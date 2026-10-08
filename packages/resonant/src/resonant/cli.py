@@ -354,3 +354,44 @@ def model_bench(
                 typer.echo(f"  {r['kind']:<6} all {n} calls failed")
     if any("p50_ms" not in r for r in results):
         raise typer.Exit(1)
+
+
+# --- self-tests ------------------------------------------------------------------------
+
+selftest_app = typer.Typer(no_args_is_help=True, help="End-to-end checks of real channels.")
+app.add_typer(selftest_app, name="selftest")
+
+
+@selftest_app.command("imessage")
+def selftest_imessage(
+    timeout: Annotated[
+        float, typer.Option(min=1.0, help="Seconds to wait for the message in chat.db.")
+    ] = 10.0,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Send a nonce to self_handle and read it back from chat.db. Exit 0 if ok, else 1.
+
+    Safe next to a running daemon: it uses its own reader with its own cursor, and both
+    readers drop self-test messages, so nothing is routed or answered. The result is
+    stored in kv `imessage.selftest`.
+    """
+    import asyncio
+
+    from resonant.components import deny_all_principals
+    from resonant.gateway.imessage.channel import IMessageChannel
+
+    settings = load_settings()
+    path = settings.principals_path
+    principals = load_principals(path) if path.exists() else deny_all_principals()
+    conn = _db(settings)
+    try:
+        channel = IMessageChannel(settings.channels.imessage, principals, conn)
+        result = asyncio.run(channel.self_test(timeout_s=timeout))
+    finally:
+        conn.close()
+    if as_json:
+        typer.echo(json.dumps({"ok": result.ok, "detail": result.detail}, indent=2))
+    else:
+        typer.echo(f"imessage self-test {'ok' if result.ok else 'FAILED'}: {result.detail}")
+    if not result.ok:
+        raise typer.Exit(1)

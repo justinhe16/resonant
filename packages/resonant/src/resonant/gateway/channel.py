@@ -52,6 +52,22 @@ class SelfTestResult:
 Submit = Callable[[Event], bool]
 
 
+class ChannelError(Exception):
+    """Base class for outbound channel failures. Messages never contain message bodies."""
+
+
+class ChannelRefused(ChannelError):
+    """The destination is not allowed: unknown principal, or no identity on this channel."""
+
+
+class ChannelRateLimited(ChannelError):
+    """The principal's outbound rate limit would need too long a wait. Nothing was sent."""
+
+
+class ChannelSendError(ChannelError):
+    """The adapter tried to send and failed. ``str(e)`` is an actionable, body-free reason."""
+
+
 class Channel(Protocol):
     @property
     def name(self) -> str: ...

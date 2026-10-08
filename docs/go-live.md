@@ -81,7 +81,7 @@ Apple doesn't let a script grant these. Do them by hand in System Settings → P
 macOS grants Full Disk Access per app. `--check` reads `chat.db` as your terminal, so to get a `PASS` there, the terminal app needs Full Disk Access too. The daemon's own access is what the self-test proves.
 
 - **Verify:** `resonant selftest imessage`
-- **Expected:** the self-test reports that it sent a message to `self_handle` and read it back from `chat.db`, and it exits 0. This also triggers the Automation prompt on the first run. Until the iMessage channel ships, `--check` prints `imessage self-test  SKIP (available after Phase 1)`. `--check` never runs the self-test because it sends a real message.
+- **Expected:** the self-test reports that it sent a message to `self_handle` and read it back from `chat.db`, and it exits 0. This also triggers the Automation prompt on the first run. `--check` never runs the self-test because it sends a real message; it prints a `SKIP` pointing here. The self-test is safe while the daemon is running. Run from a terminal, it proves the terminal's Automation grant; the daemon's own grant is proven by its startup self-test.
 
 ## 6. Turn the channel on
 

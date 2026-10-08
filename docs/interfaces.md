@@ -123,7 +123,7 @@ principals:
   cofounder: {identities: ["slack:U02"], grants: {dori: [request, approve]}}
 ```
 
-- An identity is `imessage:<E.164 | lowercase email>` or `slack:<user id>`.
+- An identity is `imessage:<E.164 | lowercase email>` or `slack:<user id>`. An email handle must start with a letter or digit (never `-`, which osascript could read as an option).
 - There is exactly one owner, and an identity can belong to only one principal.
 - `can(principal, action, extension)`:
   - The owner can do everything.
@@ -306,11 +306,16 @@ Every adapter must:
 - Dedupe sends by `dedupe_key`, rate-limit them, and never interpolate text into scripts. osascript gets its text through argv.
 - Treat all message content as untrusted.
 
+`send` failures raise `resonant.gateway.channel` errors, all subclasses of `ChannelError`, whose messages never contain bodies:
+- `ChannelRefused`: unknown principal, or no identity on this channel (a raw address passed as `principal` is just an unknown principal).
+- `ChannelRateLimited`: over the per-principal limit for longer than the adapter will wait. Nothing was sent.
+- `ChannelSendError`: the adapter tried and failed; the message says how to fix it.
+
 **iMessage** (Phase 1):
 - Resonant's own Apple ID, with an **email handle** (`channels.imessage.self_handle`, e.g. `resonant.agent@icloud.com`), is signed into Messages.app. It is iMessage only: no SMS, and no phone number on Resonant's account. Rows are still checked for `service='iMessage'` as a second guard.
 - A principal may list several handles (phone number and Apple ID email). A sender handle that maps to nobody is dropped and audited.
 - **Outbound allowlist:** it sends only to handles listed in principals.yaml (`send` takes a principal, never a raw handle). Any other destination is refused and audited.
-- **Send:** osascript.
+- **Send:** osascript, one call per message: `["/usr/bin/osascript", "-e", SEND_SCRIPT, handle, text]` with a 15s timeout (`resonant.gateway.imessage.sender`). The runner is an injectable `OsaRunner` protocol (`async (argv, timeout_s) -> OsaResult(returncode, stdout, stderr)`). Errors map to actionable `SendError`s: -1743 (grant Automation), Messages not running, unknown participant, timeout. stderr is never logged or passed on.
 - **Receive:** reads `~/Library/Messages/chat.db` read-only:
   - It is opened with `mode=ro` and never written to, WAL included.
   - A watch on `chat.db-wal` triggers reads, with 2s polling as the fallback.
@@ -318,7 +323,16 @@ Every adapter must:
   - When `text` is NULL, it parses `attributedBody`.
   - Implemented by `resonant.gateway.imessage.IMessageReader(config, principals, conn, clock)`: `async run(submit)`, `stop()`, `poll_once(submit)`, `health() -> {ok, last_read_at, last_error, fda_ok}`, and `register_selftest_callback(cb) -> unregister`. Events are `source="imessage"`, `type="message"`, `dedupe_key="imessage:<guid>"`, payload `{text, guid, handle, chat_guid, at, truncated}`. The cursor is kv `imessage.cursor`; a first start begins at the newest row. Audits (never with bodies): `imessage.unknown_sender`, `imessage.group_ignored`, `imessage.parse_failed`, `imessage.rate_limited`, `imessage.cursor_reset`.
   - Bodies matching `^resonant-selftest:[A-Za-z0-9_-]{8,}$` go only to the self-test callbacks, whatever their direction or sender, and never become events.
-- **Startup self-test:** send to Resonant's own handle and read the row back. On failure, alert through the Slack notifier.
+- **Adapter:** `resonant.gateway.imessage.IMessageChannel(config, principals, conn, *, runner=None, reader=None, clock, monotonic, sleep)` implements `Channel` with `name="imessage"`. `start(submit)` sweeps expired send records and runs the reader as a task; `stop()` stops it; `health()` is the reader's health. The daemon does not start it yet.
+  - `send(principal, text, *, thread=None, dedupe_key=None) -> MessageRef(channel="imessage", ref="imessage-out:<id>")`. The handle is `channels.imessage.preferred_handles[principal]` if that is one of the principal's `imessage:` identities, else the first one. Otherwise `ChannelRefused`, audited `imessage.send_refused`. `thread` is ignored (1:1 chats).
+  - Dedupe: a `dedupe_key` already sent returns the earlier ref without sending. Records are kv `imessage.sent:<sha256(key)>` = `{ref, at}`, valid 7 days, swept by `start()`. A send that fails partway is not recorded.
+  - Rate limit: a token bucket per principal of `channels.imessage.outbound_per_minute` (default 60), one token per part. A short bucket waits up to 30s (audited `imessage.send_rate_limited`, `decision="delayed"`); longer raises `ChannelRateLimited` (`decision="refused"`). Sends are serialized.
+  - Text over 2,000 characters is split on paragraph, sentence, then word boundaries, with a ` (i/n)` suffix per part.
+  - `request_approval` raises `NotImplementedError("Phase 2")`.
+  - Audits (never with bodies): `imessage.sent` (`requested_by`, `idempotency_key`, handle, length, chunks, ref), `imessage.send_failed` (reason, code, chunk), `imessage.send_refused`, `imessage.send_rate_limited`, `imessage.selftest`.
+- **Self-test:** `IMessageChannel.self_test(*, timeout_s=10) -> SelfTestResult(ok, detail)` sends `resonant-selftest:<nonce>` to `self_handle` and waits for a reader to see it. Only this run's in-memory nonce from `self_handle` counts: the `is_from_me = 1` row proves the send and the read path (required); the incoming copy is reported in `detail` but optional. Automation denied, Full Disk Access missing (checked before sending), a missing `self_handle`, and a timeout each give `ok=False` with the fix in `detail`. The result is stored in kv `imessage.selftest` = `{ok, at, detail}` and audited `imessage.selftest`.
+  - On a started channel it listens on the running reader (after its first read). Otherwise it polls a private reader with its own cursor, kv `imessage.selftest.cursor` (reset each run), so `resonant selftest imessage` can run next to a live daemon without moving `imessage.cursor`. Both readers drop self-test rows, so they are never routed or answered.
+  - The daemon runs it at startup; on failure, alert through the Slack notifier (health ticket).
 
 **Slack:** outbound notifier in Phase 1, two-way Socket Mode in Phase 5.
 
@@ -391,6 +405,7 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
 
 - `resonant status`: 0 when the daemon is up, 1 when it is down (in both text and `--json` modes). It never creates the store.
 - `resonant job-guard`: 75 when paused or when the state is unknown, 127 when exec fails, 2 when no command is given.
+- `resonant selftest imessage [--timeout S] [--json]`: 0 when the self-test passes, 1 otherwise. It sends a real iMessage to `self_handle`, stores kv `imessage.selftest`, and is safe to run while the daemon is up. macOS grants Automation per responsible app, so running it from a terminal proves the terminal's grant, not the daemon's.
 - `resonant model probe` and `resonant model bench`: 1 when the probe fails (model missing, context too small, or thinking not off). `bench` also exits 1 when every call of a kind failed. `probe` stores its result in kv `model.probe` if the store exists, and never creates it.
 
 ## Local API
