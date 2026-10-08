@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+
 from resonant import launchd
 from resonant.config import load_settings
 

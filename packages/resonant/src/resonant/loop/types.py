@@ -100,15 +100,48 @@ class Done:
 
 @dataclass(frozen=True)
 class Fail:
+    """``retry_at`` overrides the default exponential backoff for retryable failures."""
+
     error: str
     retryable: bool = False
+    checkpoint: dict[str, Any] | None = None
+    retry_at: datetime | None = None
 
 
 StepOutcome = Continue | Wait | Done | Fail
 
 
+class StepContext(Protocol):
+    """Lets a runner persist progress mid-step, before the step returns.
+
+    ``save`` commits right away and leaves the task 'running', without consuming any events.
+    Use it for anything a retry must not lose. For example, a Claude runner saves
+    ``claude_session_id`` as soon as the session starts, so a crash resumes that session
+    instead of starting a duplicate.
+    """
+
+    def save(
+        self,
+        *,
+        checkpoint: dict[str, Any] | None = None,
+        claude_session_id: str | None = None,
+        worktree_path: str | None = None,
+    ) -> None: ...
+
+
 class Runner(Protocol):
-    """Implemented by each kind of worker: local (Phase 1), claude (Phase 5), cu (Phase 7)."""
+    """Implemented by each kind of worker: local (Phase 1), claude (Phase 5), cu (Phase 7).
+
+    Contract:
+    - ``step`` must be idempotent with respect to its last persisted checkpoint. Side effects
+      go through the executor, which dedupes them by idempotency key.
+    - ``step`` must clean up any subprocess it started when it gets ``CancelledError``
+      (cancel, stuck timeout, or shutdown) and then re-raise.
+    - A Claude slot is held only while a step is in flight. A runner that needs to wait
+      (approval, human reply, usage reset, CI) returns ``Wait`` and frees the slot. It
+      resumes the session later by ``claude_session_id``.
+    - ``max_step_s`` overrides the loop's ``stuck_after_s`` for this runner (None = default).
+    """
 
     @property
     def name(self) -> str: ...
@@ -116,4 +149,7 @@ class Runner(Protocol):
     @property
     def uses_claude_slot(self) -> bool: ...
 
-    async def step(self, task: Task, events: list[Event]) -> StepOutcome: ...
+    @property
+    def max_step_s(self) -> float | None: ...
+
+    async def step(self, task: Task, events: list[Event], ctx: StepContext) -> StepOutcome: ...

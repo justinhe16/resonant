@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+
 from resonant.config import load_settings
 
 REPO = Path(__file__).resolve().parents[1]

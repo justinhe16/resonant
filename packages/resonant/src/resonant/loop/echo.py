@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+from resonant.loop.types import Done, StepContext, StepOutcome, Task
 from resonant_sdk import Event
-
-from resonant.loop.types import Done, StepOutcome, Task
 
 
 class EchoRunner:
     name = "echo"
     uses_claude_slot = False
+    max_step_s: float | None = None
 
-    async def step(self, task: Task, events: list[Event]) -> StepOutcome:
+    async def step(self, task: Task, events: list[Event], ctx: StepContext) -> StepOutcome:
         return Done(result={"echo": [e.payload for e in events]})

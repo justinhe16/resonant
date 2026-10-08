@@ -7,10 +7,9 @@ import sqlite3
 from datetime import datetime
 from typing import Any, cast
 
-from resonant_sdk import Event, new_id
-
 from resonant.loop.types import NewTask, Task, TaskStatus, WaitReason
 from resonant.store.db import iso, now_iso
+from resonant_sdk import Event, new_id
 
 
 def _dt(v: str | None) -> datetime | None:
@@ -149,9 +148,12 @@ def save_step(
     error: str | None = None,
     attempts_delta: int = 0,
     reset_attempts: bool = False,
-) -> None:
-    """Persist one step's outcome. Call inside a transaction, together with consume_events."""
-    conn.execute(
+) -> bool:
+    """Persist one step's outcome. Call inside a transaction, together with consume_events.
+
+    Returns False if the task is no longer 'running' (e.g. it was cancelled mid-step).
+    """
+    cur = conn.execute(
         """UPDATE tasks SET status = ?, wait_reason = ?, wake_at = ?,
                checkpoint = COALESCE(?, checkpoint), result = COALESCE(?, result),
                error = ?, step_no = step_no + 1,
@@ -171,13 +173,55 @@ def save_step(
             task_id,
         ),
     )
+    return cur.rowcount == 1
 
 
-def requeue_interrupted(conn: sqlite3.Connection) -> int:
-    """On startup: tasks left 'running' by a crash resume from their last checkpoint."""
+def save_progress(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    checkpoint: dict[str, Any] | None,
+    claude_session_id: str | None,
+    worktree_path: str | None,
+) -> bool:
+    """Mid-step progress for a running task. Fields left as None are unchanged."""
     cur = conn.execute(
-        "UPDATE tasks SET status = 'queued', updated_at = ? WHERE status = 'running'",
-        (now_iso(),),
+        """UPDATE tasks SET checkpoint = COALESCE(?, checkpoint),
+               claude_session_id = COALESCE(?, claude_session_id),
+               worktree_path = COALESCE(?, worktree_path), updated_at = ?
+           WHERE id = ? AND status = 'running'""",
+        (_dump(checkpoint), claude_session_id, worktree_path, now_iso(), task_id),
+    )
+    return cur.rowcount == 1
+
+
+def requeue_interrupted(conn: sqlite3.Connection, max_attempts: int) -> tuple[int, int]:
+    """On startup: tasks still 'running' were interrupted by a crash.
+
+    Each crash counts as an attempt, so a step that kills the process can't crash-loop
+    forever under launchd KeepAlive. Returns (requeued, failed).
+    """
+    ts = now_iso()
+    failed = conn.execute(
+        """UPDATE tasks SET status = 'failed', attempts = attempts + 1, updated_at = ?,
+               error = 'interrupted by daemon crash too many times'
+           WHERE status = 'running' AND attempts + 1 >= ?""",
+        (ts, max_attempts),
+    ).rowcount
+    requeued = conn.execute(
+        """UPDATE tasks SET status = 'queued', attempts = attempts + 1, updated_at = ?
+           WHERE status = 'running'""",
+        (ts,),
+    ).rowcount
+    return requeued, failed
+
+
+def requeue_running(conn: sqlite3.Connection, task_ids: list[str]) -> int:
+    """Graceful shutdown: steps cancelled on purpose go back to the queue, no attempt used."""
+    cur = conn.execute(
+        """UPDATE tasks SET status = 'queued', updated_at = ?
+           WHERE status = 'running' AND id IN (SELECT value FROM json_each(?))""",
+        (now_iso(), json.dumps(task_ids)),
     )
     return cur.rowcount
 

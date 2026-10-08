@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from resonant.cli import app
 from typer.testing import CliRunner
+
+from resonant.cli import app
 
 
 def test_help_lists_daemon_commands() -> None:

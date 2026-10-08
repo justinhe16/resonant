@@ -7,9 +7,10 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
+
 from resonant.config import LoopConfig
 from resonant.loop import Continue, Done, Fail, Loop, NewTask, SlotPool, StepOutcome, Task, Wait
-from resonant.loop.types import PRIORITY_BACKGROUND, PRIORITY_ONCALL, PRIORITY_OWNER
+from resonant.loop.types import PRIORITY_BACKGROUND, PRIORITY_ONCALL, PRIORITY_OWNER, StepContext
 from resonant.store import tasks as repo
 from resonant.store.db import utcnow
 from resonant_sdk import Event
@@ -33,9 +34,10 @@ class Scripted:
     outcomes: list[StepOutcome | Exception]
     name: str = "scripted"
     uses_claude_slot: bool = False
+    max_step_s: float | None = None
     calls: list[tuple[Task, list[Event]]] = field(default_factory=list[tuple[Task, list[Event]]])
 
-    async def step(self, task: Task, events: list[Event]) -> StepOutcome:
+    async def step(self, task: Task, events: list[Event], ctx: StepContext) -> StepOutcome:
         self.calls.append((task, events))
         out = self.outcomes[min(len(self.calls), len(self.outcomes)) - 1]
         if isinstance(out, Exception):
@@ -49,10 +51,11 @@ class Blocking:
 
     name: str = "blocking"
     uses_claude_slot: bool = False
+    max_step_s: float | None = None
     release: asyncio.Event = field(default_factory=asyncio.Event)
     started: list[str] = field(default_factory=list[str])
 
-    async def step(self, task: Task, events: list[Event]) -> StepOutcome:
+    async def step(self, task: Task, events: list[Event], ctx: StepContext) -> StepOutcome:
         self.started.append(task.id)
         await self.release.wait()
         return Done(result={})
@@ -98,8 +101,9 @@ async def test_continue_persists_checkpoint_between_steps(db: sqlite3.Connection
     class Counter:
         name = "counter"
         uses_claude_slot = False
+        max_step_s = None
 
-        async def step(self, task: Task, events: list[Event]) -> StepOutcome:
+        async def step(self, task: Task, events: list[Event], ctx: StepContext) -> StepOutcome:
             n = task.checkpoint.get("n", 0) + 1
             return Done(result={"n": n}) if n == 3 else Continue({"n": n})
 
@@ -145,9 +149,10 @@ async def test_event_during_step_is_not_lost(db: sqlite3.Connection) -> None:
     class SubmitsDuringStep:
         name = "s"
         uses_claude_slot = False
+        max_step_s = None
         calls = 0
 
-        async def step(self, task: Task, events: list[Event]) -> StepOutcome:
+        async def step(self, task: Task, events: list[Event], ctx: StepContext) -> StepOutcome:
             self.calls += 1
             if self.calls == 1:
                 holder["loop"].submit(Event(source="x", type="late", task_id=task.id))
@@ -231,7 +236,8 @@ async def test_dedupe_key_drops_duplicates(db: sqlite3.Connection) -> None:
 
 async def test_priority_order(db: sqlite3.Connection) -> None:
     r = Scripted([Done({})])
-    loop = make_loop(db, {"scripted": r}, max_parallel=1)
+    # max_parallel=2 keeps one slot for on-call, so non-on-call work runs one at a time.
+    loop = make_loop(db, {"scripted": r}, max_parallel=2)
     ids = {
         p: loop.create_task(spec(priority=p))
         for p in (PRIORITY_BACKGROUND, PRIORITY_ONCALL, PRIORITY_OWNER)
@@ -270,7 +276,7 @@ async def test_stuck_step_is_cancelled_and_retried(db: sqlite3.Connection) -> No
     await loop.run_once()
     await asyncio.sleep(0.01)
     t = task(db, tid)
-    assert (t.status, t.attempts, t.error) == ("queued", 1, "step exceeded stuck_after_s")
+    assert (t.status, t.attempts, t.error) == ("queued", 1, "step exceeded its time limit")
 
 
 async def test_cancel_inflight(db: sqlite3.Connection) -> None:
@@ -330,3 +336,163 @@ def test_retry_backoff(attempt: int, expected: float) -> None:
     from resonant.loop.loop import retry_backoff
 
     assert retry_backoff(attempt).total_seconds() == expected
+
+
+# --- review regressions ----------------------------------------------------------------
+
+
+async def test_cancel_before_step_starts_releases_slots(db: sqlite3.Connection) -> None:
+    claude = Blocking(name="claude", uses_claude_slot=True)
+    loop = make_loop(db, {"claude": claude})
+    tid = loop.create_task(spec("claude"))
+    await loop.run_once()
+    assert loop.cancel(tid)  # the step task exists but its body hasn't run yet
+    await asyncio.sleep(0.01)
+    assert claude.started == []
+    assert (loop.inflight, loop.slots.in_use) == (0, 0)
+    assert task(db, tid).status == "cancelled"
+
+
+async def test_unserializable_outcome_fails_task(db: sqlite3.Connection) -> None:
+    loop = make_loop(db, {"scripted": Scripted([Continue({"at": utcnow()})])})
+    tid = loop.create_task(spec())
+    await loop.run_until_idle()
+    t = task(db, tid)
+    assert t.status == "failed"
+    assert t.error is not None and "unserializable" in t.error
+
+
+async def test_persist_failure_stops_loop(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*a: Any, **kw: Any) -> bool:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    loop = make_loop(db, {"scripted": Scripted([Done({})])})
+    tid = loop.create_task(spec())
+    monkeypatch.setattr(repo, "save_step", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        await loop.run_until_idle()
+    assert task(db, tid).status == "running"  # resume() will recover it
+    assert loop.inflight == 0
+
+
+async def test_router_failure_keeps_event_then_dead_letters(db: sqlite3.Connection) -> None:
+    calls = 0
+
+    async def flaky(event: Event) -> NewTask | None:
+        nonlocal calls
+        calls += 1
+        raise ConnectionError("model down")
+
+    loop = make_loop(db, {}, router=flaky)
+    ev = Event(source="imessage", type="message")
+    loop.submit(ev)
+    for _ in range(4):
+        await loop.run_once()
+    assert [e.id for e in repo.unrouted_events(db)] == [ev.id]
+    await loop.run_once()
+    assert calls == 5
+    assert repo.unrouted_events(db) == []
+    row = db.execute("SELECT detail FROM audit_log WHERE action = 'event.dead_letter'").fetchone()
+    assert ev.id in row["detail"]
+
+
+async def test_no_router_leaves_events_unrouted(db: sqlite3.Connection) -> None:
+    loop = make_loop(db, {})
+    loop.submit(Event(source="imessage", type="message"))
+    await loop.run_until_idle()
+    assert len(repo.unrouted_events(db)) == 1
+
+
+async def test_step_context_saves_session_before_crash(db: sqlite3.Connection) -> None:
+    started = asyncio.Event()
+
+    class ClaudeLike:
+        name = "claude"
+        uses_claude_slot = True
+        max_step_s = None
+
+        async def step(self, task: Task, events: list[Event], ctx: StepContext) -> StepOutcome:
+            ctx.save(claude_session_id="sess-1", worktree_path="/wt/1", checkpoint={"m": 1})
+            started.set()
+            await asyncio.Event().wait()  # long-running session
+            raise AssertionError("unreachable")
+
+    loop1 = make_loop(db, {"claude": ClaudeLike()})
+    tid = loop1.create_task(spec("claude"))
+    await loop1.run_once()
+    await started.wait()
+    for t in list(loop1._inflight.values()):  # pyright: ignore[reportPrivateUsage]
+        t.cancel()  # crash
+    await asyncio.sleep(0.01)
+    t = task(db, tid)
+    assert (t.claude_session_id, t.worktree_path, t.checkpoint) == ("sess-1", "/wt/1", {"m": 1})
+
+    r = Scripted([Done({})], name="claude", uses_claude_slot=True)
+    loop2 = make_loop(db, {"claude": r})
+    loop2.resume()
+    await loop2.run_until_idle()
+    assert r.calls[0][0].claude_session_id == "sess-1"
+
+
+async def test_fail_retry_at_overrides_backoff(db: sqlite3.Connection) -> None:
+    clock = FakeClock()
+    reset = clock.now + timedelta(hours=3)
+    loop = make_loop(
+        db, {"scripted": Scripted([Fail("usage", retryable=True, retry_at=reset)])}, clock
+    )
+    tid = loop.create_task(spec())
+    await loop.run_until_idle()
+    wake_at = task(db, tid).wake_at
+    assert wake_at is not None and abs(wake_at - reset) < timedelta(milliseconds=1)
+
+
+async def test_crash_loop_is_bounded(db: sqlite3.Connection) -> None:
+    loop = make_loop(db, {})
+    tid = loop.create_task(spec())
+    for expected_status in ("queued", "queued", "failed"):
+        repo.set_status(db, tid, "running")
+        loop.resume()
+        assert task(db, tid).status == expected_status
+    assert task(db, tid).attempts == 3
+
+
+async def test_graceful_shutdown_requeues_without_attempt(db: sqlite3.Connection) -> None:
+    loop = make_loop(db, {"blocking": Blocking()})
+    tid = loop.create_task(spec("blocking"))
+    await loop.run_once()
+    await asyncio.sleep(0)
+    await loop._shutdown(grace_s=0.01)  # pyright: ignore[reportPrivateUsage]
+    t = task(db, tid)
+    assert (t.status, t.attempts) == ("queued", 0)
+
+
+async def test_last_parallel_slot_kept_for_oncall(db: sqlite3.Connection) -> None:
+    b = Blocking()
+    loop = make_loop(db, {"blocking": b}, max_parallel=3)
+    normal = [loop.create_task(spec("blocking")) for _ in range(3)]
+    oncall = loop.create_task(spec("blocking", PRIORITY_ONCALL, lane="oncall"))
+    await loop.run_once()
+    await asyncio.sleep(0)
+    assert sorted(b.started) == sorted([oncall, normal[0], normal[1]])
+    b.release.set()
+    await loop.run_until_idle()
+
+
+async def test_runner_max_step_s_overrides_default(db: sqlite3.Connection) -> None:
+    clock = FakeClock()
+    b = Blocking()
+    b.max_step_s = 3600
+    loop = make_loop(db, {"blocking": b}, clock)
+    tid = loop.create_task(spec("blocking"))
+    await loop.run_once()
+    await asyncio.sleep(0)
+    clock.advance(seconds=120)  # past the loop default (60s), within the runner's limit
+    await loop.run_once()
+    await asyncio.sleep(0)
+    assert task(db, tid).status == "running"
+    clock.advance(hours=1)
+    await loop.run_once()
+    await asyncio.sleep(0.01)
+    assert task(db, tid).status == "queued"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
+
 from resonant_sdk import Event, new_id
 
 

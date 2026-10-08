@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 import httpx
+
 from resonant.api import DaemonState, create_app
 from resonant.config import load_settings
 from resonant.loop import Loop, NewTask, SlotPool

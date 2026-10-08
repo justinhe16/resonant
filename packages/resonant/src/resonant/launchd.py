@@ -12,6 +12,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -20,7 +21,12 @@ from resonant.config import Settings
 
 DAEMON_LABEL = "com.resonant.daemon"
 OLLAMA_LABEL = "com.resonant.ollama"
-_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+_SYSTEM_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _path() -> str:
+    # ~/.local/bin is where uv tools and the `claude` CLI usually live.
+    return f"{Path('~/.local/bin').expanduser()}:{_SYSTEM_PATH}"
 
 
 def agents_dir() -> Path:
@@ -36,7 +42,7 @@ def daemon_plist(settings: Settings, python: str | None = None) -> dict[str, Any
     return {
         "Label": DAEMON_LABEL,
         "ProgramArguments": [python or sys.executable, "-m", "resonant", "daemon", "run"],
-        "EnvironmentVariables": {"RESONANT_HOME": str(settings.home), "PATH": _PATH},
+        "EnvironmentVariables": {"RESONANT_HOME": str(settings.home), "PATH": _path()},
         "WorkingDirectory": str(settings.home),
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -56,7 +62,7 @@ def ollama_plist(settings: Settings, ollama: str) -> dict[str, Any]:
             "OLLAMA_HOST": f"{url.hostname or '127.0.0.1'}:{url.port or 11434}",
             "OLLAMA_KEEP_ALIVE": "-1",
             "OLLAMA_CONTEXT_LENGTH": str(settings.model.context_tokens),
-            "PATH": _PATH,
+            "PATH": _path(),
         },
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -70,10 +76,19 @@ def find_ollama() -> str | None:
     return shutil.which("ollama")
 
 
+class LaunchctlError(RuntimeError):
+    pass
+
+
 def _launchctl(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603 - fixed binary, no shell
-        ["/bin/launchctl", *args], check=check, capture_output=True, text=True
+    proc = subprocess.run(  # noqa: S603 - fixed binary, no shell
+        ["/bin/launchctl", *args], check=False, capture_output=True, text=True
     )
+    if check and proc.returncode != 0:
+        raise LaunchctlError(
+            f"launchctl {' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip()}"
+        )
+    return proc
 
 
 def install(plist: dict[str, Any]) -> Path:
@@ -87,7 +102,15 @@ def install(plist: dict[str, Any]) -> Path:
     path.write_bytes(plistlib.dumps(plist))
     domain = f"gui/{os.getuid()}"
     _launchctl("bootout", f"{domain}/{label}", check=False)
-    _launchctl("bootstrap", domain, str(path))
+    # bootout is asynchronous. bootstrap fails with EIO (5) until the old instance is gone.
+    for attempt in range(10):
+        try:
+            _launchctl("bootstrap", domain, str(path))
+            break
+        except LaunchctlError:
+            if attempt == 9:
+                raise
+            time.sleep(0.5)
     _launchctl("enable", f"{domain}/{label}")
     return path
 

@@ -4,6 +4,7 @@ import asyncio
 import socket
 
 import httpx
+
 from resonant.config import load_settings
 from resonant.daemon import Daemon
 
