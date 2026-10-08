@@ -316,6 +316,8 @@ Every adapter must:
   - A watch on `chat.db-wal` triggers reads, with 2s polling as the fallback.
   - A cursor on `message.ROWID` is kept in `kv`.
   - When `text` is NULL, it parses `attributedBody`.
+  - Implemented by `resonant.gateway.imessage.IMessageReader(config, principals, conn, clock)`: `async run(submit)`, `stop()`, `poll_once(submit)`, `health() -> {ok, last_read_at, last_error, fda_ok}`, and `register_selftest_callback(cb) -> unregister`. Events are `source="imessage"`, `type="message"`, `dedupe_key="imessage:<guid>"`, payload `{text, guid, handle, chat_guid, at, truncated}`. The cursor is kv `imessage.cursor`; a first start begins at the newest row. Audits (never with bodies): `imessage.unknown_sender`, `imessage.group_ignored`, `imessage.parse_failed`, `imessage.rate_limited`, `imessage.cursor_reset`.
+  - Bodies matching `^resonant-selftest:[A-Za-z0-9_-]{8,}$` go only to the self-test callbacks, whatever their direction or sender, and never become events.
 - **Startup self-test:** send to Resonant's own handle and read the row back. On failure, alert through the Slack notifier.
 
 **Slack:** outbound notifier in Phase 1, two-way Socket Mode in Phase 5.
