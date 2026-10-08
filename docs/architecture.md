@@ -39,7 +39,8 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Contracts: Event, ToolSpec, Manifest, ToolRegistry, Gate (tokens, reply binding), Channel, Executor | `resonant_sdk/`, `resonant/tools/`, `resonant/gate/`, `resonant/gateway/`, `resonant/executor.py` | Phase 0 ✅ (DryRunGate) |
 | Extension authoring guide + `resonant ext validate` | `docs/extensions.md`, `resonant/cli.py` | Phase 0 ✅ |
 | Built-in read tools (`list_tasks`, `task_counts`, `system_status`, `daemon_status`, `model_status`); registry, `DryRunGate` and executor wired into the daemon; `GET /api/tools` | `resonant/tools/builtin.py`, `resonant/components.py`, `resonant/api.py` | Phase 1 |
-| Model client (Ollama, OpenAI-compatible), router, local runner | — | Phase 1 |
+| Model client (Ollama native or OpenAI-compatible), `resonant model probe/bench` | `resonant/models/`, `resonant/cli.py` | Phase 1 |
+| Router, local runner | — | Phase 1 |
 | iMessage channel, Slack notifier, router evals | — | Phase 1 |
 | Real gate (L0–L3, text-reply approvals, veto, kill switch), Keychain injection | — | Phase 2 |
 | Extension manager (`ext add`, CLI/MCP tools, scheduler, critical-job plists) | — | Phase 3 |
@@ -102,6 +103,7 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 |---|---|
 | 2026-10-08 | Hybrid execution: Phase 0 is built in one context to freeze contracts. Later phases are ticketed one at a time (`/linear-surf`) and run in parallel (`/robot-surf-fan`). |
 | 2026-10-08 | Ollama with `qwen3:30b-a3b` (Q4), thinking off for tool calls. The client is OpenAI-compatible, so MLX is a config swap later. |
+| 2026-10-08 | The model client defaults to Ollama's native `/api/chat` (`model.api: ollama`), where `think: false` is the documented switch for qwen3. `/v1` stays available (`model.api: openai`) for a later MLX swap. `resonant model probe` verifies thinking is really off for whichever is configured. |
 | 2026-10-08 | Durable task envelope on SQLite. No workflow engine and no generic queue. |
 | 2026-10-08 | uv workspace with `resonant` and `resonant-sdk`. Extensions depend only on the SDK. |
 | 2026-10-08 | LaunchAgent (GUI session), not LaunchDaemon. FileVault stays on, with a UPS and `fdesetup authrestart` for planned reboots. Manual login after an unplanned reboot is accepted. |

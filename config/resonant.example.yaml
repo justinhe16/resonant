@@ -7,6 +7,7 @@ model:
   base_url: http://127.0.0.1:11434/v1   # Ollama (OpenAI-compatible)
   name: qwen3:30b-a3b
   context_tokens: 32768                 # pinned server-side via OLLAMA_CONTEXT_LENGTH
+  api: ollama                           # ollama (native /api/chat, think:false) | openai (/v1)
 
 api:
   host: 127.0.0.1                       # loopback only; expose with `tailscale serve`

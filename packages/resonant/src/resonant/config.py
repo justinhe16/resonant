@@ -11,7 +11,7 @@ from __future__ import annotations
 import ipaddress
 import os
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, cast
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -49,6 +49,10 @@ class ModelConfig(_Section):
     name: str = "qwen3:30b-a3b"
     context_tokens: int = Field(default=32768, gt=0)
     timeout_s: float = Field(default=60.0, gt=0)
+    # "ollama": native /api/chat (top-level `think: false`, the documented switch for qwen3).
+    # "openai": the OpenAI-compatible /v1 endpoint (portable, e.g. to MLX later).
+    # `resonant model probe` checks that thinking is actually off for the chosen adapter.
+    api: Literal["openai", "ollama"] = "ollama"
 
     @field_validator("base_url")
     @classmethod

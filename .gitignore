@@ -41,7 +41,8 @@ worktrees/
 tmp/
 
 # Models
-models/
+# Local model weights at the repo root (not packages/.../resonant/models/, the client)
+/models/
 *.gguf
 *.safetensors
 
