@@ -239,6 +239,7 @@ def test_huge_message_is_truncated(
         pytest.param({"handle": OWNER_PHONE, "group": True}, id="group"),
         pytest.param({"handle": OWNER_PHONE, "in_chat": False}, id="no_chat"),
         pytest.param({"handle": OWNER_PHONE, "text": "   "}, id="empty"),
+        pytest.param({"handle": OWNER_PHONE, "text": "\ufffc"}, id="attachment_only"),
     ],
 )
 def test_ignored_rows_never_become_events(
@@ -610,3 +611,11 @@ def test_imessage_config_defaults() -> None:
 
 def test_attributed_body_fixtures_round_trip() -> None:
     assert parse_attributed_body(blob("long.bin")) == "abcdefghij" * 30
+
+
+async def test_stop_before_run_is_honored(
+    chat: FakeChatDB, principals: Principals, db: sqlite3.Connection
+) -> None:
+    reader = make_reader(chat, principals, db, poll_s=30)
+    reader.stop()
+    await asyncio.wait_for(reader.run(Sink(db)), 1)

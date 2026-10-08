@@ -90,6 +90,7 @@ APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=UTC)
 WAL_CHECK_S = 0.25
 DEBOUNCE_S = 0.1
 _RATE_WINDOW = timedelta(seconds=60)
+_OBJECT_REPLACEMENT = "\ufffc"
 
 FDA_MESSAGE = (
     "cannot open chat.db: grant Full Disk Access to the daemon's Python interpreter "
@@ -215,14 +216,17 @@ class IMessageReader:
 
     async def run(self, submit: Submit) -> None:
         """Read until :meth:`stop`. Never raises except ``CancelledError``."""
-        self._stop.clear()
         wal = Path(f"{self.config.db_path}-wal")
         try:
             while not self._stop.is_set():
+                # Snapshot the WAL before reading, so a write that lands mid-read still
+                # triggers the next read instead of waiting out poll_s.
+                seen = _stat(wal)
                 self._safe_poll(submit)
-                await self._wait_for_change(wal)
+                await self._wait_for_change(wal, seen)
         finally:
             self._close()
+            self._stop.clear()  # a stop() before or during run() is honored; reusable after
 
     def stop(self) -> None:
         """Ask :meth:`run` to return. Safe to call at any time, including before run."""
@@ -294,7 +298,8 @@ class IMessageReader:
         if raw_text is None and row["body"] is not None:
             raw_text = parse_attributed_body(bytes(row["body"]))
             parse_failed = raw_text is None
-        text = (raw_text or "").strip()
+        # U+FFFC marks an attachment's position; an attachment-only message has no text.
+        text = (raw_text or "").replace(_OBJECT_REPLACEMENT, "").strip()
         handle = normalize_handle(row["handle"]) if row["handle"] else None
         at = from_apple_time(row["date"]) or self.clock()
 
@@ -395,7 +400,10 @@ class IMessageReader:
         os.close(fd)
         self._fda_ok = True
         uri = f"file:{urllib.parse.quote(str(path))}?mode=ro"
-        chat = sqlite3.connect(uri, uri=True, isolation_level=None, check_same_thread=False)
+        # timeout=0: never block the event loop on a busy chat.db; retry on the next poll.
+        chat = sqlite3.connect(
+            uri, uri=True, timeout=0, isolation_level=None, check_same_thread=False
+        )
         try:
             chat.row_factory = sqlite3.Row
             _check_schema(chat)
@@ -451,11 +459,10 @@ class IMessageReader:
         if close:
             self._close()
 
-    async def _wait_for_change(self, wal: Path) -> None:
+    async def _wait_for_change(self, wal: Path, seen: tuple[int, int] | None) -> None:
         """Sleep up to ``poll_s``, returning early (debounced) when ``wal`` changes."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.config.poll_s
-        seen = _stat(wal)
         while not self._stop.is_set():
             remaining = deadline - loop.time()
             if remaining <= 0:
