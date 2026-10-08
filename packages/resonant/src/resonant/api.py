@@ -12,10 +12,12 @@ from fastapi import FastAPI
 from resonant import __version__
 from resonant.config import Settings
 from resonant.loop import Loop
+from resonant.monitor import channels_snapshot
 from resonant.status import collect_status
 
 if TYPE_CHECKING:
     from resonant.components import Components
+    from resonant.monitor import HealthMonitor
 
 
 @dataclass
@@ -25,6 +27,7 @@ class DaemonState:
     loop: Loop
     started_at: datetime
     components: Components | None = None  # set by the daemon after construction
+    monitor: HealthMonitor | None = None  # set when the health monitor runs (iMessage on)
 
 
 def create_app(state: DaemonState) -> FastAPI:
@@ -60,5 +63,13 @@ def create_app(state: DaemonState) -> FastAPI:
             }
             for s in state.components.registry.specs()
         ]
+
+    @app.get("/api/channels")
+    async def channels() -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]
+        return channels_snapshot(
+            state.conn,
+            imessage_enabled=state.settings.channels.imessage.enabled,
+            channel=None if state.monitor is None else state.monitor.channel,
+        )
 
     return app

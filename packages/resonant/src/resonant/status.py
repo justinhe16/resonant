@@ -8,6 +8,7 @@ from typing import Any
 
 from resonant import __version__
 from resonant.config import Settings
+from resonant.monitor import health_snapshot
 from resonant.store import tasks as repo
 from resonant.store.db import iso, kv_get, utcnow
 
@@ -32,4 +33,5 @@ def collect_status(
         "tasks": repo.count_by_status(conn),
         "waiting": repo.count_waiting_by_reason(conn),
         "inflight": inflight,
+        "health": health_snapshot(conn),
     }

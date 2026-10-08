@@ -6,8 +6,9 @@
   calls ``os._exit(1)`` and launchd (KeepAlive) restarts the daemon. A whole-process
   freeze (SIGSTOP, a kernel hang) also stops this thread, which is why the dead-man exists.
 - Dead-man: pings healthchecks.io every ``ping_every_s`` while healthy, and sends ``/fail``
-  when the loop is stale. If pings stop entirely (machine down, process frozen, network
-  out), healthchecks.io alerts on its own.
+  (with a plain-text reason body) when the loop is stale or the health monitor reports a
+  problem it can't text the owner about. If pings stop entirely (machine down, process
+  frozen, network out), healthchecks.io alerts on its own.
 """
 
 from __future__ import annotations
@@ -80,17 +81,46 @@ async def deadman_task(
     interval_s: float,
     healthy: Callable[[], bool],
     client: httpx.AsyncClient | None = None,
+    reason: Callable[[], str | None] | None = None,
 ) -> None:
+    """Ping ``url`` while healthy; otherwise POST ``/fail`` with a short plain-text reason.
+
+    ``reason`` (e.g. ``HealthMonitor.deadman_reason``) returns why the owner can't be
+    reached by other means, or None. A non-None reason sends ``/fail`` even while the loop
+    is healthy. The URL holds the check's secret UUID, so it is never logged.
+    """
     owns = client is None
     client = client or httpx.AsyncClient(timeout=10)
     try:
         while True:
-            target = url if healthy() else f"{url.rstrip('/')}/fail"
+            ok, why = healthy(), _safe_reason(reason)
             try:
-                await client.get(target)
+                if ok and why is None:
+                    await client.get(url)
+                else:
+                    body = "; ".join(r for r in (None if ok else "event loop stale", why) if r)
+                    await client.post(
+                        f"{url.rstrip('/')}/fail",
+                        content=body[:FAIL_BODY_MAX].encode(),
+                        headers={"content-type": "text/plain; charset=utf-8"},
+                    )
             except httpx.HTTPError as e:
-                log.warning("dead-man ping failed: %s", e)
+                # str(e) can include the request URL (e.g. HTTPStatusError): log the type only.
+                log.warning("dead-man ping failed: %s", type(e).__name__)
             await asyncio.sleep(interval_s)
     finally:
         if owns:
             await client.aclose()
+
+
+FAIL_BODY_MAX = 500
+
+
+def _safe_reason(reason: Callable[[], str | None] | None) -> str | None:
+    if reason is None:
+        return None
+    try:
+        return reason()
+    except Exception:
+        log.exception("dead-man reason callback failed")
+        return "health reason unavailable"

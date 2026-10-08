@@ -145,8 +145,25 @@ def status(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
     typer.echo(f"tasks       {tasks}")
     if waiting:
         typer.echo("waiting     " + ", ".join(f"{k}={v}" for k, v in waiting.items()))
+    echo_health(data.get("health"), live=up)
     if not up:
         raise typer.Exit(1)
+
+
+def echo_health(health: object, *, live: bool) -> None:
+    """The health section: one line per check (state, since, detail)."""
+    if not isinstance(health, dict) or not health:
+        return
+    typer.echo("health" + ("" if live else "      (last recorded; daemon is down)"))
+    for name, raw in cast(dict[str, Any], health).items():
+        h = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+        state = str(h.get("state") or "unknown")
+        line = f"  {name:<10}{state.upper() if state == 'degraded' else state}"
+        if h.get("since") and state != "unknown":
+            line += f" since {h['since']}"
+        if state == "degraded" and h.get("detail"):
+            line += f": {h['detail']}"
+        typer.echo(line)
 
 
 @app.command()

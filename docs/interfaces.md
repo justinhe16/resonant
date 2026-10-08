@@ -272,7 +272,7 @@ Five global read tools (`effect=read`, level L0, `extension=None`, `source="buil
 | `model_status` | none | `{known: false}` when `kv["model.probe"]` is absent or not an object; otherwise the cached probe's fields plus `known: true`. It never calls the model. |
 
 - `system_status`: `cpu_percent` is measured since the previous call (primed at registration), so it never blocks. `memory_pressure` comes from `sysctl kern.memorystatus_vm_pressure_level` and `memory_pressure -Q` with a 500ms timeout, best effort; off macOS, or when they are missing or slow, it is `{level: "unknown", free_pct: null}`. `disk` lists `/` and `RESONANT_HOME`; an unreadable path has null numbers.
-- The `model.probe` kv key is written by the model client and health check. Builtins read it only.
+- The `model.probe` kv key is written by `resonant model probe` and the health monitor, in one shape: `{ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail, model, api, checked_at}`. The monitor writes only these fields and scrubs URLs from `detail`. Builtins read it only.
 
 ## Components: `resonant.components`
 
@@ -335,7 +335,7 @@ Every adapter must:
   - Audits (never with bodies): `imessage.sent` (`requested_by`, `idempotency_key`, handle, length, chunks, ref), `imessage.send_failed` (reason, code, chunk), `imessage.send_refused`, `imessage.send_rate_limited`, `imessage.selftest`.
 - **Self-test:** `IMessageChannel.self_test(*, timeout_s=10) -> SelfTestResult(ok, detail)` sends `resonant-selftest:<nonce>` to `self_handle` and waits for a reader to see it. Only this run's in-memory nonce from `self_handle` counts: the `is_from_me = 1` row proves the send and the read path (required); the incoming copy is reported in `detail` but optional. Automation denied, Full Disk Access missing (checked before sending), a missing `self_handle`, and a timeout each give `ok=False` with the fix in `detail`. The result is stored in kv `imessage.selftest` = `{ok, at, detail}` and audited `imessage.selftest`.
   - On a started channel it listens on the running reader (after its first read). Otherwise it polls a private reader with its own cursor, kv `imessage.selftest.cursor` (reset each run), so `resonant selftest imessage` can run next to a live daemon without moving `imessage.cursor`. Both readers drop self-test rows, so they are never routed or answered.
-  - The daemon runs it at startup; on failure, alert through the Slack notifier (health ticket).
+  - The daemon runs it at startup; the health monitor re-runs it and reports failures (see Health monitor). No Slack.
 
 **Slack:** outbound notifier in Phase 1, two-way Socket Mode in Phase 5.
 
@@ -398,6 +398,28 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
 - **Spans.** `router.fast_path` (`command, handled, tool_used, latency_ms`), `router.label` (`intent, confidence, fallback, latency_ms, prefix_hash`) and `router.toolset` (`intent, principal, toolset, toolset_prefix_hash`). Never message text. A non-owner `/kill` or `/resume` is audited as `router.admin_refused` (principal and command only).
 - **Evals.** `classify` uses the production matcher and labeler from the owner's point of view, but runs no tools and never touches the kill switch.
 
+## Health monitor: `resonant.monitor`, `resonant.health`
+
+```python
+HealthMonitor(conn, *, model: ModelProber | None, channel: MonitoredChannel | None, owner: str | None,
+              daemon_healthy: Callable[[], bool], db_path=None, model_meta=None, clock=utcnow,
+              sleep=asyncio.sleep, disk_free=..., interval_s=60, ...)
+    async def run() -> None            # evaluate() every interval_s until stop()
+    async def evaluate() -> dict[check, CheckState]
+    def deadman_reason() -> str | None
+deadman_task(url, interval_s, healthy, client=None, reason: Callable[[], str | None] | None = None)
+health_snapshot(conn) -> {check: {state, since, detail, checked_at}}
+channels_snapshot(conn, *, imessage_enabled, channel) -> [{name, enabled, ok, last_read_at, last_selftest}]
+```
+
+- Checks, every 60s: **model** (`probe()` every 5 min, cached in kv `model.probe`); **imessage** (channel `health()` plus kv `imessage.selftest`; the self-test re-runs every 6h, every 30 min while the last one failed, and after 2 consecutive reader errors); **loop** (`Daemon.healthy()`, any `event.dead_letter` audit row in the last hour, more than 2 tasks failed in the last hour); **store** (a kv write succeeds, free disk on the DB volume > 2GB). A check whose dependency is None (no model client, no channel) is not evaluated and stays `unknown`.
+- State per check: `unknown | ok | degraded`, persisted in kv `health.<check>` (`{state, since, detail, checked_at}` plus alert bookkeeping), so a restart doesn't re-alert an incident.
+- Owner alerts: after ≥ 2 consecutive degraded evaluations (a reused, cached model probe doesn't count, so the model alerts after 2 failed probes), `channel.send(owner, "hey, some issues here: <check>: <detail>", dedupe_key="health:<check>:<window>")`, where `window = floor(epoch / 6h)`. One alert per incident, at most one per check per 6h. When an alerted incident clears: `"resolved: <check> is healthy again"` with `dedupe_key="health:<check>:<window>:resolved"`. A failed send is retried next round. Audited `health.alert` / `health.resolved` (`decision` `sent`, or `failed` once per streak of failed sends).
+- Texts and reasons are built by code from short details: URLs are replaced with `<url>`, details are capped (120 chars), and no secrets are included.
+- While the `imessage` check is degraded, or there is no channel or owner, nothing is sent over iMessage. `deadman_reason()` then returns the degraded checks; it also does so, prefixed `owner alerts failing`, after 3 consecutive failed owner sends (`"imessage: imessage selftest failed: …; model: …"`), else None.
+- `deadman_task`: while `healthy()` and `reason()` is None it GETs `url`; otherwise it POSTs `url/fail` with a `text/plain` body (≤ 500 chars): the reason, prefixed by `event loop stale` when the loop is stale. Ping failures log only the exception type; the URL is never logged.
+- The daemon starts `DaemonState.monitor.run()` and passes `deadman_reason` to the dead-man only when `DaemonState.monitor` is set. Nothing sets it yet: the end-to-end wiring (PER-240) builds it when `channels.imessage.enabled`. Without it, `/api/status.health` shows `unknown` and `/api/channels` shows the channel's config and last self-test.
+
 ## Local runner: `resonant.runners.local`
 
 ```python
@@ -426,7 +448,7 @@ Failures: `ModelUnavailableError` sends one templated fallback (the tool summary
 
 ## CLI exit codes
 
-- `resonant status`: 0 when the daemon is up, 1 when it is down (in both text and `--json` modes). It never creates the store.
+- `resonant status`: 0 when the daemon is up, 1 when it is down (in both text and `--json` modes). It never creates the store. Text mode ends with a health section: one line per check (state, since, and the detail when degraded).
 - `resonant job-guard`: 75 when paused or when the state is unknown, 127 when exec fails, 2 when no command is given.
 - `resonant selftest imessage [--timeout S] [--json]`: 0 when the self-test passes, 1 otherwise. It sends a real iMessage to `self_handle`, stores kv `imessage.selftest`, and is safe to run while the daemon is up. macOS grants Automation per responsible app, so running it from a terminal proves the terminal's grant, not the daemon's.
 - `resonant model probe` and `resonant model bench`: 1 when the probe fails (model missing, context too small, or thinking not off). `bench` also exits 1 when every call of a kind failed. `probe` stores its result in kv `model.probe` if the store exists, and never creates it.
@@ -439,5 +461,6 @@ All endpoints are loopback only and exposed to the tailnet with `tailscale serve
 | Endpoint | Returns |
 |---|---|
 | `GET /healthz` | `{"ok": true}` |
-| `GET /api/status` | version, uptime, last tick, dry_run, autonomy, paused, task counts by status and wait reason, in-flight count |
+| `GET /api/status` | version, uptime, last tick, dry_run, autonomy, paused, task counts by status and wait reason, in-flight count, `health: {model, imessage, loop, store}` each `{state: unknown\|ok\|degraded, since, detail, checked_at}` |
+| `GET /api/channels` | `[{name: "imessage", enabled, ok, last_read_at, last_selftest: {ok, at, detail} \| null}]`; `ok` and `last_read_at` are null without a live channel |
 | `GET /api/tools` | registered tool specs: `[{name, extension, effect, level, description, args_schema}]` (`level` is the effective level) |
