@@ -41,6 +41,7 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Built-in read tools (`list_tasks`, `task_counts`, `system_status`, `daemon_status`, `model_status`); registry, `DryRunGate` and executor wired into the daemon; `GET /api/tools` | `resonant/tools/builtin.py`, `resonant/components.py`, `resonant/api.py` | Phase 1 |
 | Model client (Ollama native or OpenAI-compatible), `resonant model probe/bench` | `resonant/models/`, `resonant/cli.py` | Phase 1 |
 | Router: deterministic fast path (slash commands, anchored keywords, owner-only `/kill`), one-call LLM intent label with stable prompt prefixes, principal-filtered toolsets | `resonant/router/` | Phase 1 |
+| Brain health: `HealthMonitor` (model, imessage, loop, store checks), owner alerts over iMessage, dead-man `/fail` reasons, `GET /api/channels`, `/api/status.health` | `resonant/monitor.py`, `resonant/health.py`, `resonant/api.py` | Phase 1 |
 | Local runner | — | Phase 1 |
 | iMessage channel, Slack notifier, router evals | — | Phase 1 |
 | Real gate (L0–L3, text-reply approvals, veto, kill switch), Keychain injection | — | Phase 2 |
@@ -96,7 +97,8 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 
 - **Watchdog.** An asyncio heartbeat beats every second, and a separate thread calls `os._exit(1)` if it goes stale. launchd then restarts the daemon.
 - **Dead-man switch.** It pings healthchecks.io while the loop is ticking and sends `/fail` when it isn't. A whole-process freeze (SIGSTOP), a power cut, or a reboot waiting at the FileVault login all stop the pings, and healthchecks.io alerts.
-- **iMessage self-test (Phase 1).** It runs at startup and alerts through Slack if AppleScript or the `chat.db` schema broke. It sends a random nonce to Resonant's own handle and waits for the reader to see it; the result is kept in kv `imessage.selftest`. `resonant selftest imessage` runs the same check by hand, next to a live daemon.
+- **iMessage self-test (Phase 1).** It runs at startup, and the health monitor re-runs it every 6h; a failure (AppleScript or the `chat.db` schema broke) degrades the `imessage` check. It sends a random nonce to Resonant's own handle and waits for the reader to see it; the result is kept in kv `imessage.selftest`. `resonant selftest imessage` runs the same check by hand, next to a live daemon.
+- **Health monitor (Phase 1).** `resonant/monitor.py` evaluates `model`, `imessage`, `loop` and `store` every 60s, keeps an `ok → degraded → ok` state per check in kv `health.<check>`, and texts the owner over iMessage ("hey, some issues here: …", then "resolved: …"), at most once per check per 6h. Slack is never involved: it belongs to extensions. When iMessage itself is degraded, nothing is sent over it, and the dead-man `/fail` ping carries the reason as a plain-text body instead. State shows in `/api/status.health`, `GET /api/channels` and `resonant status`.
 
 ## Decisions log
 

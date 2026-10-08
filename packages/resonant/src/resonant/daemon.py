@@ -90,13 +90,17 @@ class Daemon:
         server_task = asyncio.create_task(self._serve(), name="api")
         stop_task = asyncio.create_task(self._stop.wait(), name="stop")
         aux = [asyncio.create_task(heartbeat_task(self.heartbeat), name="heartbeat")]
+        monitor = self.state.monitor  # None until wired (channels.imessage.enabled)
+        why = None if monitor is None else monitor.deadman_reason
         if url := self.settings.health.healthchecks_url:
             aux.append(
                 asyncio.create_task(
-                    deadman_task(url, self.settings.health.ping_every_s, self.healthy),
+                    deadman_task(url, self.settings.health.ping_every_s, self.healthy, reason=why),
                     name="deadman",
                 )
             )
+        if monitor is not None:
+            aux.append(asyncio.create_task(monitor.run(), name="health-monitor"))
         watchdog = Watchdog(self.heartbeat, self.settings.health.watchdog_stale_s)
         watchdog.start()
         log.info(
