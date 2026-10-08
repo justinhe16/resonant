@@ -6,6 +6,7 @@ dependencies = ["resonant", "resonant-sdk"]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.27",
     "pre-commit>=3.8",
     "pyright>=1.1.390",
     "pytest>=8.3",
