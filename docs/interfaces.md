@@ -278,12 +278,15 @@ Five global read tools (`effect=read`, level L0, `extension=None`, `source="buil
 
 ```python
 build_components(settings, conn, state: DaemonState) -> Components
-Components(registry, principals, gate: DryRunGate, executor, handlers, principals_loaded=True)
+Components(registry, principals, gate: DryRunGate, executor, handlers, principals_loaded=True,
+           runners: dict[str, Runner] = {})
+    .register_local_runner(conn, *, model: ModelClient, channel: Channel) -> LocalRunner
 ```
 
 - `Daemon.__init__` calls it once and sets `DaemonState.components`.
 - If `principals.yaml` is missing, it logs a warning and uses an identity-less stand-in owner, so no channel identity resolves and every channel request is denied (`principals_loaded=False`). An invalid file is an error.
 - New fields (runners, channels, ...) get defaults so existing callers keep working.
+- `register_local_runner` builds `LocalRunner` from the components' gate, executor and registry and adds it to `runners["local"]`. The daemon builds the model client and channel (the channel needs `principals`), so it calls this after `build_components`.
 
 ## Channel: `resonant.gateway.channel`
 
@@ -417,6 +420,26 @@ channels_snapshot(conn, *, imessage_enabled, channel) -> [{name, enabled, ok, la
 - `deadman_task`: while `healthy()` and `reason()` is None it GETs `url`; otherwise it POSTs `url/fail` with a `text/plain` body (≤ 500 chars): the reason, prefixed by `event loop stale` when the loop is stale. Ping failures log only the exception type; the URL is never logged.
 - The daemon starts `DaemonState.monitor.run()` and passes `deadman_reason` to the dead-man only when `DaemonState.monitor` is set. Nothing sets it yet: the end-to-end wiring (PER-240) builds it when `channels.imessage.enabled`. Without it, `/api/status.health` shows `unknown` and `/api/channels` shows the channel's config and last self-test.
 
+## Local runner: `resonant.runners.local`
+
+```python
+LocalRunner(conn, *, model: ModelClient, channel: Channel, gate: RunnerGate, executor: ToolExecutor,
+            registry, max_step_s=30.0)   # name="local", uses_claude_slot=False
+```
+
+One step answers the whole task, in this order:
+
+1. `checkpoint.reply` exists: an earlier attempt computed it, so only (re)send it.
+2. `checkpoint.fast_reply`: send it as is (the router already ran its read). No model call.
+3. `checkpoint.fallback`: send `prefixes.FALLBACK_REPLY`. `intent == "run_project"`: send `ESCALATE_REPLY` ("needs the Claude runner, which arrives in Phase 5") with `escalate=true`. No tools, no model, never Claude.
+4. Context: `runner_system(intent)`, the checkpoint's `toolset` (looked up in the registry, sorted by name), this principal's previous `imessage` messages (at most 5, so 6 events with the current one; each with our reply to it, from the task it started; earlier tool outputs appear only as those replies), then the current message wrapped by `wrap_untrusted` (2000 chars).
+5. Tools: up to 3 `chat_tools` calls and 3 tool calls in all. Each call is `Intent.for_tool(spec from the toolset, task_id, principal, args)` → `gate.evaluate` → on `Allow`, `executor.execute(intent, decision, step_no=task.step_no, call_index=i)`. A tool outside the toolset, bad args, any other decision, or a failed call goes back to the model as a tool error. A model reply asking for more calls than are left escalates like `run_project`. An empty toolset skips `chat_tools`.
+   - `ChatMessage` has no `tool` role, so a call is replayed as an assistant turn `{"tool_call": {name, args}}` and its result as a user turn labeled untrusted data. The model contract is unchanged.
+6. Answer: `chat_json` with schema `{reply: string}`, clipped to 600 chars. **Number guard:** every number in the reply must appear in a tool result or in the user's message; otherwise, and on `ModelOutputError` or an empty reply, the reply is a templated summary of the tool results.
+7. `ctx.save(checkpoint={...router checkpoint, "reply", "reply_meta"})`, then `channel.send(principal, reply, dedupe_key=f"reply:{task.id}")`, then `Done({reply_len, tools_used, latency_ms, path, escalate})`. `path` is `fast | llm | summary | fallback | escalate`; `tools_used` lists the tools that ran successfully.
+
+Failures: `ModelUnavailableError` sends one templated fallback (the tool summary if tools already ran, else `FALLBACK_REPLY`) and the task is `done`. `ChannelRefused` is a final `Fail`; any other `ChannelError` is `Fail(retryable=True)`, and the dedupe key prevents a double send. Spans: `runner.local`, `runner.local.context`, `runner.local.tool`, `runner.local.final` (`outcome`: `ok | number_guard | bad_output | empty`) and `runner.local.send`, plus the model's `llm.call`. None carry message or reply text.
+
 ## Spans and logs: `resonant.observability`
 
 - `with span(conn, name, trace_id=..., task_id=..., parent_id=..., **attrs) as s: s.set(...)` writes a row to `spans` with status and timing.
@@ -429,6 +452,7 @@ channels_snapshot(conn, *, imessage_enabled, channel) -> [{name, enabled, ok, la
 - `resonant job-guard`: 75 when paused or when the state is unknown, 127 when exec fails, 2 when no command is given.
 - `resonant selftest imessage [--timeout S] [--json]`: 0 when the self-test passes, 1 otherwise. It sends a real iMessage to `self_handle`, stores kv `imessage.selftest`, and is safe to run while the daemon is up. macOS grants Automation per responsible app, so running it from a terminal proves the terminal's grant, not the daemon's.
 - `resonant model probe` and `resonant model bench`: 1 when the probe fails (model missing, context too small, or thinking not off). `bench` also exits 1 when every call of a kind failed. `probe` stores its result in kv `model.probe` if the store exists, and never creates it.
+- `resonant eval router [--set PATH] [--repeat N] [--json] [--min-accuracy F]`: 0 when accuracy ≥ `--min-accuracy` (default 0.9), 1 when it's below, 2 when the set is missing or malformed. Texts appear only in its output. The summary saved to `~/.resonant/evals/results/<ts>.json` refers to examples by line number.
 
 ## Local API
 
