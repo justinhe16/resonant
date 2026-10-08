@@ -12,6 +12,7 @@ import ipaddress
 import os
 from pathlib import Path
 from typing import Any, Self, cast
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -34,11 +35,28 @@ class _Section(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class ModelConfig(_Section):
     base_url: str = "http://127.0.0.1:11434/v1"
     name: str = "qwen3:30b-a3b"
     context_tokens: int = Field(default=32768, gt=0)
     timeout_s: float = Field(default=60.0, gt=0)
+
+    @field_validator("base_url")
+    @classmethod
+    def _local_model(cls, v: str) -> str:
+        # The Ollama LaunchAgent listens on this host; it must never be reachable off-box.
+        if not _is_loopback(urlparse(v).hostname or ""):
+            raise ValueError("model.base_url must point at a loopback host")
+        return v
 
 
 class ApiConfig(_Section):
@@ -49,7 +67,7 @@ class ApiConfig(_Section):
     @classmethod
     def _loopback_only(cls, v: str) -> str:
         # No public ports: the dashboard is exposed only via `tailscale serve`.
-        if v != "localhost" and not ipaddress.ip_address(v).is_loopback:
+        if not _is_loopback(v):
             raise ValueError("api.host must be a loopback address")
         return v
 

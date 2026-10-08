@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+
 from resonant.store.db import kv_get, kv_set, migrate, now_iso, open_db, schema_version, transaction
 
 TABLES = {

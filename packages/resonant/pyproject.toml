@@ -5,11 +5,17 @@ description = "Always-on personal agent harness: event loop, approval gate, exte
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
+    "fastapi>=0.115",
     "pydantic>=2.9",
     "pydantic-settings[yaml]>=2.6",
     "pyyaml>=6.0",
     "resonant-sdk",
+    "typer>=0.12",
+    "uvicorn>=0.32",
 ]
+
+[project.scripts]
+resonant = "resonant.cli:app"
 
 [build-system]
 requires = ["hatchling"]
