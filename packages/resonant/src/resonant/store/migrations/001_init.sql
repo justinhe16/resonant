@@ -45,7 +45,7 @@ CREATE TABLE events (
     trace_id    TEXT NOT NULL,
     consumed_at TEXT
 );
-CREATE INDEX events_pending ON events (task_id, consumed_at);
+CREATE INDEX events_pending ON events (task_id) WHERE consumed_at IS NULL;
 
 -- Approvals are bound to an intent hash and expire.
 CREATE TABLE approvals (
@@ -68,6 +68,9 @@ CREATE TABLE approvals (
     created_at   TEXT NOT NULL
 );
 CREATE INDEX approvals_pending ON approvals (status, expires_at);
+CREATE INDEX approvals_task ON approvals (task_id);
+-- At most one pending approval per (task, intent).
+CREATE UNIQUE INDEX approvals_one_pending ON approvals (task_id, intent_hash) WHERE status = 'pending';
 
 -- Side-effect idempotency: one row per (task, step, intent). A succeeded key is never re-run.
 CREATE TABLE executions (
@@ -79,6 +82,7 @@ CREATE TABLE executions (
     started_at      TEXT NOT NULL,
     finished_at     TEXT
 );
+CREATE INDEX executions_task ON executions (task_id);
 
 -- Every action, append-only. Secrets are redacted before insert.
 CREATE TABLE audit_log (
@@ -99,6 +103,10 @@ CREATE TABLE audit_log (
     trace_id        TEXT
 );
 CREATE INDEX audit_task ON audit_log (task_id);
+CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
+CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log
+BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;
 
 -- Traces: llm call -> tool -> gate -> executor.
 CREATE TABLE spans (

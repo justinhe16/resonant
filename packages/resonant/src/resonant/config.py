@@ -11,11 +11,13 @@ from __future__ import annotations
 import ipaddress
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Self, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
+    InitSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     YamlConfigSettingsSource,
@@ -35,13 +37,13 @@ class _Section(BaseModel):
 class ModelConfig(_Section):
     base_url: str = "http://127.0.0.1:11434/v1"
     name: str = "qwen3:30b-a3b"
-    context_tokens: int = 32768
-    timeout_s: float = 60.0
+    context_tokens: int = Field(default=32768, gt=0)
+    timeout_s: float = Field(default=60.0, gt=0)
 
 
 class ApiConfig(_Section):
     host: str = "127.0.0.1"
-    port: int = 7777
+    port: int = Field(default=7777, ge=1, le=65535)
 
     @field_validator("host")
     @classmethod
@@ -54,19 +56,25 @@ class ApiConfig(_Section):
 
 class HealthConfig(_Section):
     healthchecks_url: str | None = None
-    ping_every_s: float = 60.0
-    watchdog_stale_s: float = 120.0
+    ping_every_s: float = Field(default=60.0, gt=0)
+    watchdog_stale_s: float = Field(default=120.0, gt=0)
 
 
 class LoopConfig(_Section):
-    tick_s: float = 30.0
-    stuck_after_s: float = 900.0
-    max_attempts: int = 3
+    tick_s: float = Field(default=30.0, gt=0)
+    stuck_after_s: float = Field(default=900.0, gt=0)
+    max_attempts: int = Field(default=3, ge=1)
 
 
 class ClaudeConfig(_Section):
     max_concurrent: int = Field(default=5, ge=1)
     reserved_oncall_slots: int = Field(default=1, ge=0)
+
+    @model_validator(mode="after")
+    def _reserve_fits(self) -> Self:
+        if self.reserved_oncall_slots >= self.max_concurrent:
+            raise ValueError("claude.reserved_oncall_slots must be < claude.max_concurrent")
+        return self
 
 
 class Settings(BaseSettings):
@@ -86,6 +94,20 @@ class Settings(BaseSettings):
     health: HealthConfig = HealthConfig()
     loop: LoopConfig = LoopConfig()
     claude: ClaudeConfig = ClaudeConfig()
+
+    @field_validator("home")
+    @classmethod
+    def _expand_home(cls, v: Path) -> Path:
+        return v.expanduser()
+
+    @field_validator("timezone")
+    @classmethod
+    def _valid_tz(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError) as e:
+            raise ValueError(f"unknown timezone {v!r}") from e
+        return v
 
     @property
     def db_path(self) -> Path:
@@ -108,13 +130,17 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        yaml_source = YamlConfigSettingsSource(
-            settings_cls, yaml_file=resonant_home() / "config.yaml"
-        )
+        # config.yaml lives in the effective home: an explicit `home=` wins over
+        # RESONANT_HOME, which wins over the default.
+        home = resonant_home()
+        if isinstance(init_settings, InitSettingsSource):
+            init_kwargs = cast(dict[str, object], init_settings.init_kwargs)  # pyright: ignore[reportUnknownMemberType]
+            explicit = init_kwargs.get("home")
+            if isinstance(explicit, str | Path):
+                home = Path(explicit).expanduser()
+        yaml_source = YamlConfigSettingsSource(settings_cls, yaml_file=home / "config.yaml")
         return (init_settings, env_settings, yaml_source)
 
 
 def load_settings(**overrides: Any) -> Settings:
-    settings = Settings(**overrides)
-    settings.home = settings.home.expanduser()
-    return settings
+    return Settings(**overrides)

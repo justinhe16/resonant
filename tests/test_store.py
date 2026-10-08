@@ -75,3 +75,40 @@ def test_event_dedupe_key_unique(db: sqlite3.Connection) -> None:
     db.execute(row + " VALUES ('e1', 'imessage', 'message', 'im:1', ?, ?, 't')", (ts, ts))
     with pytest.raises(sqlite3.IntegrityError):
         db.execute(row + " VALUES ('e2', 'imessage', 'message', 'im:1', ?, ?, 't')", (ts, ts))
+
+
+def test_failed_migration_rolls_back(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "m.db")
+    v = schema_version(conn)
+    broken = [(v + 1, "CREATE TABLE half_done (x INTEGER);\nTHIS IS NOT SQL;")]
+    with pytest.raises(sqlite3.OperationalError):
+        migrate(conn, [*[(i, "") for i in range(1, v + 1)], *broken])
+    assert not conn.in_transaction
+    assert schema_version(conn) == v
+    names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+    assert "half_done" not in names
+
+
+def test_concurrent_migrators_apply_once(tmp_path: Path) -> None:
+    path = tmp_path / "race.db"
+    a, b = open_db(path), open_db(path)
+    v = schema_version(a)
+    extra = [*[(i, "") for i in range(1, v + 1)], (v + 1, "CREATE TABLE once (x INTEGER);")]
+    # b decided the migration was pending, but a applies it first.
+    assert migrate(a, extra) == v + 1
+    assert migrate(b, extra) == v + 1
+    assert not b.in_transaction
+
+
+def test_audit_log_is_append_only(db: sqlite3.Connection) -> None:
+    db.execute("INSERT INTO audit_log (at, action) VALUES (?, 'x')", (now_iso(),))
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db.execute("UPDATE audit_log SET action = 'y'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db.execute("DELETE FROM audit_log")
+
+
+def test_transaction_not_reentrant(db: sqlite3.Connection) -> None:
+    with pytest.raises(RuntimeError, match="reentrant"), transaction(db), transaction(db):
+        pass
+    assert not db.in_transaction

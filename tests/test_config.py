@@ -43,3 +43,26 @@ def test_unknown_keys_rejected(resonant_home: Path) -> None:
     (resonant_home / "config.yaml").write_text("model:\n  nmae: typo\n")
     with pytest.raises(ValidationError):
         load_settings()
+
+
+def test_explicit_home_reads_its_config(tmp_path: Path) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "config.yaml").write_text("dry_run: false\n")
+    s = load_settings(home=other)
+    assert s.home == other
+    assert s.dry_run is False
+
+
+@pytest.mark.parametrize(
+    "yaml_text",
+    [
+        "timezone: Mars/Olympus\n",
+        "claude:\n  max_concurrent: 2\n  reserved_oncall_slots: 2\n",
+        "loop:\n  tick_s: 0\n",
+    ],
+)
+def test_invalid_values_rejected(resonant_home: Path, yaml_text: str) -> None:
+    (resonant_home / "config.yaml").write_text(yaml_text)
+    with pytest.raises(ValidationError):
+        load_settings()

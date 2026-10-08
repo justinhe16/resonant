@@ -37,7 +37,8 @@ def connect(path: Path | str) -> sqlite3.Connection:
     with :func:`transaction`.
     """
     if isinstance(path, Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.touch(mode=0o600, exist_ok=True)
     conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -48,17 +49,30 @@ def connect(path: Path | str) -> sqlite3.Connection:
 
 
 class transaction:
-    """``with transaction(conn): ...`` runs the block in BEGIN IMMEDIATE / COMMIT."""
+    """``with transaction(conn): ...`` runs the block in BEGIN IMMEDIATE / COMMIT.
+
+    Not reentrant: nesting raises instead of silently joining the outer transaction.
+    """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
 
     def __enter__(self) -> sqlite3.Connection:
+        if self.conn.in_transaction:
+            raise RuntimeError("transaction() is not reentrant")
         self.conn.execute("BEGIN IMMEDIATE")
         return self.conn
 
     def __exit__(self, exc_type: type[BaseException] | None, *_: object) -> None:
-        self.conn.execute("COMMIT" if exc_type is None else "ROLLBACK")
+        if exc_type is not None:
+            self.conn.execute("ROLLBACK")
+            return
+        try:
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
 
 
 def _migrations() -> list[tuple[int, str]]:
@@ -78,16 +92,38 @@ def schema_version(conn: sqlite3.Connection) -> int:
     return int(conn.execute("PRAGMA user_version").fetchone()[0])
 
 
-def migrate(conn: sqlite3.Connection) -> int:
-    """Apply pending migrations. Idempotent. Returns the resulting schema version."""
-    current = schema_version(conn)
-    for version, sql in _migrations():
-        if version <= current:
+def _split_statements(sql: str) -> list[str]:
+    """Split a migration script into complete statements (handles ``;`` inside strings)."""
+    statements: list[str] = []
+    buf = ""
+    for line in sql.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            statements.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        raise ValueError(f"incomplete SQL statement in migration: {buf.strip()[:80]!r}")
+    return [s for s in statements if s]
+
+
+def migrate(conn: sqlite3.Connection, migrations: list[tuple[int, str]] | None = None) -> int:
+    """Apply pending migrations atomically. Idempotent and safe across processes.
+
+    Each migration runs in its own BEGIN IMMEDIATE transaction. ``user_version`` is
+    re-read *after* the write lock is held, so two processes starting together never
+    apply the same migration twice. Any failure rolls back that migration completely.
+    """
+    for version, sql in migrations if migrations is not None else _migrations():
+        if version <= schema_version(conn):
             continue
-        # executescript commits any open transaction, so each migration carries its own.
-        conn.executescript(f"BEGIN IMMEDIATE;\n{sql}\nPRAGMA user_version = {version};\nCOMMIT;")
-        current = version
-    return current
+        statements = _split_statements(sql)
+        with transaction(conn):
+            if version <= schema_version(conn):
+                continue  # another process applied it while we waited for the lock
+            for stmt in statements:
+                conn.execute(stmt)
+            conn.execute(f"PRAGMA user_version = {version:d}")
+    return schema_version(conn)
 
 
 def open_db(path: Path | str) -> sqlite3.Connection:
