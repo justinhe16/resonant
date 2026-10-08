@@ -35,8 +35,8 @@ The script is idempotent. It never overwrites existing files in `~/.resonant`, a
 
 FileVault disables auto-login. After a power loss or a crash reboot, the Mini waits at the login screen. Resonant and Messages don't start until someone logs in. The dead-man switch (step 7) alerts you when that happens. That is the expected recovery path, not a bug.
 
-- **Verify:** `fdesetup status` and `softwareupdate --schedule`
-- **Expected:** `FileVault is On.` and `Automatic checking for updates is turned off` (or updates set to download-only). `--check` shows `FileVault  PASS  on`. Confirm the UPS by pulling its wall plug for a few seconds: the Mini stays on.
+- **Verify:** `fdesetup status` and `defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates`
+- **Expected:** `FileVault is On.` and `0`. If the key doesn't exist, check System Settings directly. `--check` shows `FileVault  PASS  on`. Confirm the UPS by pulling its wall plug for a few seconds: the Mini stays on.
 
 ## 3. Resonant's Apple ID
 

@@ -49,7 +49,7 @@ has_cmd() {  # has_cmd <subcommand...>: true when `resonant <subcommand...>` exi
 run_check() {
   RESONANT="$REPO/.venv/bin/resonant"
   local py="$REPO/.venv/bin/python"
-  export RESONANT_HOME="$HOME_DIR"
+  export RESONANT_HOME="$HOME_DIR" PYTHONDONTWRITEBYTECODE=1
 
   printf '\033[1mResonant go-live check\033[0m  home: %s  (see docs/go-live.md)\n\n' "$HOME_DIR"
 
