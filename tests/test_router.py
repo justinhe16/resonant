@@ -399,6 +399,11 @@ async def test_non_owner_kill_is_refused(
     assert task.checkpoint["fast_reply"] == NOT_ALLOWED
     assert task.checkpoint["tool_used"] is None
     assert kv_get(db, "paused") is False
+    refused = db.execute(
+        "SELECT requested_by, detail FROM audit_log WHERE action = 'router.admin_refused'"
+    ).fetchone()
+    assert refused["requested_by"] == MEMBER
+    assert json.loads(refused["detail"]) == {"command": command}
     assert (
         db.execute("SELECT COUNT(*) FROM audit_log WHERE action = 'killswitch.engage'").fetchone()[
             0
@@ -490,6 +495,9 @@ async def test_labeled_message_makes_exactly_one_model_call(
     assert attrs["intent"] == "system"
     assert attrs["confidence"] == 0.82
     assert attrs["prefix_hash"] == LABEL_PREFIX_HASH
+    (ts,) = spans_named(db, "router.toolset")
+    assert ts["toolset"] == ["daemon_status", "model_status", "system_status"]
+    assert ts["toolset_prefix_hash"] == task.checkpoint["toolset_prefix_hash"]
     assert "latency_ms" in attrs
     # No message body in span attributes.
     assert "feels slow" not in json.dumps(attrs)

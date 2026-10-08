@@ -142,6 +142,15 @@ class Router:
 
         label = await self.labeler.label(text, spans=spans)
         toolset = self.toolset_for(label.intent, principal)
+        prefix_hash = toolset_prefix_hash(label.intent, toolset)
+        with spans(
+            "router.toolset",
+            intent=label.intent,
+            principal=principal,
+            toolset=[s.name for s in toolset],
+            toolset_prefix_hash=prefix_hash,
+        ):
+            pass
         return NewTask(
             kind=KIND_CHAT,
             runner=RUNNER,
@@ -153,7 +162,7 @@ class Router:
                 "confidence": label.confidence,
                 "toolset": [s.name for s in toolset],
                 "fallback": label.fallback,
-                "toolset_prefix_hash": toolset_prefix_hash(label.intent, toolset),
+                "toolset_prefix_hash": prefix_hash,
             },
         )
 

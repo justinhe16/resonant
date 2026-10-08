@@ -38,6 +38,8 @@ from resonant.models import SpanFactory
 from resonant.models.client import null_spans
 from resonant.principals import Principals
 from resonant.router.intents import IntentLabel
+from resonant.store.audit import audit
+from resonant.store.db import atomic
 from resonant.tools import ToolRegistry
 
 log = logging.getLogger(__name__)
@@ -283,6 +285,14 @@ class FastPath:
     ) -> FastPathResult | None:
         if cmd.admin:
             if not self.principals.can(principal, "admin", None):
+                with atomic(self.conn):
+                    audit(
+                        self.conn,
+                        "router.admin_refused",
+                        requested_by=principal,
+                        trace_id=trace_id,
+                        command=cmd.name,
+                    )
                 return self._result(cmd, NOT_ALLOWED)
             if cmd.name == "/kill":
                 killswitch.engage(self.conn, actor=principal, reason="fast path /kill")
