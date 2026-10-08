@@ -99,6 +99,18 @@ class IMessageConfig(_Section):
     # Resonant's own Apple ID email handle (iMessage only; no phone number registered).
     # The adapter skips it on receive and uses it for the send/receive self-test.
     self_handle: str | None = None
+    # Inbound reader (resonant.gateway.imessage.reader). Off until the daemon wires it in.
+    enabled: bool = False
+    # Opened read-only (mode=ro); needs Full Disk Access for the daemon's Python.
+    db_path: Path = Field(default=Path("~/Library/Messages/chat.db"), validate_default=True)
+    poll_s: float = Field(default=2.0, gt=0)
+    inbound_per_minute: int = Field(default=120, ge=1)  # per principal; excess is dropped
+    max_body_chars: int = Field(default=4000, ge=1)  # longer bodies are truncated
+
+    @field_validator("db_path")
+    @classmethod
+    def _expand_db_path(cls, v: Path) -> Path:
+        return v.expanduser()
 
     @field_validator("self_handle")
     @classmethod
