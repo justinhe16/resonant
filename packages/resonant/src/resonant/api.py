@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 
@@ -14,6 +14,9 @@ from resonant.config import Settings
 from resonant.loop import Loop
 from resonant.status import collect_status
 
+if TYPE_CHECKING:
+    from resonant.components import Components
+
 
 @dataclass
 class DaemonState:
@@ -21,6 +24,7 @@ class DaemonState:
     conn: sqlite3.Connection
     loop: Loop
     started_at: datetime
+    components: Components | None = None  # set by the daemon after construction
 
 
 def create_app(state: DaemonState) -> FastAPI:
@@ -40,5 +44,21 @@ def create_app(state: DaemonState) -> FastAPI:
             last_tick=state.loop.last_tick,
             inflight=state.loop.inflight,
         )
+
+    @app.get("/api/tools")
+    async def tools() -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]
+        if state.components is None:
+            return []
+        return [
+            {
+                "name": s.name,
+                "extension": s.extension,
+                "effect": s.effect.value,
+                "level": s.effective_level.value,
+                "description": s.description,
+                "args_schema": s.args_schema,
+            }
+            for s in state.components.registry.specs()
+        ]
 
     return app

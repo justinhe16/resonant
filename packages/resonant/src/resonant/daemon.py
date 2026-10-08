@@ -16,6 +16,7 @@ from collections.abc import Generator
 import uvicorn
 
 from resonant.api import DaemonState, create_app
+from resonant.components import build_components
 from resonant.config import Settings
 from resonant.health import Heartbeat, Watchdog, deadman_task, heartbeat_task
 from resonant.loop import Loop, SlotPool
@@ -45,6 +46,7 @@ class Daemon:
             slots=SlotPool(settings.claude.max_concurrent, settings.claude.reserved_oncall_slots),
         )
         self.state = DaemonState(settings, self.conn, self.loop, started_at=utcnow())
+        self.state.components = build_components(settings, self.conn, self.state)
         self.server = _Server(
             uvicorn.Config(
                 create_app(self.state),

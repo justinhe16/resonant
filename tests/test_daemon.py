@@ -32,7 +32,9 @@ async def test_daemon_serves_and_stops_cleanly() -> None:
     assert (await wait_healthy(port)).json() == {"ok": True}
     async with httpx.AsyncClient() as client:
         status = (await client.get(f"http://127.0.0.1:{port}/api/status")).json()
+        tools = (await client.get(f"http://127.0.0.1:{port}/api/tools")).json()
     assert status["last_tick"] is not None
+    assert len(tools) == 5
     daemon.stop()
     assert await asyncio.wait_for(run, 5) == 0
 
