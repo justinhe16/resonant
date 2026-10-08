@@ -278,12 +278,15 @@ Five global read tools (`effect=read`, level L0, `extension=None`, `source="buil
 
 ```python
 build_components(settings, conn, state: DaemonState) -> Components
-Components(registry, principals, gate: DryRunGate, executor, handlers, principals_loaded=True)
+Components(registry, principals, gate: DryRunGate, executor, handlers, principals_loaded=True,
+           runners: dict[str, Runner] = {})
+    .register_local_runner(conn, *, model: ModelClient, channel: Channel) -> LocalRunner
 ```
 
 - `Daemon.__init__` calls it once and sets `DaemonState.components`.
 - If `principals.yaml` is missing, it logs a warning and uses an identity-less stand-in owner, so no channel identity resolves and every channel request is denied (`principals_loaded=False`). An invalid file is an error.
 - New fields (runners, channels, ...) get defaults so existing callers keep working.
+- `register_local_runner` builds `LocalRunner` from the components' gate, executor and registry and adds it to `runners["local"]`. The daemon builds the model client and channel (the channel needs `principals`), so it calls this after `build_components`.
 
 ## Channel: `resonant.gateway.channel`
 
@@ -394,6 +397,26 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
 - **Prefixes for the local runner.** `prefixes.runner_system(intent)` is the runner's constant system message; `toolset_prefix_hash(intent, toolset)` hashes it with `tools_prefix(toolset)`, so it is stable per (intent, principal scope).
 - **Spans.** `router.fast_path` (`command, handled, tool_used, latency_ms`), `router.label` (`intent, confidence, fallback, latency_ms, prefix_hash`) and `router.toolset` (`intent, principal, toolset, toolset_prefix_hash`). Never message text. A non-owner `/kill` or `/resume` is audited as `router.admin_refused` (principal and command only).
 - **Evals.** `classify` uses the production matcher and labeler from the owner's point of view, but runs no tools and never touches the kill switch.
+
+## Local runner: `resonant.runners.local`
+
+```python
+LocalRunner(conn, *, model: ModelClient, channel: Channel, gate: RunnerGate, executor: ToolExecutor,
+            registry, max_step_s=30.0)   # name="local", uses_claude_slot=False
+```
+
+One step answers the whole task, in this order:
+
+1. `checkpoint.reply` exists: an earlier attempt computed it, so only (re)send it.
+2. `checkpoint.fast_reply`: send it as is (the router already ran its read). No model call.
+3. `checkpoint.fallback`: send `prefixes.FALLBACK_REPLY`. `intent == "run_project"`: send `ESCALATE_REPLY` ("needs the Claude runner, which arrives in Phase 5") with `escalate=true`. No tools, no model, never Claude.
+4. Context: `runner_system(intent)`, the checkpoint's `toolset` (looked up in the registry, sorted by name), this principal's previous `imessage` messages (at most 5, so 6 events with the current one; each with our reply to it, from the task it started; earlier tool outputs appear only as those replies), then the current message wrapped by `wrap_untrusted` (2000 chars).
+5. Tools: up to 3 `chat_tools` calls and 3 tool calls in all. Each call is `Intent.for_tool(spec from the toolset, task_id, principal, args)` → `gate.evaluate` → on `Allow`, `executor.execute(intent, decision, step_no=task.step_no, call_index=i)`. A tool outside the toolset, bad args, any other decision, or a failed call goes back to the model as a tool error. A model reply asking for more calls than are left escalates like `run_project`. An empty toolset skips `chat_tools`.
+   - `ChatMessage` has no `tool` role, so a call is replayed as an assistant turn `{"tool_call": {name, args}}` and its result as a user turn labeled untrusted data. The model contract is unchanged.
+6. Answer: `chat_json` with schema `{reply: string}`, clipped to 600 chars. **Number guard:** every number in the reply must appear in a tool result or in the user's message; otherwise, and on `ModelOutputError` or an empty reply, the reply is a templated summary of the tool results.
+7. `ctx.save(checkpoint={...router checkpoint, "reply", "reply_meta"})`, then `channel.send(principal, reply, dedupe_key=f"reply:{task.id}")`, then `Done({reply_len, tools_used, latency_ms, path, escalate})`. `path` is `fast | llm | summary | fallback | escalate`; `tools_used` lists the tools that ran successfully.
+
+Failures: `ModelUnavailableError` sends one templated fallback (the tool summary if tools already ran, else `FALLBACK_REPLY`) and the task is `done`. `ChannelRefused` is a final `Fail`; any other `ChannelError` is `Fail(retryable=True)`, and the dedupe key prevents a double send. Spans: `runner.local`, `runner.local.context`, `runner.local.tool`, `runner.local.final` (`outcome`: `ok | number_guard | bad_output | empty`) and `runner.local.send`, plus the model's `llm.call`. None carry message or reply text.
 
 ## Spans and logs: `resonant.observability`
 

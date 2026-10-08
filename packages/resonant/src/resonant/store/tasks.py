@@ -304,3 +304,39 @@ def consume_events(conn: sqlite3.Connection, event_ids: list[str]) -> None:
 
 def attach_event(conn: sqlite3.Connection, event_id: str, task_id: str) -> None:
     conn.execute("UPDATE events SET task_id = ? WHERE id = ?", (task_id, event_id))
+
+
+def get_event(conn: sqlite3.Connection, event_id: str) -> Event | None:
+    row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+    return None if row is None else _row_to_event(row)
+
+
+def principal_thread(
+    conn: sqlite3.Connection,
+    principal: str,
+    *,
+    source: str,
+    event_type: str,
+    before_event_id: str,
+    limit: int,
+) -> list[tuple[Event, dict[str, Any] | None]]:
+    """``principal``'s last ``limit`` events of one source and type before ``before_event_id``.
+
+    Oldest first. Each event comes with the checkpoint of the task it started (None if it
+    started none), so a runner can show its earlier replies as conversation history.
+    """
+    if limit <= 0:
+        return []
+    rows = conn.execute(
+        """SELECT e.*, t.checkpoint AS origin_checkpoint FROM events e
+           LEFT JOIN tasks t ON t.origin_event_id = e.id
+           WHERE e.principal = ? AND e.source = ? AND e.type = ?
+             AND e.rowid < (SELECT rowid FROM events WHERE id = ?)
+           ORDER BY e.rowid DESC LIMIT ?""",
+        (principal, source, event_type, before_event_id, limit),
+    ).fetchall()
+    out: list[tuple[Event, dict[str, Any] | None]] = []
+    for r in reversed(rows):
+        cp: Any = _json(r["origin_checkpoint"])
+        out.append((_row_to_event(r), cast(dict[str, Any], cp) if isinstance(cp, dict) else None))
+    return out

@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from resonant.config import Settings
 from resonant.executor import Executor, HandlerKey, ToolHandler
 from resonant.gate import DryRunGate
+from resonant.gateway.channel import Channel
+from resonant.loop.types import Runner
+from resonant.models import ModelClient
 from resonant.principals import Principal, Principals, load_principals
+from resonant.runners.local import LocalRunner
 from resonant.tools import ToolRegistry
 from resonant.tools.builtin import register_builtins
 
@@ -37,6 +41,26 @@ class Components:
     executor: Executor
     handlers: dict[HandlerKey, ToolHandler]
     principals_loaded: bool = True  # False: principals.yaml missing, channels deny all
+    runners: dict[str, Runner] = field(default_factory=dict[str, Runner])  # name -> runner
+
+    def register_local_runner(
+        self, conn: sqlite3.Connection, *, model: ModelClient, channel: Channel
+    ) -> LocalRunner:
+        """Build ``runner="local"`` from these components and add it to ``runners``.
+
+        The model client and channel are built by the daemon (the channel needs
+        ``principals`` from here), so the runner is registered after ``build_components``.
+        """
+        runner = LocalRunner(
+            conn,
+            model=model,
+            channel=channel,
+            gate=self.gate,
+            executor=self.executor,
+            registry=self.registry,
+        )
+        self.runners[runner.name] = runner
+        return runner
 
 
 def deny_all_principals() -> Principals:

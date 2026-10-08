@@ -41,7 +41,7 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Built-in read tools (`list_tasks`, `task_counts`, `system_status`, `daemon_status`, `model_status`); registry, `DryRunGate` and executor wired into the daemon; `GET /api/tools` | `resonant/tools/builtin.py`, `resonant/components.py`, `resonant/api.py` | Phase 1 |
 | Model client (Ollama native or OpenAI-compatible), `resonant model probe/bench` | `resonant/models/`, `resonant/cli.py` | Phase 1 |
 | Router: deterministic fast path (slash commands, anchored keywords, owner-only `/kill`), one-call LLM intent label with stable prompt prefixes, principal-filtered toolsets | `resonant/router/` | Phase 1 |
-| Local runner | — | Phase 1 |
+| Local runner: ≤3 read-tool calls through gate and executor, number-guarded reply over the channel, crash-safe resend | `resonant/runners/local.py` | Phase 1 |
 | iMessage channel, Slack notifier | — | Phase 1 |
 | Router evals: `resonant eval router` (production `classify`, accuracy, confusion, p50/p95 per path; texts only in terminal output) | `resonant/evals/`, `evals/README.md` | Phase 1 |
 | Real gate (L0–L3, text-reply approvals, veto, kill switch), Keychain injection | — | Phase 2 |
@@ -118,3 +118,4 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 | 2026-10-08 | `waiting(ci)` polls CI through `gh` on the tick. No inbound GitHub webhooks. |
 | 2026-10-08 | Router fast-path reads go through the gate but not the executor: no task exists at route time, and builtins are L0 reads with no side effect. `/kill` and `/resume` are deterministic and owner-only, never decided by the model. |
 | 2026-10-08 | Manifests load with a YAML loader where only true/false are booleans, so `notify: {on: [...]}` stays a string key. |
+| 2026-10-08 | The local runner replays tool calls to the model as assistant/user turns (no `tool` role in `ChatMessage`), guards every number in its reply against tool output and the user's message, and escalates run_project or >3 calls with a templated reply instead of calling Claude. |
