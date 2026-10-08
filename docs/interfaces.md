@@ -320,6 +320,32 @@ Every adapter must:
 
 **Slack:** outbound notifier in Phase 1, two-way Socket Mode in Phase 5.
 
+## Model client: `resonant.models`
+
+```python
+class ModelClient(Protocol):
+    async def chat_json(self, messages: list[ChatMessage], *, schema: dict, max_tokens=512,
+                        temperature=0.0, spans: SpanFactory | None = None) -> ModelReply
+    async def chat_tools(self, messages: list[ChatMessage], *, tools: list[ToolSpec],
+                         max_tokens=512, spans: SpanFactory | None = None) -> ModelReply
+    async def probe(self) -> ProbeResult
+
+ChatMessage = TypedDict(role: "system" | "user" | "assistant", content: str)
+ModelReply(text, tool_calls: list[ToolCall], json: dict | None, latency_ms, prompt_tokens, completion_tokens)
+ToolCall(name, args)                     # args validated against ToolSpec.args_schema
+ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail)
+```
+
+- `OllamaClient(cfg.model)` implements it. `model.api` picks the adapter:
+  - `ollama` (default): native `/api/chat` with top-level `think: false`.
+  - `openai`: the `/v1` endpoint via the `openai` SDK, with `think: false` and `reasoning_effort: "none"` in `extra_body`.
+- Thinking is off on every call, and `<think>…</think>` is stripped before parsing anyway.
+- `chat_json` returns schema-valid JSON. Invalid or truncated JSON gets one retry with a "return only JSON" nudge, then `ModelOutputError`.
+- `chat_tools` sends tools sorted by name with canonical key order: the same toolset is a byte-identical prefix (`tools_prefix()`). Calls to unknown tools, or with args that fail the schema, are dropped and recorded on the span. Args sent as a JSON string are parsed first.
+- Each call gets `model.timeout_s`. A connection error is retried once, immediately. Otherwise (timeout, HTTP error, missing model) it raises `ModelUnavailableError`, so callers can send a templated fallback.
+- Each call opens an `llm.call` span through the injected `SpanFactory` (e.g. `partial(span, conn, trace_id=...)`; default: none). Spans record model, adapter, latency, tokens and dropped calls, never prompt or reply text.
+- `probe()` never raises. It checks `/api/tags` (pulled), `/api/show` (context ≥ `model.context_tokens`, including a Modelfile `num_ctx`), `/api/ps` (notes a cold model) and a 1-token JSON call with thinking off.
+
 ## Spans and logs: `resonant.observability`
 
 - `with span(conn, name, trace_id=..., task_id=..., parent_id=..., **attrs) as s: s.set(...)` writes a row to `spans` with status and timing.
@@ -330,6 +356,7 @@ Every adapter must:
 
 - `resonant status`: 0 when the daemon is up, 1 when it is down (in both text and `--json` modes). It never creates the store.
 - `resonant job-guard`: 75 when paused or when the state is unknown, 127 when exec fails, 2 when no command is given.
+- `resonant model probe` and `resonant model bench`: 1 when the probe fails (model missing, context too small, or thinking not off). `bench` also exits 1 when every call of a kind failed. `probe` stores its result in kv `model.probe` if the store exists, and never creates it.
 
 ## Local API
 
