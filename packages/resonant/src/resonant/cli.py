@@ -6,6 +6,7 @@ reach Resonant only through channels, where identity is resolved from principals
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -190,12 +191,16 @@ def job_guard(
         typer.echo(f"job-guard: cannot confirm unpaused ({e}); not running {job}", err=True)
         raise typer.Exit(EX_TEMPFAIL) from None
     if paused:
-        with atomic(conn):
+        with contextlib.suppress(sqlite3.Error), atomic(conn):
             audit(conn, "job.skipped_paused", job=job)
         typer.echo(f"job-guard: kill switch engaged; skipping {job}", err=True)
         raise typer.Exit(EX_TEMPFAIL)
-    with atomic(conn):
-        audit(conn, "job.exec", job=job, command=command[0])
+    try:
+        with atomic(conn):
+            audit(conn, "job.exec", job=job, command=command[0])
+    except sqlite3.Error as e:  # no audit trail, no run
+        typer.echo(f"job-guard: cannot write audit ({e}); not running {job}", err=True)
+        raise typer.Exit(EX_TEMPFAIL) from None
     try:
         os.execvp(command[0], command)  # noqa: S606 - command comes from an approved manifest
     except OSError as e:

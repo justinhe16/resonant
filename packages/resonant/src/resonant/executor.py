@@ -25,6 +25,7 @@ Phase 2 adds Keychain secret injection and redaction.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import sqlite3
@@ -35,7 +36,7 @@ from typing import Any
 
 from resonant.gate.types import Allow, Decision, Intent, TokenVerifier
 from resonant.store.audit import audit
-from resonant.store.db import atomic, now_iso
+from resonant.store.db import atomic, now_iso, transaction
 from resonant_sdk import Effect
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -82,6 +83,9 @@ class Executor:
     async def execute(
         self, intent: Intent, decision: Decision, *, step_no: int, call_index: int = 0
     ) -> ToolResult:
+        if self.conn.in_transaction:
+            # The 'started' row must be durable before the side effect runs.
+            raise RuntimeError("Executor.execute must not be called inside a transaction")
         if not isinstance(decision, Allow) or not self.verifier.consume(
             decision.token, intent.hash
         ):
@@ -90,7 +94,7 @@ class Executor:
             raise NotAllowedError("executor requires an Allow issued by the gate for this intent")
         key = idempotency_key(intent.task_id, step_no, call_index, intent.hash)
 
-        with atomic(self.conn):
+        with transaction(self.conn):
             row = self.conn.execute(
                 "SELECT status, result FROM executions WHERE idempotency_key = ?", (key,)
             ).fetchone()
@@ -128,7 +132,9 @@ class Executor:
         handler = self.handlers.get((intent.extension, intent.tool))
         if handler is None:
             raise ToolFailed(f"no handler for {intent.extension or 'builtin'}/{intent.tool}")
-        data = await asyncio.wait_for(handler(dict(intent.args)), timeout=intent.spec.timeout_s)
+        data = await asyncio.wait_for(
+            handler(copy.deepcopy(intent.args)), timeout=intent.spec.timeout_s
+        )
         json.dumps(data, allow_nan=False)  # inside the try: an unserializable result counts
         return data
 
@@ -144,7 +150,7 @@ class Executor:
         outcome = replace(
             outcome, duration_ms=int((time.monotonic() - start) * 1000), idempotency_key=key
         )
-        with atomic(self.conn):
+        with transaction(self.conn):
             if not outcome.ambiguous:  # ambiguous rows stay 'started' until resolved
                 self.conn.execute(
                     """UPDATE executions SET status = ?, result = ?, finished_at = ?

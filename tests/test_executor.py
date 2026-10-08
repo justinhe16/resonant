@@ -182,3 +182,13 @@ async def test_handlers_keyed_by_extension(db: sqlite3.Connection, task_id: str)
     i = make(task_id, other)
     res = await ex.execute(i, gate.allow(i), step_no=1)
     assert not res.ok and "no handler for other/label" in (res.error or "")
+
+
+async def test_refuses_inside_transaction(db: sqlite3.Connection, task_id: str) -> None:
+    from resonant.store.db import transaction
+
+    gate = FakeGate()
+    ex = Executor(db, gate, {})
+    i = make(task_id)
+    with pytest.raises(RuntimeError, match="inside a transaction"), transaction(db):
+        await ex.execute(i, gate.allow(i), step_no=1)
