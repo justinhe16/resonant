@@ -1,0 +1,8 @@
+{"text": "what's running right now?", "intent": "job_control"}
+{"text": "status", "intent": "job_control"}
+{"text": "how's the mini doing, memory ok?", "intent": "question"}
+{"text": "kick off a refactor of the auth module in dori and open a PR", "intent": "run_project"}
+{"text": "pause everything", "intent": "job_control"}
+{"text": "what was my pnl yesterday", "intent": "extension:trade-jev"}
+{"text": "why did the dori deploy fail last night?", "intent": "extension:dori"}
+{"text": "remind me what we decided about the retry policy", "intent": "question"}

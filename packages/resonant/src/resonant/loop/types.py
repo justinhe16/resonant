@@ -118,6 +118,10 @@ class StepContext(Protocol):
     Use it for anything a retry must not lose. For example, a Claude runner saves
     ``claude_session_id`` as soon as the session starts, so a crash resumes that session
     instead of starting a duplicate.
+
+    Call it only from the event-loop thread, never via ``asyncio.to_thread``, because it
+    shares the loop's sqlite connection. Returns False if the task is no longer running
+    (e.g. it was cancelled).
     """
 
     def save(
@@ -126,7 +130,7 @@ class StepContext(Protocol):
         checkpoint: dict[str, Any] | None = None,
         claude_session_id: str | None = None,
         worktree_path: str | None = None,
-    ) -> None: ...
+    ) -> bool: ...
 
 
 class Runner(Protocol):

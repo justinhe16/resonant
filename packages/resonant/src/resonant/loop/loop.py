@@ -66,11 +66,11 @@ class _StepContext:
         checkpoint: dict[str, Any] | None = None,
         claude_session_id: str | None = None,
         worktree_path: str | None = None,
-    ) -> None:
+    ) -> bool:
         if checkpoint is not None:
             json.dumps(checkpoint)  # fail inside the runner, not later in the loop
         with transaction(self.conn):
-            repo.save_progress(
+            return repo.save_progress(
                 self.conn,
                 self.task_id,
                 checkpoint=checkpoint,

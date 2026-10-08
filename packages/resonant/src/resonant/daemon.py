@@ -17,8 +17,10 @@ import uvicorn
 
 from resonant.api import DaemonState, create_app
 from resonant.config import Settings
+from resonant.health import Heartbeat, Watchdog, deadman_task, heartbeat_task
 from resonant.loop import Loop, SlotPool
 from resonant.loop.echo import EchoRunner
+from resonant.observability import configure_logging
 from resonant.store.db import open_db, utcnow
 
 log = logging.getLogger(__name__)
@@ -53,6 +55,15 @@ class Daemon:
             )
         )
         self._stop = asyncio.Event()
+        self.heartbeat = Heartbeat()
+
+    def healthy(self) -> bool:
+        """The loop has ticked recently (within 3 ticks, or at least 90s)."""
+        last = self.loop.last_tick
+        if last is None:
+            return False
+        limit = max(3 * self.settings.loop.tick_s, 90.0)
+        return (utcnow() - last).total_seconds() < limit
 
     def stop(self) -> None:
         self._stop.set()
@@ -75,6 +86,16 @@ class Daemon:
         loop_task = asyncio.create_task(self.loop.run(), name="loop")
         server_task = asyncio.create_task(self._serve(), name="api")
         stop_task = asyncio.create_task(self._stop.wait(), name="stop")
+        aux = [asyncio.create_task(heartbeat_task(self.heartbeat), name="heartbeat")]
+        if url := self.settings.health.healthchecks_url:
+            aux.append(
+                asyncio.create_task(
+                    deadman_task(url, self.settings.health.ping_every_s, self.healthy),
+                    name="deadman",
+                )
+            )
+        watchdog = Watchdog(self.heartbeat, self.settings.health.watchdog_stale_s)
+        watchdog.start()
         log.info(
             "resonant daemon started (api %s:%s, dry_run=%s)",
             self.settings.api.host,
@@ -91,6 +112,10 @@ class Daemon:
         self.server.should_exit = True
         self.loop.stop()
         stop_task.cancel()
+        for t in aux:
+            t.cancel()
+        await asyncio.gather(*aux, return_exceptions=True)
+        watchdog.halt()
         results = await asyncio.gather(loop_task, server_task, return_exceptions=True)
         for r in results:
             if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
@@ -102,7 +127,5 @@ class Daemon:
 
 
 def run(settings: Settings) -> int:
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    configure_logging(settings.logs_dir)
     return asyncio.run(Daemon(settings).run())
