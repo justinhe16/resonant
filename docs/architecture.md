@@ -42,7 +42,8 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Model client (Ollama native or OpenAI-compatible), `resonant model probe/bench` | `resonant/models/`, `resonant/cli.py` | Phase 1 |
 | Router: deterministic fast path (slash commands, anchored keywords, owner-only `/kill`), one-call LLM intent label with stable prompt prefixes, principal-filtered toolsets | `resonant/router/` | Phase 1 |
 | Local runner | — | Phase 1 |
-| iMessage channel, Slack notifier, router evals | — | Phase 1 |
+| iMessage channel, Slack notifier | — | Phase 1 |
+| Router evals: `resonant eval router` (production `classify`, accuracy, confusion, p50/p95 per path; texts only in terminal output) | `resonant/evals/`, `evals/README.md` | Phase 1 |
 | Real gate (L0–L3, text-reply approvals, veto, kill switch), Keychain injection | — | Phase 2 |
 | Extension manager (`ext add`, CLI/MCP tools, scheduler, critical-job plists) | — | Phase 3 |
 | Dashboard (Vite + React + shadcn, streak look) | — | Phase 4 |
