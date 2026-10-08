@@ -3,6 +3,8 @@
 from resonant.gate.dry_run import DryRunGate
 from resonant.gate.types import (
     Allow,
+    ApprovalBatch,
+    ApprovalReply,
     ApprovalResolution,
     Decision,
     Deny,
@@ -10,13 +12,18 @@ from resonant.gate.types import (
     Gate,
     Intent,
     NeedsApproval,
+    PendingApproval,
+    ResolvedApproval,
     ResolveResult,
+    TokenVerifier,
     Veto,
-    intent_hash,
+    canonical_json,
 )
 
 __all__ = [
     "Allow",
+    "ApprovalBatch",
+    "ApprovalReply",
     "ApprovalResolution",
     "Decision",
     "Deny",
@@ -25,7 +32,10 @@ __all__ = [
     "Gate",
     "Intent",
     "NeedsApproval",
+    "PendingApproval",
     "ResolveResult",
+    "ResolvedApproval",
+    "TokenVerifier",
     "Veto",
-    "intent_hash",
+    "canonical_json",
 ]

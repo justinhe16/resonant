@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
-from resonant.store.db import now_iso, transaction
+from resonant.store.db import atomic, now_iso
 from resonant_sdk import new_id
 
 
@@ -38,7 +38,7 @@ def span(
     **attrs: Any,
 ) -> Generator[Span]:
     s = Span(id=new_id(), trace_id=trace_id, attrs=dict(attrs))
-    with transaction(conn):
+    with atomic(conn):
         conn.execute(
             """INSERT INTO spans (id, trace_id, parent_id, task_id, name, attrs, started_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -52,7 +52,8 @@ def span(
         s.set(error=f"{type(e).__name__}: {e}")
         raise
     finally:
-        with transaction(conn):
+        # Safe inside a caller's transaction too: atomic() nests via SAVEPOINT.
+        with atomic(conn):
             conn.execute(
                 "UPDATE spans SET status = ?, attrs = ?, ended_at = ? WHERE id = ?",
                 (status, json.dumps(s.attrs, default=str), now_iso(), s.id),

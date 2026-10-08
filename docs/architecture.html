@@ -527,11 +527,13 @@ resonant ext list | remove | reload`,
   gate:{label:"Policy gate (L0–L3)", phase:"2", status:"partial",
     what:"Decides each intent by reversibility × blast radius. Dry-run mode logs instead of executing. The Gate protocol and DryRunGate (permissions, L0 reads allowed, everything else logged as DryRun) are built; the full gate is Phase 2.",
     iface:`Intent{task_id, principal, extension, tool, args, effect, level,
-       scope_id?, intent_hash = sha256(canonical(tool, args))}
+       scope_id?, hash = sha256(canonical(tool, extension, args, effect, level, commit))}
+Intent.for_tool(spec, …): effect/level come from the registered ToolSpec
 
-gate.evaluate(intent) -> Allow | Deny(reason) | NeedsApproval(id, approvers)
+gate.evaluate(intent) -> Allow(token) | Deny(reason) | NeedsApproval(id, code, …)
                        | Veto(until) | DryRun
-gate.resolve(approval_id, approved, actor)   # actor ∈ approvers ∧ can(approve)
+gate.consume(token, intent.hash)        # single-use; executor checks it before running
+gate.resolve_reply(ApprovalReply)       # binds text replies by code / batch
 
 L0 act silently · L1 draft → approve · L2 act after veto window · L3 act, then report`,
     inv:["The level comes from the tool's registration","pay is always L1","dry_run is on by default in config"],
@@ -552,8 +554,8 @@ resonant job-guard --job ext/id -- cmd…   # exit 75 if paused (fails closed)`,
     inv:["Owner-only (admin)","/kill on the deterministic fast path, never through the LLM"],
     files:["packages/resonant/src/resonant/killswitch.py","packages/resonant/src/resonant/cli.py (kill, resume, job-guard)"]},
   executor:{label:"Executor", phase:"2", status:"partial",
-    what:"The only component that runs side effects. It checks that the decision matches the intent hash, runs the tool in a subprocess with secrets injected as environment variables, and audits before and after. The idempotency ledger is built; secret injection is Phase 2. A key that started but never finished is reported as ambiguous, not re-run.",
-    iface:`idempotency_key = sha256(task_id, step_no, intent_hash)
+    what:"The only component that runs side effects. It first consumes the gate's single-use Allow token for this exact intent hash, so a forged or reused Allow is refused. It runs the registered handler for (extension, tool) with that tool's timeout and audits before and after. For writes and payments, a timeout, cancel or unexpected error is recorded as ambiguous and never re-run automatically. Keychain secret injection arrives in Phase 2.",
+    iface:`idempotency_key = sha256(task_id, step_no, call_index, intent_hash)
 executions(idempotency_key PK, status started|succeeded|failed, result)
 execute(intent, decision) -> ToolResult{ok, data, error, duration_ms}`,
     inv:["A key that already succeeded returns its recorded result instead of running again","Secrets are redacted in the audit log","Every action is written to the audit log"],

@@ -131,34 +131,62 @@ principals:
   - Everyone else can do only what their grants list.
 - The local CLI acts as the owner (`owner:cli`).
 
+## Tool registry: `resonant.tools.ToolRegistry`
+
+`register(spec)`, `get(extension, name)`, `specs(extension=None)`. Specs are keyed by `(extension, name)`, and builtins use `extension=None`, so two extensions may each define a tool with the same name. The registry is the only source of a tool's effect and level.
+
 ## Gate: `resonant.gate`
 
 ```python
-Intent(task_id, principal, extension, tool, args, effect, level, commit=False, scope_id=None, trace_id=None)
-    .hash = sha256(canonical_json({"tool", "args", "extension"}))
+Intent.for_tool(spec: ToolSpec, *, task_id, principal, args, scope_id=None, trace_id=None)
+    # effect / level / commit / tool / extension are read from spec: callers can't set them
+    # args are validated with canonical_json and deep-copied
+    .hash  # recomputed on every access:
+           # sha256(canonical_json({tool, extension, args, effect, level, commit}))
+canonical_json(value)  # sorted keys; rejects non-str keys, NaN/Infinity, non-JSON types
 
-Decision = Allow(approval_id=None) | Deny(reason) | NeedsApproval(approval_id, code, approvers, expires_at)
-         | Veto(approval_id, until) | DryRun(would)
+Decision = Allow(token, approval_id=None)
+         | Deny(reason)
+         | NeedsApproval(approval_id, code, approvers, expires_at, summary, effect, level, require_code)
+         | Veto(approval_id, until, summary)
+         | DryRun(would)
 
-class Gate(Protocol):
+class Gate(TokenVerifier, Protocol):
     def evaluate(self, intent: Intent) -> Decision: ...
-    def resolve(self, resolution: ApprovalResolution) -> ResolveResult: ...
+    def consume(self, token: str, intent_hash: str) -> bool: ...   # single-use; executor calls it
+    def pending_for(self, principal: str) -> Sequence[PendingApproval]: ...
+    def open_batch(self, principal: str, approval_ids: Sequence[str]) -> ApprovalBatch: ...
+    def resolve(self, resolution: ApprovalResolution) -> ResolveResult: ...   # by id: button / CLI
+    def resolve_reply(self, reply: ApprovalReply) -> ResolveResult: ...      # text reply: gate binds it
 ```
 
 Evaluation order (Phase 2):
-1. **Permission:** if `can(principal, "request", extension)` is false, Deny.
-2. **Kill switch:** if `autonomy=off`, everything above L0 needs approval.
-3. **Level:**
+1. **Registration:** if `registry.get(extension, tool) != intent.spec`, Deny. An intent can't claim an effect or level its tool wasn't registered with.
+2. **Permission:** if `can(principal, "request", extension)` is false, Deny.
+3. **Kill switch:** if `autonomy=off`, everything above L0 needs approval.
+4. **Level:**
    - L0: Allow.
    - L1: NeedsApproval.
    - L2: Veto, and the task waits with `wait_reason=veto` and `wake_at=until`.
    - L3: Allow, then report.
    - Inside an approved computer-use scope, `commit` tools still need approval and get a screenshot.
-4. **dry_run:** anything that isn't a plain L0 read becomes DryRun.
+5. **dry_run:** anything that isn't an L0 read becomes DryRun.
 
-Every evaluation writes an audit row. Phase 0 ships `DryRunGate`, which does permission checks, allows L0 reads, and returns DryRun for everything else.
+**Allow tokens.** Every `Allow` carries a single-use token that the gate issued for one intent hash. After an approval, the runner re-evaluates the intent on wake and gets an `Allow(token, approval_id)`. Tokens live in memory, so after a restart the runner simply re-evaluates.
 
-Kill switch (`resonant.killswitch`, owner-only): `engage` sets `autonomy="off"` and `paused=true` and writes an audit row; `release` reverses both. Critical-job LaunchAgents run `resonant job-guard --job <ext>/<id> -- <cmd>`, which fails closed: it exits with code 75 and doesn't run the command when paused or when the flag can't be read. On-call autonomy checks `paused` before acting.
+Every evaluation writes an audit row. Phase 0 ships `DryRunGate`, which checks registration and permissions, allows L0 reads with a token, and returns DryRun for everything else. It has no approvals.
+
+**Transactions.** `transaction()` is not reentrant. Helpers that write bookkeeping (audit, spans, gate, executor, kill switch) use `atomic()`, which joins an enclosing transaction via SAVEPOINT. So they are safe to call standalone or inside a caller's transaction.
+
+Kill switch (`resonant.killswitch`, owner-only): `engage` sets `autonomy="off"` and `paused=true`; `release` reverses both. Both write an audit row that includes the prior state. Migration 002 writes explicit default rows.
+
+Critical-job LaunchAgents run `resonant job-guard --job <ext>/<id> -- <cmd>`. It **fails closed**:
+- It never creates or migrates the store.
+- It opens it with `open_existing`.
+- It exits 75 if the store is missing or its schema is behind, if the `paused` row is missing or isn't a boolean, or if paused is true.
+- Before exec it audits `job.exec`. If exec fails, it audits `job.exec_failed` and exits 127.
+
+On-call autonomy checks `paused` before acting.
 
 ## Approvals: binding, codes, and the classifier
 
@@ -191,28 +219,44 @@ Request (`resonant.gate.codes`):
 
 **Comments:** `yes with comments: …` approves and appends a `human_input` event to the task, which the runner treats as a constraint.
 
-**Audit:**
+**Gate API for replies.** Channels don't pick approval ids. They pass an `ApprovalReply` and the gate binds it:
+
 ```python
-ApprovalResolution(approval_id, approved, actor, actor_identity, path: parser|classifier|button|cli,
-                   raw_reply, confidence, comments)
+ApprovalReply(actor, actor_identity, channel, raw_text, decision: approve|deny,
+              path: parser|classifier, code=None, all_in_batch=False, batch_id=None,
+              confidence=None, comments=None)
+ApprovalResolution(approval_id, approved, actor, actor_identity, path: button|cli, comments=None)
+ResolveResult(ok, reason, resolved: tuple[ResolvedApproval(approval_id, task_id, intent_hash, approved), ...])
+PendingApproval(approval_id, code, task_id, summary, effect, level, require_code, expires_at)
+ApprovalBatch(batch_id, principal, approval_ids, created_at)   # stored in approval_batches
 ```
-Every field goes to the audit log. Approvals carry `expires_at`, and there is at most one pending approval per (task, intent hash).
+
+`ResolveResult.resolved` tells the caller which tasks to wake.
+
+**Audit.** Every field of the reply goes to the audit log: the raw text, the path, the confidence, the actor identity, the code, and the batch id. Approvals carry `expires_at`. There is at most one pending approval per (task, intent hash), and pending codes are unique.
 
 ## Executor: `resonant.executor`
 
 ```python
-idempotency_key(task_id, step_no, intent_hash) -> str
-Executor(conn, handlers: {tool: async (args) -> dict}).execute(intent, decision: Allow, *, step_no) -> ToolResult
-ToolResult(ok, data, error, duration_ms, replayed, ambiguous)
+idempotency_key(task_id, step_no, call_index, intent_hash) -> str
+Executor(conn, verifier: TokenVerifier, handlers: {(extension | None, tool): async (args) -> dict})
+    .execute(intent, decision, *, step_no, call_index=0) -> ToolResult
+    .resolve_ambiguous(key, *, succeeded, actor, result=None, note=None) -> bool   # audited
+ToolResult(ok, data, error, duration_ms, replayed, ambiguous, idempotency_key)
+class ToolFailed(Exception)   # raise from a handler: "definitely did not take effect"
 ```
 
-- It requires `Allow`; anything else raises `NotAllowedError`.
-- What happens to a key depends on its row in `executions`:
+- **Token check.** The decision must be `Allow`, and `verifier.consume(token, intent.hash)` must be true. Otherwise it raises `NotAllowedError` and audits `executor.refused`. A forged Allow, a reused token, or a token issued for different args is refused.
+- **What happens to a key**, by its row in `executions`:
   - `succeeded`: the recorded result is returned (`replayed=True`).
-  - `started` but never finished: `ambiguous=True`, and the tool is not re-run.
-  - `failed`: it may be retried.
-- An audit row is written before and after each call.
-- Phase 2 makes the executor the only reader of Keychain secrets, injected as environment variables for the tool process only, with values redacted from audit rows.
+  - `started`: the outcome is unknown, so it is **ambiguous** and is never re-run. It stays that way until `resolve_ambiguous` is called.
+  - `failed`: a definite failure; it may be retried.
+- **Outcomes:**
+  - Reads: any error is a definite failure.
+  - Write and pay: only `ToolFailed` is definite. A timeout (`spec.timeout_s`), cancellation, unexpected exception, or unserializable result is ambiguous.
+- **Calls in one step:** use a distinct `call_index` for each call within a step. Two calls with the same index and intent are deduped by design.
+- **Audit:** `executor.start`, `executor.result`, `executor.ambiguous`, `executor.replayed`, `executor.refused`, and `executor.ambiguous_resolved` are all written.
+- Phase 2 makes the executor the only reader of Keychain secrets. They are injected as environment variables for the tool process only, and their values are redacted in audit rows.
 
 ## Channel: `resonant.gateway.channel`
 
@@ -253,6 +297,12 @@ Every adapter must:
 
 - `with span(conn, name, trace_id=..., task_id=..., parent_id=..., **attrs) as s: s.set(...)` writes a row to `spans` with status and timing.
 - Logs are JSON lines in `~/.resonant/logs/resonant.jsonl`, rotated at 20MB × 5. Standard-library loggers flow through structlog.
+- `httpx` and `httpcore` are kept at WARNING because request URLs can carry credentials, such as the healthchecks ping UUID.
+
+## CLI exit codes
+
+- `resonant status`: 0 when the daemon is up, 1 when it is down (in both text and `--json` modes). It never creates the store.
+- `resonant job-guard`: 75 when paused or when the state is unknown, 127 when exec fails, 2 when no command is given.
 
 ## Local API
 

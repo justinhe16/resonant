@@ -58,11 +58,12 @@ class Daemon:
         self.heartbeat = Heartbeat()
 
     def healthy(self) -> bool:
-        """The loop has ticked recently (within 3 ticks, or at least 90s)."""
-        last = self.loop.last_tick
-        if last is None:
-            return False
+        """The loop has ticked recently (within 3 ticks, or at least 90s).
+
+        A startup grace period of the same length avoids sending /fail on every boot.
+        """
         limit = max(3 * self.settings.loop.tick_s, 90.0)
+        last = self.loop.last_tick or self.state.started_at
         return (utcnow() - last).total_seconds() < limit
 
     def stop(self) -> None:

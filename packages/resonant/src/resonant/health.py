@@ -70,7 +70,8 @@ class Watchdog(threading.Thread):
 
 
 def _hard_exit() -> None:
-    logging.shutdown()
+    # Don't flush logging: a stalled thread may hold a handler lock. Write straight to fd 2.
+    os.write(2, b"resonant watchdog: event loop stalled; exiting for launchd restart\n")
     os._exit(1)
 
 

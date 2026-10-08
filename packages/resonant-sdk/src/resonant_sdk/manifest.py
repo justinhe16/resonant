@@ -15,6 +15,7 @@ import re
 import string
 from pathlib import Path
 from typing import Any, Literal, Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -24,6 +25,8 @@ from resonant_sdk.tool import Effect, Level, ToolSpec
 SLUG = r"^[a-z][a-z0-9-]{0,47}$"
 _CRON_FIELD = re.compile(r"^[A-Za-z0-9*/,\-]+$")
 _DURATION = re.compile(r"^\d+[smh]$")
+_IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
+_EVENT = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 
 ArgType = Literal["string", "integer", "number", "boolean"]
 _JSON_TYPES: dict[str, str] = {
@@ -44,6 +47,16 @@ class Job(_Strict):
     tz: str | None = None
     critical: bool = False  # True: gets its own LaunchAgent and fires even if the daemon is down
     run: str
+
+    @field_validator("tz")
+    @classmethod
+    def _tz(cls, v: str | None) -> str | None:
+        if v is not None:
+            try:
+                ZoneInfo(v)
+            except (ZoneInfoNotFoundError, ValueError) as e:
+                raise ValueError(f"unknown timezone {v!r}") from e
+        return v
 
     @field_validator("schedule")
     @classmethod
@@ -68,9 +81,17 @@ class CliTool(_Strict):
 
     @model_validator(mode="after")
     def _placeholders_declared(self) -> Self:
-        used = {name for _, name, _, _ in string.Formatter().parse(self.run) if name}
+        used: set[str] = set()
+        for _, name, spec, conversion in string.Formatter().parse(self.run):
+            if name is None:
+                continue
+            if not _IDENT.match(name) or spec or conversion:
+                raise ValueError(f"placeholder {{{name}}} must be a plain arg name like {{date}}")
+            used.add(name)
         if missing := used - set(self.args):
             raise ValueError(f"run uses undeclared args: {sorted(missing)}")
+        if bad := [a for a in self.args if not _IDENT.match(a)]:
+            raise ValueError(f"arg names must be identifiers: {bad}")
         return self
 
 
@@ -92,8 +113,15 @@ class McpServer(_Strict):
 
 
 class Notify(_Strict):
-    on: tuple[str, ...]
+    on: tuple[str, ...] = Field(min_length=1)
     channel: Literal["imessage", "slack"] = "imessage"
+
+    @field_validator("on")
+    @classmethod
+    def _events(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        if bad := [e for e in v if not _EVENT.match(e)]:
+            raise ValueError(f"event names must be lowercase slugs: {bad}")
+        return v
 
 
 class Health(_Strict):
@@ -181,11 +209,22 @@ class Manifest(BaseModel):
 
 
 class _StrictBoolLoader(yaml.SafeLoader):
-    """SafeLoader that treats only true/false as booleans.
+    """SafeLoader that treats only true/false as booleans and rejects duplicate keys.
 
     YAML 1.1 also reads on/off/yes/no as booleans, which would turn ``notify: {on: [...]}``
-    into ``{True: [...]}``.
+    into ``{True: [...]}``. Duplicate keys normally keep the last value silently.
     """
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        seen: set[Any] = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)  # pyright: ignore[reportUnknownMemberType]
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    None, None, f"duplicate key {key!r}", key_node.start_mark
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
 
 
 _StrictBoolLoader.yaml_implicit_resolvers = {

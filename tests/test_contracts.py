@@ -191,3 +191,25 @@ def test_shipped_example_extension_is_valid() -> None:
     m = load_manifest(repo / "extensions/example/resonant.yaml")
     levels = {s.name: s.effective_level for s in m.tool_specs()}
     assert levels == {"get_time": Level.L0, "write_note": Level.L3}
+
+
+@pytest.mark.parametrize("run", ["./x {}", "./x {0}", "./x {date!r}", "./x {date:>10}"])
+def test_placeholders_must_be_plain_names(run: str) -> None:
+    with pytest.raises(ValidationError, match="plain arg name"):
+        load(TRADE_JEV, tools={"x": {"run": run, "effect": "read", "args": {"date": "string"}}})
+
+
+def test_duplicate_yaml_keys_rejected() -> None:
+    import yaml as pyyaml
+
+    with pytest.raises(pyyaml.YAMLError, match="duplicate key"):
+        parse_yaml("name: a\nname: b\n")
+
+
+def test_job_tz_and_notify_events_validated() -> None:
+    with pytest.raises(ValidationError, match="timezone"):
+        load(TRADE_JEV, jobs=[{"id": "a", "schedule": "0 * * * *", "tz": "Mars/X", "run": "./a"}])
+    with pytest.raises(ValidationError):
+        load(TRADE_JEV, notify={"on": []})
+    with pytest.raises(ValidationError, match="slugs"):
+        load(TRADE_JEV, notify={"on": ["Fill Event"]})

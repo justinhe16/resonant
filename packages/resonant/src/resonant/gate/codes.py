@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import unicodedata
 from collections.abc import Collection
 
 # No look-alikes: no 0/O, 1/I/L, 5/S, 2/Z, 8/B.
@@ -27,13 +28,28 @@ def new_code(pending: Collection[str]) -> str:
     return secrets.choice(free)
 
 
+# After normalization, any letter followed by a digit, optionally separated by spaces or
+# punctuation, could pass for a code like "A7". Those are masked.
+_CODE_LIKE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][\s\-_.:/]*[0-9](?![0-9])")
+
+
 def sanitize_external(text: str, max_len: int = 60) -> str:
-    """Make an untrusted string safe to embed in an approval summary."""
-    flat = re.sub(r"\s+", " ", text).strip()
-    flat = CODE_PATTERN.sub("[?]", flat)
-    flat = flat.replace('"', "'")
+    """Make an untrusted string safe to embed in an approval summary.
+
+    1. Apply NFKC normalization (fullwidth and compatibility forms become ASCII).
+    2. Keep printable ASCII only. Zero-width characters, bidi overrides, control and escape
+       sequences, and look-alike scripts (e.g. Cyrillic) are dropped.
+    3. Remove brackets and mask code-like tokens, so the string can't fake "[K4] ...".
+    4. Collapse whitespace, swap double quotes for single quotes, truncate, and wrap the
+       result in quotes.
+    """
+    norm = unicodedata.normalize("NFKC", text)
+    ascii_only = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in norm)
+    no_brackets = re.sub(r"[\[\]{}<>]", " ", ascii_only)
+    masked = _CODE_LIKE.sub("?", no_brackets)
+    flat = re.sub(r"\s+", " ", masked).strip().replace('"', "'")
     if len(flat) > max_len:
-        flat = flat[: max_len - 1].rstrip() + "…"
+        flat = flat[: max_len - 3].rstrip() + "..."
     return f'"{flat}"'
 
 

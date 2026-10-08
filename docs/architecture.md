@@ -36,7 +36,8 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | CLI: `daemon`, `status`, `kill`, `resume`, `job-guard` | `resonant/cli.py` | Phase 0 ✅ |
 | Health: watchdog thread, dead-man ping | `resonant/health.py` | Phase 0 ✅ |
 | Observability: JSON logs, spans | `resonant/observability/` | Phase 0 ✅ |
-| Contracts: Event, ToolSpec, Manifest, Gate, Channel, Executor | `resonant_sdk/`, `resonant/gate/`, `resonant/gateway/`, `resonant/executor.py` | Phase 0 ✅ (DryRunGate) |
+| Contracts: Event, ToolSpec, Manifest, ToolRegistry, Gate (tokens, reply binding), Channel, Executor | `resonant_sdk/`, `resonant/tools/`, `resonant/gate/`, `resonant/gateway/`, `resonant/executor.py` | Phase 0 ✅ (DryRunGate) |
+| Extension authoring guide + `resonant ext validate` | `docs/extensions.md`, `resonant/cli.py` | Phase 0 ✅ |
 | Model client (Ollama, OpenAI-compatible), router, local runner | — | Phase 1 |
 | iMessage channel, Slack notifier, router evals | — | Phase 1 |
 | Real gate (L0–L3, text-reply approvals, veto, kill switch), Keychain injection | — | Phase 2 |

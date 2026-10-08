@@ -49,6 +49,11 @@ def configure_logging(logs_dir: Path, *, level: int = logging.INFO, stderr: bool
         )
         handlers.append(console)
     root = logging.getLogger()
+    for old in root.handlers:
+        old.close()
     root.handlers = handlers
     root.setLevel(level)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    # httpx logs request URLs at INFO. The healthchecks ping URL works as a credential.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)

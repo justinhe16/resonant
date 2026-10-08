@@ -10,7 +10,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import httpx
 import typer
@@ -23,7 +23,7 @@ from resonant.extensions.checks import approver_errors
 from resonant.principals import load_principals
 from resonant.status import collect_status
 from resonant.store.audit import audit
-from resonant.store.db import open_db, transaction
+from resonant.store.db import StoreUnavailableError, atomic, open_db, open_existing
 from resonant_sdk import load_manifest
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -95,38 +95,55 @@ def daemon_logs(
 # --- status & control ------------------------------------------------------------------
 
 
+_STATUS_KEYS = {"version", "uptime_s", "last_tick", "dry_run", "autonomy", "paused", "tasks"}
+
+
 def _fetch_status(settings: Settings) -> dict[str, Any] | None:
     url = f"http://{settings.api.host}:{settings.api.port}/api/status"
     try:
         resp = httpx.get(url, timeout=2)
         resp.raise_for_status()
-        data: dict[str, Any] = resp.json()
-        return data
-    except httpx.HTTPError:
+        data = resp.json()
+    except (httpx.HTTPError, ValueError):
         return None
+    if not isinstance(data, dict) or not set(data) >= _STATUS_KEYS:  # pyright: ignore[reportUnknownArgumentType]
+        return None  # something else is listening on the port
+    return cast(dict[str, Any], data)
 
 
 @app.command()
 def status(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
-    """Show daemon health, task counts, and the kill-switch state."""
+    """Show daemon health, task counts, and the kill-switch state. Exit 1 if the daemon is down."""
     settings = load_settings()
     live = _fetch_status(settings)
-    data = live or collect_status(_db(settings), settings)
+    data: dict[str, Any]
+    if live is not None:
+        data = live
+    else:
+        try:
+            data = collect_status(open_existing(settings.db_path, readonly=True), settings)
+        except StoreUnavailableError as e:
+            data = {"error": str(e), "tasks": {}, "waiting": {}}
     data["daemon"] = "up" if live else "down"
     data["launchd_loaded"] = launchd.is_loaded(launchd.DAEMON_LABEL)
+    up = live is not None
     if as_json:
         typer.echo(json.dumps(data, indent=2))
-        return
-    up = data["daemon"] == "up"
+        raise typer.Exit(0 if up else 1)
     typer.echo(f"daemon      {'up' if up else 'DOWN'} (launchd: {data['launchd_loaded']})")
+    if "error" in data:
+        typer.echo(f"store       {data['error']}")
+        raise typer.Exit(1)
     if up:
         typer.echo(f"uptime      {data['uptime_s']}s, last tick {data['last_tick']}")
     typer.echo(f"autonomy    {data['autonomy']}{'  (PAUSED)' if data['paused'] else ''}")
     typer.echo(f"dry_run     {data['dry_run']}")
-    tasks = ", ".join(f"{k}={v}" for k, v in sorted(data["tasks"].items())) or "none"
+    task_counts = cast(dict[str, int], data["tasks"])
+    waiting = cast(dict[str, int], data.get("waiting") or {})
+    tasks = ", ".join(f"{k}={v}" for k, v in sorted(task_counts.items())) or "none"
     typer.echo(f"tasks       {tasks}")
-    if data["waiting"]:
-        typer.echo("waiting     " + ", ".join(f"{k}={v}" for k, v in data["waiting"].items()))
+    if waiting:
+        typer.echo("waiting     " + ", ".join(f"{k}={v}" for k, v in waiting.items()))
     if not up:
         raise typer.Exit(1)
 
@@ -158,24 +175,34 @@ def job_guard(
     """Run a critical job's command unless the kill switch is engaged.
 
     Critical-job LaunchAgents call `resonant job-guard --job <ext>/<id> -- <command...>`.
-    Fails closed: if the paused flag can't be read, the job does not run.
+    It fails closed: if the store is missing, its schema is behind, or the paused flag can't
+    be read, the job does NOT run (exit 75). It never creates or migrates the database.
     """
     command = list(ctx.args)
     if not command:
         typer.echo("job-guard: no command given", err=True)
         raise typer.Exit(2)
+    settings = load_settings()
     try:
-        conn = _db(load_settings())
+        conn = open_existing(settings.db_path)
         paused = killswitch.is_paused(conn)
-    except Exception as e:
-        typer.echo(f"job-guard: cannot read paused flag ({e}); not running {job}", err=True)
+    except (StoreUnavailableError, killswitch.PausedStateUnknownError, sqlite3.Error) as e:
+        typer.echo(f"job-guard: cannot confirm unpaused ({e}); not running {job}", err=True)
         raise typer.Exit(EX_TEMPFAIL) from None
-    with transaction(conn):
-        audit(conn, "job.skipped_paused" if paused else "job.started", job=job)
     if paused:
+        with atomic(conn):
+            audit(conn, "job.skipped_paused", job=job)
         typer.echo(f"job-guard: kill switch engaged; skipping {job}", err=True)
         raise typer.Exit(EX_TEMPFAIL)
-    os.execvp(command[0], command)  # noqa: S606 - command comes from an approved manifest
+    with atomic(conn):
+        audit(conn, "job.exec", job=job, command=command[0])
+    try:
+        os.execvp(command[0], command)  # noqa: S606 - command comes from an approved manifest
+    except OSError as e:
+        with atomic(conn):
+            audit(conn, "job.exec_failed", job=job, error=str(e))
+        typer.echo(f"job-guard: cannot exec {command[0]}: {e}", err=True)
+        raise typer.Exit(127) from None
 
 
 # --- extensions ------------------------------------------------------------------------

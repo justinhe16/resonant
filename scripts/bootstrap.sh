@@ -44,13 +44,15 @@ PYTHON_REAL="$(cd "$REPO" && uv run python -c 'import os, sys; print(os.path.rea
 uv run pre-commit install >/dev/null 2>&1 || true
 
 step "Runtime home: $HOME_DIR"
+if [[ ! -d "$HOME_DIR" ]]; then
+  mkdir -p "$HOME_DIR" && chmod 700 "$HOME_DIR"   # only when we create it
+fi
 mkdir -p "$HOME_DIR/logs" "$HOME_DIR/evals"
-chmod 700 "$HOME_DIR"
 seed() {  # seed <example> <target>: copy an example config unless the target exists
   if [[ -e "$2" ]]; then
     echo "keeping existing $2"
   else
-    cp "$1" "$2" && chmod 600 "$2" && echo "created $2 (edit it)"
+    install -m 600 "$1" "$2" && echo "created $2 (edit it)"
   fi
 }
 seed "$REPO/config/resonant.example.yaml" "$HOME_DIR/config.yaml"

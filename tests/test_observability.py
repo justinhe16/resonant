@@ -33,3 +33,18 @@ def test_json_logs(tmp_path: Path) -> None:
     rec = json.loads(line)
     assert rec["event"] == "hello world" and rec["level"] == "info"
     assert rec["logger"] == "resonant.test"
+
+
+def test_span_inside_caller_transaction(db: sqlite3.Connection) -> None:
+    from resonant.store.db import transaction
+
+    with (
+        pytest.raises(KeyError, match="original"),
+        transaction(db),
+        span(db, "inner", trace_id="tr"),
+    ):
+        raise KeyError("original")  # must not be masked by span bookkeeping
+    with transaction(db), span(db, "ok", trace_id="tr"):
+        pass
+    names = [r["name"] for r in db.execute("SELECT name FROM spans")]
+    assert names == ["ok"]  # the failed span rolled back with its transaction

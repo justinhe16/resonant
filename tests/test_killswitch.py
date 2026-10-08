@@ -22,7 +22,36 @@ def test_kill_and_resume(resonant_home: Path) -> None:
     assert actions == ["killswitch.engage", "killswitch.release"]
 
 
+def test_job_guard_fails_closed_without_store(
+    resonant_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executed: list[list[str]] = []
+    monkeypatch.setattr(os, "execvp", lambda f, a: executed.append(list(a)))  # pyright: ignore[reportUnknownLambdaType, reportUnknownArgumentType]
+    res = CliRunner().invoke(app, ["job-guard", "--job", "x/y", "--", "echo", "RAN"])
+    assert res.exit_code == 75 and executed == []
+    assert not (resonant_home / "resonant.db").exists()  # never creates a store
+
+
+def test_job_guard_fails_closed_on_missing_flag(
+    resonant_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = open_db(resonant_home / "resonant.db")
+    conn.execute("DELETE FROM kv WHERE key = 'paused'")
+    res = CliRunner().invoke(app, ["job-guard", "--job", "x/y", "--", "echo", "RAN"])
+    assert res.exit_code == 75
+
+
+def test_job_guard_exec_failure_audited(resonant_home: Path) -> None:
+    open_db(resonant_home / "resonant.db")
+    res = CliRunner().invoke(app, ["job-guard", "--job", "x/y", "--", "/nonexistent/cmd"])
+    assert res.exit_code == 127
+    conn = open_db(resonant_home / "resonant.db")
+    acts = [r["action"] for r in conn.execute("SELECT action FROM audit_log ORDER BY id")]
+    assert acts == ["job.exec", "job.exec_failed"]
+
+
 def test_job_guard(resonant_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    open_db(resonant_home / "resonant.db")
     executed: list[list[str]] = []
 
     def fake_execvp(file: str, args: list[str]) -> None:
@@ -49,8 +78,13 @@ def test_status_when_daemon_down(resonant_home: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr(launchd, "is_loaded", not_loaded)
     monkeypatch.setattr(cli, "_fetch_status", no_live_status)
     result = CliRunner().invoke(app, ["status"])
-    assert result.exit_code == 1
-    assert "DOWN" in result.output and "dry_run     True" in result.output
+    assert result.exit_code == 1 and "DOWN" in result.output
+    assert "does not exist" in result.output  # no store yet: reported, not created
+    assert not (resonant_home / "resonant.db").exists()
+    open_db(resonant_home / "resonant.db")
+    result = CliRunner().invoke(app, ["status"])
+    assert result.exit_code == 1 and "dry_run     True" in result.output
+    assert CliRunner().invoke(app, ["status", "--json"]).exit_code == 1
 
 
 def test_ext_validate(resonant_home: Path) -> None:
