@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Env / secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Local config & state (only *.example configs are committed)
+config/*.yaml
+!config/*.example.yaml
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Runtime artifacts (runtime state defaults to ~/.resonant/ anyway)
+logs/
+traces/
+recordings/
+screenshots/
+worktrees/
+tmp/
+
+# Models
+models/
+*.gguf
+*.safetensors
+
+# Dashboard build
+node_modules/
+
+# OS / editor / local agent settings
+.DS_Store
+.idea/
+.vscode/
+.claude/settings.local.json
