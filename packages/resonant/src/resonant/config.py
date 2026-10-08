@@ -110,6 +110,11 @@ class IMessageConfig(_Section):
     poll_s: float = Field(default=2.0, gt=0)
     inbound_per_minute: int = Field(default=120, ge=1)  # per principal; excess is dropped
     max_body_chars: int = Field(default=4000, ge=1)  # longer bodies are truncated
+    # Outbound (resonant.gateway.imessage.channel): per-principal token bucket.
+    outbound_per_minute: int = Field(default=60, ge=1)
+    # Optional principal -> handle to send to. It must be one of that principal's
+    # `imessage:` identities in principals.yaml; otherwise the first identity is used.
+    preferred_handles: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("db_path")
     @classmethod

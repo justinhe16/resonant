@@ -95,7 +95,7 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 
 - **Watchdog.** An asyncio heartbeat beats every second, and a separate thread calls `os._exit(1)` if it goes stale. launchd then restarts the daemon.
 - **Dead-man switch.** It pings healthchecks.io while the loop is ticking and sends `/fail` when it isn't. A whole-process freeze (SIGSTOP), a power cut, or a reboot waiting at the FileVault login all stop the pings, and healthchecks.io alerts.
-- **iMessage self-test (Phase 1).** It runs at startup and alerts through Slack if AppleScript or the `chat.db` schema broke.
+- **iMessage self-test (Phase 1).** It runs at startup and alerts through Slack if AppleScript or the `chat.db` schema broke. It sends a random nonce to Resonant's own handle and waits for the reader to see it; the result is kept in kv `imessage.selftest`. `resonant selftest imessage` runs the same check by hand, next to a live daemon.
 
 ## Decisions log
 

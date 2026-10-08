@@ -186,8 +186,13 @@ class IMessageReader:
         principals: Principals,
         conn: sqlite3.Connection,
         clock: Clock = utcnow,
+        *,
+        cursor_key: str = CURSOR_KEY,
     ) -> None:
         self.config = config
+        # A second reader (``resonant selftest imessage`` next to a running daemon) uses its
+        # own cursor key so it never moves the daemon's cursor.
+        self.cursor_key = cursor_key
         self.principals = principals
         self.conn = conn
         self.clock = clock
@@ -232,6 +237,10 @@ class IMessageReader:
         """Ask :meth:`run` to return. Safe to call at any time, including before run."""
         self._stop.set()
 
+    def close(self) -> None:
+        """Close the chat.db handle. For callers that use :meth:`poll_once` without ``run``."""
+        self._close()
+
     def health(self) -> dict[str, Any]:
         """``{ok, last_read_at, last_error, fda_ok}``. ``ok`` needs one successful read."""
         return {
@@ -248,7 +257,7 @@ class IMessageReader:
         in health instead. Useful for tests and for a self-test that wants a read now.
         """
         chat = self._open()
-        cursor = kv_get(self.conn, CURSOR_KEY)
+        cursor = kv_get(self.conn, self.cursor_key)
         max_rowid = int(chat.execute("SELECT COALESCE(MAX(ROWID), 0) FROM message").fetchone()[0])
         if not isinstance(cursor, int) or cursor > max_rowid:
             # First start: begin at the newest row so history is never replayed. A cursor
@@ -256,7 +265,7 @@ class IMessageReader:
             with atomic(self.conn):
                 if cursor is not None:
                     audit(self.conn, "imessage.cursor_reset", before=cursor, after=max_rowid)
-                kv_set(self.conn, CURSOR_KEY, max_rowid)
+                kv_set(self.conn, self.cursor_key, max_rowid)
             self._mark_read()
             return 0
         rows = chat.execute(_QUERY, (cursor, BATCH)).fetchall()
@@ -281,7 +290,7 @@ class IMessageReader:
                 with atomic(self.conn):
                     for action, detail in pending_audits:
                         audit(self.conn, action, **detail)
-                    kv_set(self.conn, CURSOR_KEY, done)
+                    kv_set(self.conn, self.cursor_key, done)
         self._mark_read()
         if rows:
             log.debug("imessage read: %d rows, %d events", len(rows), submitted)
