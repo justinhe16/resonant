@@ -395,3 +395,41 @@ def selftest_imessage(
         typer.echo(f"imessage self-test {'ok' if result.ok else 'FAILED'}: {result.detail}")
     if not result.ok:
         raise typer.Exit(1)
+
+
+# --- evals -----------------------------------------------------------------------------
+
+eval_app = typer.Typer(no_args_is_help=True, help="Evals on your own sets (see evals/README.md).")
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("router")
+def eval_router(
+    set_path: Annotated[
+        Path | None,
+        typer.Option("--set", help="JSONL set. Default: ~/.resonant/evals/router.jsonl."),
+    ] = None,
+    repeat: Annotated[int, typer.Option(min=1, help="Run the whole set N times.")] = 1,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    min_accuracy: Annotated[
+        float, typer.Option(min=0.0, max=1.0, help="Exit 1 if accuracy is below this.")
+    ] = 0.9,
+) -> None:
+    """Route each text through the production router; print accuracy, confusion and latency.
+
+    Texts appear only in this command's output. The summary saved to
+    ~/.resonant/evals/results/<ts>.json refers to examples by line number. Exit 1 if
+    accuracy < --min-accuracy, 2 if the set is missing or malformed.
+    """
+    from resonant.evals import router_eval
+
+    code = router_eval.run(
+        load_settings(),
+        set_path=set_path,
+        repeat=repeat,
+        as_json=as_json,
+        min_accuracy=min_accuracy,
+        echo=typer.echo,
+        echo_err=lambda s: typer.echo(s, err=True),
+    )
+    raise typer.Exit(code)
