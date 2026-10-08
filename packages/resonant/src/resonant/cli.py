@@ -248,3 +248,109 @@ def ext_validate(
     if problems:
         raise typer.Exit(1)
     typer.echo("ok")
+
+
+# --- model -----------------------------------------------------------------------------
+
+model_app = typer.Typer(no_args_is_help=True, help="Local LLM (Ollama): probe and benchmark.")
+app.add_typer(model_app, name="model")
+
+MODEL_PROBE_KV = "model.probe"
+
+
+def _run_probe(settings: Settings) -> dict[str, Any]:
+    # Imported lazily: the openai SDK is slow to import and only these commands need it.
+    import asyncio
+
+    from resonant.models import OllamaClient
+
+    async def go() -> dict[str, Any]:
+        async with OllamaClient(settings.model) as client:
+            result = await client.probe()
+        return result.as_dict()
+
+    data = asyncio.run(go())
+    data.update(model=settings.model.name, api=settings.model.api)
+    _record_probe(settings, data)
+    return data
+
+
+def _record_probe(settings: Settings, data: dict[str, Any]) -> None:
+    """Best-effort: keep the last probe in kv for status/tools. Never creates the store."""
+    from resonant.store.db import kv_set, now_iso
+
+    with contextlib.suppress(StoreUnavailableError, sqlite3.Error):
+        conn = open_existing(settings.db_path)
+        try:
+            with atomic(conn):
+                kv_set(conn, MODEL_PROBE_KV, {**data, "checked_at": now_iso()})
+        finally:
+            conn.close()
+
+
+def _echo_probe(data: dict[str, Any]) -> None:
+    def yn(v: object, good: str, bad: str) -> str:
+        return good if v else bad
+
+    typer.echo(f"model       {data['model']} ({data['api']} adapter)")
+    typer.echo(f"present     {yn(data['model_present'], 'yes', 'NO')}")
+    if data["model_present"]:
+        typer.echo(f"context     {yn(data['ctx_ok'], 'ok', 'TOO SMALL / unknown')}")
+        typer.echo(f"thinking    {yn(data['thinking_off_ok'], 'off', 'NOT OFF')}")
+    if data["latency_ms"] is not None:
+        typer.echo(f"latency     {data['latency_ms']} ms (1-token JSON call)")
+    if data["detail"]:
+        typer.echo(f"detail      {data['detail']}")
+
+
+@model_app.command("probe")
+def model_probe(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Check the model is pulled, its context is big enough, and thinking is off. Exit 1 if not."""
+    data = _run_probe(load_settings())
+    if as_json:
+        typer.echo(json.dumps(data, indent=2))
+    else:
+        _echo_probe(data)
+    if not data["ok"]:
+        raise typer.Exit(1)
+
+
+@model_app.command("bench")
+def model_bench(
+    n: Annotated[int, typer.Option("--n", min=1, help="Timed calls per prompt kind.")] = 20,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Probe, warm up, then time label-style JSON and single-tool calls (p50/p95)."""
+    import asyncio
+
+    from resonant.models import OllamaClient
+    from resonant.models.bench import run_bench
+
+    settings = load_settings()
+    probe = _run_probe(settings)
+    if not probe["ok"]:
+        if as_json:
+            typer.echo(json.dumps({"probe": probe}, indent=2))
+        else:
+            _echo_probe(probe)
+        raise typer.Exit(1)
+
+    async def go() -> list[dict[str, Any]]:
+        async with OllamaClient(settings.model) as client:
+            return [s.summary() for s in await run_bench(client, n)]
+
+    results = asyncio.run(go())
+    if as_json:
+        typer.echo(json.dumps({"probe": probe, "results": results}, indent=2))
+    else:
+        typer.echo(f"model {settings.model.name} ({settings.model.api} adapter), n={n}, warmed up")
+        for r in results:
+            if "p50_ms" in r:
+                typer.echo(
+                    f"  {r['kind']:<6} p50 {r['p50_ms']:>6} ms   p95 {r['p95_ms']:>6} ms"
+                    f"   failures {r['failures']}/{n}"
+                )
+            else:
+                typer.echo(f"  {r['kind']:<6} all {n} calls failed")
+    if any("p50_ms" not in r for r in results):
+        raise typer.Exit(1)
