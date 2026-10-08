@@ -40,7 +40,8 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Extension authoring guide + `resonant ext validate` | `docs/extensions.md`, `resonant/cli.py` | Phase 0 ✅ |
 | Built-in read tools (`list_tasks`, `task_counts`, `system_status`, `daemon_status`, `model_status`); registry, `DryRunGate` and executor wired into the daemon; `GET /api/tools` | `resonant/tools/builtin.py`, `resonant/components.py`, `resonant/api.py` | Phase 1 |
 | Model client (Ollama native or OpenAI-compatible), `resonant model probe/bench` | `resonant/models/`, `resonant/cli.py` | Phase 1 |
-| Router, local runner | — | Phase 1 |
+| Router: deterministic fast path (slash commands, anchored keywords, owner-only `/kill`), one-call LLM intent label with stable prompt prefixes, principal-filtered toolsets | `resonant/router/` | Phase 1 |
+| Local runner | — | Phase 1 |
 | iMessage channel, Slack notifier, router evals | — | Phase 1 |
 | Real gate (L0–L3, text-reply approvals, veto, kill switch), Keychain injection | — | Phase 2 |
 | Extension manager (`ext add`, CLI/MCP tools, scheduler, critical-job plists) | — | Phase 3 |
@@ -114,4 +115,5 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 | 2026-10-08 | Public repo from Phase 0. gitleaks runs in pre-commit and CI. Only `*.example` configs ship. Real eval sets stay out of the repo. |
 | 2026-10-08 | LaunchAgent plists are generated with `plistlib` instead of template files. |
 | 2026-10-08 | `waiting(ci)` polls CI through `gh` on the tick. No inbound GitHub webhooks. |
+| 2026-10-08 | Router fast-path reads go through the gate but not the executor: no task exists at route time, and builtins are L0 reads with no side effect. `/kill` and `/resume` are deterministic and owner-only, never decided by the model. |
 | 2026-10-08 | Manifests load with a YAML loader where only true/false are booleans, so `notify: {on: [...]}` stays a string key. |

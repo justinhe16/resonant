@@ -348,6 +348,39 @@ ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail)
 - Each call opens an `llm.call` span through the injected `SpanFactory` (e.g. `partial(span, conn, trace_id=...)`; default: none). Spans record model, adapter, latency, tokens and dropped calls, never prompt or reply text.
 - `probe()` never raises. It checks `/api/tags` (pulled), `/api/show` (context ≥ `model.context_tokens`, including a Modelfile `num_ctx`), `/api/ps` (notes a cold model) and a 1-token JSON call with thinking off.
 
+## Router: `resonant.router`
+
+```python
+class Router:                     # the Loop's router hook (Callable[[Event], Awaitable[NewTask | None]])
+    def __init__(self, conn, *, principals, registry, gate, handlers, model: ModelClient): ...
+    async def route(self, event: Event) -> NewTask | None
+    def toolset_for(self, intent, principal) -> list[ToolSpec]
+
+IntentLabel = Literal["question", "job_control", "system", "run_project", "unknown"]  # router/intents.py
+toolset_for(intent, principal, *, registry, principals) -> list[ToolSpec]   # sorted by name
+match_fast_path(text) -> FastCommand | None                                 # pure
+Labeler(model).label(text, *, spans=None) -> Label(intent, confidence, fallback, latency_ms, prefix_hash)
+classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | "llm", confidence, fallback, command)
+```
+
+`route` handles only `source="imessage"`, `type="message"` events with a known principal and non-empty `payload.text`; it returns None (event consumed) for everything else. Priority is `PRIORITY_OWNER` for the owner and `PRIORITY_MEMBER` otherwise, never from the model. `channel_ref` is `{channel, principal, handle, chat_guid, guid}`. It returns one of:
+
+| Path | `NewTask` | `checkpoint` |
+|---|---|---|
+| Fast (no model call) | `kind="reply"`, `runner="local"` | `{fast_reply: str, tool_used: str \| None, intent}` |
+| Labeled (one `chat_json` call) | `kind="chat"`, `runner="local"` | `{intent, confidence, toolset: [tool names], fallback: bool, toolset_prefix_hash}` |
+
+- **Fast path** (`router/fast_path.py`). The whole message, after lowercasing, straightening apostrophes, collapsing whitespace and dropping trailing `?!.`:
+  - Slash commands: `/status` (`daemon_status`), `/tasks` (`list_tasks`), `/help`, `/kill` and `/resume` (owner only: `killswitch.engage` / `release`, audited; anyone else gets `not allowed`). Any other `/word` gets "Unknown command. Try /help." None of these ever reach the model.
+  - Keywords: `status` and `ping` (`daemon_status`), `what's running` (`list_tasks {status: running}`), `how's the mini` (`system_status`).
+  - Each command maps to at most one builtin read; the reply is a template over its output (code computes, text narrates). The read is evaluated by the gate (audited, `task_id="route:<event id>"`). No task exists yet, so the fast path consumes the Allow token and calls the read handler directly instead of the executor (reads only; nothing to dedupe). A tool error becomes a templated "Couldn't read … right now."
+  - If the principal can't request the tool, a slash command replies `not allowed` and a keyword falls through to the labeler.
+- **Labeler** (`router/labeler.py`, `router/prefixes.py`). One `chat_json` call with schema `{intent: enum, confidence: 0..1}`, `max_tokens=20`, temperature 0. The prompt is the constant `LABEL_PREFIX` (system rules, intent definitions, 8 few-shot turns) and then the user text, truncated to 2000 characters and wrapped by `wrap_untrusted` as `<message>…</message>` (tags inside it are stripped). `ModelUnavailableError` gives `unknown` with `fallback=true` (the runner sends `prefixes.FALLBACK_REPLY`); `ModelOutputError` or an out-of-enum intent gives `unknown` with `fallback=false`.
+- **Toolset.** `INTENT_TOOLS` maps intents to builtins (`job_control`: `list_tasks`, `task_counts`; `system`: `daemon_status`, `model_status`, `system_status`; others: none). It is filtered by `principals.can(principal, "request", spec.extension)` before anything reaches the model, so a member gets no global builtins. `extension:<name>` intents are reserved for Phase 3.
+- **Prefixes for the local runner.** `prefixes.runner_system(intent)` is the runner's constant system message; `toolset_prefix_hash(intent, toolset)` hashes it with `tools_prefix(toolset)`, so it is stable per (intent, principal scope).
+- **Spans.** `router.fast_path` (`command, handled, tool_used, latency_ms`) and `router.label` (`intent, confidence, fallback, latency_ms, prefix_hash`). Never message text.
+- **Evals.** `classify` uses the production matcher and labeler from the owner's point of view, but runs no tools and never touches the kill switch.
+
 ## Spans and logs: `resonant.observability`
 
 - `with span(conn, name, trace_id=..., task_id=..., parent_id=..., **attrs) as s: s.set(...)` writes a row to `spans` with status and timing.
