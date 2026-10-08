@@ -123,7 +123,7 @@ principals:
   cofounder: {identities: ["slack:U02"], grants: {dori: [request, approve]}}
 ```
 
-- An identity is `imessage:<E.164 | lowercase email>` or `slack:<user id>`.
+- An identity is `imessage:<E.164 | lowercase email>` or `slack:<user id>`. An email handle must start with a letter or digit (never `-`, which osascript could read as an option).
 - There is exactly one owner, and an identity can belong to only one principal.
 - `can(principal, action, extension)`:
   - The owner can do everything.

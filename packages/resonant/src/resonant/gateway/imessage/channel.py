@@ -64,7 +64,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 from resonant.config import IMessageConfig
 from resonant.gateway.channel import (
@@ -326,10 +326,11 @@ class IMessageChannel:
         raise ChannelRefused(f"imessage: {reason}: {principal!r}")
 
     def _already_sent(self, dedupe_key: str) -> MessageRef | None:
-        record = kv_get(self.conn, _dedupe_kv(dedupe_key))
+        record: object = kv_get(self.conn, _dedupe_kv(dedupe_key))
         if not isinstance(record, dict):
             return None
-        ref, at = record.get("ref"), record.get("at")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        fields = cast(dict[str, object], record)
+        ref, at = fields.get("ref"), fields.get("at")
         if not isinstance(ref, str) or not isinstance(at, str):
             return None
         try:
@@ -434,7 +435,8 @@ class IMessageChannel:
                     await asyncio.sleep(SELFTEST_POLL_S / 5)
             started = loop.time()
             try:
-                await self.sender.send(me, SELFTEST_PREFIX + nonce)
+                async with self._send_lock:  # never overlap a send() inside the daemon
+                    await self.sender.send(me, SELFTEST_PREFIX + nonce)
             except SendError as e:
                 return SelfTestResult(False, f"send failed: {e}")
             deadline = started + timeout_s

@@ -621,3 +621,22 @@ def test_cli_selftest_exits_1_on_failure(
 def test_cli_lists_selftest() -> None:
     result = CliRunner().invoke(app, ["selftest", "--help"])
     assert result.exit_code == 0 and "imessage" in result.output
+
+
+@pytest.mark.parametrize("handle", ["-x@evil.com", "-e", "--", "x@-evil.com", "+0123456789"])
+async def test_sender_refuses_handles_osascript_could_misparse(handle: str) -> None:
+    from resonant.gateway.imessage import IMessageSender, SendError
+
+    runner = FakeRunner()
+    with pytest.raises(SendError, match="refusing"):
+        await IMessageSender(runner).send(handle, "hi")
+    assert runner.calls == []
+
+
+def test_principals_reject_handles_starting_with_dash() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Principals.model_validate(
+            {"principals": {"j": {"role": "owner", "identities": ["imessage:-x@evil.com"]}}}
+        )

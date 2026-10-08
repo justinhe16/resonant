@@ -27,7 +27,9 @@ GrantableAction = Literal["request", "approve"]
 _KNOWN_CHANNELS = ("imessage", "slack")
 # chat.db stores handles as E.164 phone numbers or lowercase emails. Requiring the same form
 # here means a handle can only match by exact string comparison.
-_IMESSAGE_HANDLE = re.compile(r"^(\+[1-9]\d{7,14}|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})$")
+_IMESSAGE_HANDLE = re.compile(
+    r"^(\+[1-9]\d{7,14}|[a-z0-9][a-z0-9._%+-]*@[a-z0-9][a-z0-9.-]*\.[a-z]{2,})$"
+)
 
 
 class Principal(BaseModel):

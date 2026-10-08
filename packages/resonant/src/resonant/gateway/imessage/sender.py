@@ -39,9 +39,9 @@ on run argv
   end tell
 end run"""
 
-# Same shape principals.yaml enforces for imessage identities. A handle can never start
-# with "-", so osascript can't read it as an option.
-_HANDLE = re.compile(r"^(\+[1-9]\d{7,14}|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})$")
+# Same shape principals.yaml enforces for imessage identities. The first character must be
+# "+" or alphanumeric: a handle starting with "-" could be read by osascript as an option.
+_HANDLE = re.compile(r"^(\+[1-9]\d{7,14}|[a-z0-9][a-z0-9._%+-]*@[a-z0-9][a-z0-9.-]*\.[a-z]{2,})$")
 _ERROR_NUMBER = re.compile(r"\((-?\d+)\)\s*$")
 
 AUTOMATION_DENIED = (
