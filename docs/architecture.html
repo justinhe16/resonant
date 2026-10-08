@@ -331,19 +331,23 @@ const GROUPS = [
 const F = (s)=>s; // marker for file paths
 const NODES = {
   /* ---- gateway */
-  imessage:{label:"iMessage channel", phase:"1 (1E)", status:"planned",
-    what:"Resonant's own Apple ID, with an email handle (channels.imessage.self_handle, e.g. resonant.agent@icloud.com), is iMessage only: no SMS and no phone number. It sends only to handles listed in principals.yaml, and a principal can have several (phone and email). Resonant's own Apple ID, signed into Messages.app on the Mini, is the owner's personal channel. Resonant texts the owner as a contact and can never send as them.",
-    iface:`# send — osascript via argv (never string-interpolated AppleScript)
-osascript -e 'on run argv … send item 2 of argv to buddy (item 1 of argv)' \\
-          "+15551234567" "message text"
+  imessage:{label:"iMessage channel", phase:"1", status:"built",
+    what:"Resonant's own Apple ID, with an email handle (channels.imessage.self_handle, e.g. resonant.agent@icloud.com), is iMessage only: no SMS and no phone number. It sends only to handles listed in principals.yaml, and a principal can have several (phone and email). The reader turns new chat.db rows into Events; the sender runs osascript with the text as argv. The daemon starts it only when channels.imessage.enabled is true (off by default until the go-live checklist passes).",
+    iface:`IMessageChannel(config, principals, conn, *, runner=OsaRunner, reader=None)
+  start(loop.submit) · stop() · health() → {ok, last_read_at, last_error, fda_ok}
+  send(principal, text, *, dedupe_key) → MessageRef("imessage-out:<id>")
+  self_test(timeout_s=10) → SelfTestResult(ok, detail)
 
-# receive — read-only, WAL-safe
+# send: osascript via argv (never string-interpolated AppleScript)
+["/usr/bin/osascript", "-e", SEND_SCRIPT, handle, text]   # 15s timeout
+
+# receive: read-only, WAL-safe
 sqlite3 "file:~/Library/Messages/chat.db?mode=ro"
-  cursor = kv['imessage.last_rowid']   # message.ROWID
-  only is_from_me = 0, service = 'iMessage'
+  cursor = kv['imessage.cursor']   # message.ROWID; first start = newest row
+  only is_from_me = 0, service = 'iMessage', 1:1 chats
   text NULL → parse attributedBody (typedstream)`,
-    inv:["Self-message guards: only rows with is_from_me = 0 are read, Resonant's own handle is skipped explicitly before routing, and self-test messages carry a nonce that only the self-test checker consumes","Messages that arrive as SMS are dropped, because SMS sender IDs can be spoofed","Unknown handles are dropped and audited","Sends are rate-limited and deduped by the events idempotency key","A kqueue/FSEvents watch on chat.db-wal triggers reads, with ~2s polling as a fallback (latency target 2–3s)","Startup self-test: send to Resonant's own Apple ID and read the row back. On failure, alert through the Slack notifier","Contract tests run against fixture chat.db files, because AppleScript and the schema can break on macOS updates","Needs Full Disk Access (on a pinned interpreter path) plus Automation permission for Messages"],
-    files:[]},
+    inv:["Self-message guards: only rows with is_from_me = 0 are read, Resonant's own handle is skipped before routing, and self-test messages carry a nonce that only the self-test checker consumes","SMS rows are dropped, because SMS sender IDs can be spoofed","Unknown handles are dropped and audited (imessage.unknown_sender)","Sends are deduped (reply:<task id>), rate-limited per principal, and serialized","A watch on chat.db-wal triggers reads (250ms check, 100ms debounce), with 2s polling as a fallback","Self-test: send a nonce to Resonant's own Apple ID and read the row back; the health monitor runs it and alerts over iMessage or the dead-man /fail","Tests use a FakeChatDB fixture and a fake OsaRunner; bodies never reach logs or audit rows","Needs Full Disk Access (on a pinned interpreter path) plus Automation permission for Messages"],
+    files:["packages/resonant/src/resonant/gateway/imessage/reader.py","packages/resonant/src/resonant/gateway/imessage/sender.py","packages/resonant/src/resonant/gateway/imessage/channel.py","packages/resonant/src/resonant/wiring.py","tests/test_e2e.py"]},
   slack:{label:"Slack channel", phase:"5 (5A)", status:"planned",
     what:"A two-way channel for both principals: requests, approval buttons, and incident threads. It is the co-founder's only channel and the owner's fallback if iMessage breaks.",
     iface:`slack-bolt · Socket Mode (no inbound port)
@@ -357,10 +361,10 @@ approvals = buttons (non-pay) · typed "yes A7" for pay`,
 X-Signature: HMAC-SHA256(body)`,
     inv:["Reachable from the tailnet only, never a public port","HMAC-signed","Tailscale Funnel only on specific paths, and only if a third party must push to it"],
     files:[]},
-  notifier:{label:"Slack notifier (out-only)", phase:"1 (1G)", status:"planned",
-    what:"An outbound-only Slack poster (bot token, chat.postMessage) for health and self-test alerts. It exists so the iMessage self-test can alert you even before two-way Slack arrives.",
-    iface:`notify(text, severity) → chat.postMessage(channel, text)`,
-    inv:["Outbound only, so no inbound surface","healthchecks.io stays the last resort if both channels are down"],
+  notifier:{label:"Slack notifier (out-only)", phase:"ext", status:"planned",
+    what:"An outbound-only Slack poster. It was planned for Phase 1, but Slack stays out of core: health alerts go to the owner over iMessage, and the healthchecks.io /fail ping carries the reason when iMessage itself is down. A Slack notifier, if any, belongs to an extension.",
+    iface:`notify(text, severity) → chat.postMessage(channel, text)   # extension, not core`,
+    inv:["Outbound only, so no inbound surface","healthchecks.io stays the last resort if iMessage is down"],
     files:[]},
   /* ---- sources */
   scheduler:{label:"Scheduler", phase:"3", status:"planned",
@@ -419,13 +423,15 @@ can(principal, action ∈ {request, approve, admin}, extension | None) -> bool`,
     _dispatch(now)          # priority, created_at; Claude slots`,
     inv:["One transaction per step: outcome + checkpoint + consumed events","Crash mid-step: no partial state, and the task resumes from its last checkpoint","Retryable failures keep their events and back off 5s·2ⁿ (max 300s)","Graceful shutdown gives in-flight steps a 10s grace period. The rest resume on the next start"],
     files:["packages/resonant/src/resonant/loop/loop.py","tests/test_loop.py"]},
-  router:{label:"Router", phase:"1 (1C)", status:"partial",
-    what:"Turns an unrouted event into a task. It tries a keyword, slash-command, or button match first and replies with a template where it can. An LLM label call runs only when nothing matches. The router hook itself exists in the loop now; the classifier is Phase 1.",
-    iface:`labels: question | run_project | job_control | extension:<name>
-prompt prefix = fixed per (intent, principal-scope)  # KV-cache reuse
-toolset       = filtered by principal BEFORE the model sees it`,
-    inv:["A co-founder message can never reach trading or personal tools, even through prompt injection","Tools are sorted deterministically and volatile context goes after the prefix","Target latency is 2–3s; simple queries skip the LLM"],
-    files:["packages/resonant/src/resonant/loop/loop.py (Router hook)"]},
+  router:{label:"Router", phase:"1", status:"built",
+    what:"The Loop's router hook. It turns an unrouted iMessage event into a task for the local runner. A deterministic fast path (slash commands and a few anchored keywords) runs one gated builtin read and replies from a template with no model call. Anything else gets one LLM intent label, and the toolset for that intent is filtered by principal before the model sees it.",
+    iface:`Router(conn, *, principals, registry, gate, handlers, model).route(event) -> NewTask | None
+fast:    NewTask(kind="reply", runner="local", checkpoint={fast_reply, tool_used, intent})
+labeled: NewTask(kind="chat",  runner="local", checkpoint={intent, confidence, toolset, fallback})
+intents: question | job_control | system | run_project | unknown
+prompt prefix = fixed per (intent, principal scope)   # KV-cache reuse`,
+    inv:["/kill and /resume are deterministic and owner-only, never decided by the model","A co-founder message can never reach global or personal tools, even through prompt injection","Priority comes from the principal, never the model","Exit criterion: fast p50 ≤ 1s, labeled p50 ≤ 3s (resonant bench e2e)"],
+    files:["packages/resonant/src/resonant/router/router.py","packages/resonant/src/resonant/router/fast_path.py","packages/resonant/src/resonant/router/labeler.py","packages/resonant/src/resonant/router/prefixes.py","tests/test_router.py"]},
   tasks:{label:"Task envelope", phase:"0", status:"built",
     what:"A hand-rolled durable envelope with no workflow engine. The work content is opaque (checkpoint); only the lifecycle is typed.",
     iface:`tasks(id, kind, runner('local'|'claude'|'cu'), extension, principal,
@@ -446,17 +452,15 @@ release(task_id)`,
     inv:["Non-on-call work only uses the unreserved slots, no matter what on-call holds","A usage-limit hit sets kv.claude_usage_reset_at, parks every claude task in waiting(usage_reset), and sends one notification (Phase 5)"],
     files:["packages/resonant/src/resonant/loop/slots.py","tests/test_slots.py"]},
   /* ---- runners */
-  runner_local:{label:"Local runner (qwen3)", phase:"1 (1D)", status:"planned",
-    what:"Handles simple questions and tool use with the local model, capped at about 3 tool calls. Longer or harder work escalates by switching the task's runner to claude.",
-    iface:`class Runner(Protocol):
-    name: str
-    uses_claude_slot: bool
-    async def step(self, task: Task, events: list[Event]) -> StepOutcome
-
-StepOutcome = Continue(checkpoint) | Wait(reason, checkpoint, wake_at?)
-            | Done(result) | Fail(error, retryable)`,
-    inv:["Every tool call goes through the Gate","Code computes numbers; the LLM narrates","Thinking is off for tool calls, and tool output is structured JSON"],
-    files:["packages/resonant/src/resonant/loop/types.py (Runner contract, built)"]},
+  runner_local:{label:"Local runner (qwen3)", phase:"1", status:"built",
+    what:"Answers routed chat tasks with the local model: up to 3 read-tool calls, each through the gate and the executor, then one JSON answer sent over the channel. run_project and anything needing more calls escalate with a templated reply (the Claude runner is Phase 5).",
+    iface:`LocalRunner(conn, *, model, channel, gate, executor, registry, max_step_s)  # name="local"
+step: resend saved reply | fast_reply | fallback/escalate
+      | ≤3 × (Intent.for_tool → gate.evaluate → executor.execute) → chat_json {reply}
+      → ctx.save(reply) → channel.send(dedupe_key="reply:<task id>") → Done
+max_step_s = (3 + 1) × model.timeout_s + 15s   # the model times out first`,
+    inv:["Every tool call goes through the gate and the executor","Code computes numbers; the LLM narrates (number guard against tool output)","Thinking is off; tool output is replayed as untrusted data","A crash after the reply is computed resends it, deduped, never twice"],
+    files:["packages/resonant/src/resonant/runners/local.py","packages/resonant/src/resonant/wiring.py","tests/test_local_runner.py","tests/test_e2e.py"]},
   runner_claude:{label:"Claude runner", phase:"5", status:"planned",
     what:"Runs Claude Code headless through the Agent SDK, one git worktree per task. The flow is plan first: plan.md, then approval, then execution milestone by milestone, with PROGRESS.md as durable state and a fresh session per milestone.",
     iface:`claude_session_id persisted on the task
@@ -473,14 +477,15 @@ result               → open PR (never push to main) → waiting(ci) → report
 commit actions (send / pay / delete): pause + screenshot → approval`,
     inv:["Each task declares a scope that the owner approves","The runner always pauses before a commit action","Payments use a capped virtual card and are permanently L1","Core supplies the generic cu runner, Scope, and commit-pause. The life lane's wiring stays in a private repo"],
     files:[]},
-  ollama:{label:"Ollama (LaunchAgent)", phase:"0 / 1", status:"partial",
-    what:"The local model server, running qwen3:30b-a3b (Q4). It is OpenAI-compatible, so switching to MLX later only needs a config change. Its LaunchAgent plist is generated now; the client arrives in Phase 1.",
+  ollama:{label:"Ollama (LaunchAgent)", phase:"0 / 1", status:"built",
+    what:"The local model server, running qwen3:30b-a3b (Q4), and the ModelClient over it. The client defaults to Ollama's native /api/chat (think: false); the OpenAI-compatible /v1 adapter keeps an MLX swap a config change.",
     iface:`OLLAMA_HOST=127.0.0.1:11434
 OLLAMA_KEEP_ALIVE=-1
 OLLAMA_CONTEXT_LENGTH=32768        # pinned server-side
-client: openai SDK → http://127.0.0.1:11434/v1`,
-    inv:["Context size is pinned on the server, because /v1 can't set num_ctx per request","Ticket 1A checks that thinking-off works on /v1, and falls back to a native adapter behind the same interface if it doesn't","Loopback only"],
-    files:["packages/resonant/src/resonant/launchd.py (ollama_plist)"]},
+OllamaClient(cfg.model): chat_json · chat_tools · probe()
+resonant model probe | bench`,
+    inv:["probe() checks the model is pulled, the context is big enough, and thinking is really off","Each call has model.timeout_s; failures raise ModelUnavailableError so callers send a templated fallback","Loopback only"],
+    files:["packages/resonant/src/resonant/models/client.py","packages/resonant/src/resonant/launchd.py (ollama_plist)"]},
   /* ---- extensions */
   manifest:{label:"resonant.yaml manifest", phase:"0 / 3", status:"partial",
     what:"How an extension declares its jobs, tools, notifications, health check, secrets, and approvers. The SDK validates it strictly with pydantic. The schema is built and frozen (Phase 0); the daemon starts loading manifests in Phase 3. Only true/false parse as YAML booleans, so `on:` stays a key.",
@@ -578,11 +583,13 @@ TRIGGER: UPDATE / DELETE → RAISE(ABORT, 'audit_log is append-only')`, inv:["Ap
   t_spans:{label:"spans", phase:"0", status:"built", what:"Per-task traces: LLM call, then tool, then gate, then executor. The table and the span() helper are built. The design leaves room to add Phoenix or Langfuse later.", iface:`spans(id, trace_id, parent_id, task_id, name, attrs, status, started_at, ended_at)`, inv:["Not required for v1"], files:["packages/resonant/src/resonant/store/migrations/001_init.sql"]},
   t_misc:{label:"decision_log · memory · kv", phase:"0", status:"built", what:"decision_log answers ask_human lookups. memory holds scoped key/value memory. kv holds global flags: autonomy, paused, claude_usage_reset_at, iMessage cursor, heartbeat.", iface:`kv_get(conn, key, default) · kv_set(conn, key, value)`, inv:["DB file is 0600, home dir is 0700"], files:["packages/resonant/src/resonant/store/db.py"]},
   /* ---- ops */
-  api:{label:"Local API", phase:"0", status:"built",
+  api:{label:"Local API", phase:"0 / 1", status:"built",
     what:"FastAPI running in the same asyncio process as the loop. Its async handlers run on the thread that owns the SQLite connection.",
-    iface:`GET /healthz      → {"ok": true}
-GET /api/status   → version, uptime_s, last_tick, dry_run, autonomy,
-                    paused, tasks{status: n}, waiting{reason: n}, inflight`,
+    iface:`GET /healthz       → {"ok": true}
+GET /api/status    → version, uptime_s, last_tick, dry_run, autonomy, paused,
+                     tasks{status: n}, waiting{reason: n}, inflight, health{check: state}
+GET /api/tools     → registered tool specs
+GET /api/channels  → [{name, enabled, ok, last_read_at, last_selftest}]`,
     inv:["Binds to loopback only; config rejects any other address","If the loop or API dies, the process exits non-zero so launchd restarts it"],
     files:["packages/resonant/src/resonant/api.py","packages/resonant/src/resonant/status.py","packages/resonant/src/resonant/daemon.py"]},
   dashboard:{label:"Dashboard", phase:"4", status:"planned",
@@ -591,12 +598,15 @@ GET /api/status   → version, uptime_s, last_tick, dry_run, autonomy,
 audit (who requested / approved) · Claude slots · memory pressure`,
     inv:["Exposed only through tailscale serve, never a public port"],
     files:[]},
-  health:{label:"Health", phase:"0", status:"built",
-    what:"A watchdog thread exits the process if the loop's heartbeat goes stale, so launchd restarts it. A dead-man ping goes to healthchecks.io every 60s.",
+  health:{label:"Health", phase:"0 / 1", status:"built",
+    what:"A watchdog thread exits the process if the loop's heartbeat goes stale, so launchd restarts it. A dead-man ping goes to healthchecks.io every 60s. With iMessage on, a HealthMonitor checks the model, iMessage, the loop and the store every 60s and texts the owner when one degrades; when iMessage itself is down, the /fail ping carries the reason instead.",
     iface:`watchdog: heartbeat stale > watchdog_stale_s → os._exit(1)
-dead-man: GET https://hc-ping.com/<uuid> every ping_every_s`,
-    inv:["kill -9 checks that launchd restarts the daemon (verified in PR2)","SIGSTOP freezes the whole process (watchdog included), so the dead-man switch is what alerts","The dead-man sends /fail when the loop stops ticking"],
-    files:["packages/resonant/src/resonant/health.py","tests/test_health.py"]},
+dead-man: GET hc-ping.com/<uuid> · POST …/fail with the reason
+HealthMonitor(conn, *, model, channel, owner, daemon_healthy).run()
+  checks: model (probe/5 min) · imessage (reader + self-test/6h) · loop · store
+  kv health.<check> = {state: ok|degraded|unknown, since, detail}`,
+    inv:["kill -9 checks that launchd restarts the daemon (verified in PR2)","SIGSTOP freezes the whole process (watchdog included), so the dead-man switch is what alerts","One owner alert per incident, at most one per check per 6h, plus a resolved message","No Slack in core: alerts go over iMessage or the dead-man"],
+    files:["packages/resonant/src/resonant/health.py","packages/resonant/src/resonant/monitor.py","tests/test_health.py","tests/test_monitor.py"]},
   launchd:{label:"launchd LaunchAgents", phase:"0", status:"built",
     what:"Runs as a per-user LaunchAgent (gui/<uid>), not a system daemon. Messages.app, computer use, and the login Keychain all need the GUI session. Plists are built with plistlib.",
     iface:`com.resonant.daemon  KeepAlive, ThrottleInterval 10,
@@ -605,15 +615,17 @@ com.resonant.ollama  KEEP_ALIVE=-1, CONTEXT_LENGTH=32768
 install: launchctl bootout → bootstrap gui/<uid> → enable`,
     inv:["Verified: after kill -9, launchd restarted the daemon in about 6s","Needs auto-login, and FileVault is on, so an unplanned reboot needs a manual unlock"],
     files:["packages/resonant/src/resonant/launchd.py","tests/test_launchd.py"]},
-  cli:{label:"resonant CLI", phase:"0", status:"built",
-    what:"The typer CLI. Phase 0 commands are built; eval and ext come later.",
+  cli:{label:"resonant CLI", phase:"0 / 1", status:"built",
+    what:"The typer CLI. Phase 0 and Phase 1 commands are built; approvals evals and ext come later.",
     iface:`resonant daemon run | install | uninstall | logs      # built
 resonant status [--json] · kill · resume · job-guard # built
-resonant eval router|approvals --set <path>         # Phase 1/2
+resonant model probe | bench · selftest imessage     # built (Phase 1)
+resonant eval router · bench e2e [--model real]      # built (Phase 1)
+resonant eval approvals --set <path>                # Phase 2
 resonant ext add|list|remove · reload               # Phase 3
-scripts/bootstrap.sh  # fresh Mac → running daemon (built)`,
-    inv:["Real eval sets live in ~/.resonant/evals, never in the public repo"],
-    files:["packages/resonant/src/resonant/cli.py","packages/resonant/src/resonant/__main__.py","scripts/bootstrap.sh"]},
+scripts/bootstrap.sh [--check]  # fresh Mac → running daemon (built)`,
+    inv:["Real eval sets live in ~/.resonant/evals, never in the public repo","bench e2e uses a fake chat.db and osascript, so it never texts anyone"],
+    files:["packages/resonant/src/resonant/cli.py","packages/resonant/src/resonant/__main__.py","packages/resonant/src/resonant/e2e/bench.py","scripts/bootstrap.sh"]},
 };
 
 const EDGES = [
@@ -633,8 +645,8 @@ const EDGES = [
 const PHASES = [
   {n:0, title:"Skeleton", status:"built", done:3, total:3,
    items:["PR1: workspace, config, principals, SQLite store (merged)","PR2: generic loop, slot pool, daemon, LaunchAgents, CLI (merged)","PR3: bootstrap.sh, status/kill/job-guard, watchdog + dead-man, structlog + spans, SDK contracts, docs"]},
-  {n:1, title:"Talk to it", status:"planned",
-   items:["1A Ollama client: thinking-off check, latency benchmark","1B tool registry + built-in read tools","1C router: keyword/template fast path, then LLM label","1D local runner (≤3 tool calls)","1E iMessage channel + self-test","1F router evals","1G Slack notifier (outbound only)"]},
+  {n:1, title:"Talk to it", status:"built", done:10, total:10,
+   items:["Ollama client: thinking-off probe, latency benchmark","Built-in read tools, registry/gate/executor wiring, GET /api/tools","Router: deterministic fast path, then one LLM label","Local runner (≤3 read-tool calls through gate → executor)","iMessage reader, sender, channel + self-test","Router evals (resonant eval router)","Brain health: monitor, owner alerts, dead-man reasons","Mini go-live checklist + bootstrap --check","End-to-end wiring, acceptance tests, resonant bench e2e (Mini numbers pending go-live)","Slack notifier dropped from core (extensions own Slack)"]},
   {n:2, title:"Gate + executor", status:"planned",
    items:["L0–L3, approvers + permission checks","Text-reply approvals: codes, parser, classifier","Pay strict path, veto wait, kill switch + paused","Keychain injection, audit with requested_by/approved_by","Scope + commit-pause interfaces","Approval classifier evals"]},
   {n:3, title:"Extensions", status:"planned",

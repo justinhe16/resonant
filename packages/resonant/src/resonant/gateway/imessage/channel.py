@@ -8,7 +8,7 @@ Usage::
     result = await channel.self_test()      # SelfTestResult(ok, detail)
     await channel.stop()
 
-Nothing in the daemon starts it yet (the daemon wiring ticket does).
+The daemon builds and starts it when ``channels.imessage.enabled`` (``resonant.wiring``).
 
 **Outbound allowlist.** ``send(principal, ...)`` takes a principal *name*, never a handle.
 The destination is resolved only from principals.yaml: the handle in

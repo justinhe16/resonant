@@ -3,6 +3,13 @@
 launchd (KeepAlive) supervises the process. SIGTERM/SIGINT trigger a graceful stop:
 in-flight steps get a short grace period, and anything unfinished resumes from its
 checkpoint on the next start.
+
+With ``channels.imessage.enabled`` the daemon also runs the Phase 1 stack
+(``resonant.wiring``): the iMessage channel feeds ``loop.submit``, the router is the loop's
+router hook, ``runner="local"`` answers, and the health monitor runs. On shutdown the
+reader and monitor stop first (no new events), then the loop drains in-flight steps (which
+may still send their replies), then the model client closes. With it disabled, the daemon
+is exactly Phase 0.
 """
 
 from __future__ import annotations
@@ -12,6 +19,7 @@ import contextlib
 import logging
 import signal
 from collections.abc import Generator
+from typing import TYPE_CHECKING
 
 import uvicorn
 
@@ -23,6 +31,11 @@ from resonant.loop import Loop, SlotPool
 from resonant.loop.echo import EchoRunner
 from resonant.observability import configure_logging
 from resonant.store.db import open_db, utcnow
+
+if TYPE_CHECKING:
+    from resonant.gateway.imessage.sender import OsaRunner
+    from resonant.models import ModelClient
+    from resonant.wiring import IMessageStack
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +49,17 @@ class _Server(uvicorn.Server):
 
 
 class Daemon:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        model: ModelClient | None = None,
+        osa_runner: OsaRunner | None = None,
+    ) -> None:
+        """``model`` and ``osa_runner`` replace Ollama and osascript (tests, ``bench e2e``).
+
+        They are used only when ``channels.imessage.enabled`` is true.
+        """
         self.settings = settings
         self.conn = open_db(settings.db_path)
         self.loop = Loop(
@@ -47,6 +70,20 @@ class Daemon:
         )
         self.state = DaemonState(settings, self.conn, self.loop, started_at=utcnow())
         self.state.components = build_components(settings, self.conn, self.state)
+        self.imessage: IMessageStack | None = None
+        if settings.channels.imessage.enabled:
+            from resonant.wiring import build_imessage_stack
+
+            self.imessage = build_imessage_stack(
+                settings,
+                self.conn,
+                self.state.components,
+                self.loop,
+                daemon_healthy=self.healthy,
+                model=model,
+                osa_runner=osa_runner,
+            )
+            self.state.monitor = self.imessage.monitor
         self.server = _Server(
             uvicorn.Config(
                 create_app(self.state),
@@ -86,11 +123,19 @@ class Daemon:
             with contextlib.suppress(NotImplementedError, RuntimeError):
                 aio.add_signal_handler(sig, self.stop)
 
+        if self.imessage is not None:
+            try:
+                await self.imessage.start(self.loop)
+            except Exception:
+                log.exception("imessage channel failed to start")
+                await self.imessage.aclose()
+                self.conn.close()
+                return 1
         loop_task = asyncio.create_task(self.loop.run(), name="loop")
         server_task = asyncio.create_task(self._serve(), name="api")
         stop_task = asyncio.create_task(self._stop.wait(), name="stop")
         aux = [asyncio.create_task(heartbeat_task(self.heartbeat), name="heartbeat")]
-        monitor = self.state.monitor  # None until wired (channels.imessage.enabled)
+        monitor = self.state.monitor  # set only when channels.imessage.enabled
         why = None if monitor is None else monitor.deadman_reason
         if url := self.settings.health.healthchecks_url:
             aux.append(
@@ -104,10 +149,11 @@ class Daemon:
         watchdog = Watchdog(self.heartbeat, self.settings.health.watchdog_stale_s)
         watchdog.start()
         log.info(
-            "resonant daemon started (api %s:%s, dry_run=%s)",
+            "resonant daemon started (api %s:%s, dry_run=%s, imessage=%s)",
             self.settings.api.host,
             self.settings.api.port,
             self.settings.dry_run,
+            "on" if self.imessage is not None else "off",
         )
         done, _ = await asyncio.wait(
             {loop_task, server_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
@@ -117,6 +163,8 @@ class Daemon:
             log.error("component exited unexpectedly: %s", [t.get_name() for t in done])
 
         self.server.should_exit = True
+        if self.imessage is not None:
+            await self.imessage.stop()  # no new events while the loop drains
         self.loop.stop()
         stop_task.cancel()
         for t in aux:
@@ -128,6 +176,8 @@ class Daemon:
             if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
                 log.error("component error during shutdown: %r", r)
                 crashed = True
+        if self.imessage is not None:
+            await self.imessage.aclose()
         self.conn.close()
         log.info("resonant daemon stopped")
         return 1 if crashed else 0

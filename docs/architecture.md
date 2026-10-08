@@ -38,19 +38,40 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Observability: JSON logs, spans | `resonant/observability/` | Phase 0 ✅ |
 | Contracts: Event, ToolSpec, Manifest, ToolRegistry, Gate (tokens, reply binding), Channel, Executor | `resonant_sdk/`, `resonant/tools/`, `resonant/gate/`, `resonant/gateway/`, `resonant/executor.py` | Phase 0 ✅ (DryRunGate) |
 | Extension authoring guide + `resonant ext validate` | `docs/extensions.md`, `resonant/cli.py` | Phase 0 ✅ |
-| Built-in read tools (`list_tasks`, `task_counts`, `system_status`, `daemon_status`, `model_status`); registry, `DryRunGate` and executor wired into the daemon; `GET /api/tools` | `resonant/tools/builtin.py`, `resonant/components.py`, `resonant/api.py` | Phase 1 |
-| Model client (Ollama native or OpenAI-compatible), `resonant model probe/bench` | `resonant/models/`, `resonant/cli.py` | Phase 1 |
-| Router: deterministic fast path (slash commands, anchored keywords, owner-only `/kill`), one-call LLM intent label with stable prompt prefixes, principal-filtered toolsets | `resonant/router/` | Phase 1 |
-| Brain health: `HealthMonitor` (model, imessage, loop, store checks), owner alerts over iMessage, dead-man `/fail` reasons, `GET /api/channels`, `/api/status.health` | `resonant/monitor.py`, `resonant/health.py`, `resonant/api.py` | Phase 1 (daemon wiring pending: e2e ticket) |
-| Local runner: ≤3 read-tool calls through gate and executor, number-guarded reply over the channel, crash-safe resend | `resonant/runners/local.py` | Phase 1 |
-| iMessage channel, Slack notifier | — | Phase 1 |
-| Router evals: `resonant eval router` (production `classify`, accuracy, confusion, p50/p95 per path; texts only in terminal output) | `resonant/evals/`, `evals/README.md` | Phase 1 |
+| Built-in read tools (`list_tasks`, `task_counts`, `system_status`, `daemon_status`, `model_status`); registry, `DryRunGate` and executor wired into the daemon; `GET /api/tools` | `resonant/tools/builtin.py`, `resonant/components.py`, `resonant/api.py` | Phase 1 ✅ |
+| Model client (Ollama native or OpenAI-compatible), `resonant model probe/bench` | `resonant/models/`, `resonant/cli.py` | Phase 1 ✅ |
+| Router: deterministic fast path (slash commands, anchored keywords, owner-only `/kill`), one-call LLM intent label with stable prompt prefixes, principal-filtered toolsets | `resonant/router/` | Phase 1 ✅ |
+| Brain health: `HealthMonitor` (model, imessage, loop, store checks), owner alerts over iMessage, dead-man `/fail` reasons, `GET /api/channels`, `/api/status.health` | `resonant/monitor.py`, `resonant/health.py`, `resonant/api.py` | Phase 1 ✅ |
+| Local runner: ≤3 read-tool calls through gate and executor, number-guarded reply over the channel, crash-safe resend | `resonant/runners/local.py` | Phase 1 ✅ |
+| iMessage channel: chat.db reader (WAL watch + polling, principal map, self-handle skip), osascript sender (argv only, allowlist, dedupe, rate limit), self-test, `resonant selftest imessage` | `resonant/gateway/imessage/` | Phase 1 ✅ |
+| Phase 1 wiring: channel → loop → router → local runner → channel, health monitor, clean SIGTERM; off by default (`channels.imessage.enabled`); in-process E2E tests and `resonant bench e2e` | `resonant/wiring.py`, `resonant/daemon.py`, `resonant/e2e/`, `tests/test_e2e.py` | Phase 1 ✅ |
+| Mini go-live checklist, `scripts/bootstrap.sh --check` | `docs/go-live.md`, `scripts/` | Phase 1 ✅ |
+| Slack notifier | — | Not in core (no Slack in core; extensions own Slack) |
+| Router evals: `resonant eval router` (production `classify`, accuracy, confusion, p50/p95 per path; texts only in terminal output) | `resonant/evals/`, `evals/README.md` | Phase 1 ✅ |
 | Real gate (L0–L3, text-reply approvals, veto, kill switch), Keychain injection | — | Phase 2 |
 | Extension manager (`ext add`, CLI/MCP tools, scheduler, critical-job plists) | — | Phase 3 |
 | Dashboard (Vite + React + shadcn, streak look) | — | Phase 4 |
 | Two-way Slack, Claude runner | — | Phase 5 |
 | On-call extension | — | Phase 6 |
 | Life lane: Gmail, Calendar, iMessage, payments, browser, computer use | private repo, with core runner/scope support | Phase 7 |
+
+## Phase 1 request path and latency
+
+```
+chat.db row ─(WAL watch 250ms + 100ms debounce; 2s poll fallback)─> IMessageReader ─> loop.submit
+  ─> Router.route: fast path (one gated builtin read, templated reply)  │ or one LLM label call
+  ─> NewTask(runner="local") ─> LocalRunner: send fast_reply │ ≤3 tool calls (gate → executor) + answer
+  ─> IMessageChannel.send (dedupe "reply:<task id>") ─> osascript
+```
+
+The Phase 1 exit criterion is **text → answer in 2–3s**: p50 ≤ 1s on the fast path and p50 ≤ 3s on the labeled path, measured by `resonant bench e2e` from the chat.db row insert to the osascript call (Messages.app delivery and osascript's own run time excluded; the self-test covers that path).
+
+| Run | Model | fast p50 / p95 | llm p50 / p95 |
+|---|---|---|---|
+| Dev machine, `--model fake` (n=20; CI runs the same code) | scripted | 354 / 370 ms | 354 / 361 ms |
+| Mac mini, `--model real` | `qwen3:30b-a3b` (Ollama) | pending go-live checklist (PER-234) | pending go-live checklist (PER-234) |
+
+With the scripted model nearly all of the time is the reader's WAL-watch interval plus its debounce, so the harness overhead is about 0.35s; on the Mini the labeled path adds the label call, up to three tool rounds, and the answer call.
 
 ## Task lifecycle
 
@@ -98,7 +119,7 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 
 - **Watchdog.** An asyncio heartbeat beats every second, and a separate thread calls `os._exit(1)` if it goes stale. launchd then restarts the daemon.
 - **Dead-man switch.** It pings healthchecks.io while the loop is ticking and sends `/fail` when it isn't. A whole-process freeze (SIGSTOP), a power cut, or a reboot waiting at the FileVault login all stop the pings, and healthchecks.io alerts.
-- **iMessage self-test (Phase 1).** It runs at startup, and the health monitor re-runs it every 6h; a failure (AppleScript or the `chat.db` schema broke) degrades the `imessage` check. It sends a random nonce to Resonant's own handle and waits for the reader to see it; the result is kept in kv `imessage.selftest`. `resonant selftest imessage` runs the same check by hand, next to a live daemon.
+- **iMessage self-test (Phase 1).** The health monitor runs it on its first round after start whenever it is due (none yet, older than 6h, or a failure older than 30 min) and re-runs it every 6h; a failure (AppleScript or the `chat.db` schema broke) degrades the `imessage` check. It sends a random nonce to Resonant's own handle and waits for the reader to see it; the result is kept in kv `imessage.selftest`. `resonant selftest imessage` runs the same check by hand, next to a live daemon.
 - **Health monitor (Phase 1).** `resonant/monitor.py` evaluates `model`, `imessage`, `loop` and `store` every 60s, keeps an `ok → degraded → ok` state per check in kv `health.<check>`, and texts the owner over iMessage ("hey, some issues here: …", then "resolved: …"), at most once per check per 6h. Slack is never involved: it belongs to extensions. When iMessage itself is degraded, nothing is sent over it, and the dead-man `/fail` ping carries the reason as a plain-text body instead. State shows in `/api/status.health`, `GET /api/channels` and `resonant status`.
 
 ## Decisions log
@@ -121,3 +142,4 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 | 2026-10-08 | Router fast-path reads go through the gate but not the executor: no task exists at route time, and builtins are L0 reads with no side effect. `/kill` and `/resume` are deterministic and owner-only, never decided by the model. |
 | 2026-10-08 | Manifests load with a YAML loader where only true/false are booleans, so `notify: {on: [...]}` stays a string key. |
 | 2026-10-08 | The local runner replays tool calls to the model as assistant/user turns (no `tool` role in `ChatMessage`), guards every number in its reply against tool output and the user's message, and escalates run_project or >3 calls with a templated reply instead of calling Claude. |
+| 2026-10-08 | Phase 1 is wired in one place (`resonant/wiring.py`) and only when `channels.imessage.enabled`; disabled, the daemon is exactly Phase 0. The local runner's step limit is derived from the model timeout (`(3 + 1) × timeout_s + 15s`), so the model client times out first and the user always gets a fallback reply. Shutdown stops the reader and monitor before the loop drains, so in-flight replies still go out. |

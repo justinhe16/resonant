@@ -450,3 +450,62 @@ def eval_router(
         echo_err=lambda s: typer.echo(s, err=True),
     )
     raise typer.Exit(code)
+
+
+# --- benchmarks ------------------------------------------------------------------------
+
+bench_app = typer.Typer(no_args_is_help=True, help="End-to-end latency benchmarks.")
+app.add_typer(bench_app, name="bench")
+
+
+@bench_app.command("e2e")
+def bench_e2e(
+    n: Annotated[int, typer.Option("--n", min=1, help="Timed prompts per path.")] = 10,
+    model: Annotated[
+        str,
+        typer.Option(help="fake: scripted model (CI). real: the configured Ollama model."),
+    ] = "fake",
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Time chat.db row -> send call through the real router, runner and channel (p50/p95).
+
+    Runs in a throwaway home with a fake chat.db and a recording osascript runner, so it
+    never texts anyone and is safe next to a live daemon. Exit 1 if a prompt got no reply
+    or a p50 misses its target (fast <= 1s, llm <= 3s); 2 for a bad --model.
+    """
+    import asyncio
+
+    from resonant.e2e.bench import report, run_e2e_bench
+
+    if model not in ("fake", "real"):
+        typer.echo("--model must be 'fake' or 'real'", err=True)
+        raise typer.Exit(2)
+
+    async def go() -> dict[str, Any]:
+        if model == "fake":  # needs no local config
+            return report(await run_e2e_bench(n), model_name="fake (scripted)")
+        from resonant.models import OllamaClient
+
+        settings = load_settings()
+
+        async with OllamaClient(settings.model) as client:
+            results = await run_e2e_bench(n, model=client, base=settings)
+        return report(results, model_name=f"{settings.model.name} ({settings.model.api})")
+
+    data = asyncio.run(go())
+    if as_json:
+        typer.echo(json.dumps(data, indent=2))
+    else:
+        typer.echo(f"e2e bench, model {data['model']}, n={n} per path, warmed up")
+        for r in data["results"]:
+            verdict = "ok" if r["pass"] else "MISS"
+            if "p50_ms" in r:
+                typer.echo(
+                    f"  {r['path']:<5} p50 {r['p50_ms']:>6} ms   p95 {r['p95_ms']:>6} ms"
+                    f"   target p50 <= {r['target_p50_ms']} ms   failures {r['failures']}/{n}"
+                    f"   {verdict}"
+                )
+            else:
+                typer.echo(f"  {r['path']:<5} no replies ({r['failures']}/{n} timed out)   MISS")
+    if not data["pass"]:
+        raise typer.Exit(1)
