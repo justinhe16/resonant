@@ -1,0 +1,26 @@
+# Example extension: the smallest useful resonant.yaml. Copy this to start your own.
+# Real extensions live in their own repos and depend only on resonant-sdk.
+name: example
+version: 1
+approvers: [owner]
+
+jobs:
+  - id: morning-ping
+    schedule: "0 8 * * 1-5"            # cron, evaluated in the daemon timezone unless tz is set
+    run: ./cli.py ping
+
+tools:
+  get_time:
+    description: Current time in a timezone.
+    run: ./cli.py time --tz {tz}
+    effect: read                       # read, no secrets: always L0 (acts silently)
+    args: {tz: string}
+  write_note:
+    description: Append a line to the example notes file.
+    run: ./cli.py note --text {text}
+    effect: write                      # write defaults to L1 (approval first)
+    level: L3                          # reversible + tiny blast radius: act, then report
+    args: {text: string}
+
+notify: {on: [ping], channel: imessage}
+health: {check: ./cli.py health, every: 5m}

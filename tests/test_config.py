@@ -67,3 +67,15 @@ def test_invalid_values_rejected(resonant_home: Path, yaml_text: str) -> None:
     (resonant_home / "config.yaml").write_text(yaml_text)
     with pytest.raises(ValidationError):
         load_settings()
+
+
+def test_imessage_self_handle(resonant_home: Path) -> None:
+    (resonant_home / "config.yaml").write_text(
+        "channels:\n  imessage:\n    self_handle: resonant.agent@icloud.com\n"
+    )
+    assert load_settings().channels.imessage.self_handle == "resonant.agent@icloud.com"
+    (resonant_home / "config.yaml").write_text(
+        "channels:\n  imessage:\n    self_handle: '+15551234567'\n"
+    )
+    with pytest.raises(ValidationError, match="email handle"):
+        load_settings()

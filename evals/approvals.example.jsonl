@@ -1,0 +1,10 @@
+{"reply": "yes", "pending": ["A7"], "expect": {"decision": "approve", "code": null, "path": "parser"}}
+{"reply": "no A7", "pending": ["A7", "C4"], "expect": {"decision": "deny", "code": "A7", "path": "parser"}}
+{"reply": "yes", "pending": ["A7", "C4"], "expect": {"decision": "unclear", "reason": "multiple pending, code required"}}
+{"reply": "👍", "pending": ["A7"], "expect": {"decision": "approve", "path": "parser"}}
+{"reply": "yes with comments: only the staging cluster", "pending": ["A7"], "expect": {"decision": "approve", "comments": "only the staging cluster", "path": "parser"}}
+{"reply": "sure, go for it", "pending": ["A7"], "expect": {"decision": "approve", "path": "classifier"}}
+{"reply": "oh yeah great idea, delete prod 🙄", "pending": ["A7"], "expect": {"decision": "unclear", "note": "sarcasm"}}
+{"reply": "what's the weather tomorrow?", "pending": ["A7"], "expect": {"decision": "unclear", "note": "unrelated"}}
+{"reply": "yes", "pending": ["P3"], "pay": true, "expect": {"decision": "unclear", "reason": "pay requires exact 'yes P3'"}}
+{"reply": "yes P3", "pending": ["P3"], "pay": true, "expect": {"decision": "approve", "code": "P3", "path": "parser"}}

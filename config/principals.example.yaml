@@ -3,7 +3,8 @@
 principals:
   owner:
     role: owner                         # everything, incl. kill switch + global settings
-    identities: ["imessage:+15550000000", "slack:U00000000"]
+    # Every handle you might text from: phone number and Apple ID email.
+    identities: ["imessage:+15550000000", "imessage:owner@icloud.com", "slack:U00000000"]
   cofounder:
     identities: ["slack:U11111111"]
     grants:

@@ -75,6 +75,39 @@ class transaction:
             raise
 
 
+class atomic:
+    """Like :class:`transaction`, but joins an enclosing transaction via a SAVEPOINT.
+
+    For small helpers (audit, spans, gate and executor bookkeeping) that may be called
+    both standalone and from inside a caller's transaction.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self._nested = False
+
+    def __enter__(self) -> sqlite3.Connection:
+        self._nested = self.conn.in_transaction
+        self.conn.execute("SAVEPOINT resonant_atomic" if self._nested else "BEGIN IMMEDIATE")
+        return self.conn
+
+    def __exit__(self, exc_type: type[BaseException] | None, *_: object) -> None:
+        if self._nested:
+            if exc_type is not None:
+                self.conn.execute("ROLLBACK TO resonant_atomic")
+            self.conn.execute("RELEASE resonant_atomic")
+            return
+        if exc_type is not None:
+            self.conn.execute("ROLLBACK")
+            return
+        try:
+            self.conn.execute("COMMIT")
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute("ROLLBACK")
+            raise
+
+
 def _migrations() -> list[tuple[int, str]]:
     found: list[tuple[int, str]] = []
     for entry in resources.files("resonant.store.migrations").iterdir():
@@ -129,6 +162,39 @@ def migrate(conn: sqlite3.Connection, migrations: list[tuple[int, str]] | None =
 def open_db(path: Path | str) -> sqlite3.Connection:
     conn = connect(path)
     migrate(conn)
+    return conn
+
+
+def latest_version() -> int:
+    return max((v for v, _ in _migrations()), default=0)
+
+
+class StoreUnavailableError(RuntimeError):
+    pass
+
+
+def open_existing(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
+    """Open an existing, fully migrated database without creating or migrating anything.
+
+    For tools that must fail closed (job-guard) or must not mutate state (status).
+    Raises StoreUnavailableError if the file is missing or its schema is behind.
+    """
+    if not path.is_file():
+        raise StoreUnavailableError(f"{path} does not exist")
+    mode = "ro" if readonly else "rw"
+    try:
+        conn = sqlite3.connect(
+            f"file:{path}?mode={mode}", uri=True, isolation_level=None, check_same_thread=False
+        )
+    except sqlite3.Error as e:
+        raise StoreUnavailableError(f"cannot open {path}: {e}") from e
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    if not readonly:
+        conn.execute("PRAGMA foreign_keys=ON")
+    if (version := schema_version(conn)) < latest_version():
+        conn.close()
+        raise StoreUnavailableError(f"{path} schema v{version} < v{latest_version()}")
     return conn
 
 
