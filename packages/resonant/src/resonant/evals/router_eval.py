@@ -94,6 +94,7 @@ def load_set(path: Path) -> list[EvalCase]:
             raise EvalSetError(f"{path}:{n}: not valid JSON") from None
         if not isinstance(obj, dict):
             raise EvalSetError(f"{path}:{n}: expected a JSON object")
+        # json.loads returns Any; the isinstance check above makes this a JSON object.
         row: dict[str, Any] = obj  # pyright: ignore[reportUnknownVariableType]
         text = row.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -101,6 +102,7 @@ def load_set(path: Path) -> list[EvalCase]:
         intent = parse_intent(row.get("intent"))
         if intent is None:
             raise EvalSetError(f"{path}:{n}: 'intent' must be one of {', '.join(INTENTS)}")
+        # Validated but not passed on: classify routes from the owner's point of view.
         if row.get("principal", "owner") != "owner":
             raise EvalSetError(f"{path}:{n}: only principal 'owner' is supported")
         cases.append(EvalCase(n, text, intent))
