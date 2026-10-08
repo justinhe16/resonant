@@ -44,7 +44,7 @@ known-first-party = ["resonant", "resonant_sdk"]
 "tests/**" = ["S"]
 
 [tool.pyright]
-include = ["packages", "tests"]
+include = ["packages", "scripts", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false

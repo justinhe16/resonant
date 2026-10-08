@@ -18,6 +18,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: bash -n scripts/*.sh
+      - run: shellcheck scripts/*.sh
+
   test:
     runs-on: macos-latest
     steps:

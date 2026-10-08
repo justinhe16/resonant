@@ -13,6 +13,8 @@ scripts/bootstrap.sh          # deps, venv, ~/.resonant, LaunchAgents, local mod
 resonant status               # or: .venv/bin/resonant status
 ```
 
+Then work through the **[go-live checklist](docs/go-live.md)** to get from a running daemon to texting Resonant over iMessage. `scripts/bootstrap.sh --check` verifies it without changing anything.
+
 ## Principles
 - The model never sees secrets. The executor injects them from the macOS Keychain at runtime.
 - A tool's effect tier (`read | write | pay`) comes from its registration, never from the model.
@@ -31,7 +33,7 @@ resonant status               # or: .venv/bin/resonant status
 | `config/*.example.yaml` | Example config. Copy it to `~/.resonant/` |
 | `scripts/bootstrap.sh` | Takes a fresh Mac to a running daemon |
 | `evals/*.example.jsonl` | Synthetic eval sets. Real sets live in `~/.resonant/evals/` |
-| `docs/` | Architecture and interface contracts |
+| `docs/` | Architecture, interface contracts, and the [go-live checklist](docs/go-live.md) |
 
 ## Development
 ```sh
