@@ -95,6 +95,23 @@ class ClaudeConfig(_Section):
         return self
 
 
+class IMessageConfig(_Section):
+    # Resonant's own Apple ID email handle (iMessage only; no phone number registered).
+    # The adapter skips it on receive and uses it for the send/receive self-test.
+    self_handle: str | None = None
+
+    @field_validator("self_handle")
+    @classmethod
+    def _email_handle(cls, v: str | None) -> str | None:
+        if v is not None and (v != v.lower() or "@" not in v):
+            raise ValueError("channels.imessage.self_handle must be a lowercase email handle")
+        return v
+
+
+class ChannelsConfig(_Section):
+    imessage: IMessageConfig = IMessageConfig()
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESONANT_",
@@ -112,6 +129,7 @@ class Settings(BaseSettings):
     health: HealthConfig = HealthConfig()
     loop: LoopConfig = LoopConfig()
     claude: ClaudeConfig = ClaudeConfig()
+    channels: ChannelsConfig = ChannelsConfig()
 
     @field_validator("home")
     @classmethod

@@ -332,7 +332,7 @@ const F = (s)=>s; // marker for file paths
 const NODES = {
   /* ---- gateway */
   imessage:{label:"iMessage channel", phase:"1 (1E)", status:"planned",
-    what:"Resonant's own Apple ID, signed into Messages.app on the Mini, is the owner's personal channel. Resonant texts the owner as a contact and can never send as them.",
+    what:"Resonant's own Apple ID, with an email handle (channels.imessage.self_handle, e.g. resonant.agent@icloud.com), is iMessage only: no SMS and no phone number. It sends only to handles listed in principals.yaml, and a principal can have several (phone and email). Resonant's own Apple ID, signed into Messages.app on the Mini, is the owner's personal channel. Resonant texts the owner as a contact and can never send as them.",
     iface:`# send — osascript via argv (never string-interpolated AppleScript)
 osascript -e 'on run argv … send item 2 of argv to buddy (item 1 of argv)' \\
           "+15551234567" "message text"
@@ -542,7 +542,7 @@ L0 act silently · L1 draft → approve · L2 act after veto window · L3 act, t
 
 classifier → {decision: approve|deny|unclear, approval_code, comments, confidence}
 approve iff decision = approve ∧ confidence ≥ 0.9   (never for pay)`,
-    inv:["Summaries are templated by code. Outside strings are quoted, truncated, and stripped of newlines and codes","The classifier sees only your reply and the summary, never tool output","At most one pending approval per (task, intent), enforced by a unique index","Approvals expire, and veto windows use waiting(veto) with wake_at"],
+    inv:["yes all approves exactly the codes in a stored batch message, never pay","The first valid reply on any channel wins (atomic update); on-call pages go to iMessage and Slack","Summaries are templated by code. Outside strings are quoted, truncated, and stripped of newlines and codes","The classifier sees only your reply and the summary, never tool output","At most one pending approval per (task, intent), enforced by a unique index","Approvals expire, and veto windows use waiting(veto) with wake_at"],
     files:["packages/resonant/src/resonant/store/migrations/001_init.sql (approvals table, built)","packages/resonant/src/resonant/gate/codes.py (codes, approval text, sanitize_external: built)"]},
   killswitch:{label:"Kill switch / paused", phase:"0 / 2", status:"partial",
     what:"A global brake that only the owner can use. While it's on, everything above L0 needs approval and L2/L3 timers are cancelled. It also sets kv.paused, which critical-job wrappers and on-call autonomy check before acting.",

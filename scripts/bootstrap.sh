@@ -88,9 +88,13 @@ $(printf '\033[1m')Manual steps (macOS won't let a script do these):$(printf '\0
      - Put the Mini on a UPS, and turn off automatic macOS updates.
 
   2. Resonant's own Apple ID (iMessage channel, Phase 1)
-     - Create a separate Apple ID for Resonant and sign it into Messages.app on
-       this Mac. Resonant texts you as a contact and can never send as you.
-     - Add your handle to $HOME_DIR/principals.yaml, e.g. imessage:+15551234567
+     - Create a dedicated Apple ID with an EMAIL handle (e.g. resonant.agent@icloud.com).
+       Don't attach a phone number. Resonant uses iMessage only, never SMS.
+     - Sign it into Messages.app on this Mac (Settings > iMessage: enable that email only).
+     - Set channels.imessage.self_handle in $HOME_DIR/config.yaml.
+     - Add every handle you text from (phone number AND Apple ID email) to
+       $HOME_DIR/principals.yaml, e.g. imessage:+15551234567, imessage:you@icloud.com.
+       Resonant only ever messages handles listed there.
 
   3. Privacy permissions (System Settings > Privacy & Security)
      - Full Disk Access for the daemon's interpreter (needed to read chat.db):
@@ -99,6 +103,8 @@ $(printf '\033[1m')Manual steps (macOS won't let a script do these):$(printf '\0
        changes the path, which silently drops the grant. Re-run this script after
        upgrading Python. 'resonant status' reports when chat.db is unreadable.
      - Automation: allow the daemon to control Messages (prompted on first send).
+     - Then run the send/receive self-test (available once the iMessage channel ships):
+         $RESONANT selftest imessage
 
   4. Secrets (only the executor reads these)
        security add-generic-password -s resonant -a <secret_name> -w

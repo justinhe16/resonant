@@ -9,7 +9,9 @@ from unknown identities are dropped and audited. An adapter never emits an event
 
 Content is untrusted input. Identity grants permissions, and message text never does.
 
-Outbound: sends are deduped by ``dedupe_key`` (the events idempotency key), rate-limited
+Outbound: ``send`` takes a principal, never a raw address, and goes only to that
+principal's identities from principals.yaml. Any other destination is refused and
+audited. Sends are deduped by ``dedupe_key`` (the events idempotency key), rate-limited
 by the adapter, and never interpolate text into scripts (e.g. osascript gets argv).
 """
 

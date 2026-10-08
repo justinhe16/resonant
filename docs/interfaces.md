@@ -180,6 +180,13 @@ Request (`resonant.gate.codes`):
    - Its output is `{decision: approve|deny|unclear, approval_code, comments, confidence}`.
    - It approves only if `decision == approve` and `confidence >= 0.9`. Anything else is unclear and gets a re-ask.
 
+**Batch approvals:** when an approver has several pending approvals, Resonant may send one *batch message* that lists their codes. The batch snapshot is stored.
+- A `yes all` reply approves **exactly the approvals in that snapshot**: never ones that arrived later, never pay, and never any the replier isn't an approver for.
+- The audit log records the batch id and each approval it resolved.
+- Outside a batch reply, a plain `yes` with several approvals pending is ambiguous and gets a re-ask.
+
+**Concurrency:** resolution is atomic (`UPDATE approvals … WHERE status = 'pending'`), so the first valid reply on any channel wins. On-call pages (Phase 6) go to iMessage and Slack together with one dedupe key; the other channel's message is updated to "resolved by X via Y".
+
 **Pay:** only a deterministic exact match that includes the code (`yes P3`) counts. The classifier is never used, and the same rule applies on Slack.
 
 **Comments:** `yes with comments: …` approves and appends a `human_input` event to the task, which the runner treats as a constraint.
@@ -229,7 +236,9 @@ Every adapter must:
 - Treat all message content as untrusted.
 
 **iMessage** (Phase 1):
-- Resonant's own Apple ID is signed into Messages.app.
+- Resonant's own Apple ID, with an **email handle** (`channels.imessage.self_handle`, e.g. `resonant.agent@icloud.com`), is signed into Messages.app. It is iMessage only: no SMS, and no phone number on Resonant's account. Rows are still checked for `service='iMessage'` as a second guard.
+- A principal may list several handles (phone number and Apple ID email). A sender handle that maps to nobody is dropped and audited.
+- **Outbound allowlist:** it sends only to handles listed in principals.yaml (`send` takes a principal, never a raw handle). Any other destination is refused and audited.
 - **Send:** osascript.
 - **Receive:** reads `~/Library/Messages/chat.db` read-only:
   - It is opened with `mode=ro` and never written to, WAL included.

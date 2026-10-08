@@ -105,6 +105,8 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 | 2026-10-08 | LaunchAgent (GUI session), not LaunchDaemon. FileVault stays on, with a UPS and `fdesetup authrestart` for planned reboots. Manual login after an unplanned reboot is accepted. |
 | 2026-10-08 | iMessage replaces Telegram. Resonant has its own Apple ID. Slack is shared and is the fallback channel. |
 | 2026-10-08 | Approvals by text reply with codes, a two-stage parser and classifier, and a strict pay path. |
+| 2026-10-08 | Resonant's Apple ID uses an email handle and iMessage only (`channels.imessage.self_handle`). Principals may list several handles. Outbound goes only to principals' handles. |
+| 2026-10-08 | `yes all` approves a stored batch snapshot, never pay. On-call pages go to iMessage and Slack, and the first resolution wins. |
 | 2026-10-08 | Public repo from Phase 0. gitleaks runs in pre-commit and CI. Only `*.example` configs ship. Real eval sets stay out of the repo. |
 | 2026-10-08 | LaunchAgent plists are generated with `plistlib` instead of template files. |
 | 2026-10-08 | `waiting(ci)` polls CI through `gh` on the tick. No inbound GitHub webhooks. |

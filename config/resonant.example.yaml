@@ -23,3 +23,8 @@ loop:
 claude:
   max_concurrent: 5
   reserved_oncall_slots: 1
+
+channels:
+  imessage:
+    # Resonant's own Apple ID (email handle, iMessage only, no phone number).
+    self_handle: resonant.agent@icloud.com
