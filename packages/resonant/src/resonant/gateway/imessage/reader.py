@@ -1,7 +1,7 @@
 """iMessage inbound reader: new rows in Messages' ``chat.db`` become Events.
 
 This is the receive half of the iMessage channel. The channel adapter (sender ticket)
-composes it; nothing in the daemon starts it yet.
+composes it, and the daemon starts it when ``channels.imessage.enabled``.
 
 Usage::
 

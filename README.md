@@ -2,7 +2,7 @@
 
 An always-on agent harness that runs as a daemon on a dedicated Mac. It takes events in from iMessage, Slack, webhooks and schedules, and routes simple requests to a local LLM. Hard reasoning and coding go to Claude Code. Every side effect passes an approval gate. Product-specific behaviour lives in **extensions**: separate repos that plug in through a `resonant.yaml` manifest.
 
-> Status: Phase 0 (skeleton) is done. The daemon runs, but it has no channels or runners yet. Phase 1 adds iMessage and the local model.
+> Status: Phase 1 (talk to it) is built: with `channels.imessage.enabled`, you text Resonant over iMessage and the local model answers with read-only tools. It stays off by default until the [go-live checklist](docs/go-live.md) passes. Phase 2 adds the real gate and approvals.
 
 **Architecture:** open [`docs/architecture.html`](docs/architecture.html) for an interactive diagram, or read [`docs/architecture.md`](docs/architecture.md). The frozen contracts are in [`docs/interfaces.md`](docs/interfaces.md).
 

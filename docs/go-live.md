@@ -137,6 +137,11 @@ The synthetic set in `evals/` only proves the pipeline. Gate on your own texts.
 - **Verify:** `resonant eval router --set ~/.resonant/evals/router.jsonl`
 - **Expected:** accuracy **≥ 90%**. If it is lower, look at the misroutes before going live. `--check` doesn't run evals. It prints `router eval  SKIP` with a pointer here.
 
+### End-to-end latency (Phase 1 exit criterion)
+
+- **Verify:** `resonant bench e2e --model real --n 20` (after step 8, with the model warm). It runs the real reader, router, local runner and channel against the configured Ollama model in a throwaway home, with a fake chat.db and a recording osascript runner, so it never texts anyone and is safe next to the live daemon.
+- **Expected:** exit 0: `fast` p50 ≤ 1000 ms and `llm` p50 ≤ 3000 ms. **Record the numbers** (date, model, macOS version) in the latency table in `docs/architecture.md`, replacing "pending go-live checklist".
+
 ## 10. Tailnet access to the dashboard
 
 The API binds to `127.0.0.1` only (config validation enforces it). Tailscale is the only way in.

@@ -103,7 +103,7 @@ class IMessageConfig(_Section):
     # Resonant's own Apple ID email handle (iMessage only; no phone number registered).
     # The adapter skips it on receive and uses it for the send/receive self-test.
     self_handle: str | None = None
-    # Inbound reader (resonant.gateway.imessage.reader). Off until the daemon wires it in.
+    # Turns on the Phase 1 stack (resonant.wiring): reader, router, local runner, monitor.
     enabled: bool = False
     # Opened read-only (mode=ro); needs Full Disk Access for the daemon's Python.
     db_path: Path = Field(default=Path("~/Library/Messages/chat.db"), validate_default=True)

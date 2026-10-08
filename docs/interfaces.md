@@ -326,7 +326,7 @@ Every adapter must:
   - When `text` is NULL, it parses `attributedBody`.
   - Implemented by `resonant.gateway.imessage.IMessageReader(config, principals, conn, clock)`: `async run(submit)`, `stop()`, `poll_once(submit)`, `health() -> {ok, last_read_at, last_error, fda_ok}`, and `register_selftest_callback(cb) -> unregister`. Events are `source="imessage"`, `type="message"`, `dedupe_key="imessage:<guid>"`, payload `{text, guid, handle, chat_guid, at, truncated}`. The cursor is kv `imessage.cursor`; a first start begins at the newest row. Audits (never with bodies): `imessage.unknown_sender`, `imessage.group_ignored`, `imessage.parse_failed`, `imessage.rate_limited`, `imessage.cursor_reset`.
   - Bodies matching `^resonant-selftest:[A-Za-z0-9_-]{8,}$` go only to the self-test callbacks, whatever their direction or sender, and never become events.
-- **Adapter:** `resonant.gateway.imessage.IMessageChannel(config, principals, conn, *, runner=None, reader=None, clock, monotonic, sleep)` implements `Channel` with `name="imessage"`. `start(submit)` sweeps expired send records and runs the reader as a task; `stop()` stops it; `health()` is the reader's health. The daemon does not start it yet.
+- **Adapter:** `resonant.gateway.imessage.IMessageChannel(config, principals, conn, *, runner=None, reader=None, clock, monotonic, sleep)` implements `Channel` with `name="imessage"`. `start(submit)` sweeps expired send records and runs the reader as a task; `stop()` stops it; `health()` is the reader's health. The daemon builds and starts it when `channels.imessage.enabled` (see Daemon wiring).
   - `send(principal, text, *, thread=None, dedupe_key=None) -> MessageRef(channel="imessage", ref="imessage-out:<id>")`. The handle is `channels.imessage.preferred_handles[principal]` if that is one of the principal's `imessage:` identities, else the first one. Otherwise `ChannelRefused`, audited `imessage.send_refused`. `thread` is ignored (1:1 chats).
   - Dedupe: a `dedupe_key` already sent returns the earlier ref without sending. Records are kv `imessage.sent:<sha256(key)>` = `{ref, at}`, valid 7 days, swept by `start()`. A send that fails partway is not recorded.
   - Rate limit: a token bucket per principal of `channels.imessage.outbound_per_minute` (default 60), one token per part. A short bucket waits up to 30s (audited `imessage.send_rate_limited`, `decision="delayed"`); longer raises `ChannelRateLimited` (`decision="refused"`). Sends are serialized.
@@ -335,7 +335,7 @@ Every adapter must:
   - Audits (never with bodies): `imessage.sent` (`requested_by`, `idempotency_key`, handle, length, chunks, ref), `imessage.send_failed` (reason, code, chunk), `imessage.send_refused`, `imessage.send_rate_limited`, `imessage.selftest`.
 - **Self-test:** `IMessageChannel.self_test(*, timeout_s=10) -> SelfTestResult(ok, detail)` sends `resonant-selftest:<nonce>` to `self_handle` and waits for a reader to see it. Only this run's in-memory nonce from `self_handle` counts: the `is_from_me = 1` row proves the send and the read path (required); the incoming copy is reported in `detail` but optional. Automation denied, Full Disk Access missing (checked before sending), a missing `self_handle`, and a timeout each give `ok=False` with the fix in `detail`. The result is stored in kv `imessage.selftest` = `{ok, at, detail}` and audited `imessage.selftest`.
   - On a started channel it listens on the running reader (after its first read). Otherwise it polls a private reader with its own cursor, kv `imessage.selftest.cursor` (reset each run), so `resonant selftest imessage` can run next to a live daemon without moving `imessage.cursor`. Both readers drop self-test rows, so they are never routed or answered.
-  - The daemon runs it at startup; the health monitor re-runs it and reports failures (see Health monitor). No Slack.
+  - The health monitor runs it on its first round after start whenever it is due (no result yet, the last one older than 6h, or a failed one older than 30 min), re-runs it on that schedule, and reports failures (see Health monitor). No Slack.
 
 **Slack:** outbound notifier in Phase 1, two-way Socket Mode in Phase 5.
 
@@ -418,7 +418,7 @@ channels_snapshot(conn, *, imessage_enabled, channel) -> [{name, enabled, ok, la
 - Texts and reasons are built by code from short details: URLs are replaced with `<url>`, details are capped (120 chars), and no secrets are included.
 - While the `imessage` check is degraded, or there is no channel or owner, nothing is sent over iMessage. `deadman_reason()` then returns the degraded checks; it also does so, prefixed `owner alerts failing`, after 3 consecutive failed owner sends (`"imessage: imessage selftest failed: …; model: …"`), else None.
 - `deadman_task`: while `healthy()` and `reason()` is None it GETs `url`; otherwise it POSTs `url/fail` with a `text/plain` body (≤ 500 chars): the reason, prefixed by `event loop stale` when the loop is stale. Ping failures log only the exception type; the URL is never logged.
-- The daemon starts `DaemonState.monitor.run()` and passes `deadman_reason` to the dead-man only when `DaemonState.monitor` is set. Nothing sets it yet: the end-to-end wiring (PER-240) builds it when `channels.imessage.enabled`. Without it, `/api/status.health` shows `unknown` and `/api/channels` shows the channel's config and last self-test.
+- The daemon starts `DaemonState.monitor.run()` and passes `deadman_reason` to the dead-man only when `DaemonState.monitor` is set, which `build_imessage_stack` does when `channels.imessage.enabled` (owner: the principals.yaml owner, or None when the file is missing; `model_meta` = `{model, api}`). Without it, `/api/status.health` shows `unknown` and `/api/channels` shows the channel's config and last self-test.
 
 ## Local runner: `resonant.runners.local`
 
@@ -426,6 +426,8 @@ channels_snapshot(conn, *, imessage_enabled, channel) -> [{name, enabled, ok, la
 LocalRunner(conn, *, model: ModelClient, channel: Channel, gate: RunnerGate, executor: ToolExecutor,
             registry, max_step_s=30.0)   # name="local", uses_claude_slot=False
 ```
+
+The daemon sets `max_step_s = wiring.local_step_limit(model) = (MAX_TOOL_ITERATIONS + 1) * model.timeout_s + 15` (255s with the 60s default), so the model client's own timeout always fires first and the user gets the templated fallback instead of a cancelled step. The loop's stuck check stays a backstop.
 
 One step answers the whole task, in this order:
 
@@ -440,6 +442,21 @@ One step answers the whole task, in this order:
 
 Failures: `ModelUnavailableError` sends one templated fallback (the tool summary if tools already ran, else `FALLBACK_REPLY`) and the task is `done`. `ChannelRefused` is a final `Fail`; any other `ChannelError` is `Fail(retryable=True)`, and the dedupe key prevents a double send. Spans: `runner.local`, `runner.local.context`, `runner.local.tool`, `runner.local.final` (`outcome`: `ok | number_guard | bad_output | empty`) and `runner.local.send`, plus the model's `llm.call`. None carry message or reply text.
 
+## Daemon wiring: `resonant.wiring`, `resonant.daemon`
+
+```python
+build_imessage_stack(settings, conn, components, loop, *, daemon_healthy, model=None, osa_runner=None)
+    -> IMessageStack(channel, router, runner, monitor, model)
+IMessageStack.start(loop) / .stop() / .aclose() / .running
+local_step_limit(model_cfg) -> float
+Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | None = None)
+```
+
+- **`channels.imessage.enabled: false`** (the default): the daemon is exactly Phase 0. `loop.router` is None, `loop.runners == {"echo"}`, `DaemonState.monitor` is None, and nothing imports the model client.
+- **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner`, then `loop.runners["local"]`, `max_step_s = local_step_limit`), sets `loop.router = router.route`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta)`, which becomes `DaemonState.monitor`. `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`.
+- **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`) before the loop, then the loop, the API, the monitor and the dead-man (with `monitor.deadman_reason`).
+- **Stop** (SIGTERM/SIGINT, or a component exiting): the API is told to exit; the monitor and the chat.db reader stop first, so no new events arrive; then the loop drains in-flight steps (10s grace; a draining step can still send its reply); then the model client closes and the store closes. Unfinished steps resume from their checkpoints on the next start, and the send dedupe key (`reply:<task id>`) prevents a double reply.
+
 ## Spans and logs: `resonant.observability`
 
 - `with span(conn, name, trace_id=..., task_id=..., parent_id=..., **attrs) as s: s.set(...)` writes a row to `spans` with status and timing.
@@ -452,6 +469,7 @@ Failures: `ModelUnavailableError` sends one templated fallback (the tool summary
 - `resonant job-guard`: 75 when paused or when the state is unknown, 127 when exec fails, 2 when no command is given.
 - `resonant selftest imessage [--timeout S] [--json]`: 0 when the self-test passes, 1 otherwise. It sends a real iMessage to `self_handle`, stores kv `imessage.selftest`, and is safe to run while the daemon is up. macOS grants Automation per responsible app, so running it from a terminal proves the terminal's grant, not the daemon's.
 - `resonant model probe` and `resonant model bench`: 1 when the probe fails (model missing, context too small, or thinking not off). `bench` also exits 1 when every call of a kind failed. `probe` stores its result in kv `model.probe` if the store exists, and never creates it.
+- `resonant bench e2e [--n N] [--model fake|real] [--json]`: 0 when every prompt got a reply and each path's p50 meets its target (`fast` ≤ 1000 ms, `llm` ≤ 3000 ms), 1 otherwise, 2 for an unknown `--model`. It runs the production reader, loop, router, runner and channel in a throwaway home with a `FakeChatDB` and a `RecordingOsaRunner`, timing each prompt from the chat.db row insert to the osascript call (N per path, after one untimed warm-up per path). `--model fake` (default, CI) uses `ScriptedModel`; `--model real` uses the configured Ollama model. It never texts anyone and never touches `~/.resonant/resonant.db`.
 - `resonant eval router [--set PATH] [--repeat N] [--json] [--min-accuracy F]`: 0 when accuracy ≥ `--min-accuracy` (default 0.9), 1 when it's below, 2 when the set is missing or malformed. Texts appear only in its output. The summary saved to `~/.resonant/evals/results/<ts>.json` refers to examples by line number.
 
 ## Local API
