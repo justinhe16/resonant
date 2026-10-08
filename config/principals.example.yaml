@@ -1,0 +1,10 @@
+# Copy to ~/.resonant/principals.yaml. Maps channel identities to people.
+# Identity grants permissions; message content never does.
+principals:
+  owner:
+    role: owner                         # everything, incl. kill switch + global settings
+    identities: ["imessage:+15550000000", "slack:U00000000"]
+  cofounder:
+    identities: ["slack:U11111111"]
+    grants:
+      example: [request, approve]       # per-extension: request and/or approve

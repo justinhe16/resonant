@@ -1,0 +1,25 @@
+# Copy to ~/.resonant/config.yaml (scripts/bootstrap.sh does this for you).
+# Non-secret settings only. Secrets live in the macOS Keychain.
+timezone: America/Los_Angeles
+dry_run: true            # gate logs side effects instead of executing them
+
+model:
+  base_url: http://127.0.0.1:11434/v1   # Ollama (OpenAI-compatible)
+  name: qwen3:30b-a3b
+  context_tokens: 32768                 # pinned server-side via OLLAMA_CONTEXT_LENGTH
+
+api:
+  host: 127.0.0.1                       # loopback only; expose with `tailscale serve`
+  port: 7777
+
+health:
+  healthchecks_url: null                # e.g. https://hc-ping.com/<uuid>
+  ping_every_s: 60
+  watchdog_stale_s: 120
+
+loop:
+  tick_s: 30
+
+claude:
+  max_concurrent: 5
+  reserved_oncall_slots: 1
