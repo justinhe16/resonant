@@ -214,7 +214,11 @@ def openai_tools(tools: Sequence[ToolSpec]) -> list[ChatCompletionFunctionToolPa
 
 
 def tools_prefix(tools: Sequence[ToolSpec]) -> str:
-    """The serialized tools block; byte-identical for the same toolset in any order."""
+    """The serialized tools block; byte-identical for the same toolset in any order.
+
+    Ollama renders tools into the system part of the prompt via the chat template, so a
+    stable tools block plus a stable system message gives a reusable KV-cache prefix.
+    """
     return json.dumps(openai_tools(tools), separators=(",", ":"))
 
 
@@ -480,13 +484,30 @@ class OllamaClient:
         if self._owns_http:
             await self._http.aclose()
 
-    async def _complete(self, messages: list[ChatMessage], **kw: Any) -> RawReply:
+    async def _complete(
+        self,
+        messages: list[ChatMessage],
+        *,
+        max_tokens: int,
+        temperature: float,
+        schema: dict[str, Any] | None = None,
+        tools: list[ChatCompletionFunctionToolParam] | None = None,
+    ) -> RawReply:
+        async def once() -> RawReply:
+            return await self._adapter.complete(
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                schema=schema,
+                tools=tools,
+            )
+
         try:
-            return await self._adapter.complete(messages, **kw)
+            return await once()
         except _ConnectError:
             pass  # one immediate retry: Ollama may be restarting under launchd
         try:
-            return await self._adapter.complete(messages, **kw)
+            return await once()
         except _ConnectError as e:
             raise ModelUnavailableError(f"cannot connect to {self._root}: {e}") from e
 
@@ -592,7 +613,10 @@ class OllamaClient:
             method, f"{self._root}{path}", timeout=self.cfg.timeout_s, **kw
         )
         resp.raise_for_status()
-        return cast(dict[str, Any], resp.json())
+        data: object = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: expected a JSON object")
+        return cast(dict[str, Any], data)
 
     async def _model_present(self, notes: list[str]) -> bool:
         try:
@@ -600,15 +624,22 @@ class OllamaClient:
         except (httpx.HTTPError, ValueError) as e:
             notes.append(f"ollama unreachable at {self._root} ({type(e).__name__})")
             return False
-        names = {
-            str(m.get("name") or m.get("model"))
-            for m in cast(list[dict[str, Any]], data.get("models") or [])
-        }
-        wanted = self.cfg.name if ":" in self.cfg.name else f"{self.cfg.name}:latest"
-        if wanted not in names:
+        if self._tagged() not in self._names(data):
             notes.append(f"model {self.cfg.name!r} not pulled (run: ollama pull {self.cfg.name})")
             return False
         return True
+
+    def _tagged(self) -> str:
+        return self.cfg.name if ":" in self.cfg.name else f"{self.cfg.name}:latest"
+
+    @staticmethod
+    def _names(data: dict[str, Any]) -> set[str]:
+        out: set[str] = set()
+        for m in cast(list[dict[str, Any]], data.get("models") or []):
+            for key in ("name", "model"):
+                if isinstance(v := m.get(key), str):
+                    out.add(v)
+        return out
 
     async def _ctx_ok(self, notes: list[str]) -> bool:
         need = self.cfg.context_tokens
@@ -644,7 +675,7 @@ class OllamaClient:
         loaded = [
             m
             for m in cast(list[dict[str, Any]], data.get("models") or [])
-            if self.cfg.name in (m.get("name"), m.get("model"))
+            if self._tagged() in (m.get("name"), m.get("model"))
         ]
         if not loaded:
             notes.append("model was not loaded (cold start; first call includes the load)")

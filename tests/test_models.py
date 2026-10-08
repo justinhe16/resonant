@@ -612,3 +612,22 @@ def test_cli_bench_prints_p50_p95(cli_fake: FakeOllama) -> None:
     assert result.exit_code == 0, result.output
     assert "label  p50" in result.output and "p95" in result.output
     assert "tool   p50" in result.output
+
+
+async def test_probe_untagged_name_matches_latest() -> None:
+    fake = FakeOllama([Turn("{")], models=["mymodel:latest"])
+    cfg = ModelConfig(name="mymodel", timeout_s=5)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
+    async with OllamaClient(cfg, http=http) as client:
+        result = await client.probe()
+    assert result.ok and "cold start" not in result.detail
+
+
+async def test_probe_non_object_body_does_not_raise() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2])
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with OllamaClient(CFG, http=http) as client:
+        result = await client.probe()
+    assert not result.ok and "unreachable" in result.detail
