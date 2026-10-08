@@ -7,15 +7,19 @@
 # Flags:
 #   --no-model   skip pulling the local model (it is large)
 #   --no-start   prepare everything but don't install or start the LaunchAgents
+#   --check      verify the go-live checklist (docs/go-live.md) and change nothing.
+#                Prints PASS/FAIL/SKIP per step; exits 1 if a required step fails.
 set -euo pipefail
 
 PULL_MODEL=1
 START=1
+CHECK=0
 for arg in "$@"; do
   case "$arg" in
     --no-model) PULL_MODEL=0 ;;
     --no-start) START=0 ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    --check) CHECK=1 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
@@ -25,6 +29,98 @@ HOME_DIR="${RESONANT_HOME:-$HOME/.resonant}"
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "Resonant targets macOS." >&2; exit 1; }
+
+# --- --check: read-only go-live verification (docs/go-live.md) ----------------------
+# Installs nothing and writes nothing. It never runs uv (uv run/sync can modify .venv)
+# and runs Python with -B so no bytecode is written.
+NOT_YET="SKIP (available after Phase 1)"
+FAILED=0
+report() {  # report <status> <required:1|0> <step> [detail]
+  local status="$1" required="$2" name="$3" detail="${4:-}" tag=""
+  if [[ "$status" == "FAIL" ]]; then
+    if [[ "$required" == "1" ]]; then FAILED=$((FAILED + 1)); else tag=" (advisory)"; fi
+  fi
+  printf '  %-30s %s%s%s\n' "$name" "$status" "${detail:+  $detail}" "$tag"
+}
+has_cmd() {  # has_cmd <subcommand...>: true when `resonant <subcommand...>` exists
+  "$RESONANT" "$@" --help >/dev/null 2>&1
+}
+
+run_check() {
+  RESONANT="$REPO/.venv/bin/resonant"
+  local py="$REPO/.venv/bin/python"
+  export RESONANT_HOME="$HOME_DIR"
+
+  printf '\033[1mResonant go-live check\033[0m  home: %s  (see docs/go-live.md)\n\n' "$HOME_DIR"
+
+  if [[ ! -x "$py" || ! -x "$RESONANT" ]]; then
+    report FAIL 1 "python env (.venv)" "missing; run scripts/bootstrap.sh first"
+    printf '\n%d required step(s) failed.\n' "$FAILED"
+    return 1
+  fi
+  report PASS 1 "python env (.venv)" "$RESONANT"
+  echo "  (Full Disk Access target: $("$py" -B -c 'import os, sys; print(os.path.realpath(sys.executable))'))"
+
+  if command -v fdesetup >/dev/null && fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
+    report PASS 0 "FileVault" "on"
+  else
+    report FAIL 0 "FileVault" "not on (step 2)"
+  fi
+
+  # Config, principals, Full Disk Access and health: checked by Python with the daemon's
+  # own loaders. Note that macOS grants FDA per app: this shell checks with Terminal's
+  # grant, while the daemon needs the interpreter path above.
+  local status required name detail helper_out
+  if ! helper_out="$("$py" -B "$REPO/scripts/go_live_check.py" 2>&1)"; then
+    helper_out+=$'\n'$'FAIL\t1\tconfig checks\tgo_live_check.py crashed (output above)'
+  fi
+  while IFS=$'\t' read -r status required name detail; do
+    if [[ -n "${name:-}" ]]; then
+      report "$status" "$required" "$name" "${detail:-}"
+    else
+      echo "    $status"  # stray output (e.g. a traceback line)
+    fi
+  done <<< "$helper_out"
+
+  if has_cmd model probe; then
+    if "$RESONANT" model probe >/dev/null 2>&1; then
+      report PASS 1 "model probe" "resonant model probe ok"
+    else
+      report FAIL 1 "model probe" "failed; run 'resonant model probe' for details (step 8)"
+    fi
+  else
+    report "$NOT_YET" 1 "model probe"
+  fi
+
+  # These send a real iMessage or run the whole eval set, so --check only points at them.
+  if has_cmd selftest imessage; then
+    report SKIP 0 "imessage self-test" "run manually: resonant selftest imessage (step 5)"
+  else
+    report "$NOT_YET" 0 "imessage self-test"
+  fi
+  if has_cmd eval router; then
+    report SKIP 0 "router eval" "run manually: resonant eval router (step 9)"
+  else
+    report "$NOT_YET" 0 "router eval"
+  fi
+
+  if "$RESONANT" status >/dev/null 2>&1; then
+    report PASS 0 "daemon up" "resonant status ok"
+  else
+    report FAIL 0 "daemon up" "resonant status reports down (step 6)"
+  fi
+
+  echo
+  if [[ $FAILED -gt 0 ]]; then
+    printf '%d required step(s) failed. See docs/go-live.md.\n' "$FAILED"
+    return 1
+  fi
+  echo "All required steps pass."
+}
+
+if [[ $CHECK -eq 1 ]]; then
+  if run_check; then exit 0; else exit 1; fi
+fi
 
 step "Homebrew packages"
 if ! command -v brew >/dev/null; then
@@ -122,4 +218,7 @@ $(printf '\033[1m')Manual steps (macOS won't let a script do these):$(printf '\0
   6. Edit $HOME_DIR/config.yaml (dry_run stays true until Phase 2 ships), then:
        $RESONANT daemon install   # reload after config changes
        $RESONANT status
+
+$(printf '\033[1m')Next:$(printf '\033[0m') work through docs/go-live.md step by step, then verify with
+       scripts/bootstrap.sh --check
 EOF
