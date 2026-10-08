@@ -17,7 +17,9 @@ iMessage per incident once a check has been degraded for ``alert_after`` (2) con
 evaluations, at most one per check per ``alert_cooldown_s`` (6h), and one "resolved: ..."
 message when an alerted incident clears. While the ``imessage`` check itself is degraded
 (or there is no channel), no iMessage is attempted: :meth:`HealthMonitor.deadman_reason`
-returns the reason and the healthchecks.io ``/fail`` ping carries it instead.
+returns the reason and the healthchecks.io ``/fail`` ping carries it instead. The same
+happens after 3 consecutive failed owner sends. A cached model probe doesn't count as a new
+degraded evaluation, so the model alerts only after 2 failed probes (about 5 minutes).
 
 Alert text and dead-man reasons are built by code from short check details. URLs are
 scrubbed and the text is capped, so no secret or ping URL ever leaves in a message.
@@ -235,6 +237,7 @@ class HealthMonitor:
         min_free_bytes: int = 2 * GB,
         max_dead_letters_1h: int = 0,
         max_failed_tasks_1h: int = 2,
+        send_failures_for_deadman: int = 3,
     ) -> None:
         self.conn = conn
         self.model = model
@@ -260,7 +263,10 @@ class HealthMonitor:
         self.states: dict[CheckName, CheckState] | None = None  # loaded on first evaluate
         self._model_result: CheckResult | None = None
         self._model_probed_at: datetime | None = None
+        self._model_fresh = False  # the last _check_model ran a new probe
         self._reader_errors = 0
+        self._send_failures = 0  # consecutive failed owner sends
+        self.send_failures_for_deadman = send_failures_for_deadman
         self._stop = asyncio.Event()
 
     # --- lifecycle -----------------------------------------------------------------------
@@ -291,7 +297,10 @@ class HealthMonitor:
         }
         for name, result in results.items():
             if result is not None:
-                self._transition(states[name], result, now)
+                # A cached model result is not a new observation: it doesn't count
+                # toward the alert debounce (so a single failed probe never alerts).
+                fresh = name != "model" or self._model_fresh
+                self._transition(states[name], result, now, count=fresh)
         self._persist(states)
         await self._notify(states, now)
         return states
@@ -299,20 +308,24 @@ class HealthMonitor:
     def deadman_reason(self) -> str | None:
         """Reason for the dead-man ``/fail`` body, or None when the owner can be texted.
 
-        Set while the ``imessage`` check is degraded (alerts can't go out), or when any
-        check is degraded and there is no channel at all.
+        Set while a check is degraded and the owner can't be texted: the ``imessage``
+        check is degraded, there is no channel or owner, or the last
+        ``send_failures_for_deadman`` owner sends failed.
         """
         if self.states is None:
             return None
         degraded = [(n, s) for n, s in self.states.items() if s.state == "degraded"]
         if not degraded:
             return None
-        im = self.states["imessage"]
-        if self.channel is not None and self.owner is not None and im.state != "degraded":
+        sends_failing = self._send_failures >= self.send_failures_for_deadman
+        if self._can_text_owner() and not sends_failing:
             return None
         # The imessage reason first: it's why nobody was texted.
         degraded.sort(key=lambda ns: ns[0] != "imessage")
-        return scrub("; ".join(f"{n}: {s.detail or 'degraded'}" for n, s in degraded), 300)
+        parts = [f"{n}: {s.detail or 'degraded'}" for n, s in degraded]
+        if sends_failing:
+            parts.insert(0, "owner alerts failing")
+        return scrub("; ".join(parts), 300)
 
     # --- checks --------------------------------------------------------------------------
 
@@ -320,7 +333,8 @@ class HealthMonitor:
         if self.model is None:
             return None
         due = self._model_probed_at is None or now - self._model_probed_at >= self.model_every
-        if due or self._model_result is None:
+        self._model_fresh = due or self._model_result is None
+        if self._model_fresh:
             probe = await self.model.probe()  # never raises
             self._model_probed_at = now
             self._model_result = _model_result(probe)
@@ -429,7 +443,7 @@ class HealthMonitor:
 
     # --- state machine -------------------------------------------------------------------
 
-    def _transition(self, s: CheckState, r: CheckResult, now: datetime) -> None:
+    def _transition(self, s: CheckState, r: CheckResult, now: datetime, *, count: bool) -> None:
         s.checked_at = now
         if r.ok:
             if s.state != "ok":
@@ -440,7 +454,9 @@ class HealthMonitor:
         if s.state != "degraded":
             s.state, s.since, s.consecutive = "degraded", now, 0
             s.alerted, s.alert_window = False, None
-        s.consecutive += 1
+            count = True
+        if count:
+            s.consecutive += 1
         s.detail = scrub(r.detail)
 
     def _can_text_owner(self) -> bool:
@@ -480,8 +496,13 @@ class HealthMonitor:
             await self.channel.send(self.owner, scrub(text, 300), dedupe_key=dedupe_key)
         except ChannelError as e:
             log.warning("health %s for %s not sent: %s", kind, check, type(e).__name__)
-            self._audit(f"health.{kind}", check=check, decision="failed", error=type(e).__name__)
+            if self._send_failures == 0:  # audit the first failure of a streak, not each retry
+                self._audit(
+                    f"health.{kind}", check=check, decision="failed", error=type(e).__name__
+                )
+            self._send_failures += 1
             return False
+        self._send_failures = 0
         log.info("health %s sent for %s", kind, check)
         self._audit(f"health.{kind}", check=check, decision="sent", idempotency_key=dedupe_key)
         return True

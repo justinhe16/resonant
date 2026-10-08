@@ -41,7 +41,7 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Built-in read tools (`list_tasks`, `task_counts`, `system_status`, `daemon_status`, `model_status`); registry, `DryRunGate` and executor wired into the daemon; `GET /api/tools` | `resonant/tools/builtin.py`, `resonant/components.py`, `resonant/api.py` | Phase 1 |
 | Model client (Ollama native or OpenAI-compatible), `resonant model probe/bench` | `resonant/models/`, `resonant/cli.py` | Phase 1 |
 | Router: deterministic fast path (slash commands, anchored keywords, owner-only `/kill`), one-call LLM intent label with stable prompt prefixes, principal-filtered toolsets | `resonant/router/` | Phase 1 |
-| Brain health: `HealthMonitor` (model, imessage, loop, store checks), owner alerts over iMessage, dead-man `/fail` reasons, `GET /api/channels`, `/api/status.health` | `resonant/monitor.py`, `resonant/health.py`, `resonant/api.py` | Phase 1 |
+| Brain health: `HealthMonitor` (model, imessage, loop, store checks), owner alerts over iMessage, dead-man `/fail` reasons, `GET /api/channels`, `/api/status.health` | `resonant/monitor.py`, `resonant/health.py`, `resonant/api.py` | Phase 1 (daemon wiring pending: e2e ticket) |
 | Local runner | — | Phase 1 |
 | iMessage channel, Slack notifier, router evals | — | Phase 1 |
 | Real gate (L0–L3, text-reply approvals, veto, kill switch), Keychain injection | — | Phase 2 |

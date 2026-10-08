@@ -413,9 +413,9 @@ def test_no_slack_imports_in_core() -> None:
 
 
 def test_cli_health_section(capsys: pytest.CaptureFixture[str]) -> None:
-    from resonant.cli import _echo_health  # pyright: ignore[reportPrivateUsage]
+    from resonant.cli import echo_health
 
-    _echo_health(
+    echo_health(
         {
             "model": {"state": "degraded", "since": iso(T0), "detail": "model context too small"},
             "imessage": {"state": "ok", "since": iso(T0), "detail": "ok"},
@@ -428,3 +428,45 @@ def test_cli_health_section(capsys: pytest.CaptureFixture[str]) -> None:
     assert out[1] == f"  model     DEGRADED since {iso(T0)}: model context too small"
     assert out[2] == f"  imessage  ok since {iso(T0)}"
     assert out[3] == "  loop      unknown"
+
+
+async def test_single_failed_model_probe_does_not_alert(env: Env) -> None:
+    env.model.result = DOWN_PROBE
+    await env.tick()
+    env.model.result = OK_PROBE
+    await env.tick(4)  # cached failure reused for 4 more rounds
+    assert env.sent == []
+    await env.tick()  # next probe: ok again
+    assert _state(env.db, "model")["state"] == "ok"
+    assert env.sent == []
+
+
+async def test_loop_failed_tasks(env: Env) -> None:
+    for i in range(3):
+        env.db.execute(
+            "INSERT INTO tasks (id, kind, runner, priority, status, trace_id, created_at,"
+            " updated_at) VALUES (?, 'k', 'echo', 1, 'failed', 't', ?, ?)",
+            (f"T{i}", iso(T0), iso(T0)),
+        )
+    await env.tick()
+    assert _state(env.db, "loop")["detail"] == "3 tasks failed in the last hour"
+    env.clock.advance(3600)
+    await env.tick()
+    assert _state(env.db, "loop")["state"] == "ok"
+
+
+async def test_persistent_send_failure_goes_to_deadman(env: Env) -> None:
+    assert env.channel is not None
+    env.channel.fail_sends = True
+    env.healthy = False
+    await env.tick(4)  # alerts attempted on rounds 2, 3, 4
+    reason = env.monitor.deadman_reason()
+    assert reason == "owner alerts failing; loop: loop is not ticking"
+    failed = env.db.execute(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'health.alert' AND decision = 'failed'"
+    ).fetchone()[0]
+    assert failed == 1  # one audit row per failure streak
+    env.channel.fail_sends = False
+    await env.tick()
+    assert len(env.sent) == 1
+    assert env.monitor.deadman_reason() is None

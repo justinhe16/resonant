@@ -145,12 +145,12 @@ def status(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
     typer.echo(f"tasks       {tasks}")
     if waiting:
         typer.echo("waiting     " + ", ".join(f"{k}={v}" for k, v in waiting.items()))
-    _echo_health(data.get("health"), live=up)
+    echo_health(data.get("health"), live=up)
     if not up:
         raise typer.Exit(1)
 
 
-def _echo_health(health: object, *, live: bool) -> None:
+def echo_health(health: object, *, live: bool) -> None:
     """The health section: one line per check (state, since, detail)."""
     if not isinstance(health, dict) or not health:
         return
