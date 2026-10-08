@@ -165,6 +165,10 @@ async def run_e2e_bench(
                 if warmup:
                     with contextlib.suppress(TimeoutError):
                         await _one(chat, osa, prompts[0], timeout, clock)
+                    # A warm-up that timed out may still answer: wait it out so its late
+                    # send isn't credited to the first timed prompt.
+                    with contextlib.suppress(TimeoutError):
+                        await wait_until(lambda: loop.inflight == 0, timeout)
                 for i in range(n):
                     try:
                         ms = await _one(chat, osa, prompts[i % len(prompts)], timeout, clock)

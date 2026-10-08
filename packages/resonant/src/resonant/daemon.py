@@ -124,7 +124,13 @@ class Daemon:
                 aio.add_signal_handler(sig, self.stop)
 
         if self.imessage is not None:
-            await self.imessage.start(self.loop)
+            try:
+                await self.imessage.start(self.loop)
+            except Exception:
+                log.exception("imessage channel failed to start")
+                await self.imessage.aclose()
+                self.conn.close()
+                return 1
         loop_task = asyncio.create_task(self.loop.run(), name="loop")
         server_task = asyncio.create_task(self._serve(), name="api")
         stop_task = asyncio.create_task(self._stop.wait(), name="stop")

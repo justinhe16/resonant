@@ -480,12 +480,13 @@ def bench_e2e(
     if model not in ("fake", "real"):
         typer.echo("--model must be 'fake' or 'real'", err=True)
         raise typer.Exit(2)
-    settings = load_settings()
 
     async def go() -> dict[str, Any]:
-        if model == "fake":
+        if model == "fake":  # needs no local config
             return report(await run_e2e_bench(n), model_name="fake (scripted)")
         from resonant.models import OllamaClient
+
+        settings = load_settings()
 
         async with OllamaClient(settings.model) as client:
             results = await run_e2e_bench(n, model=client, base=settings)
