@@ -259,6 +259,32 @@ class ToolFailed(Exception)   # raise from a handler: "definitely did not take e
 - **Audit:** `executor.start`, `executor.result`, `executor.ambiguous`, `executor.replayed`, `executor.refused`, and `executor.ambiguous_resolved` are all written.
 - Phase 2 makes the executor the only reader of Keychain secrets. They are injected as environment variables for the tool process only, and their values are redacted in audit rows.
 
+## Built-in tools: `resonant.tools.builtin`
+
+Five global read tools (`effect=read`, level L0, `extension=None`, `source="builtin"`). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state) -> {(None, name): handler}` registers the specs and returns the handlers. Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents.
+
+| Tool | Args | Returns |
+|---|---|---|
+| `list_tasks` | `status?`: `queued\|running\|waiting\|done\|failed\|cancelled`; `limit?`: int, default 10, clamped to 1..50 | `{tasks: [{id, kind, status, wait_reason, age_s}], count, limit, status}`, newest first (by ULID id) |
+| `task_counts` | none | `{by_status: {status: n}, waiting_by_reason: {reason: n}, total}` |
+| `system_status` | none | `{cpu_percent, cpu_count, load_avg: [1m, 5m, 15m] \| null, memory: {used_bytes, total_bytes, percent}, swap: {used_bytes, total_bytes, percent}, memory_pressure: {level: normal\|warn\|critical\|unknown, free_pct: int \| null}, disk: [{path, free_bytes, total_bytes, used_pct}], uptime_s}` |
+| `daemon_status` | none | `{version, uptime_s, last_tick, inflight, dry_run, autonomy, paused}` (a subset of `collect_status`) |
+| `model_status` | none | `{known: false}` when `kv["model.probe"]` is absent or not an object; otherwise the cached probe's fields plus `known: true`. It never calls the model. |
+
+- `system_status`: `cpu_percent` is measured since the previous call (primed at registration), so it never blocks. `memory_pressure` comes from `sysctl kern.memorystatus_vm_pressure_level` and `memory_pressure -Q` with a 500ms timeout, best effort; off macOS, or when they are missing or slow, it is `{level: "unknown", free_pct: null}`. `disk` lists `/` and `RESONANT_HOME`; an unreadable path has null numbers.
+- The `model.probe` kv key is written by the model client and health check. Builtins read it only.
+
+## Components: `resonant.components`
+
+```python
+build_components(settings, conn, state: DaemonState) -> Components
+Components(registry, principals, gate: DryRunGate, executor, handlers, principals_loaded=True)
+```
+
+- `Daemon.__init__` calls it once and sets `DaemonState.components`.
+- If `principals.yaml` is missing, it logs a warning and uses an identity-less stand-in owner, so no channel identity resolves and every channel request is denied (`principals_loaded=False`). An invalid file is an error.
+- New fields (runners, channels, ...) get defaults so existing callers keep working.
+
 ## Channel: `resonant.gateway.channel`
 
 ```python
@@ -313,3 +339,4 @@ All endpoints are loopback only and exposed to the tailnet with `tailscale serve
 |---|---|
 | `GET /healthz` | `{"ok": true}` |
 | `GET /api/status` | version, uptime, last tick, dry_run, autonomy, paused, task counts by status and wait reason, in-flight count |
+| `GET /api/tools` | registered tool specs: `[{name, extension, effect, level, description, args_schema}]` (`level` is the effective level) |
