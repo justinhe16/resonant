@@ -51,3 +51,19 @@ def test_status_when_daemon_down(resonant_home: Path, monkeypatch: pytest.Monkey
     result = CliRunner().invoke(app, ["status"])
     assert result.exit_code == 1
     assert "DOWN" in result.output and "dry_run     True" in result.output
+
+
+def test_ext_validate(resonant_home: Path) -> None:
+    repo = Path(__file__).resolve().parents[1]
+    runner = CliRunner()
+    ok = runner.invoke(app, ["ext", "validate", str(repo / "extensions/example")])
+    assert ok.exit_code == 0, ok.output
+    assert "get_time" in ok.output and "write_note" in ok.output and "ok" in ok.output
+
+    (resonant_home / "principals.yaml").write_text("principals:\n  justin: {role: owner}\n")
+    bad = runner.invoke(app, ["ext", "validate", str(repo / "extensions/example")])
+    assert bad.exit_code == 1  # example lists approver 'owner', which doesn't exist here
+
+    broken = resonant_home / "broken.yaml"
+    broken.write_text("name: x\nversion: 2\n")
+    assert runner.invoke(app, ["ext", "validate", str(broken)]).exit_code == 1

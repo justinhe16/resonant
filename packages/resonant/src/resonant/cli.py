@@ -9,21 +9,28 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from pathlib import Path
 from typing import Annotated, Any
 
 import httpx
 import typer
+from pydantic import ValidationError
 
 from resonant import daemon as daemon_mod
 from resonant import killswitch, launchd
 from resonant.config import Settings, load_settings
+from resonant.extensions.checks import approver_errors
+from resonant.principals import load_principals
 from resonant.status import collect_status
 from resonant.store.audit import audit
 from resonant.store.db import open_db, transaction
+from resonant_sdk import load_manifest
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 daemon_app = typer.Typer(no_args_is_help=True, help="Run and supervise the daemon.")
 app.add_typer(daemon_app, name="daemon")
+ext_app = typer.Typer(no_args_is_help=True, help="Extensions (see docs/extensions.md).")
+app.add_typer(ext_app, name="ext")
 
 EX_TEMPFAIL = 75
 _CLI_ACTOR = "owner:cli"
@@ -169,3 +176,43 @@ def job_guard(
         typer.echo(f"job-guard: kill switch engaged; skipping {job}", err=True)
         raise typer.Exit(EX_TEMPFAIL)
     os.execvp(command[0], command)  # noqa: S606 - command comes from an approved manifest
+
+
+# --- extensions ------------------------------------------------------------------------
+
+
+@ext_app.command("validate")
+def ext_validate(
+    path: Annotated[Path, typer.Argument(help="Extension dir or resonant.yaml")],
+) -> None:
+    """Validate a manifest: schema, invariants, and approver grants (if principals exist)."""
+    manifest_path = path / "resonant.yaml" if path.is_dir() else path
+    try:
+        manifest = load_manifest(manifest_path)
+    except FileNotFoundError:
+        typer.echo(f"error: {manifest_path} not found", err=True)
+        raise typer.Exit(1) from None
+    except ValidationError as e:
+        typer.echo(f"invalid manifest {manifest_path}:\n{e}", err=True)
+        raise typer.Exit(1) from None
+    settings = load_settings()
+    problems: list[str] = []
+    if settings.principals_path.exists():
+        problems = approver_errors(manifest, load_principals(settings.principals_path))
+    else:
+        typer.echo(f"note: {settings.principals_path} missing; approver grants not checked")
+    typer.echo(f"{manifest.name} v{manifest.version}")
+    for spec in manifest.tool_specs():
+        flag = " commit" if spec.commit else ""
+        typer.echo(
+            f"  tool {spec.name:<24} {spec.effect.value:<5} {spec.effective_level.value}{flag}"
+        )
+    for job in manifest.jobs:
+        typer.echo(f"  job  {job.id:<24} {job.schedule}{'  critical' if job.critical else ''}")
+    if manifest.secrets:
+        typer.echo(f"  secrets: {', '.join(manifest.secrets)}")
+    for p in problems:
+        typer.echo(f"error: {p}", err=True)
+    if problems:
+        raise typer.Exit(1)
+    typer.echo("ok")
