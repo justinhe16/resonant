@@ -69,7 +69,9 @@ The Phase 1 exit criterion is **text → answer in 2–3s**: p50 ≤ 1s on the f
 | Run | Model | fast p50 / p95 | llm p50 / p95 |
 |---|---|---|---|
 | Dev machine, `--model fake` (n=20; CI runs the same code) | scripted | 354 / 370 ms | 354 / 361 ms |
-| Mac mini, `--model real` | `qwen3:30b-a3b-instruct-2507-q4_K_M` (Ollama) | pending go-live checklist (PER-234) | pending go-live checklist (PER-234) |
+| Mac mini (Apple M5 Pro, 64 GB), macOS 27.0.1, Ollama 0.40.3, `--model real` (n=20, 2026-10-13) | `qwen3:30b-a3b-instruct-2507-q4_K_M` (Ollama) | 353 / 367 ms | 1531 / 2129 ms |
+
+`resonant model bench` on the same run: label p50 / p95 86 / 89 ms, single tool call 229 / 232 ms, 0/20 failures.
 
 With the scripted model nearly all of the time is the reader's WAL-watch interval plus its debounce, so the harness overhead is about 0.35s; on the Mini the labeled path adds the label call, up to three tool rounds, and the answer call.
 
