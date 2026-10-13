@@ -155,8 +155,8 @@ async def test_all_ok_first_round(env: Env) -> None:
     cached = kv_get(env.db, "model.probe")
     assert cached["ok"] is True and cached["model"] == "qwen" and cached["api"] == "ollama"
     assert set(cached) == {
-        "ok", "model_present", "ctx_ok", "thinking_off_ok", "tool_call_ok", "latency_ms",
-        "detail", "model", "api", "checked_at",
+        "ok", "model_present", "ctx_ok", "thinking_off_ok", "tool_call_ok", "call_failed",
+        "latency_ms", "detail", "model", "api", "checked_at",
     }  # fmt: skip
 
 
@@ -180,6 +180,24 @@ async def test_model_degraded_when_tool_call_leaks_reasoning(env: Env) -> None:
     assert s["state"] == "degraded"
     assert s["detail"] == "model tool call failed or leaked reasoning"
     assert kv_get(env.db, "model.probe")["tool_call_ok"] is False
+
+
+async def test_model_call_failure_is_not_reported_as_a_leak(env: Env) -> None:
+    env.model.result = ProbeResult(
+        False, True, True, True, 120, "x", tool_call_ok=False, call_failed=True
+    )
+    await env.tick()
+    s = _state(env.db, "model")
+    assert s["detail"] == "model call failed (timeout, connection or HTTP error)"
+    assert kv_get(env.db, "model.probe")["call_failed"] is True
+
+
+async def test_model_call_failure_wins_over_thinking(env: Env) -> None:
+    env.model.result = ProbeResult(
+        False, True, True, False, None, "x", tool_call_ok=False, call_failed=True
+    )
+    await env.tick()
+    assert _state(env.db, "model")["detail"].startswith("model call failed")
 
 
 async def test_model_degraded_alerts_once_then_recovers(env: Env) -> None:

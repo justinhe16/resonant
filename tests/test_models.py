@@ -557,6 +557,8 @@ async def test_probe_tool_call_unavailable_is_reported() -> None:
     async with OllamaClient(CFG, http=http) as client:
         result = await client.probe()
     assert not result.ok and not result.tool_call_ok and "tool probe failed" in result.detail
+    assert result.thinking_off_ok and result.call_failed  # a transport error, not a leak
+    assert result.as_dict()["call_failed"] is True
 
 
 @pytest.mark.parametrize(
@@ -577,6 +579,23 @@ async def test_probe_detects_thinking_on(turn: Turn, api: Api) -> None:
     assert "thinking is not off" in result.detail
     if api == "openai":
         assert "model.api: ollama" in result.detail
+    # Already degraded, so the tool call is skipped rather than adding a timeout's wait.
+    assert not result.tool_call_ok and not result.call_failed
+    assert "tool call: skipped" in result.detail
+    assert fake.turns == [TOOL_OK]
+
+
+async def test_probe_json_call_failure_is_a_call_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat":
+            raise httpx.ConnectError("refused")
+        return FakeOllama([]).handler(request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with OllamaClient(CFG, http=http) as client:
+        result = await client.probe()
+    assert not result.ok and result.call_failed and not result.thinking_off_ok
+    assert "probe call failed" in result.detail and "tool call: skipped" in result.detail
 
 
 async def test_probe_model_missing() -> None:
@@ -669,12 +688,12 @@ def test_cli_probe_ok_writes_kv(cli_fake: FakeOllama) -> None:
 
 
 def test_cli_probe_fails_without_creating_store(cli_fake: FakeOllama) -> None:
-    cli_fake.turns = [Turn("", thinking="hmm"), TOOL_OK]
+    cli_fake.turns = [Turn("", thinking="hmm")]
     result = CliRunner().invoke(app, ["model", "probe", "--json"])
     assert result.exit_code == 1
     data = json.loads(result.output)
     assert data["thinking_off_ok"] is False and data["model_present"] is True
-    assert data["tool_call_ok"] is True
+    assert data["tool_call_ok"] is False and data["call_failed"] is False  # skipped
     assert not load_settings().db_path.exists()
 
 
