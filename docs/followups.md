@@ -2,44 +2,41 @@
 
 Work we've decided to do eventually but have deferred. Each entry says why it was deferred, what is open, and what "done" looks like. When an item is picked up, ticket it and remove it from here.
 
-## Dead-man switch: choose the provider
+## Status relay: dead-man switch and remote dashboard
 
-*Deferred 2026-10-13, during Mac mini go-live (step 7 of [`go-live.md`](go-live.md)).*
+*Deferred 2026-10-13, during Mac mini go-live (steps 7 and 10 of [`go-live.md`](go-live.md)). This replaces healthchecks.io for the dead-man switch and Tailscale for remote access.*
 
-**What it is.** If the Mini loses power, crashes, or reboots to the FileVault login screen, Resonant can't tell anyone it's down. The dead-man switch is an outside service that expects a ping from the daemon every `health.ping_every_s` (60s) and alerts the owner when the pings stop. The daemon already pings `health.healthchecks_url` and sends `/fail` with a reason when the loop is stale (see [Health](architecture.md#health)).
+**Problem.** Two gaps, one fix.
+- **Dead-man switch.** If the Mini loses power, crashes, or reboots to the FileVault login screen, Resonant can't tell anyone it's down. Something off the Mini has to notice the silence. The daemon already pings `health.healthchecks_url` every `health.ping_every_s` (60s) and sends `/fail` with a reason when the loop is stale (see [Health](architecture.md#health)).
+- **Remote dashboard.** The owner wants to check status from anywhere, from any browser, after logging in. The API binds to `127.0.0.1:7777` only, and config validation enforces it.
 
-**Why deferred.** We want to compare reliable alternatives, or build our own, before depending on healthchecks.io.
-
-**Open questions**
-- Hosted (healthchecks.io, Better Stack, Cronitor, UptimeRobot heartbeats, Dead Man's Snitch) vs self-hosted (healthchecks.io is open source) vs our own. A self-hosted monitor must not run on the Mini it watches.
-- Alert channels: push, SMS, email. The alert can't depend on the Mini, so it can't go over Resonant's iMessage.
-- Does the provider accept the `/fail` ping with a plain-text reason body, or do we need an adapter?
-- Free-tier limits, the provider's own uptime, and how quickly it alerts.
-
-**Until then**
-- `health.healthchecks_url` stays empty, so the daemon sends no pings.
-- `scripts/bootstrap.sh --check` reports `healthchecks URL set  FAIL (advisory)`. It doesn't fail the check; make it required again once a provider is set up.
-- Nobody is alerted when the Mini is down.
-
-**Done when** a provider is chosen and configured, the go-live step 7 freeze test (`kill -STOP` the daemon) produces an alert, and `go-live.md` and `--check` describe the chosen provider.
-
-## Remote dashboard access: Tailscale or our own relay
-
-*Deferred 2026-10-13, during Mac mini go-live (step 10 of [`go-live.md`](go-live.md)).*
-
-**What it is.** The API and dashboard bind to `127.0.0.1:7777` only, and config validation enforces it. The current design exposes them to the owner's devices with `tailscale serve` (see README, [`architecture.md`](architecture.md) and [`interfaces.md`](interfaces.md)). Until then, the dashboard is reachable only on the Mini itself. iMessage doesn't need it.
-
-**Why deferred.** We want to weigh an alternative before installing Tailscale: our own small server on Fly.io with Supabase Auth, restricted to one user (the owner). The same Fly app could also be the dead-man monitor above.
+**Proposed design: push-based, read-only.**
+- **Push, not pull.** Every minute the daemon writes a status snapshot to Supabase: health checks, `dry_run`, task and slot counts, a last-seen time and version. Nothing connects into the Mini, so it keeps no inbound ports and the loopback-only rule doesn't change.
+- **Dashboard.** A small app on Fly.io reads the snapshots from Supabase. It keeps working when the Mini is down and shows "last seen N min ago" with the last known health. A dashboard served from the Mini would go dark exactly then.
+- **Dead-man switch.** A scheduled job on Fly alerts the owner when snapshots stop arriving, or when a snapshot reports a failure (today's `/fail` reason). The alert must not depend on the Mini, so it can't go over Resonant's iMessage. Use push, SMS or email instead. One system covers both gaps.
+- **Auth.** Use Supabase Auth with sign-ups turned off and exactly one user (the owner), MFA (TOTP) required, and short sessions. The app and the database row-level-security policies allow only the owner's user ID. Don't use IP allowlists: on the road the owner's IP changes constantly.
+- **Read-only.** The relay only shows status. Approvals, the kill switch and other actions stay on iMessage, which is already restricted to `principals.yaml`. A command path from the relay back into the Mini would be a new way in, so it needs its own design and review before anyone adds it.
 
 **Open questions**
-- **Connectivity.** The Mini must keep no inbound ports, so it dials out to the relay: a persistent tunnel such as a WebSocket or SSE stream. Fly then proxies dashboard and API requests over it. How do we keep that tunnel reliable across sleep, network changes and restarts?
-- **Exposure.** With Tailscale, the URL doesn't resolve off the tailnet. A Fly relay is a public login page, so security depends on the auth code. Phase 2 adds approvals and the kill switch to this API. What do we need on top of a single allowed user: MFA, short sessions, rate limits, audit of every request?
-- **Trust.** Fly and Supabase can see dashboard traffic and sessions. Tailscale is end-to-end between our own devices.
-- **Cost and upkeep.** Tailscale's personal plan is free and needs no code. The relay is a service we build, patch and monitor.
-- **Hybrid.** One option is Fly for the dead-man switch only, with Tailscale for access.
+- **What leaves the Mini.** Health and counts are fine. Message bodies, task contents and audit details should probably stay local. Write down the allowed snapshot fields as a schema.
+- **Snapshot writes.** The daemon needs a Supabase credential. Store it in the Keychain like other secrets, and give it insert-only access to its own table.
+- **Alert delivery and timing.** Which channel (push, SMS, email)? How long a gap before alerting, to match today's 60s period plus grace?
+- **Fly cron vs a long-running checker.** Also: what watches the watcher if Fly itself is down?
+- **Retention.** How long to keep snapshots.
+- **Fallback.** Tailscale (`tailscale serve --bg 7777`) stays a zero-code way to reach the full local dashboard from the owner's own devices, if we ever want both.
 
 **Until then**
-- No remote access. `tailscale serve` is not set up, and `--check` doesn't check it.
-- The API still binds to loopback only. Nothing about the loopback rule changes.
+- `health.healthchecks_url` stays empty, so the daemon sends no pings. Nobody is alerted when the Mini is down.
+- `scripts/bootstrap.sh --check` reports `healthchecks URL set  FAIL (advisory)`, which doesn't fail the check. Tailscale isn't checked at all.
+- The dashboard is reachable only on the Mini itself. iMessage doesn't need it.
 
-**Done when** the owner can reach `/api/status` from a phone off the home network, nobody else can, and the README, `architecture.md` (including the "no public ports" rule), `interfaces.md`, `config.py` and `api.py` comments, and go-live step 10 describe the chosen approach.
+**Done when**
+- The owner can log in from any browser and see current status.
+- Nobody else can log in.
+- The go-live step 7 freeze test (`kill -STOP` the daemon) produces an alert, and the dashboard shows the Mini as stale.
+- The following describe the relay instead of healthchecks.io and Tailscale:
+  - go-live steps 7 and 10
+  - the `--check` health check (required again)
+  - the README
+  - `architecture.md`, `interfaces.md`
+  - the `config.py` and `api.py` comments
