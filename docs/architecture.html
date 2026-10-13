@@ -332,7 +332,7 @@ const F = (s)=>s; // marker for file paths
 const NODES = {
   /* ---- gateway */
   imessage:{label:"iMessage channel", phase:"1", status:"built",
-    what:"Resonant's own Apple ID, with an email handle (channels.imessage.self_handle, e.g. resonant.agent@icloud.com), is iMessage only: no SMS and no phone number. It sends only to handles listed in principals.yaml, and a principal can have several (phone and email). The reader turns new chat.db rows into Events; the sender runs osascript with the text as argv. The daemon starts it only when channels.imessage.enabled is true (off by default until the go-live checklist passes).",
+    what:"Resonant's own Apple ID, with an email handle (channels.imessage.self_handle, e.g. a dedicated @icloud.com address), is iMessage only: no SMS and no phone number. It sends only to handles listed in principals.yaml, and a principal can have several (phone and email). The reader turns new chat.db rows into Events; the sender runs osascript with the text as argv. The daemon starts it only when channels.imessage.enabled is true (off by default until the go-live checklist passes).",
     iface:`IMessageChannel(config, principals, conn, *, runner=OsaRunner, reader=None)
   start(loop.submit) · stop() · health() → {ok, last_read_at, last_error, fda_ok}
   send(principal, text, *, dedupe_key) → MessageRef("imessage-out:<id>")

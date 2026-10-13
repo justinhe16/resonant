@@ -28,7 +28,7 @@ claude:
 channels:
   imessage:
     # Resonant's own Apple ID (email handle, iMessage only, no phone number).
-    self_handle: resonant.agent@icloud.com
+    self_handle: resonant@example.com
     # Inbound reader (needs Full Disk Access for the daemon's Python interpreter).
     enabled: false
     db_path: ~/Library/Messages/chat.db   # opened read-only, never written
