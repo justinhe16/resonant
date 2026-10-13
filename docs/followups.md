@@ -87,3 +87,37 @@ Work we've decided to do eventually but have deferred. Each entry says why it wa
 **Cheaper win first.** For intents whose tools take no arguments (`system`: `daemon_status`, `model_status`, `system_status`), the tool round could be skipped: run the toolset directly and let the model only narrate (the final `chat_json`). That saves one model round per system question. Measure with `resonant bench e2e --model real` before and after.
 
 **Two more measured wins (2026-10-13, Instruct-2507, e2e bench).** (1) After the last tool result the model's no-call `chat_tools` turn already writes the answer as plain text (~5-20 tokens), and `_final` then asks again via `chat_json` (median ~0.9 s on `job_control`). Using that text as the reply, through the same number guard and length cap, would save one round. (2) With earlier replies in the thread, the model sometimes answers a repeated question from history without calling a tool, which can be stale. Consider a system-prompt rule to always re-read live state for `job_control` and `system`, or dropping prior replies for those intents.
+
+## Claude sessions for `run_project`: reuse claude-surf, or build "resonant-surf"
+
+*Deferred 2026-10-13, after installing [claude-surf](https://github.com/justinhe16/claude-surf) on the Mini.*
+
+**What it is.** Today the local runner answers `run_project` messages ("write code", "open a PR") with a templated escalation instead of calling Claude (see the 2026-10-08 entry in the [decisions log](architecture.md#decisions-log)). The planned Claude-session runner would take that work. It already has slots (`SlotPool`), `Wait`/resume by `claude_session_id`, and `ctx.save` (see [Scheduling and priority](architecture.md#scheduling-and-priority)). claude-surf's agents and skills now live in `~/.claude/` on the Mini. Its `/robot-surf-prompt` flow is close to what that runner should do: worktree, plan if complex, implement, PR, CI, code review, report. This is also the workflow we've been running by hand.
+
+**Decision to make.** Pick one:
+- **Reuse claude-surf as is.** Resonant starts a headless Claude Code session that runs `/robot-surf-prompt`.
+- **Edit claude-surf upstream.** Fix what doesn't fit, then reuse it.
+- **Build a Resonant-native flow ("resonant-surf").** It would live in this repo or as an extension, built for Resonant's gate, approvals, audit and iMessage reporting.
+
+**Open questions**
+- **Why the agents are pinned to Sonnet.** All four claude-surf agents set `model: sonnet`, and its `settings.json` sets `"model": "sonnet"`. Was that for cost, speed, or rate limits? Is it still the right default for planning and code review, where a stronger model may pay off, versus implementation? Should the model be set per agent, or inherited from the caller?
+- **Known mismatches with Resonant:**
+  - The skills hard-code `MAIN_BRANCH="master"`; Resonant uses `main`.
+  - Worktrees go in `~/Projects/<repo>-<branch>`.
+  - `/robot-surf-fan` auto-merges by default.
+  - `/robot-surf` needs Linear.
+  - `global-surf` overwrites `~/.claude/settings.json` with broad pre-approved permissions; we didn't install that part.
+- **Safety under Resonant.** A session started from iMessage must:
+  - go through the gate and Phase 2 approvals before any side effect (push, PR, merge);
+  - never auto-merge without the owner's approval;
+  - stay within the principal's grants;
+  - report progress and results back over iMessage.
+
+  How much of that fits as a wrapper around claude-surf, and how much needs its own flow?
+- **Headless operation.** How does the runner start a session (Claude Code CLI or the Agent SDK)? It needs to stream status, survive `Wait`/resume, and respect the slot cap. Credentials and usage limits matter too.
+- **Where the skill lives.** Should it be global `~/.claude/skills` on the Mini, or pinned in this repo so that a Resonant run is reproducible?
+
+**Done when**
+- Reuse, edit or build is decided, with the Sonnet question answered.
+- A `run_project` text from the owner leads, after approval, to a reviewed PR and an iMessage with its link.
+- `architecture.md` and `interfaces.md` describe the runner.
