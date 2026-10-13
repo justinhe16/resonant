@@ -105,6 +105,8 @@ resonant status
 
 ## 7. Dead-man switch (healthchecks.io)
 
+This step is optional for now: the provider choice is open (see [`followups.md`](followups.md#dead-man-switch-choose-the-provider)), so `--check` reports `healthchecks URL set` as advisory.
+
 - Create a check at [healthchecks.io](https://healthchecks.io). Set its period to 1 minute (the daemon pings every `health.ping_every_s`, 60s by default) and a grace time of a few minutes. Add your phone or email as an integration.
 - Set the ping URL in `~/.resonant/config.yaml`, then reload with `resonant daemon install`.
 
