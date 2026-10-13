@@ -56,7 +56,15 @@ GB = 1024**3
 _MAX_DETAIL = 120
 _URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
 # Fields of ProbeResult.as_dict() plus what the CLI adds. Nothing else is cached.
-_PROBE_FIELDS = ("ok", "model_present", "ctx_ok", "thinking_off_ok", "latency_ms", "detail")
+_PROBE_FIELDS = (
+    "ok",
+    "model_present",
+    "ctx_ok",
+    "thinking_off_ok",
+    "tool_call_ok",
+    "latency_ms",
+    "detail",
+)
 
 State = Literal["ok", "degraded", "unknown"]
 
@@ -556,4 +564,6 @@ def _model_result(p: ProbeResult) -> CheckResult:
         return CheckResult(False, "model context too small")
     if not p.thinking_off_ok:
         return CheckResult(False, "model thinking is not off")
+    if not p.tool_call_ok:
+        return CheckResult(False, "model tool call failed or leaked reasoning")
     return CheckResult(False, "model probe failed")

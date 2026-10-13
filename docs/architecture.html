@@ -478,7 +478,7 @@ commit actions (send / pay / delete): pause + screenshot → approval`,
     inv:["Each task declares a scope that the owner approves","The runner always pauses before a commit action","Payments use a capped virtual card and are permanently L1","Core supplies the generic cu runner, Scope, and commit-pause. The life lane's wiring stays in a private repo"],
     files:[]},
   ollama:{label:"Ollama (LaunchAgent)", phase:"0 / 1", status:"built",
-    what:"The local model server, running qwen3:30b-a3b (Q4), and the ModelClient over it. The client defaults to Ollama's native /api/chat (think: false); the OpenAI-compatible /v1 adapter keeps an MLX swap a config change.",
+    what:"The local model server, running qwen3:30b-a3b-instruct-2507 (Q4, non-thinking), and the ModelClient over it. The client defaults to Ollama's native /api/chat (think: false); the OpenAI-compatible /v1 adapter keeps an MLX swap a config change.",
     iface:`OLLAMA_HOST=127.0.0.1:11434
 OLLAMA_KEEP_ALIVE=-1
 OLLAMA_CONTEXT_LENGTH=32768        # pinned server-side

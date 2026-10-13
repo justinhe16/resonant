@@ -27,6 +27,7 @@ from resonant.models.client import (
     RawToolCall,
     SpanLike,
     has_think,
+    has_think_tag,
     ollama_root,
     strip_think,
     validate_tool_calls,
@@ -79,7 +80,7 @@ class Turn:
 @dataclass
 class FakeOllama:
     turns: list[Turn] = field(default_factory=list[Turn])
-    models: list[str] = field(default_factory=lambda: ["qwen3:30b-a3b"])
+    models: list[str] = field(default_factory=lambda: ["qwen3:30b-a3b-instruct-2507-q4_K_M"])
     context_length: int = 40960
     parameters: str = ""
     loaded: bool = True
@@ -150,7 +151,7 @@ class FakeOllama:
             "id": "chatcmpl-1",
             "object": "chat.completion",
             "created": 0,
-            "model": "qwen3:30b-a3b",
+            "model": "qwen3:30b-a3b-instruct-2507-q4_K_M",
             "choices": [
                 {
                     "index": 0,
@@ -214,6 +215,8 @@ def test_strip_think(raw: str, want: str) -> None:
 
 def test_has_think_and_root() -> None:
     assert has_think("<THINK>x") and not has_think(None) and not has_think("{}")
+    assert has_think_tag("reasoning</think>") and has_think_tag("<think>")
+    assert not has_think_tag(None) and not has_think_tag("{}")
     assert ollama_root("http://127.0.0.1:11434/v1/") == "http://127.0.0.1:11434"
     assert ollama_root("http://localhost:11434") == "http://localhost:11434"
 
@@ -289,7 +292,7 @@ async def test_chat_json_success(api: Api) -> None:
     assert reply.tool_calls == [] and reply.prompt_tokens == 11 and reply.completion_tokens == 3
     name, attrs = spans.spans[0]
     assert name == "llm.call"
-    assert attrs["model"] == "qwen3:30b-a3b" and attrs["api"] == api
+    assert attrs["model"] == "qwen3:30b-a3b-instruct-2507-q4_K_M" and attrs["api"] == api
     assert attrs["attempts"] == 1 and "latency_ms" in attrs and not attrs["thinking_leak"]
     assert "pii-body-xyz" not in json.dumps(attrs)  # no prompt text on spans
 
@@ -446,6 +449,28 @@ async def test_chat_tools_parses_validates_and_records_drops(api: Api) -> None:
 
 
 @pytest.mark.parametrize("api", APIS)
+async def test_chat_tools_drops_and_records_prose_beside_calls(api: Api) -> None:
+    # A reasoning model's untagged prose (and a bare </think>) next to its tool call.
+    leaked = "Okay, the user wants the weather. pii-body-xyz</think>"
+    fake = FakeOllama(
+        [
+            Turn(leaked, tool_calls=[("weather", {"city": "Oakland"})]),
+            Turn("It's sunny.", truncated=True),
+        ]
+    )
+    spans = RecordingSpans()
+    async with make(fake, api, spans) as client:
+        with_call = await client.chat_tools(MSGS, tools=[_weather()])
+        no_call = await client.chat_tools(MSGS, tools=[_weather()])
+    assert with_call.text is None and [c.name for c in with_call.tool_calls] == ["weather"]
+    assert no_call.text == "It's sunny." and no_call.tool_calls == []
+    first, second = (a for _, a in spans.spans)
+    assert first["content_chars"] == len(leaked) and first["thinking_leak"] is True
+    assert second["truncated"] is True and second["thinking_leak"] is False
+    assert "pii-body-xyz" not in json.dumps([a for _, a in spans.spans])
+
+
+@pytest.mark.parametrize("api", APIS)
 async def test_chat_tools_sends_sorted_canonical_tools(api: Api) -> None:
     fake = FakeOllama([Turn("no tool needed"), Turn("no tool needed")])
     async with make(fake, api) as client:
@@ -464,23 +489,74 @@ async def test_chat_tools_sends_sorted_canonical_tools(api: Api) -> None:
 
 # --- probe -----------------------------------------------------------------------------
 
+TOOL_OK = Turn("", tool_calls=[("weather", {"city": "Oakland"})])
+PROBE_OK = [Turn("{"), TOOL_OK]  # the JSON check, then the tool-call check
+
 
 @pytest.mark.parametrize("api", APIS)
 async def test_probe_ok(api: Api) -> None:
-    fake = FakeOllama([Turn("{")])
+    fake = FakeOllama(list(PROBE_OK))
     async with make(fake, api) as client:
         result = await client.probe()
     assert result.ok and result.model_present and result.ctx_ok and result.thinking_off_ok
+    assert result.tool_call_ok and result.as_dict()["tool_call_ok"] is True
     assert result.latency_ms is not None
     assert result.detail.startswith(f"ok ({api} adapter)")
 
 
-async def test_probe_probe_call_is_one_token_with_thinking_off() -> None:
-    fake = FakeOllama([Turn("{")])
+async def test_probe_calls_are_json_then_one_small_tool_call_with_thinking_off() -> None:
+    fake = FakeOllama(list(PROBE_OK))
     async with make(fake, "ollama") as client:
         await client.probe()
-    (body,) = fake.bodies("/api/chat")
+    body, tool_body = fake.bodies("/api/chat")
     assert body["think"] is False and body["options"]["num_predict"] == 1 and "format" in body
+    assert tool_body["think"] is False and "format" not in tool_body
+    assert [t["function"]["name"] for t in tool_body["tools"]] == ["weather"]
+    assert tool_body["options"]["num_predict"] <= 64
+
+
+# The live failure: qwen3:30b-a3b (Thinking-2507) with think:false. JSON mode passes, but a
+# tool call comes with its reasoning as untagged prose in content.
+LEAKED = "Okay, the user is asking for the weather in Oakland today. Let me check the tools."
+
+
+@pytest.mark.parametrize(
+    ("tool_turn", "api", "expect"),
+    [
+        (Turn(LEAKED, tool_calls=[("weather", {"city": "Oakland"})]), "ollama", "leaked"),
+        (Turn(LEAKED, tool_calls=[("weather", {"city": "Oakland"})]), "openai", "leaked"),
+        (Turn(LEAKED, truncated=True), "ollama", "leaked"),  # reasoning starved the call
+        (Turn("</think>", tool_calls=[("weather", {"city": "X"})]), "ollama", "leaked"),
+        (Turn("", thinking="Okay", tool_calls=[("weather", {"city": "X"})]), "ollama", "leaked"),
+        (Turn(""), "ollama", "no valid call"),
+        (Turn("", tool_calls=[("weather", {})]), "ollama", "no valid call"),  # bad args
+    ],
+)
+async def test_probe_tool_call_check_fails_loudly(tool_turn: Turn, api: Api, expect: str) -> None:
+    fake = FakeOllama([Turn("{"), tool_turn])
+    async with make(fake, api) as client:
+        result = await client.probe()
+    assert result.thinking_off_ok  # the JSON check alone can't see this
+    assert not result.ok and not result.tool_call_ok
+    assert expect in result.detail
+    if expect == "leaked":
+        assert "instruct" in result.detail  # points at the fix
+    assert LEAKED not in result.detail  # lengths only, never the text
+
+
+async def test_probe_tool_call_unavailable_is_reported() -> None:
+    fake = FakeOllama([Turn("{")])  # nothing left for the tool call
+    fake_handler = fake.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat" and not fake.turns:
+            return httpx.Response(500)
+        return fake_handler(request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with OllamaClient(CFG, http=http) as client:
+        result = await client.probe()
+    assert not result.ok and not result.tool_call_ok and "tool probe failed" in result.detail
 
 
 @pytest.mark.parametrize(
@@ -493,7 +569,7 @@ async def test_probe_probe_call_is_one_token_with_thinking_off() -> None:
     ],
 )
 async def test_probe_detects_thinking_on(turn: Turn, api: Api) -> None:
-    fake = FakeOllama([turn])
+    fake = FakeOllama([turn, TOOL_OK])
     async with make(fake, api) as client:
         result = await client.probe()
     assert not result.ok and not result.thinking_off_ok
@@ -508,12 +584,12 @@ async def test_probe_model_missing() -> None:
     async with make(fake) as client:
         result = await client.probe()
     assert not result.ok and not result.model_present
-    assert "ollama pull qwen3:30b-a3b" in result.detail
+    assert "ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M" in result.detail
     assert not fake.bodies("/api/chat")  # no chat call without the model
 
 
 async def test_probe_context_too_small() -> None:
-    fake = FakeOllama([Turn("{")], context_length=8192)
+    fake = FakeOllama(list(PROBE_OK), context_length=8192)
     async with make(fake) as client:
         result = await client.probe()
     assert not result.ok and not result.ctx_ok and result.thinking_off_ok
@@ -521,14 +597,14 @@ async def test_probe_context_too_small() -> None:
 
 
 async def test_probe_modelfile_num_ctx_too_small() -> None:
-    fake = FakeOllama([Turn("{")], parameters="temperature 0.6\nnum_ctx 4096\n")
+    fake = FakeOllama(list(PROBE_OK), parameters="temperature 0.6\nnum_ctx 4096\n")
     async with make(fake) as client:
         result = await client.probe()
     assert not result.ctx_ok and "num_ctx 4096" in result.detail
 
 
 async def test_probe_reports_cold_model() -> None:
-    fake = FakeOllama([Turn("{")], loaded=False)
+    fake = FakeOllama(list(PROBE_OK), loaded=False)
     async with make(fake) as client:
         result = await client.probe()
     assert result.ok and "cold start" in result.detail
@@ -578,23 +654,36 @@ def cli_fake(monkeypatch: pytest.MonkeyPatch) -> FakeOllama:
 def test_cli_probe_ok_writes_kv(cli_fake: FakeOllama) -> None:
     settings = load_settings()
     open_db(settings.db_path).close()
-    cli_fake.turns = [Turn("{")]
+    cli_fake.turns = list(PROBE_OK)
     result = CliRunner().invoke(app, ["model", "probe"])
     assert result.exit_code == 0, result.output
-    assert "thinking    off" in result.output
+    assert "thinking    off" in result.output and "tool call   ok" in result.output
     conn = sqlite3.connect(settings.db_path)
     conn.row_factory = sqlite3.Row
     stored = kv_get(conn, "model.probe")
-    assert stored["ok"] is True and stored["model"] == "qwen3:30b-a3b" and stored["checked_at"]
+    assert (
+        stored["ok"] is True
+        and stored["model"] == "qwen3:30b-a3b-instruct-2507-q4_K_M"
+        and stored["checked_at"]
+    )
 
 
 def test_cli_probe_fails_without_creating_store(cli_fake: FakeOllama) -> None:
-    cli_fake.turns = [Turn("", thinking="hmm")]
+    cli_fake.turns = [Turn("", thinking="hmm"), TOOL_OK]
     result = CliRunner().invoke(app, ["model", "probe", "--json"])
     assert result.exit_code == 1
     data = json.loads(result.output)
     assert data["thinking_off_ok"] is False and data["model_present"] is True
+    assert data["tool_call_ok"] is True
     assert not load_settings().db_path.exists()
+
+
+def test_cli_probe_fails_on_leaked_tool_reasoning(cli_fake: FakeOllama) -> None:
+    cli_fake.turns = [Turn("{"), Turn(LEAKED, tool_calls=[("weather", {"city": "Oakland"})])]
+    result = CliRunner().invoke(app, ["model", "probe"])
+    assert result.exit_code == 1
+    assert "thinking    off" in result.output and "tool call   FAILED" in result.output
+    assert "reasoning leaked" in result.output
 
 
 def test_cli_bench_exits_1_when_probe_fails(cli_fake: FakeOllama) -> None:
@@ -606,7 +695,7 @@ def test_cli_bench_exits_1_when_probe_fails(cli_fake: FakeOllama) -> None:
 
 
 def test_cli_bench_prints_p50_p95(cli_fake: FakeOllama) -> None:
-    cli_fake.turns = [Turn("{")] + [Turn('{"label": "chat"}')] * 3
+    cli_fake.turns = list(PROBE_OK) + [Turn('{"label": "chat"}')] * 3
     cli_fake.turns += [Turn("", tool_calls=[("weather", {"city": "Oakland"})])] * 3
     result = CliRunner().invoke(app, ["model", "bench", "--n", "2"])
     assert result.exit_code == 0, result.output
@@ -615,7 +704,7 @@ def test_cli_bench_prints_p50_p95(cli_fake: FakeOllama) -> None:
 
 
 async def test_probe_untagged_name_matches_latest() -> None:
-    fake = FakeOllama([Turn("{")], models=["mymodel:latest"])
+    fake = FakeOllama(list(PROBE_OK), models=["mymodel:latest"])
     cfg = ModelConfig(name="mymodel", timeout_s=5)
     http = httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
     async with OllamaClient(cfg, http=http) as client:

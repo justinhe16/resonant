@@ -7,7 +7,11 @@
   - ``openai``: the OpenAI-compatible ``/v1`` endpoint via the ``openai`` SDK, with
     ``think: false`` and ``reasoning_effort: "none"`` in ``extra_body``. Portable (a later
     switch to MLX is a config change), but older Ollama builds ignore both fields there.
-  ``probe()`` checks that thinking really is off for whichever adapter is configured.
+  ``probe()`` checks that thinking really is off for whichever adapter is configured, for
+  a JSON call and for a tool call. ``think: false`` only works on hybrid models: a
+  thinking-only build (qwen3:30b-a3b is Thinking-2507) still reasons, as untagged prose in
+  ``content``, and only the tool-call check catches that (JSON mode is grammar-constrained).
+  The default model is the non-thinking Instruct-2507 build for this reason.
 - ``<think>…</think>`` is always stripped before parsing, whatever the adapter says.
 - ``chat_json`` validates the reply against the schema. Invalid or truncated JSON gets one
   retry with a "return only JSON" nudge, then ``ModelOutputError``.
@@ -41,7 +45,7 @@ from openai.types.chat import (
 from openai.types.shared_params import ResponseFormatJSONSchema
 
 from resonant.config import ModelConfig
-from resonant_sdk import ToolSpec
+from resonant_sdk import Effect, ToolSpec
 
 JSON_NUDGE = (
     "Your previous reply was not valid JSON for the required schema. "
@@ -80,6 +84,9 @@ class ProbeResult:
     thinking_off_ok: bool
     latency_ms: int | None  # the 1-token call, including a cold load if there was one
     detail: str
+    # A real tool call came back with no reasoning beside it (in content or a thinking
+    # field). Defaults True so results built without this check read as before.
+    tool_call_ok: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +94,7 @@ class ProbeResult:
             "model_present": self.model_present,
             "ctx_ok": self.ctx_ok,
             "thinking_off_ok": self.thinking_off_ok,
+            "tool_call_ok": self.tool_call_ok,
             "latency_ms": self.latency_ms,
             "detail": self.detail,
         }
@@ -148,6 +156,31 @@ _PROBE_MESSAGES: list[ChatMessage] = [
 ]
 _PROBE_MAX_TOKENS = 1
 
+# Probe: one tool call. JSON mode is grammar-constrained, so the 1-token call above passes
+# even on a model that reasons regardless of ``think: false``. Tool calls aren't
+# constrained: such a model writes its reasoning first, as plain untagged text in
+# ``content`` (qwen3:30b-a3b is the thinking-only Thinking-2507 build and does this). The
+# call itself is ~20 tokens, so a small budget also catches reasoning that starves it.
+_PROBE_TOOL = ToolSpec(
+    name="weather",
+    description="Today's weather forecast for a city.",
+    args_schema={
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+    effect=Effect.READ,
+)
+_PROBE_TOOL_MESSAGES: list[ChatMessage] = [
+    {"role": "system", "content": "Call exactly one tool to answer the user."},
+    {"role": "user", "content": "What's the weather in Oakland today?"},
+]
+_PROBE_TOOL_MAX_TOKENS = 64
+NON_THINKING_HINT = (
+    "the model reasons even with think: false; use a non-thinking instruct build, "
+    "e.g. qwen3:30b-a3b-instruct-2507-q4_K_M"
+)
+
 
 class _NullSpan:
     def set(self, **attrs: Any) -> None:
@@ -182,6 +215,13 @@ def strip_think(text: str) -> str:
 
 def has_think(text: str | None) -> bool:
     return text is not None and "<think>" in text.lower()
+
+
+def has_think_tag(text: str | None) -> bool:
+    """An opening or a closing think tag. Thinking-only templates prefill ``<think>``, so
+    the reply may carry only the closing one."""
+    low = (text or "").lower()
+    return "<think>" in low or "</think>" in low
 
 
 def ollama_root(base_url: str) -> str:
@@ -577,9 +617,14 @@ class OllamaClient:
                 completion_tokens=raw.completion_tokens,
                 tool_calls=[c.name for c in calls],
                 dropped_tool_calls=dropped,
-                thinking_leak=bool(raw.thinking) or has_think(raw.content),
+                thinking_leak=bool(raw.thinking) or has_think_tag(raw.content),
+                # Length only (bodies are PII). Prose beside a tool call is almost always
+                # untagged reasoning; this makes it visible in traces.
+                content_chars=len(raw.content or ""),
+                truncated=raw.truncated,
             )
-            text = strip_think(raw.content) if raw.content else None
+            # With calls, the calls are the answer: prose beside them is reasoning.
+            text = strip_think(raw.content) if raw.content and not calls else None
             return ModelReply(
                 text=text or None,
                 tool_calls=calls,
@@ -595,18 +640,22 @@ class OllamaClient:
     # --- probe ---------------------------------------------------------------------------
 
     async def probe(self) -> ProbeResult:
-        """Model pulled? Context big enough? Thinking really off? Never raises."""
+        """Model pulled? Context big enough? Thinking really off, for JSON and for tool
+        calls? Never raises."""
         notes: list[str] = []
         model_present = await self._model_present(notes)
         if not model_present:
-            return ProbeResult(False, False, False, False, None, "; ".join(notes))
+            return ProbeResult(False, False, False, False, None, "; ".join(notes), False)
         ctx_ok = await self._ctx_ok(notes)
         await self._note_cold(notes)
         thinking_off_ok, latency = await self._thinking_off(notes)
-        ok = model_present and ctx_ok and thinking_off_ok
+        tool_call_ok = await self._tool_call(notes)
+        ok = model_present and ctx_ok and thinking_off_ok and tool_call_ok
         if ok:
             notes.insert(0, f"ok ({self.api} adapter)")
-        return ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency, "; ".join(notes))
+        return ProbeResult(
+            ok, model_present, ctx_ok, thinking_off_ok, latency, "; ".join(notes), tool_call_ok
+        )
 
     async def _get_json(self, method: str, path: str, **kw: Any) -> dict[str, Any]:
         resp = await self._http.request(
@@ -706,3 +755,28 @@ class OllamaClient:
             notes.append(f"thinking is not off with the {self.api} adapter{hint}")
             return False, latency
         return True, latency
+
+    async def _tool_call(self, notes: list[str]) -> bool:
+        """One small tool call: it must arrive, with no reasoning beside it."""
+        try:
+            raw = await self._complete(
+                _PROBE_TOOL_MESSAGES,
+                max_tokens=_PROBE_TOOL_MAX_TOKENS,
+                temperature=0.0,
+                tools=openai_tools([_PROBE_TOOL]),
+            )
+        except ModelError as e:
+            notes.append(f"tool probe failed: {e}")
+            return False
+        calls, _ = validate_tool_calls(raw.tool_calls, [_PROBE_TOOL])
+        content = (raw.content or "").strip()
+        if (raw.thinking or "").strip() or content:
+            notes.append(
+                f"tool call: reasoning leaked ({len(content)} chars of content, "
+                f"{len((raw.thinking or '').strip())} of thinking); {NON_THINKING_HINT}"
+            )
+            return False
+        if not calls:
+            notes.append(f"tool call: no valid call within {_PROBE_TOOL_MAX_TOKENS} tokens")
+            return False
+        return True
