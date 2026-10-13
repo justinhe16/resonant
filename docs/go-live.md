@@ -31,12 +31,13 @@ The script is idempotent. It never overwrites existing files in `~/.resonant`, a
 - Turn **FileVault on** (System Settings → Privacy & Security → FileVault).
 - Put the Mini on a **UPS**.
 - Turn **automatic macOS updates off** (System Settings → General → Software Update → Automatic Updates: off for "Install macOS updates").
+- **Never sleep**, and power back on after an outage: `sudo pmset -a sleep 0 disksleep 0 standby 0 autorestart 1 womp 1`. The display can still sleep. A sleeping Mini doesn't read `chat.db`, so texts would wait until it wakes. `autorestart 1` matters most without a UPS: after a power cut the Mini boots by itself (to the FileVault login screen, see below).
 - For planned reboots, use `sudo fdesetup authrestart`. It unlocks the disk once, so the Mini comes back up logged in.
 
 FileVault disables auto-login. After a power loss or a crash reboot, the Mini waits at the login screen. Resonant and Messages don't start until someone logs in. That is the expected recovery path, not a bug. The dead-man switch (step 7) that would alert you isn't set up yet: it is planned as the status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)).
 
-- **Verify:** `fdesetup status` and `defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates`
-- **Expected:** `FileVault is On.` and `0`. If the key doesn't exist, check System Settings directly. `--check` shows `FileVault  PASS  on`. Confirm the UPS by pulling its wall plug for a few seconds: the Mini stays on.
+- **Verify:** `fdesetup status`, `defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates` and `pmset -g | grep -E ' sleep|autorestart'`
+- **Expected:** `FileVault is On.`, `0`, and `sleep 0` and `autorestart 1`. If the key doesn't exist, check System Settings directly. `--check` shows `FileVault  PASS  on`. Confirm the UPS by pulling its wall plug for a few seconds: the Mini stays on.
 
 ## 3. Resonant's Apple ID
 
@@ -116,7 +117,7 @@ Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:3
 
 ## 9. Router evals
 
-The synthetic set in `evals/` only proves the pipeline. Gate on your own texts.
+*Deferred: needs real texts labelled by hand (see [`followups.md`](followups.md#router-evals-on-real-texts-go-live-step-9)).* The synthetic set in `evals/` only proves the pipeline. Gate on your own texts.
 
 - Put real messages (anonymised as you like) in `~/.resonant/evals/router.jsonl`, in the same format as `evals/*.example.jsonl`. That directory is outside the repo and is never committed.
 - **Verify:** `resonant eval router --set ~/.resonant/evals/router.jsonl`

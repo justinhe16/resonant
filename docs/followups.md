@@ -61,6 +61,20 @@ Work we've decided to do eventually but have deferred. Each entry says why it wa
 - The docs (`architecture.md`, `architecture.html`, `interfaces.md`) describe it.
 - The Mini still has no public port.
 
+## Router evals on real texts (go-live step 9)
+
+*Deferred 2026-10-13, during Mac mini go-live. It needs real texts labelled by hand, and routing works well enough in day-to-day use for now.*
+
+**What.** `resonant eval router` measures how often the router picks the right intent (question, system, job_control, run_project, unknown). The synthetic set in `evals/` only proves the pipeline.
+
+**To do.**
+- Collect 30-50 real texts sent to Resonant and label each with its intent in `~/.resonant/evals/router.jsonl`, in the format of `evals/router.example.jsonl`. The file stays on the Mini and is never committed.
+- Run `resonant eval router --set ~/.resonant/evals/router.jsonl` and look at the misroutes.
+
+**When to revisit.** When replies start going to the wrong intent, before Phase 2 adds side-effecting tools (a misroute then costs an approval prompt), or when the model or router prompt changes.
+
+**Done when.** Accuracy is ≥ 90% on the real set, as go-live step 9 expects.
+
 ## Slow-reply acknowledgement ("on it")
 
 *Deferred 2026-10-13, from the local-model latency fix (Instruct-2507 default).*
