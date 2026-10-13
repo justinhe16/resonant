@@ -81,7 +81,7 @@ def main() -> None:
     except OSError as e:
         out("FAIL", True, "Full Disk Access (chat.db)", f"{chat_db}: {e.strerror or e}")
 
-    # Advisory until the dead-man provider is chosen (docs/followups.md).
+    # Advisory until the status relay is built (docs/followups.md).
     if settings.health.healthchecks_url:
         out("PASS", False, "healthchecks URL set", "health.healthchecks_url is set")
     else:

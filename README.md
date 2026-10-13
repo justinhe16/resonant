@@ -21,7 +21,7 @@ Then work through the **[go-live checklist](docs/go-live.md)** to get from a run
 - Code computes numbers. The LLM narrates.
 - All state is persisted in SQLite. Tasks are idempotent and resume after a crash.
 - Every action is in the audit log.
-- There are no public ports. The dashboard is reachable only through `tailscale serve`.
+- There are no public ports. The dashboard and API are loopback only. Remote status access is planned through a push-only status relay ([follow-up](docs/followups.md#status-relay-dead-man-switch-and-remote-dashboard)), never by exposing the API.
 - Core stays generic. Anything only one use case needs belongs in that extension.
 
 ## Layout

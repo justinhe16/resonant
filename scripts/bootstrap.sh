@@ -209,12 +209,8 @@ $(printf '\033[1m')Manual steps (macOS won't let a script do these):$(printf '\0
      Never put secrets in config files or .env.
 
   5. Network
-     - Optional for now (see docs/followups.md: a status relay is planned instead).
-     - Remote dashboard: install Tailscale (https://tailscale.com/download/mac),
-       log in, then expose the dashboard and API to your tailnet only:
-         tailscale serve --bg 7777
-     - Dead-man switch: create a check at healthchecks.io and set
-       health.healthchecks_url in $HOME_DIR/config.yaml.
+     - Nothing to do now. Remote access and the dead-man switch are planned as
+       the status relay (docs/followups.md).
 
   6. Edit $HOME_DIR/config.yaml (dry_run stays true until Phase 2 ships), then:
        $RESONANT daemon install   # reload after config changes

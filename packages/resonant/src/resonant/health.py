@@ -5,10 +5,11 @@
 - Watchdog: a separate *thread* checks the heartbeat age. Past ``watchdog_stale_s`` it
   calls ``os._exit(1)`` and launchd (KeepAlive) restarts the daemon. A whole-process
   freeze (SIGSTOP, a kernel hang) also stops this thread, which is why the dead-man exists.
-- Dead-man: pings healthchecks.io every ``ping_every_s`` while healthy, and sends ``/fail``
-  (with a plain-text reason body) when the loop is stale or the health monitor reports a
-  problem it can't text the owner about. If pings stop entirely (machine down, process
-  frozen, network out), healthchecks.io alerts on its own.
+- Dead-man: GETs the configured dead-man URL every ``ping_every_s`` while healthy, and
+  POSTs ``<url>/fail`` (with a plain-text reason body) when the loop is stale or the health
+  monitor reports a problem it can't text the owner about. If pings stop entirely (machine
+  down, process frozen, network out), the receiver alerts on its own. The planned receiver
+  is the status relay (docs/followups.md), which isn't built yet.
 """
 
 from __future__ import annotations

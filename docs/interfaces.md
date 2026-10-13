@@ -461,7 +461,7 @@ Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | No
 
 - `with span(conn, name, trace_id=..., task_id=..., parent_id=..., **attrs) as s: s.set(...)` writes a row to `spans` with status and timing.
 - Logs are JSON lines in `~/.resonant/logs/resonant.jsonl`, rotated at 20MB × 5. Standard-library loggers flow through structlog.
-- `httpx` and `httpcore` are kept at WARNING because request URLs can carry credentials, such as the healthchecks ping UUID.
+- `httpx` and `httpcore` are kept at WARNING because request URLs can carry credentials, such as a secret in the dead-man URL.
 
 ## CLI exit codes
 
@@ -474,7 +474,7 @@ Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | No
 
 ## Local API
 
-All endpoints are loopback only and exposed to the tailnet with `tailscale serve`.
+All endpoints are loopback only. Remote status access is planned via the push-only status relay ([`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)), never by exposing the API.
 
 | Endpoint | Returns |
 |---|---|

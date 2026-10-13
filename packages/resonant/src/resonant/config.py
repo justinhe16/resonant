@@ -70,7 +70,7 @@ class ApiConfig(_Section):
     @field_validator("host")
     @classmethod
     def _loopback_only(cls, v: str) -> str:
-        # No public ports: the dashboard is exposed only via `tailscale serve`.
+        # No public ports: remote status is planned via the push-only status relay.
         if not _is_loopback(v):
             raise ValueError("api.host must be a loopback address")
         return v

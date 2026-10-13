@@ -1,4 +1,4 @@
-"""Local HTTP API. Bound to loopback only; exposed to the tailnet with `tailscale serve`."""
+"""Local HTTP API. Bound to loopback only; remote status is planned via a push-only relay."""
 
 from __future__ import annotations
 

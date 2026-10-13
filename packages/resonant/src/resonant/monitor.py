@@ -17,7 +17,7 @@ iMessage per incident once a check has been degraded for ``alert_after`` (2) con
 evaluations, at most one per check per ``alert_cooldown_s`` (6h), and one "resolved: ..."
 message when an alerted incident clears. While the ``imessage`` check itself is degraded
 (or there is no channel), no iMessage is attempted: :meth:`HealthMonitor.deadman_reason`
-returns the reason and the healthchecks.io ``/fail`` ping carries it instead. The same
+returns the reason and the dead-man ``/fail`` ping carries it instead. The same
 happens after 3 consecutive failed owner sends. A cached model probe doesn't count as a new
 degraded evaluation, so the model alerts only after 2 failed probes (about 5 minutes).
 

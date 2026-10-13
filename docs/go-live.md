@@ -33,7 +33,7 @@ The script is idempotent. It never overwrites existing files in `~/.resonant`, a
 - Turn **automatic macOS updates off** (System Settings → General → Software Update → Automatic Updates: off for "Install macOS updates").
 - For planned reboots, use `sudo fdesetup authrestart`. It unlocks the disk once, so the Mini comes back up logged in.
 
-FileVault disables auto-login. After a power loss or a crash reboot, the Mini waits at the login screen. Resonant and Messages don't start until someone logs in. The dead-man switch (step 7) alerts you when that happens. That is the expected recovery path, not a bug.
+FileVault disables auto-login. After a power loss or a crash reboot, the Mini waits at the login screen. Resonant and Messages don't start until someone logs in. That is the expected recovery path, not a bug. The dead-man switch (step 7) that would alert you isn't set up yet: it is planned as the status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)).
 
 - **Verify:** `fdesetup status` and `defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates`
 - **Expected:** `FileVault is On.` and `0`. If the key doesn't exist, check System Settings directly. `--check` shows `FileVault  PASS  on`. Confirm the UPS by pulling its wall plug for a few seconds: the Mini stays on.
@@ -103,26 +103,9 @@ resonant status
 - **Verify:** `resonant status`, then text "hi" to the Resonant handle from your phone.
 - **Expected:** `daemon  up (launchd: True)`, `dry_run  True`, and exit code 0. `--check` shows `daemon up  PASS` and `imessage channel enabled  PASS  enabled: True`. You get a reply on your phone.
 
-## 7. Dead-man switch (healthchecks.io)
+## 7. Dead-man switch
 
-This step is optional for now. We plan to replace healthchecks.io with our own status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)), so `--check` reports `healthchecks URL set` as advisory.
-
-- Create a check at [healthchecks.io](https://healthchecks.io). Set its period to 1 minute (the daemon pings every `health.ping_every_s`, 60s by default) and a grace time of a few minutes. Add your phone or email as an integration.
-- Set the ping URL in `~/.resonant/config.yaml`, then reload with `resonant daemon install`.
-
-  ```yaml
-  health:
-    healthchecks_url: https://hc-ping.com/<uuid>
-  ```
-
-- **Verify:** `scripts/bootstrap.sh --check`, then freeze the daemon for longer than the check's period plus grace:
-
-  ```sh
-  pid=$(launchctl list | awk '/com.resonant.daemon/ {print $1}')
-  kill -STOP "$pid"; sleep 400; kill -CONT "$pid"   # adjust sleep to period + grace
-  ```
-
-- **Expected:** `healthchecks URL set  PASS`. On healthchecks.io the check shows recent pings. While the daemon is frozen, the check goes **down** and you get the alert. After `kill -CONT` it recovers. If the watchdog sees a stale loop first, the event log shows a `/fail` ping with the reason.
+Not set up yet: planned as the status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)). Skip this step for now; `--check` reports `healthchecks URL set` as advisory.
 
 ## 8. Local model
 
@@ -144,20 +127,9 @@ The synthetic set in `evals/` only proves the pipeline. Gate on your own texts.
 - **Verify:** `resonant bench e2e --model real --n 20` (after step 8, with the model warm). It runs the real reader, router, local runner and channel against the configured Ollama model in a throwaway home, with a fake chat.db and a recording osascript runner, so it never texts anyone and is safe next to the live daemon.
 - **Expected:** exit 0: `fast` p50 ≤ 1000 ms and `llm` p50 ≤ 3000 ms. **Record the numbers** (date, model, macOS version) in the latency table in `docs/architecture.md`, replacing "pending go-live checklist".
 
-## 10. Tailnet access to the dashboard
+## 10. Remote dashboard access
 
-The API binds to `127.0.0.1` only (config validation enforces it). Tailscale is the only way in.
-
-This step is optional for now. We plan to replace it with a read-only status relay that the Mini pushes to (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)). Without it, the dashboard is reachable only on the Mini. iMessage doesn't need it.
-
-- Install Tailscale (https://tailscale.com/download/mac), log in, then:
-
-  ```sh
-  tailscale serve --bg 7777
-  ```
-
-- **Verify:** `tailscale serve status` on the Mini, then from another device on your tailnet: `curl -s https://<mini-name>.<tailnet>.ts.net/api/status`
-- **Expected:** `serve status` shows `https://<mini-name>...` proxying to `http://127.0.0.1:7777`. The remote `curl` returns JSON with `"dry_run": true`. Off the tailnet the name doesn't resolve.
+Not set up yet: planned as the status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)). Skip this step for now. The API binds to `127.0.0.1` only (config validation enforces it), so the dashboard is reachable only on the Mini. iMessage doesn't need it.
 
 ## 11. Keep `dry_run: true`
 

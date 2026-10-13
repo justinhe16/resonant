@@ -10,11 +10,11 @@ model:
   api: ollama                           # ollama (native /api/chat, think:false) | openai (/v1)
 
 api:
-  host: 127.0.0.1                       # loopback only; expose with `tailscale serve`
+  host: 127.0.0.1                       # loopback only; remote status: planned status relay (docs/followups.md)
   port: 7777
 
 health:
-  healthchecks_url: null                # e.g. https://hc-ping.com/<uuid>
+  healthchecks_url: null                # dead-man URL: GET while healthy, POST <url>/fail; planned receiver: status relay (docs/followups.md)
   ping_every_s: 60
   watchdog_stale_s: 120
 
