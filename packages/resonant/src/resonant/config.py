@@ -46,7 +46,9 @@ def _is_loopback(host: str) -> bool:
 
 class ModelConfig(_Section):
     base_url: str = "http://127.0.0.1:11434/v1"
-    name: str = "qwen3:30b-a3b"
+    # Non-thinking Instruct-2507 build. Not `qwen3:30b-a3b`: that tag is the thinking-only
+    # Thinking-2507 build, which ignores `think: false` and reasons before every tool call.
+    name: str = "qwen3:30b-a3b-instruct-2507-q4_K_M"
     context_tokens: int = Field(default=32768, gt=0)
     timeout_s: float = Field(default=60.0, gt=0)
     # "ollama": native /api/chat (top-level `think: false`, the documented switch for qwen3).

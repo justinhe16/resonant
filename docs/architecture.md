@@ -69,7 +69,7 @@ The Phase 1 exit criterion is **text → answer in 2–3s**: p50 ≤ 1s on the f
 | Run | Model | fast p50 / p95 | llm p50 / p95 |
 |---|---|---|---|
 | Dev machine, `--model fake` (n=20; CI runs the same code) | scripted | 354 / 370 ms | 354 / 361 ms |
-| Mac mini, `--model real` | `qwen3:30b-a3b` (Ollama) | pending go-live checklist (PER-234) | pending go-live checklist (PER-234) |
+| Mac mini, `--model real` | `qwen3:30b-a3b-instruct-2507-q4_K_M` (Ollama) | pending go-live checklist (PER-234) | pending go-live checklist (PER-234) |
 
 With the scripted model nearly all of the time is the reader's WAL-watch interval plus its debounce, so the harness overhead is about 0.35s; on the Mini the labeled path adds the label call, up to three tool rounds, and the answer call.
 
@@ -138,6 +138,7 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 | 2026-10-08 | `yes all` approves a stored batch snapshot, never pay. On-call pages go to iMessage and Slack, and the first resolution wins. |
 | 2026-10-08 | Public repo from Phase 0. gitleaks runs in pre-commit and CI. Only `*.example` configs ship. Real eval sets stay out of the repo. |
 | 2026-10-08 | LaunchAgent plists are generated with `plistlib` instead of template files. |
+| 2026-10-13 | Default model is `qwen3:30b-a3b-instruct-2507-q4_K_M`, the non-thinking Instruct-2507 build. Ollama's `qwen3:30b-a3b` tag now points at the thinking-only Thinking-2507 build, which ignores `think: false` and writes ~100-500 tokens of untagged reasoning before each tool call (llm path p50 6.4s). `resonant model probe` now also makes a tool call and fails if reasoning leaks or no call arrives. |
 | 2026-10-08 | `waiting(ci)` polls CI through `gh` on the tick. No inbound GitHub webhooks. |
 | 2026-10-08 | Router fast-path reads go through the gate but not the executor: no task exists at route time, and builtins are L0 reads with no side effect. `/kill` and `/resume` are deterministic and owner-only, never decided by the model. |
 | 2026-10-08 | Manifests load with a YAML loader where only true/false are booleans, so `notify: {on: [...]}` stays a string key. |

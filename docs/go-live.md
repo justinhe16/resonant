@@ -109,7 +109,7 @@ Not set up yet: planned as the status relay (see [`followups.md`](followups.md#s
 
 ## 8. Local model
 
-Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:30b-a3b`).
+Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:30b-a3b-instruct-2507-q4_K_M`, ~19 GB). Use an instruct (non-thinking) build: plain `qwen3:30b-a3b` is the thinking-only Thinking-2507 build, and the probe's tool-call check fails on it.
 
 - **Verify:** `resonant model probe`, then `resonant model bench`
 - **Expected:** the probe reports the model is loaded with the configured context length, and exits 0. The bench prints latency and tokens/sec. **Record the numbers** (date, model, macOS version) in your notes so regressions are visible. `--check` runs the probe (required). Until it ships, `--check` prints `model probe  SKIP (available after Phase 1)`. In the meantime, `curl -s http://127.0.0.1:11434/api/tags` should list the model.

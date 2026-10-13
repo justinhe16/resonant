@@ -314,6 +314,7 @@ def _echo_probe(data: dict[str, Any]) -> None:
     if data["model_present"]:
         typer.echo(f"context     {yn(data['ctx_ok'], 'ok', 'TOO SMALL / unknown')}")
         typer.echo(f"thinking    {yn(data['thinking_off_ok'], 'off', 'NOT OFF')}")
+        typer.echo(f"tool call   {yn(data['tool_call_ok'], 'ok', 'FAILED (see detail)')}")
     if data["latency_ms"] is not None:
         typer.echo(f"latency     {data['latency_ms']} ms (1-token JSON call)")
     if data["detail"]:
@@ -322,7 +323,8 @@ def _echo_probe(data: dict[str, Any]) -> None:
 
 @model_app.command("probe")
 def model_probe(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
-    """Check the model is pulled, its context is big enough, and thinking is off. Exit 1 if not."""
+    """Check the model is pulled, its context is big enough, thinking is off, and a tool call
+    comes back with no reasoning. Exit 1 if not."""
     data = _run_probe(load_settings())
     if as_json:
         typer.echo(json.dumps(data, indent=2))

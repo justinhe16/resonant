@@ -155,8 +155,8 @@ async def test_all_ok_first_round(env: Env) -> None:
     cached = kv_get(env.db, "model.probe")
     assert cached["ok"] is True and cached["model"] == "qwen" and cached["api"] == "ollama"
     assert set(cached) == {
-        "ok", "model_present", "ctx_ok", "thinking_off_ok", "latency_ms", "detail",
-        "model", "api", "checked_at",
+        "ok", "model_present", "ctx_ok", "thinking_off_ok", "tool_call_ok", "latency_ms",
+        "detail", "model", "api", "checked_at",
     }  # fmt: skip
 
 
@@ -171,6 +171,15 @@ async def test_model_probe_every_five_minutes(env: Env) -> None:
     assert env.model.calls == 1
     await env.tick()  # t=5m
     assert env.model.calls == 2
+
+
+async def test_model_degraded_when_tool_call_leaks_reasoning(env: Env) -> None:
+    env.model.result = ProbeResult(False, True, True, True, 120, "x", tool_call_ok=False)
+    await env.tick()
+    s = _state(env.db, "model")
+    assert s["state"] == "degraded"
+    assert s["detail"] == "model tool call failed or leaked reasoning"
+    assert kv_get(env.db, "model.probe")["tool_call_ok"] is False
 
 
 async def test_model_degraded_alerts_once_then_recovers(env: Env) -> None:
