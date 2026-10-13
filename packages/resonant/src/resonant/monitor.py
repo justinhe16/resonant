@@ -62,6 +62,7 @@ _PROBE_FIELDS = (
     "ctx_ok",
     "thinking_off_ok",
     "tool_call_ok",
+    "call_failed",
     "latency_ms",
     "detail",
 )
@@ -562,6 +563,8 @@ def _model_result(p: ProbeResult) -> CheckResult:
         return CheckResult(False, "model unreachable or not pulled")
     if not p.ctx_ok:
         return CheckResult(False, "model context too small")
+    if p.call_failed:
+        return CheckResult(False, "model call failed (timeout or connection error)")
     if not p.thinking_off_ok:
         return CheckResult(False, "model thinking is not off")
     if not p.tool_call_ok:

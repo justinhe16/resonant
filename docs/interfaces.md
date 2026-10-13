@@ -272,7 +272,7 @@ Five global read tools (`effect=read`, level L0, `extension=None`, `source="buil
 | `model_status` | none | `{known: false}` when `kv["model.probe"]` is absent or not an object; otherwise the cached probe's fields plus `known: true`. It never calls the model. |
 
 - `system_status`: `cpu_percent` is measured since the previous call (primed at registration), so it never blocks. `memory_pressure` comes from `sysctl kern.memorystatus_vm_pressure_level` and `memory_pressure -Q` with a 500ms timeout, best effort; off macOS, or when they are missing or slow, it is `{level: "unknown", free_pct: null}`. `disk` lists `/` and `RESONANT_HOME`; an unreadable path has null numbers.
-- The `model.probe` kv key is written by `resonant model probe` and the health monitor, in one shape: `{ok, model_present, ctx_ok, thinking_off_ok, tool_call_ok, latency_ms, detail, model, api, checked_at}`. The monitor writes only these fields and scrubs URLs from `detail`. Builtins read it only.
+- The `model.probe` kv key is written by `resonant model probe` and the health monitor, in one shape: `{ok, model_present, ctx_ok, thinking_off_ok, tool_call_ok, call_failed, latency_ms, detail, model, api, checked_at}`. The monitor writes only these fields and scrubs URLs from `detail`. Builtins read it only.
 
 ## Components: `resonant.components`
 
@@ -352,7 +352,7 @@ class ModelClient(Protocol):
 ChatMessage = TypedDict(role: "system" | "user" | "assistant", content: str)
 ModelReply(text, tool_calls: list[ToolCall], json: dict | None, latency_ms, prompt_tokens, completion_tokens)
 ToolCall(name, args)                     # args validated against ToolSpec.args_schema
-ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail, tool_call_ok=True)
+ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail, tool_call_ok=True, call_failed=False)
 ```
 
 - `OllamaClient(cfg.model)` implements it. `model.api` picks the adapter:
@@ -363,7 +363,7 @@ ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail, tool
 - `chat_tools` sends tools sorted by name with canonical key order: the same toolset is a byte-identical prefix (`tools_prefix()`). Calls to unknown tools, or with args that fail the schema, are dropped and recorded on the span. Args sent as a JSON string are parsed first.
 - Each call gets `model.timeout_s`. A connection error is retried once, immediately. Otherwise (timeout, HTTP error, missing model) it raises `ModelUnavailableError`, so callers can send a templated fallback.
 - Each call opens an `llm.call` span through the injected `SpanFactory` (e.g. `partial(span, conn, trace_id=...)`; default: none). Spans record model, adapter, latency, tokens and dropped calls, never prompt or reply text.
-- `probe()` never raises. It checks `/api/tags` (pulled), `/api/show` (context ≥ `model.context_tokens`, including a Modelfile `num_ctx`), `/api/ps` (notes a cold model), a 1-token JSON call with thinking off, and one small tool call (`tool_call_ok`): it must return a valid call with nothing in `content` or `thinking`. JSON mode is grammar-constrained, so only the tool call shows a model that reasons despite `think: false` (a thinking-only build such as `qwen3:30b-a3b`, which is Thinking-2507).
+- `probe()` never raises. It checks `/api/tags` (pulled), `/api/show` (context ≥ `model.context_tokens`, including a Modelfile `num_ctx`), `/api/ps` (notes a cold model), a 1-token JSON call with thinking off, and one small tool call (`tool_call_ok`): it must return a valid call with nothing in `content` or `thinking`. The tool call is skipped (and `tool_call_ok` is false) when the JSON call already failed. `call_failed` is true when a generation call raised (timeout, connection or HTTP error); the monitor then reports a failed call rather than thinking or leaked reasoning. JSON mode is grammar-constrained, so only the tool call shows a model that reasons despite `think: false` (a thinking-only build such as `qwen3:30b-a3b`, which is Thinking-2507).
 - `chat_tools` drops any text that comes beside a valid tool call (it is reasoning, not an answer) and records `content_chars`, `truncated` and `thinking_leak` (an opening or closing think tag, or a `thinking` field) on the span.
 
 ## Router: `resonant.router`

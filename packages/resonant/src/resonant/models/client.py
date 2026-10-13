@@ -87,6 +87,9 @@ class ProbeResult:
     # A real tool call came back with no reasoning beside it (in content or a thinking
     # field). Defaults True so results built without this check read as before.
     tool_call_ok: bool = True
+    # A generation call raised (timeout, connection, HTTP error), so the thinking and
+    # tool-call flags say nothing about the model itself.
+    call_failed: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +98,7 @@ class ProbeResult:
             "ctx_ok": self.ctx_ok,
             "thinking_off_ok": self.thinking_off_ok,
             "tool_call_ok": self.tool_call_ok,
+            "call_failed": self.call_failed,
             "latency_ms": self.latency_ms,
             "detail": self.detail,
         }
@@ -648,13 +652,26 @@ class OllamaClient:
             return ProbeResult(False, False, False, False, None, "; ".join(notes), False)
         ctx_ok = await self._ctx_ok(notes)
         await self._note_cold(notes)
-        thinking_off_ok, latency = await self._thinking_off(notes)
-        tool_call_ok = await self._tool_call(notes)
+        failed: list[bool] = []
+        thinking_off_ok, latency = await self._thinking_off(notes, failed)
+        if thinking_off_ok:
+            tool_call_ok = await self._tool_call(notes, failed)
+        else:
+            # Already degraded; the tool call would only add up to a timeout's wait.
+            tool_call_ok = False
+            notes.append("tool call: skipped")
         ok = model_present and ctx_ok and thinking_off_ok and tool_call_ok
         if ok:
             notes.insert(0, f"ok ({self.api} adapter)")
         return ProbeResult(
-            ok, model_present, ctx_ok, thinking_off_ok, latency, "; ".join(notes), tool_call_ok
+            ok,
+            model_present,
+            ctx_ok,
+            thinking_off_ok,
+            latency,
+            "; ".join(notes),
+            tool_call_ok,
+            call_failed=bool(failed),
         )
 
     async def _get_json(self, method: str, path: str, **kw: Any) -> dict[str, Any]:
@@ -735,7 +752,7 @@ class OllamaClient:
                 f"loaded with context {ctx} < model.context_tokens (check OLLAMA_CONTEXT_LENGTH)"
             )
 
-    async def _thinking_off(self, notes: list[str]) -> tuple[bool, int | None]:
+    async def _thinking_off(self, notes: list[str], failed: list[bool]) -> tuple[bool, int | None]:
         start = self._clock()
         try:
             raw = await self._complete(
@@ -746,6 +763,7 @@ class OllamaClient:
             )
         except ModelError as e:
             notes.append(f"probe call failed: {e}")
+            failed.append(True)
             return False, None
         latency = self._ms(start)
         content = raw.content or ""
@@ -756,7 +774,7 @@ class OllamaClient:
             return False, latency
         return True, latency
 
-    async def _tool_call(self, notes: list[str]) -> bool:
+    async def _tool_call(self, notes: list[str], failed: list[bool]) -> bool:
         """One small tool call: it must arrive, with no reasoning beside it."""
         try:
             raw = await self._complete(
@@ -767,6 +785,7 @@ class OllamaClient:
             )
         except ModelError as e:
             notes.append(f"tool probe failed: {e}")
+            failed.append(True)
             return False
         calls, _ = validate_tool_calls(raw.tool_calls, [_PROBE_TOOL])
         content = (raw.content or "").strip()
