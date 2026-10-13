@@ -186,7 +186,7 @@ $(printf '\033[1m')Manual steps (macOS won't let a script do these):$(printf '\0
      - Put the Mini on a UPS, and turn off automatic macOS updates.
 
   2. Resonant's own Apple ID (iMessage channel, Phase 1)
-     - Create a dedicated Apple ID with an EMAIL handle (e.g. resonant.agent@icloud.com).
+     - Create a dedicated Apple ID with an EMAIL handle (e.g. a new @icloud.com address).
        Don't attach a phone number. Resonant uses iMessage only, never SMS.
      - Sign it into Messages.app on this Mac (Settings > iMessage: enable that email only).
      - Set channels.imessage.self_handle in $HOME_DIR/config.yaml.

@@ -76,6 +76,13 @@ def test_helper_fails_the_seeded_example_config(resonant_home: Path) -> None:
     assert rows["healthchecks URL set"][0] == "FAIL"
 
 
+def test_helper_passes_a_real_icloud_self_handle(resonant_home: Path) -> None:
+    # The example is a reserved-domain address, so a real @icloud.com handle is never "example".
+    config = LIVE_CONFIG.replace("resonant.real@icloud.com", "resonant.agent@icloud.com")
+    (resonant_home / "config.yaml").write_text(config)
+    assert _helper(resonant_home)["imessage self_handle set"][0] == "PASS"
+
+
 def test_helper_fails_when_dry_run_is_off(resonant_home: Path) -> None:
     (resonant_home / "config.yaml").write_text(LIVE_CONFIG.replace("true", "false"))
     assert _helper(resonant_home)["dry_run is true"][0] == "FAIL"

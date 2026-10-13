@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 # The values config/*.example.yaml ship with. Seeded config still holding them is not live.
-EXAMPLE_SELF_HANDLE = "resonant.agent@icloud.com"
+EXAMPLE_SELF_HANDLE = "resonant@example.com"
 EXAMPLE_IDENTITIES = frozenset({"imessage:+15550000000", "imessage:owner@icloud.com"})
 NOT_YET = "SKIP (available after Phase 1)"
 DEFAULT_CHAT_DB = "~/Library/Messages/chat.db"

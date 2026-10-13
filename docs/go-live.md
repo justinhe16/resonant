@@ -42,14 +42,14 @@ FileVault disables auto-login. After a power loss or a crash reboot, the Mini wa
 
 Resonant has its own Apple ID so that it can text you, and you can text it.
 
-- Create a dedicated Apple ID with an **email handle**, e.g. `resonant.agent@icloud.com`. Do **not** attach a phone number. Resonant uses iMessage only, never SMS.
+- Create a dedicated Apple ID with an **email handle**, e.g. a new `@icloud.com` address. Do **not** attach a phone number. Resonant uses iMessage only, never SMS.
 - Sign it into **Messages.app** on the Mini. In Messages → Settings → iMessage, enable only that email address under "You can be reached for messages at".
 - Set the handle in `~/.resonant/config.yaml`. It must be the lowercase email.
 
   ```yaml
   channels:
     imessage:
-      self_handle: resonant.agent@icloud.com
+      self_handle: resonant@example.com
   ```
 
 - **Verify:** `scripts/bootstrap.sh --check`, then from your phone send an iMessage to the handle.

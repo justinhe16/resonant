@@ -315,7 +315,7 @@ Every adapter must:
 - `ChannelSendError`: the adapter tried and failed; the message says how to fix it.
 
 **iMessage** (Phase 1):
-- Resonant's own Apple ID, with an **email handle** (`channels.imessage.self_handle`, e.g. `resonant.agent@icloud.com`), is signed into Messages.app. It is iMessage only: no SMS, and no phone number on Resonant's account. Rows are still checked for `service='iMessage'` as a second guard.
+- Resonant's own Apple ID, with an **email handle** (`channels.imessage.self_handle`, e.g. a dedicated `@icloud.com` address), is signed into Messages.app. It is iMessage only: no SMS, and no phone number on Resonant's account. Rows are still checked for `service='iMessage'` as a second guard.
 - A principal may list several handles (phone number and Apple ID email). A sender handle that maps to nobody is dropped and audited.
 - **Outbound allowlist:** it sends only to handles listed in principals.yaml (`send` takes a principal, never a raw handle). Any other destination is refused and audited.
 - **Send:** osascript, one call per message: `["/usr/bin/osascript", "-e", SEND_SCRIPT, handle, text]` with a 15s timeout (`resonant.gateway.imessage.sender`). The runner is an injectable `OsaRunner` protocol (`async (argv, timeout_s) -> OsaResult(returncode, stdout, stderr)`). Errors map to actionable `SendError`s: -1743 (grant Automation), Messages not running, unknown participant, timeout. stderr is never logged or passed on.
