@@ -148,6 +148,8 @@ The synthetic set in `evals/` only proves the pipeline. Gate on your own texts.
 
 The API binds to `127.0.0.1` only (config validation enforces it). Tailscale is the only way in.
 
+This step is optional for now: remote access is undecided between Tailscale and a relay of our own (see [`followups.md`](followups.md#remote-dashboard-access-tailscale-or-our-own-relay)). Without it, the dashboard is reachable only on the Mini. iMessage doesn't need it.
+
 - Install Tailscale (https://tailscale.com/download/mac), log in, then:
 
   ```sh

@@ -22,3 +22,24 @@ Work we've decided to do eventually but have deferred. Each entry says why it wa
 - Nobody is alerted when the Mini is down.
 
 **Done when** a provider is chosen and configured, the go-live step 7 freeze test (`kill -STOP` the daemon) produces an alert, and `go-live.md` and `--check` describe the chosen provider.
+
+## Remote dashboard access: Tailscale or our own relay
+
+*Deferred 2026-10-13, during Mac mini go-live (step 10 of [`go-live.md`](go-live.md)).*
+
+**What it is.** The API and dashboard bind to `127.0.0.1:7777` only, and config validation enforces it. The current design exposes them to the owner's devices with `tailscale serve` (see README, [`architecture.md`](architecture.md) and [`interfaces.md`](interfaces.md)). Until then, the dashboard is reachable only on the Mini itself. iMessage doesn't need it.
+
+**Why deferred.** We want to weigh an alternative before installing Tailscale: our own small server on Fly.io with Supabase Auth, restricted to one user (the owner). The same Fly app could also be the dead-man monitor above.
+
+**Open questions**
+- **Connectivity.** The Mini must keep no inbound ports, so it dials out to the relay: a persistent tunnel such as a WebSocket or SSE stream. Fly then proxies dashboard and API requests over it. How do we keep that tunnel reliable across sleep, network changes and restarts?
+- **Exposure.** With Tailscale, the URL doesn't resolve off the tailnet. A Fly relay is a public login page, so security depends on the auth code. Phase 2 adds approvals and the kill switch to this API. What do we need on top of a single allowed user: MFA, short sessions, rate limits, audit of every request?
+- **Trust.** Fly and Supabase can see dashboard traffic and sessions. Tailscale is end-to-end between our own devices.
+- **Cost and upkeep.** Tailscale's personal plan is free and needs no code. The relay is a service we build, patch and monitor.
+- **Hybrid.** One option is Fly for the dead-man switch only, with Tailscale for access.
+
+**Until then**
+- No remote access. `tailscale serve` is not set up, and `--check` doesn't check it.
+- The API still binds to loopback only. Nothing about the loopback rule changes.
+
+**Done when** the owner can reach `/api/status` from a phone off the home network, nobody else can, and the README, `architecture.md` (including the "no public ports" rule), `interfaces.md`, `config.py` and `api.py` comments, and go-live step 10 describe the chosen approach.
