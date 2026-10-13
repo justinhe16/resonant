@@ -564,7 +564,7 @@ def _model_result(p: ProbeResult) -> CheckResult:
     if not p.ctx_ok:
         return CheckResult(False, "model context too small")
     if p.call_failed:
-        return CheckResult(False, "model call failed (timeout or connection error)")
+        return CheckResult(False, "model call failed (timeout, connection or HTTP error)")
     if not p.thinking_off_ok:
         return CheckResult(False, "model thinking is not off")
     if not p.tool_call_ok:
