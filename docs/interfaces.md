@@ -233,6 +233,31 @@ ApprovalBatch(batch_id, principal, approval_ids, created_at)   # stored in appro
 
 `ResolveResult.resolved` tells the caller which tasks to wake.
 
+**Store** (`resonant.store.approvals`, migration 003). Plain functions over a connection; the gate owns the policy, this module owns the rows:
+
+```python
+NewApproval(task_id, intent_hash, tool, effect, level, summary, approvers, code, expires_at,
+            require_code=False, extension=None, requested_by=None)
+insert_approval(conn, spec, now) -> str              # IntegrityError if one is pending for (task, intent) or the code is taken
+get_approval(conn, id) / pending_for_intent(conn, task_id, intent_hash, now) / pending_by_code(conn, code, now) -> Approval | None
+pending_for(conn, principal, now) -> list[Approval]  # unexpired, principal in approvers
+pending_codes(conn) -> set[str]                      # for new_code
+add_channel_ref(conn, id, *, ref, at, principal) -> bool   # keeps the first send per (ref, principal)
+resolve(conn, id, *, approved, decided_by, now, event_id=None)
+    -> None | "not_found" | "already_resolved" | "expired" | "task_not_waiting"
+by_resolved_event(conn, event_id) -> list[Approval]; resolve_result(approvals) -> ResolveResult
+approved_unused(conn, task_id, intent_hash) -> Approval | None
+mark_used(conn, id, now) -> bool                     # True exactly once
+expire_due(conn, now) -> int                         # audits approval.expired
+wake_resolved(conn, result, now, *, principal=None) -> int
+```
+
+- `resolve` is one conditional UPDATE: the row must be pending, `expires_at > now`, and its task `waiting` or `running`. It records `decided_by`, `decided_at` and `resolved_event_id`. The refusal reason is read afterwards and is informational.
+- **Single use.** `used_at` is set once, with the executor's `started` row. Once approved, an approval has no expiry; it is valid for the life of its task.
+- **Orphans.** Every `store.tasks` path that makes a task terminal (`set_status`, `save_step`, `requeue_interrupted`) expires its pending approvals in the same transaction and audits `approval.orphaned`. Decided approvals are left alone.
+- **Waking.** `wake_resolved` inserts `Event(source="gate", type="approval.reply", task_id, payload={approval_id, approved})` with `dedupe_key="approval:<id>:resolved"`, and requeues the task only if it is `waiting`. A running task sees the event when its step returns `Wait`. Call it in the resolver's transaction.
+- `Approval.sent_at(principal)` is the first time the prompt went to that principal (from `channel_refs`, entries `{ref, at, principal}`), for the sent-before rule.
+
 **Audit.** Every field of the reply goes to the audit log: the raw text, the path, the confidence, the actor identity, the code, and the batch id. Approvals carry `expires_at`. There is at most one pending approval per (task, intent hash), and pending codes are unique.
 
 ## Executor: `resonant.executor`

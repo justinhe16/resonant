@@ -7,8 +7,9 @@ import sqlite3
 from datetime import datetime
 from typing import Any, cast
 
-from resonant.loop.types import NewTask, Task, TaskStatus, WaitReason
-from resonant.store.db import iso, now_iso
+from resonant.loop.types import TERMINAL, NewTask, Task, TaskStatus, WaitReason
+from resonant.store.audit import audit
+from resonant.store.db import atomic, iso, now_iso
 from resonant_sdk import Event, new_id
 
 
@@ -133,7 +134,13 @@ def set_status(
     if expect:
         sql += " AND status IN (SELECT value FROM json_each(?))"
         params.append(json.dumps(expect))
-    return conn.execute(sql, params).rowcount == 1
+    if status not in TERMINAL:
+        return conn.execute(sql, params).rowcount == 1
+    with atomic(conn):
+        changed = conn.execute(sql, params).rowcount == 1
+        if changed:
+            expire_orphaned_approvals(conn, [task_id])
+    return changed
 
 
 def save_step(
@@ -151,29 +158,34 @@ def save_step(
 ) -> bool:
     """Persist one step's outcome. Call inside a transaction, together with consume_events.
 
-    Returns False if the task is no longer 'running' (e.g. it was cancelled mid-step).
+    Returns False if the task is no longer 'running' (e.g. it was cancelled mid-step). A
+    terminal status expires the task's pending approvals.
     """
-    cur = conn.execute(
-        """UPDATE tasks SET status = ?, wait_reason = ?, wake_at = ?,
-               checkpoint = COALESCE(?, checkpoint), result = COALESCE(?, result),
-               error = ?, step_no = step_no + 1,
-               attempts = CASE WHEN ? THEN 0 ELSE attempts + ? END,
-               updated_at = ?
-           WHERE id = ? AND status = 'running'""",
-        (
-            status,
-            wait_reason,
-            None if wake_at is None else iso(wake_at),
-            _dump(checkpoint),
-            _dump(result),
-            error,
-            reset_attempts,
-            attempts_delta,
-            now_iso(),
-            task_id,
-        ),
-    )
-    return cur.rowcount == 1
+    with atomic(conn):
+        cur = conn.execute(
+            """UPDATE tasks SET status = ?, wait_reason = ?, wake_at = ?,
+                   checkpoint = COALESCE(?, checkpoint), result = COALESCE(?, result),
+                   error = ?, step_no = step_no + 1,
+                   attempts = CASE WHEN ? THEN 0 ELSE attempts + ? END,
+                   updated_at = ?
+               WHERE id = ? AND status = 'running'""",
+            (
+                status,
+                wait_reason,
+                None if wake_at is None else iso(wake_at),
+                _dump(checkpoint),
+                _dump(result),
+                error,
+                reset_attempts,
+                attempts_delta,
+                now_iso(),
+                task_id,
+            ),
+        )
+        changed = cur.rowcount == 1
+        if changed and status in TERMINAL:
+            expire_orphaned_approvals(conn, [task_id])
+    return changed
 
 
 def save_progress(
@@ -202,18 +214,23 @@ def requeue_interrupted(conn: sqlite3.Connection, max_attempts: int) -> tuple[in
     forever under launchd KeepAlive. Returns (requeued, failed).
     """
     ts = now_iso()
-    failed = conn.execute(
-        """UPDATE tasks SET status = 'failed', attempts = attempts + 1, updated_at = ?,
-               error = 'interrupted by daemon crash too many times'
-           WHERE status = 'running' AND attempts + 1 >= ?""",
-        (ts, max_attempts),
-    ).rowcount
+    failed = [
+        r["id"]
+        for r in conn.execute(
+            """UPDATE tasks SET status = 'failed', attempts = attempts + 1, updated_at = ?,
+                   error = 'interrupted by daemon crash too many times'
+               WHERE status = 'running' AND attempts + 1 >= ?
+               RETURNING id""",
+            (ts, max_attempts),
+        ).fetchall()
+    ]
+    expire_orphaned_approvals(conn, failed)
     requeued = conn.execute(
         """UPDATE tasks SET status = 'queued', attempts = attempts + 1, updated_at = ?
            WHERE status = 'running'""",
         (ts,),
     ).rowcount
-    return requeued, failed
+    return requeued, len(failed)
 
 
 def requeue_running(conn: sqlite3.Connection, task_ids: list[str]) -> int:
@@ -224,6 +241,34 @@ def requeue_running(conn: sqlite3.Connection, task_ids: list[str]) -> int:
         (now_iso(), json.dumps(task_ids)),
     )
     return cur.rowcount
+
+
+def expire_orphaned_approvals(conn: sqlite3.Connection, task_ids: list[str]) -> int:
+    """pending -> expired for approvals of tasks that just became terminal.
+
+    Called by every path that makes a task terminal, in the same transaction, so a later
+    ``yes`` binds nothing. Audits ``approval.orphaned`` for each one.
+    """
+    if not task_ids:
+        return 0
+    ts = now_iso()
+    rows = conn.execute(
+        """UPDATE approvals SET status = 'expired', decided_at = ?
+           WHERE status = 'pending' AND task_id IN (SELECT value FROM json_each(?))
+           RETURNING id, task_id, tool, extension, intent_hash""",
+        (ts, json.dumps(task_ids)),
+    ).fetchall()
+    for r in rows:
+        audit(
+            conn,
+            "approval.orphaned",
+            task_id=r["task_id"],
+            tool=r["tool"],
+            extension=r["extension"],
+            intent_hash=r["intent_hash"],
+            approval_id=r["id"],
+        )
+    return len(rows)
 
 
 def count_by_status(conn: sqlite3.Connection) -> dict[str, int]:
