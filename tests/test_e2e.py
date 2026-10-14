@@ -272,7 +272,7 @@ async def test_labeled_question_runs_tools_through_gate_and_executor(running: Ru
     (task,) = r.rows("SELECT * FROM tasks")
     assert (task["kind"], task["runner"], task["status"]) == ("chat", "local", "done")
     cp = json.loads(task["checkpoint"])
-    assert cp["intent"] == "job_control" and cp["toolset"] == [
+    assert cp["intent"] == "job_control" and [e["name"] for e in cp["toolset"]] == [
         "list_tasks",
         "projects",
         "task_counts",

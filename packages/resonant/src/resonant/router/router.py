@@ -8,7 +8,8 @@
     checkpoint={"direct_call": {"tool", "args"}, "intent": ..., "title": command})``: the
     local runner runs that one call with ``origin="explicit"``.
 (b) Labeled (one model call): ``NewTask(kind="chat", runner="local", checkpoint={"intent",
-    "confidence", "toolset": [names], "fallback", "toolset_prefix_hash", "title"})``.
+    "confidence", "toolset": [{"extension", "name"}], "fallback", "toolset_prefix_hash",
+    "title"})``.
 (c) None for anything else (other sources/types, no principal, empty text). The Loop
     consumes the event.
 
@@ -28,14 +29,23 @@ Priority always comes from the principal (owner or member), never from the model
 toolset is filtered by ``principals.can(principal, "request", extension)`` before anything
 reaches the model, so a member never sees global builtins.
 
+**Extension intents** (Phase 3). ``intents`` is built once at construction from the loaded
+extensions (``intents.intent_set``). ``extension:<name>`` gets only that extension's chat
+tools from the host (``host.tool_specs(name)``: never registry-wide, never job specs),
+filtered by the same ``request`` grant. Tools reach the model by bare name, so a toolset
+never holds two tools with one name, and an extension tool named like a builtin tool is
+refused (left out, logged): ``chat_toolset``.
+
 ``classify(text, labeler)`` is the side-effect-free entry point for evals: it returns the
 predicted intent and the path (``fast`` | ``llm``) without running tools or the kill switch.
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
-from collections.abc import Callable, Mapping
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -49,7 +59,16 @@ from resonant.observability.spans import span
 from resonant.principals import Principals
 from resonant.router.approvals import ApprovalInbox
 from resonant.router.fast_path import FastPath, match_fast_path
-from resonant.router.intents import INTENT_TOOLS, IntentLabel
+from resonant.router.intents import (
+    BUILTIN_INTENTS,
+    INTENT_TOOLS,
+    ExtensionCatalog,
+    IntentLabel,
+    IntentSet,
+    builtin_intent,
+    extension_of,
+    intent_set,
+)
 from resonant.router.labeler import Labeler
 from resonant.router.prefixes import toolset_prefix_hash
 from resonant.store.db import utcnow
@@ -63,19 +82,64 @@ KIND_COMMAND = "command"
 APPROVAL_TITLE = "approval reply"
 
 
+log = logging.getLogger(__name__)
+
+
+def builtin_names(registry: ToolRegistry) -> frozenset[str]:
+    return frozenset(s.name for s in registry.specs() if s.extension is None)
+
+
+def chat_toolset(specs: Iterable[ToolSpec], builtins: frozenset[str]) -> list[ToolSpec]:
+    """``specs`` as the model may see them, sorted by name. The model names a tool by its
+    bare name, so names must be unique: an extension tool named like a builtin tool, or any
+    name held by two different tools, is refused (left out, logged)."""
+    unique = list({(s.extension, s.name): s for s in specs}.values())
+    counts = Counter(s.name for s in unique)
+    out: list[ToolSpec] = []
+    for spec in unique:
+        if (spec.extension is not None and spec.name in builtins) or counts[spec.name] > 1:
+            log.warning(
+                "tool name collides in the model's toolset; not offered",
+                extra={"extension": spec.extension, "tool": spec.name},
+            )
+            continue
+        out.append(spec)
+    return sorted(out, key=lambda s: s.name)
+
+
 def toolset_for(
-    intent: IntentLabel, principal: str, *, registry: ToolRegistry, principals: Principals
+    intent: IntentLabel,
+    principal: str,
+    *,
+    registry: ToolRegistry,
+    principals: Principals,
+    extensions: ExtensionCatalog | None = None,
 ) -> list[ToolSpec]:
     """The tools ``principal`` may request for ``intent``, sorted by name.
 
-    Phase 1 maps intents to builtins only. Unregistered names are skipped.
+    A builtin intent maps to builtins (``INTENT_TOOLS``); unregistered names are skipped.
+    ``extension:<name>`` maps to that extension's chat tools from the host, never its job
+    specs. Either way each tool needs ``principals.can(principal, "request", extension)``.
     """
     specs: list[ToolSpec] = []
-    for name in INTENT_TOOLS[intent]:
-        spec = registry.get(None, name)
-        if spec is not None and principals.can(principal, "request", spec.extension):
-            specs.append(spec)
-    return sorted(specs, key=lambda s: s.name)
+    ext = extension_of(intent)
+    builtin = builtin_intent(intent)
+    if builtin is not None:
+        for name in INTENT_TOOLS[builtin]:
+            spec = registry.get(None, name)
+            if spec is not None:
+                specs.append(spec)
+    elif ext is not None and extensions is not None:
+        specs = [
+            s for s in extensions.tool_specs(ext) if s.extension == ext and not extensions.is_job(s)
+        ]
+    allowed = [s for s in specs if principals.can(principal, "request", s.extension)]
+    return chat_toolset(allowed, builtin_names(registry))
+
+
+def toolset_entries(toolset: Iterable[ToolSpec]) -> list[dict[str, str | None]]:
+    """The checkpoint form of a toolset: ``[{"extension", "name"}]``."""
+    return [{"extension": s.extension, "name": s.name} for s in toolset]
 
 
 @dataclass(frozen=True)
@@ -114,10 +178,16 @@ class Router:
         model: ModelClient,
         clock: Callable[[], datetime] = utcnow,
         timezone: str = "UTC",
+        extensions: ExtensionCatalog | None = None,
     ) -> None:
         self.conn = conn
         self.principals = principals
         self.registry = registry
+        self.extensions = extensions
+        # Built once: the labeler prefix changes only with an install, remove or restart.
+        self.intents: IntentSet = (
+            intent_set(extensions) if extensions is not None else BUILTIN_INTENTS
+        )
         self.fast_path = FastPath(
             conn,
             principals=principals,
@@ -128,10 +198,16 @@ class Router:
             timezone=timezone,
         )
         self.inbox = ApprovalInbox(conn, principals=principals, gate=gate)
-        self.labeler = Labeler(model)
+        self.labeler = Labeler(model, self.intents)
 
     def toolset_for(self, intent: IntentLabel, principal: str) -> list[ToolSpec]:
-        return toolset_for(intent, principal, registry=self.registry, principals=self.principals)
+        return toolset_for(
+            intent,
+            principal,
+            registry=self.registry,
+            principals=self.principals,
+            extensions=self.extensions,
+        )
 
     async def __call__(self, event: Event) -> NewTask | None:
         return await self.route(event)
@@ -204,12 +280,13 @@ class Router:
 
         label = await self.labeler.label(text, spans=spans)
         toolset = self.toolset_for(label.intent, principal)
-        prefix_hash = toolset_prefix_hash(label.intent, toolset)
+        prefix_hash = toolset_prefix_hash(label.intent, toolset, self.intents)
         with spans(
             "router.toolset",
             intent=label.intent,
             principal=principal,
             toolset=[s.name for s in toolset],
+            extension=extension_of(label.intent),
             toolset_prefix_hash=prefix_hash,
         ):
             pass
@@ -222,7 +299,7 @@ class Router:
             checkpoint={
                 "intent": label.intent,
                 "confidence": label.confidence,
-                "toolset": [s.name for s in toolset],
+                "toolset": toolset_entries(toolset),
                 "fallback": label.fallback,
                 "toolset_prefix_hash": prefix_hash,
                 "title": f"chat: {label.intent}",

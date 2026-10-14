@@ -31,7 +31,12 @@ from resonant.models import (
     ToolCall,
 )
 from resonant.principals import Principal, Principals
-from resonant.router.prefixes import FALLBACK_REPLY, runner_system, wrap_untrusted
+from resonant.router.prefixes import (
+    FALLBACK_REPLY,
+    runner_system,
+    wrap_prior_reply,
+    wrap_untrusted,
+)
 from resonant.runners.local import (
     ESCALATE_REPLY,
     MAX_REPLY_CHARS,
@@ -405,7 +410,10 @@ async def test_context_has_system_prefix_history_and_wrapped_message(make: Any) 
     messages = model.tool_calls_made[0]
     assert messages[0] == {"role": "system", "content": runner_system("job_control")}
     assert messages[1] == {"role": "user", "content": wrap_untrusted("ping")}
-    assert messages[2] == {"role": "assistant", "content": "pong (up 2h)"}
+    # Prior replies are untrusted user turns, never assistant turns (they may quote tools).
+    assert messages[2] == {"role": "user", "content": wrap_prior_reply("pong (up 2h)")}
+    assert messages[2]["content"] == "<prior_reply>pong (up 2h)</prior_reply>"
+    assert not any(m["role"] == "assistant" for m in messages)
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"].startswith("<message>")
     assert messages[-1]["content"].count("</message>") == 1
@@ -458,7 +466,12 @@ async def test_history_is_this_principals_and_at_most_six_events(make: Any) -> N
 
     messages = model.tool_calls_made[0]
     users = [m["content"] for m in messages if m["role"] == "user"]
-    assert users == [wrap_untrusted(f"owner {i}") for i in range(3, 8)] + [wrap_untrusted("now")]
+    history = [
+        turn
+        for i in range(3, 8)
+        for turn in (wrap_untrusted(f"owner {i}"), wrap_prior_reply(f"r{i}"))
+    ]
+    assert users == [*history, wrap_untrusted("now")]
     assert all("member secret" not in m["content"] for m in messages)
 
 

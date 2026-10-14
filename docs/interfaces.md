@@ -648,7 +648,8 @@ build_components(settings, conn, state: DaemonState, *, ops_runner: OpsRunner | 
                  secrets: SecretStore | None = None, ext_runner: ExtRunner | None = None) -> Components
 Components(registry, principals, gate: Gate, executor, handlers, principals_loaded=True,
            runners: dict[str, Runner] = {}, extensions: ExtensionHost | None = None)
-    .register_local_runner(conn, *, model: ModelClient, channel: Channel, timezone="UTC") -> LocalRunner
+    .register_local_runner(conn, *, model: ModelClient, channel: Channel, timezone="UTC",
+                           model_result_max_chars=4096) -> LocalRunner
     .chat_specs() -> list[ToolSpec]     # builtins + extension tools, never job specs
 ```
 
@@ -658,7 +659,7 @@ Components(registry, principals, gate: Gate, executor, handlers, principals_load
 - `gate` is `PolicyGate(conn, principals, registry, dry_run=settings.dry_run, approval_ttl_s=settings.gate.approval_ttl_s, actions=summary_actions(conn), approvers_for=host.approvers_for)`. `summary_actions` maps `(None, "clear_notes")` to the notes hook (`delete all 4 notes`) and the ops writes to their headings (`restart Ollama`, `restart Resonant`, `update Resonant`). `ops_runner` goes to `register_builtins`. `DryRunGate` stays as a test double.
 - If `principals.yaml` is missing, it logs a warning and uses an identity-less stand-in owner, so no channel identity resolves and every channel request is denied (`principals_loaded=False`). An invalid file is an error.
 - New fields (runners, channels, ...) get defaults so existing callers keep working.
-- `register_local_runner` builds `LocalRunner` from the components' gate, executor and registry and adds it to `runners["local"]`. The daemon builds the model client and channel (the channel needs `principals`), so it calls this after `build_components`.
+- `register_local_runner` builds `LocalRunner` from the components' gate, executor, registry and `extensions` host and adds it to `runners["local"]`; the daemon passes `settings.extensions.model_result_max_chars`, and builds the `Router` with `extensions=components.extensions`. The daemon builds the model client and channel (the channel needs `principals`), so it calls this after `build_components`.
 
 ## Channel: `resonant.gateway.channel`
 
@@ -745,15 +746,21 @@ ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail, tool
 ```python
 class Router:                     # the Loop's router hook (Callable[[Event], Awaitable[NewTask | None]])
     def __init__(self, conn, *, principals, registry, gate: Gate, handlers, model: ModelClient,
-                 clock=utcnow, timezone: str = "UTC"): ...
+                 clock=utcnow, timezone: str = "UTC", extensions: ExtensionCatalog | None = None): ...
+    intents: IntentSet                # built once here, from the loaded extensions
     async def route(self, event: Event) -> NewTask | None
     def toolset_for(self, intent, principal) -> list[ToolSpec]
 
-IntentLabel = Literal["question", "job_control", "system", "notes", "reminders", "ops",
-                      "run_project", "unknown"]                               # router/intents.py
-toolset_for(intent, principal, *, registry, principals) -> list[ToolSpec]   # sorted by name
+BuiltinIntent = Literal["question", "job_control", "system", "notes", "reminders", "ops",
+                        "run_project", "unknown"]                             # router/intents.py
+IntentLabel = str                 # a BuiltinIntent or "extension:<name>", validated by an IntentSet
+IntentSet(extensions=()).labels / .parse(value) / .definition(intent) / .with_manifest(m)
+IntentSet.from_manifests(manifests); intent_set(catalog | None) -> IntentSet; BUILTIN_INTENTS
+ExtensionCatalog = Protocol: tool_specs(extension=None), is_job(spec), manifest(name)  # ExtensionHost
+toolset_for(intent, principal, *, registry, principals, extensions=None) -> list[ToolSpec]  # sorted by name
+chat_toolset(specs, builtin_names) -> list[ToolSpec]                        # unique model-facing names
 match_fast_path(text, ctx: ParseContext | None = None) -> FastCommand | None  # no I/O; ctx: now (UTC) + zone
-Labeler(model).label(text, *, spans=None) -> Label(intent, confidence, fallback, latency_ms, prefix_hash)
+Labeler(model, intents=BUILTIN_INTENTS).label(text, *, spans=None) -> Label(intent, confidence, fallback, latency_ms, prefix_hash)
 classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | "llm", confidence, fallback, command)
 ```
 
@@ -762,8 +769,8 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
 | Path | `NewTask` | `checkpoint` |
 |---|---|---|
 | Fast (no model call) | `kind="reply"`, `runner="local"` | `{fast_reply: str, tool_used: str \| None, intent, title}` |
-| Side-effecting slash command (no model call) | `kind="command"`, `runner="local"` | `{direct_call: {tool, args}, intent, title}` |
-| Labeled (one `chat_json` call) | `kind="chat"`, `runner="local"` | `{intent, confidence, toolset: [tool names], fallback: bool, toolset_prefix_hash, title}` |
+| Side-effecting slash command (no model call) | `kind="command"`, `runner="local"` | `{direct_call: {extension, tool, args}, intent, title}` (`extension` None or absent for builtins) |
+| Labeled (one `chat_json` call) | `kind="chat"`, `runner="local"` | `{intent, confidence, toolset: [{extension, name}], fallback: bool, toolset_prefix_hash, title}` |
 
 `title` is code-built for `/projects`: the fast-path command name (`/status`, `what's running`, `/unknown`) plus a subcommand word (`/notes clear`, `/restart ollama`), `approval reply`, or `chat: <intent>`. Never message text.
 
@@ -821,7 +828,8 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
   - A read command maps to one builtin read; the reply is a template over its output (code computes, text narrates). The read is evaluated by the gate (audited, `task_id="route:<event id>"`). No task exists yet, so the fast path consumes the Allow token and calls the read handler directly instead of the executor (reads only; nothing to dedupe). A tool error becomes a templated "Couldn't read … right now."
   - If the principal can't request the tool, a slash command replies `not allowed` and a keyword falls through to the labeler.
 - **Command registry** (`router/commands.py`). `Command(name, usage, description, intent, tool: str | None, parse: (rest, ctx) -> args, owner_only, subs: tuple[Sub, ...])`; `Sub(word, tool, parse)` is a fixed first word that picks another tool (`/notes clear`, `/restart ollama`). `cmd.resolve(rest, ctx) -> (sub word | None, tool, args)`; a command with no tool of its own needs a subcommand. `ParseContext(now, tz)` carries the clock and zone for `/remind`. `parse` raises `UsageError(hint)` for bad args, and the reply is `<hint>. Usage: <usage>` (or just the usage). `COMMANDS` is the single source for the fast path, `/help`, suggestions and `list_commands`. Helpers: `get(name)`, `suggest(word, commands)`, `unknown_reply(word, commands)`, `available(principal, *, principals, registry)` (owner-only commands need `admin`; a command with tools needs each registered and `request` on its extension), `can_request(principal, tool, *, principals, registry)`, `search(query, commands)`, `describe(cmd, registry)` (the level comes from the tool registry, never the command) and `help_text(commands, query, *, keywords)`. A command with a read tool has a reply template in `fast_path.COMMAND_RENDERS`, and each side-effecting tool has a report line in `runners.local.REPORTS` (a test checks both); shared templates live in `router/render.py`. `render_projects` lists running, waiting(reason), queued, then finished items, one line each (`- waiting(approval) · chat · chat: ops · 2m`), and stays within one iMessage chunk (2000 chars), ending `+N more (/projects all)` when items are left out.
-- **Labeler** (`router/labeler.py`, `router/prefixes.py`). One `chat_json` call with schema `{intent: enum, confidence: 0..1}`, `max_tokens=20`, temperature 0. The prompt is the constant `LABEL_PREFIX` (system rules, intent definitions, 12 few-shot turns) and then the user text, truncated to 2000 characters and wrapped by `wrap_untrusted` as `<message>…</message>` (tags inside it are stripped). `ModelUnavailableError` gives `unknown` with `fallback=true` (the runner sends `prefixes.FALLBACK_REPLY`); `ModelOutputError` or an out-of-enum intent gives `unknown` with `fallback=false`.
+- **Labeler** (`router/labeler.py`, `router/prefixes.py`). One `chat_json` call with schema `{intent: enum, confidence: 0..1}`, `max_tokens=32`, temperature 0. The prompt is `LabelPrompt(intents).prefix` (system rules, intent definitions, few-shot turns) and then the user text, truncated to 2000 characters and wrapped by `wrap_untrusted` as `<message>…</message>` (tags inside it are stripped). With no extension intents the prefix is exactly the constant `LABEL_PREFIX` (12 few-shots). `ModelUnavailableError` gives `unknown` with `fallback=true` (the runner sends `prefixes.FALLBACK_REPLY`); `ModelOutputError` or an intent outside the set gives `unknown` with `fallback=false`.
+- **Extension intents** (contract change C6, Phase 3). `IntentLabel` is a `str`: a builtin, or `extension:<name>` for each loaded extension whose manifest has a `description` and at least one tool. The `IntentSet` is built **once at start** (`intent_set(components.extensions)`) by the router and the local runner, so the labeler prefix changes only with `resonant ext add|update|remove` (each restarts the daemon) or a restart. The schema enum lists the builtins in their fixed order, then extensions sorted by name. In the prompt, each extension adds one definition line (`- extension:github: <description>`) and up to 3 manifest `examples` as few-shots (confidence 0.9), by name, after the specific builtins and before the catch-all `unknown`, whose definition and two few-shots stay last (on the local model this kept builtin accuracy higher than appending after `unknown`). Manifest strings go through `clean_external` (printable ASCII, no brackets, code-like tokens masked) and are clipped to 120/80 chars. The prefix is a pure function of the installed set (`LabelPrompt(intents).prefix_hash`), byte-identical across calls and install order.
 - **Intents and toolsets** (contract change C9, Phase 2 D10: `notes`, `reminders` and `ops` were added, so plain chat reaches the same tools as the slash commands through the model). `INTENT_TOOLS` maps intents to builtins:
 
   | Intent | Tools |
@@ -833,11 +841,13 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
   | `reminders` | `add_reminder`, `cancel_reminder`, `list_reminders` |
   | `ops` | `disk`, `recent_logs`, `restart_ollama`, `restart_resonant`, `update_resonant` |
 
-  It is filtered by `principals.can(principal, "request", spec.extension)` before anything reaches the model, so a member gets no global builtins. Every call the model chooses is `origin="inferred"`, so the gate decides by level: L3 (`add_note`, `add_reminder`, `restart_ollama`, …) runs and reports, L2 (`restart_resonant`, `update_resonant`) asks `[A7] … Reply yes / no`, L1 (`clear_notes`) asks `[D7] … Reply yes D7 / no`. The local runner still makes at most one gated side effect per task. `extension:<name>` intents are reserved for Phase 3.
-- **Prefixes for the local runner.** `prefixes.runner_system(intent)` is the runner's constant system message (plus a constant per-intent rule: for `reminders`, pass `at` as an ISO-8601 datetime with its UTC offset); `toolset_prefix_hash(intent, toolset)` hashes it with `tools_prefix(toolset)`, so it is stable per (intent, principal scope). `prefixes.current_turn(intent, text, *, now, tz, max_chars)` is the runner's last user turn: `wrap_untrusted(text)`, and for `TIMED_INTENTS` (`reminders`) preceded by the code-built `time_context(now, tz)` line `Current time: 2026-10-13T15:04:30-07:00 (Tue, America/Los_Angeles).`. The time changes every minute, so it goes last rather than in the system message: the system message, tools block (some chat templates render it inside the system turn) and history stay byte-identical for KV-cache reuse.
-- **Label prefix snapshot.** `tests/fixtures/router/label_prefix.json` pins `LABEL_PREFIX` and `LABEL_SCHEMA`. Changing an intent, a definition or a few-shot changes `LABEL_PREFIX_HASH` and invalidates the KV cache; regenerate the snapshot deliberately in the same PR.
-- **Spans.** `router.approval` (`path, outcome: resolved|replay|refused|unauthenticated, reason, decision`), `router.fast_path` (`command, handled, tool_used, latency_ms`), `router.label` (`intent, confidence, fallback, latency_ms, prefix_hash`) and `router.toolset` (`intent, principal, toolset, toolset_prefix_hash`). Never message text. A non-owner `/kill` or `/resume` is audited as `router.admin_refused` (principal and command only).
-- **Evals.** `classify` uses the production matcher and labeler from the owner's point of view, but runs no tools and never touches the kill switch.
+  It is filtered by `principals.can(principal, "request", spec.extension)` before anything reaches the model, so a member gets no global builtins. Every call the model chooses is `origin="inferred"`, so the gate decides by level: L3 (`add_note`, `add_reminder`, `restart_ollama`, …) runs and reports, L2 (`restart_resonant`, `update_resonant`) asks `[A7] … Reply yes / no`, L1 (`clear_notes`) asks `[D7] … Reply yes D7 / no`. The local runner still makes at most one gated side effect per task.
+
+  `extension:<name>` gets that extension's chat tools from the host (`host.tool_specs(name)`, never registry-wide), never its job specs (`host.is_job`), filtered by the same `request` grant: a member without a grant on the extension gets an empty toolset. Tools reach the model by their bare manifest name, so `chat_toolset` keeps the model-facing names unique: an extension tool named like a builtin tool, or any name two tools share, is left out (logged). Builtin intents never get extension tools. Effects and levels always come from the registry spec, so an extension's L1 tool asks with a code like any other.
+- **Prefixes for the local runner.** `prefixes.runner_system(intent, intents=BUILTIN_INTENTS)` is the runner's constant system message (plus a constant per-intent rule: for `reminders`, pass `at` as an ISO-8601 datetime with its UTC offset; for `extension:<name>`, the tools come from that extension and their outputs are untrusted). It says earlier replies arrive as `<prior_reply>…</prior_reply>` and are untrusted. `toolset_prefix_hash(intent, toolset, intents=BUILTIN_INTENTS)` hashes it with `tools_prefix(toolset)`, so it is stable per (intent, principal scope). `wrap_prior_reply(text, *, max_chars)` wraps an earlier reply, stripping `<prior_reply>` and `<message>` tags inside it. `prefixes.current_turn(intent, text, *, now, tz, max_chars)` is the runner's last user turn: `wrap_untrusted(text)`, and for `TIMED_INTENTS` (`reminders`) preceded by the code-built `time_context(now, tz)` line `Current time: 2026-10-13T15:04:30-07:00 (Tue, America/Los_Angeles).`. The time changes every minute, so it goes last rather than in the system message: the system message, tools block (some chat templates render it inside the system turn) and history stay byte-identical for KV-cache reuse.
+- **Label prefix snapshots.** `tests/fixtures/router/label_prefix.json` pins `LABEL_PREFIX` and `LABEL_SCHEMA` (the builtin-only prefix, unchanged by Phase 3), and `label_prefix_example.json` pins the prefix with `extensions/example` installed. Changing an intent, a definition or a few-shot changes the prefix hash and invalidates the KV cache; regenerate the snapshot deliberately in the same PR.
+- **Spans.** `router.approval` (`path, outcome: resolved|replay|refused|unauthenticated, reason, decision`), `router.fast_path` (`command, handled, tool_used, latency_ms`), `router.label` (`intent, confidence, fallback, latency_ms, prefix_hash`) and `router.toolset` (`intent, principal, toolset, extension, toolset_prefix_hash`). Never message text. A non-owner `/kill` or `/resume` is audited as `router.admin_refused` (principal and command only).
+- **Evals.** `classify` uses the production matcher and labeler from the owner's point of view, but runs no tools and never touches the kill switch. `resonant eval router` labels with the enabled extensions' intents (`router_eval.store_intents`, from the approved manifest snapshots), so a set may use `extension:<name>` for an installed extension. `resonant ext add|update` runs `router_eval.advisory`: the repo's `evals/router.example.jsonl` (builtin rows) labeled without and with the new intent, plus the manifest's examples, printing `Router: builtin accuracy X% before, Y% after` and a warning on a drop. It never blocks; no set or no model prints one `skipped` line.
 
 ## Health monitor: `resonant.monitor`, `resonant.health`
 
@@ -865,7 +875,9 @@ channels_snapshot(conn, *, imessage_enabled, channel) -> [{name, enabled, ok, la
 
 ```python
 LocalRunner(conn, *, model: ModelClient, channel: Channel, gate: RunnerGate, executor: ToolExecutor,
-            registry, max_step_s=30.0, now=utcnow, timezone="UTC")   # name="local", uses_claude_slot=False
+            registry, max_step_s=30.0, now=utcnow, timezone="UTC",
+            extensions: ExtensionCatalog | None = None,
+            model_result_max_chars=4096)   # name="local", uses_claude_slot=False
 # ToolExecutor: execute(intent, decision, *, step_no, call_index) and recorded(key)
 ```
 
@@ -875,15 +887,15 @@ One step answers the whole task, unless it waits for an approval. In this order:
 
 1. `checkpoint.reply` exists: an earlier attempt computed it, so only (re)send it.
 2. `checkpoint.call` exists: resume the task's pinned gated call (below). No model call.
-3. `checkpoint.direct_call = {tool, args}` (written only by the router's command parser): pin it as `call` with `call_index=0` and run it as a gated call with `origin="explicit"`. This is the only place `explicit` is set, and only when the pinned call is exactly the `direct_call`. An unregistered tool replies `Not done: that tool isn't available.` and runs nothing. No model call.
+3. `checkpoint.direct_call = {extension, tool, args}` (written only by the router's command parser; `extension` is None or absent for builtins): pin it as `call` with `call_index=0` and run it as a gated call with `origin="explicit"`. This is the only place `explicit` is set, and only when the pinned call is exactly the `direct_call` (`is_explicit`: same extension, tool and args, `call_index=0`). An unregistered tool replies `Not done: that tool isn't available.` and runs nothing. No model call.
 4. `checkpoint.fast_reply`: send it as is (the router already ran its read). No model call.
 5. `checkpoint.fallback`: send `prefixes.FALLBACK_REPLY`. `intent == "run_project"`: send `ESCALATE_REPLY` ("needs the Claude runner, which arrives in Phase 5") with `escalate=true`. No tools, no model, never Claude.
-6. Context: `runner_system(intent)`, the checkpoint's `toolset` (looked up in the registry, sorted by name), this principal's previous `imessage` messages (at most 5, so 6 events with the current one; each with our reply to it, from the task it started; messages that started no task, such as approval replies, are skipped; earlier tool outputs appear only as those replies), then the current message as `prefixes.current_turn` (wrapped by `wrap_untrusted`, 2000 chars; for `reminders`, after the `Current time:` line in the runner's `timezone`, which the daemon sets to `settings.timezone`).
+6. Context: `runner_system(intent, intents)`, the checkpoint's `toolset` (each `{extension, name}` looked up again in the registry; a bare name is a builtin from an older checkpoint; an extension entry is kept only for that extension's own `extension:<name>` intent and never when it is a job spec; then `chat_toolset`), this principal's previous `imessage` messages (at most 5, so 6 events with the current one; each with our reply to it, from the task it started, as an untrusted **user** turn `wrap_prior_reply(reply)` = `<prior_reply>…</prior_reply>`, never an assistant turn, since a reply can quote extension output; messages that started no task, such as approval replies, are skipped; earlier tool outputs appear only as those replies), then the current message as `prefixes.current_turn` (wrapped by `wrap_untrusted`, 2000 chars; for `reminders`, after the `Current time:` line in the runner's `timezone`, which the daemon sets to `settings.timezone`).
 7. Tools: up to 3 `chat_tools` calls and 3 tool calls in all. Each call is `Intent.for_tool(spec from the toolset, task_id, principal, args, origin="inferred")` → `gate.evaluate`. The model path is always `inferred`.
    - A read that is allowed runs (`executor.execute(..., step_no=task.step_no, call_index=i)`) and its result goes back to the model. A refused read, a tool outside the toolset, bad args, or a failed read goes back as a tool error.
    - Anything else (a side effect, or any call that needs approval) is the task's **one gated call** and ends the loop. `Allow` and `NeedsApproval` pin it as `call` first. Allowed, it runs; then the model may narrate, but the reply always contains the call's code-built report line (appended if the model left it out; the report alone if the model fails). Needs approval: the task waits. `DryRun` or `Deny`: the templated reply only.
    - A model reply asking for more calls than are left escalates like `run_project`. An empty toolset skips `chat_tools`.
-   - `ChatMessage` has no `tool` role, so a call is replayed as an assistant turn `{"tool_call": {name, args}}` and its result as a user turn labeled untrusted data. The model contract is unchanged.
+   - `ChatMessage` has no `tool` role, so a call is replayed as an assistant turn `{"tool_call": {name, args}}` and its result as a user turn labeled untrusted data. The model contract is unchanged. An extension tool's result is clipped to `model_result_max_chars` (`settings.extensions.model_result_max_chars`, ending `…[truncated]`) in that turn; `executions.result` keeps it whole (redacted, up to `result_max_bytes`).
 8. Answer: `chat_json` with schema `{reply: string}`, clipped to 600 chars. **Number guard:** every number in the reply must appear in a tool result or in the user's message; otherwise, and on `ModelOutputError` or an empty reply, the reply is a templated summary of the tool results.
 9. `ctx.save(checkpoint={...checkpoint, "reply", "reply_meta"})`, then `channel.send(principal, reply, dedupe_key=f"reply:{task.id}")`, then `Done({reply_len, tools_used, latency_ms, path, escalate})`. `path` is `fast | llm | summary | fallback | escalate`, or for a gated call `done | replay | failed | ambiguous | refused | dry_run`; `tools_used` lists the tools that ran successfully.
 

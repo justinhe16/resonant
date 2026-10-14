@@ -729,7 +729,7 @@ async def test_labeled_message_makes_exactly_one_model_call(
     assert len(model.calls) == 1
     call = model.calls[0]
     assert call["schema"] == LABEL_SCHEMA
-    assert call["max_tokens"] <= 20
+    assert call["max_tokens"] <= 32
     assert call["temperature"] == 0
     assert task.kind == "chat"
     assert task.runner == "local"
@@ -738,7 +738,10 @@ async def test_labeled_message_makes_exactly_one_model_call(
     assert task.checkpoint == {
         "intent": "system",
         "confidence": 0.82,
-        "toolset": ["daemon_status", "list_commands", "model_status", "system_status"],
+        "toolset": [
+            {"extension": None, "name": n}
+            for n in ("daemon_status", "list_commands", "model_status", "system_status")
+        ],
         "fallback": False,
         "toolset_prefix_hash": toolset_prefix_hash("system", toolset),
         "title": "chat: system",
@@ -821,7 +824,7 @@ async def test_injection_gets_normal_label_and_no_extra_tools(
     assert task is not None
     assert task.kind == "chat"  # never the fast path, never the kill switch
     assert task.checkpoint["intent"] == "system"
-    assert task.checkpoint["toolset"] == [
+    assert [e["name"] for e in task.checkpoint["toolset"]] == [
         "daemon_status",
         "list_commands",
         "model_status",

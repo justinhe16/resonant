@@ -19,6 +19,7 @@ import json
 import logging
 import socket
 import sqlite3
+import sys
 import urllib.parse
 from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass, field
@@ -32,16 +33,18 @@ from resonant.config import Settings, load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.e2e.extensions import install_fixture
+from resonant.e2e.fakes import DEFAULT_FINAL_REPLY
 from resonant.extensions.host import tampered_text
 from resonant.gate import Allow, Intent
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import NewTask
 from resonant.loop.types import PRIORITY_OWNER, Done, StepContext, StepOutcome, Task
+from resonant.models import ChatMessage, ModelReply, SpanFactory
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.secrets import FakeKeychain, SecretStore
 from resonant.store.db import iso, kv_set, open_db, utcnow
 from resonant.store.extensions import get_extension
-from resonant_sdk import Event
+from resonant_sdk import Event, ToolSpec
 
 OWNER_PHONE = "+15551234567"
 SELF = "resonant.agent@icloud.com"
@@ -210,14 +213,38 @@ def settings_for(home: Path, chat: FakeChatDB) -> Settings:
     )
 
 
+class RecordingModel(ScriptedModel):
+    """A ``ScriptedModel`` that keeps each ``chat_tools`` prompt and the tool names offered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_turns: list[tuple[list[ChatMessage], list[str]]] = []
+
+    async def chat_tools(
+        self,
+        messages: list[ChatMessage],
+        *,
+        tools: list[ToolSpec],
+        max_tokens: int = 512,
+        spans: SpanFactory | None = None,
+    ) -> ModelReply:
+        if not any(m["content"].startswith('{"tool_call"') for m in messages):
+            self.tool_turns.append((list(messages), [t.name for t in tools]))
+        return await super().chat_tools(messages, tools=tools, max_tokens=max_tokens, spans=spans)
+
+
 @contextlib.asynccontextmanager
 async def start_daemon(
-    settings: Settings, keychain: FakeKeychain, osa: RecordingOsaRunner | None = None
+    settings: Settings,
+    keychain: FakeKeychain,
+    osa: RecordingOsaRunner | None = None,
+    *,
+    model: ScriptedModel | None = None,
 ) -> AsyncGenerator[Running]:
     osa = osa or RecordingOsaRunner()
     daemon = Daemon(
         settings,
-        model=ScriptedModel(),
+        model=model or ScriptedModel(),
         osa_runner=osa,
         ops_runner=FakeOpsRunner(),
         secrets=SecretStore(keychain),
@@ -346,3 +373,110 @@ async def test_e9_tampered_copy_is_disabled_and_owner_alerted_once(
     async with start_daemon(settings, FakeKeychain(), osa2):
         await asyncio.sleep(0.2)
         assert alert not in [m.text for m in osa2.sent]
+
+
+# --- E3: chat routes to an extension (P3-11) ----------------------------------------------
+
+REPO = Path(__file__).resolve().parents[1]
+FAKE_GH = REPO / "tests/fixtures/fake_gh.py"
+GH_TOKEN = "gh-token-not-real-0123456789"
+
+
+def install_github(settings: Settings, root: Path) -> Path:
+    """The real ``extensions/github`` copy, with a fake ``gh`` first on the child's PATH.
+    Returns the fake's state file."""
+    src = REPO / "extensions/github"
+    files = {rel: (src / rel).read_text() for rel in ("cli.py", "README.md")}
+    install(settings, (src / "resonant.yaml").read_text(), files)
+    state = root / "gh" / "state.json"
+    state.parent.mkdir()
+    pr = {
+        "number": 40,
+        "title": "Router extension intents",
+        "url": "https://github.com/justinhe16/resonant/pull/40",
+        "isDraft": False,
+        "createdAt": "2026-10-10T00:00:00Z",
+        "updatedAt": "2026-10-13T00:00:00Z",
+        "headRefName": "p3-11",
+        "headRefOid": "abc123",
+        "reviewDecision": "REVIEW_REQUIRED",
+        "repository": {"nameWithOwner": "justinhe16/resonant"},
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]},
+    }
+    state.write_text(json.dumps({"token": GH_TOKEN, "mine": [pr], "review": [], "runs": {}}))
+    return state
+
+
+def gh_settings(home: Path, chat: FakeChatDB, bin_dir: Path, state: Path) -> Settings:
+    (home / "principals.yaml").write_text(PRINCIPALS)
+    bin_dir.mkdir()
+    shim = bin_dir / "gh"
+    shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I -S "{FAKE_GH}" "{state}" "$@"\n')
+    shim.chmod(0o755)
+    return load_settings(
+        dry_run=False,
+        api={"port": free_port()},
+        channels={
+            "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
+        },
+        extensions={"process": {"path": [str(bin_dir), "/usr/bin", "/bin"]}},
+    )
+
+
+async def test_e3_show_my_prs_routes_to_github_and_runs_prs(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    state = tmp_path / "gh" / "state.json"
+    settings = gh_settings(resonant_home, chat, tmp_path / "bin", state)
+    install_github(settings, tmp_path)
+    keychain = FakeKeychain(items={"github/token": GH_TOKEN})
+    osa = RecordingOsaRunner()
+    model = RecordingModel()
+    async with start_daemon(settings, keychain, osa, model=model) as r:
+        chat.add_message(handle=OWNER_PHONE, text="what can you do?")
+        await osa.wait_for(1, 20)
+        chat.add_message(handle=OWNER_PHONE, text="show my PRs")
+        await osa.wait_for(2, 20)
+        await wait_until(
+            lambda: (
+                r.conn.execute(
+                    "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'failed')"
+                ).fetchone()[0]
+                == 0
+            ),
+            10,
+        )
+
+        rows = r.conn.execute("SELECT checkpoint, status FROM tasks ORDER BY created_at").fetchall()
+        cp = json.loads(rows[-1]["checkpoint"])
+        assert rows[-1]["status"] == "done"
+        assert cp["intent"] == "extension:github" and cp["title"] == "chat: extension:github"
+        # Only github's chat tools: never its jobs (watch, digest), never a builtin.
+        assert cp["toolset"] == [
+            {"extension": "github", "name": n} for n in ("merge_pr", "pr", "prs", "rerun_failed")
+        ]
+        # prs ran through the gate as a model-chosen (inferred) call, with the token.
+        gate = r.conn.execute(
+            "SELECT extension, tool, decision, detail FROM audit_log "
+            "WHERE action = 'gate.evaluate' AND extension = 'github'"
+        ).fetchall()
+        assert [(g["tool"], g["decision"], json.loads(g["detail"])["origin"]) for g in gate] == [
+            ("prs", "Allow", "inferred")
+        ]
+        calls = [
+            json.loads(line) for line in (state.parent / "calls.jsonl").read_text().splitlines()
+        ]
+        assert calls and all(c["token_ok"] is True for c in calls)
+        results = [
+            row["result"]
+            for row in r.conn.execute("SELECT result FROM executions WHERE status = 'succeeded'")
+        ]
+        assert sum("1 open PRs" in res for res in results) == 1
+        assert GH_TOKEN not in everything_stored(r.conn)
+        # The earlier reply went back to the model wrapped as untrusted, never as an
+        # assistant turn; the toolset the model saw was github's alone.
+        messages, tools = model.tool_turns[-1]
+        assert tools == ["merge_pr", "pr", "prs", "rerun_failed"]
+        history = messages[1:-1]
+        assert [m["role"] for m in history] == ["user", "user"]
+        assert history[1]["content"] == f"<prior_reply>{DEFAULT_FINAL_REPLY}</prior_reply>"
