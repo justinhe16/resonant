@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
@@ -23,13 +24,14 @@ from typing import Any
 import httpx
 import pytest
 
+from resonant.api import DaemonState
 from resonant.components import Components, build_components
 from resonant.config import load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.gate import Allow, DryRun, Intent, NeedsApproval, PolicyGate
 from resonant.gateway.imessage.fixtures import FakeChatDB
-from resonant.loop import NewTask
+from resonant.loop import Loop, NewTask, SlotPool
 from resonant.loop.types import PRIORITY_OWNER, Done, StepContext, StepOutcome, Task, Wait
 from resonant.runners.reminder import ReminderRunner
 from resonant.store.db import iso, kv_set, utcnow
@@ -56,8 +58,6 @@ FAKE_OPS = ToolSpec(
 
 
 def free_port() -> int:
-    import socket
-
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
@@ -243,9 +243,6 @@ def test_imessage_disabled_has_policy_gate_and_no_reminder_runner() -> None:
 
 
 def test_gate_follows_settings(db: sqlite3.Connection) -> None:
-    from resonant.api import DaemonState
-    from resonant.loop import Loop, SlotPool
-
     settings = load_settings(dry_run=False, gate={"approval_ttl_s": 600})
     loop = Loop(db, {}, settings.loop, SlotPool(2, 1))
     state = DaemonState(settings, db, loop, started_at=utcnow())

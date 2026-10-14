@@ -9,8 +9,7 @@ With ``channels.imessage.enabled`` the daemon also runs the Phase 1 stack
 router hook, ``runner="local"`` answers, ``runner="reminder"`` sends due reminders, and the
 health monitor runs. On shutdown the reader and monitor stop first (no new events), then
 the loop drains in-flight steps (which may still send their replies), then the model client
-closes. With it disabled, the daemon
-is exactly Phase 0 apart from the gate.
+closes. With it disabled, the daemon is exactly Phase 0 apart from the gate.
 
 The gate is always the Phase 2 ``PolicyGate``; the startup line logs
 ``gate=policy dry_run=<bool>``.
