@@ -200,6 +200,63 @@ async def test_add_rejects_bad_args(
     assert kv_get(db, reminders.SEQ_KEY) is None
 
 
+async def test_a_routed_reminder_survives_a_late_runner(
+    db: sqlite3.Connection, tools: dict[str, ToolHandler], channel: FakeChannel, clock: FakeClock
+) -> None:
+    """``/remind now x`` routed 10 min before the command task ran (a busy loop, a restart):
+    checked against ``routed_at``, it is set and fires at once, marked late."""
+    routed = T0 - timedelta(minutes=10)
+    args = {"at": routed.isoformat(), "text": "stretch"}
+    with pytest.raises(ToolFailed, match="that time has passed"):
+        await tools["add_reminder"](args)  # without routed_at: checked against the clock
+    out = await tools["add_reminder"]({**args, "routed_at": routed.isoformat()})
+    assert out["at"] == iso(routed)
+    await make_loop(db, channel, clock).run_until_idle()
+    assert channel.texts == ["⏰ stretch (late, due 9:50am)"]
+
+
+async def test_a_near_term_routed_reminder_is_on_time(
+    db: sqlite3.Connection, tools: dict[str, ToolHandler], channel: FakeChannel, clock: FakeClock
+) -> None:
+    routed = T0 - timedelta(seconds=90)  # "/remind in 2 min x", run 90 s late
+    at = routed + timedelta(minutes=2)
+    await tools["add_reminder"](
+        {"at": at.isoformat(), "text": "x", "routed_at": routed.isoformat()}
+    )
+    loop = make_loop(db, channel, clock)
+    await loop.run_until_idle()
+    assert channel.sent == []
+    clock.advance(seconds=30)
+    await loop.run_until_idle()
+    assert channel.texts == ["⏰ x"]
+
+
+@pytest.mark.parametrize(
+    "routed_at",
+    [
+        (T0 + timedelta(minutes=5)).isoformat(),  # in the future
+        (T0 - timedelta(days=1, minutes=1)).isoformat(),  # more than a day old
+        "2026-10-13T10:00:00",  # no offset
+        "yesterday",
+        1760000000,
+    ],
+)
+async def test_routed_at_must_be_recent(
+    db: sqlite3.Connection, tools: dict[str, ToolHandler], routed_at: Any
+) -> None:
+    at = (T0 + timedelta(minutes=20)).isoformat()
+    with pytest.raises(ToolFailed, match="routed_at"):
+        await tools["add_reminder"]({"at": at, "text": "x", "routed_at": routed_at})
+    assert repo.count_by_status(db) == {}
+
+
+def test_the_model_cannot_send_routed_at() -> None:
+    """Model tool calls are validated against the schema, which has no ``routed_at``."""
+    schema = reminders.ADD_REMINDER.args_schema
+    assert "routed_at" not in schema["properties"]
+    assert schema["additionalProperties"] is False
+
+
 async def test_list_soonest_first_and_pending_only(
     db: sqlite3.Connection, tools: dict[str, ToolHandler], clock: FakeClock
 ) -> None:

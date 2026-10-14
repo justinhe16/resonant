@@ -338,7 +338,7 @@ async def test_plain_yes_with_one_pending_resolves_wakes_and_runs_once(
 
     await h.say("Yes!")
     assert h.tool_log == ["restart_resonant"]
-    assert h.channel.replies() == ["Done: restart resonant"]
+    assert h.channel.replies() == ["Done: restart Resonant"]
     assert h.tasks("reply") == []  # the reply started no task of its own
     assert h.task_status(task_id) == "done"
     assert h.model.label_calls == 0  # never reached the labeler
@@ -372,7 +372,7 @@ async def test_two_pending_re_asks_with_codes_then_the_code_binds(
     await h.say(f"yes {second.code}")
     assert h.tool_log == ["restart_ollama"]
     assert h.status(first) == "pending" and h.status(second) == "approved"
-    assert h.channel.replies()[-1] == "Done: restart ollama"
+    assert h.channel.replies()[-1] == "Done: restart Ollama"
 
 
 async def test_l1_needs_the_code(make: Callable[[], Harness]) -> None:
@@ -508,7 +508,7 @@ async def test_yes_while_the_task_is_running_is_caught_by_the_wait_requeue(
     assert replied == [None]
     assert h.status(approval) == "approved"
     assert h.tool_log == ["restart_resonant"]
-    assert h.channel.replies() == ["Done: restart resonant"]
+    assert h.channel.replies() == ["Done: restart Resonant"]
 
 
 # --- /approvals --------------------------------------------------------------------------

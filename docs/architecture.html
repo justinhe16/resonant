@@ -211,8 +211,8 @@ pre.code{background:var(--code-bg);border:1px solid var(--border);border-radius:
     <div class="canvas"><svg id="lifeSvg" role="img" aria-label="Task lifecycle state machine"></svg></div>
     <div class="grid" style="margin-top:12px">
       <div class="card"><h4>Wait reasons</h4><ul>
-        <li><code>approval</code>: a gate decision is pending (L1)</li>
-        <li><code>veto</code>: an L2 veto window, with <code>wake_at</code> = the deadline</li>
+        <li><code>approval</code>: a gate decision is pending (L1, inferred L2, or anything above L0 under the kill switch), with <code>wake_at</code> = the expiry</li>
+        <li><code>veto</code>: reserved for Phase 3 veto windows on unattended jobs; unused in Phase 2</li>
         <li><code>human_reply</code>: an <code>ask_human</code> question was forwarded to a person</li>
         <li><code>usage_reset</code>: hit the Claude usage limit; parked until the reset</li>
         <li><code>ci</code>: PR opened; CI is polled on the tick via gh/API, with no inbound webhooks</li>
@@ -235,30 +235,34 @@ pre.code{background:var(--code-bg);border:1px solid var(--border);border-radius:
   <!-- APPROVAL -->
   <section class="view" id="view-appr">
     <h2 class="section-title">Approval flow (text-reply over iMessage)</h2>
-    <p class="lede">Planned for Phase 2. A side effect at level L1 parks the task in <code>waiting(approval)</code>. Resonant texts the approver a short code. Your reply binds to <b>exactly one</b> pending approval, or Resonant asks again; it never guesses. Pay approvals skip the classifier entirely.</p>
+    <p class="lede">Built in Phase 2. A side effect that asks (L1 always; L2 when the model chose it; anything above L0 while the kill switch is on) parks the task in <code>waiting(approval)</code>. Resonant texts the approver a short code: <code>[A7] restart Resonant? Reply yes / no</code>, or for L1 <code>[D7] delete all 4 notes? This can't be undone. Reply yes D7 / no</code>. Your reply binds to <b>exactly one</b> pending approval, or Resonant asks again; it never guesses. Phase 2 uses a deterministic parser only.</p>
     <div class="canvas"><svg id="apprSvg" role="img" aria-label="Approval sequence diagram"></svg></div>
     <div class="grid" style="margin-top:12px">
-      <div class="card"><h4>Stage 1: deterministic parser</h4><ul>
-        <li>Matches yes / no / approve / deny / 👍 / 👎, case-insensitive</li>
-        <li><code>yes with comments: …</code></li>
-        <li>An optional code, e.g. <code>yes A7</code>; required when more than one approval is pending</li>
+      <div class="card"><h4>Deterministic parser</h4><ul>
+        <li>The whole message: <code>yes|approve|👍 [code]</code>, <code>&lt;code&gt; yes</code>, <code>no|deny|👎 [code]</code>, <code>&lt;code&gt; no</code>, <code>yes [code] with comments: …</code></li>
+        <li><code>y</code>, <code>ok</code>, <code>sure</code> and <code>yes all</code> are not replies; text that doesn't parse routes normally</li>
+        <li>Slash commands win first, so <code>/kill</code> is never read as a reply</li>
+        <li>A plain <code>yes</code> binds only when exactly one approval is pending; otherwise Resonant re-asks with the codes</li>
       </ul></div>
-      <div class="card"><h4>Stage 2: approval classifier</h4><ul>
-        <li>Runs only if the parser fails. Separate from the router.</li>
-        <li>Input: <b>only</b> your reply plus the code-templated summary</li>
-        <li>Output: <code>{decision, approval_code, comments, confidence}</code></li>
-        <li>Approves only if <code>decision=approve ∧ confidence ≥ 0.9</code>; anything else is unclear, so Resonant re-asks</li>
+      <div class="card"><h4>Deferred</h4><ul>
+        <li>An approval classifier for free-form replies, and <code>resonant eval approvals</code></li>
+        <li>Batch approvals (<code>yes all</code>)</li>
+        <li>Veto windows ("doing X unless you stop"), for Phase 3 unattended jobs</li>
+        <li>See <code>docs/followups.md</code></li>
       </ul></div>
       <div class="card"><h4>Money is stricter</h4><ul>
         <li><code>pay</code> tools are <b>always L1</b>, and that is enforced at registration</li>
-        <li>The only accepted reply is an exact <code>yes A7</code> that includes the code. No classifier.</li>
+        <li>Like every L1 action, the only accepted reply is <code>yes A7</code> with the code; a plain <code>yes</code> never approves it</li>
         <li>The same rule applies on Slack: a typed code, not a button</li>
       </ul></div>
       <div class="card"><h4>Binding and audit</h4><ul>
-        <li>The reply must come from an approver handle, which must also hold <code>can(…, 'approve', ext)</code></li>
+        <li>The reply must come from an approver handle (the owner for builtins); a non-approver always gets <code>Nothing is waiting for approval.</code></li>
+        <li>Sent-before rule: the prompt must have been sent before the reply's <code>occurred_at</code></li>
         <li>Messages that arrive as SMS are dropped; only <code>service='iMessage'</code> counts</li>
-        <li>Each approval is tied to an <code>intent_hash</code> and expires</li>
-        <li>The audit row records the raw reply, the path (parser or classifier), the confidence, <code>approved_by</code>, and the code</li>
+        <li>Each approval is tied to an <code>intent_hash</code> and expires after <code>gate.approval_ttl_s</code> (default 1800s); the task wakes at expiry and says so</li>
+        <li>Resolution is one conditional UPDATE, idempotent per event (<code>resolved_event_id</code>): a replayed or racing reply resolves once</li>
+        <li>Single use (<code>used_at</code>); a task that ends expires its pending approvals, so a later <code>yes</code> binds nothing</li>
+        <li>The audit row records the path, <code>approved_by</code>, and the code</li>
         <li><code>yes with comments</code> adds a <code>human_input</code> event that the runner sees as a constraint</li>
       </ul></div>
     </div>
@@ -439,9 +443,10 @@ prompt prefix = fixed per (intent, principal scope)   # KV-cache reuse`,
       checkpoint JSON, claude_session_id, worktree_path, scope JSON,
       origin_event_id, channel_ref, trace_id, result, error, …)
 
-status: queued → running → waiting(approval|human_reply|usage_reset|ci|veto)
+status: queued → running → waiting(approval|human_reply|usage_reset|ci|veto*)
         → done | failed | cancelled
-priority: on-call 0 < owner 1 < member 2 < background 3`,
+priority: on-call 0 < owner 1 < member 2 < background 3
+* veto: reserved for Phase 3 unattended jobs, unused in Phase 2`,
     inv:["CHECK: status='waiting' ⇔ wait_reason IS NOT NULL","For queued tasks, wake_at means 'not before' (retry backoff)","Priority comes from lane and principal, never from the model"],
     files:["packages/resonant/src/resonant/loop/types.py","packages/resonant/src/resonant/store/migrations/001_init.sql"]},
   slots:{label:"Claude slot pool", phase:"0 / 5", status:"built",
@@ -529,44 +534,48 @@ resonant ext list | remove | reload`,
     iface:`if not can(intent.principal, "request", intent.extension): Deny(…)`,
     inv:["Identity grants permissions, and content never does","The co-founder is scoped to DORI, with no access to trading, the personal lane, the owner's data, or global settings"],
     files:["packages/resonant/src/resonant/principals.py (can(), built)","packages/resonant/src/resonant/gate/dry_run.py (checked first, built)"]},
-  gate:{label:"Policy gate (L0–L3)", phase:"2", status:"partial",
-    what:"Decides each intent by reversibility × blast radius. Dry-run mode logs instead of executing. The Gate protocol and DryRunGate (permissions, L0 reads allowed, everything else logged as DryRun) are built; the full gate is Phase 2.",
+  gate:{label:"Policy gate (L0–L3)", phase:"2", status:"built",
+    what:"PolicyGate decides each intent by risk (the registered level) × origin (who chose it): a slash command is consent, a model-chosen action asks first at medium risk, and destructive actions always need a typed code. Order: registration, permission, unsafe args (Deny), dry_run, then level × origin × autonomy. dry_run exempts only the store-internal builtins (notes, reminders); ops tools are not exempt.",
     iface:`Intent{task_id, principal, extension, tool, args, effect, level,
        scope_id?, hash = sha256(canonical(tool, extension, args, effect, level, commit))}
 Intent.for_tool(spec, …): effect/level come from the registered ToolSpec
 
+Intent.origin: explicit (router-parsed slash command) | inferred (model, jobs)
+
 gate.evaluate(intent) -> Allow(token) | Deny(reason) | NeedsApproval(id, code, …)
-                       | Veto(until) | DryRun
+                       | DryRun          # Veto(until): Phase 3, never returned now
 gate.consume(token, intent.hash)        # single-use; executor checks it before running
-gate.resolve_reply(ApprovalReply)       # binds text replies by code / batch
+gate.resolve_reply(ApprovalReply)       # binds text replies by code
 
-L0 act silently · L1 draft → approve · L2 act after veto window · L3 act, then report`,
-    inv:["The level comes from the tool's registration","pay is always L1","dry_run is on by default in config"],
-    files:["packages/resonant/src/resonant/gate/types.py","packages/resonant/src/resonant/gate/dry_run.py"]},
-  approvals:{label:"Approvals (text codes)", phase:"2", status:"planned",
-    what:"Approval requests go out as texts with a short code, and a reply binds to exactly one pending approval. A deterministic parser runs first; a separate classifier runs only if the parser fails. See the Approval flow tab.",
-    iface:`[A7] Send email to X re: "Lunch?" ? Reply yes / no / yes with comments: …
+L0 silent · L3 run + report
+L2 explicit: run + report · inferred: ask (plain yes)
+L1 always ask (yes <code>) · kill switch: everything above L0 asks`,
+    inv:["The level comes from the tool's registration","origin=explicit is set only by the local runner's direct_call path, which only the router's command parser writes","pay is always L1","No veto in Phase 2","dry_run is on by default in config"],
+    files:["packages/resonant/src/resonant/gate/policy.py","packages/resonant/src/resonant/gate/types.py","packages/resonant/src/resonant/gate/replies.py"]},
+  approvals:{label:"Approvals (text codes)", phase:"2", status:"built",
+    what:"Approval requests go out as texts with a short code, and a reply binds to exactly one pending approval. Phase 2 uses a deterministic parser only; a classifier and batch approvals are deferred. See the Approval flow tab.",
+    iface:`[A7] restart Resonant? Reply yes / no                          # L2 / L3
+[D7] delete all 4 notes? This can't be undone. Reply yes D7 / no  # L1
 
-classifier → {decision: approve|deny|unclear, approval_code, comments, confidence}
-approve iff decision = approve ∧ confidence ≥ 0.9   (never for pay)`,
-    inv:["yes all approves exactly the codes in a stored batch message, never pay","The first valid reply on any channel wins (atomic update); on-call pages go to iMessage and Slack","Summaries are templated by code. Outside strings are quoted, truncated, and stripped of newlines and codes","The classifier sees only your reply and the summary, never tool output","At most one pending approval per (task, intent), enforced by a unique index","Approvals expire, and veto windows use waiting(veto) with wake_at"],
-    files:["packages/resonant/src/resonant/store/migrations/001_init.sql (approvals table, built)","packages/resonant/src/resonant/gate/codes.py (codes, approval text, sanitize_external: built)"]},
-  killswitch:{label:"Kill switch / paused", phase:"0 / 2", status:"partial",
-    what:"A global brake that only the owner can use. While it's on, everything above L0 needs approval and L2/L3 timers are cancelled. It also sets kv.paused, which critical-job wrappers and on-call autonomy check before acting.",
+resonant approvals list | show | approve | deny <id|code>   # CLI, owner on the Mini`,
+    inv:["A plain yes binds only with exactly one pending approval; L1 needs yes <code>","Sent-before rule: the prompt went out before the reply's occurred_at","One conditional UPDATE, idempotent per event (resolved_event_id); CLI and daemon can't race","Summaries are templated by code. Outside strings are quoted, truncated, and stripped of newlines and codes; full args via /approvals <code>","At most one pending approval per (task, intent), enforced by a unique index","Approvals expire (gate.approval_ttl_s), are single use (used_at), and expire when their task ends"],
+    files:["packages/resonant/src/resonant/store/approvals.py","packages/resonant/src/resonant/store/migrations/003_approvals_phase2.sql","packages/resonant/src/resonant/gate/replies.py","packages/resonant/src/resonant/router/approvals.py","packages/resonant/src/resonant/gate/codes.py"]},
+  killswitch:{label:"Kill switch / paused", phase:"0 / 2", status:"built",
+    what:"A global brake that only the owner can use. While it's on (kv.autonomy off), everything above L0 asks first, even a slash command; L1 still needs the code. The gate reads it on every call, and a missing or garbage value counts as off. It also sets kv.paused, which critical-job wrappers and on-call autonomy check before acting.",
     iface:`kv.autonomy = "off"    kv.paused = true
-resonant kill [--reason …] / resonant resume          # built
+resonant kill [--reason …] / resonant resume · /kill · /resume   # built
 resonant job-guard --job ext/id -- cmd…   # exit 75 if paused (fails closed)`,
-    inv:["Owner-only (admin)","/kill on the deterministic fast path, never through the LLM"],
+    inv:["Owner-only (admin)","/kill on the deterministic fast path, never through the LLM, and never read as an approval reply"],
     files:["packages/resonant/src/resonant/killswitch.py","packages/resonant/src/resonant/cli.py (kill, resume, job-guard)"]},
   executor:{label:"Executor", phase:"2", status:"partial",
-    what:"The only component that runs side effects. It first consumes the gate's single-use Allow token for this exact intent hash, so a forged or reused Allow is refused. It runs the registered handler for (extension, tool) with that tool's timeout and audits before and after. For writes and payments, a timeout, cancel or unexpected error is recorded as ambiguous and never re-run automatically. Keychain secret injection arrives in Phase 2.",
+    what:"The only component that runs side effects. It first consumes the gate's single-use Allow token for this exact intent hash, so a forged or reused Allow is refused. It runs the registered handler for (extension, tool) with that tool's timeout and audits before and after. For writes and payments, a timeout, cancel or unexpected error is recorded as ambiguous and never re-run automatically. Keychain secret injection is deferred to Phase 3, with the first tool that needs a secret.",
     iface:`idempotency_key = sha256(task_id, step_no, call_index, intent_hash)
 executions(idempotency_key PK, status started|succeeded|failed, result)
 execute(intent, decision) -> ToolResult{ok, data, error, duration_ms}`,
     inv:["A key that already succeeded returns its recorded result instead of running again","Secrets are redacted in the audit log","Every action is written to the audit log"],
     files:["packages/resonant/src/resonant/executor.py","packages/resonant/src/resonant/store/migrations/001_init.sql (executions)"]},
-  secrets:{label:"Keychain secrets", phase:"2", status:"planned",
-    what:"Credentials live in the macOS login Keychain. The daemon runs as a LaunchAgent in the auto-login session, which makes that keychain readable.",
+  secrets:{label:"Keychain secrets", phase:"3", status:"planned",
+    what:"Credentials live in the macOS login Keychain. The daemon runs as a LaunchAgent in the auto-login session, which makes that keychain readable. Executor injection is deferred to Phase 3, with the first tool that needs a secret.",
     iface:`keyring.get_password("resonant", "<extension>/<name>")  # executor only`,
     inv:["The model never sees secrets","No secrets in the repo. gitleaks runs in pre-commit and CI, and only *.example configs ship","FileVault is on: after an unplanned reboot it needs a manual unlock (UPS, manual updates, fdesetup authrestart for planned reboots)"],
     files:[]},
@@ -574,8 +583,8 @@ execute(intent, decision) -> ToolResult{ok, data, error, duration_ms}`,
   t_tasks:{label:"tasks", phase:"0", status:"built", what:"The durable task envelope. See the Task envelope node.", iface:`CHECK ((status = 'waiting') = (wait_reason IS NOT NULL))
 INDEX (status, priority, created_at) · INDEX wake_at WHERE waiting`, inv:["Checkpoint is written every iteration"], files:["packages/resonant/src/resonant/store/migrations/001_init.sql"]},
   t_events:{label:"events", phase:"0", status:"built", what:"The append-only input log.", iface:`dedupe_key UNIQUE · INDEX (task_id) WHERE consumed_at IS NULL`, inv:["Rows are never mutated, only marked consumed"], files:["packages/resonant/src/resonant/store/migrations/001_init.sql"]},
-  t_approvals:{label:"approvals", phase:"0", status:"built", what:"Pending and decided approvals, each tied to an intent hash.", iface:`status pending|approved|rejected|expired · expires_at
-UNIQUE (task_id, intent_hash) WHERE status = 'pending'`, inv:["Records requested_by and decided_by"], files:["packages/resonant/src/resonant/store/migrations/001_init.sql"]},
+  t_approvals:{label:"approvals", phase:"0 / 2", status:"built", what:"Pending and decided approvals, each tied to an intent hash.", iface:`status pending|approved|rejected|expired · expires_at · used_at · resolved_event_id
+UNIQUE (task_id, intent_hash) WHERE status = 'pending'`, inv:["Records requested_by and decided_by","Expired when their task ends (orphans)"], files:["packages/resonant/src/resonant/store/migrations/001_init.sql","packages/resonant/src/resonant/store/migrations/003_approvals_phase2.sql"]},
   t_exec:{label:"executions", phase:"0", status:"built", what:"The idempotency ledger for side effects.", iface:`idempotency_key PRIMARY KEY`, inv:["A succeeded key is never run again"], files:["packages/resonant/src/resonant/store/migrations/001_init.sql"]},
   t_audit:{label:"audit_log", phase:"0", status:"built", what:"Every action, append-only.", iface:`requested_by, approved_by, tool, effect, level, intent_hash,
 idempotency_key, decision, detail JSON
@@ -615,13 +624,14 @@ com.resonant.ollama  KEEP_ALIVE=-1, CONTEXT_LENGTH=32768
 install: launchctl bootout → bootstrap gui/<uid> → enable`,
     inv:["Verified: after kill -9, launchd restarted the daemon in about 6s","Needs auto-login, and FileVault is on, so an unplanned reboot needs a manual unlock"],
     files:["packages/resonant/src/resonant/launchd.py","tests/test_launchd.py"]},
-  cli:{label:"resonant CLI", phase:"0 / 1", status:"built",
-    what:"The typer CLI. Phase 0 and Phase 1 commands are built; approvals evals and ext come later.",
+  cli:{label:"resonant CLI", phase:"0 / 1 / 2", status:"built",
+    what:"The typer CLI. Phase 0, 1 and 2 commands are built; approvals evals and ext come later.",
     iface:`resonant daemon run | install | uninstall | logs      # built
 resonant status [--json] · kill · resume · job-guard # built
 resonant model probe | bench · selftest imessage     # built (Phase 1)
 resonant eval router · bench e2e [--model real]      # built (Phase 1)
-resonant eval approvals --set <path>                # Phase 2
+resonant approvals list|show|approve|deny          # built (Phase 2)
+resonant eval approvals --set <path>                # deferred (follow-up)
 resonant ext add|list|remove · reload               # Phase 3
 scripts/bootstrap.sh [--check]  # fresh Mac → running daemon (built)`,
     inv:["Real eval sets live in ~/.resonant/evals, never in the public repo","bench e2e uses a fake chat.db and osascript, so it never texts anyone"],
@@ -647,10 +657,10 @@ const PHASES = [
    items:["PR1: workspace, config, principals, SQLite store (merged)","PR2: generic loop, slot pool, daemon, LaunchAgents, CLI (merged)","PR3: bootstrap.sh, status/kill/job-guard, watchdog + dead-man, structlog + spans, SDK contracts, docs"]},
   {n:1, title:"Talk to it", status:"built", done:10, total:10,
    items:["Ollama client: thinking-off probe, latency benchmark","Built-in read tools, registry/gate/executor wiring, GET /api/tools","Router: deterministic fast path, then one LLM label","Local runner (≤3 read-tool calls through gate → executor)","iMessage reader, sender, channel + self-test","Router evals (resonant eval router)","Brain health: monitor, owner alerts, dead-man reasons","Mini go-live checklist + bootstrap --check","End-to-end wiring, acceptance tests, resonant bench e2e (Mini numbers pending go-live)","Slack notifier dropped from core (extensions own Slack)"]},
-  {n:2, title:"Gate + executor", status:"planned",
-   items:["L0–L3, approvers + permission checks","Text-reply approvals: codes, parser, classifier","Pay strict path, veto wait, kill switch + paused","Keychain injection, audit with requested_by/approved_by","Scope + commit-pause interfaces","Approval classifier evals"]},
+  {n:2, title:"Gate + real tools", status:"built", done:17, total:17,
+   items:["PolicyGate: risk × origin (explicit runs, inferred L2 asks, L1 always yes <code>), kill switch, dry_run exemption","Text-reply approvals: codes, deterministic parser, sent-before binding, expiry, orphans, single use","Local runner: direct_call, Wait/resume, execute once, templated replies","Notes (L1 /notes clear) and reminders (durable tasks, on time, late marker)","Mini ops: /restart ollama|resonant, /update, /disk, /logs, \"back up\"","/projects, command registry, /help [word], fuzzy suggestions","Chat intents notes / reminders / ops","CLI: resonant approvals list|show|approve|deny","Go-live Stage A (dry_run) → Stage B (flip), bootstrap --check","Deferred: classifier + eval approvals, yes all, Keychain injection and veto windows (Phase 3)"]},
   {n:3, title:"Extensions", status:"planned",
-   items:["Manifest loader, ext add with diff + L1 approval","CLI + MCP tools (typed)","Scheduler + critical-job LaunchAgents + job-guard","emit() → notify, health tiles","extensions/example, then trade-jev (private)"]},
+   items:["Manifest loader, ext add with diff + L1 approval","Keychain secret injection; veto windows for unattended jobs (always inferred)","CLI + MCP tools (typed)","Scheduler + critical-job LaunchAgents + job-guard","emit() → notify, health tiles","extensions/example, then trade-jev (private)"]},
   {n:4, title:"Dashboard", status:"planned",
    items:["Vite + React + shadcn (streak look)","jobs, runs, logs (SSE), approvals, audit, slots","loopback only; remote status via the planned status relay"]},
   {n:5, title:"Claude runner + Slack", status:"planned",
@@ -939,7 +949,7 @@ function drawLifecycle(){
   const S = {
     queued:{x:40,y:200,label:"queued",sub:"runnable (wake_at = not before)"},
     running:{x:420,y:200,label:"running",sub:"Runner.step in flight"},
-    waiting:{x:690,y:70,label:"waiting(reason)",sub:"approval · veto · human_reply · usage_reset · ci", w:300},
+    waiting:{x:690,y:70,label:"waiting(reason)",sub:"approval · human_reply · usage_reset · ci · veto (Phase 3)", w:330},
     done:{x:730,y:220,label:"done",sub:"Done(result)",term:true},
     failed:{x:730,y:310,label:"failed",sub:"non-retryable / attempts exhausted",term:true, w:240},
     cancelled:{x:730,y:400,label:"cancelled",sub:"loop.cancel() · worktree cleanup",term:true, w:240},
@@ -994,8 +1004,8 @@ function drawLifecycle(){
 /* ---------------------------------------------------------- approval seq */
 function drawApproval(){
   const svg = document.getElementById("apprSvg");
-  const lanes = ["Runner","Gate","Channel (iMessage)","Approver","Parser","Classifier","Executor","Audit"];
-  const LW = 132, X0 = 24, W = X0 * 2 + lanes.length * LW, H = 840;
+  const lanes = ["Runner","Gate","Channel (iMessage)","Approver","Router + parser","Executor","Audit"];
+  const LW = 140, X0 = 24, W = X0 * 2 + lanes.length * LW, H = 880;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.setAttribute("height", H);
   const lx = (i) => X0 + i * LW + LW/2;
   lanes.forEach((l, i) => {
@@ -1004,21 +1014,21 @@ function drawApproval(){
     text(svg, lx(i), 29.5, l, "st-label", "middle");
   });
   const msgs = [
-    [0,1,"Intent{tool,args} (L1)","effect + level from registration"],
-    [1,1,"NeedsApproval(id, code=A7)","task → waiting(approval)"],
-    [1,2,"request_approval(approval)","summary templated by code"],
-    [2,3,"“[A7] Send email to X re: ‘Lunch?’? Reply yes / no”",""],
-    [3,2,"“yes A7”","iMessage only (SMS dropped), approver handle"],
-    [2,4,"Event(approval.reply)","is_from_me=0 · own handle skipped"],
-    [4,4,"match? yes / no / 👍 / 👎 / code","deterministic"],
-    [4,5,"no match → classify(reply, summary)","NOT for pay: exact code only", true],
-    [5,4,"{decision, code, comments, confidence}","approve iff approve ∧ ≥ 0.9 else re-ask", true],
-    [4,1,"bind to exactly one pending approval","ambiguous → re-ask, never guess"],
-    [1,7,"approved_by, raw reply, path, confidence",""],
-    [1,0,"task → queued (+ human_input comments)",""],
-    [0,6,"execute(intent, decision)","hash must match approval"],
-    [6,6,"idempotency_key · Keychain env","succeeded key → replay result"],
-    [6,7,"audit row (secrets redacted)",""],
+    [0,1,"Intent{tool,args,origin}","L1 · inferred L2 · kill switch (above L0)"],
+    [1,1,"NeedsApproval(id, code=A7, expires_at)","task → waiting(approval), wake_at = expiry"],
+    [0,2,"request_approval(approval)","summary templated by code · deduped"],
+    [2,3,"“[A7] restart Resonant? Reply yes / no”","L1: “[D7] …? This can't be undone. Reply yes D7 / no”"],
+    [3,2,"“yes”  (or “yes D7” for L1)","iMessage only (SMS dropped), approver handle"],
+    [2,4,"Event(message)","slash commands first: /kill is never a reply"],
+    [4,4,"parse: yes / no / 👍 / 👎 [code]","deterministic; no match → routes normally"],
+    [4,1,"resolve_reply(event_id, occurred_at)","sent-before · exactly one pending · code for L1"],
+    [1,1,"one conditional UPDATE + wake","idempotent per event (resolved_event_id)"],
+    [1,6,"approved_by, path, code",""],
+    [1,0,"task → queued",""],
+    [0,5,"execute(intent, Allow)","used_at set with started · hash must match"],
+    [5,5,"idempotency_key","succeeded key → replay result"],
+    [5,6,"audit row",""],
+    [0,2,"templated reply (“Restarting Resonant…”)","no more model rounds"],
   ];
   let y = 80;
   msgs.forEach(([a,b,label,note,alt]) => {
@@ -1036,8 +1046,8 @@ function drawApproval(){
       y += 46;
     }
   });
-  el("rect", {x:lx(3) - 40, y: H - 44, width: lx(6) - lx(3) + 80, height: 30, rx:8, class:"note-box"}, svg);
-  text(svg, (lx(3) + lx(6))/2, H - 29, "classifier input: reply + summary only — never tool output or external content", "msg-note", "middle");
+  el("rect", {x:lx(2) - 40, y: H - 44, width: lx(5) - lx(2) + 80, height: 30, rx:8, class:"note-box"}, svg);
+  text(svg, (lx(2) + lx(5))/2, H - 29, "parser only in Phase 2 — classifier and yes all deferred; a later yes after expiry or task end binds nothing", "msg-note", "middle");
 }
 
 /* -------------------------------------------------------------- roadmap */
@@ -1091,9 +1101,9 @@ function drawTrust(){
   zone(300, 16, 330, 348, "Identity & policy (core)", "where permissions come from");
   box(316, 62, 298, "channel identity → principal", "imessage:+1… / slack:U…", "var(--built)");
   box(316, 120, 298, "can(principal, action, ext)", "owner: all · cofounder: dori only", "var(--built)");
-  box(316, 178, 298, "ToolSpec registration", "effect + level · pay ≡ L1", "var(--planned)");
-  box(316, 236, 298, "Gate: L0–L3 · approvals · kill switch", "approval = authenticated reply", "var(--planned)");
-  box(316, 294, 298, "Executor (only secrets holder)", "Keychain → env · idempotent · audited", "var(--planned)");
+  box(316, 178, 298, "ToolSpec registration", "effect + level · pay ≡ L1", "var(--built)");
+  box(316, 236, 298, "Gate: risk × origin · approvals · kill switch", "approval = authenticated reply", "var(--built)");
+  box(316, 294, 298, "Executor (only secrets holder)", "idempotent · audited · Keychain → env (Phase 3)", "var(--partial)");
 
   zone(664, 16, 300, 348, "Outside the core path", "");
   box(680, 62, 268, "trade-jev order execution", "never via loop or gate");
@@ -1111,8 +1121,8 @@ function trustCards(){
     ["Identity grants permissions","A request is authorized by the authenticated sender (iMessage handle or Slack user ID), never by what the message says. Unknown identities are dropped and audited."],
     ["All content is untrusted","Messages, emails, web pages, tool output, and extension payloads are data. Toolsets are filtered by principal before the LLM sees them, so injected text can't reach tools outside that principal's scope."],
     ["Co-founder scoped to DORI","The co-founder can request DORI tasks and approve DORI on-call actions. They have no access to the personal lane, trading, the owner's data, or global settings. admin and global scope are owner-only."],
-    ["Approvals are bound","Each approval is tied to an intent hash, expires, and records who requested and who approved. Pay needs an exact reply with the code. The classifier sees only the reply and a code-templated summary."],
-    ["Secrets never reach the model","Only the executor reads the Keychain, and it injects secrets as subprocess environment variables. The audit log redacts them. Only *.example configs ship in the public repo, and gitleaks runs in pre-commit and CI."],
+    ["Approvals are bound","Each approval is tied to an intent hash, expires, is used once, and records who requested and who approved. L1 and pay need yes with the code. A plain yes binds only when exactly one approval is pending and its prompt was sent first. The parser is deterministic; no model reads replies."],
+    ["Secrets never reach the model","Only the executor will read the Keychain (Phase 3), injecting secrets as subprocess environment variables. The audit log redacts them. Only *.example configs ship in the public repo, and gitleaks runs in pre-commit and CI."],
     ["No public ports","The API binds to loopback only, and config rejects any other address. Remote status access is planned via the push-only status relay, never by exposing the API. Slack uses Socket Mode, iMessage uses local chat.db, and webhooks need HMAC (their transport is an open follow-up)."],
     ["trade-jev stays outside","Order execution never goes through the loop or gate. Core sees only trade-jev's jobs, read tools, events, and kill switch. The kill switch sets kv.paused, which job-guard checks."],
     ["Claude stays in its lane","Claude works in a worktree per task, opens PRs only, and never pushes to main. A PreToolUse guard denies risky commands, and permission requests go to the gate."],

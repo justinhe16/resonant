@@ -21,6 +21,10 @@ from resonant.config import Settings
 
 DAEMON_LABEL = "com.resonant.daemon"
 OLLAMA_LABEL = "com.resonant.ollama"
+# Keeps the Mini awake (power.keep_awake). The label matches the hand-installed agent the
+# Mini already had, so `resonant daemon install` adopts it instead of adding a second one.
+CAFFEINATE_LABEL = "com.resonant.caffeinate"
+CAFFEINATE = "/usr/bin/caffeinate"
 _SYSTEM_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
@@ -69,6 +73,17 @@ def ollama_plist(settings: Settings, ollama: str) -> dict[str, Any]:
         "ThrottleInterval": 10,
         "StandardOutPath": str(logs / "ollama.out.log"),
         "StandardErrorPath": str(logs / "ollama.err.log"),
+    }
+
+
+def caffeinate_plist() -> dict[str, Any]:
+    """``caffeinate -i -m -s``: no idle sleep, no disk sleep, no system sleep on AC power.
+    It holds the power assertions while it runs, so launchd keeps it running."""
+    return {
+        "Label": CAFFEINATE_LABEL,
+        "ProgramArguments": [CAFFEINATE, "-i", "-m", "-s"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
     }
 
 

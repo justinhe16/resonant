@@ -67,7 +67,7 @@ def daemon_install(
         bool, typer.Option(help="Also install the Ollama LaunchAgent if ollama is on PATH.")
     ] = True,
 ) -> None:
-    """Install and start the LaunchAgents (daemon, and Ollama if available)."""
+    """Install and start the LaunchAgents (daemon, Ollama if available, and keep-awake)."""
     settings = load_settings()
     try:
         if ollama:
@@ -75,6 +75,10 @@ def daemon_install(
                 typer.echo(f"installed {launchd.install(launchd.ollama_plist(settings, path))}")
             else:
                 typer.echo("ollama not found on PATH; skipping Ollama LaunchAgent")
+        if settings.power.keep_awake:
+            typer.echo(f"installed {launchd.install(launchd.caffeinate_plist())}")
+        elif launchd.uninstall(launchd.CAFFEINATE_LABEL):
+            typer.echo(f"{launchd.CAFFEINATE_LABEL}: removed (power.keep_awake is false)")
         typer.echo(f"installed {launchd.install(launchd.daemon_plist(settings))}")
     except launchd.LaunchctlError as e:
         typer.echo(f"error: {e}", err=True)
@@ -84,9 +88,13 @@ def daemon_install(
 @daemon_app.command("uninstall")
 def daemon_uninstall(
     ollama: Annotated[bool, typer.Option(help="Also remove the Ollama LaunchAgent.")] = True,
+    keep_awake: Annotated[
+        bool, typer.Option(help="Also remove the keep-awake (caffeinate) LaunchAgent.")
+    ] = True,
 ) -> None:
     """Stop and remove the LaunchAgents."""
     labels = [launchd.DAEMON_LABEL] + ([launchd.OLLAMA_LABEL] if ollama else [])
+    labels += [launchd.CAFFEINATE_LABEL] if keep_awake else []
     for label in labels:
         removed = launchd.uninstall(label)
         typer.echo(f"{label}: {'removed' if removed else 'not installed'}")

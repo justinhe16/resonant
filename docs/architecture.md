@@ -33,6 +33,7 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Generic loop, task envelope, slot pool | `resonant/loop/` | Phase 0 ✅ |
 | Daemon and local API (`/healthz`, `/api/status`) | `resonant/daemon.py`, `resonant/api.py` | Phase 0 ✅ |
 | LaunchAgents (daemon, Ollama) | `resonant/launchd.py` | Phase 0 ✅ |
+| Keep-awake LaunchAgent (`caffeinate -i -m -s`, `power.keep_awake`), installed by `resonant daemon install` | `resonant/launchd.py`, `resonant/cli.py` | Phase 2 ✅ |
 | CLI: `daemon`, `status`, `kill`, `resume`, `job-guard` | `resonant/cli.py` | Phase 0 ✅ |
 | Health: watchdog thread, dead-man ping | `resonant/health.py` | Phase 0 ✅ |
 | Observability: JSON logs, spans | `resonant/observability/` | Phase 0 ✅ |
@@ -48,7 +49,17 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Mini go-live checklist, `scripts/bootstrap.sh --check` | `docs/go-live.md`, `scripts/` | Phase 1 ✅ |
 | Slack notifier | — | Not in core (no Slack in core; extensions own Slack) |
 | Router evals: `resonant eval router` (production `classify`, accuracy, confusion, p50/p95 per path; texts only in terminal output) | `resonant/evals/`, `evals/README.md` | Phase 1 ✅ |
-| Real gate (L0–L3, text-reply approvals, veto, kill switch), Keychain injection | — | Phase 2 |
+| Policy gate: risk × origin (`Intent.origin`), kill switch read on every call, dry_run exemption for store-internal builtins, approval expiry and single use; executor `recorded()` | `resonant/gate/policy.py`, `resonant/executor.py` | Phase 2 ✅ |
+| Approvals: store and migration 003, deterministic reply parser, binding (sent-before, per-event idempotency, orphan expiry), router approval inbox, `request_approval`, `/approvals`, `resonant approvals list\|show\|approve\|deny` | `resonant/store/approvals.py`, `resonant/gate/replies.py`, `resonant/router/approvals.py`, `resonant/cli.py` | Phase 2 ✅ |
+| Local runner: `direct_call` (explicit), Wait/resume on approval, execute once, code-built reports, one gated side effect per task | `resonant/runners/local.py` | Phase 2 ✅ |
+| Notes (`/note`, `/notes [clear]`, `/unnote`; soft delete) | `resonant/tools/notes.py` | Phase 2 ✅ |
+| Reminders (`/remind`, `/reminders`, `/unremind`; durable tasks, `ReminderRunner`, loop next-wake) | `resonant/tools/reminders.py`, `resonant/tools/when.py`, `resonant/runners/reminder.py` | Phase 2 ✅ |
+| Mini ops (`/restart ollama\|resonant`, `/update`, `/disk`, `/logs`; "back up" after a restart) | `resonant/tools/ops.py`, `resonant/ops/` | Phase 2 ✅ |
+| `/projects`: all work in progress by state | `resonant/tools/projects.py` | Phase 2 ✅ |
+| Command registry: every slash command, `/help [word]`, "did you mean" suggestions that never execute, `list_commands` | `resonant/router/commands.py`, `resonant/router/fast_path.py` | Phase 2 ✅ |
+| Chat intents `notes`, `reminders`, `ops` (model-chosen calls are `inferred`) | `resonant/router/intents.py`, `resonant/router/prefixes.py` | Phase 2 ✅ |
+| Go-live Phase 2: stage A / B checklist, `--check` rows for store, dry_run, kill switch, ops, keep-awake, stale approvals | `docs/go-live.md`, `scripts/go_live_check.py` | Phase 2 ✅ |
+| Keychain secret injection, veto windows for unattended jobs | — | Phase 3 |
 | Extension manager (`ext add`, CLI/MCP tools, scheduler, critical-job plists) | — | Phase 3 |
 | Dashboard (Vite + React + shadcn, streak look) | — | Phase 4 |
 | Two-way Slack, Claude runner | — | Phase 5 |
@@ -83,7 +94,7 @@ queued ──dispatch──> running ──Continue──> queued
                         │──Done──> done
                         │──Fail(retryable, attempts left)──> queued (backoff or retry_at; events kept)
                         └──Fail(final) / cancel ──> failed / cancelled
-wait reasons: approval · human_reply · usage_reset · ci · veto
+wait reasons: approval · human_reply · usage_reset · ci · veto (Phase 3; unused in Phase 2)
 ```
 
 - One transaction per step commits the outcome, the checkpoint and the consumed events together.
@@ -108,14 +119,28 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
   - `pay` is always L1.
   - A read with no secrets is always L0.
   - MCP tools must be typed in the manifest, and unlisted ones are refused.
-- **Approvals are text replies on iMessage** (Phase 2), bound to a 2-character code and an intent hash, and they expire.
-  - A deterministic parser runs first. A separate classifier handles the rest, approves only at confidence ≥ 0.9, and sees only the reply and the code-built summary.
-  - Pay approvals need an exact `yes <code>`.
+- **The gate weighs risk against who chose the action** (Phase 2). The level comes from registration; the origin is `explicit` only for a slash command the router parsed (the local runner's `direct_call` path) and `inferred` for anything the model chose (and, from Phase 3, every extension job).
+
+  | Level | Explicit (slash command) | Inferred (model) | Kill switch on |
+  |---|---|---|---|
+  | L0 read | Silent | Silent | Silent |
+  | L3 small, reversible | Run, then report | Run, then report | Ask (plain `yes`) |
+  | L2 medium | Run, then report | Ask (plain `yes`) | Ask (plain `yes`) |
+  | L1 destructive or pay | Ask, `yes <code>` only | Ask, `yes <code>` only | Ask, `yes <code>` only |
+
+  There is no veto window in Phase 2: `Veto` stays in the contract for Phase 3 unattended jobs. Under `dry_run`, only the store-internal builtins (notes, reminders) run; everything else that isn't an L0 read replies `Dry run: would …`.
+- **Approvals are text replies on iMessage**, bound to a 2-character code and an intent hash. They expire (`gate.approval_ttl_s`, 30 min) and are single use.
+  - A deterministic parser reads the whole message (`yes`, `no`, `yes A7`, `A7 no`, `yes A7 with comments: …`). There is no classifier and no `yes all` yet ([`followups.md`](followups.md)).
+  - A plain `yes` binds only when exactly one approval is pending, and only to a prompt sent before the reply. Each chat.db event resolves at most once.
+  - L1 (including pay) needs an exact `yes <code>`.
+  - Slash commands are checked first, so `/kill` is never read as a reply.
   - SMS-delivered messages are ignored.
-  - External strings in summaries are sanitized: quoted, truncated, newlines removed, codes removed.
-- **The model never sees secrets.** The executor injects them from the Keychain as environment variables for the tool process only.
+  - Summaries are built by code from the registry and the args: sanitized, clipped, with losses marked. `/approvals <code>` shows the full args.
+- **One side effect per task, and a residual risk.** Within one task, a tool read's output (untrusted) can still steer the model's choice of an L3 write, which runs without asking. Mitigations: the local runner stops at the first gated side effect, so one injected read buys at most one small, reversible effect; toolsets are owner-only and filtered by intent; and the runner prompt treats tool output as data. L2 and L1 always ask when the model chose them.
+- **The model never sees secrets.** From Phase 3 the executor injects them from the Keychain as environment variables for the tool process only.
 - **trade-jev order execution never goes through the loop or gate.** Core only sees its jobs, read tools, events and kill switch.
-- **The kill switch** sets `autonomy=off`, so everything above L0 needs approval, and `paused=true`, which critical-job wrappers and on-call autonomy check before acting.
+- **The kill switch** sets `autonomy=off`, so everything above L0 asks first (L1 still needs its code), and `paused=true`, which critical-job wrappers and on-call autonomy check before acting. A missing or garbage `autonomy` counts as off.
+- **Local code is outside the gate's threat model.** The gate protects against remote principals, iMessage content and the model, not against processes running as the same macOS user: those can run `resonant approvals approve` or `resonant resume`, write `~/.resonant/resonant.db`, and read the Keychain. Phase 3/5 runners with shell access must be sandboxed from all three ([`followups.md`](followups.md)).
 
 ## Health
 
@@ -147,3 +172,9 @@ wait reasons: approval · human_reply · usage_reset · ci · veto
 | 2026-10-08 | The local runner replays tool calls to the model as assistant/user turns (no `tool` role in `ChatMessage`), guards every number in its reply against tool output and the user's message, and escalates run_project or >3 calls with a templated reply instead of calling Claude. |
 | 2026-10-13 | Plain chat reaches the Phase 2 tools through the model: new intents `notes`, `reminders` and `ops` (and `projects` / `list_commands` in `job_control` / `system`). Model-chosen calls are always `inferred`, so the gate asks before L2 and L1 effects. The reminders turn carries the current local time after the stable prefix, so the model can pass `at` as an ISO datetime. |
 | 2026-10-08 | Phase 1 is wired in one place (`resonant/wiring.py`) and only when `channels.imessage.enabled`; disabled, the daemon is exactly Phase 0. The local runner's step limit is derived from the model timeout (`(3 + 1) × timeout_s + 15s`), so the model client times out first and the user always gets a fallback reply. Shutdown stops the reader and monitor before the loop drains, so in-flight replies still go out. |
+| 2026-10-13 | Phase 2 gate: risk × origin. A slash command is consent (explicit L3/L2 run and report), a model-chosen action asks at L2, L1 always needs `yes <code>`, and the kill switch makes everything above L0 ask. `origin` is set only by the router-written `direct_call` path. No veto windows in Phase 2 (Phase 3, for unattended jobs). |
+| 2026-10-13 | Phase 2 approvals are parser-only, with the sent-before rule and per-event idempotency; the classifier and `yes all` batches from 2026-10-08 are deferred. One gated side effect per local task. |
+| 2026-10-13 | `dry_run` exempts only store-internal builtins (notes, reminders), keyed on registry identity; ops tools are never exempt. Go-live flips `dry_run: false` after stage A of the checklist, so the remote ops work. |
+| 2026-10-13 | Reminders are durable queued tasks with `wake_at` and a `ReminderRunner`, not a scheduler. A missed one fires once on start, marked late. `/remind` passes the routing time, so a late-running command still sets it. |
+| 2026-10-13 | Ops reply first, then restart: `/restart resonant` spawns a detached helper that kickstarts the daemon after 3s, and the next start says "back up". `/update` is `git pull --ff-only` on a clean `main`, then `uv sync --frozen`; a failed sync doesn't restart. |
+| 2026-10-13 | The Mini's keep-awake `caffeinate` LaunchAgent is part of the product (`power.keep_awake`), under the label already hand-installed on the Mini, so the install adopts it. |

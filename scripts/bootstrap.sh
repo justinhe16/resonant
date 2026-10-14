@@ -156,7 +156,8 @@ seed "$REPO/config/principals.example.yaml" "$HOME_DIR/principals.yaml"
 export RESONANT_HOME="$HOME_DIR"
 
 if [[ $START -eq 1 ]]; then
-  step "LaunchAgents (Ollama + daemon)"
+  step "LaunchAgents (Ollama, keep-awake, daemon)"
+  # Keep-awake is a caffeinate LaunchAgent (power.keep_awake, default true).
   "$RESONANT" daemon install
 
   if [[ $PULL_MODEL -eq 1 ]]; then
@@ -184,6 +185,8 @@ $(printf '\033[1m')Manual steps (macOS won't let a script do these):$(printf '\0
        The dead-man switch alerts you when that happens.
      - For planned reboots use:  sudo fdesetup authrestart
      - Put the Mini on a UPS, and turn off automatic macOS updates.
+     - Never sleep: sudo pmset -a sleep 0 disksleep 0 standby 0 autorestart 1 womp 1
+       (the keep-awake LaunchAgent holds sleep off too, while power.keep_awake is true).
 
   2. Resonant's own Apple ID (iMessage channel, Phase 1)
      - Create a dedicated Apple ID with an EMAIL handle (e.g. a new @icloud.com address).
@@ -212,7 +215,7 @@ $(printf '\033[1m')Manual steps (macOS won't let a script do these):$(printf '\0
      - Nothing to do now. Remote access and the dead-man switch are planned as
        the status relay (docs/followups.md).
 
-  6. Edit $HOME_DIR/config.yaml (dry_run stays true until Phase 2 ships), then:
+  6. Edit $HOME_DIR/config.yaml (keep dry_run: true until go-live step 11 stage B), then:
        $RESONANT daemon install   # reload after config changes
        $RESONANT status
 

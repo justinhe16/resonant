@@ -17,11 +17,12 @@ import logging
 import re
 import socket
 import sqlite3
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -34,15 +35,19 @@ from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.e2e.fakes import DEFAULT_FINAL_REPLY
 from resonant.gate import Allow, DryRun, Intent, NeedsApproval, PolicyGate
 from resonant.gateway.imessage.fixtures import FakeChatDB
+from resonant.gateway.imessage.sender import OsaResult
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.loop.types import PRIORITY_OWNER, Done, StepContext, StepOutcome, Task, Wait
 from resonant.ops import mark_restart, restart_pending
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.router import commands
+from resonant.router.approvals import NOTHING_WAITING
+from resonant.router.fast_path import KILL_REPLY, RESUME_REPLY
 from resonant.runners.reminder import ReminderRunner
-from resonant.store.db import iso, kv_set, utcnow
+from resonant.store.db import iso, kv_get, kv_set, utcnow
+from resonant.store.tasks import get_event
 from resonant.tools.ops import GIT
-from resonant.tools.when import format_due
+from resonant.tools.when import clock_time, format_due
 from resonant_sdk import Event
 
 OWNER_PHONE = "+15551234567"
@@ -201,6 +206,7 @@ def build_daemon(
     ops_runner: FakeOpsRunner,
     *,
     dry_run: bool = True,
+    osa: RecordingOsaRunner | None = None,
     **overrides: Any,
 ) -> Running:
     """A daemon with iMessage on, fakes for osascript, the model and ops subprocesses."""
@@ -214,7 +220,7 @@ def build_daemon(
         },
         **overrides,
     )
-    osa = RecordingOsaRunner()
+    osa = osa or RecordingOsaRunner()
     daemon = Daemon(settings, model=ScriptedModel(), osa_runner=osa, ops_runner=ops_runner)
     kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
     components = daemon.state.components
@@ -232,9 +238,12 @@ async def start_daemon(
     *,
     dry_run: bool = True,
     ops_runner: FakeOpsRunner | None = None,
+    osa: RecordingOsaRunner | None = None,
     **overrides: Any,
 ) -> AsyncGenerator[Running]:
-    r = build_daemon(home, chat, ops_runner or FakeOpsRunner(), dry_run=dry_run, **overrides)
+    r = build_daemon(
+        home, chat, ops_runner or FakeOpsRunner(), dry_run=dry_run, osa=osa, **overrides
+    )
     if before_run is not None:
         before_run(r)
     run = asyncio.create_task(r.daemon.run())
@@ -631,7 +640,7 @@ async def test_e9_update_refuses_a_dirty_tree(resonant_home: Path, chat: FakeCha
         resonant_home, chat, ops_runner=ops, dry_run=False, ops={"uv_path": "/opt/uv/bin/uv"}
     ) as r:
         assert await r.say("/update") == [
-            "Failed: update resonant (working tree has changes; not updating)"
+            "Failed: update Resonant (working tree has changes; not updating)"
         ]
         assert not any(argv[:2] == (GIT, "pull") for argv in r.ops.argvs())
         assert r.ops.spawned == []
@@ -691,3 +700,264 @@ async def test_e15_dry_run_through_the_router(running: Running) -> None:
     assert await r.say("/note x") == ['Saved note 1: "x"']
     (reply,) = await r.say("/remind in 1 h y")
     assert reply.startswith("⏰ Reminder 1 set for ") and reply.endswith('"y"')
+
+
+# --- P2-17: kill switch, durability, restart, replay and orphans --------------------------
+
+
+class FlakyOsaRunner(RecordingOsaRunner):
+    """Fails the first send of each text in ``fail_once`` (osascript exits 1)."""
+
+    def __init__(self, *fail_once: str) -> None:
+        super().__init__()
+        self.fail_once = set(fail_once)
+        self.failed: list[str] = []
+
+    async def __call__(self, argv: Sequence[str], timeout_s: float) -> OsaResult:
+        if argv[-1] in self.fail_once:
+            self.fail_once.discard(argv[-1])
+            self.failed.append(argv[-1])
+            return OsaResult(1, "", "Messages got an error")
+        return await super().__call__(argv, timeout_s)
+
+
+def approvals(r: Running) -> list[sqlite3.Row]:
+    return r.rows("SELECT * FROM approvals ORDER BY created_at")
+
+
+def resolutions(r: Running) -> list[dict[str, Any]]:
+    return [a for a in r.audits("approval.resolve") if a["detail"]["ok"]]
+
+
+async def test_e5_kill_switch_asks_for_everything_above_l0(live_ops: Running) -> None:
+    r = live_ops
+    assert await r.say("/kill") == [KILL_REPLY]
+
+    # Explicit L3 asks with a plain yes; /kill while it is pending is a command, not a reply.
+    (prompt,) = await r.say("/note x")
+    code = _code(prompt)
+    assert prompt == f'[{code}] add note text="x"? Reply yes / no'
+    await r.prompt_recorded()
+    assert await r.say("/kill") == [KILL_REPLY]
+    assert [a["status"] for a in approvals(r)] == ["pending"]
+    assert await r.say("yes") == ['Saved note 1: "x"']
+
+    # Explicit L2 (an op) asks too, and nothing runs until it is approved.
+    (prompt,) = await r.say("/restart ollama")
+    assert prompt == f"[{_code(prompt)}] restart Ollama? Reply yes / no"
+    await r.prompt_recorded()
+    assert not any("kickstart" in argv for argv in r.ops.argvs())
+    assert await r.say("no") == ["Not done."]
+
+    # L1 still needs its code.
+    (prompt,) = await r.say("/notes clear")
+    code = _code(prompt)
+    assert prompt.endswith(f"This can't be undone. Reply yes {code} / no")
+    await r.prompt_recorded()
+    assert await r.say("yes") == [f"Reply yes {code} to confirm."]
+    assert await r.say("no") == ["Not done."]
+
+    audits = [(a["tool"], a["decision"]) for a in r.audits("gate.evaluate")]
+    assert ("add_note", "NeedsApproval") in audits
+    assert ("restart_ollama", "NeedsApproval") in audits
+
+    # /resume: explicit commands run directly again.
+    assert await r.say("/resume") == [RESUME_REPLY]
+    assert await r.say("/note y") == ['Saved note 2: "y"']
+    assert await r.say("/restart ollama") == ["Restarted Ollama."]
+    assert any("kickstart" in argv for argv in r.ops.argvs())
+
+
+async def test_e7_reminder_survives_a_restart_before_it_is_due(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    async with start_daemon(resonant_home, chat) as r:
+        due = utcnow() + timedelta(seconds=4)
+        await r.run_script({"tool": "add_reminder", "args": {"at": due.isoformat(), "text": "x"}})
+    assert utcnow() < due  # stopped before it was due
+
+    async with start_daemon(resonant_home, chat) as r:
+        sent = await r.osa.wait_for(1, 10)
+        assert sent.text == "⏰ x" and utcnow() >= due
+        await asyncio.sleep(0.3)
+        assert len(r.osa.sent) == 1
+
+    async with start_daemon(resonant_home, chat) as r:  # and never again
+        await asyncio.sleep(0.3)
+        assert r.osa.sent == []
+
+
+async def test_e7_reminder_missed_while_down_fires_once_marked_late(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    async with start_daemon(resonant_home, chat) as r:
+        (set_reply,) = await r.say("/remind in 20 min stretch")
+        assert set_reply.startswith("⏰ Reminder 1 set for ")
+        tz = r.daemon.settings.timezone
+
+    # The daemon was down from before the due time until 10 min after it: as far as the
+    # store can tell, that is the same as the due time being 10 min ago.
+    due = utcnow() - timedelta(minutes=10)
+    conn = sqlite3.connect(resonant_home / "resonant.db")
+    with conn:
+        conn.execute(
+            "UPDATE tasks SET wake_at = ?, checkpoint = json_set(checkpoint, '$.at', ?) "
+            "WHERE kind = 'reminder'",
+            (iso(due), iso(due)),
+        )
+    conn.close()
+
+    async with start_daemon(resonant_home, chat) as r:
+        sent = await r.osa.wait_for(1, 10)
+        assert sent.text == f"⏰ stretch (late, due {clock_time(due.astimezone(ZoneInfo(tz)))})"
+        await asyncio.sleep(0.3)
+        assert len(r.osa.sent) == 1
+        (task,) = r.rows("SELECT status FROM tasks WHERE kind = 'reminder'")
+        assert task["status"] == "done"
+
+
+async def test_e12_restart_mid_approval_runs_exactly_once(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    async with start_daemon(resonant_home, chat, dry_run=False) as r:
+        r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
+        prompt = await r.osa.wait_for(1, 10)
+        assert prompt.text.endswith("restart Resonant? Reply yes / no")
+        await wait_until(lambda: chat_task(r, "ops")["status"] == "waiting", 10)
+        await r.prompt_recorded()
+        assert r.ops.spawned == []
+    # SIGTERM (a graceful stop); then a new stack on the same store and chat.db.
+
+    async with start_daemon(resonant_home, chat, dry_run=False) as r:
+        assert [a["status"] for a in approvals(r)] == ["pending"]
+        await asyncio.sleep(0.2)
+        assert r.osa.sent == []  # no re-prompt and no "back up" on a plain start
+        reply(r, "yes")
+        done = await r.osa.wait_for(1, 10)
+        assert done.text == "Restarting Resonant…"
+        await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+        await asyncio.sleep(0.3)
+        assert len(r.ops.spawned) == 1 and len(r.osa.sent) == 1
+        (ex,) = r.rows("SELECT status FROM executions")
+        assert ex["status"] == "succeeded"
+        assert [a["status"] for a in approvals(r)] == ["approved"]
+        assert approvals(r)[0]["used_at"] is not None
+
+
+async def test_e13_the_same_row_routed_twice_resolves_once(live: Running) -> None:
+    r = live
+    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
+    await r.osa.wait_for(1, 10)
+    await r.prompt_recorded()
+    rowid = r.chat.add_message(
+        handle=OWNER_PHONE, text="yes", at=utcnow() + timedelta(seconds=1), guid="yes-guid"
+    )
+    await r.osa.wait_for(2, 10)
+    await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+    assert len(resolutions(r)) == 1
+
+    # A router retry of the same event: the original result, no write and no reply.
+    (row,) = r.rows("SELECT id FROM events WHERE dedupe_key = 'imessage:yes-guid'")
+    event = get_event(r.conn, row["id"])
+    assert event is not None and r.daemon.imessage is not None
+    assert await r.daemon.imessage.router.route(event) is None
+
+    # The reader re-reading the row (cursor rewound): the event is a duplicate.
+    kv_set(r.conn, "imessage.cursor", rowid - 1)
+    await wait_until(lambda: kv_get(r.conn, "imessage.cursor") == rowid, 10)
+    await asyncio.sleep(0.3)
+    assert len(r.osa.sent) == 2
+    assert len(resolutions(r)) == 1
+    assert len(r.ops.spawned) == 1
+    assert len(r.rows("SELECT status FROM executions")) == 1
+
+
+async def test_e13_two_yes_in_one_poll_resolve_and_run_once(live: Running) -> None:
+    r = live
+    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
+    await r.osa.wait_for(1, 10)
+    await r.prompt_recorded()
+    at = utcnow() + timedelta(seconds=1)
+    r.chat.conn.execute("BEGIN")
+    r.chat.add_message(handle=OWNER_PHONE, text="yes", at=at)
+    r.chat.add_message(handle=OWNER_PHONE, text="yes", at=at)
+    r.chat.conn.execute("COMMIT")
+
+    await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+    await asyncio.sleep(0.3)
+    texts = [m.text for m in r.osa.sent[1:]]
+    assert texts.count("Restarting Resonant…") == 1
+    assert set(texts) <= {"Restarting Resonant…", NOTHING_WAITING}
+    assert len(resolutions(r)) == 1
+    assert len(r.ops.spawned) == 1
+    assert len(r.rows("SELECT status FROM executions")) == 1
+
+
+async def test_e13_a_reply_from_before_the_prompt_never_binds(live: Running) -> None:
+    r = live
+    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
+    await r.osa.wait_for(1, 10)
+    await r.prompt_recorded()
+    # A late-delivered "yes" timestamped before the prompt went out.
+    r.chat.add_message(handle=OWNER_PHONE, text="yes", at=utcnow() - timedelta(minutes=1))
+    refused = await r.osa.wait_for(2, 10)
+    assert refused.text == "That reply came before the question. Reply again to answer it."
+    assert resolutions(r) == []
+    assert [a["status"] for a in approvals(r)] == ["pending"]
+    assert r.ops.spawned == []
+
+
+async def test_e14_cancelling_a_task_orphans_its_approval(running: Running) -> None:
+    r = running
+    await r.say("/note a")
+    (prompt,) = await r.say("/notes clear")
+    code = _code(prompt)
+    await r.prompt_recorded()
+    (task,) = r.rows("SELECT id FROM tasks WHERE status = 'waiting'")
+    assert r.daemon.loop.cancel(task["id"])
+
+    assert [a["status"] for a in approvals(r)] == ["expired"]
+    assert len(r.audits("approval.orphaned")) == 1
+    assert await r.say(f"yes {code}") == [NOTHING_WAITING]
+    assert await r.say("/notes") == ["Notes (1):\n1. a"]
+    assert resolutions(r) == []
+
+
+async def test_e14_a_used_approval_never_allows_again(live: Running) -> None:
+    r = live
+    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
+    await r.osa.wait_for(1, 10)
+    await r.prompt_recorded()
+    reply(r, "yes")
+    await r.osa.wait_for(2, 10)
+    task = chat_task(r, "ops")
+    await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+    (approval,) = approvals(r)
+    assert approval["status"] == "approved" and approval["used_at"] is not None
+
+    spec = r.components.registry.get(None, "restart_resonant")
+    assert spec is not None
+    intent = Intent.for_tool(spec, task_id=task["id"], principal="justin", args={})
+    assert not isinstance(r.components.gate.evaluate(intent), Allow)
+    assert len(r.ops.spawned) == 1
+
+
+async def test_e14_a_lost_reply_is_resent_from_executions(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    """The reply send fails after the side effect ran: the retry replays the recorded result
+    (no second gate call, no second note) and sends the reply."""
+    osa = FlakyOsaRunner('Saved note 1: "x"')
+    async with start_daemon(resonant_home, chat, osa=osa) as r:
+        r.chat.add_message(handle=OWNER_PHONE, text="/note x")
+        await wait_until(lambda: bool(osa.failed), 10)
+        # Skip the retry backoff rather than wait it out.
+        await wait_until(lambda: bool(r.rows("SELECT id FROM tasks WHERE status = 'queued'")), 10)
+        r.conn.execute("UPDATE tasks SET wake_at = NULL WHERE status = 'queued'")
+        await r.run_script()  # creating a task wakes the loop
+        sent = await osa.wait_for(1, 10)
+        assert sent.text == 'Saved note 1: "x"'
+        assert len(r.audits("gate.evaluate")) == 1
+        (ex,) = r.rows("SELECT status FROM executions")
+        assert ex["status"] == "succeeded"
+        assert await r.say("/notes") == ["Notes (1):\n1. x"]

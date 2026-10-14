@@ -1,6 +1,6 @@
 # Phase 2 plan (v3): risk × who chose it, approvals, and real tools
 
-Status: v3, after the owner's feedback. Scope: the real gate, text-reply approvals and the kill switch from [`architecture.md`](architecture.md#components), plus the first real tools: notes, reminders, Mini ops, projects and command discovery. Veto windows and Keychain injection move to Phase 3 ([§7](#7-deferred-and-out-of-scope)). Deviations from the frozen [`interfaces.md`](interfaces.md) are listed under [Contract changes](#contract-changes-flagged).
+Status: **implemented** (P2-1 to P2-17, PRs #17 onward; go-live per [`go-live.md`](go-live.md) step 11). v3, after the owner's feedback. Scope: the real gate, text-reply approvals and the kill switch from [`architecture.md`](architecture.md#components), plus the first real tools: notes, reminders, Mini ops, projects and command discovery. Veto windows and Keychain injection move to Phase 3 ([§7](#7-deferred-and-out-of-scope)). Deviations from the frozen [`interfaces.md`](interfaces.md) are listed under [Contract changes](#contract-changes-flagged).
 
 Each ticket is one PR (~200–600 lines including tests), run through robot-surf: worktree, tests, PR, CI, code-review agent, merge to `main`. Each ticket updates **its own** `interfaces.md` section.
 
@@ -207,7 +207,7 @@ All handlers return JSON, raise `ToolFailed` for bad args or definite failures, 
 - **No double restart.** The tool's `executions` row is `succeeded`, so a resumed task replays rather than restarting again.
 - **`update_resonant`,** in the repo path (`ops.repo_path`, default: the checkout that contains the running package):
   1. Refuse unless `git status --porcelain` is empty and the branch is `main`.
-  2. `git fetch` then `git pull --ff-only` (60 s).
+  2. `git pull --ff-only` (60 s; the pull fetches).
   3. If HEAD didn't change: `Already up to date`.
   4. `uv sync --frozen` (`ops.uv_path`, resolved by bootstrap; 240 s).
   5. Restart as above, and reply `a1b2c3d → e4f5a6b, restarting`.
@@ -418,9 +418,10 @@ Tool tickets touch `tools/builtin.py` only to add their module to `BUILTIN_MODUL
 | `dry_run` | yes | `true` passes. `false` passes only when the store is at schema 3 (Phase 2 gate installed); otherwise FAIL (`dry_run off on a pre-Phase-2 install`). |
 | store schema 3 | yes | `open_existing` succeeds |
 | kill-switch rows | yes | `autonomy` ∈ {on, off}, `paused` boolean. `autonomy off` is also an advisory FAIL. |
-| gate and ops config | yes | `approval_ttl_s` in bounds; `ops.repo_path` is a git checkout on `main`; `ops.uv_path` is executable |
-| timezone | yes | `settings.timezone` loads in `zoneinfo` |
-| repo clean | advisory | `git status --porcelain` is empty (otherwise `/update` will refuse) |
+| gate config, timezone | yes | `approval_ttl_s` in bounds and `settings.timezone` loads in `zoneinfo` (config validation) |
+| `ops.uv_path` | yes once `dry_run` is off, else advisory | an executable file |
+| repo on `main` and clean | advisory | `ops.repo_path` is a checkout on `main` and `git status --porcelain` is empty (otherwise `/update` refuses) |
+| keep-awake | advisory | `pmset -g assertions` shows caffeinate holding `PreventSystemSleep` / `PreventUserIdleSystemSleep`, or `pmset -g` shows `sleep 0` |
 | stale approvals | advisory | No pending rows past `expires_at` + 1 h |
 
 ---

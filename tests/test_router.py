@@ -1010,7 +1010,11 @@ async def test_remind_parses_in_the_owner_zone_with_the_router_clock(
     assert task is not None and task.kind == "command"
     assert task.checkpoint["direct_call"] == {
         "tool": "add_reminder",
-        "args": {"at": "2026-10-13T15:20:00-07:00", "text": "stretch"},
+        "args": {
+            "at": "2026-10-13T15:20:00-07:00",
+            "text": "stretch",
+            "routed_at": "2026-10-13T22:00:00+00:00",
+        },
     }
     assert task.checkpoint["title"] == "/remind"
 

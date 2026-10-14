@@ -48,7 +48,7 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 | `name` | slug | Unique extension id. It namespaces tools, jobs, events and secrets. |
 | `version` | `1` | Schema version. |
 | `uses` | slug, optional | A first-party extension this one configures. It allows exactly one extra block with that name. |
-| `approvers` | list of principals | Who may approve this extension's L1/L2 actions. Each must hold the `approve` grant for this extension in `principals.yaml`. |
+| `approvers` | list of principals | Who may approve this extension's actions when the gate asks (L1, inferred L2, or anything above L0 under the kill switch). Each must hold the `approve` grant for this extension in `principals.yaml`. |
 | `jobs` | list | Scheduled commands, described in §6. |
 | `tools` | map | Command-backed tools, described in §4. |
 | `mcp` | object, optional | An MCP server and the typed list of tools it may expose, described in §4. |
@@ -66,12 +66,16 @@ Every tool declares an **effect**, which says what it can change, and optionally
 | `write` | L1 | You may set L0–L3. |
 | `pay` | L1 | **Always L1, permanently.** No override, ever. Approval requires an exact `yes <code>` reply. |
 
-| Level | Behavior |
-|---|---|
-| L0 | Act silently. Use it for reads and triage. |
-| L1 | Draft first, then an approver must approve by text reply. |
-| L2 | Act after a veto window ("doing X in N min unless you stop") unless someone stops it. |
-| L3 | Act, then report. Use it for reversible actions with a small blast radius. |
+The gate weighs the level (the risk) against **who chose the action**. A slash command the owner typed is `explicit`; anything the model or a job chose is `inferred`. Extension tools and jobs are always `inferred` (Phase 3).
+
+| Level | Explicit | Inferred (model, jobs) |
+|---|---|---|
+| L0 | Act silently. Use it for reads and triage. | same |
+| L3 | Act, then report. Use it for reversible actions with a small blast radius. | same |
+| L2 | Act, then report. | Ask first: `[A7] …? Reply yes / no`, and a plain `yes` approves. |
+| L1 | Always ask: `[D7] …? This can't be undone. Reply yes D7 / no`. Only `yes <code>` approves. | same |
+
+While the kill switch is on (`/kill`), everything above L0 asks first, and L1 still needs the code. There are no veto windows ("doing X in N min unless you stop") in Phase 2; they are planned for unattended jobs in Phase 3.
 
 Pick the lowest level you'd be comfortable with if the model misunderstood a request. Mark irreversible, user-visible actions (send, pay, delete) with `commit: true`.
 
@@ -155,7 +159,7 @@ principals:
 ```
 
 - `request` allows asking Resonant to use the extension's tools or start its tasks.
-- `approve` allows approving the extension's L1/L2 actions. The principal must also be listed in `approvers:`.
+- `approve` allows approving the extension's actions when the gate asks. The principal must also be listed in `approvers:`.
 - The owner can always do everything. Identity grants permissions; message content never does.
 
 ## 9. Registering an extension
