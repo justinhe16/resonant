@@ -36,7 +36,19 @@ FETCH_RUNNERS = frozenset(
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "env"})
 RESERVED_WORDS = frozenset({"ext"})  # builtin commands that land in a later ticket
 
-DEPENDENCY_FILES = frozenset({"uv.lock", "package.json", "setup.py", "setup.cfg", "Pipfile"})
+DEPENDENCY_FILES = frozenset(
+    {
+        "uv.lock",
+        "poetry.lock",
+        "pdm.lock",
+        "Pipfile",
+        "Pipfile.lock",
+        "package.json",
+        "setup.py",
+        "setup.cfg",
+        "environment.yml",
+    }
+)
 _SKIP_DIRS = frozenset({".git", "__pycache__"})
 
 
@@ -174,6 +186,7 @@ def _pyproject_deps(path: Path) -> str | None:
         "project.optional-dependencies",
         "dependency-groups",
         "tool.poetry.dependencies",
+        "project.dynamic",
     )
     found = [k for k in keys if _dig(data, *k.split("."))]
     return f"it declares {', '.join(found)}" if found else None

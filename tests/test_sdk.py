@@ -82,7 +82,9 @@ def test_cron_min_interval(schedule: str, seconds: int) -> None:
     assert cron_min_interval_s(schedule) == seconds
 
 
-@pytest.mark.parametrize("schedule", ["* * * * *", "*/4 * * * *", "0,2 * * * *", "61 * * * *"])
+@pytest.mark.parametrize(
+    "schedule", ["* * * * *", "*/4 * * * *", "0,2 * * * *", "61 * * * *", "5/ * * * *"]
+)
 def test_schedules_faster_than_5_minutes_or_invalid_refused(schedule: str) -> None:
     with pytest.raises(ValidationError, match=r"5 minutes|range|cron"):
         manifest(jobs=[job(schedule=schedule, effect="read")])
@@ -143,6 +145,8 @@ def test_description_examples_and_names() -> None:
         {"examples": ["e" * 81]},
         {"examples": ["two\nlines"]},
         {"examples": ["  "]},
+        {"examples": ["tab\there"]},
+        {"description": "two\nlines"},
         {"name": "core"},
     ):
         with pytest.raises(ValidationError):
@@ -256,6 +260,8 @@ def test_symlink_out_of_root_refused(tmp_path: Path) -> None:
         ("requirements.txt", "requests\n"),
         ("requirements-dev.txt", "pytest\n"),
         ("uv.lock", ""),
+        ("poetry.lock", ""),
+        ("pyproject.toml", '[project]\nname = "x"\ndynamic = ["dependencies"]\n'),
         ("package.json", "{}"),
         ("setup.py", ""),
     ],

@@ -123,7 +123,7 @@ secrets:  [<name>, ...]          # ^[a-z][a-z0-9_]{0,31}$; every tool and job se
 - `resonant.extensions.checks`:
   - `approver_errors(manifest, principals)` validates the approvers against this installation.
   - `name_errors(manifest)` refuses a name equal to a builtin command word (`/help`, `/ext`, …).
-  - `dir_errors(root, manifest)` checks the extension directory: **stdlib only** (no `requirements*.txt`, `uv.lock`, `package.json`, `setup.py`, `setup.cfg`, `Pipfile`, or `pyproject.toml` declaring dependencies, at any depth), **no symlink resolving outside the root**, and the **argv[0] allowlist** for every tool, job, health and MCP command.
+  - `dir_errors(root, manifest)` checks the extension directory: **stdlib only** (no `requirements*.txt`, lock files, `package.json`, `setup.py`, `setup.cfg`, `Pipfile*`, `environment.yml`, or `pyproject.toml` declaring or dynamic dependencies, at any depth), **no symlink resolving outside the root**, and the **argv[0] allowlist** for every tool, job, health and MCP command.
   - `argv0_error(root, run)`: argv[0] must be a file inside the root (`./cli.py`), `python3 <.py file inside the root>`, `gh` or `git`. Fetch-runners (`npx`, `bunx`, `pnpx`, `pipx`, `uvx`, `uv`, `docker`, `podman`, `curl`, `wget`), shells (`sh`, `bash`, `zsh`, `dash`, `fish`, `env`), placeholders and anything else are refused.
   - `resolve_argv0(root, run, path=EXT_PATH)` returns the absolute path to pin: the file, `sys.executable` for `python3`, or `gh`/`git` looked up on `/opt/homebrew/bin:/usr/bin:/bin`.
 - **trade-jev boundary:** order execution never goes through the loop or gate. Core only sees trade-jev's jobs, read tools, events, and kill switch. Its own process owns execution and its own risk controls.

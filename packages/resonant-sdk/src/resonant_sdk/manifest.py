@@ -72,7 +72,7 @@ def _cron_values(field: str, lo: int, hi: int) -> set[int]:
     values: set[int] = set()
     for item in field.split(","):
         base, _, step_s = item.partition("/")
-        if step_s and not step_s.isdigit():
+        if "/" in item and not step_s.isdigit():
             raise ValueError(f"bad cron step in {field!r}")
         step = int(step_s) if step_s else 1
         if base == "*":
@@ -265,10 +265,17 @@ class Manifest(BaseModel):
             raise ValueError(f"extension name {v!r} is reserved")
         return v
 
+    @field_validator("description")
+    @classmethod
+    def _description(cls, v: str) -> str:
+        if not v.isprintable():
+            raise ValueError("description must be one line with no control characters")
+        return v
+
     @field_validator("examples")
     @classmethod
     def _examples(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        if bad := [e for e in v if not e.strip() or len(e) > EXAMPLE_MAX or "\n" in e]:
+        if bad := [e for e in v if not e.strip() or len(e) > EXAMPLE_MAX or not e.isprintable()]:
             raise ValueError(f"examples must be single lines of 1-{EXAMPLE_MAX} chars: {bad}")
         return v
 

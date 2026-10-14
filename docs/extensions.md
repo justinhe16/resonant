@@ -33,7 +33,7 @@ See [`extensions/example`](../extensions/example) for a complete, working refere
 
 ## 2. Stdlib only, and the SDK
 
-**Extensions are stdlib only.** `ext validate` refuses a `pyproject.toml` that declares dependencies, `requirements*.txt`, `uv.lock`, `package.json`, `setup.py`, `setup.cfg` and `Pipfile`, anywhere in the tree. There are no venvs and no install step, so no build-time code ever runs.
+**Extensions are stdlib only.** `ext add` (and `ext validate`, once Phase 3 wires the directory checks in) refuses a `pyproject.toml` that declares dependencies, `requirements*.txt`, lock files (`uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile*`), `package.json`, `setup.py`, `setup.cfg` and `environment.yml`, anywhere in the tree. There are no venvs and no install step, so no build-time code ever runs.
 
 Use `resonant-sdk` in your own CI or dev environment only, never as a runtime dependency (install it there with `pip install "resonant-sdk @ git+https://github.com/justinhe16/resonant#subdirectory=packages/resonant-sdk"`). It gives you `Manifest` and `load_manifest` for validating, `ToolSpec`, `Effect`, `Level` and `Event`.
 
