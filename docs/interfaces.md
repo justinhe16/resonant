@@ -655,7 +655,7 @@ Scheduler.from_components(settings, conn, components, *, started_at, channel=Non
 ScheduledJob(ext, job_id, spec, schedule, call, catchup=None, core=False)  .label  .inline
 CoreJob(id, schedule, run: JobCall, catchup=None, timeout_s=300)   # cron in settings.timezone
 CoreDeps(settings, conn, components, channel, owner)
-CORE_JOBS: tuple[Callable[[CoreDeps], CoreJob | None], ...] = ()  # P3-13 adds the briefing
+CORE_JOBS: tuple[Callable[[CoreDeps], CoreJob | None], ...] = (briefing_job,)
 JobCall = (args: dict, ctx: CallContext) -> Awaitable[dict]        # ExtensionHandler fits
 persist_events(conn, ext, events, *, trace_id=None) -> int
 read_paused(conn) -> bool                     # unknown counts as paused
@@ -672,7 +672,29 @@ resonant_sdk.emit.emit(type, text, dedupe_key, data=None) -> bool   # stdlib-onl
 - **Events** (`persist_events`): each `{type, text, dedupe_key, data?}` becomes `Event(source="ext:<ext>", type="ext.<ext>.<type>", payload={text, data}, principal=None, task_id=None, dedupe_key="ext:<ext>:<key>")` via `insert_event` (UNIQUE key: repeats are dropped), in the transaction that records the run. They are unrouted: the loop's router hook sees them. Until P3-12's notifier, `Router.route` consumes them without sending.
 - **JobRunner** step: `checkpoint.finished` → only (re)send reports. Else the pinned call `job_<id> {due_at}` (`origin="scheduled"`, `idempotency_key(task_id, 0, 0, hash)`): `executor.recorded` first (succeeded replays, started is ambiguous, never re-run); paused → `job.skipped_paused`; `gate.evaluate`: `Allow` → `executor.execute(step_no=0, call_index=0)`; `NeedsApproval` → `prompt_approvers` then `Wait("approval", wake_at=expires_at)` (unreachable approvers skipped, none reachable fails, a transient error retries); `DryRun`/`Deny` don't run. Then one transaction: `record_run` (`ok`, `failed`, `ambiguous`), `persist_events`, the audit row (`job.run`, `job.failed`, `job.ambiguous`, `job.killed`, `job.denied`, `job.dry_run`, `job.skipped_paused`) and `checkpoint.finished`. **Limit:** a crash between the executor's commit and that transaction replays the result but loses that run's events.
 - **Reports** go to `recipients(ext)` (the gate's `approvers`: owner first, then manifest approvers holding the grant); a refused send is skipped, any other channel error is a retryable `Fail`. Code-built and sanitized: `example/cleanup: done` (`: <summary>` from the result, ≤ 120 chars; dedupe `jobreport:<task>:<recipient>`); `example/cleanup failed: <reason>` or `example/cleanup: not done (approval expired)` at most once per job per local day (dedupe `jobfail:<ext>/<id>:<date>:<recipient>`). Dry runs, paused skips and kill-switch kills aren't reported.
-- **Seams.** P3-12: dispatch `ext:*` events in the router hook (`wiring`) and read `fail_streak` for health; `job.killed`/`job.failed` audit rows. P3-13: append a factory to `CORE_JOBS` (gets the channel and owner; returns None when `briefing.enabled` is false). P3-14: `/ext run <ext>/<job>` is a `direct_call` of the job spec (`job_<id> {due_at}`), gated as explicit; `ext_jobs` holds last run and outcome for `/ext list`.
+- **Seams.** P3-12: dispatch `ext:*` events in the router hook (`wiring`) and read `fail_streak` for health; `job.killed`/`job.failed` audit rows. P3-14: `/ext run <ext>/<job>` is a `direct_call` of the job spec (`job_<id> {due_at}`), gated as explicit; `ext_jobs` holds last run and outcome for `/ext list`.
+
+## Daily briefing: `resonant.extensions.briefing`
+
+```python
+briefing_job(deps: CoreDeps, *, clock=utcnow) -> CoreJob | None   # the CORE_JOBS entry
+await send_briefing(conn, channel, owner, *, tz, now, due=None, github=False)
+    -> {sent, date, sections, chars} | {sent: False, date, skipped: "paused"}
+gather(conn, *, owner, now, day, tz: ZoneInfo, github) -> Briefing   # the data
+render(b: Briefing) -> str   sections(b) -> list[str]                 # pure
+github_line(conn, day, tz) -> str | None
+dedupe_key(day) -> "briefing:<YYYY-MM-DD>"
+```
+
+- **Job** `core/briefing`: cron `<m> <h> * * *` from `briefing.at` in `settings.timezone`, `catchup=3h`, `timeout_s=60`. None (not scheduled) when `briefing.enabled` is false, iMessage is off (`channel` None) or there is no owner. Runs inline, without the gate, as `ext="core"`; paused ticks skip it like any job, and `send_briefing` itself sends nothing while paused (unknown counts as paused).
+- **Content.** Code-built, no model, one line per non-empty section, at most 600 chars; `Nothing on today.` when every section is empty:
+  - `⏰ 2 reminders: 9:30am stretch, 3:00pm call mom`: `list_reminders` for the owner, those due on the local date, local clock times, 3 shown then `+N more`, each text ≤ 30 chars.
+  - `▶ 1 running, 2 waiting (approval), 1 queued`: counts from the `projects` query (`all`), reminders left out. States and wait reasons only; titles and checkpoints never reach the text.
+  - `✋ 2 approvals pending (A7, C3)`: `approvals.pending_for(owner, now)`, up to 5 codes.
+  - `⚠ model, imessage degraded`: `health_snapshot` checks in `degraded`.
+  - `github: …`: `payload.text` of the latest `ext.github.digest` event (`source="ext:github"`) whose `occurred_at` falls on the local date, through `clean_external` (`✗` becomes `x`), ≤ 200 chars. Only when `github` is loaded in the host.
+- **Once a day.** The local date of `due_at` (else now) names the day; the send uses `dedupe_key=briefing:<date>`, so a restart, a catch-up, or an on-demand run the same day sends nothing more. The result holds section names and length, never the text.
+- **On demand** (P3-14, `/ext run core/briefing`): call the scheduler's core job (`ScheduledJob` with `ext="core"`, `job_id="briefing"`) `.call({}, ctx)` (or `{"due_at": iso}`), or `send_briefing` directly.
 
 ## Components: `resonant.components`
 
