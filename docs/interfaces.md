@@ -359,6 +359,28 @@ class ToolFailed(Exception)   # raise from a handler: "definitely did not take e
 - **Audit:** `executor.start`, `executor.result`, `executor.ambiguous`, `executor.replayed`, `executor.refused`, and `executor.ambiguous_resolved` are all written.
 - Keychain secret injection (the executor as the only reader, env vars for the tool process, redaction in audit rows) is deferred to Phase 3, with the first tool that needs a secret.
 
+## Secrets: `resonant.secrets`, `resonant.redact`
+
+```python
+SecretStore(runner: SecurityRunner | None = None, *, timeout_s=5.0)   # no caching
+    async .get(ref) -> str            # SecretMissing | SecretUnavailable
+    async .exists(ref) -> bool        # no value read
+    async .set(ref, value) -> None    # value on stdin; InvalidSecretValue
+    async .delete(ref) -> bool        # False when there was no item
+    async .env_for(ext, names) -> {RESONANT_SECRET_<NAME>: value}   # all or raise
+validate_ref(ref) / secret_ref(ext, name) / split_ref(ref) / env_name(name) / values_of(env)
+class SecretError(Exception): ref, reason    # SecretMissing, SecretUnavailable
+Redactor(values).text(str) -> str ; .deep(obj) -> obj      # REDACTED = "[redacted]"
+resonant.secrets.FakeKeychain                # in-memory SecurityRunner for tests
+```
+
+- **Items.** Login keychain, generic password, service `resonant`, account = the ref `<ext>/<name>`. `<ext>` follows the manifest name rule (`[a-z][a-z0-9-]{0,47}`), `<name>` is `[a-z][a-z0-9_]{0,31}`. Both start with a letter, so `-a <ref>` can never be read as an option. Env names are `RESONANT_SECRET_<UPPER(name)>`.
+- **`security` calls.** `/usr/bin/security find-generic-password -s resonant -a <ref> [-w]`, `add-generic-password -U -s resonant -a <ref> -w`, `delete-generic-password -s resonant -a <ref>`. Always an argv (no shell), 5 s timeout (the process group is killed), a new session (no controlling terminal), a minimal env (`PATH`, `LANG`, `HOME`, `USER`, `LOGNAME`), stdin `/dev/null` except for `set`, stderr discarded unread.
+- **Values never in argv.** Reads take the value from stdout (one trailing newline stripped). `set` writes it twice on stdin for the trailing `-w` prompt. `set` takes 8–128 printable ASCII characters.
+- **Exit codes.** 0 is ok. 44 (`errSecItemNotFound`) is `SecretMissing` (`exists` and `delete` return False). Anything else, a timeout or a failure to start is `SecretUnavailable`, with a reason such as `keychain locked or no user interaction allowed (exit 36)`. Messages carry the ref and code only, never a value or `security`'s output, and nothing is logged.
+- **Redaction.** `Redactor` matches each value raw, URL-encoded (`%XX` either case, `+` for space), JSON-string-escaped (incl. `\/` and `\uXXXX`), or any per-character mix of those; and base64 (standard or URL-safe) at the three byte alignments, matching only the characters that depend on the value alone, so a value inside a larger blob is caught. Overlapping matches merge into one `[redacted]`. `deep` redacts every string in dicts (keys too), lists and tuples and returns a copy. Other transforms (hex, double escaping) are not matched (phase 3 plan §5 residual).
+- Injection (`Executor(…, secrets=)`, `CallContext`) and the two redaction passes are P3-6.
+
 ## Built-in tools: `resonant.tools.builtin`
 
 Global tools (`extension=None`, `source="builtin"`): L0 reads, plus the notes writes (`add_note` and `delete_note` L3, `clear_notes` L1), the reminder writes (`add_reminder` and `cancel_reminder` L3) and the ops writes (`restart_ollama` L3, `restart_resonant` and `update_resonant` L2). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals, clock=utcnow, ops_runner=None) -> {(None, name): handler}` registers the specs and returns the handlers.
@@ -722,6 +744,7 @@ Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | No
 - `resonant selftest imessage [--timeout S] [--json]`: 0 when the self-test passes, 1 otherwise. It sends a real iMessage to `self_handle`, stores kv `imessage.selftest`, and is safe to run while the daemon is up. macOS grants Automation per responsible app, so running it from a terminal proves the terminal's grant, not the daemon's.
 - `resonant model probe` and `resonant model bench`: 1 when the probe fails (model missing, context too small, or thinking not off). `bench` also exits 1 when every call of a kind failed. `probe` stores its result in kv `model.probe` if the store exists, and never creates it.
 - `resonant bench e2e [--n N] [--model fake|real] [--json]`: 0 when every prompt got a reply and each path's p50 meets its target (`fast` ≤ 1000 ms, `llm` ≤ 3000 ms), 1 otherwise, 2 for an unknown `--model`. It runs the production reader, loop, router, runner and channel in a throwaway home with a `FakeChatDB` and a `RecordingOsaRunner`, timing each prompt from the chat.db row insert to the osascript call (N per path, after one untimed warm-up per path). `--model fake` (default, CI) uses `ScriptedModel`; `--model real` uses the configured Ollama model. It never texts anyone and never touches `~/.resonant/resonant.db`.
+- `resonant secret set <ref>`: reads the value from a hidden prompt (asked twice) on a terminal, or one line of stdin otherwise, never from argv; stores it, reads it back and compares (a mismatch removes the item). 0 stored, 1 the entries or the read-back didn't match, 2 a bad ref or value, 75 the Keychain is unavailable. `resonant secret check <ref>`: a no-prompt read; prints `ok (no prompt)` and never the value; 0 ok, 1 missing, 75 unavailable. `resonant secret list [DIR…]`: the secrets declared by installed extensions (`~/.resonant/extensions/*/resonant.yaml`) and any given extension dirs, each `present` or `missing` (no value is read); 75 if the Keychain is unavailable. `resonant secret rm <ref>`: 0 removed, 1 not found, 75 unavailable.
 - `resonant eval router [--set PATH] [--repeat N] [--json] [--min-accuracy F]`: 0 when accuracy ≥ `--min-accuracy` (default 0.9), 1 when it's below, 2 when the set is missing or malformed. Texts appear only in its output. The summary saved to `~/.resonant/evals/results/<ts>.json` refers to examples by line number.
 
 ## Local API

@@ -24,6 +24,17 @@ from resonant.config import Settings, load_settings
 from resonant.extensions.checks import approver_errors
 from resonant.gate import ApprovalResolution, PolicyGate
 from resonant.principals import Principals, load_principals
+from resonant.secrets import (
+    InvalidSecretRef,
+    InvalidSecretValue,
+    SecretError,
+    SecretMissing,
+    SecretStore,
+    SecretUnavailable,
+    secret_ref,
+    validate_ref,
+    validate_value,
+)
 from resonant.status import collect_status
 from resonant.store import approvals as ap
 from resonant.store.audit import audit
@@ -462,6 +473,168 @@ def ext_validate(
     if problems:
         raise typer.Exit(1)
     typer.echo("ok")
+
+
+# --- secrets ---------------------------------------------------------------------------
+
+secret_app = typer.Typer(
+    no_args_is_help=True,
+    help="Extension secrets in the login Keychain (service resonant, account <ext>/<name>).",
+)
+app.add_typer(secret_app, name="secret")
+SecretRef = Annotated[str, typer.Argument(help="<ext>/<name>, like github/token")]
+
+
+def _secret_store() -> SecretStore:
+    """The store the ``secret`` commands use. Tests swap in one over a ``FakeKeychain``."""
+    return SecretStore()
+
+
+def _stdin_is_tty() -> bool:
+    import sys
+
+    return sys.stdin.isatty()
+
+
+def _checked_ref(ref: str) -> str:
+    try:
+        return validate_ref(ref)
+    except InvalidSecretRef as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2) from None
+
+
+def _read_secret_value(ref: str) -> str:
+    """From a hidden prompt (twice) on a terminal, else one line of stdin. Never echoed."""
+    import getpass
+    import sys
+
+    if _stdin_is_tty():
+        value = getpass.getpass(f"Value for {ref} (hidden): ")
+        if getpass.getpass("Again: ") != value:
+            typer.echo("error: the two entries didn't match; nothing stored", err=True)
+            raise typer.Exit(1)
+        return value
+    return sys.stdin.readline().removesuffix("\n").removesuffix("\r")
+
+
+@secret_app.command("set")
+def secret_set(ref: SecretRef) -> None:
+    """Store a secret. The value comes from a hidden prompt or stdin, never the command line."""
+    import asyncio
+    import hmac
+
+    ref = _checked_ref(ref)
+    value = _read_secret_value(ref)
+    try:
+        validate_value(value)
+    except InvalidSecretValue as e:
+        typer.echo(f"error: value {e}; nothing stored", err=True)
+        raise typer.Exit(2) from None
+    store = _secret_store()
+
+    async def go() -> bool:
+        await store.set(ref, value)
+        try:
+            readback = await store.get(ref)
+        except SecretMissing:
+            readback = ""
+        if hmac.compare_digest(readback.encode(), value.encode()):
+            return True
+        await store.delete(ref)
+        return False
+
+    try:
+        verified = asyncio.run(go())
+    except SecretError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(EX_TEMPFAIL) from None
+    if not verified:
+        typer.echo(f"error: {ref} didn't read back as entered; removed it", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"stored {ref}")
+
+
+def _declared_refs(paths: list[Path]) -> list[tuple[str, str | None]]:
+    """``(ref, problem)`` for every secret the given extensions declare, sorted by ref."""
+    refs: dict[str, str | None] = {}
+    for path in paths:
+        manifest_path = path / "resonant.yaml" if path.is_dir() else path
+        try:
+            manifest = load_manifest(manifest_path)
+        except (OSError, ValueError):  # pydantic's ValidationError is a ValueError
+            typer.echo(f"note: skipped {manifest_path}: not a valid manifest", err=True)
+            continue
+        for name in manifest.secrets:
+            try:
+                refs[secret_ref(manifest.name, name)] = None
+            except InvalidSecretRef:
+                refs[f"{manifest.name}/{name}"] = "invalid name"
+    return sorted(refs.items())
+
+
+@secret_app.command("list")
+def secret_list(
+    dirs: Annotated[
+        list[Path] | None,
+        typer.Argument(help="Extension dirs to include besides the installed ones"),
+    ] = None,
+) -> None:
+    """Declared secrets and whether each is present. Names only: no value is read."""
+    import asyncio
+
+    installed = load_settings().home / "extensions"
+    found = sorted(installed.glob("*/resonant.yaml")) if installed.is_dir() else []
+    refs = _declared_refs([*found, *(dirs or [])])
+    if not refs:
+        typer.echo("no declared secrets (installed extensions, or the dirs given)")
+        return
+    store = _secret_store()
+    unavailable = False
+    for ref, problem in refs:
+        state = problem
+        if state is None:
+            try:
+                state = "present" if asyncio.run(store.exists(ref)) else "missing"
+            except SecretError as e:
+                state, unavailable = e.reason, True
+        typer.echo(f"  {ref:<40} {state}")
+    if unavailable:
+        raise typer.Exit(EX_TEMPFAIL)
+
+
+@secret_app.command("check")
+def secret_check(ref: SecretRef) -> None:
+    """Read the secret the way the daemon does (no prompt, 5 s timeout). Shows only the outcome."""
+    import asyncio
+
+    ref = _checked_ref(ref)
+    try:
+        asyncio.run(_secret_store().get(ref))
+    except SecretMissing:
+        typer.echo(f"{ref}: missing. Set it with: resonant secret set {ref}", err=True)
+        raise typer.Exit(1) from None
+    except SecretUnavailable as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(EX_TEMPFAIL) from None
+    typer.echo(f"{ref}: ok (no prompt)")
+
+
+@secret_app.command("rm")
+def secret_rm(ref: SecretRef) -> None:
+    """Delete a secret from the Keychain."""
+    import asyncio
+
+    ref = _checked_ref(ref)
+    try:
+        removed = asyncio.run(_secret_store().delete(ref))
+    except SecretError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(EX_TEMPFAIL) from None
+    if not removed:
+        typer.echo(f"{ref}: not found", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"removed {ref}")
 
 
 # --- model -----------------------------------------------------------------------------
