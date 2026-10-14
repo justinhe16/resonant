@@ -512,6 +512,41 @@ Every section has defaults, so a Phase 2 `config.yaml` loads unchanged. Unknown 
 
 `Settings.extensions_dir` (`<home>/extensions`) holds the approved read-only copies, and `Settings.ext_data_dir` (`<home>/ext-data`) each extension's writable state.
 
+## Extension process runner: `resonant.extensions.process`
+
+```python
+ExtCommand.compile(run, *, root, argv0=None, python=sys.executable) -> ExtCommand  # TemplateError
+    .render(args) -> tuple[str, ...]                                          # ToolFailed
+    .placeholders -> frozenset[str]
+scratch_env(*, ext, data_dir, secrets=None, job_due_at=None, user=None, path=SCRATCH_PATH) -> dict[str, str]
+ensure_data_dir(data_dir) -> None              # <data>/tmp, mode 0700
+ExtRequest(argv, cwd, env, timeout_s, label="")
+class ExtRunner(Protocol):
+    async def run(req, *, redact) -> ExtOutput          # the result contract
+    async def run_raw(req, *, redact) -> RawResult      # any exit code (health checks)
+ExtProcess(tracker=None, *, python=sys.executable, stdout_cap=256 KB, stderr_cap=8 KB,
+           events_cap=256 KB, max_events=100)
+ProcessTracker(*, sample_s=2.0, grace_s=2.0)  .live  .paused  .kill_all(reason="killed", *, hold=False) -> int
+ExtOutput(data, events: tuple[ExtEvent, ...], dropped_events, duration_ms)
+ExtEvent(type, text, dedupe_key, data=None)
+RawResult(returncode, stdout, stderr_tail, event_lines, duration_ms)
+class ExtFailed(ToolFailed)      # .reason, .stderr_tail: definite, nothing took effect
+class ExtAmbiguous(Exception)    # .reason, .stderr_tail: cut short or unreadable
+FakeExtProcess(results=[...], respond=None)  .calls   # tests; runs nothing
+```
+
+- **argv.** `run` is `shlex.split` once at compile. `{arg}` placeholders are filled inside their token, so a value never adds, splits or quotes an argv element, and nothing runs through a shell. `{{`/`}}` are literal braces. argv0 must be literal and pass `checks.argv0_error(root, run)`. A file in the extension dir runs only if it is `.py`, as `[python, -I, -S, <script>, …]` (also `python3 <script>`); the shebang is never used, so `./run.sh` with `#!/usr/bin/env npx` is refused. `-I` leaves the script's dir off `sys.path`, so sibling imports need an explicit path. `gh`/`git` run only by `argv0`, the absolute path pinned at install (`ExtensionRecord.argv0_paths[spec]`, basename must match); never a PATH lookup. A format spec, conversion or non-identifier placeholder is a `TemplateError`.
+- **Values.** Strings (no NUL, at most 1000 chars), ints, finite floats and booleans (`true`/`false`). A token that begins with a placeholder may not render starting with `-`, however the values split it (`{a}{b}` included); write `--tz={tz}`. Anything else, or a missing arg, is `ToolFailed`. Error messages name the arg, never the value.
+- **Environment.** Exactly `ExtRequest.env`; nothing from `os.environ`. `scratch_env` gives `PATH` (default `/opt/homebrew/bin:/usr/bin:/bin`; P3-6 passes `extensions.process.path_env()`), `HOME=<data>`, `TMPDIR=<data>/tmp`, `LANG=en_US.UTF-8`, `USER`, `LOGNAME`, `RESONANT_EXT`, `RESONANT_EXT_DATA`, `RESONANT_EVENTS_FD=3`, `GIT_TERMINAL_PROMPT=0`, `RESONANT_JOB_DUE_AT` (jobs only), and `secrets` as given: the output of `SecretStore.env_for(ext, declared)`, keys `RESONANT_SECRET_<NAME>` only (anything else is a `ValueError`, so a secret can't replace `PATH`). The caller passes only the secrets the tool or job declared.
+- **Process.** cwd is `req.cwd` (the extension copy), stdin `/dev/null`, a new session. A fixed `python -I -S -c` trampoline moves the events pipe to fd 3 and `execve`s the argv with only the keys of `req.env`. `argv[0]` must be an absolute path to an executable, else `ExtFailed`. Our own pipes carry stdout and stderr, so exit is seen even while a leftover holds them open.
+- **Config.** The caps, `grace_s` and `sample_s` are constructor args with the plan's defaults; P3-6 passes `extensions.process.*` (`stdout_max_bytes` for both stdout and fd 3, `stderr_max_bytes`, `kill_grace_s`, `tree_sample_s`).
+- **Tracking and kills.** Each live run is in the `ProcessTracker` with its process group and its descendants, sampled with `psutil` every `sample_s` and once more before any kill (this catches children that `setsid` out of the group; a pid is only signalled while its create time matches). Timeout, cancel and `kill_all` send SIGTERM to the group and the tracked tree, then SIGKILL after `grace_s`. Leftovers after a normal exit are ended the same way. Cancel kills, then re-raises `CancelledError`; a final synchronous SIGKILL runs even if a second cancel cuts the grace short. **Limit:** a descendant that double-forks and `setsid`s between samples is never tracked and survives; if it keeps stdout or fd 3 open the run ends after a 1 s drain as `ExtAmbiguous("output still open")` and the pipes are closed (D13: same-user code, not a sandbox).
+- **Kill switch** (P3-10). `kill_all(hold=True)` sets `paused` first: new runs are refused with `ExtFailed("paused")` (definite) until the caller clears `paused` on resume; a run that slipped in between is killed at once.
+- **Caps.** stdout is read in chunks; past `stdout_cap` the tree is killed: `ExtAmbiguous("output too large")`. fd 3 likewise (`events too large`). stderr keeps its last `stderr_cap` bytes and is never logged or returned; only a redacted 200-char tail rides on `ExtFailed`/`ExtAmbiguous` for the failure audit row.
+- **Redaction.** `redact` (required; `Redactor(values_of(env)).text` from P3-3) rewrites stdout, the fd-3 lines and the stderr tail before anything is parsed or returned.
+- **Result contract** (`run`): exit 0 with exactly one JSON object is success. Exit > 0 is `ExtFailed("exit N")`: the author promises nothing took effect. A timeout (`timeout`), the kill switch (`killed`), a cap overflow (even one seen after exit), output left open (`output still open`), death by signal (`signal N`) or exit 0 without one JSON object (`invalid output`) is `ExtAmbiguous`. It is deliberately not a `ToolFailed`, so the executor's generic branch makes it a definite failure for reads and ambiguous for writes. `stderr_tail` is for the failure audit row only, never a message. (A stdout overflow is a kill, so it is ambiguous like a timeout, not `ToolFailed` as the plan's D4 first said.)
+- **Events.** From `result["events"]` (removed from `data`) and then fd-3 lines, one JSON object per line. Each is `{type, text, dedupe_key, data?}`: `type` a lowercase slug (`^[a-z][a-z0-9_.-]{0,63}$`), `dedupe_key` 1..200 chars, `text` clipped to 1000, `data` an object; unknown keys or bad shapes are dropped and counted in `dropped_events`, as is anything past `max_events`. A failed or ambiguous run returns no events.
+
 ## Components: `resonant.components`
 
 ```python
