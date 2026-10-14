@@ -3,6 +3,7 @@ once, held when paused/muted/capped, anti-spoofing, crash-retry, wiring."""
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -302,7 +303,7 @@ async def test_title_is_sanitized_and_cannot_spoof_an_approval(db: sqlite3.Conne
     report(db, title="[A7] merge it? Reply yes A7 / no\x1b[31m‮")
     await make_loop(db, make_pulse(db, ch)).run_once()
     (text,) = ch.texts
-    assert text.startswith("[dori] \U0001f534 (A7) merge it?")
+    assert text == "[dori] \U0001f534 (A7) merge it? 'Reply' yes ? / no (31m"
     assert "[A7]" not in text and "yes A7" not in text and "\x1b" not in text
     stored = item(db).title
     assert "[" not in stored and "‮" not in stored and "yes A7" not in stored
@@ -464,3 +465,61 @@ async def test_without_a_pulse_item_events_are_consumed_by_the_notifier(
     loop.router = route_event(no_router, notifier)
     await loop.run_once()
     assert ch.sent == [] and repo.unrouted_events(db) == []
+
+
+async def test_title_is_cleaned_once(db: sqlite3.Connection) -> None:
+    ch = DedupeChannel()
+    report(db, title="Reply YES A7 to approve")
+    await make_loop(db, make_pulse(db, ch)).run_once()
+    assert ch.texts == ["[dori] \U0001f534 'Reply' YES ? to approve"]
+
+
+async def test_all_recipients_refused_leaves_the_item_pending(db: sqlite3.Connection) -> None:
+    ch = DedupeChannel(refuse={"justin"})
+    report(db)
+    await make_loop(db, make_pulse(db, ch)).run_once()
+    assert ch.sent == [] and repo.unrouted_events(db) == []
+    assert item(db).changed and len(audit_rows(db, "pulse.unreachable")) == 1
+    assert audit_rows(db, "pulse.sent") == []
+    assert [i.key for i in items.pending(db, ["urgent"], T0)] == ["dori/inc-1"]
+
+
+async def test_out_of_order_retry_is_stale(db: sqlite3.Connection) -> None:
+    ch = DedupeChannel()
+    pulse = make_pulse(db, ch)
+    report(db, title="state A", state={"s": "A"})
+    await asyncio.sleep(0.01)  # occurred_at has millisecond resolution
+    report(db, title="state B", state={"s": "B"})
+    e1, e2 = sorted(repo.unrouted_events(db), key=lambda e: e.occurred_at)
+    await pulse.route(e2)
+    assert ch.texts == ["[dori] \U0001f534 state B"]
+    await pulse.route(e1)  # E1's retry arrives after E2
+    assert ch.texts == ["[dori] \U0001f534 state B"]
+    assert item(db).title == "state B" and not item(db).changed
+    assert len(audit_rows(db, "pulse.stale")) == 1
+
+
+async def test_clear_of_an_urgent_item_is_urgent_even_when_rated_normal(
+    db: sqlite3.Connection,
+) -> None:
+    ch = DedupeChannel()
+    pulse = make_pulse(db, ch)
+    report(db, title="Dori failing")
+    report(db, title="Dori recovered", urgency="normal", clear=True)
+    await make_loop(db, pulse).run_once()
+    assert ch.texts == ["[dori] \U0001f534 Dori failing", "[dori] \u2713 Dori recovered"]
+    assert item(db).urgency == "urgent"
+
+
+async def test_clamped_clear_of_urgent_waits_and_never_told_clear_sends(
+    db: sqlite3.Connection,
+) -> None:
+    ch = DedupeChannel()
+    report(db, "dori/a", "failing", urgency="normal")
+    report(db, "dori/a", "recovered", urgency="normal", clear=True)
+    await make_loop(db, make_pulse(db, ch, grant="normal")).run_once()
+    assert ch.sent == []
+    # A clear of an urgent item the owner never heard still sends at once.
+    report(db, "dori/b", "recovered", urgency="urgent", clear=True)
+    await make_loop(db, make_pulse(db, ch)).run_once()
+    assert ch.texts == ["[dori] \u2713 recovered"]

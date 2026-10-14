@@ -181,7 +181,7 @@ What the grant means (shown on the `ext add` review screen and in the `ext updat
 | `low` | `Reports: 8am briefing only (low)` | Stored for the 08:00 briefing. |
 | absent | none | Reports are refused (audit `pulse.refused`) and never retried. |
 
-A bad report (key, urgency, state, ttl, empty title) is refused the same way. Titles are cleaned like notification text, with a code-built `[<name>]` prefix. A job's first run after install is a baseline: its reports are stored as already told and never sent. Changing `report.max_urgency` changes the manifest hash, so `ext update` shows the change and asks for a fresh approval.
+A bad report (key, urgency, state, ttl, empty title) is refused the same way. Titles are cleaned like notification text, with a code-built `[<name>]` prefix. A job's first run after install is a baseline: its reports are stored as already told and never sent. A `clear=True` report of an item last stored urgent counts as urgent too (still clamped to the grant), so "recovered" is texted at once; a clear of an item the owner never heard still sends. If no recipient can be reached the item stays pending for the hourly pulse. Changing `report.max_urgency` changes the manifest hash, so `ext update` shows the change and asks for a fresh approval.
 
 ## 8. Permissions and approvers
 

@@ -12,6 +12,7 @@ import re
 import sqlite3
 import subprocess
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -809,7 +810,25 @@ def test_update_diff_shows_a_changed_report_grant(mgr: ExtensionManager, repo: P
 
     assert "  + reports: may text you any time (urgent)" in diff("urgent")
     assert "  ~ reports: hourly updates (normal) (was: none)" in diff("normal")
-    path.write_text(_with_report("normal"))
+
+    def transition(old: str | None, new: str | None) -> list[str]:
+        manifest = {**record.manifest, **({"report": {"max_urgency": old}} if old else {})}
+        old_record = replace(record, manifest=manifest, manifest_sha="old")
+        path.write_text(_with_report(new))
+        commit_all(repo)
+        staged = mgr.stage("repo:demo")
+        out = update_lines(old_record, mgr.installed_files("demo"), staged)
+        mgr.discard(staged)
+        return out
+
+    lines = transition("urgent", None)
+    assert "  ~ reports: none (refused) (was: may text you any time (urgent))" in lines
+    assert "  ~ reports: 8am briefing only (low) (was: hourly updates (normal))" in (
+        transition("normal", "low")
+    )
+    lines = transition("urgent", "normal")
+    assert "  ~ reports: hourly updates (normal) (was: may text you any time (urgent))" in lines
+    assert not any(line.startswith("  - reports:") for line in lines)  # said once
 
 
 def test_cli_validate_prints_the_report_grant(tmp_path: Path) -> None:

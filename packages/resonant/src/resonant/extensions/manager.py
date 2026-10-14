@@ -275,6 +275,7 @@ def update_lines(old: ext_store.ExtensionRecord, old_files: TreeEntries, new: St
     if old_grant != new_grant and not new_grant.startswith("reports: may"):
         # An urgent grant already shows as an added escalation above.
         was = old_grant.removeprefix("reports: ") or "none"
+        diff = [d for d in diff if d != f"  - {old_grant}"]  # the ~ line says it
         diff.append(f"  ~ {new_grant or 'reports: none (refused)'} (was: {was})")
     lines.append("Manifest: changed. Escalations:" if diff else "Manifest: changed")
     lines += diff

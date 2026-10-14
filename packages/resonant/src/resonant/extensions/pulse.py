@@ -25,11 +25,23 @@ For one event, in order:
    with the reason, and the hourly pulse carries it.
 5. Normal and low items are only stored: pending for the hourly pulse and the briefing.
 
+A report whose stored row is newer than the event (``updated_at`` > ``occurred_at``: a
+retry of an older report after a later one was routed) is stale: audit ``pulse.stale``, no
+upsert, no send. Rows are stamped with the event's ``occurred_at`` for this reason.
+
+A ``clear`` of an item last stored urgent is urgent too (clamped to the grant), so "recovered"
+is texted at once however the extension rated the clear; a clear of an item the owner never
+heard (held) still sends. When no recipient takes an urgent send the item is not marked told
+(``pulse.unreachable``) and the hourly pulse carries it.
+
 Exactly once. The event is stored before it is routed, the send is deduped by event id, and
 ``mark_told`` runs after it. A crash between the send and ``mark_told`` leaves the event
 unrouted: the retry upserts the same item (still untold), the channel drops the repeated
 send, and ``mark_told`` runs. A recipient the channel refuses is skipped; any other channel
 error raises.
+
+:func:`render_item` is the one-line form of a stored item (urgent sends and the hourly pulse):
+``[name] <mark> <title>``, no prefix for ``core``; the title is already clean.
 """
 
 from __future__ import annotations
@@ -50,7 +62,7 @@ from resonant.extensions.notify import (
     clock_hour,
     muted_until,
     paused,
-    render,
+    render_clean,
     sent_in_hour,
 )
 from resonant.gateway.channel import ChannelRefused
@@ -73,6 +85,13 @@ _TTL_UNIT_S = {"s": 1, "m": 60, "h": 3600}
 def clamp(urgency: items.Urgency, grant: items.Urgency) -> items.Urgency:
     """``urgency``, or ``grant`` when that is lower (urgent > normal > low)."""
     return urgency if _RANK[urgency] <= _RANK[grant] else grant
+
+
+def render_item(item: items.Item, mark: str = "", max_chars: int = 300) -> str:
+    """``[source] <mark> <title>`` for a stored item (its title is already cleaned, so it is
+    not cleaned again). ``core`` items get no prefix."""
+    text = f"{mark} {item.title}" if mark else item.title
+    return render_clean(None if item.source == "core" else item.source, text, max_chars)
 
 
 def _ttl_s(raw: object) -> int:
@@ -121,10 +140,14 @@ class Pulse:
             return None
         now = self.clock()
         try:
-            item, urgency = self._store(ext, event, manifest.report.max_urgency, now)
+            stored = self._store(ext, event, manifest.report.max_urgency)
         except ValueError as e:
             self._audit("pulse.refused", ext, event, reason=f"bad item: {e}"[:200])
             return None
+        if stored is None:
+            self._audit("pulse.stale", ext, event, reason="newer report already stored")
+            return None
+        item, urgency = stored
         if event.payload.get("baseline") is True:
             items.mark_told(self.conn, [item], now)
             self._audit("pulse.held", ext, event, reason="baseline", key=item.key)
@@ -143,7 +166,7 @@ class Pulse:
             self._audit("pulse.held", ext, event, reason=reason, key=item.key)
             return None
         mark = CLEAR_MARK if item.cleared else URGENT_MARK
-        message = render(ext, f"{mark} {item.title}", self.config.max_chars)
+        message = render_item(item, mark, self.config.max_chars)
         sent = 0
         for recipient in self.recipients(ext) or ():
             try:
@@ -154,15 +177,18 @@ class Pulse:
                 log.warning("pulse recipient refused", extra={"extension": ext})
                 continue
             sent += 1
+        if not sent:  # nobody took it: stays pending and rides the hourly pulse
+            self._audit("pulse.unreachable", ext, event, key=item.key)
+            return None
         items.mark_told(self.conn, [item], now)
-        action = "pulse.sent" if sent else "pulse.unreachable"
-        self._audit(action, ext, event, recipients=sent, hour=iso(hour), key=item.key)
+        self._audit("pulse.sent", ext, event, recipients=sent, hour=iso(hour), key=item.key)
         return None
 
     def _store(
-        self, ext: str, event: Event, grant: items.Urgency, now: datetime
-    ) -> tuple[items.Item, items.Urgency]:
-        """Validate and upsert the report; ``ValueError`` for a bad one."""
+        self, ext: str, event: Event, grant: items.Urgency
+    ) -> tuple[items.Item, items.Urgency] | None:
+        """Validate and upsert the report; ``ValueError`` for a bad one, None for a stale
+        one (the stored row is newer than this event: a retry of an older report)."""
         text: object = event.payload.get("text")
         raw: object = event.payload.get("data")
         data = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
@@ -177,6 +203,11 @@ class Pulse:
         if not isinstance(text, str):
             raise ValueError("title must be a string")
         title = clean_text(text)
+        before = items.get(self.conn, ext, key)
+        if before is not None and before.updated_at > event.occurred_at:
+            return None
+        if clear and before is not None and before.urgency == "urgent":
+            urgency = "urgent"  # the all-clear for an urgent thing is immediate too
         granted = clamp(urgency, grant)
         _change, item = items.upsert(
             self.conn,
@@ -187,7 +218,7 @@ class Pulse:
             data.get("state"),
             clear,
             _ttl_s(data.get("ttl")),
-            now,
+            event.occurred_at,
         )
         return item, granted
 
@@ -204,4 +235,4 @@ class Pulse:
             )
 
 
-__all__ = ["EVENT_TYPE", "Pulse", "clamp"]
+__all__ = ["EVENT_TYPE", "Pulse", "clamp", "render_item"]

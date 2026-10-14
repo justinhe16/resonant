@@ -125,6 +125,17 @@ def render(name: str, text: str, max_chars: int = 300) -> str:
     return head + body
 
 
+def render_clean(name: str | None, clean: str, max_chars: int = 300) -> str:
+    """Like :func:`render` for text that already went through :func:`clean_text` (it is not
+    cleaned twice, which isn't idempotent). ``name`` None means a core line: no prefix."""
+    head = "" if name is None else prefix(name) + " "
+    body = clean or "update"
+    room = max_chars - len(head)
+    if len(body) > room:
+        body = body[: room - 1].rstrip() + "\u2026"
+    return head + body
+
+
 def more_text(name: str, n: int) -> str:
     return f"{prefix(name)} +{n} more update{'' if n == 1 else 's'}"
 
@@ -388,6 +399,7 @@ __all__ = [
     "paused",
     "prefix",
     "render",
+    "render_clean",
     "sent_in_hour",
     "take_baseline",
     "unmute",
