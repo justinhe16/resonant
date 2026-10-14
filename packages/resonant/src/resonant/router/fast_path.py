@@ -543,7 +543,9 @@ class FastPath:
         if not self.principals.can(principal, "admin", None):
             return None
         try:
-            if not (self.repo_path / "extensions" / name / "resonant.yaml").is_file():
+            base = (self.repo_path / "extensions").resolve()
+            manifest = (base / name / "resonant.yaml").resolve()
+            if not manifest.is_relative_to(base) or not manifest.is_file():
                 return None
             record = ext_store.get_extension(self.conn, name)
         except (OSError, sqlite3.Error):
@@ -552,10 +554,12 @@ class FastPath:
             return f"{name} isn't installed. On the Mini: resonant ext add repo:{name}"
         if record.status == "enabled":
             return None
-        why = (
-            "files changed since install" if record.status == "disabled_tampered" else "turned off"
-        )
-        return f"{name} is disabled ({why}). On the Mini: resonant ext update {name}"
+        if record.status == "disabled_tampered":
+            return (
+                f"{name} is disabled (files changed since install). "
+                f"On the Mini: resonant ext update {name}"
+            )
+        return f"{name} is turned off."
 
     async def _core_run(
         self,

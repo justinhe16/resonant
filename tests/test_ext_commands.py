@@ -25,6 +25,7 @@ from resonant.executor import (
     ToolFailed,
 )
 from resonant.extensions import notify
+from resonant.extensions.pulse_job import open_summary
 from resonant.gate import PolicyGate
 from resonant.gateway.channel import ApprovalPrompt, MessageRef, SelfTestResult, Submit
 from resonant.loop import Loop, NewTask, SlotPool
@@ -847,4 +848,65 @@ async def test_shipped_but_not_installed_extension_is_named(
     )
     with transaction(db):
         ext_store.save_extension(db, replace(record, status="disabled"))
-    assert "(turned off)" in await reply(router, "/github")
+    assert await reply(router, "/github") == "github is turned off."
+    assert (await reply(router, "/github", MEMBER)).startswith("Unknown command")
+
+
+async def test_not_installed_edge_cases(
+    router: Router, db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "resonant.yaml").write_text("name: x\n")
+    exts = repo / "extensions"
+    exts.mkdir(parents=True)
+    (exts / "linked").symlink_to(outside)
+    for name in ("my_ext", "github"):
+        (exts / name).mkdir()
+        (exts / name / "resonant.yaml").write_text("x\n")
+    router.fast_path.repo_path = repo
+    assert (await reply(router, "/linked")).startswith("Unknown command /linked")
+    assert (await reply(router, "/my_ext")).startswith("Unknown command /my_ext")
+    assert "isn't installed" in await reply(router, "/github")
+    router.fast_path.repo_path = tmp_path / "missing"
+    assert (await reply(router, "/github")).startswith("Unknown command /github")
+    # an installed, enabled extension's own command wins over the hint
+    (exts / "demo").mkdir()
+    (exts / "demo" / "resonant.yaml").write_text("x\n")
+    router.fast_path.repo_path = repo
+    assert "isn't installed" not in await reply(router, "/demo")
+
+
+def test_open_summary(db: sqlite3.Connection) -> None:
+    assert open_summary(db, NOW, "UTC") is None
+    _report(db, "zeta", "a", "x")
+    _report(db, "core", "approval/a1", "y")
+    _report(db, "alpha", "a", "z")
+    with transaction(db):
+        pulse_store.upsert(db, "alpha", "gone", "c", "normal", None, True, 3600, NOW)
+        pulse_store.upsert(
+            db, "alpha", "old", "e", "normal", None, False, 60, NOW - timedelta(hours=1)
+        )
+    notify.mute(db, "zeta", NOW + timedelta(minutes=30), by=OWNER)
+    assert open_summary(db, NOW, "UTC") == "Open: core 1, alpha 1, zeta 1 (muted until 6:00pm)"
+    assert open_summary(db, NOW + timedelta(minutes=45), "UTC") == "Open: core 1, alpha 1, zeta 1"
+
+
+async def test_pulse_now_real_path_paused_and_member_refused(
+    router: Router, db: sqlite3.Connection
+) -> None:
+    from resonant.extensions.scheduler import CoreDeps
+    from resonant.router.fast_path import core_pulse
+
+    settings = load_settings()
+    router.fast_path.core_jobs["pulse"] = core_pulse(CoreDeps(settings, db, None, None, OWNER))  # type: ignore[arg-type]
+    assert await reply(router, "/pulse now") == "Can't send: no channel/owner."
+    with transaction(db):
+        kv_set(db, "paused", True)
+    assert await reply(router, "/pulse") == "Nothing new since the last update."
+    assert await reply(router, "/pulse now", MEMBER) == NOT_ALLOWED
+    n = db.execute(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'router.admin_refused'"
+    ).fetchone()
+    assert n[0] == 1
