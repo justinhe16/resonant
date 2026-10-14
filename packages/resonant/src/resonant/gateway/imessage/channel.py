@@ -49,6 +49,11 @@ so it can run next to a live daemon without moving the daemon's cursor. Both rea
 drop self-test rows before routing, so self-test messages are never answered. The private
 reader drops every event it reads; the daemon's reader still delivers them.
 
+**Approvals.** :meth:`request_approval` sends ``prompt.text()`` through :meth:`send`,
+deduped by ``approval_dedupe_key(approval_id, principal)``, so the runner can re-prompt on
+every pending step and a repeat returns the first ref. Audited ``imessage.approval_sent``
+with the approval id, code, level and ref, never the summary.
+
 **PII.** Bodies never reach logs or audit rows: audits carry the principal, handle,
 length, chunk count, and dedupe key.
 """
@@ -75,6 +80,7 @@ from resonant.gateway.channel import (
     MessageRef,
     SelfTestResult,
     Submit,
+    approval_dedupe_key,
 )
 from resonant.gateway.imessage.reader import (
     SELFTEST_PREFIX,
@@ -306,7 +312,28 @@ class IMessageChannel:
         return ref
 
     async def request_approval(self, principal: str, prompt: ApprovalPrompt) -> MessageRef:
-        raise NotImplementedError("Phase 2")
+        """Send ``prompt.text()`` to ``principal`` through :meth:`send` (allowlist, rate
+        limit), deduped by ``approval_dedupe_key``: a repeat returns the first ref and sends
+        nothing. Audits ``imessage.approval_sent`` (ids, code and level; never the summary).
+        Raises what :meth:`send` raises.
+        """
+        key = approval_dedupe_key(prompt.approval_id, principal)
+        self._resolve(principal)  # refuse an unknown principal even on a repeat
+        if (prev := self._already_sent(key)) is not None:
+            return prev
+        ref = await self.send(principal, prompt.text(), dedupe_key=key)
+        with atomic(self.conn):
+            audit(
+                self.conn,
+                "imessage.approval_sent",
+                requested_by=principal,
+                level=prompt.level,
+                idempotency_key=key,
+                approval_id=prompt.approval_id,
+                code=prompt.code,
+                ref=ref.ref,
+            )
+        return ref
 
     def _resolve(self, principal: str) -> str:
         p = self.principals.principals.get(principal)
