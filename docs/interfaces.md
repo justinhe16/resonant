@@ -62,7 +62,7 @@ Loop guarantees:
 4. A crash mid-step means the task resumes from its last checkpoint with its events replayed, and the crash counts as an attempt. A graceful shutdown requeues without using an attempt.
 5. A step that exceeds `max_step_s` is cancelled and treated as a retryable failure.
 6. An outcome that isn't JSON-serializable becomes a non-retryable failure. A database error while persisting stops the loop: the daemon exits, launchd restarts it, and `resume()` recovers the task.
-7. **Next wake.** Between ticks `Loop.run` sleeps `Loop.wait_s()`: `tick_s`, or less when the earliest future `wake_at` of a queued or waiting task (`store.tasks.next_wake_at(conn, after=now)`) comes sooner. A task is dispatched within loop precision of its `wake_at`, not up to a tick late. Already-due tasks are excluded, so they never cause a busy loop.
+7. **Next wake.** Between ticks `Loop.run` sleeps `Loop.wait_s()`: `tick_s`, or less when the earliest future `wake_at` of a queued or waiting task (`store.tasks.next_wake_at(conn, after=last_tick)`) comes sooner; one that fell due since the last tick means tick at once. A task is dispatched within loop precision of its `wake_at`, not up to a tick late. Tasks already due at the last tick are excluded, so they never cause a busy loop.
 
 Runner obligations:
 - Make steps idempotent relative to the last checkpoint. Side effects go only through the executor.
@@ -166,21 +166,46 @@ class Gate(TokenVerifier, Protocol):
 
 **Origin** says who chose the action. Code sets `"explicit"` in exactly one place, the local runner's `direct_call` path, whose checkpoint only the router's deterministic command parser writes. Everything the model chooses, and later every scheduled or extension job, is `"inferred"`. It is never read from model output.
 
-Evaluation order (Phase 2):
+Evaluation order (Phase 2, `resonant.gate.PolicyGate`):
 1. **Registration:** if `registry.get(extension, tool) != intent.spec`, Deny. An intent can't claim an effect or level its tool wasn't registered with.
 2. **Permission:** if `can(principal, "request", extension)` is false, Deny.
-3. **Kill switch:** if `autonomy=off`, everything above L0 needs approval.
-4. **Level:**
-   - L0: Allow.
-   - L1: NeedsApproval.
-   - L2: Veto, and the task waits with `wait_reason=veto` and `wake_at=until`.
-   - L3: Allow, then report.
-   - Inside an approved computer-use scope, `commit` tools still need approval and get a screenshot.
-5. **dry_run:** anything that isn't an L0 read becomes DryRun.
+3. **Unsafe args:** if `unsafe_args(args)` finds anything, Deny. The reason gives only a count, never the keys or values.
+4. **dry_run:** a tool that is neither an L0 read nor store-internal becomes `DryRun(would=<summary>)`.
+5. **Level × origin × autonomy** (`policy.rule`):
+
+| Level | autonomy on, explicit | autonomy on, inferred | autonomy off |
+|---|---|---|---|
+| L0 | Allow | Allow | Allow |
+| L3 | Allow | Allow | NeedsApproval |
+| L2 | Allow | NeedsApproval | NeedsApproval |
+| L1 (destructive, pay) | NeedsApproval, `require_code=True` | same | same |
+
+`evaluate` never returns `Veto` in Phase 2; the type stays for Phase 3 unattended jobs. Reporting after an L3 or explicit Allow (`Done: <summary>`) is the runner's job.
+
+```python
+PolicyGate(conn, principals, registry, *, dry_run: bool, approval_ttl_s: float,
+           actions: {(extension, tool): (Intent) -> str | None} = {}, clock=utcnow)
+rule(level, origin, autonomy_on) -> "allow" | "ask" | "ask_code"
+autonomy_on(conn) -> bool
+NOT_APPROVED, APPROVAL_EXPIRED, APPROVAL_USED, NO_TASK   # Deny reasons the runner templates
+STORE_INTERNAL_TOOLS, is_store_internal(spec)             # resonant.tools
+```
+
+- **Kill switch:** kv `autonomy` is read on every `evaluate`. Anything but `"on"` (missing, garbage, unparseable) counts as off: fail closed.
+- **dry_run exemption** is keyed on registry identity: `is_store_internal(spec)` is true only for a builtin (`extension=None`, `source="builtin"`, no secrets) named in `STORE_INTERNAL_TOOLS = {add_note, delete_note, clear_notes, add_reminder, cancel_reminder}`. A test pins the set. An extension tool with the same name is not exempt, and ops tools never are. Exempt tools still go through step 5.
+- **Approvals** per (task, intent hash). "Ask" reuses the pending approval if there is one; otherwise it inserts one with `approvers=(owner,)` (global scope is owner-only), `expires_at = now + gate.approval_ttl_s`, a fresh code, and a code-built summary (`summarize(intent, action=actions[(extension, tool)](intent))` when an action is registered). An intent whose `task_id` has no task row (the router's fast path) gets `Deny(NO_TASK)`.
+  - Approved and unused: `Allow(token, approval_id)`.
+  - Any rejected approval for the intent: `Deny(NOT_APPROVED)`, even if the table would now Allow (the owner's "no" holds for that intent).
+  - Expired: `Deny(APPROVAL_EXPIRED)`. Used: `Deny(APPROVAL_USED)`; a used approval never yields another Allow.
+  - So an intent gets at most one approval per task: after it expires, is rejected or is used, the gate never re-asks (one gated side effect per local task). A retry needs a new task.
+- **Lazy expiry:** `evaluate`, `pending_for` and `resolve` first run `expire_due(now)`. The waiting task's `wake_at = expires_at` is the backstop that wakes it.
+- `resolve(resolution)` (CLI, button): the actor must be in `approvers` and hold `approve`; then `store.approvals.resolve` and `wake_resolved` in one transaction, audited `approval.resolve`. Refusal reasons: `not_found` (also for a non-approver, so ids aren't confirmed; the audit row says `not an approver`) or the store's reason. A refused attempt is audited `decision="refused"`. This authenticated path approves L1 without typing the code.
+- `resolve_reply` returns `ResolveResult(ok=False)` until text-reply binding lands (sent-before rule, single pending, per-event idempotency). `open_batch` raises `NotImplementedError` (deferred).
+- `pending_for(principal)` lists unexpired pending approvals as `PendingApproval`.
 
 **Allow tokens.** Every `Allow` carries a single-use token that the gate issued for one intent hash. After an approval, the runner re-evaluates the intent on wake and gets an `Allow(token, approval_id)`. Tokens live in memory, so after a restart the runner simply re-evaluates.
 
-Every evaluation writes an audit row. Phase 0 ships `DryRunGate`, which checks registration and permissions, allows L0 reads with a token, and returns DryRun for everything else. It has no approvals.
+Every evaluation writes one `gate.evaluate` audit row (decision, origin, autonomy, dry_run, approval id, deny reason, args). `DryRunGate` (Phase 0, kept as a test double) checks registration and permissions, allows L0 reads with a token, and returns `DryRun(would=<decision name>)` for everything else. It has no approvals.
 
 **Transactions.** `transaction()` is not reentrant. Helpers that write bookkeeping (audit, spans, gate, executor, kill switch) use `atomic()`, which joins an enclosing transaction via SAVEPOINT. So they are safe to call standalone or inside a caller's transaction.
 
@@ -194,7 +219,7 @@ Critical-job LaunchAgents run `resonant job-guard --job <ext>/<id> -- <cmd>`. It
 
 On-call autonomy checks `paused` before acting.
 
-## Approvals: binding, codes, and the classifier
+## Approvals: binding, codes, and replies
 
 Request (`resonant.gate.codes`):
 - `new_code(pending)` returns 2 characters, a letter then a digit, with no look-alikes, unique among pending approvals.
@@ -215,22 +240,32 @@ Request (`resonant.gate.codes`):
 - It arrived as iMessage, not SMS, or from the mapped Slack user.
 - It maps to exactly one pending, unexpired approval. With several pending, the code is required. If it's ambiguous, re-ask and never guess.
 
-**Two-stage decision** (Phase 2):
-1. **Deterministic parser.** It recognizes yes/no/approve/deny/👍/👎, `yes with comments: …`, and an optional code, case-insensitive.
-2. **Approval classifier**, only if the parser fails.
-   - It is separate from the router and uses a small, focused prompt.
-   - Its input is the reply text and the summary, and nothing else: no tool output and no external content.
-   - Its output is `{decision: approve|deny|unclear, approval_code, comments, confidence}`.
-   - It approves only if `decision == approve` and `confidence >= 0.9`. Anything else is unclear and gets a re-ask.
+**Reply parser** (`resonant.gate.replies`, Phase 2 is parser-only):
 
-**Batch approvals:** when an approver has several pending approvals, Resonant may send one *batch message* that lists their codes. The batch snapshot is stored.
-- A `yes all` reply approves **exactly the approvals in that snapshot**: never ones that arrived later, never pay, and never any the replier isn't an approver for.
-- The audit log records the batch id and each approval it resolved.
-- Outside a batch reply, a plain `yes` with several approvals pending is ambiguous and gets a re-ask.
+```python
+parse_reply(text, *, truncated=False) -> ParsedReply | None
+ParsedReply(decision: approve|deny, code=None, comments=None)   # code uppercase
+normalize_reply(text) -> str   # NFKC, straight quotes, collapsed whitespace
+MAX_COMMENTS_LEN = 500
+```
+
+- The whole message must match, after normalization and ignoring (ASCII) case:
+  - `(yes|approve|👍)( <code>)?` and `<code> yes`
+  - `(no|deny|👎)( <code>)?` and `<code> no`
+  - `yes( <code>)? with comments: <text>`, where `text` is 1–500 characters and is kept verbatim
+- Outside comments, a trailing run of `.` and `!` is dropped (`Yes.`, `yes!!`, `yes A7.`). `?` never is: `yes?` is a question.
+- 👍 and 👎 may carry a skin tone and the emoji presentation selector.
+- A code must come from the `new_code` alphabet, so look-alikes (`A1`, `O7`) never match.
+- Anything else returns None: `y`, `ok`, `sure`, `yes?`, `yes all`, `yes A7 and C4`, a pasted prompt, or text with invisible characters. A `truncated` payload is never a reply.
+- The parser only reads text. Binding (approvers, single pending, `require_code`, sent-before) is the gate's job.
+
+**Deferred** (C4): the approval classifier, `resonant eval approvals`, and batch approvals (`yes all`). `open_batch` stays `NotImplementedError`, and `ApprovalReply.path` is always `"parser"` for now. With several approvals pending, a plain `yes` gets a re-ask that lists the codes. The design kept for later:
+- **Classifier**, only if the parser fails. It is separate from the router and uses a small, focused prompt. Its input is the reply text and the summary, and nothing else. Its output is `{decision: approve|deny|unclear, approval_code, comments, confidence}`. It approves only if `decision == approve` and `confidence >= 0.9`; anything else gets a re-ask.
+- **Batch approvals:** one batch message lists an approver's pending codes, and its snapshot is stored. `yes all` approves **exactly the approvals in that snapshot**: never ones that arrived later, never pay, and never any the replier isn't an approver for. The audit log records the batch id and each approval it resolved.
 
 **Concurrency:** resolution is atomic (`UPDATE approvals … WHERE status = 'pending'`), so the first valid reply on any channel wins. On-call pages (Phase 6) go to iMessage and Slack together with one dedupe key; the other channel's message is updated to "resolved by X via Y".
 
-**Pay:** only a deterministic exact match that includes the code (`yes P3`) counts. The classifier is never used, and the same rule applies on Slack.
+**Pay:** only a parser match that includes the code (`yes P3`) counts. The classifier is never used for pay, and the same rule applies on Slack.
 
 **Comments:** `yes with comments: …` approves and appends a `human_input` event to the task, which the runner treats as a constraint.
 
@@ -255,6 +290,8 @@ NewApproval(task_id, intent_hash, tool, effect, level, summary, approvers, code,
             require_code=False, extension=None, requested_by=None)
 insert_approval(conn, spec, now) -> str              # IntegrityError if one is pending for (task, intent) or the code is taken
 get_approval(conn, id) / pending_for_intent(conn, task_id, intent_hash, now) / pending_by_code(conn, code, now) -> Approval | None
+latest_for_intent(conn, task_id, intent_hash) -> Approval | None   # newest, any status
+was_rejected(conn, task_id, intent_hash) -> bool
 pending_for(conn, principal, now) -> list[Approval]  # unexpired, principal in approvers
 pending_codes(conn) -> set[str]                      # for new_code
 add_channel_ref(conn, id, *, ref, at, principal) -> bool   # keeps the first send per (ref, principal)
@@ -281,12 +318,15 @@ wake_resolved(conn, result, now, *, principal=None) -> int
 idempotency_key(task_id, step_no, call_index, intent_hash) -> str
 Executor(conn, verifier: TokenVerifier, handlers: {(extension | None, tool): async (args) -> dict})
     .execute(intent, decision, *, step_no, call_index=0) -> ToolResult
+    .recorded(key) -> ToolResult | None   # what executions holds for key; read-only
     .resolve_ambiguous(key, *, succeeded, actor, result=None, note=None) -> bool   # audited
 ToolResult(ok, data, error, duration_ms, replayed, ambiguous, idempotency_key)
 class ToolFailed(Exception)   # raise from a handler: "definitely did not take effect"
 ```
 
 - **Token check.** The decision must be `Allow`, and `verifier.consume(token, intent.hash)` must be true. Otherwise it raises `NotAllowedError` and audits `executor.refused`. A forged Allow, a reused token, or a token issued for different args is refused.
+- **Approvals are single use.** An `Allow` with an `approval_id` spends it: `mark_used` runs in the same transaction as the `started` row. An approval that is already used, or whose task or intent hash differs, raises `NotAllowedError` (audited `executor.refused`) and nothing runs. A replayed or ambiguous key doesn't spend it.
+- **`recorded(key)`** is for a runner resuming at a pinned key, before it calls the gate: `succeeded` returns the result (`replayed=True`), `started` returns `ambiguous=True`, `failed` returns the definite error, and no row returns None. The approval is spent with `started`, so after a definite failure of an approved call, re-evaluating gives `Deny(APPROVAL_USED)`: a retry needs a new task.
 - **What happens to a key**, by its row in `executions`:
   - `succeeded`: the recorded result is returned (`replayed=True`).
   - `started`: the outcome is unknown, so it is **ambiguous** and is never re-run. It stays that way until `resolve_ambiguous` is called.
@@ -297,16 +337,16 @@ class ToolFailed(Exception)   # raise from a handler: "definitely did not take e
 - **Never inside a transaction:** `execute()` refuses to run inside a caller's transaction. Its `started` row must be committed before the side effect.
 - **Calls in one step:** use a distinct `call_index` for each call within a step. Two calls with the same index and intent are deduped by design.
 - **Audit:** `executor.start`, `executor.result`, `executor.ambiguous`, `executor.replayed`, `executor.refused`, and `executor.ambiguous_resolved` are all written.
-- Phase 2 makes the executor the only reader of Keychain secrets. They are injected as environment variables for the tool process only, and their values are redacted in audit rows.
+- Keychain secret injection (the executor as the only reader, env vars for the tool process, redaction in audit rows) is deferred to Phase 3, with the first tool that needs a secret.
 
 ## Built-in tools: `resonant.tools.builtin`
 
-Global builtins (`extension=None`, `source="builtin"`): the read tools are `effect=read`, level L0; the reminder writes are L3. Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals, clock=utcnow) -> {(None, name): handler}` registers the specs and returns the handlers.
+Global tools (`extension=None`, `source="builtin"`): L0 reads, plus the notes writes (`add_note` and `delete_note` L3, `clear_notes` L1) and the reminder writes (`add_reminder` and `cancel_reminder` L3). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals, clock=utcnow) -> {(None, name): handler}` registers the specs and returns the handlers.
 
-- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`, `reminders`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
+- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`, `notes`, `reminders`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
 - `BuiltinContext(conn, state, registry, principals, clock=utcnow)` is what a module gets. `registry` is the full registry, read at call time. `clock` returns aware UTC (tests pass a fake). New fields get defaults.
 
-Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents, except the reminder tools, which return the owner's own reminder text.
+Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, note text that is empty or over 200 characters, a missing or already-deleted note id, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents, except the notes and reminder tools, which return the owner's own text.
 
 | Tool | Args | Returns |
 |---|---|---|
@@ -319,8 +359,13 @@ Handlers return JSON-serializable dicts and never raise for "no data". Bad args 
 | `list_reminders` | none | `{reminders: [{id, at, due, text}], count}`: the owner's queued or firing reminders, soonest first, at most 50 |
 | `cancel_reminder` (write, L3) | `id`: int ≥ 1 | `{cancelled: true, id, at, due, text}`. `set_status(cancelled, expect=("queued",))`. Unknown, already fired, firing or cancelled → `ToolFailed` |
 | `list_commands` | `query?`: string, at most 50 chars | `{commands: [{name, usage, description, tool, level, owner_only}], count, query}`: the command registry (`router/commands.py`) as the owner sees it, filtered by `query` like `/help <word>`. `level` is the tool's registered level (`null` for commands without a tool). Handlers don't see the requester, and the gate only lets principals who can request global tools (the owner) call it. |
+| `list_notes` | none | `{notes: [{id, text, at}], count, total}`: live notes, newest first, at most 20. `total` counts every live note. |
+| `add_note` (L3) | `text`: string, 1–200 characters after trimming | `{id, text, at}` |
+| `delete_note` (L3) | `id`: int ≥ 1 | `{id, text, at, deleted_at}`. Soft delete. |
+| `clear_notes` (L1) | none | `{cleared, deleted_at}`: soft-deletes every live note. |
 
 - `system_status`: `cpu_percent` is measured since the previous call (primed at registration), so it never blocks. `memory_pressure` comes from `sysctl kern.memorystatus_vm_pressure_level` and `memory_pressure -Q` with a 500ms timeout, best effort; off macOS, or when they are missing or slow, it is `{level: "unknown", free_pct: null}`. `disk` lists `/` and `RESONANT_HOME`; an unreadable path has null numbers.
+- Notes (`tools/notes.py`) live in `memory` with `scope="notes"`: key = the note id (decimal), value = JSON `{text, at, deleted_at}`. Ids come from kv `notes.seq` and are never reused. Deletes are soft (they set `deleted_at` and keep the row); reads hide deleted notes. Replay can't duplicate a note, because the executor returns the recorded result for an idempotency key that already succeeded. `notes.summary_action(conn, intent)` is the code-built approval heading for the builtin `clear_notes` (`delete all 4 notes`, counting live notes), for `summarize(intent, action=...)`; it returns `None` for any other intent, including an extension tool with the same name.
 - The `model.probe` kv key is written by `resonant model probe` and the health monitor, in one shape: `{ok, model_present, ctx_ok, thinking_off_ok, tool_call_ok, call_failed, latency_ms, detail, model, api, checked_at}`. The monitor writes only these fields and scrubs URLs from `detail`. Builtins read it only.
 
 ## Reminders: `resonant.runners.reminder`, `resonant.tools.when`

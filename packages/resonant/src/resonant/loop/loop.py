@@ -167,7 +167,8 @@ class Loop:
         late). Submits, new tasks and finished steps still wake the loop early."""
         now = self.clock()
         tick = self.config.tick_s
-        nxt = repo.next_wake_at(self.conn, now)
+        # Measured from the last tick, so a wake_at that fell due since then ticks at once.
+        nxt = repo.next_wake_at(self.conn, self.last_tick or now)
         if nxt is None:
             return tick
         return min(tick, max((nxt - now).total_seconds(), 0.0))

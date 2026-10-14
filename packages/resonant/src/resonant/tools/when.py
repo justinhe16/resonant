@@ -32,6 +32,7 @@ PAST_GRACE = timedelta(seconds=60)
 MAX_WHEN_TOKENS = 5  # "tomorrow at 3:30 pm" is the longest form
 
 AMBIGUOUS = "say 3pm or 15:00"
+INVALID = "that's not a time of day"
 PASSED = "that time has passed"
 TOO_FAR = "that's more than a year away"
 DST_GAP = "that time doesn't exist that day (clocks change)"
@@ -82,12 +83,12 @@ def _time_of_day(text: str) -> time:
     if m := _AMPM_RE.fullmatch(text):
         hour, minute = int(m[1]), int(m[2] or 0)
         if not 1 <= hour <= 12 or minute > 59:
-            raise WhenError(AMBIGUOUS)
+            raise WhenError(INVALID)
         return time(hour % 12 + (12 if m[3] == "pm" else 0), minute)
     if (m := _H24_RE.fullmatch(text)) and (int(m[1]) >= 13 or m[1].startswith("0")):
         hour, minute = int(m[1]), int(m[2])
         if hour > 23 or minute > 59 or len(m[1]) != 2:
-            raise WhenError(AMBIGUOUS)
+            raise WhenError(INVALID)
         return time(hour, minute)
     if _BARE_RE.fullmatch(text):
         raise WhenError(AMBIGUOUS)

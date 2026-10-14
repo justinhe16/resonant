@@ -1,4 +1,4 @@
-"""Built-in tools: questions about Resonant itself and the machine it runs on.
+"""Built-in tools: questions about Resonant and its machine, plus the owner's notes.
 
 Each tool area is a module (see ``resonant.tools.base``); ``BUILTIN_MODULES`` lists them and
 ``register_builtins`` iterates it. A new area is one module plus one line here.
@@ -8,8 +8,8 @@ async ``(args) -> dict``, return JSON-serializable dicts, and are fast: database
 indexed and capped. "No data" is an empty result, never an exception. Bad arguments raise
 ``ToolFailed`` (a definite failure the caller can report back).
 
-No tool returns message bodies, task checkpoints/results, or file contents, except the reminder
-tools, which return the owner's own reminder text.
+No tool returns message bodies, task checkpoints/results, or file contents, except the notes and
+reminder tools, which return the owner's own text.
 Output shapes are documented in ``docs/interfaces.md`` ("Built-in tools").
 """
 
@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.principals import Principals
 from resonant.store.db import utcnow
-from resonant.tools import commands, reminders, system, tasks
+from resonant.tools import commands, notes, reminders, system, tasks
 from resonant.tools.base import BuiltinContext, BuiltinModule
 from resonant.tools.registry import ToolRegistry
 from resonant.tools.system import DAEMON_STATUS, MODEL_STATUS, SYSTEM_STATUS
@@ -46,7 +46,7 @@ __all__ = [
     "register_builtins",
 ]
 
-BUILTIN_MODULES: tuple[BuiltinModule, ...] = (tasks, system, commands, reminders)
+BUILTIN_MODULES: tuple[BuiltinModule, ...] = (tasks, system, commands, notes, reminders)
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 
 

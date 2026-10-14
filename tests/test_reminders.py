@@ -253,6 +253,11 @@ async def test_cancel_refuses_fired(db: sqlite3.Connection, tools: dict[str, Too
         repo.set_status(db, r["task_id"], "done")
     with pytest.raises(ToolFailed, match="already went off"):
         await tools["cancel_reminder"]({"id": r["id"]})
+    r = await add(tools, T0 + timedelta(minutes=1), "y")
+    with transaction(db):
+        repo.set_status(db, r["task_id"], "failed")
+    with pytest.raises(ToolFailed, match="failed to send"):
+        await tools["cancel_reminder"]({"id": r["id"]})
 
 
 # --- runner ----------------------------------------------------------------------------
@@ -329,7 +334,7 @@ async def test_fires_once_on_time(
     await loop.run_until_idle()
     assert channel.sent == []
     clock.advance(seconds=0.5)
-    assert loop.wait_s() == 30.0  # due now: no future wake left
+    assert loop.wait_s() == 0.0  # fell due since the last tick: tick at once
     await loop.run_until_idle()
     assert channel.texts == ["⏰ stretch"]
     task = reminder_task(db, r["task_id"])

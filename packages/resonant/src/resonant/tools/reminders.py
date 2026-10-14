@@ -180,7 +180,11 @@ def cancel_reminder(
         if row is None:
             raise ToolFailed(f"no reminder {n}")
         if row["status"] != "queued":
-            state = {"running": "is firing now", "done": "already went off"}
+            state = {
+                "running": "is firing now",
+                "done": "already went off",
+                "failed": "failed to send",
+            }
             raise ToolFailed(f"reminder {n} {state.get(row['status'], 'is already cancelled')}")
         if not repo.set_status(conn, row["id"], "cancelled", expect=("queued",)):
             raise ToolFailed(f"reminder {n} is no longer pending")
