@@ -11,7 +11,7 @@ import pytest
 from resonant import killswitch
 from resonant.config import load_settings
 from resonant.executor import HandlerKey, ToolHandler
-from resonant.gate import DryRunGate
+from resonant.gate import Allow, Decision, DryRunGate, Intent
 from resonant.loop import Loop, SlotPool
 from resonant.loop.types import PRIORITY_MEMBER, PRIORITY_OWNER, Done, StepContext, Task
 from resonant.models import (
@@ -25,11 +25,12 @@ from resonant.models import (
 from resonant.principals import Principal, Principals
 from resonant.router import Labeler, Router, classify, match_fast_path, toolset_for
 from resonant.router.fast_path import (
-    HELP_REPLY,
     KILL_REPLY,
     NOT_ALLOWED,
     RESUME_REPLY,
     UNKNOWN_COMMAND_REPLY,
+    FastCommand,
+    FastPath,
     normalize,
 )
 from resonant.router.intents import INTENT_TOOLS, INTENTS
@@ -238,7 +239,9 @@ def spans_named(db: sqlite3.Connection, name: str) -> list[dict[str, Any]]:
         ("/kill", "/kill"),
         ("/resume", "/resume"),
         ("/frobnicate", "/unknown"),
-        ("/kill now please", "/unknown"),
+        ("/kill now please", "/kill"),  # a usage reply; see test_bad_args_get_usage
+        ("/help remind", "/help"),
+        ("/stauts", "/unknown"),
         ("status", "status"),
         ("Status?", "status"),
         ("what's running?", "what's running"),
@@ -346,12 +349,12 @@ async def test_help_and_unknown_command(fast_router: Router) -> None:
     help_task = await fast_router.route(msg("/help"))
     unknown = await fast_router.route(msg("/frobnicate"))
     assert help_task is not None and unknown is not None
-    assert help_task.checkpoint == {
-        "fast_reply": HELP_REPLY,
-        "tool_used": None,
-        "intent": "question",
-    }
-    assert unknown.checkpoint["fast_reply"] == UNKNOWN_COMMAND_REPLY
+    assert help_task.checkpoint["tool_used"] is None
+    assert help_task.checkpoint["intent"] == "question"
+    assert help_task.checkpoint["fast_reply"].startswith("Commands:\n/status: ")
+    assert unknown.checkpoint["fast_reply"] == "Unknown command /frobnicate. Try /help."
+    bad = await fast_router.route(msg("/123"))
+    assert bad is not None and bad.checkpoint["fast_reply"] == UNKNOWN_COMMAND_REPLY
 
 
 async def test_fast_path_tool_error_is_templated(
@@ -410,6 +413,149 @@ async def test_non_owner_kill_is_refused(
         ]
         == 0
     )
+
+
+# --- command registry --------------------------------------------------------------------
+
+
+def _audit_count(db: sqlite3.Connection, action: str) -> int:
+    return db.execute("SELECT COUNT(*) FROM audit_log WHERE action = ?", (action,)).fetchone()[0]
+
+
+@pytest.mark.parametrize(
+    ("text", "reply"),
+    [
+        ("/stauts", "Unknown command /stauts. Did you mean /status?"),
+        ("/statu", "Unknown command /statu. Did you mean /status?"),
+        ("/kil", "Unknown command /kil. Did you mean /kill?"),
+        ("/zzzz", "Unknown command /zzzz. Try /help."),
+    ],
+)
+async def test_unknown_command_suggests_and_runs_nothing(
+    db: sqlite3.Connection,
+    fast_router: Router,
+    tool_calls: list[tuple[str, dict[str, Any]]],
+    text: str,
+    reply: str,
+) -> None:
+    killswitch.release(db, actor="test")
+    task = await fast_router.route(msg(text))
+    assert task is not None
+    assert task.checkpoint == {"fast_reply": reply, "tool_used": None, "intent": "unknown"}
+    assert tool_calls == []
+    assert _audit_count(db, "gate.evaluate") == 0
+    assert kv_get(db, "paused") is False  # "/kil" is one letter from /kill and never runs it
+
+
+@pytest.mark.parametrize(
+    ("text", "reply"),
+    [
+        ("/status now", "Usage: /status"),
+        ("/tasks all", "Usage: /tasks"),
+        ("/kill now please", "Usage: /kill"),
+    ],
+)
+async def test_bad_args_get_usage(
+    db: sqlite3.Connection,
+    fast_router: Router,
+    tool_calls: list[tuple[str, dict[str, Any]]],
+    text: str,
+    reply: str,
+) -> None:
+    killswitch.release(db, actor="test")
+    task = await fast_router.route(msg(text))
+    assert task is not None
+    assert task.checkpoint["fast_reply"] == reply
+    assert task.checkpoint["tool_used"] is None
+    assert tool_calls == []
+    assert kv_get(db, "paused") is False
+
+
+async def test_trailing_punctuation_is_not_an_argument(
+    fast_router: Router, tool_calls: list[tuple[str, dict[str, Any]]]
+) -> None:
+    task = await fast_router.route(msg("/status?"))
+    assert task is not None and task.checkpoint["tool_used"] == "daemon_status"
+    assert [name for name, _ in tool_calls] == ["daemon_status"]
+
+
+async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> None:
+    task = await fast_router.route(msg("/help"))
+    assert task is not None
+    assert task.checkpoint["fast_reply"] == (
+        "Commands:\n"
+        "/status: Resonant daemon status\n"
+        "/tasks: recent tasks\n"
+        "/help [word]: list commands, or the ones matching a word\n"
+        "/kill: stop autonomy and pause\n"
+        "/resume: turn autonomy back on\n"
+        "Or just ask: what's running, how's the mini, ping."
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "reply"),
+    [
+        ("/help task", 'Commands matching "task":\n/tasks: recent tasks'),
+        ("/help /Kill?", 'Commands matching "kill":\n/kill: stop autonomy and pause'),
+        ("/help stauts", 'Commands matching "stauts":\n/status: Resonant daemon status'),
+        (
+            "/help autonomy",
+            'Commands matching "autonomy":\n/kill: stop autonomy and pause\n'
+            "/resume: turn autonomy back on",
+        ),
+        ("/help remind", 'No command matches "remind". Try /help.'),
+    ],
+)
+async def test_help_word_filters(fast_router: Router, text: str, reply: str) -> None:
+    task = await fast_router.route(msg(text))
+    assert task is not None
+    assert task.checkpoint["fast_reply"] == reply
+    assert task.checkpoint["tool_used"] is None
+
+
+async def test_help_only_lists_what_a_member_may_use(fast_router: Router) -> None:
+    task = await fast_router.route(msg("/help", principal=MEMBER))
+    assert task is not None
+    assert task.checkpoint["fast_reply"] == (
+        "Commands:\n/help [word]: list commands, or the ones matching a word"
+    )
+    task = await fast_router.route(msg("/help kill", principal=MEMBER))
+    assert task is not None
+    assert task.checkpoint["fast_reply"] == 'No command matches "kill". Try /help.'
+
+
+async def test_fast_path_never_runs_a_side_effect_inline(
+    db: sqlite3.Connection, principals: Principals
+) -> None:
+    """Only reads skip the executor. A write command must become a task (P2-15)."""
+    write = ToolSpec(name="add_note", args_schema={"type": "object"}, effect=Effect.WRITE)
+    registry = ToolRegistry()
+    registry.register(write)
+    called: list[dict[str, Any]] = []
+
+    async def handler(args: dict[str, Any]) -> dict[str, Any]:
+        called.append(args)
+        return {}
+
+    class AllowAll:
+        def evaluate(self, intent: Intent) -> Decision:
+            return Allow(token="t")
+
+        def consume(self, token: str, intent_hash: str) -> bool:
+            return True
+
+    fast = FastPath(
+        db,
+        principals=principals,
+        registry=registry,
+        gate=AllowAll(),
+        handlers={(None, "add_note"): handler},
+    )
+    cmd = FastCommand("/note", "unknown", True, tool="add_note", args={"text": "x"})
+    result = await fast.run(cmd, principal=OWNER, event_id="E1")
+    assert result is not None and result.reply_text == NOT_ALLOWED
+    assert called == []
 
 
 # --- member principal --------------------------------------------------------------------

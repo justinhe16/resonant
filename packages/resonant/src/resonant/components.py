@@ -77,14 +77,14 @@ def build_components(
     from it. A missing principals.yaml is a warning (channels deny everyone); an invalid
     one is an error.
     """
-    registry = ToolRegistry()
-    handlers = register_builtins(registry, conn, state)
     path = settings.principals_path
     if path.exists():
         principals, loaded = load_principals(path), True
     else:
         log.warning("%s missing: denying all channel principals", path)
         principals, loaded = deny_all_principals(), False
+    registry = ToolRegistry()
+    handlers = register_builtins(registry, conn, state, principals=principals)
     gate = DryRunGate(conn, principals, registry)
     executor = Executor(conn, gate, handlers)
     return Components(

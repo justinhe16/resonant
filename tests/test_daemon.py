@@ -7,6 +7,7 @@ import httpx
 
 from resonant.config import load_settings
 from resonant.daemon import Daemon
+from resonant.tools.builtin import BUILTIN_SPECS
 
 
 def free_port() -> int:
@@ -34,7 +35,7 @@ async def test_daemon_serves_and_stops_cleanly() -> None:
         status = (await client.get(f"http://127.0.0.1:{port}/api/status")).json()
         tools = (await client.get(f"http://127.0.0.1:{port}/api/tools")).json()
     assert status["last_tick"] is not None
-    assert len(tools) == 5
+    assert len(tools) == len(BUILTIN_SPECS)
     daemon.stop()
     assert await asyncio.wait_for(run, 5) == 0
 
