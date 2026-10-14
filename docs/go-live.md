@@ -254,8 +254,8 @@ Times, codes and figures below are examples.
    - `/example incident failing` → within 5 minutes, once, at any hour: `[example] 🔴 Demo service failing: checkout 5xx`. A second `/ext run example/incident` says nothing more (same state, told once).
    - `/example incident resolved` → within 5 minutes: `[example] ✓ Demo service recovered`.
    - `/example incident resolved` again → `no incident open`, and nothing is texted.
-5. **Try the hourly "btw".** The example's fake `pnl` reports at `:55`. At the top of the next hour, if the rounded figure moved, one message: `btw:` / `[example] PnL -$1.8k today`. Or `/pulse` to preview it and `/pulse now` to send it. Nothing is sent in an hour where nothing changed.
-6. **Kill switch.** `/kill`, then `/example incident failing` and wait for the job: nothing arrives. `/pulse now` → `Paused: pulse not sent.`. `/resume`, then the next pulse carries what changed, once.
+5. **Try the hourly "btw".** The example's fake `pnl` reports at `:55`, and a job's first run after install is a silent baseline, so run `/ext run example/pnl` once first. After that, at the top of an hour in which the rounded figure moved (it follows the hour), one message: `btw:` / `[example] PnL -$1.8k today`. Or `/pulse` to preview it and `/pulse now` to send it. Nothing is sent in an hour where nothing changed.
+6. **Kill switch.** `/kill` pauses the scheduler, so no job runs and no report arrives while paused. With a `pnl` item pending, `/pulse now` → `Paused: pulse not sent.` Then `/resume`: the next pulse carries the pending `pnl` change, once. An urgent report is not held in a queue while paused: set `/example incident failing` after `/resume` and the `incident` job texts it within 5 minutes.
 7. **Mute.** `/ext mute example 1h`: example items are skipped by the pulse and the briefing. `/pulse` shows `example 1 (muted until …)` under `Open:`.
 8. **Clean up.** On the Mini: `resonant ext remove example`, type `example`.
 

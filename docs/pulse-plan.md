@@ -145,7 +145,7 @@ The first run after install is a baseline (as for notify): items are stored as t
 | U5 | 08:00 | The briefing always sends, with the Updates section; the 08:00 pulse doesn't. |
 | U6 | Paused | Nothing sent; after `/resume` the next pulse carries what changed, once. |
 | U7 | Grant | An extension granted `normal` that reports `urgent` waits for the pulse. One with no grant is refused. |
-| U8 | Muted | Its items are skipped while muted and not replayed after. |
+| U8 | Muted | Its items are skipped while muted and not replayed after. (As built: a held item still open when the mute ends is told once in the first pulse after; one that expired never is.) |
 | U9 | Approval re-mention | Once, at about 4h. |
 
 ## 6. Risks

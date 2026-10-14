@@ -32,8 +32,8 @@ key>``. A rerun of the same key (a crash between send and mark, a catch-up, a re
 recomposes: it resends the stored text (the channel drops it if it went out) and marks exactly
 those items told, compare-and-set, so an item that arrived since stays pending. A record
 that is done makes the rerun a ``duplicate``. A new key first finishes any other unsent record
-the same way (a run that raised after its send is not rerun: the scheduler consumes its due
-time). Records are pruned after 2 days.
+(under 2 hours old, items unchanged; else it is abandoned) the same way (a run that raised
+after its send is not rerun: the scheduler consumes its due time). Records are pruned after 2 days.
 """
 
 from __future__ import annotations
@@ -74,6 +74,7 @@ HEADER = "btw:"
 CORE = "core"
 INFLIGHT = "pulse.inflight:"  # kv: one record per dedupe key, see deliver()
 INFLIGHT_KEEP = timedelta(days=2)
+UNSENT_MAX_AGE = timedelta(hours=2)  # an unsent record older than this is abandoned
 ITEM_TTL_S = 24 * 3600
 LABEL_MAX = 60
 _BAD_KEY_CHARS = re.compile(r"[^a-z0-9/._:-]")
@@ -241,16 +242,26 @@ def _paused(conn: sqlite3.Connection) -> bool:
         return True  # fail closed, like the scheduler
 
 
+def _rec_at(rec: Any) -> datetime | None:
+    """The record's ``at``, or None when it is missing or corrupt (treated as abandoned)."""
+    try:
+        at = datetime.fromisoformat(str(cast(dict[str, Any], rec)["at"]))
+    except (KeyError, ValueError, TypeError):
+        return None
+    return at if at.utcoffset() is not None else None
+
+
 def prune_inflight(conn: sqlite3.Connection, now: datetime) -> None:
-    """Drop delivery records (done, or never finished) older than ``INFLIGHT_KEEP``."""
+    """Drop delivery records (done, or never finished) older than ``INFLIGHT_KEEP``, and
+    any whose ``at`` is corrupt."""
     rows = conn.execute("SELECT key FROM kv WHERE key LIKE ?", (INFLIGHT + "%",)).fetchall()
     with atomic(conn):
         for (k,) in rows:
             rec: Any = kv_get(conn, k)
             if not isinstance(rec, dict):
                 continue
-            at = str(cast(dict[str, Any], rec).get("at", ""))
-            if at and datetime.fromisoformat(at) < now - INFLIGHT_KEEP:
+            at = _rec_at(rec)
+            if at is None or at < now - INFLIGHT_KEEP:
                 conn.execute("DELETE FROM kv WHERE key = ?", (k,))
 
 
@@ -317,19 +328,46 @@ async def _finish_unsent(
     """Finish the delivery records of other keys that never got marked: a run that raised
     after its send (the scheduler consumes that due time, so no catch-up reruns it). Without
     this the next message would compose the same untold items again under a new key. The
-    channel drops the resend if it went out. Best effort: a failure here is logged."""
-    rows = conn.execute("SELECT key FROM kv WHERE key LIKE ?", (INFLIGHT + "%",)).fetchall()
-    for (k,) in rows:
-        if k == except_key:
-            continue
+    channel drops the resend if it went out.
+
+    Only a record younger than ``UNSENT_MAX_AGE`` whose items still have the recorded
+    fingerprints is resent (oldest first). Anything else is abandoned (the record is
+    deleted; its items stay pending and are recomposed fresh, never as stale text). A resend
+    that fails is logged and the record is tried again on the next delivery, until it ages
+    out."""
+    pending: list[tuple[datetime, str, dict[str, Any]]] = []
+    abandoned: list[str] = []
+    for (k,) in conn.execute("SELECT key FROM kv WHERE key LIKE ?", (INFLIGHT + "%",)).fetchall():
         raw: Any = kv_get(conn, k)
-        if not isinstance(raw, dict) or cast(dict[str, Any], raw).get("sent"):
+        if k == except_key or not isinstance(raw, dict) or cast(dict[str, Any], raw).get("sent"):
             continue
         rec = cast(dict[str, Any], raw)
+        at = _rec_at(rec)
+        if at is None or now - at > UNSENT_MAX_AGE or not _still_current(conn, rec):
+            abandoned.append(k)
+        else:
+            pending.append((at, k, rec))
+    if abandoned:
+        with atomic(conn):
+            for k in abandoned:
+                conn.execute("DELETE FROM kv WHERE key = ?", (k,))
+    for _at, k, rec in sorted(pending, key=lambda p: (p[0], p[1])):
         try:
             await _send_recorded(conn, channel, owner, k.removeprefix(INFLIGHT), rec, now)
         except Exception:
             log.warning("pulse: could not finish an earlier delivery", extra={"key": k})
+
+
+def _still_current(conn: sqlite3.Connection, rec: dict[str, Any]) -> bool:
+    """Every item in the record still has the fingerprint the text was composed from."""
+    try:
+        for source, ikey, fp in cast(list[list[str]], rec["items"]):
+            item = store.get(conn, source, ikey)
+            if item is None or item.fingerprint != fp:
+                return False
+    except (KeyError, ValueError, TypeError):
+        return False
+    return True
 
 
 async def send_pulse(

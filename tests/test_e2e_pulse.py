@@ -329,7 +329,7 @@ async def test_u5_briefing_always_sends_with_updates_and_the_8am_pulse_does_not(
         await w.tick(at(10, 8))
         # One message at 08:00: the briefing, with the Updates section; no "btw".
         (text,) = w.texts()
-        assert text.startswith("Updates:") or "Updates:" in text
+        assert "Updates:" in text
         assert "[trader] PnL +$1k" in text and "[dori] 3 PRs open" in text
         assert not text.startswith("btw:")
         assert not w.item("trader", "pnl").changed and not w.item("dori", "digest").changed
@@ -382,7 +382,7 @@ async def test_u7_a_normal_grant_clamps_urgent_and_no_grant_is_refused(
 # --- U8: muted -------------------------------------------------------------------------------
 
 
-async def test_u8_muted_items_are_skipped_and_never_replayed_as_duplicates(
+async def test_u8_muted_items_are_skipped_then_told_once_after_the_mute_if_still_open(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
     async with world(resonant_home, chat, at(10, 9, 0)) as w:
@@ -500,7 +500,9 @@ async def test_crash_between_pulse_send_and_told_is_texted_once(
 
 
 async def test_pulse_commands_over_imessage(resonant_home: Path, chat: FakeChatDB) -> None:
-    settings = make_settings(resonant_home, chat)
+    settings = make_settings(
+        resonant_home, chat, pulse={"enabled": False}, briefing={"enabled": False}
+    )
     osa = RecordingOsaRunner()
     daemon = Daemon(
         settings,
@@ -561,3 +563,79 @@ async def test_failed_pulse_job_after_send_does_not_repeat_the_text_next_hour(
         await w.tick(at(10, 11))
         assert w.texts() == ["btw:\n[trader] PnL -$1.8k today"]
         assert not w.item("trader", "pnl").changed
+
+
+async def _unsent_pulse(w: World, monkeypatch: pytest.MonkeyPatch, hour: int) -> None:
+    """A pulse whose send went out but whose job raised before marking (due time consumed)."""
+    real = items.mark_told
+
+    def fails(*args: Any, **kw: Any) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(items, "mark_told", fails)
+    await w.tick(at(10, hour))
+    monkeypatch.setattr(items, "mark_told", real)
+
+
+async def test_unsent_record_older_than_two_hours_is_abandoned_and_recomposed(
+    resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with world(resonant_home, chat, at(10, 9, 0)) as w:
+        await w.report("trader", "pnl", "PnL -$1.8k today", state={"b": -2})
+        await _unsent_pulse(w, monkeypatch, 10)
+        # Hours later the item is still untold: the stale text is not resent, a fresh one is.
+        await w.tick(at(10, 13))
+        assert w.texts() == ["btw:\n[trader] PnL -$1.8k today"] * 2
+        assert not w.item("trader", "pnl").changed
+
+
+async def test_unsent_record_of_a_changed_item_is_abandoned(
+    resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with world(resonant_home, chat, at(10, 9, 0)) as w:
+        await w.report("trader", "pnl", "PnL -$1.8k today", state={"b": -2})
+        await _unsent_pulse(w, monkeypatch, 10)
+        await w.report("trader", "pnl", "PnL +$1k today", state={"b": 1})
+        await w.tick(at(10, 11))
+        assert w.texts() == ["btw:\n[trader] PnL -$1.8k today", "btw:\n[trader] PnL +$1k today"]
+
+
+async def test_unsent_records_are_finished_oldest_first_and_a_corrupt_one_is_dropped(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    async with world(resonant_home, chat, at(10, 9, 0)) as w:
+        sent: list[str] = []
+
+        class Recording:
+            async def send(
+                self, principal: str, text: str, *, dedupe_key: str | None = None
+            ) -> None:
+                sent.append(text)
+
+        now = at(10, 10)
+        for name, when in (("z-newer", at(10, 9, 40)), ("a-older", at(10, 9, 10))):
+            _, it = items.upsert(w.conn, "trader", name, name, "normal", None, False, 3600, when)
+            kv_set(
+                w.conn,
+                pulse_job.INFLIGHT + name,
+                {
+                    "text": name,
+                    "items": [["trader", name, it.fingerprint]],
+                    "sent": False,
+                    "at": iso(when),
+                },
+            )
+        kv_set(
+            w.conn,
+            pulse_job.INFLIGHT + "bad",
+            {"text": "x", "items": [], "sent": False, "at": "??"},
+        )
+        await pulse_job._finish_unsent(w.conn, Recording(), "justin", now, except_key="")  # type: ignore[arg-type]
+        assert sent == ["a-older", "z-newer"]
+        assert (
+            w.conn.execute(
+                "SELECT 1 FROM kv WHERE key = ?", (pulse_job.INFLIGHT + "bad",)
+            ).fetchone()
+            is None
+        )
+        pulse_job.prune_inflight(w.conn, now)  # a corrupt record never breaks pruning
