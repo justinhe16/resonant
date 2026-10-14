@@ -87,6 +87,7 @@ from resonant.observability.spans import span
 from resonant.router.fast_path import render_mini, render_status, render_tasks
 from resonant.router.intents import UNKNOWN, IntentLabel, parse_intent
 from resonant.router.prefixes import FALLBACK_REPLY, runner_system, wrap_untrusted
+from resonant.router.render import render_projects
 from resonant.store import approvals as ap
 from resonant.store.db import transaction, utcnow
 from resonant.store.tasks import get_event, get_task, principal_thread
@@ -193,6 +194,7 @@ _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "daemon_status": render_status,
     "list_tasks": render_tasks,
     "model_status": render_model,
+    "projects": render_projects,
     "system_status": render_mini,
     "task_counts": render_counts,
 }

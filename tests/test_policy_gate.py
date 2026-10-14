@@ -13,7 +13,6 @@ from resonant.config import load_settings
 from resonant.executor import Executor, NotAllowedError, ToolFailed, idempotency_key
 from resonant.gate import (
     Allow,
-    ApprovalReply,
     ApprovalResolution,
     Decision,
     Deny,
@@ -481,11 +480,9 @@ def test_resolve_checks_approver_and_wakes_the_task(
     assert json.loads(rows[0]["detail"])["reason"] == "not an approver"
 
 
-def test_reply_binding_and_batches_are_not_here_yet(gate: PolicyGate) -> None:
+def test_batches_are_deferred(gate: PolicyGate) -> None:
     contract: Gate = gate  # PolicyGate satisfies the Gate protocol
     assert contract is gate
-    reply = ApprovalReply("justin", "imessage:+1", "imessage", "yes", "approve", "parser")
-    assert not gate.resolve_reply(reply).ok
     with pytest.raises(NotImplementedError):
         gate.open_batch("justin", [])
 

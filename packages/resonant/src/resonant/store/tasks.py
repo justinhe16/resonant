@@ -61,8 +61,8 @@ def insert_task(conn: sqlite3.Connection, spec: NewTask) -> str:
     ts = now_iso()
     conn.execute(
         """INSERT INTO tasks (id, kind, runner, extension, principal, lane, priority, checkpoint,
-               scope, origin_event_id, channel_ref, trace_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               scope, origin_event_id, channel_ref, trace_id, wake_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task_id,
             spec.kind,
@@ -76,6 +76,7 @@ def insert_task(conn: sqlite3.Connection, spec: NewTask) -> str:
             spec.origin_event_id,
             _dump(spec.channel_ref),
             spec.trace_id or new_id(),
+            None if spec.wake_at is None else iso(spec.wake_at),
             ts,
             ts,
         ),
@@ -96,6 +97,20 @@ def runnable_tasks(conn: sqlite3.Connection, now: datetime, limit: int) -> list[
         (iso(now), limit),
     ).fetchall()
     return [row_to_task(r) for r in rows]
+
+
+def next_wake_at(conn: sqlite3.Connection, after: datetime) -> datetime | None:
+    """The earliest ``wake_at`` after ``after`` among queued and waiting tasks, or None.
+
+    The loop sleeps until then instead of a whole tick. Already-due tasks are excluded:
+    they are runnable now (or wake on this tick), so they never cause a busy loop.
+    """
+    row = conn.execute(
+        """SELECT MIN(wake_at) AS w FROM tasks
+           WHERE status IN ('queued', 'waiting') AND wake_at > ?""",
+        (iso(after),),
+    ).fetchone()
+    return _dt(row["w"])
 
 
 def wake_due(conn: sqlite3.Connection, now: datetime) -> int:

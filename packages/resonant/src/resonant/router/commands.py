@@ -42,6 +42,15 @@ def no_args(rest: str) -> dict[str, Any]:
     return {}
 
 
+def projects_args(rest: str) -> dict[str, Any]:
+    word = _word(rest)
+    if word == "all":
+        return {"all": True}
+    if word:
+        raise UsageError
+    return {}
+
+
 def _word(text: str) -> str:
     """Lowercased, whitespace collapsed, a leading ``/`` and trailing ``?!.`` dropped."""
     t = " ".join(text.lower().split()).rstrip("?!. ")
@@ -81,7 +90,22 @@ HELP = Command(
 
 COMMANDS: tuple[Command, ...] = (
     Command("/status", "/status", "Resonant daemon status", "system", tool="daemon_status"),
-    Command("/tasks", "/tasks", "recent tasks", "job_control", tool="list_tasks"),
+    Command(
+        "/projects",
+        "/projects [all]",
+        "open work and recent tasks",
+        "job_control",
+        tool="projects",
+        parse=projects_args,
+    ),
+    Command(
+        "/tasks",
+        "/tasks [all]",
+        "same as /projects",
+        "job_control",
+        tool="projects",
+        parse=projects_args,
+    ),
     HELP,
     Command("/kill", "/kill", "stop autonomy and pause", "system", owner_only=True),
     Command("/resume", "/resume", "turn autonomy back on", "system", owner_only=True),
