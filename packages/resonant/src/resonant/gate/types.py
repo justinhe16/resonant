@@ -49,6 +49,13 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+# Who chose the action. "explicit": the owner typed a slash command, so the call is
+# consent; code sets it only on the local runner's direct_call path. "inferred": the model
+# (or, later, a scheduled or extension job) chose it. Never taken from model output.
+Origin = Literal["explicit", "inferred"]
+ORIGINS: tuple[Origin, ...] = ("explicit", "inferred")
+
+
 @dataclass(frozen=True)
 class Intent:
     """A request to run one registered tool with specific args. Build it with ``for_tool``.
@@ -56,6 +63,8 @@ class Intent:
     Effect, level, and commit come from the ToolSpec, never from the caller or the model.
     ``hash`` is recomputed on every access over everything that matters, so changing
     ``args`` after approval changes the hash and the approval no longer matches.
+    ``origin`` is deliberately not hashed: an approval binds to what runs, not to who
+    asked for it.
     """
 
     task_id: str
@@ -64,8 +73,11 @@ class Intent:
     args: dict[str, Any]
     scope_id: str | None = None
     trace_id: str | None = None
+    origin: Origin = "inferred"
 
     def __post_init__(self) -> None:
+        if self.origin not in ORIGINS:
+            raise ValueError(f"unknown origin {self.origin!r}")
         canonical_json(self.args)
         object.__setattr__(self, "args", copy.deepcopy(self.args))
 
@@ -79,8 +91,9 @@ class Intent:
         args: dict[str, Any],
         scope_id: str | None = None,
         trace_id: str | None = None,
+        origin: Origin = "inferred",
     ) -> Intent:
-        return cls(task_id, principal, spec, args, scope_id, trace_id)
+        return cls(task_id, principal, spec, args, scope_id, trace_id, origin)
 
     @property
     def tool(self) -> str:

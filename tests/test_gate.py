@@ -6,7 +6,13 @@ import sqlite3
 import pytest
 
 from resonant.gate import Allow, ApprovalResolution, Deny, DryRun, DryRunGate, Intent
-from resonant.gate.codes import CODE_PATTERN, approval_text, new_code, sanitize_external
+from resonant.gate.codes import (
+    CODE_PATTERN,
+    approval_text,
+    clean_external,
+    new_code,
+    sanitize_external,
+)
 from resonant.gate.types import canonical_json
 from resonant.principals import Principals
 from resonant.tools import ToolRegistry
@@ -63,6 +69,22 @@ def test_hash_is_canonical_and_tracks_mutation() -> None:
     before = a.hash
     a.args["a"] = 999  # mutating after construction changes the hash, so approvals won't match
     assert a.hash != before
+
+
+def test_origin_defaults_to_inferred_and_is_not_hashed() -> None:
+    inferred = intent(a=1)
+    assert inferred.origin == "inferred"
+    explicit = Intent.for_tool(
+        RESTART, task_id="t1", principal="justin", args={"a": 1}, origin="explicit"
+    )
+    assert explicit.origin == "explicit"
+    # An approval binds to what runs, not to who asked for it.
+    assert explicit.hash == inferred.hash
+
+
+def test_unknown_origin_rejected() -> None:
+    with pytest.raises(ValueError, match="origin"):
+        Intent(task_id="t", principal="justin", spec=RESTART, args={}, origin="model")  # pyright: ignore[reportArgumentType]
 
 
 def test_args_are_copied() -> None:
@@ -168,7 +190,20 @@ def test_sanitize_keeps_ordinary_text() -> None:
 
 
 def test_approval_text() -> None:
-    assert approval_text("A7", "Send email to X re: Y") == (
-        "[A7] Send email to X re: Y? Reply yes / no / yes with comments: …"
+    assert approval_text("A7", "restart Resonant") == "[A7] restart Resonant? Reply yes / no"
+    assert approval_text("P3", "Pay $5 to X", require_code=True) == (
+        "[P3] Pay $5 to X? Reply exactly: yes P3 / no P3"
     )
-    assert "yes A7" in approval_text("A7", "Pay $5 to X", require_code=True)
+
+
+def test_destructive_approval_text() -> None:
+    expected = "[D7] delete all 4 notes? This can't be undone. Reply yes D7 / no"
+    assert approval_text("D7", "delete all 4 notes", destructive=True) == expected
+    # Destructive wins over the pay wording when both are set.
+    assert approval_text("D7", "delete all 4 notes", destructive=True, require_code=True) == (
+        expected
+    )
+
+
+def test_clean_external_does_not_truncate_or_quote() -> None:
+    assert clean_external("  vitamin\n d3 " + "x" * 80) == "vitamin ? " + "x" * 80
