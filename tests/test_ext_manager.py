@@ -43,7 +43,7 @@ from resonant.ops import restart_pending
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.secrets import FakeKeychain, SecretStore
 from resonant.store import extensions as ext_store
-from resonant.store.db import open_db
+from resonant.store.db import atomic, kv_get, kv_set, open_db
 
 MANIFEST = """\
 name: demo
@@ -88,6 +88,13 @@ def write_ext(root: Path, manifest: str = MANIFEST, **files: str) -> Path:
     for name, text in files.items():
         (root / name).write_text(text)
     return root
+
+
+@pytest.fixture(autouse=True)
+def no_real_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test here may reach a real daemon or spawn a restart helper."""
+    monkeypatch.setattr(cli, "_daemon_up", _daemon(up=False))
+    monkeypatch.setattr(cli, "_restart_runner", FakeOpsRunner)
 
 
 @pytest.fixture
@@ -184,8 +191,8 @@ def test_repo_source_copies_the_head_commit_not_the_working_tree(
     # Read-only copy; argv[0] pinned to the copy; the data dir records its source.
     assert not os.access(final / "cli.py", os.W_OK) and not os.access(final, os.W_OK)
     assert record.argv0_paths == {"status": str((final / "cli.py").resolve())}
-    marker = json.loads((resonant_home / "ext-data" / "demo" / ".resonant-source").read_text())
-    assert marker == {"source": "repo:demo", "secrets": []}
+    assert (resonant_home / "ext-data" / "demo" / "tmp").is_dir()
+    assert kv_get(conn, "ext.origin.demo") == {"source": "repo:demo", "secrets": []}
     (row,) = ext_store.list_extensions(conn)
     assert row.manifest["name"] == "demo" and row.commit == head
     (event,) = audits(conn, "ext.install")
@@ -424,10 +431,49 @@ def test_secrets_left_by_previous_source_need_adopt(
     mgr.discard(staged)
 
 
+def test_secrets_survive_purge_and_still_need_adopt(
+    mgr: ExtensionManager, repo: Path, tmp_path: Path, keychain: FakeKeychain
+) -> None:
+    (repo / "extensions" / "demo" / "resonant.yaml").write_text(MANIFEST + "secrets: [token]\n")
+    commit_all(repo)
+    first = mgr.stage("repo:demo")
+    mgr.discard(first)
+    mgr.install(first.pin, name="demo")
+    keychain.items["demo/token"] = "q" * 12
+    assert mgr.remove("demo", purge=True).secrets_left == ["demo/token"]
+    src = tmp_path / "work"
+    src.mkdir()
+    git(src, "init", "-q", "-b", "main")
+    write_ext(src, MANIFEST)
+    commit_all(src)
+    staged = mgr.stage(f"path:{src}")
+    mgr.discard(staged)
+    assert any("Keychain items demo/token" in r for r in mgr.leftovers(staged))
+    with pytest.raises(AdoptRequired):
+        mgr.install(staged.pin, name="demo")
+
+
+def test_commands_must_be_shown_verbatim(mgr: ExtensionManager, repo: Path) -> None:
+    long_arg = "x" * 400
+    (repo / "extensions" / "demo" / "resonant.yaml").write_text(
+        MANIFEST.replace("./cli.py status", f"./cli.py status {long_arg}")
+    )
+    commit_all(repo)
+    with pytest.raises(ManagerError) as e:
+        mgr.stage("repo:demo")
+    assert "printable ASCII" in "\n".join(e.value.problems)
+    (repo / "extensions" / "demo" / "resonant.yaml").write_text(
+        MANIFEST.replace("./cli.py status", "./cli.py st\u00e4tus")
+    )
+    commit_all(repo)
+    with pytest.raises(ManagerError):
+        mgr.stage("repo:demo")
+
+
 def test_unmarked_data_dir_needs_adopt(mgr: ExtensionManager, resonant_home: Path) -> None:
     (resonant_home / "ext-data" / "demo").mkdir(parents=True)
     staged = mgr.stage("repo:demo")
-    assert any("doesn't record" in r for r in mgr.leftovers(staged))
+    assert any("no install recorded" in r for r in mgr.leftovers(staged))
     mgr.discard(staged)
 
 
@@ -634,15 +680,13 @@ def test_cli_add_leftovers_need_adopt(
 ) -> None:
     data = resonant_home / "ext-data" / "demo"
     data.mkdir(parents=True)
-    (data / ".resonant-source").write_text('{"source": "path:/elsewhere"}\n')
+    with atomic(conn):
+        kv_set(conn, "ext.origin.demo", {"source": "path:/elsewhere", "secrets": []})
     code, out = invoke("add", "repo:demo", input="demo\n")
     assert code == 1 and "--adopt" in out and "created by path:/elsewhere" in out
     code, out = invoke("add", "repo:demo", "--adopt", input="demo\n")
     assert code == 0, out
-    assert json.loads((data / ".resonant-source").read_text()) == {
-        "source": "repo:demo",
-        "secrets": [],
-    }
+    assert kv_get(conn, "ext.origin.demo") == {"source": "repo:demo", "secrets": []}
 
 
 def test_cli_update_shows_diff_and_reconfirms(
@@ -685,11 +729,10 @@ def test_cli_remove(
 
 
 def test_cli_keychain_unavailable_is_tempfail(
-    cli_env: FakeOpsRunner, keychain: FakeKeychain, resonant_home: Path, repo: Path
+    cli_env: FakeOpsRunner, keychain: FakeKeychain, conn: sqlite3.Connection, repo: Path
 ) -> None:
-    data = resonant_home / "ext-data" / "demo"
-    data.mkdir(parents=True)
-    (data / ".resonant-source").write_text('{"source": "path:/elsewhere"}\n')
+    with atomic(conn):
+        kv_set(conn, "ext.origin.demo", {"source": "path:/elsewhere", "secrets": ["token"]})
     (repo / "extensions" / "demo" / "resonant.yaml").write_text(MANIFEST + "secrets: [token]\n")
     commit_all(repo)
     keychain.fail_with = 51  # not "not found": the Keychain can't answer

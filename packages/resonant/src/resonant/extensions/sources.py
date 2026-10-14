@@ -120,7 +120,7 @@ class _Writer:
     """Writes entries into ``dest``, enforcing size and type limits."""
 
     def __init__(self, dest: Path) -> None:
-        self.dest = dest
+        self.dest = dest.resolve()
         self.total = 0
         self.count = 0
 
@@ -130,24 +130,35 @@ class _Writer:
         if self.total > MAX_TREE_BYTES or self.count > MAX_FILES:
             raise SourceError("the extension tree is too large")
 
+    def _target(self, rel: str) -> Path:
+        """``dest/rel`` with its parent dirs made, refusing a parent that leaves ``dest``
+        (a write through an earlier symlink entry)."""
+        path = self.dest / _safe_rel(rel)
+        for parent in reversed(path.relative_to(self.dest).parents):
+            p = self.dest / parent
+            if p.is_symlink():
+                raise SourceError(f"{rel}: path goes through a symlink")
+            p.mkdir(exist_ok=True)
+        if not path.parent.resolve().is_relative_to(self.dest):
+            raise SourceError(f"{rel}: path leaves the extension dir")
+        return path
+
     def file(self, rel: str, data: bytes, *, executable: bool) -> None:
         self._count(len(data))
-        path = self.dest / _safe_rel(rel)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = self._target(rel)
         with open(path, "xb") as f:  # never follows or overwrites an existing entry
             f.write(data)
         path.chmod(0o755 if executable else 0o644)
 
     def symlink(self, rel: str, target: str) -> None:
         self._count(len(target))
-        path = self.dest / _safe_rel(rel)
+        path = self._target(rel)
         if not target or "\0" in target or os.path.isabs(target):
             raise SourceError(f"{rel}: symlink must point inside the extension dir")
         # Lexical check here; the resolve-based check in checks.dir_errors runs on the result.
         joined = os.path.normpath(os.path.join(os.path.dirname(rel), target))
         if joined == ".." or joined.startswith("../"):
             raise SourceError(f"{rel}: symlink resolves outside the extension dir")
-        path.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(target, path)
 
 
@@ -231,15 +242,24 @@ def _cat_blobs(cwd: Path, shas: Sequence[str]) -> dict[str, bytes]:
     out = git(cwd, "cat-file", "--batch", stdin="".join(f"{s}\n" for s in unique).encode()).stdout
     blobs: dict[str, bytes] = {}
     pos = 0
-    for sha in unique:
-        nl = out.index(b"\n", pos)
-        header = out[pos:nl].decode().split()
-        if len(header) != 3 or header[0] != sha or header[1] != "blob":
-            raise SourceError(f"git cat-file: unexpected object for {sha[:8]}")
-        size = int(header[2])
-        blobs[sha] = out[nl + 1 : nl + 1 + size]
-        pos = nl + 1 + size + 1  # content, then a newline
+    try:
+        for sha in unique:
+            blobs[sha], pos = _next_blob(out, pos, sha)
+    except (ValueError, IndexError):
+        raise SourceError("git cat-file: unexpected output") from None
     return blobs
+
+
+def _next_blob(out: bytes, pos: int, sha: str) -> tuple[bytes, int]:
+    """One ``<sha> blob <size>\\n<content>\\n`` record at ``pos``: (content, next pos)."""
+    nl = out.index(b"\n", pos)
+    header = out[pos:nl].decode().split()
+    if len(header) != 3 or header[0] != sha or header[1] != "blob":
+        raise SourceError(f"git cat-file: unexpected object for {sha[:8]}")
+    size = int(header[2])
+    if len(out) < nl + 1 + size:
+        raise ValueError("short read")
+    return out[nl + 1 : nl + 1 + size], nl + 1 + size + 1  # content, then a newline
 
 
 def make_readonly(root: Path) -> None:

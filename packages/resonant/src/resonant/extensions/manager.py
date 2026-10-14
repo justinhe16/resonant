@@ -13,17 +13,17 @@ Terminal only. The flow for ``resonant ext add`` and ``ext update``:
    tree into ``<extensions_dir>/<name>/`` (read-only), recomputes the pin on the copy, and
    only then writes the row and the audit row in one transaction.
 
-Leftovers: the data dir records the source that created it and the secret names it
-declared (``.resonant-source``), so they survive ``remove``. If it, or
-Keychain items for the extension, exist from a *different* source, ``--adopt`` is required,
-so a new source never silently inherits old state or secrets.
+Leftovers: each install records its source and declared secret names in kv
+``ext.origin.<name>``. It survives ``remove`` and ``--purge`` and lives outside anything
+an extension can write. If the data dir, or Keychain items an install from a *different*
+source declared, still exist, ``--adopt`` is required, so a new source never silently
+inherits old state or secrets.
 """
 
 from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
 import re
 import secrets as pysecrets
 import shlex
@@ -65,13 +65,14 @@ from resonant.principals import Principals
 from resonant.secrets import InvalidSecretRef, secret_ref
 from resonant.store import extensions as ext_store
 from resonant.store.audit import audit
-from resonant.store.db import atomic, utcnow
+from resonant.store.db import atomic, kv_get, kv_set, utcnow
 from resonant_sdk import Manifest, load_manifest
 from resonant_sdk.tool import Level
 
 MANIFEST_FILE = "resonant.yaml"
-SOURCE_MARKER = ".resonant-source"  # in the data dir: the source that created it
+ORIGIN_KEY = "ext.origin.{name}"  # kv: {source, secrets} of the last install
 NETWORK_COMMANDS = frozenset({"gh", "git"})
+MAX_RUN_CHARS = 300  # commands are shown in full, verbatim
 TOOL_WARN_COUNT = 12  # above this, routing accuracy suffers (plan D9)
 _ASKS = (Level.L1, Level.L2)
 
@@ -207,20 +208,20 @@ def confirm_lines(staged: Staged) -> list[str]:
             f": {_s(spec.description or '-')}"
         )
     for name, tool in m.tools.items():
-        lines.append(f"    {_s(name, 40)} runs {_s(tool.run, 100)}")
+        lines.append(f"    {_s(name, 40)} runs {tool.run}")
     lines.append("Jobs:" if m.jobs else "Jobs: none")
     for job in m.jobs:
         spec = job.spec(m.name)
         lines.append(
             f"  {_s(job.id, 40)} {schedule_words(job.schedule, job.tz)}, "
             f"{spec.effect.value} {spec.effective_level.value}, catchup {_s(job.catchup, 10)}"
-            f", runs {_s(job.run, 100)}"
+            f", runs {job.run}"
         )
     if m.notify:
         events = ", ".join(_s(e, 40) for e in m.notify.on)
         lines.append(f"Notify: {events} via {m.notify.channel}")
     if m.health:
-        lines.append(f"Health: {_s(m.health.check, 100)} every {_s(m.health.every, 10)}")
+        lines.append(f"Health: {m.health.check} every {_s(m.health.every, 10)}")
     if len(m.tools) > TOOL_WARN_COUNT:
         lines.append(f"warning: {len(m.tools)} tools; above {TOOL_WARN_COUNT} routing suffers")
     lines += [f"note: {n}" for n in staged.notes]
@@ -327,6 +328,12 @@ class ExtensionManager:
 
     def _problems(self, src: Source, manifest: Manifest, root: Path) -> list[str]:
         problems = name_errors(manifest) + dir_errors(root, manifest)
+        for where, run in commands(manifest):
+            # Shown verbatim in the confirmation, so it must be plain printable ASCII.
+            if not (run.isascii() and run.isprintable()) or len(run) > MAX_RUN_CHARS:
+                problems.append(
+                    f"{where}: run must be printable ASCII, at most {MAX_RUN_CHARS} chars"
+                )
         problems += approver_errors(manifest, self.principals)
         if src.kind == "repo" and manifest.name != src.arg:
             problems.append(f"repo:{src.arg} declares the name {manifest.name!r}")
@@ -350,21 +357,18 @@ class ExtensionManager:
     def data_dir_for(self, name: str) -> Path:
         return self.data_dir / name
 
-    def _marker(self, name: str) -> dict[str, object]:
-        try:
-            data: object = json.loads((self.data_dir_for(name) / SOURCE_MARKER).read_text())
-        except (OSError, ValueError):
-            return {}
-        return cast(dict[str, object], data) if isinstance(data, dict) else {}
+    def _origin(self, name: str) -> dict[str, object]:
+        value: object = kv_get(self.conn, ORIGIN_KEY.format(name=name))
+        return cast(dict[str, object], value) if isinstance(value, dict) else {}
 
     def recorded_source(self, name: str) -> str | None:
-        """The source recorded in the data dir, or None (no dir, or no marker)."""
-        value = self._marker(name).get("source")
+        """The source of the last install of ``name`` (kept after remove), or None."""
+        value = self._origin(name).get("source")
         return value if isinstance(value, str) else None
 
     def recorded_secrets(self, name: str) -> list[str]:
-        """Secret names the last install from the recorded source declared."""
-        value = self._marker(name).get("secrets")
+        """Secret names the last install of ``name`` declared."""
+        value = self._origin(name).get("secrets")
         items = cast(list[object], value) if isinstance(value, list) else []
         return [v for v in items if isinstance(v, str)]
 
@@ -389,7 +393,7 @@ class ExtensionManager:
         old_secrets += self.recorded_secrets(name)
         reasons: list[str] = []
         if data.exists() and prior is None:
-            reasons.append(f"{data} exists but doesn't record which source created it")
+            reasons.append(f"{data} exists but no install recorded which source created it")
         if prior is not None and prior != source:
             if data.exists():
                 reasons.append(f"{data} was created by {prior}")
@@ -450,6 +454,8 @@ class ExtensionManager:
             with atomic(self.conn):
                 ext_store.save_extension(self.conn, record)
                 ext_store.prune_jobs(self.conn, name, [j.id for j in staged.manifest.jobs])
+                origin = {"source": approved.source, "secrets": sorted(staged.manifest.secrets)}
+                kv_set(self.conn, ORIGIN_KEY.format(name=name), origin)
                 audit(
                     self.conn,
                     action,
@@ -463,16 +469,15 @@ class ExtensionManager:
                     path="cli",
                 )
         except BaseException:
-            if swapped:
-                remove_tree(final)
-            else:
-                remove_tree(staged.root)
-            if old_tmp is not None:
-                old_tmp.rename(final)
+            try:
+                remove_tree(final if swapped else staged.root)
+            finally:
+                if old_tmp is not None:
+                    old_tmp.rename(final)
             raise
         if old_tmp is not None:
             remove_tree(old_tmp)
-        self._ensure_data_dir(name, approved.source, staged.manifest.secrets)
+        self._ensure_data_dir(name)
         return record
 
     def _argv0_paths(self, root: Path, manifest: Manifest) -> dict[str, str]:
@@ -485,13 +490,10 @@ class ExtensionManager:
             for where, run in commands(manifest)
         }
 
-    def _ensure_data_dir(self, name: str, source: str, secrets: Iterable[str]) -> None:
-        """Create the data dir and record which source (and secret names) it belongs to."""
+    def _ensure_data_dir(self, name: str) -> None:
         data = self.data_dir_for(name)
         data.mkdir(mode=0o700, parents=True, exist_ok=True)
         (data / "tmp").mkdir(mode=0o700, exist_ok=True)
-        marker = {"source": source, "secrets": sorted(set(secrets))}
-        (data / SOURCE_MARKER).write_text(json.dumps(marker) + "\n")
 
     # --- remove -----------------------------------------------------------------------
 
