@@ -23,6 +23,7 @@ alone: those are not tampering. A load never raises for one bad extension.
 
 ``handlers`` is merged into the executor's map at build. ``approvers_for`` is the gate's
 manifest-approvers seam. ``tracker`` is the one ``ProcessTracker`` for the kill switch.
+``scheduled_jobs()`` is what the scheduler (``extensions/scheduler.py``) runs.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set
 from resonant.tools.registry import ToolRegistry
 from resonant_sdk import Manifest, ToolSpec
-from resonant_sdk.manifest import load_manifest
+from resonant_sdk.manifest import Job, load_manifest
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +81,14 @@ class LoadedExtension:
     root: Path
     tools: tuple[ToolSpec, ...]
     jobs: tuple[ToolSpec, ...]
+
+
+@dataclass(frozen=True)
+class HostJob:
+    ext: str
+    job: Job  # the manifest entry: schedule, tz, catchup
+    spec: ToolSpec  # the registered job_<id> spec
+    handler: ExtensionHandler
 
 
 class LoadRefused(Exception):
@@ -281,6 +290,20 @@ class ExtensionHost:
             if extension is None or name == extension
             for s in sorted(self.loaded[name].jobs, key=lambda s: s.name)
         ]
+
+    def scheduled_jobs(self) -> list[HostJob]:
+        """Every loaded job with its manifest entry, registered spec and handler, by
+        extension then job id."""
+        out: list[HostJob] = []
+        for name in sorted(self.loaded):
+            ext = self.loaded[name]
+            specs = {s.name: s for s in ext.jobs}
+            for job in sorted(ext.manifest.jobs, key=lambda j: j.id):
+                spec = specs.get(job.spec_name)
+                handler = self.handlers.get((name, job.spec_name))
+                if spec is not None and handler is not None:
+                    out.append(HostJob(name, job, spec, handler))
+        return out
 
     def manifest(self, name: str) -> Manifest | None:
         ext = self.loaded.get(name)

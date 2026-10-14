@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import inspect
 import json
 import logging
 import socket
@@ -22,25 +23,30 @@ import sqlite3
 import urllib.parse
 from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import psutil
 import pytest
 
+import resonant_sdk.emit
 from resonant.components import Components
 from resonant.config import Settings, load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.e2e.extensions import install_fixture
 from resonant.extensions.host import tampered_text
+from resonant.extensions.scheduler import LAST_TICK_KEY
 from resonant.gate import Allow, Intent
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import NewTask
 from resonant.loop.types import PRIORITY_OWNER, Done, StepContext, StepOutcome, Task
 from resonant.ops.fakes import FakeOpsRunner
+from resonant.router.fast_path import KILL_REPLY, RESUME_REPLY
 from resonant.secrets import FakeKeychain, SecretStore
-from resonant.store.db import iso, kv_set, open_db, utcnow
-from resonant.store.extensions import get_extension
+from resonant.store.db import iso, kv_set, open_db, transaction, utcnow
+from resonant.store.extensions import get_extension, mark_due
 from resonant_sdk import Event
 
 OWNER_PHONE = "+15551234567"
@@ -346,3 +352,87 @@ async def test_e9_tampered_copy_is_disabled_and_owner_alerted_once(
     async with start_daemon(settings, FakeKeychain(), osa2):
         await asyncio.sleep(0.2)
         assert alert not in [m.text for m in osa2.sent]
+
+
+# --- E4 / E8 / E11: scheduled jobs and the kill switch -----------------------------------
+
+JOBS_MANIFEST = """\
+name: example
+version: 1
+jobs:
+  - id: ping
+    schedule: "0 * * * *"
+    run: ./job.py ping
+    effect: read
+    catchup: 2h
+  - id: sleeper
+    schedule: "0 * * * *"
+    run: ./job.py sleep
+    effect: read
+    catchup: 2h
+"""
+# ``emit.py`` is the SDK's stdlib-only helper, copied next to the script (``-I`` keeps the
+# script's dir off sys.path, so it is added explicitly).
+JOB_PY = """\
+import json, os, subprocess, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from emit import emit
+due = os.environ["RESONANT_JOB_DUE_AT"]
+if sys.argv[1] == "ping":
+    emit("ping", "ping " + due, "ping:" + due)
+    print(json.dumps({"ok": True}))
+else:
+    child = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
+    with open(os.path.join(os.environ["RESONANT_EXT_DATA"], "child.pid"), "w") as f:
+        f.write(str(child.pid))
+    time.sleep(60)
+"""
+
+
+def audit_rows(conn: sqlite3.Connection, action: str) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM audit_log WHERE action = ?", (action,)).fetchall()
+
+
+async def test_e8_kill_switch_kills_inflight_job_and_resume_does_not_catch_up(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    settings = settings_for(resonant_home, chat)
+    emit_py = inspect.getsource(resonant_sdk.emit)
+    install(settings, JOBS_MANIFEST, {"job.py": JOB_PY, "emit.py": emit_py})
+    # The daemon was down for the last 90 minutes: the latest due time is caught up, once.
+    conn = open_db(settings.db_path)
+    with transaction(conn):
+        down = utcnow() - timedelta(minutes=90)
+        kv_set(conn, LAST_TICK_KEY, iso(down))
+        for job in ("ping", "sleeper"):
+            mark_due(conn, "example", job, down)
+    conn.close()
+    osa = RecordingOsaRunner()
+    async with start_daemon(settings, FakeKeychain(), osa) as r:
+        pidfile = settings.ext_data_dir / "example" / "child.pid"
+        await wait_until(lambda: pidfile.exists() and bool(pidfile.read_text()), 10)
+        await wait_until(lambda: bool(audit_rows(r.conn, "job.run")), 10)
+        (run,) = audit_rows(r.conn, "job.run")
+        assert run["tool"] == "job_ping"
+        # E4: no task row; the run's event is persisted with its dedupe key.
+        assert r.conn.execute("SELECT COUNT(*) FROM tasks WHERE kind = 'job'").fetchone()[0] == 0
+        (event,) = r.conn.execute("SELECT * FROM events WHERE source = 'ext:example'").fetchall()
+        assert event["type"] == "ext.example.ping"
+        assert event["dedupe_key"].startswith("ext:example:ping:")
+        child = int(pidfile.read_text())
+        chat.add_message(handle=OWNER_PHONE, text="/kill")
+        await wait_until(lambda: bool(audit_rows(r.conn, "job.killed")), 10)
+        await wait_until(lambda: process_gone(child), 10)
+        await wait_until(lambda: KILL_REPLY in [m.text for m in osa.sent], 10)
+        chat.add_message(handle=OWNER_PHONE, text="/resume")
+        await wait_until(lambda: RESUME_REPLY in [m.text for m in osa.sent], 10)
+        await asyncio.sleep(0.3)
+        assert len(audit_rows(r.conn, "job.run")) == 1  # nothing caught up after /resume
+        assert len(audit_rows(r.conn, "job.killed")) == 1
+
+
+def process_gone(pid: int) -> bool:
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from resonant import cli, launchd
+from resonant import cli, killswitch, launchd
 from resonant.cli import app
 from resonant.store.db import kv_get, open_db
 
@@ -20,6 +20,29 @@ def test_kill_and_resume(resonant_home: Path) -> None:
     assert kv_get(conn, "autonomy") == "on" and kv_get(conn, "paused") is False
     actions = [r["action"] for r in conn.execute("SELECT action FROM audit_log ORDER BY id")]
     assert actions == ["killswitch.engage", "killswitch.release"]
+
+
+def test_pause_hooks_run_after_commit_and_never_undo_the_switch(resonant_home: Path) -> None:
+    conn = open_db(resonant_home / "resonant.db")
+    seen: list[tuple[bool, object]] = []
+
+    def hook(c: object, paused: bool) -> None:
+        seen.append((paused, kv_get(conn, "paused")))
+
+    def broken(c: object, paused: bool) -> None:
+        raise RuntimeError("boom")
+
+    removers = [killswitch.add_pause_hook(broken), killswitch.add_pause_hook(hook)]
+    try:
+        killswitch.engage(conn, actor="justin")
+        killswitch.release(conn, actor="justin")
+    finally:
+        for remove in removers:
+            remove()
+    assert seen == [(True, True), (False, False)]  # each saw the committed state
+    killswitch.engage(conn, actor="justin")
+    assert len(seen) == 2  # removed
+    assert killswitch.is_paused(conn)
 
 
 def test_job_guard_fails_closed_without_store(

@@ -26,7 +26,7 @@ class Event(BaseModel, extra="forbid", frozen=True):
 
 | Field | Meaning |
 |---|---|
-| `kind`, `runner` | free text; `runner` selects the `Runner` (`local`, `reminder`, `claude`, `cu`, `echo`) |
+| `kind`, `runner` | free text; `runner` selects the `Runner` (`local`, `reminder`, `job`, `claude`, `cu`, `echo`) |
 | `extension`, `principal`, `lane` | scope and requester; `lane="oncall"` gets reserved capacity |
 | `priority` | `PRIORITY_ONCALL=0 < PRIORITY_OWNER=1 < PRIORITY_MEMBER=2 < PRIORITY_BACKGROUND=3`; set by core from lane and principal, never by the model |
 | `status` | `queued`, `running`, `waiting`, `done`, `failed`, `cancelled` |
@@ -62,7 +62,8 @@ Loop guarantees:
 4. A crash mid-step means the task resumes from its last checkpoint with its events replayed, and the crash counts as an attempt. A graceful shutdown requeues without using an attempt.
 5. A step that exceeds `max_step_s` is cancelled and treated as a retryable failure.
 6. An outcome that isn't JSON-serializable becomes a non-retryable failure. A database error while persisting stops the loop: the daemon exits, launchd restarts it, and `resume()` recovers the task.
-7. **Next wake.** Between ticks `Loop.run` sleeps `Loop.wait_s()`: `tick_s`, or less when the earliest future `wake_at` of a queued or waiting task (`store.tasks.next_wake_at(conn, after=last_tick)`) comes sooner; one that fell due since the last tick means tick at once. A task is dispatched within loop precision of its `wake_at`, not up to a tick late. Tasks already due at the last tick are excluded, so they never cause a busy loop.
+7. **Next wake.** Between ticks `Loop.run` sleeps `Loop.wait_s()`: `tick_s`, or less when the earliest future `wake_at` of a queued or waiting task (`store.tasks.next_wake_at(conn, after=last_tick)`) comes sooner; one that fell due since the last tick means tick at once. A task is dispatched within loop precision of its `wake_at`, not up to a tick late. Tasks already due at the last tick are excluded, so they never cause a busy loop. With `Loop.scheduler` set, its `next_due(after=last_tick)` counts too.
+8. **Scheduler.** `Loop(..., scheduler: TickHook | None = None)`; `TickHook` is `async tick(now)` plus `next_due(after) -> datetime | None`. Each tick runs `scheduler.tick(now)` after routing and before waking and dispatching, so a job task it creates is dispatched on the same tick. A scheduler error is logged and never stops the loop.
 
 Runner obligations:
 - Make steps idempotent relative to the last checkpoint. Side effects go only through the executor.
@@ -226,7 +227,7 @@ Every evaluation writes one `gate.evaluate` audit row (decision, origin, autonom
 
 **Transactions.** `transaction()` is not reentrant. Helpers that write bookkeeping (audit, spans, gate, executor, kill switch) use `atomic()`, which joins an enclosing transaction via SAVEPOINT. So they are safe to call standalone or inside a caller's transaction.
 
-Kill switch (`resonant.killswitch`, owner-only): `engage` sets `autonomy="off"` and `paused=true`; `release` reverses both. Both write an audit row that includes the prior state. Migration 002 writes explicit default rows.
+Kill switch (`resonant.killswitch`, owner-only): `engage` sets `autonomy="off"` and `paused=true`; `release` reverses both. Both write an audit row that includes the prior state. Migration 002 writes explicit default rows. `add_pause_hook(fn) -> remove` registers `fn(conn, paused)`, called after `engage` (`True`) or `release` (`False`) commits; a hook that raises is logged and never undoes the switch. The scheduler uses it to kill extension processes on `/kill` at once; a CLI `resonant kill` (another process) is seen on the scheduler's next tick.
 
 Critical-job LaunchAgents run `resonant job-guard --job <ext>/<id> -- <cmd>`. It **fails closed**:
 - It never creates or migrates the store.
@@ -443,7 +444,7 @@ Handlers return JSON-serializable dicts and never raise for "no data". Bad args 
 
 ## Reminders: `resonant.runners.reminder`, `resonant.tools.when`
 
-A reminder is a durable queued task; there is no scheduler.
+A reminder is a durable queued task; it doesn't use the job scheduler.
 
 - **Task.** `add_reminder` inserts `NewTask(kind="reminder", runner="reminder", principal=owner, priority=PRIORITY_OWNER, wake_at=at, checkpoint={n, text, at})`, where `at` is ISO UTC. The task id is internal; the owner-facing id is `n`. The executor's idempotency key prevents a duplicate on replay. Handlers don't see the requester; global builtins are owner-only, so reminders belong to `principals.owner`.
 - **Firing.** `ReminderRunner(conn, *, channel, timezone, clock=utcnow, max_step_s=30.0)` (`name="reminder"`, `uses_claude_slot=False`, no model, no tools). One step sends `⏰ <text>` with `channel.send(principal, …, dedupe_key=f"reminder:{task.id}")` and returns `Done({late, late_s})`. More than 120s past `at`, the text ends `(late, due 3:00pm)`. `ChannelRefused` or a malformed checkpoint is a final `Fail`; any other `ChannelError` is retryable, and the dedupe key prevents a double send. The send is the deferred effect of an allowed `add_reminder`, so it doesn't go through the gate. Span `runner.reminder.send` (`late`, `ok`), never the text.
@@ -590,7 +591,7 @@ class ExtRunner(Protocol):
     async def run_raw(req, *, redact) -> RawResult      # any exit code (health checks)
 ExtProcess(tracker=None, *, python=sys.executable, stdout_cap=256 KB, stderr_cap=8 KB,
            events_cap=256 KB, max_events=100)
-ProcessTracker(*, sample_s=2.0, grace_s=2.0)  .live  .paused  .kill_all(reason="killed", *, hold=False) -> int
+ProcessTracker(*, sample_s=2.0, grace_s=2.0)  .live  .paused  .kill_all(reason="killed", *, hold=False) -> int  .resume()
 ExtOutput(data, events: tuple[ExtEvent, ...], dropped_events, duration_ms)
 ExtEvent(type, text, dedupe_key, data=None)
 RawResult(returncode, stdout, stderr_tail, event_lines, duration_ms)
@@ -605,7 +606,7 @@ FakeExtProcess(results=[...], respond=None)  .calls   # tests; runs nothing
 - **Process.** cwd is `req.cwd` (the extension copy), stdin `/dev/null`, a new session. A fixed `python -I -S -c` trampoline moves the events pipe to fd 3 and `execve`s the argv with only the keys of `req.env`. `argv[0]` must be an absolute path to an executable, else `ExtFailed`. Our own pipes carry stdout and stderr, so exit is seen even while a leftover holds them open.
 - **Config.** The caps, `grace_s` and `sample_s` are constructor args with the plan's defaults; the host (`ExtensionHost.from_settings`) passes `extensions.process.*` (`stdout_max_bytes` for both stdout and fd 3, `stderr_max_bytes`, `kill_grace_s`, `tree_sample_s`).
 - **Tracking and kills.** Each live run is in the `ProcessTracker` with its process group and its descendants, sampled with `psutil` every `sample_s` and once more before any kill (this catches children that `setsid` out of the group; a pid is only signalled while its create time matches). Timeout, cancel and `kill_all` send SIGTERM to the group and the tracked tree, then SIGKILL after `grace_s`. Leftovers after a normal exit are ended the same way. Cancel kills, then re-raises `CancelledError`; a final synchronous SIGKILL runs even if a second cancel cuts the grace short. **Limit:** a descendant that double-forks and `setsid`s between samples is never tracked and survives; if it keeps stdout or fd 3 open the run ends after a 1 s drain as `ExtAmbiguous("output still open")` and the pipes are closed (D13: same-user code, not a sandbox).
-- **Kill switch** (P3-10). `kill_all(hold=True)` sets `paused` first: new runs are refused with `ExtFailed("paused")` (definite) until the caller clears `paused` on resume; a run that slipped in between is killed at once.
+- **Kill switch** (P3-10). `kill_all(hold=True)` sets `paused` first: new runs are refused with `ExtFailed("paused")` (definite) until `resume()` clears it; a run that slipped in between is killed at once. The scheduler drives both (see [Scheduler](#scheduler-and-job-runner-resonantextensionsscheduler-resonantrunnersjob)).
 - **Caps.** stdout is read in chunks; past `stdout_cap` the tree is killed: `ExtAmbiguous("output too large")`. fd 3 likewise (`events too large`). stderr keeps its last `stderr_cap` bytes and is never logged or returned; only a redacted 200-char tail rides on `ExtFailed`/`ExtAmbiguous` for the failure audit row.
 - **Redaction.** `redact` (required; `Redactor(values_of(env)).text` from P3-3) rewrites stdout, the fd-3 lines and the stderr tail before anything is parsed or returned.
 - **Result contract** (`run`): exit 0 with exactly one JSON object is success. Exit > 0 is `ExtFailed("exit N")`: the author promises nothing took effect. A timeout (`timeout`), the kill switch (`killed`), a cap overflow (even one seen after exit), output left open (`output still open`), death by signal (`signal N`) or exit 0 without one JSON object (`invalid output`) is `ExtAmbiguous`. It is deliberately not a `ToolFailed`, so the executor's generic branch makes it a definite failure for reads and ambiguous for writes. `stderr_tail` is for the failure audit row only, never a message. (A stdout overflow is a kill, so it is ambiguous like a timeout, not `ToolFailed` as the plan's D4 first said.)
@@ -621,6 +622,7 @@ ExtensionHost.from_settings(settings, conn, registry, *, runner: ExtRunner | Non
     .handlers: {(ext, spec name): ExtensionHandler}
     .tool_specs(extension=None) / .job_specs(extension=None) -> list[ToolSpec]
     .is_job(spec) -> bool  .manifest(name) -> Manifest | None
+    .scheduled_jobs() -> list[HostJob(ext, job: manifest Job, spec, handler)]   # the scheduler's input
     .approvers_for(extension) -> tuple[str, ...]   # PolicyGate seam; () on any error
 send_alerts(conn, channel, owner) -> int     # queued owner alerts (kv "ext.alerts")
 tampered_text(name) -> str
@@ -637,9 +639,40 @@ resonant.e2e.extensions.install_fixture(settings, conn, manifest_yaml, files, *,
 - **Tree digest.** See the manager section (`resonant.extensions.pin`); the host only re-verifies.
 - **Jobs stay out of chat.** Job specs are in the registry (the gate and `/api/tools` see them; P3-10 runs them), but `tool_specs()` and `Components.chat_specs()` leave them out, and so does the step limit.
 - **Handler.** One process run per call: `render(args)`, `scratch_env(ext, data_dir=<ext_data_dir>/<name>, secrets=ctx.secrets, job_due_at=args["due_at"] for jobs, path=extensions.process.path_env)`, `ExtRequest(cwd=root, timeout_s=spec.timeout_s, label="<ext>/<tool>")`, `redact=Redactor(values_of(env)).text`. The JSON object is returned deep-redacted and its events go to `ctx.events`. Secrets the spec didn't declare are refused (`ToolFailed`). P3-10's L0 job path calls the same handler with its own `CallContext`.
-- **Process config.** `ExtProcess(tracker, stdout_cap=stdout_max_bytes, stderr_cap=stderr_max_bytes, events_cap=stdout_max_bytes)`, `ProcessTracker(sample_s=tree_sample_s, grace_s=kill_grace_s)`. `host.tracker` is the kill switch's handle (P3-10).
+- **Process config.** `ExtProcess(tracker, stdout_cap=stdout_max_bytes, stderr_cap=stderr_max_bytes, events_cap=stdout_max_bytes)`, `ProcessTracker(sample_s=tree_sample_s, grace_s=kill_grace_s)`. `host.tracker` is the kill switch's handle (the scheduler holds and resumes it).
 - **Alerts.** `IMessageStack.start` calls `send_alerts` after "back up": each is sent to the owner with `dedupe_key=ext-tampered:<name>:<installed_at>`; sent or refused alerts are dropped, other channel errors (or no owner yet) keep them for the next start.
 - The daemon's startup line includes `extensions=<loaded count>`.
+
+## Scheduler and job runner: `resonant.extensions.scheduler`, `resonant.runners.job`
+
+```python
+Scheduler.from_components(settings, conn, components, *, started_at, channel=None,
+                          core_jobs=CORE_JOBS, clock=utcnow) -> Scheduler
+    .start() / await .aclose()                # kill switch hook on; cancel inline runs
+    await .tick(now)  .next_due(after)        # Loop.scheduler (TickHook)
+    .jobs: tuple[ScheduledJob, ...]  .running  await .drain()   # drain: tests
+    .on_pause(conn, paused)                   # the killswitch hook
+ScheduledJob(ext, job_id, spec, schedule, call, catchup=None, core=False)  .label  .inline
+CoreJob(id, schedule, run: JobCall, catchup=None, timeout_s=300)   # cron in settings.timezone
+CoreDeps(settings, conn, components, channel, owner)
+CORE_JOBS: tuple[Callable[[CoreDeps], CoreJob | None], ...] = ()  # P3-13 adds the briefing
+JobCall = (args: dict, ctx: CallContext) -> Awaitable[dict]        # ExtensionHandler fits
+persist_events(conn, ext, events, *, trace_id=None) -> int
+read_paused(conn) -> bool                     # unknown counts as paused
+JobRunner(conn, *, gate, executor, registry, channel, recipients, timezone="UTC",
+          now=utcnow, max_step_s=1860)        # name="job", uses_claude_slot=False
+resonant_sdk.emit.emit(type, text, dedupe_key, data=None) -> bool   # stdlib-only; copy it
+```
+
+- **Built** by the daemon after the components and the iMessage stack, iMessage on or off, and set as `loop.scheduler`. Jobs: every loaded extension's (`host.scheduled_jobs()`, `tz` or `settings.timezone`, `catchup` from the manifest), then each `CORE_JOBS` factory's (`ext="core"`, a `read` spec `job_<id>` with `source="core"`, not registered). A schedule that doesn't parse is skipped and audited `job.refused`.
+- **Tick**, per job: `cron.decide(schedule, now, last_due=max(ext_jobs.last_due, in-memory claim), paused=read_paused, catchup, downtime, busy, on_time=1 min + tick_s)`. `downtime` is kv `scheduler.last_tick` (written every tick) to `started_at`, read once at build. `busy` is an inline run of the job in flight, or its `open_task_id` task still `queued`/`running`/`waiting`. Then `paused` → `mark_due` + one `job.skipped_paused` row per due time; `missed` → `job.missed` rows; `overlap` → `job.overlap`. One job raising (a bad `catchup`, a DB error) is logged and skipped; the others still tick.
+- **Inline** (effective level L0, and core jobs): no task row. The due time is claimed in memory, and the run waits for a slot (`extensions.max_concurrent_jobs`). An extension job is gated: `Intent.for_tool(spec, task_id="job:<ext>/<id>:<due>", principal=owner, args={due_at}, origin="scheduled")`; the token is consumed here since there is no executor. Core jobs skip the gate. Declared secrets come from the `SecretStore` (`CallContext(secrets=…)`); the result, events and error are redacted with those values. On completion one transaction writes `mark_due`, `record_run` (`ok`/`failed`), `persist_events` and the audit row: `job.run` (`late`, `events`), `job.failed` (`error`, `stderr_tail`), `job.killed` (no `record_run`), `job.denied`, `job.dry_run` or `job.skipped_paused`. A run cancelled by shutdown writes nothing, so its due time is decided again on the next start.
+- **Gated** (L3/L2/L1): `insert_task(kind="job", runner="job", extension, principal=owner, priority=PRIORITY_BACKGROUND, wake_at=due, checkpoint={ext, job, due_at, late})` and `mark_due(..., open_task_id=task)` and `job.queued` in one transaction (re-checking `last_due < due`), so a due time is claimed exactly once across ticks and restarts.
+- **Kill switch.** `start()` registers `on_pause`. Engaged in the daemon (`/kill`): `tracker.paused = True` at once (the hold), then `tracker.kill_all("killed")` in the background unless already resumed (audited `job.kill_all`); an inline run ends as `job.killed`, a gated write as ambiguous. A CLI `resonant kill` is applied on the next tick. Released (or an unpaused tick): `tracker.resume()`. Paused ticks skip every due time with no catch-up after `/resume`.
+- **Events** (`persist_events`): each `{type, text, dedupe_key, data?}` becomes `Event(source="ext:<ext>", type="ext.<ext>.<type>", payload={text, data}, principal=None, task_id=None, dedupe_key="ext:<ext>:<key>")` via `insert_event` (UNIQUE key: repeats are dropped), in the transaction that records the run. They are unrouted: the loop's router hook sees them. Until P3-12's notifier, `Router.route` consumes them without sending.
+- **JobRunner** step: `checkpoint.finished` → only (re)send reports. Else the pinned call `job_<id> {due_at}` (`origin="scheduled"`, `idempotency_key(task_id, 0, 0, hash)`): `executor.recorded` first (succeeded replays, started is ambiguous, never re-run); paused → `job.skipped_paused`; `gate.evaluate`: `Allow` → `executor.execute(step_no=0, call_index=0)`; `NeedsApproval` → `prompt_approvers` then `Wait("approval", wake_at=expires_at)` (unreachable approvers skipped, none reachable fails, a transient error retries); `DryRun`/`Deny` don't run. Then one transaction: `record_run` (`ok`, `failed`, `ambiguous`), `persist_events`, the audit row (`job.run`, `job.failed`, `job.ambiguous`, `job.killed`, `job.denied`, `job.dry_run`, `job.skipped_paused`) and `checkpoint.finished`. **Limit:** a crash between the executor's commit and that transaction replays the result but loses that run's events.
+- **Reports** go to `recipients(ext)` (the gate's `approvers`: owner first, then manifest approvers holding the grant); a refused send is skipped, any other channel error is a retryable `Fail`. Code-built and sanitized: `example/cleanup: done` (`: <summary>` from the result, ≤ 120 chars; dedupe `jobreport:<task>:<recipient>`); `example/cleanup failed: <reason>` or `example/cleanup: not done (approval expired)` at most once per job per local day (dedupe `jobfail:<ext>/<id>:<date>:<recipient>`). Dry runs, paused skips and kill-switch kills aren't reported.
+- **Seams.** P3-12: dispatch `ext:*` events in the router hook (`wiring`) and read `fail_streak` for health; `job.killed`/`job.failed` audit rows. P3-13: append a factory to `CORE_JOBS` (gets the channel and owner; returns None when `briefing.enabled` is false). P3-14: `/ext run <ext>/<job>` is a `direct_call` of the job spec (`job_<id> {due_at}`), gated as explicit; `ext_jobs` holds last run and outcome for `/ext list`.
 
 ## Components: `resonant.components`
 
@@ -911,7 +944,7 @@ PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: Chan
 
 ```python
 build_imessage_stack(settings, conn, components, loop, *, daemon_healthy, model=None, osa_runner=None)
-    -> IMessageStack(channel, router, runner, reminders, monitor, model, owner)
+    -> IMessageStack(channel, router, runner, reminders, monitor, model, owner, jobs)
 IMessageStack.start(loop) / .stop() / .aclose() / .running
 local_step_limit(model_cfg, tools: Iterable[ToolSpec] = ()) -> float   # chat tools; ext tools capped at 300s
 Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | None = None,
@@ -923,7 +956,8 @@ Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | No
 - **`channels.imessage.enabled: false`** (the default): the daemon is Phase 0 apart from the gate. `loop.router` is None, `loop.runners == {"echo"}`, `DaemonState.monitor` is None, and nothing imports the model client.
 - **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner(..., timezone=settings.timezone)`, then `loop.runners["local"]`, `max_step_s = local_step_limit`) and `ReminderRunner` (`runners["reminder"]`, see Reminders), sets `loop.router = router.route`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta)`, which becomes `DaemonState.monitor`. `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`; tests also pass `ops_runner=FakeOpsRunner()` (it goes to `build_components`).
 - **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`, then `ops.back_up`: `Back up (<commit>), down Ns` once after a requested restart, then `extensions.host.send_alerts`: queued tamper alerts to the owner, once each) before the loop, then the loop, the API, the monitor and the dead-man (with `monitor.deadman_reason`).
-- **Stop** (SIGTERM/SIGINT, or a component exiting): the API is told to exit; the monitor and the chat.db reader stop first, so no new events arrive; then the loop drains in-flight steps (10s grace; a draining step can still send its reply); then the model client closes and the store closes. Unfinished steps resume from their checkpoints on the next start, and the send dedupe key (`reply:<task id>`) prevents a double reply.
+- **Jobs.** `build_imessage_stack` also registers `JobRunner` as `runners["job"]` (recipients: `PolicyGate.approvers`). `Daemon.__init__` then builds the `Scheduler` (`channel` is the iMessage channel or None) and sets `loop.scheduler`; `Daemon.run` calls `scheduler.start()` before the loop. With iMessage off, L0 and core jobs still run, and a gated job task fails as `unknown runner`. The startup line includes `jobs=<count>`.
+- **Stop** (SIGTERM/SIGINT, or a component exiting): the API is told to exit; the monitor and the chat.db reader stop first, so no new events arrive; the scheduler's inline runs are cancelled (`aclose`); then the loop drains in-flight steps (10s grace; a draining step can still send its reply); then the model client closes and the store closes. Unfinished steps resume from their checkpoints on the next start, and the send dedupe key (`reply:<task id>`) prevents a double reply.
 
 ## Spans and logs: `resonant.observability`
 
