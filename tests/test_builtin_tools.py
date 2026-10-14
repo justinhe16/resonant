@@ -34,7 +34,13 @@ NAMES = {
     "daemon_status",
     "model_status",
     "list_commands",
+    "list_notes",
+    "add_note",
+    "delete_note",
+    "clear_notes",
 }
+# Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
+WRITES = {"add_note": Level.L3, "delete_note": Level.L3, "clear_notes": Level.L1}
 
 
 @pytest.fixture
@@ -74,11 +80,15 @@ def seed(db: sqlite3.Connection) -> dict[str, str]:
     return ids
 
 
-def test_registers_global_reads(components: Components) -> None:
+def test_registers_global_builtins(components: Components) -> None:
     specs = components.registry.specs()
     assert {s.name for s in specs} == NAMES
     assert all(s.extension is None and s.source == "builtin" for s in specs)
-    assert all(s.effect is Effect.READ and s.effective_level is Level.L0 for s in specs)
+    for s in specs:
+        if s.name in WRITES:
+            assert s.effect is Effect.WRITE and s.effective_level is WRITES[s.name]
+        else:
+            assert s.effect is Effect.READ and s.effective_level is Level.L0
     assert set(components.handlers) == {(None, n) for n in NAMES}
 
 

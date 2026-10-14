@@ -1,4 +1,4 @@
-"""Built-in tools: questions about Resonant itself and the machine it runs on.
+"""Built-in tools: questions about Resonant and its machine, plus the owner's notes.
 
 Each tool area is a module (see ``resonant.tools.base``); ``BUILTIN_MODULES`` lists them and
 ``register_builtins`` iterates it. A new area is one module plus one line here.
@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.principals import Principals
-from resonant.tools import commands, system, tasks
+from resonant.tools import commands, notes, system, tasks
 from resonant.tools.base import BuiltinContext, BuiltinModule
 from resonant.tools.registry import ToolRegistry
 from resonant.tools.system import DAEMON_STATUS, MODEL_STATUS, SYSTEM_STATUS
@@ -42,7 +42,7 @@ __all__ = [
     "register_builtins",
 ]
 
-BUILTIN_MODULES: tuple[BuiltinModule, ...] = (tasks, system, commands)
+BUILTIN_MODULES: tuple[BuiltinModule, ...] = (tasks, system, commands, notes)
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 
 

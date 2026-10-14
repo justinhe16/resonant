@@ -310,12 +310,12 @@ class ToolFailed(Exception)   # raise from a handler: "definitely did not take e
 
 ## Built-in tools: `resonant.tools.builtin`
 
-Six global read tools (`effect=read`, level L0, `extension=None`, `source="builtin"`). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals) -> {(None, name): handler}` registers the specs and returns the handlers.
+Global tools (`extension=None`, `source="builtin"`): L0 reads, plus the notes writes (`add_note` and `delete_note` L3, `clear_notes` L1). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals) -> {(None, name): handler}` registers the specs and returns the handlers.
 
-- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
+- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`, `notes`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
 - `BuiltinContext(conn, state, registry, principals)` is what a module gets. `registry` is the full registry, read at call time. New fields get defaults.
 
-Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents.
+Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, note text that is empty or over 200 characters, a missing or already-deleted note id, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents.
 
 | Tool | Args | Returns |
 |---|---|---|
@@ -325,8 +325,13 @@ Handlers return JSON-serializable dicts and never raise for "no data". Bad args 
 | `daemon_status` | none | `{version, uptime_s, last_tick, inflight, dry_run, autonomy, paused}` (a subset of `collect_status`) |
 | `model_status` | none | `{known: false}` when `kv["model.probe"]` is absent or not an object; otherwise the cached probe's fields plus `known: true`. It never calls the model. |
 | `list_commands` | `query?`: string, at most 50 chars | `{commands: [{name, usage, description, tool, level, owner_only}], count, query}`: the command registry (`router/commands.py`) as the owner sees it, filtered by `query` like `/help <word>`. `level` is the tool's registered level (`null` for commands without a tool). Handlers don't see the requester, and the gate only lets principals who can request global tools (the owner) call it. |
+| `list_notes` | none | `{notes: [{id, text, at}], count, total}`: live notes, newest first, at most 20. `total` counts every live note. |
+| `add_note` (L3) | `text`: string, 1–200 characters after trimming | `{id, text, at}` |
+| `delete_note` (L3) | `id`: int ≥ 1 | `{id, text, at, deleted_at}`. Soft delete. |
+| `clear_notes` (L1) | none | `{cleared, deleted_at}`: soft-deletes every live note. |
 
 - `system_status`: `cpu_percent` is measured since the previous call (primed at registration), so it never blocks. `memory_pressure` comes from `sysctl kern.memorystatus_vm_pressure_level` and `memory_pressure -Q` with a 500ms timeout, best effort; off macOS, or when they are missing or slow, it is `{level: "unknown", free_pct: null}`. `disk` lists `/` and `RESONANT_HOME`; an unreadable path has null numbers.
+- Notes (`tools/notes.py`) live in `memory` with `scope="notes"`: key = the note id (decimal), value = JSON `{text, at, deleted_at}`. Ids come from kv `notes.seq` and are never reused. Deletes are soft (they set `deleted_at` and keep the row); reads hide deleted notes. Replay can't duplicate a note, because the executor returns the recorded result for an idempotency key that already succeeded. `notes.summary_action(conn, intent)` is the code-built approval heading for the builtin `clear_notes` (`delete all 4 notes`, counting live notes), for `summarize(intent, action=...)`; it returns `None` for any other intent, including an extension tool with the same name.
 - The `model.probe` kv key is written by `resonant model probe` and the health monitor, in one shape: `{ok, model_present, ctx_ok, thinking_off_ok, tool_call_ok, call_failed, latency_ms, detail, model, api, checked_at}`. The monitor writes only these fields and scrubs URLs from `detail`. Builtins read it only.
 
 ## Components: `resonant.components`
