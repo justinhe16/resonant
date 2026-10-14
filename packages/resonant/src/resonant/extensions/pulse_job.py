@@ -31,7 +31,9 @@ the (source, key, fingerprint) of the items in it are stored in kv ``pulse.infli
 key>``. A rerun of the same key (a crash between send and mark, a catch-up, a restart) never
 recomposes: it resends the stored text (the channel drops it if it went out) and marks exactly
 those items told, compare-and-set, so an item that arrived since stays pending. A record
-that is done makes the rerun a ``duplicate``. Done records are pruned after 2 days.
+that is done makes the rerun a ``duplicate``. A new key first finishes any other unsent record
+the same way (a run that raised after its send is not rerun: the scheduler consumes its due
+time). Records are pruned after 2 days.
 """
 
 from __future__ import annotations
@@ -240,16 +242,15 @@ def _paused(conn: sqlite3.Connection) -> bool:
 
 
 def prune_inflight(conn: sqlite3.Connection, now: datetime) -> None:
-    """Drop done delivery records older than ``INFLIGHT_KEEP``."""
+    """Drop delivery records (done, or never finished) older than ``INFLIGHT_KEEP``."""
     rows = conn.execute("SELECT key FROM kv WHERE key LIKE ?", (INFLIGHT + "%",)).fetchall()
     with atomic(conn):
         for (k,) in rows:
             rec: Any = kv_get(conn, k)
             if not isinstance(rec, dict):
                 continue
-            done = bool(cast(dict[str, Any], rec).get("sent"))
             at = str(cast(dict[str, Any], rec).get("at", ""))
-            if done and at and datetime.fromisoformat(at) < now - INFLIGHT_KEEP:
+            if at and datetime.fromisoformat(at) < now - INFLIGHT_KEEP:
                 conn.execute("DELETE FROM kv WHERE key = ?", (k,))
 
 
@@ -272,6 +273,7 @@ async def deliver(
     raw: Any = kv_get(conn, rkey)
     rec = cast(dict[str, Any], raw) if isinstance(raw, dict) else None
     if rec is None:
+        await _finish_unsent(conn, channel, owner, now, except_key=rkey)
         built = build()
         if built is None:
             return "nothing", 0
@@ -286,6 +288,18 @@ async def deliver(
             kv_set(conn, rkey, rec)
     elif rec.get("sent"):
         return "duplicate", 0
+    return "sent", await _send_recorded(conn, channel, owner, key, rec, now)
+
+
+async def _send_recorded(
+    conn: sqlite3.Connection,
+    channel: Channel,
+    owner: str,
+    key: str,
+    rec: dict[str, Any],
+    now: datetime,
+) -> int:
+    """Send the stored text under its own dedupe key and mark exactly its items told."""
     recorded = cast(list[list[str]], rec["items"])
     await channel.send(owner, str(rec["text"]), dedupe_key=key)
     with atomic(conn):
@@ -293,8 +307,29 @@ async def deliver(
             item = store.get(conn, source, ikey)
             if item is not None:
                 store.mark_told(conn, [replace(item, fingerprint=fp)], now)
-        kv_set(conn, rkey, {**rec, "sent": True})
-    return "sent", len(recorded)
+        kv_set(conn, INFLIGHT + key, {**rec, "sent": True})
+    return len(recorded)
+
+
+async def _finish_unsent(
+    conn: sqlite3.Connection, channel: Channel, owner: str, now: datetime, *, except_key: str
+) -> None:
+    """Finish the delivery records of other keys that never got marked: a run that raised
+    after its send (the scheduler consumes that due time, so no catch-up reruns it). Without
+    this the next message would compose the same untold items again under a new key. The
+    channel drops the resend if it went out. Best effort: a failure here is logged."""
+    rows = conn.execute("SELECT key FROM kv WHERE key LIKE ?", (INFLIGHT + "%",)).fetchall()
+    for (k,) in rows:
+        if k == except_key:
+            continue
+        raw: Any = kv_get(conn, k)
+        if not isinstance(raw, dict) or cast(dict[str, Any], raw).get("sent"):
+            continue
+        rec = cast(dict[str, Any], raw)
+        try:
+            await _send_recorded(conn, channel, owner, k.removeprefix(INFLIGHT), rec, now)
+        except Exception:
+            log.warning("pulse: could not finish an earlier delivery", extra={"key": k})
 
 
 async def send_pulse(

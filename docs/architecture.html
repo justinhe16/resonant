@@ -308,7 +308,7 @@ const GROUPS = [
    children:["imessage","slack","webhook","notifier"]},
   {id:"sources", col:0, title:"Internal sources", sub:"schedules, extensions, Claude", icon:"clock",
    desc:"Non-human event producers. Each one appends Events to the same log the gateway uses.",
-   children:["scheduler","extemit","claudeevents"]},
+   children:["scheduler","extemit","pulse","claudeevents"]},
   {id:"identity", col:1, title:"Identity & ingest", sub:"who sent it · append-only log", icon:"user",
    desc:"Resolves the channel identity to a principal, then appends the Event, with duplicates dropped by dedupe_key. Identities from unknown channels are dropped and audited.",
    children:["principals","events"]},
@@ -390,6 +390,14 @@ emit("ci_failed", "✗ resonant#40 CI failed (lint)", "resonant#40:run:123:faile
 # → Event(source="ext:github", type="ext.github.ci_failed", principal=None)`,
     inv:["Core sets principal; the extension can't","Text is one line, ≤ 300 chars, and can't look like an approval prompt","dedupe_key is required"],
     files:["packages/resonant/src/resonant/extensions/notify.py","packages/resonant-sdk/src/resonant_sdk/emit.py"]},
+  pulse:{label:"Pulse", phase:"3.5", status:"built",
+    what:"Extensions report items (report(key, title, urgency, state)) and the daemon decides what is news by comparing a fingerprint of title and state with what the owner last heard. Urgent texts at once, at any hour (held while paused or muted, 20 an hour), normal goes in the hourly core/pulse \"btw\" message (quiet hours 00:00-06:00), low and every open item go under Updates in the 08:00 briefing, which always sends. The same state is told once; A, B, A is told three times. The grant in the manifest (report: max_urgency) clamps the urgency, and no grant is refused. Exactly once across crashes: the item event is stored before it is routed, sends are deduped, and the hourly message keeps an in-flight record of its exact text and items.",
+    iface:`from emit import report                       # resonant_sdk/emit.py, copied in
+report("dori/incident/INC-412", "Dori failing: triaging", urgency="urgent", state={"status": "failing"})
+report("trader/pnl/today", "PnL -$1.8k today", state={"bucket": -2})   # coarse state = real changes only
+# manifest: report: {max_urgency: urgent}     /pulse    /pulse now`,
+    inv:["Urgent latency: one job period (at least 5 minutes) plus a loop tick","Titles are cleaned and the [name] prefix is code-built, so a report can't look like an approval prompt","The first run after install is a silent baseline","Health stays with the monitor; the briefing's Updates exclude core and muted sources"],
+    files:["packages/resonant/src/resonant/store/pulse.py","packages/resonant/src/resonant/extensions/pulse.py","packages/resonant/src/resonant/extensions/pulse_job.py","packages/resonant/src/resonant/extensions/briefing.py"]},
   claudeevents:{label:"Claude SDK events", phase:"5", status:"planned",
     what:"Events from Claude sessions: permission requests, ask_human calls, Stop hooks, usage-limit errors, and results. They go back into the loop so the claude runner can supervise the session like a senior coworker.",
     iface:`Event(source="claude", type="permission_request" | "ask_human" |
@@ -668,6 +676,8 @@ const PHASES = [
    items:["PolicyGate: risk × origin (explicit runs, inferred L2 asks, L1 always yes <code>), kill switch, dry_run exemption","Text-reply approvals: codes, deterministic parser, sent-before binding, expiry, orphans, single use","Local runner: direct_call, Wait/resume, execute once, templated replies","Notes (L1 /notes clear) and reminders (durable tasks, on time, late marker)","Mini ops: /restart ollama|resonant, /update, /disk, /logs, \"back up\"","/projects, command registry, /help [word], fuzzy suggestions","Chat intents notes / reminders / ops","CLI: resonant approvals list|show|approve|deny","Go-live Stage A (dry_run) → Stage B (flip), bootstrap --check","Deferred: classifier + eval approvals, yes all; Keychain injection (built in Phase 3)"]},
   {n:3, title:"Extensions", status:"built", done:16, total:16,
    items:["Manifest additions, ext validate (stdlib only, argv0 allowlist, cadence)","Terminal ext add|update|remove|list: approved read-only copy, pins, --adopt, tamper → disabled + alert","Keychain secrets (resonant secret …), per-tool injection, redaction of every encoding","Process runner: env from scratch, output caps, tracked-tree kill, fd-3 events","Scheduler + JobRunner (cronsim, catch-up, pause wins, overlap); origin scheduled; manifest approvers","Router: extension:<name> intents, toolsets, <prior_reply> wrapping; /<ext> <tool>, /help <ext>, /ext list|run|mute","Notifier from persisted events (exactly once, mute, caps, baseline) + ext health","Core daily briefing (core/briefing)","github extension: prs, pr, watch, digest; rerun_failed (L3), merge_pr (L1)","Go-live step 12, bootstrap --check rows","Deferred: MCP, critical-job LaunchAgents, veto windows, Seatbelt sandbox, iMessage /ext add, git sources, Python deps"]},
+  {n:3.5, title:"Pulse", status:"built", done:6, total:6,
+   items:["Items store (migration 005), SDK report(), manifest report: grant, pulse: config","Ingest and urgent path: clamp, baseline, mute, pause, 20/h cap, exactly once","Hourly core/pulse (quiet hours, approval re-mention) and the briefing Updates section","github summary item; example pnl and incident reporters","/pulse, /pulse now, \"isn't installed\" reply","End-to-end U1-U9, go-live step 13, docs"]},
   {n:4, title:"Dashboard", status:"planned",
    items:["Vite + React + shadcn (streak look)","jobs, runs, logs (SSE), approvals, audit, slots","loopback only; remote status via the planned status relay"]},
   {n:5, title:"Claude runner + Slack", status:"planned",

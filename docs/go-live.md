@@ -238,6 +238,37 @@ Only if you want them (see the github README). Edit the token: Actions **read an
 - **Expected:** exit 0; `extension github pin`, `secret github/token`, `extension jobs scheduled` and `briefing scheduled` all `PASS`.
 - **Rollback:** `resonant ext remove github`, type `github`: its tools, jobs and commands go after the restart. It keeps `~/.resonant/ext-data/github/` (`--purge` deletes it) and prints `resonant secret rm github/token` for the token it leaves. `/kill` stops everything at once in the meantime.
 
+## 13. Phase 3.5: the pulse
+
+Step 12 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen` and `resonant daemon install`). `scripts/bootstrap.sh --check` shows `store schema 5  PASS` and `pulse scheduled  PASS  hourly America/Los_Angeles; quiet 00:00-06:00; next …`. The pulse sends nothing until an installed extension with a `report:` grant reports something.
+
+Times, codes and figures below are examples.
+
+### Over iMessage
+
+1. **Status.** `/pulse` → `Nothing new since the last update.` (plus `Open: …` per source once items exist). `/pulse now` → `Nothing new to send.`
+2. **List.** `/ext list` shows `- pulse (L0) · next …` under `core · built in`, next to `briefing`.
+3. **The github summary.** With github installed (step 12), the 07:50 `digest` reports a low item, so nothing is texted for it. The next 08:00 briefing shows it under `Updates:` (`[github] 3 open PRs, 1 failing CI, 2 awaiting your review`). A hard-coded line is no longer in the briefing.
+4. **Try the urgent path (the example).** On the Mini: `resonant ext add repo:example`, type `example`. Then over iMessage:
+   - `/ext run example/incident` once. This is the job's silent baseline, so nothing arrives.
+   - `/example incident failing` → within 5 minutes, once, at any hour: `[example] 🔴 Demo service failing: checkout 5xx`. A second `/ext run example/incident` says nothing more (same state, told once).
+   - `/example incident resolved` → within 5 minutes: `[example] ✓ Demo service recovered`.
+   - `/example incident resolved` again → `no incident open`, and nothing is texted.
+5. **Try the hourly "btw".** The example's fake `pnl` reports at `:55`. At the top of the next hour, if the rounded figure moved, one message: `btw:` / `[example] PnL -$1.8k today`. Or `/pulse` to preview it and `/pulse now` to send it. Nothing is sent in an hour where nothing changed.
+6. **Kill switch.** `/kill`, then `/example incident failing` and wait for the job: nothing arrives. `/pulse now` → `Paused: pulse not sent.`. `/resume`, then the next pulse carries what changed, once.
+7. **Mute.** `/ext mute example 1h`: example items are skipped by the pulse and the briefing. `/pulse` shows `example 1 (muted until …)` under `Open:`.
+8. **Clean up.** On the Mini: `resonant ext remove example`, type `example`.
+
+### What to expect
+
+- Urgent items text immediately at any hour, at most 20 an hour per extension. Normal items go out in one `btw:` message at the top of each hour, never between 00:00 and 06:00 (the 06:00 pulse carries what was held), and never in the 08:00 hour (the briefing covers it). The briefing always sends, even as `Nothing on today.`.
+- An item the owner has heard is not told again until its state changes (`A`, `B`, `A` is three tellings).
+- An approval still waiting after 4 hours is mentioned once in a `btw:`.
+
+- **Verify:** `scripts/bootstrap.sh --check`
+- **Expected:** exit 0; `pulse scheduled  PASS`. The row is a `FAIL` (required) if `pulse.enabled` is false.
+- **Rollback:** `pulse: {enabled: false}` in `~/.resonant/config.yaml` and `resonant daemon install` stops the hourly pulse (urgent reports and the briefing's Updates still work); `resonant ext remove <name>` removes a noisy reporter; `/ext mute <name> 8h` quiets one for now.
+
 ## Done
 
 `scripts/bootstrap.sh --check` exits 0 with every required step `PASS`, and you have texted Resonant and got a reply.
