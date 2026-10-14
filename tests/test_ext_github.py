@@ -710,6 +710,16 @@ def test_merge_pr_permission_and_race_errors_are_clean(gh: FakeGh) -> None:
     )
 
 
+def test_rate_limit_is_not_reported_as_a_missing_scope(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    gh.state["fail_on"] = {"pr merge": {"exit": 1, "stderr": "HTTP 403: API rate limit exceeded"}}
+    r = merge(gh)
+    assert (
+        r.code == 1
+        and r.err == "github: gh pr failed (exit 1): HTTP 403: API rate limit exceeded\n"
+    )
+
+
 def test_writes_pass_the_token_only_as_gh_token(gh: FakeGh) -> None:
     gh.state["prs"] = {f"{RESONANT}#40": view()}
     gh.state["runs"] = {f"{RESONANT}:branch-40": [run_row(9, HEAD, "failure")]}

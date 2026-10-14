@@ -77,7 +77,8 @@ _UNMERGEABLE_STATES = {
     "UNKNOWN": "still being checked for mergeability by GitHub; try again in a minute",
 }
 _SHA = re.compile(r"^[0-9a-f]{7,64}$")
-_DENIED = ("HTTP 403", "Resource not accessible", "must have admin rights", "permission")
+# A fine-grained token missing a scope gets this from GitHub (REST says it with a 403).
+_DENIED = ("resource not accessible by",)
 
 
 class Failed(Exception):
@@ -168,7 +169,7 @@ class Gh:
             raise Failed(f"gh could not run: {type(e).__name__}") from None
         if proc.returncode != 0:
             tail = self.redact(" ".join(proc.stderr.split()))[-200:]
-            if need and any(d.lower() in tail.lower() for d in _DENIED):
+            if need and any(d in tail.lower() for d in _DENIED):
                 raise Failed(
                     f"the token can't do this: it needs {need} (see the github extension "
                     "README); nothing was changed"
