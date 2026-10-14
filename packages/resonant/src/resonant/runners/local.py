@@ -37,10 +37,12 @@ One step does the whole task, unless it has to wait for an approval:
   ambiguous (reported, never re-run), failed is a definite failure. None: ``gate.evaluate``.
 - ``Allow``: ``executor.execute`` with the pinned ``step_no`` and ``call_index``, then a
   code-built report (``Saved note 3: "buy milk"``, ``Done: <summary>``).
-- ``NeedsApproval``: ``channel.request_approval`` to each approver (the channel dedupes by
-  ``approval_dedupe_key``), the ref is recorded on the approval with its send time, then
+- ``NeedsApproval``: ``runners.approve.prompt_approvers`` prompts every approver (the
+  channel dedupes by ``approval_dedupe_key``) and records each ref with its send time, then
   ``Wait("approval", wake_at=expires_at)``. Every pending step re-prompts; that is
-  idempotent. A send failure is a retryable ``Fail``; a refused one fails for good.
+  idempotent. An approver the channel refuses is skipped (audited
+  ``approval.unreachable``); the task fails for good only if none was reachable. Any other
+  send failure is a retryable ``Fail``.
 - ``DryRun``: ``Dry run: would <summary>``. ``Deny``: a templated refusal (``Not done.``,
   expired, already used).
 
@@ -76,7 +78,7 @@ from resonant.gate import Allow, Decision, Deny, DryRun, Intent, NeedsApproval, 
 from resonant.gate.codes import clean_external
 from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
 from resonant.gate.summary import summarize as summarize_args
-from resonant.gateway.channel import ApprovalPrompt, Channel, ChannelError, ChannelRefused
+from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import Done, Fail, StepContext, StepOutcome, Task, Wait
 from resonant.models import (
     ChatMessage,
@@ -95,8 +97,8 @@ from resonant.router.prefixes import (
     wrap_untrusted,
 )
 from resonant.router.render import render_disk, render_logs, render_projects
-from resonant.store import approvals as ap
-from resonant.store.db import transaction, utcnow
+from resonant.runners.approve import prompt_approvers
+from resonant.store.db import utcnow
 from resonant.store.tasks import get_event, get_task, principal_thread
 from resonant.tools import ToolRegistry
 from resonant.tools.ops import summary_action as ops_action
@@ -666,7 +668,7 @@ class LocalRunner:
     ) -> _Result:
         """Act on the gate's decision for a pinned call (``cp`` already holds ``call``)."""
         if isinstance(decision, NeedsApproval):
-            return await self._ask(decision, cp, spans)
+            return await self._ask(intent.task_id, decision, cp, spans)
         if not isinstance(decision, Allow):
             return _not_run(intent, decision)
         try:
@@ -678,38 +680,24 @@ class LocalRunner:
         return _outcome(intent, result)
 
     async def _ask(
-        self, decision: NeedsApproval, cp: dict[str, Any], spans: SpanFactory
+        self, task_id: str, decision: NeedsApproval, cp: dict[str, Any], spans: SpanFactory
     ) -> Wait | Fail:
-        """Prompt every approver (idempotent: the channel dedupes), record the refs, wait."""
-        prompt = ApprovalPrompt(
-            approval_id=decision.approval_id,
-            code=decision.code,
-            summary=decision.summary,
-            effect=decision.effect.value,
-            level=decision.level.value,
-            expires_at=decision.expires_at,
-            require_code=decision.require_code,
-        )
+        """Prompt every reachable approver (idempotent: the channel dedupes), then wait."""
         with spans(
-            "runner.local.approval", approvers=len(decision.approvers), level=prompt.level
+            "runner.local.approval",
+            approvers=len(decision.approvers),
+            level=decision.level.value,
         ) as s:
-            for approver in decision.approvers:
-                try:
-                    ref = await self.channel.request_approval(approver, prompt)
-                except ChannelRefused as e:
-                    s.set(ok=False, error=type(e).__name__)
-                    return Fail(f"approval prompt refused: {e}")
-                except ChannelError as e:
-                    s.set(ok=False, error=type(e).__name__)
-                    return Fail(f"approval prompt failed: {e}", retryable=True)
-                with transaction(self.conn):
-                    ap.add_channel_ref(
-                        self.conn,
-                        decision.approval_id,
-                        ref=ref.ref,
-                        at=self.now(),
-                        principal=approver,
-                    )
+            sent = await prompt_approvers(
+                self.conn, self.channel, decision, task_id=task_id, now=self.now
+            )
+            s.set(reached=len(sent.reached), unreachable=len(sent.unreachable))
+            if sent.retry:
+                s.set(ok=False, error=type(sent.error).__name__)
+                return Fail(f"approval prompt failed: {sent.error}", retryable=True)
+            if sent.none_reachable:
+                s.set(ok=False, error="ChannelRefused")
+                return Fail("approval prompt refused: no approver is reachable")
             s.set(ok=True)
         # The Wait replaces the stored checkpoint, so ``cp`` must hold the pinned ``call``.
         return Wait("approval", checkpoint=cp, wake_at=decision.expires_at)

@@ -7,8 +7,8 @@ Evaluation order (``PolicyGate`` implements it; ``DryRunGate`` is the Phase 0 st
 3. Unsafe args (control, bidi, zero-width characters): Deny.
 4. dry_run: anything that is neither an L0 read nor store-internal becomes DryRun.
 5. Level x origin x autonomy: L0 Allow; L1 NeedsApproval with a code; L2 Allow when
-   explicit, else NeedsApproval; L3 Allow. With autonomy off, everything above L0 needs
-   approval. No Veto in Phase 2.
+   explicit, else NeedsApproval (``scheduled`` is never explicit); L3 Allow. With autonomy
+   off, everything above L0 needs approval. No Veto yet.
 
 Every Allow carries a single-use ``token`` that the gate issued for that exact intent hash.
 The executor calls ``gate.consume(token, intent.hash)`` before running anything, so an
@@ -52,9 +52,11 @@ def canonical_json(value: Any) -> str:
 
 # Who chose the action. "explicit": the owner typed a slash command, so the call is
 # consent; code sets it only on the local runner's direct_call path. "inferred": the model
-# (or, later, a scheduled or extension job) chose it. Never taken from model output.
-Origin = Literal["explicit", "inferred"]
-ORIGINS: tuple[Origin, ...] = ("explicit", "inferred")
+# chose it. "scheduled": a job fired on its schedule; only the scheduler and the job runner
+# set it, and the gate treats it like "inferred" (never explicit). Never taken from model
+# output.
+Origin = Literal["explicit", "inferred", "scheduled"]
+ORIGINS: tuple[Origin, ...] = get_args(Origin)
 
 
 @dataclass(frozen=True)

@@ -8,21 +8,27 @@ Evaluation order:
    what was shown.
 4. dry_run: a tool that is neither an L0 read nor store-internal
    (``tools.is_store_internal``) becomes ``DryRun(would=<summary>)``.
-5. Level x origin x autonomy (``rule``):
+5. Level x origin x autonomy (``rule``). ``scheduled`` is never explicit:
 
-   | level | autonomy on, explicit | autonomy on, inferred | autonomy off |
-   |-------|-----------------------|-----------------------|--------------|
-   | L0    | Allow                 | Allow                 | Allow        |
-   | L3    | Allow                 | Allow                 | ask          |
-   | L2    | Allow                 | ask                   | ask          |
-   | L1    | ask with code         | ask with code         | ask with code|
+   | level | autonomy on, explicit | autonomy on, inferred / scheduled | autonomy off |
+   |-------|-----------------------|-----------------------------------|--------------|
+   | L0    | Allow                 | Allow                             | Allow        |
+   | L3    | Allow                 | Allow                             | ask          |
+   | L2    | Allow                 | ask                               | ask          |
+   | L1    | ask with code         | ask with code                     | ask with code|
 
 Kill switch: kv ``autonomy`` is read on every call, and anything but ``"on"`` (missing or
-garbage) counts as off. ``evaluate`` never returns ``Veto`` in Phase 2.
+garbage) counts as off. ``evaluate`` never returns ``Veto`` yet.
+
+Approvers (``approvers``): a builtin (``extension=None``) is owner-only. An extension tool's
+approvers are the owner plus each principal its manifest names (``approvers_for``) that
+holds ``approve`` for that extension in principals.yaml. The grant check runs here, so a
+manifest can't grant itself approvers: a name without the grant, or unknown, is dropped
+and logged.
 
 Approvals, per (task, intent hash):
-- "ask" reuses the pending approval if there is one, else inserts a new one (approvers:
-  the owner; ``expires_at`` = now + ``approval_ttl_s``).
+- "ask" reuses the pending approval if there is one, else inserts a new one (approvers as
+  above; ``expires_at`` = now + ``approval_ttl_s``).
 - Approved and unused: ``Allow(token, approval_id)``. The executor marks it used in the
   same transaction as its ``started`` row, so an approval runs at most once.
 - Rejected, expired, or already used: Deny with ``NOT_APPROVED``, ``APPROVAL_EXPIRED`` or
@@ -42,6 +48,7 @@ Expiry is lazy: every entry point first runs ``expire_due``. Every ``evaluate`` 
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
@@ -74,6 +81,8 @@ from resonant.tools import ToolRegistry, is_store_internal
 from resonant.tools.registry import ToolKey
 from resonant_sdk import Effect, Event, Level
 
+log = logging.getLogger(__name__)
+
 # Deny reasons the runner maps to its templated replies.
 NOT_APPROVED = "not approved"
 APPROVAL_EXPIRED = "approval expired"
@@ -89,9 +98,19 @@ Rule = Literal["allow", "ask", "ask_code"]
 # never come from a model; ``summarize`` cleans it anyway.
 SummaryAction = Callable[[Intent], str | None]
 
+# The approver names an extension's manifest declares (``Manifest.approvers``). Untrusted:
+# the gate keeps only names that hold the approve grant for that extension.
+ApproversFor = Callable[[str], Sequence[str]]
+
+
+def no_manifest_approvers(_extension: str) -> Sequence[str]:
+    """The default until the extension host supplies manifests: nobody but the owner."""
+    return ()
+
 
 def rule(level: Level, origin: Origin, autonomy_on: bool) -> Rule:
-    """The D1 table: risk (level) x who chose it (origin) x the kill switch."""
+    """The D1/D7 table: risk (level) x who chose it (origin) x the kill switch. Only
+    ``explicit`` is consent; ``inferred`` and ``scheduled`` ask before L2."""
     if level is Level.L0:
         return "allow"
     if level is Level.L1:
@@ -121,6 +140,7 @@ class PolicyGate:
         dry_run: bool,
         approval_ttl_s: float,
         actions: Mapping[ToolKey, SummaryAction] | None = None,
+        approvers_for: ApproversFor = no_manifest_approvers,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self.conn = conn
@@ -129,6 +149,7 @@ class PolicyGate:
         self.dry_run = dry_run
         self.ttl = timedelta(seconds=approval_ttl_s)
         self.actions = dict(actions or {})
+        self.approvers_for = approvers_for
         self.clock = clock
         self._tokens: dict[str, str] = {}
 
@@ -191,6 +212,25 @@ class PolicyGate:
         action = self.actions.get((intent.extension, intent.tool))
         return summarize(intent, action=action(intent) if action else None)
 
+    def approvers(self, extension: str | None) -> tuple[str, ...]:
+        """Who may approve a call to this extension's tools: the owner first, then each
+        manifest-named principal that holds ``approve`` for it. Builtins are owner-only."""
+        owner = self.principals.owner
+        if extension is None:
+            return (owner,)
+        named = self.approvers_for(extension)
+        if isinstance(named, str):  # a bare name is a seam bug, never a list of letters
+            raise TypeError("approvers_for must return a sequence of names, not a str")
+        found = [owner]
+        for name in named:
+            if name in found:
+                continue
+            if not self.principals.can(name, "approve", extension):
+                log.warning("dropping approver %r: no approve grant for %r", name, extension)
+                continue
+            found.append(name)
+        return tuple(found)
+
     def _allow(self, intent: Intent, approval_id: str | None = None) -> Allow:
         token = secrets.token_urlsafe(16)
         self._tokens[token] = intent.hash
@@ -217,7 +257,7 @@ class PolicyGate:
             effect=intent.effect,
             level=intent.level,
             summary=self._summary(intent),
-            approvers=(self.principals.owner,),  # global scope is owner-only
+            approvers=self.approvers(intent.extension),
             code=new_code(ap.pending_codes(self.conn)),
             expires_at=now + self.ttl,
             require_code=require_code,

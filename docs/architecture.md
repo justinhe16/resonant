@@ -119,7 +119,7 @@ wait reasons: approval · human_reply · usage_reset · ci · veto (Phase 3; unu
   - `pay` is always L1.
   - A read with no secrets is always L0.
   - MCP tools must be typed in the manifest, and unlisted ones are refused.
-- **The gate weighs risk against who chose the action** (Phase 2). The level comes from registration; the origin is `explicit` only for a slash command the router parsed (the local runner's `direct_call` path) and `inferred` for anything the model chose (and, from Phase 3, every extension job).
+- **The gate weighs risk against who chose the action** (Phase 2). The level comes from registration; the origin is `explicit` only for a slash command the router parsed (the local runner's `direct_call` path), `inferred` for anything the model chose, and `scheduled` for a job that fired on its schedule (Phase 3). `scheduled` is never explicit: L0 runs silently, L3 runs and reports to the approvers, L2 asks, L1 asks with a code. An extension's approvers are the owner plus the principals its manifest names that hold `approve` for it in `principals.yaml`; prompts go to every reachable approver.
 
   | Level | Explicit (slash command) | Inferred (model) | Kill switch on |
   |---|---|---|---|

@@ -154,7 +154,7 @@ Each ticket is one PR (~200–600 lines including tests), run through robot-surf
   - Every live child is tracked in a `ProcessTracker`: its pgid, plus its descendants from `psutil` sampled every 2 s, which catches children that `setsid` out of the group.
   - On timeout, cancel or kill switch: `killpg` SIGTERM, plus SIGTERM to the tracked tree, then SIGKILL after 2 s.
 - **Output caps.**
-  - stdout is read in bounded chunks to 256 KB; past that everything is killed and the result is `ToolFailed("output too large")`.
+  - stdout is read in bounded chunks to 256 KB; past that everything is killed and the result is ambiguous for writes, like any kill (`ExtAmbiguous("output too large")`, P3-4).
   - stderr is capped at 8 KB, redacted, and only a 200-char tail goes to the failure audit row. It is never logged or shown.
 - **Result contract** (`extensions.md`):
   - Exit 0 with exactly one JSON object means success.
