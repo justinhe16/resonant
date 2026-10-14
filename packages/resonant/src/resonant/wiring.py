@@ -148,6 +148,7 @@ def build_imessage_stack(
         gate=components.gate,
         handlers=components.handlers,
         model=model,
+        timezone=settings.timezone,
     )
     runner = components.register_local_runner(conn, model=model, channel=channel)
     runner.max_step_s = local_step_limit(settings.model, components.registry.specs())

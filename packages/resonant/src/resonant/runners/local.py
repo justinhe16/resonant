@@ -260,6 +260,24 @@ def _notes_cleared(d: dict[str, Any]) -> str | None:
     return f"Cleared {n} note{'' if n == 1 else 's'}."
 
 
+def _clip_text(text: str) -> str:
+    return text if len(text) <= NOTE_TEXT_CHARS else text[: NOTE_TEXT_CHARS - 1] + "…"
+
+
+def _reminder_set(d: dict[str, Any]) -> str | None:
+    n, due, text = d.get("id"), d.get("due"), d.get("text")
+    if not isinstance(n, int) or not isinstance(due, str) or not isinstance(text, str):
+        return None
+    return f'⏰ set for {due}: "{_clip_text(text)}" (reminder {n})'
+
+
+def _reminder_cancelled(d: dict[str, Any]) -> str | None:
+    n, due = d.get("id"), d.get("due")
+    if d.get("cancelled") is not True or not isinstance(n, int) or not isinstance(due, str):
+        return None
+    return f"Cancelled reminder {n} (was due {due})."
+
+
 def _ollama_restarted(d: dict[str, Any]) -> str | None:
     return "Restarted Ollama." if d.get("restarted") is True else None
 
@@ -291,6 +309,8 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "add_note": _note_saved,
     "delete_note": _note_deleted,
     "clear_notes": _notes_cleared,
+    "add_reminder": _reminder_set,
+    "cancel_reminder": _reminder_cancelled,
     "restart_ollama": _ollama_restarted,
     "restart_resonant": _resonant_restarting,
     "update_resonant": _updated,

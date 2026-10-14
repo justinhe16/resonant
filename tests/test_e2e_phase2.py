@@ -14,11 +14,12 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import socket
 import sqlite3
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,8 @@ from resonant.ops import mark_restart, restart_pending
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.runners.reminder import ReminderRunner
 from resonant.store.db import iso, kv_set, utcnow
+from resonant.tools.ops import GIT
+from resonant.tools.when import format_due
 from resonant_sdk import Event
 
 OWNER_PHONE = "+15551234567"
@@ -149,6 +152,24 @@ class Running:
         await wait_until(finished, 10)
         return self.script.results[task_id]
 
+    async def say(self, text: str, replies: int = 1) -> list[str]:
+        """Send ``text`` from the owner's phone; return the next ``replies`` sends."""
+        n = len(self.osa.sent)
+        self.chat.add_message(handle=OWNER_PHONE, text=text)
+        await self.osa.wait_for(n + replies, 10)
+        return [m.text for m in self.osa.sent[n : n + replies]]
+
+    async def prompt_recorded(self) -> None:
+        """Wait until the pending approval's prompt send is recorded: a reply must come after
+        it (the sent-before rule), and a person never answers that fast."""
+
+        def recorded() -> bool:
+            rows = self.rows("SELECT channel_refs FROM approvals WHERE status = 'pending'")
+            return bool(rows) and all(json.loads(r["channel_refs"]) for r in rows)
+
+        await wait_until(recorded, 10)
+        await asyncio.sleep(0.01)
+
     async def status(self) -> dict[str, Any]:
         async with httpx.AsyncClient() as client:
             r = await client.get(f"http://127.0.0.1:{self.port}/api/status")
@@ -172,7 +193,9 @@ async def running(
         yield r
 
 
-def build_daemon(home: Path, chat: FakeChatDB, ops: FakeOpsRunner) -> Running:
+def build_daemon(
+    home: Path, chat: FakeChatDB, ops_runner: FakeOpsRunner, **overrides: Any
+) -> Running:
     """A daemon with iMessage on, fakes for osascript, the model and ops subprocesses."""
     (home / "principals.yaml").write_text(PRINCIPALS)
     port = free_port()
@@ -181,22 +204,28 @@ def build_daemon(home: Path, chat: FakeChatDB, ops: FakeOpsRunner) -> Running:
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
+        **overrides,
     )
     osa = RecordingOsaRunner()
-    daemon = Daemon(settings, model=ScriptedModel(), osa_runner=osa, ops_runner=ops)
+    daemon = Daemon(settings, model=ScriptedModel(), osa_runner=osa, ops_runner=ops_runner)
     kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
     components = daemon.state.components
     assert components is not None
     script = ScriptRunner(components)
     daemon.loop.runners[script.name] = script
-    return Running(daemon, osa, chat, port, script, ops)
+    return Running(daemon, osa, chat, port, script, ops_runner)
 
 
 @contextlib.asynccontextmanager
 async def start_daemon(
-    home: Path, chat: FakeChatDB, before_run: Callable[[Running], None] | None = None
+    home: Path,
+    chat: FakeChatDB,
+    before_run: Callable[[Running], None] | None = None,
+    *,
+    ops_runner: FakeOpsRunner | None = None,
+    **overrides: Any,
 ) -> AsyncGenerator[Running]:
-    r = build_daemon(home, chat, FakeOpsRunner())
+    r = build_daemon(home, chat, ops_runner or FakeOpsRunner(), **overrides)
     if before_run is not None:
         before_run(r)
     run = asyncio.create_task(r.daemon.run())
@@ -348,3 +377,191 @@ async def test_back_up_once_after_a_requested_restart(
     async with start_daemon(resonant_home, chat) as r:
         await asyncio.sleep(0.2)
         assert r.osa.sent == []
+
+
+# --- P2-15: slash commands ----------------------------------------------------------------
+
+
+@pytest.fixture
+async def live(resonant_home: Path, chat: FakeChatDB) -> AsyncIterator[Running]:
+    """The daemon with ``dry_run: false`` and scripted git/uv for ``/update``."""
+    ops = (
+        FakeOpsRunner()
+        .ok(GIT, "rev-parse", "--abbrev-ref", "HEAD", stdout="main\n")
+        .ok(GIT, "status", "--porcelain")
+        .ok(GIT, "rev-parse", "--short=7", "HEAD", stdout="abc1234\n")
+    )
+    async with start_daemon(
+        resonant_home, chat, ops_runner=ops, dry_run=False, ops={"uv_path": "/opt/uv/bin/uv"}
+    ) as r:
+        yield r
+
+
+def _code(prompt: str) -> str:
+    m = re.match(r"\[([A-Z][0-9])\] ", prompt)
+    assert m, prompt
+    return m.group(1)
+
+
+async def test_e1_note_runs_with_no_prompt(running: Running) -> None:
+    r = running
+    assert await r.say("/note buy milk") == ['Saved note 1: "buy milk"']
+    (row,) = r.rows("SELECT status FROM executions")
+    assert row["status"] == "succeeded"
+    (audit,) = r.audits("gate.evaluate")
+    assert audit["tool"] == "add_note" and audit["decision"] == "Allow"
+    assert audit["detail"]["origin"] == "explicit"
+    assert (await r.status())["approvals_pending"] == 0
+
+    assert await r.say("/notes") == ["Notes (1):\n1. buy milk"]
+    assert await r.say("/unnote 1") == ["Deleted note 1."]
+    assert await r.say("/notes") == ["No notes."]
+    assert await r.say("/unnote 1") == ["Failed: delete note id=1 (delete_note: no note 1)"]
+    assert await r.say("/unnote one") == ["that's not a note number. Usage: /unnote <n>"]
+
+
+async def test_e4_notes_clear_needs_the_code(running: Running) -> None:
+    r = running
+    await r.say("/note a")
+    await r.say("/note b")
+    (prompt,) = await r.say("/notes clear")
+    code = _code(prompt)
+    assert prompt == f"[{code}] delete all 2 notes? This can't be undone. Reply yes {code} / no"
+    await r.prompt_recorded()
+
+    assert await r.say("yes") == [f"Reply yes {code} to confirm."]
+    assert await r.say("/notes") == ["Notes (2):\n2. b\n1. a"]  # still there
+
+    assert await r.say(f"yes {code}") == ["Cleared 2 notes."]
+    assert await r.say("/notes") == ["No notes."]
+    (audit,) = [a for a in r.audits("gate.evaluate") if a["tool"] == "clear_notes"][:1]
+    assert audit["detail"]["origin"] == "explicit"
+
+
+async def test_e4_notes_clear_no_denies(running: Running) -> None:
+    r = running
+    await r.say("/note a")
+    (prompt,) = await r.say("/notes clear")
+    assert prompt.endswith(f"Reply yes {_code(prompt)} / no")
+    await r.prompt_recorded()
+    assert await r.say("no") == ["Not done."]
+    assert await r.say("/notes") == ["Notes (1):\n1. a"]
+
+
+async def test_e2_restart_resonant_runs_with_no_prompt(live: Running) -> None:
+    r = live
+    assert await r.say("/restart resonant") == ["Restarting Resonant…"]
+    assert len(r.ops.spawned) == 1 and "resonant.ops.restart_later" in r.ops.spawned[0]
+    marker = restart_pending(r.conn)
+    assert marker is not None and marker["commit"] == "abc1234"
+    audit = [a for a in r.audits("gate.evaluate") if a["tool"] == "restart_resonant"]
+    assert [(a["decision"], a["detail"]["origin"]) for a in audit] == [("Allow", "explicit")]
+    assert (await r.status())["approvals_pending"] == 0
+
+    assert await r.say("/restart ollama") == ["Restarted Ollama."]
+    assert any("kickstart" in argv for argv in r.ops.argvs())
+
+
+async def test_e6_remind_set_listed_and_cancelled(running: Running) -> None:
+    r = running
+    before = utcnow()
+    (reply,) = await r.say("/remind in 20 min stretch")
+    (task,) = r.rows("SELECT id, status, wake_at, checkpoint FROM tasks WHERE kind = 'reminder'")
+    cp = json.loads(task["checkpoint"])
+    at = datetime.fromisoformat(cp["at"])
+    assert timedelta(minutes=19) < at - before <= timedelta(minutes=20, seconds=5)
+    due = format_due(at, now=utcnow(), tz=r.daemon.settings.timezone)
+    assert reply == f'⏰ set for {due}: "stretch" (reminder 1)'
+    assert (task["status"], cp["text"]) == ("queued", "stretch")
+
+    assert await r.say("/reminders") == [f"Reminders (1):\n1. {due}: stretch"]
+    assert await r.say("/unremind 1") == [f"Cancelled reminder 1 (was due {due})."]
+    (task,) = r.rows("SELECT status FROM tasks WHERE kind = 'reminder'")
+    assert task["status"] == "cancelled"
+    assert await r.say("/reminders") == ["No reminders."]
+
+
+@pytest.mark.parametrize(
+    ("text", "hint"),
+    [
+        ("/remind 3 call mom", "say 3pm or 15:00"),
+        ("/remind yesterday 9am x", "that time has passed"),
+        ("/remind in 5 min", "say what to remind you about"),
+    ],
+)
+async def test_e8_bad_times_get_a_usage_reply(running: Running, text: str, hint: str) -> None:
+    r = running
+    assert await r.say(text) == [f"{hint}. Usage: /remind <when> <text>"]
+    assert r.rows("SELECT id FROM tasks WHERE kind IN ('reminder', 'command')") == []
+
+
+async def test_e9_update_refuses_a_dirty_tree(resonant_home: Path, chat: FakeChatDB) -> None:
+    ops = (
+        FakeOpsRunner()
+        .ok(GIT, "rev-parse", "--abbrev-ref", "HEAD", stdout="main\n")
+        .ok(GIT, "status", "--porcelain", stdout=" M README.md\n")
+    )
+    async with start_daemon(
+        resonant_home, chat, ops_runner=ops, dry_run=False, ops={"uv_path": "/opt/uv/bin/uv"}
+    ) as r:
+        assert await r.say("/update") == [
+            "Failed: update resonant (working tree has changes; not updating)"
+        ]
+        assert not any(argv[:2] == (GIT, "pull") for argv in r.ops.argvs())
+        assert r.ops.spawned == []
+
+
+async def test_e9_update_already_current(live: Running) -> None:
+    r = live
+    assert await r.say("/update") == ["Already up to date (abc1234)."]
+    assert r.ops.spawned == []
+
+
+async def test_e10_unknown_command_suggests_and_never_executes(running: Running) -> None:
+    r = running
+    assert await r.say("/remnd 3pm x") == ["Unknown command /remnd. Did you mean /remind?"]
+    assert r.rows("SELECT id FROM tasks WHERE kind IN ('reminder', 'command')") == []
+    assert r.audits("gate.evaluate") == []
+
+    (text,) = await r.say("/help")
+    for usage in (
+        "/note <text>",
+        "/notes [clear]",
+        "/unnote <n>",
+        "/remind <when> <text>",
+        "/reminders",
+        "/unremind <n>",
+        "/restart ollama|resonant",
+        "/update",
+        "/disk",
+        "/logs [n]",
+        "/projects [all]",
+        "/approvals [code]",
+    ):
+        assert f"\n{usage}: " in text, usage
+    (text,) = await r.say("/help rem")
+    assert text.splitlines()[1:] == [
+        "/remind <when> <text>: set a reminder: 3pm, in 20 min, tomorrow 9am, fri 5pm",
+        "/reminders: pending reminders, soonest first",
+        "/unremind <n>: cancel reminder n",
+    ]
+
+
+async def test_e11_projects_shows_commands_by_title(running: Running) -> None:
+    r = running
+    await r.say("/note buy milk")
+    (text,) = await r.say("/projects")
+    assert text.startswith("Projects (")
+    assert "- done · command · /note · " in text
+    assert "buy milk" not in text  # titles never carry message text
+
+
+async def test_e15_dry_run_through_the_router(running: Running) -> None:
+    """dry_run on: ``/restart ollama`` is held back while notes and reminders still run."""
+    r = running
+    assert await r.say("/restart ollama") == ["Dry run: would restart Ollama"]
+    assert await r.say("/update") == ["Dry run: would update Resonant"]
+    assert r.ops.calls == [] and r.ops.spawned == []
+    assert await r.say("/note x") == ['Saved note 1: "x"']
+    (reply,) = await r.say("/remind in 1 h y")
+    assert reply.startswith("⏰ set for ") and reply.endswith('"y" (reminder 1)')
