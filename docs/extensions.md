@@ -2,7 +2,7 @@
 
 An extension teaches Resonant about one product or domain, such as a trading bot, an on-call rotation, or a home lab, without changing the core. It is usually its own repo containing a `resonant.yaml` manifest and the scripts or servers the manifest points at. The core never imports extension code. It reads the manifest, runs your commands as separate processes, and enforces policy around them.
 
-> **Status.** The manifest schema is v1, with Phase 3's additive fields (job effects and levels, `catchup`, `description`, `examples`). `resonant ext validate` and `resonant ext add|update|remove|list` work today. Scheduling, tool exposure and notifications are built in Phase 3. This guide describes the full contract so you can write extensions now.
+> **Status.** The manifest schema is v1, with Phase 3's additive fields (job effects and levels, `catchup`, `description`, `examples`). Everything in this guide is built (Phase 3) except MCP tools and critical jobs, which are deferred: `ext add` refuses an `mcp` block or `critical: true` for now ([`followups.md`](followups.md)). [`extensions/github`](../extensions/github) is a real one.
 >
 > **Phase 3 extensions are first-party, owner-installed code** from this repo or a local git work tree. They run as the owner's macOS user. See [phase3-plan.md](phase3-plan.md) D13.
 
@@ -34,6 +34,8 @@ See [`extensions/example`](../extensions/example) for a complete, working refere
 ## 2. Stdlib only, and the SDK
 
 **Extensions are stdlib only.** `ext validate` and `ext add` refuse a `pyproject.toml` that declares dependencies, `requirements*.txt`, lock files (`uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile*`), `package.json`, `setup.py`, `setup.cfg` and `environment.yml`, anywhere in the tree. There are no venvs and no install step, so no build-time code ever runs.
+
+Extensions run as `python -I -S`, so no package (the SDK included) is importable from them. The one runtime helper, `resonant_sdk/emit.py`, is stdlib only: copy it next to your script to write events (§7). `-I` also keeps your script's directory off `sys.path`, so add it yourself before importing a sibling module.
 
 Use `resonant-sdk` in your own CI or dev environment only, never as a runtime dependency (install it there with `pip install "resonant-sdk @ git+https://github.com/justinhe16/resonant#subdirectory=packages/resonant-sdk"`). It gives you `Manifest` and `load_manifest` for validating, `ToolSpec`, `Effect`, `Level` and `Event`.
 
@@ -101,13 +103,16 @@ Contract:
 - **argv[0]** must be a `.py` file in your extension directory (`./cli.py`; files there run only as Python), `python3 <script.py in your dir>`, `gh` or `git`. Commands that fetch code at run time (`npx`, `bunx`, `pipx`, `uvx`, `uv`, `docker`, `curl`, …) and shells (`sh`, `bash`, `env`, …) are refused. Python scripts run under the daemon's own interpreter with `-I -S`; the shebang is ignored.
 - Exit 0 with **exactly one JSON object** on stdout means success.
 - A **non-zero exit means nothing took effect**: you promise that a failed run changed nothing. A timeout or kill is treated as "maybe happened" for writes.
-- Write state to `$RESONANT_EXT_DATA` (also your `HOME`), never next to your code.
-- Secrets arrive as `RESONANT_SECRET_<NAME>` environment variables, for that process only. The model never sees them.
+- Write state to `$RESONANT_EXT_DATA` (also your `HOME`), never next to your code: the installed copy is read-only.
+- The environment is built from scratch, never the daemon's: `PATH=/opt/homebrew/bin:/usr/bin:/bin`, `HOME` and `RESONANT_EXT_DATA` (your data dir), `TMPDIR` (`<data>/tmp`), `LANG`, `USER`, `LOGNAME`, `RESONANT_EXT`, `RESONANT_EVENTS_FD=3`, `GIT_TERMINAL_PROMPT=0`, `RESONANT_JOB_DUE_AT` for jobs, and the secrets below.
+- Secrets arrive as `RESONANT_SECRET_<NAME>` environment variables, only the ones this tool or job declares, for that process only. The model never sees them.
+- stdout is capped at 256 KB (past that the process is killed); the result is stored up to 32 KB and the model sees at most 4 KB of it, as untrusted data. stderr (8 KB) is never shown or logged; a redacted 200-character tail goes to the failure audit row.
+- On a timeout, a cancel or the kill switch, the whole process group and any tracked children are killed.
 - Calls are idempotent per (task, step, intent). Resonant won't re-run a call that already succeeded.
 
-### MCP tools
+### MCP tools (deferred)
 
-Use an MCP server for stateful or long-running tools (a warm browser, a database connection) or when you have many tools. MCP servers don't declare effects, so **you list every tool you want exposed, with its effect**. Unlisted tools are refused.
+Not supported yet: `ext add` refuses an `mcp` block. The planned contract: use an MCP server for stateful or long-running tools (a warm browser, a database connection) or when you have many tools. MCP servers don't declare effects, so **you list every tool you want exposed, with its effect**. Unlisted tools are refused.
 
 ```yaml
 mcp:
@@ -121,7 +126,8 @@ mcp:
 
 - Declare secret names in `secrets:` and give each tool or job the ones it needs. Names are lowercase with underscores (`token`, `api_key`).
 - Store values in the macOS Keychain on the Mini, from its terminal only: `resonant secret set <ext>/<name>`.
-- Only the executor reads them, and only at call time.
+- Only the executor (and the scheduler, for L0 jobs) reads them, just before the call. `resonant secret check <ext>/<name>` does the same no-prompt read from the terminal; `resonant secret list` shows which declared secrets are present.
+- Every encoding of a value (raw, URL-encoded, JSON-escaped, base64) is replaced with `[redacted]` in results, events, errors, audit rows and logs. Don't print secrets in other forms: those aren't caught.
 - Never put secrets in the manifest, in `.env`, or in your repo. The Resonant repo runs gitleaks, and yours should too.
 
 ## 6. Jobs
@@ -143,11 +149,12 @@ jobs:
 - **Cadence.** A job may fire at most every 5 minutes, and **at most hourly if it asks** (L1 or L2), so prompts can't pile up. Give a job the lowest effect that's true; a job without `effect` is a write and asks.
 - Each job also exists as a tool spec named `job_<id>` (dashes become underscores) so `/ext run <ext>/<id>` can run it. No tool may use that name.
 - **Normal jobs** run on the daemon's scheduler.
-- **Critical jobs** get their own LaunchAgent and are wrapped as `resonant job-guard --job <ext>/<id> -- <run>`. That wrapper **refuses to run while the kill switch is engaged**, and also when it can't read the paused flag (it fails closed, exit 75). Make critical jobs idempotent and safe to skip.
+- While the kill switch is on, due jobs are skipped and never caught up, and a running job's processes are killed.
+- **Critical jobs** (deferred: `ext add` refuses `critical: true` for now) will get their own LaunchAgent, wrapped as `resonant job-guard --job <ext>/<id> -- <run>`, which **refuses to run while the kill switch is engaged** and fails closed (exit 75). Make them idempotent and safe to skip.
 
 ## 7. Events and notifications
 
-Your processes report what happened by emitting events: either an `"events"` list in the result object, or JSON lines written to file descriptor 3 (`RESONANT_EVENTS_FD`).
+Your processes report what happened by emitting events: either an `"events"` list in the result object, or JSON lines written to file descriptor 3 (`RESONANT_EVENTS_FD`) with the stdlib helper `emit.py` copied from the SDK (`from emit import emit; emit("ci_failed", "✗ resonant#40 CI failed (lint)", "resonant#40:run:123:failed")`). Events count only when the run succeeds.
 
 ```json
 {"summary": "2 PRs", "events": [{"type": "ci_failed", "text": "resonant#40 CI failed", "dedupe_key": "resonant#40:run:123:failed"}]}
@@ -212,7 +219,7 @@ The digest is sha256 over the sorted `(path, file/executable/symlink, sha256(con
 - [ ] Every tool prints exactly one JSON object and exits 0 on success.
 - [ ] Effects and levels are as low as safely possible, and `commit: true` is on irreversible actions.
 - [ ] No secrets in the repo; secrets are declared and stored in the Keychain.
-- [ ] Critical jobs are idempotent and safe to skip when paused.
+- [ ] Jobs are idempotent and safe to skip when paused.
 - [ ] Events carry `dedupe_key`.
 - [ ] Each approver holds the `approve` grant in `principals.yaml`.
 - [ ] Anything that moves money or places orders runs inside your extension with its own risk controls. Core only sees read tools, events and the kill switch, as trade-jev does.

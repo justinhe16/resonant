@@ -107,7 +107,9 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 - Cost and rate limits of a periodic sweep.
 - How it interacts with the kill switch: nudges are read-only messages, but they still respect `paused`.
 
-**Depends on.** The Phase 3 scheduler and extensions, data sources (Phase 7 for calendar and mail), and the status relay if nudges should also be visible remotely.
+**Phase 3 shipped the seed:** the code-built daily briefing (`core/briefing`, 08:00) on the new scheduler. What's left is the model-ranked part: quiet hours, ranking, "not useful" feedback.
+
+**Depends on.** The Phase 3 scheduler and extensions (built), data sources (Phase 7 for calendar and mail), and the status relay if nudges should also be visible remotely.
 
 **Done when.**
 - A sweep sends at most N useful nudges a day with no repeats.
@@ -175,21 +177,17 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 - A `run_project` text from the owner leads, after approval, to a reviewed PR and an iMessage with its link.
 - `architecture.md` and `interfaces.md` describe the runner.
 
-## Keychain secret injection (Phase 3)
+## Veto windows for unattended jobs
 
-*Deferred 2026-10-13, from Phase 2 ([plan §7](phase2-plan.md#7-deferred-and-out-of-scope)). No Phase 2 tool needs a secret.*
+*Deferred 2026-10-13 from Phase 2, and again 2026-10-14 from Phase 3 ([plan §8](phase3-plan.md#8-out-of-scope-and-deferred)): asking jobs are rare and fire at most hourly, so asking works for now.*
 
-**What.** A `SecretStore` over the `security` CLI. The executor injects a tool's declared secrets as `RESONANT_SECRET_<NAME>` into that tool's process only, and redacts their exact values from results, logs and audit.
+**What.** "Doing X in 10 min unless you stop": a `scheduled` L2 returns `Veto` and parks in `waiting(veto)` (`approvals.kind=veto`) with `wake_at` = the deadline, and runs unless the owner replies `stop`. `Veto` is already in the gate contract and is never returned today. Carried design:
+- A `stop` beats deadline expiry: a `stop` whose `occurred_at` ≤ the deadline wins even if it's ingested after it (reader watermark plus no unrouted earlier events), and so does one within a short late-stop grace after the deadline, if the call hasn't started.
+- An ambiguous `stop` (several vetoes pending) converts them all to asks.
+- A veto may run only if its prompt was recorded as sent at least the window before.
+- Late (the daemon was down past the window) or under `/kill`, it converts to an ask.
 
-**Done when.** The first extension tool that declares a secret gets it in its env and nowhere else, and a test proves the value never reaches the model, logs or `executions`.
-
-## Veto windows for unattended jobs (Phase 3)
-
-*Deferred 2026-10-13, from Phase 2. Every Phase 2 action has someone texting, so asking works; unattended jobs don't.*
-
-**What.** "Doing X in 10 min unless you stop": an inferred L2 from a scheduled or extension job parks in `waiting(veto)` with `wake_at` = the deadline, and runs unless the owner replies `stop`. `Veto` is already in the gate contract and is never returned today. Carry over the v2 plan's lateness rule (a job whose window passed while the daemon was down asks instead of running) and watermark.
-
-**Done when.** A Phase 3 job's L2 action runs after its window with no reply, never runs after `stop` or `/kill`, and a missed window asks.
+**Done when.** A job's L2 action runs after its window with no reply, never runs after `stop` or `/kill`, and a missed window asks.
 
 ## Approval classifier and `resonant eval approvals`
 
@@ -207,14 +205,6 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 **Done when.** `yes all` approves a snapshot and nothing that arrived after it.
 
-## GitHub tools
-
-*Deferred 2026-10-13: not picked for Phase 2.*
-
-**What.** Read tools for PRs and CI (`gh`, polled), then writes (comment, re-run CI) at L3/L2. They likely belong to the Claude runner work (`run_project`) rather than core.
-
-**Done when.** "is PR 12 green?" answers from `gh`, and writes go through the gate.
-
 ## Note undo
 
 *Deferred 2026-10-13, from Phase 2. Deletes are soft (`deleted_at`) so this stays possible.*
@@ -229,7 +219,7 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 **Problem.** Same-user processes are outside the gate's threat model: they can run `resonant approvals approve` or `resonant resume`, write `~/.resonant/resonant.db`, and read the Keychain. Phase 3 extension CLIs and Phase 5 Claude sessions run shell commands as that user.
 
-**Done when.** Runners with shell access run sandboxed (e.g. `sandbox-exec` or a separate user) with no access to `~/.resonant`, the `resonant` CLI or `/usr/bin/security`, and a test proves each is denied.
+**Done when.** Runners with shell access run sandboxed (e.g. `sandbox-exec` or a separate user) with no access to `~/.resonant`, the `resonant` CLI or `/usr/bin/security`, and a test proves each is denied. For extension processes this is the [Seatbelt sandbox](#seatbelt-sandbox-for-extension-processes) below.
 
 ## Ops hardening
 
@@ -270,3 +260,80 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 *Noted 2026-10-13, from the Phase 2 router eval on the real model.*
 
 The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). Look at both misses, then decide between a few-shot fix and an eval case that pins them. Re-run after any prompt or model change, together with [router evals on real texts](#router-evals-on-real-texts-go-live-step-9).
+
+## MCP stdio client for extensions
+
+*Deferred 2026-10-14, from Phase 3 ([plan §8](phase3-plan.md#8-out-of-scope-and-deferred)). No first-party extension needs one; `ext add` refuses an `mcp` block today.*
+
+**Design to carry.**
+- Only manifest-listed tools, with manifest descriptions; schema descriptions are stripped and annotations ignored.
+- A per-tool pin, `sha256(name, description, input_schema, output_schema, annotations)`, checked at start and on `list_changed`; a change disables the tool and alerts.
+- The server's stderr goes to a redacting sink, never a raw log.
+- `npx`/`uvx`-style unpinned fetch-runners are refused.
+- The server env is the union of its tools' secrets. The process group is killed on stop (MCP children survive a graceful exit).
+
+**Done when.** An extension can expose typed MCP tools that pass the same gate, pins and kill switch as CLI tools.
+
+## Critical-job LaunchAgents and `job-guard`
+
+*Deferred 2026-10-14, from Phase 3, with their only consumer (trade-jev). `ext add` refuses `critical: true` today.*
+
+**Design to carry.**
+- Critical jobs must be Allow-only: L0, or L3 with a report.
+- `job-guard` stays the **parent** (no exec), so it can pipe the job's output through redaction.
+- It checks `autonomy` and `paused`, the extension row, the job and the pin, and fails closed (exit 75).
+- The command comes from the approved manifest snapshot, never from the plist.
+
+**Done when.** A critical job fires with the daemon down, is skipped while paused, and refuses a tampered copy.
+
+## Seatbelt sandbox for extension processes
+
+*Deferred 2026-10-14, from Phase 3 (the D13 interim bar). Needs its own security review. It must land before any third-party or network source.*
+
+**Deny-default design.**
+- Deny `lsopen`, `launchctl`, `open`, `shortcuts`.
+- Deny `mach-lookup` of `securityd` / `com.apple.SecurityServer`.
+- Deny `process-info` and `signal` on other processes.
+- Deny loopback (including Ollama `:11434` and the API `:7777`) and unix sockets, except mDNSResponder.
+- Deny the pasteboard, Apple Events, and exec from the data dir or `TMPDIR`.
+- Deny `file-read*` under `$HOME` outside the extension and data dirs.
+- Go CLIs such as `gh` need `trustd` for TLS. `sandbox-exec` is deprecated but works; verify per macOS release.
+
+**Tests.** A copied `security` binary, ctypes `SecItemCopyMatching`, and a read of `~/Library/Mail` are all denied.
+
+## iMessage `/ext add|update|remove`
+
+*Deferred 2026-10-14, from Phase 3. A terminal confirmation is enough for first-party code, and it keeps remote installs out of the threat model.*
+
+**Done when.** There is a design for binding a remote approval to `{source, commit, tree_digest, manifest_sha}` with a typed confirmation, reviewed, and it ships only after the sandbox.
+
+## Git and network sources, Python deps
+
+*Deferred 2026-10-14, from Phase 3.*
+
+**What.** `git+https://…` sources and extensions with dependencies (a per-extension venv). They need the Seatbelt sandbox, clone hardening (no hooks, no submodules, pinned commits, never tags), and a `uv sync --locked` review first: install-time code must not run unreviewed.
+
+## Extension runtime extras
+
+*Deferred 2026-10-14, from Phase 3.*
+
+- An HTTP `emit()` for long-running extension processes (trade-jev).
+- Per-extension network allowlists (an `srt`-style proxy).
+- A separate macOS user for extensions.
+- CPU and memory limits.
+- Retention for tasks, audit rows and events (L0 jobs already make no task rows).
+
+## Phase 3 build notes
+
+*Noted 2026-10-14, during the Phase 3 build. Each is small; fix or accept it in the decisions log.*
+
+- **Router accuracy with extensions.** The advisory eval at `ext add` showed builtin accuracy dip from 95.6% to 91.1% with the extensions installed. Tune the intent descriptions and examples with [real texts](#router-evals-on-real-texts-go-live-step-9).
+- **Notify cap edge.** A crash between a send and its `ext.notify_sent` audit row leaves that send uncounted, so after a crash at the cap an hour can carry one notification over its 20.
+- **Briefing reads are capped.** The briefing reuses the builtin reads, which return at most 50 items (`list_reminders`, `projects`), so its counts undercount past that.
+- **L0 jobs are at least once within catch-up.** A crash after an L0 run's process finished but before its result was recorded re-runs it after the restart, if still within `catchup`. L0 jobs are reads, and events dedupe by key.
+- **JobRunner events after a crash.** A gated job's events are lost if the daemon crashes between recording the execution and finishing the task step: the retry returns the recorded result, without the events.
+- **`@me` in GraphQL search** (`author:@me`, `review-requested:@me`) is unverified against the live API; go-live step 12 checks it. If it doesn't resolve, set `author` in `~/.resonant/ext-data/github/config.json`.
+- **`gh` and `git` accept arbitrary arguments** as argv[0] until the sandbox: a manifest can run any `gh` subcommand. Only first-party, reviewed manifests are installed meanwhile.
+- **Vendored packages aren't detected.** The stdlib-only check looks for dependency files, not a vendored `site-packages` or copied third-party modules in the tree. Review catches it for now.
+- **Manifest approvers name a principal.** The shipped manifests say `approvers: [owner]`, so `ext add` refuses unless the owner principal is named `owner` (go-live step 4 names it that). The owner is always an approver anyway; consider dropping the line or treating the owner's role as implicit.
+- **Manifest rows saved before P3-14** stored `manifest_json` with sorted keys, so their positional `/<ext> <tool>` arguments would follow alphabetical order. No production install predates P3-14, so nothing to migrate; `ext remove` and `ext add` rewrite a row.

@@ -1,6 +1,6 @@
 # Phase 3 plan (v2): first-party extensions, scheduled jobs, secrets, the daily briefing
 
-Status: **v2, after the architecture and security reviews and the owner's decisions**. Scope: the extension manager from [`architecture.md`](architecture.md#components), cut down to **first-party, owner-installed** extensions: CLI tools, scheduled jobs and notifications. Also in scope:
+Status: **implemented** (P3-1 to P3-16, 2026-10-14). The live checks are [`go-live.md`](go-live.md#12-phase-3-extensions-jobs-and-the-briefing) step 12; what was deferred is in [`followups.md`](followups.md). This is v2 of the plan, after the architecture and security reviews and the owner's decisions. Scope: the extension manager from [`architecture.md`](architecture.md#components), cut down to **first-party, owner-installed** extensions: CLI tools, scheduled jobs and notifications. Also in scope:
 - Keychain secret injection and L3 reports for jobs with no requester ([`followups.md`](followups.md)).
 - A code-built **daily briefing**: the first proactive nudge.
 - The first real extension, `github`.
@@ -302,7 +302,7 @@ Each ticket is one PR (~200–600 lines including tests), run through robot-surf
   - `health`: `gh api user`, every 30m.
 - **Ticket B: writes** (needs PAT write scopes: actions, pull requests).
   - `rerun_failed {repo, number}` (L3).
-  - `merge_pr {repo, number}` (L1, `commit`: always `yes <code>`).
+  - `merge_pr {repo, number, head_sha}` (L1, `commit`: always `yes <code>`). The approval binds to that head commit.
 
 ---
 
@@ -471,6 +471,8 @@ Deploy with `/update`. The log shows `extensions=0`, and `bootstrap.sh --check` 
 8. Edit `~/.resonant/extensions/example/cli.py` (`chmod u+w` first), then `/restart resonant`. The owner gets `example changed on disk…; disabled` (E9). `resonant ext update example` restores it.
 
 ### `scripts/bootstrap.sh --check` (new rows)
+
+As built (P3-16), the rows are `extensions dir`, `extension <name> pin` (advisory; covers the copy and its pinned `argv0` paths), `secret <ext>/<name>` (existence only; required for enabled extensions), `extension jobs scheduled` and `briefing scheduled`, with next due times computed from the manifests and config (no `ext_jobs` row needed). A failed `cronsim` import fails those two rows. The no-prompt read and `gh` auth are checked live in go-live step 12 instead. The table below is the original plan.
 
 | Check | Required | Pass when |
 |---|---|---|

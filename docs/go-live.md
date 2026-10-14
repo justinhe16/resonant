@@ -182,6 +182,62 @@ Then `resonant daemon install` and `resonant status` (`dry_run  False`). `--chec
 - **Expected:** exit 0, `dry_run  False`.
 - **Rollback:** `/kill` (everything above L0 asks), or set `dry_run: true` and run `resonant daemon install`.
 
+## 12. Phase 3: extensions, jobs and the briefing
+
+Stage B of step 11 is done (`dry_run: false`). Deploy Phase 3 with `/update` (or `git pull --ff-only && uv sync --frozen` and `resonant daemon install`). `~/.resonant/logs/resonant.jsonl` shows `extensions=0` on start, and `scripts/bootstrap.sh --check` shows `store schema 4  PASS`, `extensions dir  PASS  none installed yet` and `briefing scheduled  PASS  daily 08:00 …; next …`.
+
+The shipped manifests list the approver `owner`, so the owner in `~/.resonant/principals.yaml` must be named `owner`, as in step 4. Otherwise `ext add` refuses with `approver 'owner' is not a known principal`.
+
+Codes (`A7`, `D7`), times, pins, PR numbers and counts below are examples.
+
+### In the terminal on the Mini
+
+1. **The GitHub token.** Create a fine-grained personal access token limited to the repos you want watched, with repository permissions Metadata, Contents, Pull requests, Checks and Actions, all **read** (see [`extensions/github/README.md`](../extensions/github/README.md#token)). Then:
+
+   ```sh
+   resonant secret set github/token     # paste it at the hidden prompt, twice
+   resonant secret check github/token   # github/token: ok (no prompt)
+   resonant secret list ~/resonant/extensions/github   # github/token ... present
+   ```
+
+   `set` says `stored github/token`. No Keychain dialog may appear for `check`. If one does, the item's access list doesn't trust `/usr/bin/security`: `resonant secret rm github/token` and set it again from this terminal.
+
+2. **Install github.** `resonant ext add repo:github`. Check the screen:
+   - the heading `github repo:github@<commit> digest <digest>`;
+   - **Escalations** first: the secret `token`, the approver `owner`, `merge_pr` (L1), and the commands that run `gh`;
+   - then the tools (`prs`, `pr`, `rerun_failed` L3, `merge_pr` L1), the jobs `watch` (every 10 minutes, L0) and `digest` (07:50, L0), notify on `ci_failed`, `ci_fixed`, `review_requested`, and the health check.
+
+   Type `github`. It prints `Installed github repo:github@…` and `Restarting the daemon; it texts you when it's back.`, and over iMessage you get `Back up, down 4s` / `Installed github`.
+
+3. **Optional: the example.** `resonant ext add repo:example`, type `example`. Its `morning-ping` texts `[example] ping` on weekday mornings from the second run on. Skip it if you don't want that.
+
+4. `scripts/bootstrap.sh --check`: `extension github pin  PASS  enabled, <commit> digest <digest>, copy ok`, `secret github/token  PASS  present (value not read)`, `extension jobs scheduled  PASS  2 job(s); next github/watch …`.
+
+### Over iMessage
+
+1. **List.** `/ext list` → `Extensions (1):`, then `github · enabled · <commit> digest <digest> · 4 tools`, `- digest (L0) · next tomorrow 7:50am · never run`, `- watch (L0) · next …`, then `core · built in` and `- briefing (L0) · next tomorrow 8:00am · …`. Once the health check has run, the github line ends `· health ok`.
+2. **Help.** `/help github` lists `/github prs`, `/github pr <repo> <number>`, `/github rerun_failed <repo> <number>` (L3) and `/github merge_pr <repo> <number> <head_sha>` (L1). `/gihub prs` → `Unknown command /gihub. Did you mean /github?`, and nothing runs.
+3. **PRs, no prompt.** `/github prs` → `github prs: 3 open PRs, 1 failing CI, 0 awaiting your review`. This is also the daemon-side Keychain check: the daemon read the token with nobody at the screen. If no Keychain dialog appeared on the Mini and the reply isn't `Not done: secret github/token …`, the LaunchAgent reads it without a prompt.
+4. **Chat.** "show my PRs" → an answer about your open PRs (the router labels it `extension:github`).
+5. **No token anywhere.** On the Mini, `grep -c '<first 6 chars of the token>' ~/.resonant/logs/resonant.jsonl` and `sqlite3 ~/.resonant/resonant.db "SELECT COUNT(*) FROM audit_log WHERE detail LIKE '%<first 6 chars>%'"` both print `0`.
+6. **Watch.** `/ext run github/watch` → `github/watch: done: 3 PRs watched, 2 events`. Nothing else arrives: the first run after install is a silent baseline, so PRs that were already red or green aren't announced.
+7. **CI goes red.** Push a commit that fails CI to a scratch PR. Within about 10 minutes, once: `[github] ✗ resonant#41 CI failed (<workflow>)`. Push a fix: `[github] ✓ resonant#41 CI fixed`.
+8. **Mute.** `/ext mute github 1h` → `Muted github until 3:45pm.`. Break CI again: nothing arrives, then or later. `/ext mute github off` → `Unmuted github.`.
+9. **Briefing.** `/ext run core/briefing` → the briefing (one line per section with something in it, e.g. `▶ 1 running, 1 waiting (approval)`, or `Nothing on today.`), then `Briefing sent.`. The next morning it arrives by itself at 08:00, with a `github: …` line from the 07:50 digest.
+10. **Kill switch.** `/kill` → `kill switch engaged`. Due jobs are skipped: `sqlite3 ~/.resonant/resonant.db "SELECT at, extension, tool FROM audit_log WHERE action = 'job.skipped_paused' ORDER BY id DESC LIMIT 3"` shows the next `job_watch`. Any extension process still running is killed (`job.killed`), and no notifications or briefing are sent. `/ext run github/watch` → `Paused: nothing runs until /resume.`. `/resume` → `resumed: autonomy on, unpaused`; the skipped runs are not caught up, and the next `watch` runs on time.
+11. **Tamper.** On the Mini: `chmod u+w ~/.resonant/extensions/github/README.md && echo x >> ~/.resonant/extensions/github/README.md`, then `/restart resonant`. After `Back up …` you get, once: `github changed on disk since you approved it; disabled. resonant ext update github to review`. `/ext list` shows `github · disabled_tampered · …`, and `/github prs` no longer exists. In the terminal, `resonant ext update github` shows the changed file and the full review; type `github`. `Back up …` / `Updated github`, and `/ext list` shows it `enabled` again.
+
+### Optional: the writes
+
+Only if you want them (see the github README). Edit the token: Actions **read and write** for `rerun_failed`; Contents and Pull requests **read and write** for `merge_pr`. The Keychain item doesn't change.
+
+- `/github rerun_failed justinhe16/resonant 41` on a PR with a failed run: it runs without asking (L3) and replies `Done: github: rerun failed …`. With nothing to re-run it replies `Failed: github: rerun failed …` and changes nothing.
+- `/github pr justinhe16/resonant 41` shows the head SHA. `/github merge_pr justinhe16/resonant 41 <sha>` → `[D7] … merge pr …? This can't be undone. Reply yes D7 / no`. `no` → `Not done.`. Only `yes D7` merges, and only if the head is still `<sha>` and checks are green.
+
+- **Verify:** `scripts/bootstrap.sh --check`
+- **Expected:** exit 0; `extension github pin`, `secret github/token`, `extension jobs scheduled` and `briefing scheduled` all `PASS`.
+- **Rollback:** `resonant ext remove github`, type `github`: its tools, jobs and commands go after the restart. It keeps `~/.resonant/ext-data/github/` (`--purge` deletes it) and prints `resonant secret rm github/token` for the token it leaves. `/kill` stops everything at once in the meantime.
+
 ## Done
 
 `scripts/bootstrap.sh --check` exits 0 with every required step `PASS`, and you have texted Resonant and got a reply.
