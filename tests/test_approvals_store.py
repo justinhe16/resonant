@@ -379,3 +379,14 @@ def test_wake_resolved_ignores_unknown_task(db: sqlite3.Connection) -> None:
     result = ResolveResult(ok=True, resolved=(ResolvedApproval("a", "missing", "h", True),))
     assert ap.wake_resolved(db, result, NOW) == 0
     assert db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_count_pending_skips_expired_and_resolved(db: sqlite3.Connection) -> None:
+    assert ap.count_pending(db, NOW) == 0
+    _approval(db, _task(db), code="A1", approvers=("justin",))
+    _approval(db, _task(db), code="A2", approvers=("alex",))
+    _approval(db, _task(db), code="A3", expires_at=NOW - timedelta(seconds=1))
+    done = _approval(db, _task(db), code="A4")
+    assert ap.resolve(db, done, approved=False, decided_by="justin", now=NOW) is None
+    assert ap.count_pending(db, NOW) == 2  # every approver; expired rows don't count
+    assert ap.count_pending(db, NOW + TTL) == 0

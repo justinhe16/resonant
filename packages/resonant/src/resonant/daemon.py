@@ -6,10 +6,14 @@ checkpoint on the next start.
 
 With ``channels.imessage.enabled`` the daemon also runs the Phase 1 stack
 (``resonant.wiring``): the iMessage channel feeds ``loop.submit``, the router is the loop's
-router hook, ``runner="local"`` answers, and the health monitor runs. On shutdown the
-reader and monitor stop first (no new events), then the loop drains in-flight steps (which
-may still send their replies), then the model client closes. With it disabled, the daemon
-is exactly Phase 0.
+router hook, ``runner="local"`` answers, ``runner="reminder"`` sends due reminders, and the
+health monitor runs. On shutdown the reader and monitor stop first (no new events), then
+the loop drains in-flight steps (which may still send their replies), then the model client
+closes. With it disabled, the daemon
+is exactly Phase 0 apart from the gate.
+
+The gate is always the Phase 2 ``PolicyGate``; the startup line logs
+``gate=policy dry_run=<bool>``.
 """
 
 from __future__ import annotations
@@ -149,7 +153,7 @@ class Daemon:
         watchdog = Watchdog(self.heartbeat, self.settings.health.watchdog_stale_s)
         watchdog.start()
         log.info(
-            "resonant daemon started (api %s:%s, dry_run=%s, imessage=%s)",
+            "resonant daemon started (api %s:%s, gate=policy dry_run=%s, imessage=%s)",
             self.settings.api.host,
             self.settings.api.port,
             self.settings.dry_run,

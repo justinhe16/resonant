@@ -19,7 +19,7 @@ from resonant.components import Components, build_components, deny_all_principal
 from resonant.config import Settings, load_settings
 from resonant.daemon import Daemon
 from resonant.executor import NotAllowedError, ToolFailed
-from resonant.gate import Allow, Deny, Intent
+from resonant.gate import Allow, Deny, Intent, PolicyGate
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.store.db import kv_set, utcnow
 from resonant.store.tasks import insert_task, set_status
@@ -379,6 +379,7 @@ async def test_daemon_wires_components(settings: Settings) -> None:
         comps = daemon.state.components
         assert comps is not None and not comps.principals_loaded
         assert {s.name for s in comps.registry.specs()} == NAMES
+        assert isinstance(comps.gate, PolicyGate)
         assert comps.gate.registry is comps.registry
     finally:
         daemon.conn.close()

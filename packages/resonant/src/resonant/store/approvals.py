@@ -220,6 +220,15 @@ def pending_for(conn: sqlite3.Connection, principal: str, now: datetime) -> list
     return [_row_to_approval(r) for r in rows]
 
 
+def count_pending(conn: sqlite3.Connection, now: datetime) -> int:
+    """Unexpired pending approvals, for every approver (``/api/status``)."""
+    r = conn.execute(
+        "SELECT COUNT(*) AS n FROM approvals WHERE status = 'pending' AND expires_at > ?",
+        (iso(now),),
+    ).fetchone()
+    return int(r["n"])
+
+
 def pending_by_code(conn: sqlite3.Connection, code: str, now: datetime) -> Approval | None:
     """The unexpired pending approval with this code. Codes are unique among pending."""
     r = conn.execute(
