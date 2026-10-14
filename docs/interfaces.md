@@ -165,21 +165,46 @@ class Gate(TokenVerifier, Protocol):
 
 **Origin** says who chose the action. Code sets `"explicit"` in exactly one place, the local runner's `direct_call` path, whose checkpoint only the router's deterministic command parser writes. Everything the model chooses, and later every scheduled or extension job, is `"inferred"`. It is never read from model output.
 
-Evaluation order (Phase 2):
+Evaluation order (Phase 2, `resonant.gate.PolicyGate`):
 1. **Registration:** if `registry.get(extension, tool) != intent.spec`, Deny. An intent can't claim an effect or level its tool wasn't registered with.
 2. **Permission:** if `can(principal, "request", extension)` is false, Deny.
-3. **Kill switch:** if `autonomy=off`, everything above L0 needs approval.
-4. **Level:**
-   - L0: Allow.
-   - L1: NeedsApproval.
-   - L2: Veto, and the task waits with `wait_reason=veto` and `wake_at=until`.
-   - L3: Allow, then report.
-   - Inside an approved computer-use scope, `commit` tools still need approval and get a screenshot.
-5. **dry_run:** anything that isn't an L0 read becomes DryRun.
+3. **Unsafe args:** if `unsafe_args(args)` finds anything, Deny. The reason gives only a count, never the keys or values.
+4. **dry_run:** a tool that is neither an L0 read nor store-internal becomes `DryRun(would=<summary>)`.
+5. **Level × origin × autonomy** (`policy.rule`):
+
+| Level | autonomy on, explicit | autonomy on, inferred | autonomy off |
+|---|---|---|---|
+| L0 | Allow | Allow | Allow |
+| L3 | Allow | Allow | NeedsApproval |
+| L2 | Allow | NeedsApproval | NeedsApproval |
+| L1 (destructive, pay) | NeedsApproval, `require_code=True` | same | same |
+
+`evaluate` never returns `Veto` in Phase 2; the type stays for Phase 3 unattended jobs. Reporting after an L3 or explicit Allow (`Done: <summary>`) is the runner's job.
+
+```python
+PolicyGate(conn, principals, registry, *, dry_run: bool, approval_ttl_s: float,
+           actions: {(extension, tool): (Intent) -> str | None} = {}, clock=utcnow)
+rule(level, origin, autonomy_on) -> "allow" | "ask" | "ask_code"
+autonomy_on(conn) -> bool
+NOT_APPROVED, APPROVAL_EXPIRED, APPROVAL_USED, NO_TASK   # Deny reasons the runner templates
+STORE_INTERNAL_TOOLS, is_store_internal(spec)             # resonant.tools
+```
+
+- **Kill switch:** kv `autonomy` is read on every `evaluate`. Anything but `"on"` (missing, garbage, unparseable) counts as off: fail closed.
+- **dry_run exemption** is keyed on registry identity: `is_store_internal(spec)` is true only for a builtin (`extension=None`, `source="builtin"`, no secrets) named in `STORE_INTERNAL_TOOLS = {add_note, delete_note, clear_notes, add_reminder, cancel_reminder}`. A test pins the set. An extension tool with the same name is not exempt, and ops tools never are. Exempt tools still go through step 5.
+- **Approvals** per (task, intent hash). "Ask" reuses the pending approval if there is one; otherwise it inserts one with `approvers=(owner,)` (global scope is owner-only), `expires_at = now + gate.approval_ttl_s`, a fresh code, and a code-built summary (`summarize(intent, action=actions[(extension, tool)](intent))` when an action is registered). An intent whose `task_id` has no task row (the router's fast path) gets `Deny(NO_TASK)`.
+  - Approved and unused: `Allow(token, approval_id)`.
+  - Any rejected approval for the intent: `Deny(NOT_APPROVED)`, even if the table would now Allow (the owner's "no" holds for that intent).
+  - Expired: `Deny(APPROVAL_EXPIRED)`. Used: `Deny(APPROVAL_USED)`; a used approval never yields another Allow.
+  - So an intent gets at most one approval per task: after it expires, is rejected or is used, the gate never re-asks (one gated side effect per local task). A retry needs a new task.
+- **Lazy expiry:** `evaluate`, `pending_for` and `resolve` first run `expire_due(now)`. The waiting task's `wake_at = expires_at` is the backstop that wakes it.
+- `resolve(resolution)` (CLI, button): the actor must be in `approvers` and hold `approve`; then `store.approvals.resolve` and `wake_resolved` in one transaction, audited `approval.resolve`. Refusal reasons: `not_found` (also for a non-approver, so ids aren't confirmed; the audit row says `not an approver`) or the store's reason. A refused attempt is audited `decision="refused"`. This authenticated path approves L1 without typing the code.
+- `resolve_reply` returns `ResolveResult(ok=False)` until text-reply binding lands (sent-before rule, single pending, per-event idempotency). `open_batch` raises `NotImplementedError` (deferred).
+- `pending_for(principal)` lists unexpired pending approvals as `PendingApproval`.
 
 **Allow tokens.** Every `Allow` carries a single-use token that the gate issued for one intent hash. After an approval, the runner re-evaluates the intent on wake and gets an `Allow(token, approval_id)`. Tokens live in memory, so after a restart the runner simply re-evaluates.
 
-Every evaluation writes an audit row. Phase 0 ships `DryRunGate`, which checks registration and permissions, allows L0 reads with a token, and returns DryRun for everything else. It has no approvals.
+Every evaluation writes one `gate.evaluate` audit row (decision, origin, autonomy, dry_run, approval id, deny reason, args). `DryRunGate` (Phase 0, kept as a test double) checks registration and permissions, allows L0 reads with a token, and returns `DryRun(would=<decision name>)` for everything else. It has no approvals.
 
 **Transactions.** `transaction()` is not reentrant. Helpers that write bookkeeping (audit, spans, gate, executor, kill switch) use `atomic()`, which joins an enclosing transaction via SAVEPOINT. So they are safe to call standalone or inside a caller's transaction.
 
@@ -264,6 +289,8 @@ NewApproval(task_id, intent_hash, tool, effect, level, summary, approvers, code,
             require_code=False, extension=None, requested_by=None)
 insert_approval(conn, spec, now) -> str              # IntegrityError if one is pending for (task, intent) or the code is taken
 get_approval(conn, id) / pending_for_intent(conn, task_id, intent_hash, now) / pending_by_code(conn, code, now) -> Approval | None
+latest_for_intent(conn, task_id, intent_hash) -> Approval | None   # newest, any status
+was_rejected(conn, task_id, intent_hash) -> bool
 pending_for(conn, principal, now) -> list[Approval]  # unexpired, principal in approvers
 pending_codes(conn) -> set[str]                      # for new_code
 add_channel_ref(conn, id, *, ref, at, principal) -> bool   # keeps the first send per (ref, principal)
@@ -290,12 +317,15 @@ wake_resolved(conn, result, now, *, principal=None) -> int
 idempotency_key(task_id, step_no, call_index, intent_hash) -> str
 Executor(conn, verifier: TokenVerifier, handlers: {(extension | None, tool): async (args) -> dict})
     .execute(intent, decision, *, step_no, call_index=0) -> ToolResult
+    .recorded(key) -> ToolResult | None   # what executions holds for key; read-only
     .resolve_ambiguous(key, *, succeeded, actor, result=None, note=None) -> bool   # audited
 ToolResult(ok, data, error, duration_ms, replayed, ambiguous, idempotency_key)
 class ToolFailed(Exception)   # raise from a handler: "definitely did not take effect"
 ```
 
 - **Token check.** The decision must be `Allow`, and `verifier.consume(token, intent.hash)` must be true. Otherwise it raises `NotAllowedError` and audits `executor.refused`. A forged Allow, a reused token, or a token issued for different args is refused.
+- **Approvals are single use.** An `Allow` with an `approval_id` spends it: `mark_used` runs in the same transaction as the `started` row. An approval that is already used, or whose task or intent hash differs, raises `NotAllowedError` (audited `executor.refused`) and nothing runs. A replayed or ambiguous key doesn't spend it.
+- **`recorded(key)`** is for a runner resuming at a pinned key, before it calls the gate: `succeeded` returns the result (`replayed=True`), `started` returns `ambiguous=True`, `failed` returns the definite error, and no row returns None. The approval is spent with `started`, so after a definite failure of an approved call, re-evaluating gives `Deny(APPROVAL_USED)`: a retry needs a new task.
 - **What happens to a key**, by its row in `executions`:
   - `succeeded`: the recorded result is returned (`replayed=True`).
   - `started`: the outcome is unknown, so it is **ambiguous** and is never re-run. It stays that way until `resolve_ambiguous` is called.
@@ -306,7 +336,7 @@ class ToolFailed(Exception)   # raise from a handler: "definitely did not take e
 - **Never inside a transaction:** `execute()` refuses to run inside a caller's transaction. Its `started` row must be committed before the side effect.
 - **Calls in one step:** use a distinct `call_index` for each call within a step. Two calls with the same index and intent are deduped by design.
 - **Audit:** `executor.start`, `executor.result`, `executor.ambiguous`, `executor.replayed`, `executor.refused`, and `executor.ambiguous_resolved` are all written.
-- Phase 2 makes the executor the only reader of Keychain secrets. They are injected as environment variables for the tool process only, and their values are redacted in audit rows.
+- Keychain secret injection (the executor as the only reader, env vars for the tool process, redaction in audit rows) is deferred to Phase 3, with the first tool that needs a secret.
 
 ## Built-in tools: `resonant.tools.builtin`
 

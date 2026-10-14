@@ -18,8 +18,17 @@ Outcome rules:
   exception, or unserializable result might have happened after the effect, so the call is
   ambiguous.
 
+An Allow that carries an ``approval_id`` spends that approval: ``used_at`` is set in the
+same transaction as the ``started`` row, and an approval that is already used (or belongs
+to another task or intent) is refused. So one approval runs one execution.
+
+``recorded(key)`` lets a resuming runner check a pinned key before calling the gate:
+succeeded is replayed, started is ambiguous, and failed or nothing means it may run
+again. The approval is spent with ``started``, so after a definite failure of an approved
+call the gate returns ``Deny(APPROVAL_USED)``: a retry needs a new task.
+
 Each call writes audit rows before and after it, and on every refusal or ambiguity.
-Phase 2 adds Keychain secret injection and redaction.
+Keychain secret injection and redaction are deferred to Phase 3.
 """
 
 from __future__ import annotations
@@ -35,14 +44,16 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from resonant.gate.types import Allow, Decision, Intent, TokenVerifier
+from resonant.store import approvals
 from resonant.store.audit import audit
-from resonant.store.db import atomic, now_iso, transaction
+from resonant.store.db import atomic, now_iso, transaction, utcnow
 from resonant_sdk import Effect
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 HandlerKey = tuple[str | None, str]  # (extension, tool); builtins use None
 
 _UNKNOWN = "earlier attempt has no recorded outcome"
+_USED = "approval already used or not for this intent"
 
 
 def idempotency_key(task_id: str, step_no: int, call_index: int, intent_hash: str) -> str:
@@ -105,14 +116,13 @@ class Executor:
             if row is not None and row["status"] == "started":
                 self._audit("executor.ambiguous", intent, key, decision, reason=_UNKNOWN)
                 return ToolResult(ok=False, ambiguous=True, error=_UNKNOWN, idempotency_key=key)
-            self.conn.execute(
-                """INSERT INTO executions (idempotency_key, task_id, intent_hash, status,
-                       started_at) VALUES (?, ?, ?, 'started', ?)
-                   ON CONFLICT (idempotency_key) DO UPDATE SET status = 'started',
-                       started_at = excluded.started_at, finished_at = NULL, result = NULL""",
-                (key, intent.task_id, intent.hash, now_iso()),
-            )
-            self._audit("executor.start", intent, key, decision)
+            spent = decision.approval_id is None or self._spend(intent, decision.approval_id)
+            if spent:
+                self._start(intent, key, decision)
+            else:
+                self._audit("executor.refused", intent, key, decision, reason=_USED)
+        if not spent:
+            raise NotAllowedError(_USED)
 
         start = time.monotonic()
         try:
@@ -127,6 +137,23 @@ class Executor:
         else:
             outcome = ToolResult(ok=True, data=data)
         return self._record(intent, key, decision, outcome, start)
+
+    def _spend(self, intent: Intent, approval_id: str) -> bool:
+        """Mark the approval used. Call inside the transaction that writes 'started'."""
+        a = approvals.get_approval(self.conn, approval_id)
+        if a is None or a.task_id != intent.task_id or a.intent_hash != intent.hash:
+            return False
+        return approvals.mark_used(self.conn, approval_id, utcnow())
+
+    def _start(self, intent: Intent, key: str, decision: Allow) -> None:
+        self.conn.execute(
+            """INSERT INTO executions (idempotency_key, task_id, intent_hash, status,
+                   started_at) VALUES (?, ?, ?, 'started', ?)
+               ON CONFLICT (idempotency_key) DO UPDATE SET status = 'started',
+                   started_at = excluded.started_at, finished_at = NULL, result = NULL""",
+            (key, intent.task_id, intent.hash, now_iso()),
+        )
+        self._audit("executor.start", intent, key, decision)
 
     async def _run(self, intent: Intent) -> dict[str, Any]:
         handler = self.handlers.get((intent.extension, intent.tool))
@@ -172,6 +199,26 @@ class Executor:
                 duration_ms=outcome.duration_ms,
             )
         return outcome
+
+    def recorded(self, key: str) -> ToolResult | None:
+        """What ``executions`` holds for ``key``, for a runner resuming at a pinned key.
+
+        Succeeded: the recorded result (``replayed=True``), so don't call the gate again.
+        Started: ambiguous, never re-run. Failed: the definite failure. None: nothing
+        recorded. Read-only and not audited.
+        """
+        row = self.conn.execute(
+            "SELECT status, result FROM executions WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["status"] == "succeeded":
+            data = json.loads(row["result"])
+            return ToolResult(ok=True, data=data, replayed=True, idempotency_key=key)
+        if row["status"] == "started":
+            return ToolResult(ok=False, ambiguous=True, error=_UNKNOWN, idempotency_key=key)
+        error = json.loads(row["result"] or "{}").get("error")
+        return ToolResult(ok=False, error=error, idempotency_key=key)
 
     def resolve_ambiguous(
         self,
