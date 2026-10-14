@@ -439,6 +439,45 @@ async back_up(conn, channel, owner, *, clock=utcnow) -> bool
 - **Reports** (`runners.local.REPORTS`): `Restarted Ollama.`, `Restarting Resonant…`, `Updated a1b2c3d → e4f5a6b, restarting…`, `Already up to date (a1b2c3d).`, and `Updated a1b2c3d → e4f5a6b, but uv sync failed (exit 1): not restarting. Fix it on the Mini.` Read templates: `router.render.render_disk` and `render_logs` (newest lines within one 2000-char chunk).
 - **Trust.** Owner-only (global scope), two fixed launchd labels, one configured repo. `/update` runs whatever is on the repo's `main` upstream, fast-forward only, from a clean tree: remote code execution from the owner's own repo, accepted (plan §5).
 
+## Extension store: `resonant.store.extensions` (migration 004)
+
+The DB is the registry of record for installed extensions; there is no `extensions.yaml`. Plain functions over a connection; callers own transactions and audit rows.
+
+- **`extensions`**: one row per installed extension, as `ExtensionRecord(name, source, commit, tree_digest, manifest_sha, manifest, installed_at, installed_by, argv0_paths={}, status="enabled")`. `source` is `repo:<name>` or `path:<abs dir>`. `commit` (column `commit_sha`) is None without git. `manifest` is the approved snapshot (JSON). `argv0_paths` maps a spec name to its pinned absolute `argv[0]`. `status` is `enabled`, `disabled` or `disabled_tampered` (a CHECK).
+  - `save_extension(conn, rec)` inserts or fully replaces the row (install and every update). The name `core` (`CORE_EXT`) is refused: it is reserved for core jobs.
+  - `get_extension(conn, name)`, `list_extensions(conn, *, status=None)` (sorted by name).
+  - `set_status(conn, name, status) -> bool`: False when the row is missing or already has that status, so "disable and alert once" can key off it.
+  - `delete_extension(conn, name) -> bool` deletes the row and its `ext_jobs` rows together. Data dirs and Keychain items are the manager's job.
+- **`ext_jobs`**: scheduler state per `(ext, job_id)`, as `JobState(ext, job_id, last_due, last_run_at, last_outcome, open_task_id, fail_streak)`. Core jobs use `ext="core"`, so there is no FK to `extensions`. `open_task_id` references `tasks`. `last_outcome` is free text.
+  - `mark_due(conn, ext, job_id, due, *, open_task_id=None) -> JobState` upserts `last_due`, which **never moves back**, and sets `open_task_id` when given. Call it in the same transaction as `insert_task`, so a due time is claimed once.
+  - `record_run(conn, ext, job_id, *, at, outcome, ok) -> JobState` sets `last_run_at` and `last_outcome`, clears `open_task_id`, and resets `fail_streak` on `ok` or adds one.
+  - `get_job`, `list_jobs(conn, ext=None)` (sorted by `(ext, job_id)`), and `prune_jobs(conn, ext, keep) -> int` for jobs an update removed.
+- `open_existing` (job-guard, status, the approvals CLI) refuses a v3 store until the daemon has migrated it. `scripts/go_live_check.py` labels its row `store schema <latest>`.
+
+## Phase 3 config: `resonant.config`
+
+Every section has defaults, so a Phase 2 `config.yaml` loads unchanged. Unknown keys are errors, and caps are bounded both ways.
+
+| Key | Default | Bounds | Used for |
+|---|---|---|---|
+| `extensions.max_concurrent_jobs` | 4 | 1–16 | L0 jobs running at once |
+| `extensions.result_max_bytes` | 32768 | 1 KiB–256 KiB | the stored (redacted) result |
+| `extensions.model_result_max_chars` | 4096 | 256–32768, ≤ `result_max_bytes` | the model's untrusted view |
+| `extensions.process.path` | `/opt/homebrew/bin`, `/usr/bin`, `/bin` | absolute, non-empty | the child's whole `PATH` (`path_env`) |
+| `extensions.process.stdout_max_bytes` | 262144 | 1 KiB–4 MiB | stdout and fd-3 events; past it the tree is killed |
+| `extensions.process.stderr_max_bytes` | 8192 | 256–65536 | kept redacted, never shown |
+| `extensions.process.kill_grace_s` | 2 | > 0, ≤ 30 | SIGTERM, then SIGKILL |
+| `extensions.process.tree_sample_s` | 2 | > 0, ≤ 30 | `ProcessTracker` sampling |
+| `extensions.process.health_timeout_s` | 20 | > 0, ≤ 120 | a manifest `health.check` run |
+| `extensions.notify.max_per_hour` | 20 | 1–200 | per extension, then `+N more updates` |
+| `extensions.notify.max_chars` | 300 | 40–1000 | the notification text clip |
+| `secrets.security_path` | `/usr/bin/security` | absolute | Keychain access |
+| `secrets.timeout_s` | 5 | > 0, ≤ 30 | each `security` call |
+| `briefing.enabled` | true | | `core/briefing` |
+| `briefing.at` | `"08:00"` | 24-hour `HH:MM` in `timezone` | `BriefingConfig.local_time` |
+
+`Settings.extensions_dir` (`<home>/extensions`) holds the approved read-only copies, and `Settings.ext_data_dir` (`<home>/ext-data`) each extension's writable state.
+
 ## Components: `resonant.components`
 
 ```python

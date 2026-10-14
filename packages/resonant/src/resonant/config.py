@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
+from datetime import time
 from pathlib import Path
 from typing import Any, Literal, Self, cast
 from urllib.parse import urlparse
@@ -169,6 +171,108 @@ class PowerConfig(_Section):
     keep_awake: bool = True
 
 
+def _absolute(v: Path, field: str) -> Path:
+    if not v.is_absolute():
+        raise ValueError(f"{field} must be an absolute path")
+    return v
+
+
+class ProcessConfig(_Section):
+    """Extension processes (``resonant.extensions.process``). Caps are bounded both ways."""
+
+    # The child's whole PATH. Nothing else comes from the daemon's environment.
+    path: tuple[Path, ...] = (Path("/opt/homebrew/bin"), Path("/usr/bin"), Path("/bin"))
+    # stdout (and fd-3 events) past this kills the process tree: "output too large".
+    stdout_max_bytes: int = Field(default=256 * 1024, ge=1024, le=4 * 1024 * 1024)
+    # stderr is kept up to this, redacted, and never shown.
+    stderr_max_bytes: int = Field(default=8 * 1024, ge=256, le=64 * 1024)
+    # SIGTERM to the group and tracked tree, then SIGKILL after this.
+    kill_grace_s: float = Field(default=2.0, gt=0, le=30)
+    # How often descendants are sampled into the ProcessTracker.
+    tree_sample_s: float = Field(default=2.0, gt=0, le=30)
+    # Timeout of a manifest `health.check` run.
+    health_timeout_s: float = Field(default=20.0, gt=0, le=120)
+
+    @field_validator("path")
+    @classmethod
+    def _absolute_dirs(cls, v: tuple[Path, ...]) -> tuple[Path, ...]:
+        if not v:
+            raise ValueError("extensions.process.path must not be empty")
+        for p in v:
+            _absolute(p, "extensions.process.path entries")
+            if ":" in str(p):
+                raise ValueError("extensions.process.path entries may not contain ':'")
+        return v
+
+    @property
+    def path_env(self) -> str:
+        return ":".join(str(p) for p in self.path)
+
+
+class NotifyConfig(_Section):
+    """Extension notifications (``resonant.extensions.notify``)."""
+
+    # Per extension per hour; the rest collapse into one "+N more updates".
+    max_per_hour: int = Field(default=20, ge=1, le=200)
+    # Notification text is cleaned and clipped to this many characters.
+    max_chars: int = Field(default=300, ge=40, le=1000)
+
+
+class ExtensionsConfig(_Section):
+    # L0 jobs run inline as bounded background coroutines, at most this many at once.
+    max_concurrent_jobs: int = Field(default=4, ge=1, le=16)
+    # A tool or job result is stored (redacted) up to this many bytes...
+    result_max_bytes: int = Field(default=32 * 1024, ge=1024, le=256 * 1024)
+    # ...and the model sees at most this many characters of it, as untrusted data.
+    model_result_max_chars: int = Field(default=4096, ge=256, le=32 * 1024)
+    process: ProcessConfig = ProcessConfig()
+    notify: NotifyConfig = NotifyConfig()
+
+    @model_validator(mode="after")
+    def _model_view_fits(self) -> Self:
+        if self.model_result_max_chars > self.result_max_bytes:
+            raise ValueError(
+                "extensions.model_result_max_chars must be <= extensions.result_max_bytes"
+            )
+        return self
+
+
+class SecretsConfig(_Section):
+    """Keychain access (``resonant.secrets``). Values are never in config."""
+
+    # Items created by this binary trust it, so the GUI-session daemon reads without a prompt.
+    security_path: Path = Path("/usr/bin/security")
+    timeout_s: float = Field(default=5.0, gt=0, le=30)
+
+    @field_validator("security_path")
+    @classmethod
+    def _absolute_binary(cls, v: Path) -> Path:
+        return _absolute(v, "secrets.security_path")
+
+
+_HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+class BriefingConfig(_Section):
+    """The core daily briefing (``core/briefing``), sent to the owner once a day."""
+
+    enabled: bool = True
+    # Local time in `settings.timezone`, 24-hour "HH:MM".
+    at: str = "08:00"
+
+    @field_validator("at")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        if not _HHMM.match(v):
+            raise ValueError('briefing.at must be 24-hour "HH:MM", e.g. "08:00"')
+        return v
+
+    @property
+    def local_time(self) -> time:
+        hour, minute = self.at.split(":")
+        return time(int(hour), int(minute))
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESONANT_",
@@ -190,6 +294,9 @@ class Settings(BaseSettings):
     gate: GateConfig = GateConfig()
     ops: OpsConfig = OpsConfig()
     power: PowerConfig = PowerConfig()
+    extensions: ExtensionsConfig = ExtensionsConfig()
+    secrets: SecretsConfig = SecretsConfig()
+    briefing: BriefingConfig = BriefingConfig()
 
     @field_validator("home")
     @classmethod
@@ -216,6 +323,16 @@ class Settings(BaseSettings):
     @property
     def principals_path(self) -> Path:
         return self.home / "principals.yaml"
+
+    @property
+    def extensions_dir(self) -> Path:
+        """Approved, read-only extension copies: ``<extensions_dir>/<name>/``."""
+        return self.home / "extensions"
+
+    @property
+    def ext_data_dir(self) -> Path:
+        """Writable extension state (the child's HOME): ``<ext_data_dir>/<name>/``."""
+        return self.home / "ext-data"
 
     @classmethod
     def settings_customise_sources(
