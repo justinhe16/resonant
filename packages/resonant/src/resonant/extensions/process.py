@@ -350,6 +350,10 @@ class ProcessTracker:
             log.warning("ext.process.kill_all", extra={"count": len(entries), "reason": reason})
         return len(entries)
 
+    def resume(self) -> None:
+        """Allow new runs again (the kill switch's release)."""
+        self.paused = False
+
     def track(self, pid: int, label: str) -> _Tracked:
         entry = _Tracked(pid=pid, label=label)
         self._live.add(entry)

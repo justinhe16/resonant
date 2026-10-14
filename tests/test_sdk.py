@@ -294,3 +294,23 @@ def test_resolve_argv0_pins_absolute_paths(tmp_path: Path) -> None:
         resolve_argv0(root, "git status", path=str(bindir))
     with pytest.raises(ValueError, match="fetches"):
         resolve_argv0(root, "npx x", path=str(bindir))
+
+
+def test_emit_writes_one_event_line_to_the_events_fd(monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    from resonant_sdk.emit import emit
+
+    monkeypatch.delenv("RESONANT_EVENTS_FD", raising=False)
+    assert emit("ping", "hi", "k1") is False  # not under Resonant
+    r, w = os.pipe()
+    try:
+        monkeypatch.setenv("RESONANT_EVENTS_FD", str(w))
+        assert emit("ci_failed", "red", "pr#1:run:2", {"n": 1}) is True
+        line = os.read(r, 4096).decode()
+    finally:
+        os.close(r)
+        os.close(w)
+    assert line == '{"type":"ci_failed","text":"red","dedupe_key":"pr#1:run:2","data":{"n":1}}\n'
+    with pytest.raises(ValueError, match="dedupe_key"):
+        emit("x", "y", "")
