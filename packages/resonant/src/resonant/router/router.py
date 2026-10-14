@@ -4,6 +4,9 @@
 
 (a) Fast path (no model call): ``NewTask(kind="reply", runner="local",
     checkpoint={"fast_reply": text, "tool_used": ..., "intent": ..., "title": command})``.
+    A side-effecting slash command instead gives ``NewTask(kind="command", runner="local",
+    checkpoint={"direct_call": {"tool", "args"}, "intent": ..., "title": command})``: the
+    local runner runs that one call with ``origin="explicit"``.
 (b) Labeled (one model call): ``NewTask(kind="chat", runner="local", checkpoint={"intent",
     "confidence", "toolset": [names], "fallback", "toolset_prefix_hash", "title"})``.
 (c) None for anything else (other sources/types, no principal, empty text). The Loop
@@ -18,8 +21,8 @@ the confirmation). A refused reply gets a code-built ``fast_reply`` titled
 ``gate`` is the full ``Gate`` (``PolicyGate``, or ``DryRunGate`` before it is wired): the
 fast path uses ``evaluate``/``consume``/``pending_for``, the inbox ``resolve_reply``.
 
-``title`` is code-built (the command name, or ``chat: <intent>``) and is what ``/projects``
-shows; it never contains message text.
+``title`` is code-built (the command name with any subcommand word, or ``chat: <intent>``)
+and is what ``/projects`` shows; it never contains message text.
 
 Priority always comes from the principal (owner or member), never from the model. The
 toolset is filtered by ``principals.can(principal, "request", extension)`` before anything
@@ -56,6 +59,7 @@ from resonant_sdk import Event, ToolSpec
 RUNNER = "local"
 KIND_REPLY = "reply"
 KIND_CHAT = "chat"
+KIND_COMMAND = "command"
 APPROVAL_TITLE = "approval reply"
 
 
@@ -109,6 +113,7 @@ class Router:
         handlers: Mapping[HandlerKey, ToolHandler],
         model: ModelClient,
         clock: Callable[[], datetime] = utcnow,
+        timezone: str = "UTC",
     ) -> None:
         self.conn = conn
         self.principals = principals
@@ -120,6 +125,7 @@ class Router:
             gate=gate,
             handlers=handlers,
             clock=clock,
+            timezone=timezone,
         )
         self.inbox = ApprovalInbox(conn, principals=principals, gate=gate)
         self.labeler = Labeler(model)
@@ -162,11 +168,24 @@ class Router:
 
         # Order: slash commands (so /kill is never read as a reply), approval replies, then
         # keywords and the labeler.
-        cmd = match_fast_path(text)
+        cmd = match_fast_path(text, self.fast_path.context())
         if cmd is not None and cmd.slash:
             result = await self.fast_path.run(
                 cmd, principal=principal, event_id=event.id, trace_id=event.trace_id, spans=spans
             )
+            if result is not None and result.direct_call is not None:
+                return NewTask(
+                    kind=KIND_COMMAND,
+                    runner=RUNNER,
+                    priority=priority,
+                    principal=principal,
+                    channel_ref=channel_ref,
+                    checkpoint={
+                        "direct_call": result.direct_call,
+                        "intent": result.intent,
+                        "title": result.command,
+                    },
+                )
             if result is not None:
                 return reply(result.reply_text, result.tool_used, result.intent, result.command)
 

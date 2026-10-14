@@ -119,3 +119,36 @@ def render_logs(d: dict[str, Any]) -> str:
         kept.append(line)
         size += len(line) + 1
     return "\n".join(reversed(kept))
+
+
+def _numbered(lines: list[str], head: str, empty: str) -> str:
+    """``head`` then ``lines``, within one iMessage chunk (ending ``+N more``)."""
+    if not lines:
+        return empty
+    out = [head]
+    size = len(head)
+    for n, line in enumerate(lines):
+        if size + 1 + len(line) > MAX_REPLY_CHARS - _FOOTER_RESERVE:
+            out.append(f"+{len(lines) - n} more")
+            break
+        out.append(line)
+        size += 1 + len(line)
+    return "\n".join(out)
+
+
+def render_notes(d: dict[str, Any]) -> str:
+    """``/notes``: ``3. buy milk``, newest first; ``Notes (2 of 25):`` when some aren't shown."""
+    notes = [n for n in (as_dict(x) for x in as_list(d.get("notes"))) if n]
+    lines = [f"{n.get('id', '?')}. {' '.join(str(n.get('text', '')).split())}" for n in notes]
+    total = d.get("total")
+    count = str(len(lines))
+    if isinstance(total, int) and not isinstance(total, bool) and total > len(lines):
+        count = f"{len(lines)} of {total}"
+    return _numbered(lines, f"Notes ({count}):", "No notes.")
+
+
+def render_reminders(d: dict[str, Any]) -> str:
+    """``/reminders``: ``3. Tue 3:00pm: stretch``, soonest first."""
+    items = [r for r in (as_dict(x) for x in as_list(d.get("reminders"))) if r]
+    lines = [f"{r.get('id', '?')}. {r.get('due', '?')}: {r.get('text', '')}" for r in items]
+    return _numbered(lines, f"Reminders ({len(lines)}):", "No reminders.")

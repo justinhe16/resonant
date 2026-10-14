@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ from resonant.router.prefixes import (
     toolset_prefix_hash,
     wrap_untrusted,
 )
+from resonant.router.render import MAX_REPLY_CHARS, render_notes, render_reminders
 from resonant.store.db import kv_get
 from resonant.store.tasks import get_task, insert_task
 from resonant.tools import ToolRegistry
@@ -164,6 +166,22 @@ CANNED: dict[str, dict[str, Any]] = {
         "more": 0,
         "all": False,
     },
+    "list_notes": {
+        "notes": [
+            {"id": 2, "text": "call\nmom", "at": "x"},
+            {"id": 1, "text": "buy milk", "at": "x"},
+        ],
+        "count": 2,
+        "total": 2,
+    },
+    "list_reminders": {
+        "reminders": [{"id": 3, "at": "x", "due": "Tue 3:00pm", "text": "stretch"}],
+        "count": 1,
+    },
+    "disk": {
+        "disk": [{"path": "/", "free_bytes": 120.3e9, "total_bytes": 494.4e9, "used_pct": 76}]
+    },
+    "recent_logs": {"lines": ["one", "two"], "count": 2, "n": 5},
     "system_status": {
         "cpu_percent": 12.4,
         "cpu_count": 10,
@@ -445,6 +463,7 @@ def _audit_count(db: sqlite3.Connection, action: str) -> int:
     [
         ("/stauts", "Unknown command /stauts. Did you mean /status?"),
         ("/statu", "Unknown command /statu. Did you mean /status?"),
+        ("/remnd 3pm x", "Unknown command /remnd. Did you mean /remind?"),
         ("/kil", "Unknown command /kil. Did you mean /kill?"),
         ("/zzzz", "Unknown command /zzzz. Try /help."),
     ],
@@ -511,6 +530,16 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
         "/status: Resonant daemon status\n"
         "/projects [all]: open work and recent tasks\n"
         "/tasks [all]: same as /projects\n"
+        "/note <text>: save a note\n"
+        "/notes [clear]: your notes; clear deletes them all (asks first)\n"
+        "/unnote <n>: delete note n\n"
+        "/remind <when> <text>: set a reminder: 3pm, in 20 min, tomorrow 9am, fri 5pm\n"
+        "/reminders: pending reminders, soonest first\n"
+        "/unremind <n>: cancel reminder n\n"
+        "/restart ollama|resonant: restart the model server or Resonant itself\n"
+        "/update: pull Resonant from GitHub and restart\n"
+        "/disk: free disk space\n"
+        "/logs [n]: the last n log lines (at most 20)\n"
         "/approvals [code]: pending approvals; a code shows its details\n"
         "/help [word]: list commands, or the ones matching a word\n"
         "/kill: stop autonomy and pause\n"
@@ -528,13 +557,25 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
             "/tasks [all]: same as /projects",
         ),
         ("/help /Kill?", 'Commands matching "kill":\n/kill: stop autonomy and pause'),
-        ("/help stauts", 'Commands matching "stauts":\n/status: Resonant daemon status'),
+        (
+            "/help stauts",
+            'Commands matching "stauts":\n/status: Resonant daemon status\n'
+            "/restart ollama|resonant: restart the model server or Resonant itself\n"
+            "/update: pull Resonant from GitHub and restart",
+        ),
         (
             "/help autonomy",
             'Commands matching "autonomy":\n/kill: stop autonomy and pause\n'
             "/resume: turn autonomy back on",
         ),
-        ("/help remind", 'No command matches "remind". Try /help.'),
+        (
+            "/help remind",
+            'Commands matching "remind":\n'
+            "/remind <when> <text>: set a reminder: 3pm, in 20 min, tomorrow 9am, fri 5pm\n"
+            "/reminders: pending reminders, soonest first\n"
+            "/unremind <n>: cancel reminder n",
+        ),
+        ("/help zebra", 'No command matches "zebra". Try /help.'),
     ],
 )
 async def test_help_word_filters(fast_router: Router, text: str, reply: str) -> None:
@@ -558,7 +599,7 @@ async def test_help_only_lists_what_a_member_may_use(fast_router: Router) -> Non
 async def test_fast_path_never_runs_a_side_effect_inline(
     db: sqlite3.Connection, principals: Principals
 ) -> None:
-    """Only reads skip the executor. A write command must become a task (P2-15)."""
+    """Only reads run inline. A write command becomes a direct_call for the local runner."""
     write = ToolSpec(name="add_note", args_schema={"type": "object"}, effect=Effect.WRITE)
     registry = ToolRegistry()
     registry.register(write)
@@ -587,7 +628,13 @@ async def test_fast_path_never_runs_a_side_effect_inline(
     )
     cmd = FastCommand("/note", "unknown", True, tool="add_note", args={"text": "x"})
     result = await fast.run(cmd, principal=OWNER, event_id="E1")
-    assert result is not None and result.reply_text == NOT_ALLOWED
+    assert result is not None
+    assert result.direct_call == {"tool": "add_note", "args": {"text": "x"}}
+    assert result.reply_text == ""
+    assert called == []
+    # A keyword may never name a side effect: it falls through, nothing runs.
+    keyword = FastCommand("note", "unknown", False, tool="add_note", args={"text": "x"})
+    assert await fast.run(keyword, principal=OWNER, event_id="E2") is None
     assert called == []
 
 
@@ -904,3 +951,188 @@ async def test_projects_end_to_end_shows_titles_not_bodies(
     assert reply.startswith("Projects (1 open, 0 recent):\n- queued · chat · chat: system · ")
     assert "/status" not in reply and "/projects" not in reply.split("\n", 1)[1]
     assert "landlord" not in reply
+
+
+# --- P2-15: slash commands for every tool --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "title", "tool", "args"),
+    [
+        ("/note buy milk", "/note", "add_note", {"text": "buy milk"}),
+        ('/note "Buy\nmilk"', "/note", "add_note", {"text": "Buy\nmilk"}),
+        ("/unnote 1", "/unnote", "delete_note", {"id": 1}),
+        ("/notes clear", "/notes clear", "clear_notes", {}),
+        ("/unremind #3", "/unremind", "cancel_reminder", {"id": 3}),
+        ("/restart ollama", "/restart ollama", "restart_ollama", {}),
+        ("/restart resonant", "/restart resonant", "restart_resonant", {}),
+        ("/update", "/update", "update_resonant", {}),
+    ],
+)
+async def test_side_effect_commands_become_direct_call_tasks(
+    db: sqlite3.Connection,
+    fast_router: Router,
+    tool_calls: list[tuple[str, dict[str, Any]]],
+    text: str,
+    title: str,
+    tool: str,
+    args: dict[str, Any],
+) -> None:
+    task = await fast_router.route(msg(text))
+    assert task is not None
+    assert (task.kind, task.runner, task.priority) == ("command", "local", PRIORITY_OWNER)
+    assert task.checkpoint["direct_call"] == {"tool": tool, "args": args}
+    assert task.checkpoint["title"] == title  # code-built: never the note text
+    assert "fast_reply" not in task.checkpoint
+    # Nothing ran and nothing was gated at route time: the local runner does both.
+    assert tool_calls == []
+    assert _audit_count(db, "gate.evaluate") == 0
+
+
+async def test_remind_parses_in_the_owner_zone_with_the_router_clock(
+    db: sqlite3.Connection,
+    principals: Principals,
+    registry: ToolRegistry,
+    handlers: dict[HandlerKey, ToolHandler],
+) -> None:
+    now = datetime(2026, 10, 13, 22, 0, tzinfo=UTC)  # Tue 3:00pm in Los Angeles
+    router = Router(
+        db,
+        principals=principals,
+        registry=registry,
+        gate=DryRunGate(db, principals, registry),
+        handlers=handlers,
+        model=FailingModel(),
+        clock=lambda: now,
+        timezone="America/Los_Angeles",
+    )
+    task = await router.route(msg("/remind in 20 min stretch"))
+    assert task is not None and task.kind == "command"
+    assert task.checkpoint["direct_call"] == {
+        "tool": "add_reminder",
+        "args": {"at": "2026-10-13T15:20:00-07:00", "text": "stretch"},
+    }
+    assert task.checkpoint["title"] == "/remind"
+
+    for text, hint in [
+        ("/remind 3 call mom", "say 3pm or 15:00"),
+        ("/remind 9am call mom", "that time has passed"),
+    ]:
+        task = await router.route(msg(text))
+        assert task is not None and task.kind == "reply"
+        assert task.checkpoint["fast_reply"] == f"{hint}. Usage: /remind <when> <text>"
+
+
+@pytest.mark.parametrize(
+    ("text", "tool", "args", "reply"),
+    [
+        ("/notes", "list_notes", {}, "Notes (2):\n2. call mom\n1. buy milk"),
+        ("/reminders", "list_reminders", {}, "Reminders (1):\n3. Tue 3:00pm: stretch"),
+        ("/disk", "disk", {}, "Disk: / 120.3 GB free of 494.4 GB (76% used)"),
+        ("/logs 5", "recent_logs", {"n": 5}, "one\ntwo"),
+        ("/logs", "recent_logs", {}, "one\ntwo"),
+    ],
+)
+async def test_read_commands_render_inline(
+    fast_router: Router,
+    tool_calls: list[tuple[str, dict[str, Any]]],
+    text: str,
+    tool: str,
+    args: dict[str, Any],
+    reply: str,
+) -> None:
+    task = await fast_router.route(msg(text))
+    assert task is not None and task.kind == "reply"
+    assert task.checkpoint["fast_reply"] == reply
+    assert task.checkpoint["tool_used"] == tool
+    assert tool_calls == [(tool, args)]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/note buy milk",
+        "/note",  # permission before arguments: no usage line for a member
+        "/notes",
+        "/notes clear",
+        "/unnote 1",
+        "/remind in 20 min stretch",
+        "/remind 3 x",
+        "/reminders",
+        "/unremind 1",
+    ],
+)
+async def test_member_gets_not_allowed_for_owner_tools(
+    db: sqlite3.Connection,
+    fast_router: Router,
+    tool_calls: list[tuple[str, dict[str, Any]]],
+    text: str,
+) -> None:
+    task = await fast_router.route(msg(text, principal=MEMBER))
+    assert task is not None and task.kind == "reply"
+    assert task.checkpoint["fast_reply"] == NOT_ALLOWED
+    assert "direct_call" not in task.checkpoint
+    assert tool_calls == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/restart ollama", "/restart", "/restart bogus", "/update", "/update now", "/disk", "/logs x"],
+)
+async def test_member_owner_only_commands_are_refused_and_audited(
+    db: sqlite3.Connection,
+    fast_router: Router,
+    tool_calls: list[tuple[str, dict[str, Any]]],
+    text: str,
+) -> None:
+    task = await fast_router.route(msg(text, principal=MEMBER))
+    assert task is not None and task.kind == "reply"
+    assert task.checkpoint["fast_reply"] == NOT_ALLOWED
+    assert tool_calls == []
+    refused = db.execute(
+        "SELECT requested_by, detail FROM audit_log WHERE action = 'router.admin_refused'"
+    ).fetchall()
+    assert [(r["requested_by"], json.loads(r["detail"])) for r in refused] == [
+        (MEMBER, {"command": text.split()[0]})
+    ]
+
+
+async def test_member_is_never_pointed_at_an_owner_command(fast_router: Router) -> None:
+    owner = await fast_router.route(msg("/restrt ollama"))
+    member = await fast_router.route(msg("/restrt ollama", principal=MEMBER))
+    assert owner is not None and member is not None
+    assert owner.checkpoint["fast_reply"] == "Unknown command /restrt. Did you mean /restart?"
+    assert member.checkpoint["fast_reply"] == "Unknown command /restrt. Try /help."
+
+
+async def test_a_usage_reply_never_runs_kill(db: sqlite3.Connection, fast_router: Router) -> None:
+    killswitch.release(db, actor="test")
+    task = await fast_router.route(msg("/kill now please"))
+    assert task is not None and task.checkpoint["fast_reply"] == "Usage: /kill"
+    assert kv_get(db, "paused") is False
+
+
+def test_list_renders_cap_and_count() -> None:
+    assert render_notes({"notes": [], "total": 0}) == "No notes."
+    assert render_reminders({}) == "No reminders."
+    notes = [{"id": i, "text": "x" * 190} for i in range(20, 0, -1)]
+    text = render_notes({"notes": notes, "total": 25})
+    assert text.startswith("Notes (20 of 25):\n20. ")
+    assert len(text) <= MAX_REPLY_CHARS and text.splitlines()[-1].startswith("+")
+
+
+@pytest.mark.parametrize("text", ["/approvals", "/approvals A7", "/approvals not-a-code"])
+async def test_member_approvals_refused_before_args(
+    db: sqlite3.Connection, fast_router: Router, text: str
+) -> None:
+    task = await fast_router.route(msg(text, principal=MEMBER))
+    assert task is not None and task.checkpoint["fast_reply"] == NOT_ALLOWED
+    assert _audit_count(db, "router.admin_refused") == 1
+
+
+async def test_owner_approvals_bad_code_gets_usage(fast_router: Router) -> None:
+    task = await fast_router.route(msg("/approvals not-a-code"))
+    assert task is not None
+    assert task.checkpoint["fast_reply"] == (
+        "that's not an approval code. Usage: /approvals [code]"
+    )

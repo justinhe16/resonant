@@ -1,13 +1,26 @@
 """Deterministic fast path: slash commands and a few anchored keywords, no model call.
 
-Code computes and text narrates: each command maps to at most one builtin read tool, and
-the reply is rendered from a template over the tool's output.
+Code computes and text narrates: a read command runs one builtin read tool here, and the
+reply is rendered from a template over the tool's output. A side-effecting command runs
+nothing here: it becomes a ``direct_call`` task for the local runner (below).
 
 - Slash commands come from the command registry (``router/commands.py``): the first word
-  names the command and the rest is its argument text, parsed deterministically. A bad
-  argument gets the usage line. ``/help [word]`` lists the commands the asker may use. Any
-  other ``/word`` gets "Unknown command", with a "Did you mean" suggestion when one is
-  close. None of these reach the model, and a suggestion never runs anything.
+  names the command and the rest is its argument text, parsed deterministically (with the
+  clock and the owner's zone, for ``/remind``). A bad argument gets the usage line.
+  ``/help [word]`` lists the commands the asker may use. Any other ``/word`` gets "Unknown
+  command", with a "Did you mean" suggestion from the commands the asker may use. None of
+  these reach the model, and a suggestion never runs anything.
+- Permission comes before arguments: an owner-only command from anyone else gets "not
+  allowed" (audited), and so does a command whose tools the asker can't request, whatever
+  the arguments.
+- **Side-effecting commands** (``/note``, ``/remind``, ``/restart``, ``/update``, ...) return
+  ``FastPathResult.direct_call = {tool, args}``; the router turns it into
+  ``NewTask(kind="command", runner="local", checkpoint={"direct_call": ..., "title": ...})``.
+  The local runner pins exactly that call and gates it with ``origin="explicit"``, the only
+  way a call gets that origin. So explicit consent comes only from this deterministic
+  parser, never from a fuzzy match or the model. The gate still decides: L3 runs, L2 runs
+  for the owner, L1 asks for a code, the kill switch asks for everything, dry_run holds back
+  the ops tools.
 - Keywords (the whole message, case-insensitive, trailing ``?!.`` ignored): ``status``,
   ``what's running``, ``how's the mini``, ``ping``.
 
@@ -35,7 +48,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -47,12 +60,18 @@ from resonant.models.client import null_spans
 from resonant.principals import Principals
 from resonant.router import commands
 from resonant.router.approvals import approvals_reply
-from resonant.router.commands import Command, UsageError
+from resonant.router.commands import Command, ParseContext, UsageError
 from resonant.router.intents import IntentLabel
 from resonant.router.render import as_dict as _as_dict
 from resonant.router.render import as_list as _as_list
 from resonant.router.render import duration as _duration
-from resonant.router.render import render_projects
+from resonant.router.render import (
+    render_disk,
+    render_logs,
+    render_notes,
+    render_projects,
+    render_reminders,
+)
 from resonant.store.audit import audit
 from resonant.store.db import atomic, utcnow
 from resonant.tools import ToolRegistry
@@ -82,8 +101,10 @@ class FastGate(Protocol):
 class FastPathResult:
     reply_text: str
     tool_used: str | None
-    command: str = ""
+    command: str = ""  # the task title: the command name, plus a subcommand word
     intent: IntentLabel = "system"
+    # A side-effecting command: ``{tool, args}`` for the local runner; ``reply_text`` is "".
+    direct_call: dict[str, Any] | None = None
 
 
 # --- templates ---------------------------------------------------------------------------
@@ -168,19 +189,27 @@ class FastCommand:
     name: str  # "/status", "status", "what's running", ...
     intent: IntentLabel
     slash: bool
-    tool: str | None = None  # a builtin read tool (extension None)
+    tool: str | None = None  # a builtin tool (extension None)
     args: dict[str, Any] = field(default_factory=dict[str, Any])
     render: Render | None = None
-    reply: str | None = None  # static reply (no tool)
+    reply: str | None = None  # static reply (no tool): a usage line
     admin: bool = False  # owner-only (the registry's ``owner_only``)
     help: bool = False  # /help: rendered from the registry for the asking principal
+    tools: tuple[str, ...] = ()  # every tool the command can call: checked before ``reply``
+    title: str = ""  # the task title ("/restart ollama"); defaults to ``name``
+    unknown: str | None = None  # an unknown ``/word``: suggestions depend on the asker
 
 
-# The reply template for each registry command that has a tool.
+# The reply template for each registry command with a read tool (side effects are reported
+# by the local runner instead).
 COMMAND_RENDERS: dict[str, Render] = {
     "/status": render_status,
     "/projects": render_projects,
     "/tasks": render_projects,
+    "/notes": render_notes,
+    "/reminders": render_reminders,
+    "/disk": render_disk,
+    "/logs": render_logs,
 }
 
 _RUNNING = FastCommand(
@@ -214,28 +243,30 @@ def normalize(text: str) -> str:
 
 
 def _unknown(word: str | None) -> FastCommand:
-    return FastCommand("/unknown", "unknown", True, reply=commands.unknown_reply(word))
-
-
-def _from_command(cmd: Command, rest: str) -> FastCommand:
-    try:
-        args = cmd.parse(rest)
-    except UsageError as e:
-        return FastCommand(cmd.name, cmd.intent, True, reply=cmd.usage_reply(e))
     return FastCommand(
-        cmd.name,
-        cmd.intent,
-        True,
-        tool=cmd.tool,
-        args=args,
-        render=COMMAND_RENDERS.get(cmd.name),
-        admin=cmd.owner_only,
-        help=cmd is commands.HELP,
+        "/unknown", "unknown", True, reply=commands.unknown_reply(word), unknown=word
     )
 
 
-def match_fast_path(text: str) -> FastCommand | None:
-    """The fast-path command for ``text``, or None. Pure: no I/O, no principal needed."""
+def _from_command(cmd: Command, rest: str, ctx: ParseContext) -> FastCommand:
+    base = FastCommand(cmd.name, cmd.intent, True, admin=cmd.owner_only, tools=cmd.tools)
+    try:
+        sub, tool, args = cmd.resolve(rest, ctx)
+    except UsageError as e:
+        return replace(base, reply=cmd.usage_reply(e))
+    return replace(
+        base,
+        tool=tool,
+        args=args,
+        render=COMMAND_RENDERS.get(cmd.name),
+        help=cmd is commands.HELP,
+        title=f"{cmd.name} {sub}" if sub else cmd.name,
+    )
+
+
+def match_fast_path(text: str, ctx: ParseContext | None = None) -> FastCommand | None:
+    """The fast-path command for ``text``, or None. No I/O and no principal needed; ``ctx``
+    (the clock and zone, for ``/remind``) defaults to now in UTC."""
     t = normalize(text)
     if t.startswith("/"):
         word = t.split(" ", 1)[0]
@@ -245,7 +276,8 @@ def match_fast_path(text: str) -> FastCommand | None:
         if cmd is None:
             return _unknown(word)
         parts = text.split(maxsplit=1)  # the rest keeps its original case
-        return _from_command(cmd, parts[1].strip() if len(parts) == 2 else "")
+        rest = parts[1].strip() if len(parts) == 2 else ""
+        return _from_command(cmd, rest, ctx or ParseContext())
     return KEYWORDS.get(t)
 
 
@@ -262,6 +294,7 @@ class FastPath:
         gate: FastGate,
         handlers: Mapping[HandlerKey, ToolHandler],
         clock: Callable[[], datetime] = utcnow,
+        timezone: str = "UTC",
     ) -> None:
         self.conn = conn
         self.principals = principals
@@ -269,6 +302,11 @@ class FastPath:
         self.gate = gate
         self.handlers = handlers
         self.clock = clock
+        self.timezone = timezone
+
+    def context(self) -> ParseContext:
+        """What ``match_fast_path`` needs to parse ``/remind``: now, and the owner's zone."""
+        return ParseContext(self.clock(), self.timezone)
 
     async def run(
         self,
@@ -291,29 +329,43 @@ class FastPath:
         return result
 
     def _result(self, cmd: FastCommand, text: str, tool: str | None = None) -> FastPathResult:
-        return FastPathResult(text, tool, command=cmd.name, intent=cmd.intent)
+        return FastPathResult(text, tool, command=cmd.title or cmd.name, intent=cmd.intent)
+
+    def _can_request(self, principal: str, tool: str) -> bool:
+        return commands.can_request(
+            principal, tool, principals=self.principals, registry=self.registry
+        )
 
     async def _run(
         self, cmd: FastCommand, principal: str, event_id: str, trace_id: str | None
     ) -> FastPathResult | None:
-        if cmd.admin:
-            if not self.principals.can(principal, "admin", None):
-                with atomic(self.conn):
-                    audit(
-                        self.conn,
-                        "router.admin_refused",
-                        requested_by=principal,
-                        trace_id=trace_id,
-                        command=cmd.name,
-                    )
-                return self._result(cmd, NOT_ALLOWED)
-            if cmd.name == "/kill":
-                killswitch.engage(self.conn, actor=principal, reason="fast path /kill")
-                return self._result(cmd, KILL_REPLY, "killswitch.engage")
-            if cmd.name == "/resume":
-                killswitch.release(self.conn, actor=principal)
-                return self._result(cmd, RESUME_REPLY, "killswitch.release")
-        if cmd.name == "/approvals" and cmd.reply is None:  # else: a usage reply
+        # Permission before arguments: a refused asker never sees a usage line.
+        if cmd.admin and not self.principals.can(principal, "admin", None):
+            with atomic(self.conn):
+                audit(
+                    self.conn,
+                    "router.admin_refused",
+                    requested_by=principal,
+                    trace_id=trace_id,
+                    command=cmd.name,
+                )
+            return self._result(cmd, NOT_ALLOWED)
+        if cmd.slash and not all(self._can_request(principal, t) for t in cmd.tools):
+            return self._result(cmd, NOT_ALLOWED)
+        if cmd.unknown is not None:
+            available = commands.available(
+                principal, principals=self.principals, registry=self.registry
+            )
+            return self._result(cmd, commands.unknown_reply(cmd.unknown, available))
+        if cmd.reply is not None:  # a usage line
+            return self._result(cmd, cmd.reply)
+        if cmd.admin and cmd.name == "/kill":
+            killswitch.engage(self.conn, actor=principal, reason="fast path /kill")
+            return self._result(cmd, KILL_REPLY, "killswitch.engage")
+        if cmd.admin and cmd.name == "/resume":
+            killswitch.release(self.conn, actor=principal)
+            return self._result(cmd, RESUME_REPLY, "killswitch.release")
+        if cmd.name == "/approvals":
             return self._approvals(cmd, principal)
         if cmd.help:
             available = commands.available(
@@ -323,7 +375,7 @@ class FastPath:
             text = commands.help_text(available, cmd.args.get("query"), keywords=keywords)
             return self._result(cmd, text)
         if cmd.tool is None:
-            return self._result(cmd, cmd.reply or UNKNOWN_COMMAND_REPLY)
+            return self._result(cmd, UNKNOWN_COMMAND_REPLY)
 
         spec = self.registry.get(None, cmd.tool)
         handler = self.handlers.get((None, cmd.tool))
@@ -334,10 +386,18 @@ class FastPath:
         ):
             return self._result(cmd, NOT_ALLOWED) if cmd.slash else None
         if spec.effect is not Effect.READ:
-            # Only reads skip the executor here. Side-effecting commands become direct_call
-            # tasks (P2-15, plan D5); until then they are refused, never run inline.
-            log.error("fast path refused non-read tool %s", cmd.tool)
-            return self._result(cmd, NOT_ALLOWED) if cmd.slash else None
+            # Only reads run here. A side effect never runs inline: a slash command becomes a
+            # direct_call task (explicit origin, gated by the runner); a keyword never may.
+            if not cmd.slash:
+                log.error("fast path refused non-read keyword tool %s", cmd.tool)
+                return None
+            return FastPathResult(
+                "",
+                None,
+                command=cmd.title or cmd.name,
+                intent=cmd.intent,
+                direct_call={"tool": cmd.tool, "args": dict(cmd.args)},
+            )
         intent = Intent.for_tool(
             spec, task_id=f"route:{event_id}", principal=principal, args=cmd.args, trace_id=trace_id
         )

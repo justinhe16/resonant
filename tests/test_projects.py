@@ -252,7 +252,7 @@ def test_projects_command_usage() -> None:
     cmd = commands.get("/projects")
     assert cmd is not None
     with pytest.raises(UsageError):
-        cmd.parse("everything")
+        cmd.parse("everything", commands.ParseContext())
     assert cmd.usage_reply() == "Usage: /projects [all]"
 
 

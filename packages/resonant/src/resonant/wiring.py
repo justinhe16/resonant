@@ -148,6 +148,7 @@ def build_imessage_stack(
         gate=components.gate,
         handlers=components.handlers,
         model=model,
+        timezone=settings.timezone,
     )
     runner = components.register_local_runner(
         conn, model=model, channel=channel, timezone=settings.timezone
