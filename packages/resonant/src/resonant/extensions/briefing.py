@@ -270,7 +270,9 @@ async def send_briefing(
     github: bool = False,
 ) -> dict[str, Any]:
     """Build and send the briefing for the local date of ``due`` (else ``now``), deduped
-    per date. Returns ``{sent, date, sections, chars}``; never the text. Paused: not sent."""
+    per date. Returns ``{sent, date, sections, chars}``; never the text. ``sent`` means
+    handed to the channel: a same-day repeat is dropped there, by the dedupe key. Paused:
+    not sent."""
     zone = ZoneInfo(tz)
     day = (due or now).astimezone(zone).date()
     if _paused(conn):

@@ -693,7 +693,7 @@ dedupe_key(day) -> "briefing:<YYYY-MM-DD>"
   - `✋ 2 approvals pending (A7, C3)`: `approvals.pending_for(owner, now)`, up to 5 codes.
   - `⚠ model, imessage degraded`: `health_snapshot` checks in `degraded`.
   - `github: …`: `payload.text` of the latest `ext.github.digest` event (`source="ext:github"`) whose `occurred_at` falls on the local date, through `clean_external` (`✗` becomes `x`), ≤ 200 chars. Only when `github` is loaded in the host.
-- **Once a day.** The local date of `due_at` (else now) names the day; the send uses `dedupe_key=briefing:<date>`, so a restart, a catch-up, or an on-demand run the same day sends nothing more. The result holds section names and length, never the text.
+- **Once a day.** The local date of `due_at` (else now) names the day; the send uses `dedupe_key=briefing:<date>`, so a restart, a catch-up, or an on-demand run the same day sends nothing more. The result holds section names and length, never the text; `sent: true` means handed to the channel, which drops a same-day repeat by the key.
 - **On demand** (P3-14, `/ext run core/briefing`): call the scheduler's core job (`ScheduledJob` with `ext="core"`, `job_id="briefing"`) `.call({}, ctx)` (or `{"due_at": iso}`), or `send_briefing` directly.
 
 ## Components: `resonant.components`
