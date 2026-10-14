@@ -1,4 +1,5 @@
-"""iMessage composition: the channel, router, local and reminder runners, and health monitor.
+"""iMessage composition: the channel, router, local, reminder and job runners, and health
+monitor.
 
 ``build_imessage_stack`` is the one place these are wired together. The daemon calls it when
 ``channels.imessage.enabled`` is true; ``resonant bench e2e`` and the end-to-end tests call
@@ -28,6 +29,12 @@ Back up. After a restart the owner asked for (``restart_resonant``, ``update_res
 Then it sends any queued extension alerts to the owner (``extensions.host.send_alerts``:
 ``example changed on disk since you approved it; disabled. …``), once each.
 
+Jobs. ``runner="job"`` (``runners.job.JobRunner``) runs scheduled jobs above L0: it prompts
+approvers and sends job reports over iMessage, so it is registered here. Its recipients are
+the gate's approvers for the extension (owner first). The scheduler itself is the daemon's
+(it runs L0 jobs with iMessage off too); a gated job task left with no job runner fails as
+``unknown runner``, like a reminder.
+
 Reminders. ``runner="reminder"`` sends due reminders through the iMessage channel, so it is
 registered here, not in Phase 0. ``add_reminder`` only runs inside the loop (the router or a
 runner step). The loop ticks again after every step and then sleeps only until the earliest
@@ -47,6 +54,7 @@ from dataclasses import dataclass, field
 from resonant.components import Components
 from resonant.config import ModelConfig, Settings
 from resonant.extensions.host import send_alerts
+from resonant.gate import PolicyGate
 from resonant.gateway.imessage.channel import IMessageChannel
 from resonant.gateway.imessage.sender import OsaRunner
 from resonant.loop import Loop
@@ -54,6 +62,7 @@ from resonant.models import ModelClient
 from resonant.monitor import HealthMonitor
 from resonant.ops import back_up
 from resonant.router import Router
+from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
 from resonant.runners.reminder import ReminderRunner
 from resonant_sdk import ToolSpec
@@ -89,6 +98,7 @@ class IMessageStack:
     monitor: HealthMonitor
     model: ModelClient
     owner: str | None = None  # gets "back up" after a requested restart
+    jobs: JobRunner | None = None
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     _started: bool = field(default=False, repr=False)
 
@@ -141,8 +151,9 @@ def build_imessage_stack(
 ) -> IMessageStack:
     """Build the channel, router, runners and monitor, and hook them into ``loop``.
 
-    Sets ``loop.router`` to ``Router.route`` and registers ``runner="local"`` and
-    ``runner="reminder"`` in both ``components.runners`` and ``loop.runners``. ``model``
+    Sets ``loop.router`` to ``Router.route`` and registers ``runner="local"``,
+    ``runner="reminder"`` and ``runner="job"`` in both ``components.runners`` and
+    ``loop.runners``. ``model``
     defaults to an ``OllamaClient`` over ``settings.model`` (closed by
     :meth:`IMessageStack.aclose`); ``osa_runner`` defaults to the real osascript runner.
     Tests and the e2e bench inject fakes for both.
@@ -182,6 +193,20 @@ def build_imessage_stack(
     loop.runners[reminders.name] = reminders
     loop.router = router.route
 
+    gate = components.gate
+    fallback = (components.principals.owner,)
+    jobs = JobRunner(
+        conn,
+        gate=gate,
+        executor=components.executor,
+        registry=components.registry,
+        channel=channel,
+        recipients=gate.approvers if isinstance(gate, PolicyGate) else lambda _ext: fallback,
+        timezone=settings.timezone,
+    )
+    components.runners[jobs.name] = jobs
+    loop.runners[jobs.name] = jobs
+
     owner = components.principals.owner if components.principals_loaded else None
     monitor = HealthMonitor(
         conn,
@@ -200,5 +225,6 @@ def build_imessage_stack(
         monitor=monitor,
         model=model,
         owner=owner,
+        jobs=jobs,
         _close_model=close_model,
     )

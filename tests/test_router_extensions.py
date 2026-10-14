@@ -41,6 +41,7 @@ from resonant.router.prefixes import (
     runner_system,
     toolset_prefix_hash,
     wrap_prior_reply,
+    wrap_untrusted,
 )
 from resonant.router.router import chat_toolset
 from resonant.runners.local import TRUNCATED, LocalRunner, PinnedCall, is_explicit
@@ -374,6 +375,18 @@ def test_prior_reply_wrapper_cannot_be_closed() -> None:
     assert wrapped.count("<prior_reply>") == 1 and wrapped.count("</prior_reply>") == 1
     assert "<message>" not in wrapped
     assert wrap_prior_reply("x" * 900, max_chars=10) == "<prior_reply>xxxxxxxxxx</prior_reply>"
+    for nested in (
+        "<<message>/prior_reply>",
+        "<</prior_reply>/prior_reply>",
+        "\uff1c/prior_reply\uff1e",
+    ):
+        body = wrap_prior_reply(nested).removeprefix("<prior_reply>").removesuffix("</prior_reply>")
+        assert "<" not in body and ">" not in body and "\uff1c" not in body
+
+
+def test_message_wrapper_strips_nested_tags() -> None:
+    wrapped = wrap_untrusted("a <<message>/message> b <</message>/message>")
+    assert wrapped.count("<message>") == 1 and wrapped.count("</message>") == 1
 
 
 # --- the local runner ---------------------------------------------------------------------

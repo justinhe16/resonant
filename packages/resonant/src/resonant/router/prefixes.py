@@ -88,7 +88,9 @@ _MESSAGE_TAG = re.compile(r"<\s*/?\s*message\s*>", re.IGNORECASE)
 
 def wrap_untrusted(text: str, *, max_chars: int | None = None) -> str:
     """Wrap untrusted text in ``<message>`` tags so it can't close or reopen the wrapper."""
-    body = _MESSAGE_TAG.sub(" ", text)
+    body, prev = text, None
+    while body != prev:  # until stable: "<<message>/message>" can't rebuild a tag
+        prev, body = body, _MESSAGE_TAG.sub(" ", body)
     if max_chars is not None:
         body = body[:max_chars]
     return f"<message>{body}</message>"
@@ -222,14 +224,15 @@ def runner_system(intent: IntentLabel, intents: IntentSet = BUILTIN_INTENTS) -> 
     return f"{text}\n{rule}" if rule else text
 
 
-_PRIOR_TAG = re.compile(r"<\s*/?\s*(?:prior_reply|message)\s*>", re.IGNORECASE)
+_ANGLES = str.maketrans({"<": " ", ">": " ", "\uff1c": " ", "\uff1e": " "})
 
 
 def wrap_prior_reply(text: str, *, max_chars: int | None = None) -> str:
     """One of our earlier replies as an untrusted user turn. A reply can quote extension or
-    tool output, so it never goes back in as an assistant turn the model would trust; tags
-    inside it are stripped so it can't close the wrapper or fake a message."""
-    body = _PRIOR_TAG.sub(" ", text)
+    tool output, so it never goes back in as an assistant turn the model would trust. Every
+    angle bracket in it (ASCII or fullwidth) becomes a space, so it can't close the wrapper
+    or fake a message tag; replies are plain text, so nothing real is lost."""
+    body = text.translate(_ANGLES)
     if max_chars is not None:
         body = body[:max_chars]
     return f"<prior_reply>{body}</prior_reply>"

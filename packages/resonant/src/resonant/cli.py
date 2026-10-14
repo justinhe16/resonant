@@ -586,8 +586,12 @@ def _router_check(settings: Settings, conn: sqlite3.Connection, staged: Staged) 
         )
         return
     typer.echo(f"Router: new intent extension:{staged.name}")
-    before = router_eval.installed_intents(conn, exclude=staged.name)
-    for line in router_eval.advisory(settings, m, before=before):
+    try:
+        before = router_eval.installed_intents(conn, exclude=staged.name)
+        lines = router_eval.advisory(settings, m, before=before)
+    except Exception as e:  # advisory: never blocks an install or update
+        lines = [f"Router: advisory eval skipped ({type(e).__name__})"]
+    for line in lines:
         typer.echo(line)
 
 
