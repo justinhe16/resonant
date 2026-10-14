@@ -11,7 +11,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
-from datetime import time
+from datetime import time, timedelta
 from pathlib import Path
 from typing import Any, Literal, Self, cast
 from urllib.parse import urlparse
@@ -25,6 +25,8 @@ from pydantic_settings import (
     SettingsConfigDict,
     YamlConfigSettingsSource,
 )
+
+from resonant_sdk.manifest import duration_s
 
 DEFAULT_HOME = Path("~/.resonant")
 
@@ -263,7 +265,7 @@ class BriefingConfig(_Section):
     @field_validator("at")
     @classmethod
     def _hhmm(cls, v: str) -> str:
-        if not _HHMM.match(v):
+        if not _HHMM.fullmatch(v):
             raise ValueError('briefing.at must be 24-hour "HH:MM", e.g. "08:00"')
         return v
 
@@ -271,6 +273,65 @@ class BriefingConfig(_Section):
     def local_time(self) -> time:
         hour, minute = self.at.split(":")
         return time(int(hour), int(minute))
+
+
+_QUIET_HOURS = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _hhmm_time(text: str) -> time:
+    hour, minute = text.split(":")
+    return time(int(hour), int(minute))
+
+
+class PulseConfig(_Section):
+    """The pulse (docs/pulse-plan.md): hourly "btw" messages and urgent interrupts."""
+
+    enabled: bool = True
+    # Local time in `settings.timezone`, "HH:MM-HH:MM". Only urgent items go out inside it.
+    # A window whose end is before its start wraps midnight ("22:00-06:00").
+    quiet_hours: str = "00:00-06:00"
+    # How long an approval waits before it is mentioned once more (a duration: 30m, 4h).
+    remention_after: str = "4h"
+
+    @field_validator("quiet_hours")
+    @classmethod
+    def _quiet_hours(cls, v: str) -> str:
+        m = _QUIET_HOURS.fullmatch(v)
+        if not m:
+            raise ValueError('pulse.quiet_hours must look like "00:00-06:00"')
+        if v[:5] == v[6:]:
+            raise ValueError("pulse.quiet_hours must start and end at different times")
+        return v
+
+    @field_validator("remention_after")
+    @classmethod
+    def _remention(cls, v: str) -> str:
+        try:
+            seconds = duration_s(v)
+        except ValueError as e:
+            raise ValueError("pulse.remention_after must look like 30m or 4h") from e
+        if not 5 * 60 <= seconds <= 24 * 3600:
+            raise ValueError("pulse.remention_after must be between 5m and 24h")
+        return v
+
+    @property
+    def quiet_start(self) -> time:
+        return _hhmm_time(self.quiet_hours[:5])
+
+    @property
+    def quiet_end(self) -> time:
+        return _hhmm_time(self.quiet_hours[6:])
+
+    def in_quiet(self, local_time: time) -> bool:
+        """Whether a local wall-clock time is inside the quiet window (start inclusive)."""
+        start, end = self.quiet_start, self.quiet_end
+        if start < end:
+            return start <= local_time < end
+        return local_time >= start or local_time < end  # wraps midnight
+
+    @property
+    def remention(self) -> timedelta:
+        return timedelta(seconds=duration_s(self.remention_after))
 
 
 class Settings(BaseSettings):
@@ -297,6 +358,7 @@ class Settings(BaseSettings):
     extensions: ExtensionsConfig = ExtensionsConfig()
     secrets: SecretsConfig = SecretsConfig()
     briefing: BriefingConfig = BriefingConfig()
+    pulse: PulseConfig = PulseConfig()
 
     @field_validator("home")
     @classmethod

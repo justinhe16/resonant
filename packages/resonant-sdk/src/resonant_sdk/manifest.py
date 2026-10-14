@@ -43,6 +43,7 @@ _CRON_FIELD = re.compile(r"^[A-Za-z0-9*/,\-]+$")
 _DURATION = re.compile(r"^\d+[smh]$")
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 _EVENT = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+RESERVED_EVENT = "item"  # the pulse's event type (``report()``); never a ``notify.on`` entry
 _UNIT_S = {"s": 1, "m": 60, "h": 3600}
 
 SecretName = Annotated[str, Field(pattern=SECRET_NAME)]
@@ -62,7 +63,7 @@ class _Strict(BaseModel):
 
 def duration_s(v: str) -> int:
     """Seconds in a ``30s`` / ``5m`` / ``1h`` duration."""
-    if not _DURATION.match(v):
+    if not _DURATION.fullmatch(v):
         raise ValueError(f"{v!r} must look like 30s, 5m, or 1h")
     return int(v[:-1]) * _UNIT_S[v[-1]]
 
@@ -132,7 +133,7 @@ class Job(_Strict):
     @classmethod
     def _cron(cls, v: str) -> str:
         fields = v.split()
-        if len(fields) != 5 or not all(_CRON_FIELD.match(f) for f in fields):
+        if len(fields) != 5 or not all(_CRON_FIELD.fullmatch(f) for f in fields):
             raise ValueError(f"schedule {v!r} must be a 5-field cron expression")
         if cron_min_interval_s(v) < JOB_MIN_INTERVAL_S:
             raise ValueError(f"schedule {v!r} fires more often than every 5 minutes")
@@ -192,12 +193,12 @@ class CliTool(_Strict):
         for _, name, spec, conversion in string.Formatter().parse(self.run):
             if name is None:
                 continue
-            if not _IDENT.match(name) or spec or conversion:
+            if not _IDENT.fullmatch(name) or spec or conversion:
                 raise ValueError(f"placeholder {{{name}}} must be a plain arg name like {{date}}")
             used.add(name)
         if missing := used - set(self.args):
             raise ValueError(f"run uses undeclared args: {sorted(missing)}")
-        if bad := [a for a in self.args if not _IDENT.match(a)]:
+        if bad := [a for a in self.args if not _IDENT.fullmatch(a)]:
             raise ValueError(f"arg names must be identifiers: {bad}")
         return self
 
@@ -226,9 +227,23 @@ class Notify(_Strict):
     @field_validator("on")
     @classmethod
     def _events(cls, v: tuple[str, ...]) -> tuple[str, ...]:
-        if bad := [e for e in v if not _EVENT.match(e)]:
+        if RESERVED_EVENT in v:
+            raise ValueError(
+                f"{RESERVED_EVENT!r} is a reserved event type (pulse reports, set by "
+                "`report:`); it can't be in notify.on"
+            )
+        if bad := [e for e in v if not _EVENT.fullmatch(e)]:
             raise ValueError(f"event names must be lowercase slugs: {bad}")
         return v
+
+
+class Report(_Strict):
+    """The pulse grant: the highest urgency this extension's ``report()`` items may use.
+
+    Items asking for more are clamped to it. Without this section, reports are refused.
+    """
+
+    max_urgency: Literal["urgent", "normal", "low"]
 
 
 class Health(_Strict):
@@ -255,6 +270,7 @@ class Manifest(BaseModel):
     tools: dict[str, CliTool] = Field(default_factory=dict[str, CliTool])
     mcp: McpServer | None = None
     notify: Notify | None = None
+    report: Report | None = None
     health: Health | None = None
     secrets: tuple[SecretName, ...] = ()
 

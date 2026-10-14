@@ -111,7 +111,8 @@ jobs:     [{id, schedule (5-field cron), tz?, critical?, run,
 tools:    {<name>: {run, description?, effect, level?, args: {<arg>: string|integer|number|boolean},
                     secrets?, commit?, timeout_s? (<= 300)}}   # {placeholders} in run must be declared args
 mcp:      {command, tools: {<name>: {effect, level?, commit?, secrets?}}}   # unlisted MCP tools are refused
-notify:   {on: [<event>, ...], channel: imessage|slack}
+notify:   {on: [<event>, ...], channel: imessage|slack}   # "item" is reserved (pulse reports): refused here
+report:   {max_urgency: urgent|normal|low}   # optional; the highest urgency report() may use (no section: reports refused)
 health:   {check, every: 30s|5m|1h}
 secrets:  [<name>, ...]          # ^[a-z][a-z0-9_]{0,31}$; every tool and job secret must be declared here
 ```
@@ -576,8 +577,26 @@ Every section has defaults, so a Phase 2 `config.yaml` loads unchanged. Unknown 
 | `secrets.timeout_s` | 5 | > 0, ≤ 30 | each `security` call |
 | `briefing.enabled` | true | | `core/briefing` |
 | `briefing.at` | `"08:00"` | 24-hour `HH:MM` in `timezone` | `BriefingConfig.local_time` |
+| `pulse.enabled` | true | | the hourly pulse and urgent interrupts |
+| `pulse.quiet_hours` | `"00:00-06:00"` | `HH:MM-HH:MM` in `timezone`, start != end, may wrap midnight | `PulseConfig.quiet_start`, `.quiet_end`, `.in_quiet(local_time)` |
+| `pulse.remention_after` | `4h` | `30m`/`4h` style, 5m–24h | `PulseConfig.remention` (a `timedelta`) |
 
 `Settings.extensions_dir` (`<home>/extensions`) holds the approved read-only copies, and `Settings.ext_data_dir` (`<home>/ext-data`) each extension's writable state.
+
+## Pulse items: `resonant.store.pulse` (migration 005), SDK `report()`
+
+Table `pulse_items(source, key, title, urgency, fingerprint, cleared, updated_at, expires_at, told_fingerprint, told_at)`, primary key `(source, key)`. `source` is `core` or an extension name. Plain functions over a connection; callers own transactions and audit rows. Timestamps are `iso()` strings.
+
+- `fingerprint(title, state=None, *, urgency="normal", clear=False) -> str`: sha256 of the canonical JSON of `{"state": state}` when `state` is given, else `{"title": title}`, plus `urgency` and `clear`. So a resolve with the same text, and a normal -> urgent escalation, are changes. `ValueError` for a `state` that is not JSON (NaN included) or is over `MAX_STATE_BYTES` (2000).
+- `upsert(conn, source, key, title, urgency, state, clear, ttl_s, now) -> (Change, Item)` where `Change` is `"new" | "changed" | "same"` and `Item` is the stored row (hand it to `mark_told`). The change compares with `told_fingerprint`: `new` when nothing was ever told for the row (it repeats on every report while untold, so it means "there is news", not "send now"; exactly once comes from the event-id dedupe of the send plus the told state), `changed` when it differs, `same` when the owner already heard exactly this. A -> B -> A after B was told is `changed`. The row is always rewritten (expiry extended, cleared flag set to `clear`). `ValueError` for a bad `key` (1..120 of `[a-z0-9/._:-]`), urgency, `ttl_s` (1..604800; `DEFAULT_TTL_S` is 24h), an empty title, a naive `now`, or an unusable `state`. The title is clipped to 200; sanitizing is the caller's job.
+- `get(conn, source, key) -> Item | None`.
+- `pending(conn, urgencies, now, sources_excluded=()) -> list[Item]`: unexpired items at those urgencies whose fingerprint is not the told one, urgent first then oldest. Includes cleared items until their last word is told, and an untold cleared item never expires out of this list.
+- `open_items(conn, now) -> list[Item]`: uncleared, unexpired items at any urgency, changed-since-told first (for the briefing).
+- `mark_told(conn, items, at)`: compare-and-set. It sets `told_fingerprint` to the item's fingerprint only where the row still has that fingerprint, so a report that arrived since listing stays pending and a stale list never overwrites newer state.
+- `prune(conn, now) -> int`: deletes rows expired, or cleared and told, more than 7 days ago. A cleared item nobody heard is kept 30 days.
+- `Item` (frozen dataclass): the columns, with datetimes, `cleared: bool`, and `changed` (not what was told).
+
+`resonant_sdk.emit.report(key, title, *, urgency="normal", state=None, clear=False, ttl="24h") -> bool` is stdlib only and copied next to the script like `emit()`. It validates locally (`ValueError`) and writes one event `{"type": "item", "text": title, "dedupe_key": "item:<key>:<time_ns hex>", "data": {"key", "urgency", "state", "clear", "ttl"}}`. `ttl` is `<n>m|h` (seconds are accepted, but at least 1 minute and at most `168h`); `state` is at most 2000 bytes of JSON, else `ValueError`. The unique dedupe key means ingest never drops a repeat; the pulse decides by fingerprint. `item` is a reserved event type: the manifest refuses it in `notify.on`.
 
 ## Extension process runner: `resonant.extensions.process`
 

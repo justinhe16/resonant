@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from datetime import time
+from datetime import time, timedelta
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from resonant.config import BriefingConfig, ExtensionsConfig, SecretsConfig, load_settings
+from resonant.config import (
+    BriefingConfig,
+    ExtensionsConfig,
+    PulseConfig,
+    SecretsConfig,
+    load_settings,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -134,6 +140,7 @@ def test_pre_phase3_config_loads_unchanged(resonant_home: Path) -> None:
     s = load_settings()
     assert s.extensions == ExtensionsConfig()
     assert s.secrets == SecretsConfig() and s.briefing == BriefingConfig()
+    assert s.pulse == PulseConfig()
 
 
 def test_phase3_from_yaml_and_env(resonant_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,6 +181,62 @@ def test_phase3_from_yaml_and_env(resonant_home: Path, monkeypatch: pytest.Monke
     ],
 )
 def test_phase3_invalid_values_rejected(resonant_home: Path, yaml_text: str) -> None:
+    (resonant_home / "config.yaml").write_text(yaml_text)
+    with pytest.raises(ValidationError):
+        load_settings()
+
+
+def test_pulse_defaults_and_helpers(resonant_home: Path) -> None:
+    p = load_settings().pulse
+    assert p.enabled is True and p.quiet_hours == "00:00-06:00"
+    assert (p.quiet_start, p.quiet_end) == (time(0, 0), time(6, 0))
+    assert p.remention == timedelta(hours=4)
+
+
+def test_pulse_from_yaml_and_env(resonant_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (resonant_home / "config.yaml").write_text(
+        "pulse:\n  enabled: false\n  quiet_hours: '22:30-07:00'\n  remention_after: 90m\n"
+    )
+    p = load_settings().pulse
+    assert p.enabled is False and p.remention == timedelta(minutes=90)
+    assert (p.quiet_start, p.quiet_end) == (time(22, 30), time(7, 0))
+    monkeypatch.setenv("RESONANT_PULSE__REMENTION_AFTER", "2h")
+    assert load_settings().pulse.remention == timedelta(hours=2)
+
+
+def test_in_quiet_plain_window() -> None:
+    p = PulseConfig(quiet_hours="00:00-06:00")
+    assert p.in_quiet(time(0, 0)) and p.in_quiet(time(3, 30)) and p.in_quiet(time(5, 59, 59))
+    assert not p.in_quiet(time(6, 0)) and not p.in_quiet(time(12, 0))
+    assert not p.in_quiet(time(23, 59))
+
+
+def test_in_quiet_window_wrapping_midnight() -> None:
+    p = PulseConfig(quiet_hours="22:00-06:00")
+    assert p.in_quiet(time(22, 0)) and p.in_quiet(time(23, 59)) and p.in_quiet(time(0, 0))
+    assert p.in_quiet(time(5, 59))
+    assert not p.in_quiet(time(6, 0)) and not p.in_quiet(time(21, 59))
+    assert not p.in_quiet(time(12, 0))
+
+
+@pytest.mark.parametrize(
+    "yaml_text",
+    [
+        "pulse:\n  quiet_hours: '0:00-6:00'\n",
+        "pulse:\n  quiet_hours: '00:00-06:00\\n'\n",
+        "pulse:\n  remention_after: '4h\\n'\n",
+        "briefing:\n  at: '08:00\\n'\n",
+        "pulse:\n  quiet_hours: '00:00-24:00'\n",
+        "pulse:\n  quiet_hours: '00:00'\n",
+        "pulse:\n  quiet_hours: '06:00-06:00'\n",
+        "pulse:\n  remention_after: 4\n",
+        "pulse:\n  remention_after: 1m\n",
+        "pulse:\n  remention_after: 25h\n",
+        "pulse:\n  remention_after: soon\n",
+        "pulse:\n  cap: 3\n",
+    ],
+)
+def test_pulse_invalid_values_rejected(resonant_home: Path, yaml_text: str) -> None:
     (resonant_home / "config.yaml").write_text(yaml_text)
     with pytest.raises(ValidationError):
         load_settings()
