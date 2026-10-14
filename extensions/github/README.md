@@ -35,7 +35,7 @@ It keeps no state. Each run reads the current open PRs and their branch's workfl
 - It succeeded and the previous finished run of that workflow failed: `ci_fixed`, key `<repo>#<n>:run:<run id>:fixed`, text `✓ resonant#40 CI fixed`.
 - You're a requested reviewer: `review_requested`, key `<repo>#<n>:<head sha>:review`.
 
-Cancelled, skipped and in-progress runs are ignored. The same state always produces the same keys, so Resonant's events table (unique per key) drops repeats, and the first run after install is a silent baseline. Events go to fd 3 when Resonant provides it, otherwise into the result's `events` list.
+Cancelled, skipped and in-progress runs are ignored. A re-run keeps its run id, so a failed run that passes on re-run sends no `fixed` (the next push's run does). The same state always produces the same keys, so Resonant's events table (unique per key) drops repeats, and the first run after install is a silent baseline. Events go to fd 3 when Resonant provides it, otherwise into the result's `events` list.
 
 ```sh
 RESONANT_SECRET_TOKEN=... ./cli.py prs     # by hand, with a token in the env

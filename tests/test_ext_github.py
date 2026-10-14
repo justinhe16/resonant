@@ -356,6 +356,16 @@ def test_watch_ignores_cancelled_and_reports_per_workflow(gh: FakeGh) -> None:
     assert keys(r.events) == [f"{RESONANT}#40:run:7:fixed"]
 
 
+def test_watch_rerun_keeps_its_run_id(gh: FakeGh) -> None:
+    """A re-run reuses the run id: failing again repeats the key; passing sends no fixed."""
+    gh.state["mine"] = [pr_node(40, "s1")]
+    branch = f"{RESONANT}:branch-40"
+    gh.state["runs"] = {branch: [run_row(1, "s1", "failure")]}
+    assert keys(gh.run("watch").events) == [f"{RESONANT}#40:run:1:failed"]
+    gh.state["runs"] = {branch: [run_row(1, "s1", "success")]}
+    assert gh.run("watch").events == []
+
+
 def test_watch_review_requested(gh: FakeGh) -> None:
     gh.state["review"] = [pr_node(12, "abc", repo="org/app", title="Please look")]
     r = gh.run("watch")
