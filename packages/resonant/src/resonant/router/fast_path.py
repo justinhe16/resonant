@@ -11,6 +11,11 @@ the reply is rendered from a template over the tool's output.
 - Keywords (the whole message, case-insensitive, trailing ``?!.`` ignored): ``status``,
   ``what's running``, ``how's the mini``, ``ping``.
 
+``/approvals`` lists the asker's pending approvals (code, summary, expiry);
+``/approvals <code>`` adds the intent's full args, for the owner only. Approval *replies*
+(``yes``, ``no A7``) are not fast-path commands: the router hands them to
+``router/approvals.py`` after slash commands.
+
 ``/kill`` and ``/resume`` are never decided by the LLM. A non-owner gets "not allowed".
 A slash command whose tool the principal can't request gets "not allowed"; a keyword in
 that case falls through to the labeler (``run`` returns None).
@@ -29,17 +34,19 @@ import logging
 import re
 import sqlite3
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
 
 from resonant import killswitch
 from resonant.executor import HandlerKey, ToolHandler
-from resonant.gate import Allow, Decision, Intent
+from resonant.gate import Allow, Decision, Intent, PendingApproval
 from resonant.models import SpanFactory
 from resonant.models.client import null_spans
 from resonant.principals import Principals
 from resonant.router import commands
+from resonant.router.approvals import approvals_reply
 from resonant.router.commands import Command, UsageError
 from resonant.router.intents import IntentLabel
 from resonant.router.render import as_dict as _as_dict
@@ -47,7 +54,7 @@ from resonant.router.render import as_list as _as_list
 from resonant.router.render import duration as _duration
 from resonant.router.render import render_projects
 from resonant.store.audit import audit
-from resonant.store.db import atomic
+from resonant.store.db import atomic, utcnow
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect
 
@@ -67,6 +74,8 @@ class FastGate(Protocol):
     def evaluate(self, intent: Intent) -> Decision: ...
 
     def consume(self, token: str, intent_hash: str) -> bool: ...
+
+    def pending_for(self, principal: str) -> Sequence[PendingApproval]: ...
 
 
 @dataclass(frozen=True)
@@ -252,12 +261,14 @@ class FastPath:
         registry: ToolRegistry,
         gate: FastGate,
         handlers: Mapping[HandlerKey, ToolHandler],
+        clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self.conn = conn
         self.principals = principals
         self.registry = registry
         self.gate = gate
         self.handlers = handlers
+        self.clock = clock
 
     async def run(
         self,
@@ -302,6 +313,8 @@ class FastPath:
             if cmd.name == "/resume":
                 killswitch.release(self.conn, actor=principal)
                 return self._result(cmd, RESUME_REPLY, "killswitch.release")
+        if cmd.name == "/approvals" and cmd.reply is None:  # else: a usage reply
+            return self._approvals(cmd, principal)
         if cmd.help:
             available = commands.available(
                 principal, principals=self.principals, registry=self.registry
@@ -338,3 +351,15 @@ class FastPath:
             log.warning("fast path %s failed: %s", cmd.tool, type(e).__name__)
             text = f"Couldn't read {cmd.tool} right now."
         return self._result(cmd, text, cmd.tool)
+
+    def _approvals(self, cmd: FastCommand, principal: str) -> FastPathResult:
+        """``/approvals [code]``: pending approvals, or one's full args (owner only)."""
+        code = cmd.args.get("code")
+        text = approvals_reply(
+            self.conn,
+            self.gate.pending_for(principal),
+            code if isinstance(code, str) else None,
+            is_owner=self.principals.can(principal, "admin", None),
+            now=self.clock(),
+        )
+        return self._result(cmd, NOT_ALLOWED if text is None else text)

@@ -9,6 +9,15 @@
 (c) None for anything else (other sources/types, no principal, empty text). The Loop
     consumes the event.
 
+Order: slash commands first (so ``/kill`` is never read as a reply), then approval replies
+(``router/approvals.py``: the parser, then ``gate.resolve_reply``), then keywords and the
+labeler. A reply that resolves an approval returns None (consumed; the woken runner sends
+the confirmation). A refused reply gets a code-built ``fast_reply`` titled
+``approval reply``. Text the parser doesn't recognize routes normally.
+
+``gate`` is the full ``Gate`` (``PolicyGate``, or ``DryRunGate`` before it is wired): the
+fast path uses ``evaluate``/``consume``/``pending_for``, the inbox ``resolve_reply``.
+
 ``title`` is code-built (the command name, or ``chat: <intent>``) and is what ``/projects``
 shows; it never contains message text.
 
@@ -23,26 +32,31 @@ predicted intent and the path (``fast`` | ``llm``) without running tools or the 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from typing import Any, Literal
 
 from resonant.executor import HandlerKey, ToolHandler
+from resonant.gate import Gate
 from resonant.loop.types import PRIORITY_MEMBER, PRIORITY_OWNER, NewTask
 from resonant.models import ModelClient, SpanFactory
 from resonant.observability.spans import span
 from resonant.principals import Principals
-from resonant.router.fast_path import FastGate, FastPath, match_fast_path
+from resonant.router.approvals import ApprovalInbox
+from resonant.router.fast_path import FastPath, match_fast_path
 from resonant.router.intents import INTENT_TOOLS, IntentLabel
 from resonant.router.labeler import Labeler
 from resonant.router.prefixes import toolset_prefix_hash
+from resonant.store.db import utcnow
 from resonant.tools import ToolRegistry
 from resonant_sdk import Event, ToolSpec
 
 RUNNER = "local"
 KIND_REPLY = "reply"
 KIND_CHAT = "chat"
+APPROVAL_TITLE = "approval reply"
 
 
 def toolset_for(
@@ -91,16 +105,23 @@ class Router:
         *,
         principals: Principals,
         registry: ToolRegistry,
-        gate: FastGate,
+        gate: Gate,
         handlers: Mapping[HandlerKey, ToolHandler],
         model: ModelClient,
+        clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self.conn = conn
         self.principals = principals
         self.registry = registry
         self.fast_path = FastPath(
-            conn, principals=principals, registry=registry, gate=gate, handlers=handlers
+            conn,
+            principals=principals,
+            registry=registry,
+            gate=gate,
+            handlers=handlers,
+            clock=clock,
         )
+        self.inbox = ApprovalInbox(conn, principals=principals, gate=gate)
         self.labeler = Labeler(model)
 
     def toolset_for(self, intent: IntentLabel, principal: str) -> list[ToolSpec]:
@@ -124,25 +145,43 @@ class Router:
         spans: SpanFactory = partial(span, self.conn, trace_id=event.trace_id)
         channel_ref = _channel_ref(event, principal)
 
+        def reply(text: str, tool_used: str | None, intent: IntentLabel, title: str) -> NewTask:
+            return NewTask(
+                kind=KIND_REPLY,
+                runner=RUNNER,
+                priority=priority,
+                principal=principal,
+                channel_ref=channel_ref,
+                checkpoint={
+                    "fast_reply": text,
+                    "tool_used": tool_used,
+                    "intent": intent,
+                    "title": title,
+                },
+            )
+
+        # Order: slash commands (so /kill is never read as a reply), approval replies, then
+        # keywords and the labeler.
         cmd = match_fast_path(text)
-        if cmd is not None:
+        if cmd is not None and cmd.slash:
             result = await self.fast_path.run(
                 cmd, principal=principal, event_id=event.id, trace_id=event.trace_id, spans=spans
             )
             if result is not None:
-                return NewTask(
-                    kind=KIND_REPLY,
-                    runner=RUNNER,
-                    priority=priority,
-                    principal=principal,
-                    channel_ref=channel_ref,
-                    checkpoint={
-                        "fast_reply": result.reply_text,
-                        "tool_used": result.tool_used,
-                        "intent": result.intent,
-                        "title": result.command,
-                    },
-                )
+                return reply(result.reply_text, result.tool_used, result.intent, result.command)
+
+        answered = self.inbox.handle(event, text, principal, spans=spans)
+        if answered is not None:
+            if answered.reply is None:
+                return None  # consumed: the woken runner sends the confirmation
+            return reply(answered.reply, None, "job_control", APPROVAL_TITLE)
+
+        if cmd is not None and not cmd.slash:
+            result = await self.fast_path.run(
+                cmd, principal=principal, event_id=event.id, trace_id=event.trace_id, spans=spans
+            )
+            if result is not None:
+                return reply(result.reply_text, result.tool_used, result.intent, result.command)
 
         label = await self.labeler.label(text, spans=spans)
         toolset = self.toolset_for(label.intent, principal)

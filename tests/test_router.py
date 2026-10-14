@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import pytest
 from resonant import killswitch
 from resonant.config import load_settings
 from resonant.executor import HandlerKey, ToolHandler
-from resonant.gate import Allow, Decision, DryRunGate, Intent
+from resonant.gate import Allow, Decision, DryRunGate, Intent, PendingApproval
 from resonant.loop import Loop, SlotPool
 from resonant.loop.types import PRIORITY_MEMBER, PRIORITY_OWNER, Done, StepContext, Task
 from resonant.models import (
@@ -510,6 +511,7 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
         "/status: Resonant daemon status\n"
         "/projects [all]: open work and recent tasks\n"
         "/tasks [all]: same as /projects\n"
+        "/approvals [code]: pending approvals; a code shows its details\n"
         "/help [word]: list commands, or the ones matching a word\n"
         "/kill: stop autonomy and pause\n"
         "/resume: turn autonomy back on\n"
@@ -572,6 +574,9 @@ async def test_fast_path_never_runs_a_side_effect_inline(
 
         def consume(self, token: str, intent_hash: str) -> bool:
             return True
+
+        def pending_for(self, principal: str) -> Sequence[PendingApproval]:
+            return ()
 
     fast = FastPath(
         db,

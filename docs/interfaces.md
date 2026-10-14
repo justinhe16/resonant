@@ -471,8 +471,8 @@ Every adapter must:
   - Dedupe: a `dedupe_key` already sent returns the earlier ref without sending. Records are kv `imessage.sent:<sha256(key)>` = `{ref, at}`, valid 7 days, swept by `start()`. A send that fails partway is not recorded.
   - Rate limit: a token bucket per principal of `channels.imessage.outbound_per_minute` (default 60), one token per part. A short bucket waits up to 30s (audited `imessage.send_rate_limited`, `decision="delayed"`); longer raises `ChannelRateLimited` (`decision="refused"`). Sends are serialized.
   - Text over 2,000 characters is split on paragraph, sentence, then word boundaries, with a ` (i/n)` suffix per part.
-  - `request_approval` raises `NotImplementedError("Phase 2")`.
-  - Audits (never with bodies): `imessage.sent` (`requested_by`, `idempotency_key`, handle, length, chunks, ref), `imessage.send_failed` (reason, code, chunk), `imessage.send_refused`, `imessage.send_rate_limited`, `imessage.selftest`.
+  - `request_approval(principal, prompt)` sends `prompt.text()` through `send` (same allowlist, rate limit and errors) with `dedupe_key=approval_dedupe_key(approval_id, principal)`. A repeat returns the first ref and sends nothing. The runner records the ref and send time with `add_channel_ref` after it returns.
+  - Audits (never with bodies): `imessage.sent` (`requested_by`, `idempotency_key`, handle, length, chunks, ref), `imessage.approval_sent` (`requested_by`, `level`, `idempotency_key`, approval_id, code, ref; never the summary), `imessage.send_failed` (reason, code, chunk), `imessage.send_refused`, `imessage.send_rate_limited`, `imessage.selftest`.
 - **Self-test:** `IMessageChannel.self_test(*, timeout_s=10) -> SelfTestResult(ok, detail)` sends `resonant-selftest:<nonce>` to `self_handle` and waits for a reader to see it. Only this run's in-memory nonce from `self_handle` counts: the `is_from_me = 1` row proves the send and the read path (required); the incoming copy is reported in `detail` but optional. Automation denied, Full Disk Access missing (checked before sending), a missing `self_handle`, and a timeout each give `ok=False` with the fix in `detail`. The result is stored in kv `imessage.selftest` = `{ok, at, detail}` and audited `imessage.selftest`.
   - On a started channel it listens on the running reader (after its first read). Otherwise it polls a private reader with its own cursor, kv `imessage.selftest.cursor` (reset each run), so `resonant selftest imessage` can run next to a live daemon without moving `imessage.cursor`. Both readers drop self-test rows, so they are never routed or answered.
   - The health monitor runs it on its first round after start whenever it is due (no result yet, the last one older than 6h, or a failed one older than 30 min), re-runs it on that schedule, and reports failures (see Health monitor). No Slack.
@@ -510,7 +510,8 @@ ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail, tool
 
 ```python
 class Router:                     # the Loop's router hook (Callable[[Event], Awaitable[NewTask | None]])
-    def __init__(self, conn, *, principals, registry, gate, handlers, model: ModelClient): ...
+    def __init__(self, conn, *, principals, registry, gate: Gate, handlers, model: ModelClient,
+                 clock=utcnow): ...
     async def route(self, event: Event) -> NewTask | None
     def toolset_for(self, intent, principal) -> list[ToolSpec]
 
@@ -528,12 +529,35 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
 | Fast (no model call) | `kind="reply"`, `runner="local"` | `{fast_reply: str, tool_used: str \| None, intent, title}` |
 | Labeled (one `chat_json` call) | `kind="chat"`, `runner="local"` | `{intent, confidence, toolset: [tool names], fallback: bool, toolset_prefix_hash, title}` |
 
-`title` is code-built for `/projects`: the fast-path command name (`/status`, `what's running`, `/unknown`) or `chat: <intent>`. Never message text.
+`title` is code-built for `/projects`: the fast-path command name (`/status`, `what's running`, `/unknown`), `approval reply`, or `chat: <intent>`. Never message text.
+
+`gate` is the full `Gate` (`PolicyGate` once wired, `DryRunGate` before): the fast path uses `evaluate`, `consume` and `pending_for`; the approval inbox uses `resolve_reply`. `clock` only drives the "expires in" times of `/approvals`.
+
+**Order:** slash commands first (so `/kill` is never read as a reply), then approval replies, then keywords and the labeler.
+
+- **Approval inbox** (`router/approvals.py`, `ApprovalInbox(conn, *, principals, gate)`):
+  1. `parse_reply(text, truncated=payload.truncated)`. Text that doesn't parse (including a pasted prompt, `ok`, `yes please`, or any truncated payload) routes normally; it is never swallowed. There is no classifier.
+  2. The sender identity `imessage:<payload.handle>` must resolve to the event's principal, because the gate trusts `reply.actor`. A mismatch gets `Nothing is waiting for approval.` and never reaches the gate.
+  3. `gate.resolve_reply(ApprovalReply(actor=principal, actor_identity, channel="imessage", raw_text, decision, path="parser", event_id=event.id, occurred_at=event.occurred_at, code, comments))`. It resolves and wakes in one transaction and is idempotent per event id.
+  4. On success, or a replay of the same event, `route` returns None: the event is consumed with no new task, and the woken runner sends the confirmation (`Done: …`, `Not done.`).
+  5. A refusal gets a code-built `fast_reply` task (`intent="job_control"`, `title="approval reply"`):
+
+  | Refusal | Reply |
+  |---|---|
+  | `nothing_pending`, `unsupported`, `not_found`, anything else | `Nothing is waiting for approval.` (also every non-approver) |
+  | `ambiguous` | `Which one? A7 (restart resonant), D3 (delete all 4 notes). Reply yes <code> or no <code>.`, listing the actor's pending approvals whose prompts were already sent to them |
+  | `code_required` | `Reply yes D7 to confirm.` |
+  | `unknown_code` | `Nothing is waiting with code Q9. /approvals lists them.` |
+  | `expired` | `That approval expired. Not done.` |
+  | `already_resolved` | `That was already answered.` |
+  | `task_not_waiting` | `That task isn't waiting anymore. Not done.` |
+  | `not_sent_before` | `That reply came before the question. Reply again to answer it.` |
 
 - **Fast path** (`router/fast_path.py`). The whole message, after lowercasing, straightening apostrophes, collapsing whitespace and dropping trailing `?!.`:
-  - Slash commands come from the command registry (below): `/status` (`daemon_status`), `/projects [all]` and its alias `/tasks [all]` (`projects`), `/help [word]`, `/kill` and `/resume` (owner only: `killswitch.engage` / `release`, audited; anyone else gets `not allowed`). The first word names the command; the rest (original case) goes to its parser, and a bad argument gets `Usage: <usage>` and runs nothing. Trailing `?!.` is not an argument. None of these ever reach the model.
+  - Slash commands come from the command registry (below): `/status` (`daemon_status`), `/projects [all]` and its alias `/tasks [all]` (`projects`), `/help [word]`, `/kill` and `/resume` (owner only: `killswitch.engage` / `release`, audited; anyone else gets `not allowed`), and `/approvals [code]` (owner only, below). The first word names the command; the rest (original case) goes to its parser, and a bad argument gets `Usage: <usage>` and runs nothing. Trailing `?!.` is not an argument. None of these ever reach the model.
   - An unknown `/word` gets `Unknown command /remnd. Did you mean /remind?` (`difflib.get_close_matches`, n=3, cutoff 0.6, over command names), or `Unknown command /word. Try /help.` when nothing is close. A suggestion never executes, even one letter away. Text that isn't a `/word` gets `Unknown command. Try /help.`
   - `/help` lists the commands the asking principal may use (no tool call, so members get it too), plus the keyword hint for principals who can use global tools. `/help <word>` keeps the ones whose name or description contains the word, else a `difflib` match over names and description words; none gives `No command matches "<word>". Try /help.`
+  - `/approvals` lists the owner's pending approvals from `gate.pending_for`, oldest first: `- A7 · restart resonant · expires in 29m`, then `Reply yes <code> or no <code>. /approvals <code> shows the details.` (or `Nothing is waiting for approval.`). `/approvals <code>` adds the tool, level, effect and the intent's full args (`store.approvals.intent_args`, pretty JSON, clipped at 1500 characters), since the summary masks them. A code outside the approval alphabet gets the usage line; one that isn't pending gets `Nothing is waiting with code Q9.`
   - Only read tools run inline here; a command whose tool isn't `effect=read` gets `not allowed` and its handler never runs.
   - Keywords: `status` and `ping` (`daemon_status`), `what's running` / `whats running` / `what is running` (`list_tasks {status: running}`), `how's the mini` / `hows the mini` / `how is the mini` (`system_status`).
   - Each command maps to at most one builtin read; the reply is a template over its output (code computes, text narrates). The read is evaluated by the gate (audited, `task_id="route:<event id>"`). No task exists yet, so the fast path consumes the Allow token and calls the read handler directly instead of the executor (reads only; nothing to dedupe). A tool error becomes a templated "Couldn't read … right now."
@@ -542,7 +566,7 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
 - **Labeler** (`router/labeler.py`, `router/prefixes.py`). One `chat_json` call with schema `{intent: enum, confidence: 0..1}`, `max_tokens=20`, temperature 0. The prompt is the constant `LABEL_PREFIX` (system rules, intent definitions, 8 few-shot turns) and then the user text, truncated to 2000 characters and wrapped by `wrap_untrusted` as `<message>…</message>` (tags inside it are stripped). `ModelUnavailableError` gives `unknown` with `fallback=true` (the runner sends `prefixes.FALLBACK_REPLY`); `ModelOutputError` or an out-of-enum intent gives `unknown` with `fallback=false`.
 - **Toolset.** `INTENT_TOOLS` maps intents to builtins (`job_control`: `list_tasks`, `task_counts`; `system`: `daemon_status`, `model_status`, `system_status`; others: none). It is filtered by `principals.can(principal, "request", spec.extension)` before anything reaches the model, so a member gets no global builtins. `extension:<name>` intents are reserved for Phase 3.
 - **Prefixes for the local runner.** `prefixes.runner_system(intent)` is the runner's constant system message; `toolset_prefix_hash(intent, toolset)` hashes it with `tools_prefix(toolset)`, so it is stable per (intent, principal scope).
-- **Spans.** `router.fast_path` (`command, handled, tool_used, latency_ms`), `router.label` (`intent, confidence, fallback, latency_ms, prefix_hash`) and `router.toolset` (`intent, principal, toolset, toolset_prefix_hash`). Never message text. A non-owner `/kill` or `/resume` is audited as `router.admin_refused` (principal and command only).
+- **Spans.** `router.approval` (`path, outcome: resolved|replay|refused|unauthenticated, reason, decision`), `router.fast_path` (`command, handled, tool_used, latency_ms`), `router.label` (`intent, confidence, fallback, latency_ms, prefix_hash`) and `router.toolset` (`intent, principal, toolset, toolset_prefix_hash`). Never message text. A non-owner `/kill` or `/resume` is audited as `router.admin_refused` (principal and command only).
 - **Evals.** `classify` uses the production matcher and labeler from the owner's point of view, but runs no tools and never touches the kill switch.
 
 ## Health monitor: `resonant.monitor`, `resonant.health`

@@ -18,10 +18,12 @@ from typer.testing import CliRunner
 from resonant.cli import app
 from resonant.config import IMessageConfig
 from resonant.gateway.channel import (
+    ApprovalPrompt,
     Channel,
     ChannelRateLimited,
     ChannelRefused,
     ChannelSendError,
+    approval_dedupe_key,
 )
 from resonant.gateway.imessage import IMessageChannel, IMessageReader, split_text
 from resonant.gateway.imessage.channel import (
@@ -210,15 +212,87 @@ async def test_text_goes_through_argv_verbatim(
     assert "theText" in SEND_SCRIPT and OWNER_PHONE not in SEND_SCRIPT
 
 
-async def test_request_approval_is_phase_2(
+def _prompt(level: str = "L2", effect: str = "write", require_code: bool = False) -> ApprovalPrompt:
+    return ApprovalPrompt(
+        "a1", "K7", SECRET, effect, level, datetime(2026, 10, 8, 12, 30, tzinfo=UTC), require_code
+    )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "text"),
+    [
+        (_prompt(), f"[K7] {SECRET}? Reply yes / no"),
+        (
+            _prompt("L1", require_code=True),
+            f"[K7] {SECRET}? This can't be undone. Reply yes K7 / no",
+        ),
+    ],
+)
+async def test_request_approval_sends_the_prompt_text(
+    principals: Principals, db: sqlite3.Connection, ft: FakeTime, prompt: ApprovalPrompt, text: str
+) -> None:
+    runner = FakeRunner()
+    channel = make(principals, db, runner, ft)
+    ref = await channel.request_approval("justin", prompt)
+    assert runner.calls == [send_argv(OWNER_PHONE, text)]
+    assert text == prompt.text()
+    assert ref.channel == "imessage" and ref.ref.startswith("imessage-out:")
+
+
+async def test_request_approval_dedupes_and_audits_without_the_summary(
     principals: Principals, db: sqlite3.Connection, ft: FakeTime
 ) -> None:
-    from resonant.gateway.channel import ApprovalPrompt
+    runner = FakeRunner()
+    channel = make(principals, db, runner, ft)
+    first = await channel.request_approval("justin", _prompt())
+    again = await channel.request_approval("justin", _prompt())
+    assert again == first
+    assert len(runner.calls) == 1
+    key = approval_dedupe_key("a1", "justin")
+    assert key == "approval:a1:prompt:justin"
+    (sent,) = audits(db, "imessage.approval_sent")
+    assert sent == {
+        "requested_by": "justin",
+        "idempotency_key": key,
+        "decision": None,
+        "approval_id": "a1",
+        "code": "K7",
+        "ref": first.ref,
+    }
+    level = db.execute(
+        "SELECT level FROM audit_log WHERE action = 'imessage.approval_sent'"
+    ).fetchone()["level"]
+    assert level == "L2"
+    assert SECRET not in all_audit_text(db)
+    # Another approver gets their own prompt.
+    await channel.request_approval("ana", _prompt())
+    assert [c[3] for c in runner.calls] == [OWNER_PHONE, MEMBER]
 
-    channel = make(principals, db, FakeRunner(), ft)
-    prompt = ApprovalPrompt("a1", "K7", "s", "read", "L1", datetime.now(UTC))
-    with pytest.raises(NotImplementedError, match="Phase 2"):
-        await channel.request_approval("justin", prompt)
+
+async def test_request_approval_refuses_unknown_principals(
+    principals: Principals, db: sqlite3.Connection, ft: FakeTime
+) -> None:
+    runner = FakeRunner()
+    channel = make(principals, db, runner, ft)
+    for principal in ("nobody", "slackonly", OWNER_PHONE):
+        with pytest.raises(ChannelRefused):
+            await channel.request_approval(principal, _prompt())
+    assert runner.calls == []
+    assert audits(db, "imessage.approval_sent") == []
+    assert len(audits(db, "imessage.send_refused")) == 3
+
+
+async def test_request_approval_failure_is_not_recorded(
+    principals: Principals, db: sqlite3.Connection, ft: FakeTime
+) -> None:
+    channel = make(principals, db, FakeRunner(result=OsaResult(1, "", "boom")), ft)
+    with pytest.raises(ChannelSendError):
+        await channel.request_approval("justin", _prompt())
+    assert audits(db, "imessage.approval_sent") == []
+    runner = FakeRunner()
+    channel = make(principals, db, runner, ft)
+    await channel.request_approval("justin", _prompt())  # the retry sends
+    assert len(runner.calls) == 1
 
 
 # --- outbound allowlist -------------------------------------------------------------------

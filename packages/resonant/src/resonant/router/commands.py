@@ -15,10 +15,12 @@ The single source for the fast path's slash commands, ``/help`` and ``/help <wor
 from __future__ import annotations
 
 import difflib
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from resonant.gate.codes import CODE_DIGITS, CODE_LETTERS
 from resonant.principals import Principals
 from resonant.router.intents import IntentLabel
 from resonant.tools.registry import ToolRegistry
@@ -55,6 +57,19 @@ def _word(text: str) -> str:
     """Lowercased, whitespace collapsed, a leading ``/`` and trailing ``?!.`` dropped."""
     t = " ".join(text.lower().split()).rstrip("?!. ")
     return t.removeprefix("/")
+
+
+_CODE = re.compile(f"[{CODE_LETTERS}][{CODE_DIGITS}]", re.ASCII | re.IGNORECASE)
+
+
+def approvals_args(rest: str) -> dict[str, Any]:
+    """``/approvals [code]``: a code from the approval alphabet, uppercased."""
+    word = _word(rest)
+    if not word:
+        return {}
+    if not _CODE.fullmatch(word):
+        raise UsageError("that's not an approval code")
+    return {"code": word.upper()}
 
 
 def help_args(rest: str) -> dict[str, Any]:
@@ -105,6 +120,14 @@ COMMANDS: tuple[Command, ...] = (
         "job_control",
         tool="projects",
         parse=projects_args,
+    ),
+    Command(
+        "/approvals",
+        "/approvals [code]",
+        "pending approvals; a code shows its details",
+        "job_control",
+        parse=approvals_args,
+        owner_only=True,
     ),
     HELP,
     Command("/kill", "/kill", "stop autonomy and pause", "system", owner_only=True),
