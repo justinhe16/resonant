@@ -150,7 +150,9 @@ def build_imessage_stack(
         model=model,
         timezone=settings.timezone,
     )
-    runner = components.register_local_runner(conn, model=model, channel=channel)
+    runner = components.register_local_runner(
+        conn, model=model, channel=channel, timezone=settings.timezone
+    )
     runner.max_step_s = local_step_limit(settings.model, components.registry.specs())
     loop.runners[runner.name] = runner
     reminders = ReminderRunner(conn, channel=channel, timezone=settings.timezone)

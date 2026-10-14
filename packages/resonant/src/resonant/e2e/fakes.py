@@ -4,8 +4,11 @@
 
 - Label calls (``schema == LABEL_SCHEMA``): the intent comes from keyword rules over the
   user's message (``LABEL_RULES``, first match wins, default ``question``), confidence 0.9.
-- ``chat_tools``: the first call asks for one tool (``task_counts`` if it is in the toolset,
-  else the first tool), with no args; later calls ask for nothing.
+- ``chat_tools``: the first call asks for one tool, later calls ask for nothing. The tool is
+  the first ``TOOL_RULES`` match over the current message whose tool is in the toolset, else
+  ``task_counts`` if it is in the toolset, else the first tool. Args are none, except
+  ``add_reminder``: "remind me in N minutes to X" becomes ``{at: <Current time> + N min, text:
+  X}``, using the ``Current time:`` line the runner puts before the message.
 - Answer calls (``schema == REPLY_SCHEMA``): ``{"reply": final_reply}``.
 - ``probe()``: always ok.
 
@@ -19,9 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from resonant.gateway.imessage.sender import OSASCRIPT, OsaResult
@@ -31,6 +36,10 @@ from resonant.runners.local import REPLY_SCHEMA
 from resonant_sdk import ToolSpec
 
 LABEL_RULES: tuple[tuple[str, str], ...] = (
+    ("remind me in", "reminders"),
+    ("restart", "ops"),
+    ("what can you do", "system"),
+    ("clear my notes", "notes"),
     ("queue", "job_control"),
     ("task", "job_control"),
     ("job", "job_control"),
@@ -41,6 +50,16 @@ LABEL_RULES: tuple[tuple[str, str], ...] = (
     ("refactor", "run_project"),
     ("open a pr", "run_project"),
 )
+# (keyword in the current message, tool). First match whose tool is in the toolset wins.
+TOOL_RULES: tuple[tuple[str, str], ...] = (
+    ("remind me in", "add_reminder"),
+    ("restart resonant", "restart_resonant"),
+    ("restart ollama", "restart_ollama"),
+    ("what can you do", "list_commands"),
+    ("clear my notes", "clear_notes"),
+)
+_REMIND = re.compile(r"remind me in (\d+) minutes? to (.+?)</message>", re.IGNORECASE | re.DOTALL)
+_NOW = re.compile(r"^Current time: (\S+) ", re.MULTILINE)
 DEFAULT_FINAL_REPLY = "Here's the rundown from the task list: all good."
 
 
@@ -100,8 +119,16 @@ class ScriptedModel:
         if already or not tools:
             return ModelReply(None, [], None, 1, 10, 5)
         names = [t.name for t in tools]
-        name = "task_counts" if "task_counts" in names else names[0]
-        return ModelReply(None, [ToolCall(name, {})], None, 1, 10, 5)
+        current = next(
+            (m["content"] for m in reversed(messages) if "<message>" in m["content"]), ""
+        )
+        lowered = current.lower()
+        name = next(
+            (t for k, t in TOOL_RULES if k in lowered and t in names),
+            "task_counts" if "task_counts" in names else names[0],
+        )
+        args = reminder_args(current) if name == "add_reminder" else {}
+        return ModelReply(None, [ToolCall(name, args)], None, 1, 10, 5)
 
     async def probe(self) -> ProbeResult:
         self.calls["probe"] += 1
@@ -113,6 +140,15 @@ class ScriptedModel:
             if keyword in text:
                 return intent
         return "question"
+
+
+def reminder_args(turn: str) -> dict[str, Any]:
+    """``add_reminder`` args for "remind me in N minutes to X", from the turn's current time."""
+    now, ask = _NOW.search(turn), _REMIND.search(turn)
+    if now is None or ask is None:
+        return {}
+    at = datetime.fromisoformat(now.group(1)) + timedelta(minutes=int(ask.group(1)))
+    return {"at": at.isoformat(), "text": ask.group(2).strip()}
 
 
 @dataclass(frozen=True)

@@ -117,7 +117,7 @@ def note_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
     return {"text": _text(rest, NOTE_TEXT_MAX)}
 
 
-_NUMBER = re.compile(r"#?(\d{1,9})")
+_NUMBER = re.compile(r"#?(\d{1,9})", re.ASCII)
 
 
 def _number(rest: str, what: str) -> int:
@@ -218,7 +218,6 @@ HELP = Command(
     parse=help_args,
 )
 
-# Notes and reminders have no intent label of their own yet (P2-16 adds them).
 COMMANDS: tuple[Command, ...] = (
     Command("/status", "/status", "Resonant daemon status", "system", tool="daemon_status"),
     Command(
@@ -237,23 +236,23 @@ COMMANDS: tuple[Command, ...] = (
         tool="projects",
         parse=projects_args,
     ),
-    Command("/note", "/note <text>", "save a note", "unknown", tool="add_note", parse=note_args),
+    Command("/note", "/note <text>", "save a note", "notes", tool="add_note", parse=note_args),
     Command(
         "/notes",
         "/notes [clear]",
         "your notes; clear deletes them all (asks first)",
-        "unknown",
+        "notes",
         tool="list_notes",
         subs=(Sub("clear", "clear_notes"),),
     ),
     Command(
-        "/unnote", "/unnote <n>", "delete note n", "unknown", tool="delete_note", parse=unnote_args
+        "/unnote", "/unnote <n>", "delete note n", "notes", tool="delete_note", parse=unnote_args
     ),
     Command(
         "/remind",
         "/remind <when> <text>",
         "set a reminder: 3pm, in 20 min, tomorrow 9am, fri 5pm",
-        "unknown",
+        "reminders",
         tool="add_reminder",
         parse=remind_args,
     ),
@@ -261,14 +260,14 @@ COMMANDS: tuple[Command, ...] = (
         "/reminders",
         "/reminders",
         "pending reminders, soonest first",
-        "unknown",
+        "reminders",
         tool="list_reminders",
     ),
     Command(
         "/unremind",
         "/unremind <n>",
         "cancel reminder n",
-        "unknown",
+        "reminders",
         tool="cancel_reminder",
         parse=unremind_args,
     ),
@@ -276,7 +275,7 @@ COMMANDS: tuple[Command, ...] = (
         "/restart",
         "/restart ollama|resonant",
         "restart the model server or Resonant itself",
-        "system",
+        "ops",
         owner_only=True,
         subs=(Sub("ollama", "restart_ollama"), Sub("resonant", "restart_resonant")),
     ),
@@ -284,16 +283,16 @@ COMMANDS: tuple[Command, ...] = (
         "/update",
         "/update",
         "pull Resonant from GitHub and restart",
-        "system",
+        "ops",
         tool="update_resonant",
         owner_only=True,
     ),
-    Command("/disk", "/disk", "free disk space", "system", tool="disk", owner_only=True),
+    Command("/disk", "/disk", "free disk space", "ops", tool="disk", owner_only=True),
     Command(
         "/logs",
         "/logs [n]",
         f"the last n log lines (at most {LOGS_MAX})",
-        "system",
+        "ops",
         tool="recent_logs",
         parse=logs_args,
         owner_only=True,
