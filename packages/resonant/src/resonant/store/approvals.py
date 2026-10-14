@@ -24,7 +24,7 @@ from typing import Literal, cast
 from resonant.gate.types import ResolvedApproval, ResolveResult
 from resonant.store import tasks as repo
 from resonant.store.audit import audit
-from resonant.store.db import iso
+from resonant.store.db import atomic, iso
 from resonant_sdk import Effect, Event, Level, new_id
 
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired"]
@@ -183,7 +183,7 @@ def approved_unused(conn: sqlite3.Connection, task_id: str, intent_hash: str) ->
     r = conn.execute(
         """SELECT * FROM approvals WHERE task_id = ? AND intent_hash = ?
                AND status = 'approved' AND used_at IS NULL
-           ORDER BY decided_at LIMIT 1""",
+           ORDER BY decided_at, id LIMIT 1""",
         (task_id, intent_hash),
     ).fetchone()
     return None if r is None else _row_to_approval(r)
@@ -299,22 +299,23 @@ def mark_used(conn: sqlite3.Connection, approval_id: str, now: datetime) -> bool
 
 def expire_due(conn: sqlite3.Connection, now: datetime) -> int:
     """pending -> expired for approvals past ``expires_at``. Audits each one."""
-    rows = conn.execute(
-        """UPDATE approvals SET status = 'expired', decided_at = ?
-           WHERE status = 'pending' AND expires_at <= ?
-           RETURNING id, task_id, tool, extension, intent_hash""",
-        (iso(now), iso(now)),
-    ).fetchall()
-    for r in rows:
-        audit(
-            conn,
-            "approval.expired",
-            task_id=r["task_id"],
-            tool=r["tool"],
-            extension=r["extension"],
-            intent_hash=r["intent_hash"],
-            approval_id=r["id"],
-        )
+    with atomic(conn):
+        rows = conn.execute(
+            """UPDATE approvals SET status = 'expired', decided_at = ?
+               WHERE status = 'pending' AND expires_at <= ?
+               RETURNING id, task_id, tool, extension, intent_hash""",
+            (iso(now), iso(now)),
+        ).fetchall()
+        for r in rows:
+            audit(
+                conn,
+                "approval.expired",
+                task_id=r["task_id"],
+                tool=r["tool"],
+                extension=r["extension"],
+                intent_hash=r["intent_hash"],
+                approval_id=r["id"],
+            )
     return len(rows)
 
 
@@ -333,27 +334,31 @@ def wake_resolved(
     number of tasks requeued.
     """
     woken = 0
-    for r in result.resolved:
-        row = conn.execute("SELECT trace_id FROM tasks WHERE id = ?", (r.task_id,)).fetchone()
-        if row is None:
-            continue
-        event = Event(
-            source="gate",
-            type="approval.reply",
-            task_id=r.task_id,
-            principal=principal,
-            payload={"approval_id": r.approval_id, "approved": r.approved},
-            dedupe_key=f"approval:{r.approval_id}:resolved",
-            occurred_at=now,
-            trace_id=row["trace_id"],
-        )
-        if repo.insert_event(conn, event) and repo.set_status(
-            conn, r.task_id, "queued", expect=("waiting",)
-        ):
-            woken += 1
+    with atomic(conn):
+        for r in result.resolved:
+            row = conn.execute("SELECT trace_id FROM tasks WHERE id = ?", (r.task_id,)).fetchone()
+            if row is None:
+                continue
+            event = Event(
+                source="gate",
+                type="approval.reply",
+                task_id=r.task_id,
+                principal=principal,
+                payload={"approval_id": r.approval_id, "approved": r.approved},
+                dedupe_key=f"approval:{r.approval_id}:resolved",
+                occurred_at=now,
+                trace_id=row["trace_id"],
+            )
+            if repo.insert_event(conn, event) and repo.set_status(
+                conn, r.task_id, "queued", expect=("waiting",)
+            ):
+                woken += 1
     return woken
 
 
 def resolve_result(approvals: Sequence[Approval]) -> ResolveResult:
-    """The ``ResolveResult`` for approvals already resolved (e.g. ``by_resolved_event``)."""
+    """The ``ResolveResult`` for approvals already resolved (e.g. ``by_resolved_event``).
+
+    Check for an empty list first: it means the event resolved nothing, not that it is done.
+    """
     return ResolveResult(ok=True, resolved=tuple(a.resolved() for a in approvals))

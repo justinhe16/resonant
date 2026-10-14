@@ -252,22 +252,23 @@ def expire_orphaned_approvals(conn: sqlite3.Connection, task_ids: list[str]) -> 
     if not task_ids:
         return 0
     ts = now_iso()
-    rows = conn.execute(
-        """UPDATE approvals SET status = 'expired', decided_at = ?
-           WHERE status = 'pending' AND task_id IN (SELECT value FROM json_each(?))
-           RETURNING id, task_id, tool, extension, intent_hash""",
-        (ts, json.dumps(task_ids)),
-    ).fetchall()
-    for r in rows:
-        audit(
-            conn,
-            "approval.orphaned",
-            task_id=r["task_id"],
-            tool=r["tool"],
-            extension=r["extension"],
-            intent_hash=r["intent_hash"],
-            approval_id=r["id"],
-        )
+    with atomic(conn):
+        rows = conn.execute(
+            """UPDATE approvals SET status = 'expired', decided_at = ?
+               WHERE status = 'pending' AND task_id IN (SELECT value FROM json_each(?))
+               RETURNING id, task_id, tool, extension, intent_hash""",
+            (ts, json.dumps(task_ids)),
+        ).fetchall()
+        for r in rows:
+            audit(
+                conn,
+                "approval.orphaned",
+                task_id=r["task_id"],
+                tool=r["tool"],
+                extension=r["extension"],
+                intent_hash=r["intent_hash"],
+                approval_id=r["id"],
+            )
     return len(rows)
 
 
