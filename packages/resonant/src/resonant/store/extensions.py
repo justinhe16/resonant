@@ -106,7 +106,7 @@ def save_extension(conn: sqlite3.Connection, ext: ExtensionRecord) -> None:
             ext.commit,
             ext.tree_digest,
             ext.manifest_sha,
-            json.dumps(ext.manifest, sort_keys=True),
+            json.dumps(ext.manifest),  # declared order kept: positional command args
             json.dumps(dict(ext.argv0_paths), sort_keys=True),
             ext.status,
             iso(ext.installed_at),
@@ -209,19 +209,21 @@ def record_run(
     at: datetime,
     outcome: str,
     ok: bool,
+    clear_open: bool = True,
 ) -> JobState:
     """Record a finished run: ``fail_streak`` resets on ``ok`` and grows otherwise.
 
-    Clears ``open_task_id``. Returns the new state (``fail_streak`` feeds health).
+    Clears ``open_task_id`` unless ``clear_open`` is False (a run on demand, which never
+    owned it). Returns the new state (``fail_streak`` feeds health).
     """
     conn.execute(
         """INSERT INTO ext_jobs (ext, job_id, last_run_at, last_outcome, fail_streak)
            VALUES (?, ?, ?, ?, ?)
            ON CONFLICT (ext, job_id) DO UPDATE SET
                last_run_at = excluded.last_run_at, last_outcome = excluded.last_outcome,
-               open_task_id = NULL,
+               open_task_id = CASE WHEN ? THEN NULL ELSE ext_jobs.open_task_id END,
                fail_streak = CASE WHEN ? THEN 0 ELSE ext_jobs.fail_streak + 1 END""",
-        (ext, job_id, iso(at), outcome, 0 if ok else 1, ok),
+        (ext, job_id, iso(at), outcome, 0 if ok else 1, clear_open, ok),
     )
     state = get_job(conn, ext, job_id)
     assert state is not None

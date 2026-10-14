@@ -34,7 +34,7 @@ FETCH_RUNNERS = frozenset(
     {"npx", "bunx", "pnpx", "pipx", "uvx", "uv", "docker", "podman", "curl", "wget"}
 )
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "env"})
-RESERVED_WORDS = frozenset({"ext"})  # builtin commands that land in a later ticket
+RESERVED_WORDS: frozenset[str] = frozenset()  # command words reserved beyond BY_NAME
 
 DEPENDENCY_FILES = frozenset(
     {

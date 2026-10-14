@@ -29,6 +29,17 @@ nothing here: it becomes a ``direct_call`` task for the local runner (below).
 (``yes``, ``no A7``) are not fast-path commands: the router hands them to
 ``router/approvals.py`` after slash commands.
 
+**Extensions** (Phase 3). ``/<ext> <tool> [args]`` (from ``commands.commands_for``) always
+becomes ``direct_call = {extension, tool, args}``, reads included: extension tools run
+through the executor, which injects their secrets and redacts. A member needs ``request``
+on the extension, checked before arguments. ``/ext`` is owner-only: ``/ext list`` reads
+inline (``list_extensions``); ``/ext mute`` is a direct call of ``mute_extension`` (L3);
+``/ext run <ext>/<job>`` is a direct call of the registered ``job_<id>`` spec with
+``{due_at: now}``, so the runner gates it as explicit at the job's own level. A job spec
+is never reachable as ``/<ext> job_x``. ``/ext run core/<job>`` calls the core job's
+on-demand entry (``core_jobs``, filled by ``wiring``: ``core/briefing`` is
+``briefing.run_briefing_now``) here, with no task; nothing runs while paused.
+
 ``/kill`` and ``/resume`` are never decided by the LLM. A non-owner gets "not allowed".
 A slash command whose tool the principal can't request gets "not allowed"; a keyword in
 that case falls through to the labeler (``run`` returns None).
@@ -47,13 +58,14 @@ import logging
 import re
 import sqlite3
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from resonant import killswitch
 from resonant.executor import HandlerKey, ToolHandler
+from resonant.extensions.briefing import run_briefing_now
 from resonant.gate import Allow, Decision, Intent, PendingApproval
 from resonant.models import SpanFactory
 from resonant.models.client import null_spans
@@ -61,21 +73,25 @@ from resonant.principals import Principals
 from resonant.router import commands
 from resonant.router.approvals import approvals_reply
 from resonant.router.commands import Command, ParseContext, UsageError
-from resonant.router.intents import IntentLabel
+from resonant.router.intents import ExtensionCatalog, IntentLabel
 from resonant.router.render import as_dict as _as_dict
 from resonant.router.render import as_list as _as_list
 from resonant.router.render import duration as _duration
 from resonant.router.render import (
     render_disk,
+    render_extensions,
     render_logs,
     render_notes,
     render_projects,
     render_reminders,
 )
 from resonant.store.audit import audit
-from resonant.store.db import atomic, utcnow
+from resonant.store.db import atomic, iso, utcnow
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect
+
+if TYPE_CHECKING:
+    from resonant.extensions.scheduler import CoreDeps
 
 log = logging.getLogger(__name__)
 
@@ -83,8 +99,13 @@ NOT_ALLOWED = "not allowed"
 KILL_REPLY = "kill switch engaged"
 RESUME_REPLY = "resumed: autonomy on, unpaused"
 UNKNOWN_COMMAND_REPLY = commands.unknown_reply(None)
+PAUSED_REPLY = "Paused: nothing runs until /resume."
+CORE_EXT = "core"
+CORE_TIMEOUT_S = 60.0
 
 Render = Callable[[dict[str, Any]], str]
+# A core job's on-demand entry (``/ext run core/<job>``): runs it now, returns the reply.
+CoreRun = Callable[[], Awaitable[str]]
 
 
 class FastGate(Protocol):
@@ -198,6 +219,7 @@ class FastCommand:
     tools: tuple[str, ...] = ()  # every tool the command can call: checked before ``reply``
     title: str = ""  # the task title ("/restart ollama"); defaults to ``name``
     unknown: str | None = None  # an unknown ``/word``: suggestions depend on the asker
+    extension: str | None = None  # an ``/<ext>`` command: ``tool`` is that extension's
 
 
 # The reply template for each registry command with a read tool (side effects are reported
@@ -210,6 +232,7 @@ COMMAND_RENDERS: dict[str, Render] = {
     "/reminders": render_reminders,
     "/disk": render_disk,
     "/logs": render_logs,
+    "/ext": render_extensions,
 }
 
 _RUNNING = FastCommand(
@@ -249,7 +272,14 @@ def _unknown(word: str | None) -> FastCommand:
 
 
 def _from_command(cmd: Command, rest: str, ctx: ParseContext) -> FastCommand:
-    base = FastCommand(cmd.name, cmd.intent, True, admin=cmd.owner_only, tools=cmd.tools)
+    base = FastCommand(
+        cmd.name,
+        cmd.intent,
+        True,
+        admin=cmd.owner_only,
+        tools=cmd.tools,
+        extension=cmd.extension,
+    )
     try:
         sub, tool, args = cmd.resolve(rest, ctx)
     except UsageError as e:
@@ -264,15 +294,20 @@ def _from_command(cmd: Command, rest: str, ctx: ParseContext) -> FastCommand:
     )
 
 
-def match_fast_path(text: str, ctx: ParseContext | None = None) -> FastCommand | None:
+def match_fast_path(
+    text: str,
+    ctx: ParseContext | None = None,
+    table: Mapping[str, Command] = commands.BY_NAME,
+) -> FastCommand | None:
     """The fast-path command for ``text``, or None. No I/O and no principal needed; ``ctx``
-    (the clock and zone, for ``/remind``) defaults to now in UTC."""
+    (the clock and zone, for ``/remind``) defaults to now in UTC. ``table`` is the command
+    table by name (builtins only by default; the router passes ``commands_for``'s)."""
     t = normalize(text)
     if t.startswith("/"):
         word = t.split(" ", 1)[0]
         if not _SLASH.match(word):
             return _unknown(None)
-        cmd = commands.get(word)
+        cmd = table.get(word)
         if cmd is None:
             return _unknown(word)
         parts = text.split(maxsplit=1)  # the rest keeps its original case
@@ -295,6 +330,8 @@ class FastPath:
         handlers: Mapping[HandlerKey, ToolHandler],
         clock: Callable[[], datetime] = utcnow,
         timezone: str = "UTC",
+        extensions: ExtensionCatalog | None = None,
+        command_table: Sequence[Command] = commands.COMMANDS,
     ) -> None:
         self.conn = conn
         self.principals = principals
@@ -303,6 +340,20 @@ class FastPath:
         self.handlers = handlers
         self.clock = clock
         self.timezone = timezone
+        self.extensions = extensions
+        self.commands: tuple[Command, ...] = tuple(command_table)
+        self.table: dict[str, Command] = commands.by_name(self.commands)
+        # ``/ext run core/<job>``: filled by the daemon once the core jobs exist.
+        self.core_jobs: dict[str, CoreRun] = {}
+
+    def match(self, text: str) -> FastCommand | None:
+        """``match_fast_path`` over this fast path's command table (extensions included)."""
+        return match_fast_path(text, self.context(), self.table)
+
+    def available(self, principal: str) -> list[Command]:
+        return commands.available(
+            principal, principals=self.principals, registry=self.registry, commands=self.commands
+        )
 
     def context(self) -> ParseContext:
         """What ``match_fast_path`` needs to parse ``/remind``: now, and the owner's zone."""
@@ -331,9 +382,9 @@ class FastPath:
     def _result(self, cmd: FastCommand, text: str, tool: str | None = None) -> FastPathResult:
         return FastPathResult(text, tool, command=cmd.title or cmd.name, intent=cmd.intent)
 
-    def _can_request(self, principal: str, tool: str) -> bool:
+    def _can_request(self, principal: str, tool: str, extension: str | None = None) -> bool:
         return commands.can_request(
-            principal, tool, principals=self.principals, registry=self.registry
+            principal, tool, principals=self.principals, registry=self.registry, extension=extension
         )
 
     async def _run(
@@ -350,12 +401,10 @@ class FastPath:
                     command=cmd.name,
                 )
             return self._result(cmd, NOT_ALLOWED)
-        if cmd.slash and not all(self._can_request(principal, t) for t in cmd.tools):
+        if cmd.slash and not all(self._can_request(principal, t, cmd.extension) for t in cmd.tools):
             return self._result(cmd, NOT_ALLOWED)
         if cmd.unknown is not None:
-            available = commands.available(
-                principal, principals=self.principals, registry=self.registry
-            )
+            available = self.available(principal)
             return self._result(cmd, commands.unknown_reply(cmd.unknown, available))
         if cmd.reply is not None:  # a usage line
             return self._result(cmd, cmd.reply)
@@ -367,10 +416,12 @@ class FastPath:
             return self._result(cmd, RESUME_REPLY, "killswitch.release")
         if cmd.name == "/approvals":
             return self._approvals(cmd, principal)
+        if cmd.admin and cmd.title == "/ext run":
+            return await self._ext_run(cmd, principal, trace_id)
+        if cmd.extension is not None:
+            return self._extension_call(cmd)
         if cmd.help:
-            available = commands.available(
-                principal, principals=self.principals, registry=self.registry
-            )
+            available = self.available(principal)
             keywords = self.principals.can(principal, "request", None)
             text = commands.help_text(available, cmd.args.get("query"), keywords=keywords)
             return self._result(cmd, text)
@@ -412,6 +463,76 @@ class FastPath:
             text = f"Couldn't read {cmd.tool} right now."
         return self._result(cmd, text, cmd.tool)
 
+    def _direct(
+        self, cmd: FastCommand, extension: str | None, tool: str, args: dict[str, Any], title: str
+    ) -> FastPathResult:
+        return FastPathResult(
+            "",
+            None,
+            command=title,
+            intent=cmd.intent,
+            direct_call={"extension": extension, "tool": tool, "args": args},
+        )
+
+    def _extension_call(self, cmd: FastCommand) -> FastPathResult:
+        """``/<ext> <tool> [args]``: a direct call of that extension's chat tool, reads
+        included (the executor injects secrets and redacts). Never a job spec."""
+        ext, tool = cmd.extension, cmd.tool
+        spec = self.registry.get(ext, tool) if tool is not None else None
+        if (
+            ext is None
+            or tool is None
+            or spec is None
+            or (self.extensions is not None and self.extensions.is_job(spec))
+        ):
+            return self._result(cmd, NOT_ALLOWED)
+        return self._direct(cmd, ext, tool, dict(cmd.args), cmd.title or cmd.name)
+
+    async def _ext_run(
+        self, cmd: FastCommand, principal: str, trace_id: str | None
+    ) -> FastPathResult:
+        """``/ext run <ext>/<job>`` (owner-only, checked by the caller)."""
+        ext, job = str(cmd.args.get("extension")), str(cmd.args.get("job"))
+        label = f"{ext}/{job}"
+        if ext == CORE_EXT:  # its entry checks the kill switch itself
+            return await self._core_run(cmd, job, principal, trace_id)
+        if _paused(self.conn):
+            return self._result(cmd, PAUSED_REPLY)
+        manifest = self.extensions.manifest(ext) if self.extensions is not None else None
+        entry = next((j for j in manifest.jobs if j.id == job), None) if manifest else None
+        spec = self.registry.get(ext, entry.spec_name) if entry is not None else None
+        if spec is None:
+            return self._result(cmd, f"No job {label}. Try /ext list.")
+        args = {"due_at": iso(self.clock())}
+        return self._direct(cmd, ext, spec.name, args, f"/ext run {label}")
+
+    async def _core_run(
+        self, cmd: FastCommand, job: str, principal: str, trace_id: str | None
+    ) -> FastPathResult:
+        """A core job now, inline (trusted core code, L0, no gate), audited ``job.run``."""
+        run = self.core_jobs.get(job)
+        if run is None:
+            return self._result(cmd, f"No job core/{job}. Try /ext list.")
+        label = f"{CORE_EXT}/{job}"
+        try:
+            text = await asyncio.wait_for(run(), timeout=CORE_TIMEOUT_S)
+            ok = True
+        except Exception as e:
+            log.warning("core job %s failed: %s", label, type(e).__name__)
+            text, ok = f"{label} failed.", False
+        with atomic(self.conn):
+            audit(
+                self.conn,
+                "job.run" if ok else "job.failed",
+                requested_by=principal,
+                trace_id=trace_id,
+                extension=CORE_EXT,
+                job=label,
+                manual=True,
+                reply=text,  # code-built: what happened (sent, paused, unreachable)
+            )
+        return FastPathResult(text, label, command=f"/ext run {label}", intent=cmd.intent)
+
     def _approvals(self, cmd: FastCommand, principal: str) -> FastPathResult:
         """``/approvals [code]``: pending approvals, or one's full args (owner only)."""
         code = cmd.args.get("code")
@@ -423,3 +544,32 @@ class FastPath:
             now=self.clock(),
         )
         return self._result(cmd, NOT_ALLOWED if text is None else text)
+
+
+BRIEFING_SENT = "Briefing sent."
+BRIEFING_PAUSED = "Paused: briefing not sent."
+BRIEFING_UNREACHABLE = "Can't send: no channel/owner."
+
+
+def briefing_reply(result: Mapping[str, Any]) -> str:
+    """The reply to ``/ext run core/briefing`` from ``run_briefing_now``'s result."""
+    if result.get("sent") is True:
+        return BRIEFING_SENT
+    return BRIEFING_PAUSED if result.get("skipped") == "paused" else BRIEFING_UNREACHABLE
+
+
+def core_briefing(deps: CoreDeps) -> CoreRun:
+    """``/ext run core/briefing``: the briefing now (``briefing.run_briefing_now``)."""
+
+    async def run() -> str:
+        return briefing_reply(await run_briefing_now(deps))
+
+    return run
+
+
+def _paused(conn: sqlite3.Connection) -> bool:
+    """The kill switch's ``paused``; unknown counts as paused (fail closed)."""
+    try:
+        return killswitch.is_paused(conn)
+    except killswitch.PausedStateUnknownError:
+        return True

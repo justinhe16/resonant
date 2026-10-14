@@ -75,13 +75,15 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from functools import partial
 from typing import Any, Protocol, cast
 
 from resonant.executor import NotAllowedError, ToolResult, idempotency_key
+from resonant.extensions.notify import take_baseline
+from resonant.extensions.scheduler import persist_events
 from resonant.gate import Allow, Decision, Deny, DryRun, Intent, NeedsApproval, canonical_json
 from resonant.gate.codes import clean_external
 from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
@@ -115,7 +117,10 @@ from resonant.router.prefixes import (
 from resonant.router.render import render_disk, render_logs, render_projects
 from resonant.router.router import builtin_names, chat_toolset
 from resonant.runners.approve import prompt_approvers
-from resonant.store.db import utcnow
+from resonant.runners.job import SUMMARY_MAX, done_text, failed_text
+from resonant.store import extensions as ext_store
+from resonant.store.audit import audit
+from resonant.store.db import transaction, utcnow
 from resonant.store.tasks import get_event, get_task, principal_thread
 from resonant.tools import ToolRegistry
 from resonant.tools.ops import summary_action as ops_action
@@ -257,6 +262,8 @@ def summarize(calls: list[_Call]) -> str:
         render = _RENDERERS.get(c.tool) if c.extension is None else None
         if not c.ok or c.data is None:
             lines.append(f"Couldn't read {c.tool} right now.")
+        elif c.extension is not None:
+            lines.append(_extension_summary(c.extension, c.tool, c.data))
         elif render is None:
             lines.append(f"{c.tool}: ok")
         else:
@@ -265,6 +272,14 @@ def summarize(calls: list[_Call]) -> str:
             except Exception:
                 lines.append(f"{c.tool}: ok")
     return _clip("\n".join(lines)) if lines else NO_ANSWER_REPLY
+
+
+def _extension_summary(ext: str, tool: str, data: dict[str, Any]) -> str:
+    """``github prs: 3 open PRs, 1 failing CI``: the result's ``summary`` (cleaned, clipped
+    like a job report), else ``github prs: ok``. Never the raw result."""
+    summary: object = data.get("summary")
+    clean = clean_external(summary)[:SUMMARY_MAX].strip() if isinstance(summary, str) else ""
+    return f"{ext} {tool}: {clean or 'ok'}"
 
 
 def _clip(text: str, limit: int = MAX_REPLY_CHARS) -> str:
@@ -337,6 +352,15 @@ def _updated(d: dict[str, Any]) -> str | None:
     return None
 
 
+def _muted(d: dict[str, Any]) -> str | None:
+    ext, until = d.get("extension"), d.get("until_text")
+    if not isinstance(ext, str):
+        return None
+    if isinstance(until, str):
+        return f"Muted {ext} until {until}."
+    return f"Unmuted {ext}." if d.get("muted_until") is None else None
+
+
 def summarize_intent(intent: Intent) -> str:
     """The code-built phrase for ``intent`` in replies: the ops heading (``update Resonant``)
     when there is one, as in approval prompts and dry-run replies, else the generic summary."""
@@ -354,6 +378,7 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "restart_ollama": _ollama_restarted,
     "restart_resonant": _resonant_restarting,
     "update_resonant": _updated,
+    "mute_extension": _muted,
 }
 
 
@@ -686,7 +711,13 @@ class LocalRunner:
             prior = self.executor.recorded(key)
             if prior is not None:
                 s.set(recorded=True, ok=prior.ok, ambiguous=prior.ambiguous)
-                return _outcome(intent, prior)
+                job = self._job_id(spec)
+                answer = _outcome(intent, prior)
+                if job is None or spec.extension is None:
+                    return answer
+                if not self._job_recorded(task.id):  # a crash after execute, before recording
+                    self._record_job(intent, spec.extension, job, prior)
+                return _job_answer(intent, job, prior, answer)
             decision = self.gate.evaluate(intent)
             s.set(decision=type(decision).__name__)
             return await self._decided(intent, decision, pinned, cp, spans)
@@ -710,7 +741,70 @@ class LocalRunner:
             )
         except NotAllowedError:
             return _Answer(refusal_reply(intent, Deny(APPROVAL_USED)), "refused", [])
-        return _outcome(intent, result)
+        answer = _outcome(intent, result)
+        spec = self.registry.get(intent.extension, intent.tool)
+        job = self._job_id(spec) if spec is not None else None
+        if job is None or intent.extension is None:
+            return answer
+        if not result.replayed:
+            self._record_job(intent, intent.extension, job, result)
+        return _job_answer(intent, job, result, answer)
+
+    def _job_id(self, spec: ToolSpec) -> str | None:
+        """The manifest job id when ``spec`` is an extension's job spec (``/ext run``)."""
+        host = self.extensions
+        if host is None or spec.extension is None or not host.is_job(spec):
+            return None
+        manifest = host.manifest(spec.extension)
+        jobs = manifest.jobs if manifest is not None else ()
+        return next((j.id for j in jobs if j.spec_name == spec.name), None)
+
+    def _job_recorded(self, task_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM audit_log WHERE task_id = ? AND action IN "
+            "('job.run', 'job.failed', 'job.ambiguous') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return row is not None
+
+    def _record_job(self, intent: Intent, ext: str, job: str, result: ToolResult) -> None:
+        """A run of a job on demand, recorded like a scheduled one in one transaction:
+        ``ext_jobs`` (last run, fail streak; ``last_due`` and ``open_task_id`` untouched, so
+        the schedule and overlap checks are unchanged), its events (on success; the job's
+        first run after install is a baseline, stored and never notified) and a ``job.run``
+        / ``job.failed`` / ``job.ambiguous`` audit row marked ``manual``. A crash between
+        the executor's record and this one is caught on resume (``_job_recorded``); a
+        replayed result has no events, so those are lost, as in ``JobRunner``."""
+        outcome = "ok" if result.ok else ("ambiguous" if result.ambiguous else "failed")
+        with transaction(self.conn):
+            ext_store.record_run(
+                self.conn,
+                ext,
+                job,
+                at=self.now(),
+                outcome=outcome,
+                ok=result.ok,
+                clear_open=False,
+            )
+            n = 0
+            if result.ok:
+                first = take_baseline(self.conn, ext, job)
+                n = persist_events(
+                    self.conn, ext, result.events, trace_id=intent.trace_id, baseline=first
+                )
+            audit(
+                self.conn,
+                "job.run" if result.ok else f"job.{outcome}",
+                task_id=intent.task_id,
+                extension=ext,
+                tool=intent.tool,
+                trace_id=intent.trace_id,
+                job=f"{ext}/{job}",
+                manual=True,
+                error=result.error,
+                events=n,
+                idempotency_key=result.idempotency_key,
+            )
 
     async def _ask(
         self, task_id: str, decision: NeedsApproval, cp: dict[str, Any], spans: SpanFactory
@@ -968,6 +1062,17 @@ def _outcome(intent: Intent, result: ToolResult) -> _Answer:
     else:
         reply = report_line(intent, data)
     return _Answer(reply, "replay" if result.replayed else "done", [intent.tool], data=data)
+
+
+def _job_answer(intent: Intent, job: str, result: ToolResult, answer: _Answer) -> _Answer:
+    """``github/watch: done: 3 PRs watched, 0 events`` (as a scheduled job's report);
+    a definite failure ``github/watch failed: <reason>``; anything else as ``answer``."""
+    label = f"{intent.extension}/{job}"
+    if result.ok:
+        return replace(answer, reply=done_text(label, result.data))
+    if not result.ambiguous and result.notice is None:
+        return replace(answer, reply=failed_text(label, result.error))
+    return answer
 
 
 def _with_report(narration: _Answer, done: _Answer) -> _Answer:

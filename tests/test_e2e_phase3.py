@@ -5,9 +5,9 @@ Keychain a FakeKeychain. Extensions are tiny temp ``.py`` extensions installed w
 ``resonant.e2e.extensions.install_fixture`` and run by the real process runner. Each Phase 3
 ticket adds its own scenarios here.
 
-Until ``/<ext> <tool>`` commands land (P3-14), extension calls are driven by
-``ExtScriptRunner``: it sends each call in its checkpoint through the daemon's own gate and
-executor inside a loop step.
+The E7 cases drive extension calls with ``ExtScriptRunner``: it sends each call in its
+checkpoint through the daemon's own gate and executor inside a loop step. From P3-14 on,
+scenarios use ``/<ext> <tool>`` and ``/ext`` over iMessage.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import contextlib
 import inspect
 import json
 import logging
+import re
 import socket
 import sqlite3
 import sys
@@ -40,7 +41,7 @@ from resonant.e2e.extensions import install_fixture
 from resonant.e2e.fakes import DEFAULT_FINAL_REPLY
 from resonant.extensions.host import tampered_text
 from resonant.extensions.notify import mute
-from resonant.extensions.scheduler import LAST_TICK_KEY
+from resonant.extensions.scheduler import LAST_TICK_KEY, persist_events
 from resonant.gate import Allow, Intent
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import NewTask
@@ -50,8 +51,8 @@ from resonant.monitor import health_snapshot
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.router.fast_path import KILL_REPLY, RESUME_REPLY
 from resonant.secrets import FakeKeychain, SecretStore
-from resonant.store.db import iso, kv_set, open_db, transaction, utcnow
-from resonant.store.extensions import get_extension, mark_due
+from resonant.store.db import iso, kv_get, kv_set, open_db, transaction, utcnow
+from resonant.store.extensions import get_extension, get_job, mark_due
 from resonant.store.tasks import unrouted_events
 from resonant_sdk import Event, ToolSpec
 
@@ -574,6 +575,137 @@ def process_gone(pid: int) -> bool:
         return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return True
+
+
+# --- E2 / E14: /<ext> <tool> and /ext (P3-14) ----------------------------------------------
+
+MEMBER_PHONE = "+15559876543"
+MEMBER_PRINCIPAL = """\
+  cofounder:
+    identities: ["imessage:{phone}"]
+"""
+
+
+def gate_rows(conn: sqlite3.Connection, extension: str) -> list[tuple[str, str, str]]:
+    rows = conn.execute(
+        "SELECT tool, decision, detail FROM audit_log WHERE action = 'gate.evaluate' "
+        "AND extension = ? ORDER BY id",
+        (extension,),
+    ).fetchall()
+    return [(r["tool"], r["decision"], json.loads(r["detail"])["origin"]) for r in rows]
+
+
+async def test_e2_e14_github_commands_over_imessage(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    state = tmp_path / "gh" / "state.json"
+    settings = gh_settings(resonant_home, chat, tmp_path / "bin", state)
+    with (resonant_home / "principals.yaml").open("a") as f:
+        f.write(MEMBER_PRINCIPAL.format(phone=MEMBER_PHONE))
+    install_github(settings, tmp_path)
+    keychain = FakeKeychain(items={"github/token": GH_TOKEN})
+    osa = RecordingOsaRunner()
+    async with start_daemon(settings, keychain, osa) as r:
+        n = 0
+
+        async def say(text: str, handle: str = OWNER_PHONE) -> str:
+            nonlocal n
+            n += 1
+            chat.add_message(handle=handle, text=text)
+            return (await osa.wait_for(n, 20)).text
+
+        def manual(tool: str) -> list[tuple[str, str, str]]:
+            # The scheduler may run github's jobs meanwhile (origin scheduled): left out.
+            return [g for g in gate_rows(r.conn, "github") if g[0] == tool and g[2] == "explicit"]
+
+        # An L0 read: no prompt, gated as explicit, the reply is the result's summary.
+        assert await say("/github prs") == (
+            "github prs: 1 open PRs, 0 failing CI, 0 awaiting your review"
+        )
+        assert manual("prs") == [("prs", "Allow", "explicit")]
+
+        # An L1 write asks for a code even from the owner, explicitly; nothing runs yet.
+        prompt = await say("/github merge_pr resonant 40 abc1234")
+        assert re.fullmatch(r"\[([A-Z]\d)\] .*Reply yes \1 / no", prompt), prompt
+        assert "can't be undone" in prompt
+        assert manual("merge_pr") == [("merge_pr", "NeedsApproval", "explicit")]
+
+        # A member without the github grant: not allowed, before any argument parsing.
+        assert await say("/github prs", MEMBER_PHONE) == "not allowed"
+        assert await say("/ext list", MEMBER_PHONE) == "not allowed"
+        assert await say("/ext run github/watch", MEMBER_PHONE) == "not allowed"
+
+        # /help github lists its tools with levels; a typo suggests and never runs.
+        help_text = await say("/help github")
+        assert help_text.splitlines()[0].startswith("/github: Your GitHub pull requests")
+        assert "/github merge_pr <repo> <number> <head_sha>: " in help_text
+        assert help_text.splitlines()[-1].endswith("(L3)")  # rerun_failed
+        assert await say("/gihub prs") == "Unknown command /gihub. Did you mean /github?"
+        assert (
+            await say("/github pres") == "Unknown command /github pres. Did you mean /github prs?"
+        )
+        assert await say("/github job_watch") == (
+            "Unknown command /github job_watch. Try /help github."
+        )
+        assert len(manual("prs")) == 1 and manual("job_watch") == []
+
+        # /ext list: status, pin, tools and each job's next due time.
+        listing = await say("/ext list")
+        lines = listing.splitlines()
+        assert lines[0] == "Extensions (1):"
+        assert lines[1].startswith("github · enabled · a1b2c3d4 digest ")
+        assert " · 4 tools" in lines[1]
+        assert lines[2].startswith("- digest (L0) · next ")
+        assert lines[3].startswith("- watch (L0) · next ")
+
+        # /ext run github/watch: the job spec, explicit at its level, recorded as a run.
+        assert await say("/ext run github/watch") == ("github/watch: done: 1 PRs watched, 0 events")
+        assert manual("job_watch") == [("job_watch", "Allow", "explicit")]
+        runs = [
+            json.loads(row["detail"])
+            for row in audit_rows(r.conn, "job.run")
+            if json.loads(row["detail"]).get("manual")
+        ]
+        assert [run["job"] for run in runs] == ["github/watch"]
+        job = get_job(r.conn, "github", "watch")
+        assert job is not None and job.last_outcome == "ok"
+
+        # /ext mute github 1h holds its notifications (kv read by the notifier); off lifts it.
+        muted = await say("/ext mute github 1h")
+        assert muted.startswith("Muted github until "), muted
+        assert isinstance(kv_get(r.conn, "ext.github.muted_until"), str)
+        assert len(audit_rows(r.conn, "ext.notify_muted")) == 1
+        # A ci_failed event while muted is consumed unsent (held), never delivered.
+        sent_before = len(osa.sent)
+        with transaction(r.conn):
+            event = {"type": "ci_failed", "text": "resonant#40 CI failed", "dedupe_key": "m1"}
+            persist_events(r.conn, "github", [event])
+        await wait_until(lambda: bool(audit_rows(r.conn, "ext.notify_held")), 10)
+        (held,) = audit_rows(r.conn, "ext.notify_held")
+        assert json.loads(held["detail"])["reason"] == "muted"
+        await asyncio.sleep(0.2)
+        assert len(osa.sent) == sent_before
+        assert await say("/ext mute github off") == "Unmuted github."
+        assert kv_get(r.conn, "ext.github.muted_until") is None
+        assert GH_TOKEN not in everything_stored(r.conn)
+
+
+async def test_e13_e14_ext_run_core_briefing_sends_it_now(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    settings = settings_for(resonant_home, chat)
+    osa = RecordingOsaRunner()
+    async with start_daemon(settings, FakeKeychain(), osa) as r:
+        chat.add_message(handle=OWNER_PHONE, text="/ext run core/briefing")
+        await osa.wait_for(2, 20)
+        # The briefing itself (its content is P3-13's), then the command's reply.
+        assert [m.text for m in osa.sent][1:] == ["Briefing sent."]
+        (run,) = audit_rows(r.conn, "job.run")
+        assert json.loads(run["detail"])["job"] == "core/briefing"
+        chat.add_message(handle=OWNER_PHONE, text="/kill")
+        chat.add_message(handle=OWNER_PHONE, text="/ext run core/briefing")
+        await osa.wait_for(4, 20)
+        assert [m.text for m in osa.sent[2:]] == [KILL_REPLY, "Paused: briefing not sent."]
 
 
 # --- E12: github watch, deterministic, exactly once ----------------------------------------
