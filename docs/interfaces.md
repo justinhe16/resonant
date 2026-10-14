@@ -617,7 +617,7 @@ FakeExtProcess(results=[...], respond=None)  .calls   # tests; runs nothing
 ```python
 ExtensionHost.from_settings(settings, conn, registry, *, runner: ExtRunner | None = None) -> ExtensionHost
     .load() -> None                       # once, from build_components
-    .loaded: {name: LoadedExtension(record, manifest, root, tools, jobs)}
+    .loaded: {name: LoadedExtension(record, manifest, root, tools, jobs, health: ExtCommand | None)}
     .refused: {name: reason}  .tampered: [name]  .tracker: ProcessTracker
     .handlers: {(ext, spec name): ExtensionHandler}
     .tool_specs(extension=None) / .job_specs(extension=None) -> list[ToolSpec]
@@ -625,6 +625,8 @@ ExtensionHost.from_settings(settings, conn, registry, *, runner: ExtRunner | Non
     .scheduled_jobs() -> list[HostJob(ext, job: manifest Job, spec, handler)]   # the scheduler's input
     .approvers_for(extension) -> tuple[str, ...]   # PolicyGate seam; () on any error
 send_alerts(conn, channel, owner) -> int     # queued owner alerts (kv "ext.alerts")
+ExtensionHealth(host, secrets=None, timeout_s=20)   # HealthMonitor(ext_checks=...); P3-12
+    .from_settings(settings, host, secrets)  await .evaluate(now) -> {"ext:<name>": (CheckResult, fresh) | None}
 tampered_text(name) -> str
 resonant.extensions.pin: tree_digest(root) -> str ; verify_copy(record, root) -> "ok" | "changed" | "missing"   # P3-7
 resonant.extensions.handlers.ExtensionHandler(ContextHandler)
@@ -635,7 +637,9 @@ resonant.e2e.extensions.install_fixture(settings, conn, manifest_yaml, files, *,
   1. **Pin.** `pin.verify_copy(record, root)` (P3-7's digest, every byte including `resonant.yaml`). Anything but `ok` (`changed`, `missing`) sets `disabled_tampered`, and only when that flips (`set_status` is True) audits `ext.tampered` and queues one alert, all in one transaction: `example changed on disk since you approved it; disabled. resonant ext update example to review`. Nothing of it is registered, and a restart doesn't load it or alert again.
   2. **Manifest.** The row's approved snapshot, validated again; its name must match, and it must equal the copy's (pinned) `resonant.yaml`. Any unexpected error while loading is a refusal too (`load failed (<type>)`), never a daemon crash. `checks.dir_errors` must pass on the copy. MCP is refused for now.
   3. **Commands.** Each tool's and job's `run` is compiled once (`ExtCommand.compile`, `argv0=record.argv0_paths[<spec name>]`, which must still be a file). A tool's placeholders must be its declared args; a job's may only be `{due_at}`. Only `gh`/`git` run by their pinned path, so only those must still exist; scripts and `python3` run with the daemon's interpreter.
-  4. **Register.** `Manifest.tool_specs()` and `job_specs()` (`job_<id>`) go into the registry, each with an `ExtensionHandler`. If any step 2-4 fails, nothing of that extension is registered; it is audited `ext.load_refused` and kept in `refused` (health, P3-12). Its status is unchanged. One bad extension never blocks the others or the daemon.
+  4. **Register.** `Manifest.tool_specs()` and `job_specs()` (`job_<id>`) go into the registry, each with an `ExtensionHandler`. If any step 2-4 fails, nothing of that extension is registered; it is audited `ext.load_refused` and kept in `refused` (health). Its status is unchanged. One bad extension never blocks the others or the daemon.
+- **Health command.** `manifest.health.check` is compiled at load like a tool (`argv0=record.argv0_paths["health"]`; no placeholders, else a refusal).
+- **Health** (`ExtensionHealth`, D11). One `ext:<name>` check per loaded, refused or `disabled_tampered` extension. Loaded: degraded when the last health-command run failed or any job's `ext_jobs.fail_streak` ≥ 3 (`job <id> failed N times in a row`). The command runs every `health.every` (not while paused), through `host.runner.run_raw` with `scratch_env` plus the manifest's top-level `secrets` and `timeout_s=extensions.process.health_timeout_s`; exit 0 is ok. Details are code-built (`health check failed (exit 1)`, `… timed out`, `health check: a declared secret is missing or unreadable`); stderr is never shown. A cached failing result is not `fresh` (doesn't count toward the monitor's `alert_after`). Refused: `not loaded: <reason>`. Tampered: `disabled: changed on disk since you approved it`.
 - **Tree digest.** See the manager section (`resonant.extensions.pin`); the host only re-verifies.
 - **Jobs stay out of chat.** Job specs are in the registry (the gate and `/api/tools` see them; P3-10 runs them), but `tool_specs()` and `Components.chat_specs()` leave them out, and so does the step limit.
 - **Handler.** One process run per call: `render(args)`, `scratch_env(ext, data_dir=<ext_data_dir>/<name>, secrets=ctx.secrets, job_due_at=args["due_at"] for jobs, path=extensions.process.path_env)`, `ExtRequest(cwd=root, timeout_s=spec.timeout_s, label="<ext>/<tool>")`, `redact=Redactor(values_of(env)).text`. The JSON object is returned deep-redacted and its events go to `ctx.events`. Secrets the spec didn't declare are refused (`ToolFailed`). P3-10's L0 job path calls the same handler with its own `CallContext`.
@@ -657,7 +661,7 @@ CoreJob(id, schedule, run: JobCall, catchup=None, timeout_s=300)   # cron in set
 CoreDeps(settings, conn, components, channel, owner)
 CORE_JOBS: tuple[Callable[[CoreDeps], CoreJob | None], ...] = ()  # P3-13 adds the briefing
 JobCall = (args: dict, ctx: CallContext) -> Awaitable[dict]        # ExtensionHandler fits
-persist_events(conn, ext, events, *, trace_id=None) -> int
+persist_events(conn, ext, events, *, trace_id=None, baseline=False) -> int
 read_paused(conn) -> bool                     # unknown counts as paused
 JobRunner(conn, *, gate, executor, registry, channel, recipients, timezone="UTC",
           now=utcnow, max_step_s=1860)        # name="job", uses_claude_slot=False
@@ -669,10 +673,33 @@ resonant_sdk.emit.emit(type, text, dedupe_key, data=None) -> bool   # stdlib-onl
 - **Inline** (effective level L0, and core jobs): no task row. The due time is claimed in memory, and the run waits for a slot (`extensions.max_concurrent_jobs`). An extension job is gated: `Intent.for_tool(spec, task_id="job:<ext>/<id>:<due>", principal=owner, args={due_at}, origin="scheduled")`; the token is consumed here since there is no executor. Core jobs skip the gate. Declared secrets come from the `SecretStore` (`CallContext(secrets=…)`); the result, events and error are redacted with those values. On completion one transaction writes `mark_due`, `record_run` (`ok`/`failed`), `persist_events` and the audit row: `job.run` (`late`, `events`), `job.failed` (`error`, `stderr_tail`), `job.killed` (no `record_run`), `job.denied`, `job.dry_run` or `job.skipped_paused`. A run cancelled by shutdown writes nothing, so its due time is decided again on the next start.
 - **Gated** (L3/L2/L1): `insert_task(kind="job", runner="job", extension, principal=owner, priority=PRIORITY_BACKGROUND, wake_at=due, checkpoint={ext, job, due_at, late})` and `mark_due(..., open_task_id=task)` and `job.queued` in one transaction (re-checking `last_due < due`), so a due time is claimed exactly once across ticks and restarts.
 - **Kill switch.** `start()` registers `on_pause`. Engaged in the daemon (`/kill`): `tracker.paused = True` at once (the hold), then `tracker.kill_all("killed")` in the background unless already resumed (audited `job.kill_all`); an inline run ends as `job.killed`, a gated write as ambiguous. A CLI `resonant kill` is applied on the next tick. Released (or an unpaused tick): `tracker.resume()`. Paused ticks skip every due time with no catch-up after `/resume`.
-- **Events** (`persist_events`): each `{type, text, dedupe_key, data?}` becomes `Event(source="ext:<ext>", type="ext.<ext>.<type>", payload={text, data}, principal=None, task_id=None, dedupe_key="ext:<ext>:<key>")` via `insert_event` (UNIQUE key: repeats are dropped), in the transaction that records the run. They are unrouted: the loop's router hook sees them. Until P3-12's notifier, `Router.route` consumes them without sending.
+- **Events** (`persist_events`): each `{type, text, dedupe_key, data?}` becomes `Event(source="ext:<ext>", type="ext.<ext>.<type>", payload={text, data}, principal=None, task_id=None, dedupe_key="ext:<ext>:<key>")` via `insert_event` (UNIQUE key: repeats are dropped), in the transaction that records the run. They are unrouted: the loop's router hook sees them and `wiring.route_event` hands them to the `Notifier` (below). A job's first successful run after install (`notify.take_baseline`, in the same transaction, both runners) stores them with `payload.baseline=true`.
 - **JobRunner** step: `checkpoint.finished` → only (re)send reports. Else the pinned call `job_<id> {due_at}` (`origin="scheduled"`, `idempotency_key(task_id, 0, 0, hash)`): `executor.recorded` first (succeeded replays, started is ambiguous, never re-run); paused → `job.skipped_paused`; `gate.evaluate`: `Allow` → `executor.execute(step_no=0, call_index=0)`; `NeedsApproval` → `prompt_approvers` then `Wait("approval", wake_at=expires_at)` (unreachable approvers skipped, none reachable fails, a transient error retries); `DryRun`/`Deny` don't run. Then one transaction: `record_run` (`ok`, `failed`, `ambiguous`), `persist_events`, the audit row (`job.run`, `job.failed`, `job.ambiguous`, `job.killed`, `job.denied`, `job.dry_run`, `job.skipped_paused`) and `checkpoint.finished`. **Limit:** a crash between the executor's commit and that transaction replays the result but loses that run's events.
 - **Reports** go to `recipients(ext)` (the gate's `approvers`: owner first, then manifest approvers holding the grant); a refused send is skipped, any other channel error is a retryable `Fail`. Code-built and sanitized: `example/cleanup: done` (`: <summary>` from the result, ≤ 120 chars; dedupe `jobreport:<task>:<recipient>`); `example/cleanup failed: <reason>` or `example/cleanup: not done (approval expired)` at most once per job per local day (dedupe `jobfail:<ext>/<id>:<date>:<recipient>`). Dry runs, paused skips and kill-switch kills aren't reported.
-- **Seams.** P3-12: dispatch `ext:*` events in the router hook (`wiring`) and read `fail_streak` for health; `job.killed`/`job.failed` audit rows. P3-13: append a factory to `CORE_JOBS` (gets the channel and owner; returns None when `briefing.enabled` is false). P3-14: `/ext run <ext>/<job>` is a `direct_call` of the job spec (`job_<id> {due_at}`), gated as explicit; `ext_jobs` holds last run and outcome for `/ext list`.
+- **Seams.** P3-13: append a factory to `CORE_JOBS` (gets the channel and owner; returns None when `briefing.enabled` is false). P3-14: `/ext run <ext>/<job>` is a `direct_call` of the job spec (`job_<id> {due_at}`), gated as explicit; `ext_jobs` holds last run and outcome for `/ext list`.
+
+## Notifications: `resonant.extensions.notify`
+
+```python
+Notifier(conn, *, channel: Sender, recipients: Callable[[str], Sequence[str]],
+         manifest_of: Callable[[str], Manifest | None], config: NotifyConfig | None = None,
+         clock=utcnow, sleep=asyncio.sleep)
+    await .route(event) -> None       # ext:* events; raises ChannelError to retry
+    await .flush() -> int             # end-of-hour "+N more updates"
+    await .run(interval_s=60) / .stop()
+render(name, text, max_chars=300) -> str      # "[<name>] <clean_text(text)>"
+clean_text(text) -> str  prefix(name) -> str  more_text(name, n) -> str
+mute(conn, ext, until: datetime, *, by) -> None          # kv ext.<name>.muted_until; audit ext.notify_muted
+unmute(conn, ext, *, by) -> bool                         # audit ext.notify_unmuted
+muted_until(conn, ext, now=None) -> datetime | None      # None once past
+take_baseline(conn, ext, job_id) -> bool                 # once per job per install (kv ext.<name>.baseline.<job>)
+```
+
+- **Route**, per `ext:*` event (D10): a malformed or not-loaded source is consumed (`ext.notify_dropped`); a type outside `notify.on` is consumed silently (`digest` stays stored for the briefing); `payload.baseline`, paused (unknown counts as paused) or muted → consumed unsent, `ext.notify_held {reason}`, never queued (no flood on `/resume` or unmute); over `extensions.notify.max_per_hour` distinct events this UTC clock hour → `ext.notify_capped`; otherwise `render(name, payload.text, max_chars)` to each of `recipients(ext)` (the gate's approvers, owner first) with `dedupe_key="<event dedupe key>:<recipient>"`, then `ext.notify_sent` (`idempotency_key` = the event's dedupe key, `hour`). A refused recipient is skipped (`ext.notify_unreachable` when none took it); any other `ChannelError` raises, so the loop retries every tick (dead-letter after 5).
+- **Exactly once.** Persist, then deliver from the store: a crash before the send leaves the event unrouted (delivered on start); a crash after it hits the channel's dedupe record on the retry. The hourly count is the distinct event keys audited `ext.notify_sent`, so a retry never counts twice.
+- **Flush.** Started by the daemon with iMessage on. For each finished hour with capped events (kv `ext.notify.overflow`), one `[<name>] +N more updates` per recipient (dedupe `ext-more:<name>:<hour>:<recipient>`, audit `ext.notify_overflow`), or `ext.notify_held` when paused or muted.
+- **Anti-spoofing** (`clean_text`). NFKC; printable ASCII plus a short list of status symbols (✓ ✗ ⚠ 👀 …), everything else a space; one line; `[ ] { }` become `( )` (`[A7]` → `(A7)`); a code-like token after `yes`/`no`/`stop` is masked (`yes ?`); `reply` and a leading `yes`/`no`/`stop` are quoted (`'Reply'`). The code-built `[<name>]` prefix comes first (`(<name>)` if the name itself looks like a code), and the whole is clipped to `max_chars`. Binding a reply still needs a sent prompt and a single pending approval.
+- **Baseline.** Per job, keyed by the extension's `installed_at`, so a reinstall or update baselines again. A first run that fails doesn't take it.
 
 ## Components: `resonant.components`
 
@@ -881,12 +908,14 @@ HealthMonitor(conn, *, model: ModelProber | None, channel: MonitoredChannel | No
     async def run() -> None            # evaluate() every interval_s until stop()
     async def evaluate() -> dict[check, CheckState]
     def deadman_reason() -> str | None
+    # ext_checks: DynamicChecks | None = None  (extensions.host.ExtensionHealth)
+DynamicChecks.evaluate(now) -> {name: (CheckResult, fresh) | None}
 deadman_task(url, interval_s, healthy, client=None, reason: Callable[[], str | None] | None = None)
-health_snapshot(conn) -> {check: {state, since, detail, checked_at}}
+health_snapshot(conn) -> {check: {state, since, detail, checked_at}}   # plus persisted ext:<name>
 channels_snapshot(conn, *, imessage_enabled, channel) -> [{name, enabled, ok, last_read_at, last_selftest}]
 ```
 
-- Checks, every 60s: **model** (`probe()` every 5 min, cached in kv `model.probe`); **imessage** (channel `health()` plus kv `imessage.selftest`; the self-test re-runs every 6h, every 30 min while the last one failed, and after 2 consecutive reader errors); **loop** (`Daemon.healthy()`, any `event.dead_letter` audit row in the last hour, more than 2 tasks failed in the last hour); **store** (a kv write succeeds, free disk on the DB volume > 2GB). A check whose dependency is None (no model client, no channel) is not evaluated and stays `unknown`.
+- Checks, every 60s: **model** (`probe()` every 5 min, cached in kv `model.probe`); **imessage** (channel `health()` plus kv `imessage.selftest`; the self-test re-runs every 6h, every 30 min while the last one failed, and after 2 consecutive reader errors); **loop** (`Daemon.healthy()`, any `event.dead_letter` audit row in the last hour, more than 2 tasks failed in the last hour); **store** (a kv write succeeds, free disk on the DB volume > 2GB). A check whose dependency is None (no model client, no channel) is not evaluated and stays `unknown`. **ext:<name>** (dynamic, from `ext_checks`): one per extension, same state machine, alerts and kv (`health.ext:<name>`); `fresh=False` doesn't count toward `alert_after`, None is no observation; a name no longer returned (removed or disabled extension) is dropped from kv. `ext:` checks never feed `deadman_reason`.
 - State per check: `unknown | ok | degraded`, persisted in kv `health.<check>` (`{state, since, detail, checked_at}` plus alert bookkeeping), so a restart doesn't re-alert an incident.
 - Owner alerts: after ≥ 2 consecutive degraded evaluations (a reused, cached model probe doesn't count, so the model alerts after 2 failed probes), `channel.send(owner, "hey, some issues here: <check>: <detail>", dedupe_key="health:<check>:<window>")`, where `window = floor(epoch / 6h)`. One alert per incident, at most one per check per 6h. When an alerted incident clears: `"resolved: <check> is healthy again"` with `dedupe_key="health:<check>:<window>:resolved"`. A failed send is retried next round. Audited `health.alert` / `health.resolved` (`decision` `sent`, or `failed` once per streak of failed sends).
 - Texts and reasons are built by code from short details: URLs are replaced with `<url>`, details are capped (120 chars), and no secrets are included.
@@ -944,7 +973,8 @@ PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: Chan
 
 ```python
 build_imessage_stack(settings, conn, components, loop, *, daemon_healthy, model=None, osa_runner=None)
-    -> IMessageStack(channel, router, runner, reminders, monitor, model, owner, jobs)
+    -> IMessageStack(channel, router, runner, reminders, monitor, model, owner, jobs, notifier)
+route_event(router_route, notifier) -> router hook   # ext:* to Notifier.route, the rest to Router.route
 IMessageStack.start(loop) / .stop() / .aclose() / .running
 local_step_limit(model_cfg, tools: Iterable[ToolSpec] = ()) -> float   # chat tools; ext tools capped at 300s
 Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | None = None,
@@ -954,8 +984,8 @@ Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | No
 
 - **Gate.** Always `PolicyGate`, iMessage on or off. The startup log line includes `gate=policy dry_run=<bool>`. With `dry_run: true`, L0 reads (chat and the fast path) are allowed exactly as before.
 - **`channels.imessage.enabled: false`** (the default): the daemon is Phase 0 apart from the gate. `loop.router` is None, `loop.runners == {"echo"}`, `DaemonState.monitor` is None, and nothing imports the model client.
-- **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner(..., timezone=settings.timezone)`, then `loop.runners["local"]`, `max_step_s = local_step_limit`) and `ReminderRunner` (`runners["reminder"]`, see Reminders), sets `loop.router = router.route`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta)`, which becomes `DaemonState.monitor`. `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`; tests also pass `ops_runner=FakeOpsRunner()` (it goes to `build_components`).
-- **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`, then `ops.back_up`: `Back up (<commit>), down Ns` once after a requested restart, then `extensions.host.send_alerts`: queued tamper alerts to the owner, once each) before the loop, then the loop, the API, the monitor and the dead-man (with `monitor.deadman_reason`).
+- **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner(..., timezone=settings.timezone)`, then `loop.runners["local"]`, `max_step_s = local_step_limit`) and `ReminderRunner` (`runners["reminder"]`, see Reminders), builds the `Notifier` (same recipients as `JobRunner`, `config=extensions.notify`), sets `loop.router = route_event(router.route, notifier)`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta, ext_checks=ExtensionHealth(...))`, which becomes `DaemonState.monitor`. `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`; tests also pass `ops_runner=FakeOpsRunner()` (it goes to `build_components`).
+- **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`, then `ops.back_up`: `Back up (<commit>), down Ns` once after a requested restart, then `extensions.host.send_alerts`: queued tamper alerts to the owner, once each) before the loop, then the loop, the API, the monitor, the notifier's flush (`notifier.run()`) and the dead-man (with `monitor.deadman_reason`). `IMessageStack.stop` stops the flush with the monitor.
 - **Jobs.** `build_imessage_stack` also registers `JobRunner` as `runners["job"]` (recipients: `PolicyGate.approvers`). `Daemon.__init__` then builds the `Scheduler` (`channel` is the iMessage channel or None) and sets `loop.scheduler`; `Daemon.run` calls `scheduler.start()` before the loop. With iMessage off, L0 and core jobs still run, and a gated job task fails as `unknown runner`. The startup line includes `jobs=<count>`.
 - **Stop** (SIGTERM/SIGINT, or a component exiting): the API is told to exit; the monitor and the chat.db reader stop first, so no new events arrive; the scheduler's inline runs are cancelled (`aclose`); then the loop drains in-flight steps (10s grace; a draining step can still send its reply); then the model client closes and the store closes. Unfinished steps resume from their checkpoints on the next start, and the send dedupe key (`reply:<task id>`) prevents a double reply.
 
@@ -984,6 +1014,6 @@ All endpoints are loopback only. Remote status access is planned via the push-on
 | Endpoint | Returns |
 |---|---|
 | `GET /healthz` | `{"ok": true}` |
-| `GET /api/status` | version, uptime, last tick, dry_run, autonomy, paused, task counts by status and wait reason, `approvals_pending` (unexpired pending approvals, all approvers), in-flight count, `health: {model, imessage, loop, store}` each `{state: unknown\|ok\|degraded, since, detail, checked_at}` |
+| `GET /api/status` | version, uptime, last tick, dry_run, autonomy, paused, task counts by status and wait reason, `approvals_pending` (unexpired pending approvals, all approvers), in-flight count, `health: {model, imessage, loop, store, ext:<name>…}` each `{state: unknown\|ok\|degraded, since, detail, checked_at}` |
 | `GET /api/channels` | `[{name: "imessage", enabled, ok, last_read_at, last_selftest: {ok, at, detail} \| null}]`; `ok` and `last_read_at` are null without a live channel |
 | `GET /api/tools` | registered tool specs: `[{name, extension, effect, level, description, args_schema}]` (`level` is the effective level) |

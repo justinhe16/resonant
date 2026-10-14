@@ -14,7 +14,8 @@ The scheduler creates the task (``kind="job"``, ``wake_at`` = the due time, chec
    retries), then ``Wait("approval", wake_at=expires_at)``; an unanswered prompt expires
    and the next step gets ``Deny``. ``Deny``/``DryRun``: not run.
 5. **Finish**, in one transaction: ``record_run`` (``ok`` / ``failed`` / ``ambiguous``),
-   the run's redacted events (``scheduler.persist_events``), the audit row (``job.run``,
+   the run's redacted events (``scheduler.persist_events``; the job's first successful run
+   after install stores them as baseline, never notified), the audit row (``job.run``,
    ``job.failed``, ``job.ambiguous``, ``job.killed``, ``job.denied``, ``job.dry_run``,
    ``job.skipped_paused``) and ``checkpoint.finished``.
 6. **Reports** (code-built, sanitized) to every approver of the extension (the gate's
@@ -43,6 +44,7 @@ from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from resonant.executor import NotAllowedError, ToolResult, idempotency_key
+from resonant.extensions.notify import take_baseline
 from resonant.extensions.scheduler import (
     JOB_RUNNER,
     job_checkpoint,
@@ -249,7 +251,10 @@ class JobRunner:
                 )
             n = 0
             if result is not None and result.ok:
-                n = persist_events(self.conn, ext, result.events, trace_id=task.trace_id)
+                first = take_baseline(self.conn, ext, job_id)
+                n = persist_events(
+                    self.conn, ext, result.events, trace_id=task.trace_id, baseline=first
+                )
             action = {"ok": "job.run", "dry_run": "job.dry_run"}.get(outcome, f"job.{outcome}")
             audit(
                 self.conn,
