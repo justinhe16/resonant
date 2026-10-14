@@ -92,7 +92,7 @@ The first run after install is a baseline (as for notify): items are stored as t
 ### D4. The hourly pulse and the 08:00 briefing (`core/pulse`)
 - One core job, cron `0 * * * *` in `settings.timezone`, catch-up 50 minutes. It skips the briefing's hour (the briefing covers it), quiet hours, and paused.
 - Core items are refreshed in-process first:
-  - `core/health/<check>`: a degraded check (normal); cleared on recovery.
+  - Health stays with the monitor, which already alerts (no `core/health` items).
   - `core/approval/<code>`: an approval pending for `remention_after` (normal), one re-mention.
 - It collects untold `normal` and `urgent` items (the urgent ones were held), from extensions that aren't muted, and sends one message if there are any:
   ```

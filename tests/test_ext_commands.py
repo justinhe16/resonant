@@ -607,6 +607,7 @@ def test_list_extensions(ctx: BuiltinContext) -> None:
         "- nightly (L0) · next tomorrow 3:00am · never run",
         "core · built in",
         "- briefing (L0) · next tomorrow 8:00am · never run",
+        "- pulse (L0) · next 11:00am · never run",
     ]
 
 
@@ -621,19 +622,23 @@ def test_list_extensions_shows_core_briefing_from_config(ctx: BuiltinContext) ->
     # No extensions and no ext_jobs row yet: the briefing's next due comes from config.
     out = list_extensions(ctx)
     assert out["extensions"] == []
-    (job,) = out["core"]
+    job, pulse = out["core"]
+    assert (pulse["id"], pulse["schedule"], pulse["level"]) == ("pulse", "0 * * * *", "L0")
     assert (job["id"], job["schedule"], job["level"]) == ("briefing", "0 8 * * *", "L0")
     assert job["next_due_text"] == "tomorrow 8:00am" and job["last_outcome"] is None
     assert render_extensions(out).splitlines() == [
         "No extensions installed. On the Mini: resonant ext add repo:<name>",
         "core · built in",
         "- briefing (L0) · next tomorrow 8:00am · never run",
+        "- pulse (L0) · next 11:00am · never run",
     ]
     with transaction(ctx.conn):
         ext_store.record_run(ctx.conn, "core", "briefing", at=NOW, outcome="ok", ok=True)
-    (job,) = list_extensions(ctx)["core"]
+    job, _pulse = list_extensions(ctx)["core"]
     assert (job["last_outcome"], job["last_run_text"]) == ("ok", "10:30am")
     ctx.state.settings.briefing.enabled = False
+    assert [j["id"] for j in list_extensions(ctx)["core"]] == ["pulse"]
+    ctx.state.settings.pulse.enabled = False
     assert list_extensions(ctx)["core"] == []
 
 

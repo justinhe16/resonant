@@ -67,6 +67,7 @@ from resonant.extensions.briefing import JOB_ID as BRIEFING_JOB
 from resonant.extensions.host import ExtensionHealth, send_alerts
 from resonant.extensions.notify import Notifier
 from resonant.extensions.pulse import EVENT_TYPE, Pulse
+from resonant.extensions.pulse_job import JOB_ID as PULSE_JOB
 from resonant.extensions.scheduler import CoreDeps
 from resonant.gate import PolicyGate
 from resonant.gateway.imessage.channel import IMessageChannel
@@ -76,7 +77,7 @@ from resonant.models import ModelClient
 from resonant.monitor import HealthMonitor
 from resonant.ops import back_up
 from resonant.router import Router
-from resonant.router.fast_path import core_briefing
+from resonant.router.fast_path import core_briefing, core_pulse
 from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
 from resonant.runners.reminder import ReminderRunner
@@ -265,6 +266,9 @@ def build_imessage_stack(
     owner = components.principals.owner if components.principals_loaded else None
     # /ext run core/briefing (P3-14): the briefing on demand, through this channel.
     router.fast_path.core_jobs[BRIEFING_JOB] = core_briefing(
+        CoreDeps(settings, conn, components, channel, owner)
+    )
+    router.fast_path.core_jobs[PULSE_JOB] = core_pulse(
         CoreDeps(settings, conn, components, channel, owner)
     )
     monitor = HealthMonitor(

@@ -7,7 +7,8 @@
   level, next due time (from the manifest's cron, in the job's zone or ``settings.timezone``:
   an ``ext_jobs`` row exists only after the first due time), and the last run's outcome and
   fail streak from ``ext_jobs``. Manifest strings never appear, only names. ``core`` lists
-  the core jobs the same way (``core/briefing`` while ``briefing.enabled``).
+  the core jobs the same way (``core/briefing`` while ``briefing.enabled``, ``core/pulse``
+  while ``pulse.enabled``).
 - ``mute_extension`` (L3): ``{extension, until}`` holds that extension's notifications
   until ``until`` (ISO with an offset, in the future, at most 7 days ahead); ``{extension,
   off: true}`` lifts it, through the notifier's API (``notify.mute`` / ``notify.unmute``:
@@ -26,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from resonant.executor import ToolFailed, ToolHandler
-from resonant.extensions import briefing, notify
+from resonant.extensions import briefing, notify, pulse_job
 from resonant.extensions.cron import CronError, parse_schedule
 from resonant.monitor import health_snapshot
 from resonant.store import extensions as store
@@ -173,14 +174,20 @@ def _job(
 
 
 def _core_jobs(ctx: BuiltinContext, now: datetime) -> list[dict[str, Any]]:
-    """Core jobs (``ext="core"``): the briefing when ``briefing.enabled``, L0 in
-    ``settings.timezone``."""
+    """Core jobs (``ext="core"``): the briefing while ``briefing.enabled`` and the pulse
+    while ``pulse.enabled``, L0 in ``settings.timezone``."""
     settings = ctx.state.settings
-    if not settings.briefing.enabled:
-        return []
     tz = settings.timezone
-    state = store.get_job(ctx.conn, store.CORE_EXT, briefing.JOB_ID)
-    return [_job(briefing.JOB_ID, briefing.schedule(settings.briefing), tz, "L0", state, now, tz)]
+    out: list[dict[str, Any]] = []
+    if settings.briefing.enabled:
+        state = store.get_job(ctx.conn, store.CORE_EXT, briefing.JOB_ID)
+        out.append(
+            _job(briefing.JOB_ID, briefing.schedule(settings.briefing), tz, "L0", state, now, tz)
+        )
+    if settings.pulse.enabled:
+        state = store.get_job(ctx.conn, store.CORE_EXT, pulse_job.JOB_ID)
+        out.append(_job(pulse_job.JOB_ID, pulse_job.schedule(), tz, "L0", state, now, tz))
+    return out
 
 
 def mute_extension(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:

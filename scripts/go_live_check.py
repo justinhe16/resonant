@@ -263,6 +263,26 @@ def briefing_row(settings: Settings, now: datetime) -> Row:
     )
 
 
+def pulse_row(settings: Settings, now: datetime) -> Row:
+    """``core/pulse``: enabled, its next due time (hourly) and the quiet hours."""
+    from resonant.extensions import pulse_job
+    from resonant.extensions.cron import CronError, parse_schedule
+
+    cfg, tz = settings.pulse, settings.timezone
+    if not cfg.enabled:
+        return ("FAIL", False, "pulse scheduled", "pulse.enabled is false")
+    try:
+        at = parse_schedule(pulse_job.schedule(), tz).next_after(now)
+    except CronError as e:
+        return ("FAIL", True, "pulse scheduled", str(e))
+    return (
+        "PASS",
+        True,
+        "pulse scheduled",
+        f"hourly {tz}; quiet {cfg.quiet_hours}; next {_next_text(at, now, tz)}",
+    )
+
+
 def _keychain_exists(ref: str) -> bool:
     import asyncio
 
@@ -287,6 +307,7 @@ def phase3_rows(
         *secret_rows(records, exists),
         jobs_row(records, settings.timezone, now),
         briefing_row(settings, now),
+        pulse_row(settings, now),
     ]
 
 

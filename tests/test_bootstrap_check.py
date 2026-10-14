@@ -550,6 +550,14 @@ def test_jobs_and_briefing_rows_come_from_config(resonant_home: Path) -> None:
         "briefing scheduled",
         "daily 07:15 America/Los_Angeles; next tomorrow 7:15am",
     )
+    assert check.pulse_row(settings, NOW) == (
+        "PASS",
+        True,
+        "pulse scheduled",
+        "hourly America/Los_Angeles; quiet 00:00-06:00; next 11:00am",
+    )
+    off = load_settings(pulse={"enabled": False})
+    assert check.pulse_row(off, NOW) == ("FAIL", False, "pulse scheduled", "pulse.enabled is false")
     keychain = FakeKeychain(items={"demo/token": "a-secret-value-1", "demo/other": "b-value-22"})
     store = SecretStore(keychain)
 
@@ -567,5 +575,6 @@ def test_jobs_and_briefing_rows_come_from_config(resonant_home: Path) -> None:
         "secret demo/other",
         "extension jobs scheduled",
         "briefing scheduled",
+        "pulse scheduled",
     ]
     assert all(r[0] == "PASS" for r in rows), rows

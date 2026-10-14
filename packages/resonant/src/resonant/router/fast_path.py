@@ -66,6 +66,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from resonant import killswitch
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.extensions.briefing import run_briefing_now
+from resonant.extensions.pulse_job import run_pulse_now
 from resonant.gate import Allow, Decision, Intent, PendingApproval
 from resonant.models import SpanFactory
 from resonant.models.client import null_spans
@@ -563,6 +564,30 @@ def core_briefing(deps: CoreDeps) -> CoreRun:
 
     async def run() -> str:
         return briefing_reply(await run_briefing_now(deps))
+
+    return run
+
+
+PULSE_SENT = "Pulse sent."
+PULSE_NOTHING = "Nothing new to send."
+PULSE_PAUSED = "Paused: pulse not sent."
+
+
+def pulse_reply(result: Mapping[str, Any]) -> str:
+    """The reply to ``/ext run core/pulse`` from ``run_pulse_now``'s result."""
+    if result.get("sent") is True:
+        return PULSE_SENT
+    skipped = result.get("skipped")
+    if skipped == "paused":
+        return PULSE_PAUSED
+    return PULSE_NOTHING if skipped in ("nothing", "duplicate") else BRIEFING_UNREACHABLE
+
+
+def core_pulse(deps: CoreDeps) -> CoreRun:
+    """``/ext run core/pulse``: the pulse now (``pulse_job.run_pulse_now``)."""
+
+    async def run() -> str:
+        return pulse_reply(await run_pulse_now(deps))
 
     return run
 
