@@ -60,6 +60,7 @@ from typing import TYPE_CHECKING, Any
 
 from resonant import killswitch
 from resonant.executor import CallContext, ToolFailed
+from resonant.extensions.briefing import briefing_job
 from resonant.extensions.cron import (
     ON_TIME,
     CronError,
@@ -129,8 +130,8 @@ class CoreDeps:
 
 CoreJobFactory = Callable[[CoreDeps], CoreJob | None]
 
-# Built-in jobs, one factory each (P3-13 adds the briefing).
-CORE_JOBS: tuple[CoreJobFactory, ...] = ()
+# Built-in jobs, one factory each.
+CORE_JOBS: tuple[CoreJobFactory, ...] = (briefing_job,)
 
 
 @dataclass(frozen=True)
