@@ -540,7 +540,7 @@ resonant ext list | remove | reload`,
        scope_id?, hash = sha256(canonical(tool, extension, args, effect, level, commit))}
 Intent.for_tool(spec, …): effect/level come from the registered ToolSpec
 
-Intent.origin: explicit (router-parsed slash command) | inferred (model, jobs)
+Intent.origin: explicit (router-parsed slash command) | inferred (model) | scheduled (jobs)
 
 gate.evaluate(intent) -> Allow(token) | Deny(reason) | NeedsApproval(id, code, …)
                        | DryRun          # Veto(until): Phase 3, never returned now
@@ -548,9 +548,9 @@ gate.consume(token, intent.hash)        # single-use; executor checks it before 
 gate.resolve_reply(ApprovalReply)       # binds text replies by code
 
 L0 silent · L3 run + report
-L2 explicit: run + report · inferred: ask (plain yes)
+L2 explicit: run + report · inferred / scheduled: ask (plain yes)
 L1 always ask (yes <code>) · kill switch: everything above L0 asks`,
-    inv:["The level comes from the tool's registration","origin=explicit is set only by the local runner's direct_call path, which only the router's command parser writes","pay is always L1","No veto in Phase 2","dry_run is on by default in config"],
+    inv:["The level comes from the tool's registration","origin=explicit is set only by the local runner's direct_call path, which only the router's command parser writes","pay is always L1","scheduled is never explicit","Extension approvers = owner + manifest approvers holding the approve grant","No veto yet","dry_run is on by default in config"],
     files:["packages/resonant/src/resonant/gate/policy.py","packages/resonant/src/resonant/gate/types.py","packages/resonant/src/resonant/gate/replies.py"]},
   approvals:{label:"Approvals (text codes)", phase:"2", status:"built",
     what:"Approval requests go out as texts with a short code, and a reply binds to exactly one pending approval. Phase 2 uses a deterministic parser only; a classifier and batch approvals are deferred. See the Approval flow tab.",

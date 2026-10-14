@@ -131,6 +131,7 @@ class FakeChannel:
     refs: dict[str, MessageRef] = field(default_factory=dict[str, MessageRef])
     fail_send: list[BaseException] = field(default_factory=list[BaseException])
     fail_prompt: list[BaseException] = field(default_factory=list[BaseException])
+    unreachable: set[str] = field(default_factory=set[str])  # refused: no identity
 
     async def start(self, submit: Submit) -> None:
         pass
@@ -163,6 +164,8 @@ class FakeChannel:
         self.prompt_calls += 1
         if self.fail_prompt:
             raise self.fail_prompt.pop(0)
+        if principal in self.unreachable:
+            raise ChannelRefused(f"no imessage identity for {principal}")
         key = approval_dedupe_key(prompt.approval_id, principal)
         if key not in self.refs:
             self.prompts.append((principal, prompt.text()))
@@ -257,13 +260,16 @@ def make(db: sqlite3.Connection) -> Any:
         dry_run: bool = False,
         restart: ToolHandler | None = None,
         add_note: ToolHandler | None = None,
+        principals: Principals | None = None,
+        approvers_for: Callable[[str], list[str]] | None = None,
+        extra_specs: tuple[ToolSpec, ...] = (),
     ) -> Harness:
         clock = Clock()
-        principals = Principals(
+        principals = principals or Principals(
             principals={OWNER: Principal(role="owner", identities=("imessage:+15550000000",))}
         )
         registry = ToolRegistry()
-        for spec in (*notes.SPECS, TASK_COUNTS, RESTART_RESONANT, RESTART_OLLAMA):
+        for spec in (*notes.SPECS, TASK_COUNTS, RESTART_RESONANT, RESTART_OLLAMA, *extra_specs):
             registry.register(spec)
         tool_log: list[str] = []
 
@@ -292,6 +298,7 @@ def make(db: sqlite3.Connection) -> Any:
             dry_run=dry_run,
             approval_ttl_s=TTL_S,
             actions={(None, "clear_notes"): partial(notes.summary_action, db)},
+            approvers_for=approvers_for or (lambda _ext: []),
             clock=clock,
         )
         executor = Executor(db, gate, handlers)
@@ -867,3 +874,143 @@ async def test_replayed_restart_does_not_restart_twice(make: Any) -> None:
     assert h.executions(task_id) == 1
     assert h.task(task_id).checkpoint["reply"] == "Restarting Resonant…"
     assert h.channel.replies() == ["Restarting Resonant…"]  # deduped by reply:<task id>
+
+
+# --- extension approvers: send to every reachable approver ------------------------------
+
+MEMBER = "cofounder"
+ROTATE = ToolSpec(
+    name="rotate", effect=Effect.WRITE, level=Level.L2, source="ext:dori", extension="dori"
+)
+
+
+def team() -> Principals:
+    return Principals.model_validate(
+        {
+            "principals": {
+                OWNER: {"role": "owner", "identities": ["imessage:+15550000000"]},
+                MEMBER: {
+                    "identities": ["imessage:+15550000001"],
+                    "grants": {"dori": ["request", "approve"]},
+                },
+                "viewer": {
+                    "identities": ["imessage:+15550000002"],
+                    "grants": {"dori": ["request"]},
+                },
+            }
+        }
+    )
+
+
+def make_team(make: Any) -> Harness:
+    def manifest_approvers(_ext: str) -> list[str]:
+        # A granted member, a member without approve, and an unknown name.
+        return [MEMBER, "viewer", "ghost"]
+
+    return make(principals=team(), approvers_for=manifest_approvers, extra_specs=(ROTATE,))
+
+
+def rotate_call() -> dict[str, Any]:
+    call: dict[str, Any] = {
+        "tool": "rotate",
+        "extension": "dori",
+        "args": {},
+        "step_no": 0,
+        "call_index": 0,
+    }
+    return {"call": call}
+
+
+def unreachable_audits(h: Harness, task_id: str) -> list[str]:
+    rows = h.db.execute(
+        "SELECT requested_by FROM audit_log WHERE action = 'approval.unreachable' "
+        "AND task_id = ? ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    return [r["requested_by"] for r in rows]
+
+
+async def test_extension_approval_goes_to_every_granted_approver(make: Any) -> None:
+    h = make_team(make)
+    task_id = h.add_task(rotate_call())
+    await h.loop.run_until_idle()
+
+    assert h.task(task_id).status == "waiting"
+    (approval,) = h.approvals(task_id)
+    assert approval.approvers == (OWNER, MEMBER)  # viewer and ghost dropped
+    assert [p for p, _ in h.channel.prompts] == [OWNER, MEMBER]
+    assert {r.principal for r in approval.channel_refs} == {OWNER, MEMBER}
+    assert unreachable_audits(h, task_id) == []
+
+
+async def test_member_approver_can_approve(make: Any) -> None:
+    h = make_team(make)
+    task_id = h.add_task(rotate_call())
+    await h.loop.run_until_idle()
+    (approval,) = h.approvals(task_id)
+    assert [p.approval_id for p in h.gate.pending_for(MEMBER)] == [approval.id]
+    assert h.gate.pending_for("viewer") == ()
+
+    result = h.gate.resolve(ApprovalResolution(approval.id, True, MEMBER, "cli", "cli"))
+    assert result.ok, result.reason
+    assert h.task(task_id).status == "queued"
+
+
+async def test_one_unreachable_approver_is_skipped(make: Any) -> None:
+    h = make_team(make)
+    h.channel.unreachable.add(OWNER)
+    task_id = h.add_task(rotate_call())
+    await h.loop.run_until_idle()
+
+    assert h.task(task_id).status == "waiting"
+    assert [p for p, _ in h.channel.prompts] == [MEMBER]
+    (approval,) = h.approvals(task_id)
+    assert [r.principal for r in approval.channel_refs] == [MEMBER]
+    assert unreachable_audits(h, task_id) == [OWNER]
+
+
+async def test_no_reachable_approver_fails_for_good(make: Any) -> None:
+    h = make_team(make)
+    h.channel.unreachable.update({OWNER, MEMBER})
+    task_id = h.add_task(rotate_call())
+    await h.loop.run_until_idle()
+
+    t = h.task(task_id)
+    assert t.status == "failed" and t.error is not None and "no approver" in t.error
+    assert h.channel.prompts == []
+    assert unreachable_audits(h, task_id) == [OWNER, MEMBER]
+
+
+async def test_transient_failure_still_prompts_the_others_then_retries(make: Any) -> None:
+    h = make_team(make)
+    h.channel.fail_prompt.append(ChannelSendError("Messages is not running"))  # the owner's
+    task_id = h.add_task(rotate_call())
+    await h.loop.run_until_idle()
+
+    t = h.task(task_id)
+    assert t.status == "queued" and t.error is not None and "approval prompt" in t.error
+    assert [p for p, _ in h.channel.prompts] == [MEMBER]
+
+    h.skip_backoff(task_id)
+    await h.loop.run_until_idle()
+    assert h.task(task_id).status == "waiting"
+    assert [p for p, _ in h.channel.prompts] == [MEMBER, OWNER]  # the member's deduped
+    assert len(h.approvals(task_id)) == 1
+
+
+async def test_builtin_approvals_stay_owner_only(make: Any) -> None:
+    calls: list[str] = []
+
+    def approvers_for(ext: str) -> list[str]:
+        calls.append(ext)
+        return [MEMBER]
+
+    h: Harness = make(
+        FakeModel([tc("restart_resonant")]), principals=team(), approvers_for=approvers_for
+    )
+    task_id = h.add_task(chat("restart_resonant"))
+    await h.loop.run_until_idle()
+    (approval,) = h.approvals(task_id)
+    assert approval.approvers == (OWNER,)
+    assert [p for p, _ in h.channel.prompts] == [OWNER]
+    assert calls == []  # a builtin never consults a manifest
