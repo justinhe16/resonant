@@ -393,7 +393,7 @@ async def test_explicit_l2_runs_with_no_prompt(make: Any) -> None:
     h: Harness = make()
     task_id = h.add_task(direct("restart_resonant"), kind="command")
     await h.loop.run_until_idle()
-    assert h.channel.replies() == ["Done: restart resonant"]
+    assert h.channel.replies() == ["Done: restart Resonant"]
     assert h.channel.prompts == []
     assert h.tool_log == ["restart_resonant"]
     assert [(e["decision"], e["origin"]) for e in h.evaluations(task_id)] == [("Allow", "explicit")]
@@ -449,7 +449,7 @@ async def test_inferred_l2_asks_waits_until_expiry_then_runs_once_on_yes(make: A
     h.resolve(task_id, approved=True)
     await h.loop.run_until_idle()
     assert h.tool_log == ["restart_resonant"]
-    assert h.channel.replies() == ["Done: restart resonant"]  # templated: no model round
+    assert h.channel.replies() == ["Done: restart Resonant"]  # templated: no model round
     assert h.model.tool_calls_made == 1 and h.model.json_calls == []
     assert h.task(task_id).status == "done"
     assert [e["origin"] for e in h.evaluations(task_id)] == ["inferred", "inferred"]
@@ -481,7 +481,7 @@ async def test_expiry_wakes_the_task_and_says_so(make: Any) -> None:
 
     h.clock.advance(1)
     await h.loop.run_until_idle()
-    assert h.channel.replies() == ["Not done: the approval for restart resonant expired."]
+    assert h.channel.replies() == ["Not done: the approval for restart Resonant expired."]
     assert h.tool_log == []
     assert h.approvals(task_id)[0].status == "expired"
 
@@ -636,7 +636,7 @@ async def test_definite_failure_is_reported_not_retried(make: Any) -> None:
     h: Harness = make(restart=fails)
     task_id = h.add_task(direct("restart_resonant"), kind="command")
     await h.loop.run_until_idle()
-    assert h.channel.replies() == ["Failed: restart resonant (launchctl exited 5)"]
+    assert h.channel.replies() == ["Failed: restart Resonant (launchctl exited 5)"]
     assert h.task(task_id).status == "done"
 
 
@@ -768,7 +768,7 @@ def test_refusal_and_dry_run_templates() -> None:
     restart = _intent(RESTART_RESONANT)
     assert refusal_reply(restart, Deny(NOT_APPROVED)) == "Not done."
     assert refusal_reply(restart, Deny(APPROVAL_EXPIRED)) == (
-        "Not done: the approval for restart resonant expired."
+        "Not done: the approval for restart Resonant expired."
     )
     assert refusal_reply(restart, Deny(APPROVAL_USED)) == (
         "Not done: that approval was already used."

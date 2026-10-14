@@ -349,7 +349,7 @@ def test_resolve(text: str, expected: Resolved) -> None:
 def test_remind(text: str, at: str, body: str) -> None:
     sub, tool, args = resolve(text)
     assert (sub, tool) == (None, "add_reminder")
-    assert args == {"at": at, "text": body}
+    assert args == {"at": at, "text": body, "routed_at": CTX.now.isoformat()}
     parsed = datetime.fromisoformat(args["at"])
     assert parsed.utcoffset() is not None and parsed > CTX.now
 

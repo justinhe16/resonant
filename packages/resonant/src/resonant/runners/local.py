@@ -75,7 +75,7 @@ from resonant.executor import NotAllowedError, ToolResult, idempotency_key
 from resonant.gate import Allow, Decision, Deny, DryRun, Intent, NeedsApproval, canonical_json
 from resonant.gate.codes import clean_external
 from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
-from resonant.gate.summary import summarize as summarize_intent
+from resonant.gate.summary import summarize as summarize_args
 from resonant.gateway.channel import ApprovalPrompt, Channel, ChannelError, ChannelRefused
 from resonant.loop.types import Done, Fail, StepContext, StepOutcome, Task, Wait
 from resonant.models import (
@@ -99,6 +99,7 @@ from resonant.store import approvals as ap
 from resonant.store.db import transaction, utcnow
 from resonant.store.tasks import get_event, get_task, principal_thread
 from resonant.tools import ToolRegistry
+from resonant.tools.ops import summary_action as ops_action
 from resonant_sdk import Effect, Event, ToolSpec
 
 log = logging.getLogger(__name__)
@@ -312,6 +313,12 @@ def _updated(d: dict[str, Any]) -> str | None:
             "Fix it on the Mini."
         )
     return None
+
+
+def summarize_intent(intent: Intent) -> str:
+    """The code-built phrase for ``intent`` in replies: the ops heading (``update Resonant``)
+    when there is one, as in approval prompts and dry-run replies, else the generic summary."""
+    return summarize_args(intent, action=ops_action(intent))
 
 
 # Code-built report lines for builtin side effects, keyed by tool name. Anything else

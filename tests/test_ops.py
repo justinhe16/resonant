@@ -344,7 +344,7 @@ def test_report_lines() -> None:
     same = {"old": "a1b2c3d", "new": "a1b2c3d", "updated": False, "restarting": False}
     assert report_line(upd, same) == "Already up to date (a1b2c3d)."
     # An unrecognized result falls back to the summary.
-    assert report_line(intent(RESTART_RESONANT), {}) == "Done: restart resonant"
+    assert report_line(intent(RESTART_RESONANT), {}) == "Done: restart Resonant"
 
 
 def make_gate(db: sqlite3.Connection, *, dry_run: bool) -> PolicyGate:

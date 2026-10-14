@@ -10,12 +10,19 @@ task checkpoint as ``n`` with ``text`` and ``at`` (ISO, UTC). Handlers don't see
 requester; the gate lets only the owner call global builtins, so reminders belong to the
 owner. ``at`` comes in as an ISO-8601 datetime with an offset: from the model, or from the
 ``/remind`` parser (``tools/when.py``).
+
+``/remind`` also passes ``routed_at``, the time the router resolved ``<when>`` against, and
+``at`` is checked against that instead of the handler's clock: the command task may run
+late (a busy loop, a restart before it ran), and ``/remind now x`` or ``in 1 min`` must not
+fail as "passed" because of it. A reminder that is due by then fires at once, marked late.
+``routed_at`` is not in the args schema, so the model can't send it (its calls are
+validated against the schema); it must not be in the future or more than a day old.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from resonant.executor import ToolFailed, ToolHandler
@@ -31,6 +38,8 @@ RUNNER = "reminder"
 TEXT_MAX = 200
 LIST_MAX = 50
 SEQ_KEY = "reminders.seq"
+ROUTED_MAX_AGE = timedelta(days=1)
+ROUTED_SKEW = timedelta(seconds=60)
 
 ADD_REMINDER = ToolSpec(
     name="add_reminder",
@@ -90,13 +99,30 @@ def _text(value: Any) -> str:
     return text
 
 
-def _at(value: Any, now: datetime) -> datetime:
+def _iso(name: str, value: Any) -> datetime:
     if not isinstance(value, str):
-        raise ToolFailed("at must be an ISO-8601 datetime string")
+        raise ToolFailed(f"{name} must be an ISO-8601 datetime string")
     try:
-        at = datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(value)
     except ValueError:
-        raise ToolFailed("at must be an ISO-8601 datetime with a UTC offset") from None
+        raise ToolFailed(f"{name} must be an ISO-8601 datetime with a UTC offset") from None
+    if dt.utcoffset() is None:
+        raise ToolFailed(f"{name} needs a UTC offset")
+    return dt
+
+
+def _reference(value: Any, now: datetime) -> datetime:
+    """What ``at`` is checked against: ``now``, or a ``/remind`` command's ``routed_at``."""
+    if value is None:
+        return now
+    routed = _iso("routed_at", value)
+    if routed > now + ROUTED_SKEW or now - routed > ROUTED_MAX_AGE:
+        raise ToolFailed("routed_at is out of range")
+    return min(routed, now)
+
+
+def _at(value: Any, now: datetime) -> datetime:
+    at = _iso("at", value)
     try:
         check_at(at, now=now)
     except WhenError as e:
@@ -123,10 +149,10 @@ def _view(row: sqlite3.Row, now: datetime, tz: str) -> dict[str, Any]:
 def add_reminder(
     conn: sqlite3.Connection, args: dict[str, Any], *, owner: str, now: datetime, tz: str
 ) -> dict[str, Any]:
-    _check_keys(args, {"at", "text"})
+    _check_keys(args, {"at", "text", "routed_at"})
     if "at" not in args or "text" not in args:
         raise ToolFailed("add_reminder needs at and text")
-    at = _at(args["at"], now)
+    at = _at(args["at"], _reference(args.get("routed_at"), now))
     text = _text(args["text"])
     with atomic(conn):
         seq = kv_get(conn, SEQ_KEY, 0)

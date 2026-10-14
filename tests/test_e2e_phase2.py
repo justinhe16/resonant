@@ -631,7 +631,7 @@ async def test_e9_update_refuses_a_dirty_tree(resonant_home: Path, chat: FakeCha
         resonant_home, chat, ops_runner=ops, dry_run=False, ops={"uv_path": "/opt/uv/bin/uv"}
     ) as r:
         assert await r.say("/update") == [
-            "Failed: update resonant (working tree has changes; not updating)"
+            "Failed: update Resonant (working tree has changes; not updating)"
         ]
         assert not any(argv[:2] == (GIT, "pull") for argv in r.ops.argvs())
         assert r.ops.spawned == []

@@ -141,12 +141,18 @@ def unremind_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
 
 def remind_args(rest: str, ctx: ParseContext) -> dict[str, Any]:
     """``/remind <when> <text>``: the longest leading words that parse as a time
-    (``tools/when.py``, in the owner's zone), then the text. ``at`` is ISO with an offset."""
+    (``tools/when.py``, in the owner's zone), then the text. ``at`` is ISO with an offset;
+    ``routed_at`` is the time it was resolved against, so a late-running task still takes
+    it (``tools/reminders.py``)."""
     try:
         at, text = split_when(rest, now=ctx.now, tz=ctx.tz)
     except WhenError as e:
         raise UsageError(str(e)) from None
-    return {"at": at.isoformat(), "text": _text(text, REMINDER_TEXT_MAX)}
+    return {
+        "at": at.isoformat(),
+        "text": _text(text, REMINDER_TEXT_MAX),
+        "routed_at": ctx.now.isoformat(),
+    }
 
 
 def logs_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
