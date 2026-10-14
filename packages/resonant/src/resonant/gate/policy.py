@@ -153,9 +153,10 @@ class PolicyGate:
 
     def _decide(self, intent: Intent, now: datetime, autonomy: bool) -> Decision:
         if self.registry.get(intent.extension, intent.tool) != intent.spec:
-            return Deny(f"tool {intent.tool!r} is not registered with this spec")
+            # Static reasons: the audit row already names the tool, extension and principal.
+            return Deny("tool is not registered with this spec")
         if not self.principals.can(intent.principal, "request", intent.extension):
-            return Deny(f"{intent.principal} may not request {intent.extension or 'global'}")
+            return Deny("not permitted to request this tool")
         unsafe = unsafe_args(intent.args)
         if unsafe:
             # Never echo the offending keys or values: they are what's unsafe to show.
@@ -257,7 +258,9 @@ class PolicyGate:
                     decided_by=resolution.actor,
                     now=now,
                 )
-            result = ResolveResult(ok=False, reason=reason)
+            # A non-approver can't tell an existing approval from a missing one.
+            shown = "not_found" if reason == "not an approver" else reason
+            result = ResolveResult(ok=False, reason=shown)
             if reason is None and approval is not None:
                 done = ap.get_approval(self.conn, approval.id)
                 assert done is not None
@@ -272,7 +275,10 @@ class PolicyGate:
                 tool=approval.tool if approval else None,
                 extension=approval.extension if approval else None,
                 intent_hash=approval.intent_hash if approval else None,
-                decision="approved" if resolution.approved else "rejected",
+                decision=("approved" if resolution.approved else "rejected")
+                if result.ok
+                else "refused",
+                requested="approve" if resolution.approved else "deny",
                 approval_id=resolution.approval_id,
                 actor_identity=resolution.actor_identity,
                 path=resolution.path,

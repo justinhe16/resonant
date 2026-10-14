@@ -465,7 +465,7 @@ def test_resolve_checks_approver_and_wakes_the_task(
     repo.set_status(db, task_id, "waiting", wait_reason="approval", wake_at=asked.expires_at)
 
     nope = gate.resolve(ApprovalResolution(asked.approval_id, True, "cofounder", "x", "cli"))
-    assert not nope.ok and nope.reason == "not an approver"
+    assert not nope.ok and nope.reason == "not_found"  # same answer as a missing id
     missing = gate.resolve(ApprovalResolution("nope", True, "justin", "cli", "cli"))
     assert not missing.ok and missing.reason == "not_found"
 
@@ -476,7 +476,9 @@ def test_resolve_checks_approver_and_wakes_the_task(
     assert [(e.source, e.type) for e in events] == [("gate", "approval.reply")]
     again = gate.resolve(ApprovalResolution(asked.approval_id, True, "justin", "cli", "cli"))
     assert not again.ok and again.reason == "already_resolved"
-    assert len(audits(db, "approval.resolve")) == 4
+    rows = audits(db, "approval.resolve")
+    assert [r["decision"] for r in rows] == ["refused", "refused", "approved", "refused"]
+    assert json.loads(rows[0]["detail"])["reason"] == "not an approver"
 
 
 def test_reply_binding_and_batches_are_not_here_yet(gate: PolicyGate) -> None:

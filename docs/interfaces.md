@@ -196,8 +196,9 @@ STORE_INTERNAL_TOOLS, is_store_internal(spec)             # resonant.tools
   - Approved and unused: `Allow(token, approval_id)`.
   - Any rejected approval for the intent: `Deny(NOT_APPROVED)`, even if the table would now Allow (the owner's "no" holds for that intent).
   - Expired: `Deny(APPROVAL_EXPIRED)`. Used: `Deny(APPROVAL_USED)`; a used approval never yields another Allow.
+  - So an intent gets at most one approval per task: after it expires, is rejected or is used, the gate never re-asks (one gated side effect per local task). A retry needs a new task.
 - **Lazy expiry:** `evaluate`, `pending_for` and `resolve` first run `expire_due(now)`. The waiting task's `wake_at = expires_at` is the backstop that wakes it.
-- `resolve(resolution)` (CLI, button): the actor must be in `approvers` and hold `approve`; then `store.approvals.resolve` and `wake_resolved` in one transaction, audited `approval.resolve`. Refusal reasons: `not_found`, `not an approver`, or the store's reason.
+- `resolve(resolution)` (CLI, button): the actor must be in `approvers` and hold `approve`; then `store.approvals.resolve` and `wake_resolved` in one transaction, audited `approval.resolve`. Refusal reasons: `not_found` (also for a non-approver, so ids aren't confirmed; the audit row says `not an approver`) or the store's reason. A refused attempt is audited `decision="refused"`. This authenticated path approves L1 without typing the code.
 - `resolve_reply` returns `ResolveResult(ok=False)` until text-reply binding lands (sent-before rule, single pending, per-event idempotency). `open_batch` raises `NotImplementedError` (deferred).
 - `pending_for(principal)` lists unexpired pending approvals as `PendingApproval`.
 
