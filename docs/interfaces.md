@@ -397,7 +397,8 @@ A reminder is a durable queued task; there is no scheduler.
 - **Firing.** `ReminderRunner(conn, *, channel, timezone, clock=utcnow, max_step_s=30.0)` (`name="reminder"`, `uses_claude_slot=False`, no model, no tools). One step sends `⏰ <text>` with `channel.send(principal, …, dedupe_key=f"reminder:{task.id}")` and returns `Done({late, late_s})`. More than 120s past `at`, the text ends `(late, due 3:00pm)`. `ChannelRefused` or a malformed checkpoint is a final `Fail`; any other `ChannelError` is retryable, and the dedupe key prevents a double send. The send is the deferred effect of an allowed `add_reminder`, so it doesn't go through the gate. Span `runner.reminder.send` (`late`, `ok`), never the text.
 - **Durability.** The `tasks` row is the reminder. `requeue_interrupted` touches only running tasks, so a queued reminder survives any restart, and one missed while the daemon was down fires once on start, marked late.
 - **Precision.** The loop sleeps until the next `wake_at` (Runner, guarantee 7).
-- **Wiring.** The daemon registers `ReminderRunner` with `timezone=settings.timezone` (P2-9).
+- **Wiring.** `build_imessage_stack` registers `ReminderRunner(conn, channel=<the iMessage channel>, timezone=settings.timezone)` as `runner="reminder"` (in `loop.runners` and `components.runners`). `add_reminder` only runs inside the loop (router or runner step); the loop ticks after every step and sleeps until the next `wake_at`, so a new reminder needs no extra wakeup.
+- **iMessage disabled.** No reminder runner exists, and nothing can create a reminder (no router, no local runner). A reminder left from an earlier run stays queued until due, then fails as `unknown runner 'reminder'`: it couldn't be delivered.
 
 **Time parser** (`tools/when.py`, pure, stdlib `zoneinfo`, an explicit aware `now` and the zone):
 
@@ -416,12 +417,13 @@ format_due(at, *, now, tz) -> str                    # 3:00pm | tomorrow 3:00pm 
 
 ```python
 build_components(settings, conn, state: DaemonState) -> Components
-Components(registry, principals, gate: DryRunGate, executor, handlers, principals_loaded=True,
+Components(registry, principals, gate: Gate, executor, handlers, principals_loaded=True,
            runners: dict[str, Runner] = {})
     .register_local_runner(conn, *, model: ModelClient, channel: Channel) -> LocalRunner
 ```
 
 - `Daemon.__init__` calls it once and sets `DaemonState.components`.
+- `gate` is `PolicyGate(conn, principals, registry, dry_run=settings.dry_run, approval_ttl_s=settings.gate.approval_ttl_s, actions=summary_actions(conn))`. `summary_actions` maps `(None, "clear_notes")` to the notes hook (`delete all 4 notes`). `DryRunGate` stays as a test double.
 - If `principals.yaml` is missing, it logs a warning and uses an identity-less stand-in owner, so no channel identity resolves and every channel request is denied (`principals_loaded=False`). An invalid file is an error.
 - New fields (runners, channels, ...) get defaults so existing callers keep working.
 - `register_local_runner` builds `LocalRunner` from the components' gate, executor and registry and adds it to `runners["local"]`. The daemon builds the model client and channel (the channel needs `principals`), so it calls this after `build_components`.
@@ -607,14 +609,15 @@ Failures: `ModelUnavailableError` sends one templated fallback (the report line 
 
 ```python
 build_imessage_stack(settings, conn, components, loop, *, daemon_healthy, model=None, osa_runner=None)
-    -> IMessageStack(channel, router, runner, monitor, model)
+    -> IMessageStack(channel, router, runner, reminders, monitor, model)
 IMessageStack.start(loop) / .stop() / .aclose() / .running
 local_step_limit(model_cfg) -> float
 Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | None = None)
 ```
 
-- **`channels.imessage.enabled: false`** (the default): the daemon is exactly Phase 0. `loop.router` is None, `loop.runners == {"echo"}`, `DaemonState.monitor` is None, and nothing imports the model client.
-- **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner`, then `loop.runners["local"]`, `max_step_s = local_step_limit`), sets `loop.router = router.route`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta)`, which becomes `DaemonState.monitor`. `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`.
+- **Gate.** Always `PolicyGate`, iMessage on or off. The startup log line includes `gate=policy dry_run=<bool>`. With `dry_run: true`, L0 reads (chat and the fast path) are allowed exactly as before.
+- **`channels.imessage.enabled: false`** (the default): the daemon is Phase 0 apart from the gate. `loop.router` is None, `loop.runners == {"echo"}`, `DaemonState.monitor` is None, and nothing imports the model client.
+- **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner`, then `loop.runners["local"]`, `max_step_s = local_step_limit`) and `ReminderRunner` (`runners["reminder"]`, see Reminders), sets `loop.router = router.route`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta)`, which becomes `DaemonState.monitor`. `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`.
 - **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`) before the loop, then the loop, the API, the monitor and the dead-man (with `monitor.deadman_reason`).
 - **Stop** (SIGTERM/SIGINT, or a component exiting): the API is told to exit; the monitor and the chat.db reader stop first, so no new events arrive; then the loop drains in-flight steps (10s grace; a draining step can still send its reply); then the model client closes and the store closes. Unfinished steps resume from their checkpoints on the next start, and the send dedupe key (`reply:<task id>`) prevents a double reply.
 
@@ -641,6 +644,6 @@ All endpoints are loopback only. Remote status access is planned via the push-on
 | Endpoint | Returns |
 |---|---|
 | `GET /healthz` | `{"ok": true}` |
-| `GET /api/status` | version, uptime, last tick, dry_run, autonomy, paused, task counts by status and wait reason, in-flight count, `health: {model, imessage, loop, store}` each `{state: unknown\|ok\|degraded, since, detail, checked_at}` |
+| `GET /api/status` | version, uptime, last tick, dry_run, autonomy, paused, task counts by status and wait reason, `approvals_pending` (unexpired pending approvals, all approvers), in-flight count, `health: {model, imessage, loop, store}` each `{state: unknown\|ok\|degraded, since, detail, checked_at}` |
 | `GET /api/channels` | `[{name: "imessage", enabled, ok, last_read_at, last_selftest: {ok, at, detail} \| null}]`; `ok` and `last_read_at` are null without a live channel |
 | `GET /api/tools` | registered tool specs: `[{name, extension, effect, level, description, args_schema}]` (`level` is the effective level) |

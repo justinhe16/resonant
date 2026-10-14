@@ -220,6 +220,15 @@ def pending_for(conn: sqlite3.Connection, principal: str, now: datetime) -> list
     return [_row_to_approval(r) for r in rows]
 
 
+def count_pending(conn: sqlite3.Connection, now: datetime) -> int:
+    """Unexpired pending approvals, for every approver (``/api/status``)."""
+    r = conn.execute(
+        "SELECT COUNT(*) AS n FROM approvals WHERE status = 'pending' AND expires_at > ?",
+        (iso(now),),
+    ).fetchone()
+    return int(r["n"])
+
+
 def open_at(conn: sqlite3.Connection, principal: str, at: datetime) -> list[Approval]:
     """Approvals ``principal`` is an approver for that were open (created, undecided and
     unexpired) at time ``at``, whatever their status now. Oldest first.

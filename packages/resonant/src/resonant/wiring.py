@@ -1,4 +1,4 @@
-"""Phase 1 composition: the iMessage channel, router, local runner and health monitor.
+"""iMessage composition: the channel, router, local and reminder runners, and health monitor.
 
 ``build_imessage_stack`` is the one place these are wired together. The daemon calls it when
 ``channels.imessage.enabled`` is true; ``resonant bench e2e`` and the end-to-end tests call
@@ -19,6 +19,14 @@ that would cancel a slow-but-healthy step before the model client's own timeout 
 it into the templated fallback reply. So the step limit is derived from the model timeout
 (``local_step_limit``): the model client times out first and the user always gets an
 answer; the loop's stuck check stays a backstop for a wedged step.
+
+Reminders. ``runner="reminder"`` sends due reminders through the iMessage channel, so it is
+registered here, not in Phase 0. ``add_reminder`` only runs inside the loop (the router or a
+runner step). The loop ticks again after every step and then sleeps only until the earliest
+queued ``wake_at`` (``Loop.wait_s``), so a new reminder fires on time with no extra nudge.
+With iMessage disabled no reminder runner exists: nothing can create a reminder, and one
+left over from an earlier run fails as ``unknown runner`` once it is due (it couldn't be
+delivered anyway). Reminders not yet due stay queued.
 """
 
 from __future__ import annotations
@@ -37,6 +45,7 @@ from resonant.models import ModelClient
 from resonant.monitor import HealthMonitor
 from resonant.router import Router
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
+from resonant.runners.reminder import ReminderRunner
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +62,7 @@ class IMessageStack:
     channel: IMessageChannel
     router: Router
     runner: LocalRunner
+    reminders: ReminderRunner
     monitor: HealthMonitor
     model: ModelClient
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
@@ -94,12 +104,13 @@ def build_imessage_stack(
     model: ModelClient | None = None,
     osa_runner: OsaRunner | None = None,
 ) -> IMessageStack:
-    """Build the channel, router, local runner and monitor, and hook them into ``loop``.
+    """Build the channel, router, runners and monitor, and hook them into ``loop``.
 
-    Sets ``loop.router`` to ``Router.route`` and registers ``runner="local"`` in both
-    ``components.runners`` and ``loop.runners``. ``model`` defaults to an ``OllamaClient``
-    over ``settings.model`` (closed by :meth:`IMessageStack.aclose`); ``osa_runner``
-    defaults to the real osascript runner. Tests and the e2e bench inject fakes for both.
+    Sets ``loop.router`` to ``Router.route`` and registers ``runner="local"`` and
+    ``runner="reminder"`` in both ``components.runners`` and ``loop.runners``. ``model``
+    defaults to an ``OllamaClient`` over ``settings.model`` (closed by
+    :meth:`IMessageStack.aclose`); ``osa_runner`` defaults to the real osascript runner.
+    Tests and the e2e bench inject fakes for both.
     """
     close_model: Callable[[], Awaitable[None]] | None = None
     if model is None:
@@ -123,6 +134,9 @@ def build_imessage_stack(
     runner = components.register_local_runner(conn, model=model, channel=channel)
     runner.max_step_s = local_step_limit(settings.model)
     loop.runners[runner.name] = runner
+    reminders = ReminderRunner(conn, channel=channel, timezone=settings.timezone)
+    components.runners[reminders.name] = reminders
+    loop.runners[reminders.name] = reminders
     loop.router = router.route
 
     owner = components.principals.owner if components.principals_loaded else None
@@ -139,6 +153,7 @@ def build_imessage_stack(
         channel=channel,
         router=router,
         runner=runner,
+        reminders=reminders,
         monitor=monitor,
         model=model,
         _close_model=close_model,
