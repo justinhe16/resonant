@@ -15,7 +15,8 @@ Lifecycle (the daemon drives it)::
 
 Step limit. ``LocalRunner`` defaults to ``max_step_s=30`` but one step can make up to
 ``MAX_TOOL_ITERATIONS + 1`` model calls of ``model.timeout_s`` (60s) each, or run one tool
-for up to its ``timeout_s`` (``update_resonant``: 360s). A step limit below either would
+for up to its ``timeout_s`` (``update_resonant``: 360s; an extension tool at most 300s; job
+specs never run in a chat step, so they don't count). A step limit below either would
 cancel a slow-but-healthy step: before the model client's own timeout could turn it into the
 templated fallback reply, or mid-``/update`` into an ambiguous outcome. So the step limit is
 the larger of the two plus slack (``local_step_limit``): the model client and the executor
@@ -24,6 +25,8 @@ for a wedged step.
 
 Back up. After a restart the owner asked for (``restart_resonant``, ``update_resonant``),
 ``IMessageStack.start`` sends ``Back up (<commit>), down Ns`` once (``resonant.ops.back_up``).
+Then it sends any queued extension alerts to the owner (``extensions.host.send_alerts``:
+``example changed on disk since you approved it; disabled. …``), once each.
 
 Reminders. ``runner="reminder"`` sends due reminders through the iMessage channel, so it is
 registered here, not in Phase 0. ``add_reminder`` only runs inside the loop (the router or a
@@ -43,6 +46,7 @@ from dataclasses import dataclass, field
 
 from resonant.components import Components
 from resonant.config import ModelConfig, Settings
+from resonant.extensions.host import send_alerts
 from resonant.gateway.imessage.channel import IMessageChannel
 from resonant.gateway.imessage.sender import OsaRunner
 from resonant.loop import Loop
@@ -53,6 +57,7 @@ from resonant.router import Router
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
 from resonant.runners.reminder import ReminderRunner
 from resonant_sdk import ToolSpec
+from resonant_sdk.manifest import TOOL_TIMEOUT_MAX_S
 
 log = logging.getLogger(__name__)
 
@@ -62,9 +67,16 @@ STEP_SLACK_S = 15.0  # sends, tool reads and bookkeeping on top of the model cal
 def local_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> float:
     """``max_step_s`` for the local runner: every model call it may make, or the longest
     tool timeout (so ``/update`` is never cancelled mid-run), whichever is larger, plus
-    slack."""
+    slack. Pass chat tools only (``Components.chat_specs()``: no job specs); an extension
+    tool counts at most ``TOOL_TIMEOUT_MAX_S`` (300s)."""
     model_s = (MAX_TOOL_ITERATIONS + 1) * model.timeout_s
-    tool_s = max((t.timeout_s for t in tools), default=0.0)
+    tool_s = max(
+        (
+            t.timeout_s if t.extension is None else min(t.timeout_s, TOOL_TIMEOUT_MAX_S)
+            for t in tools
+        ),
+        default=0.0,
+    )
     return max(model_s, tool_s) + STEP_SLACK_S
 
 
@@ -96,6 +108,11 @@ class IMessageStack:
                 log.info("sent back-up message after a requested restart")
         except Exception:
             log.exception("back-up message failed")  # never blocks the start
+        try:
+            if sent := await send_alerts(self.channel.conn, self.channel, self.owner):
+                log.info("sent %d extension alert(s)", sent)
+        except Exception:
+            log.exception("extension alerts failed")  # never blocks the start
 
     async def stop(self) -> None:
         """Stop the monitor and the reader. Safe to call twice or before ``start``."""
@@ -153,7 +170,7 @@ def build_imessage_stack(
     runner = components.register_local_runner(
         conn, model=model, channel=channel, timezone=settings.timezone
     )
-    runner.max_step_s = local_step_limit(settings.model, components.registry.specs())
+    runner.max_step_s = local_step_limit(settings.model, components.chat_specs())
     loop.runners[runner.name] = runner
     reminders = ReminderRunner(conn, channel=channel, timezone=settings.timezone)
     components.runners[reminders.name] = reminders

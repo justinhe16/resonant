@@ -36,9 +36,11 @@ from resonant.observability import configure_logging
 from resonant.store.db import open_db, utcnow
 
 if TYPE_CHECKING:
+    from resonant.extensions.process import ExtRunner
     from resonant.gateway.imessage.sender import OsaRunner
     from resonant.models import ModelClient
     from resonant.ops import OpsRunner
+    from resonant.secrets import SecretStore
     from resonant.wiring import IMessageStack
 
 log = logging.getLogger(__name__)
@@ -60,11 +62,14 @@ class Daemon:
         model: ModelClient | None = None,
         osa_runner: OsaRunner | None = None,
         ops_runner: OpsRunner | None = None,
+        secrets: SecretStore | None = None,
+        ext_runner: ExtRunner | None = None,
     ) -> None:
         """``model`` and ``osa_runner`` replace Ollama and osascript (tests, ``bench e2e``).
 
         They are used only when ``channels.imessage.enabled`` is true. ``ops_runner``
-        replaces the ops tools' subprocesses (git, uv, launchctl).
+        replaces the ops tools' subprocesses (git, uv, launchctl); ``secrets`` and
+        ``ext_runner`` replace the Keychain and the extension process runner.
         """
         self.settings = settings
         self.conn = open_db(settings.db_path)
@@ -76,7 +81,12 @@ class Daemon:
         )
         self.state = DaemonState(settings, self.conn, self.loop, started_at=utcnow())
         self.state.components = build_components(
-            settings, self.conn, self.state, ops_runner=ops_runner
+            settings,
+            self.conn,
+            self.state,
+            ops_runner=ops_runner,
+            secrets=secrets,
+            ext_runner=ext_runner,
         )
         self.imessage: IMessageStack | None = None
         if settings.channels.imessage.enabled:
@@ -156,12 +166,15 @@ class Daemon:
             aux.append(asyncio.create_task(monitor.run(), name="health-monitor"))
         watchdog = Watchdog(self.heartbeat, self.settings.health.watchdog_stale_s)
         watchdog.start()
+        host = self.state.components.extensions if self.state.components else None
         log.info(
-            "resonant daemon started (api %s:%s, gate=policy dry_run=%s, imessage=%s)",
+            "resonant daemon started (api %s:%s, gate=policy dry_run=%s, imessage=%s, "
+            "extensions=%d)",
             self.settings.api.host,
             self.settings.api.port,
             self.settings.dry_run,
             "on" if self.imessage is not None else "off",
+            0 if host is None else len(host.loaded),
         )
         done, _ = await asyncio.wait(
             {loop_task, server_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
