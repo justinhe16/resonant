@@ -2,7 +2,7 @@
 
 An extension teaches Resonant about one product or domain, such as a trading bot, an on-call rotation, or a home lab, without changing the core. It is usually its own repo containing a `resonant.yaml` manifest and the scripts or servers the manifest points at. The core never imports extension code. It reads the manifest, runs your commands as separate processes, and enforces policy around them.
 
-> **Status.** The manifest schema is v1, with Phase 3's additive fields (job effects and levels, `catchup`, `description`, `examples`). `resonant ext validate` works today. Registration (`resonant ext add`), scheduling, tool exposure and notifications are built in Phase 3. This guide describes the full contract so you can write extensions now.
+> **Status.** The manifest schema is v1, with Phase 3's additive fields (job effects and levels, `catchup`, `description`, `examples`). `resonant ext validate` and `resonant ext add|update|remove|list` work today. Scheduling, tool exposure and notifications are built in Phase 3. This guide describes the full contract so you can write extensions now.
 >
 > **Phase 3 extensions are first-party, owner-installed code** from this repo or a local git work tree. They run as the owner's macOS user. See [phase3-plan.md](phase3-plan.md) D13.
 
@@ -33,7 +33,7 @@ See [`extensions/example`](../extensions/example) for a complete, working refere
 
 ## 2. Stdlib only, and the SDK
 
-**Extensions are stdlib only.** `ext add` (and `ext validate`, once Phase 3 wires the directory checks in) refuses a `pyproject.toml` that declares dependencies, `requirements*.txt`, lock files (`uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile*`), `package.json`, `setup.py`, `setup.cfg` and `environment.yml`, anywhere in the tree. There are no venvs and no install step, so no build-time code ever runs.
+**Extensions are stdlib only.** `ext validate` and `ext add` refuse a `pyproject.toml` that declares dependencies, `requirements*.txt`, lock files (`uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile*`), `package.json`, `setup.py`, `setup.cfg` and `environment.yml`, anywhere in the tree. There are no venvs and no install step, so no build-time code ever runs.
 
 Use `resonant-sdk` in your own CI or dev environment only, never as a runtime dependency (install it there with `pip install "resonant-sdk @ git+https://github.com/justinhe16/resonant#subdirectory=packages/resonant-sdk"`). It gives you `Manifest` and `load_manifest` for validating, `ToolSpec`, `Effect`, `Level` and `Event`.
 
@@ -85,12 +85,12 @@ Pick the lowest level you'd be comfortable with if the model misunderstood a req
 tools:
   get_pnl:
     description: P&L for a trading day.
-    run: ./cli pnl --date {date} --json     # {placeholders} must be declared in args
+    run: ./cli.py pnl --date {date} --json     # {placeholders} must be declared in args
     effect: read
     args: {date: string}                    # string | integer | number | boolean
     timeout_s: 30                           # at most 300
   restart_worker:
-    run: ./cli restart
+    run: ./cli.py restart
     effect: write
     level: L3
     secrets: [api_token]                    # must also appear in top-level secrets
@@ -98,7 +98,7 @@ tools:
 
 Contract:
 - The command runs in your installed (read-only) extension directory with arguments substituted. It is never run through a shell. Arguments the model doesn't declare are refused (`additionalProperties: false`).
-- **argv[0]** must be a file in your extension directory (`./cli.py`), `python3 <script.py in your dir>`, `gh` or `git`. Commands that fetch code at run time (`npx`, `bunx`, `pipx`, `uvx`, `uv`, `docker`, `curl`, …) and shells (`sh`, `bash`, `env`, …) are refused. Python scripts run under the daemon's own interpreter with `-I -S`; the shebang is ignored.
+- **argv[0]** must be a `.py` file in your extension directory (`./cli.py`; files there run only as Python), `python3 <script.py in your dir>`, `gh` or `git`. Commands that fetch code at run time (`npx`, `bunx`, `pipx`, `uvx`, `uv`, `docker`, `curl`, …) and shells (`sh`, `bash`, `env`, …) are refused. Python scripts run under the daemon's own interpreter with `-I -S`; the shebang is ignored.
 - Exit 0 with **exactly one JSON object** on stdout means success.
 - A **non-zero exit means nothing took effect**: you promise that a failed run changed nothing. A timeout or kill is treated as "maybe happened" for writes.
 - Write state to `$RESONANT_EXT_DATA` (also your `HOME`), never next to your code.
@@ -174,24 +174,36 @@ principals:
 ## 9. Registering an extension
 
 ```sh
-resonant ext validate ./my-ext     # works today: schema, invariants, approver grants
-resonant ext add repo:my-ext       # Phase 3; or path:/abs/dir inside a git work tree
+resonant ext validate ./my-ext     # schema, names, directory checks, approver grants
+resonant ext add repo:my-ext       # extensions/my-ext in the Resonant checkout, at HEAD
+resonant ext add path:/abs/my-ext  # a clean directory inside a git work tree
+resonant ext list                  # status, pins, and whether each copy still matches
+resonant ext update my-ext         # re-stage from the same source, diff, re-approve
+resonant ext remove my-ext         # keeps its data dir (--purge deletes it)
 ```
 
-`ext add` (Phase 3) runs **only in the Mini's terminal**, never over iMessage:
-1. Validates the manifest and the directory (stdlib only, argv[0] allowlist, no symlinks out of the tree).
-2. Shows the source, commit and content digest, then escalations first (secrets, approvers, L1/L2 tools, tools that use `gh`/`git`), then every tool, job and notify event.
-3. The owner confirms by typing the extension name.
-4. Copies the approved files to `~/.resonant/extensions/<name>/` (read-only), pins them, and records the install in the database.
+These run **only in the Mini's terminal**, never over iMessage.
 
-On daemon start the extension is loaded from that copy, after re-checking the pin: jobs go to the scheduler, tools to the registry, `notify` to event delivery, `health` to periodic checks.
+`ext add`:
+1. Copies the approved bytes into a staging dir. `repo:` reads the **HEAD commit** (`git archive`), so uncommitted edits are never installed. `path:` reads the tracked files from the git index, and refuses the directory if any tracked file there has uncommitted changes. Nothing else is a source.
+2. Validates the manifest and the directory: stdlib only, the argv[0] allowlist, no symlink that leaves the tree, the name rules and approver grants. MCP servers and critical jobs are refused for now.
+3. Shows a heading built by code, `my-ext repo:my-ext@a1b2c3d4 digest 9f3e01aa` (commit and content digest), then **escalations first** (secrets, approvers, tools and jobs that ask, commands that use `gh`/`git`), then every tool, job, notify event and the health check. Every string from your manifest is shown sanitized.
+4. You confirm by typing the extension name.
+5. It stages the source **again** and refuses if the commit, digest or manifest changed since you confirmed. The copy goes to `~/.resonant/extensions/<name>/` (read-only), its digest is recomputed, and only then is the row written, with an `ext.install` audit row.
+6. If the daemon is up, it restarts (reply-first path), and the owner gets `Back up …` and `Installed my-ext`.
 
-**Changing an extension later.** `resonant ext update <name>` shows a diff and asks for the typed confirmation **every time**, even when only code changed.
+The digest is sha256 over the sorted `(path, file/executable/symlink, sha256(content))` of the tree. The daemon re-checks it at every load, so an edit to the installed copy disables the extension until you run `ext update`.
+
+**Data and secrets from another source.** Resonant remembers each extension's last source and secret names, even after `remove --purge`. If `~/.resonant/ext-data/<name>/`, or Keychain items an earlier install declared, came from a different source, `ext add` refuses until you pass `--adopt`. Secrets you stored before the first install are fine.
+
+**Changing an extension later.** `resonant ext update <name>` shows the pins before and after, the files added, removed or changed, and the escalations added or removed (or `code only` when the manifest is unchanged), then the full review, and asks for the typed confirmation **every time**. To move to another source, `remove` and `add` again (with `--adopt`).
+
+**Removing.** `ext remove` deletes the row, the job state and the copy. It keeps the data dir unless you pass `--purge`, and lists the Keychain items left with the `resonant secret rm …` command for each.
 
 ## 10. Checklist
 
 - [ ] `resonant ext validate` passes, and your CI validates with `resonant_sdk.load_manifest`.
-- [ ] Stdlib only: no dependency files; every command starts with a file in your dir, `python3 <script>`, `gh` or `git`.
+- [ ] Stdlib only: no dependency files; every command starts with a `.py` file in your dir, `python3 <script.py>`, `gh` or `git`.
 - [ ] A non-zero exit means nothing took effect; state goes to `$RESONANT_EXT_DATA`.
 - [ ] Every job declares its real effect; asking jobs (L1/L2) run at most hourly.
 - [ ] Every tool prints exactly one JSON object and exits 0 on success.

@@ -95,7 +95,7 @@ def dir_errors(root: Path, manifest: Manifest) -> list[str]:
 def argv0_error(root: Path, run: str) -> str | None:
     """Why ``run``'s argv[0] isn't allowed, or None. ``root`` must be resolved.
 
-    Allowed: a file inside ``root`` (``./cli.py``), ``python3 <.py file inside root>``,
+    Allowed: a ``.py`` file inside ``root`` (``./cli.py``), ``python3 <.py file inside root>``,
     ``gh`` or ``git``. Everything else is refused; fetch-runners and shells by name.
     """
     try:
@@ -113,7 +113,12 @@ def argv0_error(root: Path, run: str) -> str | None:
     if name in SHELLS:
         return f"{word!r}: commands never run through a shell; refused"
     if "/" in word:
-        return _inside_error(root, word)
+        if err := _inside_error(root, word):
+            return err
+        # The process runner runs in-dir files only as Python, under the daemon interpreter.
+        if not word.endswith(".py"):
+            return f"{word!r}: files in the extension dir run as Python; name it *.py"
+        return None
     if word not in ALLOWED_COMMANDS:
         allowed = ", ".join(sorted(ALLOWED_COMMANDS))
         return f"{word!r} is not allowed; use a file in the extension dir or one of {allowed}"
