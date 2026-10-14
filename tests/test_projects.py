@@ -254,3 +254,11 @@ def test_projects_command_usage() -> None:
     with pytest.raises(UsageError):
         cmd.parse("everything")
     assert cmd.usage_reply() == "Usage: /projects [all]"
+
+
+def test_malformed_checkpoint_row_is_skipped(db: sqlite3.Connection) -> None:
+    good = add(db)
+    bad = add(db)
+    db.execute("UPDATE tasks SET checkpoint = '{not json' WHERE id = ?", (bad,))
+    out = projects(db, {})
+    assert [i["id"] for i in out["items"]] == [good] and out["more"] == 0

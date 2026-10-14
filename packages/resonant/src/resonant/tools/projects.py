@@ -81,12 +81,16 @@ def projects(conn: sqlite3.Connection, args: dict[str, Any]) -> dict[str, Any]:
                        THEN json_extract(checkpoint, '$.title') END AS title,
                    CASE WHEN kind = 'reminder' AND json_type(checkpoint, '$.text') = 'text'
                        THEN json_extract(checkpoint, '$.text') END AS reminder_text
-            FROM tasks  -- open first; the IN list is loop.types.TERMINAL
+            FROM tasks
+            WHERE json_valid(checkpoint)  -- a malformed row is skipped, never an error
+            -- open first; the IN list is loop.types.TERMINAL
             ORDER BY status IN ('cancelled', 'done', 'failed'), updated_at DESC, id DESC
             LIMIT ?""",
         (limit,),
     ).fetchall()
-    total: int = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    total: int = conn.execute("SELECT COUNT(*) FROM tasks WHERE json_valid(checkpoint)").fetchone()[
+        0
+    ]
     now = utcnow()
     items = [
         {

@@ -10,6 +10,7 @@ from typing import Any, cast
 
 # One iMessage chunk (``gateway.imessage.channel.MAX_CHUNK``): a reply never splits.
 MAX_REPLY_CHARS = 2000
+_FOOTER_RESERVE = 40  # room for "+N more (/projects all)"
 
 _OPEN_ORDER = ("running", "waiting", "queued")
 
@@ -73,8 +74,7 @@ def render_projects(d: dict[str, Any]) -> str:
     size = len(head)
     for n, item in enumerate(ordered):
         line = _project_line(item)
-        # Keep room for the "+N more" footer.
-        if size + 1 + len(line) > MAX_REPLY_CHARS - 40:
+        if size + 1 + len(line) > MAX_REPLY_CHARS - _FOOTER_RESERVE:
             hidden += len(ordered) - n
             break
         lines.append(line)
