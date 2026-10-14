@@ -579,9 +579,7 @@ def test_refusal_replies() -> None:
     assert refusal_reply("ambiguous", None, []) == NOTHING_WAITING
     assert refusal_reply("code_required", None, [a7, d3]) == "Reply yes D3 to confirm."
     assert refusal_reply("code_required", None, []) == "Reply yes <code> to confirm."
-    assert refusal_reply("unknown_code", "Q9", [a7]) == (
-        "Nothing is waiting with code Q9. /approvals lists them."
-    )
+    assert refusal_reply("unknown_code", "Q9", [a7]) == ("Nothing is waiting with code Q9.")
     for reason in ("expired", "already_resolved", "task_not_waiting", "not_sent_before"):
         assert refusal_reply(reason, "A7", [a7]) != NOTHING_WAITING
 

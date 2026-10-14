@@ -547,7 +547,7 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
   | `nothing_pending`, `unsupported`, `not_found`, anything else | `Nothing is waiting for approval.` (also every non-approver) |
   | `ambiguous` | `Which one? A7 (restart resonant), D3 (delete all 4 notes). Reply yes <code> or no <code>.`, listing the actor's pending approvals whose prompts were already sent to them |
   | `code_required` | `Reply yes D7 to confirm.` |
-  | `unknown_code` | `Nothing is waiting with code Q9. /approvals lists them.` |
+  | `unknown_code` | `Nothing is waiting with code Q9.` |
   | `expired` | `That approval expired. Not done.` |
   | `already_resolved` | `That was already answered.` |
   | `task_not_waiting` | `That task isn't waiting anymore. Not done.` |

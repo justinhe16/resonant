@@ -68,7 +68,7 @@ def refusal_reply(reason: str | None, code: str | None, sent: Sequence[PendingAp
         target = coded[0].code if len(coded) == 1 else "<code>"
         return f"Reply yes {target} to confirm."
     if reason == "unknown_code":
-        return f"Nothing is waiting with code {code}. /approvals lists them."
+        return f"Nothing is waiting with code {code}."
     if reason == "expired":
         return "That approval expired. Not done."
     if reason == "already_resolved":
