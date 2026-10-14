@@ -180,7 +180,7 @@ async def test_list_commands_tool_lists_the_owner_view(ctx: BuiltinContext) -> N
         "owner_only": True,
     }
     filtered = await handlers[(None, "list_commands")]({"query": "task"})
-    assert [c["name"] for c in filtered["commands"]] == ["/tasks"]
+    assert [c["name"] for c in filtered["commands"]] == ["/projects", "/tasks"]
     assert filtered["query"] == "task"
 
 

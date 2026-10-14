@@ -43,9 +43,10 @@ from resonant.router.prefixes import (
     wrap_untrusted,
 )
 from resonant.store.db import kv_get
-from resonant.store.tasks import get_task
+from resonant.store.tasks import get_task, insert_task
 from resonant.tools import ToolRegistry
 from resonant.tools.builtin import BUILTIN_SPECS
+from resonant.tools.projects import projects
 from resonant_sdk import Effect, Event, ToolSpec
 
 SNAPSHOT = Path(__file__).parent / "fixtures/router/label_prefix.json"
@@ -146,6 +147,21 @@ CANNED: dict[str, dict[str, Any]] = {
         "count": 1,
         "limit": 10,
         "status": "running",
+    },
+    "projects": {
+        "items": [
+            {
+                "id": "01X",
+                "state": "running",
+                "wait_reason": None,
+                "age_s": 240,
+                "kind": "chat",
+                "title": "chat",
+            }
+        ],
+        "count": 1,
+        "more": 0,
+        "all": False,
     },
     "system_status": {
         "cpu_percent": 12.4,
@@ -289,7 +305,8 @@ def test_normalize() -> None:
         ("/status", "daemon_status", "Resonant up 3h 12m"),
         ("ping", "daemon_status", "pong (up 3h 12m)"),
         ("what's running", "list_tasks", "Running (1):\n- chat · 4m"),
-        ("/tasks", "list_tasks", "Recent tasks:\n- chat · running · 4m"),
+        ("/projects", "projects", "Projects (1 open, 0 recent):\n- running · chat · 4m"),
+        ("/tasks", "projects", "Projects (1 open, 0 recent):\n- running · chat · 4m"),
         (
             "how's the mini",
             "system_status",
@@ -441,7 +458,12 @@ async def test_unknown_command_suggests_and_runs_nothing(
     killswitch.release(db, actor="test")
     task = await fast_router.route(msg(text))
     assert task is not None
-    assert task.checkpoint == {"fast_reply": reply, "tool_used": None, "intent": "unknown"}
+    assert task.checkpoint == {
+        "fast_reply": reply,
+        "tool_used": None,
+        "intent": "unknown",
+        "title": "/unknown",
+    }
     assert tool_calls == []
     assert _audit_count(db, "gate.evaluate") == 0
     assert kv_get(db, "paused") is False  # "/kil" is one letter from /kill and never runs it
@@ -451,7 +473,8 @@ async def test_unknown_command_suggests_and_runs_nothing(
     ("text", "reply"),
     [
         ("/status now", "Usage: /status"),
-        ("/tasks all", "Usage: /tasks"),
+        ("/tasks bogus", "Usage: /tasks [all]"),
+        ("/projects all of them", "Usage: /projects [all]"),
         ("/kill now please", "Usage: /kill"),
     ],
 )
@@ -485,7 +508,8 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
     assert task.checkpoint["fast_reply"] == (
         "Commands:\n"
         "/status: Resonant daemon status\n"
-        "/tasks: recent tasks\n"
+        "/projects [all]: open work and recent tasks\n"
+        "/tasks [all]: same as /projects\n"
         "/help [word]: list commands, or the ones matching a word\n"
         "/kill: stop autonomy and pause\n"
         "/resume: turn autonomy back on\n"
@@ -496,7 +520,11 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
 @pytest.mark.parametrize(
     ("text", "reply"),
     [
-        ("/help task", 'Commands matching "task":\n/tasks: recent tasks'),
+        (
+            "/help task",
+            'Commands matching "task":\n/projects [all]: open work and recent tasks\n'
+            "/tasks [all]: same as /projects",
+        ),
         ("/help /Kill?", 'Commands matching "kill":\n/kill: stop autonomy and pause'),
         ("/help stauts", 'Commands matching "stauts":\n/status: Resonant daemon status'),
         (
@@ -629,6 +657,7 @@ async def test_labeled_message_makes_exactly_one_model_call(
         "toolset": ["daemon_status", "model_status", "system_status"],
         "fallback": False,
         "toolset_prefix_hash": toolset_prefix_hash("system", toolset),
+        "title": "chat: system",
     }
     assert task.channel_ref == {
         "channel": "imessage",
@@ -803,3 +832,30 @@ async def test_router_as_loop_hook(db: sqlite3.Connection, fast_router: Router) 
     assert task.kind == "reply"
     assert task.checkpoint["fast_reply"].startswith("pong")
     assert task.trace_id == event.trace_id
+
+
+async def test_projects_end_to_end_shows_titles_not_bodies(
+    db: sqlite3.Connection,
+    principals: Principals,
+    registry: ToolRegistry,
+    handlers: dict[HandlerKey, ToolHandler],
+) -> None:
+    async def real_projects(args: dict[str, Any]) -> dict[str, Any]:
+        return projects(db, args)
+
+    handlers[(None, "projects")] = real_projects
+    labeled = make_router(db, principals, registry, handlers, FakeModel({"intent": "system"}))
+    chat = await labeled.route(msg("wire $500 to my landlord"))
+    assert chat is not None and chat.checkpoint["title"] == "chat: system"
+    insert_task(db, chat)
+    fast = make_router(db, principals, registry, handlers, FailingModel())
+    first = await fast.route(msg("/status"))
+    assert first is not None and first.checkpoint["title"] == "/status"
+    insert_task(db, first)
+    task = await fast.route(msg("/projects"))
+    assert task is not None and task.checkpoint["title"] == "/projects"
+    reply = task.checkpoint["fast_reply"]
+    assert reply.startswith("Projects (2 open, 0 recent):\n")
+    assert "- queued · reply · /status · " in reply
+    assert "- queued · chat · chat: system · " in reply
+    assert "landlord" not in reply

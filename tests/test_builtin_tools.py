@@ -34,6 +34,7 @@ NAMES = {
     "daemon_status",
     "model_status",
     "list_commands",
+    "projects",
 }
 
 
