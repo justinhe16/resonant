@@ -1,13 +1,14 @@
 """Gate contract: intents, decisions, tokens, and approval resolution.
 
-Evaluation order (Phase 2 implements it; DryRunGate approximates it):
+Evaluation order (``PolicyGate`` implements it; ``DryRunGate`` is the Phase 0 stand-in):
 1. Registration: the intent's ToolSpec must be the one registered for (extension, tool).
 2. Permission: can(principal, "request", extension)? If not, Deny. This runs before any
    level logic.
-3. Kill switch: if autonomy is off, anything above L0 needs approval.
-4. Level: L0 Allow, L1 NeedsApproval, L2 Veto(until), L3 Allow (then report).
-   Inside an approved computer-use scope, commit tools still need approval.
-5. dry_run: anything that isn't an L0 read becomes DryRun.
+3. Unsafe args (control, bidi, zero-width characters): Deny.
+4. dry_run: anything that is neither an L0 read nor store-internal becomes DryRun.
+5. Level x origin x autonomy: L0 Allow; L1 NeedsApproval with a code; L2 Allow when
+   explicit, else NeedsApproval; L3 Allow. With autonomy off, everything above L0 needs
+   approval. No Veto in Phase 2.
 
 Every Allow carries a single-use ``token`` that the gate issued for that exact intent hash.
 The executor calls ``gate.consume(token, intent.hash)`` before running anything, so an
@@ -155,7 +156,7 @@ class NeedsApproval:
     summary: str  # built by code from intent fields; external strings sanitized
     effect: Effect
     level: Level
-    require_code: bool  # pay: only an exact "yes <code>" counts
+    require_code: bool  # L1 (destructive or pay): only "yes <code>" approves
 
 
 @dataclass(frozen=True)
@@ -167,7 +168,9 @@ class Veto:
 
 @dataclass(frozen=True)
 class DryRun:
-    would: str  # what the real gate would have decided, e.g. "NeedsApproval"
+    # PolicyGate: the code-built summary of what would have run, e.g. "restart ollama".
+    # DryRunGate: the decision the real gate would have made, e.g. "NeedsApproval".
+    would: str
 
 
 Decision = Allow | Deny | NeedsApproval | Veto | DryRun

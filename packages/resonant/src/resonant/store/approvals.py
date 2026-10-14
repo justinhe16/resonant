@@ -189,6 +189,16 @@ def approved_unused(conn: sqlite3.Connection, task_id: str, intent_hash: str) ->
     return None if r is None else _row_to_approval(r)
 
 
+def latest_for_intent(conn: sqlite3.Connection, task_id: str, intent_hash: str) -> Approval | None:
+    """The newest approval for (task, intent hash), whatever its status."""
+    r = conn.execute(
+        """SELECT * FROM approvals WHERE task_id = ? AND intent_hash = ?
+           ORDER BY created_at DESC, id DESC LIMIT 1""",
+        (task_id, intent_hash),
+    ).fetchone()
+    return None if r is None else _row_to_approval(r)
+
+
 def pending_for(conn: sqlite3.Connection, principal: str, now: datetime) -> list[Approval]:
     """Unexpired pending approvals that ``principal`` is an approver for, oldest first."""
     rows = conn.execute(
