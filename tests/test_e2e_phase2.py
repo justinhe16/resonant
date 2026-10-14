@@ -371,6 +371,11 @@ async def live(resonant_home: Path, chat: FakeChatDB) -> AsyncIterator[Running]:
         yield r
 
 
+def reply(r: Running, text: str) -> None:
+    """An approval reply, timestamped clearly after the prompt (the sent-before rule)."""
+    r.chat.add_message(handle=OWNER_PHONE, text=text, at=utcnow() + timedelta(seconds=1))
+
+
 def chat_task(r: Running, intent: str) -> sqlite3.Row:
     (task,) = r.rows("SELECT * FROM tasks WHERE kind = 'chat'")
     assert json.loads(task["checkpoint"])["intent"] == intent
@@ -391,7 +396,7 @@ async def test_natural_language_reminder_is_set_with_its_due_time(live: Running)
     cp = json.loads(reminder["checkpoint"])
     assert cp["text"] == "stretch"
     due = datetime.fromisoformat(cp["at"])
-    # The model computed ``at`` from the "Current time" line (minute precision).
+    # The model computed ``at`` from the "Current time" line.
     assert timedelta(minutes=19) <= due - utcnow() <= timedelta(minutes=20)
     assert reminder["status"] == "queued"
 
@@ -420,7 +425,7 @@ async def test_chat_restart_resonant_asks_and_runs_only_after_yes(live: Running)
     assert r.ops.spawned == []  # nothing ran yet
     assert restart_pending(r.conn) is None
 
-    r.chat.add_message(handle=OWNER_PHONE, text="yes")
+    reply(r, "yes")
     done = await r.osa.wait_for(2, 10)
     assert done.text == "Restarting Resonant…"
     assert len(r.ops.spawned) == 1  # the detached helper, exactly once
@@ -447,3 +452,27 @@ async def test_what_can_you_do_lists_real_commands(live: Running) -> None:
     model = r.daemon.imessage.model
     assert isinstance(model, ScriptedModel)
     assert model.calls["tools"] == 2 and model.calls["answer"] == 1
+
+
+async def test_chat_clear_notes_needs_the_code(live: Running) -> None:
+    r = live
+    await r.run_script({"tool": "add_note", "args": {"text": "buy milk"}})
+    r.chat.add_message(handle=OWNER_PHONE, text="clear my notes")
+    prompt = await r.osa.wait_for(1, 10)
+    match = re.fullmatch(
+        r"\[([A-Z]\d)\] delete all 1 note\? This can't be undone\. Reply yes \1 / no",
+        prompt.text,
+    )
+    assert match is not None, prompt.text
+    await wait_until(lambda: chat_task(r, "notes")["status"] == "waiting", 10)
+    audit = r.audits("gate.evaluate")[-1]
+    assert (audit["tool"], audit["detail"]["origin"]) == ("clear_notes", "inferred")
+
+    reply(r, "yes")  # a plain yes never approves L1
+    refused = await r.osa.wait_for(2, 10)
+    assert refused.text == f"Reply yes {match.group(1)} to confirm."
+    assert chat_task(r, "notes")["status"] == "waiting"
+
+    reply(r, f"yes {match.group(1)}")
+    done = await r.osa.wait_for(3, 10)
+    assert done.text == "Cleared 1 note."

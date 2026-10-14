@@ -39,6 +39,7 @@ LABEL_RULES: tuple[tuple[str, str], ...] = (
     ("remind me in", "reminders"),
     ("restart", "ops"),
     ("what can you do", "system"),
+    ("clear my notes", "notes"),
     ("queue", "job_control"),
     ("task", "job_control"),
     ("job", "job_control"),
@@ -55,6 +56,7 @@ TOOL_RULES: tuple[tuple[str, str], ...] = (
     ("restart resonant", "restart_resonant"),
     ("restart ollama", "restart_ollama"),
     ("what can you do", "list_commands"),
+    ("clear my notes", "clear_notes"),
 )
 _REMIND = re.compile(r"remind me in (\d+) minutes? to (.+?)</message>", re.IGNORECASE | re.DOTALL)
 _NOW = re.compile(r"^Current time: (\S+) ", re.MULTILINE)

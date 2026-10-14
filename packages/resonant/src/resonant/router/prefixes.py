@@ -148,9 +148,9 @@ def runner_system(intent: IntentLabel) -> str:
 
 
 def time_context(now: datetime, tz: str) -> str:
-    """``Current time: 2026-10-13T15:04-07:00 (Tue, America/Los_Angeles).``, from code."""
+    """``Current time: 2026-10-13T15:04:30-07:00 (Tue, America/Los_Angeles).``, from code."""
     local = now.astimezone(ZoneInfo(tz))
-    return f"Current time: {local.isoformat(timespec='minutes')} ({local:%a}, {tz})."
+    return f"Current time: {local.isoformat(timespec='seconds')} ({local:%a}, {tz})."
 
 
 def current_turn(intent: IntentLabel, text: str, *, now: datetime, tz: str, max_chars: int) -> str:

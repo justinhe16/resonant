@@ -438,7 +438,7 @@ async def test_reminders_turn_has_the_local_time_and_the_prefix_stays_constant(
     assert first[0] == {"role": "system", "content": runner_system("reminders")}
     assert "ISO-8601 datetime with the UTC offset" in first[0]["content"]
     assert first[-1]["content"] == (
-        "Current time: 2026-10-13T15:04-07:00 (Tue, America/Los_Angeles).\n"
+        "Current time: 2026-10-13T15:04:30-07:00 (Tue, America/Los_Angeles).\n"
         + wrap_untrusted("remind me at 3 to call mom")
     )
     # Other intents get no time line, and the system message never has one.
