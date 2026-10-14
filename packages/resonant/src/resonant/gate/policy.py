@@ -218,8 +218,11 @@ class PolicyGate:
         owner = self.principals.owner
         if extension is None:
             return (owner,)
+        named = self.approvers_for(extension)
+        if isinstance(named, str):  # a bare name is a seam bug, never a list of letters
+            raise TypeError("approvers_for must return a sequence of names, not a str")
         found = [owner]
-        for name in self.approvers_for(extension):
+        for name in named:
             if name in found:
                 continue
             if not self.principals.can(name, "approve", extension):

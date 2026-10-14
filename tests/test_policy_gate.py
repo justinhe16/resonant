@@ -675,3 +675,14 @@ def test_chat_paths_never_set_scheduled() -> None:
     sources = [Path(resonant.runners.local.__file__), *sorted(router_dir.glob("*.py"))]
     for path in sources:
         assert '"scheduled"' not in path.read_text(), path.name
+
+
+def test_a_bare_string_from_the_seam_is_refused(
+    db: sqlite3.Connection, principals: Principals, registry: ToolRegistry, clock: Clock
+) -> None:
+    def one_name(_ext: str) -> str:
+        return "cofounder"  # a str is a Sequence[str]: the type alone can't catch this
+
+    gate = make_gate(db, principals, registry, clock, approvers_for=one_name)
+    with pytest.raises(TypeError, match="not a str"):
+        gate.approvers("dori")
