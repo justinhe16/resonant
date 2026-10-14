@@ -16,10 +16,10 @@ or no ``principals.yaml`` owner: not scheduled. Each run:
    told. Nothing pending: nothing sent.
 
 The message is at most ``MAX_CHARS`` (1,000). Items that don't fit are not marked told and ride
-the next pulse; the message ends ``+N more``. Extension items are rendered by
-``notify.render(source, title)`` (code-built ``[name]`` prefix, anti-spoofing); core items
-have no prefix. The decisions use the job's due time (a catch-up run at 06:20 for 05:00 is
-still quiet), the reads use the clock.
+the next pulse; the message ends ``+N more``. Extension items are rendered as
+``notify.prefix(source)`` (the code-built ``[name]``, anti-spoofing) + mark + the stored,
+already cleaned title; core items have no prefix. The decisions use the job's due time (a
+catch-up run at 06:20 for 05:00 is still quiet), the reads use the clock.
 
 On demand: ``run_pulse_now(deps)`` (P35-5's ``/pulse now``, ``/ext run core/pulse``) is keyed
 ``pulse:manual:<date>:<HHMM>`` and ignores the briefing hour and the quiet hours, but not
@@ -89,7 +89,9 @@ def item_line(item: store.Item, max_chars: int = LINE_MAX) -> str:
     if item.source == CORE:
         return clip(item.title, max_chars)
     mark = "✓ " if item.cleared else "🔴 " if item.urgency == "urgent" else ""
-    return notify.render(item.source, mark + item.title, max_chars)
+    # Stored titles are already cleaned (clean_text is not idempotent): never re-clean.
+    head = notify.prefix(item.source) + " "
+    return head + clip(mark + item.title, max(1, max_chars - len(head)))
 
 
 def _order(items: Sequence[store.Item]) -> list[store.Item]:
