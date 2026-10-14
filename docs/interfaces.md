@@ -703,11 +703,10 @@ resonant_sdk.emit.emit(type, text, dedupe_key, data=None) -> bool   # stdlib-onl
 
 ```python
 briefing_job(deps: CoreDeps, *, clock=utcnow) -> CoreJob | None   # the CORE_JOBS entry
-await send_briefing(conn, channel, owner, *, tz, now, due=None, github=False, manual=False)
+await send_briefing(conn, channel, owner, *, tz, now, due=None, manual=False)
     -> {sent, date, sections, chars} | {sent: False, date, skipped: "paused"}
-gather(conn, *, owner, now, day, tz: ZoneInfo, github) -> Briefing   # the data
+gather(conn, *, owner, now, day, tz: ZoneInfo) -> Briefing   # the data
 render(b: Briefing) -> str   sections(b) -> list[str]                 # pure
-github_line(conn, day, tz) -> str | None
 await run_briefing_now(deps: CoreDeps, *, now=None) -> dict   # on demand (P3-14)
 dedupe_key(day) -> "briefing:<YYYY-MM-DD>"
 manual_dedupe_key(local_now) -> "briefing:manual:<YYYY-MM-DD>:<HHMM>"
@@ -719,8 +718,7 @@ manual_dedupe_key(local_now) -> "briefing:manual:<YYYY-MM-DD>:<HHMM>"
   - `▶ 1 running, 2 waiting (approval), 1 queued`: counts from the `projects` query (`all`), reminders left out. States and wait reasons only; titles and checkpoints never reach the text.
   - `✋ 2 approvals pending (A7, C3)`: `approvals.pending_for(owner, now)`, up to 5 codes.
   - `⚠ model, imessage degraded`: `health_snapshot` checks in `degraded`.
-  - `github: …`: `payload.text` of the latest `ext.github.digest` event (`source="ext:github"`) whose `occurred_at` falls on the local date, through `clean_external` (`✗` becomes `x`), ≤ 200 chars. Only when `github` is loaded in the host. (P35-4 replaces it with a `github/summary` item.)
-  - `Updates:` then one line per open pulse item (`pulse.open_items`: every urgency; extension items only, not `core` and not muted extensions, which are neither listed nor marked told), changed-since-told first, at most 8 lines (fewer if they don't fit in `MAX_CHARS`) then `+N more`. Lines are `pulse_job.item_line`. The listed items are marked told after the send (also for a manual run; not while paused), through `pulse_job.deliver`. `render_full(b) -> (text, listed_items)`; `Briefing.updates` holds the open items.
+  - `Updates:` then one line per open pulse item (`pulse.open_items`; github's morning summary is one, `[github] 3 open PRs, 1 failing CI, 2 awaiting your review`, reported at low urgency by its `digest` job: every urgency; extension items only, not `core` and not muted extensions, which are neither listed nor marked told), changed-since-told first, at most 8 lines (fewer if they don't fit in `MAX_CHARS`) then `+N more`. Lines are `pulse_job.item_line`. The listed items are marked told after the send (also for a manual run; not while paused), through `pulse_job.deliver`. `render_full(b) -> (text, listed_items)`; `Briefing.updates` holds the open items.
 - **Once a day.** The local date of `due_at` (else now) names the day; the send uses `dedupe_key=briefing:<date>`, so a restart or a catch-up the same day sends nothing more. The result holds section names and length, never the text; `sent: true` means handed to the channel, which drops a same-day repeat by the key.
 - **On demand** (P3-14, `/ext run core/briefing`): `run_briefing_now(CoreDeps(...))`, i.e. `send_briefing(..., manual=True)`. Keyed `briefing:manual:<local date>:<HHMM>`: at most one per minute, and it never uses up the day's scheduled one. Nothing while paused; `{sent: False, skipped: "unreachable"}` with no channel or owner.
 

@@ -173,8 +173,9 @@ def ext_dir(tmp_path: Path) -> Path:
 def test_shipped_example_passes_every_check() -> None:
     m = load_manifest(EXAMPLE / "resonant.yaml")
     assert dir_errors(EXAMPLE, m) == [] and name_errors(m) == []
-    (spec,) = m.job_specs()
-    assert spec.name == "job_morning_ping" and spec.effective_level is Level.L0
+    specs = {s.name: s for s in m.job_specs()}
+    assert set(specs) == {"job_morning_ping", "job_pnl", "job_incident"}
+    assert all(s.effective_level is Level.L0 for s in specs.values())
     assert m.description and m.examples
 
 

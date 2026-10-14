@@ -169,6 +169,8 @@ def test_manifest_passes_every_check() -> None:
     assert m.notify is not None and m.notify.on == ("ci_failed", "ci_fixed", "review_requested")
     assert m.health is not None and m.health.check == "python3 cli.py health"
     assert m.secrets == ("token",) and m.description and m.examples
+    # The digest reports an item for the briefing: low, so it can never text on its own.
+    assert m.report is not None and m.report.max_urgency == "low"
     # Every command runs cli.py under the daemon interpreter.
     assert resolve_argv0(EXT, m.tools["prs"].run) == sys.executable
 
@@ -422,32 +424,33 @@ def test_watch_events_go_to_fd3_when_provided(gh: FakeGh) -> None:
 # --- digest and health --------------------------------------------------------------------
 
 
-def test_digest_line_and_key(gh: FakeGh) -> None:
+def test_digest_reports_the_summary_item(gh: FakeGh) -> None:
     gh.state["mine"] = [
         pr_node(41, "a", contexts=[check("lint", conclusion="FAILURE")]),
         pr_node(42, "b", contexts=[check("test")]),
         pr_node(43, "c", contexts=[check("build", conclusion="FAILURE")]),
     ]
-    gh.state["review"] = [pr_node(9, "d", repo="org/app")]
+    gh.state["review"] = [pr_node(9, "d", repo="org/app"), pr_node(10, "e", repo="org/app")]
     r = gh.run("digest", env=gh.env(RESONANT_JOB_DUE_AT="2026-10-14T07:50:00-07:00"))
     (e,) = r.events
-    line = "github: 3 open PRs, resonant#41 ✗ lint, resonant#43 ✗ build, 1 review requested"
-    assert e == {
-        "type": "digest",
-        "text": line,
-        "dedupe_key": "digest:2026-10-14T07:50:00-07:00",
-        "data": {
-            "open": 3,
-            "failing": [f"{RESONANT}#41", f"{RESONANT}#43"],
-            "review_requested": 1,
-        },
+    line = "3 open PRs, 2 failing CI, 2 awaiting your review"
+    assert e["type"] == "item" and e["text"] == line
+    assert e["dedupe_key"].startswith("item:github/summary:")
+    # Coarse state (counts), low urgency: the briefing's Updates, never a text on its own.
+    assert e["data"] == {
+        "key": "github/summary",
+        "urgency": "low",
+        "state": {"open": 3, "failing": 2, "review_requested": 2},
+        "clear": False,
+        "ttl": "30h",
     }
     assert r.out["summary"] == line
 
 
 def test_digest_with_nothing_open(gh: FakeGh) -> None:
     r = gh.run("digest", env=gh.env(RESONANT_JOB_DUE_AT="2026-10-14T07:50:00Z"))
-    assert r.events[0]["text"] == "github: 0 open PRs"
+    assert r.events[0]["text"] == "0 open PRs, 0 failing CI, 0 awaiting your review"
+    assert r.events[0]["data"]["state"] == {"open": 0, "failing": 0, "review_requested": 0}
 
 
 def test_health(gh: FakeGh) -> None:

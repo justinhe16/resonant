@@ -190,7 +190,7 @@ def test_shipped_example_extension_is_valid() -> None:
     repo = Path(__file__).resolve().parents[1]
     m = load_manifest(repo / "extensions/example/resonant.yaml")
     levels = {s.name: s.effective_level for s in m.tool_specs()}
-    assert levels == {"get_time": Level.L0, "write_note": Level.L3}
+    assert levels == {"get_time": Level.L0, "write_note": Level.L3, "incident": Level.L3}
 
 
 @pytest.mark.parametrize("run", ["./x {}", "./x {0}", "./x {date!r}", "./x {date:>10}"])

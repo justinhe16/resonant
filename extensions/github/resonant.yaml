@@ -53,7 +53,7 @@ jobs:
     level: L0
     secrets: [token]
     timeout_s: 300
-  - id: digest                         # one line for the 08:00 briefing; not notified
+  - id: digest                         # reports github/summary for the 08:00 briefing
     schedule: "50 7 * * *"
     run: python3 cli.py digest
     effect: read
@@ -62,5 +62,7 @@ jobs:
     timeout_s: 120
     catchup: 1h
 
+# Low: the summary item waits for the 08:00 briefing and never texts on its own.
+report: {max_urgency: low}
 notify: {on: [ci_failed, ci_fixed, review_requested], channel: imessage}
 health: {check: python3 cli.py health, every: 30m}

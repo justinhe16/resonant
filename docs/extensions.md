@@ -183,6 +183,14 @@ What the grant means (shown on the `ext add` review screen and in the `ext updat
 
 A bad report (key, urgency, state, ttl, empty title) is refused the same way. Titles are cleaned like notification text, with a code-built `[<name>]` prefix. A job's first run after install is a baseline: its reports are stored as already told and never sent. A `clear=True` report of an item last stored urgent counts as urgent too (still clamped to the grant), so "recovered" is texted at once; a clear of an item the owner never heard still sends. If no recipient can be reached the item stays pending for the hourly pulse. Changing `report.max_urgency` changes the manifest hash, so `ext update` shows the change and asks for a fresh approval.
 
+#### Walkthrough: the example extension
+
+`extensions/example` has two reporters. Its manifest asks for the highest grant, `report: {max_urgency: urgent}`, and `cli.py` imports `report` from a copy of `emit.py` next to it (a test keeps the copy identical to the SDK's).
+
+- **Normal, PnL-style.** The `pnl` job (`55 * * * *`) calls `report("example/pnl/today", "PnL -$1.8k today", urgency="normal", state={"bucket": -2000})`. The title carries the exact figure; `state` holds it rounded to $500, so only a move to another bucket counts as news. Nothing is texted: it is listed in the next hourly pulse (`[example] PnL -$1.8k today`) and then, if still open, in the briefing's `Updates:`.
+- **Urgent, Dori-style.** Only job runs persist events (a tool's events are dropped), so the demo is a job plus a tool that feeds it. `/example incident failing` (L3: acts, then reports) writes `incident` in the extension's data dir. Within 5 minutes the `incident` job reports `example/incident/demo` with `urgency="urgent"` and `state={"status": "failing"}`, and you get `[example] 🔴 Demo service failing: checkout 5xx` at any hour, once, however many runs repeat that state. `/example incident resolved` makes the next run report `clear=True`, texted as `[example] ✓ Demo service recovered`. Run `/ext run example/incident` to skip the wait; do it once after install first, because a job's first run is a silent baseline.
+- **Low, github-style.** `github`'s `digest` job (07:50) reports `github/summary` with `urgency="low"` and `state={"open": 3, "failing": 1, "review_requested": 2}` under `report: {max_urgency: low}`. It never texts; it appears in the 08:00 briefing's `Updates:` when the counts change.
+
 ## 8. Permissions and approvers
 
 `principals.yaml` decides who can do what with your extension:
