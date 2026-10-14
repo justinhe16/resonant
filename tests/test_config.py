@@ -223,6 +223,9 @@ def test_in_quiet_window_wrapping_midnight() -> None:
     "yaml_text",
     [
         "pulse:\n  quiet_hours: '0:00-6:00'\n",
+        "pulse:\n  quiet_hours: '00:00-06:00\\n'\n",
+        "pulse:\n  remention_after: '4h\\n'\n",
+        "briefing:\n  at: '08:00\\n'\n",
         "pulse:\n  quiet_hours: '00:00-24:00'\n",
         "pulse:\n  quiet_hours: '00:00'\n",
         "pulse:\n  quiet_hours: '06:00-06:00'\n",

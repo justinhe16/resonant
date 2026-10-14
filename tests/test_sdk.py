@@ -394,7 +394,12 @@ def test_report_without_the_events_fd_is_a_noop(monkeypatch: pytest.MonkeyPatch)
         ({"key": "x" * 121}, "key"),
         ({"key": "has space"}, "key"),
         ({"urgency": "loud"}, "urgency"),
+        ({"key": "a\n"}, "key"),
+        ({"ttl": "24h\n"}, "ttl"),
+        ({"ttl": "30s"}, "ttl"),
         ({"ttl": "7d"}, "ttl"),
+        ({"state": {"x": object()}}, "state"),
+        ({"state": {"x": "y" * 3000}}, "state"),
         ({"ttl": "169h"}, "ttl"),
         ({"ttl": "0h"}, "ttl"),
         ({"ttl": "soon"}, "ttl"),
@@ -409,3 +414,27 @@ def test_report_validates_locally(
     args: dict[str, Any] = {"key": "ok", "title": "t", **kwargs}
     with pytest.raises(ValueError, match=match):
         report(**args)
+
+
+def test_emit_module_imports_only_the_stdlib() -> None:
+    import ast
+
+    import resonant_sdk.emit as mod
+
+    tree = ast.parse(Path(mod.__file__ or "").read_text())
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            roots.add(node.module.split(".")[0])
+    assert roots <= set(sys.stdlib_module_names)
+
+
+def test_manifest_patterns_reject_a_trailing_newline() -> None:
+    from resonant_sdk.manifest import duration_s
+
+    with pytest.raises(ValueError):
+        duration_s("5m\n")
+    with pytest.raises(ValidationError):
+        manifest(notify={"on": ["ci_failed\n"]})

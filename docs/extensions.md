@@ -170,7 +170,7 @@ Your processes report what happened by emitting events: either an `"events"` lis
 
 ### Reports
 
-`from emit import report; report("dori/incident/inc-412", "Dori failing: checkout 5xx", urgency="urgent", state={"status": "triaging"})` tells the owner about a thing, by `key` (1..120 of `[a-z0-9/._:-]`). It is mentioned again only when its fingerprint changes: the hash of `state` when given, else of `title`. Keep `state` coarse (bucket a PnL, leave timestamps out) or every report counts as news. `clear=True` marks it over; `ttl` (`30m`, `24h`, at most `168h`) is how long it stays open without a new report. Urgency is clamped to the manifest's `report.max_urgency`.
+`from emit import report; report("dori/incident/inc-412", "Dori failing: checkout 5xx", urgency="urgent", state={"status": "triaging"})` tells the owner about a thing, by `key` (1..120 of `[a-z0-9/._:-]`). It is mentioned again only when its fingerprint changes: the hash of `state` when given, else of `title`, plus the urgency and `clear`, so a resolve or an escalation always counts. `state` is at most 2000 bytes of JSON. Keep `state` coarse (bucket a PnL, leave timestamps out) or every report counts as news. `clear=True` marks it over; `ttl` (`30m`, `24h`; 1 minute to `168h`) is how long it stays open without a new report. Urgency is clamped to the manifest's `report.max_urgency`.
 
 ## 8. Permissions and approvers
 

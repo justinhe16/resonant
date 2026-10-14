@@ -36,7 +36,9 @@ from typing import Any
 EVENTS_FD_ENV = "RESONANT_EVENTS_FD"
 MAX_DEDUPE_KEY = 200
 URGENCIES = ("urgent", "normal", "low")
+MIN_TTL_S = 60
 MAX_TTL_S = 7 * 24 * 3600
+MAX_STATE_BYTES = 2000  # canonical JSON of `state`; it is only hashed, so keep it coarse
 _ITEM_KEY = re.compile(r"^[a-z0-9/._:-]{1,120}$")
 _TTL = re.compile(r"^(\d+)([smh])$")
 _TTL_UNIT_S = {"s": 1, "m": 60, "h": 3600}
@@ -71,19 +73,26 @@ def report(
 ) -> bool:
     """Report a pulse item. False when not running under Resonant (no events fd).
 
-    ``key`` is 1..120 characters of ``[a-z0-9/._:-]``. ``ttl`` (``30m``, ``24h``; at most ``168h``,
-    7 days) is how long the item stays open without a new report. ``clear=True`` says
-    the thing is over; it is mentioned once more if that is news, then dropped. Every call
-    gets a unique dedupe key, so a repeat is never dropped at ingest: Resonant decides
-    whether it is news.
+    ``key`` is 1..120 characters of ``[a-z0-9/._:-]``. ``ttl`` (``30m``, ``24h``; 1 minute to
+    ``168h``, 7 days) is how long the item stays open without a new report. ``clear=True`` says
+    the thing is over; a clear, like an urgency change, always counts as news, and is
+    then dropped. ``state`` is at most 2,000 bytes of JSON. Every call gets a unique
+    dedupe key, so a repeat is never dropped at ingest: Resonant decides whether it is news.
     """
-    if not _ITEM_KEY.match(key):
+    if not _ITEM_KEY.fullmatch(key):
         raise ValueError("key must be 1..120 characters of [a-z0-9/._:-]")
     if urgency not in URGENCIES:
         raise ValueError(f"urgency must be one of {URGENCIES}")
-    m = _TTL.match(ttl)
-    if not m or not 1 <= int(m.group(1)) * _TTL_UNIT_S[m.group(2)] <= MAX_TTL_S:
-        raise ValueError("ttl must look like 30s, 30m or 24h, and be at most 7 days")
+    m = _TTL.fullmatch(ttl)
+    if not m or not MIN_TTL_S <= int(m.group(1)) * _TTL_UNIT_S[m.group(2)] <= MAX_TTL_S:
+        raise ValueError("ttl must look like 30m or 24h, and be between 1m and 168h")
+    if state is not None:
+        try:
+            canonical = json.dumps(state, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"state must be JSON-serializable: {e}") from e
+        if len(canonical.encode()) > MAX_STATE_BYTES:
+            raise ValueError(f"state must be at most {MAX_STATE_BYTES} bytes of JSON")
     data: dict[str, Any] = {
         "key": key,
         "urgency": urgency,

@@ -265,7 +265,7 @@ class BriefingConfig(_Section):
     @field_validator("at")
     @classmethod
     def _hhmm(cls, v: str) -> str:
-        if not _HHMM.match(v):
+        if not _HHMM.fullmatch(v):
             raise ValueError('briefing.at must be 24-hour "HH:MM", e.g. "08:00"')
         return v
 
@@ -296,7 +296,7 @@ class PulseConfig(_Section):
     @field_validator("quiet_hours")
     @classmethod
     def _quiet_hours(cls, v: str) -> str:
-        m = _QUIET_HOURS.match(v)
+        m = _QUIET_HOURS.fullmatch(v)
         if not m:
             raise ValueError('pulse.quiet_hours must look like "00:00-06:00"')
         if v[:5] == v[6:]:

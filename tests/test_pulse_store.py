@@ -30,7 +30,7 @@ def report(
     source: str = "dori",
     now: datetime = NOW,
 ) -> pulse.Change:
-    return pulse.upsert(db, source, key, title, urgency, state, clear, ttl_s, now)
+    return pulse.upsert(db, source, key, title, urgency, state, clear, ttl_s, now)[0]
 
 
 def told(db: sqlite3.Connection, at: datetime = NOW) -> list[pulse.Item]:
@@ -46,6 +46,19 @@ def test_fingerprint_prefers_state_and_is_canonical() -> None:
     assert pulse.fingerprint("a") != pulse.fingerprint("b")
     # A state that equals the title text is still a different thing.
     assert pulse.fingerprint("a", "a") != pulse.fingerprint("a")
+    # Urgency and the clear flag are part of what the owner heard.
+    assert pulse.fingerprint("a", urgency="urgent") != pulse.fingerprint("a")
+    assert pulse.fingerprint("a", clear=True) != pulse.fingerprint("a")
+
+
+def test_fingerprint_rejects_unusable_state() -> None:
+    with pytest.raises(ValueError, match="JSON"):
+        pulse.fingerprint("a", {"x": object()})
+    with pytest.raises(ValueError, match="JSON"):
+        pulse.fingerprint("a", {"x": float("nan")})
+    with pytest.raises(ValueError, match="bytes"):
+        pulse.fingerprint("a", {"x": "y" * pulse.MAX_STATE_BYTES})
+    pulse.fingerprint("a", {"x": "y" * (pulse.MAX_STATE_BYTES - 10)})
 
 
 def test_new_then_same_once_told(db: sqlite3.Connection) -> None:
@@ -63,7 +76,7 @@ def test_a_b_a_is_a_change_each_time(db: sqlite3.Connection) -> None:
     told(db)
     assert report(db, state={"s": "A"}) == "changed"  # B was told, so A is news again
     assert [i.fingerprint for i in pulse.pending(db, pulse.URGENCIES, NOW)] == [
-        pulse.fingerprint("", {"s": "A"})
+        pulse.fingerprint("Dori failing", {"s": "A"}, urgency="urgent")
     ]
 
 
@@ -93,8 +106,8 @@ def test_mark_told_records_the_version_that_was_sent(db: sqlite3.Connection) -> 
     report(db, state={"s": 2})  # lands between listing and sending
     pulse.mark_told(db, listed, NOW)
     (still,) = pulse.pending(db, pulse.URGENCIES, NOW)
-    assert still.fingerprint == pulse.fingerprint("", {"s": 2})
-    assert still.told_at == NOW
+    assert still.fingerprint == pulse.fingerprint("Dori failing", {"s": 2}, urgency="urgent")
+    assert still.told_at is None  # the stale list changed nothing
 
 
 def test_pending_filters_urgency_source_and_orders(db: sqlite3.Connection) -> None:
@@ -123,12 +136,80 @@ def test_cleared_is_pending_once_then_gone(db: sqlite3.Connection) -> None:
     assert report(db, "Dori recovered", state={"s": "resolved"}, clear=True) == "same"
 
 
-def test_cleared_with_the_told_state_is_silent(db: sqlite3.Connection) -> None:
-    report(db, state={"s": 1})
+def test_a_resolve_with_the_told_text_is_still_news(db: sqlite3.Connection) -> None:
+    report(db, "PnL ok")
     told(db)
-    assert report(db, state={"s": 1}, clear=True) == "same"
+    assert report(db, "PnL ok", clear=True) == "changed"
+    (item,) = pulse.pending(db, pulse.URGENCIES, NOW)
+    assert item.cleared
+    pulse.mark_told(db, [item], NOW)
     assert pulse.pending(db, pulse.URGENCIES, NOW) == []
     assert pulse.open_items(db, NOW) == []
+    assert report(db, "PnL ok") == "changed"  # reopening after a told clear is news too
+
+
+def test_escalation_is_news(db: sqlite3.Connection) -> None:
+    report(db, state={"s": 1}, urgency="normal")
+    told(db)
+    assert report(db, state={"s": 1}, urgency="normal") == "same"
+    assert report(db, state={"s": 1}, urgency="urgent") == "changed"
+
+
+def test_upsert_returns_the_stored_item_and_get_finds_it(db: sqlite3.Connection) -> None:
+    change, item = pulse.upsert(db, "dori", "k", " t ", "urgent", {"s": 1}, False, 3600, NOW)
+    assert change == "new" and item.title == "t" and item.urgency == "urgent"
+    assert item.fingerprint == pulse.fingerprint("t", {"s": 1}, urgency="urgent")
+    assert pulse.get(db, "dori", "k") == item
+    assert pulse.get(db, "dori", "nope") is None
+    pulse.mark_told(db, [item], NOW)
+    change, again = pulse.upsert(db, "dori", "k", "t", "urgent", {"s": 1}, False, 3600, NOW)
+    assert change == "same" and again.told_fingerprint == again.fingerprint
+
+
+def test_an_untold_clear_survives_expiry_until_told(db: sqlite3.Connection) -> None:
+    report(db, "failing", state={"s": 1})
+    told(db)
+    report(db, "recovered", state={"s": 2}, clear=True, ttl_s=3600)  # held over a mute
+    later = NOW + timedelta(days=2)
+    (item,) = pulse.pending(db, pulse.URGENCIES, later)
+    assert item.cleared
+    pulse.mark_told(db, [item], later)
+    assert pulse.pending(db, pulse.URGENCIES, later) == []
+    # Told clears are pruned after a week; an expired untold open item is not pending.
+    assert pulse.prune(db, later + timedelta(days=8)) == 1
+
+
+def test_untold_clear_is_pruned_only_after_30_days(db: sqlite3.Connection) -> None:
+    report(db, clear=True)
+    assert pulse.prune(db, NOW + timedelta(days=29)) == 0
+    assert pulse.prune(db, NOW + timedelta(days=31)) == 1
+
+
+def test_mark_told_is_compare_and_set(db: sqlite3.Connection) -> None:
+    report(db, state={"s": 1})
+    stale = pulse.pending(db, pulse.URGENCIES, NOW)
+    report(db, state={"s": 2})
+    fresh = pulse.pending(db, pulse.URGENCIES, NOW)
+    pulse.mark_told(db, fresh, NOW)
+    pulse.mark_told(db, stale, NOW + HOUR)  # a stale list must not regress the told state
+    item = pulse.get(db, "dori", "dori/incident/1")
+    assert item is not None and item.told_at == NOW and not item.changed
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"now": datetime(2026, 10, 14, 15, 0)},  # naive
+        {"title": "   "},
+        {"title": ""},
+        {"state": {"x": object()}},
+        {"state": {"x": "y" * 3000}},
+    ],
+)
+def test_upsert_refuses_unusable_input(db: sqlite3.Connection, kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        report(db, **kwargs)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+    assert pulse.pending(db, pulse.URGENCIES, NOW) == []
 
 
 def test_a_new_report_reopens_a_cleared_item(db: sqlite3.Connection) -> None:
@@ -160,6 +241,7 @@ def test_expiry_hides_items_and_a_report_extends_it(db: sqlite3.Connection) -> N
 def test_prune_removes_old_cleared_and_expired_only(db: sqlite3.Connection) -> None:
     report(db, key="expired", ttl_s=3600)
     report(db, key="cleared", clear=True)
+    told(db)  # a told clear goes after a week
     report(db, key="live", ttl_s=pulse.MAX_TTL_S)
     report(db, key="fresh-clear", clear=True, now=NOW + timedelta(days=7))
     assert pulse.prune(db, NOW + timedelta(days=6)) == 0
@@ -192,7 +274,7 @@ def test_ttl_bounds(db: sqlite3.Connection, ttl_s: int) -> None:
 
 def test_bad_urgency_is_refused(db: sqlite3.Connection) -> None:
     with pytest.raises(ValueError, match="urgency"):
-        pulse.upsert(db, "x", "k", "t", "loud", None, False, 60, NOW)  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]
+        pulse.upsert(db, "x", "k", "t", "loud", None, False, 60, NOW)  # pyright: ignore[reportArgumentType]
 
 
 def test_title_is_clipped(db: sqlite3.Connection) -> None:
