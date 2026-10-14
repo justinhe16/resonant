@@ -220,6 +220,24 @@ def pending_for(conn: sqlite3.Connection, principal: str, now: datetime) -> list
     return [_row_to_approval(r) for r in rows]
 
 
+def open_at(conn: sqlite3.Connection, principal: str, at: datetime) -> list[Approval]:
+    """Approvals ``principal`` is an approver for that were open (created, undecided and
+    unexpired) at time ``at``, whatever their status now. Oldest first.
+
+    The gate uses it to judge a reply against what was pending when it was sent, so
+    re-routing an old reply can't bind an approval that has since become the only one.
+    """
+    t = iso(at)
+    rows = conn.execute(
+        """SELECT * FROM approvals WHERE created_at < ? AND expires_at > ?
+               AND (decided_at IS NULL OR decided_at > ?)
+               AND EXISTS (SELECT 1 FROM json_each(approvers) WHERE value = ?)
+           ORDER BY created_at, id""",
+        (t, t, t, principal),
+    ).fetchall()
+    return [_row_to_approval(r) for r in rows]
+
+
 def pending_by_code(conn: sqlite3.Connection, code: str, now: datetime) -> Approval | None:
     """The unexpired pending approval with this code. Codes are unique among pending."""
     r = conn.execute(

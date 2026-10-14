@@ -187,6 +187,7 @@ PolicyGate(conn, principals, registry, *, dry_run: bool, approval_ttl_s: float,
 rule(level, origin, autonomy_on) -> "allow" | "ask" | "ask_code"
 autonomy_on(conn) -> bool
 NOT_APPROVED, APPROVAL_EXPIRED, APPROVAL_USED, NO_TASK   # Deny reasons the runner templates
+REPLY_CHANNELS = {"imessage"}                           # channels whose text replies may bind
 STORE_INTERNAL_TOOLS, is_store_internal(spec)             # resonant.tools
 ```
 
@@ -199,7 +200,7 @@ STORE_INTERNAL_TOOLS, is_store_internal(spec)             # resonant.tools
   - So an intent gets at most one approval per task: after it expires, is rejected or is used, the gate never re-asks (one gated side effect per local task). A retry needs a new task.
 - **Lazy expiry:** `evaluate`, `pending_for` and `resolve` first run `expire_due(now)`. The waiting task's `wake_at = expires_at` is the backstop that wakes it.
 - `resolve(resolution)` (CLI, button): the actor must be in `approvers` and hold `approve`; then `store.approvals.resolve` and `wake_resolved` in one transaction, audited `approval.resolve`. Refusal reasons: `not_found` (also for a non-approver, so ids aren't confirmed; the audit row says `not an approver`) or the store's reason. A refused attempt is audited `decision="refused"`. This authenticated path approves L1 without typing the code.
-- `resolve_reply` returns `ResolveResult(ok=False)` until text-reply binding lands (sent-before rule, single pending, per-event idempotency). `open_batch` raises `NotImplementedError` (deferred).
+- `resolve_reply(reply)` (text replies) binds the reply to one approval (see **Binding** below), then `store.approvals.resolve(..., event_id=reply.event_id)` and `wake_resolved` in one transaction. Every attempt writes one `approval.resolve` audit row with every reply field (raw text, event id, `occurred_at`, code, path, channel, actor identity, comments) and the reason. `open_batch` raises `NotImplementedError` (deferred).
 - `pending_for(principal)` lists unexpired pending approvals as `PendingApproval`.
 
 **Allow tokens.** Every `Allow` carries a single-use token that the gate issued for one intent hash. After an approval, the runner re-evaluates the intent on wake and gets an `Allow(token, approval_id)`. Tokens live in memory, so after a restart the runner simply re-evaluates.
@@ -234,10 +235,26 @@ Request (`resonant.gate.codes`):
   - `unsafe_args(args)` returns the JSON paths (`$.text`, `$.items[1]`, `$.<key>`) of keys or strings containing control characters other than tab/newline/CR, format characters (bidi overrides and isolates, zero-width characters, BOM) line/paragraph separators, or lone surrogates. Variation selectors and private-use characters are allowed. The gate denies such intents rather than sanitizing them, so what runs always matches what was shown.
 - Config (`gate:`): `approval_ttl_s` (default 1800, 60–86400) is how long a prompt stays answerable.
 
-**Binding.** A reply resolves an approval only if all of these hold:
+**Binding** (`PolicyGate.resolve_reply`). A reply resolves an approval only if all of these hold:
 - It comes from an authenticated identity whose principal is in the approval's `approvers` list and holds `approve` for the extension.
-- It arrived as iMessage, not SMS, or from the mapped Slack user.
-- It maps to exactly one pending, unexpired approval. With several pending, the code is required. If it's ambiguous, re-ask and never guess.
+- It arrived as iMessage (`channel="imessage"`, not SMS) via the parser. Slack comes later. The router never builds a reply from a `truncated` payload.
+- **Sent-before.** The approval's prompt was sent to the actor (`Approval.sent_at(actor)`) strictly before the reply's `occurred_at`, with or without a code. A reply never binds a prompt sent after it.
+- With a code, it names one of the actor's pending, unexpired approvals. Without a code, exactly one approval is pending for the actor, both now and among those open and already sent to the actor at `occurred_at`. So an old plain reply re-routed later can't bind what has since become the only pending approval. If it's ambiguous, re-ask and never guess.
+- `require_code` (L1, pay): only `yes <code>` approves. A plain `no` may deny under the single-pending rule.
+- **Idempotent per event.** If `reply.event_id` already resolved an approval (`resolved_event_id`), the gate returns that original result with no write, wake or audit. A replay under another actor gets `nothing_pending`.
+- `yes with comments: …` approves and appends one `Event(source="gate", type="human_input", payload={approval_id, comments})` to the task (`dedupe_key="approval:<id>:comments"`), before the wake.
+
+Refusals are closed (`ReplyRefusal`, `REPLY_REFUSALS` in `resonant.gate.types`):
+
+| Reason | When |
+|---|---|
+| `nothing_pending` | Nothing is pending for the actor. A non-approver always gets this, whatever it sends, so pending approvals are never revealed. |
+| `ambiguous` | No code and several pending (now or when the reply was sent). Re-ask listing the codes. |
+| `unknown_code` | The code matches none of the actor's pending approvals. |
+| `code_required` | A plain `yes` for a `require_code` approval. |
+| `not_sent_before` | The prompt wasn't sent to the actor before the reply. |
+| `unsupported` | Not an iMessage parser reply, or a batch reply (deferred). |
+| `already_resolved`, `expired`, `task_not_waiting`, `not_found` | The store's conditional UPDATE refused (a race, or the task moved on). |
 
 **Reply parser** (`resonant.gate.replies`, Phase 2 is parser-only):
 
@@ -272,8 +289,9 @@ MAX_COMMENTS_LEN = 500
 
 ```python
 ApprovalReply(actor, actor_identity, channel, raw_text, decision: approve|deny,
-              path: parser|classifier, code=None, all_in_batch=False, batch_id=None,
-              confidence=None, comments=None)
+              path: parser|classifier, event_id, occurred_at, code=None, all_in_batch=False,
+              batch_id=None, confidence=None, comments=None)
+    # event_id, occurred_at: from the reply Event (C5); occurred_at must be timezone-aware
 ApprovalResolution(approval_id, approved, actor, actor_identity, path: button|cli, comments=None)
 ResolveResult(ok, reason, resolved: tuple[ResolvedApproval(approval_id, task_id, intent_hash, approved), ...])
 PendingApproval(approval_id, code, task_id, summary, effect, level, require_code, expires_at)
@@ -292,6 +310,7 @@ get_approval(conn, id) / pending_for_intent(conn, task_id, intent_hash, now) / p
 latest_for_intent(conn, task_id, intent_hash) -> Approval | None   # newest, any status
 was_rejected(conn, task_id, intent_hash) -> bool
 pending_for(conn, principal, now) -> list[Approval]  # unexpired, principal in approvers
+open_at(conn, principal, at) -> list[Approval]       # open (created, undecided, unexpired) at `at`, any status now
 pending_codes(conn) -> set[str]                      # for new_code
 add_channel_ref(conn, id, *, ref, at, principal) -> bool   # keeps the first send per (ref, principal)
 resolve(conn, id, *, approved, decided_by, now, event_id=None)

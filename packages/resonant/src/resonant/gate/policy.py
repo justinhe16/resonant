@@ -28,8 +28,15 @@ Approvals, per (task, intent hash):
 - Rejected, expired, or already used: Deny with ``NOT_APPROVED``, ``APPROVAL_EXPIRED`` or
   ``APPROVAL_USED``. A rejection also beats a later Allow for the same intent.
 
+Text replies (``resolve_reply``): the actor must be an approver with ``approve``, the reply an
+iMessage parser match, and the approval's prompt sent to the actor before the reply's
+``occurred_at`` (the sent-before rule). A plain yes/no binds only when exactly one approval
+is pending for the actor, now and when the reply was sent. ``require_code`` needs
+``yes <code>``; a plain no may deny. Resolution is idempotent per reply event
+(``resolved_event_id``).
+
 Expiry is lazy: every entry point first runs ``expire_due``. Every ``evaluate`` writes one
-``gate.evaluate`` audit row.
+``gate.evaluate`` audit row; every resolution attempt writes one ``approval.resolve`` row.
 """
 
 from __future__ import annotations
@@ -55,21 +62,26 @@ from resonant.gate.types import (
     NeedsApproval,
     Origin,
     PendingApproval,
+    ReplyRefusal,
     ResolveResult,
 )
 from resonant.principals import Principals
 from resonant.store import approvals as ap
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, utcnow
+from resonant.store.tasks import insert_event
 from resonant.tools import ToolRegistry, is_store_internal
 from resonant.tools.registry import ToolKey
-from resonant_sdk import Effect, Level
+from resonant_sdk import Effect, Event, Level
 
 # Deny reasons the runner maps to its templated replies.
 NOT_APPROVED = "not approved"
 APPROVAL_EXPIRED = "approval expired"
 APPROVAL_USED = "approval already used"
 NO_TASK = "approvals need a task"
+
+# Channels whose text replies may bind approvals. The iMessage reader already drops SMS.
+REPLY_CHANNELS = frozenset({"imessage"})
 
 Rule = Literal["allow", "ask", "ask_code"]
 
@@ -289,12 +301,142 @@ class PolicyGate:
         return result
 
     def resolve_reply(self, reply: ApprovalReply) -> ResolveResult:
-        """Binding a text reply (sent-before, single pending, per-event idempotency) is not
-        implemented yet, so a reply never resolves anything."""
-        return ResolveResult(ok=False, reason="text replies are not bound yet")
+        """Bind a text reply to one approval, resolve it and wake its task, in one
+        transaction. See ``ApprovalReply`` for the binding rules and ``ReplyRefusal`` for
+        the closed set of refusal reasons.
+
+        Idempotent per event: if ``reply.event_id`` already resolved an approval, this
+        returns that result again with no new effect (no write, wake or audit).
+        """
+        now = self.clock()
+        with atomic(self.conn):
+            ap.expire_due(self.conn, now)
+            earlier = ap.by_resolved_event(self.conn, reply.event_id)
+            if earlier:
+                if all(a.decided_by == reply.actor for a in earlier):
+                    return ap.resolve_result(earlier)
+                return ResolveResult(ok=False, reason="nothing_pending")
+            target, reason = self._bind(reply, now)
+            if target is not None:
+                reason = ap.resolve(
+                    self.conn,
+                    target.id,
+                    approved=reply.decision == "approve",
+                    decided_by=reply.actor,
+                    now=now,
+                    event_id=reply.event_id,
+                )
+            result = ResolveResult(ok=False, reason=reason)
+            if reason is None and target is not None:
+                done = ap.get_approval(self.conn, target.id)
+                assert done is not None
+                result = ap.resolve_result([done])
+                if reply.comments and reply.decision == "approve":
+                    _add_comments(self.conn, done, reply)
+                ap.wake_resolved(self.conn, result, now, principal=reply.actor)
+            audit(
+                self.conn,
+                "approval.resolve",
+                task_id=target.task_id if target else None,
+                requested_by=reply.actor,
+                approved_by=reply.actor if result.ok and reply.decision == "approve" else None,
+                tool=target.tool if target else None,
+                extension=target.extension if target else None,
+                intent_hash=target.intent_hash if target else None,
+                decision=("approved" if reply.decision == "approve" else "rejected")
+                if result.ok
+                else "refused",
+                requested=reply.decision,
+                approval_id=target.id if target else None,
+                actor_identity=reply.actor_identity,
+                channel=reply.channel,
+                path=reply.path,
+                code=reply.code,
+                event_id=reply.event_id,
+                occurred_at=reply.occurred_at.isoformat(),
+                raw_text=reply.raw_text,
+                comments=reply.comments,
+                ok=result.ok,
+                reason=reason,
+            )
+        return result
+
+    def _bind(
+        self, reply: ApprovalReply, now: datetime
+    ) -> tuple[ap.Approval | None, ReplyRefusal | None]:
+        """The approval this reply binds to, or why it binds none."""
+        if (
+            reply.channel not in REPLY_CHANNELS
+            or reply.path != "parser"
+            or reply.all_in_batch
+            or reply.batch_id is not None
+        ):
+            return None, "unsupported"
+        mine = [
+            a for a in ap.pending_for(self.conn, reply.actor, now) if self._may_approve(reply, a)
+        ]
+        if not mine:
+            return None, "nothing_pending"  # also what a non-approver always gets
+        if reply.code is not None:
+            code = reply.code.upper()
+            target = next((a for a in mine if a.code == code), None)
+            if target is None:
+                return None, "unknown_code"
+        elif len(mine) > 1:
+            return None, "ambiguous"
+        else:
+            target = mine[0]
+        if not _sent_before(target, reply):
+            return None, "not_sent_before"
+        if reply.code is None:
+            # Judge a plain reply against what the actor had been shown when they sent it,
+            # so an old reply re-routed later can't bind what has since become the only one.
+            seen = [
+                a.id
+                for a in ap.open_at(self.conn, reply.actor, reply.occurred_at)
+                if self._may_approve(reply, a) and _sent_before(a, reply)
+            ]
+            if seen != [target.id]:
+                return None, "ambiguous"
+            if target.require_code and reply.decision == "approve":
+                return None, "code_required"
+        return target, None
+
+    def _may_approve(self, reply: ApprovalReply, a: ap.Approval) -> bool:
+        return (
+            a.task_id is not None
+            and reply.actor in a.approvers
+            and self.principals.can(reply.actor, "approve", a.extension)
+        )
 
     def open_batch(self, principal: str, approval_ids: Sequence[str]) -> ApprovalBatch:
         raise NotImplementedError("batch approvals are deferred")
+
+
+def _sent_before(a: ap.Approval, reply: ApprovalReply) -> bool:
+    """The sent-before rule: the prompt reached the actor before the reply was sent."""
+    sent = a.sent_at(reply.actor)
+    return sent is not None and sent < reply.occurred_at
+
+
+def _add_comments(conn: sqlite3.Connection, a: ap.Approval, reply: ApprovalReply) -> None:
+    """``yes with comments: ...``: a ``human_input`` event for the task, at most once."""
+    assert a.task_id is not None
+    row = conn.execute("SELECT trace_id FROM tasks WHERE id = ?", (a.task_id,)).fetchone()
+    assert row is not None  # resolve just checked the task is waiting or running
+    insert_event(
+        conn,
+        Event(
+            source="gate",
+            type="human_input",
+            task_id=a.task_id,
+            principal=reply.actor,
+            payload={"approval_id": a.id, "comments": reply.comments},
+            dedupe_key=f"approval:{a.id}:comments",
+            occurred_at=reply.occurred_at,
+            trace_id=row["trace_id"],
+        ),
+    )
 
 
 def _needs(a: ap.Approval) -> NeedsApproval:
