@@ -146,7 +146,7 @@ Intent.for_tool(spec: ToolSpec, *, task_id, principal, args, scope_id=None, trac
     .hash  # recomputed on every access:
            # sha256(canonical_json({tool, extension, args, effect, level, commit}))
            # origin is not hashed: an approval binds to what runs, not to who asked
-Origin = Literal["explicit", "inferred"]   # anything else raises ValueError
+Origin = Literal["explicit", "inferred", "scheduled"]   # anything else raises ValueError
 canonical_json(value)  # sorted keys; rejects non-str keys, NaN/Infinity, non-JSON types
 
 Decision = Allow(token, approval_id=None)
@@ -164,7 +164,7 @@ class Gate(TokenVerifier, Protocol):
     def resolve_reply(self, reply: ApprovalReply) -> ResolveResult: ...      # text reply: gate binds it
 ```
 
-**Origin** says who chose the action. Code sets `"explicit"` in exactly one place, the local runner's `direct_call` path, whose checkpoint only the router's deterministic command parser writes. Everything the model chooses, and later every scheduled or extension job, is `"inferred"`. It is never read from model output.
+**Origin** says who chose the action. Code sets `"explicit"` in exactly one place, the local runner's `direct_call` path, whose checkpoint only the router's deterministic command parser writes. Everything the model chooses is `"inferred"`. A job that fired on its schedule is `"scheduled"`: only the scheduler and the job runner set it, and the gate treats it like `"inferred"`, so it is **never explicit**. The router and the local runner never set it (a test scans them). Origin is never read from model output.
 
 Evaluation order (Phase 2, `resonant.gate.PolicyGate`):
 1. **Registration:** if `registry.get(extension, tool) != intent.spec`, Deny. An intent can't claim an effect or level its tool wasn't registered with.
@@ -173,18 +173,21 @@ Evaluation order (Phase 2, `resonant.gate.PolicyGate`):
 4. **dry_run:** a tool that is neither an L0 read nor store-internal becomes `DryRun(would=<summary>)`. The summary uses the tool's code-built heading when it has one (`restart Ollama`), as approval prompts do.
 5. **Level × origin × autonomy** (`policy.rule`):
 
-| Level | autonomy on, explicit | autonomy on, inferred | autonomy off |
+| Level | autonomy on, explicit | autonomy on, inferred / scheduled | autonomy off |
 |---|---|---|---|
 | L0 | Allow | Allow | Allow |
 | L3 | Allow | Allow | NeedsApproval |
 | L2 | Allow | NeedsApproval | NeedsApproval |
 | L1 (destructive, pay) | NeedsApproval, `require_code=True` | same | same |
 
-`evaluate` never returns `Veto` in Phase 2; the type stays for Phase 3 unattended jobs. Reporting after an L3 or explicit Allow (`Done: <summary>`) is the runner's job.
+`evaluate` never returns `Veto` yet (veto windows are deferred); the type stays for them. Reporting after an L3 or explicit Allow (`Done: <summary>`) is the runner's job.
 
 ```python
 PolicyGate(conn, principals, registry, *, dry_run: bool, approval_ttl_s: float,
-           actions: {(extension, tool): (Intent) -> str | None} = {}, clock=utcnow)
+           actions: {(extension, tool): (Intent) -> str | None} = {},
+           approvers_for: ApproversFor = no_manifest_approvers, clock=utcnow)
+ApproversFor = Callable[[str], Sequence[str]]   # extension -> the names its manifest lists
+PolicyGate.approvers(extension: str | None) -> tuple[str, ...]
 rule(level, origin, autonomy_on) -> "allow" | "ask" | "ask_code"
 autonomy_on(conn) -> bool
 NOT_APPROVED, APPROVAL_EXPIRED, APPROVAL_USED, NO_TASK   # Deny reasons the runner templates
@@ -194,7 +197,8 @@ STORE_INTERNAL_TOOLS, is_store_internal(spec)             # resonant.tools
 
 - **Kill switch:** kv `autonomy` is read on every `evaluate`. Anything but `"on"` (missing, garbage, unparseable) counts as off: fail closed.
 - **dry_run exemption** is keyed on registry identity: `is_store_internal(spec)` is true only for a builtin (`extension=None`, `source="builtin"`, no secrets) named in `STORE_INTERNAL_TOOLS = {add_note, delete_note, clear_notes, add_reminder, cancel_reminder}`. A test pins the set. An extension tool with the same name is not exempt, and ops tools never are. Exempt tools still go through step 5.
-- **Approvals** per (task, intent hash). "Ask" reuses the pending approval if there is one; otherwise it inserts one with `approvers=(owner,)` (global scope is owner-only), `expires_at = now + gate.approval_ttl_s`, a fresh code, and a code-built summary (`summarize(intent, action=actions[(extension, tool)](intent))` when an action is registered). An intent whose `task_id` has no task row (the router's fast path) gets `Deny(NO_TASK)`.
+- **Approvers** (`approvers(extension)`). A builtin (`extension=None`, global scope) is owner-only: `(owner,)`, and no manifest is consulted. An extension tool's approvers are the owner first, then each name from `approvers_for(extension)` (the manifest's `approvers`, untrusted) that holds `approve` for that extension in `principals.yaml`, in manifest order, deduped. A name without the grant, or an unknown name, is dropped and logged, so an extension can never grant itself approvers. The default `no_manifest_approvers` returns `()` (owner only) until the extension host supplies manifests. A pending approval keeps the approvers it was created with; `resolve` and `resolve_reply` re-check the grant at resolution time.
+- **Approvals** per (task, intent hash). "Ask" reuses the pending approval if there is one; otherwise it inserts one with `approvers=gate.approvers(extension)`, `expires_at = now + gate.approval_ttl_s`, a fresh code, and a code-built summary (`summarize(intent, action=actions[(extension, tool)](intent))` when an action is registered). An intent whose `task_id` has no task row (the router's fast path) gets `Deny(NO_TASK)`.
   - Approved and unused: `Allow(token, approval_id)`.
   - Any rejected approval for the intent: `Deny(NOT_APPROVED)`, even if the table would now Allow (the owner's "no" holds for that intent).
   - Expired: `Deny(APPROVAL_EXPIRED)`. Used: `Deny(APPROVAL_USED)`; a used approval never yields another Allow.
@@ -724,11 +728,21 @@ One step answers the whole task, unless it waits for an approval. In this order:
 - **Pinned** with `ctx.save` before it is gated (direct) or run or prompted (model), so `idempotency_key(task_id, step_no, call_index, intent.hash)` stays the same across retries, waits and restarts.
 - **Resume:** `executor.recorded(key)` first. Succeeded: replay the report, no gate call. Started: ambiguous, reported (`Not sure whether <summary> ran…`) and never re-run. Failed: the definite failure is reported. None: `gate.evaluate`.
 - `Allow`: `executor.execute(intent, decision, step_no=pinned, call_index=pinned)`. The reply is code-built: `Saved note 3: "buy milk"`, `Deleted note 3.`, `Cleared 4 notes.`, `⏰ Reminder 3 set for 3:20pm: "stretch"` (the due time from `format_due`), `Cancelled reminder 3.`, `Restarting Resonant…` (builtins in `REPORTS`; see [Ops](#ops-resonantops-resonanttoolsops)), else `Done: <summary>`. A definite failure replies `Failed: <summary>` with the handler's `ToolFailed` message. `<summary>` uses the ops heading when there is one (`Failed: update Resonant (…)`), as approval prompts and dry-run replies do.
-- `NeedsApproval`: `channel.request_approval(approver, ApprovalPrompt)` for each approver, then `approvals.add_channel_ref(id, ref, at=now(), principal)`, then `Wait("approval", wake_at=expires_at)`. Every pending step re-prompts (a spurious wake, a crash between save and prompt); the channel dedupes by `approval_dedupe_key`, and the first send time is kept. `ChannelRefused` fails for good; any other `ChannelError` is a retryable `Fail`.
+- `NeedsApproval`: `runners.approve.prompt_approvers` sends `channel.request_approval(approver, ApprovalPrompt)` to **every** approver in order and records each sent ref with `approvals.add_channel_ref(id, ref, at=now(), principal)`, then `Wait("approval", wake_at=expires_at)`. Every pending step re-prompts (a spurious wake, a crash between save and prompt); the channel dedupes by `approval_dedupe_key`, and the first send time is kept. An approver the channel refuses (`ChannelRefused`: no identity) is skipped and audited `approval.unreachable`, and the others still get the prompt; the task fails for good only if **no** approver was reachable. Any other `ChannelError` is a retryable `Fail` after the remaining approvers are tried.
 - `DryRun`: `Dry run: would <summary>`. `Deny`: `Not done.` (`NOT_APPROVED`), `Not done: the approval for <summary> expired.` (`APPROVAL_EXPIRED`), `Not done: that approval was already used.` (`APPROVAL_USED`), else `Not done: <reason>.`
 - After an approval or a direct call there are no more model rounds: the reply is templated.
 
-Failures: `ModelUnavailableError` sends one templated fallback (the report line if a side effect ran, else the tool summary if tools already ran, else `FALLBACK_REPLY`) and the task is `done`. `ChannelRefused` is a final `Fail`; any other `ChannelError` is `Fail(retryable=True)`, and the dedupe key prevents a double send. Spans: `runner.local`, `runner.local.context`, `runner.local.tool`, `runner.local.call` (`origin`, `decision`, `recorded`), `runner.local.approval`, `runner.local.final` (`outcome`: `ok | number_guard | bad_output | empty`) and `runner.local.send`, plus the model's `llm.call`. None carry message or reply text.
+Failures: `ModelUnavailableError` sends one templated fallback (the report line if a side effect ran, else the tool summary if tools already ran, else `FALLBACK_REPLY`) and the task is `done`. For the reply send, `ChannelRefused` is a final `Fail`; any other `ChannelError` is `Fail(retryable=True)`, and the dedupe key prevents a double send. Spans: `runner.local`, `runner.local.context`, `runner.local.tool`, `runner.local.call` (`origin`, `decision`, `recorded`), `runner.local.approval` (`approvers`, `reached`, `unreachable`), `runner.local.final` (`outcome`: `ok | number_guard | bad_output | empty`) and `runner.local.send`, plus the model's `llm.call`. None carry message or reply text.
+
+**Approval sends** (`resonant.runners.approve`, shared with the job runner):
+
+```python
+approval_prompt(decision: NeedsApproval) -> ApprovalPrompt
+async prompt_approvers(conn, channel, decision: NeedsApproval, *, task_id, now) -> PromptResult
+PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: ChannelError | None)
+    .retry            # a transient ChannelError: Fail(retryable=True)
+    .none_reachable   # no error and nobody reached: fail for good
+```
 
 ## Daemon wiring: `resonant.wiring`, `resonant.daemon`
 

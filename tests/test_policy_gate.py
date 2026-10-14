@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -31,7 +32,7 @@ from resonant.gate.policy import (
     autonomy_on,
     rule,
 )
-from resonant.gate.types import Origin
+from resonant.gate.types import ORIGINS, Origin
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.principals import Principals
 from resonant.store import approvals as ap
@@ -142,32 +143,52 @@ def approve(gate: PolicyGate, approval_id: str, *, approved: bool = True) -> Non
     assert result.ok, result.reason
 
 
-# --- the D1 table ----------------------------------------------------------------------
+# --- the D1 / D7 table -----------------------------------------------------------------
 
 # (level, origin, autonomy on) -> expected verdict. Written out, not derived from `rule`.
 TABLE: dict[tuple[Level, Origin, bool], str] = {
     (Level.L0, "explicit", True): "allow",
     (Level.L0, "inferred", True): "allow",
+    (Level.L0, "scheduled", True): "allow",
     (Level.L0, "explicit", False): "allow",
     (Level.L0, "inferred", False): "allow",
+    (Level.L0, "scheduled", False): "allow",
     (Level.L3, "explicit", True): "allow",
     (Level.L3, "inferred", True): "allow",
+    (Level.L3, "scheduled", True): "allow",
     (Level.L3, "explicit", False): "ask",
     (Level.L3, "inferred", False): "ask",
+    (Level.L3, "scheduled", False): "ask",
     (Level.L2, "explicit", True): "allow",
     (Level.L2, "inferred", True): "ask",
+    (Level.L2, "scheduled", True): "ask",
     (Level.L2, "explicit", False): "ask",
     (Level.L2, "inferred", False): "ask",
+    (Level.L2, "scheduled", False): "ask",
     (Level.L1, "explicit", True): "ask_code",
     (Level.L1, "inferred", True): "ask_code",
+    (Level.L1, "scheduled", True): "ask_code",
     (Level.L1, "explicit", False): "ask_code",
     (Level.L1, "inferred", False): "ask_code",
+    (Level.L1, "scheduled", False): "ask_code",
 }
 
 
 @pytest.mark.parametrize(("key", "verdict"), TABLE.items())
 def test_rule_matches_table(key: tuple[Level, Origin, bool], verdict: str) -> None:
     assert rule(*key) == verdict
+
+
+def test_table_covers_every_origin() -> None:
+    assert ORIGINS == ("explicit", "inferred", "scheduled")
+    assert set(TABLE) == {(lv, o, a) for lv in Level for o in ORIGINS for a in (True, False)}
+
+
+@pytest.mark.parametrize("autonomy", [True, False])
+@pytest.mark.parametrize("level", list(Level))
+def test_scheduled_is_never_explicit(level: Level, autonomy: bool) -> None:
+    assert rule(level, "scheduled", autonomy) == rule(level, "inferred", autonomy)
+    assert rule(Level.L2, "scheduled", autonomy) != "allow"
 
 
 def _set_autonomy(db: sqlite3.Connection, value: str) -> None:
@@ -201,7 +222,7 @@ MATRIX_SPECS = [
 
 @pytest.mark.parametrize("dry_run", [False, True])
 @pytest.mark.parametrize("autonomy", ["on", "off", "garbage"])
-@pytest.mark.parametrize("origin", ["explicit", "inferred"])
+@pytest.mark.parametrize("origin", ORIGINS)
 @pytest.mark.parametrize(("spec", "exempt"), MATRIX_SPECS, ids=lambda v: getattr(v, "name", v))
 def test_decision_matrix(
     db: sqlite3.Connection,
@@ -530,3 +551,127 @@ async def test_recorded(db: sqlite3.Connection, gate: PolicyGate, task_id: str) 
     db.execute("UPDATE executions SET status = 'started' WHERE idempotency_key = ?", (key,))
     started = ex.recorded(key)
     assert started is not None and started.ambiguous and not started.ok
+
+
+# --- extension approvers (D8) ------------------------------------------------------------
+
+EXT_ROTATE = ToolSpec(
+    name="rotate", effect=Effect.WRITE, level=Level.L2, source="ext:dori", extension="dori"
+)
+
+
+def team() -> Principals:
+    return Principals.model_validate(
+        {
+            "principals": {
+                "justin": {"role": "owner"},
+                "cofounder": {"grants": {"dori": ["request", "approve"]}},
+                "viewer": {"grants": {"dori": ["request"]}},  # no approve
+                "elsewhere": {"grants": {"trade": ["request", "approve"]}},  # other extension
+            }
+        }
+    )
+
+
+def team_gate(
+    db: sqlite3.Connection, clock: Clock, named: list[str], calls: list[str] | None = None
+) -> PolicyGate:
+    reg = ToolRegistry()
+    for spec in (EXT_ROTATE, RESTART):
+        reg.register(spec)
+    kv_set(db, "autonomy", "on")
+
+    def approvers_for(ext: str) -> list[str]:
+        if calls is not None:
+            calls.append(ext)
+        return named
+
+    return make_gate(db, team(), reg, clock, approvers_for=approvers_for)
+
+
+def test_approvers_are_manifest_names_with_the_grant(
+    db: sqlite3.Connection, clock: Clock, task_id: str
+) -> None:
+    named = ["viewer", "ghost", "cofounder", "elsewhere", "cofounder", "justin"]
+    gate = team_gate(db, clock, named)
+    assert gate.approvers("dori") == ("justin", "cofounder")
+
+    asked = gate.evaluate(intent(EXT_ROTATE, task_id, origin="scheduled"))
+    assert isinstance(asked, NeedsApproval) and asked.approvers == ("justin", "cofounder")
+    row = ap.get_approval(db, asked.approval_id)
+    assert row is not None and row.approvers == ("justin", "cofounder")
+
+
+def test_an_extension_cant_grant_itself_approvers(
+    db: sqlite3.Connection, clock: Clock, task_id: str
+) -> None:
+    # Naming principals in the manifest grants nothing: only principals.yaml does.
+    gate = team_gate(db, clock, ["viewer", "elsewhere", "ghost"])
+    asked = gate.evaluate(intent(EXT_ROTATE, task_id))
+    assert isinstance(asked, NeedsApproval) and asked.approvers == ("justin",)
+    nope = gate.resolve(ApprovalResolution(asked.approval_id, True, "viewer", "x", "cli"))
+    assert not nope.ok and nope.reason == "not_found"
+
+
+def test_default_extension_approvers_are_the_owner(
+    db: sqlite3.Connection, principals: Principals, registry: ToolRegistry, clock: Clock
+) -> None:
+    assert make_gate(db, principals, registry, clock).approvers("dori") == ("justin",)
+
+
+def test_builtins_never_consult_a_manifest(
+    db: sqlite3.Connection, clock: Clock, task_id: str
+) -> None:
+    calls: list[str] = []
+    gate = team_gate(db, clock, ["cofounder"], calls)
+    asked = gate.evaluate(intent(RESTART, task_id))
+    assert isinstance(asked, NeedsApproval) and asked.approvers == ("justin",)
+    assert calls == []
+
+
+def test_member_approver_resolves_an_extension_approval(
+    db: sqlite3.Connection, clock: Clock, task_id: str
+) -> None:
+    gate = team_gate(db, clock, ["cofounder"])
+    asked = gate.evaluate(intent(EXT_ROTATE, task_id, origin="scheduled"))
+    assert isinstance(asked, NeedsApproval)
+    repo.set_status(db, task_id, "waiting", wait_reason="approval", wake_at=asked.expires_at)
+    assert [p.approval_id for p in gate.pending_for("cofounder")] == [asked.approval_id]
+
+    done = gate.resolve(ApprovalResolution(asked.approval_id, True, "cofounder", "cli", "cli"))
+    assert done.ok, done.reason
+    allowed = gate.evaluate(intent(EXT_ROTATE, task_id, origin="scheduled"))
+    assert isinstance(allowed, Allow) and allowed.approval_id == asked.approval_id
+
+
+@pytest.mark.parametrize("level", [Level.L0, Level.L3])
+def test_scheduled_l0_and_l3_run(
+    db: sqlite3.Connection, clock: Clock, task_id: str, level: Level
+) -> None:
+    spec = ToolSpec(
+        name="job_cleanup",
+        effect=Effect.READ if level is Level.L0 else Effect.WRITE,
+        level=level,
+        source="ext:dori",
+        extension="dori",
+    )
+    reg = ToolRegistry()
+    reg.register(spec)
+    kv_set(db, "autonomy", "on")
+    gate = make_gate(db, team(), reg, clock)
+    assert isinstance(gate.evaluate(intent(spec, task_id, origin="scheduled")), Allow)
+    kv_set(db, "autonomy", "off")
+    off = gate.evaluate(intent(spec, task_id, origin="scheduled"))
+    assert isinstance(off, Allow) is (level is Level.L0)
+
+
+def test_chat_paths_never_set_scheduled() -> None:
+    """Only the scheduler and the job runner may set ``scheduled``; the router and the local
+    runner (model and slash-command paths) never do."""
+    import resonant.router
+    import resonant.runners.local
+
+    router_dir = Path(resonant.router.__file__).parent
+    sources = [Path(resonant.runners.local.__file__), *sorted(router_dir.glob("*.py"))]
+    for path in sources:
+        assert '"scheduled"' not in path.read_text(), path.name
