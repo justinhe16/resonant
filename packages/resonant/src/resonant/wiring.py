@@ -35,6 +35,15 @@ the gate's approvers for the extension (owner first). The scheduler itself is th
 (it runs L0 jobs with iMessage off too); a gated job task left with no job runner fails as
 ``unknown runner``, like a reminder.
 
+Notifications. The loop's router hook is :func:`route_event`: ``ext:*`` events (stored by
+job runs) go to ``extensions.notify.Notifier.route``, everything else to ``Router.route``,
+which is unchanged. The notifier sends to the same recipients as job reports, and its
+``run`` (started by the daemon) sends the end-of-hour ``+N more updates``. With iMessage
+off there is no router hook: extension events wait unrouted, as messages would.
+
+Extension health. The monitor gets ``extensions.host.ExtensionHealth`` as its dynamic
+``ext:<name>`` checks (health commands, job fail streaks, load refusals, tampering).
+
 Reminders. ``runner="reminder"`` sends due reminders through the iMessage channel, so it is
 registered here, not in Phase 0. ``add_reminder`` only runs inside the loop (the router or a
 runner step). The loop ticks again after every step and then sleeps only until the earliest
@@ -53,11 +62,12 @@ from dataclasses import dataclass, field
 
 from resonant.components import Components
 from resonant.config import ModelConfig, Settings
-from resonant.extensions.host import send_alerts
+from resonant.extensions.host import ExtensionHealth, send_alerts
+from resonant.extensions.notify import Notifier
 from resonant.gate import PolicyGate
 from resonant.gateway.imessage.channel import IMessageChannel
 from resonant.gateway.imessage.sender import OsaRunner
-from resonant.loop import Loop
+from resonant.loop import Loop, NewTask
 from resonant.models import ModelClient
 from resonant.monitor import HealthMonitor
 from resonant.ops import back_up
@@ -65,7 +75,7 @@ from resonant.router import Router
 from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
 from resonant.runners.reminder import ReminderRunner
-from resonant_sdk import ToolSpec
+from resonant_sdk import Event, ToolSpec
 from resonant_sdk.manifest import TOOL_TIMEOUT_MAX_S
 
 log = logging.getLogger(__name__)
@@ -89,6 +99,20 @@ def local_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> floa
     return max(model_s, tool_s) + STEP_SLACK_S
 
 
+RouteFn = Callable[[Event], Awaitable[NewTask | None]]
+
+
+def route_event(router: RouteFn, notifier: Notifier) -> RouteFn:
+    """The loop's router hook: ``ext:*`` events to the notifier, the rest to the router."""
+
+    async def route(event: Event) -> NewTask | None:
+        if event.source.startswith("ext:"):
+            return await notifier.route(event)
+        return await router(event)
+
+    return route
+
+
 @dataclass
 class IMessageStack:
     channel: IMessageChannel
@@ -99,6 +123,7 @@ class IMessageStack:
     model: ModelClient
     owner: str | None = None  # gets "back up" after a requested restart
     jobs: JobRunner | None = None
+    notifier: Notifier | None = None
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     _started: bool = field(default=False, repr=False)
 
@@ -125,8 +150,11 @@ class IMessageStack:
             log.exception("extension alerts failed")  # never blocks the start
 
     async def stop(self) -> None:
-        """Stop the monitor and the reader. Safe to call twice or before ``start``."""
+        """Stop the monitor, the notifier's flush and the reader. Safe to call twice or
+        before ``start``."""
         self.monitor.stop()
+        if self.notifier is not None:
+            self.notifier.stop()
         if self._started:
             self._started = False
             await self.channel.stop()
@@ -151,7 +179,8 @@ def build_imessage_stack(
 ) -> IMessageStack:
     """Build the channel, router, runners and monitor, and hook them into ``loop``.
 
-    Sets ``loop.router`` to ``Router.route`` and registers ``runner="local"``,
+    Sets ``loop.router`` to :func:`route_event` (the notifier, then ``Router.route``) and
+    registers ``runner="local"``,
     ``runner="reminder"`` and ``runner="job"`` in both ``components.runners`` and
     ``loop.runners``. ``model``
     defaults to an ``OllamaClient`` over ``settings.model`` (closed by
@@ -191,17 +220,27 @@ def build_imessage_stack(
     reminders = ReminderRunner(conn, channel=channel, timezone=settings.timezone)
     components.runners[reminders.name] = reminders
     loop.runners[reminders.name] = reminders
-    loop.router = router.route
-
     gate = components.gate
     fallback = (components.principals.owner,)
+    recipients: Callable[[str], tuple[str, ...]] = (
+        gate.approvers if isinstance(gate, PolicyGate) else lambda _ext: fallback
+    )
+    host = components.extensions
+    notifier = Notifier(
+        conn,
+        channel=channel,
+        recipients=recipients,
+        manifest_of=(lambda _ext: None) if host is None else host.manifest,
+        config=settings.extensions.notify,
+    )
+    loop.router = route_event(router.route, notifier)
     jobs = JobRunner(
         conn,
         gate=gate,
         executor=components.executor,
         registry=components.registry,
         channel=channel,
-        recipients=gate.approvers if isinstance(gate, PolicyGate) else lambda _ext: fallback,
+        recipients=recipients,
         timezone=settings.timezone,
     )
     components.runners[jobs.name] = jobs
@@ -216,6 +255,11 @@ def build_imessage_stack(
         daemon_healthy=daemon_healthy,
         db_path=settings.db_path,
         model_meta={"model": settings.model.name, "api": settings.model.api},
+        ext_checks=(
+            None
+            if host is None
+            else ExtensionHealth.from_settings(settings, host, components.executor.secrets)
+        ),
     )
     return IMessageStack(
         channel=channel,
@@ -226,5 +270,6 @@ def build_imessage_stack(
         model=model,
         owner=owner,
         jobs=jobs,
+        notifier=notifier,
         _close_model=close_model,
     )

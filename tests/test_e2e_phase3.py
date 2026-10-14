@@ -39,17 +39,20 @@ from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.e2e.extensions import install_fixture
 from resonant.e2e.fakes import DEFAULT_FINAL_REPLY
 from resonant.extensions.host import tampered_text
+from resonant.extensions.notify import mute
 from resonant.extensions.scheduler import LAST_TICK_KEY
 from resonant.gate import Allow, Intent
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import NewTask
 from resonant.loop.types import PRIORITY_OWNER, Done, StepContext, StepOutcome, Task
 from resonant.models import ChatMessage, ModelReply, SpanFactory
+from resonant.monitor import health_snapshot
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.router.fast_path import KILL_REPLY, RESUME_REPLY
 from resonant.secrets import FakeKeychain, SecretStore
 from resonant.store.db import iso, kv_set, open_db, transaction, utcnow
 from resonant.store.extensions import get_extension, mark_due
+from resonant.store.tasks import unrouted_events
 from resonant_sdk import Event, ToolSpec
 
 OWNER_PHONE = "+15551234567"
@@ -571,3 +574,168 @@ def process_gone(pid: int) -> bool:
         return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return True
+
+
+# --- E12: github watch, deterministic, exactly once ----------------------------------------
+
+GITHUB = REPO / "extensions/github"
+RESONANT = "justinhe16/resonant"
+# A due time of github/watch (*/10), far enough ahead that the real clock never reaches it.
+WATCH_T0 = utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+
+def gh_pr(number: int, sha: str) -> dict[str, Any]:
+    return {
+        "number": number,
+        "title": "A change",
+        "url": f"https://github.com/{RESONANT}/pull/{number}",
+        "isDraft": False,
+        "createdAt": "2026-10-10T00:00:00Z",
+        "updatedAt": "2026-10-13T00:00:00Z",
+        "headRefName": f"branch-{number}",
+        "headRefOid": sha,
+        "reviewDecision": "REVIEW_REQUIRED",
+        "repository": {"nameWithOwner": RESONANT},
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]},
+    }
+
+
+def gh_run(run_id: int, sha: str, conclusion: str) -> dict[str, Any]:
+    return {
+        "databaseId": run_id,
+        "workflowName": "lint",
+        "status": "completed",
+        "conclusion": conclusion,
+        "headSha": sha,
+        "createdAt": f"2026-10-14T00:{run_id:02d}:00Z",
+    }
+
+
+class GhWorld:
+    """The fake ``gh`` on the extensions' PATH: PR #40 is driven red/green; PR #41 was fixed
+    before the install (its ``fixed`` event is part of the first run's baseline)."""
+
+    def __init__(self, root: Path) -> None:
+        self.bin = root / "gh-bin"
+        self.bin.mkdir()
+        self.state_path = root / "gh-state" / "state.json"
+        self.state_path.parent.mkdir()
+        shim = self.bin / "gh"
+        shim.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" -I -S "{FAKE_GH}" "{self.state_path}" "$@"\n'
+        )
+        shim.chmod(0o755)
+        self.pr40: list[dict[str, Any]] = []
+
+    def set_pr40(self, sha: str, *runs: dict[str, Any]) -> None:
+        self.pr40 = [*runs, *self.pr40]
+        state = {
+            "token": GH_TOKEN,
+            "mine": [gh_pr(40, sha), gh_pr(41, "t2")],
+            "review": [],
+            "runs": {
+                f"{RESONANT}:branch-40": self.pr40,
+                f"{RESONANT}:branch-41": [gh_run(6, "t2", "success"), gh_run(5, "t1", "failure")],
+            },
+        }
+        self.state_path.write_text(json.dumps(state))
+
+
+def github_daemon(settings: Settings, osa: RecordingOsaRunner) -> Daemon:
+    """The daemon's parts, not its run loop: the test drives the scheduler and the loop."""
+    keychain = FakeKeychain(items={"github/token": GH_TOKEN})
+    return Daemon(
+        settings,
+        model=ScriptedModel(),
+        osa_runner=osa,
+        ops_runner=FakeOpsRunner(),
+        secrets=SecretStore(keychain),
+    )
+
+
+async def watch(daemon: Daemon, k: int) -> None:
+    """github/watch at its k-th due time, twice (a second tick at the same state finds
+    nothing new). Routing is left to the caller."""
+    for _ in range(2):
+        await daemon.scheduler.tick(WATCH_T0 + timedelta(minutes=10 * k))
+        await daemon.scheduler.drain()
+
+
+async def test_e12_github_red_green_red_notifies_exactly_once_across_crashes(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    gh = GhWorld(tmp_path)
+    (resonant_home / "principals.yaml").write_text(PRINCIPALS)
+    settings = load_settings(
+        dry_run=False,
+        api={"port": free_port()},
+        channels={"imessage": {"enabled": True, "db_path": chat.path, "self_handle": SELF}},
+        extensions={"process": {"path": [str(gh.bin), "/usr/bin", "/bin"]}},
+    )
+    manifest = (GITHUB / "resonant.yaml").read_text()
+    install(settings, manifest, {"cli.py": (GITHUB / "cli.py").read_text()})
+    osa = RecordingOsaRunner()
+
+    def texts() -> list[str]:
+        return [m.text for m in osa.sent]
+
+    def unrouted() -> list[Event]:
+        return [e for e in unrouted_events(d.conn) if e.source == "ext:github"]
+
+    # Run 1 (the first after install): #40 green, #41 just fixed. Stored as the baseline,
+    # never sent: no "fixed" for a PR that was already green.
+    d = github_daemon(settings, osa)
+    gh.set_pr40("s1", gh_run(1, "s1", "success"))
+    await watch(d, 0)
+    await d.loop.run_once()
+    assert texts() == []
+    stored = d.conn.execute("SELECT payload FROM events WHERE source = 'ext:github'").fetchall()
+    assert [json.loads(r["payload"]).get("baseline") for r in stored] == [True]
+
+    # Red, then a crash after the event is stored and before it is sent.
+    gh.set_pr40("s2", gh_run(2, "s2", "failure"))
+    await watch(d, 1)
+    assert len(unrouted()) == 1 and texts() == []
+    d.conn.close()
+    d = github_daemon(settings, osa)  # the restart delivers it, once
+    await d.loop.run_once()
+    assert texts() == ["[github] ✗ resonant#40 CI failed (lint)"]
+
+    # Green, then a crash after the send and before the loop consumed the event.
+    gh.set_pr40("s3", gh_run(3, "s3", "success"))
+    await watch(d, 2)
+    (fixed,) = unrouted()
+    assert d.imessage is not None and d.imessage.notifier is not None
+    await d.imessage.notifier.route(fixed)  # sent; the daemon dies before consuming it
+    d.conn.close()
+    d = github_daemon(settings, osa)
+    await d.loop.run_once()  # routed again: the channel's dedupe record stops a resend
+    assert unrouted() == []
+    assert texts() == ["[github] ✗ resonant#40 CI failed (lint)", "[github] ✓ resonant#40 CI fixed"]
+
+    # Red again, delivered by the loop.
+    gh.set_pr40("s4", gh_run(4, "s4", "failure"))
+    await watch(d, 3)
+    await d.loop.run_once()
+    await watch(d, 4)  # unchanged state: nothing new
+    await d.loop.run_once()
+    assert texts() == [
+        "[github] ✗ resonant#40 CI failed (lint)",
+        "[github] ✓ resonant#40 CI fixed",
+        "[github] ✗ resonant#40 CI failed (lint)",
+    ]
+    assert {m.handle for m in osa.sent} == {OWNER_PHONE}
+
+    # Muted: a new failure is stored and held, never sent (not even after the mute ends).
+    mute(d.conn, "github", utcnow() + timedelta(hours=1), by="justin")
+    gh.set_pr40("s5", gh_run(7, "s5", "failure"))
+    await watch(d, 5)
+    await d.loop.run_once()
+    assert len(texts()) == 3 and unrouted() == []
+    assert len(audit_rows(d.conn, "ext.notify_held")) == 2  # the baseline and this one
+
+    # Health: the real `cli.py health` against the fake gh, through the monitor.
+    assert d.imessage is not None
+    await d.imessage.monitor.evaluate()
+    assert health_snapshot(d.conn)["ext:github"]["state"] == "ok"
+    d.conn.close()

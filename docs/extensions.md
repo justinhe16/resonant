@@ -156,6 +156,9 @@ Your processes report what happened by emitting events: either an `"events"` lis
 - Events arrive as `ext.<name>.<event>`. Core sets the principal, so extensions can never claim one.
 - `notify.on` chooses which events are forwarded to people over `channel`.
 - `dedupe_key` is required (≤ 200 chars), so retries don't double-notify.
+- Each job's first successful run after install is a silent baseline: its events are stored but not sent, so state that existed before the install is never announced.
+- A notification reads `[<name>] <text>`. The text is one line, clipped to 300 characters, with brackets turned into parentheses and reply words quoted, so it can never pass for an approval prompt. Keep it short and lead with a symbol (`✗`, `✓`, `👀`).
+- At most 20 notifications per extension per hour; the rest become one `[<name>] +N more updates` when the hour ends. Nothing is sent while Resonant is paused or the extension is muted (`/ext mute`), and nothing held is sent later.
 
 ## 8. Permissions and approvers
 

@@ -7,7 +7,8 @@ checkpoint on the next start.
 With ``channels.imessage.enabled`` the daemon also runs the Phase 1 stack
 (``resonant.wiring``): the iMessage channel feeds ``loop.submit``, the router is the loop's
 router hook, ``runner="local"`` answers, ``runner="reminder"`` sends due reminders, and the
-health monitor runs; ``runner="job"`` runs scheduled jobs above L0. On shutdown the reader
+health monitor runs; ``runner="job"`` runs scheduled jobs above L0; extension events are
+notified (``extensions.notify``) and the notifier's end-of-hour flush runs. On shutdown the reader
 and monitor stop first (no new events), then the loop drains in-flight steps (which may
 still send their replies), then the model client closes. With it disabled, the daemon is
 exactly Phase 0 apart from the gate and the scheduler.
@@ -180,6 +181,8 @@ class Daemon:
             )
         if monitor is not None:
             aux.append(asyncio.create_task(monitor.run(), name="health-monitor"))
+        if self.imessage is not None and self.imessage.notifier is not None:
+            aux.append(asyncio.create_task(self.imessage.notifier.run(), name="notify-flush"))
         watchdog = Watchdog(self.heartbeat, self.settings.health.watchdog_stale_s)
         watchdog.start()
         host = self.state.components.extensions if self.state.components else None
