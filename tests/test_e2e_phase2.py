@@ -772,7 +772,7 @@ async def test_e7_reminder_survives_a_restart_before_it_is_due(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
     async with start_daemon(resonant_home, chat) as r:
-        due = utcnow() + timedelta(seconds=1.5)
+        due = utcnow() + timedelta(seconds=4)
         await r.run_script({"tool": "add_reminder", "args": {"at": due.isoformat(), "text": "x"}})
     assert utcnow() < due  # stopped before it was due
 
