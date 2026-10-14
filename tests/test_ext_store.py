@@ -188,9 +188,12 @@ def test_gated_run_claims_due_with_its_task(db: sqlite3.Connection) -> None:
     # A later mark without a task keeps it open.
     s = ext_store.mark_due(db, "example", "cleanup", NOW + timedelta(hours=1))
     assert s.open_task_id == task_id
+    # A stale due time doesn't move the open task pointer.
+    stale = ext_store.mark_due(db, "example", "cleanup", NOW, open_task_id=_task(db))
+    assert stale.open_task_id == task_id
     # Only real tasks can be referenced.
     with pytest.raises(sqlite3.IntegrityError):
-        ext_store.mark_due(db, "example", "cleanup", NOW, open_task_id="no-such-task")
+        ext_store.mark_due(db, "example", "other", NOW, open_task_id="no-such-task")
 
 
 def test_record_run_streak(db: sqlite3.Connection) -> None:

@@ -180,8 +180,9 @@ def mark_due(
 ) -> JobState:
     """Record ``due`` as handled (creating the row if needed); ``last_due`` never moves back.
 
-    ``open_task_id`` (a gated run's task) is set when given, and otherwise left as is. Call it
-    in the same transaction as ``insert_task`` so a due time is claimed exactly once.
+    ``open_task_id`` (a gated run's task) is set only when ``due`` advances ``last_due``;
+    otherwise it is left as is. The caller checks ``last_due < due`` first and calls this in
+    the same transaction as ``insert_task``, so a due time is claimed exactly once.
     """
     conn.execute(
         """INSERT INTO ext_jobs (ext, job_id, last_due, open_task_id) VALUES (?, ?, ?, ?)
@@ -189,7 +190,10 @@ def mark_due(
                last_due = CASE WHEN ext_jobs.last_due IS NULL
                                  OR excluded.last_due > ext_jobs.last_due
                                THEN excluded.last_due ELSE ext_jobs.last_due END,
-               open_task_id = COALESCE(excluded.open_task_id, ext_jobs.open_task_id)""",
+               open_task_id = CASE WHEN excluded.open_task_id IS NOT NULL
+                                    AND (ext_jobs.last_due IS NULL
+                                         OR excluded.last_due > ext_jobs.last_due)
+                                   THEN excluded.open_task_id ELSE ext_jobs.open_task_id END""",
         (ext, job_id, iso(due), open_task_id),
     )
     state = get_job(conn, ext, job_id)
