@@ -678,12 +678,14 @@ resonant_sdk.emit.emit(type, text, dedupe_key, data=None) -> bool   # stdlib-onl
 
 ```python
 briefing_job(deps: CoreDeps, *, clock=utcnow) -> CoreJob | None   # the CORE_JOBS entry
-await send_briefing(conn, channel, owner, *, tz, now, due=None, github=False)
+await send_briefing(conn, channel, owner, *, tz, now, due=None, github=False, manual=False)
     -> {sent, date, sections, chars} | {sent: False, date, skipped: "paused"}
 gather(conn, *, owner, now, day, tz: ZoneInfo, github) -> Briefing   # the data
 render(b: Briefing) -> str   sections(b) -> list[str]                 # pure
 github_line(conn, day, tz) -> str | None
+await run_briefing_now(deps: CoreDeps, *, now=None) -> dict   # on demand (P3-14)
 dedupe_key(day) -> "briefing:<YYYY-MM-DD>"
+manual_dedupe_key(local_now) -> "briefing:manual:<YYYY-MM-DD>:<HHMM>"
 ```
 
 - **Job** `core/briefing`: cron `<m> <h> * * *` from `briefing.at` in `settings.timezone`, `catchup=3h`, `timeout_s=60`. None (not scheduled) when `briefing.enabled` is false, iMessage is off (`channel` None) or there is no owner. Runs inline, without the gate, as `ext="core"`; paused ticks skip it like any job, and `send_briefing` itself sends nothing while paused (unknown counts as paused).
@@ -693,8 +695,8 @@ dedupe_key(day) -> "briefing:<YYYY-MM-DD>"
   - `✋ 2 approvals pending (A7, C3)`: `approvals.pending_for(owner, now)`, up to 5 codes.
   - `⚠ model, imessage degraded`: `health_snapshot` checks in `degraded`.
   - `github: …`: `payload.text` of the latest `ext.github.digest` event (`source="ext:github"`) whose `occurred_at` falls on the local date, through `clean_external` (`✗` becomes `x`), ≤ 200 chars. Only when `github` is loaded in the host.
-- **Once a day.** The local date of `due_at` (else now) names the day; the send uses `dedupe_key=briefing:<date>`, so a restart, a catch-up, or an on-demand run the same day sends nothing more. The result holds section names and length, never the text; `sent: true` means handed to the channel, which drops a same-day repeat by the key.
-- **On demand** (P3-14, `/ext run core/briefing`): call the scheduler's core job (`ScheduledJob` with `ext="core"`, `job_id="briefing"`) `.call({}, ctx)` (or `{"due_at": iso}`), or `send_briefing` directly.
+- **Once a day.** The local date of `due_at` (else now) names the day; the send uses `dedupe_key=briefing:<date>`, so a restart or a catch-up the same day sends nothing more. The result holds section names and length, never the text; `sent: true` means handed to the channel, which drops a same-day repeat by the key.
+- **On demand** (P3-14, `/ext run core/briefing`): `run_briefing_now(CoreDeps(...))`, i.e. `send_briefing(..., manual=True)`. Keyed `briefing:manual:<local date>:<HHMM>`: at most one per minute, and it never uses up the day's scheduled one. Nothing while paused; `{sent: False, skipped: "unreachable"}` with no channel or owner.
 
 ## Components: `resonant.components`
 

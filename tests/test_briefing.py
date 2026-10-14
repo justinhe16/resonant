@@ -438,7 +438,7 @@ async def test_e13_once_per_local_day_across_restart_and_catch_up() -> None:
         h.scheduler(at=T0 + timedelta(minutes=6))
         await h.tick(T0 + timedelta(minutes=6))
         assert len(h.channel.sent) == 1
-        # An on-demand run later that day is the same message: not sent again.
+        # The scheduled run repeated later that day (no due_at): not sent again.
         job = bf.briefing_job(h.deps(h.channel), clock=h.clock)
         assert job is not None
         await job.run({}, CTX)
@@ -477,7 +477,7 @@ async def test_e5_once_a_day_across_midnight() -> None:
         h.clock.now = local(10, 14, 0, 1)  # a new local day, still the 14th 07:01 UTC
         await job.run({}, CTX)
         h.scheduler(at=local(10, 14, 7, 59))
-        await h.tick(local(10, 14, 8))  # the 14th's was already sent on demand
+        await h.tick(local(10, 14, 8))  # the 14th's was already sent
         await h.tick(local(10, 15, 8))
         assert [k for _, _, k in h.channel.sent] == [
             "briefing:2026-10-13",
@@ -495,4 +495,40 @@ async def test_skipped_while_paused() -> None:
         assert len(h.audits("job.skipped_paused")) == 1
         out = await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T0)
         assert out == {"sent": False, "date": "2026-10-13", "skipped": "paused"}
+        assert h.channel.sent == []
+
+
+async def test_on_demand_never_uses_up_the_scheduled_one() -> None:
+    async with harness() as h:
+        out = await bf.run_briefing_now(h.deps(h.channel), now=local(10, 13, 7))
+        assert out["sent"] is True
+        h.scheduler(at=local(10, 13, 7, 59))
+        await h.tick(T0)
+        assert [k for _, _, k in h.channel.sent] == [
+            "briefing:manual:2026-10-13:0700",
+            "briefing:2026-10-13",
+        ]
+
+
+async def test_on_demand_sends_at_most_once_a_minute() -> None:
+    async with harness() as h:
+        deps = h.deps(h.channel)
+        await bf.run_briefing_now(deps, now=local(10, 13, 9, 15))
+        await bf.run_briefing_now(deps, now=local(10, 13, 9, 15) + timedelta(seconds=40))
+        await bf.run_briefing_now(deps, now=local(10, 13, 9, 16))
+        assert [k for _, _, k in h.channel.sent] == [
+            "briefing:manual:2026-10-13:0915",
+            "briefing:manual:2026-10-13:0916",
+        ]
+
+
+async def test_on_demand_sends_nothing_while_paused_or_unreachable() -> None:
+    async with harness() as h:
+        killswitch.engage(h.db, actor="test")
+        out = await bf.run_briefing_now(h.deps(h.channel), now=T0)
+        assert out == {"sent": False, "date": "2026-10-13", "skipped": "paused"}
+        assert await bf.run_briefing_now(h.deps(None), now=T0) == {
+            "sent": False,
+            "skipped": "unreachable",
+        }
         assert h.channel.sent == []

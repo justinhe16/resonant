@@ -22,9 +22,9 @@ The whole message is at most 600 characters, well inside one iMessage chunk. It 
 ``dedupe_key=briefing:<local date>``, so a restart, a catch-up or an on-demand run never
 sends a second one that day. Skipped while paused.
 
-On demand (P3-14's ``/ext run core/briefing``): call the core job's ``run`` (it is the
-``ScheduledJob.call`` of the scheduler's ``core/briefing`` job) with ``{}`` (now) or
-``{"due_at": iso}``, or ``send_briefing`` directly.
+On demand (P3-14's ``/ext run core/briefing``): ``run_briefing_now(deps)``. It is keyed
+``briefing:manual:<local date>:<HHMM>``, so it sends at most once a minute and never uses up
+the scheduled one.
 """
 
 from __future__ import annotations
@@ -72,6 +72,11 @@ OPEN_STATES = ("running", "waiting", "queued")
 
 def dedupe_key(day: date) -> str:
     return f"briefing:{day.isoformat()}"
+
+
+def manual_dedupe_key(local_now: datetime) -> str:
+    """An on-demand run's key: at most one per local minute, separate from the day's."""
+    return f"briefing:manual:{local_now.date().isoformat()}:{local_now:%H%M}"
 
 
 # --- the content: pure data, then a pure render -----------------------------------------
@@ -268,23 +273,44 @@ async def send_briefing(
     now: datetime,
     due: datetime | None = None,
     github: bool = False,
+    manual: bool = False,
 ) -> dict[str, Any]:
     """Build and send the briefing for the local date of ``due`` (else ``now``), deduped
-    per date. Returns ``{sent, date, sections, chars}``; never the text. ``sent`` means
-    handed to the channel: a same-day repeat is dropped there, by the dedupe key. Paused:
-    not sent."""
+    per date (``briefing:<date>``). ``manual`` (on demand): keyed
+    ``briefing:manual:<date>:<HHMM>`` instead, so it never uses up the scheduled one and
+    sends at most once a minute. Returns ``{sent, date, sections, chars}``; never the text.
+    ``sent`` means handed to the channel: a repeat key is dropped there. Paused: not sent."""
     zone = ZoneInfo(tz)
-    day = (due or now).astimezone(zone).date()
+    local_now = (due or now).astimezone(zone)
+    day = local_now.date()
     if _paused(conn):
         return {"sent": False, "date": day.isoformat(), "skipped": "paused"}
     b = gather(conn, owner=owner, now=now, day=day, tz=zone, github=github)
     text = render(b)
-    await channel.send(owner, text, dedupe_key=dedupe_key(day))
+    key = manual_dedupe_key(local_now) if manual else dedupe_key(day)
+    await channel.send(owner, text, dedupe_key=key)
     return {"sent": True, "date": day.isoformat(), "sections": sections(b), "chars": len(text)}
 
 
 def _github_loaded(host: ExtensionHost | None) -> bool:
     return host is not None and GITHUB in host.loaded
+
+
+async def run_briefing_now(deps: CoreDeps, *, now: datetime | None = None) -> dict[str, Any]:
+    """Send the briefing on demand (P3-14's ``/ext run core/briefing``), keyed per minute
+    (``manual``). Sent even when ``briefing.enabled`` is false; nothing while paused, and
+    ``{sent: False, skipped: "unreachable"}`` with no channel or owner."""
+    if deps.channel is None or deps.owner is None:
+        return {"sent": False, "skipped": "unreachable"}
+    return await send_briefing(
+        deps.conn,
+        deps.channel,
+        deps.owner,
+        tz=deps.settings.timezone,
+        now=now or utcnow(),
+        github=_github_loaded(deps.components.extensions),
+        manual=True,
+    )
 
 
 def _due(args: dict[str, Any]) -> datetime | None:
@@ -343,7 +369,9 @@ __all__ = [
     "dedupe_key",
     "gather",
     "github_line",
+    "manual_dedupe_key",
     "render",
+    "run_briefing_now",
     "sections",
     "send_briefing",
 ]
