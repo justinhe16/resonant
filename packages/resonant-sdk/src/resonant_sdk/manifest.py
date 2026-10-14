@@ -43,6 +43,7 @@ _CRON_FIELD = re.compile(r"^[A-Za-z0-9*/,\-]+$")
 _DURATION = re.compile(r"^\d+[smh]$")
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 _EVENT = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+RESERVED_EVENT = "item"  # the pulse's event type (``report()``); never a ``notify.on`` entry
 _UNIT_S = {"s": 1, "m": 60, "h": 3600}
 
 SecretName = Annotated[str, Field(pattern=SECRET_NAME)]
@@ -226,9 +227,23 @@ class Notify(_Strict):
     @field_validator("on")
     @classmethod
     def _events(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        if RESERVED_EVENT in v:
+            raise ValueError(
+                f"{RESERVED_EVENT!r} is a reserved event type (pulse reports, set by "
+                "`report:`); it can't be in notify.on"
+            )
         if bad := [e for e in v if not _EVENT.match(e)]:
             raise ValueError(f"event names must be lowercase slugs: {bad}")
         return v
+
+
+class Report(_Strict):
+    """The pulse grant: the highest urgency this extension's ``report()`` items may use.
+
+    Items asking for more are clamped to it. Without this section, reports are refused.
+    """
+
+    max_urgency: Literal["urgent", "normal", "low"]
 
 
 class Health(_Strict):
@@ -255,6 +270,7 @@ class Manifest(BaseModel):
     tools: dict[str, CliTool] = Field(default_factory=dict[str, CliTool])
     mcp: McpServer | None = None
     notify: Notify | None = None
+    report: Report | None = None
     health: Health | None = None
     secrets: tuple[SecretName, ...] = ()
 

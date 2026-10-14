@@ -55,6 +55,7 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 | `tools` | map | Command-backed tools, described in §4. |
 | `mcp` | object, optional | An MCP server and the typed list of tools it may expose, described in §4. |
 | `notify` | `{on: [event…], channel: imessage\|slack}` | Which of your emitted events are forwarded to people. |
+| `report` | `{max_urgency: urgent\|normal\|low}` | The highest urgency your `report()` items may use (`urgent` texts the owner right away, `normal` joins the hourly pulse, `low` waits for the 08:00 briefing). Without it, reports are refused. `item` is reserved and can't be in `notify.on`. |
 | `health` | `{check: <cmd>, every: 30s\|5m\|1h}` | A health command. A zero exit code means healthy. |
 | `secrets` | list of names | Keychain secret names (`^[a-z][a-z0-9_]{0,31}$`) your tools and jobs may receive. Every tool's and job's `secrets` must be listed here. |
 
@@ -166,6 +167,10 @@ Your processes report what happened by emitting events: either an `"events"` lis
 - Each job's first successful run after install is a silent baseline: its events are stored but not sent, so state that existed before the install is never announced.
 - A notification reads `[<name>] <text>`. The text is one line, clipped to 300 characters, with brackets turned into parentheses and reply words quoted, so it can never pass for an approval prompt. Keep it short and lead with a symbol (`✗`, `✓`, `👀`).
 - At most 20 notifications per extension per hour; the rest become one `[<name>] +N more updates` when the hour ends. Nothing is sent while Resonant is paused or the extension is muted (`/ext mute`), and nothing held is sent later.
+
+### Reports
+
+`from emit import report; report("dori/incident/inc-412", "Dori failing: checkout 5xx", urgency="urgent", state={"status": "triaging"})` tells the owner about a thing, by `key` (1..120 of `[a-z0-9/._:-]`). It is mentioned again only when its fingerprint changes: the hash of `state` when given, else of `title`. Keep `state` coarse (bucket a PnL, leave timestamps out) or every report counts as news. `clear=True` marks it over; `ttl` (`30m`, `24h`, at most `168h`) is how long it stays open without a new report. Urgency is clamped to the manifest's `report.max_urgency`.
 
 ## 8. Permissions and approvers
 

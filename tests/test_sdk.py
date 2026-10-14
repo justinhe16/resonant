@@ -314,3 +314,98 @@ def test_emit_writes_one_event_line_to_the_events_fd(monkeypatch: pytest.MonkeyP
     assert line == '{"type":"ci_failed","text":"red","dedupe_key":"pr#1:run:2","data":{"n":1}}\n'
     with pytest.raises(ValueError, match="dedupe_key"):
         emit("x", "y", "")
+
+
+# --- Pulse reports (Phase 3.5) ---------------------------------------------------------
+
+
+def test_report_grant_is_optional_and_strict() -> None:
+    assert manifest().report is None  # existing manifests are unchanged
+    assert manifest(report={"max_urgency": "urgent"}).report is not None
+    for bad in ({}, {"max_urgency": "loud"}, {"max_urgency": "normal", "extra": 1}):
+        with pytest.raises(ValidationError):
+            manifest(report=bad)
+
+
+def test_item_is_a_reserved_event_in_notify_on() -> None:
+    assert manifest(notify={"on": ["ci_failed"]}).notify is not None
+    with pytest.raises(ValidationError, match="reserved"):
+        manifest(notify={"on": ["ci_failed", "item"]})
+    with pytest.raises(ValidationError, match="reserved"):
+        manifest(notify={"on": ["item"]}, report={"max_urgency": "normal"})
+
+
+def _captured_events(monkeypatch: pytest.MonkeyPatch, calls: Any) -> list[dict[str, Any]]:
+    import json
+    import os
+
+    r, w = os.pipe()
+    try:
+        monkeypatch.setenv("RESONANT_EVENTS_FD", str(w))
+        calls()
+        os.close(w)
+        w = -1
+        raw = os.read(r, 65536).decode()
+    finally:
+        os.close(r)
+        if w >= 0:
+            os.close(w)
+    return [json.loads(line) for line in raw.splitlines()]
+
+
+def test_report_writes_an_item_event_with_a_unique_dedupe_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from resonant_sdk.emit import MAX_DEDUPE_KEY, report
+
+    def go() -> None:
+        assert report("dori/incident/inc-412", "Dori failing", urgency="urgent", state={"s": 1})
+        assert report("dori/incident/inc-412", "Dori failing", urgency="urgent", state={"s": 1})
+        assert report("k" * 120, "t", clear=True, ttl="30m")
+
+    first, second, third = _captured_events(monkeypatch, go)
+    assert first["type"] == "item" and first["text"] == "Dori failing"
+    assert first["data"] == {
+        "key": "dori/incident/inc-412",
+        "urgency": "urgent",
+        "state": {"s": 1},
+        "clear": False,
+        "ttl": "24h",
+    }
+    assert first["dedupe_key"].startswith("item:dori/incident/inc-412:")
+    assert first["dedupe_key"] != second["dedupe_key"]  # a repeat is never dropped at ingest
+    assert len(third["dedupe_key"]) <= MAX_DEDUPE_KEY
+    assert third["data"]["clear"] is True and third["data"]["state"] is None
+    assert third["data"]["urgency"] == "normal" and third["data"]["ttl"] == "30m"
+
+
+def test_report_without_the_events_fd_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    from resonant_sdk.emit import report
+
+    monkeypatch.delenv("RESONANT_EVENTS_FD", raising=False)
+    assert report("a", "b") is False
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"key": ""}, "key"),
+        ({"key": "Upper"}, "key"),
+        ({"key": "x" * 121}, "key"),
+        ({"key": "has space"}, "key"),
+        ({"urgency": "loud"}, "urgency"),
+        ({"ttl": "7d"}, "ttl"),
+        ({"ttl": "169h"}, "ttl"),
+        ({"ttl": "0h"}, "ttl"),
+        ({"ttl": "soon"}, "ttl"),
+    ],
+)
+def test_report_validates_locally(
+    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, Any], match: str
+) -> None:
+    from resonant_sdk.emit import report
+
+    monkeypatch.delenv("RESONANT_EVENTS_FD", raising=False)
+    args: dict[str, Any] = {"key": "ok", "title": "t", **kwargs}
+    with pytest.raises(ValueError, match=match):
+        report(**args)

@@ -146,7 +146,7 @@ cd ~/resonant && git switch main && git pull --ff-only && uv sync --frozen
 resonant daemon install   # also installs the keep-awake agent (step 2)
 ```
 
-`~/.resonant/logs/resonant.jsonl` shows `gate=policy dry_run=True`, and `scripts/bootstrap.sh --check` shows `store schema 4  PASS` and `dry_run  PASS  true`. Then text Resonant:
+`~/.resonant/logs/resonant.jsonl` shows `gate=policy dry_run=True`, and `scripts/bootstrap.sh --check` shows `store schema 5  PASS` and `dry_run  PASS  true`. Then text Resonant:
 
 1. **Notes (no prompt).** `/note milk` → `Saved note 1: "milk"`. `/notes` → `Notes (1):` / `1. milk`. `/unnote 1` → `Deleted note 1.`. `/notes` → `No notes.`
 2. **L1 needs the code.** `/note a`, then `/notes clear` → `[D7] delete all 1 note? This can't be undone. Reply yes D7 / no`. A plain `yes` → `Reply yes D7 to confirm.` and nothing is deleted. `yes D7` → `Cleared 1 note.`. Repeat with `no` → `Not done.`
@@ -184,7 +184,7 @@ Then `resonant daemon install` and `resonant status` (`dry_run  False`). `--chec
 
 ## 12. Phase 3: extensions, jobs and the briefing
 
-Stage B of step 11 is done (`dry_run: false`). Deploy Phase 3 with `/update` (or `git pull --ff-only && uv sync --frozen` and `resonant daemon install`). `~/.resonant/logs/resonant.jsonl` shows `extensions=0` on start, and `scripts/bootstrap.sh --check` shows `store schema 4  PASS`, `extensions dir  PASS  none installed yet` and `briefing scheduled  PASS  daily 08:00 …; next …`.
+Stage B of step 11 is done (`dry_run: false`). Deploy Phase 3 with `/update` (or `git pull --ff-only && uv sync --frozen` and `resonant daemon install`). `~/.resonant/logs/resonant.jsonl` shows `extensions=0` on start, and `scripts/bootstrap.sh --check` shows `store schema 5  PASS`, `extensions dir  PASS  none installed yet` and `briefing scheduled  PASS  daily 08:00 …; next …`.
 
 The shipped manifests list the approver `owner`, so the owner in `~/.resonant/principals.yaml` must be named `owner`, as in step 4. Otherwise `ext add` refuses with `approver 'owner' is not a known principal`.
 
