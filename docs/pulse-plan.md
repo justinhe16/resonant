@@ -1,6 +1,6 @@
 # Pulse plan (Phase 3.5): the hourly briefing, urgent interrupts, extension reports
 
-Status: **approved** by the owner (2026-10-14). Built as P35-1 to P35-6 with robot-surf: worktree, tests, PR, CI, code-review agent, squash-merge to `main`. It builds on Phase 3 ([`phase3-plan.md`](phase3-plan.md)): the scheduler, jobs, the fd-3 event pipe, the notifier and `core/briefing`.
+Status: **implemented** (2026-10-14): P35-1 to P35-6, PRs #50 and #52 to #55 and the final one (P35-6, e2e, go-live step 13, docs). Approved by the owner the same day. Built with robot-surf: worktree, tests, PR, CI, code-review agent, squash-merge to `main`. The e2e is `tests/test_e2e_pulse.py` (U1 to U9); the live checklist is go-live [step 13](go-live.md#13-phase-35-the-pulse). It builds on Phase 3 ([`phase3-plan.md`](phase3-plan.md)): the scheduler, jobs, the fd-3 event pipe, the notifier and `core/briefing`.
 
 **Goal.** Resonant tells the owner things when they matter, not just at 08:00:
 - **Urgent** reports text right away, at any hour. Example: "Dori is failing, triaging".
@@ -10,6 +10,19 @@ Status: **approved** by the owner (2026-10-14). Built as P35-1 to P35-6 with rob
 - Nothing is said twice: an item is mentioned again only when its state changes.
 
 Any extension can report items, so future extensions (Dori on-call, a trading bot) plug in with no core changes.
+
+
+### As built (deviations from the design below)
+
+- **Health stays with the monitor.** No `core/health` items: the `HealthMonitor` already alerts on degrade and recovery, so the pulse would only say it twice. The core items are `core/approval/<code>` only.
+- **Briefing Updates exclude `core` and muted sources.** They list open extension items at any urgency, changed-since-told first.
+- **Ordering.** Urgent first, then normal, then low; oldest first within each, so an overflow can't starve old items.
+- **Clears of urgent items inherit urgent.** The "recovered" for an urgent item is texted at once however the extension rated the clear (clamped to the grant), including a clear of something the owner never heard.
+- **All recipients refuse.** An urgent send that no approver takes leaves the item pending (`pulse.unreachable`) for the hourly pulse.
+- **Inflight record per dedupe key.** `deliver()` (shared by the pulse and the briefing) stores the exact text and the (source, key, fingerprint) of its items in kv `pulse.inflight:<key>` before sending, so a rerun resends the same text and marks exactly those items told, compare-and-set. P35-6 added: a new key first finishes any other unsent record, because a job that raised after its send is not rerun by the scheduler.
+- **Stale reports.** A retried older report (row `updated_at` newer than the event's `occurred_at`) is dropped (`pulse.stale`).
+- **Held urgent items ride the pulse** (paused, muted, capped), including after a mute ends, unless their `ttl` expired.
+- **Tool runs don't persist fd-3 events**, so reporters must be jobs; the example's `incident` is a job plus a tool that writes its state.
 
 ---
 
@@ -132,7 +145,7 @@ The first run after install is a baseline (as for notify): items are stored as t
 | U5 | 08:00 | The briefing always sends, with the Updates section; the 08:00 pulse doesn't. |
 | U6 | Paused | Nothing sent; after `/resume` the next pulse carries what changed, once. |
 | U7 | Grant | An extension granted `normal` that reports `urgent` waits for the pulse. One with no grant is refused. |
-| U8 | Muted | Its items are skipped while muted and not replayed after. |
+| U8 | Muted | Its items are skipped while muted and not replayed after. (As built: a held item still open when the mute ends is told once in the first pulse after; one that expired never is.) |
 | U9 | Approval re-mention | Once, at about 4h. |
 
 ## 6. Risks

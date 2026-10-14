@@ -107,7 +107,7 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 - Cost and rate limits of a periodic sweep.
 - How it interacts with the kill switch: nudges are read-only messages, but they still respect `paused`.
 
-**Phase 3 shipped the seed:** the code-built daily briefing (`core/briefing`, 08:00) on the new scheduler. What's left is the model-ranked part: quiet hours, ranking, "not useful" feedback.
+**Phase 3 shipped the seed** (the code-built daily briefing, `core/briefing`) and **Phase 3.5 the plumbing** ([`pulse-plan.md`](pulse-plan.md)): extensions report items, urgent ones text at once, normal ones ride an hourly "btw", quiet hours and told-once dedupe. What's left is the model-ranked part and the items below.
 
 **Depends on.** The Phase 3 scheduler and extensions (built), data sources (Phase 7 for calendar and mail), and the status relay if nudges should also be visible remotely.
 
@@ -341,3 +341,16 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 ## Pulse build notes
 
 - **Urgent send races the pulse.** `Pulse.route` marks an urgent item told after `channel.send`; a pulse running in that window composes the same untold item and sends it again under another dedupe key. Narrow (top of the hour); fix with an in-flight skip if it shows up.
+- **Failed pulse job after its send.** The scheduler consumes a due time even when the job raised, so no catch-up reruns it. `deliver` now finishes any earlier unsent in-flight record before composing a new message (found by the e2e), but only for records under 2 hours old whose items are unchanged (older or changed ones are abandoned and recomposed fresh, oldest first otherwise). A resend that fails is logged and retried on the next delivery until the record ages out. A manual `/pulse now` in the quiet hours, or the 08:00 briefing, also flushes such a record first.
+- **Tool runs don't persist fd-3 events.** Only job runs store events, so a reporter must be a job (the example's `incident` is a job plus a tool that writes the state it reads). A tool that calls `report()` is dropped silently.
+- **The first job run after install is a silent baseline.** For a reporter that means whatever it reports on that run is stored as told: install it, run the job once (`/ext run <ext>/<job>`), then expect news.
+- **Muted urgent items ride the pulse after the mute.** A muted source's untold items stay pending (not dropped), so the first pulse after the mute ends carries those still open and unexpired; a short `ttl` lets one expire instead.
+- **Briefing Updates exclude `core` and muted sources**, and urgent clears inherit urgent; if every recipient of an urgent send refuses it, the item stays pending for the pulse.
+
+## Pulse: deferred (from `pulse-plan.md` section 7)
+
+*Noted 2026-10-14, at the end of Phase 3.5.*
+
+- **Local push endpoint.** A long-running process (a trading bot, an on-call listener) calls the daemon directly instead of waiting for a job period (5 minutes at best). Loopback only, a per-extension token in the Keychain, same `report()` payload and the same pulse path, so grants, dedupe and the cap apply unchanged.
+- **Model ranking, feedback and snooze.** A ranking step over the open items (novelty, urgency, relevance), "not useful" replies that lower a source or key, and per-item snooze (`/snooze <key> 4h`). This is the nudges follow-up above; the pulse gives it the items store and the told-once state to rank over.
+- **Status relay visibility.** Show the count of pending (untold) and open pulse items in the remote status, so a stuck or muted reporter is visible when away from the Mini ([status relay](#status-relay-dead-man-switch-and-remote-dashboard)).
