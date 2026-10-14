@@ -2,7 +2,7 @@
 
 An always-on agent harness that runs as a daemon on a dedicated Mac. It takes events in from iMessage, Slack, webhooks and schedules, and routes simple requests to a local LLM. Hard reasoning and coding go to Claude Code. Every side effect passes an approval gate. Product-specific behaviour lives in **extensions**: separate repos that plug in through a `resonant.yaml` manifest.
 
-> Status: Phase 1 (talk to it) is built: with `channels.imessage.enabled`, you text Resonant over iMessage and the local model answers with read-only tools. It stays off by default until the [go-live checklist](docs/go-live.md) passes. Phase 2 (built) adds the real gate, text-reply approvals and the kill switch, plus notes, reminders, Mini ops (`/restart`, `/update`) and `/projects`, by slash command or in plain language.
+> Status: Phase 1 (talk to it) is built: with `channels.imessage.enabled`, you text Resonant over iMessage and the local model answers with read-only tools. It stays off by default until the [go-live checklist](docs/go-live.md) passes. Phase 2 (built) adds the real gate, text-reply approvals and the kill switch, plus notes, reminders, Mini ops (`/restart`, `/update`) and `/projects`, by slash command or in plain language. Phase 3 (built) adds first-party extensions installed from the Mini's terminal (`resonant ext add`), Keychain secrets, scheduled jobs and notifications, a daily briefing, and the `github` extension (`/github prs`, CI alerts); see go-live [step 12](docs/go-live.md#12-phase-3-extensions-jobs-and-the-briefing).
 
 **Architecture:** open [`docs/architecture.html`](docs/architecture.html) for an interactive diagram, or read [`docs/architecture.md`](docs/architecture.md). The frozen contracts are in [`docs/interfaces.md`](docs/interfaces.md).
 
@@ -30,6 +30,7 @@ Then work through the **[go-live checklist](docs/go-live.md)** to get from a run
 | `packages/resonant` | Daemon, CLI, store, gate, and the rest of core |
 | `packages/resonant-sdk` | The only package extensions depend on: manifest schema, tools, events |
 | `extensions/example` | A minimal example extension (`resonant.yaml`) |
+| `extensions/github` | GitHub PRs and CI: read tools, a CI watch, the briefing digest, two approved writes |
 | `config/*.example.yaml` | Example config. Copy it to `~/.resonant/` |
 | `scripts/bootstrap.sh` | Takes a fresh Mac to a running daemon |
 | `evals/*.example.jsonl` | Synthetic eval sets. Real sets live in `~/.resonant/evals/` |

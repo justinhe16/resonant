@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
-from datetime import timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
 from resonant import killswitch
+from resonant.config import load_settings
+from resonant.e2e.extensions import install_fixture
 from resonant.loop import NewTask
+from resonant.secrets import FakeKeychain, SecretStore
 from resonant.store import approvals as ap
+from resonant.store import extensions as ext_store
 from resonant.store import tasks as repo
 from resonant.store.db import kv_set, open_db, utcnow
 from resonant_sdk import Effect, Level
@@ -360,3 +366,206 @@ def test_check_changes_nothing_and_fails_on_required_steps(resonant_home: Path) 
 
     assert _snapshot(resonant_home) == before
     assert list(empty.iterdir()) == []
+
+
+# --- Phase 3 rows (go-live step 12) -------------------------------------------------------
+
+SECRET_EXT = """\
+name: demo
+version: 1
+secrets: [token, other]
+tools:
+  status:
+    run: ./cli.py status
+    effect: read
+    secrets: [token]
+jobs:
+  - id: nightly
+    schedule: "0 3 * * *"
+    run: ./cli.py nightly
+    effect: read
+    secrets: [other]
+"""
+PLAIN_EXT = """\
+name: plain
+version: 1
+tools:
+  status:
+    run: ./cli.py status
+    effect: read
+jobs:
+  - id: watch
+    schedule: "*/10 * * * *"
+    run: ./cli.py watch
+    effect: read
+"""
+# 2026-10-14 10:30 in Los Angeles.
+NOW = datetime(2026, 10, 14, 17, 30, tzinfo=UTC)
+
+
+def test_phase3_rows_with_no_extensions(resonant_home: Path) -> None:
+    (resonant_home / "config.yaml").write_text(LIVE_CONFIG)
+    _store(resonant_home).close()
+    rows = _helper(resonant_home)
+    assert rows["extensions dir"] == ("PASS", True, "none installed yet")
+    assert rows["extension jobs scheduled"] == ("PASS", True, "no extension jobs")
+    status, required, detail = rows["briefing scheduled"]
+    assert (status, required) == ("PASS", True)
+    assert detail.startswith("daily 08:00 America/Los_Angeles; next ")
+    assert [step for step in rows if step.startswith(("secret ", "extension "))] == [
+        "extension jobs scheduled"
+    ]
+
+    (resonant_home / "config.yaml").write_text(LIVE_CONFIG + "briefing:\n  enabled: false\n")
+    rows = _helper(resonant_home)
+    assert rows["briefing scheduled"] == ("FAIL", False, "briefing.enabled is false")
+
+
+def test_phase3_rows_with_an_installed_extension(resonant_home: Path) -> None:
+    # No secrets declared, so the subprocess never asks the (real) Keychain anything.
+    (resonant_home / "config.yaml").write_text(LIVE_CONFIG)
+    settings = load_settings()
+    conn = _store(resonant_home)
+    record = install_fixture(settings, conn, PLAIN_EXT, {"cli.py": "print('{}')\n"})
+    conn.close()
+    before = _snapshot(resonant_home)
+    rows = _helper(resonant_home)
+    # Read-only. (SQLite itself may add the WAL index files beside a WAL-mode database.)
+    after = {k: v for k, v in _snapshot(resonant_home).items() if not k.endswith(("-shm", "-wal"))}
+    assert after == before
+    assert rows["extensions dir"][:2] == ("PASS", True)
+    assert rows["extension plain pin"] == (
+        "PASS",
+        False,
+        f"enabled, a1b2c3d4 digest {record.tree_digest[:8]}, copy ok",
+    )
+    status, required, detail = rows["extension jobs scheduled"]
+    assert (status, required) == ("PASS", True) and detail.startswith("1 job(s); next plain/watch ")
+    assert not [step for step in rows if step.startswith("secret ")]
+
+
+def _records(resonant_home: Path, *manifests: str) -> list[ext_store.ExtensionRecord]:
+    settings = load_settings()
+    conn = _store(resonant_home)
+    for manifest in manifests:
+        install_fixture(settings, conn, manifest, {"cli.py": "print('{}')\n"})
+    records = ext_store.list_extensions(conn)
+    conn.close()
+    return records
+
+
+def test_extensions_dir_row(resonant_home: Path) -> None:
+    check = _load_helper()
+    root = resonant_home / "extensions"
+    assert check.extensions_dir_row(root, []) == (
+        "PASS",
+        True,
+        "extensions dir",
+        "none installed yet",
+    )
+    records = _records(resonant_home, PLAIN_EXT)
+    assert check.extensions_dir_row(root, records)[:2] == ("PASS", True)
+    (root / ".staging-abc").mkdir()
+    assert check.extensions_dir_row(root, records)[3].endswith("not installed: .staging-abc")
+    root.chmod(0o777)
+    try:
+        assert check.extensions_dir_row(root, records)[:3] == ("FAIL", True, "extensions dir")
+    finally:
+        root.chmod(0o755)
+    shutil.rmtree(root / "plain")
+    assert check.extensions_dir_row(root, records) == (
+        "FAIL",
+        True,
+        "extensions dir",
+        "no copy for plain",
+    )
+
+
+def test_pin_rows_are_advisory(resonant_home: Path) -> None:
+    check = _load_helper()
+    root = resonant_home / "extensions"
+    (record,) = _records(resonant_home, PLAIN_EXT)
+    ((status, required, step, _),) = check.pin_rows(root, [record])
+    assert (status, required, step) == ("PASS", False, "extension plain pin")
+
+    (root / "plain" / "cli.py").write_text("print('edited')\n")
+    assert check.pin_rows(root, [record]) == [
+        ("FAIL", False, "extension plain pin", "copy changed; resonant ext update plain")
+    ]
+    tampered = replace(record, status="disabled_tampered")
+    assert check.pin_rows(root, [tampered])[0][3] == (
+        "disabled_tampered; resonant ext update plain"
+    )
+    (root / "plain" / "cli.py").write_text("print('{}')\n")
+    gone = replace(record, argv0_paths={"x": "/nonexistent/gh"})
+    assert check.pin_rows(root, [gone])[0] == (
+        "FAIL",
+        False,
+        "extension plain pin",
+        "argv0 missing: /nonexistent/gh",
+    )
+
+
+def test_secret_rows_check_existence_only(resonant_home: Path) -> None:
+    check = _load_helper()
+    (record,) = _records(resonant_home, SECRET_EXT)
+    keychain = FakeKeychain(items={"demo/token": "a-secret-value-1"})
+    store = SecretStore(keychain)
+
+    def exists(ref: str) -> bool:
+        return asyncio.run(store.exists(ref))
+
+    assert check.secret_rows([record], exists) == [
+        ("PASS", True, "secret demo/token", "present (value not read)"),
+        ("FAIL", True, "secret demo/other", "missing: resonant secret set demo/other"),
+    ]
+    assert keychain.calls and all("-w" not in c.argv for c in keychain.calls)
+    disabled = replace(record, status="disabled")
+    assert [r[1] for r in check.secret_rows([disabled], exists)] == [False, False]
+    keychain.fail_with = 36  # locked: reported, never a crash
+    assert check.secret_rows([record], exists)[0] == (
+        "FAIL",
+        True,
+        "secret demo/token",
+        "unavailable: keychain locked or no user interaction allowed (exit 36)",
+    )
+
+
+def test_jobs_and_briefing_rows_come_from_config(resonant_home: Path) -> None:
+    check = _load_helper()
+    records = _records(resonant_home, SECRET_EXT, PLAIN_EXT)
+    tz = "America/Los_Angeles"
+    assert check.jobs_row(records, tz, NOW) == (
+        "PASS",
+        True,
+        "extension jobs scheduled",
+        "2 job(s); next plain/watch 10:40am",
+    )
+    disabled = [replace(r, status="disabled") for r in records]
+    assert check.jobs_row(disabled, tz, NOW)[3] == "no extension jobs"
+    settings = load_settings(briefing={"at": "07:15"})
+    assert check.briefing_row(settings, NOW) == (
+        "PASS",
+        True,
+        "briefing scheduled",
+        "daily 07:15 America/Los_Angeles; next tomorrow 7:15am",
+    )
+    keychain = FakeKeychain(items={"demo/token": "a-secret-value-1", "demo/other": "b-value-22"})
+    store = SecretStore(keychain)
+
+    def exists(ref: str) -> bool:
+        return asyncio.run(store.exists(ref))
+
+    conn = _store(resonant_home)
+    rows = check.phase3_rows(load_settings(), conn, NOW, exists)
+    conn.close()
+    assert [r[2] for r in rows] == [
+        "extensions dir",
+        "extension demo pin",
+        "extension plain pin",
+        "secret demo/token",
+        "secret demo/other",
+        "extension jobs scheduled",
+        "briefing scheduled",
+    ]
+    assert all(r[0] == "PASS" for r in rows), rows

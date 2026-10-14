@@ -6,7 +6,8 @@
   mute, and its ``ext:<name>`` health when that check has run. Per job: its schedule,
   level, next due time (from the manifest's cron, in the job's zone or ``settings.timezone``:
   an ``ext_jobs`` row exists only after the first due time), and the last run's outcome and
-  fail streak from ``ext_jobs``. Manifest strings never appear, only names.
+  fail streak from ``ext_jobs``. Manifest strings never appear, only names. ``core`` lists
+  the core jobs the same way (``core/briefing`` while ``briefing.enabled``).
 - ``mute_extension`` (L3): ``{extension, until}`` holds that extension's notifications
   until ``until`` (ISO with an offset, in the future, at most 7 days ahead); ``{extension,
   off: true}`` lifts it, through the notifier's API (``notify.mute`` / ``notify.unmute``:
@@ -25,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from resonant.executor import ToolFailed, ToolHandler
-from resonant.extensions import notify
+from resonant.extensions import briefing, notify
 from resonant.extensions.cron import CronError, parse_schedule
 from resonant.monitor import health_snapshot
 from resonant.store import extensions as store
@@ -126,28 +127,60 @@ def list_extensions(ctx: BuiltinContext) -> dict[str, Any]:
             continue
         item["tools"] = len(manifest.tools)
         states = {j.job_id: j for j in store.list_jobs(conn, record.name)}
-        for job in sorted(manifest.jobs, key=lambda j: j.id):
-            try:
-                next_due = parse_schedule(job.schedule, job.tz or tz).next_after(now)
-            except (CronError, ValueError):
-                next_due = None
-            state = states.get(job.id)
-            last_at = state.last_run_at if state is not None else None
-            item["jobs"].append(
-                {
-                    "id": job.id,
-                    "schedule": job.schedule,
-                    "level": job.spec(record.name).effective_level.value,
-                    "next_due": None if next_due is None else iso(next_due),
-                    "next_due_text": _when(next_due, now, tz),
-                    "last_run_at": None if last_at is None else iso(last_at),
-                    "last_run_text": _when(last_at, now, tz),
-                    "last_outcome": state.last_outcome if state is not None else None,
-                    "fail_streak": state.fail_streak if state is not None else 0,
-                }
+        item["jobs"] = [
+            _job(
+                job.id,
+                job.schedule,
+                job.tz or tz,
+                job.spec(record.name).effective_level.value,
+                states.get(job.id),
+                now,
+                tz,
             )
+            for job in sorted(manifest.jobs, key=lambda j: j.id)
+        ]
         out.append(item)
-    return {"extensions": out, "count": len(out)}
+    return {"extensions": out, "count": len(out), "core": _core_jobs(ctx, now)}
+
+
+def _job(
+    job_id: str,
+    schedule: str,
+    zone: str,
+    level: str,
+    state: store.JobState | None,
+    now: datetime,
+    tz: str,
+) -> dict[str, Any]:
+    """One job's line: next due from its cron (an ``ext_jobs`` row exists only after the
+    first due time), last run from ``ext_jobs``."""
+    try:
+        next_due = parse_schedule(schedule, zone).next_after(now)
+    except (CronError, ValueError):
+        next_due = None
+    last_at = state.last_run_at if state is not None else None
+    return {
+        "id": job_id,
+        "schedule": schedule,
+        "level": level,
+        "next_due": None if next_due is None else iso(next_due),
+        "next_due_text": _when(next_due, now, tz),
+        "last_run_at": None if last_at is None else iso(last_at),
+        "last_run_text": _when(last_at, now, tz),
+        "last_outcome": state.last_outcome if state is not None else None,
+        "fail_streak": state.fail_streak if state is not None else 0,
+    }
+
+
+def _core_jobs(ctx: BuiltinContext, now: datetime) -> list[dict[str, Any]]:
+    """Core jobs (``ext="core"``): the briefing when ``briefing.enabled``, L0 in
+    ``settings.timezone``."""
+    settings = ctx.state.settings
+    if not settings.briefing.enabled:
+        return []
+    tz = settings.timezone
+    state = store.get_job(ctx.conn, store.CORE_EXT, briefing.JOB_ID)
+    return [_job(briefing.JOB_ID, briefing.schedule(settings.briefing), tz, "L0", state, now, tz)]
 
 
 def mute_extension(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:

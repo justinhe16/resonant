@@ -49,6 +49,7 @@ from resonant.tools.reminders import list_reminders
 from resonant.tools.when import clock_time
 
 if TYPE_CHECKING:
+    from resonant.config import BriefingConfig
     from resonant.extensions.host import ExtensionHost
     from resonant.extensions.scheduler import CoreDeps, CoreJob
     from resonant.gateway.channel import Channel
@@ -68,6 +69,12 @@ REMINDERS_SHOWN = 3
 REMINDER_TEXT_MAX = 30
 CODES_SHOWN = 5
 OPEN_STATES = ("running", "waiting", "queued")
+
+
+def schedule(cfg: BriefingConfig) -> str:
+    """The briefing's daily cron, in ``settings.timezone``."""
+    at = cfg.local_time
+    return f"{at.minute} {at.hour} * * *"
 
 
 def dedupe_key(day: date) -> str:
@@ -337,7 +344,6 @@ def briefing_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> C
         return None
     tz = deps.settings.timezone
     conn, host = deps.conn, deps.components.extensions
-    at = cfg.local_time
 
     async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         return await send_briefing(
@@ -352,7 +358,7 @@ def briefing_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> C
 
     return CoreJob(
         id=JOB_ID,
-        schedule=f"{at.minute} {at.hour} * * *",
+        schedule=schedule(cfg),
         run=run,
         catchup=CATCHUP,
         timeout_s=TIMEOUT_S,

@@ -33,6 +33,13 @@ def main() -> int:
         with NOTES.open("a") as f:
             f.write(args.text.replace("\n", " ") + "\n")
         out = {"appended": True}
+    elif args.cmd == "ping":
+        # One event per due time; notify.on: [ping] texts it as "[example] ping".
+        due = os.environ.get("RESONANT_JOB_DUE_AT", "manual")
+        out = {
+            "ok": True,
+            "events": [{"type": "ping", "text": "ping", "dedupe_key": f"ping:{due}"}],
+        }
     else:
         out = {"ok": True}
     json.dump(out, sys.stdout)

@@ -19,9 +19,9 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 ```
 
 - **One asyncio process** runs the loop and the local API. Extensions, MCP servers, Claude sessions and computer-use workers run as child processes, so a crash never takes down the core.
-- **launchd supervises it** as a per-user LaunchAgent (`gui/<uid>`). Messages.app, computer use and the login Keychain all need the GUI session. Ollama has its own LaunchAgent (`OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_CONTEXT_LENGTH=32768`). Critical extension jobs get their own LaunchAgents, so they fire even if the daemon is down. They run through `resonant job-guard`, which honors the kill switch.
+- **launchd supervises it** as a per-user LaunchAgent (`gui/<uid>`). Messages.app, computer use and the login Keychain all need the GUI session. Ollama has its own LaunchAgent (`OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_CONTEXT_LENGTH=32768`). Extension jobs run on the daemon's scheduler. Critical jobs with their own LaunchAgents (through `resonant job-guard`, which honors the kill switch) are deferred ([`followups.md`](followups.md#critical-job-launchagents-and-job-guard)).
 - **There are no public ports.** The API binds to loopback only, and config validation enforces it. iMessage reads `chat.db` locally. Slack uses Socket Mode. Inbound webhooks have no transport yet: with no tailnet, how third parties reach `/hooks` without a public port is an open follow-up (see [`followups.md`](followups.md#inbound-webhooks)). They must still be HMAC-signed. CI status is polled, never pushed to us. Remote status access is planned as a push-only, read-only relay, so this rule stays: see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard).
-- **Runtime state** lives in `~/.resonant/`: `config.yaml`, `principals.yaml`, `resonant.db`, `logs/`, `worktrees/`, `evals/`.
+- **Runtime state** lives in `~/.resonant/`: `config.yaml`, `principals.yaml`, `resonant.db`, `logs/`, `worktrees/`, `evals/`, `extensions/` (approved read-only copies) and `ext-data/` (each extension's writable state).
 
 ## Components
 
@@ -59,8 +59,16 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Command registry: every slash command, `/help [word]`, "did you mean" suggestions that never execute, `list_commands` | `resonant/router/commands.py`, `resonant/router/fast_path.py` | Phase 2 ✅ |
 | Chat intents `notes`, `reminders`, `ops` (model-chosen calls are `inferred`) | `resonant/router/intents.py`, `resonant/router/prefixes.py` | Phase 2 ✅ |
 | Go-live Phase 2: stage A / B checklist, `--check` rows for store, dry_run, kill switch, ops, keep-awake, stale approvals | `docs/go-live.md`, `scripts/go_live_check.py` | Phase 2 ✅ |
-| Keychain secret injection, veto windows for unattended jobs | — | Phase 3 |
-| Extension manager (`ext add`, CLI/MCP tools, scheduler, critical-job plists) | — | Phase 3 |
+| Extension manager: terminal `resonant ext validate\|add\|update\|remove\|list` (approved read-only copy, commit + tree-digest pins, escalations-first review, `--adopt`, every update re-approved) | `resonant/extensions/manager.py`, `sources.py`, `pin.py`, `checks.py`, `resonant/cli.py` | Phase 3 ✅ |
+| Extension host and process runner: load rows, re-verify pins (tamper → `disabled_tampered` + one alert), register tools and job specs; env from scratch, output caps, process-group and tracked-tree kill, fd-3 events | `resonant/extensions/host.py`, `handlers.py`, `process.py` | Phase 3 ✅ |
+| Keychain secrets (`SecretStore` over `/usr/bin/security`, `resonant secret set\|check\|list\|rm`), per-tool injection, redaction of every encoding | `resonant/secrets.py`, `resonant/redact.py`, `resonant/executor.py` | Phase 3 ✅ |
+| Scheduler and `JobRunner` (cronsim, pause wins, catch-up, overlap; L0 inline with no task row; L3/L2/L1 gated tasks; reports to approvers); origin `scheduled`; manifest approvers ∩ grants | `resonant/extensions/scheduler.py`, `cron.py`, `resonant/runners/job.py`, `resonant/gate/`, `resonant/runners/approve.py` | Phase 3 ✅ |
+| Notifier from persisted events (exactly once, mute, 20/h cap, silent baseline, anti-spoof) and `ext:<name>` health | `resonant/extensions/notify.py`, `resonant/monitor.py` | Phase 3 ✅ |
+| Core daily briefing (`core/briefing`, 08:00) | `resonant/extensions/briefing.py` | Phase 3 ✅ |
+| Router: `extension:<name>` intents and toolsets, `<prior_reply>` wrapping; `/<ext> <tool>`, `/help <ext>`, `/ext list\|run\|mute` | `resonant/router/`, `resonant/runners/local.py`, `resonant/tools/ext.py` | Phase 3 ✅ |
+| `github` extension: `prs`, `pr`, `watch`, `digest`; `rerun_failed` (L3), `merge_pr` (L1) | `extensions/github/` | Phase 3 ✅ |
+| Go-live Phase 3: step 12, `--check` rows for extensions, pins, secrets, jobs, briefing | `docs/go-live.md`, `scripts/go_live_check.py` | Phase 3 ✅ |
+| MCP tools, critical-job LaunchAgents and `job-guard` rewrite, veto windows, Seatbelt sandbox, iMessage `/ext add`, git and network sources, Python deps | — | Deferred ([`followups.md`](followups.md)) |
 | Dashboard (Vite + React + shadcn, streak look) | — | Phase 4 |
 | Two-way Slack, Claude runner | — | Phase 5 |
 | On-call extension | — | Phase 6 |
@@ -118,7 +126,7 @@ wait reasons: approval · human_reply · usage_reset · ci · veto (Phase 3; unu
 - **Effects come from registration** (`ToolSpec` or the manifest), never from the model.
   - `pay` is always L1.
   - A read with no secrets is always L0.
-  - MCP tools must be typed in the manifest, and unlisted ones are refused.
+  - MCP tools must be typed in the manifest, and unlisted ones are refused (MCP itself is deferred; `ext add` refuses an `mcp` block today).
 - **The gate weighs risk against who chose the action** (Phase 2). The level comes from registration; the origin is `explicit` only for a slash command the router parsed (the local runner's `direct_call` path), `inferred` for anything the model chose, and `scheduled` for a job that fired on its schedule (Phase 3). `scheduled` is never explicit: L0 runs silently, L3 runs and reports to the approvers, L2 asks, L1 asks with a code. An extension's approvers are the owner plus the principals its manifest names that hold `approve` for it in `principals.yaml`; prompts go to every reachable approver.
 
   | Level | Explicit (slash command) | Inferred (model) | Kill switch on |
@@ -128,7 +136,7 @@ wait reasons: approval · human_reply · usage_reset · ci · veto (Phase 3; unu
   | L2 medium | Run, then report | Ask (plain `yes`) | Ask (plain `yes`) |
   | L1 destructive or pay | Ask, `yes <code>` only | Ask, `yes <code>` only | Ask, `yes <code>` only |
 
-  There is no veto window in Phase 2: `Veto` stays in the contract for Phase 3 unattended jobs. Under `dry_run`, only the store-internal builtins (notes, reminders) run; everything else that isn't an L0 read replies `Dry run: would …`.
+  There are no veto windows yet: unattended L2 and L1 jobs ask, and asking jobs may fire at most hourly. `Veto` stays in the contract ([`followups.md`](followups.md#veto-windows-for-unattended-jobs)). Under `dry_run`, only the store-internal builtins (notes, reminders) run; everything else that isn't an L0 read replies `Dry run: would …`.
 - **Approvals are text replies on iMessage**, bound to a 2-character code and an intent hash. They expire (`gate.approval_ttl_s`, 30 min) and are single use.
   - A deterministic parser reads the whole message (`yes`, `no`, `yes A7`, `A7 no`, `yes A7 with comments: …`). There is no classifier and no `yes all` yet ([`followups.md`](followups.md)).
   - A plain `yes` binds only when exactly one approval is pending, and only to a prompt sent before the reply. Each chat.db event resolves at most once.
@@ -137,10 +145,18 @@ wait reasons: approval · human_reply · usage_reset · ci · veto (Phase 3; unu
   - SMS-delivered messages are ignored.
   - Summaries are built by code from the registry and the args: sanitized, clipped, with losses marked. `/approvals <code>` shows the full args.
 - **One side effect per task, and a residual risk.** Within one task, a tool read's output (untrusted) can still steer the model's choice of an L3 write, which runs without asking. Mitigations: the local runner stops at the first gated side effect, so one injected read buys at most one small, reversible effect; toolsets are owner-only and filtered by intent; and the runner prompt treats tool output as data. L2 and L1 always ask when the model chose them.
-- **The model never sees secrets.** From Phase 3 the executor injects them from the Keychain as environment variables for the tool process only.
+- **The model never sees secrets.** The executor (and the scheduler, for L0 jobs) reads a tool's or job's declared secrets from the Keychain just before the call and passes them as `RESONANT_SECRET_<NAME>` in that process's environment only. Every encoding of a value (raw, URL, JSON-escaped, base64 at three alignments) is redacted before anything is stored, logged or replied. Secrets are entered only in the Mini's terminal (`resonant secret set`), never over iMessage.
+- **Phase 3 extensions: an interim trust bar.** Extensions are first-party, owner-installed code (this repo or a local git work tree), installed only from the Mini's terminal. They run as the same macOS user and inherit the daemon's Full Disk Access, so they can read `resonant.db`, chat.db, other extensions' data and the Keychain like any same-user process. Phase 3's protections are env and secret isolation, not filesystem isolation:
+  - an environment built from scratch, with `HOME` and `TMPDIR` in the extension's data dir;
+  - per-tool secret injection and redaction;
+  - output caps, and a process-group plus tracked-tree kill;
+  - an argv[0] allowlist (a `.py` file in the extension, `python3`, `gh`, `git`), stdlib only, Python under `-I -S`;
+  - a pinned, copied, read-only tree, re-verified at every start.
+
+  **Keychain ACL residual.** Items are created by `/usr/bin/security` and trust it, so any same-user caller can read every `resonant/*` item, including the owner's own Claude Code sessions and any extension. Accepted for now; tokens are scoped minimally (the github PAT is read-only unless the owner wants the writes). No third-party sources until the Seatbelt sandbox lands ([`followups.md`](followups.md#seatbelt-sandbox-for-extension-processes)).
 - **trade-jev order execution never goes through the loop or gate.** Core only sees its jobs, read tools, events and kill switch.
-- **The kill switch** sets `autonomy=off`, so everything above L0 asks first (L1 still needs its code), and `paused=true`, which critical-job wrappers and on-call autonomy check before acting. A missing or garbage `autonomy` counts as off.
-- **Local code is outside the gate's threat model.** The gate protects against remote principals, iMessage content and the model, not against processes running as the same macOS user: those can run `resonant approvals approve` or `resonant resume`, write `~/.resonant/resonant.db`, and read the Keychain. Phase 3/5 runners with shell access must be sandboxed from all three ([`followups.md`](followups.md)).
+- **The kill switch** sets `autonomy=off`, so everything above L0 asks first (L1 still needs its code), and `paused=true`: due jobs are skipped and never caught up, in-flight extension processes are killed, and notifications and the briefing are held (not sent later). A missing or garbage `autonomy` counts as off.
+- **Local code is outside the gate's threat model.** The gate protects against remote principals, iMessage content and the model, not against processes running as the same macOS user: those can run `resonant approvals approve` or `resonant resume`, write `~/.resonant/resonant.db`, and read the Keychain. Phase 3 extension processes are such processes (see the interim bar above); they and Phase 5 runners with shell access must be sandboxed from all three ([`followups.md`](followups.md#runner-sandboxing-phase-35)).
 
 ## Health
 
@@ -178,3 +194,10 @@ wait reasons: approval · human_reply · usage_reset · ci · veto (Phase 3; unu
 | 2026-10-13 | Reminders are durable queued tasks with `wake_at` and a `ReminderRunner`, not a scheduler. A missed one fires once on start, marked late. `/remind` passes the routing time, so a late-running command still sets it. |
 | 2026-10-13 | Ops reply first, then restart: `/restart resonant` spawns a detached helper that kickstarts the daemon after 3s, and the next start says "back up". `/update` is `git pull --ff-only` on a clean `main`, then `uv sync --frozen`; a failed sync doesn't restart. |
 | 2026-10-13 | The Mini's keep-awake `caffeinate` LaunchAgent is part of the product (`power.keep_awake`), under the label already hand-installed on the Mini, so the install adopts it. |
+| 2026-10-14 | Phase 3 extensions are first-party and owner-installed, from the Mini's terminal only (`resonant ext add repo:<name>\|path:<dir>`). The install copies the approved tree to a read-only `~/.resonant/extensions/<name>/`, pins commit and tree digest, and the daemon re-verifies it at every start; a changed copy is disabled with one alert. Every update is a full re-approval. The registry of record is the `extensions` table, not `extensions.yaml`. |
+| 2026-10-14 | Extensions are stdlib only, with no install step. Python runs under the daemon's interpreter with `-I -S`; argv[0] must be a `.py` file in the extension, `python3`, `gh` or `git`. Each process gets an environment built from scratch with only its own declared secrets. Protection is env and secret isolation, not filesystem isolation, until the Seatbelt sandbox. |
+| 2026-10-14 | Secrets go through `/usr/bin/security` from the GUI-session LaunchAgent, not Python `keyring` (whose ACL follows the interpreter). Any same-user process can read them; accepted and documented, with minimal token scopes. |
+| 2026-10-14 | The scheduler is a small loop over `cronsim`, not APScheduler. Origin `scheduled` is never explicit: L0 jobs run inline with no task row, L3 runs and reports to the approvers, L2 and L1 ask, and asking jobs fire at most hourly. Veto windows are deferred. |
+| 2026-10-14 | Notifications are delivered from persisted events through the router hook: the unique event key plus the channel's dedupe give exactly once across crashes. A job's first run after install is a silent baseline; paused or muted events are consumed unsent, so nothing floods on `/resume`. |
+| 2026-10-14 | The daily briefing is code-built from builtin reads with no model, at 08:00 (`core/briefing`), once a day. Ranked proactive nudges come later. |
+| 2026-10-14 | Deferred past Phase 3, each with its design in `followups.md`: MCP, critical-job LaunchAgents and `job-guard`, veto windows, the Seatbelt sandbox, iMessage `/ext add`, git and network sources, Python deps. |
