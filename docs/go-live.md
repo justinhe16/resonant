@@ -2,7 +2,7 @@
 
 This takes the Mac mini from fresh to "I can text Resonant". Work through it in order. Every step has a **verify** command and the **expected** result. Don't move on until it matches.
 
-The iMessage channel stays **off** (`channels.imessage.enabled: false`, the default) until steps 1–5 pass. Step 6 turns it on. `dry_run` stays `true` for all of Phase 1.
+The iMessage channel stays **off** (`channels.imessage.enabled: false`, the default) until steps 1–5 pass. Step 6 turns it on. `dry_run` stays `true` until stage B of step 11.
 
 Re-check the automated parts at any time. The check is read-only: it installs nothing and edits nothing.
 
@@ -32,12 +32,13 @@ The script is idempotent. It never overwrites existing files in `~/.resonant`, a
 - Put the Mini on a **UPS**.
 - Turn **automatic macOS updates off** (System Settings → General → Software Update → Automatic Updates: off for "Install macOS updates").
 - **Never sleep**, and power back on after an outage: `sudo pmset -a sleep 0 disksleep 0 standby 0 autorestart 1 womp 1`. The display can still sleep. A sleeping Mini doesn't read `chat.db`, so texts would wait until it wakes. `autorestart 1` matters most without a UPS: after a power cut the Mini boots by itself (to the FileVault login screen, see below).
+- **Keep-awake LaunchAgent.** `resonant daemon install` (and bootstrap) installs `com.resonant.caffeinate`, which runs `/usr/bin/caffeinate -i -m -s` under launchd (RunAtLoad, KeepAlive) and holds the sleep assertions while you're logged in. It is on by default (`power.keep_awake: true`); a hand-installed agent with that label is replaced, not duplicated. Keep the `pmset` line above as well: caffeinate only runs in your login session.
 - For planned reboots, use `sudo fdesetup authrestart`. It unlocks the disk once, so the Mini comes back up logged in.
 
 FileVault disables auto-login. After a power loss or a crash reboot, the Mini waits at the login screen. Resonant and Messages don't start until someone logs in. That is the expected recovery path, not a bug. The dead-man switch (step 7) that would alert you isn't set up yet: it is planned as the status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)).
 
-- **Verify:** `fdesetup status`, `defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates` and `pmset -g | grep -E ' sleep|autorestart'`
-- **Expected:** `FileVault is On.`, `0`, and `sleep 0` and `autorestart 1`. If the key doesn't exist, check System Settings directly. `--check` shows `FileVault  PASS  on`. Confirm the UPS by pulling its wall plug for a few seconds: the Mini stays on.
+- **Verify:** `fdesetup status`, `defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates`, `pmset -g | grep -E ' sleep|autorestart'` and `pmset -g assertions | grep caffeinate`
+- **Expected:** `FileVault is On.`, `0`, `sleep 0` and `autorestart 1`, and caffeinate holding `PreventSystemSleep` / `PreventUserIdleSystemSleep`. `--check` shows `keep-awake  PASS` (advisory). If the key doesn't exist, check System Settings directly. `--check` shows `FileVault  PASS  on`. Confirm the UPS by pulling its wall plug for a few seconds: the Mini stays on.
 
 ## 3. Resonant's Apple ID
 
@@ -132,12 +133,54 @@ Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:3
 
 Not set up yet: planned as the status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)). Skip this step for now. The API binds to `127.0.0.1` only (config validation enforces it), so the dashboard is reachable only on the Mini. iMessage doesn't need it.
 
-## 11. Keep `dry_run: true`
+## 11. Phase 2: approvals, then real ops
 
-Phase 1 is read-only. The gate logs side effects instead of executing them. Leave `dry_run: true` until Phase 2 ships approvals.
+Two stages. Stage A checks every Phase 2 path with `dry_run: true`, so ops tools only say what they would do. Stage B turns `dry_run` off so `/restart` and `/update` act. Codes in the replies (`A7`, `D7`) vary: use the one you get. Times and commits are examples.
+
+### Stage A: `dry_run: true`
+
+Deploy Phase 2. The live checkout must be on `main`, not a detached HEAD (`/update` needs it in stage B):
+
+```sh
+cd ~/resonant && git switch main && git pull --ff-only && uv sync --frozen
+resonant daemon install   # also installs the keep-awake agent (step 2)
+```
+
+`~/.resonant/logs/resonant.jsonl` shows `gate=policy dry_run=True`, and `scripts/bootstrap.sh --check` shows `store schema 3  PASS` and `dry_run  PASS  true`. Then text Resonant:
+
+1. **Notes (no prompt).** `/note milk` → `Saved note 1: "milk"`. `/notes` → `Notes (1):` / `1. milk`. `/unnote 1` → `Deleted note 1.`. `/notes` → `No notes.`
+2. **L1 needs the code.** `/note a`, then `/notes clear` → `[D7] delete all 1 note? This can't be undone. Reply yes D7 / no`. A plain `yes` → `Reply yes D7 to confirm.` and nothing is deleted. `yes D7` → `Cleared 1 note.`. Repeat with `no` → `Not done.`
+3. **Reminders.** `/remind in 2 min test` → `⏰ Reminder 1 set for 3:02pm: "test"`, and `⏰ test` arrives on time. `/remind in 5 min x`, then `resonant daemon install` (a restart): it still fires, once. `/remind in 1 h y`, `/reminders` lists it, `/unremind 3` → `Cancelled reminder 3.` and it never fires. `/remind 3 x` → `say 3pm or 15:00. Usage: /remind <when> <text>`.
+4. **Dry-run ops and reads.** `/restart ollama` → `Dry run: would restart Ollama`. `/restart resonant` → `Dry run: would restart Resonant`. `/update` → `Dry run: would update Resonant`. `/disk` and `/logs 5` answer.
+5. **Discovery.** `/projects` lists recent work by state (`/note` items show as `command · /note`, never the text). `/help` lists every command, `/help rem` only the reminder ones, and `/remnd 3pm x` → `Unknown command /remnd. Did you mean /remind?` with nothing run.
+6. **Chat phrasing.** "remind me in 10 minutes to stretch" → `⏰ Reminder N set for …: "stretch"`. "what can you do?" answers from the command list. "clear my notes" → `[D7] delete all … notes? …`; reply `no` → `Not done.`. "restart ollama" → `Dry run: would restart Ollama`.
+7. **Kill switch.** `/kill` → `kill switch engaged`. `/note y` → `[A7] add note text="y"? Reply yes / no` (explicit commands ask now). Send `/kill` again: it is a command, not an answer, and the note stays pending. `yes` → `Saved note …: "y"`. `/resume` → `resumed: autonomy on, unpaused`, and `/note z` runs with no prompt again.
+
+- **Verify:** `resonant approvals list` and `scripts/bootstrap.sh --check`
+- **Expected:** `no pending approvals`; `autonomy on  PASS` and `approvals not stale  PASS`.
+
+### Stage B: `dry_run: false`
+
+Set both in `~/.resonant/config.yaml`. `ops.uv_path` is the absolute path from `which uv`, since launchd's `PATH` has no Homebrew:
+
+```yaml
+dry_run: false
+ops:
+  uv_path: /opt/homebrew/bin/uv
+```
+
+Then `resonant daemon install` and `resonant status` (`dry_run  False`). `--check` shows `dry_run  PASS  false (Phase 2 gate installed)`, `ops.uv_path set  PASS` (required now) and `repo on main and clean  PASS`. Then:
+
+1. **Restart Ollama.** `/restart ollama` → `Restarted Ollama.`; `resonant model probe` still passes.
+2. **Restart Resonant.** `/restart resonant` → `Restarting Resonant…`, then a few seconds later `Back up (a1b2c3d), down 6s`.
+3. **Chat asks first.** "please restart resonant" → `[A7] restart Resonant? Reply yes / no`. `no` → `Not done.`. Ask again and reply `yes` → `Restarting Resonant…`, then `Back up …`. "please restart ollama" (L3) just runs → `Restarted Ollama.`
+4. **Update.** On a clean `main`, `/update` → `Already up to date (a1b2c3d).`, or `Updated a1b2c3d → e4f5a6b, restarting…` then `Back up …`. Then `touch ~/resonant/x` and `/update` → `Failed: update Resonant (working tree has changes; not updating)`; `rm ~/resonant/x`. On a detached HEAD or another branch it refuses too (`not on main`).
+5. **Crash mid-approval.** "please restart resonant", then before replying `kill -9 $(pgrep -f 'resonant daemon run')`. launchd restarts the daemon; reply `yes` → it restarts exactly once and says `Back up …`.
+6. **Clean up.** `resonant approvals list` → `no pending approvals`.
 
 - **Verify:** `scripts/bootstrap.sh --check` and `resonant status`
-- **Expected:** `dry_run is true  PASS` and `dry_run  True`. `--check` fails if `dry_run` is off.
+- **Expected:** exit 0, `dry_run  False`.
+- **Rollback:** `/kill` (everything above L0 asks), or set `dry_run: true` and run `resonant daemon install`.
 
 ## Done
 

@@ -174,3 +174,99 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 - Reuse, edit or build is decided, with the Sonnet question answered.
 - A `run_project` text from the owner leads, after approval, to a reviewed PR and an iMessage with its link.
 - `architecture.md` and `interfaces.md` describe the runner.
+
+## Keychain secret injection (Phase 3)
+
+*Deferred 2026-10-13, from Phase 2 ([plan §7](phase2-plan.md#7-deferred-and-out-of-scope)). No Phase 2 tool needs a secret.*
+
+**What.** A `SecretStore` over the `security` CLI. The executor injects a tool's declared secrets as `RESONANT_SECRET_<NAME>` into that tool's process only, and redacts their exact values from results, logs and audit.
+
+**Done when.** The first extension tool that declares a secret gets it in its env and nowhere else, and a test proves the value never reaches the model, logs or `executions`.
+
+## Veto windows for unattended jobs (Phase 3)
+
+*Deferred 2026-10-13, from Phase 2. Every Phase 2 action has someone texting, so asking works; unattended jobs don't.*
+
+**What.** "Doing X in 10 min unless you stop": an inferred L2 from a scheduled or extension job parks in `waiting(veto)` with `wake_at` = the deadline, and runs unless the owner replies `stop`. `Veto` is already in the gate contract and is never returned today. Carry over the v2 plan's lateness rule (a job whose window passed while the daemon was down asks instead of running) and watermark.
+
+**Done when.** A Phase 3 job's L2 action runs after its window with no reply, never runs after `stop` or `/kill`, and a missed window asks.
+
+## Approval classifier and `resonant eval approvals`
+
+*Deferred 2026-10-13, from Phase 2. The deterministic parser covers the replies people actually send.*
+
+**What.** A small model call for replies the parser misses ("sure go ahead", "nah"), seeing only the reply and the code-built summary, approving only at confidence ≥ 0.9 and never for L1 or pay. `resonant eval approvals` scores it on `evals/approvals.example.jsonl` and a real set in `~/.resonant/evals/`.
+
+**Done when.** Misses get a classifier decision or a re-ask, never a wrong approval, and the eval reports precision on approvals.
+
+## Batch approvals (`yes all`)
+
+*Deferred 2026-10-13, from Phase 2. With one gated side effect per task, several pending approvals are rare, and a re-ask with codes covers it.*
+
+**What.** `yes all` approves exactly the approvals listed in one stored batch message (`approval_batches`), never L1 or pay. `open_batch` stays `NotImplementedError` until then.
+
+**Done when.** `yes all` approves a snapshot and nothing that arrived after it.
+
+## GitHub tools
+
+*Deferred 2026-10-13: not picked for Phase 2.*
+
+**What.** Read tools for PRs and CI (`gh`, polled), then writes (comment, re-run CI) at L3/L2. They likely belong to the Claude runner work (`run_project`) rather than core.
+
+**Done when.** "is PR 12 green?" answers from `gh`, and writes go through the gate.
+
+## Note undo
+
+*Deferred 2026-10-13, from Phase 2. Deletes are soft (`deleted_at`) so this stays possible.*
+
+**What.** `/undo` (or `/unnote undo`) restores the most recent `/unnote` or `/notes clear`.
+
+**Done when.** A cleared or deleted note comes back with its number, and undo of an undo is refused.
+
+## Runner sandboxing (Phase 3/5)
+
+*Deferred 2026-10-13, from the Phase 2 trust model ([architecture.md](architecture.md#trust-model)).*
+
+**Problem.** Same-user processes are outside the gate's threat model: they can run `resonant approvals approve` or `resonant resume`, write `~/.resonant/resonant.db`, and read the Keychain. Phase 3 extension CLIs and Phase 5 Claude sessions run shell commands as that user.
+
+**Done when.** Runners with shell access run sandboxed (e.g. `sandbox-exec` or a separate user) with no access to `~/.resonant`, the `resonant` CLI or `/usr/bin/security`, and a test proves each is denied.
+
+## Ops hardening
+
+*Noted 2026-10-13, during the Phase 2 build.*
+
+- Call `git` by absolute path (like `launchctl` and `uv`) instead of resolving it on launchd's `PATH`.
+- Run ops subprocesses with a minimal environment, not the daemon's.
+- Scrub more from `/logs`: paths under `$HOME`, tokens that look like keys.
+- A cooldown on `restart_ollama`, so a loop of requests can't keep the model down.
+- `/update` runs whatever is on `origin/main`: anyone who can push there gets code execution on the Mini. Consider requiring a signed commit or tag, and branch protection.
+
+**Done when.** Each item is done or explicitly accepted in the decisions log.
+
+## Bare `yes` / `no` with nothing pending
+
+*Noted 2026-10-13, during Phase 2. The owner may revisit.*
+
+**Today.** A plain `yes` or `no` with no approval pending gets `Nothing is waiting for approval.` instead of going to the chat path, so a casual "yes" in conversation is answered as an approval reply.
+
+**Decide.** Keep it (clear and safe), or route a bare reply to chat when nothing has been asked recently.
+
+## Clamp future `occurred_at`
+
+*Noted 2026-10-13, during the Phase 2 build.*
+
+**Problem.** The sent-before rule compares the prompt's send time with the reply's `occurred_at` from chat.db. A phone clock running ahead makes a reply look later than it was, so a `yes` sent just before a prompt went out could bind to it. (A clock running behind only refuses instant replies, and the owner re-sends.)
+
+**Done when.** The reader clamps `occurred_at` to at most a little past its own read time, and a test covers a skewed clock both ways.
+
+## Timing-flaky tests
+
+*Noted 2026-10-13, from Phase 2 CI.*
+
+`test_reads_200_rows_under_100ms` and `test_bench_e2e_cli_json` sometimes fail on a loaded CI runner and pass on a rerun. Give them headroom (a relative bound, or a marker that skips the timing assert in CI) so a red build always means a real failure.
+
+## Labeler near-misses
+
+*Noted 2026-10-13, from the Phase 2 router eval on the real model.*
+
+The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). Look at both misses, then decide between a few-shot fix and an eval case that pins them. Re-run after any prompt or model change, together with [router evals on real texts](#router-evals-on-real-texts-go-live-step-9).
