@@ -756,3 +756,63 @@ def test_cli_validate_runs_directory_and_name_checks(tmp_path: Path) -> None:
     named = write_ext(tmp_path / "named", MANIFEST.replace("name: demo", "name: help"))
     code, out = invoke("validate", str(named))
     assert code == 1 and "builtin command" in out
+
+
+# --- the report grant line (P35-2) ----------------------------------------------------
+
+
+def _with_report(grant: str | None) -> str:
+    return MANIFEST + (f"report:\n  max_urgency: {grant}\n" if grant else "")
+
+
+@pytest.mark.parametrize(
+    ("grant", "line", "in_escalations"),
+    [
+        ("urgent", "reports: may text you any time (urgent)", True),
+        ("normal", "Reports: hourly updates (normal)", False),
+        ("low", "Reports: 8am briefing only (low)", False),
+    ],
+)
+def test_confirm_shows_the_report_grant(
+    mgr: ExtensionManager, repo: Path, grant: str, line: str, in_escalations: bool
+) -> None:
+    (repo / "extensions" / "demo" / "resonant.yaml").write_text(_with_report(grant))
+    commit_all(repo)
+    staged = mgr.stage("repo:demo")
+    lines = confirm_lines(staged)
+    mgr.discard(staged)
+    esc = lines[lines.index("Escalations:") + 1 : lines.index("Tools:")] if in_escalations else []
+    assert (f"  ! {line}" in esc) is in_escalations
+    assert (line in lines) is (not in_escalations)
+
+
+def test_confirm_shows_no_grant_line_without_report(mgr: ExtensionManager) -> None:
+    staged = mgr.stage("repo:demo")
+    lines = confirm_lines(staged)
+    mgr.discard(staged)
+    assert not any("eports:" in line for line in lines)
+
+
+def test_update_diff_shows_a_changed_report_grant(mgr: ExtensionManager, repo: Path) -> None:
+    record = mgr.install(mgr.stage("repo:demo").pin, name="demo")
+    path = repo / "extensions" / "demo" / "resonant.yaml"
+
+    def diff(grant: str | None) -> list[str]:
+        path.write_text(_with_report(grant))
+        commit_all(repo)
+        staged = mgr.stage("repo:demo")
+        out = update_lines(record, mgr.installed_files("demo"), staged)
+        # The pinned manifest hash covers `report:`, so re-approval is forced.
+        assert staged.pin.manifest_sha != record.manifest_sha
+        mgr.discard(staged)
+        return out
+
+    assert "  + reports: may text you any time (urgent)" in diff("urgent")
+    assert "  ~ reports: hourly updates (normal) (was: none)" in diff("normal")
+    path.write_text(_with_report("normal"))
+
+
+def test_cli_validate_prints_the_report_grant(tmp_path: Path) -> None:
+    ext = write_ext(tmp_path / "rep", _with_report("urgent"))
+    code, out = invoke("validate", str(ext))
+    assert code == 0 and "reports: may text you any time (urgent)" in out

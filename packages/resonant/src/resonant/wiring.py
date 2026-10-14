@@ -36,7 +36,8 @@ the gate's approvers for the extension (owner first). The scheduler itself is th
 ``unknown runner``, like a reminder.
 
 Notifications. The loop's router hook is :func:`route_event`: ``ext:*`` events (stored by
-job runs) go to ``extensions.notify.Notifier.route``, everything else to ``Router.route``,
+job runs) go to ``extensions.notify.Notifier.route`` (``ext.<name>.item`` reports go to
+``extensions.pulse.Pulse.route``), everything else to ``Router.route``,
 which is unchanged. The notifier sends to the same recipients as job reports, and its
 ``run`` (started by the daemon) sends the end-of-hour ``+N more updates``. With iMessage
 off there is no router hook: extension events wait unrouted, as messages would.
@@ -65,6 +66,7 @@ from resonant.config import ModelConfig, Settings
 from resonant.extensions.briefing import JOB_ID as BRIEFING_JOB
 from resonant.extensions.host import ExtensionHealth, send_alerts
 from resonant.extensions.notify import Notifier
+from resonant.extensions.pulse import EVENT_TYPE, Pulse
 from resonant.extensions.scheduler import CoreDeps
 from resonant.gate import PolicyGate
 from resonant.gateway.imessage.channel import IMessageChannel
@@ -105,11 +107,14 @@ def local_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> floa
 RouteFn = Callable[[Event], Awaitable[NewTask | None]]
 
 
-def route_event(router: RouteFn, notifier: Notifier) -> RouteFn:
-    """The loop's router hook: ``ext:*`` events to the notifier, the rest to the router."""
+def route_event(router: RouteFn, notifier: Notifier, pulse: Pulse | None = None) -> RouteFn:
+    """The loop's router hook: ``ext.<name>.item`` events to the pulse, other ``ext:*``
+    events to the notifier, the rest to the router."""
 
     async def route(event: Event) -> NewTask | None:
         if event.source.startswith("ext:"):
+            if pulse is not None and event.type == f"ext.{event.source[4:]}.{EVENT_TYPE}":
+                return await pulse.route(event)
             return await notifier.route(event)
         return await router(event)
 
@@ -127,6 +132,7 @@ class IMessageStack:
     owner: str | None = None  # gets "back up" after a requested restart
     jobs: JobRunner | None = None
     notifier: Notifier | None = None
+    pulse: Pulse | None = None
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     _started: bool = field(default=False, repr=False)
 
@@ -236,7 +242,14 @@ def build_imessage_stack(
         manifest_of=(lambda _ext: None) if host is None else host.manifest,
         config=settings.extensions.notify,
     )
-    loop.router = route_event(router.route, notifier)
+    pulse = Pulse(
+        conn,
+        channel=channel,
+        recipients=recipients,
+        manifest_of=(lambda _ext: None) if host is None else host.manifest,
+        config=settings.extensions.notify,
+    )
+    loop.router = route_event(router.route, notifier, pulse)
     jobs = JobRunner(
         conn,
         gate=gate,
@@ -278,5 +291,6 @@ def build_imessage_stack(
         owner=owner,
         jobs=jobs,
         notifier=notifier,
+        pulse=pulse,
         _close_model=close_model,
     )

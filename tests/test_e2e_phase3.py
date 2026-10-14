@@ -861,6 +861,7 @@ async def test_e12_github_red_green_red_notifies_exactly_once_across_crashes(
     await watch(d, 2)
     (fixed,) = unrouted()
     assert d.imessage is not None and d.imessage.notifier is not None
+    assert d.imessage.pulse is not None
     await d.imessage.notifier.route(fixed)  # sent; the daemon dies before consuming it
     d.conn.close()
     d = github_daemon(settings, osa)

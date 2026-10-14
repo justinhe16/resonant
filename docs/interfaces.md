@@ -743,6 +743,27 @@ take_baseline(conn, ext, job_id) -> bool                 # once per job per inst
 - **Route**, per `ext:*` event (D10): a malformed or not-loaded source is consumed (`ext.notify_dropped`); a type outside `notify.on` is consumed silently (`digest` stays stored for the briefing); `payload.baseline`, paused (unknown counts as paused) or muted → consumed unsent, `ext.notify_held {reason}`, never queued (no flood on `/resume` or unmute); over `extensions.notify.max_per_hour` distinct events this UTC clock hour → `ext.notify_capped`; otherwise `render(name, payload.text, max_chars)` to each of `recipients(ext)` (the gate's approvers, owner first) with `dedupe_key="<event dedupe key>:<recipient>"`, then `ext.notify_sent` (`idempotency_key` = the event's dedupe key, `hour`). A refused recipient is skipped (`ext.notify_unreachable` when none took it); any other `ChannelError` raises, so the loop retries every tick (dead-letter after 5).
 - **Exactly once.** Persist, then deliver from the store: a crash before the send leaves the event unrouted (delivered on start); a crash after it hits the channel's dedupe record on the retry. The hourly count is the distinct event keys audited `ext.notify_sent`, so a retry never counts twice.
 - **Flush.** Started by the daemon with iMessage on. For each finished hour with capped events (kv `ext.notify.overflow`), one `[<name>] +N more updates` per recipient (dedupe `ext-more:<name>:<hour>:<recipient>`, audit `ext.notify_overflow`), or `ext.notify_held` when paused or muted.
+
+## Pulse ingest: `resonant.extensions.pulse` (P35-2)
+
+```python
+Pulse(conn, *, channel: Sender, recipients: Callable[[str], Sequence[str]],
+      manifest_of: Callable[[str], Manifest | None], config: NotifyConfig | None = None,
+      clock=utcnow)
+    await .route(event) -> None       # ext.<name>.item events; raises ChannelError to retry
+clamp(urgency, grant) -> Urgency      # urgent > normal > low
+notify.sent_in_hour(conn, ext, hour, dedupe_key=None) -> int   # shared immediate-send cap count
+```
+
+`wiring.route_event(router, notifier, pulse=None)` sends `ext.<name>.item` events (source `ext:<name>`) to `Pulse.route`, other `ext:*` events to the notifier, the rest to the router. `build_imessage_stack` builds the `Pulse` with the notifier's recipients, manifest lookup and `extensions.notify` config (`IMessageStack.pulse`). The `item` payload is `text` = title and `data` = `{key, urgency, state, clear, ttl}` (what `report()` writes).
+
+- **Refused** (consumed, never retried, audit `pulse.refused {reason}`): malformed event, source not loaded, manifest without `report:`, or a bad `key`/`urgency`/`state`/`ttl`/`clear`/empty title (the `store.pulse` validation).
+- **Stored**: urgency clamped to `report.max_urgency`; title through `notify.clean_text`; `store.pulse.upsert(source=<ext>)`. `payload.baseline` items are `mark_told` at once, nothing sent, audit `pulse.held reason=baseline`.
+- **Urgent and `item.changed`** (fingerprint != `told_fingerprint`): paused (unknown = paused), `notify.muted_until`, or `notify.sent_in_hour >= extensions.notify.max_per_hour` leaves it pending, audit `pulse.held reason=paused|muted|capped {key}`. Otherwise `notify.render(name, "🔴 <title>")` (`✓` when cleared) goes to each recipient with `dedupe_key="pulse:urgent:<event.id>:<recipient>"`, then `mark_told`, audit `pulse.sent {recipients, hour, key}` (`pulse.unreachable` when every recipient was refused). A refused recipient is skipped; any other `ChannelError` raises (the loop retries; sends are deduped).
+- **Normal, low, or already told**: nothing sent; normal and low are pending for the hourly pulse and the briefing.
+- **Shared cap.** `pulse.sent` and `ext.notify_sent` rows count together per extension per clock hour (distinct `idempotency_key`, so a retry never counts twice).
+- **Exactly once.** The event is stored before routing, the send is deduped by event id, `mark_told` runs after it. A crash between them: the retry re-upserts the same untold item, the channel drops the repeat send, `mark_told` runs.
+- **Install screen.** `manager.report_grant(manifest)` gives `reports: may text you any time (urgent)` (an escalation), `Reports: hourly updates (normal)` or `Reports: 8am briefing only (low)`; `update_lines` shows a grant change as `+`/`-` (urgent) or `~ <grant> (was: <old>)`; `manifest_sha` is over the raw manifest bytes, so any grant change forces re-approval. `ext validate` prints the grant too.
 - **Anti-spoofing** (`clean_text`). NFKC; printable ASCII plus a short list of status symbols (✓ ✗ ⚠ 👀 …), everything else a space; one line; `[ ] { }` become `( )` (`[A7]` → `(A7)`); a code-like token next to `yes`/`no`/`stop` is masked (`yes ?`, `? yes`); `reply` and a leading `yes`/`no`/`stop` are quoted (`'Reply'`). The code-built `[<name>]` prefix comes first (`(<name>)` if the name itself looks like a code), and the whole is clipped to `max_chars`. Binding a reply still needs a sent prompt and a single pending approval.
 - **Baseline.** Per job, keyed by the extension's `installed_at`, so a reinstall or update baselines again. A first run that fails doesn't take it.
 
@@ -1037,7 +1058,7 @@ PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: Chan
 ```python
 build_imessage_stack(settings, conn, components, loop, *, daemon_healthy, model=None, osa_runner=None)
     -> IMessageStack(channel, router, runner, reminders, monitor, model, owner, jobs, notifier)
-route_event(router_route, notifier) -> router hook   # ext:* to Notifier.route, the rest to Router.route
+route_event(router_route, notifier, pulse=None) -> router hook   # ext.<n>.item to Pulse.route, other ext:* to Notifier.route, the rest to Router.route
 IMessageStack.start(loop) / .stop() / .aclose() / .running
 local_step_limit(model_cfg, tools: Iterable[ToolSpec] = ()) -> float   # chat tools; ext tools capped at 300s
 Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | None = None,

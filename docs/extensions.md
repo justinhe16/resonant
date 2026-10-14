@@ -172,6 +172,17 @@ Your processes report what happened by emitting events: either an `"events"` lis
 
 `from emit import report; report("dori/incident/inc-412", "Dori failing: checkout 5xx", urgency="urgent", state={"status": "triaging"})` tells the owner about a thing, by `key` (1..120 of `[a-z0-9/._:-]`). It is mentioned again only when its fingerprint changes: the hash of `state` when given, else of `title`, plus the urgency and `clear`, so a resolve or an escalation always counts. `state` is at most 2000 bytes of JSON. Keep `state` coarse (bucket a PnL, leave timestamps out) or every report counts as news. `clear=True` marks it over; `ttl` (`30m`, `24h`; 1 minute to `168h`) is how long it stays open without a new report. Urgency is clamped to the manifest's `report.max_urgency`.
 
+What the grant means (shown on the `ext add` review screen and in the `ext update` diff, and printed by `ext validate`):
+
+| `report.max_urgency` | Review line | Effect |
+|---|---|---|
+| `urgent` | `reports: may text you any time (urgent)`, under Escalations | An urgent item is texted right away, at any hour, as `[<name>] 🔴 <title>` (`✓` when `clear=True`). It is held (and joins the next hourly pulse) while paused, muted, or over the 20/hour cap shared with notifications. |
+| `normal` | `Reports: hourly updates (normal)` | Stored for the hourly pulse. |
+| `low` | `Reports: 8am briefing only (low)` | Stored for the 08:00 briefing. |
+| absent | none | Reports are refused (audit `pulse.refused`) and never retried. |
+
+A bad report (key, urgency, state, ttl, empty title) is refused the same way. Titles are cleaned like notification text, with a code-built `[<name>]` prefix. A job's first run after install is a baseline: its reports are stored as already told and never sent. Changing `report.max_urgency` changes the manifest hash, so `ext update` shows the change and asks for a fresh approval.
+
 ## 8. Permissions and approvers
 
 `principals.yaml` decides who can do what with your extension:
@@ -202,7 +213,7 @@ These run **only in the Mini's terminal**, never over iMessage.
 `ext add`:
 1. Copies the approved bytes into a staging dir. `repo:` reads the **HEAD commit** (`git archive`), so uncommitted edits are never installed. `path:` reads the tracked files from the git index, and refuses the directory if any tracked file there has uncommitted changes. Nothing else is a source.
 2. Validates the manifest and the directory: stdlib only, the argv[0] allowlist, no symlink that leaves the tree, the name rules and approver grants. MCP servers and critical jobs are refused for now.
-3. Shows a heading built by code, `my-ext repo:my-ext@a1b2c3d4 digest 9f3e01aa` (commit and content digest), then **escalations first** (secrets, approvers, tools and jobs that ask, commands that use `gh`/`git`), then every tool, job, notify event and the health check. Every string from your manifest is shown sanitized.
+3. Shows a heading built by code, `my-ext repo:my-ext@a1b2c3d4 digest 9f3e01aa` (commit and content digest), then **escalations first** (secrets, approvers, tools and jobs that ask, commands that use `gh`/`git`), then every tool, job, report grant, notify event and the health check. Every string from your manifest is shown sanitized.
 4. You confirm by typing the extension name.
 5. It stages the source **again** and refuses if the commit, digest or manifest changed since you confirmed. The copy goes to `~/.resonant/extensions/<name>/` (read-only), its digest is recomputed, and only then is the row written, with an `ext.install` audit row.
 6. If the daemon is up, it restarts (reply-first path), and the owner gets `Back up …` and `Installed my-ext`.

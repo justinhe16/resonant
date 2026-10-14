@@ -164,7 +164,23 @@ def escalations(manifest: Manifest) -> list[str]:
     for where, run in commands(manifest):
         if _argv0(run) in NETWORK_COMMANDS:
             out.append(f"{_s(where)} runs {_argv0(run)} (network)")
+    if manifest.report is not None and manifest.report.max_urgency == "urgent":
+        out.append(report_grant(manifest))
     return out
+
+
+_GRANT_WORDS = {
+    "urgent": "may text you any time (urgent)",
+    "normal": "hourly updates (normal)",
+    "low": "8am briefing only (low)",
+}
+
+
+def report_grant(manifest: Manifest) -> str:
+    """``reports: may text you any time (urgent)``; "" when the extension can't report."""
+    if manifest.report is None:
+        return ""
+    return f"reports: {_GRANT_WORDS[manifest.report.max_urgency]}"
 
 
 _NUM = re.compile(r"^\d{1,2}$")
@@ -217,6 +233,8 @@ def confirm_lines(staged: Staged) -> list[str]:
             f"{spec.effect.value} {spec.effective_level.value}, catchup {_s(job.catchup, 10)}"
             f", runs {job.run}"
         )
+    if m.report is not None and m.report.max_urgency != "urgent":
+        lines.append(report_grant(m).replace("reports:", "Reports:", 1))
     if m.notify:
         events = ", ".join(_s(e, 40) for e in m.notify.on)
         lines.append(f"Notify: {events} via {m.notify.channel}")
@@ -252,9 +270,22 @@ def update_lines(old: ext_store.ExtensionRecord, old_files: TreeEntries, new: St
     after = escalations(new.manifest)
     diff = [f"  + {e}" for e in after if e not in before]
     diff += [f"  - {e}" for e in sorted(before) if e not in after]
+    old_grant = _old_grant(old)
+    new_grant = report_grant(new.manifest)
+    if old_grant != new_grant and not new_grant.startswith("reports: may"):
+        # An urgent grant already shows as an added escalation above.
+        was = old_grant.removeprefix("reports: ") or "none"
+        diff.append(f"  ~ {new_grant or 'reports: none (refused)'} (was: {was})")
     lines.append("Manifest: changed. Escalations:" if diff else "Manifest: changed")
     lines += diff
     return lines
+
+
+def _old_grant(old: ext_store.ExtensionRecord) -> str:
+    try:
+        return report_grant(Manifest.model_validate(old.manifest))
+    except ValidationError:
+        return ""
 
 
 class ExtensionManager:
