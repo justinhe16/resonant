@@ -24,7 +24,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, get_args
 
 from resonant_sdk import Effect, Level, ToolSpec
 
@@ -217,13 +217,20 @@ class ApprovalResolution:
 
 @dataclass(frozen=True)
 class ApprovalReply:
-    """A text reply from a channel. The gate binds it to approvals.
+    """A text reply from a channel. The gate binds it to approvals (``resolve_reply``).
 
-    Binding rules: the actor must be an approver with the approve grant. ``code`` picks one
-    approval. ``all_in_batch`` with ``batch_id`` picks that batch's snapshot. With neither,
-    the reply binds only if exactly one non-pay approval is pending for the actor. Pay
-    approvals bind only via path="parser" with an exact code. Anything else is ambiguous,
-    so Resonant re-asks.
+    ``event_id`` and ``occurred_at`` come from the reply's ``Event``. ``occurred_at`` drives
+    the sent-before rule (a reply never binds an approval whose prompt was sent after it),
+    and ``event_id`` makes resolution idempotent per event: routing the same event again
+    returns the original result with no new effect.
+
+    Binding rules: the actor must be an approver with the approve grant, and the reply
+    must come from iMessage via the parser. ``code`` picks one approval. Without a code,
+    the reply binds only if exactly one approval is pending for the actor. A
+    ``require_code`` approval (L1, pay) is approved only by ``yes <code>``; a plain ``no``
+    may deny it. Anything else is refused with a ``ReplyRefusal`` and Resonant re-asks.
+    ``all_in_batch``, ``batch_id``, ``confidence`` and ``path="classifier"`` are deferred
+    (C4) and refused.
     """
 
     actor: str
@@ -232,11 +239,42 @@ class ApprovalReply:
     raw_text: str
     decision: Literal["approve", "deny"]
     path: Literal["parser", "classifier"]
+    event_id: str  # the reply Event's id
+    occurred_at: datetime  # the reply Event's occurred_at; timezone-aware
     code: str | None = None
     all_in_batch: bool = False
     batch_id: str | None = None
     confidence: float | None = None
     comments: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.occurred_at.tzinfo is None:
+            raise ValueError("occurred_at must be timezone-aware")
+
+
+# Why ``resolve_reply`` refused a reply. A closed set the router maps to its replies:
+# - nothing_pending: no approval is pending for the actor. A non-approver always gets
+#   this, whatever it sends, so pending approvals are never revealed.
+# - ambiguous: no code and more than one approval pending (or was, when the reply was
+#   sent). Re-ask listing the codes.
+# - unknown_code: the code matches none of the actor's pending approvals.
+# - code_required: a plain "yes" for a require_code approval.
+# - not_sent_before: the approval's prompt was not sent to the actor before the reply.
+# - unsupported: not an iMessage parser reply, or a batch reply (deferred).
+# - not_found, already_resolved, expired, task_not_waiting: the store refused (a race).
+ReplyRefusal = Literal[
+    "nothing_pending",
+    "ambiguous",
+    "unknown_code",
+    "code_required",
+    "not_sent_before",
+    "unsupported",
+    "not_found",
+    "already_resolved",
+    "expired",
+    "task_not_waiting",
+]
+REPLY_REFUSALS: tuple[ReplyRefusal, ...] = get_args(ReplyRefusal)
 
 
 @dataclass(frozen=True)

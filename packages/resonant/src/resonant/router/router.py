@@ -3,11 +3,14 @@
 ``Router.route(event) -> NewTask | None``. For ``imessage``/``message`` events:
 
 (a) Fast path (no model call): ``NewTask(kind="reply", runner="local",
-    checkpoint={"fast_reply": text, "tool_used": ..., "intent": ...})``.
+    checkpoint={"fast_reply": text, "tool_used": ..., "intent": ..., "title": command})``.
 (b) Labeled (one model call): ``NewTask(kind="chat", runner="local", checkpoint={"intent",
-    "confidence", "toolset": [names], "fallback", "toolset_prefix_hash"})``.
+    "confidence", "toolset": [names], "fallback", "toolset_prefix_hash", "title"})``.
 (c) None for anything else (other sources/types, no principal, empty text). The Loop
     consumes the event.
+
+``title`` is code-built (the command name, or ``chat: <intent>``) and is what ``/projects``
+shows; it never contains message text.
 
 Priority always comes from the principal (owner or member), never from the model. The
 toolset is filtered by ``principals.can(principal, "request", extension)`` before anything
@@ -137,6 +140,7 @@ class Router:
                         "fast_reply": result.reply_text,
                         "tool_used": result.tool_used,
                         "intent": result.intent,
+                        "title": result.command,
                     },
                 )
 
@@ -163,6 +167,7 @@ class Router:
                 "toolset": [s.name for s in toolset],
                 "fallback": label.fallback,
                 "toolset_prefix_hash": prefix_hash,
+                "title": f"chat: {label.intent}",
             },
         )
 

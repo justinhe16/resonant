@@ -41,6 +41,7 @@ NAMES = {
     "add_reminder",
     "list_reminders",
     "cancel_reminder",
+    "projects",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {
