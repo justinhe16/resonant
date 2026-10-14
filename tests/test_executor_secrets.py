@@ -198,7 +198,7 @@ async def test_large_extension_results_are_capped(db: sqlite3.Connection, task_i
     assert res.ok and res.data is not None and res.data["truncated"] is True
     assert res.data["bytes"] > 2048 and len(res.data["text"].encode()) <= 2048
     stored = db.execute("SELECT result FROM executions").fetchone()["result"]
-    assert len(stored.encode()) <= 2048 + 100 and SECRET not in stored
+    assert len(stored) <= 2048 and SECRET not in stored
     # Builtins are never capped.
     small = Recorder(big)
     builtin = ToolSpec(name="b", effect=Effect.READ)

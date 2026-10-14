@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+import yaml
 from pydantic import ValidationError
 
 from resonant.config import Settings
@@ -56,6 +57,7 @@ from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set
 from resonant.tools.registry import ToolRegistry
 from resonant_sdk import Manifest, ToolSpec
+from resonant_sdk.manifest import load_manifest
 
 log = logging.getLogger(__name__)
 
@@ -146,6 +148,9 @@ class ExtensionHost:
                 self._register(self._prepare(record, root))
             except LoadRefused as e:
                 self._refuse(record.name, str(e))
+            except Exception as e:  # never let one extension stop the daemon
+                log.exception("extension load failed", extra={"extension": record.name})
+                self._refuse(record.name, f"load failed ({type(e).__name__})")
         log.info(
             "extensions loaded",
             extra={
@@ -165,6 +170,12 @@ class ExtensionHost:
             raise LoadRefused(f"approved manifest no longer validates ({n} errors)") from None
         if manifest.name != record.name:
             raise LoadRefused("manifest name does not match the installed name")
+        try:  # the snapshot must be the pinned resonant.yaml
+            on_disk = load_manifest(root / "resonant.yaml")
+        except (OSError, ValueError, yaml.YAMLError):
+            raise LoadRefused("resonant.yaml in the copy can't be read") from None
+        if on_disk != manifest:
+            raise LoadRefused("approved manifest snapshot does not match resonant.yaml")
         if manifest.mcp is not None:
             raise LoadRefused("mcp servers are not supported yet")
         if errors := dir_errors(root, manifest):

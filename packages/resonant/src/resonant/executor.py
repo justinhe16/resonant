@@ -97,7 +97,7 @@ class CallContext:
     executor redacts them and returns them on ``ToolResult.events``.
     """
 
-    secrets: Mapping[str, str]
+    secrets: Mapping[str, str] = field(repr=False)  # values never in a repr or log
     idempotency_key: str
     task_id: str
     events: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
@@ -270,15 +270,26 @@ class Executor:
         return ToolResult(ok=False, ambiguous=True, error=error)
 
     def _cap(self, intent: Intent, data: dict[str, Any] | None) -> dict[str, Any] | None:
-        """An extension result over ``result_max_bytes`` becomes a truncated text form."""
-        if data is None or intent.extension is None or self.result_max_bytes is None:
+        """An extension result whose stored JSON is over ``result_max_bytes`` becomes
+        ``{"truncated": true, "bytes": n, "text": <prefix>}``, itself within the cap."""
+        cap = self.result_max_bytes
+        if data is None or intent.extension is None or cap is None:
             return data
-        text = json.dumps(data, ensure_ascii=False)
-        size = len(text.encode())
-        if size <= self.result_max_bytes:
+        text = json.dumps(data)  # the same encoding _record stores
+        if len(text) <= cap:
             return data
-        keep = text.encode()[: max(0, self.result_max_bytes - 128)].decode(errors="ignore")
-        return {"truncated": True, "bytes": size, "text": keep}
+
+        def capped(n: int) -> dict[str, Any]:
+            return {"truncated": True, "bytes": len(text), "text": text[:n]}
+
+        lo, hi = 0, len(text)  # the longest prefix whose stored form fits
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(json.dumps(capped(mid))) <= cap:
+                lo = mid
+            else:
+                hi = mid - 1
+        return capped(lo)
 
     def _record(
         self,

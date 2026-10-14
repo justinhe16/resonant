@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -316,3 +318,30 @@ def test_no_extensions_dir_is_fine(settings: Settings, db: sqlite3.Connection) -
     host = host_for(settings, db)
     assert host.loaded == {} and host.registry.specs() == []
     assert os.environ.get("RESONANT_HOME") == str(settings.home)
+
+
+def test_snapshot_must_match_the_pinned_manifest(
+    settings: Settings, db: sqlite3.Connection
+) -> None:
+    install_fixture(settings, db, MANIFEST, {"cli.py": CLI})
+    row = db.execute("SELECT manifest_json FROM extensions").fetchone()
+    snap = json.loads(row["manifest_json"])
+    snap["tools"]["write_note"]["level"] = "L0"
+    snap["tools"]["write_note"]["effect"] = "read"
+    db.execute("UPDATE extensions SET manifest_json = ?", (json.dumps(snap),))
+    host = host_for(settings, db)
+    assert not host.loaded
+    assert host.refused["example"] == "approved manifest snapshot does not match resonant.yaml"
+
+
+def test_unexpected_load_error_is_a_refusal(
+    settings: Settings, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_fixture(settings, db, MANIFEST, {"cli.py": CLI})
+
+    def boom(root: Path, manifest: Manifest) -> list[str]:
+        raise RuntimeError("symlink loop")
+
+    monkeypatch.setattr("resonant.extensions.host.dir_errors", boom)
+    host = host_for(settings, db)
+    assert host.refused == {"example": "load failed (RuntimeError)"}
