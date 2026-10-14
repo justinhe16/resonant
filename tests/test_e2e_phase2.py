@@ -14,11 +14,12 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import socket
 import sqlite3
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,14 +31,17 @@ from resonant.components import Components, build_components
 from resonant.config import load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
+from resonant.e2e.fakes import DEFAULT_FINAL_REPLY
 from resonant.gate import Allow, DryRun, Intent, NeedsApproval, PolicyGate
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.loop.types import PRIORITY_OWNER, Done, StepContext, StepOutcome, Task, Wait
 from resonant.ops import mark_restart, restart_pending
 from resonant.ops.fakes import FakeOpsRunner
+from resonant.router import commands
 from resonant.runners.reminder import ReminderRunner
 from resonant.store.db import iso, kv_set, utcnow
+from resonant.tools.when import format_due
 from resonant_sdk import Event
 
 OWNER_PHONE = "+15551234567"
@@ -172,11 +176,14 @@ async def running(
         yield r
 
 
-def build_daemon(home: Path, chat: FakeChatDB, ops: FakeOpsRunner) -> Running:
+def build_daemon(
+    home: Path, chat: FakeChatDB, ops: FakeOpsRunner, *, dry_run: bool = True
+) -> Running:
     """A daemon with iMessage on, fakes for osascript, the model and ops subprocesses."""
     (home / "principals.yaml").write_text(PRINCIPALS)
     port = free_port()
     settings = load_settings(
+        dry_run=dry_run,
         api={"port": port},
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
@@ -194,9 +201,13 @@ def build_daemon(home: Path, chat: FakeChatDB, ops: FakeOpsRunner) -> Running:
 
 @contextlib.asynccontextmanager
 async def start_daemon(
-    home: Path, chat: FakeChatDB, before_run: Callable[[Running], None] | None = None
+    home: Path,
+    chat: FakeChatDB,
+    before_run: Callable[[Running], None] | None = None,
+    *,
+    dry_run: bool = True,
 ) -> AsyncGenerator[Running]:
-    r = build_daemon(home, chat, FakeOpsRunner())
+    r = build_daemon(home, chat, FakeOpsRunner(), dry_run=dry_run)
     if before_run is not None:
         before_run(r)
     run = asyncio.create_task(r.daemon.run())
@@ -348,3 +359,120 @@ async def test_back_up_once_after_a_requested_restart(
     async with start_daemon(resonant_home, chat) as r:
         await asyncio.sleep(0.2)
         assert r.osa.sent == []
+
+
+# --- chat intents (P2-16): plain chat reaches the tools through the model -----------------
+
+
+@pytest.fixture
+async def live(resonant_home: Path, chat: FakeChatDB) -> AsyncIterator[Running]:
+    """The daemon after the go-live flip: ``dry_run: false``."""
+    async with start_daemon(resonant_home, chat, dry_run=False) as r:
+        yield r
+
+
+def reply(r: Running, text: str) -> None:
+    """An approval reply, timestamped clearly after the prompt (the sent-before rule)."""
+    r.chat.add_message(handle=OWNER_PHONE, text=text, at=utcnow() + timedelta(seconds=1))
+
+
+def chat_task(r: Running, intent: str) -> sqlite3.Row:
+    (task,) = r.rows("SELECT * FROM tasks WHERE kind = 'chat'")
+    assert json.loads(task["checkpoint"])["intent"] == intent
+    return task
+
+
+async def test_natural_language_reminder_is_set_with_its_due_time(live: Running) -> None:
+    r = live
+    r.chat.add_message(handle=OWNER_PHONE, text="remind me in 20 minutes to stretch")
+    sent = await r.osa.wait_for(1, 10)
+
+    task = chat_task(r, "reminders")
+    (call,) = r.audits("gate.evaluate")
+    assert (call["tool"], call["decision"]) == ("add_reminder", "Allow")
+    assert call["detail"]["origin"] == "inferred"  # the model chose it: L3 runs and reports
+
+    (reminder,) = r.rows("SELECT * FROM tasks WHERE runner = 'reminder'")
+    cp = json.loads(reminder["checkpoint"])
+    assert cp["text"] == "stretch"
+    due = datetime.fromisoformat(cp["at"])
+    # The model computed ``at`` from the "Current time" line.
+    assert timedelta(minutes=19) <= due - utcnow() <= timedelta(minutes=20)
+    assert reminder["status"] == "queued"
+
+    # The reply carries the code-built report with the due time, in the owner's zone.
+    when = format_due(due, now=utcnow(), tz=r.daemon.settings.timezone)
+    assert sent.handle == OWNER_PHONE
+    assert f'⏰ Reminder 1 set for {when}: "stretch"' in sent.text
+    assert json.loads(task["checkpoint"])["call"]["tool"] == "add_reminder"
+    (ex,) = r.rows("SELECT status FROM executions")
+    assert ex["status"] == "succeeded"
+
+
+async def test_chat_restart_resonant_asks_and_runs_only_after_yes(live: Running) -> None:
+    r = live
+    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
+    prompt = await r.osa.wait_for(1, 10)
+
+    await wait_until(lambda: chat_task(r, "ops")["status"] == "waiting", 10)
+    assert chat_task(r, "ops")["wait_reason"] == "approval"
+    match = re.fullmatch(r"\[([A-Z]\d)\] restart Resonant\? Reply yes / no", prompt.text)
+    assert match is not None, prompt.text
+    (audit,) = r.audits("gate.evaluate")
+    assert (audit["tool"], audit["decision"]) == ("restart_resonant", "NeedsApproval")
+    assert audit["detail"]["origin"] == "inferred"
+    await asyncio.sleep(0.2)
+    assert r.ops.spawned == []  # nothing ran yet
+    assert restart_pending(r.conn) is None
+
+    reply(r, "yes")
+    done = await r.osa.wait_for(2, 10)
+    assert done.text == "Restarting Resonant…"
+    assert len(r.ops.spawned) == 1  # the detached helper, exactly once
+    assert restart_pending(r.conn) is not None
+    await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+    assert r.rows("SELECT status FROM approvals")[0]["status"] == "approved"
+
+
+async def test_what_can_you_do_lists_real_commands(live: Running) -> None:
+    r = live
+    r.chat.add_message(handle=OWNER_PHONE, text="what can you do?")
+    sent = await r.osa.wait_for(1, 10)
+    assert sent.text == DEFAULT_FINAL_REPLY  # the scripted model's narration
+
+    chat_task(r, "system")
+    (audit,) = r.audits("gate.evaluate")
+    assert (audit["tool"], audit["decision"]) == ("list_commands", "Allow")
+    (ex,) = r.rows("SELECT status, result FROM executions")
+    assert ex["status"] == "succeeded"
+    listed = [c["name"] for c in json.loads(ex["result"])["commands"]]
+    assert listed == [c.name for c in commands.COMMANDS]  # the registry, owner's view
+    # The model got that registry output (as untrusted data) before it answered.
+    assert r.daemon.imessage is not None
+    model = r.daemon.imessage.model
+    assert isinstance(model, ScriptedModel)
+    assert model.calls["tools"] == 2 and model.calls["answer"] == 1
+
+
+async def test_chat_clear_notes_needs_the_code(live: Running) -> None:
+    r = live
+    await r.run_script({"tool": "add_note", "args": {"text": "buy milk"}})
+    r.chat.add_message(handle=OWNER_PHONE, text="clear my notes")
+    prompt = await r.osa.wait_for(1, 10)
+    match = re.fullmatch(
+        r"\[([A-Z]\d)\] delete all 1 note\? This can't be undone\. Reply yes \1 / no",
+        prompt.text,
+    )
+    assert match is not None, prompt.text
+    await wait_until(lambda: chat_task(r, "notes")["status"] == "waiting", 10)
+    audit = r.audits("gate.evaluate")[-1]
+    assert (audit["tool"], audit["detail"]["origin"]) == ("clear_notes", "inferred")
+
+    reply(r, "yes")  # a plain yes never approves L1
+    refused = await r.osa.wait_for(2, 10)
+    assert refused.text == f"Reply yes {match.group(1)} to confirm."
+    assert chat_task(r, "notes")["status"] == "waiting"
+
+    reply(r, f"yes {match.group(1)}")
+    done = await r.osa.wait_for(3, 10)
+    assert done.text == "Cleared 1 note."

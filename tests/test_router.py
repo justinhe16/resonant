@@ -628,10 +628,42 @@ def test_toolset_never_contains_tools_principal_cannot_request(
         owner = toolset_for(intent, OWNER, registry=registry, principals=principals)
         member = toolset_for(intent, MEMBER, registry=registry, principals=principals)
         assert [s.name for s in owner] == sorted(INTENT_TOOLS[intent])
-        assert member == []  # every Phase 1 tool is a global builtin
-        for spec in owner + member:
-            assert spec.effect is Effect.READ
+        assert member == []  # every builtin is global: owner-only
     assert toolset_for("system", "stranger", registry=registry, principals=principals) == []
+    assert toolset_for("ops", "stranger", registry=registry, principals=principals) == []
+
+
+def test_intent_toolsets_name_registered_builtins() -> None:
+    """Every toolset tool is a registered builtin, and the chat intents reach the tools the
+    slash commands do. Side effects only in notes, reminders and ops."""
+    names = {s.name: s for s in BUILTIN_SPECS}
+    for intent, tools in INTENT_TOOLS.items():
+        assert tools == tuple(sorted(tools)), intent
+        for tool in tools:
+            assert tool in names, (intent, tool)
+            if intent not in ("notes", "reminders", "ops"):
+                assert names[tool].effect is Effect.READ, (intent, tool)
+    assert set(INTENT_TOOLS["notes"]) == {"list_notes", "add_note", "delete_note", "clear_notes"}
+    assert set(INTENT_TOOLS["reminders"]) == {"add_reminder", "list_reminders", "cancel_reminder"}
+    assert set(INTENT_TOOLS["ops"]) == {
+        "restart_ollama",
+        "restart_resonant",
+        "update_resonant",
+        "recent_logs",
+        "disk",
+    }
+    assert "projects" in INTENT_TOOLS["job_control"]
+    assert "list_commands" in INTENT_TOOLS["system"]
+    assert set(INTENTS) == {
+        "question",
+        "job_control",
+        "system",
+        "notes",
+        "reminders",
+        "ops",
+        "run_project",
+        "unknown",
+    }
 
 
 # --- labeler -----------------------------------------------------------------------------
@@ -659,7 +691,7 @@ async def test_labeled_message_makes_exactly_one_model_call(
     assert task.checkpoint == {
         "intent": "system",
         "confidence": 0.82,
-        "toolset": ["daemon_status", "model_status", "system_status"],
+        "toolset": ["daemon_status", "list_commands", "model_status", "system_status"],
         "fallback": False,
         "toolset_prefix_hash": toolset_prefix_hash("system", toolset),
         "title": "chat: system",
@@ -676,7 +708,7 @@ async def test_labeled_message_makes_exactly_one_model_call(
     assert attrs["confidence"] == 0.82
     assert attrs["prefix_hash"] == LABEL_PREFIX_HASH
     (ts,) = spans_named(db, "router.toolset")
-    assert ts["toolset"] == ["daemon_status", "model_status", "system_status"]
+    assert ts["toolset"] == ["daemon_status", "list_commands", "model_status", "system_status"]
     assert ts["toolset_prefix_hash"] == task.checkpoint["toolset_prefix_hash"]
     assert "latency_ms" in attrs
     # No message body in span attributes.
@@ -693,7 +725,7 @@ async def test_prefix_bytes_identical_across_calls() -> None:
     prefix_b = json.dumps(b[:-1]).encode()
     assert prefix_a == prefix_b
     assert a[-1] == {"role": "user", "content": "<message>first message</message>"}
-    assert 6 <= sum(m["role"] == "assistant" for m in a) <= 10  # few-shot examples
+    assert 8 <= sum(m["role"] == "assistant" for m in a) <= 12  # few-shot examples
 
 
 def test_label_prefix_snapshot() -> None:
@@ -742,7 +774,12 @@ async def test_injection_gets_normal_label_and_no_extra_tools(
     assert task is not None
     assert task.kind == "chat"  # never the fast path, never the kill switch
     assert task.checkpoint["intent"] == "system"
-    assert task.checkpoint["toolset"] == ["daemon_status", "model_status", "system_status"]
+    assert task.checkpoint["toolset"] == [
+        "daemon_status",
+        "list_commands",
+        "model_status",
+        "system_status",
+    ]
     assert kv_get(db, "paused") is not True
     last = model.calls[0]["messages"][-1]
     assert last == {"role": "user", "content": f"<message>{text}</message>"}

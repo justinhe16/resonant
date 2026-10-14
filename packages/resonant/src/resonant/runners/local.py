@@ -15,8 +15,10 @@ One step does the whole task, unless it has to wait for an approval:
    that work needs the Claude runner (Phase 5). No tools run and Claude is never called.
 6. **Context.** ``runner_system(intent)``, the checkpoint's toolset (sorted), this
    principal's last few messages that started a task and our replies to them, then the
-   current message wrapped by ``wrap_untrusted``. Messages that started no task (approval
-   replies) are skipped. Earlier tool outputs appear only as the replies built from them.
+   current message wrapped by ``wrap_untrusted`` (for ``reminders``, after a code-built
+   ``Current time: …`` line in the runner's ``timezone``, so the model can compute ``at``).
+   Messages that started no task (approval replies) are skipped. Earlier tool outputs
+   appear only as the replies built from them.
 7. **Tools.** Up to ``MAX_TOOL_ITERATIONS`` ``chat_tools`` calls and ``MAX_TOOL_CALLS`` tool
    calls. Each call is ``Intent.for_tool`` (spec from the registry, never the model; origin
    always ``inferred``) -> ``gate.evaluate``. A read that is allowed runs and goes back to
@@ -86,7 +88,12 @@ from resonant.models import (
 from resonant.observability.spans import span
 from resonant.router.fast_path import render_mini, render_status, render_tasks
 from resonant.router.intents import UNKNOWN, IntentLabel, parse_intent
-from resonant.router.prefixes import FALLBACK_REPLY, runner_system, wrap_untrusted
+from resonant.router.prefixes import (
+    FALLBACK_REPLY,
+    current_turn,
+    runner_system,
+    wrap_untrusted,
+)
 from resonant.router.render import render_disk, render_logs, render_projects
 from resonant.store import approvals as ap
 from resonant.store.db import transaction, utcnow
@@ -190,9 +197,18 @@ def render_model(d: dict[str, Any]) -> str:
     return "Model: " + ("ok" if d.get("ok") is True else "not ok")
 
 
+def render_commands(d: dict[str, Any]) -> str:
+    lines = [
+        f"{c.get('usage')}: {c.get('description')}"
+        for c in (_as_dict(x) for x in cast(list[Any], d.get("commands") or []))
+    ]
+    return "\n".join(["Commands:", *lines]) if lines else "No commands available."
+
+
 _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "daemon_status": render_status,
     "disk": render_disk,
+    "list_commands": render_commands,
     "list_tasks": render_tasks,
     "model_status": render_model,
     "projects": render_projects,
@@ -260,6 +276,19 @@ def _notes_cleared(d: dict[str, Any]) -> str | None:
     return f"Cleared {n} note{'' if n == 1 else 's'}."
 
 
+def _reminder_set(d: dict[str, Any]) -> str | None:
+    n, due, text = d.get("id"), d.get("due"), d.get("text")
+    if not isinstance(n, int) or not isinstance(due, str) or not isinstance(text, str):
+        return None
+    shown = text if len(text) <= NOTE_TEXT_CHARS else text[: NOTE_TEXT_CHARS - 1] + "…"
+    return f'⏰ Reminder {n} set for {due}: "{shown}"'
+
+
+def _reminder_cancelled(d: dict[str, Any]) -> str | None:
+    n = d.get("id")
+    return f"Cancelled reminder {n}." if d.get("cancelled") is True and isinstance(n, int) else None
+
+
 def _ollama_restarted(d: dict[str, Any]) -> str | None:
     return "Restarted Ollama." if d.get("restarted") is True else None
 
@@ -291,6 +320,8 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "add_note": _note_saved,
     "delete_note": _note_deleted,
     "clear_notes": _notes_cleared,
+    "add_reminder": _reminder_set,
+    "cancel_reminder": _reminder_cancelled,
     "restart_ollama": _ollama_restarted,
     "restart_resonant": _resonant_restarting,
     "update_resonant": _updated,
@@ -425,6 +456,7 @@ class LocalRunner:
         max_step_s: float | None = 30.0,
         clock: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] = utcnow,
+        timezone: str = "UTC",
     ) -> None:
         self.conn = conn
         self.model = model
@@ -435,6 +467,7 @@ class LocalRunner:
         self.max_step_s = max_step_s
         self.clock = clock
         self.now = now
+        self.timezone = timezone  # for the reminders intent's "Current time" line
 
     async def step(self, task: Task, events: list[Event], ctx: StepContext) -> StepOutcome:
         start = self.clock()
@@ -718,9 +751,10 @@ class LocalRunner:
                 reply = _prior_reply(origin_cp)
                 if reply is not None:
                     messages.append({"role": "assistant", "content": reply[:MAX_HISTORY_CHARS]})
-        messages.append(
-            {"role": "user", "content": wrap_untrusted(text, max_chars=MAX_MESSAGE_CHARS)}
+        current = current_turn(
+            intent, text, now=self.now(), tz=self.timezone, max_chars=MAX_MESSAGE_CHARS
         )
+        messages.append({"role": "user", "content": current})
         return messages
 
     async def _tool_loop(

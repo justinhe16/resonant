@@ -53,7 +53,12 @@ class Components:
     runners: dict[str, Runner] = field(default_factory=dict[str, Runner])  # name -> runner
 
     def register_local_runner(
-        self, conn: sqlite3.Connection, *, model: ModelClient, channel: Channel
+        self,
+        conn: sqlite3.Connection,
+        *,
+        model: ModelClient,
+        channel: Channel,
+        timezone: str = "UTC",
     ) -> LocalRunner:
         """Build ``runner="local"`` from these components and add it to ``runners``.
 
@@ -67,6 +72,7 @@ class Components:
             gate=self.gate,
             executor=self.executor,
             registry=self.registry,
+            timezone=timezone,
         )
         self.runners[runner.name] = runner
         return runner
