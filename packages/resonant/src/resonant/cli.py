@@ -10,6 +10,7 @@ import contextlib
 import json
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -21,10 +22,20 @@ from resonant import daemon as daemon_mod
 from resonant import killswitch, launchd
 from resonant.config import Settings, load_settings
 from resonant.extensions.checks import approver_errors
-from resonant.principals import load_principals
+from resonant.gate import ApprovalResolution, PolicyGate
+from resonant.principals import Principals, load_principals
 from resonant.status import collect_status
+from resonant.store import approvals as ap
 from resonant.store.audit import audit
-from resonant.store.db import StoreUnavailableError, atomic, open_db, open_existing
+from resonant.store.db import (
+    StoreUnavailableError,
+    atomic,
+    iso,
+    open_db,
+    open_existing,
+    utcnow,
+)
+from resonant.tools import ToolRegistry
 from resonant_sdk import load_manifest
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -225,6 +236,184 @@ def job_guard(
             audit(conn, "job.exec_failed", job=job, error=str(e))
         typer.echo(f"job-guard: cannot exec {command[0]}: {e}", err=True)
         raise typer.Exit(127) from None
+
+
+# --- approvals -------------------------------------------------------------------------
+
+approvals_app = typer.Typer(
+    no_args_is_help=True, help="Pending approvals: list, show, approve or deny."
+)
+app.add_typer(approvals_app, name="approvals")
+
+ApprovalKey = Annotated[str, typer.Argument(help="Approval id, or the code of a pending one.")]
+
+_REFUSALS = {
+    "not_found": "approval not found",
+    "already_resolved": "already resolved",
+    "expired": "expired",
+    "task_not_waiting": "its task is no longer waiting",
+}
+
+
+def _principals(settings: Settings) -> Principals:
+    from resonant.components import deny_all_principals
+
+    path = settings.principals_path
+    return load_principals(path) if path.exists() else deny_all_principals()
+
+
+def _open_store(settings: Settings, *, readonly: bool) -> sqlite3.Connection:
+    """The existing store, never created or migrated. Exit 75 if it's missing or behind."""
+    try:
+        return open_existing(settings.db_path, readonly=readonly)
+    except StoreUnavailableError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(EX_TEMPFAIL) from None
+
+
+def _find_approval(conn: sqlite3.Connection, key: str, owner: str, now: datetime) -> ap.Approval:
+    """By id first. Codes are reused over time, so a code matches only pending approvals.
+    Exit 1 if nothing (or more than one approval) matches."""
+    if (by_id := ap.get_approval(conn, key)) is not None:
+        return by_id
+    code = key.strip().upper()
+    matches = [a for a in ap.pending_for(conn, owner, now) if a.code == code]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        ids = ", ".join(a.id for a in matches)
+        typer.echo(f"error: code {code} is ambiguous ({ids}); use the id", err=True)
+    else:
+        typer.echo(f"error: no approval with id {key} or pending code {code}", err=True)
+    raise typer.Exit(1)
+
+
+def _expires_in(expires_at: datetime, now: datetime) -> str:
+    s = max(0, int((expires_at - now).total_seconds()))
+    if s < 60:
+        return f"{s}s"
+    m = s // 60
+    return f"{m}m" if m < 60 else f"{m // 60}h{m % 60:02d}m"
+
+
+def _tool_name(a: ap.Approval) -> str:
+    return f"{a.extension}:{a.tool}" if a.extension else a.tool
+
+
+def _approval_dict(a: ap.Approval, now: datetime) -> dict[str, Any]:
+    return {
+        "id": a.id,
+        "code": a.code,
+        "status": a.status,
+        "task_id": a.task_id,
+        "tool": a.tool,
+        "extension": a.extension,
+        "effect": a.effect.value,
+        "level": a.level.value,
+        "require_code": a.require_code,
+        "summary": a.summary,
+        "requested_by": a.requested_by,
+        "created_at": iso(a.created_at),
+        "expires_at": iso(a.expires_at),
+        "expires_in_s": max(0, int((a.expires_at - now).total_seconds())),
+        "decided_by": a.decided_by,
+        "decided_at": iso(a.decided_at) if a.decided_at else None,
+    }
+
+
+@approvals_app.command("list")
+def approvals_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """List pending approvals, oldest first: code, tool, expires in, summary, id."""
+    settings = load_settings()
+    owner = _principals(settings).owner
+    with contextlib.closing(_open_store(settings, readonly=True)) as conn:
+        now = utcnow()
+        pending = ap.pending_for(conn, owner, now)
+    if as_json:
+        typer.echo(json.dumps([_approval_dict(a, now) for a in pending], indent=2))
+        return
+    if not pending:
+        typer.echo("no pending approvals")
+        return
+    for a in pending:
+        typer.echo(
+            f"{a.code or '--':<4} {_tool_name(a):<24} {_expires_in(a.expires_at, now):>6}  "
+            f"{a.summary}  ({a.id})"
+        )
+
+
+@approvals_app.command("show")
+def approvals_show(
+    key: ApprovalKey, as_json: Annotated[bool, typer.Option("--json")] = False
+) -> None:
+    """Show one approval with its full args (the summary masks them)."""
+    settings = load_settings()
+    owner = _principals(settings).owner
+    with contextlib.closing(_open_store(settings, readonly=True)) as conn:
+        now = utcnow()
+        a = _find_approval(conn, key, owner, now)
+        args = ap.intent_args(conn, a)
+    if as_json:
+        typer.echo(json.dumps({**_approval_dict(a, now), "args": args}, indent=2))
+        return
+    state = a.status
+    if a.status == "pending":
+        state += f", expires in {_expires_in(a.expires_at, now)}"
+    elif a.decided_by:
+        state += f" by {a.decided_by}"
+    typer.echo(f"id          {a.id}")
+    typer.echo(f"code        {a.code or '-'}")
+    typer.echo(f"status      {state}")
+    typer.echo(f"tool        {_tool_name(a)} ({a.effect.value} {a.level.value})")
+    typer.echo(f"task        {a.task_id or '-'}")
+    typer.echo(f"requested   by {a.requested_by or '-'} at {iso(a.created_at)}")
+    typer.echo(f"summary     {a.summary}")
+    shown = "(not recorded)" if args is None else json.dumps(args, indent=2, ensure_ascii=False)
+    typer.echo(f"args        {shown}")
+
+
+def _resolve(key: str, *, approved: bool) -> None:
+    verb = "approved" if approved else "denied"
+    settings = load_settings()
+    principals = _principals(settings)
+    with contextlib.closing(_open_store(settings, readonly=False)) as conn:
+        a = _find_approval(conn, key, principals.owner, utcnow())
+        typer.echo(f"[{a.code or '-'}] {a.summary}")
+        gate = PolicyGate(
+            conn,
+            principals,
+            ToolRegistry(),
+            dry_run=settings.dry_run,
+            approval_ttl_s=settings.gate.approval_ttl_s,
+        )
+        result = gate.resolve(
+            ApprovalResolution(
+                approval_id=a.id,
+                approved=approved,
+                actor=principals.owner,
+                actor_identity="cli",
+                path="cli",
+            )
+        )
+        if not result.ok:
+            reason = _REFUSALS.get(result.reason or "", result.reason or "refused")
+            if result.reason == "already_resolved" and (cur := ap.get_approval(conn, a.id)):
+                reason = f"already {cur.status}"
+            typer.echo(f"error: not {verb}: {reason}", err=True)
+            raise typer.Exit(1)
+    typer.echo(f"{verb}; task woken (the daemon picks it up on its next tick)")
+
+
+@approvals_app.command("approve")
+def approvals_approve(key: ApprovalKey) -> None:
+    """Approve a pending approval and wake its task. Exit 1 if refused."""
+    _resolve(key, approved=True)
+
+
+@approvals_app.command("deny")
+def approvals_deny(key: ApprovalKey) -> None:
+    """Deny a pending approval and wake its task. Exit 1 if refused."""
+    _resolve(key, approved=False)
 
 
 # --- extensions ------------------------------------------------------------------------

@@ -19,7 +19,7 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from resonant.gate.types import ResolvedApproval, ResolveResult
 from resonant.store import tasks as repo
@@ -400,3 +400,19 @@ def resolve_result(approvals: Sequence[Approval]) -> ResolveResult:
     Check for an empty list first: it means the event resolved nothing, not that it is done.
     """
     return ResolveResult(ok=True, resolved=tuple(a.resolved() for a in approvals))
+
+
+def intent_args(conn: sqlite3.Connection, approval: Approval) -> dict[str, Any] | None:
+    """The full args of the intent that created ``approval``, from its ``gate.evaluate``
+    audit row. None if that row is missing. For the owner only: the summary masks them.
+    """
+    r = conn.execute(
+        """SELECT detail FROM audit_log WHERE action = 'gate.evaluate' AND intent_hash = ?
+               AND json_extract(detail, '$.approval_id') = ?
+           ORDER BY id LIMIT 1""",
+        (approval.intent_hash, approval.id),
+    ).fetchone()
+    if r is None:
+        return None
+    args = json.loads(r["detail"]).get("args")
+    return cast(dict[str, Any], args) if isinstance(args, dict) else None
