@@ -1027,8 +1027,10 @@ def weekday_eight(tz: str, after: datetime) -> datetime:
 async def test_e4_morning_ping_first_run_is_baseline_then_sends_once(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
-    # The briefing is also due at 08:00; its own test is E13.
-    settings = settings_for(resonant_home, chat, briefing={"enabled": False})
+    # The briefing is also due at 08:00; its own test is E13. No hourly pulse either.
+    settings = settings_for(
+        resonant_home, chat, briefing={"enabled": False}, pulse={"enabled": False}
+    )
     files = {rel: (EXAMPLE / rel).read_text() for rel in ("cli.py", "README.md")}
     install(settings, (EXAMPLE / "resonant.yaml").read_text(), files)
     osa = RecordingOsaRunner()

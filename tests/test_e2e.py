@@ -299,6 +299,7 @@ async def test_sigterm_stops_channel_monitor_and_loop(
     settings = load_settings(
         api={"port": free_port()},
         channels={"imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05}},
+        pulse={"enabled": False},  # an hourly pulse due at start would send
     )
     osa = RecordingOsaRunner()
     daemon = Daemon(settings, model=ScriptedModel(), osa_runner=osa)

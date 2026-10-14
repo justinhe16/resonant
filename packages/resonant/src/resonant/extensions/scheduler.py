@@ -73,6 +73,7 @@ from resonant.extensions.cron import (
 )
 from resonant.extensions.notify import take_baseline
 from resonant.extensions.process import ExtAmbiguous, ExtFailed, ProcessTracker
+from resonant.extensions.pulse_job import pulse_job
 from resonant.gate import Allow, DryRun, Gate, Intent
 from resonant.gate.types import Deny
 from resonant.loop.types import PRIORITY_BACKGROUND, NewTask
@@ -131,7 +132,7 @@ class CoreDeps:
 CoreJobFactory = Callable[[CoreDeps], CoreJob | None]
 
 # Built-in jobs, one factory each.
-CORE_JOBS: tuple[CoreJobFactory, ...] = (briefing_job,)
+CORE_JOBS: tuple[CoreJobFactory, ...] = (briefing_job, pulse_job)
 
 
 @dataclass(frozen=True)
