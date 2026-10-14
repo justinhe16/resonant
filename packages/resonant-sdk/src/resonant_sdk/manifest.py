@@ -4,17 +4,22 @@ Validation is strict: unknown keys are errors. The one exception is a first-part
 named after ``uses`` (e.g. ``uses: oncall`` allows an ``oncall:`` block). The first-party
 extension validates that block with its own schema.
 
-Tool effects are declared here and nowhere else. MCP servers do not declare effects, so
-every MCP tool an extension wants exposed must be listed under ``mcp.tools``. Unlisted MCP
+Tool and job effects are declared here and nowhere else. MCP servers do not declare effects,
+so every MCP tool an extension wants exposed must be listed under ``mcp.tools``. Unlisted MCP
 tools are refused at runtime.
+
+Checks that need the extension's directory or this installation (stdlib only, the argv[0]
+allowlist, symlinks, builtin command names, approver grants) live in
+``resonant.extensions.checks``.
 """
 
 from __future__ import annotations
 
 import re
 import string
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -23,10 +28,24 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from resonant_sdk.tool import Effect, Level, ToolSpec
 
 SLUG = r"^[a-z][a-z0-9-]{0,47}$"
+SECRET_NAME = r"^[a-z][a-z0-9_]{0,31}$"  # noqa: S105 - a pattern, not a secret
+RESERVED_NAMES = frozenset({"core"})  # core jobs use ext="core"
+TOOL_TIMEOUT_MAX_S = 300.0
+JOB_TIMEOUT_MAX_S = 1800.0
+CATCHUP_MAX_S = 24 * 3600
+JOB_MIN_INTERVAL_S = 5 * 60
+ASKING_JOB_MIN_INTERVAL_S = 3600  # an L1/L2 job prompts a person each run
+DESCRIPTION_MAX = 120
+EXAMPLES_MAX = 3
+EXAMPLE_MAX = 80
+
 _CRON_FIELD = re.compile(r"^[A-Za-z0-9*/,\-]+$")
 _DURATION = re.compile(r"^\d+[smh]$")
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 _EVENT = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_UNIT_S = {"s": 1, "m": 60, "h": 3600}
+
+SecretName = Annotated[str, Field(pattern=SECRET_NAME)]
 
 ArgType = Literal["string", "integer", "number", "boolean"]
 _JSON_TYPES: dict[str, str] = {
@@ -41,12 +60,63 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def duration_s(v: str) -> int:
+    """Seconds in a ``30s`` / ``5m`` / ``1h`` duration."""
+    if not _DURATION.match(v):
+        raise ValueError(f"{v!r} must look like 30s, 5m, or 1h")
+    return int(v[:-1]) * _UNIT_S[v[-1]]
+
+
+def _cron_values(field: str, lo: int, hi: int) -> set[int]:
+    """Expand one numeric cron field (``*``, ``a``, ``a-b``, any with ``/n``, comma lists)."""
+    values: set[int] = set()
+    for item in field.split(","):
+        base, _, step_s = item.partition("/")
+        if step_s and not step_s.isdigit():
+            raise ValueError(f"bad cron step in {field!r}")
+        step = int(step_s) if step_s else 1
+        if base == "*":
+            start, end = lo, hi
+        else:
+            a, _, b = base.partition("-")
+            if not a.isdigit() or (b and not b.isdigit()):
+                raise ValueError(f"bad cron field {field!r}")
+            start = int(a)
+            end = int(b) if b else (hi if step_s else start)
+        if step < 1 or not lo <= start <= end <= hi:
+            raise ValueError(f"cron field {field!r} is out of range {lo}-{hi}")
+        values.update(range(start, end + 1, step))
+    return values
+
+
+def cron_min_interval_s(schedule: str) -> int:
+    """The shortest gap between two firings of a 5-field cron, from its minute and hour fields.
+
+    Conservative: it assumes consecutive days both fire, so a day-of-week or day-of-month
+    restriction never makes a schedule look sparser than it is.
+    """
+    minute, hour = schedule.split()[:2]
+    times = sorted(
+        h * 60 + m for h in _cron_values(hour, 0, 23) for m in _cron_values(minute, 0, 59)
+    )
+    gaps = [b - a for a, b in pairwise(times)]
+    gaps.append(times[0] + 24 * 60 - times[-1])  # across midnight
+    return min(gaps) * 60
+
+
 class Job(_Strict):
+    """A scheduled command. ``effect`` defaults to ``write`` (L1, the safe default)."""
+
     id: str = Field(pattern=SLUG)
     schedule: str  # 5-field cron, evaluated in `tz` (default: daemon timezone)
     tz: str | None = None
     critical: bool = False  # True: gets its own LaunchAgent and fires even if the daemon is down
     run: str
+    effect: Effect = Effect.WRITE
+    level: Level | None = None
+    secrets: tuple[SecretName, ...] = ()
+    timeout_s: float = Field(default=300.0, gt=0, le=JOB_TIMEOUT_MAX_S)
+    catchup: str = "none"  # "none" or a duration <= 24h
 
     @field_validator("tz")
     @classmethod
@@ -64,7 +134,44 @@ class Job(_Strict):
         fields = v.split()
         if len(fields) != 5 or not all(_CRON_FIELD.match(f) for f in fields):
             raise ValueError(f"schedule {v!r} must be a 5-field cron expression")
+        if cron_min_interval_s(v) < JOB_MIN_INTERVAL_S:
+            raise ValueError(f"schedule {v!r} fires more often than every 5 minutes")
         return v
+
+    @field_validator("catchup")
+    @classmethod
+    def _catchup(cls, v: str) -> str:
+        if v != "none" and duration_s(v) > CATCHUP_MAX_S:
+            raise ValueError("catchup must be none or a duration of at most 24h")
+        return v
+
+    @property
+    def catchup_s(self) -> int:
+        """The catch-up window in seconds; 0 for ``none``."""
+        return 0 if self.catchup == "none" else duration_s(self.catchup)
+
+    @property
+    def spec_name(self) -> str:
+        return "job_" + self.id.replace("-", "_")
+
+    def spec(self, extension: str) -> ToolSpec:
+        """The job as a ToolSpec. It never enters a model toolset or a member's commands."""
+        return ToolSpec(
+            name=self.spec_name,
+            description="scheduled job",
+            args_schema={
+                "type": "object",
+                "properties": {"due_at": {"type": "string"}},
+                "required": ["due_at"],
+                "additionalProperties": False,
+            },
+            effect=self.effect,
+            level=self.level,
+            source=f"ext:{extension}",
+            extension=extension,
+            timeout_s=self.timeout_s,
+            secrets=self.secrets,
+        )
 
 
 class CliTool(_Strict):
@@ -75,9 +182,9 @@ class CliTool(_Strict):
     effect: Effect
     level: Level | None = None
     args: dict[str, ArgType] = Field(default_factory=dict[str, ArgType])
-    secrets: tuple[str, ...] = ()
+    secrets: tuple[SecretName, ...] = ()
     commit: bool = False
-    timeout_s: float = Field(default=30.0, gt=0)
+    timeout_s: float = Field(default=30.0, gt=0, le=TOOL_TIMEOUT_MAX_S)
 
     @model_validator(mode="after")
     def _placeholders_declared(self) -> Self:
@@ -99,7 +206,7 @@ class McpToolDecl(_Strict):
     effect: Effect
     level: Level | None = None
     commit: bool = False
-    secrets: tuple[str, ...] = ()
+    secrets: tuple[SecretName, ...] = ()
 
 
 class McpServer(_Strict):
@@ -131,8 +238,7 @@ class Health(_Strict):
     @field_validator("every")
     @classmethod
     def _duration(cls, v: str) -> str:
-        if not _DURATION.match(v):
-            raise ValueError("every must look like 30s, 5m, or 1h")
+        duration_s(v)
         return v
 
 
@@ -141,6 +247,8 @@ class Manifest(BaseModel):
 
     name: str = Field(pattern=SLUG)
     version: Literal[1]
+    description: str = Field(default="", max_length=DESCRIPTION_MAX)  # the router intent
+    examples: tuple[str, ...] = Field(default=(), max_length=EXAMPLES_MAX)  # router few-shots
     uses: str | None = Field(default=None, pattern=SLUG)
     approvers: tuple[str, ...] = ()
     jobs: tuple[Job, ...] = ()
@@ -148,7 +256,21 @@ class Manifest(BaseModel):
     mcp: McpServer | None = None
     notify: Notify | None = None
     health: Health | None = None
-    secrets: tuple[str, ...] = ()
+    secrets: tuple[SecretName, ...] = ()
+
+    @field_validator("name")
+    @classmethod
+    def _not_reserved(cls, v: str) -> str:
+        if v in RESERVED_NAMES:
+            raise ValueError(f"extension name {v!r} is reserved")
+        return v
+
+    @field_validator("examples")
+    @classmethod
+    def _examples(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        if bad := [e for e in v if not e.strip() or len(e) > EXAMPLE_MAX or "\n" in e]:
+            raise ValueError(f"examples must be single lines of 1-{EXAMPLE_MAX} chars: {bad}")
+        return v
 
     @model_validator(mode="after")
     def _check(self) -> Self:
@@ -161,10 +283,20 @@ class Manifest(BaseModel):
         mcp_names: set[str] = set(self.mcp.tools) if self.mcp else set()
         if clash := set(self.tools) & mcp_names:
             raise ValueError(f"tool names defined twice (cli and mcp): {sorted(clash)}")
+        job_specs = self.job_specs()  # also enforces ToolSpec invariants
+        tool_specs = self.tool_specs()
+        if clash := {s.name for s in tool_specs} & {s.name for s in job_specs}:
+            raise ValueError(f"tool names collide with job spec names: {sorted(clash)}")
         declared = set(self.secrets)
-        for spec in self.tool_specs():  # also enforces ToolSpec invariants
+        for spec in tool_specs + job_specs:
             if undeclared := set(spec.secrets) - declared:
                 raise ValueError(f"{spec.name}: secrets not declared at top level: {undeclared}")
+        for job in self.jobs:
+            asks = job.spec(self.name).effective_level in (Level.L1, Level.L2)
+            if asks and cron_min_interval_s(job.schedule) < ASKING_JOB_MIN_INTERVAL_S:
+                raise ValueError(
+                    f"job {job.id}: it asks for approval (L1/L2), so it may run at most hourly"
+                )
         return self
 
     @property
@@ -181,6 +313,7 @@ class Manifest(BaseModel):
                     "type": "object",
                     "properties": {a: {"type": _JSON_TYPES[ty]} for a, ty in t.args.items()},
                     "required": sorted(t.args),
+                    "additionalProperties": False,
                 },
                 effect=t.effect,
                 level=t.level,
@@ -206,6 +339,10 @@ class Manifest(BaseModel):
                 for name, d in self.mcp.tools.items()
             ]
         return specs
+
+    def job_specs(self) -> list[ToolSpec]:
+        """One ``job_<id>`` spec per job. Never part of a model toolset."""
+        return [j.spec(self.name) for j in self.jobs]
 
 
 class _StrictBoolLoader(yaml.SafeLoader):
