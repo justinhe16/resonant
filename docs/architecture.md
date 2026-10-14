@@ -91,6 +91,7 @@ The Phase 1 exit criterion is **text → answer in 2–3s**: p50 ≤ 1s on the f
 |---|---|---|---|
 | Dev machine, `--model fake` (n=20; CI runs the same code) | scripted | 354 / 370 ms | 354 / 361 ms |
 | Mac mini (Apple M5 Pro, 64 GB), macOS 27.0.1, Ollama 0.40.3, `--model real` (n=20, 2026-10-13) | `qwen3:30b-a3b-instruct-2507-q4_K_M` (Ollama) | 353 / 367 ms | 1531 / 2129 ms |
+| Same Mini, after Phase 3.5 (n=20, 2026-10-14) | same | 354 / 366 ms | 1384 / 2335 ms |
 
 `resonant model bench` on the same run: label p50 / p95 86 / 89 ms, single tool call 229 / 232 ms, 0/20 failures.
 
