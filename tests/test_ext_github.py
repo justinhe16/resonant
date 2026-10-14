@@ -431,7 +431,7 @@ def test_digest_reports_the_summary_item(gh: FakeGh) -> None:
         pr_node(43, "c", contexts=[check("build", conclusion="FAILURE")]),
     ]
     gh.state["review"] = [pr_node(9, "d", repo="org/app"), pr_node(10, "e", repo="org/app")]
-    r = gh.run("digest", env=gh.env(RESONANT_JOB_DUE_AT="2026-10-14T07:50:00-07:00"))
+    r = gh.run("digest")
     (e,) = r.events
     line = "3 open PRs, 2 failing CI, 2 awaiting your review"
     assert e["type"] == "item" and e["text"] == line
@@ -447,8 +447,31 @@ def test_digest_reports_the_summary_item(gh: FakeGh) -> None:
     assert r.out["summary"] == line
 
 
+def test_report_event_matches_the_sdk_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The inline copy in cli.py must produce what ``resonant_sdk.emit.report`` would."""
+    import importlib.util
+
+    from resonant_sdk.emit import report
+
+    spec = importlib.util.spec_from_file_location("github_cli", CLI)
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    r, w = os.pipe()
+    monkeypatch.setenv("RESONANT_EVENTS_FD", str(w))
+    state = {"open": 3, "failing": 1, "review_requested": 2}
+    assert report("github/summary", "3 open PRs", urgency="low", state=state, ttl="30h")
+    os.close(w)
+    with os.fdopen(r) as f:
+        sdk = json.loads(f.read())
+    mine = cli.report_event("github/summary", "3 open PRs", state)
+    assert mine["type"] == sdk["type"] and mine["text"] == sdk["text"]
+    assert mine["data"] == sdk["data"]
+    assert mine["dedupe_key"].startswith("item:github/summary:")
+
+
 def test_digest_with_nothing_open(gh: FakeGh) -> None:
-    r = gh.run("digest", env=gh.env(RESONANT_JOB_DUE_AT="2026-10-14T07:50:00Z"))
+    r = gh.run("digest")
     assert r.events[0]["text"] == "0 open PRs, 0 failing CI, 0 awaiting your review"
     assert r.events[0]["data"]["state"] == {"open": 0, "failing": 0, "review_requested": 0}
 

@@ -30,7 +30,7 @@ Then work through the **[go-live checklist](docs/go-live.md)** to get from a run
 | `packages/resonant` | Daemon, CLI, store, gate, and the rest of core |
 | `packages/resonant-sdk` | The only package extensions depend on: manifest schema, tools, events |
 | `extensions/example` | A minimal example extension (`resonant.yaml`) |
-| `extensions/github` | GitHub PRs and CI: read tools, a CI watch, the briefing digest, two approved writes |
+| `extensions/github` | GitHub PRs and CI: read tools, a CI watch, the morning summary, two approved writes |
 | `config/*.example.yaml` | Example config. Copy it to `~/.resonant/` |
 | `scripts/bootstrap.sh` | Takes a fresh Mac to a running daemon |
 | `evals/*.example.jsonl` | Synthetic eval sets. Real sets live in `~/.resonant/evals/` |

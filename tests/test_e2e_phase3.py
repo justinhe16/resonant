@@ -1052,9 +1052,11 @@ async def test_e4_morning_ping_first_run_is_baseline_then_sends_once(
     assert d.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     job = get_job(d.conn, "example", "morning-ping")
     assert job is not None and job.last_due == second and job.last_outcome == "ok"
-    # The example's other jobs (pnl, incident) are due at those ticks too; they report nothing.
+    # The incident job also runs at each tick (no incident file: no report); pnl is due at :55.
     ran = [json.loads(r["detail"])["job"] for r in audit_rows(d.conn, "job.run")]
-    assert [j for j in ran if j == "example/morning-ping"] == ["example/morning-ping"] * 2
+    assert (
+        sorted(ran) == ["example/incident"] * 2 + ["example/morning-ping"] * 2
+    )  # tick order varies
     keys = [r["dedupe_key"] for r in d.conn.execute("SELECT dedupe_key FROM events")]
     assert keys == [f"ext:example:ping:{iso(first)}", f"ext:example:ping:{iso(second)}"]
     d.conn.close()

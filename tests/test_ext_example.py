@@ -115,22 +115,39 @@ async def test_pnl_is_normal_and_only_a_new_bucket_is_news(
     assert item is not None and item.urgency == "normal" and item.changed
     with transaction(db):
         items.mark_told(db, [item], utcnow())
-    # Same hour again: same bucket, not news. Another hour in the same bucket: still not.
-    await ingest(db, pulse, run_cli(tmp_path, "pnl"))
+    # Hour 13 is -$2,053: a different title but the same -$2,000 bucket, so not news.
+    (same_bucket,) = run_cli(tmp_path, "pnl", due="2026-10-14T13:55:00-07:00")
+    assert same_bucket["text"] == "PnL -$2.1k today"
+    assert same_bucket["data"]["state"] == event["data"]["state"]
+    await ingest(db, pulse, [same_bucket])
     again = items.get(db, "example", "example/pnl/today")
     assert again is not None and not again.changed
 
 
-async def test_incident_urgent_once_then_all_clear(db: sqlite3.Connection, tmp_path: Path) -> None:
+async def test_incident_failing_and_resolved_each_told_once(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
     ch = Channel()
     pulse = make_pulse(db, ch)
     assert run_cli(tmp_path, "incident-check") == []  # nothing set: nothing reported
+    # A stray resolve with nothing open writes nothing, so nothing is ever texted for it.
+    assert run_cli(tmp_path, "incident", "--state", "resolved") == []
+    assert not (tmp_path / "incident").exists()
+    await ingest(db, pulse, run_cli(tmp_path, "incident-check"))
+    assert ch.texts == []
     assert run_cli(tmp_path, "incident", "--state", "failing") == []  # a tool reports nothing
     for _ in range(3):  # the job runs every 5 minutes; the same state is told once
         await ingest(db, pulse, run_cli(tmp_path, "incident-check"))
     assert ch.texts == ["[example] \U0001f534 Demo service failing: checkout 5xx"]
     run_cli(tmp_path, "incident", "--state", "resolved")
-    for _ in range(2):
+    for _ in range(3):  # reported every run, told once; the file stays
         await ingest(db, pulse, run_cli(tmp_path, "incident-check"))
     assert ch.texts[1:] == ["[example] ✓ Demo service recovered"]
-    assert not (tmp_path / "incident").exists()
+    assert (tmp_path / "incident").read_text() == "resolved"
+    # A second resolve is refused (not failing); a new failure is told again.
+    run_cli(tmp_path, "incident", "--state", "resolved")
+    await ingest(db, pulse, run_cli(tmp_path, "incident-check"))
+    assert len(ch.texts) == 2
+    run_cli(tmp_path, "incident", "--state", "failing")
+    await ingest(db, pulse, run_cli(tmp_path, "incident-check"))
+    assert len(ch.texts) == 3

@@ -74,14 +74,21 @@ def main() -> int:
         )
         out = {"ok": True, "summary": f"PnL {money(pnl)}, bucket {bucket}"}
     elif args.cmd == "incident":
-        # Tools don't persist events, only job runs do, so this just records the state;
-        # the `incident` job picks it up within 5 minutes (or run `/ext run example/incident`).
-        INCIDENT.write_text(args.state)
-        out = {"ok": True, "summary": f"demo incident set to {args.state}"}
+        # Tools don't persist events, only job runs do, so this just records the state
+        # (atomically); the `incident` job reports it within 5 minutes.
+        current = INCIDENT.read_text().strip() if INCIDENT.exists() else ""
+        if args.state == "resolved" and current != "failing":
+            out = {"ok": True, "summary": "no incident open"}
+        else:
+            tmp = INCIDENT.with_suffix(".tmp")
+            tmp.write_text(args.state)
+            os.replace(tmp, INCIDENT)
+            out = {"ok": True, "summary": f"demo incident set to {args.state}"}
     elif args.cmd == "incident-check":
+        # Reports the file's state on every run and never deletes it: a repeat of the same
+        # state is not news (same fingerprint), so it is told once.
         state = INCIDENT.read_text().strip() if INCIDENT.exists() else ""
         if state == "failing":
-            # Same state every run: told once. Urgent: texted at once, at any hour.
             report(
                 "example/incident/demo",
                 "Demo service failing: checkout 5xx",
@@ -96,7 +103,6 @@ def main() -> int:
                 state={"status": "resolved"},
                 clear=True,
             )
-            INCIDENT.unlink()  # a clear is reported once
         out = {"ok": True, "summary": state or "no incident"}
     else:
         out = {"ok": True}
