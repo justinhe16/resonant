@@ -91,8 +91,11 @@ class IMessageStack:
         await self.channel.start(loop.submit)
         self._started = True
         log.info("imessage channel started")
-        if await back_up(self.channel.conn, self.channel, self.owner):
-            log.info("sent back-up message after a requested restart")
+        try:
+            if await back_up(self.channel.conn, self.channel, self.owner):
+                log.info("sent back-up message after a requested restart")
+        except Exception:
+            log.exception("back-up message failed")  # never blocks the start
 
     async def stop(self) -> None:
         """Stop the monitor and the reader. Safe to call twice or before ``start``."""

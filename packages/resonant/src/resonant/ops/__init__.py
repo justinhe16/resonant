@@ -25,12 +25,13 @@ import asyncio
 import contextlib
 import logging
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -46,7 +47,14 @@ KICKSTART_TIMEOUT_S = 15.0
 RESTART_PENDING_KEY = "ops.restart_pending"
 
 # git and uv never prompt: there is no terminal, and a prompt would only hang to the timeout.
-_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}
+_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "",
+    "SSH_ASKPASS": "",
+    "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",
+}
+# A marker older than this is stale (the kickstart never happened): no "back up" for it.
+RESTART_MARKER_MAX_AGE = timedelta(minutes=10)
 
 
 @dataclass(frozen=True)
@@ -91,12 +99,14 @@ class SubprocessRunner:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,  # its own process group, so a kill reaches its children
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout_s)
         except (TimeoutError, asyncio.CancelledError):
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+            # git spawns ssh / git-remote-https and uv spawns build backends: kill them all.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
             await proc.wait()
             raise
         return ProcResult(
@@ -178,16 +188,24 @@ async def back_up(
     """On start: if a restart was requested, tell the owner it is back, once.
 
     Returns True if a message was sent (or had already been sent). A send failure keeps the
-    marker, so the next start tries again; the dedupe key prevents a double send.
+    marker, so the next start tries again; the dedupe key prevents a double send. A marker
+    older than ``RESTART_MARKER_MAX_AGE`` is stale (the restart never happened) and is
+    dropped without a message.
     """
     from resonant.gateway.channel import ChannelError, ChannelRefused
 
     marker = restart_pending(conn)
     if marker is None:
         return False
-    by = marker.get("by")
+    by, at = marker.get("by"), marker.get("at")
     to = by if isinstance(by, str) and by else owner
-    if to is None:
+    try:
+        stale = not isinstance(at, str) or clock() - datetime.fromisoformat(at) > (
+            RESTART_MARKER_MAX_AGE
+        )
+    except (TypeError, ValueError):
+        stale = True
+    if to is None or stale:
         clear_restart(conn)
         return False
     try:
@@ -210,6 +228,7 @@ __all__ = [
     "LABELS",
     "LAUNCHCTL",
     "RESTART_DELAY_S",
+    "RESTART_MARKER_MAX_AGE",
     "RESTART_PENDING_KEY",
     "OpsRunner",
     "ProcResult",

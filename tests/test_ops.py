@@ -10,6 +10,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,7 @@ from resonant.loop.types import PRIORITY_OWNER
 from resonant.ops import (
     LAUNCHCTL,
     ProcResult,
+    SubprocessRunner,
     back_up,
     back_up_text,
     kickstart_argv,
@@ -443,6 +445,26 @@ async def test_back_up_retries_after_a_send_failure(db: sqlite3.Connection) -> N
     mark_restart(db, by=OWNER, commit=None, now=T0)
     assert not await back_up(db, refused, OWNER, clock=lambda: T0)
     assert restart_pending(db) is None  # a refusal won't get better by retrying
+
+
+async def test_stale_marker_is_dropped_without_a_message(db: sqlite3.Connection) -> None:
+    channel = Channel()
+    mark_restart(db, by=OWNER, commit="abc1234", now=T0)
+    later = T0 + timedelta(minutes=11)  # the kickstart never happened
+    assert not await back_up(db, channel, OWNER, clock=lambda: later)
+    assert channel.sent == [] and restart_pending(db) is None
+
+
+async def test_subprocess_runner_kills_on_timeout(tmp_path: Path) -> None:
+    """The real runner (harmless argv: a sleeping python) times out and kills it."""
+    runner = SubprocessRunner()
+    done = await runner.run([sys.executable, "-c", "print('hi')"], timeout_s=10, cwd=tmp_path)
+    assert done == ProcResult(0, "hi\n", "")
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await runner.run([sys.executable, "-c", "import time; time.sleep(30)"], timeout_s=0.5)
+    assert time.monotonic() - start < 5
+    assert runner.env["GIT_TERMINAL_PROMPT"] == "0"
 
 
 def test_back_up_text() -> None:
