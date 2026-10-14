@@ -40,6 +40,7 @@ from zoneinfo import ZoneInfo
 from resonant import killswitch
 from resonant.executor import CallContext
 from resonant.extensions import notify
+from resonant.extensions.pulse import render_item
 from resonant.monitor import health_snapshot
 from resonant.store import pulse as store
 from resonant.store.approvals import pending_for
@@ -86,12 +87,8 @@ def manual_dedupe_key(local: datetime) -> str:
 def item_line(item: store.Item, max_chars: int = LINE_MAX) -> str:
     """One item as a line: ``[dori] ✓ Dori recovered``, ``[trader] 🔴 PnL ...``; a core item
     has no ``[name]`` prefix (its title carries its own symbol)."""
-    if item.source == CORE:
-        return clip(item.title, max_chars)
-    mark = "✓ " if item.cleared else "🔴 " if item.urgency == "urgent" else ""
-    # Stored titles are already cleaned (clean_text is not idempotent): never re-clean.
-    head = notify.prefix(item.source) + " "
-    return head + clip(mark + item.title, max(1, max_chars - len(head)))
+    mark = "✓" if item.cleared and item.source != CORE else "🔴" if item.urgency == "urgent" else ""
+    return render_item(item, mark, max_chars)
 
 
 def _order(items: Sequence[store.Item]) -> list[store.Item]:
