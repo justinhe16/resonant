@@ -582,13 +582,13 @@ class ExtProcess:
         bufs = [bytearray(), bytearray(), bytearray()]
         transports: list[asyncio.BaseTransport] = []
         tasks: list[asyncio.Task[Any]] = []
+        files = [os.fdopen(r, "rb", 0) for r, _ in pipes]  # each fd is closed via its file
         try:
             readers: list[asyncio.StreamReader] = []
-            for r, _ in pipes:
+            for f in files:
                 reader = asyncio.StreamReader()
                 transport, _proto = await loop.connect_read_pipe(
-                    lambda reader=reader: asyncio.StreamReaderProtocol(reader),
-                    os.fdopen(r, "rb", 0),
+                    lambda reader=reader: asyncio.StreamReaderProtocol(reader), f
                 )
                 transports.append(transport)
                 readers.append(reader)
@@ -627,8 +627,8 @@ class ExtProcess:
             await asyncio.gather(*tasks, return_exceptions=True)
             for transport in transports:
                 transport.close()
-            for r, _ in pipes[len(transports) :]:
-                os.close(r)
+            for f in files[len(transports) :]:
+                f.close()
         out, err, evs = bufs
         tail = redact(err.decode(errors="replace"))[-STDERR_TAIL:]
         if entry.reason is not None:
