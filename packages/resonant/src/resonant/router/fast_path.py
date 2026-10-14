@@ -210,7 +210,7 @@ KEYWORDS: dict[str, FastCommand] = {
     "how is the mini": _MINI,
 }
 
-_SLASH = re.compile(r"^/[a-z][a-z0-9_-]*$")
+_SLASH = re.compile(r"^/[a-z][a-z0-9_-]{0,31}$")  # capped: an unknown word is echoed
 _APOSTROPHES = str.maketrans(dict.fromkeys((0x2018, 0x2019, 0x02BC), "'"))  # curly quotes
 
 
@@ -337,7 +337,8 @@ class FastPath:
         ):
             return self._result(cmd, NOT_ALLOWED) if cmd.slash else None
         if spec.effect is not Effect.READ:
-            # Only reads skip the executor here; side effects run as tasks (never inline).
+            # Only reads skip the executor here. Side-effecting commands become direct_call
+            # tasks (P2-15, plan D5); until then they are refused, never run inline.
             log.error("fast path refused non-read tool %s", cmd.tool)
             return self._result(cmd, NOT_ALLOWED) if cmd.slash else None
         intent = Intent.for_tool(
