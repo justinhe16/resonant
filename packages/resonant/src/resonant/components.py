@@ -32,7 +32,7 @@ from resonant.gateway.channel import Channel
 from resonant.loop.types import Runner
 from resonant.models import ModelClient
 from resonant.principals import Principal, Principals, load_principals
-from resonant.runners.local import LocalRunner
+from resonant.runners.local import MODEL_RESULT_MAX_CHARS, LocalRunner
 from resonant.secrets import SecretStore
 from resonant.tools import ToolRegistry
 from resonant.tools import notes as notes_tools
@@ -76,6 +76,7 @@ class Components:
         model: ModelClient,
         channel: Channel,
         timezone: str = "UTC",
+        model_result_max_chars: int = MODEL_RESULT_MAX_CHARS,
     ) -> LocalRunner:
         """Build ``runner="local"`` from these components and add it to ``runners``.
 
@@ -90,6 +91,8 @@ class Components:
             executor=self.executor,
             registry=self.registry,
             timezone=timezone,
+            extensions=self.extensions,
+            model_result_max_chars=model_result_max_chars,
         )
         self.runners[runner.name] = runner
         return runner

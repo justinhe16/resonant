@@ -4,7 +4,10 @@
 
 - **Input.** JSONL, one ``{"text": str, "intent": <IntentLabel>, "principal"?: "owner"}`` per
   line (blank lines are skipped). The default set is ``~/.resonant/evals/router.jsonl``,
-  outside the public repo; ``evals/router.example.jsonl`` is a synthetic example.
+  outside the public repo; ``evals/router.example.jsonl`` is a synthetic example. An
+  ``extension:<name>`` intent is valid when that extension is installed and enabled.
+- **Intents.** The labeler gets the same ``IntentSet`` as the daemon: the builtins plus the
+  enabled extensions' intents, from their approved manifest snapshots in the store.
 - **Run.** Every text goes through ``resonant.router.router.classify``: the production
   fast-path matcher and labeler, not a copy. It runs no tools and never touches the kill
   switch. When any text reaches the labeler, one untimed warm-up call is made first so a
@@ -12,6 +15,10 @@
 - **Output.** Accuracy, per-intent precision and recall, the confusion matrix, p50/p95
   latency overall and per path (``fast`` | ``llm``), fast-path coverage, labeler fallbacks
   and the misclassified examples.
+- **Advisory check** (``advisory``, run by ``resonant ext add|update``): the repo's example
+  set, builtin intents only, labeled with and without the new ``extension:<name>`` intent,
+  plus the manifest's own ``examples``. It prints builtin accuracy before and after and
+  warns on a drop; it never blocks. A missing set or model skips it with one line.
 - **Texts are PII.** They appear only in what the CLI prints. They are never logged, and the
   summary saved to ``~/.resonant/evals/results/<ts>.json`` for trend tracking refers to
   examples by line number only. Load errors name the line, never the text.
@@ -23,6 +30,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import sqlite3
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -32,14 +40,26 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from pydantic import ValidationError
+
 from resonant.config import Settings
 from resonant.models import ModelClient
 from resonant.models.bench import percentile
 from resonant.router import router as _router
 from resonant.router.fast_path import match_fast_path
-from resonant.router.intents import INTENTS, IntentLabel, parse_intent
+from resonant.router.intents import (
+    BUILTIN_INTENTS,
+    INTENTS,
+    IntentLabel,
+    IntentSet,
+    builtin_intent,
+    extension_intent,
+)
 from resonant.router.labeler import Labeler
-from resonant.router.prefixes import LABEL_PREFIX_HASH
+from resonant.router.prefixes import LabelPrompt
+from resonant.store import extensions as ext_store
+from resonant.store.db import StoreUnavailableError, open_existing
+from resonant_sdk import Manifest
 
 log = logging.getLogger(__name__)
 
@@ -76,7 +96,7 @@ class EvalCase:
     intent: IntentLabel
 
 
-def load_set(path: Path) -> list[EvalCase]:
+def load_set(path: Path, intents: IntentSet = BUILTIN_INTENTS) -> list[EvalCase]:
     """Parse a JSONL eval set. Raises ``EvalSetError`` naming the line (never the text)."""
     try:
         raw = path.read_text(encoding="utf-8")
@@ -99,9 +119,10 @@ def load_set(path: Path) -> list[EvalCase]:
         text = row.get("text")
         if not isinstance(text, str) or not text.strip():
             raise EvalSetError(f"{path}:{n}: 'text' must be a non-empty string")
-        intent = parse_intent(row.get("intent"))
+        intent = intents.parse(row.get("intent"))
         if intent is None:
-            raise EvalSetError(f"{path}:{n}: 'intent' must be one of {', '.join(INTENTS)}")
+            labels = ", ".join(intents.labels)
+            raise EvalSetError(f"{path}:{n}: 'intent' must be one of {labels}")
         # Validated but not passed on: classify routes from the owner's point of view.
         if row.get("principal", "owner") != "owner":
             raise EvalSetError(f"{path}:{n}: only principal 'owner' is supported")
@@ -109,6 +130,32 @@ def load_set(path: Path) -> list[EvalCase]:
     if not cases:
         raise EvalSetError(f"{path}: no examples")
     return cases
+
+
+def installed_intents(conn: sqlite3.Connection, *, exclude: str | None = None) -> IntentSet:
+    """The enabled extensions' intents, from their approved manifest snapshots (a snapshot
+    that no longer validates is skipped). ``exclude`` leaves one extension out."""
+    manifests: list[Manifest] = []
+    for record in ext_store.list_extensions(conn, status="enabled"):
+        if record.name == exclude:
+            continue
+        try:
+            manifests.append(Manifest.model_validate(record.manifest))
+        except ValidationError:
+            continue
+    return IntentSet.from_manifests(manifests)
+
+
+def store_intents(settings: Settings) -> IntentSet:
+    """``installed_intents`` from the store, read-only; builtins only when there is none."""
+    try:
+        conn = open_existing(settings.db_path, readonly=True)
+    except StoreUnavailableError:
+        return BUILTIN_INTENTS
+    try:
+        return installed_intents(conn)
+    finally:
+        conn.close()
 
 
 def set_digest(path: Path) -> str:
@@ -175,6 +222,8 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
     """All metrics, keyed for JSON. Contains no texts: examples are referred to by line."""
     n = len(results)
     correct = sum(r.correct for r in results)
+    seen = {r.expected for r in results} | {r.predicted for r in results}
+    intents = [*INTENTS, *sorted(i for i in seen if builtin_intent(i) is None)]
     expected = Counter(r.expected for r in results)
     predicted = Counter(r.predicted for r in results)
     hits = Counter(r.expected for r in results if r.correct)
@@ -185,9 +234,9 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
             "precision": _ratio(hits[i], predicted[i]),
             "recall": _ratio(hits[i], expected[i]),
         }
-        for i in INTENTS
+        for i in intents
     }
-    labels = [i for i in INTENTS if expected[i] or predicted[i]]
+    labels = [i for i in intents if expected[i] or predicted[i]]
     pairs = Counter((r.expected, r.predicted) for r in results)
     confusion = {e: {p: pairs[(e, p)] for p in labels} for e in labels}
     by_path = {p: [r.latency_ms for r in results if r.path == p] for p in PATHS}
@@ -317,11 +366,17 @@ def run(
     min_accuracy: float,
     echo: Callable[[str], None],
     echo_err: Callable[[str], None],
+    intents: IntentSet | None = None,
 ) -> int:
-    """Run the eval, print the report, save the text-free summary. Returns the exit code."""
+    """Run the eval, print the report, save the text-free summary. Returns the exit code.
+
+    ``intents`` defaults to the installed extensions' (``store_intents``), as in the daemon.
+    """
     path = (set_path or default_set_path(settings)).expanduser()
+    if intents is None:
+        intents = store_intents(settings)
     try:
-        cases = load_set(path)
+        cases = load_set(path, intents)
         digest = set_digest(path)
     except EvalSetError as e:
         echo_err(f"error: {e}")
@@ -331,7 +386,7 @@ def run(
 
     async def go() -> list[CaseResult]:
         async with open_model(settings) as model:
-            return await run_eval(cases, Labeler(model), repeat=repeat)
+            return await run_eval(cases, Labeler(model, intents), repeat=repeat)
 
     now = datetime.now(UTC)
     results = asyncio.run(go())
@@ -346,7 +401,8 @@ def run(
             "cases": len(cases),
             "repeat": repeat,
             "model": settings.model.name,
-            "label_prefix_hash": LABEL_PREFIX_HASH,
+            "label_prefix_hash": LabelPrompt(intents).prefix_hash,
+            "extension_intents": [e.label for e in intents.extensions],
             "min_accuracy": min_accuracy,
             "passed": passed,
         },
@@ -363,3 +419,63 @@ def run(
     else:
         echo(render_text(summary, texts))
     return EXIT_OK if passed else EXIT_BELOW_MIN
+
+
+# --- advisory check at ext add / update (docs/phase3-plan.md D2) ----------------------
+
+
+def example_set_path(settings: Settings) -> Path | None:
+    repo = settings.ops.repo_path
+    return None if repo is None else repo / "evals" / "router.example.jsonl"
+
+
+def _accuracy(results: Sequence[CaseResult]) -> float:
+    return sum(r.correct for r in results) / len(results) if results else 0.0
+
+
+def advisory(
+    settings: Settings, manifest: Manifest, *, before: IntentSet, set_path: Path | None = None
+) -> list[str]:
+    """Advisory lines for adding ``manifest``'s intent to ``before`` (never raises).
+
+    Builtin accuracy on the example set's builtin cases, before and after, then how many
+    of the manifest's ``examples`` route to its intent. A drop is a warning only.
+    """
+    after = before.with_manifest(manifest)
+    label = extension_intent(manifest.name)
+    if after.extension(label) is None:
+        return []
+    path = set_path or example_set_path(settings)
+    try:
+        if path is None or not path.is_file():
+            return ["Router: advisory eval skipped (no example set)"]
+        base = [c for c in load_set(path) if builtin_intent(c.intent) is not None]
+        own = [EvalCase(0, text, label) for text in manifest.examples]
+
+        async def go() -> tuple[list[CaseResult], list[CaseResult]]:
+            async with open_model(settings) as model:
+                old = await run_eval(base, Labeler(model, before))
+                new = await run_eval([*base, *own], Labeler(model, after))
+                return old, new
+
+        old, new = asyncio.run(go())
+    except Exception as e:  # advisory: never blocks an install
+        log.warning("advisory router eval failed: %s", type(e).__name__)
+        return [f"Router: advisory eval skipped ({type(e).__name__})"]
+    if any(r.fallback for r in [*old, *new]):
+        return ["Router: advisory eval skipped (model unavailable; try resonant model probe)"]
+    new_base, new_own = new[: len(base)], new[len(base) :]
+    acc_old, acc_new = _accuracy(old), _accuracy(new_base)
+    lines = [
+        f"Router: builtin accuracy {acc_old * 100:.1f}% before, {acc_new * 100:.1f}% after "
+        f"({len(base)} examples, advisory)"
+    ]
+    if acc_new < acc_old:
+        lines.append(
+            f"warning: {label} takes messages from builtin intents; "
+            "a narrower description may help (not blocking)"
+        )
+    if new_own:
+        hits = sum(r.correct for r in new_own)
+        lines.append(f"Router: {hits}/{len(new_own)} of its examples route to {label}")
+    return lines

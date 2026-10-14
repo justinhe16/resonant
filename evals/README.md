@@ -43,13 +43,17 @@ The default set is `~/.resonant/evals/router.jsonl`. It stays outside the repo a
    ```
 
    - `text`: the message, exactly as you'd send it.
-   - `intent`: what the router *should* say. One of `question`, `job_control`, `system`, `run_project`, `unknown` (see `resonant/router/intents.py` for the definitions).
+   - `intent`: what the router *should* say. One of `question`, `job_control`, `system`, `notes`, `reminders`, `ops`, `run_project`, `unknown` (see `resonant/router/intents.py` for the definitions), or `extension:<name>` for an installed, enabled extension. The eval labels with the same extension intents as the daemon, read from the store.
    - `principal` (optional): only `"owner"` is supported. The eval routes from the owner's point of view.
 
    Blank lines are skipped. A malformed line fails the load with its line number (the text is never echoed).
 3. Cover every intent, with at least ~10 examples each. Include the fast-path phrasings (`status`, `ping`, `what's running`, `how's the mini`, `/status`, `/tasks`, `/help`) and near-misses that should *not* hit the fast path ("what's running on the build box?").
 4. Don't copy the labeler's few-shot examples (`resonant/router/prefixes.py`) into the set. That inflates accuracy.
 5. Label by what you meant, not by what the router currently says. Disagreements are the point.
+
+### At `resonant ext add` / `update`
+
+Adding an extension adds an `extension:<name>` intent (from its manifest `description` and `examples`), which can pull messages away from the builtin intents. Before you confirm, `ext add` and `ext update` label `router.example.jsonl` (builtin rows only) without and with the new intent, plus the manifest's own examples, and print builtin accuracy before and after. A drop is a warning, not a refusal. Without Ollama, it prints one `skipped` line.
 
 ### Target
 

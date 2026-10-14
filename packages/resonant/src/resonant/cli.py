@@ -572,15 +572,27 @@ def _typed_confirm(name: str, verb: str) -> None:
         raise typer.Exit(1)
 
 
-def _router_check(staged: Staged) -> None:
-    """Advisory only. Seam for P3-11: once ``extension:<name>`` intents exist, run the
-    router eval on the example set with this intent included and print builtin accuracy
-    before and after (a drop is a warning, never a refusal)."""
-    if not staged.manifest.description:
+def _router_check(settings: Settings, conn: sqlite3.Connection, staged: Staged) -> None:
+    """Advisory only (docs/phase3-plan.md D2): the router eval on the repo's example set
+    with and without ``extension:<name>``, printing builtin accuracy before and after. A
+    drop is a warning, never a refusal; no model or no set skips it with one line."""
+    from resonant.evals import router_eval
+
+    m = staged.manifest
+    if not m.description or not m.tools:
         typer.echo(
-            f"Router: no description, so chat won't route to {staged.name}; /{staged.name} works."
+            f"Router: no description or tools, so chat won't route to {staged.name}; "
+            f"/{staged.name} works."
         )
-    typer.echo(f"Router: new intent extension:{staged.name} (advisory eval arrives with P3-11)")
+        return
+    typer.echo(f"Router: new intent extension:{staged.name}")
+    try:
+        before = router_eval.installed_intents(conn, exclude=staged.name)
+        lines = router_eval.advisory(settings, m, before=before)
+    except Exception as e:  # advisory: never blocks an install or update
+        lines = [f"Router: advisory eval skipped ({type(e).__name__})"]
+    for line in lines:
+        typer.echo(line)
 
 
 @ext_app.command("add")
@@ -606,7 +618,7 @@ def ext_add(
                 raise AdoptRequired(f"{staged.name}: leftovers from another source", reasons)
             for line in confirm_lines(staged):
                 typer.echo(line)
-            _router_check(staged)
+            _router_check(settings, conn, staged)
             _typed_confirm(staged.name, "install")
         finally:
             mgr.discard(staged)
@@ -638,7 +650,7 @@ def ext_update(name: Annotated[str, typer.Argument(help="An installed extension"
             typer.echo("")
             for line in confirm_lines(staged):
                 typer.echo(line)
-            _router_check(staged)
+            _router_check(settings, conn, staged)
             _typed_confirm(name, "update")
         finally:
             mgr.discard(staged)

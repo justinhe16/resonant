@@ -14,6 +14,7 @@ import subprocess
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -22,6 +23,7 @@ from resonant import cli
 from resonant.cli import app
 from resonant.components import deny_all_principals
 from resonant.config import Settings
+from resonant.evals import router_eval
 from resonant.extensions.manager import (
     AdoptRequired,
     ExtensionManager,
@@ -620,6 +622,11 @@ def cli_env(
     monkeypatch.setattr(cli, "_daemon_up", _daemon(up=False))
     runner = FakeOpsRunner()
     monkeypatch.setattr(cli, "_restart_runner", lambda: runner)
+
+    def no_model(settings: Settings) -> Any:
+        raise AssertionError("the advisory router eval must not reach a real model here")
+
+    monkeypatch.setattr(router_eval, "open_model", no_model)
     return runner
 
 
@@ -637,6 +644,7 @@ def test_cli_add_confirm_install_and_list(
     assert re.fullmatch(r"demo repo:demo@[0-9a-f]{8} digest [0-9a-f]{8}", first)
     assert "Escalations: none" in out and "Installed demo repo:demo@" in out
     assert "Router: new intent extension:demo" in out
+    assert "Router: advisory eval skipped (no example set)" in out  # the temp repo has none
     assert "isn't running" in out and cli_env.spawned == []
     assert ext_store.get_extension(conn, "demo") is not None
     assert no_staging_left(resonant_home)

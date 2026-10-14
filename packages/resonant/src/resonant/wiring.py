@@ -177,9 +177,14 @@ def build_imessage_stack(
         handlers=components.handlers,
         model=model,
         timezone=settings.timezone,
+        extensions=components.extensions,
     )
     runner = components.register_local_runner(
-        conn, model=model, channel=channel, timezone=settings.timezone
+        conn,
+        model=model,
+        channel=channel,
+        timezone=settings.timezone,
+        model_result_max_chars=settings.extensions.model_result_max_chars,
     )
     runner.max_step_s = local_step_limit(settings.model, components.chat_specs())
     loop.runners[runner.name] = runner
