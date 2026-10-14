@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -409,6 +410,40 @@ async def test_context_has_system_prefix_history_and_wrapped_message(make: Any) 
     assert messages[-1]["content"].startswith("<message>")
     assert messages[-1]["content"].count("</message>") == 1
     assert h.task(first).status == "done"
+
+
+REMINDERS = {
+    "intent": "reminders",
+    "confidence": 0.9,
+    "toolset": ["add_reminder", "cancel_reminder", "list_reminders"],
+    "fallback": False,
+    "toolset_prefix_hash": "x",
+}
+
+
+async def test_reminders_turn_has_the_local_time_and_the_prefix_stays_constant(
+    make: Any,
+) -> None:
+    model = FakeModel(tool_replies=[[], []], final={"reply": "ok"})
+    h: Harness = make(model)
+    h.runner.timezone = "America/Los_Angeles"
+    h.runner.now = lambda: datetime(2026, 10, 13, 22, 4, 30, tzinfo=UTC)
+    h.add_task(REMINDERS, text="remind me at 3 to call mom")
+    await h.loop.run_until_idle()
+    h.runner.now = lambda: datetime(2026, 10, 14, 1, 0, tzinfo=UTC)
+    h.add_task(JOB_CONTROL, text="anything stuck?")
+    await h.loop.run_until_idle()
+
+    first, second = model.tool_calls_made
+    assert first[0] == {"role": "system", "content": runner_system("reminders")}
+    assert "ISO-8601 datetime with the UTC offset" in first[0]["content"]
+    assert first[-1]["content"] == (
+        "Current time: 2026-10-13T15:04-07:00 (Tue, America/Los_Angeles).\n"
+        + wrap_untrusted("remind me at 3 to call mom")
+    )
+    # Other intents get no time line, and the system message never has one.
+    assert second[-1]["content"] == wrap_untrusted("anything stuck?")
+    assert "Current time" not in second[0]["content"] + first[0]["content"]
 
 
 async def test_history_is_this_principals_and_at_most_six_events(make: Any) -> None:

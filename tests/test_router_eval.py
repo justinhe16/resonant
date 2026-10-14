@@ -121,6 +121,9 @@ def test_example_set_is_valid_and_covers_both_paths() -> None:
         "question",
         "job_control",
         "system",
+        "notes",
+        "reminders",
+        "ops",
         "run_project",
         "unknown",
     }

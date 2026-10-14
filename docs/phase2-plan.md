@@ -228,7 +228,7 @@ All handlers return JSON, raise `ToolFailed` for bad args or definite failures, 
   - `ops`: `restart_ollama`, `restart_resonant`, `update_resonant`, `recent_logs`
   - `job_control` += `projects`
   - `system` += `list_commands` ("what can you do" is about Resonant itself)
-- **Prompt changes.** The labeler's definitions and few-shots change, so the `label_prefix.json` snapshot changes. `runner_system` tells the model to pass reminder times as ISO datetimes, with the current local time and the zone given in the system message. That makes it a per-minute-varying suffix, so it goes after the stable prefix.
+- **Prompt changes.** The labeler's definitions and few-shots change, so the `label_prefix.json` snapshot changes. `runner_system` tells the model to pass reminder times as ISO datetimes, with the current local time and the zone given just before the message. That is a per-minute-varying suffix, so it goes after the stable prefix: in the last user turn rather than the system message, since some chat templates render the tools inside the system turn (as built in P2-16).
 - **Evals.** Add ~15 synthetic cases to `evals/router.example.jsonl`. `resonant eval router` on the example set must stay ≥ 90%.
 - Inferred L2 asks and inferred L3 runs, with one gated side effect per task.
 

@@ -50,7 +50,7 @@ from resonant.runners.local import (
 from resonant.store import approvals as ap
 from resonant.store import tasks as repo
 from resonant.store.db import kv_set, transaction
-from resonant.tools import ToolRegistry, notes
+from resonant.tools import ToolRegistry, notes, reminders
 from resonant.tools.ops import RESTART_OLLAMA, RESTART_RESONANT, Ops
 from resonant.tools.tasks import TASK_COUNTS
 from resonant_sdk import Effect, Event, Level, ToolSpec
@@ -788,6 +788,18 @@ def test_report_lines() -> None:
         name="add_note", effect=Effect.WRITE, level=Level.L3, source="ext:x", extension="x"
     )
     assert report_line(_intent(ext), {"id": 1, "text": "y"}) == "Done: x: add note"
+
+
+def test_reminder_report_lines_carry_the_due_time() -> None:
+    add, cancel = reminders.ADD_REMINDER, reminders.CANCEL_REMINDER
+    data = {"id": 2, "task_id": "t", "at": "x", "due": "3:20pm", "text": "stretch"}
+    assert report_line(_intent(add, at="x", text="stretch"), data) == (
+        '⏰ Reminder 2 set for 3:20pm: "stretch"'
+    )
+    assert report_line(_intent(cancel, id=2), {"cancelled": True, "id": 2}) == (
+        "Cancelled reminder 2."
+    )
+    assert report_line(_intent(cancel, id=2), {}) == "Done: cancel reminder id=2"
 
 
 def test_prompt_text_and_dedupe_key() -> None:
