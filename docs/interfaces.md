@@ -226,10 +226,11 @@ MAX_COMMENTS_LEN = 500
 - The whole message must match, after normalization and ignoring (ASCII) case:
   - `(yes|approve|👍)( <code>)?` and `<code> yes`
   - `(no|deny|👎)( <code>)?` and `<code> no`
-  - `yes( <code>)? with comments: <text>`, where `text` is 1–500 characters and keeps its case
+  - `yes( <code>)? with comments: <text>`, where `text` is 1–500 characters and is kept verbatim
+- Outside comments, a trailing run of `.` and `!` is dropped (`Yes.`, `yes!!`, `yes A7.`). `?` never is: `yes?` is a question.
 - 👍 and 👎 may carry a skin tone and the emoji presentation selector.
 - A code must come from the `new_code` alphabet, so look-alikes (`A1`, `O7`) never match.
-- Anything else returns None: `y`, `ok`, `sure`, `yes!`, `yes all`, `yes A7 and C4`, a pasted prompt, or text with invisible characters. A `truncated` payload is never a reply.
+- Anything else returns None: `y`, `ok`, `sure`, `yes?`, `yes all`, `yes A7 and C4`, a pasted prompt, or text with invisible characters. A `truncated` payload is never a reply.
 - The parser only reads text. Binding (approvers, single pending, `require_code`, sent-before) is the gate's job.
 
 **Deferred** (C4): the approval classifier, `resonant eval approvals`, and batch approvals (`yes all`). `open_batch` stays `NotImplementedError`, and `ApprovalReply.path` is always `"parser"` for now. With several approvals pending, a plain `yes` gets a re-ask that lists the codes. The design kept for later:

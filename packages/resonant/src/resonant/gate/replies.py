@@ -1,7 +1,9 @@
 """The deterministic approval-reply parser.
 
 A reply is the whole message, after normalization (NFKC, curly quotes straightened,
-whitespace collapsed, case ignored). It matches exactly one of:
+whitespace collapsed, case ignored). Outside comments, a trailing run of ``.`` and ``!``
+is dropped ("Yes.", "yes!!"); ``?`` never is ("yes?" is a question). It matches exactly
+one of:
 
 - ``(yes|approve|👍)( <code>)?``
 - ``<code> yes``
@@ -9,7 +11,7 @@ whitespace collapsed, case ignored). It matches exactly one of:
 - ``<code> no``
 - ``yes( <code>)? with comments: <text>`` (text 1-500 characters)
 
-Anything else is not a reply: ``y``, ``ok``, ``sure``, ``yes all``, ``yes A7 and C4``, a
+Anything else is not a reply: ``y``, ``ok``, ``sure``, ``yes?``, ``yes all``, ``yes A7 and C4``, a
 pasted prompt, or a code outside the approval alphabet (``yes A1``). A message the reader
 truncated is never a reply. There is no classifier and there are no batch replies in
 Phase 2.
@@ -49,6 +51,8 @@ _COMMENTS = re.compile(
     rf"yes(?: (?P<code>{_CODE}))? with comments: ?(?P<comments>.+)", _FLAGS | re.DOTALL
 )
 _DENY = re.compile(_NO, _FLAGS)
+# Trailing periods and exclamation marks (autocorrect, emphasis), never question marks.
+_TRAILING = re.compile(r"[\s.!]+\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +80,7 @@ def parse_reply(text: str, *, truncated: bool = False) -> ParsedReply | None:
         if not comments or len(comments) > MAX_COMMENTS_LEN:
             return None
         return ParsedReply("approve", _upper(m["code"]), comments)
+    norm = _TRAILING.sub("", norm)
     m = _WORD_CODE.fullmatch(norm) or _CODE_WORD.fullmatch(norm)
     if m is None:
         return None

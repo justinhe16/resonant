@@ -110,8 +110,15 @@ def test_bad_comments_are_not_replies(text: str) -> None:
         "sure",
         "yep",
         "yes please",
-        "yes!",
-        "yes.",
+        "yes?",
+        "yes!?",
+        "yes?!",
+        "no?",
+        "yes A7?",
+        ".",
+        "!!",
+        "yes,",
+        ".yes",
         "yes all",
         "approve all",
         "yes A7 and C4",
@@ -171,6 +178,34 @@ def test_unicode_case_folding_is_ascii_only() -> None:
     # Unicode IGNORECASE would let a dotless i pass for "i"; NFKC doesn't fold it.
     assert parse_reply("den\u0131") is None  # dotless i
     assert parse_reply("approve") == APPROVE
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Yes.", APPROVE),
+        ("yes!", APPROVE),
+        ("yes!!", APPROVE),
+        ("yes.!.", APPROVE),
+        ("No.", DENY),
+        ("yes A7.", ParsedReply("approve", "A7")),
+        ("yes A7 !", ParsedReply("approve", "A7")),
+        ("A7 no!", ParsedReply("deny", "A7")),
+        ("\U0001f44d!", APPROVE),
+        ("approve. ", APPROVE),
+    ],
+)
+def test_trailing_punctuation(text: str, expected: ParsedReply) -> None:
+    assert parse_reply(text) == expected
+
+
+def test_comments_keep_trailing_punctuation() -> None:
+    assert parse_reply("yes with comments: go!") == ParsedReply("approve", None, "go!")
+    assert parse_reply("Yes A7 with comments: staging only.") == ParsedReply(
+        "approve", "A7", "staging only."
+    )
+    assert parse_reply("yes with comments: really?") == ParsedReply("approve", None, "really?")
+    assert parse_reply("yes with comments: ...") == ParsedReply("approve", None, "...")
 
 
 def test_truncated_payload_is_never_a_reply() -> None:
