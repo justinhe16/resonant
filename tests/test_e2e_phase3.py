@@ -1031,7 +1031,7 @@ async def test_e4_morning_ping_first_run_is_baseline_then_sends_once(
     settings = settings_for(
         resonant_home, chat, briefing={"enabled": False}, pulse={"enabled": False}
     )
-    files = {rel: (EXAMPLE / rel).read_text() for rel in ("cli.py", "README.md")}
+    files = {rel: (EXAMPLE / rel).read_text() for rel in ("cli.py", "emit.py", "README.md")}
     install(settings, (EXAMPLE / "resonant.yaml").read_text(), files)
     osa = RecordingOsaRunner()
     d = github_daemon(settings, osa)  # its parts, not its run loop
@@ -1052,10 +1052,11 @@ async def test_e4_morning_ping_first_run_is_baseline_then_sends_once(
     assert d.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     job = get_job(d.conn, "example", "morning-ping")
     assert job is not None and job.last_due == second and job.last_outcome == "ok"
-    assert [json.loads(r["detail"])["job"] for r in audit_rows(d.conn, "job.run")] == [
-        "example/morning-ping",
-        "example/morning-ping",
-    ]
+    # The incident job also runs at each tick (no incident file: no report); pnl is due at :55.
+    ran = [json.loads(r["detail"])["job"] for r in audit_rows(d.conn, "job.run")]
+    assert (
+        sorted(ran) == ["example/incident"] * 2 + ["example/morning-ping"] * 2
+    )  # tick order varies
     keys = [r["dedupe_key"] for r in d.conn.execute("SELECT dedupe_key FROM events")]
     assert keys == [f"ext:example:ping:{iso(first)}", f"ext:example:ping:{iso(second)}"]
     d.conn.close()

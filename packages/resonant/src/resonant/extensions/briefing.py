@@ -14,14 +14,21 @@ nothing to say is left out (``Nothing on today.`` when all are):
   wait reasons only, never titles or message bodies). Reminders are left out (above).
 - ``✋ 1 approval pending (A7)``: ``approvals.pending_for(owner)``.
 - ``⚠ model, imessage degraded``: degraded checks in ``health_snapshot``.
-- ``github: 3 open PRs, ...``: the text of today's latest ``ext.github.digest`` event
-  (P3-9 schedules ``digest`` at 07:50), sanitized and at most 200 chars. Left out when there
-  is none today or ``github`` isn't loaded.
-
 - ``Updates:`` then one line per open pulse item (``store.pulse.open_items``: every source
   including ``core``, every urgency), changed-since-told first, at most 8 lines and
   ``+N more``. The items listed are marked told after the send (a manual run too), so the
-  next pulse doesn't repeat them. The github line above goes when P35-4 reports it as an item.
+  next pulse doesn't repeat them. github's morning summary is one of these
+  (``[github] 3 open PRs, 1 failing CI, 2 awaiting your review``, reported at low urgency).
+
+For example::
+
+    ⏰ 2 reminders: 9:30am stretch, 3:00pm call mom
+    ▶ 1 running, 2 waiting (approval)
+    ✋ 1 approval pending (A7)
+    ⚠ imessage degraded
+    Updates:
+    [github] 3 open PRs, 1 failing CI, 2 awaiting your review
+    [example] PnL -$1.8k today
 
 The whole message is at most 1,000 characters (the Updates lines are dropped, with
 ``+N more``, to fit), well inside one iMessage chunk. It is sent with
@@ -35,12 +42,11 @@ the scheduled one.
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
@@ -48,18 +54,16 @@ from resonant import killswitch
 from resonant.executor import CallContext
 from resonant.extensions import notify
 from resonant.extensions.pulse_job import deliver, fit_lines, item_line, prune_inflight
-from resonant.gate.codes import clean_external
 from resonant.monitor import health_snapshot
 from resonant.store import pulse as pulse_store
 from resonant.store.approvals import pending_for
-from resonant.store.db import iso, kv_get, utcnow
+from resonant.store.db import kv_get, utcnow
 from resonant.tools.projects import clip, projects
 from resonant.tools.reminders import list_reminders
 from resonant.tools.when import clock_time
 
 if TYPE_CHECKING:
     from resonant.config import BriefingConfig
-    from resonant.extensions.host import ExtensionHost
     from resonant.extensions.scheduler import CoreDeps, CoreJob
     from resonant.gateway.channel import Channel
 
@@ -72,10 +76,6 @@ MAX_CHARS = 1000
 UPDATES_SHOWN = 8
 UPDATES_HEADER = "Updates:"
 NOTHING = "Nothing on today."
-GITHUB = "github"
-DIGEST_TYPE = "ext.github.digest"
-DIGEST_SOURCE = "ext:github"
-DIGEST_MAX = 200
 REMINDERS_SHOWN = 3
 REMINDER_TEXT_MAX = 30
 CODES_SHOWN = 5
@@ -108,7 +108,6 @@ class Briefing:
     queued: int = 0
     approvals: tuple[str, ...] = ()  # one code per pending approval ("" when it has none)
     degraded: tuple[str, ...] = ()  # health check names
-    github: str | None = None  # the sanitized digest line
     updates: tuple[pulse_store.Item, ...] = ()  # open pulse items, most changed first
 
 
@@ -177,7 +176,6 @@ def render_full(b: Briefing) -> tuple[str, list[pulse_store.Item]]:
             _work_line(b),
             _approvals_line(b),
             _health_line(b),
-            b.github,
         )
         if line
     ]
@@ -198,19 +196,12 @@ def sections(b: Briefing) -> list[str]:
         "work": _work_line(b),
         "approvals": _approvals_line(b),
         "health": _health_line(b),
-        "github": b.github,
         "updates": "x" if b.updates else None,
     }
     return [name for name, line in named.items() if line]
 
 
 # --- reads ---------------------------------------------------------------------------------
-
-
-def _day_bounds(day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
-    start = datetime.combine(day, time(0), tzinfo=tz)
-    end = datetime.combine(day + timedelta(days=1), time(0), tzinfo=tz)
-    return start, end
 
 
 def _reminders(
@@ -246,33 +237,6 @@ def _degraded(conn: sqlite3.Connection) -> tuple[str, ...]:
     return tuple(name for name, s in health_snapshot(conn).items() if s["state"] == "degraded")
 
 
-def github_line(conn: sqlite3.Connection, day: date, tz: ZoneInfo) -> str | None:
-    """The text of the latest ``ext.github.digest`` event that occurred on ``day`` (local),
-    sanitized and at most ``DIGEST_MAX`` chars; None if there is none."""
-    start, end = _day_bounds(day, tz)
-    row = conn.execute(
-        """SELECT payload FROM events WHERE type = ? AND source = ?
-               AND occurred_at >= ? AND occurred_at < ?
-           ORDER BY occurred_at DESC, received_at DESC LIMIT 1""",
-        (DIGEST_TYPE, DIGEST_SOURCE, iso(start), iso(end)),
-    ).fetchone()
-    if row is None:
-        return None
-    try:
-        payload: object = json.loads(row["payload"])
-    except ValueError:
-        return None
-    text = cast(dict[str, Any], payload).get("text") if isinstance(payload, dict) else None
-    if not isinstance(text, str):
-        return None
-    line = clean_external(text.replace("✗", "x"))
-    if not line:
-        return None
-    if not line.startswith(f"{GITHUB}:"):
-        line = f"{GITHUB}: {line}"
-    return line if len(line) <= DIGEST_MAX else line[: DIGEST_MAX - 3].rstrip() + "..."
-
-
 def _updates(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item, ...]:
     """Open pulse items for the Updates section: extension items only (the briefing has its
     own approvals and health lines) and not from muted extensions (they are neither listed
@@ -289,9 +253,8 @@ def gather(
     now: datetime,
     day: date,
     tz: ZoneInfo,
-    github: bool,
 ) -> Briefing:
-    """Every section's data for local ``day``. ``github``: the extension is loaded."""
+    """Every section's data for local ``day``."""
     running, waiting, queued = _work(conn)
     return Briefing(
         reminders=_reminders(conn, owner, now, day, tz),
@@ -300,7 +263,6 @@ def gather(
         queued=queued,
         approvals=tuple(a.code or "" for a in pending_for(conn, owner, now)),
         degraded=_degraded(conn),
-        github=github_line(conn, day, tz) if github else None,
         updates=_updates(conn, now),
     )
 
@@ -323,7 +285,6 @@ async def send_briefing(
     tz: str,
     now: datetime,
     due: datetime | None = None,
-    github: bool = False,
     manual: bool = False,
 ) -> dict[str, Any]:
     """Build and send the briefing for the local date of ``due`` (else ``now``), deduped
@@ -336,7 +297,7 @@ async def send_briefing(
     day = local_now.date()
     if _paused(conn):
         return {"sent": False, "date": day.isoformat(), "skipped": "paused"}
-    b = gather(conn, owner=owner, now=now, day=day, tz=zone, github=github)
+    b = gather(conn, owner=owner, now=now, day=day, tz=zone)
     key = manual_dedupe_key(local_now) if manual else dedupe_key(day)
     prune_inflight(conn, now)
     built: dict[str, Any] = {}
@@ -359,10 +320,6 @@ async def send_briefing(
     }
 
 
-def _github_loaded(host: ExtensionHost | None) -> bool:
-    return host is not None and GITHUB in host.loaded
-
-
 async def run_briefing_now(deps: CoreDeps, *, now: datetime | None = None) -> dict[str, Any]:
     """Send the briefing on demand (P3-14's ``/ext run core/briefing``), keyed per minute
     (``manual``). Sent even when ``briefing.enabled`` is false; nothing while paused, and
@@ -375,7 +332,6 @@ async def run_briefing_now(deps: CoreDeps, *, now: datetime | None = None) -> di
         deps.owner,
         tz=deps.settings.timezone,
         now=now or utcnow(),
-        github=_github_loaded(deps.components.extensions),
         manual=True,
     )
 
@@ -403,7 +359,7 @@ def briefing_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> C
         log.info("briefing not scheduled", extra={"channel": channel is not None})
         return None
     tz = deps.settings.timezone
-    conn, host = deps.conn, deps.components.extensions
+    conn = deps.conn
 
     async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         return await send_briefing(
@@ -413,7 +369,6 @@ def briefing_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> C
             tz=tz,
             now=clock(),
             due=_due(args),
-            github=_github_loaded(host),
         )
 
     return CoreJob(
@@ -434,7 +389,6 @@ __all__ = [
     "briefing_job",
     "dedupe_key",
     "gather",
-    "github_line",
     "manual_dedupe_key",
     "render",
     "render_full",

@@ -23,7 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import UTC, datetime
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -35,7 +35,6 @@ MAX_EVENTS = 100  # the process runner keeps at most 100 events per run
 TEXT_MAX = 300  # notify clips at 300 chars
 TITLE_MAX = 80
 CHECKS_MAX = 30
-DIGEST_FAILING_MAX = 3
 
 FAILED = frozenset({"failure", "timed_out", "startup_failure"})
 SUCCEEDED = frozenset({"success"})
@@ -305,8 +304,7 @@ def emit(result: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any]
 
 def cmd_prs(gh: Gh) -> dict[str, Any]:
     mine, review, truncated = search(gh)
-    failing = sum(1 for p in mine if p["ci"] == "failing")
-    summary = f"{len(mine)} open PRs, {failing} failing CI, {len(review)} awaiting your review"
+    summary = summary_line(mine, review)
     return {"summary": summary, "prs": mine, "review_requested": review, "truncated": truncated}
 
 
@@ -415,29 +413,33 @@ def cmd_watch(gh: Gh) -> dict[str, Any]:
     return emit({"summary": summary, "prs": len(mine), "events_found": len(events)}, events)
 
 
-def digest_line(mine: list[dict[str, Any]], review: list[dict[str, Any]]) -> str:
-    """``github: 3 open PRs, resonant#41 ✗ lint, 1 review requested``."""
-    parts = [f"{len(mine)} open PR{'' if len(mine) == 1 else 's'}"]
-    red = [p for p in mine if p["ci"] == "failing"]
-    for p in red[:DIGEST_FAILING_MAX]:
-        parts.append(f"{ref(p)} ✗ {clip(p['failing'][0], 24)}" if p["failing"] else ref(p))
-    if len(red) > DIGEST_FAILING_MAX:
-        parts.append(f"+{len(red) - DIGEST_FAILING_MAX} more failing")
-    if review:
-        parts.append(f"{len(review)} review{'' if len(review) == 1 else 's'} requested")
-    return clip("github: " + ", ".join(parts), 200)
+def summary_line(mine: list[dict[str, Any]], review: list[dict[str, Any]]) -> str:
+    """``3 open PRs, 1 failing CI, 2 awaiting your review``."""
+    failing = sum(1 for p in mine if p["ci"] == "failing")
+    return f"{len(mine)} open PRs, {failing} failing CI, {len(review)} awaiting your review"
+
+
+def report_event(
+    key: str, title: str, state: dict[str, Any], *, urgency: str = "low"
+) -> dict[str, Any]:
+    """A pulse item (what ``resonant_sdk.emit.report`` sends), built inline: this file can't
+    import the SDK. Every call gets a unique dedupe key; Resonant decides whether it's news
+    from the fingerprint of ``state``."""
+    data = {"key": key, "urgency": urgency, "state": state, "clear": False, "ttl": "30h"}
+    return event("item", title, f"item:{key}:{time.time_ns():x}", data)
 
 
 def cmd_digest(gh: Gh) -> dict[str, Any]:
+    """Reports ``github/summary`` (low: the 08:00 briefing's Updates section). The state is
+    the counts, so an unchanged day is not news."""
     mine, review, _ = search(gh)
-    line = digest_line(mine, review)
-    due = os.environ.get("RESONANT_JOB_DUE_AT") or datetime.now(UTC).strftime("%Y-%m-%dT%H:%MZ")
-    data = {
+    line = summary_line(mine, review)
+    state = {
         "open": len(mine),
-        "failing": [f"{p['repo']}#{p['number']}" for p in mine if p["ci"] == "failing"],
+        "failing": sum(1 for p in mine if p["ci"] == "failing"),
         "review_requested": len(review),
     }
-    return emit({"summary": line}, [event("digest", line, f"digest:{clip(due, 64)}", data)])
+    return emit({"summary": line}, [report_event("github/summary", line, state)])
 
 
 def cmd_health(gh: Gh) -> dict[str, Any]:

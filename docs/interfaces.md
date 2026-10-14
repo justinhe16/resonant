@@ -703,11 +703,10 @@ resonant_sdk.emit.emit(type, text, dedupe_key, data=None) -> bool   # stdlib-onl
 
 ```python
 briefing_job(deps: CoreDeps, *, clock=utcnow) -> CoreJob | None   # the CORE_JOBS entry
-await send_briefing(conn, channel, owner, *, tz, now, due=None, github=False, manual=False)
+await send_briefing(conn, channel, owner, *, tz, now, due=None, manual=False)
     -> {sent, date, sections, chars} | {sent: False, date, skipped: "paused"}
-gather(conn, *, owner, now, day, tz: ZoneInfo, github) -> Briefing   # the data
+gather(conn, *, owner, now, day, tz: ZoneInfo) -> Briefing   # the data
 render(b: Briefing) -> str   sections(b) -> list[str]                 # pure
-github_line(conn, day, tz) -> str | None
 await run_briefing_now(deps: CoreDeps, *, now=None) -> dict   # on demand (P3-14)
 dedupe_key(day) -> "briefing:<YYYY-MM-DD>"
 manual_dedupe_key(local_now) -> "briefing:manual:<YYYY-MM-DD>:<HHMM>"
@@ -719,8 +718,7 @@ manual_dedupe_key(local_now) -> "briefing:manual:<YYYY-MM-DD>:<HHMM>"
   - `▶ 1 running, 2 waiting (approval), 1 queued`: counts from the `projects` query (`all`), reminders left out. States and wait reasons only; titles and checkpoints never reach the text.
   - `✋ 2 approvals pending (A7, C3)`: `approvals.pending_for(owner, now)`, up to 5 codes.
   - `⚠ model, imessage degraded`: `health_snapshot` checks in `degraded`.
-  - `github: …`: `payload.text` of the latest `ext.github.digest` event (`source="ext:github"`) whose `occurred_at` falls on the local date, through `clean_external` (`✗` becomes `x`), ≤ 200 chars. Only when `github` is loaded in the host. (P35-4 replaces it with a `github/summary` item.)
-  - `Updates:` then one line per open pulse item (`pulse.open_items`: every urgency; extension items only, not `core` and not muted extensions, which are neither listed nor marked told), changed-since-told first, at most 8 lines (fewer if they don't fit in `MAX_CHARS`) then `+N more`. Lines are `pulse_job.item_line`. The listed items are marked told after the send (also for a manual run; not while paused), through `pulse_job.deliver`. `render_full(b) -> (text, listed_items)`; `Briefing.updates` holds the open items.
+  - `Updates:` then one line per open pulse item (`pulse.open_items`; github's morning summary is one, `[github] 3 open PRs, 1 failing CI, 2 awaiting your review`, reported at low urgency by its `digest` job: every urgency; extension items only, not `core` and not muted extensions, which are neither listed nor marked told), changed-since-told first, at most 8 lines (fewer if they don't fit in `MAX_CHARS`) then `+N more`. Lines are `pulse_job.item_line`. The listed items are marked told after the send (also for a manual run; not while paused), through `pulse_job.deliver`. `render_full(b) -> (text, listed_items)`; `Briefing.updates` holds the open items.
 - **Once a day.** The local date of `due_at` (else now) names the day; the send uses `dedupe_key=briefing:<date>`, so a restart or a catch-up the same day sends nothing more. The result holds section names and length, never the text; `sent: true` means handed to the channel, which drops a same-day repeat by the key.
 - **On demand** (P3-14, `/ext run core/briefing`): `run_briefing_now(CoreDeps(...))`, i.e. `send_briefing(..., manual=True)`. Keyed `briefing:manual:<local date>:<HHMM>`: at most one per minute, and it never uses up the day's scheduled one. Nothing while paused; `{sent: False, skipped: "unreachable"}` with no channel or owner.
 
@@ -765,7 +763,7 @@ muted_until(conn, ext, now=None) -> datetime | None      # None once past
 take_baseline(conn, ext, job_id) -> bool                 # once per job per install (kv ext.<name>.baseline.<job>)
 ```
 
-- **Route**, per `ext:*` event (D10): a malformed or not-loaded source is consumed (`ext.notify_dropped`); a type outside `notify.on` is consumed silently (`digest` stays stored for the briefing); `payload.baseline`, paused (unknown counts as paused) or muted → consumed unsent, `ext.notify_held {reason}`, never queued (no flood on `/resume` or unmute); over `extensions.notify.max_per_hour` distinct events this UTC clock hour → `ext.notify_capped`; otherwise `render(name, payload.text, max_chars)` to each of `recipients(ext)` (the gate's approvers, owner first) with `dedupe_key="<event dedupe key>:<recipient>"`, then `ext.notify_sent` (`idempotency_key` = the event's dedupe key, `hour`). A refused recipient is skipped (`ext.notify_unreachable` when none took it); any other `ChannelError` raises, so the loop retries every tick (dead-letter after 5).
+- **Route**, per `ext:*` event (D10): a malformed or not-loaded source is consumed (`ext.notify_dropped`); a type outside `notify.on` is consumed silently (it stays stored; github's morning summary is an `item` event, routed to the pulse instead); `payload.baseline`, paused (unknown counts as paused) or muted → consumed unsent, `ext.notify_held {reason}`, never queued (no flood on `/resume` or unmute); over `extensions.notify.max_per_hour` distinct events this UTC clock hour → `ext.notify_capped`; otherwise `render(name, payload.text, max_chars)` to each of `recipients(ext)` (the gate's approvers, owner first) with `dedupe_key="<event dedupe key>:<recipient>"`, then `ext.notify_sent` (`idempotency_key` = the event's dedupe key, `hour`). A refused recipient is skipped (`ext.notify_unreachable` when none took it); any other `ChannelError` raises, so the loop retries every tick (dead-letter after 5).
 - **Exactly once.** Persist, then deliver from the store: a crash before the send leaves the event unrouted (delivered on start); a crash after it hits the channel's dedupe record on the retry. The hourly count is the distinct event keys audited `ext.notify_sent`, so a retry never counts twice.
 - **Flush.** Started by the daemon with iMessage on. For each finished hour with capped events (kv `ext.notify.overflow`), one `[<name>] +N more updates` per recipient (dedupe `ext-more:<name>:<hour>:<recipient>`, audit `ext.notify_overflow`), or `ext.notify_held` when paused or muted.
 

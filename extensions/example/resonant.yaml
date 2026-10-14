@@ -13,6 +13,17 @@ jobs:
     schedule: "0 8 * * 1-5"            # cron, evaluated in the daemon timezone unless tz is set
     run: ./cli.py ping
     effect: read                       # jobs default to write (L1, asks); this one only reads
+  # Reporters: they call report() (emit.py) and Resonant decides what is news; see README.
+  - id: pnl                            # a fake PnL: normal urgency, so it rides the hourly pulse
+    schedule: "55 * * * *"
+    run: ./cli.py pnl
+    effect: read
+    level: L0
+  - id: incident                       # urgent when the `incident` tool set "failing"
+    schedule: "*/5 * * * *"
+    run: ./cli.py incident-check
+    effect: read
+    level: L0
 
 tools:
   get_time:
@@ -27,5 +38,14 @@ tools:
     level: L3                          # reversible + tiny blast radius: act, then report
     args: {text: string}
 
+  incident:
+    description: Demo urgent report; set the demo incident to failing or resolved.
+    run: ./cli.py incident --state {state}
+    effect: write                      # writes a file in the data dir; the incident job reports it
+    level: L3
+    args: {state: string}
+
+# The most urgency its reports may use: urgent means they can text you at any hour.
+report: {max_urgency: urgent}
 notify: {on: [ping], channel: imessage}
 health: {check: ./cli.py health, every: 5m}

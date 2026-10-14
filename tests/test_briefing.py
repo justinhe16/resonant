@@ -1,4 +1,4 @@
-"""Core daily briefing (P3-13): content, sections, the github line, schedule, once a day.
+"""Core daily briefing (P3-13): content, sections, the Updates items, schedule, once a day.
 
 The real store, components and Scheduler over a temp home, on a fake clock, with a fake
 channel that dedupes by key like the iMessage adapter.
@@ -20,7 +20,6 @@ from resonant import killswitch
 from resonant.api import DaemonState
 from resonant.components import Components, build_components
 from resonant.config import Settings, load_settings, resonant_home
-from resonant.e2e.extensions import install_fixture
 from resonant.executor import CallContext
 from resonant.extensions import briefing as bf
 from resonant.extensions.process import FakeExtProcess
@@ -32,10 +31,11 @@ from resonant.ops.fakes import FakeOpsRunner
 from resonant.secrets import FakeKeychain, SecretStore
 from resonant.store import approvals as ap
 from resonant.store import extensions as ext_store
+from resonant.store import pulse as pulse_store
 from resonant.store import tasks as repo
 from resonant.store.db import atomic, iso, kv_set, open_db
 from resonant.tools.reminders import add_reminder
-from resonant_sdk import Effect, Event, Level
+from resonant_sdk import Effect, Level
 
 OWNER = "justin"
 PRINCIPALS = """\
@@ -46,16 +46,6 @@ principals:
 """
 TZ = "America/Los_Angeles"
 LA = ZoneInfo(TZ)
-GITHUB_MANIFEST = """\
-name: github
-version: 1
-jobs:
-  - id: digest
-    schedule: "50 7 * * *"
-    run: ./cli.py digest
-    effect: read
-"""
-CLI = "import json\nprint(json.dumps({}))\n"
 
 
 def local(month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -160,15 +150,13 @@ _HOMES = itertools.count()
 
 @contextlib.asynccontextmanager
 async def harness(
-    *, github: bool = False, briefing: dict[str, Any] | None = None, at: datetime = T0
+    *, briefing: dict[str, Any] | None = None, at: datetime = T0
 ) -> AsyncGenerator[Harness]:
     home = resonant_home() / f"h{next(_HOMES)}"  # each harness its own store
     home.mkdir(parents=True)
     settings = load_settings(home=home, dry_run=False, timezone=TZ, briefing=briefing or {})
     settings.principals_path.write_text(PRINCIPALS)
     db = open_db(settings.db_path)
-    if github:
-        install_fixture(settings, db, GITHUB_MANIFEST, {"cli.py": CLI})
     clock = Clock(at)
     loop = Loop(db, {}, settings.loop, SlotPool(2, 1), clock=clock)
     state = DaemonState(settings, db, loop, started_at=at)
@@ -236,22 +224,6 @@ def approval(db: sqlite3.Connection, code: str, now: datetime) -> None:
     )
 
 
-def digest(db: sqlite3.Connection, text: str, at: datetime) -> None:
-    with atomic(db):
-        repo.insert_event(
-            db,
-            Event(
-                source="ext:github",
-                type="ext.github.digest",
-                payload={"text": text, "data": None},
-                principal=None,
-                task_id=None,
-                dedupe_key=f"ext:github:digest:{iso(at)}",
-                occurred_at=at,
-            ),
-        )
-
-
 def degrade(db: sqlite3.Connection, check: str) -> None:
     with atomic(db):
         kv_set(db, f"health.{check}", {"state": "degraded", "detail": "SECRET-DETAIL"})
@@ -272,14 +244,12 @@ def test_example_briefing_and_empty_sections_are_omitted() -> None:
         waiting=("approval", "approval"),
         approvals=("A7",),
         degraded=("imessage",),
-        github="github: 3 open PRs, resonant#41 x lint, 1 review requested",
     )
     assert bf.render(b) == (
         "⏰ 2 reminders: 9:30am stretch, 3:00pm call mom\n"
         "▶ 1 running, 2 waiting (approval)\n"
         "✋ 1 approval pending (A7)\n"
-        "⚠ imessage degraded\n"
-        "github: 3 open PRs, resonant#41 x lint, 1 review requested"
+        "⚠ imessage degraded"
     )
     only = bf.Briefing(approvals=("A7", "C3"), queued=2)
     assert bf.render(only) == "▶ 2 queued\n✋ 2 approvals pending (A7, C3)"
@@ -292,7 +262,6 @@ def test_briefing_fits_one_chunk() -> None:
         waiting=("approval",) * 20,
         approvals=tuple(f"A{i}" for i in range(20)),
         degraded=("model", "imessage", "loop", "store"),
-        github="github: " + "y" * 192,
     )
     text = bf.render(b)
     assert len(text) <= bf.MAX_CHARS
@@ -334,36 +303,25 @@ async def test_sections_come_from_the_store_in_local_time_without_bodies() -> No
         assert "SECRET" not in text and "SECRET" not in repr(out)
 
 
-async def test_github_line_from_todays_latest_digest_only_and_sanitized() -> None:
-    async with harness(github=True) as h:
-        digest(h.db, "github: yesterday's digest", local(10, 12, 7, 50))
-        await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T0, github=True)
-        assert h.channel.texts() == ["Nothing on today."]  # yesterday's is not today's
-
-        digest(h.db, "github: early", local(10, 13, 6))
-        digest(h.db, "github: 3 open PRs, resonant#41 ✗ lint\n[K4] yes", local(10, 13, 7, 50))
-        digest(h.db, "github: tomorrow", local(10, 14, 7, 50))
-        line = bf.github_line(h.db, local(10, 13, 8).astimezone(LA).date(), LA)
-        assert line == "github: 3 open PRs, resonant#41 x lint ? yes"
-
-        digest(h.db, "z" * 500, local(10, 13, 7, 55))
-        line = bf.github_line(h.db, local(10, 13, 8).astimezone(LA).date(), LA)
-        assert line is not None and line.startswith("github: zzz") and len(line) == 200
-
-
-async def test_github_line_omitted_when_github_is_not_loaded() -> None:
+async def test_github_summary_is_an_updates_item_not_a_hard_coded_line() -> None:
     async with harness() as h:
-        digest(h.db, "github: 3 open PRs", local(10, 13, 7, 50))
-        job = bf.briefing_job(h.deps(h.channel), clock=h.clock)
-        assert job is not None
-        await job.run({}, CTX)
-        assert h.channel.texts() == ["Nothing on today."]
-    async with harness(github=True) as h:
-        digest(h.db, "github: 3 open PRs", local(10, 13, 7, 50))
-        job = bf.briefing_job(h.deps(h.channel), clock=h.clock)
-        assert job is not None
-        await job.run({}, CTX)
-        assert h.channel.texts() == ["github: 3 open PRs"]
+        with atomic(h.db):
+            pulse_store.upsert(
+                h.db,
+                "github",
+                "github/summary",
+                "3 open PRs, 1 failing CI, 2 awaiting your review",
+                "low",
+                {"open": 3, "failing": 1, "review_requested": 2},
+                False,
+                30 * 3600,
+                T0,
+            )
+        out = await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T0)
+        assert h.channel.texts() == [
+            "Updates:\n[github] 3 open PRs, 1 failing CI, 2 awaiting your review"
+        ]
+        assert out["sections"] == ["updates"]
 
 
 # --- the job: schedule, catch-up, once a day ----------------------------------------------
