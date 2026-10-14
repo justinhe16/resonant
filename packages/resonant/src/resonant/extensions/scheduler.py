@@ -348,7 +348,11 @@ class Scheduler:
 
     async def _kill_all(self) -> None:
         assert self.tracker is not None
-        n = await self.tracker.kill_all("killed", hold=True)
+        if not self._paused:
+            return  # resumed before this ran; the hold was already set and cleared
+        # The hold was set synchronously in _apply_pause; don't set it again here, or a
+        # /resume handled before this task ran would be undone.
+        n = await self.tracker.kill_all("killed")
         if n:
             with atomic(self.conn):
                 audit(self.conn, "job.kill_all", count=n)
@@ -492,7 +496,15 @@ class Scheduler:
             self._run_inline(job, d), name=f"job:{job.label}"
         )
         self._inflight[job.key] = task
-        task.add_done_callback(lambda _t, key=job.key: self._inflight.pop(key, None))
+        task.add_done_callback(lambda t, key=job.key: self._inline_done(key, t))
+
+    def _inline_done(self, key: tuple[str, str], task: asyncio.Task[None]) -> None:
+        self._inflight.pop(key, None)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            # Recording the run failed (e.g. the store is locked): free the claim so the due
+            # time is decided again on the next tick.
+            self._claimed.pop(key, None)
+            log.error("inline job not recorded: %s", type(exc).__name__, extra={"job": key})
 
     async def _run_inline(self, job: ScheduledJob, d: Decision) -> None:
         assert d.due is not None
@@ -543,7 +555,8 @@ class Scheduler:
         except TimeoutError:
             outcome, error = "failed", "timeout"
         except Exception as e:
-            log.exception("inline job failed", extra={"job": job.label})
+            # Only the type: the message may carry secret values (the audit row is redacted).
+            log.warning("inline job failed: %s", type(e).__name__, extra={"job": job.label})
             outcome, error = "failed", f"{type(e).__name__}: {e}"
         else:
             ms = int((asyncio.get_running_loop().time() - start) * 1000)

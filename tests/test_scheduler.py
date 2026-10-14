@@ -462,6 +462,18 @@ async def test_cli_kill_is_seen_on_the_next_tick(tmp_path: Path) -> None:
         assert not tracker.paused
 
 
+async def test_kill_then_resume_without_a_yield_leaves_runs_allowed(tmp_path: Path) -> None:
+    async with harness(tmp_path, FakeExtProcess()) as h:
+        await h.tick(at_local(7))
+        tracker = h.components.extensions.tracker if h.components.extensions else None
+        assert tracker is not None
+        killswitch.engage(h.db, actor=OWNER)
+        assert tracker.paused  # held at once
+        killswitch.release(h.db, actor=OWNER)  # before the background kill ran
+        await h.sched.drain()
+        assert not tracker.paused
+
+
 async def test_paused_gated_task_is_skipped_by_the_job_runner(tmp_path: Path) -> None:
     fake = FakeExtProcess()
     async with harness(tmp_path, fake) as h:
