@@ -31,6 +31,7 @@ from resonant.extensions.manager import (
     Staged,
     confirm_lines,
     heading,
+    report_grant,
     update_lines,
 )
 from resonant.extensions.pin import TreeError
@@ -489,6 +490,8 @@ def ext_validate(
         )
     for job in manifest.jobs:
         typer.echo(f"  job  {job.id:<24} {job.schedule}{'  critical' if job.critical else ''}")
+    if grant := report_grant(manifest):
+        typer.echo(f"  {grant}")
     if manifest.secrets:
         typer.echo(f"  secrets: {', '.join(manifest.secrets)}")
     for p in problems:

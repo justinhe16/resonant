@@ -125,6 +125,17 @@ def render(name: str, text: str, max_chars: int = 300) -> str:
     return head + body
 
 
+def render_clean(name: str | None, clean: str, max_chars: int = 300) -> str:
+    """Like :func:`render` for text that already went through :func:`clean_text` (it is not
+    cleaned twice, which isn't idempotent). ``name`` None means a core line: no prefix."""
+    head = "" if name is None else prefix(name) + " "
+    body = clean or "update"
+    room = max_chars - len(head)
+    if len(body) > room:
+        body = body[: room - 1].rstrip() + "\u2026"
+    return head + body
+
+
 def more_text(name: str, n: int) -> str:
     return f"{prefix(name)} +{n} more update{'' if n == 1 else 's'}"
 
@@ -187,15 +198,31 @@ def take_baseline(conn: sqlite3.Connection, ext: str, job_id: str) -> bool:
 # --- the notifier --------------------------------------------------------------------------
 
 
-def _paused(conn: sqlite3.Connection) -> bool:
+def paused(conn: sqlite3.Connection) -> bool:
     try:
         return killswitch.is_paused(conn)
     except killswitch.PausedStateUnknownError:
         return True
 
 
-def _hour(at: datetime) -> datetime:
+def clock_hour(at: datetime) -> datetime:
     return at.replace(minute=0, second=0, microsecond=0)
+
+
+def sent_in_hour(
+    conn: sqlite3.Connection, ext: str, hour: datetime, dedupe_key: str | None = None
+) -> int:
+    """Distinct events sent immediately for ``ext`` in the clock hour ``hour``: notifier
+    sends (``ext.notify_sent``) and urgent pulse sends (``pulse.sent``) share one count, the
+    per-hour flood cap. ``dedupe_key`` itself (a retry of an event already sent) doesn't
+    count against it."""
+    row = conn.execute(
+        """SELECT COUNT(DISTINCT idempotency_key) FROM audit_log
+           WHERE action IN ('ext.notify_sent', 'pulse.sent') AND extension = ?
+             AND json_extract(detail, '$.hour') = ? AND idempotency_key IS NOT ?""",
+        (ext, iso(hour), dedupe_key),
+    ).fetchone()
+    return int(row[0])
 
 
 class Notifier:
@@ -243,13 +270,13 @@ class Notifier:
         if event.payload.get("baseline") is True:
             self._audit("ext.notify_held", ext, event, reason="baseline")
             return None
-        if _paused(self.conn):
+        if paused(self.conn):
             self._audit("ext.notify_held", ext, event, reason="paused")
             return None
         if muted_until(self.conn, ext, now) is not None:
             self._audit("ext.notify_held", ext, event, reason="muted")
             return None
-        hour = _hour(now)
+        hour = clock_hour(now)
         if self._sent_since(ext, hour, event.dedupe_key) >= self.config.max_per_hour:
             self._cap(ext, event, hour)
             return None
@@ -274,15 +301,7 @@ class Notifier:
         return sent
 
     def _sent_since(self, ext: str, hour: datetime, dedupe_key: str | None) -> int:
-        """Distinct events notified for ``ext`` in the clock hour ``hour``; ``dedupe_key`` itself (a
-        retry of an event already sent) doesn't count against it."""
-        row = self.conn.execute(
-            """SELECT COUNT(DISTINCT idempotency_key) FROM audit_log
-               WHERE action = 'ext.notify_sent' AND extension = ?
-                 AND json_extract(detail, '$.hour') = ? AND idempotency_key IS NOT ?""",
-            (ext, iso(hour), dedupe_key),
-        ).fetchone()
-        return int(row[0])
+        return sent_in_hour(self.conn, ext, hour, dedupe_key)
 
     def _cap(self, ext: str, event: Event, hour: datetime) -> None:
         with atomic(self.conn):
@@ -299,14 +318,14 @@ class Notifier:
         """Send ``[<name>] +N more updates`` for every finished hour that had capped events;
         returns how many hours were flushed. Held (not sent) while paused or muted."""
         now = self.clock()
-        current = iso(_hour(now))
+        current = iso(clock_hour(now))
         done = 0
         for ext, hours in sorted(_overflow(self.conn).items()):
             for hour in sorted(hours):
                 if hour >= current:
                     continue  # this hour isn't over yet
                 n = self._capped_in(ext, hour)
-                if n and not _paused(self.conn) and muted_until(self.conn, ext, now) is None:
+                if n and not paused(self.conn) and muted_until(self.conn, ext, now) is None:
                     await self._send_all(ext, more_text(ext, n), f"ext-more:{ext}:{hour}:")
                     action = "ext.notify_overflow"
                 else:
@@ -373,11 +392,15 @@ def _overflow(conn: sqlite3.Connection) -> dict[str, list[str]]:
 __all__ = [
     "Notifier",
     "clean_text",
+    "clock_hour",
     "more_text",
     "mute",
     "muted_until",
+    "paused",
     "prefix",
     "render",
+    "render_clean",
+    "sent_in_hour",
     "take_baseline",
     "unmute",
 ]
