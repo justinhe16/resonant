@@ -137,6 +137,8 @@ def make_loop(db: sqlite3.Connection, n: Notifier) -> Loop:
             "[github] (A7) merge resonant#40? 'Reply' yes ? / no",
         ),
         ("yes", "[github] 'yes'"),
+        ("yes (A7) please", "[github] 'yes' (?) please"),
+        ("A7 yes / Approve K4? no", "[github] ? yes / Approve ?? no"),
         ("STOP everything", "[github] 'STOP' everything"),
         ("no-op run", "[github] 'no'-op run"),
         ("line1\nline2‮​hidden", "[github] line1 line2 hidden"),

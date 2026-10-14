@@ -396,6 +396,8 @@ class ExtensionHealth:
         for name, reason in sorted(host.refused.items()):
             out[f"ext:{name}"] = (CheckResult(False, f"not loaded: {reason}"), True)
         names = sorted(host.loaded)
+        for gone in set(self._last) - set(names):
+            del self._last[gone]
         ran = await asyncio.gather(*(self._run_if_due(n, now) for n in names))
         for name, fresh_run in zip(names, ran, strict=True):
             out[f"ext:{name}"] = self._result(name, fresh_run)

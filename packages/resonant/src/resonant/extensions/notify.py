@@ -8,8 +8,9 @@ returns None (consumed) or raises (the loop retries every tick, dead-letters aft
 
 For one event, in order:
 
-1. Not from a loaded extension, or a type outside the manifest's ``notify.on``: consumed,
-   nothing sent (``digest`` is stored for the briefing, never notified).
+1. Not from a loaded extension (removed, disabled, tampered or refused at this start), or
+   a type outside the manifest's ``notify.on``: consumed, nothing sent, never retried
+   (``digest`` is stored for the briefing, never notified).
 2. ``payload.baseline`` (the job's first successful run after install, see
    :func:`take_baseline`): consumed unsent, audit ``ext.notify_held`` ``reason=baseline``.
    State that existed before the install is never announced.
@@ -31,7 +32,7 @@ distinct event keys audited ``ext.notify_sent``, so a retried event never counts
 
 Anti-spoofing (:func:`render`). The text is untrusted: one line of printable ASCII plus a
 few status symbols, ``[ ] { }`` become ``( )`` so ``[A7]`` reads ``(A7)``, a code-like token
-after ``yes``/``no``/``stop`` is masked, every ``reply`` and a leading ``yes``/``no``/
+next to ``yes``/``no``/``stop`` is masked, every ``reply`` and a leading ``yes``/``no``/
 ``stop`` is quoted, and the whole is clipped to ``max_chars``. The code-built prefix comes
 first, so a notification never starts like an approval prompt (``[A7] …? Reply yes / no``).
 
@@ -75,7 +76,10 @@ SYMBOLS = frozenset(
     "\U0001f440\U0001f534\U0001f7e2\U0001f7e1\u23f0\u270b"  # eyes, red/green/yellow, alarm, hand
 )
 _BRACKETS = str.maketrans({"[": "(", "]": ")", "{": "(", "}": ")"})
-_CODE_AFTER_REPLY = re.compile(r"(?i)\b(yes|no|stop)([\s:,-]+)[A-Za-z][\s\-_.:/]*[0-9](?![0-9])")
+_SEP = r"[\s:,;&'\"()?!.-]+"
+_CODE = r"(?<![A-Za-z0-9])[A-Za-z][\s\-_.:/]*[0-9](?![0-9])"
+_CODE_AFTER_REPLY = re.compile(rf"(?i)\b(yes|no|stop)({_SEP}){_CODE}")
+_CODE_BEFORE_REPLY = re.compile(rf"(?i){_CODE}({_SEP})(yes|no|stop)\b")
 _REPLY_WORD = re.compile(r"(?i)\breply\b")
 _LEADING = re.compile(r"(?i)^(yes|no|stop|reply)\b")
 _CODE_LIKE_NAME = re.compile(r"^[a-z]-*[0-9]")
@@ -106,6 +110,7 @@ def clean_text(text: str) -> str:
     kept = "".join(ch if 32 <= ord(ch) < 127 or ch in SYMBOLS else " " for ch in norm)
     flat = " ".join(kept.translate(_BRACKETS).split())
     flat = _CODE_AFTER_REPLY.sub(lambda m: f"{m.group(1)}{m.group(2)}?", flat)
+    flat = _CODE_BEFORE_REPLY.sub(lambda m: f"?{m.group(1)}{m.group(2)}", flat)
     flat = _REPLY_WORD.sub(lambda m: f"'{m.group(0)}'", flat)
     return _LEADING.sub(lambda m: f"'{m.group(1)}'", flat)
 
