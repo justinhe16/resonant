@@ -471,6 +471,10 @@ def test_back_up_text() -> None:
     marker = {"by": OWNER, "at": "2026-10-13T15:00:00.000+00:00", "commit": "abc1234"}
     assert back_up_text(marker, T0 + timedelta(seconds=75)) == "Back up (abc1234), down 1m"
     assert back_up_text({"at": "garbage"}, T0) == "Back up"
+    noted = {**marker, "note": "Installed example"}
+    assert back_up_text(noted, T0 + timedelta(seconds=75)) == (
+        "Back up (abc1234), down 1m\nInstalled example"
+    )
 
 
 # --- disk and logs -----------------------------------------------------------------------

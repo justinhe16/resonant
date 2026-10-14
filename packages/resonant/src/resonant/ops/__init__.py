@@ -142,10 +142,20 @@ def restart_later_argv(label: str, delay_s: int = RESTART_DELAY_S) -> list[str]:
 
 
 def mark_restart(
-    conn: sqlite3.Connection, *, by: str, commit: str | None, now: datetime
+    conn: sqlite3.Connection,
+    *,
+    by: str,
+    commit: str | None,
+    now: datetime,
+    note: str | None = None,
 ) -> dict[str, Any]:
-    """Write the restart marker that makes the next start say "back up"."""
+    """Write the restart marker that makes the next start say "back up".
+
+    ``note`` (code-built, e.g. ``Installed example``) is sent on its own line after it.
+    """
     marker: dict[str, Any] = {"by": by, "at": iso(now), "commit": commit}
+    if note:
+        marker["note"] = note
     with atomic(conn):
         kv_set(conn, RESTART_PENDING_KEY, marker)
     return marker
@@ -175,6 +185,9 @@ def back_up_text(marker: Mapping[str, Any], now: datetime) -> str:
             down = None
         if down is not None:
             text += f", down {duration(down)}"
+    note = marker.get("note")
+    if isinstance(note, str) and note:
+        text += f"\n{note}"
     return text
 
 

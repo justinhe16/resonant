@@ -10,6 +10,7 @@ import contextlib
 import json
 import os
 import sqlite3
+from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -21,8 +22,28 @@ from pydantic import ValidationError
 from resonant import daemon as daemon_mod
 from resonant import killswitch, launchd
 from resonant.config import Settings, load_settings
-from resonant.extensions.checks import approver_errors
+from resonant.extensions.checks import approver_errors, dir_errors, name_errors
+from resonant.extensions.manager import (
+    AdoptRequired,
+    ExtensionManager,
+    ManagerError,
+    Pin,
+    Staged,
+    confirm_lines,
+    heading,
+    update_lines,
+)
+from resonant.extensions.pin import TreeError
 from resonant.gate import ApprovalResolution, PolicyGate
+from resonant.launchd import DAEMON_LABEL
+from resonant.ops import (
+    OpsRunner,
+    SubprocessRunner,
+    clear_restart,
+    kickstart_argv,
+    mark_restart,
+    restart_later_argv,
+)
 from resonant.principals import Principals, load_principals
 from resonant.secrets import (
     InvalidSecretRef,
@@ -37,6 +58,7 @@ from resonant.secrets import (
 )
 from resonant.status import collect_status
 from resonant.store import approvals as ap
+from resonant.store import extensions as ext_store
 from resonant.store.audit import audit
 from resonant.store.db import (
     StoreUnavailableError,
@@ -442,7 +464,8 @@ def approvals_deny(key: ApprovalKey) -> None:
 def ext_validate(
     path: Annotated[Path, typer.Argument(help="Extension dir or resonant.yaml")],
 ) -> None:
-    """Validate a manifest: schema, invariants, and approver grants (if principals exist)."""
+    """Validate a manifest: schema, invariants, names, the directory (stdlib only, argv[0]
+    allowlist, symlinks) and approver grants (if principals exist)."""
     manifest_path = path / "resonant.yaml" if path.is_dir() else path
     try:
         manifest = load_manifest(manifest_path)
@@ -453,9 +476,9 @@ def ext_validate(
         typer.echo(f"invalid manifest {manifest_path}:\n{e}", err=True)
         raise typer.Exit(1) from None
     settings = load_settings()
-    problems: list[str] = []
+    problems = name_errors(manifest) + dir_errors(manifest_path.parent, manifest)
     if settings.principals_path.exists():
-        problems = approver_errors(manifest, load_principals(settings.principals_path))
+        problems += approver_errors(manifest, load_principals(settings.principals_path))
     else:
         typer.echo(f"note: {settings.principals_path} missing; approver grants not checked")
     typer.echo(f"{manifest.name} v{manifest.version}")
@@ -473,6 +496,214 @@ def ext_validate(
     if problems:
         raise typer.Exit(1)
     typer.echo("ok")
+
+
+def _daemon_up(settings: Settings) -> bool:
+    return _fetch_status(settings) is not None
+
+
+def _restart_runner() -> OpsRunner:
+    """Spawns the detached restart helper. Tests swap in a ``FakeOpsRunner``."""
+    return SubprocessRunner()
+
+
+def _restart_daemon(settings: Settings, conn: sqlite3.Connection, owner: str, note: str) -> None:
+    """Restart through the reply-first path (restart marker + detached helper), if the
+    daemon is up. Extensions are materialized once at start; there is no hot reload."""
+    if not _daemon_up(settings):
+        typer.echo("The daemon isn't running; it loads the change when it starts.")
+        return
+    mark_restart(conn, by=owner, commit=None, now=utcnow(), note=note)
+    try:
+        _restart_runner().spawn_detached(restart_later_argv(DAEMON_LABEL))
+    except OSError as e:
+        clear_restart(conn)
+        typer.echo(f"warning: couldn't start the restart helper ({type(e).__name__})", err=True)
+        typer.echo(f"Restart it yourself: {' '.join(kickstart_argv(DAEMON_LABEL))}", err=True)
+        return
+    typer.echo("Restarting the daemon; it texts you when it's back.")
+
+
+def _ext_manager(settings: Settings, conn: sqlite3.Connection) -> ExtensionManager:
+    import asyncio
+
+    store = _secret_store()
+    principals = _principals(settings)
+
+    def secret_exists(ref: str) -> bool:
+        return asyncio.run(store.exists(ref))
+
+    return ExtensionManager(
+        conn,
+        extensions_dir=settings.extensions_dir,
+        data_dir=settings.ext_data_dir,
+        repo_path=settings.ops.repo_path,
+        principals=principals,
+        secret_exists=secret_exists,
+        ext_path=settings.extensions.process.path_env,
+        actor=principals.owner,
+    )
+
+
+@contextlib.contextmanager
+def _ext_errors() -> Generator[None]:
+    """Manager and source refusals as ``error:`` lines: exit 1, or 75 for the Keychain."""
+    try:
+        yield
+    except SecretError as e:
+        typer.echo(f"error: the Keychain is unavailable ({e.reason}); nothing changed", err=True)
+        raise typer.Exit(EX_TEMPFAIL) from None
+    except TreeError as e:  # SourceError included
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1) from None
+    except ManagerError as e:
+        typer.echo(f"error: {e}", err=True)
+        for p in e.problems:
+            typer.echo(f"  {p}", err=True)
+        if isinstance(e, AdoptRequired):
+            typer.echo("Re-run with --adopt to take them over.", err=True)
+        raise typer.Exit(1) from None
+
+
+def _typed_confirm(name: str, verb: str) -> None:
+    typed = typer.prompt(f"Type {name} to {verb}", default="", show_default=False)
+    if typed.strip() != name:
+        typer.echo("Not confirmed; nothing changed.", err=True)
+        raise typer.Exit(1)
+
+
+def _router_check(staged: Staged) -> None:
+    """Advisory only. Seam for P3-11: once ``extension:<name>`` intents exist, run the
+    router eval on the example set with this intent included and print builtin accuracy
+    before and after (a drop is a warning, never a refusal)."""
+    if not staged.manifest.description:
+        typer.echo(
+            f"Router: no description, so chat won't route to {staged.name}; /{staged.name} works."
+        )
+    typer.echo(f"Router: new intent extension:{staged.name} (advisory eval arrives with P3-11)")
+
+
+@ext_app.command("add")
+def ext_add(
+    source: Annotated[str, typer.Argument(help="repo:<name> or path:/abs/dir (a git work tree)")],
+    adopt: Annotated[
+        bool, typer.Option("--adopt", help="Take over data and secrets from another source.")
+    ] = False,
+) -> None:
+    """Install an extension after you review it and type its name. Terminal only."""
+    settings = load_settings()
+    with contextlib.closing(_open_store(settings, readonly=False)) as conn, _ext_errors():
+        mgr = _ext_manager(settings, conn)
+        staged = mgr.stage(source)
+        try:
+            if ext_store.get_extension(conn, staged.name) is not None:
+                typer.echo(
+                    f"error: {staged.name} is installed; use: resonant ext update {staged.name}",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            if (reasons := mgr.leftovers(staged)) and not adopt:
+                raise AdoptRequired(f"{staged.name}: leftovers from another source", reasons)
+            for line in confirm_lines(staged):
+                typer.echo(line)
+            _router_check(staged)
+            _typed_confirm(staged.name, "install")
+        finally:
+            mgr.discard(staged)
+        mgr.install(staged.pin, name=staged.name, adopt=adopt)
+        typer.echo(f"Installed {heading(staged)}")
+        _restart_daemon(settings, conn, mgr.actor, f"Installed {staged.name}")
+
+
+@ext_app.command("update")
+def ext_update(name: Annotated[str, typer.Argument(help="An installed extension")]) -> None:
+    """Re-stage an extension from its source, show what changed, and re-approve it."""
+    settings = load_settings()
+    with contextlib.closing(_open_store(settings, readonly=False)) as conn, _ext_errors():
+        mgr = _ext_manager(settings, conn)
+        record = ext_store.get_extension(conn, name)
+        if record is None:
+            raise ManagerError(f"{name} is not installed")
+        staged = mgr.stage(record.source, expect_name=name)
+        try:
+            copy = mgr.verify(record)
+            current = Pin(record.source, record.commit, record.tree_digest, record.manifest_sha)
+            if staged.pin == current and copy == "ok" and record.status != "disabled_tampered":
+                typer.echo(f"{name} is up to date ({heading(staged)})")
+                return
+            for line in update_lines(record, mgr.installed_files(name), staged):
+                typer.echo(line)
+            if copy != "ok":
+                typer.echo(f"note: the installed copy is {copy} since you approved it")
+            typer.echo("")
+            for line in confirm_lines(staged):
+                typer.echo(line)
+            _router_check(staged)
+            _typed_confirm(name, "update")
+        finally:
+            mgr.discard(staged)
+        mgr.install(staged.pin, name=name)
+        typer.echo(f"Updated {heading(staged)}")
+        _restart_daemon(settings, conn, mgr.actor, f"Updated {name}")
+
+
+@ext_app.command("remove")
+def ext_remove(
+    name: Annotated[str, typer.Argument(help="An installed extension")],
+    purge: Annotated[bool, typer.Option("--purge", help="Also delete its data dir.")] = False,
+) -> None:
+    """Remove an extension: its row, jobs and copy. Keeps its data and Keychain items."""
+    settings = load_settings()
+    with contextlib.closing(_open_store(settings, readonly=False)) as conn, _ext_errors():
+        mgr = _ext_manager(settings, conn)
+        if ext_store.get_extension(conn, name) is None:
+            raise ManagerError(f"{name} is not installed")
+        _typed_confirm(name, "remove" + (" it and delete its data" if purge else ""))
+        removed = mgr.remove(name, purge=purge)
+        typer.echo(f"Removed {name}")
+        if removed.data_dir is not None:
+            typer.echo(f"Kept its data: {removed.data_dir} (remove --purge deletes it)")
+        if removed.secrets_left:
+            typer.echo("Keychain items left (delete with resonant secret rm):")
+            for ref in removed.secrets_left:
+                typer.echo(f"  resonant secret rm {ref}")
+        _restart_daemon(settings, conn, mgr.actor, f"Removed {name}")
+
+
+@ext_app.command("list")
+def ext_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Installed extensions: status, pins, and whether the copy still matches its pin."""
+    settings = load_settings()
+    with contextlib.closing(_open_store(settings, readonly=True)) as conn:
+        mgr = _ext_manager(settings, conn)
+        rows = [(r, mgr.verify(r)) for r in ext_store.list_extensions(conn)]
+    out = [
+        {
+            "name": r.name,
+            "status": r.status,
+            "source": r.source,
+            "commit": r.commit,
+            "tree_digest": r.tree_digest,
+            "copy": copy,
+            "tools": len(r.manifest.get("tools") or {}),
+            "jobs": len(r.manifest.get("jobs") or []),
+            "installed_at": iso(r.installed_at),
+        }
+        for r, copy in rows
+    ]
+    if as_json:
+        typer.echo(json.dumps(out, indent=2))
+        return
+    if not out:
+        typer.echo("no extensions installed")
+        return
+    for r, copy in rows:
+        sha = (r.commit or "no-commit")[:8]
+        typer.echo(
+            f"{r.name:<16} {r.status:<18} {r.source}@{sha} digest {r.tree_digest[:8]}"
+            f"  copy {copy}  tools {len(r.manifest.get('tools') or {})}"
+            f" jobs {len(r.manifest.get('jobs') or [])}  {iso(r.installed_at)}"
+        )
 
 
 # --- secrets ---------------------------------------------------------------------------
