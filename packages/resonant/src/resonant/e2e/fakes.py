@@ -2,8 +2,10 @@
 
 ``ScriptedModel`` behaves like a well-behaved local model, deterministically:
 
-- Label calls (``schema == LABEL_SCHEMA``): the intent comes from keyword rules over the
-  user's message (``LABEL_RULES``, first match wins, default ``question``), confidence 0.9.
+- Label calls (a schema with an ``intent`` property: ``LABEL_SCHEMA`` or the schema for a
+  set with extension intents): the intent comes from keyword rules over the user's message
+  (``LABEL_RULES``, first match wins, default ``question``), confidence 0.9. A rule's intent
+  outside the schema's enum (an extension that isn't loaded) is skipped.
 - ``chat_tools``: the first call asks for one tool, later calls ask for nothing. The tool is
   the first ``TOOL_RULES`` match over the current message whose tool is in the toolset, else
   ``task_counts`` if it is in the toolset, else the first tool. Args are none, except
@@ -27,7 +29,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from resonant.gateway.imessage.sender import OSASCRIPT, OsaResult
 from resonant.models import ChatMessage, ModelReply, ProbeResult, SpanFactory, ToolCall
@@ -36,6 +38,8 @@ from resonant.runners.local import REPLY_SCHEMA
 from resonant_sdk import ToolSpec
 
 LABEL_RULES: tuple[tuple[str, str], ...] = (
+    ("my prs", "extension:github"),  # only when github is loaded (in the schema's enum)
+    ("time is it in", "extension:example"),
     ("remind me in", "reminders"),
     ("restart", "ops"),
     ("what can you do", "system"),
@@ -52,6 +56,7 @@ LABEL_RULES: tuple[tuple[str, str], ...] = (
 )
 # (keyword in the current message, tool). First match whose tool is in the toolset wins.
 TOOL_RULES: tuple[tuple[str, str], ...] = (
+    ("my prs", "prs"),
     ("remind me in", "add_reminder"),
     ("restart resonant", "restart_resonant"),
     ("restart ollama", "restart_ollama"),
@@ -92,9 +97,9 @@ class ScriptedModel:
         spans: SpanFactory | None = None,
     ) -> ModelReply:
         await self._wait()
-        if schema == LABEL_SCHEMA:
+        if _is_label_schema(schema):
             self.calls["label"] += 1
-            intent = self.label_for(messages[-1]["content"])
+            intent = self.label_for(messages[-1]["content"], _enum(schema))
             data: dict[str, Any] = {"intent": intent, "confidence": 0.9}
         elif schema == REPLY_SCHEMA:
             self.calls["answer"] += 1
@@ -134,12 +139,22 @@ class ScriptedModel:
         self.calls["probe"] += 1
         return ProbeResult(True, True, True, True, 1, "scripted model")
 
-    def label_for(self, wrapped: str) -> str:
+    def label_for(self, wrapped: str, allowed: Sequence[str] | None = None) -> str:
         text = wrapped.lower()
         for keyword, intent in self.rules:
-            if keyword in text:
+            if keyword in text and (allowed is None or intent in allowed):
                 return intent
         return "question"
+
+
+def _enum(schema: dict[str, Any]) -> list[str]:
+    props = cast(dict[str, Any], schema.get("properties") or {})
+    intent = cast(dict[str, Any], props.get("intent") or {})
+    return [str(v) for v in cast(list[Any], intent.get("enum") or [])]
+
+
+def _is_label_schema(schema: dict[str, Any]) -> bool:
+    return schema == LABEL_SCHEMA or bool(_enum(schema))
 
 
 def reminder_args(turn: str) -> dict[str, Any]:

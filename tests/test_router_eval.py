@@ -11,7 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from resonant.cli import app
-from resonant.config import Settings
+from resonant.config import Settings, load_settings
 from resonant.evals import router_eval
 from resonant.evals.router_eval import (
     CaseResult,
@@ -30,7 +30,9 @@ from resonant.models import (
 )
 from resonant.router import Labeler, match_fast_path
 from resonant.router import router as router_mod
-from resonant.router.intents import IntentLabel
+from resonant.router.intents import BUILTIN_INTENTS, IntentLabel, IntentSet
+from resonant_sdk import Manifest
+from resonant_sdk.manifest import parse_yaml
 
 EXAMPLE_SET = Path(__file__).resolve().parents[1] / "evals" / "router.example.jsonl"
 _MESSAGE = re.compile(r"\A<message>(.*)</message>\Z", re.DOTALL)
@@ -383,3 +385,93 @@ def test_saved_results_do_not_collide(resonant_home: Path) -> None:
     b = router_eval.save_summary({"n": 2}, d, now=now)
     assert a.name == "20261008T120000Z.json"
     assert b.name == "20261008T120000Z-1.json"
+
+
+# --- extension intents (P3-11) -------------------------------------------------------------
+
+DEMO = """\
+name: demo
+version: 1
+description: Demo things; tells the time in a timezone.
+examples:
+  - what time is it in tokyo
+  - time in paris please
+tools:
+  get_time:
+    run: ./cli.py time
+    effect: read
+"""
+
+
+def _demo() -> Manifest:
+    return Manifest.model_validate(parse_yaml(DEMO))
+
+
+def test_load_set_takes_extension_intents_only_when_installed(tmp_path: Path) -> None:
+    path = tmp_path / "set.jsonl"
+    path.write_text('{"text": "time in tokyo", "intent": "extension:demo"}\n')
+    with pytest.raises(EvalSetError, match="must be one of"):
+        load_set(path)
+    (case,) = load_set(path, IntentSet.from_manifests([_demo()]))
+    assert case.intent == "extension:demo"
+
+
+def test_summarize_reports_extension_intents() -> None:
+    results = [
+        CaseResult(1, "extension:demo", "extension:demo", "llm", 5.0, False),
+        CaseResult(2, "notes", "extension:demo", "llm", 5.0, False),
+    ]
+    s = summarize(results)
+    assert s["per_intent"]["extension:demo"]["precision"] == 0.5
+    assert list(s["confusion"]) == ["notes", "extension:demo"]
+
+
+def test_installed_intents_come_from_enabled_rows(db: Any, resonant_home: Path) -> None:
+    from resonant.e2e.extensions import install_fixture
+
+    settings = load_settings()
+    install_fixture(settings, db, DEMO, {"cli.py": "print('{}')\n"})
+    assert [e.label for e in router_eval.installed_intents(db).extensions] == ["extension:demo"]
+    assert router_eval.installed_intents(db, exclude="demo") == BUILTIN_INTENTS
+
+
+def test_advisory_prints_builtin_accuracy_before_and_after(use_model: Any) -> None:
+    labels = _example_labels()
+    # After the new intent exists, the model sends one builtin text to it.
+    stolen = next(t for t, i in labels.items() if i == "notes" and not match_fast_path(t))
+
+    class Stealing(FakeModel):
+        async def chat_json(self, messages: list[ChatMessage], **kw: Any) -> ModelReply:
+            reply = await super().chat_json(messages, **kw)
+            enum = kw["schema"]["properties"]["intent"]["enum"]
+            if "extension:demo" in enum and self.texts[-1] == stolen:
+                data = {"intent": "extension:demo", "confidence": 0.9}
+                return ModelReply(json.dumps(data), [], data, 3, 10, 3)
+            return reply
+
+    demo_texts = {t: "extension:demo" for t in _demo().examples}
+    use_model(Stealing({**labels, **demo_texts}))
+    lines = router_eval.advisory(
+        load_settings(), _demo(), before=BUILTIN_INTENTS, set_path=EXAMPLE_SET
+    )
+    builtin = len(load_set(EXAMPLE_SET))
+    assert lines[0] == (
+        f"Router: builtin accuracy 100.0% before, {(builtin - 1) / builtin * 100:.1f}% after "
+        f"({builtin} examples, advisory)"
+    )
+    assert lines[1].startswith("warning: extension:demo takes messages from builtin intents")
+    assert lines[2] == "Router: 2/2 of its examples route to extension:demo"
+
+
+def test_advisory_never_blocks(use_model: Any, tmp_path: Path) -> None:
+    settings = load_settings()
+    use_model(FakeModel(error=ModelUnavailableError("down")))
+    assert router_eval.advisory(
+        settings, _demo(), before=BUILTIN_INTENTS, set_path=EXAMPLE_SET
+    ) == ["Router: advisory eval skipped (model unavailable; try resonant model probe)"]
+    missing = tmp_path / "nope.jsonl"
+    assert router_eval.advisory(settings, _demo(), before=BUILTIN_INTENTS, set_path=missing) == [
+        "Router: advisory eval skipped (no example set)"
+    ]
+    no_description = Manifest.model_validate(parse_yaml(DEMO.replace("description:", "#")))
+    assert router_eval.advisory(settings, no_description, before=BUILTIN_INTENTS) == []

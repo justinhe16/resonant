@@ -1,6 +1,8 @@
 """LLM intent labeler: one small ``chat_json`` call per message.
 
-The prompt is the stable prefix from ``prefixes.py`` with the untrusted text last. Thinking
+The prompt is the stable prefix from ``prefixes.py`` with the untrusted text last. It is
+built once, from the ``IntentSet`` passed at construction (builtins only by default), and
+the reply's intent is validated against that same set. Thinking
 is off (the model client guarantees it), ``max_tokens`` is tiny and temperature is 0.
 
 Failure handling (never raises for model problems):
@@ -22,12 +24,12 @@ from typing import Any
 
 from resonant.models import ModelClient, ModelOutputError, ModelUnavailableError, SpanFactory
 from resonant.models.client import null_spans
-from resonant.router.intents import UNKNOWN, IntentLabel, parse_intent
-from resonant.router.prefixes import LABEL_PREFIX_HASH, LABEL_SCHEMA, label_messages
+from resonant.router.intents import BUILTIN_INTENTS, UNKNOWN, IntentLabel, IntentSet
+from resonant.router.prefixes import LABEL_PREFIX_HASH, LabelPrompt
 
 log = logging.getLogger(__name__)
 
-LABEL_MAX_TOKENS = 20
+LABEL_MAX_TOKENS = 32  # room for `extension:<name>` labels
 LABEL_TEMPERATURE = 0.0
 
 
@@ -47,20 +49,23 @@ def _confidence(value: Any) -> float:
 
 
 class Labeler:
-    def __init__(self, model: ModelClient) -> None:
+    def __init__(self, model: ModelClient, intents: IntentSet = BUILTIN_INTENTS) -> None:
         self.model = model
+        self.intents = intents
+        self.prompt = LabelPrompt(intents)
 
     async def label(self, text: str, *, spans: SpanFactory | None = None) -> Label:
         spans = spans or null_spans
         start = time.monotonic()
-        with spans("router.label", prefix_hash=LABEL_PREFIX_HASH) as s:
+        prefix_hash = self.prompt.prefix_hash
+        with spans("router.label", prefix_hash=prefix_hash) as s:
             intent: IntentLabel = UNKNOWN
             confidence = 0.0
             fallback = False
             try:
                 reply = await self.model.chat_json(
-                    label_messages(text),
-                    schema=LABEL_SCHEMA,
+                    self.prompt.messages(text),
+                    schema=self.prompt.schema,
                     max_tokens=LABEL_MAX_TOKENS,
                     temperature=LABEL_TEMPERATURE,
                     spans=spans,
@@ -72,9 +77,9 @@ class Labeler:
                 log.warning("labeler: model returned invalid output")
             else:
                 data = reply.json or {}
-                parsed = parse_intent(data.get("intent"))
+                parsed = self.intents.parse(data.get("intent"))
                 if parsed is not None:
                     intent, confidence = parsed, _confidence(data.get("confidence"))
             latency_ms = int((time.monotonic() - start) * 1000)
             s.set(intent=intent, confidence=confidence, fallback=fallback, latency_ms=latency_ms)
-        return Label(intent, confidence, fallback, latency_ms)
+        return Label(intent, confidence, fallback, latency_ms, prefix_hash)

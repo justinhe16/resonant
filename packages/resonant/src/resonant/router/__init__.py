@@ -1,7 +1,7 @@
 """Router: deterministic fast path, then one LLM intent label. See ``resonant.router.router``."""
 
 from resonant.router.fast_path import FastPathResult, match_fast_path
-from resonant.router.intents import INTENT_TOOLS, INTENTS, IntentLabel
+from resonant.router.intents import INTENT_TOOLS, INTENTS, IntentLabel, IntentSet, intent_set
 from resonant.router.labeler import Label, Labeler
 from resonant.router.router import Classification, Router, classify, toolset_for
 
@@ -11,10 +11,12 @@ __all__ = [
     "Classification",
     "FastPathResult",
     "IntentLabel",
+    "IntentSet",
     "Label",
     "Labeler",
     "Router",
     "classify",
+    "intent_set",
     "match_fast_path",
     "toolset_for",
 ]
