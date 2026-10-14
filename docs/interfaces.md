@@ -194,7 +194,7 @@ STORE_INTERNAL_TOOLS, is_store_internal(spec)             # resonant.tools
 - **dry_run exemption** is keyed on registry identity: `is_store_internal(spec)` is true only for a builtin (`extension=None`, `source="builtin"`, no secrets) named in `STORE_INTERNAL_TOOLS = {add_note, delete_note, clear_notes, add_reminder, cancel_reminder}`. A test pins the set. An extension tool with the same name is not exempt, and ops tools never are. Exempt tools still go through step 5.
 - **Approvals** per (task, intent hash). "Ask" reuses the pending approval if there is one; otherwise it inserts one with `approvers=(owner,)` (global scope is owner-only), `expires_at = now + gate.approval_ttl_s`, a fresh code, and a code-built summary (`summarize(intent, action=actions[(extension, tool)](intent))` when an action is registered). An intent whose `task_id` has no task row (the router's fast path) gets `Deny(NO_TASK)`.
   - Approved and unused: `Allow(token, approval_id)`.
-  - Rejected: `Deny(NOT_APPROVED)`, even if the table would now Allow (the owner's "no" holds for that intent).
+  - Any rejected approval for the intent: `Deny(NOT_APPROVED)`, even if the table would now Allow (the owner's "no" holds for that intent).
   - Expired: `Deny(APPROVAL_EXPIRED)`. Used: `Deny(APPROVAL_USED)`; a used approval never yields another Allow.
 - **Lazy expiry:** `evaluate`, `pending_for` and `resolve` first run `expire_due(now)`. The waiting task's `wake_at = expires_at` is the backstop that wakes it.
 - `resolve(resolution)` (CLI, button): the actor must be in `approvers` and hold `approve`; then `store.approvals.resolve` and `wake_resolved` in one transaction, audited `approval.resolve`. Refusal reasons: `not_found`, `not an approver`, or the store's reason.
@@ -279,6 +279,7 @@ NewApproval(task_id, intent_hash, tool, effect, level, summary, approvers, code,
 insert_approval(conn, spec, now) -> str              # IntegrityError if one is pending for (task, intent) or the code is taken
 get_approval(conn, id) / pending_for_intent(conn, task_id, intent_hash, now) / pending_by_code(conn, code, now) -> Approval | None
 latest_for_intent(conn, task_id, intent_hash) -> Approval | None   # newest, any status
+was_rejected(conn, task_id, intent_hash) -> bool
 pending_for(conn, principal, now) -> list[Approval]  # unexpired, principal in approvers
 pending_codes(conn) -> set[str]                      # for new_code
 add_channel_ref(conn, id, *, ref, at, principal) -> bool   # keeps the first send per (ref, principal)
@@ -313,7 +314,7 @@ class ToolFailed(Exception)   # raise from a handler: "definitely did not take e
 
 - **Token check.** The decision must be `Allow`, and `verifier.consume(token, intent.hash)` must be true. Otherwise it raises `NotAllowedError` and audits `executor.refused`. A forged Allow, a reused token, or a token issued for different args is refused.
 - **Approvals are single use.** An `Allow` with an `approval_id` spends it: `mark_used` runs in the same transaction as the `started` row. An approval that is already used, or whose task or intent hash differs, raises `NotAllowedError` (audited `executor.refused`) and nothing runs. A replayed or ambiguous key doesn't spend it.
-- **`recorded(key)`** is for a runner resuming at a pinned key, before it calls the gate: `succeeded` returns the result (`replayed=True`), `started` returns `ambiguous=True`, `failed` returns the definite error, and no row returns None.
+- **`recorded(key)`** is for a runner resuming at a pinned key, before it calls the gate: `succeeded` returns the result (`replayed=True`), `started` returns `ambiguous=True`, `failed` returns the definite error, and no row returns None. The approval is spent with `started`, so after a definite failure of an approved call, re-evaluating gives `Deny(APPROVAL_USED)`: a retry needs a new task.
 - **What happens to a key**, by its row in `executions`:
   - `succeeded`: the recorded result is returned (`replayed=True`).
   - `started`: the outcome is unknown, so it is **ambiguous** and is never re-run. It stays that way until `resolve_ambiguous` is called.

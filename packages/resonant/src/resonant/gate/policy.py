@@ -95,7 +95,7 @@ def autonomy_on(conn: sqlite3.Connection) -> bool:
     """The kill switch. Fails closed: a missing or unreadable value is off."""
     try:
         return kv_get(conn, "autonomy") == "on"
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError, ValueError):
         return False
 
 
@@ -166,9 +166,9 @@ class PolicyGate:
         verdict = rule(intent.level, intent.origin, autonomy)
         if verdict == "allow" and intent.level is Level.L0:
             return self._allow(intent)
-        last = ap.latest_for_intent(self.conn, intent.task_id, intent.hash)
-        if last is not None and last.status == "rejected":
+        if ap.was_rejected(self.conn, intent.task_id, intent.hash):
             return Deny(NOT_APPROVED)  # the owner's "no" holds for this intent
+        last = ap.latest_for_intent(self.conn, intent.task_id, intent.hash)
         if verdict == "allow":
             return self._allow(intent)
         return self._ask(intent, now, last, require_code=verdict == "ask_code")
@@ -267,7 +267,8 @@ class PolicyGate:
                 self.conn,
                 "approval.resolve",
                 task_id=approval.task_id if approval else None,
-                approved_by=resolution.actor,
+                requested_by=resolution.actor,
+                approved_by=resolution.actor if result.ok else None,
                 tool=approval.tool if approval else None,
                 extension=approval.extension if approval else None,
                 intent_hash=approval.intent_hash if approval else None,

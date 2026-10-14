@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -243,15 +244,14 @@ def test_decision_matrix(
 def test_veto_never_returned_and_every_evaluate_audited_once(
     db: sqlite3.Connection, gate: PolicyGate, task_id: str
 ) -> None:
-    calls = 0
+    origins: list[str] = []
     for spec in SPECS:
         for origin in ("explicit", "inferred"):
             d = gate.evaluate(intent(spec, task_id, origin=origin))
-            calls += 1
+            origins.append(origin)
             assert not isinstance(d, Veto)
     rows = audits(db, "gate.evaluate")
-    assert len(rows) == calls
-    assert {r["detail"].count('"origin"') for r in rows} == {1}
+    assert [json.loads(r["detail"])["origin"] for r in rows] == origins
 
 
 # --- dry_run exemption -----------------------------------------------------------------
@@ -431,6 +431,12 @@ def test_rejection_holds(db: sqlite3.Connection, gate: PolicyGate, task_id: str)
     asked = gate.evaluate(i)
     assert isinstance(asked, NeedsApproval)
     approve(gate, asked.approval_id, approved=False)
+    assert gate.evaluate(i) == Deny(NOT_APPROVED)
+    # Even with a newer row for the intent, the rejection still holds.
+    newer = ap.NewApproval(
+        task_id, i.hash, "label", Effect.WRITE, Level.L3, "label", ("justin",), "C3", NOW
+    )
+    ap.insert_approval(db, newer, NOW + timedelta(seconds=1))
     assert gate.evaluate(i) == Deny(NOT_APPROVED)
     kv_set(db, "autonomy", "on")  # L3 would now run, but the owner said no
     assert gate.evaluate(i) == Deny(NOT_APPROVED)

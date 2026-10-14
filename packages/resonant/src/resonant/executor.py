@@ -23,7 +23,9 @@ same transaction as the ``started`` row, and an approval that is already used (o
 to another task or intent) is refused. So one approval runs one execution.
 
 ``recorded(key)`` lets a resuming runner check a pinned key before calling the gate:
-succeeded is replayed, started is ambiguous, and failed or nothing means it may run.
+succeeded is replayed, started is ambiguous, and failed or nothing means it may run
+again. The approval is spent with ``started``, so after a definite failure of an approved
+call the gate returns ``Deny(APPROVAL_USED)``: a retry needs a new task.
 
 Each call writes audit rows before and after it, and on every refusal or ambiguity.
 Keychain secret injection and redaction are deferred to Phase 3.
