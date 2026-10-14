@@ -26,12 +26,12 @@ class Event(BaseModel, extra="forbid", frozen=True):
 
 | Field | Meaning |
 |---|---|
-| `kind`, `runner` | free text; `runner` selects the `Runner` (`local`, `claude`, `cu`, `echo`) |
+| `kind`, `runner` | free text; `runner` selects the `Runner` (`local`, `reminder`, `claude`, `cu`, `echo`) |
 | `extension`, `principal`, `lane` | scope and requester; `lane="oncall"` gets reserved capacity |
 | `priority` | `PRIORITY_ONCALL=0 < PRIORITY_OWNER=1 < PRIORITY_MEMBER=2 < PRIORITY_BACKGROUND=3`; set by core from lane and principal, never by the model |
 | `status` | `queued`, `running`, `waiting`, `done`, `failed`, `cancelled` |
 | `wait_reason` | `approval`, `human_reply`, `usage_reset`, `ci`, `veto`; a CHECK constraint requires it exactly when status is `waiting` |
-| `wake_at` | for `waiting`, when to wake; for `queued`, not before (retry backoff) |
+| `wake_at` | for `waiting`, when to wake; for `queued`, not before (retry backoff, or a reminder's due time). `NewTask.wake_at` (default None) sets it at creation |
 | `attempts`, `step_no` | `attempts` counts failures and crashes and resets on progress; `step_no` counts persisted steps |
 | `checkpoint` | opaque JSON owned by the runner, written every step |
 | `claude_session_id`, `worktree_path`, `scope` | runner state that must survive a crash |
@@ -62,6 +62,7 @@ Loop guarantees:
 4. A crash mid-step means the task resumes from its last checkpoint with its events replayed, and the crash counts as an attempt. A graceful shutdown requeues without using an attempt.
 5. A step that exceeds `max_step_s` is cancelled and treated as a retryable failure.
 6. An outcome that isn't JSON-serializable becomes a non-retryable failure. A database error while persisting stops the loop: the daemon exits, launchd restarts it, and `resume()` recovers the task.
+7. **Next wake.** Between ticks `Loop.run` sleeps `Loop.wait_s()`: `tick_s`, or less when the earliest future `wake_at` of a queued or waiting task (`store.tasks.next_wake_at(conn, after=last_tick)`) comes sooner; one that fell due since the last tick means tick at once. A task is dispatched within loop precision of its `wake_at`, not up to a tick late. Tasks already due at the last tick are excluded, so they never cause a busy loop.
 
 Runner obligations:
 - Make steps idempotent relative to the last checkpoint. Side effects go only through the executor.
@@ -340,12 +341,12 @@ class ToolFailed(Exception)   # raise from a handler: "definitely did not take e
 
 ## Built-in tools: `resonant.tools.builtin`
 
-Global tools (`extension=None`, `source="builtin"`): L0 reads, plus the notes writes (`add_note` and `delete_note` L3, `clear_notes` L1). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals) -> {(None, name): handler}` registers the specs and returns the handlers.
+Global tools (`extension=None`, `source="builtin"`): L0 reads, plus the notes writes (`add_note` and `delete_note` L3, `clear_notes` L1) and the reminder writes (`add_reminder` and `cancel_reminder` L3). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals, clock=utcnow) -> {(None, name): handler}` registers the specs and returns the handlers.
 
-- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`, `notes`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
-- `BuiltinContext(conn, state, registry, principals)` is what a module gets. `registry` is the full registry, read at call time. New fields get defaults.
+- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`, `notes`, `reminders`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
+- `BuiltinContext(conn, state, registry, principals, clock=utcnow)` is what a module gets. `registry` is the full registry, read at call time. `clock` returns aware UTC (tests pass a fake). New fields get defaults.
 
-Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, note text that is empty or over 200 characters, a missing or already-deleted note id, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents.
+Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, note text that is empty or over 200 characters, a missing or already-deleted note id, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents, except the notes and reminder tools, which return the owner's own text.
 
 | Tool | Args | Returns |
 |---|---|---|
@@ -354,6 +355,9 @@ Handlers return JSON-serializable dicts and never raise for "no data". Bad args 
 | `system_status` | none | `{cpu_percent, cpu_count, load_avg: [1m, 5m, 15m] \| null, memory: {used_bytes, total_bytes, percent}, swap: {used_bytes, total_bytes, percent}, memory_pressure: {level: normal\|warn\|critical\|unknown, free_pct: int \| null}, disk: [{path, free_bytes, total_bytes, used_pct}], uptime_s}` |
 | `daemon_status` | none | `{version, uptime_s, last_tick, inflight, dry_run, autonomy, paused}` (a subset of `collect_status`) |
 | `model_status` | none | `{known: false}` when `kv["model.probe"]` is absent or not an object; otherwise the cached probe's fields plus `known: true`. It never calls the model. |
+| `add_reminder` (write, L3) | `at`: ISO-8601 datetime with a UTC offset, not more than 60s in the past and at most 365 days out; `text`: 1..200 chars (whitespace collapsed) | `{id, task_id, at, due, text}`. Creates the reminder task ([Reminders](#reminders-resonantrunnersreminder-resonanttoolswhen)). `id` is the short number from kv `reminders.seq`; `at` is ISO UTC; `due` is `format_due` in `settings.timezone` (`3:00pm`, `tomorrow 9:30am`, `Fri 9:00am`, `Oct 20 9:00am`) |
+| `list_reminders` | none | `{reminders: [{id, at, due, text}], count}`: the owner's queued or firing reminders, soonest first, at most 50 |
+| `cancel_reminder` (write, L3) | `id`: int ≥ 1 | `{cancelled: true, id, at, due, text}`. `set_status(cancelled, expect=("queued",))`. Unknown, already fired, firing or cancelled → `ToolFailed` |
 | `list_commands` | `query?`: string, at most 50 chars | `{commands: [{name, usage, description, tool, level, owner_only}], count, query}`: the command registry (`router/commands.py`) as the owner sees it, filtered by `query` like `/help <word>`. `level` is the tool's registered level (`null` for commands without a tool). Handlers don't see the requester, and the gate only lets principals who can request global tools (the owner) call it. |
 | `list_notes` | none | `{notes: [{id, text, at}], count, total}`: live notes, newest first, at most 20. `total` counts every live note. |
 | `add_note` (L3) | `text`: string, 1–200 characters after trimming | `{id, text, at}` |
@@ -363,6 +367,29 @@ Handlers return JSON-serializable dicts and never raise for "no data". Bad args 
 - `system_status`: `cpu_percent` is measured since the previous call (primed at registration), so it never blocks. `memory_pressure` comes from `sysctl kern.memorystatus_vm_pressure_level` and `memory_pressure -Q` with a 500ms timeout, best effort; off macOS, or when they are missing or slow, it is `{level: "unknown", free_pct: null}`. `disk` lists `/` and `RESONANT_HOME`; an unreadable path has null numbers.
 - Notes (`tools/notes.py`) live in `memory` with `scope="notes"`: key = the note id (decimal), value = JSON `{text, at, deleted_at}`. Ids come from kv `notes.seq` and are never reused. Deletes are soft (they set `deleted_at` and keep the row); reads hide deleted notes. Replay can't duplicate a note, because the executor returns the recorded result for an idempotency key that already succeeded. `notes.summary_action(conn, intent)` is the code-built approval heading for the builtin `clear_notes` (`delete all 4 notes`, counting live notes), for `summarize(intent, action=...)`; it returns `None` for any other intent, including an extension tool with the same name.
 - The `model.probe` kv key is written by `resonant model probe` and the health monitor, in one shape: `{ok, model_present, ctx_ok, thinking_off_ok, tool_call_ok, call_failed, latency_ms, detail, model, api, checked_at}`. The monitor writes only these fields and scrubs URLs from `detail`. Builtins read it only.
+
+## Reminders: `resonant.runners.reminder`, `resonant.tools.when`
+
+A reminder is a durable queued task; there is no scheduler.
+
+- **Task.** `add_reminder` inserts `NewTask(kind="reminder", runner="reminder", principal=owner, priority=PRIORITY_OWNER, wake_at=at, checkpoint={n, text, at})`, where `at` is ISO UTC. The task id is internal; the owner-facing id is `n`. The executor's idempotency key prevents a duplicate on replay. Handlers don't see the requester; global builtins are owner-only, so reminders belong to `principals.owner`.
+- **Firing.** `ReminderRunner(conn, *, channel, timezone, clock=utcnow, max_step_s=30.0)` (`name="reminder"`, `uses_claude_slot=False`, no model, no tools). One step sends `⏰ <text>` with `channel.send(principal, …, dedupe_key=f"reminder:{task.id}")` and returns `Done({late, late_s})`. More than 120s past `at`, the text ends `(late, due 3:00pm)`. `ChannelRefused` or a malformed checkpoint is a final `Fail`; any other `ChannelError` is retryable, and the dedupe key prevents a double send. The send is the deferred effect of an allowed `add_reminder`, so it doesn't go through the gate. Span `runner.reminder.send` (`late`, `ok`), never the text.
+- **Durability.** The `tasks` row is the reminder. `requeue_interrupted` touches only running tasks, so a queued reminder survives any restart, and one missed while the daemon was down fires once on start, marked late.
+- **Precision.** The loop sleeps until the next `wake_at` (Runner, guarantee 7).
+- **Wiring.** The daemon registers `ReminderRunner` with `timezone=settings.timezone` (P2-9).
+
+**Time parser** (`tools/when.py`, pure, stdlib `zoneinfo`, an explicit aware `now` and the zone):
+
+```python
+parse_when(text, *, now, tz) -> datetime             # aware, in tz; raises WhenError
+split_when(text, *, now, tz) -> (datetime, rest)     # /remind: longest leading words that parse
+check_at(at, *, now, grace=PAST_GRACE) -> None       # the model path: aware, ≥ now-60s, ≤ 365 days
+format_due(at, *, now, tz) -> str                    # 3:00pm | tomorrow 3:00pm | Tue 3:00pm | Oct 20 3:00pm
+```
+
+- **Accepted** (case-insensitive): `now`; `in N (m|min|mins|minute|minutes|h|hr|hrs|hour|hours)`; a time today, `H(:MM)?(am|pm)` or 24-hour `HH:MM` when the hour is ≥ 13 or zero-padded, with an optional `at`; `today|tomorrow|<weekday> [at] <time>`. A weekday is the next one, today if the time is still ahead. Weekdays may be abbreviated.
+- **Rejected** with `WhenError`, whose message is the usage hint: an ambiguous time (`3`, `9:30`, `12:00`: `say 3pm or 15:00`), a time that has passed (`yesterday …` too: `that time has passed`), more than 365 days out, or a nonexistent local time (DST gap). A repeated local time (DST fold) is the first one.
+- `split_when` tries at most 5 leading words, longest first. The first that parses wins; the first that is a recognizable but bad time raises its hint; empty text after the time raises `say what to remind you about`.
 
 ## Components: `resonant.components`
 

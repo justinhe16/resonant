@@ -8,18 +8,22 @@ async ``(args) -> dict``, return JSON-serializable dicts, and are fast: database
 indexed and capped. "No data" is an empty result, never an exception. Bad arguments raise
 ``ToolFailed`` (a definite failure the caller can report back).
 
-No tool returns message bodies, task checkpoints/results, or file contents.
+No tool returns message bodies, task checkpoints/results, or file contents, except the notes and
+reminder tools, which return the owner's own text.
 Output shapes are documented in ``docs/interfaces.md`` ("Built-in tools").
 """
 
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.principals import Principals
-from resonant.tools import commands, notes, system, tasks
+from resonant.store.db import utcnow
+from resonant.tools import commands, notes, reminders, system, tasks
 from resonant.tools.base import BuiltinContext, BuiltinModule
 from resonant.tools.registry import ToolRegistry
 from resonant.tools.system import DAEMON_STATUS, MODEL_STATUS, SYSTEM_STATUS
@@ -42,7 +46,7 @@ __all__ = [
     "register_builtins",
 ]
 
-BUILTIN_MODULES: tuple[BuiltinModule, ...] = (tasks, system, commands, notes)
+BUILTIN_MODULES: tuple[BuiltinModule, ...] = (tasks, system, commands, notes, reminders)
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 
 
@@ -52,9 +56,12 @@ def register_builtins(
     state: DaemonState,
     *,
     principals: Principals,
+    clock: Callable[[], datetime] = utcnow,
 ) -> dict[HandlerKey, ToolHandler]:
     """Register every module's specs and return their handlers, keyed ``(None, name)``."""
-    ctx = BuiltinContext(conn=conn, state=state, registry=registry, principals=principals)
+    ctx = BuiltinContext(
+        conn=conn, state=state, registry=registry, principals=principals, clock=clock
+    )
     out: dict[HandlerKey, ToolHandler] = {}
     for module in BUILTIN_MODULES:
         handlers = module.handlers(ctx)
