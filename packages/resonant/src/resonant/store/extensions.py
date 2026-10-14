@@ -106,7 +106,7 @@ def save_extension(conn: sqlite3.Connection, ext: ExtensionRecord) -> None:
             ext.commit,
             ext.tree_digest,
             ext.manifest_sha,
-            json.dumps(ext.manifest, sort_keys=True),
+            json.dumps(ext.manifest),  # declared order kept: positional command args
             json.dumps(dict(ext.argv0_paths), sort_keys=True),
             ext.status,
             iso(ext.installed_at),

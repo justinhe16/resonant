@@ -152,3 +152,44 @@ def render_reminders(d: dict[str, Any]) -> str:
     items = [r for r in (as_dict(x) for x in as_list(d.get("reminders"))) if r]
     lines = [f"{r.get('id', '?')}. {r.get('due', '?')}: {r.get('text', '')}" for r in items]
     return _numbered(lines, f"Reminders ({len(lines)}):", "No reminders.")
+
+
+def _job_line(j: dict[str, Any]) -> str:
+    bits = [f"- {j.get('id', '?')} ({j.get('level', '?')})"]
+    nxt = j.get("next_due_text")
+    bits.append(f"next {nxt}" if isinstance(nxt, str) else "not scheduled")
+    outcome, at = j.get("last_outcome"), j.get("last_run_text")
+    if isinstance(outcome, str):
+        last = f"last {outcome}" + (f" {at}" if isinstance(at, str) else "")
+        streak = j.get("fail_streak")
+        if isinstance(streak, int) and not isinstance(streak, bool) and streak > 1:
+            last += f" ({streak} in a row)"
+        bits.append(last)
+    else:
+        bits.append("never run")
+    return " · ".join(bits)
+
+
+def render_extensions(d: dict[str, Any]) -> str:
+    """``/ext list``: one line per extension (name, status, pin, tools, mute, health), then
+    one per job (level, next due, last run)."""
+    items = [e for e in (as_dict(x) for x in as_list(d.get("extensions"))) if e]
+    if not items:
+        return "No extensions installed. On the Mini: resonant ext add repo:<name>"
+    lines: list[str] = []
+    for e in items:
+        pin = e.get("commit") or "no commit"
+        bits = [
+            str(e.get("name", "?")),
+            str(e.get("status", "?")),
+            f"{pin} digest {e.get('digest', '?')}",
+            f"{e.get('tools', '?')} tools",
+        ]
+        if isinstance(e.get("muted_until_text"), str):
+            bits.append(f"muted until {e['muted_until_text']}")
+        if isinstance(e.get("health"), str):
+            bits.append(f"health {e['health']}")
+        lines.append(" · ".join(bits))
+        lines.extend(_job_line(j) for j in (as_dict(x) for x in as_list(e.get("jobs"))) if j)
+    text = f"Extensions ({len(items)}):\n" + "\n".join(lines)
+    return text if len(text) <= MAX_REPLY_CHARS else text[: MAX_REPLY_CHARS - 1] + "…"

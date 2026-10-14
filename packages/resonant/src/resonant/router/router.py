@@ -4,9 +4,10 @@
 
 (a) Fast path (no model call): ``NewTask(kind="reply", runner="local",
     checkpoint={"fast_reply": text, "tool_used": ..., "intent": ..., "title": command})``.
-    A side-effecting slash command instead gives ``NewTask(kind="command", runner="local",
-    checkpoint={"direct_call": {"tool", "args"}, "intent": ..., "title": command})``: the
-    local runner runs that one call with ``origin="explicit"``.
+    A side-effecting slash command (and every ``/<ext> <tool>``, ``/ext mute`` and ``/ext
+    run``) instead gives ``NewTask(kind="command", runner="local", checkpoint={"direct_call":
+    {"extension", "tool", "args"}, "intent": ..., "title": command})``: the local runner
+    runs that one call with ``origin="explicit"``.
 (b) Labeled (one model call): ``NewTask(kind="chat", runner="local", checkpoint={"intent",
     "confidence", "toolset": [{"extension", "name"}], "fallback", "toolset_prefix_hash",
     "title"})``.
@@ -58,6 +59,7 @@ from resonant.models import ModelClient, SpanFactory
 from resonant.observability.spans import span
 from resonant.principals import Principals
 from resonant.router.approvals import ApprovalInbox
+from resonant.router.commands import commands_for
 from resonant.router.fast_path import FastPath, match_fast_path
 from resonant.router.intents import (
     BUILTIN_INTENTS,
@@ -196,6 +198,8 @@ class Router:
             handlers=handlers,
             clock=clock,
             timezone=timezone,
+            extensions=extensions,
+            command_table=commands_for(extensions, registry),  # built once, like intents
         )
         self.inbox = ApprovalInbox(conn, principals=principals, gate=gate)
         self.labeler = Labeler(model, self.intents)
@@ -244,7 +248,7 @@ class Router:
 
         # Order: slash commands (so /kill is never read as a reply), approval replies, then
         # keywords and the labeler.
-        cmd = match_fast_path(text, self.fast_path.context())
+        cmd = self.fast_path.match(text)
         if cmd is not None and cmd.slash:
             result = await self.fast_path.run(
                 cmd, principal=principal, event_id=event.id, trace_id=event.trace_id, spans=spans

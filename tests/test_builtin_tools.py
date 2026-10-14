@@ -47,6 +47,8 @@ NAMES = {
     "restart_ollama",
     "restart_resonant",
     "update_resonant",
+    "list_extensions",
+    "mute_extension",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {
@@ -58,6 +60,7 @@ WRITES = {
     "restart_ollama": Level.L3,
     "restart_resonant": Level.L2,
     "update_resonant": Level.L2,
+    "mute_extension": Level.L3,
 }
 
 

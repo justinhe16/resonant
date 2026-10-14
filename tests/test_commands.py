@@ -169,6 +169,7 @@ def test_describe_takes_the_level_from_the_tool_registry() -> None:
         "tool": None,
         "level": None,
         "owner_only": False,
+        "extension": None,
         "subcommands": [],
     }
 
@@ -193,6 +194,7 @@ async def test_list_commands_tool_lists_the_owner_view(ctx: BuiltinContext) -> N
         "tool": None,
         "level": None,
         "owner_only": True,
+        "extension": None,
         "subcommands": [],
     }
     assert by_name["/notes"]["level"] == "L0"
@@ -388,6 +390,7 @@ def test_owner_only_commands() -> None:
         "/disk",
         "/logs",
         "/approvals",
+        "/ext",
         "/kill",
         "/resume",
     }

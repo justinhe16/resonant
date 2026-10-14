@@ -1,6 +1,7 @@
 """``list_commands``: the slash commands, from the command registry (``router/commands.py``).
 
 The model's answer to "what can you do?" comes from here, so it can't invent commands.
+Loaded extensions' ``/<ext>`` commands are included (``commands.commands_for``).
 It is a global builtin, so the gate lets only principals who can request global tools (the
 owner) call it; it lists what the owner may use. ``/help`` renders the same registry for
 whoever asks, without a tool call, so members get it too.
@@ -41,7 +42,14 @@ def list_commands(ctx: BuiltinContext, args: dict[str, Any], *, principal: str) 
     query = args.get("query")
     if query is not None and (not isinstance(query, str) or len(query) > commands.HELP_QUERY_MAX):
         raise ToolFailed(f"query must be a string of at most {commands.HELP_QUERY_MAX} chars")
-    cmds = commands.available(principal, principals=ctx.principals, registry=ctx.registry)
+    components = ctx.state.components
+    host = components.extensions if components is not None else None
+    cmds = commands.available(
+        principal,
+        principals=ctx.principals,
+        registry=ctx.registry,
+        commands=commands.commands_for(host, ctx.registry),
+    )
     if query:
         cmds = commands.search(query, cmds)
     out = [commands.describe(c, ctx.registry) for c in cmds]
