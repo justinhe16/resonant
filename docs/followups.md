@@ -75,6 +75,45 @@ Work we've decided to do eventually but have deferred. Each entry says why it wa
 
 **Done when.** Accuracy is ≥ 90% on the real set, as go-live step 9 expects.
 
+## Proactive nudges ("btw …")
+
+*Noted 2026-10-13, during Phase 2 planning. Not scheduled yet.*
+
+**What.** Resonant texts the owner unprompted when something is worth knowing: things they may have forgotten or never saw. Examples:
+- "btw, XYZ rescheduled your 3pm to Thursday."
+- "You said you'd follow up with A last week."
+- "PR #12 has been red for two days."
+- "Your 9am tomorrow conflicts with the dentist."
+
+This is the opposite of a reminder the owner sets: Resonant decides what's worth saying.
+
+**Shape (sketch).**
+- **Sources.** Each source is an extension that emits events or exposes read tools:
+  - calendar, Gmail (Phase 7 life lane)
+  - GitHub and CI
+  - Resonant's own tasks, notes and reminders
+  - on-call (Phase 6)
+- **Trigger.** A scheduled job (Phase 3 scheduler) runs a periodic sweep, plus event-driven triggers, e.g. a calendar change event. Not a model running in a loop.
+- **Decide.** A ranking step picks at most a few items worth interrupting for: novelty (not already told), urgency, relevance. This is where a stronger model may be needed (Claude, not the local model).
+- **Deliver.** One short iMessage digest or a single "btw", through the normal channel, with:
+  - quiet hours
+  - a daily cap
+  - dedupe per item, never repeating something already sent
+  - an easy "stop telling me about X"
+
+**Open questions.**
+- What counts as worth interrupting for, and how the owner tunes it (feedback replies like "useful" / "not useful").
+- Privacy: what the ranking model may see, local vs Claude.
+- Cost and rate limits of a periodic sweep.
+- How it interacts with the kill switch: nudges are read-only messages, but they still respect `paused`.
+
+**Depends on.** The Phase 3 scheduler and extensions, data sources (Phase 7 for calendar and mail), and the status relay if nudges should also be visible remotely.
+
+**Done when.**
+- A sweep sends at most N useful nudges a day with no repeats.
+- The owner can mute a category from iMessage.
+- Every nudge links back to its source.
+
 ## Slow-reply acknowledgement ("on it")
 
 *Deferred 2026-10-13, from the local-model latency fix (Instruct-2507 default).*
