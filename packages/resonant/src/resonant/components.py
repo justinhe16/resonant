@@ -27,11 +27,13 @@ from resonant.principals import Principal, Principals, load_principals
 from resonant.runners.local import LocalRunner
 from resonant.tools import ToolRegistry
 from resonant.tools import notes as notes_tools
+from resonant.tools import ops as ops_tools
 from resonant.tools.builtin import register_builtins
 from resonant.tools.registry import ToolKey
 
 if TYPE_CHECKING:
     from resonant.api import DaemonState
+    from resonant.ops import OpsRunner
 
 log = logging.getLogger(__name__)
 
@@ -76,22 +78,31 @@ def deny_all_principals() -> Principals:
 
 
 def summary_actions(conn: sqlite3.Connection) -> dict[ToolKey, SummaryAction]:
-    """Code-built approval headings per builtin tool (``delete all 4 notes``)."""
+    """Code-built approval and dry-run headings per builtin tool (``delete all 4 notes``,
+    ``restart Ollama``)."""
 
     def clear_notes(intent: Intent) -> str | None:
         return notes_tools.summary_action(conn, intent)
 
-    return {(None, notes_tools.CLEAR_NOTES.name): clear_notes}
+    actions: dict[ToolKey, SummaryAction] = {(None, notes_tools.CLEAR_NOTES.name): clear_notes}
+    for name in ops_tools.SUMMARY_ACTIONS:
+        actions[(None, name)] = ops_tools.summary_action
+    return actions
 
 
 def build_components(
-    settings: Settings, conn: sqlite3.Connection, state: DaemonState
+    settings: Settings,
+    conn: sqlite3.Connection,
+    state: DaemonState,
+    *,
+    ops_runner: OpsRunner | None = None,
 ) -> Components:
     """Build the registry (with builtins), principals, ``PolicyGate`` and ``Executor``.
 
     ``state`` is the daemon's live state; ``daemon_status`` reads uptime and loop progress
-    from it. A missing principals.yaml is a warning (channels deny everyone); an invalid
-    one is an error.
+    from it. ``ops_runner`` runs the ops tools' subprocesses (default: the real one; tests
+    pass a fake). A missing principals.yaml is a warning (channels deny everyone); an
+    invalid one is an error.
     """
     path = settings.principals_path
     if path.exists():
@@ -100,7 +111,9 @@ def build_components(
         log.warning("%s missing: denying all channel principals", path)
         principals, loaded = deny_all_principals(), False
     registry = ToolRegistry()
-    handlers = register_builtins(registry, conn, state, principals=principals)
+    handlers = register_builtins(
+        registry, conn, state, principals=principals, ops_runner=ops_runner
+    )
     gate = PolicyGate(
         conn,
         principals,

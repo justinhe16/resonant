@@ -26,6 +26,7 @@ from resonant_sdk import ToolSpec
 
 if TYPE_CHECKING:
     from resonant.api import DaemonState
+    from resonant.ops import OpsRunner
 
 NO_ARGS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
@@ -37,6 +38,7 @@ class BuiltinContext:
     registry: ToolRegistry  # the full registry, read at call time (extensions included)
     principals: Principals
     clock: Callable[[], datetime] = utcnow  # aware UTC; tests pass a fake
+    ops_runner: OpsRunner | None = None  # ops subprocesses; None: the real one
 
 
 class BuiltinModule(Protocol):

@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from resonant.config import LoopConfig
+from resonant.config import LoopConfig, load_settings
 from resonant.executor import Executor, HandlerKey, ToolFailed, ToolHandler
 from resonant.gate import ApprovalResolution, Deny, DryRun, Intent, PolicyGate
 from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
@@ -27,6 +27,7 @@ from resonant.gateway.channel import (
     Submit,
     approval_dedupe_key,
 )
+from resonant.launchd import DAEMON_LABEL
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.loop.types import PRIORITY_OWNER, StepContext, Task
 from resonant.models import (
@@ -37,6 +38,8 @@ from resonant.models import (
     SpanFactory,
     ToolCall,
 )
+from resonant.ops import RESTART_DELAY_S, restart_later_argv, restart_pending
+from resonant.ops.fakes import FakeOpsRunner
 from resonant.principals import Principal, Principals
 from resonant.runners.local import (
     LocalRunner,
@@ -48,16 +51,13 @@ from resonant.store import approvals as ap
 from resonant.store import tasks as repo
 from resonant.store.db import kv_set, transaction
 from resonant.tools import ToolRegistry, notes
+from resonant.tools.ops import RESTART_OLLAMA, RESTART_RESONANT, Ops
 from resonant.tools.tasks import TASK_COUNTS
 from resonant_sdk import Effect, Event, Level, ToolSpec
 
 OWNER = "justin"
 T0 = datetime(2026, 10, 13, 15, 0, tzinfo=UTC)
 TTL_S = 1800.0
-
-# Fixture specs standing in for P2-14's ops tools.
-RESTART_RESONANT = ToolSpec(name="restart_resonant", effect=Effect.WRITE, level=Level.L2)
-RESTART_OLLAMA = ToolSpec(name="restart_ollama", effect=Effect.WRITE, level=Level.L3)
 
 
 class Crash(BaseException):
@@ -802,3 +802,56 @@ def test_prompt_text_and_dedupe_key() -> None:
         "[D7] do it? Reply exactly: yes D7 / no D7"
     )
     assert approval_dedupe_key("ap1", OWNER) == "approval:ap1:prompt:justin"
+
+
+# --- ops (P2-14): the reply goes out before the detached restart -------------------------
+
+
+def real_restart(h: Harness, runner: FakeOpsRunner) -> ToolHandler:
+    ops = Ops(h.db, load_settings(), runner, owner=OWNER, clock=h.clock, uid=501)
+
+    async def handler(_args: dict[str, Any]) -> dict[str, Any]:
+        return await ops.restart_resonant()
+
+    return handler
+
+
+async def test_restart_reply_is_recorded_before_the_helper_fires(make: Any) -> None:
+    runner = FakeOpsRunner()
+    h: Harness = make()
+    h.executor.handlers[(None, "restart_resonant")] = real_restart(h, runner)
+    task_id = h.add_task(direct("restart_resonant"), text="/restart resonant", kind="command")
+    await h.loop.run_until_idle()
+
+    # The helper was spawned with a delay (it kickstarts 3 s later), and within the same
+    # step the reply was saved to the checkpoint and sent.
+    assert runner.spawned == [tuple(restart_later_argv(DAEMON_LABEL, RESTART_DELAY_S))]
+    assert RESTART_DELAY_S == 3
+    t = h.task(task_id)
+    assert t.status == "done" and t.checkpoint["reply"] == "Restarting Resonant…"
+    assert h.channel.replies() == ["Restarting Resonant…"]
+    assert restart_pending(h.db) is not None  # the next start says "back up"
+
+
+async def test_replayed_restart_does_not_restart_twice(make: Any) -> None:
+    runner = FakeOpsRunner()
+    h: Harness = make()
+    h.executor.handlers[(None, "restart_resonant")] = real_restart(h, runner)
+    task_id = h.add_task(direct("restart_resonant"), text="/restart resonant", kind="command")
+    await h.loop.run_until_idle()
+    assert len(runner.spawned) == 1
+
+    # The kill landed after the tool ran but before the reply was saved: the new daemon
+    # requeues the task with only the pinned call in its checkpoint.
+    cp = {k: v for k, v in h.task(task_id).checkpoint.items() if k not in ("reply", "reply_meta")}
+    with transaction(h.db):
+        h.db.execute(
+            "UPDATE tasks SET status = 'queued', checkpoint = ? WHERE id = ?",
+            (json.dumps(cp), task_id),
+        )
+    await h.loop.run_until_idle()
+
+    assert len(runner.spawned) == 1  # replayed from executions: no second restart
+    assert h.executions(task_id) == 1
+    assert h.task(task_id).checkpoint["reply"] == "Restarting Resonant…"
+    assert h.channel.replies() == ["Restarting Resonant…"]  # deduped by reply:<task id>

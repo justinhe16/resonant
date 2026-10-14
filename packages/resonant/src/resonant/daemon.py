@@ -38,6 +38,7 @@ from resonant.store.db import open_db, utcnow
 if TYPE_CHECKING:
     from resonant.gateway.imessage.sender import OsaRunner
     from resonant.models import ModelClient
+    from resonant.ops import OpsRunner
     from resonant.wiring import IMessageStack
 
 log = logging.getLogger(__name__)
@@ -58,10 +59,12 @@ class Daemon:
         *,
         model: ModelClient | None = None,
         osa_runner: OsaRunner | None = None,
+        ops_runner: OpsRunner | None = None,
     ) -> None:
         """``model`` and ``osa_runner`` replace Ollama and osascript (tests, ``bench e2e``).
 
-        They are used only when ``channels.imessage.enabled`` is true.
+        They are used only when ``channels.imessage.enabled`` is true. ``ops_runner``
+        replaces the ops tools' subprocesses (git, uv, launchctl).
         """
         self.settings = settings
         self.conn = open_db(settings.db_path)
@@ -72,7 +75,9 @@ class Daemon:
             slots=SlotPool(settings.claude.max_concurrent, settings.claude.reserved_oncall_slots),
         )
         self.state = DaemonState(settings, self.conn, self.loop, started_at=utcnow())
-        self.state.components = build_components(settings, self.conn, self.state)
+        self.state.components = build_components(
+            settings, self.conn, self.state, ops_runner=ops_runner
+        )
         self.imessage: IMessageStack | None = None
         if settings.channels.imessage.enabled:
             from resonant.wiring import build_imessage_stack

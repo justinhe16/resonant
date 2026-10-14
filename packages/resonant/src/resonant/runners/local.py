@@ -87,7 +87,7 @@ from resonant.observability.spans import span
 from resonant.router.fast_path import render_mini, render_status, render_tasks
 from resonant.router.intents import UNKNOWN, IntentLabel, parse_intent
 from resonant.router.prefixes import FALLBACK_REPLY, runner_system, wrap_untrusted
-from resonant.router.render import render_projects
+from resonant.router.render import render_disk, render_logs, render_projects
 from resonant.store import approvals as ap
 from resonant.store.db import transaction, utcnow
 from resonant.store.tasks import get_event, get_task, principal_thread
@@ -192,9 +192,11 @@ def render_model(d: dict[str, Any]) -> str:
 
 _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "daemon_status": render_status,
+    "disk": render_disk,
     "list_tasks": render_tasks,
     "model_status": render_model,
     "projects": render_projects,
+    "recent_logs": render_logs,
     "system_status": render_mini,
     "task_counts": render_counts,
 }
@@ -258,12 +260,40 @@ def _notes_cleared(d: dict[str, Any]) -> str | None:
     return f"Cleared {n} note{'' if n == 1 else 's'}."
 
 
+def _ollama_restarted(d: dict[str, Any]) -> str | None:
+    return "Restarted Ollama." if d.get("restarted") is True else None
+
+
+def _resonant_restarting(d: dict[str, Any]) -> str | None:
+    return "Restarting Resonant…" if d.get("restarting") is True else None
+
+
+def _updated(d: dict[str, Any]) -> str | None:
+    old, new = d.get("old"), d.get("new")
+    if not isinstance(old, str) or not isinstance(new, str):
+        return None
+    if d.get("updated") is False:
+        return f"Already up to date ({new})."
+    if d.get("restarting") is True:
+        return f"Updated {old} → {new}, restarting…"
+    if d.get("synced") is False:
+        error = clean_external(str(d.get("sync_error") or "failed"))[:60]
+        return (
+            f"Updated {old} → {new}, but uv sync failed ({error}): not restarting. "
+            "Fix it on the Mini."
+        )
+    return None
+
+
 # Code-built report lines for builtin side effects, keyed by tool name. Anything else
 # reports ``Done: <summary>``. A renderer returns None for a result it doesn't recognize.
 REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "add_note": _note_saved,
     "delete_note": _note_deleted,
     "clear_notes": _notes_cleared,
+    "restart_ollama": _ollama_restarted,
+    "restart_resonant": _resonant_restarting,
+    "update_resonant": _updated,
 }
 
 

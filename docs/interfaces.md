@@ -170,7 +170,7 @@ Evaluation order (Phase 2, `resonant.gate.PolicyGate`):
 1. **Registration:** if `registry.get(extension, tool) != intent.spec`, Deny. An intent can't claim an effect or level its tool wasn't registered with.
 2. **Permission:** if `can(principal, "request", extension)` is false, Deny.
 3. **Unsafe args:** if `unsafe_args(args)` finds anything, Deny. The reason gives only a count, never the keys or values.
-4. **dry_run:** a tool that is neither an L0 read nor store-internal becomes `DryRun(would=<summary>)`.
+4. **dry_run:** a tool that is neither an L0 read nor store-internal becomes `DryRun(would=<summary>)`. The summary uses the tool's code-built heading when it has one (`restart Ollama`), as approval prompts do.
 5. **Level × origin × autonomy** (`policy.rule`):
 
 | Level | autonomy on, explicit | autonomy on, inferred | autonomy off |
@@ -361,12 +361,12 @@ class ToolFailed(Exception)   # raise from a handler: "definitely did not take e
 
 ## Built-in tools: `resonant.tools.builtin`
 
-Global tools (`extension=None`, `source="builtin"`): L0 reads, plus the notes writes (`add_note` and `delete_note` L3, `clear_notes` L1) and the reminder writes (`add_reminder` and `cancel_reminder` L3). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals, clock=utcnow) -> {(None, name): handler}` registers the specs and returns the handlers.
+Global tools (`extension=None`, `source="builtin"`): L0 reads, plus the notes writes (`add_note` and `delete_note` L3, `clear_notes` L1), the reminder writes (`add_reminder` and `cancel_reminder` L3) and the ops writes (`restart_ollama` L3, `restart_resonant` and `update_resonant` L2). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals, clock=utcnow, ops_runner=None) -> {(None, name): handler}` registers the specs and returns the handlers.
 
-- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`, `notes`, `reminders`, `projects`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
-- `BuiltinContext(conn, state, registry, principals, clock=utcnow)` is what a module gets. `registry` is the full registry, read at call time. `clock` returns aware UTC (tests pass a fake). New fields get defaults.
+- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`, `notes`, `reminders`, `projects`, `ops`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
+- `BuiltinContext(conn, state, registry, principals, clock=utcnow, ops_runner=None)` is what a module gets. `registry` is the full registry, read at call time. `clock` returns aware UTC (tests pass a fake). `ops_runner` runs the ops tools' subprocesses (`None`: the real `SubprocessRunner`; tests pass `FakeOpsRunner`). New fields get defaults.
 
-Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, note text that is empty or over 200 characters, a missing or already-deleted note id, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents, except the notes and reminder tools, which return the owner's own text, and `projects`, which reads only the code-built `checkpoint.title` and a reminder's own text.
+Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, note text that is empty or over 200 characters, a missing or already-deleted note id, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents, except the notes and reminder tools, which return the owner's own text, `projects`, which reads only the code-built `checkpoint.title` and a reminder's own text, and `recent_logs`, which returns a few scrubbed lines of Resonant's own log.
 
 | Tool | Args | Returns |
 |---|---|---|
@@ -384,6 +384,11 @@ Handlers return JSON-serializable dicts and never raise for "no data". Bad args 
 | `add_note` (L3) | `text`: string, 1–200 characters after trimming | `{id, text, at}` |
 | `delete_note` (L3) | `id`: int ≥ 1 | `{id, text, at, deleted_at}`. Soft delete. |
 | `clear_notes` (L1) | none | `{cleared, deleted_at}`: soft-deletes every live note. |
+| `restart_ollama` (L3) | none | `{label, restarted: true}`. `launchctl kickstart -k gui/<uid>/com.resonant.ollama`, 15s. A non-zero exit, timeout or missing binary → `ToolFailed`. |
+| `restart_resonant` (L2) | none | `{label, restarting: true, delay_s: 3, commit}`. Writes the restart marker and spawns the detached helper; returns at once ([Ops](#ops-resonantops-resonanttoolsops)). `commit` is the repo's short HEAD, or null. |
+| `update_resonant` (L2) | none | `{old, new, updated, synced, restarting}` (+ `delay_s` when restarting, `sync_error` when the sync failed). Refuses (`ToolFailed`) without `ops.repo_path` or `ops.uv_path`, off `main` (`not on main; not updating`), with a dirty tree (`working tree has changes; not updating`), or when `git pull --ff-only` fails. HEAD unchanged: `updated: false`, nothing else runs. A failed `uv sync --frozen` returns `synced: false` and does not restart. |
+| `disk` | none | `{disk: [{path, free_bytes, total_bytes, used_pct}]}` for `/` and `RESONANT_HOME`, like `system_status` without the slow probes. |
+| `recent_logs` | `n?`: int 1..20, default 10; larger is capped at 20 | `{lines, count, n}`: the last `n` records of `logs/resonant.jsonl`, oldest first, each as `15:04:05 warning resonant.daemon: event k=v`. URLs → `<url>`, emails and phone numbers → `<handle>`, at most 300 chars a line. Reads at most the last 256 KB. No log yet: `lines: []`. |
 
 - `system_status`: `cpu_percent` is measured since the previous call (primed at registration), so it never blocks. `memory_pressure` comes from `sysctl kern.memorystatus_vm_pressure_level` and `memory_pressure -Q` with a 500ms timeout, best effort; off macOS, or when they are missing or slow, it is `{level: "unknown", free_pct: null}`. `disk` lists `/` and `RESONANT_HOME`; an unreadable path has null numbers.
 - Notes (`tools/notes.py`) live in `memory` with `scope="notes"`: key = the note id (decimal), value = JSON `{text, at, deleted_at}`. Ids come from kv `notes.seq` and are never reused. Deletes are soft (they set `deleted_at` and keep the row); reads hide deleted notes. Replay can't duplicate a note, because the executor returns the recorded result for an idempotency key that already succeeded. `notes.summary_action(conn, intent)` is the code-built approval heading for the builtin `clear_notes` (`delete all 4 notes`, counting live notes), for `summarize(intent, action=...)`; it returns `None` for any other intent, including an extension tool with the same name.
@@ -413,17 +418,38 @@ format_due(at, *, now, tz) -> str                    # 3:00pm | tomorrow 3:00pm 
 - **Rejected** with `WhenError`, whose message is the usage hint: an ambiguous time (`3`, `9:30`, `12:00`: `say 3pm or 15:00`), a time that has passed (`yesterday …` too: `that time has passed`), more than 365 days out, or a nonexistent local time (DST gap). A repeated local time (DST fold) is the first one.
 - `split_when` tries at most 5 leading words, longest first. The first that parses wins; the first that is a recognizable but bad time raises its hint; empty text after the time raises `say what to remind you about`.
 
+## Ops: `resonant.ops`, `resonant.tools.ops`
+
+```python
+class OpsRunner(Protocol):
+    async def run(self, argv, *, timeout_s, cwd: Path | None = None) -> ProcResult  # TimeoutError, OSError
+    def spawn_detached(self, argv) -> None                                          # OSError
+ProcResult(returncode, stdout, stderr)
+SubprocessRunner()          # the real one; FakeOpsRunner (resonant.ops.fakes) for tests
+kickstart_argv(label, uid=None) -> list[str]       # only the two ops labels
+restart_later_argv(label, delay_s=3) -> list[str]  # [sys.executable, "-m", "resonant.ops.restart_later", label, "3"]
+mark_restart(conn, *, by, commit, now) / restart_pending(conn) / clear_restart(conn)
+async back_up(conn, channel, owner, *, clock=utcnow) -> bool
+```
+
+- **Subprocesses.** argv only, never a shell; each has a timeout (git reads 10s, `git pull --ff-only` 60s, `uv sync --frozen` 240s, `launchctl` 15s); stdin is `/dev/null` and git never prompts (`GIT_TERMINAL_PROMPT=0`). stderr is never logged or returned. Each tool's `timeout_s` exceeds the sum of its steps (`update_resonant`: 360s), so the executor never times one out first. A timeout or a failed check is a definite `ToolFailed` with a short reason.
+- **Restart, reply first.** `restart_resonant` (and `update_resonant` after a good sync) writes kv `ops.restart_pending = {by, at, commit}`, then spawns the helper with `start_new_session=True`, so it leaves launchd's process group. The helper sleeps 3s and runs `launchctl kickstart -k gui/<uid>/com.resonant.daemon`. The tool returns at once; the runner saves and sends its reply well inside the delay, and graceful shutdown drains in-flight sends. If the kill lands before the reply is saved, the resumed task replays the `succeeded` execution (no second restart) and sends the report.
+- **Back up.** `IMessageStack.start` calls `back_up` after the reader starts. With a marker it sends `Back up (<commit>), down 6s` to the marker's principal (`dedupe_key=restart:<at>`) and clears it. No marker (a normal start or a crash): nothing. A `ChannelRefused` clears the marker; another `ChannelError` keeps it for the next start.
+- **dry_run.** Ops tools are never exempt: the gate returns `Dry run: would restart Ollama` (`restart Resonant`, `update Resonant`) and nothing runs. `tools.ops.summary_action(intent)` gives those headings for approval prompts too.
+- **Reports** (`runners.local.REPORTS`): `Restarted Ollama.`, `Restarting Resonant…`, `Updated a1b2c3d → e4f5a6b, restarting…`, `Already up to date (a1b2c3d).`, and `Updated a1b2c3d → e4f5a6b, but uv sync failed (exit 1): not restarting. Fix it on the Mini.` Read templates: `router.render.render_disk` and `render_logs` (newest lines within one 2000-char chunk).
+- **Trust.** Owner-only (global scope), two fixed launchd labels, one configured repo. `/update` runs whatever is on the repo's `main` upstream, fast-forward only, from a clean tree: remote code execution from the owner's own repo, accepted (plan §5).
+
 ## Components: `resonant.components`
 
 ```python
-build_components(settings, conn, state: DaemonState) -> Components
+build_components(settings, conn, state: DaemonState, *, ops_runner: OpsRunner | None = None) -> Components
 Components(registry, principals, gate: Gate, executor, handlers, principals_loaded=True,
            runners: dict[str, Runner] = {})
     .register_local_runner(conn, *, model: ModelClient, channel: Channel) -> LocalRunner
 ```
 
 - `Daemon.__init__` calls it once and sets `DaemonState.components`.
-- `gate` is `PolicyGate(conn, principals, registry, dry_run=settings.dry_run, approval_ttl_s=settings.gate.approval_ttl_s, actions=summary_actions(conn))`. `summary_actions` maps `(None, "clear_notes")` to the notes hook (`delete all 4 notes`). `DryRunGate` stays as a test double.
+- `gate` is `PolicyGate(conn, principals, registry, dry_run=settings.dry_run, approval_ttl_s=settings.gate.approval_ttl_s, actions=summary_actions(conn))`. `summary_actions` maps `(None, "clear_notes")` to the notes hook (`delete all 4 notes`) and the ops writes to their headings (`restart Ollama`, `restart Resonant`, `update Resonant`). `ops_runner` goes to `register_builtins`. `DryRunGate` stays as a test double.
 - If `principals.yaml` is missing, it logs a warning and uses an identity-less stand-in owner, so no channel identity resolves and every channel request is denied (`principals_loaded=False`). An invalid file is an error.
 - New fields (runners, channels, ...) get defaults so existing callers keep working.
 - `register_local_runner` builds `LocalRunner` from the components' gate, executor and registry and adds it to `runners["local"]`. The daemon builds the model client and channel (the channel needs `principals`), so it calls this after `build_components`.
@@ -577,7 +603,7 @@ LocalRunner(conn, *, model: ModelClient, channel: Channel, gate: RunnerGate, exe
 # ToolExecutor: execute(intent, decision, *, step_no, call_index) and recorded(key)
 ```
 
-The daemon sets `max_step_s = wiring.local_step_limit(model) = (MAX_TOOL_ITERATIONS + 1) * model.timeout_s + 15` (255s with the 60s default), so the model client's own timeout always fires first and the user gets the templated fallback instead of a cancelled step. The loop's stuck check stays a backstop. (P2-14 raises it to cover the longest tool timeout.)
+The daemon sets `max_step_s = wiring.local_step_limit(model, registry.specs()) = max((MAX_TOOL_ITERATIONS + 1) * model.timeout_s, longest tool timeout_s) + 15` (375s with the defaults: `update_resonant`'s 360s beats the model's 240s), so the model client's or the executor's own timeout always fires first: the user gets the templated fallback instead of a cancelled step, and `/update` is never cancelled into an ambiguous outcome. The loop's stuck check stays a backstop.
 
 One step answers the whole task, unless it waits for an approval. In this order:
 
@@ -598,7 +624,7 @@ One step answers the whole task, unless it waits for an approval. In this order:
 **Gated call** (`checkpoint.call = {tool, extension, args, step_no, call_index}`), at most one per task, exactly once:
 - **Pinned** with `ctx.save` before it is gated (direct) or run or prompted (model), so `idempotency_key(task_id, step_no, call_index, intent.hash)` stays the same across retries, waits and restarts.
 - **Resume:** `executor.recorded(key)` first. Succeeded: replay the report, no gate call. Started: ambiguous, reported (`Not sure whether <summary> ran…`) and never re-run. Failed: the definite failure is reported. None: `gate.evaluate`.
-- `Allow`: `executor.execute(intent, decision, step_no=pinned, call_index=pinned)`. The reply is code-built: `Saved note 3: "buy milk"`, `Deleted note 3.`, `Cleared 4 notes.` (builtins in `REPORTS`), else `Done: <summary>`. A definite failure replies `Failed: <summary>` with the handler's `ToolFailed` message.
+- `Allow`: `executor.execute(intent, decision, step_no=pinned, call_index=pinned)`. The reply is code-built: `Saved note 3: "buy milk"`, `Deleted note 3.`, `Cleared 4 notes.`, `Restarting Resonant…` (builtins in `REPORTS`; see [Ops](#ops-resonantops-resonanttoolsops)), else `Done: <summary>`. A definite failure replies `Failed: <summary>` with the handler's `ToolFailed` message.
 - `NeedsApproval`: `channel.request_approval(approver, ApprovalPrompt)` for each approver, then `approvals.add_channel_ref(id, ref, at=now(), principal)`, then `Wait("approval", wake_at=expires_at)`. Every pending step re-prompts (a spurious wake, a crash between save and prompt); the channel dedupes by `approval_dedupe_key`, and the first send time is kept. `ChannelRefused` fails for good; any other `ChannelError` is a retryable `Fail`.
 - `DryRun`: `Dry run: would <summary>`. `Deny`: `Not done.` (`NOT_APPROVED`), `Not done: the approval for <summary> expired.` (`APPROVAL_EXPIRED`), `Not done: that approval was already used.` (`APPROVAL_USED`), else `Not done: <reason>.`
 - After an approval or a direct call there are no more model rounds: the reply is templated.
@@ -609,16 +635,17 @@ Failures: `ModelUnavailableError` sends one templated fallback (the report line 
 
 ```python
 build_imessage_stack(settings, conn, components, loop, *, daemon_healthy, model=None, osa_runner=None)
-    -> IMessageStack(channel, router, runner, reminders, monitor, model)
+    -> IMessageStack(channel, router, runner, reminders, monitor, model, owner)
 IMessageStack.start(loop) / .stop() / .aclose() / .running
-local_step_limit(model_cfg) -> float
-Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | None = None)
+local_step_limit(model_cfg, tools: Iterable[ToolSpec] = ()) -> float
+Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | None = None,
+       ops_runner: OpsRunner | None = None)
 ```
 
 - **Gate.** Always `PolicyGate`, iMessage on or off. The startup log line includes `gate=policy dry_run=<bool>`. With `dry_run: true`, L0 reads (chat and the fast path) are allowed exactly as before.
 - **`channels.imessage.enabled: false`** (the default): the daemon is Phase 0 apart from the gate. `loop.router` is None, `loop.runners == {"echo"}`, `DaemonState.monitor` is None, and nothing imports the model client.
-- **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner`, then `loop.runners["local"]`, `max_step_s = local_step_limit`) and `ReminderRunner` (`runners["reminder"]`, see Reminders), sets `loop.router = router.route`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta)`, which becomes `DaemonState.monitor`. `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`.
-- **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`) before the loop, then the loop, the API, the monitor and the dead-man (with `monitor.deadman_reason`).
+- **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner`, then `loop.runners["local"]`, `max_step_s = local_step_limit`) and `ReminderRunner` (`runners["reminder"]`, see Reminders), sets `loop.router = router.route`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta)`, which becomes `DaemonState.monitor`. `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`; tests also pass `ops_runner=FakeOpsRunner()` (it goes to `build_components`).
+- **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`, then `ops.back_up`: `Back up (<commit>), down Ns` once after a requested restart) before the loop, then the loop, the API, the monitor and the dead-man (with `monitor.deadman_reason`).
 - **Stop** (SIGTERM/SIGINT, or a component exiting): the API is told to exit; the monitor and the chat.db reader stop first, so no new events arrive; then the loop drains in-flight steps (10s grace; a draining step can still send its reply); then the model client closes and the store closes. Unfinished steps resume from their checkpoints on the next start, and the send dedupe key (`reply:<task id>`) prevents a double reply.
 
 ## Spans and logs: `resonant.observability`

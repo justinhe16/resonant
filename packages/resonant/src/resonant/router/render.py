@@ -83,3 +83,39 @@ def render_projects(d: dict[str, Any]) -> str:
         hint = "" if d.get("all") is True else " (/projects all)"
         lines.append(f"+{hidden} more{hint}")
     return "\n".join(lines)
+
+
+def _gb(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return "?"
+    return f"{value / 1e9:.1f} GB"
+
+
+def render_disk(d: dict[str, Any]) -> str:
+    """``/disk``: ``Disk: / 120.3 GB free of 494.4 GB (76% used)``, one line per path."""
+    lines: list[str] = []
+    for item in (as_dict(x) for x in as_list(d.get("disk"))):
+        pct = item.get("used_pct")
+        used = f"{pct:g}%" if isinstance(pct, int | float) and not isinstance(pct, bool) else "?"
+        lines.append(
+            f"{item.get('path', '?')} {_gb(item.get('free_bytes'))} free of "
+            f"{_gb(item.get('total_bytes'))} ({used} used)"
+        )
+    if not lines:
+        return "Disk: unknown."
+    return "Disk: " + "\n".join(lines) if len(lines) == 1 else "Disk:\n" + "\n".join(lines)
+
+
+def render_logs(d: dict[str, Any]) -> str:
+    """``/logs``: the scrubbed lines, oldest first, within one iMessage chunk."""
+    lines = [str(x) for x in as_list(d.get("lines"))]
+    if not lines:
+        return "No log lines."
+    kept: list[str] = []
+    size = 0
+    for line in reversed(lines):  # keep the newest when it doesn't all fit
+        if size + len(line) + 1 > MAX_REPLY_CHARS:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    return "\n".join(reversed(kept))
