@@ -193,7 +193,7 @@ Critical-job LaunchAgents run `resonant job-guard --job <ext>/<id> -- <cmd>`. It
 
 On-call autonomy checks `paused` before acting.
 
-## Approvals: binding, codes, and the classifier
+## Approvals: binding, codes, and replies
 
 Request (`resonant.gate.codes`):
 - `new_code(pending)` returns 2 characters, a letter then a digit, with no look-alikes, unique among pending approvals.
@@ -214,22 +214,32 @@ Request (`resonant.gate.codes`):
 - It arrived as iMessage, not SMS, or from the mapped Slack user.
 - It maps to exactly one pending, unexpired approval. With several pending, the code is required. If it's ambiguous, re-ask and never guess.
 
-**Two-stage decision** (Phase 2):
-1. **Deterministic parser.** It recognizes yes/no/approve/deny/👍/👎, `yes with comments: …`, and an optional code, case-insensitive.
-2. **Approval classifier**, only if the parser fails.
-   - It is separate from the router and uses a small, focused prompt.
-   - Its input is the reply text and the summary, and nothing else: no tool output and no external content.
-   - Its output is `{decision: approve|deny|unclear, approval_code, comments, confidence}`.
-   - It approves only if `decision == approve` and `confidence >= 0.9`. Anything else is unclear and gets a re-ask.
+**Reply parser** (`resonant.gate.replies`, Phase 2 is parser-only):
 
-**Batch approvals:** when an approver has several pending approvals, Resonant may send one *batch message* that lists their codes. The batch snapshot is stored.
-- A `yes all` reply approves **exactly the approvals in that snapshot**: never ones that arrived later, never pay, and never any the replier isn't an approver for.
-- The audit log records the batch id and each approval it resolved.
-- Outside a batch reply, a plain `yes` with several approvals pending is ambiguous and gets a re-ask.
+```python
+parse_reply(text, *, truncated=False) -> ParsedReply | None
+ParsedReply(decision: approve|deny, code=None, comments=None)   # code uppercase
+normalize_reply(text) -> str   # NFKC, straight quotes, collapsed whitespace
+MAX_COMMENTS_LEN = 500
+```
+
+- The whole message must match, after normalization and ignoring (ASCII) case:
+  - `(yes|approve|👍)( <code>)?` and `<code> yes`
+  - `(no|deny|👎)( <code>)?` and `<code> no`
+  - `yes( <code>)? with comments: <text>`, where `text` is 1–500 characters and is kept verbatim
+- Outside comments, a trailing run of `.` and `!` is dropped (`Yes.`, `yes!!`, `yes A7.`). `?` never is: `yes?` is a question.
+- 👍 and 👎 may carry a skin tone and the emoji presentation selector.
+- A code must come from the `new_code` alphabet, so look-alikes (`A1`, `O7`) never match.
+- Anything else returns None: `y`, `ok`, `sure`, `yes?`, `yes all`, `yes A7 and C4`, a pasted prompt, or text with invisible characters. A `truncated` payload is never a reply.
+- The parser only reads text. Binding (approvers, single pending, `require_code`, sent-before) is the gate's job.
+
+**Deferred** (C4): the approval classifier, `resonant eval approvals`, and batch approvals (`yes all`). `open_batch` stays `NotImplementedError`, and `ApprovalReply.path` is always `"parser"` for now. With several approvals pending, a plain `yes` gets a re-ask that lists the codes. The design kept for later:
+- **Classifier**, only if the parser fails. It is separate from the router and uses a small, focused prompt. Its input is the reply text and the summary, and nothing else. Its output is `{decision: approve|deny|unclear, approval_code, comments, confidence}`. It approves only if `decision == approve` and `confidence >= 0.9`; anything else gets a re-ask.
+- **Batch approvals:** one batch message lists an approver's pending codes, and its snapshot is stored. `yes all` approves **exactly the approvals in that snapshot**: never ones that arrived later, never pay, and never any the replier isn't an approver for. The audit log records the batch id and each approval it resolved.
 
 **Concurrency:** resolution is atomic (`UPDATE approvals … WHERE status = 'pending'`), so the first valid reply on any channel wins. On-call pages (Phase 6) go to iMessage and Slack together with one dedupe key; the other channel's message is updated to "resolved by X via Y".
 
-**Pay:** only a deterministic exact match that includes the code (`yes P3`) counts. The classifier is never used, and the same rule applies on Slack.
+**Pay:** only a parser match that includes the code (`yes P3`) counts. The classifier is never used for pay, and the same rule applies on Slack.
 
 **Comments:** `yes with comments: …` approves and appends a `human_input` event to the task, which the runner treats as a constraint.
 

@@ -3,7 +3,7 @@
 The example sets here are synthetic. Your real sets, built from your own texts, live outside the public repo in `~/.resonant/evals/` and are passed with `--set`.
 
 - `router.example.jsonl`: `{text, intent}` pairs for the router. Run with `resonant eval router`.
-- `approvals.example.jsonl`: replies to approval requests covering yes/no/ambiguous/sarcasm/unrelated/pay, with the expected decision and which path (`parser` or `classifier`) should decide (Phase 2).
+- `approvals.example.jsonl`: replies to approval requests covering yes/no/ambiguous/sarcasm/unrelated/pay, with the expected decision and which path (`parser` or `classifier`) should decide. Phase 2 is parser-only: `tests/test_gate_replies.py` checks the parser lines, and the classifier, sarcasm and unrelated lines must not parse. The classifier and `resonant eval approvals` are deferred.
 
 ## Router eval
 
