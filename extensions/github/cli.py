@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""github extension CLI: open PRs, one PR, a stateless CI/review watch, a daily digest.
+"""github extension CLI: PRs, a stateless CI/review watch, a digest, and two gated writes.
 
 Stdlib only and a single file: Resonant runs it as ``python -I -S cli.py``, so nothing next to
 it is importable. Every GitHub call goes through the ``gh`` CLI with the Keychain token
 (``RESONANT_SECRET_TOKEN``) passed as ``GH_TOKEN`` in gh's own environment only.
 
 Tools print one JSON object on stdout and exit 0. Any failure prints one line to stderr and
-exits 1; this extension only reads, so a failed run changed nothing.
+exits 1, and a failed run changed nothing: the writes (``rerun_failed``, ``merge_pr``) check
+everything before their first mutating ``gh`` call, and once one has gone through they report
+success with what happened rather than exit 1.
 
 ``watch`` keeps no state. It derives events from GitHub's current state, each with a
 deterministic ``dedupe_key``, and Resonant's events table (UNIQUE on the key) is the memory.
@@ -62,6 +64,20 @@ PR_VIEW_FIELDS = (
     "createdAt,updatedAt"
 )
 RUN_FIELDS = "databaseId,workflowName,status,conclusion,headSha,createdAt"
+MERGE_VIEW_FIELDS = (
+    "number,title,url,state,isDraft,headRefName,headRefOid,mergeable,mergeStateStatus,"
+    "statusCheckRollup"
+)
+# Merge states gh can't merge without --admin (which this extension never passes) or a fix.
+_UNMERGEABLE_STATES = {
+    "BLOCKED": "blocked by branch protection (required reviews or checks)",
+    "BEHIND": "behind its base branch; update it first",
+    "DIRTY": "in conflict with its base branch",
+    "DRAFT": "a draft",
+    "UNKNOWN": "still being checked for mergeability by GitHub; try again in a minute",
+}
+_SHA = re.compile(r"^[0-9a-f]{7,64}$")
+_DENIED = ("HTTP 403", "Resource not accessible", "must have admin rights", "permission")
 
 
 class Failed(Exception):
@@ -127,6 +143,15 @@ class Gh:
             self.env["TMPDIR"] = tmp
 
     def json(self, *args: str) -> Any:
+        out = self.text(*args)
+        try:
+            return json.loads(out)
+        except ValueError:
+            raise Failed(f"gh {args[0]} returned invalid JSON") from None
+
+    def text(self, *args: str, need: str = "") -> str:
+        """``gh``'s stdout. ``need`` names the token permission a write call needs, so a
+        permission error reads as what to widen rather than gh's raw HTTP text."""
         try:
             proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
                 [self.path, *args],
@@ -143,11 +168,13 @@ class Gh:
             raise Failed(f"gh could not run: {type(e).__name__}") from None
         if proc.returncode != 0:
             tail = self.redact(" ".join(proc.stderr.split()))[-200:]
+            if need and any(d.lower() in tail.lower() for d in _DENIED):
+                raise Failed(
+                    f"the token can't do this: it needs {need} (see the github extension "
+                    "README); nothing was changed"
+                )
             raise Failed(f"gh {args[0]} failed (exit {proc.returncode}): {tail}")
-        try:
-            return json.loads(proc.stdout)
-        except ValueError:
-            raise Failed(f"gh {args[0]} returned invalid JSON") from None
+        return proc.stdout
 
     def redact(self, text: str) -> str:
         return text.replace(self.token, "[redacted]")
@@ -282,11 +309,15 @@ def cmd_prs(gh: Gh) -> dict[str, Any]:
     return {"summary": summary, "prs": mine, "review_requested": review, "truncated": truncated}
 
 
-def cmd_pr(gh: Gh, repo: str, number: int) -> dict[str, Any]:
+def check_target(repo: str, number: int) -> None:
     if not _REPO.match(repo):
         raise Failed("repo must look like owner/name")
     if number <= 0:
         raise Failed("number must be a positive integer")
+
+
+def cmd_pr(gh: Gh, repo: str, number: int) -> dict[str, Any]:
+    check_target(repo, number)
     v = _d(gh.json("pr", "view", str(number), "--repo", repo, "--json", PR_VIEW_FIELDS))
     ci, failing, checks = checks_of(_l(v.get("statusCheckRollup")))
     return {
@@ -415,19 +446,165 @@ def cmd_health(gh: Gh) -> dict[str, Any]:
     return {"ok": True, "login": _s(user.get("login"))}
 
 
+# --- writes ----------------------------------------------------------------------------
+
+
+def rerun_targets(head_sha: str, runs: list[Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """``(runs to rerun, workflows already running)`` on ``head_sha``: per workflow, its
+    latest run on the head, if that run failed. A workflow whose latest run is queued or in
+    progress (e.g. already re-running) is left alone."""
+    latest: dict[str, dict[str, Any]] = {}
+    for r in sorted(
+        (_d(r) for r in runs if isinstance(_d(r).get("databaseId"), int)),
+        key=lambda r: (_s(r.get("createdAt")), r["databaseId"]),
+    ):
+        if _s(r.get("headSha")) == head_sha:
+            latest[_s(r.get("workflowName"))] = r
+    failed = [
+        r
+        for _, r in sorted(latest.items())
+        if _s(r.get("status")) == "completed" and _s(r.get("conclusion")) in FAILED
+    ]
+    running = [w for w, r in sorted(latest.items()) if _s(r.get("status")) != "completed"]
+    return failed, running
+
+
+def cmd_rerun_failed(gh: Gh, repo: str, number: int) -> dict[str, Any]:
+    """Re-runs the failed jobs of every failed workflow run on the PR's current head."""
+    check_target(repo, number)
+    v = _d(gh.json("pr", "view", str(number), "--repo", repo, "--json", MERGE_VIEW_FIELDS))
+    pr = {"repo": repo, "number": number}
+    branch, head = _s(v.get("headRefName")), _s(v.get("headRefOid"))
+    if _s(v.get("state")).upper() != "OPEN":
+        raise Failed(f"{ref(pr)} is {_s(v.get('state')).lower() or 'not open'}; nothing to rerun")
+    if not branch or not _SHA.match(head):
+        raise Failed(f"gh pr view returned no head for {ref(pr)}")
+    runs = gh.json(
+        "run",
+        "list",
+        "--repo",
+        repo,
+        "--branch",
+        branch,
+        "--json",
+        RUN_FIELDS,
+        "--limit",
+        str(RUN_LIMIT),
+    )
+    failed, running = rerun_targets(head, _l(runs))
+    if not failed:
+        why = f"{', '.join(running)} still running" if running else "no failed runs"
+        raise Failed(f"nothing to rerun on {ref(pr)} ({head[:7]}): {why}")
+    rerun: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for r in failed:
+        try:
+            gh.text(
+                "run",
+                "rerun",
+                str(r["databaseId"]),
+                "--repo",
+                repo,
+                "--failed",
+                need="Actions: write",
+            )
+        except Failed as e:
+            if not rerun:
+                raise  # nothing has changed yet: fail the whole call
+            errors.append(f"{clip(_s(r.get('workflowName')), 60)}: {e}")
+            continue
+        rerun.append({"workflow": clip(_s(r.get("workflowName")), 60), "run_id": r["databaseId"]})
+    names = ", ".join(r["workflow"] for r in rerun)
+    summary = f"re-running failed jobs on {ref(pr)} ({head[:7]}): {names}"
+    if errors:
+        summary += f"; {len(errors)} could not be re-run"
+    return {
+        "summary": clip(summary, TEXT_MAX),
+        "repo": repo,
+        "number": number,
+        "head_sha": head,
+        "rerun": rerun,
+        "errors": errors,
+        "already_running": running,
+    }
+
+
+def cmd_merge_pr(gh: Gh, repo: str, number: int, head_sha: str) -> dict[str, Any]:
+    """Squash-merges the PR, only if its head is still ``head_sha`` (what was approved),
+    CI is green and GitHub says it's mergeable. Never ``--admin``."""
+    check_target(repo, number)
+    want = head_sha.lower()
+    if not _SHA.match(want):
+        raise Failed("head_sha must be the PR's head commit SHA (at least 7 hex characters)")
+    pr = {"repo": repo, "number": number}
+    v = _d(gh.json("pr", "view", str(number), "--repo", repo, "--json", MERGE_VIEW_FIELDS))
+    state = _s(v.get("state")).upper()
+    head = _s(v.get("headRefOid")).lower()
+    if state == "MERGED":
+        raise Failed(f"{ref(pr)} is already merged")
+    if state != "OPEN":
+        raise Failed(f"{ref(pr)} is {state.lower() or 'not open'}; not merging")
+    if not _SHA.match(head):
+        raise Failed(f"gh pr view returned no head for {ref(pr)}")
+    if not head.startswith(want):
+        raise Failed(
+            f"{ref(pr)} has new commits since it was approved (head {head[:7]}, approved "
+            f"{want[:7]}); not merging"
+        )
+    if v.get("isDraft") is True:
+        raise Failed(f"{ref(pr)} is a draft; not merging")
+    ci, failing, _ = checks_of(_l(v.get("statusCheckRollup")))
+    if ci == "failing":
+        raise Failed(f"{ref(pr)} has failing checks ({', '.join(failing[:5])}); not merging")
+    if ci == "pending":
+        raise Failed(f"{ref(pr)} still has checks running; not merging")
+    merge_state = _s(v.get("mergeStateStatus")).upper()
+    if merge_state in _UNMERGEABLE_STATES:
+        raise Failed(f"{ref(pr)} is {_UNMERGEABLE_STATES[merge_state]}; not merging")
+    if _s(v.get("mergeable")).upper() != "MERGEABLE":
+        raise Failed(f"{ref(pr)} is not mergeable ({_s(v.get('mergeable')).lower()})")
+    # --match-head-commit makes GitHub itself refuse if the head moved since this check.
+    gh.text(
+        "pr",
+        "merge",
+        str(number),
+        "--repo",
+        repo,
+        "--squash",
+        "--match-head-commit",
+        head,
+        need="Contents: write and Pull requests: write",
+    )
+    return {
+        "summary": f"merged {ref(pr)} (squash) at {head[:7]}",
+        "repo": repo,
+        "number": number,
+        "head_sha": head,
+        "method": "squash",
+        "url": _s(v.get("url")),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="github")
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("prs", "watch", "digest", "health"):
         sub.add_parser(name)
-    p = sub.add_parser("pr")
-    p.add_argument("--repo", required=True)
-    p.add_argument("--number", required=True, type=int)
+    for name in ("pr", "rerun_failed", "merge_pr"):
+        p = sub.add_parser(name)
+        p.add_argument("--repo", required=True)
+        p.add_argument("--number", required=True, type=int)
+        if name == "merge_pr":
+            p.add_argument("--head-sha", required=True)
     args = parser.parse_args(argv)
     try:
         gh = Gh()
         if args.cmd == "pr":
             out = cmd_pr(gh, args.repo, args.number)
+        elif args.cmd == "rerun_failed":
+            out = cmd_rerun_failed(gh, args.repo, args.number)
+        elif args.cmd == "merge_pr":
+            out = cmd_merge_pr(gh, args.repo, args.number, args.head_sha)
         else:
             out = {"prs": cmd_prs, "watch": cmd_watch, "digest": cmd_digest, "health": cmd_health}[
                 args.cmd
