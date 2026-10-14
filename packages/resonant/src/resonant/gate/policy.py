@@ -175,7 +175,7 @@ class PolicyGate:
             return Deny(f"args contain unsafe characters ({len(unsafe)} found)")
         l0_read = intent.effect is Effect.READ and intent.level is Level.L0
         if self.dry_run and not l0_read and not is_store_internal(intent.spec):
-            return DryRun(would=summarize(intent))
+            return DryRun(would=self._summary(intent))
         verdict = rule(intent.level, intent.origin, autonomy)
         if verdict == "allow" and intent.level is Level.L0:
             return self._allow(intent)
@@ -185,6 +185,11 @@ class PolicyGate:
         if verdict == "allow":
             return self._allow(intent)
         return self._ask(intent, now, last, require_code=verdict == "ask_code")
+
+    def _summary(self, intent: Intent) -> str:
+        """The code-built summary, with the tool's action heading if it has one."""
+        action = self.actions.get((intent.extension, intent.tool))
+        return summarize(intent, action=action(intent) if action else None)
 
     def _allow(self, intent: Intent, approval_id: str | None = None) -> Allow:
         token = secrets.token_urlsafe(16)
@@ -205,14 +210,13 @@ class PolicyGate:
         task = self.conn.execute("SELECT 1 FROM tasks WHERE id = ?", (intent.task_id,))
         if task.fetchone() is None:
             return Deny(NO_TASK)  # e.g. the router's fast path: nothing could wait
-        action = self.actions.get((intent.extension, intent.tool))
         spec = ap.NewApproval(
             task_id=intent.task_id,
             intent_hash=intent.hash,
             tool=intent.tool,
             effect=intent.effect,
             level=intent.level,
-            summary=summarize(intent, action=action(intent) if action else None),
+            summary=self._summary(intent),
             approvers=(self.principals.owner,),  # global scope is owner-only
             code=new_code(ap.pending_codes(self.conn)),
             expires_at=now + self.ttl,

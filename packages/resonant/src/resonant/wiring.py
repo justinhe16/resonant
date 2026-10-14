@@ -14,11 +14,16 @@ Lifecycle (the daemon drives it)::
     await stack.aclose()     # close the model client's HTTP pool
 
 Step limit. ``LocalRunner`` defaults to ``max_step_s=30`` but one step can make up to
-``MAX_TOOL_ITERATIONS + 1`` model calls of ``model.timeout_s`` (60s) each. A step limit below
-that would cancel a slow-but-healthy step before the model client's own timeout could turn
-it into the templated fallback reply. So the step limit is derived from the model timeout
-(``local_step_limit``): the model client times out first and the user always gets an
-answer; the loop's stuck check stays a backstop for a wedged step.
+``MAX_TOOL_ITERATIONS + 1`` model calls of ``model.timeout_s`` (60s) each, or run one tool
+for up to its ``timeout_s`` (``update_resonant``: 360s). A step limit below either would
+cancel a slow-but-healthy step: before the model client's own timeout could turn it into the
+templated fallback reply, or mid-``/update`` into an ambiguous outcome. So the step limit is
+the larger of the two plus slack (``local_step_limit``): the model client and the executor
+time out first and the user always gets an answer; the loop's stuck check stays a backstop
+for a wedged step.
+
+Back up. After a restart the owner asked for (``restart_resonant``, ``update_resonant``),
+``IMessageStack.start`` sends ``Back up (<commit>), down Ns`` once (``resonant.ops.back_up``).
 
 Reminders. ``runner="reminder"`` sends due reminders through the iMessage channel, so it is
 registered here, not in Phase 0. ``add_reminder`` only runs inside the loop (the router or a
@@ -33,7 +38,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 
 from resonant.components import Components
@@ -43,18 +48,24 @@ from resonant.gateway.imessage.sender import OsaRunner
 from resonant.loop import Loop
 from resonant.models import ModelClient
 from resonant.monitor import HealthMonitor
+from resonant.ops import back_up
 from resonant.router import Router
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
 from resonant.runners.reminder import ReminderRunner
+from resonant_sdk import ToolSpec
 
 log = logging.getLogger(__name__)
 
 STEP_SLACK_S = 15.0  # sends, tool reads and bookkeeping on top of the model calls
 
 
-def local_step_limit(model: ModelConfig) -> float:
-    """``max_step_s`` for the local runner: every model call it may make, plus slack."""
-    return (MAX_TOOL_ITERATIONS + 1) * model.timeout_s + STEP_SLACK_S
+def local_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> float:
+    """``max_step_s`` for the local runner: every model call it may make, or the longest
+    tool timeout (so ``/update`` is never cancelled mid-run), whichever is larger, plus
+    slack."""
+    model_s = (MAX_TOOL_ITERATIONS + 1) * model.timeout_s
+    tool_s = max((t.timeout_s for t in tools), default=0.0)
+    return max(model_s, tool_s) + STEP_SLACK_S
 
 
 @dataclass
@@ -65,6 +76,7 @@ class IMessageStack:
     reminders: ReminderRunner
     monitor: HealthMonitor
     model: ModelClient
+    owner: str | None = None  # gets "back up" after a requested restart
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     _started: bool = field(default=False, repr=False)
 
@@ -74,10 +86,16 @@ class IMessageStack:
         return self._started
 
     async def start(self, loop: Loop) -> None:
-        """Start the chat.db reader; its events go to ``loop.submit``."""
+        """Start the chat.db reader (its events go to ``loop.submit``), then say "back up"
+        if this start follows a restart the owner asked for."""
         await self.channel.start(loop.submit)
         self._started = True
         log.info("imessage channel started")
+        try:
+            if await back_up(self.channel.conn, self.channel, self.owner):
+                log.info("sent back-up message after a requested restart")
+        except Exception:
+            log.exception("back-up message failed")  # never blocks the start
 
     async def stop(self) -> None:
         """Stop the monitor and the reader. Safe to call twice or before ``start``."""
@@ -132,7 +150,7 @@ def build_imessage_stack(
         model=model,
     )
     runner = components.register_local_runner(conn, model=model, channel=channel)
-    runner.max_step_s = local_step_limit(settings.model)
+    runner.max_step_s = local_step_limit(settings.model, components.registry.specs())
     loop.runners[runner.name] = runner
     reminders = ReminderRunner(conn, channel=channel, timezone=settings.timezone)
     components.runners[reminders.name] = reminders
@@ -156,5 +174,6 @@ def build_imessage_stack(
         reminders=reminders,
         monitor=monitor,
         model=model,
+        owner=owner,
         _close_model=close_model,
     )

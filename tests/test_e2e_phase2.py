@@ -11,11 +11,12 @@ own gate and executor inside a loop step, the way a runner will.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import socket
 import sqlite3
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -33,9 +34,11 @@ from resonant.gate import Allow, DryRun, Intent, NeedsApproval, PolicyGate
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.loop.types import PRIORITY_OWNER, Done, StepContext, StepOutcome, Task, Wait
+from resonant.ops import mark_restart, restart_pending
+from resonant.ops.fakes import FakeOpsRunner
 from resonant.runners.reminder import ReminderRunner
 from resonant.store.db import iso, kv_set, utcnow
-from resonant_sdk import Effect, Event, Level, ToolSpec
+from resonant_sdk import Event
 
 OWNER_PHONE = "+15551234567"
 SELF = "resonant.agent@icloud.com"
@@ -45,16 +48,6 @@ principals:
     role: owner
     identities: ["imessage:{OWNER_PHONE}"]
 """
-
-# A non-exempt side effect standing in for the ops tools until P2-14 registers them.
-FAKE_OPS = ToolSpec(
-    name="fake_restart",
-    description="Restart something (test stand-in for an ops tool).",
-    args_schema={"type": "object", "properties": {}, "additionalProperties": False},
-    effect=Effect.WRITE,
-    level=Level.L3,
-    timeout_s=5.0,
-)
 
 
 def free_port() -> int:
@@ -115,7 +108,7 @@ class Running:
     chat: FakeChatDB
     port: int
     script: ScriptRunner
-    fake_ops_calls: list[dict[str, Any]]
+    ops: FakeOpsRunner
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -174,7 +167,14 @@ async def running(
     resonant_home: Path, chat: FakeChatDB, caplog: pytest.LogCaptureFixture
 ) -> AsyncIterator[Running]:
     """The daemon with iMessage on and the default ``dry_run: true``."""
-    (resonant_home / "principals.yaml").write_text(PRINCIPALS)
+    caplog.set_level(logging.INFO, logger="resonant.daemon")
+    async with start_daemon(resonant_home, chat) as r:
+        yield r
+
+
+def build_daemon(home: Path, chat: FakeChatDB, ops: FakeOpsRunner) -> Running:
+    """A daemon with iMessage on, fakes for osascript, the model and ops subprocesses."""
+    (home / "principals.yaml").write_text(PRINCIPALS)
     port = free_port()
     settings = load_settings(
         api={"port": port},
@@ -183,29 +183,31 @@ async def running(
         },
     )
     osa = RecordingOsaRunner()
-    daemon = Daemon(settings, model=ScriptedModel(), osa_runner=osa)
+    daemon = Daemon(settings, model=ScriptedModel(), osa_runner=osa, ops_runner=ops)
     kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
     components = daemon.state.components
     assert components is not None
-    fake_ops_calls: list[dict[str, Any]] = []
-
-    async def fake_ops(args: dict[str, Any]) -> dict[str, Any]:
-        fake_ops_calls.append(args)
-        return {"restarted": True}
-
-    components.registry.register(FAKE_OPS)
-    components.handlers[(None, FAKE_OPS.name)] = fake_ops
     script = ScriptRunner(components)
     daemon.loop.runners[script.name] = script
+    return Running(daemon, osa, chat, port, script, ops)
 
-    caplog.set_level(logging.INFO, logger="resonant.daemon")
-    run = asyncio.create_task(daemon.run())
-    assert daemon.imessage is not None
-    channel = daemon.imessage.channel
+
+@contextlib.asynccontextmanager
+async def start_daemon(
+    home: Path, chat: FakeChatDB, before_run: Callable[[Running], None] | None = None
+) -> AsyncGenerator[Running]:
+    r = build_daemon(home, chat, FakeOpsRunner())
+    if before_run is not None:
+        before_run(r)
+    run = asyncio.create_task(r.daemon.run())
+    assert r.daemon.imessage is not None
+    channel = r.daemon.imessage.channel
     await wait_until(lambda: channel.health()["last_read_at"] is not None, 10)
-    yield Running(daemon, osa, chat, port, script, fake_ops_calls)
-    daemon.stop()
-    assert await asyncio.wait_for(run, 10) == 0
+    try:
+        yield r
+    finally:
+        r.daemon.stop()
+        assert await asyncio.wait_for(run, 10) == 0
 
 
 # --- wiring (P2-9) ---------------------------------------------------------------------
@@ -272,7 +274,7 @@ async def test_e15_dry_run_runs_store_tools_and_holds_back_the_rest(running: Run
     calls = await r.run_script(
         {"tool": "add_note", "args": {"text": "buy milk"}},
         {"tool": "add_reminder", "args": {"at": due.isoformat(), "text": "stretch"}},
-        {"tool": FAKE_OPS.name},
+        {"tool": "restart_ollama"},
         {"tool": "clear_notes"},
     )
     assert [c["decision"] for c in calls] == ["Allow", "Allow", "DryRun", "NeedsApproval"]
@@ -283,8 +285,8 @@ async def test_e15_dry_run_runs_store_tools_and_holds_back_the_rest(running: Run
 
     # The non-exempt write was held back and never reached its handler.
     dry = r.script.decisions[2]
-    assert isinstance(dry, DryRun) and dry.would == "fake restart"
-    assert r.fake_ops_calls == []
+    assert isinstance(dry, DryRun) and dry.would == "restart Ollama"
+    assert r.ops.calls == [] and r.ops.spawned == []
 
     # L1 still asks with a code (the task waits on it); the summary is the notes hook's.
     asked = r.script.decisions[3]
@@ -299,3 +301,50 @@ async def test_e15_dry_run_runs_store_tools_and_holds_back_the_rest(running: Run
     assert utcnow() >= due
     (task,) = r.rows("SELECT status FROM tasks WHERE runner = 'reminder'")
     assert task["status"] == "done"
+
+
+async def test_e15_dry_run_ops_reply(running: Running) -> None:
+    """``/restart ollama`` under dry_run: the local runner's templated reply, no subprocess."""
+    r = running
+    r.daemon.loop.create_task(
+        NewTask(
+            kind="command",
+            runner="local",
+            priority=PRIORITY_OWNER,
+            principal="justin",
+            checkpoint={
+                "direct_call": {"tool": "restart_ollama", "args": {}},
+                "title": "/restart ollama",
+            },
+        )
+    )
+    sent = await r.osa.wait_for(1, 10)
+    assert (sent.handle, sent.text) == (OWNER_PHONE, "Dry run: would restart Ollama")
+    assert r.ops.calls == [] and r.ops.spawned == []
+
+
+# --- "back up" (P2-14) -------------------------------------------------------------------
+
+
+async def test_normal_start_sends_no_back_up(running: Running) -> None:
+    await asyncio.sleep(0.2)
+    assert running.osa.sent == []
+    assert restart_pending(running.conn) is None
+
+
+async def test_back_up_once_after_a_requested_restart(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    def marked(r: Running) -> None:
+        mark_restart(r.conn, by="justin", commit="abc1234", now=utcnow() - timedelta(seconds=6))
+
+    async with start_daemon(resonant_home, chat, before_run=marked) as r:
+        sent = await r.osa.wait_for(1, 10)
+        assert sent.handle == OWNER_PHONE
+        assert sent.text.startswith("Back up (abc1234), down ")
+        assert restart_pending(r.conn) is None
+
+    # The next start (no restart requested) says nothing.
+    async with start_daemon(resonant_home, chat) as r:
+        await asyncio.sleep(0.2)
+        assert r.osa.sent == []

@@ -42,6 +42,11 @@ NAMES = {
     "list_reminders",
     "cancel_reminder",
     "projects",
+    "disk",
+    "recent_logs",
+    "restart_ollama",
+    "restart_resonant",
+    "update_resonant",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {
@@ -50,6 +55,9 @@ WRITES = {
     "clear_notes": Level.L1,
     "add_reminder": Level.L3,
     "cancel_reminder": Level.L3,
+    "restart_ollama": Level.L3,
+    "restart_resonant": Level.L2,
+    "update_resonant": Level.L2,
 }
 
 

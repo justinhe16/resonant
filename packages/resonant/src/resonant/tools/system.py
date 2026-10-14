@@ -90,7 +90,7 @@ async def memory_pressure(timeout_s: float = MEMORY_PRESSURE_TIMEOUT_S) -> dict[
     return {"level": level, "free_pct": int(match.group(1)) if match else None}
 
 
-def _disk(path: str) -> dict[str, Any]:
+def disk_usage(path: str) -> dict[str, Any]:
     try:
         u = psutil.disk_usage(path)
     except OSError:
@@ -106,9 +106,9 @@ async def system_status(home: str) -> dict[str, Any]:
         load = None
     vm = psutil.virtual_memory()
     swap = psutil.swap_memory()
-    disks = [_disk("/")]
+    disks = [disk_usage("/")]
     if home != "/":
-        disks.append(_disk(home))
+        disks.append(disk_usage(home))
     return {
         # Since the previous call (primed at registration), so it never blocks.
         "cpu_percent": psutil.cpu_percent(interval=None),

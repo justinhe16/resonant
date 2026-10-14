@@ -31,6 +31,7 @@ from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop.echo import EchoRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS
 from resonant.store.db import iso, kv_set, utcnow
+from resonant.tools.ops import RESTART_OLLAMA, UPDATE_RESONANT
 from resonant.wiring import local_step_limit
 
 OWNER_PHONE = "+15551234567"
@@ -166,7 +167,11 @@ async def test_enabled_daemon_wires_router_runner_and_monitor(running: Running) 
     assert d.loop.runners["local"] is d.imessage.runner
     assert d.state.components is not None
     assert d.state.components.runners["local"] is d.imessage.runner
-    assert d.imessage.runner.max_step_s == local_step_limit(d.settings.model)
+    specs = d.state.components.registry.specs()
+    assert d.imessage.runner.max_step_s == local_step_limit(d.settings.model, specs)
+    # /update (the longest tool) is never cancelled mid-run.
+    limit = d.imessage.runner.max_step_s
+    assert limit is not None and limit >= UPDATE_RESONANT.timeout_s + 15
     assert d.imessage.monitor.owner == "justin"
     async with httpx.AsyncClient() as client:
         channels = (await client.get(f"http://127.0.0.1:{running.port}/api/channels")).json()
@@ -177,6 +182,16 @@ def test_step_limit_outlasts_every_model_call() -> None:
     cfg = ModelConfig(timeout_s=60)
     assert local_step_limit(cfg) > (MAX_TOOL_ITERATIONS + 1) * cfg.timeout_s
     assert local_step_limit(ModelConfig(timeout_s=5)) < local_step_limit(cfg)
+
+
+def test_step_limit_outlasts_the_longest_tool() -> None:
+    short = ModelConfig(timeout_s=5)
+    assert local_step_limit(short, [UPDATE_RESONANT, RESTART_OLLAMA]) == (
+        UPDATE_RESONANT.timeout_s + 15
+    )
+    # The model-based limit wins when it is longer.
+    long = ModelConfig(timeout_s=120)
+    assert local_step_limit(long, [UPDATE_RESONANT]) == (MAX_TOOL_ITERATIONS + 1) * 120 + 15
 
 
 # --- the "what's running?" flow (fast path) --------------------------------------------
