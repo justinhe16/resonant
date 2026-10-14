@@ -12,10 +12,11 @@ from typing import Any
 
 from test_briefing import (
     CTX,
+    LA,
     OWNER,
+    TZ,
     Harness,
     approval,
-    degrade,
     harness,
     local,
 )
@@ -25,7 +26,7 @@ from resonant.extensions import notify
 from resonant.extensions import pulse_job as pj
 from resonant.extensions.scheduler import CORE_JOBS, Scheduler
 from resonant.store import pulse as ps
-from resonant.store.db import atomic, kv_set
+from resonant.store.db import atomic, kv_get, kv_set
 
 T9 = local(10, 13, 9)  # 09:00 PDT: a normal hour
 MANUAL = {"enabled": True}
@@ -94,7 +95,7 @@ async def test_sends_one_btw_message_with_changed_items_then_nothing() -> None:
         assert h.channel.sent == [
             (
                 OWNER,
-                "btw:\n[trader] PnL -$1.8k today\n[dori] ✓ Dori recovered",
+                "btw:\n[dori] ✓ Dori recovered\n[trader] PnL -$1.8k today",
                 "pulse:2026-10-13:09",
             )
         ]
@@ -110,14 +111,14 @@ async def test_sends_one_btw_message_with_changed_items_then_nothing() -> None:
         assert h.channel.texts()[-1] == "btw:\n[trader] PnL -$2.5k today"
 
 
-async def test_urgent_held_items_come_first_with_a_marker_and_newest_first() -> None:
+async def test_urgent_held_items_come_first_with_a_marker_and_oldest_first() -> None:
     async with harness() as h:
         report(h, "a", "k1", "older normal", at=T9 - timedelta(minutes=50))
         report(h, "a", "k2", "newer normal", at=T9 - timedelta(minutes=10))
         report(h, "dori", "k", "Dori failing", urgency="urgent", at=T9 - timedelta(minutes=40))
         await pulse(h, T9)
         assert h.channel.texts() == [
-            "btw:\n[dori] 🔴 Dori failing\n[a] newer normal\n[a] older normal"
+            "btw:\n[dori] 🔴 Dori failing\n[a] older normal\n[a] newer normal"
         ]
 
 
@@ -272,39 +273,6 @@ async def test_preview_is_the_pending_text_and_read_only() -> None:
 # --- core items ---------------------------------------------------------------------------------
 
 
-async def test_health_degrade_then_recover() -> None:
-    async with harness() as h:
-        degrade(h.db, "imessage")
-        await pulse(h, T9)
-        assert h.channel.texts() == ["btw:\n⚠ imessage degraded"]
-        await pulse(h, T9 + timedelta(hours=1))  # still degraded: nothing new
-        assert len(h.channel.sent) == 1
-        with atomic(h.db):
-            kv_set(h.db, "health.imessage", {"state": "ok"})
-        await pulse(h, T9 + timedelta(hours=2))
-        assert h.channel.texts()[-1] == "btw:\n✓ imessage recovered"
-        await pulse(h, T9 + timedelta(hours=3))
-        assert len(h.channel.sent) == 2
-        # Degrades again: said again.
-        degrade(h.db, "imessage")
-        await pulse(h, T9 + timedelta(hours=4))
-        assert h.channel.texts()[-1] == "btw:\n⚠ imessage degraded"
-
-
-async def test_health_blip_the_owner_never_heard_clears_silently() -> None:
-    async with harness() as h:
-        set_paused(h, True)
-        degrade(h.db, "model")
-        await pulse(h, T9)
-        with atomic(h.db):
-            kv_set(h.db, "health.model", {"state": "ok"})
-        set_paused(h, False)
-        await pulse(h, T9 + timedelta(hours=1))
-        assert h.channel.sent == []
-        item = ps.get(h.db, "core", "health/model")
-        assert item is not None and item.cleared and not item.changed
-
-
 async def test_approval_is_mentioned_once_after_the_remention_delay() -> None:
     async with harness() as h:
         base = local(10, 13, 9)
@@ -331,7 +299,7 @@ async def test_briefing_updates_section_lists_open_items_and_marks_them_told() -
         report(h, "dori", "k", "Dori failing", urgency="urgent")
         report(h, "trader", "pnl", "PnL -$1.8k")
         report(h, "github", "summary", "3 open PRs", urgency="low")
-        report(h, "core", "health/model", "⚠ model degraded")
+        report(h, "core", "approval/a7", "✋ A7 still waiting: x")  # core: never listed
         report(h, "dori", "gone", "Dori recovered", clear=True)  # cleared: not listed
         h.db.execute(  # one the owner already heard sorts last
             "UPDATE pulse_items SET told_fingerprint = fingerprint WHERE key = 'summary'"
@@ -339,11 +307,12 @@ async def test_briefing_updates_section_lists_open_items_and_marks_them_told() -
         out = await bf.send_briefing(h.db, h.channel, OWNER, tz="America/Los_Angeles", now=T9)
         ((_, text, _),) = h.channel.sent
         assert text == (
-            "Updates:\n[dori] 🔴 Dori failing\n⚠ model degraded\n[trader] PnL -$1.8k\n"
-            "[github] 3 open PRs"
+            "Updates:\n[dori] 🔴 Dori failing\n[trader] PnL -$1.8k\n[github] 3 open PRs"
         )
         assert "updates" in out["sections"]
-        assert told(h, "dori", "k") and told(h, "trader", "pnl") and told(h, "core", "health/model")
+        assert (
+            told(h, "dori", "k") and told(h, "trader", "pnl") and not told(h, "core", "approval/a7")
+        )
         assert not told(h, "dori", "gone")  # the held clear still rides the pulse
         # Told items stay listed while they are open.
         await bf.send_briefing(
@@ -397,3 +366,91 @@ def test_pulse_reply_texts() -> None:
     assert pulse_reply({"sent": False, "skipped": "paused"}) == "Paused: pulse not sent."
     assert pulse_reply({"sent": False, "skipped": "nothing"}) == "Nothing new to send."
     assert pulse_reply({"sent": False, "skipped": "unreachable"}) == "Can't send: no channel/owner."
+
+
+async def test_crash_between_send_and_told_with_a_new_item_pending_keeps_the_new_one() -> None:
+    async with harness() as h:
+        report(h, "a", "k", "x")
+        job_now = T9
+        # The send happened, then the process died before the items were marked.
+        text, shown = pj.compose(ps.pending(h.db, ("urgent", "normal"), job_now)) or ("", [])
+        with atomic(h.db):
+            kv_set(
+                h.db,
+                "pulse.inflight:pulse:2026-10-13:09",
+                {
+                    "text": text,
+                    "items": [[i.source, i.key, i.fingerprint] for i in shown],
+                    "sent": False,
+                    "at": job_now.isoformat(),
+                },
+            )
+        await h.channel.send(OWNER, text, dedupe_key="pulse:2026-10-13:09")
+        report(h, "a", "new", "arrived since", at=T9 + timedelta(minutes=5))
+        out = await pulse(h, T9, now=T9 + timedelta(minutes=10))
+        assert out == {"sent": True, "count": 1}
+        assert len(h.channel.sent) == 1  # the resend was dropped by the channel
+        assert told(h, "a", "k") and not told(h, "a", "new")
+        await pulse(h, T9 + timedelta(hours=1))
+        assert h.channel.texts()[-1] == "btw:\n[a] arrived since"
+
+
+async def test_scheduled_manual_scheduled_rerun_in_one_hour() -> None:
+    async with harness() as h:
+        report(h, "a", "k", "x")
+        assert (await pulse(h, T9))["sent"] is True
+        report(h, "a", "k2", "y", at=T9 + timedelta(minutes=5))
+        out = await pj.run_pulse_now(h.deps(h.channel), now=T9 + timedelta(minutes=10))
+        assert out == {"sent": True, "count": 1}
+        report(h, "a", "k3", "z", at=T9 + timedelta(minutes=15))
+        out = await pulse(h, T9, now=T9 + timedelta(minutes=20))  # catch-up rerun
+        assert out["skipped"] == "duplicate"
+        assert told(h, "a", "k2") and not told(h, "a", "k3")
+        assert h.channel.texts() == ["btw:\n[a] x", "btw:\n[a] y"]
+
+
+async def test_done_inflight_records_are_pruned_after_two_days() -> None:
+    async with harness() as h:
+        report(h, "a", "k", "x")
+        await pulse(h, T9)
+        assert kv_get(h.db, "pulse.inflight:pulse:2026-10-13:09") is not None
+        await pulse(h, T9 + timedelta(days=1))
+        assert kv_get(h.db, "pulse.inflight:pulse:2026-10-13:09") is not None
+        await pulse(h, T9 + timedelta(days=2, hours=1))
+        assert kv_get(h.db, "pulse.inflight:pulse:2026-10-13:09") is None
+
+
+async def test_dst_day_quiet_hours_and_key_follow_local_time() -> None:
+    spring = datetime(2027, 3, 14, 3, tzinfo=LA)  # 02:00 does not exist; 03:00 PDT
+    async with harness(at=spring) as h:
+        report(h, "a", "k", "x", at=spring)
+        assert (await pulse(h, spring))["skipped"] == "quiet"
+        six = datetime(2027, 3, 14, 6, tzinfo=LA)
+        assert (await pulse(h, six))["sent"] is True
+        assert h.channel.sent[0][2] == "pulse:2027-03-14:06"
+
+
+async def test_briefing_rerun_same_day_with_a_new_item_does_not_mark_it() -> None:
+    async with harness() as h:
+        report(h, "a", "k", "x")
+        await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T9)
+        report(h, "a", "new", "later", at=T9 + timedelta(minutes=5))
+        out = await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T9 + timedelta(minutes=10))
+        assert out["sent"] is True and len(h.channel.sent) == 1
+        assert told(h, "a", "k") and not told(h, "a", "new")
+        # A crash before the mark: the stored intent is resent and marks only its items.
+        key = "pulse.inflight:briefing:2026-10-13"
+        rec = kv_get(h.db, key)
+        kv_set(h.db, key, {**rec, "sent": False})
+        await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T9 + timedelta(minutes=20))
+        assert len(h.channel.sent) == 1 and not told(h, "a", "new")
+
+
+async def test_briefing_updates_skip_muted_sources_and_do_not_mark_them() -> None:
+    async with harness() as h:
+        report(h, "noisy", "k", "spam")
+        report(h, "dori", "k", "real")
+        notify.mute(h.db, "noisy", T9 + timedelta(hours=3), by=OWNER)
+        await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T9)
+        assert h.channel.texts() == ["Updates:\n[dori] real"]
+        assert not told(h, "noisy", "k")

@@ -337,3 +337,7 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 - **Vendored packages aren't detected.** The stdlib-only check looks for dependency files, not a vendored `site-packages` or copied third-party modules in the tree. Review catches it for now.
 - **Manifest approvers name a principal.** The shipped manifests say `approvers: [owner]`, so `ext add` refuses unless the owner principal is named `owner` (go-live step 4 names it that). The owner is always an approver anyway; consider dropping the line or treating the owner's role as implicit.
 - **Manifest rows saved before P3-14** stored `manifest_json` with sorted keys, so their positional `/<ext> <tool>` arguments would follow alphabetical order. No production install predates P3-14, so nothing to migrate; `ext remove` and `ext add` rewrite a row.
+
+## Pulse build notes
+
+- **Urgent send races the pulse.** `Pulse.route` marks an urgent item told after `channel.send`; a pulse running in that window composes the same untold item and sends it again under another dedupe key. Narrow (top of the hour); fix with an in-flight skip if it shows up.

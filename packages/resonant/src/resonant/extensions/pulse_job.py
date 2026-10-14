@@ -5,13 +5,13 @@ A core job (``scheduler.CORE_JOBS``): L0, no model, run inline at ``0 * * * *`` 
 or no ``principals.yaml`` owner: not scheduled. Each run:
 
 1. prunes old items and refreshes the **core items** (source ``core``) from the store:
-   ``health/<check>`` (a degraded check, ``⚠ imessage degraded``, then ``✓ imessage recovered``
-   once, unless nobody heard it degrade) and ``approval/<code>`` (a pending approval older
-   than ``pulse.remention_after``: ``✋ A7 still waiting: <label>``, said once; it is cleared
-   without a message when it is resolved, the owner has seen that);
+   ``approval/<code>`` (a pending approval older than ``pulse.remention_after``:
+   ``✋ A7 still waiting: <label>``, said once; it is cleared without a message when it is
+   resolved, the owner has seen that). Health stays with the HealthMonitor, which already
+   alerts on degrade and recovery;
 2. unless it is the briefing's hour (the briefing covers it), inside the quiet hours, or
    paused: lists the untold ``urgent`` and ``normal`` items of sources that aren't muted
-   (urgent ones only get here when they were held), newest first, urgent first, and sends
+   (urgent ones only get here when they were held), oldest first, urgent first, and sends
    ONE message to the owner, ``dedupe_key=pulse:<local date>:<HH>``; then marks those items
    told. Nothing pending: nothing sent.
 
@@ -25,6 +25,13 @@ On demand: ``run_pulse_now(deps)`` (P35-5's ``/pulse now``, ``/ext run core/puls
 ``pulse:manual:<date>:<HHMM>`` and ignores the briefing hour and the quiet hours, but not
 pause. ``preview(conn, now)`` is the pure text of what the next pulse would say.
 Results carry counts and reasons, never text.
+
+Exactly once (``deliver``, shared with the briefing): before ``channel.send`` the exact text and
+the (source, key, fingerprint) of the items in it are stored in kv ``pulse.inflight:<dedupe
+key>``. A rerun of the same key (a crash between send and mark, a catch-up, a restart) never
+recomposes: it resends the stored text (the channel drops it if it went out) and marks exactly
+those items told, compare-and-set, so an item that arrived since stays pending. A record
+that is done makes the rerun a ``duplicate``. Done records are pruned after 2 days.
 """
 
 from __future__ import annotations
@@ -33,18 +40,18 @@ import logging
 import re
 import sqlite3
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
 from resonant import killswitch
 from resonant.executor import CallContext
 from resonant.extensions import notify
 from resonant.extensions.pulse import render_item
-from resonant.monitor import health_snapshot
 from resonant.store import pulse as store
 from resonant.store.approvals import pending_for
-from resonant.store.db import atomic, kv_get, kv_set, utcnow
+from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.tools.projects import clip
 
 if TYPE_CHECKING:
@@ -62,7 +69,8 @@ MAX_CHARS = 1000
 LINE_MAX = 200
 HEADER = "btw:"
 CORE = "core"
-LAST_KEY = "pulse.last_key"  # kv: the dedupe key of the last pulse that was sent and told
+INFLIGHT = "pulse.inflight:"  # kv: one record per dedupe key, see deliver()
+INFLIGHT_KEEP = timedelta(days=2)
 ITEM_TTL_S = 24 * 3600
 LABEL_MAX = 60
 _BAD_KEY_CHARS = re.compile(r"[^a-z0-9/._:-]")
@@ -92,10 +100,11 @@ def item_line(item: store.Item, max_chars: int = LINE_MAX) -> str:
 
 
 def _order(items: Sequence[store.Item]) -> list[store.Item]:
-    """Urgent first, then normal, then low; newest first within each."""
+    """Urgent first, then normal, then low; oldest first within each, so an overflow can't
+    starve old items."""
     rank = {"urgent": 0, "normal": 1, "low": 2}
     by_age = sorted(items, key=lambda i: (i.source, i.key))
-    by_age.sort(key=lambda i: i.updated_at, reverse=True)
+    by_age.sort(key=lambda i: i.updated_at)
     by_age.sort(key=lambda i: rank[i.urgency])
     return by_age
 
@@ -125,6 +134,7 @@ def compose(items: Sequence[store.Item]) -> tuple[str, list[store.Item]] | None:
     shown, more = fit_lines(lines, MAX_CHARS - len(HEADER))
     if not shown:  # one line is at most LINE_MAX, so this is only a tiny-cap safety net
         shown, more = lines[:1], len(lines) - 1
+        assert len(shown[0]) <= MAX_CHARS - len(HEADER)
     parts = [HEADER, *shown]
     if more:
         parts.append(f"+{more} more")
@@ -189,19 +199,7 @@ def _sync(
 def refresh_core_items(
     conn: sqlite3.Connection, owner: str, settings: Settings, now: datetime
 ) -> None:
-    """Refresh ``core/health/<check>`` and ``core/approval/<code>`` from the store."""
-    degraded = {
-        name: f"⚠ {notify.clean_text(name)} degraded"
-        for name, s in health_snapshot(conn).items()
-        if s["state"] == "degraded"
-    }
-    _sync(
-        conn,
-        now,
-        "health",
-        {_key("health", n): t for n, t in degraded.items()},
-        lambda item: "✓ " + item.title.removeprefix("⚠ ").removesuffix(" degraded") + " recovered",
-    )
+    """Refresh ``core/approval/<code>`` from the store."""
     waiting: dict[str, str] = {}
     for a in pending_for(conn, owner, now):
         if now - a.created_at < settings.pulse.remention:
@@ -222,6 +220,64 @@ def _paused(conn: sqlite3.Connection) -> bool:
         return True  # fail closed, like the scheduler
 
 
+def prune_inflight(conn: sqlite3.Connection, now: datetime) -> None:
+    """Drop done delivery records older than ``INFLIGHT_KEEP``."""
+    rows = conn.execute("SELECT key FROM kv WHERE key LIKE ?", (INFLIGHT + "%",)).fetchall()
+    with atomic(conn):
+        for (k,) in rows:
+            rec: Any = kv_get(conn, k)
+            if not isinstance(rec, dict):
+                continue
+            done = bool(cast(dict[str, Any], rec).get("sent"))
+            at = str(cast(dict[str, Any], rec).get("at", ""))
+            if done and at and datetime.fromisoformat(at) < now - INFLIGHT_KEEP:
+                conn.execute("DELETE FROM kv WHERE key = ?", (k,))
+
+
+async def deliver(
+    conn: sqlite3.Connection,
+    channel: Channel,
+    owner: str,
+    key: str,
+    now: datetime,
+    build: Callable[[], tuple[str, list[store.Item]] | None],
+) -> tuple[str, int]:
+    """Send one message to ``owner`` exactly once for dedupe key ``key``.
+
+    ``build`` returns the text and the items it lists (None: nothing to say). The intent is
+    stored before the send; a rerun resends the stored text and marks exactly the stored
+    items told (see the module docstring). Returns ``("sent", n)``, ``("nothing", 0)`` or
+    ``("duplicate", 0)``.
+    """
+    rkey = INFLIGHT + key
+    raw: Any = kv_get(conn, rkey)
+    rec = cast(dict[str, Any], raw) if isinstance(raw, dict) else None
+    if rec is None:
+        built = build()
+        if built is None:
+            return "nothing", 0
+        text, listed = built
+        rec = {
+            "text": text,
+            "items": [[i.source, i.key, i.fingerprint] for i in listed],
+            "sent": False,
+            "at": iso(now),
+        }
+        with atomic(conn):
+            kv_set(conn, rkey, rec)
+    elif rec.get("sent"):
+        return "duplicate", 0
+    recorded = cast(list[list[str]], rec["items"])
+    await channel.send(owner, str(rec["text"]), dedupe_key=key)
+    with atomic(conn):
+        for source, ikey, fp in recorded:
+            item = store.get(conn, source, ikey)
+            if item is not None:
+                store.mark_told(conn, [replace(item, fingerprint=fp)], now)
+        kv_set(conn, rkey, {**rec, "sent": True})
+    return "sent", len(recorded)
+
+
 async def send_pulse(
     conn: sqlite3.Connection,
     channel: Channel,
@@ -240,6 +296,7 @@ async def send_pulse(
     """
     local = (due or now).astimezone(ZoneInfo(settings.timezone))
     store.prune(conn, now)
+    prune_inflight(conn, now)
     refresh_core_items(conn, owner, settings, now)
     if _paused(conn):
         return {"sent": False, "count": 0, "skipped": "paused"}
@@ -249,19 +306,12 @@ async def send_pulse(
         if settings.pulse.in_quiet(local.time()):
             return {"sent": False, "count": 0, "skipped": "quiet"}
     key = manual_dedupe_key(local) if manual else dedupe_key(local)
-    if kv_get(conn, LAST_KEY) == key:
-        # Already sent and told this hour (a restart or a catch-up): what is pending now
-        # arrived since, and rides the next pulse.
-        return {"sent": False, "count": 0, "skipped": "duplicate"}
-    composed = compose(_pending(conn, now))
-    if composed is None:
-        return {"sent": False, "count": 0, "skipped": "nothing"}
-    text, shown = composed
-    await channel.send(owner, text, dedupe_key=key)
-    with atomic(conn):
-        store.mark_told(conn, shown, now)
-        kv_set(conn, LAST_KEY, key)
-    return {"sent": True, "count": len(shown)}
+    status, count = await deliver(
+        conn, channel, owner, key, now, lambda: compose(_pending(conn, now))
+    )
+    if status == "sent":
+        return {"sent": True, "count": count}
+    return {"sent": False, "count": 0, "skipped": status}
 
 
 async def run_pulse_now(deps: CoreDeps, *, now: datetime | None = None) -> dict[str, Any]:
@@ -317,6 +367,7 @@ __all__ = [
     "MAX_CHARS",
     "compose",
     "dedupe_key",
+    "deliver",
     "fit_lines",
     "item_line",
     "manual_dedupe_key",

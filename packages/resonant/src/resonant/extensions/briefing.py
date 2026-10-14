@@ -46,12 +46,13 @@ from zoneinfo import ZoneInfo
 
 from resonant import killswitch
 from resonant.executor import CallContext
-from resonant.extensions.pulse_job import fit_lines, item_line
+from resonant.extensions import notify
+from resonant.extensions.pulse_job import deliver, fit_lines, item_line, prune_inflight
 from resonant.gate.codes import clean_external
 from resonant.monitor import health_snapshot
 from resonant.store import pulse as pulse_store
 from resonant.store.approvals import pending_for
-from resonant.store.db import iso, utcnow
+from resonant.store.db import iso, kv_get, utcnow
 from resonant.tools.projects import clip, projects
 from resonant.tools.reminders import list_reminders
 from resonant.tools.when import clock_time
@@ -272,6 +273,15 @@ def github_line(conn: sqlite3.Connection, day: date, tz: ZoneInfo) -> str | None
     return line if len(line) <= DIGEST_MAX else line[: DIGEST_MAX - 3].rstrip() + "..."
 
 
+def _updates(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item, ...]:
+    """Open pulse items for the Updates section: extension items only (the briefing has its
+    own approvals and health lines) and not from muted extensions (they are neither listed
+    nor marked told)."""
+    items = [i for i in pulse_store.open_items(conn, now) if i.source != "core"]
+    muted = {s for s in {i.source for i in items} if notify.muted_until(conn, s, now)}
+    return tuple(i for i in items if i.source not in muted)
+
+
 def gather(
     conn: sqlite3.Connection,
     *,
@@ -291,7 +301,7 @@ def gather(
         approvals=tuple(a.code or "" for a in pending_for(conn, owner, now)),
         degraded=_degraded(conn),
         github=github_line(conn, day, tz) if github else None,
-        updates=tuple(pulse_store.open_items(conn, now)),
+        updates=_updates(conn, now),
     )
 
 
@@ -327,11 +337,26 @@ async def send_briefing(
     if _paused(conn):
         return {"sent": False, "date": day.isoformat(), "skipped": "paused"}
     b = gather(conn, owner=owner, now=now, day=day, tz=zone, github=github)
-    text, listed = render_full(b)
     key = manual_dedupe_key(local_now) if manual else dedupe_key(day)
-    await channel.send(owner, text, dedupe_key=key)
-    pulse_store.mark_told(conn, listed, now)
-    return {"sent": True, "date": day.isoformat(), "sections": sections(b), "chars": len(text)}
+    prune_inflight(conn, now)
+    built: dict[str, Any] = {}
+
+    def build() -> tuple[str, list[pulse_store.Item]]:
+        text, listed = render_full(b)
+        built["sections"] = sections(b)
+        return text, listed
+
+    # Stored intent first: a rerun of this key resends the same text and marks only the
+    # items it listed (a new item stays pending).
+    await deliver(conn, channel, owner, key, now, build)
+    rec: Any = kv_get(conn, "pulse.inflight:" + key)
+    text = str(cast(dict[str, Any], rec)["text"]) if isinstance(rec, dict) else ""
+    return {
+        "sent": True,
+        "date": day.isoformat(),
+        "sections": built.get("sections", []),
+        "chars": len(text),
+    }
 
 
 def _github_loaded(host: ExtensionHost | None) -> bool:
