@@ -12,7 +12,8 @@ forms (and any per-character mix of the text forms):
   depend on the neighbouring bytes are left, as is ``=`` padding.
 
 Overlapping matches (of one value or of several) are merged into one ``[redacted]``. Values
-in other transforms (hex, double-escaped, reversed…) are not caught: that residual is
+in other transforms (hex, HTML entities, double-escaped, line-wrapped MIME base64…) are not
+caught: that residual is
 accepted in docs/phase3-plan.md §5.
 """
 
@@ -121,7 +122,8 @@ class Redactor:
         return "".join(parts)
 
     def deep[T](self, obj: T) -> T:
-        """Redact every string in a JSON-like structure (dict keys too). Other values pass."""
+        """Redact every string in a JSON-like structure (dict keys too) and return a copy.
+        Other values, including ``bytes`` and sets, pass through unchanged."""
         if not self._patterns:
             return obj
         return cast(T, self._deep(obj))

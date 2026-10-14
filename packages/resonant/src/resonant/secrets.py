@@ -160,7 +160,7 @@ class SubprocessSecurity:
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(stdin), timeout_s)
-        except (TimeoutError, asyncio.CancelledError):
+        except BaseException:  # timeout, cancel, or anything else: never leave it running
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(proc.pid, signal.SIGKILL)
             await proc.wait()
