@@ -1,4 +1,4 @@
-"""The github extension (P3-9) against a fake ``gh``: never the real one, never GitHub.
+"""The github extension (P3-9, P3-15) against a fake ``gh``: never the real one, never GitHub.
 
 Each test runs ``extensions/github/cli.py`` the way Resonant does (``python -I -S``, an env
 built from scratch) with a ``gh`` shim on a temp PATH that answers from a JSON state file.
@@ -152,10 +152,19 @@ def test_manifest_passes_every_check() -> None:
     m = load_manifest(EXT / "resonant.yaml")
     assert dir_errors(EXT, m) == [] and name_errors(m) == []
     specs = {s.name: s for s in m.tool_specs() + m.job_specs()}
-    assert set(specs) == {"prs", "pr", "job_watch", "job_digest"}
+    assert set(specs) == {"prs", "pr", "rerun_failed", "merge_pr", "job_watch", "job_digest"}
     for s in specs.values():
-        assert s.effect is Effect.READ and s.effective_level is Level.L0
         assert s.secrets == ("token",)
+        if s.name not in ("rerun_failed", "merge_pr"):
+            assert s.effect is Effect.READ and s.effective_level is Level.L0 and not s.commit
+    rerun, merge = specs["rerun_failed"], specs["merge_pr"]
+    assert rerun.effect is Effect.WRITE and rerun.effective_level is Level.L3
+    assert not rerun.commit
+    # Destructive: L1 and commit, so only "yes <code>" approves it.
+    assert merge.effect is Effect.WRITE and merge.effective_level is Level.L1 and merge.commit
+    # The approval binds the head SHA: it's a required arg, not something looked up later.
+    assert merge.args_schema["required"] == ["head_sha", "number", "repo"]
+    assert rerun.args_schema["required"] == ["number", "repo"]
     assert {j.id: j.schedule for j in m.jobs} == {"watch": "*/10 * * * *", "digest": "50 7 * * *"}
     assert m.notify is not None and m.notify.on == ("ci_failed", "ci_fixed", "review_requested")
     assert m.health is not None and m.health.check == "python3 cli.py health"
@@ -495,3 +504,230 @@ def test_gh_missing_or_garbage_fails_cleanly(gh: FakeGh, tmp_path: Path) -> None
     gh.state["garbage"] = True
     r = gh.run("watch")
     assert r.code == 1 and r.err == "github: gh api returned invalid JSON\n"
+
+
+# --- writes: rerun_failed and merge_pr ----------------------------------------------------
+
+HEAD = "a1b2c3d" + "0" * 33
+
+
+def view(
+    number: int = 40,
+    *,
+    head: str = HEAD,
+    state: str = "OPEN",
+    draft: bool = False,
+    mergeable: str = "MERGEABLE",
+    merge_state: str = "CLEAN",
+    checks: list[Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "number": number,
+        "title": "A change",
+        "url": f"https://github.com/{RESONANT}/pull/{number}",
+        "state": state,
+        "isDraft": draft,
+        "headRefName": f"branch-{number}",
+        "headRefOid": head,
+        "mergeable": mergeable,
+        "mergeStateStatus": merge_state,
+        "statusCheckRollup": [check("test"), check("lint")] if checks is None else checks,
+    }
+
+
+def mutating(gh: FakeGh) -> list[list[str]]:
+    return [c["argv"] for c in gh.calls() if c["argv"][:2] in (["pr", "merge"], ["run", "rerun"])]
+
+
+def merge(gh: FakeGh, sha: str = HEAD, number: str = "40") -> Result:
+    return gh.run("merge_pr", "--repo", RESONANT, "--number", number, "--head-sha", sha)
+
+
+def test_rerun_failed_reruns_failed_runs_on_the_head_only(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    gh.state["runs"] = {
+        f"{RESONANT}:branch-40": [
+            run_row(9, HEAD, "failure", workflow="lint"),
+            run_row(8, HEAD, "success", workflow="test"),
+            run_row(7, HEAD, "timed_out", workflow="e2e"),
+            run_row(6, HEAD, "failure", workflow="docs"),  # superseded by 10
+            run_row(10, HEAD, "success", workflow="docs"),
+            run_row(5, "old" + "0" * 37, "failure", workflow="build"),  # an older push
+            run_row(11, HEAD, None, workflow="slow", status="in_progress"),
+        ]
+    }
+    r = gh.run("rerun_failed", "--repo", RESONANT, "--number", "40")
+    assert r.code == 0, r.err
+    assert mutating(gh) == [
+        ["run", "rerun", "7", "--repo", RESONANT, "--failed"],
+        ["run", "rerun", "9", "--repo", RESONANT, "--failed"],
+    ]
+    assert r.out["summary"] == "re-running failed jobs on resonant#40 (a1b2c3d): e2e, lint"
+    assert r.out["rerun"] == [{"workflow": "e2e", "run_id": 7}, {"workflow": "lint", "run_id": 9}]
+    assert r.out["already_running"] == ["slow"] and r.out["errors"] == []
+    reads = [c["argv"][:2] for c in gh.calls()][:2]
+    assert reads == [["pr", "view"], ["run", "list"]]
+
+
+def test_rerun_failed_when_already_rerunning_is_a_clean_failure(gh: FakeGh) -> None:
+    """A re-run keeps its run id and goes back to in_progress: nothing to do, nothing done."""
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    gh.state["runs"] = {
+        f"{RESONANT}:branch-40": [run_row(9, HEAD, None, workflow="lint", status="queued")]
+    }
+    r = gh.run("rerun_failed", "--repo", RESONANT, "--number", "40")
+    assert r.code == 1 and r.stdout == ""
+    assert r.err == "github: nothing to rerun on resonant#40 (a1b2c3d): lint still running\n"
+    gh.state["runs"] = {f"{RESONANT}:branch-40": [run_row(9, HEAD, "success")]}
+    r = gh.run("rerun_failed", "--repo", RESONANT, "--number", "40")
+    assert r.code == 1 and r.err.endswith("(a1b2c3d): no failed runs\n")
+    assert mutating(gh) == []
+
+
+def test_rerun_failed_refuses_closed_prs_and_bad_args(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view(state="MERGED")}
+    r = gh.run("rerun_failed", "--repo", RESONANT, "--number", "40")
+    assert r.code == 1 and r.err == "github: resonant#40 is merged; nothing to rerun\n"
+    bad = gh.run("rerun_failed", "--repo", "x", "--number", "40")
+    assert bad.code == 1 and "owner/name" in bad.err
+    assert [c["argv"][:2] for c in gh.calls()] == [["pr", "view"]]
+
+
+def test_rerun_failed_permission_error_is_clean(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    gh.state["runs"] = {f"{RESONANT}:branch-40": [run_row(9, HEAD, "failure")]}
+    gh.state["fail_on"] = {
+        "run rerun": {
+            "exit": 1,
+            "stderr": f"HTTP 403: Resource not accessible by personal access token {TOKEN}",
+        }
+    }
+    r = gh.run("rerun_failed", "--repo", RESONANT, "--number", "40")
+    assert r.code == 1 and r.stdout == "" and TOKEN not in r.err
+    assert r.err == (
+        "github: the token can't do this: it needs Actions: write (see the github extension "
+        "README); nothing was changed\n"
+    )
+
+
+def test_rerun_failed_partial_success_reports_rather_than_fails(gh: FakeGh) -> None:
+    """Once one rerun has gone through, exit 1 would claim nothing happened: report instead."""
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    gh.state["runs"] = {
+        f"{RESONANT}:branch-40": [
+            run_row(7, HEAD, "failure", workflow="a"),
+            run_row(8, HEAD, "failure", workflow="b"),
+        ]
+    }
+    gh.state["fail_on"] = {"run rerun 8": {"exit": 1, "stderr": "HTTP 500: oops"}}
+    r = gh.run("rerun_failed", "--repo", RESONANT, "--number", "40")
+    assert r.code == 0, r.err
+    assert r.out["rerun"] == [{"workflow": "a", "run_id": 7}]
+    assert r.out["errors"] == ["b: gh run failed (exit 1): HTTP 500: oops"]
+    assert r.out["summary"].endswith(": a; 1 could not be re-run")
+
+
+def test_merge_pr_squashes_bound_to_the_approved_head(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    r = merge(gh, sha="A1B2C3D")  # an abbreviated, upper-case SHA is fine
+    assert r.code == 0, r.err
+    (argv,) = mutating(gh)
+    assert argv == [
+        "pr", "merge", "40", "--repo", RESONANT, "--squash", "--match-head-commit", HEAD,
+    ]  # fmt: skip
+    assert "--admin" not in argv and "--auto" not in argv
+    assert r.out == {
+        "summary": "merged resonant#40 (squash) at a1b2c3d",
+        "repo": RESONANT,
+        "number": 40,
+        "head_sha": HEAD,
+        "method": "squash",
+        "url": f"https://github.com/{RESONANT}/pull/40",
+    }
+    view_argv = gh.calls()[0]["argv"]
+    assert view_argv[:5] == ["pr", "view", "40", "--repo", RESONANT]
+    assert "mergeStateStatus" in view_argv[-1]
+
+
+@pytest.mark.parametrize(
+    ("pr", "sha", "err"),
+    [
+        (view(head="f" * 40), HEAD, "has new commits since it was approved (head fffffff"),
+        (view(checks=[check("test"), check("lint", conclusion="FAILURE")]), HEAD,
+         "has failing checks (lint); not merging"),
+        (view(checks=[check("test", conclusion=None, status="IN_PROGRESS")]), HEAD,
+         "still has checks running"),
+        (view(mergeable="CONFLICTING", merge_state="DIRTY"), HEAD, "in conflict with its base"),
+        (view(mergeable="UNKNOWN", merge_state="UNKNOWN"), HEAD, "try again in a minute"),
+        (view(merge_state="BLOCKED"), HEAD, "blocked by branch protection"),
+        (view(merge_state="BEHIND"), HEAD, "behind its base branch"),
+        (view(mergeable="CONFLICTING", merge_state="CLEAN"), HEAD, "not mergeable (conflicting)"),
+        (view(draft=True), HEAD, "is a draft"),
+        (view(state="MERGED"), HEAD, "resonant#40 is already merged"),
+        (view(state="CLOSED"), HEAD, "resonant#40 is closed; not merging"),
+    ],
+)  # fmt: skip
+def test_merge_pr_refuses_without_merging(
+    gh: FakeGh, pr: dict[str, Any], sha: str, err: str
+) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": pr}
+    r = merge(gh, sha=sha)
+    assert r.code == 1 and r.stdout == "" and err in r.err, r.err
+    assert mutating(gh) == []
+
+
+@pytest.mark.parametrize("sha", ["", "abc", "zzzzzzz", "a1b2c3d e", "a" * 65])
+def test_merge_pr_needs_a_sha(gh: FakeGh, sha: str) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    r = merge(gh, sha=sha)
+    assert r.code == 1 and "head_sha must be" in r.err
+    assert gh.calls() == []
+
+
+def test_merge_pr_permission_and_race_errors_are_clean(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    gh.state["fail_on"] = {
+        "pr merge": {
+            "exit": 1,
+            "stderr": "GraphQL: Resource not accessible by personal access token",
+        }
+    }
+    r = merge(gh)
+    assert r.code == 1 and r.stdout == ""
+    assert r.err == (
+        "github: the token can't do this: it needs Contents: write and Pull requests: write "
+        "(see the github extension README); nothing was changed\n"
+    )
+    # The head moved between the view and the merge: GitHub refuses via --match-head-commit.
+    gh.state["fail_on"] = {
+        "pr merge": {"exit": 1, "stderr": "GraphQL: Head branch was modified. Review and try"}
+    }
+    r = merge(gh)
+    assert r.code == 1
+    assert (
+        r.err
+        == "github: gh pr failed (exit 1): GraphQL: Head branch was modified. Review and try\n"
+    )
+
+
+def test_rate_limit_is_not_reported_as_a_missing_scope(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    gh.state["fail_on"] = {"pr merge": {"exit": 1, "stderr": "HTTP 403: API rate limit exceeded"}}
+    r = merge(gh)
+    assert (
+        r.code == 1
+        and r.err == "github: gh pr failed (exit 1): HTTP 403: API rate limit exceeded\n"
+    )
+
+
+def test_writes_pass_the_token_only_as_gh_token(gh: FakeGh) -> None:
+    gh.state["prs"] = {f"{RESONANT}#40": view()}
+    gh.state["runs"] = {f"{RESONANT}:branch-40": [run_row(9, HEAD, "failure")]}
+    outs = [merge(gh), gh.run("rerun_failed", "--repo", RESONANT, "--number", "40")]
+    assert all(o.code == 0 for o in outs)
+    calls = gh.calls()
+    assert len(mutating(gh)) == 2
+    for call in calls:
+        assert call["token_ok"] is True and TOKEN not in json.dumps(call["argv"])
+        assert not {k for k in call["env"] if k.startswith("RESONANT_")}
+    assert all(TOKEN not in o.stdout + o.err for o in outs)
