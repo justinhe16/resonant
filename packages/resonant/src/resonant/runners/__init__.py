@@ -1,5 +1,6 @@
-"""Task runners. Phase 1 ships ``runner="local"``; Claude (Phase 5) and cu (Phase 7) follow."""
+"""Task runners: ``local`` (chat) and ``reminder``; Claude (Phase 5) and cu (Phase 7) follow."""
 
 from resonant.runners.local import LocalRunner
+from resonant.runners.reminder import ReminderRunner
 
-__all__ = ["LocalRunner"]
+__all__ = ["LocalRunner", "ReminderRunner"]

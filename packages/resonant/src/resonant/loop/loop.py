@@ -5,7 +5,8 @@ One loop serves every task. It is driven by events (Loop.submit) and by a period
 - Route: an event with no task_id goes to the router, which may create a task. If the
   router raises, the event is retried on later ticks and dead-lettered after
   ``ROUTE_MAX_FAILURES`` failures. With no router configured, events wait unrouted.
-- Wake: waiting tasks whose wake_at has passed are requeued.
+- Wake: waiting tasks whose wake_at has passed are requeued. Between ticks the loop sleeps
+  ``tick_s``, or only until the earliest queued or waiting ``wake_at`` if that is sooner.
 - Stuck: steps running longer than the runner's ``max_step_s`` (default
   ``stuck_after_s``) are cancelled and retried.
 - Dispatch: queued tasks run in priority order, up to ``max_parallel`` steps at once. One
@@ -153,12 +154,23 @@ class Loop:
             while not self._stopping:
                 await self.run_once()
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(self._wakeup.wait(), timeout=self.config.tick_s)
+                    await asyncio.wait_for(self._wakeup.wait(), timeout=self.wait_s())
                 self._wakeup.clear()
         finally:
             await self._shutdown()
         if self._fatal is not None:
             raise self._fatal
+
+    def wait_s(self) -> float:
+        """How long to sleep before the next tick: ``tick_s``, or less when a queued or
+        waiting task's ``wake_at`` comes sooner (a reminder fires on time, not up to a tick
+        late). Submits, new tasks and finished steps still wake the loop early."""
+        now = self.clock()
+        tick = self.config.tick_s
+        nxt = repo.next_wake_at(self.conn, now)
+        if nxt is None:
+            return tick
+        return min(tick, max((nxt - now).total_seconds(), 0.0))
 
     def stop(self) -> None:
         self._stopping = True
