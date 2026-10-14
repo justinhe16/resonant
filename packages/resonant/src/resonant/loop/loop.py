@@ -5,8 +5,11 @@ One loop serves every task. It is driven by events (Loop.submit) and by a period
 - Route: an event with no task_id goes to the router, which may create a task. If the
   router raises, the event is retried on later ticks and dead-lettered after
   ``ROUTE_MAX_FAILURES`` failures. With no router configured, events wait unrouted.
+- Schedule: ``Loop.scheduler`` (when set) ticks; due jobs run inline or become tasks that
+  this same tick dispatches. A scheduler error is logged and never stops the loop.
 - Wake: waiting tasks whose wake_at has passed are requeued. Between ticks the loop sleeps
-  ``tick_s``, or only until the earliest queued or waiting ``wake_at`` if that is sooner.
+  ``tick_s``, or only until the earliest queued or waiting ``wake_at`` (or the scheduler's
+  next due time) if that is sooner.
 - Stuck: steps running longer than the runner's ``max_step_s`` (default
   ``stuck_after_s``) are cancelled and retried.
 - Dispatch: queued tasks run in priority order, up to ``max_parallel`` steps at once. One
@@ -31,7 +34,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 
 from resonant.config import LoopConfig
 from resonant.loop.slots import SlotPool
@@ -45,6 +48,15 @@ log = logging.getLogger(__name__)
 
 Router = Callable[[Event], Awaitable[NewTask | None]]
 Clock = Callable[[], datetime]
+
+
+class TickHook(Protocol):
+    """The scheduler, as the loop sees it (``extensions.scheduler.Scheduler``)."""
+
+    async def tick(self, now: datetime) -> None: ...
+
+    def next_due(self, after: datetime) -> datetime | None: ...
+
 
 ROUTE_MAX_FAILURES = 5
 _RETRY_BASE_S = 5.0
@@ -91,6 +103,7 @@ class Loop:
         router: Router | None = None,
         clock: Clock = utcnow,
         max_parallel: int = 8,
+        scheduler: TickHook | None = None,
     ) -> None:
         if max_parallel < 2:
             raise ValueError("max_parallel must be >= 2 (one slot is kept for on-call)")
@@ -99,6 +112,7 @@ class Loop:
         self.config = config
         self.slots = slots
         self.router = router
+        self.scheduler = scheduler
         self.clock = clock
         self.max_parallel = max_parallel
         self.last_tick: datetime | None = None
@@ -163,12 +177,20 @@ class Loop:
 
     def wait_s(self) -> float:
         """How long to sleep before the next tick: ``tick_s``, or less when a queued or
-        waiting task's ``wake_at`` comes sooner (a reminder fires on time, not up to a tick
-        late). Submits, new tasks and finished steps still wake the loop early."""
+        waiting task's ``wake_at``, or the scheduler's next due time, comes sooner (a
+        reminder or job fires on time, not up to a tick late). Submits, new tasks and
+        finished steps still wake the loop early."""
         now = self.clock()
         tick = self.config.tick_s
         # Measured from the last tick, so a wake_at that fell due since then ticks at once.
-        nxt = repo.next_wake_at(self.conn, self.last_tick or now)
+        after = self.last_tick or now
+        times = [repo.next_wake_at(self.conn, after)]
+        if self.scheduler is not None:
+            try:
+                times.append(self.scheduler.next_due(after))
+            except Exception:
+                log.exception("scheduler next_due failed")
+        nxt = min((t for t in times if t is not None), default=None)
         if nxt is None:
             return tick
         return min(tick, max((nxt - now).total_seconds(), 0.0))
@@ -195,6 +217,11 @@ class Loop:
         self.last_tick = now
         if self.router is not None:
             await self._route_unrouted()
+        if self.scheduler is not None:
+            try:
+                await self.scheduler.tick(now)
+            except Exception:
+                log.exception("scheduler tick failed")
         with transaction(self.conn):
             repo.wake_due(self.conn, now)
         self._check_stuck(now)

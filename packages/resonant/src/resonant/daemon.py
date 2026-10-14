@@ -7,12 +7,18 @@ checkpoint on the next start.
 With ``channels.imessage.enabled`` the daemon also runs the Phase 1 stack
 (``resonant.wiring``): the iMessage channel feeds ``loop.submit``, the router is the loop's
 router hook, ``runner="local"`` answers, ``runner="reminder"`` sends due reminders, and the
-health monitor runs. On shutdown the reader and monitor stop first (no new events), then
-the loop drains in-flight steps (which may still send their replies), then the model client
-closes. With it disabled, the daemon is exactly Phase 0 apart from the gate.
+health monitor runs; ``runner="job"`` runs scheduled jobs above L0. On shutdown the reader
+and monitor stop first (no new events), then the loop drains in-flight steps (which may
+still send their replies), then the model client closes. With it disabled, the daemon is
+exactly Phase 0 apart from the gate and the scheduler.
 
 The gate is always the Phase 2 ``PolicyGate``; the startup line logs
 ``gate=policy dry_run=<bool>``.
+
+The scheduler (``extensions.scheduler.Scheduler``) is built after the components and the
+iMessage stack and set as ``loop.scheduler``, iMessage on or off: L0 and core jobs run
+inline from the loop's tick. It registers the kill switch hook at start; on shutdown,
+after the reader stops, its inline runs are cancelled (decided again on the next start).
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ import uvicorn
 from resonant.api import DaemonState, create_app
 from resonant.components import build_components
 from resonant.config import Settings
+from resonant.extensions.scheduler import Scheduler
 from resonant.health import Heartbeat, Watchdog, deadman_task, heartbeat_task
 from resonant.loop import Loop, SlotPool
 from resonant.loop.echo import EchoRunner
@@ -102,6 +109,14 @@ class Daemon:
                 osa_runner=osa_runner,
             )
             self.state.monitor = self.imessage.monitor
+        self.scheduler = Scheduler.from_components(
+            settings,
+            self.conn,
+            self.state.components,
+            started_at=self.state.started_at,
+            channel=None if self.imessage is None else self.imessage.channel,
+        )
+        self.loop.scheduler = self.scheduler
         self.server = _Server(
             uvicorn.Config(
                 create_app(self.state),
@@ -149,6 +164,7 @@ class Daemon:
                 await self.imessage.aclose()
                 self.conn.close()
                 return 1
+        self.scheduler.start()
         loop_task = asyncio.create_task(self.loop.run(), name="loop")
         server_task = asyncio.create_task(self._serve(), name="api")
         stop_task = asyncio.create_task(self._stop.wait(), name="stop")
@@ -169,12 +185,13 @@ class Daemon:
         host = self.state.components.extensions if self.state.components else None
         log.info(
             "resonant daemon started (api %s:%s, gate=policy dry_run=%s, imessage=%s, "
-            "extensions=%d)",
+            "extensions=%d, jobs=%d)",
             self.settings.api.host,
             self.settings.api.port,
             self.settings.dry_run,
             "on" if self.imessage is not None else "off",
             0 if host is None else len(host.loaded),
+            len(self.scheduler.jobs),
         )
         done, _ = await asyncio.wait(
             {loop_task, server_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
@@ -186,6 +203,7 @@ class Daemon:
         self.server.should_exit = True
         if self.imessage is not None:
             await self.imessage.stop()  # no new events while the loop drains
+        await self.scheduler.aclose()
         self.loop.stop()
         stop_task.cancel()
         for t in aux:
