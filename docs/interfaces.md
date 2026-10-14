@@ -321,6 +321,7 @@ approved_unused(conn, task_id, intent_hash) -> Approval | None
 mark_used(conn, id, now) -> bool                     # True exactly once
 expire_due(conn, now) -> int                         # audits approval.expired
 wake_resolved(conn, result, now, *, principal=None) -> int
+intent_args(conn, approval) -> dict | None           # full args, from its gate.evaluate audit row
 ```
 
 - `resolve` is one conditional UPDATE: the row must be pending, `expires_at > now`, and its task `waiting` or `running`. It records `decided_by`, `decided_at` and `resolved_event_id`. The refusal reason is read afterwards and is informational.
@@ -610,6 +611,7 @@ Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | No
 ## CLI exit codes
 
 - `resonant status`: 0 when the daemon is up, 1 when it is down (in both text and `--json` modes). It never creates the store. Text mode ends with a health section: one line per check (state, since, and the detail when degraded).
+- `resonant approvals list [--json]`, `show <id|code> [--json]`, `approve <id|code>`, `deny <id|code>`: 0 on success, 1 when nothing matches or the gate refuses (already resolved, expired, task no longer waiting), 75 when the store is missing or its schema is behind. They never create or migrate the store; `list` and `show` open it read-only. `list` shows pending approvals the owner can approve (code, tool, expires in, summary, id). `show` adds the full args from the `gate.evaluate` audit row, which the summary masks. An id is tried first; codes are reused over time, so a code matches only a currently pending approval. `approve` and `deny` print the summary, then call `PolicyGate.resolve(ApprovalResolution(actor=<owner>, actor_identity="cli", path="cli"))`, which resolves and wakes the task in one transaction; the running daemon picks the task up on its next tick.
 - `resonant job-guard`: 75 when paused or when the state is unknown, 127 when exec fails, 2 when no command is given.
 - `resonant selftest imessage [--timeout S] [--json]`: 0 when the self-test passes, 1 otherwise. It sends a real iMessage to `self_handle`, stores kv `imessage.selftest`, and is safe to run while the daemon is up. macOS grants Automation per responsible app, so running it from a terminal proves the terminal's grant, not the daemon's.
 - `resonant model probe` and `resonant model bench`: 1 when the probe fails (model missing, context too small, or thinking not off). `bench` also exits 1 when every call of a kind failed. `probe` stores its result in kv `model.probe` if the store exists, and never creates it.
