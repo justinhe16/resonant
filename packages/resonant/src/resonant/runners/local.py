@@ -641,6 +641,7 @@ class LocalRunner:
                         principal=approver,
                     )
             s.set(ok=True)
+        # The Wait replaces the stored checkpoint, so ``cp`` must hold the pinned ``call``.
         return Wait("approval", checkpoint=cp, wake_at=decision.expires_at)
 
     def _current_text(self, task: Task, events: list[Event]) -> str | None:
@@ -801,6 +802,7 @@ class LocalRunner:
             if not ctx.save(checkpoint=cp):
                 return Fail("task is no longer running")
             result = await self._decided(intent, decision, pinned, cp, spans)
+            # "replay": an earlier attempt already ran it; it still counts as the side effect.
             if not isinstance(result, _Answer) or result.path not in ("done", "replay"):
                 return result
             return _Call(name, True, result.data or {}, None, report=result.reply)
