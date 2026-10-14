@@ -45,3 +45,27 @@ gate:
 # ops:
 #   repo_path: ~/resonant               # repo /update pulls into; default: the checkout Resonant runs from
 #   uv_path: /opt/homebrew/bin/uv       # absolute path to uv for /update; unset means /update refuses
+
+# Phase 3. Every key has a default; the values below are the defaults.
+extensions:
+  max_concurrent_jobs: 4                # L0 jobs running at once (1..16)
+  result_max_bytes: 32768               # a tool or job result is stored (redacted) up to this
+  model_result_max_chars: 4096          # the model sees this much of it, as untrusted data
+  process:
+    path: [/opt/homebrew/bin, /usr/bin, /bin]   # an extension process's whole PATH
+    stdout_max_bytes: 262144            # past this the process tree is killed
+    stderr_max_bytes: 8192              # kept redacted, never shown
+    kill_grace_s: 2                     # SIGTERM, then SIGKILL after this
+    tree_sample_s: 2                    # how often child processes are tracked
+    health_timeout_s: 20                # a manifest health check's timeout
+  notify:
+    max_per_hour: 20                    # per extension; the rest collapse into "+N more updates"
+    max_chars: 300                      # notification text is clipped to this
+
+secrets:
+  security_path: /usr/bin/security      # Keychain items trust this binary (no prompt)
+  timeout_s: 5
+
+briefing:
+  enabled: true                         # the daily briefing to the owner (core/briefing)
+  at: "08:00"                           # local time in `timezone`, 24-hour HH:MM

@@ -176,7 +176,12 @@ def main() -> None:
         out("FAIL", False, "healthchecks URL set", "health.healthchecks_url is empty")
 
     # Phase 2: the gate, ops and power (docs/go-live.md steps 2 and 11).
-    from resonant.store.db import StoreUnavailableError, open_existing, schema_version
+    from resonant.store.db import (
+        StoreUnavailableError,
+        latest_version,
+        open_existing,
+        schema_version,
+    )
 
     conn: sqlite3.Connection | None = None
     try:
@@ -184,9 +189,9 @@ def main() -> None:
         version = schema_version(conn)
     except (StoreUnavailableError, sqlite3.Error) as e:
         version = 0
-        out("FAIL", True, "store schema 3", f"{e} (start the daemon: step 6)")
+        out("FAIL", True, f"store schema {latest_version()}", f"{e} (start the daemon: step 6)")
     else:
-        out("PASS", True, "store schema 3", f"{settings.db_path} v{version}")
+        out("PASS", True, f"store schema {latest_version()}", f"{settings.db_path} v{version}")
 
     if settings.dry_run:
         out("PASS", True, "dry_run", "true (stage A of step 11)")

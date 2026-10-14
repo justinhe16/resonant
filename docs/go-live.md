@@ -146,7 +146,7 @@ cd ~/resonant && git switch main && git pull --ff-only && uv sync --frozen
 resonant daemon install   # also installs the keep-awake agent (step 2)
 ```
 
-`~/.resonant/logs/resonant.jsonl` shows `gate=policy dry_run=True`, and `scripts/bootstrap.sh --check` shows `store schema 3  PASS` and `dry_run  PASS  true`. Then text Resonant:
+`~/.resonant/logs/resonant.jsonl` shows `gate=policy dry_run=True`, and `scripts/bootstrap.sh --check` shows `store schema 4  PASS` and `dry_run  PASS  true`. Then text Resonant:
 
 1. **Notes (no prompt).** `/note milk` → `Saved note 1: "milk"`. `/notes` → `Notes (1):` / `1. milk`. `/unnote 1` → `Deleted note 1.`. `/notes` → `No notes.`
 2. **L1 needs the code.** `/note a`, then `/notes clear` → `[D7] delete all 1 note? This can't be undone. Reply yes D7 / no`. A plain `yes` → `Reply yes D7 to confirm.` and nothing is deleted. `yes D7` → `Cleared 1 note.`. Repeat with `no` → `Not done.`
