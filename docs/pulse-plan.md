@@ -106,7 +106,7 @@ The first run after install is a baseline (as for notify): items are stored as t
 - One core job, cron `0 * * * *` in `settings.timezone`, catch-up 50 minutes. It skips the briefing's hour (the briefing covers it), quiet hours, and paused.
 - Core items are refreshed in-process first:
   - Health stays with the monitor, which already alerts (no `core/health` items).
-  - `core/approval/<code>`: an approval pending for `remention_after` (normal), one re-mention.
+  - `core/approval/<code>`: an approval pending for `remention_after` (normal), one re-mention. As built: capped at half the approval TTL; with the defaults (10 and 30 minutes) only approvals asked between :30 and :50 past an hour are caught by the next pulse. A proper "expires soon" reminder belongs to the approval runner (follow-up).
 - It collects untold `normal` and `urgent` items (the urgent ones were held), from extensions that aren't muted, and sends one message if there are any:
   ```
   btw:

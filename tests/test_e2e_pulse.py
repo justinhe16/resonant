@@ -439,6 +439,43 @@ async def test_u9_a_waiting_approval_is_mentioned_once_before_it_expires(
         assert len(w.texts()) == 1  # once
 
 
+@pytest.mark.parametrize(
+    ("asked", "expires"),
+    [((10, 9, 55), (10, 10, 25)), ((10, 9, 10), (10, 9, 40))],
+    ids=["too-young-at-the-pulse", "expired-before-the-pulse"],
+)
+async def test_u9_other_approvals_are_not_mentioned(
+    resonant_home: Path,
+    chat: FakeChatDB,
+    asked: tuple[int, int, int],
+    expires: tuple[int, int, int],
+) -> None:
+    async with world(resonant_home, chat, at(*asked)) as w:
+        task_id = repo.insert_task(
+            w.conn,
+            NewTask(kind="chat", runner="local", priority=PRIORITY_OWNER, principal="justin"),
+        )
+        repo.set_status(w.conn, task_id, "waiting", wait_reason="approval")
+        ap.insert_approval(
+            w.conn,
+            ap.NewApproval(
+                task_id=task_id,
+                intent_hash="h-a7",
+                tool="restart_resonant",
+                effect=Effect.WRITE,
+                level=Level.L2,
+                summary="restart Resonant",
+                approvers=("justin",),
+                code="A7",
+                expires_at=at(*expires),
+            ),
+            at(*asked),
+        )
+        for hour in (10, 11):
+            await w.tick(at(10, hour))
+        assert w.texts() == []
+
+
 # --- crash between send and told: exactly once ------------------------------------------------
 
 

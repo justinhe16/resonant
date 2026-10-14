@@ -5,7 +5,10 @@ A core job (``scheduler.CORE_JOBS``): L0, no model, run inline at ``0 * * * *`` 
 or no ``principals.yaml`` owner: not scheduled. Each run:
 
 1. prunes old items and refreshes the **core items** (source ``core``) from the store:
-   ``approval/<code>`` (a pending approval older than ``pulse.remention_after``:
+   ``approval/<code>`` (a pending approval older than :func:`remention_delay`, which is
+   ``pulse.remention_after`` capped at half the approval TTL; with the defaults, 10 and 30
+   minutes, only approvals asked between :30 and :50 are still open and old enough at the
+   next pulse:
    ``✋ A7 still waiting: <label>``, said once; it is cleared without a message when it is
    resolved, the owner has seen that). Health stays with the HealthMonitor, which already
    alerts on degrade and recovery;

@@ -354,3 +354,7 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 - **Local push endpoint.** A long-running process (a trading bot, an on-call listener) calls the daemon directly instead of waiting for a job period (5 minutes at best). Loopback only, a per-extension token in the Keychain, same `report()` payload and the same pulse path, so grants, dedupe and the cap apply unchanged.
 - **Model ranking, feedback and snooze.** A ranking step over the open items (novelty, urgency, relevance), "not useful" replies that lower a source or key, and per-item snooze (`/snooze <key> 4h`). This is the nudges follow-up above; the pulse gives it the items store and the told-once state to rank over.
 - **Status relay visibility.** Show the count of pending (untold) and open pulse items in the remote status, so a stuck or muted reporter is visible when away from the Mini ([status relay](#status-relay-dead-man-switch-and-remote-dashboard)).
+
+## Approval "expires soon" reminder
+
+*Found 2026-10-14, after the pulse shipped.* The pulse's approval re-mention runs only at the top of the hour, and approvals expire after 30 minutes, so it catches only approvals asked between :30 and :50 past an hour. A reminder scheduled by the approval runner itself (e.g. `[A7] still waiting, expires in 10 min`, once, at half the TTL) would cover every approval. Then drop `core/approval` from the pulse.
