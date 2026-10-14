@@ -35,8 +35,9 @@ the next tick. ``/resume`` (or the next unpaused tick) lets runs start again.
 
 Events. A run's events become unrouted ``Event(source="ext:<name>",
 type="ext.<name>.<type>", dedupe_key="ext:<name>:<key>", payload={text, data})`` rows
-(``persist_events``); the UNIQUE dedupe key drops repeats. Delivery is the notifier's
-(P3-12), through the loop's router hook.
+(``persist_events``); the UNIQUE dedupe key drops repeats. A job's first successful run
+after install stores them as ``payload.baseline=true`` (``notify.take_baseline``). Delivery
+is ``extensions.notify.Notifier``'s, through the loop's router hook.
 
 Core jobs (``ext="core"``). ``CORE_JOBS`` is a tuple of factories, like ``BUILTIN_MODULES``:
 each gets ``CoreDeps`` at daemon start and returns a ``CoreJob`` (or None when disabled).
@@ -70,6 +71,7 @@ from resonant.extensions.cron import (
     decide,
     parse_schedule,
 )
+from resonant.extensions.notify import take_baseline
 from resonant.extensions.process import ExtAmbiguous, ExtFailed, ProcessTracker
 from resonant.gate import Allow, DryRun, Gate, Intent
 from resonant.gate.types import Deny
@@ -171,20 +173,26 @@ def persist_events(
     events: Sequence[Mapping[str, Any]],
     *,
     trace_id: str | None = None,
+    baseline: bool = False,
 ) -> int:
     """Insert a run's (redacted) events as unrouted ``ext:<name>`` events; returns how many
     were new. Call inside the transaction that records the run. Malformed items are
-    skipped (the process runner already validated them)."""
+    skipped (the process runner already validated them). ``baseline`` (the job's first
+    run after install, ``notify.take_baseline``) marks them ``payload.baseline=true``: stored,
+    never notified."""
     n = 0
     for item in events:
         etype, text, key = item.get("type"), item.get("text"), item.get("dedupe_key")
         if not (isinstance(etype, str) and isinstance(text, str) and isinstance(key, str)):
             continue
         data: object = item.get("data")
+        payload: dict[str, Any] = {"text": text, "data": data if isinstance(data, dict) else None}
+        if baseline:
+            payload["baseline"] = True
         event = Event(
             source=f"ext:{ext}",
             type=f"ext.{ext}.{etype}",
-            payload={"text": text, "data": data if isinstance(data, dict) else None},
+            payload=payload,
             principal=None,
             task_id=None,
             dedupe_key=f"ext:{ext}:{key}",
@@ -580,7 +588,8 @@ class Scheduler:
             match r.outcome:
                 case "ok":
                     store.record_run(self.conn, job.ext, job.job_id, at=now, outcome="ok", ok=True)
-                    n = persist_events(self.conn, job.ext, r.events)
+                    first = not job.core and take_baseline(self.conn, job.ext, job.job_id)
+                    n = persist_events(self.conn, job.ext, r.events, baseline=first)
                     self._audit(
                         job, "job.run", d.due, ok=True, late=d.late, events=n, ms=r.duration_ms
                     )

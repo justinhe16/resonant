@@ -9,8 +9,8 @@
   fail streak from ``ext_jobs``. Manifest strings never appear, only names.
 - ``mute_extension`` (L3): ``{extension, until}`` holds that extension's notifications
   until ``until`` (ISO with an offset, in the future, at most 7 days ahead); ``{extension,
-  off: true}`` lifts it. kv ``ext.<name>.muted_until`` (ISO, UTC), audited
-  ``ext.notify_muted`` / ``ext.notify_unmuted``. The notifier (P3-12) reads the same key.
+  off: true}`` lifts it, through the notifier's API (``notify.mute`` / ``notify.unmute``:
+  kv ``ext.<name>.muted_until``, audited ``ext.notify_muted`` / ``ext.notify_unmuted``).
 
 Handlers don't see the requester; the gate limits callers to principals who may request
 global tools (the owner).
@@ -19,18 +19,17 @@ global tools (the owner).
 from __future__ import annotations
 
 import logging
-import sqlite3
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
 from resonant.executor import ToolFailed, ToolHandler
+from resonant.extensions import notify
 from resonant.extensions.cron import CronError, parse_schedule
-from resonant.monitor import HEALTH_KV_PREFIX, CheckState
+from resonant.monitor import health_snapshot
 from resonant.store import extensions as store
-from resonant.store.audit import audit
-from resonant.store.db import atomic, iso, kv_get, kv_set
+from resonant.store.db import iso
 from resonant.tools.base import BuiltinContext, no_args
 from resonant.tools.when import format_due
 from resonant_sdk import Effect, Level, Manifest, ToolSpec
@@ -74,26 +73,10 @@ MUTE_EXTENSION = ToolSpec(
 SPECS: tuple[ToolSpec, ...] = (LIST_EXTENSIONS, MUTE_EXTENSION)
 
 
-def muted_key(ext: str) -> str:
-    return f"ext.{ext}.muted_until"
-
-
-def muted_until(conn: sqlite3.Connection, ext: str, now: datetime) -> datetime | None:
-    """When ``ext``'s mute ends, or None (never set, unreadable or already past)."""
-    raw: object = kv_get(conn, muted_key(ext))
-    if not isinstance(raw, str):
-        return None
-    try:
-        until = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return until if until.utcoffset() is not None and until > now else None
-
-
-def _health(conn: sqlite3.Connection, ext: str) -> str | None:
+def _health(snapshot: dict[str, dict[str, Any]], ext: str) -> str | None:
     """The ``ext:<name>`` health check's state, or None if it has never run."""
-    state = CheckState.from_kv(kv_get(conn, f"{HEALTH_KV_PREFIX}ext:{ext}")).state
-    return None if state == "unknown" else state
+    state: object = snapshot.get(f"ext:{ext}", {}).get("state")
+    return state if isinstance(state, str) and state != "unknown" else None
 
 
 def _loaded(ctx: BuiltinContext, host: ExtensionHost | None, name: str) -> bool:
@@ -111,6 +94,7 @@ def list_extensions(ctx: BuiltinContext) -> dict[str, Any]:
     tz = ctx.state.settings.timezone
     components = ctx.state.components
     host = components.extensions if components is not None else None
+    health = health_snapshot(conn)
     out: list[dict[str, Any]] = []
     for record in store.list_extensions(conn):
         status: str = record.status
@@ -130,9 +114,9 @@ def list_extensions(ctx: BuiltinContext) -> dict[str, Any]:
             "jobs": [],
             "muted_until": None,
             "muted_until_text": None,
-            "health": _health(conn, record.name),
+            "health": _health(health, record.name),
         }
-        if (until := muted_until(conn, record.name, now)) is not None:
+        if (until := notify.muted_until(conn, record.name, now)) is not None:
             item["muted_until"], item["muted_until_text"] = iso(until), _when(until, now, tz)
         try:
             manifest = Manifest.model_validate(record.manifest)
@@ -176,10 +160,7 @@ def mute_extension(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
     owner = ctx.principals.owner
     now = ctx.clock()
     if off is True and until_raw is None:
-        with atomic(ctx.conn):
-            was = muted_until(ctx.conn, name, now) is not None
-            ctx.conn.execute("DELETE FROM kv WHERE key = ?", (muted_key(name),))
-            audit(ctx.conn, "ext.notify_unmuted", extension=name, requested_by=owner, was_muted=was)
+        was = notify.unmute(ctx.conn, name, by=owner)
         return {"extension": name, "muted_until": None, "was_muted": was}
     if off is not None or not isinstance(until_raw, str):
         raise ToolFailed("give either until or off")
@@ -191,9 +172,7 @@ def mute_extension(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
         raise ToolFailed("until needs a UTC offset")
     if until <= now or until > now + MUTE_MAX + MUTE_SLACK:
         raise ToolFailed("until must be in the future and at most 7 days ahead")
-    with atomic(ctx.conn):
-        kv_set(ctx.conn, muted_key(name), iso(until))
-        audit(ctx.conn, "ext.notify_muted", extension=name, requested_by=owner, until=iso(until))
+    notify.mute(ctx.conn, name, until, by=owner)
     tz = ctx.state.settings.timezone
     return {
         "extension": name,

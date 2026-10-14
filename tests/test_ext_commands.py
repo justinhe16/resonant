@@ -40,7 +40,7 @@ from resonant.store.db import kv_get, kv_set, transaction, utcnow
 from resonant.tools import ToolRegistry, builtin
 from resonant.tools.base import BuiltinContext
 from resonant.tools.ext import list_extensions, mute_extension
-from resonant_sdk import Event, Manifest, ToolSpec
+from resonant_sdk import Effect, Event, Manifest, ToolSpec
 from resonant_sdk.manifest import parse_yaml
 
 OWNER, MEMBER, HELPER = "justin", "cofounder", "helper"
@@ -390,7 +390,9 @@ async def test_ext_run_core_job_runs_inline_and_is_audited(
 def test_briefing_reply() -> None:
     assert briefing_reply({"sent": True}) == "Briefing sent."
     assert briefing_reply({"sent": False, "skipped": "paused"}) == "Paused: briefing not sent."
-    assert briefing_reply({"sent": False, "skipped": "unreachable"}).startswith("Briefing not")
+    assert briefing_reply({"sent": False, "skipped": "unreachable"}) == (
+        "Can't send: no channel/owner."
+    )
 
 
 async def test_ext_mute_is_a_direct_call(router: Router) -> None:
@@ -663,3 +665,50 @@ def test_manifest_snapshot_keeps_the_declared_arg_order(ctx: BuiltinContext) -> 
     stored_spec = next(s for s in stored.tool_specs() if s.name == "move")
     assert [n for n, _ in commands.arg_names(stored_spec)] == ["to", "count", "fast", "ratio"]
     assert commands.arg_names(stored_spec) == commands.arg_names(spec)
+
+
+def test_optional_args_backslashes_and_apostrophes() -> None:
+    spec = ToolSpec(
+        name="find",
+        args_schema={
+            "type": "object",
+            "properties": {"repo": {"type": "string"}, "state": {"type": "string"}},
+            "required": ["repo"],
+            "additionalProperties": False,
+        },
+        effect=Effect.READ,
+        extension="demo",
+    )
+    parse = commands.ext_tool_args(spec)
+    assert commands.ext_tool_usage("demo", spec) == "/demo find <repo> [<state>]"
+    assert parse("resonant", CTX) == {"repo": "resonant"}
+    assert parse("resonant open", CTX) == {"repo": "resonant", "state": "open"}
+    assert parse('C:\\x "a b"', CTX) == {"repo": "C:\\x", "state": "a b"}
+    with pytest.raises(UsageError, match="want 1 to 2 values, got 3"):
+        parse("a b c", CTX)
+    with pytest.raises(UsageError):
+        parse("", CTX)
+
+
+async def test_manual_run_keeps_the_schedulers_open_task(
+    db: sqlite3.Connection, principals: Principals, registry: ToolRegistry, host: FakeHost
+) -> None:
+    with transaction(db):
+        scheduled = repo.insert_task(
+            db, NewTask(kind="job", runner="job", priority=PRIORITY_OWNER, principal=OWNER)
+        )
+        ext_store.mark_due(db, "demo", "nightly", NOW, open_task_id=scheduled)
+
+    async def nightly(args: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    await run_direct(
+        db,
+        principals,
+        registry,
+        host,
+        {"extension": "demo", "tool": "job_nightly", "args": {"due_at": "x"}},
+        {("demo", "job_nightly"): nightly},
+    )
+    job = ext_store.get_job(db, "demo", "nightly")
+    assert job is not None and job.last_outcome == "ok" and job.open_task_id == scheduled

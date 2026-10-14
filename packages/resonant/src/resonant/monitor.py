@@ -10,6 +10,9 @@
   ``selftest_retry_s`` (30 min) while the last one failed.
 - ``loop``: ``Daemon.healthy()``, dead-lettered events and failed tasks in the last hour.
 - ``store``: the DB is writable and free disk is above ``min_free_bytes`` (2GB).
+- ``ext:<name>`` (dynamic, one per extension): from ``ext_checks``
+  (``extensions.host.ExtensionHealth``): the extension's health command, job fail streaks,
+  and load refusals or tampering. A removed extension's check is dropped.
 
 Each check is a small state machine ``ok -> degraded -> ok`` persisted in kv
 ``health.<check>`` = ``{state, since, detail, checked_at, ...}``. The owner gets one
@@ -17,7 +20,8 @@ iMessage per incident once a check has been degraded for ``alert_after`` (2) con
 evaluations, at most one per check per ``alert_cooldown_s`` (6h), and one "resolved: ..."
 message when an alerted incident clears. While the ``imessage`` check itself is degraded
 (or there is no channel), no iMessage is attempted: :meth:`HealthMonitor.deadman_reason`
-returns the reason and the dead-man ``/fail`` ping carries it instead. The same
+returns the reason and the dead-man ``/fail`` ping carries it instead (``ext:`` checks
+are not brain health and never reach the dead-man). The same
 happens after 3 consecutive failed owner sends. A cached model probe doesn't count as a new
 degraded evaluation, so the model alerts only after 2 failed probes (about 5 minutes).
 
@@ -48,6 +52,7 @@ log = logging.getLogger(__name__)
 CheckName = Literal["model", "imessage", "loop", "store"]
 CHECKS: tuple[CheckName, ...] = ("model", "imessage", "loop", "store")
 HEALTH_KV_PREFIX = "health."
+EXT_CHECK_PREFIX = "ext:"
 MODEL_PROBE_KV = "model.probe"  # same key and shape as `resonant model probe`
 SELFTEST_KV = "imessage.selftest"  # written by IMessageChannel.self_test
 DEAD_LETTER_ACTION = "event.dead_letter"
@@ -74,6 +79,14 @@ def scrub(text: str, limit: int = _MAX_DETAIL) -> str:
     """One line, URLs replaced by ``<url>``, capped at ``limit`` characters."""
     one_line = " ".join(_URL_RE.sub("<url>", text).split())
     return one_line if len(one_line) <= limit else one_line[: limit - 1] + "…"
+
+
+class DynamicChecks(Protocol):
+    """Checks whose names come and go (``ext:<name>``). ``evaluate`` returns every current
+    name with ``(result, fresh)`` or None (no observation this round); ``fresh`` False
+    means a repeat of an old observation, which doesn't count toward ``alert_after``."""
+
+    async def evaluate(self, now: datetime) -> Mapping[str, tuple[CheckResult, bool] | None]: ...
 
 
 class ModelProber(Protocol):
@@ -170,8 +183,20 @@ def _disk_free(path: Path) -> int:
 
 
 def health_snapshot(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
-    """``{check: {state, since, detail, checked_at}}`` from kv; ``unknown`` if never run."""
-    return {c: CheckState.from_kv(kv_get(conn, HEALTH_KV_PREFIX + c)).public() for c in CHECKS}
+    """``{check: {state, since, detail, checked_at}}`` from kv; ``unknown`` if never run.
+    The static checks, then every persisted ``ext:<name>`` check by name."""
+    snap = {c: CheckState.from_kv(kv_get(conn, HEALTH_KV_PREFIX + c)).public() for c in CHECKS}
+    for name in _ext_check_names(conn):
+        snap[name] = CheckState.from_kv(kv_get(conn, HEALTH_KV_PREFIX + name)).public()
+    return snap
+
+
+def _ext_check_names(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT key FROM kv WHERE key LIKE ? ORDER BY key",
+        (HEALTH_KV_PREFIX + EXT_CHECK_PREFIX + "%",),
+    ).fetchall()
+    return [str(r[0]).removeprefix(HEALTH_KV_PREFIX) for r in rows]
 
 
 def channels_snapshot(
@@ -247,6 +272,7 @@ class HealthMonitor:
         max_dead_letters_1h: int = 0,
         max_failed_tasks_1h: int = 2,
         send_failures_for_deadman: int = 3,
+        ext_checks: DynamicChecks | None = None,
     ) -> None:
         self.conn = conn
         self.model = model
@@ -269,7 +295,8 @@ class HealthMonitor:
         self.min_free_bytes = min_free_bytes
         self.max_dead_letters_1h = max_dead_letters_1h
         self.max_failed_tasks_1h = max_failed_tasks_1h
-        self.states: dict[CheckName, CheckState] | None = None  # loaded on first evaluate
+        self.ext_checks = ext_checks
+        self.states: dict[str, CheckState] | None = None  # loaded on first evaluate
         self._model_result: CheckResult | None = None
         self._model_probed_at: datetime | None = None
         self._model_fresh = False  # the last _check_model ran a new probe
@@ -294,7 +321,7 @@ class HealthMonitor:
 
     # --- one round -----------------------------------------------------------------------
 
-    async def evaluate(self) -> dict[CheckName, CheckState]:
+    async def evaluate(self) -> dict[str, CheckState]:
         """Run every check once, update state, persist it, then send alerts/recoveries."""
         states = self._load()
         now = self.clock()
@@ -310,9 +337,37 @@ class HealthMonitor:
                 # toward the alert debounce (so a single failed probe never alerts).
                 fresh = name != "model" or self._model_fresh
                 self._transition(states[name], result, now, count=fresh)
+        await self._evaluate_dynamic(states, now)
         self._persist(states)
         await self._notify(states, now)
         return states
+
+    async def _evaluate_dynamic(self, states: dict[str, CheckState], now: datetime) -> None:
+        if self.ext_checks is None:
+            return
+        try:
+            results = dict(await self.ext_checks.evaluate(now))
+        except Exception:
+            log.exception("extension health checks failed")
+            return
+        for name, observed in results.items():
+            if not name.startswith(EXT_CHECK_PREFIX):
+                continue
+            s = states.get(name)
+            if s is None:
+                s = states[name] = CheckState.from_kv(kv_get(self.conn, HEALTH_KV_PREFIX + name))
+            if observed is not None:
+                result, fresh = observed
+                self._transition(s, result, now, count=fresh)
+        gone = {n for n in states if n.startswith(EXT_CHECK_PREFIX)} - set(results)
+        gone |= set(_ext_check_names(self.conn)) - set(results)
+        for name in gone:  # the extension was removed or disabled
+            states.pop(name, None)
+            try:
+                with atomic(self.conn):
+                    self.conn.execute("DELETE FROM kv WHERE key = ?", (HEALTH_KV_PREFIX + name,))
+            except sqlite3.Error as e:
+                log.warning("health state not dropped: %s", type(e).__name__)
 
     def deadman_reason(self) -> str | None:
         """Reason for the dead-man ``/fail`` body, or None when the owner can be texted.
@@ -323,7 +378,11 @@ class HealthMonitor:
         """
         if self.states is None:
             return None
-        degraded = [(n, s) for n, s in self.states.items() if s.state == "degraded"]
+        degraded = [
+            (n, s)
+            for n, s in self.states.items()
+            if s.state == "degraded" and not n.startswith(EXT_CHECK_PREFIX)
+        ]
         if not degraded:
             return None
         sends_failing = self._send_failures >= self.send_failures_for_deadman
@@ -476,7 +535,7 @@ class HealthMonitor:
             and self.states["imessage"].state != "degraded"
         )
 
-    async def _notify(self, states: dict[CheckName, CheckState], now: datetime) -> None:
+    async def _notify(self, states: dict[str, CheckState], now: datetime) -> None:
         if not self._can_text_owner():
             return
         changed = False
@@ -518,14 +577,14 @@ class HealthMonitor:
 
     # --- persistence ---------------------------------------------------------------------
 
-    def _load(self) -> dict[CheckName, CheckState]:
+    def _load(self) -> dict[str, CheckState]:
         if self.states is None:
             self.states = {
                 c: CheckState.from_kv(kv_get(self.conn, HEALTH_KV_PREFIX + c)) for c in CHECKS
             }
         return self.states
 
-    def _persist(self, states: dict[CheckName, CheckState]) -> None:
+    def _persist(self, states: dict[str, CheckState]) -> None:
         try:
             with atomic(self.conn):
                 for name, s in states.items():

@@ -622,31 +622,48 @@ def ext_tool_args(spec: ToolSpec) -> Parse:
     with ``"`` or ``'`` (curly quotes too), typed per the manifest. A one-argument tool takes
     the rest of the text (one pair of surrounding quotes dropped)."""
     names = arg_names(spec)
+    required: object = spec.args_schema.get("required")
+    needed = set(cast(list[str], required)) if isinstance(required, list) else set[str]()
+    # Values fill the declared order; the fewest is up to the last required argument.
+    least = max((i + 1 for i, (n, _) in enumerate(names) if n in needed), default=0)
 
     def parse(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
         text = rest.strip()
-        if not names:
+        if not names or (not text and least == 0):
             return no_args(text)
         if not text:
             raise UsageError
         if len(names) == 1:
             name, kind = names[0]
-            value = _text(text, EXT_ARG_MAX) if kind == "string" else _word(text)
+            value = _text(text, EXT_ARG_MAX) if kind == "string" else text
             return {name: _typed(name, kind, value)}
-        try:
-            words = shlex.split(text.translate(_SMART_QUOTES))
-        except ValueError:
-            raise UsageError("a quote isn't closed") from None
-        if len(words) != len(names):
-            raise UsageError(f"want {len(names)} values, got {len(words)}")
-        return {n: _typed(n, k, w) for (n, k), w in zip(names, words, strict=True)}
+        words = _split(text)
+        if not least <= len(words) <= len(names):
+            want = str(len(names)) if least == len(names) else f"{least} to {len(names)}"
+            raise UsageError(f"want {want} values, got {len(words)}")
+        return {n: _typed(n, k, w) for (n, k), w in zip(names, words, strict=False)}
 
     return parse
 
 
+def _split(text: str) -> list[str]:
+    """Words, with ``"..."`` or ``'...'`` (curly quotes too) grouping; no backslash escapes."""
+    lexer = shlex.shlex(text.translate(_SMART_QUOTES), posix=True)
+    lexer.whitespace_split = True
+    lexer.escape = ""
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        raise UsageError("a quote isn't closed") from None
+
+
 def ext_tool_usage(ext: str, spec: ToolSpec) -> str:
     """``/github pr <repo> <number>``."""
-    return " ".join([f"/{ext} {spec.name}", *(f"<{n}>" for n, _ in arg_names(spec))])
+    required: object = spec.args_schema.get("required")
+    needed = set(cast(list[str], required)) if isinstance(required, list) else set[str]()
+    args = (f"<{n}>" if n in needed else f"[<{n}>]" for n, _ in arg_names(spec))
+    return " ".join([f"/{ext} {spec.name}", *args])
 
 
 def _clean(text: str, limit: int = EXT_DESCRIPTION_MAX) -> str:

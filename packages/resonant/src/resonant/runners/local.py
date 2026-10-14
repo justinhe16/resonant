@@ -82,6 +82,7 @@ from functools import partial
 from typing import Any, Protocol, cast
 
 from resonant.executor import NotAllowedError, ToolResult, idempotency_key
+from resonant.extensions.notify import take_baseline
 from resonant.extensions.scheduler import persist_events
 from resonant.gate import Allow, Decision, Deny, DryRun, Intent, NeedsApproval, canonical_json
 from resonant.gate.codes import clean_external
@@ -712,7 +713,11 @@ class LocalRunner:
                 s.set(recorded=True, ok=prior.ok, ambiguous=prior.ambiguous)
                 job = self._job_id(spec)
                 answer = _outcome(intent, prior)
-                return answer if job is None else _job_answer(intent, job, prior, answer)
+                if job is None or spec.extension is None:
+                    return answer
+                if not self._job_recorded(task.id):  # a crash after execute, before recording
+                    self._record_job(intent, spec.extension, job, prior)
+                return _job_answer(intent, job, prior, answer)
             decision = self.gate.evaluate(intent)
             s.set(decision=type(decision).__name__)
             return await self._decided(intent, decision, pinned, cp, spans)
@@ -754,18 +759,39 @@ class LocalRunner:
         jobs = manifest.jobs if manifest is not None else ()
         return next((j.id for j in jobs if j.spec_name == spec.name), None)
 
+    def _job_recorded(self, task_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM audit_log WHERE task_id = ? AND action IN "
+            "('job.run', 'job.failed', 'job.ambiguous') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return row is not None
+
     def _record_job(self, intent: Intent, ext: str, job: str, result: ToolResult) -> None:
         """A run of a job on demand, recorded like a scheduled one in one transaction:
-        ``ext_jobs`` (last run, fail streak), its events (on success; delivered by the
-        notifier) and a ``job.run`` / ``job.failed`` / ``job.ambiguous`` audit row marked
-        ``manual``. ``last_due`` is untouched, so the schedule is unchanged."""
+        ``ext_jobs`` (last run, fail streak; ``last_due`` and ``open_task_id`` untouched, so
+        the schedule and overlap checks are unchanged), its events (on success; the job's
+        first run after install is a baseline, stored and never notified) and a ``job.run``
+        / ``job.failed`` / ``job.ambiguous`` audit row marked ``manual``. A crash between
+        the executor's record and this one is caught on resume (``_job_recorded``); a
+        replayed result has no events, so those are lost, as in ``JobRunner``."""
         outcome = "ok" if result.ok else ("ambiguous" if result.ambiguous else "failed")
         with transaction(self.conn):
-            ext_store.record_run(self.conn, ext, job, at=self.now(), outcome=outcome, ok=result.ok)
+            ext_store.record_run(
+                self.conn,
+                ext,
+                job,
+                at=self.now(),
+                outcome=outcome,
+                ok=result.ok,
+                clear_open=False,
+            )
             n = 0
             if result.ok:
-                # P3-12: the job's first run after install is a baseline (not notified).
-                n = persist_events(self.conn, ext, result.events, trace_id=intent.trace_id)
+                first = take_baseline(self.conn, ext, job)
+                n = persist_events(
+                    self.conn, ext, result.events, trace_id=intent.trace_id, baseline=first
+                )
             audit(
                 self.conn,
                 "job.run" if result.ok else f"job.{outcome}",

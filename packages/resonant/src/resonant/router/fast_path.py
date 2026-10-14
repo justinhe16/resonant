@@ -529,6 +529,7 @@ class FastPath:
                 extension=CORE_EXT,
                 job=label,
                 manual=True,
+                reply=text,  # code-built: what happened (sent, paused, unreachable)
             )
         return FastPathResult(text, label, command=f"/ext run {label}", intent=cmd.intent)
 
@@ -547,7 +548,7 @@ class FastPath:
 
 BRIEFING_SENT = "Briefing sent."
 BRIEFING_PAUSED = "Paused: briefing not sent."
-BRIEFING_UNREACHABLE = "Briefing not sent: no owner to send it to."
+BRIEFING_UNREACHABLE = "Can't send: no channel/owner."
 
 
 def briefing_reply(result: Mapping[str, Any]) -> str:

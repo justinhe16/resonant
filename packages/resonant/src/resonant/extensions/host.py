@@ -18,47 +18,63 @@ For each ``enabled`` row (``store.extensions``), in name order:
    apart.
 
 Any refusal in 2-4 skips the whole extension (nothing half-registered), is audited
-``ext.load_refused`` and is kept in ``refused`` for health (P3-12). The status is left
+``ext.load_refused`` and is kept in ``refused`` for health. The status is left
 alone: those are not tampering. A load never raises for one bad extension.
 
 ``handlers`` is merged into the executor's map at build. ``approvers_for`` is the gate's
 manifest-approvers seam. ``tracker`` is the one ``ProcessTracker`` for the kill switch.
 ``scheduled_jobs()`` is what the scheduler (``extensions/scheduler.py``) runs.
+
+Health (D11). The manifest's ``health.check`` is compiled at load like a tool (no
+placeholders; a pinned ``gh``/``git`` uses ``argv0_paths["health"]``).
+``ExtensionHealth`` turns the loaded, refused and tampered extensions into the monitor's
+``ext:<name>`` checks.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shlex
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 
 import yaml
 from pydantic import ValidationError
 
+from resonant import killswitch
 from resonant.config import Settings
 from resonant.executor import HandlerKey
 from resonant.extensions import pin
 from resonant.extensions.checks import ALLOWED_COMMANDS, dir_errors
 from resonant.extensions.handlers import ExtensionHandler
 from resonant.extensions.process import (
+    ExtAmbiguous,
     ExtCommand,
+    ExtFailed,
     ExtProcess,
+    ExtRequest,
     ExtRunner,
     ProcessTracker,
     TemplateError,
+    ensure_data_dir,
+    scratch_env,
 )
 from resonant.gateway.channel import ChannelError, ChannelRefused
+from resonant.monitor import CheckResult
 from resonant.ops import Sender
+from resonant.redact import Redactor
+from resonant.secrets import SecretError, SecretStore, values_of
 from resonant.store import extensions as store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set
 from resonant.tools.registry import ToolRegistry
 from resonant_sdk import Manifest, ToolSpec
-from resonant_sdk.manifest import Job, load_manifest
+from resonant_sdk.manifest import Job, duration_s, load_manifest
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +97,7 @@ class LoadedExtension:
     root: Path
     tools: tuple[ToolSpec, ...]
     jobs: tuple[ToolSpec, ...]
+    health: ExtCommand | None = None  # the compiled manifest ``health.check``
 
 
 @dataclass(frozen=True)
@@ -223,7 +240,17 @@ class ExtensionHost:
                 path_env=self.path_env,
                 job=job,
             )
-        ext = LoadedExtension(record, manifest, root, tools, jobs)
+        health: ExtCommand | None = None
+        if manifest.health is not None:
+            try:
+                health = ExtCommand.compile(
+                    manifest.health.check, root=root, argv0=record.argv0_paths.get("health")
+                )
+            except TemplateError as e:
+                raise LoadRefused(f"health: {e}") from None
+            if health.placeholders:
+                raise LoadRefused("health: the check takes no placeholders")
+        ext = LoadedExtension(record, manifest, root, tools, jobs, health)
         return ext, handlers
 
     def _register(
@@ -318,6 +345,138 @@ class ExtensionHost:
         except Exception:
             log.exception("approvers_for failed; owner only")
             return ()
+
+
+# --- health (D11) -------------------------------------------------------------------------
+
+FAIL_STREAK_ALERT = 3
+TAMPERED_DETAIL = "disabled: changed on disk since you approved it"
+
+
+@dataclass
+class _HealthRun:
+    at: datetime
+    ok: bool
+    detail: str
+
+
+@dataclass
+class ExtensionHealth:
+    """The monitor's dynamic ``ext:<name>`` checks (``HealthMonitor(ext_checks=...)``).
+
+    One check per extension that is loaded, refused at load, or ``disabled_tampered``.
+    A loaded one is ok unless its manifest ``health.check`` failed (run every
+    ``health.every`` through the process runner, with the extension's declared secrets and
+    ``extensions.process.health_timeout_s``; exit 0 is ok) or a job has failed
+    ``FAIL_STREAK_ALERT`` (3) times in a row (``ext_jobs.fail_streak``). Refused and
+    tampered ones are always degraded. While paused no command runs (the last result
+    stands). Details are code-built: stderr never reaches them.
+    """
+
+    host: ExtensionHost
+    secrets: SecretStore | None = None
+    timeout_s: float = 20.0
+    _last: dict[str, _HealthRun] = field(default_factory=dict[str, _HealthRun])
+
+    @classmethod
+    def from_settings(
+        cls, settings: Settings, host: ExtensionHost, secrets: SecretStore | None
+    ) -> ExtensionHealth:
+        return cls(host, secrets, settings.extensions.process.health_timeout_s)
+
+    async def evaluate(self, now: datetime) -> dict[str, tuple[CheckResult, bool] | None]:
+        """``{"ext:<name>": (result, fresh) | None}`` for every current extension. ``fresh``
+        is False when only a cached health result is failing (it doesn't count toward the
+        alert debounce again); None means no observation this round."""
+        host = self.host
+        out: dict[str, tuple[CheckResult, bool] | None] = {}
+        tampered = {r.name for r in store.list_extensions(host.conn, status="disabled_tampered")}
+        for name in sorted(tampered | set(host.tampered)):
+            out[f"ext:{name}"] = (CheckResult(False, TAMPERED_DETAIL), True)
+        for name, reason in sorted(host.refused.items()):
+            out[f"ext:{name}"] = (CheckResult(False, f"not loaded: {reason}"), True)
+        names = sorted(host.loaded)
+        for gone in set(self._last) - set(names):
+            del self._last[gone]
+        ran = await asyncio.gather(*(self._run_if_due(n, now) for n in names))
+        for name, fresh_run in zip(names, ran, strict=True):
+            out[f"ext:{name}"] = self._result(name, fresh_run)
+        return out
+
+    def _result(self, name: str, fresh_run: bool) -> tuple[CheckResult, bool]:
+        streaks = [
+            f"job {j.job_id} failed {j.fail_streak} times in a row"
+            for j in store.list_jobs(self.host.conn, name)
+            if j.fail_streak >= FAIL_STREAK_ALERT
+        ]
+        last = self._last.get(name)
+        problems = ([last.detail] if last is not None and not last.ok else []) + streaks
+        if not problems:
+            return CheckResult(True, "ok"), True
+        return CheckResult(False, "; ".join(problems)), fresh_run or bool(streaks)
+
+    async def _run_if_due(self, name: str, now: datetime) -> bool:
+        ext = self.host.loaded[name]
+        if ext.health is None or ext.manifest.health is None:
+            return False
+        last = self._last.get(name)
+        every = timedelta(seconds=duration_s(ext.manifest.health.every))
+        if last is not None and now - last.at < every:
+            return False
+        if self.host.tracker.paused or _paused(self.host.conn):
+            return False
+        try:
+            ok, detail = await self._run(name, ext, ext.health)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # a health check never takes the monitor down
+            log.warning("health check raised %s", type(e).__name__, extra={"extension": name})
+            ok, detail = False, f"health check error ({type(e).__name__})"
+        if detail == "paused":
+            return False
+        self._last[name] = _HealthRun(now, ok, detail)
+        return True
+
+    async def _run(self, name: str, ext: LoadedExtension, command: ExtCommand) -> tuple[bool, str]:
+        env_secrets: dict[str, str] = {}
+        if ext.manifest.secrets:
+            try:
+                if self.secrets is None:
+                    raise SecretError(f"{name}/{ext.manifest.secrets[0]}", "unavailable")
+                env_secrets = await self.secrets.env_for(name, ext.manifest.secrets)
+            except SecretError:
+                return False, "health check: a declared secret is missing or unreadable"
+        data_dir = self.host.data_dir / name
+        ensure_data_dir(data_dir)
+        env = scratch_env(ext=name, data_dir=data_dir, secrets=env_secrets, path=self.host.path_env)
+        redactor = Redactor(values_of(env))
+        req = ExtRequest(
+            argv=command.render({}),
+            cwd=ext.root,
+            env=env,
+            timeout_s=self.timeout_s,
+            label=f"{name}/health",
+        )
+        try:
+            raw = await self.host.runner.run_raw(req, redact=redactor.text)
+        except ExtFailed as e:
+            if e.reason == "paused":
+                return False, "paused"
+            return False, "health check could not start"
+        except ExtAmbiguous as e:
+            return False, f"health check {'timed out' if e.reason == 'timeout' else 'cut short'}"
+        if raw.returncode == 0:
+            return True, "ok"
+        if raw.returncode < 0:
+            return False, f"health check killed (signal {-raw.returncode})"
+        return False, f"health check failed (exit {raw.returncode})"
+
+
+def _paused(conn: sqlite3.Connection) -> bool:
+    try:
+        return killswitch.is_paused(conn)
+    except killswitch.PausedStateUnknownError:
+        return True
 
 
 def pending_alerts(conn: sqlite3.Connection) -> dict[str, dict[str, str]]:
