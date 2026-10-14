@@ -71,6 +71,7 @@ class NewTask:
     origin_event_id: str | None = None
     channel_ref: dict[str, Any] | None = None
     trace_id: str | None = None
+    wake_at: datetime | None = None  # not before (e.g. a reminder's due time)
 
 
 # --- step outcomes -------------------------------------------------------------------

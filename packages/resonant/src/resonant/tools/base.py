@@ -13,11 +13,14 @@ a module may use; later phases add fields with defaults so existing modules keep
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.principals import Principals
+from resonant.store.db import utcnow
 from resonant.tools.registry import ToolRegistry
 from resonant_sdk import ToolSpec
 
@@ -33,6 +36,7 @@ class BuiltinContext:
     state: DaemonState
     registry: ToolRegistry  # the full registry, read at call time (extensions included)
     principals: Principals
+    clock: Callable[[], datetime] = utcnow  # aware UTC; tests pass a fake
 
 
 class BuiltinModule(Protocol):

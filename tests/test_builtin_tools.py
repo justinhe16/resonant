@@ -38,10 +38,19 @@ NAMES = {
     "add_note",
     "delete_note",
     "clear_notes",
+    "add_reminder",
+    "list_reminders",
+    "cancel_reminder",
     "projects",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
-WRITES = {"add_note": Level.L3, "delete_note": Level.L3, "clear_notes": Level.L1}
+WRITES = {
+    "add_note": Level.L3,
+    "delete_note": Level.L3,
+    "clear_notes": Level.L1,
+    "add_reminder": Level.L3,
+    "cancel_reminder": Level.L3,
+}
 
 
 @pytest.fixture
