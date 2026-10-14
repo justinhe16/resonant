@@ -377,3 +377,41 @@ def test_mixed_zones_compare_in_utc() -> None:
     # `now` in UTC and `last_due` in LA give the same answer as both in LA.
     d = run(now=(NINE + timedelta(seconds=5)).astimezone(UTC), last_due=NINE - timedelta(days=1))
     assert d.outcome is Outcome.RUN and d.due == NINE
+
+
+def test_on_time_follows_the_tick() -> None:
+    # A 90 s tick sees 09:00 at 09:01:20: on time with on_time=2 min, missed with the default.
+    now, last = NINE + timedelta(seconds=80), NINE - timedelta(days=1)
+    assert run(now=now, last_due=last).outcome is Outcome.MISSED
+    d = decide(
+        DAILY_9,
+        now=now,
+        last_due=last,
+        paused=False,
+        catchup=None,
+        downtime=None,
+        busy=False,
+        on_time=timedelta(minutes=2),
+    )
+    assert d.outcome is Outcome.RUN and not d.late
+
+
+def test_truncated_idle_advances_last_due() -> None:
+    yearly = parse_schedule("0 9 1 1 *", TZ)
+    d = run(yearly, now=NINE, last_due=NINE - timedelta(days=400))
+    assert d.outcome is Outcome.IDLE and d.truncated
+    assert d.last_due == NINE - LOOKBACK
+    assert run(yearly, now=NINE + timedelta(minutes=1), last_due=d.last_due) == Decision(
+        Outcome.IDLE
+    )
+
+
+def test_unknown_timezone_is_a_cron_error() -> None:
+    with pytest.raises(CronError, match="unknown timezone"):
+        parse_schedule("0 9 * * *", "Mars/Olympus")
+
+
+def test_downtime_needs_aware() -> None:
+    down = Downtime(since=NINE - timedelta(hours=1), until=NINE)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        down.covers(datetime(2026, 10, 14, 9))

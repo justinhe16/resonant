@@ -464,12 +464,12 @@ Schedule(expr, tz).next_after(after) -> datetime | None     # strictly after; Lo
 Schedule.due_between(after, until) -> list[datetime]        # (after, until], ascending
 Downtime(since, until)        # daemon not running over (since, until]: last tick, then started_at
 decide(schedule, *, now, last_due, paused, catchup: timedelta | None, downtime: Downtime | None,
-       busy: bool) -> Decision
+       busy: bool, on_time: timedelta = ON_TIME) -> Decision
 Decision(outcome: Outcome, due, late, missed, skipped, truncated, last_due)
 Outcome: idle | run | skipped_paused | overlap | missed
 ```
 
-- **Expressions** are five-field cron on `cronsim`. `@daily`, six fields (seconds), bad fields and schedules that never fire raise `CronError` with the reason (`'60 * * * *': bad minute`). Whitespace is normalized into `Schedule.expr`.
+- **Expressions** are five-field cron on `cronsim`. `@daily`, six fields (seconds), bad fields and schedules that never fire raise `CronError` with the reason (an unknown zone too) (`'60 * * * *': bad minute`). Whitespace is normalized into `Schedule.expr`.
 - **Every returned datetime is UTC.** Aware datetimes sharing a `ZoneInfo` compare by wall time and ignore `fold`, so compare and store in UTC (`store.db.iso` already does).
 - **DST** (Debian cron semantics, pinned for `America/Los_Angeles`):
 
@@ -480,10 +480,10 @@ Outcome: idle | run | skipped_paused | overlap | missed
 
 - **`decide` precedence**, over the due times in `(last_due, now]` (with `last_due=None`, only an on-time one, nothing missed):
   1. **Pause wins.** `paused` → `skipped_paused` with every due time in `skipped`; `last_due` moves past them, so nothing is caught up after `/resume`.
-  2. **Catch-up.** Only the latest due time can run: if it's on time (within `ON_TIME` = 1 min of `now`), or `catchup` is set, it is within `catchup` of `now`, and `downtime` covers it. A paused or merely stalled daemon never catches up. Otherwise `missed`. Earlier due times are always in `missed` (`job.missed`).
+  2. **Catch-up.** Only the latest due time can run: if it's on time (within `on_time` of `now`, default `ON_TIME` = 1 min; the scheduler passes at least its tick interval), or `catchup` is set, it is within `catchup` of `now`, and `downtime` covers it. A paused or merely stalled daemon never catches up. Otherwise `missed`. Earlier due times are always in `missed` (`job.missed`).
   3. **Overlap.** `busy` (the previous run is still running, or its task is waiting) turns `run` into `overlap` (`job.overlap`); the due time is still consumed.
 - `run` carries `due` and `late` (a catch-up). Whenever something came due, `last_due` is the latest due time, for `store.extensions.mark_due`.
-- `catchup` must be within 0–24h (`MAX_CATCHUP`), else `ValueError`. `missed`/`skipped` list at most the 50 most recent (`MAX_LISTED`), and only due times within 31 days (`LOOKBACK`); `truncated` says more were dropped.
+- `catchup` must be within 0–24h (`MAX_CATCHUP`), else `ValueError`. `missed`/`skipped` list at most the 50 most recent (`MAX_LISTED`), and only due times within 31 days (`LOOKBACK`); `truncated` says more were dropped; an `idle` with `truncated` returns `last_due` at the lookback edge so later ticks don't rescan.
 
 ## Phase 3 config: `resonant.config`
 

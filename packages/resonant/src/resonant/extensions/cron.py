@@ -22,7 +22,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cronsim import CronSim, CronSimError
 
@@ -55,14 +55,12 @@ class Schedule:
         # really later than the previous one. Compare in UTC: aware datetimes sharing a
         # tzinfo compare by wall time, ignoring ``fold``.
         prev = after.astimezone(UTC)
-        try:
-            for local in CronSim(self.expr, after.astimezone(self.tz)):
-                due = local.astimezone(UTC)
-                if due > prev:
-                    prev = due
-                    yield due
-        except StopIteration:  # cronsim gives up after 50 years without a match
-            return
+        # cronsim ends the iteration after 50 years without a match.
+        for local in CronSim(self.expr, after.astimezone(self.tz)):
+            due = local.astimezone(UTC)
+            if due > prev:
+                prev = due
+                yield due
 
     def next_after(self, after: datetime) -> datetime | None:
         """The first due time strictly after ``after``, or None if it never fires again."""
@@ -82,7 +80,10 @@ class Schedule:
 
 def parse_schedule(expr: str, tz: ZoneInfo | str) -> Schedule:
     """Validate ``expr`` (five fields) in ``tz``. Raises :class:`CronError` with the reason."""
-    zone = tz if isinstance(tz, ZoneInfo) else ZoneInfo(tz)
+    try:
+        zone = tz if isinstance(tz, ZoneInfo) else ZoneInfo(tz)
+    except (ValueError, ZoneInfoNotFoundError) as e:
+        raise CronError(f"unknown timezone {tz!r}") from e
     text = " ".join(expr.split())
     if not text:
         raise CronError("empty cron expression")
@@ -121,6 +122,7 @@ class Downtime:
     until: datetime
 
     def covers(self, t: datetime) -> bool:
+        _aware(t, "t")
         return self.since.astimezone(UTC) < t.astimezone(UTC) <= self.until.astimezone(UTC)
 
 
@@ -131,7 +133,7 @@ class Decision:
     outcome: Outcome
     # The due time that runs (RUN) or was skipped because the previous run is live (OVERLAP).
     due: datetime | None = None
-    # True when ``due`` is a catch-up (older than ON_TIME).
+    # True when ``due`` is a catch-up (older than ``on_time``).
     late: bool = False
     # Due times that won't run, for job.missed audits: the most recent MAX_LISTED, ascending.
     missed: tuple[datetime, ...] = ()
@@ -152,6 +154,7 @@ def decide(
     catchup: timedelta | None,
     downtime: Downtime | None,
     busy: bool,
+    on_time: timedelta = ON_TIME,
 ) -> Decision:
     """What one scheduler tick does with a job. Precedence: pause, then catch-up, then overlap.
 
@@ -160,9 +163,9 @@ def decide(
     - **Pause wins.** Paused, every due time is skipped and ``last_due`` moves past them,
       so nothing is caught up after a resume.
     - **Catch-up.** Only the latest due time can run. It runs if it is on time (within
-      ``ON_TIME`` of ``now``), or if ``catchup`` is set, it is within ``catchup`` of
-      ``now``, **and** ``downtime`` covers it (the daemon wasn't running, as opposed to
-      paused or stalled). Every other due time is missed.
+      ``on_time`` of ``now``; pass at least the tick interval), or if ``catchup`` is set,
+      it is within ``catchup`` of ``now``, **and** ``downtime`` covers it (the daemon
+      wasn't running, as opposed to paused or stalled). Every other due time is missed.
     - **Overlap.** ``busy`` (the previous run is still running, or its task is waiting)
       turns a run into OVERLAP; the due time is still consumed.
     """
@@ -172,7 +175,7 @@ def decide(
         raise ValueError(f"catchup must be between 0 and {MAX_CATCHUP}")
     truncated = False
     if last_due is None:
-        start = now - ON_TIME
+        start = now - on_time
     else:
         _aware(last_due, "last_due")
         last_due = last_due.astimezone(UTC)
@@ -182,7 +185,8 @@ def decide(
             truncated = first is not None and first <= start
     due_times = schedule.due_between(start, now)
     if not due_times:
-        return Decision(Outcome.IDLE, truncated=truncated)
+        # Due times only before the lookback: move last_due up so later ticks don't rescan.
+        return Decision(Outcome.IDLE, truncated=truncated, last_due=start if truncated else None)
     latest = due_times[-1]
     if len(due_times) > MAX_LISTED:
         truncated = True
@@ -195,11 +199,11 @@ def decide(
         )
     older = due_times[:-1]
     age = now - latest
-    on_time = age < ON_TIME
+    is_on_time = age < on_time
     catchable = (
         catchup is not None and age <= catchup and downtime is not None and downtime.covers(latest)
     )
-    if not (on_time or catchable):
+    if not (is_on_time or catchable):
         return Decision(
             Outcome.MISSED,
             missed=tuple(due_times[-MAX_LISTED:]),
@@ -210,7 +214,7 @@ def decide(
     return Decision(
         outcome,
         due=latest,
-        late=not on_time,
+        late=not is_on_time,
         missed=tuple(older[-MAX_LISTED:]),
         truncated=truncated,
         last_due=latest,
