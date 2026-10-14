@@ -8,6 +8,19 @@ ticket adds its own scenarios here.
 The E7 cases drive extension calls with ``ExtScriptRunner``: it sends each call in its
 checkpoint through the daemon's own gate and executor inside a loop step. From P3-14 on,
 scenarios use ``/<ext> <tool>`` and ``/ext`` over iMessage.
+
+Exit criteria (docs/phase3-plan.md §1) and where each is covered:
+
+- E1, E2, E9.2: ``test_e1_e2_e9_example_install_restart_commands_and_repo_update`` (the
+  install screen's details and ``--adopt``: ``test_ext_manager.py``)
+- E2, E14: ``test_e2_e14_github_commands_over_imessage``, ``test_ext_commands.py``
+- E3: ``test_e3_show_my_prs_routes_to_github_and_runs_prs``, ``test_router_extensions.py``
+- E4: ``test_e4_morning_ping_first_run_is_baseline_then_sends_once``, ``test_scheduler.py``
+- E5, E6, E11: ``test_scheduler.py`` (fake clock, ``FakeExtProcess``)
+- E7: ``test_e7_*``; E8: ``test_e8_*`` here and in ``test_scheduler.py``
+- E9.1: ``test_e9_*``; E9.3 and E10: ``test_ext_manager.py``
+- E12: ``test_e12_*``; E13: ``test_e13_e14_*``, ``test_briefing.py``
+- E15 is live: docs/go-live.md step 12.
 """
 
 from __future__ import annotations
@@ -18,21 +31,27 @@ import contextlib
 import inspect
 import json
 import logging
+import os
 import re
+import shutil
 import socket
 import sqlite3
+import subprocess
 import sys
 import urllib.parse
 from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import psutil
 import pytest
+from typer.testing import CliRunner
 
 import resonant_sdk.emit
+from resonant import cli
 from resonant.components import Components
 from resonant.config import Settings, load_settings
 from resonant.daemon import Daemon
@@ -41,6 +60,7 @@ from resonant.e2e.extensions import install_fixture
 from resonant.e2e.fakes import DEFAULT_FINAL_REPLY
 from resonant.extensions.host import tampered_text
 from resonant.extensions.notify import mute
+from resonant.extensions.pin import tree_digest
 from resonant.extensions.scheduler import LAST_TICK_KEY, persist_events
 from resonant.gate import Allow, Intent
 from resonant.gateway.imessage.fixtures import FakeChatDB
@@ -212,7 +232,7 @@ class Running:
         return self.script.results[task_id]
 
 
-def settings_for(home: Path, chat: FakeChatDB) -> Settings:
+def settings_for(home: Path, chat: FakeChatDB, **overrides: Any) -> Settings:
     (home / "principals.yaml").write_text(PRINCIPALS)
     return load_settings(
         dry_run=False,
@@ -220,6 +240,7 @@ def settings_for(home: Path, chat: FakeChatDB) -> Settings:
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
+        **overrides,
     )
 
 
@@ -657,6 +678,8 @@ async def test_e2_e14_github_commands_over_imessage(
         assert " · 4 tools" in lines[1]
         assert lines[2].startswith("- digest (L0) · next ")
         assert lines[3].startswith("- watch (L0) · next ")
+        assert lines[4] == "core · built in"  # core jobs too, next due from config
+        assert lines[5].startswith("- briefing (L0) · next ") and "8:00am" in lines[5]
 
         # /ext run github/watch: the job spec, explicit at its level, recorded as a run.
         assert await say("/ext run github/watch") == ("github/watch: done: 1 PRs watched, 0 events")
@@ -870,4 +893,166 @@ async def test_e12_github_red_green_red_notifies_exactly_once_across_crashes(
     assert d.imessage is not None
     await d.imessage.monitor.evaluate()
     assert health_snapshot(d.conn)["ext:github"]["state"] == "ok"
+    d.conn.close()
+
+
+# --- E1 / E2 / E9.2: the real example, installed from a checkout by the CLI (P3-16) --------
+
+EXAMPLE = REPO / "extensions/example"
+GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@example.com",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@example.com",
+}
+
+
+def git(cwd: Path, *args: str) -> str:
+    env = {**os.environ, **GIT_ENV}
+    out = subprocess.run(
+        ["git", "-C", str(cwd), *args], env=env, check=True, capture_output=True, text=True
+    )
+    return out.stdout.strip()
+
+
+def checkout_with_example(root: Path) -> Path:
+    """A Resonant-like checkout with the real ``extensions/example`` committed on main."""
+    root.mkdir()
+    git(root, "init", "-q", "-b", "main")
+    shutil.copytree(EXAMPLE, root / "extensions" / "example")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "example")
+    return root
+
+
+async def test_e1_e2_e9_example_install_restart_commands_and_repo_update(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = settings_for(resonant_home, chat)
+    # The shipped manifests name the approver `owner`, as go-live step 4 names the owner.
+    (resonant_home / "principals.yaml").write_text(PRINCIPALS.replace("justin:", "owner:"))
+    checkout = checkout_with_example(tmp_path / "checkout")
+    keychain = FakeKeychain()
+    ops = FakeOpsRunner()
+    monkeypatch.setenv("RESONANT_OPS__REPO_PATH", str(checkout))
+
+    def daemon_up(settings: Settings) -> bool:
+        return True
+
+    monkeypatch.setattr(cli, "_daemon_up", daemon_up)
+    monkeypatch.setattr(cli, "_restart_runner", lambda: ops)
+    monkeypatch.setattr(cli, "_secret_store", lambda: SecretStore(keychain))
+
+    open_db(settings.db_path).close()  # the daemon has run once (go-live step 6)
+
+    # E1: `resonant ext add repo:example`, confirmed by typing the name.
+    result = CliRunner().invoke(cli.app, ["ext", "add", "repo:example"], input="example\n")
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert re.fullmatch(r"example repo:example@[0-9a-f]{8} digest [0-9a-f]{8}", lines[0])
+    escalations = lines.index("Escalations:")
+    assert escalations < next(i for i, line in enumerate(lines) if "get_time" in line)
+    assert "Type example to install" in result.output
+    assert re.search(r"^Installed example repo:example@[0-9a-f]{8} ", result.output, re.M)
+    copy = settings.extensions_dir / "example"
+    with contextlib.closing(open_db(settings.db_path)) as conn:
+        rec = get_extension(conn, "example")
+    assert rec is not None and rec.status == "enabled" and rec.tree_digest == tree_digest(copy)
+    assert not os.access(copy / "cli.py", os.W_OK)  # the approved copy is read-only
+    (spawned,) = ops.spawned  # the reply-first restart helper, never launchctl here
+    assert "resonant.ops.restart_later" in spawned
+
+    # The restarted daemon says it's back, with the install note, then the tools work.
+    osa = RecordingOsaRunner()
+    async with start_daemon(settings, keychain, osa) as r:
+        back = await osa.wait_for(1, 10)
+        assert back.handle == OWNER_PHONE
+        assert re.fullmatch(r"Back up, down \S+\nInstalled example", back.text), back.text
+        n = 1
+
+        async def say(text: str) -> str:
+            nonlocal n
+            n += 1
+            chat.add_message(handle=OWNER_PHONE, text=text)
+            return (await osa.wait_for(n, 20)).text
+
+        # E2: an L0 read answers inline; an L3 write runs and reports.
+        assert await say("/example get_time Asia/Tokyo") == "example get_time: ok"
+        assert await say("/example write_note hi") == 'Done: example: write note text="hi"'
+        assert (settings.ext_data_dir / "example" / "notes.txt").read_text() == "hi\n"
+        help_text = await say("/help example")
+        assert "/example get_time <tz>: Current time in a timezone. (L0)" in help_text
+        assert "/example write_note <text>: " in help_text and "(L3)" in help_text
+        assert await say("/exmaple hi") == "Unknown command /exmaple. Did you mean /example?"
+        assert [g[:2] for g in gate_rows(r.conn, "example") if g[2] == "explicit"] == [
+            ("get_time", "Allow"),
+            ("write_note", "Allow"),
+        ]
+
+    # E9.2: an update of the checkout (what /update's pull does) never touches the copy.
+    before = tree_digest(copy)
+    git(checkout, "rm", "-q", "extensions/example/README.md")
+    (checkout / "extensions/example/cli.py").write_text("raise SystemExit(3)\n")
+    git(checkout, "commit", "-qam", "change example in the repo")
+    osa2 = RecordingOsaRunner()
+    async with start_daemon(settings, keychain, osa2) as r:
+        chat.add_message(handle=OWNER_PHONE, text="/example get_time UTC")
+        reply = await osa2.wait_for(1, 20)
+        assert reply.text == "example get_time: ok"
+        assert tamper_alerts(osa2) == []
+        rec = get_extension(r.conn, "example")
+        assert rec is not None and rec.status == "enabled"
+    assert tree_digest(copy) == before and (copy / "README.md").exists()
+
+
+def tamper_alerts(osa: RecordingOsaRunner) -> list[str]:
+    return [m.text for m in osa.sent if "changed on disk" in m.text]
+
+
+# --- E4: the example's morning-ping, notified exactly once after the baseline (P3-16) -------
+
+
+def weekday_eight(tz: str, after: datetime) -> datetime:
+    """The first weekday 08:00 local strictly after ``after`` (aware UTC)."""
+    zone = ZoneInfo(tz)
+    day = after.astimezone(zone).date() + timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return datetime.combine(day, time(8), zone).astimezone(UTC)
+
+
+async def test_e4_morning_ping_first_run_is_baseline_then_sends_once(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    # The briefing is also due at 08:00; its own test is E13.
+    settings = settings_for(resonant_home, chat, briefing={"enabled": False})
+    files = {rel: (EXAMPLE / rel).read_text() for rel in ("cli.py", "README.md")}
+    install(settings, (EXAMPLE / "resonant.yaml").read_text(), files)
+    osa = RecordingOsaRunner()
+    d = github_daemon(settings, osa)  # its parts, not its run loop
+
+    async def due(at: datetime) -> None:
+        for _ in range(2):  # a second tick at the same time runs nothing more
+            await d.scheduler.tick(at)
+            await d.scheduler.drain()
+        await d.loop.run_once()
+
+    first = weekday_eight(settings.timezone, utcnow())
+    await due(first)  # the first run after install: stored as the silent baseline
+    assert [m.text for m in osa.sent] == []
+    second = weekday_eight(settings.timezone, first)
+    await due(second + timedelta(seconds=5))
+    assert [(m.handle, m.text) for m in osa.sent] == [(OWNER_PHONE, "[example] ping")]
+    # No task rows: only ext_jobs, the job.run audit rows and the two events.
+    assert d.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    job = get_job(d.conn, "example", "morning-ping")
+    assert job is not None and job.last_due == second and job.last_outcome == "ok"
+    assert [json.loads(r["detail"])["job"] for r in audit_rows(d.conn, "job.run")] == [
+        "example/morning-ping",
+        "example/morning-ping",
+    ]
+    keys = [r["dedupe_key"] for r in d.conn.execute("SELECT dedupe_key FROM events")]
+    assert keys == [f"ext:example:ping:{iso(first)}", f"ext:example:ping:{iso(second)}"]
     d.conn.close()

@@ -3,7 +3,9 @@
 Loads config and principals with the daemon's own loaders and prints one line per
 check: ``STATUS<TAB>REQUIRED<TAB>STEP<TAB>DETAIL`` (STATUS is PASS, FAIL or SKIP ...).
 It never writes anything: no files, no database, no network. The store is opened read-only,
-git runs with ``--no-optional-locks`` and ``pmset`` only with ``-g``. See docs/go-live.md.
+git runs with ``--no-optional-locks`` and ``pmset`` only with ``-g``. Keychain secrets are
+checked for existence only (``security find-generic-password`` without ``-w``), never read.
+See docs/go-live.md.
 """
 
 from __future__ import annotations
@@ -12,10 +14,18 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from resonant.config import Settings
+    from resonant.store.extensions import ExtensionRecord
+
+Row = tuple[str, bool, str, str]  # (status, required, step, detail)
 
 # The values config/*.example.yaml ship with. Seeded config still holding them is not live.
 EXAMPLE_SELF_HANDLE = "resonant@example.com"
@@ -23,6 +33,7 @@ EXAMPLE_IDENTITIES = frozenset({"imessage:+15550000000", "imessage:owner@icloud.
 NOT_YET = "SKIP (available after Phase 1)"
 DEFAULT_CHAT_DB = "~/Library/Messages/chat.db"
 PHASE2_SCHEMA = 3  # migration 003: the Phase 2 gate's approvals columns
+PHASE3_SCHEMA = 4  # migration 004: extensions, ext_jobs
 STALE_AFTER = timedelta(hours=1)  # pending approvals this far past expires_at are stale
 CMD_TIMEOUT_S = 10.0
 _CAFFEINATE_RE = re.compile(
@@ -115,6 +126,170 @@ def _store_rows(conn: sqlite3.Connection, now: datetime) -> None:
         out("PASS", False, "approvals not stale", "none")
 
 
+# --- Phase 3: extensions, secrets, jobs, briefing (docs/go-live.md step 12) --------------
+
+
+def extensions_dir_row(root: Path, records: Sequence[ExtensionRecord]) -> Row:
+    """The approved copies' dir: a real directory nobody else can write, with a copy for
+    every installed extension. Missing is fine before the first install."""
+    step = "extensions dir"
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        return ("FAIL", True, step, f"{root} is not a directory")
+    if not root.exists():
+        if records:
+            return ("FAIL", True, step, f"{root} missing but {len(records)} installed")
+        return ("PASS", True, step, "none installed yet")
+    if stat.S_IMODE(root.stat().st_mode) & 0o022:
+        return ("FAIL", True, step, f"{root} is writable by group or others")
+    names = {r.name for r in records}
+    entries = {p.name for p in root.iterdir()}
+    missing = sorted(names - entries)
+    if missing:
+        return ("FAIL", True, step, f"no copy for {', '.join(missing)}")
+    extra = sorted(entries - names)
+    detail = f"{root}, {len(names)} installed"
+    if extra:
+        detail += f"; not installed: {', '.join(extra)}"
+    return ("PASS", True, step, detail)
+
+
+def pin_rows(root: Path, records: Sequence[ExtensionRecord]) -> list[Row]:
+    """Each installed copy against its pin, and its pinned ``argv0`` paths. Advisory: a
+    tampered copy is already disabled and alerted by the daemon (ext update restores it)."""
+    from resonant.extensions.pin import verify_copy
+
+    rows: list[Row] = []
+    for r in records:
+        step = f"extension {r.name} pin"
+        state = verify_copy(r, root / r.name)
+        gone = sorted(p for p in set(r.argv0_paths.values()) if not os.access(p, os.X_OK))
+        if r.status == "disabled_tampered":
+            rows.append(("FAIL", False, step, f"disabled_tampered; resonant ext update {r.name}"))
+        elif state != "ok":
+            rows.append(("FAIL", False, step, f"copy {state}; resonant ext update {r.name}"))
+        elif gone:
+            rows.append(("FAIL", False, step, f"argv0 missing: {', '.join(gone)}"))
+        else:
+            pin = f"{(r.commit or 'no commit')[:8]} digest {r.tree_digest[:8]}"
+            rows.append(("PASS", False, step, f"{r.status}, {pin}, copy ok"))
+    return rows
+
+
+def secret_rows(records: Sequence[ExtensionRecord], exists: Callable[[str], bool]) -> list[Row]:
+    """Each declared secret is in the Keychain. Existence only: the value is never read.
+    Required for enabled extensions, advisory for disabled ones."""
+    from resonant.secrets import SecretError, secret_ref
+    from resonant_sdk import Manifest
+
+    rows: list[Row] = []
+    for r in records:
+        try:
+            names = Manifest.model_validate(r.manifest).secrets
+        except ValueError:
+            continue  # the pin row and the daemon report a bad snapshot
+        required = r.status == "enabled"
+        for name in names:
+            ref = secret_ref(r.name, name)
+            step = f"secret {ref}"
+            try:
+                present = exists(ref)
+            except SecretError as e:
+                rows.append(("FAIL", required, step, e.reason))
+                continue
+            if present:
+                rows.append(("PASS", required, step, "present (value not read)"))
+            else:
+                rows.append(("FAIL", required, step, f"missing: resonant secret set {ref}"))
+    return rows
+
+
+def _next_text(at: datetime | None, now: datetime, tz: str) -> str:
+    from resonant.tools.when import format_due
+
+    return "never" if at is None else format_due(at, now=now, tz=tz)
+
+
+def jobs_row(records: Sequence[ExtensionRecord], tz: str, now: datetime) -> Row:
+    """Every enabled extension's jobs have a next due time, from the approved manifest's
+    cron (an ``ext_jobs`` row appears only after the first due time)."""
+    from resonant.extensions.cron import CronError, parse_schedule
+    from resonant_sdk import Manifest
+
+    step = "extension jobs scheduled"
+    due: list[tuple[datetime, str]] = []
+    bad: list[str] = []
+    for r in records:
+        if r.status != "enabled":
+            continue
+        try:
+            jobs = Manifest.model_validate(r.manifest).jobs
+        except ValueError:
+            bad.append(f"{r.name} (manifest)")
+            continue
+        for job in jobs:
+            try:
+                at = parse_schedule(job.schedule, job.tz or tz).next_after(now)
+            except (CronError, ValueError):
+                at = None
+            if at is None:
+                bad.append(f"{r.name}/{job.id}")
+            else:
+                due.append((at, f"{r.name}/{job.id}"))
+    if bad:
+        return ("FAIL", True, step, f"no next due time: {', '.join(bad)}")
+    if not due:
+        return ("PASS", True, step, "no extension jobs")
+    at, first = min(due)
+    return ("PASS", True, step, f"{len(due)} job(s); next {first} {_next_text(at, now, tz)}")
+
+
+def briefing_row(settings: Settings, now: datetime) -> Row:
+    """``core/briefing``: enabled, and its next due time from ``briefing.at``."""
+    from resonant.extensions import briefing
+    from resonant.extensions.cron import CronError, parse_schedule
+
+    cfg, tz = settings.briefing, settings.timezone
+    if not cfg.enabled:
+        return ("FAIL", False, "briefing scheduled", "briefing.enabled is false")
+    try:
+        at = parse_schedule(briefing.schedule(cfg), tz).next_after(now)
+    except CronError as e:
+        return ("FAIL", True, "briefing scheduled", str(e))
+    return (
+        "PASS",
+        True,
+        "briefing scheduled",
+        f"daily {cfg.at} {tz}; next {_next_text(at, now, tz)}",
+    )
+
+
+def _keychain_exists(ref: str) -> bool:
+    import asyncio
+
+    from resonant.secrets import SecretStore
+
+    return asyncio.run(SecretStore().exists(ref))
+
+
+def phase3_rows(
+    settings: Settings,
+    conn: sqlite3.Connection | None,
+    now: datetime,
+    exists: Callable[[str], bool] = _keychain_exists,
+) -> list[Row]:
+    from resonant.store.extensions import list_extensions
+
+    records = list_extensions(conn) if conn is not None else []
+    root = settings.extensions_dir
+    return [
+        extensions_dir_row(root, records),
+        *pin_rows(root, records),
+        *secret_rows(records, exists),
+        jobs_row(records, settings.timezone, now),
+        briefing_row(settings, now),
+    ]
+
+
 def main() -> None:
     from resonant.config import load_settings
     from resonant.principals import load_principals
@@ -200,15 +375,22 @@ def main() -> None:
     else:
         out("FAIL", True, "dry_run", "dry_run off on a pre-Phase-2 install")
 
+    now = datetime.now(UTC)
     if conn is not None:
         try:
-            _store_rows(conn, datetime.now(UTC))
+            _store_rows(conn, now)
         except sqlite3.Error as e:
             out("FAIL", True, "kill switch state", _err(e))
-        finally:
-            conn.close()
     else:
         out("SKIP", True, "kill switch state", "no store")
+    try:
+        for row in phase3_rows(settings, conn if version >= PHASE3_SCHEMA else None, now):
+            out(*row)
+    except sqlite3.Error as e:
+        out("FAIL", True, "extensions", _err(e))
+    finally:
+        if conn is not None:
+            conn.close()
 
     out("PASS", True, "timezone", settings.timezone)  # validated when config loads
 

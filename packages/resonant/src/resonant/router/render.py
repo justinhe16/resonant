@@ -172,10 +172,9 @@ def _job_line(j: dict[str, Any]) -> str:
 
 def render_extensions(d: dict[str, Any]) -> str:
     """``/ext list``: one line per extension (name, status, pin, tools, mute, health), then
-    one per job (level, next due, last run)."""
+    one per job (level, next due, last run). Core jobs (the briefing) follow under ``core``."""
     items = [e for e in (as_dict(x) for x in as_list(d.get("extensions"))) if e]
-    if not items:
-        return "No extensions installed. On the Mini: resonant ext add repo:<name>"
+    core = [j for j in (as_dict(x) for x in as_list(d.get("core"))) if j]
     lines: list[str] = []
     for e in items:
         pin = e.get("commit") or "no commit"
@@ -191,5 +190,12 @@ def render_extensions(d: dict[str, Any]) -> str:
             bits.append(f"health {e['health']}")
         lines.append(" · ".join(bits))
         lines.extend(_job_line(j) for j in (as_dict(x) for x in as_list(e.get("jobs"))) if j)
-    text = f"Extensions ({len(items)}):\n" + "\n".join(lines)
+    if items:
+        head = f"Extensions ({len(items)}):"
+    else:
+        head = "No extensions installed. On the Mini: resonant ext add repo:<name>"
+    if core:
+        lines.append("core · built in")
+        lines.extend(_job_line(j) for j in core)
+    text = "\n".join([head, *lines])
     return text if len(text) <= MAX_REPLY_CHARS else text[: MAX_REPLY_CHARS - 1] + "…"
