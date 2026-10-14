@@ -1,0 +1,46 @@
+# github: your pull requests' CI and reviews, read-only. Stdlib Python plus the gh CLI.
+# The token (resonant secret set github/token) reaches gh as GH_TOKEN, in gh's env only.
+name: github
+version: 1
+description: Your GitHub pull requests; open PRs, CI failures and fixes, review requests.
+examples:
+  - any of my PRs failing CI?
+  - show PR 40 in justinhe16/resonant
+  - what's waiting on my review on github
+approvers: [owner]
+secrets: [token]
+
+tools:
+  prs:
+    description: Your open PRs with CI and review state, plus PRs awaiting your review.
+    run: python3 cli.py prs
+    effect: read                       # reads only: L0
+    secrets: [token]
+    timeout_s: 60
+  pr:
+    description: One pull request with its checks.
+    run: python3 cli.py pr --repo {repo} --number {number}
+    effect: read
+    args: {repo: string, number: integer}
+    secrets: [token]
+    timeout_s: 60
+
+jobs:
+  - id: watch                          # stateless: the events table's dedupe key is the memory
+    schedule: "*/10 * * * *"
+    run: python3 cli.py watch
+    effect: read
+    level: L0
+    secrets: [token]
+    timeout_s: 300
+  - id: digest                         # one line for the 08:00 briefing; not notified
+    schedule: "50 7 * * *"
+    run: python3 cli.py digest
+    effect: read
+    level: L0
+    secrets: [token]
+    timeout_s: 120
+    catchup: 1h
+
+notify: {on: [ci_failed, ci_fixed, review_requested], channel: imessage}
+health: {check: python3 cli.py health, every: 30m}

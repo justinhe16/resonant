@@ -3,10 +3,10 @@
 ``load()`` runs once, from ``build_components``, before the gate and executor are built.
 For each ``enabled`` row (``store.extensions``), in name order:
 
-1. **Pin.** ``pin.verify(record, <extensions_dir>/<name>)``. A mismatch (edited file,
-   missing copy, escaping symlink) sets ``status=disabled_tampered`` and queues one owner
-   alert in the same transaction (``set_status`` is True only on the flip, so it alerts
-   once), audited ``ext.tampered``. Nothing of it is registered.
+1. **Pin.** ``pin.verify_copy(record, <extensions_dir>/<name>)``. Anything but ``ok`` (an
+   edited, added or removed file, a missing copy) sets ``status=disabled_tampered`` and
+   queues one owner alert in the same transaction (``set_status`` is True only on the
+   flip, so it alerts once), audited ``ext.tampered``. Nothing of it is registered.
 2. **Manifest.** The approved snapshot from the row, validated again; its name must be the
    row's. ``checks.dir_errors`` must pass on the copy.
 3. **Commands.** Every tool's and job's ``run`` is compiled once (``ExtCommand.compile``,
@@ -28,6 +28,7 @@ manifest-approvers seam. ``tracker`` is the one ``ProcessTracker`` for the kill 
 from __future__ import annotations
 
 import logging
+import shlex
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -39,7 +40,7 @@ from pydantic import ValidationError
 from resonant.config import Settings
 from resonant.executor import HandlerKey
 from resonant.extensions import pin
-from resonant.extensions.checks import dir_errors
+from resonant.extensions.checks import ALLOWED_COMMANDS, dir_errors
 from resonant.extensions.handlers import ExtensionHandler
 from resonant.extensions.process import (
     ExtCommand,
@@ -60,6 +61,7 @@ log = logging.getLogger(__name__)
 
 ALERTS_KEY = "ext.alerts"  # kv: {name: {text, dedupe_key}}, sent to the owner on start
 JOB_ARGS = frozenset({"due_at"})
+PINNED_COMMANDS = ALLOWED_COMMANDS - {"python3"}
 
 
 def tampered_text(name: str) -> str:
@@ -136,8 +138,9 @@ class ExtensionHost:
         bad extension."""
         for record in store.list_extensions(self.conn, status="enabled"):
             root = self.extensions_dir / record.name
-            if reason := pin.verify(record, root):
-                self._tamper(record, reason)
+            state = pin.verify_copy(record, root)
+            if state != "ok":
+                self._tamper(record, f"copy {state}")
                 continue
             try:
                 self._register(self._prepare(record, root))
@@ -179,7 +182,10 @@ class ExtensionHost:
                 raise LoadRefused(f"{spec.name}: spec is not scoped to this extension")
             run, allowed, job = runs[spec.name]
             argv0 = record.argv0_paths.get(spec.name)
-            if argv0 is not None and not Path(argv0).is_file():
+            # Only gh/git run by the pinned path; scripts and python3 run with the daemon's
+            # interpreter, so a moved interpreter path doesn't matter.
+            pinned = shlex.split(run)[0] in PINNED_COMMANDS
+            if pinned and argv0 is not None and not Path(argv0).is_file():
                 raise LoadRefused(f"{spec.name}: pinned command {argv0} is missing")
             try:
                 command = ExtCommand.compile(run, root=root, argv0=argv0)

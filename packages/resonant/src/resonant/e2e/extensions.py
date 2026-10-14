@@ -48,7 +48,7 @@ def install_fixture(
         commit=FAKE_COMMIT,
         tree_digest=tree_digest(root),
         manifest_sha=hashlib.sha256(manifest_yaml.encode()).hexdigest(),
-        manifest=manifest.model_dump(mode="json", exclude_defaults=True),
+        manifest=manifest.model_dump(mode="json"),
         installed_at=utcnow(),
         installed_by="owner:cli",
         argv0_paths=dict(argv0_paths or {}),

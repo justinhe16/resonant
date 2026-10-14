@@ -1,112 +1,86 @@
-"""Extension pins: the tree digest of an installed copy, and its re-verification.
+"""Pins: the tree digest of an extension copy, and verifying a copy against its row (D1).
 
-Pure functions over a directory. The manager computes the digest on the staged source and
-again on the copy before it writes the row; the host re-verifies every enabled row at load.
+Shared by the manager (install, ``ext list``) and the host (every load). Pure: nothing here
+writes, runs a process, or reads anything outside the given root.
 
-``tree_digest(root)`` is a sha256 over every file and symlink under ``root`` (directories
-only through their contents, like git), sorted by POSIX relative path. Each entry is
-``<mode>\\0<path>\\0<sha256 hex>\\0``, where ``mode`` is git's: ``100644``, ``100755`` (any
-exec bit) or ``120000`` (a symlink, hashed over its target string, never followed). Write
-bits are not part of it, so the read-only copy has the same digest as its source.
+``tree_digest(root)`` is sha256 over the sorted ``path\\0kind\\0sha256(content)\\0`` of every
+entry under ``root``, where kind is ``f`` (file), ``x`` (owner-executable file) or ``l``
+(symlink; its content is the link target, never followed). Permissions other than the exec
+bit don't count, so the read-only copy has the same digest as the staging dir it came from.
+Special files (fifos, devices, sockets) raise ``TreeError``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-import re
 import stat
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Literal
 
-_COMMIT = re.compile(r"^[0-9a-f]{40}$")
-_CHUNK = 1024 * 1024
+from resonant.store.extensions import ExtensionRecord
 
-
-class Pinned(Protocol):
-    """What ``verify`` reads from an ``ExtensionRecord``."""
-
-    @property
-    def commit(self) -> str | None: ...
-
-    @property
-    def tree_digest(self) -> str: ...
+Kind = str  # "f" | "x" | "l"
+TreeEntries = Mapping[str, tuple[Kind, str]]  # rel posix path -> (kind, sha256 hex)
+CopyState = Literal["ok", "changed", "missing"]
 
 
-def _entries(root: Path) -> list[tuple[str, str, str]]:
-    out: list[tuple[str, str, str]] = []
-    for dirpath, dirnames, filenames in os.walk(root):  # never follows symlinked dirs
+class TreeError(Exception):
+    """A tree can't be pinned (an unsupported entry, or an unsafe one)."""
+
+
+def tree_entries(root: Path) -> dict[str, tuple[Kind, str]]:
+    """Every entry under ``root`` as ``rel -> (kind, sha256)``. Symlinks are never followed."""
+    out: dict[str, tuple[Kind, str]] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
         base = Path(dirpath)
-        names = list(filenames)
-        # A symlink to a directory shows up in dirnames; hash it as a link, don't descend.
-        for d in list(dirnames):
-            if (base / d).is_symlink():
-                dirnames.remove(d)
-                names.append(d)
-        for name in names:
-            p = base / name
-            rel = p.relative_to(root).as_posix()
-            st = p.lstat()
+        for name in [*dirnames, *filenames]:
+            path = base / name
+            rel = path.relative_to(root).as_posix()
+            st = path.lstat()
             if stat.S_ISLNK(st.st_mode):
-                target = os.readlink(p)
-                out.append(("120000", rel, hashlib.sha256(target.encode()).hexdigest()))
+                target = os.readlink(path).encode(errors="surrogateescape")
+                out[rel] = ("l", hashlib.sha256(target).hexdigest())
             elif stat.S_ISREG(st.st_mode):
-                mode = "100755" if st.st_mode & 0o111 else "100644"
-                out.append((mode, rel, _file_sha(p)))
-            else:
-                raise ValueError(f"{rel}: not a regular file or symlink")
-    return sorted(out, key=lambda e: e[1])
+                kind = "x" if st.st_mode & stat.S_IXUSR else "f"
+                out[rel] = (kind, _file_sha(path))
+            elif not stat.S_ISDIR(st.st_mode):
+                raise TreeError(f"{rel}: unsupported file type")
+        dirnames[:] = [d for d in dirnames if not (base / d).is_symlink()]
+    return out
 
 
 def _file_sha(path: Path) -> str:
     h = hashlib.sha256()
-    with path.open("rb") as f:
-        while chunk := f.read(_CHUNK):
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def tree_digest(root: Path) -> str:
-    """The sha256 hex digest of the tree under ``root`` (see the module docstring).
-
-    Raises ``FileNotFoundError`` if ``root`` isn't a directory and ``ValueError`` for a
-    special file (fifo, socket, device).
-    """
-    if not root.is_dir() or root.is_symlink():
-        raise FileNotFoundError(f"{root} is not a directory")
+def digest_of(entries: TreeEntries) -> str:
     h = hashlib.sha256()
-    for mode, rel, digest in _entries(root):
-        h.update(f"{mode}\0{rel}\0{digest}\0".encode())
+    for rel in sorted(entries):
+        kind, sha = entries[rel]
+        h.update(f"{rel}\0{kind}\0{sha}\0".encode(errors="surrogateescape"))
     return h.hexdigest()
 
 
-def escaping_symlinks(root: Path) -> list[str]:
-    """Relative paths of symlinks under ``root`` that resolve outside it."""
-    real = root.resolve()
-    out: list[str] = []
-    for mode, rel, _ in _entries(root):
-        if mode == "120000" and not (root / rel).resolve().is_relative_to(real):
-            out.append(rel)
-    return out
+def tree_digest(root: Path) -> str:
+    """The pin for the tree at ``root``."""
+    return digest_of(tree_entries(root))
 
 
-def verify(record: Pinned, root: Path) -> str | None:
-    """None if the copy at ``root`` still matches the record's pins, else the reason.
+def verify_copy(record: ExtensionRecord, root: Path) -> CopyState:
+    """The copy at ``root`` against ``record.tree_digest``: ``ok``, ``changed`` (any
+    difference, an unreadable entry or a special file) or ``missing`` (no such dir).
 
-    Checks: ``commit`` is None or a full 40-hex sha; the copy exists; no symlink escapes
-    it; and its ``tree_digest`` equals the pinned one. The reason never includes file
-    contents.
-    """
-    if record.commit is not None and not _COMMIT.match(record.commit):
-        return "commit pin is not a full sha"
+    The commit is part of the approval, not of the bytes; the digest covers every byte
+    (``resonant.yaml`` included), so a matching digest means the approved tree."""
+    if root.is_symlink() or not root.is_dir():
+        return "missing"
     try:
-        if escaping_symlinks(root):
-            return "a symlink resolves outside the extension dir"
-        digest = tree_digest(root)
-    except FileNotFoundError:
-        return "the installed copy is missing"
-    except (OSError, ValueError) as e:
-        return f"the installed copy can't be read ({type(e).__name__})"
-    if digest != record.tree_digest:
-        return "tree digest changed"
-    return None
+        return "ok" if tree_digest(root) == record.tree_digest else "changed"
+    except (OSError, TreeError):
+        return "changed"

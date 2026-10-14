@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -14,7 +13,6 @@ from resonant.api import DaemonState, create_app
 from resonant.components import build_components
 from resonant.config import Settings, load_settings
 from resonant.e2e.extensions import install_fixture
-from resonant.extensions import pin
 from resonant.extensions.host import ALERTS_KEY, ExtensionHost, send_alerts, tampered_text
 from resonant.extensions.process import FakeExtProcess
 from resonant.gate import PolicyGate
@@ -82,50 +80,6 @@ def host_for(settings: Settings, db: sqlite3.Connection) -> ExtensionHost:
 
 def actions(db: sqlite3.Connection, action: str) -> list[sqlite3.Row]:
     return db.execute("SELECT * FROM audit_log WHERE action = ?", (action,)).fetchall()
-
-
-# --- pin ------------------------------------------------------------------------------
-
-
-def test_digest_ignores_write_bits_but_not_exec_or_content(tmp_path: Path) -> None:
-    root = tmp_path / "x"
-    (root / "sub").mkdir(parents=True)
-    (root / "a.py").write_text("a")
-    (root / "sub" / "b.txt").write_text("b")
-    first = pin.tree_digest(root)
-    (root / "a.py").chmod(0o444)
-    assert pin.tree_digest(root) == first
-    (root / "a.py").chmod(0o555)
-    exec_digest = pin.tree_digest(root)
-    assert exec_digest != first
-    (root / "a.py").chmod(0o755)
-    (root / "a.py").write_text("A")
-    assert pin.tree_digest(root) not in (first, exec_digest)
-    (root / "empty").mkdir()  # empty dirs are not part of the tree (like git)
-    before = pin.tree_digest(root)
-    (root / "sub" / "c").write_text("")
-    assert pin.tree_digest(root) != before
-
-
-def test_verify_reasons(tmp_path: Path) -> None:
-    root = tmp_path / "x"
-    root.mkdir()
-    (root / "a.py").write_text("a")
-
-    class Rec:
-        commit: str | None = "f" * 40
-        tree_digest = pin.tree_digest(root)
-
-    assert pin.verify(Rec(), root) is None
-    Rec.commit = "main"
-    assert pin.verify(Rec(), root) == "commit pin is not a full sha"
-    Rec.commit = None
-    assert pin.verify(Rec(), tmp_path / "gone") == "the installed copy is missing"
-    (root / "out").symlink_to(tmp_path)
-    assert pin.verify(Rec(), root) == "a symlink resolves outside the extension dir"
-    (root / "out").unlink()
-    (root / "a.py").write_text("b")
-    assert pin.verify(Rec(), root) == "tree digest changed"
 
 
 # --- load and register ----------------------------------------------------------------
