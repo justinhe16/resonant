@@ -154,7 +154,7 @@ def test_available_filters_by_principal(principals: Principals) -> None:
     assert [c.name for c in stranger] == ["/help"]
     # A command whose tool isn't registered is hidden, even from the owner.
     empty = commands.available(OWNER, principals=principals, registry=ToolRegistry())
-    assert [c.name for c in empty] == ["/approvals", "/help", "/kill", "/resume"]
+    assert [c.name for c in empty] == ["/approvals", "/pulse", "/help", "/kill", "/resume"]
 
 
 def test_describe_takes_the_level_from_the_tool_registry() -> None:
@@ -391,6 +391,7 @@ def test_owner_only_commands() -> None:
         "/logs",
         "/approvals",
         "/ext",
+        "/pulse",
         "/kill",
         "/resume",
     }

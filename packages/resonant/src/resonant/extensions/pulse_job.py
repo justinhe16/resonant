@@ -53,6 +53,7 @@ from resonant.store import pulse as store
 from resonant.store.approvals import pending_for
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.tools.projects import clip
+from resonant.tools.when import format_due
 
 if TYPE_CHECKING:
     from resonant.config import Settings
@@ -153,6 +154,24 @@ def preview(conn: sqlite3.Connection, now: datetime | None = None) -> str | None
     only refreshed by a run)."""
     composed = compose(_pending(conn, now or utcnow()))
     return None if composed is None else composed[0]
+
+
+def open_summary(conn: sqlite3.Connection, now: datetime, tz: str) -> str | None:
+    """``Open: github 1, example 2 (muted until 3:00pm)``: open (uncleared, unexpired) items
+    per source, core first; None with none. Read-only."""
+    counts: dict[str, int] = {}
+    for item in store.open_items(conn, now):
+        counts[item.source] = counts.get(item.source, 0) + 1
+    if not counts:
+        return None
+    parts: list[str] = []
+    for source in sorted(counts, key=lambda s: (s != CORE, s)):
+        part = f"{source} {counts[source]}"
+        until = None if source == CORE else notify.muted_until(conn, source, now)
+        if until is not None:
+            part += f" (muted until {format_due(until, now=now, tz=tz)})"
+        parts.append(part)
+    return "Open: " + ", ".join(parts)
 
 
 # --- core items ------------------------------------------------------------------------------
@@ -371,6 +390,7 @@ __all__ = [
     "fit_lines",
     "item_line",
     "manual_dedupe_key",
+    "open_summary",
     "preview",
     "pulse_job",
     "refresh_core_items",

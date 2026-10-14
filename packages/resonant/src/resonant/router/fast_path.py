@@ -40,6 +40,13 @@ is never reachable as ``/<ext> job_x``. ``/ext run core/<job>`` calls the core j
 on-demand entry (``core_jobs``, filled by ``wiring``: ``core/briefing`` is
 ``briefing.run_briefing_now``) here, with no task; nothing runs while paused.
 
+``/pulse`` (owner-only) answers inline: what the next pulse would say plus the open items per
+source (read-only; core re-mentions appear once a pulse run computes them). ``/pulse now`` is
+``core/pulse`` on demand, like ``/ext run core/pulse``. An unknown ``/word`` that names an
+extension shipped in ``<repo>/extensions/<word>/resonant.yaml`` gets, for the owner, "<word>
+isn't installed. On the Mini: resonant ext add repo:<word>" (or "is disabled ... ext update");
+nothing runs.
+
 ``/kill`` and ``/resume`` are never decided by the LLM. A non-owner gets "not allowed".
 A slash command whose tool the principal can't request gets "not allowed"; a keyword in
 that case falls through to the labeler (``run`` returns None).
@@ -61,12 +68,13 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from resonant import killswitch
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.extensions.briefing import run_briefing_now
-from resonant.extensions.pulse_job import run_pulse_now
+from resonant.extensions.pulse_job import open_summary, preview, run_pulse_now
 from resonant.gate import Allow, Decision, Intent, PendingApproval
 from resonant.models import SpanFactory
 from resonant.models.client import null_spans
@@ -86,6 +94,7 @@ from resonant.router.render import (
     render_projects,
     render_reminders,
 )
+from resonant.store import extensions as ext_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, utcnow
 from resonant.tools import ToolRegistry
@@ -256,6 +265,7 @@ KEYWORDS: dict[str, FastCommand] = {
     "how is the mini": _MINI,
 }
 
+_SLUG = re.compile(r"[a-z][a-z0-9-]{0,47}", re.ASCII)  # the manifest's name pattern
 _SLASH = re.compile(r"^/[a-z][a-z0-9_-]{0,31}$")  # capped: an unknown word is echoed
 _APOSTROPHES = str.maketrans(dict.fromkeys((0x2018, 0x2019, 0x02BC), "'"))  # curly quotes
 
@@ -346,6 +356,8 @@ class FastPath:
         self.table: dict[str, Command] = commands.by_name(self.commands)
         # ``/ext run core/<job>``: filled by the daemon once the core jobs exist.
         self.core_jobs: dict[str, CoreRun] = {}
+        # The checkout whose ``extensions/<name>/`` ships extensions (the "isn't installed" reply).
+        self.repo_path: Path | None = None
 
     def match(self, text: str) -> FastCommand | None:
         """``match_fast_path`` over this fast path's command table (extensions included)."""
@@ -405,6 +417,8 @@ class FastPath:
         if cmd.slash and not all(self._can_request(principal, t, cmd.extension) for t in cmd.tools):
             return self._result(cmd, NOT_ALLOWED)
         if cmd.unknown is not None:
+            if (hint := self._not_installed(cmd.unknown, principal)) is not None:
+                return self._result(cmd, hint)
             available = self.available(principal)
             return self._result(cmd, commands.unknown_reply(cmd.unknown, available))
         if cmd.reply is not None:  # a usage line
@@ -419,6 +433,10 @@ class FastPath:
             return self._approvals(cmd, principal)
         if cmd.admin and cmd.title == "/ext run":
             return await self._ext_run(cmd, principal, trace_id)
+        if cmd.admin and cmd.name == "/pulse":
+            if cmd.title == "/pulse now":
+                return await self._core_run(cmd, "pulse", principal, trace_id, "/pulse now")
+            return self._result(cmd, self._pulse_preview())
         if cmd.extension is not None:
             return self._extension_call(cmd)
         if cmd.help:
@@ -507,8 +525,49 @@ class FastPath:
         args = {"due_at": iso(self.clock())}
         return self._direct(cmd, ext, spec.name, args, f"/ext run {label}")
 
+    def _pulse_preview(self) -> str:
+        """``/pulse``: what the next pulse would say, then the open items per source. Read-only
+        (core re-mentions appear once a pulse run computes them)."""
+        now = self.clock()
+        text = preview(self.conn, now) or "Nothing new since the last update."
+        summary = open_summary(self.conn, now, self.timezone)
+        return f"{text}\n{summary}" if summary else text
+
+    def _not_installed(self, word: str, principal: str) -> str | None:
+        """For an unknown ``/word`` that names an extension shipped in the repo checkout
+        (``extensions/<word>/resonant.yaml``) but isn't running: how to install or update it.
+        Owner only, slug-valid words only; reads one file's existence and runs nothing."""
+        name = word.removeprefix("/")
+        if self.repo_path is None or not _SLUG.fullmatch(name):
+            return None
+        if not self.principals.can(principal, "admin", None):
+            return None
+        try:
+            base = (self.repo_path / "extensions").resolve()
+            manifest = (base / name / "resonant.yaml").resolve()
+            if not manifest.is_relative_to(base) or not manifest.is_file():
+                return None
+            record = ext_store.get_extension(self.conn, name)
+        except (OSError, sqlite3.Error):
+            return None
+        if record is None:
+            return f"{name} isn't installed. On the Mini: resonant ext add repo:{name}"
+        if record.status == "enabled":
+            return None
+        if record.status == "disabled_tampered":
+            return (
+                f"{name} is disabled (files changed since install). "
+                f"On the Mini: resonant ext update {name}"
+            )
+        return f"{name} is turned off."
+
     async def _core_run(
-        self, cmd: FastCommand, job: str, principal: str, trace_id: str | None
+        self,
+        cmd: FastCommand,
+        job: str,
+        principal: str,
+        trace_id: str | None,
+        title: str | None = None,
     ) -> FastPathResult:
         """A core job now, inline (trusted core code, L0, no gate), audited ``job.run``."""
         run = self.core_jobs.get(job)
@@ -532,7 +591,7 @@ class FastPath:
                 manual=True,
                 reply=text,  # code-built: what happened (sent, paused, unreachable)
             )
-        return FastPathResult(text, label, command=f"/ext run {label}", intent=cmd.intent)
+        return FastPathResult(text, label, command=title or f"/ext run {label}", intent=cmd.intent)
 
     def _approvals(self, cmd: FastCommand, principal: str) -> FastPathResult:
         """``/approvals [code]``: pending approvals, or one's full args (owner only)."""
