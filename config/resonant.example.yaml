@@ -36,6 +36,9 @@ channels:
     inbound_per_minute: 120               # per principal; excess is dropped and audited
     max_body_chars: 4000                  # longer messages are truncated
 
+power:
+  keep_awake: true                      # resonant daemon install adds a caffeinate LaunchAgent (no system sleep)
+
 gate:
   approval_ttl_s: 1800                  # an approval prompt stays answerable this long (60..86400)
 

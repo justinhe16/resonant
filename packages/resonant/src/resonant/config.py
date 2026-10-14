@@ -163,6 +163,12 @@ class OpsConfig(_Section):
         return v.expanduser() if v is not None else None
 
 
+class PowerConfig(_Section):
+    # Install the caffeinate LaunchAgent (`resonant daemon install`), so the Mini never
+    # sleeps: a sleeping Mini doesn't read chat.db or fire reminders.
+    keep_awake: bool = True
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESONANT_",
@@ -183,6 +189,7 @@ class Settings(BaseSettings):
     channels: ChannelsConfig = ChannelsConfig()
     gate: GateConfig = GateConfig()
     ops: OpsConfig = OpsConfig()
+    power: PowerConfig = PowerConfig()
 
     @field_validator("home")
     @classmethod
