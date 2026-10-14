@@ -3,8 +3,9 @@
 A summary is the one line an approver reads before replying, so nothing in it comes from a
 model as prose. The tool name comes from the registry. Arg keys and values are untrusted:
 each goes through ``clean_external``, is clipped, and any loss is marked (``(truncated)``,
-``+N more args``). Masking code-like tokens is lossy on purpose: "vitamin d3" reads as
-``vitamin ?``. The full args stay available to the owner via ``/approvals <code>``.
+``+N more args``, ``(non-ASCII hidden)``). Masking code-like tokens is lossy on purpose:
+"vitamin d3" reads as ``vitamin ?``. The full args stay available to the owner via
+``/approvals <code>``.
 
 ``unsafe_args`` finds strings an approver couldn't read faithfully anywhere (bidi
 overrides, zero-width and other invisible format characters, control characters). The gate
@@ -27,8 +28,10 @@ MAX_VALUE_LEN = 40
 
 # Ordinary whitespace controls are readable once whitespace is collapsed for display.
 _ALLOWED_CONTROLS = frozenset("\t\n\r")
-# Cc control, Cf format (bidi, zero-width, BOM), Zl/Zp line and paragraph separators.
-_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+# Cc control, Cf format (bidi, zero-width, BOM), Zl/Zp line and paragraph separators, Cs
+# lone surrogates. Variation selectors (emoji presentation) and private-use characters
+# (Apple's logo) are allowed: they render visibly and can't reorder or hide text.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
 
 
 def _is_unsafe(text: str) -> bool:
@@ -80,7 +83,11 @@ def _value(value: Any) -> str:
         return text + (" (truncated)" if cut else "")
     if isinstance(value, str):
         text, cut = _clip(value, MAX_VALUE_LEN)
-        return f'"{text}"' + (" (truncated)" if cut else "")
+        out = f'"{text}"' + (" (truncated)" if cut else "")
+        # clean_external drops non-ASCII; say so rather than show a silently shorter value.
+        if any(ord(ch) >= 127 for ch in unicodedata.normalize("NFKC", value)):
+            out += " (non-ASCII hidden)"
+        return out
     if isinstance(value, Mapping):
         return f"(object, {len(value)} keys)"  # pyright: ignore[reportUnknownArgumentType]
     if isinstance(value, list | tuple):

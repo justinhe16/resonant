@@ -144,7 +144,7 @@ class GateConfig(_Section):
 def _package_checkout() -> Path | None:
     """The git checkout containing the running package, if it runs from one."""
     for parent in Path(__file__).resolve().parents:
-        if (parent / ".git").exists():
+        if (parent / ".git").exists() and (parent / "pyproject.toml").is_file():
             return parent
     return None
 

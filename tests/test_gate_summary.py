@@ -46,6 +46,14 @@ def test_values_by_type() -> None:
     assert describe_args({}) == ""
 
 
+def test_non_ascii_loss_is_marked() -> None:
+    assert describe_args({"text": "日本語 café"}) == 'text="caf" (non-ASCII hidden)'
+    assert describe_args({"text": "日本語"}) == 'text="" (non-ASCII hidden)'
+    # NFKC folds fullwidth letters to ASCII, so nothing is hidden.
+    fullwidth = "".join(chr(0xFEE0 + ord(c)) for c in "milk")
+    assert describe_args({"text": fullwidth}) == 'text="milk"'
+
+
 def test_lossiness_is_marked() -> None:
     long = "x" * (MAX_VALUE_LEN + 10)
     assert describe_args({"text": long}) == f'text="{"x" * MAX_VALUE_LEN}" (truncated)'
@@ -101,6 +109,7 @@ def test_injected_action_is_cleaned() -> None:
         "\x1b",  # escape
         "\x00",
         "\x7f",
+        chr(0xD800),  # lone surrogate
     ],
 )
 def test_unsafe_characters_found(ch: str) -> None:
@@ -110,5 +119,5 @@ def test_unsafe_characters_found(ch: str) -> None:
 
 
 def test_ordinary_text_is_safe() -> None:
-    args = {"text": "Lunch on Friday?\nbring the café menu 👍", "n": 3, "flag": False}
+    args = {"text": "Lunch on Friday?\nbring the café menu 👍\ufe0f \uf8ff", "n": 3, "flag": False}
     assert unsafe_args(args) == ()

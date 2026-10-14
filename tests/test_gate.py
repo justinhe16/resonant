@@ -85,6 +85,8 @@ def test_origin_defaults_to_inferred_and_is_not_hashed() -> None:
 def test_unknown_origin_rejected() -> None:
     with pytest.raises(ValueError, match="origin"):
         Intent(task_id="t", principal="justin", spec=RESTART, args={}, origin="model")  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ValueError, match="origin"):
+        Intent.for_tool(RESTART, task_id="t", principal="justin", args={}, origin="model")  # pyright: ignore[reportArgumentType]
 
 
 def test_args_are_copied() -> None:
