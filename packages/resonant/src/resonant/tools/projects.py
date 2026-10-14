@@ -1,5 +1,10 @@
 """``projects``: open work first, then recently finished tasks. Ids, states, kinds, titles, ages.
 
+Fast-path replies (``kind="reply"`` with a ``fast_reply`` checkpoint: ``/status``,
+``/help``, ``/projects`` itself, usage and "did you mean" replies) are bookkeeping, not
+work: they are left out in SQL, so they never count toward the caps or ``more``. A waiting
+one would still show.
+
 Open tasks (running, waiting, queued) come before finished ones (done, failed, cancelled),
 so a burst of quick replies never hides work still in flight. Each group is ordered by
 ``updated_at`` descending. At most 15 items, or 50 with ``all``.
@@ -80,17 +85,19 @@ def projects(conn: sqlite3.Connection, args: dict[str, Any]) -> dict[str, Any]:
                    CASE WHEN json_type(checkpoint, '$.title') = 'text'
                        THEN json_extract(checkpoint, '$.title') END AS title,
                    CASE WHEN kind = 'reminder' AND json_type(checkpoint, '$.text') = 'text'
-                       THEN json_extract(checkpoint, '$.text') END AS reminder_text
+                       THEN json_extract(checkpoint, '$.text') END AS reminder_text,
+                   COUNT(*) OVER () AS total
             FROM tasks
             WHERE json_valid(checkpoint)  -- a malformed row is skipped, never an error
+              -- fast-path replies are bookkeeping, not work (router.KIND_REPLY)
+              AND NOT (kind = 'reply' AND json_type(checkpoint, '$.fast_reply') IS NOT NULL
+                       AND status <> 'waiting')
             -- open first; the IN list is loop.types.TERMINAL
             ORDER BY status IN ('cancelled', 'done', 'failed'), updated_at DESC, id DESC
             LIMIT ?""",
         (limit,),
     ).fetchall()
-    total: int = conn.execute("SELECT COUNT(*) FROM tasks WHERE json_valid(checkpoint)").fetchone()[
-        0
-    ]
+    total: int = rows[0]["total"] if rows else 0
     now = utcnow()
     items = [
         {

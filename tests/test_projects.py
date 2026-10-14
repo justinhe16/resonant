@@ -107,7 +107,7 @@ def test_bad_args(db: sqlite3.Connection, args: dict[str, Any]) -> None:
 
 
 def test_titles(db: sqlite3.Connection) -> None:
-    add(db, "reply", checkpoint={"fast_reply": BODY, "title": "/status", "intent": "system"})
+    add(db, "command", checkpoint={"title": "/note", "args": {"text": BODY}})
     add(db, "chat", checkpoint={"intent": "question", "title": "chat: question", "text": BODY})
     add(db, "reminder", checkpoint={"text": "call mom about the   flights to Lisbon", "at": "x"})
     add(db, "reminder", checkpoint={"text": "  "})
@@ -116,7 +116,7 @@ def test_titles(db: sqlite3.Connection) -> None:
     add(db, "chat", checkpoint={"title": "x" * 100})
     titles = {i["title"] for i in projects(db, {})["items"]}
     assert titles == {
-        "/status",
+        "/note",
         "chat: question",
         "⏰ call mom about the flights to…",
         "reminder",
@@ -262,3 +262,36 @@ def test_malformed_checkpoint_row_is_skipped(db: sqlite3.Connection) -> None:
     db.execute("UPDATE tasks SET checkpoint = '{not json' WHERE id = ?", (bad,))
     out = projects(db, {})
     assert [i["id"] for i in out["items"]] == [good] and out["more"] == 0
+
+
+def fast_reply(db: sqlite3.Connection, command: str, **kw: Any) -> str:
+    cp = {"fast_reply": BODY, "tool_used": None, "intent": "system", "title": command}
+    return add(db, "reply", checkpoint=cp, **kw)
+
+
+def test_fast_replies_are_left_out(db: sqlite3.Connection) -> None:
+    chat = add(db, status="done", age_s=600, checkpoint={"title": "chat: question"})
+    reminder = add(db, "reminder", checkpoint={"text": "stretch"})
+    for n in range(20):
+        fast_reply(db, ("/status", "/help", "/unknown", "/projects")[n % 4], status="done")
+    fast_reply(db, "/projects", status="running")  # the /projects reply being built now
+    for args in ({}, {"all": True}):
+        out = projects(db, args)
+        assert [i["id"] for i in out["items"]] == [reminder, chat]
+        assert out["count"] == 2 and out["more"] == 0
+    assert "/projects" not in render_projects(projects(db, {}))
+    # Only replies with a fast_reply checkpoint are bookkeeping; a waiting one still shows.
+    waiting = fast_reply(db, "/update", status="waiting", wait_reason="approval")
+    plain = add(db, "reply", status="done")
+    ids = [i["id"] for i in projects(db, {})["items"]]
+    assert waiting in ids and plain in ids
+
+
+def test_fast_replies_never_take_cap_slots(db: sqlite3.Connection) -> None:
+    for _ in range(PROJECTS_DEFAULT):
+        add(db, status="done", age_s=600)
+    for _ in range(20):
+        fast_reply(db, "/status", status="done")
+    out = projects(db, {})
+    assert out["count"] == PROJECTS_DEFAULT and out["more"] == 0
+    assert {i["kind"] for i in out["items"]} == {"chat"}

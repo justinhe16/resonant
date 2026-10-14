@@ -854,8 +854,11 @@ async def test_projects_end_to_end_shows_titles_not_bodies(
     insert_task(db, first)
     task = await fast.route(msg("/projects"))
     assert task is not None and task.checkpoint["title"] == "/projects"
-    reply = task.checkpoint["fast_reply"]
-    assert reply.startswith("Projects (2 open, 0 recent):\n")
-    assert "- queued · reply · /status · " in reply
-    assert "- queued · chat · chat: system · " in reply
+    insert_task(db, task)
+    again = await fast.route(msg("/projects"))
+    assert again is not None
+    reply = again.checkpoint["fast_reply"]
+    # Fast-path replies (/status, /projects itself) are bookkeeping and left out.
+    assert reply.startswith("Projects (1 open, 0 recent):\n- queued · chat · chat: system · ")
+    assert "/status" not in reply and "/projects" not in reply.split("\n", 1)[1]
     assert "landlord" not in reply
