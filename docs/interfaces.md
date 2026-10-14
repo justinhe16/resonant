@@ -98,22 +98,34 @@ The model supplies only the tool name and args. Effect and level always come fro
 ## Manifest: `resonant_sdk.manifest.Manifest` (`resonant.yaml`, `version: 1`)
 
 ```yaml
-name: <slug>                     # required
+name: <slug>                     # required; not "core", not a builtin command word
 version: 1                       # required
+description: <text>              # optional, <= 120 chars: the router intent definition
+examples: [<line>, ...]          # optional, <= 3 lines of <= 80 chars: router few-shots
 uses: <first-party ext>          # optional; allows exactly one extra block named after it
 approvers: [<principal>, ...]    # each must hold the approve grant for this extension
-jobs:     [{id, schedule (5-field cron), tz?, critical?, run}]
+jobs:     [{id, schedule (5-field cron), tz?, critical?, run,
+            effect? (default write), level?, secrets?, timeout_s? (<= 1800, default 300),
+            catchup? (none | duration <= 24h, default none)}]
 tools:    {<name>: {run, description?, effect, level?, args: {<arg>: string|integer|number|boolean},
-                    secrets?, commit?, timeout_s?}}      # {placeholders} in run must be declared args
+                    secrets?, commit?, timeout_s? (<= 300)}}   # {placeholders} in run must be declared args
 mcp:      {command, tools: {<name>: {effect, level?, commit?, secrets?}}}   # unlisted MCP tools are refused
 notify:   {on: [<event>, ...], channel: imessage|slack}
 health:   {check, every: 30s|5m|1h}
-secrets:  [<keychain ref>, ...]  # every tool secret must be declared here
+secrets:  [<name>, ...]          # ^[a-z][a-z0-9_]{0,31}$; every tool and job secret must be declared here
 ```
 
 - Unknown keys are an error. A tool name defined in both `tools` and `mcp.tools` is an error.
 - Load manifests with `load_manifest` / `parse_yaml`. In that loader only `true`/`false` are booleans, so `on:` stays a string key.
-- `resonant.extensions.checks.approver_errors(manifest, principals)` validates the approvers against this installation.
+- `tool_specs()` returns the tools (CLI and MCP). Each `args_schema` has `additionalProperties: false`.
+- `job_specs()` returns one `ToolSpec` per job: `name=f"job_{id}"` with dashes as underscores, `description="scheduled job"`, args `{due_at: string}` (required, closed), and the job's effect, level, secrets and timeout. Job specs never enter a model toolset or a member's commands. A tool name equal to a job spec name is an error.
+- **Cadence.** A job fires no more often than every 5 minutes, and at most hourly when its effective level asks (L1/L2). `cron_min_interval_s(schedule)` is computed from the minute and hour fields, assuming consecutive days both fire. `Job.catchup_s` is the catch-up window in seconds (0 for `none`).
+- `resonant.extensions.checks`:
+  - `approver_errors(manifest, principals)` validates the approvers against this installation.
+  - `name_errors(manifest)` refuses a name equal to a builtin command word (`/help`, `/ext`, …).
+  - `dir_errors(root, manifest)` checks the extension directory: **stdlib only** (no `requirements*.txt`, lock files, `package.json`, `setup.py`, `setup.cfg`, `Pipfile*`, `environment.yml`, or `pyproject.toml` declaring or dynamic dependencies, at any depth), **no symlink resolving outside the root**, and the **argv[0] allowlist** for every tool, job, health and MCP command.
+  - `argv0_error(root, run)`: argv[0] must be a file inside the root (`./cli.py`), `python3 <.py file inside the root>`, `gh` or `git`. Fetch-runners (`npx`, `bunx`, `pnpx`, `pipx`, `uvx`, `uv`, `docker`, `podman`, `curl`, `wget`), shells (`sh`, `bash`, `zsh`, `dash`, `fish`, `env`), placeholders and anything else are refused.
+  - `resolve_argv0(root, run, path=EXT_PATH)` returns the absolute path to pin: the file, `sys.executable` for `python3`, or `gh`/`git` looked up on `/opt/homebrew/bin:/usr/bin:/bin`.
 - **trade-jev boundary:** order execution never goes through the loop or gate. Core only sees trade-jev's jobs, read tools, events, and kill switch. Its own process owns execution and its own risk controls.
 
 ## Principals: `resonant.principals` (`~/.resonant/principals.yaml`)

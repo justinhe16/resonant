@@ -2,7 +2,9 @@
 
 An extension teaches Resonant about one product or domain, such as a trading bot, an on-call rotation, or a home lab, without changing the core. It is usually its own repo containing a `resonant.yaml` manifest and the scripts or servers the manifest points at. The core never imports extension code. It reads the manifest, runs your commands as separate processes, and enforces policy around them.
 
-> **Status.** The manifest schema is frozen (v1), and `resonant ext validate` works today. Registration (`resonant ext add`), scheduling, tool exposure and notifications are built in Phase 3. This guide describes the full contract so you can write extensions now.
+> **Status.** The manifest schema is v1, with Phase 3's additive fields (job effects and levels, `catchup`, `description`, `examples`). `resonant ext validate` works today. Registration (`resonant ext add`), scheduling, tool exposure and notifications are built in Phase 3. This guide describes the full contract so you can write extensions now.
+>
+> **Phase 3 extensions are first-party, owner-installed code** from this repo or a local git work tree. They run as the owner's macOS user. See [phase3-plan.md](phase3-plan.md) D13.
 
 ## 1. The smallest extension
 
@@ -15,6 +17,7 @@ my-ext/
 ```yaml
 name: my-ext          # slug: lowercase, digits, dashes
 version: 1            # manifest schema version (only 1 exists)
+description: Status of the thing.   # one line; how Resonant recognizes requests for you
 tools:
   get_status:
     description: Current status of the thing.
@@ -28,16 +31,11 @@ resonant ext validate ./my-ext    # schema + invariants + approver grants
 
 See [`extensions/example`](../extensions/example) for a complete, working reference.
 
-## 2. Depending on the SDK
+## 2. Stdlib only, and the SDK
 
-Extensions depend only on `resonant-sdk`, never on the daemon package:
+**Extensions are stdlib only.** `ext add` (and `ext validate`, once Phase 3 wires the directory checks in) refuses a `pyproject.toml` that declares dependencies, `requirements*.txt`, lock files (`uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile*`), `package.json`, `setup.py`, `setup.cfg` and `environment.yml`, anywhere in the tree. There are no venvs and no install step, so no build-time code ever runs.
 
-```toml
-# pyproject.toml of your extension
-dependencies = ["resonant-sdk @ git+https://github.com/justinhe16/resonant#subdirectory=packages/resonant-sdk"]
-```
-
-The SDK gives you `Manifest` and `load_manifest` for validating in your own CI, `ToolSpec`, `Effect`, `Level`, `Event`, and later `emit()` and MCP helpers (Phase 3). Plain-CLI extensions don't need the SDK at all.
+Use `resonant-sdk` in your own CI or dev environment only, never as a runtime dependency (install it there with `pip install "resonant-sdk @ git+https://github.com/justinhe16/resonant#subdirectory=packages/resonant-sdk"`). It gives you `Manifest` and `load_manifest` for validating, `ToolSpec`, `Effect`, `Level` and `Event`.
 
 ## 3. Manifest reference (`version: 1`)
 
@@ -45,8 +43,10 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 
 | Key | Type | Meaning |
 |---|---|---|
-| `name` | slug | Unique extension id. It namespaces tools, jobs, events and secrets. |
+| `name` | slug | Unique extension id. It namespaces tools, jobs, events and secrets, and becomes the `/<name>` command, so it may not be `core` or a builtin command word (`help`, `status`, `ext`, …). |
 | `version` | `1` | Schema version. |
+| `description` | string, ≤ 120 chars, optional | One line saying what the extension is for. Resonant's router uses it to recognize requests meant for you, and the install screen shows it. |
+| `examples` | ≤ 3 lines of ≤ 80 chars, optional | Example requests, used as few-shots for the router. |
 | `uses` | slug, optional | A first-party extension this one configures. It allows exactly one extra block with that name. |
 | `approvers` | list of principals | Who may approve this extension's actions when the gate asks (L1, inferred L2, or anything above L0 under the kill switch). Each must hold the `approve` grant for this extension in `principals.yaml`. |
 | `jobs` | list | Scheduled commands, described in §6. |
@@ -54,7 +54,7 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 | `mcp` | object, optional | An MCP server and the typed list of tools it may expose, described in §4. |
 | `notify` | `{on: [event…], channel: imessage\|slack}` | Which of your emitted events are forwarded to people. |
 | `health` | `{check: <cmd>, every: 30s\|5m\|1h}` | A health command. A zero exit code means healthy. |
-| `secrets` | list of names | Keychain secret names your tools may receive. Every tool's `secrets` must be listed here. |
+| `secrets` | list of names | Keychain secret names (`^[a-z][a-z0-9_]{0,31}$`) your tools and jobs may receive. Every tool's and job's `secrets` must be listed here. |
 
 ## 4. Tools
 
@@ -66,16 +66,16 @@ Every tool declares an **effect**, which says what it can change, and optionally
 | `write` | L1 | You may set L0–L3. |
 | `pay` | L1 | **Always L1, permanently.** No override, ever. Approval requires an exact `yes <code>` reply. |
 
-The gate weighs the level (the risk) against **who chose the action**. A slash command the owner typed is `explicit`; anything the model or a job chose is `inferred`. Extension tools and jobs are always `inferred` (Phase 3).
+The gate weighs the level (the risk) against **who chose the action**. A slash command the owner typed is `explicit`; anything the model chose is `inferred`; a job's run is `scheduled`, which the gate treats like `inferred`.
 
-| Level | Explicit | Inferred (model, jobs) |
+| Level | Explicit | Inferred or scheduled (model, jobs) |
 |---|---|---|
 | L0 | Act silently. Use it for reads and triage. | same |
 | L3 | Act, then report. Use it for reversible actions with a small blast radius. | same |
 | L2 | Act, then report. | Ask first: `[A7] …? Reply yes / no`, and a plain `yes` approves. |
 | L1 | Always ask: `[D7] …? This can't be undone. Reply yes D7 / no`. Only `yes <code>` approves. | same |
 
-While the kill switch is on (`/kill`), everything above L0 asks first, and L1 still needs the code. There are no veto windows ("doing X in N min unless you stop") in Phase 2; they are planned for unattended jobs in Phase 3.
+While the kill switch is on (`/kill`), everything above L0 asks first, and L1 still needs the code. There are no veto windows ("doing X in N min unless you stop") yet; they are deferred past Phase 3.
 
 Pick the lowest level you'd be comfortable with if the model misunderstood a request. Mark irreversible, user-visible actions (send, pay, delete) with `commit: true`.
 
@@ -88,7 +88,7 @@ tools:
     run: ./cli pnl --date {date} --json     # {placeholders} must be declared in args
     effect: read
     args: {date: string}                    # string | integer | number | boolean
-    timeout_s: 30
+    timeout_s: 30                           # at most 300
   restart_worker:
     run: ./cli restart
     effect: write
@@ -97,9 +97,12 @@ tools:
 ```
 
 Contract:
-- The command runs in your extension directory with arguments substituted. It is never run through a shell.
-- It must print **one JSON object** on stdout and exit 0 on success. A non-zero exit or invalid JSON is a tool error.
-- Secrets arrive as environment variables, for that process only. The model never sees them.
+- The command runs in your installed (read-only) extension directory with arguments substituted. It is never run through a shell. Arguments the model doesn't declare are refused (`additionalProperties: false`).
+- **argv[0]** must be a file in your extension directory (`./cli.py`), `python3 <script.py in your dir>`, `gh` or `git`. Commands that fetch code at run time (`npx`, `bunx`, `pipx`, `uvx`, `uv`, `docker`, `curl`, …) and shells (`sh`, `bash`, `env`, …) are refused. Python scripts run under the daemon's own interpreter with `-I -S`; the shebang is ignored.
+- Exit 0 with **exactly one JSON object** on stdout means success.
+- A **non-zero exit means nothing took effect**: you promise that a failed run changed nothing. A timeout or kill is treated as "maybe happened" for writes.
+- Write state to `$RESONANT_EXT_DATA` (also your `HOME`), never next to your code.
+- Secrets arrive as `RESONANT_SECRET_<NAME>` environment variables, for that process only. The model never sees them.
 - Calls are idempotent per (task, step, intent). Resonant won't re-run a call that already succeeded.
 
 ### MCP tools
@@ -116,8 +119,8 @@ mcp:
 
 ## 5. Secrets
 
-- Declare secret names in `secrets:` and give each tool the ones it needs.
-- Store values in the macOS Keychain on the Mini: `security add-generic-password -s resonant -a <ext>/<name> -w`
+- Declare secret names in `secrets:` and give each tool or job the ones it needs. Names are lowercase with underscores (`token`, `api_key`).
+- Store values in the macOS Keychain on the Mini, from its terminal only: `resonant secret set <ext>/<name>`.
 - Only the executor reads them, and only at call time.
 - Never put secrets in the manifest, in `.env`, or in your repo. The Resonant repo runs gitleaks, and yours should too.
 
@@ -125,28 +128,34 @@ mcp:
 
 ```yaml
 jobs:
-  - id: daily-session
-    schedule: "15 6 * * 1-5"       # 5-field cron
+  - id: watch
+    schedule: "*/10 * * * *"       # 5-field cron
     tz: America/Los_Angeles        # default: the daemon's timezone
-    critical: true                 # its own LaunchAgent; fires even if the daemon is down
-    run: ./run_session.sh
+    run: ./cli.py watch
+    effect: read                   # default write, which is L1 and asks every run
+    level: L0                      # optional, same rules as tools
+    secrets: [token]               # must also appear in top-level secrets
+    timeout_s: 300                 # default 300, at most 1800
+    catchup: 1h                    # none (default) or up to 24h: run once if missed while down
 ```
 
+- A job runs as `scheduled`: nobody chose it, so L0 runs silently, L3 runs and reports to your approvers, and L2 and L1 ask first.
+- **Cadence.** A job may fire at most every 5 minutes, and **at most hourly if it asks** (L1 or L2), so prompts can't pile up. Give a job the lowest effect that's true; a job without `effect` is a write and asks.
+- Each job also exists as a tool spec named `job_<id>` (dashes become underscores) so `/ext run <ext>/<id>` can run it. No tool may use that name.
 - **Normal jobs** run on the daemon's scheduler.
 - **Critical jobs** get their own LaunchAgent and are wrapped as `resonant job-guard --job <ext>/<id> -- <run>`. That wrapper **refuses to run while the kill switch is engaged**, and also when it can't read the paused flag (it fails closed, exit 75). Make critical jobs idempotent and safe to skip.
 
 ## 7. Events and notifications
 
-Your processes report what happened by emitting events. Phase 3 adds the `emit()` helper and the local endpoint behind it.
+Your processes report what happened by emitting events: either an `"events"` list in the result object, or JSON lines written to file descriptor 3 (`RESONANT_EVENTS_FD`).
 
-```python
-from resonant_sdk import emit                 # Phase 3
-emit("fill", {"symbol": "ES", "qty": 1}, dedupe_key="fill:123")
+```json
+{"summary": "2 PRs", "events": [{"type": "ci_failed", "text": "resonant#40 CI failed", "dedupe_key": "resonant#40:run:123:failed"}]}
 ```
 
 - Events arrive as `ext.<name>.<event>`. Core sets the principal, so extensions can never claim one.
 - `notify.on` chooses which events are forwarded to people over `channel`.
-- Use `dedupe_key` so retries don't double-notify.
+- `dedupe_key` is required (≤ 200 chars), so retries don't double-notify.
 
 ## 8. Permissions and approvers
 
@@ -166,26 +175,25 @@ principals:
 
 ```sh
 resonant ext validate ./my-ext     # works today: schema, invariants, approver grants
-resonant ext add ./my-ext          # Phase 3
+resonant ext add repo:my-ext       # Phase 3; or path:/abs/dir inside a git work tree
 ```
 
-`ext add` (Phase 3) runs these steps:
-1. Validates the manifest.
-2. Shows a **diff** of the jobs, tools with their effects and levels, secrets, and approvers.
-3. Asks the owner to approve. Registration is an L1 action.
-4. Records the path in `~/.resonant/extensions.yaml`.
+`ext add` (Phase 3) runs **only in the Mini's terminal**, never over iMessage:
+1. Validates the manifest and the directory (stdlib only, argv[0] allowlist, no symlinks out of the tree).
+2. Shows the source, commit and content digest, then escalations first (secrets, approvers, L1/L2 tools, tools that use `gh`/`git`), then every tool, job and notify event.
+3. The owner confirms by typing the extension name.
+4. Copies the approved files to `~/.resonant/extensions/<name>/` (read-only), pins them, and records the install in the database.
 
-On daemon start or `resonant reload`, the extension is materialized:
-- jobs go to the scheduler or to LaunchAgents
-- tools go to the registry
-- `notify` becomes event subscriptions
-- `health` becomes periodic checks and dashboard tiles
+On daemon start the extension is loaded from that copy, after re-checking the pin: jobs go to the scheduler, tools to the registry, `notify` to event delivery, `health` to periodic checks.
 
-**Changing a manifest later.** Adding a `write`/`pay` tool, a secret or an approver, or raising a level, requires approval again. Removing things, or lowering a level, doesn't.
+**Changing an extension later.** `resonant ext update <name>` shows a diff and asks for the typed confirmation **every time**, even when only code changed.
 
 ## 10. Checklist
 
 - [ ] `resonant ext validate` passes, and your CI validates with `resonant_sdk.load_manifest`.
+- [ ] Stdlib only: no dependency files; every command starts with a file in your dir, `python3 <script>`, `gh` or `git`.
+- [ ] A non-zero exit means nothing took effect; state goes to `$RESONANT_EXT_DATA`.
+- [ ] Every job declares its real effect; asking jobs (L1/L2) run at most hourly.
 - [ ] Every tool prints exactly one JSON object and exits 0 on success.
 - [ ] Effects and levels are as low as safely possible, and `commit: true` is on irreversible actions.
 - [ ] No secrets in the repo; secrets are declared and stored in the Keychain.

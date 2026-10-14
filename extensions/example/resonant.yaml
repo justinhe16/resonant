@@ -2,12 +2,17 @@
 # Real extensions live in their own repos and depend only on resonant-sdk.
 name: example
 version: 1
+description: Example extension; tells the time in a timezone and keeps a notes file.
+examples:
+  - what time is it in tokyo
+  - add "buy milk" to the example notes
 approvers: [owner]
 
 jobs:
   - id: morning-ping
     schedule: "0 8 * * 1-5"            # cron, evaluated in the daemon timezone unless tz is set
     run: ./cli.py ping
+    effect: read                       # jobs default to write (L1, asks); this one only reads
 
 tools:
   get_time:

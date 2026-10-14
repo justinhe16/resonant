@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-NOTES = Path(__file__).with_name("notes.txt")
+# Installed copies are read-only; writable state goes in the data dir Resonant provides.
+DATA = Path(os.environ.get("RESONANT_EXT_DATA") or Path(__file__).parent)
+NOTES = DATA / "notes.txt"
 
 
 def main() -> int:
