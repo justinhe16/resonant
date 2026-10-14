@@ -219,6 +219,7 @@ class Command:
     owner_only: bool = False
     subs: tuple[Sub, ...] = ()
     extension: str | None = None  # an ``/<ext>`` command: every tool is that extension's
+    bare: bool = False  # no tool, no text: the fast path answers it (``/pulse``)
 
     @property
     def tools(self) -> tuple[str, ...]:
@@ -249,7 +250,7 @@ class Command:
                     return sub.word, sub.tool, args
             if self.extension is not None and first:
                 raise UsageError(reply=self._unknown_sub(first))
-            if self.tool is None:
+            if self.tool is None and not (self.bare and not first):
                 raise UsageError
         return None, self.tool, self.parse(rest, ctx)
 
@@ -332,6 +333,16 @@ EXT = Command(
     ),
 )
 
+
+PULSE = Command(
+    "/pulse",
+    "/pulse [now]",
+    "what the next update would say and what's open; now sends it",
+    "system",
+    owner_only=True,
+    bare=True,
+    subs=(Sub("now", None, usage="/pulse now"),),
+)
 
 HELP = Command(
     "/help",
@@ -429,6 +440,7 @@ COMMANDS: tuple[Command, ...] = (
         owner_only=True,
     ),
     EXT,
+    PULSE,
     HELP,
     Command("/kill", "/kill", "stop autonomy and pause", "system", owner_only=True),
     Command("/resume", "/resume", "turn autonomy back on", "system", owner_only=True),

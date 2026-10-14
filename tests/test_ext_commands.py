@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,6 +24,7 @@ from resonant.executor import (
     HandlerKey,
     ToolFailed,
 )
+from resonant.extensions import notify
 from resonant.gate import PolicyGate
 from resonant.gateway.channel import ApprovalPrompt, MessageRef, SelfTestResult, Submit
 from resonant.loop import Loop, NewTask, SlotPool
@@ -31,14 +33,16 @@ from resonant.models import ChatMessage, ModelReply, ProbeResult
 from resonant.principals import Principal, Principals
 from resonant.router import Router, commands
 from resonant.router.commands import ParseContext, UsageError
-from resonant.router.fast_path import NOT_ALLOWED, PAUSED_REPLY, briefing_reply
+from resonant.router.fast_path import NOT_ALLOWED, PAUSED_REPLY, briefing_reply, pulse_reply
 from resonant.router.render import render_extensions
 from resonant.runners.local import LocalRunner
 from resonant.store import extensions as ext_store
+from resonant.store import pulse as pulse_store
 from resonant.store import tasks as repo
 from resonant.store.db import kv_get, kv_set, transaction, utcnow
 from resonant.tools import ToolRegistry, builtin
 from resonant.tools.base import BuiltinContext
+from resonant.tools.commands import list_commands
 from resonant.tools.ext import list_extensions, mute_extension
 from resonant_sdk import Effect, Event, Manifest, ToolSpec
 from resonant_sdk.manifest import parse_yaml
@@ -739,3 +743,108 @@ async def test_manual_run_keeps_the_schedulers_open_task(
     )
     job = ext_store.get_job(db, "demo", "nightly")
     assert job is not None and job.last_outcome == "ok" and job.open_task_id == scheduled
+
+
+# --- /pulse, /pulse now, "isn't installed" (P35-5) ---------------------------------------------
+
+
+def _report(
+    db: sqlite3.Connection, source: str, key: str, title: str, urgency: str = "normal"
+) -> None:
+    with transaction(db):
+        pulse_store.upsert(db, source, key, title, urgency, {"k": key}, False, 3600, NOW)  # type: ignore[arg-type]
+
+
+async def test_pulse_previews_and_counts_open_items(router: Router, db: sqlite3.Connection) -> None:
+    assert await reply(router, "/pulse") == "Nothing new since the last update."
+    _report(db, "demo", "a", "one thing")
+    _report(db, "demo", "b", "two things", "low")
+    _report(db, "other", "c", "third")
+    text = await reply(router, "/pulse")
+    assert text.startswith("btw:\n[demo] one thing")
+    assert text.endswith("Open: demo 2, other 1")
+    notify.mute(db, "demo", NOW + timedelta(hours=2), by=OWNER)
+    text = await reply(router, "/pulse")
+    assert "[demo]" not in text and "[other] third" in text
+    assert text.endswith("Open: demo 2 (muted until 12:30pm), other 1")
+    assert await reply(router, "/pulse?") == text  # trailing punctuation is ignored
+
+
+async def test_pulse_is_owner_only_and_takes_only_now(router: Router) -> None:
+    assert await reply(router, "/pulse", MEMBER) == NOT_ALLOWED
+    assert await reply(router, "/pulse now", MEMBER) == NOT_ALLOWED
+    assert await reply(router, "/pulse later") == "Usage: /pulse [now]"
+    assert await reply(router, "/pulse now now") == "Usage: /pulse now"
+
+
+async def test_pulse_now_runs_the_core_job_inline_and_audits(
+    router: Router, db: sqlite3.Connection
+) -> None:
+    assert await reply(router, "/pulse now") == "No job core/pulse. Try /ext list."
+
+    async def run() -> str:
+        return pulse_reply({"sent": True, "count": 2})
+
+    router.fast_path.core_jobs["pulse"] = run
+    assert await reply(router, "/pulse now") == "Pulse sent."
+    (row,) = db.execute("SELECT detail FROM audit_log WHERE action = 'job.run'").fetchall()
+    assert json.loads(row["detail"])["job"] == "core/pulse"
+
+
+def test_pulse_reply_maps_every_skip_reason() -> None:
+    assert pulse_reply({"sent": False, "skipped": "nothing"}) == "Nothing new to send."
+    assert pulse_reply({"sent": False, "skipped": "duplicate"}) == "Nothing new to send."
+    assert pulse_reply({"sent": False, "skipped": "paused"}) == "Paused: pulse not sent."
+    assert pulse_reply({"sent": False, "skipped": "unreachable"}) == "Can't send: no channel/owner."
+
+
+def test_pulse_is_in_help_list_commands_and_search(ctx: BuiltinContext) -> None:
+    owner = commands.available(OWNER, principals=ctx.principals, registry=ctx.registry)
+    assert "/pulse" in [c.name for c in owner]
+    assert "/pulse [now]" in commands.help_text(owner, keywords=False)
+    assert [c.name for c in commands.search("pulse", owner)] == ["/pulse"]
+    assert [c.name for c in commands.search("puls", owner)] == ["/pulse"]
+    assert "/pulse" in commands.suggest("pulze")
+    member = commands.available(MEMBER, principals=ctx.principals, registry=ctx.registry)
+    assert "/pulse" not in [c.name for c in member]
+    out = list_commands(ctx, {"query": "pulse"}, principal=OWNER)
+    assert [c["name"] for c in out["commands"]] == ["/pulse"]
+    assert out["commands"][0]["subcommands"] == [{"word": "now", "tool": None, "level": None}]
+
+
+async def test_shipped_but_not_installed_extension_is_named(
+    router: Router, db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    shipped = tmp_path / "extensions" / "github"
+    shipped.mkdir(parents=True)
+    (shipped / "resonant.yaml").write_text("name: github\n")
+    (tmp_path / "extensions" / "empty").mkdir()
+    fp = router.fast_path
+    fp.repo_path = None
+    assert (await reply(router, "/github")).startswith("Unknown command /github.")
+    fp.repo_path = tmp_path
+    want = "github isn't installed. On the Mini: resonant ext add repo:github"
+    assert await reply(router, "/github") == want
+    assert await reply(router, "/github prs resonant") == want  # never executes
+    assert (await reply(router, "/empty")).startswith("Unknown command /empty")
+    assert (await reply(router, "/github", MEMBER)).startswith("Unknown command /github")
+    assert (await reply(router, "/..")).startswith("Unknown command")
+    record = ext_store.ExtensionRecord(
+        name="github",
+        source="repo:github",
+        commit=None,
+        tree_digest="d",
+        manifest_sha="m",
+        manifest={},
+        installed_at=NOW,
+        installed_by=OWNER,
+        status="disabled_tampered",
+    )
+    with transaction(db):
+        ext_store.save_extension(db, record)
+    assert await reply(router, "/github") == (
+        "github is disabled (files changed since install). On the Mini: resonant ext update github"
+    )
+    with transaction(db):
+        ext_store.save_extension(db, replace(record, status="disabled"))
+    assert "(turned off)" in await reply(router, "/github")

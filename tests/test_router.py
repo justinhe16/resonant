@@ -542,6 +542,7 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
         "/logs [n]: the last n log lines (at most 20)\n"
         "/approvals [code]: pending approvals; a code shows its details\n"
         "/ext list|run|mute: extensions; run <ext>/<job> now; mute <ext> [1h|until tomorrow|off]\n"
+        "/pulse [now]: what the next update would say and what's open; now sends it\n"
         "/help [word]: list commands, or the ones matching a word\n"
         "/kill: stop autonomy and pause\n"
         "/resume: turn autonomy back on\n"

@@ -268,6 +268,7 @@ def build_imessage_stack(
     router.fast_path.core_jobs[BRIEFING_JOB] = core_briefing(
         CoreDeps(settings, conn, components, channel, owner)
     )
+    router.fast_path.repo_path = settings.ops.repo_path
     router.fast_path.core_jobs[PULSE_JOB] = core_pulse(
         CoreDeps(settings, conn, components, channel, owner)
     )
