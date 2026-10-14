@@ -4,6 +4,12 @@ The gate is the Phase 2 ``PolicyGate`` (risk x origin, approvals, kill switch), 
 ``settings.dry_run`` and ``settings.gate.approval_ttl_s``. ``DryRunGate`` stays as a test
 double.
 
+Extensions (Phase 3). The ``ExtensionHost`` loads every enabled extension once, before the
+gate and executor exist: it registers their tool and job specs, and its handlers are merged
+into the executor's map here (the executor copies its map at build, so nothing is added
+later). The gate gets the host's ``approvers_for``; the executor gets the ``SecretStore``
+and ``extensions.result_max_bytes``.
+
 ``build_components`` is the single place the daemon wires these together. Later phases add
 fields here (runners, channels, ...); give new fields defaults so existing callers and tests
 keep working.
@@ -17,7 +23,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from resonant.config import Settings
-from resonant.executor import Executor, HandlerKey, ToolHandler
+from resonant.executor import Executor, Handler, HandlerKey, ToolHandler
+from resonant.extensions.host import ExtensionHost
+from resonant.extensions.process import ExtRunner
 from resonant.gate import Gate, Intent, PolicyGate
 from resonant.gate.policy import SummaryAction
 from resonant.gateway.channel import Channel
@@ -25,11 +33,13 @@ from resonant.loop.types import Runner
 from resonant.models import ModelClient
 from resonant.principals import Principal, Principals, load_principals
 from resonant.runners.local import LocalRunner
+from resonant.secrets import SecretStore
 from resonant.tools import ToolRegistry
 from resonant.tools import notes as notes_tools
 from resonant.tools import ops as ops_tools
 from resonant.tools.builtin import register_builtins
 from resonant.tools.registry import ToolKey
+from resonant_sdk import ToolSpec
 
 if TYPE_CHECKING:
     from resonant.api import DaemonState
@@ -48,9 +58,16 @@ class Components:
     principals: Principals
     gate: Gate
     executor: Executor
-    handlers: dict[HandlerKey, ToolHandler]
+    handlers: dict[HandlerKey, ToolHandler]  # builtins (the fast path's reads)
     principals_loaded: bool = True  # False: principals.yaml missing, channels deny all
     runners: dict[str, Runner] = field(default_factory=dict[str, Runner])  # name -> runner
+    extensions: ExtensionHost | None = None  # None only in tests that build by hand
+
+    def chat_specs(self) -> list[ToolSpec]:
+        """Every registered spec a chat step can call: builtins and extension tools, never
+        extension job specs."""
+        host = self.extensions
+        return [s for s in self.registry.specs() if host is None or not host.is_job(s)]
 
     def register_local_runner(
         self,
@@ -102,13 +119,17 @@ def build_components(
     state: DaemonState,
     *,
     ops_runner: OpsRunner | None = None,
+    secrets: SecretStore | None = None,
+    ext_runner: ExtRunner | None = None,
 ) -> Components:
-    """Build the registry (with builtins), principals, ``PolicyGate`` and ``Executor``.
+    """Build the registry (with builtins and loaded extensions), principals,
+    ``PolicyGate`` and ``Executor``.
 
     ``state`` is the daemon's live state; ``daemon_status`` reads uptime and loop progress
     from it. ``ops_runner`` runs the ops tools' subprocesses (default: the real one; tests
-    pass a fake). A missing principals.yaml is a warning (channels deny everyone); an
-    invalid one is an error.
+    pass a fake). ``secrets`` defaults to the real Keychain store and ``ext_runner`` to the
+    real process runner; tests pass ``SecretStore(FakeKeychain())`` and fakes. A missing
+    principals.yaml is a warning (channels deny everyone); an invalid one is an error.
     """
     path = settings.principals_path
     if path.exists():
@@ -120,6 +141,8 @@ def build_components(
     handlers = register_builtins(
         registry, conn, state, principals=principals, ops_runner=ops_runner
     )
+    host = ExtensionHost.from_settings(settings, conn, registry, runner=ext_runner)
+    host.load()
     gate = PolicyGate(
         conn,
         principals,
@@ -127,8 +150,16 @@ def build_components(
         dry_run=settings.dry_run,
         approval_ttl_s=settings.gate.approval_ttl_s,
         actions=summary_actions(conn),
+        approvers_for=host.approvers_for,
     )
-    executor = Executor(conn, gate, handlers)
+    merged: dict[HandlerKey, Handler] = {**handlers, **host.handlers}
+    executor = Executor(
+        conn,
+        gate,
+        merged,
+        secrets=secrets if secrets is not None else SecretStore(),
+        result_max_bytes=settings.extensions.result_max_bytes,
+    )
     return Components(
         registry=registry,
         principals=principals,
@@ -136,4 +167,5 @@ def build_components(
         executor=executor,
         handlers=handlers,
         principals_loaded=loaded,
+        extensions=host,
     )

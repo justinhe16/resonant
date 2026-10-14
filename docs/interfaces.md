@@ -352,12 +352,18 @@ intent_args(conn, approval) -> dict | None           # full args, from its gate.
 
 ```python
 idempotency_key(task_id, step_no, call_index, intent_hash) -> str
-Executor(conn, verifier: TokenVerifier, handlers: {(extension | None, tool): async (args) -> dict})
+Executor(conn, verifier: TokenVerifier,
+         handlers: {(extension | None, tool): async (args) -> dict | ContextHandler},
+         *, secrets: SecretStore | None = None, result_max_bytes: int | None = None)
     .execute(intent, decision, *, step_no, call_index=0) -> ToolResult
     .recorded(key) -> ToolResult | None   # what executions holds for key; read-only
     .resolve_ambiguous(key, *, succeeded, actor, result=None, note=None) -> bool   # audited
-ToolResult(ok, data, error, duration_ms, replayed, ambiguous, idempotency_key)
+ToolResult(ok, data, error, duration_ms, replayed, ambiguous, idempotency_key,
+           events=(), notice=None)
 class ToolFailed(Exception)   # raise from a handler: "definitely did not take effect"
+CallContext(secrets: {RESONANT_SECRET_<NAME>: value}, idempotency_key, task_id, events: list)
+class ContextHandler(ABC): async __call__(args, ctx: CallContext) -> dict
+secret_notice(SecretError) -> str
 ```
 
 - **Token check.** The decision must be `Allow`, and `verifier.consume(token, intent.hash)` must be true. Otherwise it raises `NotAllowedError` and audits `executor.refused`. A forged Allow, a reused token, or a token issued for different args is refused.
@@ -373,7 +379,10 @@ class ToolFailed(Exception)   # raise from a handler: "definitely did not take e
 - **Never inside a transaction:** `execute()` refuses to run inside a caller's transaction. Its `started` row must be committed before the side effect.
 - **Calls in one step:** use a distinct `call_index` for each call within a step. Two calls with the same index and intent are deduped by design.
 - **Audit:** `executor.start`, `executor.result`, `executor.ambiguous`, `executor.replayed`, `executor.refused`, and `executor.ambiguous_resolved` are all written.
-- Keychain secret injection (the executor as the only reader, env vars for the tool process, redaction in audit rows) is deferred to Phase 3, with the first tool that needs a secret.
+- **Secrets.** When `intent.spec.secrets` is non-empty and the key isn't already succeeded or started, the executor reads exactly those refs (`secrets.env_for(intent.extension, spec.secrets)`) after the token check and before the `started` row. It is the only Keychain reader for gated calls. A `SecretMissing` or `SecretUnavailable` (or no `SecretStore`) is a definite failure with **no `executions` row**, audited `executor.result`, approval not spent; `ToolResult.notice` is the code-built reply: `Not done: secret github/token is missing. On the Mini: resonant secret set github/token`. The local runner sends `notice` as is. A replay never reads the Keychain.
+- **CallContext.** Handlers that subclass `ContextHandler` (extension tools and jobs) get `CallContext(secrets, idempotency_key, task_id, events)`; `secrets` holds only this spec's declared secrets. Plain `(args) -> dict` handlers (builtins) are unchanged and never see secrets. A context handler appends its run's events to `ctx.events`; they come back on `ToolResult.events` (P3-10/P3-12 persist them).
+- **Redaction.** Before anything is stored, audited or returned, the executor applies `Redactor(values_of(env))` to the result (`deep`, which also covers values that only appear after JSON decoding), the error, the events and the failure audit's `stderr_tail` (from an `ExtFailed`/`ExtAmbiguous`). The process runner already redacted stdout and stderr; this is the second pass.
+- **Result cap.** An extension result whose JSON is over `result_max_bytes` (`extensions.result_max_bytes`, 32 KB) is stored and returned as `{"truncated": true, "bytes": n, "text": <prefix>}` (its stored JSON within the cap), after redaction. `CallContext.secrets` is left out of its repr. Builtins are never capped. The model-side cap (`extensions.model_result_max_chars`) is the local runner's (P3-11).
 
 ## Secrets: `resonant.secrets`, `resonant.redact`
 
@@ -395,7 +404,7 @@ resonant.secrets.FakeKeychain                # in-memory SecurityRunner for test
 - **Values never in argv.** Reads take the value from stdout (one trailing newline stripped). `set` writes it twice on stdin for the trailing `-w` prompt. `set` takes 8–128 printable ASCII characters.
 - **Exit codes.** 0 is ok. 44 (`errSecItemNotFound`) is `SecretMissing` (`exists` and `delete` return False). Anything else, a timeout or a failure to start is `SecretUnavailable`, with a reason such as `keychain locked or no user interaction allowed (exit 36)`. Messages carry the ref and code only, never a value or `security`'s output, and nothing is logged.
 - **Redaction.** `Redactor` matches each value raw, URL-encoded (`%XX` either case, `+` for space), JSON-string-escaped (incl. `\/` and `\uXXXX`), or any per-character mix of those; and base64 (standard or URL-safe) at the three byte alignments, matching only the characters that depend on the value alone, so a value inside a larger blob is caught. Overlapping matches merge into one `[redacted]`. `deep` redacts every string in dicts (keys too), lists and tuples and returns a copy. Other transforms (hex, HTML entities, double escaping, line-wrapped MIME base64) are not matched; `bytes` and sets pass through `deep` unchanged (phase 3 plan §5 residual).
-- Injection (`Executor(…, secrets=)`, `CallContext`) and the two redaction passes are P3-6.
+- Injection (`Executor(…, secrets=)`, `CallContext`) and the second redaction pass are in [Executor](#executor-resonantexecutor); the first pass is the process runner's.
 
 ## Built-in tools: `resonant.tools.builtin`
 
@@ -592,9 +601,9 @@ FakeExtProcess(results=[...], respond=None)  .calls   # tests; runs nothing
 
 - **argv.** `run` is `shlex.split` once at compile. `{arg}` placeholders are filled inside their token, so a value never adds, splits or quotes an argv element, and nothing runs through a shell. `{{`/`}}` are literal braces. argv0 must be literal and pass `checks.argv0_error(root, run)`. A file in the extension dir runs only if it is `.py`, as `[python, -I, -S, <script>, …]` (also `python3 <script>`); the shebang is never used, so `./run.sh` with `#!/usr/bin/env npx` is refused. `-I` leaves the script's dir off `sys.path`, so sibling imports need an explicit path. `gh`/`git` run only by `argv0`, the absolute path pinned at install (`ExtensionRecord.argv0_paths[spec]`, basename must match); never a PATH lookup. A format spec, conversion or non-identifier placeholder is a `TemplateError`.
 - **Values.** Strings (no NUL, at most 1000 chars), ints, finite floats and booleans (`true`/`false`). A token that begins with a placeholder may not render starting with `-`, however the values split it (`{a}{b}` included); write `--tz={tz}`. Anything else, or a missing arg, is `ToolFailed`. Error messages name the arg, never the value.
-- **Environment.** Exactly `ExtRequest.env`; nothing from `os.environ`. `scratch_env` gives `PATH` (default `/opt/homebrew/bin:/usr/bin:/bin`; P3-6 passes `extensions.process.path_env()`), `HOME=<data>`, `TMPDIR=<data>/tmp`, `LANG=en_US.UTF-8`, `USER`, `LOGNAME`, `RESONANT_EXT`, `RESONANT_EXT_DATA`, `RESONANT_EVENTS_FD=3`, `GIT_TERMINAL_PROMPT=0`, `RESONANT_JOB_DUE_AT` (jobs only), and `secrets` as given: the output of `SecretStore.env_for(ext, declared)`, keys `RESONANT_SECRET_<NAME>` only (anything else is a `ValueError`, so a secret can't replace `PATH`). The caller passes only the secrets the tool or job declared.
+- **Environment.** Exactly `ExtRequest.env`; nothing from `os.environ`. `scratch_env` gives `PATH` (default `/opt/homebrew/bin:/usr/bin:/bin`; the host passes `extensions.process.path_env`), `HOME=<data>`, `TMPDIR=<data>/tmp`, `LANG=en_US.UTF-8`, `USER`, `LOGNAME`, `RESONANT_EXT`, `RESONANT_EXT_DATA`, `RESONANT_EVENTS_FD=3`, `GIT_TERMINAL_PROMPT=0`, `RESONANT_JOB_DUE_AT` (jobs only), and `secrets` as given: the output of `SecretStore.env_for(ext, declared)`, keys `RESONANT_SECRET_<NAME>` only (anything else is a `ValueError`, so a secret can't replace `PATH`). The caller passes only the secrets the tool or job declared.
 - **Process.** cwd is `req.cwd` (the extension copy), stdin `/dev/null`, a new session. A fixed `python -I -S -c` trampoline moves the events pipe to fd 3 and `execve`s the argv with only the keys of `req.env`. `argv[0]` must be an absolute path to an executable, else `ExtFailed`. Our own pipes carry stdout and stderr, so exit is seen even while a leftover holds them open.
-- **Config.** The caps, `grace_s` and `sample_s` are constructor args with the plan's defaults; P3-6 passes `extensions.process.*` (`stdout_max_bytes` for both stdout and fd 3, `stderr_max_bytes`, `kill_grace_s`, `tree_sample_s`).
+- **Config.** The caps, `grace_s` and `sample_s` are constructor args with the plan's defaults; the host (`ExtensionHost.from_settings`) passes `extensions.process.*` (`stdout_max_bytes` for both stdout and fd 3, `stderr_max_bytes`, `kill_grace_s`, `tree_sample_s`).
 - **Tracking and kills.** Each live run is in the `ProcessTracker` with its process group and its descendants, sampled with `psutil` every `sample_s` and once more before any kill (this catches children that `setsid` out of the group; a pid is only signalled while its create time matches). Timeout, cancel and `kill_all` send SIGTERM to the group and the tracked tree, then SIGKILL after `grace_s`. Leftovers after a normal exit are ended the same way. Cancel kills, then re-raises `CancelledError`; a final synchronous SIGKILL runs even if a second cancel cuts the grace short. **Limit:** a descendant that double-forks and `setsid`s between samples is never tracked and survives; if it keeps stdout or fd 3 open the run ends after a 1 s drain as `ExtAmbiguous("output still open")` and the pipes are closed (D13: same-user code, not a sandbox).
 - **Kill switch** (P3-10). `kill_all(hold=True)` sets `paused` first: new runs are refused with `ExtFailed("paused")` (definite) until the caller clears `paused` on resume; a run that slipped in between is killed at once.
 - **Caps.** stdout is read in chunks; past `stdout_cap` the tree is killed: `ExtAmbiguous("output too large")`. fd 3 likewise (`events too large`). stderr keeps its last `stderr_cap` bytes and is never logged or returned; only a redacted 200-char tail rides on `ExtFailed`/`ExtAmbiguous` for the failure audit row.
@@ -602,17 +611,51 @@ FakeExtProcess(results=[...], respond=None)  .calls   # tests; runs nothing
 - **Result contract** (`run`): exit 0 with exactly one JSON object is success. Exit > 0 is `ExtFailed("exit N")`: the author promises nothing took effect. A timeout (`timeout`), the kill switch (`killed`), a cap overflow (even one seen after exit), output left open (`output still open`), death by signal (`signal N`) or exit 0 without one JSON object (`invalid output`) is `ExtAmbiguous`. It is deliberately not a `ToolFailed`, so the executor's generic branch makes it a definite failure for reads and ambiguous for writes. `stderr_tail` is for the failure audit row only, never a message. (A stdout overflow is a kill, so it is ambiguous like a timeout, not `ToolFailed` as the plan's D4 first said.)
 - **Events.** From `result["events"]` (removed from `data`) and then fd-3 lines, one JSON object per line. Each is `{type, text, dedupe_key, data?}`: `type` a lowercase slug (`^[a-z][a-z0-9_.-]{0,63}$`), `dedupe_key` 1..200 chars, `text` clipped to 1000, `data` an object; unknown keys or bad shapes are dropped and counted in `dropped_events`, as is anything past `max_events`. A failed or ambiguous run returns no events.
 
+## Extension host: `resonant.extensions.host`
+
+```python
+ExtensionHost.from_settings(settings, conn, registry, *, runner: ExtRunner | None = None) -> ExtensionHost
+    .load() -> None                       # once, from build_components
+    .loaded: {name: LoadedExtension(record, manifest, root, tools, jobs)}
+    .refused: {name: reason}  .tampered: [name]  .tracker: ProcessTracker
+    .handlers: {(ext, spec name): ExtensionHandler}
+    .tool_specs(extension=None) / .job_specs(extension=None) -> list[ToolSpec]
+    .is_job(spec) -> bool  .manifest(name) -> Manifest | None
+    .approvers_for(extension) -> tuple[str, ...]   # PolicyGate seam; () on any error
+send_alerts(conn, channel, owner) -> int     # queued owner alerts (kv "ext.alerts")
+tampered_text(name) -> str
+resonant.extensions.pin: tree_digest(root) -> str ; verify_copy(record, root) -> "ok" | "changed" | "missing"   # P3-7
+resonant.extensions.handlers.ExtensionHandler(ContextHandler)
+resonant.e2e.extensions.install_fixture(settings, conn, manifest_yaml, files, *, argv0_paths=None)  # tests
+```
+
+- **Load**, per `enabled` row in name order, from `<extensions_dir>/<name>/`:
+  1. **Pin.** `pin.verify_copy(record, root)` (P3-7's digest, every byte including `resonant.yaml`). Anything but `ok` (`changed`, `missing`) sets `disabled_tampered`, and only when that flips (`set_status` is True) audits `ext.tampered` and queues one alert, all in one transaction: `example changed on disk since you approved it; disabled. resonant ext update example to review`. Nothing of it is registered, and a restart doesn't load it or alert again.
+  2. **Manifest.** The row's approved snapshot, validated again; its name must match, and it must equal the copy's (pinned) `resonant.yaml`. Any unexpected error while loading is a refusal too (`load failed (<type>)`), never a daemon crash. `checks.dir_errors` must pass on the copy. MCP is refused for now.
+  3. **Commands.** Each tool's and job's `run` is compiled once (`ExtCommand.compile`, `argv0=record.argv0_paths[<spec name>]`, which must still be a file). A tool's placeholders must be its declared args; a job's may only be `{due_at}`. Only `gh`/`git` run by their pinned path, so only those must still exist; scripts and `python3` run with the daemon's interpreter.
+  4. **Register.** `Manifest.tool_specs()` and `job_specs()` (`job_<id>`) go into the registry, each with an `ExtensionHandler`. If any step 2-4 fails, nothing of that extension is registered; it is audited `ext.load_refused` and kept in `refused` (health, P3-12). Its status is unchanged. One bad extension never blocks the others or the daemon.
+- **Tree digest.** See the manager section (`resonant.extensions.pin`); the host only re-verifies.
+- **Jobs stay out of chat.** Job specs are in the registry (the gate and `/api/tools` see them; P3-10 runs them), but `tool_specs()` and `Components.chat_specs()` leave them out, and so does the step limit.
+- **Handler.** One process run per call: `render(args)`, `scratch_env(ext, data_dir=<ext_data_dir>/<name>, secrets=ctx.secrets, job_due_at=args["due_at"] for jobs, path=extensions.process.path_env)`, `ExtRequest(cwd=root, timeout_s=spec.timeout_s, label="<ext>/<tool>")`, `redact=Redactor(values_of(env)).text`. The JSON object is returned deep-redacted and its events go to `ctx.events`. Secrets the spec didn't declare are refused (`ToolFailed`). P3-10's L0 job path calls the same handler with its own `CallContext`.
+- **Process config.** `ExtProcess(tracker, stdout_cap=stdout_max_bytes, stderr_cap=stderr_max_bytes, events_cap=stdout_max_bytes)`, `ProcessTracker(sample_s=tree_sample_s, grace_s=kill_grace_s)`. `host.tracker` is the kill switch's handle (P3-10).
+- **Alerts.** `IMessageStack.start` calls `send_alerts` after "back up": each is sent to the owner with `dedupe_key=ext-tampered:<name>:<installed_at>`; sent or refused alerts are dropped, other channel errors (or no owner yet) keep them for the next start.
+- The daemon's startup line includes `extensions=<loaded count>`.
+
 ## Components: `resonant.components`
 
 ```python
-build_components(settings, conn, state: DaemonState, *, ops_runner: OpsRunner | None = None) -> Components
+build_components(settings, conn, state: DaemonState, *, ops_runner: OpsRunner | None = None,
+                 secrets: SecretStore | None = None, ext_runner: ExtRunner | None = None) -> Components
 Components(registry, principals, gate: Gate, executor, handlers, principals_loaded=True,
-           runners: dict[str, Runner] = {})
+           runners: dict[str, Runner] = {}, extensions: ExtensionHost | None = None)
     .register_local_runner(conn, *, model: ModelClient, channel: Channel, timezone="UTC") -> LocalRunner
+    .chat_specs() -> list[ToolSpec]     # builtins + extension tools, never job specs
 ```
 
+- **Extensions.** After the builtins, `ExtensionHost.from_settings(settings, conn, registry, runner=ext_runner).load()` registers every enabled extension (see [Extension host](#extension-host-resonantextensionshost)). Then the gate is built with `approvers_for=host.approvers_for`, and the executor with the builtin and extension handlers merged (it copies its map at build, so nothing is added later), `secrets` (default: the real `SecretStore()`) and `result_max_bytes=settings.extensions.result_max_bytes`. `Components.handlers` stays builtins only (the fast path's reads).
+
 - `Daemon.__init__` calls it once and sets `DaemonState.components`.
-- `gate` is `PolicyGate(conn, principals, registry, dry_run=settings.dry_run, approval_ttl_s=settings.gate.approval_ttl_s, actions=summary_actions(conn))`. `summary_actions` maps `(None, "clear_notes")` to the notes hook (`delete all 4 notes`) and the ops writes to their headings (`restart Ollama`, `restart Resonant`, `update Resonant`). `ops_runner` goes to `register_builtins`. `DryRunGate` stays as a test double.
+- `gate` is `PolicyGate(conn, principals, registry, dry_run=settings.dry_run, approval_ttl_s=settings.gate.approval_ttl_s, actions=summary_actions(conn), approvers_for=host.approvers_for)`. `summary_actions` maps `(None, "clear_notes")` to the notes hook (`delete all 4 notes`) and the ops writes to their headings (`restart Ollama`, `restart Resonant`, `update Resonant`). `ops_runner` goes to `register_builtins`. `DryRunGate` stays as a test double.
 - If `principals.yaml` is missing, it logs a warning and uses an identity-less stand-in owner, so no channel identity resolves and every channel request is denied (`principals_loaded=False`). An invalid file is an error.
 - New fields (runners, channels, ...) get defaults so existing callers keep working.
 - `register_local_runner` builds `LocalRunner` from the components' gate, executor and registry and adds it to `runners["local"]`. The daemon builds the model client and channel (the channel needs `principals`), so it calls this after `build_components`.
@@ -826,7 +869,7 @@ LocalRunner(conn, *, model: ModelClient, channel: Channel, gate: RunnerGate, exe
 # ToolExecutor: execute(intent, decision, *, step_no, call_index) and recorded(key)
 ```
 
-The daemon sets `max_step_s = wiring.local_step_limit(model, registry.specs()) = max((MAX_TOOL_ITERATIONS + 1) * model.timeout_s, longest tool timeout_s) + 15` (375s with the defaults: `update_resonant`'s 360s beats the model's 240s), so the model client's or the executor's own timeout always fires first: the user gets the templated fallback instead of a cancelled step, and `/update` is never cancelled into an ambiguous outcome. The loop's stuck check stays a backstop.
+The daemon sets `max_step_s = wiring.local_step_limit(model, components.chat_specs()) = max((MAX_TOOL_ITERATIONS + 1) * model.timeout_s, longest tool timeout_s) + 15`. Job specs are not chat tools and never count; an extension tool counts at most 300s (375s with the defaults: `update_resonant`'s 360s beats the model's 240s), so the model client's or the executor's own timeout always fires first: the user gets the templated fallback instead of a cancelled step, and `/update` is never cancelled into an ambiguous outcome. The loop's stuck check stays a backstop.
 
 One step answers the whole task, unless it waits for an approval. In this order:
 
@@ -870,15 +913,16 @@ PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: Chan
 build_imessage_stack(settings, conn, components, loop, *, daemon_healthy, model=None, osa_runner=None)
     -> IMessageStack(channel, router, runner, reminders, monitor, model, owner)
 IMessageStack.start(loop) / .stop() / .aclose() / .running
-local_step_limit(model_cfg, tools: Iterable[ToolSpec] = ()) -> float
+local_step_limit(model_cfg, tools: Iterable[ToolSpec] = ()) -> float   # chat tools; ext tools capped at 300s
 Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | None = None,
-       ops_runner: OpsRunner | None = None)
+       ops_runner: OpsRunner | None = None, secrets: SecretStore | None = None,
+       ext_runner: ExtRunner | None = None)
 ```
 
 - **Gate.** Always `PolicyGate`, iMessage on or off. The startup log line includes `gate=policy dry_run=<bool>`. With `dry_run: true`, L0 reads (chat and the fast path) are allowed exactly as before.
 - **`channels.imessage.enabled: false`** (the default): the daemon is Phase 0 apart from the gate. `loop.router` is None, `loop.runners == {"echo"}`, `DaemonState.monitor` is None, and nothing imports the model client.
 - **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner(..., timezone=settings.timezone)`, then `loop.runners["local"]`, `max_step_s = local_step_limit`) and `ReminderRunner` (`runners["reminder"]`, see Reminders), sets `loop.router = router.route`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta)`, which becomes `DaemonState.monitor`. `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`; tests also pass `ops_runner=FakeOpsRunner()` (it goes to `build_components`).
-- **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`, then `ops.back_up`: `Back up (<commit>), down Ns` once after a requested restart) before the loop, then the loop, the API, the monitor and the dead-man (with `monitor.deadman_reason`).
+- **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`, then `ops.back_up`: `Back up (<commit>), down Ns` once after a requested restart, then `extensions.host.send_alerts`: queued tamper alerts to the owner, once each) before the loop, then the loop, the API, the monitor and the dead-man (with `monitor.deadman_reason`).
 - **Stop** (SIGTERM/SIGINT, or a component exiting): the API is told to exit; the monitor and the chat.db reader stop first, so no new events arrive; then the loop drains in-flight steps (10s grace; a draining step can still send its reply); then the model client closes and the store closes. Unfinished steps resume from their checkpoints on the next start, and the send dedupe key (`reply:<task id>`) prevents a double reply.
 
 ## Spans and logs: `resonant.observability`

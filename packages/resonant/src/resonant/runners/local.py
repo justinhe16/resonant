@@ -359,6 +359,8 @@ def dry_run_reply(decision: DryRun) -> str:
 
 
 def _failure_reply(intent: Intent, result: ToolResult) -> str:
+    if result.notice is not None:  # code-built by the executor (a missing secret)
+        return result.notice
     if result.ambiguous:
         return (
             f"Not sure whether {summarize_intent(intent)} ran: it has no recorded outcome. "

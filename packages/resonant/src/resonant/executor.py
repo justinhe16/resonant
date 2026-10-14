@@ -28,7 +28,17 @@ again. The approval is spent with ``started``, so after a definite failure of an
 call the gate returns ``Deny(APPROVAL_USED)``: a retry needs a new task.
 
 Each call writes audit rows before and after it, and on every refusal or ambiguity.
-Keychain secret injection and redaction are deferred to Phase 3.
+
+Secrets (Phase 3). With ``secrets=SecretStore``, a call whose spec declares ``secrets``
+reads exactly those from the Keychain just before it runs (after the replay check, before
+the ``started`` row). A missing or unavailable secret is a definite failure with no
+``executions`` row and a code-built ``notice``. Handlers that subclass
+``ContextHandler`` get them in a ``CallContext``; plain handlers never see them.
+
+Redaction. Everything the call produced (the result, the error, its events, the audit
+fields) is deep-redacted with ``Redactor`` over that call's secret values before it is
+stored, audited or returned. An extension result whose JSON is over ``result_max_bytes``
+is stored and returned as ``{"truncated": true, "bytes": n, "text": <prefix>}``.
 """
 
 from __future__ import annotations
@@ -39,11 +49,14 @@ import hashlib
 import json
 import sqlite3
 import time
+from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from resonant.gate.types import Allow, Decision, Intent, TokenVerifier
+from resonant.redact import Redactor
+from resonant.secrets import SecretError, SecretMissing, SecretStore, values_of
 from resonant.store import approvals
 from resonant.store.audit import audit
 from resonant.store.db import atomic, now_iso, transaction, utcnow
@@ -54,6 +67,12 @@ HandlerKey = tuple[str | None, str]  # (extension, tool); builtins use None
 
 _UNKNOWN = "earlier attempt has no recorded outcome"
 _USED = "approval already used or not for this intent"
+
+
+def _stderr_tail(error: BaseException) -> str | None:
+    """The redacted stderr tail an extension failure carries, for the audit row only."""
+    tail: object = getattr(error, "stderr_tail", None)
+    return tail if isinstance(tail, str) else None
 
 
 def idempotency_key(task_id: str, step_no: int, call_index: int, intent_hash: str) -> str:
@@ -70,6 +89,31 @@ class NotAllowedError(Exception):
 
 
 @dataclass(frozen=True)
+class CallContext:
+    """What a ``ContextHandler`` gets besides its args.
+
+    ``secrets`` is ``{RESONANT_SECRET_<NAME>: value}`` for exactly this spec's declared
+    secrets. A handler appends the run's events (JSON-like dicts) to ``events``; the
+    executor redacts them and returns them on ``ToolResult.events``.
+    """
+
+    secrets: Mapping[str, str] = field(repr=False)  # values never in a repr or log
+    idempotency_key: str
+    task_id: str
+    events: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+
+
+class ContextHandler(ABC):
+    """A handler that wants a ``CallContext`` (extension tools and jobs)."""
+
+    @abstractmethod
+    async def __call__(self, args: dict[str, Any], ctx: CallContext) -> dict[str, Any]: ...
+
+
+Handler = ToolHandler | ContextHandler
+
+
+@dataclass(frozen=True)
 class ToolResult:
     ok: bool
     data: dict[str, Any] | None = None
@@ -78,6 +122,17 @@ class ToolResult:
     replayed: bool = False  # True: returned from a previous successful execution
     ambiguous: bool = False  # True: outcome unknown; not re-run until resolved
     idempotency_key: str | None = None
+    events: tuple[dict[str, Any], ...] = ()  # a ContextHandler's events, redacted
+    notice: str | None = None  # a code-built reply for a definite failure (missing secret)
+
+
+def secret_notice(error: SecretError) -> str:
+    """``Not done: secret github/token is missing. On the Mini: resonant secret set …``"""
+    if isinstance(error, SecretMissing):
+        return (
+            f"Not done: secret {error.ref} is missing. On the Mini: resonant secret set {error.ref}"
+        )
+    return f"Not done: {error}."
 
 
 class Executor:
@@ -85,11 +140,19 @@ class Executor:
         self,
         conn: sqlite3.Connection,
         verifier: TokenVerifier,
-        handlers: Mapping[HandlerKey, ToolHandler],
+        handlers: Mapping[HandlerKey, Handler],
+        *,
+        secrets: SecretStore | None = None,
+        result_max_bytes: int | None = None,
     ) -> None:
+        """``handlers`` is copied: pass builtins and extension handlers together
+        (``build_components`` merges them at start). ``result_max_bytes`` caps extension
+        results (None: no cap)."""
         self.conn = conn
         self.verifier = verifier
-        self.handlers = dict(handlers)
+        self.handlers: dict[HandlerKey, Handler] = dict(handlers)
+        self.secrets = secrets
+        self.result_max_bytes = result_max_bytes
 
     async def execute(
         self, intent: Intent, decision: Decision, *, step_no: int, call_index: int = 0
@@ -104,6 +167,22 @@ class Executor:
                 self._audit("executor.refused", intent, None, decision)
             raise NotAllowedError("executor requires an Allow issued by the gate for this intent")
         key = idempotency_key(intent.task_id, step_no, call_index, intent.hash)
+
+        env: dict[str, str] = {}
+        if intent.spec.secrets and self._may_run(key):
+            try:
+                env = await self._secrets_for(intent)
+            except SecretError as e:
+                # Before 'started': nothing ran, so this is a definite failure with no row.
+                with atomic(self.conn):
+                    self._audit("executor.result", intent, key, decision, ok=False, error=str(e))
+                return ToolResult(
+                    ok=False,
+                    error=f"ToolFailed: {e}",
+                    idempotency_key=key,
+                    notice=secret_notice(e),
+                )
+        redactor = Redactor(values_of(env))
 
         with transaction(self.conn):
             row = self.conn.execute(
@@ -125,18 +204,37 @@ class Executor:
             raise NotAllowedError(_USED)
 
         start = time.monotonic()
+        ctx = CallContext(secrets=env, idempotency_key=key, task_id=intent.task_id)
+        tail: str | None = None
         try:
-            data = await self._run(intent)
+            data = await self._run(intent, ctx)
         except asyncio.CancelledError:
-            self._record(intent, key, decision, self._classify(intent, "cancelled"), start)
+            outcome = self._classify(intent, "cancelled")
+            self._record(intent, key, decision, outcome, start, redactor)
             raise
         except ToolFailed as e:
             outcome = ToolResult(ok=False, error=f"ToolFailed: {e}")
+            tail = _stderr_tail(e)
         except Exception as e:
             outcome = self._classify(intent, f"{type(e).__name__}: {e}")
+            tail = _stderr_tail(e)
         else:
-            outcome = ToolResult(ok=True, data=data)
-        return self._record(intent, key, decision, outcome, start)
+            outcome = ToolResult(ok=True, data=data, events=tuple(ctx.events))
+        return self._record(intent, key, decision, outcome, start, redactor, stderr_tail=tail)
+
+    def _may_run(self, key: str) -> bool:
+        """False when the key is already succeeded or started (replayed or ambiguous)."""
+        row = self.conn.execute(
+            "SELECT status FROM executions WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        return row is None or row["status"] == "failed"
+
+    async def _secrets_for(self, intent: Intent) -> dict[str, str]:
+        if self.secrets is None:
+            raise SecretError(f"{intent.extension}/{intent.spec.secrets[0]}", "unavailable")
+        if intent.extension is None:
+            raise SecretError(f"builtin/{intent.spec.secrets[0]}", "unavailable")
+        return await self.secrets.env_for(intent.extension, intent.spec.secrets)
 
     def _spend(self, intent: Intent, approval_id: str) -> bool:
         """Mark the approval used. Call inside the transaction that writes 'started'."""
@@ -155,13 +253,13 @@ class Executor:
         )
         self._audit("executor.start", intent, key, decision)
 
-    async def _run(self, intent: Intent) -> dict[str, Any]:
+    async def _run(self, intent: Intent, ctx: CallContext) -> dict[str, Any]:
         handler = self.handlers.get((intent.extension, intent.tool))
         if handler is None:
             raise ToolFailed(f"no handler for {intent.extension or 'builtin'}/{intent.tool}")
-        data = await asyncio.wait_for(
-            handler(copy.deepcopy(intent.args)), timeout=intent.spec.timeout_s
-        )
+        args = copy.deepcopy(intent.args)
+        call = handler(args, ctx) if isinstance(handler, ContextHandler) else handler(args)
+        data = await asyncio.wait_for(call, timeout=intent.spec.timeout_s)
         json.dumps(data, allow_nan=False)  # inside the try: an unserializable result counts
         return data
 
@@ -171,12 +269,51 @@ class Executor:
             return ToolResult(ok=False, error=error)
         return ToolResult(ok=False, ambiguous=True, error=error)
 
+    def _cap(self, intent: Intent, data: dict[str, Any] | None) -> dict[str, Any] | None:
+        """An extension result whose stored JSON is over ``result_max_bytes`` becomes
+        ``{"truncated": true, "bytes": n, "text": <prefix>}``, itself within the cap."""
+        cap = self.result_max_bytes
+        if data is None or intent.extension is None or cap is None:
+            return data
+        text = json.dumps(data)  # the same encoding _record stores
+        if len(text) <= cap:
+            return data
+
+        def capped(n: int) -> dict[str, Any]:
+            return {"truncated": True, "bytes": len(text), "text": text[:n]}
+
+        lo, hi = 0, len(text)  # the longest prefix whose stored form fits
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(json.dumps(capped(mid))) <= cap:
+                lo = mid
+            else:
+                hi = mid - 1
+        return capped(lo)
+
     def _record(
-        self, intent: Intent, key: str, decision: Allow, outcome: ToolResult, start: float
+        self,
+        intent: Intent,
+        key: str,
+        decision: Allow,
+        outcome: ToolResult,
+        start: float,
+        redactor: Redactor,
+        *,
+        stderr_tail: str | None = None,
     ) -> ToolResult:
+        # Redact first, then cap: a cut can only shorten text that is already redacted.
         outcome = replace(
-            outcome, duration_ms=int((time.monotonic() - start) * 1000), idempotency_key=key
+            outcome,
+            data=self._cap(intent, redactor.deep(outcome.data)),
+            error=None if outcome.error is None else redactor.text(outcome.error),
+            events=redactor.deep(outcome.events),
+            duration_ms=int((time.monotonic() - start) * 1000),
+            idempotency_key=key,
         )
+        detail: dict[str, Any] = {}
+        if stderr_tail:
+            detail["stderr_tail"] = redactor.text(stderr_tail)
         with transaction(self.conn):
             if not outcome.ambiguous:  # ambiguous rows stay 'started' until resolved
                 self.conn.execute(
@@ -197,6 +334,7 @@ class Executor:
                 ok=outcome.ok,
                 error=outcome.error,
                 duration_ms=outcome.duration_ms,
+                **detail,
             )
         return outcome
 
