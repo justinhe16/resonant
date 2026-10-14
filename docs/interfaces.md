@@ -438,6 +438,8 @@ class Channel(Protocol):
     async def self_test(self) -> SelfTestResult
 ```
 
+`request_approval` sends `prompt.text()` (`approval_text` with the destructive variant for L1 non-pay, the pay variant for pay) and dedupes by `approval_dedupe_key(approval_id, principal) = "approval:<id>:prompt:<principal>"`: a repeat returns the first ref without sending, so the local runner can re-prompt on every pending step.
+
 Every adapter must:
 - Resolve identity to a principal before calling `submit`. Unknown identities are dropped and audited.
 - **Never emit events for its own messages**:
@@ -569,23 +571,37 @@ channels_snapshot(conn, *, imessage_enabled, channel) -> [{name, enabled, ok, la
 
 ```python
 LocalRunner(conn, *, model: ModelClient, channel: Channel, gate: RunnerGate, executor: ToolExecutor,
-            registry, max_step_s=30.0)   # name="local", uses_claude_slot=False
+            registry, max_step_s=30.0, now=utcnow)   # name="local", uses_claude_slot=False
+# ToolExecutor: execute(intent, decision, *, step_no, call_index) and recorded(key)
 ```
 
-The daemon sets `max_step_s = wiring.local_step_limit(model) = (MAX_TOOL_ITERATIONS + 1) * model.timeout_s + 15` (255s with the 60s default), so the model client's own timeout always fires first and the user gets the templated fallback instead of a cancelled step. The loop's stuck check stays a backstop.
+The daemon sets `max_step_s = wiring.local_step_limit(model) = (MAX_TOOL_ITERATIONS + 1) * model.timeout_s + 15` (255s with the 60s default), so the model client's own timeout always fires first and the user gets the templated fallback instead of a cancelled step. The loop's stuck check stays a backstop. (P2-14 raises it to cover the longest tool timeout.)
 
-One step answers the whole task, in this order:
+One step answers the whole task, unless it waits for an approval. In this order:
 
 1. `checkpoint.reply` exists: an earlier attempt computed it, so only (re)send it.
-2. `checkpoint.fast_reply`: send it as is (the router already ran its read). No model call.
-3. `checkpoint.fallback`: send `prefixes.FALLBACK_REPLY`. `intent == "run_project"`: send `ESCALATE_REPLY` ("needs the Claude runner, which arrives in Phase 5") with `escalate=true`. No tools, no model, never Claude.
-4. Context: `runner_system(intent)`, the checkpoint's `toolset` (looked up in the registry, sorted by name), this principal's previous `imessage` messages (at most 5, so 6 events with the current one; each with our reply to it, from the task it started; earlier tool outputs appear only as those replies), then the current message wrapped by `wrap_untrusted` (2000 chars).
-5. Tools: up to 3 `chat_tools` calls and 3 tool calls in all. Each call is `Intent.for_tool(spec from the toolset, task_id, principal, args)` → `gate.evaluate` → on `Allow`, `executor.execute(intent, decision, step_no=task.step_no, call_index=i)`. A tool outside the toolset, bad args, any other decision, or a failed call goes back to the model as a tool error. A model reply asking for more calls than are left escalates like `run_project`. An empty toolset skips `chat_tools`.
+2. `checkpoint.call` exists: resume the task's pinned gated call (below). No model call.
+3. `checkpoint.direct_call = {tool, args}` (written only by the router's command parser): pin it as `call` with `call_index=0` and run it as a gated call with `origin="explicit"`. This is the only place `explicit` is set, and only when the pinned call is exactly the `direct_call`. An unregistered tool replies `Not done: that tool isn't available.` and runs nothing. No model call.
+4. `checkpoint.fast_reply`: send it as is (the router already ran its read). No model call.
+5. `checkpoint.fallback`: send `prefixes.FALLBACK_REPLY`. `intent == "run_project"`: send `ESCALATE_REPLY` ("needs the Claude runner, which arrives in Phase 5") with `escalate=true`. No tools, no model, never Claude.
+6. Context: `runner_system(intent)`, the checkpoint's `toolset` (looked up in the registry, sorted by name), this principal's previous `imessage` messages (at most 5, so 6 events with the current one; each with our reply to it, from the task it started; messages that started no task, such as approval replies, are skipped; earlier tool outputs appear only as those replies), then the current message wrapped by `wrap_untrusted` (2000 chars).
+7. Tools: up to 3 `chat_tools` calls and 3 tool calls in all. Each call is `Intent.for_tool(spec from the toolset, task_id, principal, args, origin="inferred")` → `gate.evaluate`. The model path is always `inferred`.
+   - A read that is allowed runs (`executor.execute(..., step_no=task.step_no, call_index=i)`) and its result goes back to the model. A refused read, a tool outside the toolset, bad args, or a failed read goes back as a tool error.
+   - Anything else (a side effect, or any call that needs approval) is the task's **one gated call** and ends the loop. `Allow` and `NeedsApproval` pin it as `call` first. Allowed, it runs; then the model may narrate, but the reply always contains the call's code-built report line (appended if the model left it out; the report alone if the model fails). Needs approval: the task waits. `DryRun` or `Deny`: the templated reply only.
+   - A model reply asking for more calls than are left escalates like `run_project`. An empty toolset skips `chat_tools`.
    - `ChatMessage` has no `tool` role, so a call is replayed as an assistant turn `{"tool_call": {name, args}}` and its result as a user turn labeled untrusted data. The model contract is unchanged.
-6. Answer: `chat_json` with schema `{reply: string}`, clipped to 600 chars. **Number guard:** every number in the reply must appear in a tool result or in the user's message; otherwise, and on `ModelOutputError` or an empty reply, the reply is a templated summary of the tool results.
-7. `ctx.save(checkpoint={...router checkpoint, "reply", "reply_meta"})`, then `channel.send(principal, reply, dedupe_key=f"reply:{task.id}")`, then `Done({reply_len, tools_used, latency_ms, path, escalate})`. `path` is `fast | llm | summary | fallback | escalate`; `tools_used` lists the tools that ran successfully.
+8. Answer: `chat_json` with schema `{reply: string}`, clipped to 600 chars. **Number guard:** every number in the reply must appear in a tool result or in the user's message; otherwise, and on `ModelOutputError` or an empty reply, the reply is a templated summary of the tool results.
+9. `ctx.save(checkpoint={...checkpoint, "reply", "reply_meta"})`, then `channel.send(principal, reply, dedupe_key=f"reply:{task.id}")`, then `Done({reply_len, tools_used, latency_ms, path, escalate})`. `path` is `fast | llm | summary | fallback | escalate`, or for a gated call `done | replay | failed | ambiguous | refused | dry_run`; `tools_used` lists the tools that ran successfully.
 
-Failures: `ModelUnavailableError` sends one templated fallback (the tool summary if tools already ran, else `FALLBACK_REPLY`) and the task is `done`. `ChannelRefused` is a final `Fail`; any other `ChannelError` is `Fail(retryable=True)`, and the dedupe key prevents a double send. Spans: `runner.local`, `runner.local.context`, `runner.local.tool`, `runner.local.final` (`outcome`: `ok | number_guard | bad_output | empty`) and `runner.local.send`, plus the model's `llm.call`. None carry message or reply text.
+**Gated call** (`checkpoint.call = {tool, extension, args, step_no, call_index}`), at most one per task, exactly once:
+- **Pinned** with `ctx.save` before it is gated (direct) or run or prompted (model), so `idempotency_key(task_id, step_no, call_index, intent.hash)` stays the same across retries, waits and restarts.
+- **Resume:** `executor.recorded(key)` first. Succeeded: replay the report, no gate call. Started: ambiguous, reported (`Not sure whether <summary> ran…`) and never re-run. Failed: the definite failure is reported. None: `gate.evaluate`.
+- `Allow`: `executor.execute(intent, decision, step_no=pinned, call_index=pinned)`. The reply is code-built: `Saved note 3: "buy milk"`, `Deleted note 3.`, `Cleared 4 notes.` (builtins in `REPORTS`), else `Done: <summary>`. A definite failure replies `Failed: <summary>` with the handler's `ToolFailed` message.
+- `NeedsApproval`: `channel.request_approval(approver, ApprovalPrompt)` for each approver, then `approvals.add_channel_ref(id, ref, at=now(), principal)`, then `Wait("approval", wake_at=expires_at)`. Every pending step re-prompts (a spurious wake, a crash between save and prompt); the channel dedupes by `approval_dedupe_key`, and the first send time is kept. `ChannelRefused` fails for good; any other `ChannelError` is a retryable `Fail`.
+- `DryRun`: `Dry run: would <summary>`. `Deny`: `Not done.` (`NOT_APPROVED`), `Not done: the approval for <summary> expired.` (`APPROVAL_EXPIRED`), `Not done: that approval was already used.` (`APPROVAL_USED`), else `Not done: <reason>.`
+- After an approval or a direct call there are no more model rounds: the reply is templated.
+
+Failures: `ModelUnavailableError` sends one templated fallback (the report line if a side effect ran, else the tool summary if tools already ran, else `FALLBACK_REPLY`) and the task is `done`. `ChannelRefused` is a final `Fail`; any other `ChannelError` is `Fail(retryable=True)`, and the dedupe key prevents a double send. Spans: `runner.local`, `runner.local.context`, `runner.local.tool`, `runner.local.call` (`origin`, `decision`, `recorded`), `runner.local.approval`, `runner.local.final` (`outcome`: `ok | number_guard | bad_output | empty`) and `runner.local.send`, plus the model's `llm.call`. None carry message or reply text.
 
 ## Daemon wiring: `resonant.wiring`, `resonant.daemon`
 

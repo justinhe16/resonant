@@ -22,7 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from resonant_sdk import Event
+from resonant.gate.codes import approval_text
+from resonant_sdk import Effect, Event, Level
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,23 @@ class ApprovalPrompt:
     effect: str
     level: str
     expires_at: datetime
-    require_code: bool = False  # pay approvals: only an exact "yes <code>" counts
+    require_code: bool = False  # L1 (destructive or pay): only "yes <code>" counts
+
+    def text(self) -> str:
+        """The prompt as sent: the destructive variant for L1 writes, the pay variant for pay."""
+        destructive = self.level == Level.L1.value and self.effect != Effect.PAY.value
+        return approval_text(
+            self.code, self.summary, require_code=self.require_code, destructive=destructive
+        )
+
+
+def approval_dedupe_key(approval_id: str, principal: str) -> str:
+    """The send dedupe key for one approval's prompt to one approver.
+
+    ``request_approval`` dedupes on it, so the runner can re-prompt on every pending step.
+    The ``prompt`` part keeps it apart from the ``approval:<id>:resolved`` wake event.
+    """
+    return f"approval:{approval_id}:prompt:{principal}"
 
 
 @dataclass(frozen=True)
@@ -88,7 +105,9 @@ class Channel(Protocol):
     ) -> MessageRef: ...
 
     async def request_approval(self, principal: str, prompt: ApprovalPrompt) -> MessageRef:
-        """Send an approval request. Its text comes from ``gate.codes.approval_text``."""
+        """Send an approval request: ``prompt.text()``, deduped by
+        ``approval_dedupe_key(prompt.approval_id, principal)`` (a repeat returns the first
+        ref without sending)."""
         ...
 
     async def self_test(self) -> SelfTestResult:
