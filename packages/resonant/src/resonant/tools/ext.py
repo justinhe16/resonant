@@ -193,7 +193,7 @@ def mute_extension(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
     owner = ctx.principals.owner
     now = ctx.clock()
     if off is True and until_raw is None:
-        was = notify.unmute(ctx.conn, name, by=owner)
+        was = notify.unmute(ctx.conn, name, by=owner, now=now)
         return {"extension": name, "muted_until": None, "was_muted": was}
     if off is not None or not isinstance(until_raw, str):
         raise ToolFailed("give either until or off")

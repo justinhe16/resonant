@@ -156,10 +156,11 @@ def mute(conn: sqlite3.Connection, ext: str, until: datetime, *, by: str) -> Non
         audit(conn, "ext.notify_muted", extension=ext, requested_by=by, until=iso(until))
 
 
-def unmute(conn: sqlite3.Connection, ext: str, *, by: str) -> bool:
-    """Lift ``ext``'s mute; False if it wasn't muted. Audited ``ext.notify_unmuted``."""
+def unmute(conn: sqlite3.Connection, ext: str, *, by: str, now: datetime | None = None) -> bool:
+    """Lift ``ext``'s mute; False if it wasn't muted (as of ``now``, default the wall
+    clock). Audited ``ext.notify_unmuted``."""
     with atomic(conn):
-        was = muted_until(conn, ext) is not None
+        was = muted_until(conn, ext, now) is not None
         conn.execute("DELETE FROM kv WHERE key = ?", (_muted_key(ext),))
         audit(conn, "ext.notify_unmuted", extension=ext, requested_by=by, was_muted=was)
     return was

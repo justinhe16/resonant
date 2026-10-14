@@ -178,9 +178,9 @@ def test_mute_and_unmute(db: sqlite3.Connection) -> None:
     assert muted_until(db, "example", T0) is None
     (row,) = audit_rows(db, "ext.notify_muted")
     assert row["extension"] == "github" and row["requested_by"] == "justin"
-    assert unmute(db, "github", by="justin") is True
+    assert unmute(db, "github", by="justin", now=T0) is True
     assert muted_until(db, "github", T0) is None
-    assert unmute(db, "github", by="justin") is False
+    assert unmute(db, "github", by="justin", now=T0) is False
     with pytest.raises(ValueError, match="timezone"):
         mute(db, "github", datetime(2026, 1, 1), by="justin")
 
