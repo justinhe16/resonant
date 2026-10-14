@@ -73,4 +73,4 @@ briefing:
 pulse:
   enabled: true                         # hourly "btw" messages and urgent interrupts
   quiet_hours: "00:00-06:00"            # local time in `timezone`; only urgent items go out inside it
-  remention_after: 4h                   # a pending approval is mentioned once more after this
+  remention_after: 10m                  # a pending approval is mentioned once more after this (capped at half gate.approval_ttl_s)

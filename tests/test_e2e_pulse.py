@@ -407,10 +407,11 @@ async def test_u8_muted_items_are_skipped_then_told_once_after_the_mute_if_still
 # --- U9: approval re-mention -----------------------------------------------------------------
 
 
-async def test_u9_a_waiting_approval_is_mentioned_once_at_about_four_hours(
+async def test_u9_a_waiting_approval_is_mentioned_once_before_it_expires(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
-    async with world(resonant_home, chat, at(10, 9, 0)) as w:
+    # Defaults: re-mentioned after 10 minutes, by the next hourly pulse; it expires at 30.
+    async with world(resonant_home, chat, at(10, 9, 45)) as w:
         task_id = repo.insert_task(
             w.conn,
             NewTask(kind="chat", runner="local", priority=PRIORITY_OWNER, principal="justin"),
@@ -427,16 +428,13 @@ async def test_u9_a_waiting_approval_is_mentioned_once_at_about_four_hours(
                 summary="restart Resonant",
                 approvers=("justin",),
                 code="A7",
-                expires_at=at(10, 22, 0),
+                expires_at=at(10, 10, 15),
             ),
-            at(10, 9, 0),
+            at(10, 9, 45),
         )
-        for hour in (10, 11, 12):
-            await w.tick(at(10, hour))
-        assert w.texts() == []  # too young
-        await w.tick(at(10, 13))
+        await w.tick(at(10, 10))
         assert w.texts() == ["btw:\n✋ A7 still waiting: restart Resonant"]
-        for hour in (14, 15, 16):
+        for hour in (11, 12):
             await w.tick(at(10, hour))
         assert len(w.texts()) == 1  # once
 

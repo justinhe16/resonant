@@ -579,7 +579,7 @@ Every section has defaults, so a Phase 2 `config.yaml` loads unchanged. Unknown 
 | `briefing.at` | `"08:00"` | 24-hour `HH:MM` in `timezone` | `BriefingConfig.local_time` |
 | `pulse.enabled` | true | | the hourly pulse and urgent interrupts |
 | `pulse.quiet_hours` | `"00:00-06:00"` | `HH:MM-HH:MM` in `timezone`, start != end, may wrap midnight | `PulseConfig.quiet_start`, `.quiet_end`, `.in_quiet(local_time)` |
-| `pulse.remention_after` | `4h` | `30m`/`4h` style, 5m–24h | `PulseConfig.remention` (a `timedelta`) |
+| `pulse.remention_after` | `10m` | `30m`/`4h` style, 5m–24h, capped at half of `gate.approval_ttl_s` | `PulseConfig.remention` (a `timedelta`) |
 
 `Settings.extensions_dir` (`<home>/extensions`) holds the approved read-only copies, and `Settings.ext_data_dir` (`<home>/ext-data`) each extension's writable state.
 

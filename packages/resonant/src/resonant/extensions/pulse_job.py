@@ -218,13 +218,20 @@ def _sync(
             store.mark_told(conn, [cleared], now)
 
 
+def remention_delay(settings: Settings) -> timedelta:
+    """``pulse.remention_after``, capped at half the approval TTL so the approval is still
+    open when it is mentioned again."""
+    return min(settings.pulse.remention, timedelta(seconds=settings.gate.approval_ttl_s / 2))
+
+
 def refresh_core_items(
     conn: sqlite3.Connection, owner: str, settings: Settings, now: datetime
 ) -> None:
     """Refresh ``core/approval/<code>`` from the store."""
     waiting: dict[str, str] = {}
+    delay = remention_delay(settings)
     for a in pending_for(conn, owner, now):
-        if now - a.created_at < settings.pulse.remention:
+        if now - a.created_at < delay:
             continue
         code = notify.clean_text(a.code or a.id[:8])
         label = clip(notify.clean_text(a.summary), LABEL_MAX)

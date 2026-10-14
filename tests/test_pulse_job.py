@@ -454,3 +454,17 @@ async def test_briefing_updates_skip_muted_sources_and_do_not_mark_them() -> Non
         await bf.send_briefing(h.db, h.channel, OWNER, tz=TZ, now=T9)
         assert h.channel.texts() == ["Updates:\n[dori] real"]
         assert not told(h, "noisy", "k")
+
+
+def test_remention_delay_is_capped_at_half_the_approval_ttl() -> None:
+    from resonant.config import GateConfig, PulseConfig, Settings
+
+    def delay(remention: str, ttl_s: float) -> timedelta:
+        settings = Settings(
+            pulse=PulseConfig(remention_after=remention), gate=GateConfig(approval_ttl_s=ttl_s)
+        )
+        return pj.remention_delay(settings)
+
+    assert delay("10m", 1800) == timedelta(minutes=10)  # the defaults
+    assert delay("4h", 1800) == timedelta(minutes=15)  # would never fire uncapped
+    assert delay("4h", 86400) == timedelta(hours=4)

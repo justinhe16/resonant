@@ -34,7 +34,7 @@ Any extension can report items, so future extensions (Dori on-call, a trading bo
 | Q2 | Stale detection | Rules, not a model: a key plus a fingerprint of the item's state. A model can rank later (the [nudges follow-up](followups.md#proactive-nudges-btw-)). |
 | Q3 | Quiet hours | 00:00–06:00 local. Only `urgent` goes out. Normal items held over show in the 06:00 pulse. |
 | Q4 | Hourly cap | None. A pulse is one message an hour at most, and only when something changed. (The existing 20/h per-extension cap on immediate sends stays, as flood protection against a broken extension.) |
-| Q5 | Re-mentions | A pending approval is mentioned again once, about 4 hours after it was asked. After that it waits for 08:00. |
+| Q5 | Re-mentions | A pending approval is mentioned again once by the next hourly pulse after 10 minutes. (Planned as 4 hours; as built it is capped at half of `gate.approval_ttl_s` (30 minutes), or the approval would expire first.) |
 
 ## 2. The line of communication
 
@@ -89,7 +89,7 @@ CREATE TABLE pulse_items (
 ### D2. SDK and manifest
 - `resonant_sdk/emit.py`: `report(key, title, *, urgency="normal", state=None, clear=False, ttl="24h")`, stdlib only, copied next to the script like `emit()`. It writes one `{"type": "item", ...}` event with a unique dedupe key, so re-reporting is never dropped at ingest. The pulse does the dedupe.
 - Manifest: `report: {max_urgency: urgent | normal | low}` (default absent: reports are refused and audited `pulse.refused`). `item` is a reserved event type: it can't be in `notify.on`. `ext validate` and the install screen show the grant: `may interrupt you any time (urgent)`.
-- Config: `pulse: {enabled: true, quiet_hours: "00:00-06:00", remention_after: "4h"}`.
+- Config: `pulse: {enabled: true, quiet_hours: "00:00-06:00", remention_after: "10m"}`.
 
 ### D3. Ingest and the urgent path (`extensions/pulse.py`)
 `wiring.route_event` sends `ext.<name>.item` events to `Pulse.route`; other `ext:*` events still go to the notifier. For one item event:
@@ -146,7 +146,7 @@ The first run after install is a baseline (as for notify): items are stored as t
 | U6 | Paused | Nothing sent; after `/resume` the next pulse carries what changed, once. |
 | U7 | Grant | An extension granted `normal` that reports `urgent` waits for the pulse. One with no grant is refused. |
 | U8 | Muted | Its items are skipped while muted and not replayed after. (As built: a held item still open when the mute ends is told once in the first pulse after; one that expired never is.) |
-| U9 | Approval re-mention | Once, at about 4h. |
+| U9 | Approval re-mention | Once, by the first pulse after 10 minutes, before it expires. |
 
 ## 6. Risks
 
