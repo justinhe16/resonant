@@ -33,6 +33,16 @@ def new_code(pending: Collection[str]) -> str:
 _CODE_LIKE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][\s\-_.:/]*[0-9](?![0-9])")
 
 
+def clean_external(text: str) -> str:
+    """Steps 1-3 of ``sanitize_external`` plus whitespace collapse, without truncating or
+    quoting. Callers that truncate must mark the loss themselves."""
+    norm = unicodedata.normalize("NFKC", text)
+    ascii_only = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in norm)
+    no_brackets = re.sub(r"[\[\]{}<>]", " ", ascii_only)
+    masked = _CODE_LIKE.sub("?", no_brackets)
+    return re.sub(r"\s+", " ", masked).strip().replace('"', "'")
+
+
 def sanitize_external(text: str, max_len: int = 60) -> str:
     """Make an untrusted string safe to embed in an approval summary.
 
@@ -43,18 +53,22 @@ def sanitize_external(text: str, max_len: int = 60) -> str:
     4. Collapse whitespace, swap double quotes for single quotes, truncate, and wrap the
        result in quotes.
     """
-    norm = unicodedata.normalize("NFKC", text)
-    ascii_only = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in norm)
-    no_brackets = re.sub(r"[\[\]{}<>]", " ", ascii_only)
-    masked = _CODE_LIKE.sub("?", no_brackets)
-    flat = re.sub(r"\s+", " ", masked).strip().replace('"', "'")
+    flat = clean_external(text)
     if len(flat) > max_len:
         flat = flat[: max_len - 3].rstrip() + "..."
     return f'"{flat}"'
 
 
-def approval_text(code: str, summary: str, *, require_code: bool = False) -> str:
-    """The message sent to approvers. ``summary`` must be built by code from intent fields."""
+def approval_text(
+    code: str, summary: str, *, require_code: bool = False, destructive: bool = False
+) -> str:
+    """The message sent to approvers. ``summary`` must be built by code from intent fields.
+
+    ``destructive`` (L1) and ``require_code`` (pay) both mean only ``yes <code>`` approves;
+    ``destructive`` takes precedence when both are set.
+    """
+    if destructive:
+        return f"[{code}] {summary}? This can't be undone. Reply yes {code} / no"
     if require_code:
         return f"[{code}] {summary}? Reply exactly: yes {code} / no {code}"
-    return f"[{code}] {summary}? Reply yes / no / yes with comments: …"
+    return f"[{code}] {summary}? Reply yes / no"

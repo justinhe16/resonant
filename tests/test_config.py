@@ -79,3 +79,28 @@ def test_imessage_self_handle(resonant_home: Path) -> None:
     )
     with pytest.raises(ValidationError, match="email handle"):
         load_settings()
+
+
+def test_gate_and_ops_defaults(resonant_home: Path) -> None:
+    s = load_settings()
+    assert s.gate.approval_ttl_s == 1800
+    # Running from this checkout, so the default repo is this checkout.
+    assert s.ops.repo_path == REPO
+    assert s.ops.uv_path is None
+
+
+def test_gate_and_ops_from_yaml(resonant_home: Path) -> None:
+    (resonant_home / "config.yaml").write_text(
+        "gate:\n  approval_ttl_s: 600\nops:\n  repo_path: ~/src/resonant\n  uv_path: /usr/bin/uv\n"
+    )
+    s = load_settings()
+    assert s.gate.approval_ttl_s == 600
+    assert s.ops.repo_path == Path("~/src/resonant").expanduser()
+    assert s.ops.uv_path == Path("/usr/bin/uv")
+
+
+@pytest.mark.parametrize("ttl", [0, 59, 86401])
+def test_approval_ttl_bounds(resonant_home: Path, ttl: int) -> None:
+    (resonant_home / "config.yaml").write_text(f"gate:\n  approval_ttl_s: {ttl}\n")
+    with pytest.raises(ValidationError):
+        load_settings()

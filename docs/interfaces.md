@@ -138,11 +138,14 @@ principals:
 ## Gate: `resonant.gate`
 
 ```python
-Intent.for_tool(spec: ToolSpec, *, task_id, principal, args, scope_id=None, trace_id=None)
+Intent.for_tool(spec: ToolSpec, *, task_id, principal, args, scope_id=None, trace_id=None,
+                origin: Origin = "inferred")
     # effect / level / commit / tool / extension are read from spec: callers can't set them
     # args are validated with canonical_json and deep-copied
     .hash  # recomputed on every access:
            # sha256(canonical_json({tool, extension, args, effect, level, commit}))
+           # origin is not hashed: an approval binds to what runs, not to who asked
+Origin = Literal["explicit", "inferred"]   # anything else raises ValueError
 canonical_json(value)  # sorted keys; rejects non-str keys, NaN/Infinity, non-JSON types
 
 Decision = Allow(token, approval_id=None)
@@ -159,6 +162,8 @@ class Gate(TokenVerifier, Protocol):
     def resolve(self, resolution: ApprovalResolution) -> ResolveResult: ...   # by id: button / CLI
     def resolve_reply(self, reply: ApprovalReply) -> ResolveResult: ...      # text reply: gate binds it
 ```
+
+**Origin** says who chose the action. Code sets `"explicit"` in exactly one place, the local runner's `direct_call` path, whose checkpoint only the router's deterministic command parser writes. Everything the model chooses, and later every scheduled or extension job, is `"inferred"`. It is never read from model output.
 
 Evaluation order (Phase 2):
 1. **Registration:** if `registry.get(extension, tool) != intent.spec`, Deny. An intent can't claim an effect or level its tool wasn't registered with.
@@ -192,8 +197,17 @@ On-call autonomy checks `paused` before acting.
 
 Request (`resonant.gate.codes`):
 - `new_code(pending)` returns 2 characters, a letter then a digit, with no look-alikes, unique among pending approvals.
-- `approval_text(code, summary)` returns `"[A7] <summary>? Reply yes / no / yes with comments: …"`. For pay, it uses `require_code=True` and returns `"[P3] <summary>? Reply exactly: yes P3 / no P3"`.
-- The summary is built by code from intent fields. Every external string goes through `sanitize_external`, which quotes it, collapses whitespace and newlines, strips code-like tokens, and truncates to 60 characters.
+- `approval_text(code, summary, *, require_code=False, destructive=False)`:
+  - L2/L3: `"[A7] <summary>? Reply yes / no"`.
+  - L1 (`destructive=True`): `"[D7] <summary>? This can't be undone. Reply yes D7 / no"`. It takes precedence over `require_code`.
+  - Pay (`require_code=True`): `"[P3] <summary>? Reply exactly: yes P3 / no P3"`.
+- The summary is built by code from intent fields. Every external string goes through `sanitize_external`, which quotes it, collapses whitespace and newlines, strips code-like tokens, and truncates to 60 characters. `clean_external` does the same without truncating or quoting.
+- `resonant.gate.summary`:
+  - `summarize(intent, *, action=None)` returns `<extension>: <tool name> key="value", …` (underscores become spaces; no extension prefix for builtins), e.g. `add note text="buy milk"`. `action` is an optional code-built heading (`delete all 4 notes`) that replaces the tool name; it is cleaned too and never comes from a model.
+  - `describe_args(args)`: sorted keys, at most 3 shown, then `+N more args`. Keys (≤ 20 chars) and values (≤ 40 chars) go through `clean_external`; a clipped value gets `(truncated)`, and a value that lost non-ASCII characters gets `(non-ASCII hidden)`. Numbers, booleans and null print as JSON; lists and objects print as `(list, N items)` / `(object, N keys)`.
+  - Masking is lossy on purpose: `"vitamin d3"` shows as `"vitamin ?"`. The full args are available to the owner via `/approvals <code>`.
+  - `unsafe_args(args)` returns the JSON paths (`$.text`, `$.items[1]`, `$.<key>`) of keys or strings containing control characters other than tab/newline/CR, format characters (bidi overrides and isolates, zero-width characters, BOM) line/paragraph separators, or lone surrogates. Variation selectors and private-use characters are allowed. The gate denies such intents rather than sanitizing them, so what runs always matches what was shown.
+- Config (`gate:`): `approval_ttl_s` (default 1800, 60–86400) is how long a prompt stays answerable.
 
 **Binding.** A reply resolves an approval only if all of these hold:
 - It comes from an authenticated identity whose principal is in the approval's `approvers` list and holds `approve` for the extension.

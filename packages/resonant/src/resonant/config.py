@@ -135,6 +135,34 @@ class ChannelsConfig(_Section):
     imessage: IMessageConfig = IMessageConfig()
 
 
+class GateConfig(_Section):
+    # How long an approval prompt stays answerable. The waiting task wakes at expiry and
+    # tells the owner it wasn't done.
+    approval_ttl_s: float = Field(default=1800.0, ge=60, le=86400)
+
+
+def _package_checkout() -> Path | None:
+    """The git checkout containing the running package, if it runs from one."""
+    for parent in Path(__file__).resolve().parents:
+        if (parent / ".git").exists() and (parent / "pyproject.toml").is_file():
+            return parent
+    return None
+
+
+class OpsConfig(_Section):
+    # The repo `/update` pulls into. Default: the checkout this package runs from (None
+    # when installed outside a checkout, and `/update` refuses).
+    repo_path: Path | None = Field(default_factory=_package_checkout)
+    # The `uv` binary `/update` syncs with. launchd's PATH is minimal, so this is an
+    # absolute path; None means `/update` refuses.
+    uv_path: Path | None = None
+
+    @field_validator("repo_path", "uv_path")
+    @classmethod
+    def _expand(cls, v: Path | None) -> Path | None:
+        return v.expanduser() if v is not None else None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESONANT_",
@@ -153,6 +181,8 @@ class Settings(BaseSettings):
     loop: LoopConfig = LoopConfig()
     claude: ClaudeConfig = ClaudeConfig()
     channels: ChannelsConfig = ChannelsConfig()
+    gate: GateConfig = GateConfig()
+    ops: OpsConfig = OpsConfig()
 
     @field_validator("home")
     @classmethod
