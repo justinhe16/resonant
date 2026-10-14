@@ -263,7 +263,7 @@ Times, codes and figures below are examples.
 
 - Urgent items text immediately at any hour, at most 20 an hour per extension. Normal items go out in one `btw:` message at the top of each hour, never between 00:00 and 06:00 (the 06:00 pulse carries what was held), and never in the 08:00 hour (the briefing covers it). The briefing always sends, even as `Nothing on today.`.
 - An item the owner has heard is not told again until its state changes (`A`, `B`, `A` is three tellings).
-- An approval still waiting after 4 hours is mentioned once in a `btw:`.
+- An approval asked between :30 and :50 past an hour and still waiting at the top of the hour is mentioned once in that `btw:` (re-mentions need it 10 minutes old, and approvals expire after 30). Others expire before a pulse sees them.
 
 - **Verify:** `scripts/bootstrap.sh --check`
 - **Expected:** exit 0; `pulse scheduled  PASS`. The row is a `FAIL` (required) if `pulse.enabled` is false.

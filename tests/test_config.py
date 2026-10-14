@@ -190,7 +190,7 @@ def test_pulse_defaults_and_helpers(resonant_home: Path) -> None:
     p = load_settings().pulse
     assert p.enabled is True and p.quiet_hours == "00:00-06:00"
     assert (p.quiet_start, p.quiet_end) == (time(0, 0), time(6, 0))
-    assert p.remention == timedelta(hours=4)
+    assert p.remention == timedelta(minutes=10)
 
 
 def test_pulse_from_yaml_and_env(resonant_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:

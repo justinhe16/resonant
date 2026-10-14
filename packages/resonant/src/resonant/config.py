@@ -290,8 +290,10 @@ class PulseConfig(_Section):
     # Local time in `settings.timezone`, "HH:MM-HH:MM". Only urgent items go out inside it.
     # A window whose end is before its start wraps midnight ("22:00-06:00").
     quiet_hours: str = "00:00-06:00"
-    # How long an approval waits before it is mentioned once more (a duration: 30m, 4h).
-    remention_after: str = "4h"
+    # How long an approval waits before the next hourly pulse mentions it once more (a
+    # duration: 10m, 1h). Capped at half of `gate.approval_ttl_s` (30m by default), so the
+    # approval hasn't expired by then.
+    remention_after: str = "10m"
 
     @field_validator("quiet_hours")
     @classmethod
