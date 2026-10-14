@@ -31,7 +31,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 from resonant import killswitch
 from resonant.executor import HandlerKey, ToolHandler
@@ -42,6 +42,10 @@ from resonant.principals import Principals
 from resonant.router import commands
 from resonant.router.commands import Command, UsageError
 from resonant.router.intents import IntentLabel
+from resonant.router.render import as_dict as _as_dict
+from resonant.router.render import as_list as _as_list
+from resonant.router.render import duration as _duration
+from resonant.router.render import render_projects
 from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.tools import ToolRegistry
@@ -76,22 +80,6 @@ class FastPathResult:
 # --- templates ---------------------------------------------------------------------------
 
 
-def _duration(seconds: Any) -> str:
-    if isinstance(seconds, bool) or not isinstance(seconds, int | float):
-        return "?"
-    s = max(0, int(seconds))
-    d, rem = divmod(s, 86400)
-    h, rem = divmod(rem, 3600)
-    m, s = divmod(rem, 60)
-    if d:
-        return f"{d}d {h}h"
-    if h:
-        return f"{h}h {m}m"
-    if m:
-        return f"{m}m"
-    return f"{s}s"
-
-
 def _pct(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return "?"
@@ -116,14 +104,6 @@ def render_status(d: dict[str, Any]) -> str:
 
 def render_ping(d: dict[str, Any]) -> str:
     return f"pong (up {_duration(d.get('uptime_s'))})"
-
-
-def _as_dict(value: Any) -> dict[str, Any]:
-    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
-
-
-def _as_list(value: Any) -> list[Any]:
-    return cast(list[Any], value) if isinstance(value, list) else []
 
 
 def _task_lines(d: dict[str, Any], *, with_status: bool) -> list[str]:
@@ -188,7 +168,11 @@ class FastCommand:
 
 
 # The reply template for each registry command that has a tool.
-COMMAND_RENDERS: dict[str, Render] = {"/status": render_status, "/tasks": render_tasks}
+COMMAND_RENDERS: dict[str, Render] = {
+    "/status": render_status,
+    "/projects": render_projects,
+    "/tasks": render_projects,
+}
 
 _RUNNING = FastCommand(
     "what's running",
