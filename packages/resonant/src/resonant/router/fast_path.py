@@ -3,9 +3,11 @@
 Code computes and text narrates: each command maps to at most one builtin read tool, and
 the reply is rendered from a template over the tool's output.
 
-- Slash commands (the whole message): ``/status``, ``/tasks``, ``/help``, ``/kill`` and
-  ``/resume`` (owner only). Any other ``/word`` gets "Unknown command" and never reaches the
-  model.
+- Slash commands come from the command registry (``router/commands.py``): the first word
+  names the command and the rest is its argument text, parsed deterministically. A bad
+  argument gets the usage line. ``/help [word]`` lists the commands the asker may use. Any
+  other ``/word`` gets "Unknown command", with a "Did you mean" suggestion when one is
+  close. None of these reach the model, and a suggestion never runs anything.
 - Keywords (the whole message, case-insensitive, trailing ``?!.`` ignored): ``status``,
   ``what's running``, ``how's the mini``, ``ping``.
 
@@ -37,22 +39,20 @@ from resonant.gate import Allow, Decision, Intent
 from resonant.models import SpanFactory
 from resonant.models.client import null_spans
 from resonant.principals import Principals
+from resonant.router import commands
+from resonant.router.commands import Command, UsageError
 from resonant.router.intents import IntentLabel
 from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.tools import ToolRegistry
+from resonant_sdk import Effect
 
 log = logging.getLogger(__name__)
 
 NOT_ALLOWED = "not allowed"
 KILL_REPLY = "kill switch engaged"
 RESUME_REPLY = "resumed: autonomy on, unpaused"
-UNKNOWN_COMMAND_REPLY = "Unknown command. Try /help."
-HELP_REPLY = (
-    "Commands: /status (daemon), /tasks (recent tasks), /help, "
-    "/kill (stop autonomy, owner only), /resume (owner only). "
-    "Or just ask: what's running, how's the mini, ping."
-)
+UNKNOWN_COMMAND_REPLY = commands.unknown_reply(None)
 
 Render = Callable[[dict[str, Any]], str]
 
@@ -183,20 +183,12 @@ class FastCommand:
     args: dict[str, Any] = field(default_factory=dict[str, Any])
     render: Render | None = None
     reply: str | None = None  # static reply (no tool)
-    admin: bool = False  # owner-only kill switch commands
+    admin: bool = False  # owner-only (the registry's ``owner_only``)
+    help: bool = False  # /help: rendered from the registry for the asking principal
 
 
-SLASH_COMMANDS: dict[str, FastCommand] = {
-    c.name: c
-    for c in (
-        FastCommand("/status", "system", True, tool="daemon_status", render=render_status),
-        FastCommand("/tasks", "job_control", True, tool="list_tasks", render=render_tasks),
-        FastCommand("/help", "question", True, reply=HELP_REPLY),
-        FastCommand("/kill", "system", True, admin=True),
-        FastCommand("/resume", "system", True, admin=True),
-    )
-}
-UNKNOWN_COMMAND = FastCommand("/unknown", "unknown", True, reply=UNKNOWN_COMMAND_REPLY)
+# The reply template for each registry command that has a tool.
+COMMAND_RENDERS: dict[str, Render] = {"/status": render_status, "/tasks": render_tasks}
 
 _RUNNING = FastCommand(
     "what's running",
@@ -218,7 +210,7 @@ KEYWORDS: dict[str, FastCommand] = {
     "how is the mini": _MINI,
 }
 
-_SLASH = re.compile(r"^/[a-z][a-z0-9_-]*$")
+_SLASH = re.compile(r"^/[a-z][a-z0-9_-]{0,31}$")  # capped: an unknown word is echoed
 _APOSTROPHES = str.maketrans(dict.fromkeys((0x2018, 0x2019, 0x02BC), "'"))  # curly quotes
 
 
@@ -228,13 +220,39 @@ def normalize(text: str) -> str:
     return t.rstrip("?!. ")
 
 
+def _unknown(word: str | None) -> FastCommand:
+    return FastCommand("/unknown", "unknown", True, reply=commands.unknown_reply(word))
+
+
+def _from_command(cmd: Command, rest: str) -> FastCommand:
+    try:
+        args = cmd.parse(rest)
+    except UsageError as e:
+        return FastCommand(cmd.name, cmd.intent, True, reply=cmd.usage_reply(e))
+    return FastCommand(
+        cmd.name,
+        cmd.intent,
+        True,
+        tool=cmd.tool,
+        args=args,
+        render=COMMAND_RENDERS.get(cmd.name),
+        admin=cmd.owner_only,
+        help=cmd is commands.HELP,
+    )
+
+
 def match_fast_path(text: str) -> FastCommand | None:
     """The fast-path command for ``text``, or None. Pure: no I/O, no principal needed."""
     t = normalize(text)
     if t.startswith("/"):
-        if " " in t or not _SLASH.match(t):
-            return UNKNOWN_COMMAND
-        return SLASH_COMMANDS.get(t, UNKNOWN_COMMAND)
+        word = t.split(" ", 1)[0]
+        if not _SLASH.match(word):
+            return _unknown(None)
+        cmd = commands.get(word)
+        if cmd is None:
+            return _unknown(word)
+        parts = text.split(maxsplit=1)  # the rest keeps its original case
+        return _from_command(cmd, parts[1].strip() if len(parts) == 2 else "")
     return KEYWORDS.get(t)
 
 
@@ -297,8 +315,16 @@ class FastPath:
             if cmd.name == "/kill":
                 killswitch.engage(self.conn, actor=principal, reason="fast path /kill")
                 return self._result(cmd, KILL_REPLY, "killswitch.engage")
-            killswitch.release(self.conn, actor=principal)
-            return self._result(cmd, RESUME_REPLY, "killswitch.release")
+            if cmd.name == "/resume":
+                killswitch.release(self.conn, actor=principal)
+                return self._result(cmd, RESUME_REPLY, "killswitch.release")
+        if cmd.help:
+            available = commands.available(
+                principal, principals=self.principals, registry=self.registry
+            )
+            keywords = self.principals.can(principal, "request", None)
+            text = commands.help_text(available, cmd.args.get("query"), keywords=keywords)
+            return self._result(cmd, text)
         if cmd.tool is None:
             return self._result(cmd, cmd.reply or UNKNOWN_COMMAND_REPLY)
 
@@ -309,6 +335,11 @@ class FastPath:
             or handler is None
             or not self.principals.can(principal, "request", spec.extension)
         ):
+            return self._result(cmd, NOT_ALLOWED) if cmd.slash else None
+        if spec.effect is not Effect.READ:
+            # Only reads skip the executor here. Side-effecting commands become direct_call
+            # tasks (P2-15, plan D5); until then they are refused, never run inline.
+            log.error("fast path refused non-read tool %s", cmd.tool)
             return self._result(cmd, NOT_ALLOWED) if cmd.slash else None
         intent = Intent.for_tool(
             spec, task_id=f"route:{event_id}", principal=principal, args=cmd.args, trace_id=trace_id

@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from resonant.api import DaemonState, create_app
-from resonant.components import Components, build_components
+from resonant.components import Components, build_components, deny_all_principals
 from resonant.config import Settings, load_settings
 from resonant.daemon import Daemon
 from resonant.executor import NotAllowedError, ToolFailed
@@ -23,11 +23,18 @@ from resonant.gate import Allow, Deny, Intent
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.store.db import kv_set, utcnow
 from resonant.store.tasks import insert_task, set_status
-from resonant.tools import ToolRegistry, builtin
+from resonant.tools import ToolRegistry, builtin, system
 from resonant_sdk import Effect, Level
 
 REPO = Path(__file__).resolve().parents[1]
-NAMES = {"list_tasks", "task_counts", "system_status", "daemon_status", "model_status"}
+NAMES = {
+    "list_tasks",
+    "task_counts",
+    "system_status",
+    "daemon_status",
+    "model_status",
+    "list_commands",
+}
 
 
 @pytest.fixture
@@ -67,7 +74,7 @@ def seed(db: sqlite3.Connection) -> dict[str, str]:
     return ids
 
 
-def test_registers_five_global_reads(components: Components) -> None:
+def test_registers_global_reads(components: Components) -> None:
     specs = components.registry.specs()
     assert {s.name for s in specs} == NAMES
     assert all(s.extension is None and s.source == "builtin" for s in specs)
@@ -77,9 +84,10 @@ def test_registers_five_global_reads(components: Components) -> None:
 
 def test_double_registration_rejected(db: sqlite3.Connection, state: DaemonState) -> None:
     registry = ToolRegistry()
-    builtin.register_builtins(registry, db, state)
+    principals = deny_all_principals()
+    builtin.register_builtins(registry, db, state, principals=principals)
     with pytest.raises(ValueError, match="already registered"):
-        builtin.register_builtins(registry, db, state)
+        builtin.register_builtins(registry, db, state, principals=principals)
 
 
 async def test_list_tasks(db: sqlite3.Connection, components: Components) -> None:
@@ -202,7 +210,7 @@ def fake_psutil(monkeypatch: pytest.MonkeyPatch, *, loadavg_fails: bool = False)
         disk_usage=disk_usage,
         boot_time=lambda: time.time() - 3600,
     )
-    monkeypatch.setattr(builtin, "psutil", fake)
+    monkeypatch.setattr(system, "psutil", fake)
 
 
 async def test_system_status_shape(
@@ -215,7 +223,7 @@ async def test_system_status_shape(
             return "1\n"
         return "System-wide memory free percentage: 77%\n"
 
-    monkeypatch.setattr(builtin, "_run", run)
+    monkeypatch.setattr(system, "_run", run)
     out = await call(components, "system_status")
     assert out["cpu_percent"] == 12.5 and out["cpu_count"] == 8
     assert out["load_avg"] == [1.23, 0.5, 0.25]
@@ -234,8 +242,8 @@ async def test_system_status_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run(argv: list[str], timeout_s: float) -> str | None:
         return None
 
-    monkeypatch.setattr(builtin, "_run", run)
-    out = await builtin.system_status("/missing")
+    monkeypatch.setattr(system, "_run", run)
+    out = await system.system_status("/missing")
     assert out["memory_pressure"] == {"level": "unknown", "free_pct": None}
     assert out["load_avg"] is None
     assert out["disk"][1] == {
@@ -247,12 +255,12 @@ async def test_system_status_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def test_run_missing_or_slow_command() -> None:
-    assert await builtin._run(["/nonexistent/memory_pressure", "-Q"], 0.5) is None  # pyright: ignore[reportPrivateUsage]
+    assert await system._run(["/nonexistent/memory_pressure", "-Q"], 0.5) is None  # pyright: ignore[reportPrivateUsage]
     start = time.monotonic()
-    assert await builtin._run(["sleep", "5"], 0.05) is None  # pyright: ignore[reportPrivateUsage]
+    assert await system._run(["sleep", "5"], 0.05) is None  # pyright: ignore[reportPrivateUsage]
     assert time.monotonic() - start < 1
-    assert await builtin._run(["false"], 0.5) is None  # pyright: ignore[reportPrivateUsage]
-    assert await builtin._run(["echo", "hi"], 0.5) == "hi\n"  # pyright: ignore[reportPrivateUsage]
+    assert await system._run(["false"], 0.5) is None  # pyright: ignore[reportPrivateUsage]
+    assert await system._run(["echo", "hi"], 0.5) == "hi\n"  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_system_status_real(components: Components) -> None:
