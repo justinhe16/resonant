@@ -454,6 +454,37 @@ The DB is the registry of record for installed extensions; there is no `extensio
   - `get_job`, `list_jobs(conn, ext=None)` (sorted by `(ext, job_id)`), and `prune_jobs(conn, ext, keep) -> int` for jobs an update removed.
 - `open_existing` (job-guard, status, the approvals CLI) refuses a v3 store until the daemon has migrated it. `scripts/go_live_check.py` labels its row `store schema <latest>`.
 
+## Cron: `resonant.extensions.cron`
+
+Pure functions over an explicit aware `now` and a zone (`settings.timezone`); no I/O. The scheduler (P3-10) reads `ext_jobs`, the pause flag and the downtime, calls `decide`, and writes what it says.
+
+```python
+parse_schedule(expr, tz: ZoneInfo | str) -> Schedule        # raises CronError(ValueError)
+Schedule(expr, tz).next_after(after) -> datetime | None     # strictly after; Loop.wait_s
+Schedule.due_between(after, until) -> list[datetime]        # (after, until], ascending
+Downtime(since, until)        # daemon not running over (since, until]: last tick, then started_at
+decide(schedule, *, now, last_due, paused, catchup: timedelta | None, downtime: Downtime | None,
+       busy: bool) -> Decision
+Decision(outcome: Outcome, due, late, missed, skipped, truncated, last_due)
+Outcome: idle | run | skipped_paused | overlap | missed
+```
+
+- **Expressions** are five-field cron on `cronsim`. `@daily`, six fields (seconds), bad fields and schedules that never fire raise `CronError` with the reason (`'60 * * * *': bad minute`). Whitespace is normalized into `Schedule.expr`.
+- **Every returned datetime is UTC.** Aware datetimes sharing a `ZoneInfo` compare by wall time and ignore `fold`, so compare and store in UTC (`store.db.iso` already does).
+- **DST** (Debian cron semantics, pinned for `America/Los_Angeles`):
+
+  | Schedule | Spring forward (02:00 → 03:00) | Fall back (02:00 → 01:00) |
+  |---|---|---|
+  | Fixed time (`30 2 * * *`, `30 1 * * *`) | A gap time runs once, at 03:00 | Runs once, at the first 01:30 |
+  | `*` in minute or hour (`*/10 * * * *`) | Wall time: the skipped hour doesn't run | Wall time: the repeated hour runs twice |
+
+- **`decide` precedence**, over the due times in `(last_due, now]` (with `last_due=None`, only an on-time one, nothing missed):
+  1. **Pause wins.** `paused` → `skipped_paused` with every due time in `skipped`; `last_due` moves past them, so nothing is caught up after `/resume`.
+  2. **Catch-up.** Only the latest due time can run: if it's on time (within `ON_TIME` = 1 min of `now`), or `catchup` is set, it is within `catchup` of `now`, and `downtime` covers it. A paused or merely stalled daemon never catches up. Otherwise `missed`. Earlier due times are always in `missed` (`job.missed`).
+  3. **Overlap.** `busy` (the previous run is still running, or its task is waiting) turns `run` into `overlap` (`job.overlap`); the due time is still consumed.
+- `run` carries `due` and `late` (a catch-up). Whenever something came due, `last_due` is the latest due time, for `store.extensions.mark_due`.
+- `catchup` must be within 0–24h (`MAX_CATCHUP`), else `ValueError`. `missed`/`skipped` list at most the 50 most recent (`MAX_LISTED`), and only due times within 31 days (`LOOKBACK`); `truncated` says more were dropped.
+
 ## Phase 3 config: `resonant.config`
 
 Every section has defaults, so a Phase 2 `config.yaml` loads unchanged. Unknown keys are errors, and caps are bounded both ways.
