@@ -1,4 +1,5 @@
-"""The repo registry (migration 007). Plain functions over a connection.
+"""The repo registry (migration 007) and extension repo links (008). Plain functions over a
+connection.
 
 A repo is a GitHub ``owner/name`` the Claude runner may work in (docs/repos-plan.md D1). It has
 a short unique ``name`` (the handle in ``runs.repo`` and the mirror's dir name), optional
@@ -196,12 +197,39 @@ def find(conn: sqlite3.Connection, key: str) -> Repo | None:
     return None
 
 
-def by_extension(conn: sqlite3.Connection, extension: str) -> list[Repo]:
-    """Repos an extension linked (``source = extension:<name>``)."""
+def set_links(conn: sqlite3.Connection, extension: str, slugs: Iterable[str]) -> None:
+    """Replace the repos ``extension`` links (migration 008). Links are kept apart from the
+    registry, so they can name a repo that hasn't been resolved against GitHub yet."""
+    with atomic(conn):
+        conn.execute("DELETE FROM repo_links WHERE extension = ?", (extension,))
+        conn.executemany(
+            "INSERT OR IGNORE INTO repo_links (extension, slug) VALUES (?, ?)",
+            [(extension, slug) for slug in slugs],
+        )
+
+
+def drop_links(conn: sqlite3.Connection, extension: str) -> None:
+    with atomic(conn):
+        conn.execute("DELETE FROM repo_links WHERE extension = ?", (extension,))
+
+
+def enabled_links(conn: sqlite3.Connection, extension: str) -> list[str]:
+    """Like :func:`links`, but only while the extension is installed and enabled: a disabled
+    or tampered extension's name stops meaning anything to the resolver."""
     rows = conn.execute(
-        "SELECT * FROM repos WHERE source = ? ORDER BY slug", (f"extension:{extension.lower()}",)
+        "SELECT l.slug FROM repo_links l JOIN extensions e ON e.name = l.extension COLLATE NOCASE"
+        " WHERE l.extension = ? AND e.status = 'enabled' ORDER BY l.slug",
+        (extension,),
     )
-    return [_row(r) for r in rows]
+    return [r["slug"] for r in rows]
+
+
+def links(conn: sqlite3.Connection, extension: str) -> list[str]:
+    """``owner/name`` slugs ``extension`` links (name compared case-insensitively), sorted."""
+    rows = conn.execute(
+        "SELECT slug FROM repo_links WHERE extension = ? ORDER BY slug", (extension,)
+    )
+    return [r["slug"] for r in rows]
 
 
 def list_all(conn: sqlite3.Connection) -> list[Repo]:

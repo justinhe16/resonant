@@ -38,6 +38,8 @@ import psutil
 
 from resonant.sandbox.profile import (
     API_PORT,
+    HOME_SECRET_DIRS,
+    HOME_SECRET_FILES,
     OLLAMA_PORT,
     SandboxError,
     SandboxParams,
@@ -99,6 +101,38 @@ DENIED_OPS = (
     "signal",
     "file-write-create",
 )
+# Secret-file probes: a scratch dir outside $HOME that the profile otherwise leaves readable.
+OUTSIDE_PARENT = "/private/var/tmp"
+FILE_SECRET_NAMES = (
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.example.local",
+    ".envrc",
+    "server.pem",
+    "client.p12",
+    "client.pfx",
+    "store.jks",
+    "api.key",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa_sk",
+)
+OPEN_NAMES = (
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+    ".environment",
+    "notes.txt",
+    "keyboard.txt",
+    "pem.txt",
+    "id_rsa.pub",
+    "valid_rsa",
+)
+# In outside/upper/ (the filesystem is case-insensitive, so these can't sit beside the
+# lower-case names above): the same rules in other cases.
+UPPER_SECRET_NAMES = (".ENV", ".Env.Local", ".ENVRC", "KEY.PEM", "ID.PFX", "ID_RSA")
+UPPER_OPEN_NAMES = (".Env.Example", ".ENV.SAMPLE", "ID_RSA.PUB")
 MDNS_SOCKET = "/private/var/run/mDNSResponder"
 MAX_SOCKET_PATH = 104
 
@@ -134,6 +168,9 @@ class ProbeContext:
     lan_ip: str | None
     claude: Path | None
     daemon_pid: int | None = None
+    # a dir the sandbox can otherwise read (under /private/var/tmp, outside $HOME) holding
+    # fake secret files, and a subdir of it that params.deny_read covers
+    outside: Path | None = None
     cleanup: list[Path] = field(default_factory=lambda: [])
 
     def sandboxed(
@@ -479,6 +516,7 @@ def probe_context(
     home: Path | None = None,
     deny_exec: Sequence[Path] = (),
     read_paths: Sequence[Path] | None = None,
+    deny_read: Sequence[Path] = (),
 ) -> Generator[ProbeContext]:
     """Build a throwaway run dir (a direct child of ``work_dir``, like a real run's) and a
     sibling, using the configured cache and secrets dirs, plus a canary dir under ``$HOME``
@@ -497,8 +535,8 @@ def probe_context(
     tag = uuid.uuid4().hex[:8]
     run = work_dir / f".check-{tag}"
     sibling = work_dir / f".check-other-{tag}"
-    canary = Path(tempfile.mkdtemp(prefix=".resonant-probe-", dir=home))
-    sleeper = subprocess.Popen(["/bin/sleep", "300"], start_new_session=True)
+    scratch: list[Path] = [run, sibling]  # removed on the way out, however far setup got
+    sleeper: subprocess.Popen[bytes] | None = None
     interpreter = Path(os.path.realpath(getattr(sys, "_base_executable", sys.executable)))
     reads = [
         *(default_read_paths() if read_paths is None else read_paths),
@@ -506,6 +544,13 @@ def probe_context(
         interpreter.parent,
     ]
     try:
+        canary = Path(tempfile.mkdtemp(prefix=".resonant-probe-", dir=home))
+        scratch.append(canary)
+        outside = Path(
+            os.path.realpath(tempfile.mkdtemp(prefix="resonant-probe-", dir=OUTSIDE_PARENT))
+        )
+        scratch.append(outside)
+        sleeper = subprocess.Popen(["/bin/sleep", "300"], start_new_session=True)
         params = SandboxParams(
             run_dir=run,
             cache_dir=cache_dir,
@@ -513,7 +558,15 @@ def probe_context(
             home=home,
             read_paths=tuple(reads),
             deny_exec=tuple(deny_exec),
+            deny_read=(*deny_read, outside / "denied"),
         ).resolved()
+        for name in (*FILE_SECRET_NAMES, *OPEN_NAMES):
+            (outside / name).write_text("secret")
+        (outside / "upper").mkdir()
+        for name in (*UPPER_SECRET_NAMES, *UPPER_OPEN_NAMES):
+            (outside / "upper" / name).write_text("secret")
+        (outside / "denied").mkdir()
+        (outside / "denied" / "x.txt").write_text("secret")
         (canary / "canary.txt").write_text("canary")
         prepare_dirs(params)
         sibling.mkdir(mode=0o700)
@@ -532,11 +585,13 @@ def probe_context(
             lan_ip=_lan_ip(),
             claude=claude,
             daemon_pid=_daemon_pid(),
+            outside=outside,
         )
     finally:
-        sleeper.kill()
-        sleeper.wait()
-        for d in (run, sibling, canary):
+        if sleeper is not None:
+            sleeper.kill()
+            sleeper.wait()
+        for d in scratch:
             shutil.rmtree(d, ignore_errors=True)
         for sub in ("uv", "npm", "pip"):  # the cache subdirs prepare_dirs made, if empty
             with contextlib.suppress(OSError):
@@ -803,6 +858,123 @@ def p_run_dir(ctx: ProbeContext) -> tuple[Status, str]:
     want = str(run / "repo")
     ok = data["r"] == "x" and data["cwd"] == want and data["real"] == want
     return ("pass", "run dir and cache usable") if ok else ("fail", f"unexpected: {data}")
+
+
+def p_secret_names(ctx: ProbeContext) -> tuple[Status, str]:
+    """.env and .env.*, *.pem, *.p12 and *.key are unreadable and unwritable outside the run
+    dir; the .env.example family and look-alikes stay readable; the run dir's own copies
+    work."""
+    out_dir = ctx.outside
+    if out_dir is None:
+        return "skip", "no scratch dir"
+    denied = [("read", str(out_dir / n)) for n in FILE_SECRET_NAMES]
+    denied += [("read", str(out_dir / "upper" / n)) for n in UPPER_SECRET_NAMES]
+    # control: the open names are readable, so the denies above are the regexes' doing
+    allowed = [("read", str(out_dir / n)) for n in OPEN_NAMES]
+    allowed += [("read", str(out_dir / "upper" / n)) for n in UPPER_OPEN_NAMES]
+    res = _fs(ctx, denied)
+    ok = _fs(ctx, allowed)
+    bad = {k: v for k, v in res.items() if not _denied(v)}
+    blocked = {k: v for k, v in ok.items() if v != "ok"}
+    # the run dir's own files: readable, and creatable (a committed .env.test, a dev cert)
+    run = ctx.params.run_dir / "repo"
+    (run / ".env").write_text("mine")
+    (run / "dev.pem").write_text("mine")
+    code = (
+        "res = {}\n"
+        f"for n in ('.env', 'dev.pem'): res[n] = open({str(run)!r} + '/' + n).read()\n"
+        f"open({str(run / '.env.new')!r}, 'w').write('x')\n"
+        f"open({str(run / 'new.key')!r}, 'w').write('x')\n"
+        "out(res=res)\n"
+    )
+    mine = ctx.snippet(code)["res"]
+    if bad:
+        return "fail", f"secret names reachable or inconclusive: {_fmt(bad)}"
+    if blocked:
+        return "fail", f"not-a-secret names blocked: {_fmt(blocked)}"
+    if mine != {".env": "mine", "dev.pem": "mine"}:
+        return "fail", f"run dir copies unusable: {mine}"
+    return "pass", f"{len(denied)} denied, {len(allowed)} look-alikes and run dir files allowed"
+
+
+def p_secret_home(ctx: ProbeContext) -> tuple[Status, str]:
+    """The credential files and dirs under $HOME (profile.HOME_SECRETS), read and write.
+    The sandbox only judges paths that exist, and the real $HOME is denied as a whole, so
+    this plants every one in a fake home and lays a read path right on top of each: only the
+    final denies can keep them closed (writes are denied everywhere outside the run dir and
+    cache, so only reads are probed). A sibling file in a read-path dir is the control."""
+    root = Path(
+        os.path.realpath(tempfile.mkdtemp(prefix="resonant-probe-home-", dir=OUTSIDE_PARENT))
+    )
+    try:
+        home = root / "home"
+        targets: list[Path] = []
+        for rel in HOME_SECRET_DIRS:
+            (home / rel).mkdir(parents=True)
+            (home / rel / "x").write_text("secret")
+            targets.append(home / rel / "x")
+        for rel in HOME_SECRET_FILES:
+            (home / rel).parent.mkdir(parents=True, exist_ok=True)
+            (home / rel).write_text("secret")
+            targets.append(home / rel)
+        control = home / ".docker" / "ok.txt"
+        control.write_text("fine")
+        interp = Path(os.path.realpath(getattr(sys, "_base_executable", sys.executable)))
+        fake = SandboxParams(
+            run_dir=root / "run",
+            cache_dir=root / "cache",
+            secrets_dir=home / ".resonant" / "run-secrets",
+            home=home,
+            read_paths=(
+                *(home / rel for rel in HOME_SECRET_DIRS),
+                home / ".docker",
+                *(home / rel for rel in HOME_SECRET_FILES),
+                Path(sys.base_prefix),
+                interp.parent,
+            ),
+        )
+        ops = [("read", str(t)) for t in [*targets, control]]
+        argv = [str(interp), "-I", "-c", _PRELUDE + _FS, json.dumps(ops)]
+        proc = subprocess.run(  # noqa: S603 - argv is built here
+            wrap(argv, fake),
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            timeout=SNIPPET_TIMEOUT_S,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+        lines = proc.stdout.strip().splitlines()
+        if proc.returncode != 0 or not lines:
+            tail = (proc.stderr.strip().splitlines() or [""])[-1][:150]
+            return "fail", f"snippet failed: {tail}"
+        res: dict[str, Any] = json.loads(lines[-1])["res"]
+        if res.pop(str(control)) != "ok":
+            return "fail", "control file in a read-path dir was unreadable"
+        bad = {k: v for k, v in res.items() if not _denied(v)}
+        if bad:
+            return "fail", f"reachable or inconclusive: {_fmt(bad)}"
+        return "pass", f"{len(targets)} credential paths denied under a fake home"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def p_deny_read(ctx: ProbeContext) -> tuple[Status, str]:
+    """runner.deny_read paths (and the probe's own) are unreadable and unwritable."""
+    ops: list[tuple[str, str]] = []
+    for d in ctx.params.deny_read:
+        ops.append(("list", str(d)))
+        ops.append(("create", str(d / f"zz-probe-{uuid.uuid4().hex[:10]}")))
+    if ctx.outside is not None:
+        ops.append(("read", str(ctx.outside / "denied" / "x.txt")))
+    res = _fs(ctx, ops)
+    bad = {k: v for k, v in res.items() if not _denied(v)}
+    return (
+        ("fail", f"reachable or inconclusive: {_fmt(bad)}")
+        if bad
+        else ("pass", f"{len(res)} denied")
+    )
 
 
 def p_exec_denied(ctx: ProbeContext) -> tuple[Status, str]:
@@ -1135,6 +1307,9 @@ PROBES: tuple[Probe, ...] = (
     Probe("run dir and cache allows", "ci", p_run_dir),
     Probe("work dir and sibling run dirs", "ci", p_work_dir),
     Probe("secrets_dir unreadable", "ci", p_secrets_dir),
+    Probe("secret file names (.env, *.pem, *.p12, *.key)", "ci", p_secret_names),
+    Probe("credential files under $HOME", "ci", p_secret_home),
+    Probe("runner.deny_read paths", "ci", p_deny_read),
     Probe("other terminals and ptys", "ci", p_terminals),
     Probe("other processes' environment (known limitation)", "ci", p_other_env),
     Probe("daemon env holds no secrets", "local", p_daemon_env),
@@ -1228,6 +1403,7 @@ def self_check(params: SandboxParams, *, python: str | None = None) -> tuple[boo
         home=p.home,
         read_paths=(*p.read_paths, Path(sys.base_prefix), Path(interpreter).parent),
         deny_exec=p.deny_exec,
+        deny_read=p.deny_read,
     )
     argv = [interpreter, "-I", "-c", code, json.dumps({"home": str(p.home), "port": API_PORT})]
     try:

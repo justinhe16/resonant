@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from resonant.gate.codes import clean_external
+
 # One iMessage chunk (``gateway.imessage.channel.MAX_CHUNK``): a reply never splits.
 MAX_REPLY_CHARS = 2000
 _FOOTER_RESERVE = 40  # room for "+N more (/projects all)"
@@ -171,7 +173,7 @@ def _job_line(j: dict[str, Any]) -> str:
 
 
 def render_extensions(d: dict[str, Any]) -> str:
-    """``/ext list``: one line per extension (name, status, pin, tools, mute, health), then
+    """``/ext list``: one line per extension (name, status, pin, tools, repos, mute, health), then
     one per job (level, next due, last run). Core jobs (the briefing) follow under ``core``."""
     items = [e for e in (as_dict(x) for x in as_list(d.get("extensions"))) if e]
     core = [j for j in (as_dict(x) for x in as_list(d.get("core"))) if j]
@@ -184,6 +186,8 @@ def render_extensions(d: dict[str, Any]) -> str:
             f"{pin} digest {e.get('digest', '?')}",
             f"{e.get('tools', '?')} tools",
         ]
+        if linked := [clean_external(str(r))[:80] for r in as_list(e.get("repos"))]:
+            bits.append(f"repos {', '.join(linked)}")
         if isinstance(e.get("muted_until_text"), str):
             bits.append(f"muted until {e['muted_until_text']}")
         if isinstance(e.get("health"), str):
