@@ -116,7 +116,7 @@ async def test_extension_name_resolves_its_single_link(db: sqlite3.Connection) -
     again = await Resolver(db).resolve("trading", gh)  # registered now: no GitHub call
     assert again == Resolved(got.repo, new=False, via="trading")
     assert isinstance(again, Resolved) and again.note == ""
-    assert gh.calls == ["repo_info me/bot"]
+    assert gh.calls == ["repo_info me/bot", "is_protected me/bot main"]
 
 
 async def test_extension_name_with_several_links_is_ambiguous(db: sqlite3.Connection) -> None:
