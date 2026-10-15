@@ -58,6 +58,7 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 | `report` | `{max_urgency: urgent\|normal\|low}` | The highest urgency your `report()` items may use (`urgent` texts the owner right away, `normal` joins the hourly pulse, `low` waits for the 08:00 briefing). Without it, reports are refused. `item` is reserved and can't be in `notify.on`. |
 | `health` | `{check: <cmd>, every: 30s\|5m\|1h}` | A health command. A zero exit code means healthy. |
 | `secrets` | list of names | Keychain secret names (`^[a-z][a-z0-9_]{0,31}$`) your tools and jobs may receive. Every tool's and job's `secrets` must be listed here. |
+| `repos` | list of `owner/name`, ≤ 20, optional | GitHub repos this extension is about (e.g. `me/trading-bot`). Saying "work on trading" in a request then means those repos: one link resolves to it, several ask which. Links are only a name for the repo; they grant nothing, and the repo is checked against GitHub when first used. `ext add`/`update` replace the links, `ext remove` drops them, and `/ext list` shows them. |
 
 ## 4. Tools
 
@@ -223,7 +224,7 @@ These run **only in the Mini's terminal**, never over iMessage.
 `ext add`:
 1. Copies the approved bytes into a staging dir. `repo:` reads the **HEAD commit** (`git archive`), so uncommitted edits are never installed. `path:` reads the tracked files from the git index, and refuses the directory if any tracked file there has uncommitted changes. Nothing else is a source.
 2. Validates the manifest and the directory: stdlib only, the argv[0] allowlist, no symlink that leaves the tree, the name rules and approver grants. MCP servers and critical jobs are refused for now.
-3. Shows a heading built by code, `my-ext repo:my-ext@a1b2c3d4 digest 9f3e01aa` (commit and content digest), then **escalations first** (secrets, approvers, tools and jobs that ask, commands that use `gh`/`git`), then every tool, job, report grant, notify event and the health check. Every string from your manifest is shown sanitized.
+3. Shows a heading built by code, `my-ext repo:my-ext@a1b2c3d4 digest 9f3e01aa` (commit and content digest), then **escalations first** (secrets, approvers, tools and jobs that ask, commands that use `gh`/`git`), then every tool, job, report grant, notify event, linked repo and the health check. Every string from your manifest is shown sanitized.
 4. You confirm by typing the extension name.
 5. It stages the source **again** and refuses if the commit, digest or manifest changed since you confirmed. The copy goes to `~/.resonant/extensions/<name>/` (read-only), its digest is recomputed, and only then is the row written, with an `ext.install` audit row.
 6. If the daemon is up, it restarts (reply-first path), and the owner gets `Back up …` and `Installed my-ext`.
@@ -234,7 +235,7 @@ The digest is sha256 over the sorted `(path, file/executable/symlink, sha256(con
 
 **Changing an extension later.** `resonant ext update <name>` shows the pins before and after, the files added, removed or changed, and the escalations added or removed (or `code only` when the manifest is unchanged), then the full review, and asks for the typed confirmation **every time**. To move to another source, `remove` and `add` again (with `--adopt`).
 
-**Removing.** `ext remove` deletes the row, the job state and the copy. It keeps the data dir unless you pass `--purge`, and lists the Keychain items left with the `resonant secret rm …` command for each.
+**Removing.** `ext remove` deletes the row, the job state, the repo links and the copy (repos already registered stay). It keeps the data dir unless you pass `--purge`, and lists the Keychain items left with the `resonant secret rm …` command for each.
 
 ## 10. Checklist
 

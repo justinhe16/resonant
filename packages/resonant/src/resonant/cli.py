@@ -36,6 +36,7 @@ from resonant.extensions.manager import (
 )
 from resonant.extensions.pin import TreeError
 from resonant.gate import ApprovalResolution, PolicyGate
+from resonant.gate.codes import clean_external
 from resonant.launchd import DAEMON_LABEL
 from resonant.ops import (
     OpsRunner,
@@ -619,7 +620,7 @@ def ext_add(
                 raise typer.Exit(1)
             if (reasons := mgr.leftovers(staged)) and not adopt:
                 raise AdoptRequired(f"{staged.name}: leftovers from another source", reasons)
-            for line in confirm_lines(staged):
+            for line in confirm_lines(staged, mgr.registered_slugs()):
                 typer.echo(line)
             _router_check(settings, conn, staged)
             _typed_confirm(staged.name, "install")
@@ -646,12 +647,14 @@ def ext_update(name: Annotated[str, typer.Argument(help="An installed extension"
             if staged.pin == current and copy == "ok" and record.status != "disabled_tampered":
                 typer.echo(f"{name} is up to date ({heading(staged)})")
                 return
-            for line in update_lines(record, mgr.installed_files(name), staged):
+            for line in update_lines(
+                record, mgr.installed_files(name), staged, mgr.registered_slugs()
+            ):
                 typer.echo(line)
             if copy != "ok":
                 typer.echo(f"note: the installed copy is {copy} since you approved it")
             typer.echo("")
-            for line in confirm_lines(staged):
+            for line in confirm_lines(staged, mgr.registered_slugs()):
                 typer.echo(line)
             _router_check(settings, conn, staged)
             _typed_confirm(name, "update")
@@ -685,6 +688,11 @@ def ext_remove(
         _restart_daemon(settings, conn, mgr.actor, f"Removed {name}")
 
 
+def _clean_repos(manifest: dict[str, Any]) -> list[str]:
+    repos_: list[Any] = manifest.get("repos") or []
+    return [clean_external(str(x))[:80] for x in repos_]
+
+
 @ext_app.command("list")
 def ext_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
     """Installed extensions: status, pins, and whether the copy still matches its pin."""
@@ -702,6 +710,7 @@ def ext_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
             "copy": copy,
             "tools": len(r.manifest.get("tools") or {}),
             "jobs": len(r.manifest.get("jobs") or []),
+            "repos": _clean_repos(r.manifest),
             "installed_at": iso(r.installed_at),
         }
         for r, copy in rows
@@ -718,6 +727,7 @@ def ext_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
             f"{r.name:<16} {r.status:<18} {r.source}@{sha} digest {r.tree_digest[:8]}"
             f"  copy {copy}  tools {len(r.manifest.get('tools') or {})}"
             f" jobs {len(r.manifest.get('jobs') or [])}  {iso(r.installed_at)}"
+            + (f"  repos {', '.join(_clean_repos(r.manifest))}" if r.manifest.get("repos") else "")
         )
 
 
