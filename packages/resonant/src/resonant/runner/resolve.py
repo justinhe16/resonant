@@ -4,8 +4,8 @@ Tried in order, the way a person would:
 
 1. ``owner/name`` or a ``github.com`` URL.
 2. A registry name or alias.
-3. An extension's linked repo, by extension name (store-level; the SDK manifest field that
-   fills these in comes later).
+3. An extension's linked repos (its manifest ``repos``), by extension name. One link resolves
+   like that slug; several are :class:`Ambiguous`.
 4. The owner's GitHub repos (listed through the API, cached for an hour), fuzzy-matched by name.
 
 The first time a repo is resolved, GitHub is asked what access the token has: push access
@@ -146,11 +146,11 @@ class Resolver:
             return await self._by_slug(slug, github)
         if (known := repos.find(self.conn, text)) is not None:
             return Resolved(known, new=False)
-        linked = repos.by_extension(self.conn, text)
+        linked = repos.links(self.conn, text)
         if len(linked) == 1:
-            return Resolved(linked[0], new=False)
+            return await self._by_slug(linked[0], github)
         if linked:
-            return Ambiguous(tuple(r.name for r in linked[:MAX_CANDIDATES]))
+            return Ambiguous(tuple(linked[:MAX_CANDIDATES]))
         return await self._fuzzy(text, github)
 
     async def _by_slug(self, slug: str, github: GitHub) -> Resolution:

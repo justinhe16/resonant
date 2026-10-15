@@ -64,6 +64,7 @@ from resonant.gate.codes import sanitize_external
 from resonant.principals import Principals
 from resonant.secrets import InvalidSecretRef, secret_ref
 from resonant.store import extensions as ext_store
+from resonant.store import repos
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, kv_set, utcnow
 from resonant_sdk import Manifest, load_manifest
@@ -233,6 +234,8 @@ def confirm_lines(staged: Staged) -> list[str]:
             f"{spec.effect.value} {spec.effective_level.value}, catchup {_s(job.catchup, 10)}"
             f", runs {job.run}"
         )
+    if m.repos:
+        lines.append(f"Repos: {', '.join(_s(r, 80) for r in m.repos)}")
     if m.report is not None and m.report.max_urgency != "urgent":
         lines.append(report_grant(m).replace("reports:", "Reports:", 1))
     if m.notify:
@@ -486,6 +489,7 @@ class ExtensionManager:
             with atomic(self.conn):
                 ext_store.save_extension(self.conn, record)
                 ext_store.prune_jobs(self.conn, name, [j.id for j in staged.manifest.jobs])
+                repos.set_links(self.conn, name, staged.manifest.repos)
                 origin = {"source": approved.source, "secrets": sorted(staged.manifest.secrets)}
                 kv_set(self.conn, ORIGIN_KEY.format(name=name), origin)
                 audit(
@@ -537,6 +541,7 @@ class ExtensionManager:
             raise ManagerError(f"{name} is not installed")
         with atomic(self.conn):
             ext_store.delete_extension(self.conn, name)
+            repos.drop_links(self.conn, name)
             audit(
                 self.conn,
                 "ext.remove",

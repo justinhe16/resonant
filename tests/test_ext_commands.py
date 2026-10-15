@@ -41,6 +41,7 @@ from resonant.router.render import render_extensions
 from resonant.runners.local import LocalRunner
 from resonant.store import extensions as ext_store
 from resonant.store import pulse as pulse_store
+from resonant.store import repos
 from resonant.store import tasks as repo
 from resonant.store.db import kv_get, kv_set, transaction, utcnow
 from resonant.tools import ToolRegistry, builtin, updates
@@ -623,6 +624,14 @@ def test_list_extensions(ctx: BuiltinContext) -> None:
         "- briefing (L0) · next tomorrow 8:00am · never run",
         "- pulse (L0) · next 11:00am · never run",
     ]
+
+
+def test_list_extensions_shows_linked_repos(ctx: BuiltinContext) -> None:
+    install(ctx)
+    repos.set_links(ctx.conn, "demo", ["me/a", "me/b"])
+    out = list_extensions(ctx)
+    assert out["extensions"][0]["repos"] == ["me/a", "me/b"]
+    assert "4 tools · repos me/a, me/b" in render_extensions(out)
 
 
 def test_list_extensions_marks_an_unloaded_row_refused(ctx: BuiltinContext) -> None:

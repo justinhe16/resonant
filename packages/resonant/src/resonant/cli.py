@@ -702,6 +702,7 @@ def ext_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
             "copy": copy,
             "tools": len(r.manifest.get("tools") or {}),
             "jobs": len(r.manifest.get("jobs") or []),
+            "repos": list(r.manifest.get("repos") or []),
             "installed_at": iso(r.installed_at),
         }
         for r, copy in rows
@@ -718,6 +719,7 @@ def ext_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
             f"{r.name:<16} {r.status:<18} {r.source}@{sha} digest {r.tree_digest[:8]}"
             f"  copy {copy}  tools {len(r.manifest.get('tools') or {})}"
             f" jobs {len(r.manifest.get('jobs') or [])}  {iso(r.installed_at)}"
+            + (f"  repos {', '.join(r.manifest['repos'])}" if r.manifest.get("repos") else "")
         )
 
 

@@ -138,6 +138,37 @@ def test_secret_names_are_slugs(name: str) -> None:
         manifest(secrets=[], tools={"t": {"run": "./x", "effect": "write", "secrets": [name]}})
 
 
+def test_repos_are_optional_owner_name_slugs() -> None:
+    assert manifest().repos == ()
+    assert manifest(repos=["me/trading-bot", "Org_1/a.b-c"]).repos == (
+        "me/trading-bot",
+        "Org_1/a.b-c",
+    )
+    assert manifest(repos=[f"me/r{i}" for i in range(20)]).repos[-1] == "me/r19"
+
+
+@pytest.mark.parametrize(
+    "repos",
+    [
+        ["trading"],
+        ["a/b/c"],
+        ["../x"],
+        ["me/.."],
+        ["./x"],
+        ["me/bad name"],
+        ["me/b;rm"],
+        ["me/\u00e9"],
+        ["me/x\n"],
+        [""],
+        ["me/x", "ME/X"],
+        [f"me/r{i}" for i in range(21)],
+    ],
+)
+def test_bad_repos_refused(repos: list[str]) -> None:
+    with pytest.raises(ValidationError):
+        manifest(repos=repos)
+
+
 def test_description_examples_and_names() -> None:
     m = manifest(description="d" * 120, examples=["what time is it", "e" * 80])
     assert m.description and len(m.examples) == 2

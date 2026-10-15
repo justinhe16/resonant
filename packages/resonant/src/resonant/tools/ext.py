@@ -31,6 +31,7 @@ from resonant.extensions import briefing, notify, pulse_job
 from resonant.extensions.cron import CronError, parse_schedule
 from resonant.monitor import health_snapshot
 from resonant.store import extensions as store
+from resonant.store import repos
 from resonant.store.db import iso
 from resonant.tools.base import BuiltinContext, no_args
 from resonant.tools.when import format_due
@@ -113,6 +114,7 @@ def list_extensions(ctx: BuiltinContext) -> dict[str, Any]:
             "commit": record.commit[:SHORT] if record.commit else None,
             "digest": record.tree_digest[:SHORT],
             "tools": 0,
+            "repos": repos.links(conn, record.name),
             "jobs": [],
             "muted_until": None,
             "muted_until_text": None,

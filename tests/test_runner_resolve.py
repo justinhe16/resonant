@@ -86,14 +86,29 @@ async def test_registry_name_and_alias_win_before_github(db: sqlite3.Connection)
     assert gh.calls == []
 
 
-async def test_extension_link_by_extension_name(db: sqlite3.Connection) -> None:
-    r = repos.add(db, "me/bot", base="main", source="extension:trading")
+async def test_extension_name_resolves_its_single_link(db: sqlite3.Connection) -> None:
+    repos.set_links(db, "trading", ["me/bot"])
+    gh = FakeGitHub([info("me/bot")])
+    got = await Resolver(db).resolve("Trading", gh)
+    assert isinstance(got, Resolved) and got.new and got.repo.slug == "me/bot"
+    assert got.repo.source == "auto"
+    again = await Resolver(db).resolve("trading", gh)  # registered now: no GitHub call
+    assert again == Resolved(got.repo, new=False)
+    assert gh.calls == ["repo_info me/bot"]
+
+
+async def test_extension_name_with_several_links_is_ambiguous(db: sqlite3.Connection) -> None:
+    repos.set_links(db, "trading", ["me/bot2", "me/bot"])
     gh = FakeGitHub()
-    resolver = Resolver(db)
-    assert await resolver.resolve("trading", gh) == Resolved(r, new=False)
-    repos.add(db, "me/bot2", base="main", source="extension:trading")
-    assert await resolver.resolve("trading", gh) == Ambiguous(("bot", "bot2"))
+    assert await Resolver(db).resolve("trading", gh) == Ambiguous(("me/bot", "me/bot2"))
     assert gh.calls == []
+
+
+async def test_extension_link_without_access_and_registry_first(db: sqlite3.Connection) -> None:
+    repos.set_links(db, "trading", ["them/gone"])
+    assert await Resolver(db).resolve("trading", FakeGitHub()) == NoAccess("them/gone")
+    r = repos.add(db, "me/other", base="main", source="owner", aliases=["trading"])
+    assert await Resolver(db).resolve("trading", FakeGitHub()) == Resolved(r, new=False)
 
 
 async def test_fuzzy_match_on_the_owners_repo_list(db: sqlite3.Connection) -> None:
