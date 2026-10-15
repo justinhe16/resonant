@@ -39,6 +39,8 @@
   (subpath (string-append (param "HOME") "/.claude"))
   (subpath (string-append (param "HOME") "/Library"))
   (subpath (string-append (param "HOME") "/.local/bin")))
+;; the runner's token files: briefly on disk under runner.secrets_dir (rendered when set)
+;; @DENY_SECRETS@
 
 ;; ---- exec: defense in depth (the mach denies below do the real work) ---------------------
 (deny process-exec

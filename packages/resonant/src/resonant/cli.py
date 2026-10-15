@@ -1158,8 +1158,11 @@ def sandbox_check(
     deny = [Path(sys.prefix)]
     if (entry := shutil.which("resonant")) is not None:
         deny.append(Path(entry))
+    # runner.secrets_dir comes from the settings once the runner config lands
+    runner = getattr(load_settings(), "runner", None)
+    secrets_dir: Path = getattr(runner, "secrets_dir", None) or Path("~/.resonant/run-secrets")
     try:
-        with probe_context(deny_exec=deny) as ctx:
+        with probe_context(deny_exec=deny, secrets_dir=secrets_dir.expanduser()) as ctx:
             results = run_probes(ctx, scopes)
     except SandboxError as e:
         typer.echo(f"sandbox unavailable: {e}", err=True)

@@ -52,6 +52,7 @@ _PLACEHOLDERS = {
     "read": ";; @READ_ALLOW@",
     "meta": ";; @META_ALLOW@",
     "exec": ";; @DENY_EXEC@",
+    "secrets": ";; @DENY_SECRETS@",
 }
 
 
@@ -80,6 +81,7 @@ class SandboxParams:
     home: Path = field(default_factory=Path.home)
     read_paths: tuple[Path, ...] = ()
     deny_exec: tuple[Path, ...] = ()
+    secrets_dir: Path | None = None  # runner.secrets_dir: never readable or writable
 
     def resolved(self) -> SandboxParams:
         home = Path(checked_path(self.home))
@@ -89,12 +91,26 @@ class SandboxParams:
                 raise SandboxError(
                     f"run dir {run} is inside {home / name}, which is never readable"
                 )
+        cache = Path(checked_path(self.cache_dir))
+        reads = tuple(Path(checked_path(p)) for p in self.read_paths if Path(p).exists())
+        secrets = Path(checked_path(self.secrets_dir)) if self.secrets_dir else None
+        if secrets is not None:
+            for what, path in (
+                ("run dir", run),
+                ("cache dir", cache),
+                *(("read path", r) for r in reads),
+            ):
+                if path.is_relative_to(secrets) or secrets.is_relative_to(path):
+                    raise SandboxError(
+                        f"secrets_dir {secrets} overlaps the sandbox-readable {what} {path}"
+                    )
         return SandboxParams(
             run_dir=run,
-            cache_dir=Path(checked_path(self.cache_dir)),
+            cache_dir=cache,
             home=home,
-            read_paths=tuple(Path(checked_path(p)) for p in self.read_paths if Path(p).exists()),
+            read_paths=reads,
             deny_exec=tuple(Path(checked_path(p)) for p in self.deny_exec),
+            secrets_dir=secrets,
         )
 
 
@@ -131,8 +147,17 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
     for i, path in enumerate(p.deny_exec):
         defs[f"DENY_EXEC_{i}"] = str(path)
         exec_lines.append(f'  (subpath (param "DENY_EXEC_{i}"))')
+    secret_lines: list[str] = []
+    if p.secrets_dir is not None:
+        defs["SECRETS"] = str(p.secrets_dir)
+        secret_lines.append('(deny file-read* file-write* (subpath (param "SECRETS")))')
     text = template_text()
-    for key, lines in (("read", read_lines), ("meta", meta_lines), ("exec", exec_lines)):
+    for key, lines in (
+        ("read", read_lines),
+        ("meta", meta_lines),
+        ("exec", exec_lines),
+        ("secrets", secret_lines),
+    ):
         if _PLACEHOLDERS[key] not in text:
             raise SandboxError(f"runner.sb lost its {_PLACEHOLDERS[key]} placeholder")
         text = text.replace(_PLACEHOLDERS[key], "\n".join(lines))

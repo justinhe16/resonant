@@ -170,7 +170,7 @@ def test_cli_help_lists_check() -> None:
 def ctx() -> Iterator[ProbeContext]:
     if sys.platform != "darwin":
         pytest.skip("Seatbelt is macOS only")
-    with probe_context() as c:
+    with probe_context(secrets_dir=Path.home() / ".resonant" / "run-secrets") as c:
         yield c
 
 
@@ -259,3 +259,25 @@ def test_cached_self_check_caches_passes_not_failures(ctx: ProbeContext, tmp_pat
 
 
 _DETAIL = "read, keychain lookup and API port denied"
+
+
+def test_secrets_dir_overlapping_a_readable_path_is_refused(tmp_path: Path) -> None:
+    run = tmp_path / "work" / "R1"
+    cache = tmp_path / "work" / ".cache"
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+
+    def build(secrets: Path) -> SandboxParams:
+        return SandboxParams(
+            run_dir=run, cache_dir=cache, home=home, read_paths=(tools,), secrets_dir=secrets
+        )
+
+    for bad in (run / "s", cache / "s", tools / "s", tmp_path / "work", tools, run):
+        with pytest.raises(SandboxError):
+            build(bad).resolved()
+    ok = build(home / ".resonant" / "run-secrets").resolved()
+    _, defs = render(ok)
+    assert defs["SECRETS"] == os.path.realpath(home / ".resonant" / "run-secrets")
+    assert "SECRETS" not in render(params_in(tmp_path))[1]

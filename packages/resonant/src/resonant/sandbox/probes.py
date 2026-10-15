@@ -476,6 +476,7 @@ def probe_context(
     home: Path | None = None,
     deny_exec: Sequence[Path] = (),
     read_paths: Sequence[Path] | None = None,
+    secrets_dir: Path | None = None,
 ) -> Generator[ProbeContext]:
     """Build a throwaway run dir and cache (under ``base_dir``, default ``~/resonant-runs``),
     a canary dir under ``$HOME`` and a process outside the sandbox. Cleans up on exit."""
@@ -499,6 +500,7 @@ def probe_context(
         home=home,
         read_paths=tuple(reads),
         deny_exec=tuple(deny_exec),
+        secrets_dir=secrets_dir,
     ).resolved()
     try:
         (canary / "canary.txt").write_text("canary")
@@ -700,6 +702,42 @@ def p_daemon_env(ctx: ProbeContext) -> tuple[Status, str]:
         allow = ("CLAUDE_CODE_OAUTH_TOKEN",) if where == "this process" else ()
         bad += [f"{name} in {where}" for name in secret_findings(env, allow=allow)]
     return ("fail", "; ".join(bad)) if bad else ("pass", "no secret-looking variables")
+
+
+def p_secrets_dir(ctx: ProbeContext) -> tuple[Status, str]:
+    """The configured runner.secrets_dir (token file, helper, gh hosts.yml) can be neither
+    listed, read, stat'ed nor written. Names that don't exist still say EPERM, never ENOENT,
+    so the dir's contents are not even probeable."""
+    sd = ctx.params.secrets_dir
+    if sd is None:
+        return "skip", "no secrets_dir configured"
+    # a nonexistent name under a denied dir answers ENOENT, so the probe needs real entries:
+    # a uniquely named canary file, in the dir (made 0700 if missing; removed afterwards)
+    made: list[Path] = []
+    for d in reversed([sd, *sd.parents]):
+        if not d.exists():
+            d.mkdir(mode=0o700)
+            made.append(d)
+    canary = sd / f".probe-canary-{uuid.uuid4().hex[:10]}"
+    canary.write_text("canary")
+    try:
+        ops = [
+            ("list", str(sd)),
+            ("stat", str(sd)),
+            ("read", str(canary)),
+            ("stat", str(canary)),
+            ("create", _unique(sd, "secrets")),
+        ]
+        res = _fs(ctx, ops)
+    finally:
+        canary.unlink(missing_ok=True)
+        for d in reversed(made):
+            with contextlib.suppress(OSError):
+                d.rmdir()
+    bad = {k: v for k, v in res.items() if not _denied(v)}
+    if bad:
+        return "fail", f"reachable or inconclusive: {_fmt(bad)}"
+    return "pass", f"{len(res)} denied under {sd}"
 
 
 def p_run_dir(ctx: ProbeContext) -> tuple[Status, str]:
@@ -1049,6 +1087,7 @@ PROBES: tuple[Probe, ...] = (
     Probe("file write denies", "ci", p_write_denied),
     Probe("run dir and cache allows", "ci", p_run_dir),
     Probe("work dir and sibling run dirs", "ci", p_work_dir),
+    Probe("secrets_dir unreadable", "ci", p_secrets_dir),
     Probe("other processes' environment (known limitation)", "ci", p_other_env),
     Probe("daemon env holds no secrets", "local", p_daemon_env),
     Probe("exec denies", "ci", p_exec_denied),
@@ -1140,6 +1179,7 @@ def self_check(params: SandboxParams, *, python: str | None = None) -> tuple[boo
         home=p.home,
         read_paths=(*p.read_paths, Path(sys.base_prefix), Path(interpreter).parent),
         deny_exec=p.deny_exec,
+        secrets_dir=p.secrets_dir,
     )
     argv = [interpreter, "-I", "-c", code, json.dumps({"home": str(p.home), "port": API_PORT})]
     try:
