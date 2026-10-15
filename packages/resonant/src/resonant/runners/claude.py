@@ -78,6 +78,7 @@ from resonant.runner.resolve import (
     Resolver,
 )
 from resonant.runner.workspace import (
+    UPSTREAM_LATER,
     BundleRefused,
     MergeRefused,
     NoChanges,
@@ -133,7 +134,6 @@ MAX_LINE = 1024 * 1024  # one stream-json line, in the transcript and in memory
 TRUNCATED_TAIL = 256  # dropped from a truncated line: a secret may be cut at the limit
 MAX_TRANSCRIPT = 256 * 1024 * 1024
 MAX_ASK = 4000
-UPSTREAM_LATER = "Upstream PRs come in a later update."
 SUMMARY_MAX = 600
 REASON_MAX = 240
 MAX_TURNS = 200
@@ -507,7 +507,12 @@ class ClaudeRunner:
     async def _startup(self) -> int:
         # runner.repos is only a seed: import it into the registry (idempotent).
         with atomic(self.conn):
-            repo_store.import_config(self.conn, self.cfg.repos)
+            imported = repo_store.import_config(self.conn, self.cfg.repos)
+        for name, reason in imported.skipped:
+            log.warning("runner.repos entry %s not imported: %s", name, reason)
+        for old, new in imported.renamed:  # the mirror follows the repo's name
+            async with self.workspace.mirror_lock(old):
+                await asyncio.to_thread(self._move_mirror, old, new)
         reaped = 0
         for run in runs.active(self.conn):
             has_process = run.pgid is not None or run.leader_pid is not None
@@ -546,6 +551,11 @@ class ClaudeRunner:
             run_dir=self.cfg.work_dir / run.code,
             marker=run.session_id,
         )
+
+    def _move_mirror(self, old: str, new: str) -> None:
+        src, dst = self.workspace.mirror_path(old), self.workspace.mirror_path(new)
+        if src.is_dir() and not dst.exists():
+            src.rename(dst)
 
     def _spawn(self, coro: Any) -> None:
         task: asyncio.Task[Any] = asyncio.ensure_future(coro)

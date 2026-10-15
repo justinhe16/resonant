@@ -105,9 +105,9 @@ def test_import_config_is_idempotent_and_owner_sourced(db: sqlite3.Connection) -
         "proj": RunnerRepo(remote="github.com/own/proj", base="trunk", quote_ask=False),
         "tool": RunnerRepo(remote="github.com/own/tool", allow_github_changes=True),
     }
-    assert repos.import_config(db, cfg) == 2
+    assert repos.import_config(db, cfg).imported == 2
     first = repos.list_all(db)
-    assert repos.import_config(db, cfg) == 2
+    assert repos.import_config(db, cfg).imported == 2
     assert repos.list_all(db) == first
     proj = repos.find(db, "proj")
     assert proj is not None and (proj.source, proj.base, proj.quote_ask) == (
@@ -134,3 +134,65 @@ def test_import_config_adopts_an_auto_registered_repo(db: sqlite3.Connection) ->
     assert moved is not None and moved.name == "other-web"
     proj = repos.get(db, "own/proj")
     assert proj is not None and proj.source == "owner" and proj.last_used_at is not None
+
+
+def test_import_config_skips_an_owner_clash_and_imports_the_rest(db: sqlite3.Connection) -> None:
+    first = repos.import_config(db, {"web": RunnerRepo(remote="github.com/a/web")})
+    assert first.imported == 1
+    again = repos.import_config(db, {"web": RunnerRepo(remote="github.com/b/web")})
+    assert [n for n, _ in again.skipped] == ["web"]  # an owner entry already has that name
+    other = repos.import_config(
+        db,
+        {"web": RunnerRepo(remote="github.com/b/web"), "ok": RunnerRepo(remote="github.com/b/ok")},
+    )
+    assert other.imported == 1 and repos.find(db, "ok") is not None
+    assert repos.find(db, "web").slug == "a/web"  # pyright: ignore[reportOptionalMemberAccess]
+
+
+def test_import_config_rejects_an_invalid_name_on_the_update_path(db: sqlite3.Connection) -> None:
+    repos.add(db, "own/proj", base="main", source="auto")
+    bad = RunnerRepo.model_construct(remote="github.com/own/proj", base="main")
+    res = repos.import_config(db, {"../x": bad, "Bad Name": bad})
+    assert res.imported == 0 and len(res.skipped) == 2
+    proj = repos.get(db, "own/proj")
+    assert proj is not None and proj.name == "proj" and proj.source == "auto"
+
+
+def _run(db: sqlite3.Connection, repo: str, status: str) -> None:
+    db.execute(
+        "INSERT INTO runs (code, principal, repo, ask, status, session_id, max_seconds,"
+        " created_at, updated_at) VALUES (?, 'o', ?, 'x', ?, 's', 60, 't', 't')",
+        (f"R{db.execute('SELECT COUNT(*) FROM runs').fetchone()[0] + 1}", repo, status),
+    )
+
+
+def test_rename_on_clash_is_refused_while_a_run_is_in_progress(db: sqlite3.Connection) -> None:
+    repos.add(db, "other/web", base="main", source="auto")
+    _run(db, "web", "ready")
+    cfg = {"web": RunnerRepo(remote="github.com/own/web")}
+    res = repos.import_config(db, cfg)
+    assert res.imported == 0 and "run in progress" in res.skipped[0][1]
+    assert repos.get(db, "other/web").name == "web"  # pyright: ignore[reportOptionalMemberAccess]
+    assert repos.get(db, "own/web") is None
+    db.execute("UPDATE runs SET status = 'merged'")
+    res = repos.import_config(db, cfg)
+    assert res.renamed == (("web", "other-web"),) and res.skipped == ()
+    assert db.execute("SELECT repo FROM runs").fetchone()[0] == "other-web"  # history follows
+
+
+def test_renaming_an_existing_repo_keeps_the_old_name_as_an_alias(db: sqlite3.Connection) -> None:
+    repos.add(db, "own/proj", base="main", source="auto")
+    res = repos.import_config(db, {"mine": RunnerRepo(remote="github.com/own/proj")})
+    assert res.renamed == (("proj", "mine"),)
+    r = repos.get(db, "own/proj")
+    assert r is not None and r.name == "mine" and r.aliases == ("proj",)
+    assert repos.find(db, "proj") == r
+
+
+def test_slugs_are_case_insensitive_and_dots_are_rejected(db: sqlite3.Connection) -> None:
+    repos.add(db, "Own/Proj", base="main", source="auto")
+    with pytest.raises(RepoConflict):
+        repos.add(db, "own/proj", base="main", source="auto")
+    for bad in ("../..", "own/..", "./x", "own/."):
+        with pytest.raises(ValueError):
+            repos.add(db, bad, base="main", source="auto")

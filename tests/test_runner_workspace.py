@@ -1186,3 +1186,17 @@ def test_secret_dir_base_is_tightened(tmp_path: Path) -> None:
     base.mkdir(mode=0o755)
     with workspace_mod.secret_dir(base):
         assert stat.S_IMODE(base.stat().st_mode) == 0o700
+
+
+async def test_workspace_takes_only_the_registry_name_and_never_publishes_to_a_fork(
+    env: Env,
+) -> None:
+    with pytest.raises(RunnerError, match="isn't a registered repo"):
+        await env.ws.prepare("R1", "own/proj", "x", github_token=GH_TOKEN)
+    p = await env.prepare()
+    head = await env.deliver(p, {"a.txt": "a\n"})
+    result = await env.ws.check(p, head, SECRETS)
+    env.conn.execute("UPDATE repos SET mode = 'fork'")
+    with pytest.raises(RunnerError, match="Upstream PRs come in a later update"):
+        await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)
+    assert env.gh_calls() == [] and env.remote_branches() == ["main"]

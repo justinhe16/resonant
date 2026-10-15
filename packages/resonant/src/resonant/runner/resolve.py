@@ -30,12 +30,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
+from resonant.config import RunnerRepo
 from resonant.runner.checks import MAX_WORKFLOW_BYTES, runs_on_pull_request
 from resonant.runner.workspace import Workspace
 from resonant.secrets import RunnerSecrets
 from resonant.store import repos
 from resonant.store.db import atomic
-from resonant.store.repos import Repo
+from resonant.store.repos import Repo, RepoConflict
 
 LIST_TTL_S = 3600.0
 MAX_CANDIDATES = 3
@@ -160,15 +161,21 @@ class Resolver:
             return NoAccess(slug)
         if (known := repos.get(self.conn, info.slug)) is not None:  # GitHub spells it otherwise
             return Resolved(known, new=False)
-        with atomic(self.conn):
-            repo = repos.add(
-                self.conn,
-                info.slug,
-                base=info.base,
-                source="auto",
-                mode="push" if info.can_push else "fork",
-                ci=info.has_ci,
-            )
+        try:
+            with atomic(self.conn):
+                repo = repos.add(
+                    self.conn,
+                    info.slug,
+                    base=info.base,
+                    source="auto",
+                    mode="push" if info.can_push else "fork",
+                    ci=info.has_ci,
+                )
+        except (RepoConflict, ValueError):
+            # Another request registered it while GitHub was being asked.
+            if (known := repos.get(self.conn, info.slug)) is None:
+                raise
+            return Resolved(known, new=False)
         return Resolved(repo, new=True)
 
     async def _list(self, github: GitHub) -> list[str]:
@@ -216,7 +223,7 @@ class GhGitHub:
     async def repo_info(self, slug: str) -> RepoInfo | None:
         code, out, err = await self._api(f"repos/{slug}")
         if code != 0:
-            if "404" in err or "Not Found" in err:
+            if "HTTP 404" in err:
                 return None
             raise GitHubError(f"couldn't read {slug} from GitHub: {err[-120:]}")
         try:
@@ -226,6 +233,10 @@ class GhGitHub:
             permissions = cast("dict[str, Any]", data.get("permissions") or {})
             can_push = bool(permissions.get("push"))
         except (ValueError, KeyError, TypeError, AttributeError):
+            raise GitHubError(f"GitHub's answer about {slug} wasn't readable") from None
+        try:
+            RunnerRepo(remote=f"github.com/{name}", base=base)  # the config's own checks
+        except ValueError:
             raise GitHubError(f"GitHub's answer about {slug} wasn't readable") from None
         if parse_slug(name) != name:
             raise GitHubError(f"GitHub's answer about {slug} wasn't readable")

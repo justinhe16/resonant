@@ -1558,3 +1558,27 @@ async def test_the_pulse_item_says_when_waiting_for_the_usage_reset(
     await h.drain()
     item = pulse_store.get(db, "core", "run/r1")
     assert item is not None and item.title.startswith("R1 waiting for usage reset · proj")
+
+
+async def test_startup_moves_the_mirror_with_a_renamed_repo(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    db.execute("DELETE FROM repos")
+    repo_store.add(db, "other/proj", base="main", source="auto")
+    mirror = h.ws.mirror_path("proj")
+    mirror.mkdir(parents=True)
+    (mirror / "HEAD").write_text("ref: refs/heads/main\n")
+    await h.runner.start()
+    assert not mirror.exists() and (h.ws.mirror_path("other-proj") / "HEAD").exists()
+    assert {r.name for r in repo_store.list_all(db)} == {"proj", "other-proj"}
+
+
+async def test_a_config_clash_does_not_stop_startup(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = build(tmp_path, db)
+    repo_store.add(db, "other/web", base="main", source="owner")
+    h.runner.cfg = h.cfg.model_copy(
+        update={"repos": {"web": RunnerRepo(remote="github.com/own/web")}}
+    )
+    await h.runner.start()
+    assert not h.runner._blocked  # pyright: ignore[reportPrivateUsage]

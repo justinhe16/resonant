@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import sys
@@ -159,6 +160,12 @@ elif path == "repos/me/proj/contents/.github/workflows":
     print(json.dumps([{"name": "a.yml", "type": "file"}, {"name": "notes.md", "type": "file"}]))
 elif path == "repos/me/proj/contents/.github/workflows/a.yml":
     print("on:\\n  pull_request:\\n")
+elif path == "repos/me/weird":
+    print(json.dumps({"full_name": "me/weird", "default_branch": "--upload-pack=x/..",
+                      "private": False, "permissions": {"push": True}}))
+elif path == "repos/me/boom":
+    print("HTTP 403: bad credentials ghp_secret", file=sys.stderr)
+    sys.exit(1)
 elif path == "user/repos":
     print("me/proj\\nme/other")
 else:
@@ -167,10 +174,11 @@ else:
 """
 
 
-async def test_gh_client_reads_access_and_ci_without_the_token_in_argv(tmp_path: Path) -> None:
-    log = tmp_path / "calls.jsonl"
+def make_client(tmp_path: Path, _case: str = "") -> GhGitHub:
     gh = tmp_path / "gh"
-    gh.write_text(FAKE_GH.replace("@PY@", sys.executable).replace("@LOG@", str(log)))
+    gh.write_text(
+        FAKE_GH.replace("@PY@", sys.executable).replace("@LOG@", str(tmp_path / "calls.jsonl"))
+    )
     gh.chmod(0o755)
     cfg = RunnerConfig(
         work_dir=tmp_path / "runs",
@@ -180,7 +188,12 @@ async def test_gh_client_reads_access_and_ci_without_the_token_in_argv(tmp_path:
         gh_path=gh,
     )
     secrets = RunnerSecrets(github_token="ghp_secret", claude_token="c", anthropic_key=None)
-    client = GhGitHub(Workspace(cfg, sqlite3.connect(":memory:")), secrets)
+    return GhGitHub(Workspace(cfg, sqlite3.connect(":memory:")), secrets)
+
+
+async def test_gh_client_reads_access_and_ci_without_the_token_in_argv(tmp_path: Path) -> None:
+    log = tmp_path / "calls.jsonl"
+    client = make_client(tmp_path)
     assert await client.repo_info("me/proj") == RepoInfo("Me/Proj", "dev", True, True, True)
     assert await client.repo_info("me/missing") is None
     assert await client.my_repos() == ["me/proj", "me/other"]
@@ -188,3 +201,31 @@ async def test_gh_client_reads_access_and_ci_without_the_token_in_argv(tmp_path:
     assert "ghp_secret" not in json.dumps(calls)
     assert all("GH_CONFIG_DIR" in c["env"] and "GH_TOKEN" not in c["env"] for c in calls)
     assert list((tmp_path / "state" / "secrets").iterdir()) == []  # the throwaway dir is gone
+
+
+class SlowGitHub(FakeGitHub):
+    async def repo_info(self, slug: str) -> RepoInfo | None:
+        await asyncio.sleep(0.01)  # both requests are past the registry check
+        return await super().repo_info(slug)
+
+
+async def test_concurrent_resolves_of_one_new_repo(db: sqlite3.Connection) -> None:
+    gh = SlowGitHub([info("me/fresh")])
+    resolver = Resolver(db)
+    a, b = await asyncio.gather(resolver.resolve("me/fresh", gh), resolver.resolve("ME/fresh", gh))
+    assert isinstance(a, Resolved) and isinstance(b, Resolved)
+    assert a.repo == b.repo and sorted([a.new, b.new]) == [False, True]
+    assert len(repos.list_all(db)) == 1
+
+
+async def test_a_bad_default_branch_from_github_is_refused(tmp_path: Path) -> None:
+    client = make_client(tmp_path, "weird")
+    with pytest.raises(GitHubError, match="wasn't readable"):
+        await client.repo_info("me/weird")
+
+
+async def test_a_token_in_gh_stderr_is_redacted(tmp_path: Path) -> None:
+    client = make_client(tmp_path, "boom")
+    with pytest.raises(GitHubError) as e:
+        await client.repo_info("me/boom")
+    assert "ghp_secret" not in str(e.value) and "403" in str(e.value)

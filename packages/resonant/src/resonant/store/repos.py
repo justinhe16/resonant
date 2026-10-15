@@ -145,7 +145,7 @@ def add(
     """Register ``owner/name``. ``name`` defaults to a free handle derived from the slug;
     ``quote_ask`` defaults to off for ``fork`` repos (a public ask shouldn't show). Raises
     :class:`RepoConflict` when the slug, name or an alias is taken."""
-    if not SLUG.fullmatch(slug):
+    if not SLUG.fullmatch(slug) or {".", ".."} & set(slug.split("/")):
         raise ValueError(f"{slug!r} isn't owner/name")
     ts = now_iso()
     with atomic(conn):
@@ -236,52 +236,98 @@ def forget(conn: sqlite3.Connection, key: str) -> bool:
     return conn.execute("DELETE FROM repos WHERE slug = ?", (repo.slug,)).rowcount == 1
 
 
-def import_config(conn: sqlite3.Connection, configured: Mapping[str, RunnerRepo]) -> int:
+@dataclass(frozen=True)
+class ImportResult:
+    imported: int
+    renamed: tuple[tuple[str, str], ...]  # (old name, new name): the caller moves mirrors
+    skipped: tuple[tuple[str, str], ...]  # (config name, reason)
+
+
+_TERMINAL = ("merged", "failed", "cancelled", "no_changes")
+
+
+def _rename(conn: sqlite3.Connection, repo: Repo, new_name: str, *, keep_old: bool) -> None:
+    """Give ``repo`` a new handle. Runs name their repo by handle, so a repo with a run that
+    isn't over (including one ready to merge) can't be renamed; finished runs follow it.
+    ``keep_old`` leaves the old handle as an alias."""
+    _check_handle(new_name)
+    busy = conn.execute(
+        "SELECT 1 FROM runs WHERE repo = ? COLLATE NOCASE AND status NOT IN (?, ?, ?, ?) LIMIT 1",
+        (repo.name, *_TERMINAL),
+    ).fetchone()
+    if busy:
+        raise RepoConflict(f"{repo.slug} has a run in progress, so it can't be renamed")
+    aliases = [a for a in repo.aliases if a.lower() != new_name.lower()]
+    if keep_old:
+        aliases.append(repo.name)
+    conn.execute(
+        "UPDATE repos SET name = ?, aliases = ? WHERE slug = ?",
+        (new_name, json.dumps(aliases), repo.slug),
+    )
+    conn.execute("UPDATE runs SET repo = ? WHERE repo = ? COLLATE NOCASE", (new_name, repo.name))
+
+
+def _import_one(
+    conn: sqlite3.Connection, name: str, cfg: RunnerRepo, renamed: list[tuple[str, str]]
+) -> None:
+    _check_handle(name)
+    existing = get(conn, cfg.slug)
+    squatter = find(conn, name)
+    if squatter is not None and (existing is None or squatter.slug != existing.slug):
+        if squatter.source == "owner":
+            raise RepoConflict(f"runner.repos name {name!r} is used by {squatter.slug}")
+        if squatter.name.lower() == name.lower():
+            # The old handle now belongs to the owner's entry, so it can't be kept as an alias.
+            new = unique_name(conn, squatter.slug, except_slug=squatter.slug, avoid=name.lower())
+            _rename(conn, squatter, new, keep_old=False)
+            renamed.append((squatter.name, new))
+        else:  # only an alias of the other repo
+            aliases = [a for a in squatter.aliases if a.lower() != name.lower()]
+            conn.execute(
+                "UPDATE repos SET aliases = ? WHERE slug = ?",
+                (json.dumps(aliases), squatter.slug),
+            )
+    if existing is None:
+        add(
+            conn,
+            cfg.slug,
+            name=name,
+            base=cfg.base,
+            source="owner",
+            allow_github_changes=cfg.allow_github_changes,
+            quote_ask=cfg.quote_ask,
+        )
+        return
+    if existing.name.lower() != name.lower():
+        _rename(conn, existing, name, keep_old=True)
+        renamed.append((existing.name, name))
+    conn.execute(
+        "UPDATE repos SET base = ?, allow_github_changes = ?, quote_ask = ?, source = 'owner'"
+        " WHERE slug = ?",
+        (cfg.base, int(cfg.allow_github_changes), int(cfg.quote_ask), existing.slug),
+    )
+
+
+def import_config(conn: sqlite3.Connection, configured: Mapping[str, RunnerRepo]) -> ImportResult:
     """Upsert the ``runner.repos`` config entries as ``source=owner`` (idempotent: a second
-    call changes nothing). The config is only a seed after this. Returns how many entries
-    there were. The configured name wins: a repo that auto-registered under it is renamed."""
+    call changes nothing). The config is only a seed after this. The configured name wins: a
+    repo that auto-registered under it is renamed (unless it has a run in progress), and a
+    repo already registered under another handle keeps that handle as an alias.
+
+    An entry that can't be imported (a bad handle, a clash with another owner entry, a rename
+    blocked by a run) is skipped with a reason; the rest still import."""
+    renamed: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
+    done = 0
     with atomic(conn):
         for name, cfg in configured.items():
-            existing = get(conn, cfg.slug)
-            squatter = find(conn, name)
-            if squatter is not None and (existing is None or squatter.slug != existing.slug):
-                if squatter.source == "owner":
-                    raise RepoConflict(f"runner.repos name {name!r} is used by {squatter.slug}")
-                new_name = squatter.name
-                if squatter.name.lower() == name.lower():
-                    new_name = unique_name(
-                        conn, squatter.slug, except_slug=squatter.slug, avoid=name.lower()
-                    )
-                conn.execute(
-                    "UPDATE repos SET name = ?, aliases = ? WHERE slug = ?",
-                    (
-                        new_name,
-                        json.dumps([a for a in squatter.aliases if a.lower() != name.lower()]),
-                        squatter.slug,
-                    ),
-                )
-            if existing is None:
-                add(
-                    conn,
-                    cfg.slug,
-                    name=name,
-                    base=cfg.base,
-                    source="owner",
-                    allow_github_changes=cfg.allow_github_changes,
-                    quote_ask=cfg.quote_ask,
-                )
-                continue
-            aliases = [a for a in existing.aliases if a.lower() != name.lower()]
-            conn.execute(
-                "UPDATE repos SET name = ?, aliases = ?, base = ?, allow_github_changes = ?,"
-                " quote_ask = ?, source = 'owner' WHERE slug = ?",
-                (
-                    name,
-                    json.dumps(aliases),
-                    cfg.base,
-                    int(cfg.allow_github_changes),
-                    int(cfg.quote_ask),
-                    existing.slug,
-                ),
-            )
-    return len(configured)
+            mark = len(renamed)
+            try:
+                with atomic(conn):  # a skipped entry leaves nothing half done
+                    _import_one(conn, name, cfg, renamed)
+            except (RepoConflict, ValueError) as e:
+                del renamed[mark:]
+                skipped.append((name, str(e)))
+            else:
+                done += 1
+    return ImportResult(done, tuple(renamed), tuple(skipped))

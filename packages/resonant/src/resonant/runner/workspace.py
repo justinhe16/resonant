@@ -56,6 +56,7 @@ from resonant.secrets import RunnerSecrets
 from resonant.store import repos as repo_store
 from resonant.store.repos import Repo
 
+UPSTREAM_LATER = "Upstream PRs come in a later update."
 GIT_TIMEOUT_S = 300.0
 GH_TIMEOUT_S = 120.0
 HARVEST_TIMEOUT_S = 300.0
@@ -366,7 +367,8 @@ class Workspace:
 
     def _repo(self, repo_name: str) -> Repo:
         repo = repo_store.find(self.conn, repo_name)
-        if repo is None:
+        # Only the registry name: it is the mirror's dir name, never a slug or alias.
+        if repo is None or repo.name != repo_name:
             raise RunnerError(f"{repo_name} isn't a registered repo")
         return repo
 
@@ -679,6 +681,8 @@ class Workspace:
         ``gh pr create``; a falsy answer raises ``PublishAborted``.
         """
         repo = self._repo(p.repo_name)
+        if repo.mode != "push":  # never push to a repo the token can't push to
+            raise RunnerError(UPSTREAM_LATER)
         if not _SHA.fullmatch(result.head_sha):
             raise RunnerError("bad head commit")
         body = build_pr_body(p.code, repo, ask, summary, result)
