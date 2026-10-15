@@ -322,8 +322,13 @@ def _repo_has_ci(settings: Settings, name: str) -> bool | None:
     import asyncio
 
     from resonant.runner.workspace import Workspace
+    from resonant.store import repos as repo_store
+    from resonant.store.db import connect, migrate
 
-    ws = Workspace(settings.runner)
+    conn = connect(":memory:")  # the config seed only: this check never opens the real store
+    migrate(conn)
+    repo_store.import_config(conn, settings.runner.repos)
+    ws = Workspace(settings.runner, conn)
     if not ws.mirror_path(name).is_dir():
         return None
     return asyncio.run(ws.repo_has_ci(name, refresh=False))

@@ -35,6 +35,8 @@ from resonant.runner.workspace import (
     slugify,
 )
 from resonant.secrets import FakeKeychain, RunnerSecrets, SecretStore
+from resonant.store import repos as repo_store
+from resonant.store.db import connect, migrate
 
 GIT = "/usr/bin/git"
 GH_TOKEN = "github_pat_" + "A1b2C3d4E5" * 6
@@ -148,7 +150,10 @@ class Env:
             git_path=self.shim,
             gh_path=self.gh,
         )
-        self.ws = Workspace(self.cfg, url_for=lambda repo: str(self.remote))
+        self.conn = connect(":memory:")
+        migrate(self.conn)
+        repo_store.import_config(self.conn, self.cfg.repos)
+        self.ws = Workspace(self.cfg, self.conn, url_for=lambda repo: str(self.remote))
 
     def gh_calls(self, verb: str | None = None) -> list[dict[str, Any]]:
         """The fake gh's calls; with ``verb`` ("create"), only ``gh pr <verb>``."""
@@ -336,7 +341,7 @@ async def test_prepare_leaves_no_token_anywhere(env: Env) -> None:
 
 
 async def test_prepare_unknown_repo_and_bad_code(env: Env) -> None:
-    with pytest.raises(RunnerError, match=r"isn't in runner\.repos"):
+    with pytest.raises(RunnerError, match="isn't a registered repo"):
         await env.ws.prepare("R1", "nope", "x", github_token=GH_TOKEN)
     with pytest.raises(RunnerError, match="bad run code"):
         await env.ws.prepare("../R1", "proj", "x", github_token=GH_TOKEN)
@@ -350,7 +355,7 @@ async def test_prepare_rebuilds_a_leftover_run_dir_and_failure_cleans_up(env: En
     assert not (second.run_dir / "stale.txt").exists()
     assert (second.repo_dir / "README.md").exists()
     assert (env.root / "seed").exists()  # the symlink target was not followed
-    env.cfg.repos["proj"] = RunnerRepo(remote="github.com/own/proj", base="nope")
+    env.conn.execute("UPDATE repos SET base = 'nope'")
     with pytest.raises(RunnerError, match="isn't a branch"):
         await env.prepare("R2")
     assert not (env.cfg.work_dir / "R2").exists()
@@ -608,7 +613,7 @@ async def test_flagged_paths_reach_the_pr_body(env: Env) -> None:
 
 
 async def test_quote_ask_false_leaves_the_ask_out(env: Env) -> None:
-    env.cfg.repos["proj"] = RunnerRepo(remote="github.com/own/proj", quote_ask=False)
+    env.conn.execute("UPDATE repos SET quote_ask = 0")
     p = await env.prepare()
     head = await env.deliver(p, {"a.txt": "a\n"})
     result = await env.ws.check(p, head, SECRETS)

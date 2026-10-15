@@ -25,6 +25,7 @@ from resonant.router.render import render_runs
 from resonant.router.router import toolset_for
 from resonant.runners.claude import MAX_ASK, Cancelled, Merged, Refused, Started
 from resonant.runners.local import report_line
+from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
 from resonant.store.db import kv_set, utcnow
 from resonant.store.tasks import insert_task
@@ -80,6 +81,7 @@ def settings() -> Settings:
 @pytest.fixture
 def components(settings: Settings, db: sqlite3.Connection) -> Iterator[Components]:
     shutil.copy(REPO / "config/principals.example.yaml", settings.principals_path)
+    repo_store.import_config(db, REPOS)  # what the runner's startup does with the seed
     state = DaemonState(settings, db, Loop(db, {}, settings.loop, SlotPool(2, 1)), utcnow())
     state.components = build_components(settings, db, state)
     yield state.components
@@ -125,20 +127,21 @@ def test_levels_and_effects(components: Components) -> None:
         assert spec is not None and spec.effect is effect and spec.effective_level is level
 
 
-def test_start_run_repo_is_an_enum_of_the_configured_names(components: Components) -> None:
+def test_start_run_repo_is_a_free_string_and_the_description_names_recent_repos(
+    components: Components,
+) -> None:
     spec = components.registry.get(None, "start_run")
     assert spec is not None
-    assert spec.args_schema["properties"]["repo"]["enum"] == ["dori", "resonant"]
-    assert "dori, resonant" in spec.description
+    assert "enum" not in spec.args_schema["properties"]["repo"]
+    assert "Recent repos: dori, resonant." in spec.description
 
 
-def test_no_repos_means_no_enum(db: sqlite3.Connection) -> None:
+def test_no_registered_repos_means_no_list(db: sqlite3.Connection) -> None:
     settings = load_settings()
     state = DaemonState(settings, db, Loop(db, {}, settings.loop, SlotPool(2, 1)), utcnow())
     c = build_components(settings, db, state)
     spec = c.registry.get(None, "start_run")
-    assert spec is not None and "enum" not in spec.args_schema["properties"]["repo"]
-    assert "No repos are configured" in spec.description
+    assert spec is not None and "Recent repos" not in spec.description
 
 
 def test_ask_limit_matches_the_runner() -> None:
@@ -216,7 +219,7 @@ def test_members_cannot_request_run_tools(components: Components) -> None:
 
 
 async def test_start_run(components: Components, runner: FakeRunner) -> None:
-    out = await call(components, "start_run", {"repo": "Dori ", "ask": "fix the typo"})
+    out = await call(components, "start_run", {"repo": " dori ", "ask": "fix the typo"})
     assert out["started"] is True and out["code"] == "R1"
     assert out["text"] == "On it: R1 · dori. Up to 30m. /runs to check, /cancel R1 to stop."
     assert runner.calls == [("start", "dori", "fix the typo", OWNER)]
@@ -224,12 +227,21 @@ async def test_start_run(components: Components, runner: FakeRunner) -> None:
                                        principal=OWNER, args={}), out) == out["text"]  # fmt: skip
 
 
-async def test_start_run_refuses_an_unknown_repo_in_code(
+async def test_start_run_passes_free_text_to_the_runner(
     components: Components, runner: FakeRunner
 ) -> None:
-    out = await call(components, "start_run", {"repo": "../etc", "ask": "x"})
-    assert out == {"started": False, "text": "No repo named ../etc. Known: dori, resonant."}
-    assert runner.calls == []
+    for text in ("github.com/foo/bar", "Foo/Bar", "the trading bot"):
+        out = await call(components, "start_run", {"repo": text, "ask": "x"})
+        assert out["started"] is True
+    assert [c[1] for c in runner.calls] == ["github.com/foo/bar", "Foo/Bar", "the trading bot"]
+
+
+async def test_start_run_refusals_come_from_the_runner(
+    components: Components, runner: FakeRunner
+) -> None:
+    runner.missing = "Which repo? a, b, c"
+    out = await call(components, "start_run", {"repo": "x", "ask": "x"})
+    assert out == {"started": False, "text": "Which repo? a, b, c"}
 
 
 async def test_start_run_bad_arguments(components: Components, runner: FakeRunner) -> None:
@@ -238,6 +250,7 @@ async def test_start_run_bad_arguments(components: Components, runner: FakeRunne
         {"repo": "dori", "ask": "  "},
         {"repo": 3, "ask": "x"},
         {"repo": "dori", "ask": "x", "path": "/"},
+        {"repo": "d" * (tools.REPO_MAX + 1), "ask": "x"},
         {"repo": "dori", "ask": "x" * (MAX_ASK + 1)},
     ):
         with pytest.raises(ToolFailed):
@@ -458,7 +471,7 @@ def test_run_project_toolset(components: Components) -> None:
     )
     assert [s.name for s in owner] == list(INTENT_TOOLS["run_project"])
     start = next(s for s in owner if s.name == "start_run")
-    assert start.args_schema["properties"]["repo"]["enum"] == ["dori", "resonant"]
+    assert "enum" not in start.args_schema["properties"]["repo"]
     member = toolset_for(
         "run_project", MEMBER, registry=components.registry, principals=components.principals
     )
