@@ -360,3 +360,7 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 ## Approval "expires soon" reminder
 
 *Found 2026-10-14, after the pulse shipped.* The pulse's approval re-mention runs only at the top of the hour, and approvals expire after 30 minutes, so it catches only approvals asked between :30 and :50 past an hour. A reminder scheduled by the approval runner itself (e.g. `[A7] still waiting, expires in 10 min`, once, at half the TTL) would cover every approval. Then drop `core/approval` from the pulse.
+
+## Runner as a separate macOS user (hardening)
+
+Deferred 2026-10-15 from the Phase 5a plan. The Seatbelt sandbox cannot stop a session reading another same-user process's argv and environment (`sysctl KERN_PROCARGS2`), so the owner chose never to put a secret in any process's env or argv instead (`resonant sandbox check` probes the daemon's environment). Running sessions as a dedicated user (`_resonant-runner`, no Keychain, no access to the owner's home) would close that structurally and drop the reliance on the rule. Needs one more owner terminal step (creating the user) and a `sudo`-free launchd helper.

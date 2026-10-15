@@ -64,7 +64,7 @@ def checked_path(path: str | os.PathLike[str]) -> str:
     text = os.fspath(path)
     if not os.path.isabs(text):
         raise SandboxError(f"not an absolute path: {text!r}")
-    real = os.path.realpath(text)
+    real = os.path.realpath(text) if "\0" not in text else text
     for ch in real:
         if ch in '"\\)' or ord(ch) < 32 or ord(ch) == 127:
             raise SandboxError(f"path has a character the sandbox refuses: {real!r}")
@@ -110,7 +110,7 @@ def _ancestors(paths: Iterable[Path]) -> list[str]:
     return list(seen)
 
 
-def _template() -> str:
+def template_text() -> str:
     return resources.files("resonant.sandbox").joinpath("runner.sb").read_text(encoding="utf-8")
 
 
@@ -131,7 +131,7 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
     for i, path in enumerate(p.deny_exec):
         defs[f"DENY_EXEC_{i}"] = str(path)
         exec_lines.append(f'  (subpath (param "DENY_EXEC_{i}"))')
-    text = _template()
+    text = template_text()
     for key, lines in (("read", read_lines), ("meta", meta_lines), ("exec", exec_lines)):
         if _PLACEHOLDERS[key] not in text:
             raise SandboxError(f"runner.sb lost its {_PLACEHOLDERS[key]} placeholder")

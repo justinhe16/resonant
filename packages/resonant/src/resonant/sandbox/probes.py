@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import plistlib
 import shutil
 import socket
 import subprocess
@@ -28,10 +29,12 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+
+import psutil
 
 from resonant.sandbox.profile import (
     API_PORT,
@@ -49,7 +52,7 @@ from resonant.sandbox.profile import (
     wrap,
 )
 
-Status = Literal["pass", "fail", "skip"]
+Status = Literal["pass", "fail", "skip", "info"]
 Scope = Literal["ci", "local"]
 
 DENIED_ERRNOS = frozenset({1, 13})  # EPERM, EACCES
@@ -319,7 +322,8 @@ out(env=dict(os.environ), cwd=os.getcwd(), real=os.path.realpath("."))
 # A child that starts a new session still carries the sandbox.
 _SETSID = """
 import subprocess
-code = "import os,json;\\ntry:\\n open(%r,'rb').read(1); r='READ'\\nexcept OSError as e: r='errno:%%d'%%e.errno\\nprint(r)" % A["path"]
+code = ("import os\\ntry:\\n open(%r,'rb').read(1); r='READ'\\n"
+        "except OSError as e: r='errno:%%d'%%e.errno\\nprint(r)") % A["path"]
 p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True,
                    start_new_session=True)
 out(res=p.stdout.strip())
@@ -446,12 +450,8 @@ def _lan_ip() -> str | None:
 
 
 def _daemon_pid() -> int | None:
-    try:
-        import psutil
-    except ImportError:  # pragma: no cover
-        return None
     for proc in psutil.process_iter(["pid", "cmdline"]):
-        cmd = proc.info["cmdline"] or []
+        cmd: list[str] = proc.info["cmdline"] or []
         if "resonant" in " ".join(cmd) and cmd[-2:] == ["daemon", "run"]:
             return int(proc.info["pid"])
     return None
@@ -476,7 +476,7 @@ def probe_context(
     home: Path | None = None,
     deny_exec: Sequence[Path] = (),
     read_paths: Sequence[Path] | None = None,
-) -> Iterator[ProbeContext]:
+) -> Generator[ProbeContext]:
     """Build a throwaway run dir and cache (under ``base_dir``, default ``~/resonant-runs``),
     a canary dir under ``$HOME`` and a process outside the sandbox. Cleans up on exit."""
     if not sandbox_exec_available():
@@ -628,9 +628,10 @@ def p_work_dir(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_other_env(ctx: ProbeContext) -> tuple[Status, str]:
-    """Another process's environment and arguments (what `ps eww` shows) can't be read, so
-    the daemon's `git push` with a token in its env stays private. `ps` itself can't be
-    exec'd by a sandboxed process (setuid), so the sysctl behind it is probed."""
+    """KNOWN LIMITATION, informational. Another same-user process's environment and
+    arguments (what `ps eww` shows) are readable through sysctl KERN_PROCARGS2, and no
+    Seatbelt operation gates it. Secrets are therefore never put in a process's env or argv
+    (see `daemon env clean`). `ps` itself can't be exec'd in the sandbox (setuid)."""
     marker = uuid.uuid4().hex
     victim = subprocess.Popen(  # noqa: S603 - fixed argv
         [ctx.python, "-I", "-c", "import time; time.sleep(300)"],  # not a SIP binary
@@ -647,14 +648,58 @@ def p_other_env(ctx: ProbeContext) -> tuple[Status, str]:
     finally:
         victim.kill()
         victim.wait()
-    return (
-        ("fail", "read another process's environment")
-        if res == "found"
-        else (
-            "pass",
-            f"KERN_PROCARGS2 refused ({res})",
-        )
-    )
+    if res == "found":
+        return "info", "readable from the sandbox; mitigated by keeping secrets out of env/argv"
+    return "pass", f"KERN_PROCARGS2 refused ({res})"
+
+
+TOKEN_SHAPES = ("ghp_", "gho_", "ghs_", "github_pat_", "sk-ant-", "sk-proj-", "xoxb-", "xoxp-")
+SECRET_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+SECRET_NAME_PREFIXES = ("RESONANT_SECRET_",)
+
+
+def secret_findings(env: Mapping[str, str], *, allow: Sequence[str] = ()) -> list[str]:
+    """Names (never values) of variables that look like they carry a secret."""
+    found: list[str] = []
+    for name, value in env.items():
+        if name in allow:
+            continue
+        if (
+            name in SECRET_NAMES
+            or name.startswith(SECRET_NAME_PREFIXES)
+            or any(shape in value for shape in TOKEN_SHAPES)
+        ):
+            found.append(name)
+    return sorted(found)
+
+
+def daemon_environments() -> dict[str, Mapping[str, str]]:
+    """The environments a secret could sit in: this process, the LaunchAgent plist and the
+    running daemon's own process."""
+    envs: dict[str, Mapping[str, str]] = {"this process": dict(os.environ)}
+    plist = Path("~/Library/LaunchAgents/com.resonant.daemon.plist").expanduser()
+    try:
+        with plist.open("rb") as f:
+            envs["LaunchAgent plist"] = plistlib.load(f).get("EnvironmentVariables") or {}
+    except (OSError, plistlib.InvalidFileException):
+        pass
+    pid = _daemon_pid()
+    if pid is not None:
+        with contextlib.suppress(psutil.Error, OSError):
+            envs["running daemon"] = psutil.Process(pid).environ()
+    return envs
+
+
+def p_daemon_env(ctx: ProbeContext) -> tuple[Status, str]:
+    """The mitigation for the KERN_PROCARGS2 limitation: no secret sits in the daemon's
+    environment (this process, the LaunchAgent plist, the running daemon). Only names are
+    ever reported. CLAUDE_CODE_OAUTH_TOKEN in this process is the owner's input to the
+    authenticated claude probe and is not counted."""
+    bad: list[str] = []
+    for where, env in daemon_environments().items():
+        allow = ("CLAUDE_CODE_OAUTH_TOKEN",) if where == "this process" else ()
+        bad += [f"{name} in {where}" for name in secret_findings(env, allow=allow)]
+    return ("fail", "; ".join(bad)) if bad else ("pass", "no secret-looking variables")
 
 
 def p_run_dir(ctx: ProbeContext) -> tuple[Status, str]:
@@ -714,7 +759,8 @@ def p_bind_dev_server(ctx: ProbeContext) -> tuple[Status, str]:
         "import http.server, threading, urllib.request\n"
         "srv = http.server.HTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler)\n"
         "threading.Thread(target=srv.serve_forever, daemon=True).start()\n"
-        "code = urllib.request.urlopen('http://127.0.0.1:%d/' % srv.server_port, timeout=5).status\n"
+        "url = 'http://127.0.0.1:%d/' % srv.server_port\n"
+        "code = urllib.request.urlopen(url, timeout=5).status\n"
         "out(status=code)\n"
     )
     data = ctx.snippet(code)
@@ -997,7 +1043,8 @@ PROBES: tuple[Probe, ...] = (
     Probe("file write denies", "ci", p_write_denied),
     Probe("run dir and cache allows", "ci", p_run_dir),
     Probe("work dir and sibling run dirs", "ci", p_work_dir),
-    Probe("other processes' environment", "ci", p_other_env),
+    Probe("other processes' environment (known limitation)", "ci", p_other_env),
+    Probe("daemon env holds no secrets", "local", p_daemon_env),
     Probe("exec denies", "ci", p_exec_denied),
     Probe("ports 7777 and 11434 on loopback", "ci", p_ports),
     Probe("loopback dev server", "ci", p_bind_dev_server),
@@ -1045,7 +1092,7 @@ def run_probes(ctx: ProbeContext, scopes: Sequence[Scope] = ("ci", "local")) -> 
 
 
 @contextlib.contextmanager
-def _listener() -> Iterator[tuple[str, int]]:
+def _listener() -> Generator[tuple[str, int]]:
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(8)
@@ -1063,7 +1110,9 @@ def render_table(results: Sequence[ProbeResult]) -> str:
     ]
     fails = sum(r.status == "fail" for r in results)
     skips = sum(r.status == "skip" for r in results)
-    lines.append(f"{len(results) - fails - skips} passed, {fails} failed, {skips} skipped")
+    infos = sum(r.status == "info" for r in results)
+    passed = len(results) - fails - skips - infos
+    lines.append(f"{passed} passed, {fails} failed, {skips} skipped, {infos} known limitation(s)")
     return "\n".join(lines)
 
 
@@ -1100,7 +1149,7 @@ def self_check(params: SandboxParams, *, python: str | None = None) -> tuple[boo
         res: dict[str, Any] = json.loads(proc.stdout.strip().splitlines()[-1])["res"]
     except (OSError, SandboxError, subprocess.TimeoutExpired, IndexError, ValueError) as e:
         return False, f"self-check could not run: {type(e).__name__}: {e}"
-    problems = []
+    problems: list[str] = []
     if not _denied(res["read"]):
         problems.append(f"read of {p.home} gave {res['read']}")
     if res["mach"] != BOOTSTRAP_NOT_PRIVILEGED:

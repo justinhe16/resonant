@@ -1127,3 +1127,46 @@ def bench_e2e(
                 typer.echo(f"  {r['path']:<5} no replies ({r['failures']}/{n} timed out)   MISS")
     if not data["pass"]:
         raise typer.Exit(1)
+
+
+# --- sandbox ---------------------------------------------------------------------------
+
+sandbox_app = typer.Typer(no_args_is_help=True, help="The runner sandbox (docs/phase5a-plan.md).")
+app.add_typer(sandbox_app, name="sandbox")
+
+
+@sandbox_app.command("check")
+def sandbox_check(
+    scope: Annotated[
+        str, typer.Option(help="all, ci (host-independent probes) or local (needs the Mini).")
+    ] = "all",
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Run every probe against the live runner profile and print a table. Exit 1 on any
+    failure. Re-run after every macOS update. Set CLAUDE_CODE_OAUTH_TOKEN to also run an
+    authenticated `claude -p` inside the sandbox."""
+    import shutil
+    import sys
+
+    from resonant.sandbox import SandboxError
+    from resonant.sandbox.probes import probe_context, render_table, run_probes
+
+    if scope not in ("all", "ci", "local"):
+        typer.echo("--scope must be all, ci or local", err=True)
+        raise typer.Exit(2)
+    scopes: tuple[Any, ...] = ("ci", "local") if scope == "all" else (scope,)
+    deny = [Path(sys.prefix)]
+    if (entry := shutil.which("resonant")) is not None:
+        deny.append(Path(entry))
+    try:
+        with probe_context(deny_exec=deny) as ctx:
+            results = run_probes(ctx, scopes)
+    except SandboxError as e:
+        typer.echo(f"sandbox unavailable: {e}", err=True)
+        raise typer.Exit(1) from e
+    if as_json:
+        typer.echo(json.dumps([r.as_dict() for r in results], indent=2))
+    else:
+        typer.echo(render_table(results))
+    if any(r.status == "fail" for r in results):
+        raise typer.Exit(1)
