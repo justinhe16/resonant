@@ -214,21 +214,33 @@ def delete_run_dir(work_dir: Path, code: str) -> bool:
 # --- the cache ---------------------------------------------------------------------------
 
 
-def _files(fd: int, parts: tuple[str, ...]) -> list[tuple[float, int, tuple[str, ...]]]:
+def _files(root: int) -> list[tuple[float, int, tuple[str, ...]]]:
+    """Every non-directory under an open dir, iteratively. Directories nested deeper than
+    ``MAX_DEPTH`` or that won't open are skipped (they can't be pruned)."""
     out: list[tuple[float, int, tuple[str, ...]]] = []
-    for name, st in _entries(fd):
-        if stat.S_ISDIR(st.st_mode):
-            try:
-                child = _open_dir(name, fd)
-            except OSError:
+    stack: list[tuple[int, tuple[str, ...], list[tuple[str, os.stat_result]]]] = [
+        (os.dup(root), (), _entries(root))
+    ]
+    try:
+        while stack:
+            fd, parts, pending = stack[-1]
+            if not pending:
+                stack.pop()
+                os.close(fd)
                 continue
-            try:
-                out.extend(_files(child, (*parts, name)))
-            finally:
-                os.close(child)
-        else:
-            out.append((max(st.st_atime, st.st_mtime), st.st_blocks * 512, (*parts, name)))
-    return out
+            name, st = pending.pop()
+            if not stat.S_ISDIR(st.st_mode):
+                out.append((max(st.st_atime, st.st_mtime), st.st_blocks * 512, (*parts, name)))
+            elif len(stack) < MAX_DEPTH:
+                try:
+                    child = _open_dir(name, fd)
+                except OSError:
+                    continue
+                stack.append((child, (*parts, name), _entries(child)))
+        return out
+    finally:
+        for fd, _, _ in stack:
+            os.close(fd)
 
 
 def _unlink_at(root_fd: int, parts: tuple[str, ...]) -> None:
@@ -254,7 +266,7 @@ def prune_cache(cache_dir: Path, max_bytes: int) -> int:
     except (FileNotFoundError, NotADirectoryError):
         return 0
     try:
-        files = _files(root, ())
+        files = _files(root)
         total = sum(size for _, size, _ in files)
         freed = 0
         for _, size, parts in sorted(files):
@@ -280,10 +292,38 @@ class CleanupResult:
     errors: list[str] = field(default_factory=list[str])
 
 
+def wipe_secret_dirs(secrets_dir: Path, mirror_dir: Path | None = None) -> int:
+    """Delete every leftover per-call secret dir (a crash between writing a token file and
+    removing it) and, with ``mirror_dir``, stale bundle copies in ``<mirror_dir>/.incoming``.
+    Never raises. The daemon calls this at startup (before any run), and ``cleanup`` calls
+    it daily. Returns how many entries were removed."""
+    removed = 0
+    targets = [secrets_dir]
+    if mirror_dir is not None:
+        targets.append(mirror_dir / ".incoming")
+    for target in targets:
+        try:
+            names = os.listdir(target)
+        except OSError:
+            continue
+        for name in names:
+            if target != secrets_dir and not name.endswith(".bundle"):
+                continue
+            with contextlib.suppress(Exception):
+                try:
+                    rmtree_nofollow(target / name)
+                except NotADirectoryError:
+                    (target / name).unlink()
+                removed += 1
+    return removed
+
+
 def cleanup(
     work_dir: Path,
     cache_dir: Path,
     *,
+    secrets_dir: Path | None = None,
+    mirror_dir: Path | None = None,
     ended_at: Mapping[str, float],
     keep_days: int,
     max_cache_bytes: int,
@@ -302,5 +342,10 @@ def cleanup(
                 result.removed_runs.append(code)
         except Exception as e:  # one bad run dir must not stop the rest
             result.errors.append(f"{code}: {getattr(e, 'strerror', None) or type(e).__name__}")
-    result.cache_freed_bytes = prune_cache(cache_dir, max_cache_bytes)
+    try:
+        result.cache_freed_bytes = prune_cache(cache_dir, max_cache_bytes)
+    except Exception as e:
+        result.errors.append(f"cache: {getattr(e, 'strerror', None) or type(e).__name__}")
+    if secrets_dir is not None:
+        wipe_secret_dirs(secrets_dir, mirror_dir)
     return result

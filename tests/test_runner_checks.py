@@ -432,3 +432,10 @@ async def test_ci_present(repo: Path) -> None:
     assert await checks.ci_present(runner_for(repo), "main") is True
     with pytest.raises(GitError):
         await checks.ci_present(runner_for(repo), "nope")
+
+
+async def test_token_in_a_file_path_refused(repo: Path) -> None:
+    base = git(repo, "rev-parse", "HEAD")
+    head = commit(repo, {"ghp_" + "a" * 36 + ".txt": "x\n"})
+    with pytest.raises(CheckFailed, match="file paths"):
+        await check(repo, base, head)

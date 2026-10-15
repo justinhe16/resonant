@@ -311,7 +311,11 @@ async def run_checks(
         raise CheckFailed("the history is too large to check") from None
     added = await asyncio.to_thread(added_lines, patch)
     await asyncio.to_thread(
-        check_texts, values, commit_object=raw_commits.decode(errors="replace"), diff=added
+        check_texts,
+        values,
+        file_paths="\n".join(e.path for e in history),
+        commit_object=raw_commits.decode(errors="replace"),
+        diff=added,
     )
 
     log = await git("log", "-z", "--reverse", "--format=%B", span)
@@ -359,6 +363,6 @@ async def ci_present(git: GitRunner, rev: str) -> bool:
             blob = await git("cat-file", "blob", f"{rev}:{name}", max_out=MAX_WORKFLOW_BYTES)
         except (GitError, OutputTooLarge):
             continue
-        if runs_on_pull_request(blob.decode(errors="replace")):
+        if await asyncio.to_thread(runs_on_pull_request, blob.decode(errors="replace")):
             return True
     return False

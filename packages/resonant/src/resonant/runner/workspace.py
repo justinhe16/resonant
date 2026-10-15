@@ -76,8 +76,8 @@ g add -A
 if ! g diff --cached --quiet; then
   g commit -q --no-verify -m "$6"
 fi
-[ "$(g rev-list --count "$3..$4")" = 0 ] && exit 0
-g bundle create -q "$2" "$3..$4"
+[ "$(g rev-list --count "$3..refs/heads/$4")" = 0 ] && exit 0
+g bundle create -q "$2" "$3..refs/heads/$4"
 """
 
 
@@ -169,6 +169,7 @@ def secret_dir(base: Path) -> Generator[Path]:
     the body succeeded or not. File reads in it are protected by the sandbox's ``$HOME``
     read deny (``~/.resonant`` is denied), not by anything in here."""
     base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(base, 0o700)
     path = Path(tempfile.mkdtemp(prefix="call-", dir=base))  # mkdtemp is 0700
     try:
         yield path

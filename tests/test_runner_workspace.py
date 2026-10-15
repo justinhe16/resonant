@@ -1111,3 +1111,73 @@ async def test_secret_files_removed_after_failure(env: Env) -> None:
         env.cfg.gh_path = slow
         await asyncio.wait_for(env.ws.merge("proj", 41, "a" * 40, SECRETS), 1)
     assert _leftovers(env) == []
+
+
+# --- startup wipe, deep cache, path scan ------------------------------------------------------
+
+
+def test_wipe_secret_dirs_removes_leftovers_and_never_raises(tmp_path: Path) -> None:
+    secrets = tmp_path / "secrets"
+    (secrets / "call-1").mkdir(parents=True)
+    (secrets / "call-1" / "token").write_text(GH_TOKEN)
+    (secrets / "stray-file").write_text("x")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("keep")
+    (secrets / "link").symlink_to(outside)
+    mirrors = tmp_path / "mirrors"
+    (mirrors / ".incoming").mkdir(parents=True)
+    (mirrors / ".incoming" / "R1.bundle").write_bytes(b"x")
+    (mirrors / ".incoming" / "other.txt").write_text("not ours")
+
+    assert cleanup_mod.wipe_secret_dirs(secrets, mirrors) == 4
+    assert list(secrets.iterdir()) == []
+    assert not (mirrors / ".incoming" / "R1.bundle").exists()
+    assert (mirrors / ".incoming" / "other.txt").exists()
+    assert (outside / "keep").read_text() == "keep"
+    assert cleanup_mod.wipe_secret_dirs(tmp_path / "missing", tmp_path / "missing2") == 0
+
+
+def test_cleanup_wipes_secret_dirs(tmp_path: Path) -> None:
+    secrets = tmp_path / "secrets"
+    (secrets / "call-1").mkdir(parents=True)
+    result = cleanup_mod.cleanup(
+        tmp_path / "runs",
+        tmp_path / "cache",
+        secrets_dir=secrets,
+        ended_at={},
+        keep_days=7,
+        max_cache_bytes=10**9,
+    )
+    assert result.errors == []
+    assert list(secrets.iterdir()) == []
+
+
+def test_prune_cache_survives_a_deep_tree(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    _deep(cache, cleanup_mod.MAX_DEPTH + 50)
+    (cache / "f").write_bytes(b"x" * 100_000)
+    assert cleanup_mod.prune_cache(cache, 0) >= 100_000
+    assert not (cache / "f").exists()
+    result = cleanup_mod.cleanup(
+        tmp_path / "runs", cache, ended_at={}, keep_days=7, max_cache_bytes=0
+    )
+    assert result.errors == []
+
+
+def test_cleanup_records_a_prune_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(cache_dir: Path, max_bytes: int) -> int:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cleanup_mod, "prune_cache", boom)
+    result = cleanup_mod.cleanup(
+        tmp_path, tmp_path / "c", ended_at={}, keep_days=7, max_cache_bytes=0
+    )
+    assert result.errors == ["cache: RuntimeError"]
+
+
+def test_secret_dir_base_is_tightened(tmp_path: Path) -> None:
+    base = tmp_path / "secrets"
+    base.mkdir(mode=0o755)
+    with workspace_mod.secret_dir(base):
+        assert stat.S_IMODE(base.stat().st_mode) == 0o700
