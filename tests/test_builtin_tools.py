@@ -49,6 +49,9 @@ NAMES = {
     "update_resonant",
     "list_extensions",
     "mute_extension",
+    "pulse_preview",
+    "open_items",
+    "briefing_preview",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {

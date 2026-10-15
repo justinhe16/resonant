@@ -12,7 +12,7 @@ texts anyone and never touches the live daemon's state:
 
 Latency is measured from the row insert to the osascript call, per path:
 
-- ``fast``: slash commands and anchored keywords (no model call).
+- ``fast``: slash commands and the `status`/`ping` keywords (no model call).
 - ``llm``: one label call, then the runner's tool loop and answer.
 
 Messages.app delivery and osascript's own run time are not included (the iMessage self-test
@@ -47,7 +47,7 @@ BenchPath = Literal["fast", "llm"]
 
 OWNER_HANDLE = "+15550100100"
 TARGET_P50_MS: dict[BenchPath, int] = {"fast": 1000, "llm": 3000}
-FAST_PROMPTS = ("what's running?", "status", "ping", "how's the mini", "/tasks")
+FAST_PROMPTS = ("status", "ping", "/status", "/tasks", "/help")
 LLM_PROMPTS = (
     "anything queued up right now?",
     "how many tasks finished today?",
