@@ -221,6 +221,12 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 **Done when.** Runners with shell access run sandboxed (e.g. `sandbox-exec` or a separate user) with no access to `~/.resonant`, the `resonant` CLI or `/usr/bin/security`, and a test proves each is denied. For extension processes this is the [Seatbelt sandbox](#seatbelt-sandbox-for-extension-processes) below.
 
+## A `resource` wait reason for runner runs
+
+*From the P5A-3 review.* A run that finds its repo busy, the runner full or Resonant paused returns `Wait("usage_reset")` because `tasks.wait_reason` has no better value. `/status` then counts it under usage resets.
+
+**Done when.** `resource` is added to `WaitReason` and to the `tasks.wait_reason` CHECK in the next migration that touches `tasks`, and `ClaudeRunner._defer` uses it.
+
 ## Ops hardening
 
 *Noted 2026-10-13, during the Phase 2 build.*

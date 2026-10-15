@@ -8,7 +8,7 @@ leaves notes for the test: ``argv.json`` (flags, env and the prompt of every inv
 pid files.
 
 Scenarios: happy, nochanges, slow, hang, hang_then_ok, escapee, usage_limit, error, maxturns,
-maxbudget, longline, leak, disk, makefile, github, noresult, tokens.
+maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, makefile, github, noresult, tokens.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -94,10 +95,15 @@ history.append({"argv": sys.argv[1:], "env": dict(os.environ), "prompt": prompt,
 note("argv.json", json.dumps(history))
 note("claude.pid", str(os.getpid()))
 
+if scenario == "preinit_hang":  # dies before Claude ever writes a session
+    time.sleep(3600)
+if scenario == "stubborn":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
 emit({"type": "system", "subtype": "init", "session_id": session, "cwd": os.getcwd()})
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "working on it"}]}})
 
-if scenario == "hang" or (scenario == "hang_then_ok" and not args.resume):
+if scenario in ("hang", "stubborn") or (scenario == "hang_then_ok" and not args.resume):
     time.sleep(3600)
     sys.exit(0)
 elif scenario == "usage_limit" and not os.path.exists(os.path.join(tmp, "limit-seen")):
@@ -153,6 +159,10 @@ if scenario == "longline":
     for leak in args.leak:  # a secret right at the cut of a line that is too long
         emit({"type": "assistant", "message": {"content": [{"type": "text",
               "text": "y" * (1_048_576 - 200) + leak + "z" * 500}]}})  # fmt: skip
+if scenario == "cachefill":
+    with open(os.path.join(os.environ["UV_CACHE_DIR"], "big.bin"), "wb") as f:
+        f.write(b"\0" * 4_000_000)
+    time.sleep(30)
 if scenario == "disk":
     with open(os.path.join(tmp, "big.bin"), "wb") as f:
         f.write(b"\0" * 4_000_000)

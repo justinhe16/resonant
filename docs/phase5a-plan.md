@@ -254,3 +254,16 @@ Built: `store/migrations/006_runs.sql` + `store/runs.py`, `runners/claude.py` (`
 - **Cleanup job** `core/run-cleanup` (daily 04:30, catch-up 12 h) is registered by the daemon (`core_jobs=(*CORE_JOBS, cleanup_job)`), not in `CORE_JOBS`, to keep `scheduler.py` untouched. Not scheduled when `runner.repos` is empty.
 - **Unverified on the real CLI** (the authenticated `claude -p` is an owner step): the exact usage-limit result shape (`usage_limit()` reads an error result whose subtype or text names a limit, with a reset epoch in `resets_at`/`reset_at` or after a `|`; an unreadable reset waits one hour), and the inline-JSON form of `--settings`. Each is one function or one argv entry.
 - **Known gaps.** A crash between the spawn and saving the pid leaves a process that only the env marker can find (the startup reap does look for it). A `--resume` of a session Claude never wrote fails the run. A failed self-check is logged and audited (`run.sandbox_failed`) and fails the run; a texted health alert for it is not wired.
+
+P5A-3 review changes:
+
+- The env marker the reaper matches is the run's **session id** (a uuid), not the run code, so a second daemon instance's `R1` is never touched. Matching by cwd skips processes with a controlling terminal (the owner's shell).
+- **Tree kill is best effort inside the sandbox**: a process that clears its environment, changes directory and leaves the group is not found by marker, cwd or tree. It stays inside the sandbox (no `$HOME`, no secrets, no launchd), so the residue is a stray process, not an escape.
+- `start()` failing leaves the runner blocked: every step defers (audit `run.startup_failed`) until a later `start()` succeeds, so nothing resumes before the old processes are reaped.
+- `/kill` and `/cancel` use SIGTERM, then SIGKILL after 2 s; cancel also reaps anything marked to the run (a running harvest) before the run dir is deleted.
+- A session counts (and is resumed with `--resume`) only after Claude's system message with the session id arrived; otherwise the next start is a fresh `--session-id`. The saved process is cleared only once the tree is really gone; if it won't die the run fails.
+- The watchdog also covers the shared runner cache: over `runner.max_cache_gb`, the run is killed. The daily cleanup also runs with no repos configured when the work or cache dir exists.
+- `pr list` uses `--state all`, so a PR merged or closed in between is reused, not duplicated. During a usage wait the pulse item reads "waiting for usage reset".
+- Busy/full/paused keep `Wait("usage_reset")`; a `resource` reason is a follow-up ([followups.md](followups.md#a-resource-wait-reason-for-runner-runs)).
+- `--max-turns` is hidden and undocumented in Claude Code's help; confirm on the first real run (test.md row 16). `--setting-sources project` makes Claude obey the repo's own `.claude/settings.json` inside the sandbox (accepted, as in D2). Whether `sandbox.enabled: false` takes effect is an owner step (row 16). The redundant `autoUpdates` setting was dropped (`DISABLE_AUTOUPDATER=1` is in the env).
+

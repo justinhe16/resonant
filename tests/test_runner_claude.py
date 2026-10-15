@@ -264,7 +264,7 @@ class Harness:
             await running
 
     def processes_of(self, code: str) -> list[psutil.Process]:
-        t = Target(None, None, None, run_dir=self.code_dir(code), marker=code)
+        t = Target(None, None, None, run_dir=self.code_dir(code), marker=self.run(code).session_id)
         return reaper.find(t)[0]
 
 
@@ -356,7 +356,8 @@ def with_scenario(h: Harness, scenario: str, *extra: str) -> None:
 async def killall(h: Harness) -> None:
     for run in runs_store.recent(h.conn, 50):
         await reaper.reap(
-            Target(None, None, None, run_dir=h.code_dir(run.code), marker=run.code), grace_s=0.2
+            Target(None, None, None, run_dir=h.code_dir(run.code), marker=run.session_id),
+            grace_s=0.2,
         )
 
 
@@ -416,7 +417,7 @@ async def test_session_flags_environment_and_prompt(h: Harness) -> None:
     assert env["HOME"] == f"{run_dir}/home"
     assert env["CLAUDE_CONFIG_DIR"] == f"{run_dir}/home/.claude"
     assert env["CLAUDE_CODE_TMPDIR"] == f"{run_dir}/tmp" and env["DISABLE_AUTOUPDATER"] == "1"
-    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN and env["RESONANT_RUN"] == "R1"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN and env["RESONANT_RUN"] == run.session_id
     assert "ANTHROPIC_API_KEY" not in env and "SSH_AUTH_SOCK" not in env
     assert all(GH_TOKEN not in v for v in env.values())
     assert not any(k.startswith("RESONANT_SECRET") for k in env)
@@ -726,10 +727,11 @@ SLEEPER = "import time; time.sleep(600)"
 
 
 def spawn(
-    code: str, *, setsid: bool = True, env: dict[str, str] | None = None
+    code: str, *, setsid: bool = True, env: dict[str, str] | None = None, cwd: Path | None = None
 ) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [sys.executable, "-c", code],
+        cwd=cwd,
         env={**os.environ, **(env or {})},
         start_new_session=setsid,
     )
@@ -1276,10 +1278,14 @@ async def test_cleanup_job_deletes_old_run_dirs(tmp_path: Path, db: sqlite3.Conn
     out = await job.run({}, cast(Any, None))
     assert out["removed"] == 1 and not h.code_dir(code).exists()
     assert h.run(fresh).status == "queued"  # active runs are never touched
-    deps2 = SimpleNamespace(
-        settings=SimpleNamespace(runner=h.cfg.model_copy(update={"repos": {}})), conn=db
+    empty = h.cfg.model_copy(update={"repos": {}})
+    deps2 = SimpleNamespace(settings=SimpleNamespace(runner=empty), conn=db)
+    assert claude_mod.cleanup_job(cast(Any, deps2)) is not None  # dirs exist: still cleaned
+    bare = empty.model_copy(
+        update={"work_dir": tmp_path / "none", "cache_dir": tmp_path / "none" / "cache"}
     )
-    assert claude_mod.cleanup_job(cast(Any, deps2)) is None
+    deps3 = SimpleNamespace(settings=SimpleNamespace(runner=bare), conn=db)
+    assert claude_mod.cleanup_job(cast(Any, deps3)) is None
 
 
 async def test_reconcile_ends_runs_whose_task_failed(h: Harness) -> None:
@@ -1370,3 +1376,123 @@ async def test_the_daemon_registers_the_runner_and_the_cleanup_job(
     finally:
         daemon.conn.close()
         chat.close()
+
+
+# --- review fixes ----------------------------------------------------------------------------
+
+
+async def test_reap_marker_is_the_session_id_not_the_run_code(tmp_path: Path) -> None:
+    """Another daemon instance's R1 (same code, other session) is not ours to kill."""
+    other = spawn(SLEEPER, env={"RESONANT_RUN": "R1"})
+    mine = spawn(SLEEPER, env={"RESONANT_RUN": "session-uuid-1"})
+    try:
+        await until(lambda: live(other.pid) and live(mine.pid))
+        t = Target(None, None, None, marker="session-uuid-1")
+        assert await reaper.reap(t, grace_s=0.3) == 1
+        mine.wait(timeout=5)
+        assert other.poll() is None
+    finally:
+        other.kill()
+        mine.kill()
+
+
+async def test_the_session_env_marker_is_the_session_id(h: Harness) -> None:
+    await h.start()
+    await h.drain()
+    env = h.argv_log()[0]["env"]
+    assert env["RESONANT_RUN"] == h.run().session_id != "R1"
+
+
+async def test_a_failed_startup_holds_every_run_until_it_succeeds(
+    tmp_path: Path, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = build(tmp_path, db)
+    code = await h.start()
+    runs_store.update(db, code, status="running", pgid=999_999, leader_pid=999_999)
+
+    async def boom(*a: Any, **k: Any) -> int:
+        raise OSError("cannot scan")
+
+    real = reaper.reap
+    monkeypatch.setattr(reaper, "reap", boom)
+    with pytest.raises(OSError):
+        await h.runner.start()
+    monkeypatch.setattr(reaper, "reap", real)
+    runs_store.update(db, code, status="queued", pgid=None, leader_pid=None)
+    t = asyncio.ensure_future(h.loop.run_until_idle())
+    await asyncio.wait_for(t, 10)
+    assert h.run(code).status == "queued" and not (h.tmp(code) / "argv.json").exists()
+    assert db.execute("SELECT 1 FROM audit_log WHERE action = 'run.startup_failed'").fetchone()
+    await h.runner.start()  # the retry succeeds: runs go
+    await h.drain()
+    assert h.run(code).status == "ready"
+    await h.runner.aclose()
+
+
+async def test_cancel_is_sigterm_then_sigkill_after_a_short_grace(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="stubborn", kill_grace_s=60)
+    code = await h.start()
+    t = h.spawn_loop()
+    await until(lambda: (h.tmp(code) / "claude.pid").exists())
+    pid = h.pid_of(code, "claude.pid")
+    t0 = time.monotonic()
+    await h.runner.cancel_run(code)
+    await asyncio.wait_for(t, 30)
+    assert not live(pid) and time.monotonic() - t0 < 10  # not the 60 s grace
+
+
+async def test_cancel_also_ends_a_harvest_process_in_the_run_dir(h: Harness) -> None:
+    code = await h.start()
+    run = h.run(code)
+    h.code_dir(code).mkdir(parents=True)
+    straggler = spawn(SLEEPER, env={"RESONANT_RUN": run.session_id}, cwd=h.code_dir(code))
+    try:
+        await until(lambda: live(straggler.pid))
+        await h.runner.cancel_run(code)
+        straggler.wait(timeout=10)
+        assert not h.code_dir(code).exists()
+    finally:
+        straggler.kill()
+
+
+async def test_a_session_counts_only_after_claude_wrote_it(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="preinit_hang")
+    code = await h.start()
+    t = h.spawn_loop()
+    await until(lambda: (h.tmp(code) / "claude.pid").exists())
+    await asyncio.sleep(0.5)
+    assert h.run(code).sessions == 0  # no system message yet: nothing to resume
+    await h.runner.cancel_run(code)
+    await asyncio.wait_for(t, 20)
+
+    # after a crash before the first write the next start is a fresh --session-id
+    h2 = build(tmp_path / "b", db, scenario="happy")
+    code2 = await h2.start()
+    runs_store.update(db, code2, attempts=1)
+    await h2.drain()
+    argv = h2.argv_log(code2)[0]["argv"]
+    assert "--session-id" in argv and "--resume" not in argv
+    assert h2.run(code2).sessions == 1  # counted once Claude's init arrived
+
+
+async def test_the_shared_cache_is_watched_too(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = build(tmp_path, db, scenario="cachefill", cache_limit_bytes=1_000_000, disk_interval_s=0.1)
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed" and (run.failure or "").startswith("the runner cache grew over")
+    assert h.processes_of("R1") == []
+
+
+async def test_the_pulse_item_says_when_waiting_for_the_usage_reset(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="usage_limit")
+    await h.start()
+    await h.drain()
+    item = pulse_store.get(db, "core", "run/r1")
+    assert item is not None and item.title.startswith("R1 waiting for usage reset · proj")

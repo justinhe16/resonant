@@ -39,6 +39,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -125,6 +126,7 @@ MAX_ASK = 4000
 SUMMARY_MAX = 600
 REASON_MAX = 240
 MAX_TURNS = 200
+CANCEL_GRACE_S = 2.0  # /kill and /cancel: SIGTERM, then SIGKILL after this
 STEP_SLACK_S = 600.0  # prepare, harvest, import and publish on top of the session limit
 SAVE_EVERY_S = 30.0
 PULSE_TTL_S = 48 * 3600
@@ -414,10 +416,11 @@ class ClaudeRunner:
         read_paths: Sequence[Path] | None = None,
         max_session_s: int | None = None,
         max_turns: int = MAX_TURNS,
-        poll_s: float = 1.0,
+        poll_s: float = 0.25,
         kill_grace_s: float = reaper.GRACE_S,
         disk_interval_s: float = 60.0,
         disk_limit_bytes: int | None = None,
+        cache_limit_bytes: int | None = None,
         defer_s: float = DEFER_S,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
@@ -446,7 +449,10 @@ class ClaudeRunner:
         self.kill_grace_s = kill_grace_s
         self.disk_interval_s = disk_interval_s
         self.disk_limit_bytes = disk_limit_bytes or runner.max_run_dir_mb * 1024 * 1024
+        self.cache_limit_bytes = cache_limit_bytes or runner.max_cache_gb * 1024**3
+        self.cancel_grace_s = min(kill_grace_s, CANCEL_GRACE_S)
         self.defer_s = defer_s
+        self._blocked = False  # start() began and hasn't finished: nothing may run
         self.clock = clock
         self.max_step_s: float | None = self.max_session_s + STEP_SLACK_S
         self.state_dir = runner.mirror_dir.parent
@@ -464,7 +470,20 @@ class ClaudeRunner:
     async def start(self) -> int:
         """Daemon start, before the loop resumes anything: end every process a crash left,
         wipe leftover token dirs, end runs whose task is gone, and hook the kill switch.
-        Returns how many runs had processes."""
+        Returns how many runs had processes. If it raises, the runner stays blocked (every
+        step defers) so no session is resumed before the old processes are known to be gone."""
+        self._blocked = True
+        try:
+            reaped = await self._startup()
+        except Exception:
+            log.exception("runner startup failed; runs are held until it succeeds")
+            with contextlib.suppress(Exception), atomic(self.conn):
+                audit(self.conn, "run.startup_failed")
+            raise
+        self._blocked = False
+        return reaped
+
+    async def _startup(self) -> int:
         reaped = 0
         for run in runs.active(self.conn):
             has_process = run.pgid is not None or run.leader_pid is not None
@@ -501,7 +520,7 @@ class ClaudeRunner:
             run.leader_pid,
             run.leader_started_at,
             run_dir=self.cfg.work_dir / run.code,
-            marker=run.code,
+            marker=run.session_id,
         )
 
     def _spawn(self, coro: Any) -> None:
@@ -628,6 +647,8 @@ class ClaudeRunner:
             return Fail("run not found")
         if not run.active:
             return await self._conclude(run)
+        if self._blocked:
+            return self._defer(task, "starting")
         if self._paused():
             return self._defer(task, "paused")
         lock = self._locks.setdefault(run.repo, asyncio.Lock())
@@ -661,6 +682,7 @@ class ClaudeRunner:
         try:
             if run.status == "waiting":
                 run = self._end_wait(run)
+                self._pulse_open(run)
                 if run.wait_seconds > MAX_WAIT_S:
                     return await self._fail(run, "usage limit didn't reset within 24h", w.redactor)
             if run.step == "prepare":
@@ -747,7 +769,7 @@ class ClaudeRunner:
         return cached_self_check(params, self.state_dir / CHECK_CACHE)
 
     def _env(
-        self, params: SandboxParams, code: str, secrets: RunnerSecrets | None
+        self, params: SandboxParams, marker: str, secrets: RunnerSecrets | None
     ) -> dict[str, str]:
         """The sandbox environment: from scratch, the one allowed secret only when asked."""
         bins = [p for p in params.read_paths if p.name == "bin"]
@@ -757,7 +779,7 @@ class ClaudeRunner:
             claude_token=None if secrets is None else secrets.claude_token,
             anthropic_key=None if secrets is None else secrets.anthropic_key,
         )
-        env[MARKER_ENV] = code
+        env[MARKER_ENV] = marker  # the run's session id: unique, never reused
         return env
 
     def _argv(
@@ -778,7 +800,7 @@ class ClaudeRunner:
             "--setting-sources",
             "project",
             "--settings",
-            json.dumps({"sandbox": {"enabled": False}, "autoUpdates": False}),
+            json.dumps({"sandbox": {"enabled": False}}),
             "--append-system-prompt",
             RUNNER_PROMPT.format(branch=p.branch),
             "--max-turns",
@@ -815,7 +837,7 @@ class ClaudeRunner:
                 self._argv(run, p, params, api_billing=bool(w.secrets.anthropic_key)), params
             )
         )
-        env = self._env(params, run.code, w.secrets)
+        env = self._env(params, run.session_id, w.secrets)
         prompt = (RESUME_PROMPT if run.sessions else run.ask).encode()
         writer = TranscriptWriter(self.transcript_dir / f"{run.code}.jsonl", w.redactor)
         state = StreamState()
@@ -838,7 +860,7 @@ class ClaudeRunner:
             created = psutil.Process(proc.pid).create_time()
         except psutil.Error:
             created = time.time()
-        target = Target(proc.pid, proc.pid, created, run_dir=p.run_dir, marker=run.code)
+        target = Target(proc.pid, proc.pid, created, run_dir=p.run_dir, marker=run.session_id)
         self._live[run.code] = target
         runs.set_process(self.conn, run.code, proc.pid, proc.pid, created)
         stop = await self._supervise(w, run, p, proc, target, writer, state, prompt)
@@ -857,8 +879,9 @@ class ClaudeRunner:
             tokens_in=_int(usage.get("input_tokens")),
             tokens_out=_int(usage.get("output_tokens")),
         )
-        runs.clear_process(self.conn, run.code)
         run = self._must_get(run.code)
+        if run.pgid is not None:  # the tree wouldn't die: never harvest under a live session
+            return await self._fail(run, "the session's processes wouldn't stop", w.redactor)
         if stop == "cancelled":
             raise _Cancelled
         if stop == "timeout":
@@ -867,6 +890,11 @@ class ClaudeRunner:
             over = _size(self.disk_limit_bytes)
             return await self._fail(
                 run, f"used over {over} of disk (work kept: /runs {run.code})", w.redactor
+            )
+        if stop == "cache":
+            over = _size(self.cache_limit_bytes)
+            return await self._fail(
+                run, f"the runner cache grew over {over} (work kept: /runs {run.code})", w.redactor
             )
         if result is not None and (hit := usage_limit(result)) is not None:
             return self._wait_for_limit(w, run, hit)
@@ -898,10 +926,15 @@ class ClaudeRunner:
 
         async def pump_out() -> None:
             assert proc.stdout
+            counted = False
             async for raw, truncated in read_lines(proc.stdout):
                 writer.write(raw, truncated)
                 if not truncated:
                     state.feed(raw)
+                if state.session_id and not counted:
+                    # Only a session Claude has written can be resumed.
+                    counted = True
+                    runs.mark_session(self.conn, run.code)
 
         async def pump_err() -> None:
             assert proc.stderr
@@ -912,10 +945,22 @@ class ClaudeRunner:
             nonlocal stop
             stop = stop or "disk"
 
+        async def cache_exceeded(_size: int) -> None:
+            nonlocal stop
+            stop = stop or "cache"
+
         pumps = [asyncio.create_task(c) for c in (feed(), pump_out(), pump_err())]
         disk = asyncio.create_task(
             watch_disk(
                 p.run_dir, self.disk_limit_bytes, disk_exceeded, interval_s=self.disk_interval_s
+            )
+        )
+        cache = asyncio.create_task(
+            watch_disk(
+                self.cfg.cache_dir,
+                self.cache_limit_bytes,
+                cache_exceeded,
+                interval_s=self.disk_interval_s,
             )
         )
         exited = asyncio.create_task(proc.wait())
@@ -945,14 +990,16 @@ class ClaudeRunner:
         finally:
             # Also on cancellation: nothing of the session may outlive the step.
             disk.cancel()
-            await reaper.reap(target, grace_s=self.kill_grace_s)
+            cache.cancel()
+            hurry = stop == "cancelled" or sys.exc_info()[0] is not None
+            await reaper.reap(target, grace_s=self.cancel_grace_s if hurry else self.kill_grace_s)
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), 5)
             exited.cancel()
             done_pumps, pending = await asyncio.wait(pumps, timeout=5)
             for t in pending:
                 t.cancel()
-            await asyncio.wait([*done_pumps, *pending, disk, exited])
+            await asyncio.wait([*done_pumps, *pending, disk, cache, exited])
             self._live.pop(run.code, None)
             writer.note("exit", code=proc.returncode, stop=stop)
             writer.close()
@@ -997,6 +1044,7 @@ class ClaudeRunner:
         now = self.clock()
         wake = wake_time(hit, now)
         runs.update(self.conn, run.code, status="waiting", waiting_since=now)
+        self._pulse_open(self._must_get(run.code), "waiting")
         return Wait("usage_reset", dict(w.task.checkpoint), wake)
 
     def _end_wait(self, run: Run) -> Run:
@@ -1013,7 +1061,7 @@ class ClaudeRunner:
     async def _harvest(self, w: _Work, run: Run, p: Prepared) -> Run:
         self._check_stop(run.code)
         params = self._params(p.run_dir)
-        env = self._env(params, run.code, None)  # no token: the harvest doesn't need one
+        env = self._env(params, run.session_id, None)  # no token: the harvest doesn't need one
         env.update(committer_env())
         await self.workspace.harvest(p, lambda argv: self._wrap(argv, params), env)
         self._check_stop(run.code)
@@ -1089,9 +1137,10 @@ class ClaudeRunner:
         pulse item cleared, and (once) the reply. Safe to repeat."""
         async with self._cleanup_locks.setdefault(code, asyncio.Lock()):
             run = self._must_get(code)
-            target = self._live.get(code)
-            if target is not None:
-                await reaper.reap(target, grace_s=self.kill_grace_s)
+            # The live session if there is one, and anything else of the run (a harvest
+            # still going) by marker and cwd: nothing may outlive the dir deleted below.
+            target = self._live.get(code) or self._target(run)
+            await reaper.reap(target, grace_s=self.cancel_grace_s)
             with contextlib.suppress(Exception):
                 # two deletes of one tree would trip over each other, hence the lock
                 await _finish_thread(delete_run_dir, self.cfg.work_dir, code)
@@ -1204,7 +1253,8 @@ class ClaudeRunner:
         """The ``normal`` pulse item while a run goes: mentioned by the next hourly pulse."""
         started = run.started_at or self.clock()
         at = started.astimezone(self.tz).strftime("%H:%M")
-        title = f"{run.code} still running · {run.repo} · started {at}"
+        what = "waiting for usage reset" if bucket == "waiting" else "still running"
+        title = f"{run.code} {what} · {run.repo} · started {at}"
         state = {"bucket": bucket or _bucket(run.session_seconds)}
         now = self.clock()
         with atomic(self.conn):
@@ -1289,12 +1339,12 @@ CLEANUP_SCHEDULE = "30 4 * * *"
 def cleanup_job(deps: CoreDeps) -> CoreJob | None:
     """The ``CORE_JOBS`` factory: delete run dirs that ended more than ``runner.keep_days``
     ago, prune the cache to ``runner.max_cache_gb`` and wipe stale token dirs. None when no
-    repo is configured (there is nothing to clean)."""
+    repo is configured and no run or cache dir exists."""
     from resonant.extensions.scheduler import CoreJob
 
     cfg, conn = deps.settings.runner, deps.conn
-    if not cfg.repos:
-        return None
+    if not cfg.repos and not (cfg.work_dir.exists() or cfg.cache_dir.exists()):
+        return None  # nothing configured and nothing on disk
 
     async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         result = await asyncio.to_thread(

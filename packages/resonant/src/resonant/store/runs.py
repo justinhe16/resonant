@@ -248,11 +248,19 @@ def cancel(conn: sqlite3.Connection, code: str, reason: str) -> bool:
 
 
 def set_process(conn: sqlite3.Connection, code: str, pgid: int, pid: int, started: float) -> None:
-    """Record the live session's process, and count the session."""
+    """Record the live session's process."""
     conn.execute(
         "UPDATE runs SET pgid = ?, leader_pid = ?, leader_started_at = ?,"
-        " sessions = sessions + 1, updated_at = ? WHERE code = ?",
+        " updated_at = ? WHERE code = ?",
         (pgid, pid, started, now_iso(), code),
+    )
+
+
+def mark_session(conn: sqlite3.Connection, code: str) -> None:
+    """Claude's first message of a session arrived: it exists, so it can be resumed."""
+    conn.execute(
+        "UPDATE runs SET sessions = sessions + 1, updated_at = ? WHERE code = ?",
+        (now_iso(), code),
     )
 
 

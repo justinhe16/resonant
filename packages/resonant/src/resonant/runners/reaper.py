@@ -35,7 +35,7 @@ import psutil
 
 START_TOLERANCE_S = 1.0
 GRACE_S = 10.0
-POLL_S = 0.1
+POLL_S = 0.5  # between full rescans of the process table
 KILL_WAIT_S = 5.0
 MARKER_ENV = "RESONANT_RUN"
 
@@ -109,7 +109,7 @@ def _marked(t: Target) -> list[psutil.Process]:
                 continue
             if t.marker is not None and proc.environ().get(MARKER_ENV) == t.marker:
                 out.append(proc)
-            elif run_dir is not None:
+            elif run_dir is not None and not proc.terminal():  # not the owner's terminal
                 cwd = os.path.realpath(proc.cwd())
                 if cwd == run_dir or cwd.startswith(run_dir + os.sep):
                     out.append(proc)
