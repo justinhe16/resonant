@@ -1,5 +1,11 @@
-"""The runner's workspace: mirror, clone, bundle handback, push, PR and merge
-(docs/phase5a-plan.md D3).
+"""The runner's workspace: mirror, clone, the session's credentials, PR discovery and merge
+(docs/phase5a-plan.md D3, docs/repos-plan.md D10).
+
+On a ``push`` repo the Claude session pushes its own branch and opens the PR with a per-run
+GitHub App token (``write_session_credentials``); this module finds the PR afterwards and, before
+any merge, fetches its head into the mirror and runs the checks. The bundle handback and the
+daemon-driven push and PR (``harvest``, ``import_bundle``, ``check``, ``publish``) stay for the
+fork mode, where the daemon still publishes.
 
 Trust rules this module keeps:
 
@@ -16,9 +22,14 @@ Trust rules this module keeps:
   ``core.hooksPath=/dev/null``, no credential helper and an absolute git binary. The
   committer comes from the environment, never from a config file.
 - Once the session starts, the daemon runs git only in the mirror. In the clone it runs
-  three commands, all in ``prepare``, before any sandboxed process exists. The bundle the
-  session leaves behind is read by file descriptor and fetched into the mirror with fsck.
-- The daemon writes nothing into a run dir after ``prepare``.
+  four commands, all in ``prepare``, before any sandboxed process exists. What the session
+  leaves behind arrives in the mirror by ``git fetch`` with fsck (the PR's branch) or, for a
+  bundle, by file descriptor and fsck.
+- The session's own token (a one-repo App installation token, see ``github_app``) lives in a
+  0700 ``creds`` dir inside the run dir, which the session can read: a credential helper
+  script, a ``token`` file and a ``gh/hosts.yml``. It is never in env or argv. The daemon
+  writes there only through directory fds with ``O_NOFOLLOW`` and ``rename``, so a link planted
+  by the session can't redirect a write.
 - Accepted risk: the package cache (``runner.cache_dir``) is shared between runs, so one run
   can poison it for the next; it sits inside the same sandbox and nothing else uses it.
 """
@@ -38,11 +49,12 @@ import tempfile
 from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from resonant.config import RunnerConfig
 from resonant.redact import Redactor
 from resonant.runner.checks import (
+    CheckFailed,
     CheckResult,
     GitError,
     GitRunner,
@@ -68,6 +80,8 @@ _SAFE_PATH = "/usr/bin:/bin"
 _PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _ERR_CLIP = 300
+CREDS_DIR = "creds"
+_PR_FIELDS = "state,headRefName,headRefOid,baseRefName,isCrossRepository,title,body"
 
 # Run inside the sandbox: commit anything left over, then bundle base..branch.
 # argv: repo, out.bundle, base sha, branch, git, commit message.
@@ -200,6 +214,107 @@ def write_gh_config(dir_: Path, token: str) -> Path:
     return config
 
 
+# --- the session's credentials -----------------------------------------------------------
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _hosts_yml(token: str) -> str:
+    return f"github.com:\n    oauth_token: {token}\n    git_protocol: https\n"
+
+
+def _plain_dir(parent_fd: int | None, name: str | Path, *, create: bool) -> int:
+    """An fd for a directory of ours below ``parent_fd`` (or at an absolute path), never
+    through a link, created 0700 when ``create``. The session can write the run dir, so each
+    step is checked."""
+    try:
+        if parent_fd is not None and create:
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+        fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as e:
+        raise RunnerError("the session's credential dir isn't a plain directory") from e
+    if os.fstat(fd).st_uid != os.getuid():
+        os.close(fd)
+        raise RunnerError("the session's credential dir isn't ours")
+    if create:
+        os.fchmod(fd, 0o700)
+    return fd
+
+
+def _replace_file(dir_fd: int, name: str, text: str, mode: int) -> None:
+    """Atomically put ``text`` at ``name``: a new file beside it, then ``rename``. A planted
+    symlink or hard link at ``name`` is replaced, never written through."""
+    tmp = f".{name}.new"
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(tmp, dir_fd=dir_fd)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode,
+                 dir_fd=dir_fd)  # fmt: skip
+    try:
+        os.write(fd, text.encode())
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+    try:
+        os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp, dir_fd=dir_fd)
+        raise RunnerError("the session's credential files can't be updated") from e
+
+
+def write_session_credentials(run_dir: Path, token: str) -> Path:
+    """Put the run's token where its session finds it: ``<run>/creds/token`` and
+    ``credential-helper`` (git) and ``creds/gh/hosts.yml`` (``gh``), 0700 dirs and 0600 files.
+    Creates them the first time and replaces them in place after (a refresh). Returns the dir.
+    ``run_dir`` is daemon-created; everything below it may have been touched by the session,
+    so nothing is followed."""
+    run_fd = _plain_dir(None, run_dir, create=False)
+    try:
+        creds_fd = _plain_dir(run_fd, CREDS_DIR, create=True)
+        try:
+            gh_fd = _plain_dir(creds_fd, "gh", create=True)
+            try:
+                _replace_file(creds_fd, "token", token + "\n", 0o600)
+                _replace_file(creds_fd, "credential-helper", CREDENTIAL_HELPER, 0o700)
+                _replace_file(gh_fd, "hosts.yml", _hosts_yml(token), 0o600)
+            finally:
+                os.close(gh_fd)
+        finally:
+            os.close(creds_fd)
+    finally:
+        os.close(run_fd)
+    return run_dir / CREDS_DIR
+
+
+def read_session_token(run_dir: Path) -> str | None:
+    """The token last written for the run, or None (no file, not a plain file, too big). For
+    revoking a token a crash left behind."""
+    try:
+        run_fd = _plain_dir(None, run_dir, create=False)
+        try:
+            creds_fd = _plain_dir(run_fd, CREDS_DIR, create=False)
+            try:
+                fd = os.open("token", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                             dir_fd=creds_fd)  # fmt: skip
+            finally:
+                os.close(creds_fd)
+        finally:
+            os.close(run_fd)
+    except (OSError, RunnerError):
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        raw = os.read(fd, 4096)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    token = raw.decode(errors="replace").strip()
+    return token if token and "\n" not in token and len(raw) < 4096 else None
+
+
 async def _read_limited(stream: asyncio.StreamReader, limit: int | None) -> bytes:
     buf = bytearray()
     while chunk := await stream.read(1 << 16):
@@ -314,6 +429,10 @@ class Prepared:
         return self.run_dir / "out.bundle"
 
     @property
+    def creds_dir(self) -> Path:
+        return self.run_dir / CREDS_DIR
+
+    @property
     def run_ref(self) -> str:
         return f"refs/runs/{self.code.lower()}"
 
@@ -322,6 +441,21 @@ class Prepared:
 class PullRequest:
     number: int
     url: str
+
+
+@dataclass(frozen=True)
+class PrInfo:
+    """A PR the session opened, as ``gh pr list`` reports it."""
+
+    number: int
+    url: str
+    state: str  # OPEN, CLOSED or MERGED
+    base: str
+    head_sha: str
+    files: int | None
+
+
+CiState = Literal["green", "red", "pending", "none", "error"]
 
 
 StillOk = Callable[[], Awaitable[bool]]
@@ -468,8 +602,8 @@ class Workspace:
 
     async def prepare(self, code: str, repo_name: str, ask: str, *, github_token: str) -> Prepared:
         """Refresh the mirror, check the repo has CI, clone it into ``<work_dir>/<code>/repo``
-        and branch. The only daemon-side git in the clone, and it happens before the session
-        exists.
+        and branch, with the credential helper set (and an empty ``creds`` dir for it). The
+        only daemon-side git in the clone, and it happens before the session exists.
 
         Invariant for the sandbox (P5A-1 probes it): the only sandbox-writable path is
         ``<work_dir>/<code>`` (plus the cache), so ``work_dir`` and the mirror dir are never
@@ -505,7 +639,7 @@ class Workspace:
             await asyncio.to_thread(rmtree_nofollow, run_dir)
             run_dir.mkdir(mode=0o700)
             try:
-                for sub in ("home", "tmp"):
+                for sub in ("home", "tmp", CREDS_DIR):
                     (run_dir / sub).mkdir(mode=0o700)
                 await self._git(
                     [
@@ -522,6 +656,18 @@ class Workspace:
                     cwd=run_dir,
                 )
                 await self._git(["-C", str(repo_dir), "remote", "set-url", "origin", url])
+                # The helper reads the token file next to it; the path is no secret. The file
+                # is written when the session starts (``write_session_credentials``).
+                helper = run_dir / CREDS_DIR / "credential-helper"
+                await self._git(
+                    [
+                        "-C",
+                        str(repo_dir),
+                        "config",
+                        "credential.helper",
+                        f"!{shlex.quote(str(helper))}",
+                    ]
+                )
                 await self._git(["-C", str(repo_dir), "checkout", "-q", "-b", branch])
             except BaseException:
                 await asyncio.to_thread(rmtree_nofollow, run_dir)
@@ -733,25 +879,191 @@ class Workspace:
             raise RunnerError("gh pr create didn't print a PR URL")
         return PullRequest(int(match[1]), match[0])
 
+    # -- what the session left --
+
+    async def find_pr(self, repo_name: str, branch: str, secrets: RunnerSecrets) -> PrInfo | None:
+        """The PR the session opened for ``branch`` (``gh pr list --head``), or None. A PR
+        from a fork is ignored, and an open one wins over a closed one."""
+        repo = self._repo(repo_name)
+        listed = await self._gh(
+            ["pr", "list", "--repo", repo.slug, "--head", branch, "--state", "all", "--json",
+             "number,url,state,baseRefName,headRefOid,isCrossRepository,changedFiles"],
+            secrets,
+        )  # fmt: skip
+        if listed.returncode != 0:
+            raise RunnerError(f"gh pr list failed: {listed.stderr[-120:]}")
+        try:
+            items: list[Any] = json.loads(listed.stdout)
+        except ValueError:
+            raise RunnerError("gh pr list printed something unreadable") from None
+        found: list[PrInfo] = []
+        for item in items:
+            try:
+                url, head = str(item["url"]), str(item["headRefOid"])
+                files = item.get("changedFiles")
+                if item.get("isCrossRepository") or not _PR_URL.fullmatch(url):
+                    continue
+                if not _SHA.fullmatch(head):
+                    continue
+                found.append(
+                    PrInfo(
+                        int(item["number"]),
+                        url,
+                        str(item["state"]),
+                        str(item["baseRefName"]),
+                        head,
+                        files if isinstance(files, int) else None,
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        found.sort(key=lambda pr: (pr.state != "OPEN", -pr.number))
+        return found[0] if found else None
+
+    async def pushed_commits(self, p: Prepared, secrets: RunnerSecrets) -> int:
+        """How many commits ``p.branch`` has on the remote beyond the run's base (0 if the
+        branch was never pushed)."""
+        async with self.mirror_lock(p.repo_name):
+            await self._refresh(p.repo_name, secrets.github_token)
+            try:
+                out = await self._mirror_git(p.repo_name)(
+                    "rev-list", "--count", f"{p.base_sha}..refs/heads/{p.branch}"
+                )
+            except GitError:
+                return 0
+        return int(out.decode().strip() or 0)
+
+    async def ci_state(self, repo_name: str, pr_number: int, secrets: RunnerSecrets) -> CiState:
+        """The PR's checks: ``gh pr checks`` exits 0 (green), 8 (pending) or 1 (red, or none
+        reported)."""
+        repo = self._repo(repo_name)
+        checks = await self._gh(["pr", "checks", str(pr_number), "--repo", repo.slug], secrets)
+        if checks.returncode == 0:
+            return "green"
+        if checks.returncode == 8:
+            return "pending"
+        if checks.returncode == 1:
+            return "none" if "no checks reported" in checks.stderr else "red"
+        return "error"
+
+    async def check_pr(
+        self,
+        repo_name: str,
+        pr_number: int,
+        branch: str,
+        secrets: RunnerSecrets,
+        *,
+        expect_head: str | None = None,
+    ) -> CheckResult:
+        """The checks of docs/repos-plan.md D10, on the PR as it is now: fetch its head branch
+        into the mirror (with fsck: the session wrote it), then run ``run_checks`` over
+        ``merge-base..head`` plus a token scan of the PR's title and body. Raises
+        ``MergeRefused`` (the PR isn't mergeable as it stands) or ``CheckFailed`` (the checks
+        refuse it). With ``expect_head`` the PR must still be at that commit."""
+        repo = self._repo(repo_name)
+        if pr_number < 1 or not re.fullmatch(r"[\w./-]+", branch) or ".." in branch:
+            raise MergeRefused("bad PR reference")
+        viewed = await self._gh(
+            ["pr", "view", str(pr_number), "--repo", repo.slug, "--json", _PR_FIELDS], secrets
+        )
+        if viewed.returncode != 0:
+            raise MergeRefused(f"couldn't read the PR (gh pr view: {viewed.stderr[-120:]})")
+        try:
+            pr = json.loads(viewed.stdout)
+            state, head_ref, head, base = (
+                str(pr[k]) for k in ("state", "headRefName", "headRefOid", "baseRefName")
+            )
+            cross, title, body = bool(pr["isCrossRepository"]), str(pr["title"]), str(pr["body"])
+        except (ValueError, KeyError, TypeError):
+            raise MergeRefused("the PR couldn't be read") from None
+        if state != "OPEN":
+            raise MergeRefused(f"PR #{pr_number} is {state.lower()}, not open")
+        if cross or head_ref != branch:
+            raise MergeRefused(f"PR #{pr_number} isn't the run's branch")
+        if base != repo.base:
+            raise MergeRefused(f"PR #{pr_number} targets {base}, not {repo.base}")
+        if not _SHA.fullmatch(head):
+            raise MergeRefused("the PR's head commit couldn't be read")
+        if expect_head is not None and head != expect_head:
+            raise MergeRefused(
+                f"PR #{pr_number} changed since the run finished (head {head[:7]}, "
+                f"was {expect_head[:7]})"
+            )
+        ref = f"refs/runs/pr-{pr_number}"
+        mirror = self.mirror_path(repo_name)
+        async with self.mirror_lock(repo_name):
+            await self._ensure_mirror(repo_name)
+            try:
+                await self._git(
+                    ["-C", str(mirror), "-c", "transfer.fsckObjects=true",
+                     "-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-tags",
+                     "--no-write-fetch-head", self._url_for(repo), f"+refs/heads/{branch}:{ref}"],
+                    token=secrets.github_token,
+                )  # fmt: skip
+            except GitError as e:
+                raise MergeRefused(f"fetching the PR's branch failed: {e.message[-120:]}") from None
+            await self._refresh(repo_name, secrets.github_token)  # the base as it is now
+            git = self._mirror_git(repo_name)
+            try:
+                fetched = (await git("rev-parse", "--verify", ref)).decode().strip()
+                base_tip = (await git("rev-parse", "--verify", f"refs/heads/{repo.base}")).decode()
+                merge_base = (await git("merge-base", base_tip.strip(), fetched)).decode().strip()
+            except GitError:
+                raise MergeRefused("the PR's branch shares no history with its base") from None
+            if fetched != head:
+                raise MergeRefused(f"PR #{pr_number} moved while it was being checked")
+            result = await run_checks(
+                git,
+                base_sha=merge_base,
+                head_sha=fetched,
+                branch=branch,
+                repo=repo,
+                secrets=secrets.values(),
+            )
+        check_texts(secrets.values(), pr_title=title, pr_body=body)
+        return result
+
     # -- merge --
 
     async def merge(
-        self, repo_name: str, pr_number: int, head_sha: str, secrets: RunnerSecrets
-    ) -> None:
-        """Squash-merge a PR whose CI is green, only if its head is still ``head_sha``."""
+        self,
+        repo_name: str,
+        pr_number: int,
+        head_sha: str,
+        secrets: RunnerSecrets,
+        *,
+        branch: str,
+    ) -> CheckResult:
+        """Squash-merge a PR whose CI is green, only if its head is still ``head_sha``.
+
+        The only merge path, and it checks first: the PR's head is fetched into the mirror
+        and put through ``check_pr`` (tokens in the history, objects, paths and the PR text;
+        sensitive paths; ``.github`` changes refused unless the repo allows them), then CI,
+        then ``--match-head-commit``. Returns the check result (its flagged paths are what
+        the merge reply lists). Raises ``MergeRefused``."""
         repo = self._repo(repo_name)
         if not _SHA.fullmatch(head_sha) or pr_number < 1:
             raise MergeRefused("bad PR reference")
+        try:
+            result = await self.check_pr(
+                repo_name, pr_number, branch, secrets, expect_head=head_sha
+            )
+        except CheckFailed as e:
+            raise MergeRefused(f"the checks refuse it: {e}") from None
+        except GitError as e:
+            raise MergeRefused(f"checking the PR failed: {e.message[-120:]}") from None
         number = str(pr_number)
-        checks = await self._gh(["pr", "checks", number, "--repo", repo.slug], secrets)
-        if checks.returncode == 8:
-            raise MergeRefused("CI is still running")
-        if checks.returncode == 1 and "no checks reported" in checks.stderr:
-            raise MergeRefused("no CI checks reported for this PR")
-        if checks.returncode == 1:
-            raise MergeRefused("CI isn't green")
-        if checks.returncode != 0:
-            raise MergeRefused("couldn't read the CI checks (gh pr checks errored)")
+        match await self.ci_state(repo_name, pr_number, secrets):
+            case "pending":
+                raise MergeRefused("CI is still running")
+            case "none":
+                raise MergeRefused("no CI checks reported for this PR")
+            case "red":
+                raise MergeRefused("CI isn't green")
+            case "error":
+                raise MergeRefused("couldn't read the CI checks (gh pr checks errored)")
+            case "green":
+                pass
         merged = await self._gh(
             ["pr", "merge", number, "--repo", repo.slug, "--squash",
              "--match-head-commit", head_sha],
@@ -759,6 +1071,7 @@ class Workspace:
         )  # fmt: skip
         if merged.returncode != 0:
             raise MergeRefused(f"gh pr merge failed: {merged.stderr[-120:]}")
+        return result
 
 
 # --- the bundle read ---------------------------------------------------------------------

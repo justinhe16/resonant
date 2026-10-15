@@ -373,8 +373,20 @@ class RunnerRepo(_Section):
         return self.remote.removeprefix("github.com/")
 
 
+class GitHubAppConfig(_Section):
+    """The GitHub App that gives each run its own one-repo token (docs/repos-plan.md D10).
+    Both numbers are public identifiers; the private key is the Keychain item
+    ``runner/github_app_key``."""
+
+    app_id: int = Field(gt=0)
+    installation_id: int = Field(gt=0)
+
+
 class RunnerConfig(_Section):
     """The Claude runner (docs/phase5a-plan.md). Nothing here is secret."""
+
+    # The per-run token source. Without it the runner is not set up.
+    github_app: GitHubAppConfig | None = None
 
     # name -> repo. Only a seed: at startup these are imported into the repo registry (the
     # `repos` table) as source=owner, and the registry is what the runner reads. Repos not

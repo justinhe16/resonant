@@ -7,6 +7,10 @@ real CLI, and acts out one scenario, chosen by an extra ``--scenario NAME`` the 
 leaves notes for the test: ``argv.json`` (flags, env and the prompt of every invocation) and
 pid files.
 
+Like the real session (docs/repos-plan.md D10) it pushes its branch to ``origin``, opens the PR with
+``gh pr create`` and waits with ``gh pr checks --watch`` (both are the test's fake gh); ``--no-push``
+and ``--no-pr`` skip those, and ``--ci-fixes N`` makes it push N more commits as if CI had failed.
+
 Scenarios: happy, nochanges, slow, hang, hang_then_ok, escapee, usage_limit, error, maxturns,
 maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, makefile, github, noresult, tokens.
 """
@@ -40,6 +44,10 @@ ap.add_argument("--sleep", type=float, default=0.0)
 ap.add_argument("--leak", action="append", default=[])
 ap.add_argument("--reset-in", type=float, default=120.0)
 ap.add_argument("--file", default="claude-fix.txt")
+ap.add_argument("--no-push", action="store_true")
+ap.add_argument("--no-pr", action="store_true")
+ap.add_argument("--ci-fixes", type=int, default=0)
+ap.add_argument("--echo-token", action="store_true")
 args = ap.parse_args()
 
 prompt = sys.stdin.read()
@@ -73,6 +81,33 @@ def commit(files: dict[str, str], message: str = "Fix it") -> None:
     git("commit", "-q", "-m", message)
 
 
+def out(*argv: str) -> str:
+    """Run a tool the way the session does (PATH is the run-local bin) and note what it did."""
+    done = subprocess.run(argv, capture_output=True, text=True)
+    path = os.path.join(tmp, "tools.json")
+    calls = json.load(open(path)) if os.path.exists(path) else []
+    calls.append({"argv": list(argv), "rc": done.returncode, "stderr": done.stderr[-300:]})
+    note("tools.json", json.dumps(calls))
+    return done.stdout.strip()
+
+
+def deliver() -> None:
+    """Push the branch, open the PR and watch CI, as the prompt tells the session to."""
+    branch = out("git", "rev-parse", "--abbrev-ref", "HEAD")
+    if args.no_push:
+        return
+    out("git", "push", "-q", "-u", "origin", branch)
+    if args.no_pr:
+        return
+    out("gh", "pr", "create", "--base", "main", "--head", branch,
+        "--title", "Fix the flaky test", "--body", "Fixed by the fake session.")  # fmt: skip
+    out("gh", "pr", "checks", "--watch")
+    for i in range(args.ci_fixes):
+        commit({f"ci-fix-{i}.txt": "fix\n"}, f"Fix CI {i}")
+        out("git", "push", "-q", "origin", branch)
+        out("gh", "pr", "checks", "--watch")
+
+
 def result(text: str = "Fixed it.", **extra: Any) -> None:
     emit(
         {
@@ -93,6 +128,33 @@ log = os.path.join(tmp, "argv.json")
 history: list[Any] = json.load(open(log)) if os.path.exists(log) else []
 history.append({"argv": sys.argv[1:], "env": dict(os.environ), "prompt": prompt, "pid": os.getpid()})
 note("argv.json", json.dumps(history))
+
+
+def probe_creds(name: str = "creds.json") -> None:
+    """What the session can read of its own credentials, and of a sibling run's."""
+    creds = os.path.join(run_dir, "creds")
+
+    def read(path: str) -> str:
+        try:
+            return open(path).read().strip()
+        except OSError as e:
+            return f"ERR {e.errno}"
+
+    hosts = read(os.path.join(creds, "gh", "hosts.yml"))
+    token = ""
+    for line in hosts.splitlines():
+        if "oauth_token:" in line:
+            token = line.split(":", 1)[1].strip()
+    note(name, json.dumps({
+        "token": read(os.path.join(creds, "token")),
+        "hosts_token": token,
+        "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
+        "modes": [oct(os.stat(creds).st_mode & 0o777)],
+        "sibling": read(os.path.join(os.path.dirname(run_dir), "R9", "creds", "token")),
+    }))  # fmt: skip
+
+
+probe_creds()
 note("claude.pid", str(os.getpid()))
 
 if scenario == "preinit_hang":  # dies before Claude ever writes a session
@@ -171,6 +233,11 @@ if scenario == "disk":
 if args.sleep:
     time.sleep(args.sleep)
 
+if args.echo_token:  # a session that prints its own credentials into the transcript
+    creds = os.path.join(run_dir, "creds")
+    text = open(os.path.join(creds, "token")).read() + open(os.path.join(creds, "gh", "hosts.yml")).read()
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+
 files = {args.file: f"fixed by {session}\n"}
 if scenario == "makefile":
     files.update({"Makefile": "all:\n\ttrue\n", ".claude/settings.json": "{}\n"})
@@ -179,5 +246,7 @@ if scenario == "github":
 if scenario == "tokens":
     files[args.file] = " ".join(args.leak) + "\n"
 commit(files, "Fix the flaky test")
+probe_creds("creds-end.json")
+deliver()
 result("Fixed it. Added " + args.file + ".")
 sys.exit(0)

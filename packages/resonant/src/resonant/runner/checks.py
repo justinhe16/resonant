@@ -1,12 +1,14 @@
-"""Checks on a run's commits before anything is pushed (docs/phase5a-plan.md D3).
+"""Checks on a run's commits before anything is merged (docs/phase5a-plan.md D3, moved from
+before the push by docs/repos-plan.md D10, since the session pushes its own branch).
 
 They run on the commits fetched into the daemon's own mirror, through a ``GitRunner`` bound
 to the mirror: nothing here ever executes git in the run's clone.
 
 - **Refused** (``CheckFailed``, the message is the reason shown to the owner): a merge
   commit; a head that doesn't descend from the base; too many files, commits or bytes; a
-  change under ``.github/`` (unless the repo allows it), a ``.gitmodules`` change or a
-  submodule *in any commit of the history* (so adding then removing doesn't hide it); a runner
+  change under ``.github/`` (unless the repo allows it: then it is flagged), a
+  ``.gitmodules`` change or a submodule *in any commit of the history* (so adding then
+  removing doesn't hide it); a runner
   token (or anything shaped like one) in any commit's patch, raw commit object (author,
   committer, message), the branch name or the PR body.
 - **Flagged** (``CheckResult.flagged``): files a ``pull_request`` CI run or the owner's
@@ -134,7 +136,8 @@ def classify_path(path: str, *, allow_github: bool = False) -> tuple[str | None,
     if name == ".gitmodules":
         return "it changes .gitmodules", False
     flagged = (
-        any(part in _FLAGGED_DIRS for part in parts)
+        parts[0] == ".github"  # allowed, but the merge prompt and reply list it
+        or any(part in _FLAGGED_DIRS for part in parts)
         or name in _FLAGGED_NAMES
         or name.startswith(("dockerfile", ".yarnrc"))
         or (len(parts) >= 2 and parts[-2] == ".vscode" and name in ("tasks.json", "settings.json"))

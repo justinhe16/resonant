@@ -340,11 +340,18 @@ def runner_rows(
     exists: Callable[[str], bool] = _keychain_exists,
     has_ci: Callable[[Settings, str], bool | None] = _repo_has_ci,
 ) -> list[Row]:
-    """Phase 5a (docs/go-live.md step 14): the runs table, the runner's secrets (names only,
-    never values), and for each configured repo that it has CI on ``pull_request``. All
+    """Phase 5a (docs/go-live.md step 14): the runs table, the GitHub App config, the runner's
+    secrets (names only, never values), and for each configured repo that it has CI on
+    ``pull_request``. All
     advisory: a Mac with no runner repos configured is a valid install. The sandbox row is
     ``sandbox_row``."""
-    from resonant.secrets import ANTHROPIC_KEY_REF, CLAUDE_TOKEN_REF, GITHUB_TOKEN_REF, SecretError
+    from resonant.secrets import (
+        ANTHROPIC_KEY_REF,
+        CLAUDE_TOKEN_REF,
+        GITHUB_APP_KEY_REF,
+        GITHUB_TOKEN_REF,
+        SecretError,
+    )
 
     rows: list[Row] = []
     if version >= PHASE5A_SCHEMA:
@@ -356,6 +363,13 @@ def runner_rows(
         rows.append(("SKIP", False, "runner repos", "none in runner.repos (step 14)"))
     else:
         rows.append(("PASS", False, "runner repos", f"{len(repos)}: {', '.join(sorted(repos))}"))
+    app = settings.runner.github_app
+    if app is None:
+        why = "runner.github_app (app_id, installation_id) is not in the config: runs need it"
+        rows.append(("FAIL", False, "runner github app", why))
+    else:
+        detail = f"app {app.app_id}, installation {app.installation_id}"
+        rows.append(("PASS", False, "runner github app", detail))
 
     def present(ref: str) -> bool | str:
         try:
@@ -365,6 +379,11 @@ def runner_rows(
 
     for label, refs, how in (
         ("runner/github_token", (GITHUB_TOKEN_REF,), f"resonant secret set {GITHUB_TOKEN_REF}"),
+        (
+            "runner/github_app_key",
+            (GITHUB_APP_KEY_REF,),
+            f"store the GitHub App's private key as Keychain item {GITHUB_APP_KEY_REF}",
+        ),
         (
             "runner/claude_token (or runner/anthropic_key)",
             (CLAUDE_TOKEN_REF, ANTHROPIC_KEY_REF),

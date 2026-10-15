@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -84,6 +85,11 @@ elif args[:2] == ["pr", "create"]:
     open(prs, "w").write(json.dumps([{"number": 41, "url": url}]))
     print("Creating pull request...", file=sys.stderr)
     print(url)
+elif args[:2] == ["pr", "view"]:
+    view = os.path.join(d, "view.json")
+    if not os.path.exists(view):
+        sys.exit(1)
+    print(open(view).read())
 elif args[:2] == ["pr", "checks"]:
     err = os.path.join(d, "checks_err")
     if os.path.exists(err):
@@ -166,6 +172,27 @@ class Env:
     def gh_set(self, name: str, text: str) -> None:
         self.gh_dir.mkdir(parents=True, exist_ok=True)
         (self.gh_dir / name).write_text(text)
+
+    def set_pr(self, branch: str, head: str, **over: Any) -> None:
+        """What ``gh pr view``/``list`` say about PR 41."""
+        pr = {
+            "state": "OPEN", "headRefName": branch, "headRefOid": head, "baseRefName": "main",
+            "isCrossRepository": False, "title": "Fix the flaky test", "body": "Fixed.", **over,
+        }  # fmt: skip
+        self.gh_set("view.json", json.dumps(pr))
+        url = "https://github.com/own/proj/pull/41"
+        self.gh_set("prs.json", json.dumps([{"number": 41, "url": url, **pr}]))
+
+    async def open_pr(
+        self, files: dict[str, str] | None = None, *, message: str = "Fix it", **over: Any
+    ) -> tuple[Prepared, str]:
+        """A run whose session pushed its branch and opened PR 41 (plain git, the fake gh)."""
+        p = await self.prepare()
+        self.session(p, files or {"a.txt": "a\n"}, message)
+        git(p.repo_dir, "push", "-q", str(self.remote), p.branch)
+        head = git(p.repo_dir, "rev-parse", "HEAD")
+        self.set_pr(p.branch, head, **over)
+        return p, head
 
     def remote_branches(self) -> list[str]:
         out = git(self.remote, "for-each-ref", "--format=%(refname:short)", "refs/heads")
@@ -267,9 +294,11 @@ async def test_missing_and_loaded_runner_secrets() -> None:
     store = SecretStore(kc)
     assert await secrets_mod.missing_runner_secrets(store) == [
         "runner/github_token",
+        "runner/github_app_key",
         "runner/claude_token (or runner/anthropic_key)",
     ]
     kc.items["runner/github_token"] = GH_TOKEN
+    kc.items["runner/github_app_key"] = "LS0tLS1CRUdJTiBmYWtl"
     kc.items["runner/anthropic_key"] = "sk-ant-api03-abcdefgh"
     assert await secrets_mod.missing_runner_secrets(store) == []
     loaded = await secrets_mod.load_runner_secrets(store)
@@ -684,17 +713,18 @@ async def test_gh_create_failure_is_a_clean_error(env: Env) -> None:
 
 
 async def test_merge_needs_green_ci_and_matches_head(env: Env) -> None:
-    sha = "a" * 40
+    p, sha = await env.open_pr()
     env.gh_set("checks_rc", "1")
     with pytest.raises(MergeRefused, match="isn't green"):
-        await env.ws.merge("proj", 41, sha, SECRETS)
+        await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
     env.gh_set("checks_rc", "8")
     with pytest.raises(MergeRefused, match="still running"):
-        await env.ws.merge("proj", 41, sha, SECRETS)
+        await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
     assert not env.gh_calls("merge")
 
     env.gh_set("checks_rc", "0")
-    await env.ws.merge("proj", 41, sha, SECRETS)
+    result = await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
+    assert result.head_sha == sha and result.files == 1 and result.flagged == ()
     merge = env.gh_calls("merge")[0]
     argv: list[str] = merge["argv"]  # type: ignore[assignment]
     assert argv[:3] == ["pr", "merge", "41"]
@@ -704,13 +734,153 @@ async def test_merge_needs_green_ci_and_matches_head(env: Env) -> None:
 
 
 async def test_merge_failure_and_bad_input(env: Env) -> None:
+    p, sha = await env.open_pr()
     env.gh_set("merge_rc", "1")
     with pytest.raises(MergeRefused, match="gh pr merge failed"):
-        await env.ws.merge("proj", 41, "b" * 40, SECRETS)
+        await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
     with pytest.raises(MergeRefused, match="bad PR"):
-        await env.ws.merge("proj", 41, "--admin", SECRETS)
+        await env.ws.merge("proj", 41, "--admin", SECRETS, branch=p.branch)
     with pytest.raises(MergeRefused, match="bad PR"):
-        await env.ws.merge("proj", 0, "b" * 40, SECRETS)
+        await env.ws.merge("proj", 0, sha, SECRETS, branch=p.branch)
+    with pytest.raises(MergeRefused, match="bad PR"):
+        await env.ws.merge("proj", 41, sha, SECRETS, branch="--upload-pack=x")
+
+
+# --- the checks before a merge (docs/repos-plan.md D10) ---------------------------------------
+
+
+async def _refused(env: Env, p: Prepared, head: str, match: str) -> None:
+    env.gh_set("checks_rc", "0")
+    with pytest.raises(MergeRefused, match=match):
+        await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
+    assert env.gh_calls("merge") == []  # never reached the merge
+
+
+async def test_merge_refuses_a_github_change(env: Env) -> None:
+    p, head = await env.open_pr({".github/workflows/x.yml": "on: push\n"})
+    await _refused(env, p, head, r"the checks refuse it: it changes \.github/")
+
+
+async def test_merge_lists_a_github_change_when_the_repo_allows_it(env: Env) -> None:
+    env.conn.execute("UPDATE repos SET allow_github_changes = 1")
+    p, head = await env.open_pr({".github/workflows/x.yml": "on: push\n", "Makefile": "all:\n"})
+    env.gh_set("checks_rc", "0")
+    result = await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
+    assert result.flagged == (".github/workflows/x.yml", "Makefile")
+    assert len(env.gh_calls("merge")) == 1
+
+
+async def test_merge_refuses_a_token_in_the_history_even_if_removed(env: Env) -> None:
+    p = await env.prepare()
+    env.session(p, {"leak.txt": f"{GH_TOKEN}\n"}, "add")
+    git(p.repo_dir, "rm", "-q", "leak.txt")
+    git(p.repo_dir, "commit", "-q", "-m", "remove it again")
+    git(p.repo_dir, "push", "-q", str(env.remote), p.branch)
+    head = git(p.repo_dir, "rev-parse", "HEAD")
+    env.set_pr(p.branch, head)
+    env.gh_set("checks_rc", "0")
+    with pytest.raises(MergeRefused, match="a token appears") as e:
+        await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
+    assert GH_TOKEN not in str(e.value) and env.gh_calls("merge") == []
+
+
+async def test_merge_refuses_a_token_shaped_string_in_a_commit_message(env: Env) -> None:
+    p, head = await env.open_pr(message="use ghs_" + "A" * 36)
+    await _refused(env, p, head, "a token appears in the commit object")
+
+
+async def test_merge_refuses_a_token_in_the_pr_text(env: Env) -> None:
+    p, _head = await env.open_pr(body=f"see {CLAUDE_TOKEN}")
+    env.gh_set("checks_rc", "0")
+    with pytest.raises(CheckFailed, match="pr body"):
+        await env.ws.check_pr("proj", 41, p.branch, SECRETS)
+
+
+async def test_merge_refuses_a_merge_commit_and_a_submodule(env: Env) -> None:
+    p = await env.prepare()
+    env.session(p, {"a.txt": "a\n"})
+    git(p.repo_dir, "update-index", "--add", "--cacheinfo", f"160000,{p.base_sha},sub")
+    git(p.repo_dir, "commit", "-q", "-m", "sub")
+    git(p.repo_dir, "push", "-q", str(env.remote), p.branch)
+    head = git(p.repo_dir, "rev-parse", "HEAD")
+    env.set_pr(p.branch, head)
+    await _refused(env, p, head, "submodule")
+
+
+async def test_merge_refuses_a_pr_that_changed_or_isnt_the_runs(env: Env) -> None:
+    p, head = await env.open_pr()
+    env.gh_set("checks_rc", "0")
+    with pytest.raises(MergeRefused, match="changed since the run finished"):
+        await env.ws.merge("proj", 41, "c" * 40, SECRETS, branch=p.branch)
+    for over, match in (
+        ({"state": "MERGED"}, "is merged, not open"),
+        ({"state": "CLOSED"}, "is closed, not open"),
+        ({"baseRefName": "develop"}, "targets develop"),
+        ({"isCrossRepository": True}, "isn't the run's branch"),
+        ({"headRefName": "other"}, "isn't the run's branch"),
+    ):
+        env.set_pr(p.branch, head, **over)
+        await _refused(env, p, head, match)
+    env.gh_dir.joinpath("view.json").unlink()
+    await _refused(env, p, head, "couldn't read the PR")
+
+
+async def test_merge_notices_a_branch_that_moved_after_the_view(env: Env) -> None:
+    p, head = await env.open_pr()
+    env.session(p, {"b.txt": "b\n"}, "later")
+    git(p.repo_dir, "push", "-q", str(env.remote), p.branch)
+    await _refused(env, p, head, "moved while it was being checked")
+
+
+async def test_pr_branch_is_fetched_with_fsck(env: Env) -> None:
+    p, _head = await env.open_pr()
+    env.gh_set("checks_rc", "0")
+    await env.ws.check_pr("proj", 41, p.branch, SECRETS)
+    fetches = [line for line in env.shim_log.read_text().splitlines() if " fetch " in f" {line} "]
+    pr_fetch = next(line for line in fetches if "refs/runs/pr-41" in line)
+    assert "transfer.fsckObjects=true" in pr_fetch and "fetch.fsckObjects=true" in pr_fetch
+    assert git(env.ws.mirror_path("proj"), "rev-parse", "refs/runs/pr-41") == _head
+
+
+async def test_find_pr_ignores_forks_and_prefers_an_open_pr(env: Env) -> None:
+    url = "https://github.com/own/proj/pull/%d"
+    sha = "a" * 40
+
+    def pr(n: int, **over: Any) -> dict[str, Any]:
+        return {
+            "number": n, "url": url % n, "state": "OPEN", "baseRefName": "main", "headRefOid": sha,
+            "isCrossRepository": False, "changedFiles": 2, **over,
+        }  # fmt: skip
+
+    assert await env.ws.find_pr("proj", "b", SECRETS) is None  # nothing listed
+    env.gh_set("prs.json", json.dumps([pr(7, state="CLOSED"), pr(9, isCrossRepository=True)]))
+    found = await env.ws.find_pr("proj", "b", SECRETS)
+    assert found is not None and (found.number, found.state, found.files) == (7, "CLOSED", 2)
+    env.gh_set("prs.json", json.dumps([pr(7, state="CLOSED"), pr(8), pr(9, state="MERGED")]))
+    found = await env.ws.find_pr("proj", "b", SECRETS)
+    assert found is not None and found.number == 8
+    env.gh_set("prs.json", json.dumps([{"number": 1, "url": "http://evil/x"}]))
+    assert await env.ws.find_pr("proj", "b", SECRETS) is None  # a bad url is no PR
+    listed = env.gh_calls("list")[-1]["argv"]
+    assert "--head" in listed and "--state" in listed
+
+
+async def test_pushed_commits_counts_the_branch_beyond_the_base(env: Env) -> None:
+    p = await env.prepare()
+    assert await env.ws.pushed_commits(p, SECRETS) == 0  # never pushed
+    env.session(p, {"a.txt": "a\n"})
+    env.session(p, {"b.txt": "b\n"})
+    git(p.repo_dir, "push", "-q", str(env.remote), p.branch)
+    assert await env.ws.pushed_commits(p, SECRETS) == 2
+
+
+async def test_ci_state(env: Env) -> None:
+    for rc, err, want in (("0", "", "green"), ("8", "", "pending"), ("1", "", "red"),
+                          ("1", "no checks reported on the 'x' branch", "none"),
+                          ("4", "", "error")):  # fmt: skip
+        env.gh_set("checks_rc", rc)
+        env.gh_set("checks_err", err)
+        assert await env.ws.ci_state("proj", 41, SECRETS) == want
 
 
 # --- cleanup ---------------------------------------------------------------------------------
@@ -938,16 +1108,17 @@ async def test_push_sends_the_checked_head_and_neutralizes_mentions(env: Env) ->
 
 
 async def test_merge_distinguishes_no_ci_checks(env: Env) -> None:
+    p, sha = await env.open_pr()
     env.gh_set("checks_rc", "1")
     env.gh_set("checks_err", "no checks reported on the 'x' branch")
     with pytest.raises(MergeRefused, match="no CI checks reported"):
-        await env.ws.merge("proj", 41, "a" * 40, SECRETS)
+        await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
     env.gh_set("checks_err", "")
     with pytest.raises(MergeRefused, match="isn't green"):
-        await env.ws.merge("proj", 41, "a" * 40, SECRETS)
+        await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
     env.gh_set("checks_rc", "4")
     with pytest.raises(MergeRefused, match="errored"):
-        await env.ws.merge("proj", 41, "a" * 40, SECRETS)
+        await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
 
 
 def _deep(root: Path, depth: int) -> None:
@@ -1078,8 +1249,9 @@ async def test_no_token_in_any_child_env_or_argv(env: Env) -> None:
     head = await env.deliver(p, {"a.txt": "a\n"})
     result = await env.ws.check(p, head, SECRETS)
     await env.ws.publish(p, result, SECRETS, ask="x", summary="s", still_ok=always)
+    env.set_pr(p.branch, head)
     env.gh_set("checks_rc", "0")
-    await env.ws.merge("proj", 41, head, SECRETS)
+    await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
 
     git_seen = env.shim_log.read_text() + env.env_log.read_text()
     assert "credential.helper" in env.env_log.read_text()  # the helper path was passed
@@ -1114,7 +1286,7 @@ async def test_secret_files_removed_after_failure(env: Env) -> None:
         slow.write_text("#!/bin/sh\nsleep 30\n")
         slow.chmod(0o755)
         env.cfg.gh_path = slow
-        await asyncio.wait_for(env.ws.merge("proj", 41, "a" * 40, SECRETS), 1)
+        await asyncio.wait_for(env.ws.merge("proj", 41, "a" * 40, SECRETS, branch="b"), 1)
     assert _leftovers(env) == []
 
 
@@ -1200,3 +1372,111 @@ async def test_workspace_takes_only_the_registry_name_and_never_publishes_to_a_f
     with pytest.raises(RunnerError, match="Upstream PRs come in a later update"):
         await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)
     assert env.gh_calls() == [] and env.remote_branches() == ["main"]
+
+
+# --- the session's credentials (docs/repos-plan.md D10) ----------------------------------------
+
+SESSION_TOKEN = "ghs_" + "Sess10nT0ken" * 3
+
+
+async def test_prepare_sets_the_session_credential_helper(env: Env) -> None:
+    p = await env.prepare()
+    assert p.creds_dir == p.run_dir / "creds"
+    assert stat.S_IMODE(p.creds_dir.stat().st_mode) == 0o700 and list(p.creds_dir.iterdir()) == []
+    config = (p.repo_dir / ".git" / "config").read_text()
+    assert f"helper = !{p.creds_dir}/credential-helper" in config
+    assert git(p.repo_dir, "remote", "get-url", "origin") == str(env.remote)
+
+
+def test_session_credentials_files_and_modes(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    run.mkdir(mode=0o700)
+    creds = workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+    assert creds == run / "creds"
+    modes = {str(f.relative_to(creds)): stat.S_IMODE(f.stat().st_mode) for f in creds.rglob("*")}
+    assert modes == {
+        "token": 0o600,
+        "credential-helper": 0o700,
+        "gh": 0o700,
+        "gh/hosts.yml": 0o600,
+    }
+    assert stat.S_IMODE(creds.stat().st_mode) == 0o700
+    assert (creds / "token").read_text() == SESSION_TOKEN + "\n"
+    assert f"oauth_token: {SESSION_TOKEN}" in (creds / "gh" / "hosts.yml").read_text()
+    # git gets it through the helper, exactly like the daemon's own calls do
+    out = subprocess.run(
+        [GIT, "credential", "fill"],
+        env=git_env(creds / "credential-helper"),
+        input="protocol=https\nhost=github.com\n\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert f"password={SESSION_TOKEN}" in out
+    assert workspace_mod.read_session_token(run) == SESSION_TOKEN
+
+
+def test_session_credentials_are_refreshed_in_place(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    run.mkdir(mode=0o700)
+    creds = workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+    names = sorted(str(f.relative_to(creds)) for f in creds.rglob("*"))
+    again = workspace_mod.write_session_credentials(run, "ghs_" + "N3wT0ken" * 5)
+    assert again == creds and sorted(str(f.relative_to(creds)) for f in creds.rglob("*")) == names
+    assert (creds / "token").read_text() == "ghs_" + "N3wT0ken" * 5 + "\n"
+    assert "N3wT0ken" in (creds / "gh" / "hosts.yml").read_text()
+    assert SESSION_TOKEN not in (creds / "gh" / "hosts.yml").read_text()
+    assert stat.S_IMODE((creds / "token").stat().st_mode) == 0o600
+
+
+def test_refresh_never_writes_through_a_planted_link(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    run.mkdir(mode=0o700)
+    creds = workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+    target = tmp_path / "victim.txt"
+    target.write_text("keep me")
+    (creds / "token").unlink()
+    (creds / "token").symlink_to(target)  # the session replaces the file with a link
+    (creds / "gh" / "hosts.yml").unlink()
+    os.link(target, creds / "gh" / "hosts.yml")  # ... and the other with a hard link
+    workspace_mod.write_session_credentials(run, "ghs_" + "N3wT0ken" * 5)
+    assert target.read_text() == "keep me"  # nothing was written through
+    assert not (creds / "token").is_symlink()
+    assert (creds / "token").read_text().startswith("ghs_N3w")
+    assert "N3wT0ken" in (creds / "gh" / "hosts.yml").read_text()
+    # a planted symlink where a directory belongs is refused, not followed
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    shutil.rmtree(creds / "gh")
+    (creds / "gh").symlink_to(elsewhere)
+    with pytest.raises(RunnerError, match="plain directory"):
+        workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+    assert list(elsewhere.iterdir()) == []
+    shutil.rmtree(creds)
+    creds.symlink_to(elsewhere)
+    with pytest.raises(RunnerError, match="plain directory"):
+        workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+    assert list(elsewhere.iterdir()) == []
+    # and a run dir that is itself a link
+    link = tmp_path / "R2"
+    link.symlink_to(elsewhere)
+    with pytest.raises(RunnerError, match="plain directory"):
+        workspace_mod.write_session_credentials(link, SESSION_TOKEN)
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_read_session_token_only_reads_a_plain_token_file(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    run.mkdir(mode=0o700)
+    assert workspace_mod.read_session_token(run) is None  # no creds yet
+    creds = workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+    (creds / "token").unlink()
+    (creds / "token").symlink_to(tmp_path / "other")
+    (tmp_path / "other").write_text("ghs_nottheone\n")
+    assert workspace_mod.read_session_token(run) is None
+    (creds / "token").unlink()
+    os.mkfifo(creds / "token")
+    assert workspace_mod.read_session_token(run) is None  # a FIFO can't hang it
+    (creds / "token").unlink()
+    (creds / "token").write_text("two\nlines\n")
+    assert workspace_mod.read_session_token(run) is None

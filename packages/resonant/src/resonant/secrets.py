@@ -275,6 +275,9 @@ RUNNER_EXT = "runner"
 GITHUB_TOKEN_REF = secret_ref(RUNNER_EXT, "github_token")
 CLAUDE_TOKEN_REF = secret_ref(RUNNER_EXT, "claude_token")
 ANTHROPIC_KEY_REF = secret_ref(RUNNER_EXT, "anthropic_key")
+# The GitHub App's private key (PEM, or its base64 on one line). It is not in ``RunnerSecrets``:
+# only ``runner.github_app`` reads it, to sign the JWT that mints a run's token.
+GITHUB_APP_KEY_REF = secret_ref(RUNNER_EXT, "github_app_key")
 
 
 @dataclass(frozen=True)
@@ -295,6 +298,8 @@ async def missing_runner_secrets(store: SecretStore) -> list[str]:
     missing: list[str] = []
     if not await store.exists(GITHUB_TOKEN_REF):
         missing.append(GITHUB_TOKEN_REF)
+    if not await store.exists(GITHUB_APP_KEY_REF):
+        missing.append(GITHUB_APP_KEY_REF)
     if not (await store.exists(CLAUDE_TOKEN_REF) or await store.exists(ANTHROPIC_KEY_REF)):
         missing.append(f"{CLAUDE_TOKEN_REF} (or {ANTHROPIC_KEY_REF})")
     return missing

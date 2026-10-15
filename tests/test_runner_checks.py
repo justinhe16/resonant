@@ -131,7 +131,7 @@ def test_classify_path(path: str, refused: bool, flagged: bool) -> None:
 
 
 def test_github_allowed_when_the_repo_says_so() -> None:
-    assert classify_path(".github/workflows/ci.yml", allow_github=True) == (None, False)
+    assert classify_path(".github/workflows/ci.yml", allow_github=True) == (None, True)
     # .gitmodules is refused regardless
     assert classify_path(".gitmodules", allow_github=True)[0] is not None
 
@@ -185,7 +185,8 @@ async def test_github_change_refused(repo: Path) -> None:
     with pytest.raises(CheckFailed, match=r"\.github/"):
         await check(repo, base, head)
     allowed = RunnerRepo(remote="github.com/own/proj", allow_github_changes=True)
-    assert (await check(repo, base, head, repo=allowed)).files == 1
+    res = await check(repo, base, head, repo=allowed)
+    assert res.files == 1 and res.flagged == (".github/workflows/ci.yml",)  # allowed, listed
 
 
 async def test_github_rename_out_of_dir_still_seen(repo: Path) -> None:
