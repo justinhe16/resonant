@@ -207,7 +207,19 @@ def set_links(conn: sqlite3.Connection, extension: str, slugs: Iterable[str]) ->
 
 
 def drop_links(conn: sqlite3.Connection, extension: str) -> None:
-    conn.execute("DELETE FROM repo_links WHERE extension = ?", (extension,))
+    with atomic(conn):
+        conn.execute("DELETE FROM repo_links WHERE extension = ?", (extension,))
+
+
+def enabled_links(conn: sqlite3.Connection, extension: str) -> list[str]:
+    """Like :func:`links`, but only while the extension is installed and enabled: a disabled
+    or tampered extension's name stops meaning anything to the resolver."""
+    rows = conn.execute(
+        "SELECT l.slug FROM repo_links l JOIN extensions e ON e.name = l.extension COLLATE NOCASE"
+        " WHERE l.extension = ? AND e.status = 'enabled' ORDER BY l.slug",
+        (extension,),
+    )
+    return [r["slug"] for r in rows]
 
 
 def links(conn: sqlite3.Connection, extension: str) -> list[str]:

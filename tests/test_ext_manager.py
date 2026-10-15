@@ -488,15 +488,30 @@ def test_repo_links_follow_install_update_and_remove(
     manifest.write_text(MANIFEST + "repos: [me/a, me/b]\n")
     commit_all(repo)
     first = mgr.stage("repo:demo")
-    assert 'Repos: "me/a", "me/b"' in confirm_lines(first)
-    mgr.install(first.pin, name="demo")
+    lines = confirm_lines(first, mgr.registered_slugs())
+    assert 'Repos: "me/a", "me/b"' in lines
+    esc = lines[lines.index("Escalations:") + 1 : lines.index("Intent:")]
+    assert esc == [
+        '  ! repo link "me/a": requests naming demo run there (not in your repo registry)',
+        '  ! repo link "me/b": requests naming demo run there (not in your repo registry)',
+    ]
+    mgr.discard(first)
+    record = mgr.install(first.pin, name="demo")
     assert repos.links(conn, "demo") == ["me/a", "me/b"]
     # An update replaces the links, and a registered repo is not touched by remove.
     repos.add(conn, "me/a", base="main", source="auto")
-    manifest.write_text(MANIFEST + "repos: [me/c]\n")
+    manifest.write_text(MANIFEST + "repos: [me/a, me/c]\n")
     commit_all(repo)
-    mgr.install(mgr.stage("repo:demo").pin, name="demo")
-    assert repos.links(conn, "demo") == ["me/c"]
+    second = mgr.stage("repo:demo")
+    diff = update_lines(record, mgr.installed_files("demo"), second, mgr.registered_slugs())
+    assert "Manifest: unchanged (code only)" not in diff
+    tail = ": requests naming demo run there"
+    assert f'  + repo link "me/c"{tail} (not in your repo registry)' in diff
+    assert f'  - repo link "me/b"{tail} (not in your repo registry)' in diff
+    assert not [d for d in diff if '"me/a"' in d]  # unchanged
+    mgr.discard(second)
+    mgr.install(second.pin, name="demo")
+    assert repos.links(conn, "demo") == ["me/a", "me/c"]
     mgr.remove("demo")
     assert repos.links(conn, "demo") == []
     assert [r.slug for r in repos.list_all(conn)] == ["me/a"]
@@ -517,7 +532,7 @@ def test_failed_install_leaves_the_old_links(
     def boom(*args: object, **kwargs: object) -> None:
         raise sqlite3.OperationalError("disk full")
 
-    monkeypatch.setattr("resonant.store.extensions.prune_jobs", boom)
+    monkeypatch.setattr("resonant.extensions.manager.kv_set", boom)  # after set_links ran
     with pytest.raises(sqlite3.OperationalError):
         mgr.install(staged.pin, name="demo")
     assert repos.links(conn, "demo") == ["me/a"]

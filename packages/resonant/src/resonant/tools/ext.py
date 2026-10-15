@@ -29,6 +29,7 @@ from pydantic import ValidationError
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.extensions import briefing, notify, pulse_job
 from resonant.extensions.cron import CronError, parse_schedule
+from resonant.gate.codes import clean_external
 from resonant.monitor import health_snapshot
 from resonant.store import extensions as store
 from resonant.store import repos
@@ -114,7 +115,7 @@ def list_extensions(ctx: BuiltinContext) -> dict[str, Any]:
             "commit": record.commit[:SHORT] if record.commit else None,
             "digest": record.tree_digest[:SHORT],
             "tools": 0,
-            "repos": repos.links(conn, record.name),
+            "repos": [clean_external(s)[:80] for s in repos.links(conn, record.name)],
             "jobs": [],
             "muted_until": None,
             "muted_until_text": None,
