@@ -9,7 +9,7 @@ under the real ``sandbox-exec``, which is local-only. The runner-level R-tests (
 timeouts, usage limits, symlinks, token hygiene in the transcript) live in
 ``test_runner_claude.py``; this file is what a person texting the Mini sees.
 
-- R1 ``test_r1_*``  R4 ``test_r4_*``  R5 ``test_r5_*``  R6 ``test_r6_*``  R7 ``test_r7_*``
+- R1 and R5 ``test_r1_*``  R4 ``test_r4_*``  R6 ``test_r6_*``  R7 ``test_kill_*``
 - R13 ``test_r13_*``  R14 ``test_r14_*``  cancel ``test_cancel_*``  no CI ``test_no_ci_*``
 """
 
@@ -50,6 +50,7 @@ from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import Loop
 from resonant.models import ChatMessage, ModelReply, SpanFactory, ToolCall
 from resonant.ops.fakes import FakeOpsRunner
+from resonant.router.fast_path import RESUME_REPLY
 from resonant.runner.workspace import Workspace
 from resonant.runners import claude as claude_mod
 from resonant.runners import reaper
@@ -387,8 +388,9 @@ async def test_kill_ends_runs_and_the_reply_counts_them(
         assert w.gh_calls("create") == []
         await until(lambda: "R1 cancelled." in w.texts(), 10, "the cancelled reply")
         # a killed run isn't restarted by /resume, and nothing starts while paused
-        refused = await w.say("/resume")
-        assert refused != "" and w.run().status == "cancelled"
+        await w.say("/resume")
+        await until(lambda: RESUME_REPLY in w.texts(), 10, "the resume reply")
+        assert w.run().status == "cancelled"
         killswitch.engage(w.conn, actor="test")
         reply = await w.say("/run demo again")
         assert "paused" in reply.lower()

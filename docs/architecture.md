@@ -78,7 +78,7 @@ For an interactive version, open [`architecture.html`](architecture.html), which
 | Go-live Phase 5a: step 14, `--check` rows `runs table`, `runner sandbox`, `runner repos`, runner secrets, `runner repo <name> has CI`; runner e2e over the fake iMessage channel | `docs/go-live.md`, `scripts/go_live_check.py`, `tests/test_e2e_runner.py` | Phase 5a ✅ |
 | MCP tools, critical-job LaunchAgents and `job-guard` rewrite, veto windows, the Seatbelt sandbox for extension processes, iMessage `/ext add`, git and network sources, Python deps | — | Deferred ([`followups.md`](followups.md)) |
 | Dashboard (Vite + React + shadcn, streak look) | — | Phase 4 |
-| Two-way Slack, Claude runner | — | Phase 5 |
+| Two-way Slack, richer Claude runs | — | Phase 5b |
 | On-call extension | — | Phase 6 |
 | Life lane: Gmail, Calendar, iMessage, payments, browser, computer use | private repo, with core runner/scope support | Phase 7 |
 

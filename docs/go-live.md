@@ -305,10 +305,11 @@ What the runner is: "fix the typo in the README in demo" starts a Claude Code se
 5. **The authenticated probe.** The self-check proves the denies without a login; this proves a real `claude -p` authenticates inside the sandbox:
 
    ```sh
-   CLAUDE_CODE_OAUTH_TOKEN=<the token> resonant sandbox check
+   read -rs T   # paste the token, then Enter; nothing is shown or saved to history
+   CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check; unset T
    ```
 
-   Every row `PASS`, including `claude -p with CLAUDE_CODE_OAUTH_TOKEN`. The token is in that one command's environment only: don't put it in a file or the LaunchAgent. The daemon's own environment must hold no secrets (`daemon env holds no secrets` is a row of the same check).
+   Every row `PASS`, including `claude -p with CLAUDE_CODE_OAUTH_TOKEN`. The token is in that one command's environment only, and never in shell history: don't put it in a file or the LaunchAgent. The daemon's own environment must hold no secrets (`daemon env holds no secrets` is a row of the same check).
 6. `scripts/bootstrap.sh --check`: `runner repos  PASS  1: demo`, `runner secret runner/github_token  PASS  present (value not read)`, `runner secret runner/claude_token (or runner/anthropic_key)  PASS …`. The row `runner repo demo has CI` is `SKIP` until the first run has fetched the mirror, then `PASS`. All runner rows are advisory.
 
 ### First real run (Claude can do this on the Mini)
