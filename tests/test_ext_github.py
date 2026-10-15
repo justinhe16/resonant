@@ -781,15 +781,35 @@ def test_writes_pass_the_token_only_via_the_config_file(gh: FakeGh) -> None:
     assert all(TOKEN not in o.stdout + o.err for o in outs)
 
 
-def test_config_dir_is_removed_and_stale_ones_are_swept(gh: FakeGh) -> None:
-    stale = gh.data / "gh-stale"
-    stale.mkdir()
-    (stale / "hosts.yml").write_text("x")
-    os.utime(stale, (1, 1))
-    fresh = gh.data / "gh-fresh"
-    fresh.mkdir()  # a concurrent run's dir: left alone
+def test_config_dir_is_removed_and_only_real_stale_ones_are_swept(gh: FakeGh) -> None:
+    tmp = gh.data / "tmp"
+    tmp.mkdir()
+    old = (1, 1)
+
+    def mk(name: str, mode: int = 0o700) -> Path:
+        d = tmp / name
+        d.mkdir()
+        (d / "hosts.yml").write_text("x")
+        d.chmod(mode)
+        os.utime(d, old)
+        return d
+
+    mk("resonant-gh-stale")
+    mk("other-stale")  # name does not match
+    mk("resonant-gh-open", 0o755)  # mode is not 0700
+    mk("resonant-gh-fresh").touch()  # a concurrent run's dir (recent)
+    victim = gh.data / "victim"
+    victim.mkdir()
+    (victim / "keep").write_text("x")
+    (tmp / "resonant-gh-link").symlink_to(victim)
     assert gh.run("prs").code == 0
-    assert sorted(p.name for p in gh.data.glob("gh-*")) == ["gh-fresh"]
+    assert sorted(p.name for p in tmp.iterdir()) == [
+        "other-stale",
+        "resonant-gh-fresh",
+        "resonant-gh-link",
+        "resonant-gh-open",
+    ]
+    assert (victim / "keep").exists()
 
 
 def test_extension_reads_secrets_only_from_the_pipe() -> None:

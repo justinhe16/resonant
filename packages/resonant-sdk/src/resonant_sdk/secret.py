@@ -26,27 +26,34 @@ SECRETS_FD_ENV = "RESONANT_SECRETS_FD"
 MAX_BYTES = 64 * 1024
 
 _cache: dict[str, str] | None = None
+_failure: str | None = None
 
 
 class SecretError(RuntimeError):
     """A secret was not delivered. The message names the secret, never a value."""
 
 
+def _fail(reason: str) -> SecretError:
+    global _failure
+    _failure = reason
+    return SecretError(reason)
+
+
 def _load() -> dict[str, str]:
     global _cache
     if _cache is not None:
         return _cache
+    if _failure is not None:  # the fd is already consumed: repeat the original reason
+        raise SecretError(_failure)
     fd_text = os.environ.pop(SECRETS_FD_ENV, "")
     if not fd_text.isdigit():
-        raise SecretError(
-            "no secrets were delivered (not running under Resonant, or none declared)"
-        )
+        raise _fail("no secrets were delivered (not running under Resonant, or none declared)")
     try:
         with os.fdopen(int(fd_text), "rb") as f:
             raw = f.read(MAX_BYTES + 1)
         parsed: object = json.loads(raw)
     except (OSError, ValueError):
-        raise SecretError("secrets could not be read") from None
+        raise _fail("secrets could not be read") from None
     if (
         len(raw) > MAX_BYTES
         or not isinstance(parsed, dict)
@@ -55,7 +62,7 @@ def _load() -> dict[str, str]:
             for k, v in cast("dict[object, object]", parsed).items()
         )
     ):
-        raise SecretError("secrets were malformed")
+        raise _fail("secrets were malformed")
     _cache = dict(cast("dict[str, str]", parsed))
     return _cache
 

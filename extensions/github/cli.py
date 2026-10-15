@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,10 @@ from typing import Any, cast
 
 DEFAULT_PATH = "/opt/homebrew/bin:/usr/bin:/bin"
 GH_TIMEOUT_S = 30
-STALE_CONFIG_S = 3600  # a gh-* config dir this old was left by a killed run
+CONFIG_PREFIX = "resonant-gh-"
+# A config dir this old was left by a killed run. It must stay well above the longest tool
+# timeout in resonant.yaml (300 s), or a slow concurrent run could lose its dir.
+STALE_CONFIG_S = 3600
 SEARCH_LIMIT = 50  # PRs per search
 RUN_LIMIT = 20  # workflow runs per PR branch
 MAX_EVENTS = 100  # the process runner keeps at most 100 events per run
@@ -142,6 +146,28 @@ def secret(name: str) -> str:
     return _secrets.get(name, "")
 
 
+def _sweep_stale(base: Path) -> None:
+    """Remove ``resonant-gh-*`` dirs left by killed runs. Only a real directory (lstat: a
+    symlink is never followed), owned by us, mode 0700 and old enough; anything else stays."""
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            st = entry.lstat()
+            if (
+                entry.name.startswith(CONFIG_PREFIX)
+                and stat.S_ISDIR(st.st_mode)
+                and st.st_uid == os.getuid()
+                and stat.S_IMODE(st.st_mode) == 0o700
+                and time.time() - st.st_mtime > STALE_CONFIG_S
+            ):
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            pass
+
+
 class Gh:
     """Runs ``gh`` by absolute path with a minimal env and no token in it or in argv: ``gh``
     reads the token from ``hosts.yml`` in a private config dir (keyring off), removed at exit."""
@@ -177,15 +203,10 @@ class Gh:
     def _config_dir(token: str) -> str:
         """A fresh 0700 dir (mkdtemp) with a 0600 hosts.yml holding the token as a plaintext
         ``oauth_token`` (gh uses the config file when no keyring entry exists). Removed at exit."""
-        base = os.environ.get("TMPDIR") or str(data_dir())
-        # A SIGKILL (timeout) skips every cleanup, so also sweep dirs a dead run left behind.
-        for stale in Path(base).glob("gh-*"):
-            try:
-                if time.time() - stale.stat().st_mtime > STALE_CONFIG_S:
-                    shutil.rmtree(stale, ignore_errors=True)
-            except OSError:
-                pass
-        directory = Path(tempfile.mkdtemp(prefix="gh-", dir=base))
+        base = data_dir() / "tmp"
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _sweep_stale(base)
+        directory = Path(tempfile.mkdtemp(prefix=CONFIG_PREFIX, dir=base))
         atexit.register(shutil.rmtree, directory, ignore_errors=True)
         for sig in (signal.SIGTERM, signal.SIGINT):  # Resonant ends a run with SIGTERM first
             signal.signal(sig, lambda *_: sys.exit(1))

@@ -21,7 +21,7 @@ The two write tools need more, and **only** they do. Leave the token read-only i
 - `rerun_failed`: Actions **read and write**.
 - `merge_pr`: Contents **read and write** and Pull requests **read and write**.
 
-Store it on the Mini, in its terminal: `resonant secret set github/token`. Resonant passes it to this extension on a pipe (fd 4, `RESONANT_SECRETS_FD`), never in its environment or argv. The extension writes it to a `hosts.yml` (0600) in a fresh private (0700) `GH_CONFIG_DIR` under the data dir's `tmp/` and points `gh` at it, so `gh` has no token in its env or argv; the dir is removed when the run ends (and any left by a killed run is swept next time). It never uses `gh`'s own login, and never prints the token.
+Store it on the Mini, in its terminal: `resonant secret set github/token`. Resonant passes it to this extension on a pipe (fd 4, `RESONANT_SECRETS_FD`), never in its environment or argv. The extension writes it to a `hosts.yml` (0600) in a fresh private (0700) `GH_CONFIG_DIR` under the data dir's `tmp/` (`resonant-gh-*`) and points `gh` at it, so `gh` has no token in its env or argv; the dir is removed when the run ends (and any left by a killed run is swept next time, only real 0700 directories of ours older than an hour). It never uses `gh`'s own login, and never prints the token.
 
 ## Config
 

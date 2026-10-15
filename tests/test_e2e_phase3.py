@@ -558,7 +558,10 @@ def audit_rows(conn: sqlite3.Connection, action: str) -> list[sqlite3.Row]:
 async def test_e8_kill_switch_kills_inflight_job_and_resume_does_not_catch_up(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
-    settings = settings_for(resonant_home, chat)
+    # No core pulse/briefing jobs: they would add job.run rows near the hour.
+    settings = settings_for(
+        resonant_home, chat, briefing={"enabled": False}, pulse={"enabled": False}
+    )
     emit_py = inspect.getsource(resonant_sdk.emit)
     install(settings, JOBS_MANIFEST, {"job.py": JOB_PY, "emit.py": emit_py})
     # The daemon was down for the last 90 minutes: the latest due time is caught up, once.
@@ -1034,7 +1037,12 @@ async def test_e4_morning_ping_first_run_is_baseline_then_sends_once(
         resonant_home, chat, briefing={"enabled": False}, pulse={"enabled": False}
     )
     files = {rel: (EXAMPLE / rel).read_text() for rel in ("cli.py", "emit.py", "README.md")}
-    install(settings, (EXAMPLE / "resonant.yaml").read_text(), files)
+    # Only the 08:00 job: the example's pnl (:55) and incident (*/5) jobs would also fire
+    # whenever the real clock sits on their boundaries.
+    manifest = (EXAMPLE / "resonant.yaml").read_text()
+    head, rest = manifest.split("  # Reporters:", 1)
+    manifest = head + "\ntools:" + rest.split("\ntools:", 1)[1]
+    install(settings, manifest, files)
     osa = RecordingOsaRunner()
     d = github_daemon(settings, osa)  # its parts, not its run loop
 
@@ -1054,11 +1062,8 @@ async def test_e4_morning_ping_first_run_is_baseline_then_sends_once(
     assert d.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     job = get_job(d.conn, "example", "morning-ping")
     assert job is not None and job.last_due == second and job.last_outcome == "ok"
-    # The incident job also runs at each tick (no incident file: no report); pnl is due at :55.
     ran = [json.loads(r["detail"])["job"] for r in audit_rows(d.conn, "job.run")]
-    assert (
-        sorted(ran) == ["example/incident"] * 2 + ["example/morning-ping"] * 2
-    )  # tick order varies
+    assert ran == ["example/morning-ping"] * 2
     keys = [r["dedupe_key"] for r in d.conn.execute("SELECT dedupe_key FROM events")]
     assert keys == [f"ext:example:ping:{iso(first)}", f"ext:example:ping:{iso(second)}"]
     d.conn.close()

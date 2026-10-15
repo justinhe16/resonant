@@ -1120,7 +1120,7 @@ function drawTrust(){
   box(316, 120, 298, "can(principal, action, ext)", "owner: all · cofounder: dori only", "var(--built)");
   box(316, 178, 298, "ToolSpec registration", "effect + level · pay ≡ L1", "var(--built)");
   box(316, 236, 298, "Gate: risk × origin · approvals · kill switch", "approval = authenticated reply", "var(--built)");
-  box(316, 294, 298, "Executor (only secrets holder)", "idempotent · audited · Keychain → env", "var(--built)");
+  box(316, 294, 298, "Executor (only secrets holder)", "idempotent · audited · Keychain → fd 4 pipe", "var(--built)");
 
   zone(664, 16, 300, 348, "Outside the core path", "");
   box(680, 62, 268, "trade-jev order execution", "never via loop or gate");
@@ -1139,7 +1139,7 @@ function trustCards(){
     ["All content is untrusted","Messages, emails, web pages, tool output, and extension payloads are data. Toolsets are filtered by principal before the LLM sees them, so injected text can't reach tools outside that principal's scope."],
     ["Co-founder scoped to DORI","The co-founder can request DORI tasks and approve DORI on-call actions. They have no access to the personal lane, trading, the owner's data, or global settings. admin and global scope are owner-only."],
     ["Approvals are bound","Each approval is tied to an intent hash, expires, is used once, and records who requested and who approved. L1 and pay need yes with the code. A plain yes binds only when exactly one approval is pending and its prompt was sent first. The parser is deterministic; no model reads replies."],
-    ["Secrets never reach the model","Only the executor and the job host read the Keychain, injecting a tool's own declared secrets as environment variables of that process. Every encoding of a value is redacted before it is stored, logged or shown. Secrets are entered only in the Mini's terminal. Only *.example configs ship in the public repo, and gitleaks runs in pre-commit and CI."],
+    ["Secrets never reach the model","Only the executor and the job host read the Keychain, delivering a tool's own declared secrets on a pipe (fd 4), never in the process's env or argv. Every encoding of a value is redacted before it is stored, logged or shown. Secrets are entered only in the Mini's terminal. Only *.example configs ship in the public repo, and gitleaks runs in pre-commit and CI."],
     ["Phase 3 extensions: an interim bar","Extensions are first-party, owner-installed code, run as the same macOS user with the daemon's Full Disk Access. The protection is env and secret isolation, not filesystem isolation: an env built from scratch, HOME in its data dir, per-tool secrets and redaction, output caps, an argv0 allowlist, and a pinned read-only copy. Residual: any same-user process, including the owner's own Claude sessions, can read every resonant Keychain item. No third-party sources until the Seatbelt sandbox."],
     ["No public ports","The API binds to loopback only, and config rejects any other address. Remote status access is planned via the push-only status relay, never by exposing the API. Slack uses Socket Mode, iMessage uses local chat.db, and webhooks need HMAC (their transport is an open follow-up)."],
     ["trade-jev stays outside","Order execution never goes through the loop or gate. Core sees only trade-jev's jobs, read tools, events, and kill switch. The kill switch sets kv.paused, which job-guard checks."],

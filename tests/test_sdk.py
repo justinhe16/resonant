@@ -524,3 +524,13 @@ def test_secret_module_imports_only_the_stdlib() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             roots.add(node.module.split(".")[0])
     assert roots <= set(sys.stdlib_module_names)
+
+
+def test_second_secret_call_after_a_failed_read_repeats_the_reason() -> None:
+    proc = _run_secret_snippet(
+        "from secret import secret, SecretError\n"
+        "for _ in range(2):\n"
+        "    try:\n        secret('t')\n    except SecretError as e:\n        print('ERR', e)",
+        b"not json",
+    )
+    assert proc.stdout.splitlines() == ["ERR secrets could not be read"] * 2

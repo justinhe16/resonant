@@ -1,6 +1,7 @@
 # github: your pull requests' CI and reviews, plus two approved writes (rerun, merge).
-# Stdlib Python plus the gh CLI. The token (resonant secret set github/token) reaches gh as
-# GH_TOKEN, in gh's env only. A read-only token is fine: the writes then fail cleanly.
+# Stdlib Python plus the gh CLI. The token (resonant secret set github/token) reaches this extension on
+# fd 4 and gh through a private 0600 hosts.yml in a GH_CONFIG_DIR; it is never in any env or
+# argv. A read-only token is fine: the writes then fail cleanly.
 name: github
 version: 1
 description: Your GitHub pull requests; open PRs, CI failures and fixes, review requests.
