@@ -1092,6 +1092,30 @@ PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: Chan
     .none_reachable   # no error and nobody reached: fail for good
 ```
 
+## Claude runner: `resonant.runners.claude`, `resonant.runner`, `resonant.sandbox`, `resonant.store.runs` (Phase 5a, migration 006)
+
+The design is [`phase5a-plan.md`](phase5a-plan.md); this is the surface other code uses.
+
+```python
+ClaudeRunner(conn, *, runner: RunnerConfig, channel, secrets, ...)   # name="claude", uses_claude_slot
+await runner.start() -> int                       # before the loop resumes: reap what a crash left; returns runs reaped
+await runner.start_run(repo, ask, principal) -> Started | Refused     # Started.text is "On it: R3 · dori. Up to 45m. …"
+runner.list_runs(limit=20) / runner.get_run(code) -> Run
+await runner.cancel_run(code, *, reason="cancelled") -> Cancelled | Refused
+await runner.merge_run(code) -> Merged | Refused  # CI check + gh pr merge --squash --match-head-commit; no approval here
+await runner.setup_missing() -> str | None        # "The runner isn't set up: …" naming exactly what is missing
+runner.last_killed                                # runs the last kill switch engage ended
+```
+
+- **Task.** One task per run: `kind="run"`, `runner="claude"`, `title="run R3 · dori"` (never the ask). The step is `prepare` → `session` → `harvest` → `publish` → `reply`, each checkpointed; a crash resumes at the last one (`attempts` counts crashes survived, the second fails the run).
+- **`runs` table.** `code` (`R1`, `R2`, never reused), `task_id`, `repo`, `branch`, `base_sha`, `head_sha`, `pr_number`, `pr_url`, `status` (`queued`, `running`, `waiting`, `ready`, `merged`, `failed`, `cancelled`, `no_changes`), `step`, `session_id`, `sessions`, `attempts`, process fields (`pgid`, `leader_pid`, `leader_started_at`), `session_seconds`, `files_changed`, `flagged_paths`, `summary`, `failure`, `ask`, token and cost counts. `store/runs.py`: `create`, `get`, `update`, `recent`, `active`.
+- **Replies** are code-built and deduped per run and kind: `R3 done: PR #41 · <url> · 3 files · 12m` (+ `⚠ changes Makefile, package.json`), `R3: no changes. …`, `R3 failed: <reason>`, `R3 cancelled.`. The model's summary is cleaned, redacted, clipped to 600 characters and shown only after the `R3:` prefix.
+- **Pulse.** While a run goes: item `core` / `run/r3`, `normal`, `R3 still running · dori · started 14:05`, cleared when it ends.
+- **Workspace** (`resonant.runner.workspace.Workspace(cfg, url_for=…)`): `mirror_path`, `mirror_lock`, `repo_has_ci(name, github_token=None, refresh=True)`, `prepare`, harvest, `publish`, `merge`, `rmtree_nofollow`. Tokens reach `git` and `gh` through 0600 files under `runner.secrets_dir`, never env or argv.
+- **Sandbox** (`resonant.sandbox`): `SandboxParams(run_dir, cache_dir, secrets_dir, read_paths, deny_exec)`, `render`, `wrap(argv, params)`, `scratch_env`, `probes.self_check`, `cached_self_check`. CLI: `resonant sandbox check [--scope all|ci|local] [--json]`, exit 1 on any failed probe.
+- **Config** (`runner:`): `repos` (name → `{remote, base, allow_github_changes, quote_ask}`), `work_dir`, `mirror_dir`, `secrets_dir`, `cache_dir`, `max_run_dir_mb`, `max_cache_gb`, `max_minutes`, `max_budget_usd`, `max_bundle_mb`, `keep_days`, `git_path`, `gh_path`. Secrets: `runner/claude_token` (or `runner/anthropic_key`) and `runner/github_token`.
+- **Tests.** `tests/fakes/claude` is a fake CLI with scenarios; `tests/test_runner_claude.py` drives the runner over it, and `tests/test_e2e_runner.py` drives the whole daemon from the fake iMessage channel.
+
 ## Daemon wiring: `resonant.wiring`, `resonant.daemon`
 
 ```python

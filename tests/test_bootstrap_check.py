@@ -531,6 +531,64 @@ def test_secret_rows_check_existence_only(resonant_home: Path) -> None:
     )
 
 
+def test_runner_rows_report_names_only(resonant_home: Path) -> None:
+    check = _load_helper()
+    settings = load_settings(
+        runner={
+            "repos": {
+                "demo": {"remote": "github.com/o/demo"},
+                "old": {"remote": "github.com/o/old"},
+            }
+        }
+    )
+    keychain = FakeKeychain(items={"runner/github_token": "ghp_" + "a" * 36})
+    store = SecretStore(keychain)
+
+    def exists(ref: str) -> bool:
+        return asyncio.run(store.exists(ref))
+
+    cis = {"demo": True, "old": False}
+
+    def ci_of(_settings: object, name: str) -> bool | None:
+        return cis[name]
+
+    def no_mirror(_settings: object, _name: str) -> bool | None:
+        return None
+
+    rows = {r[2]: r for r in check.runner_rows(settings, 6, exists, ci_of)}
+    assert rows["runs table"][:2] == ("PASS", False)
+    assert rows["runner repos"][3] == "2: demo, old"
+    assert rows["runner secret runner/github_token"][0] == "PASS"
+    claude = rows["runner secret runner/claude_token (or runner/anthropic_key)"]
+    assert claude[0] == "FAIL" and "claude setup-token" in claude[3]
+    assert rows["runner repo demo has CI"][0] == "PASS"
+    assert rows["runner repo old has CI"][0] == "FAIL"
+    assert all(not r[1] for r in rows.values())  # advisory
+    assert keychain.calls and all("-w" not in c.argv for c in keychain.calls)
+    # old schema, no repos, no mirror yet
+    assert check.runner_rows(load_settings(), 5, exists)[:2] == [
+        ("FAIL", False, "runs table", "schema v5, need 6"),
+        ("SKIP", False, "runner repos", "none in runner.repos (step 14)"),
+    ]
+    none = check.runner_rows(settings, 6, exists, no_mirror)
+    assert [r[0] for r in none if r[2].endswith("has CI")] == ["SKIP", "SKIP"]
+
+
+def test_runner_ci_row_reads_the_mirror_only(resonant_home: Path, tmp_path: Path) -> None:
+    check = _load_helper()
+    settings = load_settings(
+        runner={
+            "repos": {"demo": {"remote": "github.com/o/demo"}},
+            "mirror_dir": tmp_path / "mirrors",
+            "work_dir": tmp_path / "runs",
+            "cache_dir": tmp_path / "runs" / ".cache",
+            "secrets_dir": tmp_path / "secrets",
+        }
+    )
+    assert check._repo_has_ci(settings, "demo") is None  # no mirror: nothing fetched
+    assert not (tmp_path / "mirrors").exists()
+
+
 def test_jobs_and_briefing_rows_come_from_config(resonant_home: Path) -> None:
     check = _load_helper()
     records = _records(resonant_home, SECRET_EXT, PLAIN_EXT)
