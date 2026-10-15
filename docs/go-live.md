@@ -269,6 +269,81 @@ Times, codes and figures below are examples.
 - **Expected:** exit 0; `pulse scheduled  PASS`. The row is a `FAIL` (required) if `pulse.enabled` is false.
 - **Rollback:** `pulse: {enabled: false}` in `~/.resonant/config.yaml` and `resonant daemon install` stops the hourly pulse (urgent reports and the briefing's Updates still work); `resonant ext remove <name>` removes a noisy reporter; `/ext mute <name> 8h` quiets one for now.
 
+## 14. Phase 5a: the Claude runner
+
+Step 13 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen` and `resonant daemon install`). `scripts/bootstrap.sh --check` shows `store schema 6  PASS`, `runs table  PASS`, `runner sandbox  PASS` and, until you finish the terminal steps, `runner repos  SKIP` and `FAIL` (advisory) rows for the two runner secrets. Until then everything else works, `/runs` and "fix X in Y" answer `The runner isn't set up: …`, and nothing can start a run.
+
+What the runner is: "fix the typo in the README in demo" starts a Claude Code session in a throwaway clone, inside the macOS sandbox ([`phase5a-plan.md`](phase5a-plan.md)), and texts back a PR link. Merging is the one approval. Codes (`R1`), PR numbers and times below are examples.
+
+### In the terminal on the Mini
+
+1. **Claude's token.** `claude setup-token` prints a long-lived token for your subscription. Then:
+
+   ```sh
+   resonant secret set runner/claude_token    # paste it at the hidden prompt, twice
+   ```
+
+   For API billing instead, set `runner/anthropic_key` (and `runner.max_budget_usd` in config). The secret store takes values up to 128 bytes; a setup token is about 108.
+2. **A GitHub token for the runner repos only.** Create a **fine-grained** personal access token, limited to the repos the runner may touch, with these repository permissions: Contents **read and write**, Pull requests **read and write**, Checks **read**, Commit statuses **read**, Metadata **read**. **No Workflows permission**: the runner is never allowed to edit `.github/`. Then:
+
+   ```sh
+   resonant secret set runner/github_token
+   ```
+
+3. **Name the repos.** Tell Claude which repos (for example "demo is github.com/you/demo"). Claude adds them to `runner.repos` in `~/.resonant/config.yaml` (it is not a secret) and restarts the daemon:
+
+   ```yaml
+   runner:
+     repos:
+       demo: {remote: github.com/you/demo, base: main}
+   ```
+
+4. **On GitHub, for each runner repo.** These keep a runner PR from doing harm before you merge it:
+   - The repo has a workflow that runs on `pull_request`. The runner refuses a repo without one (`R1 failed: demo has no CI on pull_request …`).
+   - No repo or organization secrets are available to `pull_request` runs from branches of the same repo. A runner PR can change a test, a `Makefile` or `package.json` that CI executes. Either the workflows that use secrets run only on `push` to `main`, or the secrets live in a GitHub environment that needs approval. Claude can read each repo's workflows and say which need a change.
+   - Recommended: branch protection on `main` requiring CI, so `/merge` can never land red code.
+5. **The authenticated probe.** The self-check proves the denies without a login; this proves a real `claude -p` authenticates inside the sandbox:
+
+   ```sh
+   read -rs T   # paste the token, then Enter; nothing is shown or saved to history
+   CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check; unset T
+   ```
+
+   Every row `PASS`, including `claude -p with CLAUDE_CODE_OAUTH_TOKEN`. The token is in that one command's environment only, and never in shell history: don't put it in a file or the LaunchAgent. The daemon's own environment must hold no secrets (`daemon env holds no secrets` is a row of the same check).
+6. `scripts/bootstrap.sh --check`: `runner repos  PASS  1: demo`, `runner secret runner/github_token  PASS  present (value not read)`, `runner secret runner/claude_token (or runner/anthropic_key)  PASS …`. The row `runner repo demo has CI` is `SKIP` until the first run has fetched the mirror, then `PASS`. All runner rows are advisory.
+
+### First real run (Claude can do this on the Mini)
+
+A small ask on a repo with CI, such as "add a blank line at the end of the README", from iMessage (`/run demo …`). Check:
+
+- **Claude's own sandbox is off, and ours is the only one.** The transcript `~/.resonant/runner/transcripts/R1.jsonl` has no `sandbox_apply` or permission errors, and the session wrote files. (A nested sandbox would fail; the run passes `--settings '{"sandbox":{"enabled":false}}'`.)
+- **`--max-turns` is accepted** by the installed Claude Code (it is undocumented in `claude --help`): the run doesn't fail on an unknown flag. If it does, the flag is one entry in `runners/claude.py`.
+- **The usage-limit text.** If the subscription's limit is ever hit, the run goes to `waiting` and resumes by itself. If it fails instead with the limit's text, send the text to Claude (the matcher is `usage_limit()` in `runners/claude.py`).
+- **No token anywhere.** `grep -c '<first 6 chars of each token>' ~/.resonant/logs/resonant.jsonl` and the same query on `audit_log` (as in step 12) print `0`; so does the same `grep` on `~/.resonant/runner/transcripts/R1.jsonl`.
+- **The sandbox held.** The session wrote only under `~/resonant-runs/R1/` (and the runner cache): `~/Library/LaunchAgents`, `~/.zshrc` and the `~/resonant` checkout are unchanged.
+
+### Over iMessage
+
+1. **Not set up (before the terminal steps).** `/runs` and "fix the typo in the README in demo" → `The runner isn't set up: no repos in runner.repos, secret runner/github_token, secret runner/claude_token (or runner/anthropic_key). On the Mini: …`.
+2. **A run.** `/run demo fix the typo in the README` (or in plain words: "fix the typo in the README in demo") → at once `On it: R1 · demo. Up to 45m. /runs to check, /cancel R1 to stop.`. A few minutes later `R1 done: PR #41 · https://github.com/you/demo/pull/41 · 1 file · 4m` and Claude's one-line summary. A change to a file CI or your tooling executes adds `⚠ changes Makefile, package.json`.
+3. **While it runs.** `/runs` → `Runs (1 active):` / `- R1 demo · running · 3m`. The next hourly `btw:` mentions `R1 still running · demo · started 14:05`, and stops once it's done.
+4. **Cancel.** `/run demo add a README badge`, then `/cancel R2` → `R2 cancelled.` Nothing is pushed and no PR appears.
+5. **Merge, explicit.** Once the PR's CI is green: `/merge R1` → `R1 merged: PR #41.` (plus the `⚠` line and the link). While CI is red or pending: `R1 not merged: CI isn't green`, and the run stays `ready`.
+6. **Merge, in chat.** After another finished run, "merge it" → `[F6] merge R2: PR #42 in demo https://github.com/you/demo/pull/42, changes Makefile … Reply yes / no`. `no` → `Not done.`. `yes` → `R2 merged: PR #42.`
+7. **Kill switch.** Start a run, then `/kill` → `kill switch engaged, 1 run ended`. On the Mini, `pgrep -fl claude` shows nothing of that run within a few seconds, and nothing was pushed. `/resume` does not restart it. `/runs` shows it `cancelled`.
+8. **Refusals.** A repo without CI → `R1 failed: demo has no CI on pull_request; the runner only works in repos with CI`. A run that touches `.github/` → `R1 failed: …` naming it, with nothing pushed. A run that puts a token in the diff is refused the same way, and the token is never echoed back.
+9. **Restart mid-run.** Start a run and `/restart resonant` once it's going. After `Back up …` the same run finishes (`R1 done: …`): one PR, not two.
+
+### What to expect
+
+- Two runs at once at most, and one per repo (a second on the same repo waits). A run gets 45 minutes of session time (`runner.max_minutes`), then it is stopped and fails with the work kept (`/runs R1`).
+- The sandbox is a wall, not a prompt: starting a run asks nothing. The run can't read `~/.resonant`, the Keychain, your SSH keys or home, can't reach Resonant's API port, and can't start anything outside itself. It does have the network, so it can send the repo's code (or its own Claude token) anywhere; the GitHub token is never inside.
+- Run directories (`~/resonant-runs/R1`) are deleted on merge, on `/cancel`, or 7 days after the run ends.
+
+- **Verify:** `scripts/bootstrap.sh --check`, `resonant sandbox check`
+- **Expected:** exit 0; `runner sandbox  PASS`, `runs table  PASS`, and the runner rows `PASS` once steps 1–3 are done.
+- **Rollback:** empty `runner.repos` in `~/.resonant/config.yaml` and restart: no run can start (running ones finish, or `/kill` them). `resonant secret rm runner/claude_token` and `resonant secret rm runner/github_token` remove the credentials; revoke the GitHub token on github.com.
+
 ## Done
 
 `scripts/bootstrap.sh --check` exits 0 with every required step `PASS`, and you have texted Resonant and got a reply.

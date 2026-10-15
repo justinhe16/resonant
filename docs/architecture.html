@@ -227,7 +227,7 @@ pre.code{background:var(--code-bg);border:1px solid var(--border);border-radius:
       <div class="card"><h4>Terminal states</h4><ul>
         <li><code>done</code>: the runner returned <code>Done(result)</code></li>
         <li><code>failed</code>: a non-retryable failure, or attempts ran out (default 3)</li>
-        <li><code>cancelled</code>: abandoned, which also triggers worktree cleanup (planned, Phase 5)</li>
+        <li><code>cancelled</code>: abandoned, which also triggers run-dir cleanup (Phase 5a)</li>
       </ul></div>
     </div>
   </section>
@@ -317,7 +317,7 @@ const GROUPS = [
    children:["looptick","router","tasks","slots"]},
   {id:"runners", col:3, title:"Runners", sub:"implement Runner.step()", icon:"cpu",
    desc:"Pluggable workers behind one contract. A task's runner field picks which one runs it. Escalating from local to Claude switches the runner on the same task.",
-   children:["runner_local","runner_claude","runner_cu","ollama"]},
+   children:["runner_local","runner_claude","runner_sandbox","runner_cu","ollama"]},
   {id:"extensions", col:2, title:"Extensions", sub:"resonant.yaml · separate repos", icon:"puzzle",
    desc:"Product logic lives in extensions: first-party ones in this repo (github, the example) today, separate repos (trade-jev, dori, life lane) later. Phase 3 installs only first-party code, from the Mini's terminal. Each one plugs in through a strictly validated manifest and runs in its own process, so a crash never takes down the core.",
    children:["manifest","extadd","tools_cli","tools_mcp","critjobs"]},
@@ -470,7 +470,7 @@ release(task_id)`,
     files:["packages/resonant/src/resonant/loop/slots.py","tests/test_slots.py"]},
   /* ---- runners */
   runner_local:{label:"Local runner (qwen3)", phase:"1", status:"built",
-    what:"Answers routed chat tasks with the local model: up to 3 read-tool calls, each through the gate and the executor, then one JSON answer sent over the channel. run_project and anything needing more calls escalate with a templated reply (the Claude runner is Phase 5).",
+    what:"Answers routed chat tasks with the local model: up to 3 read-tool calls, each through the gate and the executor, then one JSON answer sent over the channel. run_project is an ordinary tool intent (start_run, list_runs, cancel_run, merge_run); a model asking for more than three calls ends the task with a templated reply.",
     iface:`LocalRunner(conn, *, model, channel, gate, executor, registry, max_step_s)  # name="local"
 step: resend saved reply | fast_reply | fallback/escalate
       | ≤3 × (Intent.for_tool → gate.evaluate → executor.execute) → chat_json {reply}
@@ -478,16 +478,23 @@ step: resend saved reply | fast_reply | fallback/escalate
 max_step_s = (3 + 1) × model.timeout_s + 15s   # the model times out first`,
     inv:["Every tool call goes through the gate and the executor","Code computes numbers; the LLM narrates (number guard against tool output)","Thinking is off; tool output is replayed as untrusted data","A crash after the reply is computed resends it, deduped, never twice"],
     files:["packages/resonant/src/resonant/runners/local.py","packages/resonant/src/resonant/wiring.py","tests/test_local_runner.py","tests/test_e2e.py"]},
-  runner_claude:{label:"Claude runner", phase:"5", status:"planned",
-    what:"Runs Claude Code headless through the Agent SDK, one git worktree per task. The flow is plan first: plan.md, then approval, then execution milestone by milestone, with PROGRESS.md as durable state and a fresh session per milestone.",
-    iface:`claude_session_id persisted on the task
-permission requests  → Gate
-ask_human (MCP)      → decision_log lookup | forward to requester's channel
-Stop hook            → continue | retry | escalate
-usage limit          → waiting(usage_reset, wake_at=reset)
-result               → open PR (never push to main) → waiting(ci) → report`,
-    inv:["Opens PRs only and never pushes to main","A PreToolUse guard denies risky commands","CI is polled on the tick through gh/API, with no inbound GitHub webhooks","The worktree is cleaned up automatically after merge or cancel","Holds a slot from the slot pool while a step is in flight"],
-    files:[]},
+  runner_claude:{label:"Claude runner", phase:"5a", status:"built",
+    what:"Runs Claude Code headless (claude -p, stream-json) in a throwaway clone of an owner-listed repo, inside the Seatbelt sandbox, and texts back a PR link. One task per run (kind run); steps prepare, session, harvest, publish, reply are checkpointed, so a crash resumes the same session. The GitHub token never enters the sandbox: the daemon refreshes a bare mirror, clones it before the session, reads one git bundle by fd afterwards, runs the checks and pushes. Commands: /run, /runs, /cancel, /merge, and plain words through the run_project intent. Merging is the one approval: /merge R3 is explicit, \"merge it\" in chat asks yes.",
+    iface:`start_run{repo, ask} (L3, owner) → "On it: R3 · dori. Up to 45m."  # inserts a task, kind run
+prepare → session (≤ runner.max_minutes) → harvest → publish → reply
+checks: refuse .github/, .gitmodules, tokens, > 200 files; flag Makefile, package.json, .claude/ …
+reply: "R3 done: PR #41 · <url> · 3 files · 12m  ⚠ changes Makefile"
+usage limit → waiting(usage_reset) → same session resumed
+/kill, /cancel → the whole process tree reaped; nothing pushed`,
+    inv:["No approval to start a run; the sandbox is the wall, /merge the only approval","Max 2 runs at once, 1 per repo; 45 minutes of session time","Every descendant process is reaped on end, cancel, kill and daemon start","Tokens (Claude and GitHub) are redacted from the transcript, replies and the DB","The daemon never runs git in the clone after the session starts","Only repos with CI on pull_request; a progress item in the pulse while a run goes"],
+    files:["packages/resonant/src/resonant/runners/claude.py","packages/resonant/src/resonant/runners/reaper.py","packages/resonant/src/resonant/runner/workspace.py","packages/resonant/src/resonant/runner/checks.py","packages/resonant/src/resonant/tools/runs.py","packages/resonant/src/resonant/store/runs.py","tests/test_runner_claude.py","tests/test_tools_runs.py","tests/test_e2e_runner.py"]},
+  runner_sandbox:{label:"Runner sandbox", phase:"5a", status:"built",
+    what:"A macOS Seatbelt profile (sandbox-exec) that every Claude session and its children run under. A wall, not a gate: allow-default with unconditional denies, each with a probe. No read of ~/.resonant, ~/.ssh, ~/Library or $HOME; writes only to the run dir and the runner cache; no Keychain, launchd, window server, HID, Apple Events or LaunchServices; no signals or task ports on other processes; Resonant's API port and Ollama's blocked on every address; unix sockets denied. The network is otherwise open.",
+    iface:`resonant sandbox check [--scope all|ci|local] [--json]   # every probe against the live profile
+wrap(argv, SandboxParams) → sandbox-exec -f runner.sb -D KEY=VALUE … argv
+self_check(params)  # cached 1 h by macOS build + profile hash; fails closed before each run`,
+    inv:["Paths are realpath-ed and passed as -D parameters, never string-built","A failed self-check fails the run before the session starts","Not deniable: another same-user process's env and argv (KERN_PROCARGS2), so no secret sits in any env or argv","Extension processes are not sandboxed yet (followups)"],
+    files:["packages/resonant/src/resonant/sandbox/profile.py","packages/resonant/src/resonant/sandbox/runner.sb","packages/resonant/src/resonant/sandbox/probes.py","tests/test_sandbox.py","tests/test_sandbox_local.py"]},
   runner_cu:{label:"Computer-use runner", phase:"7", status:"planned",
     what:"Browser and host computer use in the Mini's auto-login GUI session. It is used by the life lane (Gmail, Calendar, iMessage, payments).",
     iface:`gate.approve_scope(scope) -> scope_id   # declared scope, approved at L1
@@ -678,10 +685,12 @@ const PHASES = [
    items:["Manifest additions, ext validate (stdlib only, argv0 allowlist, cadence)","Terminal ext add|update|remove|list: approved read-only copy, pins, --adopt, tamper → disabled + alert","Keychain secrets (resonant secret …), per-tool injection, redaction of every encoding","Process runner: env from scratch, output caps, tracked-tree kill, fd-3 events","Scheduler + JobRunner (cronsim, catch-up, pause wins, overlap); origin scheduled; manifest approvers","Router: extension:<name> intents, toolsets, <prior_reply> wrapping; /<ext> <tool>, /help <ext>, /ext list|run|mute","Notifier from persisted events (exactly once, mute, caps, baseline) + ext health","Core daily briefing (core/briefing)","github extension: prs, pr, watch, digest; rerun_failed (L3), merge_pr (L1)","Go-live step 12, bootstrap --check rows","Deferred: MCP, critical-job LaunchAgents, veto windows, Seatbelt sandbox, iMessage /ext add, git sources, Python deps"]},
   {n:3.5, title:"Pulse", status:"built", done:6, total:6,
    items:["Items store (migration 005), SDK report(), manifest report: grant, pulse: config","Ingest and urgent path: clamp, baseline, mute, pause, 20/h cap, exactly once","Hourly core/pulse (quiet hours, approval re-mention) and the briefing Updates section","github summary item; example pnl and incident reporters","/pulse, /pulse now, \"isn't installed\" reply","End-to-end U1-U9, go-live step 13, docs"]},
+  {n:"5a", title:"Claude runner (iMessage)", status:"built", done:7, total:7,
+   items:["Seatbelt sandbox for runners: profile, probes, resonant sandbox check, fail-closed self-probe","Runner config and workspace: bare mirror, clone, bundle harvest, checks, push, gh pr create","ClaudeRunner and the runs table (migration 006): steps, resume, reaper, transcript, usage-limit wait","/run, /runs, /cancel, /merge, the start_run, list_runs, cancel_run, merge_run tools and the run_project intent","Extension secrets leave the environment (fd 4 pipe)","End-to-end tests over the fake iMessage channel, --check runner rows, go-live step 14"]},
   {n:4, title:"Dashboard", status:"planned",
    items:["Vite + React + shadcn (streak look)","jobs, runs, logs (SSE), approvals, audit, slots","loopback only; remote status via the planned status relay"]},
-  {n:5, title:"Claude runner + Slack", status:"planned",
-   items:["5A two-way Slack (Socket Mode)","Worktree per task, plan → approve → milestones, PROGRESS.md","ask_human, Stop hook, permission requests → gate","Usage-limit park, PR only → waiting(ci) polling"]},
+  {n:5, title:"Slack + richer Claude runs", status:"planned",
+   items:["5B two-way Slack (Socket Mode)","Worktree per task, plan → approve → milestones, PROGRESS.md","ask_human, Stop hook, permission requests → gate","Usage-limit park, PR only → waiting(ci) polling"]},
   {n:6, title:"On-call", status:"planned",
    items:["Slack trigger, incident threads, triage","Runbooks (L3), break-glass forward-fix (L2) with deny paths","Auto-revert watch, co-founder approves DORI actions"]},
   {n:7, title:"Life lane (private)", status:"planned",
@@ -1143,7 +1152,7 @@ function trustCards(){
     ["Phase 3 extensions: an interim bar","Extensions are first-party, owner-installed code, run as the same macOS user with the daemon's Full Disk Access. The protection is env and secret isolation, not filesystem isolation: an env built from scratch, HOME in its data dir, per-tool secrets and redaction, output caps, an argv0 allowlist, and a pinned read-only copy. Residual: any same-user process, including the owner's own Claude sessions, can read every resonant Keychain item. No third-party sources until the Seatbelt sandbox."],
     ["No public ports","The API binds to loopback only, and config rejects any other address. Remote status access is planned via the push-only status relay, never by exposing the API. Slack uses Socket Mode, iMessage uses local chat.db, and webhooks need HMAC (their transport is an open follow-up)."],
     ["trade-jev stays outside","Order execution never goes through the loop or gate. Core sees only trade-jev's jobs, read tools, events, and kill switch. The kill switch sets kv.paused, which job-guard checks."],
-    ["Claude stays in its lane","Claude works in a worktree per task, opens PRs only, and never pushes to main. A PreToolUse guard denies risky commands, and permission requests go to the gate."],
+    ["Claude stays in its lane","A Claude run works in a throwaway clone inside a macOS Seatbelt sandbox: no read of ~/.resonant, the Keychain, SSH keys or home, no way to reach Resonant's API port or start a process outside the wall. The GitHub token never enters it; the daemon pushes a branch and opens a PR, and merging is the one approval. Files CI or tooling executes are flagged in the reply, and a PR touching .github/ is refused."],
   ];
   document.getElementById("trustCards").innerHTML = cards.map(([h,b]) => `<div class="card"><h4>${esc(h)}</h4><p class="k" style="font-size:13px;margin:4px 0 0">${esc(b)}</p></div>`).join("");
 }

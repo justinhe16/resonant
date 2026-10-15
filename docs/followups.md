@@ -215,11 +215,7 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 ## Runner sandboxing (Phase 3/5)
 
-*Deferred 2026-10-13, from the Phase 2 trust model ([architecture.md](architecture.md#trust-model)).*
-
-**Problem.** Same-user processes are outside the gate's threat model: they can run `resonant approvals approve` or `resonant resume`, write `~/.resonant/resonant.db`, and read the Keychain. Phase 3 extension CLIs and Phase 5 Claude sessions run shell commands as that user.
-
-**Done when.** Runners with shell access run sandboxed (e.g. `sandbox-exec` or a separate user) with no access to `~/.resonant`, the `resonant` CLI or `/usr/bin/security`, and a test proves each is denied. For extension processes this is the [Seatbelt sandbox](#seatbelt-sandbox-for-extension-processes) below.
+*Deferred 2026-10-13, from the Phase 2 trust model ([architecture.md](architecture.md#trust-model)). **Closed 2026-10-15 for Claude runs** by Phase 5a: they run under the Seatbelt `runner` profile, with probes for each deny ([plan](phase5a-plan.md#d1-the-sandbox-resonantsandbox), `resonant sandbox check`). Extension processes are what remains: see the [Seatbelt sandbox for extension processes](#seatbelt-sandbox-for-extension-processes).*
 
 ## A `resource` wait reason for runner runs
 
@@ -296,7 +292,7 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 
 *Deferred 2026-10-14, from Phase 3 (the D13 interim bar). Needs its own security review. It must land before any third-party or network source.*
 
-**Update 2026-10-15.** The `runner` profile and `resonant/sandbox/` land in Phase 5a ([plan](phase5a-plan.md#d1-the-sandbox-resonantsandbox)). The deny-default `extension` profile was moved out of that build (it is in nobody's critical path, and on by default it risks breaking the github digest and pulse reporters). What's left here: a second template in `resonant/sandbox/`, opt-in per extension (`sandbox: true` in config), probes for `gh api` and the example extension under it, then default-on once both are proven. It reuses Phase 5a's unconditional mach denies (launchd, window server, HID, accessibility, Apple Events) and port denies on every address.
+**Update 2026-10-15.** The `runner` profile and `resonant/sandbox/` shipped in Phase 5a ([plan](phase5a-plan.md#d1-the-sandbox-resonantsandbox)), so this section is now only about extension processes. The deny-default `extension` profile was moved out of that build (it is in nobody's critical path, and on by default it risks breaking the github digest and pulse reporters). What's left here: a second template in `resonant/sandbox/`, opt-in per extension (`sandbox: true` in config), probes for `gh api` and the example extension under it, then default-on once both are proven. It reuses Phase 5a's unconditional mach denies (launchd, window server, HID, accessibility, Apple Events) and port denies on every address.
 
 **Deny-default design.**
 - Deny `lsopen`, `launchctl`, `open`, `shortcuts`.

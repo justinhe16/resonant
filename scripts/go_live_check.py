@@ -34,6 +34,7 @@ NOT_YET = "SKIP (available after Phase 1)"
 DEFAULT_CHAT_DB = "~/Library/Messages/chat.db"
 PHASE2_SCHEMA = 3  # migration 003: the Phase 2 gate's approvals columns
 PHASE3_SCHEMA = 4  # migration 004: extensions, ext_jobs
+PHASE5A_SCHEMA = 6  # migration 006: the runs table
 STALE_AFTER = timedelta(hours=1)  # pending approvals this far past expires_at are stale
 CMD_TIMEOUT_S = 10.0
 _CAFFEINATE_RE = re.compile(
@@ -315,6 +316,81 @@ def sandbox_row(settings: Settings) -> Row:
     return ("FAIL", False, "runner sandbox", f"{detail}; run: resonant sandbox check")
 
 
+def _repo_has_ci(settings: Settings, name: str) -> bool | None:
+    """Whether the repo's mirrored base branch has a workflow on ``pull_request``. Reads the
+    existing mirror only (no fetch, no network); None while there is no mirror yet."""
+    import asyncio
+
+    from resonant.runner.workspace import Workspace
+
+    ws = Workspace(settings.runner)
+    if not ws.mirror_path(name).is_dir():
+        return None
+    return asyncio.run(ws.repo_has_ci(name, refresh=False))
+
+
+def runner_rows(
+    settings: Settings,
+    version: int,
+    exists: Callable[[str], bool] = _keychain_exists,
+    has_ci: Callable[[Settings, str], bool | None] = _repo_has_ci,
+) -> list[Row]:
+    """Phase 5a (docs/go-live.md step 14): the runs table, the runner's secrets (names only,
+    never values), and for each configured repo that it has CI on ``pull_request``. All
+    advisory: a Mac with no runner repos configured is a valid install. The sandbox row is
+    ``sandbox_row``."""
+    from resonant.secrets import ANTHROPIC_KEY_REF, CLAUDE_TOKEN_REF, GITHUB_TOKEN_REF, SecretError
+
+    rows: list[Row] = []
+    if version >= PHASE5A_SCHEMA:
+        rows.append(("PASS", False, "runs table", f"schema v{version}"))
+    else:
+        rows.append(("FAIL", False, "runs table", f"schema v{version}, need {PHASE5A_SCHEMA}"))
+    repos = settings.runner.repos
+    if not repos:
+        rows.append(("SKIP", False, "runner repos", "none in runner.repos (step 14)"))
+    else:
+        rows.append(("PASS", False, "runner repos", f"{len(repos)}: {', '.join(sorted(repos))}"))
+
+    def present(ref: str) -> bool | str:
+        try:
+            return exists(ref)
+        except SecretError as e:
+            return e.reason
+
+    for label, refs, how in (
+        ("runner/github_token", (GITHUB_TOKEN_REF,), f"resonant secret set {GITHUB_TOKEN_REF}"),
+        (
+            "runner/claude_token (or runner/anthropic_key)",
+            (CLAUDE_TOKEN_REF, ANTHROPIC_KEY_REF),
+            f"claude setup-token, then resonant secret set {CLAUDE_TOKEN_REF}",
+        ),
+    ):
+        step = f"runner secret {label}"
+        found = [present(ref) for ref in refs]
+        errors = [f for f in found if isinstance(f, str)]
+        if any(f is True for f in found):
+            rows.append(("PASS", False, step, "present (value not read)"))
+        elif errors:
+            rows.append(("FAIL", False, step, errors[0]))
+        else:
+            rows.append(("FAIL", False, step, f"missing: {how}"))
+    for name in sorted(repos):
+        step = f"runner repo {name} has CI"
+        try:
+            ci = has_ci(settings, name)
+        except Exception as e:  # a broken mirror is a FAIL row, not a crash
+            rows.append(("FAIL", False, step, _err(e)))
+            continue
+        if ci is None:
+            rows.append(("SKIP", False, step, "no mirror yet: the first /run fetches and checks"))
+        elif ci:
+            rows.append(("PASS", False, step, "a workflow runs on pull_request"))
+        else:
+            rows.append(("FAIL", False, step, "no workflow on pull_request: runs would be refused"))
+    return rows
+
+
 def phase3_rows(
     settings: Settings,
     conn: sqlite3.Connection | None,
@@ -438,6 +514,8 @@ def main() -> None:
             conn.close()
 
     out(*sandbox_row(settings))
+    for row in runner_rows(settings, version):
+        out(*row)
 
     out("PASS", True, "timezone", settings.timezone)  # validated when config loads
 
