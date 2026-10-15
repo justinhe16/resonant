@@ -19,6 +19,8 @@ Phase 5a lets the runner work only on repos named in `runner.repos` in the confi
 | 3 | Approvals | Like a coworker: runs on your own repos don't ask; creating a repo asks; anything sent under your name to someone else's repo asks |
 | 4 | Repo list | Nothing hardcoded. The list is in the database, fills itself as repos are used, and extensions can add to it |
 | 5 | Upstream PRs | A classic `public_repo` token, `runner/github_public_token`, used only for fork and upstream-PR calls (2026-10-15) |
+| 7 | Who drives a run | The Claude session: it pushes, opens and updates the PR, watches CI and fixes. Resonant starts and supervises it, and keeps merge, create, upstream PRs and starter CI (D10, 2026-10-15) |
+| 8 | Session token | A per-run GitHub App installation token: one repo, 1 hour, everything except Administration (so no delete, rename, settings or protection changes). Includes Workflows unless the repo sets `allow_github_changes: false` (2026-10-15) |
 | 6 | Starter CI | Grant Workflows; Resonant adds only the fixed template file (checked by hash), behind a `yes` (2026-10-15) |
 
 ## 2. Why broad tokens are acceptable here
@@ -128,17 +130,34 @@ For a `fork` repo:
 - The daily `core/run-cleanup` job also removes mirrors not used for 30 days.
 - The registry is never pruned automatically.
 
+### D10. Claude drives the run (GitHub App token)
+
+- **Owner step:** create a GitHub App once. It's installed on your account for all repos, with these permissions: Contents, Pull requests, Issues and Workflows read/write; Actions read/write (logs and re-runs); Checks, Statuses and Metadata read; **no Administration**. Its private key goes in the Keychain as `runner/github_app_key`, and its app ID and installation ID go in the config.
+- **Per run:**
+  - The daemon signs a JWT with the key, then mints an installation token limited to `repositories=[that repo]` with the permissions above. Workflows is dropped when `allow_github_changes` is false.
+  - The token goes into the run's 0600 credential file and gh `hosts.yml` (Phase 5a plumbing). It never goes into env or argv.
+  - Tokens last 1 hour, so a run longer than 50 minutes gets a fresh one written to the same files.
+  - The token is revoked (`DELETE /installation/token`) when the run ends, is cancelled, or `/kill` fires.
+- **Session prompt:** work on a branch `resonant/R<n>-…`, push it, open a PR, wait for CI, fix failures and push again, and stop when CI is green or after N fix attempts. Never push to the base branch; branch protection blocks it anyway.
+- **Resonant keeps:**
+  - Supervision: starting runs, the kill switch, budgets, the time limit, the reaper and the texts you get.
+  - Merge: your `yes`, or merge once CI is green (D4). Before merging it runs the Phase 5a checks on the PR's diff: tokens in the history, `.github` changes noted in the merge prompt, and sensitive paths.
+  - Creating repos, upstream PRs (fork mode stays daemon-driven with the `public_repo` token) and starter CI.
+- **Lost compared with Phase 5a:** the checks run before the merge, not before each push.
+- **Risk:** a leaked token reaches one repo for at most 1 hour. With Workflows, it could also reach that repo's Actions secrets through a pushed workflow. Turn Workflows off for repos with valuable Actions secrets.
+
 ## 4. Tickets and waves
 
 | Ticket | Scope | Wave |
 |---|---|---|
 | RP-1 | Migration 007, `store/repos.py`, the config import, `runner/resolve.py` (GitHub calls behind an interface with a fake), and the workspace and `claude.py` reading the registry | 1 |
-| RP-2 | Fork mode (D3) and its upstream-PR ask | 2 |
-| RP-3 | Merge on green (D4) and the CI rule change (D5) | 2 |
+| RP-8 | GitHub App token minting, refresh and revoke; the session pushes and drives the PR; harvest and push removed for `push` repos; checks moved to before merge (D10) | 2 |
+| RP-2 | Fork mode (D3) and its upstream-PR ask | 3 |
+| RP-3 | Merge on green (D4), the CI rule change (D5) and the pre-merge checks | 3 |
 | RP-4 | `create_repo` (D6), branch protection on create, and the protection check on registration | 2 |
 | RP-5 | Extension `repos` in the SDK manifest, plus install/remove hooks and `/ext list` (D7) | 2 |
-| RP-6 | Router: the `repos` intent, the tools and slash commands, resolver wiring, few-shots, the parity test and eval rows (D8) | 3 |
-| RP-7 | e2e tests (fake `gh` for fork, merge on green and create), go-live step 14 rewrite, `test.md`, `architecture.md` and the artifact | 4 |
+| RP-6 | Router: the `repos` intent, the tools and slash commands, resolver wiring, few-shots, the parity test and eval rows (D8) | 4 |
+| RP-7 | e2e tests (fake `gh` for fork, merge on green and create), go-live step 14 rewrite (App setup), `test.md`, `architecture.md` and the artifact | 5 |
 
 Every ticket follows the usual process: a worktree, a PR, a code-reviewer pass, then a squash merge.
 
