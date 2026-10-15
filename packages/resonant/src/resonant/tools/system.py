@@ -44,7 +44,7 @@ DAEMON_STATUS = ToolSpec(
     name="daemon_status",
     description=(
         "Resonant daemon status: uptime, last loop tick, in-flight tasks, dry_run, "
-        "autonomy and paused."
+        "autonomy, paused and Claude runs per status."
     ),
     args_schema=NO_ARGS,
     effect=Effect.READ,
@@ -130,7 +130,7 @@ def daemon_status(state: DaemonState) -> dict[str, Any]:
         last_tick=state.loop.last_tick,
         inflight=state.loop.inflight,
     )
-    keys = ("version", "uptime_s", "last_tick", "inflight", "dry_run", "autonomy", "paused")
+    keys = ("version", "uptime_s", "last_tick", "inflight", "dry_run", "autonomy", "paused", "runs")
     return {k: s[k] for k in keys}
 
 

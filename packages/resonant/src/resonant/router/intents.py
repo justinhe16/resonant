@@ -55,13 +55,17 @@ INTENT_DEFINITIONS: dict[BuiltinIntent, str] = {
     "notes": "asks to save, list or delete the owner's notes",
     "reminders": "asks to set a reminder, or to list or cancel pending reminders",
     "ops": "asks Resonant to restart Ollama or itself, update itself, or show its recent logs",
-    "run_project": "asks Resonant to do work on a project: write code, open a PR, run a job",
+    "run_project": (
+        "asks Claude to do coding work in a repo (fix, change, open a PR), or about Claude runs "
+        "(R3): what is going, cancel or merge one; not general updates or status"
+    ),
     "unknown": "anything else, or unclear",
 }
 
 # Builtin tools (extension None) per intent. Filtered by principal before the model sees them.
 # A model-chosen call is always ``origin="inferred"``: the gate runs L3 and reports, asks a
-# plain yes for L2 (restart_resonant, update_resonant) and a code for L1 (clear_notes).
+# plain yes for L2 (restart_resonant, update_resonant, merge_run) and a code for L1
+# (clear_notes). start_run is L3: the sandbox is the wall, so the owner's request is the go-ahead.
 INTENT_TOOLS: dict[BuiltinIntent, tuple[str, ...]] = {
     "question": (),
     "job_control": ("list_tasks", "projects", "task_counts"),
@@ -76,7 +80,7 @@ INTENT_TOOLS: dict[BuiltinIntent, tuple[str, ...]] = {
     "notes": ("add_note", "clear_notes", "delete_note", "list_notes"),
     "reminders": ("add_reminder", "cancel_reminder", "list_reminders"),
     "ops": ("disk", "recent_logs", "restart_ollama", "restart_resonant", "update_resonant"),
-    "run_project": (),
+    "run_project": ("cancel_run", "list_runs", "merge_run", "start_run"),
     "unknown": (),
 }
 

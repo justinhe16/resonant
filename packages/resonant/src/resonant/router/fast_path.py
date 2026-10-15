@@ -96,6 +96,7 @@ from resonant.router.render import (
     render_notes,
     render_projects,
     render_reminders,
+    render_runs,
 )
 from resonant.store import extensions as ext_store
 from resonant.store.audit import audit
@@ -144,6 +145,13 @@ class FastPathResult:
 # --- templates ---------------------------------------------------------------------------
 
 
+def kill_reply(runs_ended: int) -> str:
+    """``kill switch engaged``, plus ``, 2 runs ended`` when Claude runs were stopped."""
+    if runs_ended <= 0:
+        return KILL_REPLY
+    return f"{KILL_REPLY}, {runs_ended} run{'' if runs_ended == 1 else 's'} ended"
+
+
 def _pct(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return "?"
@@ -163,7 +171,25 @@ def render_status(d: dict[str, Any]) -> str:
     ]
     if d.get("dry_run") is True:
         parts.append("dry run")
-    return " · ".join(parts)
+    text = " · ".join(parts)
+    runs = _runs_line(d.get("runs"))
+    return f"{text}\n{runs}" if runs else text
+
+
+def _runs_line(value: Any) -> str:
+    """``runs: 1 running, 1 queued, 2 ready to merge`` (nothing when none is open or ready)."""
+    counts = _as_dict(value)
+    bits: list[str] = []
+    for status, label in (
+        ("running", "running"),
+        ("waiting", "waiting"),
+        ("queued", "queued"),
+        ("ready", "ready to merge"),
+    ):
+        n = counts.get(status)
+        if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+            bits.append(f"{n} {label}")
+    return f"runs: {', '.join(bits)}" if bits else ""
 
 
 def render_text(d: dict[str, Any]) -> str:
@@ -245,6 +271,7 @@ COMMAND_RENDERS: dict[str, Render] = {
     "/logs": render_logs,
     "/ext": render_extensions,
     "/pulse": render_text,
+    "/runs": render_runs,
 }
 
 # The only keywords: everything else in plain words goes through an intent (the labeler).
@@ -346,6 +373,8 @@ class FastPath:
         self.core_jobs: dict[str, CoreRun] = {}
         # The checkout whose ``extensions/<name>/`` ships extensions (the "isn't installed" reply).
         self.repo_path: Path | None = None
+        # How many runs the last ``/kill`` ended (``ClaudeRunner.last_killed``; wiring sets it).
+        self.runs_killed: Callable[[], int] = lambda: 0
 
     def match(self, text: str) -> FastCommand | None:
         """``match_fast_path`` over this fast path's command table (extensions included)."""
@@ -413,7 +442,7 @@ class FastPath:
             return self._result(cmd, cmd.reply)
         if cmd.admin and cmd.name == "/kill":
             killswitch.engage(self.conn, actor=principal, reason="fast path /kill")
-            return self._result(cmd, KILL_REPLY, "killswitch.engage")
+            return self._result(cmd, kill_reply(self.runs_killed()), "killswitch.engage")
         if cmd.admin and cmd.name == "/resume":
             killswitch.release(self.conn, actor=principal)
             return self._result(cmd, RESUME_REPLY, "killswitch.release")

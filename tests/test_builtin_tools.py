@@ -52,6 +52,10 @@ NAMES = {
     "pulse_preview",
     "open_items",
     "briefing_preview",
+    "start_run",
+    "list_runs",
+    "cancel_run",
+    "merge_run",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {
@@ -64,6 +68,9 @@ WRITES = {
     "restart_resonant": Level.L2,
     "update_resonant": Level.L2,
     "mute_extension": Level.L3,
+    "start_run": Level.L3,
+    "cancel_run": Level.L3,
+    "merge_run": Level.L2,
 }
 
 
@@ -210,6 +217,7 @@ async def test_daemon_status(db: sqlite3.Connection, components: Components) -> 
         "dry_run",
         "autonomy",
         "paused",
+        "runs",
     }
     assert out["dry_run"] is True and out["paused"] is True and out["autonomy"] == "on"
     assert out["inflight"] == 0 and out["last_tick"] is None and out["uptime_s"] >= 0

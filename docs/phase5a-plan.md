@@ -267,3 +267,15 @@ P5A-3 review changes:
 - Busy/full/paused keep `Wait("usage_reset")`; a `resource` reason is a follow-up ([followups.md](followups.md#a-resource-wait-reason-for-runner-runs)).
 - `--max-turns` is hidden and undocumented in Claude Code's help; confirm on the first real run (test.md row 16). `--setting-sources project` makes Claude obey the repo's own `.claude/settings.json` inside the sandbox (accepted, as in D2). Whether `sandbox.enabled: false` takes effect is an owner step (row 16). The redundant `autoUpdates` setting was dropped (`DISABLE_AUTOUPDATER=1` is in the env).
 
+### P5A-4 and P5A-5 (run tools, commands and the `run_project` intent)
+
+Built together: `tools/runs.py`, `router/commands.py` (`/run`, `/runs`, `/cancel`, `/merge`), `router/fast_path.py`, `router/render.py` (`render_runs`), `router/intents.py`, `router/prefixes.py`, `runners/local.py`, `status.py`, `evals/router.example.jsonl`, the prefix goldens, `tests/test_tools_runs.py`.
+
+- **`start_run` repo enum.** Builtin specs are static, so `register_builtins` lets a module export `specs_for(ctx)`; `tools.runs` uses it to put the configured `runner.repos` names in `start_run`'s schema as an enum (and in its description). With no repos there is no enum and the description says so. The handler also refuses an unknown name before calling the runner.
+- **Refusals are results, not failures.** `start_run`, `cancel_run` and `merge_run` return `{..., text}` for a refusal (not set up, unknown repo, CI red), and `runners.local.REPORTS` sends `text` as is, because `ToolFailed` details are clipped to 120 characters, which would cut the not-set-up sentence.
+- **Merge approval.** `/merge R3` is explicit and runs (L2, owner). From chat it asks a plain yes; the prompt heading is `merge R7: PR #41 in dori <url>, changes Makefile`, built from the run's row (`tools.runs.summary_action`, registered in `components.summary_actions`).
+- **ESCALATE_REPLY is gone.** `run_project` is an ordinary tool intent. A model asking for more than three tool calls still ends the task, now with `TOO_MANY_REPLY` and the same `escalate=true` result flag.
+- **Labeler.** The labeler only labels; repo and ask are extracted by the runner model's `start_run` call, guided by a `run_project` rule in the runner system message. The labeler definition and two few-shots (`how's R3 going`, `merge R3`) changed, so the golden prefixes (both fixtures) were regenerated.
+- **`/kill` count** comes from `FastPath.runs_killed`, which `wiring` points at `ClaudeRunner.last_killed`. `/status` and `daemon_status` carry `runs` (counts per status).
+- **Not-set-up without a runner** (iMessage off): `The runner isn't set up: the Claude runner isn't running. On the Mini: set channels.imessage.enabled …`.
+- **Run codes vs approval codes.** `R` was removed from `CODE_LETTERS` (approval codes never start with R), and `clean_external` masks only approval-alphabet look-alikes, so `R3`, `k8s`, `s3` and `src/a1.py` are no longer mangled.

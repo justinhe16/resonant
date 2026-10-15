@@ -305,7 +305,7 @@ def test_cli_json_output(use_model: Any, resonant_home: Path) -> None:
     assert data["fast_path_coverage"] is not None
     assert data["misclassified"] == [
         {
-            "line": 23,
+            "line": 29,
             "expected": "unknown",
             "predicted": "question",
             "path": "llm",

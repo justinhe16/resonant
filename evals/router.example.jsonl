@@ -16,6 +16,12 @@
 {"text": "kick off a refactor of the auth module in the demo repo and open a PR", "intent": "run_project"}
 {"text": "bump the dependencies in the example project and run the tests", "intent": "run_project"}
 {"text": "write a script that renames the photos in the sample folder", "intent": "run_project"}
+{"text": "fix the typo in the README in resonant", "intent": "run_project"}
+{"text": "open a PR in demo that bumps the lint config", "intent": "run_project"}
+{"text": "what runs are going", "intent": "run_project"}
+{"text": "cancel R3", "intent": "run_project"}
+{"text": "merge R3", "intent": "run_project"}
+{"text": "how's R2 going", "intent": "run_project"}
 {"text": "remind me what a retry policy with jitter is", "intent": "question"}
 {"text": "how many ounces in a cup", "intent": "question"}
 {"text": "explain the difference between a mutex and a semaphore", "intent": "question"}

@@ -282,6 +282,7 @@ def build_imessage_stack(
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
+    router.fast_path.runs_killed = lambda: claude.last_killed
 
     owner = components.principals.owner if components.principals_loaded else None
     # /ext run core/briefing (P3-14): the briefing on demand, through this channel.

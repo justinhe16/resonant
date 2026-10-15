@@ -30,6 +30,8 @@ Update a row when you try it, with the date and anything odd.
 | 14 | Sandbox self-check (after the Phase 5a deploy) | `resonant sandbox check`: every deny and allow row passes. Claude can run it on the Mini. | 🖥 (Claude) |
 | 15 | Runner not set up yet: "fix the typo in the README in resonant" | `The runner isn't set up: …` naming what's missing | 📱 after the Phase 5a deploy |
 | 16 | First real run: Claude's own sandbox is off and the session works inside ours | `/run` a trivial ask on a CI repo; the transcript (`~/.resonant/runner/transcripts/R1.jsonl`) shows no sandbox_apply or permission errors, and the settings flag `sandbox.enabled: false` took effect (a nested sandbox would fail) | 🖥 (Claude) after the Phase 5a deploy |
+| 17 | `/runs` and `/run resonant fix the typo` before the owner steps | `/runs`: `The runner isn't set up: …`; `/run …` the same, naming what's missing. `/status` has no runs line. | 📱 after the P5A-4 deploy |
+| 18 | Plain words reach the run tools: "what runs are going", "cancel R3", "merge R3" | `run_project` intent; before the owner steps the same not-set-up text (or `No run R3.`); `merge R3` asks `yes` when R3 is ready | 📱 after the P5A-5 deploy |
 
 ## Needs the Mini
 

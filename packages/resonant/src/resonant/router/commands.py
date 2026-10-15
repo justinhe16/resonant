@@ -43,6 +43,7 @@ from resonant.tools.notes import TEXT_MAX as NOTE_TEXT_MAX
 from resonant.tools.ops import LOGS_MAX
 from resonant.tools.registry import ToolRegistry
 from resonant.tools.reminders import TEXT_MAX as REMINDER_TEXT_MAX
+from resonant.tools.runs import ASK_MAX, RUN_CODE
 from resonant.tools.when import WhenError, split_when, zone
 from resonant_sdk import ToolSpec
 from resonant_sdk.manifest import SLUG
@@ -191,6 +192,41 @@ def logs_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
     if not m or int(m.group(1)) < 1:
         raise UsageError("say how many lines, like /logs 5")
     return {"n": min(int(m.group(1)), LOGS_MAX)}
+
+
+_REPO = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
+
+
+def run_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
+    """``/run <repo> <ask>``: a repo name (lowercased) and the ask as typed. Whether the repo
+    is configured is the tool's to say."""
+    parts = rest.split(maxsplit=1)
+    if not parts:
+        raise UsageError
+    repo = parts[0].lower()
+    if not _REPO.fullmatch(repo):
+        raise UsageError("that's not a repo name")
+    if len(parts) < 2:
+        raise UsageError("say what to do")
+    return {"repo": repo, "ask": _text(parts[1], ASK_MAX)}
+
+
+def _run_code(rest: str) -> str:
+    word = _word(rest)
+    m = RUN_CODE.fullmatch(word)
+    if not m:
+        raise UsageError("that's not a run code like R3" if word else "say which run, like R3")
+    return f"R{int(m.group(1))}"
+
+
+def runs_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
+    """``/runs [code]``."""
+    return {"code": _run_code(rest)} if _word(rest) else {}
+
+
+def run_code_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
+    """``/cancel <code>`` and ``/merge <code>``."""
+    return {"code": _run_code(rest)}
 
 
 @dataclass(frozen=True)
@@ -436,6 +472,42 @@ COMMANDS: tuple[Command, ...] = (
         "pending approvals; a code shows its details",
         "job_control",
         parse=approvals_args,
+        owner_only=True,
+    ),
+    Command(
+        "/run",
+        "/run <repo> <ask>",
+        "have Claude work on a repo and open a PR",
+        "run_project",
+        tool="start_run",
+        parse=run_args,
+        owner_only=True,
+    ),
+    Command(
+        "/runs",
+        "/runs [R3]",
+        "Claude runs, active first; a code shows one",
+        "run_project",
+        tool="list_runs",
+        parse=runs_args,
+        owner_only=True,
+    ),
+    Command(
+        "/cancel",
+        "/cancel <R3>",
+        "stop a run and discard its work",
+        "run_project",
+        tool="cancel_run",
+        parse=run_code_args,
+        owner_only=True,
+    ),
+    Command(
+        "/merge",
+        "/merge <R3>",
+        "squash-merge a finished run's PR (CI must be green)",
+        "run_project",
+        tool="merge_run",
+        parse=run_code_args,
         owner_only=True,
     ),
     EXT,

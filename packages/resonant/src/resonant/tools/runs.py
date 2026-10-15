@@ -1,0 +1,331 @@
+"""Claude runner tools: ``start_run`` (L3), ``list_runs`` (L0), ``cancel_run`` (L3) and
+``merge_run`` (L2). The slash commands ``/run``, ``/runs``, ``/cancel`` and ``/merge`` and the
+``run_project`` intent reach the same tools.
+
+They are global builtins, so the gate lets only principals who can request global tools (the
+owner) call them. The handlers call ``ClaudeRunner`` (``components.runners["claude"]``, found
+at call time: the runner is built after the tools are registered) and return code-built
+``text`` that the local runner's report line and the fast path's render send as is.
+
+- ``start_run{repo, ask}``: L3, no approval (the sandbox is the wall). ``repo`` is an enum of
+  the configured ``runner.repos`` names in the registered spec (``specs_for``), so the model
+  can't invent a path; code refuses an unknown name too. A run that can't start (not set up,
+  unknown repo, paused) is a normal result with ``started: false`` and the reason as ``text``.
+- ``list_runs{code?}``: L0, active runs first. Run codes (``R3``) are not approval codes: the
+  model sees them, never an approval code. Free text from Claude (summary, failure) is
+  cleaned and clipped.
+- ``cancel_run{code}``: L3.
+- ``merge_run{code}``: L2: ``/merge R3`` is explicit and runs; a model-chosen call asks a
+  plain yes. The approval prompt (``summary_action``) names the PR and the flagged paths.
+"""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+from resonant.executor import ToolFailed, ToolHandler
+from resonant.gate.codes import clean_external
+from resonant.gate.types import Intent
+from resonant.store import runs as runs_store
+from resonant.tools.base import BuiltinContext
+from resonant_sdk import Effect, Level, ToolSpec
+
+if TYPE_CHECKING:
+    from resonant.runners.claude import Cancelled, Merged, Refused, Started
+    from resonant.store.runs import Run
+
+RUNNER = "claude"
+ASK_MAX = 4000  # ClaudeRunner's MAX_ASK (a test checks they agree)
+REPO_MAX = 32
+RUNS_MAX = 8  # runs listed
+TEXT_MAX = 120  # Claude's summary or a failure, as the model and the reply see it
+ASK_SHOWN = 60
+
+# Run codes: ``R`` and a number. ``R`` is not in the approval alphabet (``gate.codes``), so a run
+# code can't be mistaken for, or parsed as, an approval code (``yes R3`` is not a reply).
+RUN_CODE = re.compile(r"R(\d{1,9})", re.ASCII | re.IGNORECASE)
+
+
+class RunnerApi(Protocol):
+    """What the tools use of ``ClaudeRunner``."""
+
+    async def setup_missing(self) -> str | None: ...
+
+    async def start_run(self, repo: str, ask: str, principal: str) -> Started | Refused: ...
+
+    def list_runs(self, limit: int = 20) -> list[Run]: ...
+
+    def get_run(self, code: str) -> Run | None: ...
+
+    async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused: ...
+
+    async def merge_run(self, code: str) -> Merged | Refused: ...
+
+
+def _code_schema() -> dict[str, Any]:
+    return {"type": "string", "pattern": "^[Rr][0-9]{1,9}$", "description": "run code like R3"}
+
+
+START_RUN = ToolSpec(
+    name="start_run",
+    description=(
+        "Start a Claude Code run on one of the configured repos: it works in a sandbox and "
+        "opens a pull request. `ask` is what to do, in the owner's words."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "maxLength": REPO_MAX},
+            "ask": {"type": "string", "minLength": 1, "maxLength": ASK_MAX},
+        },
+        "required": ["repo", "ask"],
+        "additionalProperties": False,
+    },
+    effect=Effect.WRITE,
+    level=Level.L3,
+    timeout_s=60.0,
+)
+LIST_RUNS = ToolSpec(
+    name="list_runs",
+    description=(
+        "Claude runs, active ones first: code, repo, status and PR. Give `code` for one run. "
+        "Read only."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {"code": _code_schema()},
+        "additionalProperties": False,
+    },
+    effect=Effect.READ,
+    timeout_s=15.0,
+)
+CANCEL_RUN = ToolSpec(
+    name="cancel_run",
+    description="Stop a Claude run that is queued, running or waiting, and discard its work.",
+    args_schema={
+        "type": "object",
+        "properties": {"code": _code_schema()},
+        "required": ["code"],
+        "additionalProperties": False,
+    },
+    effect=Effect.WRITE,
+    level=Level.L3,
+    timeout_s=30.0,
+)
+MERGE_RUN = ToolSpec(
+    name="merge_run",
+    description=(
+        "Squash-merge the pull request of a finished Claude run (needs green CI). Asks the "
+        "owner first when chosen from chat."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {"code": _code_schema()},
+        "required": ["code"],
+        "additionalProperties": False,
+    },
+    effect=Effect.WRITE,
+    level=Level.L2,
+    timeout_s=120.0,
+)
+
+SPECS: tuple[ToolSpec, ...] = (START_RUN, LIST_RUNS, CANCEL_RUN, MERGE_RUN)
+
+
+def specs_for(ctx: BuiltinContext) -> tuple[ToolSpec, ...]:
+    """``SPECS`` with ``start_run``'s ``repo`` limited to the configured names (an enum, so
+    the model's call is validated against it). With no repos configured the spec says so."""
+    names = sorted(ctx.state.settings.runner.repos)
+    props = dict(cast(dict[str, Any], START_RUN.args_schema["properties"]))
+    if names:
+        props["repo"] = {"type": "string", "enum": names}
+        description = f"{START_RUN.description} Repos: {', '.join(names)}."
+    else:
+        description = f"{START_RUN.description} No repos are configured yet."
+    schema = {**START_RUN.args_schema, "properties": props}
+    start = START_RUN.model_copy(update={"args_schema": schema, "description": description})
+    return (start, *SPECS[1:])
+
+
+def summary_action(conn: sqlite3.Connection, intent: Intent) -> str | None:
+    """The approval and dry-run heading for ``merge_run`` (matched by registry identity):
+    ``merge R7: PR #41 in dori https://github.com/o/dori/pull/41, changes Makefile``, built from
+    the run's row. None for another tool or a run that isn't there."""
+    if intent.extension is not None or intent.tool != MERGE_RUN.name:
+        return None
+    code = _code(intent.args.get("code"))
+    run = runs_store.get(conn, code) if code is not None else None
+    if run is None or run.pr_number is None:
+        return None
+    head = f"merge {run.code}: PR #{run.pr_number} in {run.repo}"
+    if run.pr_url:
+        head += f" {run.pr_url}"
+    if run.flagged_paths:
+        head += f", changes {', '.join(run.flagged_paths)}"
+    return head
+
+
+# --- helpers -----------------------------------------------------------------------------
+
+
+def _code(value: object) -> str | None:
+    """``R3`` for ``"r3"`` or ``" R3 "``; None if it isn't a run code."""
+    if not isinstance(value, str):
+        return None
+    m = RUN_CODE.fullmatch(value.strip())
+    return f"R{int(m.group(1))}" if m else None
+
+
+def _need_code(tool: str, args: dict[str, Any]) -> str:
+    unknown = set(args) - {"code"}
+    if unknown:
+        raise ToolFailed(f"{tool}: unknown arguments: {sorted(unknown)}")
+    code = _code(args.get("code"))
+    if code is None:
+        raise ToolFailed(f"{tool}: code must be a run code like R3")
+    return code
+
+
+def not_set_up(why: str, how: str) -> str:
+    from resonant.runners.claude import not_set_up_text
+
+    return not_set_up_text([why], [how])
+
+
+def _refusal(result: object) -> str | None:
+    """The sentence of a ``Refused`` result, None for any other."""
+    from resonant.runners.claude import Refused
+
+    return result.reason if isinstance(result, Refused) else None
+
+
+def _clip(text: str | None, limit: int) -> str | None:
+    if not text:
+        return None
+    flat = clean_external(text)
+    return None if not flat else flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def run_json(run: Run) -> dict[str, Any]:
+    """One run for the model and the reply templates. The ask is the owner's own text; the
+    summary and failure can carry Claude's or a command's output, so they are cleaned."""
+    return {
+        "code": run.code,
+        "repo": run.repo,
+        "status": run.status,
+        "ask": _clip(run.ask, ASK_SHOWN),
+        "elapsed_s": round(run.session_seconds),
+        "pr_number": run.pr_number,
+        "pr_url": run.pr_url,
+        "files_changed": run.files_changed,
+        "flagged_paths": list(run.flagged_paths),
+        "summary": _clip(run.summary, TEXT_MAX),
+        "failure": _clip(run.failure, TEXT_MAX),
+    }
+
+
+# --- handlers ----------------------------------------------------------------------------
+
+
+def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
+    def runner() -> RunnerApi | None:
+        components = ctx.state.components
+        found = components.runners.get(RUNNER) if components is not None else None
+        return cast("RunnerApi | None", found)
+
+    def missing() -> str:
+        return not_set_up(
+            "the Claude runner isn't running",
+            "set channels.imessage.enabled in ~/.resonant/config.yaml and restart Resonant",
+        )
+
+    async def _start_run(args: dict[str, Any]) -> dict[str, Any]:
+        unknown = set(args) - {"repo", "ask"}
+        if unknown:
+            raise ToolFailed(f"start_run: unknown arguments: {sorted(unknown)}")
+        repo, ask = args.get("repo"), args.get("ask")
+        if not isinstance(repo, str) or not isinstance(ask, str) or not ask.strip():
+            raise ToolFailed("start_run: repo and ask are required strings")
+        repo = repo.strip().lower()
+        if len(ask) > ASK_MAX:
+            raise ToolFailed(f"start_run: ask is too long (at most {ASK_MAX} characters)")
+        claude = runner()
+        if claude is None:
+            return {"started": False, "text": missing()}
+        known = sorted(ctx.state.settings.runner.repos)
+        if known and repo not in known:  # code, not the model, decides which repos exist
+            return {"started": False, "text": f"No repo named {repo}. Known: {', '.join(known)}."}
+        result = await claude.start_run(repo, ask, ctx.principals.owner)
+        if (reason := _refusal(result)) is not None:
+            return {"started": False, "text": reason}
+        started = cast("Started", result)
+        return {"started": True, "code": started.code, "repo": started.repo, "text": started.text}
+
+    async def _list_runs(args: dict[str, Any]) -> dict[str, Any]:
+        unknown = set(args) - {"code"}
+        if unknown:
+            raise ToolFailed(f"list_runs: unknown arguments: {sorted(unknown)}")
+        code = None
+        if args.get("code") is not None:
+            code = _code(args["code"])
+            if code is None:
+                raise ToolFailed("list_runs: code must be a run code like R3")
+        claude = runner()
+        if claude is None:
+            return {"runs": [], "count": 0, "code": code, "setup": missing()}
+        if code is not None:
+            one = claude.get_run(code)
+            shown = [] if one is None else [one]
+            total = len(shown)
+        else:
+            found = claude.list_runs(RUNS_MAX + 1)
+            shown, total = found[:RUNS_MAX], len(found)
+        out: dict[str, Any] = {
+            "runs": [run_json(r) for r in shown],
+            "count": total,
+            "truncated": code is None and total > RUNS_MAX,
+            "code": code,
+        }
+        if not shown:
+            out["setup"] = await claude.setup_missing()
+        return out
+
+    async def _cancel_run(args: dict[str, Any]) -> dict[str, Any]:
+        code = _need_code("cancel_run", args)
+        claude = runner()
+        if claude is None:
+            return {"cancelled": False, "code": code, "text": missing()}
+        result = await claude.cancel_run(code)
+        if (reason := _refusal(result)) is not None:
+            return {"cancelled": False, "code": code, "text": reason}
+        return {"cancelled": True, "code": code, "text": cast("Cancelled", result).text}
+
+    async def _merge_run(args: dict[str, Any]) -> dict[str, Any]:
+        code = _need_code("merge_run", args)
+        claude = runner()
+        if claude is None:
+            return {"merged": False, "code": code, "text": missing()}
+        result = await claude.merge_run(code)
+        if (reason := _refusal(result)) is not None:
+            return {"merged": False, "code": code, "text": reason}
+        merged = cast("Merged", result)
+        run = claude.get_run(code)
+        text = merged.text
+        if run is not None and run.pr_url:
+            text += f"\n{run.pr_url}"
+        return {
+            "merged": True,
+            "code": code,
+            "pr_number": merged.pr_number,
+            "flagged_paths": list(merged.flagged),
+            "text": text,
+        }
+
+    return {
+        START_RUN.name: _start_run,
+        LIST_RUNS.name: _list_runs,
+        CANCEL_RUN.name: _cancel_run,
+        MERGE_RUN.name: _merge_run,
+    }

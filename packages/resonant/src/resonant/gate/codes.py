@@ -14,7 +14,7 @@ import unicodedata
 from collections.abc import Collection
 
 # No look-alikes: no 0/O, 1/I/L, 5/S, 2/Z, 8/B.
-CODE_LETTERS = "ACDEFGHJKMNPQRTUVWXY"
+CODE_LETTERS = "ACDEFGHJKMNPQTUVWXY"  # no R: run codes are R<n> (R3), see tools/runs.py
 CODE_DIGITS = "34679"
 CODE_PATTERN = re.compile(r"\[?\b([A-Z][0-9])\b\]?", re.IGNORECASE)
 
@@ -28,9 +28,13 @@ def new_code(pending: Collection[str]) -> str:
     return secrets.choice(free)
 
 
-# After normalization, any letter followed by a digit, optionally separated by spaces or
-# punctuation, could pass for a code like "A7". Those are masked.
-_CODE_LIKE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z][\s\-_.:/]*[0-9](?![0-9])")
+# After normalization, an approval-alphabet letter followed by an approval digit, optionally
+# separated by spaces or punctuation, could pass for a code like "A7". Those are masked.
+# Only the approval alphabet is masked, so run codes (R3), ``k8s``, ``s3`` and ``src/a1.py``
+# survive while anything that could pass for a real approval code (``A7``, ``a 7``) does not.
+_CODE_LIKE = re.compile(
+    rf"(?<![A-Za-z0-9])[{CODE_LETTERS}][\s\-_.:/]*[{CODE_DIGITS}](?![0-9])", re.IGNORECASE
+)
 
 
 def clean_external(text: str) -> str:

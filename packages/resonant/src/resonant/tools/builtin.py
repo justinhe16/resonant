@@ -24,7 +24,18 @@ from typing import TYPE_CHECKING
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.principals import Principals
 from resonant.store.db import utcnow
-from resonant.tools import commands, ext, notes, ops, projects, reminders, system, tasks, updates
+from resonant.tools import (
+    commands,
+    ext,
+    notes,
+    ops,
+    projects,
+    reminders,
+    runs,
+    system,
+    tasks,
+    updates,
+)
 from resonant.tools.base import BuiltinContext, BuiltinModule
 from resonant.tools.projects import PROJECTS
 from resonant.tools.registry import ToolRegistry
@@ -60,6 +71,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     ops,
     ext,
     updates,
+    runs,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 
@@ -88,9 +100,14 @@ def register_builtins(
     out: dict[HandlerKey, ToolHandler] = {}
     for module in BUILTIN_MODULES:
         handlers = module.handlers(ctx)
-        if set(handlers) != {s.name for s in module.SPECS}:
+        # A module may refine its specs from the settings (``runs``: the repo names).
+        specs_for: Callable[[BuiltinContext], tuple[ToolSpec, ...]] | None = getattr(
+            module, "specs_for", None
+        )
+        specs = specs_for(ctx) if specs_for is not None else module.SPECS
+        if set(handlers) != {s.name for s in specs}:
             raise ValueError(f"{module!r}: handlers don't match its specs")
-        for spec in module.SPECS:
+        for spec in specs:
             registry.register(spec)
             out[(None, spec.name)] = handlers[spec.name]
     return out

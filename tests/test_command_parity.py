@@ -34,6 +34,10 @@ CHAT_WRITES = {
     "restart_ollama",
     "restart_resonant",
     "update_resonant",
+    # Deliberately chat-reachable: the sandbox is the wall (start, cancel); merge asks yes.
+    "start_run",
+    "cancel_run",
+    "merge_run",
 }
 
 SPECS = {s.name: s for s in BUILTIN_SPECS}
