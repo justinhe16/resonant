@@ -290,6 +290,8 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 
 *Deferred 2026-10-14, from Phase 3 (the D13 interim bar). Needs its own security review. It must land before any third-party or network source.*
 
+**Update 2026-10-15.** The `runner` profile and `resonant/sandbox/` land in Phase 5a ([plan](phase5a-plan.md#d1-the-sandbox-resonantsandbox)). The deny-default `extension` profile was moved out of that build (it is in nobody's critical path, and on by default it risks breaking the github digest and pulse reporters). What's left here: a second template in `resonant/sandbox/`, opt-in per extension (`sandbox: true` in config), probes for `gh api` and the example extension under it, then default-on once both are proven. It reuses Phase 5a's unconditional mach denies (launchd, window server, HID, accessibility, Apple Events) and port denies on every address.
+
 **Deny-default design.**
 - Deny `lsopen`, `launchctl`, `open`, `shortcuts`.
 - Deny `mach-lookup` of `securityd` / `com.apple.SecurityServer`.
