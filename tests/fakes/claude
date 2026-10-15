@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""A fake Claude Code CLI for the runner tests: ``claude -p`` with stream-json output.
+
+It takes the flags the runner passes (and ignores most), reads the prompt on stdin like the
+real CLI, and acts out one scenario, chosen by an extra ``--scenario NAME`` the test puts in
+``claude_cmd``. Only the standard library. cwd is ``<run>/repo``, so ``<run>/tmp`` is where it
+leaves notes for the test: ``argv.json`` (flags, env and the prompt of every invocation) and
+pid files.
+
+Scenarios: happy, nochanges, slow, hang, hang_then_ok, escapee, usage_limit, error, maxturns,
+maxbudget, longline, leak, disk, makefile, github, noresult, tokens.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from typing import Any
+
+ap = argparse.ArgumentParser()
+ap.add_argument("-p", action="store_true")
+ap.add_argument("--session-id")
+ap.add_argument("--resume")
+ap.add_argument("--output-format")
+ap.add_argument("--verbose", action="store_true")
+ap.add_argument("--permission-mode")
+ap.add_argument("--strict-mcp-config", action="store_true")
+ap.add_argument("--setting-sources")
+ap.add_argument("--settings")
+ap.add_argument("--append-system-prompt")
+ap.add_argument("--max-turns")
+ap.add_argument("--max-budget-usd")
+ap.add_argument("--scenario", default="happy")
+ap.add_argument("--sleep", type=float, default=0.0)
+ap.add_argument("--leak", action="append", default=[])
+ap.add_argument("--reset-in", type=float, default=120.0)
+ap.add_argument("--file", default="claude-fix.txt")
+args = ap.parse_args()
+
+prompt = sys.stdin.read()
+session = args.resume or args.session_id
+run_dir = os.path.dirname(os.getcwd())
+tmp = os.path.join(run_dir, "tmp")
+scenario = args.scenario
+
+
+def emit(obj: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def note(name: str, text: str) -> None:
+    with open(os.path.join(tmp, name), "w") as f:
+        f.write(text)
+
+
+def git(*argv: str) -> None:
+    subprocess.run(["git", "-c", "commit.gpgsign=false", *argv], check=True, capture_output=True)
+
+
+def commit(files: dict[str, str], message: str = "Fix it") -> None:
+    for name, text in files.items():
+        path = os.path.join(os.getcwd(), name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+    git("add", "-A")
+    git("commit", "-q", "-m", message)
+
+
+def result(text: str = "Fixed it.", **extra: Any) -> None:
+    emit(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": text,
+            "session_id": session,
+            "total_cost_usd": 0.0123,
+            "usage": {"input_tokens": 11, "output_tokens": 7},
+            **extra,
+        }
+    )
+
+
+# Every invocation leaves a record: the test checks flags, env and prompt.
+log = os.path.join(tmp, "argv.json")
+history: list[Any] = json.load(open(log)) if os.path.exists(log) else []
+history.append({"argv": sys.argv[1:], "env": dict(os.environ), "prompt": prompt, "pid": os.getpid()})
+note("argv.json", json.dumps(history))
+note("claude.pid", str(os.getpid()))
+
+emit({"type": "system", "subtype": "init", "session_id": session, "cwd": os.getcwd()})
+emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "working on it"}]}})
+
+if scenario == "hang" or (scenario == "hang_then_ok" and not args.resume):
+    time.sleep(3600)
+    sys.exit(0)
+elif scenario == "usage_limit" and not os.path.exists(os.path.join(tmp, "limit-seen")):
+    note("limit-seen", "1")
+    reset = int(time.time() + args.reset_in)
+    emit(
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "result": f"Claude AI usage limit reached|{reset}",
+            "session_id": session,
+        }
+    )
+    sys.exit(1)
+elif scenario == "error":
+    emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
+          "result": "boom", "session_id": session})  # fmt: skip
+    sys.exit(1)
+elif scenario == "maxturns":
+    emit({"type": "result", "subtype": "error_max_turns", "is_error": True,
+          "session_id": session})  # fmt: skip
+    sys.exit(1)
+elif scenario == "maxbudget":
+    emit({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+          "session_id": session})  # fmt: skip
+    sys.exit(1)
+elif scenario == "noresult":
+    sys.exit(0)
+elif scenario == "nochanges":
+    result("Nothing to change.")
+    sys.exit(0)
+
+if scenario == "escapee":
+    # A child that setsid-ed into its own group, and a grandchild that setsid-ed and lost its
+    # parent (reparented to launchd): both outlive the session unless the runner reaps them.
+    sleeper = "import time; time.sleep(600)"
+    kid = subprocess.Popen([sys.executable, "-c", sleeper], start_new_session=True)
+    note("escapee.pid", str(kid.pid))
+    middle = (
+        "import subprocess, sys; "
+        f"p = subprocess.Popen([sys.executable, '-c', {sleeper!r}], start_new_session=True); "
+        f"open({os.path.join(tmp, 'orphan.pid')!r}, 'w').write(str(p.pid))"
+    )
+    subprocess.run([sys.executable, "-c", middle], check=True)
+    plain = subprocess.Popen([sys.executable, "-c", sleeper])
+    note("child.pid", str(plain.pid))
+if scenario == "leak":
+    text = " ".join(args.leak) + " " + json.dumps(dict(os.environ))
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+if scenario == "longline":
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "x" * 2_000_000}]}})
+    for leak in args.leak:  # a secret right at the cut of a line that is too long
+        emit({"type": "assistant", "message": {"content": [{"type": "text",
+              "text": "y" * (1_048_576 - 200) + leak + "z" * 500}]}})  # fmt: skip
+if scenario == "disk":
+    with open(os.path.join(tmp, "big.bin"), "wb") as f:
+        f.write(b"\0" * 4_000_000)
+    time.sleep(30)
+
+if args.sleep:
+    time.sleep(args.sleep)
+
+files = {args.file: f"fixed by {session}\n"}
+if scenario == "makefile":
+    files.update({"Makefile": "all:\n\ttrue\n", ".claude/settings.json": "{}\n"})
+if scenario == "github":
+    files[".github/workflows/evil.yml"] = "on: push\n"
+if scenario == "tokens":
+    files[args.file] = " ".join(args.leak) + "\n"
+commit(files, "Fix the flaky test")
+result("Fixed it. Added " + args.file + ".")
+sys.exit(0)

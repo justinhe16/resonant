@@ -184,7 +184,7 @@ def test_dry_run_off_fails_without_a_phase2_store(resonant_home: Path) -> None:
     )
     rows = _helper(resonant_home)
     assert rows["dry_run"] == ("FAIL", True, "dry_run off on a pre-Phase-2 install")
-    assert rows["store schema 5"][:2] == ("FAIL", True)
+    assert rows["store schema 6"][:2] == ("FAIL", True)
 
 
 def test_dry_run_off_fails_on_a_pre_phase2_store(resonant_home: Path) -> None:
@@ -195,8 +195,8 @@ def test_dry_run_off_fails_on_a_pre_phase2_store(resonant_home: Path) -> None:
         LIVE_CONFIG.replace("dry_run: true", "dry_run: false")
     )
     rows = _helper(resonant_home)
-    assert rows["store schema 5"][:2] == ("FAIL", True)
-    assert "v2 < v5" in rows["store schema 5"][2]
+    assert rows["store schema 6"][:2] == ("FAIL", True)
+    assert "v2 < v6" in rows["store schema 6"][2]
     assert rows["dry_run"][:2] == ("FAIL", True)
 
 
@@ -205,7 +205,7 @@ def test_dry_run_off_passes_on_phase2_and_needs_uv(resonant_home: Path, tmp_path
     config = LIVE_CONFIG.replace("dry_run: true", "dry_run: false")
     (resonant_home / "config.yaml").write_text(config)
     rows = _helper(resonant_home)
-    assert rows["store schema 5"][:2] == ("PASS", True)
+    assert rows["store schema 6"][:2] == ("PASS", True)
     assert rows["dry_run"] == ("PASS", True, "false (Phase 2 gate installed)")
     assert rows["ops.uv_path set"][:2] == ("FAIL", True)  # required once ops run for real
 
