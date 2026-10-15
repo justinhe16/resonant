@@ -203,3 +203,28 @@ Until steps 1–3 are done, everything else is deployable and testable: `resonan
 - Runs on repos not in the allow-list, or creating new repos.
 - Network allow-listing by domain (a filtering proxy, as Claude Code's own `/sandbox` does).
 - Members (non-owner) starting runs.
+
+## As built
+
+### P5A-1 spike (macOS 27.0.1 / 26A434, the Mini) - WIP, one blocker open
+
+Probes run under the real `runner.sb` (`resonant.sandbox.probes`). "Control" = the same call outside the sandbox succeeds, so a denial is a denial.
+
+| Probe | Result |
+|---|---|
+| Read `~/.resonant`, `~/.claude`, `~/Library`, `~/.local/bin`, `$HOME`, `/Volumes`, `/Users/Shared`, `/private/tmp`, `/private/var/folders` | EPERM (control: readable) |
+| Allow-list reads (`~/.local/share/claude`, `uv/python`), `realpath`/`getcwd` in run dir | OK (needs `file-read-metadata` on every ancestor of each allowed path, incl. the run dir's) |
+| Write `~/Library/LaunchAgents`, `~/.zshrc*`, `~/.gitconfig*`, `~/.claude`, `$HOME`, `/Volumes`, `/Users/Shared`, `/private/tmp`, `/Library` (unique nonexistent names) | EPERM, nothing created. `~/.ssh` does not exist here (ENOENT, inconclusive; covered by the `$HOME` rule) |
+| Exec `security`, `osascript`, `open`, `launchctl`, `sudo`, `crontab`, `screencapture`, the `resonant` entry point | EPERM. `/bin/ps` is setuid, so no sandboxed process can exec it at all |
+| Keychain (throwaway keychain item, then `SecKeychainCopySearchList`) | Denied. Real `/usr/bin/security` with the exec deny lifted could not read the item; a denied call fails in about 20 ms, no hang. Copied system binaries are SIGKILLed by AMFI, so copies are not a valid probe |
+| launchd job submit from Python (`launch_msg` SubmitJob) | Refused (errno 1). Control (outside) accepted a job. Refused even under a bare `(allow default)` profile: launchd rejects submits from any sandboxed caller. `com.apple.xpc.launchd*` mach-lookup is not what blocks it (denying all mach-lookup changes nothing) |
+| CGEvent / HID | `IOServiceOpen(IOHIDSystem)` refused (control opened); window-server lookups denied; `CGDisplayCreateImage` none. `CGEventPost` itself is not observable here (no effect even outside, TCC), so it rests on the lookup and IOKit denials |
+| Apple Events, `lsopen` | `osascript` runs and AppleScript works with every mach-lookup denied, so the mach deny alone does NOT stop Apple Events. Added `(deny appleevent-send)` and `(deny lsopen)`; `sandbox_check` now reports both denied. Not exercised end to end (a real Finder event hangs on a TCC prompt outside the sandbox too) |
+| `task_for_pid` / `task_name_for_pid` on another pid | Denied (control: name port obtained) |
+| Signals to other pids; own children | Other: EPERM. Own children killable. Needs `(require-not (target same-sandbox))`; `(target others)` blocked killing the session's own children |
+| `*:7777`, `*:11434` connect on 127.0.0.1, ::1, LAN IP (192.168.4.50); bind | EPERM; another loopback port refused normally (connectable) |
+| Unix sockets | Denied except mDNSResponder (ssh-agent socket denied; a run-dir socket denied) |
+| git clone/commit/bundle, `uv run pytest` from the runner cache, `http.server` on loopback, HTTPS to github.com | OK. `/usr/bin/git` is an xcrun shim that tries to write `/var/folders/.../T`; use the real git (`xcrun --find git`) in the run-local bin. `npm`: not installed on the Mini, untested |
+| `claude --version` | OK, 20 ms |
+| `claude -p` with fresh `CLAUDE_CONFIG_DIR`, no token | `Not logged in`, about 430 ms: fails fast. Needs `CLAUDE_CODE_TMPDIR=<run>/tmp` (Claude hard-codes `/tmp/claude-<uid>`). Authenticated run is an owner step |
+| **Another process's argv/env via `sysctl KERN_PROCARGS2`** | **NOT denied.** A sandboxed process reads a same-user non-SIP process's environment (control and sandbox both read the marker). Denying `process-info*`, `signal`, `mach-task-name`, `mach-priv-task-port`, `system-info`, `sysctl-read` (by name, prefix or all-but-allowlist) and combinations changes nothing. SIP-protected binaries (e.g. `/bin/sleep`) hide their env; Python, `git`, `gh` and the daemon do not. This is a blocker-class finding: it exposes any token in the env of a concurrent daemon-side process (`git push` with `GH_TOKEN`, `RESONANT_SECRET_*` for extensions) |

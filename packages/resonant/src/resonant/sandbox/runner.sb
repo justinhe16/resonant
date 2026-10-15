@@ -1,0 +1,96 @@
+;; Seatbelt profile for Claude runner sessions (docs/phase5a-plan.md, D1).
+;; A wall, not a gate: allow by default, then enumerated denies. SBPL is last-match-wins,
+;; so every deny that must hold sits AFTER the allows it overrides. Every path arrives as a
+;; -D parameter (see profile.py); nothing is spliced into this text.
+(version 1)
+(allow default)
+
+;; ---- file write: deny everywhere, then the run dir and cache ----------------------------
+(deny file-write*)
+(allow file-write*
+  (subpath (param "RUN"))
+  (subpath (param "CACHE"))
+  (literal "/dev/null")
+  (literal "/dev/dtracehelper")
+  (regex #"^/dev/tty"))
+
+;; ---- file read: deny the owner's world, then allow the run's own paths ------------------
+(deny file-read*
+  (subpath (param "HOME"))
+  (subpath "/Volumes")
+  (subpath "/Users/Shared")
+  (subpath "/private/tmp")
+  (subpath "/private/var/folders"))
+(allow file-read*
+  (subpath (param "RUN"))
+  (subpath (param "CACHE"))
+;; @READ_ALLOW@
+  )
+;; stat only on the ancestors of the allowed paths, so realpath and getcwd work
+(allow file-read-metadata
+;; @META_ALLOW@
+  )
+;; never readable, even if a toolchain path above sits inside one
+(deny file-read*
+  (subpath (string-append (param "HOME") "/.resonant"))
+  (subpath (string-append (param "HOME") "/.ssh"))
+  (subpath (string-append (param "HOME") "/.aws"))
+  (subpath (string-append (param "HOME") "/.config/gh"))
+  (subpath (string-append (param "HOME") "/.claude"))
+  (subpath (string-append (param "HOME") "/Library"))
+  (subpath (string-append (param "HOME") "/.local/bin")))
+
+;; ---- exec: defense in depth (the mach denies below do the real work) ---------------------
+(deny process-exec
+  (literal "/usr/bin/security")
+  (literal "/usr/bin/osascript")
+  (literal "/usr/bin/open")
+  (literal "/bin/launchctl")
+  (literal "/usr/bin/shortcuts")
+  (literal "/usr/bin/crontab")
+  (literal "/usr/bin/at")
+  (literal "/usr/bin/sudo")
+  (literal "/usr/sbin/screencapture")
+;; @DENY_EXEC@
+  )
+
+;; ---- mach / IPC: nothing may act outside the sandbox on the owner's behalf --------------
+(deny mach-lookup
+  (global-name-prefix "com.apple.xpc.launchd")
+  (global-name "com.apple.SecurityServer")
+  (global-name-prefix "com.apple.securityd")
+  (global-name-prefix "com.apple.windowserver")
+  (global-name-prefix "com.apple.hidsystem")
+  (global-name-prefix "com.apple.accessibility")
+  (global-name-prefix "com.apple.universalaccessd")
+  (global-name "com.apple.coreservices.appleevents")
+  (global-name "com.apple.coreservices.appleevent-send")
+  (global-name "com.apple.coreservices.launchservicesd")
+  (global-name-prefix "com.apple.lsd.")
+  (global-name-prefix "com.apple.pasteboard.")
+  (global-name-prefix "com.apple.tccd"))
+;; Apple Events and LaunchServices opens are checked as operations, not only as lookups
+(deny appleevent-send)
+(deny lsopen)
+;; synthetic input straight through the HID drivers
+(deny iokit-open-user-client
+  (iokit-user-client-class "IOHIDParamUserClient")
+  (iokit-user-client-class "IOHIDLibUserClient")
+  (iokit-user-client-class "IOHIDEventServiceUserClient"))
+(deny mach-priv-task-port)
+(deny mach-task-name)
+(deny process-info* (require-not (target same-sandbox)))
+(deny signal (require-not (target same-sandbox)))
+;; another process's argv and environment (`ps eww`) come from sysctl, not process-info
+(deny sysctl-read
+  (sysctl-name "kern.procargs")
+  (sysctl-name "kern.procargs2")
+  (sysctl-name "kern.procargs2.hash"))
+
+;; ---- network -----------------------------------------------------------------------------
+;; the daemon's API and Ollama, on every address (loopback and the LAN IP)
+(deny network-outbound (remote ip "*:7777") (remote ip "*:11434"))
+(deny network-bind (local ip "*:7777") (local ip "*:11434"))
+;; unix sockets: deny by default (docker, ssh-agent, any daemon), mDNSResponder only
+(deny network-outbound (remote unix-socket))
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
