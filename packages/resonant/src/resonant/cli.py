@@ -1159,6 +1159,7 @@ def sandbox_check(
             cache_dir=runner.cache_dir,
             secrets_dir=runner.secrets_dir,
             deny_exec=default_deny_exec(),
+            deny_read=runner.deny_read,
         ) as ctx:
             results = run_probes(ctx, scopes)
     except SandboxError as e:
