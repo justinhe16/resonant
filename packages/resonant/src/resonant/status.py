@@ -9,7 +9,7 @@ from typing import Any
 from resonant import __version__
 from resonant.config import Settings
 from resonant.monitor import health_snapshot
-from resonant.store import approvals
+from resonant.store import approvals, runs
 from resonant.store import tasks as repo
 from resonant.store.db import iso, kv_get, utcnow
 
@@ -35,5 +35,6 @@ def collect_status(
         "waiting": repo.count_waiting_by_reason(conn),
         "approvals_pending": approvals.count_pending(conn, now),
         "inflight": inflight,
+        "runs": dict(runs.count_by_status(conn)),
         "health": health_snapshot(conn),
     }

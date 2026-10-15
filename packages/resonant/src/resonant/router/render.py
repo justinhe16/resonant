@@ -199,3 +199,44 @@ def render_extensions(d: dict[str, Any]) -> str:
         lines.extend(_job_line(j) for j in core)
     text = "\n".join([head, *lines])
     return text if len(text) <= MAX_REPLY_CHARS else text[: MAX_REPLY_CHARS - 1] + "…"
+
+
+def _run_line(run: dict[str, Any]) -> str:
+    code, repo, status = run.get("code", "?"), run.get("repo", "?"), str(run.get("status", "?"))
+    bits = [f"{code} {repo}", status]
+    if status in ("running", "waiting"):
+        bits.append(duration(run.get("elapsed_s")))
+    if run.get("pr_number") is not None:
+        bits.append(f"PR #{run['pr_number']}")
+    flagged = [str(p) for p in as_list(run.get("flagged_paths"))]
+    if flagged:
+        bits.append(f"changes {', '.join(flagged)}")
+    line = "- " + " · ".join(str(b) for b in bits)
+    ask = run.get("ask")
+    return f'{line}\n  "{ask}"' if isinstance(ask, str) and ask else line
+
+
+def render_runs(d: dict[str, Any]) -> str:
+    """``/runs``: one line per run (active first), or one run in full (``/runs R3``). With no
+    runs it says so, or why the runner can't start any."""
+    runs = [r for r in (as_dict(x) for x in as_list(d.get("runs"))) if r]
+    if not runs:
+        code = d.get("code")
+        if isinstance(code, str):
+            return f"No run {code}."
+        setup = d.get("setup")
+        return setup if isinstance(setup, str) and setup else "No runs yet."
+    if isinstance(d.get("code"), str):
+        run = runs[0]
+        lines = [_run_line(run)]
+        if run.get("pr_url"):
+            lines.append(str(run["pr_url"]))
+        for key in ("summary", "failure"):
+            if run.get(key):
+                lines.append(f"{key}: {run[key]}")
+        return "\n".join(lines)
+    n_active = sum(1 for r in runs if r.get("status") in ("queued", "running", "waiting"))
+    lines = [f"Runs ({n_active} active):", *(_run_line(r) for r in runs)]
+    if d.get("truncated") is True:
+        lines.append("+ more older runs")
+    return "\n".join(lines)

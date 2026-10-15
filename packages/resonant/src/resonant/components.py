@@ -37,6 +37,7 @@ from resonant.secrets import SecretStore
 from resonant.tools import ToolRegistry
 from resonant.tools import notes as notes_tools
 from resonant.tools import ops as ops_tools
+from resonant.tools import runs as runs_tools
 from resonant.tools.builtin import register_builtins
 from resonant.tools.registry import ToolKey
 from resonant_sdk import ToolSpec
@@ -113,6 +114,11 @@ def summary_actions(conn: sqlite3.Connection) -> dict[ToolKey, SummaryAction]:
     actions: dict[ToolKey, SummaryAction] = {(None, notes_tools.CLEAR_NOTES.name): clear_notes}
     for name in ops_tools.SUMMARY_ACTIONS:
         actions[(None, name)] = ops_tools.summary_action
+
+    def merge_run(intent: Intent) -> str | None:
+        return runs_tools.summary_action(conn, intent)
+
+    actions[(None, runs_tools.MERGE_RUN.name)] = merge_run
     return actions
 
 

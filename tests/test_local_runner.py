@@ -38,8 +38,8 @@ from resonant.router.prefixes import (
     wrap_untrusted,
 )
 from resonant.runners.local import (
-    ESCALATE_REPLY,
     MAX_REPLY_CHARS,
+    TOO_MANY_REPLY,
     LocalRunner,
     numbers_in,
     summarize,
@@ -509,7 +509,7 @@ async def test_asking_for_more_than_three_calls_escalates(
 
     assert len(tool_log) == 3
     assert model.json_calls == []
-    assert [s[1] for s in h.channel.sent] == [ESCALATE_REPLY]
+    assert [s[1] for s in h.channel.sent] == [TOO_MANY_REPLY]
     t = h.task(task_id)
     assert t.result is not None
     assert t.result["escalate"] is True
@@ -618,23 +618,24 @@ async def test_router_fallback_sends_fallback_reply(make: Any) -> None:
     assert [s[1] for s in h.channel.sent] == [FALLBACK_REPLY]
 
 
-async def test_run_project_escalates_without_tools_or_model(
+async def test_run_project_is_an_ordinary_tool_intent(
     make: Any, tool_log: list[tuple[str, dict[str, Any]]]
 ) -> None:
-    model = FakeModel(tool_replies=[tc("task_counts")])
+    """No escalation: the model reads the owner's runs through list_runs like any intent."""
+    model = FakeModel(tool_replies=[tc("list_runs"), []], final={"reply": "Nothing is running."})
     h: Harness = make(model)
     task_id = h.add_task(
-        {"intent": "run_project", "toolset": [], "fallback": False}, text="fix the flaky test"
+        {"intent": "run_project", "toolset": ["list_runs", "start_run"], "fallback": False},
+        text="what runs are going",
     )
     await h.loop.run_until_idle()
-    assert model.calls == 0
-    assert tool_log == []
-    assert [s[1] for s in h.channel.sent] == [ESCALATE_REPLY]
+    assert tool_log == [("list_runs", {})]
+    assert [s[1] for s in h.channel.sent] == ["Nothing is running."]
     t = h.task(task_id)
     assert t.status == "done"
     assert t.result is not None
-    assert t.result["escalate"] is True
-    assert t.result["tools_used"] == []
+    assert t.result["escalate"] is False
+    assert t.result["tools_used"] == ["list_runs"]
 
 
 async def test_model_down_sends_one_fallback_and_task_is_done(make: Any) -> None:

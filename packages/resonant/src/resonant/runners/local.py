@@ -12,8 +12,8 @@ One step does the whole task, unless it has to wait for an approval:
    ``origin="explicit"`` is set, and only while the pinned call is exactly that call.
 4. **Fast path.** ``checkpoint.fast_reply`` (the router already ran its read) is sent as is.
 5. **No model.** ``checkpoint.fallback`` (the labeler couldn't reach the model) sends
-   ``FALLBACK_REPLY``. ``run_project`` sends ``ESCALATE_REPLY`` with ``escalate=true``:
-   that work needs the Claude runner (Phase 5). No tools run and Claude is never called.
+   ``FALLBACK_REPLY``. (``run_project`` is an ordinary tool intent: ``start_run``,
+   ``list_runs``, ``cancel_run`` and ``merge_run``, see ``tools/runs.py``.)
 6. **Context.** ``runner_system(intent, intents)``, the checkpoint's toolset (sorted), this
    principal's last few messages that started a task and our replies to them, then the
    current message wrapped by ``wrap_untrusted`` (for ``reminders``, after a code-built
@@ -114,7 +114,7 @@ from resonant.router.prefixes import (
     wrap_prior_reply,
     wrap_untrusted,
 )
-from resonant.router.render import render_disk, render_logs, render_projects
+from resonant.router.render import render_disk, render_logs, render_projects, render_runs
 from resonant.router.router import builtin_names, chat_toolset
 from resonant.runners.approve import prompt_approvers
 from resonant.runners.job import SUMMARY_MAX, done_text, failed_text
@@ -139,10 +139,7 @@ MODEL_RESULT_MAX_CHARS = 4096  # an extension tool's result, as the model sees i
 TRUNCATED = "…[truncated]"
 FINAL_MAX_TOKENS = 300
 
-ESCALATE_REPLY = (
-    "That needs the Claude runner, which arrives in Phase 5. "
-    "For now I can answer questions and check on tasks and the Mac mini."
-)
+TOO_MANY_REPLY = "That needs more steps than I take at once. Ask for one thing at a time."
 NO_ANSWER_REPLY = "I couldn't put together a reliable answer. Try /status or /tasks."
 
 FINAL_INSTRUCTION = (
@@ -240,6 +237,7 @@ _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "model_status": render_model,
     "projects": render_projects,
     "recent_logs": render_logs,
+    "list_runs": render_runs,
     "system_status": render_mini,
     "task_counts": render_counts,
 }
@@ -352,6 +350,12 @@ def _updated(d: dict[str, Any]) -> str | None:
     return None
 
 
+def _run_text(d: dict[str, Any]) -> str | None:
+    """A run tool's result is already the code-built reply (``Started.text``, a refusal)."""
+    text = d.get("text")
+    return text if isinstance(text, str) and text else None
+
+
 def _muted(d: dict[str, Any]) -> str | None:
     ext, until = d.get("extension"), d.get("until_text")
     if not isinstance(ext, str):
@@ -379,6 +383,9 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "restart_resonant": _resonant_restarting,
     "update_resonant": _updated,
     "mute_extension": _muted,
+    "start_run": _run_text,
+    "cancel_run": _run_text,
+    "merge_run": _run_text,
 }
 
 
@@ -625,8 +632,6 @@ class LocalRunner:
         if cp.get("fallback") is True:
             return _Answer(FALLBACK_REPLY, "fallback", [])
         intent = parse_intent(cp.get("intent"), self.intents) or UNKNOWN
-        if intent == "run_project":
-            return _Answer(ESCALATE_REPLY, "escalate", [], escalate=True)
 
         text = self._current_text(task, events)
         if text is None:
@@ -647,7 +652,7 @@ class LocalRunner:
                 # The side effect ran: the model may narrate, the report line is code's.
                 return _with_report(await self._final(messages, text, calls, spans), stop)
             if stop:
-                return _Answer(ESCALATE_REPLY, "escalate", _used(calls), escalate=True)
+                return _Answer(TOO_MANY_REPLY, "escalate", _used(calls), escalate=True)
             return await self._final(messages, text, calls, spans)
         except ModelUnavailableError:
             log.warning("model unavailable for task %s; sending fallback", task.id)
