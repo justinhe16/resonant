@@ -18,8 +18,8 @@ Phase 5a lets the runner work only on repos named in `runner.repos` in the confi
 | 2 | Merge | Plain `yes`. Asking to "… and merge it" gets one `yes` up front, then it merges on its own once CI is green (§3 D4) |
 | 3 | Approvals | Like a coworker: runs on your own repos don't ask; creating a repo asks; anything sent under your name to someone else's repo asks |
 | 4 | Repo list | Nothing hardcoded. The list is in the database, fills itself as repos are used, and extensions can add to it |
-| 5 | Upstream PRs need a second token? | Open: §6 Q1 |
-| 6 | Adding CI files needs the Workflows permission? | Open: §6 Q2 |
+| 5 | Upstream PRs | A classic `public_repo` token, `runner/github_public_token`, used only for fork and upstream-PR calls (2026-10-15) |
+| 6 | Starter CI | Grant Workflows; Resonant adds only the fixed template file (checked by hash), behind a `yes` (2026-10-15) |
 
 ## 2. Why broad tokens are acceptable here
 
@@ -153,7 +153,7 @@ These are end-to-end tests with a fake `gh` and a real sandbox:
 - Old `runner.repos` config entries still work after the import.
 - No token appears in the env, argv, logs or the DB (the Phase 5a scans extended to the new paths).
 
-## 6. Open questions
+## 6. Questions (answered 2026-10-15: Q1 yes, Q2 option a)
 
 **Q1. Upstream PRs need a second token.**
 GitHub's fine-grained tokens can't open PRs on repos outside your own account. RP-2 will check this against the GitHub docs. If it holds, upstream PRs need a classic token with only the `public_repo` scope, stored as `runner/github_public_token` and used only for forking and upstream PRs. That scope can also write to all of your public repos, but like the main token it never leaves the daemon.
