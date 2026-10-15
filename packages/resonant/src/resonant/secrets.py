@@ -278,10 +278,11 @@ ANTHROPIC_KEY_REF = secret_ref(RUNNER_EXT, "anthropic_key")
 
 @dataclass(frozen=True)
 class RunnerSecrets:
-    github_token: str
-    # Exactly one of these is set: the subscription token, or the API key for API billing.
-    claude_token: str | None
-    anthropic_key: str | None
+    # repr=False: a value must never reach a log line or a traceback by accident.
+    github_token: str = field(repr=False)
+    # At most one of these is set: the subscription token, or the API key for API billing.
+    claude_token: str | None = field(repr=False)
+    anthropic_key: str | None = field(repr=False)
 
     def values(self) -> list[str]:
         """Every secret value, for a ``Redactor``."""

@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from resonant import secrets as secrets_mod
 from resonant.config import RunnerConfig, RunnerRepo, load_settings
 from resonant.runner import cleanup as cleanup_mod
+from resonant.runner import workspace as workspace_mod
 from resonant.runner.checks import CheckFailed
 from resonant.runner.workspace import (
     BundleRefused,
@@ -49,13 +50,26 @@ ENV = {
     "GIT_COMMITTER_EMAIL": "t@example.com",
 }
 
-FAKE_GH = f"""#!{sys.executable}
+FAKE_GH = """#!@PY@
 import json, os, sys
-d = os.environ["GH_CONFIG_DIR"]
+d = "@STATE@"
 args = sys.argv[1:]
 stdin = sys.stdin.read() if "--body-file" in args else ""
+conf = os.environ.get("GH_CONFIG_DIR", "")
+hosts = os.path.join(conf, "hosts.yml")
+hosts_token = None
+if os.path.exists(hosts):
+    for line in open(hosts):
+        if "oauth_token:" in line:
+            hosts_token = line.split(":", 1)[1].strip()
 with open(os.path.join(d, "calls.jsonl"), "a") as f:
-    call = {{"argv": args, "token": os.environ.get("GH_TOKEN"), "stdin": stdin}}
+    call = {
+        "argv": args,
+        "env": dict(os.environ),
+        "hosts_token": hosts_token,
+        "config_dir": conf,
+        "stdin": stdin,
+    }
     f.write(json.dumps(call) + "\\n")
 def rc(name):
     p = os.path.join(d, name)
@@ -65,18 +79,22 @@ if args[:2] == ["pr", "list"]:
     print(open(prs).read() if os.path.exists(prs) else "[]")
 elif args[:2] == ["pr", "create"]:
     url = "https://github.com/own/proj/pull/41"
-    open(prs, "w").write(json.dumps([{{"number": 41, "url": url}}]))
+    open(prs, "w").write(json.dumps([{"number": 41, "url": url}]))
     print("Creating pull request...", file=sys.stderr)
     print(url)
 elif args[:2] == ["pr", "checks"]:
+    err = os.path.join(d, "checks_err")
+    if os.path.exists(err):
+        print(open(err).read(), file=sys.stderr)
     sys.exit(rc("checks_rc"))
 elif args[:2] == ["pr", "merge"]:
     sys.exit(rc("merge_rc"))
 """
 
-# Logs every git argv, then runs the real git.
+# Logs every git argv and env, then runs the real git.
 GIT_SHIM = """#!/bin/sh
 printf '%s\\n' "$*" >> "{log}"
+env >> "{envlog}"
 exec {git} "$@"
 """
 
@@ -92,7 +110,7 @@ def _ps() -> str:
 
 
 class Env:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, ci: bool = True) -> None:
         self.root = root
         self.remote = root / "remote.git"
         subprocess.run(
@@ -102,30 +120,35 @@ class Env:
         seed.mkdir()
         git(seed, "init", "-q", "-b", "main")
         (seed / "README.md").write_text("hello\n")
+        if ci:
+            (seed / ".github" / "workflows").mkdir(parents=True)
+            (seed / ".github" / "workflows" / "ci.yml").write_text("on:\n  pull_request:\n")
         git(seed, "add", "-A")
         git(seed, "commit", "-q", "-m", "base")
         git(seed, "push", "-q", str(self.remote), "main")
         self.gh = root / "bin" / "gh"
         self.gh.parent.mkdir()
-        self.gh.write_text(FAKE_GH)
+        self.gh_dir = root / "gh-state"
+        self.gh_dir.mkdir()
+        self.gh.write_text(
+            FAKE_GH.replace("@PY@", sys.executable).replace("@STATE@", str(self.gh_dir))
+        )
         self.gh.chmod(0o755)
         self.shim = root / "bin" / "git"
         self.shim_log = root / "git-calls.log"
-        self.shim.write_text(GIT_SHIM.format(log=self.shim_log, git=GIT))
+        self.env_log = root / "git-env.log"
+        self.shim.write_text(GIT_SHIM.format(log=self.shim_log, envlog=self.env_log, git=GIT))
         self.shim.chmod(0o755)
         self.cfg = RunnerConfig(
             repos={"proj": RunnerRepo(remote="github.com/own/proj")},
             work_dir=root / "runs",
             mirror_dir=root / "state" / "mirrors",
             cache_dir=root / "runs" / ".cache",
+            secrets_dir=root / "state" / "secrets",
             git_path=self.shim,
             gh_path=self.gh,
         )
         self.ws = Workspace(self.cfg, url_for=lambda repo: str(self.remote))
-
-    @property
-    def gh_dir(self) -> Path:
-        return self.cfg.mirror_dir.parent / "gh"
 
     def gh_calls(self, verb: str | None = None) -> list[dict[str, Any]]:
         """The fake gh's calls; with ``verb`` ("create"), only ``gh pr <verb>``."""
@@ -263,20 +286,23 @@ def test_branch_names() -> None:
 
 
 def test_git_env_is_hardened() -> None:
-    e = git_env(GH_TOKEN)
+    e = git_env(Path("/x/credential-helper"))
     assert e["GIT_CONFIG_GLOBAL"] == "/dev/null"
     assert e["GIT_CONFIG_NOSYSTEM"] == "1"
-    pairs = {
-        e[f"GIT_CONFIG_KEY_{i}"]: e[f"GIT_CONFIG_VALUE_{i}"]
+    pairs = [
+        (e[f"GIT_CONFIG_KEY_{i}"], e[f"GIT_CONFIG_VALUE_{i}"])
         for i in range(int(e["GIT_CONFIG_COUNT"]))
-    }
-    assert pairs["core.hooksPath"] == "/dev/null"
-    assert pairs["credential.helper"] == ""
-    assert pairs["http.https://github.com/.extraHeader"].startswith("Authorization: Basic ")
+    ]
+    assert ("core.hooksPath", "/dev/null") in pairs
+    assert pairs.index(("credential.helper", "")) < pairs.index(
+        ("credential.helper", "!/x/credential-helper")
+    )
+    assert not any("extraHeader" in k for k, _ in pairs)
     assert e["GIT_COMMITTER_NAME"] == "Resonant runner"
-    assert "http.https://github.com/.extraHeader" not in {
-        e[f"GIT_CONFIG_KEY_{i}"] for i in range(int(git_env()["GIT_CONFIG_COUNT"]))
-    }
+    assert ("credential.helper", "!/x/credential-helper") not in [
+        (git_env()[f"GIT_CONFIG_KEY_{i}"], git_env()[f"GIT_CONFIG_VALUE_{i}"])
+        for i in range(int(git_env()["GIT_CONFIG_COUNT"]))
+    ]
 
 
 # --- prepare ---------------------------------------------------------------------------------
@@ -316,10 +342,14 @@ async def test_prepare_unknown_repo_and_bad_code(env: Env) -> None:
         await env.ws.prepare("../R1", "proj", "x", github_token=GH_TOKEN)
 
 
-async def test_prepare_twice_refuses_and_failure_cleans_up(env: Env) -> None:
-    await env.prepare("R1")
-    with pytest.raises(RunnerError, match="already exists"):
-        await env.prepare("R1")
+async def test_prepare_rebuilds_a_leftover_run_dir_and_failure_cleans_up(env: Env) -> None:
+    first = await env.prepare("R1")
+    (first.run_dir / "stale.txt").write_text("from a crashed attempt")
+    (first.run_dir / "link").symlink_to(env.root)
+    second = await env.prepare("R1")
+    assert not (second.run_dir / "stale.txt").exists()
+    assert (second.repo_dir / "README.md").exists()
+    assert (env.root / "seed").exists()  # the symlink target was not followed
     env.cfg.repos["proj"] = RunnerRepo(remote="github.com/own/proj", base="nope")
     with pytest.raises(RunnerError, match="isn't a branch"):
         await env.prepare("R2")
@@ -394,7 +424,8 @@ async def test_token_never_on_argv_or_in_urls(env: Env) -> None:
     assert CLAUDE_TOKEN not in env.shim_log.read_text()
     for call in env.gh_calls():
         assert GH_TOKEN not in json.dumps(call["argv"])
-        assert call["token"] == GH_TOKEN  # by env only
+        assert call["hosts_token"] == GH_TOKEN  # by file only
+        assert GH_TOKEN not in json.dumps(call["env"])
     for config in [env.ws.mirror_path("proj") / "config", p.repo_dir / ".git" / "config"]:
         assert GH_TOKEN not in config.read_text()
     assert GH_TOKEN not in await asyncio.to_thread(_ps)
@@ -664,7 +695,7 @@ async def test_merge_needs_green_ci_and_matches_head(env: Env) -> None:
     assert argv[:3] == ["pr", "merge", "41"]
     assert "--squash" in argv
     assert argv[argv.index("--match-head-commit") + 1] == sha
-    assert merge["token"] == GH_TOKEN
+    assert merge["hosts_token"] == GH_TOKEN
 
 
 async def test_merge_failure_and_bad_input(env: Env) -> None:
@@ -801,3 +832,282 @@ def test_cleanup_job_keeps_recent_and_running(tmp_path: Path) -> None:
     assert result.errors == []
     assert (work / "R2").exists() and (work / "R4").exists()  # R4 is still running
     assert (work / ".cache").exists()
+
+
+# --- review follow-ups -----------------------------------------------------------------------
+
+
+def test_runner_secrets_repr_hides_values() -> None:
+    text = repr(SECRETS) + str(SECRETS)
+    assert GH_TOKEN not in text and CLAUDE_TOKEN not in text
+
+
+def test_runner_dirs_validated(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    assert RunnerConfig(work_dir=tmp_path / "link" / "w").work_dir == real / "w"
+    with pytest.raises(ValidationError, match="absolute"):
+        RunnerConfig(work_dir=Path("relative/runs"))
+    for mirror, work, cache in [
+        (tmp_path / "w" / "m", tmp_path / "w", tmp_path / "c"),  # mirror inside work
+        (tmp_path / "m", tmp_path / "m" / "w", tmp_path / "c"),  # work inside mirror
+        (tmp_path / "c" / "m", tmp_path / "w", tmp_path / "c"),  # mirror inside cache
+        (tmp_path / "m", tmp_path / "w", tmp_path / "m" / "c"),  # cache inside mirror
+        (tmp_path / "m", tmp_path / "m", tmp_path / "c"),  # same
+    ]:
+        with pytest.raises(ValidationError, match="overlap"):
+            RunnerConfig(mirror_dir=mirror, work_dir=work, cache_dir=cache)
+    with pytest.raises(ValidationError):
+        RunnerRepo(remote="github.com/own/..")
+    with pytest.raises(ValidationError):
+        RunnerRepo(remote="github.com/./repo")
+
+
+def test_git_env_does_not_follow_redirects() -> None:
+    e = git_env()
+    pairs = {
+        e[f"GIT_CONFIG_KEY_{i}"]: e[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(e["GIT_CONFIG_COUNT"]))
+    }
+    assert pairs["http.followRedirects"] == "false"
+
+
+async def test_repo_without_ci_is_refused(tmp_path: Path) -> None:
+    env = Env(tmp_path, ci=False)
+    with pytest.raises(RunnerError) as e:
+        await env.prepare()
+    assert str(e.value) == (
+        "proj has no CI on pull_request; the runner only works in repos with CI"
+    )
+    assert not (env.cfg.work_dir / "R1").exists()
+    assert await env.ws.repo_has_ci("proj", github_token=GH_TOKEN) is False
+
+
+async def test_repo_with_push_only_ci_is_refused(tmp_path: Path) -> None:
+    env = Env(tmp_path, ci=False)
+    seed = tmp_path / "seed"
+    (seed / ".github" / "workflows").mkdir(parents=True)
+    (seed / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "ci on push only")
+    git(seed, "push", "-q", str(env.remote), "main")
+    with pytest.raises(RunnerError, match="no CI on pull_request"):
+        await env.prepare()
+
+
+async def test_repo_has_ci(env: Env) -> None:
+    assert await env.ws.repo_has_ci("proj", github_token=GH_TOKEN) is True
+    await env.ws.refresh_mirror("proj", github_token=GH_TOKEN)
+    assert await env.ws.repo_has_ci("proj", refresh=False) is True
+    with pytest.raises(ValueError):
+        await env.ws.repo_has_ci("proj")
+
+
+async def test_harvest_forces_the_run_branch(env: Env) -> None:
+    p = await env.prepare()
+    git(p.repo_dir, "checkout", "-q", "-b", "elsewhere")  # the session wandered off
+    (p.repo_dir / "wip.txt").write_text("wip\n")
+    await env.bundle(p)
+    head = await env.ws.import_bundle(p)
+    assert (
+        git(env.ws.mirror_path("proj"), "show", "-s", "--format=%s", head) == "R1: uncommitted work"
+    )
+    assert git(p.repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == p.branch
+
+
+async def test_push_sends_the_checked_head_and_neutralizes_mentions(env: Env) -> None:
+    p = await env.prepare()
+    head = await env.deliver(p, {"a.txt": "a\n"}, "Ping @someone in the title")
+    result = await env.ws.check(p, head, SECRETS)
+    await env.ws.publish(
+        p, result, SECRETS, ask="cc @team/leads", summary="thanks @bob", still_ok=always
+    )
+    assert git(env.remote, "rev-parse", p.branch) == result.head_sha
+    create = env.gh_calls("create")[0]
+    argv: list[str] = create["argv"]
+    assert "@" + "​" in argv[argv.index("--title") + 1]
+    body = str(create["stdin"])
+    assert "@team" not in body and "@bob" not in body
+    assert "@​team/leads" in body
+
+
+async def test_merge_distinguishes_no_ci_checks(env: Env) -> None:
+    env.gh_set("checks_rc", "1")
+    env.gh_set("checks_err", "no checks reported on the 'x' branch")
+    with pytest.raises(MergeRefused, match="no CI checks reported"):
+        await env.ws.merge("proj", 41, "a" * 40, SECRETS)
+    env.gh_set("checks_err", "")
+    with pytest.raises(MergeRefused, match="isn't green"):
+        await env.ws.merge("proj", 41, "a" * 40, SECRETS)
+    env.gh_set("checks_rc", "4")
+    with pytest.raises(MergeRefused, match="errored"):
+        await env.ws.merge("proj", 41, "a" * 40, SECRETS)
+
+
+def _deep(root: Path, depth: int) -> None:
+    """A chain of directories ``depth`` deep, built with fds (paths would be too long)."""
+    root.mkdir()
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    for _ in range(depth):
+        os.mkdir("d", dir_fd=fd)
+        nxt = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+        os.close(fd)
+        fd = nxt
+    os.close(fd)
+
+
+def test_deep_tree_is_unmeasurable_and_not_deleted(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    _deep(run, cleanup_mod.MAX_DEPTH + 20)
+    assert cleanup_mod.dir_size(run) == cleanup_mod.UNMEASURABLE
+    with pytest.raises(OSError, match="too deep"):
+        cleanup_mod.rmtree_nofollow(run)
+
+
+def test_moderately_deep_tree_is_measured_and_deleted(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    _deep(run, 100)
+    assert cleanup_mod.dir_size(run) < cleanup_mod.UNMEASURABLE
+    assert cleanup_mod.rmtree_nofollow(run) is True
+    assert not run.exists()
+
+
+def test_unopenable_dir_counts_as_over_the_limit(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    (run / "hidden").mkdir(parents=True)
+    (run / "hidden" / "big").write_bytes(b"x" * 10_000)
+    (run / "hidden").chmod(0)
+    try:
+        assert cleanup_mod.dir_size(run) == cleanup_mod.UNMEASURABLE
+    finally:
+        (run / "hidden").chmod(0o700)
+
+
+def test_rmtree_clears_uchg(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    (run / "sub").mkdir(parents=True)
+    f = run / "sub" / "locked.txt"
+    f.write_text("x")
+    os.chflags(f, stat.UF_IMMUTABLE)
+    assert cleanup_mod.rmtree_nofollow(run) is True
+    assert not run.exists()
+
+
+def test_cleanup_continues_after_a_failing_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work = tmp_path / "runs"
+    for code in ("R1", "R2"):
+        (work / code).mkdir(parents=True)
+    real = cleanup_mod.delete_run_dir
+
+    def flaky(work_dir: Path, code: str) -> bool:
+        if code == "R1":
+            raise RuntimeError("boom")
+        return real(work_dir, code)
+
+    monkeypatch.setattr(cleanup_mod, "delete_run_dir", flaky)
+    result = cleanup_mod.cleanup(
+        work,
+        work / ".cache",
+        ended_at={"R1": 0.0, "R2": 0.0},
+        keep_days=7,
+        max_cache_bytes=10**9,
+        now=10**9,
+    )
+    assert result.removed_runs == ["R2"]
+    assert result.errors == ["R1: RuntimeError"]
+
+
+async def test_exec_bounds_output(tmp_path: Path) -> None:
+    from resonant.runner.checks import OutputTooLarge
+    from resonant.runner.workspace import _exec  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(OutputTooLarge):
+        await _exec(["/usr/bin/yes", "x" * 100], env={}, max_out=1000)
+
+
+# --- the token never reaches a child's env or argv ---------------------------------------------
+
+
+def test_credential_helper_hands_git_the_token(tmp_path: Path) -> None:
+    with workspace_mod.secret_dir(tmp_path / "secrets") as d:
+        helper = workspace_mod.write_git_credentials(d, GH_TOKEN)
+        assert stat.S_IMODE((d / "token").stat().st_mode) == 0o600
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700
+        assert stat.S_IMODE((tmp_path / "secrets").stat().st_mode) == 0o700
+        out = subprocess.run(
+            [GIT, "credential", "fill"],
+            env=git_env(helper),
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert "username=x-access-token" in out
+        assert f"password={GH_TOKEN}" in out
+    assert not d.exists()
+
+
+def test_gh_config_holds_the_token_in_hosts_yml(tmp_path: Path) -> None:
+    with workspace_mod.secret_dir(tmp_path / "secrets") as d:
+        config = workspace_mod.write_gh_config(d, GH_TOKEN)
+        hosts = config / "hosts.yml"
+        assert stat.S_IMODE(hosts.stat().st_mode) == 0o600
+        assert f"oauth_token: {GH_TOKEN}" in hosts.read_text()
+    assert not d.exists()
+
+
+def _exists(path: str) -> bool:
+    return Path(path).exists()
+
+
+def _leftovers(env: Env) -> list[Path]:
+    root = env.cfg.secrets_dir
+    return list(root.iterdir()) if root.exists() else []
+
+
+async def test_no_token_in_any_child_env_or_argv(env: Env) -> None:
+    p = await env.prepare()
+    head = await env.deliver(p, {"a.txt": "a\n"})
+    result = await env.ws.check(p, head, SECRETS)
+    await env.ws.publish(p, result, SECRETS, ask="x", summary="s", still_ok=always)
+    env.gh_set("checks_rc", "0")
+    await env.ws.merge("proj", 41, head, SECRETS)
+
+    git_seen = env.shim_log.read_text() + env.env_log.read_text()
+    assert "credential.helper" in env.env_log.read_text()  # the helper path was passed
+    gh_calls = env.gh_calls()
+    assert len(gh_calls) >= 4
+    for text in [git_seen, json.dumps([[c["argv"], c["env"]] for c in gh_calls])]:
+        for token in (GH_TOKEN, CLAUDE_TOKEN):
+            assert token not in text
+    for call in gh_calls:
+        assert "GH_TOKEN" not in call["env"] and "GITHUB_TOKEN" not in call["env"]
+        assert call["hosts_token"] == GH_TOKEN  # the file was there while gh ran
+        assert not _exists(call["config_dir"])  # and gone afterwards
+    assert _leftovers(env) == []
+
+
+async def test_secret_files_removed_after_failure(env: Env) -> None:
+    p, result = await _published(env)
+    # git failure: the remote vanishes
+    env.remote.rename(env.root / "gone.git")
+    with pytest.raises(RunnerError, match="pushing the branch failed"):
+        await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)  # type: ignore[arg-type]
+    assert _leftovers(env) == []
+    env.remote = env.root / "gone.git"
+    # gh failure
+    env.gh.write_text("#!/bin/sh\nexit 1\n")
+    with pytest.raises(RunnerError, match="gh pr create failed"):
+        await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)  # type: ignore[arg-type]
+    assert _leftovers(env) == []
+    # cancelled mid-call
+    with pytest.raises(asyncio.TimeoutError):
+        slow = env.root / "bin" / "slowgh"
+        slow.write_text("#!/bin/sh\nsleep 30\n")
+        slow.chmod(0o755)
+        env.cfg.gh_path = slow
+        await asyncio.wait_for(env.ws.merge("proj", 41, "a" * 40, SECRETS), 1)
+    assert _leftovers(env) == []

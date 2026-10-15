@@ -356,7 +356,7 @@ class RunnerRepo(_Section):
     @classmethod
     def _remote(cls, v: str) -> str:
         v = v.removesuffix(".git")
-        if not _RUNNER_REMOTE.fullmatch(v):
+        if not _RUNNER_REMOTE.fullmatch(v) or {".", ".."} & set(v.split("/")):
             raise ValueError('runner repo remote must look like "github.com/owner/repo"')
         return v
 
@@ -382,6 +382,8 @@ class RunnerConfig(_Section):
     work_dir: Path = Field(default=Path("~/resonant-runs"), validate_default=True)
     # Bare mirrors, daemon-only.
     mirror_dir: Path = Field(default=Path("~/.resonant/runner/mirrors"), validate_default=True)
+    # Per-call token files for git and gh (0700, daemon-only, never sandbox-readable).
+    secrets_dir: Path = Field(default=Path("~/.resonant/run-secrets"), validate_default=True)
     # Package caches shared between runs and used by nothing outside the sandbox.
     cache_dir: Path = Field(default=Path("~/resonant-runs/.cache"), validate_default=True)
     max_run_dir_mb: int = Field(default=5000, ge=100)
@@ -402,10 +404,23 @@ class RunnerConfig(_Section):
                 raise ValueError(f"runner repo name {name!r} must match [a-z][a-z0-9_-]{{0,31}}")
         return v
 
-    @field_validator("work_dir", "mirror_dir", "cache_dir")
+    @field_validator("work_dir", "mirror_dir", "cache_dir", "secrets_dir")
     @classmethod
     def _dirs(cls, v: Path) -> Path:
-        return v.expanduser()
+        v = v.expanduser()
+        if not v.is_absolute():
+            raise ValueError("runner directories must be absolute paths")
+        # Symlinks resolved now, so overlap checks and the sandbox see the same real path.
+        return v.resolve()
+
+    @model_validator(mode="after")
+    def _mirror_apart(self) -> Self:
+        # The mirror is daemon-only; the sandbox can write the work and cache dirs.
+        for private, plabel in ((self.mirror_dir, "mirror_dir"), (self.secrets_dir, "secrets_dir")):
+            for other, label in ((self.work_dir, "work_dir"), (self.cache_dir, "cache_dir")):
+                if private.is_relative_to(other) or other.is_relative_to(private):
+                    raise ValueError(f"runner.{plabel} must not overlap runner.{label}")
+        return self
 
     @field_validator("git_path", "gh_path")
     @classmethod

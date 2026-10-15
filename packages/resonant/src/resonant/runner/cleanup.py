@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
+import fcntl
 import os
 import re
 import stat
+import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -39,22 +42,78 @@ def _entries(fd: int) -> list[tuple[str, os.stat_result]]:
     return out
 
 
-def _remove_children(fd: int) -> None:
-    os.fchmod(fd, 0o700)  # a directory the session made unreadable or read-only
-    for name, st in _entries(fd):
-        if stat.S_ISDIR(st.st_mode):
-            try:
-                child = _open_dir(name, fd)
-            except PermissionError:
-                os.chmod(name, 0o700, dir_fd=fd, follow_symlinks=False)
-                child = _open_dir(name, fd)
-            try:
-                _remove_children(child)
-            finally:
-                os.close(child)
-            os.rmdir(name, dir_fd=fd)
-        else:
-            os.unlink(name, dir_fd=fd)  # a symlink is removed as a link
+MAX_DEPTH = 256  # deeper trees are refused (deleted never, counted as over any limit)
+
+
+def _clear_flags(dir_fd: int, name: str) -> None:
+    """Clear immutable flags (``uchg``) on an entry the session set them on."""
+    # Python has no fchflags, so this goes by the directory's real path (F_GETPATH) and
+    # doesn't follow a link at the last component. The only effect of losing a race here
+    # is clearing a flag elsewhere; nothing is read, written or deleted through it.
+    getpath = getattr(fcntl, "F_GETPATH", None)
+    if getpath is None or not hasattr(os, "chflags"):
+        return
+    with contextlib.suppress(OSError):
+        real = fcntl.fcntl(dir_fd, getpath, b"\0" * 1024).split(b"\0", 1)[0].decode()
+        os.chflags(os.path.join(real, name), 0, follow_symlinks=False)  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def _retry_flags(fn: Callable[[], None], dir_fd: int, name: str) -> None:
+    try:
+        fn()
+    except PermissionError:
+        _clear_flags(dir_fd, name)
+        fn()
+
+
+@dataclass
+class _Frame:
+    fd: int
+    name: str  # in the parent
+    parent_fd: int
+    pending: list[tuple[str, os.stat_result]]
+
+
+def _open_for_delete(name: str, parent_fd: int) -> _Frame:
+    try:
+        fd = _open_dir(name, parent_fd)
+    except PermissionError:
+        os.chmod(name, 0o700, dir_fd=parent_fd, follow_symlinks=False)
+        fd = _open_dir(name, parent_fd)
+    try:
+        os.fchmod(fd, 0o700)  # a directory the session made unreadable or read-only
+        return _Frame(fd, name, parent_fd, _entries(fd))
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _delete_tree(parent_fd: int, name: str) -> None:
+    """Iterative delete of directory ``name`` in ``parent_fd``: one open fd per level (at
+    most ``MAX_DEPTH``), no recursion, symlinks unlinked as links."""
+    stack = [_open_for_delete(name, parent_fd)]
+    try:
+        while stack:
+            top = stack[-1]
+            if top.pending:
+                child, st = top.pending.pop()
+                if stat.S_ISDIR(st.st_mode):
+                    if len(stack) >= MAX_DEPTH:
+                        raise OSError(errno.ELOOP, "directory tree too deep to delete")
+                    stack.append(_open_for_delete(child, top.fd))
+                else:
+                    _retry_flags(lambda c=child, f=top.fd: os.unlink(c, dir_fd=f), top.fd, child)
+            else:
+                stack.pop()
+                os.close(top.fd)
+                _retry_flags(
+                    lambda f=top.parent_fd, n=top.name: os.rmdir(n, dir_fd=f),
+                    top.parent_fd,
+                    top.name,
+                )
+    finally:
+        for frame in stack:
+            os.close(frame.fd)
 
 
 def rmtree_nofollow(path: Path) -> bool:
@@ -74,43 +133,57 @@ def rmtree_nofollow(path: Path) -> bool:
             return True
         if not stat.S_ISDIR(st.st_mode):
             raise NotADirectoryError(str(path))
-        fd = _open_dir(path.name, parent_fd)
-        try:
-            _remove_children(fd)
-        finally:
-            os.close(fd)
-        os.rmdir(path.name, dir_fd=parent_fd)
+        _delete_tree(parent_fd, path.name)
         return True
     finally:
         os.close(parent_fd)
 
 
+UNMEASURABLE = sys.maxsize
+
+
 def dir_size(path: Path) -> int:
-    """Bytes in use under ``path`` (allocated blocks), not following symlinks. 0 if missing."""
+    """Bytes in use under ``path`` (allocated blocks), not following symlinks. 0 if missing.
+
+    A tree that can't be measured (a directory that won't open, or one nested deeper than
+    ``MAX_DEPTH``) returns ``UNMEASURABLE``, which is over any limit: the disk watchdog must
+    not be beaten by hiding files where it can't look.
+    """
     try:
-        fd = _open_dir(str(path), None)
+        root = _open_dir(str(path), None)
     except (FileNotFoundError, NotADirectoryError):
         return 0
-    try:
-        return _size(fd)
-    finally:
-        os.close(fd)
-
-
-def _size(fd: int) -> int:
+    except OSError:
+        return UNMEASURABLE
     total = 0
-    for name, st in _entries(fd):
-        total += st.st_blocks * 512
-        if stat.S_ISDIR(st.st_mode):
-            try:
-                child = _open_dir(name, fd)
-            except OSError:
+    stack: list[tuple[int, list[tuple[str, os.stat_result]]]] = [(root, _entries(root))]
+    try:
+        while stack:
+            fd, pending = stack[-1]
+            if not pending:
+                stack.pop()
+                os.close(fd)
                 continue
-            try:
-                total += _size(child)
-            finally:
-                os.close(child)
-    return total
+            name, st = pending.pop()
+            total += st.st_blocks * 512
+            if stat.S_ISDIR(st.st_mode):
+                if len(stack) >= MAX_DEPTH:
+                    return UNMEASURABLE
+                try:
+                    child = _open_dir(name, fd)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return UNMEASURABLE
+                try:
+                    stack.append((child, _entries(child)))
+                except OSError:
+                    os.close(child)
+                    return UNMEASURABLE
+        return total
+    finally:
+        for fd, _ in stack:
+            os.close(fd)
 
 
 async def watch_disk(
@@ -227,7 +300,7 @@ def cleanup(
         try:
             if delete_run_dir(work_dir, code):
                 result.removed_runs.append(code)
-        except OSError as e:
-            result.errors.append(f"{code}: {e.strerror or type(e).__name__}")
+        except Exception as e:  # one bad run dir must not stop the rest
+            result.errors.append(f"{code}: {getattr(e, 'strerror', None) or type(e).__name__}")
     result.cache_freed_bytes = prune_cache(cache_dir, max_cache_bytes)
     return result

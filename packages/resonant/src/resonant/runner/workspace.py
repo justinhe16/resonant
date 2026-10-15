@@ -4,8 +4,14 @@
 Trust rules this module keeps:
 
 - The GitHub token is only ever given to the daemon's own git (in the bare mirror) and to
-  ``gh``, by environment (``GIT_CONFIG_COUNT`` / ``GH_TOKEN``). It is never on an argv, in a
-  remote URL or in a file, and never goes into the sandbox.
+  ``gh``, and never by argv or environment: a sandboxed process can read any same-user
+  process's env and argv. It goes in a 0600 file in a fresh 0700 dir under
+  ``runner.secrets_dir`` (``~/.resonant/run-secrets``, which the sandbox's ``$HOME`` read
+  deny covers), created right before the call and removed right after, success or not.
+  git reads it through a credential helper script; ``gh`` through a ``hosts.yml`` in its own
+  ``GH_CONFIG_DIR`` (``gh`` prefers the config token and never reaches for the Keychain
+  when it has one). Only the paths are in env. The token is never in a remote URL, and
+  never goes into the sandbox.
 - Every git command runs with ``GIT_CONFIG_NOSYSTEM=1``, ``GIT_CONFIG_GLOBAL=/dev/null``,
   ``core.hooksPath=/dev/null``, no credential helper and an absolute git binary. The
   committer comes from the environment, never from a config file.
@@ -13,21 +19,25 @@ Trust rules this module keeps:
   three commands, all in ``prepare``, before any sandboxed process exists. The bundle the
   session leaves behind is read by file descriptor and fetched into the mirror with fsck.
 - The daemon writes nothing into a run dir after ``prepare``.
+- Accepted risk: the package cache (``runner.cache_dir``) is shared between runs, so one run
+  can poison it for the next; it sits inside the same sandbox and nothing else uses it.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import os
 import re
+import shlex
 import signal
 import stat
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+import tempfile
+from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from resonant.config import RunnerConfig, RunnerRepo
 from resonant.redact import Redactor
@@ -35,7 +45,9 @@ from resonant.runner.checks import (
     CheckResult,
     GitError,
     GitRunner,
+    OutputTooLarge,
     check_texts,
+    ci_present,
     run_checks,
 )
 from resonant.runner.cleanup import RUN_CODE, rmtree_nofollow
@@ -57,13 +69,15 @@ _ERR_CLIP = 300
 # argv: repo, out.bundle, base sha, branch, git, commit message.
 HARVEST_SCRIPT = """set -e
 cd "$1"
-g="$5"
-"$g" -c core.hooksPath=/dev/null add -A
-if ! "$g" -c core.hooksPath=/dev/null diff --cached --quiet; then
-  "$g" -c core.hooksPath=/dev/null commit -q --no-verify -m "$6"
+bin="$5"
+g() { "$bin" -c core.hooksPath=/dev/null -c gc.auto=0 -c core.fsmonitor=false "$@"; }
+g symbolic-ref HEAD "refs/heads/$4"
+g add -A
+if ! g diff --cached --quiet; then
+  g commit -q --no-verify -m "$6"
 fi
-[ "$("$g" rev-list --count "$3..$4")" = 0 ] && exit 0
-"$g" bundle create -q "$2" "$3..$4"
+[ "$(g rev-list --count "$3..$4")" = 0 ] && exit 0
+g bundle create -q "$2" "$3..$4"
 """
 
 
@@ -109,13 +123,14 @@ def branch_name(code: str, ask: str) -> str:
     return f"resonant/{code.lower()}-{slugify(ask)}"
 
 
-def git_env(token: str | None = None) -> dict[str, str]:
-    """A from-scratch git environment: no user or system config, no hooks, no credential
-    helper, no prompts. With a token, an Authorization header scoped to github.com."""
-    config = [("core.hooksPath", "/dev/null"), ("credential.helper", "")]
-    if token:
-        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-        config.append(("http.https://github.com/.extraHeader", f"Authorization: Basic {basic}"))
+def git_env(helper: Path | None = None) -> dict[str, str]:
+    """A from-scratch git environment: no user or system config, no hooks, no prompts, no
+    redirects, and a credential helper only when ``helper`` (a script path, never a token)
+    is given."""
+    config = [("core.hooksPath", "/dev/null"), ("http.followRedirects", "false")]
+    config.append(("credential.helper", ""))  # reset any inherited helper
+    if helper is not None:
+        config.append(("credential.helper", f"!{shlex.quote(str(helper))}"))
     env = {
         "PATH": _SAFE_PATH,
         "HOME": "/var/empty",
@@ -130,6 +145,77 @@ def git_env(token: str | None = None) -> dict[str, str]:
         env[f"GIT_CONFIG_KEY_{i}"] = key
         env[f"GIT_CONFIG_VALUE_{i}"] = value
     return env
+
+
+CREDENTIAL_HELPER = """#!/bin/sh
+# git credential helper: answers "get" from a 0600 file next to it.
+[ "$1" = get ] || exit 0
+IFS= read -r token < "$(dirname "$0")/token"
+printf 'username=x-access-token\\npassword=%s\\n' "$token"
+"""
+
+
+def _write_private(path: Path, text: str, mode: int = 0o600) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def secret_dir(base: Path) -> Generator[Path]:
+    """A fresh 0700 dir under ``base`` (itself 0700, daemon-only), removed on exit whether
+    the body succeeded or not. File reads in it are protected by the sandbox's ``$HOME``
+    read deny (``~/.resonant`` is denied), not by anything in here."""
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = Path(tempfile.mkdtemp(prefix="call-", dir=base))  # mkdtemp is 0700
+    try:
+        yield path
+    finally:
+        rmtree_nofollow(path)
+
+
+def write_git_credentials(dir_: Path, token: str) -> Path:
+    """Put the token and the credential helper script in ``dir_``; returns the helper."""
+    _write_private(dir_ / "token", token + "\n")
+    helper = dir_ / "credential-helper"
+    _write_private(helper, CREDENTIAL_HELPER, 0o700)
+    return helper
+
+
+def write_gh_config(dir_: Path, token: str) -> Path:
+    """A ``GH_CONFIG_DIR`` with a ``hosts.yml`` holding the token; returns the dir."""
+    config = dir_ / "gh"
+    config.mkdir(mode=0o700)
+    _write_private(
+        config / "hosts.yml",
+        f"github.com:\n    oauth_token: {token}\n    git_protocol: https\n",
+    )
+    return config
+
+
+async def _read_limited(stream: asyncio.StreamReader, limit: int | None) -> bytes:
+    buf = bytearray()
+    while chunk := await stream.read(1 << 16):
+        buf += chunk
+        if limit is not None and len(buf) > limit:
+            raise OutputTooLarge
+    return bytes(buf)
+
+
+async def _drain(stream: asyncio.StreamReader) -> None:
+    while await stream.read(1 << 16):
+        pass
+
+
+async def _feed(proc: asyncio.subprocess.Process, data: bytes) -> None:
+    assert proc.stdin is not None
+    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+        proc.stdin.write(data)
+        await proc.stdin.drain()
+    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+        proc.stdin.close()
 
 
 @dataclass(frozen=True)
@@ -147,6 +233,7 @@ async def _exec(
     stdin: bytes | None = None,
     timeout_s: float = GIT_TIMEOUT_S,
     redact: Iterable[str] = (),
+    max_out: int | None = None,
 ) -> Exec:
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -157,11 +244,34 @@ async def _exec(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
+    stdout, stderr = proc.stdout, proc.stderr
+    assert stdout is not None and stderr is not None
+
+    async def run() -> tuple[bytes, bytes]:
+        t_out = asyncio.create_task(_read_limited(stdout, max_out))
+        t_err = asyncio.create_task(_read_limited(stderr, 1 << 20))
+        t_in = asyncio.create_task(_feed(proc, stdin)) if stdin is not None else None
+        tasks: list[asyncio.Future[Any]] = [t_out, t_err, *([t_in] if t_in else [])]
+        try:
+            out, err = await asyncio.gather(t_out, t_err)
+            if t_in:
+                await t_in
+            await proc.wait()
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return out, err
+
     try:
-        out, err = await asyncio.wait_for(proc.communicate(stdin), timeout_s)
+        out, err = await asyncio.wait_for(run(), timeout_s)
     except BaseException:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
+        # A paused pipe never reaches EOF, and the exit isn't reported until it does.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.gather(_drain(stdout), _drain(stderr)), 5)
         await proc.wait()
         raise
     text = Redactor(redact).text(err.decode(errors="replace")).strip()
@@ -171,7 +281,7 @@ async def _exec(
 def build_pr_body(code: str, repo: RunnerRepo, ask: str, summary: str, result: CheckResult) -> str:
     """Code-built PR body: the run, the ask (unless ``quote_ask`` is off), Claude's summary,
     the checks and the flagged paths."""
-    lines = [f"Resonant run {code}."]
+    lines = [f"Resonant run {code}."]  # untrusted text below has @ neutralized
     if repo.quote_ask:
         quoted = ask.strip()[:MAX_ASK_QUOTE].replace("\n", "\n> ")
         lines += ["", "Ask:", f"> {quoted}"]
@@ -180,7 +290,8 @@ def build_pr_body(code: str, repo: RunnerRepo, ask: str, summary: str, result: C
     lines += ["", f"Checks: {result.files} files, {result.changed_bytes} bytes changed."]
     if result.flagged:
         lines.append(result.flag_line)
-    return "\n".join(lines) + "\n"
+    # A zero-width space after "@" so the PR can't ping users or teams.
+    return "\n".join(lines).replace("@", "@\u200b") + "\n"
 
 
 @dataclass(frozen=True)
@@ -256,8 +367,13 @@ class Workspace:
     def _mirror_git(self, repo_name: str) -> GitRunner:
         mirror = self.mirror_path(repo_name)
 
-        async def git(*args: str, stdin: bytes | None = None) -> bytes:
-            res = await _exec([self._git_bin, "-C", str(mirror), *args], env=git_env(), stdin=stdin)
+        async def git(*args: str, stdin: bytes | None = None, max_out: int | None = None) -> bytes:
+            res = await _exec(
+                [self._git_bin, "-C", str(mirror), *args],
+                env=git_env(),
+                stdin=stdin,
+                max_out=max_out,
+            )
             if res.returncode != 0:
                 raise GitError(args, res.returncode, res.stderr)
             return res.stdout
@@ -272,13 +388,20 @@ class Workspace:
         cwd: Path | None = None,
         stdin: bytes | None = None,
     ) -> bytes:
-        res = await _exec(
-            [self._git_bin, *args],
-            env=git_env(token),
-            cwd=cwd,
-            stdin=stdin,
-            redact=[token] if token else (),
-        )
+        """Run git. With a ``token``, it's written to a private file for the length of this
+        call and handed over by a credential helper, never by env or argv."""
+        with contextlib.ExitStack() as stack:
+            helper = None
+            if token:
+                tmp = stack.enter_context(secret_dir(self.cfg.secrets_dir))
+                helper = write_git_credentials(tmp, token)
+            res = await _exec(
+                [self._git_bin, *args],
+                env=git_env(helper),
+                cwd=cwd,
+                stdin=stdin,
+                redact=[token] if token else (),
+            )
         if res.returncode != 0:
             raise GitError(args, res.returncode, res.stderr)
         return res.stdout
@@ -291,7 +414,10 @@ class Workspace:
         return mirror
 
     async def _refresh(self, repo_name: str, token: str) -> None:
-        """Fetch the remote's branches into the mirror. Caller holds the mirror lock."""
+        """Fetch the remote's branches into the mirror. Caller holds the mirror lock.
+
+        No fsckObjects here: the remote is the owner's own repo, and old histories often
+        fail fsck. The untrusted input (the session's bundle) is fetched with fsck."""
         repo = self._repo(repo_name)
         mirror = await self._ensure_mirror(repo_name)
         await self._git(
@@ -315,39 +441,64 @@ class Workspace:
 
     # -- prepare --
 
+    async def repo_has_ci(
+        self, repo_name: str, *, github_token: str | None = None, refresh: bool = True
+    ) -> bool:
+        """Whether the repo's base branch has a workflow that runs on ``pull_request``
+        (the runner only works in repos with CI). Fails closed. With ``refresh`` the mirror
+        is brought up to date first; this is also what a ``--check`` row per repo can use."""
+        repo = self._repo(repo_name)
+        async with self.mirror_lock(repo_name):
+            if refresh:
+                if github_token is None:
+                    raise ValueError("refresh needs the GitHub token")
+                await self._refresh(repo_name, github_token)
+            try:
+                return await ci_present(self._mirror_git(repo_name), f"refs/heads/{repo.base}")
+            except GitError:
+                return False
+
     async def prepare(self, code: str, repo_name: str, ask: str, *, github_token: str) -> Prepared:
-        """Refresh the mirror, clone it into ``<work_dir>/<code>/repo`` and branch. The only
-        daemon-side git in the clone, and it happens before the session exists."""
+        """Refresh the mirror, check the repo has CI, clone it into ``<work_dir>/<code>/repo``
+        and branch. The only daemon-side git in the clone, and it happens before the session
+        exists.
+
+        Invariant for the sandbox (P5A-1 probes it): the only sandbox-writable path is
+        ``<work_dir>/<code>`` (plus the cache), so ``work_dir`` and the mirror dir are never
+        written by a session. A leftover ``<code>`` dir (a crash before the session started)
+        is daemon-owned and is deleted and rebuilt.
+        """
         if not RUN_CODE.fullmatch(code):
             raise RunnerError(f"bad run code {code!r}")
         repo = self._repo(repo_name)
         run_dir = self.cfg.work_dir / code
-        run_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
+        repo_dir = run_dir / "repo"
+        branch = branch_name(code, ask)
+        url = self._url_for(repo)
+        async with self.mirror_lock(repo_name):
+            await self._refresh(repo_name, github_token)
+            mirror = self.mirror_path(repo_name)
+            git = self._mirror_git(repo_name)
+            try:
+                base_sha = (await git("rev-parse", "--verify", f"refs/heads/{repo.base}")).decode()
+            except GitError:
+                raise RunnerError(f"{repo.base} isn't a branch of {repo_name}") from None
+            base_sha = base_sha.strip()
+            try:
+                has_ci = await ci_present(git, base_sha)
+            except GitError:
+                has_ci = False
+            if not has_ci:
+                raise RunnerError(
+                    f"{repo_name} has no CI on pull_request; the runner only works in repos with CI"
+                )
+
+            run_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            await asyncio.to_thread(rmtree_nofollow, run_dir)
             run_dir.mkdir(mode=0o700)
-        except FileExistsError:
-            raise RunnerError(f"run dir for {code} already exists") from None
-        try:
-            for sub in ("home", "tmp"):
-                (run_dir / sub).mkdir(mode=0o700)
-            repo_dir = run_dir / "repo"
-            branch = branch_name(code, ask)
-            url = self._url_for(repo)
-            async with self.mirror_lock(repo_name):
-                await self._refresh(repo_name, github_token)
-                mirror = self.mirror_path(repo_name)
-                try:
-                    base_sha = (
-                        (
-                            await self._mirror_git(repo_name)(
-                                "rev-parse", "--verify", f"refs/heads/{repo.base}"
-                            )
-                        )
-                        .decode()
-                        .strip()
-                    )
-                except GitError:
-                    raise RunnerError(f"{repo.base} isn't a branch of {repo_name}") from None
+            try:
+                for sub in ("home", "tmp"):
+                    (run_dir / sub).mkdir(mode=0o700)
                 await self._git(
                     [
                         "clone",
@@ -362,11 +513,11 @@ class Workspace:
                     ],
                     cwd=run_dir,
                 )
-            await self._git(["-C", str(repo_dir), "remote", "set-url", "origin", url])
-            await self._git(["-C", str(repo_dir), "checkout", "-q", "-b", branch])
-        except BaseException:
-            await asyncio.to_thread(rmtree_nofollow, run_dir)
-            raise
+                await self._git(["-C", str(repo_dir), "remote", "set-url", "origin", url])
+                await self._git(["-C", str(repo_dir), "checkout", "-q", "-b", branch])
+            except BaseException:
+                await asyncio.to_thread(rmtree_nofollow, run_dir)
+                raise
         return Prepared(code, repo_name, run_dir, repo_dir, branch, repo.base, base_sha)
 
     # -- harvest --
@@ -470,25 +621,29 @@ class Workspace:
     async def _gh(
         self, args: Sequence[str], secrets: RunnerSecrets, *, stdin: bytes | None = None
     ) -> Exec:
-        home = self.cfg.mirror_dir.parent / "gh"
-        home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        env = {
-            "PATH": _SAFE_PATH,
-            "HOME": str(home),
-            "GH_CONFIG_DIR": str(home),
-            "GH_TOKEN": secrets.github_token,
-            "GH_PROMPT_DISABLED": "1",
-            "GH_NO_UPDATE_NOTIFIER": "1",
-            "NO_COLOR": "1",
-        }
-        return await _exec(
-            [str(self.cfg.gh_path), *args],
-            env=env,
-            cwd=home,
-            stdin=stdin,
-            timeout_s=GH_TIMEOUT_S,
-            redact=secrets.values(),
-        )
+        # Everything gh reads or writes lives in one throwaway dir; the token is in its
+        # hosts.yml (which gh prefers to the Keychain) and never in env or argv.
+        with secret_dir(self.cfg.secrets_dir) as tmp:
+            config = write_gh_config(tmp, secrets.github_token)
+            env = {
+                "PATH": _SAFE_PATH,
+                "HOME": str(tmp),
+                "GH_CONFIG_DIR": str(config),
+                "XDG_CONFIG_HOME": str(tmp),
+                "XDG_CACHE_HOME": str(tmp / "cache"),
+                "XDG_STATE_HOME": str(tmp / "state"),
+                "GH_PROMPT_DISABLED": "1",
+                "GH_NO_UPDATE_NOTIFIER": "1",
+                "NO_COLOR": "1",
+            }
+            return await _exec(
+                [str(self.cfg.gh_path), *args],
+                env=env,
+                cwd=tmp,
+                stdin=stdin,
+                timeout_s=GH_TIMEOUT_S,
+                redact=secrets.values(),
+            )
 
     @staticmethod
     async def _must_still_be_ok(still_ok: StillOk) -> None:
@@ -512,6 +667,8 @@ class Workspace:
         ``gh pr create``; a falsy answer raises ``PublishAborted``.
         """
         repo = self._repo(p.repo_name)
+        if not _SHA.fullmatch(result.head_sha):
+            raise RunnerError("bad head commit")
         body = build_pr_body(p.code, repo, ask, summary, result)
         check_texts(secrets.values(), pr_body=body, pr_title=result.title, branch_name=p.branch)
 
@@ -525,7 +682,7 @@ class Workspace:
                         "push",
                         "-q",
                         self._url_for(repo),
-                        f"{p.run_ref}:refs/heads/{p.branch}",
+                        f"{result.head_sha}:refs/heads/{p.branch}",
                     ],
                     token=secrets.github_token,
                 )
@@ -548,7 +705,7 @@ class Workspace:
         await self._must_still_be_ok(still_ok)
         created = await self._gh(
             ["pr", "create", "--repo", repo.slug, "--head", p.branch, "--base", p.base_branch,
-             "--title", result.title, "--body-file", "-"],
+             "--title", result.title.replace("@", "@\u200b"), "--body-file", "-"],
             secrets,
             stdin=body.encode(),
         )  # fmt: skip
@@ -573,8 +730,12 @@ class Workspace:
         checks = await self._gh(["pr", "checks", number, "--repo", repo.slug], secrets)
         if checks.returncode == 8:
             raise MergeRefused("CI is still running")
-        if checks.returncode != 0:
+        if checks.returncode == 1 and "no checks reported" in checks.stderr:
+            raise MergeRefused("no CI checks reported for this PR")
+        if checks.returncode == 1:
             raise MergeRefused("CI isn't green")
+        if checks.returncode != 0:
+            raise MergeRefused("couldn't read the CI checks (gh pr checks errored)")
         merged = await self._gh(
             ["pr", "merge", number, "--repo", repo.slug, "--squash",
              "--match-head-commit", head_sha],
@@ -622,10 +783,13 @@ def _copy_bundle(run_dir: Path, name: str, dest: Path, cap: int) -> None:
                     break
                 os.write(out, chunk)
                 remaining -= len(chunk)
+            if remaining == 0:
+                raise BundleRefused(f"the bundle is over {cap // (1024 * 1024)} MB")
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                dest.unlink()  # never leave a partial copy
+            raise
         finally:
             os.close(out)
-        if remaining == 0:
-            dest.unlink()
-            raise BundleRefused(f"the bundle is over {cap // (1024 * 1024)} MB")
     finally:
         os.close(fd)
