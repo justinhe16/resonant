@@ -41,7 +41,7 @@ from resonant.store import extensions as ext_store
 from resonant.store import pulse as pulse_store
 from resonant.store import tasks as repo
 from resonant.store.db import kv_get, kv_set, transaction, utcnow
-from resonant.tools import ToolRegistry, builtin
+from resonant.tools import ToolRegistry, builtin, updates
 from resonant.tools.base import BuiltinContext
 from resonant.tools.commands import list_commands
 from resonant.tools.ext import list_extensions, mute_extension
@@ -283,7 +283,11 @@ async def never(args: dict[str, Any]) -> dict[str, Any]:
 
 @pytest.fixture
 def router(
-    db: sqlite3.Connection, principals: Principals, registry: ToolRegistry, host: FakeHost
+    db: sqlite3.Connection,
+    principals: Principals,
+    registry: ToolRegistry,
+    host: FakeHost,
+    ctx: BuiltinContext,
 ) -> Router:
     with transaction(db):
         kv_set(db, "paused", False)
@@ -294,7 +298,10 @@ def router(
         principals=principals,
         registry=registry,
         gate=gate,
-        handlers={(None, "mute_extension"): never},
+        handlers={
+            (None, "mute_extension"): never,
+            (None, "pulse_preview"): updates.handlers(ctx)["pulse_preview"],
+        },
         model=NoModel(),
         clock=lambda: NOW,
         timezone="America/Los_Angeles",
@@ -769,6 +776,44 @@ async def test_pulse_previews_and_counts_open_items(router: Router, db: sqlite3.
     assert "[demo]" not in text and "[other] third" in text
     assert text.endswith("Open: demo 2 (muted until 12:30pm), other 1")
     assert await reply(router, "/pulse?") == text  # trailing punctuation is ignored
+
+
+async def test_pulse_command_is_the_pulse_preview_tool(
+    router: Router, db: sqlite3.Connection, ctx: BuiltinContext
+) -> None:
+    _report(db, "demo", "a", "one thing")
+    handler = updates.handlers(ctx)["pulse_preview"]
+    assert await reply(router, "/pulse") == (await handler({}))["text"]
+    with pytest.raises(ToolFailed):
+        await handler({"x": 1})
+    assert all(i.told_at is None for i in pulse_store.open_items(db, NOW))  # read-only
+
+
+async def test_open_items_lists_and_filters_by_source(
+    db: sqlite3.Connection, ctx: BuiltinContext
+) -> None:
+    _report(db, "demo", "a", "one thing")
+    _report(db, "other", "c", "third", "urgent")
+    handler = updates.handlers(ctx)["open_items"]
+    everything = await handler({})
+    assert everything["count"] == 2 and everything["source"] is None
+    assert {i["text"] for i in everything["items"]} == {"[demo] one thing", "[other] third"}
+    only = await handler({"source": "demo"})
+    assert only["count"] == 1 and only["items"][0]["source"] == "demo"
+    assert only["items"][0]["new"] is True
+    assert (await handler({"source": "nope"}))["items"] == []
+    for bad in ({"source": 3}, {"limit": 1}):
+        with pytest.raises(ToolFailed):
+            await handler(bad)
+
+
+async def test_briefing_preview_does_not_mark_told(
+    db: sqlite3.Connection, ctx: BuiltinContext
+) -> None:
+    _report(db, "demo", "a", "one thing")
+    out = await updates.handlers(ctx)["briefing_preview"]({})
+    assert "one thing" in out["text"]
+    assert all(i.told_at is None for i in pulse_store.open_items(db, NOW))
 
 
 async def test_pulse_is_owner_only_and_takes_only_now(router: Router) -> None:

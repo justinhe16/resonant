@@ -22,7 +22,15 @@ from resonant.gate.codes import clean_external
 from resonant_sdk import Manifest, ToolSpec
 
 BuiltinIntent = Literal[
-    "question", "job_control", "system", "notes", "reminders", "ops", "run_project", "unknown"
+    "question",
+    "job_control",
+    "system",
+    "updates",
+    "notes",
+    "reminders",
+    "ops",
+    "run_project",
+    "unknown",
 ]
 # A builtin intent, or ``extension:<name>`` for a loaded extension. Always validated against
 # the ``IntentSet`` built at start (``IntentSet.parse``), never taken from the model as is.
@@ -43,6 +51,10 @@ INTENT_DEFINITIONS: dict[BuiltinIntent, str] = {
         "asks about the health of the Mac mini (CPU, memory, disk), the Resonant daemon or "
         "the local model, or what Resonant can do"
     ),
+    "updates": (
+        "asks what's new, for an update, a summary, the briefing, or how a project or "
+        "extension is doing"
+    ),
     "notes": "asks to save, list or delete the owner's notes",
     "reminders": "asks to set a reminder, or to list or cancel pending reminders",
     "ops": "asks Resonant to restart Ollama or itself, update itself, or show its recent logs",
@@ -56,7 +68,14 @@ INTENT_DEFINITIONS: dict[BuiltinIntent, str] = {
 INTENT_TOOLS: dict[BuiltinIntent, tuple[str, ...]] = {
     "question": (),
     "job_control": ("list_tasks", "projects", "task_counts"),
-    "system": ("daemon_status", "list_commands", "model_status", "system_status"),
+    "system": (
+        "daemon_status",
+        "list_commands",
+        "list_extensions",
+        "model_status",
+        "system_status",
+    ),
+    "updates": ("briefing_preview", "open_items", "pulse_preview"),
     "notes": ("add_note", "clear_notes", "delete_note", "list_notes"),
     "reminders": ("add_reminder", "cancel_reminder", "list_reminders"),
     "ops": ("disk", "recent_logs", "restart_ollama", "restart_resonant", "update_resonant"),

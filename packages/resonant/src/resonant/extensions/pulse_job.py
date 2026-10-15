@@ -180,6 +180,15 @@ def open_summary(conn: sqlite3.Connection, now: datetime, tz: str) -> str | None
     return "Open: " + ", ".join(parts)
 
 
+def preview_text(conn: sqlite3.Connection, now: datetime, tz: str) -> str:
+    """``/pulse`` and the ``pulse_preview`` tool: what the next pulse would say, then the open
+    items per source. Read-only (nothing is marked told; core re-mentions appear once a pulse
+    run computes them)."""
+    text = preview(conn, now) or "Nothing new since the last update."
+    summary = open_summary(conn, now, tz)
+    return f"{text}\n{summary}" if summary else text
+
+
 # --- core items ------------------------------------------------------------------------------
 
 

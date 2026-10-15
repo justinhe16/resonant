@@ -21,8 +21,10 @@ nothing here: it becomes a ``direct_call`` task for the local runner (below).
   parser, never from a fuzzy match or the model. The gate still decides: L3 runs, L2 runs
   for the owner, L1 asks for a code, the kill switch asks for everything, dry_run holds back
   the ops tools.
-- Keywords (the whole message, case-insensitive, trailing ``?!.`` ignored): ``status``,
-  ``what's running``, ``how's the mini``, ``ping``.
+- Keywords (the whole message, case-insensitive, trailing ``?!.`` ignored): ``status`` and
+  ``ping``, nothing else. Every other plain-words message goes through an intent, so each
+  read command also has a chat tool (``what's running`` is ``job_control``, ``any updates``
+  is ``updates``); a test checks that no read command lacks one.
 
 ``/approvals`` lists the asker's pending approvals (code, summary, expiry);
 ``/approvals <code>`` adds the intent's full args, for the owner only. Approval *replies*
@@ -40,8 +42,9 @@ is never reachable as ``/<ext> job_x``. ``/ext run core/<job>`` calls the core j
 on-demand entry (``core_jobs``, filled by ``wiring``: ``core/briefing`` is
 ``briefing.run_briefing_now``) here, with no task; nothing runs while paused.
 
-``/pulse`` (owner-only) answers inline: what the next pulse would say plus the open items per
-source (read-only; core re-mentions appear once a pulse run computes them). ``/pulse now`` is
+``/pulse`` (owner-only) is a read of ``pulse_preview``, the same tool the ``updates`` intent
+offers: what the next pulse would say plus the open items per source (read-only; core
+re-mentions appear once a pulse run computes them). ``/pulse now`` is
 ``core/pulse`` on demand, like ``/ext run core/pulse``. An unknown ``/word`` that names an
 extension shipped in ``<repo>/extensions/<word>/resonant.yaml`` gets, for the owner, "<word>
 isn't installed. On the Mini: resonant ext add repo:<word>" (or "is disabled ... ext update");
@@ -74,7 +77,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from resonant import killswitch
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.extensions.briefing import run_briefing_now
-from resonant.extensions.pulse_job import open_summary, preview, run_pulse_now
+from resonant.extensions.pulse_job import run_pulse_now
 from resonant.gate import Allow, Decision, Intent, PendingApproval
 from resonant.models import SpanFactory
 from resonant.models.client import null_spans
@@ -163,6 +166,11 @@ def render_status(d: dict[str, Any]) -> str:
     return " · ".join(parts)
 
 
+def render_text(d: dict[str, Any]) -> str:
+    """A tool whose output is already the reply (``pulse_preview``)."""
+    return str(d.get("text", ""))
+
+
 def render_ping(d: dict[str, Any]) -> str:
     return f"pong (up {_duration(d.get('uptime_s'))})"
 
@@ -182,13 +190,6 @@ def _task_lines(d: dict[str, Any], *, with_status: bool) -> list[str]:
         bits.append(_duration(task.get("age_s")))
         lines.append("- " + " · ".join(bits))
     return lines
-
-
-def render_running(d: dict[str, Any]) -> str:
-    lines = _task_lines(d, with_status=False)
-    if not lines:
-        return "Nothing running."
-    return f"Running ({len(lines)}):\n" + "\n".join(lines)
 
 
 def render_tasks(d: dict[str, Any]) -> str:
@@ -243,26 +244,13 @@ COMMAND_RENDERS: dict[str, Render] = {
     "/disk": render_disk,
     "/logs": render_logs,
     "/ext": render_extensions,
+    "/pulse": render_text,
 }
 
-_RUNNING = FastCommand(
-    "what's running",
-    "job_control",
-    False,
-    tool="list_tasks",
-    args={"status": "running"},
-    render=render_running,
-)
-_MINI = FastCommand("how's the mini", "system", False, tool="system_status", render=render_mini)
+# The only keywords: everything else in plain words goes through an intent (the labeler).
 KEYWORDS: dict[str, FastCommand] = {
     "status": FastCommand("status", "system", False, tool="daemon_status", render=render_status),
     "ping": FastCommand("ping", "system", False, tool="daemon_status", render=render_ping),
-    "what's running": _RUNNING,
-    "whats running": _RUNNING,
-    "what is running": _RUNNING,
-    "how's the mini": _MINI,
-    "hows the mini": _MINI,
-    "how is the mini": _MINI,
 }
 
 _SLUG = re.compile(r"[a-z][a-z0-9-]{0,47}", re.ASCII)  # the manifest's name pattern
@@ -433,10 +421,8 @@ class FastPath:
             return self._approvals(cmd, principal)
         if cmd.admin and cmd.title == "/ext run":
             return await self._ext_run(cmd, principal, trace_id)
-        if cmd.admin and cmd.name == "/pulse":
-            if cmd.title == "/pulse now":
-                return await self._core_run(cmd, "pulse", principal, trace_id, "/pulse now")
-            return self._result(cmd, self._pulse_preview())
+        if cmd.admin and cmd.title == "/pulse now":
+            return await self._core_run(cmd, "pulse", principal, trace_id, "/pulse now")
         if cmd.extension is not None:
             return self._extension_call(cmd)
         if cmd.help:
@@ -524,14 +510,6 @@ class FastPath:
             return self._result(cmd, f"No job {label}. Try /ext list.")
         args = {"due_at": iso(self.clock())}
         return self._direct(cmd, ext, spec.name, args, f"/ext run {label}")
-
-    def _pulse_preview(self) -> str:
-        """``/pulse``: what the next pulse would say, then the open items per source. Read-only
-        (core re-mentions appear once a pulse run computes them)."""
-        now = self.clock()
-        text = preview(self.conn, now) or "Nothing new since the last update."
-        summary = open_summary(self.conn, now, self.timezone)
-        return f"{text}\n{summary}" if summary else text
 
     def _not_installed(self, word: str, principal: str) -> str | None:
         """For an unknown ``/word`` that names an extension shipped in the repo checkout

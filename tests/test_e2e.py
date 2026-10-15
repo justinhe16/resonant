@@ -194,14 +194,14 @@ def test_step_limit_outlasts_the_longest_tool() -> None:
     assert local_step_limit(long, [UPDATE_RESONANT]) == (MAX_TOOL_ITERATIONS + 1) * 120 + 15
 
 
-# --- the "what's running?" flow (fast path) --------------------------------------------
+# --- the "/tasks" flow (fast path) --------------------------------------------
 
 
-async def test_whats_running_end_to_end(running: Running) -> None:
+async def test_tasks_command_end_to_end(running: Running) -> None:
     r = running
     r.chat.add_message(handle=SELF, text="hello from myself")  # Resonant's own handle
     r.chat.add_message(handle=STRANGER, text=SECRET)  # nobody in principals.yaml
-    r.chat.add_message(handle=OWNER_PHONE, text="what's running?")
+    r.chat.add_message(handle=OWNER_PHONE, text="/tasks")
 
     sent = await r.osa.wait_for(1, 10)
     await r.idle()
@@ -210,7 +210,7 @@ async def test_whats_running_end_to_end(running: Running) -> None:
     # Exactly one send: to the owner, with the fast-path reply. No model call.
     assert len(r.osa.sent) == 1
     assert sent.handle == OWNER_PHONE
-    assert sent.text == "Nothing running."
+    assert sent.text == "No tasks yet."
     assert sum(r.model.calls[k] for k in ("label", "tools", "answer")) == 0
 
     # The event: only the owner's message became one, and it was consumed.
@@ -227,13 +227,13 @@ async def test_whats_running_end_to_end(running: Running) -> None:
     task = tasks[0]
     assert (task["kind"], task["runner"], task["status"]) == ("reply", "local", "done")
     assert task["origin_event_id"] == ev["id"] and task["trace_id"] == ev["trace_id"]
-    assert json.loads(task["checkpoint"])["tool_used"] == "list_tasks"
+    assert json.loads(task["checkpoint"])["tool_used"] == "projects"
     assert json.loads(task["result"])["path"] == "fast"
 
     # The audit trail: the gated read, the send, and the dropped stranger.
     gate = r.audits("gate.evaluate")
     assert [(a["tool"], a["task_id"], a["requested_by"]) for a in gate] == [
-        ("list_tasks", f"route:{ev['id']}", "justin")
+        ("projects", f"route:{ev['id']}", "justin")
     ]
     sends = r.audits("imessage.sent")
     assert len(sends) == 1
@@ -251,7 +251,7 @@ async def test_whats_running_end_to_end(running: Running) -> None:
     # Bodies never reach the audit log.
     for row in r.rows("SELECT detail FROM audit_log"):
         assert SECRET not in (row["detail"] or "")
-        assert "what's running" not in (row["detail"] or "")
+        assert "/tasks" not in (row["detail"] or "")
 
 
 # --- the labeled path: tools through gate -> executor ----------------------------------
