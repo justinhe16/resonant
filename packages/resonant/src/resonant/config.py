@@ -336,6 +336,83 @@ class PulseConfig(_Section):
         return timedelta(seconds=duration_s(self.remention_after))
 
 
+_RUNNER_REPO_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+_RUNNER_REMOTE = re.compile(r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_RUNNER_BASE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,99}")
+
+
+class RunnerRepo(_Section):
+    """One repo the Claude runner may work in (docs/phase5a-plan.md D3)."""
+
+    # "github.com/owner/repo": no scheme, no credentials; the daemon adds https://.
+    remote: str
+    base: str = "main"
+    # `.github/**` changes are refused unless this is set.
+    allow_github_changes: bool = False
+    # Quote the owner's ask in the PR body (false for public repos that shouldn't show it).
+    quote_ask: bool = True
+
+    @field_validator("remote")
+    @classmethod
+    def _remote(cls, v: str) -> str:
+        v = v.removesuffix(".git")
+        if not _RUNNER_REMOTE.fullmatch(v):
+            raise ValueError('runner repo remote must look like "github.com/owner/repo"')
+        return v
+
+    @field_validator("base")
+    @classmethod
+    def _base(cls, v: str) -> str:
+        if not _RUNNER_BASE.fullmatch(v) or ".." in v or v.endswith(("/", ".lock")):
+            raise ValueError("runner repo base must be a plain branch name")
+        return v
+
+    @property
+    def slug(self) -> str:
+        """``owner/repo``, as ``gh --repo`` wants it."""
+        return self.remote.removeprefix("github.com/")
+
+
+class RunnerConfig(_Section):
+    """The Claude runner (docs/phase5a-plan.md). Nothing here is secret."""
+
+    # name -> repo. Empty by default: the owner names the repos the runner may touch.
+    repos: dict[str, RunnerRepo] = Field(default_factory=dict[str, RunnerRepo])
+    # Run dirs. Not under ~/.resonant, which the sandbox denies.
+    work_dir: Path = Field(default=Path("~/resonant-runs"), validate_default=True)
+    # Bare mirrors, daemon-only.
+    mirror_dir: Path = Field(default=Path("~/.resonant/runner/mirrors"), validate_default=True)
+    # Package caches shared between runs and used by nothing outside the sandbox.
+    cache_dir: Path = Field(default=Path("~/resonant-runs/.cache"), validate_default=True)
+    max_run_dir_mb: int = Field(default=5000, ge=100)
+    max_cache_gb: int = Field(default=20, ge=1)
+    max_minutes: int = Field(default=45, ge=1, le=600)
+    max_budget_usd: float | None = Field(default=None, gt=0)
+    max_bundle_mb: int = Field(default=50, ge=1, le=500)
+    # Days a finished run's dir is kept (a daily job deletes it after).
+    keep_days: int = Field(default=7, ge=0, le=365)
+    git_path: Path = Path("/usr/bin/git")
+    gh_path: Path = Path("/opt/homebrew/bin/gh")
+
+    @field_validator("repos")
+    @classmethod
+    def _names(cls, v: dict[str, RunnerRepo]) -> dict[str, RunnerRepo]:
+        for name in v:
+            if not _RUNNER_REPO_NAME.fullmatch(name):
+                raise ValueError(f"runner repo name {name!r} must match [a-z][a-z0-9_-]{{0,31}}")
+        return v
+
+    @field_validator("work_dir", "mirror_dir", "cache_dir")
+    @classmethod
+    def _dirs(cls, v: Path) -> Path:
+        return v.expanduser()
+
+    @field_validator("git_path", "gh_path")
+    @classmethod
+    def _absolute_binary(cls, v: Path) -> Path:
+        return _absolute(v, "runner binary paths")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESONANT_",
@@ -361,6 +438,7 @@ class Settings(BaseSettings):
     secrets: SecretsConfig = SecretsConfig()
     briefing: BriefingConfig = BriefingConfig()
     pulse: PulseConfig = PulseConfig()
+    runner: RunnerConfig = RunnerConfig()
 
     @field_validator("home")
     @classmethod
