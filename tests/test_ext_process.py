@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import sys
 import time
@@ -356,7 +357,8 @@ async def test_secrets_reach_only_the_call_that_declares_them(tmp_path: Path) ->
     )
     without = ExtRequest(with_secret.argv, tmp_path, scratch_env(ext="e", data_dir=data), 10)
     ext = runner()
-    assert (await ext.run(with_secret, redact=same)).data["RESONANT_SECRET_TOKEN"] == (FAKE_A)
+    got = (await ext.run(with_secret, redact=same)).data
+    assert got["RESONANT_SECRETS_FD"] == "4" and FAKE_A not in json.dumps(got)
     assert not [k for k in (await ext.run(without, redact=same)).data if "SECRET" in k]
 
 
@@ -426,9 +428,9 @@ async def test_redaction_runs_before_parsing(tmp_path: Path) -> None:
     script = helper(
         tmp_path,
         "leak.py",
-        "print(json.dumps({'echo': os.environ['RESONANT_SECRET_TOKEN']}))\n"
-        "os.write(3, (json.dumps({'type': 'x', 'text': os.environ['RESONANT_SECRET_TOKEN'],"
-        " 'dedupe_key': 'k'}) + '\\n').encode())",
+        "tok = json.load(os.fdopen(4, 'rb'))['token']\n"
+        "print(json.dumps({'echo': tok}))\n"
+        "os.write(3, (json.dumps({'type': 'x', 'text': tok, 'dedupe_key': 'k'}) + '\\n').encode())",
     )
     req = request(tmp_path, script, RESONANT_SECRET_TOKEN=FAKE_B)
     out = await runner().run(req, redact=lambda s: s.replace(FAKE_B, "[redacted]"))
@@ -734,3 +736,125 @@ async def test_fake_records_and_scripts(tmp_path: Path) -> None:
     assert fake.calls == [req, req, req]
     responder = FakeExtProcess(respond=lambda r: ExtOutput({"argv": list(r.argv)}, (), 0, 0))
     assert (await responder.run(req, redact=same)).data == {"argv": ["./cli", "ping"]}
+
+
+# --- secrets are delivered on fd 4, never in env or argv (P5A-7) ---------------------------
+
+
+def secret_request(tmp_path: Path, script: Path, *, timeout_s: float = 10.0) -> ExtRequest:
+    data = tmp_path / "data"
+    ensure_data_dir(data)
+    env = scratch_env(
+        ext="e",
+        data_dir=data,
+        secrets={"RESONANT_SECRET_TOKEN": FAKE_A, "RESONANT_SECRET_API_KEY": FAKE_B},
+    )
+    return ExtRequest((sys.executable, "-I", "-S", str(script)), tmp_path, env, timeout_s, "e/t")
+
+
+def open_fds() -> int:
+    return psutil.Process().num_fds()
+
+
+async def test_secrets_are_read_from_fd_4_and_not_in_env_or_argv(tmp_path: Path) -> None:
+    script = helper(
+        tmp_path,
+        "s.py",
+        "fd = int(os.environ['RESONANT_SECRETS_FD'])\n"
+        "got = json.load(os.fdopen(fd, 'rb'))\n"
+        "print(json.dumps({'got': got, 'fd': fd, 'env': dict(os.environ), 'argv': sys.argv}))",
+    )
+    out = await runner().run(secret_request(tmp_path, script), redact=same)
+    assert out.data["got"] == {"token": FAKE_A, "api_key": FAKE_B}
+    assert out.data["fd"] == 4
+    blob = json.dumps({"env": out.data["env"], "argv": out.data["argv"]})
+    assert FAKE_A not in blob and FAKE_B not in blob
+    assert not [k for k in out.data["env"] if k.startswith("RESONANT_SECRET_")]
+
+
+async def test_a_live_process_shows_no_secret_in_its_env_or_argv(tmp_path: Path) -> None:
+    """What KERN_PROCARGS2 would show a same-user observer, via psutil, while it runs."""
+    pidfile = tmp_path / "pid"
+    script = helper(
+        tmp_path,
+        "live.py",
+        f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+        "tok = json.load(os.fdopen(4, 'rb'))['token']\n"
+        "time.sleep(60)",
+    )
+    ext = runner()
+    task = asyncio.create_task(ext.run(secret_request(tmp_path, script), redact=same))
+    pid = int(await wait_for_file(pidfile))
+    seen = psutil.Process(pid)
+    blob = json.dumps(seen.environ()) + json.dumps(seen.cmdline())
+    assert FAKE_A not in blob and FAKE_B not in blob
+    await ext.tracker.kill_all("test")
+    with pytest.raises(ExtAmbiguous):
+        await task
+
+
+async def test_no_secrets_means_no_fd_4(tmp_path: Path) -> None:
+    script = helper(
+        tmp_path,
+        "n.py",
+        "try:\n    os.fstat(4); has = True\nexcept OSError:\n    has = False\n"
+        "print(json.dumps({'has': has, 'env': 'RESONANT_SECRETS_FD' in os.environ}))",
+    )
+    out = await runner().run(request(tmp_path, script), redact=same)
+    assert out.data == {"has": False, "env": False}
+
+
+async def test_secrets_pipe_is_closed_in_the_daemon_after_every_ending(tmp_path: Path) -> None:
+    ok = helper(tmp_path, "ok.py", "print('{}')")
+    hang = helper(tmp_path, "hang.py", "time.sleep(60)")
+    ext = runner()
+    before = open_fds()
+    await ext.run(secret_request(tmp_path, ok), redact=same)  # never reads fd 4
+    with pytest.raises(ExtAmbiguous, match="timeout"):
+        await ext.run(secret_request(tmp_path, hang, timeout_s=0.5), redact=same)
+    task = asyncio.create_task(ext.run(secret_request(tmp_path, hang), redact=same))
+    await asyncio.sleep(0.5)
+    await ext.tracker.kill_all("test")
+    with pytest.raises(ExtAmbiguous):
+        await task
+    task = asyncio.create_task(ext.run(secret_request(tmp_path, hang), redact=same))
+    await asyncio.sleep(0.5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert open_fds() == before
+
+
+async def test_a_failed_start_leaves_no_secrets_fd(tmp_path: Path) -> None:
+    req = secret_request(tmp_path, tmp_path / "x.py")
+    bad = ExtRequest(("relative",), req.cwd, req.env, 5, "e/t")
+    before = open_fds()
+    with pytest.raises(ExtFailed):
+        await runner().run(bad, redact=same)
+    broken = ExtRequest((sys.executable,), tmp_path / "missing-cwd", req.env, 5, "e/t")
+    with pytest.raises(ExtFailed):
+        await runner().run(broken, redact=same)
+    assert open_fds() == before
+
+
+async def test_oversized_secrets_are_refused_without_starting(tmp_path: Path) -> None:
+    script = helper(tmp_path, "ok.py", "print('{}')")
+    req = secret_request(tmp_path, script)
+    big = ExtRequest(req.argv, req.cwd, {**req.env, "RESONANT_SECRET_BIG": "x" * 9000}, 5, "e/t")
+    before = open_fds()
+    with pytest.raises(ExtFailed, match="too large"):
+        await runner().run(big, redact=same)
+    assert open_fds() == before
+
+
+async def test_a_grandchild_does_not_inherit_the_secrets_fd(tmp_path: Path) -> None:
+    script = helper(
+        tmp_path,
+        "g.py",
+        "r = subprocess.run([sys.executable, '-c', 'import os\\n"
+        "try:\\n os.fstat(4); print(1)\\nexcept OSError:\\n print(0)'],\n"
+        "                   capture_output=True, text=True)\n"
+        "print(json.dumps({'child_has_fd4': r.stdout.strip()}))",
+    )
+    out = await runner().run(secret_request(tmp_path, script), redact=same)
+    assert out.data == {"child_has_fd4": "0"}

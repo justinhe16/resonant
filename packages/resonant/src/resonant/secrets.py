@@ -1,8 +1,9 @@
 """Keychain secrets: ``SecretStore`` over ``/usr/bin/security``.
 
 Every secret is a generic-password item in the login keychain with service ``resonant`` and
-account ``<ext>/<name>`` (a *ref*, e.g. ``github/token``). Extensions see a secret only as
-``RESONANT_SECRET_<NAME>`` in their own process env (injection is the executor's job).
+account ``<ext>/<name>`` (a *ref*, e.g. ``github/token``). Extensions get a secret only on an
+inherited pipe (fd 4), never in env or argv; ``RESONANT_SECRET_<NAME>`` is just this module's
+key format for the hand-off to the process runner, which strips it before spawning.
 
 Rules this module keeps:
 
