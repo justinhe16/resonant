@@ -53,7 +53,7 @@ async def test_each_run_gets_a_token_for_its_one_repo(
     await h.start("proj")
     await h.start("other")
     await h.drain()
-    assert [m["repositories"] for m in h.api.mints] == [["proj"], ["other"]]
+    assert sorted(m["repositories"] for m in h.api.mints) == [["other"], ["proj"]]
     assert len(set(h.api.tokens)) == 2
     # the registry says allow_github_changes is off for the seeded repos: no Workflows
     assert all("workflows" not in m["permissions"] for m in h.api.mints)
