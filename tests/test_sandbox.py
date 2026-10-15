@@ -243,14 +243,22 @@ def test_render_secret_denies_come_last_and_carry_deny_read(tmp_path: Path) -> N
     assert ";; @" not in text  # every placeholder was filled
     # the name rules sit after every allow, and spare the run dir, cache and read paths
     last_allow = text.rindex("(allow ")
-    names = text.index('(regex #"/\\.env$")')
+    names = text.index('(regex #"/\\.[eE][nN][vV]$")')
     assert names > last_allow
     assert text.index('(param "DENY_READ_0")') > last_allow
     exempt = text[names:]
     assert "(require-not (require-any" in exempt
     for key in ("RUN", "CACHE", "READ_0"):
         assert f'(subpath (param "{key}"))' in exempt
-    assert '(regex #"/\\.env\\.(example|sample|template)$")' in text
+    # case-insensitive filesystem: every letter is a class, and the template allow-list too
+    assert "[eE][nN][vV]\\.([eE][xX][aA][mM][pP][lL][eE]|" in text
+    assert "[kK][eE][yY]" in text and "[pP][fF][xX]" in text and "[jJ][kK][sS]" in text
+    assert "[eE][nN][vV][rR][cC]" in text and "[iI][dD]_([rR][sS][aA]|" in text
+    # every HOME_SECRETS entry is rendered, none is a leftover literal in the template
+    for rel in profile_mod.HOME_SECRETS:
+        assert f'(subpath (string-append (param "HOME") "/{rel}"))' in text[names:]
+    for rel in (".git-credentials", ".pgpass", ".config/gcloud", ".azure"):
+        assert rel in profile_mod.HOME_SECRETS
 
 
 def test_deny_read_is_checked_like_other_paths(tmp_path: Path) -> None:
@@ -430,8 +438,8 @@ def test_final_denies_come_after_every_allow(tmp_path: Path) -> None:
     last_allow = body.rfind("(allow ")
     for marker in (
         '(subpath (param "SECRETS"))',
-        '(regex #"/\\.env$")',
-        '(literal (string-append (param "HOME") "/.netrc"))',
+        '(regex #"/\\.[eE][nN][vV]$")',
+        '(subpath (string-append (param "HOME") "/.netrc"))',
         '(literal (string-append (param "HOME") "/.zshrc"))',
         '(subpath (string-append (param "HOME") "/.claude"))',
     ):

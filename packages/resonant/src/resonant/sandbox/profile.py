@@ -46,20 +46,26 @@ ALWAYS_DENIED = (
     "Library",
     ".local/bin",
 )
-# Credential files and dirs under $HOME that are denied for read and write (the last word in
-# runner.sb mirrors this list; keep them in step). ``.ssh``, ``.aws`` and ``.config/gh`` are
-# in ALWAYS_DENIED above too.
-HOME_SECRETS = (
+# Credential dirs and files under $HOME, denied for read and write. runner.sb gets one
+# subpath line each (the @HOME_SECRETS@ placeholder), so this list is the whole rule.
+HOME_SECRET_DIRS = (
     ".ssh",
     ".aws",
     ".config/gh",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".docker/config.json",
+    ".config/gcloud",
+    ".azure",
     ".kube",
     ".gnupg",
 )
+HOME_SECRET_FILES = (
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".git-credentials",
+    ".docker/config.json",
+)
+HOME_SECRETS = (*HOME_SECRET_DIRS, *HOME_SECRET_FILES)
 # Binaries that may be linked into the run-local bin/.
 NEVER_LINKED = frozenset({"resonant"})
 
@@ -69,6 +75,7 @@ _PLACEHOLDERS = {
     "exec": ";; @DENY_EXEC@",
     "exempt": ";; @SECRET_EXEMPT@",
     "deny_read": ";; @DENY_READ@",
+    "home_secrets": ";; @HOME_SECRETS@",
 }
 
 
@@ -209,6 +216,9 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
     for i, path in enumerate(p.deny_read):
         defs[f"DENY_READ_{i}"] = str(path)
         deny_read_lines.append(f'  (subpath (param "DENY_READ_{i}"))')
+    home_secret_lines = [
+        f'  (subpath (string-append (param "HOME") "/{rel}"))' for rel in HOME_SECRETS
+    ]
     defs["SECRETS"] = str(p.secrets_dir)
     text = template_text()
     for key, lines in (
@@ -217,6 +227,7 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
         ("exec", exec_lines),
         ("exempt", exempt_lines),
         ("deny_read", deny_read_lines),
+        ("home_secrets", home_secret_lines),
     ):
         if _PLACEHOLDERS[key] not in text:
             raise SandboxError(f"runner.sb lost its {_PLACEHOLDERS[key]} placeholder")
