@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -439,3 +441,86 @@ def test_manifest_patterns_reject_a_trailing_newline() -> None:
         duration_s("5m\n")
     with pytest.raises(ValidationError):
         manifest(notify={"on": ["ci_failed\n"]})
+
+
+# --- secret() (P5A-7) ---------------------------------------------------------------------
+
+
+def _run_secret_snippet(code: str, payload: bytes | None) -> subprocess.CompletedProcess[str]:
+    """Run ``code`` as ``python -I -S`` with secret.py importable and payload on a pipe."""
+    import resonant_sdk.secret as mod
+
+    env = {"PATH": "/usr/bin:/bin"}
+    pass_fds: tuple[int, ...] = ()
+    r = -1
+    if payload is not None:
+        r, w = os.pipe()
+        os.write(w, payload)
+        os.close(w)
+        env["RESONANT_SECRETS_FD"] = str(r)
+        pass_fds = (r,)
+    try:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-c",
+                f"import sys; sys.path.insert(0, {str(Path(mod.__file__ or '').parent)!r})\n{code}",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            pass_fds=pass_fds,
+        )
+    finally:
+        if r >= 0:
+            os.close(r)
+
+
+def test_secret_reads_the_pipe_once_and_caches() -> None:
+    proc = _run_secret_snippet(
+        "from secret import secret\n"
+        "import os\n"
+        "print(secret('token'), secret('token'), secret('api_key'))\n"
+        "print('RESONANT_SECRETS_FD' in os.environ)",
+        b'{"token": "tok-1", "api_key": "key-2"}',
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split("\n")[:2] == ["tok-1 tok-1 key-2", "False"]
+
+
+def test_secret_missing_name_errors_cleanly() -> None:
+    proc = _run_secret_snippet(
+        "from secret import secret, SecretError\n"
+        "try:\n    secret('nope')\nexcept SecretError as e:\n    print('ERR', e)",
+        b'{"token": "tok-1"}',
+    )
+    assert "ERR secret 'nope' is missing" in proc.stdout and "tok-1" not in proc.stdout
+
+
+@pytest.mark.parametrize("payload", [None, b"", b"not json", b'["a"]', b'{"a": 1}'])
+def test_secret_errors_when_nothing_usable_was_delivered(payload: bytes | None) -> None:
+    proc = _run_secret_snippet(
+        "from secret import secret, SecretError\n"
+        "try:\n    secret('token')\nexcept SecretError as e:\n    print('ERR', e)",
+        payload,
+    )
+    assert proc.returncode == 0 and proc.stdout.startswith("ERR ")
+
+
+def test_secret_module_imports_only_the_stdlib() -> None:
+    import ast
+
+    import resonant_sdk.secret as mod
+
+    tree = ast.parse(Path(mod.__file__ or "").read_text())
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots |= {a.name.split(".")[0] for a in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            roots.add(node.module.split(".")[0])
+    assert roots <= set(sys.stdlib_module_names)

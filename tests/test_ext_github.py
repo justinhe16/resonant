@@ -62,22 +62,38 @@ class FakeGh:
             "LANG": "en_US.UTF-8",
             "RESONANT_EXT": "github",
             "RESONANT_EXT_DATA": str(self.data),
-            "RESONANT_SECRET_TOKEN": TOKEN,
             "PARENT_SENTINEL": "must-not-reach-gh",
         }
         return {**env, **extra}
 
-    def run(self, *args: str, env: dict[str, str] | None = None) -> Result:
+    def run(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
+        deliver: bool = True,
+    ) -> Result:
+        """Run the CLI like Resonant does: secrets on a pipe at fd 4, never in env or argv."""
         self.state_path.write_text(json.dumps(self.state))
-        proc = subprocess.run(
-            [sys.executable, "-I", "-S", str(CLI), *args],
-            env=self.env() if env is None else env,
-            cwd=EXT,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
+        env = dict(self.env() if env is None else env)
+        r, w = os.pipe()
+        if deliver:
+            os.write(w, json.dumps({"token": TOKEN} if secrets is None else secrets).encode())
+            env["RESONANT_SECRETS_FD"] = str(r)
+        os.close(w)
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", "-S", str(CLI), *args],
+                env=env,
+                cwd=EXT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                pass_fds=(r,),
+            )
+        finally:
+            os.close(r)
         out = cast(dict[str, Any], json.loads(proc.stdout)) if proc.returncode == 0 else {}
         events = cast(list[dict[str, Any]], out.get("events", []))
         return Result(proc.returncode, out, proc.stderr, proc.stdout, events)
@@ -402,16 +418,20 @@ def test_watch_events_go_to_fd3_when_provided(gh: FakeGh) -> None:
     gh.state["runs"] = {f"{RESONANT}:branch-40": [run_row(1, "s1", "failure")]}
     gh.state_path.write_text(json.dumps(gh.state))
     read_fd, write_fd = os.pipe()
+    sec_r, sec_w = os.pipe()
+    os.write(sec_w, json.dumps({"token": TOKEN}).encode())
+    os.close(sec_w)
     proc = subprocess.Popen(
         [sys.executable, "-I", "-S", str(CLI), "watch"],
-        env=gh.env(RESONANT_EVENTS_FD=str(write_fd)),
+        env=gh.env(RESONANT_EVENTS_FD=str(write_fd), RESONANT_SECRETS_FD=str(sec_r)),
         cwd=EXT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        pass_fds=(write_fd,),
+        pass_fds=(write_fd, sec_r),
         text=True,
     )
     os.close(write_fd)
+    os.close(sec_r)
     stdout, _ = proc.communicate(timeout=30)
     with os.fdopen(read_fd) as f:
         lines = f.read().splitlines()
@@ -489,7 +509,7 @@ def test_health(gh: FakeGh) -> None:
 # --- token handling and failures ----------------------------------------------------------
 
 
-def test_token_reaches_gh_only_as_gh_token(gh: FakeGh) -> None:
+def test_token_reaches_gh_only_via_a_private_config_file(gh: FakeGh) -> None:
     gh.state["mine"] = [pr_node(40, "s1")]
     r = gh.run("watch")
     assert r.code == 0
@@ -498,7 +518,9 @@ def test_token_reaches_gh_only_as_gh_token(gh: FakeGh) -> None:
     for call in calls:
         assert call["token_ok"] is True
         env = set(call["env"])
-        assert {"GH_TOKEN", "PATH", "HOME", "GH_PROMPT_DISABLED"} <= env
+        assert {"GH_CONFIG_DIR", "PATH", "HOME", "GH_PROMPT_DISABLED"} <= env
+        assert not {k for k in env if "TOKEN" in k or "SECRET" in k}
+        assert call["modes"] == [0o700, 0o600]
         assert not {k for k in env if k.startswith("RESONANT_")}
         assert "PARENT_SENTINEL" not in env
         assert TOKEN not in json.dumps(call["argv"])
@@ -514,9 +536,9 @@ def test_token_is_redacted_from_gh_errors(gh: FakeGh) -> None:
 
 
 def test_missing_token_fails_before_gh(gh: FakeGh) -> None:
-    env = gh.env()
-    del env["RESONANT_SECRET_TOKEN"]
-    r = gh.run("prs", env=env)
+    r = gh.run("prs", deliver=False)
+    assert r.code == 1 and "secret github/token is missing" in r.err
+    r = gh.run("prs", secrets={"other": "x"})
     assert r.code == 1 and "secret github/token is missing" in r.err
     assert gh.calls() == []
 
@@ -746,7 +768,7 @@ def test_rate_limit_is_not_reported_as_a_missing_scope(gh: FakeGh) -> None:
     )
 
 
-def test_writes_pass_the_token_only_as_gh_token(gh: FakeGh) -> None:
+def test_writes_pass_the_token_only_via_the_config_file(gh: FakeGh) -> None:
     gh.state["prs"] = {f"{RESONANT}#40": view()}
     gh.state["runs"] = {f"{RESONANT}:branch-40": [run_row(9, HEAD, "failure")]}
     outs = [merge(gh), gh.run("rerun_failed", "--repo", RESONANT, "--number", "40")]
@@ -757,3 +779,19 @@ def test_writes_pass_the_token_only_as_gh_token(gh: FakeGh) -> None:
         assert call["token_ok"] is True and TOKEN not in json.dumps(call["argv"])
         assert not {k for k in call["env"] if k.startswith("RESONANT_")}
     assert all(TOKEN not in o.stdout + o.err for o in outs)
+
+
+def test_config_dir_is_removed_and_stale_ones_are_swept(gh: FakeGh) -> None:
+    stale = gh.data / "gh-stale"
+    stale.mkdir()
+    (stale / "hosts.yml").write_text("x")
+    os.utime(stale, (1, 1))
+    fresh = gh.data / "gh-fresh"
+    fresh.mkdir()  # a concurrent run's dir: left alone
+    assert gh.run("prs").code == 0
+    assert sorted(p.name for p in gh.data.glob("gh-*")) == ["gh-fresh"]
+
+
+def test_extension_reads_secrets_only_from_the_pipe() -> None:
+    src = CLI.read_text()
+    assert "RESONANT_SECRETS_FD" in src and "RESONANT_SECRET_" not in src

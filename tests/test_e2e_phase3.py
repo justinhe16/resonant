@@ -108,7 +108,8 @@ tools:
 # raw after JSON decoding) and base64 at the three alignments; also to stderr and fd 3.
 DUMP_PY = r"""
 import base64, json, os, sys, urllib.parse
-s = os.environ.get("RESONANT_SECRET_TOKEN", "")
+fd = os.environ.get("RESONANT_SECRETS_FD")
+s = json.load(os.fdopen(int(fd), "rb"))["token"] if fd else ""
 forms = {}
 if s:
     sys.stderr.write("stderr " + s + "\n")
@@ -342,8 +343,9 @@ async def test_e7_env_dump_only_declared_secret_and_never_stored(
         # 1. The env is exactly the allowlist plus this tool's own secret; none for plain.
         assert dump["ok"] and plain["ok"], (dump, plain)
         env: dict[str, str] = dump["data"]["env"]
-        assert set(env) - PLATFORM_ENV == ALLOWED_ENV | {"RESONANT_SECRET_TOKEN"}
-        assert env["RESONANT_SECRET_TOKEN"] == "[redacted]"
+        assert set(env) - PLATFORM_ENV == ALLOWED_ENV | {"RESONANT_SECRETS_FD"}
+        assert env["RESONANT_SECRETS_FD"] == "4"  # the fd number, never the value
+        assert SENTINEL not in json.dumps(env)
         assert env["PATH"] == settings.extensions.process.path_env
         assert env["HOME"] == str(settings.ext_data_dir / "example")
         assert set(plain["data"]["env"]) - PLATFORM_ENV == ALLOWED_ENV
