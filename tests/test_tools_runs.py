@@ -183,7 +183,10 @@ def test_merge_is_explicit_or_asks_yes(components: Components, db: sqlite3.Conne
     assert isinstance(asked, NeedsApproval)
     assert asked.level is Level.L2 and not asked.require_code
     # The prompt names the PR, its link and the flagged paths; code-built.
-    assert "PR #41 in resonant" in asked.summary
+    assert asked.summary.startswith(
+        "merge R1: PR #41 in resonant https://github.com/own/resonant/pull/"
+    )
+    assert "Makefile, package.json" in asked.summary
     assert "https://github.com/own/resonant/pull/41" in asked.summary
     assert "changes Makefile, package.json" in asked.summary
 
@@ -195,7 +198,7 @@ def test_dry_run_merge_names_the_pr(db: sqlite3.Connection, settings: Settings) 
     c = build_components(settings, db, state)
     make_run(db, status="ready", pr_number=7, pr_url="https://github.com/own/resonant/pull/7")
     decision = c.gate.evaluate(intent(c, "merge_run", {"code": "R1"}, origin="explicit"))
-    assert isinstance(decision, DryRun) and "merge PR #7 in resonant" in decision.would
+    assert isinstance(decision, DryRun) and "merge R1: PR #7 in resonant" in decision.would
 
 
 def test_members_cannot_request_run_tools(components: Components) -> None:

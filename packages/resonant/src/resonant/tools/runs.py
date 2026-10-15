@@ -43,8 +43,8 @@ RUNS_MAX = 8  # runs listed
 TEXT_MAX = 120  # Claude's summary or a failure, as the model and the reply see it
 ASK_SHOWN = 60
 
-# Run codes: ``R`` and a number. (They look like approval codes; ``yes R3`` still resolves
-# only a real pending approval, and nothing here ever shows the model an approval code.)
+# Run codes: ``R`` and a number. ``R`` is not in the approval alphabet (``gate.codes``), so a run
+# code can't be mistaken for, or parsed as, an approval code (``yes R3`` is not a reply).
 RUN_CODE = re.compile(r"R(\d{1,9})", re.ASCII | re.IGNORECASE)
 
 
@@ -151,7 +151,7 @@ def specs_for(ctx: BuiltinContext) -> tuple[ToolSpec, ...]:
 
 def summary_action(conn: sqlite3.Connection, intent: Intent) -> str | None:
     """The approval and dry-run heading for ``merge_run`` (matched by registry identity):
-    ``merge PR #41 in dori https://github.com/o/dori/pull/41, changes Makefile``, built from
+    ``merge R7: PR #41 in dori https://github.com/o/dori/pull/41, changes Makefile``, built from
     the run's row. None for another tool or a run that isn't there."""
     if intent.extension is not None or intent.tool != MERGE_RUN.name:
         return None
@@ -159,7 +159,7 @@ def summary_action(conn: sqlite3.Connection, intent: Intent) -> str | None:
     run = runs_store.get(conn, code) if code is not None else None
     if run is None or run.pr_number is None:
         return None
-    head = f"merge PR #{run.pr_number} in {run.repo}"
+    head = f"merge {run.code}: PR #{run.pr_number} in {run.repo}"
     if run.pr_url:
         head += f" {run.pr_url}"
     if run.flagged_paths:

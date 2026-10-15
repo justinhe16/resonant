@@ -56,8 +56,8 @@ INTENT_DEFINITIONS: dict[BuiltinIntent, str] = {
     "reminders": "asks to set a reminder, or to list or cancel pending reminders",
     "ops": "asks Resonant to restart Ollama or itself, update itself, or show its recent logs",
     "run_project": (
-        "asks Resonant to change code in a repo and open a PR, or about its runs: "
-        "what is going, cancel or merge one"
+        "asks Claude to do coding work in a repo (fix, change, open a PR), or about Claude runs "
+        "(R3): what is going, cancel or merge one; not general updates or status"
     ),
     "unknown": "anything else, or unclear",
 }
