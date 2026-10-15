@@ -38,9 +38,11 @@ ASKING_JOB_MIN_INTERVAL_S = 3600  # an L1/L2 job prompts a person each run
 DESCRIPTION_MAX = 120
 EXAMPLES_MAX = 3
 EXAMPLE_MAX = 80
+REPOS_MAX = 20
 
 _CRON_FIELD = re.compile(r"^[A-Za-z0-9*/,\-]+$")
 _DURATION = re.compile(r"^\d+[smh]$")
+_REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 _EVENT = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 RESERVED_EVENT = "item"  # the pulse's event type (``report()``); never a ``notify.on`` entry
@@ -273,6 +275,7 @@ class Manifest(BaseModel):
     report: Report | None = None
     health: Health | None = None
     secrets: tuple[SecretName, ...] = ()
+    repos: tuple[str, ...] = Field(default=(), max_length=REPOS_MAX)  # GitHub "owner/name" links
 
     @field_validator("name")
     @classmethod
@@ -293,6 +296,15 @@ class Manifest(BaseModel):
     def _examples(cls, v: tuple[str, ...]) -> tuple[str, ...]:
         if bad := [e for e in v if not e.strip() or len(e) > EXAMPLE_MAX or not e.isprintable()]:
             raise ValueError(f"examples must be single lines of 1-{EXAMPLE_MAX} chars: {bad}")
+        return v
+
+    @field_validator("repos")
+    @classmethod
+    def _repos(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        if bad := [r for r in v if not _REPO_SLUG.fullmatch(r) or {".", ".."} & set(r.split("/"))]:
+            raise ValueError(f"repos must be GitHub owner/name: {bad}")
+        if len({r.lower() for r in v}) != len(v):
+            raise ValueError("repos must be unique")
         return v
 
     @model_validator(mode="after")

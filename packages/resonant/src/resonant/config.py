@@ -388,6 +388,9 @@ class RunnerConfig(_Section):
     secrets_dir: Path = Field(default=Path("~/.resonant/run-secrets"), validate_default=True)
     # Package caches shared between runs and used by nothing outside the sandbox.
     cache_dir: Path = Field(default=Path("~/resonant-runs/.cache"), validate_default=True)
+    # Extra paths a session may neither read nor write, on top of the built-in secret-file
+    # denies (.env, *.pem, ~/.ssh, ...; resonant/sandbox/runner.sb).
+    deny_read: list[Path] = Field(default_factory=list[Path])
     max_run_dir_mb: int = Field(default=5000, ge=100)
     max_cache_gb: int = Field(default=20, ge=1)
     max_minutes: int = Field(default=45, ge=1, le=600)
@@ -415,6 +418,11 @@ class RunnerConfig(_Section):
         # Symlinks resolved now, so overlap checks and the sandbox see the same real path.
         return v.resolve()
 
+    @field_validator("deny_read")
+    @classmethod
+    def _deny_read(cls, v: list[Path]) -> list[Path]:
+        return [cls._dirs(p) for p in v]
+
     @model_validator(mode="after")
     def _mirror_apart(self) -> Self:
         # The mirror is daemon-only; the sandbox can write the work and cache dirs.
@@ -422,6 +430,10 @@ class RunnerConfig(_Section):
             for other, label in ((self.work_dir, "work_dir"), (self.cache_dir, "cache_dir")):
                 if private.is_relative_to(other) or other.is_relative_to(private):
                     raise ValueError(f"runner.{plabel} must not overlap runner.{label}")
+        for denied in self.deny_read:
+            for other, label in ((self.work_dir, "work_dir"), (self.cache_dir, "cache_dir")):
+                if denied.is_relative_to(other) or other.is_relative_to(denied):
+                    raise ValueError(f"runner.deny_read must not overlap runner.{label}")
         return self
 
     @field_validator("git_path", "gh_path")

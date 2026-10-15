@@ -4,8 +4,8 @@ Tried in order, the way a person would:
 
 1. ``owner/name`` or a ``github.com`` URL.
 2. A registry name or alias.
-3. An extension's linked repo, by extension name (store-level; the SDK manifest field that
-   fills these in comes later).
+3. An extension's linked repos (its manifest ``repos``), by extension name. One link resolves
+   like that slug; several are :class:`Ambiguous`.
 4. The owner's GitHub repos (listed through the API, cached for an hour), fuzzy-matched by name.
 
 The first time a repo is resolved, GitHub is asked what access the token has: push access
@@ -87,7 +87,16 @@ class GitHub(Protocol):
 class Resolved:
     repo: Repo
     new: bool  # registered by this call
+    via: str | None = None  # the extension whose link led here
     warning: str | None = None  # for the reply to append (a new push repo's base is unprotected)
+
+    @property
+    def note(self) -> str:
+        """``(new repo: owner/name)`` for a repo this call registered, else empty."""
+        if not self.new:
+            return ""
+        by = f" via {self.via}" if self.via else ""
+        return f"(new repo: {self.repo.slug}{by})"
 
 
 @dataclass(frozen=True)
@@ -111,6 +120,21 @@ class NoAccess:
     @property
     def text(self) -> str:
         return f"No access to {self.slug}."
+
+
+@dataclass(frozen=True)
+class NotPushable(NoAccess):
+    """An extension links a repo the token can't push to. Links don't register those (a
+    :class:`NoAccess`, so callers refuse it like one)."""
+
+    extension: str = ""
+
+    @property
+    def text(self) -> str:
+        return (
+            f"{self.slug} (linked by {self.extension}) isn't one you can push to; "
+            f"add it yourself with its owner/name."
+        )
 
 
 Resolution = Resolved | Ambiguous | NotFound | NoAccess
@@ -151,21 +175,23 @@ class Resolver:
             return await self._by_slug(slug, github)
         if (known := repos.find(self.conn, text)) is not None:
             return Resolved(known, new=False)
-        linked = repos.by_extension(self.conn, text)
+        linked = repos.enabled_links(self.conn, text)
         if len(linked) == 1:
-            return Resolved(linked[0], new=False)
+            return await self._by_slug(linked[0], github, via=text.lower())
         if linked:
-            return Ambiguous(tuple(r.name for r in linked[:MAX_CANDIDATES]))
+            return Ambiguous(tuple(linked[:MAX_CANDIDATES]))
         return await self._fuzzy(text, github)
 
-    async def _by_slug(self, slug: str, github: GitHub) -> Resolution:
+    async def _by_slug(self, slug: str, github: GitHub, via: str | None = None) -> Resolution:
         if (known := repos.get(self.conn, slug)) is not None:
-            return Resolved(known, new=False)
+            return Resolved(known, new=False, via=via)
         info = await github.repo_info(slug)
         if info is None or not (info.can_push or not info.private):
             return NoAccess(slug)
         if (known := repos.get(self.conn, info.slug)) is not None:  # GitHub spells it otherwise
-            return Resolved(known, new=False)
+            return Resolved(known, new=False, via=via)
+        if via is not None and not info.can_push:
+            return NotPushable(slug, via)  # a link never writes a fork-mode row
         try:
             with atomic(self.conn):
                 repo = repos.add(
@@ -180,8 +206,10 @@ class Resolver:
             # Another request registered it while GitHub was being asked.
             if (known := repos.get(self.conn, info.slug)) is None:
                 raise
-            return Resolved(known, new=False)
-        return Resolved(repo, new=True, warning=await self._protection_warning(repo, github))
+            return Resolved(known, new=False, via=via)
+        return Resolved(
+            repo, new=True, via=via, warning=await self._protection_warning(repo, github)
+        )
 
     @staticmethod
     async def _protection_warning(repo: Repo, github: GitHub) -> str | None:

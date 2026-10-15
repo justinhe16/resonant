@@ -6,6 +6,7 @@ import asyncio
 import json
 import sqlite3
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from resonant.runner.resolve import (
     GitHubError,
     NoAccess,
     NotFound,
+    NotPushable,
     RepoInfo,
     Resolved,
     Resolver,
@@ -25,6 +27,7 @@ from resonant.runner.resolve import (
 )
 from resonant.runner.workspace import Workspace
 from resonant.secrets import RunnerSecrets
+from resonant.store import extensions as ext_store
 from resonant.store import repos
 
 
@@ -86,14 +89,71 @@ async def test_registry_name_and_alias_win_before_github(db: sqlite3.Connection)
     assert gh.calls == []
 
 
-async def test_extension_link_by_extension_name(db: sqlite3.Connection) -> None:
-    r = repos.add(db, "me/bot", base="main", source="extension:trading")
+def _install(db: sqlite3.Connection, name: str, status: str = "enabled") -> None:
+    ext_store.save_extension(
+        db,
+        ext_store.ExtensionRecord(
+            name=name,
+            source=f"repo:{name}",
+            commit=None,
+            tree_digest="d",
+            manifest_sha="m",
+            manifest={},
+            installed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            installed_by="owner",
+            status=status,  # type: ignore[arg-type]
+        ),
+    )
+
+
+async def test_extension_name_resolves_its_single_link(db: sqlite3.Connection) -> None:
+    _install(db, "trading")
+    repos.set_links(db, "trading", ["me/bot"])
+    gh = FakeGitHub([info("me/bot")])
+    got = await Resolver(db).resolve("Trading", gh)
+    assert isinstance(got, Resolved) and got.new and got.repo.slug == "me/bot"
+    assert got.repo.source == "auto" and got.note == "(new repo: me/bot via trading)"
+    again = await Resolver(db).resolve("trading", gh)  # registered now: no GitHub call
+    assert again == Resolved(got.repo, new=False, via="trading")
+    assert isinstance(again, Resolved) and again.note == ""
+    assert gh.calls == ["repo_info me/bot"]
+
+
+async def test_extension_name_with_several_links_is_ambiguous(db: sqlite3.Connection) -> None:
+    _install(db, "trading")
+    repos.set_links(db, "trading", ["me/bot2", "me/bot"])
     gh = FakeGitHub()
-    resolver = Resolver(db)
-    assert await resolver.resolve("trading", gh) == Resolved(r, new=False)
-    repos.add(db, "me/bot2", base="main", source="extension:trading")
-    assert await resolver.resolve("trading", gh) == Ambiguous(("bot", "bot2"))
+    assert await Resolver(db).resolve("trading", gh) == Ambiguous(("me/bot", "me/bot2"))
     assert gh.calls == []
+
+
+async def test_extension_link_without_access_and_registry_first(db: sqlite3.Connection) -> None:
+    _install(db, "trading")
+    repos.set_links(db, "trading", ["them/gone"])
+    assert await Resolver(db).resolve("trading", FakeGitHub()) == NoAccess("them/gone")
+    r = repos.add(db, "me/other", base="main", source="owner", aliases=["trading"])
+    assert await Resolver(db).resolve("trading", FakeGitHub()) == Resolved(r, new=False)
+
+
+async def test_disabled_or_missing_extension_links_are_ignored(db: sqlite3.Connection) -> None:
+    repos.set_links(db, "ghost", ["me/bot"])  # no extension row at all
+    _install(db, "trading", status="disabled")
+    repos.set_links(db, "trading", ["me/bot"])
+    gh = FakeGitHub([info("me/bot")], mine=[])
+    for name in ("ghost", "trading"):
+        assert await Resolver(db).resolve(name, gh) == NotFound(name)
+    assert gh.calls == ["my_repos"] * 2 or gh.calls == ["my_repos"]
+    assert repos.list_all(db) == []
+
+
+async def test_link_to_a_repo_you_cant_push_to_is_not_registered(db: sqlite3.Connection) -> None:
+    _install(db, "trading")
+    repos.set_links(db, "trading", ["them/pub"])
+    gh = FakeGitHub([info("them/pub", push=False)])
+    got = await Resolver(db).resolve("trading", gh)
+    assert got == NotPushable("them/pub", "trading")
+    assert isinstance(got, NotPushable) and "them/pub" in got.text
+    assert repos.list_all(db) == []
 
 
 async def test_fuzzy_match_on_the_owners_repo_list(db: sqlite3.Connection) -> None:

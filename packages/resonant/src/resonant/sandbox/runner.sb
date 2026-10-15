@@ -114,4 +114,48 @@
   (regex #"^/dev/ttys[0-9]+")
   (literal "/dev/ptmx"))
 ;; the runner's token files, briefly on disk under runner.secrets_dir
-(deny file-read* file-write* (subpath (param "SECRETS")))
+(deny file-read* file-write*
+  (subpath (param "SECRETS"))
+;; runner.deny_read: the owner's extra paths
+;; @DENY_READ@
+  )
+
+;; ---- secret files: denied for read AND write, wherever they sit -----------------------------
+;; Credentials the owner keeps next to their code (~/trading/.env with exchange keys) or in
+;; the usual tool homes. Last in the file so no allow above can undo them (SBPL: last match
+;; wins). The name rules (.env*, .envrc, *.pem, *.p12, *.pfx, *.jks, *.key, id_rsa-style SSH
+;; keys) spare the run dir, the cache and the toolchain read paths (profile.py passes them as
+;; params), so a repo's own committed files and a package's bundled cacert.pem still work.
+;; Read paths are exempt because a toolchain tree is not the owner's secrets; never put a
+;; credential dir in runner read paths. They also spare the few system locations that hold
+;; the OS and Homebrew CA bundles (TLS for git, curl, python and gh needs them).
+;; SBPL regexes are POSIX extended, matched against the whole path; #"..." is a raw string, so
+;; `\.` is an escaped dot. The macOS filesystem is case-insensitive, so every letter is a
+;; [xX] class (`.ENV` opens `.env`). No lookahead exists, hence the require-not for templates.
+(deny file-read* file-write*
+  (require-all
+    (require-any
+      (regex #"/\.[eE][nN][vV]$")
+      (regex #"/\.[eE][nN][vV]\.[^/]*$")
+      (regex #"/\.[eE][nN][vV][rR][cC]$")
+      (regex #"\.([pP][eE][mM]|[pP]12|[pP][fF][xX]|[jJ][kK][sS]|[kK][eE][yY])$")
+      (regex #"/[iI][dD]_([rR][sS][aA]|[dD][sS][aA]|[eE][cC][dD][sS][aA]|[eE][dD]25519)(_[sS][kK])?$"))
+    ;; committed templates carry no secrets
+    (require-not
+      (regex #"/\.[eE][nN][vV]\.([eE][xX][aA][mM][pP][lL][eE]|[sS][aA][mM][pP][lL][eE]|[tT][eE][mM][pP][lL][aA][tT][eE])$"))
+    ;; CA bundles the OS and Homebrew tools read
+    (require-not (subpath "/private/etc/ssl"))
+    (require-not (subpath "/System/Library/Security"))
+    (require-not (subpath "/opt/homebrew/etc/ca-certificates"))
+    (require-not (subpath "/opt/homebrew/etc/openssl@3"))
+    (require-not (subpath "/opt/homebrew/share/ca-certificates"))
+    (require-not (subpath "/opt/homebrew/Cellar/ca-certificates"))
+    ;; the run's own files and the toolchain paths
+    (require-not (require-any
+;; @SECRET_EXEMPT@
+      ))))
+;; fixed credential files and dirs under $HOME (profile.py HOME_SECRETS), even when a
+;; read path above sits inside one
+(deny file-read* file-write*
+;; @HOME_SECRETS@
+  )

@@ -232,6 +232,123 @@ def test_always_denied_dirs_win_over_read_paths(tmp_path: Path) -> None:
     assert got[paths[1]] == "ok"
 
 
+def test_render_secret_denies_come_last_and_carry_deny_read(tmp_path: Path) -> None:
+    extra = tmp_path / "keys"
+    extra.mkdir()
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    text, defs = render(params_in(tmp_path, deny_read=(extra,), read_paths=(tools,)))
+    assert defs["DENY_READ_0"] == os.path.realpath(extra)
+    assert str(extra) not in text
+    assert ";; @" not in text  # every placeholder was filled
+    # the name rules sit after every allow, and spare the run dir, cache and read paths
+    last_allow = text.rindex("(allow ")
+    names = text.index('(regex #"/\\.[eE][nN][vV]$")')
+    assert names > last_allow
+    assert text.index('(param "DENY_READ_0")') > last_allow
+    exempt = text[names:]
+    assert "(require-not (require-any" in exempt
+    for key in ("RUN", "CACHE", "READ_0"):
+        assert f'(subpath (param "{key}"))' in exempt
+    # case-insensitive filesystem: every letter is a class, and the template allow-list too
+    assert "[eE][nN][vV]\\.([eE][xX][aA][mM][pP][lL][eE]|" in text
+    assert "[kK][eE][yY]" in text and "[pP][fF][xX]" in text and "[jJ][kK][sS]" in text
+    assert "[eE][nN][vV][rR][cC]" in text and "[iI][dD]_([rR][sS][aA]|" in text
+    # every HOME_SECRETS entry is rendered, none is a leftover literal in the template
+    for rel in profile_mod.HOME_SECRETS:
+        assert f'(subpath (string-append (param "HOME") "/{rel}"))' in text[names:]
+    for rel in (".git-credentials", ".pgpass", ".config/gcloud", ".azure"):
+        assert rel in profile_mod.HOME_SECRETS
+
+
+def test_deny_read_is_checked_like_other_paths(tmp_path: Path) -> None:
+    with pytest.raises(SandboxError):
+        params_in(tmp_path, deny_read=(Path("relative"),)).resolved()
+    with pytest.raises(SandboxError):
+        params_in(tmp_path, deny_read=(tmp_path / 'a"b',)).resolved()
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    with pytest.raises(SandboxError):  # a run dir inside ~/.kube would be unreadable
+        SandboxParams(
+            run_dir=home / ".kube" / "r",
+            cache_dir=tmp_path / "c",
+            secrets_dir=home / ".resonant" / "s",
+            home=home,
+        ).resolved()
+
+
+@on_mac
+def test_secret_denies_in_a_fake_home(tmp_path: Path) -> None:
+    """With read paths put right on top of credential files, the final denies still win, and
+    the exempt paths (a read path, the run dir) keep their .env and .pem files."""
+    home = tmp_path / "home"
+    for rel in (".docker/config.json", ".docker/ok.txt", ".kube/config", ".gnupg/k", ".ssh/id"):
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text("secret")
+    for rel in (".netrc", ".npmrc", ".pypirc"):
+        (home / rel).write_text("secret")
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "cacert.pem").write_text("cert")
+    (tools / ".env").write_text("tool")
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    (extra / "f").write_text("secret")
+    interp = os.path.realpath(getattr(sys, "_base_executable", sys.executable))
+    params = SandboxParams(
+        run_dir=tmp_path / "run",
+        cache_dir=tmp_path / "cache",
+        secrets_dir=home / ".resonant" / "run-secrets",
+        home=home,
+        read_paths=(
+            home / ".docker",
+            home / ".kube",
+            home / ".gnupg",
+            home / ".ssh",
+            home / ".netrc",
+            home / ".npmrc",
+            home / ".pypirc",
+            tools,
+            extra,
+            Path(sys.base_prefix),
+            Path(interp).parent,
+        ),
+        deny_read=(extra,),
+    )
+    prepare_dirs(params)
+    (tmp_path / "run" / "repo" / ".env").write_text("mine")
+    code = (
+        "import json,sys\n"
+        "r={}\n"
+        "for p in sys.argv[1:]:\n"
+        "    try: r[p]=open(p,'rb').read(4).decode()\n"
+        "    except OSError as e: r[p]='errno:%d'%e.errno\n"
+        "print(json.dumps(r))\n"
+    )
+    denied = [
+        *(home / rel for rel in (".docker/config.json", ".kube/config", ".gnupg/k", ".ssh/id")),
+        *(home / rel for rel in (".netrc", ".npmrc", ".pypirc")),
+        extra / "f",
+    ]
+    allowed = [
+        home / ".docker" / "ok.txt",
+        tools / "cacert.pem",
+        tools / ".env",
+        tmp_path / "run" / "repo" / ".env",
+    ]
+    paths = [str(p) for p in (*denied, *allowed)]
+    proc = subprocess.run(
+        wrap([interp, "-I", "-c", code, *paths], params),
+        cwd="/",
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    got = json.loads(proc.stdout)
+    assert {str(p): got[str(p)] for p in denied} == {str(p): "errno:1" for p in denied}, got
+    assert not any(got[str(p)].startswith("errno") for p in allowed), got
+
+
 @on_mac
 def test_self_check_passes(ctx: ProbeContext) -> None:
     ok, detail = self_check(ctx.params)
@@ -320,7 +437,9 @@ def test_final_denies_come_after_every_allow(tmp_path: Path) -> None:
     last_allow_file = max(body.rfind("(allow file-write*"), body.rfind("(allow file-read*"))
     last_allow = body.rfind("(allow ")
     for marker in (
-        '(deny file-read* file-write* (subpath (param "SECRETS")))',
+        '(subpath (param "SECRETS"))',
+        '(regex #"/\\.[eE][nN][vV]$")',
+        '(subpath (string-append (param "HOME") "/.netrc"))',
         '(literal (string-append (param "HOME") "/.zshrc"))',
         '(subpath (string-append (param "HOME") "/.claude"))',
     ):

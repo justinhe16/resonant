@@ -100,8 +100,9 @@ For a `fork` repo:
 ### D7. Extension links (SDK manifest)
 
 - Manifest v1 gets an optional `repos: ["owner/name", ...]` field. It's additive, so existing manifests still load.
-- On `ext add` or `update`, each linked repo is registered with `source=extension:<name>`, and the extension name becomes an alias.
-- On `ext remove`, those links are dropped. A repo you also used yourself stays registered.
+- Links live in their own table, `repo_links(extension, slug)` (migration 008), not in the registry, so a link can exist before the repo is resolved against GitHub. `ext add` or `update` replaces the extension's links; `ext remove` drops them. Registry rows for repos you used stay.
+- Resolver step 3 maps an extension name to its linked slug, only while the extension is enabled. One link resolves like that slug, several are ambiguous. The repo is registered on first use with `source=auto` (a repo can be linked by several extensions and used directly, so one `source` can't describe it), and the reply says `(new repo: owner/name via <ext>)`. A linked repo you can't push to is refused (`NotPushable`) before any row is written.
+- A link changes what "work on <ext>" does, so the install and update confirmations list each link under Escalations, flagged when the repo isn't in your registry. Update diffs show added and removed links.
 - `/ext list` shows the linked repos.
 - Follow-up, not part of this plan: the github extension's watch could cover registry repos by default.
 

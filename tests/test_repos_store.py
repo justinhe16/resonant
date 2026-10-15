@@ -23,13 +23,26 @@ def _through(version: int) -> list[tuple[int, str]]:
     return sorted(m for m in found if m[0] <= version)
 
 
+def test_migration_008_over_populated_007(tmp_path: Path) -> None:
+    path = tmp_path / "old.db"
+    conn = connect(path)
+    assert migrate(conn, _through(7)) == 7
+    repos.add(conn, "me/a", base="main", source="auto")
+    conn.close()
+    conn = open_db(path)
+    assert schema_version(conn) == latest_version() == 8
+    assert [r.slug for r in repos.list_all(conn)] == ["me/a"]
+    assert repos.links(conn, "x") == []
+    conn.close()
+
+
 def test_migration_007_over_populated_006(tmp_path: Path) -> None:
     path = tmp_path / "old.db"
     conn = connect(path)
     assert migrate(conn, _through(6)) == 6
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == latest_version() == 7
+    assert schema_version(conn) == latest_version() == 8
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(repos)")}
     assert {"slug", "name", "aliases", "base", "mode", "ci", "source", "last_used_at"} <= cols
     assert repos.list_all(conn) == []
@@ -93,11 +106,16 @@ def test_forget_and_set_ci(db: sqlite3.Connection) -> None:
     assert repos.get(db, "o/a") is None
 
 
-def test_by_extension(db: sqlite3.Connection) -> None:
-    repos.add(db, "me/bot", base="main", source="extension:trading", aliases=["trading"])
-    repos.add(db, "me/other", base="main", source="auto")
-    assert [r.slug for r in repos.by_extension(db, "Trading")] == ["me/bot"]
-    assert repos.by_extension(db, "nope") == []
+def test_links_are_replaced_and_dropped_per_extension(db: sqlite3.Connection) -> None:
+    repos.set_links(db, "trading", ["me/b", "me/a"])
+    repos.set_links(db, "other", ["me/c"])
+    assert repos.links(db, "Trading") == ["me/a", "me/b"]
+    repos.set_links(db, "trading", ["me/d", "me/D"])
+    assert repos.links(db, "trading") == ["me/d"]
+    repos.drop_links(db, "trading")
+    assert repos.links(db, "trading") == []
+    assert repos.links(db, "other") == ["me/c"]
+    assert repos.list_all(db) == []  # links never register a repo
 
 
 def test_import_config_is_idempotent_and_owner_sourced(db: sqlite3.Connection) -> None:

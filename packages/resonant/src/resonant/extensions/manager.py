@@ -28,7 +28,7 @@ import re
 import secrets as pysecrets
 import shlex
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -64,6 +64,7 @@ from resonant.gate.codes import sanitize_external
 from resonant.principals import Principals
 from resonant.secrets import InvalidSecretRef, secret_ref
 from resonant.store import extensions as ext_store
+from resonant.store import repos
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, kv_set, utcnow
 from resonant_sdk import Manifest, load_manifest
@@ -141,10 +142,16 @@ def _argv0(run: str) -> str:
     return argv[0] if argv else ""
 
 
-def escalations(manifest: Manifest) -> list[str]:
+def escalations(manifest: Manifest, registered: Collection[str] = ()) -> list[str]:
     """What raises the stakes, one line each: secrets, approvers, asking tools and jobs,
-    and commands that use the network (``gh``/``git``). Stable text, so updates can diff."""
+    commands that use the network (``gh``/``git``), and linked repos. A repo link makes
+    "work on <extension>" start runs there. The owner's GitHub login isn't known offline, so a
+    slug not in the repo registry (``registered``, lowercase) is flagged. Stable text, so
+    updates can diff."""
     out: list[str] = []
+    for slug in manifest.repos:
+        new = "" if slug.lower() in registered else " (not in your repo registry)"
+        out.append(f"repo link {_s(slug)}: requests naming {manifest.name} run there{new}")
     for name in manifest.secrets:
         out.append(f"secret {_s(f'{manifest.name}/{name}')} (Keychain)")
     for name in manifest.approvers:
@@ -204,11 +211,11 @@ def schedule_words(cron: str, tz: str | None = None) -> str:
     return f"{words} {_s(tz, 40)}" if tz else words
 
 
-def confirm_lines(staged: Staged) -> list[str]:
+def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]:
     """The install/update confirmation: heading, escalations first, then everything else."""
     m = staged.manifest
     lines = [heading(staged), ""]
-    esc = escalations(m)
+    esc = escalations(m, registered)
     lines.append("Escalations:" if esc else "Escalations: none")
     lines += [f"  ! {e}" for e in esc]
     if m.description or m.examples:
@@ -233,6 +240,8 @@ def confirm_lines(staged: Staged) -> list[str]:
             f"{spec.effect.value} {spec.effective_level.value}, catchup {_s(job.catchup, 10)}"
             f", runs {job.run}"
         )
+    if m.repos:
+        lines.append(f"Repos: {', '.join(_s(r, 80) for r in m.repos)}")
     if m.report is not None and m.report.max_urgency != "urgent":
         lines.append(report_grant(m).replace("reports:", "Reports:", 1))
     if m.notify:
@@ -246,7 +255,12 @@ def confirm_lines(staged: Staged) -> list[str]:
     return lines
 
 
-def update_lines(old: ext_store.ExtensionRecord, old_files: TreeEntries, new: Staged) -> list[str]:
+def update_lines(
+    old: ext_store.ExtensionRecord,
+    old_files: TreeEntries,
+    new: Staged,
+    registered: Collection[str] = (),
+) -> list[str]:
     """What an update changes: pins, files, and escalations added or removed."""
     lines = [
         f"{new.name}: {old.source}@{(old.commit or 'no-commit')[:8]} digest "
@@ -266,8 +280,8 @@ def update_lines(old: ext_store.ExtensionRecord, old_files: TreeEntries, new: St
         return lines
     before: set[str] = set()
     with contextlib.suppress(ValidationError):  # an old snapshot may not parse any more
-        before = set(escalations(Manifest.model_validate(old.manifest)))
-    after = escalations(new.manifest)
+        before = set(escalations(Manifest.model_validate(old.manifest), registered))
+    after = escalations(new.manifest, registered)
     diff = [f"  + {e}" for e in after if e not in before]
     diff += [f"  - {e}" for e in sorted(before) if e not in after]
     old_grant = _old_grant(old)
@@ -381,6 +395,10 @@ class ExtensionManager:
                     problems.append(f"{where}: {e}")
         return problems
 
+    def registered_slugs(self) -> frozenset[str]:
+        """Lowercase slugs in the repo registry, for flagging unfamiliar repo links."""
+        return frozenset(r.slug.lower() for r in repos.list_all(self.conn))
+
     def discard(self, staged: Staged) -> None:
         remove_tree(staged.root)
 
@@ -486,6 +504,7 @@ class ExtensionManager:
             with atomic(self.conn):
                 ext_store.save_extension(self.conn, record)
                 ext_store.prune_jobs(self.conn, name, [j.id for j in staged.manifest.jobs])
+                repos.set_links(self.conn, name, staged.manifest.repos)
                 origin = {"source": approved.source, "secrets": sorted(staged.manifest.secrets)}
                 kv_set(self.conn, ORIGIN_KEY.format(name=name), origin)
                 audit(
@@ -537,6 +556,7 @@ class ExtensionManager:
             raise ManagerError(f"{name} is not installed")
         with atomic(self.conn):
             ext_store.delete_extension(self.conn, name)
+            repos.drop_links(self.conn, name)
             audit(
                 self.conn,
                 "ext.remove",

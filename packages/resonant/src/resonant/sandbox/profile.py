@@ -46,6 +46,26 @@ ALWAYS_DENIED = (
     "Library",
     ".local/bin",
 )
+# Credential dirs and files under $HOME, denied for read and write. runner.sb gets one
+# subpath line each (the @HOME_SECRETS@ placeholder), so this list is the whole rule.
+HOME_SECRET_DIRS = (
+    ".ssh",
+    ".aws",
+    ".config/gh",
+    ".config/gcloud",
+    ".azure",
+    ".kube",
+    ".gnupg",
+)
+HOME_SECRET_FILES = (
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".git-credentials",
+    ".docker/config.json",
+)
+HOME_SECRETS = (*HOME_SECRET_DIRS, *HOME_SECRET_FILES)
 # Binaries that may be linked into the run-local bin/.
 NEVER_LINKED = frozenset({"resonant"})
 
@@ -53,6 +73,9 @@ _PLACEHOLDERS = {
     "read": ";; @READ_ALLOW@",
     "meta": ";; @META_ALLOW@",
     "exec": ";; @DENY_EXEC@",
+    "exempt": ";; @SECRET_EXEMPT@",
+    "deny_read": ";; @DENY_READ@",
+    "home_secrets": ";; @HOME_SECRETS@",
 }
 
 
@@ -82,11 +105,12 @@ class SandboxParams:
     home: Path = field(default_factory=Path.home)
     read_paths: tuple[Path, ...] = ()
     deny_exec: tuple[Path, ...] = ()
+    deny_read: tuple[Path, ...] = ()  # runner.deny_read: extra paths, read and write denied
 
     def resolved(self) -> SandboxParams:
         home = Path(checked_path(self.home))
         run = Path(checked_path(self.run_dir))
-        for name in ALWAYS_DENIED:
+        for name in (*ALWAYS_DENIED, *HOME_SECRETS):
             if run.is_relative_to(home / name):
                 raise SandboxError(
                     f"run dir {run} is inside {home / name}, which is never readable"
@@ -116,6 +140,7 @@ class SandboxParams:
             home=home,
             read_paths=reads,
             deny_exec=tuple(Path(checked_path(p)) for p in self.deny_exec),
+            deny_read=tuple(Path(checked_path(p)) for p in self.deny_read),
             secrets_dir=secrets,
         )
 
@@ -183,12 +208,26 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
     for i, path in enumerate(p.deny_exec):
         defs[f"DENY_EXEC_{i}"] = str(path)
         exec_lines.append(f'  (subpath (param "DENY_EXEC_{i}"))')
+    # the secret-file name denies spare the run's own files and the toolchain paths (a
+    # package's bundled cacert.pem); the system roots are spared in runner.sb itself
+    exempt_lines = [f'  (subpath (param "{k}"))' for k in ("RUN", "CACHE")]
+    exempt_lines += [f'  (subpath (param "READ_{i}"))' for i in range(len(p.read_paths))]
+    deny_read_lines: list[str] = []
+    for i, path in enumerate(p.deny_read):
+        defs[f"DENY_READ_{i}"] = str(path)
+        deny_read_lines.append(f'  (subpath (param "DENY_READ_{i}"))')
+    home_secret_lines = [
+        f'  (subpath (string-append (param "HOME") "/{rel}"))' for rel in HOME_SECRETS
+    ]
     defs["SECRETS"] = str(p.secrets_dir)
     text = template_text()
     for key, lines in (
         ("read", read_lines),
         ("meta", meta_lines),
         ("exec", exec_lines),
+        ("exempt", exempt_lines),
+        ("deny_read", deny_read_lines),
+        ("home_secrets", home_secret_lines),
     ):
         if _PLACEHOLDERS[key] not in text:
             raise SandboxError(f"runner.sb lost its {_PLACEHOLDERS[key]} placeholder")
