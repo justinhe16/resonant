@@ -21,9 +21,20 @@ SLASH_ONLY = {
     "/approvals",  # control plane: codes and args are for the owner's explicit eyes
     "/help",  # answered from the registry; chat has list_commands
 }
-# Tools that must never be reachable by the model: they run a control-plane action. (The
-# fast path also keeps `/pulse now` and `/ext run` as tool-less subcommands.)
-CONTROL_TOOLS = {"mute_extension"}
+# The only non-read tools an intent may reach (all chat-gated: L3 runs and reports, L2 asks,
+# L1 needs a code). A new write tool in an intent must be added here deliberately; control
+# plane (`mute_extension`, kill, resume, approvals) never is. The fast path also keeps
+# `/pulse now` and `/ext run` as tool-less subcommands.
+CHAT_WRITES = {
+    "add_note",
+    "clear_notes",
+    "delete_note",
+    "add_reminder",
+    "cancel_reminder",
+    "restart_ollama",
+    "restart_resonant",
+    "update_resonant",
+}
 
 SPECS = {s.name: s for s in BUILTIN_SPECS}
 REACHABLE = {t for tools in INTENT_TOOLS.values() for t in tools}
@@ -49,7 +60,8 @@ def test_slash_only_commands_have_no_tool() -> None:
 
 
 def test_control_plane_is_not_reachable_by_the_model() -> None:
-    assert not CONTROL_TOOLS & REACHABLE
+    writes = {t for t in REACHABLE if SPECS[t].effect is not Effect.READ}
+    assert writes == CHAT_WRITES, writes ^ CHAT_WRITES
     # `/pulse now`, `/ext run` and `/ext mute` are slash-only subcommands.
     pulse = commands.get("/pulse")
     assert pulse is not None and pulse.tool == "pulse_preview"

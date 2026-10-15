@@ -53,7 +53,7 @@ SUGGEST_N = 3
 SUGGEST_CUTOFF = 0.6
 SUGGEST_MARGIN = 0.1  # "/remnd": /remind, not also /unremind and /reminders
 HELP_QUERY_MAX = 50
-KEYWORDS_HINT = "Or just ask in plain words: what's running, any updates, ping."
+KEYWORDS_HINT = "Instant, no model: /status, /tasks, ping. Or just ask in plain words."
 EXT_ARG_MAX = 1000  # the process runner's limit for one value
 EXT_DESCRIPTION_MAX = 120
 MUTE_DEFAULT = timedelta(hours=1)

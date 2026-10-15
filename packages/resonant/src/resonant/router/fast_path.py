@@ -1,4 +1,4 @@
-"""Deterministic fast path: slash commands and a few anchored keywords, no model call.
+"""Deterministic fast path: slash commands and the ``status`` / ``ping`` keywords, no model call.
 
 Code computes and text narrates: a read command runs one builtin read tool here, and the
 reply is rendered from a template over the tool's output. A side-effecting command runs

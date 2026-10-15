@@ -137,7 +137,7 @@ def _work_line(b: Briefing) -> str | None:
     return "▶ " + ", ".join(parts) if parts else None
 
 
-def _approvals_line(b: Briefing) -> str | None:
+def approvals_line(b: Briefing) -> str | None:
     if not b.approvals:
         return None
     codes = [c for c in b.approvals if c]
@@ -174,7 +174,7 @@ def render_full(b: Briefing) -> tuple[str, list[pulse_store.Item]]:
         for line in (
             _reminders_line(b),
             _work_line(b),
-            _approvals_line(b),
+            approvals_line(b),
             _health_line(b),
         )
         if line
@@ -194,7 +194,7 @@ def sections(b: Briefing) -> list[str]:
     named = {
         "reminders": _reminders_line(b),
         "work": _work_line(b),
-        "approvals": _approvals_line(b),
+        "approvals": approvals_line(b),
         "health": _health_line(b),
         "updates": "x" if b.updates else None,
     }

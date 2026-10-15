@@ -440,7 +440,7 @@ can(principal, action ∈ {request, approve, admin}, extension | None) -> bool`,
     inv:["One transaction per step: outcome + checkpoint + consumed events","Crash mid-step: no partial state, and the task resumes from its last checkpoint","Retryable failures keep their events and back off 5s·2ⁿ (max 300s)","Graceful shutdown gives in-flight steps a 10s grace period. The rest resume on the next start"],
     files:["packages/resonant/src/resonant/loop/loop.py","tests/test_loop.py"]},
   router:{label:"Router", phase:"1", status:"built",
-    what:"The Loop's router hook. It turns an unrouted iMessage event into a task for the local runner. A deterministic fast path (slash commands and a few anchored keywords) runs one gated builtin read and replies from a template with no model call. Anything else gets one LLM intent label, and the toolset for that intent is filtered by principal before the model sees it.",
+    what:"The Loop's router hook. It turns an unrouted iMessage event into a task for the local runner. A deterministic fast path (slash commands plus the `status` and `ping` keywords) runs one gated builtin read and replies from a template with no model call. Anything else gets one LLM intent label, and the toolset for that intent is filtered by principal before the model sees it.",
     iface:`Router(conn, *, principals, registry, gate, handlers, model).route(event) -> NewTask | None
 fast:    NewTask(kind="reply", runner="local", checkpoint={fast_reply, tool_used, intent})
 labeled: NewTask(kind="chat",  runner="local", checkpoint={intent, confidence, toolset, fallback})

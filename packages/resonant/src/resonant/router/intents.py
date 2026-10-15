@@ -51,10 +51,7 @@ INTENT_DEFINITIONS: dict[BuiltinIntent, str] = {
         "asks about the health of the Mac mini (CPU, memory, disk), the Resonant daemon or "
         "the local model, or what Resonant can do"
     ),
-    "updates": (
-        "asks what's new, for an update, a summary, the briefing, or how a project or "
-        "extension is doing"
-    ),
+    "updates": "asks what's new, for an update, a summary, the briefing, or what's open",
     "notes": "asks to save, list or delete the owner's notes",
     "reminders": "asks to set a reminder, or to list or cancel pending reminders",
     "ops": "asks Resonant to restart Ollama or itself, update itself, or show its recent logs",

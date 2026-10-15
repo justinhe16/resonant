@@ -148,17 +148,29 @@ def compose(items: Sequence[store.Item]) -> tuple[str, list[store.Item]] | None:
     return "\n".join(parts), ordered[: len(shown)]
 
 
-def _pending(conn: sqlite3.Connection, now: datetime) -> list[store.Item]:
-    """Untold urgent and normal items of sources that aren't muted."""
+def is_approval_item(item: store.Item) -> bool:
+    """A core re-mention of a pending approval (its title carries the approval code)."""
+    return item.source == CORE and item.key.startswith("approval/")
+
+
+def _pending(
+    conn: sqlite3.Connection, now: datetime, *, hide_approvals: bool = False
+) -> list[store.Item]:
+    """Untold urgent and normal items of sources that aren't muted (``hide_approvals``: and
+    not the approval re-mentions, whose titles carry codes)."""
     items = store.pending(conn, ("urgent", "normal"), now)
+    if hide_approvals:
+        items = [i for i in items if not is_approval_item(i)]
     muted = {s for s in {i.source for i in items} if s != CORE and notify.muted_until(conn, s, now)}
     return [i for i in items if i.source not in muted]
 
 
-def preview(conn: sqlite3.Connection, now: datetime | None = None) -> str | None:
+def preview(
+    conn: sqlite3.Connection, now: datetime | None = None, *, hide_approvals: bool = False
+) -> str | None:
     """What the next pulse would say, or None if it has nothing. Read-only (core items are
     only refreshed by a run)."""
-    composed = compose(_pending(conn, now or utcnow()))
+    composed = compose(_pending(conn, now or utcnow(), hide_approvals=hide_approvals))
     return None if composed is None else composed[0]
 
 
@@ -183,8 +195,9 @@ def open_summary(conn: sqlite3.Connection, now: datetime, tz: str) -> str | None
 def preview_text(conn: sqlite3.Connection, now: datetime, tz: str) -> str:
     """``/pulse`` and the ``pulse_preview`` tool: what the next pulse would say, then the open
     items per source. Read-only (nothing is marked told; core re-mentions appear once a pulse
-    run computes them)."""
-    text = preview(conn, now) or "Nothing new since the last update."
+    run computes them). Approval re-mentions are left out: ``/pulse`` is also the chat tool,
+    and approval codes never reach the model (``/approvals`` shows them)."""
+    text = preview(conn, now, hide_approvals=True) or "Nothing new since the last update."
     summary = open_summary(conn, now, tz)
     return f"{text}\n{summary}" if summary else text
 

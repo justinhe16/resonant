@@ -46,7 +46,11 @@
 {"text": "what's the latest update", "intent": "updates"}
 {"text": "anything new?", "intent": "updates"}
 {"text": "give me the briefing", "intent": "updates"}
-{"text": "how's github doing", "intent": "updates"}
+{"text": "anything new from my extensions?", "intent": "updates"}
+{"text": "what did I miss", "intent": "updates"}
+{"text": "give me a summary of what's open", "intent": "updates"}
+{"text": "any news today", "intent": "updates"}
+{"text": "what's on the briefing right now", "intent": "updates"}
 {"text": "any updates on my PRs", "intent": "updates"}
 {"text": "what's running", "intent": "job_control"}
 {"text": "how's the mini", "intent": "system"}

@@ -533,7 +533,7 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
         "/help [word]: list commands, or the ones matching a word\n"
         "/kill: stop autonomy and pause\n"
         "/resume: turn autonomy back on\n"
-        "Or just ask in plain words: what's running, any updates, ping."
+        "Instant, no model: /status, /tasks, ping. Or just ask in plain words."
     )
 
 
@@ -665,6 +665,8 @@ def test_toolset_never_contains_tools_principal_cannot_request(
         member = toolset_for(intent, MEMBER, registry=registry, principals=principals)
         assert [s.name for s in owner] == sorted(INTENT_TOOLS[intent])
         assert member == []  # every builtin is global: owner-only
+    # The update reads are the owner's data: a member gets nothing for `updates`.
+    assert toolset_for("updates", MEMBER, registry=registry, principals=principals) == []
     assert toolset_for("system", "stranger", registry=registry, principals=principals) == []
     assert toolset_for("ops", "stranger", registry=registry, principals=principals) == []
 
