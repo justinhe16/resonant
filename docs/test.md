@@ -25,6 +25,8 @@ Update a row when you try it, with the date and anything odd.
 | 9 | Kill switch and pulse: `/kill`, `/pulse now`, `/resume` | `Paused: pulse not sent.`; `/resume` → `resumed: autonomy on, unpaused` | 📱 |
 | 10 | Urgent path with the example extension (go-live step 13.4): `/ext run example/incident`, then `/example incident failing`, then `/example incident resolved` | `[example] 🔴 Demo service failing…` within 5 min, once; then `[example] ✓ Demo service recovered` | 📱 after 🖥 `resonant ext add repo:example` |
 | 11 | Hourly "btw" with the example (step 13.5): `/ext run example/pnl` once, then wait | At a top of the hour: `btw:` / `[example] PnL …` only in hours where it moved; nothing 00:00–06:00 | 📱 after 🖥 install |
+| 12 | Sandbox self-check (after the Phase 5a deploy) | `resonant sandbox check`: every deny and allow row passes. Claude can run it on the Mini. | 🖥 (Claude) |
+| 13 | Runner not set up yet: "fix the typo in the README in resonant" | `The runner isn't set up: …` naming what's missing | 📱 after the Phase 5a deploy |
 
 ## Needs the Mini
 
@@ -43,6 +45,10 @@ Update a row when you try it, with the date and anything odd.
 | 30 | Crash mid-approval: `kill -9` the daemon before answering | go-live 11, Stage B 5 | 🖥 ❓ |
 | 31 | Optional: github writes (`rerun_failed`, `merge_pr` with `yes D7`) | go-live 12, the writes | 📱 after a token with write access |
 | 32 | Remove the example extension after tests 10–11 | `resonant ext remove example` | 🖥 |
+| 33 | Runner secrets: `claude setup-token` → `resonant secret set runner/claude_token`; a fine-grained PAT (no Workflows permission) → `resonant secret set runner/github_token` | [phase5a-plan §6](phase5a-plan.md#6-owner-steps-terminal-on-the-mini-once) | 🖥 |
+| 34 | Name the runner repos (Claude adds `runner.repos` and restarts) | phase5a-plan §6 | 📱 tell Claude |
+| 35 | First run: "fix <something small> in <repo>" → `On it: R1`, then `R1 done: PR #… `; `/runs`; `/merge R1` once CI is green | go-live 14 | 📱 after 33–34 |
+| 36 | `/kill` during a run → run cancelled, nothing pushed; `/resume` | go-live 14 | 📱 after 33–34 |
 
 ## Needs real data or effort
 
