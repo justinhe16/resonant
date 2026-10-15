@@ -78,12 +78,17 @@ class GitHub(Protocol):
         """``owner/name`` of the repos the token can see (the owner's, collaborations, orgs)."""
         ...
 
+    async def is_protected(self, slug: str, branch: str) -> bool | None:
+        """Whether ``branch`` has branch protection, or None if that can't be told."""
+        ...
+
 
 @dataclass(frozen=True)
 class Resolved:
     repo: Repo
     new: bool  # registered by this call
     via: str | None = None  # the extension whose link led here
+    warning: str | None = None  # for the reply to append (a new push repo's base is unprotected)
 
     @property
     def note(self) -> str:
@@ -202,7 +207,21 @@ class Resolver:
             if (known := repos.get(self.conn, info.slug)) is None:
                 raise
             return Resolved(known, new=False, via=via)
-        return Resolved(repo, new=True, via=via)
+        return Resolved(
+            repo, new=True, via=via, warning=await self._protection_warning(repo, github)
+        )
+
+    @staticmethod
+    async def _protection_warning(repo: Repo, github: GitHub) -> str | None:
+        """Only for a push repo (a fork repo's branches aren't ours to protect). Never blocks,
+        and an answer that can't be had is no warning."""
+        if repo.mode != "push":
+            return None
+        try:
+            protected = await github.is_protected(repo.slug, repo.base)
+        except GitHubError:
+            return None
+        return f"{repo.base} isn't protected" if protected is False else None
 
     async def _list(self, github: GitHub) -> list[str]:
         now = self._clock()
@@ -286,6 +305,15 @@ class GhGitHub:
                 return True
         return False
 
+    async def is_protected(self, slug: str, branch: str) -> bool | None:
+        code, out, _ = await self._api(f"repos/{slug}/branches/{branch}")
+        if code != 0:
+            return None
+        try:
+            return bool(json.loads(out)["protected"])
+        except (ValueError, KeyError, TypeError):
+            return None
+
     async def my_repos(self) -> list[str]:
         code, out, err = await self._api(
             "user/repos", "-X", "GET", "-f", "per_page=100", "-f", "sort=pushed",
@@ -299,7 +327,8 @@ class GhGitHub:
 
 class FakeGitHub:
     """A :class:`GitHub` for tests: ``known`` maps ``owner/name`` (any case) to its info,
-    ``mine`` is the owner's repo list. ``calls`` records what was asked; ``error`` makes every
+    ``mine`` is the owner's repo list, ``protected`` what ``is_protected`` answers. ``calls``
+    records what was asked; ``error`` makes every
     call raise :class:`GitHubError`."""
 
     def __init__(
@@ -307,7 +336,9 @@ class FakeGitHub:
         known: list[RepoInfo] | None = None,
         mine: list[str] | None = None,
         error: str | None = None,
+        protected: bool | None = True,
     ) -> None:
+        self.protected = protected
         self.known = {i.slug.lower(): i for i in known or []}
         self.mine = [i.slug for i in known or []] if mine is None else mine
         self.error = error
@@ -318,6 +349,10 @@ class FakeGitHub:
         if self.error:
             raise GitHubError(self.error)
         return self.known.get(slug.lower())
+
+    async def is_protected(self, slug: str, branch: str) -> bool | None:
+        self.calls.append(f"is_protected {slug} {branch}")
+        return self.protected
 
     async def my_repos(self) -> list[str]:
         self.calls.append("my_repos")

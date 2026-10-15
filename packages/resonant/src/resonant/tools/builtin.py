@@ -31,6 +31,7 @@ from resonant.tools import (
     ops,
     projects,
     reminders,
+    repos,
     runs,
     system,
     tasks,
@@ -72,6 +73,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     ext,
     updates,
     runs,
+    repos,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 

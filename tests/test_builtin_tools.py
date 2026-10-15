@@ -56,6 +56,11 @@ NAMES = {
     "list_runs",
     "cancel_run",
     "merge_run",
+    "create_repo",
+    "add_ci",
+    "list_repos",
+    "add_repo",
+    "forget_repo",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {
@@ -71,6 +76,10 @@ WRITES = {
     "start_run": Level.L3,
     "cancel_run": Level.L3,
     "merge_run": Level.L2,
+    "create_repo": Level.L2,
+    "add_ci": Level.L2,
+    "add_repo": Level.L3,
+    "forget_repo": Level.L3,
 }
 
 

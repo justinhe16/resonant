@@ -246,6 +246,29 @@ def touch(conn: sqlite3.Connection, slug: str) -> bool:
     )
 
 
+_TERMINAL = ("merged", "failed", "cancelled", "no_changes")
+
+
+def add_alias(conn: sqlite3.Connection, slug: str, alias: str) -> Repo:
+    """Give a repo another handle. Raises :class:`RepoConflict` if it is taken elsewhere."""
+    repo = get(conn, slug)
+    if repo is None:
+        raise ValueError(f"{slug} isn't registered")
+    _check_handle(alias)
+    if alias.lower() == repo.name.lower() or alias.lower() in (a.lower() for a in repo.aliases):
+        return repo
+    with atomic(conn):
+        if _taken(conn, alias):
+            raise RepoConflict(f"{alias} is already a repo name or alias")
+        conn.execute(
+            "UPDATE repos SET aliases = ? WHERE slug = ?",
+            (json.dumps([*repo.aliases, alias]), slug),
+        )
+    updated = get(conn, slug)
+    assert updated is not None
+    return updated
+
+
 def set_ci(conn: sqlite3.Connection, slug: str, ci: bool) -> bool:
     """Record whether a ``pull_request`` workflow exists, and when that was looked at."""
     return (
@@ -254,6 +277,12 @@ def set_ci(conn: sqlite3.Connection, slug: str, ci: bool) -> bool:
         ).rowcount
         == 1
     )
+
+
+def open_runs(conn: sqlite3.Connection, name: str) -> list[str]:
+    """Codes of the repo's runs that aren't over (including one ready to merge)."""
+    rows = conn.execute("SELECT code, status FROM runs WHERE repo = ? COLLATE NOCASE", (name,))
+    return [r["code"] for r in rows if r["status"] not in _TERMINAL]
 
 
 def forget(conn: sqlite3.Connection, key: str) -> bool:
@@ -269,9 +298,6 @@ class ImportResult:
     imported: int
     renamed: tuple[tuple[str, str], ...]  # (old name, new name): the caller moves mirrors
     skipped: tuple[tuple[str, str], ...]  # (config name, reason)
-
-
-_TERMINAL = ("merged", "failed", "cancelled", "no_changes")
 
 
 def _rename(conn: sqlite3.Connection, repo: Repo, new_name: str, *, keep_old: bool) -> None:
