@@ -27,8 +27,15 @@ from typing import Protocol, cast
 
 import yaml
 
-from resonant.config import RunnerRepo
 from resonant.redact import Redactor
+
+
+class RepoPolicy(Protocol):
+    """What the checks read of a repo (a registry ``Repo``)."""
+
+    @property
+    def allow_github_changes(self) -> bool: ...
+
 
 MAX_FILES = 200
 MAX_COMMITS = 500
@@ -224,7 +231,7 @@ async def run_checks(
     base_sha: str,
     head_sha: str,
     branch: str,
-    repo: RunnerRepo,
+    repo: RepoPolicy,
     secrets: Iterable[str],
 ) -> CheckResult:
     """Check ``base_sha..head_sha`` in the mirror. Raises ``CheckFailed``."""

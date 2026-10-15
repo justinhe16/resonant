@@ -68,7 +68,17 @@ from resonant.loop.types import (
 from resonant.redact import Redactor
 from resonant.runner.checks import CheckFailed, GitError
 from resonant.runner.cleanup import cleanup, delete_run_dir, watch_disk, wipe_secret_dirs
+from resonant.runner.resolve import (
+    Ambiguous,
+    GhGitHub,
+    GitHub,
+    GitHubError,
+    NoAccess,
+    NotFound,
+    Resolver,
+)
 from resonant.runner.workspace import (
+    UPSTREAM_LATER,
     BundleRefused,
     MergeRefused,
     NoChanges,
@@ -100,6 +110,7 @@ from resonant.secrets import (
     missing_runner_secrets,
 )
 from resonant.store import pulse as pulse_store
+from resonant.store import repos as repo_store
 from resonant.store import runs
 from resonant.store import tasks as task_store
 from resonant.store.audit import audit
@@ -157,11 +168,13 @@ class Started:
     code: str
     repo: str
     max_minutes: int
+    new_repo: str | None = None  # the slug, when this run registered the repo
 
     @property
     def text(self) -> str:
+        new = f" (new repo: {self.new_repo})" if self.new_repo else ""
         return (
-            f"On it: {self.code} · {self.repo}. Up to {self.max_minutes}m. "
+            f"On it: {self.code} · {self.repo}{new}. Up to {self.max_minutes}m. "
             f"/runs to check, /cancel {self.code} to stop."
         )
 
@@ -408,6 +421,7 @@ class ClaudeRunner:
         timezone: str = "UTC",
         max_runs: int = 2,
         workspace: Workspace | None = None,
+        github: Callable[[RunnerSecrets], GitHub] | None = None,
         create_task: Callable[[NewTask], str] | None = None,
         cancel_task: Callable[[str], bool] | None = None,
         wrap: Wrap | None = None,
@@ -425,7 +439,9 @@ class ClaudeRunner:
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
-        ``create_task`` inserts the run's task and wakes the loop (``Loop.create_task``) and
+        ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
+        default ``gh`` through the workspace). ``create_task`` inserts the run's task and wakes
+        the loop (``Loop.create_task``) and
         ``cancel_task`` cancels one (``Loop.cancel``); without them the runner writes the task
         itself and relies on its own polling. ``wrap``, ``self_check`` and ``claude_cmd`` are
         the seams for tests; by default the Seatbelt sandbox, the cached self-probe and the
@@ -436,7 +452,9 @@ class ClaudeRunner:
         self.secrets = secrets
         self.tz = ZoneInfo(timezone)
         self.max_runs = max_runs
-        self.workspace = workspace or Workspace(_with_real_git(runner))
+        self.workspace = workspace or Workspace(_with_real_git(runner), conn)
+        self.resolver = Resolver(conn)
+        self._github: Callable[[RunnerSecrets], GitHub] = github or self._gh_github
         self._create_task = create_task or self._insert_task
         self._cancel_task = cancel_task
         self._wrap: Wrap = wrap or _sandbox_wrap
@@ -465,6 +483,9 @@ class ClaudeRunner:
         self._background: set[asyncio.Task[Any]] = set()
         self._unhook: Callable[[], None] | None = None
 
+    def _gh_github(self, secrets: RunnerSecrets) -> GitHub:
+        return GhGitHub(self.workspace, secrets)
+
     # -- lifecycle --
 
     async def start(self) -> int:
@@ -484,6 +505,14 @@ class ClaudeRunner:
         return reaped
 
     async def _startup(self) -> int:
+        # runner.repos is only a seed: import it into the registry (idempotent).
+        with atomic(self.conn):
+            imported = repo_store.import_config(self.conn, self.cfg.repos)
+        for name, reason in imported.skipped:
+            log.warning("runner.repos entry %s not imported: %s", name, reason)
+        for old, new in imported.renamed:  # the mirror follows the repo's name
+            async with self.workspace.mirror_lock(old):
+                await asyncio.to_thread(self._move_mirror, old, new)
         reaped = 0
         for run in runs.active(self.conn):
             has_process = run.pgid is not None or run.leader_pid is not None
@@ -523,6 +552,11 @@ class ClaudeRunner:
             marker=run.session_id,
         )
 
+    def _move_mirror(self, old: str, new: str) -> None:
+        src, dst = self.workspace.mirror_path(old), self.workspace.mirror_path(new)
+        if src.is_dir() and not dst.exists():
+            src.rename(dst)
+
     def _spawn(self, coro: Any) -> None:
         task: asyncio.Task[Any] = asyncio.ensure_future(coro)
         self._background.add(task)
@@ -534,9 +568,6 @@ class ClaudeRunner:
         """``The runner isn't set up: …`` naming exactly what is missing, or None."""
         missing: list[str] = []
         how: list[str] = []
-        if not self.cfg.repos:
-            missing.append("no repos in runner.repos")
-            how.append("name them under runner.repos in ~/.resonant/config.yaml")
         try:
             refs = await missing_runner_secrets(self.secrets)
         except SecretError as e:
@@ -552,13 +583,13 @@ class ClaudeRunner:
         return not_set_up_text(missing, how) if missing else None
 
     async def start_run(self, repo: str, ask: str, principal: str) -> Started | Refused:
-        """Create a run and its task. Refuses (with a sentence for the requester) when the
-        runner isn't set up, the repo isn't listed, or Resonant is paused. Two runs on one repo
-        queue: the second waits for the first."""
+        """Create a run and its task. ``repo`` is free text (a name, ``owner/name``, a URL):
+        the resolver turns it into a registered repo, registering one it hasn't seen. Refuses
+        (with a sentence for the requester) when the runner isn't set up, the repo is
+        ambiguous or unknown, or Resonant is paused. Two runs on one repo queue: the second
+        waits for the first."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text)
-        if repo not in self.cfg.repos:
-            return Refused(f"No repo named {repo}. Known: {', '.join(sorted(self.cfg.repos))}.")
         ask = ask.strip()
         if not ask:
             return Refused("What should I do? Give the run something to work on.")
@@ -566,6 +597,11 @@ class ClaudeRunner:
             return Refused(f"That ask is too long ({len(ask)} characters, at most {MAX_ASK}).")
         if self._paused():
             return Refused("Resonant is paused. /resume first.")
+        resolved = await self._resolve(repo)
+        if isinstance(resolved, Refused):
+            return resolved
+        found, new = resolved
+        repo = found.name
         run = runs.create(
             self.conn,
             repo=repo,
@@ -591,7 +627,33 @@ class ClaudeRunner:
         with atomic(self.conn):
             audit(self.conn, "run.start", task_id=task_id, requested_by=principal, run=run.code,
                   repo=repo)  # fmt: skip
-        return Started(run.code, repo, max(1, self.max_session_s // 60))
+        with atomic(self.conn):
+            repo_store.touch(self.conn, found.slug)
+        return Started(
+            run.code, repo, max(1, self.max_session_s // 60), found.slug if new else None
+        )
+
+    async def _resolve(self, text: str) -> tuple[repo_store.Repo, bool] | Refused:
+        """The registered repo for the requester's words, and whether it is new."""
+        try:
+            secrets = await load_runner_secrets(self.secrets)
+            resolution = await self.resolver.resolve(text, self._github(secrets))
+        except SecretError:
+            return Refused((await self.setup_missing()) or "The runner's secrets can't be read.")
+        except GitHubError as e:
+            return Refused(f"Couldn't reach GitHub: {e}")
+        if isinstance(resolution, Ambiguous):
+            return Refused(resolution.text)
+        if isinstance(resolution, NoAccess):
+            return Refused(resolution.text)
+        if isinstance(resolution, NotFound):
+            recent = ", ".join(r.name for r in repo_store.list_all(self.conn)[:3])
+            return Refused(
+                f"No repo matches {text[:60]!r}. Which repo?" + (f" {recent}" if recent else "")
+            )
+        if resolution.repo.mode == "fork":
+            return Refused(UPSTREAM_LATER)
+        return resolution.repo, resolution.new
 
     def get_run(self, code: str) -> Run | None:
         return runs.get(self.conn, code)
@@ -1339,12 +1401,16 @@ CLEANUP_SCHEDULE = "30 4 * * *"
 def cleanup_job(deps: CoreDeps) -> CoreJob | None:
     """The ``CORE_JOBS`` factory: delete run dirs that ended more than ``runner.keep_days``
     ago, prune the cache to ``runner.max_cache_gb`` and wipe stale token dirs. None when no
-    repo is configured and no run or cache dir exists."""
+    repo is registered and no run or cache dir exists."""
     from resonant.extensions.scheduler import CoreJob
 
     cfg, conn = deps.settings.runner, deps.conn
-    if not cfg.repos and not (cfg.work_dir.exists() or cfg.cache_dir.exists()):
-        return None  # nothing configured and nothing on disk
+    if (
+        not cfg.repos
+        and not repo_store.list_all(conn)
+        and not (cfg.work_dir.exists() or cfg.cache_dir.exists())
+    ):
+        return None  # no repo registered and nothing on disk
 
     async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         result = await asyncio.to_thread(

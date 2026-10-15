@@ -32,6 +32,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import stat
 import tempfile
 from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
@@ -39,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from resonant.config import RunnerConfig, RunnerRepo
+from resonant.config import RunnerConfig
 from resonant.redact import Redactor
 from resonant.runner.checks import (
     CheckResult,
@@ -52,7 +53,10 @@ from resonant.runner.checks import (
 )
 from resonant.runner.cleanup import RUN_CODE, rmtree_nofollow
 from resonant.secrets import RunnerSecrets
+from resonant.store import repos as repo_store
+from resonant.store.repos import Repo
 
+UPSTREAM_LATER = "Upstream PRs come in a later update."
 GIT_TIMEOUT_S = 300.0
 GH_TIMEOUT_S = 120.0
 HARVEST_TIMEOUT_S = 300.0
@@ -279,7 +283,7 @@ async def _exec(
     return Exec(proc.returncode if proc.returncode is not None else -1, out, text[-_ERR_CLIP:])
 
 
-def build_pr_body(code: str, repo: RunnerRepo, ask: str, summary: str, result: CheckResult) -> str:
+def build_pr_body(code: str, repo: Repo, ask: str, summary: str, result: CheckResult) -> str:
     """Code-built PR body: the run, the ask (unless ``quote_ask`` is off), Claude's summary,
     the checks and the flagged paths."""
     lines = [f"Resonant run {code}."]  # untrusted text below has @ neutralized
@@ -329,7 +333,7 @@ Wrap = Callable[[Sequence[str]], Sequence[str]]
 bound). Tests pass the identity."""
 
 
-def _https_url(repo: RunnerRepo) -> str:
+def _https_url(repo: Repo) -> str:
     return f"https://{repo.remote}"
 
 
@@ -340,12 +344,14 @@ class Workspace:
     def __init__(
         self,
         cfg: RunnerConfig,
+        conn: sqlite3.Connection,
         *,
-        url_for: Callable[[RunnerRepo], str] | None = None,
+        url_for: Callable[[Repo], str] | None = None,
     ) -> None:
         self.cfg = cfg
+        self.conn = conn  # the repo registry (store.repos)
         # The git URL of a repo. Always https without credentials; tests point it at a path.
-        self._url_for: Callable[[RunnerRepo], str] = url_for or _https_url
+        self._url_for: Callable[[Repo], str] = url_for or _https_url
         self._locks: dict[str, asyncio.Lock] = {}
         self._git_bin = str(cfg.git_path)
 
@@ -359,11 +365,12 @@ class Workspace:
     def mirror_path(self, repo_name: str) -> Path:
         return self.cfg.mirror_dir / f"{repo_name}.git"
 
-    def _repo(self, repo_name: str) -> RunnerRepo:
-        try:
-            return self.cfg.repos[repo_name]
-        except KeyError:
-            raise RunnerError(f"{repo_name} isn't in runner.repos") from None
+    def _repo(self, repo_name: str) -> Repo:
+        repo = repo_store.find(self.conn, repo_name)
+        # Only the registry name: it is the mirror's dir name, never a slug or alias.
+        if repo is None or repo.name != repo_name:
+            raise RunnerError(f"{repo_name} isn't a registered repo")
+        return repo
 
     def _mirror_git(self, repo_name: str) -> GitRunner:
         mirror = self.mirror_path(repo_name)
@@ -619,6 +626,12 @@ class Workspace:
 
     # -- publish --
 
+    async def gh(
+        self, args: Sequence[str], secrets: RunnerSecrets, *, stdin: bytes | None = None
+    ) -> Exec:
+        """Run ``gh`` with the token in a throwaway config dir (for the repo resolver)."""
+        return await self._gh(args, secrets, stdin=stdin)
+
     async def _gh(
         self, args: Sequence[str], secrets: RunnerSecrets, *, stdin: bytes | None = None
     ) -> Exec:
@@ -668,6 +681,8 @@ class Workspace:
         ``gh pr create``; a falsy answer raises ``PublishAborted``.
         """
         repo = self._repo(p.repo_name)
+        if repo.mode != "push":  # never push to a repo the token can't push to
+            raise RunnerError(UPSTREAM_LATER)
         if not _SHA.fullmatch(result.head_sha):
             raise RunnerError("bad head commit")
         body = build_pr_body(p.code, repo, ask, summary, result)

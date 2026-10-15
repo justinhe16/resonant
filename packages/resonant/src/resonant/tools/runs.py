@@ -8,9 +8,10 @@ at call time: the runner is built after the tools are registered) and return cod
 ``text`` that the local runner's report line and the fast path's render send as is.
 
 - ``start_run{repo, ask}``: L3, no approval (the sandbox is the wall). ``repo`` is an enum of
-  the configured ``runner.repos`` names in the registered spec (``specs_for``), so the model
-  can't invent a path; code refuses an unknown name too. A run that can't start (not set up,
-  unknown repo, paused) is a normal result with ``started: false`` and the reason as ``text``.
+  a free string (a registry name, ``owner/name`` or a GitHub URL) that the runner's resolver
+  checks; the registered names are listed in the spec (``specs_for``). A run that can't start
+  (not set up, ambiguous or unknown repo, paused) is a normal result with ``started: false``
+  and the reason as ``text``.
 - ``list_runs{code?}``: L0, active runs first. Run codes (``R3``) are not approval codes: the
   model sees them, never an approval code. Free text from Claude (summary, failure) is
   cleaned and clipped.
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.gate.codes import clean_external
 from resonant.gate.types import Intent
+from resonant.store import repos as repos_store
 from resonant.store import runs as runs_store
 from resonant.tools.base import BuiltinContext
 from resonant_sdk import Effect, Level, ToolSpec
@@ -38,8 +40,9 @@ if TYPE_CHECKING:
 
 RUNNER = "claude"
 ASK_MAX = 4000  # ClaudeRunner's MAX_ASK (a test checks they agree)
-REPO_MAX = 32
+REPO_MAX = 200
 RUNS_MAX = 8  # runs listed
+RECENT_REPOS = 20  # registered repos named in the start_run description
 TEXT_MAX = 120  # Claude's summary or a failure, as the model and the reply see it
 ASK_SHOWN = 60
 
@@ -71,8 +74,8 @@ def _code_schema() -> dict[str, Any]:
 START_RUN = ToolSpec(
     name="start_run",
     description=(
-        "Start a Claude Code run on one of the configured repos: it works in a sandbox and "
-        "opens a pull request. `ask` is what to do, in the owner's words."
+        "Start a Claude Code run on a GitHub repo (a name, owner/name or URL): it works in a "
+        "sandbox and opens a pull request. `ask` is what to do, in the owner's words."
     ),
     args_schema={
         "type": "object",
@@ -135,17 +138,13 @@ SPECS: tuple[ToolSpec, ...] = (START_RUN, LIST_RUNS, CANCEL_RUN, MERGE_RUN)
 
 
 def specs_for(ctx: BuiltinContext) -> tuple[ToolSpec, ...]:
-    """``SPECS`` with ``start_run``'s ``repo`` limited to the configured names (an enum, so
-    the model's call is validated against it). With no repos configured the spec says so."""
-    names = sorted(ctx.state.settings.runner.repos)
-    props = dict(cast(dict[str, Any], START_RUN.args_schema["properties"]))
+    """``SPECS`` with ``start_run``'s description naming the most recently used registered
+    repos. ``repo`` stays a free string: the resolver checks it."""
+    names = [r.name for r in repos_store.list_all(ctx.conn)[:RECENT_REPOS]]
+    description = START_RUN.description
     if names:
-        props["repo"] = {"type": "string", "enum": names}
-        description = f"{START_RUN.description} Repos: {', '.join(names)}."
-    else:
-        description = f"{START_RUN.description} No repos are configured yet."
-    schema = {**START_RUN.args_schema, "properties": props}
-    start = START_RUN.model_copy(update={"args_schema": schema, "description": description})
+        description = f"{description} Recent repos: {', '.join(names)}."
+    start = START_RUN.model_copy(update={"description": description})
     return (start, *SPECS[1:])
 
 
@@ -248,15 +247,14 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         repo, ask = args.get("repo"), args.get("ask")
         if not isinstance(repo, str) or not isinstance(ask, str) or not ask.strip():
             raise ToolFailed("start_run: repo and ask are required strings")
-        repo = repo.strip().lower()
+        repo = repo.strip()
         if len(ask) > ASK_MAX:
             raise ToolFailed(f"start_run: ask is too long (at most {ASK_MAX} characters)")
         claude = runner()
         if claude is None:
             return {"started": False, "text": missing()}
-        known = sorted(ctx.state.settings.runner.repos)
-        if known and repo not in known:  # code, not the model, decides which repos exist
-            return {"started": False, "text": f"No repo named {repo}. Known: {', '.join(known)}."}
+        if len(repo) > REPO_MAX:
+            raise ToolFailed(f"start_run: repo is too long (at most {REPO_MAX} characters)")
         result = await claude.start_run(repo, ask, ctx.principals.owner)
         if (reason := _refusal(result)) is not None:
             return {"started": False, "text": reason}

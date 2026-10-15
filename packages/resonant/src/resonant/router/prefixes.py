@@ -204,11 +204,12 @@ _INTENT_RULES: dict[IntentLabel, str] = {
         "doesn't give."
     ),
     "run_project": (
-        "For start_run, pass `repo` as one of the repo names in the tool's schema and `ask` as "
-        "what the owner wants done, in their words; if the message names no repo you can match, "
-        "don't guess: say which repos are available. For cancel_run and merge_run, pass the "
-        "run code (like R3) from the message or the earlier replies; if you can't tell which "
-        "run, call list_runs first. Call merge_run only when the owner asks to merge."
+        "For start_run, pass `repo` as the repo the message names (a short name, owner/name or a "
+        "GitHub URL) and `ask` as what the owner wants done, in their words; if the message "
+        "names no repo, don't guess: ask which repo, naming the recent ones. For cancel_run and "
+        "merge_run, pass the run code (like R3) from the message or the earlier replies; if you "
+        "can't tell which run, call list_runs first. Call merge_run only when the owner asks to "
+        "merge."
     ),
 }
 

@@ -342,7 +342,7 @@ _RUNNER_BASE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,99}")
 
 
 class RunnerRepo(_Section):
-    """One repo the Claude runner may work in (docs/phase5a-plan.md D3)."""
+    """One repo from the ``runner.repos`` seed (docs/phase5a-plan.md D3)."""
 
     # "github.com/owner/repo": no scheme, no credentials; the daemon adds https://.
     remote: str
@@ -376,7 +376,9 @@ class RunnerRepo(_Section):
 class RunnerConfig(_Section):
     """The Claude runner (docs/phase5a-plan.md). Nothing here is secret."""
 
-    # name -> repo. Empty by default: the owner names the repos the runner may touch.
+    # name -> repo. Only a seed: at startup these are imported into the repo registry (the
+    # `repos` table) as source=owner, and the registry is what the runner reads. Repos not
+    # listed here are registered the first time they are used (docs/repos-plan.md D1).
     repos: dict[str, RunnerRepo] = Field(default_factory=dict[str, RunnerRepo])
     # Run dirs. Not under ~/.resonant, which the sandbox denies.
     work_dir: Path = Field(default=Path("~/resonant-runs"), validate_default=True)

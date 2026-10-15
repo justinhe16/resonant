@@ -39,6 +39,7 @@ from resonant.gateway.channel import (
 from resonant.loop import Loop, SlotPool
 from resonant.redact import Redactor
 from resonant.runner.cleanup import dir_size
+from resonant.runner.resolve import FakeGitHub, RepoInfo
 from resonant.runner.workspace import Workspace
 from resonant.runners import claude as claude_mod
 from resonant.runners import reaper
@@ -61,9 +62,11 @@ from resonant.secrets import (
     CLAUDE_TOKEN_REF,
     GITHUB_TOKEN_REF,
     FakeKeychain,
+    RunnerSecrets,
     SecretStore,
 )
 from resonant.store import pulse as pulse_store
+from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
 from resonant.store import tasks as task_store
 from resonant.store.db import iso, utcnow
@@ -295,6 +298,7 @@ def build(
     repos: Sequence[str] = ("proj",),
     ci: bool = True,
     secrets: bool = True,
+    github: FakeGitHub | None = None,
     **kw: Any,
 ) -> Harness:
     root.mkdir(parents=True, exist_ok=True)
@@ -315,18 +319,25 @@ def build(
         gh_path=gh,
     )
     paths = {f"github.com/own/{n}": p for n, p in remotes.items()}
-    ws = Workspace(cfg, url_for=lambda repo: str(paths[repo.remote]))
+    repo_store.import_config(conn, cfg.repos)
+    ws = Workspace(cfg, conn, url_for=lambda repo: str(paths[repo.remote]))
+    fake_github = github or FakeGitHub()
     chan = Chan()
     keychain = FakeKeychain()
     if secrets:
         keychain.items[GITHUB_TOKEN_REF] = GH_TOKEN
         keychain.items[CLAUDE_TOKEN_REF] = CLAUDE_TOKEN
+
+    def github_for(_secrets: RunnerSecrets) -> FakeGitHub:
+        return fake_github
+
     loop = Loop(conn, {}, LoopConfig(tick_s=0.05, stuck_after_s=120), SlotPool(3, 1))
     options: dict[str, Any] = {
         "runner": cfg,
         "channel": cast(Channel, chan),
         "secrets": SecretStore(keychain),
         "workspace": ws,
+        "github": github_for,
         "create_task": loop.create_task,
         "cancel_task": loop.cancel,
         "wrap": identity_wrap,
@@ -485,19 +496,69 @@ async def test_not_set_up_names_what_is_missing(tmp_path: Path, db: sqlite3.Conn
     assert CLAUDE_TOKEN_REF in res.reason
 
 
-async def test_not_set_up_without_repos(tmp_path: Path, db: sqlite3.Connection) -> None:
-    h = build(tmp_path, db)
-    h.runner.cfg = h.cfg.model_copy(update={"repos": {}})
-    res = await h.runner.start_run("proj", "x", "owner")
-    assert res == Refused(
-        "The runner isn't set up: no repos in runner.repos. On the Mini: name them under "
-        "runner.repos in ~/.resonant/config.yaml."
-    )
+async def test_no_configured_repos_is_not_a_setup_problem(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, github=FakeGitHub([RepoInfo("own/fresh", "main", False, True, True)]))
+    db.execute("DELETE FROM repos")
+    assert await h.runner.setup_missing() is None
+    res = await h.runner.start_run("own/fresh", "x", "owner")
+    assert isinstance(res, Started)
+    assert res.text.startswith("On it: R1 · fresh (new repo: own/fresh).")
+    repo = repo_store.get(db, "own/fresh")
+    assert repo is not None and repo.source == "auto" and repo.mode == "push"
+    assert repo.last_used_at is not None
+    again = await h.runner.start_run("fresh", "y", "owner")
+    assert isinstance(again, Started) and "new repo" not in again.text
+
+
+async def test_startup_imports_the_config_seed_once(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = build(tmp_path, db, repos=("a", "b"))
+    db.execute("DELETE FROM repos")
+    await h.runner.start()
+    await h.runner.start()
+    assert sorted((r.name, r.source) for r in repo_store.list_all(db)) == [
+        ("a", "owner"),
+        ("b", "owner"),
+    ]
+
+
+async def test_ambiguous_unknown_and_no_access_repos(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    infos = [
+        RepoInfo("me/trading-bot", "main", False, True, True),
+        RepoInfo("me/trading-notes", "main", False, True, True),
+        RepoInfo("them/secret", "main", True, False, True),
+    ]
+    h = build(tmp_path, db, github=FakeGitHub(infos, mine=["me/trading-bot", "me/trading-notes"]))
+    res = await h.runner.start_run("trading", "x", "owner")
+    assert res == Refused("Which repo? me/trading-bot, me/trading-notes")
+    res = await h.runner.start_run("nope", "x", "owner")
+    assert res == Refused("No repo matches 'nope'. Which repo? proj")
+    res = await h.runner.start_run("them/secret", "x", "owner")
+    assert res == Refused("No access to them/secret.")
+    assert runs_store.recent(db) == [] and repo_store.get(db, "them/secret") is None
+
+
+async def test_fork_mode_repo_is_refused_for_now(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = build(tmp_path, db, github=FakeGitHub([RepoInfo("up/stream", "main", False, False, True)]))
+    res = await h.runner.start_run("github.com/up/stream", "x", "owner")
+    assert res == Refused("Upstream PRs come in a later update.")
+    repo = repo_store.get(db, "up/stream")  # registered, so the next version finds it
+    assert repo is not None and repo.mode == "fork" and not repo.quote_ask
+    assert runs_store.recent(db) == []
+
+
+async def test_github_unreachable_is_a_refusal(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = build(tmp_path, db, github=FakeGitHub(error="rate limited"))
+    res = await h.runner.start_run("own/new", "x", "owner")
+    assert res == Refused("Couldn't reach GitHub: rate limited")
 
 
 async def test_other_refusals(h: Harness) -> None:
     res = await h.runner.start_run("nope", "x", "owner")
-    assert res == Refused("No repo named nope. Known: proj.")
+    assert res == Refused("No repo matches 'nope'. Which repo? proj")
     assert isinstance(await h.runner.start_run("proj", "   ", "owner"), Refused)
     assert isinstance(await h.runner.start_run("proj", "x" * 5000, "owner"), Refused)
     killswitch.engage(h.conn, actor="owner")
@@ -1284,6 +1345,7 @@ async def test_cleanup_job_deletes_old_run_dirs(tmp_path: Path, db: sqlite3.Conn
     bare = empty.model_copy(
         update={"work_dir": tmp_path / "none", "cache_dir": tmp_path / "none" / "cache"}
     )
+    repo_store.forget(db, "proj")
     deps3 = SimpleNamespace(settings=SimpleNamespace(runner=bare), conn=db)
     assert claude_mod.cleanup_job(cast(Any, deps3)) is None
 
@@ -1496,3 +1558,27 @@ async def test_the_pulse_item_says_when_waiting_for_the_usage_reset(
     await h.drain()
     item = pulse_store.get(db, "core", "run/r1")
     assert item is not None and item.title.startswith("R1 waiting for usage reset · proj")
+
+
+async def test_startup_moves_the_mirror_with_a_renamed_repo(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    db.execute("DELETE FROM repos")
+    repo_store.add(db, "other/proj", base="main", source="auto")
+    mirror = h.ws.mirror_path("proj")
+    mirror.mkdir(parents=True)
+    (mirror / "HEAD").write_text("ref: refs/heads/main\n")
+    await h.runner.start()
+    assert not mirror.exists() and (h.ws.mirror_path("other-proj") / "HEAD").exists()
+    assert {r.name for r in repo_store.list_all(db)} == {"proj", "other-proj"}
+
+
+async def test_a_config_clash_does_not_stop_startup(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = build(tmp_path, db)
+    repo_store.add(db, "other/web", base="main", source="owner")
+    h.runner.cfg = h.cfg.model_copy(
+        update={"repos": {"web": RunnerRepo(remote="github.com/own/web")}}
+    )
+    await h.runner.start()
+    assert not h.runner._blocked  # pyright: ignore[reportPrivateUsage]

@@ -127,7 +127,6 @@ class World:
     settings: Settings
     keychain: FakeKeychain
     osa: RecordingOsaRunner
-    ws: Workspace
     remote: Path
     gh_dir: Path
     daemon: Daemon | None = None
@@ -195,7 +194,6 @@ def make_world(
     extra: Sequence[str] = (),
     ci: bool = True,
     secrets: bool = True,
-    repos: bool = True,
     runner_opts: dict[str, Any] | None = None,
 ) -> World:
     root = tmp_path.resolve() / "rr"
@@ -215,7 +213,7 @@ def make_world(
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
         runner={
-            "repos": {REPO: {"remote": f"github.com/own/{REPO}"}} if repos else {},
+            "repos": {REPO: {"remote": f"github.com/own/{REPO}"}},
             "work_dir": root / "runs",
             "mirror_dir": root / "state" / "mirrors",
             "cache_dir": root / "runs" / ".cache",
@@ -224,14 +222,12 @@ def make_world(
             "gh_path": gh,
         },
     )
-    ws = Workspace(settings.runner, url_for=lambda repo: str(remote))
     keychain = FakeKeychain()
     if secrets:
         keychain.items[GITHUB_TOKEN_REF] = GH_TOKEN
         keychain.items[CLAUDE_TOKEN_REF] = CLAUDE_TOKEN
-    world = World(root, chat, settings, keychain, RecordingOsaRunner(), ws, remote, gh_dir)
+    world = World(root, chat, settings, keychain, RecordingOsaRunner(), remote, gh_dir)
     options: dict[str, Any] = {
-        "workspace": ws,
         "wrap": identity_wrap,
         "self_check": check_ok,
         "claude_cmd": [sys.executable, str(FAKE), "--scenario", scenario, *extra],
@@ -243,7 +239,8 @@ def make_world(
     from resonant import wiring
 
     def make_runner(conn: sqlite3.Connection, **kw: Any) -> ClaudeRunner:
-        return ClaudeRunner(conn, **kw, **options)
+        ws = Workspace(settings.runner, conn, url_for=lambda repo: str(remote))
+        return ClaudeRunner(conn, **kw, **options, workspace=ws)
 
     monkeypatch.setattr(wiring, "ClaudeRunner", make_runner)
     return world
@@ -493,15 +490,14 @@ async def test_r13_merge_by_chat_asks_yes_first(
 async def test_r14_not_set_up_names_what_is_missing(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    w = make_world(tmp_path, resonant_home, chat, monkeypatch, secrets=False, repos=False)
+    w = make_world(tmp_path, resonant_home, chat, monkeypatch, secrets=False)
     async with running(w):
         reply = await w.say("/run demo fix it")
-        assert reply.startswith("The runner isn't set up: no repos in runner.repos, ")
-        assert "secret runner/github_token" in reply and "secret runner/claude_token" in reply
+        assert reply.startswith("The runner isn't set up: secret runner/github_token, ")
+        assert "secret runner/claude_token" in reply
         assert "resonant secret set runner/claude_token" in reply
         assert await w.say("/runs") == reply
-        # In chat the model has no start_run to call (no repos), so the answer is its own;
-        # the runner never starts anything.
+        # The runner never starts anything.
         await w.say("fix the typo in the README in demo")
         assert runs_store.recent(w.conn, 10) == []
 
@@ -514,7 +510,7 @@ async def test_r14_missing_token_only(
     async with running(w):
         reply = await w.say("/run demo fix it")
         assert reply.startswith("The runner isn't set up: secret runner/claude_token")
-        assert "no repos" not in reply and "runner/github_token" not in reply
+        assert "runner/github_token" not in reply
         reply = await w.say("fix the typo in the README in demo")
         assert "The runner isn't set up: secret runner/claude_token" in reply
         assert runs_store.recent(w.conn, 10) == []
