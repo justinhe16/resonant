@@ -475,6 +475,9 @@ async def test_r13_merge_by_chat_asks_yes_first(
         assert prompt.endswith("Reply yes / no")
         assert "changes .claude/settings.json, Makefile" in prompt
         assert w.gh_calls("merge") == [] and w.run().status == "ready"  # nothing before the yes
+        # chat.db times have one-second resolution, and a reply that is not later than the
+        # prompt was "sent before the question" (the binding rule): wait a real second.
+        await asyncio.sleep(1.1)
         await w.say("yes", reply=False)
         await until(settled(w, "R1", "merged"), 20, "the merge")
         assert len(w.gh_calls("merge")) == 1
