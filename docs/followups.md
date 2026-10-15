@@ -2,6 +2,30 @@
 
 Work we've decided to do eventually but have deferred. Each entry says why it was deferred, what is open, and what "done" looks like. When an item is picked up, ticket it and remove it from here.
 
+## Owner to-dos (human, at the Mini)
+
+These are steps only you can do: entering tokens and confirming on GitHub. Claude never enters secrets. Do them in this order; the full steps are in [`go-live.md`](go-live.md) step 14 (rewritten by RP-7). Tick them off here.
+
+- [ ] **Claude token:** `claude setup-token`, then `resonant secret set runner/claude_token` (subscription).
+- [ ] **GitHub App** (runs; [`repos-plan.md`](repos-plan.md) D10):
+  1. On GitHub: Settings → Developer settings → GitHub Apps → New. No webhook.
+  2. Permissions, all repository-level:
+     - Read/write: Contents, Pull requests, Issues, Workflows, Actions.
+     - Read: Checks, Statuses, Metadata.
+     - **No Administration.**
+  3. Install it on your account, for all repositories.
+  4. Generate a private key, then `resonant secret set runner/github_app_key` and paste the `.pem`.
+  5. Tell Claude the app ID and the installation ID (they aren't secret; Claude puts them in the config).
+- [ ] **Resonant's own GitHub token:** a fine-grained token covering all repositories.
+  - Read/write: Contents, Pull requests, Administration (to create repos), Workflows (starter CI).
+  - Read: Checks, Statuses, Metadata.
+  - Then `resonant secret set runner/github_token`. The token is daemon-only and never enters a session.
+- [ ] **Upstream-PR token:** a classic token with only the `public_repo` scope, then `resonant secret set runner/github_public_token`.
+- [ ] **github extension update:** `resonant ext add repo:github` (typed confirm).
+- [ ] **Authenticated sandbox probe:** go-live step 14, terminal 5 (the `read -rs` form).
+- [ ] **First run with Claude watching:** a trivial `/run` on a repo with CI. Check `test.md` rows for the runner.
+- [ ] **Per sensitive repo:** turn on branch protection on `main` (Resonant warns if it's missing), and say "no CI edits" for any repo whose GitHub Actions secrets matter.
+
 ## Status relay: dead-man switch and remote dashboard
 
 *Deferred 2026-10-13, during Mac mini go-live (steps 7 and 10 of [`go-live.md`](go-live.md)). This is the plan for both the dead-man switch and remote dashboard access.*

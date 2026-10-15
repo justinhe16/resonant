@@ -155,6 +155,7 @@ For a `fork` repo:
 | RP-2 | Fork mode (D3) and its upstream-PR ask | 3 |
 | RP-3 | Merge on green (D4), the CI rule change (D5) and the pre-merge checks | 3 |
 | RP-4 | `create_repo` (D6), branch protection on create, and the protection check on registration | 2 |
+| RP-9 | Sandbox: deny reads of secret files outside the run dir (`.env`, `.env.*`, `*.pem`, `id_*` SSH keys, `~/.aws`, `~/.config/gh`, `~/.netrc`, …) plus a `runner.deny_read` config list; new probes | 2 |
 | RP-5 | Extension `repos` in the SDK manifest, plus install/remove hooks and `/ext list` (D7) | 2 |
 | RP-6 | Router: the `repos` intent, the tools and slash commands, resolver wiring, few-shots, the parity test and eval rows (D8) | 4 |
 | RP-7 | e2e tests (fake `gh` for fork, merge on green and create), go-live step 14 rewrite (App setup), `test.md`, `architecture.md` and the artifact | 5 |
