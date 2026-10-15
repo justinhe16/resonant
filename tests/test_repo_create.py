@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
@@ -119,12 +120,13 @@ async def test_create_repo_pushes_readme_and_ci_protects_and_registers(
     assert r is not None
     assert (r.source, r.mode, r.ci, r.base) == ("created", "push", True, "main")
     create_call = next(a for a, _ in gh.calls if a[:2] == ("repo", "create"))
-    assert create_call == ("repo", "create", "scratch", "--private", "--description=My scratch pad")
+    assert create_call == (
+        "repo", "create", "scratch", "--private", "--add-readme", "--description=My scratch pad"
+    )  # fmt: skip
     files = puts(gh)
-    assert [f["path"] for f in files] == ["README.md", create.CI_PATH]
-    assert base64.b64decode(files[1]["content"]) == create.CI_TEMPLATE_PATH.read_bytes()
-    assert b"My scratch pad" in base64.b64decode(files[0]["content"])
-    assert all(f["branch"] == "main" for f in files)
+    assert [f["path"] for f in files] == [create.CI_PATH]  # the README comes from gh itself
+    assert base64.b64decode(files[0]["content"]) == create.CI_TEMPLATE_PATH.read_bytes()
+    assert files[0]["branch"] == "main"
     protect = next((a, s) for a, s in gh.calls if a[-2:] == ("--input", "-"))
     body = json.loads(protect[1] or b"")
     assert body["required_status_checks"]["contexts"] == ["ci"]
@@ -199,16 +201,26 @@ async def test_add_ci_opens_a_pr_with_only_the_template(db: sqlite3.Connection) 
     pr = await Creator(db, gh, SECRETS).add_ci("proj", no_ci_github())
     assert (pr.number, pr.url, pr.already) == (7, PR, False)
     files = puts(gh)
-    assert [(f["path"], f["branch"]) for f in files] == [(create.CI_PATH, "resonant/add-ci")]
-    assert base64.b64decode(files[0]["content"]) == create.CI_TEMPLATE_PATH.read_bytes()
+    [file] = files
+    assert file["path"] == create.CI_PATH and re.fullmatch(
+        r"resonant/add-ci-[0-9a-f]{8}", file["branch"]
+    )
+    assert base64.b64decode(file["content"]) == create.CI_TEMPLATE_PATH.read_bytes()
     pr_create = next(a for a, _ in gh.calls if a[:2] == ("pr", "create"))
-    assert "resonant/add-ci" in pr_create and "main" in pr_create
+    assert file["branch"] in pr_create and "main" in pr_create
+    again = ci_gh()
+    await Creator(db, again, SECRETS).add_ci("proj", no_ci_github())
+    assert puts(again)[0]["branch"] != file["branch"]  # never a reused branch
 
 
 async def test_add_ci_reuses_an_open_pr(db: sqlite3.Connection) -> None:
     add_proj(db)
     gh = ci_gh()
-    gh.rules["pr list"] = (0, json.dumps([{"number": 7, "url": PR}]), "")
+    gh.rules["pr list"] = (
+        0,
+        json.dumps([{"number": 7, "url": PR, "headRefName": "resonant/add-ci-ab12cd34"}]),
+        "",
+    )
     pr = await Creator(db, gh, SECRETS).add_ci("proj", no_ci_github())
     assert pr.number == 7 and puts(gh) == []
 
@@ -365,3 +377,106 @@ async def test_add_ci_tool(
     assert out["opened"] is True and out["pr_url"] == PR
     again = await call(components, "add_ci", {"repo": "nope"})
     assert again["opened"] is False
+
+
+# --- hardening (review of #68) -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/workflows/x.yml",
+        ".github/workflows/Resonant-CI.yml",
+        ".GitHub/workflows/resonant-ci.yml",
+        "readme.md",
+        "src/README.md",
+        "",
+    ],
+)
+async def testput_file_is_an_allowlist(db: sqlite3.Connection, path: str) -> None:
+    gh = FakeGh()
+    with pytest.raises(CreateError, match="refusing to write"):
+        await Creator(db, gh, SECRETS).put_file("me/x", path, b"on: push\n", "main", "m")
+    assert gh.calls == []
+
+
+async def testput_file_allows_only_the_exact_template_and_a_readme(db: sqlite3.Connection) -> None:
+    gh = FakeGh({"api -X PUT repos/me/x/contents/": (0, "{}", "")})
+    creator = Creator(db, gh, SECRETS)
+    with pytest.raises(CreateError, match="other than the starter CI"):
+        await creator.put_file("me/x", create.CI_PATH, b"on: push\n", "main", "m")
+    assert gh.calls == []
+    await creator.put_file("me/x", "README.md", b"# any text\n", "main", "m")
+    await creator.put_file("me/x", create.CI_PATH, create.ci_template(), "main", "m")
+    assert [f["path"] for f in puts(gh)] == ["README.md", create.CI_PATH]
+
+
+async def test_a_description_starting_with_a_dash_is_inert(db: sqlite3.Connection) -> None:
+    gh = FakeGh()
+    await Creator(db, gh, SECRETS).create_repo("scratch", "--delete-me")
+    call = next(a for a, _ in gh.calls if a[:2] == ("repo", "create"))
+    assert "--description=--delete-me" in call and "--delete-me" not in call
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expect"),
+    [
+        ("gh: Upgrade to GitHub Pro or make this repository public (HTTP 403)", "this plan"),
+        ("Branch protection is not available for this repository (HTTP 403)", "this plan"),
+        ("Resource not accessible by personal access token (HTTP 403)", "lacks Administration"),
+    ],
+)
+async def test_protection_403_says_plan_or_permission(
+    db: sqlite3.Connection, stderr: str, expect: str
+) -> None:
+    gh = FakeGh({"api -X PUT repos/me/scratch/branches/main/protection": (1, "", stderr)})
+    made = await Creator(db, gh, SECRETS).create_repo("scratch")
+    assert expect in made.protection
+
+
+async def test_add_repo_alias_is_validated_first_and_failure_is_not_added_false(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    bad = await call(components, "add_repo", {"repo": "me/proj", "name": "9 bad!"})
+    assert bad["added"] is False and repos.list_all(db) == []  # nothing registered
+    repos.add(db, "me/other", base="main", source="owner", name="taken")
+    out = await call(components, "add_repo", {"repo": "me/proj", "name": "taken"})
+    assert out["added"] is True and out["alias_error"] and "Couldn't add the name" in out["text"]
+    assert repos.get(db, "me/proj") is not None
+
+
+# --- merging the add-CI PR ---------------------------------------------------------------
+
+HEAD = "b" * 40
+
+
+def pr_run(
+    *, files: list[tuple[str, str]] | None = None, content: bytes | None = None, head: str = HEAD
+) -> Callable[[Sequence[str]], Any]:
+    files = files if files is not None else [(create.CI_PATH, "added")]
+    body = content if content is not None else create.CI_TEMPLATE_PATH.read_bytes()
+
+    async def run(args: Sequence[str]) -> tuple[int, bytes]:
+        line = " ".join(args)
+        if line.endswith(".head.sha"):
+            return 0, head.encode() + b"\n"
+        if "/files" in line:
+            return 0, json.dumps([{"filename": n, "status": st} for n, st in files]).encode()
+        if "/contents/" in line:
+            assert f"ref={HEAD}" in line  # the content is read at the PR head
+            return 0, body
+        return 1, b""
+
+    return run
+
+
+async def test_only_the_starter_ci_pr_qualifies() -> None:
+    ok = create.adds_only_starter_ci
+    assert await ok(pr_run(), "me/proj", 7, HEAD) is True
+    extra = pr_run(files=[(create.CI_PATH, "added"), ("src/app.py", "added")])
+    assert await ok(extra, "me/proj", 7, HEAD) is False
+    other = pr_run(files=[(".github/workflows/other.yml", "added")])
+    assert await ok(other, "me/proj", 7, HEAD) is False
+    assert await ok(pr_run(content=b"on: push\n"), "me/proj", 7, HEAD) is False
+    assert await ok(pr_run(head="c" * 40), "me/proj", 7, HEAD) is False  # head moved
+    assert await ok(pr_run(), "me/proj", 7, "short") is False

@@ -19,8 +19,9 @@ import base64
 import hashlib
 import json
 import re
+import secrets as stdlib_secrets
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -35,8 +36,9 @@ from resonant.store.repos import Repo, RepoConflict
 CI_TEMPLATE_PATH = Path(__file__).parent / "templates" / "ci.yml"
 CI_TEMPLATE_SHA256 = "795f9f3bffdd066a9c8e24dd133d0dc169dd96c5d69913aa750c642bad2abd60"
 CI_PATH = ".github/workflows/resonant-ci.yml"
+README_PATH = "README.md"
 CI_CHECK = "ci"  # the starter workflow's job name: the required status check
-CI_BRANCH = "resonant/add-ci"
+CI_BRANCH_PREFIX = "resonant/add-ci-"  # plus a short random id: never a reused branch
 PR_BODY = "Adds a pull_request workflow that runs ./ci.sh when present. Added by Resonant."
 NAME_MAX = 100
 DESCRIPTION_MAX = 350  # GitHub's limit
@@ -117,10 +119,16 @@ class Creator:
             raise CreateError(f"{what} failed: {res.stderr[-160:]}")
         return res.stdout.decode(errors="replace")
 
-    async def _put_file(self, slug: str, path: str, data: bytes, branch: str, message: str) -> None:
-        if path == CI_PATH and data != ci_template():
-            # The one workflow file ever written, and only this exact content.
-            raise CreateError("refusing to write a workflow other than the starter CI")
+    async def put_file(self, slug: str, path: str, data: bytes, branch: str, message: str) -> None:
+        # An allowlist, exact and case-sensitive: the README (any text) and the starter CI
+        # workflow (exactly the template). Nothing else is ever written.
+        if path == README_PATH:
+            pass
+        elif path == CI_PATH:
+            if data != ci_template():
+                raise CreateError("refusing to write a workflow other than the starter CI")
+        else:
+            raise CreateError(f"refusing to write {path!r}")
         content = base64.b64encode(data).decode()
         await self._ok(
             f"writing {path}",
@@ -147,7 +155,7 @@ class Creator:
         if repos.get(self.conn, slug) is not None:
             raise CreateError(f"{slug} is already registered.")
         created = await self._gh(
-            "repo", "create", name, "--private" if private else "--public",
+            "repo", "create", name, "--private" if private else "--public", "--add-readme",
             f"--description={description}",
         )  # fmt: skip
         if created.returncode != 0:
@@ -156,9 +164,7 @@ class Creator:
         try:
             info = json.loads(await self._ok("reading the new repo", "api", f"repos/{slug}"))
             slug, base = str(info["full_name"]), str(info["default_branch"])
-            readme = f"# {name}\n\n{description}\n" if description else f"# {name}\n"
-            await self._put_file(slug, "README.md", readme.encode(), base, "Initial commit")
-            await self._put_file(slug, CI_PATH, ci_template(), base, "Add starter CI")
+            await self.put_file(slug, CI_PATH, ci_template(), base, "Add starter CI")
         except (CreateError, ValueError, KeyError, TypeError) as e:
             raise CreateError(
                 f"Created {slug} but couldn't finish setting it up ({e}). "
@@ -192,8 +198,11 @@ class Creator:
         )  # fmt: skip
         if res.returncode == 0:
             return f"{base} is protected: PRs and the CI check are required."
-        if "HTTP 403" in res.stderr or "HTTP 404" in res.stderr or "Upgrade" in res.stderr:
+        err = res.stderr.lower()
+        if "upgrade to github pro" in err or "not available" in err:
             return f"{base} isn't protected: {PROTECTION_UNAVAILABLE}."
+        if "HTTP 403" in res.stderr or "HTTP 404" in res.stderr:
+            return f"{base} isn't protected: the token lacks Administration permission."
         return f"{base} isn't protected: GitHub refused ({res.stderr[-80:]})."
 
     # -- add CI --
@@ -208,13 +217,15 @@ class Creator:
             return CiPr(None, None, already=True)
         template = ci_template()
         listed = await self._gh(
-            "pr", "list", "--repo", repo.slug, "--head", CI_BRANCH, "--state", "open",
-            "--json", "number,url",
+            "pr", "list", "--repo", repo.slug, "--state", "open",
+            "--json", "number,url,headRefName",
         )  # fmt: skip
         if listed.returncode == 0:
             try:
                 for item in json.loads(listed.stdout):
-                    if _PR_URL.fullmatch(str(item["url"])):
+                    if str(item["headRefName"]).startswith(CI_BRANCH_PREFIX) and _PR_URL.fullmatch(
+                        str(item["url"])
+                    ):
                         return CiPr(int(item["number"]), str(item["url"]), already=False)
             except (ValueError, KeyError, TypeError):
                 pass
@@ -222,16 +233,16 @@ class Creator:
         sha = (await self._ok("reading the base branch", "api", ref, "--jq", ".object.sha")).strip()
         if not re.fullmatch(r"[0-9a-f]{40}", sha):
             raise CreateError("Couldn't read the base branch.")
-        made = await self._gh(
+        branch = CI_BRANCH_PREFIX + stdlib_secrets.token_hex(4)
+        await self._ok(
+            "creating the branch",
             "api", "-X", "POST", f"repos/{repo.slug}/git/refs",
-            "-f", f"ref=refs/heads/{CI_BRANCH}", "-f", f"sha={sha}",
+            "-f", f"ref=refs/heads/{branch}", "-f", f"sha={sha}",
         )  # fmt: skip
-        if made.returncode != 0 and "already exists" not in made.stderr:
-            raise CreateError(f"creating the branch failed: {made.stderr[-160:]}")
-        await self._put_file(repo.slug, CI_PATH, template, CI_BRANCH, "Add starter CI")
+        await self.put_file(repo.slug, CI_PATH, template, branch, "Add starter CI")
         out = await self._ok(
             "opening the PR",
-            "pr", "create", "--repo", repo.slug, "--head", CI_BRANCH, "--base", repo.base,
+            "pr", "create", "--repo", repo.slug, "--head", branch, "--base", repo.base,
             "--title", "Add starter CI",
             "--body", PR_BODY,
         )  # fmt: skip
@@ -252,3 +263,35 @@ class Creator:
         with atomic(self.conn):
             repos.set_ci(self.conn, repo.slug, info.has_ci)
         return info.has_ci
+
+
+Run = Callable[[Sequence[str]], Awaitable[tuple[int, bytes]]]
+"""Runs ``gh`` with the token and returns (exit code, stdout)."""
+
+
+async def adds_only_starter_ci(run: Run, slug: str, pr_number: int, head_sha: str) -> bool:
+    """Whether PR ``pr_number``'s whole diff is the starter CI file: exactly one changed file,
+    :data:`CI_PATH`, whose content at ``head_sha`` hashes to :data:`CI_TEMPLATE_SHA256`. Fails
+    closed on any doubt. Used to let that PR merge in a repo that has no CI yet."""
+    if pr_number < 1 or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        return False
+    code, out = await run(["api", f"repos/{slug}/pulls/{pr_number}", "--jq", ".head.sha"])
+    if code != 0 or out.decode(errors="replace").strip() != head_sha:
+        return False
+    code, out = await run(["api", f"repos/{slug}/pulls/{pr_number}/files", "--paginate"])
+    if code != 0:
+        return False
+    try:
+        files = json.loads(out)
+        if [(f["filename"], f["status"]) for f in files] not in (
+            [(CI_PATH, "added")],
+            [(CI_PATH, "modified")],
+        ):
+            return False
+    except (ValueError, KeyError, TypeError):
+        return False
+    code, out = await run(
+        ["api", f"repos/{slug}/contents/{CI_PATH}", "-X", "GET", "-f", f"ref={head_sha}",
+         "-H", "Accept: application/vnd.github.raw"]
+    )  # fmt: skip
+    return code == 0 and hashlib.sha256(out).hexdigest() == CI_TEMPLATE_SHA256

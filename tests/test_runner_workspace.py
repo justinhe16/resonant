@@ -917,6 +917,28 @@ async def test_merge_is_refused_without_ci_after_a_live_recheck(tmp_path: Path) 
     assert repo is not None and repo.ci is True
 
 
+async def test_merge_allows_the_starter_ci_pr_in_a_repo_without_ci(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from resonant.runner import create
+
+    env = Env(tmp_path, ci=False)
+    await env.prepare()
+    head = "a" * 40
+    verdict = {"ci_only": True}
+
+    async def fake(run: Any, slug: str, number: int, sha: str) -> bool:
+        assert (slug, number, sha) == ("own/proj", 41, head)
+        return verdict["ci_only"]
+
+    monkeypatch.setattr(create, "adds_only_starter_ci", fake)
+    await env.ws.merge("proj", 41, head, SECRETS)
+    assert len(env.gh_calls("merge")) == 1
+    verdict["ci_only"] = False
+    with pytest.raises(MergeRefused, match="has no CI"):
+        await env.ws.merge("proj", 41, head, SECRETS)
+
+
 async def test_repo_has_ci(env: Env) -> None:
     assert await env.ws.repo_has_ci("proj", github_token=GH_TOKEN) is True
     await env.ws.refresh_mirror("proj", github_token=GH_TOKEN)

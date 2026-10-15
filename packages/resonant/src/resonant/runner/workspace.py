@@ -736,6 +736,19 @@ class Workspace:
 
     # -- merge --
 
+    async def _is_starter_ci_pr(
+        self, repo: Repo, pr_number: int, head_sha: str, secrets: RunnerSecrets
+    ) -> bool:
+        """The add-CI PR (only the starter workflow, hash-checked on the PR head) may merge
+        into a repo that has no CI yet."""
+        from resonant.runner.create import adds_only_starter_ci
+
+        async def run(args: Sequence[str]) -> tuple[int, bytes]:
+            res = await self._gh(args, secrets)
+            return res.returncode, res.stdout
+
+        return await adds_only_starter_ci(run, repo.slug, pr_number, head_sha)
+
     async def _recheck_ci(self, repo: Repo, secrets: RunnerSecrets) -> bool:
         """Look again before refusing a merge for no CI: it may have been added since. Records
         what it finds. Fails closed."""
@@ -755,7 +768,11 @@ class Workspace:
         if not _SHA.fullmatch(head_sha) or pr_number < 1:
             raise MergeRefused("bad PR reference")
         number = str(pr_number)
-        if repo.ci is False and not await self._recheck_ci(repo, secrets):
+        if (
+            repo.ci is False
+            and not await self._recheck_ci(repo, secrets)
+            and not await self._is_starter_ci_pr(repo, pr_number, head_sha, secrets)
+        ):
             raise MergeRefused(
                 f"{repo.slug} has no CI; add a pull_request workflow first (or ask me to add CI)."
             )

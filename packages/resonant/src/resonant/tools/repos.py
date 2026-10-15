@@ -258,6 +258,14 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         alias = args.get("name")
         if alias is not None and (not isinstance(alias, str) or not alias.strip()):
             raise ToolFailed("add_repo: name must be a non-empty string")
+        if isinstance(alias, str):
+            alias = alias.strip().lower()
+            if not repos_store.NAME.fullmatch(alias):
+                return {
+                    "added": False,
+                    "text": f"{alias[:40]!r} isn't a usable name (start with a letter; "
+                    "letters, digits, '_' and '-', at most 32).",
+                }
         got = await ready()
         if isinstance(got, str):
             return {"added": False, "text": got}
@@ -272,15 +280,18 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"added": False, "text": f"No repo matches {text[:60]!r}."}
         assert isinstance(resolution, Resolved)
         repo = resolution.repo
+        alias_error = None
         if isinstance(alias, str):
             try:
-                repo = repos_store.add_alias(ctx.conn, repo.slug, alias.strip().lower())
+                repo = repos_store.add_alias(ctx.conn, repo.slug, alias)
             except (RepoConflict, ValueError) as e:
-                return {"added": False, "text": str(e)}
+                alias_error = str(e)  # the repo is registered either way: say both
         lines = [
             f"{'Added' if resolution.new else 'Already have'} {repo.slug} as {repo.name}"
             f" ({repo.mode}{'' if repo.ci is None else ', CI' if repo.ci else ', no CI'})."
         ]
+        if alias_error:
+            lines.append(f"Couldn't add the name: {alias_error}.")
         if resolution.warning:
             lines.append(f"Heads up: {resolution.warning}.")
         return {
@@ -289,6 +300,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             "slug": repo.slug,
             "name": repo.name,
             "warning": resolution.warning,
+            "alias_error": alias_error,
             "text": " ".join(lines),
         }
 
