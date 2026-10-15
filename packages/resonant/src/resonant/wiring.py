@@ -45,6 +45,12 @@ off there is no router hook: extension events wait unrouted, as messages would.
 Extension health. The monitor gets ``extensions.host.ExtensionHealth`` as its dynamic
 ``ext:<name>`` checks (health commands, job fail streaks, load refusals, tampering).
 
+Claude runs. ``runner="claude"`` (``runners.claude.ClaudeRunner``) works on a repo in a
+sandboxed clone and replies with the PR; it replies over the channel, so it is registered
+here. The daemon calls its ``start()`` before the loop resumes anything (it ends the processes a
+crash left and hooks the kill switch) and ``aclose()`` at the end. The tools and slash commands
+(P5A-4) reach it as ``IMessageStack.claude`` or ``components.runners["claude"]``.
+
 Reminders. ``runner="reminder"`` sends due reminders through the iMessage channel, so it is
 registered here, not in Phase 0. ``add_reminder`` only runs inside the loop (the router or a
 runner step). The loop ticks again after every step and then sleeps only until the earliest
@@ -78,9 +84,11 @@ from resonant.monitor import HealthMonitor
 from resonant.ops import back_up
 from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
+from resonant.runners.claude import ClaudeRunner
 from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
 from resonant.runners.reminder import ReminderRunner
+from resonant.secrets import SecretStore
 from resonant_sdk import Event, ToolSpec
 from resonant_sdk.manifest import TOOL_TIMEOUT_MAX_S
 
@@ -132,6 +140,7 @@ class IMessageStack:
     model: ModelClient
     owner: str | None = None  # gets "back up" after a requested restart
     jobs: JobRunner | None = None
+    claude: ClaudeRunner | None = None
     notifier: Notifier | None = None
     pulse: Pulse | None = None
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
@@ -190,9 +199,8 @@ def build_imessage_stack(
     """Build the channel, router, runners and monitor, and hook them into ``loop``.
 
     Sets ``loop.router`` to :func:`route_event` (the notifier, then ``Router.route``) and
-    registers ``runner="local"``,
-    ``runner="reminder"`` and ``runner="job"`` in both ``components.runners`` and
-    ``loop.runners``. ``model``
+    registers ``runner="local"``, ``runner="reminder"``, ``runner="job"`` and
+    ``runner="claude"`` in both ``components.runners`` and ``loop.runners``. ``model``
     defaults to an ``OllamaClient`` over ``settings.model`` (closed by
     :meth:`IMessageStack.aclose`); ``osa_runner`` defaults to the real osascript runner.
     Tests and the e2e bench inject fakes for both.
@@ -262,6 +270,18 @@ def build_imessage_stack(
     )
     components.runners[jobs.name] = jobs
     loop.runners[jobs.name] = jobs
+    claude = ClaudeRunner(
+        conn,
+        runner=settings.runner,
+        channel=channel,
+        secrets=components.executor.secrets or SecretStore(),
+        timezone=settings.timezone,
+        max_runs=max(1, settings.claude.max_concurrent - settings.claude.reserved_oncall_slots),
+        create_task=loop.create_task,
+        cancel_task=loop.cancel,
+    )
+    components.runners[claude.name] = claude
+    loop.runners[claude.name] = claude
 
     owner = components.principals.owner if components.principals_loaded else None
     # /ext run core/briefing (P3-14): the briefing on demand, through this channel.
@@ -295,6 +315,7 @@ def build_imessage_stack(
         model=model,
         owner=owner,
         jobs=jobs,
+        claude=claude,
         notifier=notifier,
         pulse=pulse,
         _close_model=close_model,

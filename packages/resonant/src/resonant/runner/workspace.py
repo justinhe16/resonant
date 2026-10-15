@@ -692,7 +692,7 @@ class Workspace:
 
         await self._must_still_be_ok(still_ok)
         listed = await self._gh(
-            ["pr", "list", "--repo", repo.slug, "--head", p.branch, "--state", "open",
+            ["pr", "list", "--repo", repo.slug, "--head", p.branch, "--state", "all",
              "--json", "number,url"],
             secrets,
         )  # fmt: skip

@@ -29,6 +29,7 @@ Update a row when you try it, with the date and anything odd.
 | 13 | "what's running" | Tasks answer through chat (`job_control`), no longer a keyword | 📱 after deploy |
 | 14 | Sandbox self-check (after the Phase 5a deploy) | `resonant sandbox check`: every deny and allow row passes. Claude can run it on the Mini. | 🖥 (Claude) |
 | 15 | Runner not set up yet: "fix the typo in the README in resonant" | `The runner isn't set up: …` naming what's missing | 📱 after the Phase 5a deploy |
+| 16 | First real run: Claude's own sandbox is off and the session works inside ours | `/run` a trivial ask on a CI repo; the transcript (`~/.resonant/runner/transcripts/R1.jsonl`) shows no sandbox_apply or permission errors, and the settings flag `sandbox.enabled: false` took effect (a nested sandbox would fail) | 🖥 (Claude) after the Phase 5a deploy |
 
 ## Needs the Mini
 

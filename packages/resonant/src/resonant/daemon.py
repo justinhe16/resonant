@@ -13,6 +13,12 @@ and monitor stop first (no new events), then the loop drains in-flight steps (wh
 still send their replies), then the model client closes. With it disabled, the daemon is
 exactly Phase 0 apart from the gate and the scheduler.
 
+Claude runs (Phase 5a). With iMessage on, ``runner="claude"`` is registered by the wiring.
+Before the loop starts, the daemon calls ``ClaudeRunner.start()``: it ends every session
+process a crash left behind (matched by pid and start time), wipes leftover token dirs and
+hooks the kill switch, and only then does ``Loop.run`` resume tasks. The scheduler also gets
+the ``core/run-cleanup`` job (``runners.claude.cleanup_job``).
+
 The gate is always the Phase 2 ``PolicyGate``; the startup line logs
 ``gate=policy dry_run=<bool>``.
 
@@ -36,11 +42,12 @@ import uvicorn
 from resonant.api import DaemonState, create_app
 from resonant.components import build_components
 from resonant.config import Settings
-from resonant.extensions.scheduler import Scheduler
+from resonant.extensions.scheduler import CORE_JOBS, Scheduler
 from resonant.health import Heartbeat, Watchdog, deadman_task, heartbeat_task
 from resonant.loop import Loop, SlotPool
 from resonant.loop.echo import EchoRunner
 from resonant.observability import configure_logging
+from resonant.runners.claude import cleanup_job
 from resonant.store.db import open_db, utcnow
 
 if TYPE_CHECKING:
@@ -116,6 +123,7 @@ class Daemon:
             self.state.components,
             started_at=self.state.started_at,
             channel=None if self.imessage is None else self.imessage.channel,
+            core_jobs=(*CORE_JOBS, cleanup_job),
         )
         self.loop.scheduler = self.scheduler
         self.server = _Server(
@@ -166,6 +174,12 @@ class Daemon:
                 self.conn.close()
                 return 1
         self.scheduler.start()
+        if self.imessage is not None and self.imessage.claude is not None:
+            # Before the loop resumes anything: end the processes a crash left behind.
+            try:
+                await self.imessage.claude.start()
+            except Exception:
+                log.exception("runner startup failed")
         loop_task = asyncio.create_task(self.loop.run(), name="loop")
         server_task = asyncio.create_task(self._serve(), name="api")
         stop_task = asyncio.create_task(self._stop.wait(), name="stop")
@@ -219,6 +233,8 @@ class Daemon:
                 log.error("component error during shutdown: %r", r)
                 crashed = True
         if self.imessage is not None:
+            if self.imessage.claude is not None:
+                await self.imessage.claude.aclose()
             await self.imessage.aclose()
         self.conn.close()
         log.info("resonant daemon stopped")
