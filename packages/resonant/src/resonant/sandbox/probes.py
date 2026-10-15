@@ -74,7 +74,7 @@ DENIED_EXEC = (
 )
 # Looked up by name: the sandbox answers 1100 whether or not the service exists.
 DENIED_MACH = (
-    "com.apple.xpc.launchd.domain.user.501",
+    f"com.apple.xpc.launchd.domain.user.{os.getuid()}",
     "com.apple.SecurityServer",
     "com.apple.securityd.xpc",
     "com.apple.windowserver.active",
@@ -128,6 +128,7 @@ class ProbeContext:
     params: SandboxParams
     python: str
     env: dict[str, str]
+    sibling: Path  # another run dir next to this one
     canary: Path  # a dir under $HOME, written from outside; a session must not see into it
     outside_pid: int  # a process outside the sandbox
     lan_ip: str | None
@@ -472,20 +473,30 @@ def exec_candidates(deny_exec: Sequence[Path]) -> list[Path]:
 @contextlib.contextmanager
 def probe_context(
     *,
-    base_dir: Path | None = None,
+    secrets_dir: Path,
+    work_dir: Path | None = None,
+    cache_dir: Path | None = None,
     home: Path | None = None,
     deny_exec: Sequence[Path] = (),
     read_paths: Sequence[Path] | None = None,
-    secrets_dir: Path | None = None,
 ) -> Generator[ProbeContext]:
-    """Build a throwaway run dir and cache (under ``base_dir``, default ``~/resonant-runs``),
-    a canary dir under ``$HOME`` and a process outside the sandbox. Cleans up on exit."""
+    """Build a throwaway run dir (a direct child of ``work_dir``, like a real run's) and a
+    sibling, using the configured cache and secrets dirs, plus a canary dir under ``$HOME``
+    and a process outside the sandbox. Removes what it made, including a ``work_dir`` or
+    cache it had to create (if empty)."""
     if not sandbox_exec_available():
         raise SandboxError("sandbox-exec is not available on this host")
     home = home or Path.home()
-    base = base_dir or home / "resonant-runs"
-    base.mkdir(mode=0o700, parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix=".check-", dir=base))
+    work_dir = work_dir or home / "resonant-runs"
+    cache_dir = cache_dir or work_dir / ".cache"
+    made: list[Path] = []
+    for d in reversed([cache_dir, *cache_dir.parents, work_dir, *work_dir.parents]):
+        if not d.exists() and d not in made:
+            d.mkdir(mode=0o700)
+            made.append(d)
+    tag = uuid.uuid4().hex[:8]
+    run = work_dir / f".check-{tag}"
+    sibling = work_dir / f".check-other-{tag}"
     canary = Path(tempfile.mkdtemp(prefix=".resonant-probe-", dir=home))
     sleeper = subprocess.Popen(["/bin/sleep", "300"], start_new_session=True)
     interpreter = Path(os.path.realpath(getattr(sys, "_base_executable", sys.executable)))
@@ -494,19 +505,19 @@ def probe_context(
         Path(sys.base_prefix),
         interpreter.parent,
     ]
-    params = SandboxParams(
-        run_dir=work / "run",
-        cache_dir=work / "cache",
-        home=home,
-        read_paths=tuple(reads),
-        deny_exec=tuple(deny_exec),
-        secrets_dir=secrets_dir,
-    ).resolved()
     try:
+        params = SandboxParams(
+            run_dir=run,
+            cache_dir=cache_dir,
+            secrets_dir=secrets_dir,
+            home=home,
+            read_paths=tuple(reads),
+            deny_exec=tuple(deny_exec),
+        ).resolved()
         (canary / "canary.txt").write_text("canary")
         prepare_dirs(params)
-        (work / "other").mkdir()
-        (work / "other" / "keep.txt").write_text("sibling run")
+        sibling.mkdir(mode=0o700)
+        (sibling / "keep.txt").write_text("sibling run")
         claude = resolve_tool("claude")
         if claude is not None:
             with contextlib.suppress(SandboxError):
@@ -516,6 +527,7 @@ def probe_context(
             python=str(interpreter),
             env=scratch_env(params),
             canary=canary,
+            sibling=sibling,
             outside_pid=sleeper.pid,
             lan_ip=_lan_ip(),
             claude=claude,
@@ -524,8 +536,14 @@ def probe_context(
     finally:
         sleeper.kill()
         sleeper.wait()
-        for d in (work, canary):
+        for d in (run, sibling, canary):
             shutil.rmtree(d, ignore_errors=True)
+        for sub in ("uv", "npm", "pip"):  # the cache subdirs prepare_dirs made, if empty
+            with contextlib.suppress(OSError):
+                (cache_dir / sub).rmdir()
+        for d in reversed(made):
+            with contextlib.suppress(OSError):
+                d.rmdir()
 
 
 # --- the probes ------------------------------------------------------------------------------
@@ -615,8 +633,8 @@ def p_work_dir(ctx: ProbeContext) -> tuple[Status, str]:
         ("symlink", _unique(work, "link")),
         ("mkdir", _unique(work, "dir")),
         ("rename", str(ctx.params.run_dir)),
-        ("create", _unique(work / "other", "sibling")),
-        ("symlink", _unique(work / "other", "sibling-link")),
+        ("create", _unique(ctx.sibling, "sibling")),
+        ("symlink", _unique(ctx.sibling, "sibling-link")),
     ]
     res = _fs(ctx, ops)
     bad = {k: v for k, v in res.items() if not _denied(v)}
@@ -709,8 +727,6 @@ def p_secrets_dir(ctx: ProbeContext) -> tuple[Status, str]:
     listed, read, stat'ed nor written. Names that don't exist still say EPERM, never ENOENT,
     so the dir's contents are not even probeable."""
     sd = ctx.params.secrets_dir
-    if sd is None:
-        return "skip", "no secrets_dir configured"
     # a nonexistent name under a denied dir answers ENOENT, so the probe needs real entries:
     # a uniquely named canary file, in the dir (made 0700 if missing; removed afterwards)
     made: list[Path] = []
@@ -740,6 +756,33 @@ def p_secrets_dir(ctx: ProbeContext) -> tuple[Status, str]:
     return "pass", f"{len(res)} denied under {sd}"
 
 
+def p_terminals(ctx: ProbeContext) -> tuple[Status, str]:
+    """Other terminals and new ptys can't be opened for writing (headless sessions only):
+    nothing can type into the owner's Terminal."""
+    ttys = sorted(str(p) for p in Path("/dev").glob("ttys[0-9]*") if os.access(p, os.W_OK))[:3]
+    targets = [*ttys, "/dev/ptmx"]
+    code = (
+        "import os\n"
+        "r = {}\n"
+        "for p in A:\n"
+        "    try:\n"
+        "        os.close(os.open(p, os.O_WRONLY | os.O_NOCTTY))\n"
+        "        r[p] = 'opened'\n"
+        "    except OSError as e:\n"
+        "        r[p] = 'errno:%d' % e.errno\n"
+        "out(res=r)\n"
+    )
+    control: dict[str, str] = ctx.snippet(code, targets, bare=True)["res"]
+    open_outside = [t for t in targets if control[t] == "opened"]
+    if not open_outside:
+        return "skip", "control failed: no terminal can be opened outside the sandbox"
+    res: dict[str, str] = ctx.snippet(code, open_outside)["res"]
+    bad = {k: v for k, v in res.items() if not _denied(v)}
+    if bad:
+        return "fail", f"opened or inconclusive: {_fmt(bad)}"
+    return "pass", f"{len(res)} refused ({', '.join(os.path.basename(t) for t in res)})"
+
+
 def p_run_dir(ctx: ProbeContext) -> tuple[Status, str]:
     """The allows hold: the run dir and cache are writable and readable, the working
     directory resolves, /dev/null works."""
@@ -750,11 +793,13 @@ def p_run_dir(ctx: ProbeContext) -> tuple[Status, str]:
         f"p = {probe!r}\n"
         "open(p, 'w').write('x')\n"
         "r = open(p).read()\n"
-        f"open({str(cache / 'uv' / 'c.txt')!r}, 'w').write('y')\n"
+        f"open({str(cache / 'uv' / ('zz-probe-' + uuid.uuid4().hex[:8]))!r}, 'w').write('y')\n"
         "open(os.devnull, 'w').write('z')\n"
         "out(r=r, cwd=os.getcwd(), real=os.path.realpath('.'))\n"
     )
     data = ctx.snippet(code)
+    for leftover in (cache / "uv").glob("zz-probe-*"):
+        leftover.unlink(missing_ok=True)
     want = str(run / "repo")
     ok = data["r"] == "x" and data["cwd"] == want and data["real"] == want
     return ("pass", "run dir and cache usable") if ok else ("fail", f"unexpected: {data}")
@@ -928,7 +973,9 @@ def p_keychain(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_launchd(ctx: ProbeContext) -> tuple[Status, str]:
-    """A launchd job submission from Python is refused."""
+    """A launchd job submission from Python is refused. (launchd refuses submits from any
+    sandboxed caller, even under a bare allow-default profile, so this guards against a
+    macOS change rather than against a rule in our profile.)"""
     label = f"com.resonant.sandbox-probe.{uuid.uuid4().hex[:10]}"
     try:
         res = ctx.snippet(_LAUNCHD, {"label": label})["res"]
@@ -1088,6 +1135,7 @@ PROBES: tuple[Probe, ...] = (
     Probe("run dir and cache allows", "ci", p_run_dir),
     Probe("work dir and sibling run dirs", "ci", p_work_dir),
     Probe("secrets_dir unreadable", "ci", p_secrets_dir),
+    Probe("other terminals and ptys", "ci", p_terminals),
     Probe("other processes' environment (known limitation)", "ci", p_other_env),
     Probe("daemon env holds no secrets", "local", p_daemon_env),
     Probe("exec denies", "ci", p_exec_denied),
@@ -1176,10 +1224,10 @@ def self_check(params: SandboxParams, *, python: str | None = None) -> tuple[boo
     check_params = SandboxParams(
         run_dir=p.run_dir,
         cache_dir=p.cache_dir,
+        secrets_dir=p.secrets_dir,
         home=p.home,
         read_paths=(*p.read_paths, Path(sys.base_prefix), Path(interpreter).parent),
         deny_exec=p.deny_exec,
-        secrets_dir=p.secrets_dir,
     )
     argv = [interpreter, "-I", "-c", code, json.dumps({"home": str(p.home), "port": API_PORT})]
     try:

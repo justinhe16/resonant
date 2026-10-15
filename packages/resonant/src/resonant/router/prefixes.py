@@ -74,6 +74,7 @@ _FEW_SHOTS: tuple[tuple[str, IntentLabel, float], ...] = (
     ("is the mini running hot? memory looks high", "system", 0.9),
     ("is the model loaded", "system", 0.85),
     ("what can you do?", "system", 0.85),
+    ("what's the latest update", "updates", 0.9),
     ("note: call the plumber about the leak", "notes", 0.9),
     ("remind me at 3 to call mom", "reminders", 0.9),
     ("restart ollama, replies are stuck", "ops", 0.9),

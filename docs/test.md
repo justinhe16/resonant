@@ -25,8 +25,10 @@ Update a row when you try it, with the date and anything odd.
 | 9 | Kill switch and pulse: `/kill`, `/pulse now`, `/resume` | `Paused: pulse not sent.`; `/resume` → `resumed: autonomy on, unpaused` | 📱 |
 | 10 | Urgent path with the example extension (go-live step 13.4): `/ext run example/incident`, then `/example incident failing`, then `/example incident resolved` | `[example] 🔴 Demo service failing…` within 5 min, once; then `[example] ✓ Demo service recovered` | 📱 after 🖥 `resonant ext add repo:example` |
 | 11 | Hourly "btw" with the example (step 13.5): `/ext run example/pnl` once, then wait | At a top of the hour: `btw:` / `[example] PnL …` only in hours where it moved; nothing 00:00–06:00 | 📱 after 🖥 install |
-| 12 | Sandbox self-check (after the Phase 5a deploy) | `resonant sandbox check`: every deny and allow row passes. Claude can run it on the Mini. | 🖥 (Claude) |
-| 13 | Runner not set up yet: "fix the typo in the README in resonant" | `The runner isn't set up: …` naming what's missing | 📱 after the Phase 5a deploy |
+| 12 | Plain words reach the pulse: "what's the latest update" | The same text as `/pulse`, through the `updates` intent (model reply, owner only) | 📱 after deploy |
+| 13 | "what's running" | Tasks answer through chat (`job_control`), no longer a keyword | 📱 after deploy |
+| 14 | Sandbox self-check (after the Phase 5a deploy) | `resonant sandbox check`: every deny and allow row passes. Claude can run it on the Mini. | 🖥 (Claude) |
+| 15 | Runner not set up yet: "fix the typo in the README in resonant" | `The runner isn't set up: …` naming what's missing | 📱 after the Phase 5a deploy |
 
 ## Needs the Mini
 

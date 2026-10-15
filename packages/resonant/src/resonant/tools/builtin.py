@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.principals import Principals
 from resonant.store.db import utcnow
-from resonant.tools import commands, ext, notes, ops, projects, reminders, system, tasks
+from resonant.tools import commands, ext, notes, ops, projects, reminders, system, tasks, updates
 from resonant.tools.base import BuiltinContext, BuiltinModule
 from resonant.tools.projects import PROJECTS
 from resonant.tools.registry import ToolRegistry
@@ -59,6 +59,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     projects,
     ops,
     ext,
+    updates,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 

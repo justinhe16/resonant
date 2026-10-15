@@ -1145,24 +1145,21 @@ def sandbox_check(
     """Run every probe against the live runner profile and print a table. Exit 1 on any
     failure. Re-run after every macOS update. Set CLAUDE_CODE_OAUTH_TOKEN to also run an
     authenticated `claude -p` inside the sandbox."""
-    import shutil
-    import sys
-
-    from resonant.sandbox import SandboxError
+    from resonant.sandbox import SandboxError, default_deny_exec
     from resonant.sandbox.probes import probe_context, render_table, run_probes
 
     if scope not in ("all", "ci", "local"):
         typer.echo("--scope must be all, ci or local", err=True)
         raise typer.Exit(2)
     scopes: tuple[Any, ...] = ("ci", "local") if scope == "all" else (scope,)
-    deny = [Path(sys.prefix)]
-    if (entry := shutil.which("resonant")) is not None:
-        deny.append(Path(entry))
-    # runner.secrets_dir comes from the settings once the runner config lands
-    runner = getattr(load_settings(), "runner", None)
-    secrets_dir: Path = getattr(runner, "secrets_dir", None) or Path("~/.resonant/run-secrets")
+    runner = load_settings().runner  # the same dirs a real run uses
     try:
-        with probe_context(deny_exec=deny, secrets_dir=secrets_dir.expanduser()) as ctx:
+        with probe_context(
+            work_dir=runner.work_dir,
+            cache_dir=runner.cache_dir,
+            secrets_dir=runner.secrets_dir,
+            deny_exec=default_deny_exec(),
+        ) as ctx:
             results = run_probes(ctx, scopes)
     except SandboxError as e:
         typer.echo(f"sandbox unavailable: {e}", err=True)

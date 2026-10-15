@@ -13,6 +13,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
@@ -52,7 +53,6 @@ _PLACEHOLDERS = {
     "read": ";; @READ_ALLOW@",
     "meta": ";; @META_ALLOW@",
     "exec": ";; @DENY_EXEC@",
-    "secrets": ";; @DENY_SECRETS@",
 }
 
 
@@ -78,10 +78,10 @@ class SandboxParams:
 
     run_dir: Path
     cache_dir: Path
+    secrets_dir: Path  # runner.secrets_dir: required, never readable or writable
     home: Path = field(default_factory=Path.home)
     read_paths: tuple[Path, ...] = ()
     deny_exec: tuple[Path, ...] = ()
-    secrets_dir: Path | None = None  # runner.secrets_dir: never readable or writable
 
     def resolved(self) -> SandboxParams:
         home = Path(checked_path(self.home))
@@ -92,18 +92,24 @@ class SandboxParams:
                     f"run dir {run} is inside {home / name}, which is never readable"
                 )
         cache = Path(checked_path(self.cache_dir))
+        for what, d in (("run dir", run), ("cache dir", cache)):
+            for guarded in persistence_paths(home):
+                # the dir may not be, hold or sit inside a persistence path ($HOME itself
+                # may only be held: runs live under it)
+                inside = d.is_relative_to(guarded) and guarded != home
+                if inside or guarded.is_relative_to(d):
+                    raise SandboxError(f"{what} {d} is, holds or is inside {guarded}")
         reads = tuple(Path(checked_path(p)) for p in self.read_paths if Path(p).exists())
-        secrets = Path(checked_path(self.secrets_dir)) if self.secrets_dir else None
-        if secrets is not None:
-            for what, path in (
-                ("run dir", run),
-                ("cache dir", cache),
-                *(("read path", r) for r in reads),
-            ):
-                if path.is_relative_to(secrets) or secrets.is_relative_to(path):
-                    raise SandboxError(
-                        f"secrets_dir {secrets} overlaps the sandbox-readable {what} {path}"
-                    )
+        secrets = Path(checked_path(self.secrets_dir))
+        for what, path in (
+            ("run dir", run),
+            ("cache dir", cache),
+            *(("read path", r) for r in reads),
+        ):
+            if path.is_relative_to(secrets) or secrets.is_relative_to(path):
+                raise SandboxError(
+                    f"secrets_dir {secrets} overlaps the sandbox-readable {what} {path}"
+                )
         return SandboxParams(
             run_dir=run,
             cache_dir=cache,
@@ -112,6 +118,36 @@ class SandboxParams:
             deny_exec=tuple(Path(checked_path(p)) for p in self.deny_exec),
             secrets_dir=secrets,
         )
+
+
+def persistence_paths(home: Path) -> tuple[Path, ...]:
+    """Where a write would outlive the run: $HOME itself, login items, shell startup files,
+    Claude and ssh config, git config."""
+    names = (
+        "Library",
+        ".claude",
+        ".ssh",
+        ".config",
+        ".resonant",
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".zlogin",
+        ".bashrc",
+        ".bash_profile",
+        ".profile",
+        ".gitconfig",
+    )
+    return (home, *(home / n for n in names))
+
+
+def default_deny_exec() -> tuple[Path, ...]:
+    """The daemon's venv and the `resonant` entry point: sessions must not start either."""
+    found = [Path(sys.prefix)]
+    entry = shutil.which("resonant")
+    if entry is not None:
+        found.append(Path(entry))
+    return tuple(found)
 
 
 def default_read_paths() -> tuple[Path, ...]:
@@ -147,16 +183,12 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
     for i, path in enumerate(p.deny_exec):
         defs[f"DENY_EXEC_{i}"] = str(path)
         exec_lines.append(f'  (subpath (param "DENY_EXEC_{i}"))')
-    secret_lines: list[str] = []
-    if p.secrets_dir is not None:
-        defs["SECRETS"] = str(p.secrets_dir)
-        secret_lines.append('(deny file-read* file-write* (subpath (param "SECRETS")))')
+    defs["SECRETS"] = str(p.secrets_dir)
     text = template_text()
     for key, lines in (
         ("read", read_lines),
         ("meta", meta_lines),
         ("exec", exec_lines),
-        ("secrets", secret_lines),
     ):
         if _PLACEHOLDERS[key] not in text:
             raise SandboxError(f"runner.sb lost its {_PLACEHOLDERS[key]} placeholder")
@@ -283,6 +315,8 @@ def scratch_env(
         "GIT_AUTHOR_EMAIL": GIT_EMAIL,
         "GIT_COMMITTER_NAME": GIT_NAME,
         "GIT_COMMITTER_EMAIL": GIT_EMAIL,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
     }
     if claude_token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_token

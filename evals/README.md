@@ -43,11 +43,11 @@ The default set is `~/.resonant/evals/router.jsonl`. It stays outside the repo a
    ```
 
    - `text`: the message, exactly as you'd send it.
-   - `intent`: what the router *should* say. One of `question`, `job_control`, `system`, `notes`, `reminders`, `ops`, `run_project`, `unknown` (see `resonant/router/intents.py` for the definitions), or `extension:<name>` for an installed, enabled extension. The eval labels with the same extension intents as the daemon, read from the store.
+   - `intent`: what the router *should* say. One of `question`, `job_control`, `system`, `updates`, `notes`, `reminders`, `ops`, `run_project`, `unknown` (see `resonant/router/intents.py` for the definitions), or `extension:<name>` for an installed, enabled extension. The eval labels with the same extension intents as the daemon, read from the store.
    - `principal` (optional): only `"owner"` is supported. The eval routes from the owner's point of view.
 
    Blank lines are skipped. A malformed line fails the load with its line number (the text is never echoed).
-3. Cover every intent, with at least ~10 examples each. Include the fast-path phrasings (`status`, `ping`, `what's running`, `how's the mini`, `/status`, `/tasks`, `/help`) and near-misses that should *not* hit the fast path ("what's running on the build box?").
+3. Cover every intent, with at least ~10 examples each. Include the fast-path phrasings (`status`, `ping`, `/status`, `/tasks`, `/help`), the plain-words phrasings that now go through the labeler ("what's running", "how's the mini", "what's the latest update") and near-misses that should *not* hit the fast path ("what's running on the build box?").
 4. Don't copy the labeler's few-shot examples (`resonant/router/prefixes.py`) into the set. That inflates accuracy.
 5. Label by what you meant, not by what the router currently says. Disagreements are the point.
 

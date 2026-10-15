@@ -2,8 +2,9 @@
 """github extension CLI: PRs, a stateless CI/review watch, a digest, and two gated writes.
 
 Stdlib only and a single file: Resonant runs it as ``python -I -S cli.py``, so nothing next to
-it is importable. Every GitHub call goes through the ``gh`` CLI with the Keychain token
-(``RESONANT_SECRET_TOKEN``) passed as ``GH_TOKEN`` in gh's own environment only.
+it is importable. Every GitHub call goes through the ``gh`` CLI. The Keychain token arrives
+on the secrets pipe (``RESONANT_SECRETS_FD``) and is never in any environment or argv: ``gh``
+gets it from a ``hosts.yml`` in a private 0700 ``GH_CONFIG_DIR`` that is removed on exit.
 
 Tools print one JSON object on stdout and exit 0. Any failure prints one line to stderr and
 exits 1, and a failed run changed nothing: the writes (``rerun_failed``, ``merge_pr``) check
@@ -17,18 +18,26 @@ deterministic ``dedupe_key``, and Resonant's events table (UNIQUE on the key) is
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, cast
 
 DEFAULT_PATH = "/opt/homebrew/bin:/usr/bin:/bin"
 GH_TIMEOUT_S = 30
+CONFIG_PREFIX = "resonant-gh-"
+# A config dir this old was left by a killed run. It must stay well above the longest tool
+# timeout in resonant.yaml (300 s), or a slow concurrent run could lose its dir.
+STALE_CONFIG_S = 3600
 SEARCH_LIMIT = 50  # PRs per search
 RUN_LIMIT = 20  # workflow runs per PR branch
 MAX_EVENTS = 100  # the process runner keeps at most 100 events per run
@@ -114,15 +123,63 @@ def load_config() -> tuple[str, tuple[str, ...]]:
     return author, tuple(sorted(str(r) for r in repos))
 
 
+# --- secrets (the SDK's secret.py, inlined: this file must stay a single file) ---------
+
+
+_secrets: dict[str, str] | None = None
+
+
+def secret(name: str) -> str:
+    """A declared secret from the pipe at ``RESONANT_SECRETS_FD``, read once and cached.
+    "" when it was not delivered. Secrets are never in the environment or argv."""
+    global _secrets
+    if _secrets is None:
+        _secrets = {}
+        fd_text = os.environ.pop("RESONANT_SECRETS_FD", "")
+        if fd_text.isdigit():
+            try:
+                with os.fdopen(int(fd_text), "rb") as f:
+                    parsed = json.loads(f.read(65537)[:65536])
+                _secrets = {k: v for k, v in _d(parsed).items() if isinstance(v, str)}
+            except (OSError, ValueError):
+                pass
+    return _secrets.get(name, "")
+
+
+def _sweep_stale(base: Path) -> None:
+    """Remove ``resonant-gh-*`` dirs left by killed runs. Only a real directory (lstat: a
+    symlink is never followed), owned by us, mode 0700 and old enough; anything else stays."""
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            st = entry.lstat()
+            if (
+                entry.name.startswith(CONFIG_PREFIX)
+                and stat.S_ISDIR(st.st_mode)
+                and st.st_uid == os.getuid()
+                and stat.S_IMODE(st.st_mode) == 0o700
+                and time.time() - st.st_mtime > STALE_CONFIG_S
+            ):
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            pass
+
+
 class Gh:
-    """Runs ``gh`` by absolute path with a minimal env; the token goes only to that child."""
+    """Runs ``gh`` by absolute path with a minimal env and no token in it or in argv: ``gh``
+    reads the token from ``hosts.yml`` in a private config dir (keyring off), removed at exit."""
 
     def __init__(self) -> None:
-        token = os.environ.get("RESONANT_SECRET_TOKEN", "")
+        token = secret("token")
         if not token:
             raise Failed(
                 "secret github/token is missing; on the Mini: resonant secret set github/token"
             )
+        if "\n" in token or "\r" in token or '"' in token or "\\" in token:
+            raise Failed("secret github/token has characters a GitHub token never has")
         search_path = os.environ.get("PATH") or DEFAULT_PATH
         found = shutil.which("gh", path=search_path)
         if found is None:
@@ -133,7 +190,7 @@ class Gh:
             "PATH": search_path,
             "HOME": str(data_dir()),
             "LANG": "en_US.UTF-8",
-            "GH_TOKEN": token,
+            "GH_CONFIG_DIR": self._config_dir(token),
             "GH_PROMPT_DISABLED": "1",
             "GH_NO_UPDATE_NOTIFIER": "1",
             "GH_SPINNER_DISABLED": "1",
@@ -141,6 +198,22 @@ class Gh:
         }
         if tmp := os.environ.get("TMPDIR"):
             self.env["TMPDIR"] = tmp
+
+    @staticmethod
+    def _config_dir(token: str) -> str:
+        """A fresh 0700 dir (mkdtemp) with a 0600 hosts.yml holding the token as a plaintext
+        ``oauth_token`` (gh uses the config file when no keyring entry exists). Removed at exit."""
+        base = data_dir() / "tmp"
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _sweep_stale(base)
+        directory = Path(tempfile.mkdtemp(prefix=CONFIG_PREFIX, dir=base))
+        atexit.register(shutil.rmtree, directory, ignore_errors=True)
+        for sig in (signal.SIGTERM, signal.SIGINT):  # Resonant ends a run with SIGTERM first
+            signal.signal(sig, lambda *_: sys.exit(1))
+        fd = os.open(directory / "hosts.yml", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(f'github.com:\n    oauth_token: "{token}"\n    git_protocol: https\n')
+        return str(directory)
 
     def json(self, *args: str) -> Any:
         out = self.text(*args)

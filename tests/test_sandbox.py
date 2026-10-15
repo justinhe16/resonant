@@ -44,6 +44,7 @@ def params_in(tmp_path: Path, **kw: object) -> SandboxParams:
     return SandboxParams(
         run_dir=tmp_path / "work" / "R1",
         cache_dir=tmp_path / "work" / ".cache",
+        secrets_dir=home / ".resonant" / "run-secrets",
         home=home,
         **kw,  # type: ignore[arg-type]
     )
@@ -103,7 +104,10 @@ def test_run_dir_inside_a_never_readable_dir_is_refused(tmp_path: Path) -> None:
     (home / ".resonant").mkdir(parents=True)
     with pytest.raises(SandboxError):
         SandboxParams(
-            run_dir=home / ".resonant" / "runs" / "R1", cache_dir=tmp_path / "c", home=home
+            run_dir=home / ".resonant" / "runs" / "R1",
+            cache_dir=tmp_path / "c",
+            secrets_dir=tmp_path / "s",
+            home=home,
         ).resolved()
 
 
@@ -202,6 +206,7 @@ def test_always_denied_dirs_win_over_read_paths(tmp_path: Path) -> None:
     params = SandboxParams(
         run_dir=tmp_path / "run",
         cache_dir=tmp_path / "cache",
+        secrets_dir=home / ".resonant" / "run-secrets",
         home=home,
         read_paths=(home / ".ssh", tmp_path / "tools", Path(sys.base_prefix), Path(interp).parent),
     )
@@ -280,4 +285,52 @@ def test_secrets_dir_overlapping_a_readable_path_is_refused(tmp_path: Path) -> N
     ok = build(home / ".resonant" / "run-secrets").resolved()
     _, defs = render(ok)
     assert defs["SECRETS"] == os.path.realpath(home / ".resonant" / "run-secrets")
-    assert "SECRETS" not in render(params_in(tmp_path))[1]
+
+
+def test_persistence_paths_are_refused_for_run_and_cache_dirs(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    secrets = home / ".resonant" / "run-secrets"
+    for bad in (
+        home,
+        tmp_path,
+        home / "Library" / "LaunchAgents",
+        home / ".claude" / "x",
+        home / ".zshrc",
+        home / ".ssh",
+    ):
+        for kw in (
+            {"run_dir": bad, "cache_dir": tmp_path / "ok"},
+            {"run_dir": tmp_path / "ok", "cache_dir": bad},
+        ):
+            with pytest.raises(SandboxError):
+                SandboxParams(secrets_dir=secrets, home=home, **kw).resolved()  # type: ignore[arg-type]
+    SandboxParams(
+        run_dir=home / "resonant-runs" / "R1",
+        cache_dir=home / "resonant-runs" / ".cache",
+        secrets_dir=secrets,
+        home=home,
+    ).resolved()
+
+
+def test_final_denies_come_after_every_allow(tmp_path: Path) -> None:
+    text, _ = render(params_in(tmp_path))
+    lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith(";")]
+    body = "\n".join(lines)
+    last_allow_file = max(body.rfind("(allow file-write*"), body.rfind("(allow file-read*"))
+    last_allow = body.rfind("(allow ")
+    for marker in (
+        '(deny file-read* file-write* (subpath (param "SECRETS")))',
+        '(literal (string-append (param "HOME") "/.zshrc"))',
+        '(subpath (string-append (param "HOME") "/.claude"))',
+    ):
+        assert body.rfind(marker) > last_allow_file
+    assert body.rfind('(param "SECRETS")') > last_allow
+    assert '(regex #"^/dev/tty")' not in body
+    assert '(literal "/dev/tty")' in body
+
+
+def test_scratch_env_is_non_interactive(tmp_path: Path) -> None:
+    env = scratch_env(params_in(tmp_path))
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"

@@ -2,7 +2,8 @@
 
 Run as ``python fake_gh.py <state.json> <gh args…>`` through a ``gh`` shim on a temp PATH.
 It answers from ``state.json`` and appends each call (argv, the env keys it saw, and whether
-``GH_TOKEN`` matched ``state["token"]``) to ``calls.jsonl`` beside the state file.
+the ``hosts.yml`` token in ``GH_CONFIG_DIR`` matched ``state["token"]``, and the dir and file
+modes) to ``calls.jsonl`` beside the state file.
 
 State keys: ``token``, ``user``, ``mine`` / ``review`` (GraphQL search nodes), ``runs``
 (``"<repo>:<branch>"`` → ``gh run list`` rows), ``prs`` (``"<repo>#<n>"`` → ``gh pr view``),
@@ -54,6 +55,21 @@ def answer(state: dict[str, Any], args: list[str]) -> tuple[int, Any, str]:
     return 2, None, f"fake gh: unhandled {args[:2]}"
 
 
+def _hosts_token() -> str | None:
+    cfg = os.environ.get("GH_CONFIG_DIR")
+    if not cfg:
+        return None
+    for line in (Path(cfg) / "hosts.yml").read_text().splitlines():
+        if line.strip().startswith("oauth_token:"):
+            return line.split(":", 1)[1].strip().strip('"')
+    return None
+
+
+def _modes() -> list[int]:
+    cfg = Path(os.environ.get("GH_CONFIG_DIR", "/nonexistent"))
+    return [cfg.stat().st_mode & 0o777, (cfg / "hosts.yml").stat().st_mode & 0o777]
+
+
 def main() -> int:
     state_path = Path(sys.argv[1])
     args = sys.argv[2:]
@@ -61,7 +77,8 @@ def main() -> int:
     call = {
         "argv": args,
         "env": sorted(os.environ),
-        "token_ok": os.environ.get("GH_TOKEN") == state.get("token"),
+        "token_ok": _hosts_token() == state.get("token"),
+        "modes": _modes(),
     }
     with (state_path.parent / "calls.jsonl").open("a") as f:
         f.write(json.dumps(call) + "\n")

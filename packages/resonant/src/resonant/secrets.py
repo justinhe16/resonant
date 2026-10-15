@@ -1,8 +1,9 @@
 """Keychain secrets: ``SecretStore`` over ``/usr/bin/security``.
 
 Every secret is a generic-password item in the login keychain with service ``resonant`` and
-account ``<ext>/<name>`` (a *ref*, e.g. ``github/token``). Extensions see a secret only as
-``RESONANT_SECRET_<NAME>`` in their own process env (injection is the executor's job).
+account ``<ext>/<name>`` (a *ref*, e.g. ``github/token``). Extensions get a secret only on an
+inherited pipe (fd 4), never in env or argv; ``RESONANT_SECRET_<NAME>`` is just this module's
+key format for the hand-off to the process runner, which strips it before spawning.
 
 Rules this module keeps:
 
@@ -263,6 +264,50 @@ class SecretStore:
 def values_of(env: Mapping[str, str]) -> list[str]:
     """The secret values in an env built by ``env_for`` (for a ``Redactor``)."""
     return [v for k, v in env.items() if k.startswith(ENV_PREFIX)]
+
+
+# --- the runner's core secrets -----------------------------------------------------------
+# The Claude runner (docs/phase5a-plan.md) is core, not an extension, but its secrets use the
+# same store under the reserved ``runner`` prefix: ``resonant secret set runner/github_token``.
+# A ``claude setup-token`` value is about 108 characters, inside ``MAX_LEN``.
+
+RUNNER_EXT = "runner"
+GITHUB_TOKEN_REF = secret_ref(RUNNER_EXT, "github_token")
+CLAUDE_TOKEN_REF = secret_ref(RUNNER_EXT, "claude_token")
+ANTHROPIC_KEY_REF = secret_ref(RUNNER_EXT, "anthropic_key")
+
+
+@dataclass(frozen=True)
+class RunnerSecrets:
+    # repr=False: a value must never reach a log line or a traceback by accident.
+    github_token: str = field(repr=False)
+    # At most one of these is set: the subscription token, or the API key for API billing.
+    claude_token: str | None = field(repr=False)
+    anthropic_key: str | None = field(repr=False)
+
+    def values(self) -> list[str]:
+        """Every secret value, for a ``Redactor``."""
+        return [v for v in (self.github_token, self.claude_token, self.anthropic_key) if v]
+
+
+async def missing_runner_secrets(store: SecretStore) -> list[str]:
+    """What the runner still needs, as refs (names only; no value is read)."""
+    missing: list[str] = []
+    if not await store.exists(GITHUB_TOKEN_REF):
+        missing.append(GITHUB_TOKEN_REF)
+    if not (await store.exists(CLAUDE_TOKEN_REF) or await store.exists(ANTHROPIC_KEY_REF)):
+        missing.append(f"{CLAUDE_TOKEN_REF} (or {ANTHROPIC_KEY_REF})")
+    return missing
+
+
+async def load_runner_secrets(store: SecretStore) -> RunnerSecrets:
+    """The runner's values. Raises ``SecretMissing`` for the GitHub token or for both Claude
+    credentials; the Claude token wins when both exist."""
+    github = await store.get(GITHUB_TOKEN_REF)
+    try:
+        return RunnerSecrets(github, await store.get(CLAUDE_TOKEN_REF), None)
+    except SecretMissing:
+        return RunnerSecrets(github, None, await store.get(ANTHROPIC_KEY_REF))
 
 
 # --- the test double ---------------------------------------------------------------------

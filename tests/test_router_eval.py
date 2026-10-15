@@ -123,6 +123,7 @@ def test_example_set_is_valid_and_covers_both_paths() -> None:
         "question",
         "job_control",
         "system",
+        "updates",
         "notes",
         "reminders",
         "ops",
@@ -134,6 +135,9 @@ def test_example_set_is_valid_and_covers_both_paths() -> None:
     for c in fast:  # the synthetic labels agree with the deterministic fast path
         cmd = match_fast_path(c.text)
         assert cmd is not None and cmd.intent == c.intent
+    # Plain words go through the labeler; only slash commands, `status` and `ping` are fast.
+    plain = {c.text for c in cases if not c.text.startswith("/")}
+    assert {t for t in plain if match_fast_path(t) is not None} == {"status", "ping"}
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -18,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def ctx() -> Iterator[ProbeContext]:
-    with probe_context() as c:
+    with probe_context(secrets_dir=Path.home() / ".resonant" / "run-secrets") as c:
         yield c
 
 

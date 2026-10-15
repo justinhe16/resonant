@@ -13,6 +13,13 @@ element. Nothing runs through a shell.
 - stdout is read in chunks up to ``stdout_cap``; past that the tree is killed. stderr keeps
   only its last ``stderr_cap`` bytes and is never logged or returned, except a redacted
   200-char tail on the exceptions for the failure audit row.
+- Secrets never touch the child's environment or argv (a same-user process can read both with
+  ``sysctl KERN_PROCARGS2``, which no sandbox can deny). The ``RESONANT_SECRET_*`` keys that
+  :func:`scratch_env` builds are the daemon-side hand-off only: :meth:`ExtProcess.run_raw` strips
+  them out of the child's env and delivers them as one JSON object ``{name: value}`` on fd 4, a
+  pipe whose write end the daemon fills and closes before the child starts
+  (``RESONANT_SECRETS_FD=4``; ``resonant_sdk.secret`` reads it once). No file, so nothing to
+  clean up after a kill or timeout.
 - fd 3 is a pipe for structured events (``RESONANT_EVENTS_FD=3``): one JSON object per line,
   capped like stdout.
 - Every live run is tracked by a :class:`ProcessTracker`: its process group plus the
@@ -55,6 +62,8 @@ log = logging.getLogger(__name__)
 
 SCRATCH_PATH = "/opt/homebrew/bin:/usr/bin:/bin"
 EVENTS_FD = 3
+SECRETS_FD = 4
+SECRETS_CAP = 8 * 1024  # JSON bytes; fits an empty pipe buffer, so the write never blocks
 MAX_ARG_CHARS = 1000
 STDOUT_CAP = 256 * 1024
 STDERR_CAP = 8 * 1024
@@ -72,20 +81,26 @@ _SECRET_ENV = re.compile(r"RESONANT_SECRET_[A-Z][A-Z0-9_]{0,31}")
 _EVENT_TYPE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _EVENT_KEYS = frozenset({"type", "text", "dedupe_key", "data"})
 
-# Runs between fork and the extension's exec: moves the events pipe to fd 3, then execs the
-# real argv. A fixed string; argv goes through execve. The env passed on is only the keys
-# we set (names in argv[2], values from the env), since the interpreter itself may add
-# some at startup (macOS: __CF_USER_TEXT_ENCODING).
+# Runs between fork and the extension's exec: moves the events pipe to fd 3 and the secrets
+# pipe (if any, else "-1") to fd 4, then execs the real argv. Both are first copied above
+# fd 10 so neither move can clobber the other. A fixed string; argv goes through execve. The
+# env passed on is only the keys we set (names in argv[3], values from the env), since the
+# interpreter itself may add some at startup (macOS: __CF_USER_TEXT_ENCODING).
 _TRAMPOLINE = (
-    "import os,sys\n"
-    "fd=int(sys.argv[1])\n"
-    "if fd!=3:\n"
-    "    os.dup2(fd,3)\n"
-    "    os.close(fd)\n"
-    "keys=sys.argv[2].split('\\x1f') if sys.argv[2] else []\n"
+    "import os,sys,fcntl\n"
+    "src=[int(sys.argv[1]),int(sys.argv[2])]\n"
+    "tmp=[fcntl.fcntl(f,fcntl.F_DUPFD,10) if f>=0 else -1 for f in src]\n"
+    "for f in src:\n"
+    "    if f>=0:\n"
+    "        os.close(f)\n"
+    "for dst,t in zip((3,4),tmp):\n"
+    "    if t>=0:\n"
+    "        os.dup2(t,dst)\n"
+    "        os.close(t)\n"
+    "keys=sys.argv[3].split('\\x1f') if sys.argv[3] else []\n"
     "env={k:os.environ[k] for k in keys if k in os.environ}\n"
     "try:\n"
-    "    os.execve(sys.argv[3],sys.argv[4:],env)\n"
+    "    os.execve(sys.argv[4],sys.argv[5:],env)\n"
     "except OSError:\n"
     "    os._exit(127)\n"
 )
@@ -544,6 +559,7 @@ class ExtProcess:
         if self.tracker.paused:
             raise ExtFailed("paused")
         env = dict(req.env)
+        secrets = _take_secrets(env)
         if any(not k or "=" in k or _KEY_SEP in k for k in env):
             raise ExtFailed("bad env name")
         exe = _resolve(req.argv[0])
@@ -554,6 +570,18 @@ class ExtProcess:
         # Our own pipes (not asyncio's subprocess pipes), so exit is seen even while an
         # escaped grandchild still holds stdout or stderr open.
         pipes = [os.pipe() for _ in range(3)]  # stdout, stderr, events
+        secrets_fd = -1
+        try:
+            if secrets:
+                secrets_fd = _secrets_pipe(secrets)
+                env["RESONANT_SECRETS_FD"] = str(SECRETS_FD)
+        except BaseException as e:
+            for r, w in pipes:
+                os.close(r)
+                os.close(w)
+            if isinstance(e, ExtFailed):
+                raise
+            raise ExtFailed("could not pass secrets") from e
         try:
             proc = await asyncio.create_subprocess_exec(
                 self.python,
@@ -562,6 +590,7 @@ class ExtProcess:
                 "-c",
                 _TRAMPOLINE,
                 str(pipes[2][1]),
+                str(secrets_fd),
                 _KEY_SEP.join(env),
                 exe,
                 *req.argv,
@@ -570,7 +599,7 @@ class ExtProcess:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=pipes[0][1],
                 stderr=pipes[1][1],
-                pass_fds=(pipes[2][1],),
+                pass_fds=(pipes[2][1], *([secrets_fd] if secrets_fd >= 0 else [])),
                 start_new_session=True,
             )
         except BaseException as e:
@@ -582,6 +611,8 @@ class ExtProcess:
         finally:
             for _, w in pipes:
                 os.close(w)
+            if secrets_fd >= 0:
+                os.close(secrets_fd)
         entry = self.tracker.track(proc.pid, req.label)
         bufs = [bytearray(), bytearray(), bytearray()]
         transports: list[asyncio.BaseTransport] = []
@@ -674,6 +705,29 @@ class ExtProcess:
                 break
         if entry.reason is not None and not t_wait.done():
             await self.tracker.terminate(entry)
+
+
+def _take_secrets(env: dict[str, str]) -> dict[str, str]:
+    """Remove the ``RESONANT_SECRET_<NAME>`` keys from ``env``; return ``{name: value}``."""
+    found = {k: env.pop(k) for k in [k for k in env if _SECRET_ENV.fullmatch(k)]}
+    return {k.removeprefix("RESONANT_SECRET_").lower(): v for k, v in found.items()}
+
+
+def _secrets_pipe(secrets: Mapping[str, str]) -> int:
+    """A pipe holding ``secrets`` as JSON with its write end already closed; returns the read
+    end. The payload is capped so the write can't block on a full pipe."""
+    data = json.dumps(secrets, separators=(",", ":")).encode()
+    if len(data) > SECRETS_CAP:
+        raise ExtFailed("secrets too large")
+    r, w = os.pipe()
+    try:
+        os.write(w, data)
+    except BaseException:
+        os.close(r)
+        raise
+    finally:
+        os.close(w)
+    return r
 
 
 def _overflow_reason(t_out: asyncio.Task[None], t_ev: asyncio.Task[None]) -> str | None:
@@ -775,6 +829,7 @@ class FakeExtProcess:
 __all__ = [
     "EVENTS_FD",
     "SCRATCH_PATH",
+    "SECRETS_FD",
     "ExtAmbiguous",
     "ExtCommand",
     "ExtEvent",

@@ -364,3 +364,11 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 ## Runner as a separate macOS user (hardening)
 
 Deferred 2026-10-15 from the Phase 5a plan. The Seatbelt sandbox cannot stop a session reading another same-user process's argv and environment (`sysctl KERN_PROCARGS2`), so the owner chose never to put a secret in any process's env or argv instead (`resonant sandbox check` probes the daemon's environment). Running sessions as a dedicated user (`_resonant-runner`, no Keychain, no access to the owner's home) would close that structurally and drop the reliance on the rule. Needs one more owner terminal step (creating the user) and a `sudo`-free launchd helper.
+
+## Secrets on disk for `gh` (P5A-7)
+
+*Noted 2026-10-15.* Secrets no longer appear in any child's env or argv (fd 4 pipe). The github extension still has to hand its token to `gh`, which reads only an env var or a config file, so it writes a 0600 `hosts.yml` into a 0700 dir under the extension's data dir for the length of the run. A run ended by SIGKILL (a timeout, after SIGTERM's grace) can leave that dir until a later run sweeps `resonant-gh-*` dirs older than an hour. Calling the GitHub API from Python with the token in memory would remove the file; deferred because the extension is built on `gh`'s GraphQL, pagination and error text. Also: a descendant started through a shell (not `subprocess` defaults) could inherit fd 4 before the SDK reads it; first-party extensions don't.
+
+## Tools that need a pty inside the runner sandbox
+
+*Noted 2026-10-15 (P5A-1).* The runner profile lets a session write only `/dev/tty`, `/dev/null` and its own dirs, and denies `/dev/ttys*` and `/dev/ptmx`. Headless `claude -p` over pipes needs no pty, but a repo tool that allocates one (`script`, `expect`, some test harnesses, interactive installers) fails. Add a narrow pty allow only if a real run needs it.

@@ -303,11 +303,11 @@ def test_gate_follows_settings(db: sqlite3.Connection) -> None:
 
 async def test_fast_path_read_still_allowed(running: Running) -> None:
     r = running
-    r.chat.add_message(handle=OWNER_PHONE, text="what's running?")
+    r.chat.add_message(handle=OWNER_PHONE, text="/tasks")
     sent = await r.osa.wait_for(1, 10)
-    assert (sent.handle, sent.text) == (OWNER_PHONE, "Nothing running.")
+    assert sent.handle == OWNER_PHONE
     (audit,) = r.audits("gate.evaluate")
-    assert audit["tool"] == "list_tasks" and audit["decision"] == "Allow"
+    assert audit["tool"] == "projects" and audit["decision"] == "Allow"
     assert audit["detail"]["origin"] == "inferred"
     assert audit["detail"]["dry_run"] is True
 

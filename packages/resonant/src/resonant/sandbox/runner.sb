@@ -12,7 +12,7 @@
   (subpath (param "CACHE"))
   (literal "/dev/null")
   (literal "/dev/dtracehelper")
-  (regex #"^/dev/tty"))
+  (literal "/dev/tty"))  ; headless sessions only: no ptys, no other terminals
 
 ;; ---- file read: deny the owner's world, then allow the run's own paths ------------------
 (deny file-read*
@@ -39,8 +39,6 @@
   (subpath (string-append (param "HOME") "/.claude"))
   (subpath (string-append (param "HOME") "/Library"))
   (subpath (string-append (param "HOME") "/.local/bin")))
-;; the runner's token files: briefly on disk under runner.secrets_dir (rendered when set)
-;; @DENY_SECRETS@
 
 ;; ---- exec: defense in depth (the mach denies below do the real work) ---------------------
 (deny process-exec
@@ -83,11 +81,10 @@
 (deny mach-task-name)
 (deny process-info* (require-not (target same-sandbox)))
 (deny signal (require-not (target same-sandbox)))
-;; another process's argv and environment (`ps eww`) come from sysctl, not process-info
-(deny sysctl-read
-  (sysctl-name "kern.procargs")
-  (sysctl-name "kern.procargs2")
-  (sysctl-name "kern.procargs2.hash"))
+;; NOTE: another process's argv and environment (`ps eww`, KERN_PROCARGS2) are readable
+;; whatever is denied here (a known limitation, docs/phase5a-plan.md): secrets never sit in an
+;; env or argv. This line is belt and braces for macOS versions that do gate it.
+(deny sysctl-read (sysctl-name "kern.procargs2"))
 
 ;; ---- network -----------------------------------------------------------------------------
 ;; the daemon's API and Ollama, on every address (loopback and the LAN IP)
@@ -96,3 +93,25 @@
 ;; unix sockets: deny by default (docker, ssh-agent, any daemon), mDNSResponder only
 (deny network-outbound (remote unix-socket))
 (allow network-outbound (literal "/private/var/run/mDNSResponder"))
+
+;; ---- last word: nothing below may be undone by an allow above ----------------------------
+;; persistence paths (login items, shell startup, Claude config, cron, ssh) and terminals
+(deny file-write*
+  (literal (param "HOME"))
+  (subpath (string-append (param "HOME") "/Library"))
+  (subpath (string-append (param "HOME") "/.claude"))
+  (subpath (string-append (param "HOME") "/.ssh"))
+  (subpath (string-append (param "HOME") "/.config"))
+  (subpath (string-append (param "HOME") "/.resonant"))
+  (literal (string-append (param "HOME") "/.zshrc"))
+  (literal (string-append (param "HOME") "/.zshenv"))
+  (literal (string-append (param "HOME") "/.zprofile"))
+  (literal (string-append (param "HOME") "/.zlogin"))
+  (literal (string-append (param "HOME") "/.bashrc"))
+  (literal (string-append (param "HOME") "/.bash_profile"))
+  (literal (string-append (param "HOME") "/.profile"))
+  (literal (string-append (param "HOME") "/.gitconfig"))
+  (regex #"^/dev/ttys[0-9]+")
+  (literal "/dev/ptmx"))
+;; the runner's token files, briefly on disk under runner.secrets_dir
+(deny file-read* file-write* (subpath (param "SECRETS")))

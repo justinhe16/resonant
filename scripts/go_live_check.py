@@ -291,20 +291,22 @@ def _keychain_exists(ref: str) -> bool:
     return asyncio.run(SecretStore().exists(ref))
 
 
-def sandbox_row() -> Row:
-    """Phase 5a: the runner sandbox denies a read of ~/.resonant, the Keychain service and
-    the API port. Writes nothing (the run and cache dirs need not exist). Advisory until a
-    runner is configured."""
-    from resonant.sandbox import SandboxParams, default_read_paths
+def sandbox_row(settings: Settings) -> Row:
+    """Phase 5a: the runner sandbox, built from the configured runner dirs, denies a read of
+    ~/.resonant, the Keychain service and the API port. Writes nothing (the dirs need not
+    exist). Advisory until a runner is configured."""
+    from resonant.sandbox import SandboxParams, default_deny_exec, default_read_paths
     from resonant.sandbox.probes import self_check
 
-    work = Path.home() / "resonant-runs"
-    params = SandboxParams(
-        run_dir=work / ".check" / "run",
-        cache_dir=work / ".check" / "cache",
-        read_paths=default_read_paths(),
-    )
+    r = settings.runner
     try:
+        params = SandboxParams(
+            run_dir=r.work_dir / ".check",
+            cache_dir=r.cache_dir,
+            secrets_dir=r.secrets_dir,
+            read_paths=default_read_paths(),
+            deny_exec=default_deny_exec(),
+        )
         ok, detail = self_check(params)
     except Exception as e:  # a broken sandbox is a FAIL row, not a crash
         return ("FAIL", False, "runner sandbox", _err(e))
@@ -435,7 +437,7 @@ def main() -> None:
         if conn is not None:
             conn.close()
 
-    out(*sandbox_row())
+    out(*sandbox_row(settings))
 
     out("PASS", True, "timezone", settings.timezone)  # validated when config loads
 

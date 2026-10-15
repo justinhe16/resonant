@@ -53,7 +53,7 @@ SUGGEST_N = 3
 SUGGEST_CUTOFF = 0.6
 SUGGEST_MARGIN = 0.1  # "/remnd": /remind, not also /unremind and /reminders
 HELP_QUERY_MAX = 50
-KEYWORDS_HINT = "Or just ask: what's running, how's the mini, ping."
+KEYWORDS_HINT = "Instant, no model: /status, /tasks, ping. Or just ask in plain words."
 EXT_ARG_MAX = 1000  # the process runner's limit for one value
 EXT_DESCRIPTION_MAX = 120
 MUTE_DEFAULT = timedelta(hours=1)
@@ -219,7 +219,6 @@ class Command:
     owner_only: bool = False
     subs: tuple[Sub, ...] = ()
     extension: str | None = None  # an ``/<ext>`` command: every tool is that extension's
-    bare: bool = False  # no tool, no text: the fast path answers it (``/pulse``)
 
     @property
     def tools(self) -> tuple[str, ...]:
@@ -250,7 +249,7 @@ class Command:
                     return sub.word, sub.tool, args
             if self.extension is not None and first:
                 raise UsageError(reply=self._unknown_sub(first))
-            if self.tool is None and not (self.bare and not first):
+            if self.tool is None:
                 raise UsageError
         return None, self.tool, self.parse(rest, ctx)
 
@@ -338,9 +337,9 @@ PULSE = Command(
     "/pulse",
     "/pulse [now]",
     "what the next update would say and what's open; now sends it",
-    "system",
+    "updates",
+    tool="pulse_preview",
     owner_only=True,
-    bare=True,
     subs=(Sub("now", None, usage="/pulse now"),),
 )
 
