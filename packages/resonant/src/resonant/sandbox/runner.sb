@@ -114,4 +114,49 @@
   (regex #"^/dev/ttys[0-9]+")
   (literal "/dev/ptmx"))
 ;; the runner's token files, briefly on disk under runner.secrets_dir
-(deny file-read* file-write* (subpath (param "SECRETS")))
+(deny file-read* file-write*
+  (subpath (param "SECRETS"))
+;; runner.deny_read: the owner's extra paths
+;; @DENY_READ@
+  )
+
+;; ---- secret files: denied for read AND write, wherever they sit -----------------------------
+;; Credentials the owner keeps next to their code (~/trading/.env with exchange keys) or in
+;; the usual tool homes. Last in the file so no allow above can undo them (SBPL: last match
+;; wins). The name rules (.env, *.pem, *.p12, *.key) spare the run dir, the cache and the
+;; toolchain read paths, so a repo's own committed files and a package's bundled cacert.pem
+;; still work, and spare the system roots (the OS cert bundles are *.pem). SBPL regexes are
+;; POSIX extended, matched against the whole real path; #"..." is a raw string, so `\.` is
+;; the regex's escaped dot. No lookahead exists, hence the require-not for the templates.
+(deny file-read* file-write*
+  (require-all
+    (require-any
+      (regex #"/\.env$")
+      (regex #"/\.env\.[^/]*$")
+      (regex #"\.pem$")
+      (regex #"\.p12$")
+      (regex #"\.key$"))
+    ;; committed templates carry no secrets
+    (require-not (regex #"/\.env\.(example|sample|template)$"))
+    (require-not (subpath "/System"))
+    (require-not (subpath "/usr"))
+    (require-not (subpath "/Library"))
+    (require-not (subpath "/Applications"))
+    (require-not (subpath "/private/etc"))
+    (require-not (subpath "/opt/homebrew"))
+    ;; the run's own files and the toolchain paths
+    (require-not (require-any
+;; @SECRET_EXEMPT@
+      ))))
+;; fixed credential files and dirs under $HOME (profile.py HOME_SECRETS), even when a
+;; read path above sits inside one
+(deny file-read* file-write*
+  (subpath (string-append (param "HOME") "/.ssh"))
+  (subpath (string-append (param "HOME") "/.aws"))
+  (subpath (string-append (param "HOME") "/.config/gh"))
+  (literal (string-append (param "HOME") "/.netrc"))
+  (literal (string-append (param "HOME") "/.npmrc"))
+  (literal (string-append (param "HOME") "/.pypirc"))
+  (literal (string-append (param "HOME") "/.docker/config.json"))
+  (subpath (string-append (param "HOME") "/.kube"))
+  (subpath (string-append (param "HOME") "/.gnupg")))

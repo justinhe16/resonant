@@ -858,6 +858,16 @@ def test_runner_dirs_validated(tmp_path: Path) -> None:
     ]:
         with pytest.raises(ValidationError, match="overlap"):
             RunnerConfig(mirror_dir=mirror, work_dir=work, cache_dir=cache)
+    cfg = RunnerConfig(
+        work_dir=tmp_path / "w", cache_dir=tmp_path / "c", deny_read=[tmp_path / "link" / "k"]
+    )
+    assert cfg.deny_read == [real / "k"]
+    assert RunnerConfig().deny_read == []
+    with pytest.raises(ValidationError, match="absolute"):
+        RunnerConfig(deny_read=[Path("relative")])
+    for denied in (tmp_path / "w", tmp_path, tmp_path / "w" / "x", tmp_path / "c"):
+        with pytest.raises(ValidationError, match="deny_read"):
+            RunnerConfig(work_dir=tmp_path / "w", cache_dir=tmp_path / "c", deny_read=[denied])
     with pytest.raises(ValidationError):
         RunnerRepo(remote="github.com/own/..")
     with pytest.raises(ValidationError):

@@ -763,6 +763,7 @@ class ClaudeRunner:
             secrets_dir=self.cfg.secrets_dir,
             read_paths=self._read_paths,
             deny_exec=default_deny_exec(),
+            deny_read=tuple(self.cfg.deny_read),
         )
 
     def _cached_self_check(self, params: SandboxParams) -> tuple[bool, str]:
