@@ -59,7 +59,7 @@ async def test_slug_registers_a_pushable_repo_once(db: sqlite3.Connection) -> No
     assert (r.slug, r.name, r.source, r.mode, r.ci) == ("Me/Proj", "proj", "auto", "push", False)
     again = await resolver.resolve("https://github.com/ME/proj", gh)
     assert again == Resolved(r, new=False)
-    assert gh.calls == ["repo_info me/proj"]  # the second time needs no GitHub
+    assert gh.calls == ["repo_info me/proj", "is_protected Me/Proj main"]  # then no GitHub
 
 
 async def test_public_repo_without_push_is_fork_mode(db: sqlite3.Connection) -> None:

@@ -567,16 +567,18 @@ async def test_other_refusals(h: Harness) -> None:
     assert runs_store.recent(h.conn) == []
 
 
-async def test_a_repo_without_ci_fails_the_run(tmp_path: Path, db: sqlite3.Connection) -> None:
+async def test_a_repo_without_ci_still_runs_and_the_reply_says_so(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
     h = build(tmp_path, db, ci=False)
     await h.start()
     await h.drain()
     run = h.run()
-    assert run.status == "failed" and "no CI" in (run.failure or "")
-    assert h.chan.texts() == [f"R1 failed: {run.failure}"]
-    assert not h.code_dir("R1").exists() and h.gh_calls() == []
-    task = task_store.get_task(h.conn, cast(str, run.task_id))
-    assert task is not None and task.status == "failed"
+    assert run.status == "ready"
+    [text] = h.chan.texts()
+    assert "no CI: proj has no pull_request workflow." in text and "/merge" not in text
+    repo = repo_store.find(db, "proj")
+    assert repo is not None and repo.ci is False
 
 
 async def test_sandbox_self_check_fails_closed(tmp_path: Path, db: sqlite3.Connection) -> None:

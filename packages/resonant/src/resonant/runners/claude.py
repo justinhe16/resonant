@@ -222,8 +222,9 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def reply_text(run: Run) -> str | None:
-    """The message for an ended run (None for a state that has none)."""
+def reply_text(run: Run, *, no_ci: bool = False) -> str | None:
+    """The message for an ended run (None for a state that has none). ``no_ci``: the repo has
+    no pull_request workflow, so the run can't be merged from here."""
     took = fmt_duration(run.session_seconds)
     summary = f"\n{run.code}: {run.summary}" if run.summary else ""
     match run.status:
@@ -232,6 +233,8 @@ def reply_text(run: Run) -> str | None:
             text = f"{run.code} done: PR #{run.pr_number} · {run.pr_url} · {files} · {took}"
             if run.flag_line:
                 text += f"\n{run.flag_line}"
+            if no_ci:
+                return text + f"\nno CI: {run.repo} has no pull_request workflow." + summary
             return text + f"\n/merge {run.code} when CI is green." + summary
         case "no_changes":
             return f"{run.code}: no changes." + (f" {run.summary}" if run.summary else "")
@@ -485,6 +488,10 @@ class ClaudeRunner:
 
     def _gh_github(self, secrets: RunnerSecrets) -> GitHub:
         return GhGitHub(self.workspace, secrets)
+
+    def github_for(self, secrets: RunnerSecrets) -> GitHub:
+        """The GitHub client for the repo tools (``tools/repos.py``)."""
+        return self._github(secrets)
 
     # -- lifecycle --
 
@@ -1186,7 +1193,8 @@ class ClaudeRunner:
         return Done({"run": run.code, "status": run.status})
 
     async def _send_reply(self, run: Run) -> None:
-        text = reply_text(run)
+        repo = repo_store.find(self.conn, run.repo)
+        text = reply_text(run, no_ci=repo is not None and repo.mode == "push" and repo.ci is False)
         if text is None:
             return
         try:

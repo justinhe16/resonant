@@ -1,0 +1,367 @@
+"""Creating repos, starter CI and the repo tools (RP-4), with a fake ``gh`` and fake GitHub."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import shutil
+import sqlite3
+from collections.abc import Callable, Iterator, Sequence
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+from resonant.api import DaemonState
+from resonant.components import Components, build_components
+from resonant.config import RunnerConfig, Settings, load_settings
+from resonant.loop import Loop, SlotPool
+from resonant.runner import create
+from resonant.runner.checks import runs_on_pull_request
+from resonant.runner.create import CreateError, Creator, valid_repo_name
+from resonant.runner.resolve import FakeGitHub, RepoInfo, Resolved, Resolver
+from resonant.runner.workspace import Exec
+from resonant.secrets import RunnerSecrets
+from resonant.store import repos
+from resonant.store import runs as runs_store
+from resonant.store.db import utcnow
+
+REPO = Path(__file__).resolve().parents[1]
+SECRETS = RunnerSecrets("ghp_" + "a" * 36, "claude", None)
+Reply = tuple[int, str, str]
+Rule = Reply | Callable[[Sequence[str]], Reply]
+SCRATCH = json.dumps({"full_name": "me/scratch", "default_branch": "main"})
+
+
+class FakeGh:
+    """``Workspace.gh``: records each call and answers from ``rules`` (longest prefix wins)."""
+
+    def __init__(self, rules: dict[str, Rule] | None = None) -> None:
+        self.calls: list[tuple[tuple[str, ...], bytes | None]] = []
+        base: dict[str, Rule] = {
+            "api user": (0, "me\n", ""),
+            "repo create": (0, "https://github.com/me/scratch\n", ""),
+            "api repos/me/scratch": (0, SCRATCH, ""),
+            "api -X PUT repos/me/scratch/contents/": (0, "{}", ""),
+            "api -X PUT repos/me/scratch/branches/main/protection": (0, "{}", ""),
+        }
+        self.rules = {**base, **(rules or {})}
+
+    async def gh(
+        self, args: Sequence[str], secrets: RunnerSecrets, *, stdin: bytes | None = None
+    ) -> Exec:
+        self.calls.append((tuple(args), stdin))
+        line = " ".join(args)
+        for prefix, reply in sorted(self.rules.items(), key=lambda kv: -len(kv[0])):
+            if line.startswith(prefix):
+                code, out, err = reply(args) if callable(reply) else reply
+                return Exec(code, out.encode(), err)
+        return Exec(1, b"", "HTTP 404 unexpected call")
+
+    def lines(self) -> list[str]:
+        return [" ".join(a) for a, _ in self.calls]
+
+
+def puts(gh: FakeGh) -> list[dict[str, str]]:
+    """The ``-f key=value`` fields and path of each contents PUT."""
+    out: list[dict[str, str]] = []
+    for args, _ in gh.calls:
+        if "PUT" in args and any("/contents/" in a for a in args):
+            fields = dict(a.split("=", 1) for a in args if "=" in a and not a.startswith("repos"))
+            fields["path"] = next(a for a in args if "/contents/" in a).split("/contents/")[1]
+            out.append(fields)
+    return out
+
+
+# --- the template ------------------------------------------------------------------------
+
+
+def test_template_matches_its_checksum_and_runs_on_pull_request() -> None:
+    data = create.CI_TEMPLATE_PATH.read_bytes()
+    assert hashlib.sha256(data).hexdigest() == create.CI_TEMPLATE_SHA256
+    text = data.decode()
+    assert runs_on_pull_request(text)
+    assert "./ci.sh" in text and "push:" in text
+    for line in text.splitlines():
+        if "uses:" in line:
+            assert len(line.split("@")[1].split()[0]) == 40  # a full commit sha
+
+
+def test_a_changed_template_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    changed = tmp_path / "ci.yml"
+    changed.write_text(create.CI_TEMPLATE_PATH.read_text() + "# extra\n")
+    monkeypatch.setattr(create, "CI_TEMPLATE_PATH", changed)
+    with pytest.raises(CreateError, match="checksum"):
+        create.ci_template()
+
+
+@pytest.mark.parametrize("name", ["scratch", "a.b_c-d", "x" * 100, "..a", "a.git.b"])
+def test_valid_names(name: str) -> None:
+    assert valid_repo_name(name) is None
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "x" * 101, "a b", "a/b", "-a", "a.git", "é"])
+def test_invalid_names(name: str) -> None:
+    assert valid_repo_name(name) is not None
+
+
+# --- create_repo -------------------------------------------------------------------------
+
+
+async def test_create_repo_pushes_readme_and_ci_protects_and_registers(
+    db: sqlite3.Connection,
+) -> None:
+    gh = FakeGh()
+    made = await Creator(db, gh, SECRETS).create_repo("scratch", "My scratch pad")
+    assert made.repo.slug == "me/scratch"
+    r = repos.get(db, "me/scratch")
+    assert r is not None
+    assert (r.source, r.mode, r.ci, r.base) == ("created", "push", True, "main")
+    create_call = next(a for a, _ in gh.calls if a[:2] == ("repo", "create"))
+    assert create_call == ("repo", "create", "scratch", "--private", "--description=My scratch pad")
+    files = puts(gh)
+    assert [f["path"] for f in files] == ["README.md", create.CI_PATH]
+    assert base64.b64decode(files[1]["content"]) == create.CI_TEMPLATE_PATH.read_bytes()
+    assert b"My scratch pad" in base64.b64decode(files[0]["content"])
+    assert all(f["branch"] == "main" for f in files)
+    protect = next((a, s) for a, s in gh.calls if a[-2:] == ("--input", "-"))
+    body = json.loads(protect[1] or b"")
+    assert body["required_status_checks"]["contexts"] == ["ci"]
+    assert body["required_pull_request_reviews"] is not None
+    assert body["allow_force_pushes"] is False and body["allow_deletions"] is False
+    assert made.protection.startswith("main is protected")
+    assert not any(SECRETS.github_token in " ".join(a) for a, _ in gh.calls)  # never in argv
+
+
+async def test_public_when_asked(db: sqlite3.Connection) -> None:
+    gh = FakeGh()
+    await Creator(db, gh, SECRETS).create_repo("scratch", private=False)
+    assert any(line.startswith("repo create scratch --public") for line in gh.lines())
+
+
+async def test_protection_refused_on_a_free_plan_is_reported_not_fatal(
+    db: sqlite3.Connection,
+) -> None:
+    refusal: Reply = (1, "", "gh: Upgrade to GitHub Pro (HTTP 403)")
+    gh = FakeGh({"api -X PUT repos/me/scratch/branches/main/protection": refusal})
+    made = await Creator(db, gh, SECRETS).create_repo("scratch")
+    assert "protection not available on this plan" in made.protection
+    assert repos.get(db, "me/scratch") is not None
+
+
+async def test_invalid_name_creates_nothing(db: sqlite3.Connection) -> None:
+    gh = FakeGh()
+    with pytest.raises(CreateError):
+        await Creator(db, gh, SECRETS).create_repo("../evil")
+    assert gh.calls == []
+
+
+async def test_create_failure_and_partial_failure(db: sqlite3.Connection) -> None:
+    exists = FakeGh({"repo create": (1, "", "Name already exists on this account")})
+    with pytest.raises(CreateError, match="already exists"):
+        await Creator(db, exists, SECRETS).create_repo("scratch")
+    broken = FakeGh({"api -X PUT repos/me/scratch/contents/": (1, "", "HTTP 403 workflows")})
+    with pytest.raises(CreateError, match="Created me/scratch but"):
+        await Creator(db, broken, SECRETS).create_repo("scratch")
+    assert repos.get(db, "me/scratch") is None  # not registered half-made
+
+
+# --- add_ci ------------------------------------------------------------------------------
+
+SHA = "a" * 40
+PR = "https://github.com/me/proj/pull/7"
+
+
+def add_proj(db: sqlite3.Connection) -> repos.Repo:
+    return repos.add(db, "me/proj", base="main", source="owner", ci=False)
+
+
+def ci_gh() -> FakeGh:
+    return FakeGh(
+        {
+            "pr list": (0, "[]", ""),
+            "api repos/me/proj/git/ref/heads/main": (0, SHA + "\n", ""),
+            "api -X POST repos/me/proj/git/refs": (0, "{}", ""),
+            "api -X PUT repos/me/proj/contents/": (0, "{}", ""),
+            "pr create": (0, PR + "\n", ""),
+        }
+    )
+
+
+def no_ci_github(has_ci: bool = False) -> FakeGitHub:
+    return FakeGitHub([RepoInfo("me/proj", "main", False, True, has_ci)])
+
+
+async def test_add_ci_opens_a_pr_with_only_the_template(db: sqlite3.Connection) -> None:
+    add_proj(db)
+    gh = ci_gh()
+    pr = await Creator(db, gh, SECRETS).add_ci("proj", no_ci_github())
+    assert (pr.number, pr.url, pr.already) == (7, PR, False)
+    files = puts(gh)
+    assert [(f["path"], f["branch"]) for f in files] == [(create.CI_PATH, "resonant/add-ci")]
+    assert base64.b64decode(files[0]["content"]) == create.CI_TEMPLATE_PATH.read_bytes()
+    pr_create = next(a for a, _ in gh.calls if a[:2] == ("pr", "create"))
+    assert "resonant/add-ci" in pr_create and "main" in pr_create
+
+
+async def test_add_ci_reuses_an_open_pr(db: sqlite3.Connection) -> None:
+    add_proj(db)
+    gh = ci_gh()
+    gh.rules["pr list"] = (0, json.dumps([{"number": 7, "url": PR}]), "")
+    pr = await Creator(db, gh, SECRETS).add_ci("proj", no_ci_github())
+    assert pr.number == 7 and puts(gh) == []
+
+
+async def test_add_ci_notices_ci_that_has_appeared(db: sqlite3.Connection) -> None:
+    add_proj(db)
+    gh = ci_gh()
+    pr = await Creator(db, gh, SECRETS).add_ci("proj", no_ci_github(True))
+    assert pr.already and gh.calls == []
+    r = repos.get(db, "me/proj")
+    assert r is not None and r.ci is True
+
+
+async def test_add_ci_refuses_fork_and_unknown_repos(db: sqlite3.Connection) -> None:
+    repos.add(db, "up/stream", base="main", source="auto", mode="fork")
+    creator = Creator(db, ci_gh(), SECRETS)
+    with pytest.raises(CreateError, match="upstream"):
+        await creator.add_ci("stream", FakeGitHub())
+    with pytest.raises(CreateError, match="No registered repo"):
+        await creator.add_ci("nope", FakeGitHub())
+
+
+# --- the protection warning on registration ----------------------------------------------
+
+
+async def test_registering_an_unprotected_push_repo_warns(db: sqlite3.Connection) -> None:
+    gh = FakeGitHub([RepoInfo("me/proj", "main", False, True, True)], protected=False)
+    got = await Resolver(db).resolve("me/proj", gh)
+    assert isinstance(got, Resolved) and got.warning == "main isn't protected"
+    assert "is_protected me/proj main" in gh.calls
+    again = await Resolver(db).resolve("me/proj", gh)
+    assert isinstance(again, Resolved) and again.warning is None
+
+
+@pytest.mark.parametrize(("protected", "push"), [(True, True), (None, True), (False, False)])
+async def test_protected_unknown_and_fork_repos_do_not_warn(
+    db: sqlite3.Connection, protected: bool | None, push: bool
+) -> None:
+    gh = FakeGitHub([RepoInfo("me/a", "main", False, push, True)], protected=protected)
+    got = await Resolver(db).resolve("me/a", gh)
+    assert isinstance(got, Resolved) and got.warning is None
+
+
+# --- tools -------------------------------------------------------------------------------
+
+
+class FakeClaude:
+    def __init__(self, ws: FakeGh, github: FakeGitHub, resolver: Resolver) -> None:
+        self.workspace = ws
+        self.secrets = object()
+        self.github = github
+        self.resolver = resolver
+
+    async def setup_missing(self) -> str | None:
+        return None
+
+    def github_for(self, secrets: RunnerSecrets) -> FakeGitHub:
+        return self.github
+
+
+@pytest.fixture
+def settings() -> Settings:
+    base = load_settings()
+    return base.model_copy(update={"runner": RunnerConfig(), "dry_run": False})
+
+
+@pytest.fixture
+def components(settings: Settings, db: sqlite3.Connection) -> Iterator[Components]:
+    shutil.copy(REPO / "config/principals.example.yaml", settings.principals_path)
+    state = DaemonState(settings, db, Loop(db, {}, settings.loop, SlotPool(2, 1)), utcnow())
+    state.components = build_components(settings, db, state)
+    yield state.components
+
+
+@pytest.fixture
+def claude(
+    components: Components, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> FakeClaude:
+    async def fake_secrets(store: object) -> RunnerSecrets:
+        return SECRETS
+
+    monkeypatch.setattr("resonant.tools.repos.load_runner_secrets", fake_secrets)
+    github = FakeGitHub([RepoInfo("me/proj", "main", False, True, True)])
+    fake = FakeClaude(FakeGh(), github, Resolver(db))
+    components.runners["claude"] = cast(Any, fake)
+    return fake
+
+
+async def call(components: Components, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    data = await components.handlers[(None, name)](args)
+    json.dumps(data, allow_nan=False)
+    return data
+
+
+def test_levels(components: Components) -> None:
+    expected = {
+        "create_repo": "L2",
+        "add_ci": "L2",
+        "list_repos": "L0",
+        "add_repo": "L3",
+        "forget_repo": "L3",
+    }
+    for name, level in expected.items():
+        spec = components.registry.get(None, name)
+        assert spec is not None and spec.effective_level.name == level
+
+
+async def test_create_repo_tool(components: Components, claude: FakeClaude) -> None:
+    out = await call(components, "create_repo", {"name": "scratch", "description": "d"})
+    assert out["created"] is True and out["slug"] == "me/scratch" and out["private"] is True
+    assert out["text"].startswith("Created me/scratch")
+    bad = await call(components, "create_repo", {"name": "a b"})
+    assert bad["created"] is False and "letters" in bad["text"]
+
+
+async def test_tools_without_a_runner(components: Components) -> None:
+    out = await call(components, "create_repo", {"name": "x"})
+    assert out["created"] is False and "isn't running" in out["text"]
+
+
+async def test_add_repo_list_and_forget(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    claude.github.protected = False
+    out = await call(components, "add_repo", {"repo": "me/proj", "name": "p"})
+    assert out["added"] and out["new"] and out["name"] == "proj"
+    assert out["warning"] == "main isn't protected" and "Heads up" in out["text"]
+    listed = await call(components, "list_repos", {})
+    assert listed["repos"] == [
+        {"name": "proj", "slug": "me/proj", "mode": "push", "ci": True, "source": "auto"}
+    ]
+    assert repos.find(db, "p") is not None  # the alias works
+    missing = await call(components, "add_repo", {"repo": "me/none"})
+    assert missing == {"added": False, "text": "No access to me/none."}
+
+    run = runs_store.create(
+        db, repo="proj", ask="x", principal="owner", session_id="s", max_seconds=60
+    )
+    refused = await call(components, "forget_repo", {"repo": "p"})
+    assert refused["forgot"] is False and run.code in refused["text"]
+    runs_store.update(db, run.code, status="failed")
+    done = await call(components, "forget_repo", {"repo": "p"})
+    assert done["forgot"] is True and repos.list_all(db) == []
+    assert (await call(components, "forget_repo", {"repo": "p"}))["forgot"] is False
+
+
+async def test_add_ci_tool(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    add_proj(db)
+    claude.workspace.rules.update(ci_gh().rules)
+    claude.github.known["me/proj"] = RepoInfo("me/proj", "main", False, True, False)
+    out = await call(components, "add_ci", {"repo": "proj"})
+    assert out["opened"] is True and out["pr_url"] == PR
+    again = await call(components, "add_ci", {"repo": "nope"})
+    assert again["opened"] is False
