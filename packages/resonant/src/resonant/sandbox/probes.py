@@ -754,17 +754,23 @@ def p_ports(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_bind_dev_server(ctx: ProbeContext) -> tuple[Status, str]:
-    """A localhost dev server on another port works (http.server on a free port + a client)."""
-    code = (
-        "import http.server, threading, urllib.request\n"
-        "srv = http.server.HTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler)\n"
-        "threading.Thread(target=srv.serve_forever, daemon=True).start()\n"
-        "url = 'http://127.0.0.1:%d/' % srv.server_port\n"
-        "code = urllib.request.urlopen(url, timeout=5).status\n"
-        "out(status=code)\n"
+    """A localhost dev server on another port works (a listener on a free port + a client)."""
+    code = (  # raw sockets: http.server's getfqdn can stall on hosts without DNS
+        "import threading\n"
+        "srv = socket.socket()\n"
+        "srv.bind(('127.0.0.1', 0))\n"
+        "srv.listen(1)\n"
+        "def serve():\n"
+        "    c, _ = srv.accept()\n"
+        "    c.sendall(c.recv(16))\n"
+        "    c.close()\n"
+        "threading.Thread(target=serve, daemon=True).start()\n"
+        "cl = socket.create_connection(srv.getsockname(), timeout=5)\n"
+        "cl.sendall(b'ping')\n"
+        "out(status=200 if cl.recv(16) == b'ping' else 0)\n"
     )
     data = ctx.snippet(code)
-    return ("pass", "served on loopback") if data["status"] == 200 else ("fail", f"{data}")
+    return ("pass", "echo server on loopback") if data["status"] == 200 else ("fail", f"{data}")
 
 
 def p_unix_socket(ctx: ProbeContext) -> tuple[Status, str]:
