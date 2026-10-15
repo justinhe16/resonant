@@ -194,3 +194,10 @@ GitHub's fine-grained tokens can't open PRs on repos outside your own account. R
 Pushing `.github/workflows/*` needs the Workflows permission. Phase 5a left it out on purpose, as defense in depth. The options:
 - (a) Grant Workflows. Resonant can then add starter CI to new repos and to repos without CI, but only through that one fixed template file (checked by hash), always behind a `yes`. Session-made `.github` edits stay refused.
 - (b) No Workflows. New repos are generated from a template repo that already has CI; this still needs checking. Existing repos without CI need you to add CI by hand.
+
+## Carry-overs between tickets
+
+- **For RP-6:**
+  - Wire a way to merge the add-CI PR. It isn't a run, so `merge_run` can't reach it. `Workspace.merge` already allows it when the PR adds only the starter CI file. A good shape is a `merge_ci_pr(repo)` tool or a `/repo ci <repo> merge` command, with a plain `yes`.
+  - Surface `Resolved.note`, which carries the `via <ext>` text, and `Resolved.warning` in the `start_run` and `add_repo` replies.
+- **For RP-7:** confirm `create_repo` against live GitHub: `gh repo create --add-readme`, then the CI file written to the default branch, then protection. It has only been tested with the fake `gh`.

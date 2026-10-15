@@ -533,18 +533,20 @@ async def test_r14_missing_token_only(
 # --- refusals: no CI, .github, a token in the diff -------------------------------------------
 
 
-async def test_no_ci_repo_is_refused(
+async def test_no_ci_repo_runs_but_cannot_be_merged(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     w = make_world(tmp_path, resonant_home, chat, monkeypatch, ci=False)
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
-        failed = await w.next_text()
-        assert failed == (
-            "R1 failed: demo has no CI on pull_request; the runner only works in repos with CI"
+        done = await w.next_text()
+        assert done.startswith("R1 done: PR #41") and "no CI: demo has no pull_request" in done
+        assert w.run().status == "ready"
+        assert await w.say("/merge R1") == (
+            "R1 not merged: own/demo has no CI; add a pull_request workflow first "
+            "(or ask me to add CI)."
         )
-        assert w.run().status == "failed" and w.branches() == ["main"]
-        assert not (w.tmp() / "claude.pid").exists()  # the session never started
+        assert w.gh_calls("merge") == [] and w.run().status == "ready"
 
 
 async def test_r4_a_github_change_cannot_be_merged(

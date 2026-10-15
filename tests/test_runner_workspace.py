@@ -1058,18 +1058,15 @@ def test_git_env_does_not_follow_redirects() -> None:
     assert pairs["http.followRedirects"] == "false"
 
 
-async def test_repo_without_ci_is_refused(tmp_path: Path) -> None:
+async def test_repo_without_ci_is_prepared_and_recorded(tmp_path: Path) -> None:
     env = Env(tmp_path, ci=False)
-    with pytest.raises(RunnerError) as e:
-        await env.prepare()
-    assert str(e.value) == (
-        "proj has no CI on pull_request; the runner only works in repos with CI"
-    )
-    assert not (env.cfg.work_dir / "R1").exists()
+    await env.prepare()
+    repo = repo_store.find(env.conn, "proj")
+    assert repo is not None and repo.ci is False
     assert await env.ws.repo_has_ci("proj", github_token=GH_TOKEN) is False
 
 
-async def test_repo_with_push_only_ci_is_refused(tmp_path: Path) -> None:
+async def test_repo_with_push_only_ci_counts_as_no_ci(tmp_path: Path) -> None:
     env = Env(tmp_path, ci=False)
     seed = tmp_path / "seed"
     (seed / ".github" / "workflows").mkdir(parents=True)
@@ -1077,8 +1074,48 @@ async def test_repo_with_push_only_ci_is_refused(tmp_path: Path) -> None:
     git(seed, "add", "-A")
     git(seed, "commit", "-q", "-m", "ci on push only")
     git(seed, "push", "-q", str(env.remote), "main")
-    with pytest.raises(RunnerError, match="no CI on pull_request"):
-        await env.prepare()
+    await env.prepare()
+    repo = repo_store.find(env.conn, "proj")
+    assert repo is not None and repo.ci is False
+
+
+async def test_merge_is_refused_without_ci_after_a_live_recheck(tmp_path: Path) -> None:
+    env = Env(tmp_path, ci=False)
+    p, head = await env.open_pr()
+    with pytest.raises(MergeRefused, match="has no CI; add a pull_request workflow first"):
+        await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
+    assert env.gh_calls("merge") == []
+    # CI appears on the remote: the recheck finds it, records it and the merge goes on.
+    seed = tmp_path / "seed"
+    (seed / ".github" / "workflows").mkdir(parents=True)
+    (seed / ".github" / "workflows" / "ci.yml").write_text("on:\n  pull_request:\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "ci")
+    git(seed, "push", "-q", str(env.remote), "main")
+    await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
+    repo = repo_store.find(env.conn, "proj")
+    assert repo is not None and repo.ci is True
+
+
+async def test_merge_allows_the_starter_ci_pr_in_a_repo_without_ci(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from resonant.runner import create
+
+    env = Env(tmp_path, ci=False)
+    p, head = await env.open_pr()
+    verdict = {"ci_only": True}
+
+    async def fake(run: Any, slug: str, number: int, sha: str) -> bool:
+        assert (slug, number, sha) == ("own/proj", 41, head)
+        return verdict["ci_only"]
+
+    monkeypatch.setattr(create, "adds_only_starter_ci", fake)
+    await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
+    assert len(env.gh_calls("merge")) == 1
+    verdict["ci_only"] = False
+    with pytest.raises(MergeRefused, match="has no CI"):
+        await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
 
 
 async def test_repo_has_ci(env: Env) -> None:

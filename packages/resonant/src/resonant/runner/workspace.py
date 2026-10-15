@@ -66,6 +66,7 @@ from resonant.runner.checks import (
 from resonant.runner.cleanup import RUN_CODE, rmtree_nofollow
 from resonant.secrets import RunnerSecrets
 from resonant.store import repos as repo_store
+from resonant.store.db import atomic
 from resonant.store.repos import Repo
 
 UPSTREAM_LATER = "Upstream PRs come in a later update."
@@ -601,9 +602,10 @@ class Workspace:
                 return False
 
     async def prepare(self, code: str, repo_name: str, ask: str, *, github_token: str) -> Prepared:
-        """Refresh the mirror, check the repo has CI, clone it into ``<work_dir>/<code>/repo``
-        and branch, with the credential helper set (and an empty ``creds`` dir for it). The
-        only daemon-side git in the clone, and it happens before the session exists.
+        """Refresh the mirror, note whether the repo has CI, clone it into
+        ``<work_dir>/<code>/repo`` and branch, with the credential helper set (and an empty
+        ``creds`` dir for it). The only daemon-side git in the clone, and it happens before
+        the session exists.
 
         Invariant for the sandbox (P5A-1 probes it): the only sandbox-writable path is
         ``<work_dir>/<code>`` (plus the cache), so ``work_dir`` and the mirror dir are never
@@ -630,10 +632,10 @@ class Workspace:
                 has_ci = await ci_present(git, base_sha)
             except GitError:
                 has_ci = False
-            if not has_ci:
-                raise RunnerError(
-                    f"{repo_name} has no CI on pull_request; the runner only works in repos with CI"
-                )
+            # No CI is allowed (docs/repos-plan.md D5): the registry records it, the run's
+            # reply says so, and merging is what's refused.
+            with atomic(self.conn):
+                repo_store.set_ci(self.conn, repo.slug, has_ci)
 
             run_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             await asyncio.to_thread(rmtree_nofollow, run_dir)
@@ -1025,6 +1027,30 @@ class Workspace:
 
     # -- merge --
 
+    async def _is_starter_ci_pr(
+        self, repo: Repo, pr_number: int, head_sha: str, secrets: RunnerSecrets
+    ) -> bool:
+        """The add-CI PR (only the starter workflow, hash-checked on the PR head) may merge
+        into a repo that has no CI yet."""
+        from resonant.runner.create import adds_only_starter_ci
+
+        async def run(args: Sequence[str]) -> tuple[int, bytes]:
+            res = await self._gh(args, secrets)
+            return res.returncode, res.stdout
+
+        return await adds_only_starter_ci(run, repo.slug, pr_number, head_sha)
+
+    async def _recheck_ci(self, repo: Repo, secrets: RunnerSecrets) -> bool:
+        """Look again before refusing a merge for no CI: it may have been added since. Records
+        what it finds. Fails closed."""
+        try:
+            has_ci = await self.repo_has_ci(repo.name, github_token=secrets.github_token)
+        except GitError:
+            return False
+        with atomic(self.conn):
+            repo_store.set_ci(self.conn, repo.slug, has_ci)
+        return has_ci
+
     async def merge(
         self,
         repo_name: str,
@@ -1044,6 +1070,14 @@ class Workspace:
         repo = self._repo(repo_name)
         if not _SHA.fullmatch(head_sha) or pr_number < 1:
             raise MergeRefused("bad PR reference")
+        if (
+            repo.ci is False
+            and not await self._recheck_ci(repo, secrets)
+            and not await self._is_starter_ci_pr(repo, pr_number, head_sha, secrets)
+        ):
+            raise MergeRefused(
+                f"{repo.slug} has no CI; add a pull_request workflow first (or ask me to add CI)."
+            )
         try:
             result = await self.check_pr(
                 repo_name, pr_number, branch, secrets, expect_head=head_sha

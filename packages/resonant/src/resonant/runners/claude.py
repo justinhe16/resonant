@@ -245,9 +245,10 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def reply_text(run: Run, ci: str | None = None) -> str | None:
+def reply_text(run: Run, ci: str | None = None, *, no_ci: bool = False) -> str | None:
     """The message for an ended run (None for a state that has none). ``ci`` is the PR's CI
-    as a word (``green``, ``red``, ``pending``, ``none``), looked up when the reply is sent."""
+    as a word (``green``, ``red``, ``pending``, ``none``), looked up when the reply is sent.
+    ``no_ci``: the repo has no pull_request workflow, so the run can't be merged from here."""
     took = fmt_duration(run.session_seconds)
     summary = f"\n{run.code}: {run.summary}" if run.summary else ""
     match run.status:
@@ -261,6 +262,8 @@ def reply_text(run: Run, ci: str | None = None) -> str | None:
                 text += f"\n{run.flag_line}"
             if run.failure:  # the merge-time checks already refuse it
                 text += f"\n⚠ it can't be merged as it is: {run.failure}"
+            if no_ci:
+                return text + f"\nno CI: {run.repo} has no pull_request workflow." + summary
             hint = "to merge it" if ci == "green" else "when CI is green"
             return text + f"\n/merge {run.code} {hint}." + summary
         case "no_changes":
@@ -524,6 +527,10 @@ class ClaudeRunner:
 
     def _gh_github(self, secrets: RunnerSecrets) -> GitHub:
         return GhGitHub(self.workspace, secrets)
+
+    def github_for(self, secrets: RunnerSecrets) -> GitHub:
+        """The GitHub client for the repo tools (``tools/repos.py``)."""
+        return self._github(secrets)
 
     # -- lifecycle --
 
@@ -1382,7 +1389,9 @@ class ClaudeRunner:
         return None if state == "error" else state
 
     async def _send_reply(self, run: Run) -> None:
-        text = reply_text(run, await self._ci_word(run))
+        repo = repo_store.find(self.conn, run.repo)
+        no_ci = repo is not None and repo.mode == "push" and repo.ci is False
+        text = reply_text(run, await self._ci_word(run), no_ci=no_ci)
         if text is None:
             return
         try:
