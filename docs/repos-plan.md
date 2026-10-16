@@ -1,5 +1,7 @@
 # Repos plan: the runner works on any repo, like a person at a computer
 
+> **Historical.** RP-1, RP-4, RP-5, RP-8 and RP-9 shipped. RP-9's secret-file name rules were later dropped by the thin guard (EM-1), and the remaining waves (RP-2, RP-3, RP-6, RP-7, the RP-10 grants) never shipped as planned: [`employee-plan.md`](employee-plan.md) replaced them (fork mode in EM-7, the router in EM-8). For what exists now, read `employee-plan.md`, [`architecture.md`](architecture.md) and [`interfaces.md`](interfaces.md).
+
 Status: RP-1, RP-4, RP-5, RP-8 and RP-9 are merged. The remaining waves are superseded by [`employee-plan.md`](employee-plan.md) (2026-10-15). Builds on [`phase5a-plan.md`](phase5a-plan.md).
 
 Phase 5a lets the runner work only on repos named in `runner.repos` in the config file. This plan removes that fixed list:

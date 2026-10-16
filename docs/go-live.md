@@ -10,7 +10,7 @@ Re-check the automated parts at any time. The check is read-only: it installs no
 scripts/bootstrap.sh --check
 ```
 
-It prints `PASS`, `FAIL` or `SKIP` for each step and exits non-zero if a required step fails. Steps whose command hasn't shipped yet print `SKIP (available after Phase 1)`. A `FAIL ... (advisory)` line is worth fixing but doesn't fail the check.
+It prints `PASS`, `FAIL` or `SKIP` for each step and exits non-zero if a required step fails. A `FAIL ... (advisory)` line is worth fixing but doesn't fail the check.
 
 Paths below assume the defaults: the repo in `~/resonant` and runtime state in `~/.resonant`. `resonant` means `~/resonant/.venv/bin/resonant` if it isn't on your `PATH`.
 
@@ -114,7 +114,7 @@ Not set up yet: planned as the status relay (see [`followups.md`](followups.md#s
 Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:30b-a3b-instruct-2507-q4_K_M`, ~19 GB). Use an instruct (non-thinking) build: plain `qwen3:30b-a3b` is the thinking-only Thinking-2507 build, and the probe's tool-call check fails on it.
 
 - **Verify:** `resonant model probe`, then `resonant model bench`
-- **Expected:** the probe reports the model is loaded with the configured context length, and exits 0. The bench prints latency and tokens/sec. **Record the numbers** (date, model, macOS version) in your notes so regressions are visible. `--check` runs the probe (required). Until it ships, `--check` prints `model probe  SKIP (available after Phase 1)`. In the meantime, `curl -s http://127.0.0.1:11434/api/tags` should list the model.
+- **Expected:** the probe reports the model is loaded with the configured context length, and exits 0. The bench prints latency and tokens/sec. **Record the numbers** (date, model, macOS version) in your notes so regressions are visible. `--check` runs the probe (required). `curl -s http://127.0.0.1:11434/api/tags` should also list the model.
 
 ## 9. Router evals
 
@@ -146,7 +146,7 @@ cd ~/resonant && git switch main && git pull --ff-only && uv sync --frozen
 resonant daemon install   # also installs the keep-awake agent (step 2)
 ```
 
-`~/.resonant/logs/resonant.jsonl` shows `gate=policy dry_run=True`, and `scripts/bootstrap.sh --check` shows `store schema 5  PASS` and `dry_run  PASS  true`. Then text Resonant:
+`~/.resonant/logs/resonant.jsonl` shows `gate=policy dry_run=True`, and `scripts/bootstrap.sh --check` shows `store schema <n>  PASS` (the latest migration; 11 today) and `dry_run  PASS  true`. Then text Resonant:
 
 1. **Notes (no prompt).** `/note milk` → `Saved note 1: "milk"`. `/notes` → `Notes (1):` / `1. milk`. `/unnote 1` → `Deleted note 1.`. `/notes` → `No notes.`
 2. **L1 needs the code.** `/note a`, then `/notes clear` → `[D7] delete all 1 note? This can't be undone. Reply yes D7 / no`. A plain `yes` → `Reply yes D7 to confirm.` and nothing is deleted. `yes D7` → `Cleared 1 note.`. Repeat with `no` → `Not done.`
@@ -184,7 +184,7 @@ Then `resonant daemon install` and `resonant status` (`dry_run  False`). `--chec
 
 ## 12. Phase 3: extensions, jobs and the briefing
 
-Stage B of step 11 is done (`dry_run: false`). Deploy Phase 3 with `/update` (or `git pull --ff-only && uv sync --frozen` and `resonant daemon install`). `~/.resonant/logs/resonant.jsonl` shows `extensions=0` on start, and `scripts/bootstrap.sh --check` shows `store schema 5  PASS`, `extensions dir  PASS  none installed yet` and `briefing scheduled  PASS  daily 08:00 …; next …`.
+Stage B of step 11 is done (`dry_run: false`). Deploy Phase 3 with `/update` (or `git pull --ff-only && uv sync --frozen` and `resonant daemon install`). `~/.resonant/logs/resonant.jsonl` shows `extensions=0` on start, and `scripts/bootstrap.sh --check` shows `store schema <n>  PASS` (the latest migration; 11 today), `extensions dir  PASS  none installed yet` and `briefing scheduled  PASS  daily 08:00 …; next …`.
 
 The shipped manifests list the approver `owner`, so the owner in `~/.resonant/principals.yaml` must be named `owner`, as in step 4. Otherwise `ext add` refuses with `approver 'owner' is not a known principal`.
 
@@ -240,7 +240,7 @@ Only if you want them (see the github README). Edit the token: Actions **read an
 
 ## 13. Phase 3.5: the pulse
 
-Step 12 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen` and `resonant daemon install`). `scripts/bootstrap.sh --check` shows `store schema 5  PASS` and `pulse scheduled  PASS  hourly America/Los_Angeles; quiet 00:00-06:00; next …`. The pulse sends nothing until an installed extension with a `report:` grant reports something.
+Step 12 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen` and `resonant daemon install`). `scripts/bootstrap.sh --check` shows `store schema <n>  PASS` (the latest migration; 11 today) and `pulse scheduled  PASS  hourly America/Los_Angeles; quiet 00:00-06:00; next …`. The pulse sends nothing until an installed extension with a `report:` grant reports something.
 
 Times, codes and figures below are examples.
 
@@ -333,15 +333,17 @@ What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an
    CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check; unset T
    ```
 
-   Every row `PASS`, including `claude -p with CLAUDE_CODE_OAUTH_TOKEN` and `daemon env holds no secrets`. The token is in that one command's environment only: don't put it in a file, a command line or the LaunchAgent. Run `resonant sandbox check` again after every macOS update.
+   No row `FAIL`, and `claude -p with CLAUDE_CODE_OAUTH_TOKEN` and `daemon env holds no secrets` `PASS` (a `SKIP` whose control can't run here, such as no running Docker socket, is fine). The token is in that one command's environment only: don't put it in a file, a command line or the LaunchAgent. Run `resonant sandbox check` again after every macOS update.
 7. `scripts/bootstrap.sh --check`, all advisory:
+   - `runs table  PASS  schema v11` (or later);
    - `runner sandbox  PASS`;
    - `runner github app  PASS  app 123456, installation 78901234`;
    - `runner secret runner/github_token`, `runner secret runner/github_app_key` and `runner secret runner/claude_token (or runner/anthropic_key)`: `PASS  present (value not read)`;
    - `runner secret runner/github_public_token (fork runs)`: `PASS`, or `SKIP` if you skipped step 5;
    - `runner code dir`: `SKIP` until the first run creates `~/code` (it clones a repo there the first time it is used), then `PASS`;
    - `runner repos`: `SKIP` is fine. Repos don't need listing: they are registered the first time you name one (or `/repo add`). An entry in `runner.repos` is only a per-repo override (`path` for a checkout outside `~/code`, `allow_github_changes: false`, `base`);
-   - four `SKIP  owner step` rows: the first-run checks below and branch protection.
+   - four `SKIP  owner step` rows: the first-run checks below and branch protection;
+   - for each `runner.repos` entry, `runner repo <name> has CI`: `SKIP  no mirror yet` until its first run, then `PASS` (a `FAIL` means Resonant won't merge its runs until it has CI: `/repo ci <name>`).
 
 ### On GitHub, per repo you care about
 

@@ -8,7 +8,7 @@ Only you can do these: tokens, GitHub settings and the first real runs. Claude n
 
 - [ ] **github extension** (go-live 12, if not done yet): `resonant secret set github/token` (read-only fine-grained token), then `resonant ext add repo:github` (type `github`).
 - [ ] **Deploy and reinstall:** `/update`, then `resonant daemon install` (the LaunchAgent's new system-only PATH).
-- [ ] **Claude Code and `gh` installed** (`claude --version`; `gh` at `/opt/homebrew/bin/gh`), then `claude setup-token` → `resonant secret set runner/claude_token`.
+- [ ] **Claude Code and `gh` installed** (`claude --version`; `gh` at `/opt/homebrew/bin/gh`), then `claude setup-token` → `resonant secret set runner/claude_token` (or, for API billing, `resonant secret set runner/anthropic_key` and set `runner.max_budget_usd`).
 - [ ] **GitHub App:**
   1. github.com → Settings → Developer settings → GitHub Apps → New. Webhook off.
   2. Repository permissions: read and write Contents, Pull requests, Issues, Workflows, Actions; read-only Checks, Commit statuses, Metadata. **No Administration.**
@@ -17,12 +17,13 @@ Only you can do these: tokens, GitHub settings and the first real runs. Claude n
   5. Tell Claude the App ID and the installation ID (not secret; Claude adds `runner.github_app` and restarts).
 - [ ] **Resonant's own token:** fine-grained, your account, All repositories. Read and write Contents, Pull requests, Administration, Workflows; read-only Checks, Commit statuses, Metadata. → `resonant secret set runner/github_token`.
 - [ ] **Optional, for PRs to others' public repos:** a classic token with only `public_repo` → `resonant secret set runner/github_public_token`.
-- [ ] **Authenticated probe:** `read -rs T`, then `CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check; unset T`. Every row `PASS`.
-- [ ] **`scripts/bootstrap.sh --check`:** the runner rows `PASS` (`runner repos` and `runner code dir` may `SKIP`).
-- [ ] **On GitHub, per repo you care about:** branch protection (or a ruleset) on the base requiring a PR and CI, with the app not in the bypass list. Tell Claude "no CI edits in <repo>" where Actions secrets matter.
+- [ ] **Authenticated probe:** `read -rs T`, then `CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check; unset T`. No row `FAIL`, and `claude -p with CLAUDE_CODE_OAUTH_TOKEN` `PASS` (a `SKIP` such as no running Docker socket is fine).
+- [ ] **`scripts/bootstrap.sh --check`:** `runs table`, `runner sandbox`, `runner github app` and the three required `runner secret …` rows `PASS`. `runner repos`, `runner code dir`, the optional `runner/github_public_token` row and the four `owner step` rows may `SKIP`.
+- [ ] **On GitHub, per repo you care about:** branch protection (or a ruleset) on the base requiring a PR and CI, with the app not in the bypass list. Tell Claude "no CI edits in <repo>" where Actions secrets matter (Claude adds a `runner.repos` entry with `allow_github_changes: false`; see the `runner.repos` carry-over below).
 - [ ] **First real run, with Claude watching:** `/run <repo> <small ask>` on a repo with CI. The worker's `gh pr create` and `gh pr checks --watch` work with the App's token (PR by `<app>[bot]`); your checkout is untouched (go-live 14, first real run; `test.md` 39).
 - [ ] **The iMessage tests:** go-live 14, iMessage 2–11 (`test.md` 40–45): spawn in plain words and get the digest line, a question and its reply, a check and `yes always`, a rule that makes a merge ask, a scratch run, cancel and `/kill`.
 - [ ] **First fork run** (only with the `public_repo` token): the App mints a token for the new fork, and the upstream PR opens only after your `yes` (`test.md` 46).
+- [ ] **Optional tidy-up from the old runner:** drop `runner.max_bundle_mb` from `~/.resonant/config.yaml` if it is there (ignored now), and delete `~/.resonant/runner/mirrors/.incoming` if it exists (old bundle copies; nothing writes there any more).
 
 ## Status relay: dead-man switch and remote dashboard
 
@@ -87,13 +88,13 @@ Only you can do these: tokens, GitHub settings and the first real runs. Claude n
 
 *Deferred 2026-10-13, during Mac mini go-live. It needs real texts labelled by hand, and routing works well enough in day-to-day use for now.*
 
-**What.** `resonant eval router` measures how often the router picks the right intent (question, system, job_control, run_project, unknown). The synthetic set in `evals/` only proves the pipeline.
+**What.** `resonant eval router` measures how often the router picks the right intent (the built-in intents in `router/intents.py`, plus `extension:<name>`). The synthetic set in `evals/` only proves the pipeline.
 
 **To do.**
 - Collect 30-50 real texts sent to Resonant and label each with its intent in `~/.resonant/evals/router.jsonl`, in the format of `evals/router.example.jsonl`. The file stays on the Mini and is never committed.
 - Run `resonant eval router --set ~/.resonant/evals/router.jsonl` and look at the misroutes.
 
-**When to revisit.** When replies start going to the wrong intent, before Phase 2 adds side-effecting tools (a misroute then costs an approval prompt), or when the model or router prompt changes.
+**When to revisit.** When replies start going to the wrong intent, now that side-effecting tools exist (a misroute costs an approval prompt, or runs an L3 tool such as `answer_worker`), or when the model or router prompt changes.
 
 **Done when.** Accuracy is ≥ 90% on the real set, as go-live step 9 expects.
 
@@ -156,11 +157,11 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 *Noted 2026-10-13, from the local-model latency fix.*
 
-**Today.** The labeler's intent already picks the toolset (`INTENT_TOOLS`: question none, system 3, job_control 2), filtered by principal. With at most 3 small tools in the prompt the model isn't overwhelmed: the measured latency was the thinking-only model reasoning before each call, not tool count.
+**Today.** The labeler's intent already picks the toolset (`INTENT_TOOLS`: question none, system 5, job_control 3, updates 3, notes 4, reminders 3, ops 5, rules 4, run_project 12), filtered by principal. With a handful of small tools in the prompt the model isn't overwhelmed: the measured latency was the thinking-only model reasoning before each call, not tool count.
 
-**When to revisit.** Phase 3 extensions add tools. Keep the two-level shape (intent, then that intent's tools): extensions get their own `extension:<name>` intents (already reserved), so each prompt still carries only a handful of tools. Add retrieval (BM25 or embeddings, top-k over tool descriptions) only when one intent's toolset passes roughly 15-20 tools. Retrieval changes the tools block per message, which breaks the byte-identical tools prefix (KV-cache reuse), and tool descriptions become a prompt-injection surface for selection, so extension descriptions need review.
+**When to revisit.** `run_project` already has 12 tools, near the threshold below. Keep the two-level shape (intent, then that intent's tools): extensions get their own `extension:<name>` intents (already reserved), so each prompt still carries only a handful of tools. Add retrieval (BM25 or embeddings, top-k over tool descriptions) only when one intent's toolset passes roughly 15-20 tools. Retrieval changes the tools block per message, which breaks the byte-identical tools prefix (KV-cache reuse), and tool descriptions become a prompt-injection surface for selection, so extension descriptions need review.
 
-**Cheaper win first.** For intents whose tools take no arguments (`system`: `daemon_status`, `model_status`, `system_status`), the tool round could be skipped: run the toolset directly and let the model only narrate (the final `chat_json`). That saves one model round per system question. Measure with `resonant bench e2e --model real` before and after.
+**Cheaper win first.** For intents whose tools take no arguments (`system`: `daemon_status`, `model_status`, `system_status`, `list_commands`, `list_extensions`), the tool round could be skipped: run the toolset directly and let the model only narrate (the final `chat_json`). That saves one model round per system question. Measure with `resonant bench e2e --model real` before and after.
 
 **Two more measured wins (2026-10-13, Instruct-2507, e2e bench).** (1) After the last tool result the model's no-call `chat_tools` turn already writes the answer as plain text (~5-20 tokens), and `_final` then asks again via `chat_json` (median ~0.9 s on `job_control`). Using that text as the reply, through the same number guard and length cap, would save one round. (2) With earlier replies in the thread, the model sometimes answers a repeated question from history without calling a tool, which can be stale. Consider a system-prompt rule to always re-read live state for `job_control` and `system`, or dropping prior replies for those intents.
 
@@ -204,13 +205,13 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 *From the P5A-3 review.* A run that finds the runner full or Resonant paused returns `Wait("usage_reset")` because `tasks.wait_reason` has no better value. `/status` then counts it under usage resets.
 
-**Done when.** `resource` is added to `WaitReason` and to the `tasks.wait_reason` CHECK in the next migration that touches `tasks`, and `ClaudeRunner._defer` uses it.
+**Done when.** `resource` is added to `WaitReason` and to the `tasks.wait_reason` CHECK in the next migration that touches `tasks`, and `ClaudeRunner._defer` uses it. (The runs table's own `wait_reason`, migration 011, already separates `usage_reset` from `question`.)
 
 ## Ops hardening
 
 *Noted 2026-10-13, during the Phase 2 build.*
 
-- Run ops subprocesses with a minimal environment, not the daemon's.
+- Run ops subprocesses with a minimal environment, not the daemon's (the PATH is already system-only since EM-1; the rest is still `os.environ`).
 - Scrub more from `/logs`: paths under `$HOME`, tokens that look like keys.
 - A cooldown on `restart_ollama`, so a loop of requests can't keep the model down.
 - `/update` runs whatever is on `origin/main`: anyone who can push there gets code execution on the Mini. Consider requiring a signed commit or tag, and branch protection.
@@ -221,7 +222,7 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 *Noted 2026-10-13, during Phase 2. The owner may revisit.*
 
-**Today.** A plain `yes` or `no` with no approval pending gets `Nothing is waiting for approval.` instead of going to the chat path, so a casual "yes" in conversation is answered as an approval reply.
+**Today.** A plain `yes` or `no` with no approval and no worker question pending (with a question open it goes to the question, EM-5) gets `Nothing is waiting for approval.` instead of going to the chat path, so a casual "yes" in conversation is answered as an approval reply.
 
 **Decide.** Keep it (clear and safe), or route a bare reply to chat when nothing has been asked recently.
 
@@ -243,7 +244,7 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 *Noted 2026-10-13, from the Phase 2 router eval on the real model.*
 
-The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). Look at both misses, then decide between a few-shot fix and an eval case that pins them. Re-run after any prompt or model change, together with [router evals on real texts](#router-evals-on-real-texts-go-live-step-9).
+The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% bar): `question` 7/9 (the same three misses since EM-5) and `system` 11/12. Look at the misses, then decide between a few-shot fix and an eval case that pins them. Re-run after any prompt or model change, together with [router evals on real texts](#router-evals-on-real-texts-go-live-step-9).
 
 ## MCP stdio client for extensions
 
@@ -343,11 +344,11 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 
 ## Approval "expires soon" reminder
 
-*Found 2026-10-14, after the pulse shipped.* The pulse's approval re-mention runs only at the top of the hour, and approvals expire after 30 minutes, so it catches only approvals asked between :30 and :50 past an hour. A reminder scheduled by the approval runner itself (e.g. `[A7] still waiting, expires in 10 min`, once, at half the TTL) would cover every approval. Then drop `core/approval` from the pulse.
+*Found 2026-10-14, after the pulse shipped.* The pulse's approval re-mention runs only at the top of the hour, and approvals expire after 30 minutes, so it catches only approvals asked between :30 and :50 past an hour. A reminder scheduled by the approval runner itself (e.g. `[A7] still waiting, expires in 10 min`, once, at half the TTL) would cover every approval. Then drop `core/approval` from the pulse. (A worker check's `trust_check` approval lives `runner.ask_timeout_minutes`, 240 by default, so the hourly pulse already covers those.)
 
 ## Secrets on disk for `gh` (P5A-7)
 
-*Noted 2026-10-15.* Secrets no longer appear in any child's env or argv (fd 4 pipe). The github extension still has to hand its token to `gh`, which reads only an env var or a config file, so it writes a 0600 `hosts.yml` into a 0700 dir under the extension's data dir for the length of the run. A run ended by SIGKILL (a timeout, after SIGTERM's grace) can leave that dir until a later run sweeps `resonant-gh-*` dirs older than an hour. Calling the GitHub API from Python with the token in memory would remove the file; deferred because the extension is built on `gh`'s GraphQL, pagination and error text. Also: a descendant started through a shell (not `subprocess` defaults) could inherit fd 4 before the SDK reads it; first-party extensions don't.
+*Noted 2026-10-15.* No extension child gets a secret in env or argv (fd 4 pipe). (Claude workers are different by design: the session gets its Claude token in env, and reads repo keys from `.env`.) The github extension still has to hand its token to `gh`, which reads only an env var or a config file, so it writes a 0600 `hosts.yml` into a 0700 dir under the extension's data dir for the length of the run. A run ended by SIGKILL (a timeout, after SIGTERM's grace) can leave that dir until a later run sweeps `resonant-gh-*` dirs older than an hour. Calling the GitHub API from Python with the token in memory would remove the file; deferred because the extension is built on `gh`'s GraphQL, pagination and error text. Also: a descendant started through a shell (not `subprocess` defaults) could inherit fd 4 before the SDK reads it; first-party extensions don't.
 
 ## Superseded by the employee model
 
@@ -355,12 +356,16 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 
 ## Employee mode carry-overs
 
-*Noted 2026-10-16 from the EM-1..EM-8 "As built" notes ([`employee-plan.md`](employee-plan.md)). Each is small; fix it or accept it in the decisions log. EM-10 sweeps the old model's leftovers in code and docs.*
+*Noted 2026-10-16 from the EM-1..EM-8 "As built" notes ([`employee-plan.md`](employee-plan.md)). Each is small; fix it or accept it in the decisions log. EM-10 swept the old model's leftovers in code and docs.*
 
-- **Checkout `.git` is worker-writable** (EM-2, accepted). A worker can plant hooks, move your branches or change config in a checkout. Daemon git there runs tokenless under the guard (EM-3), so it can't hurt Resonant, but your own next `git commit` runs a planted hook. Hardening: deny writes to `.git/hooks` and fetch the base from the mirror only.
-- **Guard gaps** (EM-1): hardlinks that already exist into a protected file aren't covered (keep uv's link mode clone or copy); port 7777 is fixed in the profile and the self-check (derive it from `api.port` if that changes); `~/Library` and `~/.config` are write-denied whole (narrow them if workers need `~/Library/Caches`).
+- **Checkout `.git` is worker-writable** (EM-2, accepted). A worker can plant hooks, move your branches or change config in a checkout. Daemon git there runs tokenless under the guard (EM-3), so it can't hurt Resonant, but your own next `git commit` runs a planted hook. The base already comes from the daemon-only mirror (EM-3). Hardening left: deny writes to the checkout's `.git/hooks` in the guard.
+- **Guard gaps** (EM-1): hardlinks that already exist into a protected file aren't covered (keep uv's link mode clone or copy; nothing sets `UV_LINK_MODE` yet); port 7777 is fixed in the profile and the self-check (derive it from `api.port` if that changes); `~/Library` and `~/.config` are write-denied whole (narrow them if workers need `~/Library/Caches`).
 - **Per-run App token is one repo** (plan §6). An ops ask that spans repos can't push to the others; widen through `resonant check` if it comes up.
 - **A fork run pushes before its checks** (EM-7). A token the checks then find is already public on the fork, though nothing goes upstream. Rotate it if that happens. The App covering a new fork is confirmed only on the first real fork run.
 - **Model-chosen `answer_worker`/`message_worker` run without asking** (EM-5). A worker's own summary could in principle nudge the model into messaging another run; the deterministic paths cover the usual replies.
-- **Visibility** (EM-5, EM-6): the relay's "which one?" stash and the brain's pick aren't shown in `/approvals` or `/runs`; a question that times out sends no text (the transcript and the digest line show it); the urgent-note cap (6 an hour) is in memory and resets on restart.
-- **Small gaps:** time blocked inside one `resonant ask` call (up to 8 minutes) counts as session time (EM-3); no `resonant approvals approve --always` (EM-4); a renamed repo's checkout isn't moved and the checkout's `.git` growth isn't under the disk watchdog (EM-2); `/run blog fix x` with a repo only GitHub knows is a scratch run unless written `/run blog: fix x` (EM-8); `merge_ci_pr` doesn't wait for CI (EM-8).
+- **Visibility** (EM-5, EM-6): the relay's "which one?" stash and the brain's pick aren't shown in `/approvals` or `/runs`; a question that times out sends no text (the transcript and the digest line show it); the note-text cap (6 texts per run an hour) is in memory and resets on restart.
+- **Small gaps:** time blocked inside one `resonant ask` call (up to 8 minutes) counts as session time (EM-3); no `resonant approvals approve --always` (EM-4); a renamed repo's checkout isn't moved and the checkout's `.git` growth isn't under the disk watchdog (EM-2); `/run blog fix x` with a repo only GitHub knows is a scratch run unless written `/run blog: fix x` (EM-8); `merge_ci_pr` doesn't wait for CI (EM-8); no default trust rules ship (`created_from="default"` is reserved, EM-4); no per-repo auto-merge default, so merge intent comes only from the ask (EM-7); the `run_project` intent keeps its name (repos-plan D8's rename to `repos` is optional and not done, EM-8).
+- **A fork run's PR-open race** (EM-7). Between the post-yes recheck and `gh pr create` the fork branch could move; it is caught afterwards (the PR is read back and closed on a head mismatch), not prevented.
+- **A `runner.repos` entry resets per-repo defaults** (found in EM-10). `RunnerRepo.allow_github_changes` defaults to `false` and `quote_ask` to `true`, and `import_config` writes them over the registry. An auto-registered repo has `allow_github_changes` on (and a fork repo `quote_ask` off). So an entry added only for `path` or `base` silently refuses `.github/` changes and drops Workflows from the run's token. Until fixed, set `allow_github_changes: true` in such an entry. **Done when.** Those `RunnerRepo` fields are optional (unset keeps the registry's value) and a test covers a path-only entry. Not changed in EM-10 because it loosens behavior for existing entries.
+- **The github extension needs `/opt/homebrew/bin` on the extensions' PATH** (found in EM-10). `extensions/github/cli.py` finds `gh` with `shutil.which` on its PATH. The default `extensions.process.path` is `/usr/bin, /bin` (EM-1: workers can write `/opt/homebrew/bin`), so with the default the extension fails with `gh not found on /usr/bin:/bin`. `config/resonant.example.yaml` (which bootstrap copies) keeps `/opt/homebrew/bin` for that reason. The `gh` link and its keg are write-protected by the guard, but other entries in that dir are not. **Done when.** The extension gets `gh` by an absolute path (pinned at install like `argv0`, or a fixed protected location) and the example goes back to the default PATH.
+- **Naming leftovers kept on purpose** (EM-10). The run step saved as `harvest` (it now finds the PR and runs the checks) is named in the runs CHECK (migrations 006, 009), so renaming it needs a table rebuild. `runner.max_bundle_mb` is deprecated and ignored, accepted only so old config files load; drop it from config files.

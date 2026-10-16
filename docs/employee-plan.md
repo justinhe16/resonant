@@ -1,6 +1,26 @@
 # Employee plan: Resonant works like a coworker at the Mini
 
-Status: draft for owner review (2026-10-15). This replaces the remaining waves of [`repos-plan.md`](repos-plan.md) (RP-2, RP-3, RP-6, RP-7) and the RP-10 "grants" idea. What's already merged stays: RP-1, RP-4, RP-5, RP-8 and RP-9.
+Status: **Implemented** (EM-1 to EM-10 merged, 2026-10). This replaced the remaining waves of [`repos-plan.md`](repos-plan.md) (RP-2, RP-3, RP-6, RP-7) and the RP-10 "grants" idea. [`phase5a-plan.md`](phase5a-plan.md) and `repos-plan.md` are historical. Open items are in [`followups.md`](followups.md#employee-mode-carry-overs).
+
+What shipped:
+
+| PR | Ticket | What |
+|---|---|---|
+| #65 | RP-1 | Repo registry (`repos` table) and the resolver |
+| #66 | RP-9 | Secret-file read denies (later dropped by EM-1's thin guard) |
+| #67 | RP-5 | Extensions link their repos (manifest `repos`) |
+| #68 | RP-4 | `create_repo`, starter CI and the repo tools |
+| #69 | RP-8 | Per-run GitHub App tokens; the session drives its own PR |
+| #70 | EM-1 | Thin guard: allow-default Seatbelt profile and its probes |
+| #71 | EM-2 | Real checkouts under `runner.code_dir`, a worktree per run, `.env` links, scratch dirs; bundle handback and fresh clones removed |
+| #72 | EM-4 | `trust_rules`, net-new asks, `yes always`, `/rules` and chat-taught rules |
+| #73 | EM-3 | Worker CLI (`resonant ask`, `note`, `check`), the per-run socket, `waiting(question)` |
+| #74 | EM-7 | Fork-mode runs with the `external_pr` ask; merge per trust rules and `start_run(merge=true)` |
+| #75 | EM-6 | Reporting by urgency and the digest's `Workers:` section |
+| #76 | EM-5 | Relay: worker questions and owner messages through the brain |
+| #77 | EM-8 | Router: `/repos`, `/repo …`, `/run [<repo>]`, repo tools on `run_project`, `merge_ci_pr` |
+| #78 | EM-9 | Employee-mode e2e, go-live step 14, `test.md` and the architecture docs |
+| this PR | EM-10 | Sweep of old-model leftovers; docs and config examples made current |
 
 ## 1. The model in one paragraph
 
@@ -354,3 +374,11 @@ Built: `router/intents.py`, `router/prefixes.py`, `router/commands.py`, `router/
 - **Labeler.** Still 20 few-shots (the test's cap): `is the model loaded` (`system` keeps two others) gave way to `add the acme/site repo as site`. Eval rows (19 new): the plan's phrasings plus near-misses (`which repos can claude work in?`, `register jhe/notes-app as notes`, `stop tracking the blog repo`, `merge the CI PR in blog`, `spin up a worker to clean up old docker images on the mini`, `any news on my pull requests?` → `updates`). "any updates on my PRs" → `updates` was already right.
 - **Router eval** (`evals/router.example.jsonl`, 95 rows ×2, qwen3:30b-a3b-instruct-2507, local Ollama): 96.8% (184/190); `run_project` 33/33, `rules` 7/7, `updates` 10/10, `job_control` 7/7, `notes` 5/5, `reminders` 5/5, `ops` 4/4, `unknown` 3/3, `system` 11/12, `question` 7/9 (the same three misses as before EM-8).
 - **Not done.** The resolver's fuzzy match isn't tried for a bare `/run` first word (only with `:`), so `/run blog fix x` for a repo only GitHub knows is a scratch run that says so. `merge_ci_pr` doesn't wait for CI the way `start_run(merge=true)` does.
+
+### EM-10 (sweep of the old model's leftovers)
+
+- **Removed.** The `.incoming` bundle sweep in `wipe_secret_dirs`/`cleanup` (nothing writes bundles since EM-2; a stale `<mirror_dir>/.incoming` left from before can be deleted by hand), the unused `Workspace._checkout_git`, the run dir's empty `repo/` subdir (the session works in its worktree or scratch dir; `sandbox check` probes now run from the run's `tmp/`), and dead constants (`runs.ENDED`, `commands.REPO_ARG_MAX`, `prefixes.LABEL_SYSTEM`, `router_eval.DEFAULT_MIN_ACCURACY`, go-live's `NOT_YET` branch for `channels.imessage.enabled`).
+- **Renamed.** `SandboxParams.read_paths` → `path_dirs` and `DEFAULT_READ_PATHS`/`default_read_paths` → `DEFAULT_PATH_DIRS`/`default_path_dirs`: under the thin guard they only add toolchain bin dirs (`~/.cargo/bin`, `~/.bun/bin`) to the session's PATH. The non-bin entries, which did nothing, are gone. `work_dir` stays (the control-dir rules) and so does `write_paths` (grants nothing; `resolved()` refuses a worktree inside a protected path).
+- **Kept, documented.** `runner.max_bundle_mb` is deprecated and ignored, accepted so old configs load (`config.py`, with a test). The `harvest` step name stays because the runs CHECK names it (migrations 006, 009); it is the PR lookup and checks.
+- **Fixed.** A resumed scratch run is no longer told to push and open a PR (`SCRATCH_RESUME_PROMPT`). The go-live CI row says that a repo with no CI runs but isn't merged (`/repo ci <name>`), not that runs are refused; `runs table` needs migration 011; `runner repos` reads as optional.
+- **Found, left** (in [`followups.md`](followups.md#employee-mode-carry-overs)): a `runner.repos` entry resets `allow_github_changes`/`quote_ask` to the config defaults; the github extension finds `gh` only through `/opt/homebrew/bin` on the extensions' PATH.
