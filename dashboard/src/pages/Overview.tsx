@@ -10,6 +10,8 @@ interface Props {
   snap: Snapshot;
   now: number;
   go: (route: string) => void;
+  /** Data is old: say "last known" rather than state it as now. */
+  stale?: boolean;
 }
 
 const HEADLINE = {
@@ -19,7 +21,7 @@ const HEADLINE = {
   failing: "Something is failing",
 } as const;
 
-export function Overview({ snap, now, go }: Props) {
+export function Overview({ snap, now, go, stale = false }: Props) {
   const worst = snap.health.length ? worstHealth(snap.health.map((h) => h.state)) : "unknown";
   const notOk = snap.health.filter((h) => h.state !== "ok");
   const killSwitch = snap.autonomy === "off" && snap.paused;
@@ -38,8 +40,10 @@ export function Overview({ snap, now, go }: Props) {
 
       <section className="rounded-lg border bg-card px-4 py-4">
         <div className="flex items-center gap-2.5">
-          <Dot tone={healthTone(worst)} pulse={worst === "failing"} className="size-2.5 [&>span]:size-2.5" />
-          <h1 className="text-lg font-semibold tracking-tight">{HEADLINE[worst]}</h1>
+          <Dot tone={healthTone(worst)} pulse={worst === "failing" && !stale} className="size-2.5 [&>span]:size-2.5" />
+          <h1 className="text-lg font-semibold tracking-tight">
+            {stale ? `Last known: ${HEADLINE[worst].toLowerCase()}` : HEADLINE[worst]}
+          </h1>
         </div>
         {notOk.length > 0 && (
           <p className="mt-1 text-sm text-muted-foreground">

@@ -25,7 +25,7 @@ describe("App", () => {
     const f = stubFetch({ "./config.json": json({ source: "local" }), "/api/dashboard": json(local) });
     const makeRemote = vi.fn();
     render(<App makeRemote={makeRemote} />);
-    expect(await screen.findByRole("heading", { name: "Something is degraded" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /something is degraded/i })).toBeInTheDocument();
     expect(f).toHaveBeenCalledWith("/api/dashboard", expect.objectContaining({ cache: "no-store" }));
     expect(makeRemote).not.toHaveBeenCalled();
   });
@@ -38,7 +38,6 @@ describe("App", () => {
       stage: vi.fn(async () => ({ kind: "signed_out" as const })),
       signIn: vi.fn(),
       verify: vi.fn(),
-      enroll: vi.fn(),
       signOut: vi.fn(),
       latest: vi.fn(),
       onAuthChange: vi.fn(() => () => {}),
@@ -53,7 +52,17 @@ describe("App", () => {
   it("explains a broken config", async () => {
     stubFetch({ "./config.json": json({ source: "ftp" }) });
     render(<App />);
-    expect(await screen.findByText("The dashboard is misconfigured")).toBeInTheDocument();
+    expect(await screen.findByText("The dashboard couldn't start")).toBeInTheDocument();
+  });
+
+  it("doesn't fall back to local when config.json can't be fetched", async () => {
+    const f = vi.fn(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    vi.stubGlobal("fetch", f);
+    render(<App />);
+    expect(await screen.findByText("The dashboard couldn't start")).toBeInTheDocument();
+    expect(f).not.toHaveBeenCalledWith("/api/dashboard", expect.anything());
   });
 
   it("explains a daemon without the dashboard API", async () => {

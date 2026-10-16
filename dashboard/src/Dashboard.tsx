@@ -1,11 +1,12 @@
 import { LogOut, Monitor, Moon, RefreshCw, Sun } from "lucide-react";
 import { useMemo } from "react";
 import { Dot } from "@/components/bits";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Alert } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { type Loader, useHashRoute, useNow, usePolling } from "@/lib/hooks";
-import { STALE_AFTER_S, worstHealth } from "@/lib/snapshot";
-import { ageSeconds, relative } from "@/lib/time";
+import { forTier, staleness, worstHealth } from "@/lib/snapshot";
+import { duration, relative } from "@/lib/time";
 import { useTheme } from "@/lib/theme";
 import { healthTone } from "@/lib/tone";
 import { cn } from "@/lib/utils";
@@ -32,21 +33,21 @@ function tabsFor(snap: Snapshot | null): Tab[] {
     { id: "extensions", label: "Extensions" },
   ];
   // Rules and repos exist only in the local tier.
-  if (snap?.trust_rules !== undefined || snap?.repos !== undefined) {
+  if (snap?.tier === "local") {
     tabs.push({ id: "rules", label: "Rules & repos" });
   }
   return tabs;
 }
 
 export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () => void }) {
-  const { snapshot: snap, error, loading, refresh } = usePolling(load);
+  const { snapshot: raw, error, loading, refresh } = usePolling(load);
+  const snap = useMemo(() => (raw ? forTier(raw) : null), [raw]);
   const now = useNow();
   const [route, go] = useHashRoute("overview");
   const tabs = useMemo(() => tabsFor(snap), [snap]);
   const active = tabs.some((t) => t.id === route) ? route : "overview";
 
-  const age = snap ? ageSeconds(snap.taken_at, now) : null;
-  const stale = snap !== null && age !== null && age > STALE_AFTER_S[snap.tier];
+  const stale = snap ? staleness(snap, now) : null;
   const worst = snap?.health.length ? worstHealth(snap.health.map((h) => h.state)) : "unknown";
 
   return (
@@ -112,13 +113,24 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
           <Alert tone="bad" data-testid="stale-banner">
             <Dot tone="bad" className="mt-1.5" />
             <div>
-              <p className="font-medium">No fresh data for {relative(snap.taken_at, now).replace(/ ago$/, "")}</p>
-              <p className="text-muted-foreground">
-                {snap.tier === "remote"
-                  ? "The Mini has stopped sending snapshots. It may be asleep, frozen or offline."
-                  : "The daemon isn't producing new snapshots."}{" "}
-                What's below is the last thing it reported.
-              </p>
+              {stale.kind === "snapshot" ? (
+                <>
+                  <p className="font-medium">No fresh data for {duration(snap.taken_at, now)}</p>
+                  <p className="text-muted-foreground">
+                    {snap.tier === "remote"
+                      ? "The Mini has stopped sending snapshots. It may be asleep, frozen or offline."
+                      : "The daemon isn't producing new snapshots."}{" "}
+                    What's below is the last thing it reported.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="font-medium">The loop hasn't ticked for {duration(snap.last_tick ?? snap.started_at, now)}</p>
+                  <p className="text-muted-foreground">
+                    The daemon answers but its loop looks stuck, so nothing new is being worked on.
+                  </p>
+                </>
+              )}
             </div>
           </Alert>
         )}
@@ -135,7 +147,11 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
         {!snap && !loading && !error && (
           <p className="py-10 text-center text-sm text-muted-foreground">No snapshot has been sent yet.</p>
         )}
-        {snap && <Page route={active} snap={snap} now={now} go={go} />}
+        {snap && (
+          <ErrorBoundary resetKey={`${active} ${snap.taken_at}`}>
+            <Page route={active} snap={snap} now={now} go={go} stale={stale !== null} />
+          </ErrorBoundary>
+        )}
       </main>
 
       {snap && (
@@ -147,7 +163,19 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
   );
 }
 
-function Page({ route, snap, now, go }: { route: string; snap: Snapshot; now: number; go: (r: string) => void }) {
+function Page({
+  route,
+  snap,
+  now,
+  go,
+  stale,
+}: {
+  route: string;
+  snap: Snapshot;
+  now: number;
+  go: (r: string) => void;
+  stale: boolean;
+}) {
   switch (route) {
     case "workers":
       return <Workers snap={snap} now={now} />;
@@ -160,7 +188,7 @@ function Page({ route, snap, now, go }: { route: string; snap: Snapshot; now: nu
     case "rules":
       return <Rules rules={snap.trust_rules ?? []} repos={snap.repos ?? []} />;
     default:
-      return <Overview snap={snap} now={now} go={go} />;
+      return <Overview snap={snap} now={now} go={go} stale={stale} />;
   }
 }
 

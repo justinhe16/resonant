@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { SupabaseGate } from "@/SupabaseGate";
@@ -18,7 +18,6 @@ function fakeClient(initial: AuthStage) {
       if (code !== "123456") throw new Error("Invalid TOTP code entered");
       stage = { kind: "ready" };
     }),
-    enroll: vi.fn(async () => ({ factorId: "f-new", qrCode: "data:image/svg+xml;utf8,<svg/>", secret: "SECRETKEY" })),
     signOut: vi.fn(async () => {
       stage = { kind: "signed_out" };
     }),
@@ -45,7 +44,7 @@ describe("SupabaseGate", () => {
     await user.click(screen.getByRole("button", { name: "Verify" }));
     expect(client.verify).toHaveBeenCalledWith("f1", "123456");
 
-    expect(await screen.findByRole("heading", { name: "Something is degraded" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /something is degraded/i })).toBeInTheDocument();
     expect(client.latest).toHaveBeenCalled();
   });
 
@@ -69,17 +68,30 @@ describe("SupabaseGate", () => {
     expect(client.latest).not.toHaveBeenCalled();
   });
 
-  it("enrolls an authenticator when none is set up", async () => {
+  it("stays locked without a verified factor and never offers enrolment", async () => {
     const user = userEvent.setup();
-    const client = fakeClient({ kind: "mfa_enroll" });
+    const client = fakeClient({ kind: "mfa_missing" });
     render(<SupabaseGate client={client} />);
-    await user.click(await screen.findByRole("button", { name: "Set up authenticator" }));
-    expect(await screen.findByAltText("QR code for your authenticator app")).toBeInTheDocument();
-    expect(screen.getByText("SECRETKEY")).toBeInTheDocument();
-    await user.type(screen.getByLabelText("Authentication code"), "123456");
-    await user.click(screen.getByRole("button", { name: "Verify" }));
-    expect(client.verify).toHaveBeenCalledWith("f-new", "123456");
-    expect(await screen.findByRole("heading", { name: "Something is degraded" })).toBeInTheDocument();
+    expect(await screen.findByText(/isn't set up for this account/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /set up/i })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Authentication code")).not.toBeInTheDocument();
+    expect(client.latest).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(await screen.findByLabelText("Email")).toBeInTheDocument();
+  });
+
+  it("keeps the session on a failed auth check", async () => {
+    const client = fakeClient({ kind: "ready" });
+    let onChange = () => {};
+    client.onAuthChange = vi.fn((cb: () => void) => {
+      onChange = cb;
+      return () => {};
+    });
+    render(<SupabaseGate client={client} />);
+    await screen.findByRole("heading", { name: /something is degraded/i });
+    vi.mocked(client.stage).mockRejectedValueOnce(new Error("Failed to fetch"));
+    await act(async () => onChange());
+    expect(screen.getByRole("heading", { name: /something is degraded/i })).toBeInTheDocument();
   });
 
   it("signs out from the dashboard", async () => {

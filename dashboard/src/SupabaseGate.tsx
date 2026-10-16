@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import type { AuthStage, Enrollment, RemoteClient } from "@/lib/supabase";
+import type { AuthStage, RemoteClient } from "@/lib/supabase";
 
 type Stage = AuthStage | { kind: "loading" };
 
@@ -25,8 +25,9 @@ export function SupabaseGate({ client }: { client: RemoteClient }) {
     try {
       setStage(await client.stage());
     } catch (e) {
+      // A network blip shouldn't sign the owner out: keep the current stage, show why.
       setError(message(e));
-      setStage({ kind: "signed_out" });
+      setStage((s) => (s.kind === "loading" ? { kind: "signed_out" } : s));
     }
   }, [client]);
 
@@ -71,10 +72,18 @@ export function SupabaseGate({ client }: { client: RemoteClient }) {
           />
         </Shell>
       );
-    case "mfa_enroll":
+    case "mfa_missing":
       return (
         <Shell error={error}>
-          <Enroll client={client} run={run} onCancel={signOut} />
+          <div className="space-y-4">
+            <p className="text-sm">
+              Two-factor authentication isn't set up for this account, so the dashboard stays locked.
+              Enrol an authenticator as the go-live checklist describes, then sign in again.
+            </p>
+            <Button variant="outline" className="w-full" onClick={signOut}>
+              Sign out
+            </Button>
+          </div>
         </Shell>
       );
   }
@@ -183,56 +192,5 @@ function CodeForm({
         Sign out
       </Button>
     </form>
-  );
-}
-
-function Enroll({
-  client,
-  run,
-  onCancel,
-}: {
-  client: RemoteClient;
-  run: (fn: () => Promise<void>) => Promise<void>;
-  onCancel: () => void;
-}) {
-  const [enrollment, setEnrollment] = useState<Enrollment | null>(null);
-  if (!enrollment) {
-    return (
-      <div className="space-y-4">
-        <p className="text-sm">
-          Two-factor authentication is required. Set up an authenticator app to continue.
-        </p>
-        <Button
-          className="w-full"
-          onClick={() =>
-            void run(async () => {
-              setEnrollment(await client.enroll());
-            })
-          }
-        >
-          Set up authenticator
-        </Button>
-        <Button variant="ghost" className="w-full" onClick={onCancel}>
-          Sign out
-        </Button>
-      </div>
-    );
-  }
-  return (
-    <div className="space-y-4">
-      <img
-        src={enrollment.qrCode}
-        alt="QR code for your authenticator app"
-        className="mx-auto size-44 rounded-md bg-white p-2"
-      />
-      <p className="text-center text-xs break-all text-muted-foreground">
-        Or enter this key: <span className="font-mono text-foreground">{enrollment.secret}</span>
-      </p>
-      <CodeForm
-        hint="Scan the code, then enter the 6 digits it shows."
-        onSubmit={(code) => run(() => client.verify(enrollment.factorId, code))}
-        onCancel={onCancel}
-      />
-    </div>
   );
 }

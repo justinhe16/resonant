@@ -2,15 +2,18 @@ import type { DashboardConfig } from "@/types";
 
 /** Reads config.json next to index.html. A missing file means the local daemon. */
 export async function loadConfig(fetchImpl: typeof fetch = fetch): Promise<DashboardConfig> {
-  let res: Response;
-  try {
-    res = await fetchImpl("./config.json", { cache: "no-store" });
-  } catch {
-    return { source: "local" };
-  }
+  // Only a missing file means local: a network error must not quietly switch a remote
+  // deployment over to polling /api/dashboard.
+  const res = await fetchImpl("./config.json", { cache: "no-store" });
   if (res.status === 404) return { source: "local" };
   if (!res.ok) throw new Error(`config.json: HTTP ${res.status}`);
-  return parseConfig(await res.json());
+  let raw: unknown;
+  try {
+    raw = await res.json();
+  } catch {
+    throw new Error("config.json is not valid JSON");
+  }
+  return parseConfig(raw);
 }
 
 export function parseConfig(raw: unknown): DashboardConfig {

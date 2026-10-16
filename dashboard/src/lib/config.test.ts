@@ -20,6 +20,11 @@ describe("config", () => {
     expect(await loadConfig(respond(404))).toEqual({ source: "local" });
   });
 
+  it("names a config.json that isn't JSON", async () => {
+    const f = vi.fn(async () => new Response("<!doctype html>", { status: 200 }));
+    await expect(loadConfig(f)).rejects.toThrow("config.json is not valid JSON");
+  });
+
   it("rejects bad configs", () => {
     expect(() => parseConfig(null)).toThrow(/not an object/);
     expect(() => parseConfig({ source: "s3" })).toThrow(/unknown source/);

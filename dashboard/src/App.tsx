@@ -51,7 +51,7 @@ export function App({ makeRemote = createRemoteClient }: AppProps) {
         <div className="mx-auto max-w-md px-4 pt-[15vh]">
           <Alert tone="bad">
             <div>
-              <p className="font-medium">The dashboard is misconfigured</p>
+              <p className="font-medium">The dashboard couldn't start</p>
               <p className="text-muted-foreground">{state.message}</p>
             </div>
           </Alert>

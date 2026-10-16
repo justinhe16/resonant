@@ -54,6 +54,7 @@ jobs:
       - run: npm test
       - run: npm run build
       - name: dashboard/dist matches the source (rebuild and commit it)
+        # diff catches changed and deleted files; the status test catches new untracked ones.
         run: |
           git status --porcelain -- dist
           git diff --exit-code -- dist

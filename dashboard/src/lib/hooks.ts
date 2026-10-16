@@ -45,7 +45,8 @@ export function usePolling(load: Loader, intervalMs: number = POLL_MS): PollStat
       }
       setLoading(false);
       clearTimeout(timer);
-      timer = setTimeout(tick, intervalMs);
+      // Hidden tabs stop polling; the visibility handler fetches again on return.
+      if (document.visibilityState !== "hidden") timer = setTimeout(tick, intervalMs);
     };
 
     const onVisible = () => {

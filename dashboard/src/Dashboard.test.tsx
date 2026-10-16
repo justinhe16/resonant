@@ -153,6 +153,35 @@ describe("Dashboard, empty and failure states", () => {
     expect(screen.getByTestId("last-seen")).toHaveTextContent("seen 10 min ago");
   });
 
+  it("says 'last known' on the overview while stale", async () => {
+    mount(clone(remote, { taken_at: "2026-10-16T08:50:00+00:00" }));
+    expect(await screen.findByRole("heading", { name: "Last known: something is degraded" })).toBeInTheDocument();
+  });
+
+  it("flags a stuck loop on the local tier", async () => {
+    mount(clone(local, { last_tick: "2026-10-16T08:50:00+00:00" }));
+    expect(await screen.findByTestId("stale-banner")).toHaveTextContent("The loop hasn't ticked for 10 min");
+  });
+
+  it("never shows local-only texts on the remote tier, even if sent", async () => {
+    window.location.hash = "/workers";
+    mount(clone(local, { tier: "remote" }));
+    expect(await screen.findByText("Run details are shown on the local dashboard only.")).toBeInTheDocument();
+    expect(screen.queryByText(/Add a dashboard job/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/drops Python 3.11/)).not.toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Sections" });
+    expect(within(nav).queryByRole("link", { name: /Rules/ })).not.toBeInTheDocument();
+  });
+
+  it("contains a render error to the page", async () => {
+    const bad = clone(local);
+    (bad.extensions[0]!.jobs as unknown) = null;
+    window.location.hash = "/extensions";
+    mount(bad);
+    expect(await screen.findByText("This section couldn't be shown")).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Sections" })).toBeInTheDocument();
+  });
+
   it("goes stale while the page sits open", async () => {
     mount(remote);
     await screen.findByRole("heading", { name: "Something is degraded" });
@@ -190,6 +219,22 @@ describe("polling", () => {
     expect(load).toHaveBeenCalledTimes(2);
     await act(() => vi.advanceTimersByTimeAsync(10_000));
     expect(load).toHaveBeenCalledTimes(3);
+  });
+
+  it("pauses while the tab is hidden and catches up on return", async () => {
+    const load = mount(local);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    const vis = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    await act(() => vi.advanceTimersByTimeAsync(10_000)); // the pending tick runs once
+    const calls = load.mock.calls.length;
+    await act(() => vi.advanceTimersByTimeAsync(60_000));
+    expect(load).toHaveBeenCalledTimes(calls);
+    vis.mockReturnValue("visible");
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(load).toHaveBeenCalledTimes(calls + 1);
+    vis.mockRestore();
   });
 
   it("shows new data on the next poll", async () => {

@@ -1,6 +1,6 @@
 import { Ago, Counts, Empty, LocalOnly, Meta, Row, Rows, Section, StateBadge } from "@/components/bits";
 import { Badge } from "@/components/ui/badge";
-import { RUN_STATE_ORDER, ordered } from "@/lib/snapshot";
+import { RUN_STATE_ORDER, ordered, safeHttpsUrl } from "@/lib/snapshot";
 import { runTone } from "@/lib/tone";
 import type { RunItem, Snapshot } from "@/types";
 
@@ -13,14 +13,16 @@ export function Workers({ snap, now }: { snap: Snapshot; now: number }) {
         title="Questions"
         description={snap.questions.open === 1 ? "1 open" : `${snap.questions.open} open`}
       >
-        {questions === undefined ? (
+        {questions === undefined && snap.questions.open > 0 ? (
           <LocalOnly what="Question texts" />
+        ) : questions === undefined ? (
+          <Empty>No worker is waiting on you.</Empty>
         ) : questions.length === 0 ? (
           <Empty>No worker is waiting on you.</Empty>
         ) : (
           <Rows>
-            {questions.map((q) => (
-              <Row key={`${q.run_code}-${q.asked_at}`}>
+            {questions.map((q, qi) => (
+              <Row key={`${q.run_code}-${qi}`}>
                 <p className="text-sm">
                   <span className="mr-2 font-mono text-xs font-semibold">{q.run_code}</span>
                   {q.text}
@@ -28,7 +30,7 @@ export function Workers({ snap, now }: { snap: Snapshot; now: number }) {
                 {q.options.length > 0 && (
                   <div className="mt-2 flex flex-wrap gap-1.5">
                     {q.options.map((o, i) => (
-                      <Badge key={o}>
+                      <Badge key={i}>
                         ({String.fromCharCode(97 + i)}) {o}
                       </Badge>
                     ))}
@@ -64,6 +66,7 @@ export function Workers({ snap, now }: { snap: Snapshot; now: number }) {
 }
 
 function RunRow({ run, now }: { run: RunItem; now: number }) {
+  const prUrl = safeHttpsUrl(run.pr_url);
   return (
     <Row>
       <div className="flex items-start justify-between gap-3">
@@ -87,9 +90,9 @@ function RunRow({ run, now }: { run: RunItem; now: number }) {
           <Ago iso={run.started_at} now={now} prefix="started " />
         )}
         {run.branch && <span className="truncate font-mono">{run.branch}</span>}
-        {run.pr_url && /^https:\/\//.test(run.pr_url) && (
+        {prUrl && (
           <a
-            href={run.pr_url}
+            href={prUrl}
             target="_blank"
             rel="noreferrer noopener"
             className="font-medium text-info underline-offset-2 hover:underline"

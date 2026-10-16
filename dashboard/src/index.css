@@ -1,4 +1,7 @@
-@import "tailwindcss";
+/* Scan only the source: never dist/, or each build would depend on the previous one. */
+@import "tailwindcss" source(none);
+@source "../src";
+@source "../index.html";
 
 @custom-variant dark (&:where(.dark, .dark *));
 

@@ -37,11 +37,6 @@ function fake(o: FakeOpts) {
         error: null,
       })),
       challengeAndVerify: vi.fn(async () => ({ data: {}, error: null })),
-      unenroll: vi.fn(async () => ({ data: {}, error: null })),
-      enroll: vi.fn(async () => ({
-        data: { id: "f-new", totp: { qr_code: "data:image/svg+xml;utf8,<svg/>", secret: "ABC" } },
-        error: null,
-      })),
     },
   };
   const sb = { auth, from: vi.fn(() => query) } as unknown as SupabaseClient;
@@ -57,14 +52,7 @@ describe("wrapSupabase", () => {
     ).toEqual({ kind: "mfa_challenge", factorId: "f1" });
     expect(
       await wrapSupabase(fake({ session: true, totp: [{ id: "f0", status: "unverified" }] }).sb).stage(),
-    ).toEqual({ kind: "mfa_enroll" });
-  });
-
-  it("clears half-finished factors before enrolling", async () => {
-    const f = fake({ session: true, totp: [{ id: "f0", status: "unverified" }] });
-    const e = await wrapSupabase(f.sb).enroll();
-    expect(f.auth.mfa.unenroll).toHaveBeenCalledWith({ factorId: "f0" });
-    expect(e).toEqual({ factorId: "f-new", qrCode: "data:image/svg+xml;utf8,<svg/>", secret: "ABC" });
+    ).toEqual({ kind: "mfa_missing" });
   });
 
   it("surfaces auth errors", async () => {
