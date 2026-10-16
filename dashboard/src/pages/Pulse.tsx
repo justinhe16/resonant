@@ -21,14 +21,16 @@ export function Pulse({ snap, now }: { snap: Snapshot; now: number }) {
       ) : (
         <Rows>
           {sorted.map((p) => (
-            <Row key={p.key}>
+            <Row key={`${p.source}/${p.key}`}>
               <div className="flex items-start justify-between gap-3">
                 <p className="min-w-0 text-sm">{p.title}</p>
                 <StateBadge tone={urgencyTone(p.urgency)}>{p.urgency}</StateBadge>
               </div>
               <Meta>
-                <span className="truncate font-mono">{p.key}</span>
-                {p.state && <span>{p.state}</span>}
+                <span className="truncate font-mono">
+                  {p.source}/{p.key}
+                </span>
+                {p.state === "new" && <span>new</span>}
                 <Ago iso={p.updated_at} now={now} prefix="updated " />
               </Meta>
             </Row>

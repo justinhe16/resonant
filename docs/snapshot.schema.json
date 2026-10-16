@@ -1,0 +1,850 @@
+{
+  "$comment": "Generated from resonant/dashboard/snapshot.py; do not edit.",
+  "$defs": {
+    "ApprovalItem": {
+      "additionalProperties": false,
+      "properties": {
+        "asked_at": {
+          "format": "date-time",
+          "title": "Asked At",
+          "type": "string"
+        },
+        "code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Code"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "level": {
+          "enum": [
+            "L0",
+            "L1",
+            "L2",
+            "L3"
+          ],
+          "title": "Level",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "summary",
+        "level",
+        "asked_at",
+        "expires_at"
+      ],
+      "title": "ApprovalItem",
+      "type": "object"
+    },
+    "Approvals": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ApprovalItem"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Items",
+          "x-tier": "local"
+        },
+        "open": {
+          "title": "Open",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "open"
+      ],
+      "title": "Approvals",
+      "type": "object"
+    },
+    "Extension": {
+      "additionalProperties": false,
+      "properties": {
+        "health": {
+          "enum": [
+            "ok",
+            "degraded",
+            "failing",
+            "unknown"
+          ],
+          "title": "Health",
+          "type": "string"
+        },
+        "jobs": {
+          "items": {
+            "$ref": "#/$defs/Job"
+          },
+          "title": "Jobs",
+          "type": "array"
+        },
+        "name": {
+          "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "enabled",
+            "disabled",
+            "disabled_tampered"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "status",
+        "health",
+        "jobs"
+      ],
+      "title": "Extension",
+      "type": "object"
+    },
+    "HealthRow": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason",
+          "x-tier": "local"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Since"
+        },
+        "state": {
+          "enum": [
+            "ok",
+            "degraded",
+            "failing",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "state",
+        "since"
+      ],
+      "title": "HealthRow",
+      "type": "object"
+    },
+    "Job": {
+      "additionalProperties": false,
+      "properties": {
+        "fail_streak": {
+          "title": "Fail Streak",
+          "type": "integer"
+        },
+        "id": {
+          "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "last_outcome": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "failed",
+                "killed",
+                "denied",
+                "dry_run",
+                "skipped_paused",
+                "other"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Outcome"
+        },
+        "last_run_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Run At"
+        },
+        "next_due": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Due"
+        }
+      },
+      "required": [
+        "id",
+        "next_due",
+        "last_run_at",
+        "last_outcome",
+        "fail_streak"
+      ],
+      "title": "Job",
+      "type": "object"
+    },
+    "Pulse": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/PulseItem"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Items",
+          "x-tier": "local"
+        },
+        "open": {
+          "title": "Open",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "open"
+      ],
+      "title": "Pulse",
+      "type": "object"
+    },
+    "PulseItem": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "title": "Key",
+          "type": "string"
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "new",
+            "told"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        },
+        "urgency": {
+          "enum": [
+            "urgent",
+            "normal",
+            "low"
+          ],
+          "title": "Urgency",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "key",
+        "title",
+        "urgency",
+        "state",
+        "updated_at"
+      ],
+      "title": "PulseItem",
+      "type": "object"
+    },
+    "QuestionItem": {
+      "additionalProperties": false,
+      "properties": {
+        "asked_at": {
+          "format": "date-time",
+          "title": "Asked At",
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Options",
+          "type": "array"
+        },
+        "run_code": {
+          "title": "Run Code",
+          "type": "string"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_code",
+        "text",
+        "options",
+        "asked_at"
+      ],
+      "title": "QuestionItem",
+      "type": "object"
+    },
+    "Questions": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/QuestionItem"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Items",
+          "x-tier": "local"
+        },
+        "open": {
+          "title": "Open",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "open"
+      ],
+      "title": "Questions",
+      "type": "object"
+    },
+    "RepoItem": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "title": "Base",
+          "type": "string"
+        },
+        "ci": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Ci"
+        },
+        "mode": {
+          "enum": [
+            "push",
+            "fork"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "mode",
+        "base",
+        "ci"
+      ],
+      "title": "RepoItem",
+      "type": "object"
+    },
+    "RunItem": {
+      "additionalProperties": false,
+      "properties": {
+        "ask": {
+          "title": "Ask",
+          "type": "string"
+        },
+        "branch": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Branch"
+        },
+        "code": {
+          "title": "Code",
+          "type": "string"
+        },
+        "ended_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Ended At"
+        },
+        "last_note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Last Note"
+        },
+        "pr_number": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pr Number"
+        },
+        "pr_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pr Url"
+        },
+        "repo": {
+          "title": "Repo",
+          "type": "string"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Started At"
+        },
+        "state": {
+          "enum": [
+            "queued",
+            "running",
+            "waiting",
+            "ready",
+            "merged",
+            "failed",
+            "cancelled",
+            "no_changes",
+            "done"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "waiting_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "usage_reset",
+                "question"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Waiting Reason"
+        }
+      },
+      "required": [
+        "code",
+        "state",
+        "repo",
+        "ask",
+        "branch",
+        "pr_url",
+        "pr_number",
+        "started_at",
+        "ended_at",
+        "waiting_reason",
+        "last_note"
+      ],
+      "title": "RunItem",
+      "type": "object"
+    },
+    "Runner": {
+      "additionalProperties": false,
+      "properties": {
+        "missing": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Missing",
+          "x-tier": "local"
+        },
+        "set_up": {
+          "title": "Set Up",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "set_up"
+      ],
+      "title": "Runner",
+      "type": "object"
+    },
+    "Runs": {
+      "additionalProperties": false,
+      "properties": {
+        "by_state": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "queued",
+              "running",
+              "waiting",
+              "ready",
+              "merged",
+              "failed",
+              "cancelled",
+              "no_changes",
+              "done"
+            ]
+          },
+          "title": "By State",
+          "type": "object"
+        },
+        "items": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/RunItem"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Items",
+          "x-tier": "local"
+        }
+      },
+      "required": [
+        "by_state"
+      ],
+      "title": "Runs",
+      "type": "object"
+    },
+    "Slots": {
+      "additionalProperties": false,
+      "properties": {
+        "max": {
+          "title": "Max",
+          "type": "integer"
+        },
+        "used": {
+          "title": "Used",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "used",
+        "max"
+      ],
+      "title": "Slots",
+      "type": "object"
+    },
+    "Tasks": {
+      "additionalProperties": false,
+      "properties": {
+        "by_state": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "queued",
+              "running",
+              "waiting",
+              "done",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "title": "By State",
+          "type": "object"
+        }
+      },
+      "required": [
+        "by_state"
+      ],
+      "title": "Tasks",
+      "type": "object"
+    },
+    "TrustRule": {
+      "additionalProperties": false,
+      "properties": {
+        "n": {
+          "title": "N",
+          "type": "integer"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "n",
+        "text"
+      ],
+      "title": "TrustRule",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Everything the dashboard shows, at ``taken_at``.",
+  "properties": {
+    "approvals": {
+      "$ref": "#/$defs/Approvals"
+    },
+    "autonomy": {
+      "enum": [
+        "on",
+        "off"
+      ],
+      "title": "Autonomy",
+      "type": "string"
+    },
+    "dry_run": {
+      "title": "Dry Run",
+      "type": "boolean"
+    },
+    "extensions": {
+      "items": {
+        "$ref": "#/$defs/Extension"
+      },
+      "title": "Extensions",
+      "type": "array"
+    },
+    "health": {
+      "items": {
+        "$ref": "#/$defs/HealthRow"
+      },
+      "title": "Health",
+      "type": "array"
+    },
+    "last_tick": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Last Tick"
+    },
+    "paused": {
+      "title": "Paused",
+      "type": "boolean"
+    },
+    "pulse": {
+      "$ref": "#/$defs/Pulse"
+    },
+    "questions": {
+      "$ref": "#/$defs/Questions"
+    },
+    "repos": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/RepoItem"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Repos",
+      "x-tier": "local"
+    },
+    "runner": {
+      "$ref": "#/$defs/Runner"
+    },
+    "runs": {
+      "$ref": "#/$defs/Runs"
+    },
+    "schema": {
+      "const": 1,
+      "title": "Schema",
+      "type": "integer"
+    },
+    "slots": {
+      "$ref": "#/$defs/Slots"
+    },
+    "started_at": {
+      "format": "date-time",
+      "title": "Started At",
+      "type": "string"
+    },
+    "taken_at": {
+      "format": "date-time",
+      "title": "Taken At",
+      "type": "string"
+    },
+    "tasks": {
+      "$ref": "#/$defs/Tasks"
+    },
+    "tier": {
+      "enum": [
+        "local",
+        "remote"
+      ],
+      "title": "Tier",
+      "type": "string"
+    },
+    "trust_rules": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/TrustRule"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Trust Rules",
+      "x-tier": "local"
+    },
+    "version": {
+      "pattern": "^[0-9A-Za-z.+-]{1,40}$",
+      "title": "Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema",
+    "tier",
+    "taken_at",
+    "version",
+    "started_at",
+    "last_tick",
+    "autonomy",
+    "paused",
+    "dry_run",
+    "health",
+    "tasks",
+    "slots",
+    "runs",
+    "approvals",
+    "questions",
+    "pulse",
+    "extensions",
+    "runner"
+  ],
+  "title": "Snapshot",
+  "type": "object"
+}

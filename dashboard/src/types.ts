@@ -49,7 +49,8 @@ export interface Runs {
 }
 
 export interface ApprovalItem {
-  code: string;
+  /** null for an approval sent without a code */
+  code: string | null;
   summary: string;
   level: string;
   asked_at: Timestamp;
@@ -66,10 +67,13 @@ export interface QuestionItem {
 export type Urgency = "urgent" | "normal" | "low";
 
 export interface PulseItem {
+  /** "core" or the extension that reported it; (source, key) is unique */
+  source: string;
   key: string;
   title: string;
   urgency: Urgency | string;
-  state: string | null;
+  /** new: the owner hasn't heard this version yet */
+  state: "new" | "told";
   updated_at: Timestamp;
 }
 
@@ -89,7 +93,7 @@ export interface Job {
 
 export interface Extension {
   name: string;
-  status: string;
+  status: "enabled" | "disabled" | "disabled_tampered";
   health: HealthState | string;
   jobs: Job[];
 }
@@ -109,7 +113,8 @@ export interface Repo {
   name: string;
   mode: string;
   base: string;
-  protected: boolean;
+  /** CI seen on the repo; null when not checked yet */
+  ci: boolean | null;
 }
 
 export interface Snapshot {

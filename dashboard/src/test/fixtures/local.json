@@ -106,24 +106,27 @@
     "open": 3,
     "items": [
       {
-        "key": "github/pr/81",
+        "source": "github",
+        "key": "pr/81",
         "title": "PR #81 is green and waiting for you",
         "urgency": "normal",
-        "state": "ready",
+        "state": "new",
         "updated_at": "2026-10-16T08:40:00+00:00"
       },
       {
-        "key": "core/run/R11",
+        "source": "core",
+        "key": "run/R11",
         "title": "R11 asked a question",
         "urgency": "urgent",
-        "state": "waiting",
+        "state": "new",
         "updated_at": "2026-10-16T08:12:00+00:00"
       },
       {
-        "key": "weather/umbrella",
+        "source": "weather",
+        "key": "umbrella",
         "title": "Rain after 4pm",
         "urgency": "low",
-        "state": null,
+        "state": "told",
         "updated_at": "2026-10-16T06:00:00+00:00"
       }
     ]
@@ -131,7 +134,7 @@
   "extensions": [
     {
       "name": "github",
-      "status": "active",
+      "status": "enabled",
       "health": "ok",
       "jobs": [
         {
@@ -152,7 +155,7 @@
     },
     {
       "name": "weather",
-      "status": "active",
+      "status": "enabled",
       "health": "degraded",
       "jobs": [
         {
@@ -164,7 +167,7 @@
         }
       ]
     },
-    { "name": "notes-sync", "status": "muted", "health": "unknown", "jobs": [] }
+    { "name": "notes-sync", "status": "disabled", "health": "unknown", "jobs": [] }
   ],
   "runner": { "set_up": true, "missing": [] },
   "trust_rules": [
@@ -173,8 +176,8 @@
     { "n": 3, "text": "notify failed now" }
   ],
   "repos": [
-    { "name": "resonant", "mode": "push", "base": "main", "protected": true },
-    { "name": "trading-bot", "mode": "push", "base": "main", "protected": false },
-    { "name": "upstream-lib", "mode": "fork", "base": "develop", "protected": true }
+    { "name": "resonant", "mode": "push", "base": "main", "ci": true },
+    { "name": "trading-bot", "mode": "push", "base": "main", "ci": false },
+    { "name": "upstream-lib", "mode": "fork", "base": "develop", "ci": null }
   ]
 }
