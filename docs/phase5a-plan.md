@@ -1,5 +1,7 @@
 # Phase 5a plan: the Seatbelt sandbox and the Claude runner
 
+> **Historical.** This describes the first runner model: fresh clones per run, the bundle handback, the deny-all-of-home Seatbelt profile and no secrets in a worker's env. Employee mode replaced it (EM-1 to EM-10). For what exists now, read [`employee-plan.md`](employee-plan.md), [`architecture.md`](architecture.md) and [`interfaces.md`](interfaces.md). What carried over: kill and cancel, budgets and time limits, transcripts, usage-limit waits, the reaper, pulse progress items and resume after restart.
+
 Status: **implemented** (2026-10-15; P5A-1 to P5A-7 merged, see As built). The owner approved going ahead ("execute!") before this write-up; the decisions in §1 are theirs, the rest is the design. Built with robot-surf: a worktree per ticket, tests, PR, CI, code-review agent, squash-merge to `main`, in the dependency waves of §4. Slack (Phase 5b) is out of scope. The plan had a security self-review and then a code-review agent's review (below); each ticket's PR still gets the code-review agent, and P5A-1's PR a dedicated sandbox review.
 
 **Goal.** The owner texts "fix the flaky test in resonant" from anywhere. A Claude Code session on the Mini does the work in a throwaway clone, inside a macOS sandbox, and Resonant texts back a PR link. Merging is the one approval. While it runs, the hourly pulse says it is still going; `/runs` shows it; `/kill` stops it.

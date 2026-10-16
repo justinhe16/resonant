@@ -64,8 +64,6 @@ def _label_system(intents: IntentSet) -> str:
     )
 
 
-LABEL_SYSTEM = _label_system(BUILTIN_INTENTS)
-
 # (message, intent, confidence). Few-shot turns are part of the stable prefix.
 _FEW_SHOTS: tuple[tuple[str, IntentLabel, float], ...] = (
     ("what's the capital of portugal", "question", 0.95),

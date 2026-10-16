@@ -23,11 +23,13 @@ from resonant.store.db import atomic, iso, now_iso
 Status = Literal[
     "queued", "running", "waiting", "ready", "merged", "failed", "cancelled", "no_changes", "done"
 ]
+# ``harvest`` is a historical name (the CHECK in migrations 006/009): it is now the step that
+# finds the session's PR (or pushed commits) and checks it. ``publish`` is a fork run's ask and
+# upstream PR.
 Step = Literal["prepare", "session", "harvest", "publish", "reply"]
 WaitReason = Literal["usage_reset", "question"]
 
 ACTIVE: tuple[Status, ...] = ("queued", "running", "waiting")
-ENDED: tuple[Status, ...] = ("ready", "merged", "failed", "cancelled", "no_changes", "done")
 
 _COLUMNS = frozenset(
     {

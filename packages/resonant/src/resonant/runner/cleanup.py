@@ -1,4 +1,4 @@
-"""Run-dir cleanup, the disk watchdog and the cache prune (docs/phase5a-plan.md D3).
+"""Run-dir cleanup, the disk watchdog and the cache prune (docs/employee-plan.md D1).
 
 A run dir is written by the sandboxed session, so everything the daemon does to one treats it
 as hostile: no path is ever followed through a symlink. Deletes and sizes walk with directory
@@ -292,29 +292,22 @@ class CleanupResult:
     errors: list[str] = field(default_factory=list[str])
 
 
-def wipe_secret_dirs(secrets_dir: Path, mirror_dir: Path | None = None) -> int:
+def wipe_secret_dirs(secrets_dir: Path) -> int:
     """Delete every leftover per-call secret dir (a crash between writing a token file and
-    removing it) and, with ``mirror_dir``, stale bundle copies in ``<mirror_dir>/.incoming``.
-    Never raises. The daemon calls this at startup (before any run), and ``cleanup`` calls
-    it daily. Returns how many entries were removed."""
+    removing it). Never raises. The daemon calls this at startup (before any run), and
+    ``cleanup`` calls it daily. Returns how many entries were removed."""
     removed = 0
-    targets = [secrets_dir]
-    if mirror_dir is not None:
-        targets.append(mirror_dir / ".incoming")
-    for target in targets:
-        try:
-            names = os.listdir(target)
-        except OSError:
-            continue
-        for name in names:
-            if target != secrets_dir and not name.endswith(".bundle"):
-                continue
-            with contextlib.suppress(Exception):
-                try:
-                    rmtree_nofollow(target / name)
-                except NotADirectoryError:
-                    (target / name).unlink()
-                removed += 1
+    try:
+        names = os.listdir(secrets_dir)
+    except OSError:
+        return 0
+    for name in names:
+        with contextlib.suppress(Exception):
+            try:
+                rmtree_nofollow(secrets_dir / name)
+            except NotADirectoryError:
+                (secrets_dir / name).unlink()
+            removed += 1
     return removed
 
 
@@ -323,7 +316,6 @@ def cleanup(
     cache_dir: Path,
     *,
     secrets_dir: Path | None = None,
-    mirror_dir: Path | None = None,
     ended_at: Mapping[str, float],
     keep_days: int,
     max_cache_bytes: int,
@@ -347,5 +339,5 @@ def cleanup(
     except Exception as e:
         result.errors.append(f"cache: {getattr(e, 'strerror', None) or type(e).__name__}")
     if secrets_dir is not None:
-        wipe_secret_dirs(secrets_dir, mirror_dir)
+        wipe_secret_dirs(secrets_dir)
     return result

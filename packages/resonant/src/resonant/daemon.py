@@ -13,8 +13,8 @@ and monitor stop first (no new events), then the loop drains in-flight steps (wh
 still send their replies), then the model client closes. With it disabled, the daemon is
 exactly Phase 0 apart from the gate and the scheduler.
 
-Claude runs (Phase 5a). With iMessage on, ``runner="claude"`` is registered by the wiring.
-Before the loop starts, the daemon calls ``ClaudeRunner.start()``: it ends every session
+Claude workers (docs/employee-plan.md). With iMessage on, ``runner="claude"`` is registered by
+the wiring. Before the loop starts, the daemon calls ``ClaudeRunner.start()``: it ends every session
 process a crash left behind (matched by pid and start time), wipes leftover token dirs and
 hooks the kill switch, and only then does ``Loop.run`` resume tasks. The scheduler also gets
 the ``core/run-cleanup`` job (``runners.claude.cleanup_job``).

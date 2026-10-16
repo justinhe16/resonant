@@ -63,7 +63,6 @@ from resonant_sdk import Manifest
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MIN_ACCURACY = 0.9
 WARMUP_TEXT = "hello, are you there?"  # synthetic: never one of the owner's texts
 
 EXIT_OK = 0

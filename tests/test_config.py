@@ -143,6 +143,13 @@ def test_pre_phase3_config_loads_unchanged(resonant_home: Path) -> None:
     assert s.pulse == PulseConfig()
 
 
+def test_old_runner_config_still_loads(resonant_home: Path) -> None:
+    # runner.max_bundle_mb is deprecated and ignored (no bundle handback since EM-2), but a
+    # config file that still sets it must load.
+    (resonant_home / "config.yaml").write_text("runner:\n  max_bundle_mb: 80\n")
+    assert load_settings().runner.max_bundle_mb == 80
+
+
 def test_phase3_from_yaml_and_env(resonant_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (resonant_home / "config.yaml").write_text(
         "briefing:\n  enabled: false\n  at: '07:45'\n"

@@ -52,7 +52,9 @@ extensions:
   result_max_bytes: 32768               # a tool or job result is stored (redacted) up to this
   model_result_max_chars: 4096          # the model sees this much of it, as untrusted data
   process:
-    path: [/opt/homebrew/bin, /usr/bin, /bin]   # an extension process's whole PATH
+    # An extension process's whole PATH. Not the default (/usr/bin, /bin): the github extension
+    # finds gh on this PATH, so /opt/homebrew/bin stays here (docs/followups.md).
+    path: [/opt/homebrew/bin, /usr/bin, /bin]
     stdout_max_bytes: 262144            # past this the process tree is killed
     stderr_max_bytes: 8192              # kept redacted, never shown
     kill_grace_s: 2                     # SIGTERM, then SIGKILL after this
@@ -74,3 +76,30 @@ pulse:
   enabled: true                         # hourly "btw" messages and urgent interrupts
   quiet_hours: "00:00-06:00"            # local time in `timezone`; only urgent items go out inside it
   remention_after: 10m                  # a pending approval is mentioned once more after this (capped at half gate.approval_ttl_s)
+
+# Claude workers (docs/employee-plan.md, go-live step 14). Every key has a default except
+# github_app, which runs need (Claude adds it when you give it the IDs). Defaults shown;
+# github_app and repos are examples:
+# runner:
+#   github_app: {app_id: 123456, installation_id: 12345678}   # public IDs; key: Keychain runner/github_app_key
+#   code_dir: ~/code                    # checkouts; worktrees in .worktrees/<name>/R<n>, scratch in .scratch/R<n>
+#   work_dir: ~/resonant-runs           # run dirs (the session's home, tmp, credentials)
+#   cache_dir: ~/resonant-runs/.cache   # package caches shared between runs
+#   mirror_dir: ~/.resonant/runner/mirrors   # daemon-only bare mirrors the pre-merge checks read
+#   secrets_dir: ~/.resonant/run-secrets     # per-call token files, daemon-only
+#   deny_read: []                       # extra paths a worker may neither read nor write
+#   max_minutes: 45                     # session time limit (1..600)
+#   max_budget_usd: null                # per-run cap; set it with runner/anthropic_key (API billing)
+#   ask_timeout_minutes: 240            # how long a worker's ask or check waits for you
+#   keep_days: 7                        # finished run dirs and worktrees are deleted after this
+#   max_run_dir_mb: 5000
+#   max_cache_gb: 20
+#   git_path: /usr/bin/git
+#   gh_path: /opt/homebrew/bin/gh
+#   repos:                              # optional overrides; repos register on first use
+#     dori:
+#       remote: github.com/you/dori
+#       base: main
+#       path: ~/work/dori               # checkout elsewhere than <code_dir>/dori
+#       allow_github_changes: true      # false refuses .github/ changes (an entry defaults to false)
+#       quote_ask: true                 # quote your ask in the PR body

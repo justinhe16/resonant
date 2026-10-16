@@ -1,4 +1,4 @@
-"""Ending every process of a Claude session (docs/phase5a-plan.md D4).
+"""Ending every process of a Claude session (docs/employee-plan.md D1: kill and cancel).
 
 A session is a process group (the runner starts it in a new session), but ``setsid``,
 ``nohup`` and a dev server left running escape the group. So a run's processes are found four
@@ -17,7 +17,7 @@ equals the one saved at spawn, so a reused pid is left alone. The group is signa
 the leader is that process, or is gone (a group id can't be reused while the group has members).
 
 ``reap`` is SIGTERM, a grace period, then SIGKILL, rescanning each round (the session may
-start more processes while it dies). Harvest and cleanup start only once it returns, so
+start more processes while it dies). The PR lookup and cleanup start only once it returns, so
 nothing writes into the run dir while it is read.
 """
 
