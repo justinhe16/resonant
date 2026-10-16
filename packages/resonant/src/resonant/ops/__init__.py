@@ -48,6 +48,9 @@ RESTART_PENDING_KEY = "ops.restart_pending"
 
 # git and uv never prompt: there is no terminal, and a prompt would only hang to the timeout.
 _ENV = {
+    # System dirs only: git and uv run by absolute path, and nothing they spawn is looked up
+    # in a dir a Claude worker can write (docs/employee-plan.md D2)
+    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_ASKPASS": "",
     "SSH_ASKPASS": "",

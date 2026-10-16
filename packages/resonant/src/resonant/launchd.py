@@ -25,12 +25,18 @@ OLLAMA_LABEL = "com.resonant.ollama"
 # Mini already had, so `resonant daemon install` adopts it instead of adding a second one.
 CAFFEINATE_LABEL = "com.resonant.caffeinate"
 CAFFEINATE = "/usr/bin/caffeinate"
-_SYSTEM_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# System dirs only (SIP-protected). Claude workers may write ~/.local/bin and /opt/homebrew
+# (brew install, uv tool install: docs/employee-plan.md D2), so the daemon never looks a tool
+# up there by name: every tool it runs has an absolute path (runner.git_path, gh_path,
+# ops.uv_path, /usr/bin/security, ...), and its PATH is these plus its own venv's bin.
+_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# Where `daemon install` looks for ollama (the owner's terminal; pinned into the plist).
+_OLLAMA_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", str(Path("~/.local/bin").expanduser()))
 
 
-def _path() -> str:
-    # ~/.local/bin is where uv tools and the `claude` CLI usually live.
-    return f"{Path('~/.local/bin').expanduser()}:{_SYSTEM_PATH}"
+def _path(python: str | None = None) -> str:
+    """The daemon's PATH: its venv's bin, then the system dirs."""
+    return f"{Path(python or sys.executable).parent}:{_SYSTEM_PATH}"
 
 
 def agents_dir() -> Path:
@@ -46,7 +52,7 @@ def daemon_plist(settings: Settings, python: str | None = None) -> dict[str, Any
     return {
         "Label": DAEMON_LABEL,
         "ProgramArguments": [python or sys.executable, "-m", "resonant", "daemon", "run"],
-        "EnvironmentVariables": {"RESONANT_HOME": str(settings.home), "PATH": _path()},
+        "EnvironmentVariables": {"RESONANT_HOME": str(settings.home), "PATH": _path(python)},
         "WorkingDirectory": str(settings.home),
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -66,7 +72,7 @@ def ollama_plist(settings: Settings, ollama: str) -> dict[str, Any]:
             "OLLAMA_HOST": f"{url.hostname or '127.0.0.1'}:{url.port or 11434}",
             "OLLAMA_KEEP_ALIVE": "-1",
             "OLLAMA_CONTEXT_LENGTH": str(settings.model.context_tokens),
-            "PATH": _path(),
+            "PATH": _SYSTEM_PATH,
         },
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -88,7 +94,8 @@ def caffeinate_plist() -> dict[str, Any]:
 
 
 def find_ollama() -> str | None:
-    return shutil.which("ollama")
+    """ollama's absolute path, from the usual install dirs (not this process's PATH)."""
+    return shutil.which("ollama", path=os.pathsep.join(_OLLAMA_DIRS))
 
 
 class LaunchctlError(RuntimeError):

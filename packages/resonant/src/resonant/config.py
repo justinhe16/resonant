@@ -182,8 +182,10 @@ def _absolute(v: Path, field: str) -> Path:
 class ProcessConfig(_Section):
     """Extension processes (``resonant.extensions.process``). Caps are bounded both ways."""
 
-    # The child's whole PATH. Nothing else comes from the daemon's environment.
-    path: tuple[Path, ...] = (Path("/opt/homebrew/bin"), Path("/usr/bin"), Path("/bin"))
+    # The child's whole PATH. Nothing else comes from the daemon's environment. System dirs
+    # only: Claude workers may write /opt/homebrew/bin (gh and git are pinned by absolute path
+    # at install, so they don't need it).
+    path: tuple[Path, ...] = (Path("/usr/bin"), Path("/bin"))
     # stdout (and fd-3 events) past this kills the process tree: "output too large".
     stdout_max_bytes: int = Field(default=256 * 1024, ge=1024, le=4 * 1024 * 1024)
     # stderr is kept up to this, redacted, and never shown.

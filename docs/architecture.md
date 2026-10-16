@@ -169,9 +169,7 @@ wait reasons: approval · human_reply · usage_reset · ci · veto (Phase 3; unu
   - write the following, nor rename any ancestor dir of them (a `literal` deny on each, since a `subpath` rule follows the path, not the files), nor mount a disk image over any of them:
     - `~/.resonant` (DB, config, logs) or `$RESONANT_HOME`;
     - the installed daemon: its venv, the interpreter it runs on, its checkout and the `resonant` entry point;
-    - the `gh`, `uv`, `ollama`, `git` and `python3` it runs outside the guard, with their Homebrew kegs;
-    - the dirs on its PATH;
-    - uv's cache;
+    - the `gh`, `uv`, `ollama` and `git` it runs outside the guard by absolute path, with their Homebrew kegs (the PATH dirs themselves stay open for `brew install` and `uv tool install`: the daemon runs with a system-only PATH and never looks a tool up by name);
     - the real target of any symlinked path in the profile;
   - read or write `runner.secrets_dir` (`~/.resonant/run-secrets`), `~/Library/Messages`, the Keychain files or any `runner.deny_read` path;
   - look up securityd (`com.apple.SecurityServer`, `com.apple.securityd*` and its agents; `trustd` stays, so TLS works), launchd, the Messages agents, Apple Events, LaunchServices, the window server, HID or accessibility; send Apple Events or open apps; open the HID drivers;

@@ -36,11 +36,16 @@ DEFAULT_READ_PATHS = (
     "~/.nvm/versions",
     "~/.bun/bin",
 )
-# Binaries the daemon itself runs outside the guard, with credentials (gh with the run's
-# token, uv on /update, ollama under launchd, git and python3 for extensions). A worker that
-# could replace one would run code outside the sandbox, so the PATH's copy, its real file
-# and its Homebrew keg are write-protected.
-DAEMON_TOOLS = ("gh", "uv", "ollama", "git", "python3")
+# Binaries the daemon itself runs outside the guard, by absolute path, with credentials:
+# gh (runner.gh_path, the run's token), uv (ops.uv_path, /update), ollama (its LaunchAgent)
+# and git (an extension's pinned argv0 when Homebrew's git is first). A worker that could
+# replace one would run code outside the sandbox, so the link, its real file and its Homebrew
+# keg are write-protected. (The daemon's own git is /usr/bin/git, under SIP; extensions'
+# python3 is the daemon's venv.)
+DAEMON_TOOLS = ("gh", "uv", "ollama", "git")
+# Install dirs searched for those tools and for the tools linked into a session, after
+# ~/.local/bin (host_tool_path).
+HOST_TOOL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 # Binaries that may be linked into the run-local bin/.
 NEVER_LINKED = frozenset({"resonant"})
 
@@ -185,60 +190,44 @@ def _keg(real: Path) -> Path | None:
     return None
 
 
-def _path_dirs(home: Path) -> list[Path]:
-    """The dirs on this process's PATH a worker could otherwise drop a binary into, to be
-    run by name, outside the guard, by the daemon (``~/.local/bin``, ``/opt/homebrew/bin``,
-    ...). System dirs (SIP) and $HOME or its parents are left out."""
-    system = (
-        "/usr/",
-        "/bin",
-        "/sbin",
-        "/System/",
-        "/var/run/com.apple.",
-        "/private/var/run/com.apple.",
-    )
-    found: list[Path] = []
-    for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if not entry or not os.path.isabs(entry) or entry.startswith(system):
-            continue
-        path = Path(entry)
-        if path == home or path in home.parents or path == Path("/"):
-            continue
-        found.append(path)
-    return found
+def host_tool_path() -> str:
+    """Where Resonant looks for the tools it hands a session or runs itself, by name, as a
+    PATH string: the usual install dirs, never this process's PATH (the daemon's is system
+    dirs only, see launchd._path)."""
+    dirs = (Path("~/.local/bin").expanduser(), *(Path(d) for d in HOST_TOOL_DIRS))
+    return os.pathsep.join(str(d) for d in dirs)
 
 
 def default_protected() -> tuple[Path, ...]:
     """The installed daemon, write-protected from sessions. Call it in the daemon: it reads
-    the daemon's own interpreter, PATH and environment.
+    the daemon's own interpreter and environment.
 
     - its venv, the interpreter install the venv runs on, and the checkout its code runs from;
     - ``$RESONANT_HOME`` when it is set (the default ``~/.resonant`` is in runner.sb);
     - the ``resonant`` entry point and ``DAEMON_TOOLS`` (the link, its target and its
-      Homebrew keg), which the daemon runs outside the guard;
-    - every non-system dir on its PATH, so nothing can shadow a tool it runs by name;
-    - uv's cache (``$UV_CACHE_DIR`` or ``~/.cache/uv``), which ``/update``'s ``uv sync``
-      copies into the venv. Sessions use the runner cache instead (``scratch_env``)."""
-    home = Path.home()
+      Homebrew keg), which the daemon runs outside the guard by absolute path.
+
+    The dirs on PATH (``~/.local/bin``, ``/opt/homebrew/bin``) stay writable, so a worker can
+    ``brew install`` and ``uv tool install``: the daemon runs with a system-only PATH and
+    calls every tool by absolute path, so nothing put there can shadow one."""
     found: list[Path] = [Path(sys.prefix), Path(sys.base_prefix)]
     if (checkout := _package_checkout()) is not None:
         found.append(checkout)
     if state := os.environ.get("RESONANT_HOME"):
         found.append(Path(state).expanduser())
+    search = f"{Path(sys.executable).parent}{os.pathsep}{host_tool_path()}"
     for name in ("resonant", *DAEMON_TOOLS):
-        if (path := shutil.which(name)) is not None:
+        if (path := shutil.which(name, path=search)) is not None:
             found.append(Path(path))
             if (keg := _keg(Path(os.path.realpath(path)))) is not None:
                 found.append(keg)
-    found += _path_dirs(home)
-    found.append(Path(os.environ.get("UV_CACHE_DIR") or home / ".cache" / "uv").expanduser())
     return tuple(found)
 
 
 def default_deny_exec() -> tuple[Path, ...]:
     """The daemon's venv and the `resonant` entry point: sessions must not start either."""
     found = [Path(sys.prefix)]
-    entry = shutil.which("resonant")
+    entry = shutil.which("resonant", path=host_tool_path())
     if entry is not None:
         found.append(Path(entry))
     return tuple(found)
@@ -357,10 +346,10 @@ def prepare_dirs(params: SandboxParams) -> None:
 
 
 def resolve_tool(name: str) -> Path | None:
-    """The real binary behind ``name`` on the daemon's PATH. Apple's /usr/bin shims
+    """The real binary behind ``name`` in ``host_tool_path()``. Apple's /usr/bin shims
     (``git``) are resolved through ``xcrun`` so the session never runs the shim, which wants
     to write a cache under /var/folders."""
-    found = shutil.which(name)
+    found = shutil.which(name, path=host_tool_path())
     if found is None:
         return None
     real = Path(os.path.realpath(found))

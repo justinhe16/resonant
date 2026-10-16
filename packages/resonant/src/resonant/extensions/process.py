@@ -60,7 +60,7 @@ from resonant.extensions.checks import argv0_error
 
 log = logging.getLogger(__name__)
 
-SCRATCH_PATH = "/opt/homebrew/bin:/usr/bin:/bin"
+SCRATCH_PATH = "/usr/bin:/bin"
 EVENTS_FD = 3
 SECRETS_FD = 4
 SECRETS_CAP = 8 * 1024  # JSON bytes; fits an empty pipe buffer, so the write never blocks

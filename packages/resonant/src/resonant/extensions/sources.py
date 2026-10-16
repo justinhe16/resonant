@@ -83,7 +83,7 @@ def git(
     cwd: Path, *args: str, stdin: bytes | None = None, check: bool = True
 ) -> subprocess.CompletedProcess[bytes]:
     """Run ``git -C cwd <args>``. Raises SourceError on failure (when ``check``)."""
-    exe = shutil.which("git")
+    exe = shutil.which("git", path="/usr/bin")  # never a worker-writable PATH dir
     if exe is None:
         raise SourceError("git is not installed")
     argv = [exe, "-c", "core.fsmonitor=false", "-C", str(cwd), *args]

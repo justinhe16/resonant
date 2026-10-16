@@ -45,11 +45,13 @@ from resonant.store.db import kv_set, transaction
 from resonant.store.tasks import insert_task
 from resonant.tools import ToolRegistry, ops
 from resonant.tools.ops import (
+    GIT,
     PULL_TIMEOUT_S,
     RESTART_OLLAMA,
     RESTART_RESONANT,
     SYNC_TIMEOUT_S,
     UPDATE_RESONANT,
+    UV_CACHE,
     Ops,
     log_line,
     recent_logs,
@@ -63,11 +65,15 @@ UV = "/opt/homebrew/bin/uv"
 HELPER = (sys.executable, "-m", "resonant.ops.restart_later", DAEMON_LABEL, "3")
 KICK_DAEMON = (LAUNCHCTL, "kickstart", "-k", f"gui/{UID}/{DAEMON_LABEL}")
 KICK_OLLAMA = (LAUNCHCTL, "kickstart", "-k", f"gui/{UID}/{OLLAMA_LABEL}")
-BRANCH = ("git", "rev-parse", "--abbrev-ref", "HEAD")
-STATUS = ("git", "status", "--porcelain")
-HEAD = ("git", "rev-parse", "--short=7", "HEAD")
-PULL = ("git", "pull", "--ff-only")
-SYNC = (UV, "sync", "--frozen")
+BRANCH = (GIT, "rev-parse", "--abbrev-ref", "HEAD")
+STATUS = (GIT, "status", "--porcelain")
+HEAD = (GIT, "rev-parse", "--short=7", "HEAD")
+PULL = (GIT, "pull", "--ff-only")
+
+
+def sync() -> tuple[str, ...]:
+    """/update's uv sync, with its own cache under the Resonant home (not ~/.cache/uv)."""
+    return (UV, "sync", "--frozen", "--cache-dir", str(load_settings().home / UV_CACHE))
 
 
 def ok(stdout: str = "") -> ProcResult:
@@ -225,10 +231,10 @@ async def test_update_pulls_syncs_and_restarts(db: sqlite3.Connection, tmp_path:
         "restarting": True,
         "delay_s": 3,
     }
-    assert runner.argvs() == [BRANCH, STATUS, HEAD, PULL, HEAD, SYNC]
+    assert runner.argvs() == [BRANCH, STATUS, HEAD, PULL, HEAD, sync()]
     assert {c.cwd for c in runner.calls} == {tmp_path}
     timeouts = {c.argv: c.timeout_s for c in runner.calls}
-    assert timeouts[PULL] == PULL_TIMEOUT_S == 60 and timeouts[SYNC] == SYNC_TIMEOUT_S == 240
+    assert timeouts[PULL] == PULL_TIMEOUT_S == 60 and timeouts[sync()] == SYNC_TIMEOUT_S == 240
     assert sum(c.timeout_s for c in runner.calls) < UPDATE_RESONANT.timeout_s
     assert runner.spawned == [HELPER]
     marker = restart_pending(db)
@@ -265,7 +271,7 @@ async def test_update_already_current_does_not_restart(
         "synced": None,
         "restarting": False,
     }
-    assert SYNC not in runner.argvs() and runner.spawned == []
+    assert sync() not in runner.argvs() and runner.spawned == []
     assert restart_pending(db) is None
 
 
@@ -285,7 +291,7 @@ async def test_update_pull_failure(
     with pytest.raises(ToolFailed, match=message) as e:
         await make_ops(db, runner, tmp_path).update_resonant()
     assert "fatal" not in str(e.value)
-    assert SYNC not in runner.argvs() and runner.spawned == []
+    assert sync() not in runner.argvs() and runner.spawned == []
 
 
 @pytest.mark.parametrize(
@@ -297,7 +303,7 @@ async def test_update_sync_failure_reports_and_does_not_restart(
 ) -> None:
     runner = FakeOpsRunner()
     clean_repo(runner)
-    runner.on(*SYNC, results=[result])
+    runner.on(*sync(), results=[result])
     out = await make_ops(db, runner, tmp_path).update_resonant()
     assert out == {
         "old": "a1b2c3d",

@@ -8,9 +8,10 @@
 (allow default)
 
 ;; ---- Resonant's state and the installed daemon: no writes ----------------------------------
-;; ~/.resonant (DB, config, logs, run secrets) and the daemon's code, venv, interpreter, the
-;; binaries it runs outside the guard and the dirs on its PATH (profile.default_protected),
-;; plus the real targets of any symlinked path in this file (profile.SandboxParams.resolved).
+;; ~/.resonant (DB, config, logs, run secrets) and the daemon's code, venv, interpreter and
+;; the binaries it runs outside the guard (profile.default_protected), plus the real targets
+;; of any symlinked path in this file (profile.SandboxParams.resolved). The PATH dirs
+;; (~/.local/bin, /opt/homebrew/bin) stay writable: the daemon never looks a tool up there.
 (deny file-write*
   (subpath (string-append (param "HOME") "/.resonant"))
 ;; @PROTECT@

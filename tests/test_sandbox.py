@@ -181,12 +181,10 @@ def test_default_protected_is_the_installed_daemon() -> None:
     assert _real(Path(sys.prefix)) in {str(x) for x in p.protect}
 
 
-def test_default_protected_covers_path_dirs_state_kegs_and_the_uv_cache(
+def test_default_protected_covers_state_and_tool_kegs_but_not_path_dirs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    local_bin = tmp_path / "home" / ".local" / "bin"
     state = tmp_path / "state"
-    cache = tmp_path / "uvcache"
     cellar = tmp_path / "brew" / "Cellar" / "gh" / "2.0" / "bin"
     cellar.mkdir(parents=True)
     (cellar / "gh").write_text("#!/bin/sh\n")
@@ -194,15 +192,33 @@ def test_default_protected_covers_path_dirs_state_kegs_and_the_uv_cache(
     brew_bin = tmp_path / "brew" / "bin"
     brew_bin.mkdir()
     (brew_bin / "gh").symlink_to(cellar / "gh")
-    monkeypatch.setenv("PATH", f"{local_bin}:{brew_bin}:/usr/bin:/bin:{Path.home()}")
+    monkeypatch.setattr(profile_mod, "HOST_TOOL_DIRS", (str(brew_bin), "/usr/bin", "/bin"))
     monkeypatch.setenv("RESONANT_HOME", str(state))
-    monkeypatch.setenv("UV_CACHE_DIR", str(cache))
+    # the process PATH plays no part: the daemon's is system dirs only
+    monkeypatch.setenv("PATH", f"{tmp_path / 'elsewhere'}:/usr/bin:/bin")
     found = set(default_protected())
-    assert {local_bin, brew_bin, state, cache} <= found
-    assert brew_bin / "gh" in found
-    assert tmp_path / "brew" / "Cellar" / "gh" / "2.0" in found  # the whole keg
-    # system dirs and $HOME itself are never protected (a worker must write under $HOME)
+    assert state in found
+    assert brew_bin / "gh" in found  # the link the daemon runs
+    assert tmp_path / "brew" / "Cellar" / "gh" / "2.0" in found  # and its whole keg
+    # the PATH dirs themselves stay writable (brew install, uv tool install), and so does
+    # ~/.cache/uv (/update's uv sync uses its own cache under the Resonant home)
+    assert not {brew_bin, Path.home() / ".local" / "bin", Path.home() / ".cache" / "uv"} & found
     assert not {Path("/usr/bin"), Path("/bin"), Path.home()} & found
+
+
+def test_resolve_tool_searches_the_install_dirs_not_the_process_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "mytool").write_text("#!/bin/sh\n")
+    (tools / "mytool").chmod(0o755)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(profile_mod, "HOST_TOOL_DIRS", (str(tools), "/usr/bin", "/bin"))
+    assert profile_mod.resolve_tool("mytool") == Path(_real(tools / "mytool"))
+    monkeypatch.setattr(profile_mod, "HOST_TOOL_DIRS", ("/usr/bin", "/bin"))
+    monkeypatch.setenv("PATH", f"{tools}:/usr/bin:/bin")
+    assert profile_mod.resolve_tool("mytool") is None
 
 
 def test_symlinked_home_paths_protect_their_real_targets(tmp_path: Path) -> None:

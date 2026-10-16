@@ -664,6 +664,8 @@ def _fake_home(ctx: ProbeContext) -> Generator[tuple[SandboxParams, Path]]:
             ".env": "OWNER=1",
             "code/proj/.env": "KEY=1",
             "code/proj/notes.txt": "notes",
+            ".local/bin/owner-tool": "tool",
+            "brew/Cellar/gh/1.0/bin/gh": "gh",
         }
         # ~/.resonant and ~/.zshrc are symlinks (a moved state dir, a dotfiles repo): the
         # guard must hold on the real files too
@@ -680,6 +682,11 @@ def _fake_home(ctx: ProbeContext) -> Generator[tuple[SandboxParams, Path]]:
                 continue
             (home / rel).write_text(text)
         (home / ".resonant" / "mnt").mkdir()
+        # a Homebrew-like PATH dir: open to workers, except the daemon's own tool in it
+        (home / "brew" / "bin").mkdir()
+        (home / "brew" / "bin" / "gh").symlink_to(
+            home / "brew" / "Cellar" / "gh" / "1.0" / "bin" / "gh"
+        )
         (root / "denied").mkdir()
         (root / "denied" / "x.txt").write_text("secret")
         (root / "open").mkdir()
@@ -689,7 +696,12 @@ def _fake_home(ctx: ProbeContext) -> Generator[tuple[SandboxParams, Path]]:
             secrets_dir=home / ".resonant" / "run-secrets",
             home=home,
             deny_read=(root / "denied",),
-            protect=(home / "daemon" / "venv", home / "daemon" / "checkout"),
+            protect=(
+                home / "daemon" / "venv",
+                home / "daemon" / "checkout",
+                home / "brew" / "bin" / "gh",
+                home / "brew" / "Cellar" / "gh" / "1.0",
+            ),
             deny_exec=ctx.params.deny_exec,
         ).resolved()
         prepare_dirs(params)
@@ -701,7 +713,8 @@ def _fake_home(ctx: ProbeContext) -> Generator[tuple[SandboxParams, Path]]:
 def p_state_writes(ctx: ProbeContext) -> tuple[Status, str]:
     """~/.resonant and the daemon's install (a fake home): no create, append, mkdir,
     rename, rename-out, hardlink, write through a symlink, or rename of the dir or an
-    ancestor. Reads of ~/.resonant (outside run-secrets) stay allowed."""
+    ancestor; nor of a daemon tool's link and keg in a Homebrew-like dir. Reads of
+    ~/.resonant (outside run-secrets) stay allowed, and so do new files in the PATH dirs."""
     with _fake_home(ctx) as (params, root):
         home, open_dir = params.home, root / "open"
         st, venv = home / ".resonant", home / "daemon" / "venv"
@@ -725,8 +738,17 @@ def p_state_writes(ctx: ProbeContext) -> tuple[Status, str]:
             ("create", _unique(home / "daemon" / "checkout", "code"), None),
             ("rename", str(home / "daemon"), o + "/daemon"),
             ("link", str(venv / "bin" / "python"), o + "/python"),
+            ("rename", str(home / "brew" / "bin" / "gh"), o + "/gh"),
+            ("openw", str(home / "brew" / "Cellar" / "gh" / "1.0" / "bin" / "gh"), None),
+            ("create", _unique(home / "brew" / "Cellar" / "gh" / "1.0", "keg"), None),
         ]
         allowed: list[Op] = [
+            # PATH dirs stay open (brew install, uv tool install): the daemon never runs a
+            # tool from them by name
+            ("create", _unique(home / "brew" / "bin", "brew"), None),
+            ("create", _unique(home / "brew" / "Cellar", "formula"), None),
+            ("create", _unique(home / ".local" / "bin", "uvtool"), None),
+            ("openw", str(home / ".local" / "bin" / "owner-tool"), None),
             ("read", str(st / "config.yaml"), None),
             ("list", str(st), None),
             ("create", _unique(home / "daemon", "beside"), None),
@@ -813,8 +835,9 @@ def p_unreadable(ctx: ProbeContext) -> tuple[Status, str]:
 
 def p_owner_files(ctx: ProbeContext) -> tuple[Status, str]:
     """Owner-like access on the real host: a planted ``.env``, key and ``.pem`` under the real
-    $HOME (outside the run) are readable; a scratch dir under $HOME and the shared temp dirs
-    are writable; runner.deny_read stays denied."""
+    $HOME (outside the run) are readable; a scratch dir under $HOME, the shared temp dirs and
+    the PATH dirs (``~/.local/bin``, ``/opt/homebrew/bin``) are writable; runner.deny_read
+    stays denied."""
     canary = ctx.canary
     for name in (".env", ".env.local", "id_rsa", "server.pem"):
         (canary / name).write_text("planted")
@@ -826,6 +849,11 @@ def p_owner_files(ctx: ProbeContext) -> tuple[Status, str]:
         ("create", _unique(Path("/private/tmp"), "tmp"), None),
         ("create", _unique(Path(OUTSIDE_PARENT), "vartmp"), None),
     ]
+    # the PATH dirs a worker installs into (brew install, uv tool install), where this user
+    # can write them
+    for d in (ctx.params.home / ".local" / "bin", Path("/opt/homebrew/bin")):
+        if d.is_dir() and os.access(d, os.W_OK):
+            allowed.append(("create", _unique(d, "path"), None))
     denied: list[Op] = []
     for d in ctx.params.deny_read:
         if d.exists():
