@@ -498,3 +498,16 @@ async def test_the_stash_doesnt_answer_a_newer_question(rig: Callable[..., Rig])
     r.workers.questions[0] = OpenQuestion(3, "R4", "Which port?", (), T0, False)
     assert await r.route("R4") == "What's your answer for R4 (Which port?)? Reply R4 <answer>."
     assert r.workers.answers == []
+
+
+async def test_an_option_that_is_a_control_word_is_still_an_answer(
+    rig: Callable[..., Rig],
+) -> None:
+    r = rig(("R4", 0.99))
+    r.workers.ask("R4", "Keep going?", ("stop", "continue"))
+    assert r.direct("R4 stop") == "→ R4"
+    assert r.workers.answers[-1][1] == "stop"
+    r.workers.ask("R4", "Which DB?")
+    assert await r.free("cancel R4") is None  # a control verb vetoes a confident pick
+    r.workers.ask("R6", "Ship it?")
+    assert await r.free("stop the docs run") is None

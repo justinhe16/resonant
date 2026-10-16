@@ -334,8 +334,9 @@ class Relay:
                     run.code,
                 )
             return None
-        if not a.tell and _CONTROL.match(a.rest):
-            return None  # "R4 cancel", "R4 status": run control, even with a question open
+        picks_option = bool(opens) and match_option(a.rest, opens[0].options) is not None
+        if not a.tell and _CONTROL.match(a.rest) and not picks_option:
+            return None  # "R4 cancel", "R4 status": run control, unless it's one of the options
         if opens:
             return self._answer(workers, opens[0], a.rest, by_content=False)
         if not run.active:
@@ -396,12 +397,14 @@ class Relay:
         if len(opens) == 1:
             q = opens[0]
             recent = (now - q.asked_at).total_seconds() <= RECENT_S
+            if says_new or _CONTROL.match(normalize(text)):
+                return None  # a leading control verb vetoes even a confident pick
             if pick is not None and pick[0] == q.run_code and pick[1] >= LIKELY:
                 return self._answer(workers, q, text, by_content=False)
-            if says_new or commandish:
+            if commandish:
                 return None
             return self._answer(workers, q, text, by_content=False) if recent and short else None
-        if pick is not None and pick[1] >= SURE:
+        if pick is not None and pick[1] >= SURE and not _CONTROL.match(normalize(text)):
             if pick[0] == NONE:
                 return None
             chosen = next(q for q in opens if q.run_code == pick[0])
