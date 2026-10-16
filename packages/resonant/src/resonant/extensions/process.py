@@ -78,6 +78,7 @@ DRAIN_S = 1.0  # after exit and cleanup, how long to wait for the pipes to reach
 _POLL_S = 0.05
 
 _SECRET_ENV = re.compile(r"RESONANT_SECRET_[A-Z][A-Z0-9_]{0,31}")
+_BIN_ENV = re.compile(r"RESONANT_BIN_[A-Z]{1,16}")
 _EVENT_TYPE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _EVENT_KEYS = frozenset({"type", "text", "dedupe_key", "data"})
 
@@ -284,12 +285,14 @@ def scratch_env(
     job_due_at: str | None = None,
     user: str | None = None,
     path: str = SCRATCH_PATH,
+    bins: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """The whole environment for one extension call, built from scratch (no ``os.environ``).
 
     ``secrets`` is ``SecretStore.env_for(ext, declared)``: ``{RESONANT_SECRET_<NAME>:
     value}`` for only this tool's or job's declared secrets. ``path`` is the whole
-    ``PATH`` (``settings.extensions.process.path_env()``).
+    ``PATH`` (``settings.extensions.process.path_env()``). ``bins`` is the manifest's pinned
+    ``bins``: ``{RESONANT_BIN_<NAME>: absolute path}``.
     """
     name = user or pwd.getpwuid(os.getuid()).pw_name
     env = {
@@ -306,6 +309,10 @@ def scratch_env(
     }
     if job_due_at is not None:
         env["RESONANT_JOB_DUE_AT"] = job_due_at
+    for key, value in (bins or {}).items():
+        if not _BIN_ENV.fullmatch(key) or not os.path.isabs(value) or "\x00" in value:
+            raise ValueError(f"bad pinned bin {key!r}")
+        env[key] = value
     for key, value in (secrets or {}).items():
         if not _SECRET_ENV.fullmatch(key):
             raise ValueError(f"bad secret env name {key!r}")

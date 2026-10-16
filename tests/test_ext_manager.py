@@ -265,6 +265,31 @@ def test_tracked_symlink_escaping_the_root_is_refused(
     assert no_staging_left(resonant_home)
 
 
+def test_bins_are_pinned_at_install_and_a_replaceable_gh_is_refused(
+    conn: sqlite3.Connection,
+    resonant_home: Path,
+    repo: Path,
+    keychain: FakeKeychain,
+    brew_gh: Path,
+) -> None:
+    (repo / "extensions" / "demo" / "resonant.yaml").write_text(MANIFEST + "bins: [gh]\n")
+    commit_all(repo)
+    loose = repo.parent / "loose"
+    loose.mkdir()
+    (loose / "gh").write_text("#!/bin/sh\n")
+    (loose / "gh").chmod(0o755)
+    bad = make_manager(conn, resonant_home, repo, keychain, ext_path=str(loose))
+    with pytest.raises(ManagerError) as e:
+        bad.stage("repo:demo")
+    assert any(p.startswith("bins: 'gh' resolves to") for p in e.value.problems)
+    mgr = make_manager(conn, resonant_home, repo, keychain, ext_path=str(brew_gh))
+    staged = mgr.stage("repo:demo")
+    assert "  ! its code runs gh (network)" in confirm_lines(staged)
+    record = mgr.install(staged.pin, name="demo")
+    mgr.discard(staged)
+    assert record.argv0_paths["bin:gh"] == os.path.realpath(brew_gh / "gh")
+
+
 def test_directory_checks_run_on_the_staged_tree(mgr: ExtensionManager, repo: Path) -> None:
     ext = repo / "extensions" / "demo"
     (ext / "requirements.txt").write_text("requests\n")
@@ -596,13 +621,13 @@ jobs:
 
 
 def test_confirm_text_is_escalations_first_and_sanitized(
-    conn: sqlite3.Connection, resonant_home: Path, repo: Path, keychain: FakeKeychain
+    conn: sqlite3.Connection,
+    resonant_home: Path,
+    repo: Path,
+    keychain: FakeKeychain,
+    brew_gh: Path,
 ) -> None:
-    bindir = repo.parent / "bin"
-    bindir.mkdir()
-    (bindir / "gh").write_text("#!/bin/sh\n")
-    (bindir / "gh").chmod(0o755)
-    mgr = make_manager(conn, resonant_home, repo, keychain, ext_path=str(bindir))
+    mgr = make_manager(conn, resonant_home, repo, keychain, ext_path=str(brew_gh))
     (repo / "extensions" / "demo" / "resonant.yaml").write_text(HOSTILE)
     commit_all(repo)
     staged = mgr.stage("repo:demo")

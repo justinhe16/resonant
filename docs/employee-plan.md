@@ -20,7 +20,8 @@ What shipped:
 | #76 | EM-5 | Relay: worker questions and owner messages through the brain |
 | #77 | EM-8 | Router: `/repos`, `/repo …`, `/run [<repo>]`, repo tools on `run_project`, `merge_ci_pr` |
 | #78 | EM-9 | Employee-mode e2e, go-live step 14, `test.md` and the architecture docs |
-| this PR | EM-10 | Sweep of old-model leftovers; docs and config examples made current |
+| #79 | EM-10 | Sweep of old-model leftovers; docs and config examples made current |
+| this PR | EM-11 | `runner.repos` entries write only the fields they set; the github extension's `gh` pinned at install (`bins`), `/opt/homebrew/bin` off the extensions' PATH |
 
 ## 1. The model in one paragraph
 

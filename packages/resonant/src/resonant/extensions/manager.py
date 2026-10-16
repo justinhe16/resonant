@@ -38,10 +38,12 @@ from pydantic import ValidationError
 
 from resonant.extensions.checks import (
     approver_errors,
+    bin_key,
     commands,
     dir_errors,
     name_errors,
     resolve_argv0,
+    resolve_bin,
 )
 from resonant.extensions.pin import (
     CopyState,
@@ -171,6 +173,8 @@ def escalations(manifest: Manifest, registered: Collection[str] = ()) -> list[st
     for where, run in commands(manifest):
         if _argv0(run) in NETWORK_COMMANDS:
             out.append(f"{_s(where)} runs {_argv0(run)} (network)")
+    for name in manifest.bins:
+        out.append(f"its code runs {name} (network)")
     if manifest.report is not None and manifest.report.max_urgency == "urgent":
         out.append(report_grant(manifest))
     return out
@@ -393,6 +397,11 @@ class ExtensionManager:
                     resolve_argv0(root, run, path=self.ext_path)
                 except ValueError as e:
                     problems.append(f"{where}: {e}")
+            for name in manifest.bins:
+                try:
+                    resolve_bin(name, self.ext_path)
+                except ValueError as e:
+                    problems.append(f"bins: {e}")
         return problems
 
     def registered_slugs(self) -> frozenset[str]:
@@ -532,14 +541,17 @@ class ExtensionManager:
         return record
 
     def _argv0_paths(self, root: Path, manifest: Manifest) -> dict[str, str]:
-        """Pinned absolute argv[0] per spec name (``health`` for the health check)."""
+        """Pinned absolute argv[0] per spec name (``health`` for the health check), and each
+        manifest ``bins`` entry under ``bin:<name>``."""
         names = {f"tool {n}": n for n in manifest.tools}
         names.update({f"job {j.id}": j.spec_name for j in manifest.jobs})
         names["health"] = "health"
-        return {
+        pins = {
             names[where]: resolve_argv0(root, run, self.ext_path)
             for where, run in commands(manifest)
         }
+        pins.update({bin_key(b): resolve_bin(b, self.ext_path) for b in manifest.bins})
+        return pins
 
     def _ensure_data_dir(self, name: str) -> None:
         data = self.data_dir_for(name)

@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from resonant.extensions.checks import argv0_error, dir_errors, name_errors, resolve_argv0
+from resonant.extensions.checks import (
+    argv0_error,
+    dir_errors,
+    name_errors,
+    resolve_argv0,
+    resolve_bin,
+)
 from resonant_sdk import Effect, Event, Level, Manifest, load_manifest, new_id
 from resonant_sdk.manifest import cron_min_interval_s
 
@@ -314,20 +320,67 @@ def test_pyproject_without_dependencies_is_fine(tmp_path: Path) -> None:
     assert dir_errors(root, manifest()) == []
 
 
-def test_resolve_argv0_pins_absolute_paths(tmp_path: Path) -> None:
+def test_resolve_argv0_pins_absolute_paths(tmp_path: Path, brew_gh: Path) -> None:
     root = ext_dir(tmp_path)
-    bindir = tmp_path / "bin"
-    bindir.mkdir()
-    gh = bindir / "gh"
-    gh.write_text("#!/bin/sh\n")
-    gh.chmod(0o755)
     assert resolve_argv0(root, "./cli.py get") == str((root / "cli.py").resolve())
     assert resolve_argv0(root, "python3 cli.py") == sys.executable
-    assert resolve_argv0(root, "gh pr list", path=str(bindir)) == str(gh.resolve())
+    keg_gh = os.path.realpath(brew_gh / "gh")  # the keg's file, not the link
+    assert resolve_argv0(root, "gh pr list", path=str(brew_gh)) == keg_gh
     with pytest.raises(ValueError, match="not found"):
-        resolve_argv0(root, "git status", path=str(bindir))
+        resolve_argv0(root, "git status", path=str(brew_gh))
     with pytest.raises(ValueError, match="fetches"):
-        resolve_argv0(root, "npx x", path=str(bindir))
+        resolve_argv0(root, "npx x", path=str(brew_gh))
+
+
+def _loose(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_resolve_bin_refuses_a_gh_workers_could_replace(
+    tmp_path: Path, brew_gh: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a guarded Homebrew keg or a root-owned file is pinned: a loose file in an install
+    dir, a link into a keg elsewhere, or a gh outside the install dirs is refused."""
+    assert resolve_bin("gh", str(brew_gh)) == os.path.realpath(brew_gh / "gh")
+    elsewhere = _loose(tmp_path / "evil" / "Cellar" / "gh" / "9.9" / "bin" / "gh")
+    (brew_gh / "gh").unlink()
+    (brew_gh / "gh").symlink_to(elsewhere)  # a keg, but not this prefix's
+    with pytest.raises(ValueError, match="workers can write"):
+        resolve_bin("gh", str(brew_gh))
+    (brew_gh / "gh").unlink()
+    _loose(brew_gh / "gh")  # a loose file next to others a worker may write
+    with pytest.raises(ValueError, match="workers can write"):
+        resolve_bin("gh", str(brew_gh))
+    other = _loose(tmp_path / "other" / "gh")  # not an install dir
+    with pytest.raises(ValueError, match="workers can write"):
+        resolve_bin("gh", str(other.parent))
+    with pytest.raises(ValueError, match="can't be pinned"):
+        resolve_bin("python3", str(brew_gh))
+    # A root-owned file (no writable dir above it) is fine wherever it is.
+    from resonant.extensions import checks
+
+    def root_owned(path: Path) -> bool:
+        return path == other.resolve()
+
+    monkeypatch.setattr(checks, "_unwritable", root_owned)
+    assert resolve_bin("gh", str(other.parent)) == str(other.resolve())
+
+
+def test_resolve_bin_accepts_the_system_git() -> None:
+    if not os.path.isfile("/usr/bin/git") or os.access("/usr/bin", os.W_OK):
+        pytest.skip("no root-owned /usr/bin/git here")
+    assert resolve_bin("git", "/usr/bin") == os.path.realpath("/usr/bin/git")
+
+
+def test_bins_declare_only_pinnable_host_binaries() -> None:
+    base = {"name": "x", "version": 1}
+    assert Manifest.model_validate({**base, "bins": ["gh"]}).bins == ("gh",)
+    for bad in (["curl"], ["gh", "gh"], ["python3"]):
+        with pytest.raises(ValidationError):
+            Manifest.model_validate({**base, "bins": bad})
 
 
 def test_emit_writes_one_event_line_to_the_events_fd(monkeypatch: pytest.MonkeyPatch) -> None:

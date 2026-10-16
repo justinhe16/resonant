@@ -222,7 +222,8 @@ def make_world(
         },
         runner={
             "github_app": {"app_id": APP_ID, "installation_id": INSTALLATION_ID},
-            "repos": {REPO: {"remote": f"github.com/own/{REPO}"}},
+            # explicit: a repo's own default is to allow .github/ changes (the r4 tests flip it)
+            "repos": {REPO: {"remote": f"github.com/own/{REPO}", "allow_github_changes": False}},
             "work_dir": root / "runs",
             "code_dir": root / "code",
             "mirror_dir": root / "state" / "mirrors",

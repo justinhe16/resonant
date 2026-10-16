@@ -1,6 +1,6 @@
 # github extension
 
-GitHub for Resonant: your open pull requests with CI and review state, a watch that texts you when CI breaks or recovers or someone asks for your review, a morning summary that appears in the briefing's Updates section, and two approved writes: re-run failed CI and merge. It is stdlib Python plus the [`gh`](https://cli.github.com) CLI (`/opt/homebrew/bin/gh` on the Mini).
+GitHub for Resonant: your open pull requests with CI and review state, a watch that texts you when CI breaks or recovers or someone asks for your review, a morning summary that appears in the briefing's Updates section, and two approved writes: re-run failed CI and merge. It is stdlib Python plus the [`gh`](https://cli.github.com) CLI (`/opt/homebrew/bin/gh` on the Mini). The manifest declares `bins: [gh]`, so Resonant pins `gh`'s real path when you install the extension (it must be a Homebrew install the sandbox guard protects, or root-owned) and passes it as `RESONANT_BIN_GH`; `gh` is never looked up on `PATH`. After `brew upgrade gh` moves it, run `resonant ext update github` to pin the new one.
 
 | Name | Kind | Level | What it does |
 |---|---|---|---|

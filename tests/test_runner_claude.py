@@ -422,7 +422,10 @@ def build(
     gh.write_text(FAKE_GH.replace("@PY@", sys.executable).replace("@STATE@", str(gh_dir)))
     gh.chmod(0o755)
     cfg = RunnerConfig(
-        repos={name: RunnerRepo(remote=f"github.com/own/{name}") for name in repos},
+        repos={
+            name: RunnerRepo(remote=f"github.com/own/{name}", allow_github_changes=False)
+            for name in repos
+        },
         github_app=GitHubAppConfig(app_id=APP_ID, installation_id=INSTALLATION_ID),
         work_dir=root / "runs",
         code_dir=root / "code",

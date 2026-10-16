@@ -156,7 +156,7 @@ class Env:
         self.shim.write_text(GIT_SHIM.format(log=self.shim_log, envlog=self.env_log, git=GIT))
         self.shim.chmod(0o755)
         self.cfg = RunnerConfig(
-            repos={"proj": RunnerRepo(remote="github.com/own/proj")},
+            repos={"proj": RunnerRepo(remote="github.com/own/proj", allow_github_changes=False)},
             work_dir=root / "runs",
             code_dir=root / "code",
             mirror_dir=root / "state" / "mirrors",
@@ -262,7 +262,8 @@ def test_runner_yaml(resonant_home: Path) -> None:
     )
     repo = load_settings().runner.repos["resonant"]
     assert repo.remote == "github.com/me/resonant"
-    assert (repo.base, repo.quote_ask, repo.allow_github_changes) == ("develop", False, False)
+    assert (repo.base, repo.quote_ask) == ("develop", False)
+    assert repo.model_fields_set == {"remote", "base", "quote_ask"}  # what import_config writes
     assert repo.slug == "me/resonant"
 
 

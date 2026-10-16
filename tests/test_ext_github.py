@@ -1,7 +1,8 @@
 """The github extension (P3-9, P3-15) against a fake ``gh``: never the real one, never GitHub.
 
 Each test runs ``extensions/github/cli.py`` the way Resonant does (``python -I -S``, an env
-built from scratch) with a ``gh`` shim on a temp PATH that answers from a JSON state file.
+built from scratch) with a ``gh`` shim, pinned as ``RESONANT_BIN_GH`` the way the host passes
+it, that answers from a JSON state file.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ class Result:
 
 
 class FakeGh:
-    """A temp PATH with a ``gh`` shim, its state file, and the extension's data dir."""
+    """A pinned ``gh`` shim, its state file, and the extension's data dir."""
 
     def __init__(self, root: Path) -> None:
         self.bin = root / "bin"
@@ -49,15 +50,16 @@ class FakeGh:
         self.state_path = root / "gh" / "state.json"
         self.state_path.parent.mkdir()
         self.state: dict[str, Any] = {"token": TOKEN, "mine": [], "review": [], "runs": {}}
-        shim = self.bin / "gh"
-        shim.write_text(
+        self.shim = self.bin / "gh"
+        self.shim.write_text(
             f'#!/bin/sh\nexec "{sys.executable}" -I -S "{FAKE_GH}" "{self.state_path}" "$@"\n'
         )
-        shim.chmod(0o755)
+        self.shim.chmod(0o755)
 
     def env(self, **extra: str) -> dict[str, str]:
         env = {
-            "PATH": str(self.bin),
+            "PATH": "/usr/bin:/bin",  # the default extensions.process.path: no gh on it
+            "RESONANT_BIN_GH": str(self.shim),
             "HOME": str(self.data),
             "LANG": "en_US.UTF-8",
             "RESONANT_EXT": "github",
@@ -546,8 +548,18 @@ def test_missing_token_fails_before_gh(gh: FakeGh) -> None:
 def test_gh_missing_or_garbage_fails_cleanly(gh: FakeGh, tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
-    r = gh.run("prs", env=gh.env(PATH=str(empty)))
-    assert r.code == 1 and r.err == f"github: gh not found on {empty}\n"
+    unpinned = (
+        "github: gh isn't pinned (RESONANT_BIN_GH is unset or not a program);"
+        " on the Mini: resonant ext update github\n"
+    )
+    env = gh.env(PATH=str(gh.bin))  # a gh on PATH is never used
+    del env["RESONANT_BIN_GH"]
+    r = gh.run("prs", env=env)
+    assert r.code == 1 and r.err == unpinned
+    for bad in ("gh", str(empty / "gh"), str(empty)):  # relative, missing, not a program
+        r = gh.run("prs", env=gh.env(RESONANT_BIN_GH=bad))
+        assert r.code == 1 and r.err == unpinned, bad
+    assert gh.calls() == []
 
     gh.state["garbage"] = True
     r = gh.run("watch")

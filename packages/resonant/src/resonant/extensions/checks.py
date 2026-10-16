@@ -23,11 +23,16 @@ from typing import Any
 
 from resonant.principals import Principals
 from resonant.router.commands import BY_NAME
+from resonant.sandbox import guarded_tool
 from resonant_sdk import Manifest
 
 # argv[0] words allowed besides a file inside the extension dir. python3 means the daemon's
-# own interpreter; gh and git are looked up on the extension PATH and pinned at install.
+# own interpreter; gh and git are looked up on EXT_PATH and pinned at install.
 ALLOWED_COMMANDS = frozenset({"python3", "gh", "git"})
+# Binaries pinned by absolute path at install: as argv[0], or a manifest's ``bins`` (which an
+# extension's own code runs, given as RESONANT_BIN_<NAME>). Only the install-time lookup
+# searches /opt/homebrew/bin; a process's PATH (extensions.process.path) never needs it.
+PINNED_BINS = frozenset({"gh", "git"})
 EXT_PATH = "/opt/homebrew/bin:/usr/bin:/bin"
 # Commands that fetch and run code at call time. Refused by name, with a clearer message.
 FETCH_RUNNERS = frozenset(
@@ -130,10 +135,46 @@ def argv0_error(root: Path, run: str) -> str | None:
     return None
 
 
+def bin_key(name: str) -> str:
+    """The ``ExtensionRecord.argv0_paths`` key a manifest ``bins`` entry is pinned under (not
+    a spec name: those never hold a colon)."""
+    return f"bin:{name}"
+
+
+def bin_env(name: str) -> str:
+    """The variable a pinned ``bins`` entry reaches the extension's process in."""
+    return f"RESONANT_BIN_{name.upper()}"
+
+
+def _unwritable(path: Path) -> bool:
+    """Neither ``path`` nor any directory above it is writable by this user (root-owned or
+    SIP-protected), so no worker running as this user can replace it."""
+    return not any(os.access(p, os.W_OK) for p in (path, *path.parents))
+
+
+def resolve_bin(name: str, path: str = EXT_PATH) -> str:
+    """The real file ``name`` (``gh``/``git``) runs, looked up on ``path``, for pinning at
+    install. Raises ValueError when it is missing, or when it sits where a Claude worker
+    could replace it: it must be root-owned all the way up, or a Homebrew keg the sandbox
+    guard write-protects (``sandbox.guarded_tool``)."""
+    if name not in PINNED_BINS:
+        raise ValueError(f"{name!r} can't be pinned; only {', '.join(sorted(PINNED_BINS))}")
+    found = shutil.which(name, path=path)
+    if found is None:
+        raise ValueError(f"{name!r} not found on {path}")
+    real = Path(os.path.realpath(found))
+    if not (_unwritable(real) or guarded_tool(Path(found))):
+        raise ValueError(
+            f"{name!r} resolves to {real}, which Claude workers can write and the guard doesn't"
+            f" protect; install it with Homebrew (brew install {name})"
+        )
+    return str(real)
+
+
 def resolve_argv0(root: Path, run: str, path: str = EXT_PATH) -> str:
     """The absolute path ``run``'s argv[0] runs, for pinning at install. Raises ValueError.
 
-    ``python3`` is the daemon's own interpreter. ``gh``/``git`` are looked up on ``path``.
+    ``python3`` is the daemon's own interpreter. ``gh``/``git`` are :func:`resolve_bin`.
     """
     root = root.resolve()
     if err := argv0_error(root, run):
@@ -143,10 +184,7 @@ def resolve_argv0(root: Path, run: str, path: str = EXT_PATH) -> str:
         return sys.executable
     if "/" in word:
         return str((root / word).resolve())
-    found = shutil.which(word, path=path)
-    if found is None:
-        raise ValueError(f"{word!r} not found on {path}")
-    return str(Path(found).resolve())
+    return resolve_bin(word, path)
 
 
 def _inside_error(root: Path, rel: str) -> str | None:

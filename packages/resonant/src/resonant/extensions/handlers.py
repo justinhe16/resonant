@@ -13,7 +13,8 @@ job's ``run`` uses it).
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ class ExtensionHandler(ContextHandler):
     runner: ExtRunner
     path_env: str
     job: bool = False
+    bins: Mapping[str, str] = field(default_factory=dict[str, str])  # RESONANT_BIN_* -> pin
 
     async def __call__(self, args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         due_at: str | None = None
@@ -59,6 +61,7 @@ class ExtensionHandler(ContextHandler):
             secrets=ctx.secrets,
             job_due_at=due_at,
             path=self.path_env,
+            bins=self.bins,
         )
         redactor = Redactor(values_of(env))
         out = await self.runner.run(

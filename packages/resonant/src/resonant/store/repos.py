@@ -349,6 +349,7 @@ def _import_one(
     conn: sqlite3.Connection, name: str, cfg: RunnerRepo, renamed: list[tuple[str, str]]
 ) -> None:
     _check_handle(name)
+    explicit = cfg.model_fields_set
     existing = get(conn, cfg.slug)
     squatter = find(conn, name)
     if squatter is not None and (existing is None or squatter.slug != existing.slug):
@@ -372,27 +373,40 @@ def _import_one(
             name=name,
             base=cfg.base,
             source="owner",
-            allow_github_changes=cfg.allow_github_changes,
-            quote_ask=cfg.quote_ask,
+            # unset: the registry's defaults (on; quote_ask by mode), not the model's
+            allow_github_changes=(
+                cfg.allow_github_changes if "allow_github_changes" in explicit else True
+            ),
+            quote_ask=cfg.quote_ask if "quote_ask" in explicit else None,
         )
         set_path(conn, cfg.slug, cfg.path)
         return
     if existing.name.lower() != name.lower():
         _rename(conn, existing, name, keep_old=True)
         renamed.append((existing.name, name))
+    # Only what the entry sets: an entry added for its path keeps the registry's other values.
+    # The column names come from this fixed tuple, never from the config.
+    values: dict[str, str | int] = {"source": "owner"}
+    for field in ("base", "allow_github_changes", "quote_ask"):
+        if field in explicit:
+            v = getattr(cfg, field)
+            values[field] = int(v) if isinstance(v, bool) else v
     conn.execute(
-        "UPDATE repos SET base = ?, allow_github_changes = ?, quote_ask = ?, source = 'owner'"
-        " WHERE slug = ?",
-        (cfg.base, int(cfg.allow_github_changes), int(cfg.quote_ask), existing.slug),
+        f"UPDATE repos SET {', '.join(f'{k} = ?' for k in values)} WHERE slug = ?",  # noqa: S608
+        (*values.values(), existing.slug),
     )
     set_path(conn, existing.slug, cfg.path)
 
 
 def import_config(conn: sqlite3.Connection, configured: Mapping[str, RunnerRepo]) -> ImportResult:
     """Upsert the ``runner.repos`` config entries as ``source=owner`` (idempotent: a second
-    call changes nothing). The config is only a seed after this. The configured name wins: a
-    repo that auto-registered under it is renamed (unless it has a run in progress), and a
-    repo already registered under another handle keeps that handle as an alias.
+    call changes nothing). The config is only a seed after this. An entry writes only the
+    fields it sets (``path`` aside, which an entry always states): an unset ``base``,
+    ``allow_github_changes`` or ``quote_ask`` keeps the registry's value, or for a new repo
+    the registry's default (``allow_github_changes`` on, ``quote_ask`` on unless ``fork``).
+    The configured name wins: a repo that auto-registered under it is renamed (unless it has a
+    run in progress), and a repo already registered under another handle keeps that handle as
+    an alias.
 
     An entry that can't be imported (a bad handle, a clash with another owner entry, a rename
     blocked by a run) is skipped with a reason; the rest still import."""

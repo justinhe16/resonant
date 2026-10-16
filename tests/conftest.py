@@ -40,3 +40,20 @@ def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     conn = open_db(tmp_path / "test.db")
     yield conn
     conn.close()
+
+
+@pytest.fixture
+def brew_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A fake Homebrew prefix whose ``bin/gh`` links into ``Cellar/gh/2.0``, made an install
+    dir (``sandbox.profile.HOST_TOOL_DIRS``) so the guard protects it. Returns its ``bin``."""
+    from resonant.sandbox import profile
+
+    prefix = tmp_path / "brew"
+    real = prefix / "Cellar" / "gh" / "2.0" / "bin" / "gh"
+    real.parent.mkdir(parents=True)
+    real.write_text("#!/bin/sh\n")
+    real.chmod(0o755)
+    (prefix / "bin").mkdir()
+    (prefix / "bin" / "gh").symlink_to(real)
+    monkeypatch.setattr(profile, "HOST_TOOL_DIRS", (str(prefix / "bin"), "/usr/bin", "/bin"))
+    return prefix / "bin"

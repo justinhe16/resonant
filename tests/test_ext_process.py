@@ -198,6 +198,7 @@ def test_scratch_env_is_exactly_the_allowlist(tmp_path: Path) -> None:
         secrets={"RESONANT_SECRET_TOKEN": FAKE_A, "RESONANT_SECRET_API_KEY": FAKE_B},
         job_due_at="2026-10-14T08:00:00+00:00",
         user="justin",
+        bins={"RESONANT_BIN_GH": "/opt/homebrew/Cellar/gh/2.0/bin/gh"},
     )
     assert env == {
         "PATH": SCRATCH_PATH,
@@ -211,9 +212,13 @@ def test_scratch_env_is_exactly_the_allowlist(tmp_path: Path) -> None:
         "RESONANT_EVENTS_FD": "3",
         "GIT_TERMINAL_PROMPT": "0",
         "RESONANT_JOB_DUE_AT": "2026-10-14T08:00:00+00:00",
+        "RESONANT_BIN_GH": "/opt/homebrew/Cellar/gh/2.0/bin/gh",
         "RESONANT_SECRET_TOKEN": FAKE_A,
         "RESONANT_SECRET_API_KEY": FAKE_B,
     }
+    for bad in ({"PATH": "/x"}, {"RESONANT_BIN_GH": "gh"}, {"RESONANT_BIN_": "/x"}):
+        with pytest.raises(ValueError, match="pinned bin"):
+            scratch_env(ext="e", data_dir=tmp_path, bins=bad)
     plain = scratch_env(ext="example", data_dir=tmp_path)
     assert "RESONANT_JOB_DUE_AT" not in plain
     assert not [k for k in plain if k.startswith("RESONANT_SECRET_")]
