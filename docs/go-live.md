@@ -271,7 +271,7 @@ Times, codes and figures below are examples.
 
 ## 14. Employee mode: Claude workers
 
-Step 13 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen`), then do terminal step 1 below before anything else. Until steps 1–5 are done, everything else keeps working, while `/runs` and "spawn a claude to …" answer `The runner isn't set up: …` (naming what's missing) and nothing can start a run.
+Step 13 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen`), then do terminal step 1 below before anything else. Until steps 2–4 are done, everything else keeps working, while `/runs` and "spawn a claude to …" answer `The runner isn't set up: …` (naming what's missing) and nothing can start a run.
 
 What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an employee. "spawn a claude to build out the search page in dori" gets `On it: R4 · dori.`, and a Claude Code worker starts in a git worktree of your real checkout, `~/code/<repo>`, with your `.env` files, Docker and the network. An ask with no repo ("do a manual db update in dori-prod …") gets an empty scratch dir. Workers act on standing trust. They ask you only for something net new (a new system, a new kind of action, anything irreversible, anything that costs money), and they ask questions when they need you (`R4 asks: …`). Good news (a PR, done, merged) goes into the hourly digest; failures, questions and checks text you right away. The **thin guard** (a macOS sandbox) only protects Resonant itself: workers can't write `~/.resonant` or the installed daemon, read the Keychain or Messages, signal the daemon, add auto-start entries or reach the API port. Codes (`R1`, `K4`), PR numbers and times below are examples.
 

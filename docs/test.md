@@ -35,7 +35,7 @@ Update a row when you try it, with the date and anything odd.
 
 | # | Test | Where | Status |
 |---|---|---|---|
-| 17 | Sandbox self-check: `resonant sandbox check` | every deny and allow row passes (Claude can run it) | 🖥 (Claude) |
+| 17 | Sandbox self-check: `resonant sandbox check` | every deny and allow row passes, including Docker and Messages (Claude can run it; CI skips the guard e2e, which runs only on a Mac) | 🖥 (Claude) |
 | 18 | GitHub token: `resonant secret set github/token`, then `check` | go-live 12, terminal 1 | 🖥 |
 | 19 | `resonant ext add repo:github` (typed confirm) | go-live 12, terminal 2 | 🖥 |
 | 20 | `scripts/bootstrap.sh --check` rows for the github pin, secret and jobs | go-live 12, terminal 4 | 🖥 |
@@ -59,7 +59,7 @@ Update a row when you try it, with the date and anything odd.
 | 38 | Branch protection on each base you care about; "no CI edits in <repo>" where Actions secrets matter | go-live 14, on GitHub | 🖥 (Claude can check) |
 | 39 | First real run: the worker's own `gh pr create` and `gh pr checks --watch` work with the App's installation token (PR by `<app>[bot]`); worktree under `~/code/.worktrees`, checkout untouched; no sandbox or permission errors in the transcript; no token in logs | go-live 14, first run | 🖥 (Claude) after 31–36 |
 | 40 | Spawn in plain words: "spawn a claude to …" → `On it: R1 · <repo>.`; no done text; the next `btw:` has `Workers:` / `R1 done: PR #… (CI green) · <url>` | go-live 14, iMessage 2 | 📱 after 39 |
-| 41 | A worker's question: `R1 asks: …`, a plain reply → `→ R1`, the run carries on; with two waiting, `R2 <answer>` and a reply by content go to the right one | go-live 14, iMessage 4 | 📱 after 39 |
+| 41 | A worker's question: `R1 asks: …`, a plain reply → `→ R1`, the run carries on; with two or three workers waiting at once, `R2 <answer>` and a reply by content go to the right one | go-live 14, iMessage 4 | 📱 after 39 |
 | 42 | A net-new check: `[K4] R1 wants to … Reply yes / yes always / no`; `yes always` → `Rule added: don't ask before …`; the next one doesn't ask | go-live 14, iMessage 5 | 📱 after 39 |
 | 43 | A rule taught over chat makes a merge ask: "always ask before merging in <area>", then "merge R<n>" on a run there asks; on another repo it merges | go-live 14, iMessage 6 | 📱 after 39 |
 | 44 | A scratch run (no repo): `On it: R… · no repo (scratch dir).`, then `R… done: <summary>` in the digest; no PR | go-live 14, iMessage 7 | 📱 after 39 |
