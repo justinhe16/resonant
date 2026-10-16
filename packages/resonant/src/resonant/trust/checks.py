@@ -8,7 +8,9 @@ API for EM-3 (the worker CLI's per-run socket)::
         what="deploy dori-api to prod",
     )  # "ok" | "denied"
 
-``request_check`` never raises for a "no": it returns ``"denied"``. It raises
+``request_check`` never raises for a "no": it returns ``"denied"``. ``"busy"`` means the
+check wasn't asked at all, because ``MAX_PENDING`` of the run's checks already wait for the
+owner (the worker is told to wait for those answers, which is not an owner "no"). It raises
 ``ValueError`` only for a bad ``system`` or ``action`` (not a slug, or ``*``), which the
 CLI should report to the worker as a usage error. ``IMessageStack.trust`` holds the
 daemon's instance.
@@ -73,11 +75,11 @@ from resonant_sdk import Effect, Level
 
 log = logging.getLogger(__name__)
 
-CHECK_TOOL = "trust_check"  # the approvals' tool name; no registered tool has it
+CHECK_TOOL = ap.CHECK_TOOL  # the approvals' tool name; no registered tool has it
 POLL_S = 1.0
 REPROMPT_S = 30.0  # re-send the prompt after a transient channel failure
 
-Answer = Literal["ok", "denied"]
+Answer = Literal["ok", "denied", "busy"]
 
 
 MAX_PENDING = 3  # pending checks per run; more is approval spam
@@ -153,7 +155,8 @@ class TrustChecks:
         cost_usd: float = 0.0,
         what: str = "",
     ) -> Answer:
-        """``"ok"`` or ``"denied"`` for one worker check (see the module docstring)."""
+        """``"ok"``, ``"denied"`` or ``"busy"`` for one worker check (see the module
+        docstring)."""
         system, action = store.slug(system), store.slug(action)
         if store.ANY in (system, action):
             raise ValueError("a check names one system and one action, not *")
@@ -185,9 +188,9 @@ class TrustChecks:
             what,
             repo=store.slug(run.repo) if run.repo else None,
         )
-        if approval is None:
-            self._audit(run.code, system, action, "denied", "too many pending checks")
-            return "denied"
+        if approval is None:  # not asked: the worker is told to wait (EM-5), not "no"
+            self._audit(run.code, system, action, "busy", "too many pending checks")
+            return "busy"
         try:
             answer, why = await self._wait(run.code, run.task_id, approval, system, action)
         except asyncio.CancelledError:

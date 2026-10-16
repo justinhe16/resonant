@@ -4,7 +4,8 @@ checks and owner messages for running Claude workers.
 ``WorkerDesk.handle`` answers one CLI request from a run's socket (``worker_cli``):
 
 - ``ask``: records the question, emits a ``question`` event, texts the requester
-  ``R4 asks: <question>`` (the run replies' path, until EM-5 routes replies) and waits up to
+  ``R4 asks: <question>`` (``worker_text.owner_question_text``; the owner's reply comes back
+  through the router's relay, EM-5), opens its pulse item, and waits up to
   ``block_s`` (8 minutes; the session's Bash tool allows 10) for ``answer_question``. Answered:
   the answer. Not yet: ``NO_ANSWER_YET`` (exit 3) and the question is deferred, so the run
   waits for it (``waiting``, reason ``question``) once the session's turn ends, and resumes
@@ -24,8 +25,9 @@ updates, so an answer is delivered whichever path (a blocked CLI call, a resume
 prompt) gets there first (at least once: a reply is marked delivered once it is written),
 and a restart loses nothing but the CLI call in flight.
 
-Events (``WorkerEvents``) are the hook EM-5 (relay) and EM-6 (digest, urgency) subscribe to:
-``question``, ``note`` (``urgent`` set for ``--urgent``) and ``check``. For now they are logged.
+Events (``WorkerEvents``) are the hook EM-6 (digest, urgency) subscribes to: ``question``,
+``note`` (``urgent`` set for ``--urgent``) and ``check``. The relay (EM-5) reads the store
+through ``open_questions``/``answer_question``/``deliver_message`` instead.
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ from resonant.gate.codes import clean_external
 from resonant.gateway.channel import Channel, ChannelError
 from resonant.redact import Redactor
 from resonant.runners.worker_cli import (
+    EXIT_BUSY,
     EXIT_DENIED,
     EXIT_OK,
     EXIT_PENDING,
@@ -57,19 +60,22 @@ from resonant.runners.worker_cli import (
     Reply,
     Request,
 )
+from resonant.store import pulse as pulse_store
 from resonant.store import questions as qs
 from resonant.store import runs
 from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.store.runs import Run
 from resonant.store.trust import ANY, slug
-from resonant.trust.checks import CHECK_TOOL
+from resonant.trust.checks import CHECK_TOOL, MAX_PENDING
+from resonant.worker_text import owner_question_text
 
 log = logging.getLogger(__name__)
 
 BLOCK_S = 480.0  # how long one ask or check call waits (Claude's Bash tool allows 600 s)
 MAX_OPEN_ASKS = 1  # so an answer can't reach the wrong one of a run's questions
 OWNER_TEXT_MAX = 600
+TWIN_S = 600.0  # an ask repeated this soon after its answer is a retry: the same answer
 NOTE_MAX = 200
 ASK_TIMEOUT = "No answer from the owner; use your judgment or stop."
 CHECK_TIMEOUT = "No decision from the owner; treat it as denied: don't do it."
@@ -78,7 +84,14 @@ RESTARTED = (
 )
 CHECK_OK = "ok"
 CHECK_DENIED = "denied"
+CHECK_BUSY = "busy"  # not asked: MAX_PENDING checks already wait for the owner
+BUSY = (
+    "Too many pending checks; wait for the owner's answers to those, then run this check "
+    "again. This is not a no."
+)
 RUN_OVER = "This run is over; stop."
+PULSE_SOURCE = "core"
+QUESTION_ITEM_TTL_S = 24 * 3600  # the pulse re-mentions an open question each hour until then
 
 EventKind = Literal["question", "note", "check"]
 NO_TRUST = "denied: checks aren't set up here, so don't do it."
@@ -95,7 +108,7 @@ class TrustChecker(Protocol):
         irreversible: bool = False,
         cost_usd: float = 0.0,
         what: str = "",
-    ) -> Literal["ok", "denied"]: ...
+    ) -> Literal["ok", "denied", "busy"]: ...
 
 
 @dataclass(frozen=True)
@@ -230,6 +243,12 @@ class WorkerDesk:
             (o for o in open_asks if o.question == req.question and o.options == req.options),
             None,
         )
+        twin = None if q is not None else _answered_twin(self.conn, run.code, req, self.clock())
+        if twin is not None:
+            # A retry of the run's last question just after the owner answered it (the
+            # session lost the reply): the same answer again, and the owner isn't re-texted.
+            return self._reply(run.code, f"You asked this already. {_answer_line(twin)}",
+                               EXIT_OK, qid=twin.id)  # fmt: skip
         if q is None:
             if len(open_asks) >= MAX_OPEN_ASKS:
                 return self._reply(run.code, (
@@ -266,17 +285,50 @@ class WorkerDesk:
         return self._reply(code, _answer_line(q), EXIT_OK, qid=qid)
 
     async def _tell_owner(self, run: Run, q: qs.Question) -> None:
-        """``R4 asks: …`` to the requester, on the run replies' path (EM-5 refines routing)."""
-        red = self._redactor_for(run.code)
-        text = f"{run.code} asks: {clean_external(red.text(q.question))}"
-        if q.options:
-            text += "\nOptions: " + ", ".join(clean_external(red.text(o)) for o in q.options)
-        if len(text) > OWNER_TEXT_MAX:
-            text = text[: OWNER_TEXT_MAX - 3].rstrip() + "..."
+        """``R4 asks: <q>`` (with ``(a) … (b) …`` options; ``⚠`` first when urgent) to the
+        requester, on the run replies' path. With other questions open it ends with how to
+        answer this one by code, since a plain reply would be ambiguous (EM-5)."""
+        others = any(
+            o.run_code != run.code and _principal(self.conn, o.run_code) == run.principal
+            for o in qs.open_asks(self.conn)
+        )
+        text = owner_question_text(
+            run.code, q.question, q.options, urgent=q.urgent, others_open=others,
+            redactor=self._redactor_for(run.code),
+        )  # fmt: skip
+        self._pulse_question(run, q)
         try:
             await self.channel.send(run.principal, text, dedupe_key=f"run:{run.code}:ask:{q.id}")
-        except ChannelError as e:  # the question stays open; /runs and EM-5 can still show it
+        except ChannelError as e:  # the question stays open; the pulse re-mentions it
             log.warning("question not texted", extra={"run": run.code, "reason": str(e)})
+
+    def _pulse_question(self, run: Run, q: qs.Question) -> None:
+        """The question as a core pulse item, already told (it is texted now). The hourly
+        pulse re-mentions it while it stays open (``pulse_job.refresh_core_items``)."""
+        title = owner_question_text(
+            run.code, q.question, q.options, urgent=q.urgent,
+            redactor=self._redactor_for(run.code),
+        ).replace("\n", " ")  # fmt: skip
+        now = self.clock()
+        with atomic(self.conn):
+            _change, item = pulse_store.upsert(
+                self.conn, PULSE_SOURCE, question_item_key(run.code, q.id), title, "normal",
+                {"open": True}, False, QUESTION_ITEM_TTL_S, now,
+            )  # fmt: skip
+            pulse_store.mark_told(self.conn, [item], now)
+
+    def _pulse_question_done(self, code: str, qid: int) -> None:
+        """Clear the question's pulse item silently: answered, timed out or cancelled."""
+        key, now = question_item_key(code, qid), self.clock()
+        with atomic(self.conn):
+            item = pulse_store.get(self.conn, PULSE_SOURCE, key)
+            if item is None or item.cleared:
+                return
+            _change, cleared = pulse_store.upsert(
+                self.conn, PULSE_SOURCE, key, item.title, "normal", {"open": False}, True,
+                QUESTION_ITEM_TTL_S, now,
+            )  # fmt: skip
+            pulse_store.mark_told(self.conn, [cleared], now)
 
     async def _note(self, run: Run, req: Note) -> Reply:
         red = self._redactor_for(run.code)
@@ -300,6 +352,8 @@ class WorkerDesk:
             return Reply(NO_TRUST, EXIT_DENIED)
         key = (run.code, system, action, req.irreversible, req.cost_usd, req.what)
         entry = self._checks.get(key)
+        if entry is None and len(qs.open_for_run(self.conn, run.code, "check")) >= MAX_PENDING:
+            return self._reply(run.code, BUSY, EXIT_BUSY)  # not a "no": nothing was asked
         if entry is None:
             text = self._check_text(system, action, req)
             q = qs.ask(self.conn, run.code, "check", text, at=self.clock())
@@ -328,8 +382,9 @@ class WorkerDesk:
         if gone.done():
             return None
         ok = q.status == "answered" and q.answer == CHECK_OK
-        return self._reply(run.code, _check_line(q, short=True), EXIT_OK if ok else EXIT_DENIED,
-                           qid=qid)  # fmt: skip
+        busy = q.status == "answered" and q.answer == CHECK_BUSY
+        rc = EXIT_OK if ok else EXIT_BUSY if busy else EXIT_DENIED
+        return self._reply(run.code, _check_line(q, short=True), rc, qid=qid)
 
     @staticmethod
     def _check_text(system: str, action: str, req: Check, *, daemon: bool = False) -> str:
@@ -398,8 +453,8 @@ class WorkerDesk:
             answer = CHECK_DENIED
         with atomic(self.conn):
             audit(self.conn, "run.check", run=code, system=system, verb=action, answer=answer)
-        if qs.answer(self.conn, qid, CHECK_OK if answer == "ok" else CHECK_DENIED,
-                     at=self.clock()):  # fmt: skip
+        recorded = {"ok": CHECK_OK, "busy": CHECK_BUSY}.get(answer, CHECK_DENIED)
+        if qs.answer(self.conn, qid, recorded, at=self.clock()):
             self._notify(code, qid)
 
     async def _wait_for(self, event: asyncio.Event, gone: asyncio.Future[None]) -> None:
@@ -438,9 +493,13 @@ class WorkerDesk:
             for q in qs.open_asks(self.conn)
         ]
 
-    def answer_question(self, run_code: str, text: str) -> Relayed:
-        """The owner's answer to the run's oldest open question. Delivered to a CLI call
-        still waiting, else on the session's next turn (the run resumes if it was waiting)."""
+    def answer_question(
+        self, run_code: str, text: str, *, question_id: int | None = None
+    ) -> Relayed:
+        """The owner's answer to the run's oldest open question (or exactly question
+        ``question_id``: the one the owner was shown, so an answer can't land on a newer
+        question). Delivered to a CLI call still waiting, else on the session's next turn
+        (the run resumes if it was waiting)."""
         text = text.strip()
         if not text:
             raise RelayRefused("An answer needs some text.")
@@ -450,11 +509,16 @@ class WorkerDesk:
         if not run.active:
             raise RelayRefused(f"{run.code} isn't running ({run.status}).")
         for q in qs.open_for_run(self.conn, run.code, "ask"):
+            if question_id is not None and q.id != question_id:
+                continue
             if qs.answer(self.conn, q.id, text, at=self.clock()):
                 with atomic(self.conn):
                     audit(self.conn, "run.answer", run=run.code, question_id=q.id)
+                self._pulse_question_done(run.code, q.id)
                 self._notify(run.code, q.id)
-                return Relayed(run.code, f"Sent to {run.code}.")
+                return Relayed(run.code, f"\u2192 {run.code}")
+        if question_id is not None:
+            raise RelayRefused(f"{run.code}'s question was already answered or timed out.")
         raise RelayRefused(f"{run.code} has no open question.")
 
     def deliver_message(self, run_code: str, text: str) -> Relayed:
@@ -472,7 +536,7 @@ class WorkerDesk:
         with atomic(self.conn):
             audit(self.conn, "run.message", run=run.code, message_id=m.id)
         self._wake(run, f"message:{m.id}")
-        return Relayed(run.code, f"Passed to {run.code}.")
+        return Relayed(run.code, f"\u2192 {run.code} (message)")
 
     def _notify(self, code: str, qid: int) -> None:
         """A question left ``open``: release the CLI calls waiting on it and wake the run."""
@@ -508,6 +572,8 @@ class WorkerDesk:
                            at=now):  # fmt: skip
                 with atomic(self.conn):
                     audit(self.conn, "run.ask_timeout", run=code, question_id=q.id)
+                if q.kind == "ask":
+                    self._pulse_question_done(code, q.id)
                 self._stop_check(q.id)
                 if (ev := self._waiters.pop(q.id, None)) is not None:
                     ev.set()
@@ -519,7 +585,10 @@ class WorkerDesk:
 
     def close_run(self, code: str) -> None:
         """The run ended: its open questions are closed and any decision in flight dropped."""
+        open_asks = qs.open_for_run(self.conn, code, "ask")
         qs.cancel_open(self.conn, code)
+        for q in open_asks:
+            self._pulse_question_done(code, q.id)
         for key, (qid, task) in list(self._checks.items()):
             if key[0] == code:
                 task.cancel()
@@ -559,6 +628,33 @@ class WorkerDesk:
                 task.cancel()
 
 
+def question_item_key(code: str, qid: int) -> str:
+    """The core pulse item of one open question: ``question/r4-12``."""
+    return f"question/{code.lower()}-{qid}"
+
+
+def _principal(conn: sqlite3.Connection, code: str) -> str | None:
+    run = runs.get(conn, code)
+    return None if run is None else run.principal
+
+
+def _answered_twin(
+    conn: sqlite3.Connection, code: str, req: Ask, now: datetime
+) -> qs.Question | None:
+    """The run's last ask, when it is this same question (and options), answered, and either
+    not yet delivered or answered within ``TWIN_S``: a retry. An older answer, or one from
+    before another question, is not reused: asking again then asks the owner again, so an
+    earlier yes can't stand in for a later decision."""
+    asks = [q for q in qs.for_run(conn, code) if q.kind == "ask"]
+    if not asks:
+        return None
+    last = asks[-1]
+    if last.status != "answered" or (last.question, last.options) != (req.question, req.options):
+        return None
+    fresh = last.answered_at is not None and now - last.answered_at <= timedelta(seconds=TWIN_S)
+    return last if last.delivered_at is None or fresh else None
+
+
 def _answer_line(q: qs.Question) -> str:
     if q.status == "timed_out":
         return q.answer or ASK_TIMEOUT
@@ -570,6 +666,8 @@ def _check_line(q: qs.Question, *, short: bool = False) -> str:
         return q.answer or CHECK_TIMEOUT
     if q.answer == CHECK_OK:
         return "ok" if short else f"Your check ({clip(q.question, 200)}) is ok: go ahead."
+    if q.answer == CHECK_BUSY:
+        return BUSY if short else f"Your check ({clip(q.question, 200)}) wasn't asked. {BUSY}"
     denied = "denied: don't do it. Find another way, or stop and say why in your summary."
     return denied if short else f"Your check ({clip(q.question, 200)}) was {denied}"
 

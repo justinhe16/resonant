@@ -277,8 +277,13 @@ def build_imessage_stack(
     components.runners[jobs.name] = jobs
     loop.runners[jobs.name] = jobs
     # workers' `resonant check` (EM-3 calls request_check; EM-4)
+    # A check's approval lives as long as the worker waits for it (runner.ask_timeout), not
+    # the gate's 30-minute TTL, so an unanswered check isn't denied early (EM-5).
     trust = TrustChecks(
-        conn, channel, components.principals, approval_ttl_s=settings.gate.approval_ttl_s
+        conn,
+        channel,
+        components.principals,
+        approval_ttl_s=settings.runner.ask_timeout_minutes * 60,
     )
     claude = ClaudeRunner(
         conn,
@@ -296,6 +301,7 @@ def build_imessage_stack(
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
     router.fast_path.runs_killed = lambda: claude.last_killed
+    router.relay.workers = lambda: claude  # owner replies to worker questions (EM-5)
 
     owner = components.principals.owner if components.principals_loaded else None
     # /ext run core/briefing (P3-14): the briefing on demand, through this channel.

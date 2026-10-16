@@ -204,6 +204,26 @@ def test_resolve_refuses_expired(db: sqlite3.Connection) -> None:
     assert ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW) == "expired"
 
 
+def test_a_worker_check_resolves_while_its_task_is_queued(db: sqlite3.Connection) -> None:
+    """EM-5: a run woken and waiting for a Claude slot is ``queued``; its trust check's
+    approval still takes the owner's answer (other approvals don't)."""
+    task_id = _task(db, "queued")
+    aid = ap.insert_approval(
+        db,
+        ap.NewApproval(task_id=task_id, intent_hash="c1", tool=ap.CHECK_TOOL,
+                       effect=Effect.WRITE, level=Level.L2, summary="R4 wants to deploy",
+                       approvers=("justin",), code="C4", expires_at=NOW + TTL,
+                       requested_by="R4"),
+        NOW,
+    )  # fmt: skip
+    assert ap.resolve(db, aid, approved=True, decided_by="justin", now=NOW) is None
+    assert _status(db, aid) == "approved"
+    other = _approval(db, task_id, code="D6", intent_hash="h2")
+    assert ap.resolve(db, other, approved=True, decided_by="justin", now=NOW) == (
+        "task_not_waiting"
+    )
+
+
 def test_resolve_refuses_task_not_waiting(db: sqlite3.Connection) -> None:
     task_id = _task(db, "queued")
     aid = _approval(db, task_id)

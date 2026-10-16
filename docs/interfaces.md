@@ -263,6 +263,7 @@ Request (`resonant.gate.codes`):
 - `require_code` (L1, pay): only `yes <code>` approves. A plain `no` may deny under the single-pending rule.
 - **Idempotent per event.** If `reply.event_id` already resolved an approval (`resolved_event_id`), the gate returns that original result with no write, wake or audit. A replay under another actor gets `nothing_pending`.
 - `yes always` (EM-4) binds by the same rules (code or single pending, sent-before), but only to an approval with `allow_always` (a worker's trust check, `trust.checks`; never `require_code`, not when an owner's `ask` rule made the check ask, and not when the system is an area of a system already seen or a rule's scope). For any other approval it is refused as `always_unsupported`, never read as a plain `yes`. The store's conditional UPDATE re-checks it. A bound `yes always` sets `approvals.always`; the waiting check adds the rule.
+- **Worker questions (EM-5).** A plain `yes`/`no` (no code) while a worker question is open for the actor binds no approval when one of the actor's approval prompts is also open: the router replies `Which one? Approval K4 (…), or R4's question. Reply yes K4 / no K4 for the approval, or R4 yes for the question.` With no approval prompt open it goes to the question (`router/relay.py`), not to `Nothing is waiting for approval.` A code (`yes K4`) always binds the approval; `R4 yes` always answers the question. A worker's `trust_check` approval is answerable while its run's task is `queued` (woken, waiting for a Claude slot); other approvals still need `waiting` or `running`.
 - `yes with comments: …` approves and appends one `Event(source="gate", type="human_input", payload={approval_id, comments})` to the task (`dedupe_key="approval:<id>:comments"`), before the wake.
 
 Refusals are closed (`ReplyRefusal`, `REPLY_REFUSALS` in `resonant.gate.types`):
@@ -441,9 +442,11 @@ Handlers return JSON-serializable dicts and never raise for "no data". Bad args 
 | `restart_resonant` (L2) | none | `{label, restarting: true, delay_s: 3, commit}`. Writes the restart marker and spawns the detached helper; returns at once ([Ops](#ops-resonantops-resonanttoolsops)). `commit` is the repo's short HEAD, or null. |
 | `update_resonant` (L2) | none | `{old, new, updated, synced, restarting}` (+ `delay_s` when restarting, `sync_error` when the sync failed). Refuses (`ToolFailed`) without `ops.repo_path` or `ops.uv_path`, off `main` (`not on main; not updating`), with a dirty tree (`working tree has changes; not updating`), or when `git pull --ff-only` fails. HEAD unchanged: `updated: false`, nothing else runs. A failed `uv sync --frozen` returns `synced: false` and does not restart. |
 | `start_run` (L3) | `repo`: one of `runner.repos` (an enum in the registered spec, so it lists the configured names; code also refuses an unknown name); `ask`: 1..4000 chars | `{started, code?, repo?, text}`: `ClaudeRunner.start_run` as the owner. `text` is the code-built reply (`On it: R1 · dori. Up to 30m. …`, or the refusal: `The runner isn't set up: …`, `No repo named x. Known: …`, paused). A refusal is a normal result with `started: false`. No approval: the sandbox is the wall. |
-| `list_runs` | `code?`: `R<n>` | `{runs: [{code, repo, status, ask (clipped to 60), elapsed_s, pr_number, pr_url, files_changed, flagged_paths, summary, failure}], count, truncated, code, setup?}`: active runs first, at most 8; one run with `code`. `summary` and `failure` are cleaned and clipped to 120. `setup` is the not-set-up sentence when there are no runs to show. |
+| `list_runs` | `code?`: `R<n>` | `{runs: [{code, repo, status, ask (clipped to 60), elapsed_s, pr_number, pr_url, files_changed, flagged_paths, summary, failure, question}], count, truncated, code, setup?}`: active runs first, at most 8; one run with `code`. `summary` and `failure` are cleaned and clipped to 120. `setup` is the not-set-up sentence when there are no runs to show. |
 | `cancel_run` (L3) | `code`: `R<n>` | `{cancelled, code, text}` (`R3 cancelled.` or the refusal) |
 | `merge_run` (L2) | `code`: `R<n>` | `{merged, code, text, pr_number?, flagged_paths?}`. `/merge R3` is explicit and runs; a model-chosen call asks a plain yes whose prompt (`tools.runs.summary_action`) reads `merge R7: PR #41 in dori <url>, changes Makefile`. `text` repeats the flagged paths and the PR link. Needs a `ready` run and green CI. |
+| `answer_worker` (L3) | `code`: `R<n>`; `text`: 1..2000 chars | `{sent, code, text}`: `ClaudeRunner.answer_question` (EM-5). A run with no open question gets the text as a message. `text` is `→ R4` (or `→ R4 (message)`, or the refusal). No approval: it's the owner talking to their own worker. |
+| `message_worker` (L3) | `code`: `R<n>`; `text`: 1..2000 chars | `{sent, code, text}`: `ClaudeRunner.deliver_message`; `→ R4 (message)` or the refusal (`R4 isn't running (done).`). |
 | `list_trust_rules` (`/rules`) | none | `{rules: [{id, scope, action, effect, text, note, created_from}], count}`, oldest first. `text` is the rule in words (`ask before merge in trading`). |
 | `add_trust_rule` (L3) | `scope`, `action`: slugs or `*`; `effect`: `ask` or `notify_now`; `note?` | `{id, scope, action, effect, text, note, created_from: "chat", existed, replaced}`. Only tightens trust or raises urgency, so chat runs it and reports `Rule added: ask before merge in trading (rule 3).` A rule replaces the one of its family (allow/ask, notify) on the same (scope, action); this tool can only replace an `allow` or a `notify_digest`. |
 | `allow_trust_rule` (L2) | `scope`, `action`, `effect?`: `allow` (default) or `notify_digest`, `note?` | Same shape. Loosens trust or lowers urgency, so a model-chosen call asks a plain yes whose prompt (`tools.trust.summary_action`) reads `allow deploy in dori-staging without asking` or `stop texting right away on failed everywhere (digest only)`. |
@@ -1018,7 +1021,7 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
   | `notes` | `add_note`, `clear_notes`, `delete_note`, `list_notes` |
   | `reminders` | `add_reminder`, `cancel_reminder`, `list_reminders` |
   | `ops` | `disk`, `recent_logs`, `restart_ollama`, `restart_resonant`, `update_resonant` |
-  | `run_project` | `cancel_run`, `list_runs`, `merge_run`, `start_run` ("fix the typo in the README in resonant", "what runs are going", "merge R3") |
+  | `run_project` | `answer_worker`, `cancel_run`, `list_runs`, `merge_run`, `message_worker`, `start_run` ("fix the typo in the README in resonant", "what runs are going", "merge R3", "go with option b", "for the dori one, use sqlite") |
   | `rules` | `add_trust_rule`, `allow_trust_rule`, `list_trust_rules`, `remove_trust_rule` ("in the future don't ask me about deploys to dori-staging", "what are my rules") |
 
   It is filtered by `principals.can(principal, "request", spec.extension)` before anything reaches the model, so a member gets no global builtins. Every call the model chooses is `origin="inferred"`, so the gate decides by level: L3 (`add_note`, `add_reminder`, `restart_ollama`, …) runs and reports, L2 (`restart_resonant`, `update_resonant`) asks `[A7] … Reply yes / no`, L1 (`clear_notes`) asks `[D7] … Reply yes D7 / no`. The local runner still makes at most one gated side effect per task.
@@ -1124,6 +1127,30 @@ runner.last_killed                                # runs the last kill switch en
 - **Sandbox** (`resonant.sandbox`, the thin guard since EM-1): `SandboxParams(run_dir, cache_dir, secrets_dir, home, read_paths, deny_exec, deny_read, work_dir, protect)`, `render`, `wrap(argv, params)`, `scratch_env`, `default_protected()`, `probes.self_check`, `cached_self_check`. `read_paths` and `work_dir` are accepted and no longer limit anything; `protect=None` means `default_protected()` (the installed daemon). CLI: `resonant sandbox check [--scope all|ci|local] [--json]`, exit 1 on any failed probe.
 - **Config** (`runner:`): `repos` (name → `{remote, base, allow_github_changes, quote_ask}`), `work_dir`, `mirror_dir`, `secrets_dir`, `cache_dir`, `max_run_dir_mb`, `max_cache_gb`, `max_minutes`, `max_budget_usd`, `max_bundle_mb`, `keep_days`, `git_path`, `gh_path`. Secrets: `runner/claude_token` (or `runner/anthropic_key`) and `runner/github_token`.
 - **Tests.** `tests/fakes/claude` is a fake CLI with scenarios; `tests/test_runner_claude.py` drives the runner over it, and `tests/test_e2e_runner.py` drives the whole daemon from the fake iMessage channel.
+
+## Relay: `resonant.router.relay` (EM-5)
+
+The owner's replies to worker questions and messages to running workers. The router calls it after the approval inbox (`direct`, no model call) and after the labeler (`free`), and returns its code-built line as a `fast_reply` titled `worker reply`.
+
+```python
+relay = Relay(conn, principals=..., model=..., workers=lambda: claude_runner, clock=...)
+relay.open_for(event, principal) -> list[OpenQuestion]   # asked before event.occurred_at, the principal's runs
+relay.direct(event, text, principal) -> RelayResult | None   # R4 …, tell R4 …, the stash, an option pick
+await relay.free(event, text, principal, intent) -> RelayResult | None   # intent in run_project|question|unknown
+RelayResult(reply: str, outcome: "answered"|"messaged"|"ambiguous"|"refused"|"clash", run_code)
+parse_addressed(text) -> Addressed(code, rest, tell) | None
+match_option(text, options) -> str | None   # "a", "1", "the second option", "go with sqlite", "b, but pin v3"
+clash_text(sent_approvals, open_questions) -> str
+```
+
+- **Addressed.** `R4 …`, `R4: …`, `tell R4 (to) …`, `ask R4 …`, `for R4, …`, `@R4 …`, or the code alone. The code is stripped. An open question of R4 (asked before the message) gets the rest as its answer (an option picked by letter, number, ordinal or text becomes that option's text); otherwise it's `deliver_message`. Without an open question, `R4 cancel|stop|kill|merge|status|how's…` routes normally. A code that isn't one of the sender's runs routes normally; one that has ended gets `R4 isn't running (<status>); nothing sent.`
+- **Free text.** One open question: an answer unless the brain says `none` with confidence ≥ 0.75; when unsure or down, a reply of ≤ 12 words to a question asked in the last 30 minutes is an answer. Several: a repo the message names (`the trading one`) picks; else the brain at ≥ 0.75; else `For R4 (<q>) or R6 (<q>)?`, with the message stashed in kv `relay.pending:<principal>` for 10 minutes. The next message resolves it by code (`R4`) or ordinal (`the second one`), and any other message drops it.
+- **The brain.** One `chat_json` (`RELAY_SYSTEM`, `max_tokens=32`, temperature 0) with the open questions (code, repo, minutes since asked, the question and options through `worker_text`) and the message wrapped last. The schema's `run` enum is the open codes plus `none`; anything else counts as no pick. Span `router.relay` (outcome, pick, confidence; never text).
+- **Confirmations.** `→ R4` for an answer, `→ R4 (<q>)` when picked by content, `→ R4 (message)` for a message. The answer binds `question_id`, the question the relay judged.
+
+`resonant.worker_text`: `worker_text(code, text, limit, redactor)` (redacted, `clean_external`, other runs' codes masked as `R?`, clipped) and `owner_question_text(code, question, options, *, urgent, others_open)`: `R4 asks: <q>`, then `(a) … (b) …` on a second line, then `Other runs are waiting too: reply R4 <answer>.` when another of the owner's runs has a question open; `⚠ ` first for `--urgent`.
+
+Pulse: each open ask is a core item `question/r<n>-<id>` (title: the question in one line), written told when it is texted and cleared silently when it is answered, times out or its run ends. `pulse_job.remention_questions` makes it news again (`still waiting: …`) once the owner was last told `pulse.remention_after` ago, so each hourly pulse repeats it while it stays open.
 
 ## Trust rules: `resonant.trust`, `resonant.store.trust` (EM-4, migration 010)
 

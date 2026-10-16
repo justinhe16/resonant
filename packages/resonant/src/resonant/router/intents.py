@@ -58,7 +58,8 @@ INTENT_DEFINITIONS: dict[BuiltinIntent, str] = {
     "ops": "asks Resonant to restart Ollama or itself, update itself, or show its recent logs",
     "run_project": (
         "asks Claude to do coding work in a repo (fix, change, open a PR), or about Claude runs "
-        "(R3): what is going, cancel or merge one; not general updates or status"
+        "(R3): what is going, cancel or merge one, answer a run's question or tell a run "
+        "something; not general updates or status"
     ),
     "rules": (
         "asks to set, list or forget trust rules: when Claude runs should or shouldn't ask "
@@ -71,7 +72,8 @@ INTENT_DEFINITIONS: dict[BuiltinIntent, str] = {
 # A model-chosen call is always ``origin="inferred"``: the gate runs L3 and reports, asks a
 # plain yes for L2 (restart_resonant, update_resonant, merge_run, allow_trust_rule,
 # remove_trust_rule) and a code for L1 (clear_notes). start_run is L3: the sandbox is the
-# wall, so the owner's request is the go-ahead. add_trust_rule is L3: it only tightens trust
+# wall, so the owner's request is the go-ahead. answer_worker and message_worker are L3: it's
+# the owner talking to their own worker. add_trust_rule is L3: it only tightens trust
 # or sets urgency; anything that widens trust (allow, forget) asks.
 INTENT_TOOLS: dict[BuiltinIntent, tuple[str, ...]] = {
     "question": (),
@@ -87,7 +89,14 @@ INTENT_TOOLS: dict[BuiltinIntent, tuple[str, ...]] = {
     "notes": ("add_note", "clear_notes", "delete_note", "list_notes"),
     "reminders": ("add_reminder", "cancel_reminder", "list_reminders"),
     "ops": ("disk", "recent_logs", "restart_ollama", "restart_resonant", "update_resonant"),
-    "run_project": ("cancel_run", "list_runs", "merge_run", "start_run"),
+    "run_project": (
+        "answer_worker",
+        "cancel_run",
+        "list_runs",
+        "merge_run",
+        "message_worker",
+        "start_run",
+    ),
     "rules": ("add_trust_rule", "allow_trust_rule", "list_trust_rules", "remove_trust_rule"),
     "unknown": (),
 }

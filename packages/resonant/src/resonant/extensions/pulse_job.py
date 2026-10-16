@@ -344,6 +344,26 @@ def refresh_core_items(
         label = clip(notify.clean_text(a.summary), LABEL_MAX)
         waiting[_key("approval", a.code or a.id)] = f"✋ {code} still waiting: {label}"
     _sync(conn, now, "approval", waiting, lambda item: None)
+    remention_questions(conn, now, delay)
+
+
+QUESTION_PREFIX = "question/"  # worker_desk.question_item_key
+STILL_WAITING = "still waiting: "
+
+
+def remention_questions(conn: sqlite3.Connection, now: datetime, delay: timedelta) -> None:
+    """An open worker question (``core/question/<run>-<id>``, written and cleared by the
+    worker desk with the question's redacted text) is news again once the owner was last
+    told about it ``delay`` ago: each hourly pulse repeats it until it is answered, times
+    out or its run ends (EM-5)."""
+    for item in store.open_items(conn, now):
+        if item.source != CORE or not item.key.startswith(QUESTION_PREFIX) or item.changed:
+            continue
+        if item.told_at is None or now - item.told_at < delay:
+            continue
+        title = STILL_WAITING + item.title.removeprefix(STILL_WAITING)
+        state = {"open": True, "reminded": now.isoformat(timespec="minutes")}
+        store.upsert(conn, CORE, item.key, title, "normal", state, False, ITEM_TTL_S, now)
 
 
 # --- sending ---------------------------------------------------------------------------------

@@ -1047,11 +1047,14 @@ class ClaudeRunner:
         """Open ``resonant ask`` questions of active runs, oldest first."""
         return self.desk.open_questions()
 
-    def answer_question(self, code: str, text: str) -> Relayed | Refused:
-        """The owner's answer to run ``code``'s open question. A CLI call still waiting gets
-        it at once; else the session is resumed with it (``claude --resume``)."""
+    def answer_question(
+        self, code: str, text: str, *, question_id: int | None = None
+    ) -> Relayed | Refused:
+        """The owner's answer to run ``code``'s open question (``question_id``: exactly that
+        one). A CLI call still waiting gets it at once; else the session is resumed with it
+        (``claude --resume``)."""
         try:
-            return self.desk.answer_question(code.upper(), text)
+            return self.desk.answer_question(code.upper(), text, question_id=question_id)
         except RelayRefused as e:
             return Refused(str(e))
 

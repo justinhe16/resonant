@@ -26,6 +26,11 @@ at call time: the runner is built after the tools are registered) and return cod
   repo's run is never merged (its upstream's maintainers merge).
 - ``start_run{..., merge?}``: ``merge`` when the owner asked to merge it too; the run then
   merges itself once CI is green (same checks, same trust rules).
+- ``answer_worker{code, text}`` and ``message_worker{code, text}``: L3, no ask: it's the
+  owner talking to their own worker (EM-5). The answer goes to the run's open question (a
+  run with none gets it as a message); a message reaches the session at its next
+  ``resonant`` call or turn. The router's relay (``router/relay.py``) handles ``R4 …`` and
+  most replies without the model; these are for what only the model can place.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from resonant_sdk import Effect, Level, ToolSpec
 
 if TYPE_CHECKING:
     from resonant.runners.claude import Cancelled, Merged, Refused, Started
+    from resonant.runners.worker_desk import OpenQuestion, Relayed
     from resonant.store.runs import Run
 
 RUNNER = "claude"
@@ -56,6 +62,8 @@ RUNS_MAX = 8  # runs listed
 RECENT_REPOS = 20  # registered repos named in the start_run description
 TEXT_MAX = 120  # Claude's summary or a failure, as the model and the reply see it
 ASK_SHOWN = 60
+OWNER_TEXT_MAX = 2000  # an answer or message to a worker
+QUESTION_SHOWN = 120
 
 # Run codes: ``R`` and a number. ``R`` is not in the approval alphabet (``gate.codes``), so a run
 # code can't be mistaken for, or parsed as, an approval code (``yes R3`` is not a reply).
@@ -84,6 +92,14 @@ class RunnerApi(Protocol):
     async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused: ...
 
     async def merge_run(self, code: str) -> Merged | Refused: ...
+
+    def open_questions(self) -> list[OpenQuestion]: ...
+
+    def answer_question(
+        self, code: str, text: str, *, question_id: int | None = None
+    ) -> Relayed | Refused: ...
+
+    def deliver_message(self, code: str, text: str) -> Relayed | Refused: ...
 
 
 def _code_schema() -> dict[str, Any]:
@@ -165,7 +181,47 @@ MERGE_RUN = ToolSpec(
     timeout_s=120.0,
 )
 
-SPECS: tuple[ToolSpec, ...] = (START_RUN, LIST_RUNS, CANCEL_RUN, MERGE_RUN)
+
+def _text_schema() -> dict[str, Any]:
+    return {"type": "string", "minLength": 1, "maxLength": OWNER_TEXT_MAX}
+
+
+ANSWER_WORKER = ToolSpec(
+    name="answer_worker",
+    description=(
+        "Answer a Claude run's open question (the owner got 'R4 asks: ...'). `text` is the "
+        "owner's answer, in their words. list_runs shows each run's open question."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {"code": _code_schema(), "text": _text_schema()},
+        "required": ["code", "text"],
+        "additionalProperties": False,
+    },
+    effect=Effect.WRITE,
+    level=Level.L3,
+    timeout_s=15.0,
+)
+MESSAGE_WORKER = ToolSpec(
+    name="message_worker",
+    description=(
+        "Pass the owner's message to a running Claude run, e.g. 'tell R4 to also update the "
+        "README'. `text` is what to tell it, in the owner's words. It sees it at its next step."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {"code": _code_schema(), "text": _text_schema()},
+        "required": ["code", "text"],
+        "additionalProperties": False,
+    },
+    effect=Effect.WRITE,
+    level=Level.L3,
+    timeout_s=15.0,
+)
+
+SPECS: tuple[ToolSpec, ...] = (
+    START_RUN, LIST_RUNS, CANCEL_RUN, MERGE_RUN, ANSWER_WORKER, MESSAGE_WORKER,
+)  # fmt: skip
 
 
 def specs_for(ctx: BuiltinContext) -> tuple[ToolSpec, ...]:
@@ -255,9 +311,10 @@ def _clip(text: str | None, limit: int) -> str | None:
     return None if not flat else flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
 
 
-def run_json(run: Run) -> dict[str, Any]:
+def run_json(run: Run, question: str | None = None) -> dict[str, Any]:
     """One run for the model and the reply templates. The ask is the owner's own text; the
-    summary and failure can carry Claude's or a command's output, so they are cleaned."""
+    summary and failure can carry Claude's or a command's output, so they are cleaned, and
+    so is the run's open ``question`` (the worker's words)."""
     return {
         "code": run.code,
         "repo": run.repo,
@@ -270,6 +327,7 @@ def run_json(run: Run) -> dict[str, Any]:
         "flagged_paths": list(run.flagged_paths),
         "summary": _clip(run.summary, TEXT_MAX),
         "failure": _clip(run.failure, TEXT_MAX),
+        "question": _clip(question, QUESTION_SHOWN),
     }
 
 
@@ -336,8 +394,9 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         else:
             found = claude.list_runs(RUNS_MAX + 1)
             shown, total = found[:RUNS_MAX], len(found)
+        asked = {q.run_code: q.question for q in claude.open_questions()}
         out: dict[str, Any] = {
-            "runs": [run_json(r) for r in shown],
+            "runs": [run_json(r, asked.get(r.code)) for r in shown],
             "count": total,
             "truncated": code is None and total > RUNS_MAX,
             "code": code,
@@ -377,7 +436,44 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             "text": text,
         }
 
+    def _owner_args(tool: str, args: dict[str, Any]) -> tuple[str, str]:
+        unknown = set(args) - {"code", "text"}
+        if unknown:
+            raise ToolFailed(f"{tool}: unknown arguments: {sorted(unknown)}")
+        code = _code(args.get("code"))
+        text = args.get("text")
+        if code is None:
+            raise ToolFailed(f"{tool}: code must be a run code like R3")
+        if not isinstance(text, str) or not text.strip() or len(text) > OWNER_TEXT_MAX:
+            raise ToolFailed(f"{tool}: text is a required string (at most {OWNER_TEXT_MAX})")
+        return code, text.strip()
+
+    async def _answer_worker(args: dict[str, Any]) -> dict[str, Any]:
+        code, text = _owner_args("answer_worker", args)
+        claude = runner()
+        if claude is None:
+            return {"sent": False, "code": code, "text": missing()}
+        if not any(q.run_code == code for q in claude.open_questions()):
+            result = claude.deliver_message(code, text)  # nothing open: it's a message
+        else:
+            result = claude.answer_question(code, text)
+        if (reason := _refusal(result)) is not None:
+            return {"sent": False, "code": code, "text": reason}
+        return {"sent": True, "code": code, "text": cast("Relayed", result).text}
+
+    async def _message_worker(args: dict[str, Any]) -> dict[str, Any]:
+        code, text = _owner_args("message_worker", args)
+        claude = runner()
+        if claude is None:
+            return {"sent": False, "code": code, "text": missing()}
+        result = claude.deliver_message(code, text)
+        if (reason := _refusal(result)) is not None:
+            return {"sent": False, "code": code, "text": reason}
+        return {"sent": True, "code": code, "text": cast("Relayed", result).text}
+
     return {
+        ANSWER_WORKER.name: _answer_worker,
+        MESSAGE_WORKER.name: _message_worker,
         START_RUN.name: _start_run,
         LIST_RUNS.name: _list_runs,
         CANCEL_RUN.name: _cancel_run,

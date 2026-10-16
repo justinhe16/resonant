@@ -97,9 +97,9 @@ async def test_ask_answered_while_the_cli_waits(tmp_path: Path, db: sqlite3.Conn
     await until(lambda: bool(h.runner.open_questions()), what="the question")
     [q] = h.runner.open_questions()
     assert (q.run_code, q.question, q.options) == ("R1", "Which DB?", ("pg", "sqlite"))
-    assert "R1 asks: Which DB?\nOptions: pg, sqlite" in h.chan.texts()
+    assert "R1 asks: Which DB?\n(a) pg (b) sqlite" in h.chan.texts()
     assert [(e.kind, e.run_code, e.question_id) for e in events] == [("question", "R1", q.id)]
-    assert h.runner.answer_question("r1", "pg") == Relayed("R1", "Sent to R1.")
+    assert h.runner.answer_question("r1", "pg") == Relayed("R1", "\u2192 R1")
     await loop
     run = h.run(code)
     assert run.status == "done"

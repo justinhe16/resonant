@@ -380,7 +380,7 @@ async def test_pending_checks_are_capped_per_run(h: Harness) -> None:
     code = h.run()
     tasks = [h.start(code, what=f"step {n}") for n in range(3)]
     await h.prompted(3)
-    assert await h.checks.request_check(code, "dori-api", "deploy", what="step 4") == "denied"
+    assert await h.checks.request_check(code, "dori-api", "deploy", what="step 4") == "busy"
     assert audits(h.db, "trust.check")[-1]["reason"] == "too many pending checks"
     for t in tasks:
         t.cancel()

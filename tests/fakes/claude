@@ -19,7 +19,8 @@ scratch (a run with no repo: writes notes in its cwd and reports).
 The worker CLI (EM-3), on the first turn only, before the scenario: ``--note TEXT`` runs
 ``resonant note`` (``--urgent-note TEXT``: ``resonant note TEXT --urgent``), ``--check SYSTEM:ACTION:WHAT`` runs ``resonant check`` (denied: the turn
 ends there with ``Didn't: denied.``), ``--ask TEXT`` (with ``--options``) runs ``resonant ask``
-(no answer yet, exit 3: the turn ends with ``Waiting for the owner.``), and ``--wait-message S``
+(no answer yet, exit 3: the turn ends with ``Waiting for the owner.``; ``--ask-map JSON``
+picks the question, ``"text|opt,opt"``, by a key found in the prompt), and ``--wait-message S``
 calls ``resonant note`` for up to S seconds until a reply carries an owner message. Each call
 is noted in ``<run>/tmp/cli.json`` (argv, exit code, output).
 """
@@ -59,6 +60,7 @@ ap.add_argument("--ci-fixes", type=int, default=0)
 ap.add_argument("--echo-token", action="store_true")
 ap.add_argument("--ask")
 ap.add_argument("--options")
+ap.add_argument("--ask-map")  # JSON {"<text in the prompt>": "<question>[|opt,opt]"}
 ap.add_argument("--note")
 ap.add_argument("--urgent-note")
 ap.add_argument("--check")
@@ -213,6 +215,12 @@ if not args.resume:
             if "Message from the owner" in text:
                 break
             time.sleep(0.2)
+    if args.ask_map:  # runs started with different asks ask different questions
+        for needle, value in json.loads(args.ask_map).items():
+            if needle in prompt:
+                args.ask, _, opts = value.partition("|")
+                args.options = opts or None
+                break
     if args.ask:
         extra = ["--options", args.options] if args.options else []
         rc, _ = cli("ask", args.ask, *extra)

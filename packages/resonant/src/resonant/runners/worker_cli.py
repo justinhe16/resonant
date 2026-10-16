@@ -27,6 +27,7 @@ text for Claude to read) and exits with ``exit``:
     2  usage error
     3  no answer yet: finish what you can, then end your turn; the run resumes with the answer
     4  Resonant can't be reached (or the run is over)
+    5  too many pending checks: the check wasn't asked; wait for answers, then run it again
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ SOCK = "sock"
 TOKEN = "token"  # noqa: S105 - a file name
 SHIM = "resonant"
 EXIT_OK, EXIT_DENIED, EXIT_USAGE, EXIT_PENDING, EXIT_UNREACHABLE = 0, 1, 2, 3, 4
+EXIT_BUSY = 5  # too many checks wait for the owner: the check wasn't asked
 MAX_REQUEST = 64 * 1024
 MAX_QUESTION = 2000
 MAX_NOTE = 2000
