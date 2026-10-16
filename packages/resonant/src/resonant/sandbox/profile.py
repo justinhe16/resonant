@@ -10,6 +10,7 @@ a closing paren or a control character. See docs/employee-plan.md (D2).
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shutil
 import subprocess
@@ -18,6 +19,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 SYSTEM_PATH = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
@@ -215,7 +218,8 @@ def _configured_tools() -> list[Path]:
         from resonant.config import load_settings
 
         settings = load_settings()
-    except Exception:
+    except Exception as e:  # a broken config is the daemon's problem; say what goes unprotected
+        log.warning("sandbox: config unreadable, configured tool paths not protected: %s", e)
         return []
     tools = [settings.runner.git_path, settings.runner.gh_path, settings.ops.uv_path]
     return [p for p in tools if p is not None]
