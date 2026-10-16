@@ -248,6 +248,16 @@ def count_pending(conn: sqlite3.Connection, now: datetime) -> int:
     return int(r["n"])
 
 
+def pending_all(conn: sqlite3.Connection, now: datetime) -> list[Approval]:
+    """Unexpired pending approvals, for every approver, oldest first (the dashboard)."""
+    rows = conn.execute(
+        "SELECT * FROM approvals WHERE status = 'pending' AND expires_at > ?"
+        " ORDER BY created_at, id",
+        (iso(now),),
+    ).fetchall()
+    return [_row_to_approval(r) for r in rows]
+
+
 def open_at(conn: sqlite3.Connection, principal: str, at: datetime) -> list[Approval]:
     """Approvals ``principal`` is an approver for that were open (created, undecided and
     unexpired) at time ``at``, whatever their status now. Oldest first.

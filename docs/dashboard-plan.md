@@ -31,14 +31,14 @@ Snapshot {
          started_at, ended_at, waiting_reason, last_note}]},                  # items: local only
   approvals: {open: n, items?: [{code, summary, level, asked_at, expires_at}]},
   questions: {open: n, items?: [{run_code, text, options, asked_at}]},
-  pulse: {open: n, items?: [{key, title, urgency, state, updated_at}]},
+  pulse: {open: n, items?: [{source, key, title, urgency, state: new|told, updated_at}]},
   extensions: [{name, status, health, jobs: [{id, next_due, last_run_at, last_outcome, fail_streak}]}],
   runner: {set_up: bool, missing?: [str]},
-  trust_rules?: [{n, text}], repos?: [{name, mode, base, protected}]           # local only
+  trust_rules?: [{n, text}], repos?: [{name, mode, base, ci}]                   # local only
 }
 ```
 
-Field names may be adjusted by DB-1 with the UI ticket told; `remote` never gains a text field without a plan change.
+Field names may be adjusted by DB-1 with the UI ticket told; `remote` never gains a text field without a plan change. DB-1 changed: `pulse.items[]` gained `source` and `state` is `new|told`; `repos[].protected` became `ci` (protection isn't stored, only a GitHub call knows it). The exact shape is `docs/snapshot.schema.json`; the field notes are in `interfaces.md` (Dashboard snapshot).
 
 ## 4. Tickets
 

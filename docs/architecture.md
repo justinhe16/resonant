@@ -54,6 +54,7 @@ The owner texts Resonant like an employee ([`employee-plan.md`](employee-plan.md
 | Store: migrations, kv, audit, task/event repos | `resonant/store/` | Phase 0 ✅ |
 | Generic loop, task envelope, slot pool | `resonant/loop/` | Phase 0 ✅ |
 | Daemon and local API (`/healthz`, `/api/status`) | `resonant/daemon.py`, `resonant/api.py` | Phase 0 ✅ |
+| Dashboard snapshot (`local`/`remote` tiers), `/api/dashboard`, the build served at `/` | `resonant/dashboard/snapshot.py`, `resonant/api.py`, `docs/snapshot.schema.json` | Phase 4 (DB-1) ✅ |
 | LaunchAgents (daemon, Ollama) | `resonant/launchd.py` | Phase 0 ✅ |
 | Keep-awake LaunchAgent (`caffeinate -i -m -s`, `power.keep_awake`), installed by `resonant daemon install` | `resonant/launchd.py`, `resonant/cli.py` | Phase 2 ✅ |
 | CLI: `daemon`, `status`, `kill`, `resume`, `job-guard` | `resonant/cli.py` | Phase 0 ✅ |
