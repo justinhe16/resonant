@@ -391,6 +391,30 @@ def expire_due(conn: sqlite3.Connection, now: datetime) -> int:
     return len(rows)
 
 
+def expire_one(conn: sqlite3.Connection, approval_id: str, now: datetime, *, reason: str) -> bool:
+    """pending -> expired for one approval whose asker gave up (its run ended, its wait was
+    cancelled), so a later reply binds nothing. Audited. True if it was pending."""
+    with atomic(conn):
+        row = conn.execute(
+            """UPDATE approvals SET status = 'expired', decided_at = ?
+               WHERE id = ? AND status = 'pending'
+               RETURNING task_id, tool, extension, intent_hash""",
+            (iso(now), approval_id),
+        ).fetchone()
+        if row is not None:
+            audit(
+                conn,
+                "approval.expired",
+                task_id=row["task_id"],
+                tool=row["tool"],
+                extension=row["extension"],
+                intent_hash=row["intent_hash"],
+                approval_id=approval_id,
+                reason=reason,
+            )
+    return row is not None
+
+
 def wake_resolved(
     conn: sqlite3.Connection,
     result: ResolveResult,

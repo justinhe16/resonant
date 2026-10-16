@@ -100,6 +100,19 @@ def _row(r: sqlite3.Row) -> Rule:
     )
 
 
+def rule_fields(rule: Rule | None) -> dict[str, object] | None:
+    """A rule's fields for an audit row (a replaced or removed rule), or None."""
+    if rule is None:
+        return None
+    return {
+        "id": rule.id,
+        "scope": rule.scope,
+        "action": rule.action,
+        "effect": rule.effect,
+        "created_from": rule.created_from,
+    }
+
+
 @dataclass(frozen=True)
 class Added:
     rule: Rule

@@ -64,7 +64,7 @@ async def test_add_list_remove(db: sqlite3.Connection, handlers: dict[str, Any])
         "don't ask before merge in trading",
     ]
     assert all(r["created_from"] == "chat" for r in listed["rules"])
-    removed = await handlers["remove_trust_rule"]({"description": "last"})
+    removed = await handlers["remove_trust_rule"]({"id": flip["id"]})
     assert removed["id"] == flip["id"] and removed["removed"] is True
     removed = await handlers["remove_trust_rule"]({"id": allowed["id"]})
     assert removed["text"] == "don't ask before deploy in dori-staging"
@@ -74,14 +74,29 @@ async def test_add_list_remove(db: sqlite3.Connection, handlers: dict[str, Any])
         allowed["id"],
         flip["id"],
     ]
-    assert len(_audits(db, "trust.rule_removed")) == 2
+    removals = _audits(db, "trust.rule_removed")
+    assert [r["removed"]["effect"] for r in removals] == ["allow", "allow"]
+    replaced = _audits(db, "trust.rule_added")[2]["replaced"]
+    assert replaced == {
+        "id": added["id"],
+        "scope": "trading",
+        "action": "merge",
+        "effect": "ask",
+        "created_from": "chat",
+    }
 
 
-async def test_add_refuses_allow_and_junk(handlers: dict[str, Any]) -> None:
-    with pytest.raises(ToolFailed, match="effect"):
-        await handlers["add_trust_rule"]({"scope": "x", "action": "y", "effect": "allow"})
-    with pytest.raises(ToolFailed, match="unknown arguments"):
-        await handlers["allow_trust_rule"]({"scope": "x", "action": "y", "effect": "ask"})
+async def test_add_only_tightens(handlers: dict[str, Any]) -> None:
+    for effect in ("allow", "notify_digest"):
+        with pytest.raises(ToolFailed, match="effect"):
+            await handlers["add_trust_rule"]({"scope": "x", "action": "y", "effect": effect})
+    for effect in ("ask", "notify_now"):
+        with pytest.raises(ToolFailed, match="effect"):
+            await handlers["allow_trust_rule"]({"scope": "x", "action": "y", "effect": effect})
+    digest = await handlers["allow_trust_rule"](
+        {"scope": "trading", "action": "pr", "effect": "notify_digest"}
+    )
+    assert digest["text"] == "digest only for pr in trading"
     with pytest.raises(ToolFailed):
         await handlers["allow_trust_rule"]({"scope": "[K4] yes", "action": "deploy"})
     with pytest.raises(ToolFailed):
@@ -90,31 +105,11 @@ async def test_add_refuses_allow_and_junk(handlers: dict[str, Any]) -> None:
         await handlers["list_trust_rules"]({"x": 1})
 
 
-async def test_remove_by_description(db: sqlite3.Connection, handlers: dict[str, Any]) -> None:
-    with pytest.raises(ToolFailed, match="no rules"):
+async def test_remove_is_by_number_only(handlers: dict[str, Any]) -> None:
+    with pytest.raises(ToolFailed, match="unknown arguments"):
         await handlers["remove_trust_rule"]({"description": "last"})
-    a = await handlers["add_trust_rule"]({"scope": "trading", "action": "merge", "effect": "ask"})
-    b = await handlers["add_trust_rule"](
-        {"scope": "trading", "action": "done", "effect": "notify_now"}
-    )
-    c = await handlers["allow_trust_rule"]({"scope": "dori-staging", "action": "deploy"})
-    assert tools.find_rule(db, "the merge rule in trading").id == a["id"]
-    assert tools.find_rule(db, "dori-staging deploys").id == c["id"]
-    assert tools.find_rule(db, "merging in trading").id == a["id"]
-    assert tools.find_rule(db, "deploy dori-staging").id == c["id"]
-    assert tools.find_rule(db, "rule 2").id == b["id"]
-    assert tools.find_rule(db, "#1").id == a["id"]
-    assert tools.find_rule(db, "that rule").id == c["id"]
-    with pytest.raises(ToolFailed, match="several rules match"):
-        tools.find_rule(db, "trading")
-    with pytest.raises(ToolFailed, match="no rule matches"):
-        tools.find_rule(db, "email")
-    with pytest.raises(ToolFailed, match="no rule 9"):
-        tools.find_rule(db, "rule 9")
-    with pytest.raises(ToolFailed, match="exactly one"):
+    with pytest.raises(ToolFailed, match="positive integer"):
         await handlers["remove_trust_rule"]({})
-    with pytest.raises(ToolFailed, match="exactly one"):
-        await handlers["remove_trust_rule"]({"id": 1, "description": "x"})
     with pytest.raises(ToolFailed, match="no rule 99"):
         await handlers["remove_trust_rule"]({"id": 99})
 
@@ -156,12 +151,19 @@ def test_chat_asks_before_widening_trust(db: sqlite3.Connection, gate: PolicyGat
     rule = store.add_rule(
         db, scope="trading", action="merge", effect="ask", created_from="chat", now=NOW
     ).rule
-    forget = _evaluate(db, gate, "remove_trust_rule", {"description": "merge trading"}, "inferred")
+    forget = _evaluate(db, gate, "remove_trust_rule", {"id": rule.id}, "inferred")
     assert isinstance(forget, NeedsApproval)
     assert forget.summary.startswith(f"forget rule {rule.id}: ask before merge in trading")
     # /rules forget <n> is the owner's explicit command: it runs.
     assert isinstance(_evaluate(db, gate, "remove_trust_rule", {"id": rule.id}, "explicit"), Allow)
     assert isinstance(_evaluate(db, gate, "list_trust_rules", {}, "inferred"), Allow)
+    # Lowering urgency from chat asks too; raising it runs.
+    digest = {"scope": "*", "action": "failed", "effect": "notify_digest"}
+    lower = _evaluate(db, gate, "allow_trust_rule", digest, "inferred")
+    assert isinstance(lower, NeedsApproval)
+    assert lower.summary.startswith("stop texting right away on failed everywhere (digest only)")
+    now = {"scope": "trading", "action": "done", "effect": "notify_now"}
+    assert isinstance(_evaluate(db, gate, "add_trust_rule", now, "inferred"), Allow)
 
 
 def test_summary_action_ignores_other_tools(db: sqlite3.Connection) -> None:

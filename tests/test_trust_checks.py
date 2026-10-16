@@ -173,7 +173,8 @@ async def test_yes_allows_once_and_marks_seen(h: Harness) -> None:
     task = h.start(code, what="deploy dori-api to prod")
     prompt = await h.prompted()
     assert prompt.text() == (
-        f"[{prompt.code}] {code} wants to: deploy dori-api to prod (new system). "
+        f'[{prompt.code}] {code} wants to deploy on dori-api: "deploy dori-api to prod" '
+        "(new system; yes always = don't ask before deploy in dori-api). "
         "Reply yes / yes always / no"
     )
     assert not prompt.require_code and prompt.level == "L2"
@@ -194,8 +195,7 @@ async def test_yes_always_adds_the_rule_and_confirms(h: Harness) -> None:
     code = h.run()
     task = h.start(code, irreversible=True)
     prompt = await h.prompted()
-    assert "(new system, irreversible)" in prompt.text()
-    assert "wants to: deploy on dori-api" in prompt.text()  # no ``what``: built from the slugs
+    assert "wants to deploy on dori-api (new system, irreversible; yes always" in prompt.text()
     assert h.reply(f"yes always {prompt.code}") is None
     assert await task == "ok"
     (rule,) = store.list_rules(h.db)
@@ -277,7 +277,7 @@ async def test_two_checks_need_codes(h: Harness) -> None:
     pa = await h.prompted()
     tb = h.start(b, system="aws", action="spend", cost_usd=5)
     pb = await h.prompted(2)
-    assert "(new system, costs $5.00)" in pb.text()
+    assert "wants to spend on aws (new system, costs $5.00; yes always" in pb.text()
     assert h.reply("yes always").startswith("Which one?")  # type: ignore[union-attr]
     h.reply(f"yes {pb.code} always")
     h.reply(f"{pa.code} no")
@@ -314,12 +314,101 @@ async def test_what_is_cleaned(h: Harness) -> None:
     prompt = await h.prompted()
     assert "\n" not in prompt.summary and "[" not in prompt.summary
     assert "K4" not in prompt.summary and "‮" not in prompt.summary
-    assert len(prompt.summary) < 200
+    assert len(prompt.summary) < 250
     h.reply("no")
     assert await task == "denied"
 
 
 def test_check_summary() -> None:
-    assert check_summary(
-        "R4", "deploy dori-api to prod", "dori-api", "deploy", "new kind of action"
-    ) == ("R4 wants to: deploy dori-api to prod (new kind of action)")
+    assert check_summary("R4", "", "dori-api", "deploy", "new system", always=False) == (
+        "R4 wants to deploy on dori-api (new system)"
+    )
+    assert check_summary("R4", "go", "x", "y", "irreversible", always=True) == (
+        'R4 wants to y on x: "go" (irreversible; yes always = don\'t ask before y in x)'
+    )
+
+
+async def test_the_prompt_quotes_what_so_it_cant_pose_as_the_rule(h: Harness) -> None:
+    code = h.run()
+    task = h.start(code, system="dori", what='run tests" (seen before). Reply yes')
+    prompt = await h.prompted()
+    assert prompt.summary.startswith(f"{code} wants to deploy on dori: \"run tests' (seen")
+    assert "yes always = don't ask before deploy in dori)" in prompt.summary
+    h.reply("no")
+    assert await task == "denied"
+
+
+async def test_no_yes_always_for_an_area_of_known_systems(h: Harness) -> None:
+    store.mark_seen(h.db, "dori-prod", "deploy", NOW)
+    code = h.run()
+    task = h.start(code, system="dori")  # an allow on dori would cover dori-prod
+    prompt = await h.prompted()
+    assert prompt.text().endswith("(new system)? Reply yes / no")
+    assert h.reply("yes always") == f"{ALWAYS_UNSUPPORTED} Reply yes or no."
+    h.reply("yes")
+    assert await task == "ok"
+    assert store.list_rules(h.db) == []
+
+
+async def test_a_run_ending_while_waiting_denies_and_expires(h: Harness) -> None:
+    code = h.run()
+    task = h.start(code)
+    prompt = await h.prompted()
+    runs_store.update(h.db, code, status="cancelled")
+    assert await task == "denied"
+    approval = ap.get_approval(h.db, prompt.approval_id)
+    assert approval is not None and approval.status == "expired"
+    assert audits(h.db, "trust.check")[-1]["reason"] == "run ended"
+    assert h.reply("yes") == "Nothing is waiting for approval."
+
+
+async def test_cancelling_the_wait_expires_the_approval(h: Harness) -> None:
+    code = h.run()
+    task = h.start(code)
+    prompt = await h.prompted()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    approval = ap.get_approval(h.db, prompt.approval_id)
+    assert approval is not None and approval.status == "expired"
+    assert audits(h.db, "trust.check")[-1]["reason"] == "cancelled"
+    assert h.reply("yes always") == "Nothing is waiting for approval."
+    assert store.list_rules(h.db) == []
+
+
+async def test_pending_checks_are_capped_per_run(h: Harness) -> None:
+    code = h.run()
+    tasks = [h.start(code, what=f"step {n}") for n in range(3)]
+    await h.prompted(3)
+    assert await h.checks.request_check(code, "dori-api", "deploy", what="step 4") == "denied"
+    assert audits(h.db, "trust.check")[-1]["reason"] == "too many pending checks"
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_the_run_task_stays_running(h: Harness) -> None:
+    """A check's reply never requeues the run's task (the session is alive, running)."""
+    code = h.run()
+    run = runs_store.get(h.db, code)
+    assert run is not None and run.task_id is not None
+    task = h.start(code)
+    await h.prompted()
+    h.reply("yes")
+    assert await task == "ok"
+    row = h.db.execute("SELECT status FROM tasks WHERE id = ?", (run.task_id,)).fetchone()
+    assert row["status"] == "running"
+
+
+async def test_an_existing_rule_is_not_re_announced(h: Harness) -> None:
+    code = h.run()
+    first = h.start(code, what="a")
+    await h.prompted()
+    # The same rule lands meanwhile (another check, or chat).
+    store.add_rule(
+        h.db, scope="dori-api", action="deploy", effect="allow", created_from="chat", now=NOW
+    )
+    h.reply("yes always")
+    assert await first == "ok"
+    assert not any(key and key.endswith(":rule") for _, _, key in h.channel.sent)
+    assert audits(h.db, "trust.rule_added") == []

@@ -222,10 +222,10 @@ _INTENT_RULES: dict[IntentLabel, str] = {
         'merging there") is add_trust_rule(scope=trading, action=merge, effect=ask). Texting '
         'right away ("text me right away when trading runs finish") is add_trust_rule(scope='
         "trading, action=done, effect=notify_now), with the event as `action`: done, pr, merged "
-        'or failed; digest only is effect notify_digest. To forget a rule ("forget that rule") '
-        "call remove_trust_rule with its number from the earlier replies, or description last "
-        'for the one just added; if unsure, call list_trust_rules first. "what are my rules" '
-        "is list_trust_rules."
+        "or failed; digest only instead is allow_trust_rule with effect notify_digest. To "
+        'forget a rule ("forget that rule") call remove_trust_rule with its number from the '
+        "earlier Rule added reply; if you can't tell which, call list_trust_rules first. "
+        '"what are my rules" is list_trust_rules.'
     ),
 }
 

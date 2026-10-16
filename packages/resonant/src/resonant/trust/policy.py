@@ -83,7 +83,7 @@ class NotifyDecision:
     rule: Rule | None = None
 
 
-def _is_area(scope: str, name: str) -> bool:
+def is_area(scope: str, name: str) -> bool:
     """``scope`` is a leading segment run of ``name`` (``trading`` of ``trading-api``)."""
     return (
         len(name) > len(scope)
@@ -100,7 +100,7 @@ def scope_rank(scope: str, system: str, repo: str | None) -> tuple[int, int] | N
         return (0, 0)
     if repo is not None and scope == repo:
         return (2, len(scope))
-    if _is_area(scope, system) or (repo is not None and _is_area(scope, repo)):
+    if is_area(scope, system) or (repo is not None and is_area(scope, repo)):
         return (2, len(scope))
     return None
 
