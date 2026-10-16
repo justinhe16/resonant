@@ -75,6 +75,7 @@ log = logging.getLogger(__name__)
 BLOCK_S = 480.0  # how long one ask or check call waits (Claude's Bash tool allows 600 s)
 MAX_OPEN_ASKS = 1  # so an answer can't reach the wrong one of a run's questions
 OWNER_TEXT_MAX = 600
+TWIN_S = 600.0  # an ask repeated this soon after its answer is a retry: the same answer
 NOTE_MAX = 200
 ASK_TIMEOUT = "No answer from the owner; use your judgment or stop."
 CHECK_TIMEOUT = "No decision from the owner; treat it as denied: don't do it."
@@ -242,9 +243,10 @@ class WorkerDesk:
             (o for o in open_asks if o.question == req.question and o.options == req.options),
             None,
         )
-        if q is None and (twin := _answered_twin(self.conn, run.code, req)) is not None:
-            # Asked again after the owner answered (the session lost the reply, or a retry
-            # after it was delivered): the same answer again, and the owner isn't re-texted.
+        twin = None if q is not None else _answered_twin(self.conn, run.code, req, self.clock())
+        if twin is not None:
+            # A retry of the run's last question just after the owner answered it (the
+            # session lost the reply): the same answer again, and the owner isn't re-texted.
             return self._reply(run.code, f"You asked this already. {_answer_line(twin)}",
                                EXIT_OK, qid=twin.id)  # fmt: skip
         if q is None:
@@ -590,17 +592,21 @@ def _principal(conn: sqlite3.Connection, code: str) -> str | None:
     return None if run is None else run.principal
 
 
-def _answered_twin(conn: sqlite3.Connection, code: str, req: Ask) -> qs.Question | None:
-    """The run's latest answered ask with the same question and options, if any."""
-    twins = [
-        q
-        for q in qs.for_run(conn, code)
-        if q.kind == "ask"
-        and q.status == "answered"
-        and q.question == req.question
-        and q.options == req.options
-    ]
-    return twins[-1] if twins else None
+def _answered_twin(
+    conn: sqlite3.Connection, code: str, req: Ask, now: datetime
+) -> qs.Question | None:
+    """The run's last ask, when it is this same question (and options), answered, and either
+    not yet delivered or answered within ``TWIN_S``: a retry. An older answer, or one from
+    before another question, is not reused: asking again then asks the owner again, so an
+    earlier yes can't stand in for a later decision."""
+    asks = [q for q in qs.for_run(conn, code) if q.kind == "ask"]
+    if not asks:
+        return None
+    last = asks[-1]
+    if last.status != "answered" or (last.question, last.options) != (req.question, req.options):
+        return None
+    fresh = last.answered_at is not None and now - last.answered_at <= timedelta(seconds=TWIN_S)
+    return last if last.delivered_at is None or fresh else None
 
 
 def _answer_line(q: qs.Question) -> str:

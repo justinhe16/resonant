@@ -17,7 +17,7 @@ from resonant.runners.worker_desk import BUSY, Relayed, question_item_key
 from resonant.store import pulse as pulse_store
 from resonant.store import questions as qs
 from resonant.store import runs as runs_store
-from resonant.store.db import utcnow
+from resonant.store.db import iso, utcnow
 
 
 def _gone() -> asyncio.Future[None]:
@@ -113,3 +113,23 @@ async def test_the_trust_layers_busy_is_passed_on(tmp_path: Path, db: sqlite3.Co
     runs_store.update(db, code, status="running")
     r = await h.runner.desk.handle(code, Check("dori", "deploy", "ship"), _gone())
     assert r is not None and (r.exit, r.text) == (EXIT_BUSY, BUSY)
+
+
+async def test_an_old_answer_isnt_reused_for_a_later_identical_question(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """A delivered answer from a while ago asks again: an earlier yes can't stand in for a
+    later decision."""
+    h = rig(tmp_path, db, ask_block_s=0.05)
+    code = await start(h)
+    runs_store.update(db, code, status="running")
+    await h.runner.desk.handle(code, Ask("Proceed?"), _gone())
+    assert isinstance(h.runner.answer_question(code, "yes"), Relayed)
+    [q] = qs.for_run(db, code)
+    qs.mark_delivered(db, q.id)
+    db.execute("UPDATE run_questions SET answered_at = ?",
+               (iso(utcnow() - timedelta(minutes=30)),))  # fmt: skip
+    again = await h.runner.desk.handle(code, Ask("Proceed?"), _gone())
+    assert again is not None and again.exit == EXIT_PENDING
+    assert len(qs.for_run(db, code)) == 2
+    assert [t for t in h.chan.texts() if "asks" in t] == [f"{code} asks: Proceed?"] * 2

@@ -128,11 +128,18 @@ _ADDRESSED = (
     re.compile(rf"(?:please )?(?:tell|ask) {_C}(?: ?[:,])?(?: to)? (?P<rest>.+)", _FLAGS),
     re.compile(rf"@?{_C} ?[:.!?]*", _FLAGS),  # the code alone
     re.compile(rf"(?:for|to|re|@) ?{_C} ?[:,\-]? ?(?P<rest>.+)", _FLAGS),
-    re.compile(rf"@?{_C}(?: ?[:,>\-\u2013\u2014]+)? ?(?P<rest>.+)", _FLAGS),
+    # "R4 x", "R4: x", "R4 - x"; not "R4's PR" or "R4.5 is out"
+    re.compile(rf"@?{_C}(?: ?[:,>\-\u2013\u2014]+ ?| )(?P<rest>.+)", _FLAGS),
 )
-# R4 with no open question: these route normally (/runs, /cancel, merge), not as a message.
+# Run control: "R4 cancel" routes normally (/runs, /cancel, merge), never as an answer or a
+# message; and a short free-text reply that starts like this is never taken as an answer.
 _CONTROL = re.compile(
     r"(?:cancel|stop|kill|abort|merge|status|progress|how'?s|how is|how are)\b", re.IGNORECASE
+)
+_RUN_CODE_IN = re.compile(r"(?<![A-Za-z0-9])R[0-9]{1,9}(?![A-Za-z0-9])", re.IGNORECASE)
+# What only makes sense as the answer to a question: refused when the run has none open.
+_BARE = re.compile(
+    r"(?:yes|no|ok|okay|sure|yep|yeah|nope|y|n|[a-j]|[0-9]{1,2})[.!]*", re.IGNORECASE
 )
 _ORDINALS = {
     "first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2, "fourth": 3, "4th": 3,
@@ -280,11 +287,15 @@ class Relay:
 
     # -- 2. no model call --
 
-    def direct(self, event: Event, text: str, principal: str) -> RelayResult | None:
+    def direct(
+        self, event: Event, text: str, principal: str, stash: dict[str, Any] | None = None
+    ) -> RelayResult | None:
+        """``stash``: what ``take_stash`` returned for this message (the router takes it for
+        every message first, so any other message, an approval reply or a slash command
+        included, drops a pending ``For R4 or R6?``)."""
         workers = self.workers()
         if workers is None or not self._authentic(event, principal):
             return None
-        stash = self._take_stash(principal)
         addressed = parse_addressed(text)
         if addressed is not None:
             result = self._addressed(workers, event, principal, addressed, stash)
@@ -313,7 +324,7 @@ class Relay:
             return None  # not one of the owner's runs: route normally
         opens = [q for q in self.open_for(event, principal) if q.run_code == run.code]
         if not a.rest:
-            if stash is not None and run.code in stash["codes"] and opens:
+            if stash is not None and opens and stash["ids"].get(run.code) == opens[0].id:
                 return self._answer(workers, opens[0], stash["text"], by_content=False)
             if opens:
                 return RelayResult(
@@ -323,15 +334,22 @@ class Relay:
                     run.code,
                 )
             return None
+        if not a.tell and _CONTROL.match(a.rest):
+            return None  # "R4 cancel", "R4 status": run control, even with a question open
         if opens:
             return self._answer(workers, opens[0], a.rest, by_content=False)
         if not run.active:
-            if _CONTROL.match(a.rest):
-                return None
             return RelayResult(f"{run.code} isn't running ({run.status}); nothing sent.",
                                "refused", run.code)  # fmt: skip
-        if not a.tell and _CONTROL.match(a.rest):
-            return None
+        if not a.tell and a.rest.rstrip().endswith("?"):
+            return None  # "R4 done yet?": a question about the run, for the labeler
+        if not a.tell and _BARE.fullmatch(normalize(a.rest)):
+            return RelayResult(
+                f"{run.code} has no open question (it may have timed out), so nothing was sent. "
+                f"To tell it something, say: tell {run.code} ...",
+                "refused",
+                run.code,
+            )
         return self._message(workers, run.code, a.rest)
 
     def _stash_pick(
@@ -369,17 +387,18 @@ class Relay:
         opens = self.open_for(event, principal)
         if not opens:
             return None
-        if len(opens) > 1 and (named := self._named_repo(workers, text, opens)) is not None:
-            return self._answer(workers, named, text, by_content=True)
         pick = await self._brain(workers, text, opens, spans=spans)
         now = self.clock()
         short = _words(text) <= SHORT_WORDS
+        # Run control or another run's code: never an answer by the short-reply bias.
+        commandish = bool(_CONTROL.match(normalize(text)) or _RUN_CODE_IN.search(text))
+        says_new = pick is not None and pick[0] == NONE and pick[1] >= LIKELY
         if len(opens) == 1:
             q = opens[0]
             recent = (now - q.asked_at).total_seconds() <= RECENT_S
             if pick is not None and pick[0] == q.run_code and pick[1] >= LIKELY:
                 return self._answer(workers, q, text, by_content=False)
-            if pick is not None and pick[0] == NONE and pick[1] >= SURE:
+            if says_new or commandish:
                 return None
             return self._answer(workers, q, text, by_content=False) if recent and short else None
         if pick is not None and pick[1] >= SURE:
@@ -387,6 +406,10 @@ class Relay:
                 return None
             chosen = next(q for q in opens if q.run_code == pick[0])
             return self._answer(workers, chosen, text, by_content=True)
+        if says_new or commandish:
+            return None
+        if (named := self._named_repo(workers, text, opens)) is not None:
+            return self._answer(workers, named, text, by_content=True)
         if pick is None and not short:
             return None  # the brain is down and this doesn't look like a reply
         self._put_stash(principal, text, opens)
@@ -512,7 +535,7 @@ class Relay:
             },
         )
 
-    def _take_stash(self, principal: str) -> dict[str, Any] | None:
+    def take_stash(self, principal: str) -> dict[str, Any] | None:
         """The pending ``For R4 or R6?`` (if still fresh), cleared: it answers only the very
         next message."""
         key = KV_PENDING + principal

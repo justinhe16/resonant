@@ -228,8 +228,10 @@ class Rig:
         return None if r is None else r.reply
 
     async def route(self, text: str, intent: str = "question") -> str | None:
-        """direct, then free, like the router."""
-        return self.direct(text) or await self.free(text, intent)
+        """The stash taken, direct, then free, like the router."""
+        stash = self.relay.take_stash(OWNER)
+        r = self.relay.direct(self.event(text), text, OWNER, stash)
+        return r.reply if r is not None else await self.free(text, intent)
 
 
 @pytest.fixture
@@ -285,7 +287,7 @@ async def test_a_question_asked_after_the_message_was_sent_isnt_its_answer(
     r = rig()
     r.workers.ask("R4", "Which DB?", OPTS, at=T0 + timedelta(minutes=10))
     assert r.direct("a", at=T0 + timedelta(minutes=9)) is None
-    assert r.direct("R4 a", at=T0 + timedelta(minutes=9)) == "→ R4 (message)"
+    assert r.direct("R4 use a", at=T0 + timedelta(minutes=9)) == "→ R4 (message)"
     assert r.workers.answers == []
 
 
@@ -314,7 +316,7 @@ async def test_one_question_the_brain_decides_with_a_bias_for_short_recent_repli
     r.workers.ask("R4", "Which DB?")
     assert await r.free("remind me to stretch at 5 and also book the dentist") is None
     assert await r.free("ok") is None  # the brain is sure it's new
-    r.brain.pick = ("none", 0.6)  # unsure: a short reply to a recent question is an answer
+    r.brain.pick = ("none", 0.4)  # unsure: a short reply to a recent question is an answer
     assert await r.free("postgres I think") == "→ R4"
     r.workers.ask("R4", "Which DB?")
     r.brain.pick = None  # down: same bias
@@ -354,7 +356,9 @@ async def test_the_repo_named_picks_the_run(rig: Callable[..., Rig]) -> None:
     assert await r.free("for the trading one, ship it", intent="run_project") == (
         "→ R4 (Merge now?)"
     )
-    assert r.brain.calls == []
+    r.workers.ask("R4", "Merge now?")
+    r.brain.pick = ("none", 0.8)  # the brain vetoes: a new request that names the repo
+    assert await r.free("start a run in trading to add tests", intent="run_project") is None
 
 
 async def test_unsure_asks_which_and_the_next_reply_resolves_it(rig: Callable[..., Rig]) -> None:
@@ -446,3 +450,51 @@ async def test_r4_yes_answers_the_question_while_an_approval_waits(
     assert workers.answers == [("R4", "yes", 1)]
     assert h.status(approval) == "pending"
     assert h.channel.replies() == ["→ R4"]
+
+
+async def test_run_control_and_questions_about_a_run_route_normally(
+    rig: Callable[..., Rig],
+) -> None:
+    r = rig()
+    r.workers.ask("R4", "Which DB?")
+    assert r.direct("R4 cancel") is None  # even with a question open
+    r.workers.run("R6")
+    assert r.direct("R6 done yet?") is None
+    assert r.direct("R6's PR looks good") is None
+    assert r.direct("R6.5 is out") is None
+    assert r.direct("R6 yes") == (
+        "R6 has no open question (it may have timed out), so nothing was sent. "
+        "To tell it something, say: tell R6 ..."
+    )
+    assert r.direct("tell R6 yes") == "→ R6 (message)"
+    assert r.workers.answers == [] and r.workers.messages == [("R6", "yes")]
+
+
+async def test_commands_never_answer_by_the_short_reply_bias(rig: Callable[..., Rig]) -> None:
+    r = rig(None)  # the brain is down
+    r.workers.ask("R4", "Which DB?")
+    assert await r.free("cancel R4") is None
+    assert await r.free("merge R3") is None
+    r.workers.ask("R6", "Ship it?")
+    assert await r.free("stop R6") is None  # no "which one?" either
+    assert r.workers.answers == []
+
+
+async def test_any_other_message_drops_the_stash(rig: Callable[..., Rig]) -> None:
+    r = rig(("R4", 0.4))
+    r.workers.ask("R4", "Which DB?")
+    r.workers.ask("R6", "Ship it?")
+    assert (await r.route("sounds good") or "").startswith("For ")
+    r.relay.take_stash(OWNER)  # what the router does for an approval reply or /command
+    assert (await r.route("the second one") or "").startswith("For ")  # asks again
+    assert r.workers.answers == []  # "second" no longer resolves the old stash
+
+
+async def test_the_stash_doesnt_answer_a_newer_question(rig: Callable[..., Rig]) -> None:
+    r = rig(("R4", 0.4))
+    r.workers.ask("R4", "Which DB?", qid=1)
+    r.workers.ask("R6", "Ship it?", qid=2)
+    await r.route("sounds good")
+    r.workers.questions[0] = OpenQuestion(3, "R4", "Which port?", (), T0, False)
+    assert await r.route("R4") == "What's your answer for R4 (Which port?)? Reply R4 <answer>."
+    assert r.workers.answers == []

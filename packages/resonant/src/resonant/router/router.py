@@ -258,6 +258,9 @@ class Router:
                 },
             )
 
+        # A pending "For R4 or R6?" answers only the very next message, whatever it is.
+        stash = self.relay.take_stash(principal)
+
         # Order: slash commands (so /kill is never read as a reply), approval replies, then
         # keywords and the labeler.
         cmd = self.fast_path.match(text)
@@ -299,7 +302,7 @@ class Router:
                 return None  # consumed: the woken runner sends the confirmation
             return reply(answered.reply, None, "job_control", APPROVAL_TITLE)
 
-        direct = self.relay.direct(event, text, principal)
+        direct = self.relay.direct(event, text, principal, stash)
         if direct is not None:
             return relayed(direct.reply)
 

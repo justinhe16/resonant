@@ -7,6 +7,7 @@ model plus a word-overlap pick for the relay's schema.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from collections.abc import Callable
@@ -194,12 +195,19 @@ async def test_a_timed_out_question_and_a_late_answer(
         await until(settled(w, "R1", "waiting"), 20, "the wait")
         [q] = qs.for_run(w.conn, "R1")
         assert pulse_store.get(w.conn, "core", f"question/r1-{q.id}") is not None
+        claude_task = "SELECT status FROM tasks WHERE runner = 'claude'"
+        await until(lambda: w.conn.execute(claude_task).fetchone()[0] == "waiting", 20,
+                    "the task's wait")  # fmt: skip
         # ask_timeout (4 h) passes; any message wakes the loop to notice
         w.conn.execute("UPDATE run_questions SET asked_at = ?",
                        (iso(utcnow() - timedelta(hours=5)),))  # fmt: skip
         w.conn.execute("UPDATE tasks SET wake_at = ? WHERE status = 'waiting'",
                        (iso(utcnow() - timedelta(seconds=1)),))  # fmt: skip
-        w.chat.add_message(handle=test_e2e_runner.OWNER_PHONE, text="/runs")
+        for _ in range(10):  # nudge the loop until it notices (it may be mid-sleep)
+            w.chat.add_message(handle=test_e2e_runner.OWNER_PHONE, text="/runs")
+            with contextlib.suppress(AssertionError):
+                await until(lambda: any(t.startswith("R1 done") for t in w.texts()), 3, "done")
+                break
         await text_like(w, lambda t: t.startswith("R1 done"), "done after the timeout")
         assert prompts(w, "R1")[1].startswith(f'Your question "{TYPO_Q}": No answer from the owner')
         item = pulse_store.get(w.conn, "core", f"question/r1-{q.id}")
