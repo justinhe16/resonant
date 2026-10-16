@@ -7,12 +7,14 @@ owner) call them. The handlers call ``ClaudeRunner`` (``components.runners["clau
 at call time: the runner is built after the tools are registered) and return code-built
 ``text`` that the local runner's report line and the fast path's render send as is.
 
-- ``start_run{repo?, ask}``: L3, no approval (the sandbox is the wall). ``repo`` is a free
+- ``start_run{repo?, ask, report?}``: L3, no approval (the sandbox is the wall). ``repo`` is a free
   string (a registry name, ``owner/name`` or a GitHub URL) that the runner's resolver checks;
   the registered names are listed in the spec (``specs_for``). Without ``repo`` the run
   works in a scratch dir and ends with Claude's summary, no PR (docs/employee-plan.md D1). A
   run that can't start (not set up, ambiguous or unknown repo, paused) is a normal result with
-  ``started: false`` and the reason as ``text``.
+  ``started: false`` and the reason as ``text``. ``report``: ``digest`` (the default) puts
+  the run's end in the hourly digest; ``now`` texts it when it ends (``/run`` passes it, and
+  the model does when the owner asks to hear right away; docs/employee-plan.md D5, EM-6).
 - ``list_runs{code?}``: L0, active runs first. Run codes (``R3``) are not approval codes: the
   model sees them, never an approval code. Free text from Claude (summary, failure) is
   cleaned and clipped.
@@ -30,7 +32,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.gate.codes import clean_external
@@ -46,6 +48,8 @@ if TYPE_CHECKING:
     from resonant.store.runs import Run
 
 RUNNER = "claude"
+Report = Literal["now", "digest"]
+REPORTS: tuple[Report, ...] = ("now", "digest")
 ASK_MAX = 4000  # ClaudeRunner's MAX_ASK (a test checks they agree)
 REPO_MAX = 200
 RUNS_MAX = 8  # runs listed
@@ -64,7 +68,13 @@ class RunnerApi(Protocol):
     async def setup_missing(self) -> str | None: ...
 
     async def start_run(
-        self, repo: str | None, ask: str, principal: str, *, merge: bool = False
+        self,
+        repo: str | None,
+        ask: str,
+        principal: str,
+        *,
+        merge: bool = False,
+        report: Report = "digest",
     ) -> Started | Refused: ...
 
     def list_runs(self, limit: int = 20) -> list[Run]: ...
@@ -95,6 +105,14 @@ START_RUN = ToolSpec(
             "repo": {"type": "string", "maxLength": REPO_MAX},
             "ask": {"type": "string", "minLength": 1, "maxLength": ASK_MAX},
             "merge": {"type": "boolean"},
+            "report": {
+                "type": "string",
+                "enum": list(REPORTS),
+                "description": (
+                    "now: text the result the moment the run ends (the owner asked to hear "
+                    "right away); digest (default): in the hourly digest"
+                ),
+            },
         },
         "required": ["ask"],
         "additionalProperties": False,
@@ -271,7 +289,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         )
 
     async def _start_run(args: dict[str, Any]) -> dict[str, Any]:
-        unknown = set(args) - {"repo", "ask", "merge"}
+        unknown = set(args) - {"repo", "ask", "merge", "report"}
         if unknown:
             raise ToolFailed(f"start_run: unknown arguments: {sorted(unknown)}")
         repo, ask, merge = args.get("repo"), args.get("ask"), args.get("merge", False)
@@ -282,6 +300,9 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         if not ask.strip():
             raise ToolFailed("start_run: ask is a required string, repo an optional one")
         repo = (repo or "").strip() or None
+        report = args.get("report", "digest")
+        if report not in REPORTS:
+            raise ToolFailed("start_run: report must be now or digest")
         if len(ask) > ASK_MAX:
             raise ToolFailed(f"start_run: ask is too long (at most {ASK_MAX} characters)")
         claude = runner()
@@ -289,7 +310,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"started": False, "text": missing()}
         if repo is not None and len(repo) > REPO_MAX:
             raise ToolFailed(f"start_run: repo is too long (at most {REPO_MAX} characters)")
-        result = await claude.start_run(repo, ask, ctx.principals.owner, merge=merge)
+        result = await claude.start_run(repo, ask, ctx.principals.owner, merge=merge, report=report)
         if (reason := _refusal(result)) is not None:
             return {"started": False, "text": reason}
         started = cast("Started", result)

@@ -18,6 +18,10 @@ or no ``principals.yaml`` owner: not scheduled. Each run:
    ONE message to the owner, ``dedupe_key=pulse:<local date>:<HH>``; then marks those items
    told. Nothing pending: nothing sent.
 
+Claude workers' items (``core`` / ``run/<code>``, EM-6) go in a ``Workers:`` section after
+the rest; when there is news, the workers still running (already told) are listed with them,
+for status (they never make a pulse send on their own).
+
 The message is at most ``MAX_CHARS`` (1,000). Items that don't fit are not marked told and ride
 the next pulse; the message ends ``+N more``. Extension items are rendered as
 ``notify.prefix(source)`` (the code-built ``[name]``, anti-spoofing) + mark + the stored,
@@ -80,6 +84,8 @@ INFLIGHT_KEEP = timedelta(days=2)
 UNSENT_MAX_AGE = timedelta(hours=2)  # an unsent record older than this is abandoned
 ITEM_TTL_S = 24 * 3600
 LABEL_MAX = 60
+WORKER_PREFIX = "run/"
+WORKERS_HEADER = "Workers:"
 _BAD_KEY_CHARS = re.compile(r"[^a-z0-9/._:-]")
 
 
@@ -132,20 +138,95 @@ def fit_lines(lines: Sequence[str], room: int) -> tuple[list[str], int]:
     return shown, len(lines) - len(shown)
 
 
-def compose(items: Sequence[store.Item]) -> tuple[str, list[store.Item]] | None:
-    """The pulse text and the items it shows (the rest wait); None with no items."""
-    ordered = _order(items)
-    if not ordered:
+def is_worker_item(item: store.Item) -> bool:
+    """A Claude worker's line (``core`` / ``run/<code>``, ``runners/reports.py``)."""
+    return item.source == CORE and item.key.startswith(WORKER_PREFIX)
+
+
+def worker_line(item: store.Item, max_chars: int = LINE_MAX) -> str:
+    """One worker as a line under ``Workers:`` (its title is code-built around cleaned
+    parts): ``🔴`` for one that should have been texted (a failure nobody took)."""
+    return render_item(item, "🔴" if item.urgency == "urgent" else "", max_chars)
+
+
+def order_workers(items: Sequence[store.Item]) -> list[store.Item]:
+    """Finished first (urgent first, oldest first: they are news), then the running ones
+    oldest first (status, dropped first when the message is full)."""
+    finished = _order([i for i in items if i.cleared])
+    going = sorted((i for i in items if not i.cleared), key=lambda i: (i.updated_at, i.key))
+    return [*finished, *going]
+
+
+def fit_entries(
+    entries: Sequence[tuple[str, store.Item | None]], room: int
+) -> tuple[list[str], list[store.Item], int]:
+    """Like :func:`fit_lines` for lines that are either an item's or a section header
+    (item None). A header is never left last, and ``+N more`` counts items only. Returns the
+    lines shown, their items and how many items are left out."""
+    total = sum(1 for _line, item in entries if item is not None)
+    shown: list[str] = []
+    listed: list[store.Item] = []
+    used = 0
+    for line, item in entries:
+        left = total - len(listed) - (item is not None)
+        reserve = len(f"\n+{left} more") if left else 0
+        if used + 1 + len(line) + reserve > room:
+            break
+        shown.append(line)
+        used += 1 + len(line)
+        if item is not None:
+            listed.append(item)
+    while shown and entries[len(shown) - 1][1] is None:  # a header with nothing under it
+        shown.pop()
+    return shown, listed, total - len(listed)
+
+
+def worker_entries(
+    workers: Sequence[store.Item], header: str = WORKERS_HEADER
+) -> list[tuple[str, store.Item | None]]:
+    """The ``Workers:`` section as entries for :func:`fit_entries` (none without workers)."""
+    if not workers:
+        return []
+    return [(header, None), *((worker_line(i), i) for i in order_workers(workers))]
+
+
+def compose(
+    items: Sequence[store.Item], context: Sequence[store.Item] = ()
+) -> tuple[str, list[store.Item]] | None:
+    """The pulse text and the items it shows (the rest wait); None with no items.
+
+    Worker items go in a ``Workers:`` section after the rest (before it when one is urgent:
+    a failure the owner wasn't texted). ``context``: workers already told that are still
+    running, listed for status when there is news (never a reason to send, and not counted
+    in ``+N more``)."""
+    if not items:
         return None
-    lines = [item_line(i) for i in ordered]
-    shown, more = fit_lines(lines, MAX_CHARS - len(HEADER))
-    if not shown:  # one line is at most LINE_MAX, so this is only a tiny-cap safety net
-        shown, more = lines[:1], len(lines) - 1
+    others = _order([i for i in items if not is_worker_item(i)])
+    keys = {(i.source, i.key) for i in items}
+    workers = [i for i in items if is_worker_item(i)]
+    workers += [i for i in context if (i.source, i.key) not in keys and is_worker_item(i)]
+    entries: list[tuple[str, store.Item | None]] = [(item_line(i), i) for i in others]
+    if any(i.urgency == "urgent" for i in workers):  # a failure nobody took goes first
+        entries = [*worker_entries(workers), *entries]
+    else:
+        entries += worker_entries(workers)
+    shown, listed, _left = fit_entries(entries, MAX_CHARS - len(HEADER))
+    shown_keys = {(i.source, i.key) for i in listed}
+    more = sum(1 for k in keys if k not in shown_keys)  # news left out, not status lines
+    if not listed:  # one line is at most LINE_MAX, so this is only a tiny-cap safety net
+        first = next(i for _line, i in entries if i is not None)
+        shown, listed = [item_line(first)], [first]
+        more = sum(1 for k in keys if k != (first.source, first.key))
         assert len(shown[0]) <= MAX_CHARS - len(HEADER)
     parts = [HEADER, *shown]
     if more:
         parts.append(f"+{more} more")
-    return "\n".join(parts), ordered[: len(shown)]
+    return "\n".join(parts), listed
+
+
+def running_workers(conn: sqlite3.Connection, now: datetime) -> list[store.Item]:
+    """Open (uncleared, unexpired) worker items: the runs still going."""
+    return [i for i in store.open_items(conn, now) if is_worker_item(i) and not i.cleared]
 
 
 def is_approval_item(item: store.Item) -> bool:
@@ -170,7 +251,8 @@ def preview(
 ) -> str | None:
     """What the next pulse would say, or None if it has nothing. Read-only (core items are
     only refreshed by a run)."""
-    composed = compose(_pending(conn, now or utcnow(), hide_approvals=hide_approvals))
+    at = now or utcnow()
+    composed = compose(_pending(conn, at, hide_approvals=hide_approvals), running_workers(conn, at))
     return None if composed is None else composed[0]
 
 
@@ -431,7 +513,12 @@ async def send_pulse(
             return {"sent": False, "count": 0, "skipped": "quiet"}
     key = manual_dedupe_key(local) if manual else dedupe_key(local)
     status, count = await deliver(
-        conn, channel, owner, key, now, lambda: compose(_pending(conn, now))
+        conn,
+        channel,
+        owner,
+        key,
+        now,
+        lambda: compose(_pending(conn, now), running_workers(conn, now)),
     )
     if status == "sent":
         return {"sent": True, "count": count}

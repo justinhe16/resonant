@@ -136,7 +136,9 @@ async def test_fork_run_asks_then_opens_the_upstream_pr(
     tmp_path: Path, db: sqlite3.Connection
 ) -> None:
     h = fork_harness(tmp_path, db)
-    res = await h.runner.start_run("github.com/up/stream", "fix the flaky test", "owner")
+    res = await h.runner.start_run(
+        "github.com/up/stream", "fix the flaky test", "owner", report="now"
+    )
     assert isinstance(res, Started), res
     assert "up/stream is upstream: the work goes to your fork, and I'll ask before the PR." in (
         res.text
@@ -198,7 +200,7 @@ async def test_fork_run_asks_then_opens_the_upstream_pr(
 
 async def test_fork_run_no_means_no_upstream_pr(tmp_path: Path, db: sqlite3.Connection) -> None:
     h = fork_harness(tmp_path, db)
-    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner")
+    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner", report="now")
     assert isinstance(res, Started)
     await settle(h, res.code, "waiting")
     answer(h, yes=False)
@@ -212,7 +214,7 @@ async def test_fork_branch_moved_after_the_ask_opens_nothing(
     tmp_path: Path, db: sqlite3.Connection
 ) -> None:
     h = fork_harness(tmp_path, db)
-    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner")
+    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner", report="now")
     assert isinstance(res, Started)
     run = await settle(h, res.code, "waiting")
     # someone pushes to the fork's branch after the owner was asked
@@ -236,7 +238,7 @@ async def test_upstream_pr_at_another_head_is_closed(
     trust_store.add_rule(db, scope=UPSTREAM, action="external_pr", effect="allow",
                          created_from="chat", now=utcnow())  # fmt: skip
     (h.gh_dir / "fork_moved").write_text("1")  # the branch moves while the PR is being opened
-    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner")
+    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner", report="now")
     assert isinstance(res, Started)
     run = await settle(h, res.code, "failed", "done")
     assert prompts(h) == []  # the owner's allow rule: no ask
@@ -254,9 +256,9 @@ async def test_fork_run_refused_without_the_public_repo_token(
     h = fork_harness(tmp_path, db)
     del h.keychain.items[GITHUB_PUBLIC_TOKEN_REF]
     assert await h.runner.setup_missing() is None  # optional for the runner as a whole
-    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner")
+    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner", report="now")
     assert res == Refused(FORK_NEEDS_PUBLIC_REPO)
-    assert isinstance(await h.runner.start_run("proj", "fix it", "owner"), Started)
+    assert isinstance(await h.runner.start_run("proj", "fix it", "owner", report="now"), Started)
 
 
 async def test_fork_checks_refuse_a_token_and_open_nothing(
@@ -264,7 +266,7 @@ async def test_fork_checks_refuse_a_token_and_open_nothing(
 ) -> None:
     h = fork_harness(tmp_path, db, "--leak", GH_TOKEN)
     h.runner._claude_cmd = (*(h.runner._claude_cmd or ()), "--scenario", "tokens")  # pyright: ignore[reportPrivateUsage]
-    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner")
+    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner", report="now")
     assert isinstance(res, Started)
     run = await settle(h, res.code, "failed")
     assert "nothing was opened upstream" in (run.failure or "")
@@ -282,7 +284,7 @@ def merge_harness(tmp_path: Path, db: sqlite3.Connection, **kw: Any) -> Harness:
 
 
 async def start_merging(h: Harness, ask: str = "fix it and merge it") -> str:
-    res = await h.runner.start_run("proj", ask, "owner", merge=True)
+    res = await h.runner.start_run("proj", ask, "owner", merge=True, report="now")
     assert isinstance(res, Started), res
     assert "I'll merge it when CI is green, unless a rule says to ask." in res.text
     return res.code
@@ -296,7 +298,7 @@ async def test_auto_merge_on_green(tmp_path: Path, db: sqlite3.Connection) -> No
     assert merge["argv"][merge["argv"].index("--match-head-commit") + 1] == run.head_sha
     assert merge["hosts_token"] == GH_TOKEN  # the daemon's token, never the session's
     [text] = h.chan.texts()
-    assert text.startswith(f"{code} merged: PR #41.") and "github.com/own/proj/pull/41" in text
+    assert text == f"{code} merged: PR #41 · https://github.com/own/proj/pull/41"
     task = task_store.get_task(db, cast(str, run.task_id))
     assert task is not None and task.status == "done"
 
@@ -319,7 +321,7 @@ async def test_auto_merge_waits_for_pending_ci_then_merges(
         await running
     ready, merged = h.chan.texts()
     assert ready.startswith(f"{code} done: PR #41 (CI pending)")
-    assert merged.startswith(f"{code} merged: PR #41.")
+    assert merged.startswith(f"{code} merged: PR #41 · ")
 
 
 async def test_auto_merge_stops_on_red(tmp_path: Path, db: sqlite3.Connection) -> None:
@@ -427,7 +429,7 @@ async def test_merge_flag_without_merge_intent_is_a_plain_run(
     tmp_path: Path, db: sqlite3.Connection
 ) -> None:
     h = merge_harness(tmp_path, db)
-    res = await h.runner.start_run("proj", "fix it", "owner")
+    res = await h.runner.start_run("proj", "fix it", "owner", report="now")
     assert isinstance(res, Started) and "merge it when CI" not in res.text
     await settle(h, res.code, "ready")
     await asyncio.sleep(0.3)
@@ -439,7 +441,9 @@ async def test_start_run_ignores_merge_for_a_fork_repo(
     tmp_path: Path, db: sqlite3.Connection, mode: str
 ) -> None:
     h = fork_harness(tmp_path, db)
-    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner", merge=True)
+    res = await h.runner.start_run(
+        "github.com/up/stream", "fix it", "owner", merge=True, report="now"
+    )
     assert isinstance(res, Started) and "merge it when CI" not in res.text
     repo = repo_store.get(db, UPSTREAM)
     assert repo is not None and repo.mode == mode
@@ -454,7 +458,7 @@ async def test_a_check_the_worker_asked_itself_never_opens_the_pr(
     """A worker's own ``resonant check`` with the very text the daemon would show can't stand
     in for the daemon's external_pr ask: its rows never match ``find_check``."""
     h = fork_harness(tmp_path, db)
-    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner")
+    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner", report="now")
     assert isinstance(res, Started)
     run = await settle(h, res.code, "waiting")
     [daemon_row] = qs.for_run(db, res.code)
@@ -489,3 +493,15 @@ async def test_cancel_stops_an_auto_merge_watch(tmp_path: Path, db: sqlite3.Conn
         h.loop.stop()
         await running
     assert h.gh_calls("merge") == [] and h.run(code).status == "ready"
+
+
+async def test_auto_merge_goes_to_the_digest_by_default(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """EM-6: an auto-merge's "merged" line follows the urgency rules (digest by default)."""
+    h = merge_harness(tmp_path, db)
+    res = await h.runner.start_run("proj", "fix it and merge it", "owner", merge=True)
+    assert isinstance(res, Started)
+    await settle(h, res.code, "merged")
+    await asyncio.sleep(0.3)
+    assert len(h.gh_calls("merge")) == 1 and h.chan.texts() == []
