@@ -58,6 +58,9 @@ class FakeGitHubApi:
         self.live: set[str] = set()
         self.fail_mint: tuple[int, str] | None = None  # (status, message) for the next mints
         self.fail_revoke = False
+        self.flaky: int = 0  # the next N requests answer 503 (a transient failure)
+        self.grant: dict[str, Any] = {}  # fields to override in a mint reply
+        self.slug = "resonant-runner"
         self.requests: list[tuple[str, str]] = []  # (method, path)
         self.issued = 0
 
@@ -93,6 +96,14 @@ class FakeGitHubApi:
         path = request.url.path
         self.requests.append((request.method, path))
         bearer = self._bearer(request)
+        if self.flaky > 0:
+            self.flaky -= 1
+            return httpx.Response(503, json={"message": "unavailable"})
+        if request.method == "GET" and path == "/app":
+            claims = self._claims(bearer)
+            if claims is None or claims.get("iss") != str(self.app_id):
+                return httpx.Response(401, json={"message": "bad jwt"})
+            return httpx.Response(200, json={"slug": self.slug, "id": self.app_id})
         if request.method == "POST" and path == (
             f"/app/installations/{self.installation_id}/access_tokens"
         ):
@@ -123,7 +134,15 @@ class FakeGitHubApi:
                 }
             )
             self.live.add(token)
-            return httpx.Response(201, json={"token": token, "expires_at": "2099-01-01T00:00:00Z"})
+            reply: dict[str, Any] = {
+                "token": token,
+                "expires_at": "2099-01-01T00:00:00Z",
+                "repository_selection": "selected",
+                "repositories": [{"name": n} for n in body.get("repositories", [])],
+                "permissions": body.get("permissions"),
+                **self.grant,
+            }
+            return httpx.Response(201, json=reply)
         if request.method == "DELETE" and path == "/installation/token":
             if self.fail_revoke:
                 return httpx.Response(500, json={"message": "boom"})

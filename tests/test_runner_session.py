@@ -4,6 +4,7 @@ not-set-up text. The runner harness of ``test_runner_claude`` with a fake GitHub
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -227,8 +228,6 @@ async def test_a_long_session_gets_a_fresh_token_in_the_same_files(
     assert start["token"] == first
     assert end["token"] in later  # rewritten in place (a later refresh may follow the probe)
     assert end["hosts_token"] == end["token"] or end["hosts_token"] in later  # gh's file too
-    # the old tokens are not revoked mid-run (a running `gh pr checks --watch` may hold one)
-    # but all of them are once the session is over
     assert h.api.live == set() and sorted(h.api.revoked) == sorted(h.api.tokens)
     transcript = (h.runner.transcript_dir / "R1.jsonl").read_text()
     assert not any(t in transcript for t in h.api.tokens)  # the refreshed one is redacted too
@@ -238,24 +237,19 @@ async def test_a_failed_refresh_is_retried_and_does_not_kill_the_session(
     tmp_path: Path, db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.WARNING)
-    h = build(tmp_path, db, extra=["--sleep", "1.2"], refresh_s=0.3)
+    h = build(tmp_path, db, extra=["--sleep", "1.6"], refresh_s=0.3)
     await h.start()
-    real = h.api.fail_mint
-    seen: list[int] = []
-    orig = h.runner.app._client  # type: ignore[union-attr]  # pyright: ignore[reportPrivateUsage]
 
-    def client() -> Any:
-        seen.append(1)
-        if len(seen) == 2:  # the first refresh
-            h.api.fail_mint = (500, "down")
-        elif len(seen) == 3:
-            h.api.fail_mint = real
-        return orig()
+    async def flap() -> None:
+        await until(lambda: len(h.api.mints) >= 1, what="the first token")
+        h.api.fail_mint = (403, "nope")  # the refreshes fail for a while ...
+        await asyncio.sleep(0.5)
+        h.api.fail_mint = None  # ... then work
 
-    h.runner.app._client = client  # type: ignore[union-attr, method-assign]  # pyright: ignore[reportPrivateUsage]
-    await h.drain()
+    await asyncio.gather(h.drain(), flap())
     assert h.run().status == "ready"
     assert "run token refresh failed" in caplog.text
+    assert len(h.api.tokens) >= 2  # a later refresh got through
     assert h.api.live == set()
 
 
@@ -323,6 +317,13 @@ async def test_a_revoke_that_fails_is_logged_and_does_not_stop_the_run(
     assert "couldn't revoke a run's token" in caplog.text
     assert not any(t in caplog.text for t in h.api.tokens)
     assert db.execute("SELECT 1 FROM audit_log WHERE action = 'run.token_revoke_failed'").fetchone()
+    # three tries, then the owner is told which token is still live and until when
+    deletes = [r for r in h.api.requests if r[0] == "DELETE"]
+    assert len(deletes) == 3
+    reply = h.chan.texts()[0]
+    assert reply.startswith("R1 done: PR #41")
+    assert "⚠ the run's GitHub token wasn't revoked; it expires at " in reply
+    assert not any(t in reply for t in h.api.tokens)
 
 
 async def test_a_resumed_session_gets_a_new_token_and_the_old_one_is_revoked(
@@ -482,7 +483,10 @@ async def test_not_set_up_names_the_app_config_and_key(
     del h.keychain.items[GITHUB_APP_KEY_REF]
     text = await h.runner.setup_missing()
     assert text is not None
-    assert f"secret {GITHUB_APP_KEY_REF}" in text and "GitHub App's private key" in text
+    assert (
+        f"secret {GITHUB_APP_KEY_REF}" in text
+        and "secret set runner/github_app_key --from-file" in text
+    )
     assert "runner.github_app" not in text
     h.runner.cfg = h.cfg.model_copy(update={"github_app": None})
     text = await h.runner.setup_missing()
@@ -495,3 +499,176 @@ async def test_not_set_up_names_the_app_config_and_key(
     del h.keychain.items[GITHUB_TOKEN_REF]
     again = await h.runner.setup_missing()
     assert again is not None and f"secret {GITHUB_TOKEN_REF}" in again
+
+
+async def test_a_refresh_revokes_the_previous_token_at_once(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="hang", refresh_s=0.3)
+    code = await h.start()
+    task = h.spawn_loop()
+    await until(lambda: len(h.api.mints) >= 2, what="a refresh")
+    await until(lambda: len(h.api.revoked) >= 1, what="the old token's revoke")
+    assert h.run(code).status == "running"  # the session is still going
+    assert h.api.revoked[0] == h.api.tokens[0]
+    newest = h.api.tokens[-1]
+    assert newest in h.api.live and h.api.tokens[0] not in h.api.live
+    token_file = (h.code_dir(code) / "creds" / "token").read_text().strip()
+    assert token_file in h.api.live  # what is on disk is always a live token
+    await h.runner.cancel_run(code)
+    await task
+    assert h.api.live == set()
+
+
+# --- the mint reply is checked --------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("grant", "why"),
+    [
+        ({"repository_selection": "all"}, "more than the one repository"),
+        ({"repositories": [{"name": "proj"}, {"name": "other"}]}, "different set of repositories"),
+        ({"repositories": [{"name": "other"}]}, "different set of repositories"),
+        ({"permissions": {"contents": "write", "administration": "write"}}, "administration"),
+        ({"permissions": {"contents": "read", "pull_requests": "write"}}, "lacks contents"),
+    ],
+)
+async def test_a_token_that_isnt_what_was_asked_for_is_revoked_and_fails_the_run(
+    tmp_path: Path, db: sqlite3.Connection, grant: dict[str, Any], why: str
+) -> None:
+    h = build(tmp_path, db)
+    h.api.grant = grant
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed" and why in (run.failure or "")
+    assert h.api.live == set() and h.api.revoked == h.api.tokens and len(h.api.tokens) == 1
+    assert not (h.tmp("R1") / "argv.json").exists()  # no session with that token
+
+
+async def test_a_transient_mint_failure_is_retried(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = build(tmp_path, db)
+    h.api.flaky = 2  # two 503s, then fine
+    await h.start()
+    await h.drain()
+    assert h.run().status == "ready" and len(h.api.tokens) == 1
+
+
+# --- the base branch ------------------------------------------------------------------------
+
+
+def push_event(
+    sha: str, *, actor: str = "resonant-runner[bot]", minutes_ago: float = 0
+) -> dict[str, Any]:
+    from datetime import UTC, datetime
+
+    when = datetime.now(UTC) - timedelta(minutes=minutes_ago)
+    return {
+        "after": sha, "before": "0" * 40, "ref": "refs/heads/main", "activity_type": "push",
+        "actor": {"login": actor}, "timestamp": when.isoformat().replace("+00:00", "Z"),
+    }  # fmt: skip
+
+
+async def test_an_unprotected_base_is_said_in_the_start_reply(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    res = await h.runner.start_run("proj", "x", "owner")
+    assert isinstance(res, claude_mod.Started) and res.warning is None
+    assert "protected" not in res.text
+    (h.gh_dir / "protected").write_text("false")
+    res = await h.runner.start_run("proj", "y", "owner")
+    assert isinstance(res, claude_mod.Started)
+    assert res.text.endswith("\nmain isn't protected — the session could push to it directly.")
+
+
+async def test_a_direct_push_to_the_base_fails_the_run_and_tells_the_owner(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    (h.gh_dir / "protected").write_text("false")
+    sha = "ab" * 20
+    (h.gh_dir / "activity.json").write_text(
+        json.dumps(
+            [
+                push_event(sha),
+                push_event("cd" * 20, actor="someone-else"),  # a person's push isn't the run's
+                push_event("ef" * 20, minutes_ago=600),  # before the run began
+            ]
+        )
+    )
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed"
+    assert run.failure == "pushed directly to main (abababa); not merged"
+    texts = h.chan.texts()
+    assert texts[0] == (
+        "⚠ R1 pushed directly to main: abababa. Look at own/proj now; this run will not be merged."
+    )
+    assert texts[1].startswith("R1 failed: pushed directly to main")
+    assert "cdcdcdc" not in "".join(texts) and "efefefe" not in "".join(texts)
+    res = await h.runner.merge_run("R1")
+    assert isinstance(res, Refused) and h.gh_calls("merge") == []
+    assert h.api.live == set()
+    assert h.prs() == [] or h.run().pr_number is None  # nothing was recorded as ready
+
+
+async def test_base_activity_is_not_asked_when_the_base_is_protected(h: Harness) -> None:
+    (h.gh_dir / "activity.json").write_text(json.dumps([push_event("ab" * 20)]))
+    await h.start()
+    await h.drain()  # protected (the default): the feed is not consulted
+    assert h.run().status == "ready"
+    assert [c for c in h.gh_calls("api") if "/activity" in c["argv"][1]] == []
+
+
+async def test_an_unprotected_base_with_a_clean_feed_runs_normally(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    (h.gh_dir / "protected").write_text("false")
+    (h.gh_dir / "activity.json").write_text(json.dumps([push_event("cd" * 20, actor="a-person")]))
+    await h.start()
+    await h.drain()
+    assert h.run().status == "ready"
+    [lookup] = [c for c in h.gh_calls("api") if "/activity" in c["argv"][1]]
+    assert "ref=refs/heads/main" in lookup["argv"][1]
+    assert h.api.requests.count(("GET", "/app")) == 1  # the bot's login, asked once
+
+
+async def test_a_feed_that_cant_be_read_fails_the_run_closed(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    (h.gh_dir / "protected").write_text("false")
+    (h.gh_dir / "activity_rc").write_text("1")
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed" and "activity" in (run.failure or "")
+    assert h.api.live == set()
+
+
+# --- the startup sweep ------------------------------------------------------------------------
+
+
+async def test_startup_revokes_a_token_left_by_a_run_that_already_ended(h: Harness) -> None:
+    from resonant.runner.workspace import write_session_credentials
+
+    await h.start()
+    await h.drain()
+    assert h.run().status == "ready" and h.api.live == set()
+    # a crash after the row said "ready" but before the token was revoked
+    left = (await h.app.mint("proj", workflows=False)).token
+    run_dir = h.code_dir("R1")
+    write_session_credentials(run_dir, left)
+    other = h.cfg.work_dir / "R7"  # a dir with no creds, and a name that isn't a run's
+    other.mkdir()
+    (h.cfg.work_dir / "notes" / "creds").mkdir(parents=True)
+    (h.cfg.work_dir / "notes" / "creds" / "token").write_text("ghs_not_a_run\n")
+    assert h.api.live == {left}
+    await h.runner.start()
+    assert h.api.live == set() and left in h.api.revoked
+    assert not (run_dir / "creds").exists()
+    assert (h.cfg.work_dir / "notes" / "creds" / "token").exists()  # only R<n> dirs are touched
+    await h.runner.aclose()

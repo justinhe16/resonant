@@ -237,7 +237,10 @@ def make_world(
     assert settings.runner.github_app is not None
     options: dict[str, Any] = {
         "github_app": GitHubApp(
-            settings.runner.github_app, SecretStore(keychain), transport=api.transport()
+            settings.runner.github_app,
+            SecretStore(keychain),
+            transport=api.transport(),
+            backoff_s=0,
         ),
         "wrap": identity_wrap,
         "self_check": check_ok,

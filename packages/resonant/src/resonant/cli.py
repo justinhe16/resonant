@@ -760,11 +760,24 @@ def _checked_ref(ref: str) -> str:
         raise typer.Exit(2) from None
 
 
-def _read_secret_value(ref: str) -> str:
-    """From a hidden prompt (twice) on a terminal, else one line of stdin. Never echoed."""
+def _read_secret_value(ref: str, from_file: str | None = None) -> str:
+    """From ``--from-file`` (a path, or ``-`` for all of stdin; read here, so a multi-line
+    value like a PEM never touches a command line), else a hidden prompt (twice) on a
+    terminal, else one line of stdin. Never echoed."""
     import getpass
     import sys
 
+    if from_file is not None:
+        try:
+            text = (
+                sys.stdin.read()
+                if from_file == "-"
+                else Path(from_file).expanduser().read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError) as e:
+            typer.echo(f"error: can't read {from_file}: {type(e).__name__}", err=True)
+            raise typer.Exit(2) from None
+        return text.replace("\r\n", "\n").strip("\n")
     if _stdin_is_tty():
         value = getpass.getpass(f"Value for {ref} (hidden): ")
         if getpass.getpass("Again: ") != value:
@@ -775,13 +788,24 @@ def _read_secret_value(ref: str) -> str:
 
 
 @secret_app.command("set")
-def secret_set(ref: SecretRef) -> None:
-    """Store a secret. The value comes from a hidden prompt or stdin, never the command line."""
+def secret_set(
+    ref: SecretRef,
+    from_file: Annotated[
+        str | None,
+        typer.Option(
+            "--from-file",
+            help="Read the value from this file (or - for stdin); it may be several lines, "
+            "like a PEM, up to about 2.5 KB. Delete the file afterwards.",
+        ),
+    ] = None,
+) -> None:
+    """Store a secret. The value comes from a hidden prompt, stdin or --from-file, never the
+    command line."""
     import asyncio
     import hmac
 
     ref = _checked_ref(ref)
-    value = _read_secret_value(ref)
+    value = _read_secret_value(ref, from_file)
     try:
         validate_value(value)
     except InvalidSecretValue as e:

@@ -283,7 +283,7 @@ What the runner is: "fix the typo in the README in demo" starts a Claude Code se
    resonant secret set runner/claude_token    # paste it at the hidden prompt, twice
    ```
 
-   For API billing instead, set `runner/anthropic_key` (and `runner.max_budget_usd` in config). The secret store takes values up to 128 bytes; a setup token is about 108.
+   For API billing instead, set `runner/anthropic_key` (and `runner.max_budget_usd` in config). The secret store takes values up to 3500 characters (`--from-file` for a multi-line one).
 2. **A GitHub token for the runner repos only.** Create a **fine-grained** personal access token, limited to the repos the runner may touch, with these repository permissions: Contents **read and write**, Pull requests **read and write**, Checks **read**, Commit statuses **read**, Metadata **read**. **No Workflows permission**: the runner is never allowed to edit `.github/`. Then:
 
    ```sh

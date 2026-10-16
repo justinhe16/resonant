@@ -382,7 +382,8 @@ def runner_rows(
         (
             "runner/github_app_key",
             (GITHUB_APP_KEY_REF,),
-            f"store the GitHub App's private key as Keychain item {GITHUB_APP_KEY_REF}",
+            f"resonant secret set {GITHUB_APP_KEY_REF} --from-file <the downloaded .pem>, "
+            "then delete the .pem",
         ),
         (
             "runner/claude_token (or runner/anthropic_key)",
@@ -399,6 +400,16 @@ def runner_rows(
             rows.append(("FAIL", False, step, errors[0]))
         else:
             rows.append(("FAIL", False, step, f"missing: {how}"))
+    # Owner steps nothing here can check without a live run or admin rights on GitHub.
+    for step, how in (
+        ("runner gh pr create with an installation token",
+         "on the first real /run, confirm the session opens its PR (the fake gh can't tell)"),
+        ("runner gh pr checks --watch with an installation token",
+         "on the first real /run, confirm the session can watch CI (needs checks: read)"),
+        ("runner base branch protection",
+         "require a PR on each repo's base branch and keep the app out of the bypass list"),
+    ):  # fmt: skip
+        rows.append(("SKIP", False, step, f"owner step: {how}"))
     for name in sorted(repos):
         step = f"runner repo {name} has CI"
         try:

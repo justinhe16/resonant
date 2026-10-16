@@ -85,6 +85,16 @@ elif args[:2] == ["pr", "create"]:
     open(prs, "w").write(json.dumps([{"number": 41, "url": url}]))
     print("Creating pull request...", file=sys.stderr)
     print(url)
+elif args[:1] == ["api"]:
+    def text(name, default):
+        p = os.path.join(d, name)
+        return open(p).read().strip() if os.path.exists(p) else default
+    if "/branches/" in args[1]:
+        print(json.dumps({"protected": text("protected", "true") == "true"}))
+    elif "/activity" in args[1]:
+        if rc("activity_rc"):
+            sys.exit(rc("activity_rc"))
+        print(text("activity.json", "[]"))
 elif args[:2] == ["pr", "view"]:
     view = os.path.join(d, "view.json")
     if not os.path.exists(view):
@@ -1527,3 +1537,73 @@ def test_read_session_token_only_reads_a_plain_token_file(tmp_path: Path) -> Non
     (creds / "token").unlink()
     (creds / "token").write_text("two\nlines\n")
     assert workspace_mod.read_session_token(run) is None
+
+
+def test_the_session_helper_answers_for_github_com_only(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    run.mkdir(mode=0o700)
+    creds = workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+
+    def ask(host: str) -> str:
+        return subprocess.run(
+            [str(creds / "credential-helper"), "get"],
+            input=f"protocol=https\nhost={host}\n\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    assert f"password={SESSION_TOKEN}" in ask("github.com")
+    for other in ("evil.example.com", "github.com.evil.example", "gist.github.com", ""):
+        assert ask(other) == ""
+    assert subprocess.run(
+        [str(creds / "credential-helper"), "store"], input="host=github.com\n\n",
+        capture_output=True, text=True, check=True,
+    ).stdout == ""  # fmt: skip
+
+
+def test_a_planted_temp_name_is_a_clean_error_not_an_oserror(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    run.mkdir(mode=0o700)
+    creds = workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+    (creds / ".token.new").mkdir()  # a directory where the next temp file goes
+    with pytest.raises(RunnerError, match="credential files can't be updated"):
+        workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+    (creds / ".token.new").rmdir()
+    (creds / "token").unlink()
+    (creds / "token").mkdir()  # ... or where the token file goes
+    with pytest.raises(RunnerError, match="credential files can't be updated"):
+        workspace_mod.write_session_credentials(run, SESSION_TOKEN)
+    assert not (creds / ".token.new").exists()  # and no temp file is left behind
+
+
+async def test_base_protected_and_base_pushes(env: Env) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    env.gh_set("protected", "false")
+    assert await env.ws.base_protected("proj", SECRETS) is False
+    env.gh_set("protected", "true")
+    assert await env.ws.base_protected("proj", SECRETS) is True
+
+    now = datetime.now(UTC)
+
+    def ev(sha: str, kind: str, actor: str, when: datetime) -> dict[str, object]:
+        return {"after": sha, "activity_type": kind, "actor": {"login": actor},
+                "timestamp": when.isoformat().replace("+00:00", "Z")}  # fmt: skip
+
+    env.gh_set("activity.json", json.dumps([
+        ev("a" * 40, "push", "bot[bot]", now),
+        ev("b" * 40, "force_push", "BOT[bot]", now),
+        ev("a" * 40, "push", "bot[bot]", now),  # a repeat
+        ev("c" * 40, "push", "someone", now),
+        ev("d" * 40, "push", "bot[bot]", now - timedelta(hours=2)),
+        ev("e" * 40, "pr_merge", "bot[bot]", now),
+        {"junk": True},
+    ]))  # fmt: skip
+    found = await env.ws.base_pushes(
+        "proj", SECRETS, actor="bot[bot]", since=now - timedelta(hours=1)
+    )
+    assert found == ["a" * 40, "b" * 40]
+    env.gh_set("activity_rc", "1")
+    with pytest.raises(RunnerError, match="activity"):
+        await env.ws.base_pushes("proj", SECRETS, actor="bot[bot]", since=now)

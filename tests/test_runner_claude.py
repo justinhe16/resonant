@@ -155,6 +155,16 @@ elif args[:2] == ["pr", "checks"]:
     sys.exit(rc("checks_rc"))
 elif args[:2] == ["pr", "merge"]:
     sys.exit(rc("merge_rc"))
+elif args[:1] == ["api"]:
+    def text(name, default):
+        p = os.path.join(d, name)
+        return open(p).read().strip() if os.path.exists(p) else default
+    if "/branches/" in args[1]:  # protected unless a test says otherwise
+        print(json.dumps({"protected": text("protected", "true") == "true"}))
+    elif "/activity" in args[1]:
+        if rc("activity_rc"):
+            sys.exit(rc("activity_rc"))
+        print(text("activity.json", "[]"))
 """
 
 
@@ -269,6 +279,9 @@ class Harness:
     def gh_calls(self, verb: str | None = None) -> list[dict[str, Any]]:
         path = self.gh_dir / "calls.jsonl"
         calls = [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+        if verb == "api":
+            return [c for c in calls if c["argv"][0] == "api"]
+        calls = [c for c in calls if c["argv"][0] != "api"]  # branch and activity lookups
         return [c for c in calls if verb is None or c["argv"][:2] == ["pr", verb]]
 
     def session_tools(self, code: str = "R1") -> list[dict[str, Any]]:
@@ -384,7 +397,7 @@ def build(
         keychain.items[GITHUB_APP_KEY_REF] = private_pem_one_line()
     api = FakeGitHubApi()
     assert cfg.github_app is not None
-    app = GitHubApp(cfg.github_app, SecretStore(keychain), transport=api.transport())
+    app = GitHubApp(cfg.github_app, SecretStore(keychain), transport=api.transport(), backoff_s=0)
 
     def github_for(_secrets: RunnerSecrets) -> FakeGitHub:
         return fake_github

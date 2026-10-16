@@ -10,8 +10,11 @@ Rules this module keeps:
 - ``security`` is run by absolute path with an argv list (never a shell), a timeout, a new
   session (no controlling terminal, so it can never prompt there) and a minimal env. stderr is
   discarded unread.
-- A value is never in argv. Reads take it from stdout; ``set`` feeds it on stdin to the
-  trailing ``-w`` prompt.
+- A value is never in argv. Reads take it from stdout; ``set`` runs ``security -i`` and feeds
+  the ``add-generic-password`` command on stdin (a pipe, not visible to ``ps``). The items
+  are still created by ``/usr/bin/security``, so its ACL and the no-prompt reads are
+  unchanged. ``security -i`` reads a line of about 4 KB at most (checked on macOS 26: 4000
+  characters work, 8000 do not), hence ``MAX_LEN``.
 - Refs are slug-validated before any argv is built: both parts start with ``[a-z]``, so the
   ``-a`` value can never look like an option.
 - Errors carry the ref and an exit code or reason, never a value or ``security``'s output.
@@ -25,6 +28,7 @@ isn't used because its ACL follows the interpreter binary.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import os
 import re
@@ -37,8 +41,12 @@ SECURITY = "/usr/bin/security"
 SERVICE = "resonant"
 TIMEOUT_S = 5.0
 MIN_LEN = 8
-# ``security`` reads the trailing ``-w`` value with getpass(3), which keeps 128 bytes.
-MAX_LEN = 128
+# The stored form of a value (see ``encode_value``) must fit one ``security -i`` command line
+# with the ref and the item's other options; 3500 leaves room. A 2048-bit RSA PEM is 1.7 KB
+# and 2.3 KB once encoded; a 4096-bit one does not fit.
+MAX_LEN = 3500
+ENCODED_PREFIX = "resonant-b64:"
+_PLAIN = re.compile(r"[A-Za-z0-9_.:@/+=-]+")
 ENV_PREFIX = "RESONANT_SECRET_"
 
 EXT_SLUG = r"[a-z][a-z0-9-]{0,47}"  # the manifest's extension name rule
@@ -109,13 +117,33 @@ def env_name(name: str) -> str:
 
 
 def validate_value(value: str) -> None:
-    """``set`` takes 8..128 printable ASCII characters (spaces allowed, no newlines)."""
+    """``set`` takes 8 or more printable ASCII characters, plus newlines (a PEM), whose stored
+    form is at most ``MAX_LEN`` characters."""
     if len(value) < MIN_LEN:
         raise InvalidSecretValue(f"too short: at least {MIN_LEN} characters")
-    if len(value) > MAX_LEN:
-        raise InvalidSecretValue(f"too long: at most {MAX_LEN} characters")
-    if not all(" " <= c <= "~" for c in value):
-        raise InvalidSecretValue("only printable ASCII (no newlines or control characters)")
+    if not all(" " <= c <= "~" or c == "\n" for c in value):
+        raise InvalidSecretValue("only printable ASCII and newlines (no control characters)")
+    if len(encode_value(value)) > MAX_LEN:
+        raise InvalidSecretValue(f"too long: at most {MAX_LEN} characters once stored")
+
+
+def encode_value(value: str) -> str:
+    """The text stored in the Keychain. A value of plain characters is stored as it is (so
+    ``security find-generic-password -w`` shows it); anything else (spaces, quotes, newlines)
+    is base64 behind ``ENCODED_PREFIX``, which keeps it on one line and out of the way of
+    ``security -i``'s own parsing. ``SecretStore.get`` undoes it."""
+    if _PLAIN.fullmatch(value) and not value.startswith(ENCODED_PREFIX):
+        return value
+    return ENCODED_PREFIX + base64.b64encode(value.encode()).decode()
+
+
+def decode_value(stored: str) -> str:
+    if stored.startswith(ENCODED_PREFIX):
+        try:
+            return base64.b64decode(stored[len(ENCODED_PREFIX) :], validate=True).decode()
+        except (ValueError, UnicodeDecodeError):
+            return stored  # not ours: show what is there
+    return stored
 
 
 # --- the security runner ---------------------------------------------------------------
@@ -177,9 +205,15 @@ def find_argv(ref: str, *, value: bool) -> list[str]:
     return [*argv, "-w"] if value else argv
 
 
-def add_argv(ref: str) -> list[str]:
-    # -U updates an existing item; -w last makes security read the value (twice) from stdin.
-    return [SECURITY, "add-generic-password", "-U", "-s", SERVICE, "-a", validate_ref(ref), "-w"]
+SET_ARGV = [SECURITY, "-i"]  # the command goes on stdin, so the value is never in argv
+
+
+def add_command(ref: str, value: str) -> bytes:
+    """The ``security -i`` line that creates or replaces (-U) the item. ``encode_value`` makes
+    the value one token of plain characters, so it needs no quoting."""
+    stored = encode_value(value)
+    assert _PLAIN.fullmatch(stored)
+    return f"add-generic-password -U -s {SERVICE} -a {validate_ref(ref)} -w {stored}\n".encode()
 
 
 def delete_argv(ref: str) -> list[str]:
@@ -221,7 +255,7 @@ class SecretStore:
         value = out[:-1] if out.endswith("\n") else out
         if not value:
             raise SecretMissing(ref)
-        return value
+        return decode_value(value)
 
     async def exists(self, ref: str) -> bool:
         """Whether the item exists, without reading its value."""
@@ -235,10 +269,8 @@ class SecretStore:
 
     async def set(self, ref: str, value: str) -> None:
         """Create or replace the item. The value goes on stdin, never in argv."""
-        argv = add_argv(ref)
         validate_value(value)
-        line = value.encode() + b"\n"
-        result = await self._run(ref, argv, stdin=line + line)  # entered, then retyped
+        result = await self._run(ref, SET_ARGV, stdin=add_command(ref, value))
         if result.returncode != 0:
             raise self._failed(ref, result.returncode)
 
@@ -316,8 +348,9 @@ async def load_runner_secrets(store: SecretStore) -> RunnerSecrets:
 
 
 # --- the test double ---------------------------------------------------------------------
-# ``FakeKeychain`` understands the three argv shapes above, keeps items in a dict, and records
-# every call (argv and stdin). ``fail_with`` makes every call exit with that code or raise.
+# ``FakeKeychain`` understands the argv shapes above (and ``set``'s ``security -i`` line),
+# keeps items in a dict, and records every call (argv and stdin). ``fail_with`` makes every
+# call exit with that code or raise.
 # Nothing in it runs ``security`` or touches the real Keychain.
 
 
@@ -344,6 +377,11 @@ class FakeKeychain:
         if self.fail_with is not None:
             return SecurityResult(self.fail_with, b"")
         assert args[0] == SECURITY, args
+        if args[1:] == ("-i",):  # ``set``: the command line is on stdin, as security reads it
+            assert stdin is not None
+            line = stdin.decode().rstrip("\n")
+            assert "\n" not in line and len(line) < 4096, "security -i reads a line of ~4 KB"
+            args = (SECURITY, *line.split(" "))
         opts = {a: args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-s", "-a")}
         assert opts.get("-s") == SERVICE, args
         ref = opts["-a"]
@@ -355,13 +393,9 @@ class FakeKeychain:
                     return SecurityResult(0, self.items[ref].encode() + b"\n")
                 return SecurityResult(0, f'keychain: "login"\n"acct"<blob>="{ref}"\n'.encode())
             case "add-generic-password":
-                assert args[-1] == "-w" and stdin is not None, args
-                first, again, *_ = stdin.decode().split("\n")
-                if first != again:
-                    return SecurityResult(1, b"")
                 if ref in self.items and "-U" not in args:
                     return SecurityResult(45, b"")  # errSecDuplicateItem
-                self.items[ref] = first
+                self.items[ref] = args[args.index("-w") + 1]
                 return SecurityResult(0, b"")
             case "delete-generic-password":
                 if self.items.pop(ref, None) is None:

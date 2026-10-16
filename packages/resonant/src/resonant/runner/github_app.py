@@ -8,8 +8,7 @@ protection changes), and valid for an hour. Workflows is left out when the repo'
 
 - The app id and installation id are config (``runner.github_app``, public). The private key
   is the Keychain item ``runner/github_app_key``, read for each call and never kept, written
-  to a file, put in env or argv, or logged. It is a PEM, or the PEM's base64 on one line (the
-  Keychain tooling is easier with that).
+  to a file, put in env or argv, or logged. It is a PEM, or the PEM's base64 on one line.
 - The JWT (RS256, 9 minutes) is built here with ``cryptography`` and sent as a bearer header
   over HTTPS. Nothing here runs a subprocess.
 - ``mint`` asks for ``repositories=[name]`` and the permissions below; ``revoke`` is
@@ -19,12 +18,15 @@ protection changes), and valid for an hour. Workflows is left out when the repo'
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, cast
 
 import httpx
@@ -38,11 +40,16 @@ from resonant.secrets import GITHUB_APP_KEY_REF, SecretError, SecretStore
 API_URL = "https://api.github.com"
 API_VERSION = "2022-11-28"
 TIMEOUT_S = 15.0
+ATTEMPTS = 3
+BACKOFF_S = 0.5
 JWT_TTL_S = 540  # GitHub allows at most 10 minutes
 CLOCK_SKEW_S = 60  # iat is back-dated so a slow clock doesn't make the JWT "from the future"
 MAX_MESSAGE = 200
 
 # What a run's token may do. No Administration, so a run can't delete, rename or reconfigure.
+# issues (PR comments and labels) and actions (re-run a workflow) are write on the owner's
+# decision, as is Workflows by default; the review noted that a same-repo workflow can read
+# the repo's Actions secrets, so Workflows can be turned off per repo (allow_github_changes).
 WRITE = ("contents", "pull_requests", "issues", "workflows", "actions")
 READ = ("checks", "statuses", "metadata")
 
@@ -103,12 +110,48 @@ def make_jwt(app_id: int, key: rsa.RSAPrivateKey, now: float) -> str:
 class InstallationToken:
     # repr=False: a token must never reach a log line or a traceback by accident.
     token: str = field(repr=False)
-    expires_at: str  # GitHub's ISO timestamp, informational
+    expires_at: str  # GitHub's ISO timestamp (UTC, "...Z"); "" if the reply had none
+
+    def expires(self) -> datetime | None:
+        try:
+            return datetime.fromisoformat(self.expires_at)
+        except ValueError:
+            return None
+
+
+_LEVEL = {"none": 0, "read": 1, "write": 2, "admin": 3}
+_ESSENTIAL = ("contents", "pull_requests")  # a session without these can't do its job
+
+
+def check_grant(data: dict[str, Any], repo_name: str, requested: dict[str, str]) -> str | None:
+    """Why a mint reply is not what was asked for, or None. The token must cover exactly the
+    one repository and no permission beyond (or outside) the request; a mis-installed app is
+    caught here, not by a session finding it can do too much (or too little)."""
+    if data.get("repository_selection") != "selected":
+        return "it covers more than the one repository"
+    repos = data.get("repositories")
+    items = cast(list[object], repos) if isinstance(repos, list) else []
+    names = [str(cast(dict[str, object], r).get("name")) for r in items if isinstance(r, dict)]
+    if len(names) != 1 or str(names[0]).lower() != repo_name.lower():
+        return "it covers a different set of repositories than asked"
+    granted_raw = data.get("permissions")
+    if not isinstance(granted_raw, dict):
+        return "it lists no permissions"
+    granted = {str(k): str(v) for k, v in cast(dict[object, object], granted_raw).items()}
+    for perm, level in granted.items():
+        if perm not in requested or _LEVEL.get(level, 99) > _LEVEL[requested[perm]]:
+            return f"it grants {perm}: {level}, which was not asked for"
+    for perm in _ESSENTIAL:
+        if _LEVEL.get(granted.get(perm, "none"), 0) < _LEVEL[requested[perm]]:
+            return f"the app lacks {perm}: {requested[perm]} on this repository"
+    return None
 
 
 class GitHubApp:
     """Mints and revokes a repo-scoped installation token. ``transport`` is the test seam
-    (an ``httpx.MockTransport``); by default the real network."""
+    (an ``httpx.MockTransport``); by default the real network. Mint, revoke and the bot
+    lookup try up to ``ATTEMPTS`` times on a network error, a timeout or a 5xx, waiting
+    ``backoff_s``, then twice that."""
 
     def __init__(
         self,
@@ -119,6 +162,7 @@ class GitHubApp:
         base_url: str = API_URL,
         clock: Callable[[], float] = time.time,
         timeout_s: float = TIMEOUT_S,
+        backoff_s: float = BACKOFF_S,
     ) -> None:
         self.cfg = cfg
         self.secrets = secrets
@@ -126,6 +170,8 @@ class GitHubApp:
         self._base = base_url.rstrip("/")
         self._clock = clock
         self._timeout_s = timeout_s
+        self._backoff_s = backoff_s
+        self._bot: str | None = None
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -142,36 +188,66 @@ class GitHubApp:
             raise GitHubAppError(f"the GitHub App key can't be read ({e.reason})") from None
         return make_jwt(self.cfg.app_id, parse_private_key(pem), self._clock())
 
+    async def _send(
+        self, method: str, url: str, bearer: str, *, body: dict[str, Any] | None = None
+    ) -> httpx.Response:
+        """One request, retried on a network error, a timeout or a 5xx. The last response (or
+        ``GitHubAppError`` for no response at all) is the answer."""
+        failure = "couldn't reach GitHub"
+        last: httpx.Response | None = None
+        for attempt in range(ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(self._backoff_s * 2 ** (attempt - 1))
+            try:
+                async with self._client() as client:
+                    resp = await client.request(method, url, headers=_headers(bearer), json=body)
+            except httpx.HTTPError as e:
+                failure = f"couldn't reach GitHub ({type(e).__name__})"
+                continue
+            if resp.status_code < 500:
+                return resp
+            last = resp
+        if last is not None:
+            return last
+        raise GitHubAppError(failure)
+
     async def mint(self, repo_name: str, *, workflows: bool) -> InstallationToken:
-        """A token for ``repo_name`` (the name only, no owner) with ``permissions``."""
+        """A token for ``repo_name`` (the name only, no owner) with ``permissions``. A reply
+        that isn't exactly that (see ``check_grant``) is revoked and refused."""
         jwt = await self._jwt()
         url = f"{self._base}/app/installations/{self.cfg.installation_id}/access_tokens"
-        body = {"repositories": [repo_name], "permissions": permissions(workflows=workflows)}
-        try:
-            async with self._client() as client:
-                resp = await client.post(url, headers=_headers(jwt), json=body)
-        except httpx.HTTPError as e:
-            raise GitHubAppError(f"couldn't reach GitHub ({type(e).__name__})") from None
+        wanted = permissions(workflows=workflows)
+        resp = await self._send(
+            "POST", url, jwt, body={"repositories": [repo_name], "permissions": wanted}
+        )
         if resp.status_code != 201:
             raise GitHubAppError(_why("minting the run's GitHub token", resp, repo_name))
         data = _json(resp)
         token, expires = data.get("token"), data.get("expires_at")
         if not isinstance(token, str) or not token:
             raise GitHubAppError("GitHub's token reply had no token")
+        if (problem := check_grant(data, repo_name, wanted)) is not None:
+            with contextlib.suppress(GitHubAppError):
+                await self.revoke(token)
+            raise GitHubAppError(f"GitHub's token for {repo_name} was refused: {problem}")
         return InstallationToken(token, expires if isinstance(expires, str) else "")
 
     async def revoke(self, token: str) -> None:
         """``DELETE /installation/token`` as the token itself. A token already dead (401) is
         fine. Raises ``GitHubAppError`` otherwise."""
-        try:
-            async with self._client() as client:
-                resp = await client.delete(
-                    f"{self._base}/installation/token", headers=_headers(token)
-                )
-        except httpx.HTTPError as e:
-            raise GitHubAppError(f"couldn't reach GitHub ({type(e).__name__})") from None
+        resp = await self._send("DELETE", f"{self._base}/installation/token", token)
         if resp.status_code not in (204, 401):
             raise GitHubAppError(_why("revoking the run's GitHub token", resp, ""))
+
+    async def bot_login(self) -> str:
+        """``<slug>[bot]``, the actor the app's pushes carry in GitHub's activity feed."""
+        if self._bot is None:
+            resp = await self._send("GET", f"{self._base}/app", await self._jwt())
+            slug = _json(resp).get("slug")
+            if resp.status_code != 200 or not isinstance(slug, str) or not slug:
+                raise GitHubAppError(_why("reading the GitHub App", resp, ""))
+            self._bot = f"{slug}[bot]"
+        return self._bot
 
 
 def _headers(bearer: str) -> dict[str, str]:
@@ -191,11 +267,19 @@ def _json(resp: httpx.Response) -> dict[str, Any]:
     return cast(dict[str, Any], data) if isinstance(data, dict) else {}
 
 
+_HINTS = {
+    403: "does the app have the permissions asked for on {repo}?",
+    404: "is the app installed on {repo}?",
+    422: "the app may lack a permission asked for on {repo}",
+}
+
+
 def _why(what: str, resp: httpx.Response, repo: str) -> str:
+    """The failure with GitHub's own message and, for the common statuses, what to check."""
     message = _json(resp).get("message")
     text = f"{what} failed (HTTP {resp.status_code})"
-    if resp.status_code in (403, 404, 422) and repo:
-        text += f": is the app installed on {repo}?"
-    elif isinstance(message, str) and message:
+    if isinstance(message, str) and message:
         text += f": {' '.join(message.split())[:MAX_MESSAGE]}"
+    if repo and (hint := _HINTS.get(resp.status_code)):
+        text += f" ({hint.format(repo=repo)})"
     return text

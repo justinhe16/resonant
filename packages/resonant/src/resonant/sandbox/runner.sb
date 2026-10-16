@@ -120,6 +120,16 @@
 ;; @DENY_READ@
   )
 
+;; every other run's dir (its creds/ holds a live GitHub token) is unreadable and unwritable
+;; wherever runner.work_dir sits, not only where the HOME denies reach. The allowed paths and
+;; their ancestors (stat for realpath) are spared; the cache may sit inside the work dir.
+(deny file-read* file-write*
+  (require-all
+    (subpath (param "WORK"))
+    (require-not (require-any
+;; @WORK_EXEMPT@
+      ))))
+
 ;; ---- secret files: denied for read AND write, wherever they sit -----------------------------
 ;; Credentials the owner keeps next to their code (~/trading/.env with exchange keys) or in
 ;; the usual tool homes. Last in the file so no allow above can undo them (SBPL: last match

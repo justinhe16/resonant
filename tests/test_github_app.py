@@ -193,3 +193,111 @@ async def test_revoke_deletes_the_installation_token_as_itself() -> None:
     api.fail_revoke = True
     with pytest.raises(GitHubAppError, match=r"revoking.*HTTP 500"):
         await app.revoke(token)
+
+
+# --- retries, messages, the grant check, the bot ---------------------------------------------
+
+
+def quick(api: FakeGitHubApi, *, key: str | None = None) -> GitHubApp:
+    kc = FakeKeychain({GITHUB_APP_KEY_REF: key or private_pem()})
+    return GitHubApp(CFG, SecretStore(kc), transport=api.transport(), backoff_s=0)
+
+
+async def test_mint_and_revoke_retry_a_transient_failure_three_times() -> None:
+    api = FakeGitHubApi()
+    app = quick(api)
+    api.flaky = 2
+    token = (await app.mint("proj", workflows=True)).token
+    assert api.requests.count(("POST", f"/app/installations/{INSTALLATION_ID}/access_tokens")) == 3
+    api.flaky = 2
+    await app.revoke(token)
+    assert api.revoked == [token]
+    api.flaky = 3  # all three tries fail
+    with pytest.raises(GitHubAppError, match="HTTP 503"):
+        await app.mint("proj", workflows=True)
+    # a 4xx answer is final: no retry
+    api.fail_mint = (403, "nope")
+    before = len(api.requests)
+    with pytest.raises(GitHubAppError, match="HTTP 403"):
+        await app.mint("proj", workflows=True)
+    assert len(api.requests) == before + 1
+
+
+async def test_network_errors_are_retried_then_reported() -> None:
+    calls = 0
+
+    def down(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ReadTimeout("slow")
+
+    kc = FakeKeychain({GITHUB_APP_KEY_REF: private_pem()})
+    app = GitHubApp(CFG, SecretStore(kc), transport=httpx.MockTransport(down), backoff_s=0)
+    with pytest.raises(GitHubAppError, match=r"couldn't reach GitHub \(ReadTimeout\)"):
+        await app.mint("proj", workflows=True)
+    assert calls == 3
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "hint"),
+    [
+        (403, "Resource not accessible by integration", "does the app have the permissions"),
+        (404, "Not Found", "is the app installed on proj"),
+        (422, "Validation Failed: permission workflows", "may lack a permission asked for"),
+    ],
+)
+async def test_mint_errors_carry_githubs_message_and_a_hint(
+    status: int, message: str, hint: str
+) -> None:
+    api = FakeGitHubApi()
+    app = quick(api)
+    api.fail_mint = (status, message)
+    with pytest.raises(GitHubAppError) as e:
+        await app.mint("proj", workflows=True)
+    assert f"HTTP {status}): {message}" in str(e.value) and hint in str(e.value)
+
+
+@pytest.mark.parametrize(
+    ("grant", "why"),
+    [
+        ({"repository_selection": "all"}, "more than the one repository"),
+        ({"repositories": []}, "different set of repositories"),
+        ({"repositories": [{"name": "proj"}, {"name": "x"}]}, "different set of repositories"),
+        ({"permissions": None}, "lists no permissions"),
+        ({"permissions": {"contents": "write", "pull_requests": "write", "metadata": "admin"}},
+         "metadata: admin"),
+        ({"permissions": {"contents": "write", "pull_requests": "write", "members": "read"}},
+         "members: read"),
+        ({"permissions": {"contents": "write"}}, "lacks pull_requests"),
+    ],
+)  # fmt: skip
+async def test_a_mint_reply_that_isnt_the_request_is_revoked_and_refused(
+    grant: dict[str, object], why: str
+) -> None:
+    api = FakeGitHubApi()
+    app = quick(api)
+    api.grant = grant
+    with pytest.raises(GitHubAppError, match=why):
+        await app.mint("proj", workflows=False)
+    assert api.live == set() and len(api.revoked) == 1  # the odd token did not survive
+
+
+async def test_a_lower_grant_than_asked_for_is_fine_for_the_optional_ones() -> None:
+    api = FakeGitHubApi()
+    app = quick(api)
+    perms = github_app.permissions(workflows=True)
+    perms.pop("actions")
+    perms["checks"] = "none"
+    api.grant = {"permissions": perms}
+    assert (await app.mint("proj", workflows=True)).token
+
+
+async def test_bot_login_is_the_apps_slug_and_asked_once() -> None:
+    api = FakeGitHubApi()
+    app = quick(api)
+    assert await app.bot_login() == "resonant-runner[bot]"
+    assert await app.bot_login() == "resonant-runner[bot]"
+    assert api.requests.count(("GET", "/app")) == 1
+    bad = quick(FakeGitHubApi(app_id=1))
+    with pytest.raises(GitHubAppError, match="HTTP 401"):
+        await bad.bot_login()

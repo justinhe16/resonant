@@ -48,6 +48,7 @@ import stat
 import tempfile
 from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -82,6 +83,7 @@ _PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _ERR_CLIP = 300
 CREDS_DIR = "creds"
+_PUSH_KINDS = ("push", "force_push", "branch_deletion")
 _PR_FIELDS = "state,headRefName,headRefOid,baseRefName,isCrossRepository,title,body"
 
 # Run inside the sandbox: commit anything left over, then bundle base..branch.
@@ -167,8 +169,13 @@ def git_env(helper: Path | None = None) -> dict[str, str]:
 
 
 CREDENTIAL_HELPER = """#!/bin/sh
-# git credential helper: answers "get" from a 0600 file next to it.
+# git credential helper: answers "get" for github.com only, from a 0600 file next to it.
 [ "$1" = get ] || exit 0
+host=
+while IFS= read -r line && [ -n "$line" ]; do
+  case "$line" in host=*) host=${line#host=} ;; esac
+done
+[ "$host" = github.com ] || exit 0
 IFS= read -r token < "$(dirname "$0")/token"
 printf 'username=x-access-token\\npassword=%s\\n' "$token"
 """
@@ -247,18 +254,18 @@ def _replace_file(dir_fd: int, name: str, text: str, mode: int) -> None:
     """Atomically put ``text`` at ``name``: a new file beside it, then ``rename``. A planted
     symlink or hard link at ``name`` is replaced, never written through."""
     tmp = f".{name}.new"
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(tmp, dir_fd=dir_fd)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode,
-                 dir_fd=dir_fd)  # fmt: skip
     try:
-        os.write(fd, text.encode())
-        os.fchmod(fd, mode)
-    finally:
-        os.close(fd)
-    try:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp, dir_fd=dir_fd)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     mode, dir_fd=dir_fd)  # fmt: skip
+        try:
+            os.write(fd, text.encode())
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
         os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-    except OSError as e:
+    except OSError as e:  # a name the session planted (a dir, say) in the way
         with contextlib.suppress(OSError):
             os.unlink(tmp, dir_fd=dir_fd)
         raise RunnerError("the session's credential files can't be updated") from e
@@ -269,7 +276,9 @@ def write_session_credentials(run_dir: Path, token: str) -> Path:
     ``credential-helper`` (git) and ``creds/gh/hosts.yml`` (``gh``), 0700 dirs and 0600 files.
     Creates them the first time and replaces them in place after (a refresh). Returns the dir.
     ``run_dir`` is daemon-created; everything below it may have been touched by the session,
-    so nothing is followed."""
+    so nothing is followed. (The session can still swap ``creds/`` for a dir of its own with
+    the same owner, which the checks accept; that gives it nothing, since it can read the
+    token it was given anyway, and it would only lose the refresh.)"""
     run_fd = _plain_dir(None, run_dir, create=False)
     try:
         creds_fd = _plain_dir(run_fd, CREDS_DIR, create=True)
@@ -880,6 +889,49 @@ class Workspace:
         if match is None:
             raise RunnerError("gh pr create didn't print a PR URL")
         return PullRequest(int(match[1]), match[0])
+
+    # -- the base branch --
+
+    async def base_protected(self, repo_name: str, secrets: RunnerSecrets) -> bool | None:
+        """Whether the base branch has protection (``GET /repos/{o}/{r}/branches/{base}``,
+        daemon token). None when GitHub can't say."""
+        repo = self._repo(repo_name)
+        res = await self._gh(["api", f"repos/{repo.slug}/branches/{repo.base}"], secrets)
+        if res.returncode != 0:
+            return None
+        try:
+            value = json.loads(res.stdout).get("protected")
+        except (ValueError, AttributeError):
+            return None
+        return value if isinstance(value, bool) else None
+
+    async def base_pushes(
+        self, repo_name: str, secrets: RunnerSecrets, *, actor: str, since: datetime
+    ) -> list[str]:
+        """The commits ``actor`` (the app's bot) pushed straight to the base branch since
+        ``since``: the ``after`` sha of each push and force-push in the repo's activity feed.
+        Raises ``RunnerError`` when the feed can't be read."""
+        repo = self._repo(repo_name)
+        res = await self._gh(
+            ["api", f"repos/{repo.slug}/activity?ref=refs/heads/{repo.base}&per_page=100"], secrets
+        )
+        if res.returncode != 0:
+            raise RunnerError(f"couldn't read {repo.base}'s activity: {res.stderr[-120:]}")
+        try:
+            events: list[Any] = json.loads(res.stdout)
+        except ValueError:
+            raise RunnerError(f"{repo.base}'s activity couldn't be read") from None
+        found: list[str] = []
+        for event in events:
+            try:
+                login = str(event["actor"]["login"])
+                when = datetime.fromisoformat(str(event["timestamp"]))
+                kind, after = str(event["activity_type"]), str(event["after"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if login.lower() == actor.lower() and when >= since and kind in _PUSH_KINDS:
+                found.append(after if _SHA.fullmatch(after) else "?")
+        return list(dict.fromkeys(found))
 
     # -- what the session left --
 

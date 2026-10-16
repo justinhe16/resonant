@@ -72,6 +72,7 @@ from resonant.loop.types import (
 from resonant.redact import Redactor
 from resonant.runner.checks import CheckFailed, GitError
 from resonant.runner.cleanup import (
+    RUN_CODE,
     cleanup,
     delete_run_dir,
     rmtree_nofollow,
@@ -159,7 +160,7 @@ CHECK_CACHE = "sandbox-check.json"
 TOOL_NAMES = ("claude", "uv")
 MAX_FIX_ATTEMPTS = 3  # CI fixes the session may push after the first push
 TOKEN_REFRESH_S = 50 * 60  # installation tokens last an hour: a fresh one after 50 minutes
-REVOKE_TIMEOUT_S = 10.0
+REVOKE_TIMEOUT_S = 45.0  # in all: the app's own three tries and their backoff
 
 RUNNER_PROMPT = (
     "You are working in a throwaway clone of {repo}, on branch {branch}, which is already "
@@ -169,7 +170,9 @@ RUNNER_PROMPT = (
     "description. Then wait for CI with `gh pr checks --watch`. If CI fails, read the failing "
     "logs (`gh run view --log-failed`), fix the problem, commit and push again; do this at most "
     "{attempts} times. Never push to {base} or to any branch but {branch}, don't force-push, and "
-    "don't change remotes, git config or the credential files. Stop when CI is green or you are "
+    "don't change remotes, git config or the credential files. The credentials are refreshed in "
+    "place about every 50 minutes: if gh or git fails with an authentication error, run it "
+    "again. Stop when CI is green or you are "
     "out of attempts. End with a 1-3 line summary: what changed, the PR number, whether CI is "
     "green, and anything left undone."
 )
@@ -192,14 +195,16 @@ class Started:
     repo: str
     max_minutes: int
     new_repo: str | None = None  # the slug, when this run registered the repo
+    warning: str | None = None  # e.g. the base branch isn't protected
 
     @property
     def text(self) -> str:
         new = f" (new repo: {self.new_repo})" if self.new_repo else ""
-        return (
+        text = (
             f"On it: {self.code} · {self.repo}{new}. Up to {self.max_minutes}m. "
             f"/runs to check, /cancel {self.code} to stop."
         )
+        return f"{text}\n{self.warning}" if self.warning else text
 
 
 @dataclass(frozen=True)
@@ -497,6 +502,9 @@ class ClaudeRunner:
         )
         self.refresh_s = refresh_s
         self._tokens: dict[str, list[str]] = {}  # run code -> tokens minted and not yet revoked
+        self._spent: dict[str, list[str]] = {}  # ... and revoked ones (still redacted)
+        self._expiry: dict[str, datetime] = {}  # token -> when GitHub expires it
+        self._unrevoked: dict[str, datetime] = {}  # run code -> latest expiry of a token left live
         self._create_task = create_task or self._insert_task
         self._cancel_task = cancel_task
         self._wrap: Wrap = wrap or _sandbox_wrap
@@ -569,16 +577,33 @@ class ClaudeRunner:
                 reaped += 1
             if has_process:
                 runs.clear_process(self.conn, run.code, crashed=True)
-            await self._deprovision(run.code)  # a token the crashed session still held
         for run in runs.with_process(self.conn):  # a run that ended with a process recorded
             if not run.active:
                 await reaper.reap(self._target(run), grace_s=self.kill_grace_s)
                 runs.clear_process(self.conn, run.code)
+        await self._sweep_credentials()
         await asyncio.to_thread(wipe_secret_dirs, self.cfg.secrets_dir, self.cfg.mirror_dir)
         await self._reconcile()
         if self._unhook is None:
             self._unhook = killswitch.add_pause_hook(self._on_pause)
         return reaped
+
+    async def _sweep_credentials(self) -> None:
+        """Revoke and delete the token left in every ``<work_dir>/R*/creds`` (whatever state
+        its run is in: a crash can come after the row says the run ended but before the
+        token was revoked). A token minted but not yet written when the daemon died is
+        nowhere; it expires within the hour."""
+
+        def codes() -> list[str]:
+            try:
+                names = sorted(os.listdir(self.cfg.work_dir))
+            except OSError:
+                return []
+            return [n for n in names if RUN_CODE.fullmatch(n)
+                    and os.path.lexists(self.cfg.work_dir / n / CREDS_DIR)]  # fmt: skip
+
+        for code in await asyncio.to_thread(codes):
+            await self._deprovision(code)
 
     async def aclose(self) -> None:
         """Remove the kill switch hook and wait for the kills it started."""
@@ -623,8 +648,11 @@ class ClaudeRunner:
         else:
             for ref in refs:
                 missing.append(f"secret {ref}")
-                if ref == GITHUB_APP_KEY_REF:  # a PEM is longer than `resonant secret set` takes
-                    how.append(f"store the GitHub App's private key as Keychain item {ref}")
+                if ref == GITHUB_APP_KEY_REF:  # a multi-line PEM comes from a file
+                    how.append(
+                        f"resonant secret set {ref} --from-file <the downloaded .pem>, "
+                        "then delete the .pem"
+                    )
                 else:
                     how.append(f"resonant secret set {ref.split(' ', 1)[0]}")
         if self.cfg.github_app is None:
@@ -683,8 +711,25 @@ class ClaudeRunner:
         with atomic(self.conn):
             repo_store.touch(self.conn, found.slug)
         return Started(
-            run.code, repo, max(1, self.max_session_s // 60), found.slug if new else None
+            run.code,
+            repo,
+            max(1, self.max_session_s // 60),
+            found.slug if new else None,
+            await self._base_warning(found),
         )
+
+    async def _base_warning(self, repo: repo_store.Repo) -> str | None:
+        """A sentence for the start reply when the base branch is not protected: the session's
+        token can push to it, and a direct push skips the checks a merge runs."""
+        try:
+            secrets = await load_runner_secrets(self.secrets)
+            protected = await self.workspace.base_protected(repo.name, secrets)
+        except Exception:  # the start reply must go out whatever GitHub says
+            log.warning("base protection unknown", extra={"repo": repo.name})
+            return None
+        if protected is False:
+            return f"{repo.base} isn't protected — the session could push to it directly."
+        return None
 
     async def _resolve(self, text: str) -> tuple[repo_store.Repo, bool] | Refused:
         """The registered repo for the requester's words, and whether it is new."""
@@ -885,6 +930,7 @@ class ClaudeRunner:
     def _params(self, run_dir: Path) -> SandboxParams:
         return SandboxParams(
             run_dir=run_dir,
+            work_dir=self.cfg.work_dir,
             cache_dir=self.cfg.cache_dir,
             secrets_dir=self.cfg.secrets_dir,
             read_paths=self._read_paths,
@@ -1230,6 +1276,7 @@ class ClaudeRunner:
         still makes the run ``ready``, with the reason, since the PR exists and the owner may
         want to look at it; ``merge_run`` refuses it again."""
         self._check_stop(run.code)
+        await self._check_base_untouched(w, run, p)
         pr = await self.workspace.find_pr(run.repo, p.branch, w.secrets)
         if pr is None:
             if await self.workspace.pushed_commits(p, w.secrets) == 0:
@@ -1268,6 +1315,37 @@ class ClaudeRunner:
             audit(self.conn, "run.ready", run=run.code, pr=pr.number)
         return self._must_get(run.code)
 
+    async def _check_base_untouched(self, w: _Work, run: Run, p: Prepared) -> None:
+        """A push straight to the base branch skips every check a merge runs (the base is
+        already live, and the checks only look at what the PR adds). Branch protection stops
+        it; without protection, the activity feed says whether the app's bot pushed there
+        during the run. If it did, the run fails, the owner is told at once and it is never
+        merged. If the feed can't be read the run fails too: it can't be shown clean."""
+        if self.app is None:
+            return
+        protected = await self.workspace.base_protected(run.repo, w.secrets)
+        if protected is True:
+            return
+        try:
+            bot = await self.app.bot_login()
+        except GitHubAppError as e:
+            raise RunnerError(f"couldn't check {p.base_branch} for direct pushes: {e}") from None
+        since = (run.started_at or run.created_at) - timedelta(minutes=1)
+        shas = await self.workspace.base_pushes(run.repo, w.secrets, actor=bot, since=since)
+        if not shas:
+            return
+        short = ", ".join(sha[:7] for sha in shas[:5])
+        with atomic(self.conn):
+            audit(self.conn, "run.base_push", run=run.code, base=p.base_branch, shas=short)
+        with contextlib.suppress(ChannelError):
+            await self.channel.send(
+                run.principal,
+                f"⚠ {run.code} pushed directly to {p.base_branch}: {short}. "
+                f"Look at {self._slug(run.repo)} now; this run will not be merged.",
+                dedupe_key=f"run:{run.code}:base-push",
+            )
+        raise RunnerError(f"pushed directly to {p.base_branch} ({short}); not merged")
+
     # -- the session's GitHub token --
 
     def _slug(self, repo_name: str) -> str:
@@ -1277,7 +1355,9 @@ class ClaudeRunner:
         return repo.slug
 
     def _redactor(self, w: _Work, code: str) -> Redactor:
-        return Redactor([*w.secrets.values(), *self._tokens.get(code, ())])
+        return Redactor(
+            [*w.secrets.values(), *self._tokens.get(code, ()), *self._spent.get(code, ())]
+        )
 
     async def _mint(self, run: Run) -> str:
         """A new token for the run's repo, remembered so it is revoked at the end."""
@@ -1293,6 +1373,7 @@ class ClaudeRunner:
         except GitHubAppError as e:
             raise RunnerError(str(e)) from None
         self._tokens.setdefault(run.code, []).append(minted.token)
+        self._expiry[minted.token] = minted.expires() or self.clock() + timedelta(hours=1)
         return minted.token
 
     async def _provision(self, w: _Work, run: Run, p: Prepared) -> None:
@@ -1308,12 +1389,18 @@ class ClaudeRunner:
         self, w: _Work, run: Run, p: Prepared, writer: TranscriptWriter
     ) -> bool:
         """A fresh token over the same files, for a session that has run for most of an hour.
-        The old token is left to expire (``gh pr checks --watch`` may still be using it) and
-        is revoked with the rest at the end."""
+        The old one is revoked at once, so only the newest is ever on disk (a crash leaves
+        one token to find, not two). A gh or git call already running with the old token
+        fails once; the prompt tells the session to run it again."""
         try:
             token = await self._mint(run)
             w.redactor = writer.redactor = self._redactor(w, run.code)
             await _finish_thread(write_session_credentials, p.run_dir, token)
+            old = [t for t in self._tokens.get(run.code, []) if t != token]
+            self._tokens[run.code] = [token]
+            self._spent.setdefault(run.code, []).extend(old)
+            for t in old:
+                await self._revoke(run.code, t)
         except RunnerError as e:
             log.warning("run token refresh failed", extra={"run": run.code, "reason": str(e)})
             with contextlib.suppress(Exception), atomic(self.conn):
@@ -1323,8 +1410,8 @@ class ClaudeRunner:
 
     async def _deprovision(self, code: str, *, remove_dir: bool = True) -> None:
         """Revoke every token minted for the run (and the one on disk, which a crash may have
-        left) and remove the ``creds`` dir. Best effort and safe to repeat; the tokens expire
-        within the hour anyway."""
+        left) and remove the ``creds`` dir. Best effort and safe to repeat; a token that
+        can't be revoked is noted for the reply and expires within the hour anyway."""
         run_dir = self.cfg.work_dir / code
         tokens = self._tokens.pop(code, [])
         on_disk = await asyncio.to_thread(read_session_token, run_dir)
@@ -1333,16 +1420,21 @@ class ClaudeRunner:
         for token in tokens:
             await self._revoke(code, token)
         if remove_dir:
+            self._spent.pop(code, None)
             with contextlib.suppress(Exception):
                 await _finish_thread(rmtree_nofollow, run_dir / CREDS_DIR)
 
     async def _revoke(self, code: str, token: str) -> None:
+        """Revoke one token (the app tries three times). On failure remember when it expires,
+        for the reply: ``R3 done … token not revoked, expires 14:05``."""
+        expiry = self._expiry.pop(token, None) or self.clock() + timedelta(hours=1)
         if self.app is None:
             return
         try:
             await asyncio.wait_for(self.app.revoke(token), REVOKE_TIMEOUT_S)
         except (GitHubAppError, TimeoutError) as e:
             log.warning("couldn't revoke a run's token", extra={"run": code, "reason": str(e)})
+            self._unrevoked[code] = max(expiry, self._unrevoked.get(code, expiry))
             with contextlib.suppress(Exception), atomic(self.conn):
                 audit(self.conn, "run.token_revoke_failed", run=code)
 
@@ -1392,6 +1484,9 @@ class ClaudeRunner:
         repo = repo_store.find(self.conn, run.repo)
         no_ci = repo is not None and repo.mode == "push" and repo.ci is False
         text = reply_text(run, await self._ci_word(run), no_ci=no_ci)
+        if text is not None and (expires := self._unrevoked.pop(run.code, None)) is not None:
+            at = expires.astimezone(self.tz).strftime("%H:%M")
+            text += f"\n⚠ the run's GitHub token wasn't revoked; it expires at {at}."
         if text is None:
             return
         try:
