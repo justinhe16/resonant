@@ -23,6 +23,39 @@ def test_daemon_plist(resonant_home: Path) -> None:
     plistlib.dumps(p)  # serializable
 
 
+def test_daemon_path_has_no_worker_writable_dir(resonant_home: Path) -> None:
+    """Claude workers may write ~/.local/bin and /opt/homebrew (brew install, uv tool
+    install): the daemon's PATH is its venv's bin plus the system dirs only, so nothing put
+    there can shadow a tool it runs (docs/employee-plan.md D2)."""
+    from resonant.extensions.process import SCRATCH_PATH
+    from resonant.ops import _ENV  # pyright: ignore[reportPrivateUsage]
+
+    settings = load_settings()
+    daemon = launchd.daemon_plist(settings, python="/venv/bin/python")
+    ollama = launchd.ollama_plist(settings, "/opt/homebrew/bin/ollama")
+    assert daemon["EnvironmentVariables"]["PATH"] == "/venv/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    paths = [
+        daemon["EnvironmentVariables"]["PATH"],
+        ollama["EnvironmentVariables"]["PATH"],
+        _ENV["PATH"],  # the ops runner: /update's git and uv sync
+        SCRATCH_PATH,  # extension children
+        settings.extensions.process.path_env,
+    ]
+    for path in paths:
+        for entry in path.split(":"):
+            assert entry.startswith(("/usr/", "/bin", "/sbin", "/venv/")), (path, entry)
+
+
+def test_find_ollama_ignores_the_process_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "ollama"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert launchd.find_ollama() != str(fake)
+
+
 def test_ollama_plist_pins_context_and_keepalive() -> None:
     env = launchd.ollama_plist(load_settings(), "/opt/homebrew/bin/ollama")["EnvironmentVariables"]
     assert env["OLLAMA_KEEP_ALIVE"] == "-1"

@@ -1,19 +1,23 @@
-"""Probes that prove the runner sandbox holds, and the cheap per-run self-check.
+"""Probes that prove the thin guard holds, and the cheap per-run self-check.
 
-Every probe runs a small Python snippet *inside* the sandbox (the real profile, built the
-way a session's is) and compares what it saw with what the profile promises. Where a denial
+Every probe runs a small Python snippet (or a real tool) *inside* the sandbox, built the way
+a session's is, and compares what it saw with what the profile promises. Where a denial
 could also be a missing file or a dead service, a control run outside the sandbox first
-proves the thing is reachable, so a pass means "denied", not "absent".
+proves the thing is reachable, so a pass means "denied", not "absent". The guard is
+allow-default, so the probes check both sides: each deny holds, and the owner-like allows
+(reading a planted ``.env`` under ``$HOME``, writing beside it, sockets, HTTPS) still work.
 
 Two scopes, by where they can run:
 
-- ``ci``: file, exec, network and mach denials that behave the same on any macOS host. These
+- ``ci``: file, exec, network and mach behaviour that is the same on any macOS host. These
   run in CI on the GitHub macOS runners.
-- ``local``: probes that need the Mini (Keychain, launchd, the HID drivers, the display, the
-  LAN address, sockets that may or may not exist, ``claude`` itself).
+- ``local``: probes that need the Mini (the real ``$HOME``'s paths, the Keychain, launchd,
+  the HID drivers, the display, the LAN address, a Docker socket, ``claude`` itself).
 
-Probes write only uniquely named, nonexistent files, and delete any that unexpectedly
-appear (and fail).
+The full deny battery (appends, renames, hardlinks, symlinks, ancestor renames) runs against
+a fake home under ``/private/var/tmp``. On the real paths, probes only open existing files for
+writing without writing, create uniquely named entries (removed again if one appears: that
+is a fail) and read, so a working guard leaves the owner's files untouched.
 """
 
 from __future__ import annotations
@@ -38,9 +42,6 @@ import psutil
 
 from resonant.sandbox.profile import (
     API_PORT,
-    HOME_SECRET_DIRS,
-    HOME_SECRET_FILES,
-    OLLAMA_PORT,
     SandboxError,
     SandboxParams,
     default_read_paths,
@@ -61,79 +62,46 @@ DENIED_ERRNOS = frozenset({1, 13})  # EPERM, EACCES
 BOOTSTRAP_NOT_PRIVILEGED = 1100  # kr from bootstrap_look_up when the sandbox says no
 SELF_CHECK_TTL_S = 3600.0
 SNIPPET_TIMEOUT_S = 30.0
+NET_TIMEOUT_S = 60.0
 CLAUDE_FAIL_FAST_S = 5.0
 
-DENIED_EXEC = (
-    "/usr/bin/security",
-    "/usr/bin/osascript",
-    "/usr/bin/open",
-    "/bin/launchctl",
-    "/usr/bin/shortcuts",
-    "/usr/bin/crontab",
-    "/usr/bin/at",
-    "/usr/bin/sudo",
-    "/usr/sbin/screencapture",
-)
+DENIED_EXEC = ("/bin/launchctl", "/usr/bin/crontab", "/usr/bin/at")
 # Looked up by name: the sandbox answers 1100 whether or not the service exists.
 DENIED_MACH = (
     f"com.apple.xpc.launchd.domain.user.{os.getuid()}",
     "com.apple.SecurityServer",
+    "com.apple.securityd",
     "com.apple.securityd.xpc",
-    "com.apple.windowserver.active",
-    "com.apple.hidsystem.server",
-    "com.apple.accessibility.AXVisualSupport",
-    "com.apple.universalaccessd",
+    "com.apple.security.agent",
+    "com.apple.imagent",
+    "com.apple.imagent.desktop.auth",
+    "com.apple.imdpersistence.IMDPersistenceAgent",
+    "com.apple.iChat",
+    "com.apple.MobileSMS",
     "com.apple.coreservices.appleevents",
     "com.apple.coreservices.appleevent-send",
     "com.apple.coreservices.launchservicesd",
     "com.apple.lsd.open",
-    "com.apple.pasteboard.1",
+    "com.apple.windowserver.active",
+    "com.apple.hidsystem.server",
+    "com.apple.accessibility.AXVisualSupport",
+    "com.apple.universalaccessd",
     "com.apple.tccd",
 )
 # Kept on purpose: TLS for Go and Apple git, and DNS.
 ALLOWED_MACH = ("com.apple.trustd", "com.apple.dnssd.service")
-DENIED_OPS = (
-    "appleevent-send",
-    "lsopen",
-    "mach-priv-task-port",
-    "mach-task-name",
-    "process-info-pidinfo",
-    "signal",
-    "file-write-create",
-)
-# Secret-file probes: a scratch dir outside $HOME that the profile otherwise leaves readable.
+DENIED_OPS = ("appleevent-send", "lsopen", "mach-priv-task-port", "mach-task-name", "signal")
+# Scratch dirs (fake homes, planted files) go here: outside $HOME, writable by everyone.
 OUTSIDE_PARENT = "/private/var/tmp"
-FILE_SECRET_NAMES = (
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".env.example.local",
-    ".envrc",
-    "server.pem",
-    "client.p12",
-    "client.pfx",
-    "store.jks",
-    "api.key",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa_sk",
+# Where a Docker daemon's socket usually sits (Docker Desktop, colima, OrbStack).
+DOCKER_SOCKETS = (
+    "/var/run/docker.sock",
+    "~/.docker/run/docker.sock",
+    "~/.colima/default/docker.sock",
+    "~/.orbstack/run/docker.sock",
 )
-OPEN_NAMES = (
-    ".env.example",
-    ".env.sample",
-    ".env.template",
-    ".environment",
-    "notes.txt",
-    "keyboard.txt",
-    "pem.txt",
-    "id_rsa.pub",
-    "valid_rsa",
-)
-# In outside/upper/ (the filesystem is case-insensitive, so these can't sit beside the
-# lower-case names above): the same rules in other cases.
-UPPER_SECRET_NAMES = (".ENV", ".Env.Local", ".ENVRC", "KEY.PEM", "ID.PFX", "ID_RSA")
-UPPER_OPEN_NAMES = (".Env.Example", ".ENV.SAMPLE", "ID_RSA.PUB")
-MDNS_SOCKET = "/private/var/run/mDNSResponder"
+HTTPS_URL = "https://github.com"
+GIT_REMOTE = "https://github.com/git/git"
 MAX_SOCKET_PATH = 104
 
 
@@ -162,14 +130,12 @@ class ProbeContext:
     params: SandboxParams
     python: str
     env: dict[str, str]
-    sibling: Path  # another run dir next to this one
-    canary: Path  # a dir under $HOME, written from outside; a session must not see into it
+    canary: Path  # a dir under the real $HOME, outside the run: a session may read and write it
     outside_pid: int  # a process outside the sandbox
     lan_ip: str | None
     claude: Path | None
     daemon_pid: int | None = None
-    # a dir the sandbox can otherwise read (under /private/var/tmp, outside $HOME) holding
-    # fake secret files, and a subdir of it that params.deny_read covers
+    # a scratch dir outside $HOME holding a subdir that params.deny_read covers
     outside: Path | None = None
     cleanup: list[Path] = field(default_factory=lambda: [])
 
@@ -179,10 +145,12 @@ class ProbeContext:
         *,
         timeout: float = SNIPPET_TIMEOUT_S,
         env: dict[str, str] | None = None,
+        params: SandboxParams | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run argv inside the sandbox from the run's repo dir."""
+        """Run argv inside the sandbox (``params``, default the run's) from the run's repo
+        dir."""
         return subprocess.run(  # noqa: S603 - argv is built here
-            wrap(argv, self.params),
+            wrap(argv, params or self.params),
             cwd=self.params.run_dir / "repo",
             env=self.env if env is None else env,
             capture_output=True,
@@ -192,7 +160,14 @@ class ProbeContext:
             stdin=subprocess.DEVNULL,
         )
 
-    def snippet(self, code: str, arg: object = None, *, bare: bool = False) -> dict[str, Any]:
+    def snippet(
+        self,
+        code: str,
+        arg: object = None,
+        *,
+        bare: bool = False,
+        params: SandboxParams | None = None,
+    ) -> dict[str, Any]:
         """Run ``code`` (which prints one JSON object) in the sandbox, or outside it."""
         argv = [self.python, "-I", "-c", _PRELUDE + code, json.dumps(arg)]
         if bare:
@@ -200,7 +175,7 @@ class ProbeContext:
                 argv, capture_output=True, text=True, timeout=SNIPPET_TIMEOUT_S, check=False
             )
         else:
-            proc = self.sandboxed(argv)
+            proc = self.sandboxed(argv, params=params)
         lines = proc.stdout.strip().splitlines()
         if proc.returncode != 0 or not lines:
             tail = (proc.stderr.strip().splitlines() or [""])[-1][:200]
@@ -227,35 +202,47 @@ def out(**kw):
     print(json.dumps(kw), flush=True)
 """
 
+# File operations, each [kind, path, other]. "ok" means it worked; anything that changed a
+# file is undone right away where the snippet still can (the host removes the rest).
 _FS = """
-def create(p):
-    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    os.close(fd)
+def create(p, other):
+    os.close(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    os.unlink(p)
+def openw(p, other):
+    # opened for writing, nothing written: the open is what the sandbox judges
+    os.close(os.open(p, os.O_WRONLY | os.O_APPEND))
+def mkdir(p, other):
+    os.mkdir(p)
+    os.rmdir(p)
+def rename(p, other):
+    os.rename(p, other)
+    os.rename(other, p)
+def rename_over(p, other):
+    # put the file `other` (made by the worker) in place of `p`
+    os.rename(other, p)
+def link(p, other):
+    os.link(p, other)
     try:
-        os.unlink(p)
-    except OSError:
-        pass
-    return "WROTE"
+        open(other, "rb").read(1)
+        os.close(os.open(other, os.O_WRONLY | os.O_APPEND))
+    finally:
+        os.unlink(other)
+def symlink_write(p, other):
+    os.symlink(p, other)
+    try:
+        os.close(os.open(other, os.O_WRONLY | os.O_APPEND))
+    finally:
+        os.unlink(other)
+OPS = {
+    "read": lambda p, o: open(p, "rb").read(1),
+    "list": lambda p, o: os.listdir(p),
+    "stat": lambda p, o: os.stat(p),
+    "create": create, "openw": openw, "mkdir": mkdir, "rename": rename,
+    "rename_over": rename_over, "link": link, "symlink_write": symlink_write,
+}
 res = {}
-for kind, p in A:
-    if kind == "read":
-        res[p] = tryit(lambda p=p: open(p, "rb").read(1))
-    elif kind == "list":
-        res[p] = tryit(lambda p=p: os.listdir(p))
-    elif kind == "stat":
-        res[p] = tryit(lambda p=p: os.stat(p))
-    elif kind == "create":
-        try:
-            res[p] = create(p)
-        except OSError as e:
-            res[p] = "errno:%d" % e.errno
-    elif kind == "mkdir":
-        res[p] = tryit(lambda p=p: os.mkdir(p))
-    elif kind == "symlink":
-        res[p] = tryit(lambda p=p: os.symlink("/etc/hosts", p))
-    elif kind == "rename":
-        dst = p + ".moved"
-        res[p] = tryit(lambda p=p, dst=dst: os.rename(p, dst))
+for kind, p, other in A:
+    res["%s %s" % (kind, p)] = tryit(lambda kind=kind, p=p, other=other: OPS[kind](p, other))
 out(res=res)
 """
 
@@ -440,13 +427,29 @@ cg.CGDisplayCreateImage.argtypes = [ctypes.c_uint32]
 out(res="image" if cg.CGDisplayCreateImage(cg.CGMainDisplayID()) else "none")
 """
 
+# The per-run self-check: a write into ~/.resonant (a unique new name; ~/.resonant itself
+# when it doesn't exist) and into the daemon's install, a Keychain lookup and the API port.
+# A write that worked is undone.
 _SELF = """
-home = A["home"]
+import uuid
 res = {}
-target = os.path.join(home, ".resonant")
-if not os.path.isdir(target):
-    target = home
-res["read"] = tryit(lambda: os.listdir(target))
+state = os.path.join(A["home"], ".resonant")
+if os.path.isdir(state):
+    p = os.path.join(state, ".sandbox-self-check-" + uuid.uuid4().hex[:10])
+    def w():
+        os.close(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        os.unlink(p)
+else:
+    def w():
+        os.mkdir(state)
+        os.rmdir(state)
+res["write"] = tryit(w)
+if A.get("protect"):
+    q = os.path.join(A["protect"], ".sandbox-self-check-" + uuid.uuid4().hex[:10])
+    def wp():
+        os.close(os.open(q, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        os.unlink(q)
+    res["protect"] = tryit(wp)
 libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
 libc.bootstrap_look_up.argtypes = [ctypes.c_uint, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint)]
 bs = ctypes.c_uint.in_dll(libc, "bootstrap_port")
@@ -470,9 +473,9 @@ def _denied(result: object) -> bool:
     )
 
 
-def _fmt(results: dict[str, Any], names: Sequence[str] | None = None) -> str:
+def _fmt(results: Mapping[str, Any], names: Sequence[str] | None = None) -> str:
     keys = names or list(results)
-    return ", ".join(f"{os.path.basename(str(k)) or k}={results[k]}" for k in keys)
+    return ", ".join(f"{k}={results[k]}" for k in keys)
 
 
 def _lan_ip() -> str | None:
@@ -493,6 +496,10 @@ def _daemon_pid() -> int | None:
         if "resonant" in " ".join(cmd) and cmd[-2:] == ["daemon", "run"]:
             return int(proc.info["pid"])
     return None
+
+
+def _interpreter() -> Path:
+    return Path(os.path.realpath(getattr(sys, "_base_executable", sys.executable)))
 
 
 def exec_candidates(deny_exec: Sequence[Path]) -> list[Path]:
@@ -517,11 +524,12 @@ def probe_context(
     deny_exec: Sequence[Path] = (),
     read_paths: Sequence[Path] | None = None,
     deny_read: Sequence[Path] = (),
+    protect: Sequence[Path] | None = None,
 ) -> Generator[ProbeContext]:
-    """Build a throwaway run dir (a direct child of ``work_dir``, like a real run's) and a
-    sibling, using the configured cache and secrets dirs, plus a canary dir under ``$HOME``
-    and a process outside the sandbox. Removes what it made, including a ``work_dir`` or
-    cache it had to create (if empty)."""
+    """Build a throwaway run dir (a direct child of ``work_dir``, like a real run's) using the
+    configured cache and secrets dirs, plus a canary dir under ``$HOME``, a scratch dir
+    outside it and a process outside the sandbox. Removes what it made, including a
+    ``work_dir`` or cache it had to create (if empty)."""
     if not sandbox_exec_available():
         raise SandboxError("sandbox-exec is not available on this host")
     home = home or Path.home()
@@ -534,15 +542,9 @@ def probe_context(
             made.append(d)
     tag = uuid.uuid4().hex[:8]
     run = work_dir / f".check-{tag}"
-    sibling = work_dir / f".check-other-{tag}"
-    scratch: list[Path] = [run, sibling]  # removed on the way out, however far setup got
+    scratch: list[Path] = [run]  # removed on the way out, however far setup got
     sleeper: subprocess.Popen[bytes] | None = None
-    interpreter = Path(os.path.realpath(getattr(sys, "_base_executable", sys.executable)))
-    reads = [
-        *(default_read_paths() if read_paths is None else read_paths),
-        Path(sys.base_prefix),
-        interpreter.parent,
-    ]
+    reads = default_read_paths() if read_paths is None else tuple(read_paths)
     try:
         canary = Path(tempfile.mkdtemp(prefix=".resonant-probe-", dir=home))
         scratch.append(canary)
@@ -560,30 +562,20 @@ def probe_context(
             read_paths=tuple(reads),
             deny_exec=tuple(deny_exec),
             deny_read=(*deny_read, outside / "denied"),
+            protect=None if protect is None else tuple(protect),
         ).resolved()
-        for name in (*FILE_SECRET_NAMES, *OPEN_NAMES):
-            (outside / name).write_text("secret")
-        (outside / "upper").mkdir()
-        for name in (*UPPER_SECRET_NAMES, *UPPER_OPEN_NAMES):
-            (outside / "upper" / name).write_text("secret")
         (outside / "denied").mkdir()
         (outside / "denied" / "x.txt").write_text("secret")
-        (canary / "canary.txt").write_text("canary")
         prepare_dirs(params)
-        sibling.mkdir(mode=0o700)
-        (sibling / "keep.txt").write_text("sibling run")
-        (sibling / "creds").mkdir(mode=0o700)  # what another live run holds
-        (sibling / "creds" / "token").write_text("ghs_other_runs_token\n")
         claude = resolve_tool("claude")
         if claude is not None:
             with contextlib.suppress(SandboxError):
                 link_tools(params, {"claude": claude})
         yield ProbeContext(
             params=params,
-            python=str(interpreter),
+            python=str(_interpreter()),
             env=scratch_env(params),
             canary=canary,
-            sibling=sibling,
             outside_pid=sleeper.pid,
             lan_ip=_lan_ip(),
             claude=claude,
@@ -606,19 +598,20 @@ def probe_context(
 
 # --- the probes ------------------------------------------------------------------------------
 
+Op = tuple[str, str, str | None]
 
-def _fs(ctx: ProbeContext, ops: Sequence[tuple[str, str]]) -> dict[str, Any]:
-    res: dict[str, Any] = ctx.snippet(_FS, ops)["res"]
-    for kind, path in ops:  # a create that stuck is a hole: remove it from outside
-        if kind == "rename" and os.path.lexists(path + ".moved"):
-            os.rename(path + ".moved", path)  # undo, then report
-            res[path] = "WROTE"
-        if kind in {"create", "mkdir", "symlink"} and os.path.lexists(path):
+
+def _fs(
+    ctx: ProbeContext, ops: Sequence[Op], params: SandboxParams | None = None
+) -> dict[str, Any]:
+    res: dict[str, Any] = ctx.snippet(_FS, [list(op) for op in ops], params=params)["res"]
+    for kind, path, _ in ops:  # a create that stuck is a hole: remove it from outside
+        if kind in {"create", "mkdir"} and os.path.lexists(path):
             if os.path.isdir(path) and not os.path.islink(path):
                 os.rmdir(path)
             else:
                 os.unlink(path)
-            res[path] = "WROTE"
+            res[f"{kind} {path}"] = "WROTE"
     return res
 
 
@@ -626,95 +619,351 @@ def _unique(parent: Path, tag: str) -> str:
     return str(parent / f".zz-sandbox-probe-{tag}-{uuid.uuid4().hex[:10]}")
 
 
-def p_read_denied(ctx: ProbeContext) -> tuple[Status, str]:
-    """Nothing under $HOME, /Volumes, /Users/Shared or the shared temp dirs can be read."""
-    home = ctx.params.home
-    ops: list[tuple[str, str]] = [
-        ("read", str(ctx.canary / "canary.txt")),
-        ("list", str(ctx.canary)),
-        ("list", str(home)),
-        ("list", "/Users/Shared"),
-        ("list", "/private/tmp"),
-        ("list", "/private/var/folders"),
-    ]
-    if Path("/Volumes").is_dir():
-        ops.append(("list", "/Volumes"))
-    for sub in (".resonant", ".ssh", ".aws", ".config/gh", ".claude", "Library", ".local/bin"):
-        if (home / sub).exists():
-            ops.append(("list", str(home / sub)))
-    # the control: from outside, the canary is readable
-    if (ctx.canary / "canary.txt").read_text() != "canary":
-        raise ProbeError("canary unreadable from outside")
-    res = _fs(ctx, ops)
-    bad = {k: v for k, v in res.items() if not _denied(v)}
-    return (
-        ("fail", f"readable or inconclusive: {_fmt(bad)}")
-        if bad
-        else ("pass", f"{len(res)} denied")
+def _short(results: Mapping[str, Any], home: Path) -> dict[str, Any]:
+    return {k.replace(str(home), "~"): v for k, v in results.items()}
+
+
+def _verdict(
+    denied: Mapping[str, Any], allowed: Mapping[str, Any], home: Path
+) -> tuple[Status, str]:
+    holes = {k: v for k, v in denied.items() if not _denied(v)}
+    blocked = {k: v for k, v in allowed.items() if v != "ok"}
+    if holes:
+        return "fail", f"not denied: {_fmt(_short(holes, home))}"
+    if blocked:
+        return "fail", f"owner-like access blocked: {_fmt(_short(blocked, home))}"
+    return "pass", f"{len(denied)} denied, {len(allowed)} allowed"
+
+
+@contextlib.contextmanager
+def _fake_home(ctx: ProbeContext) -> Generator[tuple[SandboxParams, Path]]:
+    """A fake home under /private/var/tmp with Resonant's state (``~/.resonant`` a symlink to
+    ``root/state``), a fake daemon install, the persistence files (``~/.zshrc`` a symlink into
+    ``root/dotfiles``), Messages and Keychain files and an owner's code with a ``.env``, plus
+    a sandbox built for it the way a session's is. Yields (params, root)."""
+    root = Path(
+        os.path.realpath(tempfile.mkdtemp(prefix="resonant-probe-home-", dir=OUTSIDE_PARENT))
+    )
+    try:
+        home = root / "home"
+        files = {
+            ".resonant/resonant.db": "db",
+            ".resonant/config.yaml": "cfg",
+            ".resonant/logs/daemon.log": "log",
+            ".resonant/run-secrets/token": "ghs_fake",
+            "daemon/venv/bin/python": "py",
+            "daemon/checkout/pyproject.toml": "toml",
+            "Library/LaunchAgents/com.resonant.daemon.plist": "plist",
+            "Library/Messages/chat.db": "chat",
+            "Library/Keychains/login.keychain-db": "kc",
+            ".zshrc": "rc",
+            ".gitconfig": "git",
+            ".config/git/config": "git",
+            ".claude/settings.json": "{}",
+            ".ssh/config": "ssh",
+            ".env": "OWNER=1",
+            "code/proj/.env": "KEY=1",
+            "code/proj/notes.txt": "notes",
+            ".local/bin/owner-tool": "tool",
+            "brew/Cellar/gh/1.0/bin/gh": "gh",
+        }
+        # ~/.resonant and ~/.zshrc are symlinks (a moved state dir, a dotfiles repo): the
+        # guard must hold on the real files too
+        state = root / "state"
+        state.mkdir()
+        home.mkdir()
+        (home / ".resonant").symlink_to(state)
+        for rel, text in files.items():
+            (home / rel).parent.mkdir(parents=True, exist_ok=True)
+            if rel == ".zshrc":
+                (root / "dotfiles").mkdir()
+                (root / "dotfiles" / "zshrc").write_text(text)
+                (home / rel).symlink_to(root / "dotfiles" / "zshrc")
+                continue
+            (home / rel).write_text(text)
+        (home / ".resonant" / "mnt").mkdir()
+        # a Homebrew-like PATH dir: open to workers, except the daemon's own tool in it
+        (home / "brew" / "bin").mkdir()
+        (home / "brew" / "bin" / "gh").symlink_to(
+            home / "brew" / "Cellar" / "gh" / "1.0" / "bin" / "gh"
+        )
+        (root / "denied").mkdir()
+        (root / "denied" / "x.txt").write_text("secret")
+        (root / "open").mkdir()
+        params = SandboxParams(
+            run_dir=root / "run",
+            cache_dir=root / "cache",
+            secrets_dir=home / ".resonant" / "run-secrets",
+            home=home,
+            deny_read=(root / "denied",),
+            protect=(
+                home / "daemon" / "venv",
+                home / "daemon" / "checkout",
+                home / "brew" / "bin" / "gh",
+                home / "brew" / "Cellar" / "gh" / "1.0",
+            ),
+            deny_exec=ctx.params.deny_exec,
+        ).resolved()
+        prepare_dirs(params)
+        yield params, root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def p_state_writes(ctx: ProbeContext) -> tuple[Status, str]:
+    """~/.resonant and the daemon's install (a fake home): no create, append, mkdir,
+    rename, rename-out, hardlink, write through a symlink, or rename of the dir or an
+    ancestor; nor of a daemon tool's link and keg in a Homebrew-like dir. Reads of
+    ~/.resonant (outside run-secrets) stay allowed, and so do new files in the PATH dirs."""
+    with _fake_home(ctx) as (params, root):
+        home, open_dir = params.home, root / "open"
+        st, venv = home / ".resonant", home / "daemon" / "venv"
+        o = str(open_dir)
+        denied: list[Op] = [
+            ("create", _unique(st, "state"), None),
+            ("openw", str(st / "resonant.db"), None),
+            ("openw", str(st / "logs" / "daemon.log"), None),
+            ("mkdir", _unique(st / "logs", "dir"), None),
+            ("rename", str(st / "config.yaml"), str(st / "config.moved")),
+            ("rename", str(st / "config.yaml"), o + "/config.yaml"),
+            ("link", str(st / "resonant.db"), o + "/hardlink.db"),
+            ("symlink_write", str(st / "config.yaml"), o + "/symlink.yaml"),
+            ("rename", str(st), o + "/state"),
+            ("openw", str(root / "state" / "resonant.db"), None),
+            ("create", _unique(root / "state", "real"), None),
+            ("rename", str(root / "state"), o + "/state2"),
+            ("rename", str(home), str(root / "home2")),
+            ("openw", str(venv / "bin" / "python"), None),
+            ("create", _unique(venv / "bin", "venv"), None),
+            ("create", _unique(home / "daemon" / "checkout", "code"), None),
+            ("rename", str(home / "daemon"), o + "/daemon"),
+            ("link", str(venv / "bin" / "python"), o + "/python"),
+            ("rename", str(home / "brew" / "bin" / "gh"), o + "/gh"),
+            ("openw", str(home / "brew" / "Cellar" / "gh" / "1.0" / "bin" / "gh"), None),
+            ("create", _unique(home / "brew" / "Cellar" / "gh" / "1.0", "keg"), None),
+        ]
+        allowed: list[Op] = [
+            # PATH dirs stay open (brew install, uv tool install): the daemon never runs a
+            # tool from them by name
+            ("create", _unique(home / "brew" / "bin", "brew"), None),
+            ("create", _unique(home / "brew" / "Cellar", "formula"), None),
+            ("create", _unique(home / ".local" / "bin", "uvtool"), None),
+            ("openw", str(home / ".local" / "bin" / "owner-tool"), None),
+            ("read", str(st / "config.yaml"), None),
+            ("list", str(st), None),
+            ("create", _unique(home / "daemon", "beside"), None),
+            ("create", _unique(open_dir, "open"), None),
+        ]
+        res = _fs(ctx, [*denied, *allowed], params=params)
+    keys = [f"{k} {p}" for k, p, _ in denied]
+    return _verdict(
+        {k: res[k] for k in keys},
+        {k: v for k, v in res.items() if k not in keys},
+        params.home,
     )
 
 
-def p_write_denied(ctx: ProbeContext) -> tuple[Status, str]:
-    """Persistence paths can't be written: a unique, nonexistent name in each."""
-    home = ctx.params.home
-    ops: list[tuple[str, str]] = [
-        ("create", _unique(home, "home")),
-        ("create", _unique(ctx.canary, "canary")),
-        ("create", str(home / f".zshrc-zz-probe-{uuid.uuid4().hex[:10]}")),
-        ("create", str(home / f".gitconfig-zz-probe-{uuid.uuid4().hex[:10]}")),
-        ("create", _unique(Path("/Users/Shared"), "shared")),
-        ("create", _unique(Path("/private/tmp"), "tmp")),
-        ("create", _unique(Path("/Library"), "lib")),
-        ("mkdir", _unique(home, "dir")),
-    ]
-    for sub in ("Library/LaunchAgents", ".claude", ".ssh", ".resonant", ".config"):
-        if (home / sub).is_dir():
-            ops.append(("create", _unique(home / sub, sub.replace("/", "_"))))
-    if Path("/Volumes").is_dir():
-        ops.append(("create", _unique(Path("/Volumes"), "vol")))
-    res = _fs(ctx, ops)
-    bad = {k: v for k, v in res.items() if not _denied(v)}
-    return (
-        ("fail", f"writable or inconclusive: {_fmt(bad)}")
-        if bad
-        else ("pass", f"{len(res)} denied")
+def p_persistence(ctx: ProbeContext) -> tuple[Status, str]:
+    """Auto-start entries (a fake home): LaunchAgents, shell and git startup files (create,
+    open for write and rename-over), ~/.config, ~/.claude, ~/.ssh and ~/Library."""
+    with _fake_home(ctx) as (params, root):
+        home = params.home
+        evil = root / "open" / "evil.rc"
+        evil.write_text("evil")
+        denied: list[Op] = [
+            ("create", _unique(home / "Library" / "LaunchAgents", "agent"), None),
+            ("openw", str(home / "Library" / "LaunchAgents" / "com.resonant.daemon.plist"), None),
+            ("rename", str(home / "Library" / "LaunchAgents"), str(root / "open" / "la")),
+            ("create", _unique(home / "Library", "lib"), None),
+            ("openw", str(home / ".zshrc"), None),
+            ("rename_over", str(home / ".zshrc"), str(evil)),
+            ("openw", str(root / "dotfiles" / "zshrc"), None),
+            ("create", str(home / ".zprofile"), None),
+            ("create", str(home / ".bash_profile"), None),
+            ("openw", str(home / ".gitconfig"), None),
+            ("openw", str(home / ".config" / "git" / "config"), None),
+            ("create", _unique(home / ".config", "cfg"), None),
+            ("create", _unique(home / ".claude", "claude"), None),
+            ("create", _unique(home / ".ssh", "ssh"), None),
+        ]
+        allowed: list[Op] = [
+            ("create", _unique(home, "home"), None),
+            ("read", str(home / ".zshrc"), None),
+            ("read", str(home / ".ssh" / "config"), None),
+        ]
+        res = _fs(ctx, [*denied, *allowed], params=params)
+    keys = [f"{k} {p}" for k, p, _ in denied]
+    return _verdict(
+        {k: res[k] for k in keys}, {k: v for k, v in res.items() if k not in keys}, home
     )
 
 
-def p_work_dir(ctx: ProbeContext) -> tuple[Status, str]:
-    """Only the run's own dir is writable: not the work dir above it (create, symlink, mkdir,
-    rename the run dir) and not a sibling run dir. A sibling run dir is not readable either
-    (its ``creds/token`` is a live GitHub token), wherever the work dir sits. The daemon's
-    O_NOFOLLOW opens of a run dir rest on this."""
-    work = ctx.params.run_dir.parent
+def p_unreadable(ctx: ProbeContext) -> tuple[Status, str]:
+    """run-secrets, Messages, the Keychain files and runner.deny_read (a fake home): no
+    list, read or write, and no hardlink to read one through. The owner's ``.env`` files
+    stay readable."""
+    with _fake_home(ctx) as (params, root):
+        home, o = params.home, str(root / "open")
+        secrets = home / ".resonant" / "run-secrets"
+        denied: list[Op] = [
+            ("list", str(secrets), None),
+            ("read", str(secrets / "token"), None),
+            ("stat", str(secrets / "token"), None),
+            ("link", str(secrets / "token"), o + "/token"),
+            ("list", str(home / "Library" / "Messages"), None),
+            ("read", str(home / "Library" / "Messages" / "chat.db"), None),
+            ("link", str(home / "Library" / "Messages" / "chat.db"), o + "/chat.db"),
+            ("read", str(home / "Library" / "Keychains" / "login.keychain-db"), None),
+            ("list", str(root / "denied"), None),
+            ("read", str(root / "denied" / "x.txt"), None),
+            ("create", _unique(root / "denied", "deny"), None),
+            ("rename", str(root / "denied"), o + "/denied"),
+            ("link", str(root / "denied" / "x.txt"), o + "/x.txt"),
+        ]
+        allowed: list[Op] = [
+            ("read", str(home / ".env"), None),
+            ("read", str(home / "code" / "proj" / ".env"), None),
+            ("openw", str(home / "code" / "proj" / "notes.txt"), None),
+            ("mkdir", _unique(home / "code", "dir"), None),
+        ]
+        res = _fs(ctx, [*denied, *allowed], params=params)
+    keys = [f"{k} {p}" for k, p, _ in denied]
+    return _verdict(
+        {k: res[k] for k in keys}, {k: v for k, v in res.items() if k not in keys}, home
+    )
+
+
+def p_owner_files(ctx: ProbeContext) -> tuple[Status, str]:
+    """Owner-like access on the real host: a planted ``.env``, key and ``.pem`` under the real
+    $HOME (outside the run) are readable; a scratch dir under $HOME, the shared temp dirs and
+    the PATH dirs (``~/.local/bin``, ``/opt/homebrew/bin``) are writable; runner.deny_read
+    stays denied."""
+    canary = ctx.canary
+    for name in (".env", ".env.local", "id_rsa", "server.pem"):
+        (canary / name).write_text("planted")
+    allowed: list[Op] = [
+        *(("read", str(canary / n), None) for n in (".env", ".env.local", "id_rsa", "server.pem")),
+        ("list", str(ctx.params.home), None),
+        ("create", _unique(canary, "home"), None),
+        ("mkdir", _unique(canary, "dir"), None),
+        ("create", _unique(Path("/private/tmp"), "tmp"), None),
+        ("create", _unique(Path(OUTSIDE_PARENT), "vartmp"), None),
+    ]
+    # the PATH dirs a worker installs into (brew install, uv tool install), where this user
+    # can write them
+    for d in (ctx.params.home / ".local" / "bin", Path("/opt/homebrew/bin")):
+        if d.is_dir() and os.access(d, os.W_OK):
+            allowed.append(("create", _unique(d, "path"), None))
+    denied: list[Op] = []
+    for d in ctx.params.deny_read:
+        if d.exists():
+            denied.append(("list", str(d), None))
+    if ctx.outside is not None:
+        denied.append(("read", str(ctx.outside / "denied" / "x.txt"), None))
+    res: dict[str, Any] = ctx.snippet(_FS, [list(op) for op in [*allowed, *denied]])["res"]
+    keys = [f"{k} {p}" for k, p, _ in denied]
+    return _verdict(
+        {k: res[k] for k in keys},
+        {k: v for k, v in res.items() if k not in keys},
+        ctx.params.home,
+    )
+
+
+def p_real_paths(ctx: ProbeContext) -> tuple[Status, str]:
+    """The same denies on this host's real paths, side-effect free: existing files opened for
+    writing (nothing written), uniquely named creates (removed again if one appears) and
+    reads. Covers ~/.resonant, the installed daemon, LaunchAgents and the rc files,
+    run-secrets, Messages and the Keychain files, wherever they exist."""
+    home = ctx.params.home
+    ops: list[Op] = []
+    state = home / ".resonant"
+    if state.is_dir():
+        ops.append(("create", _unique(state, "state"), None))
+        for name in ("resonant.db", "config.yaml"):
+            if (state / name).is_file():
+                ops.append(("openw", str(state / name), None))
+    for p in ctx.params.protect or ():
+        if p.is_dir():
+            ops.append(("create", _unique(p, "daemon"), None))
+        elif p.is_file() and not p.is_symlink():
+            ops.append(("openw", str(p), None))
+    agents = home / "Library" / "LaunchAgents"
+    if agents.is_dir():
+        ops.append(("create", _unique(agents, "agent"), None))
+    for rc in (".zshrc", ".zprofile", ".bash_profile", ".gitconfig"):
+        if (home / rc).is_file():  # absent ones are covered by the fake home
+            ops.append(("openw", str(home / rc), None))
+    # the control: only what this user could write outside the sandbox counts, so a denial
+    # is the guard's and not the file's permissions (a root-owned keg, a read-only file)
     ops = [
-        ("create", _unique(work, "entry")),
-        ("symlink", _unique(work, "link")),
-        ("mkdir", _unique(work, "dir")),
-        ("rename", str(ctx.params.run_dir)),
-        ("create", _unique(ctx.sibling, "sibling")),
-        ("symlink", _unique(ctx.sibling, "sibling-link")),
-        ("read", str(ctx.sibling / "keep.txt")),
-        ("read", str(ctx.sibling / "creds" / "token")),
-        ("list", str(ctx.sibling)),
-        ("list", str(ctx.sibling / "creds")),
+        op
+        for op in ops
+        if os.access(op[1] if op[0] == "openw" else os.path.dirname(op[1]), os.W_OK)
     ]
-    res = _fs(ctx, ops)
-    bad = {k: v for k, v in res.items() if not _denied(v)}
-    if not ctx.params.run_dir.is_dir():
-        return "fail", "run dir was renamed away"
-    return (
-        ("fail", f"writable or inconclusive: {_fmt(bad)}")
-        if bad
-        else ("pass", f"{len(res)} denied")
+    # reads: only where the control (outside the sandbox) can read, so a deny means the guard
+    reads: list[Op] = [
+        ("list", str(p), None)
+        for p in (
+            ctx.params.secrets_dir,
+            home / "Library" / "Messages",
+            home / "Library" / "Keychains",
+            Path("/Library/Keychains"),
+        )
+        if p.is_dir()
+    ]
+    control: dict[str, Any] = ctx.snippet(_FS, [list(op) for op in reads], bare=True)["res"]
+    readable = [op for op in reads if control[f"{op[0]} {op[1]}"] == "ok"]
+    res = _fs(ctx, [*ops, *readable])
+    skipped = len(reads) - len(readable)
+    status, detail = _verdict(res, {}, home)
+    if status == "pass" and skipped:
+        detail += f" ({skipped} read(s) not checked: unreadable outside the sandbox too)"
+    return status, detail
+
+
+def _hdiutil(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 - fixed binary
+        ["/usr/bin/hdiutil", *args], capture_output=True, text=True, timeout=60, check=False
     )
+
+
+def p_mount(ctx: ProbeContext) -> tuple[Status, str]:
+    """No disk image mounted over a protected path (a fake ``~/.resonant``): a worker could
+    otherwise lay its own files over Resonant's state or the daemon's code. Outside the
+    sandbox the same attach works (the control), and is detached again."""
+    if not os.path.exists("/usr/bin/hdiutil"):
+        return "skip", "no hdiutil"
+    with _fake_home(ctx) as (params, root):
+        image = root / "open" / "probe.dmg"
+        made = _hdiutil("create", "-size", "1m", "-fs", "HFS+", "-volname", "rprobe", str(image))
+        if made.returncode != 0:
+            return "skip", f"control failed: can't make a disk image ({made.stderr.strip()[:80]})"
+        mnt = root / "open" / "mnt"
+        mnt.mkdir()
+        attach = ["attach", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint"]
+        control = _hdiutil(*attach, str(mnt), str(image))
+        if control.returncode != 0:
+            return "skip", f"control failed: attach outside ({control.stderr.strip()[:80]})"
+        _hdiutil("detach", "-force", str(mnt))
+        target = params.home / ".resonant" / "mnt"
+        argv = ["/usr/bin/hdiutil", *attach, str(target), str(image)]
+        mounted = False
+        try:
+            proc = ctx.sandboxed(argv, params=params, timeout=60)
+        finally:
+            if os.path.ismount(target):  # a hole: take it down again
+                mounted = True
+                _hdiutil("detach", "-force", str(target))
+        if mounted or proc.returncode == 0:
+            return "fail", "a disk image was mounted over ~/.resonant"
+    return "pass", f"attach refused ({(proc.stderr or proc.stdout).strip()[:60]})"
 
 
 def p_other_env(ctx: ProbeContext) -> tuple[Status, str]:
     """KNOWN LIMITATION, informational. Another same-user process's environment and
     arguments (what `ps eww` shows) are readable through sysctl KERN_PROCARGS2, and no
     Seatbelt operation gates it. Secrets are therefore never put in a process's env or argv
-    (see `daemon env clean`). `ps` itself can't be exec'd in the sandbox (setuid)."""
+    (see `daemon env clean`)."""
     marker = uuid.uuid4().hex
     victim = subprocess.Popen(  # noqa: S603 - fixed argv
         [ctx.python, "-I", "-c", "import time; time.sleep(300)"],  # not a SIP binary
@@ -785,70 +1034,9 @@ def p_daemon_env(ctx: ProbeContext) -> tuple[Status, str]:
     return ("fail", "; ".join(bad)) if bad else ("pass", "no secret-looking variables")
 
 
-def p_secrets_dir(ctx: ProbeContext) -> tuple[Status, str]:
-    """The configured runner.secrets_dir (token file, helper, gh hosts.yml) can be neither
-    listed, read, stat'ed nor written. Names that don't exist still say EPERM, never ENOENT,
-    so the dir's contents are not even probeable."""
-    sd = ctx.params.secrets_dir
-    # a nonexistent name under a denied dir answers ENOENT, so the probe needs real entries:
-    # a uniquely named canary file, in the dir (made 0700 if missing; removed afterwards)
-    made: list[Path] = []
-    for d in reversed([sd, *sd.parents]):
-        if not d.exists():
-            d.mkdir(mode=0o700)
-            made.append(d)
-    canary = sd / f".probe-canary-{uuid.uuid4().hex[:10]}"
-    canary.write_text("canary")
-    try:
-        ops = [
-            ("list", str(sd)),
-            ("stat", str(sd)),
-            ("read", str(canary)),
-            ("stat", str(canary)),
-            ("create", _unique(sd, "secrets")),
-        ]
-        res = _fs(ctx, ops)
-    finally:
-        canary.unlink(missing_ok=True)
-        for d in reversed(made):
-            with contextlib.suppress(OSError):
-                d.rmdir()
-    bad = {k: v for k, v in res.items() if not _denied(v)}
-    if bad:
-        return "fail", f"reachable or inconclusive: {_fmt(bad)}"
-    return "pass", f"{len(res)} denied under {sd}"
-
-
-def p_terminals(ctx: ProbeContext) -> tuple[Status, str]:
-    """Other terminals and new ptys can't be opened for writing (headless sessions only):
-    nothing can type into the owner's Terminal."""
-    ttys = sorted(str(p) for p in Path("/dev").glob("ttys[0-9]*") if os.access(p, os.W_OK))[:3]
-    targets = [*ttys, "/dev/ptmx"]
-    code = (
-        "import os\n"
-        "r = {}\n"
-        "for p in A:\n"
-        "    try:\n"
-        "        os.close(os.open(p, os.O_WRONLY | os.O_NOCTTY))\n"
-        "        r[p] = 'opened'\n"
-        "    except OSError as e:\n"
-        "        r[p] = 'errno:%d' % e.errno\n"
-        "out(res=r)\n"
-    )
-    control: dict[str, str] = ctx.snippet(code, targets, bare=True)["res"]
-    open_outside = [t for t in targets if control[t] == "opened"]
-    if not open_outside:
-        return "skip", "control failed: no terminal can be opened outside the sandbox"
-    res: dict[str, str] = ctx.snippet(code, open_outside)["res"]
-    bad = {k: v for k, v in res.items() if not _denied(v)}
-    if bad:
-        return "fail", f"opened or inconclusive: {_fmt(bad)}"
-    return "pass", f"{len(res)} refused ({', '.join(os.path.basename(t) for t in res)})"
-
-
 def p_run_dir(ctx: ProbeContext) -> tuple[Status, str]:
-    """The allows hold: the run dir and cache are writable and readable, the working
-    directory resolves, /dev/null works."""
+    """The run dir and cache are writable and readable, the working directory resolves,
+    /dev/null works."""
     run, cache = ctx.params.run_dir, ctx.params.cache_dir
     probe = str(run / "repo" / "allow.txt")
     code = (
@@ -868,126 +1056,9 @@ def p_run_dir(ctx: ProbeContext) -> tuple[Status, str]:
     return ("pass", "run dir and cache usable") if ok else ("fail", f"unexpected: {data}")
 
 
-def p_secret_names(ctx: ProbeContext) -> tuple[Status, str]:
-    """.env and .env.*, *.pem, *.p12 and *.key are unreadable and unwritable outside the run
-    dir; the .env.example family and look-alikes stay readable; the run dir's own copies
-    work."""
-    out_dir = ctx.outside
-    if out_dir is None:
-        return "skip", "no scratch dir"
-    denied = [("read", str(out_dir / n)) for n in FILE_SECRET_NAMES]
-    denied += [("read", str(out_dir / "upper" / n)) for n in UPPER_SECRET_NAMES]
-    # control: the open names are readable, so the denies above are the regexes' doing
-    allowed = [("read", str(out_dir / n)) for n in OPEN_NAMES]
-    allowed += [("read", str(out_dir / "upper" / n)) for n in UPPER_OPEN_NAMES]
-    res = _fs(ctx, denied)
-    ok = _fs(ctx, allowed)
-    bad = {k: v for k, v in res.items() if not _denied(v)}
-    blocked = {k: v for k, v in ok.items() if v != "ok"}
-    # the run dir's own files: readable, and creatable (a committed .env.test, a dev cert)
-    run = ctx.params.run_dir / "repo"
-    (run / ".env").write_text("mine")
-    (run / "dev.pem").write_text("mine")
-    code = (
-        "res = {}\n"
-        f"for n in ('.env', 'dev.pem'): res[n] = open({str(run)!r} + '/' + n).read()\n"
-        f"open({str(run / '.env.new')!r}, 'w').write('x')\n"
-        f"open({str(run / 'new.key')!r}, 'w').write('x')\n"
-        "out(res=res)\n"
-    )
-    mine = ctx.snippet(code)["res"]
-    if bad:
-        return "fail", f"secret names reachable or inconclusive: {_fmt(bad)}"
-    if blocked:
-        return "fail", f"not-a-secret names blocked: {_fmt(blocked)}"
-    if mine != {".env": "mine", "dev.pem": "mine"}:
-        return "fail", f"run dir copies unusable: {mine}"
-    return "pass", f"{len(denied)} denied, {len(allowed)} look-alikes and run dir files allowed"
-
-
-def p_secret_home(ctx: ProbeContext) -> tuple[Status, str]:
-    """The credential files and dirs under $HOME (profile.HOME_SECRETS), read and write.
-    The sandbox only judges paths that exist, and the real $HOME is denied as a whole, so
-    this plants every one in a fake home and lays a read path right on top of each: only the
-    final denies can keep them closed (writes are denied everywhere outside the run dir and
-    cache, so only reads are probed). A sibling file in a read-path dir is the control."""
-    root = Path(
-        os.path.realpath(tempfile.mkdtemp(prefix="resonant-probe-home-", dir=OUTSIDE_PARENT))
-    )
-    try:
-        home = root / "home"
-        targets: list[Path] = []
-        for rel in HOME_SECRET_DIRS:
-            (home / rel).mkdir(parents=True)
-            (home / rel / "x").write_text("secret")
-            targets.append(home / rel / "x")
-        for rel in HOME_SECRET_FILES:
-            (home / rel).parent.mkdir(parents=True, exist_ok=True)
-            (home / rel).write_text("secret")
-            targets.append(home / rel)
-        control = home / ".docker" / "ok.txt"
-        control.write_text("fine")
-        interp = Path(os.path.realpath(getattr(sys, "_base_executable", sys.executable)))
-        fake = SandboxParams(
-            run_dir=root / "run",
-            cache_dir=root / "cache",
-            secrets_dir=home / ".resonant" / "run-secrets",
-            home=home,
-            read_paths=(
-                *(home / rel for rel in HOME_SECRET_DIRS),
-                home / ".docker",
-                *(home / rel for rel in HOME_SECRET_FILES),
-                Path(sys.base_prefix),
-                interp.parent,
-            ),
-        )
-        ops = [("read", str(t)) for t in [*targets, control]]
-        argv = [str(interp), "-I", "-c", _PRELUDE + _FS, json.dumps(ops)]
-        proc = subprocess.run(  # noqa: S603 - argv is built here
-            wrap(argv, fake),
-            cwd="/",
-            env={"PATH": "/usr/bin:/bin"},
-            capture_output=True,
-            text=True,
-            timeout=SNIPPET_TIMEOUT_S,
-            check=False,
-            stdin=subprocess.DEVNULL,
-        )
-        lines = proc.stdout.strip().splitlines()
-        if proc.returncode != 0 or not lines:
-            tail = (proc.stderr.strip().splitlines() or [""])[-1][:150]
-            return "fail", f"snippet failed: {tail}"
-        res: dict[str, Any] = json.loads(lines[-1])["res"]
-        if res.pop(str(control)) != "ok":
-            return "fail", "control file in a read-path dir was unreadable"
-        bad = {k: v for k, v in res.items() if not _denied(v)}
-        if bad:
-            return "fail", f"reachable or inconclusive: {_fmt(bad)}"
-        return "pass", f"{len(targets)} credential paths denied under a fake home"
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
-
-
-def p_deny_read(ctx: ProbeContext) -> tuple[Status, str]:
-    """runner.deny_read paths (and the probe's own) are unreadable and unwritable."""
-    ops: list[tuple[str, str]] = []
-    for d in ctx.params.deny_read:
-        ops.append(("list", str(d)))
-        ops.append(("create", str(d / f"zz-probe-{uuid.uuid4().hex[:10]}")))
-    if ctx.outside is not None:
-        ops.append(("read", str(ctx.outside / "denied" / "x.txt")))
-    res = _fs(ctx, ops)
-    bad = {k: v for k, v in res.items() if not _denied(v)}
-    return (
-        ("fail", f"reachable or inconclusive: {_fmt(bad)}")
-        if bad
-        else ("pass", f"{len(res)} denied")
-    )
-
-
 def p_exec_denied(ctx: ProbeContext) -> tuple[Status, str]:
-    """The named binaries, and anything in the denied-exec paths (the `resonant` CLI),
-    can't be started."""
+    """launchctl, crontab and at, and anything in the denied-exec paths (the daemon's venv
+    and the `resonant` CLI), can't be started."""
     targets = [p for p in DENIED_EXEC if os.path.exists(p)]
     targets += [str(p) for p in exec_candidates(ctx.params.deny_exec)]
     res: dict[str, Any] = ctx.snippet(_EXEC, targets)["res"]
@@ -998,13 +1069,12 @@ def p_exec_denied(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_ports(ctx: ProbeContext) -> tuple[Status, str]:
-    """The daemon API and Ollama ports are unreachable on loopback (v4 and v6), for connect
-    and for bind, while another loopback port stays open."""
+    """The daemon's API port is unreachable on loopback (v4 and v6), for connect and for
+    bind, while another loopback port stays open."""
     with _listener() as (host, port):
         arg = {
-            "connect": [[h, p] for h in ("127.0.0.1", "::1") for p in (API_PORT, OLLAMA_PORT)]
-            + [[host, port]],
-            "bind": [["127.0.0.1", API_PORT], ["0.0.0.0", OLLAMA_PORT]],  # noqa: S104
+            "connect": [[h, API_PORT] for h in ("127.0.0.1", "::1")] + [[host, port]],
+            "bind": [["127.0.0.1", API_PORT], ["0.0.0.0", API_PORT]],  # noqa: S104
         }
         res: dict[str, Any] = ctx.snippet(_NET, arg)["res"]
     bad = [k for k, v in res.items() if f":{port}" not in k and not _denied(v)]
@@ -1013,7 +1083,7 @@ def p_ports(ctx: ProbeContext) -> tuple[Status, str]:
         return "fail", f"reachable or inconclusive: {_fmt(res, bad)}"
     if not open_ok:
         return "fail", f"a free loopback port was blocked too: {res.get(f'connect {host}:{port}')}"
-    return "pass", f"{len(res) - 1} denied, loopback dev port open"
+    return "pass", f"{len(res) - 1} denied, another loopback port open"
 
 
 def p_bind_dev_server(ctx: ProbeContext) -> tuple[Status, str]:
@@ -1037,38 +1107,94 @@ def p_bind_dev_server(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_unix_socket(ctx: ProbeContext) -> tuple[Status, str]:
-    """A unix-socket connect is denied (stand-in for the Docker and ssh-agent sockets). The
-    socket sits in the run dir, so file access can't be what says no."""
-    path = ctx.params.run_dir / "tmp" / "s.sock"
+    """A unix-socket connect works (the Docker socket's route), here to a socket outside the
+    run dir."""
+    sock_dir = Path(tempfile.mkdtemp(prefix="rsp-", dir=OUTSIDE_PARENT))
+    path = sock_dir / "s.sock"
     if len(str(path)) >= MAX_SOCKET_PATH:
-        return "skip", "run dir path too long for a unix socket"
+        shutil.rmtree(sock_dir, ignore_errors=True)
+        return "skip", "scratch path too long for a unix socket"
     srv = socket.socket(socket.AF_UNIX)
-    srv.bind(str(path))
-    srv.listen(1)
     try:
-        control = socket.socket(socket.AF_UNIX)
-        control.connect(str(path))
-        control.close()
+        srv.bind(str(path))
+        srv.listen(1)
         res: dict[str, Any] = ctx.snippet(_NET, {"unix": [str(path)]})["res"]
     finally:
         srv.close()
-        path.unlink(missing_ok=True)
+        shutil.rmtree(sock_dir, ignore_errors=True)
     got = res[f"unix {path}"]
-    return ("pass", "denied") if _denied(got) else ("fail", f"connect gave {got}")
+    return ("pass", "connected") if got == "ok" else ("fail", f"connect gave {got}")
 
 
-def p_mdns(ctx: ProbeContext) -> tuple[Status, str]:
-    """mDNSResponder stays reachable (DNS), and HTTPS-relevant name lookup works."""
-    if not os.path.exists(MDNS_SOCKET):
-        return "skip", "no mDNSResponder socket"
-    res: dict[str, Any] = ctx.snippet(_NET, {"unix": [MDNS_SOCKET]})["res"]
-    got = res[f"unix {MDNS_SOCKET}"]
-    return ("pass", "reachable") if got == "ok" else ("fail", f"connect gave {got}")
+def p_https(ctx: ProbeContext) -> tuple[Status, str]:
+    """Outbound HTTPS with certificate checks, with the Keychain denied: curl, Apple git
+    (``ls-remote``), Python's ssl and gh (a dummy token: a 401 means TLS worked). Each tool
+    is first tried outside the sandbox; one that fails there too is skipped."""
+    git = resolve_tool("git")
+    gh = resolve_tool("gh")
+    py = (
+        "import urllib.request, urllib.error\n"
+        "try:\n"
+        f"    print(urllib.request.urlopen({HTTPS_URL!r}, timeout=20).status)\n"
+        "except urllib.error.HTTPError as e:\n"
+        "    print(e.code)\n"
+    )
+    gh_dir = ctx.params.run_dir / "tmp" / "gh-probe"
+    gh_dir.mkdir(parents=True, exist_ok=True)
+    gh_env = {**ctx.env, "GH_TOKEN": "resonant-probe-not-a-token", "GH_CONFIG_DIR": str(gh_dir)}
+    tools: dict[str, tuple[list[str], dict[str, str], Callable[[str], bool]]] = {
+        "curl": (
+            ["/usr/bin/curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", HTTPS_URL],
+            ctx.env,
+            lambda out: out.strip().startswith(("2", "3")),
+        ),
+        "python": ([ctx.python, "-I", "-c", py], ctx.env, lambda out: out.strip() == "200"),
+    }
+    if git is not None:
+        tools["git"] = (
+            [str(git), "ls-remote", GIT_REMOTE, "HEAD"],
+            {**ctx.env, "GIT_TERMINAL_PROMPT": "0"},
+            lambda out: "HEAD" in out,
+        )
+    if gh is not None:
+        tools["gh"] = (
+            [str(gh), "api", "/zen"],
+            gh_env,
+            lambda out: "Bad credentials" in out or "401" in out,
+        )
+    passed: list[str] = []
+    skipped: list[str] = []
+    for name, (argv, env, ok) in tools.items():
+        try:
+            control = subprocess.run(  # noqa: S603 - argv is built here
+                argv,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=NET_TIMEOUT_S,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            skipped.append(name)
+            continue
+        if not ok(control.stdout + control.stderr):
+            skipped.append(name)
+            continue
+        proc = ctx.sandboxed(argv, env=env, timeout=NET_TIMEOUT_S)
+        text = proc.stdout + proc.stderr
+        if not ok(text):
+            return "fail", f"{name} failed in the sandbox: {text.strip()[:150]}"
+        passed.append(name)
+    if not passed:
+        return "skip", f"control failed: no network outside the sandbox ({', '.join(skipped)})"
+    tail = f"; skipped {', '.join(skipped)}" if skipped else ""
+    return "pass", f"{', '.join(passed)} reached github.com{tail}"
 
 
-def p_mach_denied(ctx: ProbeContext) -> tuple[Status, str]:
-    """Services that act on the user's behalf outside the sandbox can't be looked up, and
-    the ones kept for TLS and DNS still can."""
+def p_mach(ctx: ProbeContext) -> tuple[Status, str]:
+    """The Keychain (securityd), launchd, iMessage and the services that drive apps as the
+    owner can't be looked up, and the ones kept for TLS and DNS still can."""
     res: dict[str, Any] = ctx.snippet(_MACH, [*DENIED_MACH, *ALLOWED_MACH])["res"]
     bad = [n for n in DENIED_MACH if res[n] != BOOTSTRAP_NOT_PRIVILEGED]
     if bad:
@@ -1082,7 +1208,7 @@ def p_mach_denied(ctx: ProbeContext) -> tuple[Status, str]:
 
 def p_operations(ctx: ProbeContext) -> tuple[Status, str]:
     """Operations that are not file or mach filters: Apple Events, LaunchServices opens,
-    task ports, process info, signals."""
+    task ports, signals."""
     res: dict[str, Any] = ctx.snippet(_SBCHECK, DENIED_OPS)["res"]
     bad = [op for op, rc in res.items() if rc == 0]
     return ("fail", f"allowed: {', '.join(bad)}") if bad else ("pass", f"{len(res)} denied")
@@ -1105,8 +1231,8 @@ def p_task_ports(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_signal(ctx: ProbeContext) -> tuple[Status, str]:
-    """Signals to processes outside the sandbox are refused; the session's own children are
-    still killable."""
+    """Signals to processes outside the sandbox (the daemon, the kill switch) are refused;
+    the session's own children are still killable."""
     res: dict[str, Any] = ctx.snippet(_SIGNAL, {"pid": ctx.outside_pid})["res"]
     if not _denied(res["outside"]):
         return "fail", f"outside signal gave {res['outside']}"
@@ -1131,8 +1257,10 @@ def p_env(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_setsid_child(ctx: ProbeContext) -> tuple[Status, str]:
-    """A child in a new session is still sandboxed."""
-    res = ctx.snippet(_SETSID, {"path": str(ctx.canary / "canary.txt")})["res"]
+    """A child in a new session is still sandboxed (it can't read a runner.deny_read file)."""
+    if ctx.outside is None:
+        return "skip", "no scratch dir"
+    res = ctx.snippet(_SETSID, {"path": str(ctx.outside / "denied" / "x.txt")})["res"]
     return ("pass", "new-session child denied") if _denied(res) else ("fail", f"child gave {res}")
 
 
@@ -1140,16 +1268,41 @@ def p_setsid_child(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_keychain(ctx: ProbeContext) -> tuple[Status, str]:
-    """The Keychain is unreachable (securityd is denied), and a denied call fails fast."""
-    control = ctx.snippet(_KEYCHAIN, bare=True)["res"]
-    if control != 0:
-        return "skip", f"control failed: keychain search list gives {control} outside"
-    start = time.monotonic()
-    res = ctx.snippet(_KEYCHAIN)["res"]
-    ms = (time.monotonic() - start) * 1000
-    if res == 0:
-        return "fail", "SecKeychainCopySearchList succeeded"
-    return "pass", f"denied (status {res}) in a {ms:.0f} ms run"
+    """The Keychain can't be read. A throwaway keychain file (never the login keychain, and
+    not added to the search list) holds one item; `security find-generic-password` reads it
+    outside the sandbox and must not inside, and SecKeychainCopySearchList must fail fast."""
+    security = "/usr/bin/security"
+    root = Path(os.path.realpath(tempfile.mkdtemp(prefix="resonant-probe-kc-", dir=OUTSIDE_PARENT)))
+    kc = str(root / "probe.keychain-db")
+    password, secret = uuid.uuid4().hex, uuid.uuid4().hex
+    service = "resonant-sandbox-probe"
+
+    def sec(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603 - fixed binary
+            [security, *args], capture_output=True, text=True, timeout=20, check=False
+        )
+
+    try:
+        made = sec("create-keychain", "-p", password, kc)
+        if made.returncode != 0:
+            return "skip", f"control failed: can't create a scratch keychain ({made.stderr[:80]})"
+        sec("unlock-keychain", "-p", password, kc)
+        sec("add-generic-password", "-s", service, "-a", "probe", "-w", secret, "-T", security, kc)
+        control = sec("find-generic-password", "-s", service, "-w", kc)
+        if control.stdout.strip() != secret:
+            return "skip", "control failed: the scratch item is unreadable outside the sandbox"
+        proc = ctx.sandboxed([security, "find-generic-password", "-s", service, "-w", kc])
+        if secret in proc.stdout or proc.returncode == 0:
+            return "fail", "security read a keychain item from inside the sandbox"
+        start = time.monotonic()
+        res = ctx.snippet(_KEYCHAIN)["res"]
+        ms = (time.monotonic() - start) * 1000
+        if res == 0:
+            return "fail", "SecKeychainCopySearchList succeeded"
+        return "pass", f"item unreadable (rc {proc.returncode}); search list denied in {ms:.0f} ms"
+    finally:
+        sec("delete-keychain", kc)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def p_launchd(ctx: ProbeContext) -> tuple[Status, str]:
@@ -1171,21 +1324,17 @@ def p_launchd(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_hid(ctx: ProbeContext) -> tuple[Status, str]:
-    """The HID drivers (synthetic keyboard and mouse input) can't be opened."""
+    """The HID drivers (synthetic keyboard and mouse input, e.g. typing into Messages) can't
+    be opened."""
     control: dict[str, int] = ctx.snippet(_HID, bare=True)["res"]
     opened = [k for k, v in control.items() if v == 0]
     if not opened:
         return "skip", "control failed: IOHIDSystem can't be opened outside the sandbox either"
     res: dict[str, int] = ctx.snippet(_HID)["res"]
     bad = [k for k in opened if res[k] == 0]
-    return (
-        ("fail", f"IOHIDSystem client type {', '.join(bad)} opened")
-        if bad
-        else (
-            "pass",
-            f"client types {', '.join(opened)} refused",
-        )
-    )
+    if bad:
+        return "fail", f"IOHIDSystem client type {', '.join(bad)} opened"
+    return "pass", f"client types {', '.join(opened)} refused"
 
 
 def p_display(ctx: ProbeContext) -> tuple[Status, str]:
@@ -1198,13 +1347,10 @@ def p_display(ctx: ProbeContext) -> tuple[Status, str]:
 
 
 def p_lan_ports(ctx: ProbeContext) -> tuple[Status, str]:
-    """The API and Ollama ports are unreachable on the machine's LAN address too."""
+    """The API port is unreachable on the machine's LAN address too."""
     if ctx.lan_ip is None:
         return "skip", "no LAN address"
-    arg = {
-        "connect": [[ctx.lan_ip, API_PORT], [ctx.lan_ip, OLLAMA_PORT]],
-        "bind": [[ctx.lan_ip, API_PORT]],
-    }
+    arg = {"connect": [[ctx.lan_ip, API_PORT]], "bind": [[ctx.lan_ip, API_PORT]]}
     res: dict[str, Any] = ctx.snippet(_NET, arg)["res"]
     bad = {k: v for k, v in res.items() if not _denied(v)}
     return (
@@ -1214,17 +1360,12 @@ def p_lan_ports(ctx: ProbeContext) -> tuple[Status, str]:
     )
 
 
-def p_sockets(ctx: ProbeContext) -> tuple[Status, str]:
-    """The Docker and ssh-agent sockets, where present, can't be connected to."""
-    home = ctx.params.home
-    candidates = [
-        "/var/run/docker.sock",
-        str(home / ".docker/run/docker.sock"),
-        os.environ.get("SSH_AUTH_SOCK", ""),
-    ]
+def p_docker(ctx: ProbeContext) -> tuple[Status, str]:
+    """The Docker socket, where a daemon is running, can be connected to."""
     reachable: list[str] = []
-    for path in candidates:
-        if not path or not os.path.exists(path):
+    for raw in DOCKER_SOCKETS:
+        path = os.path.expanduser(raw)
+        if not os.path.exists(path):
             continue
         s = socket.socket(socket.AF_UNIX)
         s.settimeout(2)
@@ -1236,21 +1377,10 @@ def p_sockets(ctx: ProbeContext) -> tuple[Status, str]:
         finally:
             s.close()
     if not reachable:
-        return "skip", "no connectable Docker or ssh-agent socket"
+        return "skip", "no running Docker daemon socket"
     res: dict[str, Any] = ctx.snippet(_NET, {"unix": reachable})["res"]
-    bad = {k: v for k, v in res.items() if not _denied(v)}
-    return ("fail", f"connected: {_fmt(bad)}") if bad else ("pass", f"{len(reachable)} denied")
-
-
-def p_volumes(ctx: ProbeContext) -> tuple[Status, str]:
-    """Mounted volumes (Time Machine and external disks hold copies of ~/.resonant)."""
-    entries = sorted(p for p in Path("/Volumes").iterdir()) if Path("/Volumes").is_dir() else []
-    if not entries:
-        return "skip", "no volumes"
-    ops = [("list", "/Volumes"), *(("list", str(p)) for p in entries[:3])]
-    res = _fs(ctx, ops)
-    bad = {k: v for k, v in res.items() if not _denied(v)}
-    return ("fail", f"readable: {_fmt(bad)}") if bad else ("pass", f"{len(res)} denied")
+    bad = {k: v for k, v in res.items() if v != "ok"}
+    return ("fail", f"blocked: {_fmt(bad)}") if bad else ("pass", f"{len(reachable)} connected")
 
 
 def p_claude_runs(ctx: ProbeContext) -> tuple[Status, str]:
@@ -1310,35 +1440,32 @@ class Probe:
 
 
 PROBES: tuple[Probe, ...] = (
-    Probe("file read denies", "ci", p_read_denied),
-    Probe("file write denies", "ci", p_write_denied),
-    Probe("run dir and cache allows", "ci", p_run_dir),
-    Probe("work dir and sibling run dirs", "ci", p_work_dir),
-    Probe("secrets_dir unreadable", "ci", p_secrets_dir),
-    Probe("secret file names (.env, *.pem, *.p12, *.key)", "ci", p_secret_names),
-    Probe("credential files under $HOME", "ci", p_secret_home),
-    Probe("runner.deny_read paths", "ci", p_deny_read),
-    Probe("other terminals and ptys", "ci", p_terminals),
-    Probe("other processes' environment (known limitation)", "ci", p_other_env),
-    Probe("daemon env holds no secrets", "local", p_daemon_env),
-    Probe("exec denies", "ci", p_exec_denied),
-    Probe("ports 7777 and 11434 on loopback", "ci", p_ports),
+    Probe("~/.resonant and the daemon install: no writes", "ci", p_state_writes),
+    Probe("auto-start and rc files: no writes", "ci", p_persistence),
+    Probe("run-secrets, Messages, Keychain files, deny_read", "ci", p_unreadable),
+    Probe("owner's files: .env readable, $HOME writable", "ci", p_owner_files),
+    Probe("run dir and cache", "ci", p_run_dir),
+    Probe("exec denies (launchctl, cron, the daemon)", "ci", p_exec_denied),
+    Probe("port 7777 on loopback", "ci", p_ports),
     Probe("loopback dev server", "ci", p_bind_dev_server),
     Probe("unix socket connect", "ci", p_unix_socket),
-    Probe("mDNSResponder socket", "ci", p_mdns),
-    Probe("mach lookups", "ci", p_mach_denied),
-    Probe("operations (AppleEvents, LaunchServices, task ports)", "ci", p_operations),
+    Probe("outbound HTTPS (curl, git, python, gh)", "ci", p_https),
+    Probe("mach lookups (Keychain, launchd, iMessage)", "ci", p_mach),
+    Probe("operations (AppleEvents, LaunchServices, signals)", "ci", p_operations),
     Probe("task_for_pid on another process", "ci", p_task_ports),
     Probe("signals to other processes", "ci", p_signal),
     Probe("environment", "ci", p_env),
     Probe("new-session child stays sandboxed", "ci", p_setsid_child),
-    Probe("keychain", "local", p_keychain),
+    Probe("other processes' environment (known limitation)", "ci", p_other_env),
+    Probe("real paths on this host", "local", p_real_paths),
+    Probe("disk image mount over ~/.resonant", "local", p_mount),
+    Probe("daemon env holds no secrets", "local", p_daemon_env),
+    Probe("keychain item read", "local", p_keychain),
     Probe("launchd job submit", "local", p_launchd),
     Probe("HID synthetic input", "local", p_hid),
     Probe("window server (screenshot)", "local", p_display),
-    Probe("ports on the LAN address", "local", p_lan_ports),
-    Probe("docker and ssh-agent sockets", "local", p_sockets),
-    Probe("/Volumes", "local", p_volumes),
+    Probe("port 7777 on the LAN address", "local", p_lan_ports),
+    Probe("docker socket", "local", p_docker),
     Probe("claude runs", "local", p_claude_runs),
     Probe("claude -p without a token fails fast", "local", p_claude_no_token),
     Probe("claude -p with CLAUDE_CODE_OAUTH_TOKEN", "local", p_claude_auth),
@@ -1357,7 +1484,7 @@ def run_probes(ctx: ProbeContext, scopes: Sequence[Scope] = ("ci", "local")) -> 
             status, detail = "fail", f"probe could not run: {e}"
         except subprocess.TimeoutExpired:
             status, detail = "fail", "timed out"
-        except (OSError, KeyError, ValueError, json.JSONDecodeError) as e:
+        except (OSError, KeyError, ValueError, json.JSONDecodeError, SandboxError) as e:
             status, detail = "fail", f"probe error: {type(e).__name__}: {e}"
         results.append(
             ProbeResult(
@@ -1396,28 +1523,22 @@ def render_table(results: Sequence[ProbeResult]) -> str:
 
 
 def self_check(params: SandboxParams, *, python: str | None = None) -> tuple[bool, str]:
-    """The cheap fail-closed check before a session: a denied read of ``~/.resonant`` (or
-    ``$HOME``), a denied mach lookup of securityd and a denied connect to the API port.
-    One sandboxed interpreter start, about 50 to 100 ms."""
+    """The cheap fail-closed check before a session: denied writes into ``~/.resonant`` and
+    the daemon's install, a denied mach lookup of securityd and a denied connect to the API
+    port. One sandboxed
+    interpreter start, about 50 to 100 ms. Writes nothing while the guard holds."""
     if not sandbox_exec_available():
         return False, "sandbox-exec is not available"
     p = params.resolved()
-    interpreter = python or os.path.realpath(getattr(sys, "_base_executable", sys.executable))
+    interpreter = python or str(_interpreter())
     code = _PRELUDE + _SELF
-    check_params = SandboxParams(
-        run_dir=p.run_dir,
-        work_dir=p.work_dir,
-        cache_dir=p.cache_dir,
-        secrets_dir=p.secrets_dir,
-        home=p.home,
-        read_paths=(*p.read_paths, Path(sys.base_prefix), Path(interpreter).parent),
-        deny_exec=p.deny_exec,
-        deny_read=p.deny_read,
-    )
-    argv = [interpreter, "-I", "-c", code, json.dumps({"home": str(p.home), "port": API_PORT})]
+    # the first protected dir this user could write without the guard (the daemon's venv)
+    protect = next((str(d) for d in p.protect or () if d.is_dir() and os.access(d, os.W_OK)), None)
+    arg = {"home": str(p.home), "port": API_PORT, "protect": protect}
+    argv = [interpreter, "-I", "-c", code, json.dumps(arg)]
     try:
         proc = subprocess.run(  # noqa: S603 - argv is built here
-            wrap(argv, check_params),
+            wrap(argv, p),
             cwd="/",
             env={"PATH": "/usr/bin:/bin"},
             capture_output=True,
@@ -1429,15 +1550,17 @@ def self_check(params: SandboxParams, *, python: str | None = None) -> tuple[boo
     except (OSError, SandboxError, subprocess.TimeoutExpired, IndexError, ValueError) as e:
         return False, f"self-check could not run: {type(e).__name__}: {e}"
     problems: list[str] = []
-    if not _denied(res["read"]):
-        problems.append(f"read of {p.home} gave {res['read']}")
+    if not _denied(res["write"]):
+        problems.append(f"write into {p.home / '.resonant'} gave {res['write']}")
+    if "protect" in res and not _denied(res["protect"]):
+        problems.append(f"write into {protect} gave {res['protect']}")
     if res["mach"] != BOOTSTRAP_NOT_PRIVILEGED:
         problems.append(f"securityd lookup gave {res['mach']}")
     if not _denied(res["net"]):
         problems.append(f"connect to :{API_PORT} gave {res['net']}")
     if problems:
         return False, "; ".join(problems)
-    return True, "read, keychain lookup and API port denied"
+    return True, "~/.resonant and daemon writes, keychain lookup and API port denied"
 
 
 def cached_self_check(

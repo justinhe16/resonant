@@ -121,7 +121,7 @@ def test_phase3_defaults(resonant_home: Path) -> None:
     assert s.extensions.max_concurrent_jobs == 4
     assert (s.extensions.result_max_bytes, s.extensions.model_result_max_chars) == (32768, 4096)
     p = s.extensions.process
-    assert p.path_env == "/opt/homebrew/bin:/usr/bin:/bin"
+    assert p.path_env == "/usr/bin:/bin"
     assert (p.stdout_max_bytes, p.stderr_max_bytes) == (256 * 1024, 8 * 1024)
     assert (p.kill_grace_s, p.tree_sample_s, p.health_timeout_s) == (2.0, 2.0, 20.0)
     assert (s.extensions.notify.max_per_hour, s.extensions.notify.max_chars) == (20, 300)

@@ -141,3 +141,47 @@ What goes away: the home-folder deny, the secret-file name rules (RP-9), the cro
 
 - Should `~/code` hold all repos, including ones you already have elsewhere on the Mini? Default: `~/code`, with a per-repo `path` override in the registry. (Built in EM-2: `runner.code_dir` and `repos.path`.)
 - Should the per-run App token stay scoped to one repo? A worker on "ops" asks may need several. Default: scope it to the repos the run touches, with additions through `resonant check`.
+
+## As built
+
+### EM-1 (thin guard, macOS 27.0 / the Mini)
+
+Built: `resonant/sandbox/runner.sb` rewritten as the thin guard; `profile.py` (`SandboxParams.protect`, `default_protected()`, ancestor rendering, `checked_path(..., follow=False)`); `probes.py` rewritten to 28 probes (17 `ci`, 11 `local`) and a new self-check; `tests/test_sandbox.py` with mutation tests (each critical deny is removed from the template and its probe must fail). `runners/claude.py` and `runner/workspace.py` are untouched: every `SandboxParams` field stays (`read_paths` and `work_dir` are accepted and no longer limit anything, and a run dir no longer has to sit inside `work_dir`, so EM-2's worktrees fit).
+
+- **What is denied.**
+  - **Writes:** `~/.resonant` and `$RESONANT_HOME`. The installed daemon (`default_protected()`): `sys.prefix`, `sys.base_prefix` and the checkout the package runs from. The `resonant` entry point. `gh`, `uv`, `ollama` and `git`, each as the link, its real file and its whole Homebrew keg, because the daemon runs them outside the guard by absolute path with credentials. And the real target of any symlinked `$HOME` path the profile names (a moved `~/.resonant`, a dotfiles-repo `~/.zshrc`; Messages and Keychains go to the read-and-write list). The persistence list follows:
+  - **Reads and writes:** `runner.secrets_dir`, `~/Library/Messages`, `~/Library/Keychains`, `/Library/Keychains` and `runner.deny_read`.
+  - **Exec:** `launchctl`, `crontab`, `at`, the daemon's venv and its `resonant`.
+  - **Mach lookups:**
+    - launchd;
+    - the Keychain: `com.apple.SecurityServer`, `com.apple.securityd*`, `com.apple.security.agent*`, `kcsharing`, `KeychainStasher`, `cloudkeychainproxy3`, `octagon` and `keychainsharingmessagingd`;
+    - Messages: `imagent*`, `imdpersistence*`, `imcore*`, `iChat` and `MobileSMS*`;
+    - Apple Events, LaunchServices, the window server, HID, accessibility and `tccd`.
+  - **Operations:** `file-mount` (a disk image mounted over `~/.resonant` or the venv; found in review), `appleevent-send`, `lsopen`, the HID user clients, signals outside the sandbox, task ports, and port 7777 (connect and bind, every address).
+- **What is open.** Everything else, including the PATH dirs (`~/.local/bin`, `/opt/homebrew/bin`), so a worker can `brew install` and `uv tool install` (`brew upgrade` of gh, uv, ollama or git still fails, since their kegs are protected), and including reads of all of `$HOME` (`.env`, `.ssh/config`, `~/.resonant` outside `run-secrets`), writes beside the protected paths, unix sockets (Docker), Ollama's port, ptys, the pasteboard and `ps`.
+- **Spike findings** (real `sandbox-exec`):
+  - A `file-write*` subpath deny also refuses a hardlink to a protected file, a rename out of it, a write through a symlink and the `/.vol/<dev>/<inode>` path.
+  - Renaming an ancestor dir does carry a subpath-protected tree away. So every ancestor of every protected path gets a `literal` write deny, which blocks rename and delete of that dir but still lets a worker create entries in it.
+  - The Keychain read is stopped by the securityd mach denies, not by the file denies: with only the file denies, `security find-generic-password -w` on a throwaway keychain still returned the secret.
+  - With the denies in place, curl, Apple git, Python's `ssl` and gh (Go) all validate TLS to github.com through `trustd`.
+- **Probes** (`resonant sandbox check`):
+  - The full deny battery (create, open-for-write, mkdir, rename, rename-out, hardlink, symlink-write, rename-over of `.zshrc`, ancestor rename) runs against a fake home under `/private/var/tmp` with a fake daemon install. The fake `~/.resonant` and `~/.zshrc` are symlinks, so their real targets are checked too.
+  - The fake home also has a Homebrew-like `brew/bin` with the daemon's `gh` linked into a keg, and a `~/.local/bin`. New files in either are allowed; replacing the `gh` link or writing its keg is denied. On the real host, a create in `~/.local/bin` and `/opt/homebrew/bin` must work.
+  - A disk image attach over the fake `~/.resonant` must fail. It is a local probe, with a control attach outside the sandbox.
+  - On the real paths, `real paths on this host` only opens existing files for writing without writing, creates uniquely named entries (removed again if one appears) and lists dirs whose control read works. Writes count only where this user could write without the guard.
+  - The Keychain probe uses a throwaway keychain file (not the login keychain, and not added to the search list) and deletes it.
+  - Allowed side: a planted `.env`, `id_rsa` and `.pem` under the real `$HOME` are readable, `$HOME`, `/private/tmp` and `/private/var/tmp` are writable, a unix socket connects, a Docker socket connects where one is running, and curl, git, Python and gh reach github.com.
+- **EM-2's `write_paths`** (the worktree under `~/code/.worktrees/<name>/R<n>` and the checkout's `.git`, or the scratch dir) grant nothing under allow-default (the `@WRITE_ALLOW@` block is gone with the old profile). `resolved()` refuses one that sits inside a write-denied path (`~/.resonant`, the daemon's install, a persistence path, `secrets_dir`, `deny_read`). So a checkout at the daemon's own install path would fail closed. The live install is a separate copy (D1).
+- **The daemon can't be shadowed through PATH.** It never looks up a tool by name in a dir a worker can write:
+  - The LaunchAgent PATH is the venv's bin plus `/usr/bin:/bin:/usr/sbin:/sbin`, and ollama's is the system dirs.
+  - The ops runner (`/update`, restarts) forces the system PATH. `/update` runs `/usr/bin/git`, and `uv sync --cache-dir <RESONANT_HOME>/uv-cache` uses a cache workers can't write, so `~/.cache/uv` needs no protection.
+  - Extension children get `/usr/bin:/bin` (`extensions.process.path`), and their `gh`/`git` argv0 is pinned by absolute path at install. The extension source fetch uses `/usr/bin/git`.
+  - `find_ollama` (`daemon install`), `resolve_tool` (the tools linked into a session) and `default_protected()` search fixed install dirs (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`), never the process PATH.
+  - The session itself still gets Homebrew's tools: it is the worker's own PATH.
+  - **Owner step:** re-run `resonant daemon install` so the LaunchAgent picks up the new PATH. Until then the old plist PATH is in the daemon's environment, but nothing in the daemon resolves a tool through it.
+- **Self-check:** a write into `~/.resonant` (a unique new name; `mkdir ~/.resonant` when it doesn't exist) and into the first writable protected dir (the daemon's venv), both undone if they work, a securityd lookup and port 7777.
+- **Carry-overs:**
+  - EM-3's per-run socket must not live in a dir a worker can connect to by accident. Connect is a network operation, so the `~/.resonant` write deny does not cover it; the socket needs its own rule.
+  - Hardlinks that already exist into a protected file are not covered, because the rules are path-based (`.venv` has none today; keep uv's link mode as clone or copy).
+  - `API_PORT` is fixed at 7777 in the profile and the self-check. If `api.port` changes, derive the port from settings.
+  - `~/Library` and `~/.config` are write-denied whole (the existing persistence list). Narrow them to LaunchAgents, the login-item store and the config files that run code, if workers need `~/Library/Caches` with the real `HOME`.

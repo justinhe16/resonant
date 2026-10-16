@@ -51,7 +51,11 @@ from resonant.tools.base import NO_ARGS, BuiltinContext, no_args
 from resonant.tools.system import disk_usage
 from resonant_sdk import Effect, Level, ToolSpec
 
-GIT = "git"
+# SIP-protected; never looked up by name (a worker may write /opt/homebrew/bin)
+GIT = "/usr/bin/git"
+# `uv sync` on /update uses a cache under the Resonant home: Claude workers can't write it
+# (unlike ~/.cache/uv), so nothing they plant there is copied into the daemon's venv.
+UV_CACHE = "uv-cache"
 GIT_TIMEOUT_S = 10.0  # local reads: branch, status, HEAD
 PULL_TIMEOUT_S = 60.0
 SYNC_TIMEOUT_S = 240.0
@@ -146,6 +150,7 @@ class Ops:
         self.conn = conn
         self.repo = settings.ops.repo_path
         self.uv = settings.ops.uv_path
+        self.uv_cache = settings.home / UV_CACHE
         self.runner = runner
         self.owner = owner
         self.clock = clock
@@ -223,7 +228,9 @@ class Ops:
             return {**out, "synced": None, "restarting": False}
         try:
             sync = await self.runner.run(
-                [str(self.uv), "sync", "--frozen"], timeout_s=SYNC_TIMEOUT_S, cwd=self.repo
+                [str(self.uv), "sync", "--frozen", "--cache-dir", str(self.uv_cache)],
+                timeout_s=SYNC_TIMEOUT_S,
+                cwd=self.repo,
             )
             sync_error = None if sync.returncode == 0 else f"exit {sync.returncode}"
         except TimeoutError:
