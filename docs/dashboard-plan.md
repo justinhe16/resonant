@@ -1,0 +1,57 @@
+# Phase 4 plan: dashboard, status relay, and MCP for extensions
+
+Status: **planned** (2026-10-16). The owner asked for the base dashboard (UI and backend) and MCP for extensions and the brain. Hosting (Supabase, Fly, the alert app) is set up later by the owner; until then the relay is off and the dashboard runs locally. Built with robot-surf, a worktree and PR per ticket, in the waves of §5.
+
+## 1. Decisions
+
+- **D1. One UI, two data sources.** A Vite + React + TypeScript + Tailwind + shadcn/ui app in `dashboard/`. Served by the daemon on `127.0.0.1:7777/` from the committed build in `dashboard/dist`, reading `/api/dashboard`. The same build, deployed on Fly, reads the latest snapshot from Supabase instead. The data source is picked at runtime from a small `config.json` next to `index.html`.
+- **D2. Read-only.** The dashboard only shows status. Approvals, `/kill` and every other action stay on iMessage. No POST routes.
+- **D3. Two tiers of data.** `local` (loopback only) can show run asks, PR links, approval and question texts, pulse titles, trust rules and repos. `remote` (what leaves the Mini) is health, counts, states, codes and times only; no message bodies, asks, task contents, repo names or URLs. Both are typed in one schema (§3), `remote` a strict subset. A test proves the pusher sends only `remote` fields.
+- **D4. Push, never pull.** The daemon writes a `remote` snapshot to Supabase every minute when `relay.enabled`. Nothing connects into the Mini; the loopback-only rule stays.
+- **D5. Auth on the remote side.** Supabase Auth, sign-ups off, exactly one user, TOTP MFA required (AAL2), short sessions. RLS lets only the owner's user id read; the daemon writes with its own credential that can only insert into `snapshots`.
+- **D6. Dead-man switch on Fly.** A small checker on Fly alerts when snapshots stop (default: none for 5 minutes) or a snapshot reports a failing health row, and once more on recovery. Channel: ntfy (push to the phone, no account needed; the topic is a secret) or a generic webhook URL. It never goes through the Mini.
+- **D7. Node is a dev tool only.** The Mini doesn't need Node to run Resonant: `dashboard/dist` is committed, CI rebuilds it and fails if it differs. Node is used to build and test the UI.
+- **D8. MCP servers are extension tools.** An extension's manifest may declare an `mcp:` block. Its tools become ordinary extension tools: same gate levels, approvals, secrets, kill switch, audit and pins. The brain sees them like any other extension tool. Transports: stdio (a pinned local binary) and streamable HTTP (a fixed https URL, bearer token from the Keychain). Claude workers already use MCP natively through Claude Code; this is for the brain and extensions.
+
+## 2. Out of scope
+
+Writes from the dashboard; a command path from the relay back to the Mini; inbound webhooks; MCP OAuth flows (use an API key or token as a bearer secret); MCP resources and prompts (tools only); Slack.
+
+## 3. Snapshot schema (shared contract)
+
+`resonant/dashboard/snapshot.py` builds it; `dashboard/src/types.ts` mirrors it; `docs/snapshot.schema.json` is generated from the Pydantic models and checked in CI.
+
+```
+Snapshot {
+  schema: 1, tier: "local" | "remote", taken_at, version (git sha, 8), started_at, last_tick,
+  autonomy: "on"|"off", paused: bool, dry_run: bool,
+  health: [{name, state: ok|degraded|failing|unknown, since, reason?}],     # reason: local only
+  tasks: {by_state: {state: n}}, slots: {used, max},
+  runs: {by_state: {state: n}, items?: [{code, state, repo, ask, branch, pr_url, pr_number,
+         started_at, ended_at, waiting_reason, last_note}]},                  # items: local only
+  approvals: {open: n, items?: [{code, summary, level, asked_at, expires_at}]},
+  questions: {open: n, items?: [{run_code, text, options, asked_at}]},
+  pulse: {open: n, items?: [{key, title, urgency, state, updated_at}]},
+  extensions: [{name, status, health, jobs: [{id, next_due, last_run_at, last_outcome, fail_streak}]}],
+  runner: {set_up: bool, missing?: [str]},
+  trust_rules?: [{n, text}], repos?: [{name, mode, base, protected}]           # local only
+}
+```
+
+Field names may be adjusted by DB-1 with the UI ticket told; `remote` never gains a text field without a plan change.
+
+## 4. Tickets
+
+- **DB-1 Snapshot and local API.** The models and builder (§3) over the store, `GET /api/dashboard` (local tier), static serving of `dashboard/dist` at `/` (a clear placeholder page when it's missing), `docs/snapshot.schema.json` plus its CI check. Tests: tier filtering (no text field in `remote`, property-checked over random data), an empty DB, a busy DB, the API on loopback only.
+- **DB-2 Dashboard UI.** `dashboard/`: Vite, React, TS, Tailwind, shadcn/ui. Pages: Overview (health, autonomy/paused/dry-run, slots, counts, last tick and "last seen N min ago"), Workers (runs, questions), Approvals, Pulse, Extensions and jobs, Rules and repos (local only). Polls every 10s; stale banner when `taken_at` is old; hides what the tier doesn't carry. Light and dark. Data source from `config.json` (`{source: "local"}` or `{source: "supabase", url, anon_key}`); the Supabase path includes login with email + password + TOTP. Tests with Vitest on fixtures matching the schema. CI: a `dashboard` job (`npm ci`, lint, typecheck, test, build, `git diff --exit-code dashboard/dist`).
+- **DB-3 Snapshot pusher.** `relay:` config (`enabled: false`, `supabase_url`, `every_s: 60`), secret `relay/supabase_key`, a loop task posting the `remote` snapshot (bounded retries, never blocks the loop, redaction on errors, health row `relay`), `supabase/migrations/` (the `snapshots` table, the insert-only role or function for the daemon, owner-only select via RLS, retention: keep 7 days). `--check` rows. Tests with a fake Supabase.
+- **DB-4 Fly relay app.** `relay/`: a tiny server (Node or Python, the ticket picks and says why) that serves the DB-2 build in Supabase mode and runs the dead-man checker (§1 D6), `fly.toml`, `Dockerfile`, secrets via `fly secrets`. Tests for the checker (stale, failing, recovered, no duplicate alerts). Deploy is an owner step.
+- **DB-5 Go-live, docs, owner to-dos.** go-live step 15 (Supabase project, the one user + MFA, migrations, key into the Keychain, `relay.enabled`, Fly deploy, ntfy topic, the freeze test), `--check` rows, `healthchecks_url` story updated, architecture/interfaces/README, `docs/followups.md` owner to-dos, `docs/test.md` rows.
+- **MCP-1 MCP client and stdio.** Manifest `mcp:` block (per server: `transport: stdio`, `command` pinned at install like `bins`, args, `tools:` list with name, manifest description, level, secrets), the client (`mcp` Python SDK or a minimal JSON-RPC client; the ticket decides), the carried design from followups (manifest-listed tools only, schema descriptions stripped, annotations ignored, per-tool pin `sha256(name, description, input_schema, output_schema, annotations)` checked at start and on `list_changed` with disable and alert, stderr to a redacting sink, `npx`/`uvx`-style fetch-runners refused, env = union of its tools' secrets, process group killed on stop and on `/kill`). Install screen lists MCP tools and pins. A fake MCP server in tests.
+- **MCP-2 HTTP transport and a real example.** `transport: http` with a fixed https `url`, `auth: bearer` from a declared secret, timeouts and size caps, the same pins. An example extension wiring the Linear MCP server (`extensions/linear/`, tools read-only by default at L0, writes at L2), router few-shots so "what's on my Linear" routes there. Docs: `extensions.md` MCP section.
+
+## 5. Waves
+
+1. DB-1, DB-2 (against §3 fixtures), MCP-1.
+2. DB-3, DB-4, MCP-2.
+3. DB-5.
