@@ -350,6 +350,7 @@ def runner_rows(
         ANTHROPIC_KEY_REF,
         CLAUDE_TOKEN_REF,
         GITHUB_APP_KEY_REF,
+        GITHUB_PUBLIC_TOKEN_REF,
         GITHUB_TOKEN_REF,
         SecretError,
     )
@@ -410,6 +411,18 @@ def runner_rows(
             rows.append(("FAIL", False, step, errors[0]))
         else:
             rows.append(("FAIL", False, step, f"missing: {how}"))
+    # Fork mode (docs/employee-plan.md D6) is optional: without the public_repo token, fork
+    # runs are refused with a sentence naming it, and nothing else needs it.
+    public = present(GITHUB_PUBLIC_TOKEN_REF)
+    step = "runner secret runner/github_public_token (fork runs)"
+    if public is True:
+        rows.append(("PASS", False, step, "present (value not read)"))
+    elif isinstance(public, str):
+        rows.append(("FAIL", False, step, public))
+    else:
+        how = "a classic token with only public_repo, then resonant secret set"
+        rows.append(("SKIP", False, step, f"optional, fork runs refused: {how} "
+                     f"{GITHUB_PUBLIC_TOKEN_REF}"))  # fmt: skip
     # Owner steps nothing here can check without a live run or admin rights on GitHub.
     for step, how in (
         ("runner gh pr create with an installation token",
@@ -418,6 +431,9 @@ def runner_rows(
          "on the first real /run, confirm the session can watch CI (needs checks: read)"),
         ("runner base branch protection",
          "require a PR on each repo's base branch and keep the app out of the bypass list"),
+        ("runner fork run token for the fork",
+         "on the first real fork run, confirm the app (all repositories) mints a token for the "
+         "new fork and the session can push to it"),
     ):  # fmt: skip
         rows.append(("SKIP", False, step, f"owner step: {how}"))
     for name in sorted(repos):

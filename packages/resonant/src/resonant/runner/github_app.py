@@ -123,10 +123,14 @@ _LEVEL = {"none": 0, "read": 1, "write": 2, "admin": 3}
 _ESSENTIAL = ("contents", "pull_requests")  # a session without these can't do its job
 
 
-def check_grant(data: dict[str, Any], repo_name: str, requested: dict[str, str]) -> str | None:
+def check_grant(
+    data: dict[str, Any], repo_name: str, requested: dict[str, str], owner: str | None = None
+) -> str | None:
     """Why a mint reply is not what was asked for, or None. The token must cover exactly the
     one repository and no permission beyond (or outside) the request; a mis-installed app is
-    caught here, not by a session finding it can do too much (or too little)."""
+    caught here, not by a session finding it can do too much (or too little). With ``owner``
+    (a fork run's fork) the repository's ``full_name`` must also be ``owner/repo_name``: the
+    installation's account must be the one the fork was made in."""
     if data.get("repository_selection") != "selected":
         return "it covers more than the one repository"
     repos = data.get("repositories")
@@ -134,6 +138,11 @@ def check_grant(data: dict[str, Any], repo_name: str, requested: dict[str, str])
     names = [str(cast(dict[str, object], r).get("name")) for r in items if isinstance(r, dict)]
     if len(names) != 1 or str(names[0]).lower() != repo_name.lower():
         return "it covers a different set of repositories than asked"
+    if owner is not None:
+        repo = next(cast(dict[str, object], r) for r in items if isinstance(r, dict))
+        full = str(repo.get("full_name"))
+        if full.lower() != f"{owner}/{repo_name}".lower():
+            return f"it is for {full}, not {owner}/{repo_name}"
     granted_raw = data.get("permissions")
     if not isinstance(granted_raw, dict):
         return "it lists no permissions"
@@ -211,9 +220,13 @@ class GitHubApp:
             return last
         raise GitHubAppError(failure)
 
-    async def mint(self, repo_name: str, *, workflows: bool) -> InstallationToken:
+    async def mint(
+        self, repo_name: str, *, workflows: bool, owner: str | None = None
+    ) -> InstallationToken:
         """A token for ``repo_name`` (the name only, no owner) with ``permissions``. A reply
-        that isn't exactly that (see ``check_grant``) is revoked and refused."""
+        that isn't exactly that (see ``check_grant``) is revoked and refused. ``owner`` is
+        checked against the reply when given (a fork run: the owner's fork, which the app's
+        "all repositories" installation covers)."""
         jwt = await self._jwt()
         url = f"{self._base}/app/installations/{self.cfg.installation_id}/access_tokens"
         wanted = permissions(workflows=workflows)
@@ -226,7 +239,7 @@ class GitHubApp:
         token, expires = data.get("token"), data.get("expires_at")
         if not isinstance(token, str) or not token:
             raise GitHubAppError("GitHub's token reply had no token")
-        if (problem := check_grant(data, repo_name, wanted)) is not None:
+        if (problem := check_grant(data, repo_name, wanted, owner)) is not None:
             with contextlib.suppress(GitHubAppError):
                 await self.revoke(token)
             raise GitHubAppError(f"GitHub's token for {repo_name} was refused: {problem}")

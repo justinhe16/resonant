@@ -27,7 +27,7 @@ from resonant.executor import Executor, Handler, HandlerKey, ToolHandler
 from resonant.extensions.host import ExtensionHost
 from resonant.extensions.process import ExtRunner
 from resonant.gate import Gate, Intent, PolicyGate
-from resonant.gate.policy import SummaryAction
+from resonant.gate.policy import LevelFor, SummaryAction
 from resonant.gateway.channel import Channel
 from resonant.loop.types import Runner
 from resonant.models import ModelClient
@@ -41,7 +41,7 @@ from resonant.tools import runs as runs_tools
 from resonant.tools import trust as trust_tools
 from resonant.tools.builtin import register_builtins
 from resonant.tools.registry import ToolKey
-from resonant_sdk import ToolSpec
+from resonant_sdk import Level, ToolSpec
 
 if TYPE_CHECKING:
     from resonant.api import DaemonState
@@ -129,6 +129,16 @@ def summary_actions(conn: sqlite3.Connection) -> dict[ToolKey, SummaryAction]:
     return actions
 
 
+def level_overrides(conn: sqlite3.Connection) -> dict[ToolKey, LevelFor]:
+    """Builtin tools whose level depends on the call: ``merge_run`` follows the trust rules
+    (docs/employee-plan.md D4)."""
+
+    def merge_run(intent: Intent) -> Level | None:
+        return runs_tools.merge_level(conn, intent)
+
+    return {(None, runs_tools.MERGE_RUN.name): merge_run}
+
+
 def build_components(
     settings: Settings,
     conn: sqlite3.Connection,
@@ -167,6 +177,7 @@ def build_components(
         approval_ttl_s=settings.gate.approval_ttl_s,
         actions=summary_actions(conn),
         approvers_for=host.approvers_for,
+        levels=level_overrides(conn),
     )
     merged: dict[HandlerKey, Handler] = {**handlers, **host.handlers}
     executor = Executor(

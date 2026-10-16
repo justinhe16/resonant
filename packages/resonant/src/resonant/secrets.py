@@ -310,6 +310,10 @@ ANTHROPIC_KEY_REF = secret_ref(RUNNER_EXT, "anthropic_key")
 # The GitHub App's private key (PEM, or its base64 on one line). It is not in ``RunnerSecrets``:
 # only ``runner.github_app`` reads it, to sign the JWT that mints a run's token.
 GITHUB_APP_KEY_REF = secret_ref(RUNNER_EXT, "github_app_key")
+# A classic token with only the ``public_repo`` scope, for fork-mode runs (docs/employee-plan.md
+# D6): the daemon forks other people's public repos into the owner's account and opens the
+# upstream PR with it, and with nothing else. Optional: without it fork runs are refused.
+GITHUB_PUBLIC_TOKEN_REF = secret_ref(RUNNER_EXT, "github_public_token")
 
 
 @dataclass(frozen=True)
@@ -319,10 +323,13 @@ class RunnerSecrets:
     # At most one of these is set: the subscription token, or the API key for API billing.
     claude_token: str | None = field(repr=False)
     anthropic_key: str | None = field(repr=False)
+    # Fork mode only (``GITHUB_PUBLIC_TOKEN_REF``); None when it isn't set up.
+    github_public_token: str | None = field(default=None, repr=False)
 
     def values(self) -> list[str]:
         """Every secret value, for a ``Redactor``."""
-        return [v for v in (self.github_token, self.claude_token, self.anthropic_key) if v]
+        found = (self.github_token, self.claude_token, self.anthropic_key, self.github_public_token)
+        return [v for v in found if v]
 
 
 async def missing_runner_secrets(store: SecretStore) -> list[str]:
@@ -342,9 +349,13 @@ async def load_runner_secrets(store: SecretStore) -> RunnerSecrets:
     credentials; the Claude token wins when both exist."""
     github = await store.get(GITHUB_TOKEN_REF)
     try:
-        return RunnerSecrets(github, await store.get(CLAUDE_TOKEN_REF), None)
+        public: str | None = await store.get(GITHUB_PUBLIC_TOKEN_REF)
     except SecretMissing:
-        return RunnerSecrets(github, None, await store.get(ANTHROPIC_KEY_REF))
+        public = None  # optional: only fork-mode runs need it
+    try:
+        return RunnerSecrets(github, await store.get(CLAUDE_TOKEN_REF), None, public)
+    except SecretMissing:
+        return RunnerSecrets(github, None, await store.get(ANTHROPIC_KEY_REF), public)
 
 
 # --- the test double ---------------------------------------------------------------------

@@ -521,13 +521,13 @@ async def test_two_runs_on_one_repo_each_get_a_worktree(env: Env) -> None:
     active = peak = 0
     real = env.ws.ensure_checkout
 
-    async def slow(repo: repo_store.Repo, token: str) -> Path:
+    async def slow(repo: repo_store.Repo, token: str | None, *, fork: str | None = None) -> Path:
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
         await asyncio.sleep(0.05)
         try:
-            return await real(repo, token)
+            return await real(repo, token, fork=fork)
         finally:
             active -= 1
 

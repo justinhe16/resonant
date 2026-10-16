@@ -20,7 +20,7 @@ These are steps only you can do: entering tokens and confirming on GitHub. Claud
   - Read/write: Contents, Pull requests, Administration (to create repos), Workflows (starter CI).
   - Read: Checks, Statuses, Metadata.
   - Then `resonant secret set runner/github_token`. The token is daemon-only and never enters a session.
-- [ ] **Upstream-PR token:** a classic token with only the `public_repo` scope, then `resonant secret set runner/github_public_token`.
+- [ ] **Upstream-PR token:** a classic token with only the `public_repo` scope, then `resonant secret set runner/github_public_token`. Fork runs (EM-7) are refused until it is set; on the first real fork run, confirm the App mints a token for the new fork and the session can push to it.
 - [ ] **github extension update:** `resonant ext add repo:github` (typed confirm).
 - [ ] **Authenticated sandbox probe:** go-live step 14, terminal 5 (the `read -rs` form).
 - [ ] **First run with Claude watching:** a trivial `/run` on a repo with CI. Check `test.md` rows for the runner.
