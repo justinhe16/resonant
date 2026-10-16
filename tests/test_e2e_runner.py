@@ -763,7 +763,8 @@ async def test_fork_run_asks_external_pr_and_opens_it_on_yes(
         assert started.text.startswith("On it: R1 · stream (new repo: up/stream).")
         assert "I'll ask before the PR." in started.text
         ask = await w.next_text()
-        assert 'R1 wants to external_pr on up/stream: "+1/-0, 1 file: Fix the flaky test"' in ask
+        assert 'R1 wants to external_pr on up/stream: "+1/-0, 1 file @ ' in ask, ask
+        assert ': Fix the flaky test"' in ask
         assert ask.endswith("Reply yes / yes always / no"), ask
         await until(settled(w, "R1", "waiting"), 10, "the wait")
         assert w.run().wait_reason == "question"

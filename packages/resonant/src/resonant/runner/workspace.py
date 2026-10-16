@@ -568,6 +568,7 @@ class ForkChange:
     files: int
     insertions: int
     deletions: int
+    head: str  # the branch tip these were read at
 
     @property
     def stat(self) -> str:
@@ -576,8 +577,9 @@ class ForkChange:
 
     @property
     def what(self) -> str:
-        """The external_pr check's text: the size first, so a long title can't clip it."""
-        return f"{self.stat}: {self.title}"
+        """The external_pr check's text: the size and the head first, so a long title can't
+        clip them, and an ok given for one head never stands for another."""
+        return f"{self.stat} @ {self.head[:12]}: {self.title}"
 
 
 @dataclass(frozen=True)
@@ -867,8 +869,10 @@ class Workspace:
                 await self._git(["clone", "-q", "--", url, str(dest)], token=token,
                                 extra=_CHECKOUT_CONFIG)  # fmt: skip
                 return
-            except GitError:
-                if attempt + 1 >= (FORK_READY_TRIES if fork else 1):
+            except GitError as e:
+                missing = re.search(r"not found|does not appear to be a git repository|empty",
+                                    e.message, re.IGNORECASE)  # fmt: skip
+                if attempt + 1 >= (FORK_READY_TRIES if fork else 1) or not missing:
                     raise
             await asyncio.to_thread(rmtree_nofollow, dest)  # a failed clone may leave files
             await asyncio.to_thread(dest.mkdir, mode=0o700)
@@ -1364,6 +1368,7 @@ class Workspace:
         if not _SHA.fullmatch(base_sha):
             raise RunnerError("bad base commit")
         async with self.mirror_lock(repo_name):
+            head = (await git("rev-parse", "--verify", f"{ref}^{{commit}}")).decode().strip()
             message = (await git("log", "-1", "--format=%s%x00%b", ref)).decode(errors="replace")
             stat = (await git("diff", "--shortstat", f"{base_sha}...{ref}")).decode()
         title, _, body = message.partition("\0")
@@ -1377,6 +1382,7 @@ class Workspace:
             files=numbers["file"],
             insertions=numbers["insertion"],
             deletions=numbers["deletion"],
+            head=head,
         )
 
     async def check_fork(
@@ -1551,6 +1557,7 @@ class Workspace:
         secrets: RunnerSecrets,
         *,
         branch: str,
+        allow_flagged: bool = True,
     ) -> CheckResult:
         """Squash-merge a PR whose CI is green, only if its head is still ``head_sha``.
 
@@ -1580,6 +1587,8 @@ class Workspace:
             raise MergeRefused(f"the checks refuse it: {e}") from None
         except GitError as e:
             raise MergeRefused(f"checking the PR failed: {e.message[-120:]}") from None
+        if result.flagged and not allow_flagged:  # an auto-merge: flagged paths wait for /merge
+            raise MergeRefused(f"it changes {', '.join(result.flagged)}")
         number = str(pr_number)
         match await self.ci_state(repo_name, pr_number, secrets):
             case "pending":

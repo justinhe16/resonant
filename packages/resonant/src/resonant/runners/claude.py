@@ -948,12 +948,32 @@ class ClaudeRunner:
         if run is None:
             return Refused(f"No run {code}.")
         if not run.active:
+            if run.status == "ready" and self._stop_watch(run):
+                return Refused(
+                    f"{run.code} won't be merged automatically; its PR stays open. "
+                    f"/merge {run.code} to merge it."
+                )
             return Refused(f"{run.code} isn't running ({run.status}).")
         if not self._cancel(run, reason):
             return Refused(f"{run.code} isn't running.")
         if run.code not in self._working:  # queued or waiting: no step will clean up
             await self._finish_cancelled(run.code)
         return Cancelled(run.code)
+
+    def _stop_watch(self, run: Run) -> bool:
+        """``/cancel`` on a ready run that is waiting to merge itself: the watch ends (its
+        task is cancelled), the PR stays. False when nothing was watching."""
+        task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
+        if task is None or task.status != "waiting" or not task.checkpoint.get("merge"):
+            return False
+        if self._cancel_task is not None:
+            self._cancel_task(task.id)
+        else:
+            with atomic(self.conn):
+                task_store.set_status(self.conn, task.id, "cancelled", expect=("waiting",))
+        with atomic(self.conn):
+            audit(self.conn, "run.auto_merge_stopped", run=run.code)
+        return True
 
     async def merge_run(self, code: str) -> Merged | Refused:
         """Squash-merge a ready run's PR (``--match-head-commit``, CI must be green). Whether
@@ -974,7 +994,9 @@ class ClaudeRunner:
             return Refused((await self.setup_missing()) or "The runner's secrets can't be read.")
         return await self._merge(run.code, secrets, by="owner")
 
-    async def _merge(self, code: str, secrets: RunnerSecrets, *, by: str) -> Merged | Refused:
+    async def _merge(
+        self, code: str, secrets: RunnerSecrets, *, by: str, allow_flagged: bool = True
+    ) -> Merged | Refused:
         """The one merge path of both ``merge_run`` and the auto-merge, one at a time per run
         (the row is read again under the lock, so two merges of one PR can't both go).
         ``Workspace.merge`` fetches the PR head and runs the checks first (D10), then CI,
@@ -987,8 +1009,9 @@ class ClaudeRunner:
             assert run.pr_number is not None and run.head_sha is not None and run.branch
             try:
                 checked = await self.workspace.merge(
-                    run.repo, run.pr_number, run.head_sha, secrets, branch=run.branch
-                )
+                    run.repo, run.pr_number, run.head_sha, secrets, branch=run.branch,
+                    allow_flagged=allow_flagged,
+                )  # fmt: skip
             except (MergeRefused, RunnerError, GitError) as e:
                 reason = e.message if isinstance(e, GitError) else str(e)
                 return Refused(f"{run.code} not merged: {Redactor(secrets.values()).text(reason)}")
@@ -1072,8 +1095,9 @@ class ClaudeRunner:
         if run is None:
             return Fail("run not found")
         if not run.active:
-            if run.status == "ready" and task.checkpoint.get("watch"):
-                return await self._auto_merge(task, run, first=False)
+            if run.status == "ready" and task.checkpoint.get("merge"):
+                # watching, or a retry before the first look (the reply is deduped)
+                return await self._auto_merge(task, run, first=not task.checkpoint.get("watch"))
             return await self._conclude(run)
         if self._blocked:
             return self._defer(task, "starting")
@@ -1815,6 +1839,9 @@ class ClaudeRunner:
             raise RunnerError(
                 f"the checks refuse it, so nothing was opened upstream: {e}"
             ) from None
+        # The session is over: its token goes before the owner is asked, so nothing holding
+        # it can move the branch between the ok and the PR.
+        await self._deprovision(run.code, remove_dir=False)
         self._check_stop(run.code)
         runs.update(
             self.conn, run.code, step="publish", head_sha=checked.head_sha,
@@ -1838,6 +1865,8 @@ class ClaudeRunner:
         if run.head_sha is None:
             raise RunnerError("the fork's branch wasn't checked")
         change = await self.workspace.fork_change(run.repo, run.code, p.base_sha)
+        if change.head != run.head_sha:
+            raise RunnerError(f"{p.branch} isn't at the commit that was checked")
         self._check_stop(run.code)
         check = Check(system=repo.slug, action=EXTERNAL_PR, what=change.what, irreversible=True)
         q = self.desk.find_check(run.code, check)
@@ -1925,24 +1954,29 @@ class ClaudeRunner:
                 state = await self.workspace.ci_state(run.repo, _pr_number(run), secrets)
             except (SecretError, RunnerError) as e:
                 why = f"CI couldn't be read ({e})"
-        if why is None and state in ("pending", "error"):
+        if why is None and state in ("pending", "error", "none"):  # none: checks not registered yet
             ended = run.ended_at or self.clock()
             if self.clock() - ended < timedelta(seconds=self.merge_wait_s):
                 if first:
-                    await self._conclude(run, watching=True)
+                    told = await self._conclude(run, watching=True)
+                    if isinstance(told, Fail):
+                        return told
                 checkpoint = {**task.checkpoint, "watch": True}
                 return Wait("ci", checkpoint, self.clock() + timedelta(seconds=self.merge_poll_s))
-            why = f"CI didn't finish within {fmt_duration(self.merge_wait_s)}"
+            why = (
+                "no CI checks reported"
+                if state == "none"
+                else f"CI didn't finish within {fmt_duration(self.merge_wait_s)}"
+            )
         elif why is None and state == "red":
             why = "CI is red"
-        elif why is None and state == "none":
-            why = "no CI checks reported"
         if why is None and secrets is not None:
-            merged = await self._merge(run.code, secrets, by="auto")
+            merged = await self._merge(run.code, secrets, by="auto", allow_flagged=False)
             if isinstance(merged, Merged):
                 if first:
                     self._pulse_clear(run)
                     await self._deprovision(run.code)
+                    await self._end_cli(run.code)
                 text = merged.text + (f"\n{run.pr_url}" if run.pr_url else "")
                 with contextlib.suppress(ChannelError):
                     await self.channel.send(
@@ -2080,6 +2114,7 @@ class ClaudeRunner:
         """Everything after a run's row has its final status: clear the pulse item, send the
         reply (once), and tell the loop how the task ended. ``watching`` and ``note`` are
         the auto-merge's (it will merge once CI is green; why it won't)."""
+        self._forks.pop(run.code, None)
         if run.status == "cancelled":
             await self._finish_cancelled(run.code, send=False)
         else:

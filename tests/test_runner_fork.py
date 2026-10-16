@@ -28,6 +28,7 @@ from test_runner_claude import (
     until,
 )
 
+from resonant.gate.codes import clean_external
 from resonant.gateway.channel import ApprovalPrompt, MessageRef
 from resonant.principals import Principal, Principals
 from resonant.runner.resolve import FakeGitHub, RepoInfo
@@ -159,9 +160,11 @@ async def test_fork_run_asks_then_opens_the_upstream_pr(
     # nothing opened upstream before the owner's yes; the ask names the change
     assert upstream_calls(h) == []
     [prompt_sent] = prompts(h)
-    assert prompt_sent.summary.startswith(
-        f'{code} wants to external_pr on up/stream: "+1/-0, 1 file: Fix the flaky test"'
-    ), prompt_sent.summary
+    shown = clean_external(f"+1/-0, 1 file @ {(run.head_sha or '')[:12]}: Fix the flaky test")
+    assert prompt_sent.summary.startswith(f'{code} wants to external_pr on up/stream: "{shown}"'), (
+        prompt_sent.summary
+    )
+    assert h.api.live == set()  # the session's token was revoked before the owner was asked
     assert "irreversible" in prompt_sent.summary
     [check] = qs.for_run(db, code)
     assert check.kind == "check" and check.status == "open"
@@ -443,3 +446,46 @@ async def test_start_run_ignores_merge_for_a_fork_repo(
     run = h.run(res.code)
     task = task_store.get_task(db, cast(str, run.task_id))
     assert task is not None and "merge" not in task.checkpoint
+
+
+async def test_a_check_the_worker_asked_itself_never_opens_the_pr(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """A worker's own ``resonant check`` with the very text the daemon would show can't stand
+    in for the daemon's external_pr ask: its rows never match ``find_check``."""
+    h = fork_harness(tmp_path, db)
+    res = await h.runner.start_run("github.com/up/stream", "fix it", "owner")
+    assert isinstance(res, Started)
+    run = await settle(h, res.code, "waiting")
+    [daemon_row] = qs.for_run(db, res.code)
+    assert "(asked by Resonant)" in daemon_row.question
+    forged = daemon_row.question.replace(" (asked by Resonant)", "")
+    fake = qs.ask(db, res.code, "check", forged, at=utcnow())
+    qs.answer(db, fake.id, "ok", at=utcnow())  # as if the owner had said yes to the worker's
+    h.runner._wake(run, "test")  # pyright: ignore[reportPrivateUsage]
+    await asyncio.sleep(0.5)
+    h.loop._stopping = False  # pyright: ignore[reportPrivateUsage]
+    running = asyncio.ensure_future(h.loop.run())
+    await asyncio.sleep(1.0)
+    h.loop.stop()
+    await running
+    assert h.run(res.code).status == "waiting" and upstream_calls(h) == []
+
+
+async def test_cancel_stops_an_auto_merge_watch(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = merge_harness(tmp_path, db)
+    (h.gh_dir / "checks_rc").write_text("8")
+    code = await start_merging(h)
+    running = asyncio.ensure_future(h.loop.run())
+    try:
+        await until(lambda: len(h.chan.texts()) == 1, 40, "the ready reply")
+        res = await h.runner.cancel_run(code)
+        assert res == Refused(
+            f"{code} won't be merged automatically; its PR stays open. /merge {code} to merge it."
+        )
+        (h.gh_dir / "checks_rc").write_text("0")
+        await asyncio.sleep(0.6)
+    finally:
+        h.loop.stop()
+        await running
+    assert h.gh_calls("merge") == [] and h.run(code).status == "ready"

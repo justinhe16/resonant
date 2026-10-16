@@ -332,8 +332,11 @@ class WorkerDesk:
                            qid=qid)  # fmt: skip
 
     @staticmethod
-    def _check_text(system: str, action: str, req: Check) -> str:
-        text = f"{action} on {system}: {req.what}"
+    def _check_text(system: str, action: str, req: Check, *, daemon: bool = False) -> str:
+        # A daemon-made check reads "<action> on <system> (asked by Resonant): …". A worker's
+        # can't: its system is a slug (no spaces), so ": " always follows it directly.
+        by = " (asked by Resonant)" if daemon else ""
+        text = f"{action} on {system}{by}: {req.what}"
         if req.irreversible:
             text += " (irreversible)"
         if req.cost_usd > 0:
@@ -341,8 +344,9 @@ class WorkerDesk:
         return text
 
     def find_check(self, code: str, req: Check) -> qs.Question | None:
-        """The latest check row of ``code`` for exactly this check, or None."""
-        text = self._check_text(slug(req.system), slug(req.action), req)
+        """The latest daemon-made check row of ``code`` for exactly this check, or None. A
+        check the worker asked itself (``resonant check``) never matches."""
+        text = self._check_text(slug(req.system), slug(req.action), req, daemon=True)
         found = [q for q in qs.for_run(self.conn, code) if q.kind == "check" and q.question == text]
         return max(found, key=lambda q: q.id, default=None)
 
@@ -356,10 +360,10 @@ class WorkerDesk:
         system, action = slug(req.system), slug(req.action)
         if ANY in (system, action):
             raise ValueError("name one system and one action, not *")
-        key = (run.code, system, action, req.irreversible, req.cost_usd, req.what)
+        key = (run.code, system, action, req.irreversible, req.cost_usd, req.what, "daemon")
         entry = self._checks.get(key)
         if entry is None:
-            text = self._check_text(system, action, req)
+            text = self._check_text(system, action, req, daemon=True)
             q = qs.ask(self.conn, run.code, "check", text, at=self.clock())
             if self.trust is None:
                 qs.answer(self.conn, q.id, CHECK_DENIED, at=self.clock())
