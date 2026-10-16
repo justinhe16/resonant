@@ -38,7 +38,9 @@ Text replies (``resolve_reply``): the actor must be an approver with ``approve``
 iMessage parser match, and the approval's prompt sent to the actor before the reply's
 ``occurred_at`` (the sent-before rule). A plain yes/no binds only when exactly one approval
 is pending for the actor, now and when the reply was sent. ``require_code`` needs
-``yes <code>``; a plain no may deny. Resolution is idempotent per reply event
+``yes <code>``; a plain no may deny. ``yes always`` binds the same way but only to an
+approval that offered it (``allow_always``, a worker's trust check; never ``require_code``),
+else ``always_unsupported``. Resolution is idempotent per reply event
 (``resolved_event_id``).
 
 Expiry is lazy: every entry point first runs ``expire_due``. Every ``evaluate`` writes one
@@ -369,6 +371,7 @@ class PolicyGate:
                     decided_by=reply.actor,
                     now=now,
                     event_id=reply.event_id,
+                    always=reply.always,
                 )
             result = ResolveResult(ok=False, reason=reason)
             if reason is None and target is not None:
@@ -400,6 +403,7 @@ class PolicyGate:
                 occurred_at=reply.occurred_at.isoformat(),
                 raw_text=reply.raw_text,
                 comments=reply.comments,
+                always=reply.always,
                 ok=result.ok,
                 reason=reason,
             )
@@ -432,6 +436,9 @@ class PolicyGate:
             target = mine[0]
         if not _sent_before(target, reply):
             return None, "not_sent_before"
+        if reply.always and (not target.allow_always or target.require_code):
+            # Never read as a plain yes: "always" asked for more than this approval offers.
+            return None, "always_unsupported"
         if reply.code is None:
             # Judge a plain reply against what the actor had been shown when they sent it,
             # so an old reply re-routed later can't bind what has since become the only one.
@@ -494,4 +501,5 @@ def _needs(a: ap.Approval) -> NeedsApproval:
         effect=a.effect,
         level=a.level,
         require_code=a.require_code,
+        allow_always=a.allow_always,
     )

@@ -219,6 +219,11 @@ def _run_code(rest: str) -> str:
     return f"R{int(m.group(1))}"
 
 
+def forget_rule_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
+    """``/rules forget <n>``: a rule number (``3`` or ``#3``)."""
+    return {"id": _number(rest, "rule")}
+
+
 def runs_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
     """``/runs [code]``."""
     return {"code": _run_code(rest)} if _word(rest) else {}
@@ -509,6 +514,15 @@ COMMANDS: tuple[Command, ...] = (
         tool="merge_run",
         parse=run_code_args,
         owner_only=True,
+    ),
+    Command(
+        "/rules",
+        "/rules [forget <n>]",
+        "trust rules: when runs ask first; forget <n> drops one",
+        "rules",
+        tool="list_trust_rules",
+        owner_only=True,
+        subs=(Sub("forget", "remove_trust_rule", forget_rule_args, usage="/rules forget <n>"),),
     ),
     EXT,
     PULSE,

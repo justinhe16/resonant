@@ -50,6 +50,7 @@ def approval_prompt(decision: NeedsApproval) -> ApprovalPrompt:
         level=decision.level.value,
         expires_at=decision.expires_at,
         require_code=decision.require_code,
+        always=decision.allow_always,
     )
 
 

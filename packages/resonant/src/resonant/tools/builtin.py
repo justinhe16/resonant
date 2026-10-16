@@ -35,6 +35,7 @@ from resonant.tools import (
     runs,
     system,
     tasks,
+    trust,
     updates,
 )
 from resonant.tools.base import BuiltinContext, BuiltinModule
@@ -74,6 +75,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     updates,
     runs,
     repos,
+    trust,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 

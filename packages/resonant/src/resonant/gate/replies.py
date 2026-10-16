@@ -10,9 +10,13 @@ one of:
 - ``(no|deny|👎)( <code>)?``
 - ``<code> no``
 - ``yes( <code>)? with comments: <text>`` (text 1-500 characters)
+- ``yes always( <code>)?``, ``yes <code> always`` or ``<code> yes always``: approve and
+  add a trust rule. Only a worker's trust check offers it; the gate refuses it for any
+  other approval (``always_unsupported``), and never reads it as a plain ``yes``.
 
-Anything else is not a reply: ``y``, ``ok``, ``sure``, ``yes?``, ``yes all``, ``yes A7 and C4``, a
-pasted prompt, or a code outside the approval alphabet (``yes A1``). A message the reader
+Anything else is not a reply: ``y``, ``ok``, ``sure``, ``yes?``, ``yes all``, ``always``,
+``no always``, ``yes A7 and C4``, a pasted prompt, or a code outside the approval alphabet
+(``yes A1``). A message the reader
 truncated is never a reply. There is no classifier and there are no batch replies in
 Phase 2.
 
@@ -51,6 +55,13 @@ _COMMENTS = re.compile(
     rf"yes(?: (?P<code>{_CODE}))? with comments: ?(?P<comments>.+)", _FLAGS | re.DOTALL
 )
 _DENY = re.compile(_NO, _FLAGS)
+# "yes always", with the code (if any) before or after "always". Plain "yes" only: no
+# emoji or "approve", so the one reply that widens trust is spelled out.
+_ALWAYS = (
+    re.compile(rf"yes always(?: (?P<code>{_CODE}))?", _FLAGS),
+    re.compile(rf"yes (?P<code>{_CODE}) always", _FLAGS),
+    re.compile(rf"(?P<code>{_CODE}) yes always", _FLAGS),
+)
 # Trailing periods and exclamation marks (autocorrect, emphasis), never question marks.
 _TRAILING = re.compile(r"[\s.!]+\Z")
 
@@ -62,6 +73,7 @@ class ParsedReply:
     decision: Literal["approve", "deny"]
     code: str | None = None
     comments: str | None = None
+    always: bool = False  # "yes always"
 
 
 def normalize_reply(text: str) -> str:
@@ -81,6 +93,9 @@ def parse_reply(text: str, *, truncated: bool = False) -> ParsedReply | None:
             return None
         return ParsedReply("approve", _upper(m["code"]), comments)
     norm = _TRAILING.sub("", norm)
+    for pattern in _ALWAYS:
+        if a := pattern.fullmatch(norm):
+            return ParsedReply("approve", _upper(a["code"]), always=True)
     m = _WORD_CODE.fullmatch(norm) or _CODE_WORD.fullmatch(norm)
     if m is None:
         return None

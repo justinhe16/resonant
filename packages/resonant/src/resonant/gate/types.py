@@ -159,6 +159,7 @@ class NeedsApproval:
     effect: Effect
     level: Level
     require_code: bool  # L1 (destructive or pay): only "yes <code>" approves
+    allow_always: bool = False  # a worker's trust check: "yes always" also adds a rule
 
 
 @dataclass(frozen=True)
@@ -230,7 +231,10 @@ class ApprovalReply:
     must come from iMessage via the parser. ``code`` picks one approval. Without a code,
     the reply binds only if exactly one approval is pending for the actor. A
     ``require_code`` approval (L1, pay) is approved only by ``yes <code>``; a plain ``no``
-    may deny it. Anything else is refused with a ``ReplyRefusal`` and Resonant re-asks.
+    may deny it. ``always`` (``yes always``) binds like a plain or coded yes, but only to an
+    approval that offered it (``allow_always``: a worker's trust check, never
+    ``require_code``); for any other it is refused, never read as a plain yes. Anything
+    else is refused with a ``ReplyRefusal`` and Resonant re-asks.
     ``all_in_batch``, ``batch_id``, ``confidence`` and ``path="classifier"`` are deferred
     (C4) and refused.
     """
@@ -248,10 +252,13 @@ class ApprovalReply:
     batch_id: str | None = None
     confidence: float | None = None
     comments: str | None = None
+    always: bool = False  # "yes always": approve and add a trust rule (trust checks only)
 
     def __post_init__(self) -> None:
         if self.occurred_at.tzinfo is None:
             raise ValueError("occurred_at must be timezone-aware")
+        if self.always and self.decision != "approve":
+            raise ValueError("always is an approval")
 
 
 # Why ``resolve_reply`` refused a reply. A closed set the router maps to its replies:
@@ -263,6 +270,8 @@ class ApprovalReply:
 # - code_required: a plain "yes" for a require_code approval.
 # - not_sent_before: the approval's prompt was not sent to the actor before the reply.
 # - unsupported: not an iMessage parser reply, or a batch reply (deferred).
+# - always_unsupported: "yes always" for an approval that doesn't offer it (anything but a
+#   worker's trust check, and never a require_code one).
 # - not_found, already_resolved, expired, task_not_waiting: the store refused (a race).
 ReplyRefusal = Literal[
     "nothing_pending",
@@ -271,6 +280,7 @@ ReplyRefusal = Literal[
     "code_required",
     "not_sent_before",
     "unsupported",
+    "always_unsupported",
     "not_found",
     "already_resolved",
     "expired",

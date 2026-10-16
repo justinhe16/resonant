@@ -64,13 +64,21 @@ def sanitize_external(text: str, max_len: int = 60) -> str:
 
 
 def approval_text(
-    code: str, summary: str, *, require_code: bool = False, destructive: bool = False
+    code: str,
+    summary: str,
+    *,
+    require_code: bool = False,
+    destructive: bool = False,
+    always: bool = False,
 ) -> str:
     """The message sent to approvers. ``summary`` must be built by code from intent fields.
 
     ``destructive`` (L1) and ``require_code`` (pay) both mean only ``yes <code>`` approves;
-    ``destructive`` takes precedence when both are set.
+    ``destructive`` takes precedence when both are set. ``always`` (a worker's trust check,
+    never with the other two) offers ``yes always``.
     """
+    if always and not (destructive or require_code):
+        return f"[{code}] {summary}. Reply yes / yes always / no"
     if destructive:
         return f"[{code}] {summary}? This can't be undone. Reply yes {code} / no"
     if require_code:

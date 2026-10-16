@@ -61,6 +61,10 @@ NAMES = {
     "list_repos",
     "add_repo",
     "forget_repo",
+    "list_trust_rules",
+    "add_trust_rule",
+    "allow_trust_rule",
+    "remove_trust_rule",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {
@@ -80,6 +84,9 @@ WRITES = {
     "add_ci": Level.L2,
     "add_repo": Level.L3,
     "forget_repo": Level.L3,
+    "add_trust_rule": Level.L3,
+    "allow_trust_rule": Level.L2,
+    "remove_trust_rule": Level.L2,
 }
 
 

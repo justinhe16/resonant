@@ -30,7 +30,10 @@ from resonant_sdk import Effect, Event, Level, new_id
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired"]
 
 # Why ``resolve`` refused. "task_not_waiting": the task is no longer waiting or running.
-ResolveRefusal = Literal["not_found", "already_resolved", "expired", "task_not_waiting"]
+# "always_unsupported": ``yes always`` for an approval that doesn't offer it.
+ResolveRefusal = Literal[
+    "not_found", "already_resolved", "expired", "task_not_waiting", "always_unsupported"
+]
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,12 @@ class NewApproval:
     require_code: bool = False
     extension: str | None = None
     requested_by: str | None = None
+    # The prompt offers ``yes always`` (a worker's trust check). Never with ``require_code``.
+    allow_always: bool = False
+
+    def __post_init__(self) -> None:
+        if self.allow_always and self.require_code:
+            raise ValueError("a require_code approval never accepts yes always")
 
 
 @dataclass(frozen=True)
@@ -80,6 +89,8 @@ class Approval:
     code: str | None
     used_at: datetime | None
     resolved_event_id: str | None
+    allow_always: bool = False  # the prompt offered ``yes always`` (migration 010)
+    always: bool = False  # the owner answered ``yes always``
 
     def sent_at(self, principal: str) -> datetime | None:
         """When the prompt was first sent to ``principal`` (None if it never was)."""
@@ -124,6 +135,8 @@ def _row_to_approval(r: sqlite3.Row) -> Approval:
         code=r["code"],
         used_at=_dt(r["used_at"]),
         resolved_event_id=r["resolved_event_id"],
+        allow_always=bool(r["allow_always"]),
+        always=bool(r["always"]),
     )
 
 
@@ -136,8 +149,9 @@ def insert_approval(conn: sqlite3.Connection, spec: NewApproval, now: datetime) 
     approval_id = new_id()
     conn.execute(
         """INSERT INTO approvals (id, task_id, intent_hash, extension, tool, effect, level,
-               summary, requested_by, approvers, expires_at, require_code, code, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               summary, requested_by, approvers, expires_at, require_code, code, created_at,
+               allow_always)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             approval_id,
             spec.task_id,
@@ -153,6 +167,7 @@ def insert_approval(conn: sqlite3.Connection, spec: NewApproval, now: datetime) 
             spec.require_code,
             spec.code,
             iso(now),
+            spec.allow_always and not spec.require_code,
         ),
     )
     return approval_id
@@ -301,16 +316,22 @@ def resolve(
     decided_by: str,
     now: datetime,
     event_id: str | None = None,
+    always: bool = False,
 ) -> ResolveRefusal | None:
     """Approve or reject a pending approval. Returns None on success, else why not.
 
     One conditional UPDATE: the row must still be pending and unexpired, and its task must
     be waiting or running. The refusal reason is read afterwards and is informational only.
+    ``always`` (``yes always``) is recorded only on an approval that offered it and needs no
+    code; the gate checks that first, and the UPDATE checks it again.
     """
+    if always and not approved:
+        raise ValueError("always is an approval")
     cur = conn.execute(
         """UPDATE approvals SET status = ?, decided_by = ?, decided_at = ?,
-               resolved_event_id = ?
+               resolved_event_id = ?, always = ?
            WHERE id = ? AND status = 'pending' AND expires_at > ?
+             AND (? = 0 OR (allow_always = 1 AND require_code = 0))
              AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = approvals.task_id
                          AND tasks.status IN ('waiting', 'running'))""",
         (
@@ -318,8 +339,10 @@ def resolve(
             decided_by,
             iso(now),
             event_id,
+            always,
             approval_id,
             iso(now),
+            always,
         ),
     )
     if cur.rowcount == 1:
@@ -331,6 +354,8 @@ def resolve(
         return "expired" if current.status == "expired" else "already_resolved"
     if current.expires_at <= now:
         return "expired"
+    if always and (not current.allow_always or current.require_code):
+        return "always_unsupported"
     return "task_not_waiting"
 
 
@@ -364,6 +389,30 @@ def expire_due(conn: sqlite3.Connection, now: datetime) -> int:
                 approval_id=r["id"],
             )
     return len(rows)
+
+
+def expire_one(conn: sqlite3.Connection, approval_id: str, now: datetime, *, reason: str) -> bool:
+    """pending -> expired for one approval whose asker gave up (its run ended, its wait was
+    cancelled), so a later reply binds nothing. Audited. True if it was pending."""
+    with atomic(conn):
+        row = conn.execute(
+            """UPDATE approvals SET status = 'expired', decided_at = ?
+               WHERE id = ? AND status = 'pending'
+               RETURNING task_id, tool, extension, intent_hash""",
+            (iso(now), approval_id),
+        ).fetchone()
+        if row is not None:
+            audit(
+                conn,
+                "approval.expired",
+                task_id=row["task_id"],
+                tool=row["tool"],
+                extension=row["extension"],
+                intent_hash=row["intent_hash"],
+                approval_id=approval_id,
+                reason=reason,
+            )
+    return row is not None
 
 
 def wake_resolved(

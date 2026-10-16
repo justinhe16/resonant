@@ -60,3 +60,11 @@
 {"text": "any updates on my PRs", "intent": "updates"}
 {"text": "what's running", "intent": "job_control"}
 {"text": "how's the mini", "intent": "system"}
+{"text": "/rules", "intent": "rules"}
+{"text": "stop asking me before you deploy to dori-staging", "intent": "rules"}
+{"text": "always check with me before merging anything in trading", "intent": "rules"}
+{"text": "text me right away when trading runs finish", "intent": "rules"}
+{"text": "forget that rule", "intent": "rules"}
+{"text": "show me my trust rules", "intent": "rules"}
+{"text": "drop rule 2", "intent": "rules"}
+{"text": "what are the rules of chess", "intent": "question"}

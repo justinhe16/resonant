@@ -128,6 +128,7 @@ def test_example_set_is_valid_and_covers_both_paths() -> None:
         "reminders",
         "ops",
         "run_project",
+        "rules",
         "unknown",
     }
     fast = [c for c in cases if match_fast_path(c.text) is not None]

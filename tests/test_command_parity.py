@@ -38,6 +38,10 @@ CHAT_WRITES = {
     "start_run",
     "cancel_run",
     "merge_run",
+    # Trust rules (EM-4): add tightens (L3); allow and forget can widen trust, so chat asks yes.
+    "add_trust_rule",
+    "allow_trust_rule",
+    "remove_trust_rule",
 }
 
 SPECS = {s.name: s for s in BUILTIN_SPECS}

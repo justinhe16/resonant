@@ -38,6 +38,7 @@ from resonant.tools import ToolRegistry
 from resonant.tools import notes as notes_tools
 from resonant.tools import ops as ops_tools
 from resonant.tools import runs as runs_tools
+from resonant.tools import trust as trust_tools
 from resonant.tools.builtin import register_builtins
 from resonant.tools.registry import ToolKey
 from resonant_sdk import ToolSpec
@@ -119,6 +120,12 @@ def summary_actions(conn: sqlite3.Connection) -> dict[ToolKey, SummaryAction]:
         return runs_tools.summary_action(conn, intent)
 
     actions[(None, runs_tools.MERGE_RUN.name)] = merge_run
+
+    def trust_rule(intent: Intent) -> str | None:
+        return trust_tools.summary_action(conn, intent)
+
+    for spec in (trust_tools.ALLOW_TRUST_RULE, trust_tools.REMOVE_TRUST_RULE):
+        actions[(None, spec.name)] = trust_rule
     return actions
 
 

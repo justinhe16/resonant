@@ -532,6 +532,7 @@ async def test_help_lists_the_registry_for_the_owner(fast_router: Router) -> Non
         "/runs [R3]: Claude runs, active first; a code shows one\n"
         "/cancel <R3>: stop a run and discard its work\n"
         "/merge <R3>: squash-merge a finished run's PR (CI must be green)\n"
+        "/rules [forget <n>]: trust rules: when runs ask first; forget <n> drops one\n"
         "/ext list|run|mute: extensions; run <ext>/<job> now; mute <ext> [1h|until tomorrow|off]\n"
         "/pulse [now]: what the next update would say and what's open; now sends it\n"
         "/help [word]: list commands, or the ones matching a word\n"
@@ -683,7 +684,7 @@ def test_intent_toolsets_name_registered_builtins() -> None:
         assert tools == tuple(sorted(tools)), intent
         for tool in tools:
             assert tool in names, (intent, tool)
-            if intent not in ("notes", "reminders", "ops", "run_project"):
+            if intent not in ("notes", "reminders", "ops", "run_project", "rules"):
                 assert names[tool].effect is Effect.READ, (intent, tool)
     assert set(INTENT_TOOLS["notes"]) == {"list_notes", "add_note", "delete_note", "clear_notes"}
     assert set(INTENT_TOOLS["reminders"]) == {"add_reminder", "list_reminders", "cancel_reminder"}
@@ -705,7 +706,14 @@ def test_intent_toolsets_name_registered_builtins() -> None:
         "reminders",
         "ops",
         "run_project",
+        "rules",
         "unknown",
+    }
+    assert set(INTENT_TOOLS["rules"]) == {
+        "list_trust_rules",
+        "add_trust_rule",
+        "allow_trust_rule",
+        "remove_trust_rule",
     }
 
 
@@ -783,7 +791,7 @@ async def test_prefix_bytes_identical_across_calls() -> None:
     prefix_b = json.dumps(b[:-1]).encode()
     assert prefix_a == prefix_b
     assert a[-1] == {"role": "user", "content": "<message>first message</message>"}
-    assert 8 <= sum(m["role"] == "assistant" for m in a) <= 16  # few-shot examples
+    assert 8 <= sum(m["role"] == "assistant" for m in a) <= 18  # few-shot examples
 
 
 def test_label_prefix_snapshot() -> None:
