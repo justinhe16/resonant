@@ -46,8 +46,9 @@ tmp/
 *.gguf
 *.safetensors
 
-# Dashboard build
+# Dashboard build (dashboard/dist is committed: the Mini serves it without Node)
 node_modules/
+!/dashboard/dist/
 
 # OS / editor / local agent settings
 .DS_Store
