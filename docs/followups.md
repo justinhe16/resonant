@@ -14,7 +14,7 @@ These are steps only you can do: entering tokens and confirming on GitHub. Claud
      - Read: Checks, Statuses, Metadata.
      - **No Administration.**
   3. Install it on your account, for all repositories.
-  4. Generate a private key, then `resonant secret set runner/github_app_key` and paste the `.pem`.
+  4. Generate a private key, then `resonant secret set runner/github_app_key --from-file <the .pem>`, then delete the `.pem`.
   5. Tell Claude the app ID and the installation ID (they aren't secret; Claude puts them in the config).
 - [ ] **Resonant's own GitHub token:** a fine-grained token covering all repositories.
   - Read/write: Contents, Pull requests, Administration (to create repos), Workflows (starter CI).

@@ -76,6 +76,7 @@ _PLACEHOLDERS = {
     "exempt": ";; @SECRET_EXEMPT@",
     "deny_read": ";; @DENY_READ@",
     "home_secrets": ";; @HOME_SECRETS@",
+    "work_exempt": ";; @WORK_EXEMPT@",
 }
 
 
@@ -106,6 +107,9 @@ class SandboxParams:
     read_paths: tuple[Path, ...] = ()
     deny_exec: tuple[Path, ...] = ()
     deny_read: tuple[Path, ...] = ()  # runner.deny_read: extra paths, read and write denied
+    # runner.work_dir, the parent of every run dir: all of it is denied except this run's dir,
+    # the cache and the read paths, wherever it sits (default: the run dir's parent)
+    work_dir: Path | None = None
 
     def resolved(self) -> SandboxParams:
         home = Path(checked_path(self.home))
@@ -134,9 +138,13 @@ class SandboxParams:
                 raise SandboxError(
                     f"secrets_dir {secrets} overlaps the sandbox-readable {what} {path}"
                 )
+        work = Path(checked_path(self.work_dir)) if self.work_dir is not None else run.parent
+        if work == Path("/") or not run.is_relative_to(work) or run == work:
+            raise SandboxError(f"run dir {run} must be inside the work dir {work}")
         return SandboxParams(
             run_dir=run,
             cache_dir=cache,
+            work_dir=work,
             home=home,
             read_paths=reads,
             deny_exec=tuple(Path(checked_path(p)) for p in self.deny_exec),
@@ -220,6 +228,13 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
         f'  (subpath (string-append (param "HOME") "/{rel}"))' for rel in HOME_SECRETS
     ]
     defs["SECRETS"] = str(p.secrets_dir)
+    work = p.work_dir or p.run_dir.parent
+    defs["WORK"] = str(work)
+    # other runs' dirs (and their credentials) stay unreadable even when the work dir sits
+    # where the HOME denies don't reach; the allowed paths and their ancestors are spared
+    work_lines = [f'  (subpath (param "{k}"))' for k in ("RUN", "CACHE")]
+    work_lines += [f'  (subpath (param "READ_{i}"))' for i in range(len(p.read_paths))]
+    work_lines += [f'  (literal (param "META_{i}"))' for i in range(len(meta_lines))]
     text = template_text()
     for key, lines in (
         ("read", read_lines),
@@ -228,6 +243,7 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
         ("exempt", exempt_lines),
         ("deny_read", deny_read_lines),
         ("home_secrets", home_secret_lines),
+        ("work_exempt", work_lines),
     ):
         if _PLACEHOLDERS[key] not in text:
             raise SandboxError(f"runner.sb lost its {_PLACEHOLDERS[key]} placeholder")

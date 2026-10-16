@@ -6,6 +6,7 @@ touches the real Keychain.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -24,6 +25,7 @@ from resonant.secrets import (
     EXIT_NOT_FOUND,
     SECURITY,
     SERVICE,
+    SET_ARGV,
     FakeKeychain,
     InvalidSecretRef,
     InvalidSecretValue,
@@ -31,8 +33,10 @@ from resonant.secrets import (
     SecretStore,
     SecretUnavailable,
     SubprocessSecurity,
-    add_argv,
+    add_command,
+    decode_value,
     delete_argv,
+    encode_value,
     env_name,
     find_argv,
     secret_ref,
@@ -101,9 +105,10 @@ def test_argv_shapes() -> None:
         SECURITY, "find-generic-password", "-s", SERVICE, "-a", "github/token", "-w",
     ]  # fmt: skip
     assert find_argv("github/token", value=False)[-1] == "github/token"
-    assert add_argv("github/token") == [
-        SECURITY, "add-generic-password", "-U", "-s", SERVICE, "-a", "github/token", "-w",
-    ]  # fmt: skip
+    assert SET_ARGV == [SECURITY, "-i"]  # the command is on stdin
+    assert add_command("github/token", TOKEN) == (
+        f"add-generic-password -U -s {SERVICE} -a github/token -w {TOKEN}\n".encode()
+    )
     assert delete_argv("github/token") == [
         SECURITY, "delete-generic-password", "-s", SERVICE, "-a", "github/token",
     ]  # fmt: skip
@@ -122,9 +127,9 @@ async def test_set_passes_value_on_stdin_never_argv() -> None:
     s, keychain = store()
     await s.set("github/token", TOKEN)
     (call,) = keychain.calls
-    assert call.argv == tuple(add_argv("github/token"))
+    assert call.argv == tuple(SET_ARGV)
     assert all(TOKEN not in a for a in call.argv)
-    assert call.stdin == f"{TOKEN}\n{TOKEN}\n".encode()
+    assert call.stdin == add_command("github/token", TOKEN)
     assert keychain.items == {"github/token": TOKEN}
     await s.set("github/token", TOKEN + "2")  # -U replaces
     assert keychain.items == {"github/token": TOKEN + "2"}
@@ -141,7 +146,8 @@ async def test_exists_and_delete_never_read_the_value() -> None:
 
 
 @pytest.mark.parametrize(
-    "value", ["s3cr3t!", "x" * 7, "x" * 129, "tab\there!", "new\nline!", "é" * 8]
+    "value",
+    ["s3cr3t!", "x" * 7, "x" * 3501, "tab\there!", "é" * 8, "ctl\x01chars!", "n" * 2700 + " "],
 )
 async def test_set_refuses_bad_values_before_running_security(value: str) -> None:
     s, keychain = store()
@@ -409,7 +415,7 @@ def test_cli_set_from_stdin_verifies_and_never_echoes(keychain: FakeKeychain) ->
     assert code == 0, out
     assert out.strip() == "stored github/token"
     assert keychain.items == {"github/token": TOKEN}
-    assert [a[1] for a in keychain.argvs()] == ["add-generic-password", "find-generic-password"]
+    assert [a[1] for a in keychain.argvs()] == ["-i", "find-generic-password"]
     assert all(TOKEN not in arg for argv in keychain.argvs() for arg in argv)
 
 
@@ -534,3 +540,88 @@ def test_cli_list_empty_and_unavailable(keychain: FakeKeychain, resonant_home: P
     keychain.fail_with = 36
     code, out = run("list")
     assert code == EX_TEMPFAIL and "keychain locked" in out
+
+
+# --- large and multi-line values (security -i, docs/repos-plan.md D10) ---------------------------
+
+PEM = (
+    "-----BEGIN RSA PRIVATE "
+    + "KEY-----\n"
+    + "MIIEowIBAAKCAQEA" * 90
+    + "\n-----END RSA PRIVATE "
+    + "KEY-----"
+)
+
+
+def test_values_are_stored_plain_or_as_one_safe_token() -> None:
+    assert encode_value(TOKEN) == TOKEN
+    for odd in ("has space in it", "quo\"te's", "back\\slash!", PEM, "resonant-b64:abc12345"):
+        stored = encode_value(odd)
+        assert stored.startswith("resonant-b64:") and " " not in stored and "\n" not in stored
+        assert decode_value(stored) == odd
+    assert decode_value("resonant-b64:!!notbase64") == "resonant-b64:!!notbase64"
+
+
+async def test_set_takes_a_multi_line_value_without_argv_and_reads_it_back() -> None:
+    s, keychain = store()
+    await s.set("runner/github_app_key", PEM)
+    (call,) = keychain.calls
+    assert call.argv == (SECURITY, "-i")  # nothing of the key in argv
+    assert call.stdin is not None and call.stdin.count(b"\n") == 1  # one command line
+    assert len(call.stdin) < 4096 and b"BEGIN" not in call.stdin  # ...of one safe token
+    assert await s.get("runner/github_app_key") == PEM
+    assert all("MIIE" not in a for argv in keychain.argvs() for a in argv)
+
+
+async def test_the_largest_value_fits_one_security_line() -> None:
+    s, _ = store()
+    biggest = "A" * 3500
+    await s.set("github/token", biggest)
+    assert await s.get("github/token") == biggest
+    spacey = "ab " * 800  # 2400 characters, 3.2 KB once stored
+    await s.set("github/token", spacey)
+    assert await s.get("github/token") == spacey
+
+
+def test_cli_set_from_file_reads_a_pem_in_process(keychain: FakeKeychain, tmp_path: Path) -> None:
+    pem = tmp_path / "key.pem"
+    pem.write_text(PEM + "\n")
+    code, out = run("set", "runner/github_app_key", "--from-file", str(pem))
+    assert code == 0, out
+    assert out.strip() == "stored runner/github_app_key"
+    assert asyncio.run(SecretStore(keychain).get("runner/github_app_key")) == PEM
+    assert all("MIIE" not in a for argv in keychain.argvs() for a in argv)
+    assert str(pem) not in " ".join(a for argv in keychain.argvs() for a in argv)
+
+
+def test_cli_set_from_file_dash_reads_all_of_stdin(keychain: FakeKeychain) -> None:
+    code, out = run("set", "runner/github_app_key", "--from-file", "-", input=PEM + "\n")
+    assert code == 0, out
+    assert asyncio.run(SecretStore(keychain).get("runner/github_app_key")) == PEM
+
+
+def test_cli_set_from_file_errors(keychain: FakeKeychain, tmp_path: Path) -> None:
+    code, out = run("set", "runner/github_app_key", "--from-file", str(tmp_path / "nope.pem"))
+    assert code == 2 and "can't read" in out and keychain.calls == []
+    big = tmp_path / "big.pem"
+    big.write_text("x" * 5000)
+    code, out = run("set", "runner/github_app_key", "--from-file", str(big))
+    assert code == 2 and "too long" in out and keychain.calls == []
+
+
+def test_a_plain_value_that_starts_with_a_dash_is_encoded() -> None:
+    """In `security -i` a leading "-" would read as an option."""
+    stored = encode_value("-w-looks-like-an-option")
+    assert stored.startswith("resonant-b64:") and decode_value(stored) == "-w-looks-like-an-option"
+    assert b" -w -w-looks" not in add_command("github/token", "-w-looks-like-an-option")
+    assert encode_value("not-a-dash-first") == "not-a-dash-first"
+
+
+def test_the_revoke_timeout_covers_all_three_tries_and_their_backoff() -> None:
+    from resonant.runner import github_app
+    from resonant.runners import claude
+
+    floor = github_app.ATTEMPTS * github_app.TIMEOUT_S + github_app.BACKOFF_S * (
+        2**github_app.ATTEMPTS - 1
+    )
+    assert floor < claude.REVOKE_TIMEOUT_S

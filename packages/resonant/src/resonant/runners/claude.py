@@ -6,22 +6,26 @@ restart needs. One ``step`` drives a run from its saved step to the next stoppin
 a Claude slot and the repo's run lock the whole time:
 
     prepare   refresh the mirror, check the repo has CI, clone, branch (``Workspace.prepare``)
-    session   the cached sandbox self-check (fails closed), then ``claude -p`` under
-              ``sandbox.wrap`` with a from-scratch environment
-    harvest   ``git bundle`` inside the sandbox, fd-based import into the mirror, checks
-    publish   re-check cancel/pause, push, ``gh pr create``
+    session   a per-run GitHub App token for the one repo (``runner.github_app``), the cached
+              sandbox self-check (fails closed), then ``claude -p`` under ``sandbox.wrap`` with a
+              from-scratch environment. The session itself pushes its branch, opens the PR,
+              watches CI and fixes it (docs/repos-plan.md D10); the token is revoked when the
+              session ends, however it ends
+    harvest   (the saved step keeps this name) find the PR by its head branch and check it the
+              way a merge will; no PR and no pushed commits is ``no_changes``
     reply     the code-built message to the requester
 
 Each step is saved in ``runs.step`` before it starts, so a crash resumes at the last one; the
 session is resumed by id (``--resume``) in the same run dir, after the old process tree has been
-reaped. Nothing after the session starts writes into the run dir except through the sandbox.
+reaped. After the session starts the daemon writes into the run dir only to refresh the token
+files, through ``O_NOFOLLOW`` directory fds. Merging (``merge_run``) fetches the PR's head into
+the mirror and runs the checks first; no merge path skips them.
 
 Outcomes. A usage limit parks the run (``Wait("usage_reset")``: slot and lock freed; the wait
 doesn't count as session time or an attempt, and 24 h of waiting in total fails the run). The
 time limit, the disk limit, the turn or dollar limit and a Claude error fail the run and keep its
-dir ("work kept"), nothing is pushed. ``/cancel`` and ``/kill`` end the whole process tree,
-delete the dir and never publish: ``publish`` re-reads the run and the kill switch before the
-push and again before the PR.
+dir ("work kept"); what the session already pushed stays on GitHub. ``/cancel`` and ``/kill`` end
+the whole process tree, revoke the token and delete the dir.
 
 Public API for the tools and slash commands (P5A-4): :meth:`ClaudeRunner.start_run`,
 :meth:`~ClaudeRunner.list_runs`, :meth:`~ClaudeRunner.cancel_run`,
@@ -66,8 +70,17 @@ from resonant.loop.types import (
     Wait,
 )
 from resonant.redact import Redactor
+from resonant.runner import github_app as github_app_mod
 from resonant.runner.checks import CheckFailed, GitError
-from resonant.runner.cleanup import cleanup, delete_run_dir, watch_disk, wipe_secret_dirs
+from resonant.runner.cleanup import (
+    RUN_CODE,
+    cleanup,
+    delete_run_dir,
+    rmtree_nofollow,
+    watch_disk,
+    wipe_secret_dirs,
+)
+from resonant.runner.github_app import GitHubApp, GitHubAppError
 from resonant.runner.resolve import (
     Ambiguous,
     GhGitHub,
@@ -78,15 +91,15 @@ from resonant.runner.resolve import (
     Resolver,
 )
 from resonant.runner.workspace import (
+    CREDS_DIR,
     UPSTREAM_LATER,
-    BundleRefused,
     MergeRefused,
     NoChanges,
     Prepared,
-    PublishAborted,
     RunnerError,
     Workspace,
-    committer_env,
+    read_session_token,
+    write_session_credentials,
 )
 from resonant.runners import reaper
 from resonant.runners.reaper import MARKER_ENV, Target
@@ -103,6 +116,7 @@ from resonant.sandbox import (
 )
 from resonant.sandbox.probes import cached_self_check
 from resonant.secrets import (
+    GITHUB_APP_KEY_REF,
     RunnerSecrets,
     SecretError,
     SecretStore,
@@ -145,15 +159,33 @@ PULSE_SOURCE = "core"
 KILL_REASON = "stopped by /kill"
 CHECK_CACHE = "sandbox-check.json"
 TOOL_NAMES = ("claude", "uv")
+MAX_FIX_ATTEMPTS = 3  # CI fixes the session may push after the first push
+TOKEN_REFRESH_S = 50 * 60  # installation tokens last an hour: a fresh one after 50 minutes
+# in all: the app's three tries (each up to its own timeout) and the backoff between them
+REVOKE_TIMEOUT_S = (
+    github_app_mod.ATTEMPTS * github_app_mod.TIMEOUT_S
+    + github_app_mod.BACKOFF_S * (2**github_app_mod.ATTEMPTS - 1)
+    + 5.0
+)
 
 RUNNER_PROMPT = (
-    "You are working in a throwaway clone, on branch {branch}, which is already checked out. "
-    "Commit your work with clear messages. Do not push, do not change remotes, and do not "
-    "touch git config. End with a 1-3 line summary of what changed and anything left undone."
+    "You are working in a throwaway clone of {repo}, on branch {branch}, which is already "
+    "checked out. git and gh are set up with credentials for this repo only. Commit your work "
+    "with clear messages, then push it with `git push -u origin {branch}`. Open a pull request "
+    "against {base} with `gh pr create --base {base} --head {branch}` and a short title and "
+    "description. Then wait for CI with `gh pr checks --watch`. If CI fails, read the failing "
+    "logs (`gh run view --log-failed`), fix the problem, commit and push again; do this at most "
+    "{attempts} times. Never push to {base} or to any branch but {branch}, don't force-push, and "
+    "don't change remotes, git config or the credential files. The credentials are refreshed in "
+    "place about every 50 minutes: if gh or git fails with an authentication error, run it "
+    "again. Stop when CI is green or you are "
+    "out of attempts. End with a 1-3 line summary: what changed, the PR number, whether CI is "
+    "green, and anything left undone."
 )
 RESUME_PROMPT = (
     "Your session was interrupted. Continue the task you were given. If it is already done, "
-    "make sure the work is committed and give the closing summary."
+    "make sure the work is pushed, the pull request is open and its CI has been checked, and "
+    "give the closing summary."
 )
 
 _LIMIT = re.compile(r"usage limit|rate limit|hit your limit|limit reached", re.IGNORECASE)
@@ -169,14 +201,16 @@ class Started:
     repo: str
     max_minutes: int
     new_repo: str | None = None  # the slug, when this run registered the repo
+    warning: str | None = None  # e.g. the base branch isn't protected
 
     @property
     def text(self) -> str:
         new = f" (new repo: {self.new_repo})" if self.new_repo else ""
-        return (
+        text = (
             f"On it: {self.code} · {self.repo}{new}. Up to {self.max_minutes}m. "
             f"/runs to check, /cancel {self.code} to stop."
         )
+        return f"{text}\n{self.warning}" if self.warning else text
 
 
 @dataclass(frozen=True)
@@ -222,20 +256,27 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def reply_text(run: Run, *, no_ci: bool = False) -> str | None:
-    """The message for an ended run (None for a state that has none). ``no_ci``: the repo has
-    no pull_request workflow, so the run can't be merged from here."""
+def reply_text(run: Run, ci: str | None = None, *, no_ci: bool = False) -> str | None:
+    """The message for an ended run (None for a state that has none). ``ci`` is the PR's CI
+    as a word (``green``, ``red``, ``pending``, ``none``), looked up when the reply is sent.
+    ``no_ci``: the repo has no pull_request workflow, so the run can't be merged from here."""
     took = fmt_duration(run.session_seconds)
     summary = f"\n{run.code}: {run.summary}" if run.summary else ""
     match run.status:
         case "ready":
-            files = _plural(run.files_changed or 0, "file")
-            text = f"{run.code} done: PR #{run.pr_number} · {run.pr_url} · {files} · {took}"
+            label = "no CI" if ci == "none" else f"CI {ci or 'unknown'}"
+            text = f"{run.code} done: PR #{run.pr_number} ({label}) · {run.pr_url}"
+            if run.files_changed is not None:
+                text += f" · {_plural(run.files_changed, 'file')}"
+            text += f" · {took}"
             if run.flag_line:
                 text += f"\n{run.flag_line}"
+            if run.failure:  # the merge-time checks already refuse it
+                text += f"\n⚠ it can't be merged as it is: {run.failure}"
             if no_ci:
                 return text + f"\nno CI: {run.repo} has no pull_request workflow." + summary
-            return text + f"\n/merge {run.code} when CI is green." + summary
+            hint = "to merge it" if ci == "green" else "when CI is green"
+            return text + f"\n/merge {run.code} {hint}." + summary
         case "no_changes":
             return f"{run.code}: no changes." + (f" {run.summary}" if run.summary else "")
         case "failed":
@@ -425,6 +466,7 @@ class ClaudeRunner:
         max_runs: int = 2,
         workspace: Workspace | None = None,
         github: Callable[[RunnerSecrets], GitHub] | None = None,
+        github_app: GitHubApp | None = None,
         create_task: Callable[[NewTask], str] | None = None,
         cancel_task: Callable[[str], bool] | None = None,
         wrap: Wrap | None = None,
@@ -439,6 +481,7 @@ class ClaudeRunner:
         disk_limit_bytes: int | None = None,
         cache_limit_bytes: int | None = None,
         defer_s: float = DEFER_S,
+        refresh_s: float = TOKEN_REFRESH_S,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
@@ -446,9 +489,11 @@ class ClaudeRunner:
         default ``gh`` through the workspace). ``create_task`` inserts the run's task and wakes
         the loop (``Loop.create_task``) and
         ``cancel_task`` cancels one (``Loop.cancel``); without them the runner writes the task
-        itself and relies on its own polling. ``wrap``, ``self_check`` and ``claude_cmd`` are
-        the seams for tests; by default the Seatbelt sandbox, the cached self-probe and the
-        ``claude`` on the daemon's PATH."""
+        itself and relies on its own polling. ``github_app`` mints each run's token (by default
+        from ``runner.github_app`` and the Keychain; tests pass one with a fake endpoint) and
+        ``refresh_s`` is how long a token is used before a fresh one replaces it. ``wrap``,
+        ``self_check`` and ``claude_cmd`` are the seams for tests; by default the Seatbelt
+        sandbox, the cached self-probe and the ``claude`` on the daemon's PATH."""
         self.conn = conn
         self.cfg = runner
         self.channel = channel
@@ -458,6 +503,14 @@ class ClaudeRunner:
         self.workspace = workspace or Workspace(_with_real_git(runner), conn)
         self.resolver = Resolver(conn)
         self._github: Callable[[RunnerSecrets], GitHub] = github or self._gh_github
+        self.app = github_app or (
+            GitHubApp(runner.github_app, secrets) if runner.github_app is not None else None
+        )
+        self.refresh_s = refresh_s
+        self._tokens: dict[str, list[str]] = {}  # run code -> tokens minted and not yet revoked
+        self._spent: dict[str, list[str]] = {}  # ... and revoked ones (still redacted)
+        self._expiry: dict[str, datetime] = {}  # token -> when GitHub expires it
+        self._unrevoked: dict[str, datetime] = {}  # run code -> latest expiry of a token left live
         self._create_task = create_task or self._insert_task
         self._cancel_task = cancel_task
         self._wrap: Wrap = wrap or _sandbox_wrap
@@ -534,11 +587,29 @@ class ClaudeRunner:
             if not run.active:
                 await reaper.reap(self._target(run), grace_s=self.kill_grace_s)
                 runs.clear_process(self.conn, run.code)
+        await self._sweep_credentials()
         await asyncio.to_thread(wipe_secret_dirs, self.cfg.secrets_dir, self.cfg.mirror_dir)
         await self._reconcile()
         if self._unhook is None:
             self._unhook = killswitch.add_pause_hook(self._on_pause)
         return reaped
+
+    async def _sweep_credentials(self) -> None:
+        """Revoke and delete the token left in every ``<work_dir>/R*/creds`` (whatever state
+        its run is in: a crash can come after the row says the run ended but before the
+        token was revoked). A token minted but not yet written when the daemon died is
+        nowhere; it expires within the hour."""
+
+        def codes() -> list[str]:
+            try:
+                names = sorted(os.listdir(self.cfg.work_dir))
+            except OSError:
+                return []
+            return [n for n in names if RUN_CODE.fullmatch(n)
+                    and os.path.lexists(self.cfg.work_dir / n / CREDS_DIR)]  # fmt: skip
+
+        for code in await asyncio.to_thread(codes):
+            await self._deprovision(code)
 
     async def aclose(self) -> None:
         """Remove the kill switch hook and wait for the kills it started."""
@@ -583,7 +654,16 @@ class ClaudeRunner:
         else:
             for ref in refs:
                 missing.append(f"secret {ref}")
-                how.append(f"resonant secret set {ref.split(' ', 1)[0]}")
+                if ref == GITHUB_APP_KEY_REF:  # a multi-line PEM comes from a file
+                    how.append(
+                        f"resonant secret set {ref} --from-file <the downloaded .pem>, "
+                        "then delete the .pem"
+                    )
+                else:
+                    how.append(f"resonant secret set {ref.split(' ', 1)[0]}")
+        if self.cfg.github_app is None:
+            missing.append("runner.github_app isn't set in the config file")
+            how.append("add runner.github_app with app_id and installation_id")
         if self._claude_cmd is None and resolve_tool("claude") is None:
             missing.append("the claude CLI isn't installed")
             how.append("install Claude Code")
@@ -637,8 +717,25 @@ class ClaudeRunner:
         with atomic(self.conn):
             repo_store.touch(self.conn, found.slug)
         return Started(
-            run.code, repo, max(1, self.max_session_s // 60), found.slug if new else None
+            run.code,
+            repo,
+            max(1, self.max_session_s // 60),
+            found.slug if new else None,
+            await self._base_warning(found),
         )
+
+    async def _base_warning(self, repo: repo_store.Repo) -> str | None:
+        """A sentence for the start reply when the base branch is not protected: the session's
+        token can push to it, and a direct push skips the checks a merge runs."""
+        try:
+            secrets = await load_runner_secrets(self.secrets)
+            protected = await self.workspace.base_protected(repo.name, secrets)
+        except Exception:  # the start reply must go out whatever GitHub says
+            log.warning("base protection unknown", extra={"repo": repo.name})
+            return None
+        if protected is False:
+            return f"{repo.base} isn't protected — the session could push to it directly."
+        return None
 
     async def _resolve(self, text: str) -> tuple[repo_store.Repo, bool] | Refused:
         """The registered repo for the requester's words, and whether it is new."""
@@ -688,24 +785,30 @@ class ClaudeRunner:
         run = runs.get(self.conn, code)
         if run is None:
             return Refused(f"No run {code}.")
-        if run.status != "ready" or run.pr_number is None or run.head_sha is None:
+        if (
+            run.status != "ready"
+            or run.pr_number is None
+            or run.head_sha is None
+            or run.branch is None
+        ):
             return Refused(f"{run.code} isn't ready to merge ({run.status}).")
         try:
             secrets = await load_runner_secrets(self.secrets)
         except SecretError:
             return Refused((await self.setup_missing()) or "The runner's secrets can't be read.")
-        try:
-            await self.workspace.merge(run.repo, run.pr_number, run.head_sha, secrets)
-        except MergeRefused as e:
-            return Refused(f"{run.code} not merged: {Redactor(secrets.values()).text(str(e))}")
-        except RunnerError as e:
-            return Refused(f"{run.code} not merged: {Redactor(secrets.values()).text(str(e))}")
+        try:  # fetches the PR head and runs the checks before it merges (D10)
+            checked = await self.workspace.merge(
+                run.repo, run.pr_number, run.head_sha, secrets, branch=run.branch
+            )
+        except (MergeRefused, RunnerError, GitError) as e:
+            reason = e.message if isinstance(e, GitError) else str(e)
+            return Refused(f"{run.code} not merged: {Redactor(secrets.values()).text(reason)}")
         with atomic(self.conn):
-            runs.update(self.conn, run.code, status="merged")
+            runs.update(self.conn, run.code, status="merged", flagged_paths=checked.flagged)
             audit(self.conn, "run.merged", run=run.code, pr=run.pr_number)
         with contextlib.suppress(Exception):
             await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
-        return Merged(run.code, run.pr_number, run.flagged_paths)
+        return Merged(run.code, run.pr_number, checked.flagged)
 
     # -- the loop's entry point --
 
@@ -762,15 +865,16 @@ class ClaudeRunner:
                 if outcome is not None:
                     return outcome
                 run = self._must_get(run.code)
-            if run.step == "harvest":
-                run = await self._harvest(w, run, p)
-            if run.step == "publish":
-                run = await self._publish(w, run, p)
+            if run.step in (
+                "harvest",
+                "publish",
+            ):  # "publish" only in a run saved by an older build
+                run = await self._collect(w, run, p)
         except _Cancelled:
             return await self._conclude(self._must_get(run.code))
         except NoChanges:
             return await self._end(run, "no_changes")
-        except (RunnerError, CheckFailed, BundleRefused) as e:
+        except (RunnerError, CheckFailed) as e:
             return await self._fail(run, str(e), w.redactor)
         except GitError as e:
             return await self._fail(run, f"git failed: {e.message[-120:]}", w.redactor)
@@ -817,6 +921,10 @@ class ClaudeRunner:
                 tools[name] = found
         if (git := resolve_tool("git")) is not None:
             tools["git"] = git
+        # the session drives its own PR with gh (the configured binary, else the PATH's)
+        gh = self.cfg.gh_path if self.cfg.gh_path.exists() else resolve_tool("gh")
+        if gh is not None:
+            tools["gh"] = gh
         link_tools(params, tools)
 
     def _prepared(self, run: Run) -> Prepared:
@@ -828,6 +936,7 @@ class ClaudeRunner:
     def _params(self, run_dir: Path) -> SandboxParams:
         return SandboxParams(
             run_dir=run_dir,
+            work_dir=self.cfg.work_dir,
             cache_dir=self.cfg.cache_dir,
             secrets_dir=self.cfg.secrets_dir,
             read_paths=self._read_paths,
@@ -841,7 +950,9 @@ class ClaudeRunner:
     def _env(
         self, params: SandboxParams, marker: str, secrets: RunnerSecrets | None
     ) -> dict[str, str]:
-        """The sandbox environment: from scratch, the one allowed secret only when asked."""
+        """The sandbox environment: from scratch, the one allowed secret only when asked. The
+        run's GitHub token is not in it: ``gh`` finds it by ``GH_CONFIG_DIR`` (a path) and git
+        through the credential helper in the clone's config."""
         bins = [p for p in params.read_paths if p.name == "bin"]
         env = scratch_env(
             params,
@@ -850,6 +961,9 @@ class ClaudeRunner:
             anthropic_key=None if secrets is None else secrets.anthropic_key,
         )
         env[MARKER_ENV] = marker  # the run's session id: unique, never reused
+        env["GH_CONFIG_DIR"] = str(Path(env["HOME"]).parent / CREDS_DIR / "gh")
+        env["GH_PROMPT_DISABLED"] = "1"
+        env["GH_NO_UPDATE_NOTIFIER"] = "1"
         return env
 
     def _argv(
@@ -872,7 +986,12 @@ class ClaudeRunner:
             "--settings",
             json.dumps({"sandbox": {"enabled": False}}),
             "--append-system-prompt",
-            RUNNER_PROMPT.format(branch=p.branch),
+            RUNNER_PROMPT.format(
+                repo=self._slug(run.repo),
+                branch=p.branch,
+                base=p.base_branch,
+                attempts=MAX_FIX_ATTEMPTS,
+            ),
             "--max-turns",
             str(self.max_turns),
         ]
@@ -902,6 +1021,16 @@ class ClaudeRunner:
                 run, "the sandbox check failed, see resonant sandbox check", w.redactor
             )
         self._check_stop(run.code)
+        await self._provision(w, run, p)
+        try:
+            return await self._run_session(w, run, p, params)
+        finally:
+            # However the session ended (or the step was cancelled): the token dies with it.
+            await self._deprovision(run.code)
+
+    async def _run_session(
+        self, w: _Work, run: Run, p: Prepared, params: SandboxParams
+    ) -> StepOutcome | None:
         argv = list(
             self._wrap(
                 self._argv(run, p, params, api_billing=bool(w.secrets.anthropic_key)), params
@@ -1037,12 +1166,27 @@ class ClaudeRunner:
         began = time.monotonic()
         last_save = began
         bucket = _bucket(run.session_seconds)
+        refresh_due = began + self.refresh_s
+        refreshing: asyncio.Task[bool] | None = None
         try:
             while True:
                 done, _ = await asyncio.wait({exited}, timeout=self.poll_s)
                 if done:
                     break
                 reaper.sample(target)
+                if refreshing is not None and refreshing.done():
+                    failed = (
+                        refreshing.cancelled()
+                        or refreshing.exception() is not None
+                        or refreshing.result() is not True
+                    )
+                    refreshing = None
+                    if failed:
+                        # try again soon: the old token has ten minutes left
+                        refresh_due = time.monotonic() + min(self.refresh_s, 60.0)
+                if refreshing is None and time.monotonic() >= refresh_due:
+                    refresh_due = time.monotonic() + self.refresh_s
+                    refreshing = asyncio.create_task(self._refresh_token(w, run, p, writer))
                 used = run.session_seconds + (time.monotonic() - began)
                 if stop is None:
                     if self._stopped(run.code):
@@ -1061,6 +1205,9 @@ class ClaudeRunner:
             # Also on cancellation: nothing of the session may outlive the step.
             disk.cancel()
             cache.cancel()
+            if refreshing is not None:
+                refreshing.cancel()
+                await asyncio.wait([refreshing])
             hurry = stop == "cancelled" or sys.exc_info()[0] is not None
             await reaper.reap(target, grace_s=self.cancel_grace_s if hurry else self.kill_grace_s)
             with contextlib.suppress(Exception):
@@ -1100,7 +1247,7 @@ class ClaudeRunner:
             return await self._fail(run, f"Claude failed (exit {returncode}) {keep}", w.redactor)
         text = result.get("result")
         summary = _summary(text, w.redactor) if isinstance(text, str) else None
-        runs.update(self.conn, run.code, summary=summary, step="harvest")
+        runs.update(self.conn, run.code, summary=summary, step="harvest")  # then ``_collect``
         return None
 
     async def _timed_out(self, run: Run, w: _Work) -> StepOutcome:
@@ -1128,41 +1275,181 @@ class ClaudeRunner:
         )  # fmt: skip
         return self._must_get(run.code)
 
-    async def _harvest(self, w: _Work, run: Run, p: Prepared) -> Run:
+    async def _collect(self, w: _Work, run: Run, p: Prepared) -> Run:
+        """After the session: what it left on GitHub. The PR is found by its head branch (the
+        session's own words are not trusted for it), then checked the way a merge will check
+        it so the reply and the merge prompt can say what is in it. A PR the checks refuse
+        still makes the run ``ready``, with the reason, since the PR exists and the owner may
+        want to look at it; ``merge_run`` refuses it again."""
         self._check_stop(run.code)
-        params = self._params(p.run_dir)
-        env = self._env(params, run.session_id, None)  # no token: the harvest doesn't need one
-        env.update(committer_env())
-        await self.workspace.harvest(p, lambda argv: self._wrap(argv, params), env)
-        self._check_stop(run.code)
-        head = await self.workspace.import_bundle(p)
-        self._check_stop(run.code)
-        runs.update(self.conn, run.code, head_sha=head, step="publish")
-        return self._must_get(run.code)
-
-    async def _publish(self, w: _Work, run: Run, p: Prepared) -> Run:
-        assert run.head_sha
-        self._check_stop(run.code)
-        checked = await self.workspace.check(p, run.head_sha, w.secrets)
-        runs.update(self.conn, run.code, files_changed=checked.files,
-                    flagged_paths=checked.flagged)  # fmt: skip
-
-        async def still_ok() -> bool:
-            return not self._stopped(run.code)
-
-        try:
-            pr = await self.workspace.publish(
-                p, checked, w.secrets, ask=run.ask, summary=run.summary or "", still_ok=still_ok
+        await self._check_base_untouched(w, run, p)
+        pr = await self.workspace.find_pr(run.repo, p.branch, w.secrets)
+        if pr is None:
+            if await self.workspace.pushed_commits(p, w.secrets) == 0:
+                raise NoChanges("the session pushed nothing")
+            raise RunnerError(
+                f"the session pushed {p.branch} but opened no PR (work kept: /runs {run.code})"
             )
-        except PublishAborted:
-            raise _Cancelled from None
-        if not runs.finish(self.conn, run.code, "ready", step="reply", pr_number=pr.number,
-                           pr_url=pr.url, head_sha=checked.head_sha):  # fmt: skip
+        self._check_stop(run.code)
+        if pr.state == "MERGED":  # the session merged it itself: no check ever ran on it
+            with contextlib.suppress(ChannelError):
+                await self.channel.send(
+                    run.principal,
+                    f"⚠ {run.code}: PR #{pr.number} was already merged, not by Resonant "
+                    f"(the session did it). Look at {self._slug(run.repo)}.",
+                    dedupe_key=f"run:{run.code}:pr-merged",
+                )
+            raise RunnerError(f"PR #{pr.number} was merged by the session, not by Resonant")
+        if pr.state != "OPEN":
+            raise RunnerError(f"PR #{pr.number} is {pr.state.lower()}, not open")
+        if pr.base != p.base_branch:
+            raise RunnerError(f"PR #{pr.number} targets {pr.base}, not {p.base_branch}")
+        fields: dict[str, Any] = {"pr_number": pr.number, "pr_url": pr.url, "head_sha": pr.head_sha}
+        if pr.files is not None:
+            fields["files_changed"] = pr.files
+        refusal: str | None = None
+        try:
+            checked = await self.workspace.check_pr(
+                run.repo,
+                pr.number,
+                p.branch,
+                w.secrets,
+                expect_head=pr.head_sha,  # gitleaks:allow
+            )
+        except (CheckFailed, MergeRefused) as e:
+            refusal = _clip(w.redactor.text(str(e)), REASON_MAX)
+        except GitError as e:
+            why = f"checking the PR failed: {e.message[-120:]}"
+            refusal = _clip(w.redactor.text(why), REASON_MAX)
+        else:
+            fields.update(files_changed=checked.files, flagged_paths=checked.flagged)
+        if not runs.finish(self.conn, run.code, "ready", step="reply", failure=refusal, **fields):
             runs.update(self.conn, run.code, pr_number=pr.number, pr_url=pr.url)
-            raise _Cancelled  # cancelled just after the PR was opened
+            raise _Cancelled  # cancelled just now: the reply says its PR is open
         with atomic(self.conn):
             audit(self.conn, "run.ready", run=run.code, pr=pr.number)
         return self._must_get(run.code)
+
+    async def _check_base_untouched(self, w: _Work, run: Run, p: Prepared) -> None:
+        """A push (or PR merge) straight onto the base branch skips every check a merge runs
+        (the base is already live, and the checks only look at what the PR adds). Protection
+        should stop it, but a ruleset the app can bypass would not, so the activity feed is
+        always asked whether the app's bot put anything on the base during the run. If it did,
+        the run fails, the owner is told at once and it is never merged. If the feed can't be
+        read the run fails too: it can't be shown clean."""
+        if self.app is None:
+            return
+        try:
+            bot = await self.app.bot_login()
+        except GitHubAppError as e:
+            raise RunnerError(f"couldn't check {p.base_branch} for direct pushes: {e}") from None
+        since = (run.started_at or run.created_at) - timedelta(minutes=1)
+        shas = await self.workspace.base_pushes(run.repo, w.secrets, actor=bot, since=since)
+        if not shas:
+            return
+        short = ", ".join(sha[:7] for sha in shas[:5])
+        with atomic(self.conn):
+            audit(self.conn, "run.base_push", run=run.code, base=p.base_branch, shas=short)
+        with contextlib.suppress(ChannelError):
+            await self.channel.send(
+                run.principal,
+                f"⚠ {run.code} pushed directly to {p.base_branch}: {short}. "
+                f"Look at {self._slug(run.repo)} now; this run will not be merged.",
+                dedupe_key=f"run:{run.code}:base-push",
+            )
+        raise RunnerError(f"pushed directly to {p.base_branch} ({short}); not merged")
+
+    # -- the session's GitHub token --
+
+    def _slug(self, repo_name: str) -> str:
+        repo = repo_store.find(self.conn, repo_name)
+        if repo is None:
+            raise RunnerError(f"{repo_name} isn't a registered repo")
+        return repo.slug
+
+    def _redactor(self, w: _Work, code: str) -> Redactor:
+        return Redactor(
+            [*w.secrets.values(), *self._tokens.get(code, ()), *self._spent.get(code, ())]
+        )
+
+    async def _mint(self, run: Run) -> str:
+        """A new token for the run's repo, remembered so it is revoked at the end."""
+        repo = repo_store.find(self.conn, run.repo)
+        if repo is None:
+            raise RunnerError(f"{run.repo} isn't a registered repo")
+        if self.app is None:
+            raise RunnerError("the runner isn't set up: runner.github_app isn't in the config")
+        try:
+            minted = await self.app.mint(
+                repo.slug.partition("/")[2], workflows=repo.allow_github_changes
+            )
+        except GitHubAppError as e:
+            raise RunnerError(str(e)) from None
+        self._tokens.setdefault(run.code, []).append(minted.token)
+        self._expiry[minted.token] = minted.expires() or self.clock() + timedelta(hours=1)
+        return minted.token
+
+    async def _provision(self, w: _Work, run: Run, p: Prepared) -> None:
+        """Mint the session's token and put it in the run's ``creds`` dir (git's helper and
+        gh's hosts.yml read it there). A token an earlier, crashed session left is revoked
+        first."""
+        await self._deprovision(run.code, remove_dir=False)
+        token = await self._mint(run)
+        w.redactor = self._redactor(w, run.code)
+        await _finish_thread(write_session_credentials, p.run_dir, token)
+
+    async def _refresh_token(
+        self, w: _Work, run: Run, p: Prepared, writer: TranscriptWriter
+    ) -> bool:
+        """A fresh token over the same files, for a session that has run for most of an hour.
+        The old one is revoked at once, so only the newest is ever on disk (a crash leaves
+        one token to find, not two). A gh or git call already running with the old token
+        fails once; the prompt tells the session to run it again."""
+        try:
+            token = await self._mint(run)
+            w.redactor = writer.redactor = self._redactor(w, run.code)
+            await _finish_thread(write_session_credentials, p.run_dir, token)
+            old = [t for t in self._tokens.get(run.code, []) if t != token]
+            self._tokens[run.code] = [token]
+            self._spent.setdefault(run.code, []).extend(old)
+            for t in old:
+                await self._revoke(run.code, t)
+        except RunnerError as e:
+            log.warning("run token refresh failed", extra={"run": run.code, "reason": str(e)})
+            with contextlib.suppress(Exception), atomic(self.conn):
+                audit(self.conn, "run.token_refresh_failed", run=run.code, reason=str(e)[:200])
+            return False
+        return True
+
+    async def _deprovision(self, code: str, *, remove_dir: bool = True) -> None:
+        """Revoke every token minted for the run (and the one on disk, which a crash may have
+        left) and remove the ``creds`` dir. Best effort and safe to repeat; a token that
+        can't be revoked is noted for the reply and expires within the hour anyway."""
+        run_dir = self.cfg.work_dir / code
+        tokens = self._tokens.pop(code, [])
+        on_disk = await asyncio.to_thread(read_session_token, run_dir)
+        if on_disk is not None and on_disk not in tokens:
+            tokens.append(on_disk)
+        for token in tokens:
+            await self._revoke(code, token)
+        if remove_dir:
+            self._spent.pop(code, None)
+            with contextlib.suppress(Exception):
+                await _finish_thread(rmtree_nofollow, run_dir / CREDS_DIR)
+
+    async def _revoke(self, code: str, token: str) -> None:
+        """Revoke one token (the app tries three times). On failure remember when it expires,
+        for the reply: ``R3 done … token not revoked, expires 14:05``."""
+        expiry = self._expiry.pop(token, None) or self.clock() + timedelta(hours=1)
+        if self.app is None:
+            return
+        try:
+            await asyncio.wait_for(self.app.revoke(token), REVOKE_TIMEOUT_S)
+        except (GitHubAppError, TimeoutError) as e:
+            log.warning("couldn't revoke a run's token", extra={"run": code, "reason": str(e)})
+            self._unrevoked[code] = max(expiry, self._unrevoked.get(code, expiry))
+            with contextlib.suppress(Exception), atomic(self.conn):
+                audit(self.conn, "run.token_revoke_failed", run=code)
 
     # -- ending a run --
 
@@ -1185,6 +1472,7 @@ class ClaudeRunner:
             await self._finish_cancelled(run.code, send=False)
         else:
             self._pulse_clear(run)
+            await self._deprovision(run.code)
         try:
             await self._send_reply(run)
         except ChannelError as e:
@@ -1193,9 +1481,25 @@ class ClaudeRunner:
             return Fail(run.failure or "failed")
         return Done({"run": run.code, "status": run.status})
 
+    async def _ci_word(self, run: Run) -> str | None:
+        """The PR's CI as a word for the reply; None when it can't be read."""
+        if run.status != "ready" or run.pr_number is None:
+            return None
+        try:
+            secrets = await load_runner_secrets(self.secrets)
+            state = await self.workspace.ci_state(run.repo, run.pr_number, secrets)
+        except Exception:  # a reply must go out whatever gh or the Keychain say
+            log.warning("CI state unavailable for the reply", extra={"run": run.code})
+            return None
+        return None if state == "error" else state
+
     async def _send_reply(self, run: Run) -> None:
         repo = repo_store.find(self.conn, run.repo)
-        text = reply_text(run, no_ci=repo is not None and repo.mode == "push" and repo.ci is False)
+        no_ci = repo is not None and repo.mode == "push" and repo.ci is False
+        text = reply_text(run, await self._ci_word(run), no_ci=no_ci)
+        if text is not None and (expires := self._unrevoked.pop(run.code, None)) is not None:
+            at = expires.astimezone(self.tz).strftime("%H:%M")
+            text += f"\n⚠ the run's GitHub token wasn't revoked; it expires at {at}."
         if text is None:
             return
         try:
@@ -1212,6 +1516,7 @@ class ClaudeRunner:
             # still going) by marker and cwd: nothing may outlive the dir deleted below.
             target = self._live.get(code) or self._target(run)
             await reaper.reap(target, grace_s=self.cancel_grace_s)
+            await self._deprovision(code)
             with contextlib.suppress(Exception):
                 # two deletes of one tree would trip over each other, hence the lock
                 await _finish_thread(delete_run_dir, self.cfg.work_dir, code)

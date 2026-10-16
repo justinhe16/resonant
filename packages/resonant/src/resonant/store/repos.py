@@ -140,11 +140,13 @@ def add(
     aliases: Iterable[str] = (),
     mode: Mode = "push",
     ci: bool | None = None,
-    allow_github_changes: bool = False,
+    allow_github_changes: bool = True,
     quote_ask: bool | None = None,
 ) -> Repo:
     """Register ``owner/name``. ``name`` defaults to a free handle derived from the slug;
-    ``quote_ask`` defaults to off for ``fork`` repos (a public ask shouldn't show). Raises
+    ``quote_ask`` defaults to off for ``fork`` repos (a public ask shouldn't show).
+    ``allow_github_changes`` defaults to on (docs/repos-plan.md D10): the session's token has
+    Workflows, and the changes are listed in the merge prompt instead of refused. Raises
     :class:`RepoConflict` when the slug, name or an alias is taken."""
     if not SLUG.fullmatch(slug) or {".", ".."} & set(slug.split("/")):
         raise ValueError(f"{slug!r} isn't owner/name")

@@ -453,3 +453,122 @@ def test_scratch_env_is_non_interactive(tmp_path: Path) -> None:
     env = scratch_env(params_in(tmp_path))
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
+# --- other runs' dirs, wherever the work dir sits (docs/repos-plan.md D10) ------------------------
+
+
+def test_render_denies_the_work_dir_except_the_runs_own_paths(tmp_path: Path) -> None:
+    tools = tmp_path / "work" / "tools"
+    tools.mkdir(parents=True)
+    params = SandboxParams(
+        run_dir=tmp_path / "work" / "R1",
+        work_dir=tmp_path / "work",
+        cache_dir=tmp_path / "work" / ".cache",
+        secrets_dir=tmp_path / "secrets",
+        home=tmp_path / "home",
+        read_paths=(tools,),
+    )
+    text, defs = render(params)
+    assert defs["WORK"] == os.path.realpath(tmp_path / "work")
+    start = text.index('(subpath (param "WORK"))')
+    rule = text[start : text.index("secret files: denied", start)]
+    for key in ("RUN", "CACHE", "READ_0"):
+        assert f'(subpath (param "{key}"))' in rule
+    assert '(literal (param "META_0"))' in rule  # stat on the ancestors still works
+    assert text.rindex("(allow ") < start  # after every allow: last match wins
+    # the default is the run dir's parent; a run dir outside the work dir is refused
+    default = SandboxParams(
+        run_dir=tmp_path / "w2" / "R1", cache_dir=tmp_path / "c", secrets_dir=tmp_path / "s"
+    ).resolved()
+    assert default.work_dir == Path(os.path.realpath(tmp_path / "w2"))
+    with pytest.raises(SandboxError, match="inside the work dir"):
+        SandboxParams(
+            run_dir=tmp_path / "elsewhere" / "R1",
+            work_dir=tmp_path / "work",
+            cache_dir=tmp_path / "c",
+            secrets_dir=tmp_path / "s",
+        ).resolved()
+
+
+def _outside_home_work_dir() -> Path:
+    import tempfile
+
+    # /private/var/tmp is outside every read deny of the template
+    return Path(os.path.realpath(tempfile.mkdtemp(prefix="resonant-work-", dir="/private/var/tmp")))
+
+
+@on_mac
+def test_a_run_cannot_read_another_runs_dir_with_the_work_dir_outside_home(
+    tmp_path: Path,
+) -> None:
+    """Only the WORK rule keeps ``<work>/R2/creds/token`` away from run R1 here. The cache
+    inside the work dir stays usable."""
+    import shutil
+
+    work = _outside_home_work_dir()
+    try:
+        for code in ("R1", "R2"):
+            (work / code / "creds").mkdir(parents=True)
+            (work / code / "creds" / "token").write_text(f"ghs_{code}\n")
+            (work / code / "repo").mkdir()
+        (work / ".cache").mkdir()
+        (work / ".cache" / "pkg.txt").write_text("cached")
+        home = tmp_path / "home"
+        home.mkdir(exist_ok=True)
+        interp = os.path.realpath(getattr(sys, "_base_executable", sys.executable))
+        params = SandboxParams(
+            run_dir=work / "R1",
+            work_dir=work,
+            cache_dir=work / ".cache",
+            secrets_dir=tmp_path / "secrets",
+            home=home,
+            read_paths=(Path(sys.base_prefix), Path(interp).parent),
+        )
+        code = (
+            "import json,os,sys\n"
+            "r={}\n"
+            "for p in sys.argv[1:]:\n"
+            "    try:\n"
+            "        d=os.path.isdir(p)\n"
+            "        r[p]='ok:'+(os.listdir(p)[0] if d else open(p).read().strip())\n"
+            "    except OSError as e: r[p]='errno:%d'%e.errno\n"
+            "r['cwd']=os.path.realpath(os.getcwd())\n"
+            "print(json.dumps(r))\n"
+        )
+        paths = [
+            str(work / "R1" / "creds" / "token"),
+            str(work / ".cache" / "pkg.txt"),
+            str(work / "R2" / "creds" / "token"),
+            str(work / "R2" / "creds"),
+            str(work / "R2"),
+        ]
+        proc = subprocess.run(
+            wrap([interp, "-I", "-c", code, *paths], params),
+            cwd=work / "R1" / "repo",
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        got = json.loads(proc.stdout)
+        assert got[paths[0]] == "ok:ghs_R1" and got[paths[1]] == "ok:cached"
+        assert got[paths[2]] == got[paths[3]] == got[paths[4]] == "errno:1"
+        assert got["cwd"] == str(work / "R1" / "repo")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@on_mac
+def test_probes_pass_with_the_work_dir_outside_home(tmp_path: Path) -> None:
+    import shutil
+
+    work = _outside_home_work_dir()
+    try:
+        with probe_context(secrets_dir=tmp_path / "secrets", work_dir=work) as c:
+            res = {r.name: r for r in run_probes(c, ("ci",))}
+        mine = res["work dir and sibling run dirs"]
+        assert mine.status == "pass", mine.detail
+        failed = [f"{r.name}: {r.detail}" for r in res.values() if r.status == "fail"]
+        assert not failed
+    finally:
+        shutil.rmtree(work, ignore_errors=True)

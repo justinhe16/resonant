@@ -535,10 +535,11 @@ def test_runner_rows_report_names_only(resonant_home: Path) -> None:
     check = _load_helper()
     settings = load_settings(
         runner={
+            "github_app": {"app_id": 123, "installation_id": 456},
             "repos": {
                 "demo": {"remote": "github.com/o/demo"},
                 "old": {"remote": "github.com/o/old"},
-            }
+            },
         }
     )
     keychain = FakeKeychain(items={"runner/github_token": "ghp_" + "a" * 36})
@@ -559,6 +560,16 @@ def test_runner_rows_report_names_only(resonant_home: Path) -> None:
     assert rows["runs table"][:2] == ("PASS", False)
     assert rows["runner repos"][3] == "2: demo, old"
     assert rows["runner secret runner/github_token"][0] == "PASS"
+    for owner_step in (
+        "runner gh pr create with an installation token",
+        "runner gh pr checks --watch with an installation token",
+        "runner base branch protection",
+    ):
+        assert rows[owner_step][:2] == ("SKIP", False) and "owner step" in rows[owner_step][3]
+    assert rows["runner github app"][:2] == ("PASS", False)
+    assert rows["runner github app"][3] == "app 123, installation 456"
+    key = rows["runner secret runner/github_app_key"]
+    assert key[0] == "FAIL" and "secret set runner/github_app_key --from-file" in key[3]
     claude = rows["runner secret runner/claude_token (or runner/anthropic_key)"]
     assert claude[0] == "FAIL" and "claude setup-token" in claude[3]
     assert rows["runner repo demo has CI"][0] == "PASS"
@@ -566,10 +577,12 @@ def test_runner_rows_report_names_only(resonant_home: Path) -> None:
     assert all(not r[1] for r in rows.values())  # advisory
     assert keychain.calls and all("-w" not in c.argv for c in keychain.calls)
     # old schema, no repos, no mirror yet
-    assert check.runner_rows(load_settings(), 5, exists)[:2] == [
+    old = check.runner_rows(load_settings(), 5, exists)
+    assert old[:2] == [
         ("FAIL", False, "runs table", "schema v5, need 6"),
         ("SKIP", False, "runner repos", "none in runner.repos (step 14)"),
     ]
+    assert old[2][:3] == ("FAIL", False, "runner github app")  # no runner.github_app
     none = check.runner_rows(settings, 6, exists, no_mirror)
     assert [r[0] for r in none if r[2].endswith("has CI")] == ["SKIP", "SKIP"]
 

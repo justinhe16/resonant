@@ -25,9 +25,15 @@ from typing import Any, cast
 
 import psutil
 import pytest
+from github_app_fakes import (
+    APP_ID,
+    INSTALLATION_ID,
+    FakeGitHubApi,
+    private_pem_one_line,
+)
 
 from resonant import killswitch
-from resonant.config import LoopConfig, RunnerConfig, RunnerRepo
+from resonant.config import GitHubAppConfig, LoopConfig, RunnerConfig, RunnerRepo
 from resonant.gateway.channel import (
     ApprovalPrompt,
     Channel,
@@ -39,6 +45,7 @@ from resonant.gateway.channel import (
 from resonant.loop import Loop, SlotPool
 from resonant.redact import Redactor
 from resonant.runner.cleanup import dir_size
+from resonant.runner.github_app import GitHubApp
 from resonant.runner.resolve import FakeGitHub, RepoInfo
 from resonant.runner.workspace import Workspace
 from resonant.runners import claude as claude_mod
@@ -60,6 +67,7 @@ from resonant.sandbox import SandboxParams
 from resonant.secrets import (
     ANTHROPIC_KEY_REF,
     CLAUDE_TOKEN_REF,
+    GITHUB_APP_KEY_REF,
     GITHUB_TOKEN_REF,
     FakeKeychain,
     RunnerSecrets,
@@ -85,14 +93,24 @@ GIT_ENV = {
     "GIT_COMMITTER_EMAIL": "t@example.com",
 }
 
-# A gh that tells PRs apart by branch, so several runs can open one each.
+# A gh that tells PRs apart by branch, so several runs can open one each. It answers the
+# session (pr create, pr checks --watch) and the daemon (pr list, pr view, pr checks, pr merge)
+# and records who called with which hosts.yml token.
 FAKE_GH = """#!@PY@
-import json, os, sys
+import json, os, subprocess, sys
 d = "@STATE@"
 args = sys.argv[1:]
 stdin = sys.stdin.read() if "--body-file" in args else ""
+conf = os.environ.get("GH_CONFIG_DIR", "")
+hosts = os.path.join(conf, "hosts.yml")
+hosts_token = None
+if os.path.exists(hosts):
+    for line in open(hosts):
+        if "oauth_token:" in line:
+            hosts_token = line.split(":", 1)[1].strip()
 with open(os.path.join(d, "calls.jsonl"), "a") as f:
-    f.write(json.dumps({"argv": args, "stdin": stdin}) + "\\n")
+    f.write(json.dumps({"argv": args, "stdin": stdin, "config_dir": conf,
+                        "hosts_token": hosts_token, "env": sorted(os.environ)}) + "\\n")
 path = os.path.join(d, "prs.json")
 prs = json.load(open(path)) if os.path.exists(path) else []
 def opt(name):
@@ -100,18 +118,53 @@ def opt(name):
 def rc(name):
     p = os.path.join(d, name)
     return int(open(p).read()) if os.path.exists(p) else 0
+def keep(pr, keys):
+    return {k: pr[k] for k in keys.split(",") if k in pr}
 if args[:2] == ["pr", "list"]:
-    print(json.dumps([p for p in prs if p["head"] == opt("--head")]))
+    print(json.dumps([keep(p, opt("--json")) for p in prs if p["headRefName"] == opt("--head")]))
 elif args[:2] == ["pr", "create"]:
     n = len(prs) + 41
-    url = "https://github.com/" + opt("--repo") + "/pull/" + str(n)
-    prs.append({"number": n, "url": url, "head": opt("--head")})
+    def git(*a):
+        return subprocess.run(["git", *a], capture_output=True, text=True).stdout.strip()
+    # the clone's origin is a local path <name>.git here; GitHub's would be owner/name
+    origin = os.path.basename(git("remote", "get-url", "origin")).removesuffix(".git")
+    slug = opt("--repo") if "--repo" in args else "own/" + origin
+    url = "https://github.com/" + slug + "/pull/" + str(n)
+    sha = git("rev-parse", "HEAD")
+    prs.append({"number": n, "url": url, "headRefName": opt("--head"), "headRefOid": sha,
+                "baseRefName": opt("--base"), "state": "OPEN", "isCrossRepository": False,
+                "title": opt("--title"), "body": opt("--body") if "--body" in args else ""})
     json.dump(prs, open(path, "w"))
     print(url)
+elif args[:2] == ["pr", "view"]:
+    pr = [p for p in prs if p["number"] == int(args[2])]
+    if not pr:
+        sys.exit(1)
+    print(json.dumps(keep(pr[0], opt("--json"))))
 elif args[:2] == ["pr", "checks"]:
+    if "--watch" in args:  # the session pushed more commits: GitHub moves the PR's head
+        run = lambda *a: subprocess.run(["git", *a], capture_output=True, text=True).stdout.strip()
+        branch, sha = run("rev-parse", "--abbrev-ref", "HEAD"), run("rev-parse", "HEAD")
+        for pr in prs:
+            if pr["headRefName"] == branch:
+                pr["headRefOid"] = sha
+        json.dump(prs, open(path, "w"))
+    err = os.path.join(d, "checks_err")
+    if os.path.exists(err):
+        print(open(err).read(), file=sys.stderr)
     sys.exit(rc("checks_rc"))
 elif args[:2] == ["pr", "merge"]:
     sys.exit(rc("merge_rc"))
+elif args[:1] == ["api"]:
+    def text(name, default):
+        p = os.path.join(d, name)
+        return open(p).read().strip() if os.path.exists(p) else default
+    if "/branches/" in args[1]:  # protected unless a test says otherwise
+        print(json.dumps({"protected": text("protected", "true") == "true"}))
+    elif "/activity" in args[1]:
+        if rc("activity_rc"):
+            sys.exit(rc("activity_rc"))
+        print(text("activity.json", "[]"))
 """
 
 
@@ -197,6 +250,8 @@ class Harness:
     runner: ClaudeRunner
     remotes: dict[str, Path]
     gh_dir: Path
+    api: FakeGitHubApi
+    app: GitHubApp
     extra: list[Any] = field(default_factory=list[Any])
 
     def code_dir(self, code: str) -> Path:
@@ -224,7 +279,18 @@ class Harness:
     def gh_calls(self, verb: str | None = None) -> list[dict[str, Any]]:
         path = self.gh_dir / "calls.jsonl"
         calls = [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+        if verb == "api":
+            return [c for c in calls if c["argv"][0] == "api"]
+        calls = [c for c in calls if c["argv"][0] != "api"]  # branch and activity lookups
         return [c for c in calls if verb is None or c["argv"][:2] == ["pr", verb]]
+
+    def session_tools(self, code: str = "R1") -> list[dict[str, Any]]:
+        """What the fake session ran (git, gh): argv, exit code, stderr tail."""
+        return json.loads((self.tmp(code) / "tools.json").read_text())
+
+    def prs(self) -> list[dict[str, Any]]:
+        path = self.gh_dir / "prs.json"
+        return json.loads(path.read_text()) if path.exists() else []
 
     async def start(self, repo: str = "proj", ask: str = "fix the flaky test") -> str:
         res = await self.runner.start_run(repo, ask, "owner")
@@ -311,6 +377,7 @@ def build(
     gh.chmod(0o755)
     cfg = RunnerConfig(
         repos={name: RunnerRepo(remote=f"github.com/own/{name}") for name in repos},
+        github_app=GitHubAppConfig(app_id=APP_ID, installation_id=INSTALLATION_ID),
         work_dir=root / "runs",
         mirror_dir=root / "state" / "mirrors",
         cache_dir=root / "runs" / ".cache",
@@ -327,6 +394,10 @@ def build(
     if secrets:
         keychain.items[GITHUB_TOKEN_REF] = GH_TOKEN
         keychain.items[CLAUDE_TOKEN_REF] = CLAUDE_TOKEN
+        keychain.items[GITHUB_APP_KEY_REF] = private_pem_one_line()
+    api = FakeGitHubApi()
+    assert cfg.github_app is not None
+    app = GitHubApp(cfg.github_app, SecretStore(keychain), transport=api.transport(), backoff_s=0)
 
     def github_for(_secrets: RunnerSecrets) -> FakeGitHub:
         return fake_github
@@ -338,6 +409,7 @@ def build(
         "secrets": SecretStore(keychain),
         "workspace": ws,
         "github": github_for,
+        "github_app": app,
         "create_task": loop.create_task,
         "cancel_task": loop.cancel,
         "wrap": identity_wrap,
@@ -351,7 +423,7 @@ def build(
     }
     runner = ClaudeRunner(conn, **options)
     loop.runners[runner.name] = runner
-    return Harness(root, conn, cfg, ws, chan, keychain, loop, runner, remotes, gh_dir)
+    return Harness(root, conn, cfg, ws, chan, keychain, loop, runner, remotes, gh_dir, api, app)
 
 
 @pytest.fixture
@@ -394,16 +466,23 @@ async def test_happy_path_ends_in_a_pr(h: Harness) -> None:
     assert run.summary == "Fixed it. Added claude-fix.txt."
     [(who, text)] = h.chan.sent
     assert who == "owner"
-    assert text.startswith("R1 done: PR #41 · https://github.com/own/proj/pull/41 · 1 file · ")
+    assert text.startswith(
+        "R1 done: PR #41 (CI green) · https://github.com/own/proj/pull/41 · 1 file · "
+    )
     assert "/merge R1" in text and "R1: Fixed it" in text
     assert "⚠" not in text
     task = task_store.get_task(h.conn, cast(str, run.task_id))
     assert task is not None and task.status == "done" and task.kind == "run"
     assert task.claude_session_id == run.session_id and task.worktree_path == str(h.code_dir("R1"))
-    # the PR's commit is the fake's
+    # the session pushed the branch and opened the PR itself; the daemon only looked
     assert (
         git(h.remotes["proj"], "log", "-1", "--format=%s", run.branch or "") == "Fix the flaky test"
     )
+    assert [c["argv"][:2] for c in h.gh_calls() if c["hosts_token"] != GH_TOKEN] == [
+        ["pr", "create"],
+        ["pr", "checks"],
+    ]
+    assert run.head_sha == h.prs()[0]["headRefOid"]
 
 
 async def test_session_flags_environment_and_prompt(h: Harness) -> None:
@@ -437,6 +516,7 @@ async def test_session_flags_environment_and_prompt(h: Harness) -> None:
 async def test_api_key_billing_sets_the_budget_flag(tmp_path: Path, db: sqlite3.Connection) -> None:
     h = build(tmp_path, db, secrets=False)
     h.keychain.items[GITHUB_TOKEN_REF] = GH_TOKEN
+    h.keychain.items[GITHUB_APP_KEY_REF] = private_pem_one_line()
     h.keychain.items[ANTHROPIC_KEY_REF] = "sk-ant-api03-" + "Q" * 40
     cfg = h.cfg.model_copy(update={"max_budget_usd": 3.5})
     h.runner.cfg = cfg
@@ -463,6 +543,7 @@ async def test_no_changes_ends_without_a_pr(tmp_path: Path, db: sqlite3.Connecti
     assert h.run().status == "no_changes"
     assert h.chan.texts() == ["R1: no changes. Nothing to change."]
     assert h.gh_calls("create") == [] and h.branches() == ["main"]
+    assert h.api.live == set()  # the token died with the session
     task = task_store.get_task(h.conn, cast(str, h.run().task_id))
     assert task is not None and task.status == "done"
 
@@ -474,7 +555,6 @@ async def test_flagged_paths_are_in_the_reply(tmp_path: Path, db: sqlite3.Connec
     run = h.run()
     assert run.status == "ready" and run.flagged_paths == (".claude/settings.json", "Makefile")
     assert "⚠ changes .claude/settings.json, Makefile" in h.chan.texts()[0]
-    assert "changes" in h.gh_calls("create")[0]["stdin"]  # the PR body lists them too
 
 
 # --- refusals and failures -----------------------------------------------------------------
@@ -657,19 +737,26 @@ async def test_the_disk_watchdog_kills_the_run(tmp_path: Path, db: sqlite3.Conne
 async def test_checks_refuse_a_github_change_and_tokens(
     tmp_path: Path, db: sqlite3.Connection
 ) -> None:
+    # The session pushed and opened the PR already; the pre-merge checks say it can't merge.
     h = build(tmp_path, db, scenario="github")
     await h.start()
     await h.drain()
     run = h.run()
-    assert run.status == "failed" and ".github" in (run.failure or "")
-    assert h.branches() == ["main"] and h.gh_calls("create") == []
+    assert run.status == "ready" and ".github" in (run.failure or "")
+    assert run.pr_number == 41 and run.branch in h.branches()
+    assert "⚠ it can't be merged as it is" in h.chan.texts()[0]
+    res = await h.runner.merge_run("R1")
+    assert isinstance(res, Refused) and ".github" in res.reason
+    assert h.gh_calls("merge") == [] and h.run().status == "ready"
 
     h2 = build(tmp_path / "two", db, scenario="tokens", extra=["--leak", GH_TOKEN])
     code = await h2.start()
     await h2.drain()
     run = h2.run(code)
-    assert run.status == "failed" and GH_TOKEN not in (run.failure or "")
-    assert h2.branches() == ["main"]
+    assert run.status == "ready" and GH_TOKEN not in (run.failure or "")
+    assert "a token appears" in (run.failure or "")
+    res = await h2.runner.merge_run(code)
+    assert isinstance(res, Refused) and GH_TOKEN not in res.reason and h2.gh_calls("merge") == []
 
 
 # --- steps, resume and crash ----------------------------------------------------------------
@@ -693,7 +780,11 @@ async def test_a_crash_mid_session_reaps_then_resumes_the_same_session(
     async def no_reap(*a: Any, **k: Any) -> int:
         return 0
 
+    async def no_deprovision(*a: Any, **k: Any) -> None:  # kill -9 revokes nothing
+        return None
+
     monkeypatch.setattr(reaper, "reap", no_reap)
+    monkeypatch.setattr(h.runner, "_deprovision", no_deprovision)
     first.cancel()
     inflight = list(h.loop._inflight.values())  # pyright: ignore[reportPrivateUsage]
     for t in inflight:
@@ -721,9 +812,13 @@ async def test_a_crash_mid_session_reaps_then_resumes_the_same_session(
         claude_cmd=[sys.executable, str(FAKE), "--scenario", "hang_then_ok"],
         poll_s=0.05,
         kill_grace_s=0.5,
+        github_app=h.app,
     )
     loop2.runners[runner2.name] = runner2
+    first_token = h.api.tokens[0]
+    assert h.api.live == {first_token}  # the crashed daemon never revoked it
     assert await runner2.start() == 1
+    assert first_token in h.api.revoked and h.api.live == set()  # the new daemon did
     await until(lambda: not live(old_pid), 5, "the old session to be reaped")
     reaped = h.run(code)
     assert reaped.pgid is None and reaped.attempts == 1 and reaped.step == "session"
@@ -740,6 +835,7 @@ async def test_a_crash_mid_session_reaps_then_resumes_the_same_session(
     assert "Your session was interrupted" in calls[1]["prompt"]
     assert len(h.gh_calls("create")) == 1  # one PR, not two
     assert final.sessions == 2 and not live(old_pid)
+    assert len(h.api.tokens) == 2 and h.api.live == set()  # a fresh token for the resumed session
 
 
 async def test_two_crashes_fail_the_run(tmp_path: Path, db: sqlite3.Connection) -> None:
@@ -753,22 +849,22 @@ async def test_two_crashes_fail_the_run(tmp_path: Path, db: sqlite3.Connection) 
 
 
 async def test_resume_continues_at_the_saved_step(tmp_path: Path, db: sqlite3.Connection) -> None:
-    """A step that already ran is not run again: harvest + publish pick up from the row."""
+    """A step that already ran is not run again: finding the PR picks up from the row."""
     h = build(tmp_path, db)
     code = await h.start()
-    real_publish = h.ws.publish
+    real_find = h.ws.find_pr
     crashed = False
 
-    async def publish_once_then_crash(*a: Any, **k: Any) -> Any:
+    async def find_once_then_crash(*a: Any, **k: Any) -> Any:
         nonlocal crashed
         if not crashed:
             crashed = True
             raise RuntimeError("daemon went away")
-        return await real_publish(*a, **k)
+        return await real_find(*a, **k)
 
-    h.ws.publish = publish_once_then_crash  # type: ignore[method-assign]
+    h.ws.find_pr = find_once_then_crash  # type: ignore[method-assign]
     await h.drain()
-    # the loop retried the step; the session ran once, publish twice
+    # the loop retried the step; the session ran once, the PR lookup twice
     assert len(h.argv_log(code)) == 1
     assert h.run(code).status == "ready" and len(h.gh_calls("create")) == 1
 
@@ -1052,18 +1148,13 @@ async def test_cancel_with_polling_only(tmp_path: Path, db: sqlite3.Connection) 
     assert not live(pid) and h.run(code).status == "cancelled" and not h.code_dir(code).exists()
 
 
-@pytest.mark.parametrize("phase", ["prepare", "harvest", "import", "check"])
-async def test_cancel_at_each_step_publishes_nothing(
+@pytest.mark.parametrize("phase", ["prepare", "find", "check"])
+async def test_cancel_at_each_step_ends_the_run(
     tmp_path: Path, db: sqlite3.Connection, phase: str
 ) -> None:
     h = build(tmp_path, db)
     code = await h.start()
-    target = {
-        "prepare": "prepare",
-        "harvest": "harvest",
-        "import": "import_bundle",
-        "check": "check",
-    }[phase]
+    target = {"prepare": "prepare", "find": "find_pr", "check": "check_pr"}[phase]
     real = getattr(h.ws, target)
 
     async def cancel_then(*a: Any, **k: Any) -> Any:
@@ -1075,31 +1166,15 @@ async def test_cancel_at_each_step_publishes_nothing(
     await h.drain()
     run = h.run(code)
     assert run.status == "cancelled"
-    assert h.branches() == ["main"] and h.gh_calls("create") == []
     assert not h.code_dir(code).exists()
-    assert h.chan.texts() == ["R1 cancelled."]
+    assert h.chan.texts()[0].startswith("R1 cancelled.")
     assert h.processes_of(code) == []
-
-
-async def test_cancel_between_push_and_pr_opens_no_pr(h: Harness) -> None:
-    code = await h.start()
-    real = h.ws._gh  # pyright: ignore[reportPrivateUsage]
-    cancelled = False
-
-    async def gh(args: Sequence[str], secrets: Any, **k: Any) -> Any:
-        nonlocal cancelled
-        if args[:2] == ["pr", "list"] and not cancelled:
-            cancelled = True
-            await h.runner.cancel_run(code)  # after the push, before the PR
-        return await real(args, secrets, **k)
-
-    h.ws._gh = gh  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
-    await h.drain()
-    run = h.run(code)
-    assert run.status == "cancelled"
-    assert h.run(code).branch in h.branches()  # the push happened
-    assert h.gh_calls("create") == []  # but there is no PR
-    assert h.chan.texts() == ["R1 cancelled."]
+    assert h.api.live == set()
+    if phase == "prepare":  # no session ran: nothing was pushed
+        assert h.branches() == ["main"] and h.gh_calls("create") == []
+        assert h.api.tokens == []
+    else:  # the session had already pushed and opened its PR; it stays on GitHub
+        assert h.gh_calls("merge") == []
 
 
 # --- the kill switch --------------------------------------------------------------------------
@@ -1148,20 +1223,20 @@ async def test_a_pause_set_elsewhere_is_noticed_by_the_watcher(
     assert not live(pid) and h.run(code).status == "cancelled" and h.gh_calls() == []
 
 
-async def test_pause_before_publish_stops_the_publish(h: Harness) -> None:
+async def test_pause_while_checking_the_pr_ends_the_run(h: Harness) -> None:
     code = await h.start()
-    real = h.ws.check
+    real = h.ws.check_pr
 
     async def check_then_kill(*a: Any, **k: Any) -> Any:
         out = await real(*a, **k)
         killswitch.engage(h.conn, actor="owner")
         return out
 
-    h.ws.check = check_then_kill  # type: ignore[method-assign]
+    h.ws.check_pr = check_then_kill  # type: ignore[method-assign]
     await h.runner.start()
     await h.drain()
     assert h.run(code).status == "cancelled"
-    assert h.branches() == ["main"] and h.gh_calls("create") == []
+    assert h.api.live == set()
     await h.runner.aclose()
 
 
@@ -1256,6 +1331,7 @@ async def test_merge_runs_through_the_workspace(h: Harness) -> None:
     (h.gh_dir / "checks_rc").write_text("1")
     res = await h.runner.merge_run(code)
     assert res == Refused("R1 not merged: CI isn't green") and h.run(code).status == "ready"
+    assert h.gh_calls("merge") == []
     (h.gh_dir / "checks_rc").write_text("0")
     res = await h.runner.merge_run(code)
     assert res == claude_mod.Merged(code, 41, ())
@@ -1296,10 +1372,18 @@ def test_reply_texts() -> None:
     )  # fmt: skip
     from dataclasses import replace
 
-    assert reply_text(base) == (
-        "R3 done: PR #41 · https://github.com/o/r/pull/41 · 3 files · 12m\n"
+    assert reply_text(base, "red") == (
+        "R3 done: PR #41 (CI red) · https://github.com/o/r/pull/41 · 3 files · 12m\n"
         "⚠ changes Makefile, package.json\n/merge R3 when CI is green."
     )
+    green = reply_text(base, "green") or ""
+    assert green.splitlines()[0].startswith("R3 done: PR #41 (CI green) ·")
+    assert green.endswith("/merge R3 to merge it.")
+    assert "(CI pending)" in (reply_text(base, "pending") or "")
+    assert "(no CI)" in (reply_text(base, "none") or "")
+    assert "(CI unknown)" in (reply_text(base) or "")
+    refused = reply_text(replace(base, failure="it changes .github/ (workflows)"), "green") or ""
+    assert "⚠ it can't be merged as it is: it changes .github/" in refused
     assert reply_text(replace(base, status="no_changes", summary="Already fine.")) == (
         "R3: no changes. Already fine."
     )
@@ -1384,19 +1468,31 @@ def _real_sandbox_files(tmp_path: Path) -> tuple[Path, Path, Path, str]:
 )
 async def test_happy_path_under_the_real_sandbox(tmp_path: Path, db: sqlite3.Connection) -> None:
     root, _cache, fake, python = _real_sandbox_files(tmp_path)
+    # Another run's credentials, where a session of this run might look.
+    sibling = root / "runs" / "R9" / "creds"
+    sibling.mkdir(parents=True)
+    (sibling / "token").write_text("ghs_" + "S" * 36 + "\n")
     h = build(
         root,
         db,
         wrap=claude_mod._sandbox_wrap,  # pyright: ignore[reportPrivateUsage]
         self_check=check_ok,  # the probe suite has its own tests
-        claude_cmd=[python, str(fake)],
+        # a local bare repo can't be pushed to from inside the sandbox (only the run dir is
+        # writable), so this session stops before the push; the real push goes to github.com
+        claude_cmd=[python, str(fake), "--no-push"],
         read_paths=[Path(sys.base_prefix), Path(python).parent],
     )
     await h.start()
     await h.drain()
     run = h.run()
-    assert run.status == "ready", run.failure
+    assert run.status == "no_changes", run.failure  # nothing pushed, no PR
     assert h.argv_log()[0]["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN
+    # inside the sandbox the session read its own token and nobody else's
+    seen = json.loads((h.tmp("R1") / "creds.json").read_text())
+    assert seen["token"] == h.api.tokens[0] and seen["hosts_token"] == h.api.tokens[0]
+    assert seen["sibling"].startswith("ERR")  # EPERM: the profile denies other run dirs
+    assert seen["gh_config_dir"] == str(h.code_dir("R1").resolve() / "creds" / "gh")
+    assert h.api.live == set()
 
 
 # --- the daemon ------------------------------------------------------------------------------

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from github_app_fakes import APP_ID, INSTALLATION_ID, FakeGitHubApi, private_pem_one_line
 from test_runner_claude import (
     CLAUDE_TOKEN,
     FAKE,
@@ -51,12 +52,14 @@ from resonant.loop import Loop
 from resonant.models import ChatMessage, ModelReply, SpanFactory, ToolCall
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.router.fast_path import RESUME_REPLY
+from resonant.runner.github_app import GitHubApp
 from resonant.runner.workspace import Workspace
 from resonant.runners import claude as claude_mod
 from resonant.runners import reaper
 from resonant.runners.claude import ClaudeRunner
 from resonant.secrets import (
     CLAUDE_TOKEN_REF,
+    GITHUB_APP_KEY_REF,
     GITHUB_TOKEN_REF,
     FakeKeychain,
     SecretStore,
@@ -129,6 +132,7 @@ class World:
     osa: RecordingOsaRunner
     remote: Path
     gh_dir: Path
+    api: FakeGitHubApi
     daemon: Daemon | None = None
     said: int = 0
 
@@ -213,6 +217,7 @@ def make_world(
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
         runner={
+            "github_app": {"app_id": APP_ID, "installation_id": INSTALLATION_ID},
             "repos": {REPO: {"remote": f"github.com/own/{REPO}"}},
             "work_dir": root / "runs",
             "mirror_dir": root / "state" / "mirrors",
@@ -226,8 +231,17 @@ def make_world(
     if secrets:
         keychain.items[GITHUB_TOKEN_REF] = GH_TOKEN
         keychain.items[CLAUDE_TOKEN_REF] = CLAUDE_TOKEN
-    world = World(root, chat, settings, keychain, RecordingOsaRunner(), remote, gh_dir)
+        keychain.items[GITHUB_APP_KEY_REF] = private_pem_one_line()
+    api = FakeGitHubApi()
+    world = World(root, chat, settings, keychain, RecordingOsaRunner(), remote, gh_dir, api)
+    assert settings.runner.github_app is not None
     options: dict[str, Any] = {
+        "github_app": GitHubApp(
+            settings.runner.github_app,
+            SecretStore(keychain),
+            transport=api.transport(),
+            backoff_s=0,
+        ),
         "wrap": identity_wrap,
         "self_check": check_ok,
         "claude_cmd": [sys.executable, str(FAKE), "--scenario", scenario, *extra],
@@ -309,7 +323,7 @@ async def test_r1_run_command_to_a_pr_link_with_the_pulse_item(
         assert running_line.startswith("Runs (1 active):\n- R1 demo · running · ")
 
         done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 · {PR_URL} · 3 files · "), done
+        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL} · 3 files · "), done
         assert "/merge R1" in done and "⚠ changes .claude/settings.json, Makefile" in done
         assert pulse_store.pending(w.conn, ["normal"], utcnow()) == []  # cleared, nothing owed
         cleared = pulse_store.get(w.conn, "core", "run/r1")
@@ -322,8 +336,11 @@ async def test_r1_run_command_to_a_pr_link_with_the_pulse_item(
         branch = w.run().branch or ""
         assert branch in w.branches() and len(w.gh_calls("create")) == 1
         assert git(w.remote, "log", "-1", "--format=%s", branch) == "Fix the flaky test"
-        # no token anywhere: texts, DB
+        # no token anywhere: texts, DB; the run's own token was minted for the one repo and
+        # is dead again
         assert GH_TOKEN not in w.everything() and CLAUDE_TOKEN not in w.everything()
+        assert not any(t in w.everything() for t in w.api.tokens)
+        assert [m["repositories"] for m in w.api.mints] == [["demo"]] and w.api.live == set()
 
         # the same warning on the way to a merge
         merged = await w.say("/merge R1")
@@ -338,7 +355,7 @@ async def test_r1_chat_request_starts_a_run(
         started = await w.say("fix the typo in the README in demo")
         assert started.endswith("On it: R1 · demo. Up to 45m. /runs to check, /cancel R1 to stop.")
         done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 · {PR_URL} · 1 file · ")
+        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL} · 1 file · ")
         assert "⚠" not in done
         assert w.run().ask == "fix the typo in the README" and w.run().principal == "justin"
         detail = (await w.say("/runs R1")).splitlines()
@@ -430,7 +447,7 @@ async def test_r6_crash_then_restart_resumes_the_same_session(
         # on start the old tree is reaped, then the task resumes the same session
         await until(lambda: not live(old_pid), 15, "the old session to be reaped")
         done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 · {PR_URL}"), done
+        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL}"), done
         run = w.run()
         assert run.status == "ready" and run.session_id == session and run.sessions == 2
         calls = json.loads((w.tmp() / "argv.json").read_text())
@@ -535,20 +552,38 @@ async def test_no_ci_repo_runs_but_cannot_be_merged(
         assert w.gh_calls("merge") == [] and w.run().status == "ready"
 
 
-async def test_r4_a_github_change_is_refused(
+async def test_r4_a_github_change_cannot_be_merged(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     w = make_world(tmp_path, resonant_home, chat, monkeypatch, scenario="github")
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
-        failed = await w.next_text()
-        assert failed.startswith("R1 failed: ") and ".github" in failed, failed
-        assert w.run().status == "failed" and w.branches() == ["main"]
-        assert w.gh_calls("create") == []
-        assert (await w.say("/merge R1")).startswith("R1 isn't ready to merge")
+        done = await w.next_text()  # the session pushed and opened the PR itself
+        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL}"), done
+        assert "⚠ it can't be merged as it is: it changes .github/" in done
+        assert w.run().status == "ready" and w.gh_calls("create")
+        refused = await w.say("/merge R1")
+        assert refused.startswith("R1 not merged: the checks refuse it: it changes .github/")
+        assert w.gh_calls("merge") == [] and w.run().status == "ready"
 
 
-async def test_r4_a_token_in_the_diff_is_refused_and_never_echoed(
+async def test_r4_a_github_change_is_listed_when_the_repo_allows_it(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_world(tmp_path, resonant_home, chat, monkeypatch, scenario="github")
+    w.settings.runner.repos[REPO] = w.settings.runner.repos[REPO].model_copy(
+        update={"allow_github_changes": True}
+    )
+    async with running(w):
+        assert (await w.say("/run demo fix it")).startswith("On it: R1")
+        done = await w.next_text()
+        assert "⚠ changes .github/workflows/evil.yml" in done and "can't be merged" not in done
+        assert w.api.mints[0]["permissions"]["workflows"] == "write"
+        merged = await w.say("/merge R1")
+        assert merged == f"R1 merged: PR #41.\n⚠ changes .github/workflows/evil.yml\n{PR_URL}"
+
+
+async def test_r4_a_token_in_the_diff_cannot_be_merged_and_is_never_echoed(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     w = make_world(
@@ -556,9 +591,11 @@ async def test_r4_a_token_in_the_diff_is_refused_and_never_echoed(
     )
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
-        failed = await w.next_text()
-        assert failed.startswith("R1 failed: ")
-        assert w.run().status == "failed" and w.branches() == ["main"]
+        done = await w.next_text()
+        assert done.startswith("R1 done: PR #41") and "a token appears" in done
+        refused = await w.say("/merge R1")
+        assert refused.startswith("R1 not merged: the checks refuse it: a token appears")
+        assert w.gh_calls("merge") == []
         assert GH_TOKEN not in w.everything() and CLAUDE_TOKEN not in w.everything()
 
 
@@ -587,13 +624,17 @@ async def test_r1_under_the_real_sandbox(
         monkeypatch,
         runner_opts={
             "wrap": claude_mod._sandbox_wrap,  # pyright: ignore[reportPrivateUsage]
-            "claude_cmd": [python, str(fake)],
+            # a local bare repo can't be pushed to from inside the sandbox; the real push goes
+            # to github.com, which the profile allows
+            "claude_cmd": [python, str(fake), "--no-push"],
             "read_paths": [Path(sys.base_prefix), Path(python).parent],
         },
     )
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 · {PR_URL}"), done
+        assert done.startswith("R1: no changes."), done
         env = json.loads((w.tmp() / "argv.json").read_text())[0]["env"]
         assert env["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN
+        seen = json.loads((w.tmp() / "creds.json").read_text())
+        assert seen["token"] == w.api.tokens[0]  # the sandboxed session read its own credentials

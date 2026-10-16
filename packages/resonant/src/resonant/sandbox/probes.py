@@ -553,6 +553,7 @@ def probe_context(
         sleeper = subprocess.Popen(["/bin/sleep", "300"], start_new_session=True)
         params = SandboxParams(
             run_dir=run,
+            work_dir=work_dir,
             cache_dir=cache_dir,
             secrets_dir=secrets_dir,
             home=home,
@@ -571,6 +572,8 @@ def probe_context(
         prepare_dirs(params)
         sibling.mkdir(mode=0o700)
         (sibling / "keep.txt").write_text("sibling run")
+        (sibling / "creds").mkdir(mode=0o700)  # what another live run holds
+        (sibling / "creds" / "token").write_text("ghs_other_runs_token\n")
         claude = resolve_tool("claude")
         if claude is not None:
             with contextlib.suppress(SandboxError):
@@ -680,8 +683,9 @@ def p_write_denied(ctx: ProbeContext) -> tuple[Status, str]:
 
 def p_work_dir(ctx: ProbeContext) -> tuple[Status, str]:
     """Only the run's own dir is writable: not the work dir above it (create, symlink, mkdir,
-    rename the run dir) and not a sibling run dir. The daemon's O_NOFOLLOW opens of a run
-    dir rest on this."""
+    rename the run dir) and not a sibling run dir. A sibling run dir is not readable either
+    (its ``creds/token`` is a live GitHub token), wherever the work dir sits. The daemon's
+    O_NOFOLLOW opens of a run dir rest on this."""
     work = ctx.params.run_dir.parent
     ops = [
         ("create", _unique(work, "entry")),
@@ -690,6 +694,10 @@ def p_work_dir(ctx: ProbeContext) -> tuple[Status, str]:
         ("rename", str(ctx.params.run_dir)),
         ("create", _unique(ctx.sibling, "sibling")),
         ("symlink", _unique(ctx.sibling, "sibling-link")),
+        ("read", str(ctx.sibling / "keep.txt")),
+        ("read", str(ctx.sibling / "creds" / "token")),
+        ("list", str(ctx.sibling)),
+        ("list", str(ctx.sibling / "creds")),
     ]
     res = _fs(ctx, ops)
     bad = {k: v for k, v in res.items() if not _denied(v)}
@@ -1398,6 +1406,7 @@ def self_check(params: SandboxParams, *, python: str | None = None) -> tuple[boo
     code = _PRELUDE + _SELF
     check_params = SandboxParams(
         run_dir=p.run_dir,
+        work_dir=p.work_dir,
         cache_dir=p.cache_dir,
         secrets_dir=p.secrets_dir,
         home=p.home,
