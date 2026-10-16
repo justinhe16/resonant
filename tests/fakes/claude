@@ -15,6 +15,13 @@ and ``--no-pr`` skip those, and ``--ci-fixes N`` makes it push N more commits as
 Scenarios: happy, nochanges, slow, hang, hang_then_ok, escapee, usage_limit, error, maxturns,
 maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, makefile, github, noresult, tokens,
 scratch (a run with no repo: writes notes in its cwd and reports).
+
+The worker CLI (EM-3), on the first turn only, before the scenario: ``--note TEXT`` runs
+``resonant note``, ``--check SYSTEM:ACTION:WHAT`` runs ``resonant check`` (denied: the turn
+ends there with ``Didn't: denied.``), ``--ask TEXT`` (with ``--options``) runs ``resonant ask``
+(no answer yet, exit 3: the turn ends with ``Waiting for the owner.``), and ``--wait-message S``
+calls ``resonant note`` for up to S seconds until a reply carries an owner message. Each call
+is noted in ``<run>/tmp/cli.json`` (argv, exit code, output).
 """
 
 from __future__ import annotations
@@ -50,6 +57,11 @@ ap.add_argument("--no-push", action="store_true")
 ap.add_argument("--no-pr", action="store_true")
 ap.add_argument("--ci-fixes", type=int, default=0)
 ap.add_argument("--echo-token", action="store_true")
+ap.add_argument("--ask")
+ap.add_argument("--options")
+ap.add_argument("--note")
+ap.add_argument("--check")
+ap.add_argument("--wait-message", type=float, default=0.0)
 args = ap.parse_args()
 
 prompt = sys.stdin.read()
@@ -153,7 +165,7 @@ def probe_creds(name: str = "creds.json") -> None:
         "token": read(os.path.join(creds, "token")),
         "hosts_token": token,
         "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
-        "modes": [oct(os.stat(creds).st_mode & 0o777)],
+        "modes": [oct(os.stat(creds).st_mode & 0o777)] if os.path.isdir(creds) else [],
         "sibling": read(os.path.join(os.path.dirname(run_dir), "R9", "creds", "token")),
     }))  # fmt: skip
 
@@ -168,6 +180,42 @@ if scenario == "stubborn":
 
 emit({"type": "system", "subtype": "init", "session_id": session, "cwd": os.getcwd()})
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "working on it"}]}})
+
+
+
+def cli(*argv: str) -> tuple[int, str]:
+    """``resonant …`` as the session runs it (from PATH), noted for the test."""
+    done = subprocess.run(["resonant", *argv], capture_output=True, text=True)
+    path = os.path.join(tmp, "cli.json")
+    calls = json.load(open(path)) if os.path.exists(path) else []
+    calls.append({"argv": list(argv), "rc": done.returncode, "out": done.stdout.strip(),
+                  "err": done.stderr[-300:]})  # fmt: skip
+    note("cli.json", json.dumps(calls))
+    return done.returncode, done.stdout
+
+
+if not args.resume:
+    if args.note:
+        cli("note", args.note)
+    if args.check:
+        system, action, what = args.check.split(":", 2)
+        rc, _ = cli("check", "--system", system, "--action", action, what)
+        if rc != 0:
+            result("Didn't: denied.")
+            sys.exit(0)
+    if args.wait_message:
+        end = time.time() + args.wait_message
+        while time.time() < end:
+            _rc, text = cli("note", "still going")
+            if "Message from the owner" in text:
+                break
+            time.sleep(0.2)
+    if args.ask:
+        extra = ["--options", args.options] if args.options else []
+        rc, _ = cli("ask", args.ask, *extra)
+        if rc == 3:
+            result("Waiting for the owner.")
+            sys.exit(0)
 
 if scenario in ("hang", "stubborn") or (scenario == "hang_then_ok" and not args.resume):
     time.sleep(3600)

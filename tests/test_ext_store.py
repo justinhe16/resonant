@@ -75,11 +75,11 @@ def test_migration_004_over_populated_003(tmp_path: Path) -> None:
     conn.close()
 
     # job-guard and status refuse the v3 store until the daemon migrates it.
-    with pytest.raises(StoreUnavailableError, match="schema v3 < v10"):
+    with pytest.raises(StoreUnavailableError, match="schema v3 < v11"):
         open_existing(path)
 
     conn = open_db(path)
-    assert schema_version(conn) == latest_version() == 10
+    assert schema_version(conn) == latest_version() == 11
     tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
     assert {"extensions", "ext_jobs"} <= tables
     # Existing rows survive.
@@ -106,7 +106,7 @@ def test_job_guard_fails_closed_on_v3_store(
     runner = CliRunner()
     res = runner.invoke(app, ["job-guard", "--job", "x/y", "--", "echo", "RAN"])
     assert res.exit_code == 75 and executed == []
-    assert "schema v3 < v10" in res.output
+    assert "schema v3 < v11" in res.output
 
     open_db(resonant_home / "resonant.db").close()  # the daemon migrates on start
     ok = runner.invoke(app, ["job-guard", "--job", "x/y", "--", "echo", "RAN"])
@@ -241,10 +241,10 @@ def test_migration_005_adds_pulse_items_over_populated_004(tmp_path: Path) -> No
     conn = connect(path)
     assert migrate(conn, _migrations_through(4)) == 4
     conn.close()
-    with pytest.raises(StoreUnavailableError, match="schema v4 < v10"):
+    with pytest.raises(StoreUnavailableError, match="schema v4 < v11"):
         open_existing(path)
     conn = open_db(path)
-    assert schema_version(conn) == 10
+    assert schema_version(conn) == 11
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(pulse_items)")}
     assert {"source", "key", "urgency", "fingerprint", "cleared", "told_fingerprint"} <= cols
     conn.close()

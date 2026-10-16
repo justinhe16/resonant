@@ -33,6 +33,14 @@ dir and worktree ("work kept"); what the session already pushed stays on GitHub.
 (or scratch dir); a merge deletes them too, and the daily job ``runner.keep_days`` after the run
 ended. The owner's checkout is never deleted.
 
+Worker CLI (EM-3, ``worker_cli``/``worker_desk``). A session reaches the daemon with
+``resonant ask|note|check`` over its run's socket, open only while a session runs. A turn that
+ends with a question open parks the run (``Wait("human_reply")``; run ``waiting``, reason
+``question``, slot freed, time not counted). The answer, an owner message or the ask timeout
+resumes the same session with ``--resume`` and the news as the prompt. API for the relay
+(EM-5): :meth:`~ClaudeRunner.open_questions`, :meth:`~ClaudeRunner.answer_question`,
+:meth:`~ClaudeRunner.deliver_message`, :attr:`~ClaudeRunner.events`.
+
 Public API for the tools and slash commands (P5A-4): :meth:`ClaudeRunner.start_run`,
 :meth:`~ClaudeRunner.list_runs`, :meth:`~ClaudeRunner.cancel_run`,
 :meth:`~ClaudeRunner.merge_run`. Their results are plain dataclasses; every reply text is built
@@ -109,8 +117,20 @@ from resonant.runner.workspace import (
     upstream_merges,
     write_session_credentials,
 )
-from resonant.runners import reaper
+from resonant.runners import reaper, worker_cli
 from resonant.runners.reaper import MARKER_ENV, Target
+from resonant.runners.worker_cli import Check, WorkerServer
+from resonant.runners.worker_desk import (
+    BLOCK_S,
+    CHECK_OK,
+    RESTARTED,
+    OpenQuestion,
+    Relayed,
+    RelayRefused,
+    TrustChecker,
+    WorkerDesk,
+    WorkerEvents,
+)
 from resonant.sandbox import (
     SandboxError,
     SandboxParams,
@@ -133,6 +153,7 @@ from resonant.secrets import (
     missing_runner_secrets,
 )
 from resonant.store import pulse as pulse_store
+from resonant.store import questions as questions_store
 from resonant.store import repos as repo_store
 from resonant.store import runs
 from resonant.store import tasks as task_store
@@ -140,11 +161,11 @@ from resonant.store.audit import audit
 from resonant.store.db import atomic, transaction, utcnow
 from resonant.store.runs import Run
 from resonant.trust import merge_decision
+from resonant_sdk import Event
 
 if TYPE_CHECKING:
     from resonant.executor import CallContext
     from resonant.extensions.scheduler import CoreDeps, CoreJob
-    from resonant.trust.checks import TrustChecks
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +196,6 @@ TOKEN_REFRESH_S = 50 * 60  # installation tokens last an hour: a fresh one after
 # in all: the app's three tries (each up to its own timeout) and the backoff between them
 MERGE_WAIT_S = 2 * 3600.0  # auto-merge waits this long after the run for CI to finish
 MERGE_POLL_S = 120.0  # ... looking at CI this often
-CHECK_POLL_S = 60.0  # a fork run waiting for the owner's ok looks again this often
 EXTERNAL_PR = "external_pr"  # the trust action of opening a PR on someone else's repo
 REVOKE_TIMEOUT_S = (
     github_app_mod.ATTEMPTS * github_app_mod.TIMEOUT_S
@@ -217,6 +237,18 @@ SCRATCH_PROMPT = (
     "tied to a repo and you have no GitHub credentials. Do what is asked, and end with a 1-5 "
     "line summary of what you did, what you found and anything left undone: it is what the "
     "owner reads."
+)
+WORKER_PROMPT = (
+    "\n\nYou can reach the owner with the `resonant` command on your PATH (plain-text replies). "
+    '`resonant ask "<question>" [--options a,b,c] [--urgent]`: only when you are blocked on a '
+    "decision only the owner can make. It waits for the answer; if it says there is no answer "
+    "yet, finish what you can, then end your turn with a short summary: you'll be resumed with "
+    'the answer. `resonant note "<progress>" [--urgent]`: on meaningful progress (--urgent only '
+    "for what the owner must see now). `resonant check --system <s> --action <kind> "
+    '[--irreversible] [--cost <usd>] "<what>"`: before anything that could be net new: a '
+    "deploy, a write to production data, an outgoing email or message, spending money, deleting "
+    "data, a force-push, or a system you haven't used in this task. Go ahead only on ok; on "
+    "denied, don't. Replies can end with messages from the owner: follow them."
 )
 RESUME_PROMPT = (
     "Your session was interrupted. Continue the task you were given. If it is already done, "
@@ -547,11 +579,12 @@ class ClaudeRunner:
         cache_limit_bytes: int | None = None,
         defer_s: float = DEFER_S,
         refresh_s: float = TOKEN_REFRESH_S,
-        trust: TrustChecks | None = None,
         merge_wait_s: float = MERGE_WAIT_S,
         merge_poll_s: float = MERGE_POLL_S,
-        check_poll_s: float = CHECK_POLL_S,
         clock: Callable[[], datetime] = utcnow,
+        trust: TrustChecker | None = None,
+        submit: Callable[[Event], bool] | None = None,
+        ask_block_s: float = BLOCK_S,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -562,10 +595,11 @@ class ClaudeRunner:
         from ``runner.github_app`` and the Keychain; tests pass one with a fake endpoint) and
         ``refresh_s`` is how long a token is used before a fresh one replaces it. ``wrap``,
         ``self_check`` and ``claude_cmd`` are the seams for tests; by default the Seatbelt
-        sandbox, the cached self-probe and the ``claude`` on the daemon's PATH. ``trust`` asks
-        the owner before a fork run's upstream PR (without it fork runs are refused);
-        ``merge_wait_s`` and ``merge_poll_s`` bound an auto-merge's wait for CI and
-        ``check_poll_s`` is how often a run waiting for the owner's ok looks again."""
+        sandbox, the cached self-probe and the ``claude`` on the daemon's PATH. ``trust``
+        decides ``resonant check`` (EM-4's ``TrustChecks``; without it every check is
+        denied), ``submit`` wakes a run's task with an event (``Loop.submit``) and
+        ``ask_block_s`` is how long one ``resonant ask`` call waits. ``merge_wait_s`` and
+        ``merge_poll_s`` bound an auto-merge's wait for CI (EM-7)."""
         self.conn = conn
         self.cfg = runner
         self.channel = channel
@@ -579,10 +613,8 @@ class ClaudeRunner:
             GitHubApp(runner.github_app, secrets) if runner.github_app is not None else None
         )
         self.refresh_s = refresh_s
-        self.trust = trust
         self.merge_wait_s = merge_wait_s
         self.merge_poll_s = merge_poll_s
-        self.check_poll_s = check_poll_s
         self._merge_locks: dict[str, asyncio.Lock] = {}
         self._forks: dict[str, str] = {}  # run code -> the owner's fork (fork-mode runs)
         self._tokens: dict[str, list[str]] = {}  # run code -> tokens minted and not yet revoked
@@ -615,6 +647,22 @@ class ClaudeRunner:
         self._cleanup_locks: dict[str, asyncio.Lock] = {}
         self._background: set[asyncio.Task[Any]] = set()
         self._unhook: Callable[[], None] | None = None
+        self.ctl_root = worker_cli.ctl_root(runner.work_dir)
+        self.ask_block_s = ask_block_s
+        self._submit: Callable[[Event], bool] = submit or self._insert_event
+        self._run_redactors: dict[str, Redactor] = {}
+        ask_timeout_s = runner.ask_timeout_minutes * 60
+        self.desk = WorkerDesk(
+            conn,
+            channel=channel,
+            trust=trust,
+            clock=clock,
+            ask_timeout_s=ask_timeout_s,
+            wake=self._wake,
+            redactor_for=lambda code: self._run_redactors.get(code) or Redactor(),
+            on_note=self._on_note,
+            block_s=ask_block_s,
+        )
 
     def _gh_github(self, secrets: RunnerSecrets) -> GitHub:
         return GhGitHub(self.workspace, secrets)
@@ -666,7 +714,12 @@ class ClaudeRunner:
                 runs.clear_process(self.conn, run.code)
         await self._sweep_credentials()
         await asyncio.to_thread(wipe_secret_dirs, self.cfg.secrets_dir, self.cfg.mirror_dir)
+        self.desk.startup()  # no CLI call survived the restart
+        await asyncio.to_thread(self._wipe_ctl_dirs)
         await self._reconcile()
+        for run in runs.active(self.conn):  # a check closed by the restart is news for it
+            if run.status == "waiting" and run.wait_reason == "question":
+                self._wake(run, f"startup:{uuid.uuid4().hex}")
         if self._unhook is None:
             self._unhook = killswitch.add_pause_hook(self._on_pause)
         return reaped
@@ -688,11 +741,19 @@ class ClaudeRunner:
         for code in await asyncio.to_thread(codes):
             await self._deprovision(code)
 
+    def _wipe_ctl_dirs(self) -> None:
+        """No session survived a restart: every run's socket and token goes."""
+        with contextlib.suppress(OSError):
+            for name in os.listdir(self.ctl_root):
+                if RUN_CODE.fullmatch(name):
+                    worker_cli.remove_ctl(self.cfg.work_dir, name)
+
     async def aclose(self) -> None:
         """Remove the kill switch hook and wait for the kills it started."""
         if self._unhook is not None:
             self._unhook()
             self._unhook = None
+        await self.desk.aclose()
         tasks = list(self._background)
         for t in tasks:
             t.cancel()
@@ -833,7 +894,7 @@ class ClaudeRunner:
     async def _fork_refusal(self) -> Refused | None:
         """Why a fork-mode run can't start here, or None. The ``public_repo`` token is
         optional for the runner as a whole, so it is only asked for here."""
-        if self.trust is None:
+        if self.desk.trust is None:
             return Refused("A fork run asks you before its upstream PR, and asking isn't set up.")
         try:
             have = await self.secrets.exists(GITHUB_PUBLIC_TOKEN_REF)
@@ -939,6 +1000,70 @@ class ClaudeRunner:
         await self._remove_workspace(run)
         return Merged(run.code, run.pr_number, checked.flagged)
 
+    # -- the worker CLI's owner side (EM-5's API) --
+
+    @property
+    def events(self) -> WorkerEvents:
+        """Worker events (``question``, ``note``, ``check``): ``events.subscribe(fn)``."""
+        return self.desk.events
+
+    def open_questions(self) -> list[OpenQuestion]:
+        """Open ``resonant ask`` questions of active runs, oldest first."""
+        return self.desk.open_questions()
+
+    def answer_question(self, code: str, text: str) -> Relayed | Refused:
+        """The owner's answer to run ``code``'s open question. A CLI call still waiting gets
+        it at once; else the session is resumed with it (``claude --resume``)."""
+        try:
+            return self.desk.answer_question(code.upper(), text)
+        except RelayRefused as e:
+            return Refused(str(e))
+
+    def deliver_message(self, code: str, text: str) -> Relayed | Refused:
+        """An owner message for a running worker: appended to its next ``resonant`` reply,
+        or the prompt of its next turn. Refused once the run's session part is over."""
+        run = runs.get(self.conn, code)
+        if run is not None and run.active and run.step not in ("prepare", "session"):
+            return Refused(f"{run.code} has finished its work; start a new run for more.")
+        try:
+            return self.desk.deliver_message(code.upper(), text)
+        except RelayRefused as e:
+            return Refused(str(e))
+
+    def _wake(self, run: Run, key: str) -> None:
+        """Something arrived for the run: an event for its task, which requeues it if it is
+        waiting (and, if a step is in flight, once that step returns ``Wait``)."""
+        if run.task_id is None:
+            return
+        if run.status == "waiting" and run.wait_reason != "question":
+            return  # a usage wait: the news is in the store for its natural wake
+        event = Event(source="runner", type="run.inbox", task_id=run.task_id,
+                      principal=run.principal, dedupe_key=f"run:{run.code}:{key}")  # fmt: skip
+        try:
+            self._submit(event)
+        except Exception:
+            log.exception("couldn't wake a run", extra={"run": run.code})
+
+    def _insert_event(self, event: Event) -> bool:
+        """``Loop.submit`` without a loop: insert the event and requeue a waiting task."""
+        with transaction(self.conn):
+            inserted = task_store.insert_event(self.conn, event)
+            if inserted and event.task_id:
+                task_store.set_status(self.conn, event.task_id, "queued", expect=("waiting",))
+        return inserted
+
+    def _on_note(self, code: str) -> None:
+        run = runs.get(self.conn, code)
+        if run is not None and run.status == "running":
+            self._pulse_open(run)
+
+    def _peer_ok(self, code: str, pid: int | None) -> bool:
+        """A CLI caller speaks for run ``code`` only from inside its live session."""
+        target = self._live.get(code)
+        if pid is None or target is None or target.leader_pid is None:
+            return False
+        return worker_cli.descends_from(pid, target.leader_pid, target.leader_started_at)
+
     # -- the loop's entry point --
 
     async def step(self, task: Task, events: list[Any], ctx: StepContext) -> StepOutcome:
@@ -980,8 +1105,14 @@ class ClaudeRunner:
             return await self._fail(run, f"the runner isn't set up ({e})", Redactor())
         w = _Work(task, ctx, secrets, Redactor(secrets.values()))
         try:
-            if run.status == "waiting" and run.step == "publish":
-                run = self._end_check_wait(run)  # the owner's ok isn't a usage wait
+            if run.status == "waiting" and run.wait_reason == "question":
+                self.desk.time_out_due(run.code)
+                if not self.desk.has_deliveries(run.code):
+                    until = self.desk.wait_until(run.code)
+                    if until is not None:  # nothing new: keep waiting, the row untouched
+                        return Wait("human_reply", dict(task.checkpoint), until)
+                run = self._end_wait(run)
+                self._pulse_open(run)
             elif run.status == "waiting":
                 run = self._end_wait(run)
                 self._pulse_open(run)
@@ -990,7 +1121,7 @@ class ClaudeRunner:
             if run.step == "prepare":
                 run = await self._prepare(w, run)
             p = self._prepared(run)
-            if run.step == "session":
+            while run.step == "session":  # one -p turn each; answers and messages resume it
                 outcome = await self._session(w, run, p)
                 if outcome is not None:
                     return outcome
@@ -1075,6 +1206,10 @@ class ClaudeRunner:
         if gh is not None:
             tools["gh"] = gh
         link_tools(params, tools)
+        # the worker CLI: written now, before any session can touch bin/
+        if params.ctl_dir is not None:
+            ctl = worker_cli.make_ctl_dir(self.cfg.work_dir, params.run_dir.name)
+            worker_cli.write_shim(params.run_dir / "bin", ctl, self.ask_block_s)
 
     def _prepared(self, run: Run) -> Prepared:
         run_dir = self.cfg.work_dir / run.code
@@ -1103,6 +1238,8 @@ class ClaudeRunner:
             deny_exec=default_deny_exec(),
             deny_read=tuple(self.cfg.deny_read),
             write_paths=tuple(writes),
+            ctl_root=self.ctl_root,
+            ctl_dir=self.ctl_root / p.code,
         )
 
     def _cached_self_check(self, params: SandboxParams) -> tuple[bool, str]:
@@ -1129,6 +1266,10 @@ class ClaudeRunner:
             creds = Path(env["HOME"]).parent / CREDS_DIR
             env["GH_CONFIG_DIR"] = str(creds / "gh")
             env.update(session_git_env(creds / "credential-helper", p.exclude_file))
+        # `resonant ask` waits up to ask_block_s: the Bash tool must not cut it off first
+        bash_ms = str(int((self.ask_block_s + 120) * 1000))
+        env["BASH_DEFAULT_TIMEOUT_MS"] = bash_ms
+        env["BASH_MAX_TIMEOUT_MS"] = bash_ms
         env["GH_PROMPT_DISABLED"] = "1"
         env["GH_NO_UPDATE_NOTIFIER"] = "1"
         return env
@@ -1153,7 +1294,7 @@ class ClaudeRunner:
             "--settings",
             json.dumps({"sandbox": {"enabled": False}}),
             "--append-system-prompt",
-            self._prompt(run, p),
+            self._prompt(run, p) + WORKER_PROMPT,
             "--max-turns",
             str(self.max_turns),
         ]
@@ -1217,7 +1358,72 @@ class ClaudeRunner:
             )
         )
         env = self._env(params, run.session_id, w.secrets, p)
-        prompt = (RESUME_PROMPT if run.sessions else run.ask).encode()
+        prompt = self._turn_prompt(run).encode()
+        server = await self._open_ctl(run, w)
+        try:
+            return await self._spawn_session(w, run, p, argv, env, prompt, server)
+        finally:
+            await self._close_ctl(run.code, server)
+
+    def _turn_prompt(self, run: Run) -> str:
+        """The prompt of this turn: the ask for a new session; for a resumed one, the
+        answers and owner messages it hasn't seen (saved on the run until the turn ends, so
+        a crash resends them), else the plain resume prompt."""
+        with atomic(self.conn):  # taken and saved together: a crash loses neither
+            fresh = self.desk.resume_text(run.code)
+            saved = run.resume_prompt
+            if fresh is not None:
+                saved = f"{saved}\n\n{fresh}" if saved else fresh
+                runs.update(self.conn, run.code, resume_prompt=saved)
+        if not run.sessions:
+            return run.ask + (f"\n\n{saved}" if saved else "")
+        if fresh is not None:
+            return f"{saved}\n\nCarry on with the task."
+        prompt = RESUME_PROMPT
+        if saved:
+            prompt += f"\n\nWhat you were told last turn:\n{saved}"
+        for q in questions_store.open_for_run(self.conn, run.code, "ask"):
+            prompt += (
+                f'\n\nYou asked the owner: "{q.question}". There is no answer yet; if you still '
+                "need it, finish what you can and end your turn: you'll be resumed with it."
+            )
+        return prompt
+
+    async def _open_ctl(self, run: Run, w: _Work) -> WorkerServer | None:
+        """The run's socket for this session, with a fresh token. None (the CLI says it can't
+        reach Resonant) when it can't be opened: the session still runs."""
+        self._run_redactors[run.code] = w.redactor
+        try:
+            ctl = await asyncio.to_thread(worker_cli.make_ctl_dir, self.cfg.work_dir, run.code)
+            token = await asyncio.to_thread(worker_cli.write_token, ctl)
+            server = WorkerServer(
+                ctl, token,
+                lambda req, gone: self.desk.handle(run.code, req, gone),
+                lambda pid: self._peer_ok(run.code, pid),
+            )  # fmt: skip
+            await server.start()
+        except OSError as e:
+            log.warning("worker CLI socket not opened", extra={"run": run.code, "reason": str(e)})
+            return None
+        return server
+
+    async def _close_ctl(self, code: str, server: WorkerServer | None) -> None:
+        if server is not None:
+            await server.close()
+        self._run_redactors.pop(code, None)
+        with contextlib.suppress(OSError):
+            os.unlink(self.ctl_root / code / worker_cli.TOKEN)
+
+    async def _spawn_session(
+        self,
+        w: _Work,
+        run: Run,
+        p: Prepared,
+        argv: list[str],
+        env: dict[str, str],
+        prompt: bytes,
+        server: WorkerServer | None,
+    ) -> StepOutcome | None:
         writer = TranscriptWriter(self.transcript_dir / f"{run.code}.jsonl", w.redactor)
         state = StreamState()
         started = time.monotonic()
@@ -1242,7 +1448,7 @@ class ClaudeRunner:
         target = Target(proc.pid, proc.pid, created, run_dir=p.run_dir, marker=run.session_id)
         self._live[run.code] = target
         runs.set_process(self.conn, run.code, proc.pid, proc.pid, created)
-        stop = await self._supervise(w, run, p, proc, target, writer, state, prompt)
+        stop = await self._supervise(w, run, p, proc, target, writer, state, prompt, server)
         used = run.session_seconds + (time.monotonic() - started)
         result = state.result
         usage: dict[str, Any] = {}
@@ -1289,6 +1495,7 @@ class ClaudeRunner:
         writer: TranscriptWriter,
         state: StreamState,
         prompt: bytes,
+        server: WorkerServer | None = None,
     ) -> str | None:
         """Feed the prompt, pump the output into the transcript and watch the clock, the run
         row, the kill switch and the disk. Always ends with the whole process tree gone."""
@@ -1387,7 +1594,10 @@ class ClaudeRunner:
                     bucket = _bucket(used)
                     self._pulse_open(self._must_get(run.code), bucket)
         finally:
-            # Also on cancellation: nothing of the session may outlive the step.
+            # Also on cancellation: nothing of the session may outlive the step. The socket
+            # goes first, so no CLI call still in flight texts anyone after a stop.
+            if server is not None:
+                await server.close()
             disk.cancel()
             work_disk.cancel()
             cache.cancel()
@@ -1433,6 +1643,16 @@ class ClaudeRunner:
             return await self._fail(run, f"Claude failed (exit {returncode}) {keep}", w.redactor)
         text = result.get("result")
         summary = _summary(text, w.redactor) if isinstance(text, str) else None
+        # The turn ended. From here to the step change below nothing is awaited, so an
+        # answer or message can't slip in between the look and the move (they also wake the
+        # task, which a returned Wait honours).
+        runs.update(self.conn, run.code, resume_prompt=None)
+        self.desk.time_out_due(run.code)
+        if self.desk.has_deliveries(run.code):  # answers or messages: another turn
+            runs.update(self.conn, run.code, summary=summary)
+            return None
+        if (until := self.desk.wait_until(run.code)) is not None:
+            return self._wait_for_answer(w, run, summary, until)
         if run.scratch:  # nothing to collect: the summary is the answer
             if not runs.finish(self.conn, run.code, "done", step="reply", summary=summary):
                 raise _Cancelled
@@ -1452,17 +1672,31 @@ class ClaudeRunner:
     def _wait_for_limit(self, w: _Work, run: Run, hit: LimitHit) -> StepOutcome:
         now = self.clock()
         wake = wake_time(hit, now)
-        runs.update(self.conn, run.code, status="waiting", waiting_since=now)
+        runs.update(self.conn, run.code, status="waiting", waiting_since=now,
+                    wait_reason="usage_reset")  # fmt: skip
         self._pulse_open(self._must_get(run.code), "waiting")
         return Wait("usage_reset", dict(w.task.checkpoint), wake)
 
+    def _wait_for_answer(
+        self, w: _Work, run: Run, summary: str | None, until: datetime
+    ) -> StepOutcome:
+        """The turn ended with a question open: the run waits (its slot freed, the time not
+        counted against max_minutes) until the answer, a message, or the ask timeout."""
+        runs.update(self.conn, run.code, status="waiting", wait_reason="question",
+                    waiting_since=self.clock(), summary=summary)  # fmt: skip
+        self._pulse_open(self._must_get(run.code), "question")
+        with atomic(self.conn):
+            audit(self.conn, "run.waiting_question", run=run.code)
+        return Wait("human_reply", dict(w.task.checkpoint), until)
+
     def _end_wait(self, run: Run) -> Run:
-        """A waiting run is woken: its wait is added up and the run is running again."""
+        """A waiting run is woken and running again. A usage wait is added up (24 h of it in
+        all fails the run); a question wait isn't."""
         waited = 0.0
-        if run.waiting_since is not None:
+        if run.waiting_since is not None and run.wait_reason != "question":
             waited = max((self.clock() - run.waiting_since).total_seconds(), 0.0)
         runs.update(
-            self.conn, run.code, status="running", waiting_since=None,
+            self.conn, run.code, status="running", waiting_since=None, wait_reason=None,
             wait_seconds=run.wait_seconds + waited,
         )  # fmt: skip
         return self._must_get(run.code)
@@ -1593,30 +1827,33 @@ class ClaudeRunner:
     async def _publish(self, w: _Work, run: Run, p: Prepared) -> StepOutcome | None:
         """Ask before the upstream PR: an ``external_pr`` trust check on the original repo
         (``irreversible``: it goes out under the owner's name, so it asks every time unless a
-        rule allows it). The run waits for the answer without a slot (``Wait("approval")``;
-        the owner's reply wakes it). On ok the branch is fetched and checked again, and the
-        PR is opened with the ``public_repo`` token only if its head is still the one the
-        owner was asked about. The run ends ``done`` either way. None means it ended."""
+        rule allows it). It goes through the worker desk exactly like a worker's
+        ``resonant check``: a check row, the decision (``TrustChecks.request_check``) in the
+        background, the run waiting without a slot (``waiting``, reason ``question``) and woken
+        when it comes; ``ask_timeout`` and a restart close it the same way (after a restart it
+        is asked again). On ok the branch is fetched and checked again, and the PR is opened
+        with the ``public_repo`` token only if its head is still the one the owner was asked
+        about. The run ends ``done`` either way. None means it ended."""
         repo = self._repo_of(run)
-        if self.trust is None:
-            raise RunnerError("asking you isn't set up, so nothing was opened upstream")
         if run.head_sha is None:
             raise RunnerError("the fork's branch wasn't checked")
         change = await self.workspace.fork_change(run.repo, run.code, p.base_sha)
         self._check_stop(run.code)
-        answer = await self.trust.begin_check(
-            run.code, system=repo.slug, action=EXTERNAL_PR, irreversible=True, what=change.what
-        )
-        if answer == "pending":
-            now = self.clock()
-            runs.update(self.conn, run.code, status="waiting", waiting_since=now)
-            self._pulse_open(self._must_get(run.code), "approval")
-            return Wait(
-                "approval", dict(w.task.checkpoint), now + timedelta(seconds=self.check_poll_s)
-            )
+        check = Check(system=repo.slug, action=EXTERNAL_PR, what=change.what, irreversible=True)
+        q = self.desk.find_check(run.code, check)
+        if q is None or (q.status == "timed_out" and q.answer == RESTARTED):
+            q = await self.desk.request_check(run, check)
+        if q.status == "open":
+            runs.update(self.conn, run.code, status="waiting", wait_reason="question",
+                        waiting_since=self.clock())  # fmt: skip
+            self._pulse_open(self._must_get(run.code), "question")
+            until = self.desk.wait_until(run.code) or self.clock() + timedelta(minutes=1)
+            return Wait("human_reply", dict(w.task.checkpoint), until)
+        questions_store.mark_delivered(self.conn, q.id, at=self.clock())
         self._check_stop(run.code)
-        if answer == "denied":
-            if not runs.finish(self.conn, run.code, "done", step="reply", failure="not approved"):
+        if not (q.status == "answered" and q.answer == CHECK_OK):
+            why = "no decision in time" if q.status == "timed_out" else "not approved"
+            if not runs.finish(self.conn, run.code, "done", step="reply", failure=why):
                 raise _Cancelled
             return None
         fork = await self._fork_of(run, w.secrets)
@@ -1651,12 +1888,6 @@ class ClaudeRunner:
             asked = clean_external(run.ask)[:500]
             body = f"{body}\n\n> {asked}".strip()
         return body
-
-    def _end_check_wait(self, run: Run) -> Run:
-        """A run waiting for the owner's ok is looked at again. The wait doesn't count as a
-        usage-limit wait."""
-        runs.update(self.conn, run.code, status="running", waiting_since=None)
-        return self._must_get(run.code)
 
     # -- auto-merge (``start_run(merge=True)``, merge per trust rules) --
 
@@ -1849,13 +2080,12 @@ class ClaudeRunner:
         """Everything after a run's row has its final status: clear the pulse item, send the
         reply (once), and tell the loop how the task ended. ``watching`` and ``note`` are
         the auto-merge's (it will merge once CI is green; why it won't)."""
-        if self.trust is not None:  # a check still waiting would bind a late yes to nothing
-            self.trust.cancel_checks(run.code)
         if run.status == "cancelled":
             await self._finish_cancelled(run.code, send=False)
         else:
             self._pulse_clear(run)
             await self._deprovision(run.code)
+            await self._end_cli(run.code)
         try:
             await self._send_reply(run, watching=watching, note=note)
         except ChannelError as e:
@@ -1907,8 +2137,7 @@ class ClaudeRunner:
             target = self._live.get(code) or self._target(run)
             await reaper.reap(target, grace_s=self.cancel_grace_s)
             await self._deprovision(code)
-            if self.trust is not None:
-                self.trust.cancel_checks(code)
+            await self._end_cli(code)
             with contextlib.suppress(Exception):
                 # two deletes of one tree would trip over each other, hence the lock
                 await _finish_thread(delete_run_dir, self.cfg.work_dir, code)
@@ -1917,6 +2146,12 @@ class ClaudeRunner:
             if send:
                 with contextlib.suppress(ChannelError):
                     await self._send_reply(run)
+
+    async def _end_cli(self, code: str) -> None:
+        """The run ended: its open questions close and its control dir goes."""
+        self.desk.close_run(code)
+        with contextlib.suppress(OSError):
+            await asyncio.to_thread(worker_cli.remove_ctl, self.cfg.work_dir, code)
 
     async def _on_cancelled(self, code: str) -> None:
         """The step was cancelled from outside: by ``/cancel`` or ``/kill`` (the run row says
@@ -2044,10 +2279,11 @@ class ClaudeRunner:
         """The ``normal`` pulse item while a run goes: mentioned by the next hourly pulse."""
         started = run.started_at or self.clock()
         at = started.astimezone(self.tz).strftime("%H:%M")
-        what = {"waiting": "waiting for usage reset", "approval": "waiting for your ok"}.get(
-            bucket or "", "still running"
-        )
+        labels = {"waiting": "waiting for usage reset", "question": "waiting for your answer"}
+        what = labels.get(bucket or "", "still running")
         title = f"{run.code} {what} · {run.repo or 'no repo'} · started {at}"
+        if run.last_note and bucket != "question":
+            title += f" · {run.last_note}"
         state = {"bucket": bucket or _bucket(run.session_seconds)}
         now = self.clock()
         with atomic(self.conn):

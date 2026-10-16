@@ -276,11 +276,9 @@ def build_imessage_stack(
     )
     components.runners[jobs.name] = jobs
     loop.runners[jobs.name] = jobs
+    # workers' `resonant check` (EM-3 calls request_check; EM-4)
     trust = TrustChecks(
-        conn,
-        channel,
-        components.principals,
-        approval_ttl_s=settings.gate.approval_ttl_s,
+        conn, channel, components.principals, approval_ttl_s=settings.gate.approval_ttl_s
     )
     claude = ClaudeRunner(
         conn,
@@ -291,6 +289,8 @@ def build_imessage_stack(
         max_runs=max(1, settings.claude.max_concurrent - settings.claude.reserved_oncall_slots),
         create_task=loop.create_task,
         cancel_task=loop.cancel,
+        # answers and owner messages wake a run's task through the loop (EM-3)
+        submit=loop.submit,
         trust=trust,
     )
     components.runners[claude.name] = claude

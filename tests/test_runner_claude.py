@@ -47,7 +47,7 @@ from resonant.redact import Redactor
 from resonant.runner.cleanup import dir_size
 from resonant.runner.github_app import GitHubApp
 from resonant.runner.resolve import FakeGitHub, RepoInfo
-from resonant.runner.workspace import Workspace
+from resonant.runner.workspace import FORK_NEEDS_PUBLIC_REPO, Workspace
 from resonant.runners import claude as claude_mod
 from resonant.runners import reaper
 from resonant.runners.claude import (
@@ -716,10 +716,10 @@ async def test_fork_mode_repo_needs_the_public_repo_token(
     assert await h.runner.setup_missing() is None
     res = await h.runner.start_run("github.com/up/stream", "x", "owner")
     assert res == Refused("A fork run asks you before its upstream PR, and asking isn't set up.")
-    h.runner.trust = cast(Any, object())  # any asker: the token is what is missing now
+    h.runner.desk.trust = cast(Any, object())  # any asker: the token is what is missing now
     res = await h.runner.start_run("github.com/up/stream", "x", "owner")
-    assert res == Refused(claude_mod.FORK_NEEDS_PUBLIC_REPO)
-    assert "runner/github_public_token" in res.reason
+    assert res == Refused(FORK_NEEDS_PUBLIC_REPO)
+    assert "runner/github_public_token" in FORK_NEEDS_PUBLIC_REPO
     repo = repo_store.get(db, "up/stream")  # registered, so the next try finds it
     assert repo is not None and repo.mode == "fork" and not repo.quote_ask
     assert runs_store.recent(db) == []

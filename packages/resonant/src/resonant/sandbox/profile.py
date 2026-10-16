@@ -61,7 +61,19 @@ _PLACEHOLDERS = {
     "deny_read": ";; @DENY_READ@",
     "ancestors": ";; @ANCESTORS@",
     "exec": ";; @DENY_EXEC@",
+    "ctl": ";; @CTL@",
 }
+# The control-dir rules (EM-3): per-run values, kept out of profile_hash so the cached
+# self-check still matches from one run to the next.
+_CTL_RULES = (
+    '(deny file-write* (subpath (param "CTL_ROOT")))',
+    '(deny file-read* (require-all (subpath (param "CTL_ROOT"))'
+    ' (require-not (subpath (param "CTL_OWN")))))',
+    '(deny network-outbound (require-all (remote unix-socket (subpath (param "CTL_WORK")))'
+    ' (require-not (remote unix-socket (subpath (param "CTL_RUN"))))'
+    ' (require-not (remote unix-socket (subpath (param "CTL_OWN"))))))',
+)
+_PER_RUN_DEFS = frozenset({"CTL_ROOT", "CTL_OWN", "CTL_WORK", "CTL_RUN"})
 
 
 class SandboxError(Exception):
@@ -108,6 +120,10 @@ class SandboxParams:
     # the run's worktree and its checkout's .git, or its scratch dir (EM-2). Writes are allowed
     # everywhere, so this grants nothing; resolved() checks no guard covers them.
     write_paths: tuple[Path, ...] = ()
+    # the worker CLI (EM-3): every run's control dirs (``<work_dir>/.ctl``) and this run's
+    # own (``<work_dir>/.ctl/R<n>``). Both or neither; they need ``work_dir``.
+    ctl_root: Path | None = None
+    ctl_dir: Path | None = None
 
     def resolved(self) -> SandboxParams:
         home = Path(checked_path(self.home))
@@ -148,6 +164,15 @@ class SandboxParams:
                 raise SandboxError(f"secrets_dir {secrets} is inside the {what} {d}")
         reads = tuple(Path(checked_path(p)) for p in self.read_paths if Path(p).exists())
         work = Path(checked_path(self.work_dir)) if self.work_dir is not None else None
+        ctl_root = ctl_dir = None
+        if (self.ctl_root is None) != (self.ctl_dir is None):
+            raise SandboxError("ctl_root and ctl_dir go together")
+        if self.ctl_root is not None and self.ctl_dir is not None:
+            if work is None:
+                raise SandboxError("the control dirs need work_dir")
+            ctl_root, ctl_dir = Path(checked_path(self.ctl_root)), Path(checked_path(self.ctl_dir))
+            if ctl_dir.parent != ctl_root or not ctl_root.is_relative_to(work):
+                raise SandboxError(f"{ctl_dir} isn't a control dir under {work}")
         return SandboxParams(
             run_dir=run,
             cache_dir=cache,
@@ -159,6 +184,8 @@ class SandboxParams:
             secrets_dir=secrets,
             protect=tuple(protect),
             write_paths=writes,
+            ctl_root=ctl_root,
+            ctl_dir=ctl_dir,
         )
 
 
@@ -295,6 +322,7 @@ def guarded_paths(params: SandboxParams) -> tuple[Path, ...]:
         home / "Library" / "Messages",
         home / "Library" / "Keychains",
         *(params.protect or ()),
+        *((params.ctl_root,) if params.ctl_root is not None else ()),
         params.secrets_dir,
         *params.deny_read,
         *(Path(p) for p in _FIXED_GUARDED),
@@ -319,6 +347,10 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
         for i, path in enumerate(paths):
             defs[f"{prefix}_{i}"] = str(path)
             lines[key].append(f'  ({rule} (param "{prefix}_{i}"))')
+    if p.ctl_root is not None and p.ctl_dir is not None and p.work_dir is not None:
+        defs.update(CTL_ROOT=str(p.ctl_root), CTL_OWN=str(p.ctl_dir), CTL_WORK=str(p.work_dir),
+                    CTL_RUN=str(p.run_dir))  # fmt: skip
+        lines["ctl"] = list(_CTL_RULES)
     text = template_text()
     for key, placeholder in _PLACEHOLDERS.items():
         if placeholder not in text:
@@ -341,7 +373,7 @@ def wrap(argv: Sequence[str], params: SandboxParams) -> list[str]:
 def profile_hash(params: SandboxParams) -> str:
     """Identifies the template and the parameter shape, for the self-probe cache key."""
     text, defs = render(params)
-    blob = text + "\0" + "\0".join(f"{k}={defs[k]}" for k in sorted(defs))
+    blob = text + "\0" + "\0".join(f"{k}={defs[k]}" for k in sorted(defs) if k not in _PER_RUN_DEFS)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 

@@ -78,7 +78,6 @@ POLL_S = 1.0
 REPROMPT_S = 30.0  # re-send the prompt after a transient channel failure
 
 Answer = Literal["ok", "denied"]
-Status = Literal["ok", "denied", "pending"]  # begin_check / check_status
 
 
 MAX_PENDING = 3  # pending checks per run; more is approval spam
@@ -203,119 +202,6 @@ class TrustChecks:
             raise
         self._audit(run.code, system, action, answer, why, approval_id=approval.approval_id)
         return answer
-
-    # -- the same check without blocking (a run that waits with ``Wait("approval")``) --
-
-    async def begin_check(
-        self,
-        run_code: str,
-        system: str,
-        action: str,
-        irreversible: bool = False,
-        cost_usd: float = 0.0,
-        what: str = "",
-    ) -> Status:
-        """``request_check`` for a caller that must not hold its step while the owner
-        answers (the runner's fork publish step, EM-7): decide, and on ``ask`` create and
-        send the approval, then return ``"pending"`` at once. The run's task is woken when
-        the owner answers (``wake_resolved``); the caller then asks ``check_status`` with the
-        same arguments. An earlier approval for this exact check is answered from first, so
-        calling this again after a restart neither asks twice nor forgets a yes."""
-        system, action = store.slug(system), store.slug(action)
-        if store.ANY in (system, action):
-            raise ValueError("a check names one system and one action, not *")
-        known = await self.check_status(run_code, system, action, irreversible, cost_usd, what)
-        if known is not None:
-            return known
-        run = runs_store.get(self.conn, run_code)
-        if run is None or not run.active or run.task_id is None:
-            self._audit(run_code, system, action, "denied", "run not active")
-            return "denied"
-        decision = evaluate(
-            self.conn, system, action, irreversible, cost_usd, what,
-            repo=run.repo or None, run=run.code, now=self.clock(),
-        )  # fmt: skip
-        if decision.ok:
-            return "ok"
-        approval = self._approval(
-            run.code, run.task_id, decision, system, action, irreversible, cost_usd, what,
-            repo=store.slug(run.repo) if run.repo else None,
-        )  # fmt: skip
-        if approval is None:
-            self._audit(run.code, system, action, "denied", "too many pending checks")
-            return "denied"
-        if await self._prompt(run.task_id, approval) is False:
-            with atomic(self.conn):
-                ap.expire_one(self.conn, approval.approval_id, self.clock(), reason="unreachable")
-            self._audit(run.code, system, action, "denied", "owner unreachable",
-                        approval_id=approval.approval_id)  # fmt: skip
-            return "denied"
-        return "pending"
-
-    async def check_status(
-        self,
-        run_code: str,
-        system: str,
-        action: str,
-        irreversible: bool = False,
-        cost_usd: float = 0.0,
-        what: str = "",
-    ) -> Status | None:
-        """Where the latest approval for this exact check stands: ``"ok"`` (approved; spent,
-        marked seen and, for ``yes always``, the rule added, once), ``"denied"`` (no, expired,
-        or the run ended while it was pending), ``"pending"`` (a prompt that never got out
-        is sent again), or None when no approval was ever made for it."""
-        system, action = store.slug(system), store.slug(action)
-        run = runs_store.get(self.conn, run_code)
-        if run is None or run.task_id is None:
-            return None
-        intent_hash = check_hash(
-            run.code, system, action, bool(irreversible), float(cost_usd), clean_what(what)
-        )
-        now = self.clock()
-        with atomic(self.conn):
-            ap.expire_due(self.conn, now)
-            row = ap.latest_for_intent(self.conn, run.task_id, intent_hash)
-            if row is not None and row.status == "pending" and not run.active:
-                ap.expire_one(self.conn, row.id, now, reason="run ended")
-                row = ap.get_approval(self.conn, row.id)
-        if row is None or row.tool != CHECK_TOOL:
-            return None
-        if row.status == "approved":
-            first = row.used_at is None
-            answer = await self._approved(run.code, row, system, action)
-            if first:
-                self._audit(run.code, system, action, answer, None, approval_id=row.id)
-            return answer
-        if row.status != "pending":
-            if row.decided_at is not None or row.status == "expired":
-                self._audit(run.code, system, action, "denied", row.status, approval_id=row.id)
-            return "denied"
-        if not row.channel_refs:  # the first prompt failed for now: try again
-            needs = NeedsApproval(
-                approval_id=row.id, code=row.code or "", approvers=row.approvers,
-                expires_at=row.expires_at, summary=row.summary, effect=row.effect,
-                level=row.level, require_code=row.require_code, allow_always=row.allow_always,
-            )  # fmt: skip
-            if await self._prompt(run.task_id, needs) is False:
-                with atomic(self.conn):
-                    ap.expire_one(self.conn, row.id, self.clock(), reason="unreachable")
-                return "denied"
-        return "pending"
-
-    def cancel_checks(self, run_code: str) -> int:
-        """Expire every pending check of a run that ended (cancelled, killed), so a late
-        ``yes`` binds nothing. Returns how many."""
-        run = runs_store.get(self.conn, run_code)
-        if run is None or run.task_id is None:
-            return 0
-        now = self.clock()
-        with atomic(self.conn):
-            rows = self.conn.execute(
-                "SELECT id FROM approvals WHERE task_id = ? AND tool = ? AND status = 'pending'",
-                (run.task_id, CHECK_TOOL),
-            ).fetchall()
-            return sum(ap.expire_one(self.conn, r["id"], now, reason="run ended") for r in rows)
 
     # -- internals --
 
