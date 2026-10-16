@@ -851,7 +851,10 @@ class McpToolHandler(ContextHandler):
             raise ToolFailed("arguments are not JSON") from None
         if size > ARGS_MAX_BYTES:
             raise ToolFailed(f"arguments are over {ARGS_MAX_BYTES} bytes")
-        errors = sorted(self._validator().iter_errors(args), key=lambda e: list(e.path))
+        try:
+            errors = sorted(self._validator().iter_errors(args), key=lambda e: list(e.path))
+        except Exception:  # e.g. a $ref that doesn't resolve: nothing was sent
+            raise ToolFailed("the tool's schema can't be checked") from None
         if errors:  # the pinned schema is enforced here, not only shown to the model
             where = "/".join(str(p) for p in errors[0].path) or "arguments"
             raise ToolFailed(f"{where} doesn't match the tool's schema")
