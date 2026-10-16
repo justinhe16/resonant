@@ -15,10 +15,15 @@
     consumes the event.
 
 Order: slash commands first (so ``/kill`` is never read as a reply), then approval replies
-(``router/approvals.py``: the parser, then ``gate.resolve_reply``), then keywords and the
-labeler. A reply that resolves an approval returns None (consumed; the woken runner sends
-the confirmation). A refused reply gets a code-built ``fast_reply`` titled
-``approval reply``. Text the parser doesn't recognize routes normally.
+(``router/approvals.py``: the parser, then ``gate.resolve_reply``), then the relay's direct
+step (``router/relay.py``: ``R4 …``, an option pick, the answer to ``For R4 or R6?``), then
+keywords and the labeler, then the relay's free-text step (the brain picks the question a
+reply answers). A plain ``yes``/``no`` while a worker question is open goes to the relay
+when no approval prompt is open, and gets "which one?" when one is (EM-5). Relay replies are
+code-built ``fast_reply`` tasks titled ``worker reply``. A reply that resolves an approval
+returns None (consumed; the woken runner sends the confirmation). A refused reply gets a
+code-built ``fast_reply`` titled ``approval reply``. Text the parser doesn't recognize
+routes normally.
 
 ``gate`` is the full ``Gate`` (``PolicyGate``, or ``DryRunGate`` before it is wired): the
 fast path uses ``evaluate``/``consume``/``pending_for``, the inbox ``resolve_reply``.
@@ -54,6 +59,7 @@ from typing import Any, Literal
 
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.gate import Gate
+from resonant.gate.replies import parse_reply
 from resonant.loop.types import PRIORITY_MEMBER, PRIORITY_OWNER, NewTask
 from resonant.models import ModelClient, SpanFactory
 from resonant.observability.spans import span
@@ -73,6 +79,7 @@ from resonant.router.intents import (
 )
 from resonant.router.labeler import Labeler
 from resonant.router.prefixes import toolset_prefix_hash
+from resonant.router.relay import Relay, clash_text, parse_addressed
 from resonant.store.db import utcnow
 from resonant.tools import ToolRegistry
 from resonant_sdk import Event, ToolSpec
@@ -82,6 +89,7 @@ KIND_REPLY = "reply"
 KIND_CHAT = "chat"
 KIND_COMMAND = "command"
 APPROVAL_TITLE = "approval reply"
+RELAY_TITLE = "worker reply"
 
 
 log = logging.getLogger(__name__)
@@ -164,6 +172,8 @@ async def classify(
     cmd = match_fast_path(text)
     if cmd is not None:
         return Classification(cmd.intent, "fast", 1.0, command=cmd.name)
+    if parse_addressed(text) is not None:  # "R4 …": the relay's direct step, no model call
+        return Classification("run_project", "fast", 1.0, command="relay")
     label = await labeler.label(text, spans=spans)
     return Classification(label.intent, "llm", label.confidence, fallback=label.fallback)
 
@@ -202,6 +212,8 @@ class Router:
             command_table=commands_for(extensions, registry),  # built once, like intents
         )
         self.inbox = ApprovalInbox(conn, principals=principals, gate=gate)
+        # Worker questions and messages (EM-5); wiring sets relay.workers to the runner.
+        self.relay = Relay(conn, principals=principals, model=model, clock=clock)
         self.labeler = Labeler(model, self.intents)
 
     def toolset_for(self, intent: IntentLabel, principal: str) -> list[ToolSpec]:
@@ -269,11 +281,27 @@ class Router:
             if result is not None:
                 return reply(result.reply_text, result.tool_used, result.intent, result.command)
 
-        answered = self.inbox.handle(event, text, principal, spans=spans)
+        def relayed(text: str) -> NewTask:
+            return reply(text, None, "run_project", RELAY_TITLE)
+
+        # A plain yes/no while a worker question is open: the approval keeps it only when no
+        # question competes; with both open, it binds neither (relay.py, "approval clash").
+        skip_inbox = False
+        plain = parse_reply(text, truncated=event.payload.get("truncated") is True)
+        if plain is not None and plain.code is None and self.relay.open_for(event, principal):
+            sent = self.inbox.sent_pending(principal)
+            if sent:
+                return relayed(clash_text(sent, self.relay.open_for(event, principal)))
+            skip_inbox = True
+        answered = None if skip_inbox else self.inbox.handle(event, text, principal, spans=spans)
         if answered is not None:
             if answered.reply is None:
                 return None  # consumed: the woken runner sends the confirmation
             return reply(answered.reply, None, "job_control", APPROVAL_TITLE)
+
+        direct = self.relay.direct(event, text, principal)
+        if direct is not None:
+            return relayed(direct.reply)
 
         if cmd is not None and not cmd.slash:
             result = await self.fast_path.run(
@@ -283,6 +311,9 @@ class Router:
                 return reply(result.reply_text, result.tool_used, result.intent, result.command)
 
         label = await self.labeler.label(text, spans=spans)
+        free = await self.relay.free(event, text, principal, label.intent, spans=spans)
+        if free is not None:
+            return relayed(free.reply)
         toolset = self.toolset_for(label.intent, principal)
         prefix_hash = toolset_prefix_hash(label.intent, toolset, self.intents)
         with spans(

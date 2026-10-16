@@ -22,6 +22,12 @@
 {"text": "cancel R3", "intent": "run_project"}
 {"text": "merge R3", "intent": "run_project"}
 {"text": "how's R2 going", "intent": "run_project"}
+{"text": "R4 yes go with postgres", "intent": "run_project"}
+{"text": "use the second option", "intent": "run_project"}
+{"text": "tell R6 to skip the docs", "intent": "run_project"}
+{"text": "for the trading one, ship it", "intent": "run_project"}
+{"text": "R2: just the top README", "intent": "run_project"}
+{"text": "go with sqlite for now", "intent": "run_project"}
 {"text": "remind me what a retry policy with jitter is", "intent": "question"}
 {"text": "how many ounces in a cup", "intent": "question"}
 {"text": "explain the difference between a mutex and a semaphore", "intent": "question"}

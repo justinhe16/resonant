@@ -414,6 +414,8 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "start_run": _run_text,
     "cancel_run": _run_text,
     "merge_run": _run_text,
+    "answer_worker": _run_text,
+    "message_worker": _run_text,
     "add_trust_rule": _rule_added,
     "allow_trust_rule": _rule_added,
     "remove_trust_rule": _rule_removed,

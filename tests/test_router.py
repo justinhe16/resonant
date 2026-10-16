@@ -791,7 +791,7 @@ async def test_prefix_bytes_identical_across_calls() -> None:
     prefix_b = json.dumps(b[:-1]).encode()
     assert prefix_a == prefix_b
     assert a[-1] == {"role": "user", "content": "<message>first message</message>"}
-    assert 8 <= sum(m["role"] == "assistant" for m in a) <= 18  # few-shot examples
+    assert 8 <= sum(m["role"] == "assistant" for m in a) <= 20  # few-shot examples
 
 
 def test_label_prefix_snapshot() -> None:

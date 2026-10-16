@@ -127,12 +127,12 @@ class ApprovalInbox:
         )
         if result.ok:
             return InboxResult(None, "replay" if replay else "resolved")
-        sent = self._sent_pending(principal)
+        sent = self.sent_pending(principal)
         return InboxResult(
             refusal_reply(result.reason, parsed.code, sent), "refused", result.reason
         )
 
-    def _sent_pending(self, principal: str) -> list[PendingApproval]:
+    def sent_pending(self, principal: str) -> list[PendingApproval]:
         """The principal's pending approvals whose prompts were already sent to them."""
         out: list[PendingApproval] = []
         for p in self.gate.pending_for(principal):

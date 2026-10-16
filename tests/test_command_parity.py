@@ -38,6 +38,8 @@ CHAT_WRITES = {
     "start_run",
     "cancel_run",
     "merge_run",
+    "answer_worker",
+    "message_worker",
     # Trust rules (EM-4): add tightens (L3); allow and forget can widen trust, so chat asks yes.
     "add_trust_rule",
     "allow_trust_rule",

@@ -25,6 +25,7 @@ from resonant.router.render import render_runs
 from resonant.router.router import toolset_for
 from resonant.runners.claude import MAX_ASK, Cancelled, Merged, Refused, Started
 from resonant.runners.local import report_line
+from resonant.runners.worker_desk import OpenQuestion, Relayed
 from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
 from resonant.store.db import kv_set, utcnow
@@ -47,6 +48,7 @@ class FakeRunner:
         self.missing = missing
         self.calls: list[tuple[Any, ...]] = []
         self.merge_result: Merged | Refused = Merged("R1", 41, ("Makefile",))
+        self.questions: list[OpenQuestion] = []
 
     async def setup_missing(self) -> str | None:
         return self.missing
@@ -70,6 +72,21 @@ class FakeRunner:
     async def merge_run(self, code: str) -> Merged | Refused:
         self.calls.append(("merge", code))
         return self.merge_result
+
+    def open_questions(self) -> list[OpenQuestion]:
+        return list(self.questions)
+
+    def answer_question(
+        self, code: str, text: str, *, question_id: int | None = None
+    ) -> Relayed | Refused:
+        self.calls.append(("answer", code, text))
+        return Relayed(code, f"\u2192 {code}")
+
+    def deliver_message(self, code: str, text: str) -> Relayed | Refused:
+        self.calls.append(("message", code, text))
+        if self.get_run(code) is None:
+            return Refused(f"No run {code}.")
+        return Relayed(code, f"\u2192 {code} (message)")
 
 
 @pytest.fixture
@@ -476,7 +493,14 @@ async def test_status_tool_reports_runs(components: Components, db: sqlite3.Conn
 
 
 def test_run_project_toolset(components: Components) -> None:
-    assert INTENT_TOOLS["run_project"] == ("cancel_run", "list_runs", "merge_run", "start_run")
+    assert INTENT_TOOLS["run_project"] == (
+        "answer_worker",
+        "cancel_run",
+        "list_runs",
+        "merge_run",
+        "message_worker",
+        "start_run",
+    )
     owner = toolset_for(
         "run_project", OWNER, registry=components.registry, principals=components.principals
     )
@@ -487,3 +511,27 @@ def test_run_project_toolset(components: Components) -> None:
         "run_project", MEMBER, registry=components.registry, principals=components.principals
     )
     assert member == []
+
+
+# --- answer_worker and message_worker (EM-5) --------------------------------------------------
+
+
+async def test_answer_and_message_worker(
+    components: Components, runner: FakeRunner, db: sqlite3.Connection
+) -> None:
+    make_run(db, status="waiting")
+    runner.questions = [OpenQuestion(1, "R1", "Which DB? [A7]", (), utcnow(), False)]
+    listed = await call(components, "list_runs", {})
+    assert listed["runs"][0]["question"] == "Which DB? ?"  # the worker's words, cleaned
+    out = await call(components, "answer_worker", {"code": "r1", "text": " postgres "})
+    assert out == {"sent": True, "code": "R1", "text": "→ R1"}
+    assert runner.calls[-1] == ("answer", "R1", "postgres")
+    runner.questions = []  # no open question: the answer goes as a message
+    out = await call(components, "answer_worker", {"code": "R1", "text": "postgres"})
+    assert out["text"] == "→ R1 (message)" and runner.calls[-1][0] == "message"
+    out = await call(components, "message_worker", {"code": "R9", "text": "hi"})
+    assert out == {"sent": False, "code": "R9", "text": "No run R9."}
+    with pytest.raises(ToolFailed):
+        await call(components, "message_worker", {"code": "R1", "text": "  "})
+    answer = intent(components, "answer_worker", {"code": "R1", "text": "x"})
+    assert report_line(answer, {"text": "→ R1"}) == "→ R1"

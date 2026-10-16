@@ -29,6 +29,10 @@ from resonant_sdk import Effect, Event, Level, new_id
 
 ApprovalStatus = Literal["pending", "approved", "rejected", "expired"]
 
+# The approvals' tool for a worker's ``resonant check`` (``trust.checks`` uses it).
+# Its approval may be answered while the run's task is queued.
+CHECK_TOOL = "trust_check"
+
 # Why ``resolve`` refused. "task_not_waiting": the task is no longer waiting or running.
 # "always_unsupported": ``yes always`` for an approval that doesn't offer it.
 ResolveRefusal = Literal[
@@ -321,7 +325,10 @@ def resolve(
     """Approve or reject a pending approval. Returns None on success, else why not.
 
     One conditional UPDATE: the row must still be pending and unexpired, and its task must
-    be waiting or running. The refusal reason is read afterwards and is informational only.
+    be waiting or running. A worker's trust check (``tool = 'trust_check'``) is also
+    answerable while its run's task is ``queued`` (woken and waiting for a Claude slot): the
+    check's own wait reads the row, not the task (EM-5). The refusal reason is read
+    afterwards and is informational only.
     ``always`` (``yes always``) is recorded only on an approval that offered it and needs no
     code; the gate checks that first, and the UPDATE checks it again.
     """
@@ -333,7 +340,8 @@ def resolve(
            WHERE id = ? AND status = 'pending' AND expires_at > ?
              AND (? = 0 OR (allow_always = 1 AND require_code = 0))
              AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = approvals.task_id
-                         AND tasks.status IN ('waiting', 'running'))""",
+                         AND (tasks.status IN ('waiting', 'running')
+                              OR (tasks.status = 'queued' AND approvals.tool = ?)))""",
         (
             "approved" if approved else "rejected",
             decided_by,
@@ -343,6 +351,7 @@ def resolve(
             approval_id,
             iso(now),
             always,
+            CHECK_TOOL,
         ),
     )
     if cur.rowcount == 1:

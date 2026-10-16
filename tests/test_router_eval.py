@@ -31,6 +31,7 @@ from resonant.models import (
 from resonant.router import Labeler, match_fast_path
 from resonant.router import router as router_mod
 from resonant.router.intents import BUILTIN_INTENTS, IntentLabel, IntentSet
+from resonant.router.relay import parse_addressed
 from resonant_sdk import Manifest
 from resonant_sdk.manifest import parse_yaml
 
@@ -249,7 +250,9 @@ async def test_eval_calls_the_production_classify(monkeypatch: pytest.MonkeyPatc
     assert len(results) == 2 * len(cases)
     assert all(r.correct for r in results)
     # The fast path never reaches the model; one warm-up call comes first.
-    llm = [c.text for c in cases if match_fast_path(c.text) is None]
+    llm = [
+        c.text for c in cases if match_fast_path(c.text) is None and parse_addressed(c.text) is None
+    ]
     assert model.texts == [router_eval.WARMUP_TEXT, *llm, *llm]
     assert {r.path for r in results} == {"fast", "llm"}
 
@@ -306,7 +309,7 @@ def test_cli_json_output(use_model: Any, resonant_home: Path) -> None:
     assert data["fast_path_coverage"] is not None
     assert data["misclassified"] == [
         {
-            "line": 29,
+            "line": 35,
             "expected": "unknown",
             "predicted": "question",
             "path": "llm",
