@@ -284,7 +284,10 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
         lines.append(f"    {_s(name, 40)} runs {tool.run}")
     if m.mcp:
         for sid, tool in m.mcp.tools():
-            lines.append(f"    {_s(tool.name, 40)} via mcp server {_s(sid, 40)}")
+            names = ", ".join(_s(n, 40) for n in _arg_names(staged.mcp_pins.get(tool.name)))
+            lines.append(
+                f"    {_s(tool.name, 40)} via mcp server {_s(sid, 40)}; args: {names or 'none'}"
+            )
     lines.append("Jobs:" if m.jobs else "Jobs: none")
     for job in m.jobs:
         spec = job.spec(m.name)
@@ -306,6 +309,17 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
         lines.append(f"warning: {len(m.tools)} tools; above {TOOL_WARN_COUNT} routing suffers")
     lines += [f"note: {n}" for n in staged.notes]
     return lines
+
+
+def _arg_names(entry: object) -> list[str]:
+    """The property names of a pinned MCP tool's stripped schema (shown at install)."""
+    schema: object = (
+        cast(dict[str, Any], entry).get("input_schema") if isinstance(entry, dict) else None
+    )
+    props: object = (
+        cast(dict[str, Any], schema).get("properties") if isinstance(schema, dict) else None
+    )
+    return list(cast(dict[str, Any], props)) if isinstance(props, dict) else []
 
 
 def update_lines(

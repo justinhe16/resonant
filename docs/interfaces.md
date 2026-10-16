@@ -670,7 +670,9 @@ A minimal JSON-RPC 2.0 client over newline-delimited stdio (protocol `2025-06-18
 
 ```python
 strip_schema(schema) -> schema         # keeps type, properties, required, items, enum, const, bounds, pattern, format, $ref/$defs, anyOf/oneOf/allOf/not, additionalProperties …; drops description, title, default, examples, $comment, x-*
-input_schema(tool) -> dict             # the stripped inputSchema (must be type object, <= 16 KB)
+input_schema(tool) -> dict             # the stripped inputSchema (must be type object, <= 16 KB); values type-checked:
+                                       # type a JSON type (or list), bounds numbers, required/property names <= 64 chars,
+                                       # enum (<= 100 scalars) / const / pattern / format strings <= 100 chars, $ref local "#/…"
 tool_pin(tool) -> str                  # sha256 of canonical JSON [name, description, inputSchema, outputSchema, annotations]
 approve(server_id, listed, tools) -> Discovered(pins: {tool: McpToolPin(server, pin, input_schema)}, problems, ignored)
 pins_json(pins) / parse_pins(raw) / pins_digest(raw)   # the ExtensionRecord.mcp_pins form and its digest
@@ -681,13 +683,14 @@ McpSession(req, tracker, *, redact, python, message_cap, stderr_cap, on_list_cha
     .alive ; .ended ; .stderr_tail()
 McpServerRuntime(ext, server_id, argv, root, data_dir, path_env, bins, secret_names, approved: {tool: pin}, tracker, secrets, on_drift, …)
     await .start() ; await .call(tool, args, timeout_s) -> dict ; await .aclose() ; .disabled: {tool: why}
-McpToolHandler(ext, spec, runtime)     # a ContextHandler
+McpToolHandler(ext, spec, runtime)     # a ContextHandler: args must be JSON <= 64 KB and validate against
+                                       # spec.args_schema (jsonschema 2020-12, local refs only), else ToolFailed
 ```
 
 - **Process.** `process.spawn_stdio(req, python, limit)`: the trampoline with stdin/stdout/stderr pipes, the env exactly `scratch_env(...)` minus `RESONANT_EVENTS_FD`, its `RESONANT_SECRET_*` keys moved to fd 4 (`RESONANT_SECRETS_FD=4`), argv[0] absolute, a new session. The secrets are `SecretStore.env_for(ext, server.secrets)`: the union of its tools' declared secrets, read when the server starts. The session tracks the pid in the host's `ProcessTracker` (sampled tree): `/kill` (`kill_all(hold=True)`) ends it, pending calls raise `McpAmbiguous("killed")`, and no server starts while held (`ExtFailed("paused")`).
 - **Handshake.** `initialize` with no client capabilities, then `notifications/initialized`. A version outside the supported set or no `tools` capability is `McpError`. `tools/list` follows `nextCursor` (at most 20 pages, 500 tools).
 - **Messages.** One line is at most `message_cap` (`extensions.process.stdout_max_bytes`, 256 KB); a longer one ends the server (`output too large`). Non-JSON lines are ignored. Server requests: `ping` gets `{}`, anything else (sampling, roots, elicitation) `-32601`. `notifications/tools/list_changed` re-lists and re-checks; calls wait for it (bounded by their timeout).
-- **Calls.** `tools/call {name, arguments}` with the tool's `timeout_s`; on timeout or cancel a `notifications/cancelled` is sent. Result: `{"text": <text items joined by newlines; other types as "[<type> omitted]">, "structured"?: structuredContent}`, deep-redacted with the server's secret values. A JSON-RPC error is `McpError("server error <code>")` (definite); `isError` is `McpToolError` and timeouts, kills and exits are `McpAmbiguous`, which the executor treats as failed for reads and ambiguous for writes. Error texts are code-built; server text never reaches them.
+- **Calls.** `tools/call {name, arguments}` with the tool's `timeout_s` (the write to stdin too: a server that stops reading is ended, `McpAmbiguous("timeout")`); on timeout or cancel a `notifications/cancelled` is sent. Result: `{"text": <text items joined by newlines; other types as "[<type> omitted]">, "structured"?: structuredContent}`, deep-redacted with the server's secret values. A JSON-RPC error is `McpError("server error <code>")` (definite); a malformed reply is `McpAmbiguous`; `isError` is `McpToolError` and timeouts, kills and exits are `McpAmbiguous`, which the executor treats as failed for reads and ambiguous for writes. Error texts are code-built; server text never reaches them.
 - **stderr.** Kept raw in memory (last `stderr_max_bytes`); only `stderr_tail()` leaves, redacted and 200 chars: on the failure audit row and the `mcp server ended` warning.
 - **Stop.** `close()` closes stdin, waits 0.5 s, then always SIGTERMs the group and the tracked tree and SIGKILLs after the grace: MCP servers often leave children behind on a graceful exit. A server that ended is restarted on the next call.
 

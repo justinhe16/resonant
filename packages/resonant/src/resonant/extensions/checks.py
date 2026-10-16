@@ -39,12 +39,15 @@ FETCH_RUNNERS = frozenset(
     {"npx", "bunx", "pnpx", "pipx", "uvx", "uv", "docker", "podman", "curl", "wget"}
 )
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "env"})
+MCP_SHELLS = SHELLS | {"ksh", "csh", "tcsh"}
 # Interpreters and package managers, refused as an MCP server command (any ``python*`` too):
 # their arguments name code the install pin doesn't cover.
 INTERPRETERS = frozenset(
     {
         "node", "nodejs", "deno", "bun", "ruby", "perl", "php", "java", "lua", "osascript",
         "npm", "pnpm", "yarn", "pip", "pip3", "brew", "go", "cargo", "poetry", "pdm",
+        "swift", "dotnet", "tsx", "ts-node", "corepack", "nix", "busybox", "awk", "xargs",
+        "nohup", "sudo", "su", "doas", "timeout", "nice", "caffeinate", "open",
     }
 )  # fmt: skip
 RESERVED_WORDS: frozenset[str] = frozenset()  # command words reserved beyond BY_NAME
@@ -125,7 +128,7 @@ def mcp_command_error(root: Path, command: str) -> str | None:
     name = Path(command).name
     if name in FETCH_RUNNERS:
         return f"{command!r} fetches and runs code at call time; refused"
-    if name in SHELLS:
+    if name in MCP_SHELLS:
         return f"{command!r}: commands never run through a shell; refused"
     if name in INTERPRETERS or name.startswith("python"):
         return (
@@ -159,6 +162,8 @@ def resolve_mcp_command(root: Path, command: str, path: str = EXT_PATH) -> str:
     if found is None or not os.path.isfile(found) or not os.access(found, os.X_OK):
         raise ValueError(f"{command!r} is not an executable on {path}")
     real = Path(os.path.realpath(found))
+    if err := mcp_command_error(root, str(real)):  # a link named "server" to uvx or node
+        raise ValueError(f"{command!r} resolves to {real}: {err}")
     if not (_unwritable(real) or guarded_tool(Path(found))):
         raise ValueError(
             f"{command!r} resolves to {real}, which Claude workers can write; install the "

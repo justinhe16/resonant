@@ -688,12 +688,14 @@ async def send_alerts(conn: sqlite3.Connection, channel: Sender, owner: str | No
         except ChannelError as e:
             log.warning("extension alert failed (will retry on next start): %s", e)
             continue
-        _drop_alert(conn, name)
+        _drop_alert(conn, name, alert["dedupe_key"])
     return sent
 
 
-def _drop_alert(conn: sqlite3.Connection, name: str) -> None:
+def _drop_alert(conn: sqlite3.Connection, name: str, dedupe_key: str) -> None:
+    """Drop the alert just sent, unless a newer one replaced it meanwhile."""
     with atomic(conn):
         alerts = pending_alerts(conn)
-        alerts.pop(name, None)
+        if alerts.get(name, {}).get("dedupe_key") == dedupe_key:
+            alerts.pop(name, None)
         kv_set(conn, ALERTS_KEY, alerts)

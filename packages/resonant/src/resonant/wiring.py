@@ -170,13 +170,13 @@ class IMessageStack:
                 log.info("sent back-up message after a requested restart")
         except Exception:
             log.exception("back-up message failed")  # never blocks the start
+        if self.extensions is not None:  # MCP pin drift found from now on is sent right away
+            self.extensions.alert = self._send_alerts
         try:
             if sent := await send_alerts(self.channel.conn, self.channel, self.owner):
                 log.info("sent %d extension alert(s)", sent)
         except Exception:
             log.exception("extension alerts failed")  # never blocks the start
-        if self.extensions is not None:  # MCP pin drift found later is sent right away
-            self.extensions.alert = self._send_alerts
 
     async def _send_alerts(self) -> None:
         try:

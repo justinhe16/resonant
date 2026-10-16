@@ -55,6 +55,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+import jsonschema
+
 from resonant import __version__
 from resonant.executor import CallContext, ContextHandler, ToolFailed
 from resonant.extensions.process import (
@@ -84,6 +86,7 @@ MAX_TOOLS = 500
 MAX_PAGES = 20
 SCHEMA_MAX_BYTES = 16 * 1024
 SCHEMA_MAX_DEPTH = 32
+ARGS_MAX_BYTES = 64 * 1024
 
 # JSON Schema keywords kept in an input schema. Everything else (description, title, default,
 # examples, $comment, x-*) is dropped: free text the model would read as instructions.
@@ -150,8 +153,58 @@ def strip_schema(schema: object, depth: int = 0) -> Any:
         elif key in _SCHEMA_LISTS and isinstance(value, list):
             out[key] = [strip_schema(v, depth + 1) for v in cast(list[Any], value)]
         elif key in _SCHEMA_VALUES:
-            out[key] = value
+            out[key] = _schema_value(key, value)
+    for name in cast(dict[str, Any], out.get("properties", {})):
+        if not _short(name, NAME_MAX):
+            raise ValueError("a property name is too long or not printable")
     return out
+
+
+_JSON_TYPES = frozenset({"object", "array", "string", "number", "integer", "boolean", "null"})
+_NUMBERS = frozenset({"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"})
+_COUNTS = frozenset(
+    {"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"}
+)
+NAME_MAX = 64
+TEXT_MAX = 100  # enum/const strings, pattern, format: server text the model reads
+ENUM_MAX = 100
+
+
+def _short(v: object, limit: int = TEXT_MAX) -> bool:
+    return isinstance(v, str) and len(v) <= limit and v.isprintable()
+
+
+def _scalar(v: object) -> bool:
+    return v is None or isinstance(v, bool | int | float) or _short(v)
+
+
+def _schema_value(key: str, v: object) -> Any:
+    """A validation keyword's value, type-checked and length-capped, so a schema can't carry
+    free text to the model through a value. Raises ValueError."""
+    ok: bool
+    if key == "type":
+        items = cast(list[object], v) if isinstance(v, list) else [v]
+        ok = bool(items) and all(isinstance(t, str) and t in _JSON_TYPES for t in items)
+    elif key in _NUMBERS:
+        ok = isinstance(v, int | float) and not isinstance(v, bool)
+    elif key in _COUNTS:
+        ok = isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    elif key in ("uniqueItems", "nullable"):
+        ok = isinstance(v, bool)
+    elif key == "required":
+        ok = isinstance(v, list) and all(_short(n, NAME_MAX) for n in cast(list[object], v))
+    elif key == "enum":
+        vals = cast(list[object], v) if isinstance(v, list) else []
+        ok = isinstance(v, list) and len(vals) <= ENUM_MAX and all(_scalar(e) for e in vals)
+    elif key == "const":
+        ok = _scalar(v)
+    elif key == "$ref":
+        ok = _short(v, 200) and cast(str, v).startswith("#/")
+    else:  # format, pattern
+        ok = _short(v)
+    if not ok:
+        raise ValueError(f"its schema has a bad {key!r} value")
+    return cast(Any, v)
 
 
 def input_schema(tool: Mapping[str, Any]) -> dict[str, Any]:
@@ -446,6 +499,7 @@ class McpSession:
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(McpAmbiguous(ended, stderr_tail=tail))
+                fut.add_done_callback(_retrieve)
         self._pending.clear()
         if self._ended not in ("closed", "start failed"):
             log.warning(
@@ -461,7 +515,12 @@ class McpSession:
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
         try:
-            await self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+            msg = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+            try:
+                await asyncio.wait_for(self._send(msg), timeout_s)
+            except TimeoutError:  # the server stopped reading stdin; part may have arrived
+                self._spawn(self.close("stuck"))
+                raise McpAmbiguous("timeout", stderr_tail=self.stderr_tail()) from None
             try:
                 return await asyncio.wait_for(fut, timeout_s)
             except TimeoutError:
@@ -474,13 +533,16 @@ class McpSession:
             self._pending.pop(rid, None)
 
     async def _cancel(self, rid: int, reason: str) -> None:
-        with contextlib.suppress(McpError):
-            await self._send(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "notifications/cancelled",
-                    "params": {"requestId": rid, "reason": reason},
-                }
+        with contextlib.suppress(McpError, TimeoutError):
+            await asyncio.wait_for(
+                self._send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": rid, "reason": reason},
+                    }
+                ),
+                1.0,
             )
 
     async def _send(self, msg: dict[str, Any]) -> None:
@@ -559,7 +621,8 @@ class McpSession:
         elif isinstance(m.get("result"), dict):
             fut.set_result(cast(dict[str, Any], m["result"]))
         else:
-            fut.set_exception(McpError("malformed response"))
+            # Sent and maybe run: not definite.
+            fut.set_exception(McpAmbiguous("malformed response", stderr_tail=self.stderr_tail()))
 
     async def _answer(self, rid: Any, method: str) -> None:
         if not isinstance(rid, str | int) or isinstance(rid, bool):
@@ -571,6 +634,11 @@ class McpSession:
             reply["error"] = {"code": -32601, "message": "method not supported"}
         with contextlib.suppress(McpError):
             await self._send(reply)
+
+
+def _retrieve(fut: asyncio.Future[Any]) -> None:
+    if not fut.cancelled():
+        fut.exception()  # its waiter may be gone: don't warn "never retrieved"
 
 
 # --- one server of an installed extension ----------------------------------------------
@@ -613,6 +681,7 @@ class McpServerRuntime:
     _verified: asyncio.Event = field(default_factory=asyncio.Event)
     _dirty: bool = False
     _recheck_task: asyncio.Task[None] | None = None
+    _closed: bool = False
 
     @property
     def label(self) -> str:
@@ -631,6 +700,8 @@ class McpServerRuntime:
                 self.session = None
             if self.tracker.paused:
                 raise ExtFailed("paused")
+            if self._closed:
+                raise McpError("server is shutting down")
             env_secrets: dict[str, str] = {}
             if self.secret_names:
                 store = self.secrets()
@@ -673,10 +744,14 @@ class McpServerRuntime:
             except BaseException:
                 await session.close("start failed")
                 raise
+            if self._closed:
+                await session.close()
+                raise McpError("server is shutting down")
             self._check(tools)
             self._redactor = redactor
             self.session = session
-            self._verified.set()
+            if self._recheck_task is None or self._recheck_task.done():
+                self._verified.set()
             return session
 
     async def call(self, tool: str, args: dict[str, Any], timeout_s: float) -> dict[str, Any]:
@@ -700,6 +775,7 @@ class McpServerRuntime:
         return redactor.deep(result)
 
     async def aclose(self) -> None:
+        self._closed = True
         if self._recheck_task is not None:
             self._recheck_task.cancel()
             with contextlib.suppress(BaseException):
@@ -708,16 +784,16 @@ class McpServerRuntime:
             await self.session.close()
 
     def _check(self, tools: list[dict[str, Any]]) -> None:
-        live: dict[str, str] = {}
+        live: dict[str, str | None] = {}
         for t in tools:
             name = t.get("name")
-            if isinstance(name, str) and name not in live:
-                live[name] = tool_pin(t)
+            if isinstance(name, str):
+                live[name] = None if name in live else tool_pin(t)  # a duplicate is drift
         for tool, pin in self.approved.items():
             got = live.get(tool)
             if got == pin or tool in self.disabled:
                 continue
-            self.disabled[tool] = "removed" if got is None else "changed"
+            self.disabled[tool] = "removed" if tool not in live else "changed"
             log.warning(
                 "mcp tool disabled",
                 extra={"label": self.label, "tool": tool, "why": self.disabled[tool]},
@@ -729,6 +805,8 @@ class McpServerRuntime:
                     log.exception("mcp drift alert failed")
 
     def _list_changed(self, session: McpSession) -> None:
+        if self.session is not None and session is not self.session:
+            return  # an old session's notification
         self._verified.clear()
         self._dirty = True
         if self._recheck_task is None or self._recheck_task.done():
@@ -736,6 +814,9 @@ class McpServerRuntime:
 
     async def _recheck(self, session: McpSession) -> None:
         try:
+            if self.session is None:  # during ensure(): wait for its first list
+                async with self._lock:
+                    pass
             while self._dirty and session.alive:
                 self._dirty = False
                 try:
@@ -756,10 +837,24 @@ class McpToolHandler(ContextHandler):
     spec: ToolSpec
     runtime: McpServerRuntime
 
+    def _validator(self) -> Any:
+        # Local $refs only: jsonschema's referencing registry never fetches remote ones.
+        return jsonschema.Draft202012Validator(self.spec.args_schema)
+
     async def __call__(self, args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         undeclared = set(ctx.secrets) - {f"RESONANT_SECRET_{s.upper()}" for s in self.spec.secrets}
         if undeclared:  # the executor passes only declared ones; never widen
             raise ToolFailed("secrets not declared by this tool")
+        try:
+            size = len(json.dumps(args, allow_nan=False))
+        except (TypeError, ValueError):
+            raise ToolFailed("arguments are not JSON") from None
+        if size > ARGS_MAX_BYTES:
+            raise ToolFailed(f"arguments are over {ARGS_MAX_BYTES} bytes")
+        errors = sorted(self._validator().iter_errors(args), key=lambda e: list(e.path))
+        if errors:  # the pinned schema is enforced here, not only shown to the model
+            where = "/".join(str(p) for p in errors[0].path) or "arguments"
+            raise ToolFailed(f"{where} doesn't match the tool's schema")
         return await self.runtime.call(self.spec.name, args, self.spec.timeout_s)
 
 
