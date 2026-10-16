@@ -19,7 +19,7 @@ import subprocess
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from resonant.config import Settings
@@ -163,6 +163,9 @@ def pin_rows(root: Path, records: Sequence[ExtensionRecord]) -> list[Row]:
         step = f"extension {r.name} pin"
         state = verify_copy(r, root / r.name)
         gone = sorted(p for p in set(r.argv0_paths.values()) if not os.access(p, os.X_OK))
+        # a declared bin with no pin (installed before EM-11's bins): the host refuses it
+        bins = cast(list[str], r.manifest.get("bins") or [])
+        gone += [f"{b} (not pinned)" for b in bins if f"bin:{b}" not in r.argv0_paths]
         if r.status == "disabled_tampered":
             rows.append(("FAIL", False, step, f"disabled_tampered; resonant ext update {r.name}"))
         elif state != "ok":

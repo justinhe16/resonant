@@ -276,6 +276,9 @@ class Manifest(BaseModel):
     health: Health | None = None
     secrets: tuple[SecretName, ...] = ()
     repos: tuple[str, ...] = Field(default=(), max_length=REPOS_MAX)  # GitHub "owner/name" links
+    # Host binaries the extension's own code runs (the github extension's gh). Each is pinned
+    # by absolute path at install and given as RESONANT_BIN_<NAME>; PATH never has to hold it.
+    bins: tuple[Literal["gh", "git"], ...] = ()
 
     @field_validator("name")
     @classmethod
@@ -305,6 +308,13 @@ class Manifest(BaseModel):
             raise ValueError(f"repos must be GitHub owner/name: {bad}")
         if len({r.lower() for r in v}) != len(v):
             raise ValueError("repos must be unique")
+        return v
+
+    @field_validator("bins")
+    @classmethod
+    def _bins(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(v)) != len(v):
+            raise ValueError("bins must be unique")
         return v
 
     @model_validator(mode="after")

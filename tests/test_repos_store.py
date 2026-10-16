@@ -194,6 +194,58 @@ def test_import_config_skips_an_owner_clash_and_imports_the_rest(db: sqlite3.Con
     assert repos.find(db, "web").slug == "a/web"  # pyright: ignore[reportOptionalMemberAccess]
 
 
+def test_a_path_only_entry_keeps_the_registrys_values(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """An entry added for a checkout path doesn't reset what the registry knows (EM-11)."""
+    repos.add(db, "own/pub", base="develop", source="auto", mode="fork")
+    before = repos.get(db, "own/pub")
+    assert before is not None and before.allow_github_changes and not before.quote_ask
+    cfg = {"pub": RunnerRepo(remote="github.com/own/pub", path=tmp_path)}
+    assert repos.import_config(db, cfg).imported == 1
+    after = repos.get(db, "own/pub")
+    assert after is not None
+    assert (after.base, after.mode, after.allow_github_changes, after.quote_ask) == (
+        "develop",
+        "fork",
+        True,
+        False,
+    )
+    assert (after.source, after.path) == ("owner", tmp_path)
+    assert repos.import_config(db, cfg).imported == 1 and repos.get(db, "own/pub") == after
+
+
+def test_a_new_entry_gets_the_registry_defaults_and_set_fields_win(
+    db: sqlite3.Connection,
+) -> None:
+    repos.import_config(db, {"proj": RunnerRepo(remote="github.com/own/proj")})
+    proj = repos.get(db, "own/proj")
+    assert proj is not None
+    assert (proj.base, proj.mode, proj.allow_github_changes, proj.quote_ask) == (
+        "main",
+        "push",
+        True,
+        True,
+    )
+    # Fields an entry does set are written, over a new row and an existing one alike.
+    cfg = {
+        n: RunnerRepo(remote=f"github.com/own/{n}", allow_github_changes=False, base="trunk")
+        for n in ("proj", "new")
+    }
+    repos.import_config(db, cfg)
+    for slug in ("own/proj", "own/new"):
+        r = repos.get(db, slug)
+        assert r is not None and (r.base, r.allow_github_changes, r.quote_ask) == (
+            "trunk",
+            False,
+            True,
+        )
+    # A later entry that no longer sets it leaves the stricter value alone.
+    repos.import_config(db, {"proj": RunnerRepo(remote="github.com/own/proj")})
+    again = repos.get(db, "own/proj")
+    assert again is not None and (again.base, again.allow_github_changes) == ("trunk", False)
+
+
 def test_import_config_rejects_an_invalid_name_on_the_update_path(db: sqlite3.Connection) -> None:
     repos.add(db, "own/proj", base="main", source="auto")
     bad = RunnerRepo.model_construct(remote="github.com/own/proj", base="main")

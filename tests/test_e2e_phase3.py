@@ -296,10 +296,15 @@ async def start_daemon(
         assert await asyncio.wait_for(run, 10) == 0
 
 
-def install(settings: Settings, manifest: str, files: dict[str, str]) -> None:
+def install(
+    settings: Settings,
+    manifest: str,
+    files: dict[str, str],
+    argv0_paths: dict[str, str] | None = None,
+) -> None:
     conn = open_db(settings.db_path)
     try:
-        install_fixture(settings, conn, manifest, files)
+        install_fixture(settings, conn, manifest, files, argv0_paths=argv0_paths)
     finally:
         conn.close()
 
@@ -416,11 +421,12 @@ GH_TOKEN = "gh-token-not-real-0123456789"
 
 
 def install_github(settings: Settings, root: Path) -> Path:
-    """The real ``extensions/github`` copy, with a fake ``gh`` first on the child's PATH.
-    Returns the fake's state file."""
+    """The real ``extensions/github`` copy, with a fake ``gh`` (``<root>/bin/gh``) pinned as
+    its ``bins: [gh]``. Returns the fake's state file."""
     src = REPO / "extensions/github"
     files = {rel: (src / rel).read_text() for rel in ("cli.py", "README.md")}
-    install(settings, (src / "resonant.yaml").read_text(), files)
+    pins = {"bin:gh": str(root / "bin" / "gh")}
+    install(settings, (src / "resonant.yaml").read_text(), files, pins)
     state = root / "gh" / "state.json"
     state.parent.mkdir()
     pr = {
@@ -452,8 +458,7 @@ def gh_settings(home: Path, chat: FakeChatDB, bin_dir: Path, state: Path) -> Set
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
-        extensions={"process": {"path": [str(bin_dir), "/usr/bin", "/bin"]}},
-    )
+    )  # the default extensions.process.path: gh is reached only by its pinned path
 
 
 async def test_e3_show_my_prs_routes_to_github_and_runs_prs(
@@ -772,8 +777,9 @@ def gh_run(run_id: int, sha: str, conclusion: str) -> dict[str, Any]:
 
 
 class GhWorld:
-    """The fake ``gh`` on the extensions' PATH: PR #40 is driven red/green; PR #41 was fixed
-    before the install (its ``fixed`` event is part of the first run's baseline)."""
+    """The fake ``gh``, pinned as the extension's ``bins: [gh]``: PR #40 is driven red/green;
+    PR #41 was fixed before the install (its ``fixed`` event is part of the first run's
+    baseline)."""
 
     def __init__(self, root: Path) -> None:
         self.bin = root / "gh-bin"
@@ -830,10 +836,10 @@ async def test_e12_github_red_green_red_notifies_exactly_once_across_crashes(
         dry_run=False,
         api={"port": free_port()},
         channels={"imessage": {"enabled": True, "db_path": chat.path, "self_handle": SELF}},
-        extensions={"process": {"path": [str(gh.bin), "/usr/bin", "/bin"]}},
     )
     manifest = (GITHUB / "resonant.yaml").read_text()
-    install(settings, manifest, {"cli.py": (GITHUB / "cli.py").read_text()})
+    pins = {"bin:gh": str(gh.bin / "gh")}
+    install(settings, manifest, {"cli.py": (GITHUB / "cli.py").read_text()}, pins)
     osa = RecordingOsaRunner()
 
     def texts() -> list[str]:

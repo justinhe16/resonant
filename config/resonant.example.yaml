@@ -52,9 +52,10 @@ extensions:
   result_max_bytes: 32768               # a tool or job result is stored (redacted) up to this
   model_result_max_chars: 4096          # the model sees this much of it, as untrusted data
   process:
-    # An extension process's whole PATH. Not the default (/usr/bin, /bin): the github extension
-    # finds gh on this PATH, so /opt/homebrew/bin stays here (docs/followups.md).
-    path: [/opt/homebrew/bin, /usr/bin, /bin]
+    # An extension process's whole PATH. System dirs only: Claude workers can write
+    # /opt/homebrew/bin. gh and git are pinned by absolute path at install (argv[0], or a
+    # manifest's `bins` such as the github extension's gh), so they don't need it.
+    path: [/usr/bin, /bin]
     stdout_max_bytes: 262144            # past this the process tree is killed
     stderr_max_bytes: 8192              # kept redacted, never shown
     kill_grace_s: 2                     # SIGTERM, then SIGKILL after this
@@ -101,5 +102,5 @@ pulse:
 #       remote: github.com/you/dori
 #       base: main
 #       path: ~/work/dori               # checkout elsewhere than <code_dir>/dori
-#       allow_github_changes: true      # false refuses .github/ changes (an entry defaults to false)
-#       quote_ask: true                 # quote your ask in the PR body
+#       allow_github_changes: false     # refuses .github/ changes (unset keeps the default: on)
+#       quote_ask: true                 # quote your ask in the PR body (unset keeps the default)

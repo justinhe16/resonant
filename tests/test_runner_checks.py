@@ -31,7 +31,7 @@ ENV = {
     "GIT_COMMITTER_NAME": "t",
     "GIT_COMMITTER_EMAIL": "t@example.com",
 }
-REPO = RunnerRepo(remote="github.com/own/proj")
+REPO = RunnerRepo(remote="github.com/own/proj", allow_github_changes=False)
 
 
 def git(cwd: Path, *args: str, stdin: str | None = None, env: dict[str, str] | None = None) -> str:

@@ -32,7 +32,10 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-DEFAULT_PATH = "/opt/homebrew/bin:/usr/bin:/bin"
+DEFAULT_PATH = "/usr/bin:/bin"
+# gh's absolute path, pinned by Resonant at install (the manifest's `bins: [gh]`). gh is never
+# looked up on PATH: Claude workers can write the dirs it is usually installed in.
+GH_ENV = "RESONANT_BIN_GH"
 GH_TIMEOUT_S = 30
 CONFIG_PREFIX = "resonant-gh-"
 # A config dir this old was left by a killed run. It must stay well above the longest tool
@@ -180,14 +183,16 @@ class Gh:
             )
         if "\n" in token or "\r" in token or '"' in token or "\\" in token:
             raise Failed("secret github/token has characters a GitHub token never has")
-        search_path = os.environ.get("PATH") or DEFAULT_PATH
-        found = shutil.which("gh", path=search_path)
-        if found is None:
-            raise Failed(f"gh not found on {search_path}")
-        self.path = str(Path(found).resolve())
+        pinned = os.environ.get(GH_ENV, "")
+        if not (os.path.isabs(pinned) and os.path.isfile(pinned) and os.access(pinned, os.X_OK)):
+            raise Failed(
+                f"gh isn't pinned ({GH_ENV} is unset or not a program);"
+                " on the Mini: resonant ext update github"
+            )
+        self.path = pinned
         self.token = token
         self.env = {
-            "PATH": search_path,
+            "PATH": os.environ.get("PATH") or DEFAULT_PATH,
             "HOME": str(data_dir()),
             "LANG": "en_US.UTF-8",
             "GH_CONFIG_DIR": self._config_dir(token),

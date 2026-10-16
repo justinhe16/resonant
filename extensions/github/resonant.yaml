@@ -11,6 +11,7 @@ examples:
   - what's waiting on my review on github
 approvers: [owner]
 secrets: [token]
+bins: [gh]                             # pinned at install, given as RESONANT_BIN_GH (never PATH)
 
 tools:
   prs:

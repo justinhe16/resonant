@@ -223,6 +223,21 @@ def _keg(real: Path) -> Path | None:
     return None
 
 
+def guarded_tool(found: Path) -> bool:
+    """Whether the guard write-protects ``found`` (a tool binary found by name) and the code
+    it runs: a ``DAEMON_TOOLS`` copy in an install dir that links into its own formula's keg
+    under the same Homebrew prefix (``<prefix>/bin/gh`` to ``<prefix>/Cellar/gh/<version>``),
+    which ``default_protected`` covers as the link, its real file and the whole keg. A loose
+    file there, or a link into a keg somewhere else, doesn't count."""
+    if found.name not in DAEMON_TOOLS:
+        return False
+    if found.parent not in {Path(d) for d in host_tool_path().split(os.pathsep)}:
+        return False
+    keg = _keg(Path(os.path.realpath(found)))
+    cellar = Path(os.path.realpath(found.parent.parent)) / "Cellar"
+    return keg is not None and keg.parent == cellar / found.name
+
+
 def host_tool_path() -> str:
     """Where Resonant looks for the tools it hands a session or runs itself, by name, as a
     PATH string: the usual install dirs, never this process's PATH (the daemon's is system

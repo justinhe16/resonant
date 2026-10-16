@@ -349,8 +349,11 @@ class RunnerRepo(_Section):
     # "github.com/owner/repo": no scheme, no credentials; the daemon adds https://.
     remote: str
     base: str = "main"
-    # `.github/**` changes are refused unless this is set.
-    allow_github_changes: bool = False
+    # base, allow_github_changes and quote_ask are written to the registry only when the entry
+    # sets them (model_fields_set); unset, the registry keeps its value, or for a new repo uses
+    # its defaults (base "main", allow_github_changes on, quote_ask on unless a fork repo).
+    # `.github/**` changes are refused when this is false.
+    allow_github_changes: bool = True
     # Quote the owner's ask in the PR body (false for public repos that shouldn't show it).
     quote_ask: bool = True
     # Where the owner's checkout lives, when not at <runner.code_dir>/<name> (docs/employee-plan.md

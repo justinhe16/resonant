@@ -11,7 +11,9 @@ For each ``enabled`` row (``store.extensions``), in name order:
    row's. ``checks.dir_errors`` must pass on the copy.
 3. **Commands.** Every tool's and job's ``run`` is compiled once (``ExtCommand.compile``,
    ``argv0`` from ``record.argv0_paths[<spec name>]``, which must still exist). Tool
-   placeholders must be declared args; a job's only placeholder may be ``{due_at}``.
+   placeholders must be declared args; a job's only placeholder may be ``{due_at}``. Each
+   manifest ``bins`` entry must be pinned (``argv0_paths["bin:<name>"]``) and still exist;
+   it reaches every process of the extension as ``RESONANT_BIN_<NAME>``.
 4. **Register.** Tool specs (``Manifest.tool_specs()``) and job specs (``job_specs()``,
    ``job_<id>``) go into the ``ToolRegistry``, each with an ``ExtensionHandler``. Job specs
    are kept out of chat: ``tool_specs()`` here lists tools only, and ``is_job`` tells them
@@ -50,7 +52,7 @@ from resonant import killswitch
 from resonant.config import Settings
 from resonant.executor import HandlerKey
 from resonant.extensions import pin
-from resonant.extensions.checks import ALLOWED_COMMANDS, dir_errors
+from resonant.extensions.checks import ALLOWED_COMMANDS, bin_env, bin_key, dir_errors
 from resonant.extensions.handlers import ExtensionHandler
 from resonant.extensions.process import (
     ExtAmbiguous,
@@ -98,6 +100,7 @@ class LoadedExtension:
     tools: tuple[ToolSpec, ...]
     jobs: tuple[ToolSpec, ...]
     health: ExtCommand | None = None  # the compiled manifest ``health.check``
+    bins: Mapping[str, str] = field(default_factory=dict[str, str])  # RESONANT_BIN_* -> pin
 
 
 @dataclass(frozen=True)
@@ -206,6 +209,14 @@ class ExtensionHost:
             raise LoadRefused("mcp servers are not supported yet")
         if errors := dir_errors(root, manifest):
             raise LoadRefused(errors[0])
+        bins: dict[str, str] = {}
+        for name in manifest.bins:
+            pinned_bin = record.argv0_paths.get(bin_key(name))
+            if pinned_bin is None:
+                raise LoadRefused(f"bins: {name} isn't pinned; resonant ext update {record.name}")
+            if not Path(pinned_bin).is_absolute() or not Path(pinned_bin).is_file():
+                raise LoadRefused(f"bins: pinned command {pinned_bin} is missing")
+            bins[bin_env(name)] = pinned_bin
         tools = tuple(manifest.tool_specs())
         jobs = tuple(manifest.job_specs())
         data_dir = self.data_dir / record.name
@@ -239,6 +250,7 @@ class ExtensionHost:
                 runner=self.runner,
                 path_env=self.path_env,
                 job=job,
+                bins=bins,
             )
         health: ExtCommand | None = None
         if manifest.health is not None:
@@ -250,7 +262,7 @@ class ExtensionHost:
                 raise LoadRefused(f"health: {e}") from None
             if health.placeholders:
                 raise LoadRefused("health: the check takes no placeholders")
-        ext = LoadedExtension(record, manifest, root, tools, jobs, health)
+        ext = LoadedExtension(record, manifest, root, tools, jobs, health, bins)
         return ext, handlers
 
     def _register(
@@ -448,7 +460,9 @@ class ExtensionHealth:
                 return False, "health check: a declared secret is missing or unreadable"
         data_dir = self.host.data_dir / name
         ensure_data_dir(data_dir)
-        env = scratch_env(ext=name, data_dir=data_dir, secrets=env_secrets, path=self.host.path_env)
+        env = scratch_env(
+            ext=name, data_dir=data_dir, secrets=env_secrets, path=self.host.path_env, bins=ext.bins
+        )
         redactor = Redactor(values_of(env))
         req = ExtRequest(
             argv=command.render({}),

@@ -204,10 +204,10 @@ Codes (`A7`, `D7`), times, pins, PR numbers and counts below are examples.
 
 2. **Install github.** `resonant ext add repo:github`. Check the screen:
    - the heading `github repo:github@<commit> digest <digest>`;
-   - **Escalations** first: the secret `token`, the approver `owner`, `merge_pr` (L1), and the commands that run `gh`;
+   - **Escalations** first: the secret `token`, the approver `owner`, `merge_pr` (L1), and `its code runs gh (network)` (the manifest's `bins: [gh]`: `gh` is pinned by its real path, so it must be the Homebrew one at `/opt/homebrew/bin/gh`; a `gh` a worker could replace is refused);
    - then the tools (`prs`, `pr`, `rerun_failed` L3, `merge_pr` L1), the jobs `watch` (every 10 minutes, L0) and `digest` (07:50, L0), notify on `ci_failed`, `ci_fixed`, `review_requested`, and the health check.
 
-   Type `github`. It prints `Installed github repo:github@…` and `Restarting the daemon; it texts you when it's back.`, and over iMessage you get `Back up, down 4s` / `Installed github`.
+   Type `github`. (If a later `brew upgrade gh` removes the pinned keg, the extension isn't loaded and `bootstrap.sh --check` shows `argv0 missing`; `resonant ext update github` pins the new one.) It prints `Installed github repo:github@…` and `Restarting the daemon; it texts you when it's back.`, and over iMessage you get `Back up, down 4s` / `Installed github`.
 
 3. **Optional: the example.** `resonant ext add repo:example`, type `example`. Its `morning-ping` texts `[example] ping` on weekday mornings from the second run on. Skip it if you don't want that.
 

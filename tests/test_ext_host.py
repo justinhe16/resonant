@@ -239,6 +239,17 @@ tools:
     effect: read
 """
 
+BINS_MANIFEST = """\
+name: hub
+version: 1
+bins: [gh]
+tools:
+  prs:
+    run: ./cli.py prs
+    effect: read
+health: {check: ./cli.py health, every: 30m}
+"""
+
 
 @pytest.mark.parametrize(
     ("manifest", "files", "argv0", "reason"),
@@ -251,6 +262,13 @@ tools:
         ),
         (GH_MANIFEST, {}, {"prs": "/nonexistent/gh"}, "prs: pinned command /nonexistent/gh"),
         (GH_MANIFEST, {}, None, "prs: 'gh' must run by its pinned absolute path"),
+        (BINS_MANIFEST, {"cli.py": CLI}, None, "bins: gh isn't pinned; resonant ext update hub"),
+        (
+            BINS_MANIFEST,
+            {"cli.py": CLI},
+            {"bin:gh": "/nonexistent/gh"},
+            "bins: pinned command /nonexistent/gh is missing",
+        ),
         (MANIFEST, {"cli.py": CLI, "requirements.txt": "x"}, None, "requirements.txt: "),
     ],
 )
@@ -290,6 +308,20 @@ def test_pinned_gh_runs_by_its_path(settings: Settings, db: sqlite3.Connection) 
     host = host_for(settings, db)
     assert "hub" in host.loaded
     assert host.handlers[("hub", "prs")].command.render({}) == (str(fake_gh), "pr", "list")
+
+
+def test_pinned_bins_reach_every_process_as_env(settings: Settings, db: sqlite3.Connection) -> None:
+    fake_gh = settings.home / "bin" / "gh"
+    fake_gh.parent.mkdir()
+    fake_gh.write_text("#!/bin/sh\n")
+    fake_gh.chmod(0o755)
+    install_fixture(
+        settings, db, BINS_MANIFEST, {"cli.py": CLI}, argv0_paths={"bin:gh": str(fake_gh)}
+    )
+    host = host_for(settings, db)
+    pins = {"RESONANT_BIN_GH": str(fake_gh)}
+    assert host.handlers[("hub", "prs")].bins == pins
+    assert host.loaded["hub"].bins == pins  # the health check's env
 
 
 # --- step limit ---------------------------------------------------------------------------
