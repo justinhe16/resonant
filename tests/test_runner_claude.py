@@ -63,6 +63,7 @@ from resonant.runners.claude import (
     wake_time,
 )
 from resonant.runners.reaper import Target
+from resonant.runners.reports import Report
 from resonant.sandbox import SandboxParams
 from resonant.secrets import (
     ANTHROPIC_KEY_REF,
@@ -298,8 +299,11 @@ class Harness:
         path = self.gh_dir / "prs.json"
         return json.loads(path.read_text()) if path.exists() else []
 
-    async def start(self, repo: str = "proj", ask: str = "fix the flaky test") -> str:
-        res = await self.runner.start_run(repo, ask, "owner")
+    async def start(
+        self, repo: str = "proj", ask: str = "fix the flaky test", *, report: Report = "now"
+    ) -> str:
+        """Start a run; ``report="now"`` (like ``/run``) so its end is texted."""
+        res = await self.runner.start_run(repo, ask, "owner", report=report)
         assert isinstance(res, Started), res
         return res.code
 
@@ -455,7 +459,7 @@ async def killall(h: Harness) -> None:
 
 
 async def test_happy_path_ends_in_a_pr(h: Harness) -> None:
-    res = await h.runner.start_run("proj", "fix the flaky test", "owner")
+    res = await h.runner.start_run("proj", "fix the flaky test", "owner", report="now")
     assert res == Started("R1", "proj", 45)
     assert isinstance(res, Started)
     assert res.text == "On it: R1 · proj. Up to 45m. /runs to check, /cancel R1 to stop."
@@ -541,7 +545,7 @@ async def test_a_run_with_no_repo_works_in_a_scratch_dir(
     tmp_path: Path, db: sqlite3.Connection
 ) -> None:
     h = build(tmp_path, db, scenario="scratch")
-    res = await h.runner.start_run(None, "how full is the disk?", "owner")
+    res = await h.runner.start_run(None, "how full is the disk?", "owner", report="now")
     assert isinstance(res, Started) and res.repo == ""
     assert res.text.startswith("On it: R1 · no repo. Up to")
     assert isinstance(await h.runner.start_run("  ", "and now?", "owner"), Started)

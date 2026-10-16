@@ -198,8 +198,8 @@ _REPO = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
 
 
 def run_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
-    """``/run <repo> <ask>``: a repo name (lowercased) and the ask as typed. Whether the repo
-    is configured is the tool's to say."""
+    """``/run <repo> <ask>``: a repo name (lowercased) and the ask as typed, reported now
+    (EM-6). Whether the repo is configured is the tool's to say."""
     parts = rest.split(maxsplit=1)
     if not parts:
         raise UsageError
@@ -208,7 +208,8 @@ def run_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
         raise UsageError("that's not a repo name")
     if len(parts) < 2:
         raise UsageError("say what to do")
-    return {"repo": repo, "ask": _text(parts[1], ASK_MAX)}
+    # an explicit /run is watched: its end is texted right away, not held for the digest
+    return {"repo": repo, "ask": _text(parts[1], ASK_MAX), "report": "now"}
 
 
 def _run_code(rest: str) -> str:
