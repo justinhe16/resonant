@@ -37,15 +37,19 @@ DEFAULT_READ_PATHS = (
     "~/.bun/bin",
 )
 # Binaries the daemon itself runs outside the guard, by absolute path, with credentials:
-# gh (runner.gh_path, the run's token), uv (ops.uv_path, /update), ollama (its LaunchAgent)
-# and git (an extension's pinned argv0 when Homebrew's git is first). A worker that could
-# replace one would run code outside the sandbox, so the link, its real file and its Homebrew
-# keg are write-protected. (The daemon's own git is /usr/bin/git, under SIP; extensions'
-# python3 is the daemon's venv.)
+# gh (runner.gh_path, the run's token; an extension's pinned argv0), uv (ops.uv_path,
+# /update), ollama (its LaunchAgent) and git (runner.git_path when configured elsewhere; an
+# extension's pinned argv0). A worker that could replace one would run code outside the
+# sandbox, so every copy in the install dirs and the configured paths, as the link, its real
+# file and its Homebrew keg, is write-protected. (The default git is /usr/bin/git under SIP;
+# extensions' python3 is the daemon's venv.)
 DAEMON_TOOLS = ("gh", "uv", "ollama", "git")
 # Install dirs searched for those tools and for the tools linked into a session, after
 # ~/.local/bin (host_tool_path).
 HOST_TOOL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
+# Tools the daemon runs itself, outside the guard, after resolve_tool: only the system copy,
+# never one from a dir a worker can write (runners/claude.py _with_real_git).
+SYSTEM_ONLY_TOOLS = frozenset({"git"})
 # Binaries that may be linked into the run-local bin/.
 NEVER_LINKED = frozenset({"resonant"})
 
@@ -198,14 +202,28 @@ def host_tool_path() -> str:
     return os.pathsep.join(str(d) for d in dirs)
 
 
+def _configured_tools() -> list[Path]:
+    """The tool paths the daemon's config pins (runner.git_path, runner.gh_path,
+    ops.uv_path), which may sit outside the install dirs. Empty if the config can't load."""
+    try:
+        from resonant.config import load_settings
+
+        settings = load_settings()
+    except Exception:
+        return []
+    tools = [settings.runner.git_path, settings.runner.gh_path, settings.ops.uv_path]
+    return [p for p in tools if p is not None]
+
+
 def default_protected() -> tuple[Path, ...]:
     """The installed daemon, write-protected from sessions. Call it in the daemon: it reads
     the daemon's own interpreter and environment.
 
     - its venv, the interpreter install the venv runs on, and the checkout its code runs from;
     - ``$RESONANT_HOME`` when it is set (the default ``~/.resonant`` is in runner.sb);
-    - the ``resonant`` entry point and ``DAEMON_TOOLS`` (the link, its target and its
-      Homebrew keg), which the daemon runs outside the guard by absolute path.
+    - the ``resonant`` entry point, every copy of ``DAEMON_TOOLS`` in the install dirs and
+      the tool paths its config pins (the link, its target and its Homebrew keg), which the
+      daemon runs outside the guard by absolute path.
 
     The dirs on PATH (``~/.local/bin``, ``/opt/homebrew/bin``) stay writable, so a worker can
     ``brew install`` and ``uv tool install``: the daemon runs with a system-only PATH and
@@ -215,12 +233,15 @@ def default_protected() -> tuple[Path, ...]:
         found.append(checkout)
     if state := os.environ.get("RESONANT_HOME"):
         found.append(Path(state).expanduser())
-    search = f"{Path(sys.executable).parent}{os.pathsep}{host_tool_path()}"
-    for name in ("resonant", *DAEMON_TOOLS):
-        if (path := shutil.which(name, path=search)) is not None:
-            found.append(Path(path))
-            if (keg := _keg(Path(os.path.realpath(path)))) is not None:
-                found.append(keg)
+    dirs = [Path(sys.executable).parent, *map(Path, host_tool_path().split(os.pathsep))]
+    candidates = [d / name for name in ("resonant", *DAEMON_TOOLS) for d in dirs]
+    candidates += _configured_tools()
+    for path in candidates:
+        if not path.is_file():  # also false for a dangling link
+            continue
+        found.append(path)
+        if (keg := _keg(Path(os.path.realpath(path)))) is not None:
+            found.append(keg)
     return tuple(found)
 
 
@@ -346,10 +367,12 @@ def prepare_dirs(params: SandboxParams) -> None:
 
 
 def resolve_tool(name: str) -> Path | None:
-    """The real binary behind ``name`` in ``host_tool_path()``. Apple's /usr/bin shims
-    (``git``) are resolved through ``xcrun`` so the session never runs the shim, which wants
-    to write a cache under /var/folders."""
-    found = shutil.which(name, path=host_tool_path())
+    """The real binary behind ``name`` in ``host_tool_path()``; for ``SYSTEM_ONLY_TOOLS``
+    (``git``, which the daemon also runs itself) only the system copy. Apple's /usr/bin shims
+    are resolved through ``xcrun`` (into the Command Line Tools or Xcode, both root-owned) so
+    the session never runs the shim, which wants to write a cache under /var/folders."""
+    search = "/usr/bin" if name in SYSTEM_ONLY_TOOLS else host_tool_path()
+    found = shutil.which(name, path=search)
     if found is None:
         return None
     real = Path(os.path.realpath(found))

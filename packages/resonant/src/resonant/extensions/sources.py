@@ -75,7 +75,9 @@ class StagedFiles:
 def git_env() -> dict[str, str]:
     """The caller's environment without ``GIT_*`` overrides, plus no prompts or locks."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C")
+    # system dirs only: what git spawns (ssh, helpers) is never looked up where a Claude
+    # worker can write (docs/employee-plan.md D2)
+    env.update(PATH="/usr/bin:/bin", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", LC_ALL="C")
     return env
 
 

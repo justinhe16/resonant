@@ -22,7 +22,7 @@ from pydantic import ValidationError
 from resonant import daemon as daemon_mod
 from resonant import killswitch, launchd
 from resonant.config import Settings, load_settings
-from resonant.extensions.checks import approver_errors, dir_errors, name_errors
+from resonant.extensions.checks import EXT_PATH, approver_errors, dir_errors, name_errors
 from resonant.extensions.manager import (
     AdoptRequired,
     ExtensionManager,
@@ -544,7 +544,9 @@ def _ext_manager(settings: Settings, conn: sqlite3.Connection) -> ExtensionManag
         repo_path=settings.ops.repo_path,
         principals=principals,
         secret_exists=secret_exists,
-        ext_path=settings.extensions.process.path_env,
+        # where `gh`/`git` argv0 is found and pinned at install (the owner's terminal); the
+        # child's own PATH is extensions.process.path (system dirs only)
+        ext_path=EXT_PATH,
         actor=principals.owner,
     )
 

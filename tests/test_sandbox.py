@@ -221,6 +221,54 @@ def test_resolve_tool_searches_the_install_dirs_not_the_process_path(
     assert profile_mod.resolve_tool("mytool") is None
 
 
+def _exe(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_a_planted_binary_never_becomes_the_daemons_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Workers may write ~/.local/bin and /opt/homebrew/bin. A git planted there must not
+    become the daemon's own (unsandboxed) git, and a gh planted ahead of the daemon's must
+    not leave the real one unprotected."""
+    from resonant.config import RunnerConfig
+    from resonant.runners.claude import _with_real_git  # pyright: ignore[reportPrivateUsage]
+
+    home = tmp_path / "h"
+    planted_git = _exe(home / ".local" / "bin" / "git")
+    planted_gh = _exe(home / ".local" / "bin" / "gh")
+    brew = tmp_path / "brew"
+    real_gh = _exe(brew / "Cellar" / "gh" / "2.0" / "bin" / "gh")
+    (brew / "bin").mkdir()
+    (brew / "bin" / "gh").symlink_to(real_gh)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(profile_mod, "HOST_TOOL_DIRS", (str(brew / "bin"), "/usr/bin", "/bin"))
+    assert profile_mod.resolve_tool("gh") == planted_gh.resolve()  # a session tool: fine
+    git = profile_mod.resolve_tool("git")
+    assert git is not None and not git.is_relative_to(home.resolve())
+    fixed = _with_real_git(RunnerConfig())
+    assert not fixed.git_path.is_relative_to(home.resolve())
+    found = set(default_protected())
+    assert {planted_gh, brew / "bin" / "gh", brew / "Cellar" / "gh" / "2.0"} <= found
+    assert planted_git in found  # every copy, whichever the daemon would pick
+
+
+def test_the_configured_tool_paths_are_protected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gh = _exe(tmp_path / "custom" / "Cellar" / "gh" / "9.9" / "bin" / "gh")
+    monkeypatch.setattr(profile_mod, "_configured_tools", lambda: [gh])
+    found = set(default_protected())
+    assert gh in found and tmp_path / "custom" / "Cellar" / "gh" / "9.9" in found
+    # and the real lookup reads the daemon's config
+    monkeypatch.undo()
+    configured = profile_mod._configured_tools()  # pyright: ignore[reportPrivateUsage]
+    assert Path("/usr/bin/git") in configured and Path("/opt/homebrew/bin/gh") in configured
+
+
 def test_symlinked_home_paths_protect_their_real_targets(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
