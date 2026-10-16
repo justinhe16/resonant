@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from resonant.config import RunnerRepo
-from resonant.store import repos
+from resonant.store import repos, runs
 from resonant.store.db import connect, latest_version, migrate, open_db, schema_version
 from resonant.store.repos import RepoConflict
 
@@ -30,9 +30,36 @@ def test_migration_008_over_populated_007(tmp_path: Path) -> None:
     repos.add(conn, "me/a", base="main", source="auto")
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == latest_version() == 8
+    assert schema_version(conn) == latest_version() == 9
     assert [r.slug for r in repos.list_all(conn)] == ["me/a"]
     assert repos.links(conn, "x") == []
+    conn.close()
+
+
+def test_migration_009_over_populated_008(tmp_path: Path) -> None:
+    path = tmp_path / "old.db"
+    conn = connect(path)
+    assert migrate(conn, _through(8)) == 8
+    repos.add(conn, "me/a", base="main", source="auto")
+    for _ in range(3):
+        runs.create(conn, repo="a", ask="x", principal="owner", session_id="s", max_seconds=60)
+    runs.update(conn, "R1", status="ready", pr_number=4, branch="resonant/r1-x")
+    conn.execute("DELETE FROM runs WHERE code = 'R3'")  # the high-water mark is R3
+    conn.close()
+    conn = open_db(path)
+    assert schema_version(conn) == 9
+    old = runs.get(conn, "R1")
+    assert old is not None and old.status == "ready" and old.pr_number == 4
+    assert old.branch == "resonant/r1-x" and old.workspace is None and old.checkout is None
+    new = runs.create(conn, repo="", ask="y", principal="owner", session_id="t", max_seconds=60)
+    assert new.code == "R4" and new.scratch  # codes are never reused
+    assert runs.finish(conn, "R4", "done", summary="ok")
+    assert runs.get(conn, "R4").status == "done"  # type: ignore[union-attr]
+    assert repos.get(conn, "me/a").path is None  # type: ignore[union-attr]
+    assert repos.set_path(conn, "me/a", tmp_path)
+    assert repos.get(conn, "me/a").path == tmp_path  # type: ignore[union-attr]
+    names = {r["name"] for r in conn.execute("PRAGMA index_list(runs)")}
+    assert {"runs_status", "runs_repo"} <= names
     conn.close()
 
 
@@ -42,7 +69,7 @@ def test_migration_007_over_populated_006(tmp_path: Path) -> None:
     assert migrate(conn, _through(6)) == 6
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == latest_version() == 8
+    assert schema_version(conn) == latest_version() == 9
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(repos)")}
     assert {"slug", "name", "aliases", "base", "mode", "ci", "source", "last_used_at"} <= cols
     assert repos.list_all(conn) == []

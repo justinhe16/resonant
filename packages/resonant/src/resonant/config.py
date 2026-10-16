@@ -353,6 +353,9 @@ class RunnerRepo(_Section):
     allow_github_changes: bool = False
     # Quote the owner's ask in the PR body (false for public repos that shouldn't show it).
     quote_ask: bool = True
+    # Where the owner's checkout lives, when not at <runner.code_dir>/<name> (docs/employee-plan.md
+    # D1). It is fetched and given worktrees, never checked out or reset.
+    path: Path | None = None
 
     @field_validator("remote")
     @classmethod
@@ -360,6 +363,16 @@ class RunnerRepo(_Section):
         v = v.removesuffix(".git")
         if not _RUNNER_REMOTE.fullmatch(v) or {".", ".."} & set(v.split("/")):
             raise ValueError('runner repo remote must look like "github.com/owner/repo"')
+        return v
+
+    @field_validator("path")
+    @classmethod
+    def _path(cls, v: Path | None) -> Path | None:
+        if v is None:
+            return None
+        v = v.expanduser()
+        if not v.is_absolute():
+            raise ValueError("runner repo path must be an absolute path")
         return v
 
     @field_validator("base")
@@ -394,9 +407,14 @@ class RunnerConfig(_Section):
     # `repos` table) as source=owner, and the registry is what the runner reads. Repos not
     # listed here are registered the first time they are used (docs/repos-plan.md D1).
     repos: dict[str, RunnerRepo] = Field(default_factory=dict[str, RunnerRepo])
-    # Run dirs. Not under ~/.resonant, which the sandbox denies.
+    # Run dirs (the session's home, tmp, credentials). Not under ~/.resonant, which the sandbox
+    # denies. The work itself happens in a worktree under code_dir.
     work_dir: Path = Field(default=Path("~/resonant-runs"), validate_default=True)
-    # Bare mirrors, daemon-only.
+    # The owner's checkouts, <code_dir>/<name> (cloned on first use, a repo's `path` overrides
+    # it), each run's worktree at <code_dir>/.worktrees/<name>/R<n> and the scratch dirs of
+    # runs with no repo at <code_dir>/.scratch/R<n> (docs/employee-plan.md D1).
+    code_dir: Path = Field(default=Path("~/code"), validate_default=True)
+    # Bare mirrors, daemon-only: what the pre-merge checks read (a checkout is worker-writable).
     mirror_dir: Path = Field(default=Path("~/.resonant/runner/mirrors"), validate_default=True)
     # Per-call token files for git and gh (0700, daemon-only, never sandbox-readable).
     secrets_dir: Path = Field(default=Path("~/.resonant/run-secrets"), validate_default=True)
@@ -409,6 +427,7 @@ class RunnerConfig(_Section):
     max_cache_gb: int = Field(default=20, ge=1)
     max_minutes: int = Field(default=45, ge=1, le=600)
     max_budget_usd: float | None = Field(default=None, gt=0)
+    # Unused since EM-2 (there is no bundle handback any more); kept so old configs still load.
     max_bundle_mb: int = Field(default=50, ge=1, le=500)
     # Days a finished run's dir is kept (a daily job deletes it after).
     keep_days: int = Field(default=7, ge=0, le=365)
@@ -423,7 +442,7 @@ class RunnerConfig(_Section):
                 raise ValueError(f"runner repo name {name!r} must match [a-z][a-z0-9_-]{{0,31}}")
         return v
 
-    @field_validator("work_dir", "mirror_dir", "cache_dir", "secrets_dir")
+    @field_validator("work_dir", "code_dir", "mirror_dir", "cache_dir", "secrets_dir")
     @classmethod
     def _dirs(cls, v: Path) -> Path:
         v = v.expanduser()
@@ -441,9 +460,18 @@ class RunnerConfig(_Section):
     def _mirror_apart(self) -> Self:
         # The mirror is daemon-only; the sandbox can write the work and cache dirs.
         for private, plabel in ((self.mirror_dir, "mirror_dir"), (self.secrets_dir, "secrets_dir")):
-            for other, label in ((self.work_dir, "work_dir"), (self.cache_dir, "cache_dir")):
+            for other, label in (
+                (self.work_dir, "work_dir"),
+                (self.cache_dir, "cache_dir"),
+                (self.code_dir, "code_dir"),
+            ):
                 if private.is_relative_to(other) or other.is_relative_to(private):
                     raise ValueError(f"runner.{plabel} must not overlap runner.{label}")
+        # Run dirs and checkouts are cleaned up by different rules; they never share a tree.
+        if self.code_dir.is_relative_to(self.work_dir) or self.work_dir.is_relative_to(
+            self.code_dir
+        ):
+            raise ValueError("runner.code_dir must not overlap runner.work_dir")
         for denied in self.deny_read:
             for other, label in ((self.work_dir, "work_dir"), (self.cache_dir, "cache_dir")):
                 if denied.is_relative_to(other) or other.is_relative_to(denied):

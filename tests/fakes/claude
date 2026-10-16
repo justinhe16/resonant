@@ -3,8 +3,9 @@
 
 It takes the flags the runner passes (and ignores most), reads the prompt on stdin like the
 real CLI, and acts out one scenario, chosen by an extra ``--scenario NAME`` the test puts in
-``claude_cmd``. Only the standard library. cwd is ``<run>/repo``, so ``<run>/tmp`` is where it
-leaves notes for the test: ``argv.json`` (flags, env and the prompt of every invocation) and
+``claude_cmd``. Only the standard library. cwd is the run's worktree (or scratch dir) and
+``HOME`` is ``<run>/home``, so ``<run>/tmp`` is where it leaves notes for the test:
+``argv.json`` (flags, env, cwd and the prompt of every invocation) and
 pid files.
 
 Like the real session (docs/repos-plan.md D10) it pushes its branch to ``origin``, opens the PR with
@@ -12,7 +13,8 @@ Like the real session (docs/repos-plan.md D10) it pushes its branch to ``origin`
 and ``--no-pr`` skip those, and ``--ci-fixes N`` makes it push N more commits as if CI had failed.
 
 Scenarios: happy, nochanges, slow, hang, hang_then_ok, escapee, usage_limit, error, maxturns,
-maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, makefile, github, noresult, tokens.
+maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, makefile, github, noresult, tokens,
+scratch (a run with no repo: writes notes in its cwd and reports).
 """
 
 from __future__ import annotations
@@ -52,7 +54,8 @@ args = ap.parse_args()
 
 prompt = sys.stdin.read()
 session = args.resume or args.session_id
-run_dir = os.path.dirname(os.getcwd())
+# cwd is the run's worktree (or scratch dir); HOME is <run>/home
+run_dir = os.path.dirname(os.environ["HOME"])
 tmp = os.path.join(run_dir, "tmp")
 scenario = args.scenario
 
@@ -126,7 +129,8 @@ def result(text: str = "Fixed it.", **extra: Any) -> None:
 # Every invocation leaves a record: the test checks flags, env and prompt.
 log = os.path.join(tmp, "argv.json")
 history: list[Any] = json.load(open(log)) if os.path.exists(log) else []
-history.append({"argv": sys.argv[1:], "env": dict(os.environ), "prompt": prompt, "pid": os.getpid()})
+history.append({"argv": sys.argv[1:], "env": dict(os.environ), "prompt": prompt, "pid": os.getpid(),
+                "cwd": os.getcwd()})
 note("argv.json", json.dumps(history))
 
 
@@ -197,6 +201,11 @@ elif scenario == "noresult":
     sys.exit(0)
 elif scenario == "nochanges":
     result("Nothing to change.")
+    sys.exit(0)
+elif scenario == "scratch":
+    with open("notes.md", "w") as f:
+        f.write("the disk is 80% full\n")
+    result("Checked the disk: 80% full, the biggest dir is ~/Downloads.")
     sys.exit(0)
 
 if scenario == "escapee":

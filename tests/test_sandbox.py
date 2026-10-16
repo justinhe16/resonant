@@ -231,12 +231,9 @@ def _exe(path: Path) -> Path:
 def test_a_planted_binary_never_becomes_the_daemons_tool(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Workers may write ~/.local/bin and /opt/homebrew/bin. A git planted there must not
-    become the daemon's own (unsandboxed) git, and a gh planted ahead of the daemon's must
-    not leave the real one unprotected."""
-    from resonant.config import RunnerConfig
-    from resonant.runners.claude import _with_real_git  # pyright: ignore[reportPrivateUsage]
-
+    """Workers may write ~/.local/bin and /opt/homebrew/bin. A git planted there must not be
+    picked as git (only the system copy is), and a gh planted ahead of the daemon's must not
+    leave the real one unprotected. (The daemon's own git is runner.git_path, /usr/bin/git.)"""
     home = tmp_path / "h"
     planted_git = _exe(home / ".local" / "bin" / "git")
     planted_gh = _exe(home / ".local" / "bin" / "gh")
@@ -249,8 +246,6 @@ def test_a_planted_binary_never_becomes_the_daemons_tool(
     assert profile_mod.resolve_tool("gh") == planted_gh.resolve()  # a session tool: fine
     git = profile_mod.resolve_tool("git")
     assert git is not None and not git.is_relative_to(home.resolve())
-    fixed = _with_real_git(RunnerConfig())
-    assert not fixed.git_path.is_relative_to(home.resolve())
     found = set(default_protected())
     assert {planted_gh, brew / "bin" / "gh", brew / "Cellar" / "gh" / "2.0"} <= found
     assert planted_git in found  # every copy, whichever the daemon would pick
@@ -335,6 +330,32 @@ def test_run_and_cache_dirs_must_be_writable(tmp_path: Path) -> None:
         home=home,
         protect=(daemon,),
     ).resolved()
+
+
+def test_em2_write_paths_are_checked_like_the_run_dir(tmp_path: Path) -> None:
+    """EM-2's worktree and the checkout's .git (or a scratch dir) arrive as write_paths.
+    Writes are allowed everywhere, so they grant nothing, but none may sit where the guard
+    denies writes."""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    daemon = tmp_path / "daemon"
+    base = {
+        "run_dir": home / "resonant-runs" / "R1",
+        "cache_dir": home / "resonant-runs" / ".cache",
+        "secrets_dir": home / ".resonant" / "run-secrets",
+        "home": home,
+        "protect": (daemon,),
+    }
+    ok = SandboxParams(
+        **base,  # type: ignore[arg-type]
+        write_paths=(home / "code" / ".worktrees" / "demo" / "R1", home / "code" / "demo" / ".git"),
+    ).resolved()
+    assert len(ok.write_paths) == 2
+    text, _ = render(ok)
+    assert "WRITE" not in text  # nothing to allow under allow-default
+    for bad in (daemon / "checkout" / ".git", home / ".resonant" / "scratch", home / ".ssh"):
+        with pytest.raises(SandboxError):
+            SandboxParams(**base, write_paths=(bad,)).resolved()  # type: ignore[arg-type]
 
 
 def test_scratch_env_is_built_from_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

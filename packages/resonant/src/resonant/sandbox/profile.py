@@ -102,6 +102,9 @@ class SandboxParams:
     work_dir: Path | None = None
     # write-protected paths: the installed daemon (None: ``default_protected()``)
     protect: tuple[Path, ...] | None = None
+    # the run's worktree and its checkout's .git, or its scratch dir (EM-2). Writes are allowed
+    # everywhere, so this grants nothing; resolved() checks no guard covers them.
+    write_paths: tuple[Path, ...] = ()
 
     def resolved(self) -> SandboxParams:
         home = Path(checked_path(self.home))
@@ -131,7 +134,9 @@ class SandboxParams:
             secrets,
             *deny_read,
         ]
-        for what, d in (("run dir", run), ("cache dir", cache)):
+        writes = tuple(Path(checked_path(p)) for p in self.write_paths)
+        dirs = (("run dir", run), ("cache dir", cache), *(("work path", w) for w in writes))
+        for what, d in dirs:
             for g in guarded:
                 # a session must be able to write its own dirs
                 if d.is_relative_to(g):
@@ -150,6 +155,7 @@ class SandboxParams:
             deny_read=deny_read,
             secrets_dir=secrets,
             protect=tuple(protect),
+            write_paths=writes,
         )
 
 

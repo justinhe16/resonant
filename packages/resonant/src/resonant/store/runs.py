@@ -1,6 +1,7 @@
 """Claude runner runs (migration 006). Plain functions over a connection.
 
-A run is one ask worked on by one Claude session in a throwaway clone. The row holds
+A run is one ask worked on by one Claude session, in a worktree of the repo's checkout or, with
+no repo (``repo = ''``), in a scratch dir (migration 009). The row holds
 everything a restart needs: the step reached, the session id, the live process's group, leader
 and start time (so a reused pid is never signalled), the time already used, and the outcome.
 Callers own transactions; every function here is one statement or joins the caller's.
@@ -20,12 +21,12 @@ from typing import Any, Literal, cast
 from resonant.store.db import atomic, iso, now_iso
 
 Status = Literal[
-    "queued", "running", "waiting", "ready", "merged", "failed", "cancelled", "no_changes"
+    "queued", "running", "waiting", "ready", "merged", "failed", "cancelled", "no_changes", "done"
 ]
 Step = Literal["prepare", "session", "harvest", "publish", "reply"]
 
 ACTIVE: tuple[Status, ...] = ("queued", "running", "waiting")
-ENDED: tuple[Status, ...] = ("ready", "merged", "failed", "cancelled", "no_changes")
+ENDED: tuple[Status, ...] = ("ready", "merged", "failed", "cancelled", "no_changes", "done")
 
 _COLUMNS = frozenset(
     {
@@ -33,7 +34,7 @@ _COLUMNS = frozenset(
         "sessions", "attempts", "pgid", "leader_pid", "leader_started_at", "session_seconds",
         "wait_seconds", "waiting_since", "cost_usd", "tokens_in", "tokens_out", "exit_code",
         "pr_number", "pr_url", "files_changed", "flagged_paths", "summary", "failure",
-        "started_at", "ended_at",
+        "started_at", "ended_at", "workspace", "checkout",
     }
 )  # fmt: skip
 
@@ -76,6 +77,13 @@ class Run:
     started_at: datetime | None
     ended_at: datetime | None
     updated_at: datetime
+    workspace: str | None = None  # the worktree or scratch dir (migration 009)
+    checkout: str | None = None  # the checkout the worktree belongs to
+
+    @property
+    def scratch(self) -> bool:
+        """A run with no repo: a scratch dir, no GitHub token, no PR."""
+        return not self.repo
 
     @property
     def active(self) -> bool:
@@ -133,6 +141,9 @@ def _row(r: sqlite3.Row) -> Run:
         started_at=_dt(r["started_at"]),
         ended_at=_dt(r["ended_at"]),
         updated_at=updated,
+        # no columns before migration 009 (a migration reading runs part way)
+        workspace=r["workspace"] if "workspace" in r.keys() else None,  # noqa: SIM118
+        checkout=r["checkout"] if "checkout" in r.keys() else None,  # noqa: SIM118
     )
 
 

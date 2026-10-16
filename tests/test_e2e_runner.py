@@ -220,6 +220,7 @@ def make_world(
             "github_app": {"app_id": APP_ID, "installation_id": INSTALLATION_ID},
             "repos": {REPO: {"remote": f"github.com/own/{REPO}"}},
             "work_dir": root / "runs",
+            "code_dir": root / "code",
             "mirror_dir": root / "state" / "mirrors",
             "cache_dir": root / "runs" / ".cache",
             "secrets_dir": root / "state" / "secrets",

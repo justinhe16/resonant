@@ -318,7 +318,8 @@ def sandbox_row(settings: Settings) -> Row:
 
 def _repo_has_ci(settings: Settings, name: str) -> bool | None:
     """Whether the repo's mirrored base branch has a workflow on ``pull_request``. Reads the
-    existing mirror only (no fetch, no network); None while there is no mirror yet."""
+    existing mirror only (no fetch, no network, never the owner's checkout); None while there
+    is no mirror yet (the first run's PR check fetches it)."""
     import asyncio
 
     from resonant.runner.workspace import Workspace
@@ -370,6 +371,15 @@ def runner_rows(
     else:
         detail = f"app {app.app_id}, installation {app.installation_id}"
         rows.append(("PASS", False, "runner github app", detail))
+    # Checkouts and worktrees (docs/employee-plan.md D1): cloned on a repo's first run.
+    code_dir = settings.runner.code_dir
+    if code_dir.is_dir():
+        found = sorted(p.name for p in code_dir.iterdir() if (p / ".git").exists())
+        detail = f"{code_dir}: {len(found)} checkout{'s' if len(found) != 1 else ''}"
+        rows.append(("PASS", False, "runner code dir", detail))
+    else:
+        why = f"{code_dir} doesn't exist yet: a repo's first run clones into it"
+        rows.append(("SKIP", False, "runner code dir", why))
 
     def present(ref: str) -> bool | str:
         try:
@@ -418,7 +428,7 @@ def runner_rows(
             rows.append(("FAIL", False, step, _err(e)))
             continue
         if ci is None:
-            rows.append(("SKIP", False, step, "no mirror yet: the first /run fetches and checks"))
+            rows.append(("SKIP", False, step, "no mirror yet: the first run's PR check fetches it"))
         elif ci:
             rows.append(("PASS", False, step, "a workflow runs on pull_request"))
         else:
