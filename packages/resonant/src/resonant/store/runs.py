@@ -81,7 +81,7 @@ class Run:
     updated_at: datetime
     workspace: str | None = None  # the worktree or scratch dir (migration 009)
     checkout: str | None = None  # the checkout the worktree belongs to
-    wait_reason: WaitReason | None = None  # why a waiting run waits (migration 010)
+    wait_reason: WaitReason | None = None  # why a waiting run waits (migration 011)
     last_note: str | None = None  # the worker's latest ``resonant note``
     resume_prompt: str | None = None  # what the current turn delivered (resent after a crash)
 

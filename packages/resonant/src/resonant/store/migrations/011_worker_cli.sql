@@ -1,4 +1,4 @@
--- 010: the worker CLI (docs/employee-plan.md D3, EM-3): questions, notes and owner messages.
+-- 011: the worker CLI (docs/employee-plan.md D3, EM-3): questions, notes and owner messages.
 -- A run waits for one of two reasons: a usage limit (`usage_reset`) or an open question
 -- (`question`). The task's own wait reason stays the loop's (`usage_reset` / `human_reply`).
 ALTER TABLE runs ADD COLUMN wait_reason TEXT CHECK (wait_reason IN ('usage_reset', 'question'));

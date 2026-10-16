@@ -43,7 +43,7 @@ The default set is `~/.resonant/evals/router.jsonl`. It stays outside the repo a
    ```
 
    - `text`: the message, exactly as you'd send it.
-   - `intent`: what the router *should* say. One of `question`, `job_control`, `system`, `updates`, `notes`, `reminders`, `ops`, `run_project`, `unknown` (see `resonant/router/intents.py` for the definitions), or `extension:<name>` for an installed, enabled extension. The eval labels with the same extension intents as the daemon, read from the store.
+   - `intent`: what the router *should* say. One of `question`, `job_control`, `system`, `updates`, `notes`, `reminders`, `ops`, `run_project`, `rules`, `unknown` (see `resonant/router/intents.py` for the definitions), or `extension:<name>` for an installed, enabled extension. The eval labels with the same extension intents as the daemon, read from the store.
    - `principal` (optional): only `"owner"` is supported. The eval routes from the owner's point of view.
 
    Blank lines are skipped. A malformed line fails the load with its line number (the text is never echoed).

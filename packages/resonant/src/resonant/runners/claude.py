@@ -118,13 +118,13 @@ from resonant.runner.workspace import (
 )
 from resonant.runners import reaper, worker_cli
 from resonant.runners.reaper import MARKER_ENV, Target
-from resonant.runners.trust_seam import AskOwnerTrust, TrustChecker
 from resonant.runners.worker_cli import WorkerServer
 from resonant.runners.worker_desk import (
     BLOCK_S,
     OpenQuestion,
     Relayed,
     RelayRefused,
+    TrustChecker,
     WorkerDesk,
     WorkerEvents,
 )
@@ -547,8 +547,8 @@ class ClaudeRunner:
         ``refresh_s`` is how long a token is used before a fresh one replaces it. ``wrap``,
         ``self_check`` and ``claude_cmd`` are the seams for tests; by default the Seatbelt
         sandbox, the cached self-probe and the ``claude`` on the daemon's PATH. ``trust``
-        decides ``resonant check`` (EM-4's ``TrustChecks``; until it is wired every check
-        asks the owner), ``submit`` wakes a run's task with an event (``Loop.submit``) and
+        decides ``resonant check`` (EM-4's ``TrustChecks``; without it every check is
+        denied), ``submit`` wakes a run's task with an event (``Loop.submit``) and
         ``ask_block_s`` is how long one ``resonant ask`` call waits."""
         self.conn = conn
         self.cfg = runner
@@ -601,7 +601,7 @@ class ClaudeRunner:
         self.desk = WorkerDesk(
             conn,
             channel=channel,
-            trust=trust or AskOwnerTrust(conn, channel, ttl_s=ask_timeout_s, clock=clock),
+            trust=trust,
             clock=clock,
             ask_timeout_s=ask_timeout_s,
             wake=self._wake,

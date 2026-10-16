@@ -51,6 +51,10 @@ here. The daemon calls its ``start()`` before the loop resumes anything (it ends
 crash left and hooks the kill switch) and ``aclose()`` at the end. The tools and slash commands
 (P5A-4) reach it as ``IMessageStack.claude`` or ``components.runners["claude"]``.
 
+Trust checks. ``IMessageStack.trust`` (``trust.checks.TrustChecks``) answers a worker's
+``resonant check``: it asks the owner over this channel when a check is net new or a rule
+says to ask. EM-3's per-run socket calls its ``request_check``.
+
 Reminders. ``runner="reminder"`` sends due reminders through the iMessage channel, so it is
 registered here, not in Phase 0. ``add_reminder`` only runs inside the loop (the router or a
 runner step). The loop ticks again after every step and then sleeps only until the earliest
@@ -89,6 +93,7 @@ from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
 from resonant.runners.reminder import ReminderRunner
 from resonant.secrets import SecretStore
+from resonant.trust.checks import TrustChecks
 from resonant_sdk import Event, ToolSpec
 from resonant_sdk.manifest import TOOL_TIMEOUT_MAX_S
 
@@ -143,6 +148,7 @@ class IMessageStack:
     claude: ClaudeRunner | None = None
     notifier: Notifier | None = None
     pulse: Pulse | None = None
+    trust: TrustChecks | None = None  # workers' ``resonant check`` (EM-3 calls request_check)
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     _started: bool = field(default=False, repr=False)
 
@@ -270,6 +276,10 @@ def build_imessage_stack(
     )
     components.runners[jobs.name] = jobs
     loop.runners[jobs.name] = jobs
+    # workers' `resonant check` (EM-3 calls request_check; EM-4)
+    trust = TrustChecks(
+        conn, channel, components.principals, approval_ttl_s=settings.gate.approval_ttl_s
+    )
     claude = ClaudeRunner(
         conn,
         runner=settings.runner,
@@ -279,9 +289,9 @@ def build_imessage_stack(
         max_runs=max(1, settings.claude.max_concurrent - settings.claude.reserved_oncall_slots),
         create_task=loop.create_task,
         cancel_task=loop.cancel,
-        # answers and owner messages wake a run's task through the loop (EM-3). `resonant
-        # check` asks the owner every time until EM-4's TrustChecks is passed as `trust=`.
+        # answers and owner messages wake a run's task through the loop (EM-3)
         submit=loop.submit,
+        trust=trust,
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
@@ -322,5 +332,6 @@ def build_imessage_stack(
         claude=claude,
         notifier=notifier,
         pulse=pulse,
+        trust=trust,
         _close_model=close_model,
     )

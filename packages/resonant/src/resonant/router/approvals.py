@@ -35,6 +35,7 @@ from resonant.store import approvals as ap
 from resonant_sdk import Event
 
 NOTHING_WAITING = "Nothing is waiting for approval."
+ALWAYS_UNSUPPORTED = "Not done: yes always only answers a run's check."
 CHANNEL = "imessage"
 MAX_ARGS_CHARS = 1500
 
@@ -77,6 +78,11 @@ def refusal_reply(reason: str | None, code: str | None, sent: Sequence[PendingAp
         return "That task isn't waiting anymore. Not done."
     if reason == "not_sent_before":
         return "That reply came before the question. Reply again to answer it."
+    if reason == "always_unsupported":
+        target = [p for p in sent if p.code == code] if code else list(sent)
+        if len(target) == 1 and target[0].require_code:
+            return f"{ALWAYS_UNSUPPORTED} Reply yes {target[0].code} to confirm."
+        return f"{ALWAYS_UNSUPPORTED} Reply yes or no."
     return NOTHING_WAITING  # nothing_pending, unsupported, not_found, anything else
 
 
@@ -116,6 +122,7 @@ class ApprovalInbox:
                 occurred_at=event.occurred_at,
                 code=parsed.code,
                 comments=parsed.comments,
+                always=parsed.always,
             )
         )
         if result.ok:

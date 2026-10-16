@@ -306,6 +306,34 @@ def settled(world: World, code: str, *statuses: str) -> Callable[[], bool]:
 # --- R1: /run and chat ----------------------------------------------------------------------
 
 
+async def test_a_worker_check_waits_for_the_owners_yes_across_the_turn(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EM-3 with EM-4's real ``TrustChecks``: a net-new ``resonant check`` asks the owner. The
+    CLI gives up waiting, the turn ends and the run parks with the approval still pending;
+    the owner's "yes" resumes the session with the verdict."""
+    w = make_world(tmp_path, resonant_home, chat, monkeypatch, scenario="happy",
+                   extra=["--check", "dori-api:deploy:deploy dori-api to prod"],
+                   runner_opts={"ask_block_s": 0.5})  # fmt: skip
+    async with running(w):
+        assert (await w.say(f"/run {REPO} fix the typo in the README")).startswith("On it: R1")
+        prompt = await w.next_text()
+        assert prompt.startswith("[") and "R1 wants to deploy on dori-api" in prompt, prompt
+        await until(settled(w, "R1", "waiting"), 20, "the check wait")
+        assert w.run().wait_reason == "question"
+        calls = json.loads((w.tmp() / "cli.json").read_text())
+        assert calls[0]["rc"] == 3  # no decision within the CLI's wait
+        await w.say("yes", reply=False)
+        done = await w.next_text()
+        while not done.startswith("R1 done"):  # a confirmation may come first
+            done = await w.next_text()
+        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL}"), done
+        prompts = [c["prompt"] for c in json.loads((w.tmp() / "argv.json").read_text())]
+        assert prompts[1].startswith(
+            "Your check (deploy on dori-api: deploy dori-api to prod) is ok: go ahead."
+        )
+
+
 async def test_a_worker_question_reaches_the_owner_and_the_answer_resumes_it(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:

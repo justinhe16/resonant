@@ -12,9 +12,9 @@ checks and owner messages for running Claude workers.
   ``ASK_TIMEOUT``). The same question asked again while it is open (a retry after a Bash
   timeout) joins the open one; nothing is texted twice.
 - ``note``: becomes the run's ``last_note`` (its pulse item) and a ``note`` event.
-- ``check``: ``TrustChecker.request_check`` (EM-4's API; ``AskOwnerTrust`` until it is
-  wired), waited for like an ask. A decision that comes after the CLI gave up is delivered
-  on resume.
+- ``check``: EM-4's ``TrustChecks.request_check``, waited for like an ask. The call (and so
+  the owner's approval) outlives the CLI's wait and the turn; a decision that comes later
+  wakes the run and is delivered on resume.
 
 Owner messages (``deliver_message``) are appended to the session's next CLI reply as
 ``Message from the owner: …``, or open its next turn.
@@ -39,12 +39,11 @@ import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from resonant.gate.codes import clean_external
 from resonant.gateway.channel import Channel, ChannelError
 from resonant.redact import Redactor
-from resonant.runners.trust_seam import CHECK_TOOL, TrustChecker, slug
 from resonant.runners.worker_cli import (
     EXIT_DENIED,
     EXIT_OK,
@@ -63,6 +62,8 @@ from resonant.store import runs
 from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.store.runs import Run
+from resonant.store.trust import ANY, slug
+from resonant.trust.checks import CHECK_TOOL
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +81,21 @@ CHECK_DENIED = "denied"
 RUN_OVER = "This run is over; stop."
 
 EventKind = Literal["question", "note", "check"]
+NO_TRUST = "denied: checks aren't set up here, so don't do it."
+
+
+class TrustChecker(Protocol):
+    """``resonant.trust.checks.TrustChecks`` (EM-4), as the desk uses it."""
+
+    async def request_check(
+        self,
+        run_code: str,
+        system: str,
+        action: str,
+        irreversible: bool = False,
+        cost_usd: float = 0.0,
+        what: str = "",
+    ) -> Literal["ok", "denied"]: ...
 
 
 @dataclass(frozen=True)
@@ -168,7 +184,7 @@ class WorkerDesk:
         conn: sqlite3.Connection,
         *,
         channel: Channel,
-        trust: TrustChecker,
+        trust: TrustChecker | None,
         clock: Callable[[], datetime],
         ask_timeout_s: float,
         wake: Callable[[Run, str], None],
@@ -276,8 +292,12 @@ class WorkerDesk:
     async def _check(self, run: Run, req: Check, gone: asyncio.Future[None]) -> Reply | None:
         try:
             system, action = slug(req.system), slug(req.action)
+            if ANY in (system, action):
+                raise ValueError("name one system and one action, not *")
         except ValueError as e:
-            return Reply(f"Usage error: {e}.", EXIT_USAGE)
+            return Reply(f"Usage error: --system and --action {e}.", EXIT_USAGE)
+        if self.trust is None:  # fail closed
+            return Reply(NO_TRUST, EXIT_DENIED)
         key = (run.code, system, action, req.irreversible, req.cost_usd, req.what)
         entry = self._checks.get(key)
         if entry is None:
@@ -317,6 +337,7 @@ class WorkerDesk:
 
     async def _decide(self, qid: int, code: str, system: str, action: str, req: Check) -> None:
         """The trust decision for one check; recorded (and the run woken) when it comes."""
+        assert self.trust is not None
         try:
             answer = await self.trust.request_check(
                 code, system, action, irreversible=req.irreversible, cost_usd=req.cost_usd,

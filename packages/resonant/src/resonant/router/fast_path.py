@@ -96,6 +96,7 @@ from resonant.router.render import (
     render_notes,
     render_projects,
     render_reminders,
+    render_rules,
     render_runs,
 )
 from resonant.store import extensions as ext_store
@@ -272,6 +273,7 @@ COMMAND_RENDERS: dict[str, Render] = {
     "/ext": render_extensions,
     "/pulse": render_text,
     "/runs": render_runs,
+    "/rules": render_rules,
 }
 
 # The only keywords: everything else in plain words goes through an intent (the labeler).

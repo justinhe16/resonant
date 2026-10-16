@@ -394,6 +394,7 @@ def test_owner_only_commands() -> None:
         "/runs",
         "/cancel",
         "/merge",
+        "/rules",
         "/ext",
         "/pulse",
         "/kill",

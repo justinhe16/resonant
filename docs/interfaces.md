@@ -242,8 +242,9 @@ On-call autonomy checks `paused` before acting.
 
 Request (`resonant.gate.codes`):
 - `new_code(pending)` returns 2 characters, a letter then a digit, with no look-alikes, unique among pending approvals.
-- `approval_text(code, summary, *, require_code=False, destructive=False)`:
+- `approval_text(code, summary, *, require_code=False, destructive=False, always=False)`:
   - L2/L3: `"[A7] <summary>? Reply yes / no"`.
+  - A worker's trust check (`always=True`, EM-4; never with the other two): `"[K4] R4 wants to deploy on dori-api: \"deploy to prod\" (new kind of action; yes always = don't ask before deploy in dori-api). Reply yes / yes always / no"`.
   - L1 (`destructive=True`): `"[D7] <summary>? This can't be undone. Reply yes D7 / no"`. It takes precedence over `require_code`.
   - Pay (`require_code=True`): `"[P3] <summary>? Reply exactly: yes P3 / no P3"`.
 - The summary is built by code from intent fields. Every external string goes through `sanitize_external`, which quotes it, collapses whitespace and newlines, strips code-like tokens, and truncates to 60 characters. `clean_external` does the same without truncating or quoting.
@@ -261,6 +262,7 @@ Request (`resonant.gate.codes`):
 - With a code, it names one of the actor's pending, unexpired approvals. Without a code, exactly one approval is pending for the actor, both now and among those open and already sent to the actor at `occurred_at`. So an old plain reply re-routed later can't bind what has since become the only pending approval. If it's ambiguous, re-ask and never guess.
 - `require_code` (L1, pay): only `yes <code>` approves. A plain `no` may deny under the single-pending rule.
 - **Idempotent per event.** If `reply.event_id` already resolved an approval (`resolved_event_id`), the gate returns that original result with no write, wake or audit. A replay under another actor gets `nothing_pending`.
+- `yes always` (EM-4) binds by the same rules (code or single pending, sent-before), but only to an approval with `allow_always` (a worker's trust check, `trust.checks`; never `require_code`, not when an owner's `ask` rule made the check ask, and not when the system is an area of a system already seen or a rule's scope). For any other approval it is refused as `always_unsupported`, never read as a plain `yes`. The store's conditional UPDATE re-checks it. A bound `yes always` sets `approvals.always`; the waiting check adds the rule.
 - `yes with comments: …` approves and appends one `Event(source="gate", type="human_input", payload={approval_id, comments})` to the task (`dedupe_key="approval:<id>:comments"`), before the wake.
 
 Refusals are closed (`ReplyRefusal`, `REPLY_REFUSALS` in `resonant.gate.types`):
@@ -273,13 +275,14 @@ Refusals are closed (`ReplyRefusal`, `REPLY_REFUSALS` in `resonant.gate.types`):
 | `code_required` | A plain `yes` for a `require_code` approval. |
 | `not_sent_before` | The prompt wasn't sent to the actor before the reply. |
 | `unsupported` | Not an iMessage parser reply, or a batch reply (deferred). |
+| `always_unsupported` | `yes always` for an approval that doesn't offer it. Reply: `Not done: yes always only answers a run's check. Reply yes or no.` (or `Reply yes <code> to confirm.` for a coded one). |
 | `already_resolved`, `expired`, `task_not_waiting`, `not_found` | The store's conditional UPDATE refused (a race, or the task moved on). |
 
 **Reply parser** (`resonant.gate.replies`, Phase 2 is parser-only):
 
 ```python
 parse_reply(text, *, truncated=False) -> ParsedReply | None
-ParsedReply(decision: approve|deny, code=None, comments=None)   # code uppercase
+ParsedReply(decision: approve|deny, code=None, comments=None, always=False)   # code uppercase
 normalize_reply(text) -> str   # NFKC, straight quotes, collapsed whitespace
 MAX_COMMENTS_LEN = 500
 ```
@@ -288,6 +291,7 @@ MAX_COMMENTS_LEN = 500
   - `(yes|approve|👍)( <code>)?` and `<code> yes`
   - `(no|deny|👎)( <code>)?` and `<code> no`
   - `yes( <code>)? with comments: <text>`, where `text` is 1–500 characters and is kept verbatim
+  - `yes always( <code>)?`, `yes <code> always` and `<code> yes always` (`always=True`; plain `yes` only, no emoji or `approve`)
 - Outside comments, a trailing run of `.` and `!` is dropped (`Yes.`, `yes!!`, `yes A7.`). `?` never is: `yes?` is a question.
 - 👍 and 👎 may carry a skin tone and the emoji presentation selector.
 - A code must come from the `new_code` alphabet, so look-alikes (`A1`, `O7`) never match.
@@ -440,6 +444,10 @@ Handlers return JSON-serializable dicts and never raise for "no data". Bad args 
 | `list_runs` | `code?`: `R<n>` | `{runs: [{code, repo, status, ask (clipped to 60), elapsed_s, pr_number, pr_url, files_changed, flagged_paths, summary, failure}], count, truncated, code, setup?}`: active runs first, at most 8; one run with `code`. `summary` and `failure` are cleaned and clipped to 120. `setup` is the not-set-up sentence when there are no runs to show. |
 | `cancel_run` (L3) | `code`: `R<n>` | `{cancelled, code, text}` (`R3 cancelled.` or the refusal) |
 | `merge_run` (L2) | `code`: `R<n>` | `{merged, code, text, pr_number?, flagged_paths?}`. `/merge R3` is explicit and runs; a model-chosen call asks a plain yes whose prompt (`tools.runs.summary_action`) reads `merge R7: PR #41 in dori <url>, changes Makefile`. `text` repeats the flagged paths and the PR link. Needs a `ready` run and green CI. |
+| `list_trust_rules` (`/rules`) | none | `{rules: [{id, scope, action, effect, text, note, created_from}], count}`, oldest first. `text` is the rule in words (`ask before merge in trading`). |
+| `add_trust_rule` (L3) | `scope`, `action`: slugs or `*`; `effect`: `ask` or `notify_now`; `note?` | `{id, scope, action, effect, text, note, created_from: "chat", existed, replaced}`. Only tightens trust or raises urgency, so chat runs it and reports `Rule added: ask before merge in trading (rule 3).` A rule replaces the one of its family (allow/ask, notify) on the same (scope, action); this tool can only replace an `allow` or a `notify_digest`. |
+| `allow_trust_rule` (L2) | `scope`, `action`, `effect?`: `allow` (default) or `notify_digest`, `note?` | Same shape. Loosens trust or lowers urgency, so a model-chosen call asks a plain yes whose prompt (`tools.trust.summary_action`) reads `allow deploy in dori-staging without asking` or `stop texting right away on failed everywhere (digest only)`. |
+| `remove_trust_rule` (L2) | `id` | `{…rule, removed: true}`. By number only, so the rule the owner approves forgetting is the one removed. Chat asks a plain yes (`forget rule 3: ask before merge in trading`); `/rules forget 3` is explicit and runs. |
 | `disk` | none | `{disk: [{path, free_bytes, total_bytes, used_pct}]}` for `/` and `RESONANT_HOME`, like `system_status` without the slow probes. |
 | `pulse_preview` (`/pulse`) | none | `{text}`: `pulse_job.preview_text`, without the approval re-mentions (their titles carry codes). Read-only: nothing is sent or marked told. |
 | `open_items` | `source?`: string, at most 48 chars | `{items: [{source, text, urgency, new}], count, truncated, source}`: open pulse items (uncleared, unexpired), changed-since-told first, at most 10, `text` from `pulse.render_item` clipped to 120 chars, `source` the normalized filter. Items of muted extensions (the same rule as the pulse and the briefing) and the core approval re-mentions are left out, so approval codes never reach the model. |
@@ -1011,6 +1019,7 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
   | `reminders` | `add_reminder`, `cancel_reminder`, `list_reminders` |
   | `ops` | `disk`, `recent_logs`, `restart_ollama`, `restart_resonant`, `update_resonant` |
   | `run_project` | `cancel_run`, `list_runs`, `merge_run`, `start_run` ("fix the typo in the README in resonant", "what runs are going", "merge R3") |
+  | `rules` | `add_trust_rule`, `allow_trust_rule`, `list_trust_rules`, `remove_trust_rule` ("in the future don't ask me about deploys to dori-staging", "what are my rules") |
 
   It is filtered by `principals.can(principal, "request", spec.extension)` before anything reaches the model, so a member gets no global builtins. Every call the model chooses is `origin="inferred"`, so the gate decides by level: L3 (`add_note`, `add_reminder`, `restart_ollama`, …) runs and reports, L2 (`restart_resonant`, `update_resonant`) asks `[A7] … Reply yes / no`, L1 (`clear_notes`) asks `[D7] … Reply yes D7 / no`. The local runner still makes at most one gated side effect per task.
 
@@ -1115,6 +1124,35 @@ runner.last_killed                                # runs the last kill switch en
 - **Sandbox** (`resonant.sandbox`, the thin guard since EM-1): `SandboxParams(run_dir, cache_dir, secrets_dir, home, read_paths, deny_exec, deny_read, work_dir, protect)`, `render`, `wrap(argv, params)`, `scratch_env`, `default_protected()`, `probes.self_check`, `cached_self_check`. `read_paths` and `work_dir` are accepted and no longer limit anything; `protect=None` means `default_protected()` (the installed daemon). CLI: `resonant sandbox check [--scope all|ci|local] [--json]`, exit 1 on any failed probe.
 - **Config** (`runner:`): `repos` (name → `{remote, base, allow_github_changes, quote_ask}`), `work_dir`, `mirror_dir`, `secrets_dir`, `cache_dir`, `max_run_dir_mb`, `max_cache_gb`, `max_minutes`, `max_budget_usd`, `max_bundle_mb`, `keep_days`, `git_path`, `gh_path`. Secrets: `runner/claude_token` (or `runner/anthropic_key`) and `runner/github_token`.
 - **Tests.** `tests/fakes/claude` is a fake CLI with scenarios; `tests/test_runner_claude.py` drives the runner over it, and `tests/test_e2e_runner.py` drives the whole daemon from the fake iMessage channel.
+
+## Trust rules: `resonant.trust`, `resonant.store.trust` (EM-4, migration 010)
+
+```python
+# store (rows): trust_rules(id, scope, action, effect, note, created_from, created_at)
+#               trust_seen(system, action, first_ok_at)
+store.slug(value) -> str                     # lowercase slug or "*", else ValueError
+store.add_rule(conn, *, scope, action, effect, created_from, now, note=None) -> Added(rule, replaced, existed)
+store.list_rules(conn) / get_rule / remove_rule(conn, id) / mark_seen / seen_actions
+
+# policy (pure)
+decide(Check(system, action, irreversible, cost_usd, what, repo), rules, seen) -> TrustDecision(verdict "ok"|"ask", reason, rule)
+notify_level(rules, system, action, event, repo=None) -> NotifyDecision(level "now"|"digest", reason, rule)
+
+# store-backed (audited)
+trust.evaluate(conn, system, action, irreversible=False, cost_usd=0.0, what="", *, repo=None, run=None) -> TrustDecision
+trust.notify_level(conn, system, action, event, *, repo=None) -> NotifyDecision
+trust.merge_decision(conn, repo) -> "ok" | "ask"
+
+# worker checks (EM-3 calls this from the per-run socket; IMessageStack.trust)
+await TrustChecks(conn, channel, principals, approval_ttl_s=...).request_check(
+    run_code, system, action, irreversible=False, cost_usd=0.0, what="") -> "ok" | "denied"
+```
+
+- **Precedence.** Of the matching `allow`/`ask` rules the most specific wins: scope first (the system exactly 3, the run's repo or an area 2 with the longer scope winning, `*` 0), then action (exact 1, `*` 0). At equal specificity `ask` beats `allow`. An area is a leading segment run (`trading` covers `trading-api`, `trading/prod`, not `tradingview`). A matching rule overrides every default.
+- **Defaults.** Ask for a new system (no `trust_seen` row), a new kind of action on it, `irreversible`, or `cost_usd > 0` (or non-finite); the reason lists each (`new system, irreversible`). Otherwise ok. An ok check (evaluated ok, or the owner's yes) marks the pair seen.
+- **Urgency.** `failed`, `question`, `check`, `urgent` are `now`; `done`, `pr`, `merged`, `note` are `digest`. `notify_now`/`notify_digest` rules match the event (2), then the action (1), then `*`; `notify_now` wins ties. `question` and `check` are never lowered.
+- **`request_check`.** `ok` returns at once. `ask` creates an L2-style, plain-yes approval on the run's task (`tool="trust_check"`, approvers: the owner), prompts it through `prompt_approvers`, and polls until it is answered or expires. The prompt always names the action and system (what a rule would cover) and quotes the worker's cleaned `what`. `allow_always` is set unless an `ask` rule decided or the system is an area of a system already seen or a rule's scope. `yes` → `"ok"`; `yes always` → `"ok"` plus `allow <action>` on `<system>` (`created_from="yes always"`) and a `Rule added: … (rule N)` text (not when that rule already existed); `no`, expiry, an inactive run, a run that ends while waiting, or an unreachable owner → `"denied"`, and an abandoned approval is expired (`approvals.expire_one`), also when the caller is cancelled. At most 3 checks per run wait at once. A bad slug or `*` raises `ValueError`. Concurrent waiters on one pending check share the answer.
+- **Audit.** `trust.evaluate` (each check), `trust.check` (each `request_check` outcome), `trust.merge`, `trust.rule_added` (with any replaced rule's fields), `trust.rule_removed` (the removed rule's fields), `approval.expired` with a `reason`, plus the approval's own rows.
 
 ## Daemon wiring: `resonant.wiring`, `resonant.daemon`
 

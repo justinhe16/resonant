@@ -156,6 +156,16 @@ def render_reminders(d: dict[str, Any]) -> str:
     return _numbered(lines, f"Reminders ({len(lines)}):", "No reminders.")
 
 
+def render_rules(d: dict[str, Any]) -> str:
+    """``/rules``: ``3. ask before merge in trading``, oldest first, then how to forget one."""
+    items = [r for r in (as_dict(x) for x in as_list(d.get("rules"))) if r]
+    lines = [f"{r.get('id', '?')}. {' '.join(str(r.get('text', '')).split())}" for r in items]
+    if not lines:
+        return "No rules: runs ask only for something new, irreversible or paid."
+    body = _numbered(lines, f"Rules ({len(lines)}):", "")
+    return f"{body}\n/rules forget <n> drops one."
+
+
 def _job_line(j: dict[str, Any]) -> str:
     bits = [f"- {j.get('id', '?')} ({j.get('level', '?')})"]
     nxt = j.get("next_due_text")
