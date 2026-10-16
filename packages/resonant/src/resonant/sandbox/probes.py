@@ -428,7 +428,8 @@ out(res="image" if cg.CGDisplayCreateImage(cg.CGMainDisplayID()) else "none")
 """
 
 # The per-run self-check: a write into ~/.resonant (a unique new name; ~/.resonant itself
-# when it doesn't exist), a Keychain lookup and the API port. A write that worked is undone.
+# when it doesn't exist) and into the daemon's install, a Keychain lookup and the API port.
+# A write that worked is undone.
 _SELF = """
 import uuid
 res = {}
@@ -443,6 +444,12 @@ else:
         os.mkdir(state)
         os.rmdir(state)
 res["write"] = tryit(w)
+if A.get("protect"):
+    q = os.path.join(A["protect"], ".sandbox-self-check-" + uuid.uuid4().hex[:10])
+    def wp():
+        os.close(os.open(q, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        os.unlink(q)
+    res["protect"] = tryit(wp)
 libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
 libc.bootstrap_look_up.argtypes = [ctypes.c_uint, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint)]
 bs = ctypes.c_uint.in_dll(libc, "bootstrap_port")
@@ -630,9 +637,10 @@ def _verdict(
 
 @contextlib.contextmanager
 def _fake_home(ctx: ProbeContext) -> Generator[tuple[SandboxParams, Path]]:
-    """A fake home under /private/var/tmp with Resonant's state, a fake daemon install, the
-    persistence files, Messages and Keychain files and an owner's code with a ``.env``,
-    plus a sandbox built for it the way a session's is. Yields (params, root)."""
+    """A fake home under /private/var/tmp with Resonant's state (``~/.resonant`` a symlink to
+    ``root/state``), a fake daemon install, the persistence files (``~/.zshrc`` a symlink into
+    ``root/dotfiles``), Messages and Keychain files and an owner's code with a ``.env``, plus
+    a sandbox built for it the way a session's is. Yields (params, root)."""
     root = Path(
         os.path.realpath(tempfile.mkdtemp(prefix="resonant-probe-home-", dir=OUTSIDE_PARENT))
     )
@@ -657,9 +665,21 @@ def _fake_home(ctx: ProbeContext) -> Generator[tuple[SandboxParams, Path]]:
             "code/proj/.env": "KEY=1",
             "code/proj/notes.txt": "notes",
         }
+        # ~/.resonant and ~/.zshrc are symlinks (a moved state dir, a dotfiles repo): the
+        # guard must hold on the real files too
+        state = root / "state"
+        state.mkdir()
+        home.mkdir()
+        (home / ".resonant").symlink_to(state)
         for rel, text in files.items():
             (home / rel).parent.mkdir(parents=True, exist_ok=True)
+            if rel == ".zshrc":
+                (root / "dotfiles").mkdir()
+                (root / "dotfiles" / "zshrc").write_text(text)
+                (home / rel).symlink_to(root / "dotfiles" / "zshrc")
+                continue
             (home / rel).write_text(text)
+        (home / ".resonant" / "mnt").mkdir()
         (root / "denied").mkdir()
         (root / "denied" / "x.txt").write_text("secret")
         (root / "open").mkdir()
@@ -696,6 +716,9 @@ def p_state_writes(ctx: ProbeContext) -> tuple[Status, str]:
             ("link", str(st / "resonant.db"), o + "/hardlink.db"),
             ("symlink_write", str(st / "config.yaml"), o + "/symlink.yaml"),
             ("rename", str(st), o + "/state"),
+            ("openw", str(root / "state" / "resonant.db"), None),
+            ("create", _unique(root / "state", "real"), None),
+            ("rename", str(root / "state"), o + "/state2"),
             ("rename", str(home), str(root / "home2")),
             ("openw", str(venv / "bin" / "python"), None),
             ("create", _unique(venv / "bin", "venv"), None),
@@ -732,6 +755,7 @@ def p_persistence(ctx: ProbeContext) -> tuple[Status, str]:
             ("create", _unique(home / "Library", "lib"), None),
             ("openw", str(home / ".zshrc"), None),
             ("rename_over", str(home / ".zshrc"), str(evil)),
+            ("openw", str(root / "dotfiles" / "zshrc"), None),
             ("create", str(home / ".zprofile"), None),
             ("create", str(home / ".bash_profile"), None),
             ("openw", str(home / ".gitconfig"), None),
@@ -839,8 +863,15 @@ def p_real_paths(ctx: ProbeContext) -> tuple[Status, str]:
     if agents.is_dir():
         ops.append(("create", _unique(agents, "agent"), None))
     for rc in (".zshrc", ".zprofile", ".bash_profile", ".gitconfig"):
-        path = home / rc
-        ops.append(("openw" if path.is_file() else "create", str(path), None))
+        if (home / rc).is_file():  # absent ones are covered by the fake home
+            ops.append(("openw", str(home / rc), None))
+    # the control: only what this user could write outside the sandbox counts, so a denial
+    # is the guard's and not the file's permissions (a root-owned keg, a read-only file)
+    ops = [
+        op
+        for op in ops
+        if os.access(op[1] if op[0] == "openw" else os.path.dirname(op[1]), os.W_OK)
+    ]
     # reads: only where the control (outside the sandbox) can read, so a deny means the guard
     reads: list[Op] = [
         ("list", str(p), None)
@@ -860,6 +891,44 @@ def p_real_paths(ctx: ProbeContext) -> tuple[Status, str]:
     if status == "pass" and skipped:
         detail += f" ({skipped} read(s) not checked: unreadable outside the sandbox too)"
     return status, detail
+
+
+def _hdiutil(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 - fixed binary
+        ["/usr/bin/hdiutil", *args], capture_output=True, text=True, timeout=60, check=False
+    )
+
+
+def p_mount(ctx: ProbeContext) -> tuple[Status, str]:
+    """No disk image mounted over a protected path (a fake ``~/.resonant``): a worker could
+    otherwise lay its own files over Resonant's state or the daemon's code. Outside the
+    sandbox the same attach works (the control), and is detached again."""
+    if not os.path.exists("/usr/bin/hdiutil"):
+        return "skip", "no hdiutil"
+    with _fake_home(ctx) as (params, root):
+        image = root / "open" / "probe.dmg"
+        made = _hdiutil("create", "-size", "1m", "-fs", "HFS+", "-volname", "rprobe", str(image))
+        if made.returncode != 0:
+            return "skip", f"control failed: can't make a disk image ({made.stderr.strip()[:80]})"
+        mnt = root / "open" / "mnt"
+        mnt.mkdir()
+        attach = ["attach", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint"]
+        control = _hdiutil(*attach, str(mnt), str(image))
+        if control.returncode != 0:
+            return "skip", f"control failed: attach outside ({control.stderr.strip()[:80]})"
+        _hdiutil("detach", "-force", str(mnt))
+        target = params.home / ".resonant" / "mnt"
+        argv = ["/usr/bin/hdiutil", *attach, str(target), str(image)]
+        mounted = False
+        try:
+            proc = ctx.sandboxed(argv, params=params, timeout=60)
+        finally:
+            if os.path.ismount(target):  # a hole: take it down again
+                mounted = True
+                _hdiutil("detach", "-force", str(target))
+        if mounted or proc.returncode == 0:
+            return "fail", "a disk image was mounted over ~/.resonant"
+    return "pass", f"attach refused ({(proc.stderr or proc.stdout).strip()[:60]})"
 
 
 def p_other_env(ctx: ProbeContext) -> tuple[Status, str]:
@@ -1361,6 +1430,7 @@ PROBES: tuple[Probe, ...] = (
     Probe("new-session child stays sandboxed", "ci", p_setsid_child),
     Probe("other processes' environment (known limitation)", "ci", p_other_env),
     Probe("real paths on this host", "local", p_real_paths),
+    Probe("disk image mount over ~/.resonant", "local", p_mount),
     Probe("daemon env holds no secrets", "local", p_daemon_env),
     Probe("keychain item read", "local", p_keychain),
     Probe("launchd job submit", "local", p_launchd),
@@ -1425,15 +1495,19 @@ def render_table(results: Sequence[ProbeResult]) -> str:
 
 
 def self_check(params: SandboxParams, *, python: str | None = None) -> tuple[bool, str]:
-    """The cheap fail-closed check before a session: a denied write into ``~/.resonant``, a
-    denied mach lookup of securityd and a denied connect to the API port. One sandboxed
+    """The cheap fail-closed check before a session: denied writes into ``~/.resonant`` and
+    the daemon's install, a denied mach lookup of securityd and a denied connect to the API
+    port. One sandboxed
     interpreter start, about 50 to 100 ms. Writes nothing while the guard holds."""
     if not sandbox_exec_available():
         return False, "sandbox-exec is not available"
     p = params.resolved()
     interpreter = python or str(_interpreter())
     code = _PRELUDE + _SELF
-    argv = [interpreter, "-I", "-c", code, json.dumps({"home": str(p.home), "port": API_PORT})]
+    # the first protected dir this user could write without the guard (the daemon's venv)
+    protect = next((str(d) for d in p.protect or () if d.is_dir() and os.access(d, os.W_OK)), None)
+    arg = {"home": str(p.home), "port": API_PORT, "protect": protect}
+    argv = [interpreter, "-I", "-c", code, json.dumps(arg)]
     try:
         proc = subprocess.run(  # noqa: S603 - argv is built here
             wrap(argv, p),
@@ -1450,13 +1524,15 @@ def self_check(params: SandboxParams, *, python: str | None = None) -> tuple[boo
     problems: list[str] = []
     if not _denied(res["write"]):
         problems.append(f"write into {p.home / '.resonant'} gave {res['write']}")
+    if "protect" in res and not _denied(res["protect"]):
+        problems.append(f"write into {protect} gave {res['protect']}")
     if res["mach"] != BOOTSTRAP_NOT_PRIVILEGED:
         problems.append(f"securityd lookup gave {res['mach']}")
     if not _denied(res["net"]):
         problems.append(f"connect to :{API_PORT} gave {res['net']}")
     if problems:
         return False, "; ".join(problems)
-    return True, "~/.resonant write, keychain lookup and API port denied"
+    return True, "~/.resonant and daemon writes, keychain lookup and API port denied"
 
 
 def cached_self_check(

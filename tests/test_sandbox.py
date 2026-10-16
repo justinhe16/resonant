@@ -30,6 +30,7 @@ from resonant.sandbox.probes import (
     Status,
     cached_self_check,
     p_mach,
+    p_mount,
     p_persistence,
     p_ports,
     p_signal,
@@ -178,6 +179,49 @@ def test_default_protected_is_the_installed_daemon() -> None:
     ).resolved()
     assert p.protect is not None
     assert _real(Path(sys.prefix)) in {str(x) for x in p.protect}
+
+
+def test_default_protected_covers_path_dirs_state_kegs_and_the_uv_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    local_bin = tmp_path / "home" / ".local" / "bin"
+    state = tmp_path / "state"
+    cache = tmp_path / "uvcache"
+    cellar = tmp_path / "brew" / "Cellar" / "gh" / "2.0" / "bin"
+    cellar.mkdir(parents=True)
+    (cellar / "gh").write_text("#!/bin/sh\n")
+    (cellar / "gh").chmod(0o755)
+    brew_bin = tmp_path / "brew" / "bin"
+    brew_bin.mkdir()
+    (brew_bin / "gh").symlink_to(cellar / "gh")
+    monkeypatch.setenv("PATH", f"{local_bin}:{brew_bin}:/usr/bin:/bin:{Path.home()}")
+    monkeypatch.setenv("RESONANT_HOME", str(state))
+    monkeypatch.setenv("UV_CACHE_DIR", str(cache))
+    found = set(default_protected())
+    assert {local_bin, brew_bin, state, cache} <= found
+    assert brew_bin / "gh" in found
+    assert tmp_path / "brew" / "Cellar" / "gh" / "2.0" in found  # the whole keg
+    # system dirs and $HOME itself are never protected (a worker must write under $HOME)
+    assert not {Path("/usr/bin"), Path("/bin"), Path.home()} & found
+
+
+def test_symlinked_home_paths_protect_their_real_targets(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    (tmp_path / "state").mkdir()
+    (home / ".resonant").symlink_to(tmp_path / "state")
+    (tmp_path / "dotfiles").mkdir()
+    (tmp_path / "dotfiles" / "zshrc").write_text("")
+    (home / ".zshrc").symlink_to(tmp_path / "dotfiles" / "zshrc")
+    (tmp_path / "msgs").mkdir()
+    (home / "Library").mkdir()
+    (home / "Library" / "Messages").symlink_to(tmp_path / "msgs")
+    p = params_in(tmp_path).resolved()
+    assert p.protect is not None
+    assert Path(_real(tmp_path / "state")) in p.protect
+    assert Path(_real(tmp_path / "dotfiles" / "zshrc")) in p.protect
+    assert Path(_real(tmp_path / "msgs")) in p.deny_read  # read and write, like the rule
+    assert p.resolved() == p  # idempotent
 
 
 def test_run_and_cache_dirs_must_be_writable(tmp_path: Path) -> None:
@@ -339,6 +383,23 @@ _MUTATIONS: dict[str, tuple[str, str, ProbeFn]] = {
 
 
 @on_mac
+@pytest.mark.skipif(bool(os.environ.get("CI")), reason="mounts a disk image; local only")
+def test_mount_probe_fails_without_the_mount_deny(
+    ctx: ProbeContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status, detail = p_mount(ctx)
+    if status == "skip":
+        pytest.skip(detail)
+    assert status == "pass", detail
+    template = profile_mod.template_text()
+    broken = template.replace("(deny file-mount)", "")
+    assert broken != template
+    monkeypatch.setattr(profile_mod, "template_text", lambda: broken)
+    status, detail = p_mount(ctx)
+    assert status == "fail", detail
+
+
+@on_mac
 @pytest.mark.parametrize("name", list(_MUTATIONS))
 def test_a_probe_fails_when_its_deny_is_removed(
     ctx: ProbeContext, monkeypatch: pytest.MonkeyPatch, name: str
@@ -397,4 +458,4 @@ def test_cached_self_check_caches_passes_not_failures(ctx: ProbeContext, tmp_pat
     assert cached_self_check(ctx.params, cache, now=lambda: clock[0])[1] != "cached"
 
 
-_DETAIL = "~/.resonant write, keychain lookup and API port denied"
+_DETAIL = "~/.resonant and daemon writes, keychain lookup and API port denied"

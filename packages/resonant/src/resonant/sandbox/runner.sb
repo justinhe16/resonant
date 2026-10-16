@@ -8,8 +8,9 @@
 (allow default)
 
 ;; ---- Resonant's state and the installed daemon: no writes ----------------------------------
-;; ~/.resonant (DB, config, logs, run secrets) and the daemon's code, venv, interpreter and
-;; the binaries it runs outside the guard (profile.default_protected).
+;; ~/.resonant (DB, config, logs, run secrets) and the daemon's code, venv, interpreter, the
+;; binaries it runs outside the guard and the dirs on its PATH (profile.default_protected),
+;; plus the real targets of any symlinked path in this file (profile.SandboxParams.resolved).
 (deny file-write*
   (subpath (string-append (param "HOME") "/.resonant"))
 ;; @PROTECT@
@@ -60,6 +61,9 @@
 ;; @ANCESTORS@
   )
 
+;; ---- mounts: no disk image or other filesystem laid over a protected path ---------------
+(deny file-mount)
+
 ;; ---- exec ------------------------------------------------------------------------------------
 ;; launchctl and the cron/at front ends (the launchd mach deny below does the real work), and
 ;; the daemon's own venv and `resonant` entry point
@@ -83,6 +87,8 @@
   (global-name "com.apple.security.cloudkeychainproxy3")
   (global-name "com.apple.security.octagon")
   (global-name "com.apple.keychainsharingmessagingd")
+  (global-name "com.apple.systemkeychain")
+  (global-name-prefix "com.apple.security.authhost")
   ;; iMessage: the Messages agents, and the routes that drive Messages.app as the owner
   ;; (Apple Events, LaunchServices, synthetic input, accessibility, TCC)
   (global-name-prefix "com.apple.imagent")

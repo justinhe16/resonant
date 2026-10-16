@@ -37,9 +37,10 @@ DEFAULT_READ_PATHS = (
     "~/.bun/bin",
 )
 # Binaries the daemon itself runs outside the guard, with credentials (gh with the run's
-# token, uv on /update, ollama under launchd). A worker that could replace one would run
-# code outside the sandbox, so the PATH's copy and its real file are write-protected.
-DAEMON_TOOLS = ("gh", "uv", "ollama")
+# token, uv on /update, ollama under launchd, git and python3 for extensions). A worker that
+# could replace one would run code outside the sandbox, so the PATH's copy, its real file
+# and its Homebrew keg are write-protected.
+DAEMON_TOOLS = ("gh", "uv", "ollama", "git", "python3")
 # Binaries that may be linked into the run-local bin/.
 NEVER_LINKED = frozenset({"resonant"})
 
@@ -104,6 +105,17 @@ class SandboxParams:
         for p in raw_protect:
             protect.setdefault(Path(checked_path(p, follow=False)), None)
             protect.setdefault(Path(checked_path(p)), None)
+        # runner.sb names $HOME-relative paths as strings, and SBPL matches real paths: a
+        # symlinked ~/.resonant or ~/.zshrc (a dotfiles repo) would leave its target open.
+        # Each one's real target is denied too, write-only or read and write like the rule.
+        for g in persistence_paths(home)[1:]:
+            if (real := Path(checked_path(g))) != g:
+                protect.setdefault(real, None)
+        denied: dict[Path, None] = dict.fromkeys(deny_read)
+        for g in (home / "Library" / "Messages", home / "Library" / "Keychains"):
+            if (real := Path(checked_path(g))) != g:
+                denied.setdefault(real, None)
+        deny_read = tuple(denied)
         guarded = [
             *(g for g in persistence_paths(home) if g != home),
             *protect,
@@ -164,16 +176,62 @@ def _package_checkout() -> Path | None:
     return None
 
 
+def _keg(real: Path) -> Path | None:
+    """The Homebrew keg (``.../Cellar/<formula>/<version>``) a binary lives in, if any: the
+    whole keg, since a tool loads its libs and helpers from there."""
+    parts = real.parts
+    if "Cellar" in parts and len(parts) > parts.index("Cellar") + 2:
+        return Path(*parts[: parts.index("Cellar") + 3])
+    return None
+
+
+def _path_dirs(home: Path) -> list[Path]:
+    """The dirs on this process's PATH a worker could otherwise drop a binary into, to be
+    run by name, outside the guard, by the daemon (``~/.local/bin``, ``/opt/homebrew/bin``,
+    ...). System dirs (SIP) and $HOME or its parents are left out."""
+    system = (
+        "/usr/",
+        "/bin",
+        "/sbin",
+        "/System/",
+        "/var/run/com.apple.",
+        "/private/var/run/com.apple.",
+    )
+    found: list[Path] = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or not os.path.isabs(entry) or entry.startswith(system):
+            continue
+        path = Path(entry)
+        if path == home or path in home.parents or path == Path("/"):
+            continue
+        found.append(path)
+    return found
+
+
 def default_protected() -> tuple[Path, ...]:
-    """The installed daemon, write-protected from sessions: its venv, the interpreter install
-    the venv runs on, the checkout its code runs from, the ``resonant`` entry point and the
-    binaries it runs outside the guard (``DAEMON_TOOLS``, as the link and its target)."""
+    """The installed daemon, write-protected from sessions. Call it in the daemon: it reads
+    the daemon's own interpreter, PATH and environment.
+
+    - its venv, the interpreter install the venv runs on, and the checkout its code runs from;
+    - ``$RESONANT_HOME`` when it is set (the default ``~/.resonant`` is in runner.sb);
+    - the ``resonant`` entry point and ``DAEMON_TOOLS`` (the link, its target and its
+      Homebrew keg), which the daemon runs outside the guard;
+    - every non-system dir on its PATH, so nothing can shadow a tool it runs by name;
+    - uv's cache (``$UV_CACHE_DIR`` or ``~/.cache/uv``), which ``/update``'s ``uv sync``
+      copies into the venv. Sessions use the runner cache instead (``scratch_env``)."""
+    home = Path.home()
     found: list[Path] = [Path(sys.prefix), Path(sys.base_prefix)]
     if (checkout := _package_checkout()) is not None:
         found.append(checkout)
+    if state := os.environ.get("RESONANT_HOME"):
+        found.append(Path(state).expanduser())
     for name in ("resonant", *DAEMON_TOOLS):
         if (path := shutil.which(name)) is not None:
             found.append(Path(path))
+            if (keg := _keg(Path(os.path.realpath(path)))) is not None:
+                found.append(keg)
+    found += _path_dirs(home)
+    found.append(Path(os.environ.get("UV_CACHE_DIR") or home / ".cache" / "uv").expanduser())
     return tuple(found)
 
 
