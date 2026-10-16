@@ -27,40 +27,50 @@ Update a row when you try it, with the date and anything odd.
 | 11 | Hourly "btw" with the example (step 13.5): `/ext run example/pnl` once, then wait | At a top of the hour: `btw:` / `[example] PnL …` only in hours where it moved; nothing 00:00–06:00 | 📱 after 🖥 install |
 | 12 | Plain words reach the pulse: "what's the latest update" | The same text as `/pulse`, through the `updates` intent (model reply, owner only) | 📱 after deploy |
 | 13 | "what's running" | Tasks answer through chat (`job_control`), no longer a keyword | 📱 after deploy |
-| 14 | Before the owner steps: `/runs`, `/run resonant fix the typo` | Both answer `The runner isn't set up: …`, naming what's missing. `/status` has no runs line. | 📱 after the Phase 5a deploy |
-| 15 | Plain words reach the run tools: "fix the typo in the README in resonant", "what runs are going", "cancel R3", "merge R3" | `run_project` intent; before the owner steps the not-set-up text (or `No run R3.`); `merge R3` asks `yes` when R3 is ready | 📱 after the Phase 5a deploy |
+| 14 | Before the owner steps: `/runs`, "spawn a claude to fix the typo in the README in resonant" | Both answer `The runner isn't set up: …`, naming what's missing (go-live 14, iMessage 1) | 📱 after the employee-mode deploy |
+| 15 | Trust rules need no runner: "always ask before merging in trading", then `/rules`, then `/rules forget 1` | `Rule added: ask before merge in trading (rule 1).`; `Rules (1):` / `1. ask before merge in trading`; the rule is gone | 📱 after the employee-mode deploy |
+| 16 | `/repos`, `/repo add <owner>/<name>` | The repo list (or `No repos yet.`); `Added <owner>/<name> as <name> …`, with `Heads up: main isn't protected.` if it isn't | 📱 after the employee-mode deploy |
 
 ## Needs the Mini
 
 | # | Test | Where | Status |
 |---|---|---|---|
-| 16 | Sandbox self-check: `resonant sandbox check` | every deny and allow row passes (Claude can run it) | 🖥 (Claude) |
-| 17 | GitHub token: `resonant secret set github/token`, then `check` | go-live 12, terminal 1 | 🖥 |
-| 18 | `resonant ext add repo:github` (typed confirm) | go-live 12, terminal 2 | 🖥 |
-| 19 | `scripts/bootstrap.sh --check` rows for the github pin, secret and jobs | go-live 12, terminal 4 | 🖥 |
-| 20 | `/help github`, `/github prs`, "show my PRs" | go-live 12, iMessage 2–4 | 📱 after 18 |
-| 21 | No token in logs or the DB (`grep`, `sqlite3`) | go-live 12, iMessage 5 | 🖥 |
-| 22 | Watch: baseline silent, then a red and a green CI | go-live 12, iMessage 6–7 | 📱 after 18 |
-| 23 | `/ext mute github 1h`, then `off` | go-live 12, iMessage 8 | 📱 after 18 |
-| 24 | Next 08:00 briefing shows `Updates:` / `[github] 3 open PRs, …` | go-live 13.3 | 📱 after 18 |
-| 25 | `/kill` skips jobs and kills running extension processes | go-live 12, iMessage 10 | 📱 + 🖥 (sqlite check) |
-| 26 | Tamper test: edit the installed copy, then `/restart resonant`, then `resonant ext update github` | go-live 12, iMessage 11 | 🖥 |
-| 27 | Crash mid-approval: `kill -9` the daemon before answering | go-live 11, Stage B 5 | 🖥 ❓ |
-| 28 | Optional: github writes (`rerun_failed`, `merge_pr` with `yes D7`) | go-live 12, the writes | 📱 after a token with write access |
-| 29 | Remove the example extension after tests 10–11 | `resonant ext remove example` | 🖥 |
-| 30 | Runner secrets: `claude setup-token` → `resonant secret set runner/claude_token`; a fine-grained PAT (no Workflows permission) → `resonant secret set runner/github_token` | go-live 14, terminal 1–2 | 🖥 |
-| 31 | Name the runner repos (Claude adds `runner.repos` and restarts) | go-live 14, terminal 3 | 📱 tell Claude |
-| 32 | Per runner repo: CI on `pull_request`, no secrets for same-repo `pull_request` runs, branch protection on `main` | go-live 14, GitHub | 🖥 (Claude can check the workflows) |
-| 33 | Authenticated probe: `CLAUDE_CODE_OAUTH_TOKEN=… resonant sandbox check` | go-live 14, terminal 5 | 🖥 after 30 |
-| 34 | First real run, Claude's own sandbox is off and the session works inside ours: `/run` a trivial ask on a CI repo; the transcript (`~/.resonant/runner/transcripts/R1.jsonl`) shows no sandbox_apply or permission errors; `--max-turns` is accepted | go-live 14, first run | 🖥 (Claude) after 30–32 |
-| 35 | First run over iMessage: "fix <something small> in <repo>" → `On it: R1`, then `R1 done: PR #… `; `/runs`; `/merge R1` once CI is green | go-live 14, iMessage | 📱 after 30–32 |
-| 36 | `/kill` (and `/cancel R1`) during a run → run cancelled, nothing pushed; `/resume` | go-live 14, iMessage | 📱 after 30–32 |
+| 17 | Sandbox self-check: `resonant sandbox check` | every deny and allow row passes (Claude can run it) | 🖥 (Claude) |
+| 18 | GitHub token: `resonant secret set github/token`, then `check` | go-live 12, terminal 1 | 🖥 |
+| 19 | `resonant ext add repo:github` (typed confirm) | go-live 12, terminal 2 | 🖥 |
+| 20 | `scripts/bootstrap.sh --check` rows for the github pin, secret and jobs | go-live 12, terminal 4 | 🖥 |
+| 21 | `/help github`, `/github prs`, "show my PRs" | go-live 12, iMessage 2–4 | 📱 after 19 |
+| 22 | No token in logs or the DB (`grep`, `sqlite3`) | go-live 12, iMessage 5 | 🖥 |
+| 23 | Watch: baseline silent, then a red and a green CI | go-live 12, iMessage 6–7 | 📱 after 19 |
+| 24 | `/ext mute github 1h`, then `off` | go-live 12, iMessage 8 | 📱 after 19 |
+| 25 | Next 08:00 briefing shows `Updates:` / `[github] 3 open PRs, …` | go-live 13.3 | 📱 after 19 |
+| 26 | `/kill` skips jobs and kills running extension processes | go-live 12, iMessage 10 | 📱 + 🖥 (sqlite check) |
+| 27 | Tamper test: edit the installed copy, then `/restart resonant`, then `resonant ext update github` | go-live 12, iMessage 11 | 🖥 |
+| 28 | Crash mid-approval: `kill -9` the daemon before answering | go-live 11, Stage B 5 | 🖥 ❓ |
+| 29 | Optional: github writes (`rerun_failed`, `merge_pr` with `yes D7`) | go-live 12, the writes | 📱 after a token with write access |
+| 30 | Remove the example extension after tests 10–11 | `resonant ext remove example` | 🖥 |
+| 31 | Reinstall the LaunchAgents for the system-only PATH: `resonant daemon install` | go-live 14, terminal 1 | 🖥 |
+| 32 | Claude token: `claude setup-token` → `resonant secret set runner/claude_token` | go-live 14, terminal 2 | 🖥 |
+| 33 | GitHub App: create (permissions as listed, no Administration), install on all repos, `resonant secret set runner/github_app_key --from-file <pem>`, delete the pem, tell Claude the app ID and installation ID | go-live 14, terminal 3 | 🖥 |
+| 34 | Daemon token: fine-grained, all repos → `resonant secret set runner/github_token` | go-live 14, terminal 4 | 🖥 |
+| 35 | Optional: classic `public_repo` token → `resonant secret set runner/github_public_token` | go-live 14, terminal 5 | 🖥 |
+| 36 | Authenticated probe: `CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check` (the `read -rs` form) | go-live 14, terminal 6 | 🖥 after 32 |
+| 37 | `--check` runner rows `PASS` (repos and code dir may `SKIP`) | go-live 14, terminal 7 | 🖥 after 31–34 |
+| 38 | Branch protection on each base you care about; "no CI edits in <repo>" where Actions secrets matter | go-live 14, on GitHub | 🖥 (Claude can check) |
+| 39 | First real run: the worker's own `gh pr create` and `gh pr checks --watch` work with the App's installation token (PR by `<app>[bot]`); worktree under `~/code/.worktrees`, checkout untouched; no sandbox or permission errors in the transcript; no token in logs | go-live 14, first run | 🖥 (Claude) after 31–36 |
+| 40 | Spawn in plain words: "spawn a claude to …" → `On it: R1 · <repo>.`; no done text; the next `btw:` has `Workers:` / `R1 done: PR #… (CI green) · <url>` | go-live 14, iMessage 2 | 📱 after 39 |
+| 41 | A worker's question: `R1 asks: …`, a plain reply → `→ R1`, the run carries on; with two waiting, `R2 <answer>` and a reply by content go to the right one | go-live 14, iMessage 4 | 📱 after 39 |
+| 42 | A net-new check: `[K4] R1 wants to … Reply yes / yes always / no`; `yes always` → `Rule added: don't ask before …`; the next one doesn't ask | go-live 14, iMessage 5 | 📱 after 39 |
+| 43 | A rule taught over chat makes a merge ask: "always ask before merging in <area>", then "merge R<n>" on a run there asks; on another repo it merges | go-live 14, iMessage 6 | 📱 after 39 |
+| 44 | A scratch run (no repo): `On it: R… · no repo (scratch dir).`, then `R… done: <summary>` in the digest; no PR | go-live 14, iMessage 7 | 📱 after 39 |
+| 45 | `/cancel R1`, then `/kill` during a run → run cancelled, nothing left running; `/resume`; `/restart resonant` mid-run finishes with one PR | go-live 14, iMessage 10–11 | 📱 after 39 |
+| 46 | First fork run: the fork appears, the App mints its token, `external_pr` asks, the upstream PR appears only after `yes` | go-live 14, first run | 📱 after 35 and 39 |
 
 ## Needs real data or effort
 
 | # | Test | Where | Status |
 |---|---|---|---|
-| 37 | Router evals on 30–50 real texts (≥ 90%) | go-live 9, [`followups.md`](followups.md#router-evals-on-real-texts-go-live-step-9) | deferred |
+| 47 | Router evals on 30–50 real texts (≥ 90%) | go-live 9, [`followups.md`](followups.md#router-evals-on-real-texts-go-live-step-9) | deferred |
 
 ## Done
 
