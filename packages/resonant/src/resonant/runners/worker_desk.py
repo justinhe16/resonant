@@ -295,7 +295,7 @@ class WorkerDesk:
             if ANY in (system, action):
                 raise ValueError("name one system and one action, not *")
         except ValueError as e:
-            return Reply(f"Usage error: --system and --action {e}.", EXIT_USAGE)
+            return Reply(f"Usage error: --system/--action: {e}.", EXIT_USAGE)
         if self.trust is None:  # fail closed
             return Reply(NO_TRUST, EXIT_DENIED)
         key = (run.code, system, action, req.irreversible, req.cost_usd, req.what)
