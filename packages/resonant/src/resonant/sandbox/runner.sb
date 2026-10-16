@@ -1,73 +1,103 @@
-;; Seatbelt profile for Claude runner sessions (docs/phase5a-plan.md, D1).
-;; A wall, not a gate: allow by default, then enumerated denies. SBPL is last-match-wins,
-;; so every deny that must hold sits AFTER the allows it overrides. Every path arrives as a
-;; -D parameter (see profile.py); nothing is spliced into this text.
+;; The thin guard: Seatbelt profile for Claude workers (docs/employee-plan.md, D2).
+;; Allow by default. A worker reads, writes, connects and runs like the owner at the
+;; keyboard, except for the enumerated denies below, which protect Resonant itself: its
+;; state, its daemon and kill switch, iMessage, auto-start entries and the Keychain.
+;; SBPL is last-match-wins and nothing below the first deny is an allow, so every deny holds.
+;; Every path arrives as a -D parameter (see profile.py); nothing is spliced into this text.
 (version 1)
 (allow default)
 
-;; ---- file write: deny everywhere, then the run dir and cache ----------------------------
-(deny file-write*)
-(allow file-write*
-  (subpath (param "RUN"))
-  (subpath (param "CACHE"))
-  (literal "/dev/null")
-  (literal "/dev/dtracehelper")
-  (literal "/dev/tty"))  ; headless sessions only: no ptys, no other terminals
-
-;; ---- file read: deny the owner's world, then allow the run's own paths ------------------
-(deny file-read*
-  (subpath (param "HOME"))
-  (subpath "/Volumes")
-  (subpath "/Users/Shared")
-  (subpath "/private/tmp")
-  (subpath "/private/var/folders"))
-(allow file-read*
-  (subpath (param "RUN"))
-  (subpath (param "CACHE"))
-;; @READ_ALLOW@
-  )
-;; stat only on the ancestors of the allowed paths, so realpath and getcwd work
-(allow file-read-metadata
-;; @META_ALLOW@
-  )
-;; never readable, even if a toolchain path above sits inside one
-(deny file-read*
+;; ---- Resonant's state and the installed daemon: no writes ----------------------------------
+;; ~/.resonant (DB, config, logs, run secrets) and the daemon's code, venv, interpreter and
+;; the binaries it runs outside the guard (profile.default_protected).
+(deny file-write*
   (subpath (string-append (param "HOME") "/.resonant"))
-  (subpath (string-append (param "HOME") "/.ssh"))
-  (subpath (string-append (param "HOME") "/.aws"))
-  (subpath (string-append (param "HOME") "/.config/gh"))
-  (subpath (string-append (param "HOME") "/.claude"))
-  (subpath (string-append (param "HOME") "/Library"))
-  (subpath (string-append (param "HOME") "/.local/bin")))
+;; @PROTECT@
+  )
 
-;; ---- exec: defense in depth (the mach denies below do the real work) ---------------------
+;; ---- auto-start and persistence: no writes -------------------------------------------------
+;; login items and LaunchAgents (~/Library), shell and git startup files, Claude and ssh
+;; config, ~/.config; the system LaunchAgents/LaunchDaemons, the login-item (BTM) store and
+;; the cron and at spools (/usr/lib/cron is a symlink to /private/var/at).
+(deny file-write*
+  (literal (param "HOME"))
+  (subpath (string-append (param "HOME") "/Library"))
+  (subpath (string-append (param "HOME") "/.claude"))
+  (subpath (string-append (param "HOME") "/.ssh"))
+  (subpath (string-append (param "HOME") "/.config"))
+  (literal (string-append (param "HOME") "/.zshrc"))
+  (literal (string-append (param "HOME") "/.zshenv"))
+  (literal (string-append (param "HOME") "/.zprofile"))
+  (literal (string-append (param "HOME") "/.zlogin"))
+  (literal (string-append (param "HOME") "/.zlogout"))
+  (literal (string-append (param "HOME") "/.bashrc"))
+  (literal (string-append (param "HOME") "/.bash_profile"))
+  (literal (string-append (param "HOME") "/.bash_login"))
+  (literal (string-append (param "HOME") "/.profile"))
+  (literal (string-append (param "HOME") "/.gitconfig"))
+  (subpath "/Library/LaunchAgents")
+  (subpath "/Library/LaunchDaemons")
+  (subpath "/Library/StartupItems")
+  (subpath "/private/var/at")
+  (subpath "/private/var/db/com.apple.backgroundtaskmanagement"))
+
+;; ---- never readable or writable --------------------------------------------------------------
+;; the runner's token files (runner.secrets_dir), Messages data, the Keychain files, and the
+;; owner's extra paths (runner.deny_read)
+(deny file-read* file-write*
+  (subpath (param "SECRETS"))
+  (subpath (string-append (param "HOME") "/Library/Messages"))
+  (subpath (string-append (param "HOME") "/Library/Keychains"))
+  (subpath "/Library/Keychains")
+;; @DENY_READ@
+  )
+
+;; ---- the ancestors of everything above: no rename, no delete ---------------------------------
+;; A subpath rule follows the path, not the files: renaming a parent dir would carry a
+;; protected tree out from under it (and a fresh one could be put in its place). A literal
+;; deny on each ancestor stops that and still lets a worker create entries beside it.
+(deny file-write*
+;; @ANCESTORS@
+  )
+
+;; ---- exec ------------------------------------------------------------------------------------
+;; launchctl and the cron/at front ends (the launchd mach deny below does the real work), and
+;; the daemon's own venv and `resonant` entry point
 (deny process-exec
-  (literal "/usr/bin/security")
-  (literal "/usr/bin/osascript")
-  (literal "/usr/bin/open")
   (literal "/bin/launchctl")
-  (literal "/usr/bin/shortcuts")
   (literal "/usr/bin/crontab")
   (literal "/usr/bin/at")
-  (literal "/usr/bin/sudo")
-  (literal "/usr/sbin/screencapture")
 ;; @DENY_EXEC@
   )
 
-;; ---- mach / IPC: nothing may act outside the sandbox on the owner's behalf --------------
+;; ---- mach / IPC: nothing acts outside the sandbox as the owner -----------------------------
 (deny mach-lookup
+  ;; launchd job control (load, kill, bootout of Resonant's jobs)
   (global-name-prefix "com.apple.xpc.launchd")
+  ;; the Keychain: securityd and its agents. trustd stays reachable (TLS needs it).
   (global-name "com.apple.SecurityServer")
   (global-name-prefix "com.apple.securityd")
-  (global-name-prefix "com.apple.windowserver")
-  (global-name-prefix "com.apple.hidsystem")
-  (global-name-prefix "com.apple.accessibility")
-  (global-name-prefix "com.apple.universalaccessd")
+  (global-name-prefix "com.apple.security.agent")
+  (global-name "com.apple.security.kcsharing")
+  (global-name "com.apple.security.KeychainStasher")
+  (global-name "com.apple.security.cloudkeychainproxy3")
+  (global-name "com.apple.security.octagon")
+  (global-name "com.apple.keychainsharingmessagingd")
+  ;; iMessage: the Messages agents, and the routes that drive Messages.app as the owner
+  ;; (Apple Events, LaunchServices, synthetic input, accessibility, TCC)
+  (global-name-prefix "com.apple.imagent")
+  (global-name-prefix "com.apple.imdpersistence")
+  (global-name-prefix "com.apple.imcore")
+  (global-name "com.apple.iChat")
+  (global-name-prefix "com.apple.MobileSMS")
   (global-name "com.apple.coreservices.appleevents")
   (global-name "com.apple.coreservices.appleevent-send")
   (global-name "com.apple.coreservices.launchservicesd")
   (global-name-prefix "com.apple.lsd.")
-  (global-name-prefix "com.apple.pasteboard.")
+  (global-name-prefix "com.apple.windowserver")
+  (global-name-prefix "com.apple.hidsystem")
+  (global-name-prefix "com.apple.accessibility")
+  (global-name-prefix "com.apple.universalaccessd")
   (global-name-prefix "com.apple.tccd"))
 ;; Apple Events and LaunchServices opens are checked as operations, not only as lookups
 (deny appleevent-send)
@@ -77,95 +107,13 @@
   (iokit-user-client-class "IOHIDParamUserClient")
   (iokit-user-client-class "IOHIDLibUserClient")
   (iokit-user-client-class "IOHIDEventServiceUserClient"))
+
+;; ---- other processes: the daemon and the kill switch ---------------------------------------
+;; (target same-sandbox), not (target others): a worker still kills its own children
+(deny signal (require-not (target same-sandbox)))
 (deny mach-priv-task-port)
 (deny mach-task-name)
-(deny process-info* (require-not (target same-sandbox)))
-(deny signal (require-not (target same-sandbox)))
-;; NOTE: another process's argv and environment (`ps eww`, KERN_PROCARGS2) are readable
-;; whatever is denied here (a known limitation, docs/phase5a-plan.md): secrets never sit in an
-;; env or argv. This line is belt and braces for macOS versions that do gate it.
-(deny sysctl-read (sysctl-name "kern.procargs2"))
 
-;; ---- network -----------------------------------------------------------------------------
-;; the daemon's API and Ollama, on every address (loopback and the LAN IP)
-(deny network-outbound (remote ip "*:7777") (remote ip "*:11434"))
-(deny network-bind (local ip "*:7777") (local ip "*:11434"))
-;; unix sockets: deny by default (docker, ssh-agent, any daemon), mDNSResponder only
-(deny network-outbound (remote unix-socket))
-(allow network-outbound (literal "/private/var/run/mDNSResponder"))
-
-;; ---- last word: nothing below may be undone by an allow above ----------------------------
-;; persistence paths (login items, shell startup, Claude config, cron, ssh) and terminals
-(deny file-write*
-  (literal (param "HOME"))
-  (subpath (string-append (param "HOME") "/Library"))
-  (subpath (string-append (param "HOME") "/.claude"))
-  (subpath (string-append (param "HOME") "/.ssh"))
-  (subpath (string-append (param "HOME") "/.config"))
-  (subpath (string-append (param "HOME") "/.resonant"))
-  (literal (string-append (param "HOME") "/.zshrc"))
-  (literal (string-append (param "HOME") "/.zshenv"))
-  (literal (string-append (param "HOME") "/.zprofile"))
-  (literal (string-append (param "HOME") "/.zlogin"))
-  (literal (string-append (param "HOME") "/.bashrc"))
-  (literal (string-append (param "HOME") "/.bash_profile"))
-  (literal (string-append (param "HOME") "/.profile"))
-  (literal (string-append (param "HOME") "/.gitconfig"))
-  (regex #"^/dev/ttys[0-9]+")
-  (literal "/dev/ptmx"))
-;; the runner's token files, briefly on disk under runner.secrets_dir
-(deny file-read* file-write*
-  (subpath (param "SECRETS"))
-;; runner.deny_read: the owner's extra paths
-;; @DENY_READ@
-  )
-
-;; every other run's dir (its creds/ holds a live GitHub token) is unreadable and unwritable
-;; wherever runner.work_dir sits, not only where the HOME denies reach. The allowed paths and
-;; their ancestors (stat for realpath) are spared; the cache may sit inside the work dir.
-(deny file-read* file-write*
-  (require-all
-    (subpath (param "WORK"))
-    (require-not (require-any
-;; @WORK_EXEMPT@
-      ))))
-
-;; ---- secret files: denied for read AND write, wherever they sit -----------------------------
-;; Credentials the owner keeps next to their code (~/trading/.env with exchange keys) or in
-;; the usual tool homes. Last in the file so no allow above can undo them (SBPL: last match
-;; wins). The name rules (.env*, .envrc, *.pem, *.p12, *.pfx, *.jks, *.key, id_rsa-style SSH
-;; keys) spare the run dir, the cache and the toolchain read paths (profile.py passes them as
-;; params), so a repo's own committed files and a package's bundled cacert.pem still work.
-;; Read paths are exempt because a toolchain tree is not the owner's secrets; never put a
-;; credential dir in runner read paths. They also spare the few system locations that hold
-;; the OS and Homebrew CA bundles (TLS for git, curl, python and gh needs them).
-;; SBPL regexes are POSIX extended, matched against the whole path; #"..." is a raw string, so
-;; `\.` is an escaped dot. The macOS filesystem is case-insensitive, so every letter is a
-;; [xX] class (`.ENV` opens `.env`). No lookahead exists, hence the require-not for templates.
-(deny file-read* file-write*
-  (require-all
-    (require-any
-      (regex #"/\.[eE][nN][vV]$")
-      (regex #"/\.[eE][nN][vV]\.[^/]*$")
-      (regex #"/\.[eE][nN][vV][rR][cC]$")
-      (regex #"\.([pP][eE][mM]|[pP]12|[pP][fF][xX]|[jJ][kK][sS]|[kK][eE][yY])$")
-      (regex #"/[iI][dD]_([rR][sS][aA]|[dD][sS][aA]|[eE][cC][dD][sS][aA]|[eE][dD]25519)(_[sS][kK])?$"))
-    ;; committed templates carry no secrets
-    (require-not
-      (regex #"/\.[eE][nN][vV]\.([eE][xX][aA][mM][pP][lL][eE]|[sS][aA][mM][pP][lL][eE]|[tT][eE][mM][pP][lL][aA][tT][eE])$"))
-    ;; CA bundles the OS and Homebrew tools read
-    (require-not (subpath "/private/etc/ssl"))
-    (require-not (subpath "/System/Library/Security"))
-    (require-not (subpath "/opt/homebrew/etc/ca-certificates"))
-    (require-not (subpath "/opt/homebrew/etc/openssl@3"))
-    (require-not (subpath "/opt/homebrew/share/ca-certificates"))
-    (require-not (subpath "/opt/homebrew/Cellar/ca-certificates"))
-    ;; the run's own files and the toolchain paths
-    (require-not (require-any
-;; @SECRET_EXEMPT@
-      ))))
-;; fixed credential files and dirs under $HOME (profile.py HOME_SECRETS), even when a
-;; read path above sits inside one
-(deny file-read* file-write*
-;; @HOME_SECRETS@
-  )
+;; ---- network: everything except the daemon's API port, on every address ------------------
+(deny network-outbound (remote ip "*:7777"))
+(deny network-bind (local ip "*:7777"))

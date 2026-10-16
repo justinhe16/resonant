@@ -1487,10 +1487,11 @@ async def test_happy_path_under_the_real_sandbox(tmp_path: Path, db: sqlite3.Con
     run = h.run()
     assert run.status == "no_changes", run.failure  # nothing pushed, no PR
     assert h.argv_log()[0]["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN
-    # inside the sandbox the session read its own token and nobody else's
+    # inside the sandbox the session read its own token
     seen = json.loads((h.tmp("R1") / "creds.json").read_text())
     assert seen["token"] == h.api.tokens[0] and seen["hosts_token"] == h.api.tokens[0]
-    assert seen["sibling"].startswith("ERR")  # EPERM: the profile denies other run dirs
+    # the thin guard (EM-1) no longer hides runs from each other: workers are trusted alike
+    assert not seen["sibling"].startswith("ERR")
     assert seen["gh_config_dir"] == str(h.code_dir("R1").resolve() / "creds" / "gh")
     assert h.api.live == set()
 

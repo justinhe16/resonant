@@ -400,8 +400,8 @@ class RunnerConfig(_Section):
     secrets_dir: Path = Field(default=Path("~/.resonant/run-secrets"), validate_default=True)
     # Package caches shared between runs and used by nothing outside the sandbox.
     cache_dir: Path = Field(default=Path("~/resonant-runs/.cache"), validate_default=True)
-    # Extra paths a session may neither read nor write, on top of the built-in secret-file
-    # denies (.env, *.pem, ~/.ssh, ...; resonant/sandbox/runner.sb).
+    # Extra paths a session may neither read nor write, on top of the thin guard's own
+    # (run-secrets, Messages, the Keychain; resonant/sandbox/runner.sb).
     deny_read: list[Path] = Field(default_factory=list[Path])
     max_run_dir_mb: int = Field(default=5000, ge=100)
     max_cache_gb: int = Field(default=20, ge=1)

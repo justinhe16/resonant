@@ -293,9 +293,9 @@ def _keychain_exists(ref: str) -> bool:
 
 
 def sandbox_row(settings: Settings) -> Row:
-    """Phase 5a: the runner sandbox, built from the configured runner dirs, denies a read of
-    ~/.resonant, the Keychain service and the API port. Writes nothing (the dirs need not
-    exist). Advisory until a runner is configured."""
+    """The runner sandbox (the thin guard), built from the configured runner dirs, denies a
+    write into ~/.resonant, the Keychain service and the API port. Writes nothing while the
+    guard holds (the dirs need not exist). Advisory until a runner is configured."""
     from resonant.sandbox import SandboxParams, default_deny_exec, default_read_paths
     from resonant.sandbox.probes import self_check
 
