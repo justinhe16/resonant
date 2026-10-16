@@ -93,6 +93,18 @@ FORK_NEEDS_PUBLIC_REPO = (
     "A fork run needs a classic GitHub token with only the public_repo scope. On the Mini: "
     "resonant secret set runner/github_public_token."
 )
+GITHUB_TOKEN_HOW = "resonant secret set runner/github_token"  # noqa: S105  # a command
+
+
+def needs_github_token(what: str) -> str:
+    """The sentence for something only the daemon's own GitHub token can do, when it isn't
+    set: workers still run without it (docs/employee-plan.md, RX-1)."""
+    return (
+        f"{what} needs the daemon's GitHub token (runner/github_token), which isn't set yet. "
+        f"On the Mini: {GITHUB_TOKEN_HOW}."
+    )
+
+
 FORK_READY_TRIES = 6  # GitHub makes a new fork in the background; the clone waits for it
 FORK_READY_WAIT_S = 5.0  # the first wait, doubled each try
 UPSTREAM_BODY_MAX = 4000
@@ -708,8 +720,9 @@ class Workspace:
             await self._git(["init", "--bare", "-q", str(mirror)])
         return mirror
 
-    async def _refresh(self, repo_name: str, token: str) -> None:
-        """Fetch the remote's branches into the mirror. Caller holds the mirror lock.
+    async def _refresh(self, repo_name: str, token: str | None) -> None:
+        """Fetch the remote's branches into the mirror. Caller holds the mirror lock. With no
+        ``token`` the fetch is anonymous: a public repo works, a private one fails.
 
         No fsckObjects here: the remote is the owner's own repo, and old histories often
         fail fsck. The untrusted input (a run's pushed PR head) is fetched with fsck."""
@@ -885,7 +898,13 @@ class Workspace:
             raise RunnerError(f"{path} can't be a checkout: it overlaps Resonant's own dirs")
 
     async def prepare(
-        self, code: str, repo_name: str, ask: str, *, github_token: str, fork: str | None = None
+        self,
+        code: str,
+        repo_name: str,
+        ask: str,
+        *,
+        github_token: str | None,
+        fork: str | None = None,
     ) -> Prepared:
         """Make the run's places: the checkout (cloned on first use) fetched, a worktree on a
         new branch from ``origin/<base>`` with the checkout's local config linked in, and the
@@ -896,6 +915,12 @@ class Workspace:
         the fork's (cloned with no token: it is public), and the worktree starts from the
         original's base, which comes through the mirror like a push repo's, into
         ``refs/remotes/upstream/<base>``. CI isn't recorded (theirs runs on their side).
+
+        With no ``github_token`` (RX-1: the daemon's token isn't set yet) the mirror and a
+        first clone are fetched anonymously, which works for a public repo. When that fails
+        (a private repo) and the owner already has a checkout, the run starts from the
+        checkout's own ``origin/<base>`` instead (read under the guard): such a run only ever
+        commits locally, nothing it makes is merged by Resonant, and CI isn't recorded.
 
         A leftover worktree or run dir (a crash before the session started) is removed and
         rebuilt."""
@@ -908,46 +933,58 @@ class Workspace:
         # mirror's fetch (a checkout's http.* or credential config can't reach it), and the
         # base sha, CI and the tracked names are read there, not from a worker-writable .git.
         mirror_git = self._mirror_git(repo.name)
+        from_mirror = True
+        base_sha = ""
+        tracked: list[str] = []
         async with self.mirror_lock(repo.name):
             try:
                 await self._refresh(repo.name, github_token)
             except GitError as e:
-                raise RunnerError(
+                fetch_failed = RunnerError(
                     f"fetching {repo.base} of {repo.slug} failed: {e.message[-120:]}"
-                ) from None
-            try:
-                out = await mirror_git("rev-parse", "--verify", "-q",
-                                       f"refs/heads/{repo.base}^{{commit}}")  # fmt: skip
-            except GitError:
-                raise RunnerError(f"{repo.base} isn't a branch of {repo_name}") from None
-            base_sha = out.decode().strip()
-            try:
-                has_ci = await ci_present(mirror_git, base_sha)
-            except GitError:
-                has_ci = False
-            top = await mirror_git("ls-tree", "-z", "--name-only", base_sha)
-            tracked = [n for n in top.decode(errors="replace").split("\0") if n]
-        # No CI is allowed (docs/repos-plan.md D5): the registry records it, the run's reply
-        # says so, and merging is what's refused.
-        if fork is None and (not has_ci or repo.ci is None):
-            with atomic(self.conn):
-                repo_store.set_ci(self.conn, repo.slug, has_ci)
+                )
+                if github_token is not None or fork is not None:
+                    raise fetch_failed from None
+                if not await asyncio.to_thread(os.path.lexists, self.checkout_path(repo)):
+                    raise RunnerError(self.no_clone_text(repo)) from None
+                from_mirror = False
+            if from_mirror:
+                try:
+                    out = await mirror_git("rev-parse", "--verify", "-q",
+                                           f"refs/heads/{repo.base}^{{commit}}")  # fmt: skip
+                except GitError:
+                    raise RunnerError(f"{repo.base} isn't a branch of {repo_name}") from None
+                base_sha = out.decode().strip()
+                try:
+                    has_ci = await ci_present(mirror_git, base_sha)
+                except GitError:
+                    has_ci = False
+                top = await mirror_git("ls-tree", "-z", "--name-only", base_sha)
+                tracked = [n for n in top.decode(errors="replace").split("\0") if n]
+                # No CI is allowed (docs/repos-plan.md D5): the registry records it, the run's
+                # reply says so, and merging is what's refused.
+                if fork is None and (not has_ci or repo.ci is None):
+                    with atomic(self.conn):
+                        repo_store.set_ci(self.conn, repo.slug, has_ci)
         async with self.checkout_lock(repo.name):
             # a fork's checkout is cloned from the (public) fork with no token
             checkout = await self.ensure_checkout(
                 repo, github_token if fork is None else None, fork=fork
             )
-            tracking = f"refs/remotes/{'origin' if fork is None else 'upstream'}/{repo.base}"
-            try:  # tokenless, from the mirror, under the guard
-                await self._in_checkout(
-                    checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head",
-                    str(self.mirror_path(repo.name)), f"+refs/heads/{repo.base}:{tracking}",
-                    env={"GIT_ALLOW_PROTOCOL": "file"},
-                )  # fmt: skip
-            except GitError as e:
-                raise RunnerError(
-                    f"fetching {repo.base} into {checkout} failed: {e.message[-120:]}"
-                ) from None
+            if from_mirror:
+                tracking = f"refs/remotes/{'origin' if fork is None else 'upstream'}/{repo.base}"
+                try:  # tokenless, from the mirror, under the guard
+                    await self._in_checkout(
+                        checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head",
+                        str(self.mirror_path(repo.name)), f"+refs/heads/{repo.base}:{tracking}",
+                        env={"GIT_ALLOW_PROTOCOL": "file"},
+                    )  # fmt: skip
+                except GitError as e:
+                    raise RunnerError(
+                        f"fetching {repo.base} into {checkout} failed: {e.message[-120:]}"
+                    ) from None
+            else:
+                base_sha, tracked = await self._checkout_base(checkout, repo)
 
             # a leftover from a crash (its branch is reset by ``-B`` below)
             await self._remove_worktree(code, worktree, checkout, None)
@@ -969,6 +1006,58 @@ class Workspace:
                     await asyncio.to_thread(rmtree_nofollow, run_dir)
                 raise
         return Prepared(code, repo.name, run_dir, worktree, checkout, branch, repo.base, base_sha)
+
+    async def _checkout_base(self, checkout: Path, repo: Repo) -> tuple[str, list[str]]:
+        """The base commit and its top-level names from the owner's checkout (the daemon has
+        no token to fetch a private repo with): ``origin/<base>``, else the local ``<base>``.
+        Under the guard, like every daemon git command in a checkout."""
+        for ref in (f"refs/remotes/origin/{repo.base}", f"refs/heads/{repo.base}"):
+            try:
+                out = await self._in_checkout(checkout, "rev-parse", "--verify", "-q",
+                                              f"{ref}^{{commit}}")  # fmt: skip
+            except GitError:
+                continue
+            sha = out.decode().strip()
+            if not _SHA.fullmatch(sha):
+                continue
+            top = await self._in_checkout(checkout, "ls-tree", "-z", "--name-only", sha)
+            return sha, [n for n in top.decode(errors="replace").split("\0") if n]
+        raise RunnerError(f"{checkout} has no {repo.base} branch to start from")
+
+    def no_clone_text(self, repo: Repo) -> str:
+        """Why a run on ``repo`` can't start without the daemon's token: there is no checkout
+        and the repo can't be cloned anonymously (it is private, or not reachable)."""
+        path = self.checkout_path(repo)
+        return (
+            f"I can't work on {repo.slug} yet: there's no checkout at {path}, and cloning it "
+            f"needs the daemon's GitHub token (runner/github_token). On the Mini: "
+            f"{GITHUB_TOKEN_HOW}, or clone it to {path} yourself."
+        )
+
+    async def can_start_tokenless(self, repo_name: str) -> bool:
+        """Whether a run on the repo can be prepared without the daemon's token: the owner
+        has a checkout, or the repo answers an anonymous ``git ls-remote`` (it is public)."""
+        repo = self._repo(repo_name)
+        if await asyncio.to_thread(os.path.lexists, self.checkout_path(repo)):
+            return True
+        res = await _exec(
+            [self._git_bin, "ls-remote", "-q", "--heads", "--", self._url_for(repo), repo.base],
+            env=git_env(), timeout_s=GH_TIMEOUT_S,
+        )  # fmt: skip
+        return res.returncode == 0
+
+    async def local_commits(self, p: Prepared) -> int:
+        """How many commits the run's local branch has beyond its base, read in the owner's
+        checkout under the guard (a run that can't push leaves its work there)."""
+        if p.checkout is None:
+            return 0
+        try:
+            out = await self._in_checkout(
+                p.checkout, "rev-list", "--count", f"{p.base_sha}..refs/heads/{p.branch}"
+            )
+        except GitError:
+            return 0
+        return int(out.decode().strip() or 0)
 
     async def prepare_scratch(self, code: str) -> Prepared:
         """A run with no repo: the run dir and an empty ``<code_dir>/.scratch/<code>``."""
@@ -1092,12 +1181,15 @@ class Workspace:
         """``gh`` with the daemon's token, or with ``public`` the ``public_repo`` token (fork
         mode only: making the fork, and opening or closing the upstream PR)."""
         token = secrets.github_token
+        if token is None and not public:
+            raise RunnerError(needs_github_token("That"))
         if public:
             if not secrets.github_public_token:
                 raise RunnerError(FORK_NEEDS_PUBLIC_REPO)
             token = secrets.github_public_token
         # Everything gh reads or writes lives in one throwaway dir; the token is in its
         # hosts.yml (which gh prefers to the Keychain) and never in env or argv.
+        assert token is not None
         with secret_dir(self.cfg.secrets_dir) as tmp:
             config = write_gh_config(tmp, token)
             env = {
@@ -1578,6 +1670,8 @@ class Workspace:
             raise MergeRefused(upstream_merges(repo.slug))
         if not _SHA.fullmatch(head_sha) or pr_number < 1:
             raise MergeRefused("bad PR reference")
+        if secrets.github_token is None:  # the mirror's checks and the merge itself use it
+            raise MergeRefused(needs_github_token("Merging"))
         if starter_ci and (
             not branch.startswith(CI_BRANCH_PREFIX)
             or not await self._is_starter_ci_pr(repo, pr_number, head_sha, secrets)

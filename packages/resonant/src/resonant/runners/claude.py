@@ -105,19 +105,23 @@ from resonant.runner.resolve import (
     GhGitHub,
     GitHub,
     GitHubError,
+    NeedsToken,
     NoAccess,
     NotFound,
+    OfflineGitHub,
     Resolved,
     Resolver,
 )
 from resonant.runner.workspace import (
     CREDS_DIR,
     FORK_NEEDS_PUBLIC_REPO,
+    GITHUB_TOKEN_HOW,
     MergeRefused,
     NoChanges,
     Prepared,
     RunnerError,
     Workspace,
+    needs_github_token,
     read_session_token,
     session_git_env,
     upstream_merges,
@@ -154,6 +158,7 @@ from resonant.sandbox.probes import cached_self_check
 from resonant.secrets import (
     GITHUB_APP_KEY_REF,
     GITHUB_PUBLIC_TOKEN_REF,
+    GITHUB_TOKEN_REF,
     RunnerSecrets,
     SecretError,
     SecretStore,
@@ -260,6 +265,30 @@ RESUME_PROMPT = (
     "make sure the work is pushed, the pull request is open and its CI has been checked, and "
     "give the closing summary."
 )
+# RX-1: a repo run that can't push yet (the GitHub App, or the daemon's own token, isn't set
+# up). The session gets no GitHub credentials and leaves its work on its local branch.
+LOCAL_PROMPT = (
+    "You are working in a git worktree of {repo} (your current directory), on branch {branch}, "
+    "which is already checked out and starts from {base}. The checkout's local config (.env "
+    "files and the like) is linked in and kept out of git: use it, never commit it. This run "
+    "has no GitHub credentials ({why}): don't push and don't open a pull request; the commits "
+    "on {branch} are what the owner gets. Commit your work on {branch} with clear messages. "
+    "Never commit to {base} or to any other branch, and don't change remotes or git config. "
+    "End with a 1-3 line summary: what changed and anything left undone."
+)
+LOCAL_RESUME_PROMPT = (
+    "Your session was interrupted. Continue the task you were given. If it is already done, "
+    "make sure the work is committed on your branch (don't push), and give the closing summary."
+)
+# Why a repo run can't push, by the key kept in its task checkpoint (``local``): the short
+# form for the start ack, the long one for the end reply.
+NO_PUSH_SHORT = {"app": "GitHub App not set up", "token": "runner/github_token not set"}
+NO_PUSH_LONG = {"app": "the GitHub App isn't set up", "token": "runner/github_token isn't set"}
+APP_KEY_HOW = (
+    f"resonant secret set {GITHUB_APP_KEY_REF} --from-file <the downloaded .pem>, "
+    "then delete the .pem"
+)
+APP_CONFIG_HOW = "add runner.github_app with app_id and installation_id"
 # A run with no repo has nothing to push and no PR (EM-2's scratch dir).
 SCRATCH_RESUME_PROMPT = (
     "Your session was interrupted. Continue the task you were given. If it is already done, "
@@ -282,6 +311,7 @@ class Started:
     warning: str | None = None  # e.g. the base branch isn't protected
     note: str | None = None  # how it ends: merged once CI is green, or a PR upstream after a yes
     via: str | None = None  # the extension whose link named the new repo
+    limits: str | None = None  # RX-1: what this run can't do, said up front
 
     @property
     def text(self) -> str:
@@ -292,7 +322,7 @@ class Started:
             f"On it: {self.code} · {where}{new}. Up to {self.max_minutes}m. "
             f"/runs to check, /cancel {self.code} to stop."
         )
-        for extra in (self.note, self.warning):
+        for extra in (self.limits, self.note, self.warning):
             if extra:
                 text += f"\n{extra}"
         return text
@@ -386,6 +416,13 @@ def reply_text(
                 f"{run.code} done ({took}): {run.branch} is on your fork; no PR on {upstream} "
                 f"({why})." + summary
             )
+        case "done" if run.repo:  # RX-1: a run that couldn't push; the work is on its branch
+            where = _home(run.checkout) if run.checkout else run.repo
+            why = run.failure or "it can't push yet"
+            return (
+                f"{run.code} done ({took}): work is on local branch {run.branch} in {where}; "
+                f"{why}." + summary
+            )
         case "done":  # a run with no repo: Claude's summary is the answer
             return f"{run.code} done ({took})" + (f": {run.summary}" if run.summary else ".")
         case "failed":
@@ -401,6 +438,58 @@ def reply_text(
 
 def not_set_up_text(missing: Sequence[str], how: Sequence[str]) -> str:
     return f"The runner isn't set up: {', '.join(missing)}. On the Mini: {'; '.join(how)}."
+
+
+def _home(path: str) -> str:
+    """``~/code/proj`` for a path under the home dir (the reply is read on a phone)."""
+    home = str(Path.home())
+    return "~" + path[len(home) :] if path == home or path.startswith(home + "/") else path
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    """What the runner can do beyond starting a Claude session (RX-1). The Claude credential
+    and the CLI are required for any run (``setup_missing``); the GitHub pieces each unlock
+    more: the daemon's token (lookups, private clones, the PR checks, merges, new repos, fork
+    runs) and the GitHub App (a session token, so the worker can push and open its PR)."""
+
+    github_token: bool
+    app_key: bool
+    app_config: bool
+
+    @property
+    def app(self) -> bool:
+        return self.app_key and self.app_config
+
+    @property
+    def no_push(self) -> str | None:
+        """Why a repo run can't push (a key of ``NO_PUSH_SHORT``), or None. Pushing needs the
+        App (the session's token) and the daemon's token (Resonant finds and checks the PR
+        with it, and watches the base for direct pushes)."""
+        if not self.app:
+            return "app"
+        if not self.github_token:
+            return "token"
+        return None
+
+    def notes(self) -> list[str]:
+        """One line per missing piece: what it unlocks and how to set it."""
+        notes: list[str] = []
+        if not self.app:
+            how = ([] if self.app_key else [APP_KEY_HOW]) + (
+                [] if self.app_config else [APP_CONFIG_HOW]
+            )
+            notes.append(
+                "No push or PRs yet: the GitHub App isn't set up, so workers commit to a "
+                f"local branch. On the Mini: {'; '.join(how)}."
+            )
+        if not self.github_token:
+            push = "" if not self.app else "push, PRs, "
+            notes.append(
+                f"No {push}merges, repo lookups, private clones, new repos or fork runs yet: "
+                f"runner/github_token isn't set. On the Mini: {GITHUB_TOKEN_HOW}."
+            )
+        return notes
 
 
 # --- the transcript ------------------------------------------------------------------------
@@ -554,6 +643,7 @@ class _Work:
     ctx: StepContext
     secrets: RunnerSecrets = field(repr=False)
     redactor: Redactor = field(repr=False)
+    local: str | None = None  # RX-1: why the run can't push (a ``NO_PUSH_LONG`` key)
 
 
 Wrap = Callable[[Sequence[str], SandboxParams], Sequence[str]]
@@ -795,13 +885,15 @@ class ClaudeRunner:
     # -- public API --
 
     async def setup_missing(self) -> str | None:
-        """``The runner isn't set up: …`` naming exactly what is missing, or None."""
+        """``The runner isn't set up: …`` naming exactly what is missing for any run (the
+        Claude credential and the claude CLI), or None. The GitHub pieces aren't blockers:
+        ``capability_notes`` says what each unlocks."""
         missing, how = await self.setup_gaps()
         return not_set_up_text(missing, how) if missing else None
 
     async def setup_gaps(self) -> tuple[list[str], list[str]]:
-        """What the runner still needs and how to fix each; both empty when it is set up.
-        Secrets are checked by name only (no value is read)."""
+        """What the runner still needs for any run and how to fix each; both empty when it is
+        set up. Secrets are checked by name only (no value is read)."""
         missing: list[str] = []
         how: list[str] = []
         try:
@@ -812,20 +904,31 @@ class ClaudeRunner:
         else:
             for ref in refs:
                 missing.append(f"secret {ref}")
-                if ref == GITHUB_APP_KEY_REF:  # a multi-line PEM comes from a file
-                    how.append(
-                        f"resonant secret set {ref} --from-file <the downloaded .pem>, "
-                        "then delete the .pem"
-                    )
-                else:
-                    how.append(f"resonant secret set {ref.split(' ', 1)[0]}")
-        if self.cfg.github_app is None:
-            missing.append("runner.github_app isn't set in the config file")
-            how.append("add runner.github_app with app_id and installation_id")
+                how.append(f"resonant secret set {ref.split(' ', 1)[0]}")
         if self._claude_cmd is None and resolve_tool("claude") is None:
             missing.append("the claude CLI isn't installed")
             how.append("install Claude Code")
         return missing, how
+
+    async def capabilities(self) -> Capabilities:
+        """Which GitHub pieces are set up (names only; no value is read). A Keychain that
+        can't answer counts as not set up."""
+
+        async def have(ref: str) -> bool:
+            try:
+                return await self.secrets.exists(ref)
+            except SecretError:
+                return False
+
+        return Capabilities(
+            github_token=await have(GITHUB_TOKEN_REF),
+            app_key=await have(GITHUB_APP_KEY_REF),
+            app_config=self.app is not None,
+        )
+
+    async def capability_notes(self) -> list[str]:
+        """What workers can't do yet and how to unlock it (``/runs``); empty when all set."""
+        return (await self.capabilities()).notes()
 
     async def start_run(
         self,
@@ -849,7 +952,13 @@ class ClaudeRunner:
         (``merge_decision``); it is kept in the run's task checkpoint. Ignored for a fork
         repo, which is never merged by Resonant. ``report="now"`` texts the run's end right away
         (``/run``, or the owner asked to hear); by default it goes to the digest
-        (``runners/reports.py``)."""
+        (``runners/reports.py``).
+
+        Graduated capability (RX-1): only the Claude credential and CLI are required. A repo
+        run that can't push (no GitHub App, or no daemon token) still starts: its session gets
+        no GitHub credentials and the run ends ``done`` with its local branch (``local`` in
+        the task checkpoint), and the start reply says so up front. Without the daemon's
+        token a repo needs a checkout already, or must be public (cloned anonymously)."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text)
         ask = ask.strip()
@@ -866,9 +975,18 @@ class ClaudeRunner:
             if isinstance(resolved, Refused):
                 return resolved
             resolution, found = resolved, resolved.repo
-        if found is not None and found.mode == "fork" and (refusal := await self._fork_refusal()):
+        caps = await self.capabilities()
+        fork = found is not None and found.mode == "fork"
+        if fork and (refusal := await self._fork_refusal(caps)) is not None:
             return refusal
-        auto_merge = merge and found is not None and found.mode == "push"
+        local = None if found is None else caps.no_push
+        if (
+            found is not None
+            and not caps.github_token
+            and not await self.workspace.can_start_tokenless(found.name)
+        ):
+            return Refused(self.workspace.no_clone_text(found))
+        auto_merge = merge and found is not None and found.mode == "push" and local is None
         repo = "" if found is None else found.name
         run = runs.create(
             self.conn,
@@ -889,6 +1007,7 @@ class ClaudeRunner:
                 "run": run.code,
                 "title": f"run {run.code} · {repo or 'no repo'}",
                 **({"merge": True} if auto_merge else {}),
+                **({"local": local} if local is not None else {}),
             },
         )
         try:
@@ -904,8 +1023,11 @@ class ClaudeRunner:
             return Started(run.code, "", max(1, self.max_session_s // 60))
         with atomic(self.conn):
             repo_store.touch(self.conn, found.slug)
-        note = None
-        if found.mode == "fork":
+        note = limits = None
+        if local is not None:
+            then = "so no PR and no merge" if merge else "the work stays on a local branch"
+            limits = f"Heads up: no push yet ({NO_PUSH_SHORT[local]}); {then}."
+        elif found.mode == "fork":
             note = (
                 f"{found.slug} is upstream: the work goes to your fork, and I'll ask before the PR."
             )
@@ -913,7 +1035,7 @@ class ClaudeRunner:
             note = "I'll merge it when CI is green, unless a rule says to ask."
         assert resolution is not None
         warning = None
-        if found.mode != "fork":
+        if found.mode != "fork" and local is None:
             # The resolver's warning (a new repo's base) is the same fact said shorter; the
             # live check covers every run, so it is only the fallback.
             warning = await self._base_warning(found)
@@ -927,11 +1049,20 @@ class ClaudeRunner:
             warning,
             note,
             resolution.via if resolution.new else None,
+            limits,
         )
 
-    async def _fork_refusal(self) -> Refused | None:
+    async def _fork_refusal(self, caps: Capabilities) -> Refused | None:
         """Why a fork-mode run can't start here, or None. The ``public_repo`` token is
-        optional for the runner as a whole, so it is only asked for here."""
+        optional for the runner as a whole, so it is only asked for here; a fork run also
+        needs the daemon's token (the fork's checks) and the App (pushing to the fork)."""
+        if not caps.github_token:
+            return Refused(needs_github_token("A fork run"))
+        if not caps.app:
+            return Refused(
+                "A fork run pushes to your fork with the GitHub App, which isn't set up yet. "
+                f"On the Mini: {APP_KEY_HOW if not caps.app_key else APP_CONFIG_HOW}."
+            )
         if self.desk.trust is None:
             return Refused("A fork run asks you before its upstream PR, and asking isn't set up.")
         try:
@@ -958,9 +1089,13 @@ class ClaudeRunner:
         it, ``via`` the extension whose link named it, ``warning`` about its base)."""
         try:
             secrets = await load_runner_secrets(self.secrets)
-            resolution = await self.resolver.resolve(text, self._github(secrets))
+            # No daemon token: only the registry answers (RX-1); a lookup says what it needs.
+            github = OfflineGitHub() if secrets.github_token is None else self._github(secrets)
+            resolution = await self.resolver.resolve(text, github)
         except SecretError:
             return Refused((await self.setup_missing()) or "The runner's secrets can't be read.")
+        except NeedsToken:
+            return Refused(needs_github_token(f"Looking up {text[:60]!r} on GitHub"))
         except GitHubError as e:
             return Refused(f"Couldn't reach GitHub: {e}")
         if isinstance(resolution, Ambiguous):
@@ -1028,9 +1163,11 @@ class ClaudeRunner:
         if not _mergeable(run):
             return Refused(f"{run.code} isn't ready to merge ({run.status}).")
         try:
-            secrets = await load_runner_secrets(self.secrets)
+            secrets = await load_runner_secrets(self.secrets, claude=False)
         except SecretError:
-            return Refused((await self.setup_missing()) or "The runner's secrets can't be read.")
+            return Refused("The runner's secrets can't be read.")
+        if secrets.github_token is None:
+            return Refused(needs_github_token(f"Merging {run.code}"))
         return await self._merge(run.code, secrets, by="owner")
 
     async def _merge(
@@ -1194,7 +1331,10 @@ class ClaudeRunner:
             secrets = await load_runner_secrets(self.secrets)
         except SecretError as e:
             return await self._fail(run, f"the runner isn't set up ({e})", Redactor())
-        w = _Work(task, ctx, secrets, Redactor(secrets.values()))
+        local = task.checkpoint.get("local")
+        if not (isinstance(local, str) and local in NO_PUSH_LONG) or run.scratch:
+            local = None
+        w = _Work(task, ctx, secrets, Redactor(secrets.values()), local)
         try:
             if run.status == "waiting" and run.wait_reason == "question":
                 self.desk.time_out_due(run.code)
@@ -1218,7 +1358,9 @@ class ClaudeRunner:
                     return outcome
                 run = self._must_get(run.code)
             fork = not run.scratch and self._repo_of(run).mode == "fork"
-            if run.step == "harvest" and fork:
+            if w.local is not None and run.step in ("harvest", "publish"):
+                run = await self._collect_local(w, run, p)
+            elif run.step == "harvest" and fork:
                 run = await self._collect_fork(w, run, p)
             if run.step == "publish" and fork:
                 outcome = await self._publish(w, run, p)
@@ -1337,12 +1479,19 @@ class ClaudeRunner:
         return cached_self_check(params, self.state_dir / CHECK_CACHE)
 
     def _env(
-        self, params: SandboxParams, marker: str, secrets: RunnerSecrets | None, p: Prepared
+        self,
+        params: SandboxParams,
+        marker: str,
+        secrets: RunnerSecrets | None,
+        p: Prepared,
+        *,
+        local: bool = False,
     ) -> dict[str, str]:
         """The sandbox environment: from scratch, the one allowed secret only when asked. The
         run's GitHub token is not in it: ``gh`` finds it by ``GH_CONFIG_DIR`` (a path) and git
         through the credential helper named in ``GIT_CONFIG_*`` (a path; nothing is written
-        to the checkout's config). A run with no repo has neither."""
+        to the checkout's config). A run with no repo has neither, and neither has a ``local``
+        one (RX-1: it can't push yet), which still gets the exclude file."""
         env = scratch_env(
             params,
             path_dirs=params.path_dirs,
@@ -1352,6 +1501,8 @@ class ClaudeRunner:
         env[MARKER_ENV] = marker  # the run's session id: unique, never reused
         if p.scratch:
             env.update(session_git_env(None))
+        elif local:
+            env.update(session_git_env(None, p.exclude_file))
         else:
             creds = Path(env["HOME"]).parent / CREDS_DIR
             env["GH_CONFIG_DIR"] = str(creds / "gh")
@@ -1365,7 +1516,13 @@ class ClaudeRunner:
         return env
 
     def _argv(
-        self, run: Run, p: Prepared, params: SandboxParams, *, api_billing: bool
+        self,
+        run: Run,
+        p: Prepared,
+        params: SandboxParams,
+        *,
+        api_billing: bool,
+        local: str | None = None,
     ) -> list[str]:
         head = list(self._claude_cmd or [str(params.run_dir / "bin" / "claude")])
         argv = [
@@ -1384,7 +1541,7 @@ class ClaudeRunner:
             "--settings",
             json.dumps({"sandbox": {"enabled": False}}),
             "--append-system-prompt",
-            self._prompt(run, p) + WORKER_PROMPT,
+            self._prompt(run, p, local=local) + WORKER_PROMPT,
             "--max-turns",
             str(self.max_turns),
         ]
@@ -1392,12 +1549,17 @@ class ClaudeRunner:
             argv += ["--max-budget-usd", f"{run.max_budget_usd:g}"]
         return argv
 
-    def _prompt(self, run: Run, p: Prepared) -> str:
-        """The session's system prompt: scratch, a push repo's (it drives its own PR) or a
-        fork's (it pushes to the fork and stops; Resonant opens the upstream PR)."""
+    def _prompt(self, run: Run, p: Prepared, *, local: str | None = None) -> str:
+        """The session's system prompt: scratch, a push repo's (it drives its own PR), a
+        fork's (it pushes to the fork and stops; Resonant opens the upstream PR) or a run's
+        that can't push yet (``local``, RX-1: it commits and stops)."""
         if p.scratch:
             return SCRATCH_PROMPT
         repo = self._repo_of(run)
+        if local is not None:
+            return LOCAL_PROMPT.format(
+                repo=repo.slug, branch=p.branch, base=p.base_branch, why=NO_PUSH_LONG[local]
+            )
         if repo.mode == "fork":
             fork = self._forks.get(run.code)
             if fork is None:  # set when the session's token was minted
@@ -1431,7 +1593,7 @@ class ClaudeRunner:
                 run, "the sandbox check failed, see resonant sandbox check", w.redactor
             )
         self._check_stop(run.code)
-        if not p.scratch:  # a run with no repo gets no GitHub token
+        if not p.scratch and w.local is None:  # no repo, or can't push yet: no GitHub token
             await self._provision(w, run, p)
         try:
             return await self._run_session(w, run, p, params)
@@ -1444,18 +1606,21 @@ class ClaudeRunner:
     ) -> StepOutcome | None:
         argv = list(
             self._wrap(
-                self._argv(run, p, params, api_billing=bool(w.secrets.anthropic_key)), params
+                self._argv(
+                    run, p, params, api_billing=bool(w.secrets.anthropic_key), local=w.local
+                ),
+                params,
             )
         )
-        env = self._env(params, run.session_id, w.secrets, p)
-        prompt = self._turn_prompt(run).encode()
+        env = self._env(params, run.session_id, w.secrets, p, local=w.local is not None)
+        prompt = self._turn_prompt(run, local=w.local is not None).encode()
         server = await self._open_ctl(run, w)
         try:
             return await self._spawn_session(w, run, p, argv, env, prompt, server)
         finally:
             await self._close_ctl(run.code, server)
 
-    def _turn_prompt(self, run: Run) -> str:
+    def _turn_prompt(self, run: Run, *, local: bool = False) -> str:
         """The prompt of this turn: the ask for a new session; for a resumed one, the
         answers and owner messages it hasn't seen (saved on the run until the turn ends, so
         a crash resends them), else the plain resume prompt."""
@@ -1469,7 +1634,10 @@ class ClaudeRunner:
             return run.ask + (f"\n\n{saved}" if saved else "")
         if fresh is not None:
             return f"{saved}\n\nCarry on with the task."
-        prompt = SCRATCH_RESUME_PROMPT if run.scratch else RESUME_PROMPT
+        if run.scratch:
+            prompt = SCRATCH_RESUME_PROMPT
+        else:
+            prompt = LOCAL_RESUME_PROMPT if local else RESUME_PROMPT
         if saved:
             prompt += f"\n\nWhat you were told last turn:\n{saved}"
         for q in questions_store.open_for_run(self.conn, run.code, "ask"):
@@ -1844,6 +2012,22 @@ class ClaudeRunner:
             raise _Cancelled  # cancelled just now: the reply says its PR is open
         with atomic(self.conn):
             audit(self.conn, "run.ready", run=run.code, pr=pr.number)
+        return self._must_get(run.code)
+
+    async def _collect_local(self, w: _Work, run: Run, p: Prepared) -> Run:
+        """After the session of a run that can't push (RX-1): its work is the commits on its
+        local branch, in the owner's checkout. None is ``no_changes``; otherwise the run ends
+        ``done`` saying why it wasn't pushed. ``head_sha`` stays unset, so the cleanup after
+        ``keep_days`` removes the worktree but keeps the branch (it moved from the base)."""
+        self._check_stop(run.code)
+        if await self.workspace.local_commits(p) == 0:
+            raise NoChanges("the session committed nothing")
+        assert w.local is not None
+        why = f"can't push yet: {NO_PUSH_LONG[w.local]}"
+        if not runs.finish(self.conn, run.code, "done", step="reply", failure=why):
+            raise _Cancelled
+        with atomic(self.conn):
+            audit(self.conn, "run.done_local", run=run.code, branch=p.branch, why=w.local)
         return self._must_get(run.code)
 
     async def _check_base_untouched(self, w: _Work, run: Run, p: Prepared) -> None:

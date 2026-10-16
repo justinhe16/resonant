@@ -319,7 +319,9 @@ GITHUB_PUBLIC_TOKEN_REF = secret_ref(RUNNER_EXT, "github_public_token")
 @dataclass(frozen=True)
 class RunnerSecrets:
     # repr=False: a value must never reach a log line or a traceback by accident.
-    github_token: str = field(repr=False)
+    # The daemon's own token (``GITHUB_TOKEN_REF``); None when it isn't set yet. Workers still
+    # run without it (docs/employee-plan.md, RX-1): what needs it refuses on its own.
+    github_token: str | None = field(repr=False)
     # At most one of these is set: the subscription token, or the API key for API billing.
     claude_token: str | None = field(repr=False)
     anthropic_key: str | None = field(repr=False)
@@ -332,30 +334,37 @@ class RunnerSecrets:
         return [v for v in found if v]
 
 
+CLAUDE_MISSING = f"{CLAUDE_TOKEN_REF} (or {ANTHROPIC_KEY_REF})"
+
+
 async def missing_runner_secrets(store: SecretStore) -> list[str]:
-    """What the runner still needs, as refs (names only; no value is read)."""
-    missing: list[str] = []
-    if not await store.exists(GITHUB_TOKEN_REF):
-        missing.append(GITHUB_TOKEN_REF)
-    if not await store.exists(GITHUB_APP_KEY_REF):
-        missing.append(GITHUB_APP_KEY_REF)
-    if not (await store.exists(CLAUDE_TOKEN_REF) or await store.exists(ANTHROPIC_KEY_REF)):
-        missing.append(f"{CLAUDE_TOKEN_REF} (or {ANTHROPIC_KEY_REF})")
-    return missing
+    """What the runner can't start a single run without, as refs (names only; no value is
+    read): only the Claude credential. The GitHub pieces unlock capabilities (pushing, PRs,
+    merging) and are reported as notes, not blockers (``ClaudeRunner.capability_notes``)."""
+    if await store.exists(CLAUDE_TOKEN_REF) or await store.exists(ANTHROPIC_KEY_REF):
+        return []
+    return [CLAUDE_MISSING]
 
 
-async def load_runner_secrets(store: SecretStore) -> RunnerSecrets:
-    """The runner's values. Raises ``SecretMissing`` for the GitHub token or for both Claude
-    credentials; the Claude token wins when both exist."""
-    github = await store.get(GITHUB_TOKEN_REF)
+async def _optional(store: SecretStore, ref: str) -> str | None:
     try:
-        public: str | None = await store.get(GITHUB_PUBLIC_TOKEN_REF)
+        return await store.get(ref)
     except SecretMissing:
-        public = None  # optional: only fork-mode runs need it
-    try:
-        return RunnerSecrets(github, await store.get(CLAUDE_TOKEN_REF), None, public)
-    except SecretMissing:
+        return None
+
+
+async def load_runner_secrets(store: SecretStore, *, claude: bool = True) -> RunnerSecrets:
+    """The runner's values. The GitHub tokens are optional (None when not set). With
+    ``claude`` (the default) a missing Claude credential raises ``SecretMissing``; the Claude
+    token wins when both exist. ``claude=False`` is for the repo tools, which never start a
+    session: a missing Claude credential is just None there."""
+    github = await _optional(store, GITHUB_TOKEN_REF)
+    public = await _optional(store, GITHUB_PUBLIC_TOKEN_REF)  # only fork-mode runs need it
+    if (token := await _optional(store, CLAUDE_TOKEN_REF)) is not None:
+        return RunnerSecrets(github, token, None, public)
+    if claude:
         return RunnerSecrets(github, None, await store.get(ANTHROPIC_KEY_REF), public)
+    return RunnerSecrets(github, None, await _optional(store, ANTHROPIC_KEY_REF), public)
 
 
 # --- the test double ---------------------------------------------------------------------

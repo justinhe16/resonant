@@ -117,6 +117,9 @@ def end_title(run: Run, ci: str | None = None) -> str:
             if run.flag_line or run.failure:
                 title += f" · ⚠ /runs {run.code}"
             return title
+        case "done" if run.repo and run.branch and not run.pr_url and run.head_sha is None:
+            # RX-1: a run that couldn't push (a fork run's done always has a checked head)
+            return f"{run.code} done: local branch {_part(run.branch)} (not pushed)"
         case "done":
             summary = _part(run.summary)
             return f"{run.code} done" + (f": {summary}" if summary else "")

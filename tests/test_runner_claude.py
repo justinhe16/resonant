@@ -693,20 +693,32 @@ async def test_flagged_paths_are_in_the_reply(tmp_path: Path, db: sqlite3.Connec
 # --- refusals and failures -----------------------------------------------------------------
 
 
-async def test_not_set_up_names_what_is_missing(tmp_path: Path, db: sqlite3.Connection) -> None:
+async def test_not_set_up_names_what_is_missing(
+    tmp_path: Path, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
     h = build(tmp_path, db, secrets=False)
     res = await h.runner.start_run("proj", "x", "owner")
     assert isinstance(res, Refused)
-    assert res.reason.startswith("The runner isn't set up: ")
-    assert f"secret {GITHUB_TOKEN_REF}" in res.reason and CLAUDE_TOKEN_REF in res.reason
-    assert f"resonant secret set {GITHUB_TOKEN_REF}" in res.reason
-    assert GH_TOKEN not in res.reason
+    # only the Claude credential blocks a run (RX-1); the GitHub pieces aren't named
+    assert res.reason == (
+        f"The runner isn't set up: secret {CLAUDE_TOKEN_REF} (or {ANTHROPIC_KEY_REF}). "
+        f"On the Mini: resonant secret set {CLAUDE_TOKEN_REF}."
+    )
     assert runs_store.recent(h.conn) == []
+    assert isinstance(await h.runner.start_run(None, "x", "owner"), Refused)
 
     h.keychain.items[GITHUB_TOKEN_REF] = GH_TOKEN
     res = await h.runner.start_run("proj", "x", "owner")
     assert isinstance(res, Refused) and GITHUB_TOKEN_REF not in res.reason
-    assert CLAUDE_TOKEN_REF in res.reason
+    assert CLAUDE_TOKEN_REF in res.reason and GH_TOKEN not in res.reason
+    h.runner._claude_cmd = None  # pyright: ignore[reportPrivateUsage]
+
+    def no_tool(name: str) -> None:
+        return None
+
+    monkeypatch.setattr(claude_mod, "resolve_tool", no_tool)
+    text = await h.runner.setup_missing()
+    assert text is not None and "the claude CLI isn't installed" in text
 
 
 async def test_no_configured_repos_is_not_a_setup_problem(

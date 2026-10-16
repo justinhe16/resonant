@@ -306,14 +306,20 @@ async def test_runner_secret_names_and_size_cap() -> None:
 async def test_missing_and_loaded_runner_secrets() -> None:
     kc = FakeKeychain()
     store = SecretStore(kc)
+    # RX-1: only the Claude credential is required; the GitHub pieces are capabilities
     assert await secrets_mod.missing_runner_secrets(store) == [
-        "runner/github_token",
-        "runner/github_app_key",
         "runner/claude_token (or runner/anthropic_key)",
     ]
+    with pytest.raises(secrets_mod.SecretMissing):
+        await secrets_mod.load_runner_secrets(store)
+    bare = await secrets_mod.load_runner_secrets(store, claude=False)
+    assert bare.values() == [] and bare.github_token is None
+    kc.items["runner/anthropic_key"] = "sk-ant-api03-abcdefgh"
+    assert await secrets_mod.missing_runner_secrets(store) == []
+    no_github = await secrets_mod.load_runner_secrets(store)
+    assert no_github.github_token is None and no_github.github_public_token is None
     kc.items["runner/github_token"] = GH_TOKEN
     kc.items["runner/github_app_key"] = "LS0tLS1CRUdJTiBmYWtl"
-    kc.items["runner/anthropic_key"] = "sk-ant-api03-abcdefgh"
     assert await secrets_mod.missing_runner_secrets(store) == []
     loaded = await secrets_mod.load_runner_secrets(store)
     assert (loaded.claude_token, loaded.anthropic_key) == (None, "sk-ant-api03-abcdefgh")

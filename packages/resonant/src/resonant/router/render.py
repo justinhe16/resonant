@@ -254,14 +254,17 @@ def _run_line(run: dict[str, Any]) -> str:
 
 def render_runs(d: dict[str, Any]) -> str:
     """``/runs``: one line per run (active first), or one run in full (``/runs R3``). With no
-    runs it says so, or why the runner can't start any."""
+    runs it says so, or why the runner can't start any. What workers can't do yet (RX-1's
+    ``limits``: no push without the GitHub App, …) follows as notes, not blockers."""
     runs = [r for r in (as_dict(x) for x in as_list(d.get("runs"))) if r]
+    limits = [str(x) for x in as_list(d.get("limits")) if isinstance(x, str) and x]
     if not runs:
         code = d.get("code")
         if isinstance(code, str):
             return f"No run {code}."
         setup = d.get("setup")
-        return setup if isinstance(setup, str) and setup else "No runs yet."
+        head = setup if isinstance(setup, str) and setup else "No runs yet."
+        return "\n".join([head, *limits])
     if isinstance(d.get("code"), str):
         run = runs[0]
         lines = [_run_line(run)]
@@ -275,4 +278,4 @@ def render_runs(d: dict[str, Any]) -> str:
     lines = [f"Runs ({n_active} active):", *(_run_line(r) for r in runs)]
     if d.get("truncated") is True:
         lines.append("+ more older runs")
-    return "\n".join(lines)
+    return "\n".join([*lines, *limits])

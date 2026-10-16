@@ -475,30 +475,34 @@ async def test_every_merge_runs_the_checks_first(h: Harness) -> None:
 # --- not set up ------------------------------------------------------------------------------
 
 
-async def test_not_set_up_names_the_app_config_and_key(
+async def test_the_github_pieces_are_capability_notes_not_blockers(
     tmp_path: Path, db: sqlite3.Connection
 ) -> None:
+    """RX-1: the App key, runner.github_app and the daemon's token each unlock something;
+    none of them makes the runner "not set up"."""
     h = build(tmp_path, db)
     assert await h.runner.setup_missing() is None
+    assert await h.runner.capability_notes() == []
     del h.keychain.items[GITHUB_APP_KEY_REF]
-    text = await h.runner.setup_missing()
-    assert text is not None
-    assert (
-        f"secret {GITHUB_APP_KEY_REF}" in text
-        and "secret set runner/github_app_key --from-file" in text
-    )
-    assert "runner.github_app" not in text
-    h.runner.cfg = h.cfg.model_copy(update={"github_app": None})
-    text = await h.runner.setup_missing()
-    assert text is not None
-    assert "runner.github_app isn't set in the config file" in text
-    assert "add runner.github_app with app_id and installation_id" in text
-    res = await h.runner.start_run("proj", "x", "owner")
-    assert isinstance(res, Refused) and res.reason == text
-    # the daemon's own token is still part of it
+    assert await h.runner.setup_missing() is None
+    [note] = await h.runner.capability_notes()
+    assert note.startswith("No push or PRs yet: the GitHub App isn't set up")
+    assert "secret set runner/github_app_key --from-file" in note
+    assert "runner.github_app" not in note
+    h.runner.app = None  # runner.github_app isn't in the config
+    [note] = await h.runner.capability_notes()
+    assert "add runner.github_app with app_id and installation_id" in note
     del h.keychain.items[GITHUB_TOKEN_REF]
-    again = await h.runner.setup_missing()
-    assert again is not None and f"secret {GITHUB_TOKEN_REF}" in again
+    assert await h.runner.setup_missing() is None
+    app, token = await h.runner.capability_notes()
+    assert app.startswith("No push or PRs yet")
+    assert token.startswith("No merges, repo lookups, private clones, new repos or fork runs")
+    assert f"resonant secret set {GITHUB_TOKEN_REF}" in token
+    # the token alone missing: pushing needs it too (Resonant checks the PR with it)
+    h.keychain.items[GITHUB_APP_KEY_REF] = private_pem_one_line()
+    h.runner.app = h.app
+    [token] = await h.runner.capability_notes()
+    assert token.startswith("No push, PRs, merges, repo lookups")
 
 
 async def test_a_refresh_revokes_the_previous_token_at_once(
