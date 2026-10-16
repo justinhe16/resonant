@@ -47,8 +47,8 @@ DAEMON_TOOLS = ("gh", "uv", "ollama", "git")
 # Install dirs searched for those tools and for the tools linked into a session, after
 # ~/.local/bin (host_tool_path).
 HOST_TOOL_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
-# Tools the daemon runs itself, outside the guard, after resolve_tool: only the system copy,
-# never one from a dir a worker can write (runners/claude.py _with_real_git).
+# Tools resolve_tool returns only as the system copy, never from a dir a worker can write:
+# git is also what the daemon itself runs (runner.git_path), so keep the two the same binary.
 SYSTEM_ONLY_TOOLS = frozenset({"git"})
 # Binaries that may be linked into the run-local bin/.
 NEVER_LINKED = frozenset({"resonant"})
