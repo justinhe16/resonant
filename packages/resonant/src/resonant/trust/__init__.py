@@ -9,8 +9,8 @@ record each evaluation in the audit log:
 - ``notify_level(conn, system, action, event, *, repo)`` -> ``NotifyDecision(level "now" |
   "digest", reason, rule)``: how soon the owner hears about a worker event (EM-6 delivers).
 - ``merge_decision(conn, repo)`` -> ``"ok" | "ask"``: a merge is ok unless a rule (``ask
-  merge`` on the repo, an area of it, or ``*``) says to ask. Audited ``trust.merge``. For
-  EM-7; ``merge_run`` doesn't use it yet.
+  merge`` on the repo, an area of it, or ``*``) says to ask. Audited ``trust.merge``. EM-7:
+  a model-chosen ``merge_run`` and the auto-merge follow it.
 
 Workers reach this through ``resonant.trust.checks.TrustChecks.request_check`` (EM-3's
 ``resonant check``), which asks the owner when the verdict is ``ask``.

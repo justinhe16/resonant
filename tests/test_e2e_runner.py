@@ -56,17 +56,20 @@ from resonant.runner.github_app import GitHubApp
 from resonant.runner.workspace import Workspace
 from resonant.runners import claude as claude_mod
 from resonant.runners import reaper
-from resonant.runners.claude import ClaudeRunner, Refused
+from resonant.runners.claude import ClaudeRunner, Refused, Started
 from resonant.secrets import (
     CLAUDE_TOKEN_REF,
     GITHUB_APP_KEY_REF,
+    GITHUB_PUBLIC_TOKEN_REF,
     GITHUB_TOKEN_REF,
     FakeKeychain,
     SecretStore,
 )
 from resonant.store import pulse as pulse_store
 from resonant.store import runs as runs_store
+from resonant.store import trust as trust_store
 from resonant.store.db import iso, kv_set, utcnow
+from resonant.store.repos import Repo
 from resonant_sdk import ToolSpec
 
 OWNER_PHONE = "+15551234567"
@@ -199,6 +202,7 @@ def make_world(
     ci: bool = True,
     secrets: bool = True,
     runner_opts: dict[str, Any] | None = None,
+    workspace_opts: dict[str, Any] | None = None,
 ) -> World:
     root = tmp_path.resolve() / "rr"
     root.mkdir(exist_ok=True)
@@ -254,7 +258,11 @@ def make_world(
     from resonant import wiring
 
     def make_runner(conn: sqlite3.Connection, **kw: Any) -> ClaudeRunner:
-        ws = Workspace(settings.runner, conn, url_for=lambda repo: str(remote))
+        def url_for(repo: Repo) -> str:
+            return str(remote)
+
+        ws_opts: dict[str, Any] = {"url_for": url_for, **(workspace_opts or {})}
+        ws = Workspace(settings.runner, conn, **ws_opts)
         return ClaudeRunner(conn, **kw, **options, workspace=ws)
 
     monkeypatch.setattr(wiring, "ClaudeRunner", make_runner)
@@ -697,3 +705,116 @@ async def test_r1_under_the_real_sandbox(
         assert env["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN
         seen = json.loads((w.tmp() / "creds.json").read_text())
         assert seen["token"] == w.api.tokens[0]  # the sandboxed session read its own credentials
+
+
+# --- EM-7: fork mode and merge per trust rules ------------------------------------------------
+
+PUBLIC_TOKEN = "ghp_" + "Pq7Rs8Tu9V" * 3 + "Wx1Y2Z"
+
+
+def fork_world(
+    tmp_path: Path, home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> World:
+    """A world whose ``up/stream`` is someone else's public repo (fork mode) and whose fork
+    ``me/stream`` is a bare clone of it."""
+    root = tmp_path.resolve() / "rr"
+    root.mkdir(exist_ok=True)
+    upstream = seed_remote(root, "stream")
+    fork = root / "fork-stream.git"
+    git(root, "clone", "-q", "--bare", str(upstream), str(fork))
+    remotes = {"github.com/up/stream": upstream}
+
+    def url_for(repo: Repo) -> str:
+        return str(remotes.get(repo.remote, root / f"{REPO}.git"))
+
+    def fork_url_for(slug: str) -> str:
+        return str(fork)
+
+    w = make_world(
+        tmp_path, home, chat, monkeypatch, extra=["--no-pr"],
+        workspace_opts={"url_for": url_for, "fork_url_for": fork_url_for, "fork_wait_s": 0.0},
+    )  # fmt: skip
+    w.keychain.items[GITHUB_PUBLIC_TOKEN_REF] = PUBLIC_TOKEN
+    w.api.account = "me"
+    (w.gh_dir / "fork_remote").write_text(str(fork))
+    (w.gh_dir / "forks.json").write_text(json.dumps({"up/stream": "me/stream"}))
+    (w.gh_dir / "repos.json").write_text(json.dumps({
+        "up/stream": {"full_name": "up/stream", "default_branch": "main", "private": False,
+                      "permissions": {"push": False}},
+        "me/stream": {"full_name": "me/stream", "fork": True, "private": False,
+                      "parent": {"full_name": "up/stream"}},
+    }))  # fmt: skip
+    return w
+
+
+def gh_log(world: World) -> list[dict[str, Any]]:
+    path = world.gh_dir / "calls.jsonl"
+    return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+
+async def test_fork_run_asks_external_pr_and_opens_it_on_yes(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = fork_world(tmp_path, resonant_home, chat, monkeypatch)
+    async with running(w):
+        # /run takes registered names only (the router is EM-8's): start it as start_run does
+        started = await w.runner.start_run("github.com/up/stream", "fix the typo", "justin")
+        assert isinstance(started, Started), started
+        assert started.text.startswith("On it: R1 · stream (new repo: up/stream).")
+        assert "I'll ask before the PR." in started.text
+        ask = await w.next_text()
+        assert 'R1 wants to external_pr on up/stream: "+1/-0, 1 file: Fix the flaky test"' in ask
+        assert ask.endswith("Reply yes / yes always / no"), ask
+        await until(settled(w, "R1", "waiting"), 10, "the wait")
+        assert w.run().wait_reason == "question"
+        assert [c for c in gh_log(w) if c["argv"][:2] == ["pr", "create"]] == []
+        await asyncio.sleep(1.1)  # the reply must come after the prompt (sent-before rule)
+        await w.say("yes", reply=False)
+        done = await w.next_text()
+        assert done.startswith(
+            "R1 done: PR #41 on up/stream · https://github.com/up/stream/pull/41"
+        )
+        assert "up/stream is upstream; its maintainers merge." in done
+        [create] = [c for c in gh_log(w) if c["argv"][:2] == ["pr", "create"]]
+        argv = create["argv"]
+        assert argv[argv.index("--repo") + 1] == "up/stream"
+        assert argv[argv.index("--head") + 1] == f"me:{w.run().branch}"
+        assert create["hosts_token"] == PUBLIC_TOKEN
+        assert (await w.say("/merge R1")) == "up/stream is upstream; its maintainers merge."
+        assert not [c for c in gh_log(w) if c["argv"][:2] == ["pr", "merge"]]
+        # the public_repo token went only to the fork and the upstream PR, and never leaked
+        for c in gh_log(w):
+            if c["hosts_token"] == PUBLIC_TOKEN:
+                assert c["argv"][:2] in (
+                    ["pr", "create"],
+                    ["api", "-X"],
+                    ["api", "repos/me/stream"],
+                )
+        assert PUBLIC_TOKEN not in w.everything()
+
+
+async def test_chat_merge_runs_without_asking_by_default(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_world(tmp_path, resonant_home, chat, monkeypatch)
+    async with running(w):
+        assert (await w.say("/run demo fix it")).startswith("On it: R1")
+        assert (await w.next_text()).startswith("R1 done: PR #41")
+        # no rule: merge is ok by default, so a chat merge just runs (D4)
+        reply = await w.say("merge it")
+        assert "R1 merged: PR #41." in reply, reply
+        assert len(w.gh_calls("merge")) == 1
+
+
+async def test_chat_merge_asks_when_a_rule_says_so(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w2 = make_world(tmp_path, resonant_home, chat, monkeypatch)
+    async with running(w2):
+        trust_store.add_rule(w2.conn, scope=REPO, action="merge", effect="ask",
+                             created_from="chat", now=utcnow())  # fmt: skip
+        assert (await w2.say("/run demo fix it")).startswith("On it: R1")
+        assert (await w2.next_text()).startswith("R1 done: PR #41")
+        prompt = await w2.say("merge it")
+        assert "merge R1: PR #41 in demo " in prompt and prompt.endswith("Reply yes / no")
+        assert w2.gh_calls("merge") == []

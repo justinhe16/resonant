@@ -61,6 +61,7 @@ class FakeGitHubApi:
         self.flaky: int = 0  # the next N requests answer 503 (a transient failure)
         self.grant: dict[str, Any] = {}  # fields to override in a mint reply
         self.slug = "resonant-runner"
+        self.account = "own"  # the installation's account: mint replies carry owner/name
         self.requests: list[tuple[str, str]] = []  # (method, path)
         self.issued = 0
 
@@ -138,7 +139,10 @@ class FakeGitHubApi:
                 "token": token,
                 "expires_at": "2099-01-01T00:00:00Z",
                 "repository_selection": "selected",
-                "repositories": [{"name": n} for n in body.get("repositories", [])],
+                "repositories": [
+                    {"name": n, "full_name": f"{self.account}/{n}"}
+                    for n in body.get("repositories", [])
+                ],
                 "permissions": body.get("permissions"),
                 **self.grant,
             }
