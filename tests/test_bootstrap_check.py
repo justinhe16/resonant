@@ -497,6 +497,8 @@ def test_pin_rows_are_advisory(resonant_home: Path) -> None:
         "disabled_tampered; resonant ext update plain"
     )
     (root / "plain" / "cli.py").write_text("print('{}')\n")
+    unpinned = replace(record, manifest={**record.manifest, "bins": ["gh"]})
+    assert check.pin_rows(root, [unpinned])[0][3] == "argv0 missing: gh (not pinned)"
     gone = replace(record, argv0_paths={"x": "/nonexistent/gh"})
     assert check.pin_rows(root, [gone])[0] == (
         "FAIL",
