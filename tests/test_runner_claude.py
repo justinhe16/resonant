@@ -47,7 +47,7 @@ from resonant.redact import Redactor
 from resonant.runner.cleanup import dir_size
 from resonant.runner.github_app import GitHubApp
 from resonant.runner.resolve import FakeGitHub, RepoInfo
-from resonant.runner.workspace import Workspace
+from resonant.runner.workspace import FORK_NEEDS_PUBLIC_REPO, Workspace
 from resonant.runners import claude as claude_mod
 from resonant.runners import reaper
 from resonant.runners.claude import (
@@ -122,7 +122,29 @@ def rc(name):
 def keep(pr, keys):
     return {k: pr[k] for k in keys.split(",") if k in pr}
 if args[:2] == ["pr", "list"]:
-    print(json.dumps([keep(p, opt("--json")) for p in prs if p["headRefName"] == opt("--head")]))
+    state = opt("--state") if "--state" in args else "open"
+    print(json.dumps([keep(p, opt("--json")) for p in prs if p["headRefName"] == opt("--head")
+                      and (state == "all" or p["state"] == state.upper())]))
+elif args[:2] == ["pr", "create"] and ":" in opt("--head"):  # the daemon's upstream PR (fork)
+    n = len(prs) + 41
+    owner, branch = opt("--head").split(":", 1)
+    fork = open(os.path.join(d, "fork_remote")).read().strip()
+    sha = subprocess.run(["git", "-C", fork, "rev-parse", "refs/heads/" + branch],
+                         capture_output=True, text=True).stdout.strip()
+    if os.path.exists(os.path.join(d, "fork_moved")):  # pushed to while it was opened
+        sha = "f" * 40
+    url = "https://github.com/" + opt("--repo") + "/pull/" + str(n)
+    prs.append({"number": n, "url": url, "headRefName": branch, "headRefOid": sha,
+                "baseRefName": opt("--base"), "state": "OPEN", "isCrossRepository": True,
+                "headRepositoryOwner": {"login": owner}, "changedFiles": 1,
+                "title": opt("--title"), "body": stdin, "repo": opt("--repo")})
+    json.dump(prs, open(path, "w"))
+    print(url)
+elif args[:2] == ["pr", "close"]:
+    for pr in prs:
+        if pr["number"] == int(args[2]):
+            pr["state"] = "CLOSED"
+    json.dump(prs, open(path, "w"))
 elif args[:2] == ["pr", "create"]:
     n = len(prs) + 41
     def git(*a):
@@ -160,7 +182,17 @@ elif args[:1] == ["api"]:
     def text(name, default):
         p = os.path.join(d, name)
         return open(p).read().strip() if os.path.exists(p) else default
-    if "/branches/" in args[1]:  # protected unless a test says otherwise
+    target = next((a for a in args[1:] if a.startswith("repos/")), args[1])
+    known = json.loads(text("repos.json", "{}"))  # slug -> GET repos/<slug>
+    if target.endswith("/forks") and "POST" in args:  # fork mode: make (or find) the fork
+        up = target[len("repos/"):-len("/forks")]
+        print(json.dumps(known[json.loads(text("forks.json", "{}"))[up]]))
+    elif target.count("/") == 2 and target[len("repos/"):] in known:
+        print(json.dumps(known[target[len("repos/"):]]))
+    elif target.count("/") == 2 and known:
+        print("HTTP 404: Not Found", file=sys.stderr)
+        sys.exit(1)
+    elif "/branches/" in args[1]:  # protected unless a test says otherwise
         print(json.dumps({"protected": text("protected", "true") == "true"}))
     elif "/activity" in args[1]:
         if rc("activity_rc"):
@@ -712,11 +744,19 @@ async def test_ambiguous_unknown_and_no_access_repos(
     assert runs_store.recent(db) == [] and repo_store.get(db, "them/secret") is None
 
 
-async def test_fork_mode_repo_is_refused_for_now(tmp_path: Path, db: sqlite3.Connection) -> None:
+async def test_fork_mode_repo_needs_the_public_repo_token(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    # The public_repo token is optional for the runner; only a fork run asks for it.
     h = build(tmp_path, db, github=FakeGitHub([RepoInfo("up/stream", "main", False, False, True)]))
+    assert await h.runner.setup_missing() is None
     res = await h.runner.start_run("github.com/up/stream", "x", "owner")
-    assert res == Refused("Upstream PRs come in a later update.")
-    repo = repo_store.get(db, "up/stream")  # registered, so the next version finds it
+    assert res == Refused("A fork run asks you before its upstream PR, and asking isn't set up.")
+    h.runner.desk.trust = cast(Any, object())  # any asker: the token is what is missing now
+    res = await h.runner.start_run("github.com/up/stream", "x", "owner")
+    assert res == Refused(FORK_NEEDS_PUBLIC_REPO)
+    assert "runner/github_public_token" in FORK_NEEDS_PUBLIC_REPO
+    repo = repo_store.get(db, "up/stream")  # registered, so the next try finds it
     assert repo is not None and repo.mode == "fork" and not repo.quote_ask
     assert runs_store.recent(db) == []
 

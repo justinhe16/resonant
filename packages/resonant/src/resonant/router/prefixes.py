@@ -214,9 +214,10 @@ _INTENT_RULES: dict[IntentLabel, str] = {
         "when the owner asks to be texted as soon as it's done. For cancel_run and "
         "merge_run, pass the run code (like R3) from the message or the earlier replies; if you "
         "can't tell which run, call list_runs first. Call merge_run only when the owner asks to "
-        "merge. When the owner answers a run's question (list_runs shows it), call "
-        "answer_worker with that run's code and the owner's words; \"tell R4 to ...\" is "
-        "message_worker. If you can't tell which run is meant, ask, naming the runs."
+        'merge. When the owner asks for the work and also to merge it ("fix X and merge it"), '
+        "pass merge=true to start_run. When the owner answers a run's question (list_runs "
+        "shows it), call answer_worker with that run's code and the owner's words; \"tell R4 "
+        "to ...\" is message_worker. If you can't tell which run is meant, ask, naming the runs."
     ),
     "rules": (
         "Trust rules decide when Claude runs ask the owner first and when Resonant texts right "

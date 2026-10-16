@@ -19,8 +19,13 @@ at call time: the runner is built after the tools are registered) and return cod
   model sees them, never an approval code. Free text from Claude (summary, failure) is
   cleaned and clipped.
 - ``cancel_run{code}``: L3.
-- ``merge_run{code}``: L2: ``/merge R3`` is explicit and runs; a model-chosen call asks a
-  plain yes. The approval prompt (``summary_action``) names the PR and the flagged paths.
+- ``merge_run{code}``: L2: ``/merge R3`` is explicit and runs. A model-chosen call follows
+  the trust rules (``merge_level``, docs/employee-plan.md D4): it runs without asking when
+  ``merge_decision`` is ok and the run flagged no sensitive paths, else it asks a plain yes.
+  The approval prompt (``summary_action``) names the PR and the flagged paths. A fork-mode
+  repo's run is never merged (its upstream's maintainers merge).
+- ``start_run{..., merge?}``: ``merge`` when the owner asked to merge it too; the run then
+  merges itself once CI is green (same checks, same trust rules).
 - ``answer_worker{code, text}`` and ``message_worker{code, text}``: L3, no ask: it's the
   owner talking to their own worker (EM-5). The answer goes to the run's open question (a
   run with none gets it as a message); a message reaches the session at its next
@@ -40,6 +45,7 @@ from resonant.gate.types import Intent
 from resonant.store import repos as repos_store
 from resonant.store import runs as runs_store
 from resonant.tools.base import BuiltinContext
+from resonant.trust import merge_decision
 from resonant_sdk import Effect, Level, ToolSpec
 
 if TYPE_CHECKING:
@@ -70,7 +76,13 @@ class RunnerApi(Protocol):
     async def setup_missing(self) -> str | None: ...
 
     async def start_run(
-        self, repo: str | None, ask: str, principal: str, *, report: Report = "digest"
+        self,
+        repo: str | None,
+        ask: str,
+        principal: str,
+        *,
+        merge: bool = False,
+        report: Report = "digest",
     ) -> Started | Refused: ...
 
     def list_runs(self, limit: int = 20) -> list[Run]: ...
@@ -100,13 +112,15 @@ START_RUN = ToolSpec(
         "Start a Claude Code run on a GitHub repo (a name, owner/name or URL): it works in a "
         "worktree of the repo and opens a pull request. Leave out `repo` for work not tied to a "
         "repo (ops, research): it runs in a scratch dir and reports back. `ask` is what to do, "
-        "in the owner's words."
+        "in the owner's words. Set `merge` only when the owner also asks to merge it: it then "
+        "merges once CI is green."
     ),
     args_schema={
         "type": "object",
         "properties": {
             "repo": {"type": "string", "maxLength": REPO_MAX},
             "ask": {"type": "string", "minLength": 1, "maxLength": ASK_MAX},
+            "merge": {"type": "boolean"},
             "report": {
                 "type": "string",
                 "enum": list(REPORTS),
@@ -154,7 +168,7 @@ MERGE_RUN = ToolSpec(
     name="merge_run",
     description=(
         "Squash-merge the pull request of a finished Claude run (needs green CI). Asks the "
-        "owner first when chosen from chat."
+        "owner first when a trust rule says to or the run changed sensitive paths."
     ),
     args_schema={
         "type": "object",
@@ -239,6 +253,23 @@ def summary_action(conn: sqlite3.Connection, intent: Intent) -> str | None:
     return head
 
 
+def merge_level(conn: sqlite3.Connection, intent: Intent) -> Level | None:
+    """``merge_run``'s level for one call, by the trust rules (``PolicyGate`` ``levels``): L3
+    (runs without asking, even chosen from chat) when ``merge_decision`` is ok for the run's
+    repo and the run flagged no sensitive paths; L2 (``/merge`` runs, chat asks a plain yes)
+    otherwise. None (the registered L2) for another tool, a missing run or a fork repo."""
+    if intent.extension is not None or intent.tool != MERGE_RUN.name:
+        return None
+    code = _code(intent.args.get("code"))
+    run = runs_store.get(conn, code) if code is not None else None
+    repo = repos_store.find(conn, run.repo) if run is not None and run.repo else None
+    if run is None or repo is None or repo.mode != "push":
+        return None
+    if run.flagged_paths:
+        return Level.L2
+    return Level.L3 if merge_decision(conn, repo.name) == "ok" else Level.L2
+
+
 # --- helpers -----------------------------------------------------------------------------
 
 
@@ -316,10 +347,12 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         )
 
     async def _start_run(args: dict[str, Any]) -> dict[str, Any]:
-        unknown = set(args) - {"repo", "ask", "report"}
+        unknown = set(args) - {"repo", "ask", "merge", "report"}
         if unknown:
             raise ToolFailed(f"start_run: unknown arguments: {sorted(unknown)}")
-        repo, ask = args.get("repo"), args.get("ask")
+        repo, ask, merge = args.get("repo"), args.get("ask"), args.get("merge", False)
+        if not isinstance(merge, bool):
+            raise ToolFailed("start_run: merge is a boolean")
         if not (repo is None or isinstance(repo, str)) or not isinstance(ask, str):
             raise ToolFailed("start_run: ask is a required string, repo an optional one")
         if not ask.strip():
@@ -335,7 +368,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"started": False, "text": missing()}
         if repo is not None and len(repo) > REPO_MAX:
             raise ToolFailed(f"start_run: repo is too long (at most {REPO_MAX} characters)")
-        result = await claude.start_run(repo, ask, ctx.principals.owner, report=report)
+        result = await claude.start_run(repo, ask, ctx.principals.owner, merge=merge, report=report)
         if (reason := _refusal(result)) is not None:
             return {"started": False, "text": reason}
         started = cast("Started", result)

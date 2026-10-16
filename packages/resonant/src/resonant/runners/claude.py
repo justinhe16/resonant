@@ -108,7 +108,7 @@ from resonant.runner.resolve import (
 )
 from resonant.runner.workspace import (
     CREDS_DIR,
-    UPSTREAM_LATER,
+    FORK_NEEDS_PUBLIC_REPO,
     MergeRefused,
     NoChanges,
     Prepared,
@@ -116,14 +116,17 @@ from resonant.runner.workspace import (
     Workspace,
     read_session_token,
     session_git_env,
+    upstream_merges,
     write_session_credentials,
 )
 from resonant.runners import reaper, worker_cli
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.runners.reports import Report, WorkerReports, end_event, end_title
-from resonant.runners.worker_cli import WorkerServer
+from resonant.runners.worker_cli import Check, WorkerServer
 from resonant.runners.worker_desk import (
     BLOCK_S,
+    CHECK_OK,
+    RESTARTED,
     OpenQuestion,
     Relayed,
     RelayRefused,
@@ -146,6 +149,7 @@ from resonant.sandbox import (
 from resonant.sandbox.probes import cached_self_check
 from resonant.secrets import (
     GITHUB_APP_KEY_REF,
+    GITHUB_PUBLIC_TOKEN_REF,
     RunnerSecrets,
     SecretError,
     SecretStore,
@@ -159,6 +163,7 @@ from resonant.store import tasks as task_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, transaction, utcnow
 from resonant.store.runs import Run
+from resonant.trust import merge_decision
 from resonant_sdk import Event
 
 if TYPE_CHECKING:
@@ -190,6 +195,9 @@ TOOL_NAMES = ("claude", "uv")
 MAX_FIX_ATTEMPTS = 3  # CI fixes the session may push after the first push
 TOKEN_REFRESH_S = 50 * 60  # installation tokens last an hour: a fresh one after 50 minutes
 # in all: the app's three tries (each up to its own timeout) and the backoff between them
+MERGE_WAIT_S = 2 * 3600.0  # auto-merge waits this long after the run for CI to finish
+MERGE_POLL_S = 120.0  # ... looking at CI this often
+EXTERNAL_PR = "external_pr"  # the trust action of opening a PR on someone else's repo
 REVOKE_TIMEOUT_S = (
     github_app_mod.ATTEMPTS * github_app_mod.TIMEOUT_S
     + github_app_mod.BACKOFF_S * (2**github_app_mod.ATTEMPTS - 1)
@@ -211,6 +219,19 @@ RUNNER_PROMPT = (
     "again. Stop when CI is green or you are "
     "out of attempts. End with a 1-3 line summary: what changed, the PR number, whether CI is "
     "green, and anything left undone."
+)
+FORK_PROMPT = (
+    "You are working in a git worktree of {fork}, the owner's fork of {upstream} (your current "
+    "directory), on branch {branch}, which is already checked out and starts from {upstream}'s "
+    "{base}. The checkout's local config (.env files and the like) is linked in and kept out of "
+    "git: use it, never commit it. git is set up with credentials for {fork} only. Commit your "
+    "work with clear messages; the last commit's first line becomes the pull request's title "
+    "and the rest of its message the description, so write them for {upstream}'s maintainers. "
+    "Push it with `git push -u origin {branch}`, and then stop: do not open a pull request. "
+    "Resonant checks the branch and asks the owner before it opens the pull request on "
+    "{upstream}. Never push to any branch but {branch}, don't force-push, and don't change "
+    "remotes, git config or the credential files. If git fails with an authentication error, "
+    "run it again. End with a 1-3 line summary: what changed and anything left undone."
 )
 SCRATCH_PROMPT = (
     "You are working in an empty scratch directory (your current directory); this task is not "
@@ -250,6 +271,7 @@ class Started:
     max_minutes: int
     new_repo: str | None = None  # the slug, when this run registered the repo
     warning: str | None = None  # e.g. the base branch isn't protected
+    note: str | None = None  # how it ends: merged once CI is green, or a PR upstream after a yes
 
     @property
     def text(self) -> str:
@@ -259,7 +281,10 @@ class Started:
             f"On it: {self.code} · {where}{new}. Up to {self.max_minutes}m. "
             f"/runs to check, /cancel {self.code} to stop."
         )
-        return f"{text}\n{self.warning}" if self.warning else text
+        for extra in (self.note, self.warning):
+            if extra:
+                text += f"\n{extra}"
+        return text
 
 
 @dataclass(frozen=True)
@@ -305,10 +330,19 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def reply_text(run: Run, ci: str | None = None, *, no_ci: bool = False) -> str | None:
+def reply_text(
+    run: Run,
+    ci: str | None = None,
+    *,
+    no_ci: bool = False,
+    upstream: str | None = None,
+    watching: bool = False,
+) -> str | None:
     """The message for an ended run (None for a state that has none). ``ci`` is the PR's CI
     as a word (``green``, ``red``, ``pending``, ``none``), looked up when the reply is sent.
-    ``no_ci``: the repo has no pull_request workflow, so the run can't be merged from here."""
+    ``no_ci``: the repo has no pull_request workflow, so the run can't be merged from here.
+    ``upstream``: a fork-mode run's original repo (its ``done`` names the PR opened there, or
+    why none was). ``watching``: the run merges itself once CI is green."""
     took = fmt_duration(run.session_seconds)
     summary = f"\n{run.code}: {run.summary}" if run.summary else ""
     match run.status:
@@ -324,10 +358,23 @@ def reply_text(run: Run, ci: str | None = None, *, no_ci: bool = False) -> str |
                 text += f"\n⚠ it can't be merged as it is: {run.failure}"
             if no_ci:
                 return text + f"\nno CI: {run.repo} has no pull_request workflow." + summary
+            if watching:
+                return text + "\nI'll merge it when CI is green." + summary
             hint = "to merge it" if ci == "green" else "when CI is green"
             return text + f"\n/merge {run.code} {hint}." + summary
         case "no_changes":
             return f"{run.code}: no changes." + (f" {run.summary}" if run.summary else "")
+        case "done" if upstream is not None:  # a fork-mode run
+            if run.pr_url:
+                text = f"{run.code} done: PR #{run.pr_number} on {upstream} · {run.pr_url}"
+                if run.files_changed is not None:
+                    text += f" · {_plural(run.files_changed, 'file')}"
+                return text + f" · {took}\n{upstream} is upstream; its maintainers merge." + summary
+            why = run.failure or "it wasn't approved"
+            return (
+                f"{run.code} done ({took}): {run.branch} is on your fork; no PR on {upstream} "
+                f"({why})." + summary
+            )
         case "done":  # a run with no repo: Claude's summary is the answer
             return f"{run.code} done ({took})" + (f": {run.summary}" if run.summary else ".")
         case "failed":
@@ -533,6 +580,8 @@ class ClaudeRunner:
         cache_limit_bytes: int | None = None,
         defer_s: float = DEFER_S,
         refresh_s: float = TOKEN_REFRESH_S,
+        merge_wait_s: float = MERGE_WAIT_S,
+        merge_poll_s: float = MERGE_POLL_S,
         clock: Callable[[], datetime] = utcnow,
         trust: TrustChecker | None = None,
         submit: Callable[[Event], bool] | None = None,
@@ -550,7 +599,8 @@ class ClaudeRunner:
         sandbox, the cached self-probe and the ``claude`` on the daemon's PATH. ``trust``
         decides ``resonant check`` (EM-4's ``TrustChecks``; without it every check is
         denied), ``submit`` wakes a run's task with an event (``Loop.submit``) and
-        ``ask_block_s`` is how long one ``resonant ask`` call waits."""
+        ``ask_block_s`` is how long one ``resonant ask`` call waits. ``merge_wait_s`` and
+        ``merge_poll_s`` bound an auto-merge's wait for CI (EM-7)."""
         self.conn = conn
         self.cfg = runner
         self.channel = channel
@@ -564,6 +614,10 @@ class ClaudeRunner:
             GitHubApp(runner.github_app, secrets) if runner.github_app is not None else None
         )
         self.refresh_s = refresh_s
+        self.merge_wait_s = merge_wait_s
+        self.merge_poll_s = merge_poll_s
+        self._merge_locks: dict[str, asyncio.Lock] = {}
+        self._forks: dict[str, str] = {}  # run code -> the owner's fork (fork-mode runs)
         self._tokens: dict[str, list[str]] = {}  # run code -> tokens minted and not yet revoked
         self._spent: dict[str, list[str]] = {}  # ... and revoked ones (still redacted)
         self._expiry: dict[str, datetime] = {}  # token -> when GitHub expires it
@@ -757,15 +811,28 @@ class ClaudeRunner:
         return not_set_up_text(missing, how) if missing else None
 
     async def start_run(
-        self, repo: str | None, ask: str, principal: str, *, report: Report = "digest"
+        self,
+        repo: str | None,
+        ask: str,
+        principal: str,
+        *,
+        merge: bool = False,
+        report: Report = "digest",
     ) -> Started | Refused:
         """Create a run and its task. ``repo`` is free text (a name, ``owner/name``, a URL):
         the resolver turns it into a registered repo, registering one it hasn't seen. No repo
         (None or blank) is a run in a scratch dir, with no GitHub token and no PR. Refuses
         (with a sentence for the requester) when the runner isn't set up, the repo is
-        ambiguous or unknown, or Resonant is paused. Two runs on one repo go at once, each in
-        its own worktree. ``report="now"`` texts the run's end right away (``/run``, or the
-        owner asked to hear); by default it goes to the digest (``runners/reports.py``)."""
+        ambiguous or unknown, a fork-mode repo can't be worked on here (no ``public_repo``
+        token, or no way to ask the owner), or Resonant is paused. Two runs on one repo go at
+        once, each in its own worktree.
+
+        ``merge``: the ask included merging. A push repo's run then merges its own PR once CI
+        is green and the checks are clean, if the trust rules allow a merge there
+        (``merge_decision``); it is kept in the run's task checkpoint. Ignored for a fork
+        repo, which is never merged by Resonant. ``report="now"`` texts the run's end right away
+        (``/run``, or the owner asked to hear); by default it goes to the digest
+        (``runners/reports.py``)."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text)
         ask = ask.strip()
@@ -782,6 +849,9 @@ class ClaudeRunner:
             if isinstance(resolved, Refused):
                 return resolved
             found, new = resolved
+        if found is not None and found.mode == "fork" and (refusal := await self._fork_refusal()):
+            return refusal
+        auto_merge = merge and found is not None and found.mode == "push"
         repo = "" if found is None else found.name
         run = runs.create(
             self.conn,
@@ -798,7 +868,11 @@ class ClaudeRunner:
             runner=RUNNER_NAME,
             priority=PRIORITY_OWNER,
             principal=principal,
-            checkpoint={"run": run.code, "title": f"run {run.code} · {repo or 'no repo'}"},
+            checkpoint={
+                "run": run.code,
+                "title": f"run {run.code} · {repo or 'no repo'}",
+                **({"merge": True} if auto_merge else {}),
+            },
         )
         try:
             task_id = self._create_task(spec)
@@ -813,13 +887,32 @@ class ClaudeRunner:
             return Started(run.code, "", max(1, self.max_session_s // 60))
         with atomic(self.conn):
             repo_store.touch(self.conn, found.slug)
+        note = None
+        if found.mode == "fork":
+            note = (
+                f"{found.slug} is upstream: the work goes to your fork, and I'll ask before the PR."
+            )
+        elif auto_merge:
+            note = "I'll merge it when CI is green, unless a rule says to ask."
         return Started(
             run.code,
             repo,
             max(1, self.max_session_s // 60),
             found.slug if new else None,
-            await self._base_warning(found),
+            None if found.mode == "fork" else await self._base_warning(found),
+            note,
         )
+
+    async def _fork_refusal(self) -> Refused | None:
+        """Why a fork-mode run can't start here, or None. The ``public_repo`` token is
+        optional for the runner as a whole, so it is only asked for here."""
+        if self.desk.trust is None:
+            return Refused("A fork run asks you before its upstream PR, and asking isn't set up.")
+        try:
+            have = await self.secrets.exists(GITHUB_PUBLIC_TOKEN_REF)
+        except SecretError:
+            have = False
+        return None if have else Refused(FORK_NEEDS_PUBLIC_REPO)
 
     async def _base_warning(self, repo: repo_store.Repo) -> str | None:
         """A sentence for the start reply when the base branch is not protected: the session's
@@ -852,8 +945,6 @@ class ClaudeRunner:
             return Refused(
                 f"No repo matches {text[:60]!r}. Which repo?" + (f" {recent}" if recent else "")
             )
-        if resolution.repo.mode == "fork":
-            return Refused(UPSTREAM_LATER)
         return resolution.repo, resolution.new
 
     def get_run(self, code: str) -> Run | None:
@@ -869,6 +960,11 @@ class ClaudeRunner:
         if run is None:
             return Refused(f"No run {code}.")
         if not run.active:
+            if run.status == "ready" and self._stop_watch(run):
+                return Refused(
+                    f"{run.code} won't be merged automatically; its PR stays open. "
+                    f"/merge {run.code} to merge it."
+                )
             return Refused(f"{run.code} isn't running ({run.status}).")
         if not self._cancel(run, reason):
             return Refused(f"{run.code} isn't running.")
@@ -876,34 +972,65 @@ class ClaudeRunner:
             await self._finish_cancelled(run.code)
         return Cancelled(run.code)
 
+    def _stop_watch(self, run: Run) -> bool:
+        """``/cancel`` on a ready run that is waiting to merge itself: the watch ends (its
+        task is cancelled), the PR stays. False when nothing was watching."""
+        task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
+        if task is None or task.status != "waiting" or not task.checkpoint.get("merge"):
+            return False
+        if self._cancel_task is not None:
+            self._cancel_task(task.id)
+        else:
+            with atomic(self.conn):
+                task_store.set_status(self.conn, task.id, "cancelled", expect=("waiting",))
+        with atomic(self.conn):
+            audit(self.conn, "run.auto_merge_stopped", run=run.code)
+        return True
+
     async def merge_run(self, code: str) -> Merged | Refused:
-        """Squash-merge a ready run's PR (``--match-head-commit``, CI must be green). The
-        approval to merge is the caller's; the flagged paths are in the result."""
+        """Squash-merge a ready run's PR (``--match-head-commit``, CI must be green). Whether
+        to ask first is the caller's (the gate: ``/merge`` is explicit; chosen from chat it
+        follows ``merge_decision``); the flagged paths are in the result. A fork-mode repo's
+        PR is never merged here."""
         run = runs.get(self.conn, code)
         if run is None:
             return Refused(f"No run {code}.")
-        if (
-            run.status != "ready"
-            or run.pr_number is None
-            or run.head_sha is None
-            or run.branch is None
-        ):
+        repo = repo_store.find(self.conn, run.repo) if run.repo else None
+        if repo is not None and repo.mode == "fork":
+            return Refused(upstream_merges(repo.slug))
+        if not _mergeable(run):
             return Refused(f"{run.code} isn't ready to merge ({run.status}).")
         try:
             secrets = await load_runner_secrets(self.secrets)
         except SecretError:
             return Refused((await self.setup_missing()) or "The runner's secrets can't be read.")
-        try:  # fetches the PR head and runs the checks before it merges (D10)
-            checked = await self.workspace.merge(
-                run.repo, run.pr_number, run.head_sha, secrets, branch=run.branch
-            )
-        except (MergeRefused, RunnerError, GitError) as e:
-            reason = e.message if isinstance(e, GitError) else str(e)
-            return Refused(f"{run.code} not merged: {Redactor(secrets.values()).text(reason)}")
-        with atomic(self.conn):
-            runs.update(self.conn, run.code, status="merged", flagged_paths=checked.flagged)
-            audit(self.conn, "run.merged", run=run.code, pr=run.pr_number)
-        await self._report_merged(self._must_get(run.code), by_owner=True)
+        return await self._merge(run.code, secrets, by="owner")
+
+    async def _merge(
+        self, code: str, secrets: RunnerSecrets, *, by: str, allow_flagged: bool = True
+    ) -> Merged | Refused:
+        """The one merge path of both ``merge_run`` and the auto-merge, one at a time per run
+        (the row is read again under the lock, so two merges of one PR can't both go).
+        ``Workspace.merge`` fetches the PR head and runs the checks first (D10), then CI,
+        then ``--match-head-commit`` against the head the run recorded."""
+        async with self._merge_locks.setdefault(code, asyncio.Lock()):
+            run = runs.get(self.conn, code)
+            if run is None or not _mergeable(run):
+                status = "gone" if run is None else run.status
+                return Refused(f"{code} isn't ready to merge ({status}).")
+            assert run.pr_number is not None and run.head_sha is not None and run.branch
+            try:
+                checked = await self.workspace.merge(
+                    run.repo, run.pr_number, run.head_sha, secrets, branch=run.branch,
+                    allow_flagged=allow_flagged,
+                )  # fmt: skip
+            except (MergeRefused, RunnerError, GitError) as e:
+                reason = e.message if isinstance(e, GitError) else str(e)
+                return Refused(f"{run.code} not merged: {Redactor(secrets.values()).text(reason)}")
+            with atomic(self.conn):
+                runs.update(self.conn, run.code, status="merged", flagged_paths=checked.flagged)
+                audit(self.conn, "run.merged", run=run.code, pr=run.pr_number, by=by)
+        await self._report_merged(self._must_get(run.code), by_owner=by == "owner")
         with contextlib.suppress(Exception):
             await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
         await self._remove_workspace(run)
@@ -1008,6 +1135,9 @@ class ClaudeRunner:
         if run is None:
             return Fail("run not found")
         if not run.active:
+            if run.status == "ready" and task.checkpoint.get("merge"):
+                # watching, or a retry before the first look (the reply is deduped)
+                return await self._auto_merge(task, run, first=not task.checkpoint.get("watch"))
             return await self._conclude(run)
         if self._blocked:
             return self._defer(task, "starting")
@@ -1060,7 +1190,15 @@ class ClaudeRunner:
                 if outcome is not None:
                     return outcome
                 run = self._must_get(run.code)
-            if run.step in ("harvest", "publish") and not run.scratch:
+            fork = not run.scratch and self._repo_of(run).mode == "fork"
+            if run.step == "harvest" and fork:
+                run = await self._collect_fork(w, run, p)
+            if run.step == "publish" and fork:
+                outcome = await self._publish(w, run, p)
+                if outcome is not None:
+                    return outcome
+                run = self._must_get(run.code)
+            elif run.step in ("harvest", "publish") and not run.scratch:
                 run = await self._collect(w, run, p)  # "publish" only in an older build's run
         except _Cancelled:
             return await self._conclude(self._must_get(run.code))
@@ -1073,6 +1211,8 @@ class ClaudeRunner:
         run = self._must_get(run.code)
         if run.active:  # a step ran out without ending the run: never leave it running
             return await self._fail(run, "the run stopped in an unexpected state", w.redactor)
+        if run.status == "ready" and task.checkpoint.get("merge"):
+            return await self._auto_merge(task, run, first=True)
         return await self._conclude(run)
 
     # -- steps --
@@ -1082,8 +1222,11 @@ class ClaudeRunner:
         if run.scratch:
             p = await self.workspace.prepare_scratch(run.code)
         else:
+            fork = None
+            if self._repo_of(run).mode == "fork":
+                fork = await self._fork_of(run, w.secrets)
             p = await self.workspace.prepare(
-                run.code, run.repo, run.ask, github_token=w.secrets.github_token
+                run.code, run.repo, run.ask, github_token=w.secrets.github_token, fork=fork
             )
         runs.update(
             self.conn,
@@ -1215,23 +1358,30 @@ class ClaudeRunner:
             "--settings",
             json.dumps({"sandbox": {"enabled": False}}),
             "--append-system-prompt",
-            (
-                SCRATCH_PROMPT
-                if p.scratch
-                else RUNNER_PROMPT.format(
-                    repo=self._slug(run.repo),
-                    branch=p.branch,
-                    base=p.base_branch,
-                    attempts=MAX_FIX_ATTEMPTS,
-                )
-            )
-            + WORKER_PROMPT,
+            self._prompt(run, p) + WORKER_PROMPT,
             "--max-turns",
             str(self.max_turns),
         ]
         if api_billing and run.max_budget_usd is not None:  # a subscription has no dollar budget
             argv += ["--max-budget-usd", f"{run.max_budget_usd:g}"]
         return argv
+
+    def _prompt(self, run: Run, p: Prepared) -> str:
+        """The session's system prompt: scratch, a push repo's (it drives its own PR) or a
+        fork's (it pushes to the fork and stops; Resonant opens the upstream PR)."""
+        if p.scratch:
+            return SCRATCH_PROMPT
+        repo = self._repo_of(run)
+        if repo.mode == "fork":
+            fork = self._forks.get(run.code)
+            if fork is None:  # set when the session's token was minted
+                raise RunnerError("the fork isn't known yet")
+            return FORK_PROMPT.format(
+                fork=fork, upstream=repo.slug, branch=p.branch, base=p.base_branch
+            )
+        return RUNNER_PROMPT.format(
+            repo=repo.slug, branch=p.branch, base=p.base_branch, attempts=MAX_FIX_ATTEMPTS
+        )
 
     async def _session(self, w: _Work, run: Run, p: Prepared) -> StepOutcome | None:
         """Run Claude until it exits, a limit is hit or the run is stopped. None means it
@@ -1699,6 +1849,191 @@ class ClaudeRunner:
             )
         raise RunnerError(f"pushed directly to {p.base_branch} ({short}); not merged")
 
+    # -- fork mode (docs/employee-plan.md D6) --
+
+    def _repo_of(self, run: Run) -> repo_store.Repo:
+        repo = repo_store.find(self.conn, run.repo)
+        if repo is None or repo.name != run.repo:
+            raise RunnerError(f"{run.repo} isn't a registered repo")
+        return repo
+
+    async def _fork_of(self, run: Run, secrets: RunnerSecrets) -> str:
+        """The owner's fork for a fork-mode run, from GitHub (made the first time; asked
+        again after a restart, since nothing a worker can write is trusted for it)."""
+        if (fork := self._forks.get(run.code)) is None:
+            fork = self._forks[run.code] = await self.workspace.ensure_fork(run.repo, secrets)
+        return fork
+
+    async def _collect_fork(self, w: _Work, run: Run, p: Prepared) -> Run:
+        """After a fork run's session: the branch it pushed to the fork is fetched into the
+        mirror and put through the pre-merge checks (tokens, objects, paths, the commit
+        text that becomes the PR). Nothing pushed is ``no_changes``; a refusal fails the run,
+        and nothing is opened upstream. Then the ``publish`` step asks the owner."""
+        self._check_stop(run.code)
+        fork = await self._fork_of(run, w.secrets)
+        try:
+            checked = await self.workspace.check_fork(
+                run.repo, run.code, fork, p.branch, p.base_sha, w.secrets
+            )
+        except CheckFailed as e:
+            raise RunnerError(
+                f"the checks refuse it, so nothing was opened upstream: {e}"
+            ) from None
+        # The session is over: its token goes before the owner is asked, so nothing holding
+        # it can move the branch between the ok and the PR.
+        await self._deprovision(run.code, remove_dir=False)
+        self._check_stop(run.code)
+        runs.update(
+            self.conn, run.code, step="publish", head_sha=checked.head_sha,
+            files_changed=checked.result.files, flagged_paths=checked.result.flagged,
+        )  # fmt: skip
+        with atomic(self.conn):
+            audit(self.conn, "run.fork_checked", run=run.code, fork=fork, head=checked.head_sha)
+        return self._must_get(run.code)
+
+    async def _publish(self, w: _Work, run: Run, p: Prepared) -> StepOutcome | None:
+        """Ask before the upstream PR: an ``external_pr`` trust check on the original repo
+        (``irreversible``: it goes out under the owner's name, so it asks every time unless a
+        rule allows it). It goes through the worker desk exactly like a worker's
+        ``resonant check``: a check row, the decision (``TrustChecks.request_check``) in the
+        background, the run waiting without a slot (``waiting``, reason ``question``) and woken
+        when it comes; ``ask_timeout`` and a restart close it the same way (after a restart it
+        is asked again). On ok the branch is fetched and checked again, and the PR is opened
+        with the ``public_repo`` token only if its head is still the one the owner was asked
+        about. The run ends ``done`` either way. None means it ended."""
+        repo = self._repo_of(run)
+        if run.head_sha is None:
+            raise RunnerError("the fork's branch wasn't checked")
+        change = await self.workspace.fork_change(run.repo, run.code, p.base_sha)
+        if change.head != run.head_sha:
+            raise RunnerError(f"{p.branch} isn't at the commit that was checked")
+        self._check_stop(run.code)
+        check = Check(system=repo.slug, action=EXTERNAL_PR, what=change.what, irreversible=True)
+        q = self.desk.find_check(run.code, check)
+        if q is None or (q.status == "timed_out" and q.answer == RESTARTED):
+            q = await self.desk.request_check(run, check)
+        if q.status == "open":
+            runs.update(self.conn, run.code, status="waiting", wait_reason="question",
+                        waiting_since=self.clock())  # fmt: skip
+            self._pulse_open(self._must_get(run.code), "question")
+            until = self.desk.wait_until(run.code) or self.clock() + timedelta(minutes=1)
+            return Wait("human_reply", dict(w.task.checkpoint), until)
+        questions_store.mark_delivered(self.conn, q.id, at=self.clock())
+        self._check_stop(run.code)
+        if not (q.status == "answered" and q.answer == CHECK_OK):
+            why = "no decision in time" if q.status == "timed_out" else "not approved"
+            if not runs.finish(self.conn, run.code, "done", step="reply", failure=why):
+                raise _Cancelled
+            return None
+        fork = await self._fork_of(run, w.secrets)
+        checked = await self.workspace.check_fork(
+            run.repo, run.code, fork, p.branch, p.base_sha, w.secrets
+        )
+        if checked.head_sha != run.head_sha:
+            raise RunnerError(
+                f"{p.branch} moved on {fork} after you were asked; nothing was opened upstream"
+            )
+        self._check_stop(run.code)
+        pr = await self.workspace.open_upstream_pr(
+            run.repo, fork, p.branch, run.head_sha, checked.change,
+            self._upstream_body(repo, run, checked.change.body), w.secrets,
+        )  # fmt: skip
+        fields: dict[str, Any] = {"pr_number": pr.number, "pr_url": pr.url}
+        if pr.files is not None:
+            fields["files_changed"] = pr.files
+        with atomic(self.conn):
+            audit(self.conn, "run.upstream_pr", run=run.code, repo=repo.slug, pr=pr.number,
+                  head=run.head_sha)  # fmt: skip
+        if not runs.finish(self.conn, run.code, "done", step="reply", **fields):
+            runs.update(self.conn, run.code, **fields)
+            raise _Cancelled  # cancelled just now: the reply says its PR is open
+        return None
+
+    @staticmethod
+    def _upstream_body(repo: repo_store.Repo, run: Run, body: str) -> str:
+        """The upstream PR's description: the last commit's body. The owner's ask is quoted
+        only when the repo's ``quote_ask`` is on (off by default for fork repos)."""
+        if repo.quote_ask:
+            asked = clean_external(run.ask)[:500]
+            body = f"{body}\n\n> {asked}".strip()
+        return body
+
+    # -- auto-merge (``start_run(merge=True)``, merge per trust rules) --
+
+    def _auto_merge_blocker(self, run: Run) -> str | None:
+        """Why a ready run with merge intent isn't merged without the owner, or None."""
+        repo = repo_store.find(self.conn, run.repo)
+        if repo is None or repo.mode != "push":
+            return "it isn't a repo I merge"
+        if run.failure:
+            return "the checks refuse it"
+        if run.flagged_paths:
+            return f"it changes {', '.join(run.flagged_paths)}"
+        if repo.ci is False:
+            return f"{repo.name} has no CI"
+        if self._paused():
+            return "Resonant is paused"
+        if merge_decision(self.conn, repo.name) != "ok":
+            return f"a rule says to ask before merging in {repo.name}"
+        return None
+
+    async def _auto_merge(self, task: Task, run: Run, *, first: bool) -> StepOutcome:
+        """A ready run whose ask included merging: merge once CI is green on the head the run
+        recorded, through the same path and checks as ``/merge``. Pending CI is looked at
+        again every ``merge_poll_s`` (the task waits without a slot) for at most
+        ``merge_wait_s`` after the run; red CI, a refusal, a moved head or a rule that asks
+        stops it with a reply. ``first``: the run just became ready, so its reply hasn't gone
+        out yet."""
+        done = Done({"run": run.code, "status": run.status})
+        why = self._auto_merge_blocker(run)
+        state: str | None = None
+        secrets: RunnerSecrets | None = None
+        if why is None:
+            try:
+                secrets = await load_runner_secrets(self.secrets)
+                state = await self.workspace.ci_state(run.repo, _pr_number(run), secrets)
+            except (SecretError, RunnerError) as e:
+                why = f"CI couldn't be read ({e})"
+        if why is None and state in ("pending", "error", "none"):  # none: checks not registered yet
+            ended = run.ended_at or self.clock()
+            if self.clock() - ended < timedelta(seconds=self.merge_wait_s):
+                if first:
+                    told = await self._conclude(run, watching=True)
+                    if isinstance(told, Fail):
+                        return told
+                checkpoint = {**task.checkpoint, "watch": True}
+                return Wait("ci", checkpoint, self.clock() + timedelta(seconds=self.merge_poll_s))
+            why = (
+                "no CI checks reported"
+                if state == "none"
+                else f"CI didn't finish within {fmt_duration(self.merge_wait_s)}"
+            )
+        elif why is None and state == "red":
+            why = "CI is red"
+        if why is None and secrets is not None:
+            merged = await self._merge(run.code, secrets, by="auto", allow_flagged=False)
+            if isinstance(merged, Merged):
+                if first:
+                    self._pulse_clear(run)
+                    await self._deprovision(run.code)
+                    await self._end_cli(run.code)
+                # the merged line went out by the trust rules' urgency (``_report_merged``)
+                return Done({"run": run.code, "status": "merged"})
+            now = self._must_get(run.code)
+            if now.status != "ready":  # merged (or ended) another way meanwhile: nothing to say
+                return Done({"run": run.code, "status": now.status})
+            why = merged.reason.removeprefix(f"{run.code} not merged: ")
+        assert why is not None
+        note = f"Not merged automatically: {why}. /merge {run.code} when it's ready."
+        if first:
+            return await self._conclude(run, note=note)
+        with contextlib.suppress(ChannelError):
+            await self.channel.send(
+                run.principal, f"{run.code} {note[0].lower()}{note[1:]}",
+                dedupe_key=f"run:{run.code}:auto-merge",
+            )  # fmt: skip
+        return done
+
     # -- the session's GitHub token --
 
     def _slug(self, repo_name: str) -> str:
@@ -1712,17 +2047,21 @@ class ClaudeRunner:
             [*w.secrets.values(), *self._tokens.get(code, ()), *self._spent.get(code, ())]
         )
 
-    async def _mint(self, run: Run) -> str:
-        """A new token for the run's repo, remembered so it is revoked at the end."""
+    async def _mint(self, run: Run, secrets: RunnerSecrets) -> str:
+        """A new token for the run's repo, remembered so it is revoked at the end. A fork
+        run's token is for the owner's fork (the app is installed on all of the owner's
+        repos, which covers forks), never for the original: so the session can push its
+        branch to the fork but can't open, or touch, anything upstream."""
         repo = repo_store.find(self.conn, run.repo)
         if repo is None:
             raise RunnerError(f"{run.repo} isn't a registered repo")
         if self.app is None:
             raise RunnerError("the runner isn't set up: runner.github_app isn't in the config")
+        owner, name = None, repo.slug.partition("/")[2]
+        if repo.mode == "fork":
+            owner, _, name = (await self._fork_of(run, secrets)).partition("/")
         try:
-            minted = await self.app.mint(
-                repo.slug.partition("/")[2], workflows=repo.allow_github_changes
-            )
+            minted = await self.app.mint(name, workflows=repo.allow_github_changes, owner=owner)
         except GitHubAppError as e:
             raise RunnerError(str(e)) from None
         self._tokens.setdefault(run.code, []).append(minted.token)
@@ -1734,7 +2073,7 @@ class ClaudeRunner:
         gh's hosts.yml read it there). A token an earlier, crashed session left is revoked
         first."""
         await self._deprovision(run.code, remove_dir=False)
-        token = await self._mint(run)
+        token = await self._mint(run, w.secrets)
         w.redactor = self._redactor(w, run.code)
         await _finish_thread(write_session_credentials, p.run_dir, token)
 
@@ -1746,7 +2085,7 @@ class ClaudeRunner:
         one token to find, not two). A gh or git call already running with the old token
         fails once; the prompt tells the session to run it again."""
         try:
-            token = await self._mint(run)
+            token = await self._mint(run, w.secrets)
             w.redactor = writer.redactor = self._redactor(w, run.code)
             await _finish_thread(write_session_credentials, p.run_dir, token)
             old = [t for t in self._tokens.get(run.code, []) if t != token]
@@ -1806,16 +2145,20 @@ class ClaudeRunner:
         runs.finish(self.conn, run.code, status, step="reply")
         return await self._conclude(self._must_get(run.code))
 
-    async def _conclude(self, run: Run) -> StepOutcome:
+    async def _conclude(
+        self, run: Run, *, watching: bool = False, note: str | None = None
+    ) -> StepOutcome:
         """Everything after a run's row has its final status: clear the pulse item, send the
-        reply (once), and tell the loop how the task ended."""
+        reply (once), and tell the loop how the task ended. ``watching`` and ``note`` are
+        the auto-merge's (it will merge once CI is green; why it won't)."""
+        self._forks.pop(run.code, None)
         if run.status == "cancelled":
             await self._finish_cancelled(run.code, send=False)
         else:
             await self._deprovision(run.code)
             await self._end_cli(run.code)
         try:
-            await self._send_reply(run)
+            await self._send_reply(run, watching=watching, note=note)
         except ChannelError as e:
             return Fail(f"reply failed: {e}", retryable=True)
         if run.status == "failed":
@@ -1834,15 +2177,21 @@ class ClaudeRunner:
             return None
         return None if state == "error" else state
 
-    async def _send_reply(self, run: Run) -> None:
+    async def _send_reply(
+        self, run: Run, *, watching: bool = False, note: str | None = None
+    ) -> None:
         """Report an ended run by urgency (``runners/reports.py``): its digest line is
         written untold, then, when it is ``now``, the full reply is texted and the line
         marked told. A refused text leaves the line for the next digest. A cancel is always
-        texted (the owner did it), and so is a token that wasn't revoked."""
-        repo = repo_store.find(self.conn, run.repo)
+        texted (the owner did it), and so is a token that wasn't revoked. ``watching`` and
+        ``note`` are the auto-merge's; a fork run's reply names its upstream."""
+        repo = repo_store.find(self.conn, run.repo) if run.repo else None
         no_ci = repo is not None and repo.mode == "push" and repo.ci is False
+        upstream = repo.slug if repo is not None and repo.mode == "fork" else None
         ci = await self._ci_word(run)
-        text = reply_text(run, ci, no_ci=no_ci)
+        text = reply_text(run, ci, no_ci=no_ci, upstream=upstream, watching=watching)
+        if text is not None and note:
+            text += f"\n{note}"
         event = end_event(run)
         warned = False
         title = end_title(run, ci)
@@ -2074,6 +2423,20 @@ async def _finish_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.
     except asyncio.CancelledError:
         await asyncio.wait([fut])
         raise
+
+
+def _mergeable(run: Run) -> bool:
+    return (
+        run.status == "ready"
+        and run.pr_number is not None
+        and run.head_sha is not None
+        and run.branch is not None
+    )
+
+
+def _pr_number(run: Run) -> int:
+    assert run.pr_number is not None
+    return run.pr_number
 
 
 def _bucket(seconds: float) -> str:

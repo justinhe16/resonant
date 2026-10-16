@@ -355,11 +355,7 @@ class WorkerDesk:
         if entry is None and len(qs.open_for_run(self.conn, run.code, "check")) >= MAX_PENDING:
             return self._reply(run.code, BUSY, EXIT_BUSY)  # not a "no": nothing was asked
         if entry is None:
-            text = f"{action} on {system}: {req.what}"
-            if req.irreversible:
-                text += " (irreversible)"
-            if req.cost_usd > 0:
-                text += f" (costs ${req.cost_usd:g})"
+            text = self._check_text(system, action, req)
             q = qs.ask(self.conn, run.code, "check", text, at=self.clock())
             await self.events.emit(WorkerEvent("check", run.code, text, False, q.asked_at, q.id))
             task = asyncio.ensure_future(self._decide(q.id, run.code, system, action, req))
@@ -389,6 +385,56 @@ class WorkerDesk:
         busy = q.status == "answered" and q.answer == CHECK_BUSY
         rc = EXIT_OK if ok else EXIT_BUSY if busy else EXIT_DENIED
         return self._reply(run.code, _check_line(q, short=True), rc, qid=qid)
+
+    @staticmethod
+    def _check_text(system: str, action: str, req: Check, *, daemon: bool = False) -> str:
+        # A daemon-made check reads "<action> on <system> (asked by Resonant): …". A worker's
+        # can't: its system is a slug (no spaces), so ": " always follows it directly.
+        by = " (asked by Resonant)" if daemon else ""
+        text = f"{action} on {system}{by}: {req.what}"
+        if req.irreversible:
+            text += " (irreversible)"
+        if req.cost_usd > 0:
+            text += f" (costs ${req.cost_usd:g})"
+        return text
+
+    def find_check(self, code: str, req: Check) -> qs.Question | None:
+        """The latest daemon-made check row of ``code`` for exactly this check, or None. A
+        check the worker asked itself (``resonant check``) never matches."""
+        text = self._check_text(slug(req.system), slug(req.action), req, daemon=True)
+        found = [q for q in qs.for_run(self.conn, code) if q.kind == "check" and q.question == text]
+        return max(found, key=lambda q: q.id, default=None)
+
+    async def request_check(self, run: Run, req: Check) -> qs.Question:
+        """A check the daemon makes for a run itself (EM-7: ``external_pr`` before a fork
+        run's upstream PR), with the lifecycle of a worker's ``resonant check``: a check row,
+        the decision in the background, the run woken when it comes, closed by
+        ``ask_timeout``, a restart or the run ending. Joins an open one for the same check.
+        Returns the row as it stands (already answered when a rule decided at once). Without
+        ``trust`` the row is answered ``denied`` (fail closed)."""
+        system, action = slug(req.system), slug(req.action)
+        if ANY in (system, action):
+            raise ValueError("name one system and one action, not *")
+        key = (run.code, system, action, req.irreversible, req.cost_usd, req.what, "daemon")
+        entry = self._checks.get(key)
+        if entry is None:
+            text = self._check_text(system, action, req, daemon=True)
+            q = qs.ask(self.conn, run.code, "check", text, at=self.clock())
+            if self.trust is None:
+                qs.answer(self.conn, q.id, CHECK_DENIED, at=self.clock())
+                return qs.get(self.conn, q.id) or q
+            await self.events.emit(WorkerEvent("check", run.code, text, False, q.asked_at, q.id))
+            task = asyncio.ensure_future(self._decide(q.id, run.code, system, action, req))
+            entry = (q.id, task)
+            self._checks[key] = entry
+            task.add_done_callback(lambda _t, k=key: self._checks.pop(k, None))
+        qid, task = entry
+        # a rule (or the net-new defaults) may decide at once: give it a moment
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), 0.5)
+        q = qs.get(self.conn, qid)
+        assert q is not None
+        return q
 
     async def _decide(self, qid: int, code: str, system: str, action: str, req: Check) -> None:
         """The trust decision for one check; recorded (and the run woken) when it comes."""
