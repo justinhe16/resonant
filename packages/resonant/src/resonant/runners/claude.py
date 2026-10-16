@@ -1388,6 +1388,11 @@ class ClaudeRunner:
 
     async def _prepare(self, w: _Work, run: Run) -> Run:
         self._check_stop(run.code)
+        if not run.scratch and w.local is None and w.secrets.github_token is None:
+            # started to push, and the token went since: never prepare a push run tokenless
+            raise RunnerError(
+                needs_github_token("Pushing") + " Start it again to have it commit locally."
+            )
         if run.scratch:
             p = await self.workspace.prepare_scratch(run.code)
         else:
@@ -1403,6 +1408,9 @@ class ClaudeRunner:
             workspace=str(p.workspace),
             checkout=None if p.checkout is None else str(p.checkout),
         )
+        if p.from_checkout:  # said in the end reply; kept across restarts
+            w.task.checkpoint["base_from"] = "checkout"
+            w.ctx.save(checkpoint=dict(w.task.checkpoint))
         params = self._params(p)
         try:
             await _finish_thread(self._prepare_session_dirs, params)
@@ -2024,6 +2032,8 @@ class ClaudeRunner:
             raise NoChanges("the session committed nothing")
         assert w.local is not None
         why = f"can't push yet: {NO_PUSH_LONG[w.local]}"
+        if w.task.checkpoint.get("base_from") == "checkout":
+            why += f" (it started from your checkout's origin/{p.base_branch}, not fetched)"
         if not runs.finish(self.conn, run.code, "done", step="reply", failure=why):
             raise _Cancelled
         with atomic(self.conn):

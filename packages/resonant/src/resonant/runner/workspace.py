@@ -115,6 +115,12 @@ COMMITTER_EMAIL = "resonant-runner@users.noreply.github.com"
 _SAFE_PATH = "/usr/bin:/bin"
 _PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)")
 _SHA = re.compile(r"[0-9a-f]{40}")
+# An anonymous fetch GitHub refused (a private repo), as opposed to the network failing.
+_ANON_REFUSED = re.compile(
+    r"not found|does not appear to be a git repository|could not read username|"
+    r"authentication failed|terminal prompts disabled|\b40[13]\b",
+    re.IGNORECASE,
+)
 _ERR_CLIP = 300
 CREDS_DIR = "creds"
 _PUSH_KINDS = ("push", "force_push", "branch_deletion", "pr_merge")
@@ -532,6 +538,9 @@ class Prepared:
     branch: str = ""
     base_branch: str = ""
     base_sha: str = ""
+    # RX-1: the base came from the checkout's ``origin/<base>`` (no token, a private repo),
+    # not a fresh fetch. Only ``prepare`` sets it; the runner keeps it in the task checkpoint.
+    from_checkout: bool = False
 
     @property
     def scratch(self) -> bool:
@@ -917,10 +926,13 @@ class Workspace:
         ``refs/remotes/upstream/<base>``. CI isn't recorded (theirs runs on their side).
 
         With no ``github_token`` (RX-1: the daemon's token isn't set yet) the mirror and a
-        first clone are fetched anonymously, which works for a public repo. When that fails
-        (a private repo) and the owner already has a checkout, the run starts from the
-        checkout's own ``origin/<base>`` instead (read under the guard): such a run only ever
-        commits locally, nothing it makes is merged by Resonant, and CI isn't recorded.
+        first clone are fetched anonymously, which works for a public repo. When GitHub
+        refuses that (a private repo: auth or not found; any other failure, like the network,
+        still fails the run) and the owner already has a checkout, the run starts from the
+        checkout's own ``origin/<base>`` as last fetched (read under the guard; never the
+        local ``<base>``, which may hold unpushed work) and ``from_checkout`` says so: such a
+        run only ever commits locally, nothing it makes is merged by Resonant, and CI isn't
+        recorded.
 
         A leftover worktree or run dir (a crash before the session started) is removed and
         rebuilt."""
@@ -944,6 +956,8 @@ class Workspace:
                     f"fetching {repo.base} of {repo.slug} failed: {e.message[-120:]}"
                 )
                 if github_token is not None or fork is not None:
+                    raise fetch_failed from None
+                if not _ANON_REFUSED.search(e.message):  # the network, not a private repo
                     raise fetch_failed from None
                 if not await asyncio.to_thread(os.path.lexists, self.checkout_path(repo)):
                     raise RunnerError(self.no_clone_text(repo)) from None
@@ -1005,24 +1019,29 @@ class Workspace:
                     await self._remove_worktree(code, worktree, checkout, branch, base_sha)
                     await asyncio.to_thread(rmtree_nofollow, run_dir)
                 raise
-        return Prepared(code, repo.name, run_dir, worktree, checkout, branch, repo.base, base_sha)
+        return Prepared(code, repo.name, run_dir, worktree, checkout, branch, repo.base, base_sha,
+                        from_checkout=not from_mirror)  # fmt: skip
 
     async def _checkout_base(self, checkout: Path, repo: Repo) -> tuple[str, list[str]]:
         """The base commit and its top-level names from the owner's checkout (the daemon has
-        no token to fetch a private repo with): ``origin/<base>``, else the local ``<base>``.
-        Under the guard, like every daemon git command in a checkout."""
-        for ref in (f"refs/remotes/origin/{repo.base}", f"refs/heads/{repo.base}"):
-            try:
-                out = await self._in_checkout(checkout, "rev-parse", "--verify", "-q",
-                                              f"{ref}^{{commit}}")  # fmt: skip
-            except GitError:
-                continue
-            sha = out.decode().strip()
-            if not _SHA.fullmatch(sha):
-                continue
-            top = await self._in_checkout(checkout, "ls-tree", "-z", "--name-only", sha)
-            return sha, [n for n in top.decode(errors="replace").split("\0") if n]
-        raise RunnerError(f"{checkout} has no {repo.base} branch to start from")
+        no token to fetch a private repo with): ``origin/<base>`` as the checkout last fetched
+        it. Under the guard, like every daemon git command in a checkout. The ref lives in a
+        ``.git`` an earlier worker could write, which is acceptable only because such a run
+        commits locally and nothing it makes is pushed or merged by Resonant."""
+        ref = f"refs/remotes/origin/{repo.base}"
+        try:
+            out = await self._in_checkout(checkout, "rev-parse", "--verify", "-q",
+                                          f"{ref}^{{commit}}")  # fmt: skip
+        except GitError:
+            out = b""
+        sha = out.decode().strip()
+        if not _SHA.fullmatch(sha):
+            raise RunnerError(
+                f"{checkout} has no origin/{repo.base} to start from, and fetching it needs "
+                f"the daemon's GitHub token (runner/github_token)"
+            )
+        top = await self._in_checkout(checkout, "ls-tree", "-z", "--name-only", sha)
+        return sha, [n for n in top.decode(errors="replace").split("\0") if n]
 
     def no_clone_text(self, repo: Repo) -> str:
         """Why a run on ``repo`` can't start without the daemon's token: there is no checkout
@@ -1040,10 +1059,14 @@ class Workspace:
         repo = self._repo(repo_name)
         if await asyncio.to_thread(os.path.lexists, self.checkout_path(repo)):
             return True
-        res = await _exec(
-            [self._git_bin, "ls-remote", "-q", "--heads", "--", self._url_for(repo), repo.base],
-            env=git_env(), timeout_s=GH_TIMEOUT_S,
-        )  # fmt: skip
+        try:
+            res = await _exec(
+                [self._git_bin, "ls-remote", "-q", "--exit-code", "--heads", "--",
+                 self._url_for(repo), repo.base],
+                env=git_env(), timeout_s=GH_TIMEOUT_S,
+            )  # fmt: skip
+        except (OSError, TimeoutError):
+            return False
         return res.returncode == 0
 
     async def local_commits(self, p: Prepared) -> int:
@@ -1182,14 +1205,15 @@ class Workspace:
         mode only: making the fork, and opening or closing the upstream PR)."""
         token = secrets.github_token
         if token is None and not public:
-            raise RunnerError(needs_github_token("That"))
+            raise RunnerError(needs_github_token("Asking GitHub"))
         if public:
             if not secrets.github_public_token:
                 raise RunnerError(FORK_NEEDS_PUBLIC_REPO)
             token = secrets.github_public_token
         # Everything gh reads or writes lives in one throwaway dir; the token is in its
         # hosts.yml (which gh prefers to the Keychain) and never in env or argv.
-        assert token is not None
+        if token is None:  # unreachable: both cases above raise
+            raise RunnerError(needs_github_token("Asking GitHub"))
         with secret_dir(self.cfg.secrets_dir) as tmp:
             config = write_gh_config(tmp, token)
             env = {

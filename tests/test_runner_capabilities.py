@@ -15,6 +15,7 @@ Uses the harness of ``test_runner_claude.py`` (fake Claude CLI, local bare remot
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 from dataclasses import replace
@@ -143,7 +144,10 @@ async def test_claude_only_repo_with_a_checkout_commits_locally(
     run = h.run()
     branch = "resonant/r1-fix-the-flaky-test"
     assert run.status == "done" and run.branch == branch and run.base_sha == base
-    assert run.failure == "can't push yet: the GitHub App isn't set up"
+    assert run.failure == (
+        "can't push yet: the GitHub App isn't set up "
+        "(it started from your checkout's origin/main, not fetched)"
+    )
     assert run.pr_number is None and run.head_sha is None
     # the work is on the local branch in the owner's checkout, nowhere else
     assert git(checkout, "log", "-1", "--format=%s", branch) == "Fix the flaky test"
@@ -159,7 +163,8 @@ async def test_claude_only_repo_with_a_checkout_commits_locally(
     assert text.startswith("R1 done (")
     assert (
         f"): work is on local branch {branch} in {checkout}; "
-        "can't push yet: the GitHub App isn't set up.\nR1: Fixed it." in text
+        "can't push yet: the GitHub App isn't set up (it started from your checkout's "
+        "origin/main, not fetched).\nR1: Fixed it." in text
     )
     assert end_title(run) == f"R1 done: local branch {branch} (not pushed)"
     # a resumed session isn't told to push either
@@ -337,3 +342,56 @@ def test_local_reply_texts(db: sqlite3.Connection) -> None:
         "can't push yet: the GitHub App isn't set up."
     )
     assert reply_text(replace(run, checkout="/elsewhere/proj")) is not None
+
+
+async def test_claude_only_never_falls_back_on_a_network_failure_or_a_local_base(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """The checkout's base is used only when GitHub refuses an anonymous fetch (a private
+    repo), never when the network fails, and only its ``origin/<base>``: never the local
+    ``<base>``, which may hold unpushed work."""
+    h = build(tmp_path, db, scenario="happy", extra=["--no-push"])
+    claude_only(h)
+    checkout = owner_checkout(h)
+    h.ws._url_for = lambda repo: "https://127.0.0.1:1/own/proj.git"  # pyright: ignore[reportPrivateUsage]
+    await h.start()
+    await h.drain()
+    run = h.run("R1")
+    assert run.status == "failed" and (run.failure or "").startswith(
+        "fetching main of own/proj failed"
+    )
+    private(h, tmp_path)
+    git(checkout, "update-ref", "-d", "refs/remotes/origin/main")
+    await h.start()
+    await h.drain()
+    run = h.run("R2")
+    assert run.status == "failed" and "has no origin/main to start from" in (run.failure or "")
+    assert h.api.issued == 0
+
+
+async def test_a_push_run_whose_token_went_before_prepare_fails_clearly(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    code = await h.start()
+    del h.keychain.items[GITHUB_TOKEN_REF]  # removed while the run was queued
+    await h.drain()
+    run = h.run(code)
+    assert run.status == "failed"
+    assert (run.failure or "").startswith("Pushing needs the daemon's GitHub token")
+    assert h.api.issued == 0 and not h.worktree(code).exists()
+
+
+async def test_a_bad_local_checkpoint_value_is_ignored(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    code = await h.start()
+    task = task_store.get_task(db, cast(str, h.run(code).task_id))
+    assert task is not None
+    db.execute(
+        "UPDATE tasks SET checkpoint = ? WHERE id = ?",
+        (json.dumps({**task.checkpoint, "local": ["app"]}), task.id),
+    )
+    await h.drain()
+    assert h.run(code).status == "ready"  # a push run, as started
