@@ -412,3 +412,12 @@ async def test_an_existing_rule_is_not_re_announced(h: Harness) -> None:
     assert await first == "ok"
     assert not any(key and key.endswith(":rule") for _, _, key in h.channel.sent)
     assert audits(h.db, "trust.rule_added") == []
+
+
+async def test_no_yes_always_for_an_area_of_the_runs_repo(h: Harness) -> None:
+    code = h.run("dori-api")
+    task = h.start(code, system="dori")  # first check ever: only the repo shows the overlap
+    prompt = await h.prompted()
+    assert prompt.text().endswith("(new system)? Reply yes / no")
+    h.reply("no")
+    assert await task == "denied"

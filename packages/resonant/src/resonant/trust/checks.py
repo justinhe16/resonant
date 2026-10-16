@@ -98,13 +98,15 @@ def check_summary(
     return f"{doing} ({reason})"
 
 
-def _covers_others(conn: sqlite3.Connection, system: str) -> bool:
-    """True if ``system`` is an area of a system already seen or of a rule's scope, so an
-    allow rule on it would cover more than this one system (``dori`` covers ``dori-prod``)."""
+def _covers_others(conn: sqlite3.Connection, system: str, repo: str | None) -> bool:
+    """True if ``system`` is an area of the run's repo, a system already seen or a rule's
+    scope, so an allow rule on it would cover more than this one system (``dori`` covers
+    ``dori-prod``)."""
     rows = conn.execute(
         "SELECT system AS name FROM trust_seen UNION SELECT scope FROM trust_rules"
     ).fetchall()
-    return any(is_area(system, r["name"]) for r in rows)
+    names = [r["name"] for r in rows] + ([repo] if repo else [])
+    return any(is_area(system, name) for name in names)
 
 
 def check_hash(
@@ -173,7 +175,15 @@ class TrustChecks:
         if decision.ok:
             return "ok"
         approval = self._approval(
-            run.code, run.task_id, decision, system, action, irreversible, cost_usd, what
+            run.code,
+            run.task_id,
+            decision,
+            system,
+            action,
+            irreversible,
+            cost_usd,
+            what,
+            repo=store.slug(run.repo) if run.repo else None,
         )
         if approval is None:
             self._audit(run.code, system, action, "denied", "too many pending checks")
@@ -181,12 +191,14 @@ class TrustChecks:
         try:
             answer, why = await self._wait(run.code, run.task_id, approval, system, action)
         except asyncio.CancelledError:
-            # The worker went away (its socket closed): a later reply must bind nothing.
+            # The worker went away (its socket closed): a later reply must bind nothing. If
+            # the owner had already said yes (the cancel hit the confirmation), say so.
             with atomic(self.conn):
-                ap.expire_one(self.conn, approval.approval_id, self.clock(), reason="cancelled")
-            self._audit(
-                run.code, system, action, "denied", "cancelled", approval_id=approval.approval_id
-            )
+                expired = ap.expire_one(
+                    self.conn, approval.approval_id, self.clock(), reason="cancelled"
+                )
+            answer, why = ("denied", "cancelled") if expired else ("ok", "cancelled after answer")
+            self._audit(run.code, system, action, answer, why, approval_id=approval.approval_id)
             raise
         self._audit(run.code, system, action, answer, why, approval_id=approval.approval_id)
         return answer
@@ -203,6 +215,8 @@ class TrustChecks:
         irreversible: bool,
         cost_usd: float,
         what: str,
+        *,
+        repo: str | None,
     ) -> NeedsApproval | None:
         """The pending approval for this check: reused while one is pending, else new."""
         shown = clean_what(what)
@@ -223,7 +237,7 @@ class TrustChecks:
                     return None
                 # An owner's own ask rule is changed over chat, not from a prompt; and a
                 # rule on an area of other systems would cover more than was asked.
-                always = decision.rule is None and not _covers_others(self.conn, system)
+                always = decision.rule is None and not _covers_others(self.conn, system, repo)
                 try:
                     code = new_code(ap.pending_codes(self.conn))
                 except RuntimeError:  # every approval code is taken
