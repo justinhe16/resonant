@@ -96,10 +96,12 @@ from resonant.router.render import (
     render_notes,
     render_projects,
     render_reminders,
+    render_repos,
     render_rules,
     render_runs,
 )
 from resonant.store import extensions as ext_store
+from resonant.store import repos as repo_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, utcnow
 from resonant.tools import ToolRegistry
@@ -273,6 +275,7 @@ COMMAND_RENDERS: dict[str, Render] = {
     "/ext": render_extensions,
     "/pulse": render_text,
     "/runs": render_runs,
+    "/repos": render_repos,
     "/rules": render_rules,
 }
 
@@ -388,8 +391,24 @@ class FastPath:
         )
 
     def context(self) -> ParseContext:
-        """What ``match_fast_path`` needs to parse ``/remind``: now, and the owner's zone."""
-        return ParseContext(self.clock(), self.timezone)
+        """What ``match_fast_path`` needs to parse ``/remind`` (now, and the owner's zone)
+        and ``/run`` (whether a word names a repo, from the store)."""
+        return ParseContext(self.clock(), self.timezone, self.is_repo)
+
+    def is_repo(self, word: str) -> bool:
+        """``/run``'s first word is a repo: ``owner/name`` or a GitHub URL, a registered name
+        or alias, or an enabled extension that links repos. No GitHub call: a word only
+        GitHub knows needs ``/run <word>: …``."""
+        from resonant.runner.resolve import parse_slug
+
+        if parse_slug(word) is not None:
+            return True
+        try:
+            return repo_store.find(self.conn, word) is not None or bool(
+                repo_store.enabled_links(self.conn, word.lower())
+            )
+        except sqlite3.Error:
+            return False
 
     async def run(
         self,

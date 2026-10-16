@@ -1,14 +1,21 @@
-"""Repo tools (docs/repos-plan.md D6, D8): ``create_repo`` (L2), ``add_ci`` (L2), ``list_repos``
-(L0), ``add_repo`` (L3) and ``forget_repo`` (L3).
+"""Repo tools (docs/repos-plan.md D6, D8): ``create_repo`` (L2), ``add_ci`` (L2),
+``merge_ci_pr`` (L2), ``list_repos`` (L0), ``add_repo`` (L3) and ``forget_repo`` (L3).
 
 Global builtins like the run tools: the gate lets only the owner call them, and the handlers
 find ``ClaudeRunner`` (``components.runners["claude"]``) at call time. Replies are code-built
-``text``. They are not wired into router intents or slash commands yet (RP-6 does that).
+``text``. The ``run_project`` intent offers them all (EM-8), and the slash commands are
+``/repos``, ``/repo add|forget|new|ci``. An L2 tool runs from its slash command and asks a
+plain yes when the model chose it.
 
 - ``create_repo{name, description?, private?}``: a repo under the owner's account (private by
   default) with a README, the starter CI workflow and branch protection, registered
   ``source=created``. L2: a model-chosen call asks a plain yes.
 - ``add_ci{repo}``: a PR adding the starter CI workflow to a registered push repo without CI.
+- ``merge_ci_pr{repo}``: squash-merge that repo's open add-CI PR. It isn't a run, so
+  ``merge_run`` can't reach it. ``Workspace.merge(starter_ci=True)`` checks that the PR's
+  whole diff is the hash-checked starter workflow, runs the pre-merge checks, and needs green
+  CI on the PR (the starter workflow runs on the PR itself) and ``--match-head-commit``.
+  Then the repo is recorded as having CI.
 - ``list_repos``: the registry, most recently used first.
 - ``add_repo{repo, name?}``: resolve (``owner/name``, URL, name, fuzzy) and register; ``name``
   is an extra handle for it. A new push repo whose base branch is unprotected comes with a
@@ -22,6 +29,9 @@ from __future__ import annotations
 from typing import Any, Protocol, cast
 
 from resonant.executor import ToolFailed, ToolHandler
+from resonant.gate.types import Intent
+from resonant.redact import Redactor
+from resonant.runner.checks import GitError
 from resonant.runner.create import (
     DESCRIPTION_MAX,
     NAME_MAX,
@@ -38,9 +48,10 @@ from resonant.runner.resolve import (
     Resolved,
     Resolver,
 )
-from resonant.runner.workspace import Workspace
+from resonant.runner.workspace import MergeRefused, RunnerError, Workspace
 from resonant.secrets import RunnerSecrets, SecretError, SecretStore, load_runner_secrets
 from resonant.store import repos as repos_store
+from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.store.repos import RepoConflict
 from resonant.tools.base import BuiltinContext
@@ -105,6 +116,22 @@ ADD_CI = ToolSpec(
     level=Level.L2,
     timeout_s=120.0,
 )
+MERGE_CI_PR = ToolSpec(
+    name="merge_ci_pr",
+    description=(
+        "Squash-merge the open add-CI pull request (from add_ci) of a registered repo, once "
+        "its CI is green. Asks the owner first when chosen from chat."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {"repo": _repo_schema()},
+        "required": ["repo"],
+        "additionalProperties": False,
+    },
+    effect=Effect.WRITE,
+    level=Level.L2,
+    timeout_s=180.0,
+)
 LIST_REPOS = ToolSpec(
     name="list_repos",
     description=(
@@ -151,7 +178,18 @@ FORGET_REPO = ToolSpec(
     timeout_s=15.0,
 )
 
-SPECS: tuple[ToolSpec, ...] = (CREATE_REPO, ADD_CI, LIST_REPOS, ADD_REPO, FORGET_REPO)
+SPECS: tuple[ToolSpec, ...] = (
+    CREATE_REPO, ADD_CI, MERGE_CI_PR, LIST_REPOS, ADD_REPO, FORGET_REPO,
+)  # fmt: skip
+
+
+def summary_action(intent: Intent) -> str | None:
+    """The approval heading for a model-chosen ``merge_ci_pr``: ``merge the add-CI PR in
+    blog``, from code (the repo word is cleaned like any arg)."""
+    if intent.extension is not None or intent.tool != MERGE_CI_PR.name:
+        return None
+    repo = intent.args.get("repo")
+    return f"merge the add-CI PR in {repo}" if isinstance(repo, str) and repo.strip() else None
 
 
 def _unknown(tool: str, args: dict[str, Any], allowed: set[str]) -> None:
@@ -234,6 +272,39 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"opened": False, "text": str(e)}
         return {"opened": not pr.already, "pr_url": pr.url, "text": pr.text}
 
+    async def _merge_ci_pr(args: dict[str, Any]) -> dict[str, Any]:
+        _unknown("merge_ci_pr", args, {"repo"})
+        key = _need_str("merge_ci_pr", args, "repo", REPO_MAX)
+        got = await ready()
+        if isinstance(got, str):
+            return {"merged": False, "text": got}
+        claude, secrets = got
+        try:
+            repo, pr = await Creator(ctx.conn, claude.workspace, secrets).find_ci_pr(key)
+        except CreateError as e:
+            return {"merged": False, "text": str(e)}
+        try:
+            await claude.workspace.merge(
+                repo.name, pr.number, pr.head_sha, secrets, branch=pr.branch, starter_ci=True
+            )
+        except (MergeRefused, RunnerError, GitError) as e:
+            reason = e.message if isinstance(e, GitError) else str(e)
+            reason = Redactor(secrets.values()).text(reason)
+            return {
+                "merged": False,
+                "pr_url": pr.url,
+                "text": f"Add-CI PR #{pr.number} in {repo.name} not merged: {reason}.",
+            }
+        with atomic(ctx.conn):
+            repos_store.set_ci(ctx.conn, repo.slug, True)
+            audit(ctx.conn, "repo.ci_merged", repo=repo.slug, pr=pr.number)
+        return {
+            "merged": True,
+            "pr_url": pr.url,
+            "text": f"Merged the add-CI PR #{pr.number} in {repo.name}: its runs can merge now."
+            f"\n{pr.url}",
+        }
+
     async def _list_repos(args: dict[str, Any]) -> dict[str, Any]:
         _unknown("list_repos", args, set())
         found = repos_store.list_all(ctx.conn)
@@ -286,20 +357,24 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
                 repo = repos_store.add_alias(ctx.conn, repo.slug, alias)
             except (RepoConflict, ValueError) as e:
                 alias_error = str(e)  # the repo is registered either way: say both
+        via = f" via {resolution.via}" if resolution.via else ""
         lines = [
-            f"{'Added' if resolution.new else 'Already have'} {repo.slug} as {repo.name}"
+            f"{'Added' if resolution.new else 'Already have'} {repo.slug} as {repo.name}{via}"
             f" ({repo.mode}{'' if repo.ci is None else ', CI' if repo.ci else ', no CI'})."
         ]
         if alias_error:
             lines.append(f"Couldn't add the name: {alias_error}.")
         if resolution.warning:
             lines.append(f"Heads up: {resolution.warning}.")
+        if repo.mode == "fork":
+            lines.append("It's upstream: runs work in your fork and I ask before the PR there.")
         return {
             "added": True,
             "new": resolution.new,
             "slug": repo.slug,
             "name": repo.name,
             "warning": resolution.warning,
+            "via": resolution.via,
             "alias_error": alias_error,
             "text": " ".join(lines),
         }
@@ -324,6 +399,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
     return {
         CREATE_REPO.name: _create_repo,
         ADD_CI.name: _add_ci,
+        MERGE_CI_PR.name: _merge_ci_pr,
         LIST_REPOS.name: _list_repos,
         ADD_REPO.name: _add_repo,
         FORGET_REPO.name: _forget_repo,

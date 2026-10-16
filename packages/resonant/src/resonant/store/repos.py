@@ -228,6 +228,15 @@ def enabled_links(conn: sqlite3.Connection, extension: str) -> list[str]:
     return [r["slug"] for r in rows]
 
 
+def linking_extensions(conn: sqlite3.Connection) -> list[str]:
+    """Enabled extensions that link at least one repo, by name (``trading`` names its repo)."""
+    rows = conn.execute(
+        "SELECT DISTINCT e.name FROM repo_links l JOIN extensions e"
+        " ON e.name = l.extension COLLATE NOCASE WHERE e.status = 'enabled' ORDER BY e.name"
+    )
+    return [r["name"] for r in rows]
+
+
 def links(conn: sqlite3.Connection, extension: str) -> list[str]:
     """``owner/name`` slugs ``extension`` links (name compared case-insensitively), sorted."""
     rows = conn.execute(

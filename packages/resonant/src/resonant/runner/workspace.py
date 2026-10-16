@@ -65,7 +65,7 @@ import stat
 import tempfile
 import weakref
 from collections.abc import Callable, Generator, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -1250,13 +1250,17 @@ class Workspace:
         secrets: RunnerSecrets,
         *,
         expect_head: str | None = None,
+        allow_github: bool | None = None,
     ) -> CheckResult:
         """The checks of docs/repos-plan.md D10, on the PR as it is now: fetch its head branch
         into the mirror (with fsck: the session wrote it), then run ``run_checks`` over
         ``merge-base..head`` plus a token scan of the PR's title and body. Raises
         ``MergeRefused`` (the PR isn't mergeable as it stands) or ``CheckFailed`` (the checks
-        refuse it). With ``expect_head`` the PR must still be at that commit."""
+        refuse it). With ``expect_head`` the PR must still be at that commit.
+        ``allow_github`` overrides the repo's ``allow_github_changes`` for these checks only
+        (the add-CI merge: its one file is under ``.github/`` and is checked by hash)."""
         repo = self._repo(repo_name)
+        policy = repo if allow_github is None else replace(repo, allow_github_changes=allow_github)
         if pr_number < 1 or not re.fullmatch(r"[\w./-]+", branch) or ".." in branch:
             raise MergeRefused("bad PR reference")
         viewed = await self._gh(
@@ -1313,7 +1317,7 @@ class Workspace:
                 base_sha=merge_base,
                 head_sha=fetched,
                 branch=branch,
-                repo=repo,
+                repo=policy,
                 secrets=secrets.values(),
             )
         check_texts(secrets.values(), pr_title=title, pr_body=body)
@@ -1558,6 +1562,7 @@ class Workspace:
         *,
         branch: str,
         allow_flagged: bool = True,
+        starter_ci: bool = False,
     ) -> CheckResult:
         """Squash-merge a PR whose CI is green, only if its head is still ``head_sha``.
 
@@ -1565,14 +1570,28 @@ class Workspace:
         and put through ``check_pr`` (tokens in the history, objects, paths and the PR text;
         sensitive paths; ``.github`` changes refused unless the repo allows them), then CI,
         then ``--match-head-commit``. Returns the check result (its flagged paths are what
-        the merge reply lists). Raises ``MergeRefused``."""
+        the merge reply lists). Raises ``MergeRefused``.
+
+        ``starter_ci``: the add-CI PR (``merge_ci_pr``), stricter, not looser: the branch must
+        be an add-CI branch and the PR's whole diff the hash-checked starter workflow
+        (``adds_only_starter_ci``), whether or not the repo has CI. The checks then allow
+        ``.github/`` (whatever ``allow_github_changes`` says) but nothing may be flagged
+        except that one file, so a branch that also touched anything else is refused."""
+        from resonant.runner.create import CI_BRANCH_PREFIX, CI_PATH
+
         repo = self._repo(repo_name)
         if repo.mode == "fork":
             raise MergeRefused(upstream_merges(repo.slug))
         if not _SHA.fullmatch(head_sha) or pr_number < 1:
             raise MergeRefused("bad PR reference")
+        if starter_ci and (
+            not branch.startswith(CI_BRANCH_PREFIX)
+            or not await self._is_starter_ci_pr(repo, pr_number, head_sha, secrets)
+        ):
+            raise MergeRefused(f"PR #{pr_number} isn't only the starter CI")
         if (
-            repo.ci is False
+            not starter_ci
+            and repo.ci is False
             and not await self._recheck_ci(repo, secrets)
             and not await self._is_starter_ci_pr(repo, pr_number, head_sha, secrets)
         ):
@@ -1581,12 +1600,15 @@ class Workspace:
             )
         try:
             result = await self.check_pr(
-                repo_name, pr_number, branch, secrets, expect_head=head_sha
-            )
+                repo_name, pr_number, branch, secrets, expect_head=head_sha,
+                allow_github=True if starter_ci else None,
+            )  # fmt: skip
         except CheckFailed as e:
             raise MergeRefused(f"the checks refuse it: {e}") from None
         except GitError as e:
             raise MergeRefused(f"checking the PR failed: {e.message[-120:]}") from None
+        if starter_ci and set(result.flagged) - {CI_PATH}:
+            raise MergeRefused(f"PR #{pr_number} isn't only the starter CI")
         if result.flagged and not allow_flagged:  # an auto-merge: flagged paths wait for /merge
             raise MergeRefused(f"it changes {', '.join(result.flagged)}")
         number = str(pr_number)

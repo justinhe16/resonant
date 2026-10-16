@@ -72,13 +72,13 @@ _FEW_SHOTS: tuple[tuple[str, IntentLabel, float], ...] = (
     ("any tasks stuck waiting for approval?", "job_control", 0.9),
     ("how many jobs finished today", "job_control", 0.85),
     ("is the mini running hot? memory looks high", "system", 0.9),
-    ("is the model loaded", "system", 0.85),
     ("what can you do?", "system", 0.85),
     ("what's the latest update", "updates", 0.9),
     ("note: call the plumber about the leak", "notes", 0.9),
     ("remind me at 3 to call mom", "reminders", 0.9),
     ("restart ollama, replies are stuck", "ops", 0.9),
     ("fix the flaky test in dori and open a PR", "run_project", 0.9),
+    ("add the acme/site repo as site", "run_project", 0.85),
     ("what runs are going", "run_project", 0.85),
     ("how's R3 going", "run_project", 0.85),
     ("merge R3", "run_project", 0.85),
@@ -208,16 +208,24 @@ _INTENT_RULES: dict[IntentLabel, str] = {
         "doesn't give."
     ),
     "run_project": (
-        "For start_run, pass `repo` as the repo the message names (a short name, owner/name or a "
-        "GitHub URL) and `ask` as what the owner wants done, in their words; if the message "
-        "names no repo, don't guess: ask which repo, naming the recent ones. Pass report=now only "
-        "when the owner asks to be texted as soon as it's done. For cancel_run and "
-        "merge_run, pass the run code (like R3) from the message or the earlier replies; if you "
-        "can't tell which run, call list_runs first. Call merge_run only when the owner asks to "
-        'merge. When the owner asks for the work and also to merge it ("fix X and merge it"), '
-        "pass merge=true to start_run. When the owner answers a run's question (list_runs "
-        "shows it), call answer_worker with that run's code and the owner's words; \"tell R4 "
-        "to ...\" is message_worker. If you can't tell which run is meant, ask, naming the runs."
+        "start_run spawns a Claude worker for any job: code in a repo, ops, research, a data "
+        "fix. Pass `ask` as what the owner wants done, in their words. Pass `repo` as the repo "
+        "the message names (a short name, owner/name, a GitHub URL or an extension like "
+        "trading); leave it out when the job isn't tied to a repo (it runs in a scratch dir). "
+        "Never guess a repo the message doesn't name; if the job plainly needs one, ask which, "
+        'naming the recent ones. When the owner also asks to merge it ("fix X and merge it"), '
+        "pass merge=true. Pass report=now only when the owner asks to be texted as soon as "
+        "it's done. A repo that isn't the owner's (upstream) goes through a fork, and Resonant "
+        "asks before opening the PR there. For cancel_run and merge_run, pass the run code "
+        "(like R3) from the message or the earlier replies; if you can't tell which run, call "
+        "list_runs first. Call merge_run only when the owner asks to merge. When the owner "
+        "answers a run's question (list_runs shows it), call answer_worker with that run's code "
+        "and the owner's words; \"tell R4 to ...\" is message_worker. If you can't tell which "
+        'run is meant, ask, naming the runs. Repos: "what repos do you know" is list_repos; '
+        '"add my trading repo" is add_repo(repo=trading); "forget the old-site repo" is '
+        'forget_repo; "make a new repo called scratch" is create_repo(name=scratch), private '
+        'unless the owner says public; "add CI to blog" is add_ci(repo=blog), and merging '
+        "that CI PR is merge_ci_pr(repo=blog)."
     ),
     "rules": (
         "Trust rules decide when Claude runs ask the owner first and when Resonant texts right "

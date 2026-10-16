@@ -56,7 +56,7 @@ from resonant.runner.github_app import GitHubApp
 from resonant.runner.workspace import Workspace
 from resonant.runners import claude as claude_mod
 from resonant.runners import reaper
-from resonant.runners.claude import ClaudeRunner, Refused, Started
+from resonant.runners.claude import ClaudeRunner, Refused
 from resonant.secrets import (
     CLAUDE_TOKEN_REF,
     GITHUB_APP_KEY_REF,
@@ -785,13 +785,10 @@ async def test_fork_run_asks_external_pr_and_opens_it_on_yes(
 ) -> None:
     w = fork_world(tmp_path, resonant_home, chat, monkeypatch)
     async with running(w):
-        # /run takes registered names only (the router is EM-8's): start it as start_run does
-        started = await w.runner.start_run(
-            "github.com/up/stream", "fix the typo", "justin", report="now"
-        )
-        assert isinstance(started, Started), started
-        assert started.text.startswith("On it: R1 · stream (new repo: up/stream).")
-        assert "I'll ask before the PR." in started.text
+        # /run takes any repo the resolver does (EM-8): a URL registers it on first use
+        started = await w.say("/run github.com/up/stream fix the typo")
+        assert started.startswith("On it: R1 · stream (new repo: up/stream)."), started
+        assert "I'll ask before the PR." in started
         ask = await w.next_text()
         assert 'R1 wants to external_pr on up/stream: "+1/-0, 1 file @ ' in ask, ask
         assert ': Fix the flaky test"' in ask

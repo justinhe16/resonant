@@ -394,9 +394,103 @@ def test_owner_only_commands() -> None:
         "/runs",
         "/cancel",
         "/merge",
+        "/repos",
+        "/repo",
         "/rules",
         "/ext",
         "/pulse",
         "/kill",
         "/resume",
     }
+
+
+# --- /run and /repo (EM-8) -------------------------------------------------------------------
+
+KNOWN = {"dori", "trading", "resonant"}
+
+
+def run_ctx() -> commands.ParseContext:
+    return commands.ParseContext(is_repo=lambda w: w.lower() in KNOWN or "/" in w)
+
+
+def cmd_resolve(text: str, ctx: commands.ParseContext | None = None) -> tuple[Any, ...]:
+    name, _, rest = text.partition(" ")
+    cmd = commands.get(name)
+    assert cmd is not None
+    return cmd.resolve(rest.strip(), ctx or run_ctx())
+
+
+@pytest.mark.parametrize(
+    ("text", "args"),
+    [
+        ("dori fix the flaky test", {"repo": "dori", "ask": "fix the flaky test"}),
+        ("Trading, check the bot", {"repo": "Trading", "ask": "check the bot"}),
+        ("github.com/foo/bar fix the typo", {"repo": "github.com/foo/bar", "ask": "fix the typo"}),
+        ("foo/bar: fix it", {"repo": "foo/bar", "ask": "fix it"}),
+        ("blog: fix the footer", {"repo": "blog", "ask": "fix the footer"}),
+        ("fix the flaky test", {"ask": "fix the flaky test"}),
+        ("clean up old docker images", {"ask": "clean up old docker images"}),
+        ("dori fix it --merge", {"repo": "dori", "ask": "fix it", "merge": True}),
+        ("--merge dori fix it", {"repo": "dori", "ask": "fix it", "merge": True}),
+        ("dori use --merged flags", {"repo": "dori", "ask": "use --merged flags"}),
+    ],
+)
+def test_run_takes_an_optional_repo(text: str, args: dict[str, Any]) -> None:
+    assert cmd_resolve(f"/run {text}") == (None, "start_run", {**args, "report": "now"})
+
+
+def test_run_without_a_repo_lookup_never_takes_a_word_for_a_repo() -> None:
+    assert cmd_resolve("/run dori fix it", commands.ParseContext()) == (
+        None, "start_run", {"ask": "dori fix it", "report": "now"},
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("text", "hint"),
+    [
+        ("", None),
+        ("dori", "say what to do"),
+        ("blog:", "say what to do"),
+        ("fix it --merge", "--merge needs a repo"),
+        ("bad;name: fix", "that's not a repo name"),
+    ],
+)
+def test_run_usage(text: str, hint: str | None) -> None:
+    with pytest.raises(UsageError, match=hint):
+        cmd_resolve(f"/run {text}")
+
+
+@pytest.mark.parametrize(
+    ("text", "tool", "args"),
+    [
+        ("/repo add me/blog", "add_repo", {"repo": "me/blog"}),
+        ("/repo add https://github.com/me/blog as Blog", "add_repo",
+         {"repo": "https://github.com/me/blog", "name": "blog"}),
+        ("/repo forget old-site", "forget_repo", {"repo": "old-site"}),
+        ("/repo new scratch", "create_repo", {"name": "scratch", "private": True}),
+        ("/repo new scratch public", "create_repo", {"name": "scratch", "private": False}),
+        ("/repo ci blog", "add_ci", {"repo": "blog"}),
+        ("/repo ci blog merge", "merge_ci_pr", {"repo": "blog"}),
+        ("/repo CI blog MERGE", "merge_ci_pr", {"repo": "blog"}),
+    ],
+)  # fmt: skip
+def test_repo_subcommands(text: str, tool: str, args: dict[str, Any]) -> None:
+    _, got_tool, got_args = cmd_resolve(text)
+    assert (got_tool, got_args) == (tool, args)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/repo", "/repo add", "/repo add a b", "/repo add a as 9x", "/repo forget",
+     "/repo new", "/repo new a b", "/repo new a/b", "/repo ci", "/repo ci a now", "/repo nope x"],
+)  # fmt: skip
+def test_repo_usage(text: str) -> None:
+    with pytest.raises(UsageError):
+        cmd_resolve(text)
+
+
+def test_repo_ci_merge_is_its_own_tool() -> None:
+    cmd = commands.get("/repo")
+    assert cmd is not None
+    assert set(cmd.tools) == {"add_repo", "forget_repo", "create_repo", "add_ci", "merge_ci_pr"}
+    assert cmd_resolve("/repo ci blog merge")[0] == "ci merge"

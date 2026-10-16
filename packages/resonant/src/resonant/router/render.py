@@ -156,6 +156,28 @@ def render_reminders(d: dict[str, Any]) -> str:
     return _numbered(lines, f"Reminders ({len(lines)}):", "No reminders.")
 
 
+def _repo_line(r: dict[str, Any]) -> str:
+    ci = r.get("ci")
+    bits = [str(r.get("mode", "?"))]
+    if ci is not None:
+        bits.append("CI" if ci else "no CI")
+    source = r.get("source")
+    if isinstance(source, str) and source.startswith("extension:"):
+        bits.append(f"via {source.removeprefix('extension:')}")
+    return f"- {r.get('name', '?')} · {r.get('slug', '?')} · {', '.join(bits)}"
+
+
+def render_repos(d: dict[str, Any]) -> str:
+    """``/repos``: ``- dori · jhe/dori · push, CI``, most recently used first."""
+    repos = [r for r in (as_dict(x) for x in as_list(d.get("repos"))) if r]
+    if not repos:
+        return "No repos yet. /repo add <owner/name> adds one, or just name it in /run."
+    lines = [f"Repos ({d.get('count', len(repos))}):", *(_repo_line(r) for r in repos)]
+    if d.get("truncated") is True:
+        lines.append("+ more")
+    return "\n".join(lines)
+
+
 def render_rules(d: dict[str, Any]) -> str:
     """``/rules``: ``3. ask before merge in trading``, oldest first, then how to forget one."""
     items = [r for r in (as_dict(x) for x in as_list(d.get("rules"))) if r]

@@ -319,6 +319,7 @@ def test_levels(components: Components) -> None:
     expected = {
         "create_repo": "L2",
         "add_ci": "L2",
+        "merge_ci_pr": "L2",
         "list_repos": "L0",
         "add_repo": "L3",
         "forget_repo": "L3",
@@ -480,3 +481,120 @@ async def test_only_the_starter_ci_pr_qualifies() -> None:
     assert await ok(pr_run(content=b"on: push\n"), "me/proj", 7, HEAD) is False
     assert await ok(pr_run(head="c" * 40), "me/proj", 7, HEAD) is False  # head moved
     assert await ok(pr_run(), "me/proj", 7, "short") is False
+
+
+# --- merge_ci_pr (EM-8) --------------------------------------------------------------------
+
+CI_BRANCH = "resonant/add-ci-0badc0de"
+
+
+class MergingGh(FakeGh):
+    """``FakeGh`` plus ``Workspace.merge``, recording the call (its checks are tested in
+    ``test_runner_workspace.py``)."""
+
+    def __init__(self, rules: dict[str, Rule] | None = None) -> None:
+        super().__init__(rules)
+        self.merges: list[dict[str, Any]] = []
+        self.refuse: str | None = None
+
+    async def merge(self, repo_name: str, pr_number: int, head_sha: str, secrets: Any,
+                    **kw: Any) -> object:  # fmt: skip
+        from resonant.runner.workspace import MergeRefused
+
+        self.merges.append({"repo": repo_name, "pr": pr_number, "head": head_sha, **kw})
+        if self.refuse:
+            raise MergeRefused(self.refuse)
+        return object()
+
+
+def ci_prs(*branches: str) -> Reply:
+    items = [
+        {"number": 7 + i, "url": f"https://github.com/me/proj/pull/{7 + i}", "headRefName": b,
+         "headRefOid": SHA, "isCrossRepository": False}
+        for i, b in enumerate(branches)
+    ]  # fmt: skip
+    return (0, json.dumps(items), "")
+
+
+async def test_merge_ci_pr_tool(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    add_proj(db)
+    ws = MergingGh({"pr list": ci_prs("resonant/r3-fix", CI_BRANCH)})
+    claude.workspace = cast(Any, ws)
+    out = await call(components, "merge_ci_pr", {"repo": "proj"})
+    assert out["merged"] is True and "PR #8" in out["text"] and out["pr_url"].endswith("/8")
+    assert ws.merges == [
+        {"repo": "proj", "pr": 8, "head": SHA, "branch": CI_BRANCH, "starter_ci": True}
+    ]
+    repo = repos.find(db, "proj")
+    assert repo is not None and repo.ci is True
+
+    repos.set_ci(db, "me/proj", False)
+    ws.refuse = "CI is still running"
+    out = await call(components, "merge_ci_pr", {"repo": "proj"})
+    assert out == {
+        "merged": False,
+        "pr_url": "https://github.com/me/proj/pull/8",
+        "text": "Add-CI PR #8 in proj not merged: CI is still running.",
+    }
+    repo = repos.find(db, "proj")
+    assert repo is not None and repo.ci is False
+
+
+async def test_merge_ci_pr_needs_exactly_one_own_add_ci_pr(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    add_proj(db)
+    repos.add(db, "up/lib", base="main", source="auto", mode="fork")
+    ws = MergingGh({"pr list": ci_prs("resonant/r3-fix")})
+    claude.workspace = cast(Any, ws)
+    none = await call(components, "merge_ci_pr", {"repo": "proj"})
+    assert none["merged"] is False and "no open add-CI PR" in none["text"]
+    ws.rules["pr list"] = ci_prs(CI_BRANCH, CI_BRANCH + "x")
+    two = await call(components, "merge_ci_pr", {"repo": "proj"})
+    assert "several add-CI PRs (#7, #8)" in two["text"]
+    cross = json.dumps([{"number": 9, "url": "https://github.com/me/proj/pull/9",
+                         "headRefName": CI_BRANCH, "headRefOid": SHA,
+                         "isCrossRepository": True}])  # fmt: skip
+    ws.rules["pr list"] = (0, cross, "")
+    assert "no open add-CI PR" in (await call(components, "merge_ci_pr", {"repo": "proj"}))["text"]
+    fork = await call(components, "merge_ci_pr", {"repo": "lib"})
+    assert fork["merged"] is False and "upstream" in fork["text"]
+    unknown = await call(components, "merge_ci_pr", {"repo": "nope"})
+    assert unknown["merged"] is False and "No registered repo" in unknown["text"]
+    assert ws.merges == []
+
+
+def test_merge_ci_pr_approval_heading(components: Components) -> None:
+    from resonant.gate.types import Intent
+    from resonant.tools import repos as repos_tools
+
+    spec = components.registry.get(None, "merge_ci_pr")
+    assert spec is not None
+    intent = Intent.for_tool(spec, task_id="t", principal="owner", args={"repo": "blog"})
+    assert repos_tools.summary_action(intent) == "merge the add-CI PR in blog"
+    other = Intent.for_tool(spec.model_copy(update={"name": "add_ci"}), task_id="t",
+                            principal="owner", args={"repo": "blog"})  # fmt: skip
+    assert repos_tools.summary_action(other) is None
+
+
+async def test_add_repo_says_which_extension_linked_it(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    from datetime import UTC, datetime
+
+    from resonant.store import extensions as ext_store
+
+    ext_store.save_extension(
+        db,
+        ext_store.ExtensionRecord(
+            name="trading", source="repo:trading", commit=None, tree_digest="d",
+            manifest_sha="m", manifest={}, installed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            installed_by="owner", status="enabled",
+        ),
+    )  # fmt: skip
+    repos.set_links(db, "trading", ["me/proj"])
+    out = await call(components, "add_repo", {"repo": "trading"})
+    assert out["added"] and out["via"] == "trading"
+    assert out["text"].startswith("Added me/proj as proj via trading (push, CI).")

@@ -1711,3 +1711,68 @@ async def test_base_protected_and_base_pushes(env: Env) -> None:
     env.gh_set("activity_rc", "1")
     with pytest.raises(RunnerError, match="activity"):
         await env.ws.base_pushes("proj", SECRETS, actor="bot[bot]", since=now)
+
+
+# --- the add-CI PR (EM-8: merge_ci_pr) ---------------------------------------------------------
+
+
+async def _ci_pr(env: Env, extra: dict[str, str] | None = None) -> tuple[str, str]:
+    """An add-CI branch on the remote with the starter workflow (plus ``extra``), as PR 41."""
+    from resonant.runner.create import CI_PATH, ci_template
+
+    p = await env.prepare("R9")
+    branch = "resonant/add-ci-0badc0de"
+    git(p.workspace, "checkout", "-q", "-b", branch)
+    f = p.workspace / CI_PATH
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(ci_template())
+    env.session(p, extra or {}, "Add starter CI")
+    git(p.workspace, "push", "-q", str(env.remote), branch)
+    head = git(p.workspace, "rev-parse", "HEAD")
+    env.set_pr(branch, head, title="Add starter CI", body="Adds a pull_request workflow.")
+    return branch, head
+
+
+async def test_starter_ci_merge_allows_its_one_github_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from resonant.runner import create
+
+    env = Env(tmp_path, ci=False)
+    branch, head = await _ci_pr(env)
+    verdict = {"ci_only": True}
+
+    async def fake(run: Any, slug: str, number: int, sha: str) -> bool:
+        return verdict["ci_only"]
+
+    monkeypatch.setattr(create, "adds_only_starter_ci", fake)
+    env.gh_set("checks_rc", "0")
+    # The ordinary merge refuses it: allow_github_changes is off for this repo.
+    with pytest.raises(MergeRefused, match=r"it changes \.github/"):
+        await env.ws.merge("proj", 41, head, SECRETS, branch=branch)
+    result = await env.ws.merge("proj", 41, head, SECRETS, branch=branch, starter_ci=True)
+    assert result.flagged == (create.CI_PATH,)
+    assert len(env.gh_calls("merge")) == 1
+    verdict["ci_only"] = False
+    with pytest.raises(MergeRefused, match="isn't only the starter CI"):
+        await env.ws.merge("proj", 41, head, SECRETS, branch=branch, starter_ci=True)
+
+
+async def test_starter_ci_merge_is_stricter_not_looser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from resonant.runner import create
+
+    async def yes(run: Any, slug: str, number: int, sha: str) -> bool:
+        return True
+
+    monkeypatch.setattr(create, "adds_only_starter_ci", yes)
+    env = Env(tmp_path, ci=False)
+    branch, head = await _ci_pr(env, {"Makefile": "all:\n"})
+    env.gh_set("checks_rc", "0")
+    with pytest.raises(MergeRefused, match="isn't only the starter CI"):  # anything else flagged
+        await env.ws.merge("proj", 41, head, SECRETS, branch=branch, starter_ci=True)
+    p, run_head = await env.open_pr()  # a run's branch is never the add-CI PR
+    with pytest.raises(MergeRefused, match="isn't only the starter CI"):
+        await env.ws.merge("proj", 41, run_head, SECRETS, branch=p.branch, starter_ci=True)
+    assert env.gh_calls("merge") == []

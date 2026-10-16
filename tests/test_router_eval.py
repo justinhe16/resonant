@@ -352,7 +352,7 @@ def test_min_accuracy_exit_code(use_model: Any) -> None:
     below = _invoke("--set", str(EXAMPLE_SET))
     assert below.exit_code == 1
     assert "BELOW TARGET" in below.output
-    assert _invoke("--set", str(EXAMPLE_SET), "--min-accuracy", "0.2").exit_code == 0
+    assert _invoke("--set", str(EXAMPLE_SET), "--min-accuracy", "0.15").exit_code == 0
     assert _invoke("--set", str(EXAMPLE_SET), "--min-accuracy", "1.5").exit_code == 2
 
 

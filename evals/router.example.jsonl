@@ -74,3 +74,22 @@
 {"text": "show me my trust rules", "intent": "rules"}
 {"text": "drop rule 2", "intent": "rules"}
 {"text": "what are the rules of chess", "intent": "question"}
+{"text": "spawn a claude to build out repo XYZ", "intent": "run_project"}
+{"text": "make a new repo called scratch", "intent": "run_project"}
+{"text": "add my trading repo", "intent": "run_project"}
+{"text": "work on github.com/foo/bar: fix the typo in the README", "intent": "run_project"}
+{"text": "fix the flaky test in resonant and merge it", "intent": "run_project"}
+{"text": "do a manual db update in dori: set user 42's plan to pro", "intent": "run_project"}
+{"text": "add CI to blog", "intent": "run_project"}
+{"text": "what repos do you know", "intent": "run_project"}
+{"text": "forget the old-site repo", "intent": "run_project"}
+{"text": "create a private repo named recipes", "intent": "run_project"}
+{"text": "which repos can claude work in?", "intent": "run_project"}
+{"text": "register jhe/notes-app as notes", "intent": "run_project"}
+{"text": "stop tracking the blog repo", "intent": "run_project"}
+{"text": "merge the CI PR in blog", "intent": "run_project"}
+{"text": "have claude look into why the nightly backup script keeps failing", "intent": "run_project"}
+{"text": "get a worker to research cheap GPU hosting and report back", "intent": "run_project"}
+{"text": "set up github actions for my recipes repo", "intent": "run_project"}
+{"text": "any news on my pull requests?", "intent": "updates"}
+{"text": "spin up a worker to clean up old docker images on the mini", "intent": "run_project"}
