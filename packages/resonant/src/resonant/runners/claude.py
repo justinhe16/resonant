@@ -70,6 +70,7 @@ from resonant.loop.types import (
     Wait,
 )
 from resonant.redact import Redactor
+from resonant.runner import github_app as github_app_mod
 from resonant.runner.checks import CheckFailed, GitError
 from resonant.runner.cleanup import (
     RUN_CODE,
@@ -160,7 +161,12 @@ CHECK_CACHE = "sandbox-check.json"
 TOOL_NAMES = ("claude", "uv")
 MAX_FIX_ATTEMPTS = 3  # CI fixes the session may push after the first push
 TOKEN_REFRESH_S = 50 * 60  # installation tokens last an hour: a fresh one after 50 minutes
-REVOKE_TIMEOUT_S = 45.0  # in all: the app's own three tries and their backoff
+# in all: the app's three tries (each up to its own timeout) and the backoff between them
+REVOKE_TIMEOUT_S = (
+    github_app_mod.ATTEMPTS * github_app_mod.TIMEOUT_S
+    + github_app_mod.BACKOFF_S * (2**github_app_mod.ATTEMPTS - 1)
+    + 5.0
+)
 
 RUNNER_PROMPT = (
     "You are working in a throwaway clone of {repo}, on branch {branch}, which is already "
@@ -1285,6 +1291,15 @@ class ClaudeRunner:
                 f"the session pushed {p.branch} but opened no PR (work kept: /runs {run.code})"
             )
         self._check_stop(run.code)
+        if pr.state == "MERGED":  # the session merged it itself: no check ever ran on it
+            with contextlib.suppress(ChannelError):
+                await self.channel.send(
+                    run.principal,
+                    f"⚠ {run.code}: PR #{pr.number} was already merged, not by Resonant "
+                    f"(the session did it). Look at {self._slug(run.repo)}.",
+                    dedupe_key=f"run:{run.code}:pr-merged",
+                )
+            raise RunnerError(f"PR #{pr.number} was merged by the session, not by Resonant")
         if pr.state != "OPEN":
             raise RunnerError(f"PR #{pr.number} is {pr.state.lower()}, not open")
         if pr.base != p.base_branch:
@@ -1316,15 +1331,13 @@ class ClaudeRunner:
         return self._must_get(run.code)
 
     async def _check_base_untouched(self, w: _Work, run: Run, p: Prepared) -> None:
-        """A push straight to the base branch skips every check a merge runs (the base is
-        already live, and the checks only look at what the PR adds). Branch protection stops
-        it; without protection, the activity feed says whether the app's bot pushed there
-        during the run. If it did, the run fails, the owner is told at once and it is never
-        merged. If the feed can't be read the run fails too: it can't be shown clean."""
+        """A push (or PR merge) straight onto the base branch skips every check a merge runs
+        (the base is already live, and the checks only look at what the PR adds). Protection
+        should stop it, but a ruleset the app can bypass would not, so the activity feed is
+        always asked whether the app's bot put anything on the base during the run. If it did,
+        the run fails, the owner is told at once and it is never merged. If the feed can't be
+        read the run fails too: it can't be shown clean."""
         if self.app is None:
-            return
-        protected = await self.workspace.base_protected(run.repo, w.secrets)
-        if protected is True:
             return
         try:
             bot = await self.app.bot_login()

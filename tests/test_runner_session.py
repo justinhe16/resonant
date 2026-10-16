@@ -614,12 +614,47 @@ async def test_a_direct_push_to_the_base_fails_the_run_and_tells_the_owner(
     assert h.prs() == [] or h.run().pr_number is None  # nothing was recorded as ready
 
 
-async def test_base_activity_is_not_asked_when_the_base_is_protected(h: Harness) -> None:
+async def test_the_feed_is_checked_even_when_the_base_is_protected(h: Harness) -> None:
+    """A ruleset the app can bypass would let a direct push through while `protected` is true."""
     (h.gh_dir / "activity.json").write_text(json.dumps([push_event("ab" * 20)]))
     await h.start()
-    await h.drain()  # protected (the default): the feed is not consulted
-    assert h.run().status == "ready"
-    assert [c for c in h.gh_calls("api") if "/activity" in c["argv"][1]] == []
+    await h.drain()  # protected is the default in the fake
+    run = h.run()
+    assert run.status == "failed" and "pushed directly to main" in (run.failure or "")
+    assert h.chan.texts()[0].startswith("⚠ R1 pushed directly to main: abababa.")
+
+
+async def test_a_pr_merge_onto_the_base_by_the_bot_is_a_violation(h: Harness) -> None:
+    event = push_event("cd" * 20) | {"activity_type": "pr_merge"}
+    (h.gh_dir / "activity.json").write_text(json.dumps([event]))
+    await h.start()
+    await h.drain()
+    assert h.run().status == "failed" and "pushed directly to main" in (h.run().failure or "")
+
+
+async def test_a_pr_the_session_merged_itself_fails_loudly_and_is_never_resonants(
+    h: Harness,
+) -> None:
+    from dataclasses import replace
+
+    await h.start()
+    real = h.ws.find_pr
+
+    async def merged(*a: Any, **k: Any) -> Any:
+        found = await real(*a, **k)
+        assert found is not None
+        return replace(found, state="MERGED")
+
+    h.ws.find_pr = merged  # type: ignore[method-assign]
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed" and "merged by the session, not by Resonant" in (
+        run.failure or ""
+    )
+    assert h.chan.texts()[0].startswith("⚠ R1: PR #41 was already merged, not by Resonant")
+    res = await h.runner.merge_run("R1")
+    assert isinstance(res, Refused) and h.gh_calls("merge") == []
+    assert run.status != "merged"
 
 
 async def test_an_unprotected_base_with_a_clean_feed_runs_normally(
@@ -631,8 +666,9 @@ async def test_an_unprotected_base_with_a_clean_feed_runs_normally(
     await h.start()
     await h.drain()
     assert h.run().status == "ready"
-    [lookup] = [c for c in h.gh_calls("api") if "/activity" in c["argv"][1]]
-    assert "ref=refs/heads/main" in lookup["argv"][1]
+    lookups = [c for c in h.gh_calls("api") if "/activity" in c["argv"][1]]
+    assert len(lookups) == 4  # push, force_push, branch_deletion, pr_merge
+    assert all("ref=refs/heads/main" in c["argv"][1] for c in lookups)
     assert h.api.requests.count(("GET", "/app")) == 1  # the bot's login, asked once
 
 

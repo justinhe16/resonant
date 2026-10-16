@@ -132,7 +132,7 @@ def encode_value(value: str) -> str:
     ``security find-generic-password -w`` shows it); anything else (spaces, quotes, newlines)
     is base64 behind ``ENCODED_PREFIX``, which keeps it on one line and out of the way of
     ``security -i``'s own parsing. ``SecretStore.get`` undoes it."""
-    if _PLAIN.fullmatch(value) and not value.startswith(ENCODED_PREFIX):
+    if _PLAIN.fullmatch(value) and not value.startswith((ENCODED_PREFIX, "-")):  # "-": an option
         return value
     return ENCODED_PREFIX + base64.b64encode(value.encode()).decode()
 

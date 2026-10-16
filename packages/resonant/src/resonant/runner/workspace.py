@@ -50,7 +50,8 @@ from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
+from urllib.parse import quote
 
 from resonant.config import RunnerConfig
 from resonant.redact import Redactor
@@ -83,7 +84,7 @@ _PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _ERR_CLIP = 300
 CREDS_DIR = "creds"
-_PUSH_KINDS = ("push", "force_push", "branch_deletion")
+_PUSH_KINDS = ("push", "force_push", "branch_deletion", "pr_merge")
 _PR_FIELDS = "state,headRefName,headRefOid,baseRefName,isCrossRepository,title,body"
 
 # Run inside the sandbox: commit anything left over, then bundle base..branch.
@@ -908,29 +909,35 @@ class Workspace:
     async def base_pushes(
         self, repo_name: str, secrets: RunnerSecrets, *, actor: str, since: datetime
     ) -> list[str]:
-        """The commits ``actor`` (the app's bot) pushed straight to the base branch since
-        ``since``: the ``after`` sha of each push and force-push in the repo's activity feed.
-        Raises ``RunnerError`` when the feed can't be read."""
+        """The commits ``actor`` (the app's bot) put on the base branch since ``since``: the
+        ``after`` sha of each push, force-push, branch deletion and PR merge in the repo's
+        activity feed. One query per activity type, filtered by actor on GitHub's side, so a
+        busy branch can't push the bot's event out of the first page. Raises ``RunnerError``
+        when the feed can't be read or an event can't be understood: it can't be shown clean."""
         repo = self._repo(repo_name)
-        res = await self._gh(
-            ["api", f"repos/{repo.slug}/activity?ref=refs/heads/{repo.base}&per_page=100"], secrets
-        )
-        if res.returncode != 0:
-            raise RunnerError(f"couldn't read {repo.base}'s activity: {res.stderr[-120:]}")
-        try:
-            events: list[Any] = json.loads(res.stdout)
-        except ValueError:
-            raise RunnerError(f"{repo.base}'s activity couldn't be read") from None
         found: list[str] = []
-        for event in events:
+        for kind in _PUSH_KINDS:
+            query = (
+                f"ref=refs/heads/{repo.base}&actor={quote(actor)}&activity_type={kind}&per_page=100"
+            )
+            res = await self._gh(["api", f"repos/{repo.slug}/activity?{query}"], secrets)
+            if res.returncode != 0:
+                raise RunnerError(f"couldn't read {repo.base}'s activity: {res.stderr[-120:]}")
             try:
-                login = str(event["actor"]["login"])
-                when = datetime.fromisoformat(str(event["timestamp"]))
-                kind, after = str(event["activity_type"]), str(event["after"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if login.lower() == actor.lower() and when >= since and kind in _PUSH_KINDS:
-                found.append(after if _SHA.fullmatch(after) else "?")
+                events = json.loads(res.stdout)
+            except ValueError:
+                events = None
+            if not isinstance(events, list):
+                raise RunnerError(f"{repo.base}'s activity couldn't be read")
+            for event in cast(list[Any], events):
+                try:
+                    login = str(event["actor"]["login"])
+                    when = datetime.fromisoformat(str(event["timestamp"]))
+                    event_kind, after = str(event["activity_type"]), str(event["after"])
+                except (KeyError, TypeError, ValueError):
+                    raise RunnerError(f"{repo.base}'s activity couldn't be read") from None
+                if login.lower() == actor.lower() and when >= since and event_kind in _PUSH_KINDS:
+                    found.append(after if _SHA.fullmatch(after) else "?")
         return list(dict.fromkeys(found))
 
     # -- what the session left --

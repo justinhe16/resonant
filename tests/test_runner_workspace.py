@@ -1597,13 +1597,33 @@ async def test_base_protected_and_base_pushes(env: Env) -> None:
         ev("a" * 40, "push", "bot[bot]", now),  # a repeat
         ev("c" * 40, "push", "someone", now),
         ev("d" * 40, "push", "bot[bot]", now - timedelta(hours=2)),
-        ev("e" * 40, "pr_merge", "bot[bot]", now),
-        {"junk": True},
+        ev("e" * 40, "pr_merge", "bot[bot]", now),  # a merge onto base counts too
+        ev("f" * 40, "branch_creation", "bot[bot]", now),
     ]))  # fmt: skip
     found = await env.ws.base_pushes(
         "proj", SECRETS, actor="bot[bot]", since=now - timedelta(hours=1)
     )
-    assert found == ["a" * 40, "b" * 40]
+    assert found == ["a" * 40, "b" * 40, "e" * 40]
+    # one query per type, filtered by actor on GitHub's side (a busy branch can't hide it)
+    queries = [
+        c["argv"][1]
+        for c in env.gh_calls()
+        if c["argv"][0] == "api" and "/activity" in c["argv"][1]
+    ]
+    assert len(queries) == 4
+    assert all("actor=bot%5Bbot%5D" in q and "ref=refs/heads/main" in q for q in queries)
+    assert {q.split("activity_type=")[1].split("&")[0] for q in queries} == {
+        "push",
+        "force_push",
+        "branch_deletion",
+        "pr_merge",
+    }
+    # anything it can't read fails closed
+    odd = ev("a" * 40, "push", "bot[bot]", now) | {"timestamp": "yesterday"}
+    for bad in ('{"message": "nope"}', "not json", json.dumps([{"junk": True}]), json.dumps([odd])):
+        env.gh_set("activity.json", bad)
+        with pytest.raises(RunnerError, match="activity couldn't be read"):
+            await env.ws.base_pushes("proj", SECRETS, actor="bot[bot]", since=now)
     env.gh_set("activity_rc", "1")
     with pytest.raises(RunnerError, match="activity"):
         await env.ws.base_pushes("proj", SECRETS, actor="bot[bot]", since=now)

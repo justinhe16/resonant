@@ -607,3 +607,21 @@ def test_cli_set_from_file_errors(keychain: FakeKeychain, tmp_path: Path) -> Non
     big.write_text("x" * 5000)
     code, out = run("set", "runner/github_app_key", "--from-file", str(big))
     assert code == 2 and "too long" in out and keychain.calls == []
+
+
+def test_a_plain_value_that_starts_with_a_dash_is_encoded() -> None:
+    """In `security -i` a leading "-" would read as an option."""
+    stored = encode_value("-w-looks-like-an-option")
+    assert stored.startswith("resonant-b64:") and decode_value(stored) == "-w-looks-like-an-option"
+    assert b" -w -w-looks" not in add_command("github/token", "-w-looks-like-an-option")
+    assert encode_value("not-a-dash-first") == "not-a-dash-first"
+
+
+def test_the_revoke_timeout_covers_all_three_tries_and_their_backoff() -> None:
+    from resonant.runner import github_app
+    from resonant.runners import claude
+
+    floor = github_app.ATTEMPTS * github_app.TIMEOUT_S + github_app.BACKOFF_S * (
+        2**github_app.ATTEMPTS - 1
+    )
+    assert floor < claude.REVOKE_TIMEOUT_S
