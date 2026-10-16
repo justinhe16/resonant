@@ -796,6 +796,12 @@ class ClaudeRunner:
 
     async def setup_missing(self) -> str | None:
         """``The runner isn't set up: …`` naming exactly what is missing, or None."""
+        missing, how = await self.setup_gaps()
+        return not_set_up_text(missing, how) if missing else None
+
+    async def setup_gaps(self) -> tuple[list[str], list[str]]:
+        """What the runner still needs and how to fix each; both empty when it is set up.
+        Secrets are checked by name only (no value is read)."""
         missing: list[str] = []
         how: list[str] = []
         try:
@@ -819,7 +825,7 @@ class ClaudeRunner:
         if self._claude_cmd is None and resolve_tool("claude") is None:
             missing.append("the claude CLI isn't installed")
             how.append("install Claude Code")
-        return not_set_up_text(missing, how) if missing else None
+        return missing, how
 
     async def start_run(
         self,

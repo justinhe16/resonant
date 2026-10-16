@@ -398,7 +398,7 @@ def test_member_denied_global_builtins(db: sqlite3.Connection, components: Compo
 
 async def test_api_tools(state: DaemonState, components: Components) -> None:
     transport = httpx.ASGITransport(app=create_app(state))
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         tools = (await client.get("/api/tools")).json()
     assert {t["name"] for t in tools} == NAMES
     lt = next(t for t in tools if t["name"] == "list_tasks")
@@ -414,7 +414,7 @@ async def test_api_tools(state: DaemonState, components: Components) -> None:
 
 async def test_api_tools_without_components(state: DaemonState) -> None:
     transport = httpx.ASGITransport(app=create_app(state))
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         assert (await client.get("/api/tools")).json() == []
 
 

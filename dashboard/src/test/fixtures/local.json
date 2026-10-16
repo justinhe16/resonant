@@ -1,0 +1,183 @@
+{
+  "schema": 1,
+  "tier": "local",
+  "taken_at": "2026-10-16T09:00:00+00:00",
+  "version": "3ef397a1",
+  "started_at": "2026-10-15T21:14:00+00:00",
+  "last_tick": "2026-10-16T08:59:58+00:00",
+  "autonomy": "on",
+  "paused": false,
+  "dry_run": false,
+  "health": [
+    { "name": "loop", "state": "ok", "since": "2026-10-15T21:14:05+00:00", "reason": null },
+    { "name": "model", "state": "ok", "since": "2026-10-15T21:14:20+00:00", "reason": null },
+    {
+      "name": "imessage",
+      "state": "degraded",
+      "since": "2026-10-16T08:41:00+00:00",
+      "reason": "self-test timed out after 90s"
+    },
+    { "name": "store", "state": "ok", "since": "2026-10-15T21:14:05+00:00", "reason": null },
+    { "name": "ext:github", "state": "unknown", "since": null, "reason": "no run yet" }
+  ],
+  "tasks": { "by_state": { "running": 2, "waiting": 1, "done": 41, "failed": 2 } },
+  "slots": { "used": 2, "max": 5 },
+  "runs": {
+    "by_state": { "running": 1, "waiting": 1, "ready": 1, "merged": 6, "failed": 1 },
+    "items": [
+      {
+        "code": "R12",
+        "state": "running",
+        "repo": "resonant",
+        "ask": "Add a dashboard job to CI that rebuilds the UI and fails if dist differs",
+        "branch": "r12-dashboard-ci",
+        "pr_url": null,
+        "pr_number": null,
+        "started_at": "2026-10-16T08:47:00+00:00",
+        "ended_at": null,
+        "waiting_reason": null,
+        "last_note": "Lint and typecheck pass; writing the workflow step now"
+      },
+      {
+        "code": "R11",
+        "state": "waiting",
+        "repo": "trading-bot",
+        "ask": "Bump the exchange client and rerun the backtest",
+        "branch": "r11-bump-client",
+        "pr_url": null,
+        "pr_number": null,
+        "started_at": "2026-10-16T07:30:00+00:00",
+        "ended_at": null,
+        "waiting_reason": "question",
+        "last_note": null
+      },
+      {
+        "code": "R10",
+        "state": "ready",
+        "repo": "resonant",
+        "ask": "Fix the flaky pulse quiet-hours test",
+        "branch": "r10-quiet-hours",
+        "pr_url": "https://github.com/example/resonant/pull/81",
+        "pr_number": 81,
+        "started_at": "2026-10-16T06:02:00+00:00",
+        "ended_at": "2026-10-16T06:40:00+00:00",
+        "waiting_reason": null,
+        "last_note": "CI green"
+      },
+      {
+        "code": "R9",
+        "state": "failed",
+        "repo": "notes",
+        "ask": "Migrate the notes export to the new schema",
+        "branch": null,
+        "pr_url": null,
+        "pr_number": null,
+        "started_at": "2026-10-15T22:10:00+00:00",
+        "ended_at": "2026-10-15T22:31:00+00:00",
+        "waiting_reason": null,
+        "last_note": "Session hit the usage limit twice; gave up"
+      }
+    ]
+  },
+  "approvals": {
+    "open": 1,
+    "items": [
+      {
+        "code": "K7Q2",
+        "summary": "merge_pr github: example/resonant#81",
+        "level": "L1",
+        "asked_at": "2026-10-16T08:50:00+00:00",
+        "expires_at": "2026-10-16T09:50:00+00:00"
+      }
+    ]
+  },
+  "questions": {
+    "open": 1,
+    "items": [
+      {
+        "run_code": "R11",
+        "text": "The new client drops Python 3.11. Bump the runtime too, or pin the old client?",
+        "options": ["bump runtime", "pin old client"],
+        "asked_at": "2026-10-16T08:12:00+00:00"
+      }
+    ]
+  },
+  "pulse": {
+    "open": 3,
+    "items": [
+      {
+        "source": "github",
+        "key": "pr/81",
+        "title": "PR #81 is green and waiting for you",
+        "urgency": "normal",
+        "state": "new",
+        "updated_at": "2026-10-16T08:40:00+00:00"
+      },
+      {
+        "source": "core",
+        "key": "run/R11",
+        "title": "R11 asked a question",
+        "urgency": "urgent",
+        "state": "new",
+        "updated_at": "2026-10-16T08:12:00+00:00"
+      },
+      {
+        "source": "weather",
+        "key": "umbrella",
+        "title": "Rain after 4pm",
+        "urgency": "low",
+        "state": "told",
+        "updated_at": "2026-10-16T06:00:00+00:00"
+      }
+    ]
+  },
+  "extensions": [
+    {
+      "name": "github",
+      "status": "enabled",
+      "health": "ok",
+      "jobs": [
+        {
+          "id": "watch",
+          "next_due": "2026-10-16T09:05:00+00:00",
+          "last_run_at": "2026-10-16T08:55:00+00:00",
+          "last_outcome": "ok",
+          "fail_streak": 0
+        },
+        {
+          "id": "digest",
+          "next_due": "2026-10-17T08:00:00+00:00",
+          "last_run_at": "2026-10-16T08:00:00+00:00",
+          "last_outcome": "ok",
+          "fail_streak": 0
+        }
+      ]
+    },
+    {
+      "name": "weather",
+      "status": "enabled",
+      "health": "degraded",
+      "jobs": [
+        {
+          "id": "forecast",
+          "next_due": "2026-10-16T10:00:00+00:00",
+          "last_run_at": "2026-10-16T08:00:00+00:00",
+          "last_outcome": "failed",
+          "fail_streak": 2
+        }
+      ]
+    },
+    { "name": "notes-sync", "status": "disabled", "health": "unknown", "jobs": [] }
+  ],
+  "runner": { "set_up": true, "missing": [] },
+  "trust_rules": [
+    { "n": 1, "text": "allow push on resonant" },
+    { "n": 2, "text": "ask merge on trading" },
+    { "n": 3, "text": "notify failed now" }
+  ],
+  "repos": [
+    { "name": "resonant", "mode": "push", "base": "main", "ci": true },
+    { "name": "trading-bot", "mode": "push", "base": "main", "ci": false },
+    { "name": "upstream-lib", "mode": "fork", "base": "develop", "ci": null }
+  ]
+}

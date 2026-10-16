@@ -130,7 +130,9 @@ async def test_components_merge_handlers_and_api_shows_specs(
     assert any(s.name == "get_time" for s in chat)
     assert not any(s.name == "job_long_job" for s in chat)
     app = create_app(state)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as h:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as h:
         tools = (await h.get("/api/tools")).json()
     ext = {t["name"]: t for t in tools if t["extension"] == "example"}
     assert set(ext) == {"get_time", "write_note", "job_long_job"}

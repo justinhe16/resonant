@@ -39,8 +39,10 @@ class _Section(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _is_loopback(host: str) -> bool:
-    if host == "localhost":
+def is_loopback(host: str) -> bool:
+    """``host`` (a name or an IP, no port or brackets) is ``localhost`` or a loopback IP.
+    The API's request guard uses the same rule (``api.LoopbackOnly``)."""
+    if host.lower() == "localhost":
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
@@ -64,7 +66,7 @@ class ModelConfig(_Section):
     @classmethod
     def _local_model(cls, v: str) -> str:
         # The Ollama LaunchAgent listens on this host; it must never be reachable off-box.
-        if not _is_loopback(urlparse(v).hostname or ""):
+        if not is_loopback(urlparse(v).hostname or ""):
             raise ValueError("model.base_url must point at a loopback host")
         return v
 
@@ -77,7 +79,7 @@ class ApiConfig(_Section):
     @classmethod
     def _loopback_only(cls, v: str) -> str:
         # No public ports: remote status is planned via the push-only status relay.
-        if not _is_loopback(v):
+        if not is_loopback(v):
             raise ValueError("api.host must be a loopback address")
         return v
 

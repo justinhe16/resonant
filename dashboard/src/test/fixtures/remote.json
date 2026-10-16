@@ -1,0 +1,114 @@
+{
+  "schema": 1,
+  "tier": "remote",
+  "taken_at": "2026-10-16T09:00:00+00:00",
+  "version": "3ef397a1",
+  "started_at": "2026-10-15T21:14:00+00:00",
+  "last_tick": "2026-10-16T08:59:58+00:00",
+  "autonomy": "on",
+  "paused": false,
+  "dry_run": false,
+  "health": [
+    {
+      "name": "loop",
+      "state": "ok",
+      "since": "2026-10-15T21:14:05+00:00"
+    },
+    {
+      "name": "model",
+      "state": "ok",
+      "since": "2026-10-15T21:14:20+00:00"
+    },
+    {
+      "name": "imessage",
+      "state": "degraded",
+      "since": "2026-10-16T08:41:00+00:00"
+    },
+    {
+      "name": "store",
+      "state": "ok",
+      "since": "2026-10-15T21:14:05+00:00"
+    },
+    {
+      "name": "ext:github",
+      "state": "unknown",
+      "since": null
+    }
+  ],
+  "tasks": {
+    "by_state": {
+      "running": 2,
+      "waiting": 1,
+      "done": 41,
+      "failed": 2
+    }
+  },
+  "slots": {
+    "used": 2,
+    "max": 5
+  },
+  "runs": {
+    "by_state": {
+      "running": 1,
+      "waiting": 1,
+      "ready": 1,
+      "merged": 6,
+      "failed": 1
+    }
+  },
+  "approvals": {
+    "open": 1
+  },
+  "questions": {
+    "open": 1
+  },
+  "pulse": {
+    "open": 3
+  },
+  "extensions": [
+    {
+      "name": "github",
+      "status": "enabled",
+      "health": "ok",
+      "jobs": [
+        {
+          "id": "watch",
+          "next_due": "2026-10-16T09:05:00+00:00",
+          "last_run_at": "2026-10-16T08:55:00+00:00",
+          "last_outcome": "ok",
+          "fail_streak": 0
+        },
+        {
+          "id": "digest",
+          "next_due": "2026-10-17T08:00:00+00:00",
+          "last_run_at": "2026-10-16T08:00:00+00:00",
+          "last_outcome": "ok",
+          "fail_streak": 0
+        }
+      ]
+    },
+    {
+      "name": "weather",
+      "status": "enabled",
+      "health": "degraded",
+      "jobs": [
+        {
+          "id": "forecast",
+          "next_due": "2026-10-16T10:00:00+00:00",
+          "last_run_at": "2026-10-16T08:00:00+00:00",
+          "last_outcome": "failed",
+          "fail_streak": 2
+        }
+      ]
+    },
+    {
+      "name": "notes-sync",
+      "status": "disabled",
+      "health": "unknown",
+      "jobs": []
+    }
+  ],
+  "runner": {
+    "set_up": true
+  }
+}
