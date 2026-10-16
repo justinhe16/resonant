@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -424,7 +425,7 @@ async def test_prepare_rebuilds_leftovers_and_failure_cleans_up(env: Env) -> Non
     assert (env.root / "seed").exists()  # the symlink target was not followed
     assert git(env.checkout, "worktree", "list", "--porcelain").count("worktree ") == 2
     env.conn.execute("UPDATE repos SET base = 'nope'")
-    with pytest.raises(RunnerError, match="fetching nope of own/proj failed"):
+    with pytest.raises(RunnerError, match=r"nope isn.t a branch of proj"):
         await env.prepare("R2")
     assert not (env.cfg.work_dir / "R2").exists() and not env.worktree("R2").exists()
 
@@ -601,10 +602,11 @@ async def test_a_run_branch_the_owner_moved_or_checked_out_is_kept(env: Env) -> 
 async def test_a_failed_clone_leaves_nothing_in_the_way(env: Env) -> None:
     real = env.remote
     env.remote = env.root / "missing.git"
-    with pytest.raises(RunnerError, match="cloning own/proj failed"):
+    with pytest.raises(RunnerError, match="of own/proj failed"):
         await env.prepare("R1")
     assert not env.checkout.exists()
-    assert [n for n in os.listdir(env.cfg.code_dir) if n.startswith(".proj")] == []
+    code = env.cfg.code_dir
+    assert not code.exists() or [n for n in os.listdir(code) if n.startswith(".proj")] == []
     env.remote = real
     p = await env.prepare("R2")
     assert (p.workspace / "README.md").exists()
@@ -706,6 +708,51 @@ async def test_planted_checkout_config_and_hooks_never_run_as_the_daemon(env: En
     await env.ws.remove_workspace("R2", workspace=second.workspace, checkout=second.checkout,
                                   branch=second.branch)  # fmt: skip
     assert not marker.exists()
+
+
+async def test_a_planted_smudge_filter_runs_only_under_the_guard(
+    env: Env, resonant_home: Path
+) -> None:
+    """EM-3 (S2): a worker can write its checkout's config. A filter there runs only inside
+    the thin guard (as the worker could run it anyway), never as the daemon: it can't write
+    Resonant's state."""
+    seed = env.root / "seed"
+    (seed / ".gitattributes").write_text("*.txt filter=evil\n")
+    (seed / "a.txt").write_text("a\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "attributes")
+    git(seed, "push", "-q", str(env.remote), "main")
+    await env.prepare("R1")
+    ran, daemon_only = env.root / "filter-ran", resonant_home / "filter-pwned"
+    git(env.checkout, "config", "filter.evil.smudge", f"touch {ran}; touch {daemon_only}; cat")
+    git(env.checkout, "config", "core.alternateRefsCommand", f"touch {daemon_only}; true")
+    git(env.checkout, "config", "core.askPass", f"touch {daemon_only}")
+    p = await env.prepare("R2")
+    assert (p.workspace / "a.txt").read_text() == "a\n"
+    assert ran.exists()  # it ran, in the guard
+    assert not daemon_only.exists()  # never as the daemon
+
+
+async def test_every_git_in_a_checkout_goes_through_the_guard(env: Env) -> None:
+    guarded: list[list[str]] = []
+
+    def guard(argv: Sequence[str]) -> Sequence[str]:
+        guarded.append(list(argv))
+        return argv
+
+    env.ws = Workspace(env.cfg, env.conn, url_for=lambda repo: str(env.remote), guard=guard)
+    p = await env.prepare("R1")
+    await env.ws.remove_workspace("R1", workspace=p.workspace, checkout=p.checkout,
+                                  branch=p.branch, expect=p.base_sha)  # fmt: skip
+    seen = {" ".join(c[1:]) for c in guarded}
+    places = (str(env.checkout), str(p.workspace))
+    for line in env.shim_log.read_text().splitlines():
+        if any(line.startswith(f"-C {place} ") for place in places):
+            assert line in seen, f"unguarded git in a checkout: {line}"
+    assert any("worktree add" in s and "--no-checkout" in s for s in seen)
+    assert any(s.startswith(f"-C {p.workspace} reset -q --hard") for s in seen)
+    assert not any("worktree remove" in s for s in seen)
+    assert all(GH_TOKEN not in s for s in seen)
 
 
 async def test_mirror_picks_up_new_remote_commits(env: Env) -> None:

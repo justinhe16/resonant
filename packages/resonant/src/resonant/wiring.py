@@ -279,6 +279,9 @@ def build_imessage_stack(
         max_runs=max(1, settings.claude.max_concurrent - settings.claude.reserved_oncall_slots),
         create_task=loop.create_task,
         cancel_task=loop.cancel,
+        # answers and owner messages wake a run's task through the loop (EM-3). `resonant
+        # check` asks the owner every time until EM-4's TrustChecks is passed as `trust=`.
+        submit=loop.submit,
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude

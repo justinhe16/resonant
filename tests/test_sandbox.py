@@ -544,3 +544,75 @@ def test_cached_self_check_caches_passes_not_failures(ctx: ProbeContext, tmp_pat
 
 
 _DETAIL = "~/.resonant and daemon writes, keychain lookup and API port denied"
+
+
+# --- the worker CLI's control dirs (EM-3) ----------------------------------------------------
+
+_CLIENT = """
+import socket, sys
+for path in sys.argv[1:]:
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.connect(path)
+        print("ok", flush=True)
+    except OSError:
+        print("denied", flush=True)
+"""
+
+
+@on_mac
+def test_a_session_reaches_only_its_own_control_dir(tmp_path: Path) -> None:
+    """Real sandbox-exec: the session connects to its own run's sockets and reads its own
+    token; another run's socket, token and control dir are out of reach, and no control dir
+    is writable (so no run can stand in for the daemon on another's socket)."""
+    import shutil
+    import socket
+    import subprocess
+    import tempfile
+
+    short = Path(tempfile.mkdtemp(prefix="ctl", dir="/private/tmp"))  # sun_path is short
+    try:
+        work = short / "w"
+        own, other = work / ".ctl" / "R1", work / ".ctl" / "R2"
+        for d in (own, other, work / "R1" / "tmp", work / "R2" / "tmp"):
+            d.mkdir(parents=True)
+        (own / "token").write_text("mine")
+        (other / "token").write_text("theirs")
+        paths = [own / "sock", other / "sock", work / "R1" / "tmp" / "s", work / "R2" / "tmp" / "s"]
+        servers: list[socket.socket] = []
+        for p in paths:
+            srv = socket.socket(socket.AF_UNIX)
+            srv.bind(str(p))
+            srv.listen(4)
+            servers.append(srv)
+        params = SandboxParams(
+            run_dir=work / "R1", cache_dir=work / ".cache", secrets_dir=short / "secrets",
+            work_dir=work, ctl_root=work / ".ctl", ctl_dir=own, protect=(),
+        )  # fmt: skip
+        argv = wrap([sys.executable, "-I", "-c", _CLIENT, *map(str, paths)], params)
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        assert out.stdout.split() == ["ok", "denied", "ok", "denied"], out.stderr
+        shell = f"cat {own}/token; cat {other}/token; : > {own}/x; mv {other} {other}x"
+        out = subprocess.run(wrap(["/bin/sh", "-c", shell], params), capture_output=True,
+                             text=True, timeout=60)  # fmt: skip
+        assert out.stdout == "mine"
+        assert not (own / "x").exists() and other.exists()
+        for srv in servers:
+            srv.close()
+    finally:
+        shutil.rmtree(short, ignore_errors=True)
+
+
+def test_the_control_dir_defs_stay_out_of_the_profile_hash(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    work = tmp_path / "work"
+    base = params_in(tmp_path, work_dir=work, ctl_root=work / ".ctl", ctl_dir=work / ".ctl" / "R1")
+    other = replace(base, run_dir=work / "R2", ctl_dir=work / ".ctl" / "R2")
+    assert profile_hash(base) == profile_hash(other)
+    text, defs = render(base)
+    assert defs["CTL_OWN"].endswith("/.ctl/R1") and "remote unix-socket" in text
+    with pytest.raises(SandboxError, match="go together"):
+        render(replace(base, ctl_dir=None))
+    with pytest.raises(SandboxError, match="isn't a control dir"):
+        render(replace(base, ctl_dir=tmp_path / "x"))

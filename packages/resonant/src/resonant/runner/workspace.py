@@ -27,8 +27,9 @@ Trust rules this module keeps:
   ``gh`` through a ``hosts.yml`` in its own ``GH_CONFIG_DIR``. The token is never in a remote
   URL.
 - Every daemon git command runs with ``GIT_CONFIG_NOSYSTEM=1``, ``GIT_CONFIG_GLOBAL=/dev/null``,
-  ``core.hooksPath=/dev/null``, no inherited credential helper and an absolute git binary; in a
-  checkout also with fsmonitor, auto-gc and submodule recursion off. The committer comes from
+  ``core.hooksPath=/dev/null``, no askpass, no inherited credential helper and an absolute git
+  binary; in a checkout also under the guard, with fsmonitor, auto-gc and submodule recursion
+  off. The committer comes from
   the environment, never from a config file.
 - The pre-merge checks read the bare mirror (``runner.mirror_dir``), which only the daemon
   writes, never a checkout: a worker can write its checkout's ``.git`` (config, refs, objects),
@@ -39,12 +40,13 @@ Trust rules this module keeps:
   ``gh/hosts.yml``. It is never in env or argv. The daemon writes there only through
   directory fds with ``O_NOFOLLOW`` and ``rename``, so a link planted by the session can't
   redirect a write.
-- Accepted risk: a worker can write its checkout's ``.git`` (it must, to commit): hooks the
-  owner's git runs, the owner's refs, and config the daemon's git still reads (a smudge filter
-  on the next ``worktree add``, ``http.*`` settings on the daemon's token-carrying fetch).
-  Daemon git there overrides hooks, fsmonitor, ``sshCommand``, gc and protocols; the rest is
-  the honor-system trust of docs/employee-plan.md D4 (the thin guard, D2, protects Resonant,
-  not checkouts).
+- A worker can write its checkout's ``.git`` (it must, to commit): its hooks, refs and config.
+  So the daemon's token goes only to the mirror's fetch; the base sha, CI and tracked names are
+  read from the mirror; and every git command in a checkout or worktree runs tokenless under
+  the thin guard (``guard``, EM-3), so a filter, hook or URL rewrite planted there runs as the
+  worker could, never as the daemon. ``worktree add`` is ``--no-checkout``; the checkout itself
+  is a guarded ``reset --hard``. The owner's own git in the checkout still trusts it: that is
+  the honor-system trust of docs/employee-plan.md D4.
 - Branch hygiene: a run's ``resonant/…`` branch is deleted only by compare-and-delete against
   the sha the run left, and never while a worktree has it checked out.
 """
@@ -121,6 +123,8 @@ _CHECKOUT_CONFIG = (
     ("protocol.allow", "never"),
     ("protocol.https.allow", "always"),
     ("protocol.file.allow", "always"),
+    ("core.askPass", ""),
+    ("core.pager", "cat"),
     *_INSTEAD_OF,
 )
 _GITHUB_REMOTE = re.compile(
@@ -244,6 +248,7 @@ def git_env(helper: Path | None = None, extra: Sequence[tuple[str, str]] = ()) -
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",  # set but empty: no core.askPass program is ever run
         **_config_env(config),
         **committer_env(),
     }
@@ -548,13 +553,36 @@ class Workspace:
         conn: sqlite3.Connection,
         *,
         url_for: Callable[[Repo], str] | None = None,
+        guard: Callable[[Sequence[str]], Sequence[str]] | None = None,
     ) -> None:
+        """``guard`` wraps every git command run in a checkout (whose ``.git`` a worker can
+        write) so it runs under the thin guard (EM-3): by default ``sandbox.wrap``."""
         self.cfg = cfg
         self.conn = conn  # the repo registry (store.repos)
         # The git URL of a repo. Always https without credentials; tests point it at a path.
         self._url_for: Callable[[Repo], str] = url_for or _https_url
         self._locks: dict[str, asyncio.Lock] = {}
         self._git_bin = str(cfg.git_path)
+        self._guard = guard or self._sandbox_guard
+        self._guard_prefix: list[str] | None = None
+
+    def _sandbox_guard(self, argv: Sequence[str]) -> Sequence[str]:
+        """``argv`` under the thin guard, with no run of its own: whatever a checkout's
+        config makes git run (a filter, a hook, an ``ext::`` URL) runs as a worker would,
+        never as the daemon. Fails closed when the sandbox isn't there."""
+        from resonant.sandbox import SandboxParams, default_deny_exec, sandbox_exec_available
+        from resonant.sandbox import wrap as sandbox_wrap
+
+        if self._guard_prefix is None:
+            if not sandbox_exec_available():
+                raise RunnerError("the sandbox isn't available, so git can't run in a checkout")
+            params = SandboxParams(
+                run_dir=self.cfg.work_dir, cache_dir=self.cfg.cache_dir,
+                secrets_dir=self.cfg.secrets_dir, work_dir=self.cfg.work_dir,
+                deny_exec=default_deny_exec(), deny_read=tuple(self.cfg.deny_read),
+            )  # fmt: skip
+            self._guard_prefix = sandbox_wrap(["/usr/bin/true"], params)[:-1]
+        return [*self._guard_prefix, *argv]
 
     # -- locks and paths --
 
@@ -701,12 +729,22 @@ class Workspace:
         return run_dir
 
     async def _in_checkout(
-        self, checkout: Path, *args: str, token: str | None = None, max_out: int | None = None
+        self,
+        checkout: Path,
+        *args: str,
+        max_out: int | None = None,
+        env: dict[str, str] | None = None,
     ) -> bytes:
-        """Daemon git in a checkout, with the checkout's risky settings overridden."""
-        return await self._git(
-            ["-C", str(checkout), *args], token=token, extra=_CHECKOUT_CONFIG, max_out=max_out
-        )
+        """Daemon git in a checkout (or one of its worktrees): under the guard, with no token
+        and with the checkout's risky settings overridden. A worker can write the checkout's
+        ``.git`` (config, hooks, attributes), so nothing it says there may run as the daemon
+        (docs/employee-plan.md, EM-3 S2)."""
+        argv = self._guard([self._git_bin, "-C", str(checkout), *args])
+        res = await _exec(argv, env={**git_env(None, _CHECKOUT_CONFIG), **(env or {})},
+                          max_out=max_out)  # fmt: skip
+        if res.returncode != 0:
+            raise GitError(args, res.returncode, res.stderr)
+        return res.stdout
 
     def _checkout_git(self, checkout: Path) -> GitRunner:
         async def git(*args: str, stdin: bytes | None = None, max_out: int | None = None) -> bytes:
@@ -783,51 +821,62 @@ class Workspace:
         repo = self._repo(repo_name)
         branch = branch_name(code, ask)
         worktree = self.worktree_path(repo.name, code)
-        async with self.checkout_lock(repo.name):
-            checkout = await self.ensure_checkout(repo, github_token)
-            tracking = f"refs/remotes/origin/{repo.base}"
+        # The base comes through the daemon-only mirror: the token is only ever given to the
+        # mirror's fetch (a checkout's http.* or credential config can't reach it), and the
+        # base sha, CI and the tracked names are read there, not from a worker-writable .git.
+        mirror_git = self._mirror_git(repo.name)
+        async with self.mirror_lock(repo.name):
             try:
-                await self._in_checkout(
-                    checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head",
-                    self._url_for(repo), f"+refs/heads/{repo.base}:{tracking}",
-                    token=github_token,
-                )  # fmt: skip
+                await self._refresh(repo.name, github_token)
             except GitError as e:
                 raise RunnerError(
                     f"fetching {repo.base} of {repo.slug} failed: {e.message[-120:]}"
                 ) from None
             try:
-                out = await self._in_checkout(checkout, "rev-parse", "--verify", "-q",
-                                              f"{tracking}^{{commit}}")  # fmt: skip
+                out = await mirror_git("rev-parse", "--verify", "-q",
+                                       f"refs/heads/{repo.base}^{{commit}}")  # fmt: skip
             except GitError:
                 raise RunnerError(f"{repo.base} isn't a branch of {repo_name}") from None
             base_sha = out.decode().strip()
             try:
-                has_ci = await ci_present(self._checkout_git(checkout), base_sha)
+                has_ci = await ci_present(mirror_git, base_sha)
             except GitError:
                 has_ci = False
-            # No CI is allowed (docs/repos-plan.md D5): the registry records it, the run's
-            # reply says so, and merging is what's refused (after a look at the mirror). The
-            # checkout is worker-writable, so its word only ever lowers what is recorded: a
-            # repo recorded without CI is only raised by the mirror (``_recheck_ci``).
-            if not has_ci or repo.ci is None:
-                with atomic(self.conn):
-                    repo_store.set_ci(self.conn, repo.slug, has_ci)
+            top = await mirror_git("ls-tree", "-z", "--name-only", base_sha)
+            tracked = [n for n in top.decode(errors="replace").split("\0") if n]
+        # No CI is allowed (docs/repos-plan.md D5): the registry records it, the run's reply
+        # says so, and merging is what's refused.
+        if not has_ci or repo.ci is None:
+            with atomic(self.conn):
+                repo_store.set_ci(self.conn, repo.slug, has_ci)
+        async with self.checkout_lock(repo.name):
+            checkout = await self.ensure_checkout(repo, github_token)
+            tracking = f"refs/remotes/origin/{repo.base}"
+            try:  # tokenless, from the mirror, under the guard
+                await self._in_checkout(
+                    checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head",
+                    str(self.mirror_path(repo.name)), f"+refs/heads/{repo.base}:{tracking}",
+                    env={"GIT_ALLOW_PROTOCOL": "file"},
+                )  # fmt: skip
+            except GitError as e:
+                raise RunnerError(
+                    f"fetching {repo.base} into {checkout} failed: {e.message[-120:]}"
+                ) from None
 
             # a leftover from a crash (its branch is reset by ``-B`` below)
             await self._remove_worktree(code, worktree, checkout, None)
             run_dir = await asyncio.to_thread(self._run_dir, code)
             try:
                 worktree.parent.mkdir(parents=True, exist_ok=True)
+                # --no-checkout: no filter or attribute of the checkout's config runs here;
+                # the checkout itself is the guarded reset below
                 await self._in_checkout(
-                    checkout, "worktree", "add", "-q", "--no-track", "-B", branch,
-                    str(worktree), base_sha,
+                    checkout, "worktree", "add", "-q", "--no-checkout", "--no-track", "-B",
+                    branch, str(worktree), base_sha,
                 )  # fmt: skip
-                listed = await self._in_checkout(checkout, "ls-files", "-z", "--", *LOCAL_CONFIG,
-                                                 ".env.*")  # fmt: skip
-                tracked = [n for n in listed.decode(errors="replace").split("\0") if n]
                 linked = await asyncio.to_thread(link_local_config, checkout, worktree, tracked)
                 (run_dir / EXCLUDE_FILE).write_text("".join(f"/{n}\n" for n in linked))
+                await self._in_checkout(worktree, "reset", "-q", "--hard", base_sha)
             except BaseException:
                 with contextlib.suppress(Exception):  # never hide why prepare failed
                     await self._remove_worktree(code, worktree, checkout, branch, base_sha)
@@ -892,13 +941,9 @@ class Workspace:
             raise RunnerError(f"refusing to remove {worktree}: not a run's worktree")
         usable = checkout is not None and await asyncio.to_thread(os.path.isdir, checkout / ".git")
         removed = False
-        if usable and checkout is not None and await asyncio.to_thread(os.path.lexists, worktree):
-            try:
-                await self._in_checkout(checkout, "worktree", "remove", "--force", "--force",
-                                        str(worktree))  # fmt: skip
-                removed = True
-            except GitError:
-                pass
+        # No ``git worktree remove``: it would read the worktree's status (filters,
+        # fsmonitor) under the checkout's config. The dir goes (no links followed) and then
+        # only its admin entry.
         if await asyncio.to_thread(os.path.lexists, worktree):
             removed = await asyncio.to_thread(self._remove_checked, worktree) or removed
         if usable and checkout is not None:
@@ -1258,6 +1303,9 @@ def _drop_admin_entry(checkout: Path, worktree: Path) -> None:
     that worktree's dir is gone (``git worktree prune`` would also drop the owner's own
     worktrees whose dirs are only out of reach). Never raises."""
     admin = checkout / ".git" / "worktrees"
+    with contextlib.suppress(OSError):
+        if not stat.S_ISDIR(os.lstat(admin).st_mode):  # a link planted by a worker
+            return
     want = {str(worktree / ".git"), os.path.join(os.path.realpath(worktree.parent),
                                                  worktree.name, ".git")}  # fmt: skip
     with contextlib.suppress(OSError):

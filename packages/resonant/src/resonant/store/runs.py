@@ -24,6 +24,7 @@ Status = Literal[
     "queued", "running", "waiting", "ready", "merged", "failed", "cancelled", "no_changes", "done"
 ]
 Step = Literal["prepare", "session", "harvest", "publish", "reply"]
+WaitReason = Literal["usage_reset", "question"]
 
 ACTIVE: tuple[Status, ...] = ("queued", "running", "waiting")
 ENDED: tuple[Status, ...] = ("ready", "merged", "failed", "cancelled", "no_changes", "done")
@@ -34,7 +35,8 @@ _COLUMNS = frozenset(
         "sessions", "attempts", "pgid", "leader_pid", "leader_started_at", "session_seconds",
         "wait_seconds", "waiting_since", "cost_usd", "tokens_in", "tokens_out", "exit_code",
         "pr_number", "pr_url", "files_changed", "flagged_paths", "summary", "failure",
-        "started_at", "ended_at", "workspace", "checkout",
+        "started_at", "ended_at", "workspace", "checkout", "wait_reason", "last_note",
+        "resume_prompt",
     }
 )  # fmt: skip
 
@@ -79,6 +81,9 @@ class Run:
     updated_at: datetime
     workspace: str | None = None  # the worktree or scratch dir (migration 009)
     checkout: str | None = None  # the checkout the worktree belongs to
+    wait_reason: WaitReason | None = None  # why a waiting run waits (migration 010)
+    last_note: str | None = None  # the worker's latest ``resonant note``
+    resume_prompt: str | None = None  # what the current turn delivered (resent after a crash)
 
     @property
     def scratch(self) -> bool:
@@ -144,6 +149,9 @@ def _row(r: sqlite3.Row) -> Run:
         # no columns before migration 009 (a migration reading runs part way)
         workspace=r["workspace"] if "workspace" in r.keys() else None,  # noqa: SIM118
         checkout=r["checkout"] if "checkout" in r.keys() else None,  # noqa: SIM118
+        wait_reason=r["wait_reason"] if "wait_reason" in r.keys() else None,  # noqa: SIM118
+        last_note=r["last_note"] if "last_note" in r.keys() else None,  # noqa: SIM118
+        resume_prompt=r["resume_prompt"] if "resume_prompt" in r.keys() else None,  # noqa: SIM118
     )
 
 
@@ -249,6 +257,7 @@ def finish(
             pgid=None,
             leader_pid=None,
             leader_started_at=None,
+            wait_reason=None,
             **fields,
         )
 
