@@ -166,7 +166,9 @@ async def test_three_workers_ask_at_once_then_spawn_a_claude_to_a_pr_in_the_dige
         for code, q, answer in (("R1", TYPO_Q, "both READMEs please"),
                                 ("R2", CHANGELOG_Q, "drop them"),
                                 ("R3", FLAKY_Q, "rewrite it")):  # fmt: skip
-            await text_like(w, starts(f"{code} done: PR #"), f"{code} done")
+            # three sessions resume at once: a slow CI runner needs more than 30 s
+            await until(lambda c=code: any(t.startswith(f"{c} done: PR #") for t in w.texts()),
+                        120, f"{code} done")  # fmt: skip
             assert prompts(w, code)[1].startswith(
                 f'The owner answered your question "{q}": {answer}'
             ), code
