@@ -254,7 +254,7 @@ async def test_the_thin_guard_lets_a_worker_read_env_but_not_touch_resonant(
     w = make_world(tmp_path, resonant_home, chat, monkeypatch, runner_opts={
         "wrap": claude_mod._sandbox_wrap,  # pyright: ignore[reportPrivateUsage]
         "claude_cmd": [python, str(fake), "--no-push", "--guard-probe", json.dumps(probe)],
-        "read_paths": [Path(sys.base_prefix), Path(python).parent],
+        "path_dirs": [Path(python).parent],
     })  # fmt: skip
     # the owner's own checkout, with its .env (untracked, as in real life)
     checkout = w.settings.runner.code_dir / REPO

@@ -44,7 +44,7 @@ from resonant.sandbox.profile import (
     API_PORT,
     SandboxError,
     SandboxParams,
-    default_read_paths,
+    default_path_dirs,
     link_tools,
     macos_build,
     prepare_dirs,
@@ -147,11 +147,11 @@ class ProbeContext:
         env: dict[str, str] | None = None,
         params: SandboxParams | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run argv inside the sandbox (``params``, default the run's) from the run's repo
+        """Run argv inside the sandbox (``params``, default the run's) from the run's tmp
         dir."""
         return subprocess.run(  # noqa: S603 - argv is built here
             wrap(argv, params or self.params),
-            cwd=self.params.run_dir / "repo",
+            cwd=self.params.run_dir / "tmp",
             env=self.env if env is None else env,
             capture_output=True,
             text=True,
@@ -522,7 +522,7 @@ def probe_context(
     cache_dir: Path | None = None,
     home: Path | None = None,
     deny_exec: Sequence[Path] = (),
-    read_paths: Sequence[Path] | None = None,
+    path_dirs: Sequence[Path] | None = None,
     deny_read: Sequence[Path] = (),
     protect: Sequence[Path] | None = None,
 ) -> Generator[ProbeContext]:
@@ -544,7 +544,7 @@ def probe_context(
     run = work_dir / f".check-{tag}"
     scratch: list[Path] = [run]  # removed on the way out, however far setup got
     sleeper: subprocess.Popen[bytes] | None = None
-    reads = default_read_paths() if read_paths is None else tuple(read_paths)
+    dirs = default_path_dirs() if path_dirs is None else tuple(path_dirs)
     try:
         canary = Path(tempfile.mkdtemp(prefix=".resonant-probe-", dir=home))
         scratch.append(canary)
@@ -559,7 +559,7 @@ def probe_context(
             cache_dir=cache_dir,
             secrets_dir=secrets_dir,
             home=home,
-            read_paths=tuple(reads),
+            path_dirs=tuple(dirs),
             deny_exec=tuple(deny_exec),
             deny_read=(*deny_read, outside / "denied"),
             protect=None if protect is None else tuple(protect),
@@ -1038,7 +1038,7 @@ def p_run_dir(ctx: ProbeContext) -> tuple[Status, str]:
     """The run dir and cache are writable and readable, the working directory resolves,
     /dev/null works."""
     run, cache = ctx.params.run_dir, ctx.params.cache_dir
-    probe = str(run / "repo" / "allow.txt")
+    probe = str(run / "tmp" / "allow.txt")
     code = (
         "import os\n"
         f"p = {probe!r}\n"
@@ -1051,7 +1051,7 @@ def p_run_dir(ctx: ProbeContext) -> tuple[Status, str]:
     data = ctx.snippet(code)
     for leftover in (cache / "uv").glob("zz-probe-*"):
         leftover.unlink(missing_ok=True)
-    want = str(run / "repo")
+    want = str(run / "tmp")
     ok = data["r"] == "x" and data["cwd"] == want and data["real"] == want
     return ("pass", "run dir and cache usable") if ok else ("fail", f"unexpected: {data}")
 

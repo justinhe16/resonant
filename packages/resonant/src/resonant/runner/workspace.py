@@ -20,8 +20,8 @@ Trust rules this module keeps:
 - The session's git finds the run's credential helper through ``GIT_CONFIG_*`` in its
   environment (``session_git_env``), not through any config file, so nothing about the run's
   token reaches the checkout's config and the owner's own pushes are unchanged.
-- The daemon's GitHub token is only ever given to the daemon's own git (clone and fetch of a
-  checkout, the bare mirror) and to ``gh``, and never by argv or environment. It goes in a
+- The daemon's GitHub token is only ever given to the daemon's own git (the first clone of a
+  checkout, the bare mirror's fetch) and to ``gh``, and never by argv or environment. It goes in a
   0600 file in a fresh 0700 dir under ``runner.secrets_dir``, created right before the call
   and removed right after, success or not. git reads it through a credential helper script;
   ``gh`` through a ``hosts.yml`` in its own ``GH_CONFIG_DIR``. The token is never in a remote
@@ -642,8 +642,8 @@ class Workspace:
     # -- locks and paths --
 
     def mirror_lock(self, repo_name: str) -> asyncio.Lock:
-        """The per-repo mirror lock: refresh, harvest-fetch and push each take it. Not
-        re-entrant, and not the runner's one-run-per-repo lock."""
+        """The per-repo mirror lock: every mirror fetch (refresh, a PR head, a fork branch)
+        takes it. Not re-entrant, and not the checkout lock (``checkout_lock``)."""
         return self._locks.setdefault(repo_name, asyncio.Lock())
 
     def mirror_path(self, repo_name: str) -> Path:
@@ -712,7 +712,7 @@ class Workspace:
         """Fetch the remote's branches into the mirror. Caller holds the mirror lock.
 
         No fsckObjects here: the remote is the owner's own repo, and old histories often
-        fail fsck. The untrusted input (the session's bundle) is fetched with fsck."""
+        fail fsck. The untrusted input (a run's pushed PR head) is fetched with fsck."""
         repo = self._repo(repo_name)
         mirror = await self._ensure_mirror(repo_name)
         await self._git(
@@ -730,7 +730,7 @@ class Workspace:
         )
 
     async def refresh_mirror(self, repo_name: str, *, github_token: str) -> None:
-        """Bring the mirror up to date (also the go-live check's "mirror is fetchable")."""
+        """Bring the mirror up to date."""
         async with self.mirror_lock(repo_name):
             await self._refresh(repo_name, github_token)
 
@@ -800,12 +800,6 @@ class Workspace:
         if res.returncode != 0:
             raise GitError(args, res.returncode, res.stderr)
         return res.stdout
-
-    def _checkout_git(self, checkout: Path) -> GitRunner:
-        async def git(*args: str, stdin: bytes | None = None, max_out: int | None = None) -> bytes:
-            return await self._in_checkout(checkout, *args, max_out=max_out)
-
-        return git
 
     async def ensure_checkout(
         self, repo: Repo, token: str | None, *, fork: str | None = None

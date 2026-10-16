@@ -45,11 +45,12 @@ off there is no router hook: extension events wait unrouted, as messages would.
 Extension health. The monitor gets ``extensions.host.ExtensionHealth`` as its dynamic
 ``ext:<name>`` checks (health commands, job fail streaks, load refusals, tampering).
 
-Claude runs. ``runner="claude"`` (``runners.claude.ClaudeRunner``) works on a repo in a
-sandboxed clone and replies with the PR; it replies over the channel, so it is registered
-here. The daemon calls its ``start()`` before the loop resumes anything (it ends the processes a
-crash left and hooks the kill switch) and ``aclose()`` at the end. The tools and slash commands
-(P5A-4) reach it as ``IMessageStack.claude`` or ``components.runners["claude"]``.
+Claude workers. ``runner="claude"`` (``runners.claude.ClaudeRunner``) runs a Claude session
+under the thin guard in a worktree of the owner's checkout (or a scratch dir) and reports the
+PR or the answer; it replies over the channel, so it is registered here. The daemon calls its
+``start()`` before the loop resumes anything (it ends the processes a crash left and hooks the
+kill switch) and ``aclose()`` at the end. The tools and slash commands reach it as
+``IMessageStack.claude`` or ``components.runners["claude"]``.
 
 Trust checks. ``IMessageStack.trust`` (``trust.checks.TrustChecks``) answers a worker's
 ``resonant check``: it asks the owner over this channel when a check is net new or a rule

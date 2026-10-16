@@ -205,7 +205,6 @@ def logs_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
 # A repo word as the resolver takes it: a name, ``owner/name`` or a GitHub URL.
 _REPO_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@#?=&%+-]{0,199}", re.ASCII)
 _MERGE_FLAG = re.compile(r"(?:^|\s)--merge(?=\s|$)")
-REPO_ARG_MAX = 200  # tools/runs.REPO_MAX
 
 
 def run_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:

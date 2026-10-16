@@ -737,10 +737,15 @@ def ext_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
 
 secret_app = typer.Typer(
     no_args_is_help=True,
-    help="Extension secrets in the login Keychain (service resonant, account <ext>/<name>).",
+    help=(
+        "Extension and runner secrets in the login Keychain (service resonant, account "
+        "<ext>/<name>; the runner's are runner/<name>)."
+    ),
 )
 app.add_typer(secret_app, name="secret")
-SecretRef = Annotated[str, typer.Argument(help="<ext>/<name>, like github/token")]
+SecretRef = Annotated[
+    str, typer.Argument(help="<ext>/<name>, like github/token or runner/claude_token")
+]
 
 
 def _secret_store() -> SecretStore:
@@ -1167,7 +1172,9 @@ def bench_e2e(
 
 # --- sandbox ---------------------------------------------------------------------------
 
-sandbox_app = typer.Typer(no_args_is_help=True, help="The runner sandbox (docs/phase5a-plan.md).")
+sandbox_app = typer.Typer(
+    no_args_is_help=True, help="The workers' thin guard (docs/employee-plan.md D2)."
+)
 app.add_typer(sandbox_app, name="sandbox")
 
 

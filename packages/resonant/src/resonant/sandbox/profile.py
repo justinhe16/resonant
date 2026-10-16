@@ -28,17 +28,9 @@ API_PORT = 7777
 GIT_NAME = "Resonant runner"
 GIT_EMAIL = "resonant-runner@users.noreply.github.com"
 
-# Toolchain dirs whose ``bin`` subdirs go on a session's PATH (runners/claude.py). Reads are
-# allowed everywhere, so these no longer widen what a session can see. Entries that don't
-# exist are dropped.
-DEFAULT_READ_PATHS = (
-    "~/.local/share/claude",
-    "~/.local/share/uv/python",
-    "~/.cargo/bin",
-    "~/.rustup/toolchains",
-    "~/.nvm/versions",
-    "~/.bun/bin",
-)
+# Toolchain bin dirs appended to a session's PATH (runners/claude.py), after the run's own bin/
+# and the system dirs. Entries that don't exist are dropped.
+DEFAULT_PATH_DIRS = ("~/.cargo/bin", "~/.bun/bin")
 # Binaries the daemon itself runs outside the guard, by absolute path, with credentials:
 # gh (runner.gh_path, the run's token; an extension's pinned argv0), uv (ops.uv_path,
 # /update), ollama (its LaunchAgent) and git (runner.git_path when configured elsewhere; an
@@ -104,14 +96,15 @@ def checked_path(path: str | os.PathLike[str], *, follow: bool = True) -> str:
 class SandboxParams:
     """One session's guard. Paths are normalised by ``resolved()`` before use.
 
-    ``read_paths`` and ``work_dir`` are accepted for the callers' sake and no longer limit
-    anything: reads are allowed everywhere and runs no longer hide from each other."""
+    Reads are allowed everywhere and runs don't hide from each other: ``work_dir`` is used only
+    by the control-dir rules (``ctl_root``/``ctl_dir``)."""
 
     run_dir: Path
     cache_dir: Path
     secrets_dir: Path  # runner.secrets_dir: required, never readable or writable
     home: Path = field(default_factory=Path.home)
-    read_paths: tuple[Path, ...] = ()
+    # extra dirs on the session's PATH (``DEFAULT_PATH_DIRS``); they grant nothing
+    path_dirs: tuple[Path, ...] = ()
     deny_exec: tuple[Path, ...] = ()
     deny_read: tuple[Path, ...] = ()  # runner.deny_read: extra paths, read and write denied
     work_dir: Path | None = None
@@ -162,7 +155,7 @@ class SandboxParams:
                     raise SandboxError(f"{what} {d} is inside {g}, which a session can't write")
             if secrets.is_relative_to(d):
                 raise SandboxError(f"secrets_dir {secrets} is inside the {what} {d}")
-        reads = tuple(Path(checked_path(p)) for p in self.read_paths if Path(p).exists())
+        path_dirs = tuple(Path(checked_path(p)) for p in self.path_dirs if Path(p).exists())
         work = Path(checked_path(self.work_dir)) if self.work_dir is not None else None
         ctl_root = ctl_dir = None
         if (self.ctl_root is None) != (self.ctl_dir is None):
@@ -178,7 +171,7 @@ class SandboxParams:
             cache_dir=cache,
             work_dir=work,
             home=home,
-            read_paths=reads,
+            path_dirs=path_dirs,
             deny_exec=tuple(Path(checked_path(p)) for p in self.deny_exec),
             deny_read=deny_read,
             secrets_dir=secrets,
@@ -291,8 +284,8 @@ def default_deny_exec() -> tuple[Path, ...]:
     return tuple(found)
 
 
-def default_read_paths() -> tuple[Path, ...]:
-    return tuple(Path(p).expanduser() for p in DEFAULT_READ_PATHS)
+def default_path_dirs() -> tuple[Path, ...]:
+    return tuple(Path(p).expanduser() for p in DEFAULT_PATH_DIRS)
 
 
 def _ancestors(paths: Iterable[Path]) -> list[str]:
@@ -399,10 +392,10 @@ def sandbox_exec_available() -> bool:
 
 
 def prepare_dirs(params: SandboxParams) -> None:
-    """Create ``repo/ home/ tmp/ bin/`` in the run dir and the cache subdirs. Daemon-side,
-    before the session starts."""
+    """Create ``home/ tmp/ bin/`` in the run dir and the cache subdirs. Daemon-side, before
+    the session starts (the session works in its worktree or scratch dir, not the run dir)."""
     p = params.resolved()
-    for sub in ("repo", "home", "tmp", "bin"):
+    for sub in ("home", "tmp", "bin"):
         (p.run_dir / sub).mkdir(mode=0o700, parents=True, exist_ok=True)
     for sub in ("uv", "npm", "pip"):
         (p.cache_dir / sub).mkdir(mode=0o700, parents=True, exist_ok=True)

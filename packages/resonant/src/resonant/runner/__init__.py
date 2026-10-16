@@ -1,3 +1,4 @@
-"""The Claude runner's daemon-side pieces (docs/phase5a-plan.md D3): the workspace (mirror,
-clone, bundle handback, push, PR, merge), the pre-push checks and cleanup. The sandbox and
-the ``ClaudeRunner`` itself live elsewhere."""
+"""The Claude runner's daemon-side pieces (docs/employee-plan.md D1): the workspace (checkouts,
+worktrees and scratch dirs, the daemon-only mirror, PR discovery, merge), the pre-merge checks,
+the repo resolver and creator, and cleanup. The sandbox and the ``ClaudeRunner`` itself live
+elsewhere."""

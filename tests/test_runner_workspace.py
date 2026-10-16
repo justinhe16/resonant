@@ -1430,17 +1430,11 @@ def test_wipe_secret_dirs_removes_leftovers_and_never_raises(tmp_path: Path) -> 
     outside.mkdir()
     (outside / "keep").write_text("keep")
     (secrets / "link").symlink_to(outside)
-    mirrors = tmp_path / "mirrors"
-    (mirrors / ".incoming").mkdir(parents=True)
-    (mirrors / ".incoming" / "R1.bundle").write_bytes(b"x")
-    (mirrors / ".incoming" / "other.txt").write_text("not ours")
 
-    assert cleanup_mod.wipe_secret_dirs(secrets, mirrors) == 4
+    assert cleanup_mod.wipe_secret_dirs(secrets) == 3
     assert list(secrets.iterdir()) == []
-    assert not (mirrors / ".incoming" / "R1.bundle").exists()
-    assert (mirrors / ".incoming" / "other.txt").exists()
     assert (outside / "keep").read_text() == "keep"
-    assert cleanup_mod.wipe_secret_dirs(tmp_path / "missing", tmp_path / "missing2") == 0
+    assert cleanup_mod.wipe_secret_dirs(tmp_path / "missing") == 0
 
 
 def test_cleanup_wipes_secret_dirs(tmp_path: Path) -> None:

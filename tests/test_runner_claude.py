@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -598,6 +598,9 @@ async def test_a_run_with_no_repo_works_in_a_scratch_dir(
     assert "GH_CONFIG_DIR" not in call["env"]
     prompt = call["argv"][call["argv"].index("--append-system-prompt") + 1]
     assert "scratch directory" in prompt and "no GitHub credentials" in prompt
+    # a resumed scratch session isn't told to push or open a PR (it has neither)
+    resumed = h.runner._turn_prompt(replace(run, sessions=1))  # pyright: ignore[reportPrivateUsage]
+    assert "pull request" not in resumed and "closing summary" in resumed
     assert h.api.issued == 0  # no GitHub token minted
     assert h.gh_calls() == [] and h.gh_calls("api") == []
     [text] = [t for t in h.chan.texts() if t.startswith("R1 ")]
@@ -1033,14 +1036,11 @@ async def test_resume_continues_at_the_saved_step(tmp_path: Path, db: sqlite3.Co
     assert h.run(code).status == "ready" and len(h.gh_calls("create")) == 1
 
 
-async def test_startup_wipes_secret_dirs_and_stale_bundles(h: Harness) -> None:
+async def test_startup_wipes_secret_dirs(h: Harness) -> None:
     (h.cfg.secrets_dir / "call-xyz").mkdir(parents=True)
     (h.cfg.secrets_dir / "call-xyz" / "token").write_text(GH_TOKEN)
-    incoming = h.cfg.mirror_dir / ".incoming"
-    incoming.mkdir(parents=True)
-    (incoming / "R9.bundle").write_text("x")
     await h.runner.start()
-    assert not (h.cfg.secrets_dir / "call-xyz").exists() and not (incoming / "R9.bundle").exists()
+    assert not (h.cfg.secrets_dir / "call-xyz").exists()
     await h.runner.aclose()
 
 
@@ -1669,7 +1669,7 @@ async def test_happy_path_under_the_real_sandbox(tmp_path: Path, db: sqlite3.Con
         # a local bare repo can't be pushed to from inside the sandbox (only the run dir is
         # writable), so this session stops before the push; the real push goes to github.com
         claude_cmd=[python, str(fake), "--no-push"],
-        read_paths=[Path(sys.base_prefix), Path(python).parent],
+        path_dirs=[Path(python).parent],
     )
     await h.start()
     await h.drain()

@@ -3,7 +3,7 @@
 Loaded from ``$RESONANT_HOME/config.yaml`` (default ``~/.resonant``), with
 ``RESONANT_*`` environment variables taking precedence (``__`` for nesting).
 Nothing in here is secret: credentials live in the macOS Keychain and are read
-only by the executor.
+only by the daemon (the executor for extensions, the runner for ``runner/*``).
 """
 
 from __future__ import annotations
@@ -344,7 +344,7 @@ _RUNNER_BASE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,99}")
 
 
 class RunnerRepo(_Section):
-    """One repo from the ``runner.repos`` seed (docs/phase5a-plan.md D3)."""
+    """One repo from the optional ``runner.repos`` seed (docs/repos-plan.md D1)."""
 
     # "github.com/owner/repo": no scheme, no credentials; the daemon adds https://.
     remote: str
@@ -398,7 +398,7 @@ class GitHubAppConfig(_Section):
 
 
 class RunnerConfig(_Section):
-    """The Claude runner (docs/phase5a-plan.md). Nothing here is secret."""
+    """The Claude runner (docs/employee-plan.md D1). Nothing here is secret."""
 
     # The per-run token source. Without it the runner is not set up.
     github_app: GitHubAppConfig | None = None
@@ -430,7 +430,8 @@ class RunnerConfig(_Section):
     # How long a worker's `resonant ask` (or a `resonant check` that asks the owner) stays
     # open. After it the session resumes with "no answer from the owner" (EM-3, D3).
     ask_timeout_minutes: int = Field(default=240, ge=1, le=7 * 24 * 60)
-    # Unused since EM-2 (there is no bundle handback any more); kept so old configs still load.
+    # DEPRECATED, ignored: the bundle handback it limited is gone (EM-2). Accepted only so
+    # old config files still load (extra keys are refused); drop it from your config.
     max_bundle_mb: int = Field(default=50, ge=1, le=500)
     # Days a finished run's dir is kept (a daily job deletes it after).
     keep_days: int = Field(default=7, ge=0, le=365)

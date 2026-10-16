@@ -1,8 +1,8 @@
-"""Checks on a run's commits before anything is merged (docs/phase5a-plan.md D3, moved from
-before the push by docs/repos-plan.md D10, since the session pushes its own branch).
+"""Checks on a run's commits before anything is merged (docs/repos-plan.md D10: after the
+session pushes its own branch, not before a push).
 
 They run on the commits fetched into the daemon's own mirror, through a ``GitRunner`` bound
-to the mirror: nothing here ever executes git in the run's clone.
+to the mirror: nothing here ever executes git in the owner's checkout or a run's worktree.
 
 - **Refused** (``CheckFailed``, the message is the reason shown to the owner): a merge
   commit; a head that doesn't descend from the base; too many files, commits or bytes; a

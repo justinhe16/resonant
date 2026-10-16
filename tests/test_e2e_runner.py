@@ -722,7 +722,7 @@ async def test_r1_under_the_real_sandbox(
             # a local bare repo can't be pushed to from inside the sandbox; the real push goes
             # to github.com, which the profile allows
             "claude_cmd": [python, str(fake), "--no-push"],
-            "read_paths": [Path(sys.base_prefix), Path(python).parent],
+            "path_dirs": [Path(python).parent],
         },
     )
     async with running(w):

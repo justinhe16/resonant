@@ -299,7 +299,7 @@ def values_of(env: Mapping[str, str]) -> list[str]:
 
 
 # --- the runner's core secrets -----------------------------------------------------------
-# The Claude runner (docs/phase5a-plan.md) is core, not an extension, but its secrets use the
+# The Claude runner (docs/employee-plan.md) is core, not an extension, but its secrets use the
 # same store under the reserved ``runner`` prefix: ``resonant secret set runner/github_token``.
 # A ``claude setup-token`` value is about 108 characters, inside ``MAX_LEN``.
 

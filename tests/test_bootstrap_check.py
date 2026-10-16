@@ -556,7 +556,7 @@ def test_runner_rows_report_names_only(resonant_home: Path) -> None:
     def no_mirror(_settings: object, _name: str) -> bool | None:
         return None
 
-    rows = {r[2]: r for r in check.runner_rows(settings, 6, exists, ci_of)}
+    rows = {r[2]: r for r in check.runner_rows(settings, 11, exists, ci_of)}
     assert rows["runs table"][:2] == ("PASS", False)
     assert rows["runner repos"][3] == "2: demo, old"
     assert rows["runner secret runner/github_token"][0] == "PASS"
@@ -579,11 +579,16 @@ def test_runner_rows_report_names_only(resonant_home: Path) -> None:
     # old schema, no repos, no mirror yet
     old = check.runner_rows(load_settings(), 5, exists)
     assert old[:2] == [
-        ("FAIL", False, "runs table", "schema v5, need 6"),
-        ("SKIP", False, "runner repos", "none in runner.repos (step 14)"),
+        ("FAIL", False, "runs table", "schema v5, need 11"),
+        (
+            "SKIP",
+            False,
+            "runner repos",
+            "none seeded in runner.repos (optional: repos register on first use)",
+        ),
     ]
     assert old[2][:3] == ("FAIL", False, "runner github app")  # no runner.github_app
-    none = check.runner_rows(settings, 6, exists, no_mirror)
+    none = check.runner_rows(settings, 11, exists, no_mirror)
     assert [r[0] for r in none if r[2].endswith("has CI")] == ["SKIP", "SKIP"]
 
 

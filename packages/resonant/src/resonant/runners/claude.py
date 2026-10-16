@@ -1,13 +1,13 @@
 """ClaudeRunner (``runner="claude"``): one Claude Code session per run, in a worktree of the
-owner's checkout or, with no repo, a scratch dir (docs/phase5a-plan.md D2 to D4,
-docs/employee-plan.md D1).
+owner's checkout or, with no repo, a scratch dir (docs/employee-plan.md D1, D3 to D6).
 
 A run is a task of kind ``run`` plus a row in ``runs`` (migration 006) that holds all the state a
 restart needs. One ``step`` drives a run from its saved step to the next stopping point, holding
 a Claude slot the whole time (two runs on one repo go at once, each in its own worktree):
 
-    prepare   clone the checkout on first use, fetch it, note whether the base has CI, add the
-              run's worktree on a new branch and link the checkout's local config into it
+    prepare   clone the checkout on first use (a fork run: fork the repo first), fetch the base
+              into the daemon-only mirror, note whether the base has CI, add the run's
+              worktree on a new branch and link the checkout's local config into it
               (``Workspace.prepare``); a run with no repo gets an empty scratch dir
     session   a per-run GitHub App token for the one repo (``runner.github_app``), the cached
               sandbox self-check (fails closed), then ``claude -p`` under ``sandbox.wrap`` with a
@@ -15,8 +15,11 @@ a Claude slot the whole time (two runs on one repo go at once, each in its own w
               watches CI and fixes it (docs/repos-plan.md D10); the token is revoked when the
               session ends, however it ends. A run with no repo gets no token and ends ``done``
               with Claude's summary
-    harvest   (the saved step keeps this name) find the PR by its head branch and check it the
-              way a merge will; no PR and no pushed commits is ``no_changes``
+    harvest   (a historical name, kept because the runs CHECK names it) find the PR by its head
+              branch and check it the way a merge will; no PR and no pushed commits is
+              ``no_changes``. A fork run's pushed branch is checked here instead
+    publish   fork runs only: ask the owner (an ``external_pr`` check), then open the
+              upstream PR with the ``public_repo`` token (EM-7)
     reply     the code-built message to the requester, by urgency (EM-6,
               ``runners/reports.py``): texted now (a failure, ``/run``, a ``notify_now`` rule)
               or a line in the hourly digest's ``Workers:`` section
@@ -27,7 +30,7 @@ reaped. After the session starts the daemon writes into the run dir only to refr
 files, through ``O_NOFOLLOW`` directory fds. Merging (``merge_run``) fetches the PR's head into
 the daemon-only mirror and runs the checks first; no merge path skips them.
 
-Outcomes. A usage limit parks the run (``Wait("usage_reset")``: slot and lock freed; the wait
+Outcomes. A usage limit parks the run (``Wait("usage_reset")``: slot freed; the wait
 doesn't count as session time or an attempt, and 24 h of waiting in total fails the run). The
 time limit, the disk limit, the turn or dollar limit and a Claude error fail the run and keep its
 dir and worktree ("work kept"); what the session already pushed stays on GitHub. ``/cancel`` and
@@ -43,7 +46,7 @@ resumes the same session with ``--resume`` and the news as the prompt. API for t
 (EM-5): :meth:`~ClaudeRunner.open_questions`, :meth:`~ClaudeRunner.answer_question`,
 :meth:`~ClaudeRunner.deliver_message`, :attr:`~ClaudeRunner.events`.
 
-Public API for the tools and slash commands (P5A-4): :meth:`ClaudeRunner.start_run`,
+Public API for the tools and slash commands: :meth:`ClaudeRunner.start_run`,
 :meth:`~ClaudeRunner.list_runs`, :meth:`~ClaudeRunner.cancel_run`,
 :meth:`~ClaudeRunner.merge_run`. Their results are plain dataclasses; every reply text is built
 here, from code, never from model output: Claude's closing summary is cleaned, redacted,
@@ -140,7 +143,7 @@ from resonant.sandbox import (
     SandboxError,
     SandboxParams,
     default_deny_exec,
-    default_read_paths,
+    default_path_dirs,
     link_tools,
     prepare_dirs,
     resolve_tool,
@@ -179,7 +182,7 @@ MAX_ATTEMPTS = 2  # a session, and one resume after a daemon crash
 MAX_WAIT_S = 24 * 3600.0  # usage-limit waiting, in total
 DEFAULT_WAIT_S = 3600.0  # when the limit message names no reset time
 MIN_WAIT_S = 60.0
-DEFER_S = 15.0  # how long a run waits for a free repo lock or a free slot
+DEFER_S = 15.0  # how long a run waits for a free slot
 MAX_LINE = 1024 * 1024  # one stream-json line, in the transcript and in memory
 TRUNCATED_TAIL = 256  # dropped from a truncated line: a secret may be cut at the limit
 MAX_TRANSCRIPT = 256 * 1024 * 1024
@@ -188,7 +191,7 @@ SUMMARY_MAX = 600
 REASON_MAX = 240
 MAX_TURNS = 200
 CANCEL_GRACE_S = 2.0  # /kill and /cancel: SIGTERM, then SIGKILL after this
-STEP_SLACK_S = 600.0  # prepare, harvest, import and publish on top of the session limit
+STEP_SLACK_S = 600.0  # prepare, the PR lookup and publish on top of the session limit
 SAVE_EVERY_S = 30.0
 KILL_REASON = "stopped by /kill"
 CHECK_CACHE = "sandbox-check.json"
@@ -255,6 +258,11 @@ WORKER_PROMPT = (
 RESUME_PROMPT = (
     "Your session was interrupted. Continue the task you were given. If it is already done, "
     "make sure the work is pushed, the pull request is open and its CI has been checked, and "
+    "give the closing summary."
+)
+# A run with no repo has nothing to push and no PR (EM-2's scratch dir).
+SCRATCH_RESUME_PROMPT = (
+    "Your session was interrupted. Continue the task you were given. If it is already done, "
     "give the closing summary."
 )
 
@@ -573,7 +581,7 @@ class ClaudeRunner:
         wrap: Wrap | None = None,
         self_check: SelfCheck | None = None,
         claude_cmd: Sequence[str] | None = None,
-        read_paths: Sequence[Path] | None = None,
+        path_dirs: Sequence[Path] | None = None,
         max_session_s: int | None = None,
         max_turns: int = MAX_TURNS,
         poll_s: float = 0.25,
@@ -630,7 +638,7 @@ class ClaudeRunner:
         self._wrap: Wrap = wrap or _sandbox_wrap
         self._self_check: SelfCheck = self_check or self._cached_self_check
         self._claude_cmd = None if claude_cmd is None else tuple(claude_cmd)
-        self._read_paths = tuple(default_read_paths() if read_paths is None else read_paths)
+        self._path_dirs = tuple(default_path_dirs() if path_dirs is None else path_dirs)
         self.max_session_s = max_session_s or runner.max_minutes * 60
         self.max_turns = max_turns
         self.poll_s = poll_s
@@ -719,7 +727,7 @@ class ClaudeRunner:
                 await reaper.reap(self._target(run), grace_s=self.kill_grace_s)
                 runs.clear_process(self.conn, run.code)
         await self._sweep_credentials()
-        await asyncio.to_thread(wipe_secret_dirs, self.cfg.secrets_dir, self.cfg.mirror_dir)
+        await asyncio.to_thread(wipe_secret_dirs, self.cfg.secrets_dir)
         self.desk.startup()  # no CLI call survived the restart
         await asyncio.to_thread(self._wipe_ctl_dirs)
         await self._reconcile()
@@ -1311,7 +1319,7 @@ class ClaudeRunner:
             work_dir=self.cfg.work_dir,
             cache_dir=self.cfg.cache_dir,
             secrets_dir=self.cfg.secrets_dir,
-            read_paths=self._read_paths,
+            path_dirs=self._path_dirs,
             deny_exec=default_deny_exec(),
             deny_read=tuple(self.cfg.deny_read),
             write_paths=tuple(writes),
@@ -1329,10 +1337,9 @@ class ClaudeRunner:
         run's GitHub token is not in it: ``gh`` finds it by ``GH_CONFIG_DIR`` (a path) and git
         through the credential helper named in ``GIT_CONFIG_*`` (a path; nothing is written
         to the checkout's config). A run with no repo has neither."""
-        bins = [p for p in params.read_paths if p.name == "bin"]
         env = scratch_env(
             params,
-            path_dirs=bins,
+            path_dirs=params.path_dirs,
             claude_token=None if secrets is None else secrets.claude_token,
             anthropic_key=None if secrets is None else secrets.anthropic_key,
         )
@@ -1398,7 +1405,7 @@ class ClaudeRunner:
 
     async def _session(self, w: _Work, run: Run, p: Prepared) -> StepOutcome | None:
         """Run Claude until it exits, a limit is hit or the run is stopped. None means it
-        finished cleanly and the run moves on to harvest."""
+        finished cleanly and the run moves on to the PR lookup (step ``harvest``)."""
         if run.attempts >= MAX_ATTEMPTS:
             return await self._fail(
                 run, f"the daemon crashed {run.attempts} times during the session "
@@ -1456,7 +1463,7 @@ class ClaudeRunner:
             return run.ask + (f"\n\n{saved}" if saved else "")
         if fresh is not None:
             return f"{saved}\n\nCarry on with the task."
-        prompt = RESUME_PROMPT
+        prompt = SCRATCH_RESUME_PROMPT if run.scratch else RESUME_PROMPT
         if saved:
             prompt += f"\n\nWhat you were told last turn:\n{saved}"
         for q in questions_store.open_for_run(self.conn, run.code, "ask"):
@@ -1542,7 +1549,7 @@ class ClaudeRunner:
             tokens_out=_int(usage.get("output_tokens")),
         )
         run = self._must_get(run.code)
-        if run.pgid is not None:  # the tree wouldn't die: never harvest under a live session
+        if run.pgid is not None:  # the tree wouldn't die: no PR lookup under a live session
             return await self._fail(run, "the session's processes wouldn't stop", w.redactor)
         if stop == "cancelled":
             raise _Cancelled
@@ -2260,7 +2267,7 @@ class ClaudeRunner:
         pulse item cleared, and (once) the reply. Safe to repeat."""
         async with self._cleanup_locks.setdefault(code, asyncio.Lock()):
             run = self._must_get(code)
-            # The live session if there is one, and anything else of the run (a harvest
+            # The live session if there is one, and anything else of the run (a straggler
             # still going) by marker and cwd: nothing may outlive the dir deleted below.
             target = self._live.get(code) or self._target(run)
             await reaper.reap(target, grace_s=self.cancel_grace_s)
@@ -2509,7 +2516,6 @@ def cleanup_job(deps: CoreDeps) -> CoreJob | None:
             cfg.work_dir,
             cfg.cache_dir,
             secrets_dir=cfg.secrets_dir,
-            mirror_dir=cfg.mirror_dir,
             ended_at=ended,
             keep_days=cfg.keep_days,
             max_cache_bytes=cfg.max_cache_gb * 1024**3,

@@ -30,11 +30,10 @@ Row = tuple[str, bool, str, str]  # (status, required, step, detail)
 # The values config/*.example.yaml ship with. Seeded config still holding them is not live.
 EXAMPLE_SELF_HANDLE = "resonant@example.com"
 EXAMPLE_IDENTITIES = frozenset({"imessage:+15550000000", "imessage:owner@icloud.com"})
-NOT_YET = "SKIP (available after Phase 1)"
 DEFAULT_CHAT_DB = "~/Library/Messages/chat.db"
 PHASE2_SCHEMA = 3  # migration 003: the Phase 2 gate's approvals columns
 PHASE3_SCHEMA = 4  # migration 004: extensions, ext_jobs
-PHASE5A_SCHEMA = 6  # migration 006: the runs table
+RUNS_SCHEMA = 11  # migration 011: the runs table as workers need it (questions, wait_reason)
 STALE_AFTER = timedelta(hours=1)  # pending approvals this far past expires_at are stale
 CMD_TIMEOUT_S = 10.0
 _CAFFEINATE_RE = re.compile(
@@ -296,7 +295,7 @@ def sandbox_row(settings: Settings) -> Row:
     """The runner sandbox (the thin guard), built from the configured runner dirs, denies a
     write into ~/.resonant, the Keychain service and the API port. Writes nothing while the
     guard holds (the dirs need not exist). Advisory until a runner is configured."""
-    from resonant.sandbox import SandboxParams, default_deny_exec, default_read_paths
+    from resonant.sandbox import SandboxParams, default_deny_exec, default_path_dirs
     from resonant.sandbox.probes import self_check
 
     r = settings.runner
@@ -305,7 +304,7 @@ def sandbox_row(settings: Settings) -> Row:
             run_dir=r.work_dir / ".check",
             cache_dir=r.cache_dir,
             secrets_dir=r.secrets_dir,
-            read_paths=default_read_paths(),
+            path_dirs=default_path_dirs(),
             deny_exec=default_deny_exec(),
         )
         ok, detail = self_check(params)
@@ -319,7 +318,7 @@ def sandbox_row(settings: Settings) -> Row:
 def _repo_has_ci(settings: Settings, name: str) -> bool | None:
     """Whether the repo's mirrored base branch has a workflow on ``pull_request``. Reads the
     existing mirror only (no fetch, no network, never the owner's checkout); None while there
-    is no mirror yet (the first run's PR check fetches it)."""
+    is no mirror yet (the repo's first run fetches it)."""
     import asyncio
 
     from resonant.runner.workspace import Workspace
@@ -341,11 +340,11 @@ def runner_rows(
     exists: Callable[[str], bool] = _keychain_exists,
     has_ci: Callable[[Settings, str], bool | None] = _repo_has_ci,
 ) -> list[Row]:
-    """Phase 5a (docs/go-live.md step 14): the runs table, the GitHub App config, the runner's
-    secrets (names only, never values), and for each configured repo that it has CI on
-    ``pull_request``. All
-    advisory: a Mac with no runner repos configured is a valid install. The sandbox row is
-    ``sandbox_row``."""
+    """Claude workers (docs/go-live.md step 14): the runs table, the optional ``runner.repos``
+    seed, the GitHub App config, the code dir, the runner's secrets (names only, never values),
+    the owner steps, and for each seeded repo whether it has CI on ``pull_request``. All
+    advisory: repos register on first use, so a Mac with none seeded is a valid install. The
+    sandbox row is ``sandbox_row``."""
     from resonant.secrets import (
         ANTHROPIC_KEY_REF,
         CLAUDE_TOKEN_REF,
@@ -356,13 +355,14 @@ def runner_rows(
     )
 
     rows: list[Row] = []
-    if version >= PHASE5A_SCHEMA:
+    if version >= RUNS_SCHEMA:
         rows.append(("PASS", False, "runs table", f"schema v{version}"))
     else:
-        rows.append(("FAIL", False, "runs table", f"schema v{version}, need {PHASE5A_SCHEMA}"))
+        rows.append(("FAIL", False, "runs table", f"schema v{version}, need {RUNS_SCHEMA}"))
     repos = settings.runner.repos
     if not repos:
-        rows.append(("SKIP", False, "runner repos", "none in runner.repos (step 14)"))
+        why = "none seeded in runner.repos (optional: repos register on first use)"
+        rows.append(("SKIP", False, "runner repos", why))
     else:
         rows.append(("PASS", False, "runner repos", f"{len(repos)}: {', '.join(sorted(repos))}"))
     app = settings.runner.github_app
@@ -444,11 +444,12 @@ def runner_rows(
             rows.append(("FAIL", False, step, _err(e)))
             continue
         if ci is None:
-            rows.append(("SKIP", False, step, "no mirror yet: the first run's PR check fetches it"))
+            rows.append(("SKIP", False, step, "no mirror yet: the repo's first run fetches it"))
         elif ci:
             rows.append(("PASS", False, step, "a workflow runs on pull_request"))
         else:
-            rows.append(("FAIL", False, step, "no workflow on pull_request: runs would be refused"))
+            why = f"no workflow on pull_request: Resonant won't merge its runs (/repo ci {name})"
+            rows.append(("FAIL", False, step, why))
     return rows
 
 
@@ -496,12 +497,7 @@ def main() -> None:
     else:
         out("PASS", True, "imessage self_handle set", handle)
 
-    # `enabled` / `db_path` arrive with the iMessage channel; detect them at runtime.
-    enabled: object = getattr(im, "enabled", None)
-    if enabled is None:
-        out(NOT_YET, False, "imessage channel enabled")
-    else:
-        out("PASS", False, "imessage channel enabled", f"enabled: {enabled} (turn on in step 6)")
+    out("PASS", False, "imessage channel enabled", f"enabled: {im.enabled} (turn on in step 6)")
 
     try:
         principals = load_principals(settings.principals_path)
