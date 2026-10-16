@@ -208,7 +208,8 @@ _INTENT_RULES: dict[IntentLabel, str] = {
     "run_project": (
         "For start_run, pass `repo` as the repo the message names (a short name, owner/name or a "
         "GitHub URL) and `ask` as what the owner wants done, in their words; if the message "
-        "names no repo, don't guess: ask which repo, naming the recent ones. For cancel_run and "
+        "names no repo, don't guess: ask which repo, naming the recent ones. Pass report=now only "
+        "when the owner asks to be texted as soon as it's done. For cancel_run and "
         "merge_run, pass the run code (like R3) from the message or the earlier replies; if you "
         "can't tell which run, call list_runs first. Call merge_run only when the owner asks to "
         "merge."

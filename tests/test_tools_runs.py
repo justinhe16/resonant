@@ -46,13 +46,17 @@ class FakeRunner:
         self.conn = conn
         self.missing = missing
         self.calls: list[tuple[Any, ...]] = []
+        self.reports: list[str] = []
         self.merge_result: Merged | Refused = Merged("R1", 41, ("Makefile",))
 
     async def setup_missing(self) -> str | None:
         return self.missing
 
-    async def start_run(self, repo: str | None, ask: str, principal: str) -> Started | Refused:
+    async def start_run(
+        self, repo: str | None, ask: str, principal: str, *, report: str = "digest"
+    ) -> Started | Refused:
         self.calls.append(("start", repo, ask, principal))
+        self.reports.append(report)
         if self.missing:
             return Refused(self.missing)
         return Started("R1", repo or "", 30)
@@ -253,6 +257,15 @@ async def test_start_run_without_a_repo_is_a_scratch_run(
         assert out["started"] is True and out["repo"] is None
         assert out["text"].startswith("On it: R1 · no repo.")
     assert [c[1] for c in runner.calls] == [None, None]
+    assert runner.reports == ["digest", "digest"]  # a chat run reports in the digest
+
+
+async def test_start_run_report_now_reaches_the_runner(
+    components: Components, runner: FakeRunner
+) -> None:
+    out = await call(components, "start_run", {"repo": "dori", "ask": "x", "report": "now"})
+    assert out["started"] is True and runner.reports == ["now"]
+    assert tools.START_RUN.args_schema["properties"]["report"]["enum"] == ["now", "digest"]
 
 
 async def test_start_run_bad_arguments(components: Components, runner: FakeRunner) -> None:
@@ -261,6 +274,7 @@ async def test_start_run_bad_arguments(components: Components, runner: FakeRunne
         {"repo": "dori", "ask": "  "},
         {"repo": 3, "ask": "x"},
         {"repo": "dori", "ask": "x", "path": "/"},
+        {"repo": "dori", "ask": "x", "report": "loud"},
         {"repo": "d" * (tools.REPO_MAX + 1), "ask": "x"},
         {"repo": "dori", "ask": "x" * (MAX_ASK + 1)},
     ):
@@ -372,9 +386,9 @@ def test_command_parsing() -> None:
     run = parse("/run Resonant  fix the typo in the README")
     assert (run.tool, run.args) == (
         "start_run",
-        {"repo": "resonant", "ask": "fix the typo in the README"},
+        {"repo": "resonant", "ask": "fix the typo in the README", "report": "now"},
     )
-    assert parse('/run dori "tidy up"').args == {"repo": "dori", "ask": "tidy up"}
+    assert parse('/run dori "tidy up"').args == {"repo": "dori", "ask": "tidy up", "report": "now"}
     assert parse("/runs").args == {} and parse("/runs r3").args == {"code": "R3"}
     assert parse("/cancel R3").args == {"code": "R3"}
     assert parse("/merge r12?").args == {"code": "R12"}
@@ -419,7 +433,10 @@ async def test_fast_path_runs_reads_inline_and_writes_as_direct_calls(
     res = await fp.run(parse("/runs"), principal=OWNER, event_id="E1")
     assert res is not None and res.reply_text.startswith("Runs (1 active):")
     for text, call_ in (
-        ("/run dori fix it", {"tool": "start_run", "args": {"repo": "dori", "ask": "fix it"}}),
+        (
+            "/run dori fix it",
+            {"tool": "start_run", "args": {"repo": "dori", "ask": "fix it", "report": "now"}},
+        ),
         ("/cancel R1", {"tool": "cancel_run", "args": {"code": "R1"}}),
         ("/merge R1", {"tool": "merge_run", "args": {"code": "R1"}}),
     ):

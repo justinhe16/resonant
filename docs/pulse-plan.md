@@ -23,6 +23,7 @@ Any extension can report items, so future extensions (Dori on-call, a trading bo
 - **Stale reports.** A retried older report (row `updated_at` newer than the event's `occurred_at`) is dropped (`pulse.stale`).
 - **Held urgent items ride the pulse** (paused, muted, capped), including after a mute ends, unless their `ttl` expired.
 - **Tool runs don't persist fd-3 events**, so reporters must be jobs; the example's `incident` is a job plus a tool that writes its state.
+- **Workers (EM-6, [`employee-plan.md`](employee-plan.md#d5-reporting-and-urgency)).** Claude workers report through `core` items keyed `run/<code>`, rendered in a `Workers:` section after the other lines of the pulse (and of the briefing, which otherwise skips `core` items). When a pulse has news, it also lists the workers still running, already told, for status; they never make a pulse send on their own. A full message drops worker lines last and never ends on a bare header; `+N more` counts items, not headers.
 
 ---
 

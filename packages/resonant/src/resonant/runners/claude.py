@@ -17,7 +17,9 @@ a Claude slot the whole time (two runs on one repo go at once, each in its own w
               with Claude's summary
     harvest   (the saved step keeps this name) find the PR by its head branch and check it the
               way a merge will; no PR and no pushed commits is ``no_changes``
-    reply     the code-built message to the requester
+    reply     the code-built message to the requester, by urgency (EM-6,
+              ``runners/reports.py``): texted now (a failure, ``/run``, a ``notify_now`` rule)
+              or a line in the hourly digest's ``Workers:`` section
 
 Each step is saved in ``runs.step`` before it starts, so a crash resumes at the last one; the
 session is resumed by id (``--resume``) in the same run dir, after the old process tree has been
@@ -118,6 +120,7 @@ from resonant.runner.workspace import (
 )
 from resonant.runners import reaper, worker_cli
 from resonant.runners.reaper import MARKER_ENV, Target
+from resonant.runners.reports import Report, WorkerReports, end_event, end_title
 from resonant.runners.worker_cli import WorkerServer
 from resonant.runners.worker_desk import (
     BLOCK_S,
@@ -126,6 +129,7 @@ from resonant.runners.worker_desk import (
     RelayRefused,
     TrustChecker,
     WorkerDesk,
+    WorkerEvent,
     WorkerEvents,
 )
 from resonant.sandbox import (
@@ -148,7 +152,6 @@ from resonant.secrets import (
     load_runner_secrets,
     missing_runner_secrets,
 )
-from resonant.store import pulse as pulse_store
 from resonant.store import questions as questions_store
 from resonant.store import repos as repo_store
 from resonant.store import runs
@@ -181,8 +184,6 @@ MAX_TURNS = 200
 CANCEL_GRACE_S = 2.0  # /kill and /cancel: SIGTERM, then SIGKILL after this
 STEP_SLACK_S = 600.0  # prepare, harvest, import and publish on top of the session limit
 SAVE_EVERY_S = 30.0
-PULSE_TTL_S = 48 * 3600
-PULSE_SOURCE = "core"
 KILL_REASON = "stopped by /kill"
 CHECK_CACHE = "sandbox-check.json"
 TOOL_NAMES = ("claude", "uv")
@@ -609,6 +610,8 @@ class ClaudeRunner:
             on_note=self._on_note,
             block_s=ask_block_s,
         )
+        self.reports = WorkerReports(conn, clock=clock, tz=self.tz)
+        self.desk.events.subscribe(self._on_worker_event)
 
     def _gh_github(self, secrets: RunnerSecrets) -> GitHub:
         return GhGitHub(self.workspace, secrets)
@@ -753,13 +756,16 @@ class ClaudeRunner:
             how.append("install Claude Code")
         return not_set_up_text(missing, how) if missing else None
 
-    async def start_run(self, repo: str | None, ask: str, principal: str) -> Started | Refused:
+    async def start_run(
+        self, repo: str | None, ask: str, principal: str, *, report: Report = "digest"
+    ) -> Started | Refused:
         """Create a run and its task. ``repo`` is free text (a name, ``owner/name``, a URL):
         the resolver turns it into a registered repo, registering one it hasn't seen. No repo
         (None or blank) is a run in a scratch dir, with no GitHub token and no PR. Refuses
         (with a sentence for the requester) when the runner isn't set up, the repo is
         ambiguous or unknown, or Resonant is paused. Two runs on one repo go at once, each in
-        its own worktree."""
+        its own worktree. ``report="now"`` texts the run's end right away (``/run``, or the
+        owner asked to hear); by default it goes to the digest (``runners/reports.py``)."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text)
         ask = ask.strip()
@@ -786,6 +792,7 @@ class ClaudeRunner:
             max_seconds=self.max_session_s,
             max_budget_usd=self.cfg.max_budget_usd,
         )
+        self.reports.set_report(run.code, report)
         spec = NewTask(
             kind=TASK_KIND,
             runner=RUNNER_NAME,
@@ -896,6 +903,7 @@ class ClaudeRunner:
         with atomic(self.conn):
             runs.update(self.conn, run.code, status="merged", flagged_paths=checked.flagged)
             audit(self.conn, "run.merged", run=run.code, pr=run.pr_number)
+        await self._report_merged(self._must_get(run.code), by_owner=True)
         with contextlib.suppress(Exception):
             await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
         await self._remove_workspace(run)
@@ -957,6 +965,30 @@ class ClaudeRunner:
         run = runs.get(self.conn, code)
         if run is not None and run.status == "running":
             self._pulse_open(run)
+
+    async def _on_worker_event(self, event: WorkerEvent) -> None:
+        """EM-6: notes by urgency. A plain note only updates the run's digest line (the
+        desk's ``on_note``); an urgent one is texted now unless a rule holds it for the
+        digest. Questions and checks are texted by the relay (EM-5) and the trust prompt
+        (EM-4), never here."""
+        if event.kind != "note":
+            return
+        run = runs.get(self.conn, event.run_code)
+        if run is None or run.status != "running":
+            return
+        kind = "urgent" if event.urgent else "note"
+        level = self.reports.level(run, kind)
+        self.reports.audit_report(run, kind, level)
+        if level != "now" or (text := self.reports.note_text(run)) is None:
+            return
+        item = self.reports.running(run, _bucket(run.session_seconds))
+        key = f"run:{run.code}:note:{event.at.isoformat()}"
+        try:
+            await self.channel.send(run.principal, text, dedupe_key=key)
+        except ChannelError as e:  # the digest line still carries the note
+            log.warning("note not texted", extra={"run": run.code, "reason": str(e)})
+            return
+        self.reports.told(item)
 
     def _peer_ok(self, code: str, pid: int | None) -> bool:
         """A CLI caller speaks for run ``code`` only from inside its live session."""
@@ -1776,7 +1808,6 @@ class ClaudeRunner:
         if run.status == "cancelled":
             await self._finish_cancelled(run.code, send=False)
         else:
-            self._pulse_clear(run)
             await self._deprovision(run.code)
             await self._end_cli(run.code)
         try:
@@ -1800,18 +1831,58 @@ class ClaudeRunner:
         return None if state == "error" else state
 
     async def _send_reply(self, run: Run) -> None:
+        """Report an ended run by urgency (``runners/reports.py``): its digest line is
+        written untold, then, when it is ``now``, the full reply is texted and the line
+        marked told. A refused text leaves the line for the next digest. A cancel is always
+        texted (the owner did it), and so is a token that wasn't revoked."""
         repo = repo_store.find(self.conn, run.repo)
         no_ci = repo is not None and repo.mode == "push" and repo.ci is False
-        text = reply_text(run, await self._ci_word(run), no_ci=no_ci)
+        ci = await self._ci_word(run)
+        text = reply_text(run, ci, no_ci=no_ci)
+        event = end_event(run)
+        warned = False
         if text is not None and (expires := self._unrevoked.pop(run.code, None)) is not None:
             at = expires.astimezone(self.tz).strftime("%H:%M")
             text += f"\n⚠ the run's GitHub token wasn't revoked; it expires at {at}."
-        if text is None:
-            return
+            warned = True
+        if text is None or event is None:
+            self.reports.clear_silently(run)
+            if text is None:
+                return
+            item = None
+        else:
+            level = "now" if warned else self.reports.level(run, event)
+            self.reports.audit_report(run, event, level)
+            item = self.reports.ended(run, end_title(run, ci), urgent=level == "now")
+            if level == "digest":
+                return
         try:
             await self.channel.send(run.principal, text, dedupe_key=f"run:{run.code}:{run.status}")
-        except ChannelRefused:
+        except ChannelRefused:  # nobody took it: the digest carries the line
             log.warning("run reply refused", extra={"run": run.code})
+            return
+        if item is not None:
+            self.reports.told(item)
+
+    async def _report_merged(self, run: Run, *, by_owner: bool) -> None:
+        """A merged run's digest line. ``by_owner``: the merge answered the owner's own
+        ``/merge`` (or a yes), which already got the reply, so the line is marked told.
+        Otherwise (EM-7's merge per trust rules) it goes by the ``merged`` level."""
+        item = self.reports.ended(run, end_title(run), urgent=False)
+        if by_owner:
+            self.reports.told(item)
+            return
+        level = self.reports.level(run, "merged")
+        self.reports.audit_report(run, "merged", level)
+        if level == "digest":
+            return
+        try:
+            await self.channel.send(run.principal, end_title(run),
+                                    dedupe_key=f"run:{run.code}:merged")  # fmt: skip
+        except ChannelError as e:
+            log.warning("merge not texted", extra={"run": run.code, "reason": str(e)})
+            return
+        self.reports.told(item)
 
     async def _finish_cancelled(self, code: str, *, send: bool = True) -> None:
         """What a cancelled run still needs once its processes are gone: its dir deleted, its
@@ -1923,8 +1994,13 @@ class ClaudeRunner:
             ):
                 ended.append(run)
         for run in ended:
-            self._pulse_clear(run)
-            if self._must_get(run.code).status == "cancelled":
+            current = self._must_get(run.code)
+            if current.status == "failed":  # no step will conclude it: report it here
+                with contextlib.suppress(ChannelError):
+                    await self._send_reply(current)
+            else:
+                self._pulse_clear(run)
+            if current.status == "cancelled":
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
                 await self._remove_workspace(self._must_get(run.code))
@@ -1962,32 +2038,13 @@ class ClaudeRunner:
     # -- pulse --
 
     def _pulse_open(self, run: Run, bucket: str | None = None) -> None:
-        """The ``normal`` pulse item while a run goes: mentioned by the next hourly pulse."""
-        started = run.started_at or self.clock()
-        at = started.astimezone(self.tz).strftime("%H:%M")
-        labels = {"waiting": "waiting for usage reset", "question": "waiting for your answer"}
-        what = labels.get(bucket or "", "still running")
-        title = f"{run.code} {what} · {run.repo or 'no repo'} · started {at}"
-        if run.last_note and bucket != "question":
-            title += f" · {run.last_note}"
-        state = {"bucket": bucket or _bucket(run.session_seconds)}
-        now = self.clock()
-        with atomic(self.conn):
-            pulse_store.upsert(self.conn, PULSE_SOURCE, _pulse_key(run.code), title, "normal",
-                               state, False, PULSE_TTL_S, now)  # fmt: skip
+        """The ``normal`` pulse item while a run goes: mentioned by the next hourly pulse
+        (``runners/reports.py``), with the worker's latest note."""
+        self.reports.running(run, bucket or _bucket(run.session_seconds))
 
     def _pulse_clear(self, run: Run) -> None:
-        """Clear the item silently: the owner gets the direct reply, not a pulse mention."""
-        key, now = _pulse_key(run.code), self.clock()
-        with atomic(self.conn):
-            if pulse_store.get(self.conn, PULSE_SOURCE, key) is None:
-                return
-            _change, item = pulse_store.upsert(
-                self.conn, PULSE_SOURCE, key, f"{run.code} finished · {run.repo or 'no repo'}",
-                "normal",
-                {"bucket": "done"}, True, PULSE_TTL_S, now,
-            )  # fmt: skip
-            pulse_store.mark_told(self.conn, [item], now)
+        """Clear the item silently: the owner got a direct reply (a cancel)."""
+        self.reports.clear_silently(run)
 
 
 # --- helpers -------------------------------------------------------------------------------
@@ -2003,10 +2060,6 @@ async def _finish_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.
     except asyncio.CancelledError:
         await asyncio.wait([fut])
         raise
-
-
-def _pulse_key(code: str) -> str:
-    return f"run/{code.lower()}"
 
 
 def _bucket(seconds: float) -> str:
