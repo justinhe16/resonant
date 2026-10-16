@@ -114,7 +114,13 @@ from resonant.router.prefixes import (
     wrap_prior_reply,
     wrap_untrusted,
 )
-from resonant.router.render import render_disk, render_logs, render_projects, render_runs
+from resonant.router.render import (
+    render_disk,
+    render_logs,
+    render_projects,
+    render_rules,
+    render_runs,
+)
 from resonant.router.router import builtin_names, chat_toolset
 from resonant.runners.approve import prompt_approvers
 from resonant.runners.job import SUMMARY_MAX, done_text, failed_text
@@ -238,6 +244,7 @@ _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "projects": render_projects,
     "recent_logs": render_logs,
     "list_runs": render_runs,
+    "list_trust_rules": render_rules,
     "system_status": render_mini,
     "task_counts": render_counts,
 }
@@ -365,6 +372,27 @@ def _muted(d: dict[str, Any]) -> str | None:
     return f"Unmuted {ext}." if d.get("muted_until") is None else None
 
 
+def _rule_added(d: dict[str, Any]) -> str | None:
+    rule_id, text = d.get("id"), d.get("text")
+    if not isinstance(rule_id, int) or not isinstance(text, str):
+        return None
+    if d.get("existed") is True:
+        return f"Rule already there: {text} (rule {rule_id})."
+    line = f"Rule added: {text} (rule {rule_id})"
+    old = d.get("replaced")
+    if isinstance(old, dict):
+        old_d = cast(dict[str, Any], old)
+        line += f", replacing rule {old_d.get('id', '?')} ({old_d.get('text', '')})"
+    return line + "."
+
+
+def _rule_removed(d: dict[str, Any]) -> str | None:
+    rule_id, text = d.get("id"), d.get("text")
+    if d.get("removed") is not True or not isinstance(rule_id, int) or not isinstance(text, str):
+        return None
+    return f"Rule removed: {text} (rule {rule_id})."
+
+
 def summarize_intent(intent: Intent) -> str:
     """The code-built phrase for ``intent`` in replies: the ops heading (``update Resonant``)
     when there is one, as in approval prompts and dry-run replies, else the generic summary."""
@@ -386,6 +414,9 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "start_run": _run_text,
     "cancel_run": _run_text,
     "merge_run": _run_text,
+    "add_trust_rule": _rule_added,
+    "allow_trust_rule": _rule_added,
+    "remove_trust_rule": _rule_removed,
 }
 
 

@@ -30,6 +30,7 @@ BuiltinIntent = Literal[
     "reminders",
     "ops",
     "run_project",
+    "rules",
     "unknown",
 ]
 # A builtin intent, or ``extension:<name>`` for a loaded extension. Always validated against
@@ -59,13 +60,19 @@ INTENT_DEFINITIONS: dict[BuiltinIntent, str] = {
         "asks Claude to do coding work in a repo (fix, change, open a PR), or about Claude runs "
         "(R3): what is going, cancel or merge one; not general updates or status"
     ),
+    "rules": (
+        "asks to set, list or forget trust rules: when Claude runs should or shouldn't ask "
+        "first, or when to text right away"
+    ),
     "unknown": "anything else, or unclear",
 }
 
 # Builtin tools (extension None) per intent. Filtered by principal before the model sees them.
 # A model-chosen call is always ``origin="inferred"``: the gate runs L3 and reports, asks a
-# plain yes for L2 (restart_resonant, update_resonant, merge_run) and a code for L1
-# (clear_notes). start_run is L3: the sandbox is the wall, so the owner's request is the go-ahead.
+# plain yes for L2 (restart_resonant, update_resonant, merge_run, allow_trust_rule,
+# remove_trust_rule) and a code for L1 (clear_notes). start_run is L3: the sandbox is the
+# wall, so the owner's request is the go-ahead. add_trust_rule is L3: it only tightens trust
+# or sets urgency; anything that widens trust (allow, forget) asks.
 INTENT_TOOLS: dict[BuiltinIntent, tuple[str, ...]] = {
     "question": (),
     "job_control": ("list_tasks", "projects", "task_counts"),
@@ -81,6 +88,7 @@ INTENT_TOOLS: dict[BuiltinIntent, tuple[str, ...]] = {
     "reminders": ("add_reminder", "cancel_reminder", "list_reminders"),
     "ops": ("disk", "recent_logs", "restart_ollama", "restart_resonant", "update_resonant"),
     "run_project": ("cancel_run", "list_runs", "merge_run", "start_run"),
+    "rules": ("add_trust_rule", "allow_trust_rule", "list_trust_rules", "remove_trust_rule"),
     "unknown": (),
 }
 

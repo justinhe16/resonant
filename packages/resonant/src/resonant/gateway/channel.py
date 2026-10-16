@@ -42,12 +42,18 @@ class ApprovalPrompt:
     level: str
     expires_at: datetime
     require_code: bool = False  # L1 (destructive or pay): only "yes <code>" counts
+    always: bool = False  # a worker's trust check: the prompt offers "yes always"
 
     def text(self) -> str:
-        """The prompt as sent: the destructive variant for L1 writes, the pay variant for pay."""
+        """The prompt as sent: the destructive variant for L1 writes, the pay variant for pay,
+        the ``yes always`` variant for a worker's trust check."""
         destructive = self.level == Level.L1.value and self.effect != Effect.PAY.value
         return approval_text(
-            self.code, self.summary, require_code=self.require_code, destructive=destructive
+            self.code,
+            self.summary,
+            require_code=self.require_code,
+            destructive=destructive,
+            always=self.always and not self.require_code and not destructive,
         )
 
 
