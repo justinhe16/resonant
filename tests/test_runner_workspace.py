@@ -548,8 +548,9 @@ async def test_remove_workspace_removes_the_worktree_and_its_branch_only(env: En
     (p.workspace / ".env").symlink_to(env.checkout / ".env")
     (p.workspace / "out").symlink_to(env.root / "keep")
     env.session(p, {"a.txt": "a\n"})
+    head = git(p.workspace, "rev-parse", "HEAD")
     assert await env.ws.remove_workspace(
-        "R1", workspace=p.workspace, checkout=p.checkout, branch=p.branch
+        "R1", workspace=p.workspace, checkout=p.checkout, branch=p.branch, expect=head
     )
     assert not p.workspace.exists()
     assert (env.checkout / ".env").read_text() == "SECRET=1\n"  # links unlinked, not followed
@@ -567,9 +568,83 @@ async def test_remove_workspace_removes_the_worktree_and_its_branch_only(env: En
 async def test_remove_workspace_never_touches_the_owners_branch(env: Env) -> None:
     p = await env.prepare("R1")
     await env.ws.remove_workspace("R1", workspace=p.workspace, checkout=p.checkout,
-                                  branch="main")  # fmt: skip
+                                  branch="main", expect=p.base_sha)  # fmt: skip
     assert "main" in git(env.checkout, "branch", "--format=%(refname:short)")
     assert git(env.checkout, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+
+
+async def test_a_run_branch_the_owner_moved_or_checked_out_is_kept(env: Env) -> None:
+    def branches() -> str:
+        return git(env.checkout, "branch", "--format=%(refname:short)")
+
+    # moved: the owner committed to it after the run (the run recorded the base)
+    p = await env.prepare("R1")
+    env.session(p, {"owner.txt": "the owner's review fix\n"})
+    await env.ws.remove_workspace("R1", workspace=p.workspace, checkout=p.checkout,
+                                  branch=p.branch, expect=p.base_sha)  # fmt: skip
+    assert not p.workspace.exists() and p.branch in branches()
+    # checked out: the owner is on it in their checkout
+    q = await env.prepare("R2")
+    git(q.workspace, "checkout", "-q", "--detach")
+    git(env.checkout, "checkout", "-q", q.branch)
+    await env.ws.remove_workspace("R2", workspace=q.workspace, checkout=q.checkout,
+                                  branch=q.branch, expect=q.base_sha)  # fmt: skip
+    assert q.branch in branches()
+    assert git(env.checkout, "rev-parse", "--abbrev-ref", "HEAD") == q.branch
+    # no sha to compare against: kept
+    r = await env.prepare("R3")
+    await env.ws.remove_workspace("R3", workspace=r.workspace, checkout=r.checkout,
+                                  branch=r.branch)  # fmt: skip
+    assert r.branch in branches()
+
+
+async def test_a_failed_clone_leaves_nothing_in_the_way(env: Env) -> None:
+    real = env.remote
+    env.remote = env.root / "missing.git"
+    with pytest.raises(RunnerError, match="cloning own/proj failed"):
+        await env.prepare("R1")
+    assert not env.checkout.exists()
+    assert [n for n in os.listdir(env.cfg.code_dir) if n.startswith(".proj")] == []
+    env.remote = real
+    p = await env.prepare("R2")
+    assert (p.workspace / "README.md").exists()
+    assert stat.S_IMODE(env.checkout.stat().st_mode) == 0o755
+
+
+async def test_a_checkout_path_must_be_a_plain_checkout_apart_from_resonants_dirs(
+    env: Env,
+) -> None:
+    for bad in (env.cfg.work_dir / "x", env.cfg.mirror_dir, env.cfg.code_dir / ".worktrees",
+                env.cfg.code_dir / ".scratch" / "x", env.cfg.secrets_dir.parent):  # fmt: skip
+        repo_store.set_path(env.conn, "own/proj", bad)
+        with pytest.raises(RunnerError, match="overlaps Resonant's own dirs"):
+            await env.prepare("R1")
+    owner = env.root / "elsewhere" / "proj"
+    git(env.root, "clone", "-q", str(env.remote), str(owner))
+    linked = env.root / "linked"
+    git(owner, "worktree", "add", "-q", str(linked))
+    repo_store.set_path(env.conn, "own/proj", linked)  # a linked worktree: .git is a file
+    with pytest.raises(RunnerError, match="isn't a plain checkout"):
+        await env.prepare("R1")
+
+
+async def test_the_checkout_never_raises_the_recorded_ci(tmp_path: Path) -> None:
+    env = Env(tmp_path, ci=False)
+    await env.prepare("R1")
+    assert env.conn.execute("SELECT ci FROM repos").fetchone()["ci"] == 0
+    # CI arrives on the base: the (worker-writable) checkout says so, but only the daemon-only
+    # mirror may raise a repo recorded without CI (a merge's recheck does)
+    seed = env.root / "seed"
+    (seed / ".github" / "workflows").mkdir(parents=True)
+    (seed / ".github" / "workflows" / "ci.yml").write_text("on:\n  pull_request:\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "ci")
+    git(seed, "push", "-q", str(env.remote), "main")
+    await env.prepare("R2")
+    assert env.conn.execute("SELECT ci FROM repos").fetchone()["ci"] == 0
+    env.conn.execute("UPDATE repos SET ci = NULL")
+    await env.prepare("R3")  # unknown: the checkout's word is taken
+    assert env.conn.execute("SELECT ci FROM repos").fetchone()["ci"] == 1
 
 
 async def test_remove_workspace_refuses_anything_but_a_run_workspace(env: Env) -> None:

@@ -14,8 +14,9 @@ Trust rules this module keeps:
 
 - The owner's checkout is only ever fetched into (``refs/remotes/origin/<base>``) and given
   worktrees and their ``resonant/…`` branches: its working tree, its current branch and its
-  config are never touched. A checkout is never deleted; only a run's worktree or scratch dir
-  is, and only at the exact path the run recorded under ``code_dir``.
+  config are never touched. A first clone lands in a temp dir and is renamed into place. A
+  checkout is never deleted; only a run's worktree or scratch dir is, and only at the exact
+  path the run recorded under ``code_dir``.
 - The session's git finds the run's credential helper through ``GIT_CONFIG_*`` in its
   environment (``session_git_env``), not through any config file, so nothing about the run's
   token reaches the checkout's config and the owner's own pushes are unchanged.
@@ -38,10 +39,14 @@ Trust rules this module keeps:
   ``gh/hosts.yml``. It is never in env or argv. The daemon writes there only through
   directory fds with ``O_NOFOLLOW`` and ``rename``, so a link planted by the session can't
   redirect a write.
-- Accepted risk: a worker can change its checkout's ``.git/config`` (a smudge filter, say), and
-  the daemon's next worktree checkout in that repo would run it outside the sandbox. The owner's
-  own git in that checkout would run it too; the thin guard (docs/employee-plan.md D2) does not
-  cover checkouts.
+- Accepted risk: a worker can write its checkout's ``.git`` (it must, to commit): hooks the
+  owner's git runs, the owner's refs, and config the daemon's git still reads (a smudge filter
+  on the next ``worktree add``, ``http.*`` settings on the daemon's token-carrying fetch).
+  Daemon git there overrides hooks, fsmonitor, ``sshCommand``, gc and protocols; the rest is
+  the honor-system trust of docs/employee-plan.md D4 (the thin guard, D2, protects Resonant,
+  not checkouts).
+- Branch hygiene: a run's ``resonant/…`` branch is deleted only by compare-and-delete against
+  the sha the run left, and never while a worktree has it checked out.
 """
 
 from __future__ import annotations
@@ -56,6 +61,7 @@ import signal
 import sqlite3
 import stat
 import tempfile
+import weakref
 from collections.abc import Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -121,6 +127,13 @@ _GITHUB_REMOTE = re.compile(
     r"(?:https?://(?:[^@/]+@)?|ssh://(?:[^@/]+@)?|[^@/:]+@)github\.com[:/]"
     r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?",
     re.IGNORECASE,
+)
+
+
+# Checkout locks, per event loop and repo, shared by every Workspace (the runner's and the
+# daily cleanup job's) so their git in one checkout never overlaps.
+_CHECKOUT_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = (
+    weakref.WeakKeyDictionary()
 )
 
 
@@ -541,7 +554,6 @@ class Workspace:
         # The git URL of a repo. Always https without credentials; tests point it at a path.
         self._url_for: Callable[[Repo], str] = url_for or _https_url
         self._locks: dict[str, asyncio.Lock] = {}
-        self._checkout_locks: dict[str, asyncio.Lock] = {}
         self._git_bin = str(cfg.git_path)
 
     # -- locks and paths --
@@ -662,8 +674,10 @@ class Workspace:
 
     def checkout_lock(self, repo_name: str) -> asyncio.Lock:
         """The per-repo checkout lock: clone, fetch, worktree add and remove each take it (two
-        runs on one repo each get a worktree, one after the other). Not re-entrant."""
-        return self._checkout_locks.setdefault(repo_name.lower(), asyncio.Lock())
+        runs on one repo each get a worktree, one after the other). Shared by every
+        ``Workspace`` on the running loop. Not re-entrant."""
+        locks = _CHECKOUT_LOCKS.setdefault(asyncio.get_running_loop(), {})
+        return locks.setdefault(repo_name.lower(), asyncio.Lock())
 
     def checkout_path(self, repo: Repo) -> Path:
         """The owner's checkout: the repo's ``path``, else ``<code_dir>/<name>``."""
@@ -706,18 +720,32 @@ class Workspace:
         existing one must be a git checkout whose ``origin`` is this repo. Caller holds the
         checkout lock."""
         path = self.checkout_path(repo)
+        self._check_checkout_place(path)
         url = self._url_for(repo)
         if not await asyncio.to_thread(os.path.lexists, path):
             path.parent.mkdir(parents=True, exist_ok=True)
+            # cloned beside the final place and renamed in, so a clone cut short (a cancel, a
+            # kill) never leaves a half checkout in the way of the next run
+            tmp = Path(tempfile.mkdtemp(prefix=f".{path.name}.clone-", dir=path.parent))
             try:
-                await self._git(["clone", "-q", "--", url, str(path)], token=token,
+                await self._git(["clone", "-q", "--", url, str(tmp)], token=token,
                                 extra=_CHECKOUT_CONFIG)  # fmt: skip
+                os.chmod(tmp, 0o755)  # noqa: S103  # a normal checkout, not mkdtemp's 0700
+                os.rename(tmp, path)
             except GitError as e:
                 raise RunnerError(f"cloning {repo.slug} failed: {e.message[-120:]}") from None
+            finally:
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(rmtree_nofollow, tmp)
             return path
         not_ours = RunnerError(f"{path} is in the way: it isn't a git checkout of {repo.slug}")
         if not await asyncio.to_thread(path.is_dir):
             raise not_ours
+        if not await asyncio.to_thread(os.path.lexists, path / ".git"):
+            raise not_ours
+        if not await asyncio.to_thread(os.path.isdir, path / ".git"):
+            # a linked worktree or a submodule: its git dir lives elsewhere
+            raise RunnerError(f"{path} isn't a plain checkout (its .git isn't a directory)")
         try:
             top = (await self._in_checkout(path, "rev-parse", "--show-toplevel")).decode().strip()
             origin = await self._in_checkout(path, "config", "--get", "remote.origin.url")
@@ -730,6 +758,17 @@ class Workspace:
         if origin_url != url and (slug is None or slug.lower() != repo.slug.lower()):
             raise RunnerError(f"{path}'s origin isn't {repo.slug}")
         return path
+
+    def _check_checkout_place(self, path: Path) -> None:
+        """A checkout (a repo's ``path``) may not sit in or over Resonant's own dirs: the run,
+        mirror, secrets and cache dirs, or the worktree and scratch roots."""
+        cfg = self.cfg
+        own = (cfg.work_dir, cfg.mirror_dir, cfg.secrets_dir, cfg.cache_dir,
+               cfg.code_dir / WORKTREES, cfg.code_dir / SCRATCH)  # fmt: skip
+        if not path.is_absolute() or any(
+            path.is_relative_to(d) or d.is_relative_to(path) for d in own
+        ):
+            raise RunnerError(f"{path} can't be a checkout: it overlaps Resonant's own dirs")
 
     async def prepare(self, code: str, repo_name: str, ask: str, *, github_token: str) -> Prepared:
         """Make the run's places: the checkout (cloned on first use) fetched, a worktree on a
@@ -768,11 +807,15 @@ class Workspace:
             except GitError:
                 has_ci = False
             # No CI is allowed (docs/repos-plan.md D5): the registry records it, the run's
-            # reply says so, and merging is what's refused (after a look at the mirror).
-            with atomic(self.conn):
-                repo_store.set_ci(self.conn, repo.slug, has_ci)
+            # reply says so, and merging is what's refused (after a look at the mirror). The
+            # checkout is worker-writable, so its word only ever lowers what is recorded: a
+            # repo recorded without CI is only raised by the mirror (``_recheck_ci``).
+            if not has_ci or repo.ci is None:
+                with atomic(self.conn):
+                    repo_store.set_ci(self.conn, repo.slug, has_ci)
 
-            await self._remove_worktree(code, worktree, checkout, branch)
+            # a leftover from a crash (its branch is reset by ``-B`` below)
+            await self._remove_worktree(code, worktree, checkout, None)
             run_dir = await asyncio.to_thread(self._run_dir, code)
             try:
                 worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -786,8 +829,9 @@ class Workspace:
                 linked = await asyncio.to_thread(link_local_config, checkout, worktree, tracked)
                 (run_dir / EXCLUDE_FILE).write_text("".join(f"/{n}\n" for n in linked))
             except BaseException:
-                await self._remove_worktree(code, worktree, checkout, branch)
-                await asyncio.to_thread(rmtree_nofollow, run_dir)
+                with contextlib.suppress(Exception):  # never hide why prepare failed
+                    await self._remove_worktree(code, worktree, checkout, branch, base_sha)
+                    await asyncio.to_thread(rmtree_nofollow, run_dir)
                 raise
         return Prepared(code, repo.name, run_dir, worktree, checkout, branch, repo.base, base_sha)
 
@@ -831,15 +875,22 @@ class Workspace:
         return rmtree_nofollow(path)
 
     async def _remove_worktree(
-        self, code: str, worktree: Path, checkout: Path | None, branch: str | None
+        self,
+        code: str,
+        worktree: Path,
+        checkout: Path | None,
+        branch: str | None,
+        expect: str | None = None,
     ) -> bool:
         """``git worktree remove --force`` in the checkout; whatever git couldn't remove is
-        deleted (checked place, no links followed) and the checkout's worktree list pruned.
-        Then the run's own ``resonant/<code>-…`` branch is deleted from the checkout. Caller
-        holds the checkout lock. The checkout itself is never deleted."""
+        deleted (checked place, no links followed) along with the checkout's admin entry for
+        that one worktree. Then the run's own ``resonant/<code>-…`` branch is deleted, but only
+        while it still points at ``expect`` (what the run left there) and no worktree has it
+        checked out: a branch the owner checked out or committed to is kept. Caller holds the
+        checkout lock. The checkout itself is never deleted."""
         if self._workspace_kind(worktree, code) != "worktree":
             raise RunnerError(f"refusing to remove {worktree}: not a run's worktree")
-        usable = checkout is not None and await asyncio.to_thread(os.path.exists, checkout / ".git")
+        usable = checkout is not None and await asyncio.to_thread(os.path.isdir, checkout / ".git")
         removed = False
         if usable and checkout is not None and await asyncio.to_thread(os.path.lexists, worktree):
             try:
@@ -850,13 +901,19 @@ class Workspace:
                 pass
         if await asyncio.to_thread(os.path.lexists, worktree):
             removed = await asyncio.to_thread(self._remove_checked, worktree) or removed
-            if usable and checkout is not None:
-                with contextlib.suppress(GitError):
-                    await self._in_checkout(checkout, "worktree", "prune")
+        if usable and checkout is not None:
+            await asyncio.to_thread(_drop_admin_entry, checkout, worktree)
         own = f"resonant/{code.lower()}-"
-        if usable and checkout is not None and branch and branch.startswith(own):
-            with contextlib.suppress(GitError):  # gone already, or checked out by the owner
-                await self._in_checkout(checkout, "branch", "-q", "-D", branch)
+        if not (usable and checkout is not None and branch and expect):
+            return removed
+        if not (branch.startswith(own) and _SHA.fullmatch(expect)):
+            return removed
+        with contextlib.suppress(GitError):
+            listed = await self._in_checkout(checkout, "worktree", "list", "--porcelain")
+            if f"branch refs/heads/{branch}\n" not in listed.decode(errors="replace") + "\n":
+                # compare-and-delete: refused when the branch moved since the run
+                await self._in_checkout(checkout, "update-ref", "-d", f"refs/heads/{branch}",
+                                        expect)  # fmt: skip
         return removed
 
     async def remove_workspace(
@@ -866,11 +923,12 @@ class Workspace:
         workspace: str | Path | None,
         checkout: str | Path | None = None,
         branch: str | None = None,
+        expect: str | None = None,
     ) -> bool:
         """Remove a run's worktree (and its branch) or scratch dir: on cancel, on merge and
         ``runner.keep_days`` after the run ended. Only the exact place the run recorded under
-        ``code_dir`` is touched; anything else raises ``RunnerError``. False if nothing was
-        there."""
+        ``code_dir`` is touched; anything else raises ``RunnerError``. The branch goes only
+        while it still points at ``expect``. False if nothing was there."""
         if workspace is None:
             return False
         path = Path(workspace)
@@ -881,7 +939,7 @@ class Workspace:
             raise RunnerError(f"refusing to remove {path}: not a run's worktree or scratch dir")
         async with self.checkout_lock(path.parent.name):
             return await self._remove_worktree(
-                code, path, None if checkout is None else Path(checkout), branch
+                code, path, None if checkout is None else Path(checkout), branch, expect
             )
 
     # -- gh --
@@ -1193,3 +1251,20 @@ class Workspace:
         if merged.returncode != 0:
             raise MergeRefused(f"gh pr merge failed: {merged.stderr[-120:]}")
         return result
+
+
+def _drop_admin_entry(checkout: Path, worktree: Path) -> None:
+    """Remove the checkout's ``.git/worktrees/<id>`` whose ``gitdir`` is ``worktree``'s, once
+    that worktree's dir is gone (``git worktree prune`` would also drop the owner's own
+    worktrees whose dirs are only out of reach). Never raises."""
+    admin = checkout / ".git" / "worktrees"
+    want = {str(worktree / ".git"), os.path.join(os.path.realpath(worktree.parent),
+                                                 worktree.name, ".git")}  # fmt: skip
+    with contextlib.suppress(OSError):
+        if os.path.lexists(worktree):
+            return
+        for entry in os.listdir(admin):
+            gitdir = admin / entry / "gitdir"
+            with contextlib.suppress(OSError):
+                if gitdir.read_text().strip() in want:
+                    rmtree_nofollow(admin / entry)

@@ -49,8 +49,6 @@ class Target:
     leader_started_at: float | None
     run_dir: Path | None = None
     marker: str | None = None
-    # the run's worktree or scratch dir (EM-2): the session's cwd, also searched like run_dir
-    work_dir: Path | None = None
     # pid -> create_time of descendants seen alive (see ``sample``).
     known: dict[int, float] = field(default_factory=dict[int, float])
 
@@ -97,12 +95,13 @@ def _members(pgid: int) -> list[psutil.Process]:
 
 
 def _marked(t: Target) -> list[psutil.Process]:
-    """Own-user processes marked with the run's env marker or working inside its run dir (or
-    its worktree)."""
-    dirs = [os.path.realpath(d) for d in (t.run_dir, t.work_dir) if d is not None]
-    if t.marker is None and not dirs:
+    """Own-user processes marked with the run's env marker or working inside its run dir. Not
+    by a cwd in the run's worktree (EM-2): the owner may have an editor or a dev server open
+    there; the session's own processes carry the marker."""
+    if t.marker is None and t.run_dir is None:
         return []
     me, uid = os.getpid(), os.getuid()
+    run_dir = None if t.run_dir is None else os.path.realpath(t.run_dir)
     out: list[psutil.Process] = []
     for proc in psutil.process_iter():
         if proc.pid == me:
@@ -112,9 +111,9 @@ def _marked(t: Target) -> list[psutil.Process]:
                 continue
             if t.marker is not None and proc.environ().get(MARKER_ENV) == t.marker:
                 out.append(proc)
-            elif dirs and not proc.terminal():  # not the owner's terminal
+            elif run_dir is not None and not proc.terminal():  # not the owner's terminal
                 cwd = os.path.realpath(proc.cwd())
-                if any(cwd == d or cwd.startswith(d + os.sep) for d in dirs):
+                if cwd == run_dir or cwd.startswith(run_dir + os.sep):
                     out.append(proc)
         except (psutil.Error, OSError):
             continue

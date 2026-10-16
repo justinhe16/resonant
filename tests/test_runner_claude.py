@@ -591,6 +591,15 @@ async def test_the_checkouts_local_config_reaches_the_session(
     assert (h.checkout() / ".env").read_text() == "API_KEY=from-the-owner\n"
 
 
+async def test_a_run_from_before_worktrees_fails_clearly_on_resume(h: Harness) -> None:
+    code = await h.start()
+    runs_store.update(h.conn, code, status="running", step="session", branch="resonant/r1-x",
+                      base_branch="main", base_sha="a" * 40)  # fmt: skip
+    await h.drain()
+    run = h.run(code)
+    assert run.status == "failed" and "older version of Resonant" in (run.failure or "")
+
+
 async def test_api_key_billing_sets_the_budget_flag(tmp_path: Path, db: sqlite3.Connection) -> None:
     h = build(tmp_path, db, secrets=False)
     h.keychain.items[GITHUB_TOKEN_REF] = GH_TOKEN
@@ -1208,7 +1217,7 @@ async def test_cancel_during_the_session_ends_the_tree_and_deletes_the_dir(
     assert not live(pid) and not h.code_dir(code).exists()
     run = h.run(code)
     assert run.status == "cancelled" and run.pgid is None
-    assert run.workspace == str(h.worktree(code)) and not h.worktree(code).exists()
+    assert run.workspace is None and not h.worktree(code).exists()  # removed, then forgotten
     assert (h.checkout() / "README.md").exists()  # the checkout stays
     assert run.branch and run.branch not in git(h.checkout(), "branch", "--format=%(refname:short)")
     assert h.chan.texts() == ["R1 cancelled."]  # once, whichever path got there first
@@ -1517,6 +1526,8 @@ async def test_cleanup_job_deletes_old_run_dirs(tmp_path: Path, db: sqlite3.Conn
     out = await job.run({}, cast(Any, None))
     assert out["removed"] == 1 and not h.code_dir(code).exists()
     assert out["worktrees"] == 1 and not h.worktree(code).exists()
+    assert h.run(code).workspace is None  # done: the next day's job doesn't try again
+    assert (await job.run({}, cast(Any, None)))["worktrees"] == 0
     branch = h.run(code).branch
     assert branch and branch not in git(h.checkout(), "branch", "--format=%(refname:short)")
     assert git(h.checkout(), "worktree", "list", "--porcelain").count("worktree ") == 1

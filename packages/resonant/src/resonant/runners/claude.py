@@ -645,7 +645,6 @@ class ClaudeRunner:
             run.leader_started_at,
             run_dir=self.cfg.work_dir / run.code,
             marker=run.session_id,
-            work_dir=None if run.workspace is None else Path(run.workspace),
         )
 
     def _move_mirror(self, old: str, new: str) -> None:
@@ -961,9 +960,10 @@ class ClaudeRunner:
             workspace = run.workspace or self.workspace.scratch_path(run.code)
             return Prepared(run.code, "", run_dir, Path(workspace))
         assert run.branch and run.base_branch and run.base_sha
-        workspace = run.workspace or self.workspace.worktree_path(run.repo, run.code)
+        if run.workspace is None:  # prepared by a build before worktrees (EM-2)
+            raise RunnerError("it was started by an older version of Resonant; start it again")
         checkout = None if run.checkout is None else Path(run.checkout)
-        return Prepared(run.code, run.repo, run_dir, Path(workspace), checkout, run.branch,
+        return Prepared(run.code, run.repo, run_dir, Path(run.workspace), checkout, run.branch,
                         run.base_branch, run.base_sha)  # fmt: skip
 
     def _params(self, p: Prepared) -> SandboxParams:
@@ -1107,8 +1107,7 @@ class ClaudeRunner:
             created = psutil.Process(proc.pid).create_time()
         except psutil.Error:
             created = time.time()
-        target = Target(proc.pid, proc.pid, created, run_dir=p.run_dir, marker=run.session_id,
-                        work_dir=p.workspace)  # fmt: skip
+        target = Target(proc.pid, proc.pid, created, run_dir=p.run_dir, marker=run.session_id)
         self._live[run.code] = target
         runs.set_process(self.conn, run.code, proc.pid, proc.pid, created)
         stop = await self._supervise(w, run, p, proc, target, writer, state, prompt)
@@ -1690,10 +1689,13 @@ class ClaudeRunner:
                     checkout = str(self.workspace.checkout_path(repo))
         try:
             await self.workspace.remove_workspace(
-                run.code, workspace=workspace, checkout=checkout, branch=run.branch
-            )
+                run.code, workspace=workspace, checkout=checkout, branch=run.branch,
+                expect=run.head_sha or run.base_sha,
+            )  # fmt: skip
         except Exception as e:
             log.warning("run workspace not removed", extra={"run": run.code, "reason": str(e)})
+            return
+        runs.update(self.conn, run.code, workspace=None, checkout=None)  # nothing left to do
 
     def _insert_task(self, spec: NewTask) -> str:
         with transaction(self.conn):
@@ -1815,7 +1817,7 @@ def cleanup_job(deps: CoreDeps) -> CoreJob | None:
         )
         for error in result.errors:
             log.warning("run cleanup: %s", error)
-        workspace = Workspace(cfg, conn)
+        workspace = Workspace(cfg, conn)  # its checkout locks are the runner's (per loop)
         cutoff = time.time() - cfg.keep_days * 86400
         removed = 0
         for code, at in sorted(ended.items()):
@@ -1824,10 +1826,13 @@ def cleanup_job(deps: CoreDeps) -> CoreJob | None:
                 continue
             try:
                 removed += await workspace.remove_workspace(
-                    code, workspace=old.workspace, checkout=old.checkout, branch=old.branch
-                )
+                    code, workspace=old.workspace, checkout=old.checkout, branch=old.branch,
+                    expect=old.head_sha or old.base_sha,
+                )  # fmt: skip
             except Exception as e:  # one bad worktree must not stop the rest
                 log.warning("run cleanup: %s: %s", code, e)
+                continue
+            runs.update(conn, code, workspace=None, checkout=None)  # done: not tried again
         return {"removed": len(result.removed_runs), "worktrees": removed,
                 "freed_bytes": result.cache_freed_bytes, "errors": len(result.errors)}  # fmt: skip
 
