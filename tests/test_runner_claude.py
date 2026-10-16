@@ -257,6 +257,12 @@ class Harness:
     def code_dir(self, code: str) -> Path:
         return self.cfg.work_dir / code
 
+    def worktree(self, code: str, repo: str = "proj") -> Path:
+        return self.cfg.code_dir / ".worktrees" / repo / code
+
+    def checkout(self, repo: str = "proj") -> Path:
+        return self.cfg.code_dir / repo
+
     def tmp(self, code: str) -> Path:
         return self.code_dir(code) / "tmp"
 
@@ -379,6 +385,7 @@ def build(
         repos={name: RunnerRepo(remote=f"github.com/own/{name}") for name in repos},
         github_app=GitHubAppConfig(app_id=APP_ID, installation_id=INSTALLATION_ID),
         work_dir=root / "runs",
+        code_dir=root / "code",
         mirror_dir=root / "state" / "mirrors",
         cache_dir=root / "runs" / ".cache",
         secrets_dir=root / "state" / "secrets",
@@ -473,7 +480,7 @@ async def test_happy_path_ends_in_a_pr(h: Harness) -> None:
     assert "⚠" not in text
     task = task_store.get_task(h.conn, cast(str, run.task_id))
     assert task is not None and task.status == "done" and task.kind == "run"
-    assert task.claude_session_id == run.session_id and task.worktree_path == str(h.code_dir("R1"))
+    assert task.claude_session_id == run.session_id and task.worktree_path == str(h.worktree("R1"))
     # the session pushed the branch and opened the PR itself; the daemon only looked
     assert (
         git(h.remotes["proj"], "log", "-1", "--format=%s", run.branch or "") == "Fix the flaky test"
@@ -511,6 +518,77 @@ async def test_session_flags_environment_and_prompt(h: Harness) -> None:
     assert "ANTHROPIC_API_KEY" not in env and "SSH_AUTH_SOCK" not in env
     assert all(GH_TOKEN not in v for v in env.values())
     assert not any(k.startswith("RESONANT_SECRET") for k in env)
+    # the session works in its worktree; git finds the run's helper by env, gh by a path
+    assert call["cwd"] == str(h.worktree("R1"))
+    assert env["GH_CONFIG_DIR"] == f"{run_dir}/creds/gh"
+    config = [
+        (env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"])
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    ]
+    assert config[:2] == [
+        ("credential.helper", ""),
+        ("credential.helper", f"!{run_dir}/creds/credential-helper"),
+    ]
+    assert ("core.excludesFile", f"{run_dir}/git-exclude") in config
+    prompt = argv[argv.index("--append-system-prompt") + 1]
+    assert "worktree of own/proj" in prompt and ".env" in prompt
+    # and the session pushed through it, with the run's token, from its worktree
+    assert [t["rc"] for t in h.session_tools()] == [0] * len(h.session_tools())
+    assert "credential" not in (h.checkout() / ".git" / "config").read_text()
+
+
+async def test_a_run_with_no_repo_works_in_a_scratch_dir(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="scratch")
+    res = await h.runner.start_run(None, "how full is the disk?", "owner")
+    assert isinstance(res, Started) and res.repo == ""
+    assert res.text.startswith("On it: R1 · no repo. Up to")
+    assert isinstance(await h.runner.start_run("  ", "and now?", "owner"), Started)
+    await h.drain()
+    run = h.run("R1")
+    scratch = h.cfg.code_dir / ".scratch" / "R1"
+    assert run.status == "done" and run.repo == "" and run.scratch
+    assert run.workspace == str(scratch) and run.checkout is None
+    assert run.branch is None and run.pr_number is None
+    assert run.summary == "Checked the disk: 80% full, the biggest dir is ~/Downloads."
+    assert (scratch / "notes.md").exists()  # kept until keep_days, like a run dir
+    [call] = h.argv_log("R1")
+    assert call["cwd"] == str(scratch)
+    assert "GH_CONFIG_DIR" not in call["env"]
+    prompt = call["argv"][call["argv"].index("--append-system-prompt") + 1]
+    assert "scratch directory" in prompt and "no GitHub credentials" in prompt
+    assert h.api.issued == 0  # no GitHub token minted
+    assert h.gh_calls() == [] and h.gh_calls("api") == []
+    [text] = [t for t in h.chan.texts() if t.startswith("R1 ")]
+    assert text.startswith("R1 done (") and text.endswith(
+        "): Checked the disk: 80% full, the biggest dir is ~/Downloads."
+    )
+    assert not h.checkout().exists() and h.branches() == ["main"]
+    # cleanup after keep_days removes the scratch dir
+    runs_store.update(db, "R1", ended_at=utcnow() - timedelta(days=8))
+    deps = SimpleNamespace(settings=SimpleNamespace(runner=h.cfg), conn=db)
+    job = claude_mod.cleanup_job(cast(Any, deps))
+    assert job is not None
+    out = await job.run({}, cast(Any, None))
+    assert out["worktrees"] == 1 and not scratch.exists()
+
+
+async def test_the_checkouts_local_config_reaches_the_session(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="happy")
+    await h.start()
+    await h.drain()  # the first run clones the checkout
+    (h.checkout() / ".env").write_text("API_KEY=from-the-owner\n")
+    code = await h.start(ask="second")
+    await h.drain()
+    wt = h.worktree(code)
+    assert h.run(code).status == "ready"
+    assert (wt / ".env").is_symlink() and (wt / ".env").read_text() == "API_KEY=from-the-owner\n"
+    # the session's `git add -A` didn't commit it
+    assert ".env" not in git(wt, "show", "--name-only", "--format=", "HEAD")
+    assert (h.checkout() / ".env").read_text() == "API_KEY=from-the-owner\n"
 
 
 async def test_api_key_billing_sets_the_budget_flag(tmp_path: Path, db: sqlite3.Connection) -> None:
@@ -1066,7 +1144,7 @@ async def test_usage_limit_parks_the_run_then_resumes_the_session(
     assert task is not None and task.status == "waiting" and task.wait_reason == "usage_reset"
     assert task.wake_at is not None and task.wake_at > utcnow() + timedelta(minutes=50)
     assert h.loop.slots.in_use == 0 and h.chan.sent == []  # slot freed, nothing said yet
-    assert h.runner._locks["proj"].locked() is False  # pyright: ignore[reportPrivateUsage]
+    assert not h.runner._working  # pyright: ignore[reportPrivateUsage]
     session_before = run.session_seconds
 
     # The limit resets: wake the task (the clock moved on) and an hour of waiting passes.
@@ -1130,6 +1208,9 @@ async def test_cancel_during_the_session_ends_the_tree_and_deletes_the_dir(
     assert not live(pid) and not h.code_dir(code).exists()
     run = h.run(code)
     assert run.status == "cancelled" and run.pgid is None
+    assert run.workspace == str(h.worktree(code)) and not h.worktree(code).exists()
+    assert (h.checkout() / "README.md").exists()  # the checkout stays
+    assert run.branch and run.branch not in git(h.checkout(), "branch", "--format=%(refname:short)")
     assert h.chan.texts() == ["R1 cancelled."]  # once, whichever path got there first
     assert h.branches() == ["main"] and h.gh_calls() == []
     item = pulse_store.get(h.conn, "core", "run/r1")
@@ -1266,7 +1347,9 @@ async def test_runs_on_two_repos_go_at_once_and_the_third_waits(
     await killall(h)
 
 
-async def test_the_same_repo_runs_one_at_a_time(tmp_path: Path, db: sqlite3.Connection) -> None:
+async def test_two_runs_on_one_repo_go_at_once_in_their_own_worktrees(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
     h = build(tmp_path, db, scenario="happy", extra=["--sleep", "0.6"])
     c1, c2 = await h.start("proj", "first"), await h.start("proj", "second")
     t = h.spawn_loop()
@@ -1276,11 +1359,19 @@ async def test_the_same_repo_runs_one_at_a_time(tmp_path: Path, db: sqlite3.Conn
         overlap = overlap or len(running) > 1
         await asyncio.sleep(0.02)
     await t
-    assert not overlap
+    assert overlap
     assert h.run(c1).status == "ready" and h.run(c2).status == "ready"
     assert h.run(c1).pr_number != h.run(c2).pr_number and len(h.gh_calls("create")) == 2
-    assert h.run(c2).started_at and h.run(c1).ended_at
-    assert h.run(c2).started_at >= h.run(c1).ended_at  # type: ignore[operator]
+    assert h.run(c1).workspace == str(h.worktree(c1))
+    assert h.run(c2).workspace == str(h.worktree(c2))
+    for code in (c1, c2):  # each worked in its own worktree on its own branch
+        wt = h.worktree(code)
+        assert git(wt, "rev-parse", "--abbrev-ref", "HEAD") == h.run(code).branch
+        assert (wt / "claude-fix.txt").exists()
+    # the owner's checkout: one clone, still on main, nothing changed in its working tree
+    assert git(h.checkout(), "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert git(h.checkout(), "status", "--porcelain") == ""
+    assert not (h.checkout() / "claude-fix.txt").exists()
 
 
 async def test_the_global_limit_caps_sessions(tmp_path: Path, db: sqlite3.Connection) -> None:
@@ -1339,6 +1430,7 @@ async def test_merge_runs_through_the_workspace(h: Harness) -> None:
     merge = h.gh_calls("merge")[0]["argv"]
     assert merge[merge.index("--match-head-commit") + 1] == h.run(code).head_sha
     assert h.run(code).status == "merged" and not h.code_dir(code).exists()
+    assert not h.worktree(code).exists() and (h.checkout() / "README.md").exists()
     assert isinstance(await h.runner.merge_run(code), Refused)  # only once
 
 
@@ -1424,12 +1516,21 @@ async def test_cleanup_job_deletes_old_run_dirs(tmp_path: Path, db: sqlite3.Conn
     runs_store.update(db, code, ended_at=utcnow() - timedelta(days=8))
     out = await job.run({}, cast(Any, None))
     assert out["removed"] == 1 and not h.code_dir(code).exists()
+    assert out["worktrees"] == 1 and not h.worktree(code).exists()
+    branch = h.run(code).branch
+    assert branch and branch not in git(h.checkout(), "branch", "--format=%(refname:short)")
+    assert git(h.checkout(), "worktree", "list", "--porcelain").count("worktree ") == 1
+    assert (h.checkout() / "README.md").exists()  # the checkout is never deleted
     assert h.run(fresh).status == "queued"  # active runs are never touched
     empty = h.cfg.model_copy(update={"repos": {}})
     deps2 = SimpleNamespace(settings=SimpleNamespace(runner=empty), conn=db)
     assert claude_mod.cleanup_job(cast(Any, deps2)) is not None  # dirs exist: still cleaned
     bare = empty.model_copy(
-        update={"work_dir": tmp_path / "none", "cache_dir": tmp_path / "none" / "cache"}
+        update={
+            "work_dir": tmp_path / "none",
+            "cache_dir": tmp_path / "none" / "cache",
+            "code_dir": tmp_path / "no-code",
+        }
     )
     repo_store.forget(db, "proj")
     deps3 = SimpleNamespace(settings=SimpleNamespace(runner=bare), conn=db)

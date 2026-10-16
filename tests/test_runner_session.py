@@ -128,9 +128,9 @@ async def test_creds_dir_exists_with_the_helper_for_the_session(h: Harness) -> N
     assert stat.S_IMODE((creds / "token").stat().st_mode) == 0o600
     assert stat.S_IMODE((creds / "gh" / "hosts.yml").stat().st_mode) == 0o600
     assert stat.S_IMODE((creds / "credential-helper").stat().st_mode) == 0o700
-    config = (h.code_dir(code) / "repo" / ".git" / "config").read_text()
-    assert f"helper = !{creds}/credential-helper" in config
-    assert '[remote "origin"]' in config
+    # the helper reaches the session by env, never by the checkout's config
+    config = (h.checkout() / ".git" / "config").read_text()
+    assert "credential" not in config and '[remote "origin"]' in config
     await h.runner.cancel_run(code)
     await run_task
 

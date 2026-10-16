@@ -19,6 +19,7 @@ import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from resonant.store.db import atomic, now_iso
@@ -50,6 +51,7 @@ class Repo:
     source: str
     added_at: datetime
     last_used_at: datetime | None
+    path: Path | None = None  # the owner's checkout, when not <runner.code_dir>/<name> (009)
 
     @property
     def remote(self) -> str:
@@ -77,6 +79,8 @@ def _row(r: sqlite3.Row) -> Repo:
         source=r["source"],
         added_at=added,
         last_used_at=_dt(r["last_used_at"]),
+        # no column before migration 009 (a migration reading the registry part way)
+        path=Path(r["path"]) if "path" in r.keys() and r["path"] is not None else None,  # noqa: SIM118
     )
 
 
@@ -248,7 +252,7 @@ def touch(conn: sqlite3.Connection, slug: str) -> bool:
     )
 
 
-_TERMINAL = ("merged", "failed", "cancelled", "no_changes")
+_TERMINAL = ("merged", "failed", "cancelled", "no_changes", "done")
 
 
 def add_alias(conn: sqlite3.Connection, slug: str, alias: str) -> Repo:
@@ -281,6 +285,14 @@ def set_ci(conn: sqlite3.Connection, slug: str, ci: bool) -> bool:
     )
 
 
+def set_path(conn: sqlite3.Connection, slug: str, path: Path | None) -> bool:
+    """Where the owner's checkout of the repo lives (None: ``<runner.code_dir>/<name>``)."""
+    if path is not None and not path.is_absolute():
+        raise ValueError("a checkout path must be absolute")
+    value = None if path is None else str(path)
+    return conn.execute("UPDATE repos SET path = ? WHERE slug = ?", (value, slug)).rowcount == 1
+
+
 def open_runs(conn: sqlite3.Connection, name: str) -> list[str]:
     """Codes of the repo's runs that aren't over (including one ready to merge)."""
     rows = conn.execute("SELECT code, status FROM runs WHERE repo = ? COLLATE NOCASE", (name,))
@@ -308,7 +320,8 @@ def _rename(conn: sqlite3.Connection, repo: Repo, new_name: str, *, keep_old: bo
     ``keep_old`` leaves the old handle as an alias."""
     _check_handle(new_name)
     busy = conn.execute(
-        "SELECT 1 FROM runs WHERE repo = ? COLLATE NOCASE AND status NOT IN (?, ?, ?, ?) LIMIT 1",
+        "SELECT 1 FROM runs WHERE repo = ? COLLATE NOCASE AND status NOT IN (?, ?, ?, ?, ?)"
+        " LIMIT 1",
         (repo.name, *_TERMINAL),
     ).fetchone()
     if busy:
@@ -353,6 +366,7 @@ def _import_one(
             allow_github_changes=cfg.allow_github_changes,
             quote_ask=cfg.quote_ask,
         )
+        set_path(conn, cfg.slug, cfg.path)
         return
     if existing.name.lower() != name.lower():
         _rename(conn, existing, name, keep_old=True)
@@ -362,6 +376,7 @@ def _import_one(
         " WHERE slug = ?",
         (cfg.base, int(cfg.allow_github_changes), int(cfg.quote_ask), existing.slug),
     )
+    set_path(conn, existing.slug, cfg.path)
 
 
 def import_config(conn: sqlite3.Connection, configured: Mapping[str, RunnerRepo]) -> ImportResult:

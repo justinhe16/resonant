@@ -77,6 +77,7 @@ _PLACEHOLDERS = {
     "deny_read": ";; @DENY_READ@",
     "home_secrets": ";; @HOME_SECRETS@",
     "work_exempt": ";; @WORK_EXEMPT@",
+    "write": ";; @WRITE_ALLOW@",
 }
 
 
@@ -110,6 +111,9 @@ class SandboxParams:
     # runner.work_dir, the parent of every run dir: all of it is denied except this run's dir,
     # the cache and the read paths, wherever it sits (default: the run dir's parent)
     work_dir: Path | None = None
+    # the run's worktree and its checkout, or its scratch dir (EM-2): read and written like the
+    # run dir. The thin guard (EM-1) replaces this profile; until then this keeps runs working.
+    write_paths: tuple[Path, ...] = ()
 
     def resolved(self) -> SandboxParams:
         home = Path(checked_path(self.home))
@@ -128,11 +132,13 @@ class SandboxParams:
                 if inside or guarded.is_relative_to(d):
                     raise SandboxError(f"{what} {d} is, holds or is inside {guarded}")
         reads = tuple(Path(checked_path(p)) for p in self.read_paths if Path(p).exists())
+        writes = tuple(Path(checked_path(p)) for p in self.write_paths)
         secrets = Path(checked_path(self.secrets_dir))
         for what, path in (
             ("run dir", run),
             ("cache dir", cache),
             *(("read path", r) for r in reads),
+            *(("work path", w) for w in writes),
         ):
             if path.is_relative_to(secrets) or secrets.is_relative_to(path):
                 raise SandboxError(
@@ -150,6 +156,7 @@ class SandboxParams:
             deny_exec=tuple(Path(checked_path(p)) for p in self.deny_exec),
             deny_read=tuple(Path(checked_path(p)) for p in self.deny_read),
             secrets_dir=secrets,
+            write_paths=writes,
         )
 
 
@@ -203,11 +210,16 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
     """The profile text and its ``-D`` definitions for ``params``."""
     p = params.resolved()
     defs: dict[str, str] = {"RUN": str(p.run_dir), "CACHE": str(p.cache_dir), "HOME": str(p.home)}
-    reads = [p.run_dir, p.cache_dir, *p.read_paths]
+    reads = [p.run_dir, p.cache_dir, *p.read_paths, *p.write_paths]
     read_lines: list[str] = []
     for i, path in enumerate(p.read_paths):
         defs[f"READ_{i}"] = str(path)
         read_lines.append(f'  (subpath (param "READ_{i}"))')
+    write_lines: list[str] = []
+    for i, path in enumerate(p.write_paths):
+        defs[f"WRITE_{i}"] = str(path)
+        write_lines.append(f'  (subpath (param "WRITE_{i}"))')
+    read_lines += write_lines
     meta_lines: list[str] = []
     for i, path in enumerate(_ancestors(reads)):
         defs[f"META_{i}"] = path
@@ -220,6 +232,7 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
     # package's bundled cacert.pem); the system roots are spared in runner.sb itself
     exempt_lines = [f'  (subpath (param "{k}"))' for k in ("RUN", "CACHE")]
     exempt_lines += [f'  (subpath (param "READ_{i}"))' for i in range(len(p.read_paths))]
+    exempt_lines += write_lines
     deny_read_lines: list[str] = []
     for i, path in enumerate(p.deny_read):
         defs[f"DENY_READ_{i}"] = str(path)
@@ -235,6 +248,7 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
     work_lines = [f'  (subpath (param "{k}"))' for k in ("RUN", "CACHE")]
     work_lines += [f'  (subpath (param "READ_{i}"))' for i in range(len(p.read_paths))]
     work_lines += [f'  (literal (param "META_{i}"))' for i in range(len(meta_lines))]
+    work_lines += write_lines
     text = template_text()
     for key, lines in (
         ("read", read_lines),
@@ -244,6 +258,7 @@ def render(params: SandboxParams) -> tuple[str, dict[str, str]]:
         ("deny_read", deny_read_lines),
         ("home_secrets", home_secret_lines),
         ("work_exempt", work_lines),
+        ("write", write_lines),
     ):
         if _PLACEHOLDERS[key] not in text:
             raise SandboxError(f"runner.sb lost its {_PLACEHOLDERS[key]} placeholder")

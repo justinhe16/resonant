@@ -1,5 +1,6 @@
-"""The runner workspace: config, secrets, mirror, clone, bundle handback, publish, merge and
-cleanup. Local bare repos for the remote and a fake ``gh``; no network, no Keychain."""
+"""The runner workspace: config, secrets, checkouts, worktrees and scratch dirs, the mirror, PR
+checks, merge and cleanup. Local bare repos for the remote and a fake ``gh``; no network, no
+Keychain, and a temp dir as ``runner.code_dir`` (never the real ~/code)."""
 
 from __future__ import annotations
 
@@ -23,16 +24,16 @@ from resonant.runner import cleanup as cleanup_mod
 from resonant.runner import workspace as workspace_mod
 from resonant.runner.checks import CheckFailed
 from resonant.runner.workspace import (
-    BundleRefused,
     MergeRefused,
-    NoChanges,
     Prepared,
-    PublishAborted,
     RunnerError,
     Workspace,
     branch_name,
-    committer_env,
     git_env,
+    link_local_config,
+    local_config_name,
+    remote_slug,
+    session_git_env,
     slugify,
 )
 from resonant.secrets import FakeKeychain, RunnerSecrets, SecretStore
@@ -123,10 +124,6 @@ def git(cwd: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _ps() -> str:
-    return subprocess.run(["ps", "-axww", "-o", "command"], capture_output=True, text=True).stdout
-
-
 class Env:
     def __init__(self, root: Path, *, ci: bool = True) -> None:
         self.root = root
@@ -160,6 +157,7 @@ class Env:
         self.cfg = RunnerConfig(
             repos={"proj": RunnerRepo(remote="github.com/own/proj")},
             work_dir=root / "runs",
+            code_dir=root / "code",
             mirror_dir=root / "state" / "mirrors",
             cache_dir=root / "runs" / ".cache",
             secrets_dir=root / "state" / "secrets",
@@ -199,10 +197,25 @@ class Env:
         """A run whose session pushed its branch and opened PR 41 (plain git, the fake gh)."""
         p = await self.prepare()
         self.session(p, files or {"a.txt": "a\n"}, message)
-        git(p.repo_dir, "push", "-q", str(self.remote), p.branch)
-        head = git(p.repo_dir, "rev-parse", "HEAD")
+        git(p.workspace, "push", "-q", str(self.remote), p.branch)
+        head = git(p.workspace, "rev-parse", "HEAD")
         self.set_pr(p.branch, head, **over)
         return p, head
+
+    @property
+    def checkout(self) -> Path:
+        return self.cfg.code_dir / "proj"
+
+    def worktree(self, code: str = "R1") -> Path:
+        return self.cfg.code_dir / ".worktrees" / "proj" / code
+
+    def push_base(self, name: str, text: str = "n\n") -> None:
+        """A new commit on the remote's main (someone else pushed)."""
+        seed = self.root / "seed"
+        (seed / name).write_text(text)
+        git(seed, "add", "-A")
+        git(seed, "commit", "-q", "-m", f"add {name}")
+        git(seed, "push", "-q", str(self.remote), "main")
 
     def remote_branches(self) -> list[str]:
         out = git(self.remote, "for-each-ref", "--format=%(refname:short)", "refs/heads")
@@ -211,33 +224,22 @@ class Env:
     async def prepare(self, code: str = "R1", ask: str = "Fix the flaky test") -> Prepared:
         return await self.ws.prepare(code, "proj", ask, github_token=GH_TOKEN)
 
+    async def prepare_scratch(self, code: str = "R7") -> Prepared:
+        return await self.ws.prepare_scratch(code)
+
     def session(self, p: Prepared, files: dict[str, str], message: str = "Fix it") -> None:
-        """What Claude does in the clone, with plain git."""
+        """What Claude does in the worktree, with plain git."""
         for name, text in files.items():
-            f = p.repo_dir / name
+            f = p.workspace / name
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_text(text)
-        git(p.repo_dir, "add", "-A")
-        git(p.repo_dir, "commit", "-q", "-m", message)
-
-    async def bundle(self, p: Prepared, *, env: dict[str, str] | None = None) -> None:
-        await self.ws.harvest(
-            p, lambda argv: list(argv), env or {"PATH": "/usr/bin:/bin", **committer_env()}
-        )
-
-    async def deliver(self, p: Prepared, files: dict[str, str], message: str = "Fix it") -> str:
-        self.session(p, files, message)
-        await self.bundle(p)
-        return await self.ws.import_bundle(p)
+        git(p.workspace, "add", "-A")
+        git(p.workspace, "commit", "-q", "-m", message)
 
 
 @pytest.fixture
 def env(tmp_path: Path) -> Env:
     return Env(tmp_path)
-
-
-async def always() -> bool:
-    return True
 
 
 # --- config and secrets --------------------------------------------------------------------
@@ -349,34 +351,56 @@ def test_git_env_is_hardened() -> None:
     ]
 
 
-# --- prepare ---------------------------------------------------------------------------------
+# --- prepare: checkouts, worktrees, scratch dirs (docs/employee-plan.md D1) -------------------
 
 
-async def test_prepare_clones_and_branches(env: Env) -> None:
+def test_remote_slug_and_local_config_names() -> None:
+    for url in (
+        "https://github.com/own/proj",
+        "https://github.com/own/proj.git",
+        "https://x-access-token@github.com/own/proj/",
+        "git@github.com:own/proj.git",
+        "ssh://git@github.com/own/proj.git",
+    ):
+        assert remote_slug(url) == "own/proj", url
+    assert remote_slug("https://gitlab.com/own/proj") is None
+    assert remote_slug("/tmp/remote.git") is None
+    for name in (".env", ".env.local", ".env.production", ".envrc", ".tool-versions",
+                 ".python-version", ".node-version", ".mcp.json"):  # fmt: skip
+        assert local_config_name(name), name
+    for name in (".env.example", ".env.sample", ".env.template", ".ENV.EXAMPLE", "env", ".git",
+                 ".environment", "README.md"):  # fmt: skip
+        assert not local_config_name(name), name
+
+
+async def test_prepare_clones_the_checkout_and_adds_a_worktree(env: Env) -> None:
     p = await env.prepare("R3", "Fix the flaky pulse test")
     assert p.branch == "resonant/r3-fix-the-flaky-pulse-test"
-    assert p.repo_dir == env.cfg.work_dir / "R3" / "repo"
-    assert git(p.repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == p.branch
-    assert git(p.repo_dir, "rev-parse", "main") == p.base_sha
-    assert (p.repo_dir / "README.md").read_text() == "hello\n"
-    assert git(p.repo_dir, "remote", "get-url", "origin") == str(env.remote)
+    assert p.workspace == env.worktree("R3") and p.checkout == env.checkout
+    assert git(p.workspace, "rev-parse", "--abbrev-ref", "HEAD") == p.branch
+    assert git(env.remote, "rev-parse", "main") == p.base_sha
+    assert git(p.workspace, "rev-parse", "HEAD") == p.base_sha
+    assert (p.workspace / "README.md").read_text() == "hello\n"
+    # the checkout: cloned on first use from the plain URL, on its default branch
+    assert git(env.checkout, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert git(env.checkout, "remote", "get-url", "origin") == str(env.remote)
+    assert git(env.checkout, "status", "--porcelain") == ""
+    assert str(p.workspace) in git(env.checkout, "worktree", "list", "--porcelain")
     assert stat.S_IMODE(p.run_dir.stat().st_mode) == 0o700
     assert (p.run_dir / "home").is_dir() and (p.run_dir / "tmp").is_dir()
-    # no hardlinks into the mirror
-    mirror_obj = next((env.ws.mirror_path("proj") / "objects").glob("??/*"))
-    clone_obj = p.repo_dir / ".git" / "objects" / mirror_obj.parent.name / mirror_obj.name
-    if clone_obj.exists():
-        assert clone_obj.stat().st_ino != mirror_obj.stat().st_ino
+    assert p.run_dir == env.cfg.work_dir / "R3" and not (p.run_dir / "repo").exists()
+    assert env.conn.execute("SELECT ci FROM repos").fetchone()["ci"] == 1
 
 
 async def test_prepare_leaves_no_token_anywhere(env: Env) -> None:
     p = await env.prepare()
-    for path in [p.repo_dir / ".git" / "config", env.ws.mirror_path("proj") / "config"]:
+    for path in [env.checkout / ".git" / "config", p.workspace / ".git"]:
         assert GH_TOKEN not in path.read_text()
     log = env.shim_log.read_text()
     assert GH_TOKEN not in log
     assert "x-access-token" not in log
-    assert "clone" in log and "checkout -q -b" in log
+    assert "clone" in log and "worktree add" in log
+    assert _leftovers(env) == []
 
 
 async def test_prepare_unknown_repo_and_bad_code(env: Env) -> None:
@@ -384,31 +408,237 @@ async def test_prepare_unknown_repo_and_bad_code(env: Env) -> None:
         await env.ws.prepare("R1", "nope", "x", github_token=GH_TOKEN)
     with pytest.raises(RunnerError, match="bad run code"):
         await env.ws.prepare("../R1", "proj", "x", github_token=GH_TOKEN)
+    with pytest.raises(RunnerError, match="bad run code"):
+        await env.ws.prepare_scratch("R1/..")
 
 
-async def test_prepare_rebuilds_a_leftover_run_dir_and_failure_cleans_up(env: Env) -> None:
+async def test_prepare_rebuilds_leftovers_and_failure_cleans_up(env: Env) -> None:
     first = await env.prepare("R1")
     (first.run_dir / "stale.txt").write_text("from a crashed attempt")
     (first.run_dir / "link").symlink_to(env.root)
+    (first.workspace / "half-done.txt").write_text("from a crashed attempt")
     second = await env.prepare("R1")
     assert not (second.run_dir / "stale.txt").exists()
-    assert (second.repo_dir / "README.md").exists()
+    assert not (second.workspace / "half-done.txt").exists()
+    assert (second.workspace / "README.md").exists()
     assert (env.root / "seed").exists()  # the symlink target was not followed
+    assert git(env.checkout, "worktree", "list", "--porcelain").count("worktree ") == 2
     env.conn.execute("UPDATE repos SET base = 'nope'")
-    with pytest.raises(RunnerError, match="isn't a branch"):
+    with pytest.raises(RunnerError, match="fetching nope of own/proj failed"):
         await env.prepare("R2")
-    assert not (env.cfg.work_dir / "R2").exists()
+    assert not (env.cfg.work_dir / "R2").exists() and not env.worktree("R2").exists()
+
+
+async def test_prepare_fetches_without_touching_the_owners_checkout(env: Env) -> None:
+    await env.prepare("R1")
+    # the owner works in their checkout: another branch, a local commit, uncommitted edits
+    git(env.checkout, "checkout", "-q", "-b", "mine")
+    (env.checkout / "mine.txt").write_text("mine\n")
+    git(env.checkout, "add", "mine.txt")
+    git(env.checkout, "commit", "-q", "-m", "mine")
+    (env.checkout / "README.md").write_text("owner's edit\n")
+    (env.checkout / "untracked.txt").write_text("u\n")
+    head = git(env.checkout, "rev-parse", "HEAD")
+    env.push_base("new.txt")
+    p = await env.prepare("R2")
+    assert (p.workspace / "new.txt").exists() and not (p.workspace / "mine.txt").exists()
+    assert git(env.checkout, "rev-parse", "origin/main") == p.base_sha
+    assert git(env.checkout, "rev-parse", "--abbrev-ref", "HEAD") == "mine"
+    assert git(env.checkout, "rev-parse", "HEAD") == head
+    assert (env.checkout / "README.md").read_text() == "owner's edit\n"
+    assert (env.checkout / "untracked.txt").exists() and not (env.checkout / "new.txt").exists()
+    assert git(env.checkout, "rev-parse", "main") != p.base_sha  # their main isn't moved either
+
+
+async def test_an_existing_checkout_is_used_and_must_be_the_repo(env: Env) -> None:
+    owner = env.root / "elsewhere" / "proj"
+    git(env.root, "clone", "-q", str(env.remote), str(owner))
+    git(owner, "remote", "set-url", "origin", "git@github.com:own/proj.git")  # an ssh remote
+    repo_store.set_path(env.conn, "own/proj", owner)
+    p = await env.prepare("R1")
+    assert p.checkout == owner and not env.checkout.exists()
+    assert git(owner, "remote", "get-url", "origin") == "git@github.com:own/proj.git"
+    assert git(owner, "rev-parse", "origin/main") == p.base_sha
+    # a checkout of another repo, or not a checkout at all, is in the way
+    git(owner, "remote", "set-url", "origin", "git@github.com:own/other.git")
+    with pytest.raises(RunnerError, match="origin isn't own/proj"):
+        await env.prepare("R2")
+    plain = env.root / "plain"
+    (plain / "sub").mkdir(parents=True)
+    repo_store.set_path(env.conn, "own/proj", plain)
+    with pytest.raises(RunnerError, match="isn't a git checkout of own/proj"):
+        await env.prepare("R3")
+    repo_store.set_path(env.conn, "own/proj", owner / ".github")  # a dir inside a checkout
+    with pytest.raises(RunnerError, match="isn't a git checkout"):
+        await env.prepare("R4")
+    assert not any((env.cfg.work_dir / c).exists() for c in ("R2", "R3", "R4"))
+
+
+async def test_local_config_is_linked_when_untracked(env: Env) -> None:
+    seed = env.root / "seed"
+    (seed / ".tool-versions").write_text("python 3.12\n")
+    (seed / ".gitignore").write_text(".env\n.env.*\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "tool versions")
+    git(seed, "push", "-q", str(env.remote), "main")
+    await env.prepare("R1")  # clones the checkout
+    for name in (".env", ".env.local", ".env.example", ".envrc", ".mcp.json", ".tool-versions",
+                 "notes.txt"):  # fmt: skip
+        (env.checkout / name).write_text(f"{name} of the owner\n")
+    (env.checkout / ".env.d").mkdir()
+    p = await env.prepare("R2")
+    linked = sorted(n for n in os.listdir(p.workspace) if (p.workspace / n).is_symlink())
+    assert linked == [".env", ".env.local", ".envrc", ".mcp.json"]
+    assert os.readlink(p.workspace / ".env") == str(env.checkout / ".env")
+    assert (p.workspace / ".env").read_text() == ".env of the owner\n"
+    assert (p.workspace / ".tool-versions").read_text() == "python 3.12\n"  # tracked: git's copy
+    assert not (p.workspace / ".env.example").exists() and not (p.workspace / "notes.txt").exists()
+    assert p.exclude_file.read_text() == "/.env\n/.env.local\n/.envrc\n/.mcp.json\n"
+    # with the session's git config, none of it shows up to be committed
+    status = await asyncio.to_thread(
+        subprocess.run,
+        [GIT, "-C", str(p.workspace), "status", "--porcelain"],
+        env={**ENV, **session_git_env(None, p.exclude_file)},
+        capture_output=True, text=True, check=True,
+    )  # fmt: skip
+    assert status.stdout == ""
+
+
+def test_link_local_config_skips_what_is_there(tmp_path: Path) -> None:
+    checkout, worktree = tmp_path / "co", tmp_path / "wt"
+    checkout.mkdir()
+    worktree.mkdir()
+    (checkout / ".env").write_text("a\n")
+    (checkout / ".envrc").write_text("b\n")
+    (checkout / ".mcp.json").symlink_to(checkout / ".env")
+    (worktree / ".envrc").write_text("already\n")
+    assert link_local_config(checkout, worktree, tracked=[".env"]) == [".mcp.json"]
+    assert (worktree / ".envrc").read_text() == "already\n"
+
+
+async def test_two_runs_on_one_repo_each_get_a_worktree(env: Env) -> None:
+    active = peak = 0
+    real = env.ws.ensure_checkout
+
+    async def slow(repo: repo_store.Repo, token: str) -> Path:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.05)
+        try:
+            return await real(repo, token)
+        finally:
+            active -= 1
+
+    env.ws.ensure_checkout = slow  # type: ignore[method-assign]
+    a, b = await asyncio.gather(env.prepare("R1", "one"), env.prepare("R2", "two"))
+    assert peak == 1  # fetch and worktree add are serialized per repo
+    assert a.workspace != b.workspace and a.branch != b.branch
+    assert git(a.workspace, "rev-parse", "--abbrev-ref", "HEAD") == a.branch
+    assert git(b.workspace, "rev-parse", "--abbrev-ref", "HEAD") == b.branch
+    assert env.ws.checkout_lock("proj") is env.ws.checkout_lock("PROJ")
+    assert env.ws.checkout_lock("proj") is not env.ws.checkout_lock("other")
+
+
+async def test_remove_workspace_removes_the_worktree_and_its_branch_only(env: Env) -> None:
+    (env.root / "keep").mkdir()
+    p = await env.prepare("R1")
+    other = await env.prepare("R2")
+    (env.checkout / ".env").write_text("SECRET=1\n")
+    (p.workspace / ".env").symlink_to(env.checkout / ".env")
+    (p.workspace / "out").symlink_to(env.root / "keep")
+    env.session(p, {"a.txt": "a\n"})
+    assert await env.ws.remove_workspace(
+        "R1", workspace=p.workspace, checkout=p.checkout, branch=p.branch
+    )
+    assert not p.workspace.exists()
+    assert (env.checkout / ".env").read_text() == "SECRET=1\n"  # links unlinked, not followed
+    assert (env.root / "keep").is_dir()
+    assert p.branch not in git(env.checkout, "branch", "--format=%(refname:short)")
+    assert other.branch in git(env.checkout, "branch", "--format=%(refname:short)")
+    assert other.workspace.is_dir() and (env.checkout / "README.md").exists()
+    assert str(p.workspace) not in git(env.checkout, "worktree", "list", "--porcelain")
+    # again: nothing there
+    assert not await env.ws.remove_workspace(
+        "R1", workspace=p.workspace, checkout=p.checkout, branch=p.branch
+    )
+
+
+async def test_remove_workspace_never_touches_the_owners_branch(env: Env) -> None:
+    p = await env.prepare("R1")
+    await env.ws.remove_workspace("R1", workspace=p.workspace, checkout=p.checkout,
+                                  branch="main")  # fmt: skip
+    assert "main" in git(env.checkout, "branch", "--format=%(refname:short)")
+    assert git(env.checkout, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+
+
+async def test_remove_workspace_refuses_anything_but_a_run_workspace(env: Env) -> None:
+    p = await env.prepare("R1")
+    root = env.cfg.code_dir
+    for bad in (env.checkout, root, root / ".worktrees", root / ".worktrees" / "proj",
+                root / ".worktrees" / "proj" / "R2", root / ".scratch" / "R2", Path("/"),
+                env.root / "runs" / "R1", root / ".worktrees" / "../.." / "R1"):  # fmt: skip
+        with pytest.raises(RunnerError, match="refusing"):
+            await env.ws.remove_workspace("R1", workspace=bad, checkout=env.checkout)
+    with pytest.raises(RunnerError, match="refusing"):
+        await env.ws.remove_workspace("R1/..", workspace=p.workspace, checkout=env.checkout)
+    assert p.workspace.is_dir() and (env.checkout / "README.md").exists()
+    # a .worktrees/<name> swapped for a link to somewhere else is refused, not followed
+    victim = env.root / "victim"
+    (victim / "R5").mkdir(parents=True)
+    (root / ".worktrees" / "evil").symlink_to(victim)
+    with pytest.raises(RunnerError, match="refusing"):
+        await env.ws.remove_workspace("R5", workspace=root / ".worktrees" / "evil" / "R5")
+    assert (victim / "R5").is_dir()
+
+
+async def test_remove_workspace_without_a_usable_checkout(env: Env) -> None:
+    p = await env.prepare("R1")
+    moved = env.root / "moved-away"
+    env.checkout.rename(moved)  # the owner moved their checkout
+    assert await env.ws.remove_workspace(
+        "R1", workspace=p.workspace, checkout=p.checkout, branch=p.branch
+    )
+    assert not p.workspace.exists() and (moved / "README.md").exists()
+
+
+async def test_scratch_dir(env: Env) -> None:
+    p = await env.prepare_scratch()
+    assert p.scratch and p.repo_name == "" and p.checkout is None and p.branch == ""
+    assert p.workspace == env.cfg.code_dir / ".scratch" / "R7"
+    assert p.workspace.is_dir() and list(p.workspace.iterdir()) == []
+    assert stat.S_IMODE(p.workspace.stat().st_mode) == 0o700
+    (p.workspace / "notes.md").write_text("n\n")
+    again = await env.prepare_scratch()  # a crash before the session: rebuilt empty
+    assert list(again.workspace.iterdir()) == []
+    assert await env.ws.remove_workspace("R7", workspace=again.workspace)
+    assert not again.workspace.exists() and (env.cfg.code_dir / ".scratch").is_dir()
+
+
+async def test_planted_checkout_config_and_hooks_never_run_as_the_daemon(env: Env) -> None:
+    p = await env.prepare("R1")
+    marker = env.root / "pwned"
+    git(env.checkout, "config", "core.fsmonitor", f"touch {marker}; echo")
+    git(env.checkout, "config", "credential.helper", f"!touch {marker}")
+    git(env.checkout, "config", "core.sshCommand", f"touch {marker}")
+    for hook in ("post-checkout", "reference-transaction", "pre-auto-gc"):
+        path = env.checkout / ".git" / "hooks" / hook
+        path.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        path.chmod(0o755)
+    second = await env.prepare("R2")
+    await env.ws.remove_workspace("R1", workspace=p.workspace, checkout=p.checkout,
+                                  branch=p.branch)  # fmt: skip
+    await env.ws.remove_workspace("R2", workspace=second.workspace, checkout=second.checkout,
+                                  branch=second.branch)  # fmt: skip
+    assert not marker.exists()
 
 
 async def test_mirror_picks_up_new_remote_commits(env: Env) -> None:
-    await env.prepare("R1")
-    seed = env.root / "seed"
-    (seed / "new.txt").write_text("n\n")
-    git(seed, "add", "-A")
-    git(seed, "commit", "-q", "-m", "second")
-    git(seed, "push", "-q", str(env.remote), "main")
-    p = await env.prepare("R2")
-    assert (p.repo_dir / "new.txt").exists()
+    await env.ws.refresh_mirror("proj", github_token=GH_TOKEN)
+    env.push_base("new.txt")
+    await env.ws.refresh_mirror("proj", github_token=GH_TOKEN)
+    mirror = env.ws.mirror_path("proj")
+    assert git(mirror, "rev-parse", "main") == git(env.remote, "rev-parse", "main")
 
 
 async def test_mirror_lock_serializes_refreshes(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -431,292 +661,7 @@ async def test_mirror_lock_serializes_refreshes(env: Env, monkeypatch: pytest.Mo
     assert env.ws.mirror_lock("proj") is not env.ws.mirror_lock("other")
 
 
-# --- harvest and bundle ----------------------------------------------------------------------
-
-
-async def test_full_flow_to_a_pr(env: Env) -> None:
-    p = await env.prepare("R1", "Fix the flaky test")
-    head = await env.deliver(p, {"src/fix.py": "x = 1\n"}, "Fix the flaky test")
-    assert git(env.ws.mirror_path("proj"), "rev-parse", p.run_ref) == head
-
-    result = await env.ws.check(p, head, SECRETS)
-    assert result.files == 1 and result.title == "Fix the flaky test"
-
-    pr = await env.ws.publish(
-        p, result, SECRETS, ask="Fix the flaky test", summary="Done.", still_ok=always
-    )
-    assert (pr.number, pr.url) == (41, "https://github.com/own/proj/pull/41")
-    assert p.branch in env.remote_branches()
-    assert git(env.remote, "rev-parse", p.branch) == head
-
-    create = env.gh_calls("create")[0]
-    argv: list[str] = create["argv"]  # type: ignore[assignment]
-    assert argv[argv.index("--head") + 1] == p.branch
-    assert argv[argv.index("--base") + 1] == "main"
-    assert argv[argv.index("--repo") + 1] == "own/proj"
-    assert argv[argv.index("--title") + 1] == "Fix the flaky test"
-    assert "Fix the flaky test" in str(create["stdin"]) and "Done." in str(create["stdin"])
-    assert "R1" in str(create["stdin"])
-
-
-async def test_token_never_on_argv_or_in_urls(env: Env) -> None:
-    p = await env.prepare()
-    head = await env.deliver(p, {"a.txt": "a\n"})
-    result = await env.ws.check(p, head, SECRETS)
-    await env.ws.publish(p, result, SECRETS, ask="x", summary="s", still_ok=always)
-    assert GH_TOKEN not in env.shim_log.read_text()
-    assert CLAUDE_TOKEN not in env.shim_log.read_text()
-    for call in env.gh_calls():
-        assert GH_TOKEN not in json.dumps(call["argv"])
-        assert call["hosts_token"] == GH_TOKEN  # by file only
-        assert GH_TOKEN not in json.dumps(call["env"])
-    for config in [env.ws.mirror_path("proj") / "config", p.repo_dir / ".git" / "config"]:
-        assert GH_TOKEN not in config.read_text()
-    assert GH_TOKEN not in await asyncio.to_thread(_ps)
-
-
-async def test_uncommitted_work_is_committed_by_harvest(env: Env) -> None:
-    p = await env.prepare()
-    (p.repo_dir / "wip.txt").write_text("wip\n")
-    await env.bundle(p)
-    head = await env.ws.import_bundle(p)
-    assert (
-        git(env.ws.mirror_path("proj"), "log", "-1", "--format=%s", head) == "R1: uncommitted work"
-    )
-    assert git(env.ws.mirror_path("proj"), "log", "-1", "--format=%an <%ae>", head) == (
-        "Resonant runner <resonant-runner@users.noreply.github.com>"
-    )
-
-
-async def test_no_commits_means_no_bundle(env: Env) -> None:
-    p = await env.prepare()
-    await env.bundle(p)
-    assert not p.bundle_path.exists()
-    with pytest.raises(NoChanges):
-        await env.ws.import_bundle(p)
-
-
-async def test_bundle_symlink_refused(env: Env) -> None:
-    p = await env.prepare()
-    secret = env.root / "resonant.db"
-    secret.write_bytes(b"SQLite format 3\0" + b"x" * 100)
-    p.bundle_path.symlink_to(secret)
-    with pytest.raises(BundleRefused, match="regular file"):
-        await env.ws.import_bundle(p)
-    assert not any(env.ws.cfg.mirror_dir.joinpath(".incoming").glob("*"))
-
-
-async def test_bundle_fifo_refused_without_hanging(env: Env) -> None:
-    p = await env.prepare()
-    os.mkfifo(p.bundle_path)
-    with pytest.raises(BundleRefused, match="regular file"):
-        await asyncio.wait_for(env.ws.import_bundle(p), 10)
-
-
-async def test_run_dir_symlink_refused(env: Env) -> None:
-    p = await env.prepare()
-    real = env.root / "elsewhere"
-    real.mkdir()
-    (real / "out.bundle").write_bytes(b"junk")
-    moved = p.run_dir.with_name("moved")
-    p.run_dir.rename(moved)
-    p.run_dir.symlink_to(real)
-    with pytest.raises(BundleRefused, match="plain directory"):
-        await env.ws.import_bundle(p)
-
-
-async def test_oversize_bundle_refused(env: Env) -> None:
-    env.cfg.max_bundle_mb = 1
-    p = await env.prepare()
-    p.bundle_path.write_bytes(b"x" * (1024 * 1024 + 1))
-    with pytest.raises(BundleRefused, match="over 1 MB"):
-        await env.ws.import_bundle(p)
-    assert not list((env.cfg.mirror_dir / ".incoming").glob("*"))
-    # exactly at the cap is read through (and then rejected as not a bundle)
-    p.bundle_path.write_bytes(b"x" * (1024 * 1024))
-    with pytest.raises(BundleRefused, match="valid git bundle"):
-        await env.ws.import_bundle(p)
-
-
-async def test_junk_bundle_refused(env: Env) -> None:
-    p = await env.prepare()
-    p.bundle_path.write_bytes(b"not a bundle")
-    with pytest.raises(BundleRefused, match="valid git bundle"):
-        await env.ws.import_bundle(p)
-
-
-async def test_bundle_with_extra_ref_refused(env: Env) -> None:
-    p = await env.prepare()
-    env.session(p, {"a.txt": "a\n"})
-    git(p.repo_dir, "branch", "extra")
-    git(
-        p.repo_dir,
-        "bundle",
-        "create",
-        "-q",
-        str(p.bundle_path),
-        f"{p.base_sha}..{p.branch}",
-        f"{p.base_sha}..extra",
-    )
-    with pytest.raises(BundleRefused, match="other than the run's branch"):
-        await env.ws.import_bundle(p)
-    assert git(env.ws.mirror_path("proj"), "for-each-ref", "refs/runs") == ""
-
-
-async def test_bundle_with_wrong_ref_refused(env: Env) -> None:
-    p = await env.prepare()
-    env.session(p, {"a.txt": "a\n"})
-    git(p.repo_dir, "branch", "-m", "evil")
-    git(p.repo_dir, "bundle", "create", "-q", str(p.bundle_path), f"{p.base_sha}..evil")
-    with pytest.raises(BundleRefused, match="other than the run's branch"):
-        await env.ws.import_bundle(p)
-
-
-async def test_bundle_failing_fsck_refused(env: Env) -> None:
-    p = await env.prepare()
-
-    def plumbing(*args: str, stdin: str) -> str:
-        res = subprocess.run(
-            [GIT, "-C", str(p.repo_dir), *args],
-            env=ENV,
-            input=stdin,
-            capture_output=True,
-            text=True,
-        )
-        assert res.returncode == 0, res.stderr
-        return res.stdout.strip()
-
-    # A tree entry named ".git" packs fine but fails fsckObjects (hasDotgit) on fetch.
-    blob = plumbing("hash-object", "-w", "--stdin", stdin="x\n")
-    tree = plumbing("mktree", stdin=f"100644 blob {blob}\t.git\n")
-    commit = plumbing("commit-tree", tree, "-p", p.base_sha, "-m", "bad", stdin="")
-    git(p.repo_dir, "update-ref", f"refs/heads/{p.branch}", commit)
-    git(p.repo_dir, "bundle", "create", "-q", str(p.bundle_path), f"{p.base_sha}..{p.branch}")
-    with pytest.raises(BundleRefused, match="git's checks"):
-        await env.ws.import_bundle(p)
-    assert git(env.ws.mirror_path("proj"), "for-each-ref", "refs/runs") == ""
-
-
-async def test_planted_clone_config_and_hooks_never_run(env: Env) -> None:
-    p = await env.prepare()
-    env.session(p, {"a.txt": "a\n"})
-    git(p.repo_dir, "bundle", "create", "-q", str(p.bundle_path), f"{p.base_sha}..{p.branch}")
-    marker = env.root / "pwned"
-    git(p.repo_dir, "config", "core.fsmonitor", f"touch {marker}; echo")
-    git(p.repo_dir, "config", "credential.helper", f"!touch {marker}")
-    git(p.repo_dir, "config", "core.sshCommand", f"touch {marker}")
-    hook = p.repo_dir / ".git" / "hooks" / "pre-push"
-    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
-    hook.chmod(0o755)
-    head = await env.ws.import_bundle(p)
-    result = await env.ws.check(p, head, SECRETS)
-    await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)
-    assert not marker.exists()
-    # the only git run against the clone was in prepare
-    for line in env.shim_log.read_text().splitlines():
-        if str(p.repo_dir) in line:
-            assert "remote set-url" in line or "checkout" in line or "clone" in line, line
-
-
 # --- checks wired through the workspace ------------------------------------------------------
-
-
-async def test_token_in_summary_refused_before_push(env: Env) -> None:
-    p = await env.prepare()
-    head = await env.deliver(p, {"a.txt": "a\n"})
-    result = await env.ws.check(p, head, SECRETS)
-    with pytest.raises(CheckFailed, match="pr body"):
-        await env.ws.publish(
-            p, result, SECRETS, ask="x", summary=f"key {CLAUDE_TOKEN}", still_ok=always
-        )
-    assert p.branch not in env.remote_branches()
-    assert env.gh_calls() == []
-
-
-async def test_github_change_refused_via_workspace(env: Env) -> None:
-    p = await env.prepare()
-    head = await env.deliver(p, {".github/workflows/x.yml": "on: push\n"})
-    with pytest.raises(CheckFailed, match=r"\.github/"):
-        await env.ws.check(p, head, SECRETS)
-    assert p.branch not in env.remote_branches()
-
-
-async def test_flagged_paths_reach_the_pr_body(env: Env) -> None:
-    p = await env.prepare()
-    head = await env.deliver(p, {"Makefile": "all:\n", ".claude/settings.json": "{}\n"})
-    result = await env.ws.check(p, head, SECRETS)
-    assert result.flag_line == "⚠ changes .claude/settings.json, Makefile"
-    await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)
-    create = env.gh_calls("create")[0]
-    assert "⚠ changes .claude/settings.json, Makefile" in str(create["stdin"])
-
-
-async def test_quote_ask_false_leaves_the_ask_out(env: Env) -> None:
-    env.conn.execute("UPDATE repos SET quote_ask = 0")
-    p = await env.prepare()
-    head = await env.deliver(p, {"a.txt": "a\n"})
-    result = await env.ws.check(p, head, SECRETS)
-    await env.ws.publish(p, result, SECRETS, ask="private ask text", summary="", still_ok=always)
-    create = env.gh_calls("create")[0]
-    assert "private ask text" not in str(create["stdin"])
-
-
-# --- publish: cancel and idempotence ---------------------------------------------------------
-
-
-async def _published(env: Env) -> tuple[Prepared, object]:
-    p = await env.prepare()
-    head = await env.deliver(p, {"a.txt": "a\n"})
-    return p, await env.ws.check(p, head, SECRETS)
-
-
-async def test_cancelled_before_push(env: Env) -> None:
-    p, result = await _published(env)
-
-    async def no() -> bool:
-        return False
-
-    with pytest.raises(PublishAborted):
-        await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=no)  # type: ignore[arg-type]
-    assert p.branch not in env.remote_branches()
-    assert env.gh_calls() == []
-
-
-@pytest.mark.parametrize(("flips_at", "pushed", "gh_calls"), [(2, True, 0), (3, True, 1)])
-async def test_cancelled_between_push_and_pr(
-    env: Env, flips_at: int, pushed: bool, gh_calls: int
-) -> None:
-    p, result = await _published(env)
-    calls = 0
-
-    async def flip() -> bool:
-        nonlocal calls
-        calls += 1
-        return calls < flips_at
-
-    with pytest.raises(PublishAborted):
-        await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=flip)  # type: ignore[arg-type]
-    assert (p.branch in env.remote_branches()) is pushed
-    created = env.gh_calls("create")
-    assert created == []
-    assert len(env.gh_calls()) == gh_calls  # the list lookup happens before the third check
-
-
-async def test_publish_is_idempotent(env: Env) -> None:
-    p, result = await _published(env)
-    first = await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)  # type: ignore[arg-type]
-    second = await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)  # type: ignore[arg-type]
-    assert first == second
-    creates = env.gh_calls("create")
-    assert len(creates) == 1
-
-
-async def test_gh_create_failure_is_a_clean_error(env: Env) -> None:
-    p, result = await _published(env)
-    env.gh.write_text(f"#!/bin/sh\necho 'boom {GH_TOKEN}' >&2\nexit 1\n")
-    with pytest.raises(RunnerError, match="gh pr create failed") as e:
-        await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)  # type: ignore[arg-type]
-    assert GH_TOKEN not in str(e.value)
 
 
 # --- merge -----------------------------------------------------------------------------------
@@ -783,10 +728,10 @@ async def test_merge_lists_a_github_change_when_the_repo_allows_it(env: Env) -> 
 async def test_merge_refuses_a_token_in_the_history_even_if_removed(env: Env) -> None:
     p = await env.prepare()
     env.session(p, {"leak.txt": f"{GH_TOKEN}\n"}, "add")
-    git(p.repo_dir, "rm", "-q", "leak.txt")
-    git(p.repo_dir, "commit", "-q", "-m", "remove it again")
-    git(p.repo_dir, "push", "-q", str(env.remote), p.branch)
-    head = git(p.repo_dir, "rev-parse", "HEAD")
+    git(p.workspace, "rm", "-q", "leak.txt")
+    git(p.workspace, "commit", "-q", "-m", "remove it again")
+    git(p.workspace, "push", "-q", str(env.remote), p.branch)
+    head = git(p.workspace, "rev-parse", "HEAD")
     env.set_pr(p.branch, head)
     env.gh_set("checks_rc", "0")
     with pytest.raises(MergeRefused, match="a token appears") as e:
@@ -809,10 +754,10 @@ async def test_merge_refuses_a_token_in_the_pr_text(env: Env) -> None:
 async def test_merge_refuses_a_merge_commit_and_a_submodule(env: Env) -> None:
     p = await env.prepare()
     env.session(p, {"a.txt": "a\n"})
-    git(p.repo_dir, "update-index", "--add", "--cacheinfo", f"160000,{p.base_sha},sub")
-    git(p.repo_dir, "commit", "-q", "-m", "sub")
-    git(p.repo_dir, "push", "-q", str(env.remote), p.branch)
-    head = git(p.repo_dir, "rev-parse", "HEAD")
+    git(p.workspace, "update-index", "--add", "--cacheinfo", f"160000,{p.base_sha},sub")
+    git(p.workspace, "commit", "-q", "-m", "sub")
+    git(p.workspace, "push", "-q", str(env.remote), p.branch)
+    head = git(p.workspace, "rev-parse", "HEAD")
     env.set_pr(p.branch, head)
     await _refused(env, p, head, "submodule")
 
@@ -838,7 +783,7 @@ async def test_merge_refuses_a_pr_that_changed_or_isnt_the_runs(env: Env) -> Non
 async def test_merge_notices_a_branch_that_moved_after_the_view(env: Env) -> None:
     p, head = await env.open_pr()
     env.session(p, {"b.txt": "b\n"}, "later")
-    git(p.repo_dir, "push", "-q", str(env.remote), p.branch)
+    git(p.workspace, "push", "-q", str(env.remote), p.branch)
     await _refused(env, p, head, "moved while it was being checked")
 
 
@@ -880,7 +825,7 @@ async def test_pushed_commits_counts_the_branch_beyond_the_base(env: Env) -> Non
     assert await env.ws.pushed_commits(p, SECRETS) == 0  # never pushed
     env.session(p, {"a.txt": "a\n"})
     env.session(p, {"b.txt": "b\n"})
-    git(p.repo_dir, "push", "-q", str(env.remote), p.branch)
+    git(p.workspace, "push", "-q", str(env.remote), p.branch)
     assert await env.ws.pushed_commits(p, SECRETS) == 2
 
 
@@ -1059,6 +1004,33 @@ def test_runner_dirs_validated(tmp_path: Path) -> None:
         RunnerRepo(remote="github.com/./repo")
 
 
+def test_code_dir_and_repo_path_validated(tmp_path: Path) -> None:
+    assert RunnerConfig().code_dir == (Path.home() / "code").resolve()
+    assert RunnerConfig(code_dir=tmp_path / "c").code_dir == (tmp_path / "c").resolve()
+    with pytest.raises(ValidationError, match="absolute"):
+        RunnerConfig(code_dir=Path("code"))
+    for code, work, mirror in [
+        (tmp_path / "w" / "code", tmp_path / "w", tmp_path / "m"),  # code inside work
+        (tmp_path / "code", tmp_path / "code" / "w", tmp_path / "m"),  # work inside code
+        (tmp_path / "code", tmp_path / "w", tmp_path / "code" / "m"),  # mirror inside code
+    ]:
+        with pytest.raises(ValidationError, match="overlap"):
+            RunnerConfig(code_dir=code, work_dir=work, mirror_dir=mirror,
+                         cache_dir=tmp_path / "cache")  # fmt: skip
+    assert RunnerRepo(remote="github.com/o/r").path is None
+    assert RunnerRepo(remote="github.com/o/r", path=Path("~/src/r")).path == Path.home() / "src/r"
+    with pytest.raises(ValidationError, match="absolute"):
+        RunnerRepo(remote="github.com/o/r", path=Path("src/r"))
+    conn = connect(":memory:")
+    migrate(conn)
+    repo_store.import_config(conn, {"r": RunnerRepo(remote="github.com/o/r", path=tmp_path)})
+    found = repo_store.find(conn, "r")
+    assert found is not None and found.path == tmp_path
+    repo_store.import_config(conn, {"r": RunnerRepo(remote="github.com/o/r")})
+    found = repo_store.find(conn, "r")
+    assert found is not None and found.path is None
+
+
 def test_git_env_does_not_follow_redirects() -> None:
     e = git_env()
     pairs = {
@@ -1134,34 +1106,6 @@ async def test_repo_has_ci(env: Env) -> None:
     assert await env.ws.repo_has_ci("proj", refresh=False) is True
     with pytest.raises(ValueError):
         await env.ws.repo_has_ci("proj")
-
-
-async def test_harvest_forces_the_run_branch(env: Env) -> None:
-    p = await env.prepare()
-    git(p.repo_dir, "checkout", "-q", "-b", "elsewhere")  # the session wandered off
-    (p.repo_dir / "wip.txt").write_text("wip\n")
-    await env.bundle(p)
-    head = await env.ws.import_bundle(p)
-    assert (
-        git(env.ws.mirror_path("proj"), "show", "-s", "--format=%s", head) == "R1: uncommitted work"
-    )
-    assert git(p.repo_dir, "rev-parse", "--abbrev-ref", "HEAD") == p.branch
-
-
-async def test_push_sends_the_checked_head_and_neutralizes_mentions(env: Env) -> None:
-    p = await env.prepare()
-    head = await env.deliver(p, {"a.txt": "a\n"}, "Ping @someone in the title")
-    result = await env.ws.check(p, head, SECRETS)
-    await env.ws.publish(
-        p, result, SECRETS, ask="cc @team/leads", summary="thanks @bob", still_ok=always
-    )
-    assert git(env.remote, "rev-parse", p.branch) == result.head_sha
-    create = env.gh_calls("create")[0]
-    argv: list[str] = create["argv"]
-    assert "@" + "​" in argv[argv.index("--title") + 1]
-    body = str(create["stdin"])
-    assert "@team" not in body and "@bob" not in body
-    assert "@​team/leads" in body
 
 
 async def test_merge_distinguishes_no_ci_checks(env: Env) -> None:
@@ -1302,18 +1246,15 @@ def _leftovers(env: Env) -> list[Path]:
 
 
 async def test_no_token_in_any_child_env_or_argv(env: Env) -> None:
-    p = await env.prepare()
-    head = await env.deliver(p, {"a.txt": "a\n"})
-    result = await env.ws.check(p, head, SECRETS)
-    await env.ws.publish(p, result, SECRETS, ask="x", summary="s", still_ok=always)
-    env.set_pr(p.branch, head)
+    p, head = await env.open_pr()
+    await env.ws.find_pr("proj", p.branch, SECRETS)
     env.gh_set("checks_rc", "0")
     await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
 
     git_seen = env.shim_log.read_text() + env.env_log.read_text()
     assert "credential.helper" in env.env_log.read_text()  # the helper path was passed
     gh_calls = env.gh_calls()
-    assert len(gh_calls) >= 4
+    assert len(gh_calls) >= 3
     for text in [git_seen, json.dumps([[c["argv"], c["env"]] for c in gh_calls])]:
         for token in (GH_TOKEN, CLAUDE_TOKEN):
             assert token not in text
@@ -1325,17 +1266,17 @@ async def test_no_token_in_any_child_env_or_argv(env: Env) -> None:
 
 
 async def test_secret_files_removed_after_failure(env: Env) -> None:
-    p, result = await _published(env)
+    await env.prepare("R1")
     # git failure: the remote vanishes
     env.remote.rename(env.root / "gone.git")
-    with pytest.raises(RunnerError, match="pushing the branch failed"):
-        await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)  # type: ignore[arg-type]
+    with pytest.raises(RunnerError, match="fetching main of own/proj failed"):
+        await env.prepare("R2")
     assert _leftovers(env) == []
     env.remote = env.root / "gone.git"
     # gh failure
     env.gh.write_text("#!/bin/sh\nexit 1\n")
-    with pytest.raises(RunnerError, match="gh pr create failed"):
-        await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)  # type: ignore[arg-type]
+    with pytest.raises(RunnerError, match="gh pr list failed"):
+        await env.ws.find_pr("proj", "resonant/r1-x", SECRETS)
     assert _leftovers(env) == []
     # cancelled mid-call
     with pytest.raises(asyncio.TimeoutError):
@@ -1417,18 +1358,12 @@ def test_secret_dir_base_is_tightened(tmp_path: Path) -> None:
         assert stat.S_IMODE(base.stat().st_mode) == 0o700
 
 
-async def test_workspace_takes_only_the_registry_name_and_never_publishes_to_a_fork(
+async def test_workspace_takes_only_the_registry_name(
     env: Env,
 ) -> None:
     with pytest.raises(RunnerError, match="isn't a registered repo"):
         await env.ws.prepare("R1", "own/proj", "x", github_token=GH_TOKEN)
-    p = await env.prepare()
-    head = await env.deliver(p, {"a.txt": "a\n"})
-    result = await env.ws.check(p, head, SECRETS)
-    env.conn.execute("UPDATE repos SET mode = 'fork'")
-    with pytest.raises(RunnerError, match="Upstream PRs come in a later update"):
-        await env.ws.publish(p, result, SECRETS, ask="x", summary="", still_ok=always)
-    assert env.gh_calls() == [] and env.remote_branches() == ["main"]
+    assert not env.checkout.exists() and env.remote_branches() == ["main"]
 
 
 # --- the session's credentials (docs/repos-plan.md D10) ----------------------------------------
@@ -1436,13 +1371,32 @@ async def test_workspace_takes_only_the_registry_name_and_never_publishes_to_a_f
 SESSION_TOKEN = "ghs_" + "Sess10nT0ken" * 3
 
 
-async def test_prepare_sets_the_session_credential_helper(env: Env) -> None:
+async def test_the_session_helper_comes_by_env_never_the_checkout_config(env: Env) -> None:
     p = await env.prepare()
     assert p.creds_dir == p.run_dir / "creds"
     assert stat.S_IMODE(p.creds_dir.stat().st_mode) == 0o700 and list(p.creds_dir.iterdir()) == []
-    config = (p.repo_dir / ".git" / "config").read_text()
-    assert f"helper = !{p.creds_dir}/credential-helper" in config
-    assert git(p.repo_dir, "remote", "get-url", "origin") == str(env.remote)
+    # nothing about the run's credentials is in the checkout's config (the owner's pushes)
+    config = (env.checkout / ".git" / "config").read_text()
+    assert "credential" not in config and "creds" not in config and "worktreeConfig" not in config
+    assert not (env.checkout / ".git" / "worktrees" / "R1" / "config.worktree").exists()
+    assert git(p.workspace, "remote", "get-url", "origin") == str(env.remote)
+    e = session_git_env(p.creds_dir / "credential-helper", p.exclude_file)
+    pairs = [
+        (e[f"GIT_CONFIG_KEY_{i}"], e[f"GIT_CONFIG_VALUE_{i}"])
+        for i in range(int(e["GIT_CONFIG_COUNT"]))
+    ]
+    assert pairs[:2] == [
+        ("credential.helper", ""),
+        ("credential.helper", f"!{p.creds_dir}/credential-helper"),
+    ]
+    assert ("url.https://github.com/.insteadOf", "git@github.com:") in pairs
+    assert ("core.excludesFile", str(p.exclude_file)) in pairs
+    none = session_git_env(None)
+    assert ("credential.helper", "") in [
+        (none[f"GIT_CONFIG_KEY_{i}"], none[f"GIT_CONFIG_VALUE_{i}"])
+        for i in range(int(none["GIT_CONFIG_COUNT"]))
+    ]
+    assert not any(v.startswith("!") for k, v in none.items() if k.startswith("GIT_CONFIG_V"))
 
 
 def test_session_credentials_files_and_modes(tmp_path: Path) -> None:
