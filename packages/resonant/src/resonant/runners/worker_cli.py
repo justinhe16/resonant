@@ -473,7 +473,10 @@ class WorkerServer:
             writer.write(json.dumps({"text": reply.text, "exit": reply.exit}).encode() + b"\n")
             await writer.drain()
             if reply.on_sent is not None:
-                reply.on_sent()
+                try:
+                    reply.on_sent()
+                except Exception:  # the reply is out: it may be delivered again, never lost
+                    log.exception("worker CLI: marking a delivery failed")
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         except Exception:

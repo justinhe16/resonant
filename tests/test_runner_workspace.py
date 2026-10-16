@@ -724,13 +724,21 @@ async def test_a_planted_smudge_filter_runs_only_under_the_guard(
     git(seed, "push", "-q", str(env.remote), "main")
     await env.prepare("R1")
     ran, daemon_only = env.root / "filter-ran", resonant_home / "filter-pwned"
-    git(env.checkout, "config", "filter.evil.smudge", f"touch {ran}; touch {daemon_only}; cat")
+    ctl = env.cfg.work_dir / ".ctl" / "R9"  # another run's socket and token
+    ctl.mkdir(parents=True)
+    (ctl / "token").write_text("theirs")
+    forge = f"echo forged > {ctl}/token; touch {ctl}/sock; cat {ctl}/token > {ran}.read"
+    git(env.checkout, "config", "filter.evil.smudge",
+        f"touch {ran}; touch {daemon_only}; {forge}; cat")  # fmt: skip
     git(env.checkout, "config", "core.alternateRefsCommand", f"touch {daemon_only}; true")
     git(env.checkout, "config", "core.askPass", f"touch {daemon_only}")
     p = await env.prepare("R2")
     assert (p.workspace / "a.txt").read_text() == "a\n"
     assert ran.exists()  # it ran, in the guard
     assert not daemon_only.exists()  # never as the daemon
+    assert (ctl / "token").read_text() == "theirs" and not (ctl / "sock").exists()
+    leaked = env.root / "filter-ran.read"
+    assert not leaked.exists() or leaked.read_text() == ""
 
 
 async def test_every_git_in_a_checkout_goes_through_the_guard(env: Env) -> None:

@@ -576,10 +576,14 @@ class Workspace:
         if self._guard_prefix is None:
             if not sandbox_exec_available():
                 raise RunnerError("the sandbox isn't available, so git can't run in a checkout")
+            # the control-dir rules too, with no run's dir as its own: what a planted filter
+            # runs here can't read, replace or reach any run's socket or token
+            ctl = self.cfg.work_dir / ".ctl"
             params = SandboxParams(
-                run_dir=self.cfg.work_dir, cache_dir=self.cfg.cache_dir,
+                run_dir=self.cfg.work_dir / ".guard", cache_dir=self.cfg.cache_dir,
                 secrets_dir=self.cfg.secrets_dir, work_dir=self.cfg.work_dir,
                 deny_exec=default_deny_exec(), deny_read=tuple(self.cfg.deny_read),
+                ctl_root=ctl, ctl_dir=ctl / "_none",
             )  # fmt: skip
             self._guard_prefix = sandbox_wrap(["/usr/bin/true"], params)[:-1]
         return [*self._guard_prefix, *argv]

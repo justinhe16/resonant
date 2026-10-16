@@ -665,7 +665,7 @@ class ClaudeRunner:
         await self._reconcile()
         for run in runs.active(self.conn):  # a check closed by the restart is news for it
             if run.status == "waiting" and run.wait_reason == "question":
-                self._wake(run, "startup")
+                self._wake(run, f"startup:{uuid.uuid4().hex}")
         if self._unhook is None:
             self._unhook = killswitch.add_pause_hook(self._on_pause)
         return reaped
@@ -936,6 +936,8 @@ class ClaudeRunner:
         waiting (and, if a step is in flight, once that step returns ``Wait``)."""
         if run.task_id is None:
             return
+        if run.status == "waiting" and run.wait_reason != "question":
+            return  # a usage wait: the news is in the store for its natural wake
         event = Event(source="runner", type="run.inbox", task_id=run.task_id,
                       principal=run.principal, dedupe_key=f"run:{run.code}:{key}")  # fmt: skip
         try:
@@ -1246,16 +1248,19 @@ class ClaudeRunner:
         """The prompt of this turn: the ask for a new session; for a resumed one, the
         answers and owner messages it hasn't seen (saved on the run until the turn ends, so
         a crash resends them), else the plain resume prompt."""
-        fresh = self.desk.resume_text(run.code)
-        if fresh is not None:
-            runs.update(self.conn, run.code, resume_prompt=fresh)
+        with atomic(self.conn):  # taken and saved together: a crash loses neither
+            fresh = self.desk.resume_text(run.code)
+            saved = run.resume_prompt
+            if fresh is not None:
+                saved = f"{saved}\n\n{fresh}" if saved else fresh
+                runs.update(self.conn, run.code, resume_prompt=saved)
         if not run.sessions:
-            return run.ask + (f"\n\n{fresh}" if fresh else "")
+            return run.ask + (f"\n\n{saved}" if saved else "")
         if fresh is not None:
-            return f"{fresh}\n\nCarry on with the task."
+            return f"{saved}\n\nCarry on with the task."
         prompt = RESUME_PROMPT
-        if run.resume_prompt:
-            prompt += f"\n\nWhat you were told last turn:\n{run.resume_prompt}"
+        if saved:
+            prompt += f"\n\nWhat you were told last turn:\n{saved}"
         for q in questions_store.open_for_run(self.conn, run.code, "ask"):
             prompt += (
                 f'\n\nYou asked the owner: "{q.question}". There is no answer yet; if you still '

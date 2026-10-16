@@ -20,8 +20,9 @@ Owner messages (``deliver_message``) are appended to the session's next CLI repl
 ``Message from the owner: …``, or open its next turn.
 
 Everything a delivery rests on is in the store (``store.questions``), with conditional
-updates, so an answer is delivered exactly once whichever path (a blocked CLI call, a resume
-prompt) gets there first, and a restart loses nothing but the CLI call in flight.
+updates, so an answer is delivered whichever path (a blocked CLI call, a resume
+prompt) gets there first (at least once: a reply is marked delivered once it is written),
+and a restart loses nothing but the CLI call in flight.
 
 Events (``WorkerEvents``) are the hook EM-5 (relay) and EM-6 (digest, urgency) subscribe to:
 ``question``, ``note`` (``urgent`` set for ``--urgent``) and ``check``. For now they are logged.
@@ -222,12 +223,15 @@ class WorkerDesk:
                 ), EXIT_PENDING)  # fmt: skip
             q = qs.ask(self.conn, run.code, "ask", req.question, options=req.options,
                        urgent=req.urgent, at=self.clock())  # fmt: skip
+            self._waiter(q.id)  # before anything awaits: an answer can come at once
             with atomic(self.conn):
                 audit(self.conn, "run.ask", run=run.code, question_id=q.id)
             await self.events.emit(WorkerEvent("question", run.code, req.question, True,
                                                q.asked_at, q.id, req.options))  # fmt: skip
             await self._tell_owner(run, q)
-        await self._wait_for(self._waiter(q.id), gone)
+        current = qs.get(self.conn, q.id)
+        if current is not None and current.status == "open":
+            await self._wait_for(self._waiter(q.id), gone)
         return self._ask_reply(run.code, q.id, hung_up=gone.done())
 
     def _ask_reply(self, code: str, qid: int, *, hung_up: bool) -> Reply | None:
