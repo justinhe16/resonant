@@ -51,11 +51,11 @@ class FakeRunner:
     async def setup_missing(self) -> str | None:
         return self.missing
 
-    async def start_run(self, repo: str, ask: str, principal: str) -> Started | Refused:
+    async def start_run(self, repo: str | None, ask: str, principal: str) -> Started | Refused:
         self.calls.append(("start", repo, ask, principal))
         if self.missing:
             return Refused(self.missing)
-        return Started("R1", repo, 30)
+        return Started("R1", repo or "", 30)
 
     def list_runs(self, limit: int = 20) -> list[runs_store.Run]:
         return runs_store.recent(self.conn, limit)
@@ -242,6 +242,17 @@ async def test_start_run_refusals_come_from_the_runner(
     runner.missing = "Which repo? a, b, c"
     out = await call(components, "start_run", {"repo": "x", "ask": "x"})
     assert out == {"started": False, "text": "Which repo? a, b, c"}
+
+
+async def test_start_run_without_a_repo_is_a_scratch_run(
+    components: Components, runner: FakeRunner
+) -> None:
+    assert "repo" not in tools.START_RUN.args_schema["required"]
+    for args in ({"ask": "check the disk"}, {"repo": " ", "ask": "check the disk"}):
+        out = await call(components, "start_run", args)
+        assert out["started"] is True and out["repo"] is None
+        assert out["text"].startswith("On it: R1 · no repo.")
+    assert [c[1] for c in runner.calls] == [None, None]
 
 
 async def test_start_run_bad_arguments(components: Components, runner: FakeRunner) -> None:

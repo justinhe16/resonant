@@ -95,7 +95,9 @@ def _members(pgid: int) -> list[psutil.Process]:
 
 
 def _marked(t: Target) -> list[psutil.Process]:
-    """Own-user processes marked with the run's env marker or working inside its run dir."""
+    """Own-user processes marked with the run's env marker or working inside its run dir. Not
+    by a cwd in the run's worktree (EM-2): the owner may have an editor or a dev server open
+    there; the session's own processes carry the marker."""
     if t.marker is None and t.run_dir is None:
         return []
     me, uid = os.getpid(), os.getuid()

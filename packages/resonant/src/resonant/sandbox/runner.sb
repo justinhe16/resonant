@@ -10,6 +10,7 @@
 (allow file-write*
   (subpath (param "RUN"))
   (subpath (param "CACHE"))
+;; @WRITE_ALLOW@
   (literal "/dev/null")
   (literal "/dev/dtracehelper")
   (literal "/dev/tty"))  ; headless sessions only: no ptys, no other terminals

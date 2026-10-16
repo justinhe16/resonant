@@ -1,37 +1,52 @@
-"""The runner's workspace: mirror, clone, the session's credentials, PR discovery and merge
-(docs/phase5a-plan.md D3, docs/repos-plan.md D10).
+"""The runner's workspace: the owner's checkouts, each run's worktree or scratch dir, the
+session's credentials, PR discovery and merge (docs/employee-plan.md D1, docs/repos-plan.md D10).
 
-On a ``push`` repo the Claude session pushes its own branch and opens the PR with a per-run
-GitHub App token (``write_session_credentials``); this module finds the PR afterwards and, before
-any merge, fetches its head into the mirror and runs the checks. The bundle handback and the
-daemon-driven push and PR (``harvest``, ``import_bundle``, ``check``, ``publish``) stay for the
-fork mode, where the daemon still publishes.
+A run on a repo works in a git worktree of the owner's checkout, ``<code_dir>/<name>`` (cloned on
+first use; a repo's ``path`` overrides where it is), at ``<code_dir>/.worktrees/<name>/R<n>`` on
+branch ``resonant/r<n>-<slug>`` from ``origin/<base>``. The checkout's gitignored local config
+(``.env`` files, ``.envrc``, tool versions, ``.mcp.json``) is symlinked into the worktree. A run
+with no repo gets ``<code_dir>/.scratch/R<n>``. The Claude session pushes its own branch and
+opens the PR with a per-run GitHub App token (``write_session_credentials``); this module finds
+the PR afterwards and, before any merge, fetches its head into the daemon-only mirror and runs
+the checks.
 
 Trust rules this module keeps:
 
-- The GitHub token is only ever given to the daemon's own git (in the bare mirror) and to
-  ``gh``, and never by argv or environment: a sandboxed process can read any same-user
-  process's env and argv. It goes in a 0600 file in a fresh 0700 dir under
-  ``runner.secrets_dir`` (``~/.resonant/run-secrets``, which the sandbox's ``$HOME`` read
-  deny covers), created right before the call and removed right after, success or not.
-  git reads it through a credential helper script; ``gh`` through a ``hosts.yml`` in its own
-  ``GH_CONFIG_DIR`` (``gh`` prefers the config token and never reaches for the Keychain
-  when it has one). Only the paths are in env. The token is never in a remote URL, and
-  never goes into the sandbox.
-- Every git command runs with ``GIT_CONFIG_NOSYSTEM=1``, ``GIT_CONFIG_GLOBAL=/dev/null``,
-  ``core.hooksPath=/dev/null``, no credential helper and an absolute git binary. The
-  committer comes from the environment, never from a config file.
-- Once the session starts, the daemon runs git only in the mirror. In the clone it runs
-  four commands, all in ``prepare``, before any sandboxed process exists. What the session
-  leaves behind arrives in the mirror by ``git fetch`` with fsck (the PR's branch) or, for a
-  bundle, by file descriptor and fsck.
+- The owner's checkout is only ever fetched into (``refs/remotes/origin/<base>``) and given
+  worktrees and their ``resonant/…`` branches: its working tree, its current branch and its
+  config are never touched. A first clone lands in a temp dir and is renamed into place. A
+  checkout is never deleted; only a run's worktree or scratch dir is, and only at the exact
+  path the run recorded under ``code_dir``.
+- The session's git finds the run's credential helper through ``GIT_CONFIG_*`` in its
+  environment (``session_git_env``), not through any config file, so nothing about the run's
+  token reaches the checkout's config and the owner's own pushes are unchanged.
+- The daemon's GitHub token is only ever given to the daemon's own git (clone and fetch of a
+  checkout, the bare mirror) and to ``gh``, and never by argv or environment. It goes in a
+  0600 file in a fresh 0700 dir under ``runner.secrets_dir``, created right before the call
+  and removed right after, success or not. git reads it through a credential helper script;
+  ``gh`` through a ``hosts.yml`` in its own ``GH_CONFIG_DIR``. The token is never in a remote
+  URL.
+- Every daemon git command runs with ``GIT_CONFIG_NOSYSTEM=1``, ``GIT_CONFIG_GLOBAL=/dev/null``,
+  ``core.hooksPath=/dev/null``, no inherited credential helper and an absolute git binary; in a
+  checkout also with fsmonitor, auto-gc and submodule recursion off. The committer comes from
+  the environment, never from a config file.
+- The pre-merge checks read the bare mirror (``runner.mirror_dir``), which only the daemon
+  writes, never a checkout: a worker can write its checkout's ``.git`` (config, refs, objects),
+  so nothing the merge decision rests on is read from there. The PR's head arrives in the
+  mirror by ``git fetch`` with fsck.
 - The session's own token (a one-repo App installation token, see ``github_app``) lives in a
-  0700 ``creds`` dir inside the run dir, which the session can read: a credential helper
-  script, a ``token`` file and a ``gh/hosts.yml``. It is never in env or argv. The daemon
-  writes there only through directory fds with ``O_NOFOLLOW`` and ``rename``, so a link planted
-  by the session can't redirect a write.
-- Accepted risk: the package cache (``runner.cache_dir``) is shared between runs, so one run
-  can poison it for the next; it sits inside the same sandbox and nothing else uses it.
+  0700 ``creds`` dir inside the run dir: a credential helper script, a ``token`` file and a
+  ``gh/hosts.yml``. It is never in env or argv. The daemon writes there only through
+  directory fds with ``O_NOFOLLOW`` and ``rename``, so a link planted by the session can't
+  redirect a write.
+- Accepted risk: a worker can write its checkout's ``.git`` (it must, to commit): hooks the
+  owner's git runs, the owner's refs, and config the daemon's git still reads (a smudge filter
+  on the next ``worktree add``, ``http.*`` settings on the daemon's token-carrying fetch).
+  Daemon git there overrides hooks, fsmonitor, ``sshCommand``, gc and protocols; the rest is
+  the honor-system trust of docs/employee-plan.md D4 (the thin guard, D2, protects Resonant,
+  not checkouts).
+- Branch hygiene: a run's ``resonant/…`` branch is deleted only by compare-and-delete against
+  the sha the run left, and never while a worktree has it checked out.
 """
 
 from __future__ import annotations
@@ -46,7 +61,8 @@ import signal
 import sqlite3
 import stat
 import tempfile
-from collections.abc import Awaitable, Callable, Generator, Iterable, Sequence
+import weakref
+from collections.abc import Callable, Generator, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -74,9 +90,6 @@ from resonant.store.repos import Repo
 UPSTREAM_LATER = "Upstream PRs come in a later update."
 GIT_TIMEOUT_S = 300.0
 GH_TIMEOUT_S = 120.0
-HARVEST_TIMEOUT_S = 300.0
-MAX_ASK_QUOTE = 2000
-MAX_SUMMARY_QUOTE = 2000
 COMMITTER_NAME = "Resonant runner"
 COMMITTER_EMAIL = "resonant-runner@users.noreply.github.com"
 _SAFE_PATH = "/usr/bin:/bin"
@@ -86,37 +99,50 @@ _ERR_CLIP = 300
 CREDS_DIR = "creds"
 _PUSH_KINDS = ("push", "force_push", "branch_deletion", "pr_merge")
 _PR_FIELDS = "state,headRefName,headRefOid,baseRefName,isCrossRepository,title,body"
+WORKTREES = ".worktrees"  # <code_dir>/.worktrees/<name>/R<n>
+SCRATCH = ".scratch"  # <code_dir>/.scratch/R<n>
+EXCLUDE_FILE = "git-exclude"  # in the run dir: the session's core.excludesFile
+# The checkout's local config a run sees through a symlink, when present and untracked.
+LOCAL_CONFIG = (".env", ".envrc", ".tool-versions", ".python-version", ".node-version", ".mcp.json")
+_TEMPLATES = (".example", ".sample", ".template")  # committed .env templates, never linked
+# github.com over ssh becomes https, so the run's credential helper answers for it
+_INSTEAD_OF = (
+    ("url.https://github.com/.insteadOf", "git@github.com:"),
+    ("url.https://github.com/.insteadOf", "ssh://git@github.com/"),
+)
+# daemon git in a checkout: nothing a worker could have configured there runs as the daemon
+_CHECKOUT_CONFIG = (
+    ("core.fsmonitor", "false"),
+    ("core.sshCommand", "false"),
+    ("gc.auto", "0"),
+    ("maintenance.auto", "false"),
+    ("fetch.recurseSubmodules", "false"),
+    ("submodule.recurse", "false"),
+    ("protocol.allow", "never"),
+    ("protocol.https.allow", "always"),
+    ("protocol.file.allow", "always"),
+    *_INSTEAD_OF,
+)
+_GITHUB_REMOTE = re.compile(
+    r"(?:https?://(?:[^@/]+@)?|ssh://(?:[^@/]+@)?|[^@/:]+@)github\.com[:/]"
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?",
+    re.IGNORECASE,
+)
 
-# Run inside the sandbox: commit anything left over, then bundle base..branch.
-# argv: repo, out.bundle, base sha, branch, git, commit message.
-HARVEST_SCRIPT = """set -e
-cd "$1"
-bin="$5"
-g() { "$bin" -c core.hooksPath=/dev/null -c gc.auto=0 -c core.fsmonitor=false "$@"; }
-g symbolic-ref HEAD "refs/heads/$4"
-g add -A
-if ! g diff --cached --quiet; then
-  g commit -q --no-verify -m "$6"
-fi
-[ "$(g rev-list --count "$3..refs/heads/$4")" = 0 ] && exit 0
-g bundle create -q "$2" "$3..refs/heads/$4"
-"""
+
+# Checkout locks, per event loop and repo, shared by every Workspace (the runner's and the
+# daily cleanup job's) so their git in one checkout never overlaps.
+_CHECKOUT_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 class RunnerError(Exception):
     """A failure with a reason fit for ``R3 failed: <reason>``. Never carries a token."""
 
 
-class BundleRefused(RunnerError):
-    pass
-
-
 class NoChanges(RunnerError):
     """The session left no commits: the run ends ``no_changes``."""
-
-
-class PublishAborted(RunnerError):
-    """The run was cancelled or Resonant paused before a publish step."""
 
 
 class MergeRefused(RunnerError):
@@ -145,11 +171,69 @@ def branch_name(code: str, ask: str) -> str:
     return f"resonant/{code.lower()}-{slugify(ask)}"
 
 
-def git_env(helper: Path | None = None) -> dict[str, str]:
+def _config_env(config: Sequence[tuple[str, str]]) -> dict[str, str]:
+    """``GIT_CONFIG_COUNT``/``KEY``/``VALUE``: config for every git started with this env,
+    above any config file, written nowhere."""
+    env = {"GIT_CONFIG_COUNT": str(len(config))}
+    for i, (key, value) in enumerate(config):
+        env[f"GIT_CONFIG_KEY_{i}"] = key
+        env[f"GIT_CONFIG_VALUE_{i}"] = value
+    return env
+
+
+def session_git_env(helper: Path | None, exclude: Path | None = None) -> dict[str, str]:
+    """The session's git config, by environment (docs/employee-plan.md D1): any credential
+    helper from the checkout's config reset, then the run's ``helper`` (a script path, never a
+    token), github.com over ssh rewritten to https, and ``exclude`` as ``core.excludesFile`` so
+    the linked local config is never committed. Nothing is written to the checkout."""
+    config = [("credential.helper", "")]
+    if helper is not None:
+        config.append(("credential.helper", f"!{shlex.quote(str(helper))}"))
+    config += _INSTEAD_OF
+    if exclude is not None:
+        config.append(("core.excludesFile", str(exclude)))
+    return _config_env(config)
+
+
+def local_config_name(name: str) -> bool:
+    """Whether a top-level checkout entry is local config a run's worktree links to."""
+    if name in LOCAL_CONFIG:
+        return True
+    return name.startswith(".env.") and not name.lower().endswith(_TEMPLATES)
+
+
+def link_local_config(checkout: Path, worktree: Path, tracked: Iterable[str]) -> list[str]:
+    """Symlink the checkout's untracked local config (``.env``, ``.env.*`` but not templates,
+    ``.envrc``, tool versions, ``.mcp.json``) into a fresh worktree. Only regular files or
+    links, only names the checkout doesn't track and the worktree doesn't already have.
+    Returns the names linked."""
+    skip = set(tracked)
+    linked: list[str] = []
+    for name in sorted(os.listdir(checkout)):
+        if not local_config_name(name) or name in skip:
+            continue
+        try:
+            mode = os.lstat(checkout / name).st_mode
+        except FileNotFoundError:
+            continue
+        if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)) or os.path.lexists(worktree / name):
+            continue
+        os.symlink(checkout / name, worktree / name)
+        linked.append(name)
+    return linked
+
+
+def remote_slug(url: str) -> str | None:
+    """``owner/name`` of a github.com remote URL (https, ssh or scp form), else None."""
+    m = _GITHUB_REMOTE.fullmatch(url.strip())
+    return m[1] if m else None
+
+
+def git_env(helper: Path | None = None, extra: Sequence[tuple[str, str]] = ()) -> dict[str, str]:
     """A from-scratch git environment: no user or system config, no hooks, no prompts, no
-    redirects, and a credential helper only when ``helper`` (a script path, never a token)
-    is given."""
-    config = [("core.hooksPath", "/dev/null"), ("http.followRedirects", "false")]
+    redirects, ``extra`` config, and a credential helper only when ``helper`` (a script path,
+    never a token) is given."""
+    config = [("core.hooksPath", "/dev/null"), ("http.followRedirects", "false"), *extra]
     config.append(("credential.helper", ""))  # reset any inherited helper
     if helper is not None:
         config.append(("credential.helper", f"!{shlex.quote(str(helper))}"))
@@ -160,12 +244,9 @@ def git_env(helper: Path | None = None) -> dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_COUNT": str(len(config)),
+        **_config_env(config),
         **committer_env(),
     }
-    for i, (key, value) in enumerate(config):
-        env[f"GIT_CONFIG_KEY_{i}"] = key
-        env[f"GIT_CONFIG_VALUE_{i}"] = value
     return env
 
 
@@ -409,49 +490,33 @@ async def _exec(
     return Exec(proc.returncode if proc.returncode is not None else -1, out, text[-_ERR_CLIP:])
 
 
-def build_pr_body(code: str, repo: Repo, ask: str, summary: str, result: CheckResult) -> str:
-    """Code-built PR body: the run, the ask (unless ``quote_ask`` is off), Claude's summary,
-    the checks and the flagged paths."""
-    lines = [f"Resonant run {code}."]  # untrusted text below has @ neutralized
-    if repo.quote_ask:
-        quoted = ask.strip()[:MAX_ASK_QUOTE].replace("\n", "\n> ")
-        lines += ["", "Ask:", f"> {quoted}"]
-    if summary.strip():
-        lines += ["", "Summary from Claude:", summary.strip()[:MAX_SUMMARY_QUOTE]]
-    lines += ["", f"Checks: {result.files} files, {result.changed_bytes} bytes changed."]
-    if result.flagged:
-        lines.append(result.flag_line)
-    # A zero-width space after "@" so the PR can't ping users or teams.
-    return "\n".join(lines).replace("@", "@\u200b") + "\n"
-
-
 @dataclass(frozen=True)
 class Prepared:
+    """A run's places. ``run_dir`` (under ``runner.work_dir``) holds the session's home, tmp and
+    credentials; ``workspace`` is where it works (its cwd): the worktree, or for a run with no
+    repo (``repo_name == ""``) the scratch dir."""
+
     code: str
     repo_name: str
     run_dir: Path
-    repo_dir: Path
-    branch: str
-    base_branch: str
-    base_sha: str
+    workspace: Path
+    checkout: Path | None = None
+    branch: str = ""
+    base_branch: str = ""
+    base_sha: str = ""
 
     @property
-    def bundle_path(self) -> Path:
-        return self.run_dir / "out.bundle"
+    def scratch(self) -> bool:
+        return not self.repo_name
 
     @property
     def creds_dir(self) -> Path:
         return self.run_dir / CREDS_DIR
 
     @property
-    def run_ref(self) -> str:
-        return f"refs/runs/{self.code.lower()}"
-
-
-@dataclass(frozen=True)
-class PullRequest:
-    number: int
-    url: str
+    def exclude_file(self) -> Path:
+        """The session's ``core.excludesFile``: the local config linked into the worktree."""
+        return self.run_dir / EXCLUDE_FILE
 
 
 @dataclass(frozen=True)
@@ -467,15 +532,6 @@ class PrInfo:
 
 
 CiState = Literal["green", "red", "pending", "none", "error"]
-
-
-StillOk = Callable[[], Awaitable[bool]]
-"""Whether the run may still publish (not cancelled, Resonant not paused). Called right
-before ``push`` and right before ``gh pr create``."""
-
-Wrap = Callable[[Sequence[str]], Sequence[str]]
-"""Wraps an argv so it runs inside the sandbox (P5A-1's ``wrap``, with the run's params
-bound). Tests pass the identity."""
 
 
 def _https_url(repo: Repo) -> str:
@@ -540,6 +596,8 @@ class Workspace:
         token: str | None = None,
         cwd: Path | None = None,
         stdin: bytes | None = None,
+        extra: Sequence[tuple[str, str]] = (),
+        max_out: int | None = None,
     ) -> bytes:
         """Run git. With a ``token``, it's written to a private file for the length of this
         call and handed over by a credential helper, never by env or argv."""
@@ -550,10 +608,11 @@ class Workspace:
                 helper = write_git_credentials(tmp, token)
             res = await _exec(
                 [self._git_bin, *args],
-                env=git_env(helper),
+                env=git_env(helper, extra),
                 cwd=cwd,
                 stdin=stdin,
                 redact=[token] if token else (),
+                max_out=max_out,
             )
         if res.returncode != 0:
             raise GitError(args, res.returncode, res.stderr)
@@ -611,178 +670,279 @@ class Workspace:
             except GitError:
                 return False
 
-    async def prepare(self, code: str, repo_name: str, ask: str, *, github_token: str) -> Prepared:
-        """Refresh the mirror, note whether the repo has CI, clone it into
-        ``<work_dir>/<code>/repo`` and branch, with the credential helper set (and an empty
-        ``creds`` dir for it). The only daemon-side git in the clone, and it happens before
-        the session exists.
+    # -- checkouts, worktrees and scratch dirs --
 
-        Invariant for the sandbox (P5A-1 probes it): the only sandbox-writable path is
-        ``<work_dir>/<code>`` (plus the cache), so ``work_dir`` and the mirror dir are never
-        written by a session. A leftover ``<code>`` dir (a crash before the session started)
-        is daemon-owned and is deleted and rebuilt.
-        """
+    def checkout_lock(self, repo_name: str) -> asyncio.Lock:
+        """The per-repo checkout lock: clone, fetch, worktree add and remove each take it (two
+        runs on one repo each get a worktree, one after the other). Shared by every
+        ``Workspace`` on the running loop. Not re-entrant."""
+        locks = _CHECKOUT_LOCKS.setdefault(asyncio.get_running_loop(), {})
+        return locks.setdefault(repo_name.lower(), asyncio.Lock())
+
+    def checkout_path(self, repo: Repo) -> Path:
+        """The owner's checkout: the repo's ``path``, else ``<code_dir>/<name>``."""
+        return repo.path if repo.path is not None else self.cfg.code_dir / repo.name
+
+    def worktree_path(self, repo_name: str, code: str) -> Path:
+        return self.cfg.code_dir / WORKTREES / repo_name / code
+
+    def scratch_path(self, code: str) -> Path:
+        return self.cfg.code_dir / SCRATCH / code
+
+    def _run_dir(self, code: str) -> Path:
+        """``<work_dir>/<code>``, made afresh: ``home``, ``tmp`` and an empty ``creds``. A
+        leftover (a crash before the session started) is daemon-owned and is rebuilt."""
+        run_dir = self.cfg.work_dir / code
+        run_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        rmtree_nofollow(run_dir)
+        run_dir.mkdir(mode=0o700)
+        for sub in ("home", "tmp", CREDS_DIR):
+            (run_dir / sub).mkdir(mode=0o700)
+        return run_dir
+
+    async def _in_checkout(
+        self, checkout: Path, *args: str, token: str | None = None, max_out: int | None = None
+    ) -> bytes:
+        """Daemon git in a checkout, with the checkout's risky settings overridden."""
+        return await self._git(
+            ["-C", str(checkout), *args], token=token, extra=_CHECKOUT_CONFIG, max_out=max_out
+        )
+
+    def _checkout_git(self, checkout: Path) -> GitRunner:
+        async def git(*args: str, stdin: bytes | None = None, max_out: int | None = None) -> bytes:
+            return await self._in_checkout(checkout, *args, max_out=max_out)
+
+        return git
+
+    async def ensure_checkout(self, repo: Repo, token: str) -> Path:
+        """The owner's checkout of ``repo``, cloned (https, no credentials in the URL; the
+        daemon's token by credential helper for this call only) when nothing is there. An
+        existing one must be a git checkout whose ``origin`` is this repo. Caller holds the
+        checkout lock."""
+        path = self.checkout_path(repo)
+        self._check_checkout_place(path)
+        url = self._url_for(repo)
+        if not await asyncio.to_thread(os.path.lexists, path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # cloned beside the final place and renamed in, so a clone cut short (a cancel, a
+            # kill) never leaves a half checkout in the way of the next run
+            tmp = Path(tempfile.mkdtemp(prefix=f".{path.name}.clone-", dir=path.parent))
+            try:
+                await self._git(["clone", "-q", "--", url, str(tmp)], token=token,
+                                extra=_CHECKOUT_CONFIG)  # fmt: skip
+                os.chmod(tmp, 0o755)  # noqa: S103  # a normal checkout, not mkdtemp's 0700
+                os.rename(tmp, path)
+            except GitError as e:
+                raise RunnerError(f"cloning {repo.slug} failed: {e.message[-120:]}") from None
+            finally:
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(rmtree_nofollow, tmp)
+            return path
+        not_ours = RunnerError(f"{path} is in the way: it isn't a git checkout of {repo.slug}")
+        if not await asyncio.to_thread(path.is_dir):
+            raise not_ours
+        if not await asyncio.to_thread(os.path.lexists, path / ".git"):
+            raise not_ours
+        if not await asyncio.to_thread(os.path.isdir, path / ".git"):
+            # a linked worktree or a submodule: its git dir lives elsewhere
+            raise RunnerError(f"{path} isn't a plain checkout (its .git isn't a directory)")
+        try:
+            top = (await self._in_checkout(path, "rev-parse", "--show-toplevel")).decode().strip()
+            origin = await self._in_checkout(path, "config", "--get", "remote.origin.url")
+        except GitError:
+            raise not_ours from None
+        if not await asyncio.to_thread(os.path.samefile, top, path):
+            raise not_ours
+        origin_url = origin.decode().strip()
+        slug = remote_slug(origin_url)
+        if origin_url != url and (slug is None or slug.lower() != repo.slug.lower()):
+            raise RunnerError(f"{path}'s origin isn't {repo.slug}")
+        return path
+
+    def _check_checkout_place(self, path: Path) -> None:
+        """A checkout (a repo's ``path``) may not sit in or over Resonant's own dirs: the run,
+        mirror, secrets and cache dirs, or the worktree and scratch roots."""
+        cfg = self.cfg
+        own = (cfg.work_dir, cfg.mirror_dir, cfg.secrets_dir, cfg.cache_dir,
+               cfg.code_dir / WORKTREES, cfg.code_dir / SCRATCH)  # fmt: skip
+        if not path.is_absolute() or any(
+            path.is_relative_to(d) or d.is_relative_to(path) for d in own
+        ):
+            raise RunnerError(f"{path} can't be a checkout: it overlaps Resonant's own dirs")
+
+    async def prepare(self, code: str, repo_name: str, ask: str, *, github_token: str) -> Prepared:
+        """Make the run's places: the checkout (cloned on first use) fetched, a worktree on a
+        new branch from ``origin/<base>`` with the checkout's local config linked in, and the
+        run dir. Notes whether the base has CI. All of it before the session exists; the
+        checkout's working tree and current branch are never touched.
+
+        A leftover worktree or run dir (a crash before the session started) is removed and
+        rebuilt."""
         if not RUN_CODE.fullmatch(code):
             raise RunnerError(f"bad run code {code!r}")
         repo = self._repo(repo_name)
-        run_dir = self.cfg.work_dir / code
-        repo_dir = run_dir / "repo"
         branch = branch_name(code, ask)
-        url = self._url_for(repo)
-        async with self.mirror_lock(repo_name):
-            await self._refresh(repo_name, github_token)
-            mirror = self.mirror_path(repo_name)
-            git = self._mirror_git(repo_name)
+        worktree = self.worktree_path(repo.name, code)
+        async with self.checkout_lock(repo.name):
+            checkout = await self.ensure_checkout(repo, github_token)
+            tracking = f"refs/remotes/origin/{repo.base}"
             try:
-                base_sha = (await git("rev-parse", "--verify", f"refs/heads/{repo.base}")).decode()
+                await self._in_checkout(
+                    checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head",
+                    self._url_for(repo), f"+refs/heads/{repo.base}:{tracking}",
+                    token=github_token,
+                )  # fmt: skip
+            except GitError as e:
+                raise RunnerError(
+                    f"fetching {repo.base} of {repo.slug} failed: {e.message[-120:]}"
+                ) from None
+            try:
+                out = await self._in_checkout(checkout, "rev-parse", "--verify", "-q",
+                                              f"{tracking}^{{commit}}")  # fmt: skip
             except GitError:
                 raise RunnerError(f"{repo.base} isn't a branch of {repo_name}") from None
-            base_sha = base_sha.strip()
+            base_sha = out.decode().strip()
             try:
-                has_ci = await ci_present(git, base_sha)
+                has_ci = await ci_present(self._checkout_git(checkout), base_sha)
             except GitError:
                 has_ci = False
             # No CI is allowed (docs/repos-plan.md D5): the registry records it, the run's
-            # reply says so, and merging is what's refused.
-            with atomic(self.conn):
-                repo_store.set_ci(self.conn, repo.slug, has_ci)
+            # reply says so, and merging is what's refused (after a look at the mirror). The
+            # checkout is worker-writable, so its word only ever lowers what is recorded: a
+            # repo recorded without CI is only raised by the mirror (``_recheck_ci``).
+            if not has_ci or repo.ci is None:
+                with atomic(self.conn):
+                    repo_store.set_ci(self.conn, repo.slug, has_ci)
 
-            run_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            await asyncio.to_thread(rmtree_nofollow, run_dir)
-            run_dir.mkdir(mode=0o700)
+            # a leftover from a crash (its branch is reset by ``-B`` below)
+            await self._remove_worktree(code, worktree, checkout, None)
+            run_dir = await asyncio.to_thread(self._run_dir, code)
             try:
-                for sub in ("home", "tmp", CREDS_DIR):
-                    (run_dir / sub).mkdir(mode=0o700)
-                await self._git(
-                    [
-                        "clone",
-                        "-q",
-                        "--no-hardlinks",
-                        "--no-tags",
-                        "--branch",
-                        repo.base,
-                        "--",
-                        str(mirror),
-                        str(repo_dir),
-                    ],
-                    cwd=run_dir,
-                )
-                await self._git(["-C", str(repo_dir), "remote", "set-url", "origin", url])
-                # The helper reads the token file next to it; the path is no secret. The file
-                # is written when the session starts (``write_session_credentials``).
-                helper = run_dir / CREDS_DIR / "credential-helper"
-                await self._git(
-                    [
-                        "-C",
-                        str(repo_dir),
-                        "config",
-                        "credential.helper",
-                        f"!{shlex.quote(str(helper))}",
-                    ]
-                )
-                await self._git(["-C", str(repo_dir), "checkout", "-q", "-b", branch])
+                worktree.parent.mkdir(parents=True, exist_ok=True)
+                await self._in_checkout(
+                    checkout, "worktree", "add", "-q", "--no-track", "-B", branch,
+                    str(worktree), base_sha,
+                )  # fmt: skip
+                listed = await self._in_checkout(checkout, "ls-files", "-z", "--", *LOCAL_CONFIG,
+                                                 ".env.*")  # fmt: skip
+                tracked = [n for n in listed.decode(errors="replace").split("\0") if n]
+                linked = await asyncio.to_thread(link_local_config, checkout, worktree, tracked)
+                (run_dir / EXCLUDE_FILE).write_text("".join(f"/{n}\n" for n in linked))
             except BaseException:
-                await asyncio.to_thread(rmtree_nofollow, run_dir)
+                with contextlib.suppress(Exception):  # never hide why prepare failed
+                    await self._remove_worktree(code, worktree, checkout, branch, base_sha)
+                    await asyncio.to_thread(rmtree_nofollow, run_dir)
                 raise
-        return Prepared(code, repo_name, run_dir, repo_dir, branch, repo.base, base_sha)
+        return Prepared(code, repo.name, run_dir, worktree, checkout, branch, repo.base, base_sha)
 
-    # -- harvest --
-
-    def harvest_argv(self, p: Prepared) -> list[str]:
-        """The argv to run **inside the sandbox**: commit leftovers, then
-        ``git bundle create out.bundle <base>..<branch>``. No bundle means no commits."""
-        return [
-            "/bin/sh",
-            "-c",
-            HARVEST_SCRIPT,
-            "sh",
-            str(p.repo_dir),
-            str(p.bundle_path),
-            p.base_sha,
-            p.branch,
-            self._git_bin,
-            f"{p.code}: uncommitted work",
-        ]
-
-    async def harvest(self, p: Prepared, wrap: Wrap, env: dict[str, str]) -> None:
-        """Run the harvest script through ``wrap`` (the sandbox). ``env`` is the sandbox env
-        (it needs the committer identity: ``committer_env()``)."""
-        res = await _exec(
-            list(wrap(self.harvest_argv(p))),
-            env=env,
-            cwd=p.run_dir,
-            timeout_s=HARVEST_TIMEOUT_S,
-        )
-        if res.returncode != 0:
-            raise RunnerError("collecting the session's commits failed")
-
-    async def import_bundle(self, p: Prepared) -> str:
-        """Read ``out.bundle`` by fd, check it, and fetch the branch into the mirror as
-        ``refs/runs/<code>``. Returns the head sha. Raises ``NoChanges`` (no bundle) or
-        ``BundleRefused``."""
-        cap = self.cfg.max_bundle_mb * 1024 * 1024
-        incoming = self.cfg.mirror_dir / ".incoming"
-        incoming.mkdir(parents=True, exist_ok=True, mode=0o700)
-        copy = incoming / f"{p.code}.bundle"
-        await asyncio.to_thread(_copy_bundle, p.run_dir, p.bundle_path.name, copy, cap)
+    async def prepare_scratch(self, code: str) -> Prepared:
+        """A run with no repo: the run dir and an empty ``<code_dir>/.scratch/<code>``."""
+        if not RUN_CODE.fullmatch(code):
+            raise RunnerError(f"bad run code {code!r}")
+        scratch = self.scratch_path(code)
+        run_dir = await asyncio.to_thread(self._run_dir, code)
         try:
+            scratch.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            await asyncio.to_thread(self._remove_checked, scratch)
+            scratch.mkdir(mode=0o700)
+        except BaseException:
+            await asyncio.to_thread(rmtree_nofollow, run_dir)
+            raise
+        return Prepared(code, "", run_dir, scratch)
+
+    def _workspace_kind(self, path: Path, code: str) -> str | None:
+        """``worktree`` or ``scratch`` when ``path`` is exactly where this module puts the
+        run's work (``<code_dir>/.worktrees/<name>/<code>``, ``<code_dir>/.scratch/<code>``),
+        with no symlink on the way down from ``code_dir``; else None."""
+        if not RUN_CODE.fullmatch(code) or not path.is_absolute() or path.name != code:
+            return None
+        root = self.cfg.code_dir
+        if path.parent == root / SCRATCH:
+            kind, between = "scratch", [root / SCRATCH]
+        elif path.parent.parent == root / WORKTREES and repo_store.NAME.fullmatch(path.parent.name):
+            kind, between = "worktree", [root / WORKTREES, path.parent]
+        else:
+            return None
+        if any(p.is_symlink() for p in between):
+            return None
+        return kind
+
+    def _remove_checked(self, path: Path) -> bool:
+        """Delete a run's worktree or scratch dir found at a checked place, without following
+        any link inside it (a linked ``.env`` is unlinked, its target kept)."""
+        if self._workspace_kind(path, path.name) is None:
+            raise RunnerError(f"refusing to delete {path}: not a run's worktree or scratch dir")
+        return rmtree_nofollow(path)
+
+    async def _remove_worktree(
+        self,
+        code: str,
+        worktree: Path,
+        checkout: Path | None,
+        branch: str | None,
+        expect: str | None = None,
+    ) -> bool:
+        """``git worktree remove --force`` in the checkout; whatever git couldn't remove is
+        deleted (checked place, no links followed) along with the checkout's admin entry for
+        that one worktree. Then the run's own ``resonant/<code>-…`` branch is deleted, but only
+        while it still points at ``expect`` (what the run left there) and no worktree has it
+        checked out: a branch the owner checked out or committed to is kept. Caller holds the
+        checkout lock. The checkout itself is never deleted."""
+        if self._workspace_kind(worktree, code) != "worktree":
+            raise RunnerError(f"refusing to remove {worktree}: not a run's worktree")
+        usable = checkout is not None and await asyncio.to_thread(os.path.isdir, checkout / ".git")
+        removed = False
+        if usable and checkout is not None and await asyncio.to_thread(os.path.lexists, worktree):
             try:
-                heads = (
-                    await self._git(
-                        [
-                            "-C",
-                            str(self.mirror_path(p.repo_name)),
-                            "bundle",
-                            "list-heads",
-                            str(copy),
-                        ]
-                    )
-                ).decode()
+                await self._in_checkout(checkout, "worktree", "remove", "--force", "--force",
+                                        str(worktree))  # fmt: skip
+                removed = True
             except GitError:
-                raise BundleRefused("the bundle isn't a valid git bundle") from None
-            refs = [line.split(" ", 1)[1].strip() for line in heads.splitlines() if " " in line]
-            if refs != [f"refs/heads/{p.branch}"]:
-                raise BundleRefused("the bundle holds refs other than the run's branch")
-            async with self.mirror_lock(p.repo_name):
-                try:
-                    await self._git(
-                        [
-                            "-C",
-                            str(self.mirror_path(p.repo_name)),
-                            "-c",
-                            "transfer.fsckObjects=true",
-                            "-c",
-                            "fetch.fsckObjects=true",
-                            "fetch",
-                            "-q",
-                            "--no-tags",
-                            "--no-write-fetch-head",
-                            str(copy),
-                            f"+refs/heads/{p.branch}:{p.run_ref}",
-                        ]
-                    )
-                except GitError as e:
-                    raise BundleRefused(
-                        f"the bundle failed git's checks: {e.message[-120:]}"
-                    ) from None
-                head = await self._mirror_git(p.repo_name)("rev-parse", "--verify", p.run_ref)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                copy.unlink()
-        return head.decode().strip()
+                pass
+        if await asyncio.to_thread(os.path.lexists, worktree):
+            removed = await asyncio.to_thread(self._remove_checked, worktree) or removed
+        if usable and checkout is not None:
+            await asyncio.to_thread(_drop_admin_entry, checkout, worktree)
+        own = f"resonant/{code.lower()}-"
+        if not (usable and checkout is not None and branch and expect):
+            return removed
+        if not (branch.startswith(own) and _SHA.fullmatch(expect)):
+            return removed
+        with contextlib.suppress(GitError):
+            listed = await self._in_checkout(checkout, "worktree", "list", "--porcelain")
+            if f"branch refs/heads/{branch}\n" not in listed.decode(errors="replace") + "\n":
+                # compare-and-delete: refused when the branch moved since the run
+                await self._in_checkout(checkout, "update-ref", "-d", f"refs/heads/{branch}",
+                                        expect)  # fmt: skip
+        return removed
 
-    async def check(self, p: Prepared, head_sha: str, secrets: RunnerSecrets) -> CheckResult:
-        """The refuse/flag checks on ``base..head`` in the mirror. Raises ``CheckFailed``."""
-        return await run_checks(
-            self._mirror_git(p.repo_name),
-            base_sha=p.base_sha,
-            head_sha=head_sha,
-            branch=p.branch,
-            repo=self._repo(p.repo_name),
-            secrets=secrets.values(),
-        )
+    async def remove_workspace(
+        self,
+        code: str,
+        *,
+        workspace: str | Path | None,
+        checkout: str | Path | None = None,
+        branch: str | None = None,
+        expect: str | None = None,
+    ) -> bool:
+        """Remove a run's worktree (and its branch) or scratch dir: on cancel, on merge and
+        ``runner.keep_days`` after the run ended. Only the exact place the run recorded under
+        ``code_dir`` is touched; anything else raises ``RunnerError``. The branch goes only
+        while it still points at ``expect``. False if nothing was there."""
+        if workspace is None:
+            return False
+        path = Path(workspace)
+        kind = self._workspace_kind(path, code)
+        if kind == "scratch":
+            return await asyncio.to_thread(rmtree_nofollow, path)
+        if kind != "worktree":
+            raise RunnerError(f"refusing to remove {path}: not a run's worktree or scratch dir")
+        async with self.checkout_lock(path.parent.name):
+            return await self._remove_worktree(
+                code, path, None if checkout is None else Path(checkout), branch, expect
+            )
 
-    # -- publish --
+    # -- gh --
 
     async def gh(
         self, args: Sequence[str], secrets: RunnerSecrets, *, stdin: bytes | None = None
@@ -816,80 +976,6 @@ class Workspace:
                 timeout_s=GH_TIMEOUT_S,
                 redact=secrets.values(),
             )
-
-    @staticmethod
-    async def _must_still_be_ok(still_ok: StillOk) -> None:
-        if not await still_ok():
-            raise PublishAborted("the run was cancelled or Resonant is paused")
-
-    async def publish(
-        self,
-        p: Prepared,
-        result: CheckResult,
-        secrets: RunnerSecrets,
-        *,
-        ask: str,
-        summary: str,
-        still_ok: StillOk,
-    ) -> PullRequest:
-        """Push the run's branch and open the PR. Idempotent: a branch already at the head
-        is a no-op push, and an open PR for the branch is reused.
-
-        ``still_ok`` is awaited before the push, again after it, and again right before
-        ``gh pr create``; a falsy answer raises ``PublishAborted``.
-        """
-        repo = self._repo(p.repo_name)
-        if repo.mode != "push":  # never push to a repo the token can't push to
-            raise RunnerError(UPSTREAM_LATER)
-        if not _SHA.fullmatch(result.head_sha):
-            raise RunnerError("bad head commit")
-        body = build_pr_body(p.code, repo, ask, summary, result)
-        check_texts(secrets.values(), pr_body=body, pr_title=result.title, branch_name=p.branch)
-
-        await self._must_still_be_ok(still_ok)
-        async with self.mirror_lock(p.repo_name):
-            try:
-                await self._git(
-                    [
-                        "-C",
-                        str(self.mirror_path(p.repo_name)),
-                        "push",
-                        "-q",
-                        self._url_for(repo),
-                        f"{result.head_sha}:refs/heads/{p.branch}",
-                    ],
-                    token=secrets.github_token,
-                )
-            except GitError as e:
-                raise RunnerError(f"pushing the branch failed: {e.message[-120:]}") from None
-
-        await self._must_still_be_ok(still_ok)
-        listed = await self._gh(
-            ["pr", "list", "--repo", repo.slug, "--head", p.branch, "--state", "all",
-             "--json", "number,url"],
-            secrets,
-        )  # fmt: skip
-        if listed.returncode == 0:
-            with contextlib.suppress(ValueError, KeyError, TypeError):
-                for item in json.loads(listed.stdout):
-                    url = str(item["url"])
-                    if _PR_URL.fullmatch(url):
-                        return PullRequest(int(item["number"]), url)
-
-        await self._must_still_be_ok(still_ok)
-        created = await self._gh(
-            ["pr", "create", "--repo", repo.slug, "--head", p.branch, "--base", p.base_branch,
-             "--title", result.title.replace("@", "@\u200b"), "--body-file", "-"],
-            secrets,
-            stdin=body.encode(),
-        )  # fmt: skip
-        if created.returncode != 0:
-            raise RunnerError(f"gh pr create failed: {created.stderr[-120:]}")
-        lines = created.stdout.decode(errors="replace").split()
-        match = _PR_URL.fullmatch(lines[-1]) if lines else None
-        if match is None:
-            raise RunnerError("gh pr create didn't print a PR URL")
-        return PullRequest(int(match[1]), match[0])
 
     # -- the base branch --
 
@@ -1167,51 +1253,18 @@ class Workspace:
         return result
 
 
-# --- the bundle read ---------------------------------------------------------------------
-
-
-def _copy_bundle(run_dir: Path, name: str, dest: Path, cap: int) -> None:
-    """Copy ``<run_dir>/<name>`` into ``dest`` through one fd: ``O_NOFOLLOW``, a regular
-    file, at most ``cap`` bytes (read ``cap + 1`` from the fd, never from the path)."""
-    try:
-        dir_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError as e:
-        raise BundleRefused("the run dir isn't a plain directory") from e
-    try:
-        try:
-            # O_NONBLOCK so a FIFO planted at the path can't hang the open.
-            fd = os.open(
-                name,
-                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-                dir_fd=dir_fd,
-            )
-        except FileNotFoundError:
-            raise NoChanges("the session made no commits") from None
-        except OSError:
-            raise BundleRefused("the bundle isn't a regular file") from None
-    finally:
-        os.close(dir_fd)
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise BundleRefused("the bundle isn't a regular file")
-        with contextlib.suppress(FileNotFoundError):
-            dest.unlink()
-        out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        try:
-            remaining = cap + 1
-            while remaining > 0:
-                chunk = os.read(fd, min(1 << 20, remaining))
-                if not chunk:
-                    break
-                os.write(out, chunk)
-                remaining -= len(chunk)
-            if remaining == 0:
-                raise BundleRefused(f"the bundle is over {cap // (1024 * 1024)} MB")
-        except BaseException:
-            with contextlib.suppress(FileNotFoundError):
-                dest.unlink()  # never leave a partial copy
-            raise
-        finally:
-            os.close(out)
-    finally:
-        os.close(fd)
+def _drop_admin_entry(checkout: Path, worktree: Path) -> None:
+    """Remove the checkout's ``.git/worktrees/<id>`` whose ``gitdir`` is ``worktree``'s, once
+    that worktree's dir is gone (``git worktree prune`` would also drop the owner's own
+    worktrees whose dirs are only out of reach). Never raises."""
+    admin = checkout / ".git" / "worktrees"
+    want = {str(worktree / ".git"), os.path.join(os.path.realpath(worktree.parent),
+                                                 worktree.name, ".git")}  # fmt: skip
+    with contextlib.suppress(OSError):
+        if os.path.lexists(worktree):
+            return
+        for entry in os.listdir(admin):
+            gitdir = admin / entry / "gitdir"
+            with contextlib.suppress(OSError):
+                if gitdir.read_text().strip() in want:
+                    rmtree_nofollow(admin / entry)

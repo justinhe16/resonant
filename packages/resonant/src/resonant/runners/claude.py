@@ -1,16 +1,20 @@
-"""ClaudeRunner (``runner="claude"``): one Claude Code session per run, in a sandboxed throwaway
-clone (docs/phase5a-plan.md D2 to D4).
+"""ClaudeRunner (``runner="claude"``): one Claude Code session per run, in a worktree of the
+owner's checkout or, with no repo, a scratch dir (docs/phase5a-plan.md D2 to D4,
+docs/employee-plan.md D1).
 
 A run is a task of kind ``run`` plus a row in ``runs`` (migration 006) that holds all the state a
 restart needs. One ``step`` drives a run from its saved step to the next stopping point, holding
-a Claude slot and the repo's run lock the whole time:
+a Claude slot the whole time (two runs on one repo go at once, each in its own worktree):
 
-    prepare   refresh the mirror, check the repo has CI, clone, branch (``Workspace.prepare``)
+    prepare   clone the checkout on first use, fetch it, note whether the base has CI, add the
+              run's worktree on a new branch and link the checkout's local config into it
+              (``Workspace.prepare``); a run with no repo gets an empty scratch dir
     session   a per-run GitHub App token for the one repo (``runner.github_app``), the cached
               sandbox self-check (fails closed), then ``claude -p`` under ``sandbox.wrap`` with a
               from-scratch environment. The session itself pushes its branch, opens the PR,
               watches CI and fixes it (docs/repos-plan.md D10); the token is revoked when the
-              session ends, however it ends
+              session ends, however it ends. A run with no repo gets no token and ends ``done``
+              with Claude's summary
     harvest   (the saved step keeps this name) find the PR by its head branch and check it the
               way a merge will; no PR and no pushed commits is ``no_changes``
     reply     the code-built message to the requester
@@ -19,13 +23,15 @@ Each step is saved in ``runs.step`` before it starts, so a crash resumes at the 
 session is resumed by id (``--resume``) in the same run dir, after the old process tree has been
 reaped. After the session starts the daemon writes into the run dir only to refresh the token
 files, through ``O_NOFOLLOW`` directory fds. Merging (``merge_run``) fetches the PR's head into
-the mirror and runs the checks first; no merge path skips them.
+the daemon-only mirror and runs the checks first; no merge path skips them.
 
 Outcomes. A usage limit parks the run (``Wait("usage_reset")``: slot and lock freed; the wait
 doesn't count as session time or an attempt, and 24 h of waiting in total fails the run). The
 time limit, the disk limit, the turn or dollar limit and a Claude error fail the run and keep its
-dir ("work kept"); what the session already pushed stays on GitHub. ``/cancel`` and ``/kill`` end
-the whole process tree, revoke the token and delete the dir.
+dir and worktree ("work kept"); what the session already pushed stays on GitHub. ``/cancel`` and
+``/kill`` end the whole process tree, revoke the token and delete the run dir and the worktree
+(or scratch dir); a merge deletes them too, and the daily job ``runner.keep_days`` after the run
+ended. The owner's checkout is never deleted.
 
 Public API for the tools and slash commands (P5A-4): :meth:`ClaudeRunner.start_run`,
 :meth:`~ClaudeRunner.list_runs`, :meth:`~ClaudeRunner.cancel_run`,
@@ -99,6 +105,7 @@ from resonant.runner.workspace import (
     RunnerError,
     Workspace,
     read_session_token,
+    session_git_env,
     write_session_credentials,
 )
 from resonant.runners import reaper
@@ -169,8 +176,10 @@ REVOKE_TIMEOUT_S = (
 )
 
 RUNNER_PROMPT = (
-    "You are working in a throwaway clone of {repo}, on branch {branch}, which is already "
-    "checked out. git and gh are set up with credentials for this repo only. Commit your work "
+    "You are working in a git worktree of {repo} (your current directory), on branch {branch}, "
+    "which is already checked out. The checkout's local config (.env files and the like) is "
+    "linked in and kept out of git: use it, never commit it. git and gh are set up with "
+    "credentials for this repo only. Commit your work "
     "with clear messages, then push it with `git push -u origin {branch}`. Open a pull request "
     "against {base} with `gh pr create --base {base} --head {branch}` and a short title and "
     "description. Then wait for CI with `gh pr checks --watch`. If CI fails, read the failing "
@@ -181,6 +190,12 @@ RUNNER_PROMPT = (
     "again. Stop when CI is green or you are "
     "out of attempts. End with a 1-3 line summary: what changed, the PR number, whether CI is "
     "green, and anything left undone."
+)
+SCRATCH_PROMPT = (
+    "You are working in an empty scratch directory (your current directory); this task is not "
+    "tied to a repo and you have no GitHub credentials. Do what is asked, and end with a 1-5 "
+    "line summary of what you did, what you found and anything left undone: it is what the "
+    "owner reads."
 )
 RESUME_PROMPT = (
     "Your session was interrupted. Continue the task you were given. If it is already done, "
@@ -206,8 +221,9 @@ class Started:
     @property
     def text(self) -> str:
         new = f" (new repo: {self.new_repo})" if self.new_repo else ""
+        where = self.repo or "no repo"
         text = (
-            f"On it: {self.code} · {self.repo}{new}. Up to {self.max_minutes}m. "
+            f"On it: {self.code} · {where}{new}. Up to {self.max_minutes}m. "
             f"/runs to check, /cancel {self.code} to stop."
         )
         return f"{text}\n{self.warning}" if self.warning else text
@@ -279,6 +295,8 @@ def reply_text(run: Run, ci: str | None = None, *, no_ci: bool = False) -> str |
             return text + f"\n/merge {run.code} {hint}." + summary
         case "no_changes":
             return f"{run.code}: no changes." + (f" {run.summary}" if run.summary else "")
+        case "done":  # a run with no repo: Claude's summary is the answer
+            return f"{run.code} done ({took})" + (f": {run.summary}" if run.summary else ".")
         case "failed":
             return f"{run.code} failed: {run.failure or 'unknown error'}"
         case "cancelled":
@@ -500,7 +518,7 @@ class ClaudeRunner:
         self.secrets = secrets
         self.tz = ZoneInfo(timezone)
         self.max_runs = max_runs
-        self.workspace = workspace or Workspace(_with_real_git(runner), conn)
+        self.workspace = workspace or Workspace(runner, conn)
         self.resolver = Resolver(conn)
         self._github: Callable[[RunnerSecrets], GitHub] = github or self._gh_github
         self.app = github_app or (
@@ -532,7 +550,6 @@ class ClaudeRunner:
         self.state_dir = runner.mirror_dir.parent
         self.transcript_dir = self.state_dir / "transcripts"
         self.last_killed = 0  # runs the last kill switch engage ended
-        self._locks: dict[str, asyncio.Lock] = {}  # one run at a time per repo
         self._working: set[str] = set()  # codes with a step in flight
         self._live: dict[str, Target] = {}  # codes with a session process
         self._cleanup_locks: dict[str, asyncio.Lock] = {}
@@ -669,12 +686,13 @@ class ClaudeRunner:
             how.append("install Claude Code")
         return not_set_up_text(missing, how) if missing else None
 
-    async def start_run(self, repo: str, ask: str, principal: str) -> Started | Refused:
+    async def start_run(self, repo: str | None, ask: str, principal: str) -> Started | Refused:
         """Create a run and its task. ``repo`` is free text (a name, ``owner/name``, a URL):
-        the resolver turns it into a registered repo, registering one it hasn't seen. Refuses
+        the resolver turns it into a registered repo, registering one it hasn't seen. No repo
+        (None or blank) is a run in a scratch dir, with no GitHub token and no PR. Refuses
         (with a sentence for the requester) when the runner isn't set up, the repo is
-        ambiguous or unknown, or Resonant is paused. Two runs on one repo queue: the second
-        waits for the first."""
+        ambiguous or unknown, or Resonant is paused. Two runs on one repo go at once, each in
+        its own worktree."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text)
         ask = ask.strip()
@@ -684,11 +702,14 @@ class ClaudeRunner:
             return Refused(f"That ask is too long ({len(ask)} characters, at most {MAX_ASK}).")
         if self._paused():
             return Refused("Resonant is paused. /resume first.")
-        resolved = await self._resolve(repo)
-        if isinstance(resolved, Refused):
-            return resolved
-        found, new = resolved
-        repo = found.name
+        found: repo_store.Repo | None = None
+        new = False
+        if repo is not None and repo.strip():
+            resolved = await self._resolve(repo)
+            if isinstance(resolved, Refused):
+                return resolved
+            found, new = resolved
+        repo = "" if found is None else found.name
         run = runs.create(
             self.conn,
             repo=repo,
@@ -703,7 +724,7 @@ class ClaudeRunner:
             runner=RUNNER_NAME,
             priority=PRIORITY_OWNER,
             principal=principal,
-            checkpoint={"run": run.code, "title": f"run {run.code} · {repo}"},
+            checkpoint={"run": run.code, "title": f"run {run.code} · {repo or 'no repo'}"},
         )
         try:
             task_id = self._create_task(spec)
@@ -714,6 +735,8 @@ class ClaudeRunner:
         with atomic(self.conn):
             audit(self.conn, "run.start", task_id=task_id, requested_by=principal, run=run.code,
                   repo=repo)  # fmt: skip
+        if found is None:
+            return Started(run.code, "", max(1, self.max_session_s // 60))
         with atomic(self.conn):
             repo_store.touch(self.conn, found.slug)
         return Started(
@@ -808,6 +831,7 @@ class ClaudeRunner:
             audit(self.conn, "run.merged", run=run.code, pr=run.pr_number)
         with contextlib.suppress(Exception):
             await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
+        await self._remove_workspace(run)
         return Merged(run.code, run.pr_number, checked.flagged)
 
     # -- the loop's entry point --
@@ -823,11 +847,9 @@ class ClaudeRunner:
             return self._defer(task, "starting")
         if self._paused():
             return self._defer(task, "paused")
-        lock = self._locks.setdefault(run.repo, asyncio.Lock())
-        if lock.locked() or len(self._working) >= self.max_runs:
+        if len(self._working) >= self.max_runs:
             return self._defer(task, "busy")  # waits without holding a Claude slot
-        await lock.acquire()  # nothing awaited since the check: it can't have been taken
-        self._working.add(run.code)
+        self._working.add(run.code)  # nothing awaited since the check
         try:
             return await self._drive(task, run, ctx)
         except asyncio.CancelledError:
@@ -835,7 +857,6 @@ class ClaudeRunner:
             raise
         finally:
             self._working.discard(run.code)
-            lock.release()
 
     def _defer(self, task: Task, why: str) -> Wait:
         # The loop has no "resource" wait reason; usage_reset is the closest, and the run's own
@@ -865,11 +886,8 @@ class ClaudeRunner:
                 if outcome is not None:
                     return outcome
                 run = self._must_get(run.code)
-            if run.step in (
-                "harvest",
-                "publish",
-            ):  # "publish" only in a run saved by an older build
-                run = await self._collect(w, run, p)
+            if run.step in ("harvest", "publish") and not run.scratch:
+                run = await self._collect(w, run, p)  # "publish" only in an older build's run
         except _Cancelled:
             return await self._conclude(self._must_get(run.code))
         except NoChanges:
@@ -887,10 +905,19 @@ class ClaudeRunner:
 
     async def _prepare(self, w: _Work, run: Run) -> Run:
         self._check_stop(run.code)
-        p = await self.workspace.prepare(
-            run.code, run.repo, run.ask, github_token=w.secrets.github_token
+        if run.scratch:
+            p = await self.workspace.prepare_scratch(run.code)
+        else:
+            p = await self.workspace.prepare(
+                run.code, run.repo, run.ask, github_token=w.secrets.github_token
+            )
+        runs.update(
+            self.conn,
+            run.code,
+            workspace=str(p.workspace),
+            checkout=None if p.checkout is None else str(p.checkout),
         )
-        params = self._params(p.run_dir)
+        params = self._params(p)
         try:
             await _finish_thread(self._prepare_session_dirs, params)
         except (SandboxError, OSError) as e:
@@ -900,12 +927,12 @@ class ClaudeRunner:
             run.code,
             status="running",
             step="session",
-            branch=p.branch,
-            base_branch=p.base_branch,
-            base_sha=p.base_sha,
+            branch=p.branch or None,
+            base_branch=p.base_branch or None,
+            base_sha=p.base_sha or None,
             started_at=self.clock(),
         )
-        w.ctx.save(claude_session_id=run.session_id, worktree_path=str(p.run_dir))
+        w.ctx.save(claude_session_id=run.session_id, worktree_path=str(p.workspace))
         self._pulse_open(self._must_get(run.code))
         self._check_stop(run.code)
         return self._must_get(run.code)
@@ -928,31 +955,44 @@ class ClaudeRunner:
         link_tools(params, tools)
 
     def _prepared(self, run: Run) -> Prepared:
-        assert run.branch and run.base_branch and run.base_sha
         run_dir = self.cfg.work_dir / run.code
-        return Prepared(run.code, run.repo, run_dir, run_dir / "repo", run.branch,
+        if run.scratch:
+            workspace = run.workspace or self.workspace.scratch_path(run.code)
+            return Prepared(run.code, "", run_dir, Path(workspace))
+        assert run.branch and run.base_branch and run.base_sha
+        if run.workspace is None:  # prepared by a build before worktrees (EM-2)
+            raise RunnerError("it was started by an older version of Resonant; start it again")
+        checkout = None if run.checkout is None else Path(run.checkout)
+        return Prepared(run.code, run.repo, run_dir, Path(run.workspace), checkout, run.branch,
                         run.base_branch, run.base_sha)  # fmt: skip
 
-    def _params(self, run_dir: Path) -> SandboxParams:
+    def _params(self, p: Prepared) -> SandboxParams:
+        # the session works in its worktree, and git writes the checkout's object store and
+        # refs; a scratch dir is all a run with no repo has
+        writes = [p.workspace]
+        if p.checkout is not None:
+            writes.append(p.checkout / ".git")
         return SandboxParams(
-            run_dir=run_dir,
+            run_dir=p.run_dir,
             work_dir=self.cfg.work_dir,
             cache_dir=self.cfg.cache_dir,
             secrets_dir=self.cfg.secrets_dir,
             read_paths=self._read_paths,
             deny_exec=default_deny_exec(),
             deny_read=tuple(self.cfg.deny_read),
+            write_paths=tuple(writes),
         )
 
     def _cached_self_check(self, params: SandboxParams) -> tuple[bool, str]:
         return cached_self_check(params, self.state_dir / CHECK_CACHE)
 
     def _env(
-        self, params: SandboxParams, marker: str, secrets: RunnerSecrets | None
+        self, params: SandboxParams, marker: str, secrets: RunnerSecrets | None, p: Prepared
     ) -> dict[str, str]:
         """The sandbox environment: from scratch, the one allowed secret only when asked. The
         run's GitHub token is not in it: ``gh`` finds it by ``GH_CONFIG_DIR`` (a path) and git
-        through the credential helper in the clone's config."""
+        through the credential helper named in ``GIT_CONFIG_*`` (a path; nothing is written
+        to the checkout's config). A run with no repo has neither."""
         bins = [p for p in params.read_paths if p.name == "bin"]
         env = scratch_env(
             params,
@@ -961,7 +1001,12 @@ class ClaudeRunner:
             anthropic_key=None if secrets is None else secrets.anthropic_key,
         )
         env[MARKER_ENV] = marker  # the run's session id: unique, never reused
-        env["GH_CONFIG_DIR"] = str(Path(env["HOME"]).parent / CREDS_DIR / "gh")
+        if p.scratch:
+            env.update(session_git_env(None))
+        else:
+            creds = Path(env["HOME"]).parent / CREDS_DIR
+            env["GH_CONFIG_DIR"] = str(creds / "gh")
+            env.update(session_git_env(creds / "credential-helper", p.exclude_file))
         env["GH_PROMPT_DISABLED"] = "1"
         env["GH_NO_UPDATE_NOTIFIER"] = "1"
         return env
@@ -986,7 +1031,9 @@ class ClaudeRunner:
             "--settings",
             json.dumps({"sandbox": {"enabled": False}}),
             "--append-system-prompt",
-            RUNNER_PROMPT.format(
+            SCRATCH_PROMPT
+            if p.scratch
+            else RUNNER_PROMPT.format(
                 repo=self._slug(run.repo),
                 branch=p.branch,
                 base=p.base_branch,
@@ -1008,7 +1055,7 @@ class ClaudeRunner:
                 f"(work kept: /runs {run.code})", w.redactor)  # fmt: skip
         if run.session_seconds >= run.max_seconds:
             return await self._timed_out(run, w)
-        params = self._params(p.run_dir)
+        params = self._params(p)
         try:
             ok, detail = await asyncio.to_thread(self._self_check, params)
         except SandboxError as e:
@@ -1021,7 +1068,8 @@ class ClaudeRunner:
                 run, "the sandbox check failed, see resonant sandbox check", w.redactor
             )
         self._check_stop(run.code)
-        await self._provision(w, run, p)
+        if not p.scratch:  # a run with no repo gets no GitHub token
+            await self._provision(w, run, p)
         try:
             return await self._run_session(w, run, p, params)
         finally:
@@ -1036,7 +1084,7 @@ class ClaudeRunner:
                 self._argv(run, p, params, api_billing=bool(w.secrets.anthropic_key)), params
             )
         )
-        env = self._env(params, run.session_id, w.secrets)
+        env = self._env(params, run.session_id, w.secrets, p)
         prompt = (RESUME_PROMPT if run.sessions else run.ask).encode()
         writer = TranscriptWriter(self.transcript_dir / f"{run.code}.jsonl", w.redactor)
         state = StreamState()
@@ -1044,7 +1092,7 @@ class ClaudeRunner:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
-                cwd=p.repo_dir,
+                cwd=p.workspace,
                 env=env,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -1154,6 +1202,11 @@ class ClaudeRunner:
                 p.run_dir, self.disk_limit_bytes, disk_exceeded, interval_s=self.disk_interval_s
             )
         )
+        work_disk = asyncio.create_task(  # the worktree or scratch dir, on the same limit
+            watch_disk(
+                p.workspace, self.disk_limit_bytes, disk_exceeded, interval_s=self.disk_interval_s
+            )
+        )
         cache = asyncio.create_task(
             watch_disk(
                 self.cfg.cache_dir,
@@ -1204,6 +1257,7 @@ class ClaudeRunner:
         finally:
             # Also on cancellation: nothing of the session may outlive the step.
             disk.cancel()
+            work_disk.cancel()
             cache.cancel()
             if refreshing is not None:
                 refreshing.cancel()
@@ -1216,7 +1270,7 @@ class ClaudeRunner:
             done_pumps, pending = await asyncio.wait(pumps, timeout=5)
             for t in pending:
                 t.cancel()
-            await asyncio.wait([*done_pumps, *pending, disk, cache, exited])
+            await asyncio.wait([*done_pumps, *pending, disk, work_disk, cache, exited])
             self._live.pop(run.code, None)
             writer.note("exit", code=proc.returncode, stop=stop)
             writer.close()
@@ -1247,6 +1301,12 @@ class ClaudeRunner:
             return await self._fail(run, f"Claude failed (exit {returncode}) {keep}", w.redactor)
         text = result.get("result")
         summary = _summary(text, w.redactor) if isinstance(text, str) else None
+        if run.scratch:  # nothing to collect: the summary is the answer
+            if not runs.finish(self.conn, run.code, "done", step="reply", summary=summary):
+                raise _Cancelled
+            with atomic(self.conn):
+                audit(self.conn, "run.done", run=run.code)
+            return None
         runs.update(self.conn, run.code, summary=summary, step="harvest")  # then ``_collect``
         return None
 
@@ -1520,6 +1580,7 @@ class ClaudeRunner:
             with contextlib.suppress(Exception):
                 # two deletes of one tree would trip over each other, hence the lock
                 await _finish_thread(delete_run_dir, self.cfg.work_dir, code)
+            await self._remove_workspace(run)
             self._pulse_clear(run)
             if send:
                 with contextlib.suppress(ChannelError):
@@ -1613,6 +1674,28 @@ class ClaudeRunner:
             if self._must_get(run.code).status == "cancelled":
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
+                await self._remove_workspace(self._must_get(run.code))
+
+    async def _remove_workspace(self, run: Run) -> None:
+        """Remove the run's worktree (and its local branch) or scratch dir; never the checkout.
+        Best effort: a failure is logged and the daily job tries again."""
+        workspace, checkout = run.workspace, run.checkout
+        if workspace is None:  # not recorded yet (or an older row): where prepare puts it
+            if run.scratch:
+                workspace = str(self.workspace.scratch_path(run.code))
+            else:
+                workspace = str(self.workspace.worktree_path(run.repo, run.code))
+                if (repo := repo_store.find(self.conn, run.repo)) is not None:
+                    checkout = str(self.workspace.checkout_path(repo))
+        try:
+            await self.workspace.remove_workspace(
+                run.code, workspace=workspace, checkout=checkout, branch=run.branch,
+                expect=run.head_sha or run.base_sha,
+            )  # fmt: skip
+        except Exception as e:
+            log.warning("run workspace not removed", extra={"run": run.code, "reason": str(e)})
+            return
+        runs.update(self.conn, run.code, workspace=None, checkout=None)  # nothing left to do
 
     def _insert_task(self, spec: NewTask) -> str:
         with transaction(self.conn):
@@ -1630,7 +1713,7 @@ class ClaudeRunner:
         started = run.started_at or self.clock()
         at = started.astimezone(self.tz).strftime("%H:%M")
         what = "waiting for usage reset" if bucket == "waiting" else "still running"
-        title = f"{run.code} {what} · {run.repo} · started {at}"
+        title = f"{run.code} {what} · {run.repo or 'no repo'} · started {at}"
         state = {"bucket": bucket or _bucket(run.session_seconds)}
         now = self.clock()
         with atomic(self.conn):
@@ -1644,7 +1727,8 @@ class ClaudeRunner:
             if pulse_store.get(self.conn, PULSE_SOURCE, key) is None:
                 return
             _change, item = pulse_store.upsert(
-                self.conn, PULSE_SOURCE, key, f"{run.code} finished · {run.repo}", "normal",
+                self.conn, PULSE_SOURCE, key, f"{run.code} finished · {run.repo or 'no repo'}",
+                "normal",
                 {"bucket": "done"}, True, PULSE_TTL_S, now,
             )  # fmt: skip
             pulse_store.mark_told(self.conn, [item], now)
@@ -1698,14 +1782,6 @@ def _sandbox_wrap(argv: Sequence[str], params: SandboxParams) -> Sequence[str]:
     return wrap(argv, params)
 
 
-def _with_real_git(cfg: RunnerConfig) -> RunnerConfig:
-    """The workspace's git also runs inside the sandbox (the harvest), where Apple's
-    ``/usr/bin/git`` shim can't write its cache; use the real binary."""
-    if cfg.git_path == Path("/usr/bin/git") and (real := resolve_tool("git")) is not None:
-        return cfg.model_copy(update={"git_path": real})
-    return cfg
-
-
 # --- the daily cleanup job -----------------------------------------------------------------
 
 CLEANUP_JOB_ID = "run-cleanup"
@@ -1713,34 +1789,52 @@ CLEANUP_SCHEDULE = "30 4 * * *"
 
 
 def cleanup_job(deps: CoreDeps) -> CoreJob | None:
-    """The ``CORE_JOBS`` factory: delete run dirs that ended more than ``runner.keep_days``
-    ago, prune the cache to ``runner.max_cache_gb`` and wipe stale token dirs. None when no
-    repo is registered and no run or cache dir exists."""
+    """The ``CORE_JOBS`` factory: delete run dirs, worktrees (with their local branches) and
+    scratch dirs of runs that ended more than ``runner.keep_days`` ago, prune the cache to
+    ``runner.max_cache_gb`` and wipe stale token dirs. Checkouts are never deleted. None when
+    no repo is registered and no run, code or cache dir exists."""
     from resonant.extensions.scheduler import CoreJob
 
     cfg, conn = deps.settings.runner, deps.conn
     if (
         not cfg.repos
         and not repo_store.list_all(conn)
-        and not (cfg.work_dir.exists() or cfg.cache_dir.exists())
+        and not (cfg.work_dir.exists() or cfg.cache_dir.exists() or cfg.code_dir.exists())
     ):
         return None  # no repo registered and nothing on disk
 
     async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
+        ended = runs.ended_at_map(conn)
         result = await asyncio.to_thread(
             cleanup,
             cfg.work_dir,
             cfg.cache_dir,
             secrets_dir=cfg.secrets_dir,
             mirror_dir=cfg.mirror_dir,
-            ended_at=runs.ended_at_map(conn),
+            ended_at=ended,
             keep_days=cfg.keep_days,
             max_cache_bytes=cfg.max_cache_gb * 1024**3,
         )
         for error in result.errors:
             log.warning("run cleanup: %s", error)
-        return {"removed": len(result.removed_runs), "freed_bytes": result.cache_freed_bytes,
-                "errors": len(result.errors)}  # fmt: skip
+        workspace = Workspace(cfg, conn)  # its checkout locks are the runner's (per loop)
+        cutoff = time.time() - cfg.keep_days * 86400
+        removed = 0
+        for code, at in sorted(ended.items()):
+            old = runs.get(conn, code)
+            if at > cutoff or old is None or old.workspace is None:
+                continue
+            try:
+                removed += await workspace.remove_workspace(
+                    code, workspace=old.workspace, checkout=old.checkout, branch=old.branch,
+                    expect=old.head_sha or old.base_sha,
+                )  # fmt: skip
+            except Exception as e:  # one bad worktree must not stop the rest
+                log.warning("run cleanup: %s: %s", code, e)
+                continue
+            runs.update(conn, code, workspace=None, checkout=None)  # done: not tried again
+        return {"removed": len(result.removed_runs), "worktrees": removed,
+                "freed_bytes": result.cache_freed_bytes, "errors": len(result.errors)}  # fmt: skip
 
     return CoreJob(
         id=CLEANUP_JOB_ID, schedule=CLEANUP_SCHEDULE, run=run, catchup=timedelta(hours=12)

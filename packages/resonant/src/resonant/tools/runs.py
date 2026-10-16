@@ -7,11 +7,12 @@ owner) call them. The handlers call ``ClaudeRunner`` (``components.runners["clau
 at call time: the runner is built after the tools are registered) and return code-built
 ``text`` that the local runner's report line and the fast path's render send as is.
 
-- ``start_run{repo, ask}``: L3, no approval (the sandbox is the wall). ``repo`` is an enum of
-  a free string (a registry name, ``owner/name`` or a GitHub URL) that the runner's resolver
-  checks; the registered names are listed in the spec (``specs_for``). A run that can't start
-  (not set up, ambiguous or unknown repo, paused) is a normal result with ``started: false``
-  and the reason as ``text``.
+- ``start_run{repo?, ask}``: L3, no approval (the sandbox is the wall). ``repo`` is a free
+  string (a registry name, ``owner/name`` or a GitHub URL) that the runner's resolver checks;
+  the registered names are listed in the spec (``specs_for``). Without ``repo`` the run
+  works in a scratch dir and ends with Claude's summary, no PR (docs/employee-plan.md D1). A
+  run that can't start (not set up, ambiguous or unknown repo, paused) is a normal result with
+  ``started: false`` and the reason as ``text``.
 - ``list_runs{code?}``: L0, active runs first. Run codes (``R3``) are not approval codes: the
   model sees them, never an approval code. Free text from Claude (summary, failure) is
   cleaned and clipped.
@@ -56,7 +57,7 @@ class RunnerApi(Protocol):
 
     async def setup_missing(self) -> str | None: ...
 
-    async def start_run(self, repo: str, ask: str, principal: str) -> Started | Refused: ...
+    async def start_run(self, repo: str | None, ask: str, principal: str) -> Started | Refused: ...
 
     def list_runs(self, limit: int = 20) -> list[Run]: ...
 
@@ -75,7 +76,9 @@ START_RUN = ToolSpec(
     name="start_run",
     description=(
         "Start a Claude Code run on a GitHub repo (a name, owner/name or URL): it works in a "
-        "sandbox and opens a pull request. `ask` is what to do, in the owner's words."
+        "worktree of the repo and opens a pull request. Leave out `repo` for work not tied to a "
+        "repo (ops, research): it runs in a scratch dir and reports back. `ask` is what to do, "
+        "in the owner's words."
     ),
     args_schema={
         "type": "object",
@@ -83,7 +86,7 @@ START_RUN = ToolSpec(
             "repo": {"type": "string", "maxLength": REPO_MAX},
             "ask": {"type": "string", "minLength": 1, "maxLength": ASK_MAX},
         },
-        "required": ["repo", "ask"],
+        "required": ["ask"],
         "additionalProperties": False,
     },
     effect=Effect.WRITE,
@@ -245,21 +248,24 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         if unknown:
             raise ToolFailed(f"start_run: unknown arguments: {sorted(unknown)}")
         repo, ask = args.get("repo"), args.get("ask")
-        if not isinstance(repo, str) or not isinstance(ask, str) or not ask.strip():
-            raise ToolFailed("start_run: repo and ask are required strings")
-        repo = repo.strip()
+        if not (repo is None or isinstance(repo, str)) or not isinstance(ask, str):
+            raise ToolFailed("start_run: ask is a required string, repo an optional one")
+        if not ask.strip():
+            raise ToolFailed("start_run: ask is a required string, repo an optional one")
+        repo = (repo or "").strip() or None
         if len(ask) > ASK_MAX:
             raise ToolFailed(f"start_run: ask is too long (at most {ASK_MAX} characters)")
         claude = runner()
         if claude is None:
             return {"started": False, "text": missing()}
-        if len(repo) > REPO_MAX:
+        if repo is not None and len(repo) > REPO_MAX:
             raise ToolFailed(f"start_run: repo is too long (at most {REPO_MAX} characters)")
         result = await claude.start_run(repo, ask, ctx.principals.owner)
         if (reason := _refusal(result)) is not None:
             return {"started": False, "text": reason}
         started = cast("Started", result)
-        return {"started": True, "code": started.code, "repo": started.repo, "text": started.text}
+        return {"started": True, "code": started.code, "repo": started.repo or None,
+                "text": started.text}  # fmt: skip
 
     async def _list_runs(args: dict[str, Any]) -> dict[str, Any]:
         unknown = set(args) - {"code"}
