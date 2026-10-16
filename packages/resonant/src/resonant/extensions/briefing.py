@@ -14,6 +14,9 @@ nothing to say is left out (``Nothing on today.`` when all are):
   wait reasons only, never titles or message bodies). Reminders are left out (above).
 - ``✋ 1 approval pending (A7)``: ``approvals.pending_for(owner)``.
 - ``⚠ model, imessage degraded``: degraded checks in ``health_snapshot``.
+- ``Workers:`` then one line per Claude worker (EM-6): the finished runs the owner hasn't
+  heard of (the 08:00 pulse is skipped, so the briefing says them) and the ones still
+  running, marked told after the send like the Updates.
 - ``Updates:`` then one line per open pulse item (``store.pulse.open_items``: every source
   including ``core``, every urgency), changed-since-told first, at most 8 lines and
   ``+N more``. The items listed are marked told after the send (a manual run too), so the
@@ -53,7 +56,16 @@ from zoneinfo import ZoneInfo
 from resonant import killswitch
 from resonant.executor import CallContext
 from resonant.extensions import notify
-from resonant.extensions.pulse_job import deliver, fit_lines, item_line, prune_inflight
+from resonant.extensions.pulse_job import (
+    deliver,
+    fit_entries,
+    fit_lines,
+    is_worker_item,
+    item_line,
+    prune_inflight,
+    running_workers,
+    worker_entries,
+)
 from resonant.monitor import health_snapshot
 from resonant.store import pulse as pulse_store
 from resonant.store.approvals import pending_for
@@ -109,6 +121,7 @@ class Briefing:
     approvals: tuple[str, ...] = ()  # one code per pending approval ("" when it has none)
     degraded: tuple[str, ...] = ()  # health check names
     updates: tuple[pulse_store.Item, ...] = ()  # open pulse items, most changed first
+    workers: tuple[pulse_store.Item, ...] = ()  # running workers, and finished ones untold
 
 
 def _plural(n: int, word: str) -> str:
@@ -180,9 +193,16 @@ def render_full(b: Briefing) -> tuple[str, list[pulse_store.Item]]:
         if line
     ]
     base = "\n".join(lines)
-    extra, shown = _updates_lines(b, MAX_CHARS - len(base) - (1 if base else 0))
+    room = MAX_CHARS - len(base) - (1 if base else 0)
+    workers, listed, more = fit_entries(worker_entries(b.workers), room)
+    if more:
+        workers.append(f"+{more} more")
+    lines += workers
+    used = len("\n".join(workers)) + (1 if workers else 0)
+    extra, shown = _updates_lines(b, room - used)
     text = "\n".join([*lines, *extra]) or NOTHING
-    return (text if len(text) <= MAX_CHARS else text[: MAX_CHARS - 1].rstrip() + "…"), shown
+    text = text if len(text) <= MAX_CHARS else text[: MAX_CHARS - 1].rstrip() + "…"
+    return text, [*listed, *shown]
 
 
 def render(b: Briefing) -> str:
@@ -196,6 +216,7 @@ def sections(b: Briefing) -> list[str]:
         "work": _work_line(b),
         "approvals": approvals_line(b),
         "health": _health_line(b),
+        "workers": "x" if b.workers else None,
         "updates": "x" if b.updates else None,
     }
     return [name for name, line in named.items() if line]
@@ -246,6 +267,16 @@ def _updates(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item,
     return tuple(i for i in items if i.source not in muted)
 
 
+def _workers(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item, ...]:
+    """The Workers section: runs still going, and finished ones the owner hasn't heard of
+    (EM-6; the 08:00 pulse is skipped, so the briefing says what it would have)."""
+    finished = [
+        i for i in pulse_store.pending(conn, ("urgent", "normal", "low"), now) if is_worker_item(i)
+    ]
+    keys = {i.key for i in finished}
+    return (*finished, *(i for i in running_workers(conn, now) if i.key not in keys))
+
+
 def gather(
     conn: sqlite3.Connection,
     *,
@@ -264,6 +295,7 @@ def gather(
         approvals=tuple(a.code or "" for a in pending_for(conn, owner, now)),
         degraded=_degraded(conn),
         updates=_updates(conn, now),
+        workers=_workers(conn, now),
     )
 
 

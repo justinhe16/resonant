@@ -17,7 +17,7 @@ maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, makefile, gi
 scratch (a run with no repo: writes notes in its cwd and reports).
 
 The worker CLI (EM-3), on the first turn only, before the scenario: ``--note TEXT`` runs
-``resonant note``, ``--check SYSTEM:ACTION:WHAT`` runs ``resonant check`` (denied: the turn
+``resonant note`` (``--urgent-note TEXT``: ``resonant note TEXT --urgent``), ``--check SYSTEM:ACTION:WHAT`` runs ``resonant check`` (denied: the turn
 ends there with ``Didn't: denied.``), ``--ask TEXT`` (with ``--options``) runs ``resonant ask``
 (no answer yet, exit 3: the turn ends with ``Waiting for the owner.``), and ``--wait-message S``
 calls ``resonant note`` for up to S seconds until a reply carries an owner message. Each call
@@ -60,6 +60,7 @@ ap.add_argument("--echo-token", action="store_true")
 ap.add_argument("--ask")
 ap.add_argument("--options")
 ap.add_argument("--note")
+ap.add_argument("--urgent-note")
 ap.add_argument("--check")
 ap.add_argument("--wait-message", type=float, default=0.0)
 args = ap.parse_args()
@@ -197,6 +198,8 @@ def cli(*argv: str) -> tuple[int, str]:
 if not args.resume:
     if args.note:
         cli("note", args.note)
+    if args.urgent_note:
+        cli("note", args.urgent_note, "--urgent")
     if args.check:
         system, action, what = args.check.split(":", 2)
         rc, _ = cli("check", "--system", system, "--action", action, what)

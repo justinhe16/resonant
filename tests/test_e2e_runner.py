@@ -66,6 +66,7 @@ from resonant.secrets import (
 )
 from resonant.store import pulse as pulse_store
 from resonant.store import runs as runs_store
+from resonant.store import trust as trust_store
 from resonant.store.db import iso, kv_set, utcnow
 from resonant_sdk import ToolSpec
 
@@ -413,12 +414,40 @@ async def test_r1_chat_request_starts_a_run(
     async with running(w):
         started = await w.say("fix the typo in the README in demo")
         assert started.endswith("On it: R1 · demo. Up to 45m. /runs to check, /cancel R1 to stop.")
-        done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL} · 1 file · ")
-        assert "⚠" not in done
+        # EM-6: a run asked for in plain words reports in the digest, not with a text
+        await until(settled(w, "R1", "ready"), 60, "R1 to finish")
         assert w.run().ask == "fix the typo in the README" and w.run().principal == "justin"
         detail = (await w.say("/runs R1")).splitlines()
         assert detail[0] == "- R1 demo · ready · PR #41" and PR_URL in detail
+        assert not any(t.startswith("R1 done") for t in w.texts())
+        digest = await w.say("/pulse now")
+        assert digest == f"btw:\nWorkers:\nR1 done: PR #41 (CI green) · {PR_URL}"
+        assert await w.next_text() == "Pulse sent."
+        assert not any(t.startswith("R1 done") for t in w.texts())  # said once, in the digest
+
+
+async def test_em6_a_chat_run_that_fails_is_texted_right_away(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_world(tmp_path, resonant_home, chat, monkeypatch, scenario="error")
+    async with running(w):
+        assert (await w.say("fix the typo in the README in demo")).endswith("/cancel R1 to stop.")
+        failed = await w.next_text()
+        assert failed == f"R1 failed: {w.run().failure}" and w.run().status == "failed"
+        assert pulse_store.pending(w.conn, ["normal", "urgent"], utcnow()) == []
+
+
+async def test_em6_a_notify_now_rule_texts_a_chat_run_when_it_finishes(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = make_world(tmp_path, resonant_home, chat, monkeypatch)
+    async with running(w):
+        trust_store.add_rule(w.conn, scope=REPO, action="done", effect="notify_now",
+                             created_from="chat", now=utcnow())  # fmt: skip
+        assert (await w.say("fix the typo in the README in demo")).endswith("/cancel R1 to stop.")
+        done = await w.next_text()
+        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL} · 1 file · ")
+        assert pulse_store.pending(w.conn, ["normal", "urgent"], utcnow()) == []
 
 
 # --- /cancel and /kill ----------------------------------------------------------------------
