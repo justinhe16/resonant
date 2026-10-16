@@ -1,6 +1,6 @@
 # Repos plan: the runner works on any repo, like a person at a computer
 
-Status: planned (2026-10-15). Builds on [`phase5a-plan.md`](phase5a-plan.md).
+Status: RP-1, RP-4, RP-5, RP-8 and RP-9 are merged. The remaining waves are superseded by [`employee-plan.md`](employee-plan.md) (2026-10-15). Builds on [`phase5a-plan.md`](phase5a-plan.md).
 
 Phase 5a lets the runner work only on repos named in `runner.repos` in the config file. This plan removes that fixed list:
 
