@@ -66,15 +66,30 @@ JobOutcome = Literal["ok", "failed", "killed", "denied", "dry_run", "skipped_pau
 PulseState = Literal["new", "told"]  # new: the owner hasn't heard this version yet
 
 # Identifiers the remote tier may carry: health check names (``model``, ``ext:github``),
-# extension names and job ids (the SDK's slugs). Never free text.
-Ident = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9:_-]{0,63}$")]
+# extension names and job ids (the SDK's slugs, owner-chosen but never message content).
+# A row whose identifier doesn't match is left out of the snapshot, never an error.
+IDENT_PATTERN: Final = r"^[a-z][a-z0-9:_-]{0,63}$"
+Ident = Annotated[str, StringConstraints(pattern=IDENT_PATTERN)]
 # A git sha (8 hex) or the package version when there is no git checkout.
-Version = Annotated[str, StringConstraints(pattern=r"^[0-9A-Za-z.+-]{1,40}$")]
+VERSION_PATTERN: Final = r"^[0-9A-Za-z.+-]{1,40}$"
+Version = Annotated[str, StringConstraints(pattern=VERSION_PATTERN)]
 
 _GIT = "/usr/bin/git"  # SIP-protected; never looked up by name
 _SHA = re.compile(r"[0-9a-f]{40}")
+_IDENT = re.compile(IDENT_PATTERN)
 _OUTCOMES: frozenset[str] = frozenset(get_args(JobOutcome))
 _HEALTH_STATES: frozenset[str] = frozenset(get_args(HealthState))
+_TASK_STATES: frozenset[str] = frozenset(get_args(TaskStatus))
+_RUN_STATES: frozenset[str] = frozenset(get_args(RunStatus))
+
+
+def _ident(value: str) -> bool:
+    return _IDENT.fullmatch(value) is not None
+
+
+def _counts(counts: Mapping[str, int], known: frozenset[str]) -> dict[Any, int]:
+    """``counts`` with only the known states (a state added later never breaks the page)."""
+    return {k: n for k, n in counts.items() if k in known}
 
 
 def _local() -> Any:
@@ -247,9 +262,10 @@ def _strip(value: Any) -> Any:
 
 
 def to_remote(snapshot: Snapshot) -> Snapshot:
-    """The same snapshot with every local-only field cleared, at any depth."""
-    stripped = cast(Snapshot, _strip(snapshot))
-    return stripped.model_copy(update={"tier": "remote"})
+    """The same snapshot with every local-only field cleared, at any depth, validated again
+    (``model_copy`` doesn't validate) so a pusher can only ever send a valid remote tier."""
+    stripped = cast(Snapshot, _strip(snapshot)).model_copy(update={"tier": "remote"})
+    return Snapshot.model_validate(stripped.model_dump())
 
 
 def schema_json() -> str:
@@ -300,6 +316,8 @@ def _since(raw: object) -> datetime | None:
 def _health(conn: sqlite3.Connection) -> dict[str, HealthRow]:
     rows: dict[str, HealthRow] = {}
     for name, h in health_snapshot(conn).items():
+        if not _ident(name):  # a stale or hand-edited kv key
+            continue
         detail = h.get("detail")
         rows[name] = HealthRow(
             name=name,
@@ -319,6 +337,8 @@ def _jobs(
     jobs: list[Job] = []
     for spec in cast(list[dict[str, Any]], record.manifest.get("jobs") or []):
         job_id = str(spec.get("id", ""))
+        if not _ident(job_id):
+            continue
         next_due: datetime | None = None
         if record.status == "enabled":
             try:
@@ -352,6 +372,8 @@ def _extensions(
 ) -> list[Extension]:
     out: list[Extension] = []
     for record in ext_store.list_extensions(conn):
+        if not _ident(record.name):
+            continue
         states = {j.job_id: j for j in ext_store.list_jobs(conn, record.name)}
         check = health.get(EXT_CHECK_PREFIX + record.name)
         out.append(
@@ -404,13 +426,13 @@ def build_snapshot(
         paused=kv_get(conn, "paused", False) is True,
         dry_run=settings.dry_run,
         health=list(health.values()),
-        tasks=Tasks(by_state=cast(dict[TaskStatus, int], task_store.count_by_status(conn))),
+        tasks=Tasks(by_state=_counts(task_store.count_by_status(conn), _TASK_STATES)),
         slots=Slots(
             used=0 if slots is None else slots.in_use,
             max=settings.claude.max_concurrent if slots is None else slots.capacity,
         ),
         runs=Runs(
-            by_state=cast(dict[RunStatus, int], dict(runs.count_by_status(conn))),
+            by_state=_counts(runs.count_by_status(conn), _RUN_STATES),
             items=[
                 RunItem(
                     code=r.code,

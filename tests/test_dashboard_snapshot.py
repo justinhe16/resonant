@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
+from resonant import __version__
 from resonant.config import load_settings
 from resonant.dashboard import snapshot as snap
 from resonant.dashboard.snapshot import (
@@ -97,16 +98,20 @@ def _remote_strings(schema: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 
 
 def test_remote_strings_are_never_free_text() -> None:
-    """Every string the remote tier keeps is an enum, a date-time or a short pattern."""
+    """Every string the remote tier keeps is an enum, a date-time or one of the two short
+    identifier patterns (never just any pattern: ``^.*$`` would be free text)."""
     strings = _remote_strings(Snapshot.model_json_schema())
     assert strings  # the walk found the remote fields
     loose = [
         path
         for path, node in strings
         if not ("enum" in node or "const" in node or node.get("format") == "date-time")
-        and not (node.get("pattern", "").startswith("^") and node["pattern"].endswith("$"))
+        and node.get("pattern") not in (snap.IDENT_PATTERN, snap.VERSION_PATTERN)
     ]
     assert loose == []
+    by_path = {p: n.get("pattern") for p, n in strings}
+    assert by_path["$.version"] == snap.VERSION_PATTERN  # used only where meant
+    assert [p for p, pat in by_path.items() if pat == snap.VERSION_PATTERN] == ["$.version"]
 
 
 def test_the_walk_flags_free_text() -> None:
@@ -521,6 +526,42 @@ def test_remote_over_random_stores(db: sqlite3.Connection, seed: int) -> None:
     _check_remote(to_remote(local))
 
 
+def test_rows_with_bad_identifiers_are_left_out(db: sqlite3.Connection) -> None:
+    """A stale or hand-edited row never breaks the dashboard (or reaches the remote tier)."""
+    now = utcnow()
+    kv_set(db, "health.ext:Bad Name", {"state": "degraded", "since": iso(now), "detail": "x"})
+    kv_set(db, "health.ext:github", {"state": "ok", "since": iso(now), "detail": None})
+
+    def ext(name: str, jobs: list[dict[str, Any]]) -> ext_store.ExtensionRecord:
+        return ext_store.ExtensionRecord(
+            name=name,
+            source=f"repo:{name}",
+            commit="abc",
+            tree_digest="d",
+            manifest_sha="m",
+            manifest={"name": name, "jobs": jobs},
+            installed_at=now,
+            installed_by="justin",
+        )
+
+    ext_store.save_extension(db, ext("Bad.Ext", []))
+    jobs = [{"id": "Bad.Id", "schedule": "0 8 * * *"}, {"id": "ok-job", "schedule": "0 8 * * *"}]
+    ext_store.save_extension(db, ext("github", jobs))
+    s = build_snapshot(db, load_settings(), now=now)
+    assert [h.name for h in s.health][-1] == "ext:github"
+    assert "ext:Bad Name" not in {h.name for h in s.health}
+    assert [(e.name, [j.id for j in e.jobs]) for e in s.extensions] == [("github", ["ok-job"])]
+    _check_remote(to_remote(s))
+
+
+def test_to_remote_validates() -> None:
+    """``to_remote`` re-validates, so a snapshot built with ``model_copy`` past the checks
+    can't be pushed."""
+    bad = _random_snapshot(random.Random(1)).model_copy(update={"version": "has spaces"})
+    with pytest.raises(ValidationError):
+        to_remote(bad)
+
+
 def test_code_version_is_a_sha_or_the_package_version() -> None:
     v = snap.code_version()
-    assert re.fullmatch(r"[0-9a-f]{8}", v) or v == "0.1.0"
+    assert re.fullmatch(r"[0-9a-f]{8}", v) or v == __version__
