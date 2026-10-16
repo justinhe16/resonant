@@ -7,7 +7,7 @@ Work we've decided to do eventually but have deferred. Each entry says why it wa
 Only you can do these: tokens, GitHub settings and the first real runs. Claude never enters a secret, and no secret goes in a command line or a chat. Do them in this order. The full steps and expected output are [`go-live.md`](go-live.md) step 14 (step 12 for the github extension); status rows are in [`test.md`](test.md). Tick them off here.
 
 - [ ] **github extension** (go-live 12, if not done yet): `resonant secret set github/token` (read-only fine-grained token), then `resonant ext add repo:github` (type `github`).
-- [ ] **Deploy and reinstall:** `/update`, then `resonant daemon install` (the LaunchAgent's new system-only PATH). If the github extension was installed before EM-11, first `resonant ext update github` (the new copy pins `gh`; the old one still looks `gh` up on PATH), then drop `/opt/homebrew/bin` from `extensions.process.path` in `~/.resonant/config.yaml` if it is there (the default is `/usr/bin`, `/bin`). In that order: the old copy fails with `gh not found on /usr/bin:/bin` without it.
+- [x] **Deploy and reinstall:** done by Claude on 2026-10-16 (main at schema 11, `resonant daemon install` run). If you install the github extension later, the new copy already pins `gh`; keep `extensions.process.path` at `/usr/bin`, `/bin`.
 - [ ] **Claude Code and `gh` installed** (`claude --version`; `gh` at `/opt/homebrew/bin/gh`), then `claude setup-token` → `resonant secret set runner/claude_token` (or, for API billing, `resonant secret set runner/anthropic_key` and set `runner.max_budget_usd`).
 - [ ] **GitHub App:**
   1. github.com → Settings → Developer settings → GitHub Apps → New. Webhook off.
@@ -24,6 +24,15 @@ Only you can do these: tokens, GitHub settings and the first real runs. Claude n
 - [ ] **The iMessage tests:** go-live 14, iMessage 2–11 (`test.md` 40–45): spawn in plain words and get the digest line, a question and its reply, a check and `yes always`, a rule that makes a merge ask, a scratch run, cancel and `/kill`.
 - [ ] **First fork run** (only with the `public_repo` token): the App mints a token for the new fork, and the upstream PR opens only after your `yes` (`test.md` 46).
 - [ ] **Optional tidy-up from the old runner:** drop `runner.max_bundle_mb` from `~/.resonant/config.yaml` if it is there (ignored now), and delete `~/.resonant/runner/mirrors/.incoming` if it exists (old bundle copies; nothing writes there any more).
+
+### Dashboard and status relay (Phase 4, [`dashboard-plan.md`](dashboard-plan.md))
+
+The local dashboard (`http://127.0.0.1:7777/` on the Mini) needs nothing from you. These make it reachable from anywhere and add the dead-man alert. Exact steps land in go-live step 15 with DB-5.
+
+- [ ] **Supabase:** create a project; turn sign-ups off; create your one user; enroll TOTP MFA; run the `supabase/migrations/`; put the daemon's insert-only key in the Keychain (`resonant secret set relay/supabase_key`); tell Claude the project URL (not secret) to set `relay.supabase_url` and `relay.enabled`.
+- [ ] **Fly:** `brew install flyctl`, `fly auth signup` or `login`, `fly launch` from `relay/` (no deploy yet), `fly secrets set` for the Supabase URL and keys and the alert target, then `fly deploy`.
+- [ ] **Alerts:** install the ntfy app on your phone and subscribe to a long random topic (or pick a webhook); that topic goes in `fly secrets`.
+- [ ] **Freeze test:** with Claude watching, `kill -STOP` the daemon; the phone alert arrives within ~5 minutes and the dashboard says stale; `kill -CONT` sends the recovery.
 
 ## Status relay: dead-man switch and remote dashboard
 

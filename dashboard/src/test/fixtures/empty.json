@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "tier": "local",
+  "taken_at": "2026-10-16T09:00:00+00:00",
+  "version": "3ef397a1",
+  "started_at": "2026-10-16T08:58:00+00:00",
+  "last_tick": null,
+  "autonomy": "off",
+  "paused": true,
+  "dry_run": true,
+  "health": [],
+  "tasks": {
+    "by_state": {}
+  },
+  "slots": {
+    "used": 0,
+    "max": 5
+  },
+  "runs": {
+    "by_state": {},
+    "items": []
+  },
+  "approvals": {
+    "open": 0,
+    "items": []
+  },
+  "questions": {
+    "open": 0,
+    "items": []
+  },
+  "pulse": {
+    "open": 0,
+    "items": []
+  },
+  "extensions": [],
+  "runner": {
+    "set_up": false,
+    "missing": [
+      "claude",
+      "gh auth"
+    ]
+  },
+  "trust_rules": [],
+  "repos": []
+}
