@@ -427,6 +427,9 @@ class RunnerConfig(_Section):
     max_cache_gb: int = Field(default=20, ge=1)
     max_minutes: int = Field(default=45, ge=1, le=600)
     max_budget_usd: float | None = Field(default=None, gt=0)
+    # How long a worker's `resonant ask` (or a `resonant check` that asks the owner) stays
+    # open. After it the session resumes with "no answer from the owner" (EM-3, D3).
+    ask_timeout_minutes: int = Field(default=240, ge=1, le=7 * 24 * 60)
     # Unused since EM-2 (there is no bundle handback any more); kept so old configs still load.
     max_bundle_mb: int = Field(default=50, ge=1, le=500)
     # Days a finished run's dir is kept (a daily job deletes it after).

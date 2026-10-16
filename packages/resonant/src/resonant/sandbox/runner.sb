@@ -54,6 +54,13 @@
 ;; @DENY_READ@
   )
 
+;; ---- the worker CLI's control dirs (EM-3) -------------------------------------------------
+;; <work_dir>/.ctl/R<n> holds each run's socket and token. A session writes none of them,
+;; reads only its own, and connects to no unix socket under work_dir but its own run dir's
+;; and its own control dir's: it can neither speak for another run nor stand in for the
+;; daemon on another run's socket. (Filled in only for a session; see profile.render.)
+;; @CTL@
+
 ;; ---- the ancestors of everything above: no rename, no delete ---------------------------------
 ;; A subpath rule follows the path, not the files: renaming a parent dir would carry a
 ;; protected tree out from under it (and a fresh one could be put in its place). A literal

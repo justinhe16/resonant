@@ -196,3 +196,73 @@ Built: `resonant/sandbox/runner.sb` rewritten as the thin guard; `profile.py` (`
   - Hardlinks that already exist into a protected file are not covered, because the rules are path-based (`.venv` has none today; keep uv's link mode as clone or copy).
   - `API_PORT` is fixed at 7777 in the profile and the self-check. If `api.port` changes, derive the port from settings.
   - `~/Library` and `~/.config` are write-denied whole (the existing persistence list). Narrow them to LaunchAgents, the login-item store and the config files that run code, if workers need `~/Library/Caches` with the real `HOME`.
+
+### EM-3 (worker CLI, question waits, daemon git under the guard)
+
+Built: `runners/worker_cli.py` (wire, shim, socket server, peer check), `runners/worker_desk.py` (asks, notes, checks, messages, events), `store/questions.py` with migration 011 (`run_questions`, `run_messages`, `runs.wait_reason`, `runs.last_note`, `runs.resume_prompt`), and changes to `runners/claude.py`, `runner/workspace.py`, `sandbox/` and `wiring.py`. Tests: `tests/test_worker_cli.py` (the fake claude runs the real shim over the real socket), one e2e in `test_e2e_runner.py`, S2 tests in `test_runner_workspace.py` and real-`sandbox-exec` control-dir tests in `test_sandbox.py`.
+
+- **The CLI.** `<run>/bin/resonant` is a stdlib Python script written at prepare, before any session can touch `bin/`. Its shebang is the daemon's base interpreter with `-IS`; the venv is exec-denied, the base install is only write-protected. Usage:
+  - `resonant ask "<q>" [--options a,b,c] [--urgent]`
+  - `resonant note "<progress>" [--urgent]`
+  - `resonant check --system S --action A [--irreversible] [--cost USD] "<what>"`
+
+  Replies are plain text. The exit codes:
+  - `0`: answered, noted, or the check is ok.
+  - `1`: check denied.
+  - `2`: usage error.
+  - `3`: no answer yet. End the turn; the session is resumed with the answer.
+  - `4`: Resonant can't be reached, or the run is over.
+
+  The worker prompt (`WORKER_PROMPT`) says when to use each command, with the D4 list of what to check.
+- **The socket.** The control dir is `<work_dir>/.ctl/R<n>/{sock,token}`: daemon-owned, 0700, lstat-checked and never followed through a link. It sits beside the run dir, not inside it, because the session can rewrite anything in its own run dir. Each session gets a fresh `secrets.token_urlsafe(32)` token (0600, written by rename); it never appears in argv or env. The server runs only while a session process runs, and it is closed (with its handlers cancelled) before the reap, so a CLI call in flight can't text anyone after a stop.
+
+  Each request is checked twice:
+  - The token, with `hmac.compare_digest`.
+  - The peer pid (`LOCAL_PEERPID`). It must be the run's live session leader, matched on start time, or one of its descendants. A process that double-forked and was reparented to launchd gets exit 4.
+
+  A socket path over 100 bytes (tests only) is bound in a short private dir under `/tmp` and renamed into place; the shim then connects from inside the control dir.
+- **The guard rules** (`runner.sb` `@CTL@`; deny-only, checked with real `sandbox-exec`):
+  - No writes anywhere under `<work_dir>/.ctl`.
+  - No reads there except the run's own control dir.
+  - No unix-socket connect under `work_dir` except to the run's own run dir and control dir.
+
+  So a worker can neither use another run's token nor plant a socket that stands in for the daemon. `.ctl` joins the ancestor rename guard. The four per-run `-D` values are kept out of `profile_hash`, so the cached self-check still hits from one run to the next. This answers EM-1's socket carry-over.
+- **`ask`.** It records the question and emits a `question` event. It texts the requester `R4 asks: <q>` (with `Options: …`), cleaned by `clean_external`, redacted and clipped, through the same `channel.send` as run replies. Then it waits up to `ask_block_s`, 8 minutes. The session env sets `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` to 10 minutes, so the Bash tool doesn't cut the call off first.
+  - A repeat of the open question (a retry) joins it, and nothing is texted twice.
+  - There is one open ask per run, so an answer can't land on the wrong question.
+  - If the caller hangs up, the handler stops at once and nothing is marked delivered.
+
+  An answer counts as delivered only after the CLI reply has been written; otherwise the next turn's prompt carries it. So delivery is at least once, never lost.
+- **`waiting(question)`.** The decision comes after a turn ends with a result, and nothing is awaited from the look to the step change:
+  - Undelivered answers, timeouts or messages: another `--resume` turn in the same step.
+  - An open question: the run goes to `waiting`, reason `question` (task wait `human_reply`, `wake_at` at the earliest `asked_at + ask_timeout`). The slot is freed. The pulse item reads `R4 waiting for your answer · …`. The time adds to neither `session_seconds` (`max_minutes`) nor `wait_seconds` (the 24 h usage cap).
+  - Otherwise: harvest, or `done` for a scratch run.
+
+  Waking: `answer_question` and `deliver_message` always submit a task event, deduped by question or message id. `Loop.submit` requeues a waiting task, and a `Wait` returned while events are pending requeues at once, so an answer can't be missed. A woken run with nothing deliverable returns the same `Wait` and leaves its row untouched.
+
+  After `runner.ask_timeout_minutes` (default 240) the question times out, and the session resumes with "No answer from the owner; use your judgment or stop."
+
+  Each delivery turn's text is saved in `runs.resume_prompt` until the turn ends. A crash mid-turn resumes with `RESUME_PROMPT` plus that text plus any still-open question. A daemon restart defers open asks. Usage waits now record `wait_reason='usage_reset'`; a NULL reason, from rows made before migration 011, is treated as a usage wait.
+- **`note`** sets `runs.last_note`, which is appended to the running pulse title, and emits a `note` event with `urgent`.
+- **`check`** calls EM-4's `TrustChecks.request_check(run_code, system, action, irreversible, cost_usd, what) -> "ok" | "denied"` (`IMessageStack.trust`, the one instance `wiring.py` also hands the runner). `system` and `action` are slugged first with EM-4's `slug`; a bad one or `*` is a usage error (exit 2). The CLI waits for the decision like an ask, up to 8 minutes. The decision call keeps running after the CLI gives up and after the turn ends, so the owner's approval (EM-4's prompt, `yes` / `yes always` / `no`) stays alive while the run is in `waiting(question)`. The verdict is recorded on the check's row; that wakes the run, and the session resumes with "Your check (deploy on x: …) is ok: go ahead." or "… was denied: don't do it …".
+
+  The call is cancelled only when the run ends or when `ask_timeout` passes, and cancelling it expires the approval (EM-4). The approval's own TTL is `gate.approval_ttl_s` (30 minutes by default, well under `ask_timeout`), so an unanswered check normally ends `denied` at that TTL. Known gap: `approvals.resolve` refuses a reply while the run's task is `queued` (woken and waiting for a slot), so a yes in that window is refused and the check expires as denied; widening the gate's rule is left to the gate's owner. EM-4 allows at most 3 pending checks per run; a fourth is `denied`. On a daemon restart, open checks are closed with "Resonant restarted before the owner decided; run `resonant check` again", and their pending `trust_check` approvals are expired so a late yes doesn't look accepted. A runner built without `trust` (tests only) denies every check.
+- **The API for EM-5 and EM-6** (on `ClaudeRunner`):
+  - `open_questions() -> [OpenQuestion(id, run_code, question, options, asked_at, urgent)]`
+  - `answer_question(code, text) -> Relayed | Refused`
+  - `deliver_message(code, text) -> Relayed | Refused`. A message is appended to the next CLI reply as `Message from the owner: …`, or opens the next turn. A run waiting for an answer resumes with it. It is refused once the run's session step is over.
+  - `events.subscribe(fn)` returns the unsubscribe function. `WorkerEvent(kind "question" | "note" | "check", run_code, text, urgent, at, question_id, options)`. Events are only logged for now; questions are texted as above.
+
+  Reply routing is EM-5's.
+- **Cancel, kill, fail and end.** `_finish_cancelled` and `_conclude` close open questions, cancel any check decisions in flight, release blocked CLI calls with "This run is over" and remove the control dir. Startup wipes stale control dirs.
+- **S2: daemon git in worker-writable checkouts.** EM-2's accepted risk, closed:
+  - The daemon's token fetch now goes only to the daemon-only mirror (`_refresh`). The base sha, the CI presence and the top-level tracked names (for the `.env` link filter) are read from the mirror at that sha.
+  - Every git command in a checkout or worktree (`_in_checkout`) runs tokenless under the thin guard (`Workspace(guard=…)`, by default `sandbox.wrap` with run-less params; it fails closed without `sandbox-exec`). Whatever a checkout's config makes git run (filters, `alternateRefsCommand`, `askPass`, `remote.<url>.vcs`, `url.*.insteadOf`, includes) therefore runs as a worker could, never as the daemon. Those commands are: the fetch from the mirror (`GIT_ALLOW_PROTOCOL=file`), `worktree add --no-checkout`, the guarded `reset -q --hard` that checks the worktree out, `rev-parse`/`config --get` in `ensure_checkout`, `worktree list` and `update-ref -d`.
+  - `git worktree remove` is gone (it reads status through filters and fsmonitor): the dir is removed with `rmtree_nofollow` and only its admin entry is dropped. `_drop_admin_entry` refuses a symlinked `.git/worktrees`.
+  - Added overrides: `core.askPass=`, `core.pager=cat`, and env `GIT_ASKPASS=` on every daemon git.
+  - The first clone of a missing checkout still uses the token, into a fresh temp dir whose config is git's own.
+  - Tests: a planted smudge filter, `alternateRefsCommand` and `askPass` in the checkout's config can't write `$RESONANT_HOME` (the filter does run, inside the guard), and every daemon git in a checkout goes through the guard with `--no-checkout` and no token.
+- **Not done.**
+  - Time a worker spends blocked inside one `ask` call (up to 8 minutes) counts as session time.
+  - Urgent notes aren't texted yet (EM-6), and nothing routes the owner's reply to `answer_question` yet (EM-5).
+  - The hourly digest doesn't list open questions yet (EM-6).
