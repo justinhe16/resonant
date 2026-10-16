@@ -22,7 +22,14 @@ ends there with ``Didn't: denied.``), ``--ask TEXT`` (with ``--options``) runs `
 (no answer yet, exit 3: the turn ends with ``Waiting for the owner.``; ``--ask-map JSON``
 picks the question, ``"text|opt,opt"``, by a key found in the prompt), and ``--wait-message S``
 calls ``resonant note`` for up to S seconds until a reply carries an owner message. Each call
-is noted in ``<run>/tmp/cli.json`` (argv, exit code, output).
+is noted in ``<run>/tmp/cli.json`` (argv, exit code, output). ``--check-flag F`` (repeatable)
+adds a flag such as ``--irreversible`` to the ``check`` call.
+
+``--guard-probe JSON`` (EM-9, under the real thin guard): before anything else, try what a worker
+may and may not do and write ``<run>/tmp/guard.json``. Keys: ``env`` (read this name in cwd, the
+checkout's linked ``.env``), ``state`` (create a file in this dir, the daemon's state),
+``pid`` (signal 0 to this process, the daemon), ``keychain``/``service`` (``security
+find-generic-password -w`` on this keychain file).
 """
 
 from __future__ import annotations
@@ -64,6 +71,8 @@ ap.add_argument("--ask-map")  # JSON {"<text in the prompt>": "<question>[|opt,o
 ap.add_argument("--note")
 ap.add_argument("--urgent-note")
 ap.add_argument("--check")
+ap.add_argument("--check-flag", action="append", default=[])
+ap.add_argument("--guard-probe")
 ap.add_argument("--wait-message", type=float, default=0.0)
 args = ap.parse_args()
 
@@ -173,6 +182,35 @@ def probe_creds(name: str = "creds.json") -> None:
     }))  # fmt: skip
 
 
+def guard_probe(spec: dict[str, Any]) -> None:
+    """What the thin guard lets a worker do (EM-9): each entry is ``ok…`` or ``denied …``."""
+
+    def attempt(fn: Any) -> str:
+        try:
+            return "ok " + str(fn())
+        except OSError as e:
+            return f"denied {e.errno}"
+
+    def write_state() -> str:
+        path = os.path.join(spec["state"], "worker-was-here")
+        with open(path, "w") as f:
+            f.write("x")
+        return path
+
+    res: dict[str, str] = {
+        "env": attempt(lambda: open(spec["env"]).read().strip()),
+        "state": attempt(write_state),
+        "signal": attempt(lambda: os.kill(spec["pid"], 0)),
+    }
+    if spec.get("keychain"):
+        done = subprocess.run(["/usr/bin/security", "find-generic-password", "-s", spec["service"],
+                               "-w", spec["keychain"]], capture_output=True, text=True)  # fmt: skip
+        res["keychain"] = f"rc {done.returncode} {done.stdout.strip()}"
+    note("guard.json", json.dumps(res))
+
+
+if args.guard_probe:
+    guard_probe(json.loads(args.guard_probe))
 probe_creds()
 note("claude.pid", str(os.getpid()))
 
@@ -204,7 +242,7 @@ if not args.resume:
         cli("note", args.urgent_note, "--urgent")
     if args.check:
         system, action, what = args.check.split(":", 2)
-        rc, _ = cli("check", "--system", system, "--action", action, what)
+        rc, _ = cli("check", "--system", system, "--action", action, *args.check_flag, what)
         if rc != 0:
             result("Didn't: denied.")
             sys.exit(0)

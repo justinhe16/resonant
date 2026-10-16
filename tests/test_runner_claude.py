@@ -98,8 +98,12 @@ GIT_ENV = {
 # session (pr create, pr checks --watch) and the daemon (pr list, pr view, pr checks, pr merge)
 # and records who called with which hosts.yml token.
 FAKE_GH = """#!@PY@
-import json, os, subprocess, sys
+import fcntl, json, os, subprocess, sys
 d = "@STATE@"
+# Several sessions can run gh at once (EM-9's parallel workers): one call at a time, so the
+# read-modify-write of prs.json never loses a PR or reads a half-written file.
+_lock = open(os.path.join(d, ".lock"), "a")
+fcntl.flock(_lock, fcntl.LOCK_EX)
 args = sys.argv[1:]
 stdin = sys.stdin.read() if "--body-file" in args else ""
 conf = os.environ.get("GH_CONFIG_DIR", "")

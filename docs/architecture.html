@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Resonant Architecture</title>
-<meta name="description" content="Interactive map of the Resonant agent harness: ingress, loop, runners, gate, executor, store, extensions — across Phases 0–7.">
+<meta name="description" content="Interactive map of the Resonant agent harness: ingress, loop, the local brain and Claude workers, gate, executor, store, extensions. Phases 0–7 and the employee model (EM-1..EM-9).">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -106,7 +106,7 @@ pre.code{background:var(--code-bg);border:1px solid var(--border);border-radius:
 .badge{display:inline-flex;align-items:center;gap:4px;height:20px;padding:0 8px;border-radius:999px;font-size:11px;font-weight:500;border:1px solid var(--border);background:var(--muted);color:var(--muted-fg)}
 .badge.built{background:var(--built-bg);color:var(--built);border-color:transparent}
 .badge.partial{background:var(--partial-bg);color:var(--partial);border-color:transparent}
-.badge.planned{background:var(--planned-bg);color:var(--planned)}
+.badge.planned,.badge.superseded{background:var(--planned-bg);color:var(--planned)}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .chip{font:500 12px var(--mono);padding:2px 8px;border-radius:6px;background:var(--muted);border:1px solid var(--border);cursor:pointer;color:var(--fg)}
 .chip:hover{border-color:var(--ring)}
@@ -163,7 +163,7 @@ pre.code{background:var(--code-bg);border:1px solid var(--border);border-radius:
     <div class="bar">
       <div class="brand">
         <span class="dot"><svg class="icon" viewBox="0 0 24 24" style="width:13px;height:13px"><path d="M2 12h3l3-8 4 16 3-8h7"/></svg></span>
-        Resonant <small>architecture · ideal end-state (Phases 0–7)</small>
+        Resonant <small>architecture · employee model (EM-1..EM-9) · Phases 0–7</small>
       </div>
       <div class="spacer"></div>
       <button class="btn" id="themeBtn" type="button" aria-label="Toggle theme">
@@ -185,7 +185,7 @@ pre.code{background:var(--code-bg);border:1px solid var(--border);border-radius:
   <!-- ARCHITECTURE -->
   <section class="view active" id="view-arch">
     <div class="toolbar">
-      <input class="search" id="search" type="search" placeholder="Search components, e.g. gate, imessage, slots…" aria-label="Search components">
+      <input class="search" id="search" type="search" placeholder="Search components, e.g. gate, relay, trust, worktree…" aria-label="Search components">
       <button class="btn" id="expandAll" type="button">
         <svg class="icon" viewBox="0 0 24 24"><path d="m7 15 5 5 5-5M7 9l5-5 5 5"/></svg>Expand all
       </button>
@@ -213,9 +213,9 @@ pre.code{background:var(--code-bg);border:1px solid var(--border);border-radius:
       <div class="card"><h4>Wait reasons</h4><ul>
         <li><code>approval</code>: a gate decision is pending (L1, inferred L2, or anything above L0 under the kill switch), with <code>wake_at</code> = the expiry</li>
         <li><code>veto</code>: reserved for veto windows on unattended jobs (deferred past Phase 3); unused</li>
-        <li><code>human_reply</code>: an <code>ask_human</code> question was forwarded to a person</li>
+        <li><code>human_reply</code>: a Claude worker ran <code>resonant ask</code>, or a <code>check</code> that asks the owner (the run's own reason is <code>question</code>); the slot is freed and the answer resumes the same session (EM-3)</li>
         <li><code>usage_reset</code>: hit the Claude usage limit; parked until the reset</li>
-        <li><code>ci</code>: PR opened; CI is polled on the tick via gh/API, with no inbound webhooks</li>
+        <li><code>ci</code>: an auto-merge waits for green CI, polled every 2 min for up to 2 h, with no inbound webhooks (EM-7)</li>
       </ul></div>
       <div class="card"><h4>Guarantees</h4><ul>
         <li>An event for a waiting task requeues it.</li>
@@ -227,7 +227,7 @@ pre.code{background:var(--code-bg);border:1px solid var(--border);border-radius:
       <div class="card"><h4>Terminal states</h4><ul>
         <li><code>done</code>: the runner returned <code>Done(result)</code></li>
         <li><code>failed</code>: a non-retryable failure, or attempts ran out (default 3)</li>
-        <li><code>cancelled</code>: abandoned, which also triggers run-dir cleanup (Phase 5a)</li>
+        <li><code>cancelled</code>: abandoned; for a Claude run this also removes its worktree or scratch dir and its run dir</li>
       </ul></div>
     </div>
   </section>
@@ -271,14 +271,14 @@ pre.code{background:var(--code-bg);border:1px solid var(--border);border-radius:
   <!-- ROADMAP -->
   <section class="view" id="view-road">
     <h2 class="section-title">Phase roadmap</h2>
-    <p class="lede">Each phase ships before the next one starts. Phase 0 is built in one session to freeze the interfaces. Phases 1 onward are broken into Linear tickets one phase at a time (<code>/linear-surf</code>) and run with <code>/robot-surf-fan</code>.</p>
+    <p class="lede">Each phase ships before the next one starts. Phase 0 is built in one session to freeze the interfaces. Phases 1 onward are broken into Linear tickets one phase at a time (<code>/linear-surf</code>) and run with <code>/robot-surf-fan</code>. Claude work now follows the employee model (<code>docs/employee-plan.md</code>, EM-1..EM-9), which superseded Phase 5a; <code>docs/phase5a-plan.md</code> and <code>docs/repos-plan.md</code> are historical.</p>
     <div class="grid roadmap" id="roadmap"></div>
   </section>
 
   <!-- TRUST -->
   <section class="view" id="view-trust">
     <h2 class="section-title">Trust model</h2>
-    <p class="lede"><b>Identity grants permissions. Content never does.</b> Messages, emails, web pages, and tool output are all untrusted input. Effect tiers come from tool registration, never from the model. The model never sees secrets.</p>
+    <p class="lede"><b>Identity grants permissions. Content never does.</b> Messages, emails, web pages, tool output and worker text are all untrusted input. Effect tiers come from tool registration, never from the model. The model never sees secrets. Claude workers run on standing trust above a hard floor: the thin guard protects Resonant itself, and everything else is an honor system shaped by trust rules (<code>docs/employee-plan.md</code>).</p>
     <div class="canvas"><svg id="trustSvg" role="img" aria-label="Trust boundaries"></svg></div>
     <div class="grid" style="margin-top:12px" id="trustCards"></div>
   </section>
@@ -315,9 +315,12 @@ const GROUPS = [
   {id:"loop", col:2, title:"Generic loop", sub:"one loop for every task", icon:"loop",
    desc:"An event-driven and ticking scheduler over the durable task envelope. It routes unrouted events, wakes due tasks, cancels stuck steps, and dispatches runnable tasks in priority order. It does not know what any task is for.",
    children:["looptick","router","tasks","slots"]},
-  {id:"runners", col:3, title:"Runners", sub:"implement Runner.step()", icon:"cpu",
-   desc:"Pluggable workers behind one contract. A task's runner field picks which one runs it. Escalating from local to Claude switches the runner on the same task.",
-   children:["runner_local","runner_claude","runner_sandbox","runner_cu","ollama"]},
+  {id:"runners", col:3, title:"Brain & workers", sub:"local brain · Claude workers · thin guard", icon:"cpu",
+   desc:"The employee model (docs/employee-plan.md). The local brain (qwen3 on Ollama) reads every message, answers what it can and routes the rest to tools. When work needs engineering or ops it spawns a Claude worker with start_run and acks \"On it: R4 · <repo>.\" Workers run like the owner at the keyboard, in a git worktree of the real checkout ~/code/<repo> (or a scratch dir), under the thin guard, which only protects Resonant itself. Up to 4 run at once. All runners share one contract (Runner.step); a task's runner field picks which one runs it.",
+   children:["runner_local","ollama","runner_claude","runner_sandbox","repos","runner_cu"]},
+  {id:"desk", col:3, title:"Worker desk", sub:"ask · note · check · relay · reports", icon:"msg",
+   desc:"How a running worker and the owner talk. The worker calls resonant ask, note and check over its run's socket. The relay routes the owner's replies and \"tell R4 …\" messages to the right worker. Trust rules decide which checks ask the owner. Worker reports go out now or in the hourly digest, by urgency.",
+   children:["worker_cli","relay","trust_rules","reports"]},
   {id:"extensions", col:2, title:"Extensions", sub:"resonant.yaml · separate repos", icon:"puzzle",
    desc:"Product logic lives in extensions: first-party ones in this repo (github, the example) today, separate repos (trade-jev, dori, life lane) later. Phase 3 installs only first-party code, from the Mini's terminal. Each one plugs in through a strictly validated manifest and runs in its own process, so a crash never takes down the core.",
    children:["manifest","extadd","tools_cli","tools_mcp","critjobs"]},
@@ -326,7 +329,7 @@ const GROUPS = [
    children:["perms","gate","approvals","killswitch","executor","secrets"]},
   {id:"store", col:5, title:"Store", sub:"SQLite · WAL · migrations", icon:"db",
    desc:"All state lives in one SQLite file in ~/.resonant. Migrations are numbered SQL files tracked with PRAGMA user_version. Each migration is atomic and safe when two processes start at once.",
-   children:["t_tasks","t_events","t_approvals","t_exec","t_audit","t_spans","t_misc"]},
+   children:["t_tasks","t_events","t_approvals","t_exec","t_audit","t_spans","t_work","t_misc"]},
   {id:"ops", col:5, title:"Ops & visibility", sub:"API · dashboard · health", icon:"activity",
    desc:"The loopback API, dashboard, health monitoring, and process supervision.",
    children:["api","dashboard","health","launchd","cli"]},
@@ -396,14 +399,18 @@ emit("ci_failed", "✗ resonant#40 CI failed (lint)", "resonant#40:run:123:faile
 report("dori/incident/INC-412", "Dori failing: triaging", urgency="urgent", state={"status": "failing"})
 report("trader/pnl/today", "PnL -$1.8k today", state={"bucket": -2})   # coarse state = real changes only
 # manifest: report: {max_urgency: urgent}     /pulse    /pulse now`,
-    inv:["Urgent latency: one job period (at least 5 minutes) plus a loop tick","Titles are cleaned and the [name] prefix is code-built, so a report can't look like an approval prompt","The first run after install is a silent baseline","Health stays with the monitor; the briefing's Updates exclude core and muted sources"],
+    inv:["Urgent latency: one job period (at least 5 minutes) plus a loop tick","Titles are cleaned and the [name] prefix is code-built, so a report can't look like an approval prompt","The first run after install is a silent baseline","Health stays with the monitor; the briefing's Updates exclude core and muted sources","Claude workers (EM-6): one core item run/<code> per run is its digest line, shown in a Workers: section of the hourly pulse and the briefing; each open worker question is a core item question/r<n>-<id>, re-mentioned every hour until answered (EM-5)"],
+    links:[{to:"reports",label:"Workers: section from"},{to:"relay",label:"question items from"}],
     files:["packages/resonant/src/resonant/store/pulse.py","packages/resonant/src/resonant/extensions/pulse.py","packages/resonant/src/resonant/extensions/pulse_job.py","packages/resonant/src/resonant/extensions/briefing.py"]},
-  claudeevents:{label:"Claude SDK events", phase:"5", status:"planned",
-    what:"Events from Claude sessions: permission requests, ask_human calls, Stop hooks, usage-limit errors, and results. They go back into the loop so the claude runner can supervise the session like a senior coworker.",
-    iface:`Event(source="claude", type="permission_request" | "ask_human" |
-      "stop" | "usage_limit" | "result", task_id=…)`,
-    inv:["Permission requests go to the Gate","Usage limits park every claude task until the reset (no proactive throttling)"],
-    files:[]},
+  claudeevents:{label:"Worker events", phase:"5a / EM-3", status:"built",
+    what:"Events from Claude workers go back into the loop so the daemon can supervise a session like a senior coworker. The worker desk emits a WorkerEvent for each resonant ask (question), note and check; the runner also sees usage-limit errors and the session's result. Questions are texted by the desk, checks by the trust prompt, and notes and run ends by the worker reports. The Phase 5 plan's ask_human, Stop hook and permission-request events are not used: workers ask through resonant ask instead.",
+    iface:`WorkerEvent(kind "question" | "note" | "check", run_code, text, urgent, at,
+            question_id, options)
+runner.events.subscribe(fn) → unsubscribe        # reports (EM-6) subscribe
+usage limit → waiting(usage_reset) · result → reply step`,
+    inv:["Worker text is untrusted: it is redacted and cleaned before it is stored or shown","A usage-limit hit parks every claude task until the reset (no proactive throttling)"],
+    links:[{to:"worker_cli",label:"emitted by the desk"},{to:"reports",label:"subscribed by"}],
+    files:["packages/resonant/src/resonant/runners/worker_desk.py","packages/resonant/src/resonant/runners/claude.py"]},
   /* ---- identity */
   principals:{label:"Principals & can()", phase:"0", status:"built",
     what:"Maps channel identities to principals. There is exactly one owner, who can do everything. Every other principal gets only explicit per-extension grants.",
@@ -439,15 +446,18 @@ can(principal, action ∈ {request, approve, admin}, extension | None) -> bool`,
     _dispatch(now)          # priority, created_at; Claude slots`,
     inv:["One transaction per step: outcome + checkpoint + consumed events","Crash mid-step: no partial state, and the task resumes from its last checkpoint","Retryable failures keep their events and back off 5s·2ⁿ (max 300s)","Graceful shutdown gives in-flight steps a 10s grace period. The rest resume on the next start"],
     files:["packages/resonant/src/resonant/loop/loop.py","tests/test_loop.py"]},
-  router:{label:"Router", phase:"1", status:"built",
-    what:"The Loop's router hook. It turns an unrouted iMessage event into a task for the local runner. A deterministic fast path (slash commands plus the `status` and `ping` keywords) runs one gated builtin read and replies from a template with no model call. Anything else gets one LLM intent label, and the toolset for that intent is filtered by principal before the model sees it.",
+  router:{label:"Router", phase:"1 / EM-8", status:"built",
+    what:"The Loop's router hook: the brain's front door. It turns an unrouted iMessage event into a task for the local runner. Order: slash commands; the relay's clash rule (a plain yes/no while a worker question is open); the approval inbox; the relay's direct step (R4 …, tell R4 …, an exact option); the status and ping keywords; then one LLM intent label, with the toolset for that intent filtered by principal before the model sees it; then the relay's free step for run_project, question or unknown labels. The run_project intent covers any job for a Claude worker, runs and repos (EM-8); rules covers trust rules (EM-4).",
     iface:`Router(conn, *, principals, registry, gate, handlers, model).route(event) -> NewTask | None
 fast:    NewTask(kind="reply", runner="local", checkpoint={fast_reply, tool_used, intent})
 labeled: NewTask(kind="chat",  runner="local", checkpoint={intent, confidence, toolset, fallback})
-intents: question | job_control | system | run_project | unknown
+intents: question | job_control | system | updates | notes | reminders | ops
+         | run_project | rules | extension:<name> | unknown
+/run [<repo>] <ask> [--merge] · /runs · /cancel · /merge · /repos · /repo … · /rules
 prompt prefix = fixed per (intent, principal scope)   # KV-cache reuse`,
-    inv:["/kill and /resume are deterministic and owner-only, never decided by the model","A co-founder message can never reach global or personal tools, even through prompt injection","Priority comes from the principal, never the model","Exit criterion: fast p50 ≤ 1s, labeled p50 ≤ 3s (resonant bench e2e)"],
-    files:["packages/resonant/src/resonant/router/router.py","packages/resonant/src/resonant/router/fast_path.py","packages/resonant/src/resonant/router/labeler.py","packages/resonant/src/resonant/router/prefixes.py","tests/test_router.py"]},
+    inv:["/kill and /resume are deterministic and owner-only, never decided by the model","A co-founder message can never reach global or personal tools, even through prompt injection","Priority comes from the principal, never the model","/run's first word is a repo only when Resonant already knows it (or it ends with :), so a scratch ask is never misread","Router eval after EM-8: 96.8% (184/190), run_project 33/33"],
+    links:[{to:"relay",label:"worker replies and messages"},{to:"runner_local",label:"chat tasks"},{to:"approvals",label:"approval replies"}],
+    files:["packages/resonant/src/resonant/router/router.py","packages/resonant/src/resonant/router/fast_path.py","packages/resonant/src/resonant/router/labeler.py","packages/resonant/src/resonant/router/intents.py","packages/resonant/src/resonant/router/prefixes.py","packages/resonant/src/resonant/router/commands.py","tests/test_router.py"]},
   tasks:{label:"Task envelope", phase:"0", status:"built",
     what:"A hand-rolled durable envelope with no workflow engine. The work content is opaque (checkpoint); only the lifecycle is typed.",
     iface:`tasks(id, kind, runner('local'|'claude'|'cu'), extension, principal,
@@ -462,39 +472,61 @@ priority: on-call 0 < owner 1 < member 2 < background 3
     inv:["CHECK: status='waiting' ⇔ wait_reason IS NOT NULL","For queued tasks, wake_at means 'not before' (retry backoff)","Priority comes from lane and principal, never from the model"],
     files:["packages/resonant/src/resonant/loop/types.py","packages/resonant/src/resonant/store/migrations/001_init.sql"]},
   slots:{label:"Claude slot pool", phase:"0 / 5", status:"built",
-    what:"Caps how many Claude sessions run at once (default 5) and reserves 1 slot for on-call. Priority decides who gets the next free slot. Running sessions are never preempted.",
+    what:"Caps how many Claude sessions run at once (default 5) and reserves 1 slot for on-call, so up to 4 workers run at once (the runner's max_runs). Priority decides who gets the next free slot. Running sessions are never preempted. A worker waiting for the owner's answer (waiting(question)) or a usage reset frees its slot.",
     iface:`SlotPool(capacity=5, reserved_oncall=1)
 try_acquire(task_id, oncall=task.lane == "oncall") -> bool
 release(task_id)`,
     inv:["Non-on-call work only uses the unreserved slots, no matter what on-call holds","A usage-limit hit sets kv.claude_usage_reset_at, parks every claude task in waiting(usage_reset), and sends one notification (Phase 5)"],
     files:["packages/resonant/src/resonant/loop/slots.py","tests/test_slots.py"]},
   /* ---- runners */
-  runner_local:{label:"Local runner (qwen3)", phase:"1", status:"built",
-    what:"Answers routed chat tasks with the local model: up to 3 read-tool calls, each through the gate and the executor, then one JSON answer sent over the channel. run_project is an ordinary tool intent (start_run, list_runs, cancel_run, merge_run); a model asking for more than three calls ends the task with a templated reply.",
+  runner_local:{label:"Local brain (qwen3)", phase:"1 / EM", status:"built",
+    what:"The brain. It answers routed chat tasks with the local model: up to 3 tool calls, each through the gate and the executor, then one JSON answer sent over the channel. It doesn't do engineering itself: work that needs code, ops or research becomes a Claude worker through start_run, from plain words or /run. The run_project intent carries the run, worker and repo tools; the rules intent carries the trust-rule tools. A model asking for more than three calls ends the task with a templated reply.",
     iface:`LocalRunner(conn, *, model, channel, gate, executor, registry, max_step_s)  # name="local"
 step: resend saved reply | fast_reply | fallback/escalate
       | ≤3 × (Intent.for_tool → gate.evaluate → executor.execute) → chat_json {reply}
       → ctx.save(reply) → channel.send(dedupe_key="reply:<task id>") → Done
+run_project: start_run{repo?, ask, merge?, report?} · list_runs · cancel_run · merge_run
+             answer_worker · message_worker · list_repos · add_repo · forget_repo
+             create_repo · add_ci · merge_ci_pr
+rules:       list_trust_rules · add_trust_rule · allow_trust_rule · remove_trust_rule
 max_step_s = (3 + 1) × model.timeout_s + 15s   # the model times out first`,
-    inv:["Every tool call goes through the gate and the executor","Code computes numbers; the LLM narrates (number guard against tool output)","Thinking is off; tool output is replayed as untrusted data","A crash after the reply is computed resends it, deduped, never twice"],
-    files:["packages/resonant/src/resonant/runners/local.py","packages/resonant/src/resonant/wiring.py","tests/test_local_runner.py","tests/test_e2e.py"]},
-  runner_claude:{label:"Claude runner", phase:"5a", status:"built",
-    what:"Runs Claude Code headless (claude -p, stream-json) in a throwaway clone of an owner-listed repo, inside the Seatbelt sandbox, and texts back a PR link. One task per run (kind run); steps prepare, session, harvest, publish, reply are checkpointed, so a crash resumes the same session. The GitHub token never enters the sandbox: the daemon refreshes a bare mirror, clones it before the session, reads one git bundle by fd afterwards, runs the checks and pushes. Commands: /run, /runs, /cancel, /merge, and plain words through the run_project intent. Merging is the one approval: /merge R3 is explicit, \"merge it\" in chat asks yes.",
-    iface:`start_run{repo, ask} (L3, owner) → "On it: R3 · dori. Up to 45m."  # inserts a task, kind run
-prepare → session (≤ runner.max_minutes) → harvest → publish → reply
-checks: refuse .github/, .gitmodules, tokens, > 200 files; flag Makefile, package.json, .claude/ …
-reply: "R3 done: PR #41 · <url> · 3 files · 12m  ⚠ changes Makefile"
-usage limit → waiting(usage_reset) → same session resumed
-/kill, /cancel → the whole process tree reaped; nothing pushed`,
-    inv:["No approval to start a run; the sandbox is the wall, /merge the only approval","Max 2 runs at once, 1 per repo; 45 minutes of session time","Every descendant process is reaped on end, cancel, kill and daemon start","Tokens (Claude and GitHub) are redacted from the transcript, replies and the DB","The daemon never runs git in the clone after the session starts","Only repos with CI on pull_request; a progress item in the pulse while a run goes"],
-    files:["packages/resonant/src/resonant/runners/claude.py","packages/resonant/src/resonant/runners/reaper.py","packages/resonant/src/resonant/runner/workspace.py","packages/resonant/src/resonant/runner/checks.py","packages/resonant/src/resonant/tools/runs.py","packages/resonant/src/resonant/store/runs.py","tests/test_runner_claude.py","tests/test_tools_runs.py","tests/test_e2e_runner.py"]},
-  runner_sandbox:{label:"Runner sandbox", phase:"5a", status:"built",
-    what:"The thin guard (EM-1): a macOS Seatbelt profile (sandbox-exec) that every Claude worker and its children run under. Allow-default with unconditional denies, each with a probe. Workers read, write and connect like the owner (.env files, Docker, the network) except: no writes to ~/.resonant or the installed daemon (nor renames of their parent dirs); no read or write of run-secrets, Messages, the Keychain files or runner.deny_read; no Keychain (securityd), launchd, Messages agents, window server, HID, Apple Events or LaunchServices; no auto-start entries (LaunchAgents, login items, cron, rc files); no signals or task ports on other processes; Resonant's API port blocked on every address.",
-    iface:`resonant sandbox check [--scope all|ci|local] [--json]   # every probe against the live profile
+    inv:["Every tool call goes through the gate and the executor","start_run is L3: spawning a worker needs no approval; the thin guard and the trust rules bound what the worker does","Code computes numbers; the LLM narrates (number guard against tool output)","Thinking is off; tool output is replayed as untrusted data","A crash after the reply is computed resends it, deduped, never twice"],
+    links:[{to:"runner_claude",label:"start_run spawns a worker"},{to:"ollama",label:"model calls"},{to:"trust_rules",label:"rules taught over chat"},{to:"repos",label:"repo tools"}],
+    files:["packages/resonant/src/resonant/runners/local.py","packages/resonant/src/resonant/tools/runs.py","packages/resonant/src/resonant/tools/repos.py","packages/resonant/src/resonant/tools/trust.py","packages/resonant/src/resonant/wiring.py","tests/test_local_runner.py","tests/test_e2e.py"]},
+  runner_claude:{label:"Claude workers", phase:"5a / EM-2", status:"built",
+    what:"Runs Claude Code headless (claude -p, stream-json) as Resonant's worker for the owner, one session per run (R<n>, a task of kind run). With a repo, the run works in a git worktree of the owner's real checkout ~/code/<repo> (cloned on first use), at ~/code/.worktrees/<repo>/R<n> on branch resonant/r<n>-…, with the checkout's .env files and other local config symlinked in. An ask with no repo gets a scratch dir ~/code/.scratch/R<n> and ends with Claude's summary. The session gets a per-run GitHub App installation token and drives the PR itself: it pushes, opens it with gh pr create and watches CI. Steps are checkpointed, so a crash resumes the same session. Up to 4 workers at once; two runs on one repo each get their own worktree. Fork-mode repos (EM-7): the worker pushes to the owner's fork, and the daemon opens the upstream PR only after an external_pr check the owner approves. Merges follow merge_decision (EM-7).",
+    iface:`start_run{repo?, ask, merge?, report?} (L3, owner) → "On it: R4 · dori. Up to 45m."
+/run [<repo>] <ask> [--merge] · /runs · /cancel R4 · /merge R4 · /kill
+prepare → session (≤ runner.max_minutes) → harvest (find the PR) → reply
+checkout ~/code/<repo> (or repos.path) · worktree ~/code/.worktrees/<repo>/R4
+branch   resonant/r4-<slug>           · scratch  ~/code/.scratch/R4
+session  sandbox-exec -f runner.sb … claude -p    # cwd = worktree, resonant ask|note|check on PATH
+GitHub   App token: one repo, 1 h, no Administration, via the run's credential helper
+reply    "R4 done: PR #12 (CI green) · <url> · 3 files · 12m" | "R4 done (12m): <summary>"
+usage limit → waiting(usage_reset) · question → waiting(question) · same session resumed`,
+    inv:["No approval to start a run: the thin guard is the hard floor, standing trust and resonant check cover the rest","The daemon-only token runner/github_token never enters a session; it serves the mirror, merges, repo creation and starter CI","The daemon-only bare mirror is kept only for the pre-merge checks (fetch with fsck, run_checks, CI, --match-head-commit); a merge never trusts the worker-writable checkout","Every daemon git command in a checkout runs tokenless under the thin guard","Every descendant process is reaped on end, cancel, kill and daemon start","Tokens are redacted from the transcript, replies and the DB; the App token is revoked when the session ends","Cleanup removes only the run's own worktree or scratch dir and its own branch (compare-and-delete); the owner's checkout is never deleted","Historical (Phase 5a, superseded by the employee model): a throwaway clone per run, the bundle handback (harvest, import_bundle), the daemon pushing for the session, runner.repos as the required list, one run per repo"],
+    links:[{to:"runner_sandbox",label:"runs under"},{to:"worker_cli",label:"talks to the daemon through"},{to:"repos",label:"resolves repos with"},{to:"reports",label:"reports through"},{to:"slots",label:"holds a slot"}],
+    files:["packages/resonant/src/resonant/runners/claude.py","packages/resonant/src/resonant/runners/reaper.py","packages/resonant/src/resonant/runner/workspace.py","packages/resonant/src/resonant/runner/github_app.py","packages/resonant/src/resonant/runner/checks.py","packages/resonant/src/resonant/runner/cleanup.py","packages/resonant/src/resonant/tools/runs.py","packages/resonant/src/resonant/store/runs.py","tests/test_runner_claude.py","tests/test_runner_workspace.py","tests/test_runner_fork.py","tests/test_e2e_runner.py","tests/test_e2e_employee.py"]},
+  runner_sandbox:{label:"Thin guard", phase:"EM-1", status:"built",
+    what:"The thin guard (EM-1): an allow-default macOS Seatbelt profile (sandbox-exec, resonant/sandbox/runner.sb) that every Claude worker and its children run under. Workers read, write and connect like the owner at the keyboard: the whole disk, .env files, the Docker socket, the network and Ollama are open. It denies only what protects Resonant: writes to ~/.resonant, $RESONANT_HOME and the installed daemon (venv, interpreter, checkout, the resonant entry point, the gh, uv, ollama and git kegs); read and write of run-secrets, ~/Library/Messages and the Keychain files; mach lookups of securityd, launchd, Messages, Apple Events, LaunchServices, the window server and HID; auto-start entries (LaunchAgents, login items, cron, shell rc files); exec of launchctl, crontab, at and the daemon's venv; signals and task ports outside its own sandbox; port 7777. Guard rules also keep each run to its own control dir under <work_dir>/.ctl.",
+    iface:`resonant sandbox check [--scope all|ci|local] [--json]   # 28 probes against the live profile
 wrap(argv, SandboxParams) → sandbox-exec -f runner.sb -D KEY=VALUE … argv
-self_check(params)  # cached 1 h by macOS build + profile hash; fails closed before each run`,
-    inv:["Paths are realpath-ed and passed as -D parameters, never string-built","A failed self-check fails the run before the session starts","Not deniable: another same-user process's env and argv (KERN_PROCARGS2), so no secret sits in any env or argv","Extension processes are not sandboxed yet (followups)"],
+SandboxParams.protect · default_protected()               # the daemon's own install
+self_check(params)  # cached by macOS build + profile hash; fails closed before each run`,
+    inv:["Paths are realpath-ed and passed as -D parameters, never string-built","Every protected path's ancestors get a literal write deny, so a rename can't carry the tree away","A failed self-check fails the run before the session starts","Mutation tests: each critical deny is removed from the template and its probe must fail","Not deniable: another same-user process's env and argv (KERN_PROCARGS2), so no secret sits in any env or argv except the session's own Claude token","Historical (Phase 5a, superseded by EM-1): a deny-default profile with all of home denied, the RP-9 secret-file name rules, a cross-run deny, and the Ollama-port and unix-socket denies","Extension processes are not sandboxed yet (followups)"],
+    links:[{to:"worker_cli",label:"keeps each run to its own control dir"}],
     files:["packages/resonant/src/resonant/sandbox/profile.py","packages/resonant/src/resonant/sandbox/runner.sb","packages/resonant/src/resonant/sandbox/probes.py","tests/test_sandbox.py","tests/test_sandbox_local.py"]},
+  repos:{label:"Repos registry", phase:"RP / EM-8", status:"built",
+    what:"The repos Claude works in. A request's words resolve to a repo in order: owner/name or a GitHub URL, a registered name or alias, an extension's linked repos, then the owner's GitHub repos by fuzzy name. A repo seen the first time is registered: mode=push when the token can push, mode=fork for a public repo it can't. Each row keeps its base branch, whether it has CI, a per-repo checkout path and flags. Over chat (EM-8): /repos, /repo add|forget|new|ci and the matching tools on the run_project intent. Creating a repo and adding starter CI act on GitHub with the daemon-only token.",
+    iface:`repos(slug, name, aliases, base, mode push|fork, ci, allow_github_changes, quote_ask,
+      source, path, added_at, last_used_at)              # migrations 007, 008, 009
+Resolver.resolve(text, github) → Resolved | Ambiguous | NotFound | NoAccess
+/repos · /repo add <x> [as <name>] · /repo forget <x> · /repo new <name> [public]
+/repo ci <repo> [merge]
+list_repos (L0) · add_repo, forget_repo (L3) · create_repo, add_ci, merge_ci_pr (L2)`,
+    inv:["Ambiguous is a question (Which repo? a, b, c), never a guess","add_repo and forget_repo change only Resonant's list; anything that acts on GitHub asks a plain yes from chat and runs when typed","The add-CI merge is stricter than a run's merge: only the hash-checked starter file, green CI on the PR","Historical: docs/repos-plan.md waves RP-2, RP-3, RP-6, RP-7 were replaced by the employee plan; runner.repos is no longer the required list"],
+    links:[{to:"runner_claude",label:"checkout for"}],
+    files:["packages/resonant/src/resonant/store/repos.py","packages/resonant/src/resonant/runner/resolve.py","packages/resonant/src/resonant/runner/create.py","packages/resonant/src/resonant/tools/repos.py","tests/test_repos_store.py","tests/test_repo_create.py"]},
   runner_cu:{label:"Computer-use runner", phase:"7", status:"planned",
     what:"Browser and host computer use in the Mini's auto-login GUI session. It is used by the life lane (Gmail, Calendar, iMessage, payments).",
     iface:`gate.approve_scope(scope) -> scope_id   # declared scope, approved at L1
@@ -502,7 +534,7 @@ commit actions (send / pay / delete): pause + screenshot → approval`,
     inv:["Each task declares a scope that the owner approves","The runner always pauses before a commit action","Payments use a capped virtual card and are permanently L1","Core supplies the generic cu runner, Scope, and commit-pause. The life lane's wiring stays in a private repo"],
     files:[]},
   ollama:{label:"Ollama (LaunchAgent)", phase:"0 / 1", status:"built",
-    what:"The local model server, running qwen3:30b-a3b-instruct-2507 (Q4, non-thinking), and the ModelClient over it. The client defaults to Ollama's native /api/chat (think: false); the OpenAI-compatible /v1 adapter keeps an MLX swap a config change.",
+    what:"The local model server, running qwen3:30b-a3b-instruct-2507 (Q4, non-thinking), and the ModelClient over it. It is the brain's model; workers can reach Ollama's port too (the thin guard leaves it open). The client defaults to Ollama's native /api/chat (think: false); the OpenAI-compatible /v1 adapter keeps an MLX swap a config change.",
     iface:`OLLAMA_HOST=127.0.0.1:11434
 OLLAMA_KEEP_ALIVE=-1
 OLLAMA_CONTEXT_LENGTH=32768        # pinned server-side
@@ -510,6 +542,53 @@ OllamaClient(cfg.model): chat_json · chat_tools · probe()
 resonant model probe | bench`,
     inv:["probe() checks the model is pulled, the context is big enough, and thinking is really off","Each call has model.timeout_s; failures raise ModelUnavailableError so callers send a templated fallback","Loopback only"],
     files:["packages/resonant/src/resonant/models/client.py","packages/resonant/src/resonant/launchd.py (ollama_plist)"]},
+  /* ---- worker desk */
+  worker_cli:{label:"Worker CLI & desk", phase:"EM-3", status:"built",
+    what:"The worker's only way into the daemon: a small resonant CLI on the session's PATH, talking over a per-run unix socket in <work_dir>/.ctl/R<n>. ask parks the run in waiting(question), frees its slot and texts the owner R4 asks: <q>; the answer resumes the same session. note updates the run's pulse line. check asks the trust rules before a net-new action and waits for the verdict. Owner messages (tell R4 …) reach the session at its next CLI call or open its next turn.",
+    iface:`resonant ask "<q>" [--options a,b,c] [--urgent]
+resonant note "<progress>" [--urgent]
+resonant check --system S --action A [--irreversible] [--cost USD] "<what>"
+exit 0 ok · 1 denied · 2 usage · 3 no answer yet (end the turn) · 4 run over · 5 busy
+ClaudeRunner: open_questions() · answer_question(code, text) · deliver_message(code, text)`,
+    inv:["Each request is checked twice: the per-session token (0600, never in argv or env) and the peer pid, which must be the run's session leader or a descendant","Guard rules: no writes under .ctl, reads only of the run's own control dir, unix-socket connect only to its own run and control dir","One open ask per run; an answer counts as delivered only after the CLI reply is written (at least once, never lost)","After runner.ask_timeout_minutes (240) the session resumes with \"No answer from the owner; use your judgment or stop.\"","At most 3 pending checks per run; a fourth is busy (exit 5), not a no","The socket server runs only while a session runs and is closed before the reap"],
+    links:[{to:"trust_rules",label:"check → request_check"},{to:"relay",label:"open questions for"},{to:"claudeevents",label:"emits WorkerEvents"}],
+    files:["packages/resonant/src/resonant/runners/worker_cli.py","packages/resonant/src/resonant/runners/worker_desk.py","packages/resonant/src/resonant/store/questions.py","packages/resonant/src/resonant/store/migrations/011_worker_cli.sql","tests/test_worker_cli.py"]},
+  relay:{label:"Relay", phase:"EM-5", status:"built",
+    what:"Routes the owner's replies to the right worker. In code first: R4 …, R4: …, tell R4 …, @R4 …, the code or ordinal that answers a pending \"which one?\", or an exact option that fits one open question. Only for free text, and only when the label was run_project, question or unknown, the brain picks by content among the open questions and the pick is echoed (→ R4 (<q>)); when it can't tell, Resonant asks For R4 (<q>) or R6 (<q>)?. A plain yes or no while a worker question and an approval are both open binds neither (the clash rule).",
+    iface:`R4 asks: Which DB?                       # texted by the desk
+(a) sqlite (b) postgres
+owner: "go with sqlite"  → "→ R4"
+owner: "use the faster one" → "→ R4 (Which DB?)"      # the brain's pick, echoed
+owner: "tell R4 to also update the README" → "→ R4 (message)"
+answer_worker{code, text} · message_worker{code, text}   # L3, run_project`,
+    inv:["A question counts only if it was asked before the owner's message was sent, only for the owner's own runs, and only when the sender's handle maps to the principal","The answer binds the exact question id judged, so it can't land on a newer question","The brain's pick is validated against the open codes and echoed, so a question written to steer the brain can at most pick another open question, visibly","Worker text shown to the owner or the brain is redacted, cleaned to one line and has other runs' codes masked as R?","Unanswered questions are re-mentioned in every hourly pulse"],
+    links:[{to:"runner_claude",label:"answer_question · deliver_message"},{to:"pulse",label:"question items"}],
+    files:["packages/resonant/src/resonant/router/relay.py","packages/resonant/src/resonant/worker_text.py","packages/resonant/src/resonant/router/router.py","packages/resonant/src/resonant/runners/worker_desk.py","tests/test_relay.py","tests/test_worker_relay.py","tests/test_e2e_relay.py"]},
+  trust_rules:{label:"Trust rules", phase:"EM-4 / EM-7", status:"built",
+    what:"Standing trust: workers act and report, and ask first only for something net new (a new system, a new kind of action on it, anything irreversible, anything that costs money). Before such an action a worker runs resonant check; the most specific allow or ask rule decides, else the net-new defaults. An ask becomes an owner approval: yes / yes always / no, where yes always also adds an allow rule. Rules are taught over chat (\"always ask before merging in trading\" → Rule added: ask before merge in trading) and listed with /rules. The same table sets report urgency (notify_now, notify_digest), and merge_decision makes merges follow it (EM-7).",
+    iface:`trust_rules(id, scope, action, effect allow|ask|notify_now|notify_digest, note,
+            created_from chat|yes always|command|default)      # migration 010
+trust_seen(system, action, first_ok_at)
+evaluate(conn, system, action, irreversible, cost_usd, what, *, repo, run)
+  → TrustDecision(verdict ok | ask, reason, rule)
+TrustChecks.request_check(run_code, system, action, irreversible, cost_usd, what)
+  → "ok" | "denied" | "busy"
+[K4] R4 wants to deploy on dori-api: "deploy to prod" (new kind of action;
+yes always = don't ask before deploy in dori-api). Reply yes / yes always / no
+merge_decision(repo) → ok | ask · notify_level(system, action, event) → now | digest
+/rules · /rules forget <n> · add_trust_rule (L3) · allow_trust_rule, remove_trust_rule (L2)`,
+    inv:["Honor system by design: the worker is trusted to call check, like a coworker; the thin guard is the hard floor","yes always answers only a worker's check; the gate refuses it for any other approval, never as a plain yes","Tightening trust from chat runs and reports; loosening or forgetting a rule asks the owner a plain yes with a code-built prompt","The prompt names the action and system a yes always rule would cover and quotes the worker's words, cleaned and clipped","Fork mode: opening an upstream PR is an irreversible external_pr check the daemon asks, bound to the checked head","Every check, rule change and merge decision is audited (trust.*)"],
+    links:[{to:"approvals",label:"asks become approvals"},{to:"reports",label:"urgency rules"}],
+    files:["packages/resonant/src/resonant/trust/policy.py","packages/resonant/src/resonant/trust/checks.py","packages/resonant/src/resonant/store/trust.py","packages/resonant/src/resonant/tools/trust.py","packages/resonant/src/resonant/gate/replies.py","tests/test_trust_policy.py","tests/test_trust_checks.py","tests/test_trust_replies.py","tests/test_trust_tools.py"]},
+  reports:{label:"Worker reports & digest", phase:"EM-6", status:"built",
+    what:"Each worker event gets an urgency, now or digest, from the trust rules. Defaults: failures, questions, checks and --urgent notes are texted now; PR opened, done and merged go to the hourly pulse's Workers: section. Each run has one core pulse item, run/<code>, that is its digest line for its whole life (running with the latest note, then its end). /run (start_run{report: now}) texts its end right away; plain-words runs report in the digest unless the owner asks otherwise.",
+    iface:`WorkerReports.level(run, event) → now | digest     # event: pr | done | merged | failed | note | urgent
+R4 still running · demo · started 10:02 · <latest note>
+R3 done: PR #12 (CI green) · <url>   R3 failed: <reason>   R3 merged: PR #12 · <url>
+Workers:   # section in the hourly pulse and the 08:00 briefing`,
+    inv:["Failures always text unless a rule naming failed itself holds them; a * digest rule never silences one","Exactly once: the end line is written untold before any text and marked told after it, so a restart neither loses nor repeats it","At most 6 note texts per run an hour; the rest only update the line","Titles are code-built around cleaned worker text, so a note can't pose as an approval prompt or a reply"],
+    links:[{to:"pulse",label:"run/<code> items"},{to:"trust_rules",label:"notify_level"}],
+    files:["packages/resonant/src/resonant/runners/reports.py","packages/resonant/src/resonant/runners/claude.py","packages/resonant/src/resonant/extensions/pulse_job.py","packages/resonant/src/resonant/extensions/briefing.py","tests/test_worker_reports.py"]},
   /* ---- extensions */
   manifest:{label:"resonant.yaml manifest", phase:"0 / 3", status:"built",
     what:"How an extension declares its tools, jobs (with effect, level, catchup), notifications, health check, secrets, approvers, and a one-line description and examples for the router. The SDK validates it strictly with pydantic. Only true/false parse as YAML booleans, so `on:` stays a key.",
@@ -573,7 +652,7 @@ L1 always ask (yes <code>) · kill switch: everything above L0 asks`,
     inv:["The level comes from the tool's registration","origin=explicit is set only by the local runner's direct_call path, which only the router's command parser writes","pay is always L1","scheduled is never explicit","Extension approvers = owner + manifest approvers holding the approve grant","No veto yet","dry_run is on by default in config"],
     files:["packages/resonant/src/resonant/gate/policy.py","packages/resonant/src/resonant/gate/types.py","packages/resonant/src/resonant/gate/replies.py"]},
   approvals:{label:"Approvals (text codes)", phase:"2", status:"built",
-    what:"Approval requests go out as texts with a short code, and a reply binds to exactly one pending approval. Phase 2 uses a deterministic parser only; a classifier and batch approvals are deferred. See the Approval flow tab.",
+    what:"Approval requests go out as texts with a short code, and a reply binds to exactly one pending approval. Phase 2 uses a deterministic parser only; a classifier and batch approvals are deferred. A worker's trust check that asks is an approval too (tool trust_check), the only kind that also takes yes always (EM-4). A plain yes or no while a worker question is also open binds neither (EM-5's clash rule). See the Approval flow tab.",
     iface:`[A7] restart Resonant? Reply yes / no                          # L2 / L3
 [D7] delete all 4 notes? This can't be undone. Reply yes D7 / no  # L1
 
@@ -598,7 +677,7 @@ execute(intent, decision) -> ToolResult{ok, data, error, events, notice}`,
     what:"Credentials live in the macOS login Keychain (service resonant, account <ext>/<name>), read through /usr/bin/security from the GUI-session LaunchAgent, so there's no prompt. They are entered only in the Mini's terminal (resonant secret set), never over iMessage. A tool or job gets only its own declared secrets, on an inherited pipe (fd 4), never in its env or argv (same-user env is readable), and every encoding of the value (raw, URL, JSON, base64 at three alignments) is redacted before anything is stored, logged or shown.",
     iface:`resonant secret set | check | list | rm <ext>/<name>
 /usr/bin/security find-generic-password -s resonant -a <ext>/<name> -w   # executor + job host only`,
-    inv:["The model never sees secrets","Residual: items trust /usr/bin/security, so any same-user process can read them (incl. the owner's own Claude sessions)","No secrets in the repo. gitleaks runs in pre-commit and CI, and only *.example configs ship"],
+    inv:["The model never sees secrets","Runner secrets: runner/github_token (daemon only: mirror, merges, repo creation, starter CI), runner/github_app_key (signs the JWT that mints each run's App token), runner/claude_token (the session's own Claude token, its one secret in env), optional runner/github_public_token (classic public_repo, daemon only, fork mode)","Claude workers can't read the Keychain: the thin guard blocks securityd and the Keychain files; repo keys come from the checkout's .env","Residual: items trust /usr/bin/security, so any unsandboxed same-user process can read them (incl. the owner's own Claude sessions)","No secrets in the repo. gitleaks runs in pre-commit and CI, and only *.example configs ship"],
     files:["packages/resonant/src/resonant/secrets.py","packages/resonant/src/resonant/redact.py"]},
   /* ---- store tables */
   t_tasks:{label:"tasks", phase:"0", status:"built", what:"The durable task envelope. See the Task envelope node.", iface:`CHECK ((status = 'waiting') = (wait_reason IS NOT NULL))
@@ -611,6 +690,9 @@ UNIQUE (task_id, intent_hash) WHERE status = 'pending'`, inv:["Records requested
 idempotency_key, decision, detail JSON
 TRIGGER: UPDATE / DELETE → RAISE(ABORT, 'audit_log is append-only')`, inv:["Append-only, enforced by triggers","Secrets are redacted before insert"], files:["packages/resonant/src/resonant/store/migrations/001_init.sql"]},
   t_spans:{label:"spans", phase:"0", status:"built", what:"Per-task traces: LLM call, then tool, then gate, then executor. The table and the span() helper are built. The design leaves room to add Phoenix or Langfuse later.", iface:`spans(id, trace_id, parent_id, task_id, name, attrs, status, started_at, ended_at)`, inv:["Not required for v1"], files:["packages/resonant/src/resonant/store/migrations/001_init.sql"]},
+  t_work:{label:"runs · repos · questions · trust", phase:"5a / EM", status:"built", what:"The employee model's state: runs (one row per worker run, with its workspace, checkout, wait reason and last note), repos (the registry), run_questions and run_messages (worker asks, checks and owner messages), trust_rules and trust_seen.", iface:`006_runs · 007_repos · 008_repo_links · 009_checkouts (runs.workspace, runs.checkout, repos.path)
+010_trust_rules (trust_rules, trust_seen, approvals.allow_always)
+011_worker_cli (run_questions, run_messages, runs.wait_reason, last_note, resume_prompt)`, inv:["Run codes are never reused (the AUTOINCREMENT high-water mark survives the rebuild)","Worker text is cleaned and redacted before it is stored"], links:[{to:"runner_claude",label:"rows for"},{to:"trust_rules",label:"rules for"}], files:["packages/resonant/src/resonant/store/runs.py","packages/resonant/src/resonant/store/repos.py","packages/resonant/src/resonant/store/questions.py","packages/resonant/src/resonant/store/trust.py"]},
   t_misc:{label:"decision_log · memory · kv", phase:"0", status:"built", what:"decision_log answers ask_human lookups. memory holds scoped key/value memory. kv holds global flags: autonomy, paused, claude_usage_reset_at, iMessage cursor, heartbeat.", iface:`kv_get(conn, key, default) · kv_set(conn, key, value)`, inv:["DB file is 0600, home dir is 0700"], files:["packages/resonant/src/resonant/store/db.py"]},
   /* ---- ops */
   api:{label:"Local API", phase:"0 / 1", status:"built",
@@ -655,6 +737,8 @@ resonant approvals list|show|approve|deny          # built (Phase 2)
 resonant eval approvals --set <path>                # deferred (follow-up)
 resonant ext validate|add|update|remove|list        # built (Phase 3)
 resonant secret set|check|list|rm                   # built (Phase 3)
+resonant sandbox check [--scope all|ci|local]       # built (EM-1)
+resonant ask|note|check   # the worker CLI: a shim in each run's bin/, not this CLI (EM-3)
 scripts/bootstrap.sh [--check]  # fresh Mac → running daemon (built)`,
     inv:["Real eval sets live in ~/.resonant/evals, never in the public repo","bench e2e uses a fake chat.db and osascript, so it never texts anyone"],
     files:["packages/resonant/src/resonant/cli.py","packages/resonant/src/resonant/__main__.py","packages/resonant/src/resonant/e2e/bench.py","scripts/bootstrap.sh"]},
@@ -671,7 +755,10 @@ const EDGES = [
   {from:"loop", to:"store", label:"checkpoint per step"},
   {from:"store", to:"ops", label:"status / dashboard reads"},
   {from:"gatex", to:"gateway", label:"[A7] approval request · replies · notifications", back:true, over:true},
-  {from:"runners", to:"sources", label:"Claude session events", back:true},
+  {from:"runners", to:"sources", label:"worker events", back:true},
+  {from:"loop", to:"desk", label:"owner replies · tell R4 → relay"},
+  {from:"desk", to:"gatex", label:"check that asks → approval"},
+  {from:"desk", to:"sources", label:"worker reports · questions → pulse", back:true},
 ];
 
 const PHASES = [
@@ -685,12 +772,14 @@ const PHASES = [
    items:["Manifest additions, ext validate (stdlib only, argv0 allowlist, cadence)","Terminal ext add|update|remove|list: approved read-only copy, pins, --adopt, tamper → disabled + alert","Keychain secrets (resonant secret …), per-tool injection, redaction of every encoding","Process runner: env from scratch, output caps, tracked-tree kill, fd-3 events","Scheduler + JobRunner (cronsim, catch-up, pause wins, overlap); origin scheduled; manifest approvers","Router: extension:<name> intents, toolsets, <prior_reply> wrapping; /<ext> <tool>, /help <ext>, /ext list|run|mute","Notifier from persisted events (exactly once, mute, caps, baseline) + ext health","Core daily briefing (core/briefing)","github extension: prs, pr, watch, digest; rerun_failed (L3), merge_pr (L1)","Go-live step 12, bootstrap --check rows","Deferred: MCP, critical-job LaunchAgents, veto windows, Seatbelt sandbox, iMessage /ext add, git sources, Python deps"]},
   {n:3.5, title:"Pulse", status:"built", done:6, total:6,
    items:["Items store (migration 005), SDK report(), manifest report: grant, pulse: config","Ingest and urgent path: clamp, baseline, mute, pause, 20/h cap, exactly once","Hourly core/pulse (quiet hours, approval re-mention) and the briefing Updates section","github summary item; example pnl and incident reporters","/pulse, /pulse now, \"isn't installed\" reply","End-to-end U1-U9, go-live step 13, docs"]},
-  {n:"5a", title:"Claude runner (iMessage)", status:"built", done:7, total:7,
-   items:["Seatbelt sandbox for runners: profile, probes, resonant sandbox check, fail-closed self-probe","Runner config and workspace: bare mirror, clone, bundle harvest, checks, push, gh pr create","ClaudeRunner and the runs table (migration 006): steps, resume, reaper, transcript, usage-limit wait","/run, /runs, /cancel, /merge, the start_run, list_runs, cancel_run, merge_run tools and the run_project intent","Extension secrets leave the environment (fd 4 pipe)","End-to-end tests over the fake iMessage channel, --check runner rows, go-live step 14"]},
+  {n:"5a", title:"Claude runner (iMessage)", status:"superseded", done:7, total:7,
+   items:["Built, then superseded by the employee model. Historical plans: docs/phase5a-plan.md and docs/repos-plan.md (RP-1, RP-4, RP-5, RP-8, RP-9 merged; the rest replaced)","Kept: ClaudeRunner and the runs table (migration 006): steps, resume, reaper, transcript, usage-limit wait","Kept: /run, /runs, /cancel, /merge, the start_run, list_runs, cancel_run, merge_run tools and the run_project intent","Kept: extension secrets leave the environment (fd 4 pipe); the GitHub App per-run token (RP-8)","Replaced: the deny-default Seatbelt profile (home denied, RP-9 name rules, cross-run deny) by the thin guard (EM-1)","Replaced: throwaway clones, the bundle handback and the daemon pushing for the session by real checkouts and worktrees, with the session pushing its own PR (EM-2)","End-to-end tests over the fake iMessage channel, --check runner rows, go-live step 14"]},
+  {n:"EM", tag:"EMPLOYEE MODE", title:"Employee mode (EM-1..EM-9)", status:"built", done:9, total:9,
+   items:["Plan: docs/employee-plan.md (section 5 is the exit criteria)","EM-1 thin guard: allow-default Seatbelt profile, 28 probes, fail-closed self-check","EM-2 real checkouts in ~/code, a worktree per run, .env symlinks, scratch dirs","EM-3 worker CLI (resonant ask, note, check) over a per-run socket; waiting(question)","EM-4 trust rules: standing trust, net-new checks, yes always, /rules, rules taught over chat","EM-5 relay: replies and tell R4 … routed to the right worker; the clash rule","EM-6 reports by urgency, the Workers: digest section","EM-7 fork mode with an external_pr check; merges per trust rules","EM-8 router: /repos, /repo …, /run [<repo>], run_project covers workers, runs and repos","EM-9 e2e tests of the section 5 exit criteria (tests/test_e2e_employee.py) and docs","Next: EM-10, a sweep of old-model leftovers (planned)"]},
   {n:4, title:"Dashboard", status:"planned",
    items:["Vite + React + shadcn (streak look)","jobs, runs, logs (SSE), approvals, audit, slots","loopback only; remote status via the planned status relay"]},
   {n:5, title:"Slack + richer Claude runs", status:"planned",
-   items:["5B two-way Slack (Socket Mode)","Worktree per task, plan → approve → milestones, PROGRESS.md","ask_human, Stop hook, permission requests → gate","Usage-limit park, PR only → waiting(ci) polling"]},
+   items:["5B two-way Slack (Socket Mode)","Plan → approve → milestones, PROGRESS.md","Already covered by the employee model: a worktree per run (EM-2), worker questions through resonant ask instead of ask_human (EM-3, EM-5), the usage-limit park (5a), the CI wait before an auto-merge (EM-7)"]},
   {n:6, title:"On-call", status:"planned",
    items:["Slack trigger, incident threads, triage","Runbooks (L3), break-glass forward-fix (L2) with deny paths","Auto-revert watch, co-founder approves DORI actions"]},
   {n:7, title:"Life lane (private)", status:"planned",
@@ -712,7 +801,7 @@ function text(parent, x, y, str, cls, anchor){
 }
 function esc(s){ return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function statusColor(s){ return s==="built"?"var(--built)":s==="partial"?"var(--partial)":"var(--planned)"; }
-function statusLabel(s){ return s==="built"?"built":s==="partial"?"partly built":"planned"; }
+function statusLabel(s){ return s==="built"?"built":s==="partial"?"partly built":s==="superseded"?"built, superseded":"planned"; }
 const ICONS = {
   msg:'<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
@@ -871,7 +960,7 @@ function toggleGroup(id){
 function nodeMatches(id){
   if (!query) return true;
   const n = NODES[id];
-  const hay = [id, n.label, n.what, n.iface, (n.inv||[]).join(" "), (n.files||[]).join(" ")].join(" ").toLowerCase();
+  const hay = [id, n.label, n.what, n.iface, (n.inv||[]).join(" "), (n.files||[]).join(" "), (n.links||[]).map(l => l.label).join(" ")].join(" ").toLowerCase();
   return hay.includes(query);
 }
 function groupOf(nodeId){ return GROUPS.find(g => g.children.includes(nodeId)); }
@@ -940,6 +1029,9 @@ function openNode(id){
   let body = `<h3>What it does</h3><p>${esc(n.what)}</p>`;
   if (n.iface) body += `<h3>Key interface</h3><pre class="code">${esc(n.iface)}</pre>`;
   if (n.inv && n.inv.length) body += `<h3>Invariants &amp; security</h3><ul>${n.inv.map(i => `<li>${esc(i)}</li>`).join("")}</ul>`;
+  if (n.links && n.links.length) body += `<h3>Connects to</h3><ul>${n.links.map(l => `<li>${esc(l.label)} → <button class="chip" type="button" data-goto="${esc(l.to)}">${esc(NODES[l.to].label)}</button></li>`).join("")}</ul>`;
+  const from = Object.keys(NODES).filter(k => (NODES[k].links || []).some(l => l.to === id));
+  if (from.length) body += `<h3>Linked from</h3><div class="chips">${from.map(k => `<button class="chip" type="button" data-goto="${k}">${esc(NODES[k].label)}</button>`).join("")}</div>`;
   body += `<h3>Files</h3>`;
   body += (n.files && n.files.length)
     ? `<ul class="files">${n.files.map(f => `<li><code>${esc(f)}</code></li>`).join("")}</ul>`
@@ -1083,7 +1175,7 @@ function drawRoadmap(){
     const pct = p.total ? Math.round(100 * p.done / p.total) : 0;
     return `<div class="card">
       <div style="display:flex;align-items:center;gap:8px;justify-content:space-between">
-        <span class="num">PHASE ${p.n}</span>${badge(p.status === "partial" ? "partial" : p.status)}
+        <span class="num">${esc(p.tag || "PHASE " + p.n)}</span>${badge(p.status === "partial" ? "partial" : p.status)}
       </div>
       <h4 style="margin-top:6px">${esc(p.title)}</h4>
       ${p.total ? `<div class="progress"><i style="width:${pct}%"></i></div><div class="k">${p.done} of ${p.total} PRs</div>` : `<div class="k">ticketed with /linear-surf after the previous phase ships</div>`}
@@ -1095,7 +1187,7 @@ function drawRoadmap(){
 /* ---------------------------------------------------------------- trust */
 function drawTrust(){
   const svg = document.getElementById("trustSvg");
-  const W = 980, H = 380;
+  const W = 1334, H = 380;
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.setAttribute("height", H);
   // zones
   const zone = (x,y,w,h,title,sub) => {
@@ -1120,9 +1212,9 @@ function drawTrust(){
   zone(16, 16, 250, 348, "Untrusted content", "never grants anything");
   box(32, 62, 218, "message text", "iMessage / Slack bodies");
   box(32, 120, 218, "emails · web pages", "life lane, browser");
-  box(32, 178, 218, "tool output", "CLI / MCP results");
+  box(32, 178, 218, "tool output · worker text", "CLI results · asks, notes, checks");
   box(32, 236, 218, "extension events", "emit() payloads");
-  box(32, 294, 218, "LLM output", "router / runner proposals");
+  box(32, 294, 218, "LLM output", "brain / worker proposals");
 
   zone(300, 16, 330, 348, "Identity & policy (core)", "where permissions come from");
   box(316, 62, 298, "channel identity → principal", "imessage:+1… / slack:U…", "var(--built)");
@@ -1131,28 +1223,40 @@ function drawTrust(){
   box(316, 236, 298, "Gate: risk × origin · approvals · kill switch", "approval = authenticated reply", "var(--built)");
   box(316, 294, 298, "Executor (only secrets holder)", "idempotent · audited · Keychain → fd 4 pipe", "var(--built)");
 
-  zone(664, 16, 300, 348, "Outside the core path", "");
-  box(680, 62, 268, "trade-jev order execution", "never via loop or gate");
-  box(680, 120, 268, "core sees only", "jobs · read tools · events · kill switch");
-  box(680, 196, 268, "private repos", "trade-jev · dori · life lane");
-  box(680, 254, 268, "public repo", "core · SDK · first-party · example");
-  box(680, 312, 268, "secrets", "Keychain only · gitleaks in CI");
+  zone(664, 16, 330, 348, "Claude workers", "honor system above a hard floor");
+  box(680, 62, 298, "thin guard: the hard floor", "Seatbelt · denies only what protects Resonant", "var(--built)");
+  box(680, 120, 298, "standing trust · resonant check", "net new asks the owner (honor system)", "var(--built)");
+  box(680, 178, 298, "GitHub App token, per run", "one repo · 1 h · no Administration", "var(--built)");
+  box(680, 236, 298, "relay: only the owner's runs", "asked before the reply · pick echoed", "var(--built)");
+  box(680, 294, 298, "env: its own Claude token only", "no other secret in env or argv", "var(--built)");
+
+  zone(1028, 16, 290, 348, "Outside the core path", "");
+  box(1044, 62, 258, "trade-jev order execution", "never via loop or gate");
+  box(1044, 120, 258, "daemon-only GitHub tokens", "runner/github_token · public_repo");
+  box(1044, 178, 258, "private repos", "trade-jev · dori · life lane");
+  box(1044, 236, 258, "public repo", "core · SDK · first-party · example");
+  box(1044, 294, 258, "secrets", "Keychain only · gitleaks in CI");
 
   arrow(250, 85, 316, 85, "data only");
   arrow(250, 317, 316, 259, "proposes Intent");
-  arrow(614, 143, 680, 143, "");
+  arrow(680, 143, 614, 259, "asks");
 }
 function trustCards(){
   const cards = [
     ["Identity grants permissions","A request is authorized by the authenticated sender (iMessage handle or Slack user ID), never by what the message says. Unknown identities are dropped and audited."],
-    ["All content is untrusted","Messages, emails, web pages, tool output, and extension payloads are data. Toolsets are filtered by principal before the LLM sees them, so injected text can't reach tools outside that principal's scope."],
+    ["All content is untrusted","Messages, emails, web pages, tool output, a worker's asks, notes and checks, and extension payloads are data. Toolsets are filtered by principal before the LLM sees them, so injected text can't reach tools outside that principal's scope."],
     ["Co-founder scoped to DORI","The co-founder can request DORI tasks and approve DORI on-call actions. They have no access to the personal lane, trading, the owner's data, or global settings. admin and global scope are owner-only."],
-    ["Approvals are bound","Each approval is tied to an intent hash, expires, is used once, and records who requested and who approved. L1 and pay need yes with the code. A plain yes binds only when exactly one approval is pending and its prompt was sent first. The parser is deterministic; no model reads replies."],
+    ["Approvals are bound","Each approval is tied to an intent hash, expires, is used once, and records who requested and who approved. L1 and pay need yes with the code. A plain yes binds only when exactly one approval is pending and its prompt was sent first. yes always answers only a worker's check. The parser is deterministic; no model reads replies."],
     ["Secrets never reach the model","Only the executor and the job host read the Keychain, delivering a tool's own declared secrets on a pipe (fd 4), never in the process's env or argv. Every encoding of a value is redacted before it is stored, logged or shown. Secrets are entered only in the Mini's terminal. Only *.example configs ship in the public repo, and gitleaks runs in pre-commit and CI."],
-    ["Phase 3 extensions: an interim bar","Extensions are first-party, owner-installed code, run as the same macOS user with the daemon's Full Disk Access. The protection is env and secret isolation, not filesystem isolation: an env built from scratch, HOME in its data dir, per-tool secrets and redaction, output caps, an argv0 allowlist, and a pinned read-only copy. Residual: any same-user process, including the owner's own Claude sessions, can read every resonant Keychain item. No third-party sources until the Seatbelt sandbox."],
+    ["Phase 3 extensions: an interim bar","Extensions are first-party, owner-installed code, run as the same macOS user with the daemon's Full Disk Access. The protection is env and secret isolation, not filesystem isolation: an env built from scratch, HOME in its data dir, per-tool secrets and redaction, output caps, an argv0 allowlist, and a pinned read-only copy. Residual: any unsandboxed same-user process, including the owner's own Claude sessions, can read every resonant Keychain item. No third-party sources until the Seatbelt sandbox."],
     ["No public ports","The API binds to loopback only, and config rejects any other address. Remote status access is planned via the push-only status relay, never by exposing the API. Slack uses Socket Mode, iMessage uses local chat.db, and webhooks need HMAC (their transport is an open follow-up)."],
     ["trade-jev stays outside","Order execution never goes through the loop or gate. Core sees only trade-jev's jobs, read tools, events, and kill switch. The kill switch sets kv.paused, which job-guard checks."],
-    ["Claude stays in its lane","A Claude worker runs inside the thin guard, a macOS Seatbelt profile: it works like the owner at the keyboard but can't write Resonant's state or daemon, read run secrets, Messages or the Keychain, add auto-start entries, signal the daemon or reach Resonant's API port. The GitHub token never enters it; the daemon pushes a branch and opens a PR, and merging is the one approval. Files CI or tooling executes are flagged in the reply, and a PR touching .github/ is refused."],
+    ["The thin guard is the hard floor","Every Claude worker and its children run under an allow-default Seatbelt profile (EM-1). A worker works like the owner at the keyboard: the whole disk, .env files, Docker, the network and Ollama. It can't write ~/.resonant or the installed daemon, read run secrets, Messages or the Keychain, add auto-start entries, run launchctl or crontab, signal the daemon or reach port 7777. resonant sandbox check probes every deny, and a cached self-check fails closed before each run."],
+    ["Standing trust, net-new checks","Above the floor, trust is an honor system, like a coworker. Workers act and report, and run resonant check before anything net new: a new system, a new kind of action, anything irreversible, anything that costs money. That is ok or an owner approval (yes / yes always / no). The owner shapes the rules over chat (\"always ask before merging in trading\"), and merges follow merge_decision."],
+    ["Three GitHub credentials, kept apart","The worker gets only a per-run GitHub App installation token: one repo, 1 hour, no Administration, revoked when the session ends. The daemon's runner/github_token never enters a worker; it serves the mirror, merges, repo creation and starter CI. The optional classic public_repo token is daemon-only, for fork mode: the upstream PR is opened only after an external_pr check the owner approved, at the head that was checked."],
+    ["The relay answers only the owner's runs","A reply binds a worker question only if the question was asked before the reply was sent, belongs to one of the owner's own runs, and the sender's handle maps to the owner. The brain's pick by content is validated against the open codes and echoed (→ R4 (<q>)). Worker text shown to the owner is cleaned and other runs' codes are masked, so one worker can't steer a reply to another."],
+    ["No secrets in env or argv","A same-user process can read another's env and argv, and a sandbox can't deny that. So no secret is ever put in one, except the session's own Claude token. Run tokens reach the session through its credential helper, the worker CLI's token through a 0600 file, and repo keys through the checkout's .env."],
+    ["Phase 5a wall: historical","Phase 5a ran Claude in a deny-default profile with all of home denied, the RP-9 secret-file name rules and a cross-run deny, in a throwaway clone whose bundle the daemon harvested and pushed. The employee model (EM-1, EM-2) replaced all of that. docs/phase5a-plan.md and docs/repos-plan.md are kept as history."],
   ];
   document.getElementById("trustCards").innerHTML = cards.map(([h,b]) => `<div class="card"><h4>${esc(h)}</h4><p class="k" style="font-size:13px;margin:4px 0 0">${esc(b)}</p></div>`).join("");
 }

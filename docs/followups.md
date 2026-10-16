@@ -4,27 +4,25 @@ Work we've decided to do eventually but have deferred. Each entry says why it wa
 
 ## Owner to-dos (human, at the Mini)
 
-These are steps only you can do: entering tokens and confirming on GitHub. Claude never enters secrets. Do them in this order; the full steps are in [`go-live.md`](go-live.md) step 14 (rewritten by RP-7). Tick them off here.
+Only you can do these: tokens, GitHub settings and the first real runs. Claude never enters a secret, and no secret goes in a command line or a chat. Do them in this order. The full steps and expected output are [`go-live.md`](go-live.md) step 14 (step 12 for the github extension); status rows are in [`test.md`](test.md). Tick them off here.
 
-- [ ] **Claude token:** `claude setup-token`, then `resonant secret set runner/claude_token` (subscription).
-- [ ] **GitHub App** (runs; [`repos-plan.md`](repos-plan.md) D10):
-  1. On GitHub: Settings → Developer settings → GitHub Apps → New. No webhook.
-  2. Permissions, all repository-level:
-     - Read/write: Contents, Pull requests, Issues, Workflows, Actions.
-     - Read: Checks, Statuses, Metadata.
-     - **No Administration.**
-  3. Install it on your account, for all repositories.
-  4. Generate a private key, then `resonant secret set runner/github_app_key --from-file <the .pem>`, then delete the `.pem`.
-  5. Tell Claude the app ID and the installation ID (they aren't secret; Claude puts them in the config).
-- [ ] **Resonant's own GitHub token:** a fine-grained token covering all repositories.
-  - Read/write: Contents, Pull requests, Administration (to create repos), Workflows (starter CI).
-  - Read: Checks, Statuses, Metadata.
-  - Then `resonant secret set runner/github_token`. The token is daemon-only and never enters a session.
-- [ ] **Upstream-PR token:** a classic token with only the `public_repo` scope, then `resonant secret set runner/github_public_token`. Fork runs (EM-7) are refused until it is set; on the first real fork run, confirm the App mints a token for the new fork and the session can push to it.
-- [ ] **github extension update:** `resonant ext add repo:github` (typed confirm).
-- [ ] **Authenticated sandbox probe:** go-live step 14, terminal 5 (the `read -rs` form).
-- [ ] **First run with Claude watching:** a trivial `/run` on a repo with CI. Check `test.md` rows for the runner.
-- [ ] **Per sensitive repo:** turn on branch protection on `main` (Resonant warns if it's missing), and say "no CI edits" for any repo whose GitHub Actions secrets matter.
+- [ ] **github extension** (go-live 12, if not done yet): `resonant secret set github/token` (read-only fine-grained token), then `resonant ext add repo:github` (type `github`).
+- [ ] **Deploy and reinstall:** `/update`, then `resonant daemon install` (the LaunchAgent's new system-only PATH).
+- [ ] **Claude Code and `gh` installed** (`claude --version`; `gh` at `/opt/homebrew/bin/gh`), then `claude setup-token` → `resonant secret set runner/claude_token`.
+- [ ] **GitHub App:**
+  1. github.com → Settings → Developer settings → GitHub Apps → New. Webhook off.
+  2. Repository permissions: read and write Contents, Pull requests, Issues, Workflows, Actions; read-only Checks, Commit statuses, Metadata. **No Administration.**
+  3. Install it on your account, **All repositories**.
+  4. Generate a private key → `resonant secret set runner/github_app_key --from-file <the .pem>` → delete the `.pem`.
+  5. Tell Claude the App ID and the installation ID (not secret; Claude adds `runner.github_app` and restarts).
+- [ ] **Resonant's own token:** fine-grained, your account, All repositories. Read and write Contents, Pull requests, Administration, Workflows; read-only Checks, Commit statuses, Metadata. → `resonant secret set runner/github_token`.
+- [ ] **Optional, for PRs to others' public repos:** a classic token with only `public_repo` → `resonant secret set runner/github_public_token`.
+- [ ] **Authenticated probe:** `read -rs T`, then `CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check; unset T`. Every row `PASS`.
+- [ ] **`scripts/bootstrap.sh --check`:** the runner rows `PASS` (`runner repos` and `runner code dir` may `SKIP`).
+- [ ] **On GitHub, per repo you care about:** branch protection (or a ruleset) on the base requiring a PR and CI, with the app not in the bypass list. Tell Claude "no CI edits in <repo>" where Actions secrets matter.
+- [ ] **First real run, with Claude watching:** `/run <repo> <small ask>` on a repo with CI. The worker's `gh pr create` and `gh pr checks --watch` work with the App's token (PR by `<app>[bot]`); your checkout is untouched (go-live 14, first real run; `test.md` 39).
+- [ ] **The iMessage tests:** go-live 14, iMessage 2–11 (`test.md` 40–45): spawn in plain words and get the digest line, a question and its reply, a check and `yes always`, a rule that makes a merge ask, a scratch run, cancel and `/kill`.
+- [ ] **First fork run** (only with the `public_repo` token): the App mints a token for the new fork, and the upstream PR opens only after your `yes` (`test.md` 46).
 
 ## Status relay: dead-man switch and remote dashboard
 
@@ -144,11 +142,10 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 *Deferred 2026-10-13, from the local-model latency fix (Instruct-2507 default).*
 
-**Problem.** A routed reply takes one label call, up to three tool rounds and a final answer. That's usually 1-3 s, but a cold model, a long thread or the Phase 5 Claude runner (minutes) can take much longer, and the sender sees nothing until the answer arrives. iMessage gives no typing indicator over AppleScript.
+**Problem.** A routed reply takes one label call, up to three tool rounds and a final answer. That's usually 1-3 s, but a cold model or a long thread can take much longer, and the sender sees nothing until the answer arrives. (Claude workers already ack at once: `On it: R4`.) iMessage gives no typing indicator over AppleScript.
 
 **Proposed design.**
 - **Timer, not a prediction.** When the runner starts a task, arm a timer (`router.ack_after_s`, ~4 s: above the llm path p95). If the reply isn't sent by then, send one short ack ("on it, back in a moment") and then the real reply. Fast-path replies never ack. Predicting slowness from the intent is brittle; a timer is exact and costs nothing when the reply is quick.
-- **Escalations ack immediately.** Anything going to the Claude runner gets an ack right away with a rough ETA, and the result comes later as its own message.
 - **Exactly once.** Send through the channel with `dedupe_key=ack:<task id>` and record `acked: true` in the checkpoint, so a retried step never acks twice. A cancelled or failed task after an ack should say so ("couldn't finish that: …") instead of going silent.
 
 **Trade-offs.** One extra message per slow reply. An ack that lands a few hundred ms before the answer is noise, so set the threshold from the measured p95, not the p50. Counts toward the outbound rate limit.
@@ -166,40 +163,6 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 **Cheaper win first.** For intents whose tools take no arguments (`system`: `daemon_status`, `model_status`, `system_status`), the tool round could be skipped: run the toolset directly and let the model only narrate (the final `chat_json`). That saves one model round per system question. Measure with `resonant bench e2e --model real` before and after.
 
 **Two more measured wins (2026-10-13, Instruct-2507, e2e bench).** (1) After the last tool result the model's no-call `chat_tools` turn already writes the answer as plain text (~5-20 tokens), and `_final` then asks again via `chat_json` (median ~0.9 s on `job_control`). Using that text as the reply, through the same number guard and length cap, would save one round. (2) With earlier replies in the thread, the model sometimes answers a repeated question from history without calling a tool, which can be stale. Consider a system-prompt rule to always re-read live state for `job_control` and `system`, or dropping prior replies for those intents.
-
-## Claude sessions for `run_project`: reuse claude-surf, or build "resonant-surf"
-
-*Deferred 2026-10-13, after installing [claude-surf](https://github.com/justinhe16/claude-surf) on the Mini.*
-
-**What it is.** Today the local runner answers `run_project` messages ("write code", "open a PR") with a templated escalation instead of calling Claude (see the 2026-10-08 entry in the [decisions log](architecture.md#decisions-log)). The planned Claude-session runner would take that work. It already has slots (`SlotPool`), `Wait`/resume by `claude_session_id`, and `ctx.save` (see [Scheduling and priority](architecture.md#scheduling-and-priority)). claude-surf's agents and skills now live in `~/.claude/` on the Mini. Its `/robot-surf-prompt` flow is close to what that runner should do: worktree, plan if complex, implement, PR, CI, code review, report. This is also the workflow we've been running by hand.
-
-**Decision to make.** Pick one:
-- **Reuse claude-surf as is.** Resonant starts a headless Claude Code session that runs `/robot-surf-prompt`.
-- **Edit claude-surf upstream.** Fix what doesn't fit, then reuse it.
-- **Build a Resonant-native flow ("resonant-surf").** It would live in this repo or as an extension, built for Resonant's gate, approvals, audit and iMessage reporting.
-
-**Open questions**
-- **Why the agents are pinned to Sonnet.** All four claude-surf agents set `model: sonnet`, and its `settings.json` sets `"model": "sonnet"`. Was that for cost, speed, or rate limits? Is it still the right default for planning and code review, where a stronger model may pay off, versus implementation? Should the model be set per agent, or inherited from the caller?
-- **Known mismatches with Resonant:**
-  - The skills hard-code `MAIN_BRANCH="master"`; Resonant uses `main`.
-  - Worktrees go in `~/Projects/<repo>-<branch>`.
-  - `/robot-surf-fan` auto-merges by default.
-  - `/robot-surf` needs Linear.
-  - `global-surf` overwrites `~/.claude/settings.json` with broad pre-approved permissions; we didn't install that part.
-- **Safety under Resonant.** A session started from iMessage must:
-  - go through the gate and Phase 2 approvals before any side effect (push, PR, merge);
-  - never auto-merge without the owner's approval;
-  - stay within the principal's grants;
-  - report progress and results back over iMessage.
-
-  How much of that fits as a wrapper around claude-surf, and how much needs its own flow?
-- **Headless operation.** How does the runner start a session (Claude Code CLI or the Agent SDK)? It needs to stream status, survive `Wait`/resume, and respect the slot cap. Credentials and usage limits matter too.
-- **Where the skill lives.** Should it be global `~/.claude/skills` on the Mini, or pinned in this repo so that a Resonant run is reproducible?
-
-**Done when**
-- Reuse, edit or build is decided, with the Sonnet question answered.
-- A `run_project` text from the owner leads, after approval, to a reviewed PR and an iMessage with its link.
-- `architecture.md` and `interfaces.md` describe the runner.
 
 ## Veto windows for unattended jobs
 
@@ -237,13 +200,9 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 **Done when.** A cleared or deleted note comes back with its number, and undo of an undo is refused.
 
-## Runner sandboxing (Phase 3/5)
-
-*Deferred 2026-10-13, from the Phase 2 trust model ([architecture.md](architecture.md#trust-model)). **Closed 2026-10-15 for Claude runs** by Phase 5a: they run under the Seatbelt `runner` profile, with probes for each deny ([plan](phase5a-plan.md#d1-the-sandbox-resonantsandbox), `resonant sandbox check`). Extension processes are what remains: see the [Seatbelt sandbox for extension processes](#seatbelt-sandbox-for-extension-processes).*
-
 ## A `resource` wait reason for runner runs
 
-*From the P5A-3 review.* A run that finds its repo busy, the runner full or Resonant paused returns `Wait("usage_reset")` because `tasks.wait_reason` has no better value. `/status` then counts it under usage resets.
+*From the P5A-3 review.* A run that finds the runner full or Resonant paused returns `Wait("usage_reset")` because `tasks.wait_reason` has no better value. `/status` then counts it under usage resets.
 
 **Done when.** `resource` is added to `WaitReason` and to the `tasks.wait_reason` CHECK in the next migration that touches `tasks`, and `ClaudeRunner._defer` uses it.
 
@@ -251,7 +210,6 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 *Noted 2026-10-13, during the Phase 2 build.*
 
-- Call `git` by absolute path (like `launchctl` and `uv`) instead of resolving it on launchd's `PATH`.
 - Run ops subprocesses with a minimal environment, not the daemon's.
 - Scrub more from `/logs`: paths under `$HOME`, tokens that look like keys.
 - A cooldown on `restart_ollama`, so a loop of requests can't keep the model down.
@@ -316,7 +274,7 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 
 *Deferred 2026-10-14, from Phase 3 (the D13 interim bar). Needs its own security review. It must land before any third-party or network source.*
 
-**Update 2026-10-15.** The `runner` profile and `resonant/sandbox/` shipped in Phase 5a ([plan](phase5a-plan.md#d1-the-sandbox-resonantsandbox)), so this section is now only about extension processes. The deny-default `extension` profile was moved out of that build (it is in nobody's critical path, and on by default it risks breaking the github digest and pulse reporters). What's left here: a second template in `resonant/sandbox/`, opt-in per extension (`sandbox: true` in config), probes for `gh api` and the example extension under it, then default-on once both are proven. It reuses Phase 5a's unconditional mach denies (launchd, window server, HID, accessibility, Apple Events) and port denies on every address.
+**Update 2026-10-16.** `resonant/sandbox/` exists, but its one profile is now the allow-default thin guard for Claude workers (EM-1), which protects Resonant and nothing else. Extension processes need the opposite: a deny-default `extension` profile (it is in nobody's critical path, and on by default it risks breaking the github digest and pulse reporters). What's left here: a second template in `resonant/sandbox/`, opt-in per extension (`sandbox: true` in config), probes for `gh api` and the example extension under it, then default-on once both are proven. It can reuse the thin guard's mach denies (launchd, securityd, window server, HID, accessibility, Apple Events) and its port denies on every address.
 
 **Deny-default design.**
 - Deny `lsopen`, `launchctl`, `open`, `shortcuts`.
@@ -387,14 +345,22 @@ The real model mislabels 2 of the 45 synthetic cases (still above the 90% bar). 
 
 *Found 2026-10-14, after the pulse shipped.* The pulse's approval re-mention runs only at the top of the hour, and approvals expire after 30 minutes, so it catches only approvals asked between :30 and :50 past an hour. A reminder scheduled by the approval runner itself (e.g. `[A7] still waiting, expires in 10 min`, once, at half the TTL) would cover every approval. Then drop `core/approval` from the pulse.
 
-## Runner as a separate macOS user (hardening)
-
-Deferred 2026-10-15 from the Phase 5a plan. The Seatbelt sandbox cannot stop a session reading another same-user process's argv and environment (`sysctl KERN_PROCARGS2`), so the owner chose never to put a secret in any process's env or argv instead (`resonant sandbox check` probes the daemon's environment). Running sessions as a dedicated user (`_resonant-runner`, no Keychain, no access to the owner's home) would close that structurally and drop the reliance on the rule. Needs one more owner terminal step (creating the user) and a `sudo`-free launchd helper.
-
 ## Secrets on disk for `gh` (P5A-7)
 
 *Noted 2026-10-15.* Secrets no longer appear in any child's env or argv (fd 4 pipe). The github extension still has to hand its token to `gh`, which reads only an env var or a config file, so it writes a 0600 `hosts.yml` into a 0700 dir under the extension's data dir for the length of the run. A run ended by SIGKILL (a timeout, after SIGTERM's grace) can leave that dir until a later run sweeps `resonant-gh-*` dirs older than an hour. Calling the GitHub API from Python with the token in memory would remove the file; deferred because the extension is built on `gh`'s GraphQL, pagination and error text. Also: a descendant started through a shell (not `subprocess` defaults) could inherit fd 4 before the SDK reads it; first-party extensions don't.
 
-## Tools that need a pty inside the runner sandbox
+## Superseded by the employee model
 
-*Noted 2026-10-15 (P5A-1).* The runner profile lets a session write only `/dev/tty`, `/dev/null` and its own dirs, and denies `/dev/ttys*` and `/dev/ptmx`. Headless `claude -p` over pipes needs no pty, but a repo tool that allocates one (`script`, `expect`, some test harnesses, interactive installers) fails. Add a narrow pty allow only if a real run needs it.
+*2026-10-16, EM-9.* Removed from this file because [`employee-plan.md`](employee-plan.md) answered them: **reusing claude-surf for `run_project`** (Resonant now spawns its own Claude workers, EM-2/EM-3), **runner sandboxing** and **running sessions as a separate macOS user** (the owner chose the thin guard: workers run like the owner at the keyboard, and the guard protects only Resonant), and **a pty allow inside the runner sandbox** (the thin guard leaves ptys open). [`repos-plan.md`](repos-plan.md) waves RP-2, RP-3, RP-6, RP-7 and the RP-10 grants idea, and [`phase5a-plan.md`](phase5a-plan.md)'s strict sandbox, fresh clones and bundle handback are historical.
+
+## Employee mode carry-overs
+
+*Noted 2026-10-16 from the EM-1..EM-8 "As built" notes ([`employee-plan.md`](employee-plan.md)). Each is small; fix it or accept it in the decisions log. EM-10 sweeps the old model's leftovers in code and docs.*
+
+- **Checkout `.git` is worker-writable** (EM-2, accepted). A worker can plant hooks, move your branches or change config in a checkout. Daemon git there runs tokenless under the guard (EM-3), so it can't hurt Resonant, but your own next `git commit` runs a planted hook. Hardening: deny writes to `.git/hooks` and fetch the base from the mirror only.
+- **Guard gaps** (EM-1): hardlinks that already exist into a protected file aren't covered (keep uv's link mode clone or copy); port 7777 is fixed in the profile and the self-check (derive it from `api.port` if that changes); `~/Library` and `~/.config` are write-denied whole (narrow them if workers need `~/Library/Caches`).
+- **Per-run App token is one repo** (plan §6). An ops ask that spans repos can't push to the others; widen through `resonant check` if it comes up.
+- **A fork run pushes before its checks** (EM-7). A token the checks then find is already public on the fork, though nothing goes upstream. Rotate it if that happens. The App covering a new fork is confirmed only on the first real fork run.
+- **Model-chosen `answer_worker`/`message_worker` run without asking** (EM-5). A worker's own summary could in principle nudge the model into messaging another run; the deterministic paths cover the usual replies.
+- **Visibility** (EM-5, EM-6): the relay's "which one?" stash and the brain's pick aren't shown in `/approvals` or `/runs`; a question that times out sends no text (the transcript and the digest line show it); the urgent-note cap (6 an hour) is in memory and resets on restart.
+- **Small gaps:** time blocked inside one `resonant ask` call (up to 8 minutes) counts as session time (EM-3); no `resonant approvals approve --always` (EM-4); a renamed repo's checkout isn't moved and the checkout's `.git` growth isn't under the disk watchdog (EM-2); `/run blog fix x` with a repo only GitHub knows is a scratch run unless written `/run blog: fix x` (EM-8); `merge_ci_pr` doesn't wait for CI (EM-8).
