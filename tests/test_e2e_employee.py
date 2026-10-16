@@ -167,8 +167,19 @@ async def test_three_workers_ask_at_once_then_spawn_a_claude_to_a_pr_in_the_dige
                                 ("R2", CHANGELOG_Q, "drop them"),
                                 ("R3", FLAKY_Q, "rewrite it")):  # fmt: skip
             # three sessions resume at once: a slow CI runner needs more than 30 s
-            await until(lambda c=code: any(t.startswith(f"{c} done: PR #") for t in w.texts()),
-                        120, f"{code} done")  # fmt: skip
+            try:
+                await until(lambda c=code: any(t.startswith(f"{c} done: PR #") for t in w.texts()),
+                            120, f"{code} done")  # fmt: skip
+            except AssertionError:
+                runs = [
+                    (r, w.run(r).status, w.run(r).step, w.run(r).failure)
+                    for r in ("R1", "R2", "R3")
+                ]
+                print("DIAG", w.texts(), runs)
+                print("DIAGQ", w.runner.open_questions())
+                for r in ("R1", "R2", "R3"):
+                    print("DIAGP", r, [p[:120] for p in prompts(w, r)], cli_calls(w, r))
+                raise
             assert prompts(w, code)[1].startswith(
                 f'The owner answered your question "{q}": {answer}'
             ), code
