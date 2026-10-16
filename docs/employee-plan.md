@@ -108,6 +108,7 @@ What goes away: the home-folder deny, the secret-file name rules (RP-9), the cro
 | EM-6 | Reporting urgencies, the digest of worker events, `notify_now` rules | 3 |
 | EM-7 | Fork mode (repos-plan D3) as a worker plus an `external_pr` check; merge per trust rules | 3 |
 | EM-8 | Router: the `repos` intent and tools (repos-plan D8), RP-4's carry-overs, few-shots and evals | 4 |
+| EM-10 | Whole-codebase sweep after EM-9: remove leftovers of the old model (Phase 5a strict sandbox, fresh clones/bundles/mirrors, RP-9 name rules, repos-plan waves that never shipped), dead config/code/tests, stale docs; bring `followups.md` owner to-dos and `test.md` fully up to date | 6 |
 | EM-9 | e2e tests (fake claude using the worker CLI), go-live rewrite, `test.md`, architecture docs and the artifact | 5 |
 
 ## 5. Exit criteria
