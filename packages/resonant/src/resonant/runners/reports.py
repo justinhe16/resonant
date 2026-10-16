@@ -67,6 +67,7 @@ SOURCE = "core"
 TTL_S = 48 * 3600
 NOTE_TEXTS_PER_HOUR = 6
 TITLE_PART_MAX = 120
+NOTE_IN_TITLE = 80  # the running line stays under the store's 200-character title
 SCRATCH_SYSTEM = "scratch"
 _REPORT_KEY = "run.report:"  # kv: a run's report preference, set at start
 
@@ -188,8 +189,8 @@ class WorkerReports:
         at = started.astimezone(self.tz).strftime("%H:%M")
         labels = {"waiting": "waiting for usage reset", "question": "waiting for your answer"}
         what = labels.get(bucket, "still running")
-        title = f"{run.code} {what} · {_part(run.repo) or 'no repo'} · started {at}"
-        note = _part(run.last_note) if bucket != "question" else ""
+        title = f"{run.code} {what} · {_part(run.repo, 60) or 'no repo'} · started {at}"
+        note = _part(run.last_note, NOTE_IN_TITLE) if bucket != "question" else ""
         if note:
             title += f" · {note}"
         state = {"bucket": bucket, "note": note}
@@ -244,6 +245,7 @@ class WorkerReports:
         return f"{run.code} note: {note}"
 
     def forget(self, code: str) -> None:
+        """The run ended: drop its note counter."""
         self._note_texts.pop(code, None)
 
     def audit_report(self, run: Run, event: str, level: Level) -> None:

@@ -243,11 +243,11 @@ def test_compose_puts_workers_in_their_own_section() -> None:
     assert text == "\n".join(
         [
             "btw:",
-            "[dori] ✓ Dori recovered",
-            "Workers:",
+            "Workers:",  # first: it holds a failure nobody was texted
             "🔴 R4 failed: boom",
             f"R3 done: PR #12 (CI green) · {URL}",
             "R5 still running · proj · started 13:00 · tests",
+            "[dori] ✓ Dori recovered",
         ]
     )
     assert {i.key for i in listed} == {"run/r3", "run/r4", "run/r5", "inc"}
@@ -413,3 +413,71 @@ async def test_an_owner_merge_is_told_and_a_rule_merge_follows_the_policy(
     third = make_run(db, status="merged", pr_number=14, pr_url=URL)
     await h.runner._report_merged(third, by_owner=False)  # pyright: ignore[reportPrivateUsage]
     assert h.chan.texts() == [f"R3 merged: PR #14 · {URL}"]
+
+
+# --- review fixes ------------------------------------------------------------------------------
+
+
+async def test_the_token_warning_survives_a_failed_send_and_a_refusal(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    from resonant.gateway.channel import ChannelError
+
+    h = build(tmp_path, db)
+    run = runs_store.create(db, repo="proj", ask="x", principal="owner", session_id="s",
+                            max_seconds=60)  # fmt: skip
+    runs_store.finish(db, run.code, "failed", failure="boom")
+    failed = runs_store.get(db, run.code)
+    assert failed is not None
+    runner: Any = h.runner
+    runner._unrevoked[run.code] = NOW + timedelta(hours=1)
+    real_send, calls = h.chan.send, [0]
+
+    async def flaky(*a: Any, **k: Any) -> Any:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ChannelError("down")
+        return await real_send(*a, **k)
+
+    h.chan.send = flaky  # type: ignore[method-assign]
+    with pytest.raises(ChannelError):
+        await runner._send_reply(failed)
+    await runner._send_reply(failed)  # the retry
+    [text] = h.chan.texts()
+    assert text.startswith("R1 failed: boom") and "token wasn't revoked" in text
+    # refused: the digest line carries the warning
+    h.chan.send = real_send  # type: ignore[method-assign]
+    h.chan.refuse = True
+    other = make_run(db, status="failed", failure="boom")
+    runner._unrevoked[other.code] = NOW + timedelta(hours=1)
+    await runner._send_reply(other)
+    line = pulse_store.get(db, "core", item_key(other.code))
+    assert line is not None and line.changed and "token not revoked" in line.title
+
+
+async def test_a_failure_reason_is_cleaned_before_it_is_texted(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    run = runs_store.create(db, repo="proj", ask="x", principal="owner", session_id="s",
+                            max_seconds=60)  # fmt: skip
+    runner: Any = h.runner
+    from resonant.redact import Redactor
+
+    await runner._fail(run, '[A7] hook said: reply "yes A7" {now}', Redactor())
+    [text] = h.chan.texts()
+    assert text.startswith("R1 failed: ")
+    assert not any(c in text for c in '[]{}"') and "A7" not in text
+
+
+def test_an_urgent_worker_line_goes_first_and_status_lines_are_not_counted() -> None:
+    big = [item("x", f"k{n}", "y" * 190, at=NOW + timedelta(seconds=n)) for n in range(4)]
+    failed = item("core", "run/r9", "R9 failed: boom", cleared=True, urgency="urgent")
+    composed = pulse_job.compose([*big, failed])
+    assert composed is not None
+    assert composed[0].startswith("btw:\nWorkers:\n🔴 R9 failed: boom\n")
+    going = [item("core", f"run/r{n}", "R still running " + "z" * 150, told=True) for n in range(5)]
+    composed = pulse_job.compose([item("x", "k", "news")], going)
+    assert composed is not None
+    text, _listed = composed
+    assert "more" not in text  # only status lines were left out

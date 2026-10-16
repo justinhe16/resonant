@@ -195,9 +195,10 @@ def compose(
 ) -> tuple[str, list[store.Item]] | None:
     """The pulse text and the items it shows (the rest wait); None with no items.
 
-    Worker items go in a ``Workers:`` section after the rest. ``context``: workers already
-    told that are still running, listed for status when there is news (never a reason to
-    send)."""
+    Worker items go in a ``Workers:`` section after the rest (before it when one is urgent:
+    a failure the owner wasn't texted). ``context``: workers already told that are still
+    running, listed for status when there is news (never a reason to send, and not counted
+    in ``+N more``)."""
     if not items:
         return None
     others = _order([i for i in items if not is_worker_item(i)])
@@ -205,11 +206,17 @@ def compose(
     workers = [i for i in items if is_worker_item(i)]
     workers += [i for i in context if (i.source, i.key) not in keys and is_worker_item(i)]
     entries: list[tuple[str, store.Item | None]] = [(item_line(i), i) for i in others]
-    entries += worker_entries(workers)
-    shown, listed, more = fit_entries(entries, MAX_CHARS - len(HEADER))
+    if any(i.urgency == "urgent" for i in workers):  # a failure nobody took goes first
+        entries = [*worker_entries(workers), *entries]
+    else:
+        entries += worker_entries(workers)
+    shown, listed, _left = fit_entries(entries, MAX_CHARS - len(HEADER))
+    shown_keys = {(i.source, i.key) for i in listed}
+    more = sum(1 for k in keys if k not in shown_keys)  # news left out, not status lines
     if not listed:  # one line is at most LINE_MAX, so this is only a tiny-cap safety net
         first = next(i for _line, i in entries if i is not None)
-        shown, listed, more = [item_line(first)], [first], more - 1
+        shown, listed = [item_line(first)], [first]
+        more = sum(1 for k in keys if k != (first.source, first.key))
         assert len(shown[0]) <= MAX_CHARS - len(HEADER)
     parts = [HEADER, *shown]
     if more:

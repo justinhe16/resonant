@@ -982,7 +982,7 @@ class ClaudeRunner:
         if level != "now" or (text := self.reports.note_text(run)) is None:
             return
         item = self.reports.running(run, _bucket(run.session_seconds))
-        key = f"run:{run.code}:note:{event.at.isoformat()}"
+        key = f"run:{run.code}:note:{uuid.uuid4().hex}"  # each urgent note is its own news
         try:
             await self.channel.send(run.principal, text, dedupe_key=key)
         except ChannelError as e:  # the digest line still carries the note
@@ -1654,10 +1654,10 @@ class ClaudeRunner:
                 expect_head=pr.head_sha,  # gitleaks:allow
             )
         except (CheckFailed, MergeRefused) as e:
-            refusal = _clip(w.redactor.text(str(e)), REASON_MAX)
+            refusal = _clip(clean_external(w.redactor.text(str(e))), REASON_MAX)
         except GitError as e:
             why = f"checking the PR failed: {e.message[-120:]}"
-            refusal = _clip(w.redactor.text(why), REASON_MAX)
+            refusal = _clip(clean_external(w.redactor.text(why)), REASON_MAX)
         else:
             fields.update(files_changed=checked.files, flagged_paths=checked.flagged)
         if not runs.finish(self.conn, run.code, "ready", step="reply", failure=refusal, **fields):
@@ -1791,7 +1791,8 @@ class ClaudeRunner:
     # -- ending a run --
 
     async def _fail(self, run: Run, reason: str, red: Redactor) -> StepOutcome:
-        reason = _clip(red.text(reason), REASON_MAX)
+        # cleaned where stored: a failure reason (git stderr, GitHub, the session) is texted
+        reason = _clip(clean_external(red.text(reason)), REASON_MAX)
         if not runs.finish(self.conn, run.code, "failed", failure=reason, step="reply"):
             return await self._conclude(self._must_get(run.code))  # cancelled first
         with atomic(self.conn):
@@ -1841,9 +1842,11 @@ class ClaudeRunner:
         text = reply_text(run, ci, no_ci=no_ci)
         event = end_event(run)
         warned = False
-        if text is not None and (expires := self._unrevoked.pop(run.code, None)) is not None:
+        title = end_title(run, ci)
+        if text is not None and (expires := self._unrevoked.get(run.code)) is not None:
             at = expires.astimezone(self.tz).strftime("%H:%M")
             text += f"\n⚠ the run's GitHub token wasn't revoked; it expires at {at}."
+            title += f" · ⚠ token not revoked, expires {at}"
             warned = True
         if text is None or event is None:
             self.reports.clear_silently(run)
@@ -1853,14 +1856,17 @@ class ClaudeRunner:
         else:
             level = "now" if warned else self.reports.level(run, event)
             self.reports.audit_report(run, event, level)
-            item = self.reports.ended(run, end_title(run, ci), urgent=level == "now")
+            item = self.reports.ended(run, title, urgent=event == "failed" or warned)
             if level == "digest":
+                self._unrevoked.pop(run.code, None)  # the line carries the warning
                 return
         try:
             await self.channel.send(run.principal, text, dedupe_key=f"run:{run.code}:{run.status}")
-        except ChannelRefused:  # nobody took it: the digest carries the line
+        except ChannelRefused:  # nobody took it: the digest carries the line (and warning)
             log.warning("run reply refused", extra={"run": run.code})
+            self._unrevoked.pop(run.code, None)
             return
+        self._unrevoked.pop(run.code, None)  # only now: a retried send says it again
         if item is not None:
             self.reports.told(item)
 
@@ -1907,6 +1913,7 @@ class ClaudeRunner:
     async def _end_cli(self, code: str) -> None:
         """The run ended: its open questions close and its control dir goes."""
         self.desk.close_run(code)
+        self.reports.forget(code)
         with contextlib.suppress(OSError):
             await asyncio.to_thread(worker_cli.remove_ctl, self.cfg.work_dir, code)
 
@@ -1984,7 +1991,8 @@ class ClaudeRunner:
                 if runs.cancel(self.conn, run.code, "cancelled"):
                     ended.append(run)
             elif runs.finish(self.conn, run.code, "failed", step="reply",
-                             failure=error or "the task ended unexpectedly"):  # fmt: skip
+                             failure=_clip(clean_external(error or ""), REASON_MAX)
+                             or "the task ended unexpectedly"):  # fmt: skip
                 ended.append(run)
         cutoff = self.clock() - timedelta(minutes=2)
         for run in runs.active(self.conn):
@@ -1995,11 +2003,14 @@ class ClaudeRunner:
                 ended.append(run)
         for run in ended:
             current = self._must_get(run.code)
-            if current.status == "failed":  # no step will conclude it: report it here
-                with contextlib.suppress(ChannelError):
-                    await self._send_reply(current)
-            else:
-                self._pulse_clear(run)
+            try:
+                if current.status == "failed":  # no step will conclude it: report it here
+                    with contextlib.suppress(ChannelError):
+                        await self._send_reply(current)
+                else:
+                    self._pulse_clear(run)
+            except Exception:  # one run's report must not stop the others'
+                log.exception("ended run not reported", extra={"run": run.code})
             if current.status == "cancelled":
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
