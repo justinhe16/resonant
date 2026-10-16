@@ -5,9 +5,10 @@ a loopback client and name a loopback ``Host`` (``localhost`` or a loopback IP, 
 a web page that rebinds its DNS name to 127.0.0.1 can't read the dashboard through the owner's
 browser. Anything else gets 403.
 
-``/`` serves the committed dashboard build (``dashboard/dist``, DB-2) when it is there, and a
-placeholder page when it isn't. ``/config.json`` is always ``{"source": "local"}``: the build
-served here reads ``/api/dashboard``, whatever ``config.json`` the build ships.
+``/`` serves the committed dashboard build (``dashboard/dist``, DB-2) when it is there, its
+``config.json`` (``{"source": "local"}``) included, and a placeholder page when it isn't.
+Every response carries a strict CSP (scripts from this origin only, no framing) and
+``nosniff``; the build has no inline script.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from resonant import __version__
 from resonant.config import Settings, is_loopback
@@ -103,6 +104,37 @@ class LoopbackOnly:
         await self.app(scope, receive, send)
 
 
+CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
+SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"content-security-policy", CSP.encode()),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+)
+
+
+class SecurityHeaders:
+    """Adds ``SECURITY_HEADERS`` to every http response."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                message["headers"] = [*message.get("headers", ()), *SECURITY_HEADERS]
+            await send(message)
+
+        await self.app(scope, receive, with_headers)
+
+
 def _loopback_request(scope: Scope) -> bool:
     # No client address (an in-process caller, never a TCP peer) passes; the bind is loopback.
     client = scope.get("client")
@@ -139,6 +171,7 @@ async def _runner_missing(state: DaemonState) -> list[str] | None:
 def create_app(state: DaemonState, *, dashboard_dist: Path | None = None) -> FastAPI:
     app = FastAPI(title="resonant", version=__version__, docs_url=None, redoc_url=None)
     app.add_middleware(LoopbackOnly)
+    app.add_middleware(SecurityHeaders)  # outermost: the 403s carry them too
     dist = DASHBOARD_DIST if dashboard_dist is None else dashboard_dist
 
     # Handlers are async so they run on the event loop thread that owns the sqlite connection.
@@ -194,11 +227,8 @@ def create_app(state: DaemonState, *, dashboard_dist: Path | None = None) -> Fas
             channel=None if state.monitor is None else state.monitor.channel,
         )
 
-    @app.get("/config.json")
-    async def dashboard_config() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        return {"source": "local"}
-
-    # Last, so the routes above win over files of the same name in the build.
+    # Last, so the routes above win over files of the same name in the build. The build's
+    # config.json is served from it ({"source": "local"}; the Fly relay ships its own).
     if (dist / "index.html").is_file():
         app.mount("/", StaticFiles(directory=dist, html=True), name="dashboard")
     else:

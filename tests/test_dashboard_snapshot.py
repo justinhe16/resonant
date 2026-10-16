@@ -183,7 +183,7 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
         tier="local",
         taken_at=_dt(rng),
         version=rng.choice(["0.1.0", "deadbeef"]),
-        started_at=_maybe(rng, _dt(rng)),
+        started_at=_dt(rng),
         last_tick=_maybe(rng, _dt(rng)),
         autonomy=rng.choice(["on", "off"]),
         paused=rng.random() < 0.5,
@@ -336,7 +336,7 @@ def test_remote_carries_no_text_over_random_snapshots(seed: int) -> None:
 
 def test_empty_db(db: sqlite3.Connection) -> None:
     settings = load_settings()
-    s = build_snapshot(db, settings, version="0.1.0")
+    s = build_snapshot(db, settings, started_at=utcnow(), version="0.1.0")
     data = s.model_dump(mode="json")
     assert data["schema"] == 1 and data["tier"] == "local"
     assert data["autonomy"] == "on" and data["paused"] is False and data["dry_run"] is True
@@ -521,7 +521,9 @@ def test_remote_over_random_stores(db: sqlite3.Connection, seed: int) -> None:
     for i in range(rng.randint(0, 5)):
         pulse.upsert(db, "core", f"k{i}", _text(rng), "normal", None, False, 3600, now)
     kv_set(db, "health.loop", {"state": "degraded", "since": iso(now), "detail": _text(rng)})
-    local = build_snapshot(db, load_settings(), runner_missing=[_text(rng)], now=now)
+    local = build_snapshot(
+        db, load_settings(), started_at=now, runner_missing=[_text(rng)], now=now
+    )
     assert SECRET in json.dumps(local.model_dump(mode="json"))
     _check_remote(to_remote(local))
 
@@ -547,7 +549,7 @@ def test_rows_with_bad_identifiers_are_left_out(db: sqlite3.Connection) -> None:
     ext_store.save_extension(db, ext("Bad.Ext", []))
     jobs = [{"id": "Bad.Id", "schedule": "0 8 * * *"}, {"id": "ok-job", "schedule": "0 8 * * *"}]
     ext_store.save_extension(db, ext("github", jobs))
-    s = build_snapshot(db, load_settings(), now=now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now)
     assert [h.name for h in s.health][-1] == "ext:github"
     assert "ext:Bad Name" not in {h.name for h in s.health}
     assert [(e.name, [j.id for j in e.jobs]) for e in s.extensions] == [("github", ["ok-job"])]
@@ -565,3 +567,16 @@ def test_to_remote_validates() -> None:
 def test_code_version_is_a_sha_or_the_package_version() -> None:
     v = snap.code_version()
     assert re.fullmatch(r"[0-9a-f]{8}", v) or v == __version__
+
+
+UI_FIXTURES = Path(__file__).resolve().parents[1] / "dashboard" / "src" / "test" / "fixtures"
+
+
+@pytest.mark.parametrize("name", ["empty", "local", "remote"])
+def test_the_ui_fixtures_match_the_schema(name: str) -> None:
+    """DB-2's fixtures are real snapshots, so the UI is tested on the shape the daemon sends."""
+    data = json.loads((UI_FIXTURES / f"{name}.json").read_text())
+    parsed = Snapshot.model_validate(data)  # extra="forbid": nothing extra, nothing renamed
+    if parsed.tier == "remote":
+        _check_remote(parsed)
+        assert to_remote(parsed) == parsed

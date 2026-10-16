@@ -223,7 +223,7 @@ class Snapshot(_Model):
     tier: Tier
     taken_at: datetime
     version: Version
-    started_at: datetime | None
+    started_at: datetime  # when the daemon started
     last_tick: datetime | None
     autonomy: Literal["on", "off"]
     paused: bool
@@ -391,7 +391,7 @@ def build_snapshot(
     conn: sqlite3.Connection,
     settings: Settings,
     *,
-    started_at: datetime | None = None,
+    started_at: datetime,
     last_tick: datetime | None = None,
     slots: SlotPool | None = None,
     runner_missing: Sequence[str] | None = None,

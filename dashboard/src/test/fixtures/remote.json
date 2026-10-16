@@ -68,7 +68,7 @@
   "extensions": [
     {
       "name": "github",
-      "status": "active",
+      "status": "enabled",
       "health": "ok",
       "jobs": [
         {
@@ -89,7 +89,7 @@
     },
     {
       "name": "weather",
-      "status": "active",
+      "status": "enabled",
       "health": "degraded",
       "jobs": [
         {
@@ -103,7 +103,7 @@
     },
     {
       "name": "notes-sync",
-      "status": "muted",
+      "status": "disabled",
       "health": "unknown",
       "jobs": []
     }

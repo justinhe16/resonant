@@ -65,7 +65,7 @@ describe("Dashboard, local tier", () => {
 
     await user.click(within(nav).getByRole("link", { name: /Rules/ }));
     expect(await screen.findByText("ask merge on trading")).toBeInTheDocument();
-    expect(screen.getByText("unprotected")).toBeInTheDocument();
+    expect(screen.getByText("no CI")).toBeInTheDocument();
   });
 
   it("shows open counts on the tabs", async () => {

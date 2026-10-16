@@ -7,8 +7,6 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 dist/
-# ...except the committed dashboard build (docs/dashboard-plan.md D7)
-!dashboard/dist/
 build/
 
 # Env / secrets — never commit

@@ -38,7 +38,7 @@ Snapshot {
 }
 ```
 
-Field names may be adjusted by DB-1 with the UI ticket told; `remote` never gains a text field without a plan change. DB-1 changed: `pulse.items[]` gained `source` and `state` is `new|told`; `repos[].protected` became `ci` (protection isn't stored, only a GitHub call knows it). The exact shape is `docs/snapshot.schema.json`; the field notes are in `interfaces.md` (Dashboard snapshot).
+Field names may be adjusted by DB-1 with the UI ticket told; `remote` never gains a text field without a plan change. DB-1 changed: `pulse.items[]` gained `source` and `state` is `new|told`; `repos[].protected` became `ci` (protection isn't stored, only a GitHub call knows it); `extensions[].status` is `enabled|disabled|disabled_tampered`; `approvals.items[].code` may be null; `started_at` is never null. The UI's types and fixtures follow, and a Python test validates the fixtures against the models. The exact shape is `docs/snapshot.schema.json`; the field notes are in `interfaces.md` (Dashboard snapshot).
 
 ## 4. Tickets
 

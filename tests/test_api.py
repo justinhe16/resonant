@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ from fastapi import FastAPI
 from starlette.types import Message
 
 from resonant.api import (
+    CSP,
+    DASHBOARD_DIST,
     RUNNER_CHECK_FAILED,
     DaemonState,
     LoopbackOnly,
@@ -231,11 +234,10 @@ async def test_placeholder_when_the_build_is_missing(
 ) -> None:
     async with _client(_app(db, tmp_path / "nope")) as client:
         r = await client.get("/")
-        config = (await client.get("/config.json")).json()
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/html")
     assert "dashboard/dist" in r.text and "/api/dashboard" in r.text
-    assert config == {"source": "local"}
+    assert r.headers["content-security-policy"] == CSP
 
 
 async def test_serves_the_build(db: sqlite3.Connection, tmp_path: Path) -> None:
@@ -243,7 +245,7 @@ async def test_serves_the_build(db: sqlite3.Connection, tmp_path: Path) -> None:
     (dist / "assets").mkdir(parents=True)
     (dist / "index.html").write_text("<!doctype html><title>UI</title>")
     (dist / "assets" / "app.js").write_text("console.log(1)")
-    (dist / "config.json").write_text('{"source": "supabase"}')
+    (dist / "config.json").write_text('{"source": "local"}')
     (tmp_path / "secret.txt").write_text("outside")
     async with _client(_app(db, dist)) as client:
         index = await client.get("/")
@@ -257,6 +259,24 @@ async def test_serves_the_build(db: sqlite3.Connection, tmp_path: Path) -> None:
     assert leak.status_code == 404  # a symlink out of the build is never followed
     assert index.status_code == 200 and "<title>UI</title>" in index.text
     assert js.status_code == 200 and js.text == "console.log(1)"
-    assert config == {"source": "local"}  # the daemon is always the local source
+    assert config == {"source": "local"}  # the build's own config.json
     assert api.status_code == 200 and api.json()["tier"] == "local"
     assert outside.status_code == 404 and missing.status_code == 404
+    for r in (index, js, api, missing):
+        assert r.headers["content-security-policy"] == CSP
+        assert r.headers["x-content-type-options"] == "nosniff"
+    assert "script-src 'self';" in CSP and "frame-ancestors 'none'" in CSP
+
+
+async def test_serves_the_committed_build(db: sqlite3.Connection) -> None:
+    """The real dashboard/dist (DB-2): index.html, its relative assets, the local config."""
+    async with _client(_app(db, DASHBOARD_DIST)) as client:
+        index = await client.get("/")
+        config = (await client.get("/config.json")).json()
+        assets = re.findall(r'(?:src|href)="\./([^"]+)"', index.text)
+        assert assets  # the theme script, the bundle, the stylesheet
+        for path in assets:
+            assert (await client.get(f"/{path}")).status_code == 200, path
+    assert index.status_code == 200 and '<div id="root">' in index.text
+    assert "<script>" not in index.text  # no inline script: the CSP allows none
+    assert config == {"source": "local"}

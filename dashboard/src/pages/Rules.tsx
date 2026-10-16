@@ -32,11 +32,8 @@ export function Rules({ rules, repos }: { rules: TrustRule[]; repos: Repo[] }) {
                     {r.mode} · base {r.base}
                   </p>
                 </div>
-                {r.protected ? (
-                  <StateBadge tone="ok">protected</StateBadge>
-                ) : (
-                  <Badge tone="warn">unprotected</Badge>
-                )}
+                {r.ci === true && <StateBadge tone="ok">CI</StateBadge>}
+                {r.ci === false && <Badge tone="warn">no CI</Badge>}
               </Row>
             ))}
           </Rows>
