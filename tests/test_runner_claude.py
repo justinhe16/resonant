@@ -708,11 +708,19 @@ async def test_ambiguous_unknown_and_no_access_repos(
     assert runs_store.recent(db) == [] and repo_store.get(db, "them/secret") is None
 
 
-async def test_fork_mode_repo_is_refused_for_now(tmp_path: Path, db: sqlite3.Connection) -> None:
+async def test_fork_mode_repo_needs_the_public_repo_token(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    # The public_repo token is optional for the runner; only a fork run asks for it.
     h = build(tmp_path, db, github=FakeGitHub([RepoInfo("up/stream", "main", False, False, True)]))
+    assert await h.runner.setup_missing() is None
     res = await h.runner.start_run("github.com/up/stream", "x", "owner")
-    assert res == Refused("Upstream PRs come in a later update.")
-    repo = repo_store.get(db, "up/stream")  # registered, so the next version finds it
+    assert res == Refused("A fork run asks you before its upstream PR, and asking isn't set up.")
+    h.runner.trust = cast(Any, object())  # any asker: the token is what is missing now
+    res = await h.runner.start_run("github.com/up/stream", "x", "owner")
+    assert res == Refused(claude_mod.FORK_NEEDS_PUBLIC_REPO)
+    assert "runner/github_public_token" in res.reason
+    repo = repo_store.get(db, "up/stream")  # registered, so the next try finds it
     assert repo is not None and repo.mode == "fork" and not repo.quote_ask
     assert runs_store.recent(db) == []
 

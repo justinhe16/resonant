@@ -100,6 +100,11 @@ Rule = Literal["allow", "ask", "ask_code"]
 # never come from a model; ``summarize`` cleans it anyway.
 SummaryAction = Callable[[Intent], str | None]
 
+# A tool's level for one call, when it depends on the call (``merge_run`` follows the trust
+# rules). None keeps the registered level. Only L2 and L3 may be chosen, and only for a tool
+# registered at one of them: an override never makes a tool skip the L1 code or the L0 path.
+LevelFor = Callable[[Intent], Level | None]
+
 # The approver names an extension's manifest declares (``Manifest.approvers``). Untrusted:
 # the gate keeps only names that hold the approve grant for that extension.
 ApproversFor = Callable[[str], Sequence[str]]
@@ -143,6 +148,7 @@ class PolicyGate:
         approval_ttl_s: float,
         actions: Mapping[ToolKey, SummaryAction] | None = None,
         approvers_for: ApproversFor = no_manifest_approvers,
+        levels: Mapping[ToolKey, LevelFor] | None = None,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self.conn = conn
@@ -152,6 +158,7 @@ class PolicyGate:
         self.ttl = timedelta(seconds=approval_ttl_s)
         self.actions = dict(actions or {})
         self.approvers_for = approvers_for
+        self.levels = dict(levels or {})
         self.clock = clock
         self._tokens: dict[str, str] = {}
 
@@ -199,7 +206,7 @@ class PolicyGate:
         l0_read = intent.effect is Effect.READ and intent.level is Level.L0
         if self.dry_run and not l0_read and not is_store_internal(intent.spec):
             return DryRun(would=self._summary(intent))
-        verdict = rule(intent.level, intent.origin, autonomy)
+        verdict = rule(self._level(intent), intent.origin, autonomy)
         if verdict == "allow" and intent.level is Level.L0:
             return self._allow(intent)
         if ap.was_rejected(self.conn, intent.task_id, intent.hash):
@@ -208,6 +215,16 @@ class PolicyGate:
         if verdict == "allow":
             return self._allow(intent)
         return self._ask(intent, now, last, require_code=verdict == "ask_code")
+
+    def _level(self, intent: Intent) -> Level:
+        """The registered level, or the tool's ``levels`` choice between L2 and L3 for this
+        call (see ``LevelFor``)."""
+        level = intent.level
+        pick = self.levels.get((intent.extension, intent.tool))
+        if pick is None or level not in (Level.L2, Level.L3):
+            return level
+        chosen = pick(intent)
+        return chosen if chosen is Level.L2 or chosen is Level.L3 else level
 
     def _summary(self, intent: Intent) -> str:
         """The code-built summary, with the tool's action heading if it has one."""

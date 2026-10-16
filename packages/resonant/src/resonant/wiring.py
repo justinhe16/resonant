@@ -276,6 +276,12 @@ def build_imessage_stack(
     )
     components.runners[jobs.name] = jobs
     loop.runners[jobs.name] = jobs
+    trust = TrustChecks(
+        conn,
+        channel,
+        components.principals,
+        approval_ttl_s=settings.gate.approval_ttl_s,
+    )
     claude = ClaudeRunner(
         conn,
         runner=settings.runner,
@@ -285,6 +291,7 @@ def build_imessage_stack(
         max_runs=max(1, settings.claude.max_concurrent - settings.claude.reserved_oncall_slots),
         create_task=loop.create_task,
         cancel_task=loop.cancel,
+        trust=trust,
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
@@ -325,11 +332,6 @@ def build_imessage_stack(
         claude=claude,
         notifier=notifier,
         pulse=pulse,
-        trust=TrustChecks(
-            conn,
-            channel,
-            components.principals,
-            approval_ttl_s=settings.gate.approval_ttl_s,
-        ),
+        trust=trust,
         _close_model=close_model,
     )

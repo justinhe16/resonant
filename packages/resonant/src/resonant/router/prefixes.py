@@ -211,7 +211,8 @@ _INTENT_RULES: dict[IntentLabel, str] = {
         "names no repo, don't guess: ask which repo, naming the recent ones. For cancel_run and "
         "merge_run, pass the run code (like R3) from the message or the earlier replies; if you "
         "can't tell which run, call list_runs first. Call merge_run only when the owner asks to "
-        "merge."
+        'merge. When the owner asks for the work and also to merge it ("fix X and merge it"), '
+        "pass merge=true to start_run."
     ),
     "rules": (
         "Trust rules decide when Claude runs ask the owner first and when Resonant texts right "

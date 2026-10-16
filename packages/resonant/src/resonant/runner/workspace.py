@@ -87,7 +87,13 @@ from resonant.store import repos as repo_store
 from resonant.store.db import atomic
 from resonant.store.repos import Repo
 
-UPSTREAM_LATER = "Upstream PRs come in a later update."
+FORK_NEEDS_PUBLIC_REPO = (
+    "A fork run needs a classic GitHub token with only the public_repo scope. On the Mini: "
+    "resonant secret set runner/github_public_token."
+)
+FORK_READY_TRIES = 6  # GitHub makes a new fork in the background; the clone waits for it
+FORK_READY_WAIT_S = 5.0  # the first wait, doubled each try
+UPSTREAM_BODY_MAX = 4000
 GIT_TIMEOUT_S = 300.0
 GH_TIMEOUT_S = 120.0
 COMMITTER_NAME = "Resonant runner"
@@ -147,6 +153,11 @@ class NoChanges(RunnerError):
 
 class MergeRefused(RunnerError):
     pass
+
+
+def upstream_merges(slug: str) -> str:
+    """Why a fork-mode repo's PR is never merged by Resonant (docs/repos-plan.md D3)."""
+    return f"{slug} is upstream; its maintainers merge."
 
 
 # --- helpers -----------------------------------------------------------------------------
@@ -538,6 +549,39 @@ def _https_url(repo: Repo) -> str:
     return f"https://{repo.remote}"
 
 
+def _slug_url(slug: str) -> str:
+    return f"https://github.com/{slug}"
+
+
+@dataclass(frozen=True)
+class ForkChange:
+    """What a fork run's branch holds, read from the daemon-only mirror: the tip commit's
+    subject and body (the upstream PR's title and description) and the diff's size."""
+
+    title: str
+    body: str
+    files: int
+    insertions: int
+    deletions: int
+
+    @property
+    def stat(self) -> str:
+        files = f"{self.files} file" + ("" if self.files == 1 else "s")
+        return f"+{self.insertions}/-{self.deletions}, {files}"
+
+    @property
+    def what(self) -> str:
+        """The external_pr check's text: the size first, so a long title can't clip it."""
+        return f"{self.stat}: {self.title}"
+
+
+@dataclass(frozen=True)
+class ForkCheck:
+    head_sha: str
+    result: CheckResult
+    change: ForkChange
+
+
 # --- the workspace -----------------------------------------------------------------------
 
 
@@ -548,11 +592,16 @@ class Workspace:
         conn: sqlite3.Connection,
         *,
         url_for: Callable[[Repo], str] | None = None,
+        fork_url_for: Callable[[str], str] | None = None,
+        fork_wait_s: float = FORK_READY_WAIT_S,
     ) -> None:
         self.cfg = cfg
         self.conn = conn  # the repo registry (store.repos)
         # The git URL of a repo. Always https without credentials; tests point it at a path.
         self._url_for: Callable[[Repo], str] = url_for or _https_url
+        # ... and of the owner's fork of a fork-mode repo, by its ``owner/name``.
+        self._fork_url_for: Callable[[str], str] = fork_url_for or _slug_url
+        self.fork_wait_s = fork_wait_s
         self._locks: dict[str, asyncio.Lock] = {}
         self._git_bin = str(cfg.git_path)
 
@@ -714,31 +763,39 @@ class Workspace:
 
         return git
 
-    async def ensure_checkout(self, repo: Repo, token: str) -> Path:
+    async def ensure_checkout(
+        self, repo: Repo, token: str | None, *, fork: str | None = None
+    ) -> Path:
         """The owner's checkout of ``repo``, cloned (https, no credentials in the URL; the
         daemon's token by credential helper for this call only) when nothing is there. An
         existing one must be a git checkout whose ``origin`` is this repo. Caller holds the
-        checkout lock."""
+        checkout lock.
+
+        For a fork-mode repo, ``fork`` is the owner's fork (``owner/name``): the checkout's
+        ``origin`` is the fork, and a fresh clone also gets an ``upstream`` remote for the
+        original. Both are public, so no token is used."""
         path = self.checkout_path(repo)
         self._check_checkout_place(path)
-        url = self._url_for(repo)
+        url = self._url_for(repo) if fork is None else self._fork_url_for(fork)
+        want = repo.slug if fork is None else fork
         if not await asyncio.to_thread(os.path.lexists, path):
             path.parent.mkdir(parents=True, exist_ok=True)
             # cloned beside the final place and renamed in, so a clone cut short (a cancel, a
             # kill) never leaves a half checkout in the way of the next run
             tmp = Path(tempfile.mkdtemp(prefix=f".{path.name}.clone-", dir=path.parent))
             try:
-                await self._git(["clone", "-q", "--", url, str(tmp)], token=token,
-                                extra=_CHECKOUT_CONFIG)  # fmt: skip
+                await self._clone(url, tmp, token, fork=fork is not None)
+                if fork is not None:  # ours, just made: the original as ``upstream``
+                    await self._in_checkout(tmp, "remote", "add", "upstream", self._url_for(repo))
                 os.chmod(tmp, 0o755)  # noqa: S103  # a normal checkout, not mkdtemp's 0700
                 os.rename(tmp, path)
             except GitError as e:
-                raise RunnerError(f"cloning {repo.slug} failed: {e.message[-120:]}") from None
+                raise RunnerError(f"cloning {want} failed: {e.message[-120:]}") from None
             finally:
                 with contextlib.suppress(OSError):
                     await asyncio.to_thread(rmtree_nofollow, tmp)
             return path
-        not_ours = RunnerError(f"{path} is in the way: it isn't a git checkout of {repo.slug}")
+        not_ours = RunnerError(f"{path} is in the way: it isn't a git checkout of {want}")
         if not await asyncio.to_thread(path.is_dir):
             raise not_ours
         if not await asyncio.to_thread(os.path.lexists, path / ".git"):
@@ -755,9 +812,26 @@ class Workspace:
             raise not_ours
         origin_url = origin.decode().strip()
         slug = remote_slug(origin_url)
-        if origin_url != url and (slug is None or slug.lower() != repo.slug.lower()):
-            raise RunnerError(f"{path}'s origin isn't {repo.slug}")
+        if origin_url != url and (slug is None or slug.lower() != want.lower()):
+            raise RunnerError(f"{path}'s origin isn't {want}")
         return path
+
+    async def _clone(self, url: str, dest: Path, token: str | None, *, fork: bool) -> None:
+        """``git clone`` into an empty ``dest``. A fork GitHub is still making isn't there
+        yet: the clone is tried again a few times, waiting longer each time."""
+        wait = self.fork_wait_s
+        for attempt in range(FORK_READY_TRIES if fork else 1):
+            try:
+                await self._git(["clone", "-q", "--", url, str(dest)], token=token,
+                                extra=_CHECKOUT_CONFIG)  # fmt: skip
+                return
+            except GitError:
+                if attempt + 1 >= (FORK_READY_TRIES if fork else 1):
+                    raise
+            await asyncio.to_thread(rmtree_nofollow, dest)  # a failed clone may leave files
+            await asyncio.to_thread(dest.mkdir, mode=0o700)
+            await asyncio.sleep(wait)
+            wait *= 2
 
     def _check_checkout_place(self, path: Path) -> None:
         """A checkout (a repo's ``path``) may not sit in or over Resonant's own dirs: the run,
@@ -770,11 +844,18 @@ class Workspace:
         ):
             raise RunnerError(f"{path} can't be a checkout: it overlaps Resonant's own dirs")
 
-    async def prepare(self, code: str, repo_name: str, ask: str, *, github_token: str) -> Prepared:
+    async def prepare(
+        self, code: str, repo_name: str, ask: str, *, github_token: str, fork: str | None = None
+    ) -> Prepared:
         """Make the run's places: the checkout (cloned on first use) fetched, a worktree on a
         new branch from ``origin/<base>`` with the checkout's local config linked in, and the
         run dir. Notes whether the base has CI. All of it before the session exists; the
         checkout's working tree and current branch are never touched.
+
+        For a fork-mode repo, ``fork`` is the owner's fork (``ensure_fork``): the checkout is
+        the fork's, and the worktree starts from the original's base, fetched (no token, both
+        are public) into ``refs/remotes/upstream/<base>``. CI isn't looked at (theirs runs on
+        their side).
 
         A leftover worktree or run dir (a crash before the session started) is removed and
         rebuilt."""
@@ -783,14 +864,15 @@ class Workspace:
         repo = self._repo(repo_name)
         branch = branch_name(code, ask)
         worktree = self.worktree_path(repo.name, code)
+        token = github_token if fork is None else None
         async with self.checkout_lock(repo.name):
-            checkout = await self.ensure_checkout(repo, github_token)
-            tracking = f"refs/remotes/origin/{repo.base}"
+            checkout = await self.ensure_checkout(repo, token, fork=fork)
+            tracking = f"refs/remotes/{'origin' if fork is None else 'upstream'}/{repo.base}"
             try:
                 await self._in_checkout(
                     checkout, "fetch", "-q", "--no-tags", "--no-write-fetch-head",
                     self._url_for(repo), f"+refs/heads/{repo.base}:{tracking}",
-                    token=github_token,
+                    token=token,
                 )  # fmt: skip
             except GitError as e:
                 raise RunnerError(
@@ -810,7 +892,7 @@ class Workspace:
             # reply says so, and merging is what's refused (after a look at the mirror). The
             # checkout is worker-writable, so its word only ever lowers what is recorded: a
             # repo recorded without CI is only raised by the mirror (``_recheck_ci``).
-            if not has_ci or repo.ci is None:
+            if fork is None and (not has_ci or repo.ci is None):
                 with atomic(self.conn):
                     repo_store.set_ci(self.conn, repo.slug, has_ci)
 
@@ -951,12 +1033,24 @@ class Workspace:
         return await self._gh(args, secrets, stdin=stdin)
 
     async def _gh(
-        self, args: Sequence[str], secrets: RunnerSecrets, *, stdin: bytes | None = None
+        self,
+        args: Sequence[str],
+        secrets: RunnerSecrets,
+        *,
+        stdin: bytes | None = None,
+        public: bool = False,
     ) -> Exec:
+        """``gh`` with the daemon's token, or with ``public`` the ``public_repo`` token (fork
+        mode only: making the fork, and opening or closing the upstream PR)."""
+        token = secrets.github_token
+        if public:
+            if not secrets.github_public_token:
+                raise RunnerError(FORK_NEEDS_PUBLIC_REPO)
+            token = secrets.github_public_token
         # Everything gh reads or writes lives in one throwaway dir; the token is in its
         # hosts.yml (which gh prefers to the Keychain) and never in env or argv.
         with secret_dir(self.cfg.secrets_dir) as tmp:
-            config = write_gh_config(tmp, secrets.github_token)
+            config = write_gh_config(tmp, token)
             env = {
                 "PATH": _SAFE_PATH,
                 "HOME": str(tmp),
@@ -1170,6 +1264,208 @@ class Workspace:
         check_texts(secrets.values(), pr_title=title, pr_body=body)
         return result
 
+    # -- fork mode (docs/employee-plan.md D6, docs/repos-plan.md D3) --
+
+    async def ensure_fork(self, repo_name: str, secrets: RunnerSecrets) -> str:
+        """The owner's fork of a fork-mode repo, made if it isn't there yet
+        (``POST /repos/{upstream}/forks`` with the ``public_repo`` token; GitHub answers with
+        the existing fork when there is one). Then read back and checked: a public fork whose
+        parent is the repo. Returns its ``owner/name``. Raises ``RunnerError``."""
+        repo = self._repo(repo_name)
+        if repo.mode != "fork":
+            raise RunnerError(f"{repo.slug} isn't a fork-mode repo")
+        made = await self._gh(
+            ["api", "-X", "POST", f"repos/{repo.slug}/forks", "-F", "default_branch_only=true"],
+            secrets,
+            public=True,
+        )
+        if made.returncode != 0:
+            raise RunnerError(f"couldn't fork {repo.slug}: {made.stderr[-120:]}")
+        try:
+            slug = str(json.loads(made.stdout)["full_name"])
+        except (ValueError, KeyError, TypeError):
+            raise RunnerError(f"GitHub's answer to forking {repo.slug} wasn't readable") from None
+        if not repo_store.SLUG.fullmatch(slug) or {".", ".."} & set(slug.split("/")):
+            raise RunnerError(f"GitHub's answer to forking {repo.slug} wasn't readable")
+        seen = await self._gh(["api", f"repos/{slug}"], secrets, public=True)
+        try:
+            info: Any = json.loads(seen.stdout) if seen.returncode == 0 else None
+            parent = str(info["parent"]["full_name"])
+            ok = (
+                info["fork"] is True and info["private"] is False and str(info["full_name"]) == slug
+            )
+        except (ValueError, KeyError, TypeError):
+            ok, parent = False, ""
+        if not ok or parent.lower() != repo.slug.lower():
+            raise RunnerError(f"{slug} isn't a public fork of {repo.slug}")
+        return slug
+
+    def _fork_ref(self, code: str) -> str:
+        if not RUN_CODE.fullmatch(code):
+            raise RunnerError(f"bad run code {code!r}")
+        return f"refs/runs/fork-{code}"
+
+    async def fork_change(self, repo_name: str, code: str, base_sha: str) -> ForkChange:
+        """The upstream PR's title, description and size for a fork run's branch, as the
+        last ``check_fork`` fetched it into the mirror. Reads only the mirror."""
+        git = self._mirror_git(repo_name)
+        ref = self._fork_ref(code)
+        if not _SHA.fullmatch(base_sha):
+            raise RunnerError("bad base commit")
+        async with self.mirror_lock(repo_name):
+            message = (await git("log", "-1", "--format=%s%x00%b", ref)).decode(errors="replace")
+            stat = (await git("diff", "--shortstat", f"{base_sha}...{ref}")).decode()
+        title, _, body = message.partition("\0")
+        numbers = {
+            unit: int(m[1]) if (m := re.search(rf"(\d+) {unit}", stat)) else 0
+            for unit in ("file", "insertion", "deletion")
+        }
+        return ForkChange(
+            title=title.strip()[:200] or "Changes from Resonant",
+            body=body.strip()[:UPSTREAM_BODY_MAX],
+            files=numbers["file"],
+            insertions=numbers["insertion"],
+            deletions=numbers["deletion"],
+        )
+
+    async def check_fork(
+        self, repo_name: str, code: str, fork: str, branch: str, base_sha: str,
+        secrets: RunnerSecrets,
+    ) -> ForkCheck:  # fmt: skip
+        """The pre-merge checks, for a fork run's branch before its upstream PR: the branch
+        is fetched from the fork into the daemon-only mirror (with fsck; the session wrote
+        it), then ``run_checks`` over ``merge-base..head`` and the token scan of the title
+        and description. Raises ``NoChanges`` (nothing pushed beyond the base),
+        ``CheckFailed`` or ``RunnerError``."""
+        repo = self._repo(repo_name)
+        if not re.fullmatch(r"[\w./-]+", branch) or ".." in branch or not _SHA.fullmatch(base_sha):
+            raise RunnerError("bad branch reference")
+        url, ref = self._fork_url_for(fork), self._fork_ref(code)
+        listed = await self._git(["ls-remote", "--", url, f"refs/heads/{branch}"])
+        if not listed.strip():
+            raise NoChanges(f"nothing was pushed to {fork}")
+        async with self.mirror_lock(repo_name):
+            mirror = await self._ensure_mirror(repo_name)
+            try:
+                await self._git(
+                    ["-C", str(mirror), "-c", "transfer.fsckObjects=true",
+                     "-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-tags",
+                     "--no-write-fetch-head", url, f"+refs/heads/{branch}:{ref}"],
+                )  # fmt: skip
+            except GitError as e:
+                raise RunnerError(
+                    f"fetching {branch} from {fork} failed: {e.message[-120:]}"
+                ) from None
+            await self._refresh(repo_name, secrets.github_token)  # the upstream base as it is now
+            git = self._mirror_git(repo_name)
+            try:
+                head = (await git("rev-parse", "--verify", f"{ref}^{{commit}}")).decode().strip()
+                ahead = int((await git("rev-list", "--count", f"{base_sha}..{head}")).decode())
+                base_tip = (await git("rev-parse", "--verify", f"refs/heads/{repo.base}")).decode()
+                merge_base = (await git("merge-base", base_tip.strip(), head)).decode().strip()
+            except GitError:
+                raise RunnerError(f"{branch} shares no history with {repo.base}") from None
+            if ahead == 0:
+                raise NoChanges(f"nothing was pushed to {fork} beyond {repo.base}")
+            result = await run_checks(
+                git, base_sha=merge_base, head_sha=head, branch=branch, repo=repo,
+                secrets=secrets.values(),
+            )  # fmt: skip
+        change = await self.fork_change(repo_name, code, base_sha)
+        check_texts(secrets.values(), pr_title=change.title, pr_body=change.body)
+        return ForkCheck(head, result, change)
+
+    async def find_upstream_pr(
+        self, repo_name: str, fork: str, branch: str, secrets: RunnerSecrets
+    ) -> PrInfo | None:
+        """An open PR on the repo from ``fork``'s ``branch`` (one Resonant opened before a
+        crash), read with the daemon's token. None if there is none."""
+        repo = self._repo(repo_name)
+        owner = fork.partition("/")[0].lower()
+        listed = await self._gh(
+            ["pr", "list", "--repo", repo.slug, "--head", branch, "--state", "open", "--json",
+             "number,url,state,baseRefName,headRefOid,isCrossRepository,headRepositoryOwner,"
+             "changedFiles"],
+            secrets,
+        )  # fmt: skip
+        if listed.returncode != 0:
+            raise RunnerError(f"gh pr list failed: {listed.stderr[-120:]}")
+        try:
+            items: list[Any] = json.loads(listed.stdout)
+        except ValueError:
+            raise RunnerError("gh pr list printed something unreadable") from None
+        for item in items:
+            try:
+                login = str(item["headRepositoryOwner"]["login"]).lower()
+                url, head, files = (
+                    str(item["url"]),
+                    str(item["headRefOid"]),
+                    item.get("changedFiles"),
+                )
+                if not item["isCrossRepository"] or login != owner or not _PR_URL.fullmatch(url):
+                    continue
+                return PrInfo(int(item["number"]), url, str(item["state"]),
+                              str(item["baseRefName"]), head,
+                              files if isinstance(files, int) else None)  # fmt: skip
+            except (KeyError, TypeError, ValueError):
+                continue
+        return None
+
+    async def open_upstream_pr(
+        self, repo_name: str, fork: str, branch: str, head_sha: str, change: ForkChange,
+        body: str, secrets: RunnerSecrets,
+    ) -> PrInfo:  # fmt: skip
+        """Open the PR on the original repo from ``fork:branch`` with the ``public_repo``
+        token (``gh pr create --repo <upstream> --head <owner>:<branch>``). Only after the
+        owner's ok on this exact head (the caller's). An open one from an earlier try is
+        reused when it is at ``head_sha``. The new PR is read back; if its head isn't
+        ``head_sha`` (the branch moved while it was being opened) it is closed at once and
+        ``RunnerError`` is raised, so no PR stays open on content the owner didn't see."""
+        repo = self._repo(repo_name)
+        if not _SHA.fullmatch(head_sha):
+            raise RunnerError("bad head commit")
+        found = await self.find_upstream_pr(repo_name, fork, branch, secrets)
+        if found is not None:
+            if found.head_sha != head_sha:
+                raise RunnerError(
+                    f"PR #{found.number} on {repo.slug} is already open from {branch} at another "
+                    f"commit ({found.head_sha[:7]})"
+                )
+            return found
+        owner = fork.partition("/")[0]
+        made = await self._gh(
+            ["pr", "create", "--repo", repo.slug, "--head", f"{owner}:{branch}",
+             "--base", repo.base, "--title", change.title, "--body-file", "-"],
+            secrets, stdin=body.encode(), public=True,
+        )  # fmt: skip
+        m = _PR_URL.search(made.stdout.decode(errors="replace"))
+        if made.returncode != 0 or m is None:
+            raise RunnerError(f"opening the PR on {repo.slug} failed: {made.stderr[-120:]}")
+        number = int(m[1])
+        viewed = await self._gh(
+            ["pr", "view", str(number), "--repo", repo.slug, "--json",
+             "headRefOid,headRefName,isCrossRepository,changedFiles,state,baseRefName"],
+            secrets,
+        )  # fmt: skip
+        try:
+            pr: Any = json.loads(viewed.stdout) if viewed.returncode == 0 else {}
+            head, files = str(pr["headRefOid"]), pr.get("changedFiles")
+            same = head == head_sha and str(pr["headRefName"]) == branch
+        except (ValueError, KeyError, TypeError):
+            head, files, same = "", None, False
+        if not same:
+            closed = await self._gh(
+                ["pr", "close", str(number), "--repo", repo.slug, "--comment",
+                 "Closed by Resonant: the branch moved while this PR was being opened."],
+                secrets, public=True,
+            )  # fmt: skip
+            gone = "closed it" if closed.returncode == 0 else "couldn't close it; close it by hand"
+            raise RunnerError(
+                f"PR #{number} on {repo.slug} isn't at the commit you approved ({gone})"
+            )
+        return PrInfo(number, m[0], "OPEN", repo.base, head,
+                      files if isinstance(files, int) else None)  # fmt: skip
+
     # -- merge --
 
     async def _is_starter_ci_pr(
@@ -1213,6 +1509,8 @@ class Workspace:
         then ``--match-head-commit``. Returns the check result (its flagged paths are what
         the merge reply lists). Raises ``MergeRefused``."""
         repo = self._repo(repo_name)
+        if repo.mode == "fork":
+            raise MergeRefused(upstream_merges(repo.slug))
         if not _SHA.fullmatch(head_sha) or pr_number < 1:
             raise MergeRefused("bad PR reference")
         if (

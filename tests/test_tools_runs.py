@@ -27,6 +27,7 @@ from resonant.runners.claude import MAX_ASK, Cancelled, Merged, Refused, Started
 from resonant.runners.local import report_line
 from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
+from resonant.store import trust as trust_store
 from resonant.store.db import kv_set, utcnow
 from resonant.store.tasks import insert_task
 from resonant.tools import runs as tools
@@ -51,8 +52,10 @@ class FakeRunner:
     async def setup_missing(self) -> str | None:
         return self.missing
 
-    async def start_run(self, repo: str | None, ask: str, principal: str) -> Started | Refused:
-        self.calls.append(("start", repo, ask, principal))
+    async def start_run(
+        self, repo: str | None, ask: str, principal: str, *, merge: bool = False
+    ) -> Started | Refused:
+        self.calls.append(("start", repo, ask, principal, *(["merge"] if merge else [])))
         if self.missing:
             return Refused(self.missing)
         return Started("R1", repo or "", 30)
@@ -194,6 +197,48 @@ def test_merge_is_explicit_or_asks_yes(components: Components, db: sqlite3.Conne
     assert "changes Makefile, package.json" in asked.summary
 
 
+def test_merge_from_chat_follows_the_trust_rules(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    """EM-7: merge per trust rules. A clean run merges from chat without asking when
+    ``merge_decision`` is ok; an ``ask merge`` rule (on the repo, an area of it or ``*``)
+    makes it ask a plain yes; ``/merge`` is explicit either way."""
+    make_run(db, status="ready", pr_number=41, pr_url="https://github.com/own/resonant/pull/41")
+    chosen = components.gate.evaluate(intent(components, "merge_run", {"code": "R1"}))
+    assert isinstance(chosen, Allow)
+    trust_store.add_rule(db, scope="resonant", action="merge", effect="ask",
+                         created_from="chat", now=utcnow())  # fmt: skip
+    asked = components.gate.evaluate(intent(components, "merge_run", {"code": "R1"}))
+    assert isinstance(asked, NeedsApproval) and asked.level is Level.L2
+    assert not asked.require_code
+    typed = components.gate.evaluate(
+        intent(components, "merge_run", {"code": "R1"}, origin="explicit")
+    )
+    assert isinstance(typed, Allow)
+    rows = db.execute(
+        "SELECT decision AS d FROM audit_log WHERE action = 'trust.merge' ORDER BY id"
+    ).fetchall()
+    assert [r["d"] for r in rows][:2] == ["ok", "ask"]
+
+
+def test_merge_level_never_lowers_a_fork_or_unknown_run(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    repo_store.add(db, "up/stream", base="main", source="auto", mode="fork")
+    fork = runs_store.create(db, repo="stream", ask="x", principal=OWNER, session_id="f",
+                             max_seconds=60)  # fmt: skip
+    runs_store.update(db, fork.code, status="ready", pr_number=7)
+    asked = components.gate.evaluate(intent(components, "merge_run", {"code": fork.code}))
+    assert isinstance(asked, NeedsApproval)  # the runner refuses it anyway
+    missing = components.gate.evaluate(intent(components, "merge_run", {"code": "R99"}))
+    assert isinstance(missing, NeedsApproval)
+    # autonomy off: every L2/L3 call asks, whatever the rules say
+    make_run(db, status="ready", pr_number=41)
+    kv_set(db, "autonomy", "off")
+    off = components.gate.evaluate(intent(components, "merge_run", {"code": "R2"}))
+    assert isinstance(off, NeedsApproval)
+
+
 def test_dry_run_merge_names_the_pr(db: sqlite3.Connection, settings: Settings) -> None:
     shutil.copy(REPO / "config/principals.example.yaml", settings.principals_path)
     settings = settings.model_copy(update={"dry_run": True})
@@ -321,7 +366,7 @@ async def test_list_runs_never_exposes_approval_codes(
     components: Components, runner: FakeRunner, db: sqlite3.Connection
 ) -> None:
     """A pending approval's code is in no run tool's result (run codes are not approval codes)."""
-    make_run(db, status="ready", pr_number=1)
+    make_run(db, status="ready", pr_number=1, flagged_paths=["Makefile"])  # so a chat merge asks
     asked = components.gate.evaluate(intent(components, "merge_run", {"code": "R1"}))
     assert isinstance(asked, NeedsApproval)
     for name, args in (("list_runs", {}), ("list_runs", {"code": "R1"})):
