@@ -74,12 +74,20 @@ class UsageError(ValueError):
         self.reply = reply
 
 
+def _no_repo(word: str) -> bool:
+    return False
+
+
 @dataclass(frozen=True)
 class ParseContext:
-    """What a parser may need besides the text: the clock (aware, UTC) and the owner's zone."""
+    """What a parser may need besides the text: the clock (aware, UTC), the owner's zone and,
+    for ``/run``, whether a word names a repo the owner already has (``owner/name`` or a
+    GitHub URL, a registered name or alias, an enabled extension's link). The fast path fills
+    ``is_repo`` from the store; without one no bare word is taken for a repo."""
 
     now: datetime = field(default_factory=utcnow)
     tz: str = "UTC"
+    is_repo: Callable[[str], bool] = _no_repo
 
 
 Parse = Callable[[str, ParseContext], dict[str, Any]]
@@ -194,22 +202,98 @@ def logs_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
     return {"n": min(int(m.group(1)), LOGS_MAX)}
 
 
-_REPO = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.ASCII)
+# A repo word as the resolver takes it: a name, ``owner/name`` or a GitHub URL.
+_REPO_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/@#?=&%+-]{0,199}", re.ASCII)
+_MERGE_FLAG = re.compile(r"(?:^|\s)--merge(?=\s|$)")
+REPO_ARG_MAX = 200  # tools/runs.REPO_MAX
 
 
 def run_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
-    """``/run <repo> <ask>``: a repo name (lowercased) and the ask as typed, reported now
-    (EM-6). Whether the repo is configured is the tool's to say."""
-    parts = rest.split(maxsplit=1)
+    """``/run [<repo>] <ask> [--merge]``, reported now (EM-6).
+
+    The first word is the repo when ``ctx.is_repo`` knows it (``owner/name``, a GitHub URL,
+    a registered name or alias, an extension's link), or when it ends with ``:``
+    (``/run blog: fix the footer``), which takes it as a repo whatever it is, so the resolver
+    may look it up on GitHub (fuzzy). Otherwise the whole text is the ask of a run with no
+    repo (a scratch dir), and the reply says so. So ``/run fix the flaky test`` never takes
+    ``fix`` for a repo. ``--merge`` (a word of its own) asks for the merge on green; it needs
+    a repo. Whether the repo resolves is the tool's to say."""
+    ctx = ctx or ParseContext()
+    merge = bool(_MERGE_FLAG.search(rest))
+    text = _MERGE_FLAG.sub(" ", rest).strip()
+    parts = text.split(maxsplit=1)
     if not parts:
         raise UsageError
-    repo = parts[0].lower()
-    if not _REPO.fullmatch(repo):
-        raise UsageError("that's not a repo name")
-    if len(parts) < 2:
-        raise UsageError("say what to do")
+    first = parts[0]
+    repo: str | None = None
+    if first.endswith(":") and len(first) > 1:
+        repo = first[:-1]
+        if not _REPO_WORD.fullmatch(repo):
+            raise UsageError("that's not a repo name")
+    elif _REPO_WORD.fullmatch(first.rstrip(",")) and ctx.is_repo(first.rstrip(",")):
+        repo = first.rstrip(",")
+    if repo is None:
+        if merge:
+            raise UsageError("--merge needs a repo")
+        ask = text
+    else:
+        if len(parts) < 2:
+            raise UsageError("say what to do")
+        ask = parts[1]
     # an explicit /run is watched: its end is texted right away, not held for the digest
-    return {"repo": repo, "ask": _text(parts[1], ASK_MAX), "report": "now"}
+    args: dict[str, Any] = {"ask": _text(ask, ASK_MAX), "report": "now"}
+    if repo is not None:
+        args["repo"] = repo
+    if merge:
+        args["merge"] = True
+    return args
+
+
+def _repo_arg(rest: str, *, what: str = "say which repo") -> str:
+    word = rest.strip()
+    if not word:
+        raise UsageError(what)
+    if " " in word or not _REPO_WORD.fullmatch(word):
+        raise UsageError("that's not a repo name")
+    return word
+
+
+def repo_add_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
+    """``/repo add <owner/name|url|name> [as <name>]``."""
+    words = rest.split()
+    if len(words) == 3 and words[1].lower() == "as":
+        if not _SUB_WORD.fullmatch(words[2].lower()):
+            raise UsageError("that's not a usable name")
+        return {"repo": _repo_arg(words[0]), "name": words[2].lower()}
+    if len(words) != 1:
+        raise UsageError("one repo, then optionally: as <name>" if words else "say which repo")
+    return {"repo": _repo_arg(words[0])}
+
+
+def repo_one_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
+    """``/repo forget <x>``."""
+    return {"repo": _repo_arg(rest)}
+
+
+def repo_new_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
+    """``/repo new <name> [public]``: private unless ``public`` follows."""
+    words = rest.split()
+    if not words:
+        raise UsageError("say the new repo's name")
+    if len(words) > 2 or (len(words) == 2 and words[1].lower() not in ("public", "private")):
+        raise UsageError("a name, then optionally: public")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", words[0]):
+        raise UsageError("a repo name may only use letters, digits, '.', '_' and '-'")
+    return {"name": words[0], "private": not (len(words) == 2 and words[1].lower() == "public")}
+
+
+def repo_ci_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
+    """``/repo ci <repo> [merge]``: the args of ``add_ci``, or of ``merge_ci_pr`` with
+    ``merge`` (see ``Command.resolve``: the sub's ``tool`` is picked by ``REPO_CI``)."""
+    words = rest.split()
+    if not words or len(words) > 2 or (len(words) == 2 and words[1].lower() != "merge"):
+        raise UsageError("say which repo" if not words else "a repo, then optionally: merge")
+    return {"repo": _repo_arg(words[0])}
 
 
 def _run_code(rest: str) -> str:
@@ -248,6 +332,15 @@ class Sub:
     usage: str = ""
     description: str = ""
     level: str = ""
+    # (last word, tool): when the sub's text ends with that word, that tool runs instead
+    # (``/repo ci blog merge`` is ``merge_ci_pr``). The word is code's, like ``word``.
+    alt: tuple[str, str] | None = None
+
+    def tool_for(self, rest: str) -> str | None:
+        words = rest.split()
+        if self.alt is not None and len(words) > 1 and words[-1].lower() == self.alt[0]:
+            return self.alt[1]
+        return self.tool
 
 
 @dataclass(frozen=True)
@@ -266,7 +359,9 @@ class Command:
     def tools(self) -> tuple[str, ...]:
         """Every tool the command can call: its own, then its subcommands'."""
         own = (self.tool,) if self.tool is not None else ()
-        return (*own, *(s.tool for s in self.subs if s.tool is not None))
+        subs = (s.tool for s in self.subs if s.tool is not None)
+        alts = (s.alt[1] for s in self.subs if s.alt is not None)
+        return (*own, *subs, *alts)
 
     def resolve(
         self, rest: str, ctx: ParseContext
@@ -282,13 +377,17 @@ class Command:
             first = _word(parts[0]) if parts else ""
             for sub in self.subs:
                 if first == sub.word:
+                    sub_rest = parts[1] if len(parts) == 2 else ""
                     try:
-                        args = sub.parse(parts[1] if len(parts) == 2 else "", ctx)
+                        args = sub.parse(sub_rest, ctx)
                     except UsageError as e:
                         if e.usage is None and sub.usage:
                             e.usage = sub.usage
                         raise
-                    return sub.word, sub.tool, args
+                    tool = sub.tool_for(sub_rest)
+                    alt = sub.alt
+                    word = f"{sub.word} {alt[0]}" if alt and tool == alt[1] else sub.word
+                    return word, tool, args
             if self.extension is not None and first:
                 raise UsageError(reply=self._unknown_sub(first))
             if self.tool is None:
@@ -482,8 +581,8 @@ COMMANDS: tuple[Command, ...] = (
     ),
     Command(
         "/run",
-        "/run <repo> <ask>",
-        "have Claude work on a repo and open a PR",
+        "/run [<repo>] <ask> [--merge]",
+        "have Claude work on a repo and open a PR, or on anything with no repo",
         "run_project",
         tool="start_run",
         parse=run_args,
@@ -515,6 +614,33 @@ COMMANDS: tuple[Command, ...] = (
         tool="merge_run",
         parse=run_code_args,
         owner_only=True,
+    ),
+    Command(
+        "/repos",
+        "/repos",
+        "the repos Claude runs work in",
+        "run_project",
+        tool="list_repos",
+        owner_only=True,
+    ),
+    Command(
+        "/repo",
+        "/repo add|forget|new|ci",
+        "add <x> [as <name>]; forget <x>; new <name> [public]; ci <repo> [merge]",
+        "run_project",
+        owner_only=True,
+        subs=(
+            Sub("add", "add_repo", repo_add_args, usage="/repo add <owner/name> [as <name>]"),
+            Sub("forget", "forget_repo", repo_one_args, usage="/repo forget <repo>"),
+            Sub("new", "create_repo", repo_new_args, usage="/repo new <name> [public]"),
+            Sub(
+                "ci",
+                "add_ci",
+                repo_ci_args,
+                usage="/repo ci <repo> [merge]",
+                alt=("merge", "merge_ci_pr"),
+            ),
+        ),
     ),
     Command(
         "/rules",
@@ -639,7 +765,14 @@ def describe(cmd: Command, registry: ToolRegistry) -> dict[str, Any]:
         "level": level(cmd.tool),
         "owner_only": cmd.owner_only,
         "extension": cmd.extension,
-        "subcommands": [{"word": s.word, "tool": s.tool, "level": level(s.tool)} for s in cmd.subs],
+        "subcommands": [
+            *({"word": s.word, "tool": s.tool, "level": level(s.tool)} for s in cmd.subs),
+            *(
+                {"word": f"{s.word} {s.alt[0]}", "tool": s.alt[1], "level": level(s.alt[1])}
+                for s in cmd.subs
+                if s.alt is not None
+            ),
+        ],
     }
 
 

@@ -7,6 +7,7 @@ import json
 import shutil
 import sqlite3
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,6 +27,7 @@ from resonant.router.router import toolset_for
 from resonant.runners.claude import MAX_ASK, Cancelled, Merged, Refused, Started
 from resonant.runners.local import report_line
 from resonant.runners.worker_desk import OpenQuestion, Relayed
+from resonant.store import extensions as ext_store
 from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
 from resonant.store import trust as trust_store
@@ -321,7 +323,7 @@ async def test_start_run_without_a_repo_is_a_scratch_run(
     for args in ({"ask": "check the disk"}, {"repo": " ", "ask": "check the disk"}):
         out = await call(components, "start_run", args)
         assert out["started"] is True and out["repo"] is None
-        assert out["text"].startswith("On it: R1 · no repo.")
+        assert out["text"].startswith("On it: R1 · no repo (scratch dir).")
     assert [c[1] for c in runner.calls] == [None, None]
     assert runner.reports == ["digest", "digest"]  # a chat run reports in the digest
 
@@ -442,8 +444,11 @@ async def test_merge_run(
 # --- commands ----------------------------------------------------------------------------
 
 
+KNOWN_REPOS = commands.ParseContext(is_repo=lambda w: w.lower() in ("resonant", "dori"))
+
+
 def parse(text: str) -> Any:
-    cmd = match_fast_path(text)
+    cmd = match_fast_path(text, KNOWN_REPOS)
     assert cmd is not None
     return cmd
 
@@ -452,16 +457,20 @@ def test_command_parsing() -> None:
     run = parse("/run Resonant  fix the typo in the README")
     assert (run.tool, run.args) == (
         "start_run",
-        {"repo": "resonant", "ask": "fix the typo in the README", "report": "now"},
+        {"repo": "Resonant", "ask": "fix the typo in the README", "report": "now"},
     )
     assert parse('/run dori "tidy up"').args == {"repo": "dori", "ask": "tidy up", "report": "now"}
+    assert parse("/run tidy the docs").args == {"ask": "tidy the docs", "report": "now"}
+    assert parse("/run dori fix it --merge").args == {
+        "repo": "dori", "ask": "fix it", "report": "now", "merge": True,
+    }  # fmt: skip
     assert parse("/runs").args == {} and parse("/runs r3").args == {"code": "R3"}
     assert parse("/cancel R3").args == {"code": "R3"}
     assert parse("/merge r12?").args == {"code": "R12"}
     for text, hint in (
-        ("/run", "Usage: /run <repo> <ask>"),
-        ("/run dori", "say what to do. Usage: /run <repo> <ask>"),
-        ("/run ../x do it", "that's not a repo name. Usage: /run <repo> <ask>"),
+        ("/run", "Usage: /run [<repo>] <ask> [--merge]"),
+        ("/run dori", "say what to do. Usage: /run [<repo>] <ask> [--merge]"),
+        ("/run ../x: do it", "that's not a repo name. Usage: /run [<repo>] <ask> [--merge]"),
         ("/cancel", "say which run, like R3. Usage: /cancel <R3>"),
         ("/merge A7", "that's not a run code like R3. Usage: /merge <R3>"),
         ("/runs now", "that's not a run code like R3. Usage: /runs [R3]"),
@@ -478,7 +487,9 @@ def test_commands_are_owner_only_with_help_text() -> None:
     ):
         cmd = commands.get(name)
         assert cmd is not None and cmd.owner_only and cmd.tool == tool and cmd.intent == intent_
-    assert "/run <repo> <ask>" in commands.help_text(list(commands.COMMANDS), None, keywords=False)
+    assert "/run [<repo>] <ask> [--merge]" in commands.help_text(
+        list(commands.COMMANDS), None, keywords=False
+    )
 
 
 def fast(components: Components, db: sqlite3.Connection) -> FastPath:
@@ -506,9 +517,42 @@ async def test_fast_path_runs_reads_inline_and_writes_as_direct_calls(
         ("/cancel R1", {"tool": "cancel_run", "args": {"code": "R1"}}),
         ("/merge R1", {"tool": "merge_run", "args": {"code": "R1"}}),
     ):
-        res = await fp.run(parse(text), principal=OWNER, event_id="E2")
+        matched = fp.match(text)  # the registry decides that dori is a repo
+        assert matched is not None
+        res = await fp.run(matched, principal=OWNER, event_id="E2")
         assert res is not None and res.direct_call == call_ and res.intent == "run_project"
     assert runner.calls == []  # nothing ran inline
+    assert fp.is_repo("dori") and fp.is_repo("DORI") and fp.is_repo("foo/bar")
+    assert fp.is_repo("https://github.com/foo/bar") and not fp.is_repo("fix")
+
+
+async def test_slash_repos_lists_inline_and_repo_writes_are_direct_calls(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    fp = fast(components, db)
+    for repo in repo_store.list_all(db):
+        repo_store.forget(db, repo.slug)
+    res = await fp.run(parse("/repos"), principal=OWNER, event_id="E1")
+    assert res is not None and res.reply_text.startswith("No repos yet.")
+    repo_store.add(db, "own/dori", base="main", source="owner", ci=True)
+    repo_store.add(db, "up/lib", base="main", source="auto", mode="fork")
+    res = await fp.run(parse("/repos"), principal=OWNER, event_id="E2")
+    assert res is not None and res.reply_text.splitlines() == [
+        "Repos (2):",
+        "- lib · up/lib · fork",
+        "- dori · own/dori · push, CI",
+    ]
+    for text, call_ in (
+        ("/repo add me/blog as b", {"tool": "add_repo", "args": {"repo": "me/blog", "name": "b"}}),
+        ("/repo forget lib", {"tool": "forget_repo", "args": {"repo": "lib"}}),
+        ("/repo new x", {"tool": "create_repo", "args": {"name": "x", "private": True}}),
+        ("/repo ci dori", {"tool": "add_ci", "args": {"repo": "dori"}}),
+        ("/repo ci dori merge", {"tool": "merge_ci_pr", "args": {"repo": "dori"}}),
+    ):
+        res = await fp.run(parse(text), principal=OWNER, event_id="E3")
+        assert res is not None and res.direct_call == call_, text
+        res = await fp.run(parse(text), principal=MEMBER, event_id="E4")
+        assert res is not None and res.reply_text == "not allowed"
 
 
 async def test_fast_path_member_is_not_allowed(
@@ -560,9 +604,15 @@ async def test_status_tool_reports_runs(components: Components, db: sqlite3.Conn
 
 def test_run_project_toolset(components: Components) -> None:
     assert INTENT_TOOLS["run_project"] == (
+        "add_ci",
+        "add_repo",
         "answer_worker",
         "cancel_run",
+        "create_repo",
+        "forget_repo",
+        "list_repos",
         "list_runs",
+        "merge_ci_pr",
         "merge_run",
         "message_worker",
         "start_run",
@@ -601,3 +651,58 @@ async def test_answer_and_message_worker(
         await call(components, "message_worker", {"code": "R1", "text": "  "})
     answer = intent(components, "answer_worker", {"code": "R1", "text": "x"})
     assert report_line(answer, {"text": "→ R1"}) == "→ R1"
+
+
+# --- the repo tools from chat and slash (EM-8) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("create_repo", {"name": "scratch"}),
+        ("add_ci", {"repo": "dori"}),
+        ("merge_ci_pr", {"repo": "dori"}),
+    ],
+)
+def test_github_repo_writes_ask_from_chat_and_run_when_typed(
+    components: Components, tool: str, args: dict[str, Any]
+) -> None:
+    asked = components.gate.evaluate(intent(components, tool, args))
+    assert isinstance(asked, NeedsApproval) and asked.level is Level.L2
+    assert not asked.require_code  # a plain yes
+    typed = components.gate.evaluate(intent(components, tool, args, origin="explicit"))
+    assert isinstance(typed, Allow)
+    if tool == "merge_ci_pr":
+        assert asked.summary.startswith("merge the add-CI PR in dori")
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [("add_repo", {"repo": "me/blog"}), ("forget_repo", {"repo": "blog"}), ("list_repos", {})],
+)
+def test_registry_tools_run_from_chat(
+    components: Components, tool: str, args: dict[str, Any]
+) -> None:
+    assert isinstance(components.gate.evaluate(intent(components, tool, args)), Allow)
+
+
+def test_start_run_description_names_repos_and_linked_extensions(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    from resonant.tools.base import BuiltinContext
+
+    ext_store.save_extension(
+        db,
+        ext_store.ExtensionRecord(
+            name="trading", source="repo:trading", commit=None, tree_digest="d",
+            manifest_sha="m", manifest={}, installed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            installed_by="owner", status="enabled",
+        ),
+    )  # fmt: skip
+    repo_store.set_links(db, "trading", ["own/bot"])
+    ctx = BuiltinContext(conn=db, state=cast(Any, None), registry=components.registry,
+                         principals=components.principals)  # fmt: skip
+    start = tools.specs_for(ctx)[0]
+    assert "Recent repos: " in start.description and "dori" in start.description
+    assert start.description.endswith("Extensions with repos: trading.")
+    assert "optional" in start.description and "fork" in start.description

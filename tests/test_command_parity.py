@@ -40,6 +40,13 @@ CHAT_WRITES = {
     "merge_run",
     "answer_worker",
     "message_worker",
+    # Repos (EM-8): add and forget only change Resonant's own list (L3); creating a repo,
+    # opening the add-CI PR and merging it act on GitHub, so chat asks a plain yes (L2).
+    "add_repo",
+    "forget_repo",
+    "create_repo",
+    "add_ci",
+    "merge_ci_pr",
     # Trust rules (EM-4): add tightens (L3); allow and forget can widen trust, so chat asks yes.
     "add_trust_rule",
     "allow_trust_rule",

@@ -579,7 +579,7 @@ async def test_a_run_with_no_repo_works_in_a_scratch_dir(
     h = build(tmp_path, db, scenario="scratch")
     res = await h.runner.start_run(None, "how full is the disk?", "owner", report="now")
     assert isinstance(res, Started) and res.repo == ""
-    assert res.text.startswith("On it: R1 · no repo. Up to")
+    assert res.text.startswith("On it: R1 · no repo (scratch dir). Up to")
     assert isinstance(await h.runner.start_run("  ", "and now?", "owner"), Started)
     await h.drain()
     run = h.run("R1")
@@ -713,6 +713,35 @@ async def test_no_configured_repos_is_not_a_setup_problem(
     assert repo.last_used_at is not None
     again = await h.runner.start_run("fresh", "y", "owner")
     assert isinstance(again, Started) and "new repo" not in again.text
+
+
+async def test_a_repo_named_by_an_extension_says_so(
+    tmp_path: Path, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime
+
+    from resonant.store import extensions as ext_store
+
+    bot = RepoInfo("own/bot", "main", False, True, True)
+    h = build(tmp_path, db, github=FakeGitHub([bot], protected=False))
+    ext_store.save_extension(
+        db,
+        ext_store.ExtensionRecord(
+            name="trading", source="repo:trading", commit=None, tree_digest="d",
+            manifest_sha="m", manifest={}, installed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            installed_by="owner", status="enabled",
+        ),
+    )  # fmt: skip
+    repo_store.set_links(db, "trading", ["own/bot"])
+
+    async def unknown(*a: object, **kw: object) -> bool | None:
+        raise RuntimeError("GitHub can't be asked")  # the live check fails: use the resolver's
+
+    monkeypatch.setattr(h.runner.workspace, "base_protected", unknown)
+    res = await h.runner.start_run("trading", "fix the bot", "owner")
+    assert isinstance(res, Started), res
+    assert res.text.startswith("On it: R1 · bot (new repo: own/bot via trading).")
+    assert res.text.endswith("\nmain isn't protected — the session could push to it directly.")
 
 
 async def test_startup_imports_the_config_seed_once(tmp_path: Path, db: sqlite3.Connection) -> None:

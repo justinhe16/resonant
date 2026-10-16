@@ -1,6 +1,7 @@
 """Claude runner tools: ``start_run`` (L3), ``list_runs`` (L0), ``cancel_run`` (L3) and
-``merge_run`` (L2). The slash commands ``/run``, ``/runs``, ``/cancel`` and ``/merge`` and the
-``run_project`` intent reach the same tools.
+``merge_run`` (L2). The slash commands ``/run [<repo>] <ask> [--merge]``, ``/runs``,
+``/cancel`` and ``/merge`` and the ``run_project`` intent reach the same tools (the repo tools
+are ``tools/repos.py``).
 
 They are global builtins, so the gate lets only principals who can request global tools (the
 owner) call them. The handlers call ``ClaudeRunner`` (``components.runners["claude"]``, found
@@ -9,7 +10,8 @@ at call time: the runner is built after the tools are registered) and return cod
 
 - ``start_run{repo?, ask, report?}``: L3, no approval (the sandbox is the wall). ``repo`` is a free
   string (a registry name, ``owner/name`` or a GitHub URL) that the runner's resolver checks;
-  the registered names are listed in the spec (``specs_for``). Without ``repo`` the run
+  the registered names and the extensions that link repos are listed in the spec
+  (``specs_for``). Without ``repo`` the run
   works in a scratch dir and ends with Claude's summary, no PR (docs/employee-plan.md D1). A
   run that can't start (not set up, ambiguous or unknown repo, paused) is a normal result with
   ``started: false`` and the reason as ``text``. ``report``: ``digest`` (the default) puts
@@ -109,11 +111,13 @@ def _code_schema() -> dict[str, Any]:
 START_RUN = ToolSpec(
     name="start_run",
     description=(
-        "Start a Claude Code run on a GitHub repo (a name, owner/name or URL): it works in a "
-        "worktree of the repo and opens a pull request. Leave out `repo` for work not tied to a "
-        "repo (ops, research): it runs in a scratch dir and reports back. `ask` is what to do, "
-        "in the owner's words. Set `merge` only when the owner also asks to merge it: it then "
-        "merges once CI is green."
+        "Spawn a Claude worker. With `repo` (a name, owner/name, a GitHub URL or an extension "
+        "that links one) it works in a worktree of that repo and opens a pull request; a repo "
+        "the owner can't push to goes through their fork and asks before the upstream PR. "
+        "`repo` is optional: leave it out for work not tied to a repo (ops, research, a data "
+        "fix) and it runs in a scratch dir and reports back. `ask` is what to do, in the "
+        "owner's words. Set `merge` only when the owner also asks to merge it: it then merges "
+        "once CI is green, unless a trust rule says to ask."
     ),
     args_schema={
         "type": "object",
@@ -228,9 +232,12 @@ def specs_for(ctx: BuiltinContext) -> tuple[ToolSpec, ...]:
     """``SPECS`` with ``start_run``'s description naming the most recently used registered
     repos. ``repo`` stays a free string: the resolver checks it."""
     names = [r.name for r in repos_store.list_all(ctx.conn)[:RECENT_REPOS]]
+    linked = repos_store.linking_extensions(ctx.conn)[:RECENT_REPOS]
     description = START_RUN.description
     if names:
         description = f"{description} Recent repos: {', '.join(names)}."
+    if linked:
+        description = f"{description} Extensions with repos: {', '.join(linked)}."
     start = START_RUN.model_copy(update={"description": description})
     return (start, *SPECS[1:])
 

@@ -104,6 +104,16 @@ class CiPr:
         return f"Opened a PR to add CI: {self.url}"
 
 
+@dataclass(frozen=True)
+class OpenCiPr:
+    """An open add-CI PR as GitHub lists it (its diff is checked again at merge)."""
+
+    number: int
+    url: str
+    branch: str
+    head_sha: str
+
+
 class Creator:
     def __init__(self, conn: sqlite3.Connection, workspace: Gh, secrets: RunnerSecrets) -> None:
         self.conn = conn
@@ -250,6 +260,42 @@ class Creator:
         if m is None:
             raise CreateError("GitHub didn't print a PR URL.")
         return CiPr(int(m[1]), m[0], already=False)
+
+    async def find_ci_pr(self, key: str) -> tuple[Repo, OpenCiPr]:
+        """The registered push repo ``key`` and its one open add-CI PR (head branch
+        ``resonant/add-ci-…``, from the repo itself), for ``merge_ci_pr``. Raises
+        ``CreateError`` with a sentence for the owner."""
+        repo = repos.find(self.conn, key)
+        if repo is None:
+            raise CreateError(f"No registered repo {key[:60]!r}.")
+        if repo.mode != "push":
+            raise CreateError(f"{repo.slug} is upstream; its maintainers own its CI.")
+        listed = await self._gh(
+            "pr", "list", "--repo", repo.slug, "--state", "open",
+            "--json", "number,url,headRefName,headRefOid,isCrossRepository",
+        )  # fmt: skip
+        if listed.returncode != 0:
+            raise CreateError(f"Couldn't list {repo.slug}'s PRs: {listed.stderr[-120:]}")
+        found: list[OpenCiPr] = []
+        try:
+            for item in json.loads(listed.stdout):
+                branch, url = str(item["headRefName"]), str(item["url"])
+                head, number = str(item["headRefOid"]), int(item["number"])
+                if (
+                    branch.startswith(CI_BRANCH_PREFIX)
+                    and not item.get("isCrossRepository")
+                    and _PR_URL.fullmatch(url)
+                    and re.fullmatch(r"[0-9a-f]{40}", head)
+                ):
+                    found.append(OpenCiPr(number, url, branch, head))
+        except (ValueError, KeyError, TypeError):
+            raise CreateError(f"{repo.slug}'s PR list couldn't be read.") from None
+        if not found:
+            raise CreateError(f"{repo.slug} has no open add-CI PR. add_ci opens one.")
+        if len(found) > 1:
+            numbers = ", ".join(f"#{p.number}" for p in found[:3])
+            raise CreateError(f"{repo.slug} has several add-CI PRs ({numbers}); merge one by hand.")
+        return repo, found[0]
 
     async def refresh_ci(self, repo: Repo, github: GitHub) -> bool:
         """Look at GitHub again and record whether the repo has a pull_request workflow now

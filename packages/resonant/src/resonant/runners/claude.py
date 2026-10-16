@@ -104,6 +104,7 @@ from resonant.runner.resolve import (
     GitHubError,
     NoAccess,
     NotFound,
+    Resolved,
     Resolver,
 )
 from resonant.runner.workspace import (
@@ -272,11 +273,13 @@ class Started:
     new_repo: str | None = None  # the slug, when this run registered the repo
     warning: str | None = None  # e.g. the base branch isn't protected
     note: str | None = None  # how it ends: merged once CI is green, or a PR upstream after a yes
+    via: str | None = None  # the extension whose link named the new repo
 
     @property
     def text(self) -> str:
-        new = f" (new repo: {self.new_repo})" if self.new_repo else ""
-        where = self.repo or "no repo"
+        by = f" via {self.via}" if self.via else ""
+        new = f" (new repo: {self.new_repo}{by})" if self.new_repo else ""
+        where = self.repo or "no repo (scratch dir)"
         text = (
             f"On it: {self.code} · {where}{new}. Up to {self.max_minutes}m. "
             f"/runs to check, /cancel {self.code} to stop."
@@ -843,12 +846,12 @@ class ClaudeRunner:
         if self._paused():
             return Refused("Resonant is paused. /resume first.")
         found: repo_store.Repo | None = None
-        new = False
+        resolution: Resolved | None = None
         if repo is not None and repo.strip():
             resolved = await self._resolve(repo)
             if isinstance(resolved, Refused):
                 return resolved
-            found, new = resolved
+            resolution, found = resolved, resolved.repo
         if found is not None and found.mode == "fork" and (refusal := await self._fork_refusal()):
             return refusal
         auto_merge = merge and found is not None and found.mode == "push"
@@ -894,13 +897,22 @@ class ClaudeRunner:
             )
         elif auto_merge:
             note = "I'll merge it when CI is green, unless a rule says to ask."
+        assert resolution is not None
+        warning = None
+        if found.mode != "fork":
+            # The resolver's warning (a new repo's base) is the same fact said shorter; the
+            # live check covers every run, so it is only the fallback.
+            warning = await self._base_warning(found)
+            if warning is None and resolution.warning:
+                warning = f"{resolution.warning} — the session could push to it directly."
         return Started(
             run.code,
             repo,
             max(1, self.max_session_s // 60),
-            found.slug if new else None,
-            None if found.mode == "fork" else await self._base_warning(found),
+            found.slug if resolution.new else None,
+            warning,
             note,
+            resolution.via if resolution.new else None,
         )
 
     async def _fork_refusal(self) -> Refused | None:
@@ -927,8 +939,9 @@ class ClaudeRunner:
             return f"{repo.base} isn't protected — the session could push to it directly."
         return None
 
-    async def _resolve(self, text: str) -> tuple[repo_store.Repo, bool] | Refused:
-        """The registered repo for the requester's words, and whether it is new."""
+    async def _resolve(self, text: str) -> Resolved | Refused:
+        """The registered repo for the requester's words (``new`` when this call registered
+        it, ``via`` the extension whose link named it, ``warning`` about its base)."""
         try:
             secrets = await load_runner_secrets(self.secrets)
             resolution = await self.resolver.resolve(text, self._github(secrets))
@@ -945,7 +958,7 @@ class ClaudeRunner:
             return Refused(
                 f"No repo matches {text[:60]!r}. Which repo?" + (f" {recent}" if recent else "")
             )
-        return resolution.repo, resolution.new
+        return resolution
 
     def get_run(self, code: str) -> Run | None:
         return runs.get(self.conn, code)
