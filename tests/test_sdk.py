@@ -267,10 +267,18 @@ def test_dir_errors_checks_every_command(tmp_path: Path) -> None:
         tools={"a": {"run": "npx x", "effect": "read"}},
         jobs=[job(run="uv run sync.py", effect="read")],
         health={"check": "bash -c true"},
-        mcp={"command": "uvx some-server", "tools": {"m": {"effect": "read"}}},
+        mcp={
+            "servers": {
+                "s": {
+                    "transport": "stdio",
+                    "command": "uvx",
+                    "tools": [{"name": "m", "effect": "read"}],
+                }
+            }
+        },
     )
     errors = dir_errors(root, m)
-    assert [e.split(":")[0] for e in errors] == ["tool a", "job sync", "health", "mcp"]
+    assert [e.split(":")[0] for e in errors] == ["tool a", "job sync", "health", "mcp server s"]
 
 
 def test_symlink_out_of_root_refused(tmp_path: Path) -> None:

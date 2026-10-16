@@ -246,18 +246,16 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% bar): `question` 7/9 (the same three misses since EM-5) and `system` 11/12. Look at the misses, then decide between a few-shot fix and an eval case that pins them. Re-run after any prompt or model change, together with [router evals on real texts](#router-evals-on-real-texts-go-live-step-9).
 
-## MCP stdio client for extensions
+## MCP stdio servers: env-token binaries and secret-gated discovery
 
-*Deferred 2026-10-14, from Phase 3 ([plan §8](phase3-plan.md#8-out-of-scope-and-deferred)). No first-party extension needs one; `ext add` refuses an `mcp` block today.*
+*Noted 2026-10-16, from MCP-1 (built: [`extensions.md`](extensions.md) §4, MCP tools). HTTP transport is MCP-2 in [`dashboard-plan.md`](dashboard-plan.md).*
 
-**Design to carry.**
-- Only manifest-listed tools, with manifest descriptions; schema descriptions are stripped and annotations ignored.
-- A per-tool pin, `sha256(name, description, input_schema, output_schema, annotations)`, checked at start and on `list_changed`; a change disables the tool and alerts.
-- The server's stderr goes to a redacting sink, never a raw log.
-- `npx`/`uvx`-style unpinned fetch-runners are refused.
-- The server env is the union of its tools' secrets. The process group is killed on stop (MCP children survive a graceful exit).
+**Open.**
+- A third-party stdio server that reads its token only from an environment variable can't be used: secrets go on fd 4, never the env (a same-user worker could read the env). Options: a per-server "env secrets" grant shown as an escalation, or preferring the HTTP transport (MCP-2, bearer held in the daemon) for such servers.
+- `ext add` lists a server's tools with no secrets, so a server that needs its token to list tools can't be installed. Option: pass the declared secrets to discovery after the owner confirms the command line.
+- A drifted tool stays disabled until a restart or `ext update`; there is no `/ext` command to re-approve one pin from iMessage.
 
-**Done when.** An extension can expose typed MCP tools that pass the same gate, pins and kill switch as CLI tools.
+**Done when.** Each is decided, and built or dropped.
 
 ## Critical-job LaunchAgents and `job-guard`
 

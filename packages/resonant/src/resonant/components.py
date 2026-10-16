@@ -70,7 +70,7 @@ class Components:
         """Every registered spec a chat step can call: builtins and extension tools, never
         extension job specs."""
         host = self.extensions
-        return [s for s in self.registry.specs() if host is None or not host.is_job(s)]
+        return [s for s in self.registry.specs() if host is None or not host.hidden(s)]
 
     def register_local_runner(
         self,
@@ -169,7 +169,9 @@ def build_components(
     handlers = register_builtins(
         registry, conn, state, principals=principals, ops_runner=ops_runner
     )
+    secret_store = secrets if secrets is not None else SecretStore()
     host = ExtensionHost.from_settings(settings, conn, registry, runner=ext_runner)
+    host.secrets = secret_store
     host.load()
     gate = PolicyGate(
         conn,
@@ -181,12 +183,12 @@ def build_components(
         approvers_for=host.approvers_for,
         levels=level_overrides(conn),
     )
-    merged: dict[HandlerKey, Handler] = {**handlers, **host.handlers}
+    merged: dict[HandlerKey, Handler] = {**handlers, **host.handlers, **host.mcp_handlers}
     executor = Executor(
         conn,
         gate,
         merged,
-        secrets=secrets if secrets is not None else SecretStore(),
+        secrets=secret_store,
         result_max_bytes=settings.extensions.result_max_bytes,
     )
     return Components(

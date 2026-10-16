@@ -1,4 +1,4 @@
-"""Extensions and job-state repositories (migration 004). Plain functions over a connection.
+"""Extensions and job-state repositories (migrations 004, 012). Plain functions over a connection.
 
 - ``extensions``: one row per installed extension, the registry of record. It holds the
   approved manifest snapshot and the pins (``commit``, ``tree_digest``, ``manifest_sha``,
@@ -39,6 +39,8 @@ class ExtensionRecord:
     installed_by: str
     argv0_paths: Mapping[str, str] = field(default_factory=dict[str, str])
     status: ExtensionStatus = "enabled"
+    # What ext add approved per MCP tool: {tool: {server, pin, input_schema}} (migration 012).
+    mcp_pins: Mapping[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,7 @@ def _row_to_extension(r: sqlite3.Row) -> ExtensionRecord:
         installed_by=r["installed_by"],
         argv0_paths=json.loads(r["argv0_paths"]),
         status=cast(ExtensionStatus, r["status"]),
+        mcp_pins=json.loads(r["mcp_pins"]),
     )
 
 
@@ -92,14 +95,14 @@ def save_extension(conn: sqlite3.Connection, ext: ExtensionRecord) -> None:
         raise ValueError(f"{CORE_EXT!r} is reserved for core jobs")
     conn.execute(
         """INSERT INTO extensions (name, source, commit_sha, tree_digest, manifest_sha,
-               manifest_json, argv0_paths, status, installed_at, installed_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               manifest_json, argv0_paths, status, installed_at, installed_by, mcp_pins)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (name) DO UPDATE SET
                source = excluded.source, commit_sha = excluded.commit_sha,
                tree_digest = excluded.tree_digest, manifest_sha = excluded.manifest_sha,
                manifest_json = excluded.manifest_json, argv0_paths = excluded.argv0_paths,
                status = excluded.status, installed_at = excluded.installed_at,
-               installed_by = excluded.installed_by""",
+               installed_by = excluded.installed_by, mcp_pins = excluded.mcp_pins""",
         (
             ext.name,
             ext.source,
@@ -111,6 +114,7 @@ def save_extension(conn: sqlite3.Connection, ext: ExtensionRecord) -> None:
             ext.status,
             iso(ext.installed_at),
             ext.installed_by,
+            json.dumps(dict(ext.mcp_pins), sort_keys=True),
         ),
     )
 

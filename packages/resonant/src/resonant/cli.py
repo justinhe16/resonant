@@ -34,6 +34,7 @@ from resonant.extensions.manager import (
     report_grant,
     update_lines,
 )
+from resonant.extensions.mcp import pins_digest
 from resonant.extensions.pin import TreeError
 from resonant.gate import ApprovalResolution, PolicyGate
 from resonant.gate.codes import clean_external
@@ -491,6 +492,11 @@ def ext_validate(
         )
     for job in manifest.jobs:
         typer.echo(f"  job  {job.id:<24} {job.schedule}{'  critical' if job.critical else ''}")
+    if manifest.mcp:
+        for sid, server in manifest.mcp.servers.items():
+            names = ", ".join(t.name for t in server.tools)
+            typer.echo(f"  mcp  {sid:<24} {server.command} (stdio): {names}")
+        typer.echo("  note: ext add starts each MCP server once to read and pin its tools")
     if grant := report_grant(manifest):
         typer.echo(f"  {grant}")
     if manifest.secrets:
@@ -645,7 +651,13 @@ def ext_update(name: Annotated[str, typer.Argument(help="An installed extension"
         staged = mgr.stage(record.source, expect_name=name)
         try:
             copy = mgr.verify(record)
-            current = Pin(record.source, record.commit, record.tree_digest, record.manifest_sha)
+            current = Pin(
+                record.source,
+                record.commit,
+                record.tree_digest,
+                record.manifest_sha,
+                pins_digest(record.mcp_pins),
+            )
             if staged.pin == current and copy == "ok" and record.status != "disabled_tampered":
                 typer.echo(f"{name} is up to date ({heading(staged)})")
                 return

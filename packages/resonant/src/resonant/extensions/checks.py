@@ -39,6 +39,14 @@ FETCH_RUNNERS = frozenset(
     {"npx", "bunx", "pnpx", "pipx", "uvx", "uv", "docker", "podman", "curl", "wget"}
 )
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "env"})
+# Interpreters and package managers, refused as an MCP server command (any ``python*`` too):
+# their arguments name code the install pin doesn't cover.
+INTERPRETERS = frozenset(
+    {
+        "node", "nodejs", "deno", "bun", "ruby", "perl", "php", "java", "lua", "osascript",
+        "npm", "pnpm", "yarn", "pip", "pip3", "brew", "go", "cargo", "poetry", "pdm",
+    }
+)  # fmt: skip
 RESERVED_WORDS: frozenset[str] = frozenset()  # command words reserved beyond BY_NAME
 
 DEPENDENCY_FILES = frozenset(
@@ -82,8 +90,6 @@ def commands(manifest: Manifest) -> list[tuple[str, str]]:
     out += [(f"job {j.id}", j.run) for j in manifest.jobs]
     if manifest.health:
         out.append(("health", manifest.health.check))
-    if manifest.mcp:
-        out.append(("mcp", shlex.join(manifest.mcp.command)))
     return out
 
 
@@ -94,7 +100,71 @@ def dir_errors(root: Path, manifest: Manifest) -> list[str]:
     for where, run in commands(manifest):
         if err := argv0_error(root, run):
             errors.append(f"{where}: {err}")
+    if manifest.mcp:
+        for sid, server in manifest.mcp.servers.items():
+            if err := mcp_command_error(root, server.command):
+                errors.append(f"mcp server {sid}: {err}")
     return errors
+
+
+def mcp_key(server_id: str) -> str:
+    """The ``ExtensionRecord.argv0_paths`` key an MCP server's command is pinned under."""
+    return f"mcp:{server_id}"
+
+
+def mcp_command_error(root: Path, command: str) -> str | None:
+    """Why an MCP server ``command`` isn't allowed, or None. ``root`` must be resolved.
+
+    Allowed: a ``.py`` file in the extension dir (``./server.py``, run under the daemon's
+    interpreter with ``-I -S``), or a server binary by name (looked up at install) or by
+    absolute path, pinned by :func:`resolve_mcp_command`. Fetch-runners, shells and
+    interpreters are refused by name: they would run code the pin doesn't cover.
+    """
+    if not command or any(c.isspace() for c in command):
+        return "command must be one word; put arguments in args"
+    name = Path(command).name
+    if name in FETCH_RUNNERS:
+        return f"{command!r} fetches and runs code at call time; refused"
+    if name in SHELLS:
+        return f"{command!r}: commands never run through a shell; refused"
+    if name in INTERPRETERS or name.startswith("python"):
+        return (
+            f"{command!r} is an interpreter; use a .py file in the extension dir or a "
+            "pinned server binary"
+        )
+    if command.startswith("/"):
+        return None
+    if "/" in command:
+        if err := _inside_error(root, command):
+            return err
+        if not command.endswith(".py"):
+            return f"{command!r}: files in the extension dir run as Python; name it *.py"
+    return None
+
+
+def resolve_mcp_command(root: Path, command: str, path: str = EXT_PATH) -> str:
+    """The absolute path an MCP server ``command`` runs, for pinning at install. Raises
+    ValueError.
+
+    An in-dir ``.py`` resolves inside ``root``. A binary (by name on ``path``, or absolute)
+    must be an executable file no Claude worker can replace: root-owned all the way up, or a
+    Homebrew keg the sandbox guard protects (as for ``bins``).
+    """
+    root = root.resolve()
+    if err := mcp_command_error(root, command):
+        raise ValueError(err)
+    if "/" in command and not command.startswith("/"):
+        return str((root / command).resolve())
+    found = command if command.startswith("/") else shutil.which(command, path=path)
+    if found is None or not os.path.isfile(found) or not os.access(found, os.X_OK):
+        raise ValueError(f"{command!r} is not an executable on {path}")
+    real = Path(os.path.realpath(found))
+    if not (_unwritable(real) or guarded_tool(Path(found))):
+        raise ValueError(
+            f"{command!r} resolves to {real}, which Claude workers can write; install the "
+            "server root-owned (for example in /usr/local/bin with sudo)"
+        )
+    return str(real)
 
 
 def argv0_error(root: Path, run: str) -> str | None:
