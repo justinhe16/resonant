@@ -9,8 +9,8 @@
 --   anon key alone          nothing: no table privileges, both RPCs refuse without a token
 --   daemon                  anon key + the ingest token -> public.relay_ingest() only. It
 --                           inserts one remote-tier snapshot and can't read, update or delete.
---   Fly checker (DB-4)      anon key + the watch token -> public.relay_watch() only: times
---                           and health states of the latest snapshot, nothing else.
+--   Fly checker (DB-4)      anon key + the status token -> public.relay_status() only: the
+--                           newest snapshot's taken_at and health states, nothing else.
 --   the owner (dashboard)   signed in as relay_private.config.owner_id with TOTP (aal2):
 --                           SELECT on public.snapshots. Nobody else, MFA or not.
 --   service_role, postgres  everything (Supabase's own; never on the Mini or Fly).
@@ -26,10 +26,10 @@
 --   update relay_private.config set
 --     owner_id            = '<auth.users.id of the one user>',
 --     ingest_token_sha256 = decode('<sha256 hex of the ingest token>', 'hex'),
---     watch_token_sha256  = decode('<sha256 hex of the watch token>', 'hex');
+--     status_token_sha256  = decode('<sha256 hex of the status token>', 'hex');
 -- Only the hashes leave the Mini (supabase/README.md shows how without the token reaching shell
--- history). The ingest token goes into the Mini's Keychain as relay/supabase_key, the watch
--- token into `fly secrets`. Both are bearer tokens: whoever holds the ingest token can push
+-- history). The ingest token goes into the Mini's Keychain as relay/supabase_key, the status
+-- token into `fly secrets` (RELAY_STATUS_TOKEN). Both are bearer tokens: whoever holds the ingest token can push
 -- snapshots (fake ones too), so keep it in the Keychain only and rotate it if in doubt.
 
 -- --- private config --------------------------------------------------------------------------
@@ -42,10 +42,10 @@ create table relay_private.config (
   singleton           boolean primary key default true check (singleton),
   owner_id            uuid,
   ingest_token_sha256 bytea check (ingest_token_sha256 is null or octet_length(ingest_token_sha256) = 32),
-  watch_token_sha256  bytea check (watch_token_sha256 is null or octet_length(watch_token_sha256) = 32),
+  status_token_sha256  bytea check (status_token_sha256 is null or octet_length(status_token_sha256) = 32),
   -- one token must never work as the other
-  check (ingest_token_sha256 is null or watch_token_sha256 is null
-         or ingest_token_sha256 <> watch_token_sha256)
+  check (ingest_token_sha256 is null or status_token_sha256 is null
+         or ingest_token_sha256 <> status_token_sha256)
 );
 insert into relay_private.config default values;
 revoke all on table relay_private.config from public, anon, authenticated;
@@ -56,7 +56,7 @@ revoke all on table relay_private.config from public, anon, authenticated;
 create table public.snapshots (
   id          bigint generated always as identity primary key,
   taken_at    timestamptz not null,                -- the snapshot's own taken_at (Mini clock)
-  received_at timestamptz not null default now(),  -- server clock; what retention and the watch use
+  received_at timestamptz not null default now(),  -- server clock; what retention and the rate limit use
   data        jsonb not null,                      -- a remote-tier Snapshot (docs/snapshot.schema.json)
   constraint snapshots_data_object check (jsonb_typeof(data) = 'object'),
   constraint snapshots_data_size check (octet_length(data::text) <= 32768)
@@ -166,38 +166,43 @@ $$;
 revoke all on function public.relay_ingest(text, jsonb) from public, anon, authenticated;
 grant execute on function public.relay_ingest(text, jsonb) to anon;
 
--- --- the Fly checker's read path (DB-4) ---------------------------------------------------
--- POST /rest/v1/rpc/relay_watch {"p_token": ...} (POST only) -> at most one row: the latest snapshot's
--- times and its health rows as [{name, state}]. No counts, no extensions, no other fields.
+-- --- the Fly checker's read path (DB-4, relay/README.md) ----------------------------------
+-- POST /rest/v1/rpc/relay_status {"token": ...} with the anon key. A wrong token raises 42501
+-- (a read error for the checker, never "no snapshots"). No snapshots: null. Otherwise the
+-- newest snapshot (by taken_at, as the dashboard reads it) as
+-- {"taken_at": ..., "health": [{"name": ..., "state": ...}]}: no counts, nothing else.
+-- volatile, not stable: PostgREST then takes POST only, so the token never sits in a URL.
 
-create function public.relay_watch(p_token text)
-returns table (taken_at timestamptz, received_at timestamptz, health jsonb)
+create function public.relay_status(token text)
+returns jsonb
 language plpgsql
-volatile  -- not stable: PostgREST then accepts POST only, so the token never sits in a URL
+volatile
 security definer
 set search_path = ''
 as $$
 declare
-  want bytea;
+  want   bytea;
+  result jsonb;
 begin
-  select c.watch_token_sha256 into want from relay_private.config c;
-  if want is null or p_token is null or length(p_token) < 32
-     or sha256(convert_to(p_token, 'UTF8')) <> want then
-    raise exception 'relay: bad token' using errcode = 'PT403';
+  select c.status_token_sha256 into want from relay_private.config c;
+  if want is null or token is null or length(token) < 32
+     or sha256(convert_to(token, 'UTF8')) <> want then
+    raise exception 'relay: bad token' using errcode = '42501';
   end if;
-  return query
-    select s.taken_at,
-           s.received_at,
-           coalesce(
+  select jsonb_build_object(
+           'taken_at', s.taken_at,
+           'health', coalesce(
              (select jsonb_agg(jsonb_build_object('name', h ->> 'name', 'state', h ->> 'state'))
               from jsonb_array_elements(
                 case when jsonb_typeof(s.data -> 'health') = 'array'
                      then s.data -> 'health' else '[]'::jsonb end) h),
-             '[]'::jsonb)
+             '[]'::jsonb))
+    into result
     from public.snapshots s
-    order by s.received_at desc
-    limit 1;
+   order by s.taken_at desc
+   limit 1;
+  return result;
 end
 $$;
-revoke all on function public.relay_watch(text) from public, anon, authenticated;
-grant execute on function public.relay_watch(text) to anon;
+revoke all on function public.relay_status(text) from public, anon, authenticated;
+grant execute on function public.relay_status(text) to anon;

@@ -39,7 +39,7 @@ STUB = ROOT / "tests" / "fixtures" / "supabase_stub.sql"
 OWNER = "11111111-1111-4111-8111-111111111111"
 STRANGER = "22222222-2222-4222-8222-222222222222"
 INGEST = "i" * 8 + "0123456789abcdef" * 3  # 56 chars; the real one is 64 hex
-WATCH = "w" * 8 + "fedcba9876543210" * 3
+STATUS = "w" * 8 + "fedcba9876543210" * 3
 
 
 def _bindir() -> Path | None:
@@ -188,7 +188,7 @@ def db(pg: Pg) -> Pg:
         "truncate public.snapshots;"
         f"update relay_private.config set owner_id = '{OWNER}',"
         f" ingest_token_sha256 = decode('{_sha(INGEST)}', 'hex'),"
-        f" watch_token_sha256 = decode('{_sha(WATCH)}', 'hex');"
+        f" status_token_sha256 = decode('{_sha(STATUS)}', 'hex');"
     )
     return pg
 
@@ -247,7 +247,7 @@ def test_authenticated_has_select_only_and_no_rpc(db: Pg, tmp_path: Path) -> Non
         "delete from public.snapshots;",
         "select * from relay_private.config;",
         f"select public.relay_ingest('{INGEST}', '{{}}');",
-        f"select * from public.relay_watch('{WATCH}');",
+        f"select public.relay_status('{STATUS}');",
     ):
         r = db.run(sql, role="authenticated", claims=OWNER_AAL2)
         assert not r.ok and r.sqlstate == "42501", (sql, r.err)
@@ -267,7 +267,7 @@ def test_ingest_stores_a_remote_snapshot(db: Pg, tmp_path: Path) -> None:
     assert db.run("select count(*) from public.snapshots;", role="anon").sqlstate == "42501"
 
 
-@pytest.mark.parametrize("token", ["", "short", INGEST + "x", WATCH])
+@pytest.mark.parametrize("token", ["", "short", INGEST + "x", STATUS])
 def test_ingest_refuses_a_bad_token(db: Pg, tmp_path: Path, token: str) -> None:
     r = ingest(db, remote_snapshot(tmp_path), token=token)
     assert r.sqlstate == "PT403", r.err
@@ -362,8 +362,8 @@ def test_a_busy_remote_snapshot_is_accepted(db: Pg, tmp_path: Path) -> None:
     _, remote = _busy_dumps(tmp_path)
     assert any(h["name"] == "relay" for h in remote["health"])
     assert ingest(db, remote).ok
-    out = db.ok(f"select health from public.relay_watch('{WATCH}');", role="anon")
-    assert {"name": "relay", "state": "failing"} in json.loads(out)
+    out = db.ok(f"select public.relay_status('{STATUS}');", role="anon")
+    assert {"name": "relay", "state": "failing"} in json.loads(out)["health"]
 
 
 def test_ingest_refuses_a_non_object(db: Pg) -> None:
@@ -444,35 +444,56 @@ def test_only_the_owner_with_mfa_reads(db: Pg, tmp_path: Path) -> None:
     assert _visible(db, OWNER_AAL2) == 0
 
 
-# --- the watch path (DB-4) -------------------------------------------------------------------
+# --- the status path (DB-4's checker, relay/README.md) ---------------------------------------
 
 
-def test_watch_returns_times_and_health_states_only(db: Pg, tmp_path: Path) -> None:
-    empty = db.ok(f"select count(*) from public.relay_watch('{WATCH}');", role="anon")
-    assert empty == "0"
+def status(db: Pg, token: str = STATUS) -> Result:
+    return db.run(f"select public.relay_status('{token}');", role="anon")
+
+
+def test_status_is_null_without_snapshots(db: Pg) -> None:
+    r = status(db)
+    assert r.ok and r.out == ""  # SQL null (psql prints nothing)
+    assert db.ok(f"select public.relay_status('{STATUS}') is null;", role="anon") == "t"
+
+
+def test_status_returns_the_newest_taken_at_and_health_states_only(db: Pg, tmp_path: Path) -> None:
+    newer = datetime.now(UTC).replace(microsecond=0)
     health = [
         {"name": "model", "state": "ok", "since": None},
         {"name": "relay", "state": "failing", "since": None},
     ]
-    assert ingest(db, remote_snapshot(tmp_path, health=health)).ok
-    out = db.ok(f"select health from public.relay_watch('{WATCH}');", role="anon")
-    assert json.loads(out) == [
+    assert ingest(db, remote_snapshot(tmp_path, taken_at=newer.isoformat(), health=health)).ok
+    older = (newer - timedelta(minutes=3)).isoformat()
+    assert ingest(db, remote_snapshot(tmp_path, taken_at=older, health=[])).ok  # arrives later
+    out = json.loads(status(db).out)
+    assert set(out) == {"taken_at", "health"}  # nothing else leaves
+    assert datetime.fromisoformat(out["taken_at"]) == newer
+    assert out["health"] == [
         {"name": "model", "state": "ok"},
         {"name": "relay", "state": "failing"},
     ]
-    # Exactly three columns: no snapshot data beyond the health states.
-    row = db.ok(f"select * from public.relay_watch('{WATCH}');", role="anon")
-    assert len(row.split("|")) == 3
 
 
-@pytest.mark.parametrize("token", ["", INGEST, WATCH + "x"])
-def test_watch_refuses_other_tokens(db: Pg, token: str) -> None:
-    r = db.run(f"select * from public.relay_watch('{token}');", role="anon")
-    assert r.sqlstate == "PT403", r.err
+def test_status_with_a_health_less_row(db: Pg) -> None:
+    db.ok("insert into public.snapshots (taken_at, data) values (now(), '{}');")
+    assert json.loads(status(db).out)["health"] == []
+
+
+@pytest.mark.parametrize("token", ["", "short", INGEST, STATUS + "x"])
+def test_status_raises_42501_on_a_wrong_token(db: Pg, token: str) -> None:
+    db.ok("insert into public.snapshots (taken_at, data) values (now(), '{}');")
+    r = status(db, token)
+    assert not r.ok and r.sqlstate == "42501", r.err
+
+
+def test_status_raises_until_configured(db: Pg) -> None:
+    db.ok("update relay_private.config set status_token_sha256 = null;")
+    assert status(db).sqlstate == "42501"
 
 
 def test_one_token_cannot_be_both(db: Pg) -> None:
     r = db.run(
-        f"update relay_private.config set watch_token_sha256 = decode('{_sha(INGEST)}', 'hex');"
+        f"update relay_private.config set status_token_sha256 = decode('{_sha(INGEST)}', 'hex');"
     )
     assert r.sqlstate == "23514"
