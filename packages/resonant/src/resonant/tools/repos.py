@@ -48,7 +48,7 @@ from resonant.runner.resolve import (
     Resolved,
     Resolver,
 )
-from resonant.runner.workspace import MergeRefused, RunnerError, Workspace
+from resonant.runner.workspace import MergeRefused, RunnerError, Workspace, needs_github_token
 from resonant.secrets import RunnerSecrets, SecretError, SecretStore, load_runner_secrets
 from resonant.store import repos as repos_store
 from resonant.store.audit import audit
@@ -213,8 +213,9 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         found = components.runners.get(RUNNER) if components is not None else None
         return cast("RunnerApi | None", found)
 
-    async def ready() -> tuple[RunnerApi, RunnerSecrets] | str:
-        """The runner and its secrets, or the sentence for why not."""
+    async def ready(what: str) -> tuple[RunnerApi, RunnerSecrets] | str:
+        """The runner and its secrets, or the sentence for why not. These tools never start a
+        session, so they need the daemon's GitHub token and not the Claude credential."""
         from resonant.runners.claude import not_set_up_text
 
         claude = runner()
@@ -224,9 +225,12 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
                 ["set channels.imessage.enabled in ~/.resonant/config.yaml and restart Resonant"],
             )
         try:
-            return claude, await load_runner_secrets(claude.secrets)
+            secrets = await load_runner_secrets(claude.secrets, claude=False)
         except SecretError:
-            return (await claude.setup_missing()) or "The runner's secrets can't be read."
+            return "The runner's secrets can't be read."
+        if secrets.github_token is None:
+            return needs_github_token(what)
+        return claude, secrets
 
     async def _create_repo(args: dict[str, Any]) -> dict[str, Any]:
         _unknown("create_repo", args, {"name", "description", "private"})
@@ -239,7 +243,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             raise ToolFailed("create_repo: private must be true or false")
         if (why := valid_repo_name(name)) is not None:
             return {"created": False, "text": why[0].upper() + why[1:] + "."}
-        got = await ready()
+        got = await ready("Creating a repo")
         if isinstance(got, str):
             return {"created": False, "text": got}
         claude, secrets = got
@@ -260,7 +264,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
     async def _add_ci(args: dict[str, Any]) -> dict[str, Any]:
         _unknown("add_ci", args, {"repo"})
         repo = _need_str("add_ci", args, "repo", REPO_MAX)
-        got = await ready()
+        got = await ready("Adding CI")
         if isinstance(got, str):
             return {"opened": False, "text": got}
         claude, secrets = got
@@ -275,7 +279,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
     async def _merge_ci_pr(args: dict[str, Any]) -> dict[str, Any]:
         _unknown("merge_ci_pr", args, {"repo"})
         key = _need_str("merge_ci_pr", args, "repo", REPO_MAX)
-        got = await ready()
+        got = await ready("Merging the add-CI PR")
         if isinstance(got, str):
             return {"merged": False, "text": got}
         claude, secrets = got
@@ -337,7 +341,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
                     "text": f"{alias[:40]!r} isn't a usable name (start with a letter; "
                     "letters, digits, '_' and '-', at most 32).",
                 }
-        got = await ready()
+        got = await ready("Adding a repo")
         if isinstance(got, str):
             return {"added": False, "text": got}
         claude, secrets = got

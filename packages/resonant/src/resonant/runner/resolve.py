@@ -59,6 +59,10 @@ class GitHubError(Exception):
     token: the workspace redacts ``gh``'s stderr."""
 
 
+class NeedsToken(GitHubError):
+    """The answer needs GitHub and the daemon has no token to ask with (RX-1)."""
+
+
 @dataclass(frozen=True)
 class RepoInfo:
     slug: str  # as GitHub spells it
@@ -323,6 +327,21 @@ class GhGitHub:
         if code != 0:
             raise GitHubError(f"couldn't list your GitHub repos: {err[-120:]}")
         return [line.strip() for line in out.splitlines() if parse_slug(line.strip())]
+
+
+class OfflineGitHub:
+    """The :class:`GitHub` when the daemon's token isn't set (RX-1): registered repos still
+    resolve (the registry is asked first), and anything that needs GitHub raises
+    :class:`NeedsToken` instead of asking."""
+
+    async def repo_info(self, slug: str) -> RepoInfo | None:
+        raise NeedsToken(f"looking up {slug} needs the daemon's GitHub token")
+
+    async def my_repos(self) -> list[str]:
+        raise NeedsToken("listing your GitHub repos needs the daemon's GitHub token")
+
+    async def is_protected(self, slug: str, branch: str) -> bool | None:
+        return None
 
 
 class FakeGitHub:

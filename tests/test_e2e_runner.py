@@ -606,10 +606,13 @@ async def test_r14_not_set_up_names_what_is_missing(
     w = make_world(tmp_path, resonant_home, chat, monkeypatch, secrets=False)
     async with running(w):
         reply = await w.say("/run demo fix it")
-        assert reply.startswith("The runner isn't set up: secret runner/github_token, ")
-        assert "secret runner/claude_token" in reply
+        # RX-1: only the Claude credential blocks a run; the GitHub pieces are notes
+        assert reply.startswith("The runner isn't set up: secret runner/claude_token")
         assert "resonant secret set runner/claude_token" in reply
-        assert await w.say("/runs") == reply
+        assert "github_token" not in reply and "github_app" not in reply
+        runs = await w.say("/runs")
+        assert runs.startswith(reply + "\nNo push or PRs yet: the GitHub App isn't set up")
+        assert "runner/github_token isn't set" in runs
         # The runner never starts anything.
         await w.say("fix the typo in the README in demo")
         assert runs_store.recent(w.conn, 10) == []

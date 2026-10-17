@@ -271,7 +271,9 @@ Times, codes and figures below are examples.
 
 ## 14. Employee mode: Claude workers
 
-Step 13 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen`), then do terminal step 1 below before anything else. Until steps 2–4 are done, everything else keeps working, while `/runs` and "spawn a claude to …" answer `The runner isn't set up: …` (naming what's missing) and nothing can start a run.
+Step 13 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen`), then do terminal step 1 below before anything else. Until step 2 (the Claude token) is done, everything else keeps working, while `/runs` and "spawn a claude to …" answer `The runner isn't set up: secret runner/claude_token …` and nothing can start a run.
+
+**You can start with just the Claude token** (steps 1, 2 and 6). Workers run as soon as it is set: a scratch run works fully, and a repo run works in a worktree of your checkout and commits to its local branch, but can't push or open a PR yet. The start reply says so up front (`On it: R1 · dori. … Heads up: no push yet (GitHub App not set up); the work stays on a local branch.`) and the end reply names the branch (`R1 done (4m): work is on local branch resonant/r1-… in ~/code/dori; can't push yet: the GitHub App isn't set up.`). Steps 3 and 4 unlock the rest, in any order: the GitHub App lets workers push and open PRs (it needs step 4 too, since Resonant finds and checks the PR with its own token), and Resonant's own token unlocks cloning private repos (until then a private repo needs a checkout already in `~/code/<name>`; a public one is cloned anonymously), naming repos it hasn't seen, merging, creating repos, adding CI and fork runs. Each of those says what it needs when asked, and `/runs` lists what's still missing.
 
 What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an employee. "spawn a claude to build out the search page in dori" gets `On it: R4 · dori.`, and a Claude Code worker starts in a git worktree of your real checkout, `~/code/<repo>`, with your `.env` files, Docker and the network. An ask with no repo ("do a manual db update in dori-prod …") gets an empty scratch dir. Workers act on standing trust. They ask you only for something net new (a new system, a new kind of action, anything irreversible, anything that costs money), and they ask questions when they need you (`R4 asks: …`). Good news (a PR, done, merged) goes into the hourly digest; failures, questions and checks text you right away. The **thin guard** (a macOS sandbox) only protects Resonant itself: workers can't write `~/.resonant` or the installed daemon, read the Keychain or Messages, signal the daemon, add auto-start entries or reach the API port. Codes (`R1`, `K4`), PR numbers and times below are examples.
 
@@ -291,7 +293,7 @@ What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an
    ```
 
    For API billing instead, set `runner/anthropic_key` (and `runner.max_budget_usd` in config).
-3. **The GitHub App** (workers' per-run tokens: one repo, one hour, PRs as `<app>[bot]`; [`repos-plan.md`](repos-plan.md) D10, kept by the employee plan):
+3. **The GitHub App** (workers' per-run tokens: one repo, one hour, PRs as `<app>[bot]`; [`repos-plan.md`](repos-plan.md) D10, kept by the employee plan). Without it workers still run and commit locally; this is what lets them push and open PRs:
    1. On github.com: Settings → Developer settings → GitHub Apps → New GitHub App. Any name and homepage URL; untick **Webhook → Active**.
    2. Repository permissions:
       - **Read and write:** Contents, Pull requests, Issues, Workflows, Actions.
@@ -312,7 +314,7 @@ What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an
         github_app: {app_id: 123456, installation_id: 78901234}
       ```
 
-4. **Resonant's own GitHub token** (`runner/github_token`: daemon-only, never in a worker; it reads repos and CI, keeps the mirrors, merges, creates repos and adds starter CI). A **fine-grained** personal access token, resource owner your account, **All repositories**:
+4. **Resonant's own GitHub token** (`runner/github_token`: daemon-only, never in a worker; it reads repos and CI, keeps the mirrors, checks and merges PRs, creates repos and adds starter CI). Without it workers still run on repos you have checked out (or public ones); a push needs it as well as the App. A **fine-grained** personal access token, resource owner your account, **All repositories**:
    - **Read and write:** Contents, Pull requests, Administration (to create repos), Workflows (starter CI).
    - **Read-only:** Checks, Commit statuses, Metadata.
 
@@ -338,7 +340,7 @@ What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an
    - `runs table  PASS  schema v11` (or later);
    - `runner sandbox  PASS`;
    - `runner github app  PASS  app 123456, installation 78901234`;
-   - `runner secret runner/github_token`, `runner secret runner/github_app_key` and `runner secret runner/claude_token (or runner/anthropic_key)`: `PASS  present (value not read)`;
+   - `runner secret runner/claude_token (or runner/anthropic_key)`, `runner secret runner/github_token` and `runner secret runner/github_app_key`: `PASS  present (value not read)`. Until steps 3–4 are done, their rows (and `runner github app`) say `FAIL  … workers still run; needed to push and open PRs: …`: advisory, not a blocker;
    - `runner secret runner/github_public_token (fork runs)`: `PASS`, or `SKIP` if you skipped step 5;
    - `runner code dir`: `SKIP` until the first run creates `~/code` (it clones a repo there the first time it is used), then `PASS`;
    - `runner repos`: `SKIP` is fine. Repos don't need listing: they are registered the first time you name one (or `/repo add`). An entry in `runner.repos` is only a per-repo override (`path` for a checkout outside `~/code`, `allow_github_changes: false`, `base`);
@@ -364,7 +366,7 @@ A small ask on a repo with CI, from iMessage: `/run <repo> add a blank line at t
 
 ### Over iMessage
 
-1. **Not set up (before the terminal steps).** `/runs` → `The runner isn't set up: secret runner/github_token, …, runner.github_app isn't set in the config file. On the Mini: …`.
+1. **Not set up (before the terminal steps).** `/runs` → `The runner isn't set up: secret runner/claude_token (or runner/anthropic_key). On the Mini: resonant secret set runner/claude_token.`, then one line per GitHub piece still missing (`No push or PRs yet: the GitHub App isn't set up, so workers commit to a local branch. On the Mini: …`). With only the Claude token set, the first line goes and the rest stay: "spawn a claude to fix the typo in the README in <repo>" (a repo checked out in `~/code`) → `On it: R1 · <repo>. … Heads up: no push yet (GitHub App not set up); the work stays on a local branch.`, and later `R1 done (…): work is on local branch resonant/r1-… in ~/code/<repo>; can't push yet: the GitHub App isn't set up.` A private repo with no checkout → `I can't work on <owner>/<repo> yet: there's no checkout at …, and cloning it needs the daemon's GitHub token (runner/github_token). …`.
 2. **Spawn a worker in plain words.** "spawn a claude to fix the typo in the README in <repo>" → `On it: R1 · <repo>. Up to 45m. /runs to check, /cancel R1 to stop.` Nothing else is texted when it opens its PR: the next hourly `btw:` has `Workers:` / `R1 done: PR #41 (CI green) · <url>`. `/pulse now` sends it at once.
 3. **`/run` texts the end.** `/run <repo> fix the typo in the README` → the same `On it`, then `R1 done: PR #41 (CI green) · <url> · 1 file · 4m` with `/merge R1 to merge it.` and Claude's summary.
 4. **A question.** Ask for something with a real choice ("spawn a claude to add search to <repo>, ask me which backend"). You get `R1 asks: …`. Reply in plain words; you get `→ R1` and the worker carries on. With two workers waiting, `R2 <answer>` picks one, a reply about one question's content goes to it (`→ R2 (<question>)`), and an unclear one gets `For R1 (…) or R2 (…)?`. "tell R1 to also update the README" → `→ R1 (message)`.
@@ -384,7 +386,7 @@ A small ask on a repo with CI, from iMessage: `/run <repo> add a blank line at t
 
 - **Verify:** `scripts/bootstrap.sh --check` and `resonant sandbox check`.
 - **Expected:** exit 0; `runner sandbox  PASS`, `runs table  PASS`, `runner github app  PASS` and the runner secret rows `PASS` once steps 2–4 are done.
-- **Rollback:** `/kill` stops every run at once. `resonant secret rm runner/claude_token` (or `runner/github_app_key`) keeps new runs from starting. Revoke `runner/github_token` on github.com and uninstall the App (Settings → Applications) to cut GitHub access.
+- **Rollback:** `/kill` stops every run at once. `resonant secret rm runner/claude_token` keeps new runs from starting; `resonant secret rm runner/github_app_key` keeps new runs from pushing (they commit locally). Revoke `runner/github_token` on github.com and uninstall the App (Settings → Applications) to cut GitHub access.
 
 ## Done
 

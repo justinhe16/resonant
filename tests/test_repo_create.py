@@ -133,7 +133,9 @@ async def test_create_repo_pushes_readme_and_ci_protects_and_registers(
     assert body["required_pull_request_reviews"] is not None
     assert body["allow_force_pushes"] is False and body["allow_deletions"] is False
     assert made.protection.startswith("main is protected")
-    assert not any(SECRETS.github_token in " ".join(a) for a, _ in gh.calls)  # never in argv
+    token = SECRETS.github_token
+    assert token is not None
+    assert not any(token in " ".join(a) for a, _ in gh.calls)  # never in argv
 
 
 async def test_public_when_asked(db: sqlite3.Connection) -> None:
@@ -273,6 +275,7 @@ class FakeClaude:
         self.secrets = object()
         self.github = github
         self.resolver = resolver
+        self.secrets_value = SECRETS
 
     async def setup_missing(self) -> str | None:
         return None
@@ -299,8 +302,9 @@ def components(settings: Settings, db: sqlite3.Connection) -> Iterator[Component
 def claude(
     components: Components, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> FakeClaude:
-    async def fake_secrets(store: object) -> RunnerSecrets:
-        return SECRETS
+    async def fake_secrets(store: object, *, claude: bool = True) -> RunnerSecrets:
+        assert claude is False  # the repo tools never start a session
+        return fake.secrets_value
 
     monkeypatch.setattr("resonant.tools.repos.load_runner_secrets", fake_secrets)
     github = FakeGitHub([RepoInfo("me/proj", "main", False, True, True)])
@@ -335,6 +339,26 @@ async def test_create_repo_tool(components: Components, claude: FakeClaude) -> N
     assert out["text"].startswith("Created me/scratch")
     bad = await call(components, "create_repo", {"name": "a b"})
     assert bad["created"] is False and "letters" in bad["text"]
+
+
+async def test_repo_tools_without_the_daemon_token_say_what_they_need(
+    components: Components, claude: FakeClaude
+) -> None:
+    """RX-1: the GitHub repo tools need runner/github_token (not the Claude credential), and
+    each one says so on its own instead of calling the whole runner not set up."""
+    claude.secrets_value = RunnerSecrets(None, None, None)
+    for tool, args, key, what in (
+        ("create_repo", {"name": "scratch"}, "created", "Creating a repo"),
+        ("add_ci", {"repo": "proj"}, "opened", "Adding CI"),
+        ("merge_ci_pr", {"repo": "proj"}, "merged", "Merging the add-CI PR"),
+        ("add_repo", {"repo": "me/proj"}, "added", "Adding a repo"),
+    ):
+        out = await call(components, tool, args)
+        assert out[key] is False, tool
+        assert out["text"].startswith(f"{what} needs the daemon's GitHub token"), out
+        assert "resonant secret set runner/github_token" in out["text"]
+        assert "isn't set up" not in out["text"]
+    assert claude.workspace.calls == []  # nothing reached gh
 
 
 async def test_tools_without_a_runner(components: Components) -> None:

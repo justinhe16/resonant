@@ -77,6 +77,8 @@ class RunnerApi(Protocol):
 
     async def setup_missing(self) -> str | None: ...
 
+    async def capability_notes(self) -> list[str]: ...
+
     async def start_run(
         self,
         repo: str | None,
@@ -410,6 +412,8 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         }
         if not shown:
             out["setup"] = await claude.setup_missing()
+        if limits := await claude.capability_notes():  # what workers can't do yet (RX-1)
+            out["limits"] = limits
         return out
 
     async def _cancel_run(args: dict[str, Any]) -> dict[str, Any]:

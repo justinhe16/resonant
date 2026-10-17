@@ -370,7 +370,10 @@ def runner_rows(
         rows.append(("PASS", False, "runner repos", f"{len(repos)}: {', '.join(sorted(repos))}"))
     app = settings.runner.github_app
     if app is None:
-        why = "runner.github_app (app_id, installation_id) is not in the config: runs need it"
+        why = (
+            "runner.github_app (app_id, installation_id) is not in the config: workers still "
+            "run, but can't push or open PRs (their work stays on a local branch)"
+        )
         rows.append(("FAIL", False, "runner github app", why))
     else:
         detail = f"app {app.app_id}, installation {app.installation_id}"
@@ -391,18 +394,26 @@ def runner_rows(
         except SecretError as e:
             return e.reason
 
+    # Only the Claude credential is needed for any run (RX-1); the GitHub pieces each unlock
+    # more, and a worker runs without them (the rows say what is missing, not that runs fail).
     for label, refs, how in (
-        ("runner/github_token", (GITHUB_TOKEN_REF,), f"resonant secret set {GITHUB_TOKEN_REF}"),
-        (
-            "runner/github_app_key",
-            (GITHUB_APP_KEY_REF,),
-            f"resonant secret set {GITHUB_APP_KEY_REF} --from-file <the downloaded .pem>, "
-            "then delete the .pem",
-        ),
         (
             "runner/claude_token (or runner/anthropic_key)",
             (CLAUDE_TOKEN_REF, ANTHROPIC_KEY_REF),
-            f"claude setup-token, then resonant secret set {CLAUDE_TOKEN_REF}",
+            f"needed for any run: claude setup-token, then resonant secret set {CLAUDE_TOKEN_REF}",
+        ),
+        (
+            "runner/github_token",
+            (GITHUB_TOKEN_REF,),
+            "workers still run; needed for private clones, PR checks, merges, new repos and "
+            f"fork runs: resonant secret set {GITHUB_TOKEN_REF}",
+        ),
+        (
+            "runner/github_app_key",
+            (GITHUB_APP_KEY_REF,),
+            "workers still run; needed to push and open PRs: "
+            f"resonant secret set {GITHUB_APP_KEY_REF} --from-file <the downloaded .pem>, "
+            "then delete the .pem",
         ),
     ):
         step = f"runner secret {label}"

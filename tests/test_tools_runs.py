@@ -53,9 +53,13 @@ class FakeRunner:
         self.reports: list[str] = []
         self.merge_result: Merged | Refused = Merged("R1", 41, ("Makefile",))
         self.questions: list[OpenQuestion] = []
+        self.limits: list[str] = []
 
     async def setup_missing(self) -> str | None:
         return self.missing
+
+    async def capability_notes(self) -> list[str]:
+        return self.limits
 
     async def start_run(
         self,
@@ -397,6 +401,23 @@ async def test_list_runs(
     assert render_runs(await call(components, "list_runs", {"code": "R9"})) == "No run R9."
     with pytest.raises(ToolFailed):
         await call(components, "list_runs", {"code": "nope"})
+
+
+async def test_list_runs_lists_what_workers_cant_do_yet(
+    components: Components, runner: FakeRunner, db: sqlite3.Connection
+) -> None:
+    """RX-1: the missing GitHub pieces are notes after the runs (or "No runs yet."), never a
+    reason the runner can't start."""
+    runner.limits = ["No push or PRs yet: the GitHub App isn't set up, so workers commit to a "
+                     "local branch. On the Mini: x."]  # fmt: skip
+    out = await call(components, "list_runs", {})
+    assert out["limits"] == runner.limits and out["setup"] is None
+    assert render_runs(out) == "No runs yet.\n" + runner.limits[0]
+    make_run(db, status="done")
+    text = render_runs(await call(components, "list_runs", {}))
+    assert text.startswith("Runs (0 active):") and text.endswith("\n" + runner.limits[0])
+    runner.limits = []
+    assert "limits" not in await call(components, "list_runs", {})
 
 
 async def test_list_runs_never_exposes_approval_codes(
