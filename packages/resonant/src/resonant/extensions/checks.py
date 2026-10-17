@@ -20,11 +20,13 @@ import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from resonant.principals import Principals
 from resonant.router.commands import BY_NAME
 from resonant.sandbox import guarded_tool
 from resonant_sdk import Manifest
+from resonant_sdk.manifest import McpHttpServer, mcp_url_problem
 
 # argv[0] words allowed besides a file inside the extension dir. python3 means the daemon's
 # own interpreter; gh and git are looked up on EXT_PATH and pinned at install.
@@ -105,9 +107,29 @@ def dir_errors(root: Path, manifest: Manifest) -> list[str]:
             errors.append(f"{where}: {err}")
     if manifest.mcp:
         for sid, server in manifest.mcp.servers.items():
-            if err := mcp_command_error(root, server.command):
+            if isinstance(server, McpHttpServer):
+                err = mcp_url_error(server.url)
+            else:
+                err = mcp_command_error(root, server.command)
+            if err:
                 errors.append(f"mcp server {sid}: {err}")
     return errors
+
+
+# Plain http to a loopback host is for tests only (their fake server); never set in the
+# daemon. Production MCP-over-HTTP is https only, so the bearer token never crosses a
+# socket another local process could squat on.
+ALLOW_LOOPBACK_HTTP = False
+
+
+def mcp_url_error(url: str) -> str | None:
+    """Why an MCP http server's ``url`` isn't allowed, or None: https only (see
+    ``ALLOW_LOOPBACK_HTTP``)."""
+    if problem := mcp_url_problem(url):
+        return problem
+    if urlsplit(url).scheme != "https" and not ALLOW_LOOPBACK_HTTP:
+        return "url must be https"
+    return None
 
 
 def mcp_key(server_id: str) -> str:

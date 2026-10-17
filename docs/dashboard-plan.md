@@ -1,13 +1,13 @@
 # Phase 4 plan: dashboard, status relay, and MCP for extensions
 
-Status: **implemented** (2026-10-16; MCP-2 in progress). The owner asked for the base dashboard (UI and backend) and MCP for extensions and the brain. Built with robot-surf, a worktree and PR per ticket, in the waves of §5. Hosting (Supabase, Fly, the ntfy app) is the owner's [go-live step 15](go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch); until then the relay is off and the dashboard runs locally.
+Status: **implemented** (2026-10-16). The owner asked for the base dashboard (UI and backend) and MCP for extensions and the brain. Built with robot-surf, a worktree and PR per ticket, in the waves of §5. Hosting (Supabase, Fly, the ntfy app) is the owner's [go-live step 15](go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch); until then the relay is off and the dashboard runs locally.
 
 **As built.**
 - **Local** (DB-1, DB-2): the daemon serves the committed `dashboard/dist` at `127.0.0.1:7777/` with `GET /api/dashboard` (the `local` tier). Read-only, no setup, no Node on the Mini.
 - **Push** (DB-3): with `relay.enabled`, `resonant/dashboard/pusher.py` POSTs `to_remote(snapshot)` every 60 s to the `relay_ingest(p_token, p_data)` RPC with the public anon key and the ingest token from Keychain `relay/supabase_key`. Health row `relay`. Not a custom JWT role: a random token whose SHA-256 sits in `relay_private.config`, checked by `SECURITY DEFINER` functions; the SQL also refuses any local-only field, rate-limits and keeps 7 days.
 - **Remote** (DB-4): `relay/` on one Fly machine, Python standard library only, serves the same build in Supabase mode (password + TOTP, `aal2`, owner-only RLS; TOTP is enrolled once with `supabase/enroll_mfa.mjs`, never in the UI) and runs the dead-man checker through `relay_status(token)` with its own status token: alerts to ntfy or a webhook on stale (5 min), failing and read-error incidents, once each way.
 - **Go-live** (DB-5): step 15 is the ordered owner walkthrough, ending with the freeze test. The relay supersedes `health.healthchecks_url` as the dead-man switch (kept as an option); `--check` has one advisory `dead-man switch` row. Leftovers are in [`followups.md`](followups.md#status-relay-whats-left).
-- **MCP** (MCP-1): stdio servers as extension tools ([`extensions.md`](extensions.md)); MCP-2 (HTTP, the Linear example) is in progress.
+- **MCP** (MCP-1, MCP-2): stdio and streamable-HTTP servers as extension tools ([`extensions.md`](extensions.md)), with the Linear example in `extensions/linear/` (go-live step 12, optional).
 
 ## 1. Decisions
 

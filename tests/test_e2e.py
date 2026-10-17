@@ -116,6 +116,14 @@ async def running(resonant_home: Path, chat: FakeChatDB) -> AsyncIterator[Runnin
     channel = daemon.imessage.channel
     # The reader's baseline read: rows written before it are history and never routed.
     await wait_until(lambda: channel.health()["last_read_at"] is not None, 10)
+    # The reader starts before the API task is even created (Daemon.run), so its baseline
+    # says nothing about the API; uvicorn sets ``started`` only once the socket listens.
+    try:
+        await wait_until(lambda: daemon.server.started or run.done(), 30)
+    except TimeoutError:
+        raise AssertionError(f"daemon API never listened on 127.0.0.1:{port}") from None
+    if run.done():
+        raise AssertionError(f"daemon exited during startup: {run.result()!r}")
     yield Running(daemon, osa, model, chat, port)
     daemon.stop()
     assert await asyncio.wait_for(run, 10) == 0

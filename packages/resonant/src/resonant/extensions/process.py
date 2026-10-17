@@ -48,7 +48,7 @@ import signal
 import string
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -338,6 +338,9 @@ class _Tracked:
     reason: str | None = None  # set when we chose to end it: timeout, killed, …
 
 
+KillHook = Callable[[str], Awaitable[None]]
+
+
 class ProcessTracker:
     """Every live extension process, with its group and sampled descendants.
 
@@ -352,10 +355,19 @@ class ProcessTracker:
         # with kill_all(hold=True) and clears it on resume.
         self.paused = False
         self._live: set[_Tracked] = set()
+        # Work with no process to signal (an MCP server over HTTP): kill_all awaits each
+        # hook with the reason, and counts it.
+        self._hooks: set[KillHook] = set()
 
     @property
     def live(self) -> int:
-        return len(self._live)
+        return len(self._live) + len(self._hooks)
+
+    def add_hook(self, hook: KillHook) -> None:
+        self._hooks.add(hook)
+
+    def remove_hook(self, hook: KillHook) -> None:
+        self._hooks.discard(hook)
 
     async def kill_all(self, reason: str = "killed", *, hold: bool = False) -> int:
         """End every tracked run (SIGTERM, then SIGKILL after the grace). Returns how many.
@@ -365,12 +377,21 @@ class ProcessTracker:
         if hold:
             self.paused = True
         entries = list(self._live)
+        hooks = list(self._hooks)
         for e in entries:
             e.reason = e.reason or reason
-        await asyncio.gather(*(self.terminate(e) for e in entries))
-        if entries:
-            log.warning("ext.process.kill_all", extra={"count": len(entries), "reason": reason})
-        return len(entries)
+        results = await asyncio.gather(
+            *(self.terminate(e) for e in entries),
+            *(h(reason) for h in hooks),
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, BaseException):  # one failure must not stop the others
+                log.error("ext.process.kill_all failed: %s", type(r).__name__)
+        count = len(entries) + len(hooks)
+        if count:
+            log.warning("ext.process.kill_all", extra={"count": count, "reason": reason})
+        return count
 
     def resume(self) -> None:
         """Allow new runs again (the kill switch's release)."""

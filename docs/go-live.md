@@ -234,8 +234,18 @@ Only if you want them (see the github README). Edit the token: Actions **read an
 - `/github rerun_failed justinhe16/resonant 41` on a PR with a failed run: it runs without asking (L3) and replies `Done: github: rerun failed …`. With nothing to re-run it replies `Failed: github: rerun failed …` and changes nothing.
 - `/github pr justinhe16/resonant 41` shows the head SHA. `/github merge_pr justinhe16/resonant 41 <sha>` → `[D7] … merge pr …? This can't be undone. Reply yes D7 / no`. `no` → `Not done.`. Only `yes D7` merges, and only if the head is still `<sha>` and checks are green.
 
+### Optional: Linear (an MCP server over HTTP)
+
+[`extensions/linear`](../extensions/linear/README.md) wires Linear's hosted MCP server (`https://mcp.linear.app/mcp`) with a personal API key as its bearer token. Reads are L0; `save_issue` and `create_comment` are L2 (a plain yes first).
+
+1. In Linear's settings, create a **personal API key** (Read only, or Read + Write for the two writes).
+2. `resonant secret set linear/token` (paste it at the hidden prompt), then `resonant secret check linear/token` → `linear/token: ok`.
+3. `resonant ext add repo:linear`. It first asks `MCP server linear at https://mcp.linear.app/mcp needs linear/token to list its tools.` / `Send linear/token to mcp.linear.app now? [y/N]`; answer `y`. The screen shows `! mcp server "linear" calls "https://mcp.linear.app/mcp" (http, network), sends secret token as its bearer token`, one `! mcp tool … pin <12 hex>` line per tool (reads `read L0`, the writes `write L2: asks`), and a note listing the server tools it never exposes. Type `linear`. If it says `mcp server linear has no tool <name>`, Linear renamed a tool: see the README.
+4. Over iMessage: "what's on my Linear" → your issues (labeled `extension:linear`, no asking). "make a Linear ticket for <x>" → `[A…] … save issue …? Reply yes / no`; `no` → `Not done.`
+5. `/kill` while a Linear call runs ends it (`maybe happened` for a write); `/resume` brings it back.
+
 - **Verify:** `scripts/bootstrap.sh --check`
-- **Expected:** exit 0; `extension github pin`, `secret github/token`, `extension jobs scheduled` and `briefing scheduled` all `PASS`.
+- **Expected:** exit 0; `extension github pin`, `secret github/token`, `extension jobs scheduled` and `briefing scheduled` all `PASS` (and `extension linear pin`, `secret linear/token` if you installed it).
 - **Rollback:** `resonant ext remove github`, type `github`: its tools, jobs and commands go after the restart. It keeps `~/.resonant/ext-data/github/` (`--purge` deletes it) and prints `resonant secret rm github/token` for the token it leaves. `/kill` stops everything at once in the meantime.
 
 ## 13. Phase 3.5: the pulse

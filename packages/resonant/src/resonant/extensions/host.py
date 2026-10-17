@@ -20,9 +20,11 @@ For each ``enabled`` row (``store.extensions``), in name order:
    apart.
 
    MCP tools (``manifest.mcp``) get an ``McpToolHandler`` on one ``McpServerRuntime`` per
-   server instead: the command runs by ``argv0_paths["mcp:<id>"]`` (an in-dir ``.py`` under
-   the daemon's interpreter), every listed tool must have its install-time pin in
-   ``record.mcp_pins``, and its args schema is the pinned, stripped one.
+   server instead: a stdio server's command runs by ``argv0_paths["mcp:<id>"]`` (an in-dir
+   ``.py`` under the daemon's interpreter), an http server is reached at its manifest
+   ``url`` (``extensions/mcp_http.py``) with its bearer secret. Every listed tool must have
+   its install-time pin in ``record.mcp_pins``, and its args schema is the pinned, stripped
+   one.
 
 Any refusal in 2-4 skips the whole extension (nothing half-registered), is audited
 ``ext.load_refused`` and is kept in ``refused`` for health. The status is left
@@ -66,7 +68,14 @@ from resonant.executor import ContextHandler, HandlerKey
 from resonant.extensions import pin
 from resonant.extensions.checks import ALLOWED_COMMANDS, bin_env, bin_key, dir_errors, mcp_key
 from resonant.extensions.handlers import ExtensionHandler
-from resonant.extensions.mcp import McpServerRuntime, McpToolHandler, parse_pins, server_argv
+from resonant.extensions.mcp import (
+    HttpTarget,
+    McpServerRuntime,
+    McpToolHandler,
+    parse_pins,
+    server_argv,
+)
+from resonant.extensions.mcp_http import HTTP_MESSAGE_CAP
 from resonant.extensions.process import (
     ExtAmbiguous,
     ExtCommand,
@@ -89,7 +98,7 @@ from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set
 from resonant.tools.registry import ToolRegistry
 from resonant_sdk import Manifest, ToolSpec
-from resonant_sdk.manifest import Job, duration_s, load_manifest
+from resonant_sdk.manifest import Job, McpHttpServer, duration_s, load_manifest
 
 log = logging.getLogger(__name__)
 
@@ -329,12 +338,17 @@ class ExtensionHost:
         runtimes: dict[str, McpServerRuntime] = {}
         schemas: dict[str, dict[str, object]] = {}
         for sid, server in manifest.mcp.servers.items():
-            try:
-                argv = server_argv(
-                    root, server.command, server.args, record.argv0_paths.get(mcp_key(sid))
-                )
-            except ValueError as e:
-                raise LoadRefused(f"mcp server {sid}: {e}") from None
+            argv: tuple[str, ...] = ()
+            http: HttpTarget | None = None
+            if isinstance(server, McpHttpServer):
+                http = HttpTarget(server.url, server.secret)
+            else:
+                try:
+                    argv = server_argv(
+                        root, server.command, server.args, record.argv0_paths.get(mcp_key(sid))
+                    )
+                except ValueError as e:
+                    raise LoadRefused(f"mcp server {sid}: {e}") from None
             approved: dict[str, str] = {}
             for tool in server.tools:
                 pin = pins.get(tool.name)
@@ -358,7 +372,8 @@ class ExtensionHost:
                 tracker=self.tracker,
                 secrets=lambda: self.secrets,
                 on_drift=lambda sid, tool, live, rec=record: self._drift(rec, sid, tool, live),
-                message_cap=self.message_cap,
+                message_cap=self.message_cap if http is None else HTTP_MESSAGE_CAP,
+                http=http,
             )
         return runtimes, schemas
 

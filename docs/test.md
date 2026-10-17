@@ -67,6 +67,9 @@ Update a row when you try it, with the date and anything odd.
 | 44 | A scratch run (no repo): `On it: R… · no repo (scratch dir).`, then `R… done: <summary>` in the digest; no PR | go-live 14, iMessage 7 | 📱 after 39 |
 | 45 | `/cancel R1`, then `/kill` during a run → run cancelled, nothing left running; `/resume`; `/restart resonant` mid-run finishes with one PR | go-live 14, iMessage 10–11 | 📱 after 39 |
 | 46 | First fork run: the fork appears, the App mints its token, `external_pr` asks, the upstream PR appears only after `yes` | go-live 14, first run | 📱 after 35 and 39 |
+| 48 | Optional Linear: API key → `resonant secret set linear/token`; `resonant ext add repo:linear` asks before sending the token, lists every tool with a pin (writes `L2: asks`) | go-live 12, Optional: Linear 1–3 | 🖥 |
+| 49 | "what's on my Linear" answers with your issues (no asking); "make a Linear ticket for …" asks a plain yes first, `no` → `Not done.` | go-live 12, Optional: Linear 4 | 📱 after 48 |
+| 50 | No Linear key in logs or the DB (`grep -r lin_api ~/.resonant/logs`, `sqlite3` on `audit_log`) | go-live 12, Optional: Linear | 🖥 after 49 |
 
 ## Phase 4: the dashboard
 

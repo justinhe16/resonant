@@ -49,6 +49,7 @@ from resonant.extensions.mcp import (
     McpAmbiguous,
     McpError,
     McpServerRuntime,
+    McpSession,
     McpToolError,
     McpToolHandler,
     approve,
@@ -521,8 +522,9 @@ async def test_kill_switch_ends_the_group_and_holds(
     pid_file = tmp_path / "data" / "child.pid"
     await until(pid_file.exists)
     child = int(pid_file.read_text())
-    assert runtime.session is not None and runtime.session.proc is not None
-    server = runtime.session.proc.pid
+    session = runtime.session
+    assert isinstance(session, McpSession) and session.proc is not None
+    server = session.proc.pid
     assert await runtime.tracker.kill_all("killed", hold=True) == 1
     with pytest.raises(McpAmbiguous, match="killed"):
         await call
