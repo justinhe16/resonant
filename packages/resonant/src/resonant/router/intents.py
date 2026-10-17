@@ -162,7 +162,7 @@ class IntentSet:
         out: dict[str, ExtensionIntent] = {}
         for m in manifests:
             definition = _clean(m.description, DEFINITION_MAX)
-            if not definition or not m.tools:
+            if not definition or not (m.tools or m.mcp):
                 continue
             cleaned = (_clean(x, EXAMPLE_MAX) for x in m.examples[:EXAMPLES_MAX])
             out[m.name] = ExtensionIntent(m.name, definition, tuple(e for e in cleaned if e))

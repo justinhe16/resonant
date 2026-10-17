@@ -129,7 +129,7 @@ def list_extensions(ctx: BuiltinContext) -> dict[str, Any]:
             item["status"], item["reason"] = "refused", "manifest no longer validates"
             out.append(item)
             continue
-        item["tools"] = len(manifest.tools)
+        item["tools"] = len(manifest.tool_specs())
         states = {j.job_id: j for j in store.list_jobs(conn, record.name)}
         item["jobs"] = [
             _job(

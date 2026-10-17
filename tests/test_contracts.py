@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from resonant.extensions.checks import approver_errors
 from resonant.principals import Principals
 from resonant_sdk import Effect, Level, Manifest, ToolSpec
-from resonant_sdk.manifest import parse_yaml
+from resonant_sdk.manifest import McpStdioServer, parse_yaml
 
 # --- ToolSpec invariants ---------------------------------------------------------------
 
@@ -146,7 +146,9 @@ def test_mcp_tools_typed() -> None:
     m = load(TRADE_JEV, mcp={"servers": {"gmail": server}})
     send = next(s for s in m.tool_specs() if s.name == "send")
     assert send.commit and send.effective_level is Level.L1
-    assert m.mcp is not None and m.mcp.servers["gmail"].command == "gmail-mcp"
+    assert m.mcp is not None
+    gmail = m.mcp.servers["gmail"]
+    assert isinstance(gmail, McpStdioServer) and gmail.command == "gmail-mcp"
     bad = {**server, "tools": [{"name": "send"}]}
     with pytest.raises(ValidationError):
         load(TRADE_JEV, mcp={"servers": {"gmail": bad}})  # effect required

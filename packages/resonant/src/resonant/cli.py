@@ -14,6 +14,7 @@ from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, cast
+from urllib.parse import urlsplit
 
 import httpx
 import typer
@@ -73,6 +74,7 @@ from resonant.store.db import (
 )
 from resonant.tools import ToolRegistry
 from resonant_sdk import load_manifest
+from resonant_sdk.manifest import McpHttpServer
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 daemon_app = typer.Typer(no_args_is_help=True, help="Run and supervise the daemon.")
@@ -495,8 +497,13 @@ def ext_validate(
     if manifest.mcp:
         for sid, server in manifest.mcp.servers.items():
             names = ", ".join(t.name for t in server.tools)
-            typer.echo(f"  mcp  {sid:<24} {server.command} (stdio): {names}")
-        typer.echo("  note: ext add starts each MCP server once to read and pin its tools")
+            where = (
+                f"{server.url} (http)"
+                if isinstance(server, McpHttpServer)
+                else f"{server.command} (stdio)"
+            )
+            typer.echo(f"  mcp  {sid:<24} {where}: {names}")
+        typer.echo("  note: ext add contacts each MCP server once to read and pin its tools")
     if grant := report_grant(manifest):
         typer.echo(f"  {grant}")
     if manifest.secrets:
@@ -543,6 +550,19 @@ def _ext_manager(settings: Settings, conn: sqlite3.Connection) -> ExtensionManag
     def secret_exists(ref: str) -> bool:
         return asyncio.run(store.exists(ref))
 
+    def secret_value(ref: str) -> str | None:
+        try:
+            return asyncio.run(store.get(ref))
+        except SecretError:
+            return None
+
+    def allow_token(server_id: str, url: str, ref: str) -> bool:
+        # Asked before the review screen: listing an http server's tools needs its token,
+        # and it goes only to this URL (the manifest's; redirects are refused).
+        # The manifest validated url as printable ASCII with no spaces.
+        typer.echo(f"MCP server {server_id} at {url} needs {ref} to list its tools.")
+        return typer.confirm(f"Send {ref} to {urlsplit(url).hostname} now?", default=False)
+
     return ExtensionManager(
         conn,
         extensions_dir=settings.extensions_dir,
@@ -550,6 +570,8 @@ def _ext_manager(settings: Settings, conn: sqlite3.Connection) -> ExtensionManag
         repo_path=settings.ops.repo_path,
         principals=principals,
         secret_exists=secret_exists,
+        secret_value=secret_value,
+        allow_token=allow_token,
         # where `gh`/`git` argv0 is found and pinned at install (the owner's terminal); the
         # child's own PATH is extensions.process.path (system dirs only)
         ext_path=EXT_PATH,
@@ -591,7 +613,7 @@ def _router_check(settings: Settings, conn: sqlite3.Connection, staged: Staged) 
     from resonant.evals import router_eval
 
     m = staged.manifest
-    if not m.description or not m.tools:
+    if not m.description or not (m.tools or m.mcp):
         typer.echo(
             f"Router: no description or tools, so chat won't route to {staged.name}; "
             f"/{staged.name} works."

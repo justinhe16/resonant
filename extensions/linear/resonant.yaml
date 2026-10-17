@@ -1,0 +1,54 @@
+# linear: Linear's hosted MCP server as extension tools (MCP-2, docs/extensions.md "MCP tools").
+# No code of ours: Resonant speaks MCP over streamable HTTP to the fixed URL below and sends
+# the Keychain secret linear/token (a Linear personal API key) as the bearer token, only there.
+# Tool names are the server's; ext add lists them live and pins each one. Descriptions are
+# ours: the server's own text never reaches the model.
+name: linear
+version: 1
+description: Your Linear issues, projects and teams; what's assigned to you, search, new tickets, updates and comments.
+examples:
+  - what's on my Linear
+  - make a Linear ticket for the flaky login test
+  - add a comment on ENG-123 saying it's fixed
+approvers: [owner]
+secrets: [token]
+
+mcp:
+  servers:
+    linear:
+      transport: http
+      url: https://mcp.linear.app/mcp
+      auth: bearer
+      secret: token
+      tools:
+        # Reads: L0, no asking.
+        - name: list_issues
+          description: >-
+            List or search Linear issues. Filter by query text, team, project, state or
+            assignee; assignee "me" lists your own issues.
+          effect: read
+        - name: get_issue
+          description: One Linear issue by its id or key (like ENG-123), with its details.
+          effect: read
+        - name: list_comments
+          description: The comments on one Linear issue.
+          effect: read
+        - name: list_projects
+          description: Linear projects, optionally filtered by team or query text.
+          effect: read
+        - name: list_teams
+          description: The Linear teams in the workspace, with their keys.
+          effect: read
+        # Writes: L2, a plain yes first.
+        - name: save_issue
+          description: >-
+            Create a Linear issue (no id; needs a title and team) or update one (with its
+            id): title, description, state, assignee, priority, project or labels.
+          effect: write
+          level: L2
+          timeout_s: 60
+        - name: create_comment
+          description: Add a comment (markdown body) to one Linear issue.
+          effect: write
+          level: L2
+          timeout_s: 60

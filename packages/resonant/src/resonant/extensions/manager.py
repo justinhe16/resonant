@@ -51,6 +51,7 @@ from resonant.extensions.checks import (
     resolve_mcp_command,
 )
 from resonant.extensions.mcp import approve, discover, pins_digest, pins_json, server_argv
+from resonant.extensions.mcp_http import discover_http
 from resonant.extensions.pin import (
     CopyState,
     TreeEntries,
@@ -77,6 +78,7 @@ from resonant.store import repos
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, kv_set, utcnow
 from resonant_sdk import Manifest, load_manifest
+from resonant_sdk.manifest import McpHttpServer
 from resonant_sdk.tool import Level
 
 MANIFEST_FILE = "resonant.yaml"
@@ -89,6 +91,26 @@ _ASKS = (Level.L1, Level.L2)
 
 def _discover_sync(req: ExtRequest) -> list[dict[str, Any]]:
     return asyncio.run(discover(req, python=sys.executable))
+
+
+# (url, bearer token or None, label) -> the server's tools/list
+HttpDiscoverFn = Callable[[str, "str | None", str], list[dict[str, Any]]]
+
+
+def _discover_http_sync(url: str, token: str | None, label: str) -> list[dict[str, Any]]:
+    return asyncio.run(discover_http(url, token, label=label))
+
+
+def _no_secret(_ref: str) -> str | None:
+    return None
+
+
+def _never(_sid: str, _url: str, _ref: str) -> bool:
+    return False
+
+
+class _NoToken(Exception):
+    """An http MCP server's bearer token can't be used to list its tools."""
 
 
 class ManagerError(Exception):
@@ -205,6 +227,10 @@ def _mcp_escalations(manifest: Manifest, pins: Mapping[str, Any]) -> list[str]:
         return []
     out: list[str] = []
     for sid, server in manifest.mcp.servers.items():
+        if isinstance(server, McpHttpServer):
+            token = f", sends secret {server.secret} as its bearer token" if server.secret else ""
+            out.append(f"mcp server {_s(sid)} calls {_s(server.url, 160)} (http, network){token}")
+            continue
         line = shlex.join([server.command, *server.args])
         secrets = f", gets secrets {', '.join(server.secrets)}" if server.secrets else ""
         out.append(f"mcp server {_s(sid)} runs {_s(line, 160)} (stdio){secrets}")
@@ -387,6 +413,9 @@ class ExtensionManager:
         actor: str,
         clock: Callable[[], datetime] = utcnow,
         mcp_discover: Callable[[ExtRequest], list[dict[str, Any]]] | None = None,
+        mcp_discover_http: HttpDiscoverFn | None = None,
+        secret_value: Callable[[str], str | None] | None = None,
+        allow_token: Callable[[str, str, str], bool] | None = None,
     ) -> None:
         self.conn = conn
         self.extensions_dir = extensions_dir
@@ -398,13 +427,34 @@ class ExtensionManager:
         self.actor = actor
         self.clock = clock
         self.mcp_discover = mcp_discover or _discover_sync
+        self.mcp_discover_http = mcp_discover_http or _discover_http_sync
+        # An http MCP server that needs its bearer token to list its tools gets it only when
+        # the owner allows it at staging (allow_token(server id, url, secret ref)), or at
+        # install when the manifest is exactly the one they confirmed. Default: never.
+        self.secret_value: Callable[[str], str | None] = (
+            _no_secret if secret_value is None else secret_value
+        )
+        self.allow_token: Callable[[str, str, str], bool] = (
+            _never if allow_token is None else allow_token
+        )
 
     # --- staging ----------------------------------------------------------------------
 
-    def stage(self, source: str | Source, *, expect_name: str | None = None) -> Staged:
+    def stage(
+        self,
+        source: str | Source,
+        *,
+        expect_name: str | None = None,
+        approved_manifest_sha: str | None = None,
+    ) -> Staged:
         """Copy the source's approved bytes into a staging dir and validate them.
 
-        Raises ``SourceError`` or ``ManagerError`` (with every problem); nothing is kept.
+        ``approved_manifest_sha`` (install): the manifest the owner confirmed. A different one
+        raises ``PinChanged`` before any MCP server is contacted; the same one lets an http
+        server's bearer token go to its (confirmed) URL without asking again.
+
+        Raises ``SourceError``, ``ManagerError`` (with every problem) or ``PinChanged``;
+        nothing is kept.
         """
         src = parse_source(source) if isinstance(source, str) else source
         self.extensions_dir.mkdir(parents=True, exist_ok=True)
@@ -432,14 +482,20 @@ class ExtensionManager:
                 raise ManagerError(f"{src.text}: refused", problems)
             entries = tree_entries(root)
             digest = tree_digest(root)
-            mcp_pins, mcp_notes = self._discover_mcp(manifest, root)
+            manifest_sha = hashlib.sha256(raw).hexdigest()
+            confirmed = approved_manifest_sha is not None
+            if confirmed and manifest_sha != approved_manifest_sha:
+                raise PinChanged(
+                    f"{manifest.name}: the source changed since you confirmed; not installed"
+                )
+            mcp_pins, mcp_notes = self._discover_mcp(manifest, root, confirmed=confirmed)
             if tree_digest(root) != digest:
                 raise ManagerError(f"{src.text}: refused", ["an MCP server changed its own files"])
             pin = Pin(
                 source=src.text,
                 commit=files.commit,
                 tree_digest=digest,
-                manifest_sha=hashlib.sha256(raw).hexdigest(),
+                manifest_sha=manifest_sha,
                 mcp=pins_digest(mcp_pins),
             )
             notes = (*files.notes, *mcp_notes)
@@ -473,6 +529,8 @@ class ExtensionManager:
                 except ValueError as e:
                     problems.append(f"bins: {e}")
             for sid, server in (manifest.mcp.servers if manifest.mcp else {}).items():
+                if isinstance(server, McpHttpServer):
+                    continue
                 try:
                     resolve_mcp_command(root, server.command, self.ext_path)
                 except ValueError as e:
@@ -480,10 +538,12 @@ class ExtensionManager:
         return problems
 
     def _discover_mcp(
-        self, manifest: Manifest, root: Path
+        self, manifest: Manifest, root: Path, *, confirmed: bool = False
     ) -> tuple[dict[str, Any], tuple[str, ...]]:
-        """Start each MCP server once, from the staged copy, with no secrets and a scratch
-        home, and pin the tools the manifest lists. Raises ManagerError with every problem."""
+        """Start each stdio MCP server once, from the staged copy, with no secrets and a
+        scratch home, list each http server's tools (with its bearer token only as
+        ``_http_token`` allows), and pin the tools the manifest lists. Raises ManagerError
+        with every problem."""
         if manifest.mcp is None:
             return {}, ()
         scratch = self.extensions_dir / f".discover-{pysecrets.token_hex(6)}"
@@ -496,16 +556,24 @@ class ExtensionManager:
             bins = {bin_env(b): resolve_bin(b, self.ext_path) for b in manifest.bins}
             env = scratch_env(ext=manifest.name, data_dir=scratch, path=SCRATCH_PATH, bins=bins)
             for sid, server in manifest.mcp.servers.items():
-                pinned = resolve_mcp_command(root, server.command, self.ext_path)
-                req = ExtRequest(
-                    argv=server_argv(root, server.command, server.args, pinned),
-                    cwd=root,
-                    env=env,
-                    timeout_s=20.0,
-                    label=f"{manifest.name}/mcp:{sid}",
-                )
+                label = f"{manifest.name}/mcp:{sid}"
                 try:
-                    tools = self.mcp_discover(req)
+                    if isinstance(server, McpHttpServer):
+                        token = self._http_token(manifest.name, sid, server, confirmed)
+                        tools = self.mcp_discover_http(server.url, token, label)
+                    else:
+                        pinned = resolve_mcp_command(root, server.command, self.ext_path)
+                        req = ExtRequest(
+                            argv=server_argv(root, server.command, server.args, pinned),
+                            cwd=root,
+                            env=env,
+                            timeout_s=20.0,
+                            label=label,
+                        )
+                        tools = self.mcp_discover(req)
+                except _NoToken as e:
+                    problems.append(f"mcp server {sid}: {e}")
+                    continue
                 except Exception as e:
                     reason = getattr(e, "reason", None) or type(e).__name__
                     problems.append(f"mcp server {sid} could not list its tools ({reason})")
@@ -523,6 +591,22 @@ class ExtensionManager:
         if problems:
             raise ManagerError(f"{manifest.name}: refused", problems)
         return dict(sorted(pins.items())), tuple(notes)
+
+    def _http_token(self, ext: str, sid: str, server: McpHttpServer, confirmed: bool) -> str | None:
+        """The bearer token to list an http server's tools with: None without auth. The
+        owner allows it per staging (``allow_token``), or confirmed this exact manifest
+        (its URL included). Raises ``_NoToken``."""
+        if server.secret is None:
+            return None
+        ref = secret_ref(ext, server.secret)
+        if not confirmed and not self.allow_token(sid, server.url, ref):
+            raise _NoToken(f"needs {ref} to list its tools, and you didn't allow sending it")
+        value = self.secret_value(ref)
+        if value is None:
+            raise _NoToken(
+                f"needs {ref} to list its tools; store it first: resonant secret set {ref}"
+            )
+        return value
 
     def registered_slugs(self) -> frozenset[str]:
         """Lowercase slugs in the repo registry, for flagging unfamiliar repo links."""
@@ -592,7 +676,9 @@ class ExtensionManager:
         and after the copy. Refuses (``AdoptRequired``) leftovers without ``adopt``. The
         row and the ``ext.install``/``ext.update`` audit row are written last, together.
         """
-        staged = self.stage(approved.source, expect_name=name)
+        staged = self.stage(
+            approved.source, expect_name=name, approved_manifest_sha=approved.manifest_sha
+        )
         old_tmp: Path | None = None
         final = self.extensions_dir / name
         swapped = False
@@ -674,6 +760,8 @@ class ExtensionManager:
         }
         pins.update({bin_key(b): resolve_bin(b, self.ext_path) for b in manifest.bins})
         for sid, server in (manifest.mcp.servers if manifest.mcp else {}).items():
+            if isinstance(server, McpHttpServer):
+                continue  # its url is in the manifest, bound by manifest_sha
             pins[mcp_key(sid)] = resolve_mcp_command(root, server.command, self.ext_path)
         return pins
 

@@ -7,6 +7,7 @@ Work we've decided to do eventually but have deferred. Each entry says why it wa
 Only you can do these: tokens, GitHub settings and the first real runs. Claude never enters a secret, and no secret goes in a command line or a chat. Do them in this order. The full steps and expected output are [`go-live.md`](go-live.md) step 14 (step 12 for the github extension); status rows are in [`test.md`](test.md). Tick them off here.
 
 - [ ] **github extension** (go-live 12, if not done yet): `resonant secret set github/token` (read-only fine-grained token), then `resonant ext add repo:github` (type `github`).
+- [ ] **Optional, Linear** (go-live 12, Optional: Linear): create a Linear personal API key → `resonant secret set linear/token` → `resonant ext add repo:linear` (answer `y` to sending the token to `mcp.linear.app`, then type `linear`). Try "what's on my Linear".
 - [x] **Deploy and reinstall:** done by Claude on 2026-10-16 (main at schema 11, `resonant daemon install` run). If you install the github extension later, the new copy already pins `gh`; keep `extensions.process.path` at `/usr/bin`, `/bin`.
 - [ ] **First: the Claude token.** Claude Code and `gh` installed (`claude --version`; `gh` at `/opt/homebrew/bin/gh`), then `claude setup-token` → `resonant secret set runner/claude_token` (or, for API billing, `resonant secret set runner/anthropic_key` and set `runner.max_budget_usd`). This is the only piece a run needs.
 - [ ] **Authenticated probe:** `read -rs T`, then `CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check; unset T`. No row `FAIL`, and `claude -p with CLAUDE_CODE_OAUTH_TOKEN` and `daemon env holds no secrets` `PASS` (a `SKIP` such as no running Docker socket is fine).
@@ -258,11 +259,12 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 
 ## MCP stdio servers: env-token binaries and secret-gated discovery
 
-*Noted 2026-10-16, from MCP-1 (built: [`extensions.md`](extensions.md) §4, MCP tools). HTTP transport is MCP-2 in [`dashboard-plan.md`](dashboard-plan.md).*
+*Noted 2026-10-16, from MCP-1 (built: [`extensions.md`](extensions.md) §4, MCP tools). HTTP transport built in MCP-2: an http server's bearer token stays in the daemon, and `ext add` sends it for discovery only after the owner says yes to that URL.*
 
 **Open.**
-- A third-party stdio server that reads its token only from an environment variable can't be used: secrets go on fd 4, never the env (a same-user worker could read the env). Options: a per-server "env secrets" grant shown as an escalation, or preferring the HTTP transport (MCP-2, bearer held in the daemon) for such servers.
-- `ext add` lists a server's tools with no secrets, so a server that needs its token to list tools can't be installed. Option: pass the declared secrets to discovery after the owner confirms the command line.
+- A third-party stdio server that reads its token only from an environment variable can't be used: secrets go on fd 4, never the env (a same-user worker could read the env). Options: a per-server "env secrets" grant shown as an escalation, or using the server's HTTP endpoint (bearer held in the daemon) where it has one.
+- `ext add` lists a **stdio** server's tools with no secrets, so one that needs its token to list tools can't be installed. Option: the same ask-then-send as http servers, passing the declared secrets on fd 4 after the owner confirms the command line.
+- Linear's tool names come from public listings, not Linear's docs (which name none): if `ext add repo:linear` reports `has no tool <name>`, rename it in `extensions/linear/resonant.yaml` (likely `create_comment` ↔ `save_comment`).
 - A drifted tool stays disabled until a restart or `ext update`; there is no `/ext` command to re-approve one pin from iMessage.
 
 **Done when.** Each is decided, and built or dropped.

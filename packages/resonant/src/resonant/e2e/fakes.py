@@ -40,6 +40,8 @@ from resonant_sdk import ToolSpec
 LABEL_RULES: tuple[tuple[str, str], ...] = (
     ("my prs", "extension:github"),  # only when github is loaded (in the schema's enum)
     ("time is it in", "extension:example"),
+    ("my linear", "extension:linear"),  # only when linear is loaded
+    ("linear ticket", "extension:linear"),
     ("remind me in", "reminders"),
     ("restart", "ops"),
     ("what can you do", "system"),
@@ -57,6 +59,8 @@ LABEL_RULES: tuple[tuple[str, str], ...] = (
 # (keyword in the current message, tool). First match whose tool is in the toolset wins.
 TOOL_RULES: tuple[tuple[str, str], ...] = (
     ("my prs", "prs"),
+    ("my linear", "list_issues"),
+    ("linear ticket", "save_issue"),
     ("remind me in", "add_reminder"),
     ("restart resonant", "restart_resonant"),
     ("restart ollama", "restart_ollama"),
