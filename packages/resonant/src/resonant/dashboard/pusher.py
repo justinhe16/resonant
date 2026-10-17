@@ -6,9 +6,11 @@ While ``relay.enabled``, the daemon runs :meth:`SnapshotPusher.run` as a backgro
 ``relay_ingest`` (``supabase/migrations``). Push only: nothing connects into the Mini.
 
 - **Credentials.** The request carries the project's anon key (``relay.anon_key``, public) as
-  ``apikey`` and the ingest token from the Keychain (``relay/supabase_key``) in the JSON body.
-  The token is read on every push (``SecretStore`` never caches) and is never logged, put in
-  a URL or a header, or stored anywhere else. Redirects are not followed.
+  ``apikey`` (and as ``Authorization: Bearer`` too only when it is a legacy JWT key; Supabase
+  wants an ``sb_publishable_`` key on ``apikey`` alone) and the ingest token from the Keychain
+  (``relay/supabase_key``) in the JSON body. The token is read on every push (``SecretStore``
+  never caches) and is never logged, put in a URL or a header, or stored anywhere else.
+  Redirects are not followed.
 - **Bounded.** At most ``relay.max_attempts`` attempts per push, each capped at
   ``relay.timeout_s``, with exponential backoff between them, for network errors, timeouts,
   429 and 5xx. A rejected credential (401/403) or a refused snapshot (any other 4xx) is not
@@ -191,10 +193,13 @@ class SnapshotPusher:
     async def _post(self, body: bytes) -> PushOutcome:
         headers = {
             "apikey": self.anon_key,
-            "authorization": f"Bearer {self.anon_key}",
             "content-type": "application/json",
             "prefer": "return=minimal",
         }
+        # Bearer only for a legacy anon JWT: an sb_publishable_ key isn't a JWT and Supabase
+        # wants it on apikey alone (the Fly relay's source.auth_headers does the same).
+        if self.anon_key.count(".") == 2:
+            headers["authorization"] = f"Bearer {self.anon_key}"
         try:
             async with asyncio.timeout(self.config.timeout_s):
                 # stream: the status line is all we need; the body is never read.

@@ -126,10 +126,10 @@ def load(env: Mapping[str, str]) -> Settings:
     read_key = get("RELAY_READ_KEY")
     if mode == "rpc":
         if not token:
-            raise ConfigError("RELAY_STATUS_TOKEN is required (fly secrets set ...)")
+            raise ConfigError("RELAY_STATUS_TOKEN is required (fly secrets import ...)")
     elif mode == "table":
         if not read_key:
-            raise ConfigError("RELAY_READ=table needs RELAY_READ_KEY (fly secrets set ...)")
+            raise ConfigError("RELAY_READ=table needs RELAY_READ_KEY (fly secrets import ...)")
     else:
         raise ConfigError("RELAY_READ must be rpc or table")
 

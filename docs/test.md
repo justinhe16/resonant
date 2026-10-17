@@ -71,6 +71,19 @@ Update a row when you try it, with the date and anything odd.
 | 49 | "what's on my Linear" answers with your issues (no asking); "make a Linear ticket for …" asks a plain yes first, `no` → `Not done.` | go-live 12, Optional: Linear 4 | 📱 after 48 |
 | 50 | No Linear key in logs or the DB (`grep -r lin_api ~/.resonant/logs`, `sqlite3` on `audit_log`) | go-live 12, Optional: Linear | 🖥 after 49 |
 
+## Phase 4: the dashboard
+
+Numbered D1–D6 so they don't collide with other sections' rows. Steps are [`go-live.md`](go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch) step 15.
+
+| # | Test | Expect | Status |
+|---|---|---|---|
+| D1 | Local dashboard: open `http://127.0.0.1:7777/` on the Mini | Overview with health, autonomy, slots and counts, "last seen" under a minute; Workers, Approvals, Pulse, Extensions and Rules & repos tabs with the local detail; no setup needed | 🖥 |
+| D2 | `--check` after go-live 15.7 | `relay pushing  PASS  ok since …`, `relay secret relay/supabase_key  PASS`, `dead-man switch  PASS  relay on: …`; a row a minute in Supabase's `snapshots` | 🖥 after 15.1–15.7 |
+| D3 | Remote sign-in at `https://<app>.fly.dev/` with password + TOTP | Status only (health, counts, states, times): no asks, texts, repo names or rules; a wrong TOTP code or no TOTP reads nothing | 📱 after 15.8 |
+| D4 | Freeze: `kill -STOP $(pgrep -f 'resonant daemon run$')` | Remote dashboard: red `No fresh data for …` banner after ~3 min; phone: one `Resonant: no snapshots` push ~4–6 min after the freeze, and no repeats | 🖥 + 📱 after D3 and 15.9 |
+| D5 | Recovery: `kill -CONT $(pgrep -f 'resonant daemon run$')` | One `Resonant: snapshots back` push within a couple of minutes; banner clears; `resonant status` shows `daemon  up` (a watchdog restart is fine) | 🖥 + 📱 after D4 |
+| D6 | Paused shows from away: `/kill` over iMessage, watch the remote dashboard, then `/resume` | Within about a minute it shows paused and autonomy off (the relay keeps pushing while paused); after `/resume` it's back to on; no alert either way | 📱 after D3 |
+
 ## Needs real data or effort
 
 | # | Test | Where | Status |

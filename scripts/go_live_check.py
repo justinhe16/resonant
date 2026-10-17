@@ -470,6 +470,21 @@ def runner_rows(
 # --- the status relay (docs/dashboard-plan.md D4, DB-3; go-live step 15) -------------------
 
 
+def deadman_row(settings: Settings) -> Row:
+    """Advisory: something off the Mini notices when it goes quiet. The status relay is the
+    dead-man switch (its Fly checker alerts on a gap in snapshots, go-live step 15);
+    ``health.healthchecks_url`` is the older alternative and still works on its own."""
+    step = "dead-man switch"
+    if settings.relay.enabled:
+        extra = " (and health.healthchecks_url)" if settings.health.healthchecks_url else ""
+        # Config only: whether the Fly checker is deployed isn't visible from the Mini.
+        detail = f"relay on: Fly alerts on a snapshot gap once deployed (`fly status`){extra}"
+        return ("PASS", False, step, detail)
+    if settings.health.healthchecks_url:
+        return ("PASS", False, step, "health.healthchecks_url is set")
+    return ("FAIL", False, step, "none: nobody is alerted if the Mini dies (go-live step 15)")
+
+
 def relay_rows(
     settings: Settings,
     conn: sqlite3.Connection | None,
@@ -599,11 +614,7 @@ def main() -> None:
     except OSError as e:
         out("FAIL", True, "Full Disk Access (chat.db)", f"{chat_db}: {e.strerror or e}")
 
-    # Advisory: the status relay's dead-man (relay rows below) replaces it (DB-5 updates this).
-    if settings.health.healthchecks_url:
-        out("PASS", False, "healthchecks URL set", "health.healthchecks_url is set")
-    else:
-        out("FAIL", False, "healthchecks URL set", "health.healthchecks_url is empty")
+    out(*deadman_row(settings))
 
     # Phase 2: the gate, ops and power (docs/go-live.md steps 2 and 11).
     from resonant.store.db import (

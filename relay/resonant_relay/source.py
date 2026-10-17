@@ -1,7 +1,7 @@
 """The checker's read path: the latest snapshot's `taken_at` and health states, nothing more.
 
 `StatusSource` is the interface; the checker never sees how Supabase is reached. Two
-implementations, chosen by RELAY_READ (relay/README.md, "What DB-3 must grant"):
+implementations, chosen by RELAY_READ (relay/README.md, "The checker's read path"):
 
 - `RpcSource` (default, least privilege): calls `public.relay_status(token text)`, a
   SECURITY DEFINER function that checks the token and returns only

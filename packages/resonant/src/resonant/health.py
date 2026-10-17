@@ -8,8 +8,9 @@
 - Dead-man: GETs the configured dead-man URL every ``ping_every_s`` while healthy, and
   POSTs ``<url>/fail`` (with a plain-text reason body) when the loop is stale or the health
   monitor reports a problem it can't text the owner about. If pings stop entirely (machine
-  down, process frozen, network out), the receiver alerts on its own. The planned receiver
-  is the status relay (docs/followups.md), which isn't built yet.
+  down, process frozen, network out), the receiver alerts on its own. Optional: the status
+  relay (``relay:``, go-live step 15) is the main dead-man switch, since its Fly checker
+  alerts when the Mini's snapshots stop.
 """
 
 from __future__ import annotations

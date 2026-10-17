@@ -78,7 +78,7 @@ class ApiConfig(_Section):
     @field_validator("host")
     @classmethod
     def _loopback_only(cls, v: str) -> str:
-        # No public ports: remote status is planned via the push-only status relay.
+        # No public ports: remote status goes through the push-only status relay (relay:).
         if not is_loopback(v):
             raise ValueError("api.host must be a loopback address")
         return v
