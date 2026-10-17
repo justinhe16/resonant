@@ -18,6 +18,12 @@ health:
   ping_every_s: 60
   watchdog_stale_s: 120
 
+relay:                                  # status relay to Supabase (docs/dashboard-plan.md D4; supabase/README.md)
+  enabled: false                        # pushes the remote-tier snapshot only; keeps pushing while /kill-paused
+  supabase_url: null                    # https://<ref>.supabase.co
+  anon_key: null                        # the project's anon/publishable key (public); the write token is Keychain relay/supabase_key
+  every_s: 60
+
 loop:
   tick_s: 30
 

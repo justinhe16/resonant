@@ -1253,3 +1253,38 @@ All endpoints are loopback only. Remote status access is planned via the push-on
 - **Fail soft.** A health row, extension or job whose identifier doesn't match is left out, and counts keep only the known task and run states, so one stale row never breaks the endpoint. A runner check that raises shows as one `missing` entry.
 - **Fields.** As in the plan's §3, with: `pulse.items[]` adds `source`, and its `state` is `new` (the owner hasn't heard this version) or `told`; `repos[]` is `{name, mode, base, ci}` (`ci`: CI seen, null when not checked; there is no stored `protected` flag); `trust_rules[].n` is the rule id; `runs.items` is `runs.recent(limit=50)` (active first) and `waiting_reason` is set only while a run waits; `questions.items` are the open asks of active runs; `approvals.items` are every unexpired pending approval (`asked_at` is when it was created); `extensions[].health` is its `ext:<name>` check; a job's `next_due` comes from the approved manifest's cron (null when the extension is disabled or the schedule doesn't parse); `last_outcome` is one of the scheduler's outcomes or `other`. `health[].state` allows `failing` for the relay (DB-3); the monitor writes only `ok`, `degraded` and `unknown`.
 - **Live state.** `started_at` (when the daemon started) is required and never null. `slots` is the loop's Claude `SlotPool` (`in_use`, `capacity`). The tick period isn't in the snapshot; the UI's 120 s loop-stall threshold assumes the default `loop.tick_s`. `runner.set_up` comes from `ClaudeRunner.setup_gaps()` (secrets by name, never a value), cached for 60 s by the API; with no Claude runner in the daemon (iMessage off) it is `false`. `version` is the checkout's git sha (8 hex, read once per process), else the package version.
+
+## Status relay: `resonant.dashboard.pusher`, `supabase/migrations` (DB-3)
+
+The push-only path from the Mini to Supabase ([`dashboard-plan.md`](dashboard-plan.md) D3–D6). Off by default.
+
+```python
+RelayConfig(enabled=False, supabase_url=None, anon_key=None, every_s=60, timeout_s=10, max_attempts=3)
+SnapshotPusher(conn, config: RelayConfig, *, snapshot: Callable[[], Awaitable[Snapshot]], secrets: SecretStore,
+               client=None, sleep=asyncio.sleep, clock=utcnow, monotonic=time.monotonic, jitter=random.random)
+    async def run() -> None             # push_once() every every_s (start to start) until cancelled
+    async def push_once() -> PushOutcome  # one push with its retries; writes kv health.relay
+PushOutcome(ok: bool, fatal: bool, detail: str)
+clear_relay_health(conn)                # the daemon calls it when relay.enabled is false
+SUPABASE_KEY_REF = "relay/supabase_key" # the ingest token (Keychain)
+api.local_snapshot(state) -> Snapshot   # what /api/dashboard serves; the pusher sends to_remote() of it
+```
+
+- **Config.** `relay.supabase_url` is a bare `https://` URL (no credentials, path, query or fragment; not loopback). `relay.anon_key` is the project's anon or publishable key: public by design (the deployed dashboard ships it in `config.json`), and it can neither read nor write on its own. `relay.enabled` needs both. `every_s` is 15–3600.
+- **Request.** `POST <supabase_url>/rest/v1/rpc/relay_ingest` with headers `apikey: <anon_key>`, `Authorization: Bearer <anon_key>`, body `{"p_token": <relay/supabase_key>, "p_data": <remote-tier Snapshot>}`. The token is read from the Keychain on every push and is only ever in the body. Redirects aren't followed; the response body is never read. `p_data` is `to_remote(...)`, applied inside the pusher, so nothing wider can be passed in; snapshots over 64 KiB (as Postgres measures `data::text`) aren't sent.
+- **Retries.** Up to `max_attempts` per push, each capped at `timeout_s`, with backoff 2 s, 4 s, … (cap 20 s, +0–25 % jitter) for network errors, timeouts, 429 and 5xx. 401/403 (credentials), 404 (migration missing) and other 4xx (refused snapshot) are not retried. A missing Keychain item sends nothing.
+- **Health row `relay`.** kv `health.relay` = `{state, since, detail}`, shown as the `relay` row of the snapshot (both tiers; `detail` is `reason`, local only): `ok` after a push lands, `degraded` after a failed push, `failing` after 3 failed pushes in a row or at once for a non-retryable failure or a missing secret. `detail` is built by code (HTTP status or exception type), redacted of the token and key, and capped at 120 chars. The row in a pushed snapshot is the state *before* that push, so a checker should alert on gaps between snapshots, not on the `relay` row. No row while the relay is off.
+- **Kill switch and dry run.** The relay keeps pushing while paused (`/kill`) and under `dry_run`: it is outbound status, not an action, and `paused: true` is what the owner needs to see from away. Only `relay.enabled: false` stops it.
+- **`--check` rows** (`scripts/go_live_check.py relay_rows`): `status relay enabled` (advisory), `relay supabase_url set`, `relay anon_key set`, `relay secret relay/supabase_key` (existence only; required when enabled, `SKIP` and the Keychain not asked when off), `relay pushing` (advisory, from kv `health.relay`).
+
+### Supabase schema (`supabase/migrations/20261016000000_relay.sql`)
+
+| Object | Shape | Who |
+|---|---|---|
+| `public.snapshots` | `id bigint identity`, `taken_at timestamptz` (the snapshot's own), `received_at timestamptz default now()` (server clock), `data jsonb` (a remote-tier snapshot; object; `octet_length(data::text) <= 65536`). Indexes on `taken_at desc` and `received_at`. RLS on | `SELECT` for `authenticated` when `relay_private.is_owner()`; no other grants or policies |
+| `relay_private.config` | one row: `owner_id uuid`, `ingest_token_sha256 bytea`, `watch_token_sha256 bytea` (32 bytes each, never equal) | `postgres` only (not in an exposed schema) |
+| `relay_private.is_owner() -> boolean` | `auth.uid() = owner_id and auth.jwt()->>'aal' = 'aal2'` | used by the RLS policy |
+| `public.relay_ingest(p_token text, p_data jsonb) -> void` | checks `sha256(p_token)`, that `p_data` is an object, ≤ 64 KiB, `tier = 'remote'`, `schema = 1`, carries none of the local-only fields, and has a `taken_at` no more than 5 min in the future; at most 10 rows per minute; deletes rows received more than 7 days ago; inserts | `anon` (with the ingest token) |
+| `public.relay_watch(p_token text) -> table(taken_at, received_at, health jsonb)` | the latest row by `received_at` (none when empty): its times and `health` as `[{name, state}]` | `anon` (with the watch token): the Fly checker (DB-4) |
+
+Errors use PostgREST's `PTxxx` codes, so the HTTP status is the reason: 403 bad token, 400 not a remote-tier snapshot or bad `taken_at`, 413 too large, 429 rate limited. The dashboard reads `select data, taken_at from snapshots order by taken_at desc limit 1` as the owner. The anon key alone can't select, insert, update or delete anything, or read the config. `tests/test_supabase_sql.py` runs the migration on a real Postgres with a stub of Supabase's roles, `auth.uid()`/`auth.jwt()` and default privileges (`tests/fixtures/supabase_stub.sql`); the `supabase-sql` CI job runs it.

@@ -30,7 +30,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from resonant import __version__
 from resonant.config import Settings, is_loopback
-from resonant.dashboard.snapshot import build_snapshot
+from resonant.dashboard.snapshot import Snapshot, build_snapshot
 from resonant.loop import Loop
 from resonant.monitor import channels_snapshot
 from resonant.status import collect_status
@@ -168,6 +168,19 @@ async def _runner_missing(state: DaemonState) -> list[str] | None:
         return state.runner_check[1]
 
 
+async def local_snapshot(state: DaemonState) -> Snapshot:
+    """The local-tier snapshot of this daemon, as ``/api/dashboard`` serves it. The status
+    relay (``dashboard.pusher``) pushes ``to_remote`` of the same."""
+    return build_snapshot(
+        state.conn,
+        state.settings,
+        started_at=state.started_at,
+        last_tick=state.loop.last_tick,
+        slots=state.loop.slots,
+        runner_missing=await _runner_missing(state),
+    )
+
+
 def create_app(state: DaemonState, *, dashboard_dist: Path | None = None) -> FastAPI:
     app = FastAPI(title="resonant", version=__version__, docs_url=None, redoc_url=None)
     app.add_middleware(LoopbackOnly)
@@ -193,15 +206,7 @@ def create_app(state: DaemonState, *, dashboard_dist: Path | None = None) -> Fas
     async def dashboard(response: Response) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """The local-tier snapshot (docs/dashboard-plan.md §3, docs/snapshot.schema.json)."""
         response.headers["Cache-Control"] = "no-store"  # it carries asks and approval texts
-        snap = build_snapshot(
-            state.conn,
-            state.settings,
-            started_at=state.started_at,
-            last_tick=state.loop.last_tick,
-            slots=state.loop.slots,
-            runner_missing=await _runner_missing(state),
-        )
-        return snap.model_dump(mode="json")
+        return (await local_snapshot(state)).model_dump(mode="json")
 
     @app.get("/api/tools")
     async def tools() -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]

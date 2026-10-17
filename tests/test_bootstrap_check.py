@@ -656,3 +656,85 @@ def test_jobs_and_briefing_rows_come_from_config(resonant_home: Path) -> None:
         "pulse scheduled",
     ]
     assert all(r[0] == "PASS" for r in rows), rows
+
+
+# --- the status relay (DB-3) ---------------------------------------------------------------
+
+RELAY_ON = {
+    "enabled": True,
+    "supabase_url": "https://abcdefghijklmnop.supabase.co",
+    "anon_key": "fake-fake-fake-fake-fake",
+}
+
+
+def _relay_rows(
+    conn: sqlite3.Connection | None, exists: object = None, **relay: object
+) -> dict[str, tuple[str, bool, str]]:
+    helper = _load_helper()
+    calls: list[str] = []
+
+    def fake_exists(ref: str) -> bool:
+        calls.append(ref)
+        if isinstance(exists, BaseException):
+            raise exists
+        return bool(exists)
+
+    rows = helper.relay_rows(load_settings(relay=relay), conn, fake_exists)
+    out = {step: (status, required, detail) for status, required, step, detail in rows}
+    out["_calls"] = ("", False, ",".join(calls))
+    return out
+
+
+def test_relay_rows_are_advisory_while_off(resonant_home: Path) -> None:
+    rows = _relay_rows(None)
+    assert rows["status relay enabled"][:2] == ("FAIL", False)
+    assert rows["relay supabase_url set"][:2] == ("FAIL", False)
+    assert rows["relay anon_key set"][:2] == ("FAIL", False)
+    assert rows["relay secret relay/supabase_key"] == (
+        "SKIP",
+        False,
+        "relay off; Keychain not checked",
+    )
+    assert "relay pushing" not in rows
+    assert rows["_calls"][2] == ""  # the Keychain isn't asked
+
+
+def test_relay_rows_when_on(resonant_home: Path, tmp_path: Path) -> None:
+    from resonant.dashboard.snapshot import RELAY_HEALTH_KV
+    from resonant.secrets import SecretUnavailable
+
+    conn = open_db(tmp_path / "r.db")
+    rows = _relay_rows(conn, True, **RELAY_ON)
+    assert rows["status relay enabled"] == ("PASS", False, "every 60s")
+    assert rows["relay supabase_url set"][:2] == ("PASS", True)
+    assert rows["relay anon_key set"] == ("PASS", True, "set (public key)")
+    assert rows["relay secret relay/supabase_key"] == ("PASS", True, "present (value not read)")
+    assert rows["_calls"][2] == "relay/supabase_key"
+    assert rows["relay pushing"][:2] == ("FAIL", False)
+
+    kv_set(conn, RELAY_HEALTH_KV, {"state": "ok", "since": "2026-10-16T12:00:00.000+00:00"})
+    assert _relay_rows(conn, True, **RELAY_ON)["relay pushing"][:2] == ("PASS", False)
+    kv_set(conn, RELAY_HEALTH_KV, {"state": "failing", "since": None, "detail": "HTTP 401"})
+    assert _relay_rows(conn, True, **RELAY_ON)["relay pushing"] == (
+        "FAIL",
+        False,
+        "failing: HTTP 401",
+    )
+
+    missing = _relay_rows(conn, False, **RELAY_ON)["relay secret relay/supabase_key"]
+    assert missing == ("FAIL", True, "missing: resonant secret set relay/supabase_key")
+    locked = SecretUnavailable("relay/supabase_key", "unavailable: keychain locked")
+    assert _relay_rows(conn, locked, **RELAY_ON)["relay secret relay/supabase_key"] == (
+        "FAIL",
+        True,
+        "unavailable: keychain locked",
+    )
+    conn.close()
+
+
+def test_helper_shows_relay_rows_without_the_keychain(resonant_home: Path) -> None:
+    # The relay is off by default, so the subprocess never asks the (real) Keychain.
+    (resonant_home / "config.yaml").write_text(LIVE_CONFIG)
+    rows = _helper(resonant_home)
+    assert rows["status relay enabled"][:2] == ("FAIL", False)
+    assert rows["relay secret relay/supabase_key"][0] == "SKIP"

@@ -456,6 +456,69 @@ def runner_rows(
     return rows
 
 
+# --- the status relay (docs/dashboard-plan.md D4, DB-3; go-live step 15) -------------------
+
+
+def relay_rows(
+    settings: Settings,
+    conn: sqlite3.Connection | None,
+    exists: Callable[[str], bool] = _keychain_exists,
+) -> list[Row]:
+    """The relay's config, its Keychain item (existence only) and its last push. Advisory
+    while ``relay.enabled`` is false, and then the Keychain isn't asked at all."""
+    from resonant.dashboard.pusher import SUPABASE_KEY_REF
+    from resonant.dashboard.snapshot import RELAY_HEALTH_KV
+    from resonant.secrets import SecretError
+    from resonant.store.db import kv_get
+
+    cfg = settings.relay
+    on = cfg.enabled
+    rows: list[Row] = []
+    if on:
+        rows.append(("PASS", False, "status relay enabled", f"every {cfg.every_s:g}s"))
+    else:
+        rows.append(
+            (
+                "FAIL",
+                False,
+                "status relay enabled",
+                "relay.enabled is false: the dashboard is local only (go-live step 15)",
+            )
+        )
+    if cfg.supabase_url:
+        rows.append(("PASS", on, "relay supabase_url set", cfg.supabase_url))
+    else:
+        rows.append(("FAIL", on, "relay supabase_url set", "relay.supabase_url is empty"))
+    if cfg.anon_key:
+        rows.append(("PASS", on, "relay anon_key set", "set (public key)"))
+    else:
+        rows.append(("FAIL", on, "relay anon_key set", "relay.anon_key is empty"))
+    step = f"relay secret {SUPABASE_KEY_REF}"
+    if not on:
+        rows.append(("SKIP", False, step, "relay off; Keychain not checked"))
+        return rows
+    try:
+        present = exists(SUPABASE_KEY_REF)
+    except SecretError as e:
+        rows.append(("FAIL", True, step, e.reason))
+    else:
+        if present:
+            rows.append(("PASS", True, step, "present (value not read)"))
+        else:
+            rows.append(("FAIL", True, step, f"missing: resonant secret set {SUPABASE_KEY_REF}"))
+    raw: Any = None if conn is None else kv_get(conn, RELAY_HEALTH_KV)
+    if not isinstance(raw, dict):
+        rows.append(("FAIL", False, "relay pushing", "no push recorded (is the daemon running?)"))
+    else:
+        health = cast(dict[str, Any], raw)
+        state, since = health.get("state"), health.get("since")
+        if state == "ok":
+            rows.append(("PASS", False, "relay pushing", f"ok since {since}"))
+        else:
+            rows.append(("FAIL", False, "relay pushing", f"{state}: {health.get('detail')}"))
+    return rows
+
+
 def phase3_rows(
     settings: Settings,
     conn: sqlite3.Connection | None,
@@ -525,7 +588,7 @@ def main() -> None:
     except OSError as e:
         out("FAIL", True, "Full Disk Access (chat.db)", f"{chat_db}: {e.strerror or e}")
 
-    # Advisory until the status relay is built (docs/followups.md).
+    # Advisory: the status relay's dead-man (relay rows below) replaces it (DB-5 updates this).
     if settings.health.healthchecks_url:
         out("PASS", False, "healthchecks URL set", "health.healthchecks_url is set")
     else:
@@ -569,6 +632,11 @@ def main() -> None:
             out(*row)
     except sqlite3.Error as e:
         out("FAIL", True, "extensions", _err(e))
+    try:
+        for row in relay_rows(settings, conn):
+            out(*row)
+    except sqlite3.Error as e:
+        out("FAIL", settings.relay.enabled, "relay pushing", _err(e))
     finally:
         if conn is not None:
             conn.close()
