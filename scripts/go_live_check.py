@@ -477,7 +477,9 @@ def deadman_row(settings: Settings) -> Row:
     step = "dead-man switch"
     if settings.relay.enabled:
         extra = " (and health.healthchecks_url)" if settings.health.healthchecks_url else ""
-        return ("PASS", False, step, f"status relay: Fly alerts on a snapshot gap{extra}")
+        # Config only: whether the Fly checker is deployed isn't visible from the Mini.
+        detail = f"relay on: Fly alerts on a snapshot gap once deployed (`fly status`){extra}"
+        return ("PASS", False, step, detail)
     if settings.health.healthchecks_url:
         return ("PASS", False, step, "health.healthchecks_url is set")
     return ("FAIL", False, step, "none: nobody is alerted if the Mini dies (go-live step 15)")

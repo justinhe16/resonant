@@ -40,7 +40,7 @@ The local dashboard (`http://127.0.0.1:7777/` on the Mini) needs nothing from yo
 - [ ] **Deploy** (15.8): `fly deploy --app "$APP" --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .`, then `fly scale count 1 --app "$APP" --yes`.
 - [ ] **Phone** (15.9): the ntfy app, subscribed to the topic.
 - [ ] **Sign in** (15.10) at `https://<app>.fly.dev/` with password + TOTP.
-- [ ] **Freeze test** (15.11), with Claude watching: `kill -STOP $(pgrep -f 'resonant daemon run')` → stale banner after ~3 min, one `Resonant: no snapshots` push within ~5–7 min; `kill -CONT …` → `Resonant: snapshots back`.
+- [ ] **Freeze test** (15.11), with Claude watching: `kill -STOP $(pgrep -f 'resonant daemon run$')` → stale banner after ~3 min, one `Resonant: no snapshots` push ~4–6 min after the freeze; `kill -CONT …` → `Resonant: snapshots back`.
 
 ## Status relay: what's left
 

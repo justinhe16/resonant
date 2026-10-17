@@ -690,7 +690,7 @@ def test_dead_man_row_passes_with_the_relay_or_a_healthchecks_url(resonant_home:
     hc = {"healthchecks_url": "https://hc-ping.com/00000000-0000-0000-0000-000000000000"}
     status, required, step, detail = helper.deadman_row(load_settings(relay=RELAY_ON))
     assert (status, required, step) == ("PASS", False, "dead-man switch")
-    assert "status relay" in detail
+    assert "relay on" in detail and "fly status" in detail
     assert helper.deadman_row(load_settings(health=hc))[:2] == ("PASS", False)
     both = helper.deadman_row(load_settings(relay=RELAY_ON, health=hc))
     assert both[0] == "PASS" and "healthchecks_url" in both[3]

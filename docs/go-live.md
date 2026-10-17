@@ -451,18 +451,18 @@ Never use the `service_role` key or the JWT secret anywhere outside Supabase. Ea
    S=$(openssl rand -hex 32)
    printf %s "$S" | shasum -a 256 | cut -d' ' -f1     # the status hash: keep it for step 6
    TOPIC=resonant-$(openssl rand -hex 16)
-   echo "ntfy topic: $TOPIC"                         # type it into the phone in step 9, then `clear`
+   echo "ntfy topic: $TOPIC"                         # type it into the phone in step 9
    {
      echo "SUPABASE_URL=https://<ref>.supabase.co"
      echo "SUPABASE_ANON_KEY=<publishable key>"
      echo "RELAY_STATUS_TOKEN=$S"
      echo "NTFY_TOPIC=$TOPIC"
    } | fly secrets import --app "$APP" --stage
-   unset S
+   unset S TOPIC
    fly secrets list --app "$APP"                     # names and digests only
    ```
 
-   `fly apps create` (rather than `fly launch`) leaves `relay/fly.toml` untouched, so the Mini's checkout stays clean for `/update`; every later command names the app with `--app`. The ntfy topic is the only thing between your alerts and anyone else: anyone who knows it can read and post to it, so keep it long and random and don't reuse it. Optional extras on the same pipe: `WEBHOOK_URL=https://…` (a JSON POST per alert, alongside or instead of ntfy), `NTFY_URL` and `NTFY_TOKEN` for your own or a protected ntfy server.
+   `fly apps create` (rather than `fly launch`) leaves `relay/fly.toml` untouched, so the Mini's checkout stays clean for `/update`; every later command names the app with `--app`, so in a new terminal set `APP=…` again first. The ntfy topic is the only thing between your alerts and anyone else: anyone who knows it can read and post to it, so keep it long and random and don't reuse it. Optional extras on the same pipe: `WEBHOOK_URL=https://…` (a JSON POST per alert, alongside or instead of ntfy), `NTFY_URL` and `NTFY_TOKEN` for your own or a protected ntfy server.
 
 ### Back in the SQL editor
 
@@ -490,7 +490,7 @@ Never use the `service_role` key or the JWT secret anywhere outside Supabase. Ea
      anon_key: sb_publishable_…
    ```
 
-   Within a minute, `scripts/bootstrap.sh --check` shows `status relay enabled  PASS`, `relay secret relay/supabase_key  PASS  present (value not read)`, `relay pushing  PASS  ok since …` and `dead-man switch  PASS  status relay: …`, and **Table Editor → snapshots** gains a row a minute (it keeps 7 days). `relay pushing  FAIL  failing: HTTP 403: credentials rejected …` means the ingest hash doesn't match the Keychain item (step 4 or 6); `HTTP 404: relay_ingest not found …`, the migration isn't applied.
+   Within a minute, `scripts/bootstrap.sh --check` shows `status relay enabled  PASS`, `relay secret relay/supabase_key  PASS  present (value not read)`, `relay pushing  PASS  ok since …` and `dead-man switch  PASS  relay on: …`, and **Table Editor → snapshots** gains a row a minute (it keeps 7 days). `relay pushing  FAIL  failing: HTTP 403: credentials rejected …` means the ingest hash doesn't match the Keychain item (step 4 or 6); `HTTP 404: relay_ingest not found …`, the migration isn't applied.
 8. **Deploy the relay**, still from `~/resonant` (the build context is the repo root, because the image copies `dashboard/dist`):
 
    ```sh
@@ -503,18 +503,19 @@ Never use the `service_role` key or the JWT secret anywhere outside Supabase. Ea
 
 ### Your phone and the browser
 
-9. **Alerts.** Install the **ntfy** app (App Store or Play Store), **Subscribe to topic**, enter the topic from step 5 (server `ntfy.sh`, the default), and allow notifications. Then `clear` the Mini's terminal.
+9. **Alerts.** Install the **ntfy** app (App Store or Play Store), **Subscribe to topic**, enter the topic from step 5 (server `ntfy.sh`, the default), and allow notifications. Then clear the Mini's terminal scrollback (**Cmd-K** in Terminal; `clear` alone keeps it).
 10. **The remote dashboard.** Open `https://<app>.fly.dev/` on your phone or any browser, sign in with the email, password and a TOTP code. You see health, autonomy, paused and dry-run, slots and counts, with "last seen" under a minute. There are no asks, message texts, repo names or rules: those stay on the Mini's local dashboard. Nobody else can sign in (sign-ups are off), and a signed-in session without TOTP reads nothing.
 11. **The freeze test** (with Claude watching, if you like). It freezes the whole daemon, watchdog included, which is exactly what the dead-man switch is for:
 
     ```sh
-    kill -STOP $(pgrep -f 'resonant daemon run')
+    pgrep -f 'resonant daemon run$'                  # exactly one pid: the daemon
+    kill -STOP $(pgrep -f 'resonant daemon run$')
     ```
 
-    Expected: after about 3 minutes the remote dashboard shows the red **No fresh data for …** banner ("The Mini has stopped sending snapshots"), and within about 5–7 minutes (5 minutes stale plus up to one check and one push period) your phone gets **Resonant: no snapshots** / `Snapshots stopped: none for …`. Exactly one alert, however long you wait. Then:
+    Expected: after about 3 minutes the remote dashboard shows the red **No fresh data for …** banner ("The Mini has stopped sending snapshots"), and about 4–6 minutes after the freeze (5 minutes from the last snapshot, plus up to one check period) your phone gets **Resonant: no snapshots** / `Snapshots stopped: none for …`. Exactly one alert, however long you wait. Then:
 
     ```sh
-    kill -CONT $(pgrep -f 'resonant daemon run')
+    kill -CONT $(pgrep -f 'resonant daemon run$')
     ```
 
     Expected: within a couple of minutes **Resonant: snapshots back**, and the banner clears. The daemon's watchdog may notice the frozen minutes and exit on resume; launchd restarts it, and `resonant status` shows `daemon  up`. Either way, one recovery alert.
