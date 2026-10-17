@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """A fake Claude Code CLI for the runner tests: ``claude -p`` with stream-json output.
 
-It takes the flags the runner passes (and ignores most), reads the prompt on stdin like the
-real CLI, and acts out one scenario, chosen by an extra ``--scenario NAME`` the test puts in
-``claude_cmd``. Only the standard library. cwd is the run's worktree (or scratch dir) and
+It takes the flags the runner passes (and ignores most), reads stream-json on stdin like the
+real CLI with ``--input-format stream-json`` (RC-1), and acts out one scenario, chosen by an
+extra ``--scenario NAME`` the test puts in ``claude_cmd``. Only the standard library. cwd is the run's worktree (or scratch dir) and
 ``TMPDIR`` is ``<run>/tmp``, which is where it leaves notes for the test:
 ``argv.json`` (flags, env, cwd and the prompt of every invocation) and
 pid files.
@@ -14,7 +14,20 @@ and ``--no-pr`` skip those, and ``--ci-fixes N`` makes it push N more commits as
 
 Scenarios: happy, nochanges, slow, hang, hang_then_ok, escapee, usage_limit, error, maxturns,
 maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, makefile, github, noresult, tokens,
-scratch (a run with no repo: writes notes in its cwd and reports).
+scratch (a run with no repo: writes notes in its cwd and reports), sticky (a scratch run that
+never exits on its own, not even when stdin closes).
+
+Stream-json input (RC-1). A reader thread takes stdin lines: ``user`` messages queue up as
+turns (each noted in ``<run>/tmp/turns.json`` with the pid), and a ``control_request``
+``remote_control`` is answered at once per ``--rc``: ``ok`` (a ``session_url`` naming the pid,
+then ``bridge_state`` events), ``error`` or ``none`` (never answered); each request is noted in
+``rc.json``. The first message is the prompt. After its final ``result`` the process stays
+idle like the real CLI: another message is another turn (the rest of the work if the first turn
+ended waiting for an answer, else a short reply), and only the end of stdin makes it exit.
+``--owner-turn TEXT`` adds a turn right after the first result, as if the owner typed it over
+Remote Control (a second ``result`` Resonant didn't ask for). ``--linger S``: after ``resonant
+ask`` gives up, keep working up to S seconds; a message that arrives then is folded into the
+turn, as the real CLI does with a message written mid-turn.
 
 The worker CLI (EM-3), on the first turn only, before the scenario: ``--note TEXT`` runs
 ``resonant note`` (``--urgent-note TEXT``: ``resonant note TEXT --urgent``), ``--check SYSTEM:ACTION:WHAT`` runs ``resonant check`` (denied: the turn
@@ -38,14 +51,18 @@ import argparse
 import json
 import os
 import signal
+import queue
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from typing import Any
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-p", action="store_true")
+ap.add_argument("-n", "--name")
+ap.add_argument("--input-format")
 ap.add_argument("--session-id")
 ap.add_argument("--resume")
 ap.add_argument("--output-format")
@@ -77,25 +94,95 @@ ap.add_argument("--guard-probe")
 ap.add_argument("--wait-message", type=float, default=0.0)
 ap.add_argument("--bash", action="append", default=[])  # Bash tool calls shown, not run (TR-1)
 ap.add_argument("--self-op", action="append", default=[])  # resonant restart|update, in order
+ap.add_argument("--rc", default="ok", choices=("ok", "error", "none"))
+ap.add_argument("--owner-turn")
+ap.add_argument("--linger", type=float, default=0.0)
 args = ap.parse_args()
 
-prompt = sys.stdin.read()
 session = args.resume or args.session_id
 # cwd is the run's worktree (or scratch dir); TMPDIR is <run>/tmp whatever the guard (HOME is
 # <run>/home under the thin guard, the owner's HOME with it off)
 run_dir = os.path.dirname(os.environ["TMPDIR"].rstrip("/"))
 tmp = os.path.join(run_dir, "tmp")
 scenario = args.scenario
+_out = threading.Lock()
+_files = threading.Lock()
 
 
 def emit(obj: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+    with _out:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
 
 
 def note(name: str, text: str) -> None:
     with open(os.path.join(tmp, name), "w") as f:
         f.write(text)
+
+
+def append(name: str, entry: Any) -> None:
+    with _files:
+        path = os.path.join(tmp, name)
+        items = json.load(open(path)) if os.path.exists(path) else []
+        items.append(entry)
+        note(name, json.dumps(items))
+
+
+# --- stdin: stream-json in (RC-1) ---
+messages: queue.Queue[str | None] = queue.Queue()
+
+
+def control(msg: dict[str, Any]) -> None:
+    rid, req = msg.get("request_id"), msg.get("request") or {}
+    append("rc.json", {"pid": os.getpid(), "request": req, "at": time.time()})
+    if req.get("subtype") != "remote_control" or args.rc == "none":
+        return
+    if args.rc == "error":
+        emit({"type": "control_response", "response": {"subtype": "error", "request_id": rid,
+              "error": "Remote Control requires a claude.ai login"}})  # fmt: skip
+        return
+    url = f"https://claude.ai/code/session_fake{os.getpid()}"
+    body = {"session_url": url} if req.get("enabled") else {}
+    emit({"type": "control_response",
+          "response": {"subtype": "success", "request_id": rid, "response": body}})  # fmt: skip
+    if req.get("enabled"):
+        emit({"type": "system", "subtype": "bridge_state", "state": "ready"})
+
+
+def text_of(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    return "".join(b.get("text", "") for b in content if isinstance(b, dict))
+
+
+def reader() -> None:
+    for line in sys.stdin:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("type") == "control_request":
+            control(msg)
+        elif msg.get("type") == "user":
+            messages.put(text_of(msg["message"]["content"]))
+    messages.put(None)
+
+
+threading.Thread(target=reader, daemon=True).start()
+
+
+def take(timeout: float | None = None, *, folded: bool = False) -> str | None:
+    """The next user message (None: stdin ended), noted in turns.json. With ``timeout``, a
+    queue.Empty when none came."""
+    text = messages.get(timeout=timeout)
+    if text is not None:
+        append("turns.json", {"pid": os.getpid(), "text": text, "folded": folded})
+    return text
+
+
+prompt = take()
+if prompt is None:
+    sys.exit(1)
 
 
 def git(*argv: str) -> None:
@@ -115,10 +202,7 @@ def commit(files: dict[str, str], message: str = "Fix it") -> None:
 def out(*argv: str) -> str:
     """Run a tool the way the session does (PATH is the run-local bin) and note what it did."""
     done = subprocess.run(argv, capture_output=True, text=True)
-    path = os.path.join(tmp, "tools.json")
-    calls = json.load(open(path)) if os.path.exists(path) else []
-    calls.append({"argv": list(argv), "rc": done.returncode, "stderr": done.stderr[-300:]})
-    note("tools.json", json.dumps(calls))
+    append("tools.json", {"argv": list(argv), "rc": done.returncode, "stderr": done.stderr[-300:]})
     return done.stdout.strip()
 
 
@@ -238,15 +322,13 @@ for n, command in enumerate(args.bash):
 def cli(*argv: str) -> tuple[int, str]:
     """``resonant …`` as the session runs it (from PATH), noted for the test."""
     done = subprocess.run(["resonant", *argv], capture_output=True, text=True)
-    path = os.path.join(tmp, "cli.json")
-    calls = json.load(open(path)) if os.path.exists(path) else []
-    calls.append({"argv": list(argv), "rc": done.returncode, "out": done.stdout.strip(),
-                  "err": done.stderr[-300:]})  # fmt: skip
-    note("cli.json", json.dumps(calls))
+    append("cli.json", {"argv": list(argv), "rc": done.returncode, "out": done.stdout.strip(),
+                        "err": done.stderr[-300:]})  # fmt: skip
     return done.returncode, done.stdout
 
 
-if not args.resume:
+def first_steps() -> bool:
+    """The worker CLI steps of a session's first turn. False: the turn ended here."""
     if args.note:
         cli("note", args.note)
     if args.urgent_note:
@@ -256,14 +338,18 @@ if not args.resume:
         rc, _ = cli("check", "--system", system, "--action", action, *args.check_flag, what)
         if rc != 0:
             result("Didn't: denied.")
-            sys.exit(0)
+            return False
     if args.wait_message:
         end = time.time() + args.wait_message
         while time.time() < end:
             _rc, text = cli("note", "still going")
             if "Message from the owner" in text:
                 break
-            time.sleep(0.2)
+            try:  # a message written into the live session is folded into this turn
+                if "Message from the owner" in (take(0.2, folded=True) or ""):
+                    break
+            except queue.Empty:
+                pass
     if args.ask_map:  # runs started with different asks ask different questions
         for needle, value in json.loads(args.ask_map).items():
             if needle in prompt:
@@ -276,102 +362,140 @@ if not args.resume:
             time.sleep(3600)  # as told: wait for the restart to stop the session
         if rc != 0:
             result(f"Didn't {op}: {text.strip()[:80]}")
-            sys.exit(0)
+            return False
     if args.ask:
         extra = ["--options", args.options] if args.options else []
         rc, _ = cli("ask", args.ask, *extra)
         if rc == 3:
+            if args.linger:  # finish what it can; an answer written meanwhile joins this turn
+                try:
+                    take(args.linger, folded=True)
+                    return True
+                except queue.Empty:
+                    pass
             result("Waiting for the owner.")
-            sys.exit(0)
+            return False
+    return True
 
-if scenario in ("hang", "stubborn") or (scenario == "hang_then_ok" and not args.resume):
+
+def work(resumed: bool) -> bool:
+    """One turn of the scenario, ending with its result (or the process). False: the turn
+    ended before the work (a denied check, a question with no answer yet)."""
+    if not resumed and not first_steps():
+        return False
+    if scenario in ("hang", "stubborn") or (scenario == "hang_then_ok" and not resumed):
+        time.sleep(3600)
+        sys.exit(0)
+    elif scenario == "usage_limit" and not os.path.exists(os.path.join(tmp, "limit-seen")):
+        note("limit-seen", "1")
+        reset = int(time.time() + args.reset_in)
+        emit(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": f"Claude AI usage limit reached|{reset}",
+                "session_id": session,
+            }
+        )
+        sys.exit(1)
+    elif scenario == "error":
+        emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
+              "result": "boom", "session_id": session})  # fmt: skip
+        sys.exit(1)
+    elif scenario == "maxturns":
+        emit({"type": "result", "subtype": "error_max_turns", "is_error": True,
+              "session_id": session})  # fmt: skip
+        sys.exit(1)
+    elif scenario == "maxbudget":
+        emit({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+              "session_id": session})  # fmt: skip
+        sys.exit(1)
+    elif scenario == "noresult":
+        sys.exit(0)
+    elif scenario == "nochanges":
+        result("Nothing to change.")
+        return True
+    elif scenario in ("scratch", "sticky"):
+        if args.sleep:
+            time.sleep(args.sleep)
+        with open("notes.md", "w") as f:
+            f.write("the disk is 80% full\n")
+        result("Checked the disk: 80% full, the biggest dir is ~/Downloads.")
+        return True
+
+    if scenario == "escapee":
+        # A child that setsid-ed into its own group, and a grandchild that setsid-ed and lost
+        # its parent (reparented to launchd): both outlive the session unless the runner reaps
+        # them.
+        sleeper = "import time; time.sleep(600)"
+        kid = subprocess.Popen([sys.executable, "-c", sleeper], start_new_session=True)
+        note("escapee.pid", str(kid.pid))
+        middle = (
+            "import subprocess, sys; "
+            f"p = subprocess.Popen([sys.executable, '-c', {sleeper!r}], start_new_session=True); "
+            f"open({os.path.join(tmp, 'orphan.pid')!r}, 'w').write(str(p.pid))"
+        )
+        subprocess.run([sys.executable, "-c", middle], check=True)
+        plain = subprocess.Popen([sys.executable, "-c", sleeper])
+        note("child.pid", str(plain.pid))
+    if scenario == "leak":
+        text = " ".join(args.leak) + " " + json.dumps(dict(os.environ))
+        emit({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+    if scenario == "longline":
+        emit({"type": "assistant",
+              "message": {"content": [{"type": "text", "text": "x" * 2_000_000}]}})  # fmt: skip
+        for leak in args.leak:  # a secret right at the cut of a line that is too long
+            emit({"type": "assistant", "message": {"content": [{"type": "text",
+                  "text": "y" * (1_048_576 - 200) + leak + "z" * 500}]}})  # fmt: skip
+    if scenario == "cachefill":
+        with open(os.path.join(os.environ["UV_CACHE_DIR"], "big.bin"), "wb") as f:
+            f.write(b"\0" * 4_000_000)
+        time.sleep(30)
+    if scenario == "disk":
+        with open(os.path.join(tmp, "big.bin"), "wb") as f:
+            f.write(b"\0" * 4_000_000)
+        time.sleep(30)
+
+    if args.sleep:
+        time.sleep(args.sleep)
+
+    if args.echo_token:  # a session that prints its own credentials into the transcript
+        creds = os.path.join(run_dir, "creds")
+        text = (open(os.path.join(creds, "token")).read()
+                + open(os.path.join(creds, "gh", "hosts.yml")).read())  # fmt: skip
+        emit({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+
+    files = {args.file: f"fixed by {session}\n"}
+    if scenario == "makefile":
+        files.update({"Makefile": "all:\n\ttrue\n", ".claude/settings.json": "{}\n",
+                      "package.json": "{}\n"})  # fmt: skip
+    if scenario == "github":
+        files[".github/workflows/evil.yml"] = "on: push\n"
+    if scenario == "tokens":
+        files[args.file] = " ".join(args.leak) + "\n"
+    commit(files, "Fix the flaky test")
+    probe_creds("creds-end.json")
+    deliver()
+    result("Fixed it. Added " + args.file + ".")
+    return True
+
+
+done = work(resumed=bool(args.resume))
+if args.owner_turn:  # the owner typed in the Claude app: a turn Resonant didn't start
+    emit({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": f"(from the app) {args.owner_turn}"}]}})  # fmt: skip
+    result("Answered the owner in the app.")
+# Idle like the real CLI: each message is another turn; only the end of stdin ends it.
+while True:
+    text = take()
+    if text is None:
+        break
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "on it"}]}})
+    if not done:
+        done = work(resumed=True)
+    else:
+        result("Carried on: " + text[:60])
+if scenario == "sticky":  # never exits on its own, not even after stdin closes
     time.sleep(3600)
-    sys.exit(0)
-elif scenario == "usage_limit" and not os.path.exists(os.path.join(tmp, "limit-seen")):
-    note("limit-seen", "1")
-    reset = int(time.time() + args.reset_in)
-    emit(
-        {
-            "type": "result",
-            "subtype": "error_during_execution",
-            "is_error": True,
-            "result": f"Claude AI usage limit reached|{reset}",
-            "session_id": session,
-        }
-    )
-    sys.exit(1)
-elif scenario == "error":
-    emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
-          "result": "boom", "session_id": session})  # fmt: skip
-    sys.exit(1)
-elif scenario == "maxturns":
-    emit({"type": "result", "subtype": "error_max_turns", "is_error": True,
-          "session_id": session})  # fmt: skip
-    sys.exit(1)
-elif scenario == "maxbudget":
-    emit({"type": "result", "subtype": "error_max_budget_usd", "is_error": True,
-          "session_id": session})  # fmt: skip
-    sys.exit(1)
-elif scenario == "noresult":
-    sys.exit(0)
-elif scenario == "nochanges":
-    result("Nothing to change.")
-    sys.exit(0)
-elif scenario == "scratch":
-    with open("notes.md", "w") as f:
-        f.write("the disk is 80% full\n")
-    result("Checked the disk: 80% full, the biggest dir is ~/Downloads.")
-    sys.exit(0)
-
-if scenario == "escapee":
-    # A child that setsid-ed into its own group, and a grandchild that setsid-ed and lost its
-    # parent (reparented to launchd): both outlive the session unless the runner reaps them.
-    sleeper = "import time; time.sleep(600)"
-    kid = subprocess.Popen([sys.executable, "-c", sleeper], start_new_session=True)
-    note("escapee.pid", str(kid.pid))
-    middle = (
-        "import subprocess, sys; "
-        f"p = subprocess.Popen([sys.executable, '-c', {sleeper!r}], start_new_session=True); "
-        f"open({os.path.join(tmp, 'orphan.pid')!r}, 'w').write(str(p.pid))"
-    )
-    subprocess.run([sys.executable, "-c", middle], check=True)
-    plain = subprocess.Popen([sys.executable, "-c", sleeper])
-    note("child.pid", str(plain.pid))
-if scenario == "leak":
-    text = " ".join(args.leak) + " " + json.dumps(dict(os.environ))
-    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
-if scenario == "longline":
-    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "x" * 2_000_000}]}})
-    for leak in args.leak:  # a secret right at the cut of a line that is too long
-        emit({"type": "assistant", "message": {"content": [{"type": "text",
-              "text": "y" * (1_048_576 - 200) + leak + "z" * 500}]}})  # fmt: skip
-if scenario == "cachefill":
-    with open(os.path.join(os.environ["UV_CACHE_DIR"], "big.bin"), "wb") as f:
-        f.write(b"\0" * 4_000_000)
-    time.sleep(30)
-if scenario == "disk":
-    with open(os.path.join(tmp, "big.bin"), "wb") as f:
-        f.write(b"\0" * 4_000_000)
-    time.sleep(30)
-
-if args.sleep:
-    time.sleep(args.sleep)
-
-if args.echo_token:  # a session that prints its own credentials into the transcript
-    creds = os.path.join(run_dir, "creds")
-    text = open(os.path.join(creds, "token")).read() + open(os.path.join(creds, "gh", "hosts.yml")).read()
-    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
-
-files = {args.file: f"fixed by {session}\n"}
-if scenario == "makefile":
-    files.update({"Makefile": "all:\n\ttrue\n", ".claude/settings.json": "{}\n",
-                  "package.json": "{}\n"})
-if scenario == "github":
-    files[".github/workflows/evil.yml"] = "on: push\n"
-if scenario == "tokens":
-    files[args.file] = " ".join(args.leak) + "\n"
-commit(files, "Fix the flaky test")
-probe_creds("creds-end.json")
-deliver()
-result("Fixed it. Added " + args.file + ".")
 sys.exit(0)

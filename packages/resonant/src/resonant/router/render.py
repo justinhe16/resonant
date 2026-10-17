@@ -280,6 +280,9 @@ def _activity_lines(a: dict[str, Any]) -> list[str]:
         lines.append(
             "Did: " + "; ".join(did[:6]) + (f" +{len(did) - 6} more" if len(did) > 6 else "")
         )
+    url = a.get("remote_url")
+    if isinstance(url, str) and url:  # RC-1: watch or steer it in the Claude app
+        lines.append(f"Remote Control: {url}")
     return lines
 
 

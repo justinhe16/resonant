@@ -40,6 +40,9 @@ Update a row when you try it, with the date and anything odd.
 | 16f | GT-1 a long note: `/note` with ~900 characters | `Saved note …` (up to 1000 characters) | 📱 |
 | 16g | TR-1 during a run: "what's R<n> doing", "status on the <repo> run", `/runs R<n>` | `R<n> <repo>: running $ … · N tool calls in 10m · last event Ns ago`, then `Recent:` commands and `Said: …`; `/runs R<n>` adds `Now: …` under the run line | 📱 during a run |
 | 16h | TR-1 detected side effects: a scratch run asked to `curl -X POST https://httpbin.org/post -d x=1` and a repo run asked to push a tag | The run's digest line ends `· did: POST httpbin.org (curl) (detected); pushed tag … (detected)`; no text for these (not high impact). A run that pushes to its base branch texts `R<n> detected: pushed to main` | 📱 after a run |
+| 16i | RC-1 Remote Control: a scratch run ("spawn a claude to check disk usage") | After `On it: R<n> …`, one text `R<n> Remote Control: https://claude.ai/code/session_…`; the link opens the live session in the Claude app; `/runs R<n>` and "what's R<n> doing" show `Remote Control: …` while it runs; the session shows as ended in the app once the run is done (none left open) | 📱 after deploy ❓ |
+| 16j | RC-1 live message: during a longer run, `tell R<n> also add a line to the README` | `→ R<n> (message)`; the worker acts on it in the same session (no new session in the app, transcript shows the message as a user turn) | 📱 after deploy ❓ |
+| 16k | RC-1 with `runner/claude_token` set (token auth) | Probably `R<n>: Remote Control unavailable: …` once, and the run still finishes; `--check` row `runner remote control` FAILs with the reason (advisory) | 🖥 + 📱 optional |
 
 ## Needs the Mini
 

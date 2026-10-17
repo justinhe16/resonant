@@ -231,8 +231,9 @@ async def test_a_message_reaches_the_running_session(
     await until(lambda: bool(cli_calls(h)), what="the first note")
     assert isinstance(h.runner.deliver_message(code, "also update the README"), Relayed)
     await loop
-    calls = cli_calls(h)
-    assert calls[-1]["out"].endswith("Message from the owner: also update the README")
+    # RC-1: written into the live session as a user message (tests/test_runner_live.py)
+    lines = (h.tmp(code) / "turns.json").read_text()
+    assert "Message from the owner: also update the README" in lines
     assert h.run(code).status == "done" and len(h.argv_log(code)) == 1
     assert isinstance(h.runner.deliver_message(code, "one more"), Refused)  # it's over
     assert isinstance(h.runner.deliver_message("R99", "hi"), Refused)

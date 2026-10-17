@@ -129,7 +129,7 @@ def test_local_only_fields_are_marked() -> None:
     # The §3 local-only fields, so a rename can't silently move one to the remote tier.
     marked = {
         (m.__name__, f)
-        for m in (Snapshot, HealthRow, Runs, Approvals, Questions, Pulse, Runner)
+        for m in (Snapshot, HealthRow, Runs, RunItem, Approvals, Questions, Pulse, Runner)
         for f in m.model_fields
         if snap.is_local_only(m, f)
     }
@@ -138,6 +138,7 @@ def test_local_only_fields_are_marked() -> None:
         ("Snapshot", "repos"),
         ("HealthRow", "reason"),
         ("Runs", "items"),
+        ("RunItem", "remote_url"),
         ("Approvals", "items"),
         ("Questions", "items"),
         ("Pulse", "items"),
@@ -315,10 +316,31 @@ def _check_remote(remote: Snapshot) -> None:
             or re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", s)  # version
         ), s
     # No local-only key at all, at any depth (left out, not null).
-    for key in ("reason", "items", "missing", "trust_rules", "repos"):
+    for key in ("reason", "items", "missing", "trust_rules", "repos", "remote_url"):
         assert f'"{key}"' not in json.dumps(data), key
     # It is still a valid snapshot (the schema DB-3 pushes).
     assert Snapshot.model_validate(data) == remote
+
+
+def test_remote_control_url_is_local_only(db: sqlite3.Connection) -> None:
+    """RC-1: a running worker's Remote Control link is on the local dashboard only (and only
+    while it runs); the remote tier and the relay never carry it."""
+    now = utcnow()
+    url = f"https://claude.ai/code/session_{SECRET}"
+    live = runs.create(db, repo="dori", ask="fix", principal="justin", session_id="s1",
+                       max_seconds=60)  # fmt: skip
+    runs.update(db, live.code, status="running", remote_url=url)
+    gone = runs.create(db, repo="dori", ask="fix", principal="justin", session_id="s2",
+                       max_seconds=60)  # fmt: skip
+    runs.update(db, gone.code, status="ready", remote_url=url)
+    s = build_snapshot(db, load_settings(), started_at=now, last_tick=now, slots=SlotPool(3, 1),
+                       runner_missing=[], now=now, version="deadbeef")  # fmt: skip
+    by_code = {r["code"]: r for r in s.model_dump(mode="json")["runs"]["items"]}
+    assert by_code[live.code]["remote_url"] == url
+    assert "remote_url" not in by_code[gone.code]  # its session is over
+    remote = to_remote(s)
+    _check_remote(remote)
+    assert "claude.ai" not in json.dumps(remote.model_dump(mode="json"))
 
 
 @pytest.mark.parametrize("seed", range(300))

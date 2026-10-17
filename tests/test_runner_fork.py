@@ -574,8 +574,13 @@ async def test_owner_merge_takes_over_an_auto_merge_watch(
         auto = h.run(code).task_id
         res = await h.runner.merge_run(code)
         assert isinstance(res, MergeQueued)
-        old = task_store.get_task(db, cast(str, auto))
-        assert old is not None and old.status == "cancelled" and h.run(code).task_id != auto
+        assert h.run(code).task_id != auto
+
+        def old_cancelled() -> bool:  # a watch caught mid-step stays running until it returns
+            old = task_store.get_task(db, cast(str, auto))
+            return old is not None and old.status == "cancelled"
+
+        await until(old_cancelled, 20, "the old watch cancelled")
         (h.gh_dir / "checks_rc").write_text("0")
         await until(lambda: h.run(code).status == "merged", 20, "the merge")
     finally:

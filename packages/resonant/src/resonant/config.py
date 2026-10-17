@@ -476,6 +476,10 @@ class RunnerConfig(_Section):
     # allow-default Seatbelt profile around every session and the daemon's git in checkouts, a
     # run-local HOME and project settings only (``resonant sandbox check`` proves it).
     guard: Literal["off", "thin"] = "off"
+    # Remote Control per worker (RC-1): ``on`` asks each session for a claude.ai session the
+    # owner can watch and steer from the Claude app (an undocumented control request; a reply
+    # that fails or never comes leaves the run going without it). ``off`` doesn't ask.
+    remote_control: Literal["on", "off"] = "on"
     # The per-run token source. Without it workers can't push.
     github_app: GitHubAppConfig | None = None
 
@@ -513,6 +517,14 @@ class RunnerConfig(_Section):
     keep_days: int = Field(default=7, ge=0, le=365)
     git_path: Path = Path("/usr/bin/git")
     gh_path: Path = Path("/opt/homebrew/bin/gh")
+
+    @field_validator("guard", "remote_control", mode="before")
+    @classmethod
+    def _on_off(cls, v: object) -> object:
+        # YAML 1.1 reads a bare on/off as a boolean: `guard: off` means "off", not False.
+        if isinstance(v, bool):
+            return "on" if v else "off"
+        return v
 
     @field_validator("repos")
     @classmethod

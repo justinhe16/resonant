@@ -33,7 +33,7 @@ EXAMPLE_IDENTITIES = frozenset({"imessage:+15550000000", "imessage:owner@icloud.
 DEFAULT_CHAT_DB = "~/Library/Messages/chat.db"
 PHASE2_SCHEMA = 3  # migration 003: the Phase 2 gate's approvals columns
 PHASE3_SCHEMA = 4  # migration 004: extensions, ext_jobs
-RUNS_SCHEMA = 11  # migration 011: the runs table as workers need it (questions, wait_reason)
+RUNS_SCHEMA = 14  # migration 014: the runs table as workers need it (questions, remote_url)
 STALE_AFTER = timedelta(hours=1)  # pending approvals this far past expires_at are stale
 CMD_TIMEOUT_S = 10.0
 _CAFFEINATE_RE = re.compile(
@@ -367,6 +367,7 @@ def runner_rows(
     exists: Callable[[str], bool] = _keychain_exists,
     has_ci: Callable[[Settings, str], bool | None] = _repo_has_ci,
     login: Callable[[Settings], bool] = _claude_login,
+    remote_last: Any = None,
 ) -> list[Row]:
     """Claude workers (docs/go-live.md step 14): the runs table, the optional ``runner.repos``
     seed, the GitHub App config, the code dir, the runner's secrets (names only, never values),
@@ -495,6 +496,7 @@ def runner_rows(
     else:
         detail = "thin: the Seatbelt profile wraps every worker (resonant sandbox check)"
     rows.append(("PASS", False, "runner guard", detail))
+    rows.append(remote_control_row(settings, remote_last))
     # Resonant's own repo (GD-1): the daemon's checkout is registered as "resonant" at start.
     own = settings.ops.repo_path
     if own is not None and (own / ".git").is_dir() and guard == "thin":
@@ -523,6 +525,25 @@ def runner_rows(
 
 
 # --- the status relay (docs/dashboard-plan.md D4, DB-3; go-live step 15) -------------------
+
+
+def remote_control_row(settings: Settings, last: Any = None) -> Row:
+    """``runner.remote_control`` (RC-1) and the last session's answer (kv
+    ``runner.remote_control``, written by the runner). Advisory: a worker runs without it."""
+    if settings.runner.remote_control == "off":
+        return ("SKIP", False, "runner remote control", "off: workers don't open one")
+    detail = (
+        "on: each worker asks Claude Code for a Remote Control session (an undocumented "
+        "request; needs your claude login, a token may be refused)"
+    )
+    if isinstance(last, dict):
+        seen = cast(dict[str, Any], last)
+        if seen.get("state") == "ok":
+            detail += f"; last answer ok ({seen.get('run')}, {seen.get('at')})"
+        else:
+            why = f"{seen.get('run')}: {seen.get('detail')}, {seen.get('at')}"
+            return ("FAIL", False, "runner remote control", f"{detail}; last unavailable ({why})")
+    return ("PASS", False, "runner remote control", detail)
 
 
 def deadman_row(settings: Settings) -> Row:
@@ -697,8 +718,13 @@ def main() -> None:
         out("FAIL", True, "dry_run", "dry_run off on a pre-Phase-2 install")
 
     now = datetime.now(UTC)
+    remote_last: Any = None
     if conn is not None:
         try:
+            from resonant.runners.claude import REMOTE_KV
+            from resonant.store.db import kv_get
+
+            remote_last = kv_get(conn, REMOTE_KV)
             _store_rows(conn, now)
         except sqlite3.Error as e:
             out("FAIL", True, "kill switch state", _err(e))
@@ -719,7 +745,7 @@ def main() -> None:
             conn.close()
 
     out(*sandbox_row(settings))
-    for row in runner_rows(settings, version):
+    for row in runner_rows(settings, version, remote_last=remote_last):
         out(*row)
 
     out("PASS", True, "timezone", settings.timezone)  # validated when config loads

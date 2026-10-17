@@ -38,7 +38,7 @@ _COLUMNS = frozenset(
         "wait_seconds", "waiting_since", "cost_usd", "tokens_in", "tokens_out", "exit_code",
         "pr_number", "pr_url", "files_changed", "flagged_paths", "summary", "failure",
         "started_at", "ended_at", "workspace", "checkout", "wait_reason", "last_note",
-        "resume_prompt",
+        "resume_prompt", "remote_url",
     }
 )  # fmt: skip
 
@@ -86,6 +86,7 @@ class Run:
     wait_reason: WaitReason | None = None  # why a waiting run waits (migration 011)
     last_note: str | None = None  # the worker's latest ``resonant note``
     resume_prompt: str | None = None  # what the current turn delivered (resent after a crash)
+    remote_url: str | None = None  # the latest session's Remote Control URL (migration 014)
 
     @property
     def scratch(self) -> bool:
@@ -154,6 +155,7 @@ def _row(r: sqlite3.Row) -> Run:
         wait_reason=r["wait_reason"] if "wait_reason" in r.keys() else None,  # noqa: SIM118
         last_note=r["last_note"] if "last_note" in r.keys() else None,  # noqa: SIM118
         resume_prompt=r["resume_prompt"] if "resume_prompt" in r.keys() else None,  # noqa: SIM118
+        remote_url=r["remote_url"] if "remote_url" in r.keys() else None,  # noqa: SIM118
     )
 
 
