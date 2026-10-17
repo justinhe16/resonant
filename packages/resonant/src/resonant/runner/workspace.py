@@ -256,6 +256,10 @@ def link_local_config(checkout: Path, worktree: Path, tracked: Iterable[str]) ->
     return linked
 
 
+def _unguarded(argv: Sequence[str]) -> Sequence[str]:
+    return argv
+
+
 def remote_slug(url: str) -> str | None:
     """``owner/name`` of a github.com remote URL (https, ssh or scp form), else None."""
     m = _GITHUB_REMOTE.fullmatch(url.strip())
@@ -625,7 +629,10 @@ class Workspace:
         guard: Callable[[Sequence[str]], Sequence[str]] | None = None,
     ) -> None:
         """``guard`` wraps every git command run in a checkout (whose ``.git`` a worker can
-        write) so it runs under the thin guard (EM-3): by default ``sandbox.wrap``."""
+        write) so it runs under the thin guard (EM-3): by default ``sandbox.wrap`` when
+        ``runner.guard`` is ``thin``, and nothing when it is ``off`` (GD-1: a worker runs
+        unguarded then, so guarding the daemon's git from it would protect nothing, and the
+        daemon's own checkout, write-protected by the profile, can be a run's repo)."""
         self.cfg = cfg
         self.conn = conn  # the repo registry (store.repos)
         # The git URL of a repo. Always https without credentials; tests point it at a path.
@@ -635,7 +642,7 @@ class Workspace:
         self.fork_wait_s = fork_wait_s
         self._locks: dict[str, asyncio.Lock] = {}
         self._git_bin = str(cfg.git_path)
-        self._guard = guard or self._sandbox_guard
+        self._guard = guard or (self._sandbox_guard if cfg.guard == "thin" else _unguarded)
         self._guard_prefix: list[str] | None = None
 
     def _sandbox_guard(self, argv: Sequence[str]) -> Sequence[str]:
@@ -822,6 +829,15 @@ class Workspace:
         if res.returncode != 0:
             raise GitError(args, res.returncode, res.stderr)
         return res.stdout
+
+    async def origin_slug(self, checkout: Path) -> str | None:
+        """``owner/name`` of a checkout's github.com ``origin`` (daemon git, no token), or
+        None when it has none or git can't say."""
+        try:
+            origin = await self._in_checkout(checkout, "config", "--get", "remote.origin.url")
+        except (GitError, RunnerError, OSError):
+            return None
+        return remote_slug(origin.decode(errors="replace"))
 
     async def ensure_checkout(
         self, repo: Repo, token: str | None, *, fork: str | None = None

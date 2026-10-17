@@ -453,8 +453,11 @@ def build(
         return fake_github
 
     loop = Loop(conn, {}, LoopConfig(tick_s=0.05, stuck_after_s=120), SlotPool(3, 1))
+    owner_home = root / "owner-home"  # the guard is off by default: a fake owner's HOME
+    owner_home.mkdir(exist_ok=True)
     options: dict[str, Any] = {
         "runner": cfg,
+        "home": owner_home,
         "channel": cast(Channel, chan),
         "secrets": SecretStore(keychain),
         "workspace": ws,
@@ -536,7 +539,8 @@ async def test_happy_path_ends_in_a_pr(h: Harness) -> None:
 
 
 async def test_session_flags_environment_and_prompt(h: Harness) -> None:
-    h.runner.cfg = h.cfg.model_copy(update={"max_budget_usd": 2.0})
+    # the thin guard's session (the default, guard off, is tests/test_runner_guard.py)
+    h.runner.cfg = h.cfg.model_copy(update={"max_budget_usd": 2.0, "guard": "thin"})
     await h.start(ask="fix the flaky test")
     await h.drain()
     [call] = h.argv_log()
@@ -701,8 +705,9 @@ async def test_not_set_up_names_what_is_missing(
     assert isinstance(res, Refused)
     # only the Claude credential blocks a run (RX-1); the GitHub pieces aren't named
     assert res.reason == (
-        f"The runner isn't set up: secret {CLAUDE_TOKEN_REF} (or {ANTHROPIC_KEY_REF}). "
-        f"On the Mini: resonant secret set {CLAUDE_TOKEN_REF}."
+        f"The runner isn't set up: a Claude login (or secret {CLAUDE_TOKEN_REF} (or "
+        f"{ANTHROPIC_KEY_REF})). On the Mini: log in with `claude` in the Mini's terminal, or "
+        f"resonant secret set {CLAUDE_TOKEN_REF}."
     )
     assert runs_store.recent(h.conn) == []
     assert isinstance(await h.runner.start_run(None, "x", "owner"), Refused)
@@ -848,6 +853,7 @@ async def test_sandbox_self_check_fails_closed(tmp_path: Path, db: sqlite3.Conne
         return False, "securityd lookup gave 0"
 
     h = build(tmp_path, db, self_check=check_bad)
+    h.runner.cfg = h.cfg.model_copy(update={"guard": "thin"})
     await h.start()
     await h.drain()
     run = h.run()

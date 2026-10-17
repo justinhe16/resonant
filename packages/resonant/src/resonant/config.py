@@ -461,7 +461,14 @@ class GitHubAppConfig(_Section):
 class RunnerConfig(_Section):
     """The Claude runner (docs/employee-plan.md D1). Nothing here is secret."""
 
-    # The per-run token source. Without it the runner is not set up.
+    # The wall around workers (docs/employee-plan.md, GD-1). ``off`` (the default): a worker
+    # runs like the owner at the keyboard, with the real HOME (the owner's ~/.claude skills,
+    # CLAUDE.md, settings and MCP servers) and no sandbox-exec; trust rules and approvals are
+    # followed by the worker as instructed, not enforced by the OS. ``thin``: EM-1's
+    # allow-default Seatbelt profile around every session and the daemon's git in checkouts, a
+    # run-local HOME and project settings only (``resonant sandbox check`` proves it).
+    guard: Literal["off", "thin"] = "off"
+    # The per-run token source. Without it workers can't push.
     github_app: GitHubAppConfig | None = None
 
     # name -> repo. Only a seed: at startup these are imported into the repo registry (the

@@ -496,3 +496,53 @@ def scratch_env(
     if anthropic_key:
         env["ANTHROPIC_API_KEY"] = anthropic_key
     return env
+
+
+def owner_env(
+    params: SandboxParams,
+    *,
+    home: Path,
+    path_dirs: Sequence[str | os.PathLike[str]] = (),
+    claude_token: str | None = None,
+    anthropic_key: str | None = None,
+) -> dict[str, str]:
+    """A session's environment with the guard off (``runner.guard: off``): the owner's real
+    ``HOME`` (so ``claude`` loads ``~/.claude``: skills, the user CLAUDE.md, settings, MCP
+    servers, and its stored login), the install dirs on ``PATH`` after the run-local
+    ``bin/``. Still built from nothing (no ``os.environ``, no ``SSH_AUTH_SOCK``), with the run's
+    own temp dir and the shared caches, so cleanup and the disk limits work as before. At
+    most one Claude credential is set, the caller's choice (``runner.claude_auth``); none
+    means the stored login."""
+    import pwd
+
+    run, cache = Path(checked_path(params.run_dir)), Path(checked_path(params.cache_dir))
+    extra = [checked_path(d) for d in path_dirs if Path(d).exists()]
+    path = [str(run / "bin"), *host_tool_path().split(os.pathsep), *SYSTEM_PATH, *extra]
+    env = {
+        "PATH": ":".join(dict.fromkeys(path)),
+        "HOME": str(home),
+        "TMPDIR": str(run / "tmp"),
+        "CLAUDE_CODE_TMPDIR": str(run / "tmp"),
+        "LANG": "en_US.UTF-8",
+        "UV_CACHE_DIR": str(cache / "uv"),
+        "npm_config_cache": str(cache / "npm"),
+        "PIP_CACHE_DIR": str(cache / "pip"),
+        "DISABLE_AUTOUPDATER": "1",
+        "GIT_AUTHOR_NAME": GIT_NAME,
+        "GIT_AUTHOR_EMAIL": GIT_EMAIL,
+        "GIT_COMMITTER_NAME": GIT_NAME,
+        "GIT_COMMITTER_EMAIL": GIT_EMAIL,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        user = None
+    if user:
+        env["USER"] = env["LOGNAME"] = user
+    if claude_token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_token
+    elif anthropic_key:
+        env["ANTHROPIC_API_KEY"] = anthropic_key
+    return env

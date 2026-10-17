@@ -71,9 +71,11 @@ import logging
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 from resonant.components import Components
 from resonant.config import ModelConfig, Settings
+from resonant.executor import ToolFailed
 from resonant.extensions.briefing import JOB_ID as BRIEFING_JOB
 from resonant.extensions.host import ExtensionHealth, ExtensionHost, send_alerts
 from resonant.extensions.notify import Notifier
@@ -86,14 +88,17 @@ from resonant.gateway.imessage.sender import OsaRunner
 from resonant.loop import Loop, NewTask
 from resonant.models import ModelClient
 from resonant.monitor import HealthMonitor
-from resonant.ops import back_up
+from resonant.ops import SubprocessRunner, back_up
 from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
 from resonant.runners.claude import ClaudeRunner
 from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
 from resonant.runners.reminder import ReminderRunner
+from resonant.runners.worker_desk import SelfOps
 from resonant.secrets import SecretStore
+from resonant.store.db import utcnow
+from resonant.tools.ops import Ops
 from resonant.trust.checks import TrustChecks
 from resonant_sdk import Event, ToolSpec
 from resonant_sdk.manifest import TOOL_TIMEOUT_MAX_S
@@ -204,6 +209,29 @@ class IMessageStack:
             await close()
 
 
+class _DryRunOps:
+    """A worker's restart or update under ``dry_run``: refused the way the gate would say."""
+
+    async def restart_resonant(self) -> dict[str, Any]:
+        raise ToolFailed("dry run: would restart Resonant")
+
+    async def update_resonant(self) -> dict[str, Any]:
+        raise ToolFailed("dry run: would update Resonant")
+
+
+def _worker_ops(
+    conn: sqlite3.Connection, settings: Settings, components: Components, owner: str | None
+) -> SelfOps | None:
+    """What a worker's ``resonant restart|update`` runs (GD-1): the ops tools' ``Ops``, which
+    tells ``owner`` "Back up" after the restart. None without an owner to tell."""
+    if owner is None:
+        return None
+    if settings.dry_run:
+        return _DryRunOps()
+    runner = components.ops_runner if components.ops_runner is not None else SubprocessRunner()
+    return Ops(conn, settings, runner, owner=owner, clock=utcnow)
+
+
 def build_imessage_stack(
     settings: Settings,
     conn: sqlite3.Connection,
@@ -297,6 +325,7 @@ def build_imessage_stack(
         components.principals,
         approval_ttl_s=settings.runner.ask_timeout_minutes * 60,
     )
+    owner_name = components.principals.owner if components.principals_loaded else None
     claude = ClaudeRunner(
         conn,
         runner=settings.runner,
@@ -309,6 +338,11 @@ def build_imessage_stack(
         # answers and owner messages wake a run's task through the loop (EM-3)
         submit=loop.submit,
         trust=trust,
+        # GD-1: a worker's `resonant restart|update` runs the same ops as /restart and
+        # /update, and the daemon's own checkout is the repo "resonant"
+        self_ops=_worker_ops(conn, settings, components, owner_name),
+        owner=owner_name,
+        self_repo=settings.ops.repo_path,
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude

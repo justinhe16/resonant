@@ -1207,7 +1207,8 @@ def bench_e2e(
 # --- sandbox ---------------------------------------------------------------------------
 
 sandbox_app = typer.Typer(
-    no_args_is_help=True, help="The workers' thin guard (docs/employee-plan.md D2)."
+    no_args_is_help=True,
+    help="The workers' thin guard (docs/employee-plan.md D2), used when runner.guard is thin.",
 )
 app.add_typer(sandbox_app, name="sandbox")
 
@@ -1218,18 +1219,38 @@ def sandbox_check(
         str, typer.Option(help="all, ci (host-independent probes) or local (needs the Mini).")
     ] = "all",
     as_json: Annotated[bool, typer.Option("--json")] = False,
+    thin: Annotated[
+        bool, typer.Option("--thin", help="Probe the thin guard even while runner.guard is off.")
+    ] = False,
 ) -> None:
     """Run every probe against the live runner profile and print a table. Exit 1 on any
     failure. Re-run after every macOS update. Set CLAUDE_CODE_OAUTH_TOKEN to also run an
-    authenticated `claude -p` inside the sandbox."""
+    authenticated `claude -p` inside the sandbox. With runner.guard: off (the default)
+    workers run without the sandbox, so every probe is skipped (and said so) unless --thin."""
     from resonant.sandbox import SandboxError, default_deny_exec
-    from resonant.sandbox.probes import probe_context, render_table, run_probes
+    from resonant.sandbox.probes import probe_context, render_table, run_probes, skipped_probes
 
     if scope not in ("all", "ci", "local"):
         typer.echo("--scope must be all, ci or local", err=True)
         raise typer.Exit(2)
     scopes: tuple[Any, ...] = ("ci", "local") if scope == "all" else (scope,)
     runner = load_settings().runner  # the same dirs a real run uses
+    if runner.guard == "off" and not thin:
+        why = "runner.guard is off: workers run without sandbox-exec"
+        results = skipped_probes(scopes, why)
+        if as_json:
+            typer.echo(json.dumps([r.as_dict() for r in results], indent=2))
+        else:
+            typer.echo(
+                f"guard: off. {why} (like the owner at the keyboard), so the thin guard's "
+                "probes are skipped. Set runner.guard: thin to use it, or pass --thin to "
+                "probe it anyway."
+            )
+            typer.echo(render_table(results))
+        return
+    if not as_json:
+        typer.echo(f"guard: {runner.guard}" + (" (probing thin: --thin)" if thin and
+                   runner.guard == "off" else ""))  # fmt: skip
     try:
         with probe_context(
             work_dir=runner.work_dir,

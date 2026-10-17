@@ -95,8 +95,9 @@ async def test_no_claude_credential_refuses_every_run(
     h = build(tmp_path, db)
     del h.keychain.items[CLAUDE_TOKEN_REF]
     want = (
-        f"The runner isn't set up: secret {CLAUDE_TOKEN_REF} (or {ANTHROPIC_KEY_REF}). "
-        f"On the Mini: resonant secret set {CLAUDE_TOKEN_REF}."
+        f"The runner isn't set up: a Claude login (or secret {CLAUDE_TOKEN_REF} (or "
+        f"{ANTHROPIC_KEY_REF})). On the Mini: log in with `claude` in the Mini's terminal, or "
+        f"resonant secret set {CLAUDE_TOKEN_REF}."
     )
     assert await h.runner.setup_missing() == want
     for repo in ("proj", None):

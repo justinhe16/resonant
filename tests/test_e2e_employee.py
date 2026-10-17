@@ -255,7 +255,7 @@ async def test_the_thin_guard_lets_a_worker_read_env_but_not_touch_resonant(
         "wrap": claude_mod._sandbox_wrap,  # pyright: ignore[reportPrivateUsage]
         "claude_cmd": [python, str(fake), "--no-push", "--guard-probe", json.dumps(probe)],
         "path_dirs": [Path(python).parent],
-    })  # fmt: skip
+    }, guard="thin")  # fmt: skip
     # the owner's own checkout, with its .env (untracked, as in real life)
     checkout = w.settings.runner.code_dir / REPO
     git(w.root, "clone", "-q", str(w.remote), str(checkout))

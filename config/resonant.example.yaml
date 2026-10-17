@@ -88,13 +88,15 @@ pulse:
 # github_app, which runs need (Claude adds it when you give it the IDs). Defaults shown;
 # github_app and repos are examples:
 # runner:
+#   guard: off                          # off: workers run like you (real HOME, your ~/.claude and claude
+#                                       #   login, no sandbox); thin: the Seatbelt thin guard (needs a token)
 #   github_app: {app_id: 123456, installation_id: 12345678}   # public IDs; key: Keychain runner/github_app_key
 #   code_dir: ~/code                    # checkouts; worktrees in .worktrees/<name>/R<n>, scratch in .scratch/R<n>
-#   work_dir: ~/resonant-runs           # run dirs (the session's home, tmp, credentials)
+#   work_dir: ~/resonant-runs           # run dirs (the session's tmp, credentials; its home under thin)
 #   cache_dir: ~/resonant-runs/.cache   # package caches shared between runs
 #   mirror_dir: ~/.resonant/runner/mirrors   # daemon-only bare mirrors the pre-merge checks read
 #   secrets_dir: ~/.resonant/run-secrets     # per-call token files, daemon-only
-#   deny_read: []                       # extra paths a worker may neither read nor write
+#   deny_read: []                       # thin only: extra paths a worker may neither read nor write
 #   max_minutes: 45                     # session time limit (1..600)
 #   max_budget_usd: null                # per-run cap; set it with runner/anthropic_key (API billing)
 #   ask_timeout_minutes: 240            # how long a worker's ask or check waits for you
@@ -103,7 +105,8 @@ pulse:
 #   max_cache_gb: 20
 #   git_path: /usr/bin/git
 #   gh_path: /opt/homebrew/bin/gh
-#   repos:                              # optional overrides; repos register on first use
+#   repos:                              # optional overrides; repos register on first use, and
+#                                       # Resonant's own checkout (ops.repo_path) is "resonant"
 #     dori:
 #       remote: github.com/you/dori
 #       base: main

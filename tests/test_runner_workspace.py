@@ -722,7 +722,10 @@ async def test_a_planted_smudge_filter_runs_only_under_the_guard(
 ) -> None:
     """EM-3 (S2): a worker can write its checkout's config. A filter there runs only inside
     the thin guard (as the worker could run it anyway), never as the daemon: it can't write
-    Resonant's state."""
+    Resonant's state. Only with ``runner.guard: thin``: with the guard off (GD-1) the daemon's
+    git in a checkout is unwrapped, as the worker itself is."""
+    env.cfg = env.cfg.model_copy(update={"guard": "thin"})
+    env.ws = Workspace(env.cfg, env.conn, url_for=lambda repo: str(env.remote))
     seed = env.root / "seed"
     (seed / ".gitattributes").write_text("*.txt filter=evil\n")
     (seed / "a.txt").write_text("a\n")
@@ -1777,3 +1780,10 @@ async def test_starter_ci_merge_is_stricter_not_looser(
     with pytest.raises(MergeRefused, match="isn't only the starter CI"):
         await env.ws.merge("proj", 41, run_head, SECRETS, branch=p.branch, starter_ci=True)
     assert env.gh_calls("merge") == []
+
+
+def test_the_daemons_git_is_unwrapped_with_the_guard_off(env: Env) -> None:
+    """GD-1: the default guard is off, so nothing wraps the daemon's git in a checkout."""
+    assert env.cfg.guard == "off"
+    ws = Workspace(env.cfg, env.conn)
+    assert ws._guard(["git", "status"]) == ["git", "status"]  # pyright: ignore[reportPrivateUsage]

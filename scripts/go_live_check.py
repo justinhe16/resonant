@@ -297,11 +297,18 @@ def _keychain_exists(ref: str) -> bool:
 def sandbox_row(settings: Settings) -> Row:
     """The runner sandbox (the thin guard), built from the configured runner dirs, denies a
     write into ~/.resonant, the Keychain service and the API port. Writes nothing while the
-    guard holds (the dirs need not exist). Advisory until a runner is configured."""
+    guard holds (the dirs need not exist). Advisory until a runner is configured. With
+    ``runner.guard: off`` (the default, GD-1) workers run without it: a SKIP saying so."""
     from resonant.sandbox import SandboxParams, default_deny_exec, default_path_dirs
     from resonant.sandbox.probes import self_check
 
     r = settings.runner
+    if r.guard == "off":
+        why = (
+            "runner.guard is off: workers run like you at the keyboard, without sandbox-exec "
+            "(set runner.guard: thin for the thin guard)"
+        )
+        return ("SKIP", False, "runner sandbox", why)
     try:
         params = SandboxParams(
             run_dir=r.work_dir / ".check",
@@ -316,6 +323,13 @@ def sandbox_row(settings: Settings) -> Row:
     if ok:
         return ("PASS", False, "runner sandbox", detail)
     return ("FAIL", False, "runner sandbox", f"{detail}; run: resonant sandbox check")
+
+
+def _safe(fn: Callable[[Settings], bool], settings: Settings) -> bool:
+    try:
+        return fn(settings)
+    except Exception:
+        return False
 
 
 def _repo_has_ci(settings: Settings, name: str) -> bool | None:
@@ -337,11 +351,22 @@ def _repo_has_ci(settings: Settings, name: str) -> bool | None:
     return asyncio.run(ws.repo_has_ci(name, refresh=False))
 
 
+def _claude_login(settings: Settings) -> bool:
+    """Whether the owner's own ``claude`` login works (``claude auth status``; nothing of its
+    output is shown). Only asked with the guard off and no Claude secret."""
+    from resonant.runner.claude_auth import login_status
+    from resonant.sandbox import resolve_tool
+
+    found = resolve_tool("claude")
+    return found is not None and login_status([str(found)], Path.home())
+
+
 def runner_rows(
     settings: Settings,
     version: int,
     exists: Callable[[str], bool] = _keychain_exists,
     has_ci: Callable[[Settings, str], bool | None] = _repo_has_ci,
+    login: Callable[[Settings], bool] = _claude_login,
 ) -> list[Row]:
     """Claude workers (docs/go-live.md step 14): the runs table, the optional ``runner.repos``
     seed, the GitHub App config, the code dir, the runner's secrets (names only, never values),
@@ -358,6 +383,7 @@ def runner_rows(
     )
 
     rows: list[Row] = []
+    guard = settings.runner.guard
     if version >= RUNS_SCHEMA:
         rows.append(("PASS", False, "runs table", f"schema v{version}"))
     else:
@@ -394,13 +420,22 @@ def runner_rows(
         except SecretError as e:
             return e.reason
 
-    # Only the Claude credential is needed for any run (RX-1); the GitHub pieces each unlock
+    # Only a Claude credential is needed for any run (RX-1); the GitHub pieces each unlock
     # more, and a worker runs without them (the rows say what is missing, not that runs fail).
+    # With the guard off the owner's own `claude` login is one (GD-1): no token needed.
+    claude_how = (
+        f"needed for any run: claude setup-token, then resonant secret set {CLAUDE_TOKEN_REF}"
+    )
+    if guard == "off":
+        claude_how = (
+            "needed for any run: log in with `claude` on the Mini, or claude setup-token, then "
+            f"resonant secret set {CLAUDE_TOKEN_REF}"
+        )
     for label, refs, how in (
         (
             "runner/claude_token (or runner/anthropic_key)",
             (CLAUDE_TOKEN_REF, ANTHROPIC_KEY_REF),
-            f"needed for any run: claude setup-token, then resonant secret set {CLAUDE_TOKEN_REF}",
+            claude_how,
         ),
         (
             "runner/github_token",
@@ -421,6 +456,8 @@ def runner_rows(
         errors = [f for f in found if isinstance(f, str)]
         if any(f is True for f in found):
             rows.append(("PASS", False, step, "present (value not read)"))
+        elif CLAUDE_TOKEN_REF in refs and guard == "off" and _safe(login, settings):
+            rows.append(("PASS", False, step, "not set: your own claude login works (guard off)"))
         elif errors:
             rows.append(("FAIL", False, step, errors[0]))
         else:
@@ -450,6 +487,24 @@ def runner_rows(
          "new fork and the session can push to it"),
     ):  # fmt: skip
         rows.append(("SKIP", False, step, f"owner step: {how}"))
+    if guard == "off":
+        detail = (
+            "off: workers run like you at the keyboard (real HOME, your ~/.claude); trust "
+            "rules are followed by the worker, not enforced by the OS"
+        )
+    else:
+        detail = "thin: the Seatbelt profile wraps every worker (resonant sandbox check)"
+    rows.append(("PASS", False, "runner guard", detail))
+    # Resonant's own repo (GD-1): the daemon's checkout is registered as "resonant" at start.
+    own = settings.ops.repo_path
+    if own is not None and (own / ".git").is_dir() and guard == "thin":
+        why = f"{own}: runner.guard is thin, which write-protects it, so workers can't use it"
+        rows.append(("SKIP", False, "runner repo resonant", why))
+    elif own is not None and (own / ".git").is_dir():
+        rows.append(("PASS", False, "runner repo resonant", f"{own} (registered at start)"))
+    else:
+        why = "ops.repo_path isn't a git checkout: workers can't work on Resonant itself"
+        rows.append(("SKIP", False, "runner repo resonant", why))
     for name in sorted(repos):
         step = f"runner repo {name} has CI"
         try:

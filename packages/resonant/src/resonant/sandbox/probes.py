@@ -1494,6 +1494,11 @@ def run_probes(ctx: ProbeContext, scopes: Sequence[Scope] = ("ci", "local")) -> 
     return results
 
 
+def skipped_probes(scopes: Sequence[Scope], why: str) -> list[ProbeResult]:
+    """Every probe in ``scopes`` as a ``skip`` row saying ``why`` (the guard is off)."""
+    return [ProbeResult(p.name, p.scope, "skip", why, 0) for p in PROBES if p.scope in scopes]
+
+
 @contextlib.contextmanager
 def _listener() -> Generator[tuple[str, int]]:
     srv = socket.socket()

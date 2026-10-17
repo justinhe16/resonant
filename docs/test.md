@@ -27,7 +27,7 @@ Update a row when you try it, with the date and anything odd.
 | 11 | Hourly "btw" with the example (step 13.5): `/ext run example/pnl` once, then wait | At a top of the hour: `btw:` / `[example] PnL …` only in hours where it moved; nothing 00:00–06:00 | 📱 after 🖥 install |
 | 12 | Plain words reach the pulse: "what's the latest update" | The same text as `/pulse`, through the `updates` intent (model reply, owner only) | 📱 after deploy |
 | 13 | "what's running" | Tasks answer through chat (`job_control`), no longer a keyword | 📱 after deploy |
-| 14 | Before the owner steps: `/runs`, "spawn a claude to fix the typo in the README in resonant" | Both answer `The runner isn't set up: secret runner/claude_token (or runner/anthropic_key). …` and nothing about GitHub; `/runs` then lists the missing GitHub pieces as `No push or PRs yet: …` lines (go-live 14, iMessage 1) | 📱 after the employee-mode deploy |
+| 14 | Before the owner steps (no token and no `claude` login on the Mini): `/runs`, "spawn a claude to fix the typo in the README in resonant" | Both answer `The runner isn't set up: a Claude login (or secret runner/claude_token (or runner/anthropic_key)). …` and nothing about GitHub; `/runs` then lists the missing GitHub pieces as `No push or PRs yet: …` lines (go-live 14, iMessage 1) | 📱 after the employee-mode deploy |
 | 14a | With only the Claude token (after 32): a scratch run, then "spawn a claude to fix the typo in the README in <repo checked out in ~/code>" | Scratch: `On it: R… · no repo (scratch dir).`, done as usual. Repo: `On it: R… · <repo>. … Heads up: no push yet (GitHub App not set up); the work stays on a local branch.`, then `R… done (…): work is on local branch resonant/r…-… in ~/code/<repo>; can't push yet: the GitHub App isn't set up.`; the branch has the commit, nothing on GitHub | 📱 after 32 |
 | 14b | With only the Claude token: a private repo with no checkout in `~/code` | `I can't work on <owner>/<repo> yet: there's no checkout at …, and cloning it needs the daemon's GitHub token (runner/github_token). …`; "create a repo called x" → `Creating a repo needs the daemon's GitHub token …` | 📱 after 32 |
 | 15 | Trust rules need no runner: "always ask before merging in trading", then `/rules`, then `/rules forget 1` | `Rule added: ask before merge in trading (rule 1).`; `Rules (1):` / `1. ask before merge in trading`; the rule is gone | 📱 after the employee-mode deploy |
@@ -37,7 +37,7 @@ Update a row when you try it, with the date and anything odd.
 
 | # | Test | Where | Status |
 |---|---|---|---|
-| 17 | Sandbox self-check: `resonant sandbox check` | every deny and allow row passes, including Docker and Messages (Claude can run it; CI skips the guard e2e, which runs only on a Mac) | 🖥 (Claude) |
+| 17 | Sandbox self-check: `resonant sandbox check` | With the default `runner.guard: off`: `guard: off …` and every row `SKIP`. With `thin` (or `--thin`): every deny and allow row passes, including Docker and Messages (Claude can run it; CI skips the guard e2e, which runs only on a Mac) | 🖥 (Claude) |
 | 18 | GitHub token: `resonant secret set github/token`, then `check` | go-live 12, terminal 1 | 🖥 |
 | 19 | `resonant ext add repo:github` (typed confirm) | go-live 12, terminal 2 | 🖥 |
 | 20 | `scripts/bootstrap.sh --check` rows for the github pin, secret and jobs | go-live 12, terminal 4 | 🖥 |
@@ -52,11 +52,11 @@ Update a row when you try it, with the date and anything odd.
 | 29 | Optional: github writes (`rerun_failed`, `merge_pr` with `yes D7`) | go-live 12, the writes | 📱 after a token with write access |
 | 30 | Remove the example extension after tests 10–11 | `resonant ext remove example` | 🖥 |
 | 31 | Reinstall the LaunchAgents for the system-only PATH: `resonant daemon install` | go-live 14, terminal 1 | 🖥 |
-| 32 | Claude token: `claude setup-token` → `resonant secret set runner/claude_token` | go-live 14, terminal 2 | 🖥 |
+| 32 | Claude: `claude` logged in on the Mini (`claude auth status`), enough with the guard off; optional token `claude setup-token` → `resonant secret set runner/claude_token` | go-live 14, terminal 2 | 🖥 |
 | 33 | GitHub App: create (permissions as listed, no Administration), install on all repos, `resonant secret set runner/github_app_key --from-file <pem>`, delete the pem, tell Claude the app ID and installation ID | go-live 14, terminal 3 | 🖥 |
 | 34 | Daemon token: fine-grained, all repos → `resonant secret set runner/github_token` | go-live 14, terminal 4 | 🖥 |
 | 35 | Optional: classic `public_repo` token → `resonant secret set runner/github_public_token` | go-live 14, terminal 5 | 🖥 |
-| 36 | Authenticated probe: `CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check` (the `read -rs` form) | go-live 14, terminal 6 | 🖥 after 32 |
+| 36 | Only with `runner.guard: thin`: authenticated probe `CLAUDE_CODE_OAUTH_TOKEN="$T" resonant sandbox check` (the `read -rs` form) | go-live 14, terminal 6 | 🖥 after 32 (skip while the guard is off) |
 | 37 | `--check` runner rows `PASS` (repos and code dir may `SKIP`) | go-live 14, terminal 7 | 🖥 after 31–34 |
 | 38 | Branch protection on each base you care about; "no CI edits in <repo>" where Actions secrets matter | go-live 14, on GitHub | 🖥 (Claude can check) |
 | 39 | First real run: the worker's own `gh pr create` and `gh pr checks --watch` work with the App's installation token (PR by `<app>[bot]`); worktree under `~/code/.worktrees`, checkout untouched; no sandbox or permission errors in the transcript; no token in logs | go-live 14, first run | 🖥 (Claude) after 31–36 |
@@ -67,6 +67,8 @@ Update a row when you try it, with the date and anything odd.
 | 44 | A scratch run (no repo): `On it: R… · no repo (scratch dir).`, then `R… done: <summary>` in the digest; no PR | go-live 14, iMessage 7 | 📱 after 39 |
 | 45 | `/cancel R1`, then `/kill` during a run → run cancelled, nothing left running; `/resume`; `/restart resonant` mid-run finishes with one PR | go-live 14, iMessage 10–11 | 📱 after 39 |
 | 46 | First fork run: the fork appears, the App mints its token, `external_pr` asks, the upstream PR appears only after `yes` | go-live 14, first run | 📱 after 35 and 39 |
+| 51 | Workers load your Claude setup (guard off): a run's transcript `init` line lists your MCP servers and skills; with no `runner/claude_token` set, `/runs` doesn't ask for one and a run works on your `claude` login | go-live 14, terminal 2 and first run | 🖥 (Claude) after 31–32 |
+| 52 | Work on Resonant itself: "spawn a claude to fix the typo in the README in resonant" → `On it: R… · resonant.`, worktree `~/code/.worktrees/resonant/R…`, `~/resonant` untouched, a PR; "spawn a claude to restart resonant and check it came back" → `Back up (…)`, the same run resumes and finishes; without "restart" in the ask its `resonant restart` asks `[K…] R… wants to restart on resonant …` first | go-live 14, iMessage 12 | 📱 after 39 |
 | 48 | Optional Linear: API key → `resonant secret set linear/token`; `resonant ext add repo:linear` asks before sending the token, lists every tool with a pin (writes `L2: asks`) | go-live 12, Optional: Linear 1–3 | 🖥 |
 | 49 | "what's on my Linear" answers with your issues (no asking); "make a Linear ticket for …" asks a plain yes first, `no` → `Not done.` | go-live 12, Optional: Linear 4 | 📱 after 48 |
 | 50 | No Linear key in logs or the DB (`grep -r lin_api ~/.resonant/logs`, `sqlite3` on `audit_log`) | go-live 12, Optional: Linear | 🖥 after 49 |

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -33,6 +33,22 @@ def never_the_real_code_dir() -> Iterator[None]:
     yield
     created = [str(p) for p, was in zip(watched, before, strict=True) if p.exists() and not was]
     assert not created, f"a test wrote the real runner.code_dir: {created}"
+
+
+@pytest.fixture(autouse=True)
+def never_the_real_claude_login(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """No test asks the real ``claude`` whether the owner is logged in (it would read the
+    real login): the probe answers "not logged in" and records what it was asked."""
+    from resonant.runner import claude_auth
+
+    asked: list[tuple[str, ...]] = []
+
+    def probe(claude: Sequence[str], home: Path, **_kw: object) -> bool:
+        asked.append((*claude, str(home)))
+        return False
+
+    monkeypatch.setattr(claude_auth, "login_status", probe)
+    return asked
 
 
 @pytest.fixture

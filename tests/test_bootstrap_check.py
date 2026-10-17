@@ -751,3 +751,48 @@ def test_helper_shows_relay_rows_without_the_keychain(resonant_home: Path) -> No
     rows = _helper(resonant_home)
     assert rows["status relay enabled"][:2] == ("FAIL", False)
     assert rows["relay secret relay/supabase_key"][0] == "SKIP"
+
+
+def test_runner_rows_by_guard_mode(resonant_home: Path, tmp_path: Path) -> None:
+    """GD-1: with the guard off the sandbox row skips, and with no Claude secret the owner's
+    own login passes the Claude row; under ``thin`` the login doesn't count."""
+    check = _load_helper()
+    own = tmp_path / "resonant"
+    (own / ".git").mkdir(parents=True)
+
+    def nothing(_ref: str) -> bool:
+        return False
+
+    asked: list[str] = []
+
+    def logged_in(settings: object) -> bool:
+        asked.append("login")
+        return True
+
+    off = load_settings(ops={"repo_path": own})
+    assert off.runner.guard == "off"
+    sandbox = check.sandbox_row(off)
+    assert sandbox[:3] == ("SKIP", False, "runner sandbox") and "guard is off" in sandbox[3]
+    rows = {r[2]: r for r in check.runner_rows(off, 11, nothing, login=logged_in)}
+    claude = rows["runner secret runner/claude_token (or runner/anthropic_key)"]
+    assert claude[0] == "PASS" and "your own claude login works" in claude[3]
+    assert rows["runner guard"][0] == "PASS" and rows["runner guard"][3].startswith("off:")
+    assert (
+        rows["runner repo resonant"][:2] == ("PASS", False)
+        and str(own) in rows["runner repo resonant"][3]
+    )
+
+    def logged_out(settings: object) -> bool:
+        return False
+
+    rows = {r[2]: r for r in check.runner_rows(off, 11, nothing, login=logged_out)}
+    claude = rows["runner secret runner/claude_token (or runner/anthropic_key)"]
+    assert claude[0] == "FAIL" and "log in with `claude`" in claude[3]
+
+    asked.clear()
+    thin = load_settings(runner={"guard": "thin"}, ops={"repo_path": None})
+    rows = {r[2]: r for r in check.runner_rows(thin, 11, nothing, login=logged_in)}
+    claude = rows["runner secret runner/claude_token (or runner/anthropic_key)"]
+    assert claude[0] == "FAIL" and "log in" not in claude[3] and asked == []
+    assert rows["runner guard"][3].startswith("thin:")
+    assert rows["runner repo resonant"][0] == "SKIP"

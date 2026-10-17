@@ -203,6 +203,7 @@ def make_world(
     secrets: bool = True,
     runner_opts: dict[str, Any] | None = None,
     workspace_opts: dict[str, Any] | None = None,
+    guard: str = "off",
 ) -> World:
     root = tmp_path.resolve() / "rr"
     root.mkdir(exist_ok=True)
@@ -220,7 +221,10 @@ def make_world(
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
+        # not this checkout: the daemon's own repo would be registered as "resonant"
+        ops={"repo_path": None},
         runner={
+            "guard": guard,
             "github_app": {"app_id": APP_ID, "installation_id": INSTALLATION_ID},
             # explicit: a repo's own default is to allow .github/ changes (the r4 tests flip it)
             "repos": {REPO: {"remote": f"github.com/own/{REPO}", "allow_github_changes": False}},
@@ -250,6 +254,7 @@ def make_world(
         ),
         "wrap": identity_wrap,
         "self_check": check_ok,
+        "home": root,  # the guard is off by default: a fake owner's HOME
         "claude_cmd": [sys.executable, str(FAKE), "--scenario", scenario, *extra],
         "poll_s": 0.05,
         "kill_grace_s": 0.5,
@@ -607,7 +612,9 @@ async def test_r14_not_set_up_names_what_is_missing(
     async with running(w):
         reply = await w.say("/run demo fix it")
         # RX-1: only the Claude credential blocks a run; the GitHub pieces are notes
-        assert reply.startswith("The runner isn't set up: secret runner/claude_token")
+        assert reply.startswith(
+            "The runner isn't set up: a Claude login (or secret runner/claude_token"
+        )
         assert "resonant secret set runner/claude_token" in reply
         assert "github_token" not in reply and "github_app" not in reply
         runs = await w.say("/runs")
@@ -625,10 +632,12 @@ async def test_r14_missing_token_only(
     w.keychain.items.pop(CLAUDE_TOKEN_REF)
     async with running(w):
         reply = await w.say("/run demo fix it")
-        assert reply.startswith("The runner isn't set up: secret runner/claude_token")
+        assert reply.startswith(
+            "The runner isn't set up: a Claude login (or secret runner/claude_token"
+        )
         assert "runner/github_token" not in reply
         reply = await w.say("fix the typo in the README in demo")
-        assert "The runner isn't set up: secret runner/claude_token" in reply
+        assert "The runner isn't set up: a Claude login (or secret runner/claude_token" in reply
         assert runs_store.recent(w.conn, 10) == []
 
 
