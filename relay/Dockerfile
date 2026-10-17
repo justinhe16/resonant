@@ -16,6 +16,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY relay/resonant_relay /app/resonant_relay
 COPY dashboard/dist /app/dist
+# Readable by the runtime user whatever the modes were in the build machine's checkout.
+RUN chmod -R a+rX,go-w /app
 
 # Read-only files owned by root; the server runs as an unprivileged user.
 USER 65532:65532

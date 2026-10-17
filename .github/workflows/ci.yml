@@ -93,3 +93,8 @@ jobs:
           grep -q "cannot read Supabase" relay.log
           if grep -E "ci-token-not-a-secret|ci-topic-not-a-secret" relay.log; then exit 1; fi
           test "$(docker inspect -f '{{.State.Running}}' relay)" = true
+          if curl -fsS http://127.0.0.1:8080/config.json | grep -q '"local"'; then exit 1; fi
+          test "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is http://127.0.0.1:8080/../etc/passwd)" = 404
+      - name: relay logs
+        if: failure()
+        run: docker logs relay || true

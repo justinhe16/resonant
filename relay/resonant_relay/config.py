@@ -17,6 +17,8 @@ class ConfigError(ValueError):
 
 
 _KEY_CHARS = re.compile(r"^[A-Za-z0-9._-]+$")
+_HOST = re.compile(r"^[a-z0-9.-]+$")
+_TOPIC = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _DURATION = re.compile(r"^(\d+)\s*([smh]?)$")
 
 
@@ -41,6 +43,8 @@ def supabase_origin(raw: str) -> str:
     if parts.path not in ("", "/"):
         raise ConfigError("SUPABASE_URL must be just the project origin (no path)")
     host = parts.hostname
+    if not _HOST.match(host):
+        raise ConfigError("SUPABASE_URL host has unexpected characters")
     port = f":{parts.port}" if parts.port else ""
     return f"https://{host}{port}"
 
@@ -62,14 +66,16 @@ def _jwt_role(key: str) -> str | None:
 
 
 def check_anon_key(key: str) -> str:
-    """The anon (publishable) key is served to every visitor in config.json, so refuse
-    anything that looks like a secret key: a service_role JWT or an `sb_secret_` key."""
+    """The anon key is served to every visitor in config.json, so only a key that is
+    provably public passes: an `sb_publishable_` key or a JWT whose role is exactly
+    `anon`. Anything else (a service_role JWT, `sb_secret_`, an access token, a JWT
+    without a role) is refused."""
     key = key.strip()
     if not key:
         raise ConfigError("SUPABASE_ANON_KEY is required")
     if not _KEY_CHARS.match(key):
         raise ConfigError("SUPABASE_ANON_KEY has unexpected characters")
-    if key.startswith("sb_secret_") or _jwt_role(key) not in (None, "anon"):
+    if not (key.startswith("sb_publishable_") or _jwt_role(key) == "anon"):
         raise ConfigError(
             "SUPABASE_ANON_KEY is not an anon/publishable key; it would be served to "
             "every visitor, so the relay refuses to start"
@@ -152,8 +158,10 @@ def load(env: Mapping[str, str]) -> Settings:
         raise ConfigError("NTFY_URL must be https")
     if settings.webhook_url and not settings.webhook_url.startswith("https://"):
         raise ConfigError("WEBHOOK_URL must be https")
-    if "/" in settings.ntfy_topic:
-        raise ConfigError("NTFY_TOPIC is the topic name only (no slashes)")
+    if settings.ntfy_topic and not _TOPIC.match(settings.ntfy_topic):
+        raise ConfigError("NTFY_TOPIC must be 1-64 letters, digits, '-' or '_'")
+    if settings.stale_after < 2 * settings.check_every:
+        raise ConfigError("STALE_AFTER must be at least twice CHECK_EVERY")
     return settings
 
 

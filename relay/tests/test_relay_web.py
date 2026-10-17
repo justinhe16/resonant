@@ -124,6 +124,36 @@ def test_only_get_and_head(server: Server, method: str):
     assert_strict(headers)
 
 
+def test_refused_request_closes_the_connection(server: Server):
+    """A POST body is never read, so it must not be parsed as the next request."""
+    import socket
+
+    smuggled = b"GET /config.json HTTP/1.1\r\nHost: x\r\n\r\n"
+    req = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % len(smuggled)
+    with socket.create_connection(("127.0.0.1", server.port), timeout=5) as s:
+        s.sendall(req + smuggled)
+        data = b""
+        while chunk := s.recv(4096):
+            data += chunk
+    assert data.startswith(b"HTTP/1.1 405")
+    assert b"connection: close" in data.lower()
+    assert b"anon_key" not in data  # the smuggled request was not answered
+
+
+def test_request_logs_escape_control_characters(server: Server, caplog: pytest.LogCaptureFixture):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="resonant_relay.web"):
+        import socket
+
+        with socket.create_connection(("127.0.0.1", server.port), timeout=5) as s:
+            s.sendall(b"GET /x\x1b[31mfake HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            while s.recv(4096):
+                pass
+    assert "\x1b" not in caplog.text
+    assert "\\x1b" in caplog.text
+
+
 def test_head_has_no_body(server: Server):
     status, headers, body = server.request("/", method="HEAD")
     assert status == 200 and body == b"" and int(headers["content-length"]) > 0

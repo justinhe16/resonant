@@ -73,6 +73,15 @@ def parse_status(raw: Any) -> Status | None:
     return Status(taken_at, tuple(sorted(failing)))
 
 
+def auth_headers(key: str) -> dict[str, str]:
+    """`apikey` always; `Authorization: Bearer` only for a legacy JWT key. The newer
+    `sb_publishable_`/`sb_secret_` keys aren't JWTs and go in `apikey` alone."""
+    headers = {"apikey": key}
+    if key.count(".") == 2:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
 def _call(send: Sender, url: str, body: bytes | None, headers: dict[str, str], method: str) -> Any:
     try:
         return send(url, body or b"", headers, method=method).json()
@@ -92,8 +101,7 @@ class RpcSource:
 
     def latest(self) -> Status | None:
         headers = {
-            "apikey": self._anon,
-            "Authorization": f"Bearer {self._anon}",
+            **auth_headers(self._anon),
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
@@ -113,11 +121,7 @@ class TableSource:
         self._send = send
 
     def latest(self) -> Status | None:
-        headers = {
-            "apikey": self._key,
-            "Authorization": f"Bearer {self._key}",
-            "Accept": "application/json",
-        }
+        headers = {**auth_headers(self._key), "Accept": "application/json"}
         rows = _call(self._send, self._url, None, headers, "GET")
         if not isinstance(rows, list):
             raise ReadError("unexpected snapshots shape")

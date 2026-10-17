@@ -67,7 +67,6 @@ class Checker:
         self._detail: dict[Kind, str] = dict.fromkeys(KINDS, "")
         self._last: Status | None = None
         self._failing_since: datetime | None = None
-        self._read_error = ""
         self.last_check: float | None = None  # monotonic time of the last finished check
 
     def check(self) -> None:
@@ -88,7 +87,6 @@ class Checker:
         if self._failing_since is None:
             self._failing_since = now
             log.warning("cannot read Supabase: %s", error)
-        self._read_error = error
         down = (now - self._failing_since).total_seconds()
         if down >= self._read_fail_after:
             self.active["read_error"] = True

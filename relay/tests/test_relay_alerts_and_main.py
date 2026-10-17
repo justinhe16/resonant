@@ -68,7 +68,7 @@ def test_both_channels():
     s = load(
         {
             "SUPABASE_URL": "https://p.supabase.co",
-            "SUPABASE_ANON_KEY": "anon",
+            "SUPABASE_ANON_KEY": "sb_publishable_x",
             "RELAY_STATUS_TOKEN": "t",
             "NTFY_TOPIC": "x",
             "WEBHOOK_URL": "https://hooks.example/y",

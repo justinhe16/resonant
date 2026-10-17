@@ -84,7 +84,8 @@ def main(env: Mapping[str, str] = os.environ) -> int:
     )
 
     started = time.monotonic()
-    limit = 3 * settings.check_every + 30
+    # A check may make one read and several alert sends, each with its own timeout.
+    limit = max(3 * settings.check_every + 30, 180)
 
     def healthy() -> bool:
         """The checker thread is alive and has finished a check recently."""

@@ -43,14 +43,25 @@ def test_secrets_stay_out_of_repr():
 
 @pytest.mark.parametrize(
     "key",
-    [jwt("service_role"), jwt("authenticated"), "sb_secret_abc123", "", "has space", "a;b"],
+    [
+        jwt("service_role"),
+        jwt("authenticated"),
+        "sb_secret_abc123",
+        "sbp_personal_access_token",
+        "plainkey",
+        "aaa.bbb.ccc",  # a JWT shape with a payload that doesn't decode
+        "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln",  # a JWT without a role
+        "",
+        "has space",
+        "a;b",
+    ],
 )
 def test_anon_key_guard_refuses_secret_or_odd_keys(key: str):
     with pytest.raises(ConfigError):
         check_anon_key(key)
 
 
-@pytest.mark.parametrize("key", [jwt("anon"), "sb_publishable_abc123", "plainkey"])
+@pytest.mark.parametrize("key", [jwt("anon"), "sb_publishable_abc123"])
 def test_anon_key_guard_accepts_public_keys(key: str):
     assert check_anon_key(key) == key
 
@@ -77,6 +88,7 @@ def test_origin(raw: str, want: str):
         "https://proj.supabase.co; script-src *",
         "https://a.co https://evil.co",
         "proj.supabase.co",
+        "https://*.supabase.co",
     ],
 )
 def test_origin_rejects_anything_but_an_https_origin(raw: str):
@@ -104,6 +116,10 @@ def test_bad_durations(raw: str):
         {"RELAY_READ": "magic"},
         {"NTFY_TOPIC": ""},  # no channel at all
         {"NTFY_TOPIC": "a/b"},
+        {"NTFY_TOPIC": "a b"},
+        {"NTFY_TOPIC": "a?x=1"},
+        {"NTFY_TOPIC": "x" * 65},
+        {"STALE_AFTER": "60", "CHECK_EVERY": "60"},
         {"NTFY_URL": "http://ntfy.example"},
         {"WEBHOOK_URL": "http://hooks.example/x"},
         {"PORT": "http"},

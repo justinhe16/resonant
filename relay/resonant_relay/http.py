@@ -49,7 +49,10 @@ def send(
     if not url.startswith(("https://", "http://")):
         raise HttpError("refusing a non-http(s) URL")
     req = urllib.request.Request(  # noqa: S310 - scheme checked above
-        url, data=body if method != "GET" else None, headers=headers, method=method
+        url,
+        data=body if method != "GET" else None,
+        headers={"User-Agent": "resonant-relay", **headers},
+        method=method,
     )
     try:
         with _opener.open(req, timeout=timeout) as res:
@@ -61,7 +64,7 @@ def send(
         raise HttpError(f"network error ({type(e.reason).__name__})") from None
     except TimeoutError:
         raise HttpError("timed out") from None
-    except OSError as e:
+    except (OSError, ValueError) as e:  # ValueError: http.client.InvalidURL
         raise HttpError(f"network error ({type(e).__name__})") from None
     if len(data) > MAX_BODY:
         raise HttpError("response too large")

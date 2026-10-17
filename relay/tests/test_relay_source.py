@@ -76,6 +76,7 @@ def test_rpc_source_posts_the_token_in_the_body_only():
     assert call["method"] == "POST"
     assert json.loads(call["body"]) == {"token": "relay-token-secret"}
     assert call["headers"]["apikey"] == "anon-key"
+    assert "Authorization" not in call["headers"]  # not a JWT: apikey only
     assert "relay-token-secret" not in json.dumps(call["headers"])
 
 
@@ -87,13 +88,13 @@ def test_table_source_reads_the_newest_row():
     send = FakeSend(
         [{"taken_at": "2026-10-16T12:00:00Z", "health": [{"name": "brain", "state": "failing"}]}]
     )
-    s = TableSource(URL, "read-key", send=send).latest()
+    s = TableSource(URL, "h.p.s", send=send).latest()
     assert s is not None and s.failing == ("brain",)
     call = send.calls[0]
     assert call["method"] == "GET"
     assert call["url"].startswith(f"{URL}/rest/v1/snapshots?")
     assert "order=taken_at.desc" in call["url"] and "limit=1" in call["url"]
-    assert call["headers"]["Authorization"] == "Bearer read-key"
+    assert call["headers"]["Authorization"] == "Bearer h.p.s"  # a legacy JWT key
 
 
 def test_table_source_empty_and_bad():
