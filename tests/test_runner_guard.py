@@ -40,6 +40,7 @@ from resonant.runner.claude_auth import LoginCheck, auth_source, parse_status, s
 from resonant.runner.claude_auth import login_status as real_login_status
 from resonant.runners import claude as claude_mod
 from resonant.runners.claude import RESTART_NOTE, ClaudeRunner, Refused, Started
+from resonant.runners.reports import did_list
 from resonant.runners.worker_desk import asked_for
 from resonant.sandbox import SandboxParams
 from resonant.secrets import (
@@ -48,9 +49,11 @@ from resonant.secrets import (
     RunnerSecrets,
     SecretStore,
 )
+from resonant.store import pulse as pulse_store
 from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
 from resonant.store import tasks as task_store
+from resonant.store import trust as trust_store
 from resonant.store.db import kv_get, utcnow
 
 API_KEY = "sk-ant-api03-" + "Q" * 40
@@ -678,3 +681,61 @@ async def test_the_ask_covers_one_restart_per_run(tmp_path: Path, db: sqlite3.Co
     assert ops.calls == ["update"]
     assert [c[2] for c in trust.calls] == ["update"]
     assert [c["rc"] for c in cli_calls(h)] == [0, 1]
+
+
+# --- reporting a worker's restart or update (GT-1) -------------------------------------------
+
+
+async def test_a_workers_restart_is_texted_now_and_on_its_did_list(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    ops = FakeOps(db)
+    h = build(tmp_path, db, extra=["--self-op", "restart"], self_ops=ops, owner="owner")
+    code = await h.start(ask="fix the flaky test, then restart resonant", report="digest")
+    running = asyncio.ensure_future(h.loop.run())
+    await until(lambda: bool(cli_calls(h)), what="the CLI's reply")
+    h.loop.stop()
+    await asyncio.wait_for(running, 30)
+    assert h.chan.texts() == [f"{code} restarted Resonant"]  # this fake has no commit
+    assert did_list(db, code) == ["restarted Resonant"]
+    item = pulse_store.get(db, "core", f"run/{code.lower()}")
+    assert item is not None and item.title.endswith(" · did: restarted Resonant")
+    assert item.told_fingerprint == item.fingerprint  # texted: not repeated in the digest
+    rows = db.execute("SELECT detail FROM audit_log WHERE action = 'run.report'").fetchall()
+    assert any(json.loads(r["detail"]) == {"run": code, "event": "restart", "notify": "now"}
+               for r in rows)  # fmt: skip
+
+
+async def test_a_rule_holds_a_workers_update_for_the_digest(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    trust_store.add_rule(db, scope="resonant", action="update", effect="notify_digest",
+                         created_from="chat", now=utcnow())  # fmt: skip
+    ops = FakeOps(db)
+    h = build(tmp_path, db, extra=["--self-op", "update"], self_ops=ops, owner="owner")
+    code = await h.start(ask="merge it and update resonant", report="digest")
+    running = asyncio.ensure_future(h.loop.run())
+    await until(lambda: bool(cli_calls(h)), what="the CLI's reply")
+    h.loop.stop()
+    await asyncio.wait_for(running, 30)
+    assert h.chan.texts() == []
+    [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
+    assert line.key == f"run/{code.lower()}"
+    assert line.title.endswith(" · did: updated Resonant abc1234 -> def5678")
+
+
+async def test_an_update_with_nothing_new_is_not_a_side_effect(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    ops = FakeOps(db, up_to_date=True)
+    h = build(tmp_path, db, extra=["--self-op", "update"], self_ops=ops, owner="owner")
+    code = await h.start(ask="deploy resonant", report="digest")
+    await h.drain()
+    assert ops.calls == ["update"] and h.chan.texts() == [] and did_list(db, code) == []
+    [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
+    assert "did:" not in line.title
+
+
+def test_the_worker_prompt_asks_for_did_notes() -> None:
+    prompt = claude_mod.WORKER_PROMPT
+    assert '`resonant note "did: <what you did>"`' in prompt and "merge with gh" in prompt

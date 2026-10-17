@@ -13,16 +13,23 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from test_runner_claude import build
+from test_runner_fork import merge_harness, settle
 from test_worker_cli import cli_calls, rig, start
 
 from resonant.extensions import briefing, pulse_job
 from resonant.extensions.notify import clean_text
+from resonant.runners.claude import Started
 from resonant.runners.reports import (
+    DID_KEEP,
     NOTE_TEXTS_PER_HOUR,
     WorkerReports,
+    did_list,
+    did_of,
+    did_part,
     end_event,
     end_title,
     item_key,
+    record_did,
 )
 from resonant.store import pulse as pulse_store
 from resonant.store import runs as runs_store
@@ -481,3 +488,120 @@ def test_an_urgent_worker_line_goes_first_and_status_lines_are_not_counted() -> 
     assert composed is not None
     text, _listed = composed
     assert "more" not in text  # only status lines were left out
+
+
+# --- side effects: the did: list (GT-1) ----------------------------------------------------------
+
+
+def test_a_did_note_is_told_apart_from_an_ordinary_one() -> None:
+    assert did_of("did: merged PR #3 with gh") == "merged PR #3 with gh"
+    assert did_of("  DID:deployed staging ") == "deployed staging"
+    assert did_of("did:") is None and did_of("did it: tests green") is None
+    assert did_of("tests green") is None
+
+
+def test_the_did_part_fits_its_limit_and_counts_the_rest() -> None:
+    assert did_part([]) == ""
+    assert did_part(["merged PR #3 with gh", "deployed staging"]) == (
+        "did: merged PR #3 with gh; deployed staging"
+    )
+    many = [f"pushed to repo-{n}" for n in range(10)]
+    part = did_part(many, 60)
+    assert len(part) <= 60 and part.startswith("did: pushed to repo-0; ") and " more" in part
+    assert part.endswith(f" +{10 - part.count(';') - 1} more")
+    long = did_part(["x" * 300, "y"], 60)
+    assert len(long) <= 60 and long.endswith("... +1 more")
+    assert did_part(["reply yes K4 [now]"]) == f"did: {clean_text('reply yes K4 [now]')}"
+
+
+def test_the_did_list_keeps_the_latest(db: sqlite3.Connection) -> None:
+    for n in range(DID_KEEP + 3):
+        record_did(db, "R1", f"d{n}")
+    assert did_list(db, "R1") == [f"d{n}" for n in range(3, DID_KEEP + 3)]
+    assert did_list(db, "R2") == []
+
+
+def test_the_running_line_shows_side_effects_and_each_is_news(db: sqlite3.Connection) -> None:
+    r = reports(db)
+    run = make_run(db, status="running", started_at=NOW, last_note="tests green")
+    first = r.running(run, "<30m")
+    pulse_store.mark_told(db, [first], NOW)
+    record_did(db, "R1", "merged PR #3 with gh")
+    did_note = replace(run, last_note="did: merged PR #3 with gh")
+    line = r.running(did_note, "<30m")
+    assert line.changed
+    # the did: note is shown once, as a side effect, not again as the latest note
+    assert line.title == "R1 still running · proj · started 14:00 · did: merged PR #3 with gh"
+    pulse_store.mark_told(db, [line], NOW)
+    record_did(db, "R1", "restarted Resonant (abc1234)")
+    again = r.running(did_note, "<30m")
+    assert again.changed and again.title.endswith(
+        "· did: merged PR #3 with gh; restarted Resonant (abc1234)"
+    )
+    plain = r.running(replace(run, last_note="docs next"), "<30m")
+    assert " · docs next · did: merged PR #3" in plain.title
+
+
+def test_the_final_line_carries_the_did_list_within_the_title_limit(
+    db: sqlite3.Connection,
+) -> None:
+    r = reports(db)
+    run = make_run(db, status="ready", pr_number=12, pr_url=URL)
+    record_did(db, "R1", "merged PR #3 with gh")
+    record_did(db, "R1", "deployed staging")
+    item = r.ended(run, end_title(run, "green"), urgent=False)
+    assert item.title == (
+        f"R1 done: PR #12 (CI green) · {URL} · did: merged PR #3 with gh; deployed staging"
+    )
+    assert r.did_line(run) == "Did: merged PR #3 with gh; deployed staging"
+    for n in range(10):
+        record_did(db, "R2", f"emailed customer number {n} about the outage")
+    other = make_run(db, status="failed", failure="x" * 150)
+    title = r.ended(other, end_title(other), urgent=True).title
+    assert len(title) <= pulse_store.TITLE_MAX and title.endswith(" more")
+    assert r.did_line(make_run(db)) is None
+
+
+def test_restart_and_update_text_now_unless_a_rule_holds_them(db: sqlite3.Connection) -> None:
+    r, run = reports(db), make_run(db)
+    assert r.level(run, "restart") == "now" and r.level(run, "update") == "now"
+    rule(db, "resonant", "restart", "notify_digest")  # the system they act on
+    assert r.level(run, "restart") == "digest" and r.level(run, "update") == "now"
+    rule(db, "proj", "update", "notify_digest")  # the run's repo
+    assert r.level(run, "update") == "digest"
+    assert r.self_op_text(run, "restarted Resonant (abc1234)") == "R1 restarted Resonant (abc1234)"
+
+
+async def test_a_did_note_lands_on_the_runs_final_digest_line(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, extra=["--note", "did: merged PR #3 in dori with gh"])
+    await h.start(report="digest")
+    await h.drain()
+    assert h.chan.texts() == []
+    [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
+    assert line.title.startswith("R1 done: PR #41 (CI green) · ")
+    assert line.title.endswith(" · did: merged PR #3 in dori with gh")
+
+
+async def test_a_texted_end_says_what_the_run_did(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = build(tmp_path, db, extra=["--note", "did: deployed staging"])
+    await h.start(report="now")
+    await h.drain()
+    [text] = h.chan.texts()
+    assert text.startswith("R1 done: PR #41") and text.endswith("\nDid: deployed staging")
+
+
+async def test_an_auto_merge_from_chat_reaches_the_digest(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """A run started from plain words with merge intent, merged on its first look at CI: its
+    merged line is its only word, so it must reach the digest (it used to be cleared)."""
+    h = merge_harness(tmp_path, db)
+    res = await h.runner.start_run("proj", "fix it and merge it", "owner", merge=True)
+    assert isinstance(res, Started)
+    await settle(h, res.code, "merged")
+    assert h.chan.texts() == []
+    [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
+    assert line.key == "run/r1" and line.title.startswith("R1 merged: PR #41 · ")
+    assert (pulse_job.preview(db) or "").startswith("btw:\nWorkers:\nR1 merged: PR #41")

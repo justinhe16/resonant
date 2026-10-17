@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from github_public_fakes import FakePublicApi, public
 
 from resonant.api import DaemonState
 from resonant.components import Components, build_components
@@ -276,6 +277,7 @@ class FakeClaude:
         self.github = github
         self.resolver = resolver
         self.secrets_value = SECRETS
+        self.public = FakePublicApi()  # GitHub without a token (GT-1); never the network
 
     async def setup_missing(self) -> str | None:
         return None
@@ -307,6 +309,7 @@ def claude(
         return fake.secrets_value
 
     monkeypatch.setattr("resonant.tools.repos.load_runner_secrets", fake_secrets)
+    monkeypatch.setattr("resonant.tools.repos.PublicGitHub", lambda: fake.public.github())
     github = FakeGitHub([RepoInfo("me/proj", "main", False, True, True)])
     fake = FakeClaude(FakeGh(), github, Resolver(db))
     components.runners["claude"] = cast(Any, fake)
@@ -351,7 +354,7 @@ async def test_repo_tools_without_the_daemon_token_say_what_they_need(
         ("create_repo", {"name": "scratch"}, "created", "Creating a repo"),
         ("add_ci", {"repo": "proj"}, "opened", "Adding CI"),
         ("merge_ci_pr", {"repo": "proj"}, "merged", "Merging the add-CI PR"),
-        ("add_repo", {"repo": "me/proj"}, "added", "Adding a repo"),
+        ("add_repo", {"repo": "proj"}, "added", "Adding a repo by name"),
     ):
         out = await call(components, tool, args)
         assert out[key] is False, tool
@@ -359,6 +362,48 @@ async def test_repo_tools_without_the_daemon_token_say_what_they_need(
         assert "resonant secret set runner/github_token" in out["text"]
         assert "isn't set up" not in out["text"]
     assert claude.workspace.calls == []  # nothing reached gh
+
+
+async def test_add_repo_registers_a_public_repo_without_the_daemon_token(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    """GT-1: an explicit owner/name or URL needs no token when GitHub shows it to anyone."""
+    claude.secrets_value = RunnerSecrets(None, None, None)
+    claude.public.repos["octo/lib"] = public("Octo/Lib", "develop")
+    out = await call(components, "add_repo", {"repo": "https://github.com/octo/lib"})
+    assert out["added"] is True and out["new"] is True and out["slug"] == "Octo/Lib"
+    assert out["text"] == (
+        "Added Octo/Lib as lib (push). Registered without the daemon's GitHub token, so push "
+        "access and CI weren't checked; runs will find out."
+    )
+    repo = repos.get(db, "Octo/Lib")
+    assert repo is not None and (repo.base, repo.mode, repo.ci) == ("develop", "push", None)
+    again = await call(components, "add_repo", {"repo": "octo/lib"})
+    assert again["added"] is True and again["new"] is False
+    assert again["text"] == "Already have Octo/Lib as lib (push)."
+    # A registered repo answers by name with no token too; an unknown name needs it.
+    assert (await call(components, "add_repo", {"repo": "lib"}))["new"] is False
+    assert claude.github.calls == []  # the token-backed client was never used
+    for r in claude.public.requests:
+        assert "authorization" not in r.headers
+
+
+async def test_add_repo_private_without_the_daemon_token_says_how(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    claude.secrets_value = RunnerSecrets(None, None, None)
+    claude.public.repos["me/secret"] = public("me/secret", private=True)
+    out = await call(components, "add_repo", {"repo": "me/secret"})
+    assert out == {
+        "added": False,
+        "text": "me/secret isn't public (or doesn't exist). Registering a private repo needs "
+        "the daemon's GitHub token (runner/github_token), which isn't set yet. "
+        "On the Mini: resonant secret set runner/github_token.",
+    }
+    claude.public.status = 403
+    limited = await call(components, "add_repo", {"repo": "me/other"})
+    assert limited["added"] is False and limited["text"].startswith("Couldn't reach GitHub:")
+    assert repos.list_all(db) == []
 
 
 async def test_tools_without_a_runner(components: Components) -> None:

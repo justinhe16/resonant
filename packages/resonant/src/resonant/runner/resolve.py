@@ -17,6 +17,13 @@ matches several repos is :class:`Ambiguous` (at most three candidates), and no m
 Every GitHub call goes through the :class:`GitHub` protocol. The real one runs ``gh`` through
 the workspace's per-call ``GH_CONFIG_DIR``, so the token is never in env or argv; tests use a
 fake.
+
+Without the daemon's token (GT-1), :class:`PublicGitHub` asks GitHub's REST API with no
+credentials at all: enough to see that an explicit ``owner/name`` is public and read its
+default branch. Push access can't be seen that way, so such a repo is registered
+``mode=push`` with its CI unknown (``ci`` NULL: the first run's mirror check decides); a
+private or missing repo is invisible to it (None, so :class:`NoAccess`). Anonymous calls are
+rate-limited by GitHub (60 an hour per IP); a 403/429 says so.
 """
 
 from __future__ import annotations
@@ -29,6 +36,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
+from urllib.parse import quote
+
+import httpx
 
 from resonant.config import RunnerRepo
 from resonant.runner.checks import MAX_WORKFLOW_BYTES, runs_on_pull_request
@@ -70,6 +80,9 @@ class RepoInfo:
     private: bool
     can_push: bool
     has_ci: bool  # a workflow on the base branch runs on pull_request
+    # Seen with no token (PublicGitHub): public, push access and CI unknown. Registered
+    # mode=push with ci unknown.
+    anonymous: bool = False
 
 
 class GitHub(Protocol):
@@ -190,11 +203,11 @@ class Resolver:
         if (known := repos.get(self.conn, slug)) is not None:
             return Resolved(known, new=False, via=via)
         info = await github.repo_info(slug)
-        if info is None or not (info.can_push or not info.private):
+        if info is None or not (info.can_push or info.anonymous or not info.private):
             return NoAccess(slug)
         if (known := repos.get(self.conn, info.slug)) is not None:  # GitHub spells it otherwise
             return Resolved(known, new=False, via=via)
-        if via is not None and not info.can_push:
+        if via is not None and not (info.can_push or info.anonymous):
             return NotPushable(slug, via)  # a link never writes a fork-mode row
         try:
             with atomic(self.conn):
@@ -203,8 +216,8 @@ class Resolver:
                     info.slug,
                     base=info.base,
                     source="auto",
-                    mode="push" if info.can_push else "fork",
-                    ci=info.has_ci,
+                    mode="push" if info.can_push or info.anonymous else "fork",
+                    ci=None if info.anonymous else info.has_ci,
                 )
         except (RepoConflict, ValueError):
             # Another request registered it while GitHub was being asked.
@@ -327,6 +340,94 @@ class GhGitHub:
         if code != 0:
             raise GitHubError(f"couldn't list your GitHub repos: {err[-120:]}")
         return [line.strip() for line in out.splitlines() if parse_slug(line.strip())]
+
+
+PUBLIC_API_URL = "https://api.github.com"
+PUBLIC_TIMEOUT_S = 15.0
+
+
+def _readable(slug: str, name: object, base: object) -> tuple[str, str]:
+    """``(full_name, default_branch)`` when they pass the config's own checks, else
+    :class:`GitHubError`."""
+    if not isinstance(name, str) or not isinstance(base, str):
+        raise GitHubError(f"GitHub's answer about {slug} wasn't readable")
+    try:
+        RunnerRepo(remote=f"github.com/{name}", base=base)
+    except ValueError:
+        raise GitHubError(f"GitHub's answer about {slug} wasn't readable") from None
+    if parse_slug(name) != name:
+        raise GitHubError(f"GitHub's answer about {slug} wasn't readable")
+    return name, base
+
+
+class PublicGitHub:
+    """The :class:`GitHub` with no token at all (GT-1): GitHub's REST API, unauthenticated.
+    It sees public repos only; listing the owner's repos needs the token (:class:`NeedsToken`).
+    ``transport`` is the test seam (an ``httpx.MockTransport``); by default the network."""
+
+    def __init__(
+        self,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        base_url: str = PUBLIC_API_URL,
+        timeout_s: float = PUBLIC_TIMEOUT_S,
+    ) -> None:
+        self._transport = transport
+        self._base = base_url.rstrip("/")
+        self._timeout_s = timeout_s
+
+    async def _get(self, path: str) -> httpx.Response:
+        try:
+            async with httpx.AsyncClient(
+                transport=self._transport,
+                timeout=self._timeout_s,
+                follow_redirects=False,
+                trust_env=False,  # never a proxy or netrc credential from the environment
+            ) as client:
+                return await client.get(
+                    f"{self._base}/{path}",
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                        "User-Agent": "resonant-runner",
+                    },
+                )
+        except httpx.HTTPError as e:
+            raise GitHubError(f"couldn't reach GitHub ({type(e).__name__})") from None
+
+    async def repo_info(self, slug: str) -> RepoInfo | None:
+        resp = await self._get(f"repos/{slug}")
+        if resp.status_code == 404:
+            return None  # private, or missing: anonymously the same
+        if resp.status_code in (403, 429):
+            raise GitHubError("GitHub's limit for lookups without a token is used up; try later")
+        if resp.status_code != 200:
+            raise GitHubError(f"couldn't read {slug} from GitHub (HTTP {resp.status_code})")
+        try:
+            data: Any = resp.json()
+            private = data["private"]
+            name, base = _readable(slug, data["full_name"], data["default_branch"])
+        except (ValueError, KeyError, TypeError):
+            raise GitHubError(f"GitHub's answer about {slug} wasn't readable") from None
+        if private is not False:
+            return None
+        return RepoInfo(name, base, False, False, False, anonymous=True)
+
+    async def my_repos(self) -> list[str]:
+        raise NeedsToken("listing your GitHub repos needs the daemon's GitHub token")
+
+    async def is_protected(self, slug: str, branch: str) -> bool | None:
+        try:
+            resp = await self._get(f"repos/{slug}/branches/{quote(branch, safe='/')}")
+        except GitHubError:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            protected: Any = resp.json()["protected"]
+        except (ValueError, KeyError, TypeError):
+            return None
+        return protected if isinstance(protected, bool) else None
 
 
 class OfflineGitHub:

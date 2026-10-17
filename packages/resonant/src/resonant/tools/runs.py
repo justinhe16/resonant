@@ -24,8 +24,14 @@ at call time: the runner is built after the tools are registered) and return cod
 - ``merge_run{code}``: L2: ``/merge R3`` is explicit and runs. A model-chosen call follows
   the trust rules (``merge_level``, docs/employee-plan.md D4): it runs without asking when
   ``merge_decision`` is ok and the run flagged no sensitive paths, else it asks a plain yes.
-  The approval prompt (``summary_action``) names the PR and the flagged paths. A fork-mode
-  repo's run is never merged (its upstream's maintainers merge).
+  The approval prompt (``summary_action``) names the PR and the flagged paths (CI config,
+  ``.claude/``, ``.mcp.json``, git hooks, CODEOWNERS; dependency manifests and lockfiles are
+  not flagged, the merged reply lists them as ``deps changed: …``). A fork-mode repo's run is
+  never merged (its upstream's maintainers merge). It is the owner's merge, so CI still
+  running is a wait, not a refusal (``queued: true``, "R3: CI is still running; I'll merge
+  PR #12 when it's green.", then the merge or why not is reported like an auto-merge's), and
+  a repo with no CI at all merges with a warning (``merged_without_ci``, "⚠ merged without
+  CI: <repo> has no CI checks"). Red CI still refuses.
 - ``start_run{..., merge?}``: ``merge`` when the owner asked to merge it too; the run then
   merges itself once CI is green (same checks, same trust rules).
 - ``answer_worker{code, text}`` and ``message_worker{code, text}``: L3, no ask: it's the
@@ -51,7 +57,7 @@ from resonant.trust import merge_decision
 from resonant_sdk import Effect, Level, ToolSpec
 
 if TYPE_CHECKING:
-    from resonant.runners.claude import Cancelled, Merged, Refused, Started
+    from resonant.runners.claude import Cancelled, Merged, MergeQueued, Refused, Started
     from resonant.runners.worker_desk import OpenQuestion, Relayed
     from resonant.store.runs import Run
 
@@ -95,7 +101,7 @@ class RunnerApi(Protocol):
 
     async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused: ...
 
-    async def merge_run(self, code: str) -> Merged | Refused: ...
+    async def merge_run(self, code: str) -> Merged | MergeQueued | Refused: ...
 
     def open_questions(self) -> list[OpenQuestion]: ...
 
@@ -434,6 +440,16 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         result = await claude.merge_run(code)
         if (reason := _refusal(result)) is not None:
             return {"merged": False, "code": code, "text": reason}
+        from resonant.runners.claude import MergeQueued
+
+        if isinstance(result, MergeQueued):  # CI still running: the run's merge watch has it
+            return {
+                "merged": False,
+                "queued": True,
+                "code": code,
+                "pr_number": result.pr_number,
+                "text": result.text,
+            }
         merged = cast("Merged", result)
         run = claude.get_run(code)
         text = merged.text
@@ -444,6 +460,8 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             "code": code,
             "pr_number": merged.pr_number,
             "flagged_paths": list(merged.flagged),
+            "deps_changed": list(merged.deps),
+            "merged_without_ci": merged.no_ci is not None,
             "text": text,
         }
 

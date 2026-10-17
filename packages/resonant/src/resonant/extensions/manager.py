@@ -202,7 +202,7 @@ def escalations(
     for spec in manifest.tool_specs():
         level = spec.effective_level
         if level in _ASKS and spec.name not in mcp_tools:
-            extra = ", irreversible (yes <code>)" if spec.commit or level is Level.L1 else ""
+            extra = _final_words(spec.commit, level)
             out.append(f"tool {_s(spec.name)} {spec.effect.value} {level.value}: asks{extra}")
     for job in manifest.jobs:
         spec = job.spec(manifest.name)
@@ -220,6 +220,14 @@ def escalations(
     if manifest.report is not None and manifest.report.max_urgency == "urgent":
         out.append(report_grant(manifest))
     return out
+
+
+def _final_words(commit: bool, level: Level) -> str:
+    """How a confirmation line marks an irreversible tool: only L1 needs ``yes <code>``; a
+    commit tool at L2/L3 asks a plain yes (GT-1 made extension writes default L2)."""
+    if level is Level.L1:
+        return ", irreversible (yes <code>)"
+    return ", irreversible" if commit else ""
 
 
 def _mcp_escalations(manifest: Manifest, pins: Mapping[str, Any]) -> list[str]:
@@ -243,8 +251,7 @@ def _mcp_escalations(manifest: Manifest, pins: Mapping[str, Any]) -> list[str]:
         shown = pin[:12] if isinstance(pin, str) else "unknown"
         asks = ""
         if level in _ASKS:
-            final = spec.commit or level is Level.L1
-            asks = ": asks" + (", irreversible (yes <code>)" if final else "")
+            asks = ": asks" + _final_words(spec.commit, level)
         out.append(
             f"mcp tool {_s(tool.name)} ({_s(sid)}) {spec.effect.value} {level.value} "
             f"pin {shown}{asks}"

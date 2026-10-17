@@ -275,15 +275,27 @@ async def test_two_checks_need_codes(h: Harness) -> None:
     a, b = h.run(), h.run()
     ta = h.start(a)
     pa = await h.prompted()
-    tb = h.start(b, system="aws", action="spend", cost_usd=5)
+    tb = h.start(b, system="aws", action="spend", cost_usd=25)
     pb = await h.prompted(2)
-    assert "wants to spend on aws (new system, costs $5.00; yes always" in pb.text()
+    assert "wants to spend on aws (new system, costs $25.00; yes always" in pb.text()
     assert h.reply("yes always").startswith("Which one?")  # type: ignore[union-attr]
     h.reply(f"yes {pb.code} always")
     h.reply(f"{pa.code} no")
     assert (await ta, await tb) == ("denied", "ok")
     (rule,) = store.list_rules(h.db)
     assert (rule.scope, rule.action) == ("aws", "spend")
+
+
+async def test_the_cost_threshold_comes_from_the_checks(h: Harness) -> None:
+    code = h.run()
+    store.mark_seen(h.db, "aws", "spend", h.clock())
+    assert await h.checks.request_check(code, "aws", "spend", cost_usd=20) == "ok"
+    h.checks.cost_ask_over_usd = 10.0  # config trust.cost_ask_over_usd
+    task = h.start(code, system="aws", action="spend", cost_usd=12)
+    p = await h.prompted()
+    assert "(costs $12.00;" in p.text()
+    h.reply("no")
+    assert await task == "denied"
 
 
 async def test_inactive_or_unknown_run_is_denied(h: Harness) -> None:

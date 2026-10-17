@@ -9,13 +9,19 @@ twice.
 Events and their defaults (``trust.notify_level``, EM-4):
 
 - ``pr`` (a run ended with its PR open), ``done`` (a run with no repo, or no changes) and
-  ``merged``: the digest.
+  ``merged``: the digest. A merged line names the dependency manifests and lockfiles the PR
+  changed (``deps changed: package.json, uv.lock``, ``deps_line``): they aren't flagged, so
+  this is where they show.
 - ``failed``: now. A ``notify_digest`` rule lowers it only when the rule names ``failed``
   itself ("stop texting right away on failed"): a ``*`` rule ("only digest trading") never
   silences a failure.
 - ``note``: the digest, and many notes of one run collapse into its latest (the run's item
   shows ``last_note``). ``urgent`` (``resonant note --urgent``): now, at most
   ``NOTE_TEXTS_PER_HOUR`` texts per run an hour (the rest only update the digest line).
+- ``restart`` and ``update`` (GD-1: a worker's ``resonant restart``/``update`` that went
+  through): now, with ``R4 restarted Resonant (abc1234)``; a ``notify_digest`` rule (on
+  ``restart``/``update``, scope ``resonant`` or the run's repo) lowers them. Matched with
+  system ``resonant`` and the run's repo. Either way it is on the run's ``did:`` list.
 - ``question`` and ``check``: not handled here. EM-5's relay texts questions and EM-4's
   approval prompt texts checks; the digest only shows the run as ``waiting for your answer``.
 
@@ -26,6 +32,16 @@ rule on ``pr`` itself is more specific. A run started with ``report="now"`` (``/
 owner asked to hear right away) texts its end now whatever the rules say: the request is
 about that one run. A cancel is always texted (the owner did it), and so is an unrevoked
 GitHub token.
+
+Side effects (``did:``). What a worker did outside the run's own branch and PR is listed on
+its digest line, running and final: ``R4 done: PR #3 (CI green) · <url> · did: merged PR #2
+with gh; deployed staging``. Two sources: Resonant's own record of a worker's restart or update
+(code-built), and the worker's notes that start with ``did:`` (``resonant note "did: merged PR
+#2 with gh"``; the prompt asks for one per side effect taken outside Resonant's tools). The
+list is kv ``run.did:<code>`` (the last ``DID_KEEP``), so it survives restarts; the line shows
+what fits (``DID_IN_TITLE``, ``+N more``) and a texted end reply adds a ``Did: …`` line. A
+``did:`` note is still a note: it is the line's latest note and, with ``--urgent``, texted
+within the per-run cap like any other; past the cap it still reaches the digest.
 
 Ordering, for exactly once: the item is written untold first, then a ``now`` text goes out
 (deduped by the channel on ``run:<code>:<status>``), then the item is marked told. A crash
@@ -44,9 +60,9 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from resonant.extensions.notify import clean_text
@@ -70,6 +86,14 @@ TITLE_PART_MAX = 120
 NOTE_IN_TITLE = 80  # the running line stays under the store's 200-character title
 SCRATCH_SYSTEM = "scratch"
 _REPORT_KEY = "run.report:"  # kv: a run's report preference, set at start
+_DID_KEY = "run.did:"  # kv: a run's side effects, oldest first
+DID_PREFIX = "did:"
+DID_KEEP = 20
+DID_ITEM_MAX = 80
+DID_IN_TITLE = 100  # the did part of a digest line
+DID_IN_TEXT = 300  # the Did: line of a texted end reply
+SELF_SYSTEM = "resonant"  # the trust system of a worker's restart or update
+SELF_EVENTS = frozenset({"restart", "update"})
 
 
 class NotifyLevel(Protocol):
@@ -102,14 +126,78 @@ def end_event(run: Run) -> EndEvent | None:
             return None
 
 
+def did_of(note: str) -> str | None:
+    """The side effect a ``did:`` note names (``did: merged PR #3 with gh``, any case), or
+    None for an ordinary note."""
+    text = note.strip()
+    if text[: len(DID_PREFIX)].lower() != DID_PREFIX:
+        return None
+    return text[len(DID_PREFIX) :].strip() or None
+
+
+def record_did(conn: sqlite3.Connection, code: str, what: str) -> None:
+    """Add a side effect to run ``code``'s list (already redacted and cleaned)."""
+    with atomic(conn):
+        kv_set(conn, _DID_KEY + code, [*did_list(conn, code), what][-DID_KEEP:])
+
+
+def did_list(conn: sqlite3.Connection, code: str) -> list[str]:
+    value: object = kv_get(conn, _DID_KEY + code)
+    if not isinstance(value, list):
+        return []
+    return [v for v in cast(list[object], value) if isinstance(v, str)]
+
+
+def did_part(items: list[str], limit: int = DID_IN_TITLE) -> str:
+    """``did: merged PR #3 with gh; deployed staging +2 more`` in at most ``limit``
+    characters (cleaned parts, oldest first), or "" with none."""
+    parts = [p for p in (_part(i, DID_ITEM_MAX) for i in items) if p]
+    shown: list[str] = []
+    for i, p in enumerate(parts):
+        rest = len(parts) - i - 1
+        more = f" +{rest} more" if rest else ""
+        if len(f"{DID_PREFIX} " + "; ".join([*shown, p]) + more) > limit:
+            break
+        shown.append(p)
+    if parts and not shown:  # the first alone doesn't fit: clip it
+        more = f" +{len(parts) - 1} more" if len(parts) > 1 else ""
+        shown = [_part(parts[0], max(limit - len(DID_PREFIX) - 1 - len(more), 10))]
+    if not shown:
+        return ""
+    more = len(parts) - len(shown)
+    return f"{DID_PREFIX} " + "; ".join(shown) + (f" +{more} more" if more else "")
+
+
+def _with_did(title: str, items: list[str]) -> str:
+    """``title · did: …`` within the store's title limit (the did part shortened to fit)."""
+    room = min(DID_IN_TITLE, pulse_store.TITLE_MAX - len(title) - 3)
+    part = did_part(items, room) if items and room >= 20 else ""
+    return f"{title} · {part}" if part else title
+
+
 def _part(text: str | None, limit: int = TITLE_PART_MAX) -> str:
     """A worker- or GitHub-supplied part of a title, cleaned once and clipped."""
     flat = clean_text(text or "")
     return flat if len(flat) <= limit else flat[: limit - 3].rstrip() + "..."
 
 
-def end_title(run: Run, ci: str | None = None) -> str:
-    """The digest line for an ended run (code-built around cleaned parts)."""
+DEPS_SHOWN = 4  # dependency files named in a merged line; the rest are counted
+
+
+def deps_line(paths: Sequence[str]) -> str:
+    """``deps changed: package.json, uv.lock`` for the dependency files a merged PR changed
+    (``CheckResult.deps``), or an empty string. Code-built: each path cleaned and clipped,
+    at most ``DEPS_SHOWN`` named and the rest counted."""
+    if not paths:
+        return ""
+    shown = ", ".join(_part(p, 60) for p in paths[:DEPS_SHOWN])
+    more = len(paths) - DEPS_SHOWN
+    return f"deps changed: {shown}" + (f" (+{more} more)" if more > 0 else "")
+
+
+def end_title(run: Run, ci: str | None = None, *, deps: Sequence[str] = ()) -> str:
+    """The digest line for an ended run (code-built around cleaned parts). ``deps``: a
+    merged run's dependency files, listed after its PR."""
     match run.status:
         case "ready":
             label = "no CI" if ci == "none" else f"CI {ci or 'unknown'}"
@@ -128,7 +216,8 @@ def end_title(run: Run, ci: str | None = None) -> str:
         case "failed":
             return f"{run.code} failed: {_part(run.failure) or 'unknown error'}"
         case "merged":
-            return f"{run.code} merged: PR #{run.pr_number} · {_part(run.pr_url)}"
+            title = f"{run.code} merged: PR #{run.pr_number} · {_part(run.pr_url)}"
+            return f"{title} · {deps_line(deps)}" if deps else title
         case _:
             return f"{run.code} finished · {_part(run.repo) or 'no repo'}"
 
@@ -162,11 +251,12 @@ class WorkerReports:
         return "now" if kv_get(self.conn, _REPORT_KEY + code) == "now" else "digest"
 
     def level(self, run: Run, event: str) -> Level:
-        """How soon the owner hears ``event`` of ``run`` (see the module docstring)."""
+        """How soon the owner hears ``event`` of ``run`` (see the module docstring). A
+        ``restart``/``update`` is matched with system ``resonant`` (what it acted on)."""
         if event in ("pr", "done", "merged") and self.report_pref(run.code) == "now":
             return "now"
         action = "done" if event in ("pr", "done") else "note" if event == "urgent" else event
-        system = run.repo or SCRATCH_SYSTEM
+        system = SELF_SYSTEM if event in SELF_EVENTS else run.repo or SCRATCH_SYSTEM
         default: Level = "now" if event in URGENT_EVENTS else "digest"
         try:
             decision = self._decide(system, action, event, run.repo or None)
@@ -193,10 +283,15 @@ class WorkerReports:
         labels = {"waiting": "waiting for usage reset", "question": "waiting for your answer"}
         what = labels.get(bucket, "still running")
         title = f"{run.code} {what} · {_part(run.repo, 60) or 'no repo'} · started {at}"
-        note = _part(run.last_note, NOTE_IN_TITLE) if bucket != "question" else ""
+        did = did_list(self.conn, run.code)
+        shows_note = bucket != "question" and not (did and did_of(run.last_note or ""))
+        note = _part(run.last_note, NOTE_IN_TITLE) if shows_note else ""  # a did: note: below
         if note:
             title += f" · {note}"
-        state = {"bucket": bucket, "note": note}
+        title = _with_did(title, did)
+        state: dict[str, object] = {"bucket": bucket, "note": note}
+        if did:
+            state["did"] = [*did[-1:], str(len(did))]  # a new side effect is news again
         now = self.clock()
         with atomic(self.conn):
             _change, item = pulse_store.upsert(self.conn, SOURCE, item_key(run.code), title,
@@ -207,6 +302,7 @@ class WorkerReports:
         """The run's last word, untold: the next digest says it once, unless :meth:`told`
         marks it heard first. A rerun with the same outcome keeps what was told."""
         state = {"status": run.status, "pr": run.pr_number}
+        title = _with_did(title, did_list(self.conn, run.code))
         now = self.clock()
         with atomic(self.conn):
             _change, item = pulse_store.upsert(
@@ -247,6 +343,15 @@ class WorkerReports:
         sent.append(now)
         return f"{run.code} note: {note}"
 
+    def did_line(self, run: Run) -> str | None:
+        """``Did: …`` for a texted end reply, or None when the run took no side effects."""
+        part = did_part(did_list(self.conn, run.code), DID_IN_TEXT)
+        return "Did" + part[len("did") :] if part else None
+
+    def self_op_text(self, run: Run, what: str) -> str:
+        """``R4 restarted Resonant (abc1234)``: a worker's restart or update, texted now."""
+        return f"{run.code} {_part(what)}"
+
     def forget(self, code: str) -> None:
         """The run ended: drop its note counter."""
         self._note_texts.pop(code, None)
@@ -257,10 +362,16 @@ class WorkerReports:
 
 
 __all__ = [
+    "DID_KEEP",
+    "DID_PREFIX",
     "NOTE_TEXTS_PER_HOUR",
     "WorkerReports",
+    "did_list",
+    "did_of",
+    "did_part",
     "end_event",
     "end_title",
     "is_worker_item",
     "item_key",
+    "record_did",
 ]

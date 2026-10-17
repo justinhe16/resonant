@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from github_public_fakes import FakePublicApi, public
 
 from resonant.config import RunnerConfig
 from resonant.runner.resolve import (
@@ -17,6 +18,7 @@ from resonant.runner.resolve import (
     FakeGitHub,
     GhGitHub,
     GitHubError,
+    NeedsToken,
     NoAccess,
     NotFound,
     NotPushable,
@@ -289,3 +291,53 @@ async def test_a_token_in_gh_stderr_is_redacted(tmp_path: Path) -> None:
     with pytest.raises(GitHubError) as e:
         await client.repo_info("me/boom")
     assert "ghp_secret" not in str(e.value) and "403" in str(e.value)
+
+
+# --- GT-1: an explicit public repo with no token ------------------------------------------
+
+
+async def test_public_github_registers_a_public_repo_without_a_token(
+    db: sqlite3.Connection,
+) -> None:
+    api = FakePublicApi({"me/proj": public("Me/Proj", "trunk")}, protected=False)
+    got = await Resolver(db).resolve("https://github.com/me/proj", api.github())
+    assert isinstance(got, Resolved) and got.new
+    assert (got.repo.slug, got.repo.base, got.repo.mode, got.repo.ci) == (
+        "Me/Proj",
+        "trunk",
+        "push",
+        None,  # unknown: the first run's mirror check decides
+    )
+    assert got.warning == "trunk isn't protected"
+    assert [r.url.path for r in api.requests] == [
+        "/repos/me/proj",
+        "/repos/Me/Proj/branches/trunk",
+    ]
+    for r in api.requests:  # anonymous: no credential of any kind
+        assert "authorization" not in r.headers and "cookie" not in r.headers
+
+
+async def test_public_github_sees_nothing_private_or_missing(db: sqlite3.Connection) -> None:
+    api = FakePublicApi({"me/secret": public("me/secret", private=True)})
+    gh = api.github()
+    assert await gh.repo_info("me/secret") is None
+    assert await Resolver(db).resolve("me/secret", gh) == NoAccess("me/secret")
+    assert await Resolver(db).resolve("me/none", gh) == NoAccess("me/none")
+    assert repos.list_all(db) == []
+
+
+async def test_public_github_errors_and_names(db: sqlite3.Connection) -> None:
+    api = FakePublicApi({"me/proj": public("me/proj")})
+    gh = api.github()
+    api.status = 403
+    with pytest.raises(GitHubError, match="without a token is used up"):
+        await gh.repo_info("me/proj")
+    api.status = 500
+    with pytest.raises(GitHubError, match="HTTP 500"):
+        await gh.repo_info("me/proj")
+    api.status = None
+    api.repos["me/odd"] = public("me/odd", "bad branch name~")
+    with pytest.raises(GitHubError, match="wasn't readable"):
+        await gh.repo_info("me/odd")
+    with pytest.raises(NeedsToken):
+        await Resolver(db).resolve("proj", gh)  # a bare name lists your repos: needs the token

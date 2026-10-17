@@ -20,13 +20,20 @@ Design (carried from ``followups.md``):
   called. The model sees the manifest's description, never the server's; the server's input
   schema is stripped to an allowlist of validation keywords (``description``, ``title``,
   ``default``, ``examples`` and anything unknown are dropped) and its annotations are ignored.
-- **Pins.** Each tool is pinned as ``sha256(name, description, input_schema, output_schema,
-  annotations)`` of what the server reports. ``ext add`` starts the server once (no secrets,
-  a scratch home) to read its tools, shows the pins as escalations and stores them with the
-  stripped schemas (``ExtensionRecord.mcp_pins``). Every server start and every
-  ``notifications/tools/list_changed`` re-lists and compares; a missing or changed tool is
-  disabled for the life of the process and the owner is alerted once. Calls wait while a
-  re-list is in flight.
+- **Pins.** Each tool is pinned as ``sha256(name, stripped input schema, stripped output
+  schema)`` (pin version 2, GT-1): only what the model sees and what arguments are checked
+  against. The server's description and annotations never reach the model, so a reworded
+  description no longer disables a tool. ``ext add`` starts the server once (no secrets, a
+  scratch home) to read its tools, shows the pins as escalations and stores them with the
+  stripped input schemas and ``"v": 2`` (``ExtensionRecord.mcp_pins``). Every server start
+  and every ``notifications/tools/list_changed`` re-lists and compares; a missing or changed
+  tool is disabled for the life of the process and the owner is alerted once. Calls wait
+  while a re-list is in flight.
+- **Pin migration.** A version-1 pin (no ``"v"``; it also hashed the description and
+  annotations) is never compared as a hash: if its stored stripped input schema equals the
+  live one, the tool is accepted and re-pinned at version 2 through ``on_migrate`` (the host
+  saves it and audits ``ext.mcp_pin_migrated`` once). The old pin never stored an output
+  schema, so the live one is accepted then. A different input schema is a change, as ever.
 - **Process.** ``spawn_stdio``: the extension's scratch env, secrets on fd 4 (the union of
   the server's tools' declared secrets), a new session. The process is tracked by the host's
   ``ProcessTracker``, so ``/kill`` ends it (and refuses restarts while held); stop closes
@@ -221,27 +228,50 @@ def input_schema(tool: Mapping[str, Any]) -> dict[str, Any]:
     return stripped
 
 
+PIN_VERSION = 2  # 1: sha256(name, description, inputSchema, outputSchema, annotations), raw
+
+
+def _output_schema(tool: Mapping[str, Any]) -> Any:
+    """A server tool's output schema, stripped like an input schema (descriptions and titles
+    don't count). One that can't be stripped is pinned as reported."""
+    raw: object = tool.get("outputSchema")
+    if raw is None:
+        return None
+    try:
+        return strip_schema(raw)
+    except ValueError:
+        return raw
+
+
 def tool_pin(tool: Mapping[str, Any]) -> str:
-    """``sha256(name, description, input_schema, output_schema, annotations)``, as the server
-    reports them (before stripping), over canonical JSON."""
-    fields = [
-        tool.get(k) for k in ("name", "description", "inputSchema", "outputSchema", "annotations")
-    ]
+    """The version-2 pin: ``sha256(name, stripped input schema, stripped output schema)``
+    over canonical JSON. The description and annotations are left out: the model never sees
+    them. Raises ValueError when the input schema is unusable (see ``input_schema``)."""
+    fields = [tool.get("name"), input_schema(tool), _output_schema(tool)]
     text = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(text.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
 class McpToolPin:
-    """What ``ext add`` approved for one MCP tool: its server, its pin and its stripped
-    input schema. Stored in ``ExtensionRecord.mcp_pins`` as JSON."""
+    """What ``ext add`` approved for one MCP tool: its server, its pin, its stripped input
+    schema and the pin's version. Stored in ``ExtensionRecord.mcp_pins`` as JSON; a
+    version-1 entry has no ``"v"``."""
 
     server: str
     pin: str
     input_schema: dict[str, Any]
+    version: int = PIN_VERSION
 
     def to_json(self) -> dict[str, Any]:
-        return {"server": self.server, "pin": self.pin, "input_schema": self.input_schema}
+        out: dict[str, Any] = {
+            "server": self.server,
+            "pin": self.pin,
+            "input_schema": self.input_schema,
+        }
+        if self.version != 1:
+            out["v"] = self.version
+        return out
 
 
 def parse_pins(raw: Mapping[str, Any]) -> dict[str, McpToolPin]:
@@ -252,9 +282,12 @@ def parse_pins(raw: Mapping[str, Any]) -> dict[str, McpToolPin]:
             raise ValueError(f"mcp pin for {name} is malformed")
         e = cast(dict[str, Any], entry)
         server, pin, schema = e.get("server"), e.get("pin"), e.get("input_schema")
+        version: object = e.get("v", 1)
         if not isinstance(server, str) or not isinstance(pin, str) or not isinstance(schema, dict):
             raise ValueError(f"mcp pin for {name} is malformed")
-        out[name] = McpToolPin(server, pin, cast(dict[str, Any], schema))
+        if isinstance(version, bool) or version not in (1, PIN_VERSION):
+            raise ValueError(f"mcp pin for {name} has an unknown version")
+        out[name] = McpToolPin(server, pin, cast(dict[str, Any], schema), cast(int, version))
     return out
 
 
@@ -697,6 +730,8 @@ def _retrieve(fut: asyncio.Future[Any]) -> None:
 # --- one server of an installed extension ----------------------------------------------
 
 DriftFn = Callable[[str, str, str | None], None]  # (server id, tool, live pin or None)
+MigrateFn = Callable[[str, str, str], None]  # (server id, tool, new version-2 pin)
+INVALID_PIN = "invalid"  # the live tool's input schema can't be used: never a match
 
 
 def disabled_text(ext: str, tool: str) -> str:
@@ -729,10 +764,14 @@ class McpServerRuntime:
     path_env: str
     bins: Mapping[str, str]
     secret_names: tuple[str, ...]  # the union of its tools' declared secrets
-    approved: Mapping[str, str]  # tool -> pin
+    approved: dict[str, str]  # tool -> version-2 pin (a migrated one is replaced in place)
     tracker: ProcessTracker
     secrets: Callable[[], SecretStore | None] = lambda: None
     on_drift: DriftFn | None = None
+    # Version-1 pins: tool -> the stored stripped input schema. Matched by schema, not hash,
+    # and migrated on the first match (``on_migrate``).
+    legacy: dict[str, dict[str, Any]] = field(default_factory=dict[str, dict[str, Any]])
+    on_migrate: MigrateFn | None = None
     python: str = sys.executable
     message_cap: int = MESSAGE_CAP
     start_timeout_s: float = START_TIMEOUT_S
@@ -871,14 +910,21 @@ class McpServerRuntime:
             await self.session.close()
 
     def _check(self, tools: list[dict[str, Any]]) -> None:
-        live: dict[str, str | None] = {}
+        live: dict[str, dict[str, Any] | None] = {}
         for t in tools:
             name = t.get("name")
             if isinstance(name, str):
-                live[name] = None if name in live else tool_pin(t)  # a duplicate is drift
-        for tool, pin in self.approved.items():
-            got = live.get(tool)
-            if got == pin or tool in self.disabled:
+                live[name] = None if name in live else t  # a duplicate is drift
+        for tool, pin in list(self.approved.items()):
+            if tool in self.disabled:
+                continue
+            entry = live.get(tool)
+            got = _live_pin(entry)
+            if tool in self.legacy:
+                if entry is not None and got != INVALID_PIN and _same_input(entry, self.legacy):
+                    self._migrate(tool, cast(str, got))
+                    continue
+            elif got == pin:
                 continue
             self.disabled[tool] = "removed" if tool not in live else "changed"
             log.warning(
@@ -890,6 +936,17 @@ class McpServerRuntime:
                     self.on_drift(self.server_id, tool, got)
                 except Exception:
                     log.exception("mcp drift alert failed")
+
+    def _migrate(self, tool: str, pin: str) -> None:
+        """A version-1 pin whose input schema still matches: re-pin it at version 2."""
+        self.approved[tool] = pin
+        del self.legacy[tool]
+        log.info("mcp pin migrated", extra={"label": self.label, "tool": tool})
+        if self.on_migrate is not None:
+            try:
+                self.on_migrate(self.server_id, tool, pin)
+            except Exception:
+                log.exception("mcp pin migration failed to save")
 
     def _list_changed(self, session: RpcSession) -> None:
         if self.session is not None and session is not self.session:
@@ -914,6 +971,25 @@ class McpServerRuntime:
                 self._check(tools)
         finally:
             self._verified.set()
+
+
+def _live_pin(tool: Mapping[str, Any] | None) -> str | None:
+    """The live tool's version-2 pin, None when it's missing (or listed twice), and
+    ``INVALID_PIN`` when its input schema can't be used."""
+    if tool is None:
+        return None
+    try:
+        return tool_pin(tool)
+    except ValueError:
+        return INVALID_PIN
+
+
+def _same_input(tool: Mapping[str, Any], legacy: Mapping[str, dict[str, Any]]) -> bool:
+    """Whether a live tool's stripped input schema is the one a version-1 pin stored."""
+    try:
+        return input_schema(tool) == legacy.get(cast(str, tool.get("name")))
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True, eq=False)
@@ -966,6 +1042,7 @@ async def discover(
 
 __all__ = [
     "MESSAGE_CAP",
+    "PIN_VERSION",
     "PROTOCOL_VERSION",
     "Discovered",
     "HttpTarget",

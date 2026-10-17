@@ -5,6 +5,8 @@ A reminder is a durable queued task, not a scheduler entry: ``add_reminder`` ins
 ``wake_at``, so the loop dispatches it when it is due and ``ReminderRunner`` sends it. It
 survives restarts with the ``tasks`` row, and a missed one fires once on start, marked late.
 
+A reminder's text is at most ``TEXT_MAX`` (1000) characters, whitespace collapsed.
+
 Each reminder gets a short number from kv ``reminders.seq`` (``/unremind 3``), kept in the
 task checkpoint as ``n`` with ``text`` and ``at`` (ISO, UTC). Handlers don't see the
 requester; the gate lets only the owner call global builtins, so reminders belong to the
@@ -35,7 +37,7 @@ from resonant_sdk import Effect, Level, ToolSpec
 
 KIND = "reminder"
 RUNNER = "reminder"
-TEXT_MAX = 200
+TEXT_MAX = 1000  # GT-1: was 200
 LIST_MAX = 50
 SEQ_KEY = "reminders.seq"
 ROUTED_MAX_AGE = timedelta(days=1)

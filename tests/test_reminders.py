@@ -188,7 +188,7 @@ async def test_add_creates_a_queued_reminder_task(
         {"at": "2026-10-13T09:00:00-07:00", "text": "x"},  # passed
         {"at": "2027-10-14T11:00:00-07:00", "text": "x"},  # over a year
         {"at": "2026-10-13T11:00:00-07:00", "text": "   "},
-        {"at": "2026-10-13T11:00:00-07:00", "text": "x" * 201},
+        {"at": "2026-10-13T11:00:00-07:00", "text": "x" * 1001},
     ],
 )
 async def test_add_rejects_bad_args(
@@ -198,6 +198,12 @@ async def test_add_rejects_bad_args(
         await tools["add_reminder"](args)
     assert repo.count_by_status(db) == {}
     assert kv_get(db, reminders.SEQ_KEY) is None
+
+
+async def test_add_accepts_1000_characters(tools: dict[str, ToolHandler]) -> None:
+    assert reminders.TEXT_MAX == 1000  # GT-1
+    out = await add(tools, T0 + timedelta(minutes=20), "y" * 1000)
+    assert out["text"] == "y" * 1000
 
 
 async def test_a_routed_reminder_survives_a_late_runner(

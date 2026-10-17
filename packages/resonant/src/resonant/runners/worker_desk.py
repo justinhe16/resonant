@@ -12,7 +12,9 @@ checks and owner messages for running Claude workers.
   the session with the answer (or, after ``runner.ask_timeout_minutes``, with
   ``ASK_TIMEOUT``). The same question asked again while it is open (a retry after a Bash
   timeout) joins the open one; nothing is texted twice.
-- ``note``: becomes the run's ``last_note`` (its pulse item) and a ``note`` event.
+- ``note``: becomes the run's ``last_note`` (its pulse item) and a ``note`` event. A note
+  that starts with ``did:`` also goes on the run's side-effect list (``reports.record_did``),
+  which its digest lines show.
 - ``check``: EM-4's ``TrustChecks.request_check``, waited for like an ask. The call (and so
   the owner's approval) outlives the CLI's wait and the turn; a decision that comes later
   wakes the run and is delivered on resume.
@@ -24,7 +26,10 @@ checks and owner messages for running Claude workers.
   ``resonant``, action ``restart`` or ``update``: net new the first time, so ``yes always``
   covers the next). The
   reply goes out before the restart (the helper waits 3 s); the restart stops the session and
-  the run resumes it afterwards, with a note saying why (``on_restart``).
+  the run resumes it afterwards, with a note saying why (``on_restart``). One that went
+  through goes on the run's side-effect list (``restarted Resonant (abc1234)``, ``updated
+  Resonant abc1234 -> def5678``) and to ``on_self_op`` (the runner reports it, by default
+  texted now), before the reply; an update with nothing new is not reported.
 
 Owner messages (``deliver_message``) are appended to the session's next CLI reply as
 ``Message from the owner: …``, or open its next turn.
@@ -55,6 +60,7 @@ from typing import Any, Literal, Protocol
 from resonant.gate.codes import clean_external
 from resonant.gateway.channel import Channel, ChannelError
 from resonant.redact import Redactor
+from resonant.runners.reports import did_of, record_did
 from resonant.runners.worker_cli import (
     EXIT_BUSY,
     EXIT_DENIED,
@@ -105,6 +111,7 @@ QUESTION_ITEM_TTL_S = 24 * 3600  # the pulse re-mentions an open question each h
 
 SELF_SYSTEM = "resonant"  # the trust system of a worker's restart or update
 NO_SELF_OPS = "Not done: restarting Resonant from a worker isn't set up here."
+SELF_OP_REPORT_S = 1.5  # the owner's text about a restart, well inside the helper's 3 s
 RESTARTING = (
     "Resonant restarts in about {delay} s. The restart stops this session; the run resumes it "
     "afterwards (same session, with a note that it restarted). Don't start anything else now: "
@@ -251,12 +258,14 @@ class WorkerDesk:
         self_ops: SelfOps | None = None,
         owner: str | None = None,
         on_restart: Callable[[str], None] = lambda _code: None,
+        on_self_op: Callable[[str, str, str], Awaitable[None]] | None = None,
     ) -> None:
         """``wake(run, key)`` tells the run's task something arrived (a no-op unless it is
         waiting). ``redactor_for(code)`` knows the run's secrets; ``on_note(code)`` refreshes
         its pulse item. ``self_ops`` restarts or updates Resonant (None: refused), ``owner``
-        is the principal whose ask can include that, and ``on_restart(code)`` runs just
-        before a restart this run asked for."""
+        is the principal whose ask can include that, ``on_restart(code)`` runs just
+        before a restart this run asked for, and ``on_self_op(code, op, what)`` reports one
+        that went through (``what``: ``restarted Resonant (abc1234)``)."""
         self.conn = conn
         self.channel = channel
         self.trust = trust
@@ -269,6 +278,7 @@ class WorkerDesk:
         self.self_ops = self_ops
         self.owner = owner
         self._on_restart = on_restart
+        self._on_self_op = on_self_op
         self._self_op_busy: set[str] = set()  # runs with a restart or update in flight
         self.events = WorkerEvents()
         self._waiters: dict[int, asyncio.Event] = {}  # question id -> set when it leaves open
@@ -321,23 +331,38 @@ class WorkerDesk:
             else:
                 result = await self.self_ops.restart_resonant()
             ok, text = True, self._self_op_text(run.code, req.op, result)
+            did = _self_op_did(req.op, result)
         except Exception as e:
             from resonant.executor import ToolFailed
 
             why = str(e) if isinstance(e, ToolFailed) else f"it failed ({type(e).__name__})"
             log.warning("worker self op failed", extra={"run": run.code, "op": req.op})
-            ok, text = False, f"Not done: {req.op} Resonant: {why}."
+            ok, text, did = False, f"Not done: {req.op} Resonant: {why}.", None
         finally:
             self._self_op_busy.discard(run.code)
         # only a restart or update that went through spends the ask's one allowance
         with atomic(self.conn):
             audit(self.conn, "run.self_op", run=run.code, op=req.op, by_ask=checked is None,
                   ok=ok)  # fmt: skip
+        if did is not None:
+            await self._report_self_op(run.code, req.op, did)
         rc = EXIT_OK if ok else EXIT_DENIED
         if checked is None:
             return self._reply(run.code, text, rc)
         _first, _, rest = checked.text.partition("\n\n")  # what the check reply delivered
         return Reply(text + (f"\n\n{rest}" if rest else ""), rc, on_sent=checked.on_sent)
+
+    async def _report_self_op(self, code: str, op: str, did: str) -> None:
+        """On the run's side-effect list, then to the runner (a text, by urgency), bounded:
+        the restart helper fires 3 s after the op, and the reply must go out first. A text
+        that doesn't make it leaves the run's line untold for the digest."""
+        with contextlib.suppress(Exception):
+            record_did(self.conn, code, did)
+        if self._on_self_op is not None:
+            try:
+                await asyncio.wait_for(self._on_self_op(code, op, did), SELF_OP_REPORT_S)
+            except Exception:
+                log.warning("worker self op not reported", extra={"run": code, "op": op})
 
     def _self_op_text(self, code: str, op: str, result: dict[str, Any]) -> str:
         """The reply to a restart or update that went through, from its result only."""
@@ -453,6 +478,8 @@ class WorkerDesk:
         red = self._redactor_for(run.code)
         shown = clip(clean_external(red.text(req.text)), NOTE_MAX)
         runs.update(self.conn, run.code, last_note=shown)
+        if (did := did_of(shown)) is not None:
+            record_did(self.conn, run.code, did)
         with atomic(self.conn):
             audit(self.conn, "run.note", run=run.code, urgent=req.urgent)
         await self.events.emit(WorkerEvent("note", run.code, req.text, req.urgent, self.clock()))
@@ -745,6 +772,19 @@ class WorkerDesk:
         for _key, (q, task) in list(self._checks.items()):
             if q == qid:
                 task.cancel()
+
+
+def _self_op_did(op: str, result: dict[str, Any]) -> str | None:
+    """A restart or update that went through, as a side effect (code-built from the ops
+    result); None for an update with nothing new."""
+    if result.get("restarting"):
+        if op == "update":
+            return f"updated Resonant {result.get('old')} -> {result.get('new')}"
+        commit = result.get("commit")
+        return "restarted Resonant" + (f" ({commit})" if isinstance(commit, str) and commit else "")
+    if op == "update" and result.get("synced") is False:
+        return f"pulled Resonant to {result.get('new')}; uv sync failed, not restarted"
+    return None
 
 
 def question_item_key(code: str, qid: int) -> str:

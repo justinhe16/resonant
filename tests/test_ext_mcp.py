@@ -46,6 +46,7 @@ from resonant.extensions.manager import (
     update_lines,
 )
 from resonant.extensions.mcp import (
+    PIN_VERSION,
     McpAmbiguous,
     McpError,
     McpServerRuntime,
@@ -55,6 +56,7 @@ from resonant.extensions.mcp import (
     approve,
     discover,
     input_schema,
+    parse_pins,
     pins_digest,
     pins_json,
     server_argv,
@@ -234,11 +236,11 @@ def test_input_schema_requires_an_object_schema() -> None:
         input_schema({"inputSchema": huge})
 
 
-def test_tool_pin_covers_the_five_fields_only() -> None:
+def test_tool_pin_covers_name_and_stripped_schemas_only() -> None:
     base = {
         "name": "a",
         "description": "d",
-        "inputSchema": {"type": "object"},
+        "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}},
         "outputSchema": {"type": "object"},
         "annotations": {"readOnlyHint": True},
     }
@@ -246,14 +248,44 @@ def test_tool_pin_covers_the_five_fields_only() -> None:
     assert pin == tool_pin(dict(reversed(list(base.items()))))  # canonical
     changes: list[tuple[str, Any]] = [
         ("name", "b"),
-        ("description", "d2"),
-        ("inputSchema", {"type": "object", "properties": {}}),
+        ("inputSchema", {"type": "object", "properties": {"x": {"type": "integer"}}}),
         ("outputSchema", None),
-        ("annotations", {"readOnlyHint": False}),
+        ("outputSchema", {"type": "object", "required": ["y"]}),
     ]
     for key, value in changes:
         assert tool_pin({**base, key: value}) != pin, key
-    assert tool_pin({**base, "title": "other"}) == pin
+    # What the model never sees doesn't count (GT-1): the server's description, its
+    # annotations, its title, and text inside the schemas.
+    same: list[tuple[str, Any]] = [
+        ("description", "reworded"),
+        ("annotations", {"readOnlyHint": False}),
+        ("title", "other"),
+        (
+            "inputSchema",
+            {
+                "type": "object",
+                "description": "new words",
+                "properties": {"x": {"type": "string", "title": "X", "default": "y"}},
+            },
+        ),
+        ("outputSchema", {"type": "object", "description": "new words"}),
+    ]
+    for key, value in same:
+        assert tool_pin({**base, key: value}) == pin, key
+    with pytest.raises(ValueError, match="not an object"):
+        tool_pin({**base, "inputSchema": {"type": "string"}})
+
+
+def test_pins_carry_their_version() -> None:
+    found = approve("s", ("a",), [{"name": "a", "inputSchema": {"type": "object"}}])
+    raw = pins_json(found.pins)
+    assert raw["a"]["v"] == PIN_VERSION == 2
+    assert parse_pins(raw)["a"].version == 2
+    old = {k: v for k, v in raw["a"].items() if k != "v"}
+    assert parse_pins({"a": old})["a"].version == 1  # stored before GT-1
+    assert "v" not in parse_pins({"a": old})["a"].to_json()
+    with pytest.raises(ValueError, match="unknown version"):
+        parse_pins({"a": {**old, "v": 3}})
 
 
 def test_approve_pins_listed_tools_and_reports_problems() -> None:
@@ -550,7 +582,7 @@ async def test_pin_mismatch_at_start_disables_the_tool(
     runtime: McpServerRuntime, tmp_path: Path
 ) -> None:
     (tmp_path / "data").mkdir(exist_ok=True)
-    (tmp_path / "data" / "variant").write_text(" changed")
+    (tmp_path / "data" / "schema").write_text("changed")
     await runtime.start()
     assert runtime.disabled == {"echo": "changed"}
     drift = cast(DriftLog, runtime.on_drift)
@@ -558,6 +590,16 @@ async def test_pin_mismatch_at_start_disables_the_tool(
     with pytest.raises(McpError, match="disabled"):
         await runtime.call("echo", {"text": "x"}, 10)
     assert "secrets" in (await runtime.call("whoami", {}, 10))["text"]  # others still work
+
+
+async def test_a_reworded_description_is_not_drift(
+    runtime: McpServerRuntime, tmp_path: Path
+) -> None:
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "variant").write_text(" reworded")  # description and annotations
+    await runtime.start()
+    assert runtime.disabled == {} and cast(DriftLog, runtime.on_drift) == []
+    assert (await runtime.call("echo", {"text": "x"}, 10))["text"] == "x"
 
 
 async def test_list_changed_rechecks_and_disables(runtime: McpServerRuntime) -> None:
@@ -647,7 +689,7 @@ async def test_host_drift_alerts_once_hides_the_tool_and_reports_health(
 ) -> None:
     data = settings.ext_data_dir / "mail"
     data.mkdir(parents=True, exist_ok=True)
-    (data / "variant").write_text(" v9")
+    (data / "schema").write_text("v9")
     sent: list[int] = []
 
     async def alert() -> None:
@@ -678,6 +720,108 @@ async def test_host_drift_alerts_once_hides_the_tool_and_reports_health(
     health = await ExtensionHealth(again).evaluate(utcnow())
     result = health["ext:mail"]
     assert result is not None and not result[0].ok and "mcp tool echo disabled" in result[0].detail
+
+
+def as_v1(pins: dict[str, Any]) -> dict[str, Any]:
+    """Pins as stored before GT-1: no ``"v"``, and a hash that also covered the description
+    and annotations (never compared again; only the stored input schema is)."""
+    return {
+        name: {**{k: v for k, v in p.items() if k != "v"}, "pin": "1" * 64}
+        for name, p in pins.items()
+    }
+
+
+async def v1_host(settings: Settings, db: sqlite3.Connection, tmp_path: Path) -> ExtensionHost:
+    stage = write_ext(tmp_path / "stage")
+    pins = as_v1(await pins_for(stage, tmp_path / "discover"))
+    install_fixture(
+        settings,
+        db,
+        MANIFEST,
+        {"server.py": SERVER, "cli.py": CLI},
+        argv0_paths={"mcp:fake": str(settings.extensions_dir / "mail" / "server.py")},
+        mcp_pins=pins,
+    )
+    return reload_host(settings, db)
+
+
+def reload_host(settings: Settings, db: sqlite3.Connection) -> ExtensionHost:
+    h = ExtensionHost.from_settings(settings, db, ToolRegistry(), runner=FakeExtProcess())
+    h.secrets = SecretStore(
+        FakeKeychain(items={"mail/token": TOKEN, "mail/api": API, "mail/other": OTHER})
+    )
+    h.load()
+    return h
+
+
+def audit_count(db: sqlite3.Connection, action: str) -> int:
+    return len(db.execute("SELECT 1 FROM audit_log WHERE action = ?", (action,)).fetchall())
+
+
+async def test_v1_pins_migrate_once_when_the_schema_matches(
+    settings: Settings, db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    data = settings.ext_data_dir / "mail"
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "variant").write_text(" reworded")  # a v1 pin would have flagged this
+    host = await v1_host(settings, db, tmp_path)
+    try:
+        await host.start_mcp()
+        assert host.disabled_tools("mail") == {}
+        assert (await host.loaded["mail"].mcp["fake"].call("echo", {"text": "x"}, 10))[
+            "text"
+        ] == "x"
+    finally:
+        await host.aclose()
+    assert audit_count(db, "ext.mcp_drift") == 0 and not pending_alerts(db)
+    rows = db.execute(
+        "SELECT tool, detail FROM audit_log WHERE action = 'ext.mcp_pin_migrated'"
+    ).fetchall()
+    assert sorted(r[0] for r in rows) == sorted(LISTED)
+    detail = json.loads(rows[0][1])
+    assert detail["server"] == "fake" and detail["old_pin"] == "1" * 64
+    assert detail["version"] == 2
+    record = ext_store.get_extension(db, "mail")
+    assert record is not None
+    stored = parse_pins(record.mcp_pins)
+    assert {p.version for p in stored.values()} == {2}
+    live = await discover(request(tmp_path / "stage", data))
+    echo = next(t for t in live if t["name"] == "echo")
+    assert stored["echo"].pin == tool_pin(echo)
+    # The next start finds version 2: nothing to migrate, nothing to note.
+    again = reload_host(settings, db)
+    try:
+        await again.start_mcp()
+        assert again.disabled_tools("mail") == {}
+    finally:
+        await again.aclose()
+    assert audit_count(db, "ext.mcp_pin_migrated") == len(LISTED)
+    assert audit_count(db, "ext.mcp_drift") == 0
+
+
+async def test_v1_pin_with_a_different_schema_is_still_drift(
+    settings: Settings, db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    data = settings.ext_data_dir / "mail"
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "schema").write_text("v9")  # echo gained a property since it was approved
+    host = await v1_host(settings, db, tmp_path)
+    try:
+        await host.start_mcp()
+        assert host.disabled_tools("mail") == {"echo": "changed"}
+    finally:
+        await host.aclose()
+    assert pending_alerts(db)["mail/echo"]["text"] == drift_text("mail", "echo")
+    assert audit_count(db, "ext.mcp_drift") == 1
+    migrated = db.execute(
+        "SELECT tool FROM audit_log WHERE action = 'ext.mcp_pin_migrated'"
+    ).fetchall()
+    assert sorted(r[0] for r in migrated) == sorted(t for t in LISTED if t != "echo")
+    record = ext_store.get_extension(db, "mail")
+    assert record is not None
+    stored = parse_pins(record.mcp_pins)
+    assert stored["echo"].version == 1 and stored["echo"].pin == "1" * 64  # left for review
+    assert stored["whoami"].version == 2
 
 
 async def test_send_alerts_delivers_drift(host: ExtensionHost, db: sqlite3.Connection) -> None:
@@ -840,7 +984,8 @@ def test_install_refuses_when_the_tools_changed_since_confirm(
         calls.append(1)
         tools = asyncio.run(discover(req))
         if len(calls) > 1:
-            tools[0] = {**tools[0], "description": "now with more power"}
+            schema = {**tools[0]["inputSchema"], "required": ["text", "description"]}
+            tools[0] = {**tools[0], "inputSchema": schema}
         return tools
 
     mgr = make_manager(conn, resonant_home, repo, mcp_discover=shifty)
@@ -900,7 +1045,9 @@ def test_update_shows_pin_changes_even_when_only_code_changed(
     mgr.discard(staged)
     mgr.install(staged.pin, name="mail")
     server = repo / "extensions" / "mail" / "server.py"
-    server.write_text(server.read_text().replace('"Echo text.', '"Echo text, v2.'))
+    text = server.read_text()
+    assert text.count('"additionalProperties": False') == 1  # echo's input schema
+    server.write_text(text.replace('"additionalProperties": False', '"additionalProperties": True'))
     git(repo, "commit", "-qam", "server v2")
     record = ext_store.get_extension(conn, "mail")
     assert record is not None

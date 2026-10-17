@@ -655,11 +655,11 @@ async def test_e2_e14_github_commands_over_imessage(
         )
         assert manual("prs") == [("prs", "Allow", "explicit")]
 
-        # An L1 write asks for a code even from the owner, explicitly; nothing runs yet.
-        prompt = await say("/github merge_pr resonant 40 abc1234")
-        assert re.fullmatch(r"\[([A-Z]\d)\] .*Reply yes \1 / no", prompt), prompt
-        assert "can't be undone" in prompt
-        assert manual("merge_pr") == [("merge_pr", "NeedsApproval", "explicit")]
+        # merge_pr is L2 (GT-1): the owner asked for it explicitly, so it runs with no prompt.
+        # The extension's own head-SHA check then refuses the stale abc1234, merging nothing.
+        reply = await say("/github merge_pr resonant 40 abc1234")
+        assert reply.startswith("Failed: github: merge pr "), reply
+        assert manual("merge_pr") == [("merge_pr", "Allow", "explicit")]
 
         # A member without the github grant: not allowed, before any argument parsing.
         assert await say("/github prs", MEMBER_PHONE) == "not allowed"

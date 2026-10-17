@@ -19,7 +19,10 @@ plain yes when the model chose it.
 - ``list_repos``: the registry, most recently used first.
 - ``add_repo{repo, name?}``: resolve (``owner/name``, URL, name, fuzzy) and register; ``name``
   is an extra handle for it. A new push repo whose base branch is unprotected comes with a
-  warning.
+  warning. Without the daemon's GitHub token (GT-1) an explicit ``owner/name`` or URL is
+  still registered when GitHub shows it to anyone (``PublicGitHub``, no credentials): as a
+  push repo with its CI unknown. A private or missing one says the token is needed for it;
+  a bare name (registry, extension link, fuzzy) needs the token unless it's registered.
 - ``forget_repo{repo}``: drop the registry entry. Nothing on GitHub changes; refused while the
   repo has an active run.
 """
@@ -43,12 +46,22 @@ from resonant.runner.resolve import (
     Ambiguous,
     GitHub,
     GitHubError,
+    NeedsToken,
     NoAccess,
     NotFound,
+    OfflineGitHub,
+    PublicGitHub,
     Resolved,
     Resolver,
+    parse_slug,
 )
-from resonant.runner.workspace import MergeRefused, RunnerError, Workspace, needs_github_token
+from resonant.runner.workspace import (
+    GITHUB_TOKEN_HOW,
+    MergeRefused,
+    RunnerError,
+    Workspace,
+    needs_github_token,
+)
 from resonant.secrets import RunnerSecrets, SecretError, SecretStore, load_runner_secrets
 from resonant.store import repos as repos_store
 from resonant.store.audit import audit
@@ -73,6 +86,15 @@ class RunnerApi(Protocol):
     secrets: SecretStore
 
     def github_for(self, secrets: RunnerSecrets) -> GitHub: ...
+
+
+def not_public_text(slug: str) -> str:
+    """An explicit repo GitHub doesn't show without a token, when the daemon has none."""
+    return (
+        f"{slug} isn't public (or doesn't exist). Registering a private repo needs the "
+        f"daemon's GitHub token (runner/github_token), which isn't set yet. "
+        f"On the Mini: {GITHUB_TOKEN_HOW}."
+    )
 
 
 def _repo_schema() -> dict[str, Any]:
@@ -213,9 +235,10 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         found = components.runners.get(RUNNER) if components is not None else None
         return cast("RunnerApi | None", found)
 
-    async def ready(what: str) -> tuple[RunnerApi, RunnerSecrets] | str:
+    async def ready(what: str, *, token: bool = True) -> tuple[RunnerApi, RunnerSecrets] | str:
         """The runner and its secrets, or the sentence for why not. These tools never start a
-        session, so they need the daemon's GitHub token and not the Claude credential."""
+        session, so they need the daemon's GitHub token (unless ``token`` is False: the caller
+        copes without it) and not the Claude credential."""
         from resonant.runners.claude import not_set_up_text
 
         claude = runner()
@@ -228,7 +251,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             secrets = await load_runner_secrets(claude.secrets, claude=False)
         except SecretError:
             return "The runner's secrets can't be read."
-        if secrets.github_token is None:
+        if token and secrets.github_token is None:
             return needs_github_token(what)
         return claude, secrets
 
@@ -341,14 +364,27 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
                     "text": f"{alias[:40]!r} isn't a usable name (start with a letter; "
                     "letters, digits, '_' and '-', at most 32).",
                 }
-        got = await ready("Adding a repo")
+        got = await ready("Adding a repo", token=False)
         if isinstance(got, str):
             return {"added": False, "text": got}
         claude, secrets = got
+        slug = parse_slug(text)
+        anonymous = secrets.github_token is None
+        github: GitHub
+        if not anonymous:
+            github = claude.github_for(secrets)
+        elif slug is not None:
+            github = PublicGitHub()  # GT-1: an explicit public repo needs no token
+        else:
+            github = OfflineGitHub()  # the registry still answers; a lookup needs the token
         try:
-            resolution = await claude.resolver.resolve(text, claude.github_for(secrets))
+            resolution = await claude.resolver.resolve(text, github)
+        except NeedsToken:
+            return {"added": False, "text": needs_github_token("Adding a repo by name")}
         except GitHubError as e:
             return {"added": False, "text": f"Couldn't reach GitHub: {e}"}
+        if anonymous and isinstance(resolution, NoAccess):
+            return {"added": False, "text": not_public_text(resolution.slug)}
         if isinstance(resolution, (Ambiguous, NoAccess)):
             return {"added": False, "text": resolution.text}
         if isinstance(resolution, NotFound):
@@ -370,6 +406,11 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             lines.append(f"Couldn't add the name: {alias_error}.")
         if resolution.warning:
             lines.append(f"Heads up: {resolution.warning}.")
+        if anonymous and resolution.new:
+            lines.append(
+                "Registered without the daemon's GitHub token, so push access and CI weren't "
+                "checked; runs will find out."
+            )
         if repo.mode == "fork":
             lines.append("It's upstream: runs work in your fork and I ask before the PR there.")
         return {

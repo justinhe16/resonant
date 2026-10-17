@@ -3,7 +3,7 @@
 - ``extensions``: one row per installed extension, the registry of record. It holds the
   approved manifest snapshot and the pins (``commit``, ``tree_digest``, ``manifest_sha``,
   ``argv0_paths``) that the host re-verifies at load. The manager writes it; the host only
-  reads it and flips ``status``.
+  reads it, flips ``status`` and re-pins a version-1 MCP pin at version 2 (``set_mcp_pin``).
 - ``ext_jobs``: scheduler state per ``(ext, job_id)``. Core jobs use ``ext="core"``.
   ``last_due`` only moves forward, so a stale writer can never make a due time run twice.
 
@@ -39,7 +39,8 @@ class ExtensionRecord:
     installed_by: str
     argv0_paths: Mapping[str, str] = field(default_factory=dict[str, str])
     status: ExtensionStatus = "enabled"
-    # What ext add approved per MCP tool: {tool: {server, pin, input_schema}} (migration 012).
+    # What ext add approved per MCP tool: {tool: {server, pin, input_schema[, v]}} (migration
+    # 012; ``"v": 2`` since GT-1, absent on a version-1 pin).
     mcp_pins: Mapping[str, Any] = field(default_factory=dict[str, Any])
 
 
@@ -143,6 +144,37 @@ def set_status(conn: sqlite3.Connection, name: str, status: ExtensionStatus) -> 
         "UPDATE extensions SET status = ? WHERE name = ? AND status != ?", (status, name, status)
     )
     return cur.rowcount == 1
+
+
+def set_mcp_pin(
+    conn: sqlite3.Connection,
+    name: str,
+    tool: str,
+    *,
+    installed_at: datetime,
+    old_pin: str,
+    pin: str,
+    version: int,
+) -> bool:
+    """Re-pin one MCP tool of the install made at ``installed_at``, only while its stored pin
+    is still ``old_pin``. False (nothing written) after a reinstall or update, or once done."""
+    with atomic(conn):
+        row = conn.execute(
+            "SELECT mcp_pins FROM extensions WHERE name = ? AND installed_at = ?",
+            (name, iso(installed_at)),
+        ).fetchone()
+        if row is None:
+            return False
+        pins = cast(dict[str, Any], json.loads(row["mcp_pins"]))
+        entry: object = pins.get(tool)
+        if not isinstance(entry, dict) or cast(dict[str, Any], entry).get("pin") != old_pin:
+            return False
+        pins[tool] = {**cast(dict[str, Any], entry), "pin": pin, "v": version}
+        conn.execute(
+            "UPDATE extensions SET mcp_pins = ? WHERE name = ?",
+            (json.dumps(pins, sort_keys=True), name),
+        )
+    return True
 
 
 def delete_extension(conn: sqlite3.Connection, name: str) -> bool:

@@ -15,7 +15,8 @@ from resonant_sdk.manifest import McpStdioServer, parse_yaml
 
 def test_default_levels() -> None:
     assert ToolSpec(name="r", effect=Effect.READ).effective_level is Level.L0
-    assert ToolSpec(name="w", effect=Effect.WRITE).effective_level is Level.L1
+    assert ToolSpec(name="w", effect=Effect.WRITE).effective_level is Level.L2  # GT-1
+    assert ToolSpec(name="w1", effect=Effect.WRITE, level=Level.L1).effective_level is Level.L1
     assert ToolSpec(name="p", effect=Effect.PAY).effective_level is Level.L1
     assert ToolSpec(name="w3", effect=Effect.WRITE, level=Level.L3).effective_level is Level.L3
 
@@ -145,7 +146,7 @@ def test_mcp_tools_typed() -> None:
     }
     m = load(TRADE_JEV, mcp={"servers": {"gmail": server}})
     send = next(s for s in m.tool_specs() if s.name == "send")
-    assert send.commit and send.effective_level is Level.L1
+    assert send.commit and send.effective_level is Level.L2  # write default (GT-1)
     assert m.mcp is not None
     gmail = m.mcp.servers["gmail"]
     assert isinstance(gmail, McpStdioServer) and gmail.command == "gmail-mcp"

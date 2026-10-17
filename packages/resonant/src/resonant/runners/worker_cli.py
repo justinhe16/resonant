@@ -254,6 +254,8 @@ _SHIM_SOURCE = r'''
       session is resumed with the answer.
   resonant note "<progress>" [--urgent]
       Report meaningful progress. --urgent only for what the owner must see now.
+      Start it with "did:" for a side effect outside your branch and PR (a merge with gh,
+      a deploy, an email): those are listed in your report to the owner.
   resonant check --system S --action A [--irreversible] [--cost USD] "<what>"
       Before anything that could be net new: ok (go ahead) or denied (don't).
   resonant restart

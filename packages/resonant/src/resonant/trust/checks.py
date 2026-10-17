@@ -17,7 +17,9 @@ daemon's instance.
 
 What it does:
 
-1. ``resonant.trust.evaluate`` decides (rules, then the net-new defaults) and audits.
+1. ``resonant.trust.evaluate`` decides (rules, then the net-new defaults) and audits. A
+   cost counts as net-new only above ``cost_ask_over_usd`` (config
+   ``trust.cost_ask_over_usd``, default $20).
    ``ok`` returns ``"ok"`` at once.
 2. ``ask``: it creates an owner approval on the run's task, through the same store, codes
    and prompt path as the gate's approvals (``runners.approve.prompt_approvers``). The
@@ -70,7 +72,7 @@ from resonant.store import trust as store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, utcnow
 from resonant.trust import TrustDecision, clean_what, evaluate
-from resonant.trust.policy import is_area
+from resonant.trust.policy import COST_ASK_OVER_USD, is_area
 from resonant_sdk import Effect, Level
 
 log = logging.getLogger(__name__)
@@ -138,8 +140,10 @@ class TrustChecks:
         approval_ttl_s: float,
         clock: Callable[[], datetime] = utcnow,
         poll_s: float = POLL_S,
+        cost_ask_over_usd: float = COST_ASK_OVER_USD,
     ) -> None:
         self.conn = conn
+        self.cost_ask_over_usd = cost_ask_over_usd  # config trust.cost_ask_over_usd
         self.channel = channel
         self.principals = principals
         self.ttl = timedelta(seconds=approval_ttl_s)
@@ -174,6 +178,7 @@ class TrustChecks:
             repo=run.repo or None,
             run=run.code,
             now=self.clock(),
+            cost_ask_over_usd=self.cost_ask_over_usd,
         )
         if decision.ok:
             return "ok"

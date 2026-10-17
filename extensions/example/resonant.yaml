@@ -12,7 +12,7 @@ jobs:
   - id: morning-ping
     schedule: "0 8 * * 1-5"            # cron, evaluated in the daemon timezone unless tz is set
     run: ./cli.py ping
-    effect: read                       # jobs default to write (L1, asks); this one only reads
+    effect: read                       # jobs default to write (L2, asks); this one only reads
   # Reporters: they call report() (emit.py) and Resonant decides what is news; see README.
   - id: pnl                            # a fake PnL: normal urgency, so it rides the hourly pulse
     schedule: "55 * * * *"
@@ -34,7 +34,7 @@ tools:
   write_note:
     description: Append a line to the example notes file.
     run: ./cli.py note --text {text}
-    effect: write                      # write defaults to L1 (approval first)
+    effect: write                      # write defaults to L2 (asks unless you asked)
     level: L3                          # reversible + tiny blast radius: act, then report
     args: {text: string}
 

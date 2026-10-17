@@ -16,7 +16,8 @@ Tools are Linear-like (``list_issues``, ``get_issue``, ``list_comments``, ``list
   GET stream.
 - ``hidden``: never listed in a manifest; records a call.
 
-Switches: ``variant`` (changes ``list_issues``'s description), ``sse``, ``get_stream``,
+Switches: ``variant`` (changes ``list_issues``'s description and adds a ``variant`` property
+to its schema: pinned), ``sse``, ``get_stream``,
 ``status`` (the next POST answers with this HTTP status), ``redirect`` (POSTs answer 307 to
 this URL), ``expire`` (the current session is forgotten: its next request gets 404).
 Everything received is recorded in ``requests`` / ``notes``.
@@ -126,6 +127,7 @@ class FakeHttpMcp:
                     "assignee": STR,
                     "team": STR,
                     "limit": {"type": "integer", "minimum": 1, "maximum": 250},
+                    **({"variant": STR} if self.variant else {}),
                 },
                 [],
             ),

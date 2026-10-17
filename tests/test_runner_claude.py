@@ -690,8 +690,8 @@ async def test_flagged_paths_are_in_the_reply(tmp_path: Path, db: sqlite3.Connec
     await h.start()
     await h.drain()
     run = h.run()
-    assert run.status == "ready" and run.flagged_paths == (".claude/settings.json", "Makefile")
-    assert "⚠ changes .claude/settings.json, Makefile" in h.chan.texts()[0]
+    assert run.status == "ready" and run.flagged_paths == (".claude/settings.json",)
+    assert "⚠ changes .claude/settings.json\n" in h.chan.texts()[0]
 
 
 # --- refusals and failures -----------------------------------------------------------------
@@ -843,7 +843,7 @@ async def test_a_repo_without_ci_still_runs_and_the_reply_says_so(
     run = h.run()
     assert run.status == "ready"
     [text] = h.chan.texts()
-    assert "no CI: proj has no pull_request workflow." in text and "/merge" not in text
+    assert "no CI: proj has no pull_request workflow; /merge R1 merges it without CI." in text
     repo = repo_store.find(db, "proj")
     assert repo is not None and repo.ci is False
 
@@ -1547,7 +1547,35 @@ async def test_merge_repeats_the_flagged_paths(tmp_path: Path, db: sqlite3.Conne
     await h.drain()
     res = await h.runner.merge_run(code)
     assert isinstance(res, claude_mod.Merged)
-    assert res.text == "R1 merged: PR #41.\n⚠ changes .claude/settings.json, Makefile"
+    assert res.text == (
+        "R1 merged: PR #41.\n⚠ changes .claude/settings.json\ndeps changed: package.json"
+    )
+
+
+def test_the_merged_line_lists_dependency_files() -> None:
+    from resonant.runners.reports import deps_line, end_title
+
+    assert deps_line(()) == ""
+    assert deps_line(("package.json", "uv.lock")) == "deps changed: package.json, uv.lock"
+    many = tuple(f"svc{n}/package.json" for n in range(6))
+    assert deps_line(many) == (
+        "deps changed: svc0/package.json, svc1/package.json, svc2/package.json, "
+        "svc3/package.json (+2 more)"
+    )
+    run = runs_store.Run(
+        code="R3", task_id=None, principal="owner", repo="proj", ask="", status="merged",
+        step="reply", branch=None, base_branch=None, base_sha=None, head_sha=None,
+        session_id="s", sessions=1, attempts=0, pgid=None, leader_pid=None,
+        leader_started_at=None, session_seconds=725, max_seconds=2700, max_budget_usd=None,
+        wait_seconds=0, waiting_since=None, cost_usd=None, tokens_in=None, tokens_out=None,
+        exit_code=0, pr_number=41, pr_url="https://github.com/o/r/pull/41", files_changed=3,
+        flagged_paths=(), summary=None, failure=None,
+        created_at=utcnow(), started_at=None, ended_at=None, updated_at=utcnow(),
+    )  # fmt: skip
+    assert end_title(run, deps=("uv.lock",)) == (
+        "R3 merged: PR #41 · https://github.com/o/r/pull/41 · deps changed: uv.lock"
+    )
+    assert end_title(run) == "R3 merged: PR #41 · https://github.com/o/r/pull/41"
 
 
 async def test_list_runs_orders_active_first(h: Harness) -> None:

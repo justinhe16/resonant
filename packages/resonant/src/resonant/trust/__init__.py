@@ -5,7 +5,8 @@ record each evaluation in the audit log:
 
 - ``evaluate(conn, system, action, irreversible, cost_usd, what, *, repo, run)`` ->
   ``TrustDecision(verdict "ok" | "ask", reason, rule)``. An ok check marks (system, action)
-  seen, so it isn't net new next time. Audited ``trust.evaluate``.
+  seen, so it isn't net new next time. A cost over ``cost_ask_over_usd`` (config
+  ``trust.cost_ask_over_usd``, default $20) asks. Audited ``trust.evaluate``.
 - ``notify_level(conn, system, action, event, *, repo)`` -> ``NotifyDecision(level "now" |
   "digest", reason, rule)``: how soon the owner hears about a worker event (EM-6 delivers).
 - ``merge_decision(conn, repo)`` -> ``"ok" | "ask"``: a merge is ok unless a rule (``ask
@@ -27,6 +28,7 @@ from resonant.store import trust as store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, utcnow
 from resonant.trust.policy import (
+    COST_ASK_OVER_USD,
     Check,
     NotifyDecision,
     TrustDecision,
@@ -66,9 +68,11 @@ def evaluate(
     repo: str | None = None,
     run: str | None = None,
     now: datetime | None = None,
+    cost_ask_over_usd: float = COST_ASK_OVER_USD,
 ) -> TrustDecision:
     """Decide one check and record it. ``system`` and ``action`` must be slugs
-    (``store.trust.slug`` normalizes them; anything else raises ``ValueError``)."""
+    (``store.trust.slug`` normalizes them; anything else raises ``ValueError``). A cost
+    above ``cost_ask_over_usd`` (config ``trust.cost_ask_over_usd``) asks."""
     check = Check(
         system=store.slug(system),
         action=store.slug(action),
@@ -81,7 +85,12 @@ def evaluate(
         raise ValueError("a check names one system and one action, not *")
     at = now or utcnow()
     with atomic(conn):
-        decision = decide(check, store.list_rules(conn), store.seen_actions(conn, check.system))
+        decision = decide(
+            check,
+            store.list_rules(conn),
+            store.seen_actions(conn, check.system),
+            cost_ask_over_usd=cost_ask_over_usd,
+        )
         if decision.ok:
             store.mark_seen(conn, check.system, check.action, at)
         audit(

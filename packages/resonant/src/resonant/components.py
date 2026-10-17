@@ -42,6 +42,7 @@ from resonant.tools import runs as runs_tools
 from resonant.tools import trust as trust_tools
 from resonant.tools.builtin import register_builtins
 from resonant.tools.registry import ToolKey
+from resonant.trust.tools import StandingAllows
 from resonant_sdk import Level, ToolSpec
 
 if TYPE_CHECKING:
@@ -183,6 +184,7 @@ def build_components(
         actions=summary_actions(conn),
         approvers_for=host.approvers_for,
         levels=level_overrides(conn),
+        standing=StandingAllows(conn),
     )
     merged: dict[HandlerKey, Handler] = {**handlers, **host.handlers, **host.mcp_handlers}
     executor = Executor(

@@ -25,6 +25,7 @@ from resonant.runner import cleanup as cleanup_mod
 from resonant.runner import workspace as workspace_mod
 from resonant.runner.checks import CheckFailed
 from resonant.runner.workspace import (
+    CiPending,
     MergeRefused,
     Prepared,
     RunnerError,
@@ -813,13 +814,15 @@ async def test_merge_needs_green_ci_and_matches_head(env: Env) -> None:
     with pytest.raises(MergeRefused, match="isn't green"):
         await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
     env.gh_set("checks_rc", "8")
-    with pytest.raises(MergeRefused, match="still running"):
+    with pytest.raises(CiPending, match="still running"):  # an owner's /merge waits on it
         await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
     assert not env.gh_calls("merge")
 
     env.gh_set("checks_rc", "0")
-    result = await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
+    done = await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch)
+    result = done.checks
     assert result.head_sha == sha and result.files == 1 and result.flagged == ()
+    assert result.deps == () and not done.no_ci
     merge = env.gh_calls("merge")[0]
     argv: list[str] = merge["argv"]  # type: ignore[assignment]
     assert argv[:3] == ["pr", "merge", "41"]
@@ -858,10 +861,12 @@ async def test_merge_refuses_a_github_change(env: Env) -> None:
 
 async def test_merge_lists_a_github_change_when_the_repo_allows_it(env: Env) -> None:
     env.conn.execute("UPDATE repos SET allow_github_changes = 1")
-    p, head = await env.open_pr({".github/workflows/x.yml": "on: push\n", "Makefile": "all:\n"})
+    files = {".github/workflows/x.yml": "on: push\n", "Makefile": "all:\n", "uv.lock": "x\n"}
+    p, head = await env.open_pr(files)
     env.gh_set("checks_rc", "0")
-    result = await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
-    assert result.flagged == (".github/workflows/x.yml", "Makefile")
+    done = await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
+    assert done.checks.flagged == (".github/workflows/x.yml",)
+    assert done.checks.deps == ("uv.lock",) and not done.no_ci
     assert len(env.gh_calls("merge")) == 1
 
 
@@ -1217,6 +1222,44 @@ async def test_merge_is_refused_without_ci_after_a_live_recheck(tmp_path: Path) 
     await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
     repo = repo_store.find(env.conn, "proj")
     assert repo is not None and repo.ci is True
+
+
+async def test_an_owners_merge_goes_in_without_ci_with_a_flag(tmp_path: Path) -> None:
+    """GT-1: a repo with no CI at all merges on the owner's word (``allow_no_ci``), and
+    says so; the auto-merge (no ``allow_no_ci``) is still refused."""
+    env = Env(tmp_path, ci=False)
+    p, head = await env.open_pr()
+    env.gh_set("checks_rc", "1")
+    env.gh_set("checks_err", "no checks reported on the 'x' branch")
+    with pytest.raises(MergeRefused, match="has no CI"):
+        await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch)
+    assert env.gh_calls("merge") == []
+    done = await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch, allow_no_ci=True)
+    assert done.no_ci and len(env.gh_calls("merge")) == 1
+
+
+async def test_an_owners_merge_still_refuses_red_ci_and_waits_on_pending(tmp_path: Path) -> None:
+    env = Env(tmp_path, ci=False)
+    p, head = await env.open_pr()
+    env.gh_set("checks_rc", "1")  # red: some check (an app's) failed
+    with pytest.raises(MergeRefused, match="isn't green") as e:
+        await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch, allow_no_ci=True)
+    assert not isinstance(e.value, CiPending)
+    env.gh_set("checks_rc", "8")
+    with pytest.raises(CiPending):
+        await env.ws.merge("proj", 41, head, SECRETS, branch=p.branch, allow_no_ci=True)
+    assert env.gh_calls("merge") == []
+
+
+async def test_an_owners_merge_waits_for_checks_not_reported_yet_in_a_repo_with_ci(
+    env: Env,
+) -> None:
+    p, sha = await env.open_pr()
+    env.gh_set("checks_rc", "1")
+    env.gh_set("checks_err", "no checks reported on the 'x' branch")
+    with pytest.raises(CiPending, match="no CI checks reported for this PR yet"):
+        await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch, allow_no_ci=True)
+    assert env.gh_calls("merge") == []
 
 
 async def test_merge_allows_the_starter_ci_pr_in_a_repo_without_ci(
@@ -1755,7 +1798,7 @@ async def test_starter_ci_merge_allows_its_one_github_file(
     with pytest.raises(MergeRefused, match=r"it changes \.github/"):
         await env.ws.merge("proj", 41, head, SECRETS, branch=branch)
     result = await env.ws.merge("proj", 41, head, SECRETS, branch=branch, starter_ci=True)
-    assert result.flagged == (create.CI_PATH,)
+    assert result.checks.flagged == (create.CI_PATH,)
     assert len(env.gh_calls("merge")) == 1
     verdict["ci_only"] = False
     with pytest.raises(MergeRefused, match="isn't only the starter CI"):
@@ -1774,7 +1817,7 @@ async def test_starter_ci_merge_is_stricter_not_looser(
     env = Env(tmp_path, ci=False)
     branch, head = await _ci_pr(env, {"Makefile": "all:\n"})
     env.gh_set("checks_rc", "0")
-    with pytest.raises(MergeRefused, match="isn't only the starter CI"):  # anything else flagged
+    with pytest.raises(MergeRefused, match="isn't only the starter CI"):  # anything else too
         await env.ws.merge("proj", 41, head, SECRETS, branch=branch, starter_ci=True)
     p, run_head = await env.open_pr()  # a run's branch is never the add-CI PR
     with pytest.raises(MergeRefused, match="isn't only the starter CI"):

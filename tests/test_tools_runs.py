@@ -24,7 +24,7 @@ from resonant.router.fast_path import FastPath, kill_reply, match_fast_path, ren
 from resonant.router.intents import INTENT_TOOLS
 from resonant.router.render import render_runs
 from resonant.router.router import toolset_for
-from resonant.runners.claude import MAX_ASK, Cancelled, Merged, Refused, Started
+from resonant.runners.claude import MAX_ASK, Cancelled, Merged, MergeQueued, Refused, Started
 from resonant.runners.local import report_line
 from resonant.runners.worker_desk import OpenQuestion, Relayed
 from resonant.store import extensions as ext_store
@@ -51,7 +51,7 @@ class FakeRunner:
         self.missing = missing
         self.calls: list[tuple[Any, ...]] = []
         self.reports: list[str] = []
-        self.merge_result: Merged | Refused = Merged("R1", 41, ("Makefile",))
+        self.merge_result: Merged | MergeQueued | Refused = Merged("R1", 41, (".mcp.json",))
         self.questions: list[OpenQuestion] = []
         self.limits: list[str] = []
 
@@ -86,7 +86,7 @@ class FakeRunner:
         self.calls.append(("cancel", code))
         return Cancelled(code) if self.get_run(code) else Refused(f"No run {code}.")
 
-    async def merge_run(self, code: str) -> Merged | Refused:
+    async def merge_run(self, code: str) -> Merged | MergeQueued | Refused:
         self.calls.append(("merge", code))
         return self.merge_result
 
@@ -453,13 +453,30 @@ async def test_merge_run(
 ) -> None:
     make_run(db, status="merged", pr_number=41, pr_url="https://github.com/own/resonant/pull/41")
     out = await call(components, "merge_run", {"code": "R1"})
-    assert out["merged"] is True and out["flagged_paths"] == ["Makefile"]
+    assert out["merged"] is True and out["flagged_paths"] == [".mcp.json"]
+    assert out["deps_changed"] == [] and out["merged_without_ci"] is False
     assert out["text"] == (
-        "R1 merged: PR #41.\n⚠ changes Makefile\nhttps://github.com/own/resonant/pull/41"
+        "R1 merged: PR #41.\n⚠ changes .mcp.json\nhttps://github.com/own/resonant/pull/41"
+    )
+    runner.merge_result = Merged("R1", 41, (), ("package.json", "uv.lock"), no_ci="resonant")
+    out = await call(components, "merge_run", {"code": "R1"})
+    assert out["deps_changed"] == ["package.json", "uv.lock"] and out["merged_without_ci"]
+    assert out["text"] == (
+        "R1 merged: PR #41.\n⚠ merged without CI: resonant has no CI checks\n"
+        "deps changed: package.json, uv.lock\nhttps://github.com/own/resonant/pull/41"
     )
     runner.merge_result = Refused("R1 not merged: CI is red.")
     out = await call(components, "merge_run", {"code": "R1"})
     assert out == {"merged": False, "code": "R1", "text": "R1 not merged: CI is red."}
+    runner.merge_result = MergeQueued("R1", 41)
+    out = await call(components, "merge_run", {"code": "R1"})
+    assert out == {
+        "merged": False,
+        "queued": True,
+        "code": "R1",
+        "pr_number": 41,
+        "text": "R1: CI is still running; I'll merge PR #41 when it's green.",
+    }
 
 
 # --- commands ----------------------------------------------------------------------------

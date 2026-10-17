@@ -16,9 +16,12 @@ code-built prompt. A misread message or a steered model can't loosen trust silen
   takes the number from the earlier ``Rule added: … (rule 3)`` reply or from
   ``list_trust_rules``. ``/rules forget <n>`` is explicit and runs.
 
-Rules made here have ``created_from="chat"``; ``yes always`` to a worker's check makes the
-others (``trust.checks``). Each change is audited (``trust.rule_added`` with any replaced
-rule's fields, ``trust.rule_removed``) on top of the executor's own rows.
+Rules made here have ``created_from="chat"``; ``yes always`` to a worker's check
+(``trust.checks``) or to an owner's L2 chat tool call (a standing allow on ``tool:<name>``,
+``trust.tools``) makes the others. ``/rules allow <what> [in <scope>]`` is the explicit path
+for widening (``allow_trust_rule``, which runs from a slash command). Each change is audited
+(``trust.rule_added`` with any replaced rule's fields, ``trust.rule_removed``) on top of the
+executor's own rows.
 """
 
 from __future__ import annotations
@@ -244,6 +247,8 @@ def summary_action(conn: sqlite3.Connection, intent: Intent) -> str | None:
         except ValueError:
             return None
         what = "anything" if action == store.ANY else action
+        if action.startswith(store.TOOL_PREFIX):
+            what = f"running {action.removeprefix(store.TOOL_PREFIX)}"
         where = "everywhere" if scope == store.ANY else f"in {scope}"
         if args.get("effect") == "notify_digest":
             return f"stop texting right away on {what} {where} (digest only)"

@@ -39,6 +39,8 @@ from resonant.gate.codes import CODE_DIGITS, CODE_LETTERS, clean_external
 from resonant.principals import Principals
 from resonant.router.intents import ExtensionCatalog, IntentLabel, extension_intent
 from resonant.store.db import utcnow
+from resonant.store.trust import TOOL_PREFIX
+from resonant.store.trust import slug as trust_slug
 from resonant.tools.notes import TEXT_MAX as NOTE_TEXT_MAX
 from resonant.tools.ops import LOGS_MAX
 from resonant.tools.registry import ToolRegistry
@@ -150,7 +152,7 @@ def _text(rest: str, limit: int) -> str:
 
 
 def note_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
-    """``/note <text>``: the text, at most 200 characters."""
+    """``/note <text>``: the text, at most ``NOTE_TEXT_MAX`` (1000) characters."""
     return {"text": _text(rest, NOTE_TEXT_MAX)}
 
 
@@ -306,6 +308,29 @@ def _run_code(rest: str) -> str:
 def forget_rule_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
     """``/rules forget <n>``: a rule number (``3`` or ``#3``)."""
     return {"id": _number(rest, "rule")}
+
+
+_TOOL_WORD = re.compile(r"running\s+(\S+)", re.IGNORECASE)
+
+
+def allow_rule_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
+    """``/rules allow <action> [in <scope>]``: widen trust explicitly (``allow_trust_rule``,
+    L2, so the slash command runs). ``deploy in dori-staging``, ``merge`` (everywhere), or a
+    chat tool's standing allow: ``running github.merge_pr in jhe/dori`` (action
+    ``tool:github.merge_pr``). Without ``in`` the scope is ``*``. Both are slugs."""
+    text = " ".join(rest.split()).rstrip("?!. ")
+    if not text:
+        raise UsageError("say what to allow, like: deploy in dori-staging")
+    what, sep, where = text.rpartition(" in ")
+    if not sep:
+        what, where = text, "*"
+    if m := _TOOL_WORD.fullmatch(what):
+        what = f"{TOOL_PREFIX}{m.group(1)}"
+    try:
+        action, scope = trust_slug(what), trust_slug(where)
+    except ValueError:
+        raise UsageError("an action and a scope are short names, like: deploy in dori") from None
+    return {"scope": scope, "action": action}
 
 
 def runs_args(rest: str, ctx: ParseContext | None = None) -> dict[str, Any]:
@@ -643,12 +668,20 @@ COMMANDS: tuple[Command, ...] = (
     ),
     Command(
         "/rules",
-        "/rules [forget <n>]",
-        "trust rules: when runs ask first; forget <n> drops one",
+        "/rules [forget <n> | allow <what> [in <scope>]]",
+        "trust rules: when runs ask first; forget <n> drops one; allow widens",
         "rules",
         tool="list_trust_rules",
         owner_only=True,
-        subs=(Sub("forget", "remove_trust_rule", forget_rule_args, usage="/rules forget <n>"),),
+        subs=(
+            Sub("forget", "remove_trust_rule", forget_rule_args, usage="/rules forget <n>"),
+            Sub(
+                "allow",
+                "allow_trust_rule",
+                allow_rule_args,
+                usage="/rules allow <action> [in <scope>]",
+            ),
+        ),
     ),
     EXT,
     PULSE,

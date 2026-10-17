@@ -11,9 +11,18 @@ to the mirror: nothing here ever executes git in the owner's checkout or a run's
   removing doesn't hide it); a runner
   token (or anything shaped like one) in any commit's patch, raw commit object (author,
   committer, message), the branch name or the PR body.
-- **Flagged** (``CheckResult.flagged``): files a ``pull_request`` CI run or the owner's
-  tooling executes, plus symlink and mode changes. Not refused, but shown in the done and
-  ``/merge`` replies.
+- **Flagged** (``CheckResult.flagged``): files that run in CI or in the owner's tooling with
+  nobody reading them first: ``.github/`` (when allowed), other CI config (``.gitlab-ci.yml``,
+  ``.circleci/``, ``.buildkite/``, ``azure-pipelines.yml``, ``Jenkinsfile``, ...), Claude
+  Code's ``.claude/`` and ``.mcp.json``, git hooks (``.githooks/``, ``.husky/``,
+  ``.pre-commit-config.yaml``, ``lefthook.yml``) and ``CODEOWNERS``; plus symlinks. Not
+  refused, but shown in the done and ``/merge`` replies, and they stop an auto-merge (it
+  waits for ``/merge``). Ordinary code (a ``Makefile``, ``conftest.py``, a ``Dockerfile``) is
+  not flagged: the owner reviews the PR as a whole.
+- **Dependency files** (``CheckResult.deps``): manifests and lockfiles (``package.json``,
+  ``pyproject.toml``, ``requirements*.txt``, ``uv.lock``, ``Cargo.lock``, ``go.mod``, ...) the
+  net diff changes. Not flagged: they merge, and the merged reply and digest line list them
+  (``deps changed: package.json, uv.lock``).
 
 Anything git prints that this module can't parse fails closed. Reasons never quote the
 matched text, so a refusal can't leak a token.
@@ -54,25 +63,81 @@ _SHAPES = re.compile(
 _FLAGGED_NAMES = frozenset(
     {
         ".mcp.json",
-        "makefile",
-        "gnumakefile",
-        "justfile",
-        "conftest.py",
-        "noxfile.py",
-        "tox.ini",
-        "package.json",
-        "pyproject.toml",
-        "setup.py",
+        # git hooks
         ".pre-commit-config.yaml",
-        ".devcontainer.json",
-        ".envrc",
-        ".npmrc",
-        ".gitattributes",
+        ".pre-commit-config.yml",
+        "lefthook.yml",
+        "lefthook.yaml",
+        ".lefthook.yml",
+        ".lefthook.yaml",
+        "lefthook-local.yml",
+        "lefthook-local.yaml",
+        # who must review (GitHub reads it from the root, .github/ or docs/)
+        "codeowners",
+        # CI outside .github/
         "jenkinsfile",
         ".gitlab-ci.yml",
+        ".gitlab-ci.yaml",
+        "azure-pipelines.yml",
+        "azure-pipelines.yaml",
+        ".travis.yml",
+        "bitbucket-pipelines.yml",
+        ".drone.yml",
+        ".woodpecker.yml",
     }
 )
-_FLAGGED_DIRS = frozenset({".claude", ".devcontainer", ".husky", ".circleci"})
+_FLAGGED_DIRS = frozenset(
+    {".claude", ".githooks", ".husky", ".circleci", ".buildkite", ".woodpecker"}
+)
+
+# Dependency manifests and lockfiles: listed in the merged report, never flagged.
+_DEP_NAMES = frozenset(
+    {
+        # JavaScript
+        "package.json",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "pnpm-workspace.yaml",
+        "bun.lock",
+        "bun.lockb",
+        "deno.json",
+        "deno.lock",
+        ".npmrc",
+        ".yarnrc",
+        ".yarnrc.yml",
+        # Python
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "uv.lock",
+        "poetry.lock",
+        "pdm.lock",
+        "pipfile",
+        "pipfile.lock",
+        # others
+        "cargo.toml",
+        "cargo.lock",
+        "go.mod",
+        "go.sum",
+        "gemfile",
+        "gemfile.lock",
+        "composer.json",
+        "composer.lock",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "gradle.lockfile",
+        "package.swift",
+        "package.resolved",
+        "podfile",
+        "podfile.lock",
+        "mix.exs",
+        "mix.lock",
+    }
+)
+_DEP_PATTERN = re.compile(r"(requirements|constraints)[\w.-]*\.(txt|in)|[\w.-]+\.gemspec", re.ASCII)
 
 
 class CheckFailed(Exception):
@@ -119,10 +184,11 @@ class CheckResult:
     flagged: tuple[str, ...]  # sensitive paths, sorted
     title: str  # the first commit's subject
     head_sha: str
+    deps: tuple[str, ...] = ()  # dependency files the net diff changes, sorted
 
     @property
     def flag_line(self) -> str:
-        """``⚠ changes Makefile, package.json`` or an empty string."""
+        """``⚠ changes .claude/settings.json, .mcp.json`` or an empty string."""
         return f"⚠ changes {', '.join(self.flagged)}" if self.flagged else ""
 
 
@@ -139,10 +205,15 @@ def classify_path(path: str, *, allow_github: bool = False) -> tuple[str | None,
         parts[0] == ".github"  # allowed, but the merge prompt and reply list it
         or any(part in _FLAGGED_DIRS for part in parts)
         or name in _FLAGGED_NAMES
-        or name.startswith(("dockerfile", ".yarnrc"))
-        or (len(parts) >= 2 and parts[-2] == ".vscode" and name in ("tasks.json", "settings.json"))
     )
     return None, flagged
+
+
+def is_dependency_file(path: str) -> bool:
+    """Whether a repo path is a dependency manifest or lockfile (by its name, any directory,
+    case-insensitively)."""
+    name = path.lower().rsplit("/", 1)[-1]
+    return name in _DEP_NAMES or _DEP_PATTERN.fullmatch(name) is not None
 
 
 def has_secret(values: Iterable[str], text: str) -> bool:
@@ -218,13 +289,10 @@ def added_lines(patch: str) -> str:
 
 
 def _mode_flag(e: RawEntry) -> str | None:
+    """A symlink is flagged (it can point a tool outside the tree); a mode change, or a new
+    executable, is ordinary code and isn't."""
     if e.new_mode == "120000":
         return f"{e.path} (symlink)"
-    regular = ("100644", "100755")
-    if e.old_mode in regular and e.new_mode in regular and e.old_mode != e.new_mode:
-        return f"{e.path} (mode change)"
-    if e.new_mode == "100755" and e.old_mode not in regular:
-        return f"{e.path} (executable)"
     return None
 
 
@@ -280,9 +348,12 @@ async def run_checks(
             raise CheckFailed(refusal)
         if is_flagged:
             flagged.add(e.path)
+    deps: set[str] = set()
     for e in net:
         if (mode_flag := _mode_flag(e)) is not None:
             flagged.add(mode_flag)
+        if is_dependency_file(e.path):
+            deps.add(e.path)
 
     # Size: new blobs and the old blobs they replace or delete.
     blobs = sorted({s for e in net for s in (e.old_sha, e.new_sha) if s != ZERO_SHA})
@@ -332,7 +403,9 @@ async def run_checks(
     messages = [m.decode(errors="replace") for m in log.split(b"\0") if m.strip()]
     first = messages[0].strip().splitlines()[0] if messages else ""
     title = first[:MAX_TITLE_CHARS] or "Resonant run"
-    return CheckResult(len(net), changed, tuple(sorted(flagged)), title, head_sha)
+    return CheckResult(
+        len(net), changed, tuple(sorted(flagged)), title, head_sha, tuple(sorted(deps))
+    )
 
 
 # --- CI presence -------------------------------------------------------------------------

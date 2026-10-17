@@ -79,7 +79,7 @@ from resonant.router.intents import (
 )
 from resonant.router.labeler import Labeler
 from resonant.router.prefixes import toolset_prefix_hash
-from resonant.router.relay import Relay, clash_text, parse_addressed
+from resonant.router.relay import Relay, clash_text, parse_addressed, plain_reply_clashes
 from resonant.store.db import utcnow
 from resonant.tools import ToolRegistry
 from resonant_sdk import Event, ToolSpec
@@ -288,14 +288,20 @@ class Router:
             return reply(text, None, "run_project", RELAY_TITLE)
 
         # A plain yes/no while a worker question is open: the approval keeps it only when no
-        # question competes; with both open, it binds neither (relay.py, "approval clash").
+        # question competes; with both open, it binds neither (relay.py, "approval clash"),
+        # unless the one question open can't take a yes/no (it offers other options).
         skip_inbox = False
         plain = parse_reply(text, truncated=event.payload.get("truncated") is True)
-        if plain is not None and plain.code is None and self.relay.open_for(event, principal):
+        opens = (
+            self.relay.open_for(event, principal)
+            if plain is not None and plain.code is None
+            else []
+        )
+        if opens:
             sent = self.inbox.sent_pending(principal)
-            if sent:
-                return relayed(clash_text(sent, self.relay.open_for(event, principal)))
-            skip_inbox = True
+            if plain_reply_clashes(sent, opens):
+                return relayed(clash_text(sent, opens))
+            skip_inbox = not sent
         answered = None if skip_inbox else self.inbox.handle(event, text, principal, spans=spans)
         if answered is not None:
             if answered.reply is None:

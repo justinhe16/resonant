@@ -354,3 +354,14 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **Small gaps:** time blocked inside one `resonant ask` call (up to 8 minutes) counts as session time (EM-3); no `resonant approvals approve --always` (EM-4); a renamed repo's checkout isn't moved and the checkout's `.git` growth isn't under the disk watchdog (EM-2); `/run blog fix x` with a repo only GitHub knows is a scratch run unless written `/run blog: fix x` (EM-8); `merge_ci_pr` doesn't wait for CI (EM-8); no default trust rules ship (`created_from="default"` is reserved, EM-4); no per-repo auto-merge default, so merge intent comes only from the ask (EM-7); the `run_project` intent keeps its name (repos-plan D8's rename to `repos` is optional and not done, EM-8).
 - **A fork run's PR-open race** (EM-7). Between the post-yes recheck and `gh pr create` the fork branch could move; it is caught afterwards (the PR is read back and closed on a head mismatch), not prevented.
 - **Naming leftovers kept on purpose** (EM-10). The run step saved as `harvest` (it now finds the PR and runs the checks) is named in the runs CHECK (migrations 006, 009), so renaming it needs a table rebuild. `runner.max_bundle_mb` is deprecated and ignored, accepted only so old config files load; drop it from config files.
+
+## GT-1 carry-overs
+
+*Noted 2026-10-16 from GT-1 ([`employee-plan.md`](employee-plan.md#gt-1-gates-sufficient-not-excessive)).*
+
+- **Standing allows are per tool and scope only.** A `yes always` on `github.merge_pr` in a repo covers every PR there; there is no per-argument rule (a branch, a size). Narrow it with an `ask` rule if needed.
+- **Injection budget is three effects.** One injected read in a chat task can now steer up to three side effects that run unasked (L3, or tools with a standing allow). Revisit if extension reads grow; a per-task cap after an extension read is a cheap tightening.
+- **Anonymously registered repos stay `push`.** `add_repo` without the daemon token can't see push access, so a public repo the owner can't push to is registered `push` and its runs fail to push; re-add with the token to get fork mode. The anonymous lookups share GitHub's 60/h per-IP limit.
+- **Narrowed flagged paths.** Makefile, justfile, Dockerfiles, `.devcontainer`, `.envrc`, `.vscode` and new executables merge without asking now; they run only when someone runs them. Add them back to `runner/checks.py` if that proves too loose.
+- **Worker side-effect reporting is honor-system.** `did:` notes are what the worker chooses to report; with the guard off nothing records a `gh pr merge` it ran itself. The note-text cap (6/h per run) is in memory and resets on restart; a worker's restart text goes to the run's requester, "Back up" to the owner.
+- **No owner text on MCP pin migration.** v1 pins that migrate are audited (`ext.mcp_pin_migrated`) and logged only.

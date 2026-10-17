@@ -116,6 +116,8 @@ async def test_add_rejects_bad_args(
 
 
 async def test_add_accepts_max_length(handlers: dict[str, ToolHandler]) -> None:
+    assert notes.TEXT_MAX == 1000  # GT-1
+    assert notes.ADD_NOTE.args_schema["properties"]["text"]["maxLength"] == 1000
     out = await call(handlers, "add_note", text="x" * notes.TEXT_MAX)
     assert len(out["text"]) == notes.TEXT_MAX
 

@@ -5,7 +5,9 @@ One step does the whole task, unless it has to wait for an approval:
 1. **Resend.** If ``checkpoint.reply`` exists, an earlier attempt computed the reply but may
    not have sent it, so only (re)send it. The send is deduped by ``reply:<task id>``.
 2. **Pinned call.** ``checkpoint.call = {tool, extension, args, step_no, call_index}`` is the
-   task's one gated side effect, pinned before it is gated or run. Resume it (below).
+   task's latest gated side effect, pinned before it is gated or run. Resume it (below);
+   ``checkpoint.effects`` holds the report lines of the side effects that ran before it in
+   the same task, and the reply starts with them.
 3. **Direct call.** ``checkpoint.direct_call = {extension, tool, args}`` (written only by
    the router's command parser; ``extension`` is None or absent for builtins) is pinned as
    ``call`` with ``call_index=0`` and run with no model. This is the only place
@@ -29,10 +31,12 @@ One step does the whole task, unless it has to wait for an approval:
    calls. Each call is ``Intent.for_tool`` (spec from the registry, never the model; origin
    always ``inferred``) -> ``gate.evaluate``. A read that is allowed runs and goes back to
    the model; an extension tool's result is clipped to ``model_result_max_chars``
-   (``extensions.model_result_max_chars``) first. The first call that is not an allowed
-   read (a side effect, or anything that needs approval) ends the loop: one gated side
-   effect per task. Allowed, it is pinned and run; it needs approval, it is pinned and the
-   task waits; refused, the reply says so.
+   (``extensions.model_result_max_chars``) first. A side effect is pinned before it is gated
+   or run. Allowed without asking (L3, or an L2 tool with the owner's standing allow), it
+   runs and the loop goes on, up to ``MAX_SIDE_EFFECTS`` per task (GT-1); each has its own
+   ``call_index``, so each is idempotent on its own. Anything that needs approval is pinned
+   and the task waits: one approval per task, and after it the task ends. Refused, the reply
+   says so (after the report lines of what already ran).
 8. **Answer.** ``chat_json`` with ``{reply: string}``, cut to ``MAX_REPLY_CHARS``. Code
    computes and text narrates: every number in the reply must appear in a tool result or
    in the user's message. Otherwise the reply is replaced by a templated summary of the
@@ -124,7 +128,9 @@ from resonant.router.render import (
 from resonant.router.router import builtin_names, chat_toolset
 from resonant.runners.approve import prompt_approvers
 from resonant.runners.job import SUMMARY_MAX, done_text, failed_text
+from resonant.store import approvals as ap
 from resonant.store import extensions as ext_store
+from resonant.store import trust as trust_store
 from resonant.store.audit import audit
 from resonant.store.db import transaction, utcnow
 from resonant.store.tasks import get_event, get_task, principal_thread
@@ -137,6 +143,7 @@ log = logging.getLogger(__name__)
 NAME = "local"
 MAX_TOOL_ITERATIONS = 3  # chat_tools calls per task
 MAX_TOOL_CALLS = 3  # tool executions per task
+MAX_SIDE_EFFECTS = 3  # gated side effects allowed without asking, per task (GT-1)
 MAX_REPLY_CHARS = 600
 MAX_MESSAGE_CHARS = 2000  # the current message, as the labeler sees it
 MAX_HISTORY_CHARS = 500  # each earlier message or reply
@@ -660,7 +667,9 @@ class LocalRunner:
             pinned = PinnedCall.from_json(cp.get("call"))
             if pinned is None:
                 return Fail("checkpoint.call is malformed")
-            return await self._resume(task, principal, pinned, cp, spans)
+            return _after_effects(
+                _effects(cp), await self._resume(task, principal, pinned, cp, spans)
+            )
         if "direct_call" in cp:
             return await self._direct(task, principal, cp, ctx, spans)
         fast = cp.get("fast_reply")
@@ -687,16 +696,16 @@ class LocalRunner:
             if isinstance(stop, _Answer):
                 if stop.path != "done":
                     return stop  # refused, dry run, failed or ambiguous: templated only
-                # The side effect ran: the model may narrate, the report line is code's.
+                # The side effects ran: the model may narrate, the report lines are code's.
                 return _with_report(await self._final(messages, text, calls, spans), stop)
             if stop:
                 return _Answer(TOO_MANY_REPLY, "escalate", _used(calls), escalate=True)
             return await self._final(messages, text, calls, spans)
         except ModelUnavailableError:
             log.warning("model unavailable for task %s; sending fallback", task.id)
-            done = next((c for c in calls if c.report is not None), None)
-            if done is not None and done.report is not None:
-                return _Answer(done.report, "done", _used(calls))
+            reports = [c.report for c in calls if c.report is not None]
+            if reports:
+                return _Answer(_clip("\n".join(reports)), "done", _used(calls))
             if calls:
                 return _Answer(summarize(calls), "fallback", _used(calls))
             return _Answer(FALLBACK_REPLY, "fallback", [])
@@ -785,6 +794,9 @@ class LocalRunner:
         except NotAllowedError:
             return _Answer(refusal_reply(intent, Deny(APPROVAL_USED)), "refused", [])
         answer = _outcome(intent, result)
+        added = self._rule_added(decision.approval_id)
+        if added is not None and answer.path in ("done", "replay"):
+            answer = replace(answer, reply=_clip(f"{answer.reply}\n{added}"))
         spec = self.registry.get(intent.extension, intent.tool)
         job = self._job_id(spec) if spec is not None else None
         if job is None or intent.extension is None:
@@ -792,6 +804,24 @@ class LocalRunner:
         if not result.replayed:
             self._record_job(intent, intent.extension, job, result)
         return _job_answer(intent, job, result, answer)
+
+    def _rule_added(self, approval_id: str | None) -> str | None:
+        """``Rule added: don't ask before running X in Y (rule 7)`` when the call ran on a
+        ``yes always`` that saved a standing allow (the gate saved it with the approval)."""
+        if approval_id is None:
+            return None
+        row = ap.get_approval(self.conn, approval_id)
+        if row is None or not row.always or not row.always_scope or not row.always_action:
+            return None
+        rule = next(
+            (
+                r
+                for r in trust_store.rules_for(self.conn, row.always_scope, row.always_action)
+                if r.effect == "allow"
+            ),
+            None,
+        )
+        return f"Rule added: {rule.text} (rule {rule.id})" if rule is not None else None
 
     def _job_id(self, spec: ToolSpec) -> str | None:
         """The manifest job id when ``spec`` is an extension's job spec (``/ext run``)."""
@@ -951,11 +981,34 @@ class LocalRunner:
     ) -> bool | _Result:
         """Run tool calls into ``messages`` and ``calls``.
 
-        Returns True if the model wanted too many calls, False when it is done, or the
-        result of the task's one gated call, which always ends the loop.
+        Returns True if the model wanted too many calls, False when it is done, the
+        ``done`` answer with the report lines once side effects ran (up to
+        ``MAX_SIDE_EFFECTS``), or the result of a gated call that didn't run (a wait for its
+        approval, a refusal), which ends the loop after the report lines of what ran.
         """
         if not toolset:
             return False
+        stop = await self._tool_rounds(task, principal, messages, toolset, calls, ctx, spans)
+        reports = [c.report for c in calls if c.report is not None]
+        if isinstance(stop, bool):
+            if not reports:
+                return stop
+            data = next((c.data for c in reversed(calls) if c.report is not None), None)
+            return _Answer(_clip("\n".join(reports)), "done", _used(calls), data=data)
+        return _after_effects(reports, stop)
+
+    async def _tool_rounds(
+        self,
+        task: Task,
+        principal: str,
+        messages: list[ChatMessage],
+        toolset: list[ToolSpec],
+        calls: list[_Call],
+        ctx: StepContext,
+        spans: SpanFactory,
+    ) -> bool | _Result:
+        """The model's tool rounds for ``_tool_loop``: True for too many calls, False when
+        done or at the side-effect cap, or a gated call's result that ends the loop."""
         for _ in range(MAX_TOOL_ITERATIONS):
             try:
                 reply = await self.model.chat_tools(messages, tools=toolset, spans=spans)
@@ -966,8 +1019,9 @@ class LocalRunner:
             for tc in reply.tool_calls:
                 if len(calls) >= MAX_TOOL_CALLS:
                     return True
+                effects = [c.report for c in calls if c.report is not None]
                 call = await self._call_tool(
-                    task, principal, toolset, tc.name, tc.args, len(calls), ctx, spans
+                    task, principal, toolset, tc.name, tc.args, len(calls), ctx, spans, effects
                 )
                 if not isinstance(call, _Call):
                     return call
@@ -984,8 +1038,8 @@ class LocalRunner:
                 )
                 turn = _tool_turn(call, self.model_result_max_chars)
                 messages.append({"role": "user", "content": turn})
-                if call.report is not None:  # one gated side effect per task
-                    return _Answer(call.report, "done", _used(calls), data=call.data)
+                if sum(c.report is not None for c in calls) >= MAX_SIDE_EFFECTS:
+                    return False
         return False
 
     async def _call_tool(
@@ -998,10 +1052,13 @@ class LocalRunner:
         call_index: int,
         ctx: StepContext,
         spans: SpanFactory,
+        effects: list[str] | None = None,
     ) -> _Call | Wait | Fail | _Answer:
-        """One model tool call. An allowed read returns its ``_Call``. Anything else is the
-        task's gated call: an executed side effect returns a ``_Call`` with ``report``
-        set, and a refusal, dry run or wait returns that result."""
+        """One model tool call. An allowed read returns its ``_Call``. Anything else is a
+        gated call: an executed side effect returns a ``_Call`` with ``report`` set, and a
+        refusal, dry run or wait returns that result. ``effects``: the report lines of the
+        side effects this task already ran, pinned with the call so a resume replies with
+        them too."""
         with spans("runner.local.tool", tool=name, call_index=call_index) as s:
             # Only the routed toolset; the spec (effect, level) comes from the registry.
             spec = next((t for t in toolset if t.name == name), None)
@@ -1042,12 +1099,12 @@ class LocalRunner:
                     return _Call(name, False, None, "the tool failed", extension=ext)
                 return _Call(name, True, result.data or {}, None, extension=ext)
 
-            # The task's one gated call: pin it before it can run or be prompted.
+            # A gated call: pin it before it can run or be prompted.
             s.set(gated=True)
             if not isinstance(decision, Allow | NeedsApproval):
                 return _not_run(intent, decision)
             pinned = PinnedCall(spec.name, spec.extension, intent.args, task.step_no, call_index)
-            cp = {**task.checkpoint, "call": pinned.to_json()}
+            cp = {**task.checkpoint, "call": pinned.to_json(), "effects": list(effects or [])}
             if not ctx.save(checkpoint=cp):
                 return Fail("task is no longer running")
             result = await self._decided(intent, decision, pinned, cp, spans)
@@ -1127,6 +1184,20 @@ def _with_report(narration: _Answer, done: _Answer) -> _Answer:
         room = MAX_REPLY_CHARS - len(done.reply) - 1
         text = f"{_clip(text, room)}\n{done.reply}" if room > 0 else done.reply
     return _Answer(text, "llm", done.tools_used)
+
+
+def _effects(cp: dict[str, Any]) -> list[str]:
+    """``checkpoint.effects``: the report lines of side effects that ran before the pinned
+    call (written by code, never a model)."""
+    raw: Any = cp.get("effects")
+    return [e for e in cast(list[Any], raw) if isinstance(e, str)] if isinstance(raw, list) else []
+
+
+def _after_effects(effects: list[str], result: _Result) -> _Result:
+    """``result``'s reply after the report lines of the side effects that already ran."""
+    if not effects or not isinstance(result, _Answer):
+        return result
+    return replace(result, reply=_clip("\n".join([*effects, result.reply])))
 
 
 def _used(calls: list[_Call]) -> list[str]:

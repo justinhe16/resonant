@@ -7,9 +7,12 @@ The router calls it at three points (``router.py``):
    an approval prompt and a worker question are open for the owner binds neither: the reply
    asks which one (``yes K4`` for the approval, ``R4 yes`` for the question). So a worker
    can't ask a question that makes the owner's ``yes`` approve its own (or another run's)
-   check, and a check can't swallow an answer. A plain ``yes``/``no`` with no approval prompt
-   open goes to the questions instead of "Nothing is waiting for approval". Approvals keep
-   their exact-code and ``yes``/``no`` semantics; everything else here is free text.
+   check, and a check can't swallow an answer. One exception (GT-1): with exactly one
+   approval prompt and one question open, and that question offering options none of which
+   is a yes or a no (``a) Postgres b) SQLite``), a plain ``yes``/``no`` can't answer the
+   question, so it goes to the approval (``yes_no_fits``). A plain ``yes``/``no`` with no
+   approval prompt open goes to the questions instead of "Nothing is waiting for approval".
+   Approvals keep their exact-code and ``yes``/``no`` semantics; everything else here is free text.
 2. **``direct``** (after the inbox, before keywords and the labeler; no model call):
 
    - An addressed message: ``R4 …``, ``R4: …``, ``tell R4 (to) …``, ``for R4, …``. The
@@ -223,6 +226,29 @@ def ambiguity_text(opens: Sequence[OpenQuestion]) -> str:
     parts = [f"{q.run_code} ({short_question(q)})" for q in opens]
     head = ", ".join(parts[:-1])
     return f"For {head} or {parts[-1]}?"
+
+
+_YES_NO = frozenset({"yes", "no", "y", "n", "yep", "nope", "ok", "approve", "deny"})
+
+
+def yes_no_fits(q: OpenQuestion) -> bool:
+    """A plain ``yes``/``no`` could answer ``q``: it offers no options, or one of them is a
+    yes or a no (``yes, ship it``, ``No``)."""
+    if not q.options:
+        return True
+    for option in q.options:
+        words = option.lower().replace(",", " ").replace(".", " ").split()
+        if words and words[0].strip("!?:;()") in _YES_NO:
+            return True
+    return False
+
+
+def plain_reply_clashes(sent: Sequence[PendingApproval], opens: Sequence[OpenQuestion]) -> bool:
+    """A plain ``yes``/``no`` binds neither an approval nor a question (the clash reply)
+    unless exactly one of each is open and the question can't take a yes/no."""
+    if not sent or not opens:
+        return False
+    return not (len(sent) == 1 and len(opens) == 1 and not yes_no_fits(opens[0]))
 
 
 def clash_text(sent: Sequence[PendingApproval], opens: Sequence[OpenQuestion]) -> str:

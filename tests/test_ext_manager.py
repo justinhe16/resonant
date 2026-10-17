@@ -644,7 +644,8 @@ def test_confirm_text_is_escalations_first_and_sanitized(
     escalated = lines[esc_at + 1 : tools_at]
     joined = "\n".join(escalated)
     assert 'secret "demo/token"' in joined
-    assert 'tool "merge" write L1: asks, irreversible' in joined
+    assert 'tool "merge" write L2: asks, irreversible' in joined  # write default (GT-1)
+    assert 'tool "merge" write L2: asks, irreversible (yes <code>)' not in joined
     assert 'job "rotate" write L2: asks an approver every run (hourly at :00)' in joined
     assert "runs gh (network)" in joined
 

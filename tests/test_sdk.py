@@ -55,11 +55,11 @@ def job(**patch: Any) -> dict[str, Any]:
     return {"id": "sync", "schedule": "0 * * * *", "run": "./cli.py sync", **patch}
 
 
-def test_job_defaults_to_write_l1_and_becomes_a_spec() -> None:
+def test_job_defaults_to_write_l2_and_becomes_a_spec() -> None:
     m = manifest(jobs=[job(id="nightly-sync", schedule="0 3 * * *")])
     (spec,) = m.job_specs()
     assert spec.name == "job_nightly_sync" and spec.description == "scheduled job"
-    assert spec.effect is Effect.WRITE and spec.effective_level is Level.L1
+    assert spec.effect is Effect.WRITE and spec.effective_level is Level.L2
     assert spec.args_schema == {
         "type": "object",
         "properties": {"due_at": {"type": "string"}},

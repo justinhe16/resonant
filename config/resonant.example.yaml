@@ -48,6 +48,9 @@ power:
 gate:
   approval_ttl_s: 1800                  # an approval prompt stays answerable this long (60..86400)
 
+trust:
+  cost_ask_over_usd: 20.0               # a worker check costing more than this asks you; at or under, cost alone doesn't
+
 # ops:
 #   repo_path: ~/resonant               # repo /update pulls into; default: the checkout Resonant runs from
 #   uv_path: /opt/homebrew/bin/uv       # absolute path to uv for /update; unset means /update refuses

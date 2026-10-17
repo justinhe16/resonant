@@ -35,6 +35,9 @@ CreatedFrom = Literal["chat", "yes always", "command", "default"]
 CREATED_FROM: tuple[CreatedFrom, ...] = get_args(CreatedFrom)
 
 ANY = "*"
+# A standing allow for a chat tool (GT-1) names the tool as its action: ``tool:<name>`` for a
+# builtin, ``tool:<extension>.<name>`` for an extension's tool (``resonant.trust.tools``).
+TOOL_PREFIX = "tool:"
 SLUG_MAX = 64
 NOTE_MAX = 200
 _SLUG = re.compile(r"[a-z0-9][a-z0-9._:/@-]*", re.ASCII)
@@ -76,8 +79,14 @@ class Rule:
 
 def describe(scope: str, action: str, effect: Effect) -> str:
     """A rule in words: ``ask before merge in trading``, ``don't ask before deploy in
-    dori-staging``, ``text right away on done in trading``, ``digest only for pr``."""
-    what = "anything" if action == ANY else action
+    dori-staging``, ``text right away on done in trading``, ``digest only for pr``. A tool
+    rule reads ``don't ask before running github.merge_pr in jhe/dori``."""
+    if action == ANY:
+        what = "anything"
+    elif action.startswith(TOOL_PREFIX):
+        what = f"running {action.removeprefix(TOOL_PREFIX)}"
+    else:
+        what = action
     where = "" if scope == ANY else f" in {scope}"
     if effect == "allow":
         return f"don't ask before {what}{where}"
