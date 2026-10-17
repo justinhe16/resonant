@@ -228,6 +228,24 @@ async def test_the_turn_end_sends_what_the_run_has_not_seen(
     assert h.run(code).resume_prompt == "Message from the owner: use sqlite"  # resent on a crash
 
 
+async def test_a_turn_end_with_a_message_written_since_its_result_leaves_it_open(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """A message written after the result was read starts another turn: that turn's result
+    decides, so the session isn't closed under it."""
+    h = rig(tmp_path, db)
+    code = await start(h)
+    stdin = Stdin()
+    live = LiveInput(stdin)  # pyright: ignore[reportArgumentType]
+    async with live.lock:
+        await live.write_user("prompt")
+    closed = asyncio.Event()
+    await h.runner._turn_ended(h.run(code), live, StreamState(), {"type": "result"}, closed, sent=0)  # pyright: ignore[reportPrivateUsage]
+    assert live.open and not stdin.closed and not closed.is_set()
+    await h.runner._turn_ended(h.run(code), live, StreamState(), {"type": "result"}, closed, sent=1)  # pyright: ignore[reportPrivateUsage]
+    assert stdin.closed and closed.is_set()
+
+
 async def test_the_turn_end_with_nothing_to_send_ends_the_session(
     tmp_path: Path, db: sqlite3.Connection
 ) -> None:
@@ -296,8 +314,8 @@ async def test_remote_control_link_is_stored_and_texted_once(
     await h.drain()
     run = h.run(code)
     assert run.wait_reason == "question"
-    first = run.remote_url
-    assert first is not None and first.startswith(FAKE_URL)
+    assert run.remote_url is None  # the remote session ended with the process
+    first = FAKE_URL + str(h.argv_log(code)[0]["pid"])
     texts = [t for _who, t in h.chan.sent if "Remote Control" in t]
     assert texts == [f"{code} Remote Control: {first}"]
     calls = rc_calls(h, code)
@@ -310,8 +328,45 @@ async def test_remote_control_link_is_stored_and_texted_once(
     await h.drain()
     run = h.run(code)
     assert run.status == "done"
-    assert run.remote_url is not None and run.remote_url != first  # the resume's own session
+    urls = [
+        line["response"]["response"]["session_url"]
+        for line in map(
+            json.loads, (h.runner.transcript_dir / f"{code}.jsonl").read_text().splitlines()
+        )
+        if line.get("type") == "control_response" and line["response"]["response"]
+    ]
+    assert urls == [first, FAKE_URL + str(h.argv_log(code)[1]["pid"])]  # the resume's own
     assert len([t for _who, t in h.chan.sent if "Remote Control" in t]) == 1  # told once
+
+
+async def test_the_remote_url_is_stored_while_the_session_lives(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="hang", max_session_s=3)
+    remote_on(h)
+    code = await h.start()
+    loop = h.spawn_loop()
+    await until(lambda: h.run(code).remote_url is not None, what="the remote session")
+    assert h.run(code).remote_url == FAKE_URL + h.tmp(code).joinpath("claude.pid").read_text()
+    act = h.runner.run_activity(code)
+    assert act is not None and act["remote_url"] == h.run(code).remote_url
+    await loop
+    assert h.run(code).remote_url is None
+
+
+async def test_kill_does_not_wait_for_remote_control_off(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="hang", extra=["--rc", "none"], rc_off_timeout_s=20.0)
+    remote_on(h)
+    code = await h.start()
+    loop = h.spawn_loop()
+    await until(lambda: bool(rc_calls(h, code)), what="the remote control request")
+    began = time.monotonic()
+    await h.runner.cancel_run(code)
+    await loop
+    assert h.run(code).status == "cancelled"
+    assert time.monotonic() - began < 10  # not the 20 s polite wait
 
 
 async def test_remote_control_refused_leaves_the_run_going(

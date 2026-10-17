@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -102,23 +103,35 @@ class LiveInput:
         self._pending: dict[str, asyncio.Future[ControlReply]] = {}
         self._n = 0
 
-    async def _write(self, data: bytes) -> bool:
+    async def _write(self, data: bytes, written: Callable[[], None] | None = None) -> bool:
+        """``written`` runs right after the (synchronous) write, before anything awaits: what
+        it marks delivered can't be read as pending by another reader during the drain."""
         if self.closed:
             return False
         try:
             self._stdin.write(data)
-            await self._stdin.drain()
         except _WRITE_ERRORS:
             self.closed = True
             return False
+        if written is not None:
+            written()
+        try:
+            await self._stdin.drain()
+        except _WRITE_ERRORS:
+            self.closed = True  # the line is in the pipe or lost with the process
         return True
 
-    async def write_user(self, text: str) -> bool:
-        """A user message; the caller holds ``lock``. False when stdin is gone."""
+    async def write_user(self, text: str, written: Callable[[], None] | None = None) -> bool:
+        """A user message; the caller holds ``lock``. False when stdin is gone (nothing
+        written, ``written`` not called)."""
         assert self.lock.locked()
-        ok = await self._write(user_line(text))
-        self.sent += ok
-        return ok
+
+        def counted() -> None:
+            self.sent += 1
+            if written is not None:
+                written()
+
+        return await self._write(user_line(text), counted)
 
     async def control(self, request: dict[str, Any]) -> asyncio.Future[ControlReply] | None:
         """Write a control request; the caller holds ``lock``. The future gets its reply (see

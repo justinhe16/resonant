@@ -81,7 +81,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
 import psutil
@@ -2230,6 +2230,7 @@ class ClaudeRunner:
         closed = asyncio.Event()  # Resonant closed stdin after a result: the session is ending
         turns: set[asyncio.Task[None]] = set()
         last_line = time.monotonic()
+        last_kind: str | None = None  # the last turn line: assistant, user or result
         remote: asyncio.Task[None] | None = None
 
         async def feed() -> None:
@@ -2247,7 +2248,7 @@ class ClaudeRunner:
             await self._push_live(run.code)  # anything that arrived since the prompt was built
 
         async def pump_out() -> None:
-            nonlocal last_line
+            nonlocal last_line, last_kind
             assert proc.stdout
             counted = False
             seen = self._side_effect_context(run, p)
@@ -2256,12 +2257,16 @@ class ClaudeRunner:
                 writer.write(raw, truncated)
                 msg = state.feed(raw) if not truncated else None
                 kind = msg.get("type") if msg is not None else None
+                if kind in ("assistant", "user", "result"):
+                    last_kind = kind
                 if kind == "assistant" and msg is not None:
                     self._detect(run, msg, seen)
                 elif kind == "control_response" and msg is not None:
                     live.feed(msg)
                 elif kind == "result" and msg is not None:
-                    turn = asyncio.create_task(self._turn_ended(run, live, state, msg, closed))
+                    turn = asyncio.create_task(
+                        self._turn_ended(run, live, state, msg, closed, sent=live.sent)
+                    )
                     turns.add(turn)
                     turn.add_done_callback(turns.discard)
                 if state.session_id and not counted:
@@ -2336,9 +2341,11 @@ class ClaudeRunner:
                         stop = "timeout"
                 if stop is not None:
                     break
-                if closed.is_set():
-                    # Stdin is closed: the CLI exits once its turn is over. One that stays
-                    # quiet that long without exiting is ended by the reaper below.
+                if closed.is_set() and cast(str | None, last_kind) == "result":  # set by the pump
+                    # Stdin is closed and the last turn is over: the CLI should exit. One that
+                    # stays quiet that long without exiting is ended by the reaper below. (A
+                    # turn still running after the close may be quiet for long: the time limit
+                    # bounds that.)
                     closed_at = closed_at or time.monotonic()
                     if time.monotonic() - max(closed_at, last_line) >= self.end_grace_s:
                         log.warning("session didn't exit after its end", extra={"run": run.code})
@@ -2364,7 +2371,9 @@ class ClaudeRunner:
             hurry = stop == "cancelled" or sys.exc_info()[0] is not None
             # Resonant ends the session (RC-1): Remote Control off (best effort), stdin
             # closed; then the reaper's SIGTERM and SIGKILL for whatever still runs.
-            if proc.returncode is None and not live.closed:
+            if hurry or cast(str | None, stop) in ("disk", "cache"):  # set by the watchers
+                live.close()  # /kill, /cancel, a crash or a runaway: no polite wait first
+            elif proc.returncode is None and not live.closed:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(
                         live.end(rc_timeout=self.rc_off_timeout_s), self.rc_off_timeout_s + 1
@@ -2386,6 +2395,8 @@ class ClaudeRunner:
             if late:
                 await asyncio.wait(late)
             self._live.pop(run.code, None)
+            with contextlib.suppress(Exception):  # the remote session ended with the process
+                runs.update(self.conn, run.code, remote_url=None)
             writer.note("exit", code=proc.returncode, stop=stop)
             writer.close()
             # The time used counts even when the step is being cancelled, and the saved process
@@ -2403,23 +2414,27 @@ class ClaudeRunner:
         state: StreamState,
         result: dict[str, Any],
         closed: asyncio.Event,
+        *,
+        sent: int = 0,
     ) -> None:
         """A ``result``: the session is idle (RC-1). What the run hasn't seen yet (answers,
         timeouts, owner messages) is its next turn, in the same process. Otherwise, or after
         an error result, Resonant ends the session and the step goes on as for a process that
         exited: a question still open parks the run, else the PR lookup. A turn Resonant
-        didn't start (the owner typing over Remote Control) ends the same way. Never raises."""
+        didn't start (the owner typing over Remote Control) ends the same way. ``sent`` is how
+        many user messages were written when the result was read: one written since starts
+        another turn, whose own result decides. Never raises."""
         try:
             async with live.lock:
-                if not live.open:
-                    return
+                if not live.open or live.sent != sent:
+                    return  # ending already (the ender sets ``closed``), or a turn in flight
                 if result.get("is_error") is not True:
                     self.desk.time_out_due(run.code)
                     found = self.desk.live_delivery(run.code, turn_end=True)
                     if found is not None:
-                        text, sent = found
-                        if await live.write_user(f"{text}\n\nCarry on with the task."):
-                            self._told_live(run.code, text, sent)
+                        text, mark = found
+                        told = lambda: self._told_live(run.code, text, mark)  # noqa: E731
+                        if await live.write_user(f"{text}\n\nCarry on with the task.", told):
                             return
                 live.open = False
                 state.ended = True
@@ -2441,8 +2456,8 @@ class ClaudeRunner:
                 if not live.open:
                     return
                 found = self.desk.live_delivery(code, turn_end=False)
-                if found is not None and await live.write_user(found[0]):
-                    self._told_live(code, *found)
+                if found is not None:
+                    await live.write_user(found[0], lambda: self._told_live(code, *found))
         except Exception:
             log.exception("live input failed", extra={"run": code})
 
