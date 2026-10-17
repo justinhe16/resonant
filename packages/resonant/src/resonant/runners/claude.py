@@ -852,12 +852,11 @@ class ClaudeRunner:
 
     async def _self_repo_seed(self) -> dict[str, RunnerRepo]:
         """``runner.repos`` plus the daemon's own checkout (``self_repo``), so "fix X in
-        resonant" works in a worktree of it (guard off only: ``thin`` write-protects that
-        checkout). The registry is left as the owner shaped it: a repo already registered
-        for its origin (by config, chat or first use) keeps its name, source and settings and
-        only gets the ``path`` when it has none (no rename, no re-adding a removed one is
-        possible either: only a slug the registry doesn't know is seeded, as ``resonant``,
-        and only when that name is free)."""
+        resonant" works in a worktree of it. Guard off only: ``thin`` write-protects that
+        checkout. A ``runner.repos`` entry or registry row for its origin keeps its name,
+        source and settings and only gets a missing ``path`` (never renamed). An origin the
+        registry doesn't know is seeded as ``resonant`` when that name is free, so a repo
+        the owner removed comes back at the next start."""
         seeds = dict(self.cfg.repos)
         path = self.self_repo
         if self.guard != "off" or path is None:
