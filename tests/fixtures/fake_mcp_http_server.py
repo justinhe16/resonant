@@ -59,6 +59,7 @@ class FakeHttpMcp:
         self.get_stream = True
         self.status: int | None = None
         self.redirect: str | None = None
+        self.trickle_202 = False  # answer notifications with a huge body, sent slowly
         self.sessions: set[str] = set()
         self.deleted: list[str] = []
         self.requests: list[dict[str, Any]] = []  # {method, headers, body}
@@ -204,6 +205,19 @@ class FakeHttpMcp:
                 if method == "notifications/cancelled":
                     params: dict[str, Any] = msg.get("params") or {}
                     self.cancelled.append(params.get("requestId"))
+            if self.trickle_202:
+                h.send_response(202)
+                h.send_header("Content-Length", str(50 * 1024 * 1024))
+                h.end_headers()
+                try:
+                    for _ in range(100):
+                        h.wfile.write(b"x" * 1024)
+                        h.wfile.flush()
+                        time.sleep(0.05)
+                except OSError:
+                    pass
+                h.close_connection = True
+                return
             self._reply(h, 202)
             return
         if method == "tools/list":

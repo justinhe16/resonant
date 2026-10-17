@@ -64,6 +64,8 @@ HTTP_MESSAGE_CAP = 1024 * 1024  # one JSON body or SSE event
 STREAM_CAP_FACTOR = 4  # one POST response, in messages
 CONNECT_TIMEOUT_S = 10.0
 CLOSE_TIMEOUT_S = 2.0  # the DELETE on close
+SEND_TIMEOUT_S = 10.0  # a notification or our answer to a server request (202 expected)
+LISTEN_STABLE_S = 30.0  # a GET stream that lived this long resets the reopen backoff
 SESSION_ID_MAX = 256
 LISTEN_BACKOFF_S = (1.0, 5.0, 30.0, 60.0)
 
@@ -116,7 +118,10 @@ class McpHttpSession(RpcSession):
         self._client = httpx.AsyncClient(
             follow_redirects=False,
             trust_env=False,
-            timeout=httpx.Timeout(timeout_s, connect=CONNECT_TIMEOUT_S),
+            # No read/write timeout of httpx's own: every request is bounded by its caller
+            # (a call by its tool's timeout_s, a notification by SEND_TIMEOUT_S, the GET
+            # stream by nothing), so a slow tool isn't cut off at the start timeout.
+            timeout=httpx.Timeout(None, connect=CONNECT_TIMEOUT_S),
             transport=self._transport,
             headers={"User-Agent": f"resonant/{__version__}"},
         )
@@ -156,19 +161,21 @@ class McpHttpSession(RpcSession):
             task.add_done_callback(lambda _t, rid=rid: self._posts.pop(rid, None))
             return
         try:  # a notification or our response to a server request: 202 Accepted
-            resp = await self._client.post(
-                self.url,
-                content=body,
-                headers={
-                    **self._headers("application/json, text/event-stream"),
-                    "Content-Type": "application/json",
-                },
-            )
-            await resp.aclose()
-        except httpx.HTTPError:
+            status = await asyncio.wait_for(self._post_oneway(body), SEND_TIMEOUT_S)
+        except (httpx.HTTPError, TimeoutError):
             raise McpError("server is not reachable") from None
-        if resp.status_code >= 300:
-            raise McpError(f"server refused a notification (http {resp.status_code})")
+        if status >= 300:
+            raise McpError(f"server refused a notification (http {status})")
+
+    async def _post_oneway(self, body: bytes) -> int:
+        """POST a message that gets no answer; its body is never read (no cap needed)."""
+        assert self._client is not None
+        headers = {
+            **self._headers("application/json, text/event-stream"),
+            "Content-Type": "application/json",
+        }
+        async with self._client.stream("POST", self.url, content=body, headers=headers) as resp:
+            return resp.status_code
 
     async def _post(
         self, body: bytes, rid: int, fut: asyncio.Future[dict[str, Any]], method: str
@@ -202,6 +209,9 @@ class McpHttpSession(RpcSession):
         except _TooLarge:
             failure = McpAmbiguous("output too large")
         except httpx.HTTPError:
+            failure = McpAmbiguous("connection lost")
+        except Exception:  # anything else after sending: never leave the call hanging
+            log.warning("mcp http request failed", extra={"label": self.label}, exc_info=False)
             failure = McpAmbiguous("connection lost")
         if failure is not None and not fut.done():
             fut.set_exception(failure)
@@ -286,7 +296,7 @@ class McpHttpSession(RpcSession):
                 if line.startswith(b"data:"):
                     value = line[5:]
                     value = value[1:] if value.startswith(b" ") else value
-                    size += len(value)
+                    size += len(value) + 1  # empty data: lines count too
                     if size > self.message_cap:
                         raise _TooLarge
                     data.append(value)
@@ -298,7 +308,9 @@ class McpHttpSession(RpcSession):
         """The server's GET stream, for messages between calls (``list_changed``). Reopened
         with a backoff while the session lives; given up when the server doesn't offer it."""
         attempt = 0
+        loop = asyncio.get_running_loop()
         while self.alive and self._client is not None:
+            opened = loop.time()
             try:
                 async with self._client.stream(
                     "GET",
@@ -309,7 +321,6 @@ class McpHttpSession(RpcSession):
                     kind = resp.headers.get("content-type", "").split(";")[0].strip().lower()
                     if resp.status_code != 200 or kind != "text/event-stream":
                         return  # 405: no GET stream; anything else: not worth retrying
-                    attempt = 0
                     await self._read_events(resp, None)
             except asyncio.CancelledError:
                 raise
@@ -318,6 +329,10 @@ class McpHttpSession(RpcSession):
                 return
             except httpx.HTTPError:
                 pass
+            except Exception:
+                log.warning("mcp http listener failed", extra={"label": self.label})
+            if loop.time() - opened >= LISTEN_STABLE_S:
+                attempt = 0  # it lived a while: reopen quickly
             delay = LISTEN_BACKOFF_S[min(attempt, len(LISTEN_BACKOFF_S) - 1)]
             attempt += 1
             await asyncio.sleep(delay)
@@ -349,14 +364,15 @@ class McpHttpSession(RpcSession):
         client = self._client
         if client is None:
             return
-        if self._session_id is not None and self._killed is None:
+        # No DELETE after a kill, or for a session the server already dropped.
+        if self._session_id is not None and self._killed is None and reason != "session expired":
             with contextlib.suppress(httpx.HTTPError, TimeoutError):
-                headers = self._headers("application/json")
-                resp = await asyncio.wait_for(
-                    client.delete(self.url, headers=headers), CLOSE_TIMEOUT_S
-                )
-                await resp.aclose()
+                await asyncio.wait_for(self._delete(client), CLOSE_TIMEOUT_S)
         await client.aclose()
+
+    async def _delete(self, client: httpx.AsyncClient) -> None:
+        async with client.stream("DELETE", self.url, headers=self._headers("application/json")):
+            pass  # the body is never read
 
 
 async def discover_http(

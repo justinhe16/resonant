@@ -707,3 +707,46 @@ async def test_extension_eval_set_routes_linear_texts() -> None:
     key = [c for c in cases if c.text.startswith(("what's on my Linear", "make a Linear"))]
     results = await run_eval(key, Labeler(ScriptedModel(), intents))
     assert [r.predicted for r in results] == ["extension:linear", "extension:linear"]
+
+
+# --- review follow-ups ----------------------------------------------------------------------
+
+
+async def test_a_slow_tool_is_bounded_by_its_own_timeout(runtime: McpServerRuntime) -> None:
+    runtime.start_timeout_s = 0.5  # was also httpx's read timeout
+    assert (await runtime.call("sleep", {"seconds": 1.0}, 10))["text"] == "slept"
+
+
+async def test_notification_answers_are_never_read(runtime: McpServerRuntime, fake: Any) -> None:
+    fake.trickle_202 = True  # a 50 MB body, trickled: only the status matters
+    loop = asyncio.get_running_loop()
+    began = loop.time()
+    assert (await runtime.call("list_teams", {}, 10))["text"] == "[]"
+    assert loop.time() - began < 3
+
+
+async def test_sse_empty_data_lines_count_toward_the_cap() -> None:
+    import httpx
+
+    from resonant.extensions import mcp_http
+
+    session = McpHttpSession(
+        "https://x.example/mcp",
+        token=None,
+        label="t",
+        tracker=ProcessTracker(),
+        redact=lambda t: t,
+        message_cap=1024,
+    )
+    resp = httpx.Response(200, content=b"data:\n" * 5000)
+    with pytest.raises(mcp_http._TooLarge):  # pyright: ignore[reportPrivateUsage]
+        await session._read_events(resp, None)  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_a_ping_flood_is_bounded(runtime: McpServerRuntime) -> None:
+    session = await runtime.ensure()
+    for i in range(500):
+        session._dispatch(  # pyright: ignore[reportPrivateUsage]
+            json.dumps({"jsonrpc": "2.0", "id": f"p{i}", "method": "ping"}).encode()
+        )
+    assert len(session._side) <= 33  # pyright: ignore[reportPrivateUsage]

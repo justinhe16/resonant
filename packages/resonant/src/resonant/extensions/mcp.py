@@ -87,6 +87,7 @@ MAX_PAGES = 20
 SCHEMA_MAX_BYTES = 16 * 1024
 SCHEMA_MAX_DEPTH = 32
 ARGS_MAX_BYTES = 64 * 1024
+MAX_ANSWERS = 32  # server requests being answered at once
 
 # JSON Schema keywords kept in an input schema. Everything else (description, title, default,
 # examples, $comment, x-*) is dropped: free text the model would read as instructions.
@@ -531,7 +532,8 @@ class RpcSession:
         method = m.get("method")
         if isinstance(method, str):
             if "id" in m:  # a request from the server: ping only; we offer no capabilities
-                self._spawn(self._answer(m.get("id"), method))
+                if len(self._side) < MAX_ANSWERS:  # a flood of pings is dropped, not queued
+                    self._spawn(self._answer(m.get("id"), method))
             elif method == "notifications/tools/list_changed" and self.on_list_changed:
                 self.on_list_changed()
             return

@@ -380,11 +380,14 @@ class ProcessTracker:
         hooks = list(self._hooks)
         for e in entries:
             e.reason = e.reason or reason
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(self.terminate(e) for e in entries),
             *(h(reason) for h in hooks),
             return_exceptions=True,
         )
+        for r in results:
+            if isinstance(r, BaseException):  # one failure must not stop the others
+                log.error("ext.process.kill_all failed: %s", type(r).__name__)
         count = len(entries) + len(hooks)
         if count:
             log.warning("ext.process.kill_all", extra={"count": count, "reason": reason})
