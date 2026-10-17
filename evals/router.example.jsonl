@@ -93,3 +93,7 @@
 {"text": "set up github actions for my recipes repo", "intent": "run_project"}
 {"text": "any news on my pull requests?", "intent": "updates"}
 {"text": "spin up a worker to clean up old docker images on the mini", "intent": "run_project"}
+{"text": "what's R4 doing", "intent": "run_project"}
+{"text": "status on the trading run", "intent": "run_project"}
+{"text": "is the dori worker stuck?", "intent": "run_project"}
+{"text": "what is R7 up to right now", "intent": "run_project"}

@@ -41,6 +41,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 ap = argparse.ArgumentParser()
@@ -74,6 +75,7 @@ ap.add_argument("--check")
 ap.add_argument("--check-flag", action="append", default=[])
 ap.add_argument("--guard-probe")
 ap.add_argument("--wait-message", type=float, default=0.0)
+ap.add_argument("--bash", action="append", default=[])  # Bash tool calls shown, not run (TR-1)
 ap.add_argument("--self-op", action="append", default=[])  # resonant restart|update, in order
 args = ap.parse_args()
 
@@ -223,6 +225,13 @@ if scenario == "stubborn":
 
 emit({"type": "system", "subtype": "init", "session_id": session, "cwd": os.getcwd()})
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "working on it"}]}})
+for n, command in enumerate(args.bash):
+    tid = f"toolu_bash_{n}"
+    emit({"type": "assistant", "timestamp": datetime.now(UTC).isoformat(),
+          "message": {"content": [{"type": "tool_use", "id": tid, "name": "Bash",
+                                   "input": {"command": command}}]}})
+    emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                                  "content": "ok"}]}})
 
 
 

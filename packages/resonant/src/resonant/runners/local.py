@@ -119,6 +119,7 @@ from resonant.router.prefixes import (
     wrap_untrusted,
 )
 from resonant.router.render import (
+    render_activity,
     render_disk,
     render_logs,
     render_projects,
@@ -251,6 +252,7 @@ _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
     "projects": render_projects,
     "recent_logs": render_logs,
     "list_runs": render_runs,
+    "run_activity": render_activity,
     "list_trust_rules": render_rules,
     "system_status": render_mini,
     "task_counts": render_counts,

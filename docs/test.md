@@ -38,6 +38,8 @@ Update a row when you try it, with the date and anything odd.
 | 16d | GT-1 `/repo add <owner>/<public repo>` before the daemon token is set | `Added … Registered without the daemon's GitHub token, so push access and CI weren't checked; runs will find out.`; a private one says it needs `runner/github_token` | 📱 |
 | 16e | GT-1 `/merge R<n>` while its CI is still running | `R<n>: CI is still running; I'll merge PR #… when it's green.`, then the merge in the digest (or `R<n> not merged: …` texted) | 📱 after a run |
 | 16f | GT-1 a long note: `/note` with ~900 characters | `Saved note …` (up to 1000 characters) | 📱 |
+| 16g | TR-1 during a run: "what's R<n> doing", "status on the <repo> run", `/runs R<n>` | `R<n> <repo>: running $ … · N tool calls in 10m · last event Ns ago`, then `Recent:` commands and `Said: …`; `/runs R<n>` adds `Now: …` under the run line | 📱 during a run |
+| 16h | TR-1 detected side effects: a scratch run asked to `curl -X POST https://httpbin.org/post -d x=1` and a repo run asked to push a tag | The run's digest line ends `· did: POST httpbin.org (curl) (detected); pushed tag … (detected)`; no text for these (not high impact). A run that pushes to its base branch texts `R<n> detected: pushed to main` | 📱 after a run |
 
 ## Needs the Mini
 
