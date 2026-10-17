@@ -40,6 +40,7 @@ export interface RunItem {
   ended_at: Timestamp | null;
   waiting_reason: string | null;
   last_note: string | null;
+  remote_url?: string; // RC-1, local tier only: the running session's Remote Control link
 }
 
 export interface Runs {

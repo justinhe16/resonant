@@ -67,6 +67,7 @@ export function Workers({ snap, now }: { snap: Snapshot; now: number }) {
 
 function RunRow({ run, now }: { run: RunItem; now: number }) {
   const prUrl = safeHttpsUrl(run.pr_url);
+  const remoteUrl = safeHttpsUrl(run.remote_url);
   return (
     <Row>
       <div className="flex items-start justify-between gap-3">
@@ -98,6 +99,16 @@ function RunRow({ run, now }: { run: RunItem; now: number }) {
             className="font-medium text-info underline-offset-2 hover:underline"
           >
             PR #{run.pr_number ?? "?"}
+          </a>
+        )}
+        {remoteUrl && (
+          <a
+            href={remoteUrl}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="font-medium text-info underline-offset-2 hover:underline"
+          >
+            Remote Control
           </a>
         )}
       </Meta>

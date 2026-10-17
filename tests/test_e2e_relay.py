@@ -180,8 +180,10 @@ async def test_tell_r1_reaches_a_running_worker_as_a_message(
                          "the message")  # fmt: skip
         assert line == "→ R1 (message)"
         await text_like(w, lambda t: t.startswith("R1 done"), "done")
-        calls = json.loads((w.tmp() / "cli.json").read_text())
-        assert "Message from the owner: also update the README" in calls[-1]["out"]
+        # RC-1: written into the live session as a user message
+        assert (
+            "Message from the owner: also update the README" in (w.tmp() / "turns.json").read_text()
+        )
 
 
 async def test_a_timed_out_question_and_a_late_answer(

@@ -134,6 +134,7 @@ class RunItem(_Model):
     ended_at: datetime | None
     waiting_reason: WaitReason | None
     last_note: str | None
+    remote_url: str | None = _local()  # RC-1: the running session's Remote Control link
 
 
 class Runs(_Model):
@@ -461,6 +462,7 @@ def build_snapshot(
                     ended_at=r.ended_at,
                     waiting_reason=r.wait_reason if r.status == "waiting" else None,
                     last_note=r.last_note,
+                    remote_url=r.remote_url if r.status == "running" else None,
                 )
                 for r in run_rows
             ],

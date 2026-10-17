@@ -492,6 +492,19 @@
           ],
           "title": "Pr Url"
         },
+        "remote_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remote Url",
+          "x-tier": "local"
+        },
         "repo": {
           "title": "Repo",
           "type": "string"

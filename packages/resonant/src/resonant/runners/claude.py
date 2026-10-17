@@ -43,7 +43,18 @@ Worker CLI (EM-3, ``worker_cli``/``worker_desk``). A session reaches the daemon 
 ``resonant ask|note|check`` over its run's socket, open only while a session runs. A turn that
 ends with a question open parks the run (``Wait("human_reply")``; run ``waiting``, reason
 ``question``, slot freed, time not counted). The answer, an owner message or the ask timeout
-resumes the same session with ``--resume`` and the news as the prompt. API for the relay
+resumes the same session with ``--resume`` and the news as the prompt.
+
+Live sessions (RC-1, ``runners/live.py``). Every session runs with ``--input-format
+stream-json`` and ``-n R<n>``; the prompt is a user line and stdin stays open while the process
+lives. An owner message, or an answer whose CLI call already gave up, is written into the live
+session at once (``_push_live``). Each ``result`` is a turn's end (``_turn_ended``): what the
+run hasn't seen yet goes in as the next turn, else Resonant ends the session (Remote Control
+off, stdin closed, the reaper after ``end_grace_s`` of quiet). The park and ``--resume`` path
+above stays for news that comes once the process is gone. With ``runner.remote_control: on``
+each session first sends the ``remote_control`` control request: the session URL is stored on
+the run (``runs.remote_url``) and texted once per run; an error or no answer within
+``rc_timeout_s`` is texted once instead, and the run goes on. API for the relay
 (EM-5): :meth:`~ClaudeRunner.open_questions`, :meth:`~ClaudeRunner.answer_question`,
 :meth:`~ClaudeRunner.deliver_message`, :attr:`~ClaudeRunner.events`.
 
@@ -132,6 +143,13 @@ from resonant.runner.workspace import (
     write_session_credentials,
 )
 from resonant.runners import activity, reaper, worker_cli
+from resonant.runners.live import (
+    RC_OFF_TIMEOUT_S,
+    RC_TIMEOUT_S,
+    ControlReply,
+    LiveInput,
+    session_url,
+)
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.runners.reports import (
     Report,
@@ -186,7 +204,7 @@ from resonant.store import repos as repo_store
 from resonant.store import runs
 from resonant.store import tasks as task_store
 from resonant.store.audit import audit
-from resonant.store.db import atomic, transaction, utcnow
+from resonant.store.db import atomic, iso, kv_set, transaction, utcnow
 from resonant.store.runs import Run
 from resonant.trust import merge_decision
 from resonant_sdk import Event
@@ -214,6 +232,8 @@ SUMMARY_MAX = 600
 REASON_MAX = 240
 MAX_TURNS = 200
 CANCEL_GRACE_S = 2.0  # /kill and /cancel: SIGTERM, then SIGKILL after this
+END_GRACE_S = 15.0  # stdin closed after the last result: this long quiet, then the kill (RC-1)
+REMOTE_KV = "runner.remote_control"  # the latest Remote Control answer: {state, at, run, detail}
 STEP_SLACK_S = 600.0  # prepare, the PR lookup and publish on top of the session limit
 SAVE_EVERY_S = 30.0
 KILL_REASON = "stopped by /kill"
@@ -639,8 +659,9 @@ class StreamState:
     """What the runner keeps from the stream-json messages."""
 
     session_id: str | None = None
-    result: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None  # the last one: a live session may have several
     lines: int = 0
+    ended: bool = False  # Resonant ended the session after a result (RC-1)
 
     def feed(self, raw: bytes) -> dict[str, Any] | None:
         """Keep what the runner needs from one line; the parsed message, or None."""
@@ -760,6 +781,9 @@ class ClaudeRunner:
         self_ops: SelfOps | None = None,
         owner: str | None = None,
         self_repo: Path | None = None,
+        rc_timeout_s: float = RC_TIMEOUT_S,
+        rc_off_timeout_s: float = RC_OFF_TIMEOUT_S,
+        end_grace_s: float = END_GRACE_S,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -782,7 +806,11 @@ class ClaudeRunner:
         (by default ``claude auth status``, cached). ``self_ops`` (``tools.ops.Ops``) is what a
         worker's ``resonant restart|update`` runs, ``owner`` the principal whose ask can
         include that, and ``self_repo`` the daemon's own checkout (``ops.repo_path``),
-        registered at start as the repo ``resonant`` with that ``path``."""
+        registered at start as the repo ``resonant`` with that ``path``.
+
+        RC-1: ``rc_timeout_s`` is how long a session's Remote Control request waits for its
+        answer and ``rc_off_timeout_s`` turning it off at the end; ``end_grace_s`` is how long
+        a session whose stdin Resonant closed may stay quiet before it is killed."""
         self.conn = conn
         self.cfg = runner
         self.channel = channel
@@ -818,6 +846,9 @@ class ClaudeRunner:
         self.disk_limit_bytes = disk_limit_bytes or runner.max_run_dir_mb * 1024 * 1024
         self.cache_limit_bytes = cache_limit_bytes or runner.max_cache_gb * 1024**3
         self.cancel_grace_s = min(kill_grace_s, CANCEL_GRACE_S)
+        self.rc_timeout_s = rc_timeout_s
+        self.rc_off_timeout_s = rc_off_timeout_s
+        self.end_grace_s = end_grace_s
         self.defer_s = defer_s
         self._blocked = False  # start() began and hasn't finished: nothing may run
         self.clock = clock
@@ -827,6 +858,7 @@ class ClaudeRunner:
         self.last_killed = 0  # runs the last kill switch engage ended
         self._working: set[str] = set()  # codes with a step in flight
         self._live: dict[str, Target] = {}  # codes with a session process
+        self._inputs: dict[str, LiveInput] = {}  # ... and its stdin, once the prompt is in (RC-1)
         self._cleanup_locks: dict[str, asyncio.Lock] = {}
         self._background: set[asyncio.Task[Any]] = set()
         self._unhook: Callable[[], None] | None = None
@@ -1332,6 +1364,8 @@ class ClaudeRunner:
             "quiet_s": round(act.quiet_s) if act is not None and act.quiet_s is not None else None,
             "did": did,
             "last_note": activity.clip(run.last_note, 120) if run.last_note else None,
+            # RC-1: the live session in the Claude app, while it runs
+            "remote_url": run.remote_url if run.status == "running" else None,
         }
 
     async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused:
@@ -1521,8 +1555,11 @@ class ClaudeRunner:
             return Refused(str(e))
 
     def _wake(self, run: Run, key: str) -> None:
-        """Something arrived for the run: an event for its task, which requeues it if it is
-        waiting (and, if a step is in flight, once that step returns ``Wait``)."""
+        """Something arrived for the run: written into its live session if it has one (RC-1),
+        and an event for its task, which requeues it if it is waiting (and, if a step is in
+        flight, once that step returns ``Wait``)."""
+        if run.code in self._inputs:
+            self._spawn(self._push_live(run.code))
         if run.task_id is None:
             return
         if run.status == "waiting" and run.wait_reason != "question":
@@ -1929,6 +1966,12 @@ class ClaudeRunner:
             "-p",
             "--resume" if run.sessions else "--session-id",
             run.session_id,
+            "-n",
+            run.code,
+            # RC-1: the prompt is a user line and stdin stays open, so Resonant can write more
+            # into the live session and decide when it ends (runners/live.py)
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--verbose",
@@ -2034,7 +2077,7 @@ class ClaudeRunner:
         if self.guard == "thin":
             argv = list(self._wrap(argv, params))
         env = self._env(params, run.session_id, w.secrets, p, local=w.local is not None)
-        prompt = self._turn_prompt(run, local=w.local is not None).encode()
+        prompt = self._turn_prompt(run, local=w.local is not None)
         server = await self._open_ctl(run, w)
         try:
             return await self._spawn_session(w, run, p, argv, env, prompt, server)
@@ -2100,7 +2143,7 @@ class ClaudeRunner:
         p: Prepared,
         argv: list[str],
         env: dict[str, str],
-        prompt: bytes,
+        prompt: str,
         server: WorkerServer | None,
     ) -> StepOutcome | None:
         writer = TranscriptWriter(self.transcript_dir / f"{run.code}.jsonl", w.redactor)
@@ -2162,7 +2205,7 @@ class ClaudeRunner:
             )
         if result is not None and (hit := usage_limit(result)) is not None:
             return self._wait_for_limit(w, run, hit)
-        return await self._after_exit(w, run, proc.returncode, result)
+        return await self._after_exit(w, run, proc.returncode, result, ended=state.ended)
 
     async def _supervise(
         self,
@@ -2173,31 +2216,54 @@ class ClaudeRunner:
         target: Target,
         writer: TranscriptWriter,
         state: StreamState,
-        prompt: bytes,
+        prompt: str,
         server: WorkerServer | None = None,
     ) -> str | None:
         """Feed the prompt, pump the output into the transcript and watch the clock, the run
-        row, the kill switch and the disk. Always ends with the whole process tree gone."""
+        row, the kill switch and the disk. Stdin stays open (RC-1): owner messages and late
+        answers are written into the live session (``_push_live``), and each ``result`` is
+        a turn's end where Resonant sends what the run hasn't seen yet or ends the session
+        (``_turn_ended``). Always ends with the whole process tree gone."""
         assert proc.stdin and proc.stdout and proc.stderr
         stop: str | None = None
+        live = LiveInput(proc.stdin)
+        closed = asyncio.Event()  # Resonant closed stdin after a result: the session is ending
+        turns: set[asyncio.Task[None]] = set()
+        last_line = time.monotonic()
+        remote: asyncio.Task[None] | None = None
 
         async def feed() -> None:
-            assert proc.stdin
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                proc.stdin.write(prompt)
-                await proc.stdin.drain()
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                proc.stdin.close()
+            nonlocal remote
+            ask = None
+            async with live.lock:
+                if self.cfg.remote_control == "on":  # first, as the CLI expects it
+                    live.remote = True
+                    ask = await live.control({"subtype": "remote_control", "enabled": True})
+                if not await live.write_user(prompt):
+                    return
+            self._inputs[run.code] = live
+            if ask is not None:
+                remote = asyncio.create_task(self._remote_answer(run, live, ask))
+            await self._push_live(run.code)  # anything that arrived since the prompt was built
 
         async def pump_out() -> None:
+            nonlocal last_line
             assert proc.stdout
             counted = False
             seen = self._side_effect_context(run, p)
             async for raw, truncated in read_lines(proc.stdout):
+                last_line = time.monotonic()
                 writer.write(raw, truncated)
                 msg = state.feed(raw) if not truncated else None
-                if msg is not None and msg.get("type") == "assistant":
+                kind = msg.get("type") if msg is not None else None
+                if kind == "assistant" and msg is not None:
                     self._detect(run, msg, seen)
+                elif kind == "control_response" and msg is not None:
+                    live.feed(msg)
+                elif kind == "result" and msg is not None:
+                    turn = asyncio.create_task(self._turn_ended(run, live, state, msg, closed))
+                    turns.add(turn)
+                    turn.add_done_callback(turns.discard)
                 if state.session_id and not counted:
                     # Only a session Claude has written can be resumed.
                     counted = True
@@ -2216,6 +2282,7 @@ class ClaudeRunner:
             nonlocal stop
             stop = stop or "cache"
 
+        runs.update(self.conn, run.code, remote_url=None)  # an earlier session's URL is gone
         pumps = [asyncio.create_task(c) for c in (feed(), pump_out(), pump_err())]
         disk = asyncio.create_task(
             watch_disk(
@@ -2241,6 +2308,7 @@ class ClaudeRunner:
         bucket = _bucket(run.session_seconds)
         refresh_due = began + self.refresh_s
         refreshing: asyncio.Task[bool] | None = None
+        closed_at: float | None = None
         try:
             while True:
                 done, _ = await asyncio.wait({exited}, timeout=self.poll_s)
@@ -2268,6 +2336,13 @@ class ClaudeRunner:
                         stop = "timeout"
                 if stop is not None:
                     break
+                if closed.is_set():
+                    # Stdin is closed: the CLI exits once its turn is over. One that stays
+                    # quiet that long without exiting is ended by the reaper below.
+                    closed_at = closed_at or time.monotonic()
+                    if time.monotonic() - max(closed_at, last_line) >= self.end_grace_s:
+                        log.warning("session didn't exit after its end", extra={"run": run.code})
+                        break
                 if time.monotonic() - last_save >= SAVE_EVERY_S:
                     last_save = time.monotonic()
                     runs.update(self.conn, run.code, session_seconds=used)
@@ -2277,6 +2352,7 @@ class ClaudeRunner:
         finally:
             # Also on cancellation: nothing of the session may outlive the step. The socket
             # goes first, so no CLI call still in flight texts anyone after a stop.
+            self._inputs.pop(run.code, None)
             if server is not None:
                 await server.close()
             disk.cancel()
@@ -2286,6 +2362,16 @@ class ClaudeRunner:
                 refreshing.cancel()
                 await asyncio.wait([refreshing])
             hurry = stop == "cancelled" or sys.exc_info()[0] is not None
+            # Resonant ends the session (RC-1): Remote Control off (best effort), stdin
+            # closed; then the reaper's SIGTERM and SIGKILL for whatever still runs.
+            if proc.returncode is None and not live.closed:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        live.end(rc_timeout=self.rc_off_timeout_s), self.rc_off_timeout_s + 1
+                    )
+            live.close()
+            for t in [*turns, *([remote] if remote is not None else [])]:
+                t.cancel()
             await reaper.reap(target, grace_s=self.cancel_grace_s if hurry else self.kill_grace_s)
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), 5)
@@ -2294,6 +2380,11 @@ class ClaudeRunner:
             for t in pending:
                 t.cancel()
             await asyncio.wait([*done_pumps, *pending, disk, work_disk, cache, exited])
+            late = [*turns, *([remote] if remote is not None else [])]  # feed may have made one
+            for t in late:
+                t.cancel()
+            if late:
+                await asyncio.wait(late)
             self._live.pop(run.code, None)
             writer.note("exit", code=proc.returncode, stop=stop)
             writer.close()
@@ -2305,12 +2396,121 @@ class ClaudeRunner:
                 runs.clear_process(self.conn, run.code)
         return stop
 
+    async def _turn_ended(
+        self,
+        run: Run,
+        live: LiveInput,
+        state: StreamState,
+        result: dict[str, Any],
+        closed: asyncio.Event,
+    ) -> None:
+        """A ``result``: the session is idle (RC-1). What the run hasn't seen yet (answers,
+        timeouts, owner messages) is its next turn, in the same process. Otherwise, or after
+        an error result, Resonant ends the session and the step goes on as for a process that
+        exited: a question still open parks the run, else the PR lookup. A turn Resonant
+        didn't start (the owner typing over Remote Control) ends the same way. Never raises."""
+        try:
+            async with live.lock:
+                if not live.open:
+                    return
+                if result.get("is_error") is not True:
+                    self.desk.time_out_due(run.code)
+                    found = self.desk.live_delivery(run.code, turn_end=True)
+                    if found is not None:
+                        text, sent = found
+                        if await live.write_user(f"{text}\n\nCarry on with the task."):
+                            self._told_live(run.code, text, sent)
+                            return
+                live.open = False
+                state.ended = True
+            await live.end(rc_timeout=self.rc_off_timeout_s)
+        except Exception:
+            log.exception("turn end failed", extra={"run": run.code})
+            live.close()
+        closed.set()
+
+    async def _push_live(self, code: str) -> None:
+        """An answer or owner message arrived while the run's session process is alive: it is
+        written in now (RC-1). Once the session is ending it stays in the store for the next
+        turn (``_after_exit`` resumes the session for it). Never raises."""
+        live = self._inputs.get(code)
+        if live is None:
+            return
+        try:
+            async with live.lock:
+                if not live.open:
+                    return
+                found = self.desk.live_delivery(code, turn_end=False)
+                if found is not None and await live.write_user(found[0]):
+                    self._told_live(code, *found)
+        except Exception:
+            log.exception("live input failed", extra={"run": code})
+
+    def _told_live(self, code: str, text: str, sent: Callable[[], None]) -> None:
+        """What was written into the live session is delivered, and saved with the turn's
+        prompt (``resume_prompt``), so a crash before the session ends resends it."""
+        with atomic(self.conn):
+            sent()
+            run = runs.get(self.conn, code)
+            saved = run.resume_prompt if run is not None else None
+            runs.update(self.conn, code, resume_prompt=f"{saved}\n\n{text}" if saved else text)
+            audit(self.conn, "run.live_input", run=code)
+
+    async def _remote_answer(
+        self, run: Run, live: LiveInput, ask: asyncio.Future[ControlReply]
+    ) -> None:
+        """The answer to the session's Remote Control request (RC-1). A URL is stored on the
+        run (a resume's replaces the last); an error, or no answer within ``rc_timeout_s``,
+        leaves the run going without it. Either is audited and kept in kv ``REMOTE_KV`` (the
+        ``--check`` row), and the requester hears it once per run."""
+        reply = await live.reply(ask, self.rc_timeout_s)
+        url = session_url(reply) if reply is not None and reply.ok else None
+        if reply is None:
+            why = f"no answer in {self.rc_timeout_s:g}s"
+        elif not reply.ok:
+            why = reply.error or "an error with no reason"
+        else:
+            why = None if url is not None else "no session URL in the answer"
+        if why is not None:
+            why = self._run_redactors.get(run.code, Redactor()).text(why)
+            live.remote = False  # nothing to turn off at the end
+        try:
+            with atomic(self.conn):
+                if url is not None:
+                    runs.update(self.conn, run.code, remote_url=url)
+                audit(self.conn, "run.remote_control", run=run.code, ok=url is not None,
+                      reason=why)  # fmt: skip
+                kv_set(self.conn, REMOTE_KV, {"state": "ok" if why is None else "unavailable",
+                       "at": iso(self.clock()), "run": run.code, "detail": why or ""})  # fmt: skip
+        except Exception:
+            log.exception("remote control not recorded", extra={"run": run.code})
+        if why is not None:
+            log.warning("remote control unavailable", extra={"run": run.code, "reason": why})
+        text = (
+            f"{run.code} Remote Control: {url}"
+            if url is not None
+            else f"{run.code}: Remote Control unavailable: {why}."
+        )
+        try:  # once per run, whichever comes first (a resume's new URL is in /runs)
+            await self.channel.send(run.principal, text, dedupe_key=f"run:{run.code}:remote")
+        except ChannelError as e:
+            log.warning("remote control not texted", extra={"run": run.code, "reason": str(e)})
+
     async def _after_exit(
-        self, w: _Work, run: Run, returncode: int | None, result: dict[str, Any] | None
+        self,
+        w: _Work,
+        run: Run,
+        returncode: int | None,
+        result: dict[str, Any] | None,
+        *,
+        ended: bool = False,
     ) -> StepOutcome | None:
-        """Classify a session that ended by itself."""
+        """Classify a session that ended by itself, or that Resonant ended after its last
+        ``result`` (``ended``, RC-1: then the exit status doesn't count, the CLI may have
+        needed the kill to go)."""
         keep = f"(work kept: /runs {run.code})"
-        failed = result is None or result.get("is_error") is True or returncode != 0
+        bad_exit = returncode != 0 and not ended
+        failed = result is None or result.get("is_error") is True or bad_exit
         on_login = not (w.secrets.claude_token or w.secrets.anthropic_key)
         if failed and on_login and isinstance(self._login_check, LoginCheck):
             self._login_check.forget()  # it ran on the owner's login, which may have expired
@@ -2324,7 +2524,7 @@ class ClaudeRunner:
         if subtype == "error_max_budget_usd":
             budget = f"${run.max_budget_usd:g}" if run.max_budget_usd else "dollar"
             return await self._fail(run, f"Claude hit the {budget} budget {keep}", w.redactor)
-        if result.get("is_error") is True or returncode != 0:
+        if result.get("is_error") is True or bad_exit:
             return await self._fail(run, f"Claude failed (exit {returncode}) {keep}", w.redactor)
         text = result.get("result")
         summary = _summary(text, w.redactor) if isinstance(text, str) else None

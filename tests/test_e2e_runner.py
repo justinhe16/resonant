@@ -204,6 +204,7 @@ def make_world(
     runner_opts: dict[str, Any] | None = None,
     workspace_opts: dict[str, Any] | None = None,
     guard: str = "off",
+    remote_control: str = "off",  # RC-1: on only where a test looks at it
 ) -> World:
     root = tmp_path.resolve() / "rr"
     root.mkdir(exist_ok=True)
@@ -235,6 +236,7 @@ def make_world(
             "secrets_dir": root / "state" / "secrets",
             "git_path": GIT,
             "gh_path": gh,
+            "remote_control": remote_control,
         },
     )
     keychain = FakeKeychain()

@@ -434,6 +434,7 @@ def build(
         secrets_dir=root / "state" / "secrets",
         git_path=Path(GIT),
         gh_path=gh,
+        remote_control="off",  # on in test_runner_live.py, so other tests' texts stay as they are
     )
     paths = {f"github.com/own/{n}": p for n, p in remotes.items()}
     repo_store.import_config(conn, cfg.repos)

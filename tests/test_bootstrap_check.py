@@ -184,7 +184,7 @@ def test_dry_run_off_fails_without_a_phase2_store(resonant_home: Path) -> None:
     )
     rows = _helper(resonant_home)
     assert rows["dry_run"] == ("FAIL", True, "dry_run off on a pre-Phase-2 install")
-    assert rows["store schema 13"][:2] == ("FAIL", True)
+    assert rows["store schema 14"][:2] == ("FAIL", True)
 
 
 def test_dry_run_off_fails_on_a_pre_phase2_store(resonant_home: Path) -> None:
@@ -195,8 +195,8 @@ def test_dry_run_off_fails_on_a_pre_phase2_store(resonant_home: Path) -> None:
         LIVE_CONFIG.replace("dry_run: true", "dry_run: false")
     )
     rows = _helper(resonant_home)
-    assert rows["store schema 13"][:2] == ("FAIL", True)
-    assert "v2 < v13" in rows["store schema 13"][2]
+    assert rows["store schema 14"][:2] == ("FAIL", True)
+    assert "v2 < v14" in rows["store schema 14"][2]
     assert rows["dry_run"][:2] == ("FAIL", True)
 
 
@@ -205,7 +205,7 @@ def test_dry_run_off_passes_on_phase2_and_needs_uv(resonant_home: Path, tmp_path
     config = LIVE_CONFIG.replace("dry_run: true", "dry_run: false")
     (resonant_home / "config.yaml").write_text(config)
     rows = _helper(resonant_home)
-    assert rows["store schema 13"][:2] == ("PASS", True)
+    assert rows["store schema 14"][:2] == ("PASS", True)
     assert rows["dry_run"] == ("PASS", True, "false (Phase 2 gate installed)")
     assert rows["ops.uv_path set"][:2] == ("FAIL", True)  # required once ops run for real
 
@@ -558,7 +558,7 @@ def test_runner_rows_report_names_only(resonant_home: Path) -> None:
     def no_mirror(_settings: object, _name: str) -> bool | None:
         return None
 
-    rows = {r[2]: r for r in check.runner_rows(settings, 11, exists, ci_of)}
+    rows = {r[2]: r for r in check.runner_rows(settings, 14, exists, ci_of)}
     assert rows["runs table"][:2] == ("PASS", False)
     assert rows["runner repos"][3] == "2: demo, old"
     assert rows["runner secret runner/github_token"][0] == "PASS"
@@ -581,7 +581,7 @@ def test_runner_rows_report_names_only(resonant_home: Path) -> None:
     # old schema, no repos, no mirror yet
     old = check.runner_rows(load_settings(), 5, exists)
     assert old[:2] == [
-        ("FAIL", False, "runs table", "schema v5, need 11"),
+        ("FAIL", False, "runs table", "schema v5, need 14"),
         (
             "SKIP",
             False,
@@ -590,7 +590,7 @@ def test_runner_rows_report_names_only(resonant_home: Path) -> None:
         ),
     ]
     assert old[2][:3] == ("FAIL", False, "runner github app")  # no runner.github_app
-    none = check.runner_rows(settings, 11, exists, no_mirror)
+    none = check.runner_rows(settings, 14, exists, no_mirror)
     assert [r[0] for r in none if r[2].endswith("has CI")] == ["SKIP", "SKIP"]
 
 
@@ -773,7 +773,7 @@ def test_runner_rows_by_guard_mode(resonant_home: Path, tmp_path: Path) -> None:
     assert off.runner.guard == "off"
     sandbox = check.sandbox_row(off)
     assert sandbox[:3] == ("SKIP", False, "runner sandbox") and "guard is off" in sandbox[3]
-    rows = {r[2]: r for r in check.runner_rows(off, 11, nothing, login=logged_in)}
+    rows = {r[2]: r for r in check.runner_rows(off, 14, nothing, login=logged_in)}
     claude = rows["runner secret runner/claude_token (or runner/anthropic_key)"]
     assert claude[0] == "PASS" and "your own claude login works" in claude[3]
     assert rows["runner guard"][0] == "PASS" and rows["runner guard"][3].startswith("off:")
@@ -785,14 +785,37 @@ def test_runner_rows_by_guard_mode(resonant_home: Path, tmp_path: Path) -> None:
     def logged_out(settings: object) -> bool:
         return False
 
-    rows = {r[2]: r for r in check.runner_rows(off, 11, nothing, login=logged_out)}
+    rows = {r[2]: r for r in check.runner_rows(off, 14, nothing, login=logged_out)}
     claude = rows["runner secret runner/claude_token (or runner/anthropic_key)"]
     assert claude[0] == "FAIL" and "log in with `claude`" in claude[3]
 
     asked.clear()
     thin = load_settings(runner={"guard": "thin"}, ops={"repo_path": None})
-    rows = {r[2]: r for r in check.runner_rows(thin, 11, nothing, login=logged_in)}
+    rows = {r[2]: r for r in check.runner_rows(thin, 14, nothing, login=logged_in)}
     claude = rows["runner secret runner/claude_token (or runner/anthropic_key)"]
     assert claude[0] == "FAIL" and "log in" not in claude[3] and asked == []
     assert rows["runner guard"][3].startswith("thin:")
     assert rows["runner repo resonant"][0] == "SKIP"
+
+
+def test_runner_remote_control_row(resonant_home: Path) -> None:
+    """RC-1: the setting, and the last session's answer the runner kept in kv."""
+    check = _load_helper()
+    on = load_settings()
+    assert on.runner.remote_control == "on"  # the default
+    row = check.remote_control_row(on)
+    assert row[:3] == ("PASS", False, "runner remote control") and row[3].startswith("on:")
+    ok = check.remote_control_row(on, {"state": "ok", "run": "R4", "at": "t", "detail": ""})
+    assert ok[0] == "PASS" and "last answer ok (R4" in ok[3]
+    bad = {"state": "unavailable", "run": "R5", "at": "t", "detail": "no answer in 15s"}
+    row = check.remote_control_row(on, bad)
+    assert row[0] == "FAIL" and "R5: no answer in 15s" in row[3]
+    off = load_settings(runner={"remote_control": False})  # YAML's bare `off`
+    assert off.runner.remote_control == "off"
+    assert check.remote_control_row(off, bad)[0] == "SKIP"
+
+    def nothing(_ref: str) -> bool:
+        return False
+
+    rows = {r[2]: r for r in check.runner_rows(off, 14, nothing)}
+    assert rows["runner remote control"][0] == "SKIP"

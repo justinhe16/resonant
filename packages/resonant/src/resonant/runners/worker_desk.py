@@ -31,8 +31,9 @@ checks and owner messages for running Claude workers.
   Resonant abc1234 -> def5678``) and to ``on_self_op`` (the runner reports it, by default
   texted now), before the reply; an update with nothing new is not reported.
 
-Owner messages (``deliver_message``) are appended to the session's next CLI reply as
-``Message from the owner: …``, or open its next turn.
+Owner messages (``deliver_message``) are written into the live session as a user message
+(RC-1, ``live_delivery``; also an answer whose CLI call already gave up), else appended to the
+session's next CLI reply as ``Message from the owner: …``, or open its next turn.
 
 Everything a delivery rests on is in the store (``store.questions``), with conditional
 updates, so an answer is delivered whichever path (a blocked CLI call, a resume
@@ -705,6 +706,26 @@ class WorkerDesk:
         if not parts:
             return None
         return "\n\n".join(parts)
+
+    def live_delivery(self, code: str, *, turn_end: bool) -> tuple[str, Callable[[], None]] | None:
+        """What to write into the run's live session now (RC-1), and the callback that marks
+        it delivered once written; None when there is nothing. Mid-turn (``turn_end`` False)
+        only answers whose CLI call already gave up (``deferred``) go, since a call still
+        waiting gets its answer in its reply; at a turn's end everything undelivered goes."""
+        answers = [q for q in qs.undelivered(self.conn, code) if turn_end or q.deferred]
+        messages = qs.pending_messages(self.conn, code)
+        parts = [_delivery_line(q) for q in answers]
+        parts += [f"Message from the owner: {m.text}" for m in messages]
+        if not parts:
+            return None
+
+        def sent() -> None:
+            now = self.clock()
+            for q in answers:
+                qs.mark_delivered(self.conn, q.id, at=now)
+            qs.mark_messages_delivered(self.conn, [m.id for m in messages], at=now)
+
+        return "\n\n".join(parts), sent
 
     def has_deliveries(self, code: str) -> bool:
         return bool(qs.undelivered(self.conn, code) or qs.pending_messages(self.conn, code))
