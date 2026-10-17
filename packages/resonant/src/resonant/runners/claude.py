@@ -188,6 +188,7 @@ log = logging.getLogger(__name__)
 
 RUNNER_NAME = "claude"
 SELF_REPO_NAME = "resonant"  # the daemon's own checkout, registered at start (GD-1)
+NO_GH_DIR = "gh-none"  # an empty gh config dir for runs with no GitHub token
 TASK_KIND = "run"
 MAX_ATTEMPTS = 2  # a session, and one resume after a daemon crash
 MAX_WAIT_S = 24 * 3600.0  # usage-limit waiting, in total
@@ -264,8 +265,11 @@ WORKER_PROMPT = (
     '[--irreversible] [--cost <usd>] "<what>"`: before anything that could be net new: a '
     "deploy, a write to production data, an outgoing email or message, spending money, deleting "
     "data, a force-push, or a system you haven't used in this task. Go ahead only on ok; on "
-    "denied, don't. Replies can end with messages from the owner: follow them. "
-    "`resonant restart` restarts Resonant itself and `resonant update` deploys it (pulls its "
+    "denied, don't. Replies can end with messages from the owner: follow them."
+)
+# GD-1, when the daemon can restart itself for a worker (``self_ops``).
+RESTART_PROMPT = (
+    " `resonant restart` restarts Resonant itself and `resonant update` deploys it (pulls its "
     "main, syncs, restarts); your session is stopped by the restart and resumed after it. Never "
     "restart or stop Resonant any other way (launchctl, kill, `resonant daemon`): your session "
     "runs under it."
@@ -848,12 +852,17 @@ class ClaudeRunner:
 
     async def _self_repo_seed(self) -> dict[str, RunnerRepo]:
         """``runner.repos`` plus the daemon's own checkout (``self_repo``), so "fix X in
-        resonant" works in a worktree of it: an entry for its origin gets ``path`` when it has
-        none, and with no entry it is added as ``resonant``. Unchanged when the checkout isn't
-        a github.com git checkout, or the name is taken by another entry."""
+        resonant" works in a worktree of it (guard off only: ``thin`` write-protects that
+        checkout). The registry is left as the owner shaped it: a repo already registered
+        for its origin (by config, chat or first use) keeps its name, source and settings and
+        only gets the ``path`` when it has none (no rename, no re-adding a removed one is
+        possible either: only a slug the registry doesn't know is seeded, as ``resonant``,
+        and only when that name is free)."""
         seeds = dict(self.cfg.repos)
         path = self.self_repo
-        if path is None or not await asyncio.to_thread(os.path.isdir, path / ".git"):
+        if self.guard != "off" or path is None:
+            return seeds
+        if not await asyncio.to_thread(os.path.isdir, path / ".git"):
             return seeds
         slug = await self.workspace.origin_slug(path)
         if slug is None:
@@ -863,7 +872,13 @@ class ClaudeRunner:
                 if entry.path is None:
                     seeds[name] = entry.model_copy(update={"path": path})
                 return seeds
-        if SELF_REPO_NAME not in seeds:
+        known = repo_store.find(self.conn, slug)  # slugs compare case-insensitively
+        if known is not None:
+            if known.path is None:
+                with atomic(self.conn):
+                    repo_store.set_path(self.conn, known.slug, path)
+            return seeds
+        if SELF_REPO_NAME not in seeds and repo_store.find(self.conn, SELF_REPO_NAME) is None:
             seeds[SELF_REPO_NAME] = RunnerRepo(remote=f"github.com/{slug}", path=path)
         return seeds
 
@@ -1554,6 +1569,7 @@ class ClaudeRunner:
     def _prepare_session_dirs(self, params: SandboxParams) -> None:
         """Daemon-side, before the first session: the run-local ``bin/`` and the caches."""
         prepare_dirs(params)
+        (params.run_dir / NO_GH_DIR).mkdir(mode=0o700, exist_ok=True)
         tools: dict[str, os.PathLike[str] | str] = {}
         for name in TOOL_NAMES:
             if name == "claude" and self._claude_cmd is not None:
@@ -1638,10 +1654,11 @@ class ClaudeRunner:
             env = owner_env(params, home=self.home, path_dirs=params.path_dirs,
                             claude_token=token, anthropic_key=key)  # fmt: skip
         env[MARKER_ENV] = marker  # the run's session id: unique, never reused
-        if p.scratch:
-            env.update(session_git_env(None))
-        elif local:
-            env.update(session_git_env(None, p.exclude_file))
+        if p.scratch or local:
+            # No GitHub credentials: with the real HOME, gh would otherwise find the owner's
+            # own login (~/.config/gh). An empty config dir keeps RX-1's "can't push yet".
+            env["GH_CONFIG_DIR"] = str(params.run_dir / NO_GH_DIR)
+            env.update(session_git_env(None, None if p.scratch else p.exclude_file))
         else:
             creds = params.run_dir / CREDS_DIR
             env["GH_CONFIG_DIR"] = str(creds / "gh")
@@ -1689,7 +1706,9 @@ class ClaudeRunner:
             ]
         argv += [
             "--append-system-prompt",
-            self._prompt(run, p, local=local) + WORKER_PROMPT,
+            self._prompt(run, p, local=local)
+            + WORKER_PROMPT
+            + (RESTART_PROMPT if self.desk.self_ops is not None else ""),
             "--max-turns",
             str(self.max_turns),
         ]
@@ -1706,7 +1725,8 @@ class ClaudeRunner:
         repo = self._repo_of(run)
         own = ""
         if (
-            self.self_repo is not None
+            self.guard == "off"
+            and self.self_repo is not None
             and p.checkout is not None
             and _same(p.checkout, self.self_repo)
         ):
@@ -2045,6 +2065,10 @@ class ClaudeRunner:
     ) -> StepOutcome | None:
         """Classify a session that ended by itself."""
         keep = f"(work kept: /runs {run.code})"
+        failed = result is None or result.get("is_error") is True or returncode != 0
+        on_login = not (w.secrets.claude_token or w.secrets.anthropic_key)
+        if failed and on_login and isinstance(self._login_check, LoginCheck):
+            self._login_check.forget()  # it ran on the owner's login, which may have expired
         if result is None:
             return await self._fail(
                 run, f"Claude ended without a result (exit {returncode}) {keep}", w.redactor

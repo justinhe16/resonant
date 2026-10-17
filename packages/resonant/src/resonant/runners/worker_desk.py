@@ -110,10 +110,16 @@ RESTARTING = (
     "afterwards (same session, with a note that it restarted). Don't start anything else now: "
     "run `sleep 120` and let the restart stop you."
 )
-_DEPLOY_WORDS = re.compile(r"\b(?:re-?start|re-?deploy|deploy|re-?launch|re-?boot|bounce)", re.I)
-_UPDATE_WORDS = re.compile(
-    r"\bupdate\s+(?:resonant|the\s+daemon|itself|yourself)\b|(?<!\w)/update\b", re.I
+# The ask must aim the verb at Resonant ("restart resonant", "then redeploy it", "/restart"):
+# "write a deploy script" or "fix the restart bug" leave it to the check.
+_TARGET = r"\s+(?:it|resonant|the\s+daemon|itself|yourself)\b"
+_DEPLOY_WORDS = re.compile(
+    r"\b(?:re-?start|re-?deploy|deploy|re-?launch|re-?boot|bounce)"
+    + _TARGET
+    + r"|(?<!\w)/restart\b",
+    re.I,
 )
+_UPDATE_WORDS = re.compile(r"\bupdate" + _TARGET + r"|(?<!\w)/update\b", re.I)
 
 EventKind = Literal["question", "note", "check"]
 NO_TRUST = "denied: checks aren't set up here, so don't do it."
@@ -263,6 +269,7 @@ class WorkerDesk:
         self.self_ops = self_ops
         self.owner = owner
         self._on_restart = on_restart
+        self._self_op_busy: set[str] = set()  # runs with a restart or update in flight
         self.events = WorkerEvents()
         self._waiters: dict[int, asyncio.Event] = {}  # question id -> set when it leaves open
         # (run, system, action, irreversible, cost, what) -> (question id, the decision task)
@@ -295,17 +302,19 @@ class WorkerDesk:
         # (a loop) goes through the check like anything else.
         done = self.conn.execute(
             "SELECT COUNT(*) FROM audit_log WHERE action = 'run.self_op'"
-            " AND json_extract(detail, '$.run') = ?",
+            " AND json_extract(detail, '$.run') = ? AND json_extract(detail, '$.ok')",
             (run.code,),
         ).fetchone()[0]
+        if run.code in self._self_op_busy:
+            return Reply("Not done: a restart or update for this run is already going.",
+                         EXIT_DENIED)  # fmt: skip
         if not (self.owner is not None and run.principal == self.owner and done == 0
                 and asked_for(run.ask, req.op)):  # fmt: skip
             what = f"{req.op} Resonant (the daemon itself)"
             checked = await self._check(run, Check(SELF_SYSTEM, req.op, what), gone)
             if checked is None or checked.exit != EXIT_OK:
                 return checked
-        with atomic(self.conn):
-            audit(self.conn, "run.self_op", run=run.code, op=req.op, by_ask=checked is None)
+        self._self_op_busy.add(run.code)
         try:
             if req.op == "update":
                 result = await self.self_ops.update_resonant()
@@ -318,6 +327,12 @@ class WorkerDesk:
             why = str(e) if isinstance(e, ToolFailed) else f"it failed ({type(e).__name__})"
             log.warning("worker self op failed", extra={"run": run.code, "op": req.op})
             ok, text = False, f"Not done: {req.op} Resonant: {why}."
+        finally:
+            self._self_op_busy.discard(run.code)
+        # only a restart or update that went through spends the ask's one allowance
+        with atomic(self.conn):
+            audit(self.conn, "run.self_op", run=run.code, op=req.op, by_ask=checked is None,
+                  ok=ok)  # fmt: skip
         rc = EXIT_OK if ok else EXIT_DENIED
         if checked is None:
             return self._reply(run.code, text, rc)

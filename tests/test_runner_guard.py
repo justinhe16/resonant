@@ -107,7 +107,7 @@ async def test_guard_off_is_the_default_and_the_session_runs_as_the_owner(
     # the per-run GitHub App token still reaches it by path, not by value
     assert env["GH_CONFIG_DIR"] == f"{run_dir}/creds/gh"
     prompt = argv[argv.index("--append-system-prompt") + 1]
-    assert "`resonant restart`" in prompt and "launchctl" in prompt
+    assert "`resonant restart`" not in prompt  # no self_ops here: not offered
 
 
 async def test_guard_thin_still_wraps_checks_and_isolates(
@@ -289,7 +289,7 @@ async def test_login_check_caches_both_answers() -> None:
         (0, '{"loggedIn": true, "authMethod": "claude.ai"}', True),
         (0, '{"loggedIn": false}', False),
         (1, '{"loggedIn": true}', False),
-        (0, "Logged in", True),
+        (0, "Logged in", False),
         (2, "", False),
     ],
 )
@@ -375,6 +375,76 @@ async def test_a_configured_entry_for_the_daemons_repo_gets_its_path(
     assert repo is not None and repo.path == own
 
 
+async def test_the_registry_keeps_its_own_entry_for_the_daemons_repo(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """Already registered under another handle (say, by first use): kept as it is, no
+    rename, and only a missing path is filled in."""
+    h = build(tmp_path, db, repos=("proj", "resonant"))
+    own = daemon_checkout(h)
+    h.runner.cfg = h.cfg.model_copy(update={"repos": {"proj": h.cfg.repos["proj"]}})
+    db.execute("UPDATE repos SET name = 'res', source = 'auto' WHERE slug = 'own/resonant'")
+    h.runner.self_repo = own
+    await h.runner.start()
+    repo = repo_store.get(db, "own/resonant")
+    assert repo is not None and repo.name == "res" and repo.source == "auto"
+    assert repo.path == own
+    assert repo_store.find(db, "resonant") is None or repo_store.find(db, "resonant") == repo
+    elsewhere = tmp_path / "elsewhere"
+    repo_store.set_path(db, "own/resonant", elsewhere)
+    await h.runner.start()
+    again = repo_store.get(db, "own/resonant")
+    assert again is not None and again.path == elsewhere  # the owner's path wins
+
+
+async def test_the_thin_guard_never_registers_the_daemons_checkout(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, repos=("proj", "resonant"))
+    own = daemon_checkout(h)
+    h.runner.cfg = h.cfg.model_copy(
+        update={"repos": {"proj": h.cfg.repos["proj"]}, "guard": "thin"}
+    )
+    db.execute("DELETE FROM repos WHERE slug = 'own/resonant'")
+    h.runner.self_repo = own
+    await h.runner.start()
+    assert repo_store.find(db, "resonant") is None
+
+
+async def test_runs_without_a_github_token_dont_see_the_owners_gh_login(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="scratch")
+    res = await h.runner.start_run(None, "how full is the disk?", "owner")
+    assert isinstance(res, Started)
+    await h.drain()
+    [call] = h.argv_log()
+    empty = h.code_dir("R1") / "gh-none"
+    assert call["env"]["GH_CONFIG_DIR"] == str(empty) and empty.is_dir()
+    assert list(empty.iterdir()) == []
+
+
+async def test_a_failed_session_on_the_login_asks_again(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    probes: list[int] = []
+
+    def probe(claude: Any, home: Path) -> bool:
+        probes.append(1)
+        return True
+
+    h = build(tmp_path, db, scenario="error")
+    h.runner._login_check = LoginCheck(  # pyright: ignore[reportPrivateUsage]
+        lambda: ["claude"], owner_home(h), probe=probe
+    )
+    del h.keychain.items[CLAUDE_TOKEN_REF]
+    await h.start()
+    await h.drain()
+    assert h.run().status == "failed"
+    before = len(probes)
+    assert await h.runner.login_ok() is True and len(probes) == before + 1  # not cached
+
+
 async def test_no_checkout_registers_nothing(tmp_path: Path, db: sqlite3.Connection) -> None:
     h = build(tmp_path, db)
     h.runner.self_repo = tmp_path / "not-a-checkout"
@@ -430,11 +500,15 @@ def cli_calls(h: Harness, code: str = "R1") -> list[dict[str, Any]]:
     ("ask", "op", "ok"),
     [
         ("fix the login bug in resonant, then restart it", "restart", True),
-        ("fix it and redeploy", "restart", True),
-        ("deploy the fix", "update", True),
+        ("fix it and redeploy it", "restart", True),
+        ("deploy resonant", "update", True),
         ("merge it and update resonant", "update", True),
+        ("then /restart", "restart", True),
         ("fix the typo in the README", "restart", False),
         ("update the docs in resonant", "update", False),
+        ("write a deploy script for dori", "restart", False),
+        ("fix the restart bug in resonant", "restart", False),
+        ("deploy the fix", "update", False),
     ],
 )
 def test_asked_for(ask: str, op: Any, ok: bool) -> None:
@@ -457,6 +531,8 @@ async def test_a_worker_restarts_resonant_and_its_run_resumes(
     await until(lambda: bool(cli_calls(h)), what="the CLI's reply")
     [call] = cli_calls(h)
     assert call["argv"] == ["restart"] and call["rc"] == 0
+    system = h.argv_log(code)[0]["argv"]
+    assert "launchctl" in system[system.index("--append-system-prompt") + 1]
     assert "Resonant restarts in about 3 s" in call["out"] and "sleep 120" in call["out"]
     assert trust.calls == []
     assert RESTART_NOTE in (h.run(code).resume_prompt or "")
@@ -505,7 +581,9 @@ async def test_a_worker_restarts_resonant_and_its_run_resumes(
     assert final.resume_prompt is None  # cleared when the resumed turn ended
     assert ops.calls == ["restart"]  # the resumed turn doesn't restart again
     rows = db.execute("SELECT detail FROM audit_log WHERE action = 'run.self_op'").fetchall()
-    assert len(rows) == 1 and json.loads(rows[0]["detail"])["by_ask"] is True
+    assert len(rows) == 1
+    assert json.loads(rows[0]["detail"]) == {"run": code, "op": "restart", "by_ask": True,
+                                             "ok": True}  # fmt: skip
 
 
 async def test_a_restart_the_ask_didnt_mention_is_a_check(
@@ -583,7 +661,7 @@ async def test_a_requested_restart_is_not_counted_as_a_crash(
 
 
 def test_the_worker_prompt_says_how_to_restart() -> None:
-    prompt = claude_mod.WORKER_PROMPT
+    prompt = claude_mod.RESTART_PROMPT
     assert "`resonant restart`" in prompt and "`resonant update`" in prompt
     assert "launchctl" in prompt
 

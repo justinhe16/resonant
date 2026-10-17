@@ -13,7 +13,7 @@ Three sources, in this order:
 source: set beside a subscription login it would win and bill the API.
 
 Whether the login works is asked of ``claude auth status --json`` (exit 0 and, when the
-output is JSON with ``loggedIn``, that being true), with a minimal environment: the real
+output is JSON, with ``loggedIn`` true when present), with a minimal environment: the real
 ``HOME``, a system-and-install-dirs ``PATH``, no token or key. Its output is never logged or
 returned (it can name the account). The answer is cached (:class:`LoginCheck`), so
 ``setup_gaps``, the dashboard and ``/runs`` don't start a process each time.
@@ -75,13 +75,13 @@ def status_env(home: Path) -> dict[str, str]:
 
 
 def parse_status(returncode: int, stdout: str) -> bool:
-    """Logged in: exit 0, and ``loggedIn`` true when the output is JSON that has it."""
+    """Logged in: exit 0 and JSON output, with ``loggedIn`` true when it has that key."""
     if returncode != 0:
         return False
     try:
         data: Any = json.loads(stdout)
     except ValueError:
-        return True
+        return False  # --json always answers JSON: anything else isn't a yes
     if isinstance(data, dict) and "loggedIn" in data:
         return data["loggedIn"] is True
     return True

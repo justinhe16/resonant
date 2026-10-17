@@ -602,7 +602,7 @@ async def test_a_run_with_no_repo_works_in_a_scratch_dir(
     assert (scratch / "notes.md").exists()  # kept until keep_days, like a run dir
     [call] = h.argv_log("R1")
     assert call["cwd"] == str(scratch)
-    assert "GH_CONFIG_DIR" not in call["env"]
+    assert call["env"]["GH_CONFIG_DIR"].endswith("/gh-none")  # empty: no GitHub login
     prompt = call["argv"][call["argv"].index("--append-system-prompt") + 1]
     assert "scratch directory" in prompt and "no GitHub credentials" in prompt
     # a resumed scratch session isn't told to push or open a PR (it has neither)
