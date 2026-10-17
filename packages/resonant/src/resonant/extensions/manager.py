@@ -22,29 +22,35 @@ inherits old state or secrets.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import re
 import secrets as pysecrets
 import shlex
 import sqlite3
-from collections.abc import Callable, Collection, Iterable
-from dataclasses import dataclass
+import sys
+from collections.abc import Callable, Collection, Iterable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from pydantic import ValidationError
 
 from resonant.extensions.checks import (
     approver_errors,
+    bin_env,
     bin_key,
     commands,
     dir_errors,
+    mcp_key,
     name_errors,
     resolve_argv0,
     resolve_bin,
+    resolve_mcp_command,
 )
+from resonant.extensions.mcp import approve, discover, pins_digest, pins_json, server_argv
 from resonant.extensions.pin import (
     CopyState,
     TreeEntries,
@@ -53,6 +59,7 @@ from resonant.extensions.pin import (
     tree_entries,
     verify_copy,
 )
+from resonant.extensions.process import SCRATCH_PATH, ExtRequest, scratch_env
 from resonant.extensions.sources import (
     Source,
     SourceError,
@@ -80,6 +87,10 @@ TOOL_WARN_COUNT = 12  # above this, routing accuracy suffers (plan D9)
 _ASKS = (Level.L1, Level.L2)
 
 
+def _discover_sync(req: ExtRequest) -> list[dict[str, Any]]:
+    return asyncio.run(discover(req, python=sys.executable))
+
+
 class ManagerError(Exception):
     """Install, update or remove refused. ``problems`` lists every reason."""
 
@@ -104,6 +115,7 @@ class Pin:
     commit: str | None
     tree_digest: str
     manifest_sha: str
+    mcp: str = ""  # pins_digest of the MCP tool pins; "" without MCP servers
 
     @property
     def heading_ref(self) -> str:
@@ -118,6 +130,8 @@ class Staged:
     root: Path  # the staging dir; discard() or install() removes it
     files: TreeEntries
     notes: tuple[str, ...] = ()
+    # What the MCP servers listed, pinned: {tool: {server, pin, input_schema}} (mcp.pins_json).
+    mcp_pins: Mapping[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass(frozen=True)
@@ -144,13 +158,18 @@ def _argv0(run: str) -> str:
     return argv[0] if argv else ""
 
 
-def escalations(manifest: Manifest, registered: Collection[str] = ()) -> list[str]:
+def escalations(
+    manifest: Manifest,
+    registered: Collection[str] = (),
+    mcp_pins: Mapping[str, Any] | None = None,
+) -> list[str]:
     """What raises the stakes, one line each: secrets, approvers, asking tools and jobs,
-    commands that use the network (``gh``/``git``), and linked repos. A repo link makes
-    "work on <extension>" start runs there. The owner's GitHub login isn't known offline, so a
-    slug not in the repo registry (``registered``, lowercase) is flagged. Stable text, so
-    updates can diff."""
+    commands that use the network (``gh``/``git``), MCP servers and every MCP tool with its
+    pin (``mcp_pins``, as stored), and linked repos. A repo link makes "work on <extension>"
+    start runs there. The owner's GitHub login isn't known offline, so a slug not in the repo
+    registry (``registered``, lowercase) is flagged. Stable text, so updates can diff."""
     out: list[str] = []
+    mcp_tools = {t.name for _, t in manifest.mcp.tools()} if manifest.mcp else set[str]()
     for slug in manifest.repos:
         new = "" if slug.lower() in registered else " (not in your repo registry)"
         out.append(f"repo link {_s(slug)}: requests naming {manifest.name} run there{new}")
@@ -160,7 +179,7 @@ def escalations(manifest: Manifest, registered: Collection[str] = ()) -> list[st
         out.append(f"approver {_s(name)} may approve this extension's actions")
     for spec in manifest.tool_specs():
         level = spec.effective_level
-        if level in _ASKS:
+        if level in _ASKS and spec.name not in mcp_tools:
             extra = ", irreversible (yes <code>)" if spec.commit or level is Level.L1 else ""
             out.append(f"tool {_s(spec.name)} {spec.effect.value} {level.value}: asks{extra}")
     for job in manifest.jobs:
@@ -175,8 +194,35 @@ def escalations(manifest: Manifest, registered: Collection[str] = ()) -> list[st
             out.append(f"{_s(where)} runs {_argv0(run)} (network)")
     for name in manifest.bins:
         out.append(f"its code runs {name} (network)")
+    out += _mcp_escalations(manifest, mcp_pins or {})
     if manifest.report is not None and manifest.report.max_urgency == "urgent":
         out.append(report_grant(manifest))
+    return out
+
+
+def _mcp_escalations(manifest: Manifest, pins: Mapping[str, Any]) -> list[str]:
+    if manifest.mcp is None:
+        return []
+    out: list[str] = []
+    for sid, server in manifest.mcp.servers.items():
+        line = shlex.join([server.command, *server.args])
+        secrets = f", gets secrets {', '.join(server.secrets)}" if server.secrets else ""
+        out.append(f"mcp server {_s(sid)} runs {_s(line, 160)} (stdio){secrets}")
+    specs = {s.name: s for s in manifest.tool_specs()}
+    for sid, tool in manifest.mcp.tools():
+        spec = specs[tool.name]
+        level = spec.effective_level
+        entry: object = pins.get(tool.name)
+        pin: object = cast(dict[str, Any], entry).get("pin") if isinstance(entry, dict) else None
+        shown = pin[:12] if isinstance(pin, str) else "unknown"
+        asks = ""
+        if level in _ASKS:
+            final = spec.commit or level is Level.L1
+            asks = ": asks" + (", irreversible (yes <code>)" if final else "")
+        out.append(
+            f"mcp tool {_s(tool.name)} ({_s(sid)}) {spec.effect.value} {level.value} "
+            f"pin {shown}{asks}"
+        )
     return out
 
 
@@ -219,7 +265,7 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
     """The install/update confirmation: heading, escalations first, then everything else."""
     m = staged.manifest
     lines = [heading(staged), ""]
-    esc = escalations(m, registered)
+    esc = escalations(m, registered, staged.mcp_pins)
     lines.append("Escalations:" if esc else "Escalations: none")
     lines += [f"  ! {e}" for e in esc]
     if m.description or m.examples:
@@ -236,6 +282,12 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
         )
     for name, tool in m.tools.items():
         lines.append(f"    {_s(name, 40)} runs {tool.run}")
+    if m.mcp:
+        for sid, tool in m.mcp.tools():
+            names = ", ".join(_s(n, 40) for n in _arg_names(staged.mcp_pins.get(tool.name)))
+            lines.append(
+                f"    {_s(tool.name, 40)} via mcp server {_s(sid, 40)}; args: {names or 'none'}"
+            )
     lines.append("Jobs:" if m.jobs else "Jobs: none")
     for job in m.jobs:
         spec = job.spec(m.name)
@@ -259,6 +311,17 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
     return lines
 
 
+def _arg_names(entry: object) -> list[str]:
+    """The property names of a pinned MCP tool's stripped schema (shown at install)."""
+    schema: object = (
+        cast(dict[str, Any], entry).get("input_schema") if isinstance(entry, dict) else None
+    )
+    props: object = (
+        cast(dict[str, Any], schema).get("properties") if isinstance(schema, dict) else None
+    )
+    return list(cast(dict[str, Any], props)) if isinstance(props, dict) else []
+
+
 def update_lines(
     old: ext_store.ExtensionRecord,
     old_files: TreeEntries,
@@ -279,13 +342,13 @@ def update_lines(
     )
     lines.append("Files:" if changed else "Files: unchanged")
     lines += [f"  {_s(c, 100)}" for c in changed]
-    if new.pin.manifest_sha == old.manifest_sha:
+    if new.pin.manifest_sha == old.manifest_sha and pins_digest(old.mcp_pins) == new.pin.mcp:
         lines.append("Manifest: unchanged (code only)")
         return lines
     before: set[str] = set()
     with contextlib.suppress(ValidationError):  # an old snapshot may not parse any more
-        before = set(escalations(Manifest.model_validate(old.manifest), registered))
-    after = escalations(new.manifest, registered)
+        before = set(escalations(Manifest.model_validate(old.manifest), registered, old.mcp_pins))
+    after = escalations(new.manifest, registered, new.mcp_pins)
     diff = [f"  + {e}" for e in after if e not in before]
     diff += [f"  - {e}" for e in sorted(before) if e not in after]
     old_grant = _old_grant(old)
@@ -295,7 +358,8 @@ def update_lines(
         was = old_grant.removeprefix("reports: ") or "none"
         diff = [d for d in diff if d != f"  - {old_grant}"]  # the ~ line says it
         diff.append(f"  ~ {new_grant or 'reports: none (refused)'} (was: {was})")
-    lines.append("Manifest: changed. Escalations:" if diff else "Manifest: changed")
+    what = "Manifest" if new.pin.manifest_sha != old.manifest_sha else "MCP tools"
+    lines.append(f"{what}: changed. Escalations:" if diff else f"{what}: changed")
     lines += diff
     return lines
 
@@ -322,6 +386,7 @@ class ExtensionManager:
         ext_path: str,
         actor: str,
         clock: Callable[[], datetime] = utcnow,
+        mcp_discover: Callable[[ExtRequest], list[dict[str, Any]]] | None = None,
     ) -> None:
         self.conn = conn
         self.extensions_dir = extensions_dir
@@ -332,6 +397,7 @@ class ExtensionManager:
         self.ext_path = ext_path
         self.actor = actor
         self.clock = clock
+        self.mcp_discover = mcp_discover or _discover_sync
 
     # --- staging ----------------------------------------------------------------------
 
@@ -365,13 +431,19 @@ class ExtensionManager:
             if problems:
                 raise ManagerError(f"{src.text}: refused", problems)
             entries = tree_entries(root)
+            digest = tree_digest(root)
+            mcp_pins, mcp_notes = self._discover_mcp(manifest, root)
+            if tree_digest(root) != digest:
+                raise ManagerError(f"{src.text}: refused", ["an MCP server changed its own files"])
             pin = Pin(
                 source=src.text,
                 commit=files.commit,
-                tree_digest=tree_digest(root),
+                tree_digest=digest,
                 manifest_sha=hashlib.sha256(raw).hexdigest(),
+                mcp=pins_digest(mcp_pins),
             )
-            return Staged(manifest.name, pin, manifest, root, entries, files.notes)
+            notes = (*files.notes, *mcp_notes)
+            return Staged(manifest.name, pin, manifest, root, entries, notes, mcp_pins)
         except BaseException:
             remove_tree(root)
             raise
@@ -387,8 +459,6 @@ class ExtensionManager:
         problems += approver_errors(manifest, self.principals)
         if src.kind == "repo" and manifest.name != src.arg:
             problems.append(f"repo:{src.arg} declares the name {manifest.name!r}")
-        if manifest.mcp is not None:
-            problems.append("MCP servers are not supported yet (deferred, plan section 8)")
         if any(j.critical for j in manifest.jobs):
             problems.append("critical jobs are not supported yet (deferred, plan section 8)")
         if not problems:
@@ -402,7 +472,57 @@ class ExtensionManager:
                     resolve_bin(name, self.ext_path)
                 except ValueError as e:
                     problems.append(f"bins: {e}")
+            for sid, server in (manifest.mcp.servers if manifest.mcp else {}).items():
+                try:
+                    resolve_mcp_command(root, server.command, self.ext_path)
+                except ValueError as e:
+                    problems.append(f"mcp server {sid}: {e}")
         return problems
+
+    def _discover_mcp(
+        self, manifest: Manifest, root: Path
+    ) -> tuple[dict[str, Any], tuple[str, ...]]:
+        """Start each MCP server once, from the staged copy, with no secrets and a scratch
+        home, and pin the tools the manifest lists. Raises ManagerError with every problem."""
+        if manifest.mcp is None:
+            return {}, ()
+        scratch = self.extensions_dir / f".discover-{pysecrets.token_hex(6)}"
+        scratch.mkdir(mode=0o700)
+        pins: dict[str, Any] = {}
+        notes: list[str] = []
+        problems: list[str] = []
+        try:
+            (scratch / "tmp").mkdir(mode=0o700)
+            bins = {bin_env(b): resolve_bin(b, self.ext_path) for b in manifest.bins}
+            env = scratch_env(ext=manifest.name, data_dir=scratch, path=SCRATCH_PATH, bins=bins)
+            for sid, server in manifest.mcp.servers.items():
+                pinned = resolve_mcp_command(root, server.command, self.ext_path)
+                req = ExtRequest(
+                    argv=server_argv(root, server.command, server.args, pinned),
+                    cwd=root,
+                    env=env,
+                    timeout_s=20.0,
+                    label=f"{manifest.name}/mcp:{sid}",
+                )
+                try:
+                    tools = self.mcp_discover(req)
+                except Exception as e:
+                    reason = getattr(e, "reason", None) or type(e).__name__
+                    problems.append(f"mcp server {sid} could not list its tools ({reason})")
+                    continue
+                found = approve(sid, tuple(t.name for t in server.tools), tools)
+                problems += found.problems
+                pins |= pins_json(found.pins)
+                if found.ignored:
+                    extra = len(found.ignored) - 10
+                    shown = ", ".join(_s(n, 40) for n in found.ignored[:10])
+                    shown += f" and {extra} more" if extra > 0 else ""
+                    notes.append(f"mcp server {sid}: not in the manifest, never exposed: {shown}")
+        finally:
+            remove_tree(scratch)
+        if problems:
+            raise ManagerError(f"{manifest.name}: refused", problems)
+        return dict(sorted(pins.items())), tuple(notes)
 
     def registered_slugs(self) -> frozenset[str]:
         """Lowercase slugs in the repo registry, for flagging unfamiliar repo links."""
@@ -494,6 +614,7 @@ class ExtensionManager:
                 commit=approved.commit,
                 tree_digest=tree_digest(final),
                 manifest_sha=hashlib.sha256((final / MANIFEST_FILE).read_bytes()).hexdigest(),
+                mcp=pins_digest(staged.mcp_pins),
             )
             if after != approved:
                 raise PinChanged(f"{name}: the copy doesn't match what you confirmed")
@@ -508,6 +629,7 @@ class ExtensionManager:
                 installed_by=self.actor,
                 argv0_paths=self._argv0_paths(final, staged.manifest),
                 status="disabled" if previous and previous.status == "disabled" else "enabled",
+                mcp_pins=staged.mcp_pins,
             )
             action = "ext.update" if previous is not None else "ext.install"
             with atomic(self.conn):
@@ -551,6 +673,8 @@ class ExtensionManager:
             for where, run in commands(manifest)
         }
         pins.update({bin_key(b): resolve_bin(b, self.ext_path) for b in manifest.bins})
+        for sid, server in (manifest.mcp.servers if manifest.mcp else {}).items():
+            pins[mcp_key(sid)] = resolve_mcp_command(root, server.command, self.ext_path)
         return pins
 
     def _ensure_data_dir(self, name: str) -> None:

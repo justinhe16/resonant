@@ -283,7 +283,7 @@ What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an
    resonant daemon install
    ```
 
-   `resonant status` shows `daemon  up`. `scripts/bootstrap.sh --check` shows `store schema 11  PASS` and `runs table  PASS`.
+   `resonant status` shows `daemon  up`. `scripts/bootstrap.sh --check` shows `store schema 12  PASS` and `runs table  PASS`.
 2. **Claude Code, `gh` and the Claude token.** Claude Code must be installed (`claude --version`), and so must `gh` at `/opt/homebrew/bin/gh` (`runner.gh_path`; `brew install gh` if it isn't). `claude setup-token` prints a long-lived token for your subscription. Then:
 
    ```sh

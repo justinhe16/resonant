@@ -134,18 +134,22 @@ def test_tool_secret_must_be_declared() -> None:
 
 
 def test_mcp_tools_typed() -> None:
-    m = load(
-        TRADE_JEV,
-        mcp={
-            "command": "uv run gmail-mcp",
-            "tools": {"search": {"effect": "read"}, "send": {"effect": "write", "commit": True}},
-        },
-    )
+    server = {
+        "transport": "stdio",
+        "command": "gmail-mcp",
+        "args": ["--readonly"],
+        "tools": [
+            {"name": "search", "effect": "read"},
+            {"name": "send", "effect": "write", "commit": True},
+        ],
+    }
+    m = load(TRADE_JEV, mcp={"servers": {"gmail": server}})
     send = next(s for s in m.tool_specs() if s.name == "send")
     assert send.commit and send.effective_level is Level.L1
-    assert m.mcp is not None and m.mcp.command == ("uv", "run", "gmail-mcp")
+    assert m.mcp is not None and m.mcp.servers["gmail"].command == "gmail-mcp"
+    bad = {**server, "tools": [{"name": "send"}]}
     with pytest.raises(ValidationError):
-        load(TRADE_JEV, mcp={"command": "x", "tools": {"send": {}}})  # effect required
+        load(TRADE_JEV, mcp={"servers": {"gmail": bad}})  # effect required
 
 
 def test_bad_cron_and_duplicate_jobs() -> None:

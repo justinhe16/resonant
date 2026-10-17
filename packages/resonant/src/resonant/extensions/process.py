@@ -714,6 +714,60 @@ class ExtProcess:
             await self.tracker.terminate(entry)
 
 
+async def spawn_stdio(
+    req: ExtRequest, *, python: str = sys.executable, limit: int = STDOUT_CAP
+) -> asyncio.subprocess.Process:
+    """Start a long-lived process (an MCP server) with pipes on stdin, stdout and stderr.
+
+    The same launch rules as :meth:`ExtProcess.run_raw`: the env is exactly ``req.env``, its
+    ``RESONANT_SECRET_*`` keys go to fd 4 instead (``RESONANT_SECRETS_FD=4``), argv[0] must be
+    an absolute executable, the process gets a new session (its own group), and no fd 3. The
+    caller tracks, reads, and ends it; ``limit`` caps one stdout line. Raises ``ExtFailed``.
+    """
+    if not req.argv:
+        raise ExtFailed("empty argv")
+    env = dict(req.env)
+    env.pop("RESONANT_EVENTS_FD", None)
+    secrets = _take_secrets(env)
+    if any(not k or "=" in k or _KEY_SEP in k for k in env):
+        raise ExtFailed("bad env name")
+    exe = _resolve(req.argv[0])
+    if exe is None:
+        raise ExtFailed("argv[0] is not an absolute path to an executable")
+    secrets_fd = -1
+    try:
+        if secrets:
+            secrets_fd = _secrets_pipe(secrets)
+            env["RESONANT_SECRETS_FD"] = str(SECRETS_FD)
+        return await asyncio.create_subprocess_exec(
+            python,
+            "-I",
+            "-S",
+            "-c",
+            _TRAMPOLINE,
+            "-1",
+            str(secrets_fd),
+            _KEY_SEP.join(env),
+            exe,
+            *req.argv,
+            cwd=req.cwd,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=limit,
+            pass_fds=(secrets_fd,) if secrets_fd >= 0 else (),
+            start_new_session=True,
+        )
+    except ExtFailed:
+        raise
+    except (OSError, ValueError) as e:
+        raise ExtFailed("could not start") from e
+    finally:
+        if secrets_fd >= 0:
+            os.close(secrets_fd)
+
+
 def _take_secrets(env: dict[str, str]) -> dict[str, str]:
     """Remove the ``RESONANT_SECRET_<NAME>`` keys from ``env``; return ``{name: value}``."""
     found = {k: env.pop(k) for k in [k for k in env if _SECRET_ENV.fullmatch(k)]}
@@ -853,4 +907,5 @@ __all__ = [
     "ensure_data_dir",
     "parse_event",
     "scratch_env",
+    "spawn_stdio",
 ]

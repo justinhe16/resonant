@@ -19,13 +19,25 @@ For each ``enabled`` row (``store.extensions``), in name order:
    are kept out of chat: ``tool_specs()`` here lists tools only, and ``is_job`` tells them
    apart.
 
+   MCP tools (``manifest.mcp``) get an ``McpToolHandler`` on one ``McpServerRuntime`` per
+   server instead: the command runs by ``argv0_paths["mcp:<id>"]`` (an in-dir ``.py`` under
+   the daemon's interpreter), every listed tool must have its install-time pin in
+   ``record.mcp_pins``, and its args schema is the pinned, stripped one.
+
 Any refusal in 2-4 skips the whole extension (nothing half-registered), is audited
 ``ext.load_refused`` and is kept in ``refused`` for health. The status is left
 alone: those are not tampering. A load never raises for one bad extension.
 
-``handlers`` is merged into the executor's map at build. ``approvers_for`` is the gate's
-manifest-approvers seam. ``tracker`` is the one ``ProcessTracker`` for the kill switch.
+``handlers`` and ``mcp_handlers`` are merged into the executor's map at build.
+``approvers_for`` is the gate's manifest-approvers seam. ``tracker`` is the one
+``ProcessTracker`` for the kill switch.
 ``scheduled_jobs()`` is what the scheduler (``extensions/scheduler.py``) runs.
+
+MCP servers (``extensions/mcp.py``) are started by :meth:`ExtensionHost.start_mcp` once the
+daemon runs (and again on the next call after one ends), tracked by ``tracker`` so ``/kill``
+ends them, and ended by :meth:`ExtensionHost.aclose` on shutdown. A tool whose live pin no
+longer matches is disabled (hidden from chat, refused on call), audited ``ext.mcp_drift``,
+and alerted once per (install, tool, live pin) through ``ALERTS_KEY`` and ``alert``.
 
 Health (D11). The manifest's ``health.check`` is compiled at load like a tool (no
 placeholders; a pinned ``gh``/``git`` uses ``argv0_paths["health"]``).
@@ -39,7 +51,7 @@ import asyncio
 import logging
 import shlex
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -50,10 +62,11 @@ from pydantic import ValidationError
 
 from resonant import killswitch
 from resonant.config import Settings
-from resonant.executor import HandlerKey
+from resonant.executor import ContextHandler, HandlerKey
 from resonant.extensions import pin
-from resonant.extensions.checks import ALLOWED_COMMANDS, bin_env, bin_key, dir_errors
+from resonant.extensions.checks import ALLOWED_COMMANDS, bin_env, bin_key, dir_errors, mcp_key
 from resonant.extensions.handlers import ExtensionHandler
+from resonant.extensions.mcp import McpServerRuntime, McpToolHandler, parse_pins, server_argv
 from resonant.extensions.process import (
     ExtAmbiguous,
     ExtCommand,
@@ -81,6 +94,7 @@ from resonant_sdk.manifest import Job, duration_s, load_manifest
 log = logging.getLogger(__name__)
 
 ALERTS_KEY = "ext.alerts"  # kv: {name: {text, dedupe_key}}, sent to the owner on start
+MCP_DRIFT_KEY = "ext.mcp_drift"  # kv: {"<ext>/<tool>": dedupe key of the last alert}
 JOB_ARGS = frozenset({"due_at"})
 PINNED_COMMANDS = ALLOWED_COMMANDS - {"python3"}
 
@@ -92,6 +106,19 @@ def tampered_text(name: str) -> str:
     )
 
 
+def drift_text(name: str, tool: str) -> str:
+    return (
+        f"{name}: MCP tool {tool} changed since you approved it; disabled. "
+        f"resonant ext update {name} to review"
+    )
+
+
+def _approved_pin(record: store.ExtensionRecord, tool: str) -> str | None:
+    entry = record.mcp_pins.get(tool)
+    pin = cast(Mapping[str, object], entry).get("pin") if isinstance(entry, dict) else None
+    return pin if isinstance(pin, str) else None
+
+
 @dataclass(frozen=True)
 class LoadedExtension:
     record: store.ExtensionRecord
@@ -101,6 +128,7 @@ class LoadedExtension:
     jobs: tuple[ToolSpec, ...]
     health: ExtCommand | None = None  # the compiled manifest ``health.check``
     bins: Mapping[str, str] = field(default_factory=dict[str, str])  # RESONANT_BIN_* -> pin
+    mcp: Mapping[str, McpServerRuntime] = field(default_factory=dict[str, McpServerRuntime])
 
 
 @dataclass(frozen=True)
@@ -130,7 +158,16 @@ class ExtensionHost:
     handlers: dict[HandlerKey, ExtensionHandler] = field(
         default_factory=dict[HandlerKey, ExtensionHandler]
     )
+    mcp_handlers: dict[HandlerKey, McpToolHandler] = field(
+        default_factory=dict[HandlerKey, McpToolHandler]
+    )
+    # MCP servers read their tools' secrets at start; build_components sets the store.
+    secrets: SecretStore | None = None
+    # Sends queued alerts now (wiring sets it to ``send_alerts`` once iMessage is up).
+    alert: Callable[[], Awaitable[object]] | None = None
+    message_cap: int = 256 * 1024
     _job_keys: set[HandlerKey] = field(default_factory=set[HandlerKey])
+    _side: set[asyncio.Task[object]] = field(default_factory=set[asyncio.Task[object]])
 
     @classmethod
     def from_settings(
@@ -160,6 +197,7 @@ class ExtensionHost:
             runner=runner,
             path_env=cfg.path_env,
             tracker=tracker,
+            message_cap=cfg.stdout_max_bytes,
         )
 
     # --- load -----------------------------------------------------------------------------
@@ -191,7 +229,7 @@ class ExtensionHost:
 
     def _prepare(
         self, record: store.ExtensionRecord, root: Path
-    ) -> tuple[LoadedExtension, dict[HandlerKey, ExtensionHandler]]:
+    ) -> tuple[LoadedExtension, dict[HandlerKey, ContextHandler]]:  # both handler kinds
         try:
             manifest = Manifest.model_validate(record.manifest)
         except ValidationError as e:
@@ -205,8 +243,6 @@ class ExtensionHost:
             raise LoadRefused("resonant.yaml in the copy can't be read") from None
         if on_disk != manifest:
             raise LoadRefused("approved manifest snapshot does not match resonant.yaml")
-        if manifest.mcp is not None:
-            raise LoadRefused("mcp servers are not supported yet")
         if errors := dir_errors(root, manifest):
             raise LoadRefused(errors[0])
         bins: dict[str, str] = {}
@@ -217,10 +253,14 @@ class ExtensionHost:
             if not Path(pinned_bin).is_absolute() or not Path(pinned_bin).is_file():
                 raise LoadRefused(f"bins: pinned command {pinned_bin} is missing")
             bins[bin_env(name)] = pinned_bin
-        tools = tuple(manifest.tool_specs())
-        jobs = tuple(manifest.job_specs())
         data_dir = self.data_dir / record.name
-        handlers: dict[HandlerKey, ExtensionHandler] = {}
+        handlers: dict[HandlerKey, ContextHandler] = {}
+        runtimes, schemas = self._prepare_mcp(record, manifest, root, data_dir, bins)
+        tools = tuple(
+            s.model_copy(update={"args_schema": schemas[s.name]}) if s.name in schemas else s
+            for s in manifest.tool_specs()
+        )
+        jobs = tuple(manifest.job_specs())
         runs: dict[str, tuple[str, frozenset[str], bool]] = {
             name: (t.run, frozenset(t.args), False) for name, t in manifest.tools.items()
         }
@@ -228,6 +268,10 @@ class ExtensionHost:
         for spec in (*tools, *jobs):
             if spec.extension != record.name or spec.source != f"ext:{record.name}":
                 raise LoadRefused(f"{spec.name}: spec is not scoped to this extension")
+            if spec.name in schemas:
+                server = next(r for r in runtimes.values() if spec.name in r.approved)
+                handlers[(record.name, spec.name)] = McpToolHandler(record.name, spec, server)
+                continue
             run, allowed, job = runs[spec.name]
             argv0 = record.argv0_paths.get(spec.name)
             # Only gh/git run by the pinned path; scripts and python3 run with the daemon's
@@ -262,12 +306,125 @@ class ExtensionHost:
                 raise LoadRefused(f"health: {e}") from None
             if health.placeholders:
                 raise LoadRefused("health: the check takes no placeholders")
-        ext = LoadedExtension(record, manifest, root, tools, jobs, health, bins)
+        ext = LoadedExtension(record, manifest, root, tools, jobs, health, bins, runtimes)
         return ext, handlers
 
-    def _register(
-        self, prepared: tuple[LoadedExtension, dict[HandlerKey, ExtensionHandler]]
-    ) -> None:
+    def _prepare_mcp(
+        self,
+        record: store.ExtensionRecord,
+        manifest: Manifest,
+        root: Path,
+        data_dir: Path,
+        bins: Mapping[str, str],
+    ) -> tuple[dict[str, McpServerRuntime], dict[str, dict[str, object]]]:
+        """One runtime per MCP server, and each MCP tool's pinned (stripped) args schema.
+        Every listed tool must have an install-time pin from its own server."""
+        if manifest.mcp is None:
+            return {}, {}
+        try:
+            pins = parse_pins(record.mcp_pins)
+        except ValueError:
+            why = f"mcp pins are malformed; resonant ext update {record.name}"
+            raise LoadRefused(why) from None
+        runtimes: dict[str, McpServerRuntime] = {}
+        schemas: dict[str, dict[str, object]] = {}
+        for sid, server in manifest.mcp.servers.items():
+            try:
+                argv = server_argv(
+                    root, server.command, server.args, record.argv0_paths.get(mcp_key(sid))
+                )
+            except ValueError as e:
+                raise LoadRefused(f"mcp server {sid}: {e}") from None
+            approved: dict[str, str] = {}
+            for tool in server.tools:
+                pin = pins.get(tool.name)
+                if pin is None or pin.server != sid:
+                    raise LoadRefused(
+                        f"mcp tool {tool.name} isn't pinned; resonant ext update {record.name}"
+                    )
+                approved[tool.name] = pin.pin
+                schemas[tool.name] = pin.input_schema
+            name = record.name
+            runtimes[sid] = McpServerRuntime(
+                ext=name,
+                server_id=sid,
+                argv=argv,
+                root=root,
+                data_dir=data_dir,
+                path_env=self.path_env,
+                bins=bins,
+                secret_names=server.secrets,
+                approved=approved,
+                tracker=self.tracker,
+                secrets=lambda: self.secrets,
+                on_drift=lambda sid, tool, live, rec=record: self._drift(rec, sid, tool, live),
+                message_cap=self.message_cap,
+            )
+        return runtimes, schemas
+
+    def _drift(self, record: store.ExtensionRecord, sid: str, tool: str, live: str | None) -> None:
+        """An MCP tool no longer matches its pin: audit it and queue one owner alert per
+        (install, tool, live pin), then send it if a sender is set."""
+        key = f"{record.name}/{tool}"
+        dedupe = f"ext-mcp-drift:{key}:{iso(record.installed_at)}:{live or 'removed'}"
+        with atomic(self.conn):
+            seen = kv_get(self.conn, MCP_DRIFT_KEY)
+            seen_map = cast(dict[str, object], seen) if isinstance(seen, dict) else {}
+            if seen_map.get(key) == dedupe:
+                return
+            kv_set(self.conn, MCP_DRIFT_KEY, {**seen_map, key: dedupe})
+            alerts = pending_alerts(self.conn)
+            alerts[key] = {"text": drift_text(record.name, tool), "dedupe_key": dedupe}
+            kv_set(self.conn, ALERTS_KEY, alerts)
+            audit(
+                self.conn,
+                "ext.mcp_drift",
+                extension=record.name,
+                server=sid,
+                tool=tool,
+                live_pin=live,
+                approved_pin=_approved_pin(record, tool),
+            )
+        if self.alert is not None:
+            task = asyncio.ensure_future(self.alert())
+            self._side.add(task)
+            task.add_done_callback(self._side.discard)
+
+    async def start_mcp(self) -> None:
+        """Start every loaded MCP server once and check its pins (drift alerts come early).
+        A server that can't start is logged; its tools try again on their next call."""
+        runtimes = [r for ext in self.loaded.values() for r in ext.mcp.values()]
+        results = await asyncio.gather(*(r.start() for r in runtimes), return_exceptions=True)
+        for r, res in zip(runtimes, results, strict=True):
+            if isinstance(res, BaseException):
+                log.warning(
+                    "mcp server did not start: %s",
+                    type(res).__name__,
+                    extra={"label": r.label, "reason": getattr(res, "reason", None)},
+                )
+
+    async def aclose(self) -> None:
+        """End every MCP server (the whole process group and tree)."""
+        runtimes = [r for ext in self.loaded.values() for r in ext.mcp.values()]
+        await asyncio.gather(*(r.aclose() for r in runtimes), return_exceptions=True)
+        for t in list(self._side):
+            t.cancel()
+        await asyncio.gather(*self._side, return_exceptions=True)
+
+    def disabled_tools(self, extension: str) -> dict[str, str]:
+        """MCP tools of ``extension`` disabled since load: ``{tool: "changed"|"removed"}``."""
+        ext = self.loaded.get(extension)
+        if ext is None:
+            return {}
+        return {t: why for r in ext.mcp.values() for t, why in r.disabled.items()}
+
+    def hidden(self, spec: ToolSpec) -> bool:
+        """Kept out of chat: job specs, and MCP tools disabled by a pin change."""
+        if self.is_job(spec):
+            return True
+        return spec.extension is not None and spec.name in self.disabled_tools(spec.extension)
+
+    def _register(self, prepared: tuple[LoadedExtension, dict[HandlerKey, ContextHandler]]) -> None:
         ext, handlers = prepared
         name = ext.record.name
         if any(s.extension == name for s in self.registry.specs()):
@@ -278,7 +435,8 @@ class ExtensionHost:
         except ValueError as e:
             self.registry.unregister_extension(name)
             raise LoadRefused(str(e)) from None
-        self.handlers |= handlers
+        self.handlers |= {k: h for k, h in handlers.items() if isinstance(h, ExtensionHandler)}
+        self.mcp_handlers |= {k: h for k, h in handlers.items() if isinstance(h, McpToolHandler)}
         self._job_keys |= {(name, s.name) for s in ext.jobs}
         self.loaded[name] = ext
 
@@ -320,6 +478,7 @@ class ExtensionHost:
             for name in sorted(self.loaded)
             if extension is None or name == extension
             for s in sorted(self.loaded[name].tools, key=lambda s: s.name)
+            if s.name not in self.disabled_tools(name)
         ]
 
     def job_specs(self, extension: str | None = None) -> list[ToolSpec]:
@@ -340,7 +499,7 @@ class ExtensionHost:
             for job in sorted(ext.manifest.jobs, key=lambda j: j.id):
                 spec = specs.get(job.spec_name)
                 handler = self.handlers.get((name, job.spec_name))
-                if spec is not None and handler is not None:
+                if spec is not None and isinstance(handler, ExtensionHandler):
                     out.append(HostJob(name, job, spec, handler))
         return out
 
@@ -422,10 +581,14 @@ class ExtensionHealth:
             if j.fail_streak >= FAIL_STREAK_ALERT
         ]
         last = self._last.get(name)
-        problems = ([last.detail] if last is not None and not last.ok else []) + streaks
+        drift = [
+            f"mcp tool {tool} disabled ({why} since you approved it)"
+            for tool, why in sorted(self.host.disabled_tools(name).items())
+        ]
+        problems = ([last.detail] if last is not None and not last.ok else []) + streaks + drift
         if not problems:
             return CheckResult(True, "ok"), True
-        return CheckResult(False, "; ".join(problems)), fresh_run or bool(streaks)
+        return CheckResult(False, "; ".join(problems)), fresh_run or bool(streaks or drift)
 
     async def _run_if_due(self, name: str, now: datetime) -> bool:
         ext = self.host.loaded[name]
@@ -525,12 +688,14 @@ async def send_alerts(conn: sqlite3.Connection, channel: Sender, owner: str | No
         except ChannelError as e:
             log.warning("extension alert failed (will retry on next start): %s", e)
             continue
-        _drop_alert(conn, name)
+        _drop_alert(conn, name, alert["dedupe_key"])
     return sent
 
 
-def _drop_alert(conn: sqlite3.Connection, name: str) -> None:
+def _drop_alert(conn: sqlite3.Connection, name: str, dedupe_key: str) -> None:
+    """Drop the alert just sent, unless a newer one replaced it meanwhile."""
     with atomic(conn):
         alerts = pending_alerts(conn)
-        alerts.pop(name, None)
+        if alerts.get(name, {}).get("dedupe_key") == dedupe_key:
+            alerts.pop(name, None)
         kv_set(conn, ALERTS_KEY, alerts)

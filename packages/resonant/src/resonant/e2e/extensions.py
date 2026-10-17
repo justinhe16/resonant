@@ -12,6 +12,7 @@ import hashlib
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from resonant.config import Settings
 from resonant.extensions.pin import tree_digest
@@ -30,6 +31,7 @@ def install_fixture(
     *,
     argv0_paths: Mapping[str, str] | None = None,
     executable: tuple[str, ...] = (),
+    mcp_pins: Mapping[str, Any] | None = None,
 ) -> ExtensionRecord:
     """Write ``resonant.yaml`` plus ``files``, pin them and save the row. Returns it."""
     manifest = Manifest.model_validate(parse_yaml(manifest_yaml))
@@ -52,6 +54,7 @@ def install_fixture(
         installed_at=utcnow(),
         installed_by="owner:cli",
         argv0_paths=dict(argv0_paths or {}),
+        mcp_pins=dict(mcp_pins or {}),
     )
     with atomic(conn):
         save_extension(conn, record)

@@ -174,6 +174,10 @@ class Daemon:
                 self.conn.close()
                 return 1
         self.scheduler.start()
+        ext_host = self.state.components.extensions if self.state.components else None
+        mcp_start = None
+        if ext_host is not None and any(e.mcp for e in ext_host.loaded.values()):
+            mcp_start = asyncio.create_task(ext_host.start_mcp(), name="mcp-start")
         if self.imessage is not None and self.imessage.claude is not None:
             # Before the loop resumes anything: end the processes a crash left behind.
             try:
@@ -221,6 +225,9 @@ class Daemon:
         if self.imessage is not None:
             await self.imessage.stop()  # no new events while the loop drains
         await self.scheduler.aclose()
+        if mcp_start is not None:
+            mcp_start.cancel()
+            await asyncio.gather(mcp_start, return_exceptions=True)
         self.loop.stop()
         stop_task.cancel()
         for t in aux:
@@ -232,6 +239,8 @@ class Daemon:
             if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
                 log.error("component error during shutdown: %r", r)
                 crashed = True
+        if ext_host is not None:
+            await ext_host.aclose()  # after the drain: every MCP server's process group
         if self.imessage is not None:
             if self.imessage.claude is not None:
                 await self.imessage.claude.aclose()

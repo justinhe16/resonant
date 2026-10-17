@@ -75,7 +75,7 @@ from dataclasses import dataclass, field
 from resonant.components import Components
 from resonant.config import ModelConfig, Settings
 from resonant.extensions.briefing import JOB_ID as BRIEFING_JOB
-from resonant.extensions.host import ExtensionHealth, send_alerts
+from resonant.extensions.host import ExtensionHealth, ExtensionHost, send_alerts
 from resonant.extensions.notify import Notifier
 from resonant.extensions.pulse import EVENT_TYPE, Pulse
 from resonant.extensions.pulse_job import JOB_ID as PULSE_JOB
@@ -148,6 +148,7 @@ class IMessageStack:
     jobs: JobRunner | None = None
     claude: ClaudeRunner | None = None
     notifier: Notifier | None = None
+    extensions: ExtensionHost | None = None  # gets ``alert`` once the channel is up
     pulse: Pulse | None = None
     trust: TrustChecks | None = None  # workers' ``resonant check`` (EM-3 calls request_check)
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
@@ -169,11 +170,19 @@ class IMessageStack:
                 log.info("sent back-up message after a requested restart")
         except Exception:
             log.exception("back-up message failed")  # never blocks the start
+        if self.extensions is not None:  # MCP pin drift found from now on is sent right away
+            self.extensions.alert = self._send_alerts
         try:
             if sent := await send_alerts(self.channel.conn, self.channel, self.owner):
                 log.info("sent %d extension alert(s)", sent)
         except Exception:
             log.exception("extension alerts failed")  # never blocks the start
+
+    async def _send_alerts(self) -> None:
+        try:
+            await send_alerts(self.channel.conn, self.channel, self.owner)
+        except Exception:
+            log.exception("extension alerts failed")
 
     async def stop(self) -> None:
         """Stop the monitor, the notifier's flush and the reader. Safe to call twice or
@@ -181,6 +190,8 @@ class IMessageStack:
         self.monitor.stop()
         if self.notifier is not None:
             self.notifier.stop()
+        if self.extensions is not None:
+            self.extensions.alert = None
         if self._started:
             self._started = False
             await self.channel.stop()
@@ -340,5 +351,6 @@ def build_imessage_stack(
         notifier=notifier,
         pulse=pulse,
         trust=trust,
+        extensions=components.extensions,
         _close_model=close_model,
     )

@@ -5,8 +5,8 @@ named after ``uses`` (e.g. ``uses: oncall`` allows an ``oncall:`` block). The fi
 extension validates that block with its own schema.
 
 Tool and job effects are declared here and nowhere else. MCP servers do not declare effects,
-so every MCP tool an extension wants exposed must be listed under ``mcp.tools``. Unlisted MCP
-tools are refused at runtime.
+so every MCP tool an extension wants exposed must be listed under ``mcp.servers.<id>.tools``,
+with its effect, level and secrets. Unlisted MCP tools are never exposed.
 
 Checks that need the extension's directory or this installation (stdlib only, the argv[0]
 allowlist, symlinks, builtin command names, approver grants) live in
@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from resonant_sdk.tool import Effect, Level, ToolSpec
+from resonant_sdk.tool import TOOL_NAME_PATTERN, Effect, Level, ToolSpec
 
 SLUG = r"^[a-z][a-z0-9-]{0,47}$"
 SECRET_NAME = r"^[a-z][a-z0-9_]{0,31}$"  # noqa: S105 - a pattern, not a secret
@@ -205,21 +205,80 @@ class CliTool(_Strict):
         return self
 
 
-class McpToolDecl(_Strict):
+MCP_SERVER_ID = r"^[a-z][a-z0-9_-]{0,31}$"
+MCP_ARGS_MAX = 32
+MCP_ARG_MAX = 300
+MCP_TOOLS_MAX = 64
+
+
+class McpTool(_Strict):
+    """One MCP tool the extension exposes. The server's own description and schema text never
+    reach the model: ``description`` here is what it sees, and the effect, level, secrets and
+    timeout come only from this entry."""
+
+    name: str = Field(pattern=TOOL_NAME_PATTERN)
+    description: str = Field(default="", max_length=300)
     effect: Effect
     level: Level | None = None
     commit: bool = False
     secrets: tuple[SecretName, ...] = ()
+    timeout_s: float = Field(default=30.0, gt=0, le=TOOL_TIMEOUT_MAX_S)
+
+    @field_validator("description")
+    @classmethod
+    def _one_line(cls, v: str) -> str:
+        if not v.isprintable():
+            raise ValueError("description must be one line with no control characters")
+        return v
 
 
 class McpServer(_Strict):
-    command: tuple[str, ...]
-    tools: dict[str, McpToolDecl]
+    """A local MCP server over stdio. ``command`` is one word: a ``.py`` file in the extension
+    dir (``./server.py``) or a server binary, pinned by its real absolute path at install
+    (``resonant.extensions.checks.resolve_mcp_command``). ``args`` are literal."""
 
-    @field_validator("command", mode="before")
+    transport: Literal["stdio"]
+    command: str = Field(min_length=1, max_length=MCP_ARG_MAX)
+    args: tuple[str, ...] = Field(default=(), max_length=MCP_ARGS_MAX)
+    tools: tuple[McpTool, ...] = Field(min_length=1, max_length=MCP_TOOLS_MAX)
+
+    @field_validator("command")
     @classmethod
-    def _split(cls, v: Any) -> Any:
-        return v.split() if isinstance(v, str) else v
+    def _command(cls, v: str) -> str:
+        if not (v.isascii() and v.isprintable()) or any(c.isspace() for c in v):
+            raise ValueError("command must be one printable word; put arguments in args")
+        return v
+
+    @field_validator("args")
+    @classmethod
+    def _args(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        bad = [a for a in v if not (a.isascii() and a.isprintable()) or len(a) > MCP_ARG_MAX]
+        if bad:
+            raise ValueError(f"args must be printable ASCII of at most {MCP_ARG_MAX} chars")
+        return v
+
+    @field_validator("tools")
+    @classmethod
+    def _unique(cls, v: tuple[McpTool, ...]) -> tuple[McpTool, ...]:
+        names = [t.name for t in v]
+        if len(names) != len(set(names)):
+            raise ValueError("mcp tool names must be unique")
+        return v
+
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        """The union of its tools' declared secrets: all the server process receives."""
+        return tuple(sorted({s for t in self.tools for s in t.secrets}))
+
+
+class Mcp(_Strict):
+    """``mcp: {servers: {<id>: McpServer}}``. Only the listed tools are ever exposed."""
+
+    servers: dict[Annotated[str, Field(pattern=MCP_SERVER_ID)], McpServer] = Field(min_length=1)
+
+    def tools(self) -> list[tuple[str, McpTool]]:
+        """Every listed tool as ``(server id, tool)``, by server then manifest order."""
+        return [(sid, t) for sid, server in self.servers.items() for t in server.tools]
 
 
 class Notify(_Strict):
@@ -270,7 +329,7 @@ class Manifest(BaseModel):
     approvers: tuple[str, ...] = ()
     jobs: tuple[Job, ...] = ()
     tools: dict[str, CliTool] = Field(default_factory=dict[str, CliTool])
-    mcp: McpServer | None = None
+    mcp: Mcp | None = None
     notify: Notify | None = None
     report: Report | None = None
     health: Health | None = None
@@ -325,8 +384,10 @@ class Manifest(BaseModel):
         ids = [j.id for j in self.jobs]
         if len(ids) != len(set(ids)):
             raise ValueError("job ids must be unique")
-        mcp_names: set[str] = set(self.mcp.tools) if self.mcp else set()
-        if clash := set(self.tools) & mcp_names:
+        mcp_names = [t.name for _, t in self.mcp.tools()] if self.mcp else []
+        if len(mcp_names) != len(set(mcp_names)):
+            raise ValueError("mcp tool names must be unique across servers")
+        if clash := set(self.tools) & set(mcp_names):
             raise ValueError(f"tool names defined twice (cli and mcp): {sorted(clash)}")
         job_specs = self.job_specs()  # also enforces ToolSpec invariants
         tool_specs = self.tool_specs()
@@ -371,17 +432,21 @@ class Manifest(BaseModel):
             for name, t in self.tools.items()
         ]
         if self.mcp:
+            # The args schema is the server's, stripped and pinned at install; the host fills
+            # it in from the install record. Here it is a placeholder.
             specs += [
                 ToolSpec(
-                    name=name,
-                    effect=d.effect,
-                    level=d.level,
+                    name=t.name,
+                    description=t.description,
+                    effect=t.effect,
+                    level=t.level,
                     source=source,
                     extension=self.name,
-                    secrets=d.secrets,
-                    commit=d.commit,
+                    timeout_s=t.timeout_s,
+                    secrets=t.secrets,
+                    commit=t.commit,
                 )
-                for name, d in self.mcp.tools.items()
+                for _, t in self.mcp.tools()
             ]
         return specs
 

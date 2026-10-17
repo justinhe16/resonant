@@ -2,7 +2,7 @@
 
 An extension teaches Resonant about one product or domain, such as a trading bot, an on-call rotation, or a home lab, without changing the core. It is usually its own repo containing a `resonant.yaml` manifest and the scripts or servers the manifest points at. The core never imports extension code. It reads the manifest, runs your commands as separate processes, and enforces policy around them.
 
-> **Status.** The manifest schema is v1, with Phase 3's additive fields (job effects and levels, `catchup`, `description`, `examples`). Everything in this guide is built (Phase 3) except MCP tools and critical jobs, which are deferred: `ext add` refuses an `mcp` block or `critical: true` for now ([`followups.md`](followups.md)). [`extensions/github`](../extensions/github) is a real one.
+> **Status.** The manifest schema is v1, with Phase 3's additive fields (job effects and levels, `catchup`, `description`, `examples`) and MCP servers over stdio (MCP-1, [dashboard-plan.md](dashboard-plan.md) D8). Everything in this guide is built except critical jobs, which are deferred: `ext add` refuses `critical: true` for now ([`followups.md`](followups.md)). MCP over HTTP is MCP-2. [`extensions/github`](../extensions/github) is a real one.
 >
 > **Phase 3 extensions are first-party, owner-installed code** from this repo or a local git work tree. They run as the owner's macOS user. See [phase3-plan.md](phase3-plan.md) D13.
 
@@ -53,7 +53,7 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 | `approvers` | list of principals | Who may approve this extension's actions when the gate asks (L1, inferred L2, or anything above L0 under the kill switch). Each must hold the `approve` grant for this extension in `principals.yaml`. |
 | `jobs` | list | Scheduled commands, described in §6. |
 | `tools` | map | Command-backed tools, described in §4. |
-| `mcp` | object, optional | An MCP server and the typed list of tools it may expose, described in §4. |
+| `mcp` | `{servers: {<id>: …}}`, optional | Local MCP servers (stdio) and the typed list of tools each may expose, described in §4. |
 | `notify` | `{on: [event…], channel: imessage\|slack}` | Which of your emitted events are forwarded to people. |
 | `report` | `{max_urgency: urgent\|normal\|low}` | The highest urgency your `report()` items may use (`urgent` texts the owner right away, `normal` joins the hourly pulse, `low` waits for the 08:00 briefing). Without it, reports are refused. `item` is reserved and can't be in `notify.on`. |
 | `health` | `{check: <cmd>, every: 30s\|5m\|1h}` | A health command. A zero exit code means healthy. |
@@ -113,17 +113,41 @@ Contract:
 - On a timeout, a cancel or the kill switch, the whole process group and any tracked children are killed.
 - Calls are idempotent per (task, step, intent). Resonant won't re-run a call that already succeeded.
 
-### MCP tools (deferred)
+### MCP tools
 
-Not supported yet: `ext add` refuses an `mcp` block. The planned contract: use an MCP server for stateful or long-running tools (a warm browser, a database connection) or when you have many tools. MCP servers don't declare effects, so **you list every tool you want exposed, with its effect**. Unlisted tools are refused.
+Use an MCP server for stateful or long-running tools (a warm browser, a database connection) or when a server already exists for the product. Its tools become ordinary extension tools: the same effects, levels, gate, approvals, secrets, audit and kill switch as CLI tools, and the brain sees them like any other tool of yours. MCP servers don't declare effects, so **you list every tool you want exposed, with its effect**. A tool the server offers that you don't list is never registered or called.
 
 ```yaml
+secrets: [token]
 mcp:
-  command: uv run my-mcp-server
-  tools:
-    search_mail: {effect: read}
-    send_mail:   {effect: write, level: L1, commit: true}
+  servers:
+    mail:                             # server id: lowercase, digits, - and _
+      transport: stdio                # the only one for now (HTTP is MCP-2)
+      command: ./server.py            # or a server binary: mail-mcp, /usr/local/bin/mail-mcp
+      args: [--readonly]              # literal; no placeholders
+      tools:
+        - name: search_mail           # the server's tool name (lowercase, digits, _)
+          description: Search the mailbox by sender or subject.   # what the model sees
+          effect: read
+          secrets: [token]
+        - name: send_mail
+          description: Send a drafted reply.
+          effect: write
+          level: L1
+          commit: true
+          secrets: [token]
+          timeout_s: 60               # default 30, at most 300
 ```
+
+Contract:
+- **Command.** One word: a `.py` file in your extension dir (run as `python -I -S server.py <args>` under the daemon's interpreter, like CLI scripts), or a server binary looked up on `/opt/homebrew/bin:/usr/bin:/bin` (or given by absolute path). A binary is pinned by its real absolute path at install, like `bins`, and must be one no Claude worker can replace: root-owned all the way up (e.g. `sudo install -m 755 mail-mcp /usr/local/bin/`), so a plain Homebrew install in `/opt/homebrew` is refused. Fetch-runners (`npx`, `uvx`, `uv`, `bunx`, `pipx`, `docker`, `curl`, …), shells and interpreters or package managers (`node`, `deno`, `bun`, `python*`, `npm`, `pip`, `brew`, …) are refused: they would run code the pin doesn't cover. Since extensions are stdlib only, a Python server is a stdlib JSON-RPC loop (see `tests/fixtures/fake_mcp_server.py`).
+- **What the model sees.** Your manifest `description`, and the server's input schema stripped to validation keywords (types, properties, required, enums, bounds, patterns, local `$ref`), with every value type-checked and short (names at most 64 chars, enum/const/pattern/format strings at most 100); a schema that doesn't fit is refused at install. The install screen lists each tool's argument names. Every call's arguments are validated against that pinned schema (and capped at 64 KB) before they reach the server. The server's tool description, every `description`/`title`/`default`/`examples` inside the schema, and its annotations (`readOnlyHint`, …) never reach the model or the gate.
+- **Pins.** `ext add` starts each server once from the staged copy, with **no secrets** and a scratch `HOME`, reads its tool list (so the server's code runs before you confirm, as your user, like `ext add`'s own checks; only add sources you trust), and pins each listed tool as `sha256(name, description, input_schema, output_schema, annotations)`. The review screen lists every MCP server and every MCP tool with its pin under Escalations (and the server's unlisted tools as a note); install refuses if the server lists something else the second time. A server that needs a secret to list its tools can't be installed yet. At every start of the server, and every time it sends `notifications/tools/list_changed`, Resonant lists the tools again: a listed tool that is gone or whose pin changed is **disabled** (hidden from the model, refused on call), audited `ext.mcp_drift`, and you get one text: `<ext>: MCP tool <tool> changed since you approved it; disabled. resonant ext update <ext> to review`. `ext update` shows the old and new pins even when no file of yours changed (`MCP tools: changed`).
+- **Secrets.** The server is one long-running process, so it gets the **union of its tools' declared secrets**, once, on fd 4 (`RESONANT_SECRETS_FD=4`, read with `secret.py`), never in its environment or argv. A third-party binary that only reads a token from an environment variable is not supported over stdio. A secret declared only by your CLI tools never reaches the server.
+- **Environment and process.** The same scratch environment as CLI tools (no `RESONANT_EVENTS_FD`: MCP tools don't emit events), cwd your read-only copy, `HOME` your data dir. The server starts when the daemon starts (or on the first call after it ended) and runs in its own process group. `/kill` ends it and its children and no server starts again until `/resume`; on shutdown Resonant closes its stdin and then always ends the whole group, because MCP servers often leave children behind.
+- **Results.** Text content is joined into `{"text": …}` (images and other content are named, not passed), plus `structured` when the server returns `structuredContent`; then capped like CLI results (32 KB stored, 4 KB to the model, untrusted data) and redacted. One message over 256 KB ends the server. A call times out at its `timeout_s` and is cancelled on the server.
+- **Failures.** A protocol error, a server that won't start, a missing secret, or a disabled tool means nothing ran. A tool result with `isError`, a timeout, a kill or a server exit is a failure for a read and **maybe happened** for a write: a third-party server doesn't promise that a failed call changed nothing. Error texts are built by Resonant; the server's error text never reaches you. stderr is never logged raw: a redacted 200-character tail goes to the failure audit row.
+- Only tools: no MCP resources, prompts, sampling, roots or elicitation (server requests other than `ping` are refused).
 
 ## 5. Secrets
 
@@ -224,10 +248,10 @@ These run **only in the Mini's terminal**, never over iMessage.
 
 `ext add`:
 1. Copies the approved bytes into a staging dir. `repo:` reads the **HEAD commit** (`git archive`), so uncommitted edits are never installed. `path:` reads the tracked files from the git index, and refuses the directory if any tracked file there has uncommitted changes. Nothing else is a source.
-2. Validates the manifest and the directory: stdlib only, the argv[0] allowlist, no symlink that leaves the tree, the name rules and approver grants. MCP servers and critical jobs are refused for now.
-3. Shows a heading built by code, `my-ext repo:my-ext@a1b2c3d4 digest 9f3e01aa` (commit and content digest), then **escalations first** (secrets, approvers, tools and jobs that ask, commands that use `gh`/`git`), then every tool, job, report grant, notify event, linked repo and the health check. Every string from your manifest is shown sanitized.
+2. Validates the manifest and the directory: stdlib only, the argv[0] allowlist, MCP server commands, no symlink that leaves the tree, the name rules and approver grants. Critical jobs are refused for now. Then it starts each MCP server once (no secrets, a scratch home) and pins the tools you listed.
+3. Shows a heading built by code, `my-ext repo:my-ext@a1b2c3d4 digest 9f3e01aa` (commit and content digest), then **escalations first** (secrets, approvers, tools and jobs that ask, commands that use `gh`/`git`, each MCP server and each MCP tool with its pin), then every tool, job, report grant, notify event, linked repo and the health check. Every string from your manifest is shown sanitized.
 4. You confirm by typing the extension name.
-5. It stages the source **again** and refuses if the commit, digest or manifest changed since you confirmed. The copy goes to `~/.resonant/extensions/<name>/` (read-only), its digest is recomputed, and only then is the row written, with an `ext.install` audit row.
+5. It stages the source **again** and refuses if the commit, digest, manifest or MCP tool pins changed since you confirmed. The copy goes to `~/.resonant/extensions/<name>/` (read-only), its digest is recomputed, and only then is the row written, with an `ext.install` audit row.
 6. If the daemon is up, it restarts (reply-first path), and the owner gets `Back up …` and `Installed my-ext`.
 
 The digest is sha256 over the sorted `(path, file/executable/symlink, sha256(content))` of the tree. The daemon re-checks it at every load, so an edit to the installed copy disables the extension until you run `ext update`.
@@ -241,7 +265,8 @@ The digest is sha256 over the sorted `(path, file/executable/symlink, sha256(con
 ## 10. Checklist
 
 - [ ] `resonant ext validate` passes, and your CI validates with `resonant_sdk.load_manifest`.
-- [ ] Stdlib only: no dependency files; every command starts with a `.py` file in your dir, `python3 <script.py>`, `gh` or `git`.
+- [ ] Stdlib only: no dependency files; every command starts with a `.py` file in your dir, `python3 <script.py>`, `gh` or `git`; an MCP server is a `.py` in your dir or a root-owned binary.
+- [ ] Every MCP tool you want is listed with its real effect and a description written for the model.
 - [ ] A non-zero exit means nothing took effect; state goes to `$RESONANT_EXT_DATA`.
 - [ ] Every job declares its real effect; asking jobs (L1/L2) run at most hourly.
 - [ ] Every tool prints exactly one JSON object and exits 0 on success.
