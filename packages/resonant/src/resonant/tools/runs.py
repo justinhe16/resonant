@@ -20,6 +20,13 @@ at call time: the runner is built after the tools are registered) and return cod
 - ``list_runs{code?}``: L0, active runs first. Run codes (``R3``) are not approval codes: the
   model sees them, never an approval code. Free text from Claude (summary, failure) is
   cleaned and clipped.
+- ``run_activity{code?, repo?, minutes?}``: L0 (TR-1). What a run is doing now, from its
+  transcript's tail (``ClaudeRunner.run_activity``, ``runners/activity.py``): a code-built
+  ``headline``, the step, the last few commands (redacted at write time, cleaned and
+  clipped), the last text, the ``did:`` list with detected side effects, and seconds since
+  the last event. No ``code``: ``repo``'s latest run, else the only active run, else the most
+  recent (several active: "Which run? R4 dori, R6 trading."). ``/runs R4`` carries the same
+  ``activity`` on ``list_runs``. No model is involved.
 - ``cancel_run{code}``: L3.
 - ``merge_run{code}``: L2: ``/merge R3`` is explicit and runs. A model-chosen call follows
   the trust rules (``merge_level``, docs/employee-plan.md D4): it runs without asking when
@@ -72,6 +79,8 @@ TEXT_MAX = 120  # Claude's summary or a failure, as the model and the reply see 
 ASK_SHOWN = 60
 OWNER_TEXT_MAX = 2000  # an answer or message to a worker
 QUESTION_SHOWN = 120
+ACTIVITY_MINUTES_MAX = 24 * 60  # activity.WINDOW_MAX
+ACTIVITY_RECENT = 50  # runs searched for a repo's latest
 
 # Run codes: ``R`` and a number. ``R`` is not in the approval alphabet (``gate.codes``), so a run
 # code can't be mistaken for, or parsed as, an approval code (``yes R3`` is not a reply).
@@ -104,6 +113,8 @@ class RunnerApi(Protocol):
     async def merge_run(self, code: str) -> Merged | MergeQueued | Refused: ...
 
     def open_questions(self) -> list[OpenQuestion]: ...
+
+    def run_activity(self, code: str, minutes: int = ...) -> dict[str, Any] | None: ...
 
     def answer_question(
         self, code: str, text: str, *, question_id: int | None = None
@@ -158,6 +169,27 @@ LIST_RUNS = ToolSpec(
     args_schema={
         "type": "object",
         "properties": {"code": _code_schema()},
+        "additionalProperties": False,
+    },
+    effect=Effect.READ,
+    timeout_s=15.0,
+)
+RUN_ACTIVITY = ToolSpec(
+    name="run_activity",
+    description=(
+        "What a Claude run is doing right now, from its transcript: the current step, its "
+        "last few commands, its last words, side effects seen in its commands and how long "
+        "since it last did anything. For 'what's R4 doing', 'status on the trading run', "
+        "'is the dori worker stuck'. Give `code` (R4), or `repo` for that repo's latest run, "
+        "or neither for the only active run. Read only."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {
+            "code": _code_schema(),
+            "repo": {"type": "string", "maxLength": REPO_MAX},
+            "minutes": {"type": "integer", "minimum": 1, "maximum": ACTIVITY_MINUTES_MAX},
+        },
         "additionalProperties": False,
     },
     effect=Effect.READ,
@@ -232,7 +264,7 @@ MESSAGE_WORKER = ToolSpec(
 )
 
 SPECS: tuple[ToolSpec, ...] = (
-    START_RUN, LIST_RUNS, CANCEL_RUN, MERGE_RUN, ANSWER_WORKER, MESSAGE_WORKER,
+    START_RUN, LIST_RUNS, CANCEL_RUN, MERGE_RUN, ANSWER_WORKER, MESSAGE_WORKER, RUN_ACTIVITY,
 )  # fmt: skip
 
 
@@ -347,6 +379,27 @@ def run_json(run: Run, question: str | None = None) -> dict[str, Any]:
     }
 
 
+def pick_run(recent: list[Run], repo: str | None) -> Run | str:
+    """The run ``run_activity`` means without a code: ``repo``'s latest (active first), else
+    the only active run, else the most recent; or a sentence asking which."""
+    if repo is not None:
+        want = repo.lower().removesuffix(".git").rsplit("/", 1)[-1]
+        mine = [r for r in recent if r.repo and r.repo.lower().rsplit("/", 1)[-1] == want]
+        if not mine:
+            return f"No run on {_clip(repo, 40) or 'that repo'} lately."
+        active = [r for r in mine if r.active]
+        return (active or mine)[0]
+    if not recent:
+        return "No runs yet."
+    active = [r for r in recent if r.active]
+    if len(active) == 1:
+        return active[0]
+    if not active:
+        return recent[0]
+    named = ", ".join(f"{r.code} {r.repo or 'no repo'}" for r in active[:5])
+    return f"Which run? {named}."
+
+
 # --- handlers ----------------------------------------------------------------------------
 
 
@@ -417,11 +470,43 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             "truncated": code is None and total > RUNS_MAX,
             "code": code,
         }
+        if code is not None and shown:  # /runs R4: what it is doing too (TR-1)
+            out["activity"] = claude.run_activity(code)
         if not shown:
             out["setup"] = await claude.setup_missing()
         if limits := await claude.capability_notes():  # what workers can't do yet (RX-1)
             out["limits"] = limits
         return out
+
+    async def _run_activity(args: dict[str, Any]) -> dict[str, Any]:
+        unknown = set(args) - {"code", "repo", "minutes"}
+        if unknown:
+            raise ToolFailed(f"run_activity: unknown arguments: {sorted(unknown)}")
+        code = None
+        if args.get("code") is not None:
+            code = _code(args["code"])
+            if code is None:
+                raise ToolFailed("run_activity: code must be a run code like R3")
+        repo = args.get("repo")
+        if repo is not None and (not isinstance(repo, str) or len(repo) > REPO_MAX):
+            raise ToolFailed(f"run_activity: repo is a string (at most {REPO_MAX})")
+        minutes = args.get("minutes", 10)
+        if isinstance(minutes, bool) or not isinstance(minutes, int):
+            raise ToolFailed("run_activity: minutes is a whole number")
+        if not 1 <= minutes <= ACTIVITY_MINUTES_MAX:
+            raise ToolFailed(f"run_activity: minutes is 1 to {ACTIVITY_MINUTES_MAX}")
+        claude = runner()
+        if claude is None:
+            return {"found": False, "text": missing()}
+        if code is None:
+            picked = pick_run(claude.list_runs(ACTIVITY_RECENT), (repo or "").strip() or None)
+            if isinstance(picked, str):
+                return {"found": False, "text": picked}
+            code = picked.code
+        found = claude.run_activity(code, minutes)
+        if found is None:
+            return {"found": False, "code": code, "text": f"No run {code}."}
+        return {"found": True, **found}
 
     async def _cancel_run(args: dict[str, Any]) -> dict[str, Any]:
         code = _need_code("cancel_run", args)
@@ -506,6 +591,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         MESSAGE_WORKER.name: _message_worker,
         START_RUN.name: _start_run,
         LIST_RUNS.name: _list_runs,
+        RUN_ACTIVITY.name: _run_activity,
         CANCEL_RUN.name: _cancel_run,
         MERGE_RUN.name: _merge_run,
     }

@@ -99,6 +99,18 @@ class FakeRunner:
         self.calls.append(("answer", code, text))
         return Relayed(code, f"\u2192 {code}")
 
+    def run_activity(self, code: str, minutes: int = 10) -> dict[str, Any] | None:
+        self.calls.append(("activity", code, minutes))
+        run = self.get_run(code)
+        if run is None:
+            return None
+        return {
+            "code": run.code, "repo": run.repo, "status": run.status, "step": "running $ pytest",
+            "headline": f"{run.code} {run.repo}: running $ pytest", "window_min": minutes,
+            "calls": ["$ pytest"], "calls_in_window": 3, "last_text": None, "quiet_s": 5,
+            "did": ["pushed to main (detected)"], "last_note": None,
+        }  # fmt: skip
+
     def deliver_message(self, code: str, text: str) -> Relayed | Refused:
         self.calls.append(("message", code, text))
         if self.get_run(code) is None:
@@ -670,6 +682,7 @@ def test_run_project_toolset(components: Components) -> None:
         "merge_ci_pr",
         "merge_run",
         "message_worker",
+        "run_activity",
         "start_run",
     )
     owner = toolset_for(

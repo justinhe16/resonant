@@ -139,7 +139,16 @@ _ADDRESSED = (
 # Run control: "R4 cancel" routes normally (/runs, /cancel, merge), never as an answer or a
 # message; and a short free-text reply that starts like this is never taken as an answer.
 _CONTROL = re.compile(
-    r"(?:cancel|stop|kill|abort|merge|status|progress|how'?s|how is|how are)\b", re.IGNORECASE
+    r"(?:cancel|stop|kill|abort|merge|status|progress|how'?s|how is|how are|doing|up to|"
+    r"activity)\b",
+    re.IGNORECASE,
+)
+# A question about a run's state ("what's R4 doing", "is the dori run stuck"): never an
+# answer to a worker's question, whatever the brain thinks (TR-1: run_activity takes it).
+_STATUS_Q = re.compile(
+    r"\b(?:what'?s|what is|whats)\b.*\b(?:doing|up to|happening|going on)\b"
+    r"|\bstatus (?:on|of)\b|\bis\b.*\b(?:stuck|still running|still going)\b",
+    re.IGNORECASE,
 )
 _RUN_CODE_IN = re.compile(r"(?<![A-Za-z0-9])R[0-9]{1,9}(?![A-Za-z0-9])", re.IGNORECASE)
 # What only makes sense as the answer to a question: refused when the run has none open.
@@ -424,6 +433,8 @@ class Relay:
         now = self.clock()
         short = _words(text) <= SHORT_WORDS
         # Run control or another run's code: never an answer by the short-reply bias.
+        if _STATUS_Q.search(normalize(text)):
+            return None  # a status question, for run_activity
         commandish = bool(_CONTROL.match(normalize(text)) or _RUN_CODE_IN.search(text))
         says_new = pick is not None and pick[0] == NONE and pick[1] >= LIKELY
         if len(opens) == 1:

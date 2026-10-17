@@ -78,7 +78,7 @@ _FEW_SHOTS: tuple[tuple[str, IntentLabel, float], ...] = (
     ("fix the flaky test in dori and open a PR", "run_project", 0.9),
     ("add the acme/site repo as site", "run_project", 0.85),
     ("what runs are going", "run_project", 0.85),
-    ("how's R3 going", "run_project", 0.85),
+    ("what's R4 doing", "run_project", 0.85),
     ("merge R3", "run_project", 0.85),
     ("go with option b", "run_project", 0.85),
     ("for the dori one, use sqlite", "run_project", 0.85),
@@ -218,7 +218,9 @@ _INTENT_RULES: dict[IntentLabel, str] = {
         "(like R3) from the message or the earlier replies; if you can't tell which run, call "
         "list_runs first. Call merge_run only when the owner asks to merge. When the owner "
         "answers a run's question (list_runs shows it), call answer_worker with that run's code "
-        "and the owner's words; \"tell R4 to ...\" is message_worker. If you can't tell which "
+        'and the owner\'s words; "tell R4 to ..." is message_worker. "what\'s R4 doing", '
+        '"status on the trading run" and "is the dori worker stuck" are run_activity '
+        '(code=R4, or repo=trading); "what runs are going" is list_runs. If you can\'t tell which '
         'run is meant, ask, naming the runs. Repos: "what repos do you know" is list_repos; '
         '"add my trading repo" is add_repo(repo=trading); "forget the old-site repo" is '
         'forget_repo; "make a new repo called scratch" is create_repo(name=scratch), private '

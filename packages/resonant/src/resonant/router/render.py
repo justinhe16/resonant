@@ -252,6 +252,57 @@ def _run_line(run: dict[str, Any]) -> str:
     return f'{line}\n  "{ask}"' if isinstance(ask, str) and ask else line
 
 
+def _activity_lines(a: dict[str, Any]) -> list[str]:
+    """The body of a run's activity (``run_activity``, ``/runs R4``), code-built around
+    parts the tool already cleaned and clipped."""
+    lines: list[str] = []
+    window = a.get("window_min")
+    n = a.get("calls_in_window")
+    quiet = a.get("quiet_s")
+    pace: list[str] = []
+    if isinstance(n, int) and isinstance(window, int):
+        pace.append(f"{n} tool calls in the last {window}m")
+    if isinstance(quiet, (int, float)):
+        pace.append(f"last event {_ago(float(quiet))} ago")
+    if pace:
+        lines.append("; ".join(pace))
+    calls = [str(c) for c in as_list(a.get("calls")) if isinstance(c, str) and c]
+    if calls:
+        lines.append("Recent:")
+        lines += [f"- {c}" for c in calls]
+    text = a.get("last_text")
+    if isinstance(text, str) and text:
+        lines.append(f'Said: "{text}"')
+    did = [str(x) for x in as_list(a.get("did")) if isinstance(x, str) and x]
+    if did:
+        lines.append(
+            "Did: " + "; ".join(did[:6]) + (f" +{len(did) - 6} more" if len(did) > 6 else "")
+        )
+    return lines
+
+
+def _ago(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    return f"{s // 3600}h {s % 3600 // 60}m"
+
+
+def render_activity(d: dict[str, Any]) -> str:
+    """``run_activity``: the headline, then the pace, recent calls, last words and side
+    effects. A run that wasn't found or picked says why (``text``)."""
+    if d.get("found") is not True:
+        text = d.get("text")
+        return text if isinstance(text, str) and text else "No such run."
+    head = d.get("headline")
+    first = (
+        head if isinstance(head, str) and head else f"{d.get('code', '?')}: {d.get('step', '?')}"
+    )
+    return "\n".join([first, *_activity_lines(d)])
+
+
 def render_runs(d: dict[str, Any]) -> str:
     """``/runs``: one line per run (active first), or one run in full (``/runs R3``). With no
     runs it says so, or why the runner can't start any. What workers can't do yet (RX-1's
@@ -273,6 +324,13 @@ def render_runs(d: dict[str, Any]) -> str:
         for key in ("summary", "failure"):
             if run.get(key):
                 lines.append(f"{key}: {run[key]}")
+        act = as_dict(d.get("activity"))
+        if act:  # TR-1: what it is doing, for an active run; side effects for any
+            if run.get("status") in ("queued", "running", "waiting") and act.get("step"):
+                lines.append(f"Now: {act['step']}")
+                lines += _activity_lines(act)
+            elif did := [str(x) for x in as_list(act.get("did")) if isinstance(x, str) and x]:
+                lines.append("Did: " + "; ".join(did[:6]))
         return "\n".join(lines)
     n_active = sum(1 for r in runs if r.get("status") in ("queued", "running", "waiting"))
     lines = [f"Runs ({n_active} active):", *(_run_line(r) for r in runs)]

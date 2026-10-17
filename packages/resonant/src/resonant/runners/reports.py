@@ -43,6 +43,16 @@ what fits (``DID_IN_TITLE``, ``+N more``) and a texted end reply adds a ``Did: �
 ``did:`` note is still a note: it is the line's latest note and, with ``--urgent``, texted
 within the per-run cap like any other; past the cap it still reaches the digest.
 
+Detected side effects (TR-1). The runner also reads the worker's own tool calls as they
+stream (``runners/side_effects.py``) and keeps the outside actions it finds in kv
+``run.seen:<code>`` (``record_detected``: the last ``DETECTED_KEEP``, one per ``what``). They
+join the ``did:`` list after the worker's own items, marked ``(detected)``, unless a ``did:``
+item already names them (``side_effects.reported``): ``did: merged PR #2 with gh; pushed to
+main (detected)``. A high-impact one (a push to the base branch, a publish, a delete) is the
+``side_effect`` event, matched with its kind as the action (``push``, ``publish``, ``repo``,
+…): now by default, texted ``R4 detected: force-pushed to main`` within the same per-run cap
+as urgent notes; a ``notify_digest`` rule lowers it. The rest are digest only.
+
 Ordering, for exactly once: the item is written untold first, then a ``now`` text goes out
 (deduped by the channel on ``run:<code>:<status>``), then the item is marked told. A crash
 between the send and the mark reruns the conclusion: the channel drops the repeat and the mark
@@ -66,6 +76,8 @@ from typing import Literal, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from resonant.extensions.notify import clean_text
+from resonant.gate.codes import clean_external
+from resonant.runners.side_effects import Kind, SideEffect, reported
 from resonant.store import pulse as pulse_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, kv_set
@@ -87,6 +99,9 @@ NOTE_IN_TITLE = 80  # the running line stays under the store's 200-character tit
 SCRATCH_SYSTEM = "scratch"
 _REPORT_KEY = "run.report:"  # kv: a run's report preference, set at start
 _DID_KEY = "run.did:"  # kv: a run's side effects, oldest first
+_SEEN_KEY = "run.seen:"  # kv: side effects detected in a run's commands (TR-1), oldest first
+DETECTED_KEEP = 20
+DETECTED_MARK = " (detected)"
 DID_PREFIX = "did:"
 DID_KEEP = 20
 DID_ITEM_MAX = 80
@@ -146,6 +161,55 @@ def did_list(conn: sqlite3.Connection, code: str) -> list[str]:
     if not isinstance(value, list):
         return []
     return [v for v in cast(list[object], value) if isinstance(v, str)]
+
+
+def record_detected(conn: sqlite3.Connection, code: str, effect: SideEffect) -> bool:
+    """Add a side effect detected in run ``code``'s commands (TR-1). False when the run
+    already has it (same ``what``): a command run twice is listed once. Kept to the last
+    ``DETECTED_KEEP``. ``what`` is code-built by ``side_effects`` and cleaned again here."""
+    what = clean_external(effect.what)[:DID_ITEM_MAX]
+    if not what:
+        return False
+    with atomic(conn):
+        seen = _seen(conn, code)
+        if any(s.get("what") == what for s in seen):
+            return False
+        entry: dict[str, object] = {"what": what, "kind": effect.kind, "high": effect.high,
+                                    "keys": list(effect.keys)}  # fmt: skip
+        kv_set(conn, _SEEN_KEY + code, [*seen, entry][-DETECTED_KEEP:])
+    return True
+
+
+def _seen(conn: sqlite3.Connection, code: str) -> list[dict[str, object]]:
+    value: object = kv_get(conn, _SEEN_KEY + code)
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, object]] = []
+    for v in cast(list[object], value):
+        if isinstance(v, dict) and isinstance(cast(dict[str, object], v).get("what"), str):
+            out.append(cast(dict[str, object], v))
+    return out
+
+
+def detected_list(conn: sqlite3.Connection, code: str) -> list[SideEffect]:
+    """The side effects detected in run ``code``'s commands, oldest first."""
+    out: list[SideEffect] = []
+    for s in _seen(conn, code):
+        keys = s.get("keys")
+        out.append(SideEffect(
+            cast(Kind, str(s.get("kind") or "http")), str(s["what"]), s.get("high") is True,
+            tuple(str(k) for k in cast(list[object], keys)) if isinstance(keys, list) else (),
+        ))  # fmt: skip
+    return out
+
+
+def shown_did(conn: sqlite3.Connection, code: str) -> list[str]:
+    """What the run's ``did:`` line lists: the worker's ``did:`` notes and Resonant's own
+    records, then each detected side effect they don't already name, marked
+    ``(detected)``."""
+    did = did_list(conn, code)
+    seen = [f"{e.what}{DETECTED_MARK}" for e in detected_list(conn, code) if not reported(e, did)]
+    return [*did, *seen]
 
 
 def did_part(items: list[str], limit: int = DID_IN_TITLE) -> str:
@@ -258,12 +322,14 @@ class WorkerReports:
     def report_pref(self, code: str) -> Report:
         return "now" if kv_get(self.conn, _REPORT_KEY + code) == "now" else "digest"
 
-    def level(self, run: Run, event: str) -> Level:
+    def level(self, run: Run, event: str, action: str | None = None) -> Level:
         """How soon the owner hears ``event`` of ``run`` (see the module docstring). A
-        ``restart``/``update`` is matched with system ``resonant`` (what it acted on)."""
+        ``restart``/``update`` is matched with system ``resonant`` (what it acted on). A
+        detected ``side_effect`` passes its kind as ``action`` (``push``, ``publish``, …)."""
         if event in ("pr", "done", "merged") and self.report_pref(run.code) == "now":
             return "now"
-        action = "done" if event in ("pr", "done") else "note" if event == "urgent" else event
+        if action is None:
+            action = "done" if event in ("pr", "done") else "note" if event == "urgent" else event
         system = SELF_SYSTEM if event in SELF_EVENTS else run.repo or SCRATCH_SYSTEM
         default: Level = "now" if event in URGENT_EVENTS else "digest"
         try:
@@ -291,7 +357,7 @@ class WorkerReports:
         labels = {"waiting": "waiting for usage reset", "question": "waiting for your answer"}
         what = labels.get(bucket, "still running")
         title = f"{run.code} {what} · {_part(run.repo, 60) or 'no repo'} · started {at}"
-        did = did_list(self.conn, run.code)
+        did = shown_did(self.conn, run.code)
         shows_note = bucket != "question" and not (did and did_of(run.last_note or ""))
         note = _part(run.last_note, NOTE_IN_TITLE) if shows_note else ""  # a did: note: below
         if note:
@@ -310,7 +376,7 @@ class WorkerReports:
         """The run's last word, untold: the next digest says it once, unless :meth:`told`
         marks it heard first. A rerun with the same outcome keeps what was told."""
         state = {"status": run.status, "pr": run.pr_number}
-        title = _with_did(title, did_list(self.conn, run.code))
+        title = _with_did(title, shown_did(self.conn, run.code))
         now = self.clock()
         with atomic(self.conn):
             _change, item = pulse_store.upsert(
@@ -338,22 +404,34 @@ class WorkerReports:
         """``R4 note: …`` for an urgent note texted now, or None when the run already had
         ``NOTE_TEXTS_PER_HOUR`` this hour (the digest line still shows the latest)."""
         note = _part(run.last_note, 300)
-        if not note:
+        if not note or not self._take_text(run.code):
             return None
+        return f"{run.code} note: {note}"
+
+    def detected_text(self, run: Run, what: str) -> str | None:
+        """``R4 detected: force-pushed to main``: a high-impact side effect read from the
+        worker's commands (TR-1), texted now; None past the per-run cap it shares with urgent
+        notes (the digest line still lists it)."""
+        if not self._take_text(run.code):
+            return None
+        return f"{run.code} detected: {_part(what)}"
+
+    def _take_text(self, code: str) -> bool:
+        """One of the run's ``NOTE_TEXTS_PER_HOUR`` immediate texts, or False (audited)."""
         now = self.clock()
-        sent = self._note_texts.setdefault(run.code, deque())
+        sent = self._note_texts.setdefault(code, deque())
         while sent and now - sent[0] >= timedelta(hours=1):
             sent.popleft()
         if len(sent) >= NOTE_TEXTS_PER_HOUR:
             with atomic(self.conn):
-                audit(self.conn, "run.note_held", run=run.code, reason="capped")
-            return None
+                audit(self.conn, "run.note_held", run=code, reason="capped")
+            return False
         sent.append(now)
-        return f"{run.code} note: {note}"
+        return True
 
     def did_line(self, run: Run) -> str | None:
         """``Did: …`` for a texted end reply, or None when the run took no side effects."""
-        part = did_part(did_list(self.conn, run.code), DID_IN_TEXT)
+        part = did_part(shown_did(self.conn, run.code), DID_IN_TEXT)
         return "Did" + part[len("did") :] if part else None
 
     def self_op_text(self, run: Run, what: str) -> str:
@@ -370,10 +448,13 @@ class WorkerReports:
 
 
 __all__ = [
+    "DETECTED_KEEP",
+    "DETECTED_MARK",
     "DID_KEEP",
     "DID_PREFIX",
     "NOTE_TEXTS_PER_HOUR",
     "WorkerReports",
+    "detected_list",
     "did_list",
     "did_of",
     "did_part",
@@ -381,5 +462,7 @@ __all__ = [
     "end_title",
     "is_worker_item",
     "item_key",
+    "record_detected",
     "record_did",
+    "shown_did",
 ]

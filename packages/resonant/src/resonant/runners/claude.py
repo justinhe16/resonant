@@ -131,9 +131,18 @@ from resonant.runner.workspace import (
     upstream_merges,
     write_session_credentials,
 )
-from resonant.runners import reaper, worker_cli
+from resonant.runners import activity, reaper, worker_cli
 from resonant.runners.reaper import MARKER_ENV, Target
-from resonant.runners.reports import Report, WorkerReports, deps_line, end_event, end_title
+from resonant.runners.reports import (
+    Report,
+    WorkerReports,
+    deps_line,
+    end_event,
+    end_title,
+    record_detected,
+    shown_did,
+)
+from resonant.runners.side_effects import RunContext, SideEffect, detect
 from resonant.runners.worker_cli import Check, WorkerServer
 from resonant.runners.worker_desk import (
     BLOCK_S,
@@ -633,21 +642,23 @@ class StreamState:
     result: dict[str, Any] | None = None
     lines: int = 0
 
-    def feed(self, raw: bytes) -> None:
+    def feed(self, raw: bytes) -> dict[str, Any] | None:
+        """Keep what the runner needs from one line; the parsed message, or None."""
         self.lines += 1
         if not raw.startswith(b"{"):
-            return
+            return None
         try:
             obj: Any = json.loads(raw)
         except ValueError:
-            return
+            return None
         if not isinstance(obj, dict):
-            return
+            return None
         msg: dict[str, Any] = obj  # pyright: ignore[reportUnknownVariableType]
         if msg.get("type") == "system" and isinstance(msg.get("session_id"), str):
             self.session_id = msg["session_id"]
         elif msg.get("type") == "result":
             self.result = msg
+        return msg
 
 
 @dataclass(frozen=True)
@@ -1277,6 +1288,52 @@ class ClaudeRunner:
         """Active runs first, then the most recent."""
         return runs.recent(self.conn, limit)
 
+    def run_activity(self, code: str, minutes: int = activity.WINDOW_MIN) -> dict[str, Any] | None:
+        """What run ``code`` is doing, from its transcript's tail (TR-1, ``run_activity``):
+        a code-built ``headline``, the current ``step``, the last few tool ``calls``, its
+        ``last_text``, ``detected``/``did`` side effects and seconds since its last event.
+        Deterministic (no model); None for an unknown run. Reads at most
+        ``activity.TAIL_BYTES`` of the file."""
+        run = runs.get(self.conn, code)
+        if run is None:
+            return None
+        minutes = min(max(int(minutes), 1), activity.WINDOW_MAX)
+        path = self.transcript_dir / f"{run.code}.jsonl"
+        now = self.clock()
+        events = activity.read_tail(path)
+        act = (
+            activity.summarize(
+                events, now=now, window_min=minutes, quiet_s=activity.quiet_for(path, now)
+            )
+            if events
+            else None
+        )
+        step = act.step if act is not None else "no transcript yet"
+        if run.status == "queued":
+            step = "queued, not started"
+        elif run.status == "waiting" and run.wait_reason == "question":
+            step = "waiting for your answer"
+        elif run.status == "waiting":
+            step = "waiting for the usage limit to reset"
+        elif not run.active:
+            step = f"ended ({run.status})"
+        did = shown_did(self.conn, run.code)
+        return {
+            "code": run.code,
+            "repo": run.repo or None,
+            "status": run.status,
+            "elapsed_s": round(run.session_seconds),
+            "headline": activity.headline(run.code, run.repo or None, step, act, minutes),
+            "step": step,
+            "window_min": minutes,
+            "calls": list(act.calls) if act is not None else [],
+            "calls_in_window": act.calls_in_window if act is not None else None,
+            "last_text": act.last_text if act is not None else None,
+            "quiet_s": round(act.quiet_s) if act is not None and act.quiet_s is not None else None,
+            "did": did,
+            "last_note": activity.clip(run.last_note, 120) if run.last_note else None,
+        }
+
     async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused:
         """End an active run: its processes, its dir, its task. Never publishes."""
         run = runs.get(self.conn, code)
@@ -1532,6 +1589,57 @@ class ClaudeRunner:
                                     dedupe_key=key)  # fmt: skip
         except ChannelError as e:  # the digest line still carries it
             log.warning("self op not texted", extra={"run": run.code, "reason": str(e)})
+            return
+        self.reports.told(item)
+
+    # -- side effects read from the session's commands (TR-1) --
+
+    def _side_effect_context(self, run: Run) -> RunContext:
+        found = repo_store.find(self.conn, run.repo) if run.repo else None
+        repo = found.slug if found is not None else (run.repo or None)
+        return RunContext(repo=repo, base=run.base_branch, branch=run.branch)
+
+    def _detect(self, run: Run, msg: dict[str, Any], ctx: RunContext) -> None:
+        """Record the outside actions in one assistant message's tool calls on the run's
+        ``did:`` list (``reports.record_detected``); a high-impact one is texted per the trust
+        rules. Never raises: the stream must keep flowing."""
+        try:
+            found = detect(msg, ctx)
+        except Exception:
+            log.exception("side effect detection failed", extra={"run": run.code})
+            return
+        for effect in found:
+            try:
+                new = record_detected(self.conn, run.code, effect)
+            except Exception:
+                log.exception("side effect not recorded", extra={"run": run.code})
+                continue
+            if not new:
+                continue
+            with contextlib.suppress(Exception), atomic(self.conn):
+                audit(self.conn, "run.side_effect", run=run.code, kind=effect.kind,
+                      high=effect.high)  # fmt: skip
+            self._spawn(self._on_detected(run.code, effect))
+
+    async def _on_detected(self, code: str, effect: SideEffect) -> None:
+        """A new detected side effect: the run's digest line is news again; a high-impact one
+        (base push, publish, delete) is also texted now unless a ``notify_digest`` rule on its
+        kind holds it, or the run already used its immediate texts this hour."""
+        run = runs.get(self.conn, code)
+        if run is None or run.status != "running":
+            return
+        item = self.reports.running(run, _bucket(run.session_seconds))
+        if not effect.high:
+            return
+        level = self.reports.level(run, "side_effect", effect.kind)
+        self.reports.audit_report(run, "side_effect", level)
+        if level != "now" or (text := self.reports.detected_text(run, effect.what)) is None:
+            return
+        key = f"run:{run.code}:seen:{uuid.uuid4().hex}"
+        try:
+            await self.channel.send(run.principal, text, dedupe_key=key)
+        except ChannelError as e:  # the digest line still lists it
+            log.warning("side effect not texted", extra={"run": run.code, "reason": str(e)})
             return
         self.reports.told(item)
 
@@ -2070,10 +2178,12 @@ class ClaudeRunner:
         async def pump_out() -> None:
             assert proc.stdout
             counted = False
+            seen = self._side_effect_context(run)
             async for raw, truncated in read_lines(proc.stdout):
                 writer.write(raw, truncated)
-                if not truncated:
-                    state.feed(raw)
+                msg = state.feed(raw) if not truncated else None
+                if msg is not None and msg.get("type") == "assistant":
+                    self._detect(run, msg, seen)
                 if state.session_id and not counted:
                     # Only a session Claude has written can be resumed.
                     counted = True

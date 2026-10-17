@@ -104,6 +104,7 @@ INTENT_TOOLS: dict[BuiltinIntent, tuple[str, ...]] = {
         "merge_ci_pr",
         "merge_run",
         "message_worker",
+        "run_activity",
         "start_run",
     ),
     "rules": ("add_trust_rule", "allow_trust_rule", "list_trust_rules", "remove_trust_rule"),

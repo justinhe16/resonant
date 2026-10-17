@@ -23,7 +23,9 @@
 
 ``notify_level(rules, system, action, event)`` -> ``NotifyDecision("now" | "digest", ...)``.
 Defaults: ``failed``, ``question``, ``check``, ``urgent`` and a worker's ``restart`` and
-``update`` of Resonant (GD-1) are texted right away; the rest (``done``, ``pr``, ``merged``,
+``update`` of Resonant (GD-1) and a high-impact ``side_effect`` read from a worker's
+commands (TR-1: a base-branch push, a publish, a delete; the action is its kind) are texted
+right away; the rest (``done``, ``pr``, ``merged``,
 ``note``) wait for the digest. ``notify_now``/``notify_digest``
 rules change it, matched by scope as above and by action against the event (2), then the
 action (1), then ``*`` (0); at equal specificity ``notify_now`` wins. A ``question`` or
@@ -48,7 +50,7 @@ Level = Literal["now", "digest"]
 
 # Events a worker can report (D5). Unknown events default to the digest.
 URGENT_EVENTS: frozenset[str] = frozenset(
-    {"failed", "question", "check", "urgent", "restart", "update"}
+    {"failed", "question", "check", "urgent", "restart", "update", "side_effect"}
 )
 # Blocking events: a rule never lowers them to the digest.
 BLOCKING_EVENTS: frozenset[str] = frozenset({"question", "check"})

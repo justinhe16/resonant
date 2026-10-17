@@ -102,7 +102,7 @@
     },
     {
       "role": "user",
-      "content": "<message>how's R3 going</message>"
+      "content": "<message>what's R4 doing</message>"
     },
     {
       "role": "assistant",

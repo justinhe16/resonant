@@ -58,6 +58,7 @@ NAMES = {
     "merge_run",
     "answer_worker",
     "message_worker",
+    "run_activity",
     "create_repo",
     "add_ci",
     "merge_ci_pr",

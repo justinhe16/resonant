@@ -568,3 +568,14 @@ async def test_an_option_that_is_a_control_word_is_still_an_answer(
     assert await r.free("cancel R4") is None  # a control verb vetoes a confident pick
     r.workers.ask("R6", "Ship it?")
     assert await r.free("stop the docs run") is None
+
+
+async def test_a_status_question_is_never_an_answer(rig: Callable[..., Rig]) -> None:
+    """TR-1: "what's R4 doing" goes to run_activity, even when the brain picks R4."""
+    r = rig(("R4", 0.99))
+    r.workers.ask("R4", "Which DB?")
+    assert await r.free("what's R4 doing") is None
+    assert await r.free("status on the trading run") is None
+    assert await r.free("is the dori worker stuck?") is None
+    assert r.direct("R4 doing anything?") is None
+    assert r.workers.answers == []
