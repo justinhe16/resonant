@@ -24,7 +24,8 @@ For each ``enabled`` row (``store.extensions``), in name order:
    ``.py`` under the daemon's interpreter), an http server is reached at its manifest
    ``url`` (``extensions/mcp_http.py``) with its bearer secret. Every listed tool must have
    its install-time pin in ``record.mcp_pins``, and its args schema is the pinned, stripped
-   one.
+   one. A version-1 pin (before GT-1) is matched by its stored input schema on the server's
+   first start and re-pinned at version 2 in the row, audited ``ext.mcp_pin_migrated`` once.
 
 Any refusal in 2-4 skips the whole extension (nothing half-registered), is audited
 ``ext.load_refused`` and is kept in ``refused`` for health. The status is left
@@ -57,7 +58,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import yaml
 from pydantic import ValidationError
@@ -69,6 +70,7 @@ from resonant.extensions import pin
 from resonant.extensions.checks import ALLOWED_COMMANDS, bin_env, bin_key, dir_errors, mcp_key
 from resonant.extensions.handlers import ExtensionHandler
 from resonant.extensions.mcp import (
+    PIN_VERSION,
     HttpTarget,
     McpServerRuntime,
     McpToolHandler,
@@ -350,6 +352,7 @@ class ExtensionHost:
                 except ValueError as e:
                     raise LoadRefused(f"mcp server {sid}: {e}") from None
             approved: dict[str, str] = {}
+            legacy: dict[str, dict[str, Any]] = {}
             for tool in server.tools:
                 pin = pins.get(tool.name)
                 if pin is None or pin.server != sid:
@@ -358,6 +361,8 @@ class ExtensionHost:
                     )
                 approved[tool.name] = pin.pin
                 schemas[tool.name] = pin.input_schema
+                if pin.version != PIN_VERSION:
+                    legacy[tool.name] = pin.input_schema
             name = record.name
             runtimes[sid] = McpServerRuntime(
                 ext=name,
@@ -372,6 +377,8 @@ class ExtensionHost:
                 tracker=self.tracker,
                 secrets=lambda: self.secrets,
                 on_drift=lambda sid, tool, live, rec=record: self._drift(rec, sid, tool, live),
+                legacy=legacy,
+                on_migrate=lambda sid, tool, new, rec=record: self._migrate(rec, sid, tool, new),
                 message_cap=self.message_cap if http is None else HTTP_MESSAGE_CAP,
                 http=http,
             )
@@ -404,6 +411,39 @@ class ExtensionHost:
             task = asyncio.ensure_future(self.alert())
             self._side.add(task)
             task.add_done_callback(self._side.discard)
+
+    def _migrate(self, record: store.ExtensionRecord, sid: str, tool: str, pin: str) -> None:
+        """A version-1 MCP pin still matched by schema: save its version-2 pin and audit it
+        once (the next start finds version 2 and says nothing)."""
+        old = _approved_pin(record, tool)
+        if old is None:
+            return
+        with atomic(self.conn):
+            saved = store.set_mcp_pin(
+                self.conn,
+                record.name,
+                tool,
+                installed_at=record.installed_at,
+                old_pin=old,
+                pin=pin,
+                version=PIN_VERSION,
+            )
+            if saved:
+                audit(
+                    self.conn,
+                    "ext.mcp_pin_migrated",
+                    extension=record.name,
+                    server=sid,
+                    tool=tool,
+                    old_pin=old,
+                    new_pin=pin,
+                    version=PIN_VERSION,
+                )
+        if saved:
+            log.info(
+                "mcp pin migrated",
+                extra={"extension": record.name, "tool": tool, "version": PIN_VERSION},
+            )
 
     async def start_mcp(self) -> None:
         """Start every loaded MCP server once and check its pins (drift alerts come early).

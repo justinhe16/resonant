@@ -177,6 +177,21 @@ class MergeRefused(RunnerError):
     pass
 
 
+class CiPending(MergeRefused):
+    """The PR's checks passed and CI is still running (or, for an owner's merge in a repo
+    that has CI, hasn't reported yet): not merged now. An owner's ``/merge`` waits for it
+    (``ClaudeRunner.merge_run``); anything else treats it as a refusal."""
+
+
+@dataclass(frozen=True)
+class MergeDone:
+    """A merged PR: its check result (the flagged paths and dependency files the reply
+    lists) and whether it went in without CI (an owner's merge in a repo with none)."""
+
+    checks: CheckResult
+    no_ci: bool = False
+
+
 def upstream_merges(slug: str) -> str:
     """Why a fork-mode repo's PR is never merged by Resonant (docs/repos-plan.md D3)."""
     return f"{slug} is upstream; its maintainers merge."
@@ -1688,21 +1703,32 @@ class Workspace:
         *,
         branch: str,
         allow_flagged: bool = True,
+        allow_no_ci: bool = False,
         starter_ci: bool = False,
-    ) -> CheckResult:
+    ) -> MergeDone:
         """Squash-merge a PR whose CI is green, only if its head is still ``head_sha``.
 
         The only merge path, and it checks first: the PR's head is fetched into the mirror
         and put through ``check_pr`` (tokens in the history, objects, paths and the PR text;
         sensitive paths; ``.github`` changes refused unless the repo allows them), then CI,
-        then ``--match-head-commit``. Returns the check result (its flagged paths are what
-        the merge reply lists). Raises ``MergeRefused``.
+        then ``--match-head-commit``. Returns a ``MergeDone`` (the check result's flagged
+        paths and dependency files are what the merge reply lists). Raises ``MergeRefused``:
+        ``CiPending`` when only CI stands in the way (still running), so an owner's merge can
+        wait for it; red or unreadable CI is a plain refusal.
+
+        ``allow_no_ci``: the owner asked for this merge (``merge_run``: ``/merge`` or a chat
+        call the owner allowed). A repo with no CI at all (no ``pull_request`` workflow, looked
+        at again first) then merges anyway, ``no_ci`` set so the reply warns; and a PR with no
+        checks reported yet in a repo that has CI is ``CiPending`` (they register a moment
+        after the push). Without it (the auto-merge) a repo with no CI, or a PR with no checks,
+        is refused.
 
         ``starter_ci``: the add-CI PR (``merge_ci_pr``), stricter, not looser: the branch must
         be an add-CI branch and the PR's whole diff the hash-checked starter workflow
         (``adds_only_starter_ci``), whether or not the repo has CI. The checks then allow
-        ``.github/`` (whatever ``allow_github_changes`` says) but nothing may be flagged
-        except that one file, so a branch that also touched anything else is refused."""
+        ``.github/`` (whatever ``allow_github_changes`` says) but the net diff must be that one
+        file and nothing else may be flagged, so a branch that also touched anything else is
+        refused."""
         from resonant.runner.create import CI_BRANCH_PREFIX, CI_PATH
 
         repo = self._repo(repo_name)
@@ -1717,15 +1743,19 @@ class Workspace:
             or not await self._is_starter_ci_pr(repo, pr_number, head_sha, secrets)
         ):
             raise MergeRefused(f"PR #{pr_number} isn't only the starter CI")
+        no_ci = False
         if (
             not starter_ci
             and repo.ci is False
             and not await self._recheck_ci(repo, secrets)
             and not await self._is_starter_ci_pr(repo, pr_number, head_sha, secrets)
         ):
-            raise MergeRefused(
-                f"{repo.slug} has no CI; add a pull_request workflow first (or ask me to add CI)."
-            )
+            if not allow_no_ci:
+                raise MergeRefused(
+                    f"{repo.slug} has no CI; add a pull_request workflow first "
+                    "(or ask me to add CI)."
+                )
+            no_ci = True
         try:
             result = await self.check_pr(
                 repo_name, pr_number, branch, secrets, expect_head=head_sha,
@@ -1735,14 +1765,20 @@ class Workspace:
             raise MergeRefused(f"the checks refuse it: {e}") from None
         except GitError as e:
             raise MergeRefused(f"checking the PR failed: {e.message[-120:]}") from None
-        if starter_ci and set(result.flagged) - {CI_PATH}:
+        if starter_ci and (set(result.flagged) - {CI_PATH} or result.files != 1):
             raise MergeRefused(f"PR #{pr_number} isn't only the starter CI")
         if result.flagged and not allow_flagged:  # an auto-merge: flagged paths wait for /merge
             raise MergeRefused(f"it changes {', '.join(result.flagged)}")
         number = str(pr_number)
         match await self.ci_state(repo_name, pr_number, secrets):
             case "pending":
-                raise MergeRefused("CI is still running")
+                raise CiPending("CI is still running")
+            case "none" if no_ci:
+                pass
+            case "none" if allow_no_ci and not starter_ci:
+                if await self._recheck_ci(repo, secrets):
+                    raise CiPending("no CI checks reported for this PR yet")
+                no_ci = True
             case "none":
                 raise MergeRefused("no CI checks reported for this PR")
             case "red":
@@ -1750,7 +1786,7 @@ class Workspace:
             case "error":
                 raise MergeRefused("couldn't read the CI checks (gh pr checks errored)")
             case "green":
-                pass
+                no_ci = False  # it has CI after all, and it passed
         merged = await self._gh(
             ["pr", "merge", number, "--repo", repo.slug, "--squash",
              "--match-head-commit", head_sha],
@@ -1758,7 +1794,7 @@ class Workspace:
         )  # fmt: skip
         if merged.returncode != 0:
             raise MergeRefused(f"gh pr merge failed: {merged.stderr[-120:]}")
-        return result
+        return MergeDone(result, no_ci=no_ci)
 
 
 def _drop_admin_entry(checkout: Path, worktree: Path) -> None:

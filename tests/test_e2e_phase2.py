@@ -459,7 +459,12 @@ async def test_chat_restart_resonant_asks_and_runs_only_after_yes(live: Running)
 
     await wait_until(lambda: chat_task(r, "ops")["status"] == "waiting", 10)
     assert chat_task(r, "ops")["wait_reason"] == "approval"
-    match = re.fullmatch(r"\[([A-Z]\d)\] restart Resonant\? Reply yes / no", prompt.text)
+    # GT-1: the first ask also offers a standing allow for the tool.
+    match = re.fullmatch(
+        r"\[([A-Z]\d)\] restart Resonant \(yes always = don't ask before running "
+        r"restart_resonant\)\. Reply yes / yes always / no",
+        prompt.text,
+    )
     assert match is not None, prompt.text
     (audit,) = r.audits("gate.evaluate")
     assert (audit["tool"], audit["decision"]) == ("restart_resonant", "NeedsApproval")
@@ -829,7 +834,10 @@ async def test_e12_restart_mid_approval_runs_exactly_once(
     async with start_daemon(resonant_home, chat, dry_run=False) as r:
         r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
         prompt = await r.osa.wait_for(1, 10)
-        assert prompt.text.endswith("restart Resonant? Reply yes / no")
+        assert prompt.text.endswith(
+            "restart Resonant (yes always = don't ask before running restart_resonant). "
+            "Reply yes / yes always / no"
+        )
         await wait_until(lambda: chat_task(r, "ops")["status"] == "waiting", 10)
         await r.prompt_recorded()
         assert r.ops.spawned == []

@@ -7,7 +7,7 @@ GitHub for Resonant: your open pull requests with CI and review state, a watch t
 | `prs` | tool | L0 | Open PRs you authored (CI rollup, failing checks, review decision), plus PRs awaiting your review. |
 | `pr {repo, number}` | tool | L0 | One PR with its checks, mergeability and size. |
 | `rerun_failed {repo, number}` | tool | L3 | Re-runs the failed jobs of each workflow whose latest run on the PR's head failed. |
-| `merge_pr {repo, number, head_sha}` | tool | L1, commit | Squash-merges the PR if its head is still `head_sha`. Always asks `yes <code>`. |
+| `merge_pr {repo, number, head_sha}` | tool | L2, commit | Squash-merges the PR if its head is still `head_sha`. Runs when you ask for it; otherwise asks a plain yes. |
 | `watch` | job, every 10 min | L0 | Emits `ci_failed`, `ci_fixed` and `review_requested` events. |
 | `digest` | job, 07:50 | L0 | Reports the pulse item `github/summary` (`3 open PRs, 1 failing CI, 2 awaiting your review`, urgency `low`, state = the three counts). It shows under the briefing's Updates once per change and never texts on its own. Needs the manifest's `report: {max_urgency: low}` grant. |
 | health | every 30 min | | `gh api user` succeeds. |

@@ -178,8 +178,8 @@ def test_manifest_passes_every_check() -> None:
     rerun, merge = specs["rerun_failed"], specs["merge_pr"]
     assert rerun.effect is Effect.WRITE and rerun.effective_level is Level.L3
     assert not rerun.commit
-    # Destructive: L1 and commit, so only "yes <code>" approves it.
-    assert merge.effect is Effect.WRITE and merge.effective_level is Level.L1 and merge.commit
+    # L2 and commit (GT-1): runs when the owner asks for it, else asks a plain yes.
+    assert merge.effect is Effect.WRITE and merge.effective_level is Level.L2 and merge.commit
     # The approval binds the head SHA: it's a required arg, not something looked up later.
     assert merge.args_schema["required"] == ["head_sha", "number", "repo"]
     assert rerun.args_schema["required"] == ["number", "repo"]

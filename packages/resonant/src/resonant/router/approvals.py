@@ -35,7 +35,7 @@ from resonant.store import approvals as ap
 from resonant_sdk import Event
 
 NOTHING_WAITING = "Nothing is waiting for approval."
-ALWAYS_UNSUPPORTED = "Not done: yes always only answers a run's check."
+ALWAYS_UNSUPPORTED = "Not done: yes always isn't offered for that one."
 CHANNEL = "imessage"
 MAX_ARGS_CHARS = 1500
 

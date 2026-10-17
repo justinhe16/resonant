@@ -355,7 +355,8 @@ if args.echo_token:  # a session that prints its own credentials into the transc
 
 files = {args.file: f"fixed by {session}\n"}
 if scenario == "makefile":
-    files.update({"Makefile": "all:\n\ttrue\n", ".claude/settings.json": "{}\n"})
+    files.update({"Makefile": "all:\n\ttrue\n", ".claude/settings.json": "{}\n",
+                  "package.json": "{}\n"})
 if scenario == "github":
     files[".github/workflows/evil.yml"] = "on: push\n"
 if scenario == "tokens":

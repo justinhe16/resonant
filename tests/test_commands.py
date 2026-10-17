@@ -161,7 +161,7 @@ def test_describe_takes_the_level_from_the_tool_registry() -> None:
     registry = ToolRegistry()
     registry.register(ToolSpec(name="add_note", effect=Effect.WRITE))
     cmd = Command("/note", "/note <text>", "save a note", "unknown", tool="add_note")
-    assert commands.describe(cmd, registry)["level"] == "L1"  # the write default, not L3
+    assert commands.describe(cmd, registry)["level"] == "L2"  # the write default, not L3
     assert commands.describe(commands.HELP, registry) == {
         "name": "/help",
         "usage": "/help [word]",
@@ -269,7 +269,7 @@ def usage(text: str) -> str:
         ("/note 'it's fine'", "it's fine"),
         ('/note say "hi" to Bo', 'say "hi" to Bo'),  # inner quotes kept
         ("/note line one\nline two", "line one\nline two"),  # newlines kept
-        ("/note " + "x" * 200, "x" * 200),
+        ("/note " + "x" * 1000, "x" * 1000),
     ],
 )
 def test_note_text(text: str, expected: str) -> None:
@@ -282,7 +282,7 @@ def test_note_text(text: str, expected: str) -> None:
         ("/note", "Usage: /note <text>"),
         ("/note   ", "Usage: /note <text>"),
         ('/note ""', "Usage: /note <text>"),
-        ("/note " + "x" * 201, "that's 201 characters (at most 200). Usage: /note <text>"),
+        ("/note " + "x" * 1001, "that's 1001 characters (at most 1000). Usage: /note <text>"),
         ("/unnote", "say which note. Usage: /unnote <n>"),
         ("/unnote abc", "that's not a note number. Usage: /unnote <n>"),
         ("/unnote 0", "that's not a note number. Usage: /unnote <n>"),
@@ -366,7 +366,7 @@ def test_remind(text: str, at: str, body: str) -> None:
         ("/remind 9am call mom", "that time has passed"),  # 9am today, it's 3pm
         ("/remind yesterday 9am x", "that time has passed"),
         ("/remind in 20 min", "say what to remind you about"),
-        ("/remind in 20 min " + "x" * 201, "that's 201 characters (at most 200)"),
+        ("/remind in 20 min " + "x" * 1001, "that's 1001 characters (at most 1000)"),
     ],
 )
 def test_remind_bad_times_get_a_hint(text: str, hint: str) -> None:

@@ -63,12 +63,21 @@ class NewApproval:
     require_code: bool = False
     extension: str | None = None
     requested_by: str | None = None
-    # The prompt offers ``yes always`` (a worker's trust check). Never with ``require_code``.
+    # The prompt offers ``yes always`` (a worker's trust check, or an owner's L2 chat tool
+    # call). Never with ``require_code``.
     allow_always: bool = False
+    # A tool approval's ``yes always`` rule (migration 013): saved as ``allow <action>`` on
+    # ``<scope>`` when the owner answers ``yes always``. None for a worker's check.
+    always_scope: str | None = None
+    always_action: str | None = None
 
     def __post_init__(self) -> None:
         if self.allow_always and self.require_code:
             raise ValueError("a require_code approval never accepts yes always")
+        if (self.always_scope is None) != (self.always_action is None):
+            raise ValueError("always_scope and always_action go together")
+        if self.always_action is not None and not self.allow_always:
+            raise ValueError("a yes always rule needs allow_always")
 
 
 @dataclass(frozen=True)
@@ -95,6 +104,8 @@ class Approval:
     resolved_event_id: str | None
     allow_always: bool = False  # the prompt offered ``yes always`` (migration 010)
     always: bool = False  # the owner answered ``yes always``
+    always_scope: str | None = None  # a tool approval's yes always rule (migration 013)
+    always_action: str | None = None
 
     def sent_at(self, principal: str) -> datetime | None:
         """When the prompt was first sent to ``principal`` (None if it never was)."""
@@ -141,6 +152,8 @@ def _row_to_approval(r: sqlite3.Row) -> Approval:
         resolved_event_id=r["resolved_event_id"],
         allow_always=bool(r["allow_always"]),
         always=bool(r["always"]),
+        always_scope=r["always_scope"],
+        always_action=r["always_action"],
     )
 
 
@@ -154,8 +167,8 @@ def insert_approval(conn: sqlite3.Connection, spec: NewApproval, now: datetime) 
     conn.execute(
         """INSERT INTO approvals (id, task_id, intent_hash, extension, tool, effect, level,
                summary, requested_by, approvers, expires_at, require_code, code, created_at,
-               allow_always)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               allow_always, always_scope, always_action)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             approval_id,
             spec.task_id,
@@ -172,6 +185,8 @@ def insert_approval(conn: sqlite3.Connection, spec: NewApproval, now: datetime) 
             spec.code,
             iso(now),
             spec.allow_always and not spec.require_code,
+            spec.always_scope,
+            spec.always_action,
         ),
     )
     return approval_id

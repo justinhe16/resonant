@@ -41,7 +41,7 @@ tools:
       (take it from the pr tool). Never bypasses branch protection.
     run: python3 cli.py merge_pr --repo {repo} --number {number} --head-sha {head_sha}
     effect: write
-    level: L1                          # can't be undone: always "yes <code>"
+    level: L2                          # runs when you ask for it; otherwise asks a plain yes
     commit: true
     args: {repo: string, number: integer, head_sha: string}
     secrets: [token]

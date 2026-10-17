@@ -20,7 +20,7 @@ Update a row when you try it, with the date and anything odd.
 | 4 | `/github prs` (before install) | `github isn't installed. On the Mini: resonant ext add repo:github` | 📱 |
 | 5 | `/ext run core/briefing` | The briefing, or `Nothing on today.`, then `Briefing sent.` | 📱 |
 | 6 | The 08:00 briefing arrives on its own | One message, every day, even if it's `Nothing on today.` | 📱 (wait for it) |
-| 7 | Chat asks first (Stage B step 3): "please restart resonant" | `[A7] restart Resonant? Reply yes / no`; `no` → `Not done.` | 📱 ❓ |
+| 7 | Chat asks first (Stage B step 3): "please restart resonant" | `[A7] restart Resonant (yes always = don't ask before running restart_resonant). Reply yes / yes always / no`; `no` → `Not done.` | 📱 ❓ |
 | 8 | Approval re-mention: around **:35–:45** past an hour, send "please restart resonant" and **don't answer** | At the top of the hour: `btw:` / `✋ A7 still waiting: restart Resonant`. Then reply `no` (or let it expire at 30 minutes). Only approvals asked :30–:50 are caught (follow-up: an expiry reminder). | 📱 |
 | 9 | Kill switch and pulse: `/kill`, `/pulse now`, `/resume` | `Paused: pulse not sent.`; `/resume` → `resumed: autonomy on, unpaused` | 📱 |
 | 10 | Urgent path with the example extension (go-live step 13.4): `/ext run example/incident`, then `/example incident failing`, then `/example incident resolved` | `[example] 🔴 Demo service failing…` within 5 min, once; then `[example] ✓ Demo service recovered` | 📱 after 🖥 `resonant ext add repo:example` |
@@ -32,6 +32,12 @@ Update a row when you try it, with the date and anything odd.
 | 14b | With only the Claude token: a private repo with no checkout in `~/code` | `I can't work on <owner>/<repo> yet: there's no checkout at …, and cloning it needs the daemon's GitHub token (runner/github_token). …`; "create a repo called x" → `Creating a repo needs the daemon's GitHub token …` | 📱 after 32 |
 | 15 | Trust rules need no runner: "always ask before merging in trading", then `/rules`, then `/rules forget 1` | `Rule added: ask before merge in trading (rule 1).`; `Rules (1):` / `1. ask before merge in trading`; the rule is gone | 📱 after the employee-mode deploy |
 | 16 | `/repos`, `/repo add <owner>/<name>` | The repo list (or `No repos yet.`); `Added <owner>/<name> as <name> …`, with `Heads up: main isn't protected.` if it isn't | 📱 after the employee-mode deploy |
+| 16a | GT-1 standing allow: "please restart resonant", answer `yes always`; later "restart resonant" again; then `/rules` and `/rules forget <n>` | First: `Restarting Resonant…` then `Rule added: don't ask before running restart_resonant (rule N)`; second: restarts with no prompt; `/rules` lists it; after forget, the next ask prompts again | 📱 |
+| 16b | GT-1 chained side effects: "note buy milk and remind me at 5pm to call mom" | Both report lines in one reply, no prompt | 📱 |
+| 16c | GT-1 `/rules allow deploy in dori-staging` | `Rule added: don't ask before deploy in dori-staging (rule N).` | 📱 |
+| 16d | GT-1 `/repo add <owner>/<public repo>` before the daemon token is set | `Added … Registered without the daemon's GitHub token, so push access and CI weren't checked; runs will find out.`; a private one says it needs `runner/github_token` | 📱 |
+| 16e | GT-1 `/merge R<n>` while its CI is still running | `R<n>: CI is still running; I'll merge PR #… when it's green.`, then the merge in the digest (or `R<n> not merged: …` texted) | 📱 after a run |
+| 16f | GT-1 a long note: `/note` with ~900 characters | `Saved note …` (up to 1000 characters) | 📱 |
 
 ## Needs the Mini
 

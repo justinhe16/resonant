@@ -109,18 +109,28 @@ async def check(
         (".claude/settings.json", False, True),
         ("pkg/.claude/hooks/x.sh", False, True),
         (".mcp.json", False, True),
+        (".githooks/pre-push", False, True),
+        ("CODEOWNERS", False, True),
+        ("docs/CODEOWNERS", False, True),
+        (".pre-commit-config.yaml", False, True),
+        ("lefthook.yml", False, True),
+        ("azure-pipelines.yml", False, True),
+        (".buildkite/pipeline.yml", False, True),
+        (".travis.yml", False, True),
+        # ordinary code and dependency files: not flagged (deps are listed when merged)
         (".devcontainer/devcontainer.json", False, True),
         (".devcontainer.json", False, True),
+        (".envrc", False, True),
+        (".npmrc", False, True),
+        ("web/.yarnrc.yml", False, True),
         (".vscode/tasks.json", False, True),
-        (".vscode/settings.json", False, True),
-        (".vscode/launch.json", False, False),
-        ("Makefile", False, True),
-        ("services/api/package.json", False, True),
-        ("pyproject.toml", False, True),
-        ("Dockerfile.dev", False, True),
-        ("docker/dockerfile", False, True),
-        ("tests/conftest.py", False, True),
-        (".pre-commit-config.yaml", False, True),
+        (".vscode/settings.json", False, False),
+        ("Makefile", False, False),
+        ("services/api/package.json", False, False),
+        ("pyproject.toml", False, False),
+        ("uv.lock", False, False),
+        ("Dockerfile.dev", False, False),
+        ("tests/conftest.py", False, False),
         ("docs/makefile.md", False, False),
     ],
 )
@@ -153,14 +163,20 @@ def test_check_texts_names_the_place_not_the_text() -> None:
 
 async def test_clean_change(repo: Path) -> None:
     base = git(repo, "rev-parse", "HEAD")
-    head = commit(
-        repo, {"src/a.py": "x = 1\n", "Makefile": "all:\n", "package.json": "{}\n"}, "Add a"
-    )
+    files = {
+        "src/a.py": "x = 1\n",
+        "Makefile": "all:\n",
+        "package.json": "{}\n",
+        "web/yarn.lock": "#\n",
+        ".mcp.json": "{}\n",
+    }
+    head = commit(repo, files, "Add a")
     r = await check(repo, base, head)
-    assert r.files == 3
+    assert r.files == 5
     assert r.title == "Add a"
-    assert r.flagged == ("Makefile", "package.json")
-    assert r.flag_line == "⚠ changes Makefile, package.json"
+    assert r.flagged == (".mcp.json",)
+    assert r.flag_line == "⚠ changes .mcp.json"
+    assert r.deps == ("package.json", "web/yarn.lock")
     assert r.head_sha == head
     assert r.changed_bytes > 0
 
@@ -355,7 +371,7 @@ async def test_oversize_history_fails_closed(repo: Path, monkeypatch: pytest.Mon
         await check(repo, base, head)
 
 
-async def test_symlink_and_mode_changes_flagged(repo: Path) -> None:
+async def test_symlinks_flagged_mode_changes_not(repo: Path) -> None:
     base = git(repo, "rev-parse", "HEAD")
     (repo / "link").symlink_to("README.md")
     (repo / "run.sh").write_text("#!/bin/sh\n")
@@ -363,30 +379,57 @@ async def test_symlink_and_mode_changes_flagged(repo: Path) -> None:
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "x")
     r = await check(repo, base, git(repo, "rev-parse", "HEAD"))
-    assert r.flagged == ("link (symlink)", "run.sh (executable)")
+    assert r.flagged == ("link (symlink)",)
     mid = git(repo, "rev-parse", "HEAD")
     (repo / "README.md").chmod(0o755)
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "chmod")
     r = await check(repo, mid, git(repo, "rev-parse", "HEAD"))
-    assert r.flagged == ("README.md (mode change)",)
+    assert r.flagged == ()
 
 
 @pytest.mark.parametrize(
     "path",
     [
-        ".envrc",
-        ".npmrc",
-        ".yarnrc.yml",
         ".husky/pre-commit",
-        ".gitattributes",
+        ".claude/commands/x.md",
+        ".github/CODEOWNERS",
         "Jenkinsfile",
         ".gitlab-ci.yml",
         ".circleci/config.yml",
     ],
 )
 def test_more_flagged_paths(path: str) -> None:
-    assert classify_path(path) == (None, True)
+    allow = path.startswith(".github/")
+    assert classify_path(path, allow_github=allow) == (None, True)
+
+
+@pytest.mark.parametrize(
+    ("path", "dep"),
+    [
+        ("package.json", True),
+        ("apps/web/package-lock.json", True),
+        ("pnpm-lock.yaml", True),
+        ("pyproject.toml", True),
+        ("uv.lock", True),
+        ("requirements.txt", True),
+        ("requirements-dev.txt", True),
+        ("reqs/requirements.in", True),
+        ("Cargo.toml", True),
+        ("Cargo.lock", True),
+        ("go.mod", True),
+        ("go.sum", True),
+        ("Gemfile", True),
+        ("Gemfile.lock", True),
+        ("x.gemspec", True),
+        ("src/package.py", False),
+        ("requirements.md", False),
+        ("Makefile", False),
+    ],
+)
+def test_dependency_files(path: str, dep: bool) -> None:
+    assert checks.is_dependency_file(path) is dep
+    assert classify_path(path) == (None, False)
 
 
 def test_parse_raw_fails_closed() -> None:

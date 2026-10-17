@@ -30,7 +30,7 @@ def test_migration_008_over_populated_007(tmp_path: Path) -> None:
     repos.add(conn, "me/a", base="main", source="auto")
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == latest_version() == 12
+    assert schema_version(conn) == latest_version() == 13
     assert [r.slug for r in repos.list_all(conn)] == ["me/a"]
     assert repos.links(conn, "x") == []
     conn.close()
@@ -47,7 +47,7 @@ def test_migration_009_over_populated_008(tmp_path: Path) -> None:
     conn.execute("DELETE FROM runs WHERE code = 'R3'")  # the high-water mark is R3
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == 12
+    assert schema_version(conn) == 13
     old = runs.get(conn, "R1")
     assert old is not None and old.status == "ready" and old.pr_number == 4
     assert old.branch == "resonant/r1-x" and old.workspace is None and old.checkout is None
@@ -69,7 +69,7 @@ def test_migration_007_over_populated_006(tmp_path: Path) -> None:
     assert migrate(conn, _through(6)) == 6
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == latest_version() == 12
+    assert schema_version(conn) == latest_version() == 13
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(repos)")}
     assert {"slug", "name", "aliases", "base", "mode", "ci", "source", "last_used_at"} <= cols
     assert repos.list_all(conn) == []

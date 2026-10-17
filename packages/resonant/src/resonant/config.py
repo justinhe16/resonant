@@ -203,6 +203,14 @@ class GateConfig(_Section):
     approval_ttl_s: float = Field(default=1800.0, ge=60, le=86400)
 
 
+class TrustConfig(_Section):
+    """Worker trust checks (``resonant check``; ``trust/policy.py``)."""
+
+    # A check costing more than this (USD) asks the owner even on a seen system and action;
+    # at or under it, cost alone isn't net-new (GT-1). A cost that isn't a number always asks.
+    cost_ask_over_usd: float = Field(default=20.0, ge=0, allow_inf_nan=False)
+
+
 def _package_checkout() -> Path | None:
     """The git checkout containing the running package, if it runs from one."""
     for parent in Path(__file__).resolve().parents:
@@ -583,6 +591,7 @@ class Settings(BaseSettings):
     briefing: BriefingConfig = BriefingConfig()
     pulse: PulseConfig = PulseConfig()
     runner: RunnerConfig = RunnerConfig()
+    trust: TrustConfig = TrustConfig()
 
     @field_validator("home")
     @classmethod

@@ -33,7 +33,7 @@ from resonant.gateway.channel import ApprovalPrompt, MessageRef
 from resonant.principals import Principal, Principals
 from resonant.runner.resolve import FakeGitHub, RepoInfo
 from resonant.runner.workspace import FORK_NEEDS_PUBLIC_REPO
-from resonant.runners.claude import Refused, Started
+from resonant.runners.claude import Merged, MergeQueued, Refused, Started
 from resonant.secrets import GITHUB_PUBLIC_TOKEN_REF
 from resonant.store import approvals as ap
 from resonant.store import questions as qs
@@ -380,10 +380,7 @@ async def test_auto_merge_never_merges_flagged_paths(
     await settle(h, code, "ready")
     await asyncio.sleep(0.3)
     assert h.gh_calls("merge") == []
-    assert (
-        "Not merged automatically: it changes .claude/settings.json, Makefile."
-        in (h.chan.texts()[0])
-    )
+    assert "Not merged automatically: it changes .claude/settings.json." in (h.chan.texts()[0])
 
 
 async def test_auto_merge_refuses_a_moved_head(tmp_path: Path, db: sqlite3.Connection) -> None:
@@ -505,3 +502,116 @@ async def test_auto_merge_goes_to_the_digest_by_default(
     await settle(h, res.code, "merged")
     await asyncio.sleep(0.3)
     assert len(h.gh_calls("merge")) == 1 and h.chan.texts() == []
+
+
+# --- GT-1: the owner's /merge waits for CI that is still running ---------------------------
+
+
+async def ready_run(h: Harness) -> str:
+    res = await h.runner.start_run("proj", "fix it", "owner", report="now")
+    assert isinstance(res, Started), res
+    await settle(h, res.code, "ready")
+    h.loop._stopping = False  # pyright: ignore[reportPrivateUsage]  # run again after a stop
+    return res.code
+
+
+async def test_owner_merge_with_ci_running_waits_then_merges(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = merge_harness(tmp_path, db)
+    code = await ready_run(h)
+    (h.gh_dir / "checks_rc").write_text("8")  # pending
+    res = await h.runner.merge_run(code)
+    assert isinstance(res, MergeQueued)
+    assert res.text == f"{code}: CI is still running; I'll merge PR #41 when it's green."
+    run = h.run(code)
+    assert run.status == "ready" and h.gh_calls("merge") == []
+    task = task_store.get_task(db, cast(str, run.task_id))
+    assert task is not None and task.checkpoint["by"] == "owner" and task.checkpoint["merge"]
+    assert await h.runner.merge_run(code) == res  # asked again: the same watch
+    assert h.run(code).task_id == run.task_id
+    running = asyncio.ensure_future(h.loop.run())
+    try:
+        await asyncio.sleep(0.3)
+        assert h.run(code).status == "ready"
+        (h.gh_dir / "checks_rc").write_text("0")
+        await until(lambda: h.run(code).status == "merged", 20, "the merge")
+    finally:
+        h.loop.stop()
+        await running
+    assert len(h.gh_calls("merge")) == 1
+    # reported like an auto-merge's: by the merged level (texted: the run asked for "now")
+    _ready, merged = h.chan.texts()
+    assert merged == f"{code} merged: PR #41 · https://github.com/own/proj/pull/41"
+
+
+async def test_owner_merge_watch_stops_on_red(tmp_path: Path, db: sqlite3.Connection) -> None:
+    h = merge_harness(tmp_path, db)
+    code = await ready_run(h)
+    (h.gh_dir / "checks_rc").write_text("8")
+    assert isinstance(await h.runner.merge_run(code), MergeQueued)
+    running = asyncio.ensure_future(h.loop.run())
+    try:
+        (h.gh_dir / "checks_rc").write_text("1")  # red
+        await until(lambda: len(h.chan.texts()) == 2, 20, "the stop")
+    finally:
+        h.loop.stop()
+        await running
+    assert h.chan.texts()[1] == f"{code} not merged: CI is red. /merge {code} to try again."
+    assert h.run(code).status == "ready" and h.gh_calls("merge") == []
+
+
+async def test_owner_merge_takes_over_an_auto_merge_watch(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """The owner's /merge replaces an auto-merge's watch with the owner's own."""
+    h = merge_harness(tmp_path, db)
+    (h.gh_dir / "checks_rc").write_text("8")
+    code = await start_merging(h)
+    running = asyncio.ensure_future(h.loop.run())
+    try:
+        await until(lambda: len(h.chan.texts()) == 1, 40, "the ready reply")
+        auto = h.run(code).task_id
+        res = await h.runner.merge_run(code)
+        assert isinstance(res, MergeQueued)
+        old = task_store.get_task(db, cast(str, auto))
+        assert old is not None and old.status == "cancelled" and h.run(code).task_id != auto
+        (h.gh_dir / "checks_rc").write_text("0")
+        await until(lambda: h.run(code).status == "merged", 20, "the merge")
+    finally:
+        h.loop.stop()
+        await running
+    assert len(h.gh_calls("merge")) == 1
+
+
+async def test_owner_merge_without_ci_merges_with_a_warning(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = merge_harness(tmp_path, db, ci=False)
+    code = await ready_run(h)
+    (h.gh_dir / "checks_rc").write_text("1")
+    (h.gh_dir / "checks_err").write_text("no checks reported on the 'x' branch")
+    res = await h.runner.merge_run(code)
+    assert isinstance(res, Merged), res
+    assert res.text == f"{code} merged: PR #41.\n⚠ merged without CI: proj has no CI checks"
+    assert h.run(code).status == "merged" and len(h.gh_calls("merge")) == 1
+
+
+async def test_auto_merge_without_ci_still_waits_for_the_owner(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = merge_harness(tmp_path, db, ci=False)
+    code = await start_merging(h)
+    await settle(h, code, "ready")
+    await asyncio.sleep(0.3)
+    assert h.gh_calls("merge") == []
+    assert "Not merged automatically: proj has no CI." in h.chan.texts()[0]
+
+
+def test_since_reads_only_an_aware_iso_time() -> None:
+    from resonant.runners.claude import _since  # pyright: ignore[reportPrivateUsage]
+
+    assert _since({"since": "2026-10-16T12:00:00+00:00"}) is not None
+    assert _since({"since": "2026-10-16T12:00:00"}) is None
+    assert _since({"since": "not a time"}) is None
+    assert _since({}) is None

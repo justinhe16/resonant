@@ -15,13 +15,16 @@
    A matching rule decides on its own: an ``allow`` rule overrides every default below,
    including irreversible and cost.
 2. **Defaults** when no rule matches. Ask for a new system (no ok check recorded on it), a
-   new kind of action on a system, anything irreversible, and anything that costs money
-   (``cost_usd > 0``, or not a finite number). Everything else is ok. The reason lists every
-   default that applied: ``new system, irreversible``.
+   new kind of action on a system, anything irreversible, and anything that costs more than
+   ``cost_ask_over_usd`` (config ``trust.cost_ask_over_usd``, default $20; a cost that isn't
+   a finite number always asks). A cost at or under it isn't net-new on its own (GT-1).
+   Everything else is ok. The reason lists every default that applied:
+   ``new system, irreversible``.
 
 ``notify_level(rules, system, action, event)`` -> ``NotifyDecision("now" | "digest", ...)``.
-Defaults: ``failed``, ``question``, ``check`` and ``urgent`` are texted right away; the rest
-(``done``, ``pr``, ``merged``, ``note``) wait for the digest. ``notify_now``/``notify_digest``
+Defaults: ``failed``, ``question``, ``check``, ``urgent`` and a worker's ``restart`` and
+``update`` of Resonant (GD-1) are texted right away; the rest (``done``, ``pr``, ``merged``,
+``note``) wait for the digest. ``notify_now``/``notify_digest``
 rules change it, matched by scope as above and by action against the event (2), then the
 action (1), then ``*`` (0); at equal specificity ``notify_now`` wins. A ``question`` or
 ``check`` is never lowered to the digest: a worker is blocked on it.
@@ -44,7 +47,9 @@ Verdict = Literal["ok", "ask"]
 Level = Literal["now", "digest"]
 
 # Events a worker can report (D5). Unknown events default to the digest.
-URGENT_EVENTS: frozenset[str] = frozenset({"failed", "question", "check", "urgent"})
+URGENT_EVENTS: frozenset[str] = frozenset(
+    {"failed", "question", "check", "urgent", "restart", "update"}
+)
 # Blocking events: a rule never lowers them to the digest.
 BLOCKING_EVENTS: frozenset[str] = frozenset({"question", "check"})
 
@@ -138,12 +143,23 @@ def matching_trust_rule(
     return _best(scored())
 
 
-def costs_money(cost_usd: float) -> bool:
-    return not math.isfinite(cost_usd) or cost_usd > 0
+COST_ASK_OVER_USD = 20.0  # config ``trust.cost_ask_over_usd``
 
 
-def decide(check: Check, rules: Iterable[Rule], seen: frozenset[str]) -> TrustDecision:
-    """The verdict for ``check``. ``seen``: the actions with an ok check on its system."""
+def costs_money(cost_usd: float, over_usd: float = COST_ASK_OVER_USD) -> bool:
+    """Whether a cost asks on its own: over ``over_usd``, or not a finite number."""
+    return not math.isfinite(cost_usd) or cost_usd > over_usd
+
+
+def decide(
+    check: Check,
+    rules: Iterable[Rule],
+    seen: frozenset[str],
+    *,
+    cost_ask_over_usd: float = COST_ASK_OVER_USD,
+) -> TrustDecision:
+    """The verdict for ``check``. ``seen``: the actions with an ok check on its system.
+    ``cost_ask_over_usd``: a cost above it asks (see the module docstring)."""
     rule = matching_trust_rule(rules, check.system, check.action, check.repo)
     if rule is not None:
         verdict: Verdict = "ask" if rule.effect == "ask" else "ok"
@@ -155,7 +171,7 @@ def decide(check: Check, rules: Iterable[Rule], seen: frozenset[str]) -> TrustDe
         reasons.append("new kind of action")
     if check.irreversible:
         reasons.append("irreversible")
-    if costs_money(check.cost_usd):
+    if costs_money(check.cost_usd, cost_ask_over_usd):
         shown = f"${check.cost_usd:.2f}" if math.isfinite(check.cost_usd) else "money"
         reasons.append(f"costs {shown}")
     if reasons:

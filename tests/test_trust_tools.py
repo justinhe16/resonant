@@ -232,6 +232,31 @@ def test_rules_command() -> None:
             cmd.resolve(bad, ctx)
 
 
+def test_rules_allow_command() -> None:
+    # GT-1: the explicit path for widening. allow_trust_rule is L2, so the slash command runs.
+    cmd = commands.get("/rules")
+    assert cmd is not None
+    ctx = ParseContext()
+    assert cmd.resolve("allow deploy in dori-staging", ctx) == (
+        "allow",
+        "allow_trust_rule",
+        {"scope": "dori-staging", "action": "deploy"},
+    )
+    assert cmd.resolve("allow merge", ctx) == (
+        "allow",
+        "allow_trust_rule",
+        {"scope": "*", "action": "merge"},
+    )
+    assert cmd.resolve("allow running github.merge_pr in jhe/dori", ctx) == (
+        "allow",
+        "allow_trust_rule",
+        {"scope": "jhe/dori", "action": "tool:github.merge_pr"},
+    )
+    for bad in ("allow", "allow [x]", "allow deploy in [x]"):
+        with pytest.raises(UsageError):
+            cmd.resolve(bad, ctx)
+
+
 def test_rules_intent() -> None:
     assert INTENT_TOOLS["rules"] == (
         "add_trust_rule",

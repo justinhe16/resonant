@@ -8,6 +8,8 @@ undo), and every read hides soft-deleted notes. No migration is needed.
 Replay can't duplicate a note: the executor records each call under its idempotency key
 and returns the recorded result instead of running the handler again.
 
+A note is at most ``TEXT_MAX`` (1000) characters after stripping.
+
 ``clear_notes`` is destructive, so its approval prompt says how many notes it would
 delete: ``summary_action`` builds that phrase in code, for
 ``gate.summary.summarize(intent, action=...)``.
@@ -27,7 +29,7 @@ from resonant_sdk import Effect, Level, ToolSpec
 
 SCOPE = "notes"
 SEQ_KEY = "notes.seq"
-TEXT_MAX = 200
+TEXT_MAX = 1000  # GT-1: was 200
 LIST_MAX = 20
 
 LIST_NOTES = ToolSpec(

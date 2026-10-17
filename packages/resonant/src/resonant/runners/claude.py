@@ -22,7 +22,8 @@ a Claude slot the whole time (two runs on one repo go at once, each in its own w
               upstream PR with the ``public_repo`` token (EM-7)
     reply     the code-built message to the requester, by urgency (EM-6,
               ``runners/reports.py``): texted now (a failure, ``/run``, a ``notify_now`` rule)
-              or a line in the hourly digest's ``Workers:`` section
+              or a line in the hourly digest's ``Workers:`` section, either with the run's
+              ``did:`` list (side effects: ``did:`` notes, a worker's restart or update)
 
 Each step is saved in ``runs.step`` before it starts, so a crash resumes at the last one; the
 session is resumed by id (``--resume``) in the same run dir, after the old process tree has been
@@ -118,6 +119,7 @@ from resonant.runner.workspace import (
     CREDS_DIR,
     FORK_NEEDS_PUBLIC_REPO,
     GITHUB_TOKEN_HOW,
+    CiPending,
     MergeRefused,
     NoChanges,
     Prepared,
@@ -131,7 +133,7 @@ from resonant.runner.workspace import (
 )
 from resonant.runners import reaper, worker_cli
 from resonant.runners.reaper import MARKER_ENV, Target
-from resonant.runners.reports import Report, WorkerReports, end_event, end_title
+from resonant.runners.reports import Report, WorkerReports, deps_line, end_event, end_title
 from resonant.runners.worker_cli import Check, WorkerServer
 from resonant.runners.worker_desk import (
     BLOCK_S,
@@ -261,7 +263,10 @@ WORKER_PROMPT = (
     "decision only the owner can make. It waits for the answer; if it says there is no answer "
     "yet, finish what you can, then end your turn with a short summary: you'll be resumed with "
     'the answer. `resonant note "<progress>" [--urgent]`: on meaningful progress (--urgent only '
-    "for what the owner must see now). `resonant check --system <s> --action <kind> "
+    "for what the owner must see now). After any side effect outside your branch and PR (a "
+    "merge with gh, a deploy, a push to another repo, an email, a payment), run `resonant note "
+    '"did: <what you did>"`: those go in your report to the owner. '
+    "`resonant check --system <s> --action <kind> "
     '[--irreversible] [--cost <usd>] "<what>"`: before anything that could be net new: a '
     "deploy, a write to production data, an outgoing email or message, spending money, deleting "
     "data, a force-push, or a system you haven't used in this task. Go ahead only on ok; on "
@@ -375,11 +380,31 @@ class Merged:
     code: str
     pr_number: int
     flagged: tuple[str, ...] = ()
+    deps: tuple[str, ...] = ()  # dependency files the PR changed (listed, not flagged)
+    no_ci: str | None = None  # the repo, when an owner's merge went in without CI
 
     @property
     def text(self) -> str:
-        line = f"{self.code} merged: PR #{self.pr_number}."
-        return f"{line}\n⚠ changes {', '.join(self.flagged)}" if self.flagged else line
+        lines = [f"{self.code} merged: PR #{self.pr_number}."]
+        if self.no_ci:
+            lines.append(f"⚠ merged without CI: {self.no_ci} has no CI checks")
+        if self.flagged:
+            lines.append(f"⚠ changes {', '.join(self.flagged)}")
+        if self.deps:
+            lines.append(deps_line(self.deps))
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class MergeQueued:
+    """An owner's merge that waits for CI: the run's merge watch takes it from here."""
+
+    code: str
+    pr_number: int
+
+    @property
+    def text(self) -> str:
+        return f"{self.code}: CI is still running; I'll merge PR #{self.pr_number} when it's green."
 
 
 # --- code-built replies --------------------------------------------------------------------
@@ -407,7 +432,8 @@ def reply_text(
 ) -> str | None:
     """The message for an ended run (None for a state that has none). ``ci`` is the PR's CI
     as a word (``green``, ``red``, ``pending``, ``none``), looked up when the reply is sent.
-    ``no_ci``: the repo has no pull_request workflow, so the run can't be merged from here.
+    ``no_ci``: the repo has no pull_request workflow: only the owner's ``/merge`` merges it
+    (without CI, with a warning), never an auto-merge.
     ``upstream``: a fork-mode run's original repo (its ``done`` names the PR opened there, or
     why none was). ``watching``: the run merges itself once CI is green."""
     took = fmt_duration(run.session_seconds)
@@ -424,7 +450,12 @@ def reply_text(
             if run.failure:  # the merge-time checks already refuse it
                 text += f"\n⚠ it can't be merged as it is: {run.failure}"
             if no_ci:
-                return text + f"\nno CI: {run.repo} has no pull_request workflow." + summary
+                return (
+                    text
+                    + f"\nno CI: {run.repo} has no pull_request workflow; "
+                    + f"/merge {run.code} merges it without CI."
+                    + summary
+                )
             if watching:
                 return text + "\nI'll merge it when CI is green." + summary
             hint = "to merge it" if ci == "green" else "when CI is green"
@@ -806,6 +837,7 @@ class ClaudeRunner:
             self_ops=self_ops,
             owner=owner,
             on_restart=self._on_self_restart,
+            on_self_op=self._on_self_op,
         )
         self.home = home or Path.home()
         self._login_check: Callable[[], Awaitable[bool]] = login_check or LoginCheck(
@@ -1278,11 +1310,18 @@ class ClaudeRunner:
             audit(self.conn, "run.auto_merge_stopped", run=run.code)
         return True
 
-    async def merge_run(self, code: str) -> Merged | Refused:
+    async def merge_run(self, code: str) -> Merged | MergeQueued | Refused:
         """Squash-merge a ready run's PR (``--match-head-commit``, CI must be green). Whether
         to ask first is the caller's (the gate: ``/merge`` is explicit; chosen from chat it
-        follows ``merge_decision``); the flagged paths are in the result. A fork-mode repo's
-        PR is never merged here."""
+        follows ``merge_decision``); the flagged paths and dependency files are in the
+        result. A fork-mode repo's PR is never merged here.
+
+        This is the owner's merge (``merge_run`` is an owner-only builtin, run by ``/merge``
+        or by a chat call the owner allowed), so it is looser than the auto-merge in two ways:
+        CI still running is not a refusal but a wait (``MergeQueued``: the run's merge watch,
+        the auto-merge's bounded wait, merges it once CI is green and reports it the way an
+        auto-merge does), and a repo with no CI at all merges with a warning in the reply.
+        Red CI and the checks still refuse it."""
         run = runs.get(self.conn, code)
         if run is None:
             return Refused(f"No run {code}.")
@@ -1297,15 +1336,67 @@ class ClaudeRunner:
             return Refused("The runner's secrets can't be read.")
         if secrets.github_token is None:
             return Refused(needs_github_token(f"Merging {run.code}"))
-        return await self._merge(run.code, secrets, by="owner")
+        result = await self._merge(run.code, secrets, by="owner", allow_no_ci=True, wait_ci=True)
+        if isinstance(result, MergeQueued):
+            self._watch_merge(self._must_get(run.code))
+        return result
+
+    def _watch_merge(self, run: Run) -> None:
+        """Start the owner's merge watch for a ready run whose CI is still running: a task
+        (checkpoint ``merge``, ``watch``, ``by: owner``, ``since``) that ``_auto_merge`` steps
+        like an auto-merge's, with the owner's looser rules (``_owner_merge_blocker``) and
+        ``merge_wait_s`` counted from now. An auto-merge watch already waiting on the run is
+        replaced; an owner's watch already waiting is kept."""
+        task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
+        live = task is not None and task.status in ("queued", "waiting")
+        if task is not None and live and task.checkpoint.get("merge"):
+            if task.checkpoint.get("by") == "owner":
+                return
+            if self._cancel_task is not None:
+                self._cancel_task(task.id)
+            else:
+                with atomic(self.conn):
+                    task_store.set_status(
+                        self.conn, task.id, "cancelled", expect=("queued", "waiting")
+                    )
+        spec = NewTask(
+            kind=TASK_KIND,
+            runner=RUNNER_NAME,
+            priority=PRIORITY_OWNER,
+            principal=run.principal,
+            checkpoint={
+                "run": run.code,
+                "title": f"merge {run.code} · {run.repo}",
+                "merge": True,
+                "watch": True,
+                "by": "owner",
+                "since": self.clock().isoformat(),
+            },
+        )
+        task_id = self._create_task(spec)
+        runs.update(self.conn, run.code, task_id=task_id)
+        with atomic(self.conn):
+            audit(self.conn, "run.merge_watch", run=run.code, pr=run.pr_number, task_id=task_id)
 
     async def _merge(
-        self, code: str, secrets: RunnerSecrets, *, by: str, allow_flagged: bool = True
-    ) -> Merged | Refused:
+        self,
+        code: str,
+        secrets: RunnerSecrets,
+        *,
+        by: str,
+        allow_flagged: bool = True,
+        allow_no_ci: bool = False,
+        wait_ci: bool = False,
+        replied: bool | None = None,
+    ) -> Merged | MergeQueued | Refused:
         """The one merge path of both ``merge_run`` and the auto-merge, one at a time per run
         (the row is read again under the lock, so two merges of one PR can't both go).
         ``Workspace.merge`` fetches the PR head and runs the checks first (D10), then CI,
-        then ``--match-head-commit`` against the head the run recorded."""
+        then ``--match-head-commit`` against the head the run recorded. ``allow_no_ci``: the
+        owner's merge (a repo with no CI merges, with a warning); ``wait_ci``: CI still
+        running is ``MergeQueued``, not a refusal. ``replied``: the owner already got the
+        reply (default: ``by == "owner"``), so the merged digest line is marked told;
+        otherwise it goes by the ``merged`` level."""
         async with self._merge_locks.setdefault(code, asyncio.Lock()):
             run = runs.get(self.conn, code)
             if run is None or not _mergeable(run):
@@ -1313,21 +1404,31 @@ class ClaudeRunner:
                 return Refused(f"{code} isn't ready to merge ({status}).")
             assert run.pr_number is not None and run.head_sha is not None and run.branch
             try:
-                checked = await self.workspace.merge(
+                done = await self.workspace.merge(
                     run.repo, run.pr_number, run.head_sha, secrets, branch=run.branch,
-                    allow_flagged=allow_flagged,
+                    allow_flagged=allow_flagged, allow_no_ci=allow_no_ci,
                 )  # fmt: skip
+            except CiPending as e:
+                if wait_ci:
+                    return MergeQueued(run.code, run.pr_number)
+                return Refused(f"{run.code} not merged: {Redactor(secrets.values()).text(str(e))}")
             except (MergeRefused, RunnerError, GitError) as e:
                 reason = e.message if isinstance(e, GitError) else str(e)
                 return Refused(f"{run.code} not merged: {Redactor(secrets.values()).text(reason)}")
+            checked = done.checks
             with atomic(self.conn):
                 runs.update(self.conn, run.code, status="merged", flagged_paths=checked.flagged)
-                audit(self.conn, "run.merged", run=run.code, pr=run.pr_number, by=by)
-        await self._report_merged(self._must_get(run.code), by_owner=by == "owner")
+                audit(self.conn, "run.merged", run=run.code, pr=run.pr_number, by=by,
+                      no_ci=done.no_ci)  # fmt: skip
+        told = by == "owner" if replied is None else replied
+        await self._report_merged(self._must_get(run.code), by_owner=told, deps=checked.deps)
         with contextlib.suppress(Exception):
             await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
         await self._remove_workspace(run)
-        return Merged(run.code, run.pr_number, checked.flagged)
+        return Merged(
+            run.code, run.pr_number, checked.flagged, checked.deps,
+            no_ci=run.repo if done.no_ci else None,
+        )  # fmt: skip
 
     # -- the worker CLI's owner side (EM-5's API) --
 
@@ -1410,6 +1511,27 @@ class ClaudeRunner:
             await self.channel.send(run.principal, text, dedupe_key=key)
         except ChannelError as e:  # the digest line still carries the note
             log.warning("note not texted", extra={"run": run.code, "reason": str(e)})
+            return
+        self.reports.told(item)
+
+    async def _on_self_op(self, code: str, op: str, what: str) -> None:
+        """A worker's restart or update of Resonant went through (already on the run's
+        ``did:`` list): its line is news for the digest, and it is texted now unless a
+        ``notify_digest`` rule on ``restart``/``update`` holds it (``runners/reports.py``)."""
+        run = runs.get(self.conn, code)
+        if run is None or run.status != "running":
+            return
+        item = self.reports.running(run, _bucket(run.session_seconds))
+        level = self.reports.level(run, op)
+        self.reports.audit_report(run, op, level)
+        if level != "now":
+            return
+        key = f"run:{run.code}:{op}:{uuid.uuid4().hex}"
+        try:
+            await self.channel.send(run.principal, self.reports.self_op_text(run, what),
+                                    dedupe_key=key)  # fmt: skip
+        except ChannelError as e:  # the digest line still carries it
+            log.warning("self op not texted", extra={"run": run.code, "reason": str(e)})
             return
         self.reports.told(item)
 
@@ -2370,15 +2492,33 @@ class ClaudeRunner:
             return f"a rule says to ask before merging in {repo.name}"
         return None
 
+    def _owner_merge_blocker(self, run: Run) -> str | None:
+        """Why an owner's merge watch (``_watch_merge``) stops before merging, or None. The
+        owner asked for the merge, so flagged paths, a repo with no CI and a rule that asks
+        don't stop it; the checks and CI still do, in ``Workspace.merge``."""
+        repo = repo_store.find(self.conn, run.repo)
+        if repo is None or repo.mode != "push":
+            return "it isn't a repo I merge"
+        if self._paused():
+            return "Resonant is paused"
+        return None
+
     async def _auto_merge(self, task: Task, run: Run, *, first: bool) -> StepOutcome:
         """A ready run whose ask included merging: merge once CI is green on the head the run
         recorded, through the same path and checks as ``/merge``. Pending CI is looked at
         again every ``merge_poll_s`` (the task waits without a slot) for at most
         ``merge_wait_s`` after the run; red CI, a refusal, a moved head or a rule that asks
         stops it with a reply. ``first``: the run just became ready, so its reply hasn't gone
-        out yet."""
+        out yet.
+
+        The same wait serves an owner's ``/merge`` that found CI running (checkpoint ``by:
+        owner``, from ``_watch_merge``): its blockers are ``_owner_merge_blocker``'s, its
+        ``merge_wait_s`` counts from the ``/merge`` (``since``), and the merge is the owner's
+        (flagged paths allowed). Its outcome is reported like an auto-merge's: the merged
+        line by the ``merged`` level, a stop as a text."""
         done = Done({"run": run.code, "status": run.status})
-        why = self._auto_merge_blocker(run)
+        owner = task.checkpoint.get("by") == "owner"
+        why = self._owner_merge_blocker(run) if owner else self._auto_merge_blocker(run)
         state: str | None = None
         secrets: RunnerSecrets | None = None
         if why is None:
@@ -2388,8 +2528,9 @@ class ClaudeRunner:
             except (SecretError, RunnerError) as e:
                 why = f"CI couldn't be read ({e})"
         if why is None and state in ("pending", "error", "none"):  # none: checks not registered yet
-            ended = run.ended_at or self.clock()
-            if self.clock() - ended < timedelta(seconds=self.merge_wait_s):
+            start = _since(task.checkpoint) if owner else None
+            start = start or run.ended_at or self.clock()
+            if self.clock() - start < timedelta(seconds=self.merge_wait_s):
                 if first:
                     told = await self._conclude(run, watching=True)
                     if isinstance(told, Fail):
@@ -2404,10 +2545,22 @@ class ClaudeRunner:
         elif why is None and state == "red":
             why = "CI is red"
         if why is None and secrets is not None:
-            merged = await self._merge(run.code, secrets, by="auto", allow_flagged=False)
+            merged = await self._merge(
+                run.code, secrets, by="owner" if owner else "auto", allow_flagged=owner,
+                allow_no_ci=owner, wait_ci=owner, replied=False,
+            )  # fmt: skip
+            if isinstance(merged, MergeQueued):  # CI restarted between the look and the merge
+                checkpoint = {**task.checkpoint, "watch": True}
+                return Wait("ci", checkpoint, self.clock() + timedelta(seconds=self.merge_poll_s))
             if isinstance(merged, Merged):
-                if first:
-                    self._pulse_clear(run)
+                if owner and (merged.no_ci or merged.flagged):
+                    # the warnings the owner would have seen on a direct /merge
+                    with contextlib.suppress(ChannelError):
+                        await self.channel.send(
+                            run.principal, merged.text,
+                            dedupe_key=f"run:{run.code}:merge-watch-warn",
+                        )  # fmt: skip
+                if first:  # the merged line is the run's only word: never cleared silently
                     await self._deprovision(run.code)
                     await self._end_cli(run.code)
                 # the merged line went out by the trust rules' urgency (``_report_merged``)
@@ -2415,8 +2568,16 @@ class ClaudeRunner:
             now = self._must_get(run.code)
             if now.status != "ready":  # merged (or ended) another way meanwhile: nothing to say
                 return Done({"run": run.code, "status": now.status})
+            assert isinstance(merged, Refused)
             why = merged.reason.removeprefix(f"{run.code} not merged: ")
         assert why is not None
+        if owner:
+            with contextlib.suppress(ChannelError):
+                await self.channel.send(
+                    run.principal, f"{run.code} not merged: {why}. /merge {run.code} to try again.",
+                    dedupe_key=f"run:{run.code}:merge-watch:{task.checkpoint.get('since')}",
+                )  # fmt: skip
+            return done
         note = f"Not merged automatically: {why}. /merge {run.code} when it's ready."
         if first:
             return await self._conclude(run, note=note)
@@ -2585,6 +2746,8 @@ class ClaudeRunner:
         text = reply_text(run, ci, no_ci=no_ci, upstream=upstream, watching=watching)
         if text is not None and note:
             text += f"\n{note}"
+        if text is not None and (did := self.reports.did_line(run)) is not None:
+            text += f"\n{did}"
         event = end_event(run)
         warned = False
         title = end_title(run, ci)
@@ -2615,11 +2778,12 @@ class ClaudeRunner:
         if item is not None:
             self.reports.told(item)
 
-    async def _report_merged(self, run: Run, *, by_owner: bool) -> None:
-        """A merged run's digest line. ``by_owner``: the merge answered the owner's own
-        ``/merge`` (or a yes), which already got the reply, so the line is marked told.
-        Otherwise (EM-7's merge per trust rules) it goes by the ``merged`` level."""
-        item = self.reports.ended(run, end_title(run), urgent=False)
+    async def _report_merged(self, run: Run, *, by_owner: bool, deps: Sequence[str] = ()) -> None:
+        """A merged run's digest line (it lists the dependency files the PR changed, ``deps``).
+        ``by_owner``: the merge answered the owner's own ``/merge`` (or a yes), which already
+        got the reply, so the line is marked told. Otherwise (EM-7's merge per trust rules,
+        or an owner's merge that waited for CI) it goes by the ``merged`` level."""
+        item = self.reports.ended(run, end_title(run, deps=deps), urgent=False)
         if by_owner:
             self.reports.told(item)
             return
@@ -2628,7 +2792,7 @@ class ClaudeRunner:
         if level == "digest":
             return
         try:
-            await self.channel.send(run.principal, end_title(run),
+            await self.channel.send(run.principal, item.title,  # with its did: list
                                     dedupe_key=f"run:{run.code}:merged")  # fmt: skip
         except ChannelError as e:
             log.warning("merge not texted", extra={"run": run.code, "reason": str(e)})
@@ -2924,3 +3088,15 @@ def cleanup_job(deps: CoreDeps) -> CoreJob | None:
     return CoreJob(
         id=CLEANUP_JOB_ID, schedule=CLEANUP_SCHEDULE, run=run, catchup=timedelta(hours=12)
     )
+
+
+def _since(checkpoint: dict[str, Any]) -> datetime | None:
+    """An owner merge watch's start (``since``, code-written ISO with an offset), or None."""
+    raw = checkpoint.get("since")
+    if not isinstance(raw, str):
+        return None
+    try:
+        at = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return at if at.tzinfo is not None else None

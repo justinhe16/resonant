@@ -324,6 +324,7 @@ def build_imessage_stack(
         channel,
         components.principals,
         approval_ttl_s=settings.runner.ask_timeout_minutes * 60,
+        cost_ask_over_usd=settings.trust.cost_ask_over_usd,
     )
     owner_name = components.principals.owner if components.principals_loaded else None
     claude = ClaudeRunner(

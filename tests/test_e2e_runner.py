@@ -396,8 +396,8 @@ async def test_r1_run_command_to_a_pr_link_with_the_pulse_item(
         assert running_line.startswith("Runs (1 active):\n- R1 demo · running · ")
 
         done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL} · 3 files · "), done
-        assert "/merge R1" in done and "⚠ changes .claude/settings.json, Makefile" in done
+        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL} · 4 files · "), done
+        assert "/merge R1" in done and "⚠ changes .claude/settings.json\n" in done
         assert pulse_store.pending(w.conn, ["normal"], utcnow()) == []  # cleared, nothing owed
         cleared = pulse_store.get(w.conn, "core", "run/r1")
         assert cleared is not None and cleared.cleared
@@ -417,7 +417,10 @@ async def test_r1_run_command_to_a_pr_link_with_the_pulse_item(
 
         # the same warning on the way to a merge
         merged = await w.say("/merge R1")
-        assert merged == f"R1 merged: PR #41.\n⚠ changes .claude/settings.json, Makefile\n{PR_URL}"
+        assert merged == (
+            "R1 merged: PR #41.\n⚠ changes .claude/settings.json\n"
+            f"deps changed: package.json\n{PR_URL}"
+        )
 
 
 async def test_r1_chat_request_starts_a_run(
@@ -590,7 +593,7 @@ async def test_r13_merge_by_chat_asks_yes_first(
         prompt = await w.say("merge it")
         assert "merge R1: PR #41 in demo " in prompt and PR_URL in prompt, prompt
         assert prompt.endswith("Reply yes / no")
-        assert "changes .claude/settings.json, Makefile" in prompt
+        assert "changes .claude/settings.json" in prompt
         assert w.gh_calls("merge") == [] and w.run().status == "ready"  # nothing before the yes
         # chat.db times have one-second resolution, and a reply that is not later than the
         # prompt was "sent before the question" (the binding rule): wait a real second.
@@ -644,20 +647,23 @@ async def test_r14_missing_token_only(
 # --- refusals: no CI, .github, a token in the diff -------------------------------------------
 
 
-async def test_no_ci_repo_runs_but_cannot_be_merged(
+async def test_no_ci_repo_runs_and_merges_only_on_the_owners_word(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """GT-1: a repo with no CI at all merges on an explicit /merge, with a warning."""
     w = make_world(tmp_path, resonant_home, chat, monkeypatch, ci=False)
+    (w.gh_dir / "checks_rc").write_text("1")
+    (w.gh_dir / "checks_err").write_text("no checks reported on the 'x' branch")
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         done = await w.next_text()
         assert done.startswith("R1 done: PR #41") and "no CI: demo has no pull_request" in done
-        assert w.run().status == "ready"
+        assert "/merge R1 merges it without CI." in done
+        assert w.run().status == "ready" and w.gh_calls("merge") == []
         assert await w.say("/merge R1") == (
-            "R1 not merged: own/demo has no CI; add a pull_request workflow first "
-            "(or ask me to add CI)."
+            f"R1 merged: PR #41.\n⚠ merged without CI: demo has no CI checks\n{PR_URL}"
         )
-        assert w.gh_calls("merge") == [] and w.run().status == "ready"
+        assert len(w.gh_calls("merge")) == 1 and w.run().status == "merged"
 
 
 async def test_r4_a_github_change_cannot_be_merged(

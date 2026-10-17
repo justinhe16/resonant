@@ -17,6 +17,15 @@ Evaluation order:
    | L2    | Allow                 | ask                               | ask          |
    | L1    | ask with code         | ask with code                     | ask with code|
 
+Standing allows (GT-1, ``standing``: ``resonant.trust.tools.StandingAllows``): an owner's
+own ``inferred`` call of an L2 tool that the owner answered ``yes always`` for before (an
+``allow`` trust rule on ``tool:<name>``) runs as L3. Never for anyone else, never for L1,
+never for ``explicit`` or ``scheduled`` calls (they don't need it, or never get it), and
+never under the kill switch or dry run (both are checked first). Its first prompt offers the
+rule: ``(yes always = don't ask before running <tool> in <scope>)``; the scope and action are
+stored on the approval, and ``resolve_reply`` saves exactly that rule in the same
+transaction as the approval when the owner answers ``yes always``.
+
 Kill switch: kv ``autonomy`` is read on every call, and anything but ``"on"`` (missing or
 garbage) counts as off. ``evaluate`` never returns ``Veto`` yet.
 
@@ -39,9 +48,9 @@ iMessage parser match, and the approval's prompt sent to the actor before the re
 ``occurred_at`` (the sent-before rule). A plain yes/no binds only when exactly one approval
 is pending for the actor, now and when the reply was sent. ``require_code`` needs
 ``yes <code>``; a plain no may deny. ``yes always`` binds the same way but only to an
-approval that offered it (``allow_always``, a worker's trust check; never ``require_code``),
-else ``always_unsupported``. Resolution is idempotent per reply event
-(``resolved_event_id``).
+approval that offered it (``allow_always``: a worker's trust check or an owner's L2 chat
+call; never ``require_code``) and only from the owner, else ``always_unsupported``.
+Resolution is idempotent per reply event (``resolved_event_id``).
 
 Expiry is lazy: every entry point first runs ``expire_due``. Every ``evaluate`` writes one
 ``gate.evaluate`` audit row; every resolution attempt writes one ``approval.resolve`` row.
@@ -55,7 +64,7 @@ import secrets
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, Protocol
 
 from resonant.gate.codes import new_code
 from resonant.gate.summary import summarize, unsafe_args
@@ -76,6 +85,7 @@ from resonant.gate.types import (
 )
 from resonant.principals import Principals
 from resonant.store import approvals as ap
+from resonant.store import trust as trust_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, utcnow
 from resonant.store.tasks import insert_event
@@ -108,6 +118,31 @@ LevelFor = Callable[[Intent], Level | None]
 # The approver names an extension's manifest declares (``Manifest.approvers``). Untrusted:
 # the gate keeps only names that hold the approve grant for that extension.
 ApproversFor = Callable[[str], Sequence[str]]
+
+
+class StandingScope(Protocol):
+    """What a ``yes always`` on one call would save (``trust.tools.ToolScope``)."""
+
+    @property
+    def scope(self) -> str: ...
+
+    @property
+    def action(self) -> str: ...
+
+    @property
+    def text(self) -> str: ...
+
+
+class Standing(Protocol):
+    """The owner's standing allows for chat tools (``trust.tools.StandingAllows``)."""
+
+    def allows(self, intent: Intent) -> object | None:
+        """The rule that lets this call run without asking, or None."""
+        ...
+
+    def offer(self, intent: Intent) -> StandingScope | None:
+        """The rule a ``yes always`` on this call's prompt would save, or None."""
+        ...
 
 
 def no_manifest_approvers(_extension: str) -> Sequence[str]:
@@ -149,6 +184,7 @@ class PolicyGate:
         actions: Mapping[ToolKey, SummaryAction] | None = None,
         approvers_for: ApproversFor = no_manifest_approvers,
         levels: Mapping[ToolKey, LevelFor] | None = None,
+        standing: Standing | None = None,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self.conn = conn
@@ -159,6 +195,7 @@ class PolicyGate:
         self.actions = dict(actions or {})
         self.approvers_for = approvers_for
         self.levels = dict(levels or {})
+        self.standing = standing
         self.clock = clock
         self._tokens: dict[str, str] = {}
 
@@ -169,7 +206,7 @@ class PolicyGate:
         with atomic(self.conn):
             ap.expire_due(self.conn, now)
             autonomy = autonomy_on(self.conn)
-            decision = self._decide(intent, now, autonomy)
+            decision, standing = self._decide(intent, now, autonomy)
             audit(
                 self.conn,
                 "gate.evaluate",
@@ -189,32 +226,60 @@ class PolicyGate:
                     decision.approval_id if isinstance(decision, Allow | NeedsApproval) else None
                 ),
                 reason=decision.reason if isinstance(decision, Deny) else None,
+                standing=standing,
                 args=intent.args,
             )
         return decision
 
-    def _decide(self, intent: Intent, now: datetime, autonomy: bool) -> Decision:
+    def _decide(
+        self, intent: Intent, now: datetime, autonomy: bool
+    ) -> tuple[Decision, bool | None]:
+        """The decision, and whether a standing allow made the call L3 (None: not asked)."""
         if self.registry.get(intent.extension, intent.tool) != intent.spec:
             # Static reasons: the audit row already names the tool, extension and principal.
-            return Deny("tool is not registered with this spec")
+            return Deny("tool is not registered with this spec"), None
         if not self.principals.can(intent.principal, "request", intent.extension):
-            return Deny("not permitted to request this tool")
+            return Deny("not permitted to request this tool"), None
         unsafe = unsafe_args(intent.args)
         if unsafe:
             # Never echo the offending keys or values: they are what's unsafe to show.
-            return Deny(f"args contain unsafe characters ({len(unsafe)} found)")
+            return Deny(f"args contain unsafe characters ({len(unsafe)} found)"), None
         l0_read = intent.effect is Effect.READ and intent.level is Level.L0
         if self.dry_run and not l0_read and not is_store_internal(intent.spec):
-            return DryRun(would=self._summary(intent))
-        verdict = rule(self._level(intent), intent.origin, autonomy)
+            return DryRun(would=self._summary(intent)), None
+        level = self._level(intent)
+        standing: bool | None = None
+        if level is Level.L2 and autonomy and self._standing_eligible(intent):
+            assert self.standing is not None
+            standing = self.standing.allows(intent) is not None
+            if standing:
+                level = Level.L3
+        verdict = rule(level, intent.origin, autonomy)
         if verdict == "allow" and intent.level is Level.L0:
-            return self._allow(intent)
+            return self._allow(intent), standing
         if ap.was_rejected(self.conn, intent.task_id, intent.hash):
-            return Deny(NOT_APPROVED)  # the owner's "no" holds for this intent
+            return Deny(NOT_APPROVED), standing  # the owner's "no" holds for this intent
         last = ap.latest_for_intent(self.conn, intent.task_id, intent.hash)
         if verdict == "allow":
-            return self._allow(intent)
-        return self._ask(intent, now, last, require_code=verdict == "ask_code")
+            # An approval already given for this intent is still spent (single use), e.g.
+            # the yes always that just made the call L3.
+            approved = ap.approved_unused(self.conn, intent.task_id, intent.hash)
+            return self._allow(intent, approved.id if approved else None), standing
+        offer = None
+        if verdict == "ask" and level is Level.L2 and autonomy and self._standing_eligible(intent):
+            assert self.standing is not None
+            offer = self.standing.offer(intent)
+        decision = self._ask(intent, now, last, require_code=verdict == "ask_code", offer=offer)
+        return decision, standing
+
+    def _standing_eligible(self, intent: Intent) -> bool:
+        """A standing allow may apply: the owner's own model-chosen call of a tool at L2."""
+        return (
+            self.standing is not None
+            and intent.origin == "inferred"
+            and intent.principal == self.principals.owner
+            and intent.level is not Level.L1
+        )
 
     def _level(self, intent: Intent) -> Level:
         """The registered level, or the tool's ``levels`` choice between L2 and L3 for this
@@ -256,7 +321,13 @@ class PolicyGate:
         return Allow(token=token, approval_id=approval_id)
 
     def _ask(
-        self, intent: Intent, now: datetime, last: ap.Approval | None, *, require_code: bool
+        self,
+        intent: Intent,
+        now: datetime,
+        last: ap.Approval | None,
+        *,
+        require_code: bool,
+        offer: StandingScope | None = None,
     ) -> Decision:
         approved = ap.approved_unused(self.conn, intent.task_id, intent.hash)
         if approved is not None:
@@ -269,19 +340,27 @@ class PolicyGate:
         task = self.conn.execute("SELECT 1 FROM tasks WHERE id = ?", (intent.task_id,))
         if task.fetchone() is None:
             return Deny(NO_TASK)  # e.g. the router's fast path: nothing could wait
+        summary = self._summary(intent)
+        always = offer is not None and not require_code
+        if always:
+            assert offer is not None
+            summary = f"{summary} (yes always = {offer.text})"
         spec = ap.NewApproval(
             task_id=intent.task_id,
             intent_hash=intent.hash,
             tool=intent.tool,
             effect=intent.effect,
             level=intent.level,
-            summary=self._summary(intent),
+            summary=summary,
             approvers=self.approvers(intent.extension),
             code=new_code(ap.pending_codes(self.conn)),
             expires_at=now + self.ttl,
             require_code=require_code,
             extension=intent.extension,
             requested_by=intent.principal,
+            allow_always=always,
+            always_scope=offer.scope if always and offer is not None else None,
+            always_action=offer.action if always and offer is not None else None,
         )
         approval_id = ap.insert_approval(self.conn, spec, now)
         created = ap.get_approval(self.conn, approval_id)
@@ -397,6 +476,8 @@ class PolicyGate:
                 result = ap.resolve_result([done])
                 if reply.comments and reply.decision == "approve":
                     _add_comments(self.conn, done, reply)
+                if done.always and done.always_scope and done.always_action:
+                    _add_standing_rule(self.conn, done, reply.actor, now)
                 ap.wake_resolved(self.conn, result, now, principal=reply.actor)
             audit(
                 self.conn,
@@ -453,8 +534,11 @@ class PolicyGate:
             target = mine[0]
         if not _sent_before(target, reply):
             return None, "not_sent_before"
-        if reply.always and (not target.allow_always or target.require_code):
-            # Never read as a plain yes: "always" asked for more than this approval offers.
+        if reply.always and (
+            not target.allow_always or target.require_code or reply.actor != self.principals.owner
+        ):
+            # Never read as a plain yes: "always" asked for more than this approval offers,
+            # and only the owner widens trust.
             return None, "always_unsupported"
         if reply.code is None:
             # Judge a plain reply against what the actor had been shown when they sent it,
@@ -505,6 +589,36 @@ def _add_comments(conn: sqlite3.Connection, a: ap.Approval, reply: ApprovalReply
             trace_id=row["trace_id"],
         ),
     )
+
+
+def _add_standing_rule(conn: sqlite3.Connection, a: ap.Approval, actor: str, now: datetime) -> None:
+    """``yes always`` on a tool approval: save the ``allow`` rule its prompt offered."""
+    assert a.always_scope is not None and a.always_action is not None
+    added = trust_store.add_rule(
+        conn,
+        scope=a.always_scope,
+        action=a.always_action,
+        effect="allow",
+        created_from="yes always",
+        now=now,
+        note=f"yes always to {a.code}" if a.code else "yes always",
+    )
+    if not added.existed:
+        audit(
+            conn,
+            "trust.rule_added",
+            task_id=a.task_id,
+            approved_by=actor,
+            rule_id=added.rule.id,
+            scope=added.rule.scope,
+            action_kind=added.rule.action,
+            effect=added.rule.effect,
+            created_from="yes always",
+            approval_id=a.id,
+            tool=a.tool,
+            extension=a.extension,
+            replaced=trust_store.rule_fields(added.replaced),
+        )
 
 
 def _needs(a: ap.Approval) -> NeedsApproval:

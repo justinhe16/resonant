@@ -109,7 +109,8 @@ def cron_min_interval_s(schedule: str) -> int:
 
 
 class Job(_Strict):
-    """A scheduled command. ``effect`` defaults to ``write`` (L1, the safe default)."""
+    """A scheduled command. ``effect`` defaults to ``write`` (L2 unless ``level`` says
+    otherwise: it asks)."""
 
     id: str = Field(pattern=SLUG)
     schedule: str  # 5-field cron, evaluated in `tz` (default: daemon timezone)

@@ -25,7 +25,7 @@ Linear's MCP docs (<https://linear.app/docs/mcp>) say the server accepts "OAuth 
 
 1. In Linear's settings, under your account's security / API section, create a **personal API key**. Pick the permissions you want (Read only, or Read + Write for `save_issue` and `create_comment`) and the teams it may see.
 2. `resonant secret set linear/token` and paste the key.
-3. `resonant ext add repo:linear`. Listing the server's tools needs the key, so it first asks `Send linear/token to mcp.linear.app now?`; answer `y`. It then shows every tool with the pin of what the server reports (`sha256` of its name, description and schemas), the server's unlisted tools as a note, and the escalations (`mcp server "linear" calls https://mcp.linear.app/mcp (http, network), sends secret token as its bearer token`, the two writes at L2). Type `linear` to install. The daemon restarts and texts you.
+3. `resonant ext add repo:linear`. Listing the server's tools needs the key, so it first asks `Send linear/token to mcp.linear.app now?`; answer `y`. It then shows every tool with the pin of what the server reports (`sha256` of its name and the stripped input and output schemas, what the model sees), the server's unlisted tools as a note, and the escalations (`mcp server "linear" calls https://mcp.linear.app/mcp (http, network), sends secret token as its bearer token`, the two writes at L2). Type `linear` to install. The daemon restarts and texts you.
 4. Try it: "what's on my Linear", "make a Linear ticket for the flaky login test" (asks first).
 
 ## When Linear changes a tool

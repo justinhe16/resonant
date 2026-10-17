@@ -6,6 +6,8 @@ never from the model. The model only ever supplies a tool name and arguments.
 Invariants, enforced here at registration:
 - ``pay`` is always L1. Nothing can lower or raise it, including future trust promotion.
 - ``read`` with no secrets is always L0.
+- ``write`` with no level declared is L2 (GT-1): it runs when the owner explicitly asked for
+  it and asks a plain yes otherwise. A tool that can't be undone declares L1 (yes <code>).
 - ``commit=True`` marks irreversible user-visible actions (send, pay, delete). These always
   pause for approval inside a computer-use scope, so they must have a side effect.
 """
@@ -35,7 +37,7 @@ class Level(StrEnum):
 
 DEFAULT_LEVEL: dict[Effect, Level] = {
     Effect.READ: Level.L0,
-    Effect.WRITE: Level.L1,
+    Effect.WRITE: Level.L2,
     Effect.PAY: Level.L1,
 }
 

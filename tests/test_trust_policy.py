@@ -33,7 +33,7 @@ def rule(
 
 
 def test_migration_010(db: sqlite3.Connection) -> None:
-    assert schema_version(db) == latest_version() == 12
+    assert schema_version(db) == latest_version() == 13
     cols = {r["name"] for r in db.execute("PRAGMA table_info(trust_rules)")}
     assert cols == {"id", "scope", "action", "effect", "note", "created_from", "created_at"}
     cols = {r["name"] for r in db.execute("PRAGMA table_info(trust_seen)")}
@@ -135,16 +135,40 @@ def test_defaults() -> None:
     assert (ok.verdict, ok.reason, ok.ok) == ("ok", "seen before", True)
     irr = decide(Check("dori-api", "deploy", irreversible=True), [], frozenset({"deploy"}))
     assert (irr.verdict, irr.reason) == ("ask", "irreversible")
-    paid = decide(Check("aws", "spend", cost_usd=12.5), [], frozenset({"spend"}))
-    assert (paid.verdict, paid.reason) == ("ask", "costs $12.50")
-    both = decide(Check("x", "y", irreversible=True, cost_usd=1), [], frozenset())
-    assert both.reason == "new system, irreversible, costs $1.00"
+    paid = decide(Check("aws", "spend", cost_usd=20.01), [], frozenset({"spend"}))
+    assert (paid.verdict, paid.reason) == ("ask", "costs $20.01")
+    both = decide(Check("x", "y", irreversible=True, cost_usd=25), [], frozenset())
+    assert both.reason == "new system, irreversible, costs $25.00"
+
+
+@pytest.mark.parametrize("cost", [0.01, 12.5, 20.0])
+def test_a_cost_at_or_under_the_threshold_is_not_net_new(cost: float) -> None:
+    # GT-1: a seen action that costs up to trust.cost_ask_over_usd (default $20) is ok.
+    d = decide(Check("aws", "spend", cost_usd=cost), [], frozenset({"spend"}))
+    assert (d.verdict, d.reason) == ("ok", "seen before")
+    new = decide(Check("aws", "spend", cost_usd=cost), [], frozenset())
+    assert new.reason == "new system"  # asks for being new, not for the cost
+
+
+def test_the_cost_threshold_is_configurable() -> None:
+    check = Check("aws", "spend", cost_usd=5)
+    strict = decide(check, [], frozenset({"spend"}), cost_ask_over_usd=0)
+    assert (strict.verdict, strict.reason) == ("ask", "costs $5.00")
+    assert decide(check, [], frozenset({"spend"}), cost_ask_over_usd=5).ok
+    free = Check("aws", "spend", cost_usd=0)
+    assert decide(free, [], frozenset({"spend"}), cost_ask_over_usd=0).ok
+    huge = decide(Check("aws", "spend", cost_usd=99), [], frozenset({"spend"}))
+    assert huge.reason == "costs $99.00"
 
 
 @pytest.mark.parametrize("cost", [math.nan, math.inf])
 def test_a_non_finite_cost_asks(cost: float) -> None:
     d = decide(Check("aws", "spend", cost_usd=cost), [], frozenset({"spend"}))
     assert d.verdict == "ask" and "money" in d.reason
+    big = decide(
+        Check("aws", "spend", cost_usd=cost), [], frozenset({"spend"}), cost_ask_over_usd=1e9
+    )
+    assert big.verdict == "ask"
 
 
 # --- decide: rules ------------------------------------------------------------------------

@@ -113,6 +113,16 @@ def test_approval_ttl_bounds(resonant_home: Path, ttl: int) -> None:
         load_settings()
 
 
+def test_trust_cost_threshold(resonant_home: Path) -> None:
+    assert load_settings().trust.cost_ask_over_usd == 20.0
+    (resonant_home / "config.yaml").write_text("trust:\n  cost_ask_over_usd: 5\n")
+    assert load_settings().trust.cost_ask_over_usd == 5.0
+    for bad in ("-1", ".inf", ".nan"):
+        (resonant_home / "config.yaml").write_text(f"trust:\n  cost_ask_over_usd: {bad}\n")
+        with pytest.raises(ValidationError):
+            load_settings()
+
+
 # --- Phase 3 sections -----------------------------------------------------------------
 
 
