@@ -1439,7 +1439,9 @@ class ClaudeRunner:
         ``merge_wait_s`` counted from now. An auto-merge watch already waiting on the run is
         replaced; an owner's watch already waiting is kept."""
         task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
-        live = task is not None and task.status in ("queued", "waiting")
+        # A watch caught mid-step (running) is replaced too: Loop.cancel cancels its step, else
+        # it would go on beside the owner's watch.
+        live = task is not None and task.status in ("queued", "running", "waiting")
         if task is not None and live and task.checkpoint.get("merge"):
             if task.checkpoint.get("by") == "owner":
                 return
@@ -1448,7 +1450,7 @@ class ClaudeRunner:
             else:
                 with atomic(self.conn):
                     task_store.set_status(
-                        self.conn, task.id, "cancelled", expect=("queued", "waiting")
+                        self.conn, task.id, "cancelled", expect=("queued", "running", "waiting")
                     )
         spec = NewTask(
             kind=TASK_KIND,

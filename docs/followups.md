@@ -228,7 +228,7 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 `test_reads_200_rows_under_100ms` and `test_bench_e2e_cli_json` sometimes fail on a loaded CI runner and pass on a rerun. Give them headroom (a relative bound, or a marker that skips the timing assert in CI) so a red build always means a real failure.
 
-*2026-10-17, TR-1 CI:* `test_runner_fork.py::test_owner_merge_takes_over_an_auto_merge_watch` (GT-1) failed once on CI: right after `/merge` it expects the auto watch's task to be `cancelled`, but a watch caught mid-step is still `running` until its step returns. It passes locally. *Fixed in RC-1:* the test now waits for the status (`until(...)`); it failed on RC-1's first CI run too.
+*2026-10-17, TR-1 CI:* `test_runner_fork.py::test_owner_merge_takes_over_an_auto_merge_watch` (GT-1) failed once on CI: right after `/merge` it expects the auto watch's task to be `cancelled`, but a watch caught mid-step is still `running` until its step returns. It passes locally. *Fixed in RC-1:* it wasn't only the test. `_watch_merge` replaced an auto-merge watch only while it was `queued` or `waiting`, so an owner `/merge` that landed while the watch was mid-step left the old watch running beside the new one. It now cancels a `running` watch too (`Loop.cancel` cancels the step), and the test waits for the status. It failed on both of RC-1's CI runs before the fix.
 
 ## Labeler near-misses
 
