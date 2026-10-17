@@ -59,3 +59,42 @@ jobs:
           git status --porcelain -- dist
           git diff --exit-code -- dist
           test -z "$(git status --porcelain -- dist)"
+
+  relay:
+    # Builds the Fly image from the repo root and smoke-tests it: generated config.json,
+    # security headers, /healthz, and no secret values in its logs. Never deploys.
+    # (The relay's unit tests run in the test job with the rest of pytest.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build -f relay/Dockerfile -t resonant-relay:ci .
+      - name: smoke test the image
+        run: |
+          docker run -d --name relay -p 8080:8080 \
+            -e SUPABASE_URL=https://ci-example.supabase.co \
+            -e SUPABASE_ANON_KEY=sb_publishable_ci \
+            -e RELAY_STATUS_TOKEN=ci-token-not-a-secret \
+            -e NTFY_URL=https://127.0.0.1:9 \
+            -e NTFY_TOPIC=ci-topic-not-a-secret \
+            -e CHECK_EVERY=2 -e READ_FAIL_AFTER=1s \
+            resonant-relay:ci
+          for _ in $(seq 30); do curl -fsS http://127.0.0.1:8080/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8080/healthz | grep -q '"ok": true'
+          curl -fsS http://127.0.0.1:8080/config.json | grep -q '"source": "supabase"'
+          curl -fsS -D headers.txt -o /dev/null http://127.0.0.1:8080/
+          cat headers.txt
+          grep -qi "^content-security-policy: .*script-src 'self'.*connect-src 'self' https://ci-example.supabase.co" headers.txt
+          grep -qi "^strict-transport-security:" headers.txt
+          grep -qi "^x-content-type-options: nosniff" headers.txt
+          grep -qi "^referrer-policy: no-referrer" headers.txt
+          sleep 5
+          docker logs relay > relay.log 2>&1
+          cat relay.log
+          grep -q "cannot read Supabase" relay.log
+          if grep -E "ci-token-not-a-secret|ci-topic-not-a-secret" relay.log; then exit 1; fi
+          test "$(docker inspect -f '{{.State.Running}}' relay)" = true
+          if curl -fsS http://127.0.0.1:8080/config.json | grep -q '"local"'; then exit 1; fi
+          test "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is http://127.0.0.1:8080/../etc/passwd)" = 404
+      - name: relay logs
+        if: failure()
+        run: docker logs relay || true

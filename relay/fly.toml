@@ -1,0 +1,46 @@
+# Fly.io config for the Resonant relay (relay/README.md). Deploy from the repo root:
+#   fly deploy --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .
+# Exactly ONE machine: the dead-man checker keeps its alert state in memory, so a second
+# machine would send every alert twice.
+
+app = "resonant-relay"          # replaced by the name you pick at `fly launch`
+primary_region = "iad"          # any region; the checker only talks to Supabase and ntfy
+
+[build]
+  dockerfile = "Dockerfile"     # relative to this file; the context is the repo root
+
+[env]
+  PORT = "8080"
+  RELAY_READ = "rpc"
+  CHECK_EVERY = "60"
+  STALE_AFTER = "5m"
+  # READ_FAIL_AFTER defaults to STALE_AFTER. NTFY_URL defaults to https://ntfy.sh.
+  # Everything else (SUPABASE_URL, SUPABASE_ANON_KEY, RELAY_STATUS_TOKEN, NTFY_TOPIC,
+  # NTFY_TOKEN, WEBHOOK_URL) is set with `fly secrets set`, never here.
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"    # the checker must run all the time
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+    hard_limit = 100
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/healthz"
+
+# The watchdog exits the process when the checker stops checking; restart it every time.
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

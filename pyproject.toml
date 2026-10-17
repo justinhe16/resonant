@@ -39,19 +39,22 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "ASYNC"]
 ignore = ["S101"]  # assert is fine in tests
 
 [tool.ruff.lint.isort]
-known-first-party = ["resonant", "resonant_sdk"]
+known-first-party = ["resonant", "resonant_sdk", "resonant_relay"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S"]
+"relay/tests/**" = ["S"]
 
 [tool.pyright]
-include = ["packages", "scripts", "tests"]
+include = ["packages", "scripts", "tests", "relay"]
+extraPaths = ["relay"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "relay/tests"]
+pythonpath = ["relay"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = ["integration: needs a real external system (Ollama, Messages.app); run with -m integration"]

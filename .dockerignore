@@ -1,0 +1,7 @@
+# Docker reads this from the build context, which is the repo root for relay/Dockerfile.
+# Allow-list: the image needs only the relay package and the committed dashboard build.
+*
+!relay/resonant_relay
+!dashboard/dist
+**/__pycache__
+**/*.pyc
