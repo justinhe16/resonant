@@ -4,7 +4,7 @@
 It takes the flags the runner passes (and ignores most), reads the prompt on stdin like the
 real CLI, and acts out one scenario, chosen by an extra ``--scenario NAME`` the test puts in
 ``claude_cmd``. Only the standard library. cwd is the run's worktree (or scratch dir) and
-``HOME`` is ``<run>/home``, so ``<run>/tmp`` is where it leaves notes for the test:
+``TMPDIR`` is ``<run>/tmp``, which is where it leaves notes for the test:
 ``argv.json`` (flags, env, cwd and the prompt of every invocation) and
 pid files.
 
@@ -74,12 +74,14 @@ ap.add_argument("--check")
 ap.add_argument("--check-flag", action="append", default=[])
 ap.add_argument("--guard-probe")
 ap.add_argument("--wait-message", type=float, default=0.0)
+ap.add_argument("--self-op", action="append", default=[])  # resonant restart|update, in order
 args = ap.parse_args()
 
 prompt = sys.stdin.read()
 session = args.resume or args.session_id
-# cwd is the run's worktree (or scratch dir); HOME is <run>/home
-run_dir = os.path.dirname(os.environ["HOME"])
+# cwd is the run's worktree (or scratch dir); TMPDIR is <run>/tmp whatever the guard (HOME is
+# <run>/home under the thin guard, the owner's HOME with it off)
+run_dir = os.path.dirname(os.environ["TMPDIR"].rstrip("/"))
 tmp = os.path.join(run_dir, "tmp")
 scenario = args.scenario
 
@@ -259,6 +261,13 @@ if not args.resume:
                 args.ask, _, opts = value.partition("|")
                 args.options = opts or None
                 break
+    for op in args.self_op:  # GD-1: `resonant restart` / `resonant update`
+        rc, text = cli(op)
+        if rc == 0 and "restarts in about" in text:
+            time.sleep(3600)  # as told: wait for the restart to stop the session
+        if rc != 0:
+            result(f"Didn't {op}: {text.strip()[:80]}")
+            sys.exit(0)
     if args.ask:
         extra = ["--options", args.options] if args.options else []
         rc, _ = cli("ask", args.ask, *extra)

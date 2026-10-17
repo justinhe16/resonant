@@ -281,11 +281,11 @@ Times, codes and figures below are examples.
 
 ## 14. Employee mode: Claude workers
 
-Step 13 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen`), then do terminal step 1 below before anything else. Until step 2 (the Claude token) is done, everything else keeps working, while `/runs` and "spawn a claude to …" answer `The runner isn't set up: secret runner/claude_token …` and nothing can start a run.
+Step 13 is done. Deploy with `/update` (or `git pull --ff-only && uv sync --frozen`), then do terminal step 1 below before anything else. Workers need a Claude credential: with the default `runner.guard: off` your own `claude` login on the Mini is enough (step 2); until one works, everything else keeps working, while `/runs` and "spawn a claude to …" answer `The runner isn't set up: a Claude login (or secret runner/claude_token …)` and nothing can start a run.
 
-**You can start with just the Claude token** (steps 1, 2 and 6). Workers run as soon as it is set: a scratch run works fully, and a repo run works in a worktree of your checkout and commits to its local branch, but can't push or open a PR yet. The start reply says so up front (`On it: R1 · dori. … Heads up: no push yet (GitHub App not set up); the work stays on a local branch.`) and the end reply names the branch (`R1 done (4m): work is on local branch resonant/r1-… in ~/code/dori; can't push yet: the GitHub App isn't set up.`). Steps 3 and 4 unlock the rest, in any order: the GitHub App lets workers push and open PRs (it needs step 4 too, since Resonant finds and checks the PR with its own token), and Resonant's own token unlocks cloning private repos (until then a private repo needs a checkout already in `~/code/<name>`; a public one is cloned anonymously), naming repos it hasn't seen, merging, creating repos, adding CI and fork runs. Each of those says what it needs when asked, and `/runs` lists what's still missing.
+**You can start with just Claude** (steps 1 and 2). Workers run as soon as it is set: a scratch run works fully, and a repo run works in a worktree of your checkout and commits to its local branch, but can't push or open a PR yet. The start reply says so up front (`On it: R1 · dori. … Heads up: no push yet (GitHub App not set up); the work stays on a local branch.`) and the end reply names the branch (`R1 done (4m): work is on local branch resonant/r1-… in ~/code/dori; can't push yet: the GitHub App isn't set up.`). Steps 3 and 4 unlock the rest, in any order: the GitHub App lets workers push and open PRs (it needs step 4 too, since Resonant finds and checks the PR with its own token), and Resonant's own token unlocks cloning private repos (until then a private repo needs a checkout already in `~/code/<name>`; a public one is cloned anonymously), naming repos it hasn't seen, merging, creating repos, adding CI and fork runs. Each of those says what it needs when asked, and `/runs` lists what's still missing.
 
-What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an employee. "spawn a claude to build out the search page in dori" gets `On it: R4 · dori.`, and a Claude Code worker starts in a git worktree of your real checkout, `~/code/<repo>`, with your `.env` files, Docker and the network. An ask with no repo ("do a manual db update in dori-prod …") gets an empty scratch dir. Workers act on standing trust. They ask you only for something net new (a new system, a new kind of action, anything irreversible, anything that costs money), and they ask questions when they need you (`R4 asks: …`). Good news (a PR, done, merged) goes into the hourly digest; failures, questions and checks text you right away. The **thin guard** (a macOS sandbox) only protects Resonant itself: workers can't write `~/.resonant` or the installed daemon, read the Keychain or Messages, signal the daemon, add auto-start entries or reach the API port. Codes (`R1`, `K4`), PR numbers and times below are examples.
+What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an employee. "spawn a claude to build out the search page in dori" gets `On it: R4 · dori.`, and a Claude Code worker starts in a git worktree of your real checkout, `~/code/<repo>`, with your `.env` files, Docker and the network. An ask with no repo ("do a manual db update in dori-prod …") gets an empty scratch dir. Workers act on standing trust. They ask you only for something net new (a new system, a new kind of action, anything irreversible, anything that costs money), and they ask questions when they need you (`R4 asks: …`). Good news (a PR, done, merged) goes into the hourly digest; failures, questions and checks text you right away. **By default there is no sandbox** (`runner.guard: off`, GD-1): a worker runs like you at the keyboard of this dedicated Mini, with your real `HOME`, so it loads your `~/.claude` (skills such as `/robot-surf`, your `CLAUDE.md`, settings and MCP servers) and, with no token set, your `claude` login. It follows the trust rules because it is told to; nothing stops it reading the Keychain or `~/.resonant`. `runner.guard: thin` brings back the **thin guard** (a macOS sandbox that only protects Resonant itself: workers can't write `~/.resonant` or the installed daemon, read the Keychain or Messages, signal the daemon, add auto-start entries or reach the API port), at the cost of your Claude setup and of working on Resonant itself. Codes (`R1`, `K4`), PR numbers and times below are examples.
 
 ### In the terminal on the Mini
 
@@ -296,13 +296,13 @@ What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an
    ```
 
    `resonant status` shows `daemon  up`. `scripts/bootstrap.sh --check` shows `store schema 12  PASS` and `runs table  PASS`.
-2. **Claude Code, `gh` and the Claude token.** Claude Code must be installed (`claude --version`), and so must `gh` at `/opt/homebrew/bin/gh` (`runner.gh_path`; `brew install gh` if it isn't). `claude setup-token` prints a long-lived token for your subscription. Then:
+2. **Claude Code, `gh` and a Claude login.** Claude Code must be installed (`claude --version`), and so must `gh` at `/opt/homebrew/bin/gh` (`runner.gh_path`; `brew install gh` if it isn't). With the default `runner.guard: off`, **your own login is enough**: run `claude` once in the Mini's terminal and log in (`claude auth status` says you are). Resonant checks it with `claude auth status` (cached for 10 minutes) and asks for a token only when no login works. Optional, and required with `runner.guard: thin`: a token. `claude setup-token` prints a long-lived token for your subscription, then:
 
    ```sh
    resonant secret set runner/claude_token    # paste it at the hidden prompt, twice
    ```
 
-   For API billing instead, set `runner/anthropic_key` (and `runner.max_budget_usd` in config).
+   A set token wins over your login. For API billing instead, set `runner/anthropic_key` (and `runner.max_budget_usd` in config); it is used only when no token is set, and it is the only time `ANTHROPIC_API_KEY` reaches a worker.
 3. **The GitHub App** (workers' per-run tokens: one repo, one hour, PRs as `<app>[bot]`; [`repos-plan.md`](repos-plan.md) D10, kept by the employee plan). Without it workers still run and commit locally; this is what lets them push and open PRs:
    1. On github.com: Settings → Developer settings → GitHub Apps → New GitHub App. Any name and homepage URL; untick **Webhook → Active**.
    2. Repository permissions:
@@ -338,7 +338,7 @@ What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an
    resonant secret set runner/github_public_token
    ```
 
-6. **The authenticated sandbox probe.** It proves the guard's denies and that a real `claude -p` authenticates inside it:
+6. **Only with `runner.guard: thin`: the authenticated sandbox probe.** With the default `off`, `resonant sandbox check` prints `guard: off …` and skips every probe (`--thin` probes the profile anyway, before you switch). Under `thin` it proves the guard's denies and that a real `claude -p` authenticates inside it:
 
    ```sh
    read -rs T   # paste the Claude token, then Enter; nothing is shown or saved to history
@@ -348,9 +348,12 @@ What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an
    No row `FAIL`, and `claude -p with CLAUDE_CODE_OAUTH_TOKEN` and `daemon env holds no secrets` `PASS` (a `SKIP` whose control can't run here, such as no running Docker socket, is fine). The token is in that one command's environment only: don't put it in a file, a command line or the LaunchAgent. Run `resonant sandbox check` again after every macOS update.
 7. `scripts/bootstrap.sh --check`, all advisory:
    - `runs table  PASS  schema v11` (or later);
-   - `runner sandbox  PASS`;
+   - `runner sandbox`: `SKIP  runner.guard is off: …` (the default), or `PASS` under `thin`;
+   - `runner guard  PASS  off: workers run like you at the keyboard …` (or `thin: …`);
+   - `runner repo resonant  PASS  /Users/<you>/resonant (registered at start)`: the daemon's own checkout (`ops.repo_path`) is the repo `resonant`, no config needed;
    - `runner github app  PASS  app 123456, installation 78901234`;
-   - `runner secret runner/claude_token (or runner/anthropic_key)`, `runner secret runner/github_token` and `runner secret runner/github_app_key`: `PASS  present (value not read)`. Until steps 3–4 are done, their rows (and `runner github app`) say `FAIL  … workers still run; needed to push and open PRs: …`: advisory, not a blocker;
+   - `runner secret runner/claude_token (or runner/anthropic_key)`: `PASS  present (value not read)`, or with the guard off and no token `PASS  not set: your own claude login works (guard off)`;
+   - `runner secret runner/github_token` and `runner secret runner/github_app_key`: `PASS  present (value not read)`. Until steps 3–4 are done, their rows (and `runner github app`) say `FAIL  … workers still run; needed to push and open PRs: …`: advisory, not a blocker;
    - `runner secret runner/github_public_token (fork runs)`: `PASS`, or `SKIP` if you skipped step 5;
    - `runner code dir`: `SKIP` until the first run creates `~/code` (it clones a repo there the first time it is used), then `PASS`;
    - `runner repos`: `SKIP` is fine. Repos don't need listing: they are registered the first time you name one (or `/repo add`). An entry in `runner.repos` is only a per-repo override (`path` for a checkout outside `~/code`, `allow_github_changes: false`, `base`);
@@ -369,7 +372,7 @@ A small ask on a repo with CI, from iMessage: `/run <repo> add a blank line at t
 
 - **The worker drove its PR with the App's token.** The PR exists, is opened by `<app>[bot]`, and the transcript (`~/.resonant/runner/transcripts/R1.jsonl`) shows `gh pr create` and `gh pr checks --watch` succeeding. Those two are untested against the real `gh` with an installation token; if either fails, send the error to Claude.
 - **The worktree and the checkout.** `~/code/<repo>` was cloned (or your existing checkout was used), the run worked in `~/code/.worktrees/<repo>/R1` on branch `resonant/r1-…`, and your checkout's own branch and files are unchanged. A checkout `.env` was linked into the worktree and not committed.
-- **Claude's own sandbox is off, ours is on.** The transcript has no `sandbox_apply` or permission errors, and `--max-turns` was accepted. (The run passes `--settings '{"sandbox":{"enabled":false}}'`.)
+- **Your Claude setup loaded.** With the guard off the session runs with your `HOME`: the transcript's `init` line lists your MCP servers and skills, and there are no permission errors (`--permission-mode bypassPermissions`); `--max-turns` was accepted. (Under `thin` it has project settings only and passes `--settings '{"sandbox":{"enabled":false}}'`; no `sandbox_apply` errors.)
 - **The usage-limit text.** If the subscription's limit is hit, the run goes to `waiting` and resumes by itself. If it fails instead with the limit's text, send the text to Claude (`usage_limit()` in `runners/claude.py`).
 - **No token anywhere.** `grep -c '<first 6 chars of each token>' ~/.resonant/logs/resonant.jsonl ~/.resonant/runner/transcripts/R1.jsonl` and the `audit_log` query from step 12 all print `0`.
 - **First fork run** (only with step 5): `/run github.com/<someone>/<public repo> fix <something small>`. The fork appears under your account, the App mints a token for it (the session pushes its branch there), Resonant asks `[K4] R1 wants to external_pr on <someone>/<repo>: …`, and only after `yes` does the upstream PR appear.
@@ -387,16 +390,18 @@ A small ask on a repo with CI, from iMessage: `/run <repo> add a blank line at t
 9. **Repos.** `/repos` lists what Resonant knows; `/repo add <owner>/<name>` registers one (`Heads up: main isn't protected.` if it isn't).
 10. **Cancel and the kill switch.** `/cancel R1` → `R1 cancelled.` `/kill` during a run → `kill switch engaged, 1 run ended`; `pgrep -fl claude` on the Mini shows nothing of that run within seconds. `/resume` doesn't restart it.
 11. **Restart mid-run.** `/restart resonant` while a run works: after `Back up …` the same run finishes, with one PR, not two.
+12. **Work on Resonant itself.** "spawn a claude to fix the typo in the README in resonant" → `On it: R1 · resonant.`; it works in `~/code/.worktrees/resonant/R1` (never in `~/resonant`, the live daemon) and opens a PR. "spawn a claude to restart resonant and check it came back" → the worker runs `resonant restart` without asking (your ask said "restart resonant"; "restart it" or "redeploy it" work too), you get `Back up (…)`, and the run resumes and finishes. Without that in the ask the worker's `resonant restart` asks you first: `[K4] R1 wants to restart on resonant: … Reply yes / yes always / no`; `yes always` makes the next one go through. `resonant update` (pull `main`, `uv sync`, restart, as `/update`) works the same way; it deploys only what is merged.
 
 ### What to expect
 
 - A run gets 45 minutes of session time (`runner.max_minutes`). Time waiting for your answer doesn't count. An unanswered question times out after 4 hours (`runner.ask_timeout_minutes`), and the worker uses its judgment or stops. The hourly digest repeats unanswered questions.
 - Worktrees and run dirs (`~/resonant-runs/R1`) are deleted on merge, on `/cancel`, or 7 days after the run ends. Your checkouts in `~/code` are never deleted, and your own branches are never moved.
-- Workers are trusted like a coworker at the keyboard: they can read your `.env` files and the disk, use the network and Docker, and change your checkouts' `.git`. The guard protects Resonant, not your repos.
+- Workers are trusted like you at the keyboard: they can read your `.env` files and the disk, use the network and Docker, change your checkouts' `.git`, and with the guard off (the default) also reach Resonant's own state and the Keychain. They follow the trust rules and ask before anything net new because they are told to; under `thin` the guard also protects Resonant.
+- A worker restarts or deploys Resonant only with `resonant restart`/`update`, never `launchctl` by hand (its prompt says so): that way you get `Back up`, and its run resumes without spending one of its two crash attempts.
 
 - **Verify:** `scripts/bootstrap.sh --check` and `resonant sandbox check`.
 - **Expected:** exit 0; `runner sandbox  PASS`, `runs table  PASS`, `runner github app  PASS` and the runner secret rows `PASS` once steps 2–4 are done.
-- **Rollback:** `/kill` stops every run at once. `resonant secret rm runner/claude_token` keeps new runs from starting; `resonant secret rm runner/github_app_key` keeps new runs from pushing (they commit locally). Revoke `runner/github_token` on github.com and uninstall the App (Settings → Applications) to cut GitHub access.
+- **Rollback:** `/kill` stops every run at once. To put the sandbox back, set `runner: {guard: thin}` in `~/.resonant/config.yaml` and restart (then a token is required, and workers can't work on Resonant's own repo). `resonant secret rm runner/claude_token` keeps new runs from starting; `resonant secret rm runner/github_app_key` keeps new runs from pushing (they commit locally). Revoke `runner/github_token` on github.com and uninstall the App (Settings → Applications) to cut GitHub access.
 
 ## 15. Phase 4: the remote dashboard and the dead-man switch
 

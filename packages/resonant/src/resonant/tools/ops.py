@@ -191,7 +191,7 @@ class Ops:
         try:
             self.runner.spawn_detached(restart_later_argv(DAEMON_LABEL, RESTART_DELAY_S))
         except OSError as e:
-            clear_restart(self.conn)
+            clear_restart(self.conn, planned=True)
             raise ToolFailed(f"couldn't start the restart helper ({type(e).__name__})") from None
 
     async def restart_resonant(self) -> dict[str, Any]:

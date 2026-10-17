@@ -65,6 +65,7 @@ class Components:
     principals_loaded: bool = True  # False: principals.yaml missing, channels deny all
     runners: dict[str, Runner] = field(default_factory=dict[str, Runner])  # name -> runner
     extensions: ExtensionHost | None = None  # None only in tests that build by hand
+    ops_runner: OpsRunner | None = None  # the ops tools' subprocesses (None: the real one)
 
     def chat_specs(self) -> list[ToolSpec]:
         """Every registered spec a chat step can call: builtins and extension tools, never
@@ -198,5 +199,6 @@ def build_components(
         executor=executor,
         handlers=handlers,
         principals_loaded=loaded,
+        ops_runner=ops_runner,
         extensions=host,
     )

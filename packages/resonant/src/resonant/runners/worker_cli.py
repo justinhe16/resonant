@@ -19,8 +19,10 @@ run's live session leader or a descendant of it. A token copied out of a run is 
 any other process.
 
 The protocol is one JSON line each way. Request: ``{"token", "cmd", ...}`` with ``cmd`` one
-of ``ask``/``note``/``check``. Reply: ``{"text", "exit"}``; the shim prints ``text`` (plain
-text for Claude to read) and exits with ``exit``:
+of ``ask``/``note``/``check``/``restart``/``update`` (GD-1: restart Resonant, or pull its main,
+sync and restart; the run is stopped by the restart and resumed after it). Reply:
+``{"text", "exit"}``; the shim prints ``text`` (plain text for Claude to read) and exits with
+``exit``:
 
     0  ok: the answer, the note recorded, or the check is ok
     1  the check was denied: don't do it
@@ -48,7 +50,7 @@ import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import psutil
 
@@ -101,7 +103,14 @@ class Check:
     cost_usd: float = 0.0
 
 
-Request = Ask | Note | Check
+@dataclass(frozen=True)
+class SelfOp:
+    """``resonant restart`` or ``resonant update``: Resonant itself (GD-1)."""
+
+    op: Literal["restart", "update"]
+
+
+Request = Ask | Note | Check | SelfOp
 
 
 @dataclass(frozen=True)
@@ -172,7 +181,9 @@ def parse_request(obj: Any) -> Request:
             _flag(req, "irreversible"),
             float(cost),
         )
-    raise BadRequest("unknown command; use ask, note or check")
+    if cmd == "restart" or cmd == "update":
+        return SelfOp(cmd)
+    raise BadRequest("unknown command; use ask, note, check, restart or update")
 
 
 # --- the control dir --------------------------------------------------------------------------
@@ -245,6 +256,10 @@ _SHIM_SOURCE = r'''
       Report meaningful progress. --urgent only for what the owner must see now.
   resonant check --system S --action A [--irreversible] [--cost USD] "<what>"
       Before anything that could be net new: ok (go ahead) or denied (don't).
+  resonant restart
+      Restart Resonant itself. This session is stopped by the restart and resumed after it.
+  resonant update
+      Deploy Resonant: pull main in its checkout, sync, restart (as /update does).
 
 Exit codes: 0 ok (answered, noted, check ok); 1 check denied; 2 usage error;
 3 no answer yet (end your turn, you'll be resumed); 4 Resonant can't be reached.
@@ -276,6 +291,8 @@ def main():
     c.add_argument("--irreversible", action="store_true")
     c.add_argument("--cost", type=float, default=0.0)
     c.add_argument("what", nargs="+")
+    sub.add_parser("restart", help="restart Resonant (this session is resumed after it)")
+    sub.add_parser("update", help="pull Resonant's main, sync and restart")
     args = p.parse_args()
     if args.cmd is None:
         p.print_help()
@@ -286,6 +303,8 @@ def main():
                "urgent": args.urgent}
     elif args.cmd == "note":
         req = {"cmd": "note", "text": " ".join(args.text), "urgent": args.urgent}
+    elif args.cmd in ("restart", "update"):
+        req = {"cmd": args.cmd}
     else:
         req = {"cmd": "check", "system": args.system, "action": args.action,
                "irreversible": args.irreversible, "cost_usd": args.cost,

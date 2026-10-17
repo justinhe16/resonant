@@ -65,7 +65,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -75,7 +75,7 @@ from zoneinfo import ZoneInfo
 import psutil
 
 from resonant import killswitch
-from resonant.config import RunnerConfig
+from resonant.config import RunnerConfig, RunnerRepo
 from resonant.gate.codes import clean_external
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import (
@@ -88,9 +88,11 @@ from resonant.loop.types import (
     Task,
     Wait,
 )
+from resonant.ops import take_planned
 from resonant.redact import Redactor
 from resonant.runner import github_app as github_app_mod
 from resonant.runner.checks import CheckFailed, GitError
+from resonant.runner.claude_auth import LOGIN_HOW, LoginCheck, auth_source
 from resonant.runner.cleanup import (
     RUN_CODE,
     cleanup,
@@ -138,6 +140,7 @@ from resonant.runners.worker_desk import (
     OpenQuestion,
     Relayed,
     RelayRefused,
+    SelfOps,
     TrustChecker,
     WorkerDesk,
     WorkerEvent,
@@ -149,6 +152,7 @@ from resonant.sandbox import (
     default_deny_exec,
     default_path_dirs,
     link_tools,
+    owner_env,
     prepare_dirs,
     resolve_tool,
     scratch_env,
@@ -156,6 +160,7 @@ from resonant.sandbox import (
 )
 from resonant.sandbox.probes import cached_self_check
 from resonant.secrets import (
+    CLAUDE_MISSING,
     GITHUB_APP_KEY_REF,
     GITHUB_PUBLIC_TOKEN_REF,
     GITHUB_TOKEN_REF,
@@ -182,6 +187,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 RUNNER_NAME = "claude"
+SELF_REPO_NAME = "resonant"  # the daemon's own checkout, registered at start (GD-1)
+NO_GH_DIR = "gh-none"  # an empty gh config dir for runs with no GitHub token
 TASK_KIND = "run"
 MAX_ATTEMPTS = 2  # a session, and one resume after a daemon crash
 MAX_WAIT_S = 24 * 3600.0  # usage-limit waiting, in total
@@ -259,6 +266,25 @@ WORKER_PROMPT = (
     "deploy, a write to production data, an outgoing email or message, spending money, deleting "
     "data, a force-push, or a system you haven't used in this task. Go ahead only on ok; on "
     "denied, don't. Replies can end with messages from the owner: follow them."
+)
+# GD-1, when the daemon can restart itself for a worker (``self_ops``).
+RESTART_PROMPT = (
+    " `resonant restart` restarts Resonant itself and `resonant update` deploys it (pulls its "
+    "main, syncs, restarts); your session is stopped by the restart and resumed after it. Never "
+    "restart or stop Resonant any other way (launchctl, kill, `resonant daemon`): your session "
+    "runs under it."
+)
+# GD-1: a run on Resonant's own repo (the daemon's checkout, ``ops.repo_path``).
+SELF_REPO_PROMPT = (
+    "\n\nThis repo is Resonant itself: the running daemon is the checkout at {checkout}. "
+    "Work only in your worktree; never edit, commit in or switch branches in that checkout. "
+    "A change reaches the running daemon only once it is merged to main and deployed with "
+    "`resonant update`; `resonant restart` only restarts."
+)
+# Put in front of the resume prompt after a restart the run asked for (``resonant restart``).
+RESTART_NOTE = (
+    "Resonant restarted as you asked; the restart stopped your session and this resumes it. "
+    "Check that what you wanted from the restart happened, then carry on."
 )
 RESUME_PROMPT = (
     "Your session was interrupted. Continue the task you were given. If it is already done, "
@@ -687,6 +713,11 @@ class ClaudeRunner:
         trust: TrustChecker | None = None,
         submit: Callable[[Event], bool] | None = None,
         ask_block_s: float = BLOCK_S,
+        home: Path | None = None,
+        login_check: Callable[[], Awaitable[bool]] | None = None,
+        self_ops: SelfOps | None = None,
+        owner: str | None = None,
+        self_repo: Path | None = None,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -701,7 +732,15 @@ class ClaudeRunner:
         decides ``resonant check`` (EM-4's ``TrustChecks``; without it every check is
         denied), ``submit`` wakes a run's task with an event (``Loop.submit``) and
         ``ask_block_s`` is how long one ``resonant ask`` call waits. ``merge_wait_s`` and
-        ``merge_poll_s`` bound an auto-merge's wait for CI (EM-7)."""
+        ``merge_poll_s`` bound an auto-merge's wait for CI (EM-7).
+
+        GD-1: ``runner.guard`` picks the wall. ``off``: no ``wrap`` and no self-check, the
+        session's ``HOME`` is ``home`` (the owner's; tests pass a fake), and with no Claude
+        secret the owner's own ``claude`` login is used when ``login_check`` says it works
+        (by default ``claude auth status``, cached). ``self_ops`` (``tools.ops.Ops``) is what a
+        worker's ``resonant restart|update`` runs, ``owner`` the principal whose ask can
+        include that, and ``self_repo`` the daemon's own checkout (``ops.repo_path``),
+        registered at start as the repo ``resonant`` with that ``path``."""
         self.conn = conn
         self.cfg = runner
         self.channel = channel
@@ -764,9 +803,83 @@ class ClaudeRunner:
             redactor_for=lambda code: self._run_redactors.get(code) or Redactor(),
             on_note=self._on_note,
             block_s=ask_block_s,
+            self_ops=self_ops,
+            owner=owner,
+            on_restart=self._on_self_restart,
         )
+        self.home = home or Path.home()
+        self._login_check: Callable[[], Awaitable[bool]] = login_check or LoginCheck(
+            self._claude_argv, self.home
+        )
+        self.self_repo = self_repo
         self.reports = WorkerReports(conn, clock=clock, tz=self.tz)
         self.desk.events.subscribe(self._on_worker_event)
+
+    @property
+    def guard(self) -> str:
+        """``runner.guard``: ``off`` (the default) or ``thin``."""
+        return self.cfg.guard
+
+    def _claude_argv(self) -> list[str] | None:
+        """The ``claude`` a session runs (the test seam, or the install), or None."""
+        if self._claude_cmd is not None:
+            return list(self._claude_cmd)
+        found = resolve_tool("claude")
+        return None if found is None else [str(found)]
+
+    async def login_ok(self) -> bool:
+        """Whether a session can use the owner's own ``claude`` login: only with the guard off
+        (under ``thin`` the session has a run-local HOME and no Keychain)."""
+        if self.guard != "off":
+            return False
+        try:
+            return await self._login_check()
+        except Exception:
+            log.exception("claude login check failed")
+            return False
+
+    def _on_self_restart(self, code: str) -> None:
+        """A restart this run asked for is about to stop its session: the resumed turn says
+        why (kept with the run like an undelivered answer, cleared when a turn ends)."""
+        run = runs.get(self.conn, code)
+        if run is None or not run.active:
+            return
+        saved = run.resume_prompt
+        if saved and RESTART_NOTE in saved:
+            return
+        runs.update(self.conn, code, resume_prompt=f"{saved}\n\n{RESTART_NOTE}" if saved
+                    else RESTART_NOTE)  # fmt: skip
+
+    async def _self_repo_seed(self) -> dict[str, RunnerRepo]:
+        """``runner.repos`` plus the daemon's own checkout (``self_repo``), so "fix X in
+        resonant" works in a worktree of it. Guard off only: ``thin`` write-protects that
+        checkout. A ``runner.repos`` entry or registry row for its origin keeps its name,
+        source and settings and only gets a missing ``path`` (never renamed). An origin the
+        registry doesn't know is seeded as ``resonant`` when that name is free, so a repo
+        the owner removed comes back at the next start."""
+        seeds = dict(self.cfg.repos)
+        path = self.self_repo
+        if self.guard != "off" or path is None:
+            return seeds
+        if not await asyncio.to_thread(os.path.isdir, path / ".git"):
+            return seeds
+        slug = await self.workspace.origin_slug(path)
+        if slug is None:
+            return seeds
+        for name, entry in seeds.items():
+            if entry.slug.lower() == slug.lower():
+                if entry.path is None:
+                    seeds[name] = entry.model_copy(update={"path": path})
+                return seeds
+        known = repo_store.find(self.conn, slug)  # slugs compare case-insensitively
+        if known is not None:
+            if known.path is None:
+                with atomic(self.conn):
+                    repo_store.set_path(self.conn, known.slug, path)
+            return seeds
+        if SELF_REPO_NAME not in seeds and repo_store.find(self.conn, SELF_REPO_NAME) is None:
+            seeds[SELF_REPO_NAME] = RunnerRepo(remote=f"github.com/{slug}", path=path)
+        return seeds
 
     def _gh_github(self, secrets: RunnerSecrets) -> GitHub:
         return GhGitHub(self.workspace, secrets)
@@ -794,15 +907,24 @@ class ClaudeRunner:
         return reaped
 
     async def _startup(self) -> int:
-        # runner.repos is only a seed: import it into the registry (idempotent).
+        # runner.repos is only a seed: import it into the registry (idempotent), with the
+        # daemon's own checkout as the repo "resonant" (GD-1).
+        try:
+            seeds = await self._self_repo_seed()
+        except Exception:
+            log.exception("Resonant's own checkout couldn't be read; not registered")
+            seeds = dict(self.cfg.repos)
         with atomic(self.conn):
-            imported = repo_store.import_config(self.conn, self.cfg.repos)
+            imported = repo_store.import_config(self.conn, seeds)
         for name, reason in imported.skipped:
             log.warning("runner.repos entry %s not imported: %s", name, reason)
         for old, new in imported.renamed:  # the mirror follows the repo's name
             async with self.workspace.mirror_lock(old):
                 await asyncio.to_thread(self._move_mirror, old, new)
         reaped = 0
+        # A session killed by a restart someone asked for (/restart, /update, a worker's
+        # `resonant restart`) isn't a crash of its run: no attempt is spent on it.
+        planned = take_planned(self.conn, self.clock())
         for run in runs.active(self.conn):
             has_process = run.pgid is not None or run.leader_pid is not None
             if not (has_process or run.status == "running"):
@@ -811,7 +933,7 @@ class ClaudeRunner:
             if await reaper.reap(target, grace_s=self.kill_grace_s):
                 reaped += 1
             if has_process:
-                runs.clear_process(self.conn, run.code, crashed=True)
+                runs.clear_process(self.conn, run.code, crashed=not planned)
         for run in runs.with_process(self.conn):  # a run that ended with a process recorded
             if not run.active:
                 await reaper.reap(self._target(run), grace_s=self.kill_grace_s)
@@ -902,10 +1024,17 @@ class ClaudeRunner:
             missing.append(f"the Keychain can't be read ({e.reason})")
             how.append("unlock the login keychain")
         else:
+            installed = self._claude_argv() is not None
+            if refs == [CLAUDE_MISSING] and installed and await self.login_ok():
+                refs = []  # GD-1: the owner's own claude login is enough with the guard off
             for ref in refs:
                 missing.append(f"secret {ref}")
-                how.append(f"resonant secret set {ref.split(' ', 1)[0]}")
-        if self._claude_cmd is None and resolve_tool("claude") is None:
+                cmd = f"resonant secret set {ref.split(' ', 1)[0]}"
+                if ref == CLAUDE_MISSING and self.guard == "off":
+                    missing[-1] = f"a Claude login (or secret {ref})"
+                    cmd = f"{LOGIN_HOW}, or {cmd}"
+                how.append(cmd)
+        if self._claude_argv() is None:
             missing.append("the claude CLI isn't installed")
             how.append("install Claude Code")
         return missing, how
@@ -1075,7 +1204,7 @@ class ClaudeRunner:
         """A sentence for the start reply when the base branch is not protected: the session's
         token can push to it, and a direct push skips the checks a merge runs."""
         try:
-            secrets = await load_runner_secrets(self.secrets)
+            secrets = await load_runner_secrets(self.secrets, claude=False)
             protected = await self.workspace.base_protected(repo.name, secrets)
         except Exception:  # the start reply must go out whatever GitHub says
             log.warning("base protection unknown", extra={"repo": repo.name})
@@ -1088,7 +1217,7 @@ class ClaudeRunner:
         """The registered repo for the requester's words (``new`` when this call registered
         it, ``via`` the extension whose link named it, ``warning`` about its base)."""
         try:
-            secrets = await load_runner_secrets(self.secrets)
+            secrets = await load_runner_secrets(self.secrets, claude=False)
             # No daemon token: only the registry answers (RX-1); a lookup says what it needs.
             github = OfflineGitHub() if secrets.github_token is None else self._github(secrets)
             resolution = await self.resolver.resolve(text, github)
@@ -1328,9 +1457,14 @@ class ClaudeRunner:
 
     async def _drive(self, task: Task, run: Run, ctx: StepContext) -> StepOutcome:
         try:
-            secrets = await load_runner_secrets(self.secrets)
+            secrets = await load_runner_secrets(self.secrets, claude=False)
         except SecretError as e:
             return await self._fail(run, f"the runner isn't set up ({e})", Redactor())
+        login = not (secrets.claude_token or secrets.anthropic_key) and await self.login_ok()
+        if auth_source(secrets, login_ok=login) is None and run.step in ("prepare", "session"):
+            # no token, no key and no working login: nothing could start a session
+            why = "no Claude token, API key or working claude login"
+            return await self._fail(run, f"the runner isn't set up ({why})", Redactor())
         local = task.checkpoint.get("local")
         if not (isinstance(local, str) and local in NO_PUSH_LONG) or run.scratch:
             local = None
@@ -1434,6 +1568,7 @@ class ClaudeRunner:
     def _prepare_session_dirs(self, params: SandboxParams) -> None:
         """Daemon-side, before the first session: the run-local ``bin/`` and the caches."""
         prepare_dirs(params)
+        (params.run_dir / NO_GH_DIR).mkdir(mode=0o700, exist_ok=True)
         tools: dict[str, os.PathLike[str] | str] = {}
         for name in TOOL_NAMES:
             if name == "claude" and self._claude_cmd is not None:
@@ -1470,14 +1605,19 @@ class ClaudeRunner:
         writes = [p.workspace]
         if p.checkout is not None:
             writes.append(p.checkout / ".git")
+        thin = self.guard == "thin"
+        # With the guard off nothing is protected (the daemon's own checkout may be the
+        # repo, GD-1); the params then only lay out the run dir, its bin/ and the caches.
         return SandboxParams(
             run_dir=p.run_dir,
             work_dir=self.cfg.work_dir,
             cache_dir=self.cfg.cache_dir,
             secrets_dir=self.cfg.secrets_dir,
+            home=Path.home() if thin else self.home,
             path_dirs=self._path_dirs,
-            deny_exec=default_deny_exec(),
-            deny_read=tuple(self.cfg.deny_read),
+            deny_exec=default_deny_exec() if thin else (),
+            deny_read=tuple(self.cfg.deny_read) if thin else (),
+            protect=None if thin else (),
             write_paths=tuple(writes),
             ctl_root=self.ctl_root,
             ctl_dir=self.ctl_root / p.code,
@@ -1495,24 +1635,31 @@ class ClaudeRunner:
         *,
         local: bool = False,
     ) -> dict[str, str]:
-        """The sandbox environment: from scratch, the one allowed secret only when asked. The
-        run's GitHub token is not in it: ``gh`` finds it by ``GH_CONFIG_DIR`` (a path) and git
-        through the credential helper named in ``GIT_CONFIG_*`` (a path; nothing is written
-        to the checkout's config). A run with no repo has neither, and neither has a ``local``
-        one (RX-1: it can't push yet), which still gets the exclude file."""
-        env = scratch_env(
-            params,
-            path_dirs=params.path_dirs,
-            claude_token=None if secrets is None else secrets.claude_token,
-            anthropic_key=None if secrets is None else secrets.anthropic_key,
-        )
-        env[MARKER_ENV] = marker  # the run's session id: unique, never reused
-        if p.scratch:
-            env.update(session_git_env(None))
-        elif local:
-            env.update(session_git_env(None, p.exclude_file))
+        """The session's environment, from scratch either way, with at most one Claude
+        credential: the token, else the API key, else none (the owner's own login, guard off
+        only; ``runner.claude_auth``). Guard ``thin``: ``HOME`` and ``CLAUDE_CONFIG_DIR`` in
+        the run. Guard ``off``: the owner's real ``HOME`` (their ``~/.claude``), the install
+        dirs on ``PATH``. The run's GitHub token is not in it: ``gh`` finds it by
+        ``GH_CONFIG_DIR`` (a path) and git through the credential helper named in
+        ``GIT_CONFIG_*`` (a path; nothing is written to the checkout's config). A run with no
+        repo has neither, and neither has a ``local`` one (RX-1: it can't push yet), which
+        still gets the exclude file."""
+        token = None if secrets is None else secrets.claude_token
+        key = None if secrets is None or token else secrets.anthropic_key
+        if self.guard == "thin":
+            env = scratch_env(params, path_dirs=params.path_dirs, claude_token=token,
+                              anthropic_key=key)  # fmt: skip
         else:
-            creds = Path(env["HOME"]).parent / CREDS_DIR
+            env = owner_env(params, home=self.home, path_dirs=params.path_dirs,
+                            claude_token=token, anthropic_key=key)  # fmt: skip
+        env[MARKER_ENV] = marker  # the run's session id: unique, never reused
+        if p.scratch or local:
+            # No GitHub credentials: with the real HOME, gh would otherwise find the owner's
+            # own login (~/.config/gh). An empty config dir keeps RX-1's "can't push yet".
+            env["GH_CONFIG_DIR"] = str(params.run_dir / NO_GH_DIR)
+            env.update(session_git_env(None, None if p.scratch else p.exclude_file))
+        else:
+            creds = params.run_dir / CREDS_DIR
             env["GH_CONFIG_DIR"] = str(creds / "gh")
             env.update(session_git_env(creds / "credential-helper", p.exclude_file))
         # `resonant ask` waits up to ask_block_s: the Bash tool must not cut it off first
@@ -1543,13 +1690,24 @@ class ClaudeRunner:
             "--verbose",
             "--permission-mode",
             "bypassPermissions",
-            "--strict-mcp-config",
-            "--setting-sources",
-            "project",
-            "--settings",
-            json.dumps({"sandbox": {"enabled": False}}),
+        ]
+        if self.guard == "thin":
+            # Project settings only and no MCP servers, and Claude Code's own sandbox off:
+            # Seatbelt can't nest inside ours. With the guard off (GD-1) the owner's setup
+            # loads as at the keyboard: user, project and local settings, ~/.claude skills,
+            # the user CLAUDE.md and MCP servers, untouched by any --settings override.
+            argv += [
+                "--strict-mcp-config",
+                "--setting-sources",
+                "project",
+                "--settings",
+                json.dumps({"sandbox": {"enabled": False}}),
+            ]
+        argv += [
             "--append-system-prompt",
-            self._prompt(run, p, local=local) + WORKER_PROMPT,
+            self._prompt(run, p, local=local)
+            + WORKER_PROMPT
+            + (RESTART_PROMPT if self.desk.self_ops is not None else ""),
             "--max-turns",
             str(self.max_turns),
         ]
@@ -1564,9 +1722,20 @@ class ClaudeRunner:
         if p.scratch:
             return SCRATCH_PROMPT
         repo = self._repo_of(run)
+        own = ""
+        if (
+            self.guard == "off"
+            and self.self_repo is not None
+            and p.checkout is not None
+            and _same(p.checkout, self.self_repo)
+        ):
+            own = SELF_REPO_PROMPT.format(checkout=_home(str(self.self_repo)))
         if local is not None:
-            return LOCAL_PROMPT.format(
-                repo=repo.slug, branch=p.branch, base=p.base_branch, why=NO_PUSH_LONG[local]
+            return (
+                LOCAL_PROMPT.format(
+                    repo=repo.slug, branch=p.branch, base=p.base_branch, why=NO_PUSH_LONG[local]
+                )
+                + own
             )
         if repo.mode == "fork":
             fork = self._forks.get(run.code)
@@ -1575,8 +1744,11 @@ class ClaudeRunner:
             return FORK_PROMPT.format(
                 fork=fork, upstream=repo.slug, branch=p.branch, base=p.base_branch
             )
-        return RUNNER_PROMPT.format(
-            repo=repo.slug, branch=p.branch, base=p.base_branch, attempts=MAX_FIX_ATTEMPTS
+        return (
+            RUNNER_PROMPT.format(
+                repo=repo.slug, branch=p.branch, base=p.base_branch, attempts=MAX_FIX_ATTEMPTS
+            )
+            + own
         )
 
     async def _session(self, w: _Work, run: Run, p: Prepared) -> StepOutcome | None:
@@ -1589,10 +1761,12 @@ class ClaudeRunner:
         if run.session_seconds >= run.max_seconds:
             return await self._timed_out(run, w)
         params = self._params(p)
-        try:
-            ok, detail = await asyncio.to_thread(self._self_check, params)
-        except SandboxError as e:
-            ok, detail = False, str(e)
+        ok, detail = True, ""
+        if self.guard == "thin":  # the guard is checked before each session it wraps
+            try:
+                ok, detail = await asyncio.to_thread(self._self_check, params)
+            except SandboxError as e:
+                ok, detail = False, str(e)
         if not ok:
             log.error("sandbox self-check failed", extra={"run": run.code, "detail": detail})
             with atomic(self.conn):
@@ -1612,14 +1786,9 @@ class ClaudeRunner:
     async def _run_session(
         self, w: _Work, run: Run, p: Prepared, params: SandboxParams
     ) -> StepOutcome | None:
-        argv = list(
-            self._wrap(
-                self._argv(
-                    run, p, params, api_billing=bool(w.secrets.anthropic_key), local=w.local
-                ),
-                params,
-            )
-        )
+        argv = self._argv(run, p, params, api_billing=bool(w.secrets.anthropic_key), local=w.local)
+        if self.guard == "thin":
+            argv = list(self._wrap(argv, params))
         env = self._env(params, run.session_id, w.secrets, p, local=w.local is not None)
         prompt = self._turn_prompt(run, local=w.local is not None).encode()
         server = await self._open_ctl(run, w)
@@ -1895,6 +2064,10 @@ class ClaudeRunner:
     ) -> StepOutcome | None:
         """Classify a session that ended by itself."""
         keep = f"(work kept: /runs {run.code})"
+        failed = result is None or result.get("is_error") is True or returncode != 0
+        on_login = not (w.secrets.claude_token or w.secrets.anthropic_key)
+        if failed and on_login and isinstance(self._login_check, LoginCheck):
+            self._login_check.forget()  # it ran on the owner's login, which may have expired
         if result is None:
             return await self._fail(
                 run, f"Claude ended without a result (exit {returncode}) {keep}", w.redactor
@@ -2210,7 +2383,7 @@ class ClaudeRunner:
         secrets: RunnerSecrets | None = None
         if why is None:
             try:
-                secrets = await load_runner_secrets(self.secrets)
+                secrets = await load_runner_secrets(self.secrets, claude=False)
                 state = await self.workspace.ci_state(run.repo, _pr_number(run), secrets)
             except (SecretError, RunnerError) as e:
                 why = f"CI couldn't be read ({e})"
@@ -2390,7 +2563,7 @@ class ClaudeRunner:
         if run.status != "ready" or run.pr_number is None:
             return None
         try:
-            secrets = await load_runner_secrets(self.secrets)
+            secrets = await load_runner_secrets(self.secrets, claude=False)
             state = await self.workspace.ci_state(run.repo, run.pr_number, secrets)
         except Exception:  # a reply must go out whatever gh or the Keychain say
             log.warning("CI state unavailable for the reply", extra={"run": run.code})
@@ -2682,6 +2855,13 @@ def _int(value: object) -> int | None:
 
 def _size(n: int) -> str:
     return f"{n / 1e9:g} GB" if n >= 1_000_000_000 else f"{n // 1_000_000} MB"
+
+
+def _same(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.realpath(a) == os.path.realpath(b)
 
 
 def _sandbox_wrap(argv: Sequence[str], params: SandboxParams) -> Sequence[str]:

@@ -17,6 +17,15 @@ checks and owner messages for running Claude workers.
   the owner's approval) outlives the CLI's wait and the turn; a decision that comes later
   wakes the run and is delivered on resume.
 
+- ``restart``/``update`` (GD-1): Resonant itself, through the same ``Ops`` as ``/restart
+  resonant`` and ``/update`` (``SelfOps``). Allowed without asking when the run's requester is
+  the owner and the ask mentions it (``asked_for``: restart, redeploy, deploy, …; for update
+  also "update resonant"), once per run; otherwise it is a check like any other (system
+  ``resonant``, action ``restart`` or ``update``: net new the first time, so ``yes always``
+  covers the next). The
+  reply goes out before the restart (the helper waits 3 s); the restart stops the session and
+  the run resumes it afterwards, with a note saying why (``on_restart``).
+
 Owner messages (``deliver_message``) are appended to the session's next CLI reply as
 ``Message from the owner: …``, or open its next turn.
 
@@ -59,6 +68,7 @@ from resonant.runners.worker_cli import (
     Note,
     Reply,
     Request,
+    SelfOp,
 )
 from resonant.store import pulse as pulse_store
 from resonant.store import questions as qs
@@ -93,6 +103,24 @@ RUN_OVER = "This run is over; stop."
 PULSE_SOURCE = "core"
 QUESTION_ITEM_TTL_S = 24 * 3600  # the pulse re-mentions an open question each hour until then
 
+SELF_SYSTEM = "resonant"  # the trust system of a worker's restart or update
+NO_SELF_OPS = "Not done: restarting Resonant from a worker isn't set up here."
+RESTARTING = (
+    "Resonant restarts in about {delay} s. The restart stops this session; the run resumes it "
+    "afterwards (same session, with a note that it restarted). Don't start anything else now: "
+    "run `sleep 120` and let the restart stop you."
+)
+# The ask must aim the verb at Resonant ("restart resonant", "then redeploy it", "/restart"):
+# "write a deploy script" or "fix the restart bug" leave it to the check.
+_TARGET = r"\s+(?:it|resonant|the\s+daemon|itself|yourself)\b"
+_DEPLOY_WORDS = re.compile(
+    r"\b(?:re-?start|re-?deploy|deploy|re-?launch|re-?boot|bounce)"
+    + _TARGET
+    + r"|(?<!\w)/restart\b",
+    re.I,
+)
+_UPDATE_WORDS = re.compile(r"\bupdate" + _TARGET + r"|(?<!\w)/update\b", re.I)
+
 EventKind = Literal["question", "note", "check"]
 NO_TRUST = "denied: checks aren't set up here, so don't do it."
 
@@ -109,6 +137,22 @@ class TrustChecker(Protocol):
         cost_usd: float = 0.0,
         what: str = "",
     ) -> Literal["ok", "denied", "busy"]: ...
+
+
+class SelfOps(Protocol):
+    """``resonant.tools.ops.Ops``: what a worker's ``restart``/``update`` runs. Failures raise
+    with a code-built message (``ToolFailed``)."""
+
+    async def restart_resonant(self) -> dict[str, Any]: ...
+
+    async def update_resonant(self) -> dict[str, Any]: ...
+
+
+def asked_for(ask: str, op: Literal["restart", "update"]) -> bool:
+    """Whether the run's ask mentions this (a mention is enough: the owner asked for it)."""
+    if _DEPLOY_WORDS.search(ask):
+        return True
+    return op == "update" and _UPDATE_WORDS.search(ask) is not None
 
 
 @dataclass(frozen=True)
@@ -204,10 +248,15 @@ class WorkerDesk:
         redactor_for: Callable[[str], Redactor] = lambda _code: Redactor(),
         on_note: Callable[[str], None] = lambda _code: None,
         block_s: float = BLOCK_S,
+        self_ops: SelfOps | None = None,
+        owner: str | None = None,
+        on_restart: Callable[[str], None] = lambda _code: None,
     ) -> None:
         """``wake(run, key)`` tells the run's task something arrived (a no-op unless it is
         waiting). ``redactor_for(code)`` knows the run's secrets; ``on_note(code)`` refreshes
-        its pulse item."""
+        its pulse item. ``self_ops`` restarts or updates Resonant (None: refused), ``owner``
+        is the principal whose ask can include that, and ``on_restart(code)`` runs just
+        before a restart this run asked for."""
         self.conn = conn
         self.channel = channel
         self.trust = trust
@@ -217,6 +266,10 @@ class WorkerDesk:
         self._wake = wake
         self._redactor_for = redactor_for
         self._on_note = on_note
+        self.self_ops = self_ops
+        self.owner = owner
+        self._on_restart = on_restart
+        self._self_op_busy: set[str] = set()  # runs with a restart or update in flight
         self.events = WorkerEvents()
         self._waiters: dict[int, asyncio.Event] = {}  # question id -> set when it leaves open
         # (run, system, action, irreversible, cost, what) -> (question id, the decision task)
@@ -236,6 +289,72 @@ class WorkerDesk:
                 return await self._note(run, req)
             case Check():
                 return await self._check(run, req, gone)
+            case SelfOp():
+                return await self._self_op(run, req, gone)
+
+    async def _self_op(self, run: Run, req: SelfOp, gone: asyncio.Future[None]) -> Reply | None:
+        """``resonant restart|update``: allowed by the ask, else checked like a net-new
+        action; then the same ``Ops`` as ``/restart resonant`` and ``/update``."""
+        if self.self_ops is None:
+            return Reply(NO_SELF_OPS, EXIT_DENIED)
+        checked: Reply | None = None
+        # The ask covers one restart or update per run: a resumed session that asks again
+        # (a loop) goes through the check like anything else.
+        done = self.conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'run.self_op'"
+            " AND json_extract(detail, '$.run') = ? AND json_extract(detail, '$.ok')",
+            (run.code,),
+        ).fetchone()[0]
+        if run.code in self._self_op_busy:
+            return Reply("Not done: a restart or update for this run is already going.",
+                         EXIT_DENIED)  # fmt: skip
+        if not (self.owner is not None and run.principal == self.owner and done == 0
+                and asked_for(run.ask, req.op)):  # fmt: skip
+            what = f"{req.op} Resonant (the daemon itself)"
+            checked = await self._check(run, Check(SELF_SYSTEM, req.op, what), gone)
+            if checked is None or checked.exit != EXIT_OK:
+                return checked
+        self._self_op_busy.add(run.code)
+        try:
+            if req.op == "update":
+                result = await self.self_ops.update_resonant()
+            else:
+                result = await self.self_ops.restart_resonant()
+            ok, text = True, self._self_op_text(run.code, req.op, result)
+        except Exception as e:
+            from resonant.executor import ToolFailed
+
+            why = str(e) if isinstance(e, ToolFailed) else f"it failed ({type(e).__name__})"
+            log.warning("worker self op failed", extra={"run": run.code, "op": req.op})
+            ok, text = False, f"Not done: {req.op} Resonant: {why}."
+        finally:
+            self._self_op_busy.discard(run.code)
+        # only a restart or update that went through spends the ask's one allowance
+        with atomic(self.conn):
+            audit(self.conn, "run.self_op", run=run.code, op=req.op, by_ask=checked is None,
+                  ok=ok)  # fmt: skip
+        rc = EXIT_OK if ok else EXIT_DENIED
+        if checked is None:
+            return self._reply(run.code, text, rc)
+        _first, _, rest = checked.text.partition("\n\n")  # what the check reply delivered
+        return Reply(text + (f"\n\n{rest}" if rest else ""), rc, on_sent=checked.on_sent)
+
+    def _self_op_text(self, code: str, op: str, result: dict[str, Any]) -> str:
+        """The reply to a restart or update that went through, from its result only."""
+        delay = result.get("delay_s", 3)
+        if result.get("restarting"):
+            with contextlib.suppress(Exception):
+                self._on_restart(code)
+            if op == "update":
+                head = f"Updated {result.get('old')} -> {result.get('new')}, synced. "
+                return head + RESTARTING.format(delay=delay)
+            return RESTARTING.format(delay=delay)
+        if op == "update" and result.get("synced") is False:
+            return (
+                f"Not restarted: pulled {result.get('new')} but uv sync failed "
+                f"({result.get('sync_error')}); the running Resonant is unchanged."
+            )
+        return f"Already up to date ({result.get('new')}): nothing to deploy, no restart."
 
     async def _ask(self, run: Run, req: Ask, gone: asyncio.Future[None]) -> Reply | None:
         open_asks = qs.open_for_run(self.conn, run.code, "ask")

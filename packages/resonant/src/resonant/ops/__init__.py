@@ -45,6 +45,10 @@ LABELS = frozenset({DAEMON_LABEL, OLLAMA_LABEL})  # the only services ops may re
 RESTART_DELAY_S = 3
 KICKSTART_TIMEOUT_S = 15.0
 RESTART_PENDING_KEY = "ops.restart_pending"
+# Written with the marker, read once by the Claude runner at its start (``take_planned``): a
+# session killed by a restart someone asked for isn't counted as a crash of its run. "back up"
+# clears the marker before the runner starts, so the runner has its own key.
+RESTART_PLANNED_KEY = "ops.restart_planned"
 
 # git and uv never prompt: there is no terminal, and a prompt would only hang to the timeout.
 _ENV = {
@@ -161,12 +165,32 @@ def mark_restart(
         marker["note"] = note
     with atomic(conn):
         kv_set(conn, RESTART_PENDING_KEY, marker)
+        kv_set(conn, RESTART_PLANNED_KEY, {"at": iso(now)})
     return marker
 
 
-def clear_restart(conn: sqlite3.Connection) -> None:
+def clear_restart(conn: sqlite3.Connection, *, planned: bool = False) -> None:
+    """Drop the "back up" marker; with ``planned`` also the runner's key (the restart was
+    never started)."""
+    keys = (RESTART_PENDING_KEY, RESTART_PLANNED_KEY) if planned else (RESTART_PENDING_KEY,)
     with atomic(conn):
-        conn.execute("DELETE FROM kv WHERE key = ?", (RESTART_PENDING_KEY,))
+        conn.executemany("DELETE FROM kv WHERE key = ?", [(k,) for k in keys])
+
+
+def take_planned(conn: sqlite3.Connection, now: datetime) -> bool:
+    """Whether this start follows a restart someone asked for (``/restart``, ``/update``, a
+    worker's ``resonant restart``) within ``RESTART_MARKER_MAX_AGE``. Clears the key."""
+    value: object = kv_get(conn, RESTART_PLANNED_KEY)
+    with atomic(conn):
+        conn.execute("DELETE FROM kv WHERE key = ?", (RESTART_PLANNED_KEY,))
+    if not isinstance(value, dict):
+        return False
+    at = cast(dict[str, Any], value).get("at")
+    try:
+        when = datetime.fromisoformat(at) if isinstance(at, str) else None
+    except ValueError:
+        when = None
+    return when is not None and timedelta(0) <= now - when <= RESTART_MARKER_MAX_AGE
 
 
 def restart_pending(conn: sqlite3.Connection) -> dict[str, Any] | None:
@@ -246,6 +270,7 @@ __all__ = [
     "RESTART_DELAY_S",
     "RESTART_MARKER_MAX_AGE",
     "RESTART_PENDING_KEY",
+    "RESTART_PLANNED_KEY",
     "OpsRunner",
     "ProcResult",
     "SubprocessRunner",
@@ -256,4 +281,5 @@ __all__ = [
     "mark_restart",
     "restart_later_argv",
     "restart_pending",
+    "take_planned",
 ]

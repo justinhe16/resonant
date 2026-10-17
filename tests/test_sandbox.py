@@ -616,3 +616,20 @@ def test_the_control_dir_defs_stay_out_of_the_profile_hash(tmp_path: Path) -> No
         render(replace(base, ctl_dir=None))
     with pytest.raises(SandboxError, match="isn't a control dir"):
         render(replace(base, ctl_dir=tmp_path / "x"))
+
+
+def test_cli_check_with_the_guard_off_skips_every_probe_and_says_so() -> None:
+    """GD-1: the default ``runner.guard: off`` runs no probe (nothing would be wrapped)."""
+    from resonant.sandbox.probes import PROBES
+
+    result = CliRunner().invoke(app, ["sandbox", "check"])
+    assert result.exit_code == 0, result.output
+    assert result.output.startswith("guard: off. runner.guard is off")
+    assert "--thin" in result.output
+    assert f"0 passed, 0 failed, {len(PROBES)} skipped" in result.output
+    local = CliRunner().invoke(app, ["sandbox", "check", "--scope", "ci", "--json"])
+    assert local.exit_code == 0
+    import json
+
+    rows = json.loads(local.output)
+    assert rows and {r["status"] for r in rows} == {"skip"} and {r["scope"] for r in rows} == {"ci"}

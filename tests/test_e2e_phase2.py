@@ -275,7 +275,14 @@ async def test_policy_gate_and_reminder_runner_are_wired(
     assert d.loop.runners["reminder"] is d.imessage.reminders is c.runners["reminder"]
     assert d.imessage.reminders.channel is d.imessage.channel
     assert d.imessage.reminders.timezone == d.settings.timezone
-    assert any("gate=policy dry_run=True" in r.getMessage() for r in caplog.get_records("setup"))
+
+    # logged once the runner has started (it reads the daemon's own checkout first, GD-1),
+    # which can land after the fixture's setup
+    def started() -> bool:
+        records = [*caplog.get_records("setup"), *caplog.records]
+        return any("gate=policy dry_run=True" in r.getMessage() for r in records)
+
+    await wait_until(started, 10)
     assert (await running.status())["approvals_pending"] == 0
 
 
