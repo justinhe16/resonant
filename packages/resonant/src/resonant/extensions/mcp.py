@@ -72,7 +72,7 @@ from resonant.extensions.process import (
     spawn_stdio,
 )
 from resonant.redact import Redactor
-from resonant.secrets import SecretError, SecretStore, values_of
+from resonant.secrets import SecretError, SecretStore, env_name, values_of
 from resonant_sdk import ToolSpec
 
 log = logging.getLogger(__name__)
@@ -327,40 +327,41 @@ def server_argv(
 # --- the session -------------------------------------------------------------------------
 
 
-class McpSession:
-    """One running server and its JSON-RPC session. Not restartable: make a new one."""
+class McpSessionExpired(McpError):
+    """An HTTP server no longer knows the session (404 with ``Mcp-Session-Id``): the
+    request was not processed. The runtime starts a new session and retries once."""
+
+
+class RpcSession:
+    """The JSON-RPC 2.0 side of one MCP session, whatever carries it: request ids and
+    pending futures, the handshake, ``tools/list`` and ``tools/call``, cancellation, server
+    requests (``ping`` only) and ``tools/list_changed``. A transport subclass provides
+    ``start``, ``_send`` and ``_close``, and feeds every message it receives to
+    ``_dispatch``. Not restartable: make a new one."""
 
     def __init__(
         self,
-        req: ExtRequest,
-        tracker: ProcessTracker,
         *,
+        label: str,
         redact: RedactFn,
-        python: str = sys.executable,
-        message_cap: int = MESSAGE_CAP,
-        stderr_cap: int = STDERR_CAP,
+        message_cap: int,
         on_list_changed: Callable[[], None] | None = None,
     ) -> None:
-        self.req = req
-        self.tracker = tracker
+        self.label = label
         self.redact = redact
-        self.python = python
         self.message_cap = message_cap
-        self.stderr_cap = stderr_cap
         self.on_list_changed = on_list_changed
-        self.proc: asyncio.subprocess.Process | None = None
-        self._entry: Any = None  # process._Tracked
+        self.protocol_version: str | None = None
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_id = 0
-        self._tasks: list[asyncio.Task[Any]] = []
         self._side: set[asyncio.Task[Any]] = set()
-        self._stderr = bytearray()  # raw, in memory only; leaves through stderr_tail()
+        self._started = False
         self._ended: str | None = None
         self._close_task: asyncio.Task[None] | None = None
 
     @property
     def alive(self) -> bool:
-        return self.proc is not None and self._ended is None
+        return self._started and self._ended is None
 
     @property
     def ended(self) -> str | None:
@@ -368,45 +369,8 @@ class McpSession:
         return self._ended
 
     def stderr_tail(self) -> str:
-        """The last ``STDERR_TAIL`` chars of stderr, redacted. Nothing else of it leaves."""
-        return self.redact(self._stderr.decode(errors="replace"))[-STDERR_TAIL:]
-
-    async def start(self, timeout_s: float = START_TIMEOUT_S) -> dict[str, Any]:
-        """Spawn the server and run the ``initialize`` handshake. Returns its result.
-        Raises ``ExtFailed`` (paused, can't start) or ``McpError``; nothing is left running."""
-        if self.tracker.paused:
-            raise ExtFailed("paused")
-        self.proc = await spawn_stdio(self.req, python=self.python, limit=self.message_cap)
-        self._entry = self.tracker.track(self.proc.pid, self.req.label)
-        self._tasks = [
-            asyncio.create_task(self._read_stdout()),
-            asyncio.create_task(self._read_stderr()),
-            asyncio.create_task(self.tracker.sample_loop(self._entry)),
-        ]
-        try:
-            if self.tracker.paused:
-                raise ExtFailed("paused")
-            params = {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "resonant", "version": __version__},
-            }
-            try:
-                result = await self._request("initialize", params, timeout_s)
-            except McpAmbiguous as e:
-                why = f"server did not start ({e.reason})"
-                raise McpError(why, stderr_tail=e.stderr_tail) from None
-            version = result.get("protocolVersion")
-            if version not in SUPPORTED_VERSIONS:
-                raise McpError("server speaks an unsupported protocol version")
-            caps = result.get("capabilities")
-            if not isinstance(caps, dict) or "tools" not in caps:
-                raise McpError("server offers no tools")
-            await self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-            return result
-        except BaseException:
-            await self.close("start failed")
-            raise
+        """A redacted tail of the server's stderr ("" when there is none to read)."""
+        return ""
 
     async def list_tools(self, timeout_s: float = START_TIMEOUT_S) -> list[dict[str, Any]]:
         """Every tool the server lists, following ``nextCursor``. Raises ``McpError``."""
@@ -455,45 +419,51 @@ class McpSession:
         return out
 
     async def close(self, reason: str = "closed") -> None:
-        """End the server: close stdin, give it a moment, then always end the whole group
-        and tracked tree. Fails anything pending. Idempotent."""
+        """End the session and fail anything pending. Idempotent."""
         if self._close_task is None:
             self._close_task = asyncio.ensure_future(self._close(reason))
         await asyncio.shield(self._close_task)
 
-    # --- internals -----------------------------------------------------------------------
+    # --- for transports --------------------------------------------------------------------
 
     async def _close(self, reason: str) -> None:
-        self._end(reason)
-        proc, entry = self.proc, self._entry
-        if proc is not None and proc.stdin is not None:
-            with contextlib.suppress(Exception):
-                proc.stdin.close()
-        if proc is not None and entry is not None:
-            if proc.returncode is None:
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(asyncio.shield(proc.wait()), CLOSE_WAIT_S)
-            entry.reason = entry.reason or reason
-            await self.tracker.terminate(entry)
-            self.tracker.kill_now(entry)
-            self.tracker.untrack(entry)
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(proc.wait(), self.tracker.grace_s + 1)
-            # Close the pipes now, not when the transport is collected (maybe after the
-            # event loop is gone): a killed tree may never have sent EOF.
-            transport: object = getattr(proc, "_transport", None)
-            if isinstance(transport, asyncio.BaseTransport):
-                transport.close()
-        for t in [*self._tasks, *self._side]:
-            t.cancel()
-        await asyncio.gather(*self._tasks, *self._side, return_exceptions=True)
+        raise NotImplementedError
+
+    async def _send(self, msg: dict[str, Any]) -> None:
+        """Send one message. Raises ``McpError`` when it can't be sent."""
+        raise NotImplementedError
+
+    def _kill_reason(self) -> str | None:
+        """Why the kill switch ended this session, if it did."""
+        return None
+
+    async def _handshake(self, timeout_s: float) -> dict[str, Any]:
+        """``initialize`` and ``notifications/initialized``. Raises ``McpError``."""
+        params = {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "resonant", "version": __version__},
+        }
+        try:
+            result = await self._request("initialize", params, timeout_s)
+        except McpAmbiguous as e:
+            why = f"server did not start ({e.reason})"
+            raise McpError(why, stderr_tail=e.stderr_tail) from None
+        version = result.get("protocolVersion")
+        if not isinstance(version, str) or version not in SUPPORTED_VERSIONS:
+            raise McpError("server speaks an unsupported protocol version")
+        caps = result.get("capabilities")
+        if not isinstance(caps, dict) or "tools" not in caps:
+            raise McpError("server offers no tools")
+        self.protocol_version = version
+        await self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        return result
 
     def _end(self, reason: str) -> None:
         """Mark the session over (once) and fail every pending request."""
         if self._ended is not None:
             return
-        killed: str | None = self._entry.reason if self._entry is not None else None
-        ended = killed or reason
+        ended = self._kill_reason() or reason
         self._ended = ended
         tail = self.stderr_tail()
         for fut in self._pending.values():
@@ -504,7 +474,7 @@ class McpSession:
         if self._ended not in ("closed", "start failed"):
             log.warning(
                 "mcp server ended",
-                extra={"label": self.req.label, "reason": self._ended, "stderr_tail": tail},
+                extra={"label": self.label, "reason": self._ended, "stderr_tail": tail},
             )
 
     async def _request(self, method: str, params: dict[str, Any], timeout_s: float) -> Any:
@@ -518,7 +488,7 @@ class McpSession:
             msg = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
             try:
                 await asyncio.wait_for(self._send(msg), timeout_s)
-            except TimeoutError:  # the server stopped reading stdin; part may have arrived
+            except TimeoutError:  # the server stopped reading; part may have arrived
                 self._spawn(self.close("stuck"))
                 raise McpAmbiguous("timeout", stderr_tail=self.stderr_tail()) from None
             try:
@@ -545,52 +515,10 @@ class McpSession:
                 1.0,
             )
 
-    async def _send(self, msg: dict[str, Any]) -> None:
-        proc = self.proc
-        if proc is None or proc.stdin is None or self._ended is not None:
-            raise McpError("server is not running")
-        line = json.dumps(msg, separators=(",", ":"), allow_nan=False).encode() + b"\n"
-        try:
-            proc.stdin.write(line)
-            await proc.stdin.drain()
-        except (OSError, RuntimeError):
-            raise McpError("server is not running") from None
-
     def _spawn(self, coro: Any) -> None:
         task = asyncio.ensure_future(coro)
         self._side.add(task)
         task.add_done_callback(self._side.discard)
-
-    async def _read_stdout(self) -> None:
-        assert self.proc is not None and self.proc.stdout is not None
-        reader = self.proc.stdout
-        reason = "server exited"
-        try:
-            while True:
-                try:
-                    line = await reader.readuntil(b"\n")
-                except asyncio.IncompleteReadError as e:
-                    if e.partial.strip():
-                        self._dispatch(e.partial)
-                    break
-                except asyncio.LimitOverrunError:
-                    reason = "output too large"
-                    break
-                self._dispatch(line)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            reason = "read error"
-        self._end(reason)
-        if self._close_task is None:
-            self._close_task = asyncio.ensure_future(self._close(reason))
-
-    async def _read_stderr(self) -> None:
-        assert self.proc is not None and self.proc.stderr is not None
-        while chunk := await self.proc.stderr.read(64 * 1024):
-            self._stderr += chunk
-            if len(self._stderr) > self.stderr_cap:
-                del self._stderr[: len(self._stderr) - self.stderr_cap]
 
     def _dispatch(self, line: bytes) -> None:
         try:
@@ -636,6 +564,129 @@ class McpSession:
             await self._send(reply)
 
 
+class McpSession(RpcSession):
+    """One running stdio server and its JSON-RPC session. Not restartable: make a new one."""
+
+    def __init__(
+        self,
+        req: ExtRequest,
+        tracker: ProcessTracker,
+        *,
+        redact: RedactFn,
+        python: str = sys.executable,
+        message_cap: int = MESSAGE_CAP,
+        stderr_cap: int = STDERR_CAP,
+        on_list_changed: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(
+            label=req.label, redact=redact, message_cap=message_cap, on_list_changed=on_list_changed
+        )
+        self.req = req
+        self.tracker = tracker
+        self.python = python
+        self.stderr_cap = stderr_cap
+        self.proc: asyncio.subprocess.Process | None = None
+        self._entry: Any = None  # process._Tracked
+        self._tasks: list[asyncio.Task[Any]] = []
+        self._stderr = bytearray()  # raw, in memory only; leaves through stderr_tail()
+
+    def stderr_tail(self) -> str:
+        """The last ``STDERR_TAIL`` chars of stderr, redacted. Nothing else of it leaves."""
+        return self.redact(self._stderr.decode(errors="replace"))[-STDERR_TAIL:]
+
+    async def start(self, timeout_s: float = START_TIMEOUT_S) -> dict[str, Any]:
+        """Spawn the server and run the ``initialize`` handshake. Returns its result.
+        Raises ``ExtFailed`` (paused, can't start) or ``McpError``; nothing is left running."""
+        if self.tracker.paused:
+            raise ExtFailed("paused")
+        self.proc = await spawn_stdio(self.req, python=self.python, limit=self.message_cap)
+        self._started = True
+        self._entry = self.tracker.track(self.proc.pid, self.req.label)
+        self._tasks = [
+            asyncio.create_task(self._read_stdout()),
+            asyncio.create_task(self._read_stderr()),
+            asyncio.create_task(self.tracker.sample_loop(self._entry)),
+        ]
+        try:
+            if self.tracker.paused:
+                raise ExtFailed("paused")
+            return await self._handshake(timeout_s)
+        except BaseException:
+            await self.close("start failed")
+            raise
+
+    def _kill_reason(self) -> str | None:
+        return self._entry.reason if self._entry is not None else None
+
+    async def _close(self, reason: str) -> None:
+        """Close stdin, give it a moment, then always end the whole group and tracked tree."""
+        self._end(reason)
+        proc, entry = self.proc, self._entry
+        if proc is not None and proc.stdin is not None:
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+        if proc is not None and entry is not None:
+            if proc.returncode is None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(proc.wait()), CLOSE_WAIT_S)
+            entry.reason = entry.reason or reason
+            await self.tracker.terminate(entry)
+            self.tracker.kill_now(entry)
+            self.tracker.untrack(entry)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), self.tracker.grace_s + 1)
+            # Close the pipes now, not when the transport is collected (maybe after the
+            # event loop is gone): a killed tree may never have sent EOF.
+            transport: object = getattr(proc, "_transport", None)
+            if isinstance(transport, asyncio.BaseTransport):
+                transport.close()
+        for t in [*self._tasks, *self._side]:
+            t.cancel()
+        await asyncio.gather(*self._tasks, *self._side, return_exceptions=True)
+
+    async def _send(self, msg: dict[str, Any]) -> None:
+        proc = self.proc
+        if proc is None or proc.stdin is None or self._ended is not None:
+            raise McpError("server is not running")
+        line = json.dumps(msg, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+        try:
+            proc.stdin.write(line)
+            await proc.stdin.drain()
+        except (OSError, RuntimeError):
+            raise McpError("server is not running") from None
+
+    async def _read_stdout(self) -> None:
+        assert self.proc is not None and self.proc.stdout is not None
+        reader = self.proc.stdout
+        reason = "server exited"
+        try:
+            while True:
+                try:
+                    line = await reader.readuntil(b"\n")
+                except asyncio.IncompleteReadError as e:
+                    if e.partial.strip():
+                        self._dispatch(e.partial)
+                    break
+                except asyncio.LimitOverrunError:
+                    reason = "output too large"
+                    break
+                self._dispatch(line)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            reason = "read error"
+        self._end(reason)
+        if self._close_task is None:
+            self._close_task = asyncio.ensure_future(self._close(reason))
+
+    async def _read_stderr(self) -> None:
+        assert self.proc is not None and self.proc.stderr is not None
+        while chunk := await self.proc.stderr.read(64 * 1024):
+            self._stderr += chunk
+            if len(self._stderr) > self.stderr_cap:
+                del self._stderr[: len(self._stderr) - self.stderr_cap]
+
+
 def _retrieve(fut: asyncio.Future[Any]) -> None:
     if not fut.cancelled():
         fut.exception()  # its waiter may be gone: don't warn "never retrieved"
@@ -651,6 +702,15 @@ def disabled_text(ext: str, tool: str) -> str:
         f"{tool} is disabled: its MCP server changed it since you approved it; "
         f"resonant ext update {ext} to review"
     )
+
+
+@dataclass(frozen=True)
+class HttpTarget:
+    """An MCP server over streamable HTTP: its fixed URL and the declared secret sent as its
+    bearer token (None: no auth)."""
+
+    url: str
+    secret: str | None = None
 
 
 @dataclass(eq=False)
@@ -674,8 +734,9 @@ class McpServerRuntime:
     python: str = sys.executable
     message_cap: int = MESSAGE_CAP
     start_timeout_s: float = START_TIMEOUT_S
+    http: HttpTarget | None = None  # set: streamable HTTP, and argv/root/bins are unused
     disabled: dict[str, str] = field(default_factory=dict[str, str])  # tool -> why
-    session: McpSession | None = None
+    session: RpcSession | None = None
     _redactor: Redactor = field(default_factory=Redactor)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _verified: asyncio.Event = field(default_factory=asyncio.Event)
@@ -691,7 +752,7 @@ class McpServerRuntime:
         """Start and verify now (the daemon warms servers up so drift alerts come early)."""
         await self.ensure()
 
-    async def ensure(self) -> McpSession:
+    async def ensure(self) -> RpcSession:
         async with self._lock:
             if self.session is not None and self.session.alive:
                 return self.session
@@ -714,29 +775,8 @@ class McpServerRuntime:
                         "a secret this MCP server needs is missing or unreadable "
                         f"(resonant secret list {self.ext})"
                     ) from None
-            ensure_data_dir(self.data_dir)
-            env = scratch_env(
-                ext=self.ext,
-                data_dir=self.data_dir,
-                secrets=env_secrets,
-                path=self.path_env,
-                bins=self.bins,
-            )
-            redactor = Redactor(values_of(env))
-            req = ExtRequest(
-                argv=self.argv,
-                cwd=self.root,
-                env=env,
-                timeout_s=self.start_timeout_s,
-                label=self.label,
-            )
-            session = McpSession(
-                req,
-                self.tracker,
-                redact=redactor.text,
-                python=self.python,
-                message_cap=self.message_cap,
-            )
+            redactor = Redactor(values_of(env_secrets))
+            session = self._new_session(env_secrets, redactor)
             session.on_list_changed = lambda: self._list_changed(session)
             await session.start(self.start_timeout_s)
             try:
@@ -754,25 +794,70 @@ class McpServerRuntime:
                 self._verified.set()
             return session
 
+    def _new_session(self, env_secrets: dict[str, str], redactor: Redactor) -> Any:
+        """A not-yet-started session for this server's transport."""
+        if self.http is not None:
+            from resonant.extensions.mcp_http import McpHttpSession
+
+            token = None
+            if self.http.secret is not None:
+                token = env_secrets.get(env_name(self.http.secret))
+            return McpHttpSession(
+                self.http.url,
+                token=token,
+                label=self.label,
+                tracker=self.tracker,
+                redact=redactor.text,
+                message_cap=self.message_cap,
+            )
+        ensure_data_dir(self.data_dir)
+        env = scratch_env(
+            ext=self.ext,
+            data_dir=self.data_dir,
+            secrets=env_secrets,
+            path=self.path_env,
+            bins=self.bins,
+        )
+        req = ExtRequest(
+            argv=self.argv,
+            cwd=self.root,
+            env=env,
+            timeout_s=self.start_timeout_s,
+            label=self.label,
+        )
+        return McpSession(
+            req,
+            self.tracker,
+            redact=redactor.text,
+            python=self.python,
+            message_cap=self.message_cap,
+        )
+
     async def call(self, tool: str, args: dict[str, Any], timeout_s: float) -> dict[str, Any]:
         if tool not in self.approved:
             raise McpError(f"{tool} is not a listed tool of this server")
         if tool in self.disabled:
             raise McpError(disabled_text(self.ext, tool))
-        session = await self.ensure()
-        try:
-            await asyncio.wait_for(self._verified.wait(), timeout_s)
-        except TimeoutError:
-            raise McpError("the server's tools are being re-checked; try again") from None
-        if tool in self.disabled:
-            raise McpError(disabled_text(self.ext, tool))
-        redactor = self._redactor
-        try:
-            result = await session.call_tool(tool, args, timeout_s)
-        except (McpError, McpAmbiguous) as e:
-            e.stderr_tail = session.stderr_tail()
-            raise
-        return redactor.deep(result)
+        for attempt in (1, 2):
+            session = await self.ensure()
+            try:
+                await asyncio.wait_for(self._verified.wait(), timeout_s)
+            except TimeoutError:
+                raise McpError("the server's tools are being re-checked; try again") from None
+            if tool in self.disabled:
+                raise McpError(disabled_text(self.ext, tool))
+            redactor = self._redactor
+            try:
+                result = await session.call_tool(tool, args, timeout_s)
+            except McpSessionExpired:
+                if attempt == 1:  # not processed: a new session (re-verified), then retry
+                    continue
+                raise
+            except (McpError, McpAmbiguous) as e:
+                e.stderr_tail = session.stderr_tail()
+                raise
+            return redactor.deep(result)
+        raise McpError("session expired")  # unreachable: the loop returns or raises
 
     async def aclose(self) -> None:
         self._closed = True
@@ -804,7 +889,7 @@ class McpServerRuntime:
                 except Exception:
                     log.exception("mcp drift alert failed")
 
-    def _list_changed(self, session: McpSession) -> None:
+    def _list_changed(self, session: RpcSession) -> None:
         if self.session is not None and session is not self.session:
             return  # an old session's notification
         self._verified.clear()
@@ -812,7 +897,7 @@ class McpServerRuntime:
         if self._recheck_task is None or self._recheck_task.done():
             self._recheck_task = asyncio.ensure_future(self._recheck(session))
 
-    async def _recheck(self, session: McpSession) -> None:
+    async def _recheck(self, session: RpcSession) -> None:
         try:
             if self.session is None:  # during ensure(): wait for its first list
                 async with self._lock:
@@ -881,13 +966,16 @@ __all__ = [
     "MESSAGE_CAP",
     "PROTOCOL_VERSION",
     "Discovered",
+    "HttpTarget",
     "McpAmbiguous",
     "McpError",
     "McpServerRuntime",
     "McpSession",
+    "McpSessionExpired",
     "McpToolError",
     "McpToolHandler",
     "McpToolPin",
+    "RpcSession",
     "approve",
     "disabled_text",
     "discover",

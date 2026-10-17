@@ -20,6 +20,7 @@ import string
 from itertools import pairwise
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -232,7 +233,7 @@ class McpTool(_Strict):
         return v
 
 
-class McpServer(_Strict):
+class McpStdioServer(_Strict):
     """A local MCP server over stdio. ``command`` is one word: a ``.py`` file in the extension
     dir (``./server.py``) or a server binary, pinned by its real absolute path at install
     (``resonant.extensions.checks.resolve_mcp_command``). ``args`` are literal."""
@@ -260,15 +261,90 @@ class McpServer(_Strict):
     @field_validator("tools")
     @classmethod
     def _unique(cls, v: tuple[McpTool, ...]) -> tuple[McpTool, ...]:
-        names = [t.name for t in v]
-        if len(names) != len(set(names)):
-            raise ValueError("mcp tool names must be unique")
-        return v
+        return _unique_tools(v)
 
     @property
     def secrets(self) -> tuple[str, ...]:
         """The union of its tools' declared secrets: all the server process receives."""
         return tuple(sorted({s for t in self.tools for s in t.secrets}))
+
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def mcp_url_problem(url: str) -> str | None:
+    """Why ``url`` can't be an MCP server's endpoint, or None. https with a host, no user
+    info or fragment; plain http only for a loopback host (the daemon refuses it outside
+    tests: ``resonant.extensions.checks.mcp_url_error``)."""
+    if not (url.isascii() and url.isprintable()) or any(c.isspace() for c in url):
+        return "url must be printable ASCII with no spaces"
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return "url is malformed"
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        return "url must not carry user info"
+    if parts.fragment or url.endswith("#"):
+        return "url must not have a fragment"
+    host = (parts.hostname or "").lower()
+    if not host:
+        return "url needs a host"
+    if parts.scheme == "https":
+        return None
+    if parts.scheme == "http" and host in _LOOPBACK_HOSTS and port is not None:
+        return None
+    return "url must be https"
+
+
+class McpHttpServer(_Strict):
+    """A remote MCP server over streamable HTTP at one fixed ``url``. With ``auth: bearer``,
+    ``secret`` (a declared secret) is sent as ``Authorization: Bearer <value>`` to that URL
+    and nowhere else. Its tools declare no secrets of their own."""
+
+    transport: Literal["http"]
+    url: str = Field(min_length=1, max_length=MCP_ARG_MAX)
+    auth: Literal["bearer"] | None = None
+    secret: SecretName | None = None
+    tools: tuple[McpTool, ...] = Field(min_length=1, max_length=MCP_TOOLS_MAX)
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, v: str) -> str:
+        if problem := mcp_url_problem(v):
+            raise ValueError(problem)
+        return v
+
+    @field_validator("tools")
+    @classmethod
+    def _unique(cls, v: tuple[McpTool, ...]) -> tuple[McpTool, ...]:
+        if any(t.secrets for t in v):
+            raise ValueError(
+                "tools of an http server declare no secrets; the server's bearer secret is "
+                "the only one sent"
+            )
+        return _unique_tools(v)
+
+    @model_validator(mode="after")
+    def _auth(self) -> Self:
+        if (self.auth == "bearer") != (self.secret is not None):
+            raise ValueError("auth: bearer needs secret: <name>, and secret needs auth: bearer")
+        return self
+
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        """The bearer secret, if any: all this server is ever sent."""
+        return (self.secret,) if self.secret else ()
+
+
+def _unique_tools(v: tuple[McpTool, ...]) -> tuple[McpTool, ...]:
+    names = [t.name for t in v]
+    if len(names) != len(set(names)):
+        raise ValueError("mcp tool names must be unique")
+    return v
+
+
+McpServer = Annotated[McpStdioServer | McpHttpServer, Field(discriminator="transport")]
 
 
 class Mcp(_Strict):
@@ -394,6 +470,11 @@ class Manifest(BaseModel):
         if clash := {s.name for s in tool_specs} & {s.name for s in job_specs}:
             raise ValueError(f"tool names collide with job spec names: {sorted(clash)}")
         declared = set(self.secrets)
+        for sid, server in (self.mcp.servers if self.mcp else {}).items():
+            if undeclared := set(server.secrets) - declared:
+                raise ValueError(
+                    f"mcp server {sid}: secrets not declared at top level: {undeclared}"
+                )
         for spec in tool_specs + job_specs:
             if undeclared := set(spec.secrets) - declared:
                 raise ValueError(f"{spec.name}: secrets not declared at top level: {undeclared}")
