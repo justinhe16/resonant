@@ -36,6 +36,18 @@ jobs:
       - run: uv run pyright
       - run: uv run pytest -q
 
+  supabase-sql:
+    # The relay migration on a real Postgres (the runner image ships the server binaries).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - run: uv sync --locked
+      - name: tests/test_supabase_sql.py
+        run: |
+          export PG_TEST_BINDIR="$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)"
+          PG_TEST_REQUIRED=1 uv run pytest -q tests/test_supabase_sql.py
+
   dashboard:
     runs-on: ubuntu-latest
     defaults:
@@ -53,6 +65,7 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - run: node --check ../supabase/enroll_mfa.mjs
       - name: dashboard/dist matches the source (rebuild and commit it)
         # diff catches changed and deleted files; the status test catches new untracked ones.
         run: |

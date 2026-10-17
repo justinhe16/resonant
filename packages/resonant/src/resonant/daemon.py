@@ -13,6 +13,10 @@ and monitor stop first (no new events), then the loop drains in-flight steps (wh
 still send their replies), then the model client closes. With it disabled, the daemon is
 exactly Phase 0 apart from the gate and the scheduler.
 
+The status relay (``dashboard.pusher``, docs/dashboard-plan.md D4). With ``relay.enabled`` an aux
+task pushes the remote tier of the dashboard snapshot to Supabase every ``relay.every_s``; it is
+cancelled with the other aux tasks on shutdown. Disabled, the daemon clears its health row.
+
 Claude workers (docs/employee-plan.md). With iMessage on, ``runner="claude"`` is registered by
 the wiring. Before the loop starts, the daemon calls ``ClaudeRunner.start()``: it ends every session
 process a crash left behind (matched by pid and start time), wipes leftover token dirs and
@@ -39,15 +43,17 @@ from typing import TYPE_CHECKING
 
 import uvicorn
 
-from resonant.api import DaemonState, create_app
+from resonant.api import DaemonState, create_app, local_snapshot
 from resonant.components import build_components
 from resonant.config import Settings
+from resonant.dashboard.pusher import SnapshotPusher, clear_relay_health
 from resonant.extensions.scheduler import CORE_JOBS, Scheduler
 from resonant.health import Heartbeat, Watchdog, deadman_task, heartbeat_task
 from resonant.loop import Loop, SlotPool
 from resonant.loop.echo import EchoRunner
 from resonant.observability import configure_logging
 from resonant.runners.claude import cleanup_job
+from resonant.secrets import SecretStore
 from resonant.store.db import open_db, utcnow
 
 if TYPE_CHECKING:
@@ -55,7 +61,6 @@ if TYPE_CHECKING:
     from resonant.gateway.imessage.sender import OsaRunner
     from resonant.models import ModelClient
     from resonant.ops import OpsRunner
-    from resonant.secrets import SecretStore
     from resonant.wiring import IMessageStack
 
 log = logging.getLogger(__name__)
@@ -126,6 +131,17 @@ class Daemon:
             core_jobs=(*CORE_JOBS, cleanup_job),
         )
         self.loop.scheduler = self.scheduler
+        # The status relay (dashboard.pusher): the remote tier of the snapshot to Supabase.
+        self.pusher: SnapshotPusher | None = None
+        if settings.relay.enabled:
+            self.pusher = SnapshotPusher(
+                self.conn,
+                settings.relay,
+                snapshot=lambda: local_snapshot(self.state),
+                secrets=secrets if secrets is not None else SecretStore(),
+            )
+        else:
+            clear_relay_health(self.conn)
         self.server = _Server(
             uvicorn.Config(
                 create_app(self.state),
@@ -199,6 +215,8 @@ class Daemon:
             )
         if monitor is not None:
             aux.append(asyncio.create_task(monitor.run(), name="health-monitor"))
+        if self.pusher is not None:
+            aux.append(asyncio.create_task(self.pusher.run(), name="relay"))
         if self.imessage is not None and self.imessage.notifier is not None:
             aux.append(asyncio.create_task(self.imessage.notifier.run(), name="notify-flush"))
         watchdog = Watchdog(self.heartbeat, self.settings.health.watchdog_stale_s)
@@ -206,11 +224,12 @@ class Daemon:
         host = self.state.components.extensions if self.state.components else None
         log.info(
             "resonant daemon started (api %s:%s, gate=policy dry_run=%s, imessage=%s, "
-            "extensions=%d, jobs=%d)",
+            "relay=%s, extensions=%d, jobs=%d)",
             self.settings.api.host,
             self.settings.api.port,
             self.settings.dry_run,
             "on" if self.imessage is not None else "off",
+            "on" if self.pusher is not None else "off",
             0 if host is None else len(host.loaded),
             len(self.scheduler.jobs),
         )

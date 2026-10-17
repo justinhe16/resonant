@@ -90,6 +90,62 @@ class HealthConfig(_Section):
     watchdog_stale_s: float = Field(default=120.0, gt=0)
 
 
+_SUPABASE_KEY = re.compile(r"[A-Za-z0-9._-]{20,1024}")
+
+
+class RelayConfig(_Section):
+    """The status relay (docs/dashboard-plan.md D4, DB-3): the daemon pushes the ``remote``
+    tier of the dashboard snapshot to Supabase every ``every_s``. Push only: nothing connects
+    in. Off by default; turned on in go-live step 15."""
+
+    enabled: bool = False
+    # The Supabase project URL, https://<ref>.supabase.co. https only, no path or query.
+    supabase_url: str | None = None
+    # The project's anon (publishable) key. Not a secret: the deployed dashboard ships it in
+    # its config.json, and on its own it can read and write nothing (the migration's grants).
+    # The write credential is the Keychain item relay/supabase_key (the ingest token).
+    anon_key: str | None = None
+    every_s: float = Field(default=60.0, ge=15, le=3600)
+    timeout_s: float = Field(default=10.0, gt=0, le=30)  # per HTTP attempt
+    max_attempts: int = Field(default=3, ge=1, le=5)  # per push; the rest waits for the next
+
+    @field_validator("supabase_url")
+    @classmethod
+    def _https(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        u = urlparse(v)
+        if (
+            u.scheme != "https"
+            or not u.hostname
+            or u.username is not None
+            or u.password is not None
+            or u.path not in ("", "/")
+            or u.params
+            or u.query
+            or u.fragment
+        ):
+            raise ValueError(
+                'relay.supabase_url must be a bare https URL, like "https://<ref>.supabase.co"'
+            )
+        if is_loopback(u.hostname):
+            raise ValueError("relay.supabase_url must not be a loopback host")
+        return v.rstrip("/")
+
+    @field_validator("anon_key")
+    @classmethod
+    def _key(cls, v: str | None) -> str | None:
+        if v is not None and not _SUPABASE_KEY.fullmatch(v):
+            raise ValueError("relay.anon_key doesn't look like a Supabase anon or publishable key")
+        return v
+
+    @model_validator(mode="after")
+    def _complete(self) -> Self:
+        if self.enabled and (self.supabase_url is None or self.anon_key is None):
+            raise ValueError("relay.enabled needs relay.supabase_url and relay.anon_key")
+        return self
+
+
 class LoopConfig(_Section):
     tick_s: float = Field(default=30.0, gt=0)
     stuck_after_s: float = Field(default=900.0, gt=0)
@@ -508,6 +564,7 @@ class Settings(BaseSettings):
     model: ModelConfig = ModelConfig()
     api: ApiConfig = ApiConfig()
     health: HealthConfig = HealthConfig()
+    relay: RelayConfig = RelayConfig()
     loop: LoopConfig = LoopConfig()
     claude: ClaudeConfig = ClaudeConfig()
     channels: ChannelsConfig = ChannelsConfig()

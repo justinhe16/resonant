@@ -74,6 +74,11 @@ Ident = Annotated[str, StringConstraints(pattern=IDENT_PATTERN)]
 VERSION_PATTERN: Final = r"^[0-9A-Za-z.+-]{1,40}$"
 Version = Annotated[str, StringConstraints(pattern=VERSION_PATTERN)]
 
+# The relay's own health row (``resonant.dashboard.pusher``): {state, since, detail}. Unlike the
+# monitor's checks it can be ``failing``. Absent while the relay is off.
+RELAY_HEALTH_KV: Final = "health.relay"
+RELAY_CHECK: Final = "relay"
+
 _GIT = "/usr/bin/git"  # SIP-protected; never looked up by name
 _SHA = re.compile(r"[0-9a-f]{40}")
 _IDENT = re.compile(IDENT_PATTERN)
@@ -323,6 +328,16 @@ def _health(conn: sqlite3.Connection) -> dict[str, HealthRow]:
             name=name,
             state=_health_state(h.get("state")),
             since=_since(h.get("since")),
+            reason=detail if isinstance(detail, str) and detail else None,
+        )
+    raw = kv_get(conn, RELAY_HEALTH_KV)
+    if isinstance(raw, dict):
+        relay = cast(dict[str, Any], raw)
+        detail = relay.get("detail")
+        rows[RELAY_CHECK] = HealthRow(
+            name=RELAY_CHECK,
+            state=_health_state(relay.get("state")),
+            since=_since(relay.get("since")),
             reason=detail if isinstance(detail, str) and detail else None,
         )
     return rows
