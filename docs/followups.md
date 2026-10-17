@@ -4,7 +4,7 @@ Work we've decided to do eventually but have deferred. Each entry says why it wa
 
 ## Owner to-dos (human, at the Mini)
 
-Only you can do these: tokens, GitHub settings and the first real runs. Claude never enters a secret, and no secret goes in a command line or a chat. Do them in this order. The full steps and expected output are [`go-live.md`](go-live.md) step 14 (step 12 for the github extension); status rows are in [`test.md`](test.md). Tick them off here.
+Only you can do these: tokens, GitHub settings and the first real runs. Claude never enters a secret, and no secret goes in a command line or a chat. Do them in this order. The full steps and expected output are [`go-live.md`](go-live.md) step 14 (step 12 for the github extension, step 15 for the remote dashboard); status rows are in [`test.md`](test.md). Tick them off here.
 
 - [ ] **github extension** (go-live 12, if not done yet): `resonant secret set github/token` (read-only fine-grained token), then `resonant ext add repo:github` (type `github`).
 - [x] **Deploy and reinstall:** done by Claude on 2026-10-16 (main at schema 11, `resonant daemon install` run). If you install the github extension later, the new copy already pins `gh`; keep `extensions.process.path` at `/usr/bin`, `/bin`.
@@ -26,52 +26,30 @@ Only you can do these: tokens, GitHub settings and the first real runs. Claude n
 - [ ] **First fork run** (only with the `public_repo` token): the App mints a token for the new fork, and the upstream PR opens only after your `yes` (`test.md` 46).
 - [ ] **Optional tidy-up from the old runner:** drop `runner.max_bundle_mb` from `~/.resonant/config.yaml` if it is there (ignored now), and delete `~/.resonant/runner/mirrors/.incoming` if it exists (old bundle copies; nothing writes there any more).
 
-### Dashboard and status relay (Phase 4, [`dashboard-plan.md`](dashboard-plan.md))
+### Remote dashboard and dead-man switch (go-live 15)
 
-The local dashboard (`http://127.0.0.1:7777/` on the Mini) needs nothing from you. These make it reachable from anywhere and add the dead-man alert. Exact steps land in go-live step 15 with DB-5.
+The local dashboard (`http://127.0.0.1:7777/` on the Mini) needs nothing from you. These make a status-only copy reachable from any browser and add the phone alert for when the Mini goes quiet. Do them in this order; the commands are in [`go-live.md`](go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch) step 15 (`test.md` D1–D6).
 
-- [ ] **Supabase:** create a project; turn sign-ups off; create your one user; enroll TOTP MFA; run the `supabase/migrations/`; put the daemon's insert-only key in the Keychain (`resonant secret set relay/supabase_key`); tell Claude the project URL (not secret) to set `relay.supabase_url` and `relay.enabled`.
-- [ ] **Fly:** `brew install flyctl`, `fly auth signup` or `login`, `fly launch` from `relay/` (no deploy yet), `fly secrets set` for the Supabase URL and keys and the alert target, then `fly deploy`.
-- [ ] **Alerts:** install the ntfy app on your phone and subscribe to a long random topic (or pick a webhook); that topic goes in `fly secrets`.
-- [ ] **Freeze test:** with Claude watching, `kill -STOP` the daemon; the phone alert arrives within ~5 minutes and the dashboard says stale; `kill -CONT` sends the recovery.
+- [ ] **Supabase project** (15.1): sign-ups off, TOTP on, your one user (Auto Confirm). Note the project URL and the publishable key.
+- [ ] **Migration** (15.2): paste `supabase/migrations/20261016000000_relay.sql` into the SQL editor and run it.
+- [ ] **TOTP** (15.3), from a machine with Node: `cd dashboard && npm ci && cd ..`, then `node supabase/enroll_mfa.mjs --url … --anon-key … --email …`. Keep the printed user id; clear the scrollback.
+- [ ] **Ingest token** (15.4, on the Mini): the `T=$(openssl rand -hex 32)` block: prints its hash, pipes the token into `resonant secret set relay/supabase_key`.
+- [ ] **Fly app, status token, ntfy topic** (15.5): `brew install flyctl`, `fly auth login`, `fly apps create "$APP"`, then the block that prints the status hash and the topic and pipes the four secrets into `fly secrets import --app "$APP" --stage`.
+- [ ] **Hashes into Supabase** (15.6): the `update relay_private.config …` with the user id and both hashes; the check query shows `32`, `32`.
+- [ ] **Tell Claude the project URL and the publishable key** (15.7, not secret): Claude sets `relay: {enabled: true, supabase_url, anon_key}` and restarts. `--check`: `relay pushing  PASS`, `dead-man switch  PASS`.
+- [ ] **Deploy** (15.8): `fly deploy --app "$APP" --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .`, then `fly scale count 1 --app "$APP" --yes`.
+- [ ] **Phone** (15.9): the ntfy app, subscribed to the topic.
+- [ ] **Sign in** (15.10) at `https://<app>.fly.dev/` with password + TOTP.
+- [ ] **Freeze test** (15.11), with Claude watching: `kill -STOP $(pgrep -f 'resonant daemon run')` → stale banner after ~3 min, one `Resonant: no snapshots` push within ~5–7 min; `kill -CONT …` → `Resonant: snapshots back`.
 
-## Status relay: dead-man switch and remote dashboard
+## Status relay: what's left
 
-*Deferred 2026-10-13, during Mac mini go-live (steps 7 and 10 of [`go-live.md`](go-live.md)). This is the plan for both the dead-man switch and remote dashboard access.*
+*The relay is built (Phase 4, [`dashboard-plan.md`](dashboard-plan.md)) and set up in [go-live step 15](go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch); it replaces `health.healthchecks_url` as the dead-man switch (that ping still works if set, and `--check`'s advisory `dead-man switch` row passes with either). What remains:*
 
-**Problem.** Two gaps, one fix.
-- **Dead-man switch.** If the Mini loses power, crashes, or reboots to the FileVault login screen, Resonant can't tell anyone it's down. Something off the Mini has to notice the silence. The daemon already GETs the configured dead-man URL (`health.healthchecks_url`) every `health.ping_every_s` (60s) and POSTs `<url>/fail` with a reason when the loop is stale (see [Health](architecture.md#health)).
-- **Remote dashboard.** The owner wants to check status from anywhere, from any browser, after logging in. The API binds to `127.0.0.1:7777` only, and config validation enforces it.
-
-**Proposed design: push-based, read-only.**
-- **Push, not pull.** Every minute the daemon writes a status snapshot to Supabase: health checks, `dry_run`, task and slot counts, a last-seen time and version. Nothing connects into the Mini, so it keeps no inbound ports and the loopback-only rule doesn't change.
-- **Dashboard.** A small app on Fly.io reads the snapshots from Supabase. It keeps working when the Mini is down and shows "last seen N min ago" with the last known health. A dashboard served from the Mini would go dark exactly then.
-- **Dead-man switch.** A scheduled job on Fly alerts the owner when snapshots stop arriving, or when a snapshot reports a failure (today's `/fail` reason). The alert must not depend on the Mini, so it can't go over Resonant's iMessage. Use push, SMS or email instead. One system covers both gaps.
-- **Auth.** Use Supabase Auth with sign-ups turned off and exactly one user (the owner), MFA (TOTP) required, and short sessions. The app and the database row-level-security policies allow only the owner's user ID. Don't use IP allowlists: on the road the owner's IP changes constantly.
-- **Read-only.** The relay only shows status. Approvals, the kill switch and other actions stay on iMessage, which is already restricted to `principals.yaml`. A command path from the relay back into the Mini would be a new way in, so it needs its own design and review before anyone adds it.
-
-**Open questions**
-- **What leaves the Mini.** Health and counts are fine. Message bodies, task contents and audit details should probably stay local. Write down the allowed snapshot fields as a schema.
-- **Snapshot writes.** The daemon needs a Supabase credential. Store it in the Keychain like other secrets, and give it insert-only access to its own table.
-- **Alert delivery and timing.** Which channel (push, SMS, email)? How long a gap before alerting, to match today's 60s period plus grace?
-- **Fly cron vs a long-running checker.** Also: what watches the watcher if Fly itself is down?
-- **Retention.** How long to keep snapshots.
-
-**Until then**
-- `health.healthchecks_url` stays empty, so the daemon sends no pings. Nobody is alerted when the Mini is down.
-- `scripts/bootstrap.sh --check` reports `healthchecks URL set  FAIL (advisory)`, which doesn't fail the check.
-- The dashboard is reachable only on the Mini itself. iMessage doesn't need it.
-
-**Done when**
-- The owner can log in from any browser and see current status.
-- Nobody else can log in.
-- The go-live step 7 freeze test (`kill -STOP` the daemon) produces an alert, and the dashboard shows the Mini as stale.
-- The following describe how to set up and verify the relay:
-  - go-live steps 7 and 10
-  - the `--check` health check (required again)
-  - the README
-  - `architecture.md`, `interfaces.md`
-  - the `config.py` and `api.py` comments
+- **Alert channel.** ntfy (public `ntfy.sh` with a long random topic) is the default because it needs no account. If missed pushes or the topic-as-password model bother you, move to a protected topic (`NTFY_TOKEN`), your own ntfy server (`NTFY_URL`), or a webhook (`WEBHOOK_URL`) into SMS or email. No code change needed.
+- **Watcher of the watcher.** If Fly or Supabase is down, the checker can't alert (a Supabase outage is reported as `read_error`; a Fly outage is silent). An external uptime check on `https://<app>.fly.dev/healthz` (503 when the checker stalls) would cover it; not set up.
+- **Retention.** Fixed at 7 days and at most 12000 rows, inside `relay_ingest`. Changing it is a new migration.
+- **Pulse visibility.** The remote tier carries `pulse.open` (open items), but not the untold count, so a muted reporter doesn't show from away.
 
 ## Inbound webhooks
 
@@ -348,7 +326,7 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 
 - **Local push endpoint.** A long-running process (a trading bot, an on-call listener) calls the daemon directly instead of waiting for a job period (5 minutes at best). Loopback only, a per-extension token in the Keychain, same `report()` payload and the same pulse path, so grants, dedupe and the cap apply unchanged.
 - **Model ranking, feedback and snooze.** A ranking step over the open items (novelty, urgency, relevance), "not useful" replies that lower a source or key, and per-item snooze (`/snooze <key> 4h`). This is the nudges follow-up above; the pulse gives it the items store and the told-once state to rank over.
-- **Status relay visibility.** Show the count of pending (untold) and open pulse items in the remote status, so a stuck or muted reporter is visible when away from the Mini ([status relay](#status-relay-dead-man-switch-and-remote-dashboard)).
+- **Status relay visibility.** The remote status shows the open pulse count (Phase 4); the pending (untold) count isn't in it yet ([status relay](#status-relay-whats-left)).
 
 ## Approval "expires soon" reminder
 

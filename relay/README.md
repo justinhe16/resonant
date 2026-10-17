@@ -61,105 +61,36 @@ A watchdog exits the process if the checker hasn't finished a check for `max(3 Ã
 
 Logs carry what happened (state changes, alerts sent, failures by status code or error class) and never a secret: error messages are built without URLs, headers or response bodies, and a log filter replaces every configured secret value with `[redacted]` as a second line.
 
-## What DB-3 must grant for the checker's read
+## The checker's read path
 
-The checker needs only the newest snapshot's `taken_at` and each health row's `name` and `state`. It reads through the `StatusSource` interface in `source.py`, so the grant is DB-3's call; either of these works.
+The checker needs only the newest snapshot's `taken_at` and each health row's `name` and `state`. It reads through the `StatusSource` interface in `source.py`.
 
-**Recommended: `RELAY_READ=rpc`, a token-gated SECURITY DEFINER function.** The relay calls `POST /rest/v1/rpc/relay_status` with the public anon key as `apikey`/`Authorization` and body `{"token": "<RELAY_STATUS_TOKEN>"}`. Nothing with write access or broad read access lives on Fly, and the function exposes only times, names and states. Contract:
+**`RELAY_READ=rpc` (the default, and what the migration grants).** The relay calls `POST /rest/v1/rpc/relay_status` with the public anon key as `apikey` (and as `Authorization: Bearer` only for a legacy JWT key; an `sb_publishable_` key goes in `apikey` alone) and body `{"token": "<RELAY_STATUS_TOKEN>"}`. The function is `public.relay_status(token text) returns jsonb` in [`supabase/migrations/20261016000000_relay.sql`](../supabase/migrations/20261016000000_relay.sql): `SECURITY DEFINER`, executable by `anon`, `volatile` so PostgREST takes POST only. It compares the token's SHA-256 with `relay_private.config.status_token_sha256`; a wrong token (or none configured) **raises** `42501`, which PostgREST answers with 401/403 and the relay reports as a read error ("HTTP 401"), never as "no snapshots". With no snapshots it returns `null`, else `{"taken_at": <timestamptz>, "health": [{"name": text, "state": text}, ...]}` from the newest row by `taken_at`. Nothing with write access or broad read access lives on Fly.
 
-- signature `public.relay_status(token text) returns jsonb`, executable by `anon`;
-- a wrong token **raises** (e.g. `errcode 42501`) rather than returning null, so it shows up as a read error, not as "no snapshots";
-- returns `null` when there are no snapshots, else `{"taken_at": <timestamptz>, "health": [{"name": text, "state": text}, ...]}` from the newest row.
-
-A sketch for DB-3's migration (the owner stores only the token's SHA-256):
-
-```sql
-create schema if not exists private;
-revoke all on schema private from public, anon, authenticated;
-create table if not exists private.relay_token (token_sha256 text primary key);
-alter table private.relay_token enable row level security;  -- no policies: definer only
-
-create or replace function public.relay_status(token text)
-returns jsonb
-language plpgsql
-stable
-security definer
-set search_path = ''
-as $$
-declare
-  result jsonb;
-begin
-  if not exists (
-    select 1 from private.relay_token t
-    where t.token_sha256 = encode(sha256(convert_to(token, 'UTF8')), 'hex')
-  ) then
-    raise exception 'denied' using errcode = '42501';
-  end if;
-  select jsonb_build_object(
-           'taken_at', s.taken_at,
-           'health', case when jsonb_typeof(s.data->'health') = 'array' then coalesce(
-             (select jsonb_agg(jsonb_build_object('name', h->>'name', 'state', h->>'state'))
-                from jsonb_array_elements(s.data->'health') h),
-             '[]'::jsonb) else '[]'::jsonb end)
-    into result
-    from public.snapshots s
-   order by s.taken_at desc
-   limit 1;
-  return result;
-end;
-$$;
-
-revoke all on function public.relay_status(text) from public;
-grant execute on function public.relay_status(text) to anon;
-```
-
-The sketch assumes the table is `public.snapshots(taken_at timestamptz, data jsonb)` as the dashboard reads it; DB-3 owns the real names. PostgREST answers the `42501` with HTTP 401/403, which the relay reports as a read error ("HTTP 401"). The relay sends `Authorization: Bearer` only for a legacy JWT key; an `sb_publishable_` key goes in `apikey` alone.
-
-**Fallback: `RELAY_READ=table`.** The relay sends `GET /rest/v1/snapshots?select=taken_at,health:data->health&order=taken_at.desc&limit=1` with `RELAY_READ_KEY` as both `apikey` and bearer. That key's role must be able to `SELECT taken_at, data` on `snapshots`. The only built-in key that can is `service_role`, which bypasses RLS and can write everything, so prefer `rpc`.
+**Fallback: `RELAY_READ=table`.** The relay sends `GET /rest/v1/snapshots?select=taken_at,health:data->health&order=taken_at.desc&limit=1` with `RELAY_READ_KEY` as both `apikey` and bearer. That key's role must be able to `SELECT taken_at, data` on `snapshots`. The migration grants that to nobody but the MFA'd owner, and the only built-in key that could is `service_role`, which bypasses RLS and can write everything: don't use it. `rpc` is the supported path.
 
 ## Deploy (owner steps)
 
-Not done by any ticket; DB-5 folds these into go-live step 15. Run from the **repo root** (the build context), with Supabase set up first (DB-3 migrations, the one user with TOTP).
+The ordered owner walkthrough, with Supabase first and the freeze test last, is [docs/go-live.md step 15](../docs/go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch). The Fly part, run from the **repo root** (the build context), with `APP` your app name:
 
 ```sh
-# 0. Tools and login
-brew install flyctl
-fly auth login
+brew install flyctl && fly auth login
+fly apps create "$APP"                  # leaves relay/fly.toml untouched; every command takes --app
+# Secrets on stdin, so they stay out of shell history and argv (go-live 15 step 5 makes the
+# status token and the ntfy topic in shell variables first):
+#   SUPABASE_URL, SUPABASE_ANON_KEY, RELAY_STATUS_TOKEN, NTFY_TOPIC [, NTFY_URL, NTFY_TOKEN, WEBHOOK_URL]
+{ echo "SUPABASE_URL=..."; ...; } | fly secrets import --app "$APP" --stage
+fly secrets list --app "$APP"           # names and digests only
 
-# 1. Create the app from relay/fly.toml without deploying (pick a name and region).
-#    This rewrites `app = ...` in relay/fly.toml to your name; that local edit is expected
-#    (keep it uncommitted, or pass --app <app-name> to the later commands instead).
-fly launch --no-deploy --copy-config --config relay/fly.toml --dockerfile relay/Dockerfile --name <app-name>
-
-# 2. The relay's token: Fly gets the token, Supabase only its hash
-TOKEN=$(openssl rand -hex 32)
-printf %s "$TOKEN" | shasum -a 256 | awk '{print $1}'   # just the hex
-#    Supabase SQL editor: insert into private.relay_token values ('<that hex>');
-
-# 3. Secrets, piped on stdin so they stay out of shell history and argv
-#    (an ntfy topic is a password: long and random; letters, digits, - and _ only)
-{
-  echo "SUPABASE_URL=https://<ref>.supabase.co"
-  echo "SUPABASE_ANON_KEY=<anon or sb_publishable_ key>"
-  echo "RELAY_STATUS_TOKEN=$TOKEN"
-  echo "NTFY_TOPIC=resonant-$(openssl rand -hex 16)"
-  # optional: NTFY_TOKEN=..., NTFY_URL=https://<your ntfy>, WEBHOOK_URL=https://...
-} | fly secrets import --config relay/fly.toml --stage
-unset TOKEN
-fly secrets list --config relay/fly.toml    # names and digests only
-#    Read the topic back for the phone app: it's the one value you need to subscribe.
-
-# 4. Deploy one machine (no HA pair: two checkers would alert twice)
-fly deploy --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .
-fly scale count 1 --config relay/fly.toml --yes
-fly status --config relay/fly.toml
+# One machine (no HA pair: two checkers would alert twice)
+fly deploy --app "$APP" --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .
+fly scale count 1 --app "$APP" --yes
+fly status --app "$APP"
 ```
 
-Always run `fly deploy` from the repo root with `.` as the context: from inside `relay/` the image can't reach `dashboard/dist`.
+The status token's SHA-256 goes into `relay_private.config.status_token_sha256` (go-live 15 step 6). Always run `fly deploy` from the repo root with `.` as the context: from inside `relay/` the image can't reach `dashboard/dist`. `fly logs --app "$APP"` shows each check's failures and every alert sent.
 
-Then: subscribe to the ntfy topic in the ntfy phone app, open `https://<app-name>.fly.dev/`, log in (password + TOTP), and run the freeze test (stop the daemon or `relay.enabled: false`; expect one "Snapshots stopped" alert after `STALE_AFTER` plus up to a minute, and one "Snapshots are back" after it resumes). `fly logs --config relay/fly.toml` shows each check's failures and every alert sent.
-
-To change a setting later: `fly secrets set --config relay/fly.toml NAME=value` (restarts the machine). A dashboard rebuild ships with the next `fly deploy`.
+To change a setting later: `fly secrets set --app "$APP" NAME=value` (restarts the machine), or pipe it to `fly secrets import --app "$APP"` for a secret value. A dashboard rebuild ships with the next `fly deploy`.
 
 ## Develop and test
 

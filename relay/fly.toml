@@ -1,9 +1,10 @@
-# Fly.io config for the Resonant relay (relay/README.md). Deploy from the repo root:
-#   fly deploy --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .
+# Fly.io config for the Resonant relay (relay/README.md; owner steps: docs/go-live.md step 15).
+# Deploy from the repo root:
+#   fly deploy --app <your app> --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .
 # Exactly ONE machine: the dead-man checker keeps its alert state in memory, so a second
 # machine would send every alert twice.
 
-app = "resonant-relay"          # replaced by the name you pick at `fly launch`
+app = "resonant-relay"          # a placeholder: pass --app <the name from `fly apps create`>
 primary_region = "iad"          # any region; the checker only talks to Supabase and ntfy
 
 [build]
@@ -16,7 +17,7 @@ primary_region = "iad"          # any region; the checker only talks to Supabase
   STALE_AFTER = "5m"
   # READ_FAIL_AFTER defaults to STALE_AFTER. NTFY_URL defaults to https://ntfy.sh.
   # Everything else (SUPABASE_URL, SUPABASE_ANON_KEY, RELAY_STATUS_TOKEN, NTFY_TOPIC,
-  # NTFY_TOKEN, WEBHOOK_URL) is set with `fly secrets set`, never here.
+  # NTFY_TOKEN, WEBHOOK_URL) is a `fly secrets` value, never here.
 
 [http_service]
   internal_port = 8080

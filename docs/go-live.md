@@ -35,7 +35,7 @@ The script is idempotent. It never overwrites existing files in `~/.resonant`, a
 - **Keep-awake LaunchAgent.** `resonant daemon install` (and bootstrap) installs `com.resonant.caffeinate`, which runs `/usr/bin/caffeinate -i -m -s` under launchd (RunAtLoad, KeepAlive) and holds the sleep assertions while you're logged in. It is on by default (`power.keep_awake: true`); a hand-installed agent with that label is replaced, not duplicated. Setting it to `false` and reinstalling removes that agent, whoever installed it. Keep the `pmset` line above as well: caffeinate only runs in your login session.
 - For planned reboots, use `sudo fdesetup authrestart`. It unlocks the disk once, so the Mini comes back up logged in.
 
-FileVault disables auto-login. After a power loss or a crash reboot, the Mini waits at the login screen. Resonant and Messages don't start until someone logs in. That is the expected recovery path, not a bug. The dead-man switch (step 7) that would alert you isn't set up yet: it is planned as the status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)).
+FileVault disables auto-login. After a power loss or a crash reboot, the Mini waits at the login screen. Resonant and Messages don't start until someone logs in. That is the expected recovery path, not a bug. The dead-man switch (step 7, set up in step 15) is what alerts you: the Mini's snapshots stop, and your phone gets a push within about 5 minutes.
 
 - **Verify:** `fdesetup status`, `defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates`, `pmset -g | grep -E ' sleep|autorestart'` and `pmset -g assertions | grep caffeinate`
 - **Expected:** `FileVault is On.`, `0`, `sleep 0` and `autorestart 1`, and caffeinate holding `PreventSystemSleep` / `PreventUserIdleSystemSleep`. `--check` shows `keep-awake  PASS` (advisory). If the key doesn't exist, check System Settings directly. `--check` shows `FileVault  PASS  on`. Confirm the UPS by pulling its wall plug for a few seconds: the Mini stays on.
@@ -107,7 +107,7 @@ resonant status
 
 ## 7. Dead-man switch
 
-Not set up yet: planned as the status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)). Skip this step for now; `--check` reports `healthchecks URL set` as advisory.
+The dead-man switch is the status relay: an app on Fly alerts your phone when the Mini's snapshots stop. It needs Supabase and Fly, so it is set up in [step 15](#15-phase-4-the-remote-dashboard-and-the-dead-man-switch); skip this step until then. `--check` reports `dead-man switch` as advisory: `PASS` once the relay is on (or the older `health.healthchecks_url` is set).
 
 ## 8. Local model
 
@@ -131,7 +131,7 @@ Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:3
 
 ## 10. Remote dashboard access
 
-Not set up yet: planned as the status relay (see [`followups.md`](followups.md#status-relay-dead-man-switch-and-remote-dashboard)). Skip this step for now. The API binds to `127.0.0.1` only (config validation enforces it), so the dashboard is reachable only on the Mini. iMessage doesn't need it.
+On the Mini, the dashboard is at `http://127.0.0.1:7777/` and needs no setup. The API binds to `127.0.0.1` only (config validation enforces it), so from anywhere else you use the remote copy, which the status relay feeds: set it up in [step 15](#15-phase-4-the-remote-dashboard-and-the-dead-man-switch). iMessage doesn't need it.
 
 ## 11. Phase 2: approvals, then real ops
 
@@ -387,6 +387,141 @@ A small ask on a repo with CI, from iMessage: `/run <repo> add a blank line at t
 - **Verify:** `scripts/bootstrap.sh --check` and `resonant sandbox check`.
 - **Expected:** exit 0; `runner sandbox  PASS`, `runs table  PASS`, `runner github app  PASS` and the runner secret rows `PASS` once steps 2–4 are done.
 - **Rollback:** `/kill` stops every run at once. `resonant secret rm runner/claude_token` keeps new runs from starting; `resonant secret rm runner/github_app_key` keeps new runs from pushing (they commit locally). Revoke `runner/github_token` on github.com and uninstall the App (Settings → Applications) to cut GitHub access.
+
+## 15. Phase 4: the remote dashboard and the dead-man switch
+
+**The local dashboard needs nothing.** On the Mini, open `http://127.0.0.1:7777/`: the daemon serves it with the full local view (runs, asks, approvals, pulse, rules, repos). It is read-only; every action stays on iMessage. This step makes a status-only copy reachable from any browser and adds the alert for when the Mini goes quiet ([`dashboard-plan.md`](dashboard-plan.md)).
+
+How it fits together: every minute the daemon pushes the `remote` tier of the snapshot (health, counts, states and times; no message text, asks, repo names or URLs) to a Supabase project. Nothing connects into the Mini. A small app on Fly serves the dashboard against Supabase (you sign in with password and TOTP) and runs the dead-man checker: no snapshot for 5 minutes, or a health row `failing`, sends a push to your phone through ntfy, and another when it recovers. A power cut, a crash loop, a reboot waiting at the FileVault login or a frozen process all stop the snapshots, so this replaces the old `health.healthchecks_url` ping (which still works if you set it, but isn't needed).
+
+Three credentials, and where each lives:
+
+| What | Where | Who sees it |
+|---|---|---|
+| The **anon (publishable) key** and the project URL | `relay:` in `~/.resonant/config.yaml` and Fly secrets | public by design: the deployed dashboard ships it, and on its own it can read and write nothing |
+| The **ingest token** (the daemon's write credential) | Keychain `relay/supabase_key` on the Mini | only its SHA-256 goes to Supabase |
+| The **status token** (the checker's read credential) | Fly secret `RELAY_STATUS_TOKEN` | only its SHA-256 goes to Supabase |
+
+Never use the `service_role` key or the JWT secret anywhere outside Supabase. Each token is made in a shell variable and piped to where it lives, so it never lands in shell history, a command line or on screen. The hashes the commands print aren't secret: paste them where step 6 says.
+
+### Supabase (any browser)
+
+1. **Create the project** at supabase.com (any name and region; the free plan is enough). Then, under **Authentication**:
+   - **Sign In / Providers:** turn **Allow new users to sign up** off. Leave Email on.
+   - **Multi-Factor:** **TOTP** enabled (the default).
+   - **Users → Add user → Create new user:** your email and a strong password, **Auto Confirm User** ticked. This is the only user there will ever be.
+   - Optional, if your plan has it: **Sessions** → a time-box or inactivity timeout (plan D5's short sessions).
+
+   From **Project Settings → API Keys**, note the **project URL** (`https://<ref>.supabase.co`) and the **publishable key** (`sb_publishable_…`; the legacy `anon` JWT also works). Not secrets.
+2. **Apply the migration.** **SQL Editor → New query**, paste all of [`supabase/migrations/20261016000000_relay.sql`](../supabase/migrations/20261016000000_relay.sql), **Run**. (Or with the Supabase CLI from the repo: `supabase link --project-ref <ref> && supabase db push`.) **Table Editor** now shows `snapshots`, empty.
+3. **Enroll TOTP**, from a machine with Node and a checkout of the repo (your laptop is fine; the Mini doesn't need Node):
+
+   ```sh
+   cd dashboard && npm ci && cd ..
+   node supabase/enroll_mfa.mjs --url https://<ref>.supabase.co --anon-key <publishable key> --email <you>
+   ```
+
+   It asks the password (hidden), shows a QR code (or the `otpauth://` URI), and asks a code from your authenticator app. It prints `Owner user id, for relay_private.config.owner_id: <uuid>`: keep it for step 6, then clear the terminal's scrollback (it showed the TOTP secret). The dashboard itself can't enroll a factor, on purpose: a stolen password can't add its own.
+
+### The Mini's terminal
+
+4. **The ingest token.** One block, pasted as is:
+
+   ```sh
+   T=$(openssl rand -hex 32)
+   printf %s "$T" | shasum -a 256 | cut -d' ' -f1     # the ingest hash: keep it for step 6
+   printf '%s\n' "$T" | resonant secret set relay/supabase_key
+   unset T
+   ```
+
+   `resonant secret check relay/supabase_key` → `relay/supabase_key: ok (no prompt)` (the value is never shown).
+5. **The Fly app, the status token and the alert topic.** Install the CLI and log in (`fly auth signup` the first time):
+
+   ```sh
+   brew install flyctl
+   fly auth login
+   ```
+
+   Pick an app name (global on Fly; it becomes `https://<name>.fly.dev`), then from the repo root:
+
+   ```sh
+   cd ~/resonant
+   APP=resonant-relay-<something>
+   fly apps create "$APP"
+   S=$(openssl rand -hex 32)
+   printf %s "$S" | shasum -a 256 | cut -d' ' -f1     # the status hash: keep it for step 6
+   TOPIC=resonant-$(openssl rand -hex 16)
+   echo "ntfy topic: $TOPIC"                         # type it into the phone in step 9, then `clear`
+   {
+     echo "SUPABASE_URL=https://<ref>.supabase.co"
+     echo "SUPABASE_ANON_KEY=<publishable key>"
+     echo "RELAY_STATUS_TOKEN=$S"
+     echo "NTFY_TOPIC=$TOPIC"
+   } | fly secrets import --app "$APP" --stage
+   unset S
+   fly secrets list --app "$APP"                     # names and digests only
+   ```
+
+   `fly apps create` (rather than `fly launch`) leaves `relay/fly.toml` untouched, so the Mini's checkout stays clean for `/update`; every later command names the app with `--app`. The ntfy topic is the only thing between your alerts and anyone else: anyone who knows it can read and post to it, so keep it long and random and don't reuse it. Optional extras on the same pipe: `WEBHOOK_URL=https://…` (a JSON POST per alert, alongside or instead of ntfy), `NTFY_URL` and `NTFY_TOKEN` for your own or a protected ntfy server.
+
+### Back in the SQL editor
+
+6. **Tie it together** (paste the user id from step 3 and the two hashes from steps 4 and 5):
+
+   ```sql
+   update relay_private.config set
+     owner_id            = '<user id>',
+     ingest_token_sha256 = decode('<ingest hash>', 'hex'),
+     status_token_sha256 = decode('<status hash>', 'hex');
+   select owner_id, octet_length(ingest_token_sha256), octet_length(status_token_sha256)
+     from relay_private.config;
+   ```
+
+   Expected: your user id, `32`, `32`. To rotate a token later, make a new one the same way (Keychain or `fly secrets import --app "$APP"`) and update its hash here; until both sides match, that side fails (the `relay` health row goes `failing`, or Fly sends a `read_error` alert).
+
+### Turn the relay on
+
+7. **Tell Claude the project URL and the publishable key** (not secret). Claude adds them to `~/.resonant/config.yaml` and restarts the daemon:
+
+   ```yaml
+   relay:
+     enabled: true
+     supabase_url: https://<ref>.supabase.co
+     anon_key: sb_publishable_…
+   ```
+
+   Within a minute, `scripts/bootstrap.sh --check` shows `status relay enabled  PASS`, `relay secret relay/supabase_key  PASS  present (value not read)`, `relay pushing  PASS  ok since …` and `dead-man switch  PASS  status relay: …`, and **Table Editor → snapshots** gains a row a minute (it keeps 7 days). `relay pushing  FAIL  failing: HTTP 403: credentials rejected …` means the ingest hash doesn't match the Keychain item (step 4 or 6); `HTTP 404: relay_ingest not found …`, the migration isn't applied.
+8. **Deploy the relay**, still from `~/resonant` (the build context is the repo root, because the image copies `dashboard/dist`):
+
+   ```sh
+   fly deploy --app "$APP" --config relay/fly.toml --dockerfile relay/Dockerfile --ha=false .
+   fly scale count 1 --app "$APP" --yes
+   fly status --app "$APP"                           # one machine, started, check passing
+   ```
+
+   Exactly one machine: the checker keeps its alert state in memory, so two would alert twice. `fly logs --app "$APP"` shows each failed check and every alert sent, never a secret.
+
+### Your phone and the browser
+
+9. **Alerts.** Install the **ntfy** app (App Store or Play Store), **Subscribe to topic**, enter the topic from step 5 (server `ntfy.sh`, the default), and allow notifications. Then `clear` the Mini's terminal.
+10. **The remote dashboard.** Open `https://<app>.fly.dev/` on your phone or any browser, sign in with the email, password and a TOTP code. You see health, autonomy, paused and dry-run, slots and counts, with "last seen" under a minute. There are no asks, message texts, repo names or rules: those stay on the Mini's local dashboard. Nobody else can sign in (sign-ups are off), and a signed-in session without TOTP reads nothing.
+11. **The freeze test** (with Claude watching, if you like). It freezes the whole daemon, watchdog included, which is exactly what the dead-man switch is for:
+
+    ```sh
+    kill -STOP $(pgrep -f 'resonant daemon run')
+    ```
+
+    Expected: after about 3 minutes the remote dashboard shows the red **No fresh data for …** banner ("The Mini has stopped sending snapshots"), and within about 5–7 minutes (5 minutes stale plus up to one check and one push period) your phone gets **Resonant: no snapshots** / `Snapshots stopped: none for …`. Exactly one alert, however long you wait. Then:
+
+    ```sh
+    kill -CONT $(pgrep -f 'resonant daemon run')
+    ```
+
+    Expected: within a couple of minutes **Resonant: snapshots back**, and the banner clears. The daemon's watchdog may notice the frozen minutes and exit on resume; launchd restarts it, and `resonant status` shows `daemon  up`. Either way, one recovery alert.
+
+- **Verify:** `scripts/bootstrap.sh --check`, `fly status --app "$APP"`, and the freeze test above.
+- **Expected:** the relay rows and `dead-man switch` `PASS` (all advisory); one Fly machine; one alert on the freeze and one on recovery; the remote dashboard behind password + TOTP.
+- **Rollback:** stop the checker first, or it alerts that snapshots stopped: `fly scale count 0 --app "$APP" --yes` (or `fly apps destroy "$APP"`). Then tell Claude to set `relay.enabled: false`, and `resonant secret rm relay/supabase_key`. Setting `ingest_token_sha256` to `null` (step 6) refuses every push at once. The local dashboard keeps working throughout.
 
 ## Done
 

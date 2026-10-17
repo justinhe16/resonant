@@ -125,7 +125,7 @@ def test_helper_passes_a_live_config(resonant_home: Path) -> None:
     ):
         assert rows[step][0] == "PASS", (step, rows[step])
         assert rows[step][1] is True
-    assert rows["healthchecks URL set"][:2] == ("PASS", False)  # advisory: docs/followups.md
+    assert rows["dead-man switch"][:2] == ("PASS", False)  # advisory: go-live step 15
     assert rows["Full Disk Access (chat.db)"][0] in {"PASS", "FAIL"}
 
 
@@ -137,7 +137,7 @@ def test_helper_fails_the_seeded_example_config(resonant_home: Path) -> None:
     assert rows["imessage self_handle set"][0] == "FAIL"
     assert "example" in rows["imessage self_handle set"][2]
     assert rows["owner has imessage identity"][0] == "FAIL"
-    assert rows["healthchecks URL set"][:2] == ("FAIL", False)
+    assert rows["dead-man switch"][:2] == ("FAIL", False)
 
 
 def test_helper_passes_a_real_icloud_self_handle(resonant_home: Path) -> None:
@@ -683,6 +683,19 @@ def _relay_rows(
     out = {step: (status, required, detail) for status, required, step, detail in rows}
     out["_calls"] = ("", False, ",".join(calls))
     return out
+
+
+def test_dead_man_row_passes_with_the_relay_or_a_healthchecks_url(resonant_home: Path) -> None:
+    helper = _load_helper()
+    hc = {"healthchecks_url": "https://hc-ping.com/00000000-0000-0000-0000-000000000000"}
+    status, required, step, detail = helper.deadman_row(load_settings(relay=RELAY_ON))
+    assert (status, required, step) == ("PASS", False, "dead-man switch")
+    assert "status relay" in detail
+    assert helper.deadman_row(load_settings(health=hc))[:2] == ("PASS", False)
+    both = helper.deadman_row(load_settings(relay=RELAY_ON, health=hc))
+    assert both[0] == "PASS" and "healthchecks_url" in both[3]
+    none = helper.deadman_row(load_settings())
+    assert none[:2] == ("FAIL", False) and "go-live step 15" in none[3]
 
 
 def test_relay_rows_are_advisory_while_off(resonant_home: Path) -> None:

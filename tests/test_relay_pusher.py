@@ -102,7 +102,8 @@ def make_pusher(
     **config: Any,
 ) -> SnapshotPusher:
     settings = load_settings()
-    cfg = RelayConfig(enabled=True, supabase_url=URL, anon_key=ANON, **config)
+    fields: dict[str, Any] = {"enabled": True, "supabase_url": URL, "anon_key": ANON, **config}
+    cfg = RelayConfig(**fields)
     kc = keychain if keychain is not None else FakeKeychain(items={SUPABASE_KEY_REF: TOKEN})
 
     async def snapshot() -> Snapshot:
@@ -159,11 +160,21 @@ async def test_request_shape_and_credentials(db: sqlite3.Connection) -> None:
     assert str(r.url) == URL + INGEST_PATH
     assert r.url.scheme == "https"
     assert r.headers["apikey"] == ANON
-    assert r.headers["authorization"] == f"Bearer {ANON}"
+    # Not a JWT (like an sb_publishable_ key): apikey alone, never as a Bearer token.
+    assert "authorization" not in r.headers
     # The ingest token is in the body only: never in the URL or a header.
     assert TOKEN not in str(r.url)
     assert all(TOKEN not in v for v in r.headers.values())
     assert json.loads(r.content)["p_token"] == TOKEN
+
+
+async def test_a_legacy_jwt_anon_key_is_also_the_bearer(db: sqlite3.Connection) -> None:
+    jwt = "fake-header.fake-payload.fake-signature"  # three dot-separated parts, like a JWT
+    fake = FakeSupabase()
+    await make_pusher(db, fake, anon_key=jwt).push_once()
+    [r] = fake.requests
+    assert r.headers["apikey"] == jwt
+    assert r.headers["authorization"] == f"Bearer {jwt}"
 
 
 async def test_the_secret_is_read_every_push(db: sqlite3.Connection) -> None:

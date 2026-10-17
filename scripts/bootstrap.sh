@@ -212,8 +212,8 @@ $(printf '\033[1m')Manual steps (macOS won't let a script do these):$(printf '\0
      Never put secrets in config files or .env.
 
   5. Network
-     - Nothing to do now. Remote access and the dead-man switch are planned as
-       the status relay (docs/followups.md).
+     - Nothing to do now. The dashboard is at http://127.0.0.1:7777/ on this Mac.
+       Remote access and the dead-man switch (the status relay) are go-live step 15.
 
   6. Edit $HOME_DIR/config.yaml (keep dry_run: true until go-live step 11 stage B), then:
        $RESONANT daemon install   # reload after config changes
