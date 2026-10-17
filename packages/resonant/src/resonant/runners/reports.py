@@ -45,7 +45,8 @@ within the per-run cap like any other; past the cap it still reaches the digest.
 
 Detected side effects (TR-1). The runner also reads the worker's own tool calls as they
 stream (``runners/side_effects.py``) and keeps the outside actions it finds in kv
-``run.seen:<code>`` (``record_detected``: the last ``DETECTED_KEEP``, one per ``what``). They
+``run.seen:<code>`` (``record_detected``: the last ``DETECTED_KEEP``, one per ``what``; after
+``DETECTED_MAX`` distinct ones a run's further ones are dropped). They
 join the ``did:`` list after the worker's own items, marked ``(detected)``, unless a ``did:``
 item already names them (``side_effects.reported``): ``did: merged PR #2 with gh; pushed to
 main (detected)``. A high-impact one (a push to the base branch, a publish, a delete) is the
@@ -101,6 +102,8 @@ _REPORT_KEY = "run.report:"  # kv: a run's report preference, set at start
 _DID_KEY = "run.did:"  # kv: a run's side effects, oldest first
 _SEEN_KEY = "run.seen:"  # kv: side effects detected in a run's commands (TR-1), oldest first
 DETECTED_KEEP = 20
+DETECTED_MAX = 200  # distinct side effects recorded (and audited, texted) per run, at most
+_SEEN_ALL_KEY = "run.seen_all:"  # kv: every what recorded for a run, for dedupe
 DETECTED_MARK = " (detected)"
 DID_PREFIX = "did:"
 DID_KEEP = 20
@@ -172,8 +175,17 @@ def record_detected(conn: sqlite3.Connection, code: str, effect: SideEffect) -> 
         return False
     with atomic(conn):
         seen = _seen(conn, code)
-        if any(s.get("what") == what for s in seen):
+        known: object = kv_get(conn, _SEEN_ALL_KEY + code)
+        whats = (
+            [w for w in cast(list[object], known) if isinstance(w, str)]
+            if isinstance(known, list)
+            else []
+        )
+        if what in whats or any(s.get("what") == what for s in seen):
             return False
+        if len(whats) >= DETECTED_MAX:
+            return False  # a run looping over many distinct commands: stop recording
+        kv_set(conn, _SEEN_ALL_KEY + code, [*whats, what])
         entry: dict[str, object] = {"what": what, "kind": effect.kind, "high": effect.high,
                                     "keys": list(effect.keys)}  # fmt: skip
         kv_set(conn, _SEEN_KEY + code, [*seen, entry][-DETECTED_KEEP:])

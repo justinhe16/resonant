@@ -219,3 +219,37 @@ def test_render_activity() -> None:
 def test_pick_run(db: sqlite3.Connection) -> None:
     assert pick_run([], None) == "No runs yet."
     assert pick_run([], "dori") == "No run on dori lately."
+
+
+def test_commands_shown_back_are_scrubbed() -> None:
+    bearer, user = "Bearer " + "abcdefgh" + "12345678", "bob" + ":" + "pw"  # built: not literals
+    cmd = (
+        f"API_KEY=sk-live-abc curl -H 'Authorization: {bearer}' -u {user} "
+        "--token xyz https://u:pw@api.example.com/v1?token=abc&x=1"
+    )
+    shown = activity.describe_call("Bash", {"command": cmd})
+    for secret in ("sk-live-abc", "abcdefgh12345678", "bob:pw", "xyz", "u:pw", "token=abc"):
+        assert secret not in shown, secret
+    assert "api.example.com/v1" in shown and shown.startswith("$ API_KEY=… curl")
+    fetched = activity.describe_call("WebFetch", {"url": "https://a:b@x.io/p?sig=1"})
+    assert fetched == "WebFetch https://x.io/p?…"
+    assert activity.describe_call("Bash", {"command": "git push origin main"}) == (
+        "$ git push origin main"
+    )
+
+
+def test_naive_timestamps_and_deep_json_dont_break_the_reducer(tmp_path: Path) -> None:
+    naive = {"type": "assistant", "timestamp": "2026-10-16T13:55:00",
+             "message": {"content": [{"type": "tool_use", "id": "a", "name": "Bash",
+                                      "input": {"command": "ls"}}]}}  # fmt: skip
+    assert activity.summarize([naive], now=NOW).calls_in_window == 1
+    path = tmp_path / "R1.jsonl"
+    path.write_text("{" + '"a":' * 5000 + "1" + "}" * 5000 + "\n" + json.dumps(text("hi")) + "\n")
+    assert [e["type"] for e in activity.read_tail(path)] == ["assistant"]
+
+
+def test_the_tool_default_window_matches_the_reducer() -> None:
+    from resonant.tools import runs as runs_tools
+
+    assert runs_tools.ACTIVITY_MINUTES == activity.WINDOW_MIN
+    assert runs_tools.ACTIVITY_MINUTES_MAX == activity.WINDOW_MAX

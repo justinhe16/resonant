@@ -139,17 +139,26 @@ _ADDRESSED = (
 # Run control: "R4 cancel" routes normally (/runs, /cancel, merge), never as an answer or a
 # message; and a short free-text reply that starts like this is never taken as an answer.
 _CONTROL = re.compile(
-    r"(?:cancel|stop|kill|abort|merge|status|progress|how'?s|how is|how are|doing|up to|"
-    r"activity)\b",
-    re.IGNORECASE,
+    r"(?:cancel|stop|kill|abort|merge|status|progress|how'?s|how is|how are)\b", re.IGNORECASE
 )
-# A question about a run's state ("what's R4 doing", "is the dori run stuck"): never an
-# answer to a worker's question, whatever the brain thinks (TR-1: run_activity takes it).
+# A short question about a run's state ("what's R4 doing", "status on the trading run", "is
+# the dori worker stuck?"): never an answer to a worker's question, whatever the brain thinks
+# (TR-1: run_activity takes it). Anchored at the start and only for short texts or questions,
+# so an answer that mentions what is going on still counts.
 _STATUS_Q = re.compile(
-    r"\b(?:what'?s|what is|whats)\b.*\b(?:doing|up to|happening|going on)\b"
-    r"|\bstatus (?:on|of)\b|\bis\b.*\b(?:stuck|still running|still going)\b",
+    r"(?:(?:so|ok|okay|hey|and),? )?(?:(?:what'?s|what is|whats)\b.*\b(?:doing|up to|happening|"
+    r"going on)\b|status (?:on|of)\b|is\b.*\b(?:stuck|still running|still going)\b)",
     re.IGNORECASE,
 )
+STATUS_Q_WORDS = 10
+
+
+def status_question(text: str) -> bool:
+    """Whether ``text`` asks how a run is doing (see ``_STATUS_Q``)."""
+    short = len(text.split()) <= STATUS_Q_WORDS or text.rstrip().endswith("?")
+    return short and _STATUS_Q.match(normalize(text)) is not None
+
+
 _RUN_CODE_IN = re.compile(r"(?<![A-Za-z0-9])R[0-9]{1,9}(?![A-Za-z0-9])", re.IGNORECASE)
 # What only makes sense as the answer to a question: refused when the run has none open.
 _BARE = re.compile(
@@ -433,7 +442,7 @@ class Relay:
         now = self.clock()
         short = _words(text) <= SHORT_WORDS
         # Run control or another run's code: never an answer by the short-reply bias.
-        if _STATUS_Q.search(normalize(text)):
+        if status_question(text):
             return None  # a status question, for run_activity
         commandish = bool(_CONTROL.match(normalize(text)) or _RUN_CODE_IN.search(text))
         says_new = pick is not None and pick[0] == NONE and pick[1] >= LIKELY

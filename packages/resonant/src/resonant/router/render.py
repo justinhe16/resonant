@@ -263,7 +263,9 @@ def _activity_lines(a: dict[str, Any]) -> list[str]:
     if isinstance(n, int) and isinstance(window, int):
         pace.append(f"{n} tool calls in the last {window}m")
     if isinstance(quiet, (int, float)):
-        pace.append(f"last event {_ago(float(quiet))} ago")
+        from resonant.runners.activity import ago  # here: runners imports the router
+
+        pace.append(f"last event {ago(float(quiet))} ago")
     if pace:
         lines.append("; ".join(pace))
     calls = [str(c) for c in as_list(a.get("calls")) if isinstance(c, str) and c]
@@ -279,15 +281,6 @@ def _activity_lines(a: dict[str, Any]) -> list[str]:
             "Did: " + "; ".join(did[:6]) + (f" +{len(did) - 6} more" if len(did) > 6 else "")
         )
     return lines
-
-
-def _ago(seconds: float) -> str:
-    s = int(seconds)
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m"
-    return f"{s // 3600}h {s % 3600 // 60}m"
 
 
 def render_activity(d: dict[str, Any]) -> str:

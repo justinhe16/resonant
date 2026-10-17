@@ -78,6 +78,7 @@ _MAX_DEPTH = 2  # nested ``bash -c`` levels read
 _SAFE = re.compile(r"[^A-Za-z0-9._/@:+#-]")
 _OPS = frozenset({"&&", "||", ";", "|", "&", "|&", ";;", "(", ")", "{", "}", "!"})
 _ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
+_VERSION_TAG = re.compile(r"v?[0-9]+(?:\.[0-9]+){1,3}(?:[-+][A-Za-z0-9.]+)?")
 _OWN_BRANCH = re.compile(r"resonant/r[0-9]+(?:-.*)?", re.IGNORECASE)
 _GITHUB = re.compile(
     r"(?:https?://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
@@ -85,6 +86,10 @@ _GITHUB = re.compile(
     re.IGNORECASE,
 )
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})  # noqa: S104
+_MCP_READ = re.compile(
+    r"(?:get|list|read|search|find|fetch|describe|show|query|lookup|view|count|check)(?:_|$)",
+    re.IGNORECASE,
+)
 _MCP_HIGH = re.compile(r"delete|remove|pay|charge|transfer|refund", re.IGNORECASE)
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _MCP_WRITE = re.compile(
@@ -131,19 +136,44 @@ def host_of(url: str) -> str | None:
         host = urlsplit(text).hostname
     except ValueError:
         return None
+    if host in _LOCAL_HOSTS:
+        return host
     if not host or not re.fullmatch(r"[a-z0-9.-]+", host):
         return None
     return tok(host, 60)
 
 
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_REDIRECT = re.compile(r"\d*(?:&>>?|>>?&?|<&|<<<|<)\s*(?:&?\d+-?(?![^\s;&|()])|[^\s;&|()]+)")
+
+
+def strip_heredocs(cmd: str) -> str:
+    """``cmd`` without heredoc bodies (``cat > f <<'EOF' … EOF``): their lines are data, not
+    commands. An unterminated body runs to the end."""
+    out: list[str] = []
+    until: str | None = None
+    for line in cmd.split("\n"):
+        if until is not None:
+            if line.strip() == until:
+                until = None
+            continue
+        m = _HEREDOC.search(line)
+        if m is not None:
+            until = m[2]
+            line = line[: m.start()] + line[m.end() :]
+        out.append(line)
+    return "\n".join(out)
+
+
 def _words(cmd: str) -> list[str]:
+    text = _REDIRECT.sub(" ", strip_heredocs(cmd))
     try:
-        lex = shlex.shlex(cmd.replace("\n", " ; "), posix=True, punctuation_chars=";&|()")
+        lex = shlex.shlex(text.replace("\n", "\n ; "), posix=True, punctuation_chars=";&|()")
         lex.whitespace_split = True
-        lex.commenters = ""
+        lex.commenters = "#"  # a comment runs to the end of its line
         return list(lex)
     except ValueError:  # unbalanced quotes: read it roughly
-        rough = re.split(r"\s+", cmd.replace("\n", " ; ").strip())
+        rough = re.split(r"\s+", re.sub(r"(?m)#.*$", "", text).replace("\n", " ; ").strip())
         return [w.strip("'\"") for w in rough if w.strip("'\"")]
 
 
@@ -173,15 +203,33 @@ _WRAPPERS = frozenset(
 _RUNNERS = {"npx": 1, "bunx": 1, "uvx": 1, "pipx": 2}  # argv0 -> words to drop (pipx run)
 
 
+_KEYWORDS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"})
+_XARGS_VALUE = frozenset({"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a"})
+
+
 def unwrap(argv: Sequence[str]) -> list[str]:
     """``argv`` with leading assignments and wrappers removed (``sudo -E env A=1 npx x``)."""
     a = list(argv)
-    for _ in range(8):
+    for _ in range(12):
         while a and _ASSIGN.fullmatch(a[0]):
             a = a[1:]
         if not a:
             return a
         head = _base(a[0])
+        if a[0] in _KEYWORDS:
+            a = a[1:]
+            continue
+        if head in ("timeout", "gtimeout"):
+            a = a[1:]
+            while a and a[0].startswith("-"):
+                a = a[2:] if a[0] in ("-s", "-k", "--signal", "--kill-after") else a[1:]
+            a = a[1:]  # the duration
+            continue
+        if head == "xargs":
+            a = a[1:]
+            while a and a[0].startswith("-"):
+                a = a[2:] if a[0] in _XARGS_VALUE else a[1:]
+            continue
         if head in _WRAPPERS or head == "env":
             a = a[1:]
             while a and (a[0].startswith("-") or _ASSIGN.fullmatch(a[0])):
@@ -275,8 +323,11 @@ def _push(args: list[str], ctx: RunContext) -> list[SideEffect]:
     pos = _positional(args, _PUSH_VALUE)
     force = _has(args, "-f", "--force", "--force-with-lease", "--force-if-includes")
     delete = _has(args, "-d", "--delete")
-    remote = pos[0] if pos else (_opt(args, "--repo") or "origin")
-    specs = pos[1:]
+    repo_opt = _opt(args, "--repo")
+    if repo_opt:  # --repo=<remote>: every positional is a refspec
+        remote, specs = repo_opt, pos
+    else:
+        remote, specs = (pos[0] if pos else "origin"), pos[1:]
     m = _GITHUB.search(remote)
     other: str | None = None
     if m is not None and not _same_repo(m["slug"], ctx.repo):
@@ -285,6 +336,7 @@ def _push(args: list[str], ctx: RunContext) -> list[SideEffect]:
         shown = host_of(remote) if "://" in remote or "@" in remote else tok(remote)
         other = f"remote {shown or '?'}"
     where = f" to {other}" if other else ""
+    tail = f" on {other}" if other else ""
     bases = {ctx.base} if ctx.base else {"main", "master"}
     out: list[SideEffect] = []
     verb = "force-pushed" if force else "pushed"
@@ -302,10 +354,16 @@ def _push(args: list[str], ctx: RunContext) -> list[SideEffect]:
         plus = spec.startswith("+")
         src, _, dst = spec.lstrip("+").partition(":")
         dst = dst or src
+        if any(c in spec for c in "$`"):
+            continue  # an unresolved ref ($(git branch …), "$BRANCH"): can't tell what it is
         name = re.sub(r"^refs/(heads/)?", "", dst)
         gone = delete or (spec.lstrip("+").startswith(":") and bool(dst))
         v = "force-pushed" if (force or plus) else "pushed"
-        if dst.startswith("refs/tags/") or src.startswith("refs/tags/"):
+        if (
+            dst.startswith("refs/tags/")
+            or src.startswith("refs/tags/")
+            or _VERSION_TAG.fullmatch(dst)
+        ):
             out.append(
                 SideEffect(
                     "push", f"pushed tag {tok(name.removeprefix('tags/'))}{where}", False, ("tag",)
@@ -319,7 +377,12 @@ def _push(args: list[str], ctx: RunContext) -> list[SideEffect]:
             )
         elif name in bases:
             out.append(
-                SideEffect("push", f"{v} to {tok(name)}{where}", True, ("push", tok(name).lower()))
+                SideEffect(
+                    "push",
+                    f"{v} {tok(name)}{tail}" if other else f"{v} to {tok(name)}",
+                    True,
+                    ("push", tok(name).lower()),
+                )
             )
         elif name in ("HEAD", "@") or name == ctx.branch or _OWN_BRANCH.fullmatch(name):
             if other:
@@ -393,11 +456,8 @@ def _gh(args: list[str]) -> list[SideEffect]:
     if group == "pr" and sub == "merge":
         n = _pr_number(rest)
         label = f"PR #{n}" if n else "a PR"
-        return [
-            SideEffect(
-                "merge", f"merged {label} with gh{where}", False, ("merge", *((n,) if n else ()))
-            )
-        ]
+        keys = ("merge", n) if n else ("merged a pr",)
+        return [SideEffect("merge", f"merged {label} with gh{where}", True, keys)]
     if group == "pr" and sub in ("close", "comment", "review"):
         n = _pr_number(rest)
         label = f"PR #{n}" if n else "a PR"
@@ -455,6 +515,10 @@ def _gh(args: list[str]) -> list[SideEffect]:
         return [SideEffect("github", f"{verb}{where}", sub == "delete", ("issue",))]
     if group == "api":
         method = (_opt(args, "-X", "--method") or "").upper()
+        if sub == "graphql" and not method:  # always POST; only a mutation writes
+            if not any("mutation" in x for x in args):
+                return []
+            method = "POST"
         fields = _has(args, "-f", "-F", "--field", "--raw-field", "--input")
         if not method:
             method = "POST" if fields else "GET"
@@ -669,6 +733,9 @@ _CURL_DATA = (
 )
 
 
+_DOMAIN = re.compile(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+(:[0-9]+)?(/|$)")
+
+
 def _url_arg(pos: Sequence[str], args: Sequence[str]) -> str | None:
     explicit = _opt(args, "--url")
     if explicit:
@@ -694,16 +761,58 @@ def _http_effect(method: str, url: str | None, tool: str) -> list[SideEffect]:
     ]
 
 
+_CURL_SHORT_VALUE = frozenset("XdFTHuoAebcmwKxEr")  # short options that take a value
+
+
 def _curl(args: list[str]) -> list[SideEffect]:
-    method = (_opt(args, "-X", "--request") or "").upper()
+    """curl's method and URL, reading short clusters (``-sd@f``, ``-XPOST``, ``-d'{}'``)."""
+    method = ""
+    data = put = get = False
+    url = _opt(args, "--url")
+    i = 0
+    while i < len(args):
+        x = args[i]
+        if x.startswith("--"):
+            name = x.split("=", 1)[0]
+            if name == "--request":
+                method = (x.split("=", 1)[1] if "=" in x else _at(args, i + 1)).upper()
+            elif name in _CURL_DATA:
+                data = True
+            elif name == "--upload-file":
+                put = True
+            elif name == "--get":
+                get = True
+            i += 1 if "=" in x or name not in _CURL_VALUE else 2
+            continue
+        if x.startswith("-") and len(x) > 1:
+            took = False
+            for j, ch in enumerate(x[1:], 1):
+                if ch == "G":
+                    get = True
+                if ch in _CURL_SHORT_VALUE:
+                    value = x[j + 1 :] or _at(args, i + 1)
+                    took = not x[j + 1 :]
+                    if ch == "X":
+                        method = value.upper()
+                    elif ch in "dF":
+                        data = True
+                    elif ch == "T":
+                        put = True
+                    break
+            i += 2 if took else 1
+            continue
+        if url is None and ("://" in x or _DOMAIN.match(x)):
+            url = x
+        i += 1
     if not method:
-        if _has(args, "-T", "--upload-file"):
-            method = "PUT"
-        elif _has(args, *_CURL_DATA) and not _has(args, "-G", "--get"):
-            method = "POST"
+        method = "PUT" if put else "POST" if data and not get else ""
     if method not in _WRITE_METHODS:
         return []
-    return _http_effect(method, _url_arg(_positional(args, _CURL_VALUE), args), "curl")
+    return _http_effect(method, url, "curl")
+
+
+def _at(args: Sequence[str], i: int) -> str:
+    return args[i] if i < len(args) else ""
 
 
 def _httpie(args: list[str]) -> list[SideEffect]:
@@ -798,6 +907,12 @@ def _resonant(args: list[str]) -> list[SideEffect]:
 _SHELLS = frozenset({"bash", "sh", "zsh", "dash", "fish"})
 
 
+def _dry_run(head: str, args: Sequence[str]) -> bool:
+    if any(x.startswith("--dry-run") or x in ("--dryrun", "--what-if", "--noop") for x in args):
+        return True
+    return head == "git" and "push" in args and "-n" in args
+
+
 def classify_command(cmd: str, ctx: RunContext | None = None) -> list[SideEffect]:
     """The outside actions in one shell command line, in order, without repeats."""
     return _dedupe(_classify(cmd, ctx or RunContext(), 0))
@@ -810,11 +925,13 @@ def _classify(cmd: str, ctx: RunContext, depth: int) -> list[SideEffect]:
         if not a:
             continue
         head, args = _base(a[0]), a[1:]
-        if head in _SHELLS and "-c" in args and depth < _MAX_DEPTH:
-            i = args.index("-c")
-            if i + 1 < len(args):
-                out += _classify(args[i + 1], ctx, depth + 1)
+        if head in _SHELLS and depth < _MAX_DEPTH:
+            flag = next((i for i, x in enumerate(args) if re.fullmatch(r"-[a-z]*c[a-z]*", x)), None)
+            if flag is not None and flag + 1 < len(args):
+                out += _classify(args[flag + 1], ctx, depth + 1)
             continue
+        if _dry_run(head, args):
+            continue  # nothing happened outside
         if head == "eval" and depth < _MAX_DEPTH:
             out += _classify(" ".join(args), ctx, depth + 1)
             continue
@@ -846,8 +963,7 @@ def classify_tool(
     if name.startswith("mcp__"):
         parts = name.split("__")
         server, tool = (parts[1], "__".join(parts[2:])) if len(parts) > 2 else ("?", name)
-        m = _MCP_WRITE.search(tool)
-        if m is None:
+        if _MCP_READ.match(tool) or _MCP_WRITE.search(tool) is None:
             return []
         high = _MCP_HIGH.search(tool) is not None
         return [

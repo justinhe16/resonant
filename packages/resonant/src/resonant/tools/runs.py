@@ -79,6 +79,7 @@ TEXT_MAX = 120  # Claude's summary or a failure, as the model and the reply see 
 ASK_SHOWN = 60
 OWNER_TEXT_MAX = 2000  # an answer or message to a worker
 QUESTION_SHOWN = 120
+ACTIVITY_MINUTES = 10  # activity.WINDOW_MIN (a test checks they agree)
 ACTIVITY_MINUTES_MAX = 24 * 60  # activity.WINDOW_MAX
 ACTIVITY_RECENT = 50  # runs searched for a repo's latest
 
@@ -490,7 +491,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         repo = args.get("repo")
         if repo is not None and (not isinstance(repo, str) or len(repo) > REPO_MAX):
             raise ToolFailed(f"run_activity: repo is a string (at most {REPO_MAX})")
-        minutes = args.get("minutes", 10)
+        minutes = args.get("minutes", ACTIVITY_MINUTES)
         if isinstance(minutes, bool) or not isinstance(minutes, int):
             raise ToolFailed("run_activity: minutes is a whole number")
         if not 1 <= minutes <= ACTIVITY_MINUTES_MAX:

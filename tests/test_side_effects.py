@@ -105,13 +105,13 @@ def test_a_push_to_another_repo_or_remote_is_flagged_without_its_credentials() -
     effects = seen("git push https://x-access-token:ghs_SECRET123@github.com/jhe/other.git HEAD")
     assert effects == [("push", "pushed to jhe/other", False)]
     assert seen("git push git@github.com:acme/site.git main") == [
-        ("push", "pushed to main to acme/site", True)
+        ("push", "pushed main on acme/site", True)
     ]
     assert seen("git push upstream resonant/r4-fix-flaky") == [
         ("push", "pushed to remote upstream", False)
     ]
     assert seen("git push https://user:pw@gitlab.example.com/a/b.git main")[0][1] == (
-        "pushed to main to remote gitlab.example.com"
+        "pushed main on remote gitlab.example.com"
     )
 
 
@@ -121,12 +121,12 @@ def test_a_push_to_another_repo_or_remote_is_flagged_without_its_credentials() -
 @pytest.mark.parametrize(
     ("cmd", "expected"),
     [
-        ("gh pr merge 12 --squash", [("merge", "merged PR #12 with gh", False)]),
+        ("gh pr merge 12 --squash", [("merge", "merged PR #12 with gh", True)]),
         (
             "gh pr merge https://github.com/jhe/dori/pull/7 -R jhe/dori --admin",
-            [("merge", "merged PR #7 with gh in jhe/dori", False)],
+            [("merge", "merged PR #7 with gh in jhe/dori", True)],
         ),
-        ("gh pr merge --squash", [("merge", "merged a PR with gh", False)]),
+        ("gh pr merge --squash", [("merge", "merged a PR with gh", True)]),
         (
             "gh release create v1.2 --notes 'big release'",
             [("release", "published release v1.2", True)],
@@ -269,7 +269,7 @@ def test_wrappers_compound_lines_and_nested_shells() -> None:
         ("push", "pushed to main", True),
     ]
     assert seen("bash -c 'cd x && git push origin main'") == [("push", "pushed to main", True)]
-    assert seen("/opt/homebrew/bin/gh pr merge 3") == [("merge", "merged PR #3 with gh", False)]
+    assert seen("/opt/homebrew/bin/gh pr merge 3") == [("merge", "merged PR #3 with gh", True)]
     # the same action twice in one line is listed once
     assert seen("npm publish || npm publish") == [
         ("publish", "published to npm (npm publish)", True)
@@ -443,7 +443,8 @@ async def test_a_noted_side_effect_is_not_listed_twice(
     code = await h.start(report="digest")
     await h.drain()
     assert [e.what for e in detected_list(db, code)] == ["merged PR #3 with gh in own/other"]
-    assert h.chan.texts() == []  # a merge isn't high impact
+    # a merge is high impact (it skips Resonant's merge rules): texted once, listed once
+    assert h.chan.texts() == [f"{code} detected: merged PR #3 with gh in own/other"]
     [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
     assert line.title.endswith("· did: merged PR #3 in other")
 
@@ -460,3 +461,62 @@ async def test_a_notify_digest_rule_keeps_a_detected_push_out_of_texts(
     [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
     assert line.title.endswith("· did: pushed to main (detected)")
     assert code == "R1"
+
+
+# --- review follow-ups: redirects, wrappers, dry runs, heredocs, curl clusters ------------------
+
+
+@pytest.mark.parametrize(
+    ("cmd", "expected"),
+    [
+        ("git push -u origin HEAD 2>&1 | tail -3", []),
+        ("git push origin resonant/r4-fix-flaky 2>&1", []),
+        ("git push origin main 2>&1", [("push", "pushed to main", True)]),
+        ("git push origin main2>&1", [("push", "pushed to main", True)]),
+        ("git push origin main > /dev/null", [("push", "pushed to main", True)]),
+        ("git push origin main # ship it", [("push", "pushed to main", True)]),
+        ("git push origin main &>/tmp/log", [("push", "pushed to main", True)]),
+        ("if true; then git push origin main; fi", [("push", "pushed to main", True)]),
+        ("for b in a; do git push origin main; done", [("push", "pushed to main", True)]),
+        ("timeout 60 git push origin main", [("push", "pushed to main", True)]),
+        ("timeout -s KILL 5m npm publish", [("publish", "published to npm (npm publish)", True)]),
+        ("echo x | xargs -I{} git push origin main", [("push", "pushed to main", True)]),
+        ("bash -lc 'git push origin main'", [("push", "pushed to main", True)]),
+        ("sh -ec 'npm publish'", [("publish", "published to npm (npm publish)", True)]),
+        ("git push --dry-run origin main", []),
+        ("git push -n origin main", []),
+        ("npm publish --dry-run", []),
+        ("kubectl apply -f k.yaml --dry-run=client", []),
+        ("cat > notes.md <<'EOF'\ngit push origin main\nEOF\nnpm test", []),
+        (
+            "cat <<EOF > x\nnpm publish\nEOF\ngit push origin main",
+            [("push", "pushed to main", True)],
+        ),
+        ("git push origin $(git branch --show-current)", []),
+        ('git push origin "$BRANCH"', []),
+        ("git push origin v1.0", [("push", "pushed tag v1.0", False)]),
+        (
+            "git push --repo=https://github.com/jhe/other main",
+            [("push", "pushed main on jhe/other", True)],
+        ),
+        ("curl -sd '{}' https://a.example.com/x", [("http", "POST a.example.com (curl)", False)]),
+        ("curl -d@f https://a.example.com", [("http", "POST a.example.com (curl)", False)]),
+        ("curl -d'{}' https://a.example.com", [("http", "POST a.example.com (curl)", False)]),
+        ("curl -XPOST https://a.example.com", [("http", "POST a.example.com (curl)", False)]),
+        ("curl -sSLo out.txt https://example.com/file", []),
+        ("curl -X POST http://[::1]:80/x", []),
+        ("gh api graphql -f query='query { viewer { login } }'", []),
+        (
+            "gh api graphql -f query='mutation { addStar }'",
+            [("http", "gh api POST graphql", False)],
+        ),
+    ],
+)
+def test_shell_forms_from_the_review(cmd: str, expected: list[tuple[str, str, bool]]) -> None:
+    assert seen(cmd) == expected
+
+
+def test_mcp_reads_are_not_writes() -> None:
+    for name in ("mcp__stripe__get_charge", "mcp__blog__get_post", "mcp__x__list_comments",
+                 "mcp__x__search_replies", "mcp__stripe__fetch_refund"):  # fmt: skip
+        assert classify_tool(name, {}) == [], name

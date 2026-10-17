@@ -228,6 +228,8 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 `test_reads_200_rows_under_100ms` and `test_bench_e2e_cli_json` sometimes fail on a loaded CI runner and pass on a rerun. Give them headroom (a relative bound, or a marker that skips the timing assert in CI) so a red build always means a real failure.
 
+*2026-10-17, TR-1 CI:* `test_runner_fork.py::test_owner_merge_takes_over_an_auto_merge_watch` (GT-1) failed once on CI: right after `/merge` it expects the auto watch's task to be `cancelled`, but a watch caught mid-step is still `running` until its step returns. It passes locally. Wait for the status (`until(...)`) instead of asserting it at once.
+
 ## Labeler near-misses
 
 *Noted 2026-10-13, from the Phase 2 router eval on the real model.*
@@ -373,7 +375,7 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 
 *Noted 2026-10-16 from TR-1 ([`employee-plan.md`](employee-plan.md#tr-1-reading-the-workers-transcript)).*
 
-- **Detection reads command text only.** A side effect inside a script (`./deploy.sh`, `make release`, `npm run deploy`), a Python or Node program, a subagent's own tool calls (they aren't in the parent's stream-json) or an MCP tool with a neutral name isn't seen. Aliases and shell functions from the owner's rc files aren't expanded. A command that failed is still listed (it says what was run, not what happened). Heredoc bodies are read as commands, so `cat <<EOF … git push origin main … EOF` can list a push that never ran. Widen `runners/side_effects.py` from real transcripts; `make`/`npm run <script>` names could be matched against a per-repo list of deploy targets.
+- **Detection reads command text only.** A side effect inside a script (`./deploy.sh`, `make release`, `npm run deploy`), a Python or Node program, a subagent's own tool calls (they aren't in the parent's stream-json) or an MCP tool with a neutral name isn't seen. Aliases and shell functions from the owner's rc files aren't expanded. A command that failed is still listed (it says what was run, not what happened). A ref in a shell variable or `$(…)` is skipped, so `git push origin "$BRANCH"` to main is missed. A detected merge is texted even when the worker also sends a `did:` note (the note arrives later; the line dedupes, the text can't). Widen `runners/side_effects.py` from real transcripts; `make`/`npm run <script>` names could be matched against a per-repo list of deploy targets.
 - **No model one-liner.** `run_activity` is deterministic; the local model isn't asked for a one-line summary (the ticket made it optional). If replies feel too raw, add it after the headline, never instead of it.
 - **Detected effects aren't in the dashboard's relay snapshot** and the per-run text cap (6/h, shared with urgent notes) is in memory, so a restart resets it.
 - **Remote Control: not shipped (spike result).** Goal: see or steer a worker in the owner's Claude app (claude.ai/code, mobile) while Resonant drives it headlessly. Findings on Claude Code 2.1.299, with the docs (code.claude.com/docs/en/remote-control.md, cli-reference.md):

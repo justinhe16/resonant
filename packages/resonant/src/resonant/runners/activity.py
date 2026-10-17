@@ -28,7 +28,7 @@ import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -83,7 +83,7 @@ def read_tail(path: Path, limit: int = TAIL_BYTES) -> list[dict[str, Any]]:
     for line in lines:
         if not line.startswith(b"{"):
             continue
-        with contextlib.suppress(ValueError):
+        with contextlib.suppress(ValueError, RecursionError):
             obj: object = json.loads(line)
             if isinstance(obj, dict):
                 out.append(cast(dict[str, Any], obj))
@@ -99,6 +99,28 @@ def quiet_for(path: Path, now: datetime) -> float | None:
     return max(now.timestamp() - mtime, 0.0)
 
 
+_SCRUBS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # header and credential options: the value goes
+    (re.compile(r"(?<!\S)(-H|--header|-u|--user|--token|--password|--passwd|--oauth2-bearer|"
+                r"--api-key|--secret|--auth)(=|\s+)('[^']*'|\"[^\"]*\"|\S+)"), r"\1\2…"),
+    (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 …"),
+    (re.compile(r"(?i)\b(authorization|api[_-]?key|token|secret|password|passwd|auth)\b(\s*[:=]\s*)"
+                r"('[^']*'|\"[^\"]*\"|\S+)"), r"\1\2…"),
+    (re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^/\s@'\"]+@"), r"\1"),  # URL user and password
+    (re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s?'\"]*)\?[^\s'\"]*"), r"\1?…"),  # query strings
+    (re.compile(r"(?<![\S])([A-Za-z_][A-Za-z0-9_]*)=(?!=)('[^']*'|\"[^\"]*\"|\S+)"), r"\1=…"),
+)  # fmt: skip
+
+
+def scrub(text: str) -> str:
+    """A command as shown back to the owner: header and credential option values, auth
+    words' values, URL credentials and query strings, and ``NAME=value`` values replaced by
+    ``…``. On top of the transcript's redaction of known secrets."""
+    for pattern, repl in _SCRUBS:
+        text = pattern.sub(repl, text)
+    return text
+
+
 def describe_call(name: str, args: Mapping[str, Any]) -> str:
     """A tool call in a few words: ``$ <command>``, ``Edit <file>``, ``linear create_issue``."""
 
@@ -107,7 +129,7 @@ def describe_call(name: str, args: Mapping[str, Any]) -> str:
         return v if isinstance(v, str) else ""
 
     if name == "Bash":
-        return "$ " + re.sub(r"\s+", " ", s("command")).strip()
+        return "$ " + scrub(re.sub(r"\s+", " ", s("command")).strip())
     if name in ("Edit", "MultiEdit", "Write", "Read", "NotebookEdit"):
         path = s("file_path") or s("notebook_path")
         return f"{name} {Path(path).name}" if path else name
@@ -116,7 +138,7 @@ def describe_call(name: str, args: Mapping[str, Any]) -> str:
     if name in ("Agent", "Task"):
         return f"{name}: {s('description')}".rstrip(": ")
     if name in ("WebFetch", "WebSearch"):
-        target = s("url") or s("query")
+        target = scrub(s("url") or s("query"))
         return f"{name} {target}".rstrip()
     if name.startswith("mcp__"):
         parts = name.split("__")
@@ -129,9 +151,10 @@ def _time(msg: Mapping[str, Any]) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    return at if at.tzinfo is not None else at.replace(tzinfo=UTC)
 
 
 def _blocks(msg: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -254,5 +277,6 @@ __all__ = [
     "headline",
     "quiet_for",
     "read_tail",
+    "scrub",
     "summarize",
 ]

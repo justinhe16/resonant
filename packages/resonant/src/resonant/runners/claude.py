@@ -1594,10 +1594,20 @@ class ClaudeRunner:
 
     # -- side effects read from the session's commands (TR-1) --
 
-    def _side_effect_context(self, run: Run) -> RunContext:
-        found = repo_store.find(self.conn, run.repo) if run.repo else None
+    def _side_effect_context(self, run: Run, p: Prepared) -> RunContext:
+        """What tells the run's own pushes apart: its repo's slug, base and branch (from the
+        prepared workspace, which the run row may not have caught up with). Never raises."""
+        try:
+            found = repo_store.find(self.conn, run.repo) if run.repo else None
+        except Exception:
+            log.exception("side effect context", extra={"run": run.code})
+            found = None
         repo = found.slug if found is not None else (run.repo or None)
-        return RunContext(repo=repo, base=run.base_branch, branch=run.branch)
+        return RunContext(
+            repo=repo,
+            base=p.base_branch or run.base_branch or None,
+            branch=p.branch or run.branch or None,
+        )
 
     def _detect(self, run: Run, msg: dict[str, Any], ctx: RunContext) -> None:
         """Record the outside actions in one assistant message's tool calls on the run's
@@ -1625,15 +1635,19 @@ class ClaudeRunner:
         """A new detected side effect: the run's digest line is news again; a high-impact one
         (base push, publish, delete) is also texted now unless a ``notify_digest`` rule on its
         kind holds it, or the run already used its immediate texts this hour."""
-        run = runs.get(self.conn, code)
-        if run is None or run.status != "running":
-            return
-        item = self.reports.running(run, _bucket(run.session_seconds))
-        if not effect.high:
-            return
-        level = self.reports.level(run, "side_effect", effect.kind)
-        self.reports.audit_report(run, "side_effect", level)
-        if level != "now" or (text := self.reports.detected_text(run, effect.what)) is None:
+        try:
+            run = runs.get(self.conn, code)
+            if run is None or run.status != "running":
+                return
+            item = self.reports.running(run, _bucket(run.session_seconds))
+            if not effect.high:
+                return
+            level = self.reports.level(run, "side_effect", effect.kind)
+            self.reports.audit_report(run, "side_effect", level)
+            if level != "now" or (text := self.reports.detected_text(run, effect.what)) is None:
+                return
+        except Exception:  # the digest line is best effort; the stream goes on
+            log.exception("side effect report failed", extra={"run": code})
             return
         key = f"run:{run.code}:seen:{uuid.uuid4().hex}"
         try:
@@ -2178,7 +2192,7 @@ class ClaudeRunner:
         async def pump_out() -> None:
             assert proc.stdout
             counted = False
-            seen = self._side_effect_context(run)
+            seen = self._side_effect_context(run, p)
             async for raw, truncated in read_lines(proc.stdout):
                 writer.write(raw, truncated)
                 msg = state.feed(raw) if not truncated else None

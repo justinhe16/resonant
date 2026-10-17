@@ -577,5 +577,15 @@ async def test_a_status_question_is_never_an_answer(rig: Callable[..., Rig]) -> 
     assert await r.free("what's R4 doing") is None
     assert await r.free("status on the trading run") is None
     assert await r.free("is the dori worker stuck?") is None
-    assert r.direct("R4 doing anything?") is None
     assert r.workers.answers == []
+
+
+async def test_answers_that_mention_progress_are_still_answers(rig: Callable[..., Rig]) -> None:
+    r = rig(("R4", 0.99))
+    r.workers.ask("R4", "Which DB?")
+    assert await r.free("up to you, pick one") == "→ R4"
+    r.workers.ask("R4", "Which DB?")
+    assert await r.free("doing it with sqlite is fine") == "→ R4"
+    r.workers.ask("R4", "Which DB?")
+    long = "use sqlite, and whatever is going on in the db is fine, what's the worker doing anyway"
+    assert await r.free(long) == "→ R4"
