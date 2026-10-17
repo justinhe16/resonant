@@ -27,8 +27,10 @@
 --     owner_id            = '<auth.users.id of the one user>',
 --     ingest_token_sha256 = decode('<sha256 hex of the ingest token>', 'hex'),
 --     watch_token_sha256  = decode('<sha256 hex of the watch token>', 'hex');
--- Only the hashes leave the Mini (`printf %s "$TOKEN" | shasum -a 256`). The ingest token goes
--- into the Mini's Keychain as relay/supabase_key, the watch token into `fly secrets`.
+-- Only the hashes leave the Mini (supabase/README.md shows how without the token reaching shell
+-- history). The ingest token goes into the Mini's Keychain as relay/supabase_key, the watch
+-- token into `fly secrets`. Both are bearer tokens: whoever holds the ingest token can push
+-- snapshots (fake ones too), so keep it in the Keychain only and rotate it if in doubt.
 
 -- --- private config --------------------------------------------------------------------------
 -- Not in an exposed API schema, so PostgREST can't reach it. Only `postgres` writes it.
@@ -57,7 +59,7 @@ create table public.snapshots (
   received_at timestamptz not null default now(),  -- server clock; what retention and the watch use
   data        jsonb not null,                      -- a remote-tier Snapshot (docs/snapshot.schema.json)
   constraint snapshots_data_object check (jsonb_typeof(data) = 'object'),
-  constraint snapshots_data_size check (octet_length(data::text) <= 65536)
+  constraint snapshots_data_size check (octet_length(data::text) <= 32768)
 );
 create index snapshots_taken_at_idx on public.snapshots (taken_at desc);
 create index snapshots_received_at_idx on public.snapshots (received_at);
@@ -117,7 +119,7 @@ begin
   if p_data is null or jsonb_typeof(p_data) <> 'object' then
     raise exception 'relay: data must be an object' using errcode = 'PT400';
   end if;
-  if octet_length(p_data::text) > 65536 then
+  if octet_length(p_data::text) > 32768 then
     raise exception 'relay: data too large' using errcode = 'PT413';
   end if;
   -- Defense in depth for plan D3: only a remote tier is stored, and none of the local-only
@@ -143,9 +145,10 @@ begin
     raise exception 'relay: bad taken_at' using errcode = 'PT400';
   end if;
 
-  -- A leaked token can't flood the table: the daemon sends one a minute.
+  -- A leaked token can't flood the table: the daemon sends one a minute (plus the odd retry
+  -- whose first attempt landed after all).
   if (select count(*) from public.snapshots s
-      where s.received_at > now() - interval '1 minute') >= 10 then
+      where s.received_at > now() - interval '1 minute') >= 3 then
     raise exception 'relay: rate limited' using errcode = 'PT429';
   end if;
 
@@ -153,19 +156,24 @@ begin
   delete from public.snapshots s where s.received_at < now() - interval '7 days';
 
   insert into public.snapshots (taken_at, data) values (t, p_data);
+
+  -- And a hard cap: 7 days at one a minute is 10080 rows; never keep more than 12000
+  -- (at most 32 KiB each: under 400 MB, whatever a token holder sends).
+  delete from public.snapshots s
+  where s.id <= (select s2.id from public.snapshots s2 order by s2.id desc offset 12000 limit 1);
 end
 $$;
 revoke all on function public.relay_ingest(text, jsonb) from public, anon, authenticated;
 grant execute on function public.relay_ingest(text, jsonb) to anon;
 
 -- --- the Fly checker's read path (DB-4) ---------------------------------------------------
--- POST /rest/v1/rpc/relay_watch {"p_token": ...} -> at most one row: the latest snapshot's
+-- POST /rest/v1/rpc/relay_watch {"p_token": ...} (POST only) -> at most one row: the latest snapshot's
 -- times and its health rows as [{name, state}]. No counts, no extensions, no other fields.
 
 create function public.relay_watch(p_token text)
 returns table (taken_at timestamptz, received_at timestamptz, health jsonb)
 language plpgsql
-stable
+volatile  -- not stable: PostgREST then accepts POST only, so the token never sits in a URL
 security definer
 set search_path = ''
 as $$

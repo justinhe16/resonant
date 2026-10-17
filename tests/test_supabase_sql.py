@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -305,22 +305,97 @@ def test_ingest_refuses_anything_but_a_remote_tier(
     assert count(db) == 0
 
 
+def _local_only_paths(local: Any, remote: Any, path: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+    """Every key the local tier has and the remote one lacks, at any depth (list items by
+    position), from real dumps: so a new LOCAL_ONLY field shows up here by itself."""
+    out: list[tuple[Any, ...]] = []
+    if isinstance(local, dict) and isinstance(remote, dict):
+        loc, rem = cast(dict[str, Any], local), cast(dict[str, Any], remote)
+        for k, v in loc.items():
+            if k not in rem:
+                out.append((*path, k))
+            else:
+                out += _local_only_paths(v, rem[k], (*path, k))
+    elif isinstance(local, list) and isinstance(remote, list):
+        for i, (lv, rv) in enumerate(
+            zip(cast(list[Any], local), cast(list[Any], remote), strict=False)
+        ):
+            out += _local_only_paths(lv, rv, (*path, i))
+    return out
+
+
+def _busy_dumps(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    from test_dashboard_snapshot import _busy  # pyright: ignore[reportPrivateUsage]
+
+    from resonant.dashboard.snapshot import RELAY_HEALTH_KV
+    from resonant.store.db import kv_set
+
+    conn = open_db(tmp_path / "busy.db")
+    try:
+        _busy(conn, datetime.now(UTC))
+        kv_set(conn, RELAY_HEALTH_KV, {"state": "failing", "since": None, "detail": "HTTP 503"})
+        snap = build_snapshot(
+            conn, load_settings(), started_at=datetime.now(UTC), version="abcdef12"
+        )
+    finally:
+        conn.close()
+    return snap.model_dump(mode="json"), to_remote(snap).model_dump(mode="json")
+
+
+def test_every_local_only_field_is_refused(db: Pg, tmp_path: Path) -> None:
+    local, remote = _busy_dumps(tmp_path)
+    paths = _local_only_paths(local, remote)
+    # The busy store fills every local-only field the models declare.
+    assert {p[-1] for p in paths} >= {"reason", "items", "missing", "trust_rules", "repos"}
+    for path in paths:
+        data = json.loads(json.dumps(remote))
+        target, src = data, local
+        for key in path[:-1]:
+            target, src = target[key], src[key]
+        target[path[-1]] = src[path[-1]]
+        r = ingest(db, data)
+        assert r.sqlstate == "PT400", (path, r.err)
+    assert count(db) == 0
+
+
+def test_a_busy_remote_snapshot_is_accepted(db: Pg, tmp_path: Path) -> None:
+    _, remote = _busy_dumps(tmp_path)
+    assert any(h["name"] == "relay" for h in remote["health"])
+    assert ingest(db, remote).ok
+    out = db.ok(f"select health from public.relay_watch('{WATCH}');", role="anon")
+    assert {"name": "relay", "state": "failing"} in json.loads(out)
+
+
 def test_ingest_refuses_a_non_object(db: Pg) -> None:
     assert ingest(db, [1, 2]).sqlstate == "PT400"
 
 
 def test_ingest_caps_the_size(db: Pg, tmp_path: Path) -> None:
-    big = remote_snapshot(tmp_path, padding="x" * 70_000)
+    big = remote_snapshot(tmp_path, padding="x" * 33_000)
     assert ingest(db, big).sqlstate == "PT413"
     assert count(db) == 0
 
 
 def test_ingest_rate_limit(db: Pg, tmp_path: Path) -> None:
     data = remote_snapshot(tmp_path)
-    for _ in range(10):
+    for _ in range(3):
         assert ingest(db, data).ok
     assert ingest(db, data).sqlstate == "PT429"
-    assert count(db) == 10
+    assert count(db) == 3
+
+
+def test_ingest_caps_the_row_count(db: Pg, tmp_path: Path) -> None:
+    # Within 7 days and outside the rate window, so only the row cap removes them.
+    db.ok(
+        "insert into public.snapshots (taken_at, received_at, data)"
+        " select now(), now() - interval '2 minutes', jsonb_build_object('n', g)"
+        " from generate_series(1, 12005) g;"
+    )
+    assert ingest(db, remote_snapshot(tmp_path)).ok
+    assert count(db) == 12000
+    # The oldest went; the new one stayed.
+    assert db.ok("select min((data->>'n')::int) from public.snapshots;") == "7"
+    assert db.ok("select count(*) from public.snapshots where data->>'tier' = 'remote';") == "1"
 
 
 def test_ingest_keeps_seven_days(db: Pg, tmp_path: Path) -> None:
@@ -340,7 +415,7 @@ def test_ingest_keeps_seven_days(db: Pg, tmp_path: Path) -> None:
 
 
 def test_the_table_caps_size_even_for_postgres(db: Pg) -> None:
-    big = json.dumps({"x": "y" * 70_000})
+    big = json.dumps({"x": "y" * 33_000})
     r = db.run(f"insert into public.snapshots (taken_at, data) values (now(), '{big}');")
     assert r.sqlstate == "23514"
 

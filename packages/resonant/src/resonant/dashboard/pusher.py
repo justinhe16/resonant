@@ -53,8 +53,10 @@ log = logging.getLogger(__name__)
 RELAY_EXT: Final = "relay"
 SUPABASE_KEY_REF: Final = secret_ref(RELAY_EXT, "supabase_key")
 INGEST_PATH: Final = "/rest/v1/rpc/relay_ingest"
-# The migration's cap on ``octet_length(data::text)``; measured here the same way.
-MAX_BYTES: Final = 65536
+# The migration caps ``octet_length(data::text)`` at 32768. Measured here the same way, with a
+# margin for Postgres's own number formatting, so a refused 413 never surprises us.
+MAX_BYTES: Final = 30 * 1024
+MIN_GAP_S: Final = 1.0  # between pushes, even when one overran every_s
 FAIL_AFTER: Final = 3
 BACKOFF_S: Final = 2.0
 BACKOFF_MAX_S: Final = 20.0
@@ -115,15 +117,23 @@ class SnapshotPusher:
         self._snapshot = snapshot
         self.secrets = secrets
         self._owns_client = client is None
-        self.client = client or httpx.AsyncClient(follow_redirects=False)
+        # Created on first use (run() closes it), so a pusher that never runs holds nothing.
+        # No proxy or CA settings from the environment: one fixed https endpoint.
+        self._client = client
         self._sleep = sleep
         self._clock = clock
         self._monotonic = monotonic
         self._jitter = jitter
         self.failures = 0  # failed pushes in a row
 
+    @property
+    def client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(follow_redirects=False, trust_env=False)
+        return self._client
+
     async def run(self) -> None:
-        """Push every ``every_s`` (measured start to start) until cancelled."""
+        """Push every ``every_s`` (start to start, at least ``MIN_GAP_S`` apart) until cancelled."""
         try:
             while True:
                 started = self._monotonic()
@@ -132,10 +142,10 @@ class SnapshotPusher:
                 except Exception as e:  # never let the task die; never log a message text
                     log.error("status relay push crashed: %s", type(e).__name__)
                 elapsed = self._monotonic() - started
-                await self._sleep(max(0.0, self.config.every_s - elapsed))
+                await self._sleep(max(MIN_GAP_S, self.config.every_s - elapsed))
         finally:
-            if self._owns_client:
-                await self.client.aclose()
+            if self._owns_client and self._client is not None:
+                await self._client.aclose()
 
     async def push_once(self) -> PushOutcome:
         """One push with its retries; records the health row. Returns the outcome."""

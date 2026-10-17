@@ -368,8 +368,8 @@ async def test_run_pushes_every_period_and_survives_a_crash(db: sqlite3.Connecti
     p.push_once = flaky  # type: ignore[method-assign]
     with pytest.raises(asyncio.CancelledError):
         await p.run()
-    # 60 - 3 elapsed; then 60 - 0.5; then a push that overran the period goes again at once.
-    assert sleeps == [57.0, 59.5, 0.0]
+    # 60 - 3 elapsed; then 60 - 0.5; a push that overran the period still waits MIN_GAP_S.
+    assert sleeps == [57.0, 59.5, 1.0]
     assert calls == 3
 
 

@@ -118,7 +118,8 @@ function check({ data, error }, what) {
 }
 
 function showQr(totp) {
-  const qr = spawnSync("qrencode", ["-t", "ansiutf8", totp.uri], { encoding: "utf8" });
+  // The URI on stdin, not in argv: argv is visible to other users in `ps`.
+  const qr = spawnSync("qrencode", ["-t", "ansiutf8"], { input: totp.uri, encoding: "utf8" });
   if (qr.status === 0) {
     console.log(qr.stdout);
     return () => {};
