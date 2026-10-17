@@ -271,8 +271,9 @@ def summary_action(conn: sqlite3.Connection, intent: Intent) -> str | None:
 def merge_level(conn: sqlite3.Connection, intent: Intent) -> Level | None:
     """``merge_run``'s level for one call, by the trust rules (``PolicyGate`` ``levels``): L3
     (runs without asking, even chosen from chat) when ``merge_decision`` is ok for the run's
-    repo and the run flagged no sensitive paths; L2 (``/merge`` runs, chat asks a plain yes)
-    otherwise. None (the registered L2) for another tool, a missing run or a fork repo."""
+    repo, the run flagged no sensitive paths and the repo has CI (a no-CI merge is on the
+    owner's word only, GT-1); L2 (``/merge`` runs, chat asks a plain yes) otherwise. None (the
+    registered L2) for another tool, a missing run or a fork repo."""
     if intent.extension is not None or intent.tool != MERGE_RUN.name:
         return None
     code = _code(intent.args.get("code"))
@@ -280,7 +281,7 @@ def merge_level(conn: sqlite3.Connection, intent: Intent) -> Level | None:
     repo = repos_store.find(conn, run.repo) if run is not None and run.repo else None
     if run is None or repo is None or repo.mode != "push":
         return None
-    if run.flagged_paths:
+    if run.flagged_paths or repo.ci is not True:
         return Level.L2
     return Level.L3 if merge_decision(conn, repo.name) == "ok" else Level.L2
 

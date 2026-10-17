@@ -184,15 +184,23 @@ def _part(text: str | None, limit: int = TITLE_PART_MAX) -> str:
 DEPS_SHOWN = 4  # dependency files named in a merged line; the rest are counted
 
 
+DEPS_CHARS = 80  # the named paths, so a merged line with its URL and did: list fits
+
+
 def deps_line(paths: Sequence[str]) -> str:
     """``deps changed: package.json, uv.lock`` for the dependency files a merged PR changed
     (``CheckResult.deps``), or an empty string. Code-built: each path cleaned and clipped,
     at most ``DEPS_SHOWN`` named and the rest counted."""
     if not paths:
         return ""
-    shown = ", ".join(_part(p, 60) for p in paths[:DEPS_SHOWN])
-    more = len(paths) - DEPS_SHOWN
-    return f"deps changed: {shown}" + (f" (+{more} more)" if more > 0 else "")
+    names: list[str] = []
+    for p in paths[:DEPS_SHOWN]:
+        part = _part(p, 60)
+        if names and len(", ".join([*names, part])) > DEPS_CHARS:
+            break  # keep the line short: the digest title is clipped at 200
+        names.append(part)
+    more = len(paths) - len(names)
+    return f"deps changed: {', '.join(names)}" + (f" (+{more} more)" if more > 0 else "")
 
 
 def end_title(run: Run, ci: str | None = None, *, deps: Sequence[str] = ()) -> str:

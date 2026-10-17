@@ -605,3 +605,14 @@ async def test_an_auto_merge_from_chat_reaches_the_digest(
     [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
     assert line.key == "run/r1" and line.title.startswith("R1 merged: PR #41 · ")
     assert (pulse_job.preview(db) or "").startswith("btw:\nWorkers:\nR1 merged: PR #41")
+
+
+def test_the_deps_line_stays_short() -> None:
+    from resonant.runners.reports import DEPS_CHARS, deps_line
+
+    long = [f"packages/very-long-package-name-{i}/package.json" for i in range(6)]
+    line = deps_line(long)
+    assert line.startswith("deps changed: packages/very-long-package-name-0/package.json")
+    assert len(line.removeprefix("deps changed: ").split(" (+")[0]) <= DEPS_CHARS
+    assert line.endswith("more)")
+    assert deps_line(["uv.lock", "package.json"]) == "deps changed: uv.lock, package.json"

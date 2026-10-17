@@ -470,6 +470,23 @@ async def test_a_plain_yes_still_clashes_when_an_option_is_yes(
     assert which.startswith("Which one?")
 
 
+async def test_a_plain_yes_never_goes_to_a_workers_own_check(
+    make: Callable[[], Harness],
+) -> None:
+    # A worker writes its question's options, so it can't steer the owner's "yes" onto its
+    # own check: with a check open, the clash reply stands whatever the options.
+    h = make()
+    _task, approval = await h.ask()
+    h.db.execute("UPDATE approvals SET tool = 'trust_check' WHERE id = ?", (approval.id,))
+    workers = FakeWorkers()
+    workers.ask("R4", "Which DB?", ("Postgres", "SQLite"), at=h.clock.now)
+    h.router.relay.workers = lambda: workers
+    await h.say("yes")
+    assert h.status(approval) == "pending"
+    [which] = h.channel.replies()
+    assert which.startswith("Which one?")
+
+
 def test_yes_no_fits() -> None:
     def q(*options: str) -> OpenQuestion:
         return OpenQuestion(1, "R4", "?", options, T0, False)

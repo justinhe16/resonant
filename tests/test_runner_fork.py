@@ -606,3 +606,12 @@ async def test_auto_merge_without_ci_still_waits_for_the_owner(
     await asyncio.sleep(0.3)
     assert h.gh_calls("merge") == []
     assert "Not merged automatically: proj has no CI." in h.chan.texts()[0]
+
+
+def test_since_reads_only_an_aware_iso_time() -> None:
+    from resonant.runners.claude import _since  # pyright: ignore[reportPrivateUsage]
+
+    assert _since({"since": "2026-10-16T12:00:00+00:00"}) is not None
+    assert _since({"since": "2026-10-16T12:00:00"}) is None
+    assert _since({"since": "not a time"}) is None
+    assert _since({}) is None

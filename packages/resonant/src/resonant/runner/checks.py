@@ -84,10 +84,18 @@ _FLAGGED_NAMES = frozenset(
         "bitbucket-pipelines.yml",
         ".drone.yml",
         ".woodpecker.yml",
+        # package-manager config that runs code or moves the registry on the next install
+        # (``yarnPath``, ``registry=``)
+        ".npmrc",
+        ".yarnrc",
+        ".yarnrc.yml",
+        # run on open, with nobody reading them: direnv, dev containers
+        ".envrc",
+        ".devcontainer.json",
     }
 )
 _FLAGGED_DIRS = frozenset(
-    {".claude", ".githooks", ".husky", ".circleci", ".buildkite", ".woodpecker"}
+    {".claude", ".githooks", ".husky", ".circleci", ".buildkite", ".woodpecker", ".devcontainer"}
 )
 
 # Dependency manifests and lockfiles: listed in the merged report, never flagged.
@@ -104,9 +112,6 @@ _DEP_NAMES = frozenset(
         "bun.lockb",
         "deno.json",
         "deno.lock",
-        ".npmrc",
-        ".yarnrc",
-        ".yarnrc.yml",
         # Python
         "pyproject.toml",
         "setup.py",
@@ -205,6 +210,7 @@ def classify_path(path: str, *, allow_github: bool = False) -> tuple[str | None,
         parts[0] == ".github"  # allowed, but the merge prompt and reply list it
         or any(part in _FLAGGED_DIRS for part in parts)
         or name in _FLAGGED_NAMES
+        or (len(parts) >= 2 and parts[-2] == ".vscode" and name == "tasks.json")  # folderOpen
     )
     return None, flagged
 

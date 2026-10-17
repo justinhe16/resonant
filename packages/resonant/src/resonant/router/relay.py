@@ -10,8 +10,10 @@ The router calls it at three points (``router.py``):
    check, and a check can't swallow an answer. One exception (GT-1): with exactly one
    approval prompt and one question open, and that question offering options none of which
    is a yes or a no (``a) Postgres b) SQLite``), a plain ``yes``/``no`` can't answer the
-   question, so it goes to the approval (``yes_no_fits``). A plain ``yes``/``no`` with no
-   approval prompt open goes to the questions instead of "Nothing is waiting for approval".
+   question, so it goes to the approval (``yes_no_fits``), unless that approval is a worker's
+   check (a worker writes its question's options, so it can't steer the owner's ``yes``).
+   A plain ``yes``/``no`` with no approval prompt open goes to the questions instead of
+   "Nothing is waiting for approval".
    Approvals keep their exact-code and ``yes``/``no`` semantics; everything else here is free text.
 2. **``direct``** (after the inbox, before keywords and the labeler; no model call):
 
@@ -243,12 +245,16 @@ def yes_no_fits(q: OpenQuestion) -> bool:
     return False
 
 
-def plain_reply_clashes(sent: Sequence[PendingApproval], opens: Sequence[OpenQuestion]) -> bool:
+def plain_reply_clashes(
+    sent: Sequence[PendingApproval], opens: Sequence[OpenQuestion], *, check: bool = True
+) -> bool:
     """A plain ``yes``/``no`` binds neither an approval nor a question (the clash reply)
-    unless exactly one of each is open and the question can't take a yes/no."""
+    unless exactly one of each is open, the question can't take a yes/no, and the approval
+    isn't a worker's check (``check``: a worker controls its question's options, so it
+    must not be able to steer the owner's ``yes`` onto its own check)."""
     if not sent or not opens:
         return False
-    return not (len(sent) == 1 and len(opens) == 1 and not yes_no_fits(opens[0]))
+    return check or not (len(sent) == 1 and len(opens) == 1 and not yes_no_fits(opens[0]))
 
 
 def clash_text(sent: Sequence[PendingApproval], opens: Sequence[OpenQuestion]) -> str:

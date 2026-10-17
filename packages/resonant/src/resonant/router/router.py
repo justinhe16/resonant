@@ -80,6 +80,7 @@ from resonant.router.intents import (
 from resonant.router.labeler import Labeler
 from resonant.router.prefixes import toolset_prefix_hash
 from resonant.router.relay import Relay, clash_text, parse_addressed, plain_reply_clashes
+from resonant.store import approvals as ap
 from resonant.store.db import utcnow
 from resonant.tools import ToolRegistry
 from resonant_sdk import Event, ToolSpec
@@ -299,7 +300,12 @@ class Router:
         )
         if opens:
             sent = self.inbox.sent_pending(principal)
-            if plain_reply_clashes(sent, opens):
+            check = any(
+                (row := ap.get_approval(self.conn, p.approval_id)) is None
+                or row.tool == ap.CHECK_TOOL
+                for p in sent
+            )
+            if plain_reply_clashes(sent, opens, check=check):
                 return relayed(clash_text(sent, opens))
             skip_inbox = not sent
         answered = None if skip_inbox else self.inbox.handle(event, text, principal, spans=spans)

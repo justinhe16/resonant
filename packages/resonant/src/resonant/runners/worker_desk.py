@@ -479,7 +479,8 @@ class WorkerDesk:
         shown = clip(clean_external(red.text(req.text)), NOTE_MAX)
         runs.update(self.conn, run.code, last_note=shown)
         if (did := did_of(shown)) is not None:
-            record_did(self.conn, run.code, did)
+            with contextlib.suppress(Exception):  # the list is best effort; the note is saved
+                record_did(self.conn, run.code, did)
         with atomic(self.conn):
             audit(self.conn, "run.note", run=run.code, urgent=req.urgent)
         await self.events.emit(WorkerEvent("note", run.code, req.text, req.urgent, self.clock()))

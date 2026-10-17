@@ -2528,12 +2528,8 @@ class ClaudeRunner:
             except (SecretError, RunnerError) as e:
                 why = f"CI couldn't be read ({e})"
         if why is None and state in ("pending", "error", "none"):  # none: checks not registered yet
-            since = task.checkpoint.get("since")
-            start = (
-                datetime.fromisoformat(since)
-                if owner and isinstance(since, str)
-                else run.ended_at or self.clock()
-            )
+            start = _since(task.checkpoint) if owner else None
+            start = start or run.ended_at or self.clock()
             if self.clock() - start < timedelta(seconds=self.merge_wait_s):
                 if first:
                     told = await self._conclude(run, watching=True)
@@ -2551,9 +2547,19 @@ class ClaudeRunner:
         if why is None and secrets is not None:
             merged = await self._merge(
                 run.code, secrets, by="owner" if owner else "auto", allow_flagged=owner,
-                allow_no_ci=owner, replied=False,
+                allow_no_ci=owner, wait_ci=owner, replied=False,
             )  # fmt: skip
+            if isinstance(merged, MergeQueued):  # CI restarted between the look and the merge
+                checkpoint = {**task.checkpoint, "watch": True}
+                return Wait("ci", checkpoint, self.clock() + timedelta(seconds=self.merge_poll_s))
             if isinstance(merged, Merged):
+                if owner and (merged.no_ci or merged.flagged):
+                    # the warnings the owner would have seen on a direct /merge
+                    with contextlib.suppress(ChannelError):
+                        await self.channel.send(
+                            run.principal, merged.text,
+                            dedupe_key=f"run:{run.code}:merge-watch-warn",
+                        )  # fmt: skip
                 if first:  # the merged line is the run's only word: never cleared silently
                     await self._deprovision(run.code)
                     await self._end_cli(run.code)
@@ -2562,7 +2568,7 @@ class ClaudeRunner:
             now = self._must_get(run.code)
             if now.status != "ready":  # merged (or ended) another way meanwhile: nothing to say
                 return Done({"run": run.code, "status": now.status})
-            assert isinstance(merged, Refused)  # no wait_ci: never MergeQueued
+            assert isinstance(merged, Refused)
             why = merged.reason.removeprefix(f"{run.code} not merged: ")
         assert why is not None
         if owner:
@@ -3082,3 +3088,15 @@ def cleanup_job(deps: CoreDeps) -> CoreJob | None:
     return CoreJob(
         id=CLEANUP_JOB_ID, schedule=CLEANUP_SCHEDULE, run=run, catchup=timedelta(hours=12)
     )
+
+
+def _since(checkpoint: dict[str, Any]) -> datetime | None:
+    """An owner merge watch's start (``since``, code-written ISO with an offset), or None."""
+    raw = checkpoint.get("since")
+    if not isinstance(raw, str):
+        return None
+    try:
+        at = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return at if at.tzinfo is not None else None

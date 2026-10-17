@@ -235,6 +235,7 @@ def test_merge_from_chat_follows_the_trust_rules(
     ``merge_decision`` is ok; an ``ask merge`` rule (on the repo, an area of it or ``*``)
     makes it ask a plain yes; ``/merge`` is explicit either way."""
     make_run(db, status="ready", pr_number=41, pr_url="https://github.com/own/resonant/pull/41")
+    db.execute("UPDATE repos SET ci = 1 WHERE name = 'resonant'")  # a no-CI repo always asks
     chosen = components.gate.evaluate(intent(components, "merge_run", {"code": "R1"}))
     assert isinstance(chosen, Allow)
     trust_store.add_rule(db, scope="resonant", action="merge", effect="ask",
@@ -250,6 +251,22 @@ def test_merge_from_chat_follows_the_trust_rules(
         "SELECT decision AS d FROM audit_log WHERE action = 'trust.merge' ORDER BY id"
     ).fetchall()
     assert [r["d"] for r in rows][:2] == ["ok", "ask"]
+
+
+def test_a_chat_merge_asks_when_the_repo_has_no_ci(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    """GT-1: an owner's /merge merges a no-CI repo with a warning, so a model-chosen merge
+    there (CI unknown or none) is never L3: it asks a plain yes."""
+    make_run(db, status="ready", pr_number=41, pr_url="https://github.com/own/resonant/pull/41")
+    for ci in (False, None):
+        db.execute("UPDATE repos SET ci = ? WHERE name = 'resonant'", (ci,))
+        asked = components.gate.evaluate(intent(components, "merge_run", {"code": "R1"}))
+        assert isinstance(asked, NeedsApproval) and asked.level is Level.L2
+    typed = components.gate.evaluate(
+        intent(components, "merge_run", {"code": "R1"}, origin="explicit")
+    )
+    assert isinstance(typed, Allow)
 
 
 def test_merge_level_never_lowers_a_fork_or_unknown_run(
