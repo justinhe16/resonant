@@ -329,7 +329,7 @@ async def test_sigterm_stops_channel_monitor_and_loop(
 async def test_bench_e2e_with_fakes() -> None:
     results = await run_e2e_bench(2, warmup=False)
     data = report(results, model_name="fake")
-    assert [r["path"] for r in data["results"]] == ["fast", "llm"]
+    assert [r["path"] for r in data["results"]] == ["fast", "llm", "loop"]
     for r in data["results"]:
         assert r["n"] == 2 and r["failures"] == 0 and r["p50_ms"] <= r["p95_ms"]
     assert data["pass"] is True

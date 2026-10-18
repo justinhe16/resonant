@@ -127,7 +127,14 @@ Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:3
 ### End-to-end latency (Phase 1 exit criterion)
 
 - **Verify:** `resonant bench e2e --model real --n 20` (after step 8, with the model warm). It runs the real reader, router, local runner and channel against the configured Ollama model in a throwaway home, with a fake chat.db and a recording osascript runner, so it never texts anyone and is safe next to the live daemon.
-- **Expected:** exit 0: `fast` p50 ≤ 1000 ms and `llm` p50 ≤ 3000 ms. **Record the numbers** (date, model, macOS version) in the latency table in `docs/architecture.md`, replacing "pending go-live checklist".
+- **Expected:** exit 0: `fast` p50 ≤ 1000 ms, `llm` p50 ≤ 3000 ms and `loop` p50 ≤ 5000 ms (the brain loop, `brain.mode: loop`, in its own throwaway home: one read, then the answer). **Record the numbers** (date, model, macOS version) in the latency table in `docs/architecture.md`, replacing "pending go-live checklist".
+
+### Task evals (the brain loop's cut-over bar, BR-6)
+
+`brain.mode: loop` becomes the default (BR-8) once the loop scores **≥ 85%** on the task eval with the real model. Each text runs through the real router, brain loop, gate and channel in a fresh temp home with its own seeded world (repos, runs, files, notes, extensions): it never reads your state or `~/code`, never texts anyone, starts no Claude session (`ask_claude` is only recorded) and runs no side effect beyond the temp home's notes, reminders and facts. It is safe next to the live daemon, but it shares Ollama's one slot, so run it when you aren't texting Resonant.
+
+- **Verify:** `resonant eval task --mode both` (after step 8, model warm; about 10–20 minutes for both modes). Without `--set` it uses `~/.resonant/evals/task.jsonl` when you have one, else the repo's `evals/task.example.jsonl`. `--only <id or category>` reruns a slice.
+- **Expected:** `[loop]` accuracy ≥ 85% (exit 0), `unapproved 0`, and the loop ahead of `[intents]` on `assistant`, `research`, `followup` and `mini`. Escalations are counted apart (rate, precision, recall), so a loop that hands everything to Claude doesn't pass on `assistant` alone. Read the failed cases (text, tools, reply) printed under each mode. The summary goes to `~/.resonant/evals/results/task-<ts>.json` (no texts); compare runs there after a prompt or model change. Record the loop's accuracy and p50/p95 latency in `docs/brain-plan.md` §6 for BR-8.
 
 ## 10. Remote dashboard access
 

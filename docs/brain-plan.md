@@ -1,6 +1,6 @@
 # Brain plan (Phase 6a): a general agent loop on the local model
 
-Status: **in progress** (2026-10-18): BR-1, BR-4 and BR-5 built (§2, §6); `brain.mode` stays `intents` until the evals (BR-6, BR-8). Built with robot-surf in the waves of §5.
+Status: **in progress** (2026-10-18): BR-1, BR-4, BR-5 and BR-6 built (§2, §6); `brain.mode` stays `intents` until the owner's real-model eval run passes (BR-6's `resonant eval task`, then BR-8). Built with robot-surf in the waves of §5.
 
 Texting Resonant should feel like texting Claude: general questions and conversation, looking around the Mini read-only, Resonant's own tools (still gated), extensions, other programs, Claude workers with Remote Control. Today every non-slash text is one intent label (`router/labeler.py`) → that intent's fixed toolset (`router/intents.py` `INTENT_TOOLS`) → `runners/local.py` capped at 3 model calls and 3 tool calls → a number guard that swaps the reply for a template. History is 5 earlier messages as user turns, nothing reads files or logs (`tools/builtin.py`), and nothing escalates (`escalate=True` is written and never read). "Where is mycelium?" had no route, so it failed.
 
@@ -63,6 +63,16 @@ Group chats; a generic "run any program" tool (programs are extensions); writes 
 4. Wave 4: **BR-8 Cut-over**: default `loop` once the evals pass, docs (architecture, interfaces, go-live), drop unused intent few-shots, the architecture artifact.
 
 ## 6. As built
+
+### BR-6: task evals (2026-10-18)
+
+`resonant eval task` (`resonant/evals/task_eval.py`) and `evals/task.example.jsonl`; format, grading and output in [`evals/README.md`](../evals/README.md#task-eval), contracts in [`interfaces.md`](interfaces.md).
+
+- **Set.** 52 synthetic owner texts in 11 categories: questions about the Mini (where a repo is, its README, which file sets X, disk, health, the logs), runs (what R1 is doing, what's waiting, a PR link, start a run, the transcript, the Remote Control link), notes, reminders and facts, extensions (failing PRs, review requests, merge a PR → asks, Linear issues, a new ticket → asks), the personal assistant and research (calendar, email, the web, a link, a screenshot → `ask_claude`), programs (`start trade-jev` and `stop` → ask, status reads), follow-ups that need history ("and where's that?"), general chat (answered, no tools), ambiguity (reads best-guess, writes ask or clarify) and injection (a file, log or transcript holding instructions; a write after reading it must ask, and nothing it asks for runs).
+- **World.** Each case gets a fresh temp home seeded from the row (repos, runs with transcripts, files, notes, reminders, facts, extension fixtures with canned results, history as real past turns) and the whole stack in process, `dry_run` off and autonomy on, so the gate's asks are the real ones. Nothing reaches the owner's state, `~/code`, the Keychain, launchd or Claude: writes other than the store-only ones are recorded and stubbed (`EvalExecutor`), `ask_claude` is recorded (`EvalAsk`), extensions are local fixtures.
+- **Grading.** A case is correct when every expectation holds: tools called and not called, escalation, ask (an approval, or a clarifying question with no write), no write outside `expect.writes` without an approval, facts in the reply, rounds. Reported per mode (`--mode both` compares loop and intents): accuracy overall, on non-escalation cases and per category; escalation rate, precision and recall (counted apart, per §4); ask correctness; unapproved writes; number-guard hits (D7: the loop only counts them); p50/p95 latency and rounds. Gate: `--min-accuracy 0.85`.
+- **CI.** The whole example set runs with the scripted model (each row's `script`, through the real stack) and must grade 100%, which proves every row is satisfiable; the grader and metrics are unit-tested; no test calls a real model. The live run is the owner's ([`go-live.md`](go-live.md) step 9, "Task evals"); its numbers decide BR-8.
+- **Bench.** `resonant bench e2e` gains the `loop` path (its own home with `brain.mode: loop`; target p50 ≤ 5 s, §4).
 
 ### BR-1: the brain loop (2026-10-18)
 

@@ -77,6 +77,7 @@ The owner texts Resonant like an employee ([`employee-plan.md`](employee-plan.md
 | Mini go-live checklist, `scripts/bootstrap.sh --check` | `docs/go-live.md`, `scripts/` | Phase 1 ✅ |
 | Slack notifier | — | Not in core (no Slack in core; extensions own Slack) |
 | Router evals: `resonant eval router` (production `classify`, accuracy, confusion, p50/p95 per path; texts only in terminal output) | `resonant/evals/`, `evals/README.md` | Phase 1 ✅ |
+| Task evals: `resonant eval task` (BR-6): each text through the real brain loop (or the intents path) in a fresh hermetic home with a seeded world; graded on tools, escalation, asks, unapproved writes and facts; ≥ 85% is BR-8's cut-over bar | `resonant/evals/task_eval.py`, `evals/task.example.jsonl`, `evals/README.md` | BR-6 ✅ |
 | Policy gate: risk × origin (`Intent.origin`), kill switch read on every call, dry_run exemption for store-internal builtins, approval expiry and single use; executor `recorded()` | `resonant/gate/policy.py`, `resonant/executor.py` | Phase 2 ✅ |
 | Approvals: store and migration 003, deterministic reply parser, binding (sent-before, per-event idempotency, orphan expiry), router approval inbox, `request_approval`, `/approvals`, `resonant approvals list\|show\|approve\|deny` | `resonant/store/approvals.py`, `resonant/gate/replies.py`, `resonant/router/approvals.py`, `resonant/cli.py` | Phase 2 ✅ |
 | Local runner: `direct_call` (explicit), Wait/resume on approval, execute once, code-built reports, one gated side effect per task | `resonant/runners/local.py` | Phase 2 ✅ |
