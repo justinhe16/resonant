@@ -347,6 +347,23 @@ async def test_a_write_after_reading_a_file_asks_and_the_resume_stays_tainted(
         assert read[0]["detail"]["origin"] == "inferred"  # the read itself isn't tainted
 
 
+@pytest.mark.parametrize("read", ["run_activity", "list_runs", "recent_logs"])
+async def test_worker_and_log_text_taints_too(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path, read: str
+) -> None:
+    """A worker's notes and transcript lines (and log lines) are outside content: a write
+    after reading them asks."""
+    async with start(resonant_home, chat, tmp_path) as b:
+        args: dict[str, Any] = {"code": "R1"} if read == "run_activity" else {}
+        if read not in CORE_TOOLS:
+            b.model.push([("load_tools", {"names": [read]})])
+        b.model.push([(read, args)], [("add_note", {"text": "buy milk"})])
+        (prompt,) = await b.say("check on things")
+        assert "Reply yes" in prompt
+        (evaluated,) = [a for a in b.audits("gate.evaluate") if a["tool"] == "add_note"]
+        assert evaluated["detail"]["origin"] == "tainted"
+
+
 async def test_an_untainted_l3_write_runs_and_reports(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:

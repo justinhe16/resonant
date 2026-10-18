@@ -1320,7 +1320,9 @@ BrainRunner(conn, *, model, channel, gate, executor, registry, settings, princip
     .idle()                                     # await background history folds
 CORE_TOOLS; NOT_IN_BRAIN = {"mute_extension"}; LOAD_TOOLS (ToolSpec, never registered)
 MAX_ROUNDS = 8; MAX_CALLS = 24; MAX_LOADED = 8; MAX_REPLY_CHARS = 1500; PROGRESS_TEXT = "On it…"
-taints(spec) -> bool                            # spec.untrusted or an extension/MCP tool
+taints(spec) -> bool       # spec.untrusted, an extension/MCP tool, or TAINTING_BUILTINS
+TAINTING_BUILTINS = {list_runs, run_activity, answer_worker, message_worker, recent_logs,
+                     open_items, pulse_preview, briefing_preview}   # worker, log, pulse text
 wiring.brain_step_limit(model, tools) = max((MAX_ROUNDS + 1) * model.timeout_s, longest tool) + 15
 ```
 

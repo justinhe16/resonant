@@ -224,7 +224,10 @@ class IMessageStack:
             log.info("imessage channel stopped")
 
     async def aclose(self) -> None:
-        """Close the model client if this stack created it."""
+        """Stop the brain's background folds, then close the model client if this stack
+        created it."""
+        if self.brain is not None:
+            await self.brain.aclose()  # background history folds use the model
         close, self._close_model = self._close_model, None
         if close is not None:
             await close()

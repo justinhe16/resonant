@@ -66,7 +66,7 @@ from resonant.brain.facts import FactStore
 from resonant.brain.history import fold, fold_due
 from resonant.config import Settings
 from resonant.gate.types import Origin
-from resonant.gateway.channel import Channel, ChannelError
+from resonant.gateway.channel import Channel
 from resonant.loop.slots import SlotPool
 from resonant.loop.types import Done, StepContext, StepOutcome, Task
 from resonant.models import (
@@ -144,6 +144,21 @@ CORE_TOOLS: frozenset[str] = frozenset(
         "system_status",
     }
 )
+# Builtins whose results carry text others wrote (a Claude worker's notes, questions and
+# transcript lines, log lines, extension items): they taint like ``untrusted`` specs (D6).
+# Workers read PRs and web pages, so their text is outside content too.
+TAINTING_BUILTINS: frozenset[str] = frozenset(
+    {
+        "list_runs",
+        "run_activity",
+        "answer_worker",
+        "message_worker",
+        "recent_logs",
+        "open_items",
+        "pulse_preview",
+        "briefing_preview",
+    }
+)
 # Control-plane tools that stay slash-only (``/ext mute``), as on the intents path.
 NOT_IN_BRAIN: frozenset[str] = frozenset({"mute_extension"})
 
@@ -210,8 +225,9 @@ class _Turn:
 
 
 def taints(spec: ToolSpec) -> bool:
-    """D6: a result from outside content. Resonant's own state reads don't taint."""
-    return spec.untrusted or spec.extension is not None
+    """D6: a result from outside content (``untrusted`` specs, extension and MCP tools, and
+    ``TAINTING_BUILTINS``). Resonant's own state reads don't taint."""
+    return spec.untrusted or spec.extension is not None or spec.name in TAINTING_BUILTINS
 
 
 class BrainRunner(LocalRunner):
@@ -262,6 +278,7 @@ class BrainRunner(LocalRunner):
         self.progress_after_s = progress_after_s
         self.labeler = Labeler(model, self.intents)  # the intents fallback
         self._folds: set[asyncio.Task[None]] = set()
+        self._folding: set[str] = set()  # principals with a fold in flight
 
     # --- step: the local runner's, then the fold ------------------------------------------
 
@@ -274,6 +291,8 @@ class BrainRunner(LocalRunner):
     def _maybe_fold(self, principal: str, trace_id: str) -> None:
         """Fold the principal's history in the background once it is due (D3): after the
         reply went out, never on the reply path."""
+        if principal in self._folding:
+            return  # one fold per principal at a time (the model has one slot)
         try:
             if not fold_due(self.conn, principal):
                 return
@@ -281,6 +300,7 @@ class BrainRunner(LocalRunner):
             log.exception("brain: fold check failed")
             return
         spans = self._spans(trace_id)
+        self._folding.add(principal)
         job = asyncio.get_running_loop().create_task(self._fold(principal, spans))
         self._folds.add(job)
         job.add_done_callback(self._folds.discard)
@@ -290,11 +310,20 @@ class BrainRunner(LocalRunner):
             await fold(self.conn, self.model, principal, spans=spans, now=self.now)
         except Exception:
             log.exception("brain: history fold failed")
+        finally:
+            self._folding.discard(principal)
 
     async def idle(self) -> None:
-        """Wait for background folds (tests, shutdown)."""
+        """Wait for background folds (tests)."""
         while self._folds:
             await asyncio.gather(*list(self._folds), return_exceptions=True)
+
+    async def aclose(self) -> None:
+        """Cancel background folds (shutdown, before the model client closes). The fold's
+        cursor moves by compare-and-set, so a cancelled fold just runs again later."""
+        for job in list(self._folds):
+            job.cancel()
+        await asyncio.gather(*list(self._folds), return_exceptions=True)
 
     def _spans(self, trace_id: str) -> SpanFactory:
         return partial(span, self.conn, trace_id=trace_id)
@@ -327,7 +356,11 @@ class BrainRunner(LocalRunner):
             return await self._turn(task, principal, text, events, ctx, spans)
         finally:
             stop.set()
-            await progress  # a send in flight finishes before the reply goes out
+            try:
+                await progress  # a send in flight finishes before the reply goes out
+            except asyncio.CancelledError:
+                progress.cancel()
+                raise
 
     async def _progress(self, task: Task, principal: str, stop: asyncio.Event) -> None:
         try:
@@ -337,7 +370,7 @@ class BrainRunner(LocalRunner):
             pass
         try:
             await self.channel.send(principal, PROGRESS_TEXT, dedupe_key=f"progress:{task.id}")
-        except ChannelError as e:
+        except Exception as e:  # never fails the turn: the reply matters, not the ack
             log.warning("brain: progress text not sent (%s)", type(e).__name__)
 
     def tools_for(self, principal: str) -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -594,7 +627,8 @@ class BrainRunner(LocalRunner):
             queued: CallResult | None = None
             if spec is not None and self.principals.may_request(principal, spec):
                 tried = ", ".join(dict.fromkeys(c.tool for c in st.calls)) or "nothing"
-                note = f"\n\n(Resonant's local model {why}; it tried: {tried})"
+                ran = "; changes already made, don't repeat them" if st.reports else ""
+                note = f"\n\n(Resonant's local model {why}; it tried: {tried}{ran})"
                 note = note[:TRIED_MAX_CHARS]
                 question = text[: QUESTION_MAX - len(note)] + note
                 done = await self._call_tool(
