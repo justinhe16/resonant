@@ -237,7 +237,8 @@ class Running:
 def settings_for(home: Path, chat: FakeChatDB, **overrides: Any) -> Settings:
     (home / "principals.yaml").write_text(PRINCIPALS)
     # core/watches (BR-7) runs every 5 minutes; off here so job.run rows are only these tests'
-    overrides.setdefault("brain", {"watches": {"enabled": False}})
+    # intents: these worlds script the labeler or send slash commands (loop is the default)
+    overrides.setdefault("brain", {"watches": {"enabled": False}, "mode": "intents"})
     return load_settings(
         dry_run=False,
         api={"port": free_port()},

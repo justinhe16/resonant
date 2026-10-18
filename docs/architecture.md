@@ -143,7 +143,7 @@ chat.db row ─(WAL watch 250ms + 100ms debounce; 2s poll fallback)─> IMessage
   ─> IMessageChannel.send ("On it…" first past 6 s) ─> history fold in the background
 ```
 
-With `brain.mode: intents` (opt-in; also the brain's fallback for one turn when the model is down or answers badly twice) chat takes the Phase 1 labeled path:
+With `brain.mode: intents` (opt-in; also the brain's fallback for one turn when the model is unavailable, or answers badly and can't escalate to `ask_claude`, unless a side effect already ran, in which case its report lines are the reply) chat takes the Phase 1 labeled path:
 
 ```
   ─> Router.route: fast path (one gated builtin read, templated reply)  │ or one LLM label call
