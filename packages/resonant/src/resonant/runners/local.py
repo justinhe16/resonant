@@ -402,6 +402,20 @@ def _rule_removed(d: dict[str, Any]) -> str | None:
     return f"Rule removed: {text} (rule {rule_id})."
 
 
+def _fact_saved(d: dict[str, Any]) -> str | None:
+    name, description = d.get("name"), d.get("description")
+    if not isinstance(name, str) or not isinstance(description, str):
+        return None
+    # The whole description (at most 120): the owner sees exactly what went into the prompt.
+    verb = "Remembered" if d.get("created") is True else "Updated fact"
+    return f'{verb} {name}: "{description}"'
+
+
+def _fact_forgotten(d: dict[str, Any]) -> str | None:
+    name = d.get("name")
+    return f"Forgot {name}." if d.get("forgotten") is True and isinstance(name, str) else None
+
+
 def summarize_intent(intent: Intent) -> str:
     """The code-built phrase for ``intent`` in replies: the ops heading (``update Resonant``)
     when there is one, as in approval prompts and dry-run replies, else the generic summary."""
@@ -433,6 +447,8 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "add_trust_rule": _rule_added,
     "allow_trust_rule": _rule_added,
     "remove_trust_rule": _rule_removed,
+    "remember": _fact_saved,
+    "forget": _fact_forgotten,
 }
 
 
