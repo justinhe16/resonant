@@ -34,6 +34,7 @@ from github_app_fakes import (
 
 from resonant import killswitch
 from resonant.config import GitHubAppConfig, LoopConfig, RunnerConfig, RunnerRepo
+from resonant.extensions import pulse_job
 from resonant.gateway.channel import (
     ApprovalPrompt,
     Channel,
@@ -1505,22 +1506,25 @@ async def test_the_pulse_item_lives_for_the_run(tmp_path: Path, db: sqlite3.Conn
     await until(lambda: pulse_store.get(h.conn, "core", "run/r1") is not None)
     item = pulse_store.get(h.conn, "core", "run/r1")
     assert item is not None and item.urgency == "normal" and not item.cleared
-    assert item.title.startswith("R1 still running · proj · started ") and item.changed
-    pending = pulse_store.pending(h.conn, ["normal"], utcnow())
-    assert [i.key for i in pending] == ["run/r1"]  # the hourly pulse will mention it
+    assert item.title.startswith("R1 still running · proj · started ")
+    # status, not news (GH-2): the rollup lists it under Still working on, never sends for it
+    assert not item.changed and pulse_store.pending(h.conn, ["normal"], utcnow()) == []
+    assert [i.key for i in pulse_job.running_workers(h.conn, utcnow())] == ["run/r1"]
     await h.runner.cancel_run(code)
     await asyncio.wait_for(t, 20)
     assert pulse_store.pending(h.conn, ["normal"], utcnow()) == []  # cleared, nothing owed
 
 
-async def test_the_pulse_item_changes_state_at_30_minutes(h: Harness) -> None:
+async def test_the_pulse_item_at_30_minutes_is_status_not_news(h: Harness) -> None:
+    """GH-2: passing 30 minutes refreshes the line (its title) without making it news."""
     code = await h.start()
     run = h.run(code)
     h.runner._pulse_open(run)  # pyright: ignore[reportPrivateUsage]
     first = pulse_store.get(h.conn, "core", "run/r1")
     h.runner._pulse_open(run, "30m+")  # pyright: ignore[reportPrivateUsage]
     second = pulse_store.get(h.conn, "core", "run/r1")
-    assert first and second and first.fingerprint != second.fingerprint
+    assert first and second and first.fingerprint == second.fingerprint
+    assert not second.changed
 
 
 async def test_merge_runs_through_the_workspace(h: Harness) -> None:

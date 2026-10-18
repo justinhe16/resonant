@@ -208,6 +208,16 @@ def active(conn: sqlite3.Connection, repo: str | None = None) -> list[Run]:
     return [_row(r) for r in conn.execute(sql + " ORDER BY seq", params)]
 
 
+def ended_since(conn: sqlite3.Connection, status: Status, since: datetime) -> list[Run]:
+    """Runs with ``status`` that ended at or after ``since``, oldest first (GH-2's rollup:
+    the ``ready`` runs whose PR still waits)."""
+    rows = conn.execute(
+        "SELECT * FROM runs WHERE status = ? AND ended_at >= ? ORDER BY seq",
+        (status, iso(since)),
+    ).fetchall()
+    return [_row(r) for r in rows]
+
+
 def with_process(conn: sqlite3.Connection) -> list[Run]:
     """Runs that have a recorded session process (the startup reaper's input)."""
     return [

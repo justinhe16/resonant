@@ -71,6 +71,7 @@ from resonant.monitor import health_snapshot
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.router.fast_path import KILL_REPLY, RESUME_REPLY
 from resonant.secrets import FakeKeychain, SecretStore
+from resonant.store import trust as trust_store
 from resonant.store.db import iso, kv_get, kv_set, open_db, transaction, utcnow
 from resonant.store.extensions import get_extension, get_job, mark_due
 from resonant.store.tasks import unrouted_events
@@ -692,7 +693,8 @@ async def test_e2_e14_github_commands_over_imessage(
         assert lines[5].startswith("- briefing (L0) · next ") and "8:00am" in lines[5]
 
         # /ext run github/watch: the job spec, explicit at its level, recorded as a run.
-        assert await say("/ext run github/watch") == ("github/watch: done: 1 PRs watched, 0 events")
+        # one event: the PR's pr_active for the rollup (GH-2), never texted
+        assert await say("/ext run github/watch") == ("github/watch: done: 1 PRs watched, 1 events")
         assert manual("job_watch") == [("job_watch", "Allow", "explicit")]
         runs = [
             json.loads(row["detail"])
@@ -708,8 +710,11 @@ async def test_e2_e14_github_commands_over_imessage(
         assert muted.startswith("Muted github until "), muted
         assert isinstance(kv_get(r.conn, "ext.github.muted_until"), str)
         assert len(audit_rows(r.conn, "ext.notify_muted")) == 1
-        # A ci_failed event while muted is consumed unsent (held), never delivered.
+        # A ci_failed event while muted is consumed unsent (held), never delivered, even
+        # with the owner's rule that texts it (GH-2: github is quiet without one).
         sent_before = len(osa.sent)
+        trust_store.add_rule(r.conn, scope="github", action="ci_failed", effect="notify_now",
+                             created_from="chat", now=utcnow())  # fmt: skip
         with transaction(r.conn):
             event = {"type": "ci_failed", "text": "resonant#40 CI failed", "dedupe_key": "m1"}
             persist_events(r.conn, "github", [event])
@@ -845,17 +850,25 @@ async def test_e12_github_red_green_red_notifies_exactly_once_across_crashes(
     def texts() -> list[str]:
         return [m.text for m in osa.sent]
 
+    ci_types = ("ext.github.ci_failed", "ext.github.ci_fixed")
+
     def unrouted() -> list[Event]:
-        return [e for e in unrouted_events(d.conn) if e.source == "ext:github"]
+        return [e for e in unrouted_events(d.conn) if e.type in ci_types]
+
+    # GH-2: github texts nothing on its own; the owner's rules bring CI texts back (and this
+    # test keeps their exactly-once delivery across crashes).
+    d = github_daemon(settings, osa)
+    for action in ("ci_failed", "ci_fixed"):
+        trust_store.add_rule(d.conn, scope="github", action=action, effect="notify_now",
+                             created_from="chat", now=utcnow())  # fmt: skip
 
     # Run 1 (the first after install): #40 green, #41 just fixed. Stored as the baseline,
     # never sent: no "fixed" for a PR that was already green.
-    d = github_daemon(settings, osa)
     gh.set_pr40("s1", gh_run(1, "s1", "success"))
     await watch(d, 0)
     await d.loop.run_once()
     assert texts() == []
-    stored = d.conn.execute("SELECT payload FROM events WHERE source = 'ext:github'").fetchall()
+    stored = d.conn.execute("SELECT payload FROM events WHERE type IN (?, ?)", ci_types).fetchall()
     assert [json.loads(r["payload"]).get("baseline") for r in stored] == [True]
 
     # Red, then a crash after the event is stored and before it is sent.
