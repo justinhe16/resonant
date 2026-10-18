@@ -435,7 +435,7 @@ def test_attachments_checked(tmp_path: Path) -> None:
     assert check_attachment(str(shot), scope)[0] == shot.resolve()
     assert check_attachment(str(ok), scope)[0] == ok.resolve()
     assert "deny list" in str(check_attachment(str(env), scope)[1])
-    assert "may read" in str(check_attachment(str(other / "k.db"), scope)[1])
+    assert "deny list" in str(check_attachment(str(other / "k.db"), scope)[1])
     assert "may read" in str(check_attachment(str(outside), scope)[1])
     assert "may read" in str(check_attachment(str(link), scope)[1])  # symlink out
     assert "absolute" in str(check_attachment("code/notes.txt", scope)[1])
@@ -452,6 +452,22 @@ def test_attachments_checked(tmp_path: Path) -> None:
     with open(big, "wb") as f:
         f.truncate(ask_mod.ATTACH_BYTES + 1)
     assert "MB" in str(check_attachment(str(big), scope)[1])
+
+
+def test_attachment_carve_out_never_lifts_the_rest_of_a_denied_dir(tmp_path: Path) -> None:
+    """A read root above a denied dir (e.g. ``~``): only the attachment root inside it is
+    lifted, and there the globs still apply; the rest (Keychains) stays denied."""
+    lib = tmp_path / "Library"
+    msgs, keys = lib / "Messages" / "Attachments", lib / "Keychains"
+    for d in (msgs, keys):
+        d.mkdir(parents=True)
+    (msgs / "x.png").write_bytes(b"png")
+    (msgs / "y.pem").write_text("key")
+    (keys / "k.db").write_text("x")
+    scope = AskScope((tmp_path,), (str(lib), "*.pem"), (), (msgs,)).attach()
+    assert check_attachment(str(msgs / "x.png"), scope)[0] is not None
+    assert "deny list" in str(check_attachment(str(msgs / "y.pem"), scope)[1])
+    assert "deny list" in str(check_attachment(str(keys / "k.db"), scope)[1])
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="F_GETPATH is macOS")

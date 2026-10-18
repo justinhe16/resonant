@@ -7,7 +7,8 @@ The session::
 
     claude -p --restricted --tools Read,Grep,Glob,WebSearch,WebFetch
         --permission-mode dontAsk --allowedTools <built-ins + the kind's connector reads>
-        --disallowedTools <connector writes + Read(<deny list>)> --add-dir <each read root>
+        --disallowedTools <connector writes> --settings <Read() deny rules, JSON>
+        --add-dir <each real read root>
         --no-session-persistence --output-format stream-json --verbose --max-turns 15
         --append-system-prompt <the ask prompt>        (the question on stdin)
 
@@ -296,25 +297,23 @@ class AskScope:
         """The read tools' scope over these sources (real roots, folded deny entries)."""
         return ReadScope.build(self.roots, self.deny, self.always)
 
-    def attach(self) -> ReadScope:
-        """The scope for attachments: the roots plus ``attachment_roots``, without the deny
-        paths that contain an attachment root (``~/Library``); globs and ``always`` stay."""
-        attach = [Path(os.path.realpath(r)) for r in self.attachment_roots]
-
-        def holds_attach_root(entry: str) -> bool:
-            if not entry.startswith(("/", "~")):
-                return False
-            d = _folded(Path(os.path.realpath(Path(entry).expanduser())))
-            return any(_folded(a)[: len(d)] == d for a in attach)
-
-        deny = [e for e in self.deny if not holds_attach_root(e)]
-        return ReadScope.build([*self.roots, *self.attachment_roots], deny, self.always)
+    def attach(self) -> AttachScope:
+        """The scope for attachments: the roots plus ``attachment_roots``. Every deny entry
+        stays; only inside an attachment root are the path entries lifted (``~/Library``
+        holds Messages' attachments), and there globs and ``always`` still apply."""
+        globs = [e for e in self.deny if not e.startswith(("/", "~"))]
+        return AttachScope(
+            ReadScope.build([*self.roots, *self.attachment_roots], self.deny, self.always),
+            ReadScope.build(self.attachment_roots, globs, self.always),
+        )
 
     def add_dirs(self) -> list[Path]:
         """``--add-dir`` values: the real top-level roots that exist."""
         return [r for r in self.read().top_roots() if r.is_dir()]
 
     def deny_rules(self) -> list[str]:
+        # The CLI may match these literally while the read tools fold case; --add-dir keeps
+        # it to the roots, and the followups note the residual (a ``.ENV`` in a root).
         """The deny list as ``Read(...)`` permission rules for ``--settings``: a path (as
         given and real; ``//`` marks an absolute path) and all under it, a glob anywhere and
         all under it."""
@@ -329,8 +328,22 @@ class AskScope:
         return list(dict.fromkeys(rules))
 
 
-def _folded(p: Path) -> tuple[str, ...]:
-    return tuple(unicodedata.normalize("NFC", x).casefold() for x in p.parts)
+@dataclass(frozen=True)
+class AttachScope:
+    """``AskScope.attach()``: ``full`` is every root and every deny entry; ``carve`` is the
+    attachment roots with only the globs and ``always``. A path inside an attachment root is
+    judged by ``carve``, anything else by ``full``."""
+
+    full: ReadScope
+    carve: ReadScope
+
+    def denied(self, path: Path | str) -> bool:
+        if self.carve.inside(path):
+            return self.carve.denied(path)
+        return self.full.denied(path)
+
+    def inside(self, real: Path | str) -> bool:
+        return self.full.inside(real)
 
 
 def ask_argv(
@@ -422,7 +435,7 @@ def has_proposal(text: str) -> bool:
 # --- attachments ---------------------------------------------------------------------------
 
 
-def check_attachment(raw: str, scope: ReadScope) -> tuple[Path | None, str | None]:
+def check_attachment(raw: str, scope: AttachScope) -> tuple[Path | None, str | None]:
     """``(real path, None)`` for a file an ask may carry, else ``(None, why)``. ``scope`` is
     ``AskScope.attach()``: the path as given and its real path must pass the deny list, the
     real path must be inside a root, and it must be a regular file of at most
@@ -455,7 +468,7 @@ def _fd_path(fd: int) -> Path | None:
     return Path(raw.split(b"\0", 1)[0].decode(errors="surrogateescape"))
 
 
-def _copy_in(src: Path, dest: Path, scope: ReadScope) -> None:
+def _copy_in(src: Path, dest: Path, scope: AttachScope) -> None:
     """Copy one checked attachment into the ask dir, never through a symlink. ``O_NOFOLLOW``
     covers only the last component, so the opened file's own path is checked again: a parent
     directory swapped for a link since the check can't carry a denied file in."""
