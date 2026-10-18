@@ -90,7 +90,7 @@ LISTED = (
     "list_projects",
     "list_teams",
     "save_issue",
-    "create_comment",
+    "save_comment",
     "leak",
     "sleep",
     "big",
@@ -148,7 +148,7 @@ def test_shipped_linear_manifest() -> None:
     levels = {s.name: s.effective_level for s in m.tool_specs()}
     reads = ("list_issues", "get_issue", "list_comments", "list_projects", "list_teams")
     assert all(levels[n] is Level.L0 for n in reads)
-    assert levels["save_issue"] is Level.L2 and levels["create_comment"] is Level.L2
+    assert levels["save_issue"] is Level.L2 and levels["save_comment"] is Level.L2
     assert all(s.secrets == () for s in m.tool_specs())  # only the server's bearer
     assert dir_errors(REPO / "extensions" / "linear", m) == []
 
@@ -242,6 +242,16 @@ async def test_discover_lists_every_page_and_needs_the_token(fake: Any) -> None:
         await discover_http(fake.url, "wrong")
     with pytest.raises(McpError, match="401"):
         await discover_http(fake.url, None)
+
+
+async def test_linear_style_long_pattern_is_pinned_without_it(fake: Any) -> None:
+    """LN-1: Linear's save_issue has slaBreachesAt with zod's 293-char ISO date-time pattern,
+    which once refused the install (``bad 'pattern' value``). It installs; the pattern is
+    neither shown nor enforced here, and the pin is the same on every listing."""
+    first = await pins_for(fake.url)
+    sla = first["save_issue"]["input_schema"]["properties"]["slaBreachesAt"]
+    assert sla == {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]}
+    assert first == await pins_for(fake.url)
 
 
 @pytest.mark.parametrize("sse", [False, True])

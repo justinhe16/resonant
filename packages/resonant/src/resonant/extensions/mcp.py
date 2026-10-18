@@ -20,6 +20,9 @@ Design (carried from ``followups.md``):
   called. The model sees the manifest's description, never the server's; the server's input
   schema is stripped to an allowlist of validation keywords (``description``, ``title``,
   ``default``, ``examples`` and anything unknown are dropped) and its annotations are ignored.
+  A ``pattern`` that is long, unprintable or not a Python regex (ECMA-262 syntax ``re``
+  refuses) is dropped too: not shown, not enforced locally; the server validates (LN-1).
+  A schema that drops one and uses ``not`` or ``oneOf`` is refused (dropping would tighten).
 - **Pins.** Each tool is pinned as ``sha256(name, stripped input schema, stripped output
   schema)`` (pin version 2, GT-1): only what the model sees and what arguments are checked
   against. The server's description and annotations never reach the model, so a reworded
@@ -52,10 +55,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -98,6 +103,8 @@ MAX_ANSWERS = 32  # server requests being answered at once
 
 # JSON Schema keywords kept in an input schema. Everything else (description, title, default,
 # examples, $comment, x-*) is dropped: free text the model would read as instructions.
+# Adding a subschema keyword here (if/then/else, dependentSchemas, …) means revisiting
+# ``_inverts``: a dropped pattern must never tighten the local check (LN-1).
 _SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
 _SCHEMA_ONE = frozenset(
     {"items", "additionalProperties", "not", "contains", "propertyNames", "additionalItems"}
@@ -143,7 +150,20 @@ class McpToolError(Exception):
 
 def strip_schema(schema: object, depth: int = 0) -> Any:
     """``schema`` with only validation keywords kept (recursively). Property names are kept
-    whatever they are called (a property named ``description`` stays). Raises ValueError."""
+    whatever they are called (a property named ``description`` stays). Raises ValueError.
+
+    A string ``pattern`` that can't be checked is dropped (``_checkable_pattern``). That only
+    loosens the local check, except under ``not`` or ``oneOf``, where an emptied subschema
+    rejects more (``not: {}`` rejects everything). So a schema that drops a pattern and has
+    either keyword anywhere (``$ref`` can reach a ``$defs`` entry from under them) is refused."""
+    dropped: list[str] = []
+    out = _strip(schema, depth, dropped)
+    if dropped and _inverts(out):
+        raise ValueError("its schema has a bad 'pattern' value under not or oneOf")
+    return out
+
+
+def _strip(schema: object, depth: int, dropped: list[str]) -> Any:
     if isinstance(schema, bool):
         return schema
     if not isinstance(schema, dict) or depth > SCHEMA_MAX_DEPTH:
@@ -152,20 +172,47 @@ def strip_schema(schema: object, depth: int = 0) -> Any:
     for key, value in cast(dict[str, Any], schema).items():
         if key in _SCHEMA_MAPS and isinstance(value, dict):
             subs = cast(dict[str, Any], value)
-            out[key] = {name: strip_schema(sub, depth + 1) for name, sub in subs.items()}
+            out[key] = {name: _strip(sub, depth + 1, dropped) for name, sub in subs.items()}
         elif key in _SCHEMA_ONE:
             if isinstance(value, list):  # draft-4 tuple ``items``
-                out[key] = [strip_schema(v, depth + 1) for v in cast(list[Any], value)]
+                out[key] = [_strip(v, depth + 1, dropped) for v in cast(list[Any], value)]
             else:
-                out[key] = strip_schema(value, depth + 1)
+                out[key] = _strip(value, depth + 1, dropped)
         elif key in _SCHEMA_LISTS and isinstance(value, list):
-            out[key] = [strip_schema(v, depth + 1) for v in cast(list[Any], value)]
-        elif key in _SCHEMA_VALUES:
+            out[key] = [_strip(v, depth + 1, dropped) for v in cast(list[Any], value)]
+        elif key == "pattern" and isinstance(value, str) and not _checkable_pattern(value):
+            dropped.append(value)  # not shown, not enforced here; the server validates (LN-1)
+        elif key in _SCHEMA_VALUES:  # a non-string pattern lands here and is refused
             out[key] = _schema_value(key, value)
     for name in cast(dict[str, Any], out.get("properties", {})):
         if not _short(name, NAME_MAX):
             raise ValueError("a property name is too long or not printable")
+    for defs in ("$defs", "definitions"):
+        for name in cast(dict[str, Any], out.get(defs, {})):
+            if not _short(name, NAME_MAX):
+                raise ValueError(f"a {defs} name is too long or not printable")
+    for name in cast(dict[str, Any], out.get("patternProperties", {})):
+        # Refused, not dropped: dropping an entry rejects more under additionalProperties.
+        if not _checkable_pattern(name):
+            raise ValueError("its schema has a bad 'patternProperties' key")
     return out
+
+
+def _inverts(schema: object) -> bool:
+    """Whether a stripped schema uses ``not`` or ``oneOf`` anywhere (keywords only: a
+    property named ``not`` doesn't count)."""
+    if not isinstance(schema, dict):
+        return False
+    s = cast(dict[str, Any], schema)
+    if "not" in s or "oneOf" in s:
+        return True
+    subs: list[object] = []
+    for key, value in s.items():
+        if key in _SCHEMA_MAPS:
+            subs += list(cast(dict[str, Any], value).values())
+        elif key in _SCHEMA_ONE or key in _SCHEMA_LISTS:
+            subs += cast(list[Any], value) if isinstance(value, list) else [value]
+    return any(_inverts(v) for v in subs)
 
 
 _JSON_TYPES = frozenset({"object", "array", "string", "number", "integer", "boolean", "null"})
@@ -180,6 +227,27 @@ ENUM_MAX = 100
 
 def _short(v: object, limit: int = TEXT_MAX) -> bool:
     return isinstance(v, str) and len(v) <= limit and v.isprintable()
+
+
+def _checkable_pattern(p: str) -> bool:
+    """Whether a string ``pattern`` is kept: short and printable (the model reads it) and one
+    Python's ``re`` compiles (``jsonschema`` checks arguments with ``re.search``).
+
+    A JSON Schema pattern is an ECMA-262 regex. Generated schemas carry long ones (zod's
+    UUID and ISO datetime patterns are well over ``TEXT_MAX``) and ECMA-only syntax
+    (``\\p{L}``, ``(?<name>…)``, ``[^]``) that ``re`` refuses. Such a
+    pattern is dropped rather than refused or translated: a dropped pattern only loosens the
+    local check (the server validates its own schema; ``strip_schema`` refuses the cases
+    under ``not``/``oneOf`` where it wouldn't), it carries no text to the model, and dropping
+    is deterministic for the daemon's interpreter (uv pins Python 3.12), so the pin is
+    stable. A non-string pattern is still refused."""
+    if not _short(p):
+        return False
+    try:
+        re.compile(p)
+    except (re.error, OverflowError, RecursionError):  # the last two on pathological ones
+        return False
+    return True
 
 
 def _scalar(v: object) -> bool:
@@ -239,7 +307,7 @@ def _output_schema(tool: Mapping[str, Any]) -> Any:
         return None
     try:
         return strip_schema(raw)
-    except ValueError:
+    except ValueError:  # e.g. a bad patternProperties key: hashed raw, never shown
         return raw
 
 
@@ -325,17 +393,33 @@ def approve(server_id: str, listed: tuple[str, ...], tools: list[dict[str, Any]]
             continue
         by_name[name] = t
     pins: dict[str, McpToolPin] = {}
+    ignored = sorted(n for n in by_name if n not in listed)
     for name in listed:
         tool = by_name.get(name)
         if tool is None:
-            problems.append(f"mcp server {server_id} has no tool {name}")
+            problems.append(_missing(server_id, name, ignored))
             continue
         try:
             pins[name] = McpToolPin(server_id, tool_pin(tool), input_schema(tool))
         except ValueError as e:
             problems.append(f"mcp tool {name}: {e}")
-    ignored = sorted(n for n in by_name if n not in listed)
     return Discovered(pins, problems, ignored)
+
+
+_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")  # resonant_sdk's TOOL_NAME_PATTERN
+
+
+def _missing(server_id: str, name: str, unlisted: list[str]) -> str:
+    """Why ``ext add`` refuses a manifest-listed tool the server doesn't offer, with the
+    server's closest unlisted names (only ones a manifest could list, so no server text
+    beyond a tool name reaches the terminal). Install still refuses: the manifest is the
+    owner's typed list of what each tool is, and a tool is only disabled after approval."""
+    names = [n for n in unlisted if _TOOL_NAME.match(n)]
+    close = difflib.get_close_matches(name, names, n=3, cutoff=0.6)
+    hint = f" (renamed? it has {', '.join(close)})" if close else ""
+    return (
+        f"mcp server {server_id} has no tool {name}{hint}; fix or remove it in the manifest's tools"
+    )
 
 
 def server_argv(
