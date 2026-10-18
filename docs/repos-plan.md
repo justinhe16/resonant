@@ -167,6 +167,8 @@ For a `fork` repo:
 - An existing checkout whose `origin` is the repo is used as is (`checked out at …`). Anything else at the path is left untouched and the reply says so. On success `repos.path` is set, and a run's first clone (`prepare`) now records it as well.
 - A failed or cut-off clone leaves the repo registered; the reply says the clone failed and that the first run will try again (it does: `prepare` clones a missing checkout). A repo GitHub reports as over about 2 GB (`GitHub.size_kb`, `CLONE_MAX_KB`) is left to the first run.
 - Fork repos aren't cloned at add time: their checkout is the owner's fork (`origin` the fork, `upstream` the original), which the first run makes with the `public_repo` token; a clone of the original at that path would be refused by that run.
+- The 120 s covers waiting for the checkout lock too; a run holding it (setting the checkout up) is reported as such, not as a slow clone. A path over Resonant's own dirs is refused up front. The size lookup has 10 s and isn't made for `create_repo` (a new repo is tiny).
+- Recording `repos.path` (rather than leaving NULL for the default place) is deliberate: a renamed repo keeps its checkout instead of cloning afresh under the new name. A later change of `runner.code_dir` doesn't move recorded checkouts, and a `runner.repos` entry restates its own `path` at every start (unset: NULL, the default place), as before.
 - Adding a registered repo that has no checkout (like one added before this change) clones it, so "add X" again is the fix. Replies: `Added mycelium (justinhe16/mycelium, base main, push): cloned to ~/code/mycelium.` `list_repos` carries each repo's `path` (or `not cloned`) and `/repos` shows it, so "where is X" needs no tool of its own.
 
 ## 4. Tickets and waves

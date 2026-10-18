@@ -1933,3 +1933,30 @@ async def test_a_runs_first_clone_records_the_path(env: Env) -> None:
     await env.prepare()
     repo = repo_store.get(env.conn, "own/proj")
     assert repo is not None and repo.path == env.checkout
+
+
+async def test_owner_checkout_refuses_a_path_over_resonants_dirs(env: Env) -> None:
+    env.conn.execute("UPDATE repos SET path = ?", (str(env.cfg.work_dir / "proj"),))
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    got = await env.ws.owner_checkout(repo, GH_TOKEN)
+    assert got.state == "in_the_way" and "overlaps Resonant's own dirs" in got.reason
+    assert not (env.cfg.work_dir / "proj").exists()
+
+
+async def test_owner_checkout_waiting_on_a_run_says_so(env: Env) -> None:
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    async with env.ws.checkout_lock("proj"):  # a run is preparing its worktree
+        got = await env.ws.owner_checkout(repo, GH_TOKEN, timeout_s=0.2)
+    assert got.state == "failed" and "a run is setting up this checkout" in got.reason
+    assert not env.checkout.exists()
+
+
+async def test_a_renamed_repo_keeps_its_recorded_checkout(env: Env) -> None:
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    assert (await env.ws.owner_checkout(repo, GH_TOKEN)).state == "cloned"
+    env.conn.execute("UPDATE repos SET name = 'renamed'")
+    renamed = repo_store.get(env.conn, "own/proj")
+    assert renamed is not None and env.ws.checkout_path(renamed) == env.checkout

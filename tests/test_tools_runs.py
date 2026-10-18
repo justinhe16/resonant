@@ -604,7 +604,9 @@ async def test_slash_repos_lists_inline_and_repo_writes_are_direct_calls(
     assert res is not None and res.reply_text.startswith("No repos yet.")
     repo_store.add(db, "own/dori", base="main", source="owner", ci=True)
     repo_store.add(db, "up/lib", base="main", source="auto", mode="fork")
-    (settings.runner.code_dir / "dori" / ".git").mkdir(parents=True)  # a checkout
+    git_dir = settings.runner.code_dir / "dori" / ".git"  # a checkout of own/dori
+    git_dir.mkdir(parents=True)
+    (git_dir / "config").write_text('[remote "origin"]\n\turl = git@github.com:own/dori.git\n')
     res = await fp.run(parse("/repos"), principal=OWNER, event_id="E2")
     assert res is not None and res.reply_text.splitlines() == [
         "Repos (2):",

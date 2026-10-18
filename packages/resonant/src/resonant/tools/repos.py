@@ -68,12 +68,14 @@ from resonant.runner.resolve import (
     parse_slug,
 )
 from resonant.runner.workspace import (
+    CLONE_TIMEOUT_S,
     GITHUB_TOKEN_HOW,
     MergeRefused,
     OwnerCheckout,
     RunnerError,
     Workspace,
     needs_github_token,
+    remote_slug,
 )
 from resonant.secrets import RunnerSecrets, SecretError, SecretStore, load_runner_secrets
 from resonant.store import repos as repos_store
@@ -87,6 +89,7 @@ RUNNER = "claude"
 NOT_CLONED = "not cloned"
 REPO_MAX = 200
 REPOS_MAX = 100  # repos listed
+SIZE_LOOKUP_S = 10.0  # GitHub's answer on a repo's size; unknown after this
 
 
 class RunnerApi(Protocol):
@@ -134,7 +137,7 @@ CREATE_REPO = ToolSpec(
     },
     effect=Effect.WRITE,
     level=Level.L2,
-    timeout_s=260.0,  # create, then the clone (CLONE_TIMEOUT_S)
+    timeout_s=120.0 + CLONE_TIMEOUT_S + 20.0,  # create, then the clone
 )
 ADD_CI = ToolSpec(
     name="add_ci",
@@ -196,7 +199,7 @@ ADD_REPO = ToolSpec(
     },
     effect=Effect.WRITE,
     level=Level.L3,
-    timeout_s=200.0,  # resolve, then the clone (CLONE_TIMEOUT_S)
+    timeout_s=60.0 + SIZE_LOOKUP_S + CLONE_TIMEOUT_S + 10.0,  # resolve, size, then the clone
 )
 FORGET_REPO = ToolSpec(
     name="forget_repo",
@@ -267,15 +270,16 @@ def checkout_text(got: OwnerCheckout) -> str:
 
 
 async def owner_checkout(
-    claude: RunnerApi, repo: Repo, secrets: RunnerSecrets, github: GitHub
+    claude: RunnerApi, repo: Repo, secrets: RunnerSecrets, github: GitHub | None
 ) -> OwnerCheckout:
-    """Clone ``repo`` for the owner (``Workspace.owner_checkout``), after asking GitHub how big
-    it is (an answer that can't be had is unknown)."""
+    """Clone ``repo`` for the owner (``Workspace.owner_checkout``). With ``github``, first ask
+    how big it is (at most ``SIZE_LOOKUP_S``; no answer is unknown). A repo just created is
+    tiny, so ``create_repo`` passes None."""
     size = None
-    if repo.mode == "push":
+    if github is not None and repo.mode == "push":
         try:
-            size = await github.size_kb(repo.slug)
-        except Exception:  # never stops an add
+            size = await asyncio.wait_for(github.size_kb(repo.slug), SIZE_LOOKUP_S)
+        except Exception:  # never stops an add (a timeout included)
             size = None
     return await claude.workspace.owner_checkout(repo, secrets.github_token, size_kb=size)
 
@@ -285,10 +289,32 @@ def _checkout_fields(got: OwnerCheckout) -> dict[str, Any]:
     return {"path": tilde(got.path) if cloned else None, "checkout": got.state}
 
 
+def _origin_slug(git_dir: Path) -> str | None:
+    """``owner/name`` of the ``origin`` in ``<git_dir>/config``, read as text: nothing in a
+    checkout's config is run (a worker can write it), and a failure is None."""
+    try:
+        text = (git_dir / "config").read_text(errors="replace")[:65536]
+    except OSError:
+        return None
+    section = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section = line.replace(" ", "").lower() == '[remote"origin"]'
+        elif section and line.lower().startswith("url") and "=" in line:
+            return remote_slug(line.split("=", 1)[1].strip())
+    return None
+
+
 def _listed_path(repo: Repo, code_dir: Path) -> str:
-    """Where the repo's checkout is, or ``not cloned`` (nothing with a ``.git`` there)."""
-    path = repo.path if repo.path is not None else code_dir / repo.name
-    return tilde(path) if os.path.lexists(path / ".git") else NOT_CLONED
+    """Where the repo's checkout is, or ``not cloned``. A recorded ``path`` (an add's or a run's
+    clone, or the owner's own) counts when it has a ``.git``; the default place only when its
+    ``origin`` is this repo, so something else in the way isn't shown as the checkout."""
+    if repo.path is not None:
+        return tilde(repo.path) if os.path.lexists(repo.path / ".git") else NOT_CLONED
+    path = code_dir / repo.name
+    origin = _origin_slug(path / ".git")
+    return tilde(path) if origin is not None and origin.lower() == repo.slug.lower() else NOT_CLONED
 
 
 def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
@@ -338,7 +364,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             )
         except CreateError as e:
             return {"created": False, "text": str(e)}
-        got = await owner_checkout(claude, made.repo, secrets, claude.github_for(secrets))
+        got = await owner_checkout(claude, made.repo, secrets, None)
         clause = checkout_text(got)
         return {
             "created": True,

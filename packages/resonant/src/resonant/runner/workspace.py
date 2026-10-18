@@ -110,7 +110,9 @@ FORK_READY_WAIT_S = 5.0  # the first wait, doubled each try
 UPSTREAM_BODY_MAX = 4000
 GIT_TIMEOUT_S = 300.0
 CLONE_TIMEOUT_S = 120.0  # an add's clone (owner_checkout); a run's first clone has GIT_TIMEOUT_S
-CLONE_MAX_KB = 2_000_000  # GitHub's size above which an add leaves the clone to the first run
+# GitHub's size above which an add leaves the clone to the first run. Only a cheap early out:
+# CLONE_TIMEOUT_S is the real bound (most links can't clone 2 GB in it).
+CLONE_MAX_KB = 2_000_000
 GH_TIMEOUT_S = 120.0
 COMMITTER_NAME = "Resonant runner"
 COMMITTER_EMAIL = "resonant-runner@users.noreply.github.com"
@@ -945,27 +947,37 @@ class Workspace:
         path = self.checkout_path(repo)
         if repo.mode == "fork":
             return OwnerCheckout("skipped", path, "it's upstream, so the first run makes your "
-                                 "fork and clones that")  # fmt: skip
+                                 "fork and clones the fork")  # fmt: skip
         if size_kb is not None and size_kb > CLONE_MAX_KB:
             gb = size_kb / 1_000_000
             return OwnerCheckout("skipped", path, f"it's about {gb:.1f} GB on GitHub, so the "
                                  "first run clones it")  # fmt: skip
-        existed = False
         try:
+            self._check_checkout_place(path)
+        except RunnerError as e:
+            return OwnerCheckout("in_the_way", path, str(e))
+        existed = started = False
+        try:
+            # one budget for the lock (a run may be setting the checkout up) and the clone
             async with asyncio.timeout(timeout_s), self.checkout_lock(repo.name):
+                started = True
                 existed = await asyncio.to_thread(os.path.lexists, path)
                 await self.ensure_checkout(repo, token)
         except TimeoutError:
+            if not started:
+                return OwnerCheckout("failed", path, "a run is setting up this checkout right now")
             minutes = max(1, round(timeout_s / 60))
             return OwnerCheckout("failed", path, f"it didn't finish within {minutes} min")
         except (RunnerError, GitError, OSError) as e:
+            # git's stderr is already redacted (``_exec``)
             reason = e.message if isinstance(e, GitError) else str(e)
-            reason = Redactor([token] if token else ()).text(reason)
-            if existed:
+            if existed and isinstance(e, RunnerError):  # ensure_checkout's "in the way"
                 return OwnerCheckout("in_the_way", path, reason)
             if token is None and _ANON_REFUSED.search(reason):
                 reason = "a private repo needs the daemon's GitHub token (runner/github_token)"
             return OwnerCheckout("failed", path, reason)
+        # Recorded, so a renamed repo keeps its checkout; written after the lock, from the
+        # snapshot: a forget or config import racing it makes this a no-op or a reset.
         if repo.path != path:
             with atomic(self.conn):
                 repo_store.set_path(self.conn, repo.slug, path)

@@ -796,6 +796,12 @@ async def test_something_else_in_the_way_is_left_alone(
     out = await call(components, "add_repo", {"repo": "me/proj"})
     assert out["checkout"] == "in_the_way" and "I left it alone" in out["text"]
     assert [p.name for p in where.iterdir()] == ["keep.txt"]
+    # another repo's checkout there isn't listed as this one's
+    (where / ".git").mkdir()
+    (where / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = https://github.com/me/other\n'
+    )
+    assert (await call(components, "list_repos", {}))["repos"][0]["path"] == "not cloned"
 
 
 async def test_fork_and_huge_repos_are_not_cloned_while_adding(
@@ -822,5 +828,6 @@ async def test_create_repo_clones_the_new_repo(
     where = settings.runner.code_dir / "scratch"
     assert out["created"] is True and out["checkout"] == "cloned"
     assert out["text"].endswith(f" Cloned to {where}.") and (where / ".git").is_dir()
+    assert not any(c.startswith("size_kb") for c in claude.github.calls)  # new: tiny
     repo = repos.get(db, "me/scratch")
     assert repo is not None and repo.path == where
