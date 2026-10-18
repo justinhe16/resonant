@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import timedelta
+from importlib import resources
+from pathlib import Path
 
 from brain_seed import OWNER, SummaryModel, message
 
@@ -22,7 +24,14 @@ from resonant.brain.history import (
 )
 from resonant.models import ModelUnavailableError
 from resonant.store import brain as store
-from resonant.store.db import latest_version, schema_version, utcnow
+from resonant.store.db import (
+    connect,
+    latest_version,
+    migrate,
+    open_db,
+    schema_version,
+    utcnow,
+)
 
 
 def seed(db: sqlite3.Connection, n: int, *, start: int = 0) -> list[str]:
@@ -30,7 +39,7 @@ def seed(db: sqlite3.Connection, n: int, *, start: int = 0) -> list[str]:
 
 
 def test_migration_015(db: sqlite3.Connection) -> None:
-    assert schema_version(db) == latest_version() == 16
+    assert schema_version(db) == latest_version() == 17
     cols = {r["name"] for r in db.execute("PRAGMA table_info(brain_summaries)")}
     assert cols == {"principal", "summary", "through_event_id", "folded", "source", "updated_at"}
 
@@ -203,3 +212,35 @@ def test_fallback_summary_keeps_the_newest_end() -> None:
     assert "q29" in text and "old" not in text
     assert fallback_summary("", []) == ""
     assert fallback_summary("", exchanges[:1][:1]).startswith("owner: q0 q0")
+
+
+def test_migration_017_starts_summaries_over(tmp_path: Path) -> None:
+    """BR-9: summaries folded before the fold dropped state claims are cleared, so the next
+    fold rebuilds them (history shows the recent exchanges as turns until then)."""
+    found = [
+        (int(f.name[:3]), f.read_text())
+        for f in resources.files("resonant.store.migrations").iterdir()
+        if f.name.endswith(".sql")
+    ]
+    path = tmp_path / "old.db"
+    conn = connect(path)
+    assert migrate(conn, sorted(m for m in found if m[0] <= 16)) == 16
+    conn.execute(
+        "INSERT INTO brain_summaries VALUES (?, ?, ?, ?, ?, ?)",
+        (OWNER, "github and claude secrets aren't configured", "e1", 12, "model", "2026-10-18"),
+    )
+    conn.commit()
+    conn.close()
+    conn = open_db(path)
+    assert schema_version(conn) == 17
+    assert store.get_summary(conn, OWNER) is None
+    conn.close()
+
+
+def test_summary_is_marked_possibly_stale_and_the_fold_drops_state_claims() -> None:
+    """BR-9: the live briefing wins over the summary, and the fold keeps no setup or health
+    claims (they go stale: "secrets aren't configured" outlived the fix)."""
+    body = history.summary_turn("the owner asked about secrets")["content"]
+    assert "out of date" in body and "briefing" in body
+    system = history.FOLD_SYSTEM
+    assert "configured" in system and "secrets" in system and "health" in system

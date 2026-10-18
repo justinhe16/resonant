@@ -77,6 +77,7 @@ NAMES = {
     "search",
     "tail_log",
     "read_transcript",
+    "recent_changes",
     "list_facts",
     "remember",
     "forget",

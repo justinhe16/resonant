@@ -15,9 +15,16 @@ bins: [gh]                             # pinned at install, given as RESONANT_BI
 
 tools:
   prs:
-    description: Your open PRs with CI and review state, plus PRs awaiting your review.
+    description: Your open PRs with CI and review state, plus PRs awaiting your review (open only; recent_prs for merged).
     run: python3 cli.py prs
     effect: read                       # reads only: L0
+    secrets: [token]
+    timeout_s: 60
+  recent_prs:
+    description: The newest PRs in one repo (owner/name), newest first, open, merged and closed, with their dates.
+    run: python3 cli.py recent_prs --repo {repo}
+    effect: read
+    args: {repo: string}
     secrets: [token]
     timeout_s: 60
   pr:

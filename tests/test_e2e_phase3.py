@@ -496,7 +496,8 @@ async def test_e3_show_my_prs_routes_to_github_and_runs_prs(
         assert cp["intent"] == "extension:github" and cp["title"] == "chat: extension:github"
         # Only github's chat tools: never its jobs (watch, digest), never a builtin.
         assert cp["toolset"] == [
-            {"extension": "github", "name": n} for n in ("merge_pr", "pr", "prs", "rerun_failed")
+            {"extension": "github", "name": n}
+            for n in ("merge_pr", "pr", "prs", "recent_prs", "rerun_failed")
         ]
         # prs ran through the gate as a model-chosen (inferred) call, with the token.
         gate = r.conn.execute(
@@ -520,7 +521,7 @@ async def test_e3_show_my_prs_routes_to_github_and_runs_prs(
         # The earlier reply went back to the model wrapped as untrusted, never as an
         # assistant turn; the toolset the model saw was github's alone.
         messages, tools = model.tool_turns[-1]
-        assert tools == ["merge_pr", "pr", "prs", "rerun_failed"]
+        assert tools == ["merge_pr", "pr", "prs", "recent_prs", "rerun_failed"]
         history = messages[1:-1]
         assert [m["role"] for m in history] == ["user", "user"]
         assert history[1]["content"] == f"<prior_reply>{DEFAULT_FINAL_REPLY}</prior_reply>"
@@ -690,7 +691,7 @@ async def test_e2_e14_github_commands_over_imessage(
         lines = listing.splitlines()
         assert lines[0] == "Extensions (1):"
         assert lines[1].startswith("github · enabled · a1b2c3d4 digest ")
-        assert " · 4 tools" in lines[1]
+        assert " · 5 tools" in lines[1]
         assert lines[2].startswith("- digest (L0) · next ")
         assert lines[3].startswith("- watch (L0) · next ")
         assert lines[4] == "core · built in"  # core jobs too, next due from config

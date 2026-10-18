@@ -33,7 +33,7 @@ def rule(
 
 
 def test_migration_010(db: sqlite3.Connection) -> None:
-    assert schema_version(db) == latest_version() == 16
+    assert schema_version(db) == latest_version() == 17
     cols = {r["name"] for r in db.execute("PRAGMA table_info(trust_rules)")}
     assert cols == {"id", "scope", "action", "effect", "note", "created_from", "created_at"}
     cols = {r["name"] for r in db.execute("PRAGMA table_info(trust_seen)")}

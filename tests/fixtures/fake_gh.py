@@ -8,9 +8,10 @@ modes) to ``calls.jsonl`` beside the state file.
 State keys: ``token``, ``user``, ``mine`` / ``review`` / ``closed`` (GraphQL search nodes;
 ``closed`` answers the search with ``is:closed``), ``runs``
 (``"<repo>:<branch>"`` → ``gh run list`` rows), ``prs`` (``"<repo>#<n>"`` → ``gh pr view``),
-``fail`` (``{"exit": n, "stderr": "..."}``) to fail every call, ``fail_on`` (``"pr merge"`` or
-``"run rerun <id>"`` → the same shape) to fail one kind of call, and ``garbage`` to print
-non-JSON with exit 0. ``pr merge`` and ``run rerun`` print a line of text, like gh does.
+``list`` (``"<repo>"`` → ``gh pr list`` rows), ``fail`` (``{"exit": n, "stderr": "..."}``) to
+fail every call, ``fail_on`` (``"pr merge"`` or ``"run rerun <id>"`` → the same shape) to fail
+one kind of call, and ``garbage`` to print non-JSON with exit 0. ``pr merge`` and ``run rerun``
+print a line of text, like gh does.
 """
 
 from __future__ import annotations
@@ -49,6 +50,8 @@ def answer(state: dict[str, Any], args: list[str]) -> tuple[int, Any, str]:
     if args[:2] == ["run", "list"]:
         key = f"{_opt(args, '--repo')}:{_opt(args, '--branch')}"
         return 0, state.get("runs", {}).get(key, []), ""
+    if args[:2] == ["pr", "list"]:
+        return 0, state.get("list", {}).get(_opt(args, "--repo"), []), ""
     if args[:2] == ["pr", "view"]:
         pr = state.get("prs", {}).get(f"{_opt(args, '--repo')}#{args[2]}")
         if pr is None:

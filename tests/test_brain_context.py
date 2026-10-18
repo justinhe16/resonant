@@ -30,7 +30,7 @@ from resonant.brain.briefing import (
     repo_path,
     since_notes,
 )
-from resonant.config import Settings, load_settings
+from resonant.config import OpsConfig, Settings, load_settings
 from resonant.dashboard.snapshot import HealthRow, build_snapshot
 from resonant.loop import NewTask, SlotPool
 from resonant.models import ChatMessage
@@ -53,7 +53,7 @@ PRINCIPALS = Principals(
 CORE = [s for s in BUILTIN_SPECS if s.name in ("list_runs", "remember", "system_status")]
 # The stable prefix with CORE and no facts. Changing BRAIN_SYSTEM or the prefix layout changes
 # this on purpose: update it in the same change.
-PINNED_PREFIX_HASH = "400f4b81b4865ed1"
+PINNED_PREFIX_HASH = "e652474ed2e54276"
 
 
 @pytest.fixture
@@ -263,8 +263,9 @@ def test_briefing_sections(db: sqlite3.Connection, settings: Settings, tmp_path:
                            runner_missing=[])  # fmt: skip
     assert text.startswith("Resonant ") and ", up 3h 0m." in text
     assert "Dry run is on" in text  # the default
-    assert f"dori: {tmp_path / 'code' / 'dori'} (push, CI)" in text  # NULL path: code_dir/name
-    assert f"site: {tmp_path / 'elsewhere' / 'site'} (fork)" in text
+    # NULL path: code_dir/name; the slug is what the github tools take (BR-9)
+    assert f"dori (own/dori): {tmp_path / 'code' / 'dori'} (push, CI)" in text
+    assert f"site (own/site): {tmp_path / 'elsewhere' / 'site'} (fork)" in text
     assert 'R1 running · dori · "fix the b flaky /b test" · for 12m' in text
     assert "Remote Control https://claude.ai/code/session_abc" in text
     assert "note: running pytest" in text
@@ -396,3 +397,21 @@ def test_since_notes_land_in_the_turn(db: sqlite3.Connection, settings: Settings
     # First contact: no previous message, no notes.
     lone = message(db, "hello", principal=MEMBER)
     assert last_talked(db, MEMBER, before_event_id=lone) is None
+
+
+def test_briefing_lists_resonants_own_checkout(
+    db: sqlite3.Connection, settings: Settings, tmp_path: Path
+) -> None:
+    """BR-9: "status on resonant repo changes" needs Resonant's own checkout in the briefing;
+    a registered repo at that path is marked instead of listed twice."""
+    own = tmp_path / "resonant"
+    own.mkdir()
+    mine = settings.model_copy(update={"ops": OpsConfig(repo_path=own)})
+    started = utcnow() - timedelta(hours=1)
+    text = gather_briefing(db, mine, owner=True, started_at=started, runner_missing=[])
+    assert f"resonant: {own} (Resonant itself)" in text
+    repo_store.add(db, "own/resonant", base="main", source="test", name="res")
+    repo_store.set_path(db, "own/resonant", own)
+    text = gather_briefing(db, mine, owner=True, started_at=started, runner_missing=[])
+    assert f"res (own/resonant): {own} (push, Resonant itself)" in text
+    assert f"resonant: {own}" not in text

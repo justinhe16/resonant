@@ -175,7 +175,9 @@ def test_manifest_passes_every_check() -> None:
     m = load_manifest(EXT / "resonant.yaml")
     assert dir_errors(EXT, m) == [] and name_errors(m) == []
     specs = {s.name: s for s in m.tool_specs() + m.job_specs()}
-    assert set(specs) == {"prs", "pr", "rerun_failed", "merge_pr", "job_watch", "job_digest"}
+    assert set(specs) == {
+        "prs", "pr", "recent_prs", "rerun_failed", "merge_pr", "job_watch", "job_digest"
+    }  # fmt: skip
     for s in specs.values():
         assert s.secrets == ("token",)
         if s.name not in ("rerun_failed", "merge_pr"):
@@ -188,6 +190,7 @@ def test_manifest_passes_every_check() -> None:
     # The approval binds the head SHA: it's a required arg, not something looked up later.
     assert merge.args_schema["required"] == ["head_sha", "number", "repo"]
     assert rerun.args_schema["required"] == ["number", "repo"]
+    assert specs["recent_prs"].args_schema["required"] == ["repo"]  # BR-9
     assert {j.id: j.schedule for j in m.jobs} == {"watch": "*/10 * * * *", "digest": "50 7 * * *"}
     # GH-2: nothing texts on its own; the hourly rollup reads the events, a trust rule can
     # bring a text back for one event type.
@@ -308,6 +311,42 @@ def test_pr_shape(gh: FakeGh) -> None:
     ]
     argv = gh.calls()[0]["argv"]
     assert argv[:5] == ["pr", "view", "40", "--repo", RESONANT]
+
+
+def test_recent_prs_newest_first_any_state(gh: FakeGh) -> None:
+    """BR-9: "most recent PRs?" needs merged PRs and no number (``pr`` guessed #1)."""
+
+    def row(n: int, state: str, merged: str | None = None) -> dict[str, Any]:
+        return {
+            "number": n,
+            "title": f"BR-{n}",
+            "url": f"https://github.com/{RESONANT}/pull/{n}",
+            "state": state,
+            "isDraft": False,
+            "author": {"login": "justinhe16"},
+            "createdAt": "2026-10-18T00:00:00Z",
+            "mergedAt": merged,
+            "closedAt": merged,
+        }
+
+    gh.state["list"] = {
+        RESONANT: [
+            row(103, "MERGED", "2026-10-18T10:00:00Z"),
+            row(105, "OPEN"),
+            row(104, "MERGED", "2026-10-18T12:00:00Z"),
+            {"number": True, "title": "not a PR"},
+        ]
+    }
+    r = gh.run("recent_prs", "--repo", RESONANT)
+    assert r.code == 0, r.err
+    assert [p["number"] for p in r.out["prs"]] == [105, 104, 103]
+    assert r.out["prs"][1]["state"] == "merged" and r.out["prs"][1]["merged_at"]
+    assert r.out["prs"][0]["merged_at"] is None
+    assert "latest merged #104" in r.out["summary"]
+    argv = gh.calls()[0]["argv"]
+    assert argv[:4] == ["pr", "list", "--repo", RESONANT] and "all" in argv
+    bad = gh.run("recent_prs", "--repo", "nope")
+    assert bad.code == 1 and "owner/name" in bad.err
 
 
 def test_pr_bad_args_and_not_found(gh: FakeGh) -> None:
