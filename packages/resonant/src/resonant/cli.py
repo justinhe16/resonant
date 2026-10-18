@@ -1145,6 +1145,70 @@ def eval_router(
     raise typer.Exit(code)
 
 
+@eval_app.command("task")
+def eval_task(
+    set_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--set",
+            help="JSONL set. Default: ~/.resonant/evals/task.jsonl, else evals/task.example.jsonl.",
+        ),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option(help="live: the configured local model. scripted: each case's script (CI)."),
+    ] = "live",
+    mode: Annotated[
+        str, typer.Option(help="loop, intents, or both (runs the set once per mode).")
+    ] = "loop",
+    repeat: Annotated[int, typer.Option(min=1, help="Run the whole set N times.")] = 1,
+    only: Annotated[
+        str | None, typer.Option(help="Only the case with this id, or this category.")
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    min_accuracy: Annotated[
+        float, typer.Option(min=0.0, max=1.0, help="Exit 1 if a mode's accuracy is below this.")
+    ] = 0.85,
+    out: Annotated[
+        Path | None,
+        typer.Option(help="Where the summary JSON goes. Default: ~/.resonant/evals/results/."),
+    ] = None,
+) -> None:
+    """Run each text through the brain in a fresh, hermetic home; grade tools, escalation,
+    asks and facts (docs/brain-plan.md §4).
+
+    Each case gets a temp home with its seeded world: never your state, ~/code or the
+    Keychain. Writes other than notes, reminders and facts are recorded, not run, and
+    ask_claude starts no Claude session. Texts and replies appear only in this command's
+    output; the saved summary refers to cases by id. Exit 1 if a mode's accuracy is below
+    --min-accuracy, a write ran without an approval, or a case timed out; 2 if the set is
+    missing or malformed or an option is bad.
+    """
+    from resonant.evals import task_eval
+
+    if model not in ("live", "scripted"):
+        typer.echo("--model must be 'live' or 'scripted'", err=True)
+        raise typer.Exit(2)
+    modes = {"loop": ["loop"], "intents": ["intents"], "both": ["loop", "intents"]}.get(mode)
+    if modes is None:
+        typer.echo("--mode must be 'loop', 'intents' or 'both'", err=True)
+        raise typer.Exit(2)
+    code = task_eval.run(
+        load_settings(),
+        set_path=set_path,
+        model_kind=model,
+        modes=cast("list[task_eval.Mode]", modes),
+        repeat=repeat,
+        only=only,
+        as_json=as_json,
+        min_accuracy=min_accuracy,
+        out_dir=out,
+        echo=typer.echo,
+        echo_err=lambda s: typer.echo(s, err=True),
+    )
+    raise typer.Exit(code)
+
+
 # --- benchmarks ------------------------------------------------------------------------
 
 bench_app = typer.Typer(no_args_is_help=True, help="End-to-end latency benchmarks.")
@@ -1164,7 +1228,8 @@ def bench_e2e(
 
     Runs in a throwaway home with a fake chat.db and a recording osascript runner, so it
     never texts anyone and is safe next to a live daemon. Exit 1 if a prompt got no reply
-    or a p50 misses its target (fast <= 1s, llm <= 3s); 2 for a bad --model.
+    or a p50 misses its target (fast <= 1s, llm <= 3s, loop <= 5s with brain.mode loop);
+    2 for a bad --model.
     """
     import asyncio
 

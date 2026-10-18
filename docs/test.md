@@ -154,6 +154,8 @@ Numbered L1–L7. `brain.mode` defaults to `intents`; L1 turns the loop on (BR-8
 | # | Test | Where | Status |
 |---|---|---|---|
 | 47 | Router evals on 30–50 real texts (≥ 90%) | go-live 9, [`followups.md`](followups.md#router-evals-on-real-texts-go-live-step-9) | deferred |
+| 53 | Task evals, real model: `resonant eval task --mode both` (BR-6). `[loop]` ≥ 85%, `unapproved 0`; record accuracy, escalation rate and p50/p95 for BR-8 | go-live 9 "Task evals", [`evals/README.md`](../evals/README.md#task-eval) | 🖥 |
+| 54 | `resonant bench e2e --model real --n 20` with the `loop` path: `loop` p50 ≤ 5 s | go-live 9 | 🖥 |
 
 ## Done
 

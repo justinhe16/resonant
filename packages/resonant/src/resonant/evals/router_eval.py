@@ -333,10 +333,12 @@ def with_texts(summary: dict[str, Any], texts: dict[int, str]) -> dict[str, Any]
 # --- saving ----------------------------------------------------------------------------
 
 
-def save_summary(summary: dict[str, Any], directory: Path, *, now: datetime) -> Path:
-    """Write the text-free summary to ``<directory>/<ts>.json`` and return the path."""
+def save_summary(
+    summary: dict[str, Any], directory: Path, *, now: datetime, prefix: str = ""
+) -> Path:
+    """Write the text-free summary to ``<directory>/<prefix><ts>.json`` and return the path."""
     directory.mkdir(parents=True, exist_ok=True)
-    stem = now.strftime("%Y%m%dT%H%M%SZ")
+    stem = prefix + now.strftime("%Y%m%dT%H%M%SZ")
     path = directory / f"{stem}.json"
     k = 1
     while path.exists():
