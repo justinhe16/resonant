@@ -8,9 +8,11 @@ async ``(args) -> dict``, return JSON-serializable dicts, and are fast: database
 indexed and capped. "No data" is an empty result, never an exception. Bad arguments raise
 ``ToolFailed`` (a definite failure the caller can report back).
 
-No tool returns message bodies, task checkpoints/results, or file contents, except the notes and
-reminder tools, which return the owner's own text, and ``recent_logs``, which returns a few
-scrubbed lines of Resonant's own log.
+No tool returns message bodies or task checkpoints/results. File contents come only from the
+read tools (``files``: ``read_file``, ``list_dir``, ``search``, ``tail_log``,
+``read_transcript``), inside the read roots and past the deny list, redacted, and marked
+``untrusted`` (docs/brain-plan.md D5); otherwise only the notes and reminder tools return the
+owner's own text, and ``recent_logs`` a few scrubbed lines of Resonant's own log.
 Output shapes are documented in ``docs/interfaces.md`` ("Built-in tools").
 """
 
@@ -28,6 +30,7 @@ from resonant.tools import (
     commands,
     ext,
     facts,
+    files,
     notes,
     ops,
     projects,
@@ -77,6 +80,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     runs,
     repos,
     trust,
+    files,
     facts,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)

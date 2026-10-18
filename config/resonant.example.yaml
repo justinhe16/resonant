@@ -87,6 +87,16 @@ pulse:
   quiet_hours: "00:00-06:00"            # local time in `timezone`; only urgent items go out inside it
   remention_after: 10m                  # a pending approval is mentioned once more after this (capped at half gate.approval_ttl_s)
 
+# The brain's read tools (docs/brain-plan.md D5; read_file, list_dir, search, tail_log,
+# read_transcript). Defaults shown commented out:
+# brain:
+#   read_roots: null                    # null: runner.code_dir, ~/resonant, ops.repo_path and
+#                                       #   Resonant's logs, docs and run transcripts; a list replaces them
+#   read_deny: []                       # added to the built-in deny list (~/Documents, ~/Library, ~/.ssh,
+#                                       #   ~/.aws, .env*, *.pem, *.key, id_*, credentials, .git/config, ...);
+#                                       #   "/abs" or "~/x" is a path, anything else a glob ("*.secret")
+#   rg_path: /opt/homebrew/bin/rg       # ripgrep for search; missing: a bounded Python search
+
 # Claude workers (docs/employee-plan.md, go-live step 14). Every key has a default except
 # github_app, which runs need (Claude adds it when you give it the IDs). Defaults shown;
 # github_app and repos are examples:

@@ -273,14 +273,16 @@ def _clip(text: str) -> str:
     return text if len(text) <= LOG_LINE_MAX else text[: LOG_LINE_MAX - 1] + "…"
 
 
-def log_line(raw: str) -> str:
-    """One log record as ``15:04:05 warning resonant.daemon: event k=v``, scrubbed, clipped."""
+def log_line(raw: str, *, clean: Callable[[str], str] | None = None) -> str:
+    """One log record as ``15:04:05 warning resonant.daemon: event k=v``, scrubbed, clipped.
+    ``clean`` (``tail_log``'s secret scrub) runs on the whole line before the clip."""
+    clean = clean or (lambda text: text)
     try:
         rec: object = json.loads(raw)
     except ValueError:
         rec = None
     if not isinstance(rec, dict):
-        return _clip(scrub(raw))
+        return _clip(scrub(clean(raw)))
     d = cast(dict[str, Any], rec)
     ts = str(d.pop("timestamp", ""))
     clock = ts[11:19] if len(ts) >= 19 else ts
@@ -291,7 +293,7 @@ def log_line(raw: str) -> str:
     rest = " ".join(
         f"{k}={v if isinstance(v, str) else json.dumps(v, default=str)}" for k, v in d.items()
     )
-    return _clip(scrub(" ".join(p for p in (head, event, rest) if p)))
+    return _clip(scrub(clean(" ".join(p for p in (head, event, rest) if p))))
 
 
 def tail_lines(path: Path, n: int) -> list[str]:
