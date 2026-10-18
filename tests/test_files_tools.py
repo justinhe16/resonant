@@ -152,6 +152,9 @@ def test_symlink_inside_root_followed_but_not_to_denied(root: Path) -> None:
         ".netrc",
         ".git/config",
         "deep/.git/config",
+        "vendored/.ssh/id_x.txt",
+        "infra/prod.tfstate",
+        ".zsh_history",
     ],
 )
 def test_deny_list_names(root: Path, name: str) -> None:
@@ -292,6 +295,44 @@ def test_redaction_in_file_contents(root: Path) -> None:
     assert "4: [redacted]" in content and "5: PASSWORD" in content  # line numbers kept
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "password" + "=hunter2",
+        "password: " + "correcthorsebattery",
+        "{token: " + "abc123def456}",
+        "API_KEY=" + "abcdef123456",
+    ],
+)
+def test_redaction_bare_values(line: str) -> None:
+    assert redact_secrets(line).count("[redacted]") == 1
+
+
+def test_secret_split_by_the_line_clip_is_still_redacted(root: Path) -> None:
+    write(root / "c.txt", "x" * (files.LINE_MAX - 10) + " " + TOKEN + "\n")
+    content = read(scope_for(root), root / "c.txt")["content"]
+    assert TOKEN[:12] not in content and content.endswith("…")
+
+
+async def test_long_lines_stay_fast(root: Path, tmp_path: Path) -> None:
+    import time
+
+    evil = "a." * 100_000 + " mycelium"
+    write(root / "evil.txt", evil + "\n")
+    write(tmp_path / "logs" / "x.log", evil + "\n")
+    write(tmp_path / "logs" / "resonant.jsonl", json.dumps({"event": evil}) + "\n")
+    events = [{"type": "assistant", "message": {"content": [{"type": "text", "text": evil}]}}]
+    write(tmp_path / "t" / "R1.jsonl", json.dumps(events[0]) + "\n")
+    start = time.monotonic()
+    read(scope_for(root), root / "evil.txt")
+    await files.search(scope_for(root), None, {"pattern": "a.a."})
+    files.tail_log(tmp_path / "logs", {"name": "x.log"})
+    files.tail_log(tmp_path / "logs", {})
+    files.read_transcript(tmp_path / "t", {"code": "R1"})
+    assert redact_secrets("a." * 5000) == "a." * 5000
+    assert time.monotonic() - start < 2.0
+
+
 async def test_search_hit_inside_a_key_block(root: Path) -> None:
     body = "x" * 40
     write(
@@ -353,7 +394,6 @@ async def test_search_python_walk(root: Path, outside: Path) -> None:
     assert TOKEN not in hit["text"] and "[redacted]" in hit["text"]
     # literal by default; regex on request; smart case
     assert (await files.search(scope, None, {"pattern": "(a.b)"}))["count"] == 1
-    assert (await files.search(scope, None, {"pattern": "a.b", "regex": True}))["count"] == 1
     assert (await files.search(scope, None, {"pattern": "Mycelium"}))["count"] == 0
     # glob, path to a file, limit
     assert (await files.search(scope, None, {"pattern": "mycelium", "glob": "*.md"}))["count"] == 1
@@ -361,8 +401,8 @@ async def test_search_python_walk(root: Path, outside: Path) -> None:
         scope, None, {"pattern": "line", "path": str(root / "app" / "main.py")}
     )
     assert one["count"] == 20 and one["more"] is True
-    with pytest.raises(ToolFailed, match="valid regular expression"):
-        await files.search(scope, None, {"pattern": "(", "regex": True})
+    with pytest.raises(ToolFailed, match="regex needs ripgrep"):
+        await files.search(scope, None, {"pattern": "(a+)+$", "regex": True})
     with pytest.raises(ToolFailed, match="deny list"):
         await files.search(scope, None, {"pattern": "x", "path": str(root / ".env")})
 

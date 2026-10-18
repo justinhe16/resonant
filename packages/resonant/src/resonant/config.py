@@ -606,6 +606,21 @@ DEFAULT_READ_DENY: tuple[str, ...] = (
     ".npmrc",
     ".pypirc",
     ".git/config",
+    # The same credential dirs anywhere (a copy in a repo, a mounted home).
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".pgpass",
+    ".htpasswd",
+    "*.p8",
+    "*.jks",
+    "*.keystore",
+    "*.tfstate",
+    "*.tfstate.*",
+    "service-account*.json",
+    ".*_history",
 )
 
 

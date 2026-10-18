@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import re
+import stat
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -59,13 +60,17 @@ def clip(text: str, limit: int) -> str:
 
 def read_tail(path: Path, limit: int = TAIL_BYTES) -> list[dict[str, Any]]:
     """The JSON objects in the last ``limit`` bytes of ``path`` (a partial first line is
-    dropped). [] when there is no file. A symlink is never followed."""
+    dropped). [] when there is no file. A symlink is never followed, and anything but a
+    regular file (a FIFO would block) is [] too."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     except OSError:
         return []
     try:
-        size = os.fstat(fd).st_size
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return []
+        size = st.st_size
         start = max(size - limit, 0)
         os.lseek(fd, start, os.SEEK_SET)
         data = b""

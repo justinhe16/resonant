@@ -43,6 +43,7 @@ import asyncio
 import contextlib
 import fcntl
 import fnmatch
+import itertools
 import os
 import re
 import stat
@@ -72,6 +73,8 @@ CONTENT_MAX = 12_000
 SCAN_MAX_BYTES = 8 * 1024 * 1024
 SNIFF_BYTES = 8192
 LIST_MAX = 200
+LIST_SCAN_MAX = 5000
+SCAN_LINE_MAX = 10_000  # the Python search skips longer lines
 SEARCH_DEFAULT = 20
 SEARCH_MAX = 50
 PATTERN_MAX = 200
@@ -79,6 +82,7 @@ GLOB_MAX = 100
 HIT_MAX = 200
 SEARCH_TIMEOUT_S = 10.0
 RG_OUT_MAX_BYTES = 1024 * 1024
+RG_LINE_MAX = 64 * 1024  # one output line; --max-columns keeps hits far shorter
 FILE_MAX_BYTES = 2 * 1024 * 1024  # search skips bigger files
 WALK_MAX_FILES = 20_000
 WALK_MAX_BYTES = 64 * 1024 * 1024
@@ -104,20 +108,29 @@ _SECRET_SCRUBS: tuple[tuple[re.Pattern[str], str], ...] = (
                 r"|lin_api_[A-Za-z0-9]{20,}|sb_secret_[A-Za-z0-9_-]{10,})"), REDACTED),
     (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), REDACTED),
     (re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{12,}"), rf"\1\2{REDACTED}"),
-    (re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^/\s@'\"]+@"), rf"\1{REDACTED}@"),
+    (re.compile(r"(\b[a-z][a-z0-9+.-]{0,31}://)[^/\s@'\"]{1,256}@"), rf"\1{REDACTED}@"),
     # A credential-named key (``GITHUB_TOKEN``, ``"password"``, ``api_key``) with a literal
     # value: quoted, or a bare token with both a letter and a digit. Calls are left alone.
-    (re.compile(r"(?i)\b([A-Za-z0-9_.-]*(?:password|passwd|pwd|secret|secret[_-]?key|token"
+    # Every run is bounded, so a long ``a.a.a.…`` line stays linear.
+    (re.compile(r"(?i)\b([A-Za-z0-9_.-]{0,40}(?:password|passwd|pwd|secret|secret[_-]?key|token"
                 r"|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)[\"']?)"
-                r"(\s*[:=]\s*)(\"[^\"\n]{4,}\"|'[^'\n]{4,}'"
-                r"|(?=[A-Za-z0-9._~+/=-]*[0-9])(?=[A-Za-z0-9._~+/=-]*[A-Za-z])"
-                r"[A-Za-z0-9._~+/=-]{8,}(?=[\s,;]|$))"), rf"\1\2{REDACTED}"),
+                r"(\s*[:=]\s*)(\"[^\"\n]{4,256}\"|'[^'\n]{4,256}'"
+                r"|(?=[A-Za-z0-9._~+/=-]{0,256}[0-9])(?=[A-Za-z0-9._~+/=-]{0,256}[A-Za-z])"
+                r"[A-Za-z0-9._~+/=-]{8,256}(?=[\s,;)}\]\"']|$))"), rf"\1\2{REDACTED}"),
+    # A password or secret with any bare value of 6+ characters (no digit needed).
+    (re.compile(r"(?i)\b([A-Za-z0-9_.-]{0,40}(?:password|passwd|secret)[\"']?)(\s*[:=]\s*)"
+                r"(?![\"']|\[redacted\])[^\s,;)}\]\"'(]{6,256}(?=[\s,;)}\]\"']|$)"),
+     rf"\1\2{REDACTED}"),
 )  # fmt: skip
+
+
+REDACT_SLACK = 256  # text past a clip that is still scanned, so a secret across it is seen
 
 
 def redact_secrets(text: str) -> str:
     """Credential-shaped text replaced by ``[redacted]``. Pattern-based: the read tools
-    don't know the values (``redact.Redactor`` is for known ones)."""
+    don't know the values (``redact.Redactor`` is for known ones). Callers bound the text
+    (``redact_clip``); the patterns are linear but not free."""
     for pattern, repl in _SECRET_SCRUBS:
         text = pattern.sub(repl, text)
     return text
@@ -135,22 +148,32 @@ class LineRedactor:
     def __init__(self) -> None:
         self.in_key = False
 
-    def __call__(self, line: str) -> str:
+    def track(self, line: str) -> bool:
+        """Follow the key-block state; True when ``line`` is inside (or ends) a block."""
         if self.in_key:
             self.in_key = not _KEY_END.search(line)
-            return REDACTED
+            return True
         if _KEY_BEGIN.search(line) and not _KEY_END.search(line):
             self.in_key = True
-        return redact_secrets(line)
+        return False
+
+    def __call__(self, line: str, limit: int) -> str:
+        return REDACTED if self.track(line) else redact_clip(line, limit)
 
 
-def redact_hit(line: str) -> str:
+def redact_hit(line: str, limit: int) -> str:
     """A search hit seen without its neighbours: a bare base64 line may be key material."""
-    return REDACTED if _KEY_BODY.fullmatch(line) else redact_secrets(line)
+    line = line[: limit + REDACT_SLACK]
+    return REDACTED if _KEY_BODY.fullmatch(line) else redact_clip(line, limit)
 
 
 def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def redact_clip(text: str, limit: int) -> str:
+    """Redact (at most ``limit + REDACT_SLACK`` chars of it), then clip to ``limit``."""
+    return _clip(redact_secrets(text[: limit + REDACT_SLACK]), limit)
 
 
 # --- scope -----------------------------------------------------------------------------
@@ -274,15 +297,19 @@ class ReadScope:
         return real
 
     def recheck_fd(self, tool: str, fd: int, given: Path) -> None:
-        """The opened file's path as the kernel sees it must pass too (macOS ``F_GETPATH``)."""
+        """The opened file's path as the kernel sees it must pass too (macOS ``F_GETPATH``,
+        Linux ``/proc/self/fd``; neither: nothing more to check)."""
         getpath = getattr(fcntl, "F_GETPATH", None)
-        if getpath is None:
-            return
         try:
-            raw = fcntl.fcntl(fd, getpath, b"\0" * 1024).split(b"\0", 1)[0]
+            if getpath is not None:
+                raw = fcntl.fcntl(fd, getpath, b"\0" * 1024).split(b"\0", 1)[0]
+                real = os.fsdecode(raw)
+            elif os.path.isdir("/proc/self/fd"):
+                real = os.readlink(f"/proc/self/fd/{fd}")
+            else:
+                return
         except OSError:
             raise ToolFailed(f"{tool}: can't confirm where {given} is") from None
-        real = os.fsdecode(raw)
         if self.denied(real) or not self.inside(real):
             raise ToolFailed(f"{tool}: {given} changed while it was opened")
 
@@ -363,7 +390,8 @@ def _text(
 
 
 def _lines(f: Any, budget: int) -> Iterator[tuple[str, int]]:
-    """``(line, bytes read)`` with long lines cut at ``LINE_MAX`` chars (the rest skipped)."""
+    """``(line, bytes read)``; a long line is cut at ``LINE_MAX * 4 + 4`` bytes (the rest
+    skipped), and the caller clips it to ``LINE_MAX`` chars after redacting."""
     used = 0
     chunk = LINE_MAX * 4 + 4
     while used < budget:
@@ -378,7 +406,7 @@ def _lines(f: Any, budget: int) -> Iterator[tuple[str, int]]:
                 break
             used += len(more)
             cut = not more.endswith(b"\n")
-        yield _clip(raw.decode("utf-8", errors="replace").rstrip("\r\n"), LINE_MAX), used
+        yield raw.decode("utf-8", errors="replace").rstrip("\r\n"), used
 
 
 def read_file(scope: ReadScope, args: Mapping[str, Any]) -> dict[str, Any]:
@@ -400,9 +428,10 @@ def read_file(scope: ReadScope, args: Mapping[str, Any]) -> dict[str, Any]:
         redact = LineRedactor()
         for line, _used in _lines(f, SCAN_MAX_BYTES):
             number += 1
-            text = redact(line)  # every line, so a key block before offset is still seen
             if number < offset:
+                redact.track(line)  # a key block that starts before offset is still seen
                 continue
+            text = redact(line, LINE_MAX)
             if len(out) == limit:
                 more = True
                 break
@@ -453,14 +482,15 @@ def list_dir(scope: ReadScope, args: Mapping[str, Any]) -> dict[str, Any]:
         entries: list[dict[str, Any]] = []
         total = 0
         with os.scandir(fd) as it:
-            for e in sorted(it, key=lambda e: e.name):
+            # A huge directory: only the first LIST_SCAN_MAX entries are sorted and shown.
+            for e in sorted(itertools.islice(it, LIST_SCAN_MAX), key=lambda e: e.name):
                 if scope.denied(real / e.name):
                     continue
                 total += 1
                 if len(entries) >= LIST_MAX:
                     continue
                 kind = _kind(e)
-                item: dict[str, Any] = {"name": redact_secrets(e.name), "type": kind}
+                item: dict[str, Any] = {"name": redact_clip(e.name, 255), "type": kind}
                 if kind == "file":
                     with contextlib.suppress(OSError):
                         item["size"] = e.stat(follow_symlinks=False).st_size
@@ -491,8 +521,8 @@ class _Hits:
 
     def add(self, path: str, line: int, text: str) -> None:
         if not self.full:
-            text = redact_hit(text.rstrip("\r\n")).strip()
-            self.items.append({"path": path, "line": line, "text": _clip(text, HIT_MAX)})
+            text = redact_hit(text.strip(), HIT_MAX)
+            self.items.append({"path": path, "line": line, "text": text})
 
 
 def _matcher(pattern: str, regex: bool) -> re.Pattern[str]:
@@ -509,21 +539,23 @@ def _glob_ok(glob: str | None, rel: str, name: str) -> bool:
     return fnmatch.fnmatch(rel if "/" in glob else name, glob)
 
 
-def _scan_file(path: Path, matcher: re.Pattern[str], hits: _Hits) -> int:
-    """Search one file (no symlink, regular, at most ``FILE_MAX_BYTES``, text); the bytes read."""
+def _scan_file(scope: ReadScope, path: Path, matcher: re.Pattern[str], hits: _Hits) -> int:
+    """Search one file (no symlink, regular, at most ``FILE_MAX_BYTES``, text, still in
+    scope once open); the bytes read. Lines over ``SCAN_LINE_MAX`` chars are skipped."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
         with os.fdopen(fd, "rb") as f:
             st = os.fstat(f.fileno())
             if not stat.S_ISREG(st.st_mode) or st.st_size > FILE_MAX_BYTES:
                 return 0
+            scope.recheck_fd("search", f.fileno(), path)
             data = f.read(FILE_MAX_BYTES)
-    except OSError:
+    except (OSError, ToolFailed):
         return 0
     if is_binary(data[:SNIFF_BYTES]):
         return len(data)
     for number, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), 1):
-        if matcher.search(line):
+        if len(line) <= SCAN_LINE_MAX and matcher.search(line):
             hits.add(str(path), number, line)
             if hits.full:
                 break
@@ -546,7 +578,7 @@ def walk_search(
     read = 0
     for root in roots:
         if not root.is_dir():
-            read += _scan_file(root, matcher, hits)
+            read += _scan_file(scope, root, matcher, hits)
             continue
         stack = [root]
         while stack and not hits.full:
@@ -556,7 +588,7 @@ def walk_search(
             d = stack.pop()
             try:
                 with os.scandir(d) as it:
-                    entries = sorted(it, key=lambda e: e.name)
+                    entries = sorted(itertools.islice(it, LIST_SCAN_MAX), key=lambda e: e.name)
             except OSError:
                 continue
             subdirs: list[Path] = []
@@ -575,7 +607,7 @@ def walk_search(
                     glob, str(path.relative_to(root)), e.name
                 ):
                     files += 1
-                    read += _scan_file(path, matcher, hits)
+                    read += _scan_file(scope, path, matcher, hits)
             stack.extend(reversed(subdirs))
 
 
@@ -620,6 +652,7 @@ async def rg_search(argv: list[str], scope: ReadScope, hits: _Hits) -> None:
         stderr=asyncio.subprocess.DEVNULL,
         env={"PATH": "/usr/bin:/bin"},
         start_new_session=True,
+        limit=RG_LINE_MAX,
     )
     assert proc.stdout is not None
     read = 0
@@ -639,6 +672,8 @@ async def rg_search(argv: list[str], scope: ReadScope, hits: _Hits) -> None:
                     hits.add(path, int(number), text.decode("utf-8", errors="replace"))
     except TimeoutError:
         hits.partial = "the search timed out"
+    except ValueError:  # a line over RG_LINE_MAX (a very long path)
+        hits.partial = "ripgrep printed a line too long to read"
     finally:
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
@@ -684,6 +719,9 @@ async def search(scope: ReadScope, rg: Path | None, args: Mapping[str, Any]) -> 
         except OSError:
             engine = "python"
     if roots and engine != "rg":
+        if regex:
+            # Python's re backtracks: a model-written pattern could pin a thread for good.
+            raise ToolFailed("search: regex needs ripgrep, which isn't installed; search literally")
         engine = "python"
         matcher = _matcher(pattern, regex)
         await asyncio.to_thread(walk_search, scope, roots, matcher, glob, hits)
@@ -729,6 +767,14 @@ def _log_names(logs_dir: Path) -> list[str]:
         return []
 
 
+LOG_RAW_MAX = 64 * 1024  # a longer record is parsed as text, not JSON
+
+
+def _log_clean(text: str) -> str:
+    """``log_line``'s hook: bounded before the scrubs run, so a huge record stays cheap."""
+    return redact_clip(text, LOG_LINE_MAX + REDACT_SLACK)
+
+
 def tail_log(logs_dir: Path, args: Mapping[str, Any]) -> dict[str, Any]:
     tool = "tail_log"
     _known(tool, args, {"name", "n", "contains"})
@@ -758,9 +804,9 @@ def tail_log(logs_dir: Path, args: Mapping[str, Any]) -> dict[str, Any]:
         if not raw.strip():
             continue
         line = (
-            log_line(raw, clean=redact_secrets)
+            log_line(raw[:LOG_RAW_MAX], clean=_log_clean)
             if name.endswith(".jsonl")
-            else _clip(scrub_handles(redact_secrets(raw)), LOG_LINE_MAX)
+            else _clip(scrub_handles(redact_clip(raw, LOG_LINE_MAX + REDACT_SLACK)), LOG_LINE_MAX)
         )
         if needle is not None and needle not in _fold(line):
             continue
@@ -790,7 +836,7 @@ def _blocks(msg: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _said(text: str, limit: int) -> str:
-    return activity.clip(redact_secrets(text), limit)
+    return activity.clip(redact_secrets(text[: limit + REDACT_SLACK]), limit)
 
 
 def _result_text(block: Mapping[str, Any]) -> str:
