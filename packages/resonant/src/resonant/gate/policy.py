@@ -8,19 +8,22 @@ Evaluation order:
    what was shown.
 4. dry_run: a tool that is neither an L0 read nor store-internal
    (``tools.is_store_internal``) becomes ``DryRun(would=<summary>)``.
-5. Level x origin x autonomy (``rule``). ``scheduled`` is never explicit:
+5. Level x origin x autonomy (``rule``). ``scheduled`` is never explicit; ``tainted``
+   (the model chose it after reading untrusted content, docs/brain-plan.md D6) asks for
+   everything above L0:
 
-   | level | autonomy on, explicit | autonomy on, inferred / scheduled | autonomy off |
-   |-------|-----------------------|-----------------------------------|--------------|
-   | L0    | Allow                 | Allow                             | Allow        |
-   | L3    | Allow                 | Allow                             | ask          |
-   | L2    | Allow                 | ask                               | ask          |
-   | L1    | ask with code         | ask with code                     | ask with code|
+   | level | autonomy on, explicit | on, inferred / scheduled | on, tainted   | autonomy off |
+   |-------|-----------------------|--------------------------|---------------|--------------|
+   | L0    | Allow                 | Allow                    | Allow         | Allow        |
+   | L3    | Allow                 | Allow                    | ask           | ask          |
+   | L2    | Allow                 | ask                      | ask           | ask          |
+   | L1    | ask with code         | ask with code            | ask with code | ask with code|
 
 Standing allows (GT-1, ``standing``: ``resonant.trust.tools.StandingAllows``): an owner's
 own ``inferred`` call of an L2 tool that the owner answered ``yes always`` for before (an
 ``allow`` trust rule on ``tool:<name>``) runs as L3. Never for anyone else, never for L1,
-never for ``explicit`` or ``scheduled`` calls (they don't need it, or never get it), and
+never for ``explicit``, ``scheduled`` or ``tainted`` calls (they don't need it, or never get
+it: a tainted call's prompt offers no ``yes always`` either), and
 never under the kill switch or dry run (both are checked first). Its first prompt offers the
 rule: ``(yes always = don't ask before running <tool> in <scope>)``; the scope and action are
 stored on the approval, and ``resolve_reply`` saves exactly that rule in the same
@@ -152,12 +155,13 @@ def no_manifest_approvers(_extension: str) -> Sequence[str]:
 
 def rule(level: Level, origin: Origin, autonomy_on: bool) -> Rule:
     """The D1/D7 table: risk (level) x who chose it (origin) x the kill switch. Only
-    ``explicit`` is consent; ``inferred`` and ``scheduled`` ask before L2."""
+    ``explicit`` is consent; ``inferred`` and ``scheduled`` ask before L2; ``tainted`` asks
+    before L3 too (an L0 read still runs, an L1 still needs its code)."""
     if level is Level.L0:
         return "allow"
     if level is Level.L1:
         return "ask_code"
-    if not autonomy_on:
+    if not autonomy_on or origin == "tainted":
         return "ask"
     if level is Level.L3 or origin == "explicit":
         return "allow"
