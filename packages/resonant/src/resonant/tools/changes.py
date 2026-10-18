@@ -70,6 +70,7 @@ _ENV = {
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_TERMINAL_PROMPT": "0",
     "GIT_OPTIONAL_LOCKS": "0",  # a read never takes the index lock
+    "GIT_NO_REPLACE_OBJECTS": "1",  # refs/replace can't rewrite what a commit says
     "GIT_ASKPASS": "",
 }
 
@@ -91,7 +92,7 @@ RECENT_CHANGES = ToolSpec(
         "additionalProperties": False,
     },
     effect=Effect.READ,
-    timeout_s=GIT_TIMEOUT_S * 3 + 5.0,
+    timeout_s=GIT_TIMEOUT_S * 4 + 5.0,  # four git commands in a row
     untrusted=True,
     grant=GRANT,
 )
@@ -142,9 +143,37 @@ def resolve_checkout(
         only = repos[0]
         label, given = only.slug, str(repo_path(only.name, only.path, code_dir))
     real = scope.check(tool, given)
-    if not (real / ".git").exists():
-        raise ToolFailed(f"{tool}: {given} isn't a git checkout")
+    check_git_dir(scope, real, given)
     return label, real
+
+
+def check_git_dir(scope: ReadScope, real: Path, given: str) -> None:
+    """The checkout's own ``.git`` must hold what git will read, inside the read roots: a real
+    directory (not a ``gitdir:`` file or a symlink), no ``commondir`` (a linked worktree),
+    ``objects`` resolving inside the roots, and every ``objects/info/alternates`` entry too.
+    Otherwise a worker-written ``.git`` could make git show commits from a repo the read
+    tools can't reach. git is then pinned to this dir (``GIT_DIR``, ``GIT_WORK_TREE``)."""
+    tool = RECENT_CHANGES.name
+    gitdir = real / ".git"
+    if gitdir.is_symlink() or not gitdir.is_dir():
+        if gitdir.exists() or gitdir.is_symlink():
+            raise ToolFailed(f"{tool}: {given}'s .git isn't a plain directory (a linked worktree?)")
+        raise ToolFailed(f"{tool}: {given} isn't a git checkout")
+    if (gitdir / "commondir").exists():
+        raise ToolFailed(f"{tool}: {given} is a linked worktree; name its main checkout")
+    objects = gitdir / "objects"
+    scope.check(tool, str(objects))
+    alternates = objects / "info" / "alternates"
+    if alternates.is_symlink():
+        raise ToolFailed(f"{tool}: {given} has a symlinked alternates file")
+    if alternates.exists():
+        try:
+            lines = alternates.read_text(errors="replace").splitlines()[:20]
+        except OSError:
+            raise ToolFailed(f"{tool}: {given}'s alternates can't be read") from None
+        for line in (x.strip() for x in lines):
+            if line and not line.startswith("#"):
+                scope.check(tool, os.path.normpath(objects / line))
 
 
 async def _git(git: Path, cwd: Path, *args: str) -> tuple[int, str]:
@@ -156,7 +185,8 @@ async def _git(git: Path, cwd: Path, *args: str) -> tuple[int, str]:
         *argv,
         *args,
         cwd=cwd,
-        env=_ENV,
+        # Pinned: the checked .git and this checkout, never a core.worktree or discovery.
+        env={**_ENV, "GIT_DIR": str(cwd / ".git"), "GIT_WORK_TREE": str(cwd)},
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,

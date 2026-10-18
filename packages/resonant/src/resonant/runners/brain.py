@@ -226,7 +226,7 @@ GUESS_CHECK = (
 )
 # A PR or issue number counts as read only where it is written as one ("#104", "PR 104",
 # ".../pull/104", a result's "number": 104); a bare digit is everywhere ("slots 0/1").
-_NUMBER_CONTEXT = r'(?:#|\bpr\s*#?|\bpull request\s*#?|/pull/|"number":\s*|\bnumber\s*)'
+_NUMBER_CONTEXT = r'(?:#|\bpr\s*#?|\bpull request\s*#?|/pull/|"number":\s*|"pr":\s*|\bnumber\s*)'
 
 
 def unnamed_target(spec: ToolSpec, args: dict[str, Any], message: str) -> str | None:
@@ -282,8 +282,8 @@ def guessed_arg(spec: ToolSpec, args: dict[str, Any], message: str, seen: str) -
 # A question about live state (BR-9: "status on resonant repo changes", "most recent
 # commits/PRs?") answered with no tool at all gets one corrective round (``LOOKUP_NUDGE``).
 _LIVE_STATE = re.compile(
-    r"\b(?:commits?|changes|changed|changelog|newest|latest|most recent|recent(?:ly)?|"
-    r"merged|status|prs|pull requests)\b",
+    r"\b(?:commits?|changes|changed|changelog|newest|latest|most recent|merged|prs|"
+    r"pull requests)\b",
     re.IGNORECASE,
 )
 LOOKUP_NUDGE = (
@@ -293,6 +293,10 @@ LOOKUP_NUDGE = (
     "system_status), or ask_claude if none fits. If it really needs no lookup, give the "
     "same answer again."
 )
+
+
+# The answer is a question back to the owner (a trailing quote, bracket or emoji allowed).
+_ASKS_BACK = re.compile(r"\?[^\w?]*$")
 
 
 def asks_live_state(message: str) -> bool:
@@ -402,7 +406,8 @@ class _Turn:
     tainted: bool = False
     errors: int = 0
     executed: int = 0  # tool calls run through the gate (their call_index)
-    nudged: bool = False  # the one corrective round was used
+    nudged: bool = False  # the claim corrective round was used
+    looked: bool = False  # the lookup corrective round was used (BR-9)
     text: str = ""  # the owner's message (the target check)
     target_checked: bool = False  # the one target check was used
     guess_checked: bool = False  # the one guessed-identifier check was used
@@ -707,7 +712,10 @@ class BrainRunner(LocalRunner):
                     nudge = self._nudge(answer, st)
                     if nudge is None:
                         return self._answered(answer, st, spans)
-                    st.nudged = True
+                    if nudge[0] == "claim":
+                        st.nudged = True
+                    else:
+                        st.looked = True
                     with spans("runner.brain.nudge", kind=nudge[0]):
                         pass
                     st.messages.append({"role": "assistant", "content": answer})
@@ -757,17 +765,22 @@ class BrainRunner(LocalRunner):
         return out
 
     def _nudge(self, answer: str, st: _Turn) -> tuple[str, str] | None:
-        """The corrective round, once per task: an answer that claims a change while no side
-        effect ran. ``(kind, text)`` or None."""
-        # Once only: a second answer goes out as is, even if it still claims (the code-built
+        """The corrective rounds, each once per task: an answer that claims a change while no
+        side effect ran (``claim``), and a live-state question answered with no tool at all
+        (``lookup``, BR-9). ``(kind, text)`` or None."""
+        # Once each: a second answer goes out as is, even if it still claims (the code-built
         # report lines are the owner's record of what ran).
-        if st.nudged or st.reports:
+        if st.reports:
             return None
-        if claims_change(answer):
+        if not st.nudged and claims_change(answer):
             return ("claim", CLAIM_NUDGE)
-        # No tool at all for a question about live state: look it up (a question back to
-        # the owner is fine as is).
-        if not st.calls and asks_live_state(st.text) and not answer.rstrip().endswith("?"):
+        # A question back to the owner is fine as is.
+        if (
+            not st.looked
+            and not st.calls
+            and asks_live_state(st.text)
+            and not _ASKS_BACK.search(answer)
+        ):
             return ("lookup", LOOKUP_NUDGE)
         return None
 

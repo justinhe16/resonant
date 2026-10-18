@@ -834,3 +834,15 @@ async def test_newest_ones_follow_up_no_guessed_identifiers(
         (unrun,) = _tool_turns(follow[1])
         assert "not run: code=R9" in unrun and "recent_changes" in unrun
         assert '"pr":104' in _tool_turns(follow[2])[-1]
+
+
+async def test_a_lookup_round_doesnt_use_up_the_claim_check(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Review of BR-9: the lookup and claim corrective rounds are separate, so a claim made
+    after a lookup round is still checked."""
+    async with start(resonant_home, chat, tmp_path) as b:
+        b.model.push("Nothing new.", "Done, merged the newest PR.", "I can't merge from here.")
+        assert await b.say("any newest PRs to merge?") == ["I can't merge from here."]
+        kinds = [r.messages[-1]["content"] for r in b.model.requests[1:]]
+        assert kinds == [LOOKUP_NUDGE, CLAIM_NUDGE]

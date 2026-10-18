@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -161,6 +162,49 @@ def test_a_repos_own_config_runs_nothing_and_text_is_redacted(
     out = run(db, world, repo=str(repo))
     assert not marker.exists()
     assert TOKEN not in out["commits"][0]["subject"]
+
+
+def test_the_hardening_is_what_stops_the_repo_config(tmp_path: Path) -> None:
+    """Control for the test above: a plain git with the repo's pager does run it."""
+    repo = make_repo(tmp_path / "plain", ["x"])
+    marker = tmp_path / "ran"
+    hook = tmp_path / "hook.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+    hook.chmod(0o755)
+    git(repo, "config", "core.pager", str(hook))
+    script = f"cd {repo} && {GIT} log -n1"  # stdout is the terminal: git pages
+    subprocess.run(["/usr/bin/script", "-q", "/dev/null", "/bin/sh", "-c", script],
+                   check=False, capture_output=True, timeout=30,
+                   env={"PATH": "/usr/bin:/bin", "HOME": str(repo), "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_CONFIG_GLOBAL": "/dev/null", "TERM": "dumb"})  # fmt: skip
+    assert marker.exists()
+
+
+@pytest.mark.parametrize("how", ["gitfile", "symlink", "commondir", "alternates", "objects"])
+def test_a_dot_git_pointing_outside_the_roots_is_refused(
+    db: sqlite3.Connection, world: tuple[Settings, ReadScope, Path], tmp_path: Path, how: str
+) -> None:
+    """A worker-written .git can't make git read a repo the read tools can't reach (review
+    of BR-9): a gitdir file, a symlinked .git, a linked worktree, alternates or objects."""
+    outside = make_repo(tmp_path / "outside", ["secret subject"])
+    repo = make_repo(tmp_path / "code" / "victim", ["fine"])
+    dot = repo / ".git"
+    if how in ("gitfile", "symlink"):
+        shutil.rmtree(dot)
+        if how == "gitfile":
+            dot.write_text(f"gitdir: {outside / '.git'}\n")
+        else:
+            dot.symlink_to(outside / ".git")
+    elif how == "commondir":
+        (dot / "commondir").write_text(str(outside / ".git"))
+    elif how == "alternates":
+        (dot / "objects" / "info" / "alternates").write_text(f"{outside / '.git' / 'objects'}\n")
+    else:
+        shutil.rmtree(dot / "objects")
+        (dot / "objects").symlink_to(outside / ".git" / "objects")
+    with pytest.raises(ToolFailed) as e:
+        run(db, world, repo=str(repo))
+    assert "secret" not in str(e.value)
 
 
 def test_parse_log_skips_malformed_lines() -> None:

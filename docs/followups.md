@@ -432,8 +432,9 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 *Noted 2026-10-18 from BR-9 ([`brain-plan.md`](brain-plan.md#br-9-what-changed-lately-2026-10-18)).*
 
 - **The checkout can lag GitHub.** `recent_changes` never fetches, so on a checkout nobody pulls it shows what was last fetched (`behind` and `fetched_at` say so). `recent_prs` is GitHub's own view, once the extension is updated. A periodic `git fetch` of registered checkouts would close the gap; it isn't done because it writes to the owner's checkouts.
-- **`asks_live_state` is a word list.** It catches commits, PRs, changes, newest, latest, recent, merged, status. A live-state question in other words ("anything new on resonant?") answered with no tool isn't sent back. Widen it from real misses, not guesses: a broad list costs a round on small talk.
+- **`asks_live_state` is a word list.** It catches commits, PRs, changes, newest, latest, merged ("status" and "recent" were dropped in review: too common in small talk). A live-state question in other words ("anything new on resonant?", "status of R4") answered with no tool isn't sent back. Widen it from real misses, not guesses: a broad list costs a round on small talk.
 - **The guess check fires once per task.** A second guess in the same task runs (as the target check). The model can still guess an identifier the briefing happens to contain (a run code from the briefing is a real one; that's the point).
+- **`recent_changes` checks `.git` itself, not every object file.** A plain `.git` dir, no `commondir`, `objects` and alternates inside the roots. A worker could still symlink single loose objects from another repo into a checkout; that needs write access it could use to read that repo directly anyway.
 
 ## BR-8 carry-overs: the cut-over
 

@@ -195,6 +195,9 @@ BRIEFING = "Claude slots 0/1 in use.\nRuns:\n- R3 running · dori"
         (PR, {"repo": "jhe/resonant", "number": 12}, "and its CI?",
          "PR #12 https://github.com/own/dori/pull/12", None),
         (PR, {"repo": "jhe/resonant", "number": 12}, "and its CI?", "up 12m, R12", "number=12"),
+        # recent_changes gives "pr":104 even when a long subject lost its "(#104)" to the clip
+        (PR, {"repo": "jhe/resonant", "number": 104}, "is it green?",
+         '{"commits":[{"pr":104,"subject":"BR-8: a very long subject…"}]}', None),
         (TRANSCRIPT, {"code": "R3"}, "what's it doing", BRIEFING, None),  # from the briefing
         (TRANSCRIPT, {"code": "R9"}, "what's it doing", BRIEFING, "code=R9"),
         (TRANSCRIPT, {"code": "R3"}, "show r3", "", None),
@@ -217,6 +220,8 @@ def test_guessed_arg(
         ("what's the latest on the dori PRs", True),
         ("anything merged today?", True),
         ("thanks!", False),
+        ("set my status to away", False),
+        ("I recently moved, what's a good mover", False),
         ("what's the capital of australia", False),
         ("where is mycelium?", False),
         ("what's R1 doing?", False),

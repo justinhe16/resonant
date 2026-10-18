@@ -1,6 +1,6 @@
 # Brain plan (Phase 6a): a general agent loop on the local model
 
-Status: **built** (2026-10-18): BR-1, BR-1b, BR-2, BR-4, BR-5, BR-6, BR-7 and BR-8 (§2, §6). `brain.mode: loop` is the default since BR-8 (the live loop scores 91.0% on the example set over 3 runs, BR-1b's 92.3% within noise, over the 85% bar); `intents` stays as an opt-in and as the loop's per-turn fallback. The owner's own eval set is still to run (followups). Built with robot-surf in the waves of §5.
+Status: **built** (2026-10-18): BR-1, BR-1b, BR-2, BR-4, BR-5, BR-6, BR-7, BR-8 and BR-9 (§2, §6). `brain.mode: loop` is the default since BR-8 (the live loop scores 91.0% on the example set over 3 runs, BR-1b's 92.3% within noise, over the 85% bar); `intents` stays as an opt-in and as the loop's per-turn fallback. The owner's own eval set is still to run (followups). Built with robot-surf in the waves of §5.
 
 Texting Resonant should feel like texting Claude: general questions and conversation, looking around the Mini read-only, Resonant's own tools (still gated), extensions, other programs, Claude workers with Remote Control. Today every non-slash text is one intent label (`router/labeler.py`) → that intent's fixed toolset (`router/intents.py` `INTENT_TOOLS`) → `runners/local.py` capped at 3 model calls and 3 tool calls → a number guard that swaps the reply for a template. History is 5 earlier messages as user turns, nothing reads files or logs (`tools/builtin.py`), and nothing escalates (`escalate=True` is written and never read). "Where is mycelium?" had no route, so it failed.
 
@@ -63,6 +63,21 @@ Group chats; a generic "run any program" tool (programs are extensions); writes 
 4. Wave 4: **BR-8 Cut-over** (built, §6): default `loop` once the evals pass, docs (architecture, interfaces, go-live), drop unused intent few-shots, the architecture artifact.
 
 ## 6. As built
+
+### BR-9: what changed lately (2026-10-18)
+
+Live failure on the cut-over: "Status on resonant repo changes" was answered with no tool call; "Most recent commits/PRs?" called the github `pr` tool with `number: 1` (no tool listed recent PRs: `prs` is open-only, `pr` needs a number) and reported PR #1 as the latest while main had #104; "I think that's an old one! … Need the newest ones" fumbled through five tools without an answer. The running summary also said the github and claude secrets weren't configured (they were), against the live briefing. Carry-overs in [`followups.md`](followups.md#br-9-carry-overs-what-changed-lately).
+
+- **`recent_changes{repo?, limit?}`** (`tools/changes.py`, L0, core): `git log` of a checkout, never a fetch, newest first with the PR number from squash or merge subjects, plus ahead/behind the upstream as of the last fetch. `repo` is a registered repo, `resonant` (Resonant itself, `ops.repo_path`) or a path; default Resonant itself. The path and its `.git` (a plain directory, no `commondir`, `objects` and alternates inside the roots) pass the read scope; git runs pinned to that `.git` with no system or global config and `-c` overrides, so nothing a worker writes in a repo's config runs. Untrusted (taints).
+- **github `recent_prs{repo}`**: the newest 15 PRs in a repo, any state. Reaches the Mini with `resonant ext update github`.
+- **Guess check** (`guessed_arg`, once per task): a read whose identifier appears nowhere the model could have read it goes back unrun ("list them first, or ask_claude"). A `number` counts only written as one (`#104`, `PR 104`, `"number":104`, `"pr":104`), since a bare digit is everywhere in the briefing.
+- **Lookup round** (`asks_live_state`, once per task, separate from the claim round): a question about commits, PRs, changes, newest, latest or merged answered with no tool goes back once (`LOOKUP_NUDGE`); a question back passes.
+- **Prompt**: one bullet on repo-history questions (the two tools, `prs` is open-only, earlier replies may be stale, never guess a PR number or run code). A general "never make up an argument; list first or ask Claude" bullet was tried and **dropped**: "where is mycelium?" went from 8/8 to 3/8 (the model listed the dir instead of answering from the briefing). The code-side guess check covers it.
+- **Briefing**: repo lines carry the `owner/name` slug, and Resonant's own checkout is listed.
+- **Summaries**: the fold keeps no claims about state that changes (setup, secrets, health, errors, what's running, latest commits or PRs); the summary turn and the system prompt say the briefing and tool results win. Migration 017 deletes the summaries once, so the stale one is rebuilt under the new rules.
+- **Evals**: `mini-repo-status`, `mini-recent-commits`, `follow-newest-prs` (55 rows); `repos[].commits` seeds a real history; the github fixture has `recent_prs`. Scripted: 55/55.
+
+BR9_EVAL_TABLE
 
 ### BR-8: cut-over (2026-10-18)
 
