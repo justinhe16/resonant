@@ -242,8 +242,8 @@ def test_brain_tool_sets_name_registered_builtins(db: sqlite3.Connection) -> Non
     assert builtins >= CORE_TOOLS | TAINTING_BUILTINS | NOT_IN_BRAIN
 
 
-def test_intents_is_the_default_mode() -> None:
-    assert load_settings().brain.mode == "intents"
+def test_loop_is_the_default_mode() -> None:
+    assert load_settings().brain.mode == "loop"  # BR-8; intents stays as an opt-in
 
 
 async def test_intents_mode_labels_and_runs_locally(

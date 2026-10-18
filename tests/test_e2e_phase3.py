@@ -461,6 +461,7 @@ def gh_settings(home: Path, chat: FakeChatDB, bin_dir: Path, state: Path) -> Set
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
+        brain={"mode": "intents"},  # the labeler routes to extension:github (loop is the default)
     )  # the default extensions.process.path: gh is reached only by its pinned path
 
 

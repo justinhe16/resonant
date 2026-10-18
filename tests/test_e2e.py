@@ -106,6 +106,7 @@ async def running(resonant_home: Path, chat: FakeChatDB) -> AsyncIterator[Runnin
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
+        brain={"mode": "intents"},  # these tests script the labeler (loop is the default)
     )
     osa, model = RecordingOsaRunner(), ScriptedModel()
     daemon = Daemon(settings, model=model, osa_runner=osa)

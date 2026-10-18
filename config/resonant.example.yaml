@@ -90,9 +90,9 @@ pulse:
 # The brain's read tools (docs/brain-plan.md D5; read_file, list_dir, search, tail_log,
 # read_transcript) and ask_claude (D8). Defaults shown commented out:
 # brain:
-#   mode: intents                       # loop: every chat message goes to the brain loop (BR-1:
-#                                       #   core tools, load_tools, ask_claude, taint) instead of
-#                                       #   the labeler and one intent's tools
+#   mode: loop                          # default since BR-8: every chat message goes to the brain
+#                                       #   loop (core tools plus stubs, ask_claude, taint); intents:
+#                                       #   the labeler and one intent's fixed tools instead
 #   read_roots: null                    # null: runner.code_dir, ~/resonant, ops.repo_path and
 #                                       #   Resonant's logs, docs and run transcripts; a list replaces them
 #   read_deny: []                       # added to the built-in deny list (~/Documents, ~/Library, ~/.ssh,

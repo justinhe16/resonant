@@ -212,6 +212,7 @@ def build_daemon(
     """A daemon with iMessage on, fakes for osascript, the model and ops subprocesses."""
     (home / "principals.yaml").write_text(PRINCIPALS)
     port = free_port()
+    overrides.setdefault("brain", {"mode": "intents"})  # scripted labels (loop is the default)
     settings = load_settings(
         dry_run=dry_run,
         api={"port": port},

@@ -77,7 +77,7 @@ The owner texts Resonant like an employee ([`employee-plan.md`](employee-plan.md
 | Mini go-live checklist, `scripts/bootstrap.sh --check` | `docs/go-live.md`, `scripts/` | Phase 1 ✅ |
 | Slack notifier | — | Not in core (no Slack in core; extensions own Slack) |
 | Router evals: `resonant eval router` (production `classify`, accuracy, confusion, p50/p95 per path; texts only in terminal output) | `resonant/evals/`, `evals/README.md` | Phase 1 ✅ |
-| Task evals: `resonant eval task` (BR-6): each text through the real brain loop (or the intents path) in a fresh hermetic home with a seeded world; graded on tools, escalation, asks, unapproved writes and facts; ≥ 85% is BR-8's cut-over bar | `resonant/evals/task_eval.py`, `evals/task.example.jsonl`, `evals/README.md` | BR-6 ✅ |
+| Task evals: `resonant eval task` (BR-6): each text through the real brain loop (or the intents path) in a fresh hermetic home with a seeded world; graded on tools, escalation, asks, unapproved writes and facts; ≥ 85% was BR-8's cut-over bar (the loop: 92.3% on the example set, live) | `resonant/evals/task_eval.py`, `evals/task.example.jsonl`, `evals/README.md` | BR-6 ✅ |
 | Policy gate: risk × origin (`Intent.origin`), kill switch read on every call, dry_run exemption for store-internal builtins, approval expiry and single use; executor `recorded()` | `resonant/gate/policy.py`, `resonant/executor.py` | Phase 2 ✅ |
 | Approvals: store and migration 003, deterministic reply parser, binding (sent-before, per-event idempotency, orphan expiry), router approval inbox, `request_approval`, `/approvals`, `resonant approvals list\|show\|approve\|deny` | `resonant/store/approvals.py`, `resonant/gate/replies.py`, `resonant/router/approvals.py`, `resonant/cli.py` | Phase 2 ✅ |
 | Local runner: `direct_call` (explicit), Wait/resume on approval, execute once, code-built reports, one gated side effect per task | `resonant/runners/local.py` | Phase 2 ✅ |
@@ -120,7 +120,7 @@ The owner texts Resonant like an employee ([`employee-plan.md`](employee-plan.md
 | MCP servers as extension tools over stdio (MCP-1, Phase 4): `mcp.servers` in the manifest with typed tools, a minimal JSON-RPC client (not the `mcp` SDK), the command pinned at install, tools pinned by `ext add` and shown as escalations, schema text stripped and annotations ignored, re-checks at start and on `list_changed` (disable and alert once), secrets on fd 4 (the union of the server's tools'), process group ended on stop and `/kill`, caps and timeouts | `resonant/extensions/mcp.py`, `host.py`, `manager.py`, `checks.py`, `process.py` (`spawn_stdio`), `resonant_sdk/manifest.py`, `resonant/store/extensions.py` (migration 012) | MCP-1 ✅ |
 | MCP servers over streamable HTTP (MCP-2, Phase 4): `transport: http` with a fixed https `url` and `auth: bearer` from a declared Keychain secret (sent only to that URL; redirects refused, env proxies ignored), the same pins, drift handling, schema stripping and argument checks as stdio, JSON and SSE answers, `Mcp-Session-Id` and a GET stream for `list_changed`, 1 MB/4 MB caps, `/kill` ends sessions through a `ProcessTracker` hook; `ext add` asks before sending the token. Example: `extensions/linear` (Linear's hosted server, reads L0, writes L2) | `resonant/extensions/mcp_http.py`, `mcp.py`, `manager.py`, `extensions/linear/` | MCP-2 ✅ |
 | Brain context and memory (BR-4, migration 015; the brain loop BR-1 uses it): the prompt in cache order (fixed system prompt, core tools, deferred-tool catalog and facts index as the stable prefix, then the rolling history, then one last turn with the briefing, "since we last talked" notes, the time and the message); the briefing from the local-tier dashboard snapshot, `collect_status` and repo paths, about 1.5k tokens with "+N more"; the last ~10 exchanges as real turns and older ones folded into a running summary per principal (one cheap model call per batch, off the reply path, code-built fallback); long-term facts as `~/.resonant/brain/facts/<name>.md` with `remember`/`forget` (L3, owner only, reported) and `list_facts`; a CI test pins the prefix hash | `resonant/brain/`, `resonant/store/brain.py`, `resonant/tools/facts.py` | BR-4 ✅ |
-| Brain loop (BR-1, `brain.mode: loop`; default `intents` until the evals): every non-fast-path chat message goes to one loop on the local model instead of the labeler: ~17 core tools with their schemas and every other tool the principal may use as a one-line stub (exact name, slim schema; BR-1b), native tool-call turns, at most 8 rounds, the local runner's gate, pinning, approvals and report lines; a task that read outside content (files, logs, transcripts, extensions, `ask_claude`) is `tainted` and every later write asks; stuck turns escalate to `ask_claude`, a down model falls back to the intents path; `On it…` after 6 s; the history fold after the reply | `resonant/runners/brain.py` | BR-1 ✅ |
+| Brain loop (BR-1, `brain.mode: loop`, the default since BR-8; `intents` is the opt-in fallback): every non-fast-path chat message goes to one loop on the local model instead of the labeler: ~17 core tools with their schemas and every other tool the principal may use as a one-line stub (exact name, slim schema; BR-1b), native tool-call turns, at most 8 rounds, the local runner's gate, pinning, approvals and report lines; a task that read outside content (files, logs, transcripts, extensions, `ask_claude`) is `tainted` and every later write asks; stuck turns escalate to `ask_claude`, a down model falls back to the intents path; `On it…` after 6 s; the history fold after the reply | `resonant/runners/brain.py` | BR-1 ✅, default BR-8 ✅ |
 | Media, links, watches, proactive (BR-7, migration 016): the chat.db reader attaches the owner's images, PDFs and voice notes (types, 20 MB and 4 per message capped; files never opened there); `runner="media"` hands an image or PDF to `ask_claude` (kind image, a code-built direct call; HEIC converted to JPEG with `sips` in the ask's folder) and a voice note to a local whisper (`brain.whisper_path`; the transcript re-enters routing as text and never approves anything), else says voice needs whisper (Claude takes no audio); links: a prompt rule sends them to `ask_claude` kind link; watches: `create_watch` (L2: asks), `list_watches`, `cancel_watch`, checked by `core/watches` every 5 minutes through `runner="watch"` (a read tool through the gate with origin `scheduled`, or a yes/no `ask_claude`), at most 10 active, every ≥15 min (asks ≥60), 7 days by default; a hit is one notice through the pulse, at most `brain.proactive_per_day` (3) texts a day on top of the hourly cap, the rest wait for the pulse or the briefing | `resonant/gateway/imessage/attachments.py`, `resonant/runners/media.py`, `convert.py`, `watch.py`, `ask.py`, `resonant/brain/watches.py`, `notices.py`, `context.py`, `resonant/tools/watches.py` | BR-7 ✅ |
 | Critical-job LaunchAgents and `job-guard` rewrite, veto windows, the Seatbelt sandbox for extension processes, iMessage `/ext add`, git and network sources, Python deps | — | Deferred ([`followups.md`](followups.md)) |
 | Two-way Slack | — | Phase 5b |
@@ -129,16 +129,10 @@ The owner texts Resonant like an employee ([`employee-plan.md`](employee-plan.md
 
 ## Phase 1 request path and latency
 
+The default since BR-8 is `brain.mode: loop` (BR-1, [`brain-plan.md`](brain-plan.md)): after the fast path every chat message goes to the brain loop.
+
 ```
 chat.db row ─(WAL watch 250ms + 100ms debounce; 2s poll fallback)─> IMessageReader ─> loop.submit
-  ─> Router.route: fast path (one gated builtin read, templated reply)  │ or one LLM label call
-  ─> NewTask(runner="local") ─> LocalRunner: send fast_reply │ ≤3 tool calls (gate → executor) + answer
-  ─> IMessageChannel.send (dedupe "reply:<task id>") ─> osascript
-```
-
-With `brain.mode: loop` (BR-1, [`brain-plan.md`](brain-plan.md)) the labeled path becomes the brain loop:
-
-```
   ─> Router.route: fast path │ approval reply │ relay (R4 …, a reply to an open worker question)
   ─> NewTask(runner="brain") ─> BrainRunner: build_context (system, core tools + stubs, facts,
        history, briefing + message) ─> ≤8 chat_tools rounds: reads run, writes gate (tainted
@@ -147,6 +141,14 @@ With `brain.mode: loop` (BR-1, [`brain-plan.md`](brain-plan.md)) the labeled pat
        ("Looking into it…", the answer comes later from runner="ask")
        │ stuck → ask_claude │ model down → labeler + LocalRunner for this turn
   ─> IMessageChannel.send ("On it…" first past 6 s) ─> history fold in the background
+```
+
+With `brain.mode: intents` (opt-in; also the brain's fallback for one turn when the model is down or answers badly twice) chat takes the Phase 1 labeled path:
+
+```
+  ─> Router.route: fast path (one gated builtin read, templated reply)  │ or one LLM label call
+  ─> NewTask(runner="local") ─> LocalRunner: send fast_reply │ ≤3 tool calls (gate → executor) + answer
+  ─> IMessageChannel.send (dedupe "reply:<task id>") ─> osascript
 ```
 
 An owner's message with attachments (BR-7) takes its own path in either mode, right after the slash commands:
@@ -167,6 +169,8 @@ The Phase 1 exit criterion is **text → answer in 2–3s**: p50 ≤ 1s on the f
 `resonant model bench` on the same run: label p50 / p95 86 / 89 ms, single tool call 229 / 232 ms, 0/20 failures.
 
 With the scripted model nearly all of the time is the reader's WAL-watch interval plus its debounce, so the harness overhead is about 0.35s; on the Mini the labeled path adds the label call, up to three tool rounds, and the answer call.
+
+The brain loop (the default since BR-8) is measured by the task eval rather than this table: on the Mini, live qwen3, its turns run p50 about 1.6 s and p95 about 3.9 s (chat.db insert to the first reply in the eval's in-process stack, `--repeat 3` on `evals/task.example.jsonl`, [`brain-plan.md`](brain-plan.md#br-8-cut-over-2026-10-18)); `resonant bench e2e --model real` has a `loop` path (target p50 ≤ 5 s) for the whole text-to-osascript time. **Cold prompt:** a first turn is about 5.2k prompt tokens (system, core tools and stubs, briefing). Ollama keeps one KV slot, so after anything else used the model (a history fold, a pulse or briefing call, `resonant eval`, a restart) the next turn pays the whole prefill again: about **4.3 s** on the Mini, against about 0.05 s when the prefix is cached. That turn crosses no `On it…` threshold (6 s) on its own, but a cold first turn plus two tool rounds can. Options if it shows in real use are in [`followups.md`](followups.md#br-1b-carry-overs-the-loop-on-the-live-model).
 
 ## Task lifecycle
 
