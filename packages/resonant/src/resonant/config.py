@@ -627,6 +627,32 @@ class AskClaudeConfig(_Section):
     def _expand_roots(cls, v: list[Path]) -> list[Path]:
         return [_absolute(p.expanduser(), "brain.ask_claude.attachment_roots") for p in v]
 
+    @field_validator("connector_tools")
+    @classmethod
+    def _connector_names(
+        cls, v: dict[Literal["email", "calendar"], list[str]]
+    ) -> dict[Literal["email", "calendar"], list[str]]:
+        for tools in v.values():
+            _mcp_names(tools)
+        return v
+
+    @field_validator("draft_tools")
+    @classmethod
+    def _draft_names(cls, v: list[str]) -> list[str]:
+        return _mcp_names(v)
+
+
+# A connector tool name as Claude Code lists it: mcp__<server>__<snake_case tool>. Anything
+# else (camelCase, dashes) is refused at load rather than guessed at by the write filter.
+_MCP_TOOL = re.compile(r"mcp__[A-Za-z0-9_]+__[a-z][a-z0-9_]*")
+
+
+def _mcp_names(tools: list[str]) -> list[str]:
+    for t in tools:
+        if not _MCP_TOOL.fullmatch(t):
+            raise ValueError(f"{t!r} isn't a connector tool name (mcp__<server>__<snake_case>)")
+    return tools
+
 
 def _read_roots() -> list[Path]:
     return [Path("~/code"), Path("~/resonant")]
@@ -656,7 +682,7 @@ class BrainConfig(_Section):
     # Never read, even inside a root. An entry with a ``/`` (``~/.ssh``) is a path: it and
     # everything under it. One without (``.env*``) is a file-name glob, matched anywhere.
     read_deny: list[str] = Field(default_factory=_read_deny)
-    ask_claude: AskClaudeConfig = AskClaudeConfig()
+    ask_claude: AskClaudeConfig = Field(default_factory=AskClaudeConfig)
 
     @field_validator("read_roots")
     @classmethod
@@ -717,7 +743,7 @@ class Settings(BaseSettings):
     pulse: PulseConfig = PulseConfig()
     runner: RunnerConfig = RunnerConfig()
     trust: TrustConfig = TrustConfig()
-    brain: BrainConfig = BrainConfig()
+    brain: BrainConfig = Field(default_factory=BrainConfig)
 
     @field_validator("home")
     @classmethod

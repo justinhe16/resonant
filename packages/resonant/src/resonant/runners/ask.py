@@ -11,14 +11,15 @@ The session::
         --no-session-persistence --output-format stream-json --verbose --max-turns 15
         --append-system-prompt <the ask prompt>        (the question on stdin)
 
-- **Read only by construction.** ``--restricted`` drops every built-in that runs code and
-  ignores the owner's settings files (so no ``allow`` rule of theirs widens it), and confines
-  the file tools to the cwd (an empty per-ask dir under ``runner.work_dir/.ask``) and the
-  ``--add-dir`` roots (``config.brain_read_roots``). ``dontAsk`` denies every tool not on
-  ``--allowedTools``. The allowlist is the five read built-ins plus, for ``email`` and
-  ``calendar`` asks only, the connector read tools in ``brain.ask_claude.connector_tools``
-  (and ``draft_tools`` for email); a name that reads as a write (:func:`is_write_tool`) is
-  never on it, whatever the config says. ``brain.read_deny`` becomes ``Read(...)`` deny rules.
+- **Read only by construction** (an email ask's draft tool aside: a draft, never a send).
+  ``--restricted`` drops every built-in that runs code and ignores the owner's settings files
+  (so no ``allow`` rule of theirs widens it), and confines the file tools to the cwd (an empty
+  per-ask dir under ``runner.work_dir/.ask``) and the ``--add-dir`` roots
+  (``config.brain_read_roots``). ``dontAsk`` denies every tool not on ``--allowedTools``. The
+  allowlist is the five read built-ins plus, for ``email`` and ``calendar`` asks only, the
+  connector read tools in ``brain.ask_claude.connector_tools`` (and ``draft_tools`` for
+  email); a name that reads as a write (:func:`is_write_tool`) is never on it, whatever the
+  config says. ``brain.read_deny`` becomes ``Read(...)`` deny rules.
 - **The init event is checked.** Its ``tools`` must hold every read built-in and every
   connector read tool the kind needs, else the session is killed at once and the ask refused
   with the missing names (:func:`check_init`). Probed on 2.1.302: with ``--restricted`` the
@@ -48,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import fnmatch
 import json
 import logging
@@ -113,15 +115,40 @@ PREFIX = "Claude: "
 LOOKING = "Looking into it…"
 PROPOSED = "Proposed:"
 
-# A connector tool whose own name (after the last ``__``) has one of these words reads as a
-# write. Never allowed, whatever the config lists.
-_WRITE_WORDS = (
-    "send|create|update|delete|remove|respond|reply|forward|modify|move|trash|archive|label|"
-    "insert|patch|write|edit|share|upload|accept|decline|cancel|set|add|import|batch|mark|"
-    "unsubscribe|rsvp|schedule|invite|post|put|copy|rename|clear|empty|draft|drafts"
+# A connector tool whose own name (after the last ``__``) has one of these words, or a word
+# starting with one of the stems, reads as a write. Never allowed, whatever the config lists.
+# Words are split on anything but letters and digits and at camelCase humps, so
+# ``send_message``, ``sendMessage``, ``send-message`` and ``sendmessage`` all read as sends.
+_WRITE_WORDS = frozenset(
+    [
+        "label",
+        "insert",
+        "patch",
+        "share",
+        "accept",
+        "decline",
+        "set",
+        "add",
+        "import",
+        "batch",
+        "mark",
+        "unsubscribe",
+        "schedule",
+        "post",
+        "put",
+        "copy",
+        "rename",
+        "clear",
+        "empty",
+        "move",
+    ]
 )
-_WRITE = re.compile(rf"(?<![^_])(?:{_WRITE_WORDS})(?![^_])", re.IGNORECASE)
-_DRAFT_OK = re.compile(r"(?<![^_])(?:create|drafts?)(?![^_])", re.IGNORECASE)
+_WRITE_STEMS = (
+    "send", "creat", "updat", "delet", "remov", "respond", "repl", "forward", "modif", "trash",
+    "archiv", "writ", "edit", "upload", "cancel", "rsvp", "invit", "draft",
+)  # fmt: skip
+_HUMP = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_DRAFT_ONLY = re.compile(r"(?:create)?drafts?")
 
 ASK_PROMPT = (
     "You answer one question for the owner of this Mac, sent by text message through "
@@ -169,19 +196,22 @@ def _own_name(tool: str) -> str:
     return tool.rsplit("__", 1)[-1]
 
 
+def _words(name: str) -> list[str]:
+    return [w.lower() for w in re.split(r"[^A-Za-z0-9]+", _HUMP.sub("_", name)) if w]
+
+
 def is_write_tool(tool: str) -> bool:
     """Whether a connector tool's name reads as a write (send, create, update, delete,
-    respond, a draft, ...). Built-ins are judged by name too; none of ours match."""
-    return _WRITE.search(_own_name(tool)) is not None
+    respond, a draft, ...), whatever its naming style. Built-ins are judged by name too;
+    none of ours match."""
+    return any(w in _WRITE_WORDS or w.startswith(_WRITE_STEMS) for w in _words(_own_name(tool)))
 
 
 def is_draft_tool(tool: str) -> bool:
-    """A tool that only writes a draft (``create_draft``): ``draft`` in its name and no write
-    word but ``create``. ``send_draft``, ``delete_draft`` and ``update_draft`` are not."""
-    own = _own_name(tool)
-    if "draft" not in own.lower():
-        return False
-    return _WRITE.search(_DRAFT_OK.sub("_", own)) is None
+    """A tool that only writes a draft: its own name is ``create_draft`` or ``drafts`` in any
+    style and nothing else. ``send_draft``, ``delete_draft`` and ``create_draft_reply`` are
+    not."""
+    return _DRAFT_ONLY.fullmatch("".join(_words(_own_name(tool)))) is not None
 
 
 @dataclass(frozen=True)
@@ -222,6 +252,7 @@ def check_init(tools: Sequence[str], ts: Toolset, kind: Kind) -> str | None:
     present = set(tools)
     bad = [t for t in ts.allowed if t in present and is_write_tool(t) and not is_draft_tool(t)]
     if bad:  # can't happen through ``toolset``; a seam bug must not run
+        log.error("ask: a write tool was on the allowlist", extra={"tools": bad[:8]})
         return FAILED.format(why="a write tool was allowed")
     missing = [t for t in ts.required if t not in present]
     if not missing:
@@ -303,12 +334,13 @@ def answer_text(text: str, redactor: Redactor, limit: int) -> str:
     """Claude's answer as the requester sees it: redacted, normalised, control, bidi and
     zero-width characters dropped (newlines kept, at most one blank line), approval-code
     look-alikes masked, clipped, after the code-built ``Claude:`` prefix."""
-    flat = unicodedata.normalize("NFKC", redactor.text(text))
+    flat = unicodedata.normalize("NFKC", text)  # first: a fullwidth secret is a secret
+    flat = redactor.text(flat)
     kept = "".join(
         c if c == "\n" or (unicodedata.category(c)[0] != "C" and c not in _LINE_SEPS) else " "
         for c in flat
     )
-    kept = mask_codes(kept)
+    kept = mask_codes(redactor.text(kept))  # again: a dropped character could split a secret
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in kept.split("\n")]
     body = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     room = max(limit - len(PREFIX), 1)
@@ -325,7 +357,14 @@ def has_proposal(text: str) -> bool:
 
 
 def _under(path: Path, roots: Sequence[Path]) -> bool:
-    return any(path == r or path.is_relative_to(r) for r in roots)
+    """``path`` is a root or inside one, compared case-insensitively (APFS is, by default:
+    ``~/code/.SSH`` is ``~/code/.ssh``)."""
+    parts = [x.casefold() for x in path.parts]
+    for r in roots:
+        rp = [x.casefold() for x in r.parts]
+        if parts[: len(rp)] == rp:
+            return True
+    return False
 
 
 def _real(p: Path) -> Path:
@@ -343,13 +382,9 @@ def check_attachment(
     if not path.is_absolute():
         return None, "attachments must be absolute paths"
     real = _real(path)
-    attach = [_real(r) for r in brain.ask_claude.attachment_roots]
-    if not _under(real, [*(_real(r) for r in roots), *attach]):
-        return None, f"{path.name} isn't in a folder I may read"
-    if any(fnmatch.fnmatch(real.name.lower(), g.lower()) for g in brain.deny_globs()):
-        return None, f"{path.name} is on the deny list"
-    if _under(real, [_real(p) for p in brain.deny_paths()]) and not _under(real, attach):
-        return None, f"{path.name} is on the deny list"
+    why = _refusal(real, brain, roots)
+    if why is not None:
+        return None, f"{path.name} {why}"
     try:
         st = os.stat(real)
     except OSError:
@@ -361,13 +396,47 @@ def check_attachment(
     return real, None
 
 
-def _copy_in(src: Path, dest: Path) -> None:
-    """Copy one checked attachment into the ask dir, never through a symlink."""
+def _refusal(real: Path, brain: BrainConfig, roots: Sequence[Path]) -> str | None:
+    """Why a resolved path may not be attached, or None. A deny glob is matched against every
+    component (``.env.d/x`` is denied too)."""
+    attach = [_real(r) for r in brain.ask_claude.attachment_roots]
+    if not _under(real, [*(_real(r) for r in roots), *attach]):
+        return "isn't in a folder I may read"
+    globs = [g.casefold() for g in brain.deny_globs()]
+    if any(fnmatch.fnmatchcase(part.casefold(), g) for part in real.parts for g in globs):
+        return "is on the deny list"
+    if _under(real, [_real(p) for p in brain.deny_paths()]) and not _under(real, attach):
+        return "is on the deny list"
+    return None
+
+
+def _fd_path(fd: int) -> Path | None:
+    """The real path of an open file (macOS ``F_GETPATH``), or None where there is none."""
+    getpath = getattr(fcntl, "F_GETPATH", None)
+    if getpath is None:
+        return None
+    raw = fcntl.fcntl(fd, getpath, b"\0" * 1024)
+    return Path(raw.split(b"\0", 1)[0].decode(errors="surrogateescape"))
+
+
+def _copy_in(src: Path, dest: Path, brain: BrainConfig, roots: Sequence[Path]) -> None:
+    """Copy one checked attachment into the ask dir, never through a symlink. ``O_NOFOLLOW``
+    covers only the last component, so the opened file's own path is checked again: a parent
+    directory swapped for a link since the check can't carry a denied file in."""
     fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > ATTACH_BYTES:
             raise OSError("not a regular file under the size cap")
+        opened = _fd_path(fd)
+        if opened is not None:
+            why = _refusal(_real(opened), brain, roots)
+            if why is not None:
+                raise OSError(f"{src.name} {why}")
+        else:  # no F_GETPATH: at least the same file the path resolves to now
+            now = os.stat(src)
+            if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                raise OSError(f"{src.name} changed while it was copied")
         with os.fdopen(fd, "rb", closefd=False) as fin, open(dest, "xb") as fout:
             shutil.copyfileobj(fin, fout)
     finally:
@@ -623,7 +692,7 @@ class AskRunner:
             if real is None:
                 raise OSError(why)
             name = f"attachment-{i}{Path(real).suffix.lower()[:8]}"
-            _copy_in(real, ask_dir / name)
+            _copy_in(real, ask_dir / name, self.brain, self.roots)
             names.append(name)
         return names
 
@@ -666,11 +735,18 @@ class AskRunner:
         except OSError as e:
             return "failed", FAILED.format(why=f"it couldn't start: {e.strerror}"), None
         try:
-            created = psutil.Process(proc.pid).create_time()
+            created: float | None = psutil.Process(proc.pid).create_time()
         except psutil.Error:
-            created = time.time()
+            created = None  # gone or unreadable: the env marker and a direct kill still end it
         target = Target(proc.pid, proc.pid, created, marker=marker)
-        ctx.save(checkpoint={**cp, "pid": proc.pid, "created": created, "marker": marker})
+        try:
+            if created is not None:  # a wrong start time would make a crash's reap skip it
+                ctx.save(checkpoint={**cp, "pid": proc.pid, "created": created, "marker": marker})
+        except BaseException:
+            await reaper.reap(target, grace_s=self.kill_grace_s)
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            raise
         result: dict[str, Any] | None = None
         refusal: str | None = None
         assert proc.stdin and proc.stdout and proc.stderr
@@ -730,6 +806,9 @@ class AskRunner:
                     break
         finally:
             await reaper.reap(target, grace_s=self.kill_grace_s)
+            if proc.returncode is None:  # our own unreaped child: its pid can't be reused
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), 5)
             exited.cancel()
@@ -765,7 +844,8 @@ class AskRunner:
         self, task: Task, ctx: StepContext, cp: dict[str, Any], hit: LimitHit
     ) -> StepOutcome:
         """Back off until the reset and tell the owner once (deduped per reset)."""
-        until = wake_time(hit, self.clock())
+        # Two sessions hitting the limit together keep one reset time (and one notice).
+        until = self.limited_until() or wake_time(hit, self.clock())
         with atomic(self.conn):
             kv_set(self.conn, LIMIT_KV, iso(until))
         text = self._limit_text(until)

@@ -233,6 +233,14 @@ def gone(pid: int) -> bool:
         (f"{GMAIL}trash_message", True),
         ("Read", False),
         ("WebFetch", False),
+        ("mcp__x__sendMessage", True),
+        ("mcp__x__send-message", True),
+        ("mcp__x__sendmessage", True),
+        ("mcp__x__createEvent", True),
+        ("mcp__x__deleteThread", True),
+        ("mcp__x__replyAll", True),
+        ("mcp__x__getThread", False),
+        ("mcp__x__listEvents", False),
     ],
 )
 def test_write_names(tool: str, write: bool) -> None:
@@ -249,6 +257,9 @@ def test_write_names(tool: str, write: bool) -> None:
         (f"{GMAIL}update_draft", False),
         (f"{GMAIL}send_message", False),
         (f"{GMAIL}search_threads", False),
+        ("mcp__x__createDraft", True),
+        ("mcp__x__create_draft_reply", False),
+        ("mcp__x__sendDraft", False),
     ],
 )
 def test_draft_names(tool: str, draft: bool) -> None:
@@ -358,6 +369,11 @@ def test_config_defaults_and_validation() -> None:
         BrainConfig(read_deny=["relative/dir"])
     with pytest.raises(ValueError, match=r", \( or \)"):
         BrainConfig(read_deny=["a,b"])
+    for bad in ("mcp__x__sendMessage", "mcp__x__send-message", "Gmail.send", "list_events"):
+        with pytest.raises(ValueError, match="connector tool name"):
+            AskClaudeConfig(connector_tools={"email": [bad]})
+        with pytest.raises(ValueError, match="connector tool name"):
+            AskClaudeConfig(draft_tools=[bad])
 
 
 # --- the answer --------------------------------------------------------------------------------
@@ -372,6 +388,9 @@ def test_answer_text_is_redacted_cleaned_and_clipped() -> None:
     assert "K7" not in out and "yes ?" in out
     assert "\u202e" not in out and "\u200b" not in out and "\u2028" not in out
     assert "\n\n\n" not in out and "\x07" not in out
+    # NFKC first: a fullwidth copy of a secret is the secret
+    wide = "".join(chr(ord(c) + 0xFEE0) if "!" <= c <= "~" else c for c in TOKEN)
+    assert TOKEN not in answer_text(f"x {wide} y", red, 500)
     long = answer_text("x" * 5000, red, 300)
     assert len(long) == 300 and long.endswith("…")
 
@@ -410,10 +429,37 @@ def test_attachments_checked(tmp_path: Path) -> None:
     assert "may read" in str(check_attachment(str(link), brain, roots)[1])  # symlink out
     assert "absolute" in str(check_attachment("code/notes.txt", brain, roots)[1])
     assert "isn't a file" in str(check_attachment(str(code), brain, roots)[1])
+    envdir = code / ".env.d"
+    envdir.mkdir()
+    (envdir / "x").write_text("SECRET=1")
+    assert "deny list" in str(check_attachment(str(envdir / "x"), brain, roots)[1])
+    upper = BrainConfig(read_roots=[code], read_deny=[str(code / "Private")])
+    (code / "private").mkdir()
+    (code / "private" / "p.txt").write_text("x")
+    assert "deny list" in str(check_attachment(str(code / "private" / "p.txt"), upper, roots)[1])
     big = code / "big.bin"
     with open(big, "wb") as f:
         f.truncate(ask_mod.ATTACH_BYTES + 1)
     assert "MB" in str(check_attachment(str(big), brain, roots)[1])
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="F_GETPATH is macOS")
+def test_copy_rechecks_the_opened_file(tmp_path: Path) -> None:
+    """A parent directory swapped for a link after the check: O_NOFOLLOW covers only the last
+    component, so the opened file's own path is checked again and the copy refused."""
+    code = tmp_path / "code"
+    code.mkdir()
+    secret = tmp_path / "ssh"
+    secret.mkdir()
+    (secret / "id").write_text("KEY")
+    brain = BrainConfig(read_roots=[code], read_deny=[str(secret)])
+    (code / "dir").symlink_to(secret)  # as if swapped in after the check passed
+    with pytest.raises(OSError, match=r"deny list|may read"):
+        ask_mod._copy_in(code / "dir" / "id", tmp_path / "out", brain, [code])  # pyright: ignore[reportPrivateUsage]
+    assert not (tmp_path / "out").exists()
+    (code / "ok.txt").write_text("hi")
+    ask_mod._copy_in(code / "ok.txt", tmp_path / "out2", brain, [code])  # pyright: ignore[reportPrivateUsage]
+    assert (tmp_path / "out2").read_text() == "hi"
 
 
 # --- the runner, end to end with the fake CLI ----------------------------------------------
