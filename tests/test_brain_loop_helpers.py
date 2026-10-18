@@ -117,6 +117,12 @@ def test_claims_change(reply: str) -> None:
         "Which note: 1 or 2?",
         "The PR was merged yesterday by sam.",
         "I'll check your calendar.",
+        "Created 3 days ago by justin, still open.",
+        "Merged 2h ago: PR #41.",
+        "Sent from the Mini at 9am.",
+        "Opened by dependabot.",
+        "Updated 5 min ago.",
+        "Logged in as justin.",
     ],
 )
 def test_reads_and_questions_dont_claim(reply: str) -> None:
@@ -140,6 +146,8 @@ LIST = next(s for s in BUILTIN_SPECS if s.name == "list_notes")
         (MERGE, {"repo": "jhe/site", "number": 41, "head_sha": "9f8e"}, "merge PR #41", None),
         (MERGE, {"repo": "jhe/site", "number": 41, "head_sha": "9f8e"}, "merge it", "number=41"),
         (ADD, {"text": "buy milk"}, "note: oat milk", None),  # content, not a target
+        (DELETE, {"note_id": "ENG-123"}, "close ENG-123 please", None),  # punctuation kept
+        (DELETE, {"note_id": "ENG-123"}, "close the ticket", "note_id=ENG-123"),
         (LIST, {}, "list them", None),  # reads never
     ],
 )

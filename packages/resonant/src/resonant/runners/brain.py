@@ -216,14 +216,16 @@ def unnamed_target(spec: ToolSpec, args: dict[str, Any], message: str) -> str | 
     calls whose target is named ("cancel R2", "merge PR 41"), pass."""
     if spec.effect is Effect.READ:
         return None
-    words = set(re.findall(r"[a-z0-9]+", message.lower()))
+    lowered = message.lower()
+    words = set(re.findall(r"[a-z0-9]+", lowered))
     for key, value in args.items():
         if not (key in TARGET_KEYS or key.endswith("_id")):
             continue
         if isinstance(value, bool) or not isinstance(value, str | int):
             continue
         token = str(value).strip().lower().lstrip("#")
-        if token and token not in words:
+        named = token in words or (not token.isalnum() and token in lowered)
+        if token and not named:
             return f"{flat(key, 32)}={flat(str(value), 40)}"
     return None
 
@@ -242,8 +244,12 @@ _PROMISE_VERBS = (
     r"stop|kill|restart|remember|note|update|forget|open|file|close|approve|remind)"
 )
 # "set" only after "I": a reply that opens "Set a reminder …?" is a proposal, not a claim.
+# A leading past participle that describes something ("Created 3 days ago by sam", "Merged
+# 2h ago", "Logged in as …", "Sent from the Mini") is a read, not a claim.
+_NOT_A_CLAIM = r"(?!\s+(?:\d|ago\b|by\b|from\b|in\b|at\b|on\b|yesterday\b|today\b|earlier\b))"
 _CLAIM = re.compile(
     rf"(?:^\W*(?:resonant\W+)?(?:(?:ok(?:ay)?|done|sure|got it)\W+)?{_CHANGE_VERBS}\b"
+    rf"{_NOT_A_CLAIM}"
     rf"|\bI(?:'ve| have| just)?\s+(?:just\s+|already\s+)?(?:set|{_CHANGE_VERBS})\b"
     rf"|\bI(?:'ll| will)\s+{_PROMISE_VERBS}\b"
     rf"|\b{_CHANGE_VERBS}\s+(?:it\s+)?(?:as an?|to your|to the)\s+"
@@ -413,6 +419,7 @@ class BrainRunner(LocalRunner):
         self.runner_gaps = runner_gaps
         self._gaps: tuple[float, list[str]] | None = None
         self._gaps_job: asyncio.Task[None] | None = None
+        self._closed = False
         self.labeler = Labeler(model, self.intents)  # the intents fallback
         self._folds: set[asyncio.Task[None]] = set()
         self._folding: set[str] = set()  # principals with a fold in flight
@@ -451,19 +458,26 @@ class BrainRunner(LocalRunner):
             self._folding.discard(principal)
 
     async def idle(self) -> None:
-        """Wait for background folds and the runner check (tests)."""
-        while self._folds or self._gaps_job is not None:
-            jobs = [*self._folds, *([self._gaps_job] if self._gaps_job is not None else [])]
+        """Wait for background folds and the runner check (tests). Only unfinished jobs are
+        awaited: a gather over finished tasks never yields, so a loop on them would stall
+        the event loop (and the watchdog ends the process)."""
+        while True:
+            gaps = [self._gaps_job] if self._gaps_job is not None else []
+            jobs = [j for j in (*self._folds, *gaps) if not j.done()]
+            if not jobs:
+                return
             await asyncio.gather(*jobs, return_exceptions=True)
 
     async def aclose(self) -> None:
         """Cancel background folds and the runner check (shutdown, before the model client
         closes). The fold's cursor moves by compare-and-set, so a cancelled fold just runs
         again later."""
+        self._closed = True
         jobs = [*self._folds, *([self._gaps_job] if self._gaps_job is not None else [])]
         for job in jobs:
             job.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
+        self._gaps_job = None
 
     def _spans(self, trace_id: str) -> SpanFactory:
         return partial(span, self.conn, trace_id=trace_id)
@@ -523,19 +537,26 @@ class BrainRunner(LocalRunner):
             return []
         now = time.monotonic()
         stale = self._gaps is None or now - self._gaps[0] >= RUNNER_GAPS_TTL_S
-        if stale and self._gaps_job is None:
+        if stale and self._gaps_job is None and not self._closed:
             job = asyncio.get_running_loop().create_task(self._refresh_gaps(self.runner_gaps))
             self._gaps_job = job
+            job.add_done_callback(self._gaps_done)
         return [] if self._gaps is None else self._gaps[1]
 
+    def _gaps_done(self, job: asyncio.Task[None]) -> None:
+        if self._gaps_job is job:  # also when cancelled before it ran
+            self._gaps_job = None
+
     async def _refresh_gaps(self, check: Callable[[], Awaitable[list[str] | None]]) -> None:
+        """A failed or slow check keeps the last answer (only its age moves), so a transient
+        Keychain error never turns known gaps into "all set"."""
         try:
             missing = await asyncio.wait_for(check(), RUNNER_GAPS_TIMEOUT_S)
         except Exception as e:
             log.warning("brain: runner set-up check failed (%s)", type(e).__name__)
-            missing = None
-        finally:
-            self._gaps_job = None
+            last = [] if self._gaps is None else self._gaps[1]
+            self._gaps = (time.monotonic(), last)
+            return
         self._gaps = (time.monotonic(), list(missing or []))
 
     def tools_for(self, principal: str) -> tuple[list[ToolSpec], list[ToolSpec]]:
@@ -662,6 +683,8 @@ class BrainRunner(LocalRunner):
     def _nudge(self, answer: str, st: _Turn) -> tuple[str, str] | None:
         """The corrective round, once per task: an answer that claims a change while no side
         effect ran. ``(kind, text)`` or None."""
+        # Once only: a second answer goes out as is, even if it still claims (the code-built
+        # report lines are the owner's record of what ran).
         if st.nudged or st.reports or not claims_change(answer):
             return None
         return ("claim", CLAIM_NUDGE)

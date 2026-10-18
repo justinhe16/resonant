@@ -360,9 +360,29 @@ def _text_call(obj: object) -> RawToolCall | None:
     return RawToolCall(name, args)
 
 
-_NAMED_CALL = re.compile(
-    r"\A([A-Za-z_][A-Za-z0-9_]{0,63})\s*(?::|\()?\s*(\{.*\})?\s*\)?\Z", re.DOTALL
-)
+_NAME_HEAD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+TEXT_CALL_MAX_CHARS = 4000  # longer replies are prose, not a call (and bound the parsing)
+
+
+def _named_call(body: str, names: Collection[str]) -> RawToolCall | None:
+    """``name``, ``name: {args}`` or ``name({args})`` for a name in ``names``. No regex over
+    the rest (a backtracking pattern there was cubic on long whitespace runs)."""
+    m = _NAME_HEAD.match(body)
+    if m is None or m.group(0) not in names:
+        return None
+    rest = body[m.end() :].strip()
+    if rest.startswith((":", "(")):
+        rest = rest[1:].strip()
+        if rest.endswith(")"):
+            rest = rest[:-1].strip()
+    if not rest:
+        return RawToolCall(m.group(0), {})
+    if not rest.startswith("{"):
+        return None
+    try:
+        return RawToolCall(m.group(0), json.loads(rest))
+    except ValueError:
+        return None
 
 
 def text_tool_calls(text: str | None, names: Collection[str] = ()) -> list[RawToolCall]:
@@ -371,18 +391,11 @@ def text_tool_calls(text: str | None, names: Collection[str] = ()) -> list[RawTo
     only ``{"name", "arguments"}``, or, for a name in ``names``, a reply that is only
     ``name``, ``name: {args}`` or ``name({args})``. [] when there is none. Names are taken
     as written (the caller validates them against the offered tools)."""
-    if not text:
+    if not text or len(text) > TEXT_CALL_MAX_CHARS:
         return []
     body = strip_think(text)
-    named = _NAMED_CALL.match(body.strip())
-    if named is not None and named.group(1) in names:
-        raw_args = named.group(2)
-        if raw_args is None:
-            return [RawToolCall(named.group(1), {})]
-        try:
-            return [RawToolCall(named.group(1), json.loads(raw_args))]
-        except ValueError:
-            return [RawToolCall(named.group(1), raw_args)]
+    if (named := _named_call(body.strip(), names)) is not None:
+        return [named]
     decoder = json.JSONDecoder()
     calls: list[RawToolCall] = []
     for m in _TEXT_CALL_START.finditer(body):

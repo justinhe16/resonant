@@ -104,6 +104,7 @@ Live runs on `evals/task.example.jsonl` (loop mode; one run each unless noted):
 | 5: target check, lookup hint | 90.4% (47/52) | 100% | 0 | 1581 / 3867 | over the bar |
 | Pre-merge, `--repeat 2`, both modes | 92.3% (96/104) | 100% | 0 | 1509 / 3641 | intents 42.3%, 4 unapproved over 2 runs (as baseline) |
 | After merging BR-7, `--repeat 3` | **92.3% (144/156)** | **100%** | **0** | **1631 / 3947** | ask 100%; the same 4 rows miss each run |
+| After the code review fixes, 1 run | 90.4% (47/52) | 87.5% | 0 | 1713 / 3755 | `pa-email-search` missed once (passed in the 3 runs above) |
 
 ### BR-1: the brain loop (2026-10-18)
 

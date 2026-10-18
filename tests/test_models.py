@@ -828,3 +828,18 @@ TEXT_CALLS: list[tuple[str, list[tuple[str, object]]]] = [
 def test_text_tool_calls(text: str, want: list[tuple[str, object]]) -> None:
     got = text_tool_calls(text, {"list_reminders", "ask_claude", "hello_tool"})
     assert [(c.name, c.arguments) for c in got] == want
+
+
+def test_text_tool_calls_is_linear_on_long_whitespace() -> None:
+    """Review of #103: a backtracking pattern took ~12 s on 2000 spaces (cubic)."""
+    import time
+
+    start = time.monotonic()
+    for body in ("search" + " " * 3900 + "x", "search" + " " * 50_000 + "x", "{" * 3000):
+        assert text_tool_calls(body, {"search"}) == []
+    assert time.monotonic() - start < 0.5
+    assert text_tool_calls('search  :  { "pattern": "x" }', {"search"})[0].arguments == {
+        "pattern": "x"
+    }
+    assert text_tool_calls("search(  {}  )", {"search"})[0].arguments == {}
+    assert text_tool_calls("search for it", {"search"}) == []

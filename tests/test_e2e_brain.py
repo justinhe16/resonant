@@ -690,3 +690,36 @@ async def test_the_briefing_reports_the_runner_check_never_a_guess(
             in (second.messages[-1]["content"])
         )
         assert checks == [1]  # cached
+
+
+async def test_the_runner_check_survives_cancel_and_keeps_known_gaps(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Review of #103: a check cancelled before it ran left ``_gaps_job`` set (``idle`` spun,
+    no refresh again), and a failed check replaced known gaps with none."""
+    calls: list[str] = []
+
+    async def gaps() -> list[str] | None:
+        calls.append("ok" if not calls else "boom")
+        if len(calls) > 1:
+            raise RuntimeError("keychain")
+        return ["the claude CLI isn't installed"]
+
+    async with start(resonant_home, chat, tmp_path) as b:
+        r = b.runner
+        r.runner_gaps = gaps
+        assert r._runner_missing() == []  # pyright: ignore[reportPrivateUsage]
+        job = r._gaps_job  # pyright: ignore[reportPrivateUsage]
+        assert job is not None
+        job.cancel()
+        await asyncio.gather(job, return_exceptions=True)
+        await asyncio.sleep(0)  # the done callback runs
+        assert r._gaps_job is None  # pyright: ignore[reportPrivateUsage]
+        r._runner_missing()  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(r.idle(), 5)
+        assert r._runner_missing() == ["the claude CLI isn't installed"]  # pyright: ignore[reportPrivateUsage]
+        r._gaps = (0.0, ["the claude CLI isn't installed"])  # pyright: ignore[reportPrivateUsage]
+        r._runner_missing()  # pyright: ignore[reportPrivateUsage]  # stale: refresh, which fails
+        await asyncio.wait_for(r.idle(), 5)
+        assert calls == ["ok", "boom"]
+        assert r._runner_missing() == ["the claude CLI isn't installed"]  # pyright: ignore[reportPrivateUsage]
