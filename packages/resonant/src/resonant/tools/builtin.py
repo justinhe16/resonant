@@ -30,6 +30,7 @@ from resonant.tools import (
     ask,
     commands,
     ext,
+    facts,
     files,
     notes,
     ops,
@@ -81,6 +82,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     repos,
     trust,
     files,
+    facts,
     ask,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)

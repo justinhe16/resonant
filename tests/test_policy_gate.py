@@ -250,6 +250,34 @@ def test_tainted_ignores_a_per_call_level(
     assert isinstance(gate.evaluate(intent(RESTART, task_id, origin="tainted")), NeedsApproval)
 
 
+@pytest.mark.parametrize("origin", ORIGINS)
+def test_tainted_remember_and_forget_ask(
+    db: sqlite3.Connection, principals: Principals, clock: Clock, task_id: str, origin: Origin
+) -> None:
+    """BR-4's facts writes are L3 (do, then report): an owner's chat call runs, but after
+    the task read untrusted content it asks first, so injected text can't plant or erase a
+    fact (D6, D9). ``list_facts`` (L0) still runs."""
+    from resonant.tools import facts
+
+    reg = ToolRegistry()
+    for spec in facts.SPECS:
+        reg.register(spec)
+    kv_set(db, "autonomy", "on")
+    gate = make_gate(db, principals, reg, clock)
+    for spec, args in ((facts.REMEMBER, {"name": "mycelium-path", "description": "where"}),
+                       (facts.FORGET, {"name": "mycelium-path"})):  # fmt: skip
+        assert spec.effective_level is Level.L3
+        i = Intent.for_tool(spec, task_id=task_id, principal="justin", args=args, origin=origin)
+        d = gate.evaluate(i)
+        if origin == "tainted":
+            assert isinstance(d, NeedsApproval) and not d.require_code and not d.allow_always
+        else:
+            assert isinstance(d, Allow)
+    listed = Intent.for_tool(facts.LIST_FACTS, task_id=task_id, principal="justin", args={},
+                             origin="tainted")  # fmt: skip
+    assert isinstance(gate.evaluate(listed), Allow)
+
+
 def _set_autonomy(db: sqlite3.Connection, value: str) -> None:
     db.execute("DELETE FROM kv WHERE key = 'autonomy'")
     if value == "missing":
