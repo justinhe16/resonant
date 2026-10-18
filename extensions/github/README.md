@@ -6,6 +6,7 @@ GitHub for Resonant: your open pull requests with CI and review state, a quiet w
 |---|---|---|---|
 | `prs` | tool | L0 | Open PRs you authored (CI rollup, failing checks, review decision), plus PRs awaiting your review. |
 | `pr {repo, number}` | tool | L0 | One PR with its checks, mergeability and size. |
+| `recent_prs {repo}` | tool | L0 | The newest 15 PRs in one repo (`owner/name`), any state, newest first, with created, merged and closed dates and a `latest merged #N` summary. `prs` lists only open PRs and `pr` needs a number, so "what are the latest PRs?" had no tool (BR-9). |
 | `rerun_failed {repo, number}` | tool | L3 | Re-runs the failed jobs of each workflow whose latest run on the PR's head failed. |
 | `merge_pr {repo, number, head_sha}` | tool | L2, commit | Squash-merges the PR if its head is still `head_sha`. Runs when you ask for it; otherwise asks a plain yes. |
 | `watch` | job, every 10 min | L0 | Emits `ci_failed`, `ci_fixed`, `review_requested`, `pr_active`, `pr_merged` and `pr_closed` events. None of them texts on its own (GH-2): the hourly rollup reads them. |

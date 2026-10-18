@@ -41,9 +41,16 @@ runner's keys) is handed to ``LocalRunner._answer`` as is.
    the owner's message doesn't contain (``cancel_run{code: R2}`` for "cancel the run")
    isn't run; the model gets ``TARGET_CHECK`` back (ask which if several fit, else call
    again), since an L3 write runs without asking.
+   **Guess check** (BR-9, once per task): a read that picks its target by an identifier
+   found nowhere the model could have read it (the message, history, briefing, tool
+   results; a ``number`` must be written as one, ``#104``) isn't run; the model gets
+   ``GUESS_CHECK`` back (list them first, or ``ask_claude``). "Most recent PRs?" had
+   become ``pr{number: 1}``.
    **Corrective round** (once per task): an answer that claims a change (``claims_change``)
    while no side effect ran goes back to the model with a short check (``CLAIM_NUDGE``)
-   instead of out to the owner.
+   instead of out to the owner; so does (BR-9) an answer to a live-state question
+   (``asks_live_state``: commits, PRs, what changed, a status) when no tool ran at all
+   (``LOOKUP_NUDGE``), unless it is a question back.
 4. **ask_claude.** When the model calls it and it queued, its text (``Looking into it…``) is
    the reply and the turn ends: the ask task answers later. A refusal goes back to the model.
 5. **Stuck.** The round cap with no answer, or two bad model outputs, escalates on its own:
@@ -165,6 +172,7 @@ CORE_TOOLS: frozenset[str] = frozenset(
         "run_activity",
         "start_run",
         "system_status",
+        "recent_changes",
     }
 )
 # Builtins whose results carry text others wrote (a Claude worker's notes, questions and
@@ -208,6 +216,17 @@ TARGET_CHECK = (
     "this one fits, call {name} again."
 )
 TARGET_KEYS = frozenset({"code", "id", "number"})
+# A read whose identifier appears nowhere the model could have got it from: once per task,
+# the call goes back unrun (``guessed_arg``). BR-9: "most recent PRs?" became pr{number: 1}.
+GUESS_CHECK = (
+    "not run: {target} isn't in the owner's message or anything you've read, so it would be "
+    "a guess. Don't guess: find it first with a tool that lists them (recent_changes or "
+    "recent_prs for the newest commits and PRs, prs for open PRs, list_runs for runs), or "
+    "call ask_claude. If the owner did give it, call {name} again."
+)
+# A PR or issue number counts as read only where it is written as one ("#104", "PR 104",
+# ".../pull/104", a result's "number": 104); a bare digit is everywhere ("slots 0/1").
+_NUMBER_CONTEXT = r'(?:#|\bpr\s*#?|\bpull request\s*#?|/pull/|"number":\s*|"pr":\s*|\bnumber\s*)'
 
 
 def unnamed_target(spec: ToolSpec, args: dict[str, Any], message: str) -> str | None:
@@ -219,7 +238,7 @@ def unnamed_target(spec: ToolSpec, args: dict[str, Any], message: str) -> str | 
     lowered = message.lower()
     words = set(re.findall(r"[a-z0-9]+", lowered))
     for key, value in args.items():
-        if not (key in TARGET_KEYS or key.endswith("_id")):
+        if not _key_of(key):
             continue
         if isinstance(value, bool) or not isinstance(value, str | int):
             continue
@@ -228,6 +247,61 @@ def unnamed_target(spec: ToolSpec, args: dict[str, Any], message: str) -> str | 
         if token and not named:
             return f"{flat(key, 32)}={flat(str(value), 40)}"
     return None
+
+
+def _key_of(key: str) -> bool:
+    return key in TARGET_KEYS or key.endswith("_id")
+
+
+def guessed_arg(spec: ToolSpec, args: dict[str, Any], message: str, seen: str) -> str | None:
+    """``number=1`` when a read picks its target by an identifier (``code``, ``id``,
+    ``number`` or ``*_id``) that is in neither the owner's ``message`` nor ``seen`` (the rest
+    of the prompt: history, briefing, tool results), else None. A ``number`` must appear
+    written as one (``#1``, ``PR 1``, ``"number": 1``) unless the message has it. Side
+    effects are ``unnamed_target``'s."""
+    if spec.effect is not Effect.READ:
+        return None
+    words = set(re.findall(r"[a-z0-9]+", message.lower()))
+    lowered = seen.lower()
+    for key, value in args.items():
+        if not _key_of(key) or isinstance(value, bool) or not isinstance(value, str | int):
+            continue
+        token = str(value).strip().lower().lstrip("#")
+        if not token or token in words or (not token.isalnum() and token in message.lower()):
+            continue
+        tok = re.escape(token)
+        if key == "number":
+            found = re.search(rf"{_NUMBER_CONTEXT}{tok}(?![0-9])", lowered)
+        else:
+            found = re.search(rf"(?<![a-z0-9]){tok}(?![a-z0-9])", lowered)
+        if found is None:
+            return f"{flat(key, 32)}={flat(str(value), 40)}"
+    return None
+
+
+# A question about live state (BR-9: "status on resonant repo changes", "most recent
+# commits/PRs?") answered with no tool at all gets one corrective round (``LOOKUP_NUDGE``).
+_LIVE_STATE = re.compile(
+    r"\b(?:commits?|changes|changed|changelog|newest|latest|most recent|merged|prs|"
+    r"pull requests)\b",
+    re.IGNORECASE,
+)
+LOOKUP_NUDGE = (
+    "Check: you answered without calling any tool, but this asks about live state (a repo's "
+    "commits or PRs, what changed, a status). Your history and summary may be out of date. "
+    "Call the tool that reads it now (recent_changes, recent_prs, prs, list_runs, "
+    "system_status), or ask_claude if none fits. If it really needs no lookup, give the "
+    "same answer again."
+)
+
+
+# The answer is a question back to the owner (a trailing quote, bracket or emoji allowed).
+_ASKS_BACK = re.compile(r"\?[^\w?]*$")
+
+
+def asks_live_state(message: str) -> bool:
+    """The owner's message asks about something that changes (commits, PRs, a status)."""
+    return _LIVE_STATE.search(message) is not None
 
 
 # "Added note: …", "I've saved that…", "Done, merged #41", "Cancelled R2": a first-person or
@@ -332,9 +406,11 @@ class _Turn:
     tainted: bool = False
     errors: int = 0
     executed: int = 0  # tool calls run through the gate (their call_index)
-    nudged: bool = False  # the one corrective round was used
+    nudged: bool = False  # the claim corrective round was used
+    looked: bool = False  # the lookup corrective round was used (BR-9)
     text: str = ""  # the owner's message (the target check)
     target_checked: bool = False  # the one target check was used
+    guess_checked: bool = False  # the one guessed-identifier check was used
     tools: list[ToolSpec] = field(default_factory=list[ToolSpec])
 
     def __post_init__(self) -> None:
@@ -345,6 +421,11 @@ class _Turn:
         """What the model is offered: the core tools and a stub per deferred tool, by name.
         The same for the whole task (the prompt prefix stays cached)."""
         return self.tools
+
+    def seen(self) -> str:
+        """Everything the model has read in this task but the system prompt: history, the
+        briefing and the message, and every tool result so far."""
+        return "\n".join(str(m.get("content") or "") for m in self.messages[1:])
 
     def lookup(self, name: str) -> ToolSpec | None:
         """The real spec for a model-facing name (core or deferred)."""
@@ -631,7 +712,10 @@ class BrainRunner(LocalRunner):
                     nudge = self._nudge(answer, st)
                     if nudge is None:
                         return self._answered(answer, st, spans)
-                    st.nudged = True
+                    if nudge[0] == "claim":
+                        st.nudged = True
+                    else:
+                        st.looked = True
                     with spans("runner.brain.nudge", kind=nudge[0]):
                         pass
                     st.messages.append({"role": "assistant", "content": answer})
@@ -681,13 +765,24 @@ class BrainRunner(LocalRunner):
         return out
 
     def _nudge(self, answer: str, st: _Turn) -> tuple[str, str] | None:
-        """The corrective round, once per task: an answer that claims a change while no side
-        effect ran. ``(kind, text)`` or None."""
-        # Once only: a second answer goes out as is, even if it still claims (the code-built
+        """The corrective rounds, each once per task: an answer that claims a change while no
+        side effect ran (``claim``), and a live-state question answered with no tool at all
+        (``lookup``, BR-9). ``(kind, text)`` or None."""
+        # Once each: a second answer goes out as is, even if it still claims (the code-built
         # report lines are the owner's record of what ran).
-        if st.nudged or st.reports or not claims_change(answer):
+        if st.reports:
             return None
-        return ("claim", CLAIM_NUDGE)
+        if not st.nudged and claims_change(answer):
+            return ("claim", CLAIM_NUDGE)
+        # A question back to the owner is fine as is.
+        if (
+            not st.looked
+            and not st.calls
+            and asks_live_state(st.text)
+            and not _ASKS_BACK.search(answer)
+        ):
+            return ("lookup", LOOKUP_NUDGE)
+        return None
 
     async def _round(self, n: int, st: _Turn, spans: SpanFactory) -> ModelReply | None:
         """One ``chat_tools`` call; None on bad output. ``ModelUnavailableError`` propagates."""
@@ -737,6 +832,13 @@ class BrainRunner(LocalRunner):
             with spans("runner.brain.target_check", tool=name):
                 pass
             call = CallResult(name, False, None, TARGET_CHECK.format(target=target, name=name))
+        elif not st.guess_checked and (
+            target := guessed_arg(spec, cast(dict[str, Any], args), st.text, st.seen())
+        ):
+            st.guess_checked = True
+            with spans("runner.brain.guess_check", tool=name):
+                pass
+            call = CallResult(name, False, None, GUESS_CHECK.format(target=target, name=name))
         else:
             args = cast(dict[str, Any], args)
             done = await self._call_tool(
@@ -923,7 +1025,9 @@ __all__ = [
     "NOT_IN_BRAIN",
     "PROGRESS_TEXT",
     "BrainRunner",
+    "asks_live_state",
     "claims_change",
+    "guessed_arg",
     "slim_schema",
     "stub",
     "taints",

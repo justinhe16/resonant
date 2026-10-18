@@ -28,6 +28,7 @@ from resonant.principals import Principals
 from resonant.store.db import utcnow
 from resonant.tools import (
     ask,
+    changes,
     commands,
     ext,
     facts,
@@ -83,6 +84,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     repos,
     trust,
     files,
+    changes,
     facts,
     ask,
     watches,

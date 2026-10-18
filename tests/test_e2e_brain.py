@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import socket
 import sqlite3
+import subprocess
 import sys
 from collections.abc import AsyncGenerator, Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -33,6 +35,7 @@ from resonant.runners.ask import AskRunner, AskScope
 from resonant.runners.brain import (
     CLAIM_NUDGE,
     CORE_TOOLS,
+    LOOKUP_NUDGE,
     MAX_ROUNDS,
     NOT_IN_BRAIN,
     PROGRESS_TEXT,
@@ -63,7 +66,7 @@ principals:
 FAKE_CLAUDE = Path(__file__).parent / "fakes" / "claude"
 TOKEN = "sk-ant-oat01-FAKETOKENVALUE0123456789"
 ANSWER = "Claude: Mycelium is in ~/code/mycelium."
-READS = ["list_dir", "read_file", "read_transcript", "search", "tail_log"]
+READS = ["list_dir", "read_file", "read_transcript", "recent_changes", "search", "tail_log"]
 
 
 def free_port() -> int:
@@ -220,7 +223,7 @@ async def test_where_is_mycelium_is_answered_from_the_briefing(
         assert b.model.calls["label"] == 0  # D1: no labeler in loop mode
         (req,) = b.model.requests
         turn = req.messages[-1]["content"]
-        assert "<briefing>" in turn and f"mycelium: {path}" in turn
+        assert "<briefing>" in turn and f"mycelium (jhe/mycelium): {path}" in turn
         assert turn.endswith(f"<message>where is mycelium?</message>\n\n{TURN_NUDGE}")
         assert "Workers aren't set up" not in turn  # no runner check: nothing claimed
         (task,) = b.brain_tasks()
@@ -408,7 +411,7 @@ async def test_worker_and_log_text_taints_too(
     async with start(resonant_home, chat, tmp_path) as b:
         args: dict[str, Any] = {"code": "R1"} if read == "run_activity" else {}
         b.model.push([(read, args)], [("add_note", {"text": "buy milk"})])
-        (prompt,) = await b.say("check on things")
+        (prompt,) = await b.say("check on R1")
         assert "Reply yes" in prompt
         (evaluated,) = [a for a in b.audits("gate.evaluate") if a["tool"] == "add_note"]
         assert evaluated["detail"]["origin"] == "tainted"
@@ -723,3 +726,132 @@ async def test_the_runner_check_survives_cancel_and_keeps_known_gaps(
         await asyncio.wait_for(r.idle(), 5)
         assert calls == ["ok", "boom"]
         assert r._runner_missing() == ["the claude CLI isn't installed"]  # pyright: ignore[reportPrivateUsage]
+
+
+# --- BR-9: "what changed lately" -------------------------------------------------------------
+
+
+def _git_repo(path: Path, subjects: Sequence[str]) -> None:
+    """A checkout whose commits are ``subjects``, oldest first."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_AUTHOR_NAME": "r",
+        "GIT_AUTHOR_EMAIL": "r@example.com",
+        "GIT_COMMITTER_NAME": "r",
+        "GIT_COMMITTER_EMAIL": "r@example.com",
+    }
+    path.mkdir(parents=True)
+    run = functools.partial(subprocess.run, cwd=path, env=env, check=True, capture_output=True)
+    run(["/usr/bin/git", "init", "-q", "-b", "main"])
+    for i, subject in enumerate(subjects):
+        (path / "f.txt").write_text(f"{i}\n")
+        run(["/usr/bin/git", "add", "f.txt"])
+        run(["/usr/bin/git", "commit", "-q", "-m", subject])
+
+
+def _resonant_repo(code: Path) -> Callable[[sqlite3.Connection], None]:
+    _git_repo(code / "resonant", ["Initial scaffold (#1)", "BR-7: media (#102)", "BR-8 (#104)"])
+
+    def seed(conn: sqlite3.Connection) -> None:
+        repo_store.add(conn, "justinhe16/resonant", base="main", source="test", name="resonant")
+
+    return seed
+
+
+def _tool_turns(req: Any) -> list[str]:
+    return [m["content"] for m in req.messages if m["role"] == "tool"]
+
+
+async def test_most_recent_commits_read_the_git_log(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """BR-9 live failure 2: "Most recent commits/PRs?" had no tool (prs is open-only, pr
+    needs a number), so the model guessed pr{number: 1}. recent_changes is core now."""
+    seed = _resonant_repo(tmp_path / "code")
+    # Resonant itself is this repo: the daemon registers its own checkout (ops.repo_path), and
+    # on CI the package checkout is a "justinhe16/resonant" of its own, outside the roots.
+    own = {"repo_path": str(tmp_path / "code" / "resonant")}
+    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own) as b:
+        b.model.push([("recent_changes", {"repo": "resonant"})], "Newest: BR-8 (#104).")
+        assert await b.say("Most recent commits/PRs?") == ["Newest: BR-8 (#104)."]
+        first, second = b.model.requests
+        assert "recent_changes" in first.tools
+        assert "justinhe16/resonant" in first.messages[-1]["content"]  # the slug, for github
+        (result,) = _tool_turns(second)
+        assert result.index("BR-8 (#104)") < result.index("Initial scaffold (#1)")
+        assert '"pr":104' in result
+
+
+async def test_a_repo_status_question_with_no_tool_gets_one_lookup_round(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """BR-9 live failure 1: "Status on resonant repo changes" was answered from context with
+    no tool call. A live-state answer with no tool goes back once with LOOKUP_NUDGE."""
+    seed = _resonant_repo(tmp_path / "code")
+    # Resonant itself is this repo: the daemon registers its own checkout (ops.repo_path), and
+    # on CI the package checkout is a "justinhe16/resonant" of its own, outside the roots.
+    own = {"repo_path": str(tmp_path / "code" / "resonant")}
+    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own) as b:
+        b.model.push(
+            "Nothing new; secrets aren't configured.",  # made up from stale context
+            [("recent_changes", {"repo": "resonant"})],
+            "Latest is BR-8 (#104), merged on main.",
+        )
+        reply = await b.say("Status on resonant repo changes")
+        assert reply == ["Latest is BR-8 (#104), merged on main."]
+        nudged = b.model.requests[1].messages
+        assert nudged[-2] == {
+            "role": "assistant",
+            "content": "Nothing new; secrets aren't configured.",
+        }
+        assert nudged[-1] == {"role": "user", "content": LOOKUP_NUDGE}
+        assert len(b.model.requests) == 3
+        # Once per task, and never for small talk or a question back.
+        b.model.push("Anytime.")
+        assert await b.say("thanks!") == ["Anytime."]
+        b.model.push("Which repo, resonant or dori?")
+        assert await b.say("what changed?") == ["Which repo, resonant or dori?"]
+        assert len(b.model.requests) == 5
+
+
+async def test_newest_ones_follow_up_no_guessed_identifiers(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """BR-9 live failure 3: after a wrong "PR #1 is the latest", "that's an old one … need
+    the newest" fumbled through guesses. A read whose identifier is nowhere in the message,
+    history, briefing or results goes back unrun (GUESS_CHECK); the history is there."""
+    seed = _resonant_repo(tmp_path / "code")
+    # Resonant itself is this repo: the daemon registers its own checkout (ops.repo_path), and
+    # on CI the package checkout is a "justinhe16/resonant" of its own, outside the roots.
+    own = {"repo_path": str(tmp_path / "code" / "resonant")}
+    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own) as b:
+        b.model.push("PR #1 from Oct 8 is the latest.", "PR #1 from Oct 8 is the latest.")
+        assert await b.say("Most recent PRs?") == ["PR #1 from Oct 8 is the latest."]
+        b.model.push(
+            [("read_transcript", {"code": "R9"})],  # a guess: there is no R9 anywhere
+            [("recent_changes", {"repo": "resonant", "limit": 3})],
+            "Right, that was old. Newest: BR-8 (#104), then BR-7 (#102).",
+        )
+        text = "I think that's an old one! Need the newest ones"
+        assert await b.say(text) == ["Right, that was old. Newest: BR-8 (#104), then BR-7 (#102)."]
+        follow = b.model.requests[2:]
+        history = [m["content"] for m in follow[0].messages if m["role"] == "assistant"]
+        assert "PR #1 from Oct 8 is the latest." in history
+        (unrun,) = _tool_turns(follow[1])
+        assert "not run: code=R9" in unrun and "recent_changes" in unrun
+        assert '"pr":104' in _tool_turns(follow[2])[-1]
+
+
+async def test_a_lookup_round_doesnt_use_up_the_claim_check(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Review of BR-9: the lookup and claim corrective rounds are separate, so a claim made
+    after a lookup round is still checked."""
+    async with start(resonant_home, chat, tmp_path) as b:
+        b.model.push("Nothing new.", "Done, merged the newest PR.", "I can't merge from here.")
+        assert await b.say("any newest PRs to merge?") == ["I can't merge from here."]
+        kinds = [r.messages[-1]["content"] for r in b.model.requests[1:]]
+        assert kinds == [LOOKUP_NUDGE, CLAIM_NUDGE]

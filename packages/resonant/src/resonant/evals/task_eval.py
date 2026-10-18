@@ -13,7 +13,9 @@
                 "facts_re": [], "not_facts": [], "max_rounds": 3},
      "script": [...]}                                       # the scripted model's rounds
 
-  ``world``: ``repos`` (``{name, slug?, path?, base?}``; the dir is created),
+  ``world``: ``repos`` (``{name, slug?, path?, base?, commits?}``; the dir is created, and
+  with ``commits`` (``{subject, days_ago?}``, oldest first) it is a git checkout with that
+  history),
   ``files`` (path relative to the world root → text: ``code/…`` is ``runner.code_dir``,
   ``logs/…`` Resonant's logs, ``docs/…`` its docs, ``runner/transcripts/…`` run
   transcripts), ``runs`` (``{repo, ask, status, minutes_ago?, last_note?, remote_url?,
@@ -73,6 +75,7 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import tempfile
 import time
 from collections import Counter
@@ -333,6 +336,9 @@ def _world(raw: Any) -> dict[str, Any]:
             _rel_path(str(r["path"]))
             if not str(r["path"]).startswith("code/"):
                 raise ValueError("world.repos[].path is under code/")
+        for c in _objs(r.get("commits"), "repos[].commits"):
+            _need(c, "subject", str, "repos[].commits")
+            _opt(c, "days_ago", (int, float), "repos[].commits")
     for run in _objs(d.get("runs"), "runs"):
         _need(run, "ask", str, "runs")
         _opt(run, "repo", str, "runs")
@@ -470,7 +476,9 @@ examples: ["any of my PRs failing CI?", "show PR 40 in justinhe16/resonant"]
 approvers: [owner]
 tools:
   prs:
-    description: Your open PRs with CI and review state, plus PRs awaiting your review.
+    description: >-
+      Your open PRs with CI and review state, plus PRs awaiting your review (open only;
+      recent_prs for merged).
     run: python3 cli.py prs
     effect: read
   pr:
@@ -478,6 +486,13 @@ tools:
     run: python3 cli.py pr {repo} {number}
     effect: read
     args: {repo: string, number: integer}
+  recent_prs:
+    description: >-
+      The newest PRs in one repo (owner/name), newest first, open, merged and closed, with
+      their dates.
+    run: python3 cli.py recent_prs {repo}
+    effect: read
+    args: {repo: string}
   rerun_failed:
     description: Re-run the failed CI jobs on a pull request's current head commit.
     run: python3 cli.py rerun_failed {repo} {number}
@@ -491,7 +506,7 @@ tools:
     level: L2
     args: {repo: string, number: integer, head_sha: string}
 """,
-        {"prs": {"mine": [], "review_requested": []}},
+        {"prs": {"mine": [], "review_requested": []}, "recent_prs": {"prs": []}},
     ),
     "linear": Fixture(
         """\
@@ -773,9 +788,12 @@ def seed_world(
         slug = str(repo.get("slug") or f"owner/{name}")
         repo_store.add(conn, slug, base=str(repo.get("base", "main")), source="eval", name=name)
         path = root / _rel_path(str(repo["path"])) if repo.get("path") else None
-        (path or settings.runner.code_dir / name).mkdir(parents=True, exist_ok=True)
+        checkout = path or settings.runner.code_dir / name
+        checkout.mkdir(parents=True, exist_ok=True)
         if path is not None:
             repo_store.set_path(conn, slug, path)
+        if repo.get("commits"):
+            seed_commits(settings.runner.git_path, checkout, repo["commits"], now)
     for run in cast(list[dict[str, Any]], w.get("runs") or []):
         _seed_run(conn, run, transcripts, now)
     for note in cast(list[str], w.get("notes") or []):
@@ -795,6 +813,34 @@ def seed_world(
             settings, conn, fx.manifest, {"cli.py": FIXTURE_CLI, "data.json": json.dumps(canned)}
         )
     _seed_history(conn, [fill(list(h), root) for h in history], now)
+
+
+def seed_commits(git: Path, path: Path, commits: Sequence[Any], now: datetime) -> None:
+    """``path`` as a git checkout on ``main`` whose history is ``commits`` (oldest first),
+    each dated ``days_ago`` days before ``now`` (default 0). No config outside the repo."""
+    base = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_AUTHOR_NAME": "Resonant Eval",
+        "GIT_AUTHOR_EMAIL": "eval@example.com",
+        "GIT_COMMITTER_NAME": "Resonant Eval",
+        "GIT_COMMITTER_EMAIL": "eval@example.com",
+    }
+
+    def run(*args: str, env: Mapping[str, str] = base) -> None:
+        subprocess.run(  # noqa: S603 - the configured git, fixed args, no shell
+            [str(git), *args], cwd=path, env=dict(env), check=True, capture_output=True, timeout=30
+        )
+
+    run("init", "-q", "-b", "main")
+    for i, c in enumerate(cast(list[dict[str, Any]], list(commits))):
+        at = iso(now - timedelta(days=float(c.get("days_ago") or 0), seconds=len(commits) - i))
+        (path / ".eval-history").write_text(f"{i}\n")
+        run("add", ".eval-history")
+        dated = {**base, "GIT_AUTHOR_DATE": at, "GIT_COMMITTER_DATE": at}
+        run("commit", "-q", "--no-verify", "-m", str(c["subject"]), env=dated)
 
 
 def _seed_run(

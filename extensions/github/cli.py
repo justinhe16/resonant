@@ -81,6 +81,8 @@ PR_VIEW_FIELDS = (
     "reviewDecision,mergeable,statusCheckRollup,additions,deletions,changedFiles,"
     "createdAt,updatedAt"
 )
+RECENT_LIMIT = 15  # recent_prs
+RECENT_FIELDS = "number,title,url,state,isDraft,author,createdAt,mergedAt,closedAt"
 RUN_FIELDS = "databaseId,workflowName,status,conclusion,headSha,createdAt"
 MERGE_VIEW_FIELDS = (
     "number,title,url,state,isDraft,headRefName,headRefOid,mergeable,mergeStateStatus,"
@@ -402,6 +404,38 @@ def cmd_prs(gh: Gh) -> dict[str, Any]:
     mine, review, truncated = search(gh)
     summary = summary_line(mine, review)
     return {"summary": summary, "prs": mine, "review_requested": review, "truncated": truncated}
+
+
+def cmd_recent_prs(gh: Gh, repo: str) -> dict[str, Any]:
+    """The newest ``RECENT_LIMIT`` PRs in ``repo`` (any state), newest first: what changed
+    lately, which ``prs`` (open only) and ``pr`` (needs a number) can't answer."""
+    if not _REPO.match(repo):
+        raise Failed("repo must look like owner/name")
+    raw = gh.json(
+        "pr", "list", "--repo", repo, "--state", "all", "--limit", str(RECENT_LIMIT),
+        "--json", RECENT_FIELDS,
+    )  # fmt: skip
+    prs: list[dict[str, Any]] = []
+    for v in (_d(x) for x in _l(raw)):
+        if not isinstance(v.get("number"), int) or isinstance(v.get("number"), bool):
+            continue
+        prs.append(
+            {
+                "number": v["number"],
+                "title": clip(_s(v.get("title")), TITLE_MAX),
+                "url": _s(v.get("url")),
+                "state": _s(v.get("state")).lower(),
+                "draft": v.get("isDraft") is True,
+                "author": _s(_d(v.get("author")).get("login")),
+                "created_at": _s(v.get("createdAt")),
+                "merged_at": _s(v.get("mergedAt")) or None,
+                "closed_at": _s(v.get("closedAt")) or None,
+            }
+        )
+    prs.sort(key=lambda p: p["number"], reverse=True)
+    merged = [p for p in prs if p["state"] == "merged"]
+    latest = f"; latest merged #{merged[0]['number']} {merged[0]['title']}" if merged else ""
+    return {"repo": repo, "summary": f"{len(prs)} recent PRs{latest}", "prs": prs}
 
 
 def check_target(repo: str, number: int) -> None:
@@ -747,6 +781,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("prs", "watch", "digest", "health"):
         sub.add_parser(name)
+    sub.add_parser("recent_prs").add_argument("--repo", required=True)
     for name in ("pr", "rerun_failed", "merge_pr"):
         p = sub.add_parser(name)
         p.add_argument("--repo", required=True)
@@ -758,6 +793,8 @@ def main(argv: list[str] | None = None) -> int:
         gh = Gh()
         if args.cmd == "pr":
             out = cmd_pr(gh, args.repo, args.number)
+        elif args.cmd == "recent_prs":
+            out = cmd_recent_prs(gh, args.repo)
         elif args.cmd == "rerun_failed":
             out = cmd_rerun_failed(gh, args.repo, args.number)
         elif args.cmd == "merge_pr":

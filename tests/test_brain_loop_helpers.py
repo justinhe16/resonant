@@ -8,7 +8,14 @@ from typing import Any
 import pytest
 
 from resonant.models.client import openai_tools
-from resonant.runners.brain import claims_change, slim_schema, stub, unnamed_target
+from resonant.runners.brain import (
+    asks_live_state,
+    claims_change,
+    guessed_arg,
+    slim_schema,
+    stub,
+    unnamed_target,
+)
 from resonant.tools.builtin import BUILTIN_SPECS
 from resonant_sdk import Effect, Level, ToolSpec
 
@@ -155,3 +162,71 @@ def test_unnamed_target(
     spec: ToolSpec, args: dict[str, Any], message: str, want: str | None
 ) -> None:
     assert unnamed_target(spec, args, message) == want
+
+
+PR = ToolSpec(
+    name="pr",
+    description="One pull request with its checks.",
+    args_schema={
+        "type": "object",
+        "properties": {"repo": {"type": "string"}, "number": {"type": "integer"}},
+        "required": ["repo", "number"],
+        "additionalProperties": False,
+    },
+    effect=Effect.READ,
+    extension="github",
+    source="ext:github",
+)
+TRANSCRIPT = next(s for s in BUILTIN_SPECS if s.name == "read_transcript")
+BRIEFING = "Claude slots 0/1 in use.\nRuns:\n- R3 running · dori"
+
+
+@pytest.mark.parametrize(
+    ("spec", "args", "message", "seen", "want"),
+    [
+        # BR-9: "most recent PRs?" became pr{number: 1}; a bare "1" in the briefing is no source
+        (PR, {"repo": "jhe/resonant", "number": 1}, "Most recent commits/PRs?", BRIEFING,
+         "number=1"),
+        (PR, {"repo": "jhe/resonant", "number": 40}, "show PR 40", BRIEFING, None),
+        (PR, {"repo": "jhe/resonant", "number": 104}, "is it green?",
+         'Tool result: {"commits":[{"pr":104,"subject":"BR-8 (#104)"}]}', None),
+        (PR, {"repo": "jhe/resonant", "number": 104}, "is it green?",
+         '{"prs":[{"number":104}]}', None),
+        (PR, {"repo": "jhe/resonant", "number": 12}, "and its CI?",
+         "PR #12 https://github.com/own/dori/pull/12", None),
+        (PR, {"repo": "jhe/resonant", "number": 12}, "and its CI?", "up 12m, R12", "number=12"),
+        # recent_changes gives "pr":104 even when a long subject lost its "(#104)" to the clip
+        (PR, {"repo": "jhe/resonant", "number": 104}, "is it green?",
+         '{"commits":[{"pr":104,"subject":"BR-8: a very long subject…"}]}', None),
+        (TRANSCRIPT, {"code": "R3"}, "what's it doing", BRIEFING, None),  # from the briefing
+        (TRANSCRIPT, {"code": "R9"}, "what's it doing", BRIEFING, "code=R9"),
+        (TRANSCRIPT, {"code": "R3"}, "show r3", "", None),
+        (CANCEL, {"code": "R9"}, "cancel the run", "", None),  # writes: unnamed_target's job
+        (LIST, {}, "list them", "", None),
+    ],
+)  # fmt: skip
+def test_guessed_arg(
+    spec: ToolSpec, args: dict[str, Any], message: str, seen: str, want: str | None
+) -> None:
+    assert guessed_arg(spec, args, message, seen) == want
+
+
+@pytest.mark.parametrize(
+    ("message", "live"),
+    [
+        ("Status on resonant repo changes", True),
+        ("Most recent commits/PRs?", True),
+        ("I think that's an old one! Need the newest ones", True),
+        ("what's the latest on the dori PRs", True),
+        ("anything merged today?", True),
+        ("thanks!", False),
+        ("set my status to away", False),
+        ("I recently moved, what's a good mover", False),
+        ("what's the capital of australia", False),
+        ("where is mycelium?", False),
+        ("what's R1 doing?", False),
+        ("how many seconds in a day", False),
+    ],
+)
+def test_asks_live_state(message: str, live: bool) -> None:
+    assert asks_live_state(message) is live

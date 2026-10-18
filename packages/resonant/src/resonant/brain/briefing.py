@@ -18,8 +18,9 @@ Owner briefing, in order (empty sections are left out):
 - ``Workers ask:`` open worker questions with their options.
 - ``Waiting on the owner:`` open approvals by their code-built summary and expiry, never
   their codes (codes are for the owner's eyes only).
-- ``Repos:`` name, checkout path (a NULL ``path`` means ``<runner.code_dir>/<name>``), mode
-  and CI.
+- ``Repos:`` name, its GitHub ``owner/name``, checkout path (a NULL ``path`` means
+  ``<runner.code_dir>/<name>``), mode and CI; then Resonant's own checkout
+  (``ops.repo_path``) when no registered repo is it (BR-9).
 - ``Extensions:`` name, status and health.
 - ``Workers aren't set up:`` the runner's setup gaps, when it isn't.
 
@@ -36,6 +37,7 @@ expired, worker questions asked; the newest ``SINCE_MAX``. Owner only (a member 
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -171,6 +173,8 @@ def repo_path(name: str, path: Path | None, code_dir: Path) -> Path:
 class RepoPath:
     name: str
     path: Path
+    slug: str = ""  # GitHub owner/name
+    note: str = ""  # shown after the path, e.g. "Resonant itself"
 
 
 def render_briefing(
@@ -226,8 +230,11 @@ def render_briefing(
     repos: list[str] = []
     for rp in repo_paths:
         item = known.get(rp.name)
-        extra = "" if item is None else f" ({item.mode}{', CI' if item.ci else ''})"
-        repos.append(f"{rp.name}: {rp.path}{extra}")
+        tags = [] if item is None else [item.mode, *(["CI"] if item.ci else [])]
+        tags += [rp.note] if rp.note else []
+        extra = f" ({', '.join(tags)})" if tags else ""
+        slug = f" ({_clean(rp.slug, 120)})" if rp.slug else ""
+        repos.append(f"{rp.name}{slug}: {rp.path}{extra}")
     extensions = [f"{e.name} ({e.status}, {e.health})" for e in snapshot.extensions]
     sections = [
         _capped("Unhealthy", health, len(health)),
@@ -241,6 +248,13 @@ def render_briefing(
         missing = snapshot.runner.missing or ["unknown"]
         sections.append(_capped("Workers aren't set up", missing, 5, inline=True))
     return _fit(" ".join(head), sections, budget)
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return False
 
 
 def gather_briefing(
@@ -269,8 +283,17 @@ def gather_briefing(
     status = collect_status(conn, settings, started_at=started_at, last_tick=last_tick)
     code_dir = settings.runner.code_dir
     paths = [
-        RepoPath(r.name, repo_path(r.name, r.path, code_dir)) for r in repo_store.list_all(conn)
+        RepoPath(r.name, repo_path(r.name, r.path, code_dir), slug=r.slug)
+        for r in repo_store.list_all(conn)
     ]
+    own = settings.ops.repo_path
+    if own is not None:
+        mine = [i for i, rp in enumerate(paths) if _same_path(rp.path, own)]
+        if mine:
+            i = mine[0]
+            paths[i] = RepoPath(paths[i].name, paths[i].path, paths[i].slug, "Resonant itself")
+        else:
+            paths.append(RepoPath("resonant", own, note="Resonant itself"))
     return render_briefing(snapshot, status, repo_paths=paths, owner=owner, tz=settings.timezone)
 
 

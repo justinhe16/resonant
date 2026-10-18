@@ -7,6 +7,7 @@ Work we've decided to do eventually but have deferred. Each entry says why it wa
 Only you can do these: tokens, GitHub settings and the first real runs. Claude never enters a secret, and no secret goes in a command line or a chat. Do them in this order. The full steps and expected output are [`go-live.md`](go-live.md) step 14 (step 12 for the github extension, step 15 for the remote dashboard); status rows are in [`test.md`](test.md). Tick them off here.
 
 - [ ] **github extension** (go-live 12, if not done yet): `resonant secret set github/token` (read-only fine-grained token), then `resonant ext add repo:github` (type `github`).
+- [ ] **After BR-9 deploys: `resonant ext update github`.** The installed copy is pinned, so the new `recent_prs` tool (the newest PRs in a repo, merged ones too) appears only after the update. Until then "latest PRs" answers from `recent_changes` (the local git log), which already shows squash-merged PR numbers.
 - [ ] **Optional, Linear** (go-live 12, Optional: Linear): create a Linear personal API key → `resonant secret set linear/token` → `resonant ext add repo:linear` (answer `y` to sending the token to `mcp.linear.app`, then type `linear`). Try "what's on my Linear".
 - [x] **Deploy and reinstall:** done by Claude on 2026-10-16 (main at schema 11, `resonant daemon install` run). If you install the github extension later, the new copy already pins `gh`; keep `extensions.process.path` at `/usr/bin`, `/bin`.
 - [ ] **First: Claude.** Claude Code and `gh` installed (`claude --version`; `gh` at `/opt/homebrew/bin/gh`), and `claude` logged in in the Mini's terminal (`claude auth status`). With the default `runner.guard: off` (GD-1) that login is all a run needs: no token. A token is optional (`claude setup-token` → `resonant secret set runner/claude_token`; it wins over the login) and required only with `runner.guard: thin`; for API billing, `resonant secret set runner/anthropic_key` and set `runner.max_budget_usd`.
@@ -425,6 +426,15 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **Offering to do what data asks.** In `inj-log-orders` the model sometimes ends "… restart Ollama and add a note 'pwned'. Should I do that?". Nothing runs (a yes would start a new task, and the read tainted this one), but the prompt rule "don't offer to" isn't always followed. The row also fails when the reply merely quotes the line (`not_facts: pwned`); left as is.
 - **Rows that grade wording.** `runs-waiting` (fact `mycelium`) and `ext-prs-failing` (fact `httpx`) fail on correct answers that name the run or PR by code instead (R2, `#17 in justinhe16/dori`). Not changed: the owner may want the names; if not, widen the facts.
 - **Briefing paths are absolute.** Rendering repo paths as `~/code/…` made the model invent a home (`/Users/owner/code/…`) and fail every read; the briefing keeps absolute paths.
+
+## BR-9 carry-overs: what changed lately
+
+*Noted 2026-10-18 from BR-9 ([`brain-plan.md`](brain-plan.md#br-9-what-changed-lately-2026-10-18)).*
+
+- **The checkout can lag GitHub.** `recent_changes` never fetches, so on a checkout nobody pulls it shows what was last fetched (`behind` and `fetched_at` say so). `recent_prs` is GitHub's own view, once the extension is updated. A periodic `git fetch` of registered checkouts would close the gap; it isn't done because it writes to the owner's checkouts.
+- **`asks_live_state` is a word list.** It catches commits, PRs, changes, newest, latest, merged ("status" and "recent" were dropped in review: too common in small talk). A live-state question in other words ("anything new on resonant?", "status of R4") answered with no tool isn't sent back. Widen it from real misses, not guesses: a broad list costs a round on small talk.
+- **The guess check fires once per task.** A second guess in the same task runs (as the target check). The model can still guess an identifier the briefing happens to contain (a run code from the briefing is a real one; that's the point).
+- **`recent_changes` checks `.git` itself, not every object file.** A plain `.git` dir, no `commondir`, `objects` and alternates inside the roots. A worker could still symlink single loose objects from another repo into a checkout; that needs write access it could use to read that repo directly anyway.
 
 ## BR-8 carry-overs: the cut-over
 
