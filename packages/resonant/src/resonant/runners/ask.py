@@ -145,7 +145,9 @@ _WRITE_WORDS = frozenset(
 )
 _WRITE_STEMS = (
     "send", "creat", "updat", "delet", "remov", "respond", "repl", "forward", "modif", "trash",
-    "archiv", "writ", "edit", "upload", "cancel", "rsvp", "invit", "draft",
+    "archiv", "writ", "edit", "upload", "cancel", "rsvp", "invit", "draft", "unarch", "star",
+    "exec", "book", "append", "snooze", "publish", "submit", "approv", "confirm", "trigger",
+    "invok",
 )  # fmt: skip
 _HUMP = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _DRAFT_ONLY = re.compile(r"(?:create)?drafts?")
@@ -743,9 +745,11 @@ class AskRunner:
             if created is not None:  # a wrong start time would make a crash's reap skip it
                 ctx.save(checkpoint={**cp, "pid": proc.pid, "created": created, "marker": marker})
         except BaseException:
-            await reaper.reap(target, grace_s=self.kill_grace_s)
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+            try:
+                await reaper.reap(target, grace_s=self.kill_grace_s)
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
             raise
         result: dict[str, Any] | None = None
         refusal: str | None = None
