@@ -16,7 +16,7 @@ Update a row when you try it, with the date and anything odd.
 |---|---|---|---|
 | 1 | `/pulse` | `Nothing new since the last update.` | 📱 |
 | 2 | `/pulse now` | `Nothing new to send.` | 📱 |
-| 3 | `/ext list` | `core · built in` with `briefing` and `pulse`, each with a next time | 📱 |
+| 3 | `/ext list` | `core · built in` with `briefing`, `pulse` and `watches` (BR-7), each with a next time | 📱 |
 | 4 | `/github prs` (before install) | `github isn't installed. On the Mini: resonant ext add repo:github` | 📱 |
 | 5 | `/ext run core/briefing` | The briefing, or `Nothing on today.`, then `Briefing sent.` | 📱 |
 | 6 | The 08:00 briefing arrives on its own | One message, every day, even if it's `Nothing on today.` | 📱 (wait for it) |
@@ -148,6 +148,22 @@ Numbered L1–L7. `brain.mode` defaults to `intents`; L1 turns the loop on (BR-8
 | L5 | "remember that dori deploys on fridays"; then "read ~/code/dori/README.md and remember what it says about deploys" | The first runs (`Remembered …`); the second asks first (`[A7] … Reply yes / no`, no `yes always`) because the file read tainted the task | 📱 after L1 |
 | L6 | Something the local model can't finish ("compare the last ten runs' failures and summarise the causes") | Either an answer, or `Looking into it…` and then `Claude: …` (auto-escalation) | 📱 after L1 |
 | L7 | `brew services stop ollama`, text "hey", then `brew services start ollama` | `I'm having trouble thinking right now. …` (the intents fallback), no crash; after the restart replies come back | 📱 + 🖥 after L1 |
+
+## Media, links, watches, proactive (BR-7)
+
+Numbered M1–M9. Attachments work in either `brain.mode`; links and watches need the loop (L1). Messages' attachments stay where Messages put them; Resonant copies one into `~/.resonant/ask/<task>` only for the length of an ask.
+
+| # | Test | Expect | Status |
+|---|---|---|---|
+| M1 | Send a screenshot with "what's this?" | `Looking into it…`, then `Claude: …` about the picture; `sqlite3 ~/.resonant/resonant.db "select runner, status from tasks order by rowid desc limit 3"` shows `media|done` and `ask|done` | 📱 + 🖥 |
+| M2 | Send an iPhone photo (HEIC) with no text | `Looking into it…`, then a description (the HEIC went to Claude as a JPEG: `sips`) | 📱 |
+| M3 | Send a PDF with no text | `Looking into it…`, then a short summary | 📱 |
+| M4 | A voice note, no whisper set up | `I can't play voice notes: Claude takes no audio and no local whisper is set up (brain.whisper_path). Type it instead?` | 📱 |
+| M5 | Optional: `brew install whisper-cpp`, download a model (`ggml-base.en.bin`), set `brain: {whisper_path: /opt/homebrew/bin/whisper-cli, whisper_model: <model path>}`, restart, send a voice note "where is mycelium" | The same answer as the typed question; no reply about the voice note itself; an approval prompt answered by voice stays pending (type `yes`) | 📱 + 🖥 |
+| M6 | A link alone ("https://…") or "summarise https://…" | `Looking into it…`, then `Claude: …` summarising the page (an `ask` task with `kind: link`) | 📱 after L1 |
+| M7 | "watch my notes and tell me when milk is on them", approve, then `/note milk` | `[A7] create watch …? Reply yes / no` → `Watching W1: …, every 1h until …`; within an hour (checks every 5 minutes, at the watch's interval) one `👀 W1 …: saw "milk"`; "list my watches" shows it `fired` | 📱 after L1 |
+| M8 | "watch https://<a page> and tell me when it says <X>" | Proposes an ask watch (every 60 minutes); when Claude answers YES, one `👀 W… : Claude: …` text; ask tasks in `select kind, checkpoint from tasks where runner='ask'` carry `"watch"` | 📱 after L1 |
+| M9 | Three watches that all fire on the same day, then a fourth | Three texts; the fourth waits (`brain.proactive_per_day: 3`) and shows in the next morning's briefing; `select decision, json_extract(detail,'$.reason') from audit_log where action='brain.notice'` shows `held|capped_day` | 📱 + 🖥 after M7 |
 
 ## Needs real data or effort
 

@@ -42,6 +42,13 @@ The session::
   task's result carries ``untrusted: true`` so a follow-up turn replays it as data. A send or
   an event change Claude would make comes back as a ``Proposed:`` line of text only.
 
+**Images** (BR-7): a HEIC/HEIF attachment is converted to JPEG inside the ask's folder
+(``convert.heic_to_jpeg``, macOS ``sips``): Claude takes JPEG, PNG, GIF and WebP only.
+
+**Watch asks** (BR-7, ``runners/watch.py``): ``enqueue(..., watch=<id>)`` adds a prompt line
+asking for ``YES`` or ``NO`` first, and the answer is handed to ``on_watch(watch_id, task_id,
+status, reply)`` instead of being texted: the watch decides whether anyone hears about it.
+
 Steps are idempotent: the answer is saved in the checkpoint before it is sent (a retry only
 re-sends, deduped by ``ask:<task>``), and a crash mid-session leaves the session's pid in the
 checkpoint so the next step reaps it before anything else.
@@ -89,6 +96,7 @@ from resonant.redact import Redactor
 from resonant.runner.claude_auth import LoginCheck, auth_source, status_env
 from resonant.runners import reaper
 from resonant.runners.claude import LimitHit, read_lines, usage_limit, wake_time
+from resonant.runners.convert import SIPS, heic_to_jpeg
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.sandbox import resolve_tool
 from resonant.secrets import SecretError, SecretStore, load_runner_secrets
@@ -175,6 +183,12 @@ KIND_HINTS: dict[str, str] = {
     "link": "Fetch the link with WebFetch and summarise it.",
 }
 KIND_NAMES = {"email": "Email", "calendar": "Calendar"}
+WATCH_HINT = (
+    "This is a scheduled check for a watch the owner set up. Start your answer with YES if "
+    "the condition in the question holds right now, or NO if it doesn't (or you can't tell), "
+    "then at most one short line on what you saw."
+)
+WatchHook = Callable[[int, str, str, str], Awaitable[None]]
 
 # Replies (code-built; only Claude's answer itself is untrusted).
 NOT_SET_UP = "Not done: Claude isn't set up here (no token, API key or working claude login)."
@@ -468,7 +482,7 @@ def _fd_path(fd: int) -> Path | None:
     return Path(raw.split(b"\0", 1)[0].decode(errors="surrogateescape"))
 
 
-def _copy_in(src: Path, dest: Path, scope: AttachScope) -> None:
+def copy_in(src: Path, dest: Path, scope: AttachScope) -> None:
     """Copy one checked attachment into the ask dir, never through a symlink. ``O_NOFOLLOW``
     covers only the last component, so the opened file's own path is checked again: a parent
     directory swapped for a link since the check can't carry a denied file in."""
@@ -531,6 +545,8 @@ class AskRunner:
         claude_cmd: Sequence[str] | None = None,
         home: Path | None = None,
         login_check: Callable[[], Awaitable[bool]] | None = None,
+        on_watch: WatchHook | None = None,
+        sips: str = SIPS,
         clock: Callable[[], datetime] = utcnow,
         poll_s: float = POLL_S,
         kill_grace_s: float = KILL_GRACE_S,
@@ -557,6 +573,8 @@ class AskRunner:
         self._login_check: Callable[[], Awaitable[bool]] = login_check or LoginCheck(
             self._claude_argv, self.home
         )
+        self.on_watch = on_watch  # a watch ask's answer (runners/watch.py), never texted
+        self.sips = sips
         self.clock = clock
         self.poll_s = poll_s
         self.kill_grace_s = kill_grace_s
@@ -576,10 +594,12 @@ class AskRunner:
         requested_by: str | None = None,
         channel_ref: dict[str, Any] | None = None,
         trace_id: str | None = None,
+        watch: int | None = None,
     ) -> Queued | AskRefused:
         """Queue an ask for ``principal`` (who gets the answer). Refused, with a code-built
         reason, when ask_claude is off, paused, at its usage limit or daily cap, or an
-        argument is bad. ``requested_by`` is the asking task (audit and the result)."""
+        argument is bad. ``requested_by`` is the asking task (audit and the result).
+        ``watch``: a watch's scheduled check; its answer goes to ``on_watch``."""
         if not self.cfg.enabled:
             return AskRefused("ask_claude is off (brain.ask_claude.enabled).")
         question = question.strip()
@@ -607,6 +627,8 @@ class AskRunner:
         cp: dict[str, Any] = {"question": question, "kind": kind, "attachments": checked}
         if requested_by is not None:
             cp["requested_by"] = requested_by
+        if watch is not None:
+            cp["watch"] = watch
         task_id = self._create_task(
             NewTask(
                 kind=TASK_KIND,
@@ -704,7 +726,7 @@ class AskRunner:
         except OSError as e:
             log.warning("ask attachments not copied", extra={"task": task.id, "error": str(e)})
             return await self._finish(task, ctx, cp, "failed", FAILED.format(why="attachments"))
-        prompt = self._prompt(question, kind, names)
+        prompt = self._prompt(question, kind, names, watch=isinstance(cp.get("watch"), int))
         try:
             outcome = await self._session(task, ctx, cp, argv, env, ask_dir, prompt, kind, marker)
         finally:
@@ -740,13 +762,13 @@ class AskRunner:
             if real is None:
                 raise OSError(why)
             name = f"attachment-{i}{Path(real).suffix.lower()[:8]}"
-            _copy_in(real, ask_dir / name, attach)
-            names.append(name)
+            copy_in(real, ask_dir / name, attach)
+            names.append(heic_to_jpeg(ask_dir / name, self.sips).name)  # Claude takes no HEIC
         return names
 
     @staticmethod
-    def _prompt(question: str, kind: Kind, names: Sequence[str]) -> str:
-        parts: list[str] = []
+    def _prompt(question: str, kind: Kind, names: Sequence[str], *, watch: bool = False) -> str:
+        parts: list[str] = [WATCH_HINT] if watch else []
         if hint := KIND_HINTS.get(kind):
             parts.append(hint)
         if names:
@@ -942,6 +964,14 @@ class AskRunner:
     async def _deliver(self, task: Task, cp: dict[str, Any]) -> StepOutcome:
         reply, status = str(cp["reply"]), str(cp.get("status") or "answered")
         assert task.principal is not None
+        watch = cp.get("watch")
+        if isinstance(watch, int) and not isinstance(watch, bool):
+            if self.on_watch is not None:  # idempotent: the watch remembers this ask's id
+                await self.on_watch(watch, task.id, status, reply)
+            else:
+                log.warning("ask: a watch answer with no watch runner", extra={"watch": watch})
+            return Done({"status": status, "kind": cp.get("kind"), "watch": watch,
+                         "untrusted": True, "proposed": False})  # fmt: skip
         key = cp.get("dedupe_key")
         try:
             await self.channel.send(

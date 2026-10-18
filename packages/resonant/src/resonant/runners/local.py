@@ -247,7 +247,25 @@ def render_commands(d: dict[str, Any]) -> str:
     return "\n".join(["Commands:", *lines]) if lines else "No commands available."
 
 
+def render_ask(d: dict[str, Any]) -> str:
+    """ask_claude's own code-built text: ``Looking into it…`` or why it was refused."""
+    text = d.get("text")
+    return text if isinstance(text, str) and text else "ask_claude: ok"
+
+
+def render_watches(d: dict[str, Any]) -> str:
+    """``list_watches``: one line each, code-built from the stored fields."""
+    lines: list[str] = []
+    for w in (_as_dict(x) for x in cast(list[Any], d.get("watches") or [])):
+        state = w.get("state")
+        tail = f"every {w.get('every_minutes')}m" if state == "active" else str(state)
+        lines.append(f"{w.get('id')} {w.get('what')} ({tail})")
+    return "\n".join(["Watches:", *lines]) if lines else "No watches."
+
+
 _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
+    "ask_claude": render_ask,
+    "list_watches": render_watches,
     "daemon_status": render_status,
     "disk": render_disk,
     "list_commands": render_commands,
@@ -420,6 +438,25 @@ def _fact_forgotten(d: dict[str, Any]) -> str | None:
     return f"Forgot {name}." if d.get("forgotten") is True and isinstance(name, str) else None
 
 
+def _watch_created(d: dict[str, Any]) -> str | None:
+    code, what, every = d.get("id"), d.get("what"), d.get("every_minutes")
+    if d.get("created") is not True or not isinstance(code, str) or not isinstance(what, str):
+        return None
+    often = f"{every // 60}h" if isinstance(every, int) and every % 60 == 0 else f"{every}m"
+    until = d.get("expires_at")
+    end = f" until {until[:10]}" if isinstance(until, str) else ""
+    return f"Watching {code}: {what}, every {often}{end}."
+
+
+def _watch_cancelled(d: dict[str, Any]) -> str | None:
+    code, what = d.get("id"), d.get("what")
+    if not isinstance(code, str) or not isinstance(what, str):
+        return None
+    if d.get("cancelled") is True:
+        return f"Stopped watch {code}: {what}."
+    return f"Watch {code} had already ended ({d.get('state')})."
+
+
 def summarize_intent(intent: Intent) -> str:
     """The code-built phrase for ``intent`` in replies: the ops heading (``update Resonant``)
     when there is one, as in approval prompts and dry-run replies, else the generic summary."""
@@ -453,6 +490,8 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "remove_trust_rule": _rule_removed,
     "remember": _fact_saved,
     "forget": _fact_forgotten,
+    "create_watch": _watch_created,
+    "cancel_watch": _watch_cancelled,
 }
 
 

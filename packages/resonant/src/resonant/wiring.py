@@ -54,6 +54,12 @@ Ask Claude. ``runner="ask"`` (``runners.ask.AskRunner``, BR-5) runs one read-onl
 per ``ask_claude`` call and texts the answer, so it is registered here; the tool reaches it as
 ``components.runners["ask"]``. With iMessage off the tool answers that it isn't running.
 
+Media and watches (BR-7). ``runner="media"`` (``runners.media.MediaRunner``) answers an
+owner's message with attachments: an image or PDF goes to ``ask_claude`` as a direct call, a
+voice note through whisper and back into ``loop.submit`` as text. ``runner="watch"``
+(``runners.watch.WatchRunner``) runs the checks ``core/watches`` queues; the ask runner hands
+it the answers of ask watches (``AskRunner.on_watch``). Both send through this channel.
+
 Claude workers. ``runner="claude"`` (``runners.claude.ClaudeRunner``) runs a Claude session
 under the thin guard in a worktree of the owner's checkout (or a scratch dir) and reports the
 PR or the answer; it replies over the channel, so it is registered here. The daemon calls its
@@ -107,7 +113,9 @@ from resonant.runners.brain import MAX_ROUNDS, BrainRunner
 from resonant.runners.claude import ClaudeRunner
 from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
+from resonant.runners.media import MediaRunner
 from resonant.runners.reminder import ReminderRunner
+from resonant.runners.watch import WatchRunner
 from resonant.runners.worker_desk import SelfOps
 from resonant.secrets import SecretStore
 from resonant.store.db import utcnow
@@ -231,6 +239,12 @@ class IMessageStack:
         close, self._close_model = self._close_model, None
         if close is not None:
             await close()
+
+
+def _ask_runner(components: Components) -> AskRunner | None:
+    """``runner="ask"`` as registered now (a test may swap it after the build)."""
+    found = components.runners.get("ask")
+    return found if isinstance(found, AskRunner) else None
 
 
 class _DryRunOps:
@@ -409,6 +423,35 @@ def build_imessage_stack(
     )
     components.runners[asks.name] = asks
     loop.runners[asks.name] = asks
+    # BR-7: attachments (images and PDFs to ask_claude, voice notes through whisper)
+    media = MediaRunner(
+        conn,
+        model=model,
+        channel=channel,
+        gate=components.gate,
+        executor=components.executor,
+        registry=components.registry,
+        settings=settings,
+        principals=components.principals,
+        submit=loop.submit,
+        extensions=components.extensions,
+    )
+    components.runners[media.name] = media
+    loop.runners[media.name] = media
+    # BR-7: watch checks (core/watches queues them); ask watches answer through on_watch
+    watcher = WatchRunner(
+        conn,
+        gate=components.gate,
+        executor=components.executor,
+        registry=components.registry,
+        principals=components.principals,
+        channel=channel,
+        settings=settings,
+        asks=lambda: _ask_runner(components),
+    )
+    asks.on_watch = watcher.ask_answered
+    components.runners[watcher.name] = watcher
+    loop.runners[watcher.name] = watcher
     router.fast_path.runs_killed = lambda: claude.last_killed
     router.relay.workers = lambda: claude  # owner replies to worker questions (EM-5)
 

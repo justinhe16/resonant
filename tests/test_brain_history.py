@@ -30,7 +30,7 @@ def seed(db: sqlite3.Connection, n: int, *, start: int = 0) -> list[str]:
 
 
 def test_migration_015(db: sqlite3.Connection) -> None:
-    assert schema_version(db) == latest_version() == 15
+    assert schema_version(db) == latest_version() == 16
     cols = {r["name"] for r in db.execute("PRAGMA table_info(brain_summaries)")}
     assert cols == {"principal", "summary", "through_event_id", "folded", "source", "updated_at"}
 

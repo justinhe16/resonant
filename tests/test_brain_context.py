@@ -53,7 +53,7 @@ PRINCIPALS = Principals(
 CORE = [s for s in BUILTIN_SPECS if s.name in ("list_runs", "remember", "system_status")]
 # The stable prefix with CORE and no facts. Changing BRAIN_SYSTEM or the prefix layout changes
 # this on purpose: update it in the same change.
-PINNED_PREFIX_HASH = "f726733262235a48"
+PINNED_PREFIX_HASH = "400f4b81b4865ed1"
 
 
 @pytest.fixture

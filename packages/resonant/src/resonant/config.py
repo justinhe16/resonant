@@ -720,6 +720,27 @@ DEFAULT_READ_DENY: tuple[str, ...] = (
 )
 
 
+class WatchConfig(_Section):
+    """Watches (BR-7, docs/brain-plan.md D10): ``create_watch`` registers a periodic check,
+    run by ``core/watches`` and ``runners/watch.py``."""
+
+    enabled: bool = True
+    max_active: int = Field(default=10, ge=1, le=50)  # active watches at once, per owner
+    # A tool check runs at most this often; an ask check (a Claude session, counted against
+    # brain.ask_claude.daily_cap) at most every ``ask_min_interval_minutes``.
+    min_interval_minutes: int = Field(default=15, ge=15, le=24 * 60)
+    ask_min_interval_minutes: int = Field(default=60, ge=15, le=24 * 60)
+    default_days: int = Field(default=7, ge=1, le=30)  # a watch ends after this, unfired
+    max_days: int = Field(default=30, ge=1, le=90)
+    max_fails: int = Field(default=3, ge=1, le=20)  # consecutive failed checks end a watch
+
+    @model_validator(mode="after")
+    def _days(self) -> Self:
+        if self.default_days > self.max_days:
+            raise ValueError("brain.watches.default_days must be <= brain.watches.max_days")
+        return self
+
+
 class BrainConfig(_Section):
     """The brain (docs/brain-plan.md). BR-2: where the read tools (``tools/files.py``) look."""
 
@@ -736,6 +757,31 @@ class BrainConfig(_Section):
     rg_path: Path | None = Path("/opt/homebrew/bin/rg")
     # ask_claude (BR-5, docs/brain-plan.md D8): reads the same roots and deny list.
     ask_claude: AskClaudeConfig = Field(default_factory=AskClaudeConfig)
+    # BR-7 (D10). Voice notes: a local whisper binary (whisper.cpp's ``whisper-cli``, by
+    # absolute path). Unset: a voice note gets "voice needs whisper" (Claude takes no audio).
+    whisper_path: Path | None = None
+    # Its model file, passed as ``-m <model>`` before ``whisper_args`` when set.
+    whisper_model: Path | None = None
+    # ``{input}`` is the audio file (a 16 kHz mono WAV when afconvert is there). The
+    # transcript is read from stdout.
+    whisper_args: list[str] = Field(default_factory=lambda: ["-nt", "-np", "-f", "{input}"])
+    whisper_timeout_s: float = Field(default=120.0, gt=0, le=900)
+    # Brain-authored texts (a watch firing): at most this many a day (settings.timezone), on
+    # top of extensions.notify.max_per_hour. Over it, a notice waits for the briefing.
+    proactive_per_day: int = Field(default=3, ge=0, le=50)
+    watches: WatchConfig = Field(default_factory=WatchConfig)
+
+    @field_validator("whisper_path", "whisper_model")
+    @classmethod
+    def _whisper(cls, v: Path | None) -> Path | None:
+        return _absolute(v.expanduser(), "brain.whisper_path/whisper_model") if v else None
+
+    @field_validator("whisper_args")
+    @classmethod
+    def _whisper_args(cls, v: list[str]) -> list[str]:
+        if sum(a.count("{input}") for a in v) != 1:
+            raise ValueError("brain.whisper_args must hold {input} exactly once")
+        return v
 
     @field_validator("read_roots")
     @classmethod

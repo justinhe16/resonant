@@ -40,6 +40,7 @@ from resonant.tools import ops as ops_tools
 from resonant.tools import repos as repos_tools
 from resonant.tools import runs as runs_tools
 from resonant.tools import trust as trust_tools
+from resonant.tools import watches as watch_tools
 from resonant.tools.builtin import register_builtins
 from resonant.tools.registry import ToolKey
 from resonant.trust.tools import StandingAllows
@@ -130,6 +131,7 @@ def summary_actions(conn: sqlite3.Connection) -> dict[ToolKey, SummaryAction]:
     for spec in (trust_tools.ALLOW_TRUST_RULE, trust_tools.REMOVE_TRUST_RULE):
         actions[(None, spec.name)] = trust_rule
     actions[(None, repos_tools.MERGE_CI_PR.name)] = repos_tools.summary_action
+    actions[(None, watch_tools.CREATE_WATCH.name)] = watch_tools.summary_action
     return actions
 
 

@@ -42,6 +42,7 @@ from resonant.tools import (
     tasks,
     trust,
     updates,
+    watches,
 )
 from resonant.tools.base import BuiltinContext, BuiltinModule
 from resonant.tools.projects import PROJECTS
@@ -84,6 +85,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     files,
     facts,
     ask,
+    watches,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 
