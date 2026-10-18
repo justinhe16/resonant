@@ -37,6 +37,12 @@ _CODE_LIKE = re.compile(
 )
 
 
+def mask_codes(text: str) -> str:
+    """Mask anything that could pass for an approval code (``A7``, ``a 7``) and nothing else,
+    for longer untrusted text shown as is (an ``ask_claude`` answer)."""
+    return _CODE_LIKE.sub("?", text)
+
+
 def clean_external(text: str) -> str:
     """Steps 1-3 of ``sanitize_external`` plus whitespace collapse, without truncating or
     quoting. Callers that truncate must mark the loss themselves."""

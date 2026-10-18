@@ -25,6 +25,7 @@ from resonant.executor import HandlerKey, ToolHandler
 from resonant.principals import Principals
 from resonant.store.db import utcnow
 from resonant.tools import (
+    ask,
     commands,
     ext,
     notes,
@@ -76,6 +77,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     runs,
     repos,
     trust,
+    ask,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 

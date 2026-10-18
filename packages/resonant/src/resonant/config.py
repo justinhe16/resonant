@@ -576,6 +576,119 @@ class RunnerConfig(_Section):
         return _absolute(v, "runner binary paths")
 
 
+_CALENDAR = "mcp__claude_ai_Google_Calendar__"
+_GMAIL = "mcp__claude_ai_Gmail__"
+
+
+def _connector_reads() -> dict[Literal["email", "calendar"], list[str]]:
+    return {
+        # The Calendar names are the connector's real ones; the Gmail names are a guess until
+        # the owner finishes connecting Gmail in claude.ai (docs/brain-plan.md D8).
+        "calendar": [f"{_CALENDAR}{t}" for t in ("list_calendars", "list_events", "get_event",
+                                                   "search_events", "suggest_time")],
+        "email": [f"{_GMAIL}search_threads", f"{_GMAIL}get_thread"],
+    }  # fmt: skip
+
+
+def _draft_tools() -> list[str]:
+    return [f"{_GMAIL}create_draft"]
+
+
+def _attachment_roots() -> list[Path]:
+    return [Path("~/Library/Messages/Attachments")]
+
+
+class AskClaudeConfig(_Section):
+    """``ask_claude`` (docs/brain-plan.md D8, ``runners/ask.py``): a read-only ``claude -p``
+    session per question, its own task, apart from the worker slots."""
+
+    enabled: bool = True
+    concurrency: int = Field(default=1, ge=1, le=4)  # sessions at once
+    daily_cap: int = Field(default=30, ge=0, le=500)  # asks a day (settings.timezone)
+    timeout_s: float = Field(default=120.0, gt=0, le=900)
+    max_turns: int = Field(default=15, ge=1, le=50)
+    reply_max_chars: int = Field(default=1500, ge=200, le=4000)
+    # API billing only (``runner/anthropic_key``): ``--max-budget-usd`` per ask.
+    max_budget_usd: float = Field(default=1.0, gt=0, le=20)
+    # Connector read tools a kind needs, exact claude.ai tool names. Every one listed must
+    # appear in the session's init event, or the ask is refused; a name that reads as a
+    # write (send, create, update, delete, respond, ...) is never allowed whatever this says.
+    connector_tools: dict[Literal["email", "calendar"], list[str]] = Field(
+        default_factory=_connector_reads
+    )
+    # Draft tools, allowed for ``email`` asks only when the connector has them (never
+    # required). A name that reads as a send or a delete is never allowed.
+    draft_tools: list[str] = Field(default_factory=_draft_tools)
+    # Where attachments (screenshots, photos) may come from besides ``brain.read_roots``.
+    attachment_roots: list[Path] = Field(default_factory=_attachment_roots, validate_default=True)
+
+    @field_validator("attachment_roots")
+    @classmethod
+    def _expand_roots(cls, v: list[Path]) -> list[Path]:
+        return [_absolute(p.expanduser(), "brain.ask_claude.attachment_roots") for p in v]
+
+
+def _read_roots() -> list[Path]:
+    return [Path("~/code"), Path("~/resonant")]
+
+
+def _read_deny() -> list[str]:
+    return [
+        "~/Documents",
+        "~/Library",
+        "~/.ssh",
+        "~/.gnupg",
+        "~/.aws",
+        ".env*",
+        "*.pem",
+        "*.key",
+        "credentials*",
+    ]
+
+
+class BrainConfig(_Section):
+    """The brain (docs/brain-plan.md). ``read_roots`` and ``read_deny`` are shared by the read
+    tools (D5, ``tools/files.py``) and ``ask_claude`` (D8)."""
+
+    # What may be read, besides Resonant's own logs and run transcripts (always added, see
+    # ``brain_read_roots``): the owner's code and Resonant's checkout (its docs).
+    read_roots: list[Path] = Field(default_factory=_read_roots, validate_default=True)
+    # Never read, even inside a root. An entry with a ``/`` (``~/.ssh``) is a path: it and
+    # everything under it. One without (``.env*``) is a file-name glob, matched anywhere.
+    read_deny: list[str] = Field(default_factory=_read_deny)
+    ask_claude: AskClaudeConfig = AskClaudeConfig()
+
+    @field_validator("read_roots")
+    @classmethod
+    def _expand_roots(cls, v: list[Path]) -> list[Path]:
+        return [_absolute(p.expanduser(), "brain.read_roots") for p in v]
+
+    @field_validator("read_deny")
+    @classmethod
+    def _deny(cls, v: list[str]) -> list[str]:
+        for entry in v:
+            if not entry.strip() or any(c in entry for c in ",()"):
+                raise ValueError(f"brain.read_deny entry {entry!r} is empty or has , ( or )")
+            if "/" in entry and not Path(entry).expanduser().is_absolute():
+                raise ValueError(f"brain.read_deny path {entry!r} must be absolute or ~/...")
+        return v
+
+    def deny_paths(self) -> list[Path]:
+        """The path entries of ``read_deny``, expanded."""
+        return [Path(e).expanduser() for e in self.read_deny if "/" in e]
+
+    def deny_globs(self) -> list[str]:
+        """The file-name glob entries of ``read_deny``."""
+        return [e for e in self.read_deny if "/" not in e]
+
+
+def brain_read_roots(settings: Settings) -> list[Path]:
+    """``brain.read_roots`` plus Resonant's logs and the run transcripts, wherever
+    ``RESONANT_HOME`` and ``runner.mirror_dir`` put them."""
+    extra = [settings.logs_dir, settings.runner.mirror_dir.parent / "transcripts"]
+    return list(dict.fromkeys([*settings.brain.read_roots, *extra]))
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESONANT_",
@@ -604,6 +717,7 @@ class Settings(BaseSettings):
     pulse: PulseConfig = PulseConfig()
     runner: RunnerConfig = RunnerConfig()
     trust: TrustConfig = TrustConfig()
+    brain: BrainConfig = BrainConfig()
 
     @field_validator("home")
     @classmethod

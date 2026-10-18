@@ -38,6 +38,10 @@ calls ``resonant note`` for up to S seconds until a reply carries an owner messa
 is noted in ``<run>/tmp/cli.json`` (argv, exit code, output). ``--check-flag F`` (repeatable)
 adds a flag such as ``--irreversible`` to the ``check`` call.
 
+Ask mode (BR-5): an argv with ``--restricted`` is an ``ask_claude`` session (``_ask_mode``
+below): the question on stdin, an ``init`` event with the allowed built-ins and fake
+connector tools, then an answer, a usage limit, an error, a hang or an escaped child.
+
 ``--guard-probe JSON`` (EM-9, under the real thin guard): before anything else, try what a worker
 may and may not do and write ``<run>/tmp/guard.json``. Keys: ``env`` (read this name in cwd, the
 checkout's linked ``.env``), ``state`` (create a file in this dir, the daemon's state),
@@ -58,6 +62,101 @@ import threading
 import time
 from datetime import UTC, datetime
 from typing import Any
+
+
+# --- ask mode (BR-5): `claude -p --restricted ...` for ask_claude (runners/ask.py) ---------
+# Taken when the argv has --restricted (only the ask session passes it). The question comes on
+# stdin. The test adds: --notes DIR (argv.json: argv, cwd, prompt, the cwd's files, which
+# credential variables are set and the marker; pid.json: pids), --scenario (answer,
+# usage_limit, hang, escapee, error, maxturns, noresult, slow), --answer TEXT, --connectors
+# (comma list of extra tool names for the init event; default: fake Calendar and Gmail tools,
+# reads and writes), --drop (comma list of tools left out of the init event), --sleep S.
+FAKE_CONNECTORS = (
+    "mcp__claude_ai_Google_Calendar__list_calendars,mcp__claude_ai_Google_Calendar__list_events,"
+    "mcp__claude_ai_Google_Calendar__get_event,mcp__claude_ai_Google_Calendar__search_events,"
+    "mcp__claude_ai_Google_Calendar__suggest_time,mcp__claude_ai_Google_Calendar__create_event,"
+    "mcp__claude_ai_Google_Calendar__update_event,mcp__claude_ai_Google_Calendar__delete_event,"
+    "mcp__claude_ai_Google_Calendar__respond_to_event,mcp__claude_ai_Gmail__search_threads,"
+    "mcp__claude_ai_Gmail__get_thread,mcp__claude_ai_Gmail__create_draft,"
+    "mcp__claude_ai_Gmail__send_message"
+)
+
+
+def _ask_mode() -> None:
+    aap = argparse.ArgumentParser()
+    aap.add_argument("-p", action="store_true")
+    aap.add_argument("--restricted", action="store_true")
+    aap.add_argument("--tools")
+    aap.add_argument("--permission-mode")
+    aap.add_argument("--allowedTools")
+    aap.add_argument("--disallowedTools")
+    aap.add_argument("--add-dir", action="append", default=[])
+    aap.add_argument("--no-session-persistence", action="store_true")
+    aap.add_argument("--output-format")
+    aap.add_argument("--verbose", action="store_true")
+    aap.add_argument("--max-turns")
+    aap.add_argument("--max-budget-usd")
+    aap.add_argument("--append-system-prompt")
+    aap.add_argument("--notes")
+    aap.add_argument("--scenario", default="answer")
+    aap.add_argument("--answer", default="Mycelium is in ~/code/mycelium.")
+    aap.add_argument("--connectors", default=FAKE_CONNECTORS)
+    aap.add_argument("--drop", default="")
+    aap.add_argument("--sleep", type=float, default=0.0)
+    a = aap.parse_args()
+    prompt = sys.stdin.read()
+
+    def out(obj: dict[str, Any]) -> None:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+    def keep(name: str, obj: Any) -> None:
+        if a.notes:
+            with open(os.path.join(a.notes, name), "w") as f:
+                json.dump(obj, f)
+
+    creds = [k for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY") if k in os.environ]
+    keep("argv.json", {"argv": sys.argv[1:], "cwd": os.getcwd(), "prompt": prompt,
+                       "files": sorted(os.listdir(".")), "creds": creds,
+                       "marker": os.environ.get("RESONANT_RUN"), "home": os.environ.get("HOME"),
+                       "env": sorted(os.environ)})  # fmt: skip
+    pids = {"leader": os.getpid()}
+    dropped = set(filter(None, a.drop.split(",")))
+    tools = [t for t in (a.tools or "").split(",") if t and t not in dropped]
+    tools += [t for t in a.connectors.split(",") if t and t not in dropped]
+    servers = sorted({t.split("__")[1] for t in tools if t.startswith("mcp__")})
+    out({"type": "system", "subtype": "init", "session_id": "fake-ask", "tools": tools,
+         "mcp_servers": [{"name": s, "status": "connected"} for s in servers],
+         "permissionMode": a.permission_mode})  # fmt: skip
+    if a.scenario == "escapee":
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"],
+                                 start_new_session=True)  # fmt: skip
+        pids["escapee"] = child.pid
+    keep("pid.json", pids)
+    if a.scenario in ("hang", "escapee"):
+        time.sleep(600)
+    if a.sleep:
+        time.sleep(a.sleep)
+    out({"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}]}})
+    if a.scenario == "noresult":
+        sys.exit(1)
+    if a.scenario == "usage_limit":
+        reset = int(time.time() + 3600)
+        out({"type": "result", "subtype": "error_during_execution", "is_error": True,
+             "result": f"Claude AI usage limit reached|{reset}"})  # fmt: skip
+        sys.exit(1)
+    if a.scenario in ("error", "maxturns"):
+        sub = "error_max_turns" if a.scenario == "maxturns" else "error_during_execution"
+        out({"type": "result", "subtype": sub, "is_error": True, "result": ""})
+        sys.exit(1)
+    out({"type": "result", "subtype": "success", "is_error": False, "result": a.answer,
+         "num_turns": 2, "total_cost_usd": 0.01})  # fmt: skip
+    sys.exit(0)
+
+
+if "--restricted" in sys.argv[1:]:
+    _ask_mode()
+
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-p", action="store_true")
