@@ -103,6 +103,8 @@ MAX_ANSWERS = 32  # server requests being answered at once
 
 # JSON Schema keywords kept in an input schema. Everything else (description, title, default,
 # examples, $comment, x-*) is dropped: free text the model would read as instructions.
+# Adding a subschema keyword here (if/then/else, dependentSchemas, …) means revisiting
+# ``_inverts``: a dropped pattern must never tighten the local check (LN-1).
 _SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
 _SCHEMA_ONE = frozenset(
     {"items", "additionalProperties", "not", "contains", "propertyNames", "additionalItems"}
@@ -305,7 +307,7 @@ def _output_schema(tool: Mapping[str, Any]) -> Any:
         return None
     try:
         return strip_schema(raw)
-    except ValueError:
+    except ValueError:  # e.g. a bad patternProperties key: hashed raw, never shown
         return raw
 
 
