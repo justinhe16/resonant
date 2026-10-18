@@ -97,6 +97,16 @@ Numbered D1–D6 so they don't collide with other sections' rows. Steps are [`go
 | D5 | Recovery: `kill -CONT $(pgrep -f 'resonant daemon run$')` | One `Resonant: snapshots back` push within a couple of minutes; banner clears; `resonant status` shows `daemon  up` (a watchdog restart is fine) | 🖥 + 📱 after D4 |
 | D6 | Paused shows from away: `/kill` over iMessage, watch the remote dashboard, then `/resume` | Within about a minute it shows paused and autonomy off (the relay keeps pushing while paused); after `/resume` it's back to on; no alert either way | 📱 after D3 |
 
+## Brain (after BR-1 wires the loop and `brain.mode: loop`)
+
+| # | Test | Expect | Status |
+|---|---|---|---|
+| B1 | "remember that mycelium is checked out at ~/code/mycelium" | `Remembered mycelium-path: "…"` (or a similar name); `ls -l ~/.resonant/brain/facts` shows one `-rw-------` file | 📱 + 🖥 after BR-1 |
+| B2 | "what do you remember?" then "forget mycelium-path" | The fact from B1; then `Forgot mycelium-path.` and the file is gone | 📱 after BR-1 |
+| B3 | Text "where is mycelium?" with no fact saved | The repo's path from the briefing (`Repos:`), or a guess that says what it assumed | 📱 after BR-1 |
+| B4 | Start a run, wait for it to finish without texting, then text "hey" | The reply can mention the run ended (the `since we last talked` notes) | 📱 after BR-1 |
+| B5 | A long thread (16+ texts), then "what did I ask you earlier about X?" | Answers from the summary; `sqlite3 ~/.resonant/resonant.db "select folded, source from brain_summaries"` shows `source=model` | 📱 + 🖥 after BR-1 |
+
 ## Needs real data or effort
 
 | # | Test | Where | Status |

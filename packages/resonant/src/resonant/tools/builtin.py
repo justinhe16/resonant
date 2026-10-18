@@ -27,6 +27,7 @@ from resonant.store.db import utcnow
 from resonant.tools import (
     commands,
     ext,
+    facts,
     notes,
     ops,
     projects,
@@ -76,6 +77,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     runs,
     repos,
     trust,
+    facts,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 

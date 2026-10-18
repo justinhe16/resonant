@@ -69,6 +69,9 @@ NAMES = {
     "add_trust_rule",
     "allow_trust_rule",
     "remove_trust_rule",
+    "list_facts",
+    "remember",
+    "forget",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {
@@ -94,6 +97,8 @@ WRITES = {
     "add_trust_rule": Level.L3,
     "allow_trust_rule": Level.L2,
     "remove_trust_rule": Level.L2,
+    "remember": Level.L3,
+    "forget": Level.L3,
 }
 
 
