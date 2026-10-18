@@ -153,14 +153,20 @@ def strip_schema(schema: object, depth: int = 0) -> Any:
     """``schema`` with only validation keywords kept (recursively). Property names are kept
     whatever they are called (a property named ``description`` stays). Raises ValueError.
 
-    A string ``pattern`` that can't be checked is dropped (``_checkable_pattern``), and the
-    result must only ever be **looser** than the server's schema: the server validates, and
-    a local check stricter than it would refuse calls the server accepts. Every keyword kept
-    is monotone in its subschemas except ``not`` and ``oneOf``, so (LN-2):
+    The result must only ever be **looser** than the server's schema: the server validates,
+    and a local check stricter than it would refuse calls the server accepts. A schema is
+    loosened when it loses an asserting keyword: a string ``pattern`` that can't be checked
+    (``_checkable_pattern``), or any keyword Draft 2020-12 enforces that isn't kept
+    (``if``/``then``/``else``, ``dependentRequired``, ``unevaluated*``, ``minContains``, …).
+    Annotations and unknown keywords change nothing (``format`` too: no format checker).
+    Every kept keyword is monotone in its subschemas except ``not`` and ``oneOf``, so (LN-2):
 
     - a ``oneOf`` with a loosened branch becomes an ``anyOf`` of the same branches (each
       branch only accepts more, and ``anyOf`` accepts whatever ``oneOf`` did);
-    - a ``not`` over a loosened subschema is removed (no constraint accepts more).
+    - a ``not`` over a loosened subschema is removed (no constraint accepts more);
+    - ``contains`` goes with a dropped ``minContains`` (``minContains: 0`` made it optional).
+
+    A nested ``$id`` is refused: it would change what a ``#/…`` pointer under it means.
 
     Looseness propagates to every enclosing schema, and through ``$ref``: a pointer to a
     root ``$defs``/``definitions`` entry is loosened when that entry is (found by iterating
@@ -180,12 +186,16 @@ def strip_schema(schema: object, depth: int = 0) -> Any:
 @dataclass
 class _StripCtx:
     loose_defs: frozenset[str]  # ``#/$defs/<name>`` pointers known to be loosened
-    any_dropped: bool  # from the previous pass: whether any pattern was dropped
+    any_dropped: bool  # from the previous pass: whether anything asserting was dropped
     dropped: bool = False
     found_defs: set[str] = field(default_factory=set[str])
 
 
-_DEF_POINTER = re.compile(r"^#/(?:\$defs|definitions)/[^/~]+$")
+_DEF_POINTER = re.compile(r"^#/(?:\$defs|definitions)/[^/~%]+$")  # no escapes to decode
+
+# Keywords the local validator (Draft 2020-12, no format checker) asserts; dropping one
+# loosens. minContains/maxContains are enforced inside ``contains``.
+_ENFORCED = frozenset(jsonschema.Draft202012Validator.VALIDATORS) | {"minContains", "maxContains"}
 
 
 def _ref_loose(ref: object, ctx: _StripCtx) -> bool:
@@ -193,7 +203,12 @@ def _ref_loose(ref: object, ctx: _StripCtx) -> bool:
         return False
     if _DEF_POINTER.match(ref):
         return ref in ctx.loose_defs
-    return ctx.any_dropped  # "#", "#/properties/…", nested $defs: assume the worst
+    return ctx.any_dropped  # "#", "#/properties/…", nested or escaped: assume the worst
+
+
+def _strip_all(values: list[Any], depth: int, ctx: _StripCtx) -> tuple[list[Any], bool]:
+    pairs = [_strip(v, depth, ctx) for v in values]
+    return [p[0] for p in pairs], any(p[1] for p in pairs)
 
 
 def _strip(schema: object, depth: int, ctx: _StripCtx, root: bool = False) -> tuple[Any, bool]:
@@ -221,23 +236,26 @@ def _strip(schema: object, depth: int, ctx: _StripCtx, root: bool = False) -> tu
                 out[key] = sub
         elif key in _SCHEMA_ONE:
             if isinstance(value, list):  # draft-4 tuple ``items``
-                pairs = [_strip(v, depth + 1, ctx) for v in cast(list[Any], value)]
-                out[key] = [p[0] for p in pairs]
-                loose |= any(p[1] for p in pairs)
+                out[key], sub_loose = _strip_all(cast(list[Any], value), depth + 1, ctx)
             else:
                 out[key], sub_loose = _strip(value, depth + 1, ctx)
-                loose |= sub_loose
+            loose |= sub_loose
         elif key in _SCHEMA_LISTS and isinstance(value, list):
-            pairs = [_strip(v, depth + 1, ctx) for v in cast(list[Any], value)]
-            out[key] = [p[0] for p in pairs]
-            loose |= any(p[1] for p in pairs)
-            one_loose = one_loose or (key == "oneOf" and any(p[1] for p in pairs))
+            out[key], sub_loose = _strip_all(cast(list[Any], value), depth + 1, ctx)
+            loose |= sub_loose
+            one_loose = one_loose or (key == "oneOf" and sub_loose)
         elif key == "pattern" and isinstance(value, str) and not _checkable_pattern(value):
             ctx.dropped = loose = True  # not shown, not enforced here; the server validates
         elif key in _SCHEMA_VALUES:  # a non-string pattern lands here and is refused
             out[key] = _schema_value(key, value)
             if key == "$ref" and _ref_loose(value, ctx):
                 loose = True
+        elif key == "$id" and not root:
+            raise ValueError("its schema has a nested $id")
+        elif key in _ENFORCED:  # an asserting keyword we don't keep: the result accepts more
+            ctx.dropped = loose = True
+    if "minContains" in cast(dict[str, Any], schema) and "contains" in out:
+        del out["contains"]  # without minContains (0 made it optional) contains would tighten
     if one_loose:  # ``anyOf`` of the loosened branches accepts whatever ``oneOf`` did
         branches = out.pop("oneOf")
         if "anyOf" in out:  # both present: keep both constraints, side by side
@@ -273,17 +291,16 @@ def _short(v: object, limit: int = TEXT_MAX) -> bool:
 
 
 def _checkable_pattern(p: str) -> bool:
-    """Whether a string ``pattern`` is kept: short and printable (the model reads it) and one
-    Python's ``re`` compiles (``jsonschema`` checks arguments with ``re.search``).
+    r"""Whether a string ``pattern`` is kept: short and printable (the model reads it) and
+    one Python's ``re`` compiles (``jsonschema`` checks arguments with ``re.search``).
 
     A JSON Schema pattern is an ECMA-262 regex. Generated schemas carry long ones (zod's
-    UUID and ISO datetime patterns are well over ``TEXT_MAX``) and ECMA-only syntax
-    (``\\p{L}``, ``(?<name>…)``, ``[^]``) that ``re`` refuses. Such a
-    pattern is dropped rather than refused or translated: a dropped pattern only loosens the
-    local check (the server validates its own schema; ``strip_schema`` refuses the cases
-    rewrites ``not``/``oneOf`` so it never tightens), it carries no text to the model, and dropping
-    is deterministic for the daemon's interpreter (uv pins Python 3.12), so the pin is
-    stable. A non-string pattern is still refused."""
+    UUID and ISO date-time patterns are well over ``TEXT_MAX``) and ECMA-only syntax
+    (``\p{L}``, ``(?<name>…)``, ``[^]``) that ``re`` refuses. Such a pattern is dropped
+    rather than refused or translated: it carries no text to the model, the server still
+    validates, and ``strip_schema`` keeps the local check only ever looser (rewriting
+    ``not``/``oneOf`` over it). Dropping is deterministic for the daemon's interpreter (uv
+    pins Python 3.12), so the pin is stable. A non-string pattern is still refused."""
     if not _short(p):
         return False
     try:

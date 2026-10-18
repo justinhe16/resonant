@@ -1205,17 +1205,9 @@ def _only_looser(raw: dict[str, Any], samples: list[object]) -> dict[str, Any]:
 
 
 SAMPLES: list[object] = [
-    UUID_OK,
-    "not-a-uuid",
-    "a",
-    "",
-    None,
-    3,
-    "2026-07-20T10:00:00Z",
-    "2026-07-20",
-    [UUID_OK],
-    {},
-]
+    UUID_OK, "not-a-uuid", "a", "ab", "abcd", "", None, 3, 7, "2026-07-20T10:00:00Z",
+    "2026-07-20", [UUID_OK], [], ["x", 1], {}, {"a": 1}, {"a": 1, "b": "x"},
+]  # fmt: skip
 
 
 def test_zod_nullable_datetime_under_oneof_becomes_anyof() -> None:
@@ -1308,8 +1300,52 @@ def test_the_rewrite_is_deterministic_for_the_pin() -> None:
     }
     pin = tool_pin(tool)
     assert all(tool_pin(json.loads(json.dumps(tool))) == pin for _ in range(3))
-    changed = json.loads(json.dumps(tool).replace("[1-8]", "[1-9]"))  # a dropped pattern moves
-    assert tool_pin(changed) == pin
+    for old, new in (("[1-8]", "[1-9]"), ("0[1-9]", "0[1-8]")):  # the not's, then the oneOf's
+        text = json.dumps(tool)
+        assert old in text
+        assert tool_pin(json.loads(text.replace(old, new))) == pin  # a dropped pattern moved
+
+
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [
+        # review LN-2: any dropped asserting keyword loosens, not only a pattern
+        ({"not": {"if": {"type": "string"}, "then": {"minLength": 3}}}, {}),
+        ({"not": {"dependentRequired": {"a": ["b"]}}}, {}),
+        ({"oneOf": [{"type": "integer"}, {"minimum": 5, "if": {"type": "integer"},
+                                          "then": {"maximum": 3}}]},
+         {"anyOf": [{"type": "integer"}, {"minimum": 5}]}),
+        ({"not": {"type": "object", "unevaluatedProperties": False}}, {}),
+        # annotations and unknown keywords change nothing: not/oneOf stay
+        ({"not": {"type": "string", "description": "d", "x-y": 1, "deprecated": True}},
+         {"not": {"type": "string"}}),
+        # minContains: 0 made contains optional; without it contains would tighten
+        ({"type": "array", "contains": {"type": "string"}, "minContains": 0},
+         {"type": "array"}),
+        ({"type": "array", "contains": {"type": "string"}, "maxContains": 1},
+         {"type": "array", "contains": {"type": "string"}}),
+        # a percent-encoded pointer to a loosened def is not matched literally
+        ({"$defs": {"a b": LONG}, "not": {"$ref": "#/$defs/a%20b"}},
+         {"$defs": {"a b": {"type": "string"}}}),
+        # definitions (not $defs), escaped names, and a def that refs a later def
+        ({"definitions": {"id": LONG}, "oneOf": [{"$ref": "#/definitions/id"}, {"const": 3}]},
+         {"definitions": {"id": {"type": "string"}},
+          "anyOf": [{"$ref": "#/definitions/id"}, {"const": 3}]}),
+        ({"$defs": {"a/b": LONG}, "not": {"$ref": "#/$defs/a~1b"}},
+         {"$defs": {"a/b": {"type": "string"}}}),
+        ({"$defs": {"a": {"$ref": "#/$defs/b"}, "b": LONG}, "not": {"$ref": "#/$defs/a"}},
+         {"$defs": {"a": {"$ref": "#/$defs/b"}, "b": {"type": "string"}}}),
+    ],
+)  # fmt: skip
+def test_only_looser_for_every_dropped_assertion(raw: dict[str, Any], want: dict[str, Any]) -> None:
+    assert _only_looser(raw, SAMPLES) == want
+
+
+def test_a_nested_id_is_refused() -> None:
+    """It would change what a ``#/…`` pointer under it means; a root ``$id`` doesn't."""
+    with pytest.raises(ValueError, match="nested"):
+        strip_schema({"type": "object", "properties": {"a": {"$id": "https://x/y"}}})
+    assert strip_schema({"$id": "https://x/y", "type": "object"}) == {"type": "object"}
 
 
 def test_pattern_properties_keys_and_defs_names_are_checked() -> None:
