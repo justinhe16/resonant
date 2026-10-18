@@ -163,6 +163,11 @@ def keys(events: list[dict[str, Any]]) -> list[str]:
     return [e["dedupe_key"] for e in events]
 
 
+def ci(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The events but ``pr_active`` (every open PR has one, for the rollup: GH-2)."""
+    return [e for e in events if e["type"] != "pr_active"]
+
+
 # --- manifest ---------------------------------------------------------------------------
 
 
@@ -184,7 +189,9 @@ def test_manifest_passes_every_check() -> None:
     assert merge.args_schema["required"] == ["head_sha", "number", "repo"]
     assert rerun.args_schema["required"] == ["number", "repo"]
     assert {j.id: j.schedule for j in m.jobs} == {"watch": "*/10 * * * *", "digest": "50 7 * * *"}
-    assert m.notify is not None and m.notify.on == ("ci_failed", "ci_fixed", "review_requested")
+    # GH-2: nothing texts on its own; the hourly rollup reads the events, a trust rule can
+    # bring a text back for one event type.
+    assert m.notify is None
     assert m.health is not None and m.health.check == "python3 cli.py health"
     assert m.secrets == ("token",) and m.description and m.examples
     # The digest reports an item for the briefing: low, so it can never text on its own.
@@ -234,7 +241,7 @@ def test_prs_shape_ci_states_and_order(gh: FakeGh) -> None:
     assert by_n[41]["review"] == "review_required" and by_n[41]["head_sha"] == "b" * 40
     assert set(by_n[41]) == {
         "repo", "number", "title", "url", "draft", "branch", "head_sha", "ci", "failing",
-        "review", "created_at", "updated_at",
+        "review", "created_at", "updated_at", "active_at",
     }  # fmt: skip
     assert [p["number"] for p in r.out["review_requested"]] == [9]
     assert r.out["summary"] == "5 open PRs, 2 failing CI, 1 awaiting your review"
@@ -327,9 +334,9 @@ def test_watch_red_green_red_emits_exactly_three_stable_events(gh: FakeGh) -> No
         first, again = gh.run("watch"), gh.run("watch")
         assert first.code == 0, first.err
         assert first.events == again.events  # unchanged state, identical keys
-        for e in first.events:
+        for e in ci(first.events):
             stored.setdefault(e["dedupe_key"], e)
-        return first.events
+        return ci(first.events)
 
     red1 = [run_row(1, "s1", "failure", workflow="lint")]
     assert keys(step("s1", red1)) == [f"{RESONANT}#40:run:1:failed"]
@@ -364,8 +371,8 @@ def test_watch_green_from_the_start_is_silent(gh: FakeGh) -> None:
         f"{RESONANT}:branch-41": [run_row(5, "t1", "success")],
     }
     r = gh.run("watch")
-    assert r.code == 0 and r.events == []
-    assert r.out["summary"] == "2 PRs watched, 0 events"
+    assert r.code == 0 and ci(r.events) == []
+    assert r.out["summary"] == "2 PRs watched, 2 events"  # the two pr_active
 
 
 def test_watch_ignores_cancelled_and_reports_per_workflow(gh: FakeGh) -> None:
@@ -382,7 +389,7 @@ def test_watch_ignores_cancelled_and_reports_per_workflow(gh: FakeGh) -> None:
     }
     r = gh.run("watch")
     # lint: latest counted run (7) succeeded after a timed-out one (5): fixed. test: green.
-    assert keys(r.events) == [f"{RESONANT}#40:run:7:fixed"]
+    assert keys(ci(r.events)) == [f"{RESONANT}#40:run:7:fixed"]
 
 
 def test_watch_rerun_keeps_its_run_id(gh: FakeGh) -> None:
@@ -390,9 +397,9 @@ def test_watch_rerun_keeps_its_run_id(gh: FakeGh) -> None:
     gh.state["mine"] = [pr_node(40, "s1")]
     branch = f"{RESONANT}:branch-40"
     gh.state["runs"] = {branch: [run_row(1, "s1", "failure")]}
-    assert keys(gh.run("watch").events) == [f"{RESONANT}#40:run:1:failed"]
+    assert keys(ci(gh.run("watch").events)) == [f"{RESONANT}#40:run:1:failed"]
     gh.state["runs"] = {branch: [run_row(1, "s1", "success")]}
-    assert gh.run("watch").events == []
+    assert ci(gh.run("watch").events) == []
 
 
 def test_watch_review_requested(gh: FakeGh) -> None:
@@ -402,8 +409,60 @@ def test_watch_review_requested(gh: FakeGh) -> None:
     assert e["type"] == "review_requested"
     assert e["dedupe_key"] == "org/app#12:abc:review"
     assert e["text"] == "👀 app#12 review requested: Please look"
-    # No run lookups for PRs you only review.
-    assert [c["argv"][0] for c in gh.calls()] == ["api"]
+    assert e["data"] == {"repo": "org/app", "number": 12, "title": "Please look",
+                         "url": "https://github.com/org/app/pull/12"}  # fmt: skip
+    # No run lookups for PRs you only review (the second call: recently closed PRs).
+    assert [c["argv"][:2] for c in gh.calls()] == [["api", "graphql"], ["api", "graphql"]]
+
+
+def test_watch_reports_pr_activity_once_per_moment_it_moved(gh: FakeGh) -> None:
+    """GH-2: one ``pr_active`` per open PR of mine, keyed by when it last moved (its
+    ``updatedAt`` or its latest check, whichever is later), for Resonant's rollup."""
+    late_check = {**check("lint"), "startedAt": "2026-10-14T01:00:00Z",
+                  "completedAt": "2026-10-14T01:05:00Z"}  # fmt: skip
+    gh.state["mine"] = [pr_node(40, "s1", contexts=[late_check]), pr_node(41, "t1")]
+    r = gh.run("watch")
+    active = [e for e in r.events if e["type"] == "pr_active"]
+    assert keys(active) == [
+        f"{RESONANT}#40:active:2026-10-14T01:05:00Z",  # the check finished after the update
+        f"{RESONANT}#41:active:2026-10-13T00:00:00Z",
+    ]
+    assert active[0]["data"] == {
+        "repo": RESONANT, "number": 40, "title": "A change",
+        "url": f"https://github.com/{RESONANT}/pull/40",
+        "active_at": "2026-10-14T01:05:00Z", "draft": False,
+    }  # fmt: skip
+    assert active[0]["text"] == "resonant#40 A change"
+    assert gh.run("prs").out["prs"][0]["active_at"] == "2026-10-14T01:05:00Z"
+    # unchanged: the same keys (the events table drops them); a new commit: a new key
+    assert keys([e for e in gh.run("watch").events if e["type"] == "pr_active"]) == keys(active)
+    gh.state["mine"][1]["updatedAt"] = "2026-10-15T00:00:00Z"
+    again = [e for e in gh.run("watch").events if e["type"] == "pr_active"]
+    assert keys(again)[1] == f"{RESONANT}#41:active:2026-10-15T00:00:00Z"
+
+
+def test_watch_reports_merged_and_closed_prs(gh: FakeGh) -> None:
+    def closed(number: int, *, merged: bool, at: str) -> dict[str, Any]:
+        return {"number": number, "title": f"Change {number}", "merged": merged,
+                "url": f"https://github.com/{RESONANT}/pull/{number}",
+                "mergedAt": at if merged else None, "closedAt": at,
+                "repository": {"nameWithOwner": RESONANT}}  # fmt: skip
+
+    (gh.data / "config.json").write_text(json.dumps({"author": "octo", "repos": [RESONANT]}))
+    gh.state["closed"] = [
+        closed(38, merged=True, at="2026-10-14T02:00:00Z"),
+        closed(39, merged=False, at="2026-10-14T03:00:00Z"),
+        {"number": "x", "repository": {"nameWithOwner": "nope"}},  # skipped
+    ]
+    r = gh.run("watch")
+    assert [(e["type"], e["dedupe_key"], e["text"]) for e in r.events] == [
+        ("pr_merged", f"{RESONANT}#38:merged", "merged resonant#38 Change 38"),
+        ("pr_closed", f"{RESONANT}#39:closed:2026-10-14T03:00:00Z", "closed resonant#39 Change 39"),
+    ]
+    assert r.events[0]["data"]["merged_at"] == "2026-10-14T02:00:00Z"
+    query = next(c["argv"] for c in gh.calls() if any("is:closed" in a for a in c["argv"]))
+    q = next(a for a in query if a.startswith("q="))
+    assert "author:octo" in q and f"repo:{RESONANT}" in q and "closed:>=" in q
 
 
 def test_watch_caps_events_and_text(gh: FakeGh) -> None:
@@ -439,8 +498,9 @@ def test_watch_events_go_to_fd3_when_provided(gh: FakeGh) -> None:
         lines = f.read().splitlines()
     assert proc.returncode == 0
     assert "events" not in json.loads(stdout)
-    (line,) = lines
-    assert json.loads(line)["dedupe_key"] == f"{RESONANT}#40:run:1:failed"
+    failed, active = (json.loads(line) for line in lines)
+    assert failed["dedupe_key"] == f"{RESONANT}#40:run:1:failed"
+    assert active["type"] == "pr_active"
 
 
 # --- digest and health --------------------------------------------------------------------
@@ -516,7 +576,7 @@ def test_token_reaches_gh_only_via_a_private_config_file(gh: FakeGh) -> None:
     r = gh.run("watch")
     assert r.code == 0
     calls = gh.calls()
-    assert len(calls) == 2
+    assert len(calls) == 3  # open PRs, the branch's runs, recently closed PRs
     for call in calls:
         assert call["token_ok"] is True
         env = set(call["env"])

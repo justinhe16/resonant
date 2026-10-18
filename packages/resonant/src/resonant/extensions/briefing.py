@@ -14,9 +14,10 @@ nothing to say is left out (``Nothing on today.`` when all are):
   wait reasons only, never titles or message bodies). Reminders are left out (above).
 - ``✋ 1 approval pending (A7)``: ``approvals.pending_for(owner)``.
 - ``⚠ model, imessage degraded``: degraded checks in ``health_snapshot``.
-- ``Workers:`` then one line per Claude worker (EM-6): the finished runs the owner hasn't
-  heard of (the 08:00 pulse is skipped, so the briefing says them) and the ones still
-  running, marked told after the send like the Updates.
+- ``Workers:`` then the progress rollup (EM-6, GH-2, ``extensions/rollup.py``): the news
+  the owner hasn't heard (the 08:00 pulse is skipped, so the briefing says it: ended and
+  merged runs, merged PRs, stalls, review requests) and what is still going, marked told
+  after the send like the Updates.
 - ``Updates:`` then one line per open pulse item (``store.pulse.open_items``: every source
   including ``core``, every urgency), changed-since-told first, at most 8 lines and
   ``+N more``. The items listed are marked told after the send (a manual run too), so the
@@ -48,14 +49,14 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
 from resonant import killswitch
 from resonant.executor import CallContext
-from resonant.extensions import notify
+from resonant.extensions import notify, rollup
 from resonant.extensions.pulse_job import (
     deliver,
     fit_entries,
@@ -63,6 +64,7 @@ from resonant.extensions.pulse_job import (
     is_worker_item,
     item_line,
     prune_inflight,
+    refresh_rollup,
     running_workers,
     worker_entries,
 )
@@ -75,7 +77,7 @@ from resonant.tools.reminders import list_reminders
 from resonant.tools.when import clock_time
 
 if TYPE_CHECKING:
-    from resonant.config import BriefingConfig
+    from resonant.config import BriefingConfig, Settings
     from resonant.extensions.scheduler import CoreDeps, CoreJob
     from resonant.gateway.channel import Channel
 
@@ -122,6 +124,7 @@ class Briefing:
     degraded: tuple[str, ...] = ()  # health check names
     updates: tuple[pulse_store.Item, ...] = ()  # open pulse items, most changed first
     workers: tuple[pulse_store.Item, ...] = ()  # running workers, and finished ones untold
+    roll: rollup.Rollup = field(default_factory=rollup.Rollup)  # the Workers rollup's names
 
 
 def _plural(n: int, word: str) -> str:
@@ -194,7 +197,9 @@ def render_full(b: Briefing) -> tuple[str, list[pulse_store.Item]]:
     ]
     base = "\n".join(lines)
     room = MAX_CHARS - len(base) - (1 if base else 0)
-    workers, listed, more = fit_entries(worker_entries(b.workers), room)
+    news = [i for i in b.workers if i.changed]
+    going = [i for i in b.workers if not i.changed]
+    workers, listed, more = fit_entries(worker_entries(news, context=going, roll=b.roll), room)
     if more:
         workers.append(f"+{more} more")
     lines += workers
@@ -268,8 +273,8 @@ def _updates(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item,
 
 
 def _workers(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item, ...]:
-    """The Workers section: runs still going, and finished ones the owner hasn't heard of
-    (EM-6; the 08:00 pulse is skipped, so the briefing says what it would have)."""
+    """The Workers section: runs still going, and the rollup's news the owner hasn't heard
+    of (EM-6, GH-2; the 08:00 pulse is skipped, so the briefing says what it would have)."""
     finished = [
         i for i in pulse_store.pending(conn, ("urgent", "normal", "low"), now) if is_worker_item(i)
     ]
@@ -284,9 +289,11 @@ def gather(
     now: datetime,
     day: date,
     tz: ZoneInfo,
+    stall_after: timedelta = rollup.STALL_AFTER,
 ) -> Briefing:
     """Every section's data for local ``day``."""
     running, waiting, queued = _work(conn)
+    workers = _workers(conn, now)
     return Briefing(
         reminders=_reminders(conn, owner, now, day, tz),
         running=running,
@@ -295,7 +302,8 @@ def gather(
         approvals=tuple(a.code or "" for a in pending_for(conn, owner, now)),
         degraded=_degraded(conn),
         updates=_updates(conn, now),
-        workers=_workers(conn, now),
+        workers=workers,
+        roll=rollup.gather(conn, now, workers, stall_after=stall_after),
     )
 
 
@@ -318,18 +326,24 @@ async def send_briefing(
     now: datetime,
     due: datetime | None = None,
     manual: bool = False,
+    settings: Settings | None = None,
 ) -> dict[str, Any]:
     """Build and send the briefing for the local date of ``due`` (else ``now``), deduped
     per date (``briefing:<date>``). ``manual`` (on demand): keyed
     ``briefing:manual:<date>:<HHMM>`` instead, so it never uses up the scheduled one and
     sends at most once a minute. Returns ``{sent, date, sections, chars}``; never the text.
-    ``sent`` means handed to the channel: a repeat key is dropped there. Paused: not sent."""
+    ``sent`` means handed to the channel: a repeat key is dropped there. Paused: not sent.
+    ``settings``: refresh the Workers rollup's derived items first (``pulse.stall_after``)."""
     zone = ZoneInfo(tz)
     local_now = (due or now).astimezone(zone)
     day = local_now.date()
     if _paused(conn):
         return {"sent": False, "date": day.isoformat(), "skipped": "paused"}
-    b = gather(conn, owner=owner, now=now, day=day, tz=zone)
+    stall_after = rollup.STALL_AFTER
+    if settings is not None:
+        refresh_rollup(conn, settings, now)
+        stall_after = settings.pulse.stall
+    b = gather(conn, owner=owner, now=now, day=day, tz=zone, stall_after=stall_after)
     key = manual_dedupe_key(local_now) if manual else dedupe_key(day)
     prune_inflight(conn, now)
     built: dict[str, Any] = {}
@@ -365,6 +379,7 @@ async def run_briefing_now(deps: CoreDeps, *, now: datetime | None = None) -> di
         tz=deps.settings.timezone,
         now=now or utcnow(),
         manual=True,
+        settings=deps.settings,
     )
 
 
@@ -391,7 +406,7 @@ def briefing_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> C
         log.info("briefing not scheduled", extra={"channel": channel is not None})
         return None
     tz = deps.settings.timezone
-    conn = deps.conn
+    conn, settings = deps.conn, deps.settings
 
     async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         return await send_briefing(
@@ -401,6 +416,7 @@ def briefing_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> C
             tz=tz,
             now=clock(),
             due=_due(args),
+            settings=settings,
         )
 
     return CoreJob(

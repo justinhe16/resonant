@@ -10,7 +10,13 @@ For one event, in order:
 
 1. Not from a loaded extension (removed, disabled, tampered or refused at this start), or
    a type outside the manifest's ``notify.on``: consumed, nothing sent, never retried
-   (``digest`` is stored for the briefing, never notified).
+   (``digest`` is stored for the briefing, never notified; github's ``ci_failed`` and the
+   PR events are read by the hourly rollup, ``extensions/rollup.py``). The owner's trust
+   rules override the manifest per event type (GH-2): a ``notify_now`` rule naming the type
+   (``text me right away when CI fails in dori``: scope ``dori``, action ``ci_failed``)
+   sends it from here on although ``notify.on`` leaves it out, and a ``notify_digest`` rule
+   naming it holds a listed one (``ext.notify_held`` ``reason=rule``). Matched like a
+   standing allow: system = the extension, repo = the event's ``data.repo``.
 2. ``payload.baseline`` (the job's first successful run after install, see
    :func:`take_baseline`): consumed unsent, audit ``ext.notify_held`` ``reason=baseline``.
    State that existed before the install is never announced.
@@ -50,15 +56,19 @@ import sqlite3
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from resonant import killswitch
 from resonant.config import NotifyConfig
 from resonant.gateway.channel import ChannelError, ChannelRefused
 from resonant.ops import Sender
 from resonant.store import extensions as store
+from resonant.store import repos as repos_store
+from resonant.store import trust as trust_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
+from resonant.trust.policy import NotifyDecision, scope_rank
+from resonant.trust.policy import notify_level as trust_notify_level
 from resonant_sdk import Event, Manifest
 
 log = logging.getLogger(__name__)
@@ -264,8 +274,13 @@ class Notifier:
         if manifest is None:
             self._audit("ext.notify_dropped", ext, event, reason="not loaded")
             return None
-        if manifest.notify is None or etype not in manifest.notify.on:
-            return None  # stored for other readers (the briefing), never notified
+        listed = manifest.notify is not None and etype in manifest.notify.on
+        override = self._rule_level(ext, etype, event)
+        if override == "digest" and listed:
+            self._audit("ext.notify_held", ext, event, reason="rule")
+            return None
+        if not listed and override != "now":
+            return None  # stored for other readers (the briefing, the rollup), never notified
         now = self.clock()
         if event.payload.get("baseline") is True:
             self._audit("ext.notify_held", ext, event, reason="baseline")
@@ -286,6 +301,48 @@ class Notifier:
         action = "ext.notify_sent" if sent else "ext.notify_unreachable"
         self._audit(action, ext, event, recipients=sent, hour=iso(hour))
         return None
+
+    def _rule_level(self, ext: str, etype: str, event: Event) -> Literal["now", "digest"] | None:
+        """The owner's override for this event (GH-2), or None: a ``notify_now`` or
+        ``notify_digest`` trust rule whose action is the event type itself (``ci_failed``;
+        a ``*`` action never matches, so "text me everything" can't wake every event an
+        extension stores). Matched like a standing allow, system = the extension, against
+        the event's ``data.repo``: its registered name, else ``owner/name`` and ``name``
+        (the most specific rule wins). Unreadable: None."""
+        try:
+            action = trust_store.slug(etype)
+            rules = [r for r in trust_store.list_rules(self.conn) if r.action == action]
+            if not rules:
+                return None
+            system = trust_store.slug(ext)
+            best: tuple[tuple[int, int], NotifyDecision] | None = None
+            for repo in self._repo_names(event):
+                decision = trust_notify_level(rules, system, action, action, repo)
+                rule = decision.rule
+                rank = None if rule is None else scope_rank(rule.scope, system, repo)
+                if rank is not None and (best is None or rank > best[0]):
+                    best = (rank, decision)
+        except Exception:
+            log.exception("notify rule unavailable", extra={"extension": ext})
+            return None
+        return None if best is None else best[1].level
+
+    def _repo_names(self, event: Event) -> list[str | None]:
+        """The scopes an event's ``data.repo`` goes by: the registered repo's name, else the
+        slugs of ``owner/name`` and ``name``; ``[None]`` without one."""
+        data = event.payload.get("data")
+        raw = cast(dict[str, Any], data).get("repo") if isinstance(data, dict) else None
+        if not isinstance(raw, str) or not raw.strip():
+            return [None]
+        found = repos_store.find(self.conn, raw)
+        names = [found.name] if found is not None else [raw, raw.rsplit("/", 1)[-1]]
+        out: list[str | None] = []
+        for name in names:
+            try:
+                out.append(trust_store.slug(name))
+            except ValueError:
+                continue
+        return out or [None]
 
     async def _send_all(self, ext: str, text: str, key_prefix: str) -> int:
         """Send to every recipient; returns how many took it. A refused recipient is

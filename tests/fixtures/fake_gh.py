@@ -5,7 +5,8 @@ It answers from ``state.json`` and appends each call (argv, the env keys it saw,
 the ``hosts.yml`` token in ``GH_CONFIG_DIR`` matched ``state["token"]``, and the dir and file
 modes) to ``calls.jsonl`` beside the state file.
 
-State keys: ``token``, ``user``, ``mine`` / ``review`` (GraphQL search nodes), ``runs``
+State keys: ``token``, ``user``, ``mine`` / ``review`` / ``closed`` (GraphQL search nodes;
+``closed`` answers the search with ``is:closed``), ``runs``
 (``"<repo>:<branch>"`` → ``gh run list`` rows), ``prs`` (``"<repo>#<n>"`` → ``gh pr view``),
 ``fail`` (``{"exit": n, "stderr": "..."}``) to fail every call, ``fail_on`` (``"pr merge"`` or
 ``"run rerun <id>"`` → the same shape) to fail one kind of call, and ``garbage`` to print
@@ -39,9 +40,10 @@ def answer(state: dict[str, Any], args: list[str]) -> tuple[int, Any, str]:
     if args[:2] == ["api", "user"]:
         return 0, state.get("user", {"login": "octo"}), ""
     if args[:2] == ["api", "graphql"]:
+        aliases = ("closed",) if any("is:closed" in a for a in args) else ("mine", "review")
         data = {
             alias: {"issueCount": len(state.get(alias, [])), "nodes": state.get(alias, [])}
-            for alias in ("mine", "review")
+            for alias in aliases
         }
         return 0, {"data": data}, ""
     if args[:2] == ["run", "list"]:

@@ -331,3 +331,73 @@ async def test_more_message_is_held_while_paused(db: sqlite3.Connection) -> None
     clock.now += timedelta(hours=1)
     assert await n.flush() == 1
     assert ch.texts == ["[github] a"]
+
+
+# --- GH-2: the owner's trust rules override notify.on per event type ---------------------------
+
+
+QUIET = Manifest.model_validate({"name": "github", "version": 1})  # no notify: (GH-2)
+
+
+def store_repo_events(db: sqlite3.Connection, *events: tuple[str, str, str, str]) -> None:
+    """Persist ``(type, text, key, repo)`` events with ``data.repo``, like github's watch."""
+    with transaction(db):
+        persist_events(
+            db,
+            "github",
+            [{"type": t, "text": x, "dedupe_key": k, "data": {"repo": r, "number": 1}}
+             for t, x, k, r in events],
+        )  # fmt: skip
+
+
+def notify_rule(db: sqlite3.Connection, scope: str, action: str, effect: str) -> None:
+    from resonant.store import trust as trust_store
+
+    trust_store.add_rule(db, scope=scope, action=action, effect=effect,  # type: ignore[arg-type]
+                         created_from="chat", now=T0)  # fmt: skip
+
+
+async def test_quiet_events_text_only_when_a_rule_names_them_for_that_repo(
+    db: sqlite3.Connection,
+) -> None:
+    """ "text me right away when CI fails in dori": the github manifest texts nothing on its
+    own, a notify_now rule naming ci_failed brings it back for that repo only."""
+    ch = DedupeChannel()
+    n = notifier(db, ch)
+    n.manifest_of = lambda ext: QUIET if ext == "github" else None  # pyright: ignore[reportUnknownLambdaType]
+    store_repo_events(
+        db,
+        ("ci_failed", "✗ dori#1 CI failed (lint)", "a:failed", "own/dori"),
+        ("ci_fixed", "✓ dori#1 CI fixed", "a:fixed", "own/dori"),
+    )
+    await make_loop(db, n).run_once()
+    assert ch.texts == []  # quiet by default: stored for the rollup, consumed unsent
+    notify_rule(db, "dori", "ci_failed", "notify_now")
+    notify_rule(db, "*", "*", "notify_now")  # "text me everything" never wakes event types
+    store_repo_events(
+        db,
+        ("ci_failed", "✗ dori#2 CI failed (lint)", "b:failed", "own/dori"),
+        ("ci_failed", "✗ app#3 CI failed (lint)", "c:failed", "own/app"),
+        ("ci_fixed", "✓ dori#2 CI fixed", "b:fixed", "own/dori"),
+    )
+    await make_loop(db, n).run_once()
+    assert ch.texts == ["[github] ✗ dori#2 CI failed (lint)"]
+    notify_rule(db, "github", "ci_fixed", "notify_now")  # the extension's name scopes it all
+    store_repo_events(db, ("ci_fixed", "✓ app#3 CI fixed", "c:fixed", "own/app"))
+    await make_loop(db, n).run_once()
+    assert ch.texts[-1] == "[github] ✓ app#3 CI fixed"
+
+
+async def test_a_digest_rule_holds_a_listed_event(db: sqlite3.Connection) -> None:
+    ch = DedupeChannel()
+    n = notifier(db, ch)  # notify.on: ci_failed, ci_fixed
+    notify_rule(db, "dori", "ci_failed", "notify_digest")
+    store_repo_events(
+        db,
+        ("ci_failed", "✗ dori#1 CI failed", "a:failed", "own/dori"),
+        ("ci_failed", "✗ app#1 CI failed", "b:failed", "own/app"),
+    )
+    await make_loop(db, n).run_once()
+    assert ch.texts == ["[github] ✗ app#1 CI failed"]
+    (row,) = audit_rows(db, "ext.notify_held")
+    assert row["idempotency_key"] == "ext:github:a:failed" and '"rule"' in row["detail"]

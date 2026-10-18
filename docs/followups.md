@@ -393,3 +393,15 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **A message written as the process dies can be lost.** Text written into the live session is marked delivered; if the CLI dies before it reads it (a crash, the end grace's kill), the next session isn't told again, since `resume_prompt` is cleared once the session's result was clean. Rare; widen `_after_exit` to keep live texts after an unclean exit if it shows up.
 - **A very short session may say nothing about Remote Control.** If the session ends before the `remote_control` answer arrives, the answer is dropped with it and there is no text, audit row or kv update for that session.
 - **The end grace is fixed.** After stdin closes, a CLI that stays quiet 15 s without exiting is killed (`END_GRACE_S`). Output resets the wait, so a turn still running after the close (one the owner started over Remote Control) can finish, bounded by the run's time limit.
+
+## GH-2 carry-overs: the quiet github extension and the progress rollup
+
+*Noted 2026-10-18 from GH-2.*
+
+- **Owner step: re-pin github.** The quiet manifest and the new watch events take effect only after `resonant ext update github` on the Mini (a full re-approval, like every update). Until then the installed copy still texts `ci_failed`, `ci_fixed` and `review_requested`, and the rollup has no PR data.
+- **Two stall clocks, one setting.** `pulse.stall_after` decides both, but a PR's activity is the extension's `active_at` (its `updatedAt` or latest check), which doesn't see everything (a label change does move `updatedAt`; a force-push of the same tree doesn't add a check). A run's PR authored by the GitHub App isn't in the owner's search, so a `ready` run's stall is measured from the run's end, not from activity on its PR.
+- **A long outage can miss a merge.** The watch looks back two days for closed PRs (`CLOSED_DAYS`), and the rollup reads seven days of events. A PR merged while the Mini was off longer than that never shows as merged; it drops out of the rollup once its last `pr_active` is older than seven days.
+- **The watch's event cap.** A run emits at most 100 events (the process runner's cap); `pr_active` come last, after CI, review and closed-PR events, so with a very large number of open PRs some may wait for the next run. Fine at personal scale.
+- **No index for the rollup's read.** `rollup.github_prs` scans `events` for `ext:github` rows of the last week each hour; `events` has no `(source, occurred_at)` index and is never pruned. Add one (a migration) if the table grows large.
+- **`/pulse` doesn't refresh.** The preview is read-only, so a stall that began since the last pulse run shows only after the next one (the same holds for approval re-mentions).
+- **Review requests: once per PR.** A review request is said once per PR (until its told row is pruned a week later), not per push; one re-requested after you reviewed isn't said again within that week.

@@ -48,7 +48,9 @@ tools:
     timeout_s: 120
 
 jobs:
-  - id: watch                          # stateless: the events table's dedupe key is the memory
+  # stateless: the events table's dedupe key is the memory. Its events (CI, reviews, PR
+  # activity, merges) never text on their own: Resonant's hourly rollup reads them.
+  - id: watch
     schedule: "*/10 * * * *"
     run: python3 cli.py watch
     effect: read
@@ -66,5 +68,8 @@ jobs:
 
 # Low: the summary item waits for the 08:00 briefing and never texts on its own.
 report: {max_urgency: low}
-notify: {on: [ci_failed, ci_fixed, review_requested], channel: imessage}
+# No notify: (GH-2). ci_failed, ci_fixed and review_requested used to text right away; now
+# the hourly pulse's Workers rollup carries merges, stalls and review requests, and you ask
+# for CI on demand ("any of my PRs failing CI?"). A trust rule brings a text back for one
+# event: "text me right away when CI fails in resonant" (notify_now, action ci_failed).
 health: {check: python3 cli.py health, every: 30m}

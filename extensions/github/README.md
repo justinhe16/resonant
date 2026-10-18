@@ -1,6 +1,6 @@
 # github extension
 
-GitHub for Resonant: your open pull requests with CI and review state, a watch that texts you when CI breaks or recovers or someone asks for your review, a morning summary that appears in the briefing's Updates section, and two approved writes: re-run failed CI and merge. It is stdlib Python plus the [`gh`](https://cli.github.com) CLI (`/opt/homebrew/bin/gh` on the Mini). The manifest declares `bins: [gh]`, so Resonant pins `gh`'s real path when you install the extension (it must be a Homebrew install the sandbox guard protects, or root-owned) and passes it as `RESONANT_BIN_GH`; `gh` is never looked up on `PATH`. After `brew upgrade gh` moves it, run `resonant ext update github` to pin the new one.
+GitHub for Resonant: your open pull requests with CI and review state, a quiet watch that feeds Resonant's hourly progress rollup (merges, PRs that went quiet, review requests), a morning summary that appears in the briefing's Updates section, and two approved writes: re-run failed CI and merge. It is stdlib Python plus the [`gh`](https://cli.github.com) CLI (`/opt/homebrew/bin/gh` on the Mini). The manifest declares `bins: [gh]`, so Resonant pins `gh`'s real path when you install the extension (it must be a Homebrew install the sandbox guard protects, or root-owned) and passes it as `RESONANT_BIN_GH`; `gh` is never looked up on `PATH`. After `brew upgrade gh` moves it, run `resonant ext update github` to pin the new one.
 
 | Name | Kind | Level | What it does |
 |---|---|---|---|
@@ -8,7 +8,7 @@ GitHub for Resonant: your open pull requests with CI and review state, a watch t
 | `pr {repo, number}` | tool | L0 | One PR with its checks, mergeability and size. |
 | `rerun_failed {repo, number}` | tool | L3 | Re-runs the failed jobs of each workflow whose latest run on the PR's head failed. |
 | `merge_pr {repo, number, head_sha}` | tool | L2, commit | Squash-merges the PR if its head is still `head_sha`. Runs when you ask for it; otherwise asks a plain yes. |
-| `watch` | job, every 10 min | L0 | Emits `ci_failed`, `ci_fixed` and `review_requested` events. |
+| `watch` | job, every 10 min | L0 | Emits `ci_failed`, `ci_fixed`, `review_requested`, `pr_active`, `pr_merged` and `pr_closed` events. None of them texts on its own (GH-2): the hourly rollup reads them. |
 | `digest` | job, 07:50 | L0 | Reports the pulse item `github/summary` (`3 open PRs, 1 failing CI, 2 awaiting your review`, urgency `low`, state = the three counts). It shows under the briefing's Updates once per change and never texts on its own. Needs the manifest's `report: {max_urgency: low}` grant. |
 | health | every 30 min | | `gh api user` succeeds. |
 
@@ -34,12 +34,25 @@ Optional: `~/.resonant/ext-data/github/config.json`.
 - `author`: whose PRs to list; `@me` (the default) is the token's user. Review requests are for the same user.
 - `repos`: limit everything to these repos. Empty or missing means every repo the token can see.
 
+## Quiet by default (GH-2)
+
+The manifest has no `notify:` block, so nothing this extension emits texts you right away. Instead:
+- The hourly pulse's `Workers:` section is a progress rollup (`resonant/extensions/rollup.py`): `Merged: … dori#40 fix login`, `Looks like dori#41 cache layer (~5h quiet) got dropped. You should take a look.`, `Review requested: app#9 bump deps`, and your recently active PRs under `Still working on:`. Each merge, review request and stall is said once; a stall again only after new activity and a new quiet stretch (`pulse.stall_after`, default `4h`). A PR that was already quiet when you installed the extension is never announced.
+- CI is on demand: `/github prs`, "any of my PRs failing CI?", `show PR 40 in justinhe16/resonant`.
+- The 08:00 briefing still has the `github/summary` line.
+
+To get a text again for one kind of event, teach a trust rule: "text me right away when CI fails in resonant" makes a `notify_now` rule with action `ci_failed` and scope `resonant` (the repo's registered name, its `owner/name` or its name), or scope `github` for every repo. Only a rule naming the event type counts: a `*` action never wakes these events. "just put dori's CI fixes in the digest" (`notify_digest`) does the reverse for a type that texts. `/rules` lists them and `/rules forget <n>` removes one. After updating to this version, run `resonant ext update github` on the Mini (it re-pins the new manifest).
+
 ## How `watch` decides
 
 It keeps no state. Each run reads the current open PRs and their branch's workflow runs, and, per workflow:
 - The latest finished run on the PR's head failed: `ci_failed`, key `<repo>#<n>:run:<run id>:failed`, text `✗ resonant#40 CI failed (<workflow>)`.
 - It succeeded and the previous finished run of that workflow failed: `ci_fixed`, key `<repo>#<n>:run:<run id>:fixed`, text `✓ resonant#40 CI fixed`.
-- You're a requested reviewer: `review_requested`, key `<repo>#<n>:<head sha>:review`.
+- You're a requested reviewer: `review_requested`, key `<repo>#<n>:<head sha>:review`, data `{repo, number, title, url}`.
+
+And for the rollup:
+- Each open PR of yours: `pr_active`, key `<repo>#<n>:active:<active_at>`, data `{repo, number, title, url, active_at, draft}`. `active_at` is when it last moved: its `updatedAt` (commits, comments, reviews) or its latest check start, finish or status, whichever is later. A new commit or a finished check makes a new key.
+- Your PRs closed in the last two days (one more search, at most 20): `pr_merged`, key `<repo>#<n>:merged` (data adds `merged_at`), or `pr_closed`, key `<repo>#<n>:closed:<closed at>`.
 
 Cancelled, skipped and in-progress runs are ignored. A re-run keeps its run id, so a failed run that passes on re-run sends no `fixed`. The same state always produces the same keys, so Resonant's events table (unique per key) drops repeats, and the first run after install is a silent baseline. Events go to fd 3 when Resonant provides it, otherwise into the result's `events` list.
 

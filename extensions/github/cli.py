@@ -58,8 +58,8 @@ _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _AUTHOR = re.compile(r"^(@me|[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))$")
 
 _ROLLUP = """statusCheckRollup { state contexts(first: 50) { nodes { __typename
-  ... on CheckRun { name status conclusion }
-  ... on StatusContext { context state } } } }"""
+  ... on CheckRun { name status conclusion startedAt completedAt }
+  ... on StatusContext { context state createdAt } } } }"""
 _PR_FIELDS = f"""... on PullRequest {{ number title url isDraft createdAt updatedAt
   headRefName headRefOid reviewDecision repository {{ nameWithOwner }}
   commits(last: 1) {{ nodes {{ commit {{ {_ROLLUP} }} }} }} }}"""
@@ -68,6 +68,13 @@ SEARCH_QUERY = f"""query($mine: String!, $review: String!) {{
     issueCount nodes {{ {_PR_FIELDS} }} }}
   review: search(query: $review, type: ISSUE, first: {SEARCH_LIMIT}) {{
     issueCount nodes {{ {_PR_FIELDS} }} }}
+}}"""
+CLOSED_LIMIT = 20  # recently closed PRs per watch
+CLOSED_DAYS = 2  # how far back watch looks for merged and closed PRs
+CLOSED_QUERY = f"""query($q: String!) {{
+  closed: search(query: $q, type: ISSUE, first: {CLOSED_LIMIT}) {{ nodes {{
+    ... on PullRequest {{ number title url merged mergedAt closedAt
+      repository {{ nameWithOwner }} }} }} }}
 }}"""
 PR_VIEW_FIELDS = (
     "number,title,url,state,isDraft,author,headRefName,headRefOid,baseRefName,"
@@ -301,11 +308,21 @@ def checks_of(contexts: list[Any]) -> tuple[str, list[str], list[dict[str, str]]
     return ci, sorted(set(failing)), checks
 
 
+def active_at(updated_at: str, contexts: list[Any]) -> str:
+    """When the PR last moved: its ``updatedAt`` (commits, comments, reviews) or its latest
+    check start, finish or status, whichever is later. ISO 8601 UTC strings compare as text."""
+    times = [updated_at]
+    for c in map(_d, contexts):
+        times += [_s(c.get(k)) for k in ("startedAt", "completedAt", "createdAt")]
+    return max((t for t in times if t), default="")
+
+
 def shape_pr(node: dict[str, Any]) -> dict[str, Any]:
     """A search node as the compact PR dict ``prs``, ``watch`` and ``digest`` share."""
     commits = _l(_d(node.get("commits")).get("nodes"))
     rollup = _d(_d(_d(commits[-1] if commits else {}).get("commit")).get("statusCheckRollup"))
-    ci, failing, _ = checks_of(_l(_d(rollup.get("contexts")).get("nodes")))
+    contexts = _l(_d(rollup.get("contexts")).get("nodes"))
+    ci, failing, _ = checks_of(contexts)
     return {
         "repo": _s(_d(node.get("repository")).get("nameWithOwner")),
         "number": node.get("number") if isinstance(node.get("number"), int) else 0,
@@ -319,6 +336,7 @@ def shape_pr(node: dict[str, Any]) -> dict[str, Any]:
         "review": _s(node.get("reviewDecision")).lower() or None,
         "created_at": _s(node.get("createdAt")),
         "updated_at": _s(node.get("updatedAt")),
+        "active_at": active_at(_s(node.get("updatedAt")), contexts),
     }
 
 
@@ -463,6 +481,60 @@ def run_events(pr: dict[str, Any], runs: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
+def pr_data(pr: dict[str, Any]) -> dict[str, Any]:
+    return {"repo": pr["repo"], "number": pr["number"], "title": pr["title"], "url": pr["url"]}
+
+
+def active_events(mine: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``pr_active`` for each open PR of the owner's, once per moment it last moved (the key
+    holds ``active_at``): Resonant's hourly rollup reads them for ``Still working on`` and
+    to flag one that has gone quiet. Never texted by default."""
+    out: list[dict[str, Any]] = []
+    for pr in mine:
+        if not pr["active_at"]:
+            continue
+        data = {**pr_data(pr), "active_at": pr["active_at"], "draft": pr["draft"]}
+        key = f"{pr['repo']}#{pr['number']}:active:{pr['active_at']}"
+        out.append(event("pr_active", f"{ref(pr)} {pr['title']}", key, data))
+    return out
+
+
+def closed_events(nodes: list[Any]) -> list[dict[str, Any]]:
+    """``pr_merged`` (key ``<repo>#<n>:merged``) or ``pr_closed`` (keyed by when, so a PR
+    reopened and closed again says it again) for the owner's recently closed PRs."""
+    out: list[dict[str, Any]] = []
+    for node in map(_d, nodes):
+        number = node.get("number")
+        repo = _s(_d(node.get("repository")).get("nameWithOwner"))
+        if not isinstance(number, int) or not _REPO.match(repo):
+            continue
+        pr = {"repo": repo, "number": number, "title": clip(_s(node.get("title")), TITLE_MAX),
+              "url": _s(node.get("url"))}  # fmt: skip
+        base = f"{repo}#{number}"
+        if node.get("merged") is True:
+            data = {**pr_data(pr), "merged_at": _s(node.get("mergedAt"))}
+            out.append(event("pr_merged", f"merged {ref(pr)} {pr['title']}", f"{base}:merged",
+                             data))  # fmt: skip
+        else:
+            closed_at = _s(node.get("closedAt"))
+            data = {**pr_data(pr), "closed_at": closed_at}
+            out.append(event("pr_closed", f"closed {ref(pr)} {pr['title']}",
+                             f"{base}:closed:{closed_at}", data))  # fmt: skip
+    return out
+
+
+def search_closed(gh: Gh) -> list[Any]:
+    """The owner's PRs closed (merged or not) in the last ``CLOSED_DAYS`` days."""
+    author, repos = load_config()
+    since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - CLOSED_DAYS * 86400))
+    scope = " ".join(
+        ["is:pr", "is:closed", "archived:false", f"author:{author}", f"closed:>={since}",
+         *(f"repo:{r}" for r in repos)]
+    )  # fmt: skip
+    data = _d(gh.json("api", "graphql", "-f", f"query={CLOSED_QUERY}", "-f", f"q={scope}"))
+    return _l(_d(_d(data.get("data")).get("closed")).get("nodes"))
+
+
 def cmd_watch(gh: Gh) -> dict[str, Any]:
     mine, review, _ = search(gh)
     events: list[dict[str, Any]] = []
@@ -485,8 +557,9 @@ def cmd_watch(gh: Gh) -> dict[str, Any]:
     for pr in review:
         key = f"{pr['repo']}#{pr['number']}:{pr['head_sha']}:review"
         text = f"👀 {ref(pr)} review requested: {pr['title']}"
-        data = {"repo": pr["repo"], "number": pr["number"], "url": pr["url"]}
-        events.append(event("review_requested", text, key, data))
+        events.append(event("review_requested", text, key, pr_data(pr)))
+    events += closed_events(search_closed(gh))
+    events += active_events(mine)
     summary = f"{len(mine)} PRs watched, {len(events)} events"
     return emit({"summary": summary, "prs": len(mine), "events_found": len(events)}, events)
 

@@ -16,8 +16,12 @@ Events and their defaults (``trust.notify_level``, EM-4):
   itself ("stop texting right away on failed"): a ``*`` rule ("only digest trading") never
   silences a failure.
 - ``note``: the digest, and many notes of one run collapse into its latest (the run's item
-  shows ``last_note``). ``urgent`` (``resonant note --urgent``): now, at most
-  ``NOTE_TEXTS_PER_HOUR`` texts per run an hour (the rest only update the digest line).
+  shows ``last_note``). Since GH-2 a running run's line is status, not news: a note (or the
+  run starting, or passing 30 minutes) never makes a digest go out on its own; the rollup
+  (``extensions/rollup.py``) lists the run under ``Still working on`` when something else
+  does. A new ``did:`` side effect is still news. ``urgent`` (``resonant note --urgent``):
+  now, at most ``NOTE_TEXTS_PER_HOUR`` texts per run an hour (the rest only update the
+  digest line).
 - ``restart`` and ``update`` (GD-1: a worker's ``resonant restart``/``update`` that went
   through): now, with ``R4 restarted Resonant (abc1234)``; a ``notify_digest`` rule (on
   ``restart``/``update``, scope ``resonant`` or the run's repo) lowers them. Matched with
@@ -72,6 +76,7 @@ import logging
 import sqlite3
 from collections import deque
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Literal, Protocol, cast
 from zoneinfo import ZoneInfo
@@ -362,8 +367,10 @@ class WorkerReports:
     # -- the run's item --
 
     def running(self, run: Run, bucket: str) -> pulse_store.Item:
-        """The open item while a run goes: mentioned by the next digest when it is new, its
-        bucket changes (30 minutes, waiting) or the worker notes something."""
+        """The open item while a run goes. It is status, not news (GH-2): the rollup lists it
+        under ``Still working on`` when something else is sent, so it is written told, with
+        the latest bucket and note in its title. Only a new side effect on its ``did:`` list
+        is news on its own (its line says it at the next digest)."""
         started = run.started_at or self.clock()
         at = started.astimezone(self.tz).strftime("%H:%M")
         labels = {"waiting": "waiting for usage reset", "question": "waiting for your answer"}
@@ -375,13 +382,16 @@ class WorkerReports:
         if note:
             title += f" · {note}"
         title = _with_did(title, did)
-        state: dict[str, object] = {"bucket": bucket, "note": note}
+        state: dict[str, object] = {"running": True}
         if did:
             state["did"] = [*did[-1:], str(len(did))]  # a new side effect is news again
         now = self.clock()
         with atomic(self.conn):
             _change, item = pulse_store.upsert(self.conn, SOURCE, item_key(run.code), title,
                                                "normal", state, False, TTL_S, now)  # fmt: skip
+            if not did and item.changed:  # status only: heard as it is written
+                pulse_store.mark_told(self.conn, [item], now)
+                item = replace(item, told_fingerprint=item.fingerprint, told_at=now)
         return item
 
     def ended(self, run: Run, title: str, *, urgent: bool) -> pulse_store.Item:

@@ -18,9 +18,13 @@ or no ``principals.yaml`` owner: not scheduled. Each run:
    ONE message to the owner, ``dedupe_key=pulse:<local date>:<HH>``; then marks those items
    told. Nothing pending: nothing sent.
 
-Claude workers' items (``core`` / ``run/<code>``, EM-6) go in a ``Workers:`` section after
-the rest; when there is news, the workers still running (already told) are listed with them,
-for status (they never make a pulse send on their own).
+Claude workers' items (``core`` / ``run/<code>``, EM-6) and the rollup's derived items
+(``stall/``, ``merged/``, ``review/``, GH-2) go in a ``Workers:`` section after the rest, as
+the progress rollup's lines (``extensions/rollup.py``: ``Merged: …``, ``Looks like … got
+dropped``, ``Still working on: …``); when there is news, the workers still running (already
+told) and the github PRs still being worked on are listed with them, for status (they never
+make a pulse send on their own). Each run first refreshes the derived items
+(:func:`refresh_rollup`, ``pulse.stall_after``).
 
 The message is at most ``MAX_CHARS`` (1,000). Items that don't fit are not marked told and ride
 the next pulse; the message ends ``+N more``. Extension items are rendered as
@@ -56,7 +60,7 @@ from zoneinfo import ZoneInfo
 
 from resonant import killswitch
 from resonant.executor import CallContext
-from resonant.extensions import notify
+from resonant.extensions import notify, rollup
 from resonant.extensions.pulse import render_item
 from resonant.store import pulse as store
 from resonant.store.approvals import pending_for
@@ -139,8 +143,10 @@ def fit_lines(lines: Sequence[str], room: int) -> tuple[list[str], int]:
 
 
 def is_worker_item(item: store.Item) -> bool:
-    """A Claude worker's line (``core`` / ``run/<code>``, ``runners/reports.py``)."""
-    return item.source == CORE and item.key.startswith(WORKER_PREFIX)
+    """A line of the ``Workers:`` rollup (GH-2): a Claude worker's item (``core`` /
+    ``run/<code>``, ``runners/reports.py``) or one the rollup derives (``stall/``,
+    ``merged/``, ``review/``, ``extensions/rollup.py``)."""
+    return rollup.is_rollup_item(item)
 
 
 def worker_line(item: store.Item, max_chars: int = LINE_MAX) -> str:
@@ -157,64 +163,77 @@ def order_workers(items: Sequence[store.Item]) -> list[store.Item]:
     return [*finished, *going]
 
 
-def fit_entries(
-    entries: Sequence[tuple[str, store.Item | None]], room: int
-) -> tuple[list[str], list[store.Item], int]:
-    """Like :func:`fit_lines` for lines that are either an item's or a section header
-    (item None). A header is never left last, and ``+N more`` counts items only. Returns the
-    lines shown, their items and how many items are left out."""
-    total = sum(1 for _line, item in entries if item is not None)
+Entries = Sequence[tuple[str, tuple[store.Item, ...] | None]]
+
+
+def fit_entries(entries: Entries, room: int) -> tuple[list[str], list[store.Item], int]:
+    """Like :func:`fit_lines` for lines that each say some items (none: a status line) or
+    are a section header (None). A header is never left last, and ``+N more`` counts items
+    only. Returns the lines shown, their items and how many items are left out."""
+    total = sum(len(items or ()) for _line, items in entries)
     shown: list[str] = []
     listed: list[store.Item] = []
     used = 0
-    for line, item in entries:
-        left = total - len(listed) - (item is not None)
+    for line, items in entries:
+        left = total - len(listed) - len(items or ())
         reserve = len(f"\n+{left} more") if left else 0
         if used + 1 + len(line) + reserve > room:
             break
         shown.append(line)
         used += 1 + len(line)
-        if item is not None:
-            listed.append(item)
+        listed += items or ()
     while shown and entries[len(shown) - 1][1] is None:  # a header with nothing under it
         shown.pop()
     return shown, listed, total - len(listed)
 
 
 def worker_entries(
-    workers: Sequence[store.Item], header: str = WORKERS_HEADER
-) -> list[tuple[str, store.Item | None]]:
-    """The ``Workers:`` section as entries for :func:`fit_entries` (none without workers)."""
-    if not workers:
+    workers: Sequence[store.Item],
+    header: str = WORKERS_HEADER,
+    *,
+    context: Sequence[store.Item] = (),
+    roll: rollup.Rollup | None = None,
+) -> list[tuple[str, tuple[store.Item, ...] | None]]:
+    """The ``Workers:`` section as entries for :func:`fit_entries`: the header and the
+    rollup's lines (``rollup.entries``: ``workers`` are the news, ``context`` the runs still
+    going). None without a line."""
+    lines = rollup.entries(workers, context, roll)
+    if not lines:
         return []
-    return [(header, None), *((worker_line(i), i) for i in order_workers(workers))]
+    return [(header, None), *lines]
 
 
 def compose(
-    items: Sequence[store.Item], context: Sequence[store.Item] = ()
+    items: Sequence[store.Item],
+    context: Sequence[store.Item] = (),
+    roll: rollup.Rollup | None = None,
 ) -> tuple[str, list[store.Item]] | None:
     """The pulse text and the items it shows (the rest wait); None with no items.
 
-    Worker items go in a ``Workers:`` section after the rest (before it when one is urgent:
-    a failure the owner wasn't texted). ``context``: workers already told that are still
-    running, listed for status when there is news (never a reason to send, and not counted
-    in ``+N more``)."""
+    Workers' and the rollup's items go in a ``Workers:`` section after the rest (before it
+    when one is urgent: a failure the owner wasn't texted), as the rollup's lines
+    (``extensions/rollup.py``). ``context``: workers already told that are still running,
+    listed under ``Still working on`` when there is news (never a reason to send, and not
+    counted in ``+N more``); ``roll`` names them and adds the PRs still being worked on."""
     if not items:
         return None
     others = _order([i for i in items if not is_worker_item(i)])
     keys = {(i.source, i.key) for i in items}
     workers = [i for i in items if is_worker_item(i)]
-    workers += [i for i in context if (i.source, i.key) not in keys and is_worker_item(i)]
-    entries: list[tuple[str, store.Item | None]] = [(item_line(i), i) for i in others]
+    going = [i for i in context if (i.source, i.key) not in keys and is_worker_item(i)]
+    entries: list[tuple[str, tuple[store.Item, ...] | None]] = [
+        (item_line(i), (i,)) for i in others
+    ]
+    section = worker_entries(workers, context=going, roll=roll)
     if any(i.urgency == "urgent" for i in workers):  # a failure nobody took goes first
-        entries = [*worker_entries(workers), *entries]
+        entries = [*section, *entries]
     else:
-        entries += worker_entries(workers)
+        entries += section
     shown, listed, _left = fit_entries(entries, MAX_CHARS - len(HEADER))
     shown_keys = {(i.source, i.key) for i in listed}
     more = sum(1 for k in keys if k not in shown_keys)  # news left out, not status lines
     if not listed:  # one line is at most LINE_MAX, so this is only a tiny-cap safety net
-        first = next(i for _line, i in entries if i is not None)
+        first = next(i for i in items)
         shown, listed = [item_line(first)], [first]
         more = sum(1 for k in keys if k != (first.source, first.key))
         assert len(shown[0]) <= MAX_CHARS - len(HEADER)
@@ -226,7 +245,11 @@ def compose(
 
 def running_workers(conn: sqlite3.Connection, now: datetime) -> list[store.Item]:
     """Open (uncleared, unexpired) worker items: the runs still going."""
-    return [i for i in store.open_items(conn, now) if is_worker_item(i) and not i.cleared]
+    return [
+        i
+        for i in store.open_items(conn, now)
+        if i.source == CORE and i.key.startswith(WORKER_PREFIX) and not i.cleared
+    ]
 
 
 def is_approval_item(item: store.Item) -> bool:
@@ -247,13 +270,28 @@ def _pending(
 
 
 def preview(
-    conn: sqlite3.Connection, now: datetime | None = None, *, hide_approvals: bool = False
+    conn: sqlite3.Connection,
+    now: datetime | None = None,
+    *,
+    hide_approvals: bool = False,
+    stall_after: timedelta = rollup.STALL_AFTER,
 ) -> str | None:
     """What the next pulse would say, or None if it has nothing. Read-only (core items are
     only refreshed by a run)."""
     at = now or utcnow()
-    composed = compose(_pending(conn, at, hide_approvals=hide_approvals), running_workers(conn, at))
+    composed = _compose_now(conn, at, stall_after, hide_approvals=hide_approvals)
     return None if composed is None else composed[0]
+
+
+def _compose_now(
+    conn: sqlite3.Connection, now: datetime, stall_after: timedelta, *, hide_approvals: bool
+) -> tuple[str, list[store.Item]] | None:
+    """:func:`compose` over the store: the pending items, the running workers and the
+    rollup's names for them. Read-only."""
+    items = _pending(conn, now, hide_approvals=hide_approvals)
+    going = running_workers(conn, now)
+    roll = rollup.gather(conn, now, [*items, *going], stall_after=stall_after)
+    return compose(items, going, roll)
 
 
 def open_summary(conn: sqlite3.Connection, now: datetime, tz: str) -> str | None:
@@ -274,12 +312,17 @@ def open_summary(conn: sqlite3.Connection, now: datetime, tz: str) -> str | None
     return "Open: " + ", ".join(parts)
 
 
-def preview_text(conn: sqlite3.Connection, now: datetime, tz: str) -> str:
+def preview_text(
+    conn: sqlite3.Connection, now: datetime, tz: str, *, stall_after: timedelta = rollup.STALL_AFTER
+) -> str:
     """``/pulse`` and the ``pulse_preview`` tool: what the next pulse would say, then the open
     items per source. Read-only (nothing is marked told; core re-mentions appear once a pulse
     run computes them). Approval re-mentions are left out: ``/pulse`` is also the chat tool,
     and approval codes never reach the model (``/approvals`` shows them)."""
-    text = preview(conn, now, hide_approvals=True) or "Nothing new since the last update."
+    text = (
+        preview(conn, now, hide_approvals=True, stall_after=stall_after)
+        or "Nothing new since the last update."
+    )
     summary = open_summary(conn, now, tz)
     return f"{text}\n{summary}" if summary else text
 
@@ -364,6 +407,20 @@ def remention_questions(conn: sqlite3.Connection, now: datetime, delay: timedelt
         title = STILL_WAITING + item.title.removeprefix(STILL_WAITING)
         state = {"open": True, "reminded": now.isoformat(timespec="minutes")}
         store.upsert(conn, CORE, item.key, title, "normal", state, False, ITEM_TTL_S, now)
+
+
+def refresh_rollup(conn: sqlite3.Connection, settings: Settings, now: datetime) -> None:
+    """The rollup's derived items (stalls, the github watch's merges and review requests,
+    ``extensions/rollup.py``). Never raises: the pulse goes out without them."""
+    try:
+        rollup.refresh(
+            conn,
+            now,
+            stall_after=settings.pulse.stall,
+            transcripts=rollup.transcripts_dir(settings.runner.mirror_dir),
+        )
+    except Exception:
+        log.exception("rollup refresh failed")
 
 
 # --- sending ---------------------------------------------------------------------------------
@@ -524,6 +581,7 @@ async def send_pulse(
     store.prune(conn, now)
     prune_inflight(conn, now)
     refresh_core_items(conn, owner, settings, now)
+    refresh_rollup(conn, settings, now)
     if _paused(conn):
         return {"sent": False, "count": 0, "skipped": "paused"}
     if not manual:
@@ -538,7 +596,7 @@ async def send_pulse(
         owner,
         key,
         now,
-        lambda: compose(_pending(conn, now), running_workers(conn, now)),
+        lambda: _compose_now(conn, now, settings.pulse.stall, hide_approvals=False),
     )
     if status == "sent":
         return {"sent": True, "count": count}
