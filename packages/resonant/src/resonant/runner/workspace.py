@@ -1,14 +1,14 @@
 """The runner's workspace: the owner's checkouts, each run's worktree or scratch dir, the
 session's credentials, PR discovery and merge (docs/employee-plan.md D1, docs/repos-plan.md D10).
 
-A run on a repo works in a git worktree of the owner's checkout, ``<code_dir>/<name>`` (cloned on
-first use; a repo's ``path`` overrides where it is), at ``<code_dir>/.worktrees/<name>/R<n>`` on
-branch ``resonant/r<n>-<slug>`` from ``origin/<base>``. The checkout's gitignored local config
-(``.env`` files, ``.envrc``, tool versions, ``.mcp.json``) is symlinked into the worktree. A run
-with no repo gets ``<code_dir>/.scratch/R<n>``. The Claude session pushes its own branch and
-opens the PR with a per-run GitHub App token (``write_session_credentials``); this module finds
-the PR afterwards and, before any merge, fetches its head into the daemon-only mirror and runs
-the checks.
+A run on a repo works in a git worktree of the owner's checkout, ``<code_dir>/<name>`` (cloned
+when the repo is added, ``owner_checkout``, or on first use; a repo's ``path`` overrides where it
+is), at ``<code_dir>/.worktrees/<name>/R<n>`` on branch ``resonant/r<n>-<slug>`` from
+``origin/<base>``. The checkout's gitignored local config (``.env`` files, ``.envrc``, tool
+versions, ``.mcp.json``) is symlinked into the worktree. A run with no repo gets
+``<code_dir>/.scratch/R<n>``. The Claude session pushes its own branch and opens the PR with a
+per-run GitHub App token (``write_session_credentials``); this module finds the PR afterwards
+and, before any merge, fetches its head into the daemon-only mirror and runs the checks.
 
 Trust rules this module keeps:
 
@@ -109,6 +109,8 @@ FORK_READY_TRIES = 6  # GitHub makes a new fork in the background; the clone wai
 FORK_READY_WAIT_S = 5.0  # the first wait, doubled each try
 UPSTREAM_BODY_MAX = 4000
 GIT_TIMEOUT_S = 300.0
+CLONE_TIMEOUT_S = 120.0  # an add's clone (owner_checkout); a run's first clone has GIT_TIMEOUT_S
+CLONE_MAX_KB = 2_000_000  # GitHub's size above which an add leaves the clone to the first run
 GH_TIMEOUT_S = 120.0
 COMMITTER_NAME = "Resonant runner"
 COMMITTER_EMAIL = "resonant-runner@users.noreply.github.com"
@@ -629,6 +631,22 @@ class ForkCheck:
     change: ForkChange
 
 
+OwnerCheckoutState = Literal["cloned", "present", "in_the_way", "failed", "skipped"]
+
+
+@dataclass(frozen=True)
+class OwnerCheckout:
+    """What ``owner_checkout`` did: ``cloned`` (a fresh clone), ``present`` (a checkout of the
+    repo was already there and is used as is), ``in_the_way`` (something else is there and was
+    left alone), ``failed`` (the clone failed or ran out of time; the first run tries again) or
+    ``skipped`` (a fork repo, or too big to clone while adding). ``reason`` says why for the
+    last three, as a clause for the reply."""
+
+    state: OwnerCheckoutState
+    path: Path
+    reason: str = ""
+
+
 # --- the workspace -----------------------------------------------------------------------
 
 
@@ -907,6 +925,52 @@ class Workspace:
             raise RunnerError(f"{path}'s origin isn't {want}")
         return path
 
+    async def owner_checkout(
+        self,
+        repo: Repo,
+        token: str | None,
+        *,
+        size_kb: int | None = None,
+        timeout_s: float = CLONE_TIMEOUT_S,
+    ) -> OwnerCheckout:
+        """Give the owner a checkout of a repo they just added (``add_repo``, ``create_repo``):
+        ``ensure_checkout`` within ``timeout_s``, then the repo's ``path`` is set to it. Never
+        raises for git or the disk: a failure is the result, and the repo stays registered (a
+        run's ``prepare`` clones it then). An existing checkout of the repo is only looked at,
+        and anything else at the path is left alone.
+
+        Skipped: a fork repo (its checkout is the owner's fork, which the first run makes; a
+        clone of the original there would be refused by that run) and a repo GitHub says is
+        over ``CLONE_MAX_KB`` (``size_kb``; None is unknown, and the timeout still bounds it)."""
+        path = self.checkout_path(repo)
+        if repo.mode == "fork":
+            return OwnerCheckout("skipped", path, "it's upstream, so the first run makes your "
+                                 "fork and clones that")  # fmt: skip
+        if size_kb is not None and size_kb > CLONE_MAX_KB:
+            gb = size_kb / 1_000_000
+            return OwnerCheckout("skipped", path, f"it's about {gb:.1f} GB on GitHub, so the "
+                                 "first run clones it")  # fmt: skip
+        existed = False
+        try:
+            async with asyncio.timeout(timeout_s), self.checkout_lock(repo.name):
+                existed = await asyncio.to_thread(os.path.lexists, path)
+                await self.ensure_checkout(repo, token)
+        except TimeoutError:
+            minutes = max(1, round(timeout_s / 60))
+            return OwnerCheckout("failed", path, f"it didn't finish within {minutes} min")
+        except (RunnerError, GitError, OSError) as e:
+            reason = e.message if isinstance(e, GitError) else str(e)
+            reason = Redactor([token] if token else ()).text(reason)
+            if existed:
+                return OwnerCheckout("in_the_way", path, reason)
+            if token is None and _ANON_REFUSED.search(reason):
+                reason = "a private repo needs the daemon's GitHub token (runner/github_token)"
+            return OwnerCheckout("failed", path, reason)
+        if repo.path != path:
+            with atomic(self.conn):
+                repo_store.set_path(self.conn, repo.slug, path)
+        return OwnerCheckout("present" if existed else "cloned", path)
+
     async def _clone(self, url: str, dest: Path, token: str | None, *, fork: bool) -> None:
         """``git clone`` into an empty ``dest``. A fork GitHub is still making isn't there
         yet: the clone is tried again a few times, waiting longer each time."""
@@ -1016,6 +1080,9 @@ class Workspace:
             checkout = await self.ensure_checkout(
                 repo, github_token if fork is None else None, fork=fork
             )
+            if repo.path is None:  # recorded, like an add's clone (owner_checkout)
+                with atomic(self.conn):
+                    repo_store.set_path(self.conn, repo.slug, checkout)
             if from_mirror:
                 tracking = f"refs/remotes/{'origin' if fork is None else 'upstream'}/{repo.base}"
                 try:  # tokenless, from the mirror, under the guard

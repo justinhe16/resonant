@@ -99,6 +99,11 @@ class GitHub(Protocol):
         """Whether ``branch`` has branch protection, or None if that can't be told."""
         ...
 
+    async def size_kb(self, slug: str) -> int | None:
+        """GitHub's size of the repo in KB (about its packed size), or None if that can't be
+        told. Never raises: it only decides whether an add clones right away."""
+        ...
+
 
 @dataclass(frozen=True)
 class Resolved:
@@ -331,6 +336,13 @@ class GhGitHub:
         except (ValueError, KeyError, TypeError):
             return None
 
+    async def size_kb(self, slug: str) -> int | None:
+        try:
+            code, out, _ = await self._api(f"repos/{slug}", "--jq", ".size")
+        except Exception:  # never raises (the Protocol)
+            return None
+        return _size(out.strip()) if code == 0 else None
+
     async def my_repos(self) -> list[str]:
         code, out, err = await self._api(
             "user/repos", "-X", "GET", "-f", "per_page=100", "-f", "sort=pushed",
@@ -358,6 +370,15 @@ def _readable(slug: str, name: object, base: object) -> tuple[str, str]:
     if parse_slug(name) != name:
         raise GitHubError(f"GitHub's answer about {slug} wasn't readable")
     return name, base
+
+
+def _size(value: object) -> int | None:
+    """GitHub's ``size`` (KB) when it is a plain non-negative integer, else None."""
+    if isinstance(value, str):
+        value = int(value) if value.isdigit() else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 class PublicGitHub:
@@ -416,6 +437,18 @@ class PublicGitHub:
     async def my_repos(self) -> list[str]:
         raise NeedsToken("listing your GitHub repos needs the daemon's GitHub token")
 
+    async def size_kb(self, slug: str) -> int | None:
+        try:
+            resp = await self._get(f"repos/{slug}")
+        except GitHubError:
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            return _size(resp.json()["size"])
+        except (ValueError, KeyError, TypeError):
+            return None
+
     async def is_protected(self, slug: str, branch: str) -> bool | None:
         try:
             resp = await self._get(f"repos/{slug}/branches/{quote(branch, safe='/')}")
@@ -444,10 +477,14 @@ class OfflineGitHub:
     async def is_protected(self, slug: str, branch: str) -> bool | None:
         return None
 
+    async def size_kb(self, slug: str) -> int | None:
+        return None
+
 
 class FakeGitHub:
     """A :class:`GitHub` for tests: ``known`` maps ``owner/name`` (any case) to its info,
-    ``mine`` is the owner's repo list, ``protected`` what ``is_protected`` answers. ``calls``
+    ``mine`` is the owner's repo list, ``protected`` what ``is_protected`` answers, ``sizes``
+    what ``size_kb`` answers by ``owner/name`` (any case). ``calls``
     records what was asked; ``error`` makes every
     call raise :class:`GitHubError`."""
 
@@ -459,6 +496,7 @@ class FakeGitHub:
         protected: bool | None = True,
     ) -> None:
         self.protected = protected
+        self.sizes: dict[str, int] = {}
         self.known = {i.slug.lower(): i for i in known or []}
         self.mine = [i.slug for i in known or []] if mine is None else mine
         self.error = error
@@ -473,6 +511,10 @@ class FakeGitHub:
     async def is_protected(self, slug: str, branch: str) -> bool | None:
         self.calls.append(f"is_protected {slug} {branch}")
         return self.protected
+
+    async def size_kb(self, slug: str) -> int | None:
+        self.calls.append(f"size_kb {slug}")
+        return self.sizes.get(slug.lower())
 
     async def my_repos(self) -> list[str]:
         self.calls.append("my_repos")

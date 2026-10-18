@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import sqlite3
+import subprocess
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -23,7 +24,7 @@ from resonant.runner import create
 from resonant.runner.checks import runs_on_pull_request
 from resonant.runner.create import CreateError, Creator, valid_repo_name
 from resonant.runner.resolve import FakeGitHub, RepoInfo, Resolved, Resolver
-from resonant.runner.workspace import Exec
+from resonant.runner.workspace import Exec, Workspace
 from resonant.secrets import RunnerSecrets
 from resonant.store import repos
 from resonant.store import runs as runs_store
@@ -270,8 +271,58 @@ async def test_protected_unknown_and_fork_repos_do_not_warn(
 # --- tools -------------------------------------------------------------------------------
 
 
+GIT = "/usr/bin/git"
+GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@example.com",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@example.com",
+}
+
+
+def git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        [GIT, "-C", str(cwd), *args], env=GIT_ENV, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+class FakeWorkspace(FakeGh):
+    """The runner's workspace for the repo tools: ``gh`` is the fake, and the owner's checkouts
+    are a real :class:`Workspace` over temp dirs whose remotes are local bare repos (``remote``
+    makes one); a slug with none fails to clone. Never the network or the real ~/code."""
+
+    def __init__(self, cfg: RunnerConfig, conn: sqlite3.Connection, root: Path) -> None:
+        super().__init__()
+        self.root = root
+        self.remotes: dict[str, Path] = {}
+        self.real = Workspace(cfg, conn, url_for=self._url)
+        self.owner_checkout = self.real.owner_checkout
+        self.checkout_path = self.real.checkout_path
+
+    def _url(self, repo: repos.Repo) -> str:
+        return str(self.remotes.get(repo.slug.lower(), self.root / "missing" / repo.slug))
+
+    def remote(self, slug: str) -> Path:
+        """A bare repo with one commit on main, as the GitHub remote of ``slug``."""
+        bare = self.root / "remotes" / f"{slug}.git"
+        bare.parent.mkdir(parents=True, exist_ok=True)
+        git(bare.parent, "init", "-q", "--bare", "-b", "main", str(bare))
+        seed = self.root / "seeds" / slug
+        seed.mkdir(parents=True)
+        git(seed, "init", "-q", "-b", "main")
+        (seed / "README.md").write_text("hello\n")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-q", "-m", "base")
+        git(seed, "push", "-q", str(bare), "main")
+        self.remotes[slug.lower()] = bare
+        return bare
+
+
 class FakeClaude:
-    def __init__(self, ws: FakeGh, github: FakeGitHub, resolver: Resolver) -> None:
+    def __init__(self, ws: FakeWorkspace, github: FakeGitHub, resolver: Resolver) -> None:
         self.workspace = ws
         self.secrets = object()
         self.github = github
@@ -287,9 +338,16 @@ class FakeClaude:
 
 
 @pytest.fixture
-def settings() -> Settings:
+def settings(tmp_path: Path) -> Settings:
     base = load_settings()
-    return base.model_copy(update={"runner": RunnerConfig(), "dry_run": False})
+    runner = RunnerConfig(
+        code_dir=tmp_path / "code",
+        work_dir=tmp_path / "runs",
+        cache_dir=tmp_path / "runs" / ".cache",
+        mirror_dir=tmp_path / "state" / "mirrors",
+        secrets_dir=tmp_path / "state" / "secrets",
+    )
+    return base.model_copy(update={"runner": runner, "dry_run": False})
 
 
 @pytest.fixture
@@ -302,7 +360,11 @@ def components(settings: Settings, db: sqlite3.Connection) -> Iterator[Component
 
 @pytest.fixture
 def claude(
-    components: Components, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+    components: Components,
+    db: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    tmp_path: Path,
 ) -> FakeClaude:
     async def fake_secrets(store: object, *, claude: bool = True) -> RunnerSecrets:
         assert claude is False  # the repo tools never start a session
@@ -311,7 +373,7 @@ def claude(
     monkeypatch.setattr("resonant.tools.repos.load_runner_secrets", fake_secrets)
     monkeypatch.setattr("resonant.tools.repos.PublicGitHub", lambda: fake.public.github())
     github = FakeGitHub([RepoInfo("me/proj", "main", False, True, True)])
-    fake = FakeClaude(FakeGh(), github, Resolver(db))
+    fake = FakeClaude(FakeWorkspace(settings.runner, db, tmp_path), github, Resolver(db))
     components.runners["claude"] = cast(Any, fake)
     return fake
 
@@ -365,22 +427,27 @@ async def test_repo_tools_without_the_daemon_token_say_what_they_need(
 
 
 async def test_add_repo_registers_a_public_repo_without_the_daemon_token(
-    components: Components, claude: FakeClaude, db: sqlite3.Connection
+    components: Components, claude: FakeClaude, db: sqlite3.Connection, settings: Settings
 ) -> None:
     """GT-1: an explicit owner/name or URL needs no token when GitHub shows it to anyone."""
     claude.secrets_value = RunnerSecrets(None, None, None)
     claude.public.repos["octo/lib"] = public("Octo/Lib", "develop")
+    claude.workspace.remote("Octo/Lib")
     out = await call(components, "add_repo", {"repo": "https://github.com/octo/lib"})
     assert out["added"] is True and out["new"] is True and out["slug"] == "Octo/Lib"
+    where = settings.runner.code_dir / "lib"
     assert out["text"] == (
-        "Added Octo/Lib as lib (push). Registered without the daemon's GitHub token, so push "
-        "access and CI weren't checked; runs will find out."
+        f"Added lib (Octo/Lib, base develop, push): cloned to {where}. Registered without the "
+        "daemon's GitHub token, so push access and CI weren't checked; runs will find out."
     )
+    assert (where / ".git").is_dir()  # a public repo clones with no token
     repo = repos.get(db, "Octo/Lib")
     assert repo is not None and (repo.base, repo.mode, repo.ci) == ("develop", "push", None)
     again = await call(components, "add_repo", {"repo": "octo/lib"})
     assert again["added"] is True and again["new"] is False
-    assert again["text"] == "Already have Octo/Lib as lib (push)."
+    assert (
+        again["text"] == f"Already have lib (Octo/Lib, base develop, push): checked out at {where}."
+    )
     # A registered repo answers by name with no token too; an unknown name needs it.
     assert (await call(components, "add_repo", {"repo": "lib"}))["new"] is False
     assert claude.github.calls == []  # the token-backed client was never used
@@ -420,8 +487,9 @@ async def test_add_repo_list_and_forget(
     assert out["warning"] == "main isn't protected" and "Heads up" in out["text"]
     listed = await call(components, "list_repos", {})
     assert listed["repos"] == [
-        {"name": "proj", "slug": "me/proj", "mode": "push", "ci": True, "source": "auto"}
-    ]
+        {"name": "proj", "slug": "me/proj", "mode": "push", "ci": True, "source": "auto",
+         "path": "not cloned"}
+    ]  # fmt: skip
     assert repos.find(db, "p") is not None  # the alias works
     missing = await call(components, "add_repo", {"repo": "me/none"})
     assert missing == {"added": False, "text": "No access to me/none."}
@@ -666,4 +734,93 @@ async def test_add_repo_says_which_extension_linked_it(
     repos.set_links(db, "trading", ["me/proj"])
     out = await call(components, "add_repo", {"repo": "trading"})
     assert out["added"] and out["via"] == "trading"
-    assert out["text"].startswith("Added me/proj as proj via trading (push, CI).")
+    assert out["text"].startswith("Added proj (me/proj via trading, base main, push, CI): ")
+
+
+# --- RP-1: adding a repo clones it for the owner -----------------------------------------
+
+
+async def test_add_repo_clones_it_and_says_where(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection, settings: Settings
+) -> None:
+    claude.workspace.remote("me/proj")
+    out = await call(components, "add_repo", {"repo": "me/proj"})
+    where = settings.runner.code_dir / "proj"
+    assert out["text"] == f"Added proj (me/proj, base main, push, CI): cloned to {where}."
+    assert out["checkout"] == "cloned" and out["path"] == str(where)
+    assert git(where, "remote", "get-url", "origin") == str(claude.workspace.remotes["me/proj"])
+    token = SECRETS.github_token
+    assert token is not None and token not in (where / ".git" / "config").read_text()
+    repo = repos.get(db, "me/proj")
+    assert repo is not None and repo.path == where
+    listed = await call(components, "list_repos", {})
+    assert listed["repos"][0]["path"] == str(where)
+    assert "size_kb me/proj" in claude.github.calls
+
+
+async def test_adding_a_registered_repo_without_a_checkout_clones_it(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection, settings: Settings
+) -> None:
+    """The mycelium case: registered before adds cloned, no path, nothing in the code dir."""
+    repos.add(db, "justinhe16/mycelium", base="main", source="auto", ci=None)
+    claude.workspace.remote("justinhe16/mycelium")
+    out = await call(components, "add_repo", {"repo": "mycelium"})
+    where = settings.runner.code_dir / "mycelium"
+    assert out["new"] is False and out["text"] == (
+        f"Already have mycelium (justinhe16/mycelium, base main, push): cloned to {where}."
+    )
+    assert (where / "README.md").read_text() == "hello\n"
+    again = await call(components, "add_repo", {"repo": "justinhe16/mycelium"})
+    assert again["checkout"] == "present" and f"checked out at {where}." in again["text"]
+
+
+async def test_a_failed_clone_keeps_the_repo_and_says_the_first_run_retries(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection
+) -> None:
+    out = await call(components, "add_repo", {"repo": "me/proj"})  # no remote: clone fails
+    assert out["added"] is True and out["checkout"] == "failed" and out["path"] is None
+    assert "the clone to " in out["text"] and "the first run will try again." in out["text"]
+    assert "cloned to" not in out["text"]
+    repo = repos.get(db, "me/proj")
+    assert repo is not None and repo.path is None
+    assert (await call(components, "list_repos", {}))["repos"][0]["path"] == "not cloned"
+
+
+async def test_something_else_in_the_way_is_left_alone(
+    components: Components, claude: FakeClaude, settings: Settings
+) -> None:
+    claude.workspace.remote("me/proj")
+    where = settings.runner.code_dir / "proj"
+    where.mkdir(parents=True)
+    (where / "keep.txt").write_text("mine\n")
+    out = await call(components, "add_repo", {"repo": "me/proj"})
+    assert out["checkout"] == "in_the_way" and "I left it alone" in out["text"]
+    assert [p.name for p in where.iterdir()] == ["keep.txt"]
+
+
+async def test_fork_and_huge_repos_are_not_cloned_while_adding(
+    components: Components, claude: FakeClaude, settings: Settings
+) -> None:
+    claude.github.known["up/lib"] = RepoInfo("up/lib", "main", False, False, True)
+    claude.workspace.remote("up/lib")
+    out = await call(components, "add_repo", {"repo": "up/lib"})
+    assert out["checkout"] == "skipped" and "makes your fork" in out["text"]
+    assert "size_kb up/lib" not in claude.github.calls  # a fork isn't asked about
+    claude.github.sizes["me/proj"] = 3_100_000
+    claude.workspace.remote("me/proj")
+    big = await call(components, "add_repo", {"repo": "me/proj"})
+    assert big["checkout"] == "skipped" and "about 3.1 GB" in big["text"]
+    assert not (settings.runner.code_dir / "lib").exists()
+    assert not (settings.runner.code_dir / "proj").exists()
+
+
+async def test_create_repo_clones_the_new_repo(
+    components: Components, claude: FakeClaude, db: sqlite3.Connection, settings: Settings
+) -> None:
+    claude.workspace.remote("me/scratch")
+    out = await call(components, "create_repo", {"name": "scratch"})
+    where = settings.runner.code_dir / "scratch"
+    assert out["created"] is True and out["checkout"] == "cloned"
+    assert out["text"].endswith(f" Cloned to {where}.") and (where / ".git").is_dir()
+    repo = repos.get(db, "me/scratch")
+    assert repo is not None and repo.path == where
