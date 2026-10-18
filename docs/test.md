@@ -91,15 +91,15 @@ Update a row when you try it, with the date and anything odd.
 
 ## Brain: ask_claude and taint (BR-5)
 
-Numbered B1–B5. Needs the brain loop (BR-1) to call `ask_claude` from chat; until then only the unit tests reach it.
+Numbered B1–B5. Needs `brain.mode: loop` (BR-1, L1 below) to call `ask_claude` from chat.
 
 | # | Test | Expect | Status |
 |---|---|---|---|
-| B1 | "look up the latest Claude Code release" (research) | `Looking into it…`, then within ~2 min one `Claude: …` reply, terse, under 1500 chars | 📱 after BR-1 |
-| B2 | "what's on my calendar tomorrow" | Today: `Not done: Calendar isn't reachable from Claude's read-only mode (missing …)` (connectors don't load under `--restricted`, followups) | 📱 after BR-1 |
+| B1 | "look up the latest Claude Code release" (research) | `Looking into it…`, then within ~2 min one `Claude: …` reply, terse, under 1500 chars | 📱 after L1 |
+| B2 | "what's on my calendar tomorrow" | Today: `Not done: Calendar isn't reachable from Claude's read-only mode (missing …)` (connectors don't load under `--restricted`, followups) | 📱 after L1 |
 | B3 | A screenshot with "what's this?" | `Claude: …` about the image (attachment copied from Messages) | 📱 after BR-7 |
 | B4 | `/kill` while an ask runs, then `/resume` | `Stopped: Resonant was paused (/kill).`; no `claude` process left (`pgrep -f -- --restricted`) | 📱 + 🖥 after BR-1 |
-| B5 | A tainted write: after "read ~/code/x/README" ask it to "add a note …" | The note asks first (`[A7] add note … Reply yes / no`), no `yes always` | 📱 after BR-1 |
+| B5 | A tainted write: after "read ~/code/x/README" ask it to "add a note …" | The note asks first (`[A7] add note … Reply yes / no`), no `yes always` | 📱 after L1 |
 
 ## Phase 4: the dashboard
 
@@ -116,24 +116,38 @@ Numbered D1–D6 so they don't collide with other sections' rows. Steps are [`go
 
 ## Phase 6a: the brain's read tools (BR-2)
 
-Numbered F1–F4. The tools are registered now but reach chat only through the brain loop (BR-1, `brain.mode: loop`); until then F1–F3 wait for it.
+Numbered F1–F4. The tools reach chat only through the brain loop (`brain.mode: loop`, L1 below).
 
 | # | Test | Expect | Status |
 |---|---|---|---|
-| F1 | "where is mycelium" | A path under `~/code` (or wherever it is in the read roots), from `search` or `list_dir` | 📱 after BR-1 |
-| F2 | "what's in ~/.ssh/config", "show me dori's .env" | Refused: the path is on the deny list; nothing from the file | 📱 after BR-1 |
-| F3 | "what did R4 say last", "any errors in the log?" | Lines from `read_transcript` / `tail_log`, URLs and handles removed, no tokens | 📱 after BR-1 |
+| F1 | "where is mycelium" | A path under `~/code` (or wherever it is in the read roots), from `search` or `list_dir` | 📱 after L1 |
+| F2 | "what's in ~/.ssh/config", "show me dori's .env" | Refused: the path is on the deny list; nothing from the file | 📱 after L1 |
+| F3 | "what did R4 say last", "any errors in the log?" | Lines from `read_transcript` / `tail_log`, URLs and handles removed, no tokens | 📱 after L1 |
 | F4 | Optional: `brew install ripgrep` (`brain.rg_path`, default `/opt/homebrew/bin/rg`); without it `search` uses the slower bounded Python walk | `/opt/homebrew/bin/rg --version` works | 🖥 |
 
-## Brain (after BR-1 wires the loop and `brain.mode: loop`)
+## Brain (with `brain.mode: loop`)
 
 | # | Test | Expect | Status |
 |---|---|---|---|
 | B1 | "remember that mycelium is checked out at ~/code/mycelium" | `Remembered mycelium-path: "…"` (or a similar name); `ls -l ~/.resonant/brain/facts` shows one `-rw-------` file | 📱 + 🖥 after BR-1 |
-| B2 | "what do you remember?" then "forget mycelium-path" | The fact from B1; then `Forgot mycelium-path.` and the file is gone | 📱 after BR-1 |
-| B3 | Text "where is mycelium?" with no fact saved | The repo's path from the briefing (`Repos:`), or a guess that says what it assumed | 📱 after BR-1 |
-| B4 | Start a run, wait for it to finish without texting, then text "hey" | The reply can mention the run ended (the `since we last talked` notes) | 📱 after BR-1 |
+| B2 | "what do you remember?" then "forget mycelium-path" | The fact from B1; then `Forgot mycelium-path.` and the file is gone | 📱 after L1 |
+| B3 | Text "where is mycelium?" with no fact saved | The repo's path from the briefing (`Repos:`), or a guess that says what it assumed | 📱 after L1 |
+| B4 | Start a run, wait for it to finish without texting, then text "hey" | The reply can mention the run ended (the `since we last talked` notes) | 📱 after L1 |
 | B5 | A long thread (16+ texts), then "what did I ask you earlier about X?" | Answers from the summary; `sqlite3 ~/.resonant/resonant.db "select folded, source from brain_summaries"` shows `source=model` | 📱 + 🖥 after BR-1 |
+
+## Brain loop (BR-1)
+
+Numbered L1–L7. `brain.mode` defaults to `intents`; L1 turns the loop on (BR-8 makes it the default once the evals pass).
+
+| # | Test | Expect | Status |
+|---|---|---|---|
+| L1 | Add `brain: {mode: loop}` to `~/.resonant/config.yaml`, restart, text "hey" | A short reply; `sqlite3 ~/.resonant/resonant.db "select runner, kind from tasks order by rowid desc limit 1"` shows `brain|chat`; `ping` and `/status` still answer at once | 📱 + 🖥 |
+| L2 | "what's R4 doing" while a run is open | From `run_activity` (a core tool), no labeler call | 📱 after L1 |
+| L3 | "how much disk is free?" | The model loads `disk` with `load_tools` and answers; a `runner.brain.load` span with `loaded: ["disk"]` | 📱 + 🖥 after L1 |
+| L4 | A question that needs a few reads ("which repo has the flaky test?") | `On it…` once if it takes over 6 s, then the answer; never more than 8 `runner.brain.round` spans for the task | 📱 after L1 |
+| L5 | "remember that dori deploys on fridays"; then "read ~/code/dori/README.md and remember what it says about deploys" | The first runs (`Remembered …`); the second asks first (`[A7] … Reply yes / no`, no `yes always`) because the file read tainted the task | 📱 after L1 |
+| L6 | Something the local model can't finish ("compare the last ten runs' failures and summarise the causes") | Either an answer, or `Looking into it…` and then `Claude: …` (auto-escalation) | 📱 after L1 |
+| L7 | `brew services stop ollama`, text "hey", then `brew services start ollama` | `I'm having trouble thinking right now. …` (the intents fallback), no crash; after the restart replies come back | 📱 + 🖥 after L1 |
 
 ## Needs real data or effort
 

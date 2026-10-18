@@ -11,8 +11,17 @@
   ``task_counts`` if it is in the toolset, else the first tool. Args are none, except
   ``add_reminder``: "remind me in N minutes to X" becomes ``{at: <Current time> + N min, text:
   X}``, using the ``Current time:`` line the runner puts before the message.
-- Answer calls (``schema == REPLY_SCHEMA``): ``{"reply": final_reply}``.
+- Answer calls (``schema == REPLY_SCHEMA``): ``{"reply": final_reply}``. A history fold
+  (``{summary}``) gets a fixed summary.
 - ``probe()``: always ok.
+
+**Scripted mode** (the brain loop, BR-1): ``ScriptedModel(script=[...])``, or ``push(...)``
+per test. Each ``chat_tools`` call takes the next item: a list of ``ToolCall`` (or
+``(name, args)`` pairs) is one round of tool calls, a string is the final reply (``text``,
+no calls), an exception is raised. An empty script answers ``final_reply``. Label and answer
+calls work as above, so a turn that falls back to the intents path still labels. Every
+``chat_tools`` request is kept in ``requests`` (messages and tool names), for asserting on
+the prompt and the toolset.
 
 Each call can sleep ``delay_s`` first, to stand in for model latency.
 
@@ -67,6 +76,8 @@ TOOL_RULES: tuple[tuple[str, str], ...] = (
     ("what can you do", "list_commands"),
     ("clear my notes", "clear_notes"),
 )
+Scripted = Sequence[ToolCall | tuple[str, dict[str, Any]]] | str | BaseException
+
 _REMIND = re.compile(r"remind me in (\d+) minutes? to (.+?)</message>", re.IGNORECASE | re.DOTALL)
 _NOW = re.compile(r"^Current time: (\S+) ", re.MULTILINE)
 DEFAULT_FINAL_REPLY = "Here's the rundown from the task list: all good."
@@ -81,11 +92,20 @@ class ScriptedModel:
         final_reply: str = DEFAULT_FINAL_REPLY,
         delay_s: float = 0.0,
         rules: Sequence[tuple[str, str]] = LABEL_RULES,
+        script: Sequence[Scripted] | None = None,
     ) -> None:
         self.final_reply = final_reply
         self.delay_s = delay_s
         self.rules = tuple(rules)
         self.calls: dict[str, int] = {"label": 0, "tools": 0, "answer": 0, "probe": 0}
+        self.script: list[Scripted] | None = None if script is None else list(script)
+        self.requests: list[ToolsRequest] = []
+
+    def push(self, *items: Scripted) -> None:
+        """Append to the script (and switch to scripted mode)."""
+        if self.script is None:
+            self.script = []
+        self.script.extend(items)
 
     async def _wait(self) -> None:
         if self.delay_s > 0:
@@ -108,6 +128,9 @@ class ScriptedModel:
         elif schema == REPLY_SCHEMA:
             self.calls["answer"] += 1
             data = {"reply": self.final_reply}
+        elif _props(schema) == {"summary"}:  # the brain's history fold
+            self.calls["fold"] = self.calls.get("fold", 0) + 1
+            data = {"summary": "Earlier: the owner and Resonant talked."}
         else:
             raise ValueError("ScriptedModel: unexpected schema")
         return ModelReply(json.dumps(data), [], data, 1, 10, 5)
@@ -122,6 +145,9 @@ class ScriptedModel:
     ) -> ModelReply:
         await self._wait()
         self.calls["tools"] += 1
+        self.requests.append(ToolsRequest(list(messages), [t.name for t in tools]))
+        if self.script is not None:
+            return self._scripted()
         already = any(
             m["role"] == "assistant" and m["content"].startswith('{"tool_call"') for m in messages
         )
@@ -138,6 +164,18 @@ class ScriptedModel:
         )
         args = reminder_args(current) if name == "add_reminder" else {}
         return ModelReply(None, [ToolCall(name, args)], None, 1, 10, 5)
+
+    def _scripted(self) -> ModelReply:
+        assert self.script is not None
+        if not self.script:
+            return ModelReply(self.final_reply, [], None, 1, 10, 5)
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        if isinstance(item, str):
+            return ModelReply(item, [], None, 1, 10, 5)
+        calls = [c if isinstance(c, ToolCall) else ToolCall(c[0], dict(c[1])) for c in item]
+        return ModelReply(None, calls, None, 1, 10, 5)
 
     async def probe(self) -> ProbeResult:
         self.calls["probe"] += 1
@@ -157,6 +195,10 @@ def _enum(schema: dict[str, Any]) -> list[str]:
     return [str(v) for v in cast(list[Any], intent.get("enum") or [])]
 
 
+def _props(schema: dict[str, Any]) -> set[str]:
+    return set(cast(dict[str, Any], schema.get("properties") or {}))
+
+
 def _is_label_schema(schema: dict[str, Any]) -> bool:
     return schema == LABEL_SCHEMA or bool(_enum(schema))
 
@@ -168,6 +210,14 @@ def reminder_args(turn: str) -> dict[str, Any]:
         return {}
     at = datetime.fromisoformat(now.group(1)) + timedelta(minutes=int(ask.group(1)))
     return {"at": at.isoformat(), "text": ask.group(2).strip()}
+
+
+@dataclass(frozen=True)
+class ToolsRequest:
+    """One ``chat_tools`` call as the scripted model saw it."""
+
+    messages: list[ChatMessage]
+    tools: list[str]  # names, in the order sent
 
 
 @dataclass(frozen=True)

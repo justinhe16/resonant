@@ -129,7 +129,7 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 ## Slow-reply acknowledgement ("on it")
 
-*Deferred 2026-10-13, from the local-model latency fix (Instruct-2507 default).*
+*Deferred 2026-10-13, from the local-model latency fix (Instruct-2507 default).* **Brain loop: done in BR-1** (`On it…` after 6 s, once per task, dedupe `progress:<task id>`); the intents path still has none.
 
 **Problem.** A routed reply takes one label call, up to three tool rounds and a final answer. That's usually 1-3 s, but a cold model or a long thread can take much longer, and the sender sees nothing until the answer arrives. (Claude workers already ack at once: `On it: R4`.) iMessage gives no typing indicator over AppleScript.
 
@@ -393,6 +393,20 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **Proposals are text only.** A `Proposed:` line is flagged (`result.proposed`) but nothing acts on it; the gated send/event tool is later work (D8).
 - **No transcript.** Ask sessions keep no transcript (only the `ask.done` audit with status, cost and turns); add one under `transcripts/ask-<id>.jsonl` if debugging needs it.
 - **Usage-limit backoff is shared kv, separate from workers.** A worker hitting the limit doesn't stop asks (and vice versa) until each hits it itself.
+
+## BR-1 carry-overs: the brain loop
+
+*Noted 2026-10-18 from BR-1 ([`brain-plan.md`](brain-plan.md#br-1-the-brain-loop-2026-10-18)).*
+
+- **The ask's answer isn't in later turns.** History is the principal's messages and the replies of the tasks they started, so `Claude: …` (an `ask` task with no origin event) never shows: "and where's that?" after an ask lacks its answer. Add finished asks for the principal to the turn (as untrusted data, like `<since_last>`), and taint any task whose prompt holds one.
+- **Taint is per task.** A reply that quoted a file goes into history as an assistant turn, and the next task starts untainted with that text in its prompt. Options: mark replies of tainted tasks (`reply_meta.meta.tainted`, already saved) and taint a turn whose history holds one within the last few exchanges, or wrap such replies as data. Weigh against asking more often.
+- **The briefing holds worker text.** `Runs:` notes and `Workers ask:` questions (written by workers, which read PRs and the web) are in every turn's briefing, so an untainted turn already sees them. Options: drop free text from the briefing (codes, states and counts only, with `run_activity` for the rest) or taint any turn whose briefing has it. Decide with BR-6's evals.
+- **Loaded tools change the tools block.** `load_tools` adds schemas mid-task, so the rounds after it miss the KV cache for everything after the system message (the next task starts from the core set again). If it shows in latency, keep a per-principal "recently loaded" set in the core list, or move the catalog tools to the end of the tools block if the template allows.
+- **Long steps.** A stuck turn can take 8 rounds plus a narration (`brain_step_limit`: 9 × `model.timeout_s` + slack, about 9 minutes with the defaults) and holds Ollama's one slot. A wall-clock budget per turn (escalate after ~60 s) would bound it.
+- **A crash retry starts the turn over.** Loaded tools and the transcript of tool results aren't checkpointed; a step that dies mid-loop re-runs from the context (reads replay from `executions`, a pinned side effect resumes). Fine at today's scale.
+- **The fallback reuses call indexes.** The intents path after the loop counts calls from 0 in the same step; a read the loop already ran with the same args replays its recorded result (harmless), a different call gets its own key.
+- **Number guard is log-only.** BR-6's evals should read `Done.result.number_guard` and decide whether a hard guard comes back for the loop.
+- **Progress before an approval.** A slow turn that ends in an approval prompt can send `On it…` right before the prompt.
 
 ## RC-1 carry-overs: live sessions and Remote Control
 

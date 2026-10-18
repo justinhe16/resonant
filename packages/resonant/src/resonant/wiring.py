@@ -45,6 +45,11 @@ off there is no router hook: extension events wait unrouted, as messages would.
 Extension health. The monitor gets ``extensions.host.ExtensionHealth`` as its dynamic
 ``ext:<name>`` checks (health commands, job fail streaks, load refusals, tampering).
 
+Brain loop. ``runner="brain"`` (``runners.brain.BrainRunner``, BR-1) is always registered, so a
+brain task outlives a switch back to ``brain.mode: intents``; the router sends chat to it only
+with ``brain.mode: loop``. It gets the daemon's ``started_at``, ``loop.last_tick`` and the slot
+pool for the briefing, and the owner's facts store. Its step limit is ``brain_step_limit``.
+
 Ask Claude. ``runner="ask"`` (``runners.ask.AskRunner``, BR-5) runs one read-only ``claude -p``
 per ``ask_claude`` call and texts the answer, so it is registered here; the tool reaches it as
 ``components.runners["ask"]``. With iMessage off the tool answers that it isn't running.
@@ -75,8 +80,10 @@ import logging
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
+from resonant.brain.facts import FactStore, facts_dir
 from resonant.components import Components
 from resonant.config import ModelConfig, Settings
 from resonant.executor import ToolFailed
@@ -96,6 +103,7 @@ from resonant.ops import SubprocessRunner, back_up
 from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
 from resonant.runners.ask import AskRunner, AskScope
+from resonant.runners.brain import MAX_ROUNDS, BrainRunner
 from resonant.runners.claude import ClaudeRunner
 from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
@@ -127,6 +135,13 @@ def local_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> floa
         default=0.0,
     )
     return max(model_s, tool_s) + STEP_SLACK_S
+
+
+def brain_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> float:
+    """``max_step_s`` for the brain runner: as ``local_step_limit``, with ``MAX_ROUNDS``
+    tool rounds and one final call (the intents fallback makes fewer)."""
+    rounds_s = (MAX_ROUNDS + 1) * model.timeout_s
+    return max(rounds_s, local_step_limit(model, tools) - STEP_SLACK_S) + STEP_SLACK_S
 
 
 RouteFn = Callable[[Event], Awaitable[NewTask | None]]
@@ -161,6 +176,7 @@ class IMessageStack:
     extensions: ExtensionHost | None = None  # gets ``alert`` once the channel is up
     pulse: Pulse | None = None
     trust: TrustChecks | None = None  # workers' ``resonant check`` (EM-3 calls request_check)
+    brain: BrainRunner | None = None  # runner="brain" (BR-1)
     _close_model: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
     _started: bool = field(default=False, repr=False)
 
@@ -208,7 +224,10 @@ class IMessageStack:
             log.info("imessage channel stopped")
 
     async def aclose(self) -> None:
-        """Close the model client if this stack created it."""
+        """Stop the brain's background folds, then close the model client if this stack
+        created it."""
+        if self.brain is not None:
+            await self.brain.aclose()  # background history folds use the model
         close, self._close_model = self._close_model, None
         if close is not None:
             await close()
@@ -246,6 +265,7 @@ def build_imessage_stack(
     daemon_healthy: Callable[[], bool],
     model: ModelClient | None = None,
     osa_runner: OsaRunner | None = None,
+    started_at: datetime | None = None,
 ) -> IMessageStack:
     """Build the channel, router, runners and monitor, and hook them into ``loop``.
 
@@ -254,7 +274,8 @@ def build_imessage_stack(
     ``runner="claude"`` in both ``components.runners`` and ``loop.runners``. ``model``
     defaults to an ``OllamaClient`` over ``settings.model`` (closed by
     :meth:`IMessageStack.aclose`); ``osa_runner`` defaults to the real osascript runner.
-    Tests and the e2e bench inject fakes for both.
+    Tests and the e2e bench inject fakes for both. ``started_at`` (the daemon's start, for
+    the brain's briefing) defaults to now.
     """
     close_model: Callable[[], Awaitable[None]] | None = None
     if model is None:
@@ -276,6 +297,7 @@ def build_imessage_stack(
         model=model,
         timezone=settings.timezone,
         extensions=components.extensions,
+        brain_mode=settings.brain.mode,
     )
     runner = components.register_local_runner(
         conn,
@@ -286,6 +308,25 @@ def build_imessage_stack(
     )
     runner.max_step_s = local_step_limit(settings.model, components.chat_specs())
     loop.runners[runner.name] = runner
+    brain = BrainRunner(
+        conn,
+        model=model,
+        channel=channel,
+        gate=components.gate,
+        executor=components.executor,
+        registry=components.registry,
+        settings=settings,
+        principals=components.principals,
+        facts=FactStore(facts_dir(settings.home)),
+        started_at=started_at,
+        last_tick=lambda: loop.last_tick,
+        slots=loop.slots,
+        max_step_s=brain_step_limit(settings.model, components.chat_specs()),
+        extensions=components.extensions,
+        model_result_max_chars=settings.extensions.model_result_max_chars,
+    )
+    components.runners[brain.name] = brain
+    loop.runners[brain.name] = brain
     reminders = ReminderRunner(conn, channel=channel, timezone=settings.timezone)
     components.runners[reminders.name] = reminders
     loop.runners[reminders.name] = reminders
@@ -406,6 +447,7 @@ def build_imessage_stack(
         notifier=notifier,
         pulse=pulse,
         trust=trust,
+        brain=brain,
         extensions=components.extensions,
         _close_model=close_model,
     )

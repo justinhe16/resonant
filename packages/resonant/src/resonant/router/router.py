@@ -11,6 +11,9 @@
 (b) Labeled (one model call): ``NewTask(kind="chat", runner="local", checkpoint={"intent",
     "confidence", "toolset": [{"extension", "name"}], "fallback", "toolset_prefix_hash",
     "title"})``.
+(b') Brain loop (``brain_mode="loop"``, ``brain.mode``; docs/brain-plan.md D1): no labeler,
+    ``NewTask(kind="chat", runner="brain", checkpoint={"title": "chat"})``. The fast path,
+    approval replies and the relay run first, unchanged.
 (c) None for anything else (other sources/types, no principal, empty text). The Loop
     consumes the event.
 
@@ -87,6 +90,8 @@ from resonant.tools import ToolRegistry
 from resonant_sdk import Event, ToolSpec
 
 RUNNER = "local"
+BRAIN_RUNNER = "brain"
+BRAIN_TITLE = "chat"
 KIND_REPLY = "reply"
 KIND_CHAT = "chat"
 KIND_COMMAND = "command"
@@ -193,8 +198,10 @@ class Router:
         clock: Callable[[], datetime] = utcnow,
         timezone: str = "UTC",
         extensions: ExtensionCatalog | None = None,
+        brain_mode: Literal["intents", "loop"] = "intents",
     ) -> None:
         self.conn = conn
+        self.brain_mode = brain_mode
         self.principals = principals
         self.registry = registry
         self.extensions = extensions
@@ -325,6 +332,23 @@ class Router:
             )
             if result is not None:
                 return reply(result.reply_text, result.tool_used, result.intent, result.command)
+
+        if self.brain_mode == "loop":
+            # D1: no labeler (its prefix would evict the brain's from the model's one KV
+            # slot). Any free text may still answer an open worker question.
+            free = await self.relay.free(event, text, principal, "question", spans=spans)
+            if free is not None:
+                return relayed(free.reply)
+            with spans("router.brain", principal=principal):
+                pass
+            return NewTask(
+                kind=KIND_CHAT,
+                runner=BRAIN_RUNNER,
+                priority=priority,
+                principal=principal,
+                channel_ref=channel_ref,
+                checkpoint={"title": BRAIN_TITLE},
+            )
 
         label = await self.labeler.label(text, spans=spans)
         free = await self.relay.free(event, text, principal, label.intent, spans=spans)
