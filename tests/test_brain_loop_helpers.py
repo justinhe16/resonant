@@ -99,6 +99,8 @@ def test_a_stub_cleans_extension_text() -> None:
         "Ok, cancelled R2.",
         "Reminder set for tomorrow at 9.",
         "I'll remember that.",
+        'First item: "ship v2 onboarding" — saved as a note.',
+        "Added it to your reminders.",
     ],
 )
 def test_claims_change(reply: str) -> None:

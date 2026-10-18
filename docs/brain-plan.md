@@ -93,7 +93,17 @@ Eval harness (BR-6) changes, each because the world was unrealistic, never to fi
 
 Live runs on `evals/task.example.jsonl` (loop mode; one run each unless noted):
 
-EVAL_TABLE
+| Run | Accuracy | Escalation recall | Unapproved writes | p50 / p95 ms | Notes |
+|---|---|---|---|---|---|
+| Baseline (BR-6's run) | 44.2% (23/52) | 50% | 0 | 1330 / 2438 | intents 42.3%, 2 unapproved |
+| Baseline, re-run | 48.1% (25/52) | 50% | 0 | 1500 / 2455 | run-to-run noise |
+| 1: native turns, stubs, runner gaps, tool errors | 73.1% (38/52) | 50% | 0 | 1593 / 3886 | claims and missed asks left |
+| 2: directive prompt, turn instruction, text-call forms | 84.6% (44/52) | 87.5% | 1 | 1577 / 3867 | "cancel the run" ran on a guess |
+| 3: no numbers check, `~` paths in the briefing | 80.8% (42/52) | 100% | 1 | 1544 / 3931 | `~` paths broke reads: reverted |
+| 4: ambiguity rule, linear fixture | 92.3% (48/52) | 100% | 1 | 1725 / 3867 | the guess again |
+| 5: target check, lookup hint | 90.4% (47/52) | 100% | 0 | 1581 / 3867 | over the bar |
+| Pre-merge, `--repeat 2`, both modes | 92.3% (96/104) | 100% | 0 | 1509 / 3641 | intents 42.3%, 4 unapproved over 2 runs (as baseline) |
+| After merging BR-7, `--repeat 3` | **92.3% (144/156)** | **100%** | **0** | **1631 / 3947** | ask 100%; the same 4 rows miss each run |
 
 ### BR-1: the brain loop (2026-10-18)
 

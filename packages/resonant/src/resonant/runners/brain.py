@@ -246,6 +246,8 @@ _CLAIM = re.compile(
     rf"(?:^\W*(?:resonant\W+)?(?:(?:ok(?:ay)?|done|sure|got it)\W+)?{_CHANGE_VERBS}\b"
     rf"|\bI(?:'ve| have| just)?\s+(?:just\s+|already\s+)?(?:set|{_CHANGE_VERBS})\b"
     rf"|\bI(?:'ll| will)\s+{_PROMISE_VERBS}\b"
+    rf"|\b{_CHANGE_VERBS}\s+(?:it\s+)?(?:as an?|to your|to the)\s+"
+    r"(?:notes?|reminders?|facts?)\b"
     rf"|\b(?:reminder|note|ticket|issue|run)\s+(?:is\s+|has been\s+)?"
     r"(?:set|saved|added|created|started|filed)\b)",
     re.IGNORECASE,
