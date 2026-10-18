@@ -589,7 +589,11 @@ def test_the_approval_shows_the_whole_watch(components: Components, db: sqlite3.
         args={"what": "stock", "ask": question, "then": "continue"},
     )
     text = action(ask)
-    assert text is not None and "TAIL" in text and "every 60m" in text
+    assert (
+        text is not None
+        and "TAIL" in text
+        and "at the default interval for the default days" in text
+    )
     assert text.endswith("text you on a yes, and keep watching")
 
 

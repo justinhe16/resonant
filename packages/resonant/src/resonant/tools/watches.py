@@ -114,9 +114,10 @@ def summary_action(intent: Intent) -> str | None:
     a = intent.args
     what = str(a.get("what", ""))[: store.WHAT_MAX]
     every = a.get("every_minutes")
-    often = f"every {every}m" if isinstance(every, int) else "every 60m"
+    # Defaults come from brain.watches; say so rather than guess a number here.
+    often = f"every {every}m" if isinstance(every, int) else "at the default interval"
     days = a.get("days")
-    span = f" for {days}d" if isinstance(days, int) else ""
+    span = f" for {days}d" if isinstance(days, int) else " for the default days"
     then = ", and keep watching" if a.get("then") == "continue" else ", then stop"
     ask = a.get("ask")
     if isinstance(ask, str):
