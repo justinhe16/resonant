@@ -20,6 +20,10 @@ Design (carried from ``followups.md``):
   called. The model sees the manifest's description, never the server's; the server's input
   schema is stripped to an allowlist of validation keywords (``description``, ``title``,
   ``default``, ``examples`` and anything unknown are dropped) and its annotations are ignored.
+  A ``pattern`` that is long, unprintable or not a Python regex (ECMA-262 syntax ``re``
+  refuses) is dropped too: not shown, not enforced locally; the server validates (LN-1).
+  The result is only ever looser (LN-2): a ``oneOf`` over a loosened branch becomes an
+  ``anyOf`` and a ``not`` over a loosened subschema is removed, through ``$ref`` too.
 - **Pins.** Each tool is pinned as ``sha256(name, stripped input schema, stripped output
   schema)`` (pin version 2, GT-1): only what the model sees and what arguments are checked
   against. The server's description and annotations never reach the model, so a reworded
@@ -52,10 +56,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -98,6 +104,8 @@ MAX_ANSWERS = 32  # server requests being answered at once
 
 # JSON Schema keywords kept in an input schema. Everything else (description, title, default,
 # examples, $comment, x-*) is dropped: free text the model would read as instructions.
+# Adding a subschema keyword here (if/then/else, dependentSchemas, …) means revisiting
+# ``_strip``'s loosening rules: a dropped pattern must never tighten the local check (LN-2).
 _SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
 _SCHEMA_ONE = frozenset(
     {"items", "additionalProperties", "not", "contains", "propertyNames", "additionalItems"}
@@ -143,29 +151,142 @@ class McpToolError(Exception):
 
 def strip_schema(schema: object, depth: int = 0) -> Any:
     """``schema`` with only validation keywords kept (recursively). Property names are kept
-    whatever they are called (a property named ``description`` stays). Raises ValueError."""
+    whatever they are called (a property named ``description`` stays). Raises ValueError.
+
+    The result must only ever be **looser** than the server's schema: the server validates,
+    and a local check stricter than it would refuse calls the server accepts. A schema is
+    loosened (LN-2) when it:
+
+    - drops a string ``pattern`` that can't be checked (``_checkable_pattern``);
+    - drops any key that isn't a pure annotation (``_ANNOTATIONS``, ``x-*``): ``if``,
+      ``dependencies``, ``unevaluated*``, ``minContains``, vendor keywords, …;
+    - keeps a ``format``: shown to the model, but no format checker runs here.
+
+    Every kept keyword is monotone in its subschemas except ``not`` and ``oneOf``, so:
+
+    - a ``oneOf`` with a loosened branch becomes an ``anyOf`` of the same branches (each
+      branch only accepts more, and ``anyOf`` accepts whatever ``oneOf`` did);
+    - a ``not`` over a loosened subschema is removed (no constraint accepts more);
+    - ``contains`` goes with a dropped ``minContains`` (``minContains: 0`` made it optional).
+
+    A nested ``$id`` is refused: it would change what a ``#/…`` pointer under it means.
+
+    Looseness propagates to every enclosing schema, and through ``$ref``: a pointer to a
+    root ``$defs``/``definitions`` entry is loosened when that entry is (found by iterating
+    to a fixed point), and any other local pointer is treated as loosened whenever
+    something was dropped. The rewrite is deterministic, so the pin is stable."""
+    loose_defs: frozenset[str] = frozenset()
+    any_dropped = False
+    while True:
+        ctx = _StripCtx(loose_defs, any_dropped)
+        out, _ = _strip(schema, depth, ctx, root=True)
+        found = frozenset(ctx.found_defs)
+        if found == loose_defs and ctx.dropped == any_dropped:
+            return out
+        loose_defs, any_dropped = found | loose_defs, ctx.dropped or any_dropped
+
+
+@dataclass
+class _StripCtx:
+    loose_defs: frozenset[str]  # ``#/$defs/<name>`` pointers known to be loosened
+    any_dropped: bool  # from the previous pass: whether anything asserting was dropped
+    dropped: bool = False
+    found_defs: set[str] = field(default_factory=set[str])
+
+
+_DEF_POINTER = re.compile(r"^#/(?:\$defs|definitions)/[^/~%]+$")  # no escapes to decode
+
+# Keywords that assert nothing in any draft. Dropping one of these (or an ``x-*``) leaves
+# the schema as strict as it was; dropping any other key counts as loosening, whatever
+# draft the server validates with (``dependencies``, ``if``, ``unevaluated*``, vendor
+# keywords). A literal list, so a jsonschema upgrade can't move a pin.
+_ANNOTATIONS = frozenset(
+    {
+        "description", "title", "default", "examples", "$comment", "deprecated", "readOnly",
+        "writeOnly", "$schema", "$id", "$anchor", "$dynamicAnchor", "$vocabulary",
+    }
+)  # fmt: skip
+
+
+def _ref_loose(ref: object, ctx: _StripCtx) -> bool:
+    if not isinstance(ref, str):
+        return False
+    if _DEF_POINTER.match(ref):
+        return ref in ctx.loose_defs
+    return ctx.any_dropped  # "#", "#/properties/…", nested or escaped: assume the worst
+
+
+def _strip_all(values: list[Any], depth: int, ctx: _StripCtx) -> tuple[list[Any], bool]:
+    pairs = [_strip(v, depth, ctx) for v in values]
+    return [p[0] for p in pairs], any(p[1] for p in pairs)
+
+
+def _strip(schema: object, depth: int, ctx: _StripCtx, root: bool = False) -> tuple[Any, bool]:
+    """``(stripped, loosened)``: loosened when it accepts more than ``schema`` does."""
     if isinstance(schema, bool):
-        return schema
+        return schema, False
     if not isinstance(schema, dict) or depth > SCHEMA_MAX_DEPTH:
         raise ValueError("schema must be an object (or a boolean) of bounded depth")
     out: dict[str, Any] = {}
+    loose = one_loose = False
     for key, value in cast(dict[str, Any], schema).items():
         if key in _SCHEMA_MAPS and isinstance(value, dict):
-            subs = cast(dict[str, Any], value)
-            out[key] = {name: strip_schema(sub, depth + 1) for name, sub in subs.items()}
+            subs: dict[str, Any] = {}
+            for name, sub in cast(dict[str, Any], value).items():
+                subs[name], sub_loose = _strip(sub, depth + 1, ctx)
+                loose |= sub_loose
+                if sub_loose and root and key in ("$defs", "definitions"):
+                    ctx.found_defs.add(f"#/{key}/{name}")
+            out[key] = subs
+        elif key == "not":
+            sub, sub_loose = _strip(value, depth + 1, ctx)
+            if sub_loose:
+                loose = True  # dropped: ``not`` over a looser schema would reject more
+            else:
+                out[key] = sub
         elif key in _SCHEMA_ONE:
             if isinstance(value, list):  # draft-4 tuple ``items``
-                out[key] = [strip_schema(v, depth + 1) for v in cast(list[Any], value)]
+                out[key], sub_loose = _strip_all(cast(list[Any], value), depth + 1, ctx)
             else:
-                out[key] = strip_schema(value, depth + 1)
+                out[key], sub_loose = _strip(value, depth + 1, ctx)
+            loose |= sub_loose
         elif key in _SCHEMA_LISTS and isinstance(value, list):
-            out[key] = [strip_schema(v, depth + 1) for v in cast(list[Any], value)]
-        elif key in _SCHEMA_VALUES:
+            out[key], sub_loose = _strip_all(cast(list[Any], value), depth + 1, ctx)
+            loose |= sub_loose
+            one_loose = one_loose or (key == "oneOf" and sub_loose)
+        elif key == "pattern" and isinstance(value, str) and not _checkable_pattern(value):
+            ctx.dropped = loose = True  # not shown, not enforced here; the server validates
+        elif key in _SCHEMA_VALUES:  # a non-string pattern lands here and is refused
             out[key] = _schema_value(key, value)
+            if key == "$ref" and _ref_loose(value, ctx):
+                loose = True
+            elif key == "format":  # shown, but no format checker runs here; the server's may
+                ctx.dropped = loose = True
+        elif key == "$id" and not root:
+            raise ValueError("its schema has a nested $id")
+        elif key not in _ANNOTATIONS and not key.startswith("x-"):
+            ctx.dropped = loose = True  # a keyword we don't keep may assert: we accept more
+    if "minContains" in cast(dict[str, Any], schema) and "contains" in out:
+        # minContains is dropped (any value): 0 made contains optional, so contains goes too
+        del out["contains"]
+    if one_loose:  # ``anyOf`` of the loosened branches accepts whatever ``oneOf`` did
+        branches = out.pop("oneOf")
+        if "anyOf" in out:  # both present: keep both constraints, side by side
+            out.setdefault("allOf", []).append({"anyOf": branches})
+        else:
+            out["anyOf"] = branches
     for name in cast(dict[str, Any], out.get("properties", {})):
         if not _short(name, NAME_MAX):
             raise ValueError("a property name is too long or not printable")
-    return out
+    for defs in ("$defs", "definitions"):
+        for name in cast(dict[str, Any], out.get(defs, {})):
+            if not _short(name, NAME_MAX):
+                raise ValueError(f"a {defs} name is too long or not printable")
+    for name in cast(dict[str, Any], out.get("patternProperties", {})):
+        # Refused, not dropped: dropping an entry rejects more under additionalProperties.
+        if not _checkable_pattern(name):
+            raise ValueError("its schema has a bad 'patternProperties' key")
+    return out, loose
 
 
 _JSON_TYPES = frozenset({"object", "array", "string", "number", "integer", "boolean", "null"})
@@ -180,6 +301,26 @@ ENUM_MAX = 100
 
 def _short(v: object, limit: int = TEXT_MAX) -> bool:
     return isinstance(v, str) and len(v) <= limit and v.isprintable()
+
+
+def _checkable_pattern(p: str) -> bool:
+    r"""Whether a string ``pattern`` is kept: short and printable (the model reads it) and
+    one Python's ``re`` compiles (``jsonschema`` checks arguments with ``re.search``).
+
+    A JSON Schema pattern is an ECMA-262 regex. Generated schemas carry long ones (zod's
+    UUID and ISO date-time patterns are well over ``TEXT_MAX``) and ECMA-only syntax
+    (``\p{L}``, ``(?<name>…)``, ``[^]``) that ``re`` refuses. Such a pattern is dropped
+    rather than refused or translated: it carries no text to the model, the server still
+    validates, and ``strip_schema`` keeps the local check only ever looser (rewriting
+    ``not``/``oneOf`` over it). Dropping is deterministic for the daemon's interpreter (uv
+    pins Python 3.12), so the pin is stable. A non-string pattern is still refused."""
+    if not _short(p):
+        return False
+    try:
+        re.compile(p)
+    except (re.error, OverflowError, RecursionError):  # the last two on pathological ones
+        return False
+    return True
 
 
 def _scalar(v: object) -> bool:
@@ -239,7 +380,7 @@ def _output_schema(tool: Mapping[str, Any]) -> Any:
         return None
     try:
         return strip_schema(raw)
-    except ValueError:
+    except ValueError:  # e.g. a bad patternProperties key: hashed raw, never shown
         return raw
 
 
@@ -325,17 +466,33 @@ def approve(server_id: str, listed: tuple[str, ...], tools: list[dict[str, Any]]
             continue
         by_name[name] = t
     pins: dict[str, McpToolPin] = {}
+    ignored = sorted(n for n in by_name if n not in listed)
     for name in listed:
         tool = by_name.get(name)
         if tool is None:
-            problems.append(f"mcp server {server_id} has no tool {name}")
+            problems.append(_missing(server_id, name, ignored))
             continue
         try:
             pins[name] = McpToolPin(server_id, tool_pin(tool), input_schema(tool))
         except ValueError as e:
             problems.append(f"mcp tool {name}: {e}")
-    ignored = sorted(n for n in by_name if n not in listed)
     return Discovered(pins, problems, ignored)
+
+
+_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")  # resonant_sdk's TOOL_NAME_PATTERN
+
+
+def _missing(server_id: str, name: str, unlisted: list[str]) -> str:
+    """Why ``ext add`` refuses a manifest-listed tool the server doesn't offer, with the
+    server's closest unlisted names (only ones a manifest could list, so no server text
+    beyond a tool name reaches the terminal). Install still refuses: the manifest is the
+    owner's typed list of what each tool is, and a tool is only disabled after approval."""
+    names = [n for n in unlisted if _TOOL_NAME.match(n)]
+    close = difflib.get_close_matches(name, names, n=3, cutoff=0.6)
+    hint = f" (renamed? it has {', '.join(close)})" if close else ""
+    return (
+        f"mcp server {server_id} has no tool {name}{hint}; fix or remove it in the manifest's tools"
+    )
 
 
 def server_argv(

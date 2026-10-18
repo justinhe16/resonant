@@ -2,7 +2,8 @@
 # No code of ours: Resonant speaks MCP over streamable HTTP to the fixed URL below and sends
 # the Keychain secret linear/token (a Linear personal API key) as the bearer token, only there.
 # Tool names are the server's; ext add lists them live and pins each one. Descriptions are
-# ours: the server's own text never reaches the model.
+# ours: the server's own text never reaches the model. Names checked against public listings
+# of the live server in October 2026 (LN-1: create_comment became save_comment).
 name: linear
 version: 1
 description: Your Linear issues, projects and teams; what's assigned to you, search, new tickets, updates and comments.
@@ -47,8 +48,10 @@ mcp:
           effect: write
           level: L2
           timeout_s: 60
-        - name: create_comment
-          description: Add a comment (markdown body) to one Linear issue.
+        - name: save_comment
+          description: >-
+            Add a comment (markdown body) to one Linear issue (issueId, like ENG-123), or
+            edit a comment (with its id).
           effect: write
           level: L2
           timeout_s: 60

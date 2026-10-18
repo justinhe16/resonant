@@ -164,11 +164,14 @@ def _repo_line(r: dict[str, Any]) -> str:
     source = r.get("source")
     if isinstance(source, str) and source.startswith("extension:"):
         bits.append(f"via {source.removeprefix('extension:')}")
-    return f"- {r.get('name', '?')} · {r.get('slug', '?')} · {', '.join(bits)}"
+    line = f"- {r.get('name', '?')} · {r.get('slug', '?')} · {', '.join(bits)}"
+    path = r.get("path")
+    return f"{line} · {path}" if isinstance(path, str) and path else line
 
 
 def render_repos(d: dict[str, Any]) -> str:
-    """``/repos``: ``- dori · jhe/dori · push, CI``, most recently used first."""
+    """``/repos``: ``- dori · jhe/dori · push, CI · ~/code/dori`` (or ``· not cloned``), most
+    recently used first."""
     repos = [r for r in (as_dict(x) for x in as_list(d.get("repos"))) if r]
     if not repos:
         return "No repos yet. /repo add <owner/name> adds one, or just name it in /run."

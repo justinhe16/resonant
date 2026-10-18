@@ -243,7 +243,7 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 **Open.**
 - A third-party stdio server that reads its token only from an environment variable can't be used: secrets go on fd 4, never the env (a same-user worker could read the env). Options: a per-server "env secrets" grant shown as an escalation, or using the server's HTTP endpoint (bearer held in the daemon) where it has one.
 - `ext add` lists a **stdio** server's tools with no secrets, so one that needs its token to list tools can't be installed. Option: the same ask-then-send as http servers, passing the declared secrets on fd 4 after the owner confirms the command line.
-- Linear's tool names come from public listings, not Linear's docs (which name none): if `ext add repo:linear` reports `has no tool <name>`, rename it in `extensions/linear/resonant.yaml` (likely `create_comment` ↔ `save_comment`).
+- Linear's tool names come from public listings, not Linear's docs (which name none): if `ext add repo:linear` reports `has no tool <name>`, rename it in `extensions/linear/resonant.yaml` (LN-1 renamed `create_comment` to `save_comment` after Linear did; the refusal now names the server's closest tools).
 - A drifted tool stays disabled until a restart or `ext update`; there is no `/ext` command to re-approve one pin from iMessage.
 
 **Done when.** Each is decided, and built or dropped.

@@ -405,14 +405,15 @@ def runner_rows(
     else:
         detail = f"app {app.app_id}, installation {app.installation_id}"
         rows.append(("PASS", False, "runner github app", detail))
-    # Checkouts and worktrees (docs/employee-plan.md D1): cloned on a repo's first run.
+    # Checkouts and worktrees (docs/employee-plan.md D1): cloned when a repo is added, or on
+    # its first run.
     code_dir = settings.runner.code_dir
     if code_dir.is_dir():
         found = sorted(p.name for p in code_dir.iterdir() if (p / ".git").exists())
         detail = f"{code_dir}: {len(found)} checkout{'s' if len(found) != 1 else ''}"
         rows.append(("PASS", False, "runner code dir", detail))
     else:
-        why = f"{code_dir} doesn't exist yet: a repo's first run clones into it"
+        why = f"{code_dir} doesn't exist yet: adding a repo (or its first run) clones into it"
         rows.append(("SKIP", False, "runner code dir", why))
 
     def present(ref: str) -> bool | str:

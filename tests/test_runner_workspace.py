@@ -1830,3 +1830,133 @@ def test_the_daemons_git_is_unwrapped_with_the_guard_off(env: Env) -> None:
     assert env.cfg.guard == "off"
     ws = Workspace(env.cfg, env.conn)
     assert ws._guard(["git", "status"]) == ["git", "status"]  # pyright: ignore[reportPrivateUsage]
+
+
+# --- RP-1: the owner's checkout when a repo is added ----------------------------------------
+
+
+async def test_owner_checkout_clones_with_no_token_left_and_records_the_path(env: Env) -> None:
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None and repo.path is None
+    got = await env.ws.owner_checkout(repo, GH_TOKEN)
+    assert (got.state, got.path, got.reason) == ("cloned", env.checkout, "")
+    assert git(env.checkout, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert git(env.checkout, "remote", "get-url", "origin") == str(env.remote)  # no credential
+    assert GH_TOKEN not in (env.checkout / ".git" / "config").read_text()
+    assert GH_TOKEN not in env.shim_log.read_text() and "clone" in env.shim_log.read_text()
+    assert _leftovers(env) == []
+    assert [p.name for p in env.cfg.code_dir.iterdir()] == ["proj"]  # no temp clone dir left
+    after = repo_store.get(env.conn, "own/proj")
+    assert after is not None and after.path == env.checkout
+
+
+async def test_owner_checkout_adopts_an_existing_checkout_untouched(env: Env) -> None:
+    """Adding again (or adding a repo the owner already cloned there) uses it as is."""
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    git(env.root, "clone", "-q", str(env.remote), str(env.checkout))
+    git(env.checkout, "checkout", "-q", "-b", "mine")
+    (env.checkout / "wip.txt").write_text("unsaved\n")
+    head = git(env.checkout, "rev-parse", "HEAD")
+    for _ in range(2):
+        got = await env.ws.owner_checkout(repo, GH_TOKEN)
+        assert got.state == "present" and got.path == env.checkout
+    assert git(env.checkout, "rev-parse", "--abbrev-ref", "HEAD") == "mine"
+    assert git(env.checkout, "rev-parse", "HEAD") == head
+    assert (env.checkout / "wip.txt").read_text() == "unsaved\n"
+    after = repo_store.get(env.conn, "own/proj")
+    assert after is not None and after.path == env.checkout
+
+
+async def test_owner_checkout_leaves_anything_else_alone(env: Env) -> None:
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    env.checkout.mkdir(parents=True)
+    (env.checkout / "notes.txt").write_text("mine\n")
+    got = await env.ws.owner_checkout(repo, GH_TOKEN)
+    assert got.state == "in_the_way" and "isn't a git checkout of own/proj" in got.reason
+    assert [p.name for p in env.checkout.iterdir()] == ["notes.txt"]
+    shutil.rmtree(env.checkout)
+    git(env.root, "clone", "-q", str(env.remote), str(env.checkout))
+    git(env.checkout, "remote", "set-url", "origin", "https://github.com/own/other")
+    got = await env.ws.owner_checkout(repo, GH_TOKEN)
+    assert got.state == "in_the_way" and "origin isn't own/proj" in got.reason
+    after = repo_store.get(env.conn, "own/proj")
+    assert after is not None and after.path is None  # not recorded
+
+
+async def test_a_failed_owner_clone_keeps_the_repo_and_leaves_nothing(env: Env) -> None:
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    env.ws = Workspace(env.cfg, env.conn, url_for=lambda r: str(env.root / "nowhere.git"))
+    got = await env.ws.owner_checkout(repo, GH_TOKEN)
+    assert got.state == "failed" and got.reason.startswith("cloning own/proj failed")
+    assert GH_TOKEN not in got.reason
+    assert list(env.cfg.code_dir.iterdir()) == [] and _leftovers(env) == []
+    after = repo_store.get(env.conn, "own/proj")
+    assert after is not None and after.path is None
+
+
+async def test_a_slow_owner_clone_is_cut_off_and_cleaned_up(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+
+    async def slow(url: str, dest: Path, token: str | None, *, fork: bool) -> None:
+        (dest / "partial").write_text("x")
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(env.ws, "_clone", slow)
+    got = await env.ws.owner_checkout(repo, GH_TOKEN, timeout_s=0.2)
+    assert got.state == "failed" and "didn't finish" in got.reason
+    assert list(env.cfg.code_dir.iterdir()) == []  # the temp clone dir is gone
+
+
+async def test_owner_checkout_skips_fork_repos_and_huge_ones(env: Env) -> None:
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    big = await env.ws.owner_checkout(repo, GH_TOKEN, size_kb=workspace_mod.CLONE_MAX_KB + 1)
+    assert big.state == "skipped" and "2.0 GB" in big.reason
+    fine = await env.ws.owner_checkout(repo, GH_TOKEN, size_kb=10)
+    assert fine.state == "cloned"
+    shutil.rmtree(env.checkout)
+    env.conn.execute("UPDATE repos SET mode = 'fork', path = NULL")
+    fork = repo_store.get(env.conn, "own/proj")
+    assert fork is not None
+    got = await env.ws.owner_checkout(fork, None)
+    assert got.state == "skipped" and "makes your fork" in got.reason
+    assert not env.checkout.exists()
+
+
+async def test_a_runs_first_clone_records_the_path(env: Env) -> None:
+    await env.prepare()
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None and repo.path == env.checkout
+
+
+async def test_owner_checkout_refuses_a_path_over_resonants_dirs(env: Env) -> None:
+    env.conn.execute("UPDATE repos SET path = ?", (str(env.cfg.work_dir / "proj"),))
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    got = await env.ws.owner_checkout(repo, GH_TOKEN)
+    assert got.state == "in_the_way" and "overlaps Resonant's own dirs" in got.reason
+    assert not (env.cfg.work_dir / "proj").exists()
+
+
+async def test_owner_checkout_waiting_on_a_run_says_so(env: Env) -> None:
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    async with env.ws.checkout_lock("proj"):  # a run is preparing its worktree
+        got = await env.ws.owner_checkout(repo, GH_TOKEN, timeout_s=0.2)
+    assert got.state == "failed" and "a run is setting up this checkout" in got.reason
+    assert not env.checkout.exists()
+
+
+async def test_a_renamed_repo_keeps_its_recorded_checkout(env: Env) -> None:
+    repo = repo_store.get(env.conn, "own/proj")
+    assert repo is not None
+    assert (await env.ws.owner_checkout(repo, GH_TOKEN)).state == "cloned"
+    env.conn.execute("UPDATE repos SET name = 'renamed'")
+    renamed = repo_store.get(env.conn, "own/proj")
+    assert renamed is not None and env.ws.checkout_path(renamed) == env.checkout
