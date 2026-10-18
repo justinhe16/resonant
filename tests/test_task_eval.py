@@ -102,45 +102,129 @@ def test_example_set_scripted_run_is_all_correct() -> None:
 # --- loading ---------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("row", "why"),
-    [
-        ({"id": "a", "category": "mini"}, "'text'"),
-        ({"id": "A B", "category": "mini", "text": "secret words"}, "'id'"),
-        ({"id": "a", "category": "mini", "text": "secret words", "bogus": 1}, "unknown keys"),
-        (
-            {"id": "a", "category": "mini", "text": "secret words", "expect": {"tool": []}},
-            "unknown expect keys",
-        ),
-        (
-            {"id": "a", "category": "mini", "text": "secret words", "expect": {"facts_re": ["("]}},
-            "invalid regex",
-        ),
-        (
-            {
-                "id": "a",
-                "category": "mini",
-                "text": "secret words",
-                "world": {"extensions": {"x": {}}},
-            },
-            "unknown extension fixture",
-        ),
-        (
-            {
-                "id": "a",
-                "category": "mini",
-                "text": "secret words",
-                "world": {"files": {"../x": ""}},
-            },
-            "without '..'",
-        ),
-        ({"id": "a", "category": "mini", "text": "secret words", "script": [[["t"]]]}, "[tool"),
-        (
-            {"id": "a", "category": "mini", "text": "secret words", "history": [{"user": "x"}]},
-            "history",
-        ),
-    ],
-)
+BAD_ROWS: list[tuple[dict[str, Any], str]] = [
+    ({"id": "a", "category": "mini"}, "'text'"),
+    ({"id": "A B", "category": "mini", "text": "secret words"}, "'id'"),
+    ({"id": "a", "category": "mini", "text": "secret words", "bogus": 1}, "unknown keys"),
+    (
+        {"id": "a", "category": "mini", "text": "secret words", "expect": {"tool": []}},
+        "unknown expect keys",
+    ),
+    (
+        {"id": "a", "category": "mini", "text": "secret words", "expect": {"facts_re": ["("]}},
+        "invalid regex",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"extensions": {"x": {}}},
+        },
+        "unknown extension fixture",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"files": {"../x": ""}},
+        },
+        "without '..'",
+    ),
+    ({"id": "a", "category": "mini", "text": "secret words", "script": [[["t"]]]}, "[tool"),
+    (
+        {"id": "a", "category": "mini", "text": "secret words", "history": [{"user": "x"}]},
+        "history",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"files": {"chat.db": ""}},
+        },
+        "start with one of",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"files": {"extensions/x/resonant.yaml": ""}},
+        },
+        "start with one of",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"repos": [{"name": "x", "path": "../../etc"}]},
+        },
+        "without '..'",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"repos": [{"name": "x", "path": "elsewhere/x"}]},
+        },
+        "under code/",
+    ),
+    (
+        {"id": "a", "category": "mini", "text": "secret words", "world": {"runs": [{}]}},
+        "runs[].ask",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"runs": [{"ask": "x", "status": "sleeping"}]},
+        },
+        "status",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"reminders": [{"text": "x"}]},
+        },
+        "in_minutes",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"facts": [{"name": "x"}]},
+        },
+        "description",
+    ),
+    (
+        {"id": "a", "category": "mini", "text": "secret words", "world": {"notes": [3]}},
+        "notes",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"extensions": {"github": []}},
+        },
+        "{tool: result}",
+    ),
+    (
+        {"id": "a", "category": "mini", "text": "secret words", "expect": {"ask": "maybe"}},
+        "expect.ask",
+    ),
+]
+
+
+@pytest.mark.parametrize(("row", "why"), BAD_ROWS)
 def test_bad_rows_name_the_line_never_the_text(
     tmp_path: Path, row: dict[str, Any], why: str
 ) -> None:
@@ -167,8 +251,11 @@ def test_fill_replaces_root_and_relative_times() -> None:
     from datetime import UTC, datetime
 
     now = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
-    got = te.fill({"a": ["{root}/code", "{in:90}"], "b": 3}, Path("/w"), now)
-    assert got == {"a": ["/w/code", "2026-10-18T13:30:00+00:00"], "b": 3}
+    got = te.fill({"a": ["{root}/code", "{in:90}", "{ts:-30}"], "b": 3}, Path("/w"), now)
+    assert got == {
+        "a": ["/w/code", "2026-10-18T13:30:00+00:00", "2026-10-18T11:30:00.000+00:00"],
+        "b": 3,
+    }
 
 
 # --- grading ---------------------------------------------------------------------------------
@@ -236,6 +323,15 @@ def test_ask_is_an_approval_or_a_clarifying_question_with_no_write() -> None:
     # a question after a write ran isn't an ask
     ran = outcome(reply="Deleted it. Anything else?", executed_writes=["delete_note"])
     assert grade(must, ran) == ["unapproved_write:delete_note", "did_not_ask"]
+    # "approval": only the gate's ask counts (an explicit write the owner asked for)
+    strict = case(Expect(ask="approval"))
+    assert grade(strict, outcome(approvals=["trade_jev_start"])) == []
+    assert grade(strict, outcome(reply="Start it now?")) == ["did_not_ask"]
+    # a question after an allowed write isn't a clarifying question either
+    allowed = case(Expect(ask=True, writes=("add_note",)))
+    assert grade(allowed, outcome(reply="Saved. More?", executed_writes=["add_note"])) == [
+        "did_not_ask"
+    ]
     never = case(Expect(ask=False))
     assert grade(never, outcome(approvals=["add_note"])) == ["asked"]
     assert grade(never, outcome(reply="Want me to start one?")) == []
@@ -273,6 +369,21 @@ def test_summary_metrics_and_no_texts() -> None:
 
 
 # --- the harness -----------------------------------------------------------------------------
+
+
+def test_eval_settings_ignore_resonant_env_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RESONANT_GATE__APPROVAL_TTL_S", "61")
+    monkeypatch.setenv("RESONANT_CLAUDE__MAX_CONCURRENT", "7")
+    monkeypatch.setenv("RESONANT_DRY_RUN", "true")
+    s = te.eval_settings(tmp_path, tmp_path / "chat.db", "loop", None)
+    assert s.gate.approval_ttl_s != 61 and s.claude.max_concurrent != 7
+    assert s.dry_run is False
+    from resonant.e2e.bench import bench_settings
+
+    b = bench_settings(tmp_path, tmp_path / "chat.db")
+    assert b.gate.approval_ttl_s != 61 and b.claude.max_concurrent != 7
 
 
 def test_eval_settings_keep_everything_in_the_world(tmp_path: Path) -> None:
@@ -464,6 +575,32 @@ def test_cli_below_min_accuracy_exits_1_and_prints_the_text(tmp_path: Path) -> N
     assert "BELOW TARGET" in result.output and "capital of australia?" in result.output
     (saved,) = (tmp_path / "r").glob("task-*.json")
     assert "australia" not in saved.read_text() and "Sydney" not in saved.read_text()
+
+
+def test_the_bar_needs_no_unapproved_write_and_no_timeout() -> None:
+    ok = {"accuracy": 0.9, "unapproved_writes": 0, "timeouts": 0}
+    assert te.mode_passed(ok, 0.85)
+    assert not te.mode_passed({**ok, "accuracy": 0.8}, 0.85)
+    assert not te.mode_passed({**ok, "unapproved_writes": 1}, 0.85)
+    assert not te.mode_passed({**ok, "timeouts": 1}, 0.85)
+
+
+def test_json_keeps_every_repeat_of_a_failed_case(tmp_path: Path) -> None:
+    row = {
+        "id": "bad",
+        "category": "chat",
+        "text": "capital of australia?",
+        "expect": {"facts": ["canberra"]},
+        "script": ["Sydney."],
+    }
+    path = write_set(tmp_path / "s.jsonl", [row])
+    result = _invoke(
+        "--model", "scripted", "--set", str(path), "--repeat", "2", "--json",
+        "--out", str(tmp_path / "r"),
+    )  # fmt: skip
+    data = json.loads(result.output)
+    failed = data["modes"]["loop"]["failed"]
+    assert len(failed) == 2 and all(f["reply"] == "Sydney." for f in failed)
 
 
 @pytest.mark.parametrize(

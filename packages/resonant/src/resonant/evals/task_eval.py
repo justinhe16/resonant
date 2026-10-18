@@ -93,6 +93,7 @@ from resonant.config import (
     RunnerConfig,
     Settings,
 )
+from resonant.e2e.bench import IsolatedSettings
 from resonant.e2e.extensions import install_fixture
 from resonant.e2e.fakes import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.evals.router_eval import save_summary, set_digest
@@ -160,6 +161,8 @@ EXPECT_KEYS = frozenset(
     {"tools", "tools_not", "escalate", "ask", "writes", "facts", "facts_re", "not_facts",
      "max_rounds"}
 )  # fmt: skip
+RUN_STATUSES = ("queued", "running", "waiting", "ready", "merged", "failed", "cancelled",
+                "no_changes", "done")  # fmt: skip
 ROW_KEYS = frozenset({"id", "category", "text", "history", "world", "expect", "script", "note"})
 WORLD_KEYS = frozenset({"repos", "files", "runs", "notes", "reminders", "facts", "extensions"})
 
@@ -189,7 +192,7 @@ class Expect:
     tools: tuple[str, ...] = ()
     tools_not: tuple[str, ...] = ()
     escalate: bool | None = None
-    ask: bool | None = None
+    ask: bool | Literal["approval"] | None = None
     writes: tuple[str, ...] = ()
     facts: tuple[str, ...] = ()
     facts_re: tuple[str, ...] = ()
@@ -223,6 +226,12 @@ def _opt_bool(v: Any, where: str) -> bool | None:
     raise ValueError(f"{where} must be true, false or null")
 
 
+def _ask(v: Any) -> bool | Literal["approval"] | None:
+    if v == "approval":
+        return "approval"
+    return _opt_bool(v, "expect.ask")
+
+
 def parse_expect(raw: Any) -> Expect:
     if raw is None:
         return Expect()
@@ -247,7 +256,7 @@ def parse_expect(raw: Any) -> Expect:
         tools=_strs(d.get("tools"), "expect.tools"),
         tools_not=_strs(d.get("tools_not"), "expect.tools_not"),
         escalate=_opt_bool(d.get("escalate"), "expect.escalate"),
-        ask=_opt_bool(d.get("ask"), "expect.ask"),
+        ask=_ask(d.get("ask")),
         writes=_strs(d.get("writes"), "expect.writes"),
         facts=_strs(d.get("facts"), "expect.facts"),
         facts_re=facts_re,
@@ -273,7 +282,32 @@ def _history(raw: Any) -> tuple[tuple[str, str], ...]:
     return tuple(out)
 
 
+FILE_PREFIXES = ("code/", "logs/", "docs/", "runner/transcripts/")
+
+
+def _objs(v: Any, where: str) -> list[dict[str, Any]]:
+    if v is None:
+        return []
+    if not isinstance(v, list) or not all(isinstance(x, dict) for x in cast(list[Any], v)):
+        raise ValueError(f"world.{where} must be a list of objects")
+    return cast(list[dict[str, Any]], v)
+
+
+def _need(d: Mapping[str, Any], key: str, kind: type | tuple[type, ...], where: str) -> None:
+    v = d.get(key)
+    if not isinstance(v, kind) or isinstance(v, bool) or (isinstance(v, str) and not v.strip()):
+        raise ValueError(f"world.{where}[].{key} is missing or the wrong type")
+
+
+def _opt(d: Mapping[str, Any], key: str, kind: type | tuple[type, ...], where: str) -> None:
+    if d.get(key) is not None:
+        _need(d, key, kind, where)
+
+
 def _world(raw: Any) -> dict[str, Any]:
+    """Validate the whole world at load time, so a bad row exits 2 instead of crashing a run.
+    Files go only under ``FILE_PREFIXES`` (never over the home's store, principals or
+    extensions)."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -282,11 +316,55 @@ def _world(raw: Any) -> dict[str, Any]:
     unknown = set(d) - WORLD_KEYS
     if unknown:
         raise ValueError(f"unknown world keys: {sorted(unknown)}")
-    for name in cast(dict[str, Any], d.get("extensions") or {}):
+    files: Any = d.get("files") or {}
+    if not isinstance(files, dict):
+        raise ValueError("world.files maps paths to text")
+    for rel, text in cast(dict[Any, Any], files).items():
+        if not isinstance(rel, str) or not isinstance(text, str):
+            raise ValueError("world.files maps paths to text")
+        _rel_path(rel)
+        if not rel.startswith(FILE_PREFIXES):
+            raise ValueError(f"world.files paths start with one of {', '.join(FILE_PREFIXES)}")
+    for r in _objs(d.get("repos"), "repos"):
+        _need(r, "name", str, "repos")
+        _opt(r, "slug", str, "repos")
+        _opt(r, "base", str, "repos")
+        if r.get("path") is not None:
+            _need(r, "path", str, "repos")
+            _rel_path(str(r["path"]))
+            if not str(r["path"]).startswith("code/"):
+                raise ValueError("world.repos[].path is under code/")
+    for run in _objs(d.get("runs"), "runs"):
+        _need(run, "ask", str, "runs")
+        _opt(run, "repo", str, "runs")
+        _opt(run, "minutes_ago", (int, float), "runs")
+        _opt(run, "pr_number", int, "runs")
+        for key in ("last_note", "remote_url", "pr_url", "branch", "summary", "failure"):
+            _opt(run, key, str, "runs")
+        if run.get("status", "running") not in RUN_STATUSES:
+            raise ValueError(f"world.runs[].status is one of {', '.join(RUN_STATUSES)}")
+        if not isinstance(run.get("transcript") or [], list):
+            raise ValueError("world.runs[].transcript is a list")
+    notes: Any = d.get("notes") or []
+    if not isinstance(notes, list) or not all(
+        isinstance(n, str) and n.strip() for n in cast(list[Any], notes)
+    ):
+        raise ValueError("world.notes is a list of strings")
+    for r in _objs(d.get("reminders"), "reminders"):
+        _need(r, "in_minutes", (int, float), "reminders")
+        _need(r, "text", str, "reminders")
+    for f in _objs(d.get("facts"), "facts"):
+        _need(f, "name", str, "facts")
+        _need(f, "description", str, "facts")
+        _opt(f, "text", str, "facts")
+    exts: Any = d.get("extensions") or {}
+    if not isinstance(exts, dict):
+        raise ValueError("world.extensions maps fixture names to canned results")
+    for name, data in cast(dict[Any, Any], exts).items():
         if name not in FIXTURES:
             raise ValueError(f"unknown extension fixture {name!r} (one of {sorted(FIXTURES)})")
-    for rel in cast(dict[str, Any], d.get("files") or {}):
-        _rel_path(rel)
+        if not isinstance(data, dict):
+            raise ValueError("world.extensions maps fixture names to {tool: result}")
     return d
 
 
@@ -600,15 +678,18 @@ def _rel_path(rel: str) -> Path:
 
 
 _IN = re.compile(r"\{in:(\d{1,6})\}")
+_TS = re.compile(r"\{ts:-(\d{1,6})\}")
 
 
 def fill(value: Any, root: Path, now: datetime | None = None) -> Any:
     """In every string of ``value``: ``{root}`` → the world root, and ``{in:N}`` → the time N
-    minutes after ``now`` (ISO 8601, for a scripted reminder)."""
+    minutes after ``now`` (ISO 8601, for a scripted reminder), ``{ts:-N}`` → N minutes before
+    ``now`` (for log lines and other seeded timestamps)."""
     if isinstance(value, str):
         out = value.replace("{root}", str(root))
         if now is not None:
             out = _IN.sub(lambda m: (now + timedelta(minutes=int(m.group(1)))).isoformat(), out)
+            out = _TS.sub(lambda m: iso(now - timedelta(minutes=int(m.group(1)))), out)
         return out
     if isinstance(value, list):
         return [fill(v, root, now) for v in cast(list[Any], value)]
@@ -621,8 +702,8 @@ def eval_settings(root: Path, chat_db: Path, mode: Mode, base: Settings | None) 
     """Settings for one case's home: everything under ``root``; the model and timezone come
     from ``base`` (the owner's config, live runs only)."""
     code = root / "code"
-    ref = base or Settings(home=root)
-    return Settings(
+    ref = base or IsolatedSettings(home=root)
+    return IsolatedSettings(
         home=root,
         timezone=ref.timezone,
         dry_run=False,
@@ -680,7 +761,7 @@ def seed_world(
 ) -> None:
     """Write the case's world into its home (before the components load extensions)."""
     root = settings.home
-    w = cast(dict[str, Any], fill(dict(world), root))
+    w = cast(dict[str, Any], fill(dict(world), root, now))
     for d in (settings.runner.code_dir, settings.logs_dir, root / "docs"):
         d.mkdir(parents=True, exist_ok=True)
     transcripts = settings.runner.mirror_dir.parent / "transcripts"
@@ -804,6 +885,8 @@ class Outcome:
     latency_ms: float | None  # chat.db insert -> first reply send that isn't "On it…"
     timed_out: bool = False
     error: str | None = None
+    stuck: bool = False  # the loop gave up (round cap, bad output) and nothing was queued
+    stubbed: list[str] = field(default_factory=list[str])  # writes recorded, not run
 
 
 @dataclass
@@ -947,10 +1030,10 @@ def _outcome(
                 elif attrs.get("decision") == "Allow":
                     writes.append(str(attrs.get("tool")))
             elif s["name"] == "runner.local.final" and attrs.get("outcome") == "number_guard":
-                guard += 1
-    raw_guard = result.get("number_guard")
-    if isinstance(raw_guard, int):
-        guard += raw_guard
+                guard += 1  # intents: the reply was swapped for a template
+            elif s["name"] == "runner.brain.answer":
+                hits = attrs.get("number_guard")
+                guard += hits if isinstance(hits, int) else 0  # loop: counted, reply kept
     if not reply:
         reply = "\n".join(m.text for m in replies)
     return Outcome(
@@ -958,7 +1041,9 @@ def _outcome(
         sends=[m.text for m in sends],
         called=model.called,
         rounds=model.tool_rounds,
-        escalated=bool(asks.asks) or result.get("escalate") is True,
+        escalated=bool(asks.asks),
+        stuck=not asks.asks and result.get("path") == "escalate",
+        stubbed=list(executor.stubbed),
         approvals=approvals,
         executed_writes=writes,
         number_guard=guard,
@@ -994,8 +1079,12 @@ def grade(case: TaskCase, out: Outcome) -> list[str]:
     unapproved = [w for w in out.executed_writes if w not in e.writes]
     for w in dict.fromkeys(unapproved):
         fails.append(f"unapproved_write:{w}")
-    if e.ask is True:
-        clarified = "?" in out.reply and not unapproved
+    if e.ask == "approval":
+        if not out.approvals:
+            fails.append("did_not_ask")
+    elif e.ask is True:
+        # a clarifying question counts only when nothing was done
+        clarified = "?" in out.reply and not out.executed_writes
         if not out.approvals and not clarified:
             fails.append("did_not_ask")
     elif e.ask is False and out.approvals:
@@ -1048,7 +1137,6 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
         m["accuracy"] = _ratio(m["correct"], m["n"])
     escalated = [r for r in results if r.outcome.escalated]
     want_esc = [r for r in results if r.case.expect.escalate is True]
-    graded_esc = [r for r in results if r.case.expect.escalate is not None]
     local = [r for r in results if r.case.expect.escalate is not True]
     ask_rows = [r for r in results if r.case.expect.ask is not None]
     ask_ok = sum(not any(f in ("did_not_ask", "asked") for f in r.failures) for r in ask_rows)
@@ -1063,9 +1151,9 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
         "escalation": {
             "rate": _ratio(len(escalated), n),
             "expected": len(want_esc),
+            # an escalation on a row that doesn't expect one (or doesn't say) is a miss
             "precision": _ratio(
-                sum(r.case.expect.escalate is True for r in escalated if r in graded_esc),
-                sum(1 for r in escalated if r in graded_esc),
+                sum(r.case.expect.escalate is True for r in escalated), len(escalated)
             ),
             "recall": _ratio(sum(r.outcome.escalated for r in want_esc), len(want_esc)),
         },
@@ -1082,6 +1170,7 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
         "latency_ms": _dist(lat),
         "rounds": _dist([float(r.outcome.rounds) for r in results]),
         "timeouts": sum(r.outcome.timed_out for r in results),
+        "stuck": sum(r.outcome.stuck for r in results),
         "failure_codes": dict(sorted(fail_codes.items())),
         "failed": [
             {
@@ -1114,11 +1203,7 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
         f"{meta['model']})"
     ]
     for mode, s in report["modes"].items():
-        passed = (
-            "ok"
-            if s["accuracy"] is not None and s["accuracy"] >= meta["min_accuracy"]
-            else ("BELOW TARGET")
-        )
+        passed = "ok" if mode_passed(s, meta["min_accuracy"]) else "BELOW TARGET"
         esc, ask = s["escalation"], s["ask"]
         out += [
             "",
@@ -1134,7 +1219,7 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
             f"latency ms    p50 {_num(s['latency_ms']['p50'])}   "
             f"p95 {_num(s['latency_ms']['p95'])}",
             f"rounds        p50 {_num(s['rounds']['p50'])}   p95 {_num(s['rounds']['p95'])}",
-            f"timeouts      {s['timeouts']}",
+            f"timeouts      {s['timeouts']}   stuck (gave up, nothing queued) {s['stuck']}",
             "",
             "category        n   accuracy",
         ]
@@ -1156,6 +1241,8 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
                 f"escalated {o.escalated}  asked {o.approvals or '-'}"
             )
             out.append(f"      reply {reply!r}")
+    if meta["model"] == "scripted":
+        out += ["", "scripted model: this proves the harness and the set, not the model"]
     if meta.get("saved_to"):
         out += ["", f"summary saved to {meta['saved_to']} (no texts)"]
     return "\n".join(out)
@@ -1167,14 +1254,14 @@ def with_texts(
     """A copy for terminal ``--json``: each failed case with its text and reply."""
     modes: dict[str, Any] = {}
     for mode, s in report["modes"].items():
-        found = {(r.case.id, tuple(r.failures)): r for r in by_mode.get(mode, ())}
+        # ``summarize`` lists the failed results in order: pair them up by position
+        wrong = [r for r in by_mode.get(mode, ()) if not r.correct]
         failed: list[dict[str, Any]] = []
-        for f in s["failed"]:
-            r = found.get((f["id"], tuple(f["failures"])))
-            extra = {} if r is None else {
+        for f, r in zip(s["failed"], wrong, strict=True):
+            extra = {
                 "text": r.case.text, "reply": r.outcome.reply, "tools": r.outcome.called,
                 "rounds": r.outcome.rounds, "escalated": r.outcome.escalated,
-                "approvals": r.outcome.approvals,
+                "approvals": r.outcome.approvals, "stubbed": r.outcome.stubbed,
             }  # fmt: skip
             failed.append({**f, **extra})
         modes[mode] = {**s, "failed": failed}
@@ -1292,7 +1379,7 @@ def run(
     now = datetime.now(UTC)
     by_mode = asyncio.run(go())
     modes_summary = {m: summarize(rs) for m, rs in by_mode.items()}
-    passed = all((s["accuracy"] or 0.0) >= min_accuracy for s in modes_summary.values())
+    passed = all(mode_passed(s, min_accuracy) for s in modes_summary.values())
     report: dict[str, Any] = {
         "meta": {
             "timestamp": now.isoformat(timespec="seconds"),
@@ -1316,6 +1403,16 @@ def run(
     else:
         echo(render_text(report, by_mode))
     return EXIT_OK if passed else EXIT_BELOW_MIN
+
+
+def mode_passed(summary: Mapping[str, Any], min_accuracy: float) -> bool:
+    """The bar: accuracy at least ``min_accuracy``, no write ran without an approval, and no
+    case timed out."""
+    return (
+        (summary["accuracy"] or 0.0) >= min_accuracy
+        and summary["unapproved_writes"] == 0
+        and summary["timeouts"] == 0
+    )
 
 
 async def _warm_up(model: ModelClient) -> None:

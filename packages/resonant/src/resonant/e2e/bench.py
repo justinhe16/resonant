@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
+
 from resonant.api import DaemonState
 from resonant.components import build_components
 from resonant.config import (
@@ -111,6 +113,22 @@ class PathResult:
         return out
 
 
+class IsolatedSettings(Settings):
+    """``Settings`` from its arguments only: no ``RESONANT_*`` env vars, no ``config.yaml``.
+    A throwaway home (the bench, the task eval) must not pick up the live daemon's tuning."""
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (init_settings,)
+
+
 def bench_settings(
     home: Path,
     chat_db: Path,
@@ -124,9 +142,9 @@ def bench_settings(
     runner's dirs, the read roots and ``ops.repo_path`` stay inside the home, and
     ``dry_run`` stays on: the loop path never touches ``~/code`` or ``~/.resonant``.
     """
-    model = (base or Settings(home=home)).model
+    model = (base or IsolatedSettings(home=home)).model
     code = home / "code"
-    return Settings(
+    return IsolatedSettings(
         home=home,
         model=model,
         runner=RunnerConfig(
@@ -255,6 +273,7 @@ async def _run_path(
 
     async def one(text: str) -> float:
         if fake is not None:  # the loop's fake: one read, then the answer
+            fake.script = []  # drop what a timed-out prompt left, so prompts stay aligned
             fake.push([("list_dir", {"path": str(b.code)})], "resonant is in ~/code/resonant.")
         return await _one(b.chat, b.osa, text, timeout_s, b.clock)
 
