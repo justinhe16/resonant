@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from brain_seed import message
 
+from resonant.brain import TURN_NUDGE
 from resonant.config import DEFAULT_READ_DENY, load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
@@ -30,6 +31,7 @@ from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.models import ModelOutputError, ModelUnavailableError
 from resonant.runners.ask import AskRunner, AskScope
 from resonant.runners.brain import (
+    CLAIM_NUDGE,
     CORE_TOOLS,
     MAX_ROUNDS,
     NOT_IN_BRAIN,
@@ -43,6 +45,7 @@ from resonant.secrets import CLAUDE_TOKEN_REF, FakeKeychain, SecretStore
 from resonant.store import brain as brain_store
 from resonant.store import repos as repo_store
 from resonant.store.db import iso, kv_set, utcnow
+from resonant.tools import notes as notes_tools
 
 OWNER_PHONE = "+15551234567"
 MEMBER_PHONE = "+15557654321"
@@ -161,6 +164,9 @@ async def start(
     kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
     kv_set(daemon.conn, "autonomy", "on")
     assert daemon.imessage is not None and daemon.state.components is not None
+    assert daemon.imessage.brain is not None
+    assert daemon.imessage.brain.runner_gaps is not None  # the daemon wires the runner check
+    daemon.imessage.brain.runner_gaps = None  # the real check asks the Keychain (by name)
     # ask_claude's sessions: the fake CLI's ask mode with a token in a fake Keychain
     notes = tmp_path / "claude-notes"
     notes.mkdir()
@@ -215,7 +221,8 @@ async def test_where_is_mycelium_is_answered_from_the_briefing(
         (req,) = b.model.requests
         turn = req.messages[-1]["content"]
         assert "<briefing>" in turn and f"mycelium: {path}" in turn
-        assert turn.rstrip().endswith("</message>")
+        assert turn.endswith(f"<message>where is mycelium?</message>\n\n{TURN_NUDGE}")
+        assert "Workers aren't set up" not in turn  # no runner check: nothing claimed
         (task,) = b.brain_tasks()
         assert (task["kind"], task["status"]) == ("chat", "done")
         assert b.rows("SELECT 1 FROM executions WHERE task_id = ?", task["id"]) == []
@@ -273,44 +280,63 @@ async def test_multi_step_read_then_answer(
         )
         assert await b.say("what's in the readme in code?") == ["The README says hello."]
         first, second, third = b.model.requests
-        assert set(CORE_TOOLS) | {"load_tools"} <= set(first.tools)
+        assert set(CORE_TOOLS) <= set(first.tools) and "load_tools" not in first.tools
         assert "README.md" in second.messages[-1]["content"]
-        assert "hello from the readme" in third.messages[-1]["content"]
-        assert third.messages[-1]["content"].startswith("Tool result (untrusted data")
+        # BR-1b: native tool turns, the call then its result, still labeled untrusted
+        call, result = third.messages[-2:]
+        assert call == {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"name": "read_file", "args": {"path": str(b.code / "README.md")}}],
+        }
+        assert result["role"] == "tool" and result.get("tool_name") == "read_file"
+        assert "hello from the readme" in result["content"]
+        assert result["content"].startswith("Tool result (untrusted data")
+        assert not any('{"tool_call"' in m["content"] for m in third.messages)
         (task,) = b.brain_tasks()
         assert b.result(task)["tools_used"] == ["list_dir", "read_file"]
         assert b.result(task)["tainted"] is True
 
 
-# --- D4: core tools, the catalog and load_tools -------------------------------------------
+# --- D4: core tools and stubs (BR-1b) -----------------------------------------------------
 
 
-async def test_load_tools_then_a_deferred_tool(
+async def test_a_deferred_tool_is_a_stub_called_directly(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Every tool is offered by its exact name (Ollama coerces an unknown name to an offered
+    one): the deferred ones as stubs with a slim schema. A stub call runs at once."""
+    async with start(resonant_home, chat, tmp_path) as b:
+        b.model.push([("task_counts", {})], "Nothing is queued.")
+        assert await b.say("anything queued?") == ["Nothing is queued."]
+        first, _ = b.model.requests
+        assert "task_counts" in first.tools and "load_tools" not in first.tools
+        assert "mute_extension" not in first.tools and first.tools == sorted(first.tools)
+        assert not any("More tools" in m["content"] for m in first.messages)
+        (task,) = b.brain_tasks()
+        assert b.result(task)["tools_used"] == ["task_counts"]
+        assert len(b.rows("SELECT 1 FROM executions WHERE task_id = ?", task["id"])) == 1
+        (evaluated,) = [a for a in b.audits("gate.evaluate") if a["task_id"] == task["id"]]
+        assert evaluated["detail"]["origin"] == "inferred"
+
+
+async def test_a_stub_call_with_bad_args_gets_the_schema_back(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as b:
         b.model.push(
-            [("task_counts", {})],  # in the catalog, not loaded yet
-            [("load_tools", {"names": ["task_counts", "nope"]})],
-            [("task_counts", {})],
-            "Nothing is queued.",
+            [("cancel_reminder", {"which": "the first"})],
+            [("nope_tool", {})],
+            "Which reminder?",
         )
-        assert await b.say("anything queued?") == ["Nothing is queued."]
-        first, second, third, _ = b.model.requests
-        catalog = first.messages[1]["content"]
-        assert "More tools" in catalog and "- task_counts:" in catalog
-        assert "task_counts" not in first.tools and "mute_extension" not in catalog
-        assert '"not loaded: call load_tools' in second.messages[-1]["content"]
-        assert '"loaded":["task_counts"]' in third.messages[-1]["content"]
-        assert '"unknown":["nope"]' in third.messages[-1]["content"]
-        assert "task_counts" in third.tools and third.tools == sorted(third.tools)
+        assert await b.say("cancel my reminder 7") == ["Which reminder?"]
+        _, second, third = b.model.requests
+        bad = second.messages[-1]
+        assert bad["role"] == "tool" and "invalid arguments" in bad["content"]
+        assert "cancel_reminder takes:" in bad["content"] and '\\"id\\"' in bad["content"]
+        assert "there is no tool named nope_tool" in third.messages[-1]["content"]
         (task,) = b.brain_tasks()
-        assert b.result(task)["tools_used"] == ["load_tools", "task_counts"]
-        # one execution: task_counts; load_tools never reaches the executor
-        assert len(b.rows("SELECT 1 FROM executions WHERE task_id = ?", task["id"])) == 1
-        # an untrusted-free task stays untainted
-        (evaluated,) = [a for a in b.audits("gate.evaluate") if a["task_id"] == task["id"]]
-        assert evaluated["detail"]["origin"] == "inferred"
+        assert b.rows("SELECT 1 FROM executions WHERE task_id = ?", task["id"]) == []
 
 
 async def test_members_see_only_granted_tools(
@@ -381,8 +407,6 @@ async def test_worker_and_log_text_taints_too(
     after reading them asks."""
     async with start(resonant_home, chat, tmp_path) as b:
         args: dict[str, Any] = {"code": "R1"} if read == "run_activity" else {}
-        if read not in CORE_TOOLS:
-            b.model.push([("load_tools", {"names": [read]})])
         b.model.push([(read, args)], [("add_note", {"text": "buy milk"})])
         (prompt,) = await b.say("check on things")
         assert "Reply yes" in prompt
@@ -490,7 +514,7 @@ async def test_prefix_is_stable_across_turns(
         assert await b.say("one") == ["first."]
         assert await b.say("two") == ["second."]
         one, two = b.model.requests
-        assert one.messages[:2] == two.messages[:2]  # system, catalog and facts
+        assert one.messages[:1] == two.messages[:1]  # the system message (no facts here)
         assert one.tools == two.tools
         assert {"role": "assistant", "content": "first."} in two.messages  # D3 history
         hashes = [
@@ -514,3 +538,188 @@ async def test_history_folds_after_the_reply(
         summary = brain_store.get_summary(b.conn, "justin")
         assert summary is not None and summary.folded >= 5
         assert b.model.calls.get("fold") == 1
+
+
+# --- BR-1b: the failure modes the live model showed --------------------------------------
+
+
+def _notes(*texts: str) -> Callable[[sqlite3.Connection], None]:
+    def seed(conn: sqlite3.Connection) -> None:
+        for t in texts:
+            notes_tools.add_note(conn, {"text": t})
+
+    return seed
+
+
+def _span_attrs(b: Brain, name: str) -> list[dict[str, Any]]:
+    return [json.loads(r["attrs"]) for r in b.rows("SELECT attrs FROM spans WHERE name = ?", name)]
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        '{"tool_call":{"args":{},"name":"list_notes"}}',
+        'No pending reminders.  {"tool_call":{"args":{},"name":"list_notes"}}',
+        '<tool_call>\n{"name": "list_notes", "arguments": {}}\n</tool_call>',
+        "list_notes",
+    ],
+)
+async def test_a_call_written_as_text_runs_and_is_never_sent(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path, written: str
+) -> None:
+    """The baseline sent ``{"tool_call": …}`` to the owner as the answer: a call the model
+    writes as text runs like a native one."""
+    async with start(resonant_home, chat, tmp_path, [written, "No notes."]) as b:
+        assert await b.say("any notes?") == ["No notes."]
+        (task,) = b.brain_tasks()
+        assert b.result(task)["tools_used"] == ["list_notes"]
+        assert _span_attrs(b, "runner.brain.text_calls") == [{"tools": ["list_notes"]}]
+
+
+async def test_a_text_call_to_a_missing_tool_gets_an_error_not_a_reply(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    script: list[Scripted] = ['{"tool_call":{"args":{},"name":"list_repoz"}}', "Can't."]
+    async with start(resonant_home, chat, tmp_path, script) as b:
+        assert await b.say("which repos?") == ["Can't."]
+        _, second = b.model.requests
+        assert "there is no tool named list_repoz" in second.messages[-1]["content"]
+
+
+async def test_a_claimed_change_gets_one_corrective_round(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """ "Added note: buy oat milk" with no tool call: the claim goes back to the model, which
+    then calls the tool; the owner never sees the false claim."""
+    script: list[Scripted] = [
+        "Added note: buy oat milk",
+        [("add_note", {"text": "buy oat milk"})],
+        "Saved.",
+    ]
+    async with start(resonant_home, chat, tmp_path, script) as b:
+        assert await b.say("note: buy oat milk") == ['Saved.\nSaved note 1: "buy oat milk"']
+        _, second, _ = b.model.requests
+        assert second.messages[-2:] == [
+            {"role": "assistant", "content": "Added note: buy oat milk"},
+            {"role": "user", "content": CLAIM_NUDGE},
+        ]
+        assert _span_attrs(b, "runner.brain.nudge") == [{"kind": "claim"}]
+
+
+async def test_the_corrective_round_is_once_per_task(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    script: list[Scripted] = ["I've saved that.", "I've saved that, really."]
+    async with start(resonant_home, chat, tmp_path, script) as b:
+        assert await b.say("remember my standup is at 9:30") == ["I've saved that, really."]
+        assert len(b.model.requests) == 2
+
+
+async def test_answers_that_claim_nothing_go_straight_out(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    script: list[Scripted] = ["Set a reminder to rotate the token? Say yes and I will."]
+    async with start(resonant_home, chat, tmp_path, script) as b:
+        assert await b.say("what does setup say") == [script[0]]
+        assert len(b.model.requests) == 1
+
+
+async def test_an_unnamed_target_is_checked_before_a_write(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """ "delete the note" with two notes: an L3 write would run at once on the model's guess,
+    so the guess goes back to the model first (once), and it asks."""
+    script: list[Scripted] = [[("delete_note", {"id": 2})], "Which note: 1 or 2?"]
+    seed = _notes("call the dentist", "rotate the tires")
+    async with start(resonant_home, chat, tmp_path, script, seed=seed) as b:
+        assert await b.say("delete the note") == ["Which note: 1 or 2?"]
+        _, second = b.model.requests
+        assert "not run yet" in second.messages[-1]["content"]
+        assert "id=2" in second.messages[-1]["content"]
+        (task,) = b.brain_tasks()
+        assert b.rows("SELECT 1 FROM executions WHERE task_id = ?", task["id"]) == []
+        assert len(notes_tools.list_notes(b.conn)["notes"]) == 2
+
+
+async def test_a_named_target_runs_and_a_repeated_guess_runs_once_checked(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    seed = _notes("call the dentist", "rotate the tires")
+    script: list[Scripted] = [[("delete_note", {"id": 2})], "Deleted."]
+    async with start(resonant_home, chat, tmp_path, script, seed=seed) as b:
+        (reply,) = await b.say("delete note 2")
+        assert reply.startswith("Deleted.") and len(b.model.requests) == 2
+        b.model.push([("delete_note", {"id": 1})], [("delete_note", {"id": 1})], "Gone.")
+        (reply,) = await b.say("drop the dentist one")
+        assert reply.startswith("Gone.") and len(notes_tools.list_notes(b.conn)["notes"]) == 0
+
+
+async def test_a_failed_read_tells_the_model_why(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """The baseline got "the tool failed" for a wrong path and gave up: the brain passes the
+    read's own reason back, so the model can fix the path."""
+    script: list[Scripted] = [[("read_file", {"path": "/etc/hosts"})], "Can't read that."]
+    async with start(resonant_home, chat, tmp_path, script) as b:
+        assert await b.say("read /etc/hosts") == ["Can't read that."]
+        _, second = b.model.requests
+        assert "is outside the read roots" in second.messages[-1]["content"]
+
+
+async def test_the_briefing_reports_the_runner_check_never_a_guess(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """The baseline's briefing always said "Workers aren't set up … (iMessage is off)": the
+    brain never passed the runner's state. Now it shows the daemon's check, refreshed off the
+    reply path, and nothing until there is an answer."""
+    checks: list[int] = []
+
+    async def gaps() -> list[str] | None:
+        checks.append(1)
+        return ["the claude CLI isn't installed"]
+
+    async with start(resonant_home, chat, tmp_path, ["one.", "two."]) as b:
+        b.runner.runner_gaps = gaps
+        assert await b.say("one") == ["one."]
+        await b.runner.idle()
+        assert await b.say("two") == ["two."]
+        first, second = b.model.requests
+        assert "Workers aren't set up" not in first.messages[-1]["content"]
+        assert (
+            "Workers aren't set up: the claude CLI isn't installed"
+            in (second.messages[-1]["content"])
+        )
+        assert checks == [1]  # cached
+
+
+async def test_the_runner_check_survives_cancel_and_keeps_known_gaps(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Review of #103: a check cancelled before it ran left ``_gaps_job`` set (``idle`` spun,
+    no refresh again), and a failed check replaced known gaps with none."""
+    calls: list[str] = []
+
+    async def gaps() -> list[str] | None:
+        calls.append("ok" if not calls else "boom")
+        if len(calls) > 1:
+            raise RuntimeError("keychain")
+        return ["the claude CLI isn't installed"]
+
+    async with start(resonant_home, chat, tmp_path) as b:
+        r = b.runner
+        r.runner_gaps = gaps
+        assert r._runner_missing() == []  # pyright: ignore[reportPrivateUsage]
+        job = r._gaps_job  # pyright: ignore[reportPrivateUsage]
+        assert job is not None
+        job.cancel()
+        await asyncio.gather(job, return_exceptions=True)
+        await asyncio.sleep(0)  # the done callback runs
+        assert r._gaps_job is None  # pyright: ignore[reportPrivateUsage]
+        r._runner_missing()  # pyright: ignore[reportPrivateUsage]
+        await asyncio.wait_for(r.idle(), 5)
+        assert r._runner_missing() == ["the claude CLI isn't installed"]  # pyright: ignore[reportPrivateUsage]
+        r._gaps = (0.0, ["the claude CLI isn't installed"])  # pyright: ignore[reportPrivateUsage]
+        r._runner_missing()  # pyright: ignore[reportPrivateUsage]  # stale: refresh, which fails
+        await asyncio.wait_for(r.idle(), 5)
+        assert calls == ["ok", "boom"]
+        assert r._runner_missing() == ["the claude CLI isn't installed"]  # pyright: ignore[reportPrivateUsage]

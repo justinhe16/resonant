@@ -13,21 +13,37 @@ runner's keys) is handed to ``LocalRunner._answer`` as is.
 **One turn** (a ``kind="chat"`` task with no ``call``):
 
 1. **Tools** (D4). The principal's tools, filtered by ``principals.may_request`` before
-   anything is listed, then made unique (``router.chat_toolset``). ``CORE_TOOLS`` are always
-   loaded; every other tool (builtins and extension chat tools, never job specs or
-   ``NOT_IN_BRAIN``) is in the deferred catalog, one line each. ``load_tools{names}`` is a
-   loop-internal pseudo-tool (never gated, never executed): it adds up to ``MAX_LOADED``
-   catalog tools for the rest of the task, sent in name order like every toolset. It is
-   offered only when the catalog isn't empty.
-2. **Context** (``brain.build_context``, D2): system, core tools, catalog and facts, history,
-   then the briefing, the "since we last talked" notes, the time and the message.
+   anything is listed, then made unique (``router.chat_toolset``). ``CORE_TOOLS`` are
+   offered with their full schemas; every other tool (builtins and extension chat tools,
+   never job specs or ``NOT_IN_BRAIN``) is offered as a **stub** (``stub``): its exact name,
+   its one-line summary and its argument names, with an open schema. A stub call is checked
+   against the real schema here and runs like any call; a bad one gets the schema back. The
+   toolset is fixed for the whole task (sorted by name), so the prompt prefix stays cached.
+   Why stubs and not a name-only catalog: Ollama constrains a call's name to the offered
+   tools, so a call to a tool that isn't offered comes back as a *different* tool
+   (``list_repos`` became ``list_reminders``).
+2. **Context** (``brain.build_context``, D2): system, the tools, facts, history, then the
+   briefing (with the Claude runner's real set-up gaps, ``runner_gaps``), the "since we last
+   talked" notes, the time and the message.
 3. **Rounds.** At most ``MAX_ROUNDS`` ``chat_tools`` calls. A reply with no tool calls is the
-   answer (clipped to ``MAX_REPLY_CHARS``). Each call goes through ``_call_tool`` with the
+   answer (clipped to ``MAX_REPLY_CHARS``). Calls and results are **native tool turns** (an
+   assistant turn with ``tool_calls``, then a ``tool`` turn holding the result, labeled
+   untrusted data), so the model never sees a call as text to imitate; a call the model
+   still writes as text (``{"tool_call": …}``, ``<tool_call>``) is run as a call, never sent.
+   A failed read's ``ToolFailed`` reason goes back to the model (``tool_error_detail``). Each
+   call goes through ``_call_tool`` with the
    task's origin: ``inferred`` until a tool result came from outside content, ``tainted``
    from then on (D6). Outside content is a spec with ``untrusted=True`` (the read tools,
    ``ask_claude``) or any extension or MCP tool. A gated call is pinned with ``tainted``, so
    its resume after an approval is gated as ``tainted`` too (``_pinned_origin``). Reads are
    free inside the rounds (``MAX_CALLS`` is only a backstop).
+   **Target check** (once per task): a side effect that picks its target by an identifier
+   the owner's message doesn't contain (``cancel_run{code: R2}`` for "cancel the run")
+   isn't run; the model gets ``TARGET_CHECK`` back (ask which if several fit, else call
+   again), since an L3 write runs without asking.
+   **Corrective round** (once per task): an answer that claims a change (``claims_change``)
+   while no side effect ran goes back to the model with a short check (``CLAIM_NUDGE``)
+   instead of out to the owner.
 4. **ask_claude.** When the model calls it and it queued, its text (``Looking into it…``) is
    the reply and the turn ends: the ask task answers later. A refusal goes back to the model.
 5. **Stuck.** The round cap with no answer, or two bad model outputs, escalates on its own:
@@ -54,16 +70,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
 from typing import Any, cast
 
+import jsonschema
+
 from resonant.brain.context import build_context, catalog_entries
 from resonant.brain.facts import FactStore
 from resonant.brain.history import fold, fold_due
+from resonant.brain.text import flat
 from resonant.config import Settings
 from resonant.gate.types import Origin
 from resonant.gateway.channel import Channel
@@ -77,6 +98,7 @@ from resonant.models import (
     ModelUnavailableError,
     SpanFactory,
 )
+from resonant.models.client import text_tool_calls
 from resonant.observability.spans import span
 from resonant.principals import Principals
 from resonant.router.intents import ExtensionCatalog
@@ -106,20 +128,21 @@ from resonant.runners.local import (
 from resonant.store.db import utcnow
 from resonant.tools import ToolRegistry
 from resonant.tools.ask import ASK_CLAUDE, QUESTION_MAX
-from resonant_sdk import Effect, Event, Level, ToolSpec
+from resonant_sdk import Effect, Event, ToolSpec
 
 log = logging.getLogger(__name__)
 
 NAME = "brain"
 MAX_ROUNDS = 8  # chat_tools calls per task (D7)
 MAX_CALLS = 24  # tool calls per task, any kind: a backstop, reads are free inside the rounds
-MAX_LOADED = 8  # catalog tools load_tools may add per task (D4)
 MAX_REPLY_CHARS = 1500  # D7
 MAX_MODEL_ERRORS = 2  # bad outputs before the loop gives up (escalates)
 TOOLS_MAX_TOKENS = 1024  # a reply may be the answer, up to MAX_REPLY_CHARS
 FINAL_MAX_TOKENS = 700
 PROGRESS_AFTER_S = 6.0
 PROGRESS_TEXT = "On it…"
+RUNNER_GAPS_TTL_S = 60.0  # as the dashboard's runner check (api.RUNNER_CHECK_TTL_S)
+RUNNER_GAPS_TIMEOUT_S = 30.0  # a background check; never on the reply path
 TRIED_MAX_CHARS = 300  # the "what was tried" note in an escalated question
 
 # Always loaded (D4): the read tools, facts, ask_claude, notes and reminders, runs, the Mini.
@@ -162,34 +185,139 @@ TAINTING_BUILTINS: frozenset[str] = frozenset(
 # Control-plane tools that stay slash-only (``/ext mute``), as on the intents path.
 NOT_IN_BRAIN: frozenset[str] = frozenset({"mute_extension"})
 
-LOAD_TOOLS = ToolSpec(
-    name="load_tools",
-    description=(
-        f"Load tools listed under More tools so you can call them (up to {MAX_LOADED} per "
-        "conversation turn). Pass their exact names."
-    ),
-    args_schema={
-        "type": "object",
-        "properties": {
-            "names": {
-                "type": "array",
-                "items": {"type": "string", "maxLength": 64},
-                "minItems": 1,
-                "maxItems": MAX_LOADED,
-            }
-        },
-        "required": ["names"],
-        "additionalProperties": False,
-    },
-    effect=Effect.READ,
-    level=Level.L0,
-)
+TOOL_ERROR_CHARS = 300  # a failed tool's reason, as the model sees it
 
 FINAL_INSTRUCTION = (
     "Now answer the owner's message from what you read. Reply with only a JSON object: "
     f'{{"reply": "<plain text, at most {MAX_REPLY_CHARS} characters>"}}.'
 )
-NOT_LOADED = "not loaded: call load_tools with its name first"
+NO_SUCH_TOOL = "there is no tool named {name}; use one of the tools you were given"
+BAD_STUB_ARGS = "invalid arguments ({why}). {name} takes: {schema}. Call it again with those."
+
+# The corrective round (once per task): an answer that claims a change no tool made.
+CLAIM_NUDGE = (
+    "Check: no tool ran in this task, so nothing was changed. If the owner asked for a "
+    "change, call the tool for it now (Resonant asks the owner first when it must). If you "
+    "can't, say so plainly. Never say something was done unless a tool result says so."
+)
+# A change's target the owner didn't name: once per task, the call goes back to the model
+# unrun (``unnamed_target``).
+TARGET_CHECK = (
+    "not run yet: the owner's message doesn't name {target}. If more than one item could "
+    "fit, don't guess: ask the owner which one, in a short question ending in '?'. If only "
+    "this one fits, call {name} again."
+)
+TARGET_KEYS = frozenset({"code", "id", "number"})
+
+
+def unnamed_target(spec: ToolSpec, args: dict[str, Any], message: str) -> str | None:
+    """``code=R2`` when a side effect picks its target by an identifier (``code``, ``id``,
+    ``number`` or ``*_id``) that the owner's message doesn't contain, else None. Reads, and
+    calls whose target is named ("cancel R2", "merge PR 41"), pass."""
+    if spec.effect is Effect.READ:
+        return None
+    lowered = message.lower()
+    words = set(re.findall(r"[a-z0-9]+", lowered))
+    for key, value in args.items():
+        if not (key in TARGET_KEYS or key.endswith("_id")):
+            continue
+        if isinstance(value, bool) or not isinstance(value, str | int):
+            continue
+        token = str(value).strip().lower().lstrip("#")
+        named = token in words or (not token.isalnum() and token in lowered)
+        if token and not named:
+            return f"{flat(key, 32)}={flat(str(value), 40)}"
+    return None
+
+
+# "Added note: …", "I've saved that…", "Done, merged #41", "Cancelled R2": a first-person or
+# leading past-tense claim of a change. Reads that quote a log ("R1 started at …") don't
+# match: the verb must open the reply (after an optional "ok"/"done"/"sure") or follow "I".
+_CHANGE_VERBS = (
+    r"(?:added|saved|created|made|merged|started|launched|kicked off|deleted|removed|cleared|"
+    r"sent|scheduled|cancell?ed|stopped|killed|restarted|remembered|noted|updated|"
+    r"forgot(?:ten)?|opened|filed|closed|approved|logged)"
+)
+# A promise ("I'll remember that") with no call is as empty as a claim.
+_PROMISE_VERBS = (
+    r"(?:add|save|create|make|merge|start|launch|delete|remove|clear|send|schedule|set|cancel|"
+    r"stop|kill|restart|remember|note|update|forget|open|file|close|approve|remind)"
+)
+# "set" only after "I": a reply that opens "Set a reminder …?" is a proposal, not a claim.
+# A leading past participle that describes something ("Created 3 days ago by sam", "Merged
+# 2h ago", "Logged in as …", "Sent from the Mini") is a read, not a claim.
+_NOT_A_CLAIM = r"(?!\s+(?:\d|ago\b|by\b|from\b|in\b|at\b|on\b|yesterday\b|today\b|earlier\b))"
+_CLAIM = re.compile(
+    rf"(?:^\W*(?:resonant\W+)?(?:(?:ok(?:ay)?|done|sure|got it)\W+)?{_CHANGE_VERBS}\b"
+    rf"{_NOT_A_CLAIM}"
+    rf"|\bI(?:'ve| have| just)?\s+(?:just\s+|already\s+)?(?:set|{_CHANGE_VERBS})\b"
+    rf"|\bI(?:'ll| will)\s+{_PROMISE_VERBS}\b"
+    rf"|\b{_CHANGE_VERBS}\s+(?:it\s+)?(?:as an?|to your|to the)\s+"
+    r"(?:notes?|reminders?|facts?)\b"
+    rf"|\b(?:reminder|note|ticket|issue|run)\s+(?:is\s+|has been\s+)?"
+    r"(?:set|saved|added|created|started|filed)\b)",
+    re.IGNORECASE,
+)
+
+
+def claims_change(reply: str) -> bool:
+    """A reply that says it changed something (to check against what actually ran)."""
+    return _CLAIM.search(reply) is not None
+
+
+_SLIM_KEYS = ("type", "enum", "items", "properties", "required")
+
+
+def slim_schema(schema: Any, depth: int = 0) -> dict[str, Any]:
+    """``schema`` with only what shapes a call: ``type``, ``enum``, ``items``, ``properties``
+    and ``required`` (no descriptions, limits or formats), three levels deep. An object
+    always has ``properties`` (llama.cpp's grammar needs it, and allows no others)."""
+    if not isinstance(schema, dict) or depth > 2:
+        return {}
+    src = cast(dict[str, Any], schema)
+    out: dict[str, Any] = {}
+    for key in _SLIM_KEYS:
+        if key not in src:
+            continue
+        value: Any = src[key]
+        if key == "properties" and isinstance(value, dict):
+            props = cast(dict[str, Any], value)
+            out[key] = {flat(str(k), 64): slim_schema(v, depth + 1) for k, v in props.items()}
+        elif key == "items":
+            out[key] = slim_schema(value, depth + 1)
+        elif key == "required" and isinstance(value, list):
+            out[key] = [flat(str(r), 64) for r in cast(list[Any], value)]
+        elif key == "enum" and isinstance(value, list):
+            out[key] = [v for v in cast(list[Any], value) if isinstance(v, str | int | float)]
+        elif key == "type" and isinstance(value, str | list):
+            out[key] = value
+    if out.get("type") == "object" and "properties" not in out:
+        out["properties"] = {}
+    return out
+
+
+def stub(spec: ToolSpec) -> ToolSpec:
+    """A deferred tool as the model sees it (D4): its exact name, its one-line summary
+    (``catalog_entries``) and a slim schema (``slim_schema``). Offering every tool by name
+    lets the decoder name it exactly: Ollama constrains a call's name (and args) to the
+    offered tools, so a call to a tool that isn't offered comes back as a different one. The
+    call is checked against the real schema in ``_one``; the toolset never changes inside a
+    task, so the prompt prefix stays cached."""
+    (entry,) = catalog_entries([spec])
+    schema = slim_schema(spec.args_schema) or {"type": "object", "properties": {}}
+    return ToolSpec(
+        name=spec.name, description=entry.summary, args_schema=schema, effect=Effect.READ
+    )
+
+
+def args_error(spec: ToolSpec, args: dict[str, Any]) -> str | None:
+    """Why ``args`` don't fit ``spec`` (a short reason, no values), or None."""
+    try:
+        jsonschema.validate(args, spec.args_schema)
+    except jsonschema.ValidationError as e:
+        where = "/".join(str(p) for p in e.path)
+        return f"{e.validator}{' at ' + where if where else ''}"
+    return None
 
 
 @dataclass
@@ -199,21 +327,28 @@ class _Turn:
     messages: list[ChatMessage]
     events: list[Event]  # the step's events, for the intents fallback
     core: list[ToolSpec]
-    deferred: dict[str, ToolSpec]  # by model-facing name
-    loaded: list[ToolSpec] = field(default_factory=list[ToolSpec])
+    deferred: dict[str, ToolSpec]  # by model-facing name; offered as stubs
     calls: list[CallResult] = field(default_factory=list[CallResult])
     tainted: bool = False
     errors: int = 0
     executed: int = 0  # tool calls run through the gate (their call_index)
+    nudged: bool = False  # the one corrective round was used
+    text: str = ""  # the owner's message (the target check)
+    target_checked: bool = False  # the one target check was used
+    tools: list[ToolSpec] = field(default_factory=list[ToolSpec])
+
+    def __post_init__(self) -> None:
+        stubs = [stub(s) for s in self.deferred.values()]
+        self.tools = sorted([*self.core, *stubs], key=lambda s: s.name)
 
     def toolset(self) -> list[ToolSpec]:
-        tools = [*self.core, *self.loaded]
-        if self.deferred:
-            tools.append(LOAD_TOOLS)
-        return sorted(tools, key=lambda s: s.name)
+        """What the model is offered: the core tools and a stub per deferred tool, by name.
+        The same for the whole task (the prompt prefix stays cached)."""
+        return self.tools
 
     def lookup(self, name: str) -> ToolSpec | None:
-        return next((s for s in (*self.core, *self.loaded) if s.name == name), None)
+        """The real spec for a model-facing name (core or deferred)."""
+        return next((s for s in self.core if s.name == name), None) or self.deferred.get(name)
 
     @property
     def origin(self) -> Origin:
@@ -234,6 +369,7 @@ class BrainRunner(LocalRunner):
     """``runner="brain"``. The local runner's collaborators, plus what the context needs."""
 
     name = NAME
+    tool_error_detail = True  # a failed read's reason goes back to the model
 
     def __init__(
         self,
@@ -255,6 +391,7 @@ class BrainRunner(LocalRunner):
         extensions: ExtensionCatalog | None = None,
         model_result_max_chars: int = MODEL_RESULT_MAX_CHARS,
         progress_after_s: float = PROGRESS_AFTER_S,
+        runner_gaps: Callable[[], Awaitable[list[str] | None]] | None = None,
     ) -> None:
         super().__init__(
             conn,
@@ -276,6 +413,13 @@ class BrainRunner(LocalRunner):
         self.last_tick = last_tick
         self.slots = slots
         self.progress_after_s = progress_after_s
+        # The Claude runner's set-up gaps for the briefing (the daemon passes the dashboard's
+        # cached check, ``api.runner_missing``); None, or a check that returns None, fails or
+        # is slow: the briefing says nothing about workers.
+        self.runner_gaps = runner_gaps
+        self._gaps: tuple[float, list[str]] | None = None
+        self._gaps_job: asyncio.Task[None] | None = None
+        self._closed = False
         self.labeler = Labeler(model, self.intents)  # the intents fallback
         self._folds: set[asyncio.Task[None]] = set()
         self._folding: set[str] = set()  # principals with a fold in flight
@@ -314,16 +458,26 @@ class BrainRunner(LocalRunner):
             self._folding.discard(principal)
 
     async def idle(self) -> None:
-        """Wait for background folds (tests)."""
-        while self._folds:
-            await asyncio.gather(*list(self._folds), return_exceptions=True)
+        """Wait for background folds and the runner check (tests). Only unfinished jobs are
+        awaited: a gather over finished tasks never yields, so a loop on them would stall
+        the event loop (and the watchdog ends the process)."""
+        while True:
+            gaps = [self._gaps_job] if self._gaps_job is not None else []
+            jobs = [j for j in (*self._folds, *gaps) if not j.done()]
+            if not jobs:
+                return
+            await asyncio.gather(*jobs, return_exceptions=True)
 
     async def aclose(self) -> None:
-        """Cancel background folds (shutdown, before the model client closes). The fold's
-        cursor moves by compare-and-set, so a cancelled fold just runs again later."""
-        for job in list(self._folds):
+        """Cancel background folds and the runner check (shutdown, before the model client
+        closes). The fold's cursor moves by compare-and-set, so a cancelled fold just runs
+        again later."""
+        self._closed = True
+        jobs = [*self._folds, *([self._gaps_job] if self._gaps_job is not None else [])]
+        for job in jobs:
             job.cancel()
-        await asyncio.gather(*list(self._folds), return_exceptions=True)
+        await asyncio.gather(*jobs, return_exceptions=True)
+        self._gaps_job = None
 
     def _spans(self, trace_id: str) -> SpanFactory:
         return partial(span, self.conn, trace_id=trace_id)
@@ -373,6 +527,38 @@ class BrainRunner(LocalRunner):
         except Exception as e:  # never fails the turn: the reply matters, not the ack
             log.warning("brain: progress text not sent (%s)", type(e).__name__)
 
+    def _runner_missing(self) -> list[str]:
+        """The workers' set-up gaps for the briefing: the last answer of ``runner_gaps``,
+        refreshed in the background once it is ``RUNNER_GAPS_TTL_S`` old, never awaited on
+        the reply path (the check asks the Keychain and may run ``claude``). No answer yet,
+        or a check that failed or timed out: no gaps, so the briefing never claims workers
+        are broken on a guess (the model refuses runs and asks because of it)."""
+        if self.runner_gaps is None:
+            return []
+        now = time.monotonic()
+        stale = self._gaps is None or now - self._gaps[0] >= RUNNER_GAPS_TTL_S
+        if stale and self._gaps_job is None and not self._closed:
+            job = asyncio.get_running_loop().create_task(self._refresh_gaps(self.runner_gaps))
+            self._gaps_job = job
+            job.add_done_callback(self._gaps_done)
+        return [] if self._gaps is None else self._gaps[1]
+
+    def _gaps_done(self, job: asyncio.Task[None]) -> None:
+        if self._gaps_job is job:  # also when cancelled before it ran
+            self._gaps_job = None
+
+    async def _refresh_gaps(self, check: Callable[[], Awaitable[list[str] | None]]) -> None:
+        """A failed or slow check keeps the last answer (only its age moves), so a transient
+        Keychain error never turns known gaps into "all set"."""
+        try:
+            missing = await asyncio.wait_for(check(), RUNNER_GAPS_TIMEOUT_S)
+        except Exception as e:
+            log.warning("brain: runner set-up check failed (%s)", type(e).__name__)
+            last = [] if self._gaps is None else self._gaps[1]
+            self._gaps = (time.monotonic(), last)
+            return
+        self._gaps = (time.monotonic(), list(missing or []))
+
     def tools_for(self, principal: str) -> tuple[list[ToolSpec], list[ToolSpec]]:
         """``(core, deferred)``: the tools ``principal`` may request, unique by name, by name.
         Job specs and ``NOT_IN_BRAIN`` are never offered."""
@@ -381,7 +567,6 @@ class BrainRunner(LocalRunner):
             s
             for s in self.registry.specs()
             if s.name not in NOT_IN_BRAIN
-            and s.name != LOAD_TOOLS.name
             and not (s.extension is not None and (host is None or host.is_job(s)))
             and self.principals.may_request(principal, s)
         ]
@@ -400,6 +585,7 @@ class BrainRunner(LocalRunner):
         spans: SpanFactory,
     ) -> StepResult:
         core, deferred = self.tools_for(principal)
+        missing = self._runner_missing()
         with spans("runner.brain.context", core=len(core), catalog=len(deferred)) as s:
             context = build_context(
                 self.conn,
@@ -409,13 +595,13 @@ class BrainRunner(LocalRunner):
                 text=text,
                 event_id=task.origin_event_id,
                 started_at=self.started_at,
-                catalog=catalog_entries(deferred),
                 facts=self.facts,
                 now=self.now(),
                 last_tick=self.last_tick(),
                 slots=self.slots,
+                runner_missing=missing,
             )
-            st = _Turn(context.messages(), events, core, {d.name: d for d in deferred})
+            st = _Turn(context.messages(), events, core, {d.name: d for d in deferred}, text=text)
             s.set(history_turns=len(context.history), prefix_hash=context.prefix_hash(st.toolset()))
         try:
             return await self._rounds(task, principal, text, st, ctx, spans)
@@ -438,23 +624,70 @@ class BrainRunner(LocalRunner):
     ) -> StepResult:
         for n in range(MAX_ROUNDS):
             reply = await self._round(n, st, spans)
-            if reply is None or not reply.tool_calls:
+            calls = self._calls(reply, st, spans)
+            if reply is None or not calls:
                 answer = (reply.text or "").strip() if reply is not None else ""
                 if answer:
-                    return self._answered(answer, st, spans)
+                    nudge = self._nudge(answer, st)
+                    if nudge is None:
+                        return self._answered(answer, st, spans)
+                    st.nudged = True
+                    with spans("runner.brain.nudge", kind=nudge[0]):
+                        pass
+                    st.messages.append({"role": "assistant", "content": answer})
+                    st.messages.append({"role": "user", "content": nudge[1]})
+                    continue
                 st.errors += 1  # bad output, or neither a call nor an answer
                 if st.errors >= MAX_MODEL_ERRORS:
                     return await self._stuck(task, principal, text, st, ctx, spans, cap=False)
                 continue
-            for tc in reply.tool_calls:
+            for name, args in calls:
                 if len(st.calls) >= MAX_CALLS:
                     return await self._stuck(task, principal, text, st, ctx, spans, cap=True)
-                ended = await self._one(task, principal, tc.name, tc.args, st, ctx, spans)
+                ended = await self._one(task, principal, name, args, st, ctx, spans)
                 if ended is not None:
                     return ended
                 if len(st.reports) >= MAX_SIDE_EFFECTS:
                     return await self._narrate(st, spans)
         return await self._stuck(task, principal, text, st, ctx, spans, cap=True)
+
+    def _calls(
+        self, reply: ModelReply | None, st: _Turn, spans: SpanFactory
+    ) -> list[tuple[str, Any]]:
+        """The round's tool calls as ``(name, args)``: the native ones, or calls the model
+        wrote as text (``{"tool_call": …}`` or ``<tool_call>``), which are never sent as the
+        answer. A text call to a tool that doesn't exist, or with args that aren't an object,
+        still goes to ``_one`` so the model gets an error back."""
+        if reply is None:
+            return []
+        if reply.tool_calls:
+            return [(c.name, c.args) for c in reply.tool_calls]
+        raw = text_tool_calls(reply.text, {t.name for t in st.toolset()})
+        if not raw:
+            return []
+        out: list[tuple[str, Any]] = []
+        for r in raw:
+            args: Any = r.arguments
+            if args is None or args == "":
+                args = {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = None
+            out.append((r.name, args))
+        with spans("runner.brain.text_calls", tools=[flat(n, 64) for n, _ in out]):
+            pass
+        return out
+
+    def _nudge(self, answer: str, st: _Turn) -> tuple[str, str] | None:
+        """The corrective round, once per task: an answer that claims a change while no side
+        effect ran. ``(kind, text)`` or None."""
+        # Once only: a second answer goes out as is, even if it still claims (the code-built
+        # report lines are the owner's record of what ran).
+        if st.nudged or st.reports or not claims_change(answer):
+            return None
+        return ("claim", CLAIM_NUDGE)
 
     async def _round(self, n: int, st: _Turn, spans: SpanFactory) -> ModelReply | None:
         """One ``chat_tools`` call; None on bad output. ``ModelUnavailableError`` propagates."""
@@ -477,97 +710,77 @@ class BrainRunner(LocalRunner):
         task: Task,
         principal: str,
         name: str,
-        args: dict[str, Any],
+        args: Any,
         st: _Turn,
         ctx: StepContext,
         spans: SpanFactory,
     ) -> StepResult | None:
         """One model tool call into ``st``. Returns a result when it ends the turn (a wait,
-        a refusal, an ask that queued), else None."""
-        if name == LOAD_TOOLS.name and st.deferred:
-            call = self._load(args, st, spans)
+        a refusal, an ask that queued), else None. A deferred tool is called through its stub:
+        its args are checked against the real schema here, and a bad call gets the schema
+        back instead of running."""
+        spec = st.lookup(name)
+        if not isinstance(args, dict):
+            call = CallResult(name, False, None, "invalid arguments: pass a JSON object")
+            args = {}
+        elif spec is None:
+            call = CallResult(name, False, None, NO_SUCH_TOOL.format(name=flat(name, 64)))
+        elif (why := args_error(spec, cast(dict[str, Any], args))) is not None:
+            schema = json.dumps(spec.args_schema, sort_keys=True, separators=(",", ":"))
+            call = CallResult(
+                name, False, None, BAD_STUB_ARGS.format(why=why, name=name, schema=schema)
+            )
+        elif not st.target_checked and (
+            target := unnamed_target(spec, cast(dict[str, Any], args), st.text)
+        ):
+            st.target_checked = True
+            with spans("runner.brain.target_check", tool=name):
+                pass
+            call = CallResult(name, False, None, TARGET_CHECK.format(target=target, name=name))
         else:
-            spec = st.lookup(name)
-            if spec is None:
-                why = NOT_LOADED if name in st.deferred else "tool not available"
-                call = CallResult(name, False, None, why)
-            else:
-                origin = st.origin
-                done = await self._call_tool(
-                    task,
-                    principal,
-                    [spec],
-                    name,
-                    args,
-                    st.executed,
-                    ctx,
-                    spans,
-                    st.reports,
-                    origin=origin,
-                    pin={"tainted": st.tainted},
-                )
-                st.executed += 1
-                if taints(spec) and not st.tainted:
-                    st.tainted = True
-                    with spans("runner.brain.taint", tool=name, extension=spec.extension):
-                        pass
-                if not isinstance(done, CallResult):
-                    return after_effects(st.reports, done, MAX_REPLY_CHARS)
-                call = done
-                data = call.data or {}
-                if name == ASK_CLAUDE.name and data.get("queued") is True:
-                    st.calls.append(call)
-                    said = data.get("text")
-                    reply = said if isinstance(said, str) and said else "Looking into it…"
-                    answer = Answer(reply, "ask", used_tools(st.calls), escalate=True)
-                    return after_effects(st.reports, answer, MAX_REPLY_CHARS)
+            args = cast(dict[str, Any], args)
+            done = await self._call_tool(
+                task,
+                principal,
+                [spec],
+                name,
+                args,
+                st.executed,
+                ctx,
+                spans,
+                st.reports,
+                origin=st.origin,
+                pin={"tainted": st.tainted},
+            )
+            st.executed += 1
+            if taints(spec) and not st.tainted:
+                st.tainted = True
+                with spans("runner.brain.taint", tool=name, extension=spec.extension):
+                    pass
+            if not isinstance(done, CallResult):
+                return after_effects(st.reports, done, MAX_REPLY_CHARS)
+            call = done
+            data = call.data or {}
+            if name == ASK_CLAUDE.name and data.get("queued") is True:
+                st.calls.append(call)
+                said = data.get("text")
+                reply = said if isinstance(said, str) and said else "Looking into it…"
+                answer = Answer(reply, "ask", used_tools(st.calls), escalate=True)
+                return after_effects(st.reports, answer, MAX_REPLY_CHARS)
         st.calls.append(call)
+        # Native tool turns: the assistant's call, then its result as a ``tool`` message
+        # (still labeled untrusted data), so the chat template renders them as it was trained.
+        st.messages.append(
+            {"role": "assistant", "content": "", "tool_calls": [{"name": name, "args": args}]}
+        )
         st.messages.append(
             {
-                "role": "assistant",
-                "content": json.dumps(
-                    {"tool_call": {"name": name, "args": args}},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
+                "role": "tool",
+                "tool_name": name,
+                "content": tool_turn(call, self.model_result_max_chars),
             }
         )
-        st.messages.append(
-            {"role": "user", "content": tool_turn(call, self.model_result_max_chars)}
-        )
         return None
-
-    def _load(self, args: dict[str, Any], st: _Turn, spans: SpanFactory) -> CallResult:
-        """``load_tools``: never gated, never executed; it only widens this turn's toolset."""
-        raw: Any = args.get("names")
-        names = (
-            [n for n in cast(list[Any], raw) if isinstance(n, str)] if isinstance(raw, list) else []
-        )
-        loaded: list[str] = []
-        unknown: list[str] = []
-        full: list[str] = []
-        for n in dict.fromkeys(names):
-            spec = st.deferred.get(n)
-            if spec is None:
-                if st.lookup(n) is None:
-                    unknown.append(n)
-                continue
-            if spec in st.loaded:
-                continue
-            if len(st.loaded) >= MAX_LOADED:
-                full.append(n)
-                continue
-            st.loaded.append(spec)
-            loaded.append(n)
-        with spans("runner.brain.load", loaded=loaded, unknown=len(unknown), full=len(full)):
-            pass
-        data: dict[str, Any] = {"loaded": loaded}
-        if unknown:
-            data["unknown"] = unknown
-        if full:
-            data["not_loaded"] = full
-            data["note"] = f"at most {MAX_LOADED} tools can be loaded"
-        return CallResult(LOAD_TOOLS.name, True, data, None)
 
     def _answered(self, answer: str, st: _Turn, spans: SpanFactory) -> Answer:
         """The model's answer: clipped, the number guard counted (log-only), and the code-built
@@ -704,13 +917,15 @@ class BrainRunner(LocalRunner):
 
 __all__ = [
     "CORE_TOOLS",
-    "LOAD_TOOLS",
-    "MAX_LOADED",
     "MAX_REPLY_CHARS",
     "MAX_ROUNDS",
     "NAME",
     "NOT_IN_BRAIN",
     "PROGRESS_TEXT",
     "BrainRunner",
+    "claims_change",
+    "slim_schema",
+    "stub",
     "taints",
+    "unnamed_target",
 ]

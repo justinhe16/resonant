@@ -11,8 +11,8 @@
 - ``cancel_watch{id}`` (L3: do, then report): ``W3`` or ``3``.
 
 They are global builtins, so only the owner (or a principal granted builtins) may call them;
-the principal is the calling task's. No intent offers them; the brain loop lists them in its
-catalog (``load_tools``). Report lines are code-built (``runners.local.REPORTS``).
+the principal is the calling task's. No intent offers them; the brain loop offers them as
+stubs (BR-1b). Report lines are code-built (``runners.local.REPORTS``).
 """
 
 from __future__ import annotations

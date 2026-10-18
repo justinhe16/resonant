@@ -445,7 +445,6 @@ def test_stubbed_writes_never_run_and_asks_start_no_claude(
             "text": "restart ollama, then ask claude about it",
             "expect": {"writes": ["restart_ollama"], "escalate": True},
             "script": [
-                [["load_tools", {"names": ["restart_ollama"]}]],
                 [["restart_ollama", {}]],
                 [["ask_claude", {"question": "why slow?"}]],
             ],
@@ -495,7 +494,6 @@ def test_world_is_seeded(tmp_path: Path) -> None:
                     ["read_file", {"path": "{root}/code/dori/README.md"}],
                     ["list_notes", {}],
                     ["read_transcript", {"code": "R1"}],
-                    ["load_tools", {"names": ["prs"]}],
                 ],
                 [["prs", {}]],
                 "ok",
@@ -671,3 +669,65 @@ def test_a_loop_that_runs_out_of_rounds_escalates_through_the_stub(tmp_path: Pat
     )
     assert r.correct, r.failures
     assert r.outcome.escalated and not r.outcome.stuck and r.outcome.rounds == 8
+
+
+# --- BR-1b ------------------------------------------------------------------------------------
+
+
+def test_a_call_the_model_writes_as_text_counts_as_called(tmp_path: Path) -> None:
+    """The loop runs a call the model wrote as text (``{"tool_call": …}``); the grade sees
+    it like a native one (the model's own record of calls has only native ones)."""
+    r = _one(
+        tmp_path,
+        {
+            "id": "text-call",
+            "category": "notes",
+            "text": "what are my notes?",
+            "world": {"notes": ["call the dentist"]},
+            "expect": {"tools": ["list_notes"], "facts": ["dentist"]},
+            "script": ['{"tool_call":{"args":{},"name":"list_notes"}}', "Call the dentist."],
+        },
+    )
+    assert r.correct, r.failures
+    assert r.outcome.called == ["list_notes"]
+
+
+def test_home_is_the_world_root_during_a_case(tmp_path: Path) -> None:
+    """``~/code/dori`` is the world's ``code/dori`` (as on the Mini, where ``runner.code_dir``
+    is ``~/code``), and HOME comes back after."""
+    import os
+
+    before = os.environ.get("HOME")
+    r = _one(
+        tmp_path,
+        {
+            "id": "tilde",
+            "category": "mini",
+            "text": "what does the dori readme say?",
+            "world": {
+                "repos": [{"name": "dori"}],
+                "files": {"code/dori/README.md": "# dori\nA Slack bot.\n"},
+            },
+            "expect": {"tools": ["read_file"], "facts": ["slack bot"]},
+            "script": [[["read_file", {"path": "~/code/dori/README.md"}]], "A Slack bot."],
+        },
+    )
+    assert r.correct, r.failures
+    assert os.environ.get("HOME") == before
+    with te.world_home(tmp_path):
+        assert Path("~").expanduser() == tmp_path
+    assert os.environ.get("HOME") == before
+
+
+def test_the_linear_fixture_takes_the_args_the_real_extension_does() -> None:
+    """The real linear extension is MCP (Linear's own schemas: list filters optional, create
+    needs a title and a team). The CLI fixture can't mark args optional, so it declares only
+    what a call needs; ``save_issue`` used to require ``id`` even to create."""
+    import yaml
+
+    from resonant_sdk.manifest import Manifest
+
+    m = Manifest.model_validate(yaml.safe_load(te.FIXTURES["linear"].manifest))
+    schemas = {s.name: s.args_schema for s in m.tool_specs()}
+    assert schemas["list_issues"]["required"] == []
+    assert schemas["save_issue"]["required"] == ["team", "title"]

@@ -39,11 +39,12 @@ import contextlib
 import logging
 import signal
 from collections.abc import Generator
+from functools import partial
 from typing import TYPE_CHECKING
 
 import uvicorn
 
-from resonant.api import DaemonState, create_app, local_snapshot
+from resonant.api import DaemonState, create_app, local_snapshot, runner_missing
 from resonant.components import build_components
 from resonant.config import Settings
 from resonant.dashboard.pusher import SnapshotPusher, clear_relay_health
@@ -52,6 +53,7 @@ from resonant.health import Heartbeat, Watchdog, deadman_task, heartbeat_task
 from resonant.loop import Loop, SlotPool
 from resonant.loop.echo import EchoRunner
 from resonant.observability import configure_logging
+from resonant.runners.brain import BrainRunner
 from resonant.runners.claude import cleanup_job
 from resonant.secrets import SecretStore
 from resonant.store.db import open_db, utcnow
@@ -123,6 +125,11 @@ class Daemon:
                 started_at=self.state.started_at,
             )
             self.state.monitor = self.imessage.monitor
+            brain = self.state.components.runners.get("brain")
+            if isinstance(brain, BrainRunner):
+                # The briefing's "Workers aren't set up" uses the dashboard's runner check
+                # (one cached Keychain-by-name and login check for both, api.RUNNER_CHECK_TTL_S).
+                brain.runner_gaps = partial(runner_missing, self.state)
         self.scheduler = Scheduler.from_components(
             settings,
             self.conn,

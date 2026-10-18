@@ -11,13 +11,13 @@ Nothing here is wired into a runner yet; the brain loop (BR-1) uses it.
 
 from resonant.brain.context import (
     BRAIN_SYSTEM,
+    TURN_NUDGE,
     BrainContext,
     CatalogEntry,
     build_context,
     catalog_entries,
     current_turn,
     prefix_hash,
-    render_catalog,
     stable_prefix,
 )
 from resonant.brain.facts import Fact, FactError, FactStore, facts_dir, render_index
@@ -25,6 +25,7 @@ from resonant.brain.history import FoldResult, fold, fold_due, history_messages
 
 __all__ = [
     "BRAIN_SYSTEM",
+    "TURN_NUDGE",
     "BrainContext",
     "CatalogEntry",
     "Fact",
@@ -39,7 +40,6 @@ __all__ = [
     "fold_due",
     "history_messages",
     "prefix_hash",
-    "render_catalog",
     "render_index",
     "stable_prefix",
 ]

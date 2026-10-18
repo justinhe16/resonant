@@ -149,7 +149,10 @@ class ScriptedModel:
         if self.script is not None:
             return self._scripted()
         already = any(
-            m["role"] == "assistant" and m["content"].startswith('{"tool_call"') for m in messages
+            m["role"] == "tool"
+            or m.get("tool_calls")
+            or (m["role"] == "assistant" and m["content"].startswith('{"tool_call"'))
+            for m in messages
         )
         if already or not tools:
             return ModelReply(None, [], None, 1, 10, 5)

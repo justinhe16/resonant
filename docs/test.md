@@ -143,7 +143,7 @@ Numbered L1–L7. `brain.mode` defaults to `intents`; L1 turns the loop on (BR-8
 |---|---|---|---|
 | L1 | Add `brain: {mode: loop}` to `~/.resonant/config.yaml`, restart, text "hey" | A short reply; `sqlite3 ~/.resonant/resonant.db "select runner, kind from tasks order by rowid desc limit 1"` shows `brain|chat`; `ping` and `/status` still answer at once | 📱 + 🖥 |
 | L2 | "what's R4 doing" while a run is open | From `run_activity` (a core tool), no labeler call | 📱 after L1 |
-| L3 | "how much disk is free?" | The model loads `disk` with `load_tools` and answers; a `runner.brain.load` span with `loaded: ["disk"]` | 📱 + 🖥 after L1 |
+| L3 | "how much disk is free?" | The model calls `disk` (a stub: not a core tool) and answers; a `runner.local.tool` span with `tool: "disk"`, and no other tool in its place | 📱 + 🖥 after L1 |
 | L4 | A question that needs a few reads ("which repo has the flaky test?") | `On it…` once if it takes over 6 s, then the answer; never more than 8 `runner.brain.round` spans for the task | 📱 after L1 |
 | L5 | "remember that dori deploys on fridays"; then "read ~/code/dori/README.md and remember what it says about deploys" | The first runs (`Remembered …`); the second asks first (`[A7] … Reply yes / no`, no `yes always`) because the file read tainted the task | 📱 after L1 |
 | L6 | Something the local model can't finish ("compare the last ten runs' failures and summarise the causes") | Either an answer, or `Looking into it…` and then `Claude: …` (auto-escalation) | 📱 after L1 |

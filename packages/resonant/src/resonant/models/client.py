@@ -30,10 +30,10 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Collection, Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, Self, TypedDict, cast
+from typing import Any, Literal, NotRequired, Protocol, Self, TypedDict, cast
 
 import httpx
 import jsonschema
@@ -55,9 +55,22 @@ JSON_NUDGE = (
 # --- types -----------------------------------------------------------------------------
 
 
+class ChatToolCall(TypedDict):
+    """One tool call in an assistant turn, adapter-neutral (``ChatMessage.tool_calls``)."""
+
+    name: str
+    args: dict[str, Any]
+
+
 class ChatMessage(TypedDict):
-    role: Literal["system", "user", "assistant"]
+    """A chat turn. ``tool_calls`` (assistant) and ``role: "tool"`` (one call's result, with
+    ``tool_name``) are the native tool-calling turns: each adapter renders them in its own
+    wire format, so the model's chat template shows them the way it was trained on."""
+
+    role: Literal["system", "user", "assistant", "tool"]
     content: str
+    tool_calls: NotRequired[list[ChatToolCall]]
+    tool_name: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -327,6 +340,92 @@ def validate_tool_calls(
     return kept, dropped
 
 
+_TEXT_CALL_START = re.compile(r'<tool_call>|\{\s*"tool_call"\s*:')
+
+
+def _text_call(obj: object) -> RawToolCall | None:
+    """``{"name", "arguments"|"args"}`` or ``{"tool_call": {...}}`` as a raw call."""
+    if not isinstance(obj, dict):
+        return None
+    outer = cast(dict[str, Any], obj)
+    inner: object = outer.get("tool_call")
+    # ``{"tool_call": {"name", "args"}}``; seen malformed too, with the name outside
+    layers = [cast(dict[str, Any], inner), outer] if isinstance(inner, dict) else [outer]
+    name = next((n for d in layers if isinstance(n := d.get("name"), str) and n), None)
+    if name is None:
+        return None
+    args: object = next(
+        (d[k] for d in layers for k in ("arguments", "args") if k in d), cast(object, {})
+    )
+    return RawToolCall(name, args)
+
+
+_NAME_HEAD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+TEXT_CALL_MAX_CHARS = 4000  # longer replies are prose, not a call (and bound the parsing)
+
+
+def _named_call(body: str, names: Collection[str]) -> RawToolCall | None:
+    """``name``, ``name: {args}`` or ``name({args})`` for a name in ``names``. No regex over
+    the rest (a backtracking pattern there was cubic on long whitespace runs)."""
+    m = _NAME_HEAD.match(body)
+    if m is None or m.group(0) not in names:
+        return None
+    rest = body[m.end() :].strip()
+    if rest.startswith((":", "(")):
+        rest = rest[1:].strip()
+        if rest.endswith(")"):
+            rest = rest[:-1].strip()
+    if not rest:
+        return RawToolCall(m.group(0), {})
+    if not rest.startswith("{"):
+        return None
+    try:
+        return RawToolCall(m.group(0), json.loads(rest))
+    except ValueError:
+        return None
+
+
+def text_tool_calls(text: str | None, names: Collection[str] = ()) -> list[RawToolCall]:
+    """Tool calls the model wrote as text instead of as a native call: a ``<tool_call>``
+    block, a ``{"tool_call": {name, args}}`` object anywhere in the reply, a reply that is
+    only ``{"name", "arguments"}``, or, for a name in ``names``, a reply that is only
+    ``name``, ``name: {args}`` or ``name({args})``. [] when there is none. Names are taken
+    as written (the caller validates them against the offered tools)."""
+    if not text or len(text) > TEXT_CALL_MAX_CHARS:
+        return []
+    body = strip_think(text)
+    if (named := _named_call(body.strip(), names)) is not None:
+        return [named]
+    decoder = json.JSONDecoder()
+    calls: list[RawToolCall] = []
+    for m in _TEXT_CALL_START.finditer(body):
+        start = m.start()
+        if m.group(0) == "<tool_call>":
+            start = m.end()
+            while start < len(body) and body[start].isspace():
+                start += 1
+        try:
+            obj, _ = decoder.raw_decode(body, start)
+        except ValueError:
+            continue
+        if (call := _text_call(obj)) is not None:
+            calls.append(call)
+    if calls:
+        return calls
+    stripped = body.strip()
+    if m := _FENCE.match(stripped):
+        stripped = m.group(1)
+    if stripped.startswith("{") and '"name"' in stripped:
+        try:
+            obj = json.loads(stripped)
+        except ValueError:
+            return []
+        if isinstance(obj, dict) and ("arguments" in obj or "args" in obj):
+            call = _text_call(cast(object, obj))
+            return [call] if call is not None else []
+    return []
+
+
 # --- adapters --------------------------------------------------------------------------
 
 
@@ -356,6 +455,59 @@ class Adapter(Protocol):
     ) -> RawReply: ...
 
 
+def native_messages(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
+    """``ChatMessage``s in Ollama ``/api/chat`` form: an assistant turn's ``tool_calls`` as
+    ``{"function": {"name", "arguments"}}`` (arguments an object), a tool result as
+    ``{"role": "tool", "content", "tool_name"}``. Plain turns pass through unchanged, so a
+    prompt without tool turns is the same request body as before."""
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        msg: dict[str, Any] = {"role": m["role"], "content": m["content"]}
+        if calls := m.get("tool_calls"):
+            msg["tool_calls"] = [
+                {"function": {"name": c["name"], "arguments": c["args"]}} for c in calls
+            ]
+        if (name := m.get("tool_name")) is not None:
+            msg["tool_name"] = name
+        out.append(msg)
+    return out
+
+
+def openai_messages(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
+    """``ChatMessage``s in OpenAI chat-completions form. Tool calls get ids ``call_<n>`` in
+    order and each tool result answers the oldest unanswered call (results follow their
+    calls in order, as the brain loop writes them)."""
+    out: list[dict[str, Any]] = []
+    pending: list[str] = []
+    n = 0
+    for m in messages:
+        role = m["role"]
+        if role == "tool":
+            call_id = pending.pop(0) if pending else f"call_{n}"
+            out.append({"role": "tool", "tool_call_id": call_id, "content": m["content"]})
+            continue
+        msg: dict[str, Any] = {"role": role, "content": m["content"]}
+        if calls := m.get("tool_calls"):
+            wire: list[dict[str, Any]] = []
+            for c in calls:
+                call_id = f"call_{n}"
+                n += 1
+                pending.append(call_id)
+                wire.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": c["name"],
+                            "arguments": json.dumps(c["args"], sort_keys=True),
+                        },
+                    }
+                )
+            msg["tool_calls"] = wire
+        out.append(msg)
+    return out
+
+
 class NativeAdapter:
     """Ollama's native ``/api/chat``. ``think: false`` is a top-level request field."""
 
@@ -375,7 +527,7 @@ class NativeAdapter:
     ) -> RawReply:
         body: dict[str, Any] = {
             "model": self._cfg.name,
-            "messages": messages,
+            "messages": native_messages(messages),
             "stream": False,
             "think": False,
             "options": {"temperature": temperature, "num_predict": max_tokens},
@@ -449,7 +601,7 @@ class OpenAIAdapter:
         try:
             resp = await self._client.chat.completions.create(
                 model=self._cfg.name,
-                messages=cast(list[ChatCompletionMessageParam], messages),
+                messages=cast(list[ChatCompletionMessageParam], openai_messages(messages)),
                 max_tokens=max_tokens,
                 temperature=temperature,
                 response_format=response_format,

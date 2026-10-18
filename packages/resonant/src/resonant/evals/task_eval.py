@@ -76,7 +76,7 @@ import sqlite3
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -107,7 +107,7 @@ from resonant.loop.types import Fail, StepContext, StepOutcome, Task
 from resonant.models import ChatMessage, ModelClient, ModelReply, ProbeResult, SpanFactory
 from resonant.models.bench import percentile
 from resonant.runners.ask import AskRefused, Queued
-from resonant.runners.brain import MAX_ROUNDS, PROGRESS_TEXT
+from resonant.runners.brain import MAX_ROUNDS, PROGRESS_TEXT, BrainRunner
 from resonant.store import repos as repo_store
 from resonant.store import runs as run_store
 from resonant.store import tasks as task_store
@@ -504,21 +504,20 @@ examples: ["what's on my linear", "make a linear ticket for the login bug"]
 approvers: [owner]
 tools:
   list_issues:
-    description: Linear issues, filtered by assignee (me), state, team or query text.
+    description: Your open Linear issues with key, title, state and priority.
     run: python3 cli.py list_issues
     effect: read
-    args: {assignee: string, state: string, query: string}
   get_issue:
     description: One Linear issue by its id or key (like ENG-123), with its details.
     run: python3 cli.py get_issue {id}
     effect: read
     args: {id: string}
   save_issue:
-    description: Create a Linear issue (no id) or update one (with id) - title, description, state.
+    description: Create a Linear issue in a team (its key, like ENG) with a title.
     run: python3 cli.py save_issue
     effect: write
     level: L2
-    args: {id: string, title: string, description: string, team: string, state: string}
+    args: {title: string, team: string}
 """,
         {"list_issues": {"issues": []}},
     ),
@@ -875,7 +874,7 @@ class Outcome:
 
     reply: str
     sends: list[str]
-    called: list[str]  # the model's tool calls, in order (load_tools included)
+    called: list[str]  # the model's tool calls, in order, then any it wrote as text
     rounds: int  # chat_tools calls
     escalated: bool
     approvals: list[str]  # tools the gate asked about
@@ -916,65 +915,100 @@ async def run_case(
     model.reset()
     with tempfile.TemporaryDirectory(prefix="resonant-task-eval-") as tmp:
         root = Path(await asyncio.to_thread(os.path.realpath, tmp))
-        (root / "principals.yaml").write_text(PRINCIPALS_YAML)
-        chat = FakeChatDB(root / "chat.db")
-        settings = eval_settings(root, chat.path, mode, base)
-        now = utcnow()
-        if isinstance(model.inner, ScriptedRoot):
-            model.inner.bind(root, now)
-        conn = open_db(settings.db_path)
-        seed_world(settings, conn, case.world, case.history, now=now)
-        kv_set(conn, "autonomy", "on")
-        kv_set(conn, "imessage.selftest", {"ok": True, "at": iso(now), "detail": "ok"})
-        osa = RecordingOsaRunner(clock)
-        loop = Loop(
-            conn,
-            runners={"echo": EchoRunner()},
-            config=settings.loop,
-            slots=SlotPool(settings.claude.max_concurrent, settings.claude.reserved_oncall_slots),
+        with world_home(root):
+            return await _run_in(case, mode, model, root, base, timeout_s, clock)
+
+
+async def _run_in(
+    case: TaskCase,
+    mode: Mode,
+    model: RecordingModel,
+    root: Path,
+    base: Settings | None,
+    timeout_s: float,
+    clock: Callable[[], float],
+) -> Outcome:
+    """``run_case`` inside its temp home ``root``."""
+    (root / "principals.yaml").write_text(PRINCIPALS_YAML)
+    chat = FakeChatDB(root / "chat.db")
+    settings = eval_settings(root, chat.path, mode, base)
+    now = utcnow()
+    if isinstance(model.inner, ScriptedRoot):
+        model.inner.bind(root, now)
+    conn = open_db(settings.db_path)
+    seed_world(settings, conn, case.world, case.history, now=now)
+    kv_set(conn, "autonomy", "on")
+    kv_set(conn, "imessage.selftest", {"ok": True, "at": iso(now), "detail": "ok"})
+    osa = RecordingOsaRunner(clock)
+    loop = Loop(
+        conn,
+        runners={"echo": EchoRunner()},
+        config=settings.loop,
+        slots=SlotPool(settings.claude.max_concurrent, settings.claude.reserved_oncall_slots),
+    )
+    state = DaemonState(settings, conn, loop, started_at=now)
+    components = build_components(settings, conn, state)
+    state.components = components
+    executor = EvalExecutor(components.executor)
+    components.executor = executor
+    stack = build_imessage_stack(
+        settings,
+        conn,
+        components,
+        loop,
+        daemon_healthy=lambda: True,
+        model=model,
+        osa_runner=osa,
+        started_at=now,
+    )
+    brain = components.runners.get("brain")
+    if isinstance(brain, BrainRunner):
+        # The owner's workers are set up in the world; the eval never asks the Keychain or
+        # the claude CLI (the real check, ClaudeRunner.setup_gaps, is the daemon's).
+        brain.runner_gaps = None
+    asks = EvalAsk(components.principals.owner)
+    components.runners[asks.name] = asks
+    loop.runners[asks.name] = asks
+    baseline = int(conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM tasks").fetchone()[0])
+    await stack.start(loop)
+    loop_task = asyncio.create_task(loop.run(), name="task-eval-loop")
+    try:
+        await wait_until(
+            lambda: stack.channel.health()["last_read_at"] is not None, READY_TIMEOUT_S
         )
-        state = DaemonState(settings, conn, loop, started_at=now)
-        components = build_components(settings, conn, state)
-        state.components = components
-        executor = EvalExecutor(components.executor)
-        components.executor = executor
-        stack = build_imessage_stack(
-            settings,
-            conn,
-            components,
-            loop,
-            daemon_healthy=lambda: True,
-            model=model,
-            osa_runner=osa,
-            started_at=now,
-        )
-        asks = EvalAsk(components.principals.owner)
-        components.runners[asks.name] = asks
-        loop.runners[asks.name] = asks
-        baseline = int(conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM tasks").fetchone()[0])
-        await stack.start(loop)
-        loop_task = asyncio.create_task(loop.run(), name="task-eval-loop")
+        start = clock()
+        chat.add_message(handle=OWNER_HANDLE, text=fill(case.text, root))
+        timed_out = False
         try:
-            await wait_until(
-                lambda: stack.channel.health()["last_read_at"] is not None, READY_TIMEOUT_S
-            )
-            start = clock()
-            chat.add_message(handle=OWNER_HANDLE, text=fill(case.text, root))
-            timed_out = False
-            try:
-                await wait_until(lambda: _settled(conn, baseline), timeout_s, poll_s=0.02)
-                await wait_until(lambda: loop.inflight == 0, timeout_s, poll_s=0.02)
-            except TimeoutError:
-                timed_out = True
-            return _outcome(conn, baseline, osa, model, asks, executor, start, timed_out)
-        finally:
-            await stack.stop()
-            loop.stop()
-            with contextlib.suppress(Exception):
-                await loop_task
-            await stack.aclose()
-            conn.close()
-            chat.close()
+            await wait_until(lambda: _settled(conn, baseline), timeout_s, poll_s=0.02)
+            await wait_until(lambda: loop.inflight == 0, timeout_s, poll_s=0.02)
+        except TimeoutError:
+            timed_out = True
+        return _outcome(conn, baseline, osa, model, asks, executor, start, timed_out)
+    finally:
+        await stack.stop()
+        loop.stop()
+        with contextlib.suppress(Exception):
+            await loop_task
+        await stack.aclose()
+        conn.close()
+        chat.close()
+
+
+@contextlib.contextmanager
+def world_home(root: Path) -> Generator[None]:
+    """``~`` is the world root while a case runs (``HOME``), as the owner's home is on the
+    Mini: ``~/code/dori`` is the world's ``code/dori``, as ``~/code`` is ``runner.code_dir``
+    there. Cases run one at a time; the old value comes back after."""
+    old = os.environ.get("HOME")
+    os.environ["HOME"] = str(root)
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old
 
 
 def _first_task(conn: sqlite3.Connection, baseline: int) -> sqlite3.Row | None:
@@ -1012,6 +1046,7 @@ def _outcome(
     result: dict[str, Any] = {}
     approvals: list[str] = []
     writes: list[str] = []
+    text_calls: list[str] = []  # calls the model wrote as text and the loop ran (BR-1b)
     guard = 0
     if task is not None:
         cp = json.loads(task["checkpoint"] or "{}")
@@ -1030,6 +1065,10 @@ def _outcome(
                     writes.append(str(attrs.get("tool")))
             elif s["name"] == "runner.local.final" and attrs.get("outcome") == "number_guard":
                 guard += 1  # intents: the reply was swapped for a template
+            elif s["name"] == "runner.brain.text_calls":
+                names: Any = attrs.get("tools")
+                if isinstance(names, list):
+                    text_calls += [str(n) for n in cast(list[Any], names)]
             elif s["name"] == "runner.brain.answer":
                 hits = attrs.get("number_guard")
                 guard += hits if isinstance(hits, int) else 0  # loop: counted, reply kept
@@ -1038,7 +1077,7 @@ def _outcome(
     return Outcome(
         reply=reply,
         sends=[m.text for m in sends],
-        called=model.called,
+        called=[*model.called, *text_calls],
         rounds=model.tool_rounds,
         escalated=bool(asks.asks),
         stuck=not asks.asks and result.get("path") == "escalate",

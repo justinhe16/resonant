@@ -155,7 +155,6 @@ async def test_a_spoken_yes_never_approves(
     whisper = fake_whisper(tmp_path, "yes")
     async with start(resonant_home, chat, tmp_path, brain={"whisper_path": str(whisper)}) as b:
         b.model.push(
-            [("load_tools", {"names": ["create_watch"]})],
             [
                 (
                     "create_watch",
@@ -211,7 +210,6 @@ async def test_an_ask_watch_texts_once_when_claude_says_yes(
         resonant_home, chat, tmp_path, ask_args=("--answer", "YES. Back in stock."), **not_quiet()
     ) as b:
         b.model.push(
-            [("load_tools", {"names": ["create_watch"]})],
             [
                 (
                     "create_watch",
