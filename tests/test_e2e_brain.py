@@ -29,7 +29,14 @@ from resonant.e2e.fakes import DEFAULT_FINAL_REPLY, Scripted
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.models import ModelOutputError, ModelUnavailableError
 from resonant.runners.ask import AskRunner, AskScope
-from resonant.runners.brain import CORE_TOOLS, MAX_ROUNDS, PROGRESS_TEXT, BrainRunner
+from resonant.runners.brain import (
+    CORE_TOOLS,
+    MAX_ROUNDS,
+    NOT_IN_BRAIN,
+    PROGRESS_TEXT,
+    TAINTING_BUILTINS,
+    BrainRunner,
+)
 from resonant.runners.local import TOO_MANY_REPLY
 from resonant.secrets import CLAUDE_TOKEN_REF, FakeKeychain, SecretStore
 from resonant.store import brain as brain_store
@@ -207,6 +214,19 @@ async def test_where_is_mycelium_is_answered_from_the_briefing(
         assert (task["kind"], task["status"]) == ("chat", "done")
         assert b.rows("SELECT 1 FROM executions WHERE task_id = ?", task["id"]) == []
         assert b.result(task)["path"] == "llm" and b.result(task)["tools_used"] == []
+
+
+def test_brain_tool_sets_name_registered_builtins(db: sqlite3.Connection) -> None:
+    """A typo in CORE_TOOLS, TAINTING_BUILTINS or NOT_IN_BRAIN would fail silently."""
+    from resonant.api import DaemonState
+    from resonant.components import build_components
+    from resonant.loop import Loop, SlotPool
+
+    settings = load_settings()
+    loop = Loop(db, {}, settings.loop, SlotPool(2, 1))
+    components = build_components(settings, db, DaemonState(settings, db, loop, utcnow()))
+    builtins = {s.name for s in components.registry.specs() if s.extension is None}
+    assert builtins >= CORE_TOOLS | TAINTING_BUILTINS | NOT_IN_BRAIN
 
 
 def test_intents_is_the_default_mode() -> None:
