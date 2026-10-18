@@ -73,7 +73,11 @@ SPECS: tuple[ToolSpec, ...] = (PULSE_PREVIEW, OPEN_ITEMS, BRIEFING_PREVIEW)
 
 
 def pulse_preview(ctx: BuiltinContext) -> dict[str, Any]:
-    return {"text": pulse_job.preview_text(ctx.conn, ctx.clock(), ctx.state.settings.timezone)}
+    settings = ctx.state.settings
+    text = pulse_job.preview_text(
+        ctx.conn, ctx.clock(), settings.timezone, stall_after=settings.pulse.stall
+    )
+    return {"text": text}
 
 
 def open_items(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
@@ -109,7 +113,12 @@ def briefing_preview(ctx: BuiltinContext) -> dict[str, Any]:
     now = ctx.clock()
     tz = ZoneInfo(ctx.state.settings.timezone)
     b = briefing.gather(
-        ctx.conn, owner=ctx.principals.owner, now=now, day=now.astimezone(tz).date(), tz=tz
+        ctx.conn,
+        owner=ctx.principals.owner,
+        now=now,
+        day=now.astimezone(tz).date(),
+        tz=tz,
+        stall_after=ctx.state.settings.pulse.stall,
     )
     # Codes never reach the model: the approvals line becomes a count.
     counted = replace(b, approvals=tuple("" for _ in b.approvals))
