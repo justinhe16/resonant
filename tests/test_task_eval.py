@@ -654,3 +654,20 @@ def test_live_path_uses_one_model_for_every_case(tmp_path: Path) -> None:
     assert data["meta"]["model"] == Settings().model.name and data["meta"]["repeat"] == 2
     assert data["modes"]["loop"]["n"] == 2 and model.calls["tools"] == 2
     assert not (tmp_path / "owner" / "resonant.db").exists()  # the owner's store untouched
+
+
+def test_a_loop_that_runs_out_of_rounds_escalates_through_the_stub(tmp_path: Path) -> None:
+    """The round cap hands the message to ask_claude on its own (BR-1): the eval counts it
+    as an escalation (it queued), not as stuck."""
+    r = _one(
+        tmp_path,
+        {
+            "id": "cap",
+            "category": "mini",
+            "text": "count my notes forever",
+            "expect": {"escalate": True},
+            "script": [[["list_notes", {}]]] * 8,
+        },
+    )
+    assert r.correct, r.failures
+    assert r.outcome.escalated and not r.outcome.stuck and r.outcome.rounds == 8

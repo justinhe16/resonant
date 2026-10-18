@@ -80,7 +80,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 from resonant.api import DaemonState
 from resonant.brain.facts import FactStore, facts_dir
@@ -161,8 +161,7 @@ EXPECT_KEYS = frozenset(
     {"tools", "tools_not", "escalate", "ask", "writes", "facts", "facts_re", "not_facts",
      "max_rounds"}
 )  # fmt: skip
-RUN_STATUSES = ("queued", "running", "waiting", "ready", "merged", "failed", "cancelled",
-                "no_changes", "done")  # fmt: skip
+RUN_STATUSES: tuple[str, ...] = get_args(run_store.Status)
 ROW_KEYS = frozenset({"id", "category", "text", "history", "world", "expect", "script", "note"})
 WORLD_KEYS = frozenset({"repos", "files", "runs", "notes", "reminders", "facts", "extensions"})
 

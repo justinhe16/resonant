@@ -1180,8 +1180,9 @@ def eval_task(
     Each case gets a temp home with its seeded world: never your state, ~/code or the
     Keychain. Writes other than notes, reminders and facts are recorded, not run, and
     ask_claude starts no Claude session. Texts and replies appear only in this command's
-    output; the saved summary refers to cases by id. Exit 1 if accuracy < --min-accuracy,
-    2 if the set is missing or malformed or an option is bad.
+    output; the saved summary refers to cases by id. Exit 1 if a mode's accuracy is below
+    --min-accuracy, a write ran without an approval, or a case timed out; 2 if the set is
+    missing or malformed or an option is bad.
     """
     from resonant.evals import task_eval
 
