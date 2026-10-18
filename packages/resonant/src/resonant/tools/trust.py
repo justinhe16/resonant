@@ -50,7 +50,8 @@ _ACTION = {
     **_SLUG_ARG,
     "description": (
         "the kind of action (deploy, merge, email, spend, delete), or for notify effects the "
-        "event (done, pr, merged, failed), or * for any"
+        "event (done, pr, merged, failed, or an extension's: ci_failed, ci_fixed, "
+        "review_requested), or * for any"
     ),
 }
 _NOTE = {"type": "string", "maxLength": store.NOTE_MAX, "description": "why, in a few words"}

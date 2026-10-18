@@ -187,14 +187,16 @@ def test_urgent_note_texts_are_capped_per_run_an_hour(db: sqlite3.Connection) ->
 # --- the run's item ------------------------------------------------------------------------------
 
 
-def test_notes_collapse_into_the_latest_and_are_news_each_time(db: sqlite3.Connection) -> None:
+def test_notes_collapse_into_the_latest_and_are_status_not_news(db: sqlite3.Connection) -> None:
+    """GH-2: a running run's line (its start, bucket, notes) is status: written told, listed
+    under Still working on when something else is sent, never a reason to send."""
     r = reports(db)
     run = make_run(db, status="running", started_at=NOW)
     first = r.running(replace(run, last_note="schema migrated"), "<30m")
-    pulse_store.mark_told(db, [first], NOW)
-    assert r.running(replace(run, last_note="schema migrated"), "<30m").changed is False
-    latest = r.running(replace(run, last_note="tests green"), "<30m")
-    assert latest.changed and latest.title.endswith("· tests green")
+    assert first.changed is False
+    latest = r.running(replace(run, last_note="tests green"), "30m+")
+    assert not latest.changed and latest.title.endswith("· tests green")
+    assert pulse_store.pending(db, ["normal", "urgent"], NOW) == []
     [item] = [i for i in pulse_store.open_items(db, NOW) if i.key == item_key("R1")]
     assert item.title == "R1 still running · proj · started 14:00 · tests green"
     waiting = r.running(replace(run, last_note="x"), "question")
@@ -253,11 +255,11 @@ def test_compose_puts_workers_in_their_own_section() -> None:
             "Workers:",  # first: it holds a failure nobody was texted
             "🔴 R4 failed: boom",
             f"R3 done: PR #12 (CI green) · {URL}",
-            "R5 still running · proj · started 13:00 · tests",
+            "Still working on: R5",  # status: named, not news
             "[dori] ✓ Dori recovered",
         ]
     )
-    assert {i.key for i in listed} == {"run/r3", "run/r4", "run/r5", "inc"}
+    assert {i.key for i in listed} == {"run/r3", "run/r4", "inc"}
 
 
 def test_running_workers_alone_are_not_news() -> None:
@@ -279,10 +281,14 @@ def test_a_full_pulse_drops_workers_last_and_never_leaves_a_bare_header() -> Non
 
 def test_fit_entries_counts_items_not_headers() -> None:
     a, b = item("core", "run/r1", "R1 a"), item("core", "run/r2", "R2 b")
-    entries: list[tuple[str, pulse_store.Item | None]] = [("Workers:", None), ("R1 a", a),
-                                                          ("R2 b", b)]  # fmt: skip
-    assert pulse_job.fit_entries(entries, 40) == (["Workers:", "R1 a", "R2 b"], [a, b], 0)
+    entries: list[tuple[str, tuple[pulse_store.Item, ...] | None]] = [
+        ("Workers:", None), ("R1 a", (a,)), ("R2 b", (b,)), ("Still working on: R3", ()),
+    ]  # fmt: skip
+    assert pulse_job.fit_entries(entries, 80) == (
+        ["Workers:", "R1 a", "R2 b", "Still working on: R3"], [a, b], 0)  # fmt: skip
     assert pulse_job.fit_entries(entries, 20) == ([], [], 2)  # no bare header
+    both = [("Workers:", None), ("Merged: R1 a, R2 b", (a, b))]
+    assert pulse_job.fit_entries(both, 40) == (["Workers:", "Merged: R1 a, R2 b"], [a, b], 0)
 
 
 async def test_the_pulse_says_a_finished_run_once_across_a_crash() -> None:
@@ -311,11 +317,7 @@ def test_the_briefing_has_a_workers_section_and_marks_it_told(db: sqlite3.Connec
     pulse_store.mark_told(db, [r.running(going, "<30m")], NOW)
     b = briefing.gather(db, owner="owner", now=NOW, day=NOW.date(), tz=ZoneInfo("UTC"))
     text, listed = briefing.render_full(b)
-    assert text.endswith(
-        "Workers:\n"
-        f"R1 done: PR #12 (CI green) · {URL}\n"
-        "R2 still running · proj · started 14:00 · halfway"
-    )
+    assert text.endswith(f"Workers:\nR1 done: PR #12 (CI green) · {URL}\nStill working on: R2 x")
     assert "workers" in briefing.sections(b)
     pulse_store.mark_told(db, listed, NOW)
     assert pulse_store.pending(db, ["normal", "urgent"], NOW) == []
@@ -604,7 +606,8 @@ async def test_an_auto_merge_from_chat_reaches_the_digest(
     assert h.chan.texts() == []
     [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
     assert line.key == "run/r1" and line.title.startswith("R1 merged: PR #41 · ")
-    assert (pulse_job.preview(db) or "").startswith("btw:\nWorkers:\nR1 merged: PR #41")
+    preview = pulse_job.preview(db) or ""
+    assert preview == "btw:\nWorkers:\nMerged: R1 fix it and merge it (#41)"  # GH-2
 
 
 def test_the_deps_line_stays_short() -> None:

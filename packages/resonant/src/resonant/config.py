@@ -362,6 +362,9 @@ class PulseConfig(_Section):
     # duration: 10m, 1h). Capped at half of `gate.approval_ttl_s` (30m by default), so the
     # approval hasn't expired by then.
     remention_after: str = "10m"
+    # GH-2: a run or open PR with no activity this long is flagged once in the progress
+    # rollup ("looks like R3 got dropped, ~5h quiet"). A duration, 1h to 168h.
+    stall_after: str = "4h"
 
     @field_validator("quiet_hours")
     @classmethod
@@ -384,6 +387,17 @@ class PulseConfig(_Section):
             raise ValueError("pulse.remention_after must be between 5m and 24h")
         return v
 
+    @field_validator("stall_after")
+    @classmethod
+    def _stall_after(cls, v: str) -> str:
+        try:
+            seconds = duration_s(v)
+        except ValueError as e:
+            raise ValueError("pulse.stall_after must look like 4h or 90m") from e
+        if not 3600 <= seconds <= 7 * 24 * 3600:
+            raise ValueError("pulse.stall_after must be between 1h and 168h")
+        return v
+
     @property
     def quiet_start(self) -> time:
         return _hhmm_time(self.quiet_hours[:5])
@@ -402,6 +416,10 @@ class PulseConfig(_Section):
     @property
     def remention(self) -> timedelta:
         return timedelta(seconds=duration_s(self.remention_after))
+
+    @property
+    def stall(self) -> timedelta:
+        return timedelta(seconds=duration_s(self.stall_after))
 
 
 _RUNNER_REPO_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")

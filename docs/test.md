@@ -44,6 +44,10 @@ Update a row when you try it, with the date and anything odd.
 | 16i | RC-1 Remote Control: a scratch run ("spawn a claude to check disk usage") | After `On it: R<n> …`, one text `R<n> Remote Control: https://claude.ai/code/session_…`; the link opens the live session in the Claude app; `/runs R<n>` and "what's R<n> doing" show `Remote Control: …` while it runs; the session shows as ended in the app once the run is done (none left open) | 📱 after deploy ❓ |
 | 16j | RC-1 live message: during a longer run, `tell R<n> also add a line to the README` | `→ R<n> (message)`; the worker acts on it in the same session (no new session in the app, transcript shows the message as a user turn) | 📱 after deploy ❓ |
 | 16k | RC-1 with `runner/claude_token` set (token auth) | Probably `R<n>: Remote Control unavailable: …` once, and the run still finishes; `--check` row `runner remote control` FAILs with the reason (advisory) | 🖥 + 📱 optional |
+| 16l | GH-2 rollup: two runs at once, merge one (`/merge R<n>` or a merge rule), leave the other running; wait for the top of the hour | One `btw:` / `Workers:` message: `Merged: R<n> <ask> (#…)` and `Still working on: R<m> <ask>`; no message in hours with nothing new (no "all quiet") | 📱 after deploy ❓ |
+| 16m | GH-2 stall: a run whose PR sits unmerged (status ready) for 4h+ | Once: `Looks like R<n> <ask> (~4h quiet) got dropped. You should take a look.`; not repeated the next hours | 📱 after deploy ❓ |
+| 16n | GH-2 override: "text me right away when CI fails in resonant", then break CI on one of your PRs | `Rule added: text right away on ci_failed in resonant (rule N).`; then `[github] ✗ resonant#… CI failed (…)` within ~10 min; other repos stay quiet. `/rules forget N` after | 📱 after `resonant ext update github` ❓ |
+| 16o | GH-2 on demand: "any of my PRs failing CI?" | The open PRs with CI state (the `prs` tool); no texts arrived on their own for that failure | 📱 after `resonant ext update github` ❓ |
 
 ## Needs the Mini
 
@@ -55,7 +59,7 @@ Update a row when you try it, with the date and anything odd.
 | 20 | `scripts/bootstrap.sh --check` rows for the github pin, secret and jobs | go-live 12, terminal 4 | 🖥 |
 | 21 | `/help github`, `/github prs`, "show my PRs" | go-live 12, iMessage 2–4 | 📱 after 19 |
 | 22 | No token in logs or the DB (`grep`, `sqlite3`) | go-live 12, iMessage 5 | 🖥 |
-| 23 | Watch: baseline silent, then a red and a green CI | go-live 12, iMessage 6–7 | 📱 after 19 |
+| 23 | Watch: baseline silent, then a red CI that doesn't text (GH-2), a merge and a 4h-quiet PR in the hourly rollup | go-live 12, iMessage 6–7 | 📱 after 19 and `resonant ext update github` |
 | 24 | `/ext mute github 1h`, then `off` | go-live 12, iMessage 8 | 📱 after 19 |
 | 25 | Next 08:00 briefing shows `Updates:` / `[github] 3 open PRs, …` | go-live 13.3 | 📱 after 19 |
 | 26 | `/kill` skips jobs and kills running extension processes | go-live 12, iMessage 10 | 📱 + 🖥 (sqlite check) |
