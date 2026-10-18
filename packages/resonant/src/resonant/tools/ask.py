@@ -17,8 +17,8 @@ the read built-ins, connector read tools only, ``dontAsk``): nothing it can do c
 anything, so it needs no approval, and a ``tainted`` task may call it (the gate asks only for
 L2 and L3). What it costs is bounded by the concurrency and the daily cap. It is a global
 builtin, so only the owner (or a principal granted builtins) can call it; the answer goes to
-whoever the calling task belongs to. Its output is untrusted, so the calling task is tainted
-(BR-1 tracks that).
+whoever the calling task belongs to. Its answer is untrusted, so the spec is
+``untrusted=True``: the brain loop taints the calling task (BR-1, D6).
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ ASK_CLAUDE = ToolSpec(
     effect=Effect.READ,
     level=Level.L0,
     timeout_s=10.0,
+    untrusted=True,  # D6: its answer is outside content, so the calling task is tainted
 )
 SPECS: tuple[ToolSpec, ...] = (ASK_CLAUDE,)
 

@@ -485,11 +485,7 @@ class FastPath:
 
         spec = self.registry.get(None, cmd.tool)
         handler = self.handlers.get((None, cmd.tool))
-        if (
-            spec is None
-            or handler is None
-            or not self.principals.can(principal, "request", spec.extension)
-        ):
+        if spec is None or handler is None or not self.principals.may_request(principal, spec):
             return self._result(cmd, NOT_ALLOWED) if cmd.slash else None
         if spec.effect is not Effect.READ:
             # Only reads run here. A side effect never runs inline: a slash command becomes a

@@ -110,6 +110,17 @@ Numbered D1–D6 so they don't collide with other sections' rows. Steps are [`go
 | D5 | Recovery: `kill -CONT $(pgrep -f 'resonant daemon run$')` | One `Resonant: snapshots back` push within a couple of minutes; banner clears; `resonant status` shows `daemon  up` (a watchdog restart is fine) | 🖥 + 📱 after D4 |
 | D6 | Paused shows from away: `/kill` over iMessage, watch the remote dashboard, then `/resume` | Within about a minute it shows paused and autonomy off (the relay keeps pushing while paused); after `/resume` it's back to on; no alert either way | 📱 after D3 |
 
+## Phase 6a: the brain's read tools (BR-2)
+
+Numbered F1–F4. The tools are registered now but reach chat only through the brain loop (BR-1, `brain.mode: loop`); until then F1–F3 wait for it.
+
+| # | Test | Expect | Status |
+|---|---|---|---|
+| F1 | "where is mycelium" | A path under `~/code` (or wherever it is in the read roots), from `search` or `list_dir` | 📱 after BR-1 |
+| F2 | "what's in ~/.ssh/config", "show me dori's .env" | Refused: the path is on the deny list; nothing from the file | 📱 after BR-1 |
+| F3 | "what did R4 say last", "any errors in the log?" | Lines from `read_transcript` / `tail_log`, URLs and handles removed, no tokens | 📱 after BR-1 |
+| F4 | Optional: `brew install ripgrep` (`brain.rg_path`, default `/opt/homebrew/bin/rg`); without it `search` uses the slower bounded Python walk | `/opt/homebrew/bin/rg --version` works | 🖥 |
+
 ## Needs real data or effort
 
 | # | Test | Where | Status |

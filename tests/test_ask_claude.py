@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -20,7 +21,7 @@ import psutil
 import pytest
 
 from resonant import killswitch
-from resonant.config import AskClaudeConfig, BrainConfig, load_settings
+from resonant.config import DEFAULT_READ_DENY, AskClaudeConfig, load_settings
 from resonant.executor import CallContext
 from resonant.gate import Allow, Intent, PolicyGate
 from resonant.gateway.channel import (
@@ -43,12 +44,12 @@ from resonant.runners.ask import (
     STOPPED,
     AskRefused,
     AskRunner,
+    AskScope,
     Queued,
     answer_text,
     ask_argv,
     check_attachment,
     check_init,
-    deny_rules,
     is_draft_tool,
     is_write_tool,
     toolset,
@@ -59,6 +60,7 @@ from resonant.store.db import kv_get, kv_set, utcnow
 from resonant.tools import ToolRegistry
 from resonant.tools import ask as ask_tool
 from resonant.tools.base import BuiltinContext
+from resonant.tools.files import ReadScope, default_roots
 
 FAKE = Path(__file__).parent / "fakes" / "claude"
 TOKEN = "sk-ant-oat01-FAKETOKENVALUE0123456789"
@@ -170,14 +172,11 @@ def make(
     roots = [tmp_path / "code", tmp_path / "resonant", tmp_path / "missing-root"]
     for r in roots[:2]:
         r.mkdir(exist_ok=True)
-    work = tmp_path / "runs"
+    work = tmp_path / "ask"
     keychain = FakeKeychain()
     if token:
         keychain.items[CLAUDE_TOKEN_REF] = TOKEN
-    brain = BrainConfig(
-        read_roots=[tmp_path / "code"],
-        ask_claude=AskClaudeConfig(**(cfg or {})),
-    )
+    scope = AskScope(tuple(roots), DEFAULT_READ_DENY)
     cmd = [sys.executable, str(FAKE), "--notes", str(notes), "--scenario", scenario, *extra]
 
     async def login_check() -> bool:
@@ -186,9 +185,9 @@ def make(
     ch = channel or FakeChannel()
     runner = AskRunner(
         db,
-        brain=brain,
-        roots=roots,
-        work_dir=work,
+        cfg=AskClaudeConfig(**(cfg or {})),
+        scope=scope,
+        ask_root=work,
         channel=ch,
         secrets=SecretStore(keychain),
         owner="justin",
@@ -200,6 +199,10 @@ def make(
         poll_s=0.05,
     )
     return Harness(runner, ch, notes, roots, work, db)
+
+
+def real(p: str | Path) -> str:
+    return os.path.realpath(p)
 
 
 def gone(pid: int) -> bool:
@@ -293,7 +296,7 @@ def test_write_tools_are_never_allowed_whatever_the_config_says() -> None:
     assert set(cal.blocked) == {f"{CAL}create_event", f"{CAL}respond_to_event"}
     assert mail.allowed == (*READ_BUILTINS, f"{GMAIL}search_threads", f"{GMAIL}create_draft")
     assert set(mail.blocked) == {f"{GMAIL}send_message", f"{GMAIL}send_draft"}
-    argv = ask_argv(["claude"], cfg=cfg, brain=BrainConfig(), kind="email", roots=[],
+    argv = ask_argv(["claude"], cfg=cfg, scope=AskScope((), ()), kind="email",
                     api_billing=False)  # fmt: skip
     allowed = argv[argv.index("--allowedTools") + 1].split(",")
     denied = argv[argv.index("--disallowedTools") + 1].split(",")
@@ -315,11 +318,17 @@ def test_init_check() -> None:
     assert why is not None and "WebSearch, WebFetch" in why and "CLI may have changed" in why
 
 
+def _settings_deny(argv: list[str]) -> list[str]:
+    return json.loads(argv[argv.index("--settings") + 1])["permissions"]["deny"]
+
+
 def test_argv_shape(tmp_path: Path) -> None:
-    brain = BrainConfig()
-    roots = [tmp_path / "a", tmp_path / "b"]
-    argv = ask_argv(["/bin/claude"], cfg=brain.ask_claude, brain=brain, kind="general",
-                    roots=roots, api_billing=False)  # fmt: skip
+    cfg = AskClaudeConfig()
+    roots = [tmp_path / "a", tmp_path / "b", tmp_path / "a" / "nested", tmp_path / "gone"]
+    for r in roots[:3]:
+        r.mkdir(parents=True, exist_ok=True)
+    scope = AskScope(tuple(roots), DEFAULT_READ_DENY)
+    argv = ask_argv(["/bin/claude"], cfg=cfg, scope=scope, kind="general", api_billing=False)
     assert argv[:3] == ["/bin/claude", "-p", "--restricted"]
     flag = {k: argv[argv.index(k) + 1] for k in ("--tools", "--permission-mode",
             "--allowedTools", "--output-format", "--max-turns")}  # fmt: skip
@@ -330,45 +339,52 @@ def test_argv_shape(tmp_path: Path) -> None:
         "--output-format": "stream-json",
         "--max-turns": "15",
     }
-    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"] == [str(r) for r in roots]
+    # real top-level roots that exist: the nested one and the missing one are left out
+    adds = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
+    assert adds == [os.path.realpath(roots[0]), os.path.realpath(roots[1])]
     for absent in ("bypassPermissions", "--resume", "--session-id", "--max-budget-usd",
                    "--dangerously-skip-permissions", "Bash", "Write", "Edit"):  # fmt: skip
         assert absent not in argv
     assert "--no-session-persistence" in argv and "--verbose" in argv
-    denied = argv[argv.index("--disallowedTools") + 1].split(",")
+    deny = _settings_deny(argv)
     home = str(Path.home())
-    assert f"Read(/{home}/.ssh/**)" in denied and f"Read(/{home}/Library/**)" in denied
-    assert "Read(**/.env*)" in denied and "Read(**/*.pem)" in denied
+    assert f"Read(/{home}/.ssh/**)" in deny and f"Read(/{home}/Library/**)" in deny
+    assert "Read(**/.env*)" in deny and "Read(**/*.pem)" in deny
+    assert "Read(**/.git/config)" in deny and "Read(**/.ssh/**)" in deny
+    assert not any(
+        r.startswith("Read(") for r in argv[argv.index("--disallowedTools") + 1].split(",")
+    )
     prompt = argv[argv.index("--append-system-prompt") + 1]
     assert "Never send, create, change" in prompt and "1500 characters" in prompt
-    billed = ask_argv(["c"], cfg=brain.ask_claude, brain=brain, kind="general", roots=[],
-                      api_billing=True)  # fmt: skip
+    billed = ask_argv(["c"], cfg=cfg, scope=scope, kind="general", api_billing=True)
     assert billed[billed.index("--max-budget-usd") + 1] == "1"
 
 
-def test_deny_rules_from_config() -> None:
-    brain = BrainConfig(read_deny=["/opt/secret", "~/.kube", "id_*"])
-    assert deny_rules(brain) == [
-        "Read(//opt/secret/**)",
-        f"Read(/{Path.home()}/.kube/**)",
-        "Read(**/id_*)",
-    ]
+def test_scope_is_the_read_tools_scope(tmp_path: Path) -> None:
+    """One source with BR-2: the same roots, DEFAULT_READ_DENY plus brain.read_deny (paths and
+    globs, spaces and commas kept whole in the JSON) and Resonant's own secrets."""
+    s = load_settings(brain={"read_deny": ["/opt/my secret, x", "~/.kube", "id_*"]})
+    scope = AskScope.from_settings(s)
+    assert scope.roots == tuple(default_roots(s))
+    assert scope.deny == (*DEFAULT_READ_DENY, "/opt/my secret, x", "~/.kube", "id_*")
+    assert scope.read() == ReadScope.from_settings(s)
+    rules = scope.deny_rules()
+    assert "Read(//opt/my secret, x/**)" in rules and "Read(**/id_*)" in rules
+    assert f"Read(/{s.db_path})" in rules  # Resonant's own secrets, always
+    assert f"Read(/{s.runner.work_dir}/**)" in rules
+    argv = ask_argv(["c"], cfg=s.brain.ask_claude, scope=scope, kind="general",
+                    api_billing=False)  # fmt: skip
+    assert "Read(//opt/my secret, x/**)" in _settings_deny(argv)
+    roots = load_settings(brain={"read_roots": [str(tmp_path)]})
+    assert AskScope.from_settings(roots).roots == (tmp_path,)
 
 
 def test_config_defaults_and_validation() -> None:
     s = load_settings()
     assert s.brain.ask_claude.concurrency == 1 and s.brain.ask_claude.daily_cap == 30
     assert s.brain.ask_claude.timeout_s == 120 and s.brain.ask_claude.max_turns == 15
-    assert s.brain.read_roots == [Path.home() / "code", Path.home() / "resonant"]
-    assert "~/.ssh" in s.brain.read_deny and ".env*" in s.brain.read_deny
-    from resonant.config import brain_read_roots
-
-    roots = brain_read_roots(s)
-    assert s.logs_dir in roots and s.runner.mirror_dir.parent / "transcripts" in roots
-    with pytest.raises(ValueError, match="absolute"):
-        BrainConfig(read_deny=["relative/dir"])
-    with pytest.raises(ValueError, match=r", \( or \)"):
-        BrainConfig(read_deny=["a,b"])
+    assert s.brain.read_roots is None and s.brain.read_deny == []  # BR-2's defaults
+    assert s.brain.ask_claude.attachment_roots == [Path.home() / "Library/Messages/Attachments"]
     for bad in ("mcp__x__sendMessage", "mcp__x__send-message", "Gmail.send", "list_events"):
         with pytest.raises(ValueError, match="connector tool name"):
             AskClaudeConfig(connector_tools={"email": [bad]})
@@ -402,11 +418,7 @@ def test_attachments_checked(tmp_path: Path) -> None:
     code, msgs = tmp_path / "code", tmp_path / "Library" / "Messages" / "Attachments"
     for d in (code, msgs):
         d.mkdir(parents=True)
-    brain = BrainConfig(
-        read_roots=[code],
-        read_deny=[str(tmp_path / "Library"), ".env*"],
-        ask_claude=AskClaudeConfig(attachment_roots=[msgs]),
-    )
+    scope = AskScope((code,), (str(tmp_path / "Library"), ".env*"), (), (msgs,)).attach()
     shot = msgs / "IMG_1.png"
     shot.write_bytes(b"png")
     ok = code / "notes.txt"
@@ -420,27 +432,26 @@ def test_attachments_checked(tmp_path: Path) -> None:
     outside.write_text("x")
     link = code / "sneaky"
     link.symlink_to(outside)
-    roots = [code]
-    assert check_attachment(str(shot), brain, roots)[0] == shot.resolve()
-    assert check_attachment(str(ok), brain, roots)[0] == ok.resolve()
-    assert "deny list" in str(check_attachment(str(env), brain, roots)[1])
-    assert "may read" in str(check_attachment(str(other / "k.db"), brain, roots)[1])
-    assert "may read" in str(check_attachment(str(outside), brain, roots)[1])
-    assert "may read" in str(check_attachment(str(link), brain, roots)[1])  # symlink out
-    assert "absolute" in str(check_attachment("code/notes.txt", brain, roots)[1])
-    assert "isn't a file" in str(check_attachment(str(code), brain, roots)[1])
+    assert check_attachment(str(shot), scope)[0] == shot.resolve()
+    assert check_attachment(str(ok), scope)[0] == ok.resolve()
+    assert "deny list" in str(check_attachment(str(env), scope)[1])
+    assert "may read" in str(check_attachment(str(other / "k.db"), scope)[1])
+    assert "may read" in str(check_attachment(str(outside), scope)[1])
+    assert "may read" in str(check_attachment(str(link), scope)[1])  # symlink out
+    assert "absolute" in str(check_attachment("code/notes.txt", scope)[1])
+    assert "isn't a file" in str(check_attachment(str(code), scope)[1])
     envdir = code / ".env.d"
     envdir.mkdir()
     (envdir / "x").write_text("SECRET=1")
-    assert "deny list" in str(check_attachment(str(envdir / "x"), brain, roots)[1])
-    upper = BrainConfig(read_roots=[code], read_deny=[str(code / "Private")])
+    assert "deny list" in str(check_attachment(str(envdir / "x"), scope)[1])
+    upper = AskScope((code,), (str(code / "Private"),)).attach()
     (code / "private").mkdir()
     (code / "private" / "p.txt").write_text("x")
-    assert "deny list" in str(check_attachment(str(code / "private" / "p.txt"), upper, roots)[1])
+    assert "deny list" in str(check_attachment(str(code / "private" / "p.txt"), upper)[1])
     big = code / "big.bin"
     with open(big, "wb") as f:
         f.truncate(ask_mod.ATTACH_BYTES + 1)
-    assert "MB" in str(check_attachment(str(big), brain, roots)[1])
+    assert "MB" in str(check_attachment(str(big), scope)[1])
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="F_GETPATH is macOS")
@@ -452,13 +463,13 @@ def test_copy_rechecks_the_opened_file(tmp_path: Path) -> None:
     secret = tmp_path / "ssh"
     secret.mkdir()
     (secret / "id").write_text("KEY")
-    brain = BrainConfig(read_roots=[code], read_deny=[str(secret)])
+    scope = AskScope((code,), (str(secret),)).attach()
     (code / "dir").symlink_to(secret)  # as if swapped in after the check passed
     with pytest.raises(OSError, match=r"deny list|may read"):
-        ask_mod._copy_in(code / "dir" / "id", tmp_path / "out", brain, [code])  # pyright: ignore[reportPrivateUsage]
+        ask_mod._copy_in(code / "dir" / "id", tmp_path / "out", scope)  # pyright: ignore[reportPrivateUsage]
     assert not (tmp_path / "out").exists()
     (code / "ok.txt").write_text("hi")
-    ask_mod._copy_in(code / "ok.txt", tmp_path / "out2", brain, [code])  # pyright: ignore[reportPrivateUsage]
+    ask_mod._copy_in(code / "ok.txt", tmp_path / "out2", scope)  # pyright: ignore[reportPrivateUsage]
     assert (tmp_path / "out2").read_text() == "hi"
 
 
@@ -478,15 +489,16 @@ async def test_answered(db: sqlite3.Connection, tmp_path: Path) -> None:
     assert seen["marker"] == f"ask-{task_id}"
     assert seen["home"] == str(tmp_path / "home")
     assert "Question: where is mycelium?" in seen["prompt"]
-    assert seen["cwd"] == str((h.work / ".ask" / task_id).resolve()) or seen["cwd"] == str(
-        h.work / ".ask" / task_id
-    )
+    assert real(seen["cwd"]) == real(h.work / task_id)
     assert seen["files"] == []
     argv: list[str] = seen["argv"]
     adds = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
-    assert adds == [str(h.roots[0]), str(h.roots[1])]  # the missing root is left out
+    # the missing root is left out; roots are real paths
+    assert adds == [real(h.roots[0]), real(h.roots[1])]
     assert "TOKEN" not in " ".join(argv) and TOKEN not in json.dumps(seen)
-    assert not (h.work / ".ask" / task_id).exists()  # the cwd is removed
+    deny = json.loads(argv[argv.index("--settings") + 1])["permissions"]["deny"]
+    assert f"Read(/{Path.home()}/.ssh/**)" in deny
+    assert not (h.work / task_id).exists()  # the cwd is removed
     row = db.execute("SELECT detail FROM audit_log WHERE action = 'ask.done'").fetchone()
     assert json.loads(row["detail"])["status"] == "answered"
     assert "mycelium" not in row["detail"]  # never the text

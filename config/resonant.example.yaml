@@ -87,6 +87,30 @@ pulse:
   quiet_hours: "00:00-06:00"            # local time in `timezone`; only urgent items go out inside it
   remention_after: 10m                  # a pending approval is mentioned once more after this (capped at half gate.approval_ttl_s)
 
+# The brain's read tools (docs/brain-plan.md D5; read_file, list_dir, search, tail_log,
+# read_transcript) and ask_claude (D8). Defaults shown commented out:
+# brain:
+#   read_roots: null                    # null: runner.code_dir, ~/resonant, ops.repo_path and
+#                                       #   Resonant's logs, docs and run transcripts; a list replaces them
+#   read_deny: []                       # added to the built-in deny list (~/Documents, ~/Library, ~/.ssh,
+#                                       #   ~/.aws, .env*, *.pem, *.key, id_*, credentials, .git/config, ...);
+#                                       #   "/abs" or "~/x" is a path, anything else a glob ("*.secret")
+#   rg_path: /opt/homebrew/bin/rg       # ripgrep for search; missing: a bounded Python search
+#   ask_claude:                         # a read-only Claude session per hard question (BR-5);
+#                                       #   it reads the same roots and deny list
+#     enabled: true
+#     concurrency: 1                    # sessions at once, apart from the worker slots
+#     daily_cap: 30                     # asks a day
+#     timeout_s: 120
+#     max_turns: 15
+#     reply_max_chars: 1500
+#     max_budget_usd: 1.0               # only with runner/anthropic_key
+#     connector_tools:                  # exact claude.ai read tool names; all must be present
+#       calendar: [mcp__claude_ai_Google_Calendar__list_events, ...]
+#       email: [mcp__claude_ai_Gmail__search_threads, mcp__claude_ai_Gmail__get_thread]
+#     draft_tools: [mcp__claude_ai_Gmail__create_draft]
+#     attachment_roots: [~/Library/Messages/Attachments]
+
 # Claude workers (docs/employee-plan.md, go-live step 14). Every key has a default except
 # github_app, which runs need (Claude adds it when you give it the IDs). Defaults shown;
 # github_app and repos are examples:
@@ -118,21 +142,3 @@ pulse:
 #       path: ~/work/dori               # checkout elsewhere than <code_dir>/dori
 #       allow_github_changes: false     # refuses .github/ changes (unset keeps the default: on)
 #       quote_ask: true                 # quote your ask in the PR body (unset keeps the default)
-
-# The brain (docs/brain-plan.md). Defaults shown.
-# brain:
-#   read_roots: [~/code, ~/resonant]    # plus Resonant's logs and run transcripts, always
-#   read_deny: [~/Documents, ~/Library, ~/.ssh, ~/.gnupg, ~/.aws, ".env*", "*.pem", "*.key", "credentials*"]
-#   ask_claude:                         # a read-only Claude session per hard question (BR-5)
-#     enabled: true
-#     concurrency: 1                    # sessions at once, apart from the worker slots
-#     daily_cap: 30                     # asks a day
-#     timeout_s: 120
-#     max_turns: 15
-#     reply_max_chars: 1500
-#     max_budget_usd: 1.0               # only with runner/anthropic_key
-#     connector_tools:                  # exact claude.ai read tool names; all must be present
-#       calendar: [mcp__claude_ai_Google_Calendar__list_events, ...]
-#       email: [mcp__claude_ai_Gmail__search_threads, mcp__claude_ai_Gmail__get_thread]
-#     draft_tools: [mcp__claude_ai_Gmail__create_draft]
-#     attachment_roots: [~/Library/Messages/Attachments]

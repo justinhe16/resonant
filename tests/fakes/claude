@@ -90,6 +90,7 @@ def _ask_mode() -> None:
     aap.add_argument("--permission-mode")
     aap.add_argument("--allowedTools")
     aap.add_argument("--disallowedTools")
+    aap.add_argument("--settings")
     aap.add_argument("--add-dir", action="append", default=[])
     aap.add_argument("--no-session-persistence", action="store_true")
     aap.add_argument("--output-format")

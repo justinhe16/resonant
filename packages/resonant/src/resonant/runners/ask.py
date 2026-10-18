@@ -14,12 +14,13 @@ The session::
 - **Read only by construction** (an email ask's draft tool aside: a draft, never a send).
   ``--restricted`` drops every built-in that runs code and ignores the owner's settings files
   (so no ``allow`` rule of theirs widens it), and confines the file tools to the cwd (an empty
-  per-ask dir under ``runner.work_dir/.ask``) and the ``--add-dir`` roots
-  (``config.brain_read_roots``). ``dontAsk`` denies every tool not on ``--allowedTools``. The
+  per-ask dir under ``<RESONANT_HOME>/ask``) and the ``--add-dir`` roots (the read tools'
+  roots, :class:`AskScope`). ``dontAsk`` denies every tool not on ``--allowedTools``. The
   allowlist is the five read built-ins plus, for ``email`` and ``calendar`` asks only, the
   connector read tools in ``brain.ask_claude.connector_tools`` (and ``draft_tools`` for
   email); a name that reads as a write (:func:`is_write_tool`) is never on it, whatever the
-  config says. ``brain.read_deny`` becomes ``Read(...)`` deny rules.
+  config says. The read tools' deny list (``DEFAULT_READ_DENY`` + ``brain.read_deny`` +
+  Resonant's own secrets) becomes ``Read(...)`` deny rules in ``--settings``.
 - **The init event is checked.** Its ``tools`` must hold every read built-in and every
   connector read tool the kind needs, else the session is killed at once and the ask refused
   with the missing names (:func:`check_init`). Probed on 2.1.302: with ``--restricted`` the
@@ -50,7 +51,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
-import fnmatch
 import json
 import logging
 import os
@@ -70,7 +70,7 @@ from zoneinfo import ZoneInfo
 import psutil
 
 from resonant import killswitch
-from resonant.config import AskClaudeConfig, BrainConfig
+from resonant.config import DEFAULT_READ_DENY, AskClaudeConfig, Settings
 from resonant.gate.codes import mask_codes
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import (
@@ -94,6 +94,7 @@ from resonant.secrets import SecretError, SecretStore, load_runner_secrets
 from resonant.store import tasks as task_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
+from resonant.tools.files import ReadScope, default_roots, resonant_secrets
 
 log = logging.getLogger(__name__)
 
@@ -265,26 +266,87 @@ def check_init(tools: Sequence[str], ts: Toolset, kind: Kind) -> str | None:
     return NOT_REACHABLE.format(what=KIND_NAMES[kind], names=names)
 
 
-def deny_rules(brain: BrainConfig) -> list[str]:
-    """``brain.read_deny`` as ``Read(...)`` permission rules: a path and all under it
-    (``//`` marks an absolute path), a file-name glob anywhere."""
-    rules = [f"Read(/{p}/**)" for p in brain.deny_paths()]
-    rules += [f"Read(**/{g})" for g in brain.deny_globs()]
-    return rules
+@dataclass(frozen=True)
+class AskScope:
+    """What an ask may read: the same sources as the read tools (``tools/files.py``,
+    BR-2). ``roots``: ``brain.read_roots`` or ``files.default_roots``; ``deny``:
+    ``config.DEFAULT_READ_DENY`` plus ``brain.read_deny`` (an entry starting with ``/`` or
+    ``~`` is a path, anything else a glob over consecutive path components); ``always``:
+    Resonant's own secrets (``files.resonant_secrets``), refused whatever the config says.
+    ``attachment_roots`` may also hold attachments (Messages' attachments, inside the denied
+    ``~/Library``, are carved out for attachments only)."""
+
+    roots: tuple[Path, ...]
+    deny: tuple[str, ...]
+    always: tuple[Path, ...] = ()
+    attachment_roots: tuple[Path, ...] = ()
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> AskScope:
+        brain = settings.brain
+        roots = brain.read_roots if brain.read_roots is not None else default_roots(settings)
+        return cls(
+            tuple(roots),
+            (*DEFAULT_READ_DENY, *brain.read_deny),
+            tuple(resonant_secrets(settings)),
+            tuple(brain.ask_claude.attachment_roots),
+        )
+
+    def read(self) -> ReadScope:
+        """The read tools' scope over these sources (real roots, folded deny entries)."""
+        return ReadScope.build(self.roots, self.deny, self.always)
+
+    def attach(self) -> ReadScope:
+        """The scope for attachments: the roots plus ``attachment_roots``, without the deny
+        paths that contain an attachment root (``~/Library``); globs and ``always`` stay."""
+        attach = [Path(os.path.realpath(r)) for r in self.attachment_roots]
+
+        def holds_attach_root(entry: str) -> bool:
+            if not entry.startswith(("/", "~")):
+                return False
+            d = _folded(Path(os.path.realpath(Path(entry).expanduser())))
+            return any(_folded(a)[: len(d)] == d for a in attach)
+
+        deny = [e for e in self.deny if not holds_attach_root(e)]
+        return ReadScope.build([*self.roots, *self.attachment_roots], deny, self.always)
+
+    def add_dirs(self) -> list[Path]:
+        """``--add-dir`` values: the real top-level roots that exist."""
+        return [r for r in self.read().top_roots() if r.is_dir()]
+
+    def deny_rules(self) -> list[str]:
+        """The deny list as ``Read(...)`` permission rules for ``--settings``: a path (as
+        given and real; ``//`` marks an absolute path) and all under it, a glob anywhere and
+        all under it."""
+        rules: list[str] = []
+        paths = [Path(e).expanduser() for e in self.deny if e.startswith(("/", "~"))]
+        for p in [*paths, *self.always]:
+            for q in dict.fromkeys([p, Path(os.path.realpath(p))]):
+                rules += [f"Read(/{q})", f"Read(/{q}/**)"]
+        for e in self.deny:
+            if not e.startswith(("/", "~")) and (g := e.strip("/")):
+                rules += [f"Read(**/{g})", f"Read(**/{g}/**)"]
+        return list(dict.fromkeys(rules))
+
+
+def _folded(p: Path) -> tuple[str, ...]:
+    return tuple(unicodedata.normalize("NFC", x).casefold() for x in p.parts)
 
 
 def ask_argv(
     head: Sequence[str],
     *,
     cfg: AskClaudeConfig,
-    brain: BrainConfig,
+    scope: AskScope,
     kind: Kind,
-    roots: Sequence[Path],
     api_billing: bool,
 ) -> list[str]:
-    """The session's argv (the question goes on stdin)."""
+    """The session's argv (the question goes on stdin). The ``Read`` deny rules go in
+    ``--settings`` (JSON: a deny entry may hold a space or a comma, which the
+    ``--disallowedTools`` list would split); ``--settings`` still applies under
+    ``--restricted``."""
     ts = toolset(cfg, kind)
-    denied = [*cfg_writes(cfg), *ts.blocked]
+    denied = [*dict.fromkeys([*cfg_writes(cfg), *ts.blocked])]
     argv = [
         *head,
         "-p",
@@ -296,9 +358,11 @@ def ask_argv(
         "--allowedTools",
         ",".join(ts.allowed),
         "--disallowedTools",
-        ",".join([*dict.fromkeys(denied), *deny_rules(brain)]),
+        ",".join(denied),
+        "--settings",
+        json.dumps({"permissions": {"deny": scope.deny_rules()}}),
     ]
-    for root in roots:
+    for root in scope.add_dirs():
         argv += ["--add-dir", str(root)]
     argv += [
         "--no-session-persistence",
@@ -358,35 +422,19 @@ def has_proposal(text: str) -> bool:
 # --- attachments ---------------------------------------------------------------------------
 
 
-def _under(path: Path, roots: Sequence[Path]) -> bool:
-    """``path`` is a root or inside one, compared case-insensitively (APFS is, by default:
-    ``~/code/.SSH`` is ``~/code/.ssh``)."""
-    parts = [x.casefold() for x in path.parts]
-    for r in roots:
-        rp = [x.casefold() for x in r.parts]
-        if parts[: len(rp)] == rp:
-            return True
-    return False
-
-
-def _real(p: Path) -> Path:
-    return Path(os.path.realpath(p))
-
-
-def check_attachment(
-    raw: str, brain: BrainConfig, roots: Sequence[Path]
-) -> tuple[Path | None, str | None]:
-    """``(real path, None)`` for a file an ask may carry, else ``(None, why)``. It must be a
-    regular file of at most ``ATTACH_BYTES`` whose real path is under a read root or an
-    attachment root, not under a ``read_deny`` path (an attachment root inside one, like
-    Messages' attachments inside ``~/Library``, is carved out) and not matching a deny glob."""
+def check_attachment(raw: str, scope: ReadScope) -> tuple[Path | None, str | None]:
+    """``(real path, None)`` for a file an ask may carry, else ``(None, why)``. ``scope`` is
+    ``AskScope.attach()``: the path as given and its real path must pass the deny list, the
+    real path must be inside a root, and it must be a regular file of at most
+    ``ATTACH_BYTES``."""
     path = Path(raw).expanduser()
     if not path.is_absolute():
         return None, "attachments must be absolute paths"
-    real = _real(path)
-    why = _refusal(real, brain, roots)
-    if why is not None:
-        return None, f"{path.name} {why}"
+    real = Path(os.path.realpath(path))
+    if scope.denied(path) or scope.denied(real):
+        return None, f"{path.name} is on the deny list"
+    if not scope.inside(real):
+        return None, f"{path.name} isn't in a folder I may read"
     try:
         st = os.stat(real)
     except OSError:
@@ -398,20 +446,6 @@ def check_attachment(
     return real, None
 
 
-def _refusal(real: Path, brain: BrainConfig, roots: Sequence[Path]) -> str | None:
-    """Why a resolved path may not be attached, or None. A deny glob is matched against every
-    component (``.env.d/x`` is denied too)."""
-    attach = [_real(r) for r in brain.ask_claude.attachment_roots]
-    if not _under(real, [*(_real(r) for r in roots), *attach]):
-        return "isn't in a folder I may read"
-    globs = [g.casefold() for g in brain.deny_globs()]
-    if any(fnmatch.fnmatchcase(part.casefold(), g) for part in real.parts for g in globs):
-        return "is on the deny list"
-    if _under(real, [_real(p) for p in brain.deny_paths()]) and not _under(real, attach):
-        return "is on the deny list"
-    return None
-
-
 def _fd_path(fd: int) -> Path | None:
     """The real path of an open file (macOS ``F_GETPATH``), or None where there is none."""
     getpath = getattr(fcntl, "F_GETPATH", None)
@@ -421,7 +455,7 @@ def _fd_path(fd: int) -> Path | None:
     return Path(raw.split(b"\0", 1)[0].decode(errors="surrogateescape"))
 
 
-def _copy_in(src: Path, dest: Path, brain: BrainConfig, roots: Sequence[Path]) -> None:
+def _copy_in(src: Path, dest: Path, scope: ReadScope) -> None:
     """Copy one checked attachment into the ask dir, never through a symlink. ``O_NOFOLLOW``
     covers only the last component, so the opened file's own path is checked again: a parent
     directory swapped for a link since the check can't carry a denied file in."""
@@ -432,9 +466,8 @@ def _copy_in(src: Path, dest: Path, brain: BrainConfig, roots: Sequence[Path]) -
             raise OSError("not a regular file under the size cap")
         opened = _fd_path(fd)
         if opened is not None:
-            why = _refusal(_real(opened), brain, roots)
-            if why is not None:
-                raise OSError(f"{src.name} {why}")
+            if scope.denied(opened) or not scope.inside(opened):
+                raise OSError(f"{src.name} changed while it was copied (deny list or outside)")
         else:  # no F_GETPATH: at least the same file the path resolves to now
             now = os.stat(src)
             if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
@@ -473,9 +506,9 @@ class AskRunner:
         self,
         conn: sqlite3.Connection,
         *,
-        brain: BrainConfig,
-        roots: Sequence[Path],
-        work_dir: Path,
+        cfg: AskClaudeConfig,
+        scope: AskScope,
+        ask_root: Path,
         channel: Channel,
         secrets: SecretStore,
         owner: str,
@@ -490,16 +523,16 @@ class AskRunner:
         kill_grace_s: float = KILL_GRACE_S,
         defer_s: float = DEFER_S,
     ) -> None:
-        """``roots``: the read roots (``config.brain_read_roots``), each an ``--add-dir`` when
-        it exists. ``work_dir``: ``runner.work_dir``; each ask gets an empty cwd under its
-        ``.ask``. ``guard``: ``runner.guard`` (the owner's login is used only with it off).
-        ``create_task`` inserts the task and wakes the loop (``Loop.create_task``).
-        ``claude_cmd``, ``home`` and ``login_check`` are seams for tests."""
+        """``scope``: what an ask may read (``AskScope.from_settings``, the read tools'
+        sources). ``ask_root``: where each ask gets an empty cwd (``<RESONANT_HOME>/ask``: not
+        under ``runner.work_dir``, which the deny list refuses). ``guard``: ``runner.guard``
+        (the owner's login is used only with it off). ``create_task`` inserts the task and
+        wakes the loop (``Loop.create_task``). ``claude_cmd``, ``home`` and ``login_check`` are
+        seams for tests."""
         self.conn = conn
-        self.brain = brain
-        self.cfg = brain.ask_claude
-        self.roots = tuple(roots)
-        self.ask_root = work_dir / ".ask"
+        self.cfg = cfg
+        self.scope = scope
+        self.ask_root = ask_root
         self.channel = channel
         self.secrets = secrets
         self.owner = owner
@@ -547,7 +580,7 @@ class AskRunner:
             return AskRefused(f"At most {ATTACH_MAX} attachments.")
         checked: list[str] = []
         for raw in attachments:
-            real, why = check_attachment(raw, self.brain, self.roots)
+            real, why = check_attachment(raw, self.scope.attach())
             if real is None:
                 return AskRefused(f"Can't attach that: {why}.")
             checked.append(str(real))
@@ -650,8 +683,7 @@ class AskRunner:
             env["ANTHROPIC_API_KEY"] = secrets.anthropic_key
         marker = f"ask-{task.id}"
         env[MARKER_ENV] = marker
-        roots = [r for r in self.roots if r.is_dir()]
-        argv = ask_argv(head, cfg=self.cfg, brain=self.brain, kind=kind, roots=roots,
+        argv = ask_argv(head, cfg=self.cfg, scope=self.scope, kind=kind,
                         api_billing=source == "api_key")  # fmt: skip
         ask_dir = self.ask_root / task.id
         try:
@@ -685,16 +717,17 @@ class AskRunner:
         if ask_dir.exists():
             shutil.rmtree(ask_dir)
         ask_dir.mkdir(parents=True, mode=0o700)
+        attach = self.scope.attach()
         names: list[str] = []
         items = cast(list[Any], attachments) if isinstance(attachments, list) else []
         for i, raw in enumerate(items, 1):
             if not isinstance(raw, str):
                 continue
-            real, why = check_attachment(raw, self.brain, self.roots)  # again: it may have moved
+            real, why = check_attachment(raw, attach)  # again: it may have moved
             if real is None:
                 raise OSError(why)
             name = f"attachment-{i}{Path(real).suffix.lower()[:8]}"
-            _copy_in(real, ask_dir / name, self.brain, self.roots)
+            _copy_in(real, ask_dir / name, attach)
             names.append(name)
         return names
 

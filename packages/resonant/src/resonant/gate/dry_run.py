@@ -45,7 +45,7 @@ class DryRunGate:
         registered = self.registry.get(intent.extension, intent.tool)
         if registered is None or registered != intent.spec:
             decision = Deny(f"tool {intent.tool!r} is not registered with this spec")
-        elif not self.principals.can(intent.principal, "request", intent.extension):
+        elif not self.principals.may_request(intent.principal, intent.spec):
             decision = Deny(f"{intent.principal} may not request {intent.extension or 'global'}")
         elif intent.effect is Effect.READ and intent.level is Level.L0:
             token = secrets.token_urlsafe(16)

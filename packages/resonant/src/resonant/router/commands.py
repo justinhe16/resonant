@@ -764,7 +764,7 @@ def can_request(
 ) -> bool:
     """``tool`` (a builtin, or ``extension``'s) is registered and ``principal`` may request it."""
     spec = registry.get(extension, tool)
-    return spec is not None and principals.can(principal, "request", spec.extension)
+    return spec is not None and principals.may_request(principal, spec)
 
 
 def search(query: str, commands: Iterable[Command]) -> list[Command]:

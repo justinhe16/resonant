@@ -10,6 +10,11 @@ Invariants, enforced here at registration:
   it and asks a plain yes otherwise. A tool that can't be undone declares L1 (yes <code>).
 - ``commit=True`` marks irreversible user-visible actions (send, pay, delete). These always
   pause for approval inside a computer-use scope, so they must have a side effect.
+- ``untrusted=True`` marks a tool whose result carries outside content (file text, logs, a
+  worker's transcript): a loop that sees one treats the task as tainted (docs/brain-plan.md
+  D6). Extension and MCP results are outside content whatever the flag says.
+- ``grant`` names a builtin a member may request through ``grants: {"builtin:<grant>":
+  [request]}`` (``resonant.principals``). Only global L0 reads can carry one.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ DEFAULT_LEVEL: dict[Effect, Level] = {
 }
 
 TOOL_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
+GRANT_PATTERN = r"^[a-z][a-z0-9_-]{0,31}$"
 
 
 class ToolSpec(BaseModel):
@@ -59,6 +65,8 @@ class ToolSpec(BaseModel):
     timeout_s: float = Field(default=30.0, gt=0)
     secrets: tuple[str, ...] = ()
     commit: bool = False
+    untrusted: bool = False
+    grant: str | None = Field(default=None, pattern=GRANT_PATTERN)
 
     @model_validator(mode="after")
     def _invariants(self) -> Self:
@@ -68,6 +76,10 @@ class ToolSpec(BaseModel):
             raise ValueError(f"{self.name}: read tools without secrets are always L0")
         if self.commit and self.effect is Effect.READ:
             raise ValueError(f"{self.name}: commit tools must have a side effect")
+        if self.grant is not None and (
+            self.extension is not None or self.effect is not Effect.READ or self.secrets
+        ):
+            raise ValueError(f"{self.name}: only builtin L0 reads can carry a member grant")
         return self
 
     @property

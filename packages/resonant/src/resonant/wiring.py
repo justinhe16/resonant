@@ -78,7 +78,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from resonant.components import Components
-from resonant.config import ModelConfig, Settings, brain_read_roots
+from resonant.config import ModelConfig, Settings
 from resonant.executor import ToolFailed
 from resonant.extensions.briefing import JOB_ID as BRIEFING_JOB
 from resonant.extensions.host import ExtensionHealth, ExtensionHost, send_alerts
@@ -95,7 +95,7 @@ from resonant.monitor import HealthMonitor
 from resonant.ops import SubprocessRunner, back_up
 from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
-from resonant.runners.ask import AskRunner
+from resonant.runners.ask import AskRunner, AskScope
 from resonant.runners.claude import ClaudeRunner
 from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
@@ -355,9 +355,9 @@ def build_imessage_stack(
     # ask_claude (BR-5): a read-only Claude session per question, apart from the worker slots
     asks = AskRunner(
         conn,
-        brain=settings.brain,
-        roots=brain_read_roots(settings),
-        work_dir=settings.runner.work_dir,
+        cfg=settings.brain.ask_claude,
+        scope=AskScope.from_settings(settings),  # the read tools' roots and deny list (BR-2)
+        ask_root=settings.home / "ask",
         channel=channel,
         secrets=components.executor.secrets or SecretStore(),
         owner=components.principals.owner,

@@ -654,65 +654,89 @@ def _mcp_names(tools: list[str]) -> list[str]:
     return tools
 
 
-def _read_roots() -> list[Path]:
-    return [Path("~/code"), Path("~/resonant")]
-
-
-def _read_deny() -> list[str]:
-    return [
-        "~/Documents",
-        "~/Library",
-        "~/.ssh",
-        "~/.gnupg",
-        "~/.aws",
-        ".env*",
-        "*.pem",
-        "*.key",
-        "credentials*",
-    ]
+# Refused by the read tools even inside a read root, always (docs/brain-plan.md D5);
+# ``brain.read_deny`` adds to these. An entry starting with ``/`` or ``~`` is a path (it and
+# everything under it); anything else is a glob matched against consecutive path components
+# (``*.pem`` against every name, ``.git/config`` against every pair).
+DEFAULT_READ_DENY: tuple[str, ...] = (
+    "~/Documents",
+    "~/Library",  # Mail, Messages, the Keychains, app data
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.config/gh",
+    "~/.docker",
+    "~/.kube",
+    ".env*",
+    "*.env",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.keychain*",
+    "id_*",
+    "credentials",
+    "credentials.*",
+    ".credentials*",
+    "*_credentials.json",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git/config",
+    # The same credential dirs anywhere (a copy in a repo, a mounted home).
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".pgpass",
+    ".htpasswd",
+    "*.p8",
+    "*.jks",
+    "*.keystore",
+    "*.tfstate",
+    "*.tfstate.*",
+    "service-account*.json",
+    ".*_history",
+)
 
 
 class BrainConfig(_Section):
-    """The brain (docs/brain-plan.md). ``read_roots`` and ``read_deny`` are shared by the read
-    tools (D5, ``tools/files.py``) and ``ask_claude`` (D8)."""
+    """The brain (docs/brain-plan.md). BR-2: where the read tools (``tools/files.py``) look."""
 
-    # What may be read, besides Resonant's own logs and run transcripts (always added, see
-    # ``brain_read_roots``): the owner's code and Resonant's checkout (its docs).
-    read_roots: list[Path] = Field(default_factory=_read_roots, validate_default=True)
-    # Never read, even inside a root. An entry with a ``/`` (``~/.ssh``) is a path: it and
-    # everything under it. One without (``.env*``) is a file-name glob, matched anywhere.
-    read_deny: list[str] = Field(default_factory=_read_deny)
+    # Where read_file, list_dir and search may look. Unset: runner.code_dir, ~/resonant (and
+    # ops.repo_path), and Resonant's logs, docs and run transcripts. Set: exactly these.
+    read_roots: list[Path] | None = None
+    # Added to DEFAULT_READ_DENY (which always applies), checked before the roots. Resonant's
+    # own secrets (the DB, run-secrets, ext-data, run dirs) are refused whatever this says.
+    read_deny: list[str] = Field(default_factory=list[str])
+    # ripgrep for `search`, by absolute path. Missing: a bounded Python search instead.
+    rg_path: Path | None = Path("/opt/homebrew/bin/rg")
+    # ask_claude (BR-5, docs/brain-plan.md D8): reads the same roots and deny list.
     ask_claude: AskClaudeConfig = Field(default_factory=AskClaudeConfig)
 
     @field_validator("read_roots")
     @classmethod
-    def _expand_roots(cls, v: list[Path]) -> list[Path]:
-        return [_absolute(p.expanduser(), "brain.read_roots") for p in v]
+    def _roots(cls, v: list[Path] | None) -> list[Path] | None:
+        if v is None:
+            return None
+        return [_absolute(p.expanduser(), "brain.read_roots entries") for p in v]
 
     @field_validator("read_deny")
     @classmethod
     def _deny(cls, v: list[str]) -> list[str]:
         for entry in v:
-            if not entry.strip() or any(c in entry for c in ",()"):
-                raise ValueError(f"brain.read_deny entry {entry!r} is empty or has , ( or )")
-            if "/" in entry and not Path(entry).expanduser().is_absolute():
-                raise ValueError(f"brain.read_deny path {entry!r} must be absolute or ~/...")
+            if not entry.strip() or "\0" in entry or entry.strip() != entry:
+                raise ValueError(
+                    "brain.read_deny entries must be non-empty, without NUL or edge spaces"
+                )
         return v
 
-    def deny_paths(self) -> list[Path]:
-        """The path entries of ``read_deny``, expanded."""
-        return [Path(e).expanduser() for e in self.read_deny if "/" in e]
-
-    def deny_globs(self) -> list[str]:
-        """The file-name glob entries of ``read_deny``."""
-        return [e for e in self.read_deny if "/" not in e]
-
-
-def brain_read_roots(settings: Settings) -> list[Path]:
-    """``brain.read_roots`` plus Resonant's logs and the run transcripts, wherever
-    ``RESONANT_HOME`` and ``runner.mirror_dir`` put them."""
-    extra = [settings.logs_dir, settings.runner.mirror_dir.parent / "transcripts"]
-    return list(dict.fromkeys([*settings.brain.read_roots, *extra]))
+    @field_validator("rg_path")
+    @classmethod
+    def _rg(cls, v: Path | None) -> Path | None:
+        return _absolute(v, "brain.rg_path") if v is not None else None
 
 
 class Settings(BaseSettings):
