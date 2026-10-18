@@ -355,7 +355,7 @@ What you get ([`employee-plan.md`](employee-plan.md)): you text Resonant like an
    - `runner secret runner/claude_token (or runner/anthropic_key)`: `PASS  present (value not read)`, or with the guard off and no token `PASS  not set: your own claude login works (guard off)`;
    - `runner secret runner/github_token` and `runner secret runner/github_app_key`: `PASS  present (value not read)`. Until steps 3–4 are done, their rows (and `runner github app`) say `FAIL  … workers still run; needed to push and open PRs: …`: advisory, not a blocker;
    - `runner secret runner/github_public_token (fork runs)`: `PASS`, or `SKIP` if you skipped step 5;
-   - `runner code dir`: `SKIP` until the first run creates `~/code` (it clones a repo there the first time it is used), then `PASS`;
+   - `runner code dir`: `SKIP` until adding a repo (or its first run) creates `~/code` by cloning the repo there, then `PASS`;
    - `runner repos`: `SKIP` is fine. Repos don't need listing: they are registered the first time you name one (or `/repo add`). An entry in `runner.repos` is only a per-repo override (`path` for a checkout outside `~/code`, `allow_github_changes: false`, `base`);
    - four `SKIP  owner step` rows: the first-run checks below and branch protection;
    - for each `runner.repos` entry, `runner repo <name> has CI`: `SKIP  no mirror yet` until its first run, then `PASS` (a `FAIL` means Resonant won't merge its runs until it has CI: `/repo ci <name>`).
