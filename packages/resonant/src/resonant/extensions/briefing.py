@@ -275,9 +275,8 @@ def _updates(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item,
 def _workers(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item, ...]:
     """The Workers section: runs still going, and the rollup's news the owner hasn't heard
     of (EM-6, GH-2; the 08:00 pulse is skipped, so the briefing says what it would have)."""
-    finished = [
-        i for i in pulse_store.pending(conn, ("urgent", "normal", "low"), now) if is_worker_item(i)
-    ]
+    pending = pulse_store.pending(conn, ("urgent", "normal", "low"), now)
+    finished = rollup.held_while_stale(conn, now, [i for i in pending if is_worker_item(i)])
     keys = {i.key for i in finished}
     return (*finished, *(i for i in running_workers(conn, now) if i.key not in keys))
 

@@ -387,6 +387,25 @@ def test_a_stale_watch_says_nothing_about_prs(db: sqlite3.Connection) -> None:
     stall = ps.get(db, "core", "stall/pr:own/dori:7")
     assert stall is not None and not stall.cleared  # left as it was
     assert ru.gather(db, now + H, []).working == ()
+    # untold (it came in quiet hours, say): held from the news until the watch is fresh
+    assert [i.key for i in ru.held_while_stale(db, now + H, ps.pending(db, ("normal",), now))] == []
+    fresh(db, now + H + timedelta(minutes=10))
+    assert ru.held_while_stale(db, now + H + timedelta(minutes=10),
+                               ps.pending(db, ("normal",), now))  # fmt: skip
+
+
+def test_the_first_new_watch_after_an_upgrade_reports_no_old_merges(
+    db: sqlite3.Connection,
+) -> None:
+    """The first watch with this code reports two days of merges, stored after the
+    activation: only a merge from around the activation on is news."""
+    now = utcnow().replace(microsecond=0)
+    activate(db, now - H)
+    install_github(db, now - 30 * 24 * H)
+    watch(db, ("pr_merged", "m1", pr(1, merged_at=iso(now - 30 * H))),
+          ("pr_merged", "m2", pr(2, merged_at=iso(now - timedelta(minutes=50)))))  # fmt: skip
+    ru.refresh(db, now)
+    assert list(pending(db, now)) == ["merged/pr:own/dori:2"]
 
 
 # --- through the pulse -----------------------------------------------------------------------

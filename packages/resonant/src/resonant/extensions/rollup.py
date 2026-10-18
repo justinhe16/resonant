@@ -410,6 +410,17 @@ def activated(conn: sqlite3.Connection, now: datetime) -> datetime:
     return at
 
 
+def held_while_stale(
+    conn: sqlite3.Connection, now: datetime, items: Sequence[store.Item]
+) -> list[store.Item]:
+    """``items`` without the PR stalls while the github watch is stale: one found while it
+    was fresh but not yet told (quiet hours, a mute) waits for fresh data rather than be
+    said from old (it stays pending; the next fresh refresh keeps or clears it)."""
+    if github_installed(conn) is None or watch_fresh(conn, now):
+        return list(items)
+    return [i for i in items if not (i.source == CORE and i.key.startswith(STALL_PREFIX + "pr:"))]
+
+
 def _run_pr_urls(runs: Iterable[Run]) -> set[str]:
     return {r.pr_url for r in runs if r.pr_url}
 
@@ -509,6 +520,7 @@ def _merged_news(pr: Pr, now: datetime, since: datetime) -> bool:
         and now - pr.merged_at < NEWS_WINDOW
         and pr.seen_at is not None
         and pr.seen_at > since
+        and pr.merged_at > since - WATCH_FRESH  # the first new watch reports two days back
     )
 
 

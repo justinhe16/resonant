@@ -288,7 +288,7 @@ def _compose_now(
 ) -> tuple[str, list[store.Item]] | None:
     """:func:`compose` over the store: the pending items, the running workers and the
     rollup's names for them. Read-only."""
-    items = _pending(conn, now, hide_approvals=hide_approvals)
+    items = rollup.held_while_stale(conn, now, _pending(conn, now, hide_approvals=hide_approvals))
     going = running_workers(conn, now)
     roll = rollup.gather(conn, now, [*items, *going], stall_after=stall_after)
     return compose(items, going, roll)
