@@ -81,6 +81,20 @@ def test_remember_replaces_same_name(store: FactStore) -> None:
     assert [f.name for f in store.list()] == ["editor"]
 
 
+def test_multibyte_fact_at_the_caps_reads_back(store: FactStore) -> None:
+    fact, _ = store.remember("emoji", "\U0001f600" * DESCRIPTION_MAX, "\U0001f600" * TEXT_MAX)
+    assert store.get("emoji") == fact and [f.name for f in store.list()] == ["emoji"]
+
+
+def test_forget_removes_an_unreadable_file(store: FactStore) -> None:
+    store.remember("ok", "x")
+    (store.root / "broken.md").write_text("no frontmatter")
+    assert store.forget("broken").description == "(unreadable)"
+    assert not (store.root / "broken.md").exists()
+    with pytest.raises(FactError, match="no fact"):
+        store.forget("../ok")
+
+
 def test_forget(store: FactStore) -> None:
     store.remember("a", "one")
     assert store.forget("a").description == "one"
@@ -206,6 +220,10 @@ def test_report_lines() -> None:
     intent = Intent.for_tool(spec, task_id="t", principal=OWNER, args={})
     assert report_line(intent, {"name": "tz", "description": "LA", "created": True}) == (
         'Remembered tz: "LA"'
+    )
+    long = "d" * 120  # the whole description, never clipped
+    assert report_line(intent, {"name": "tz", "description": long, "created": True}).endswith(
+        f'"{long}"'
     )
     assert report_line(intent, {"name": "tz", "description": "LA", "created": False}) == (
         'Updated fact tz: "LA"'

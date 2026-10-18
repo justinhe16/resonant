@@ -406,13 +406,9 @@ def _fact_saved(d: dict[str, Any]) -> str | None:
     name, description = d.get("name"), d.get("description")
     if not isinstance(name, str) or not isinstance(description, str):
         return None
-    shown = (
-        description
-        if len(description) <= NOTE_TEXT_CHARS
-        else description[: NOTE_TEXT_CHARS - 1] + "…"
-    )
+    # The whole description (at most 120): the owner sees exactly what went into the prompt.
     verb = "Remembered" if d.get("created") is True else "Updated fact"
-    return f'{verb} {name}: "{shown}"'
+    return f'{verb} {name}: "{description}"'
 
 
 def _fact_forgotten(d: dict[str, Any]) -> str | None:

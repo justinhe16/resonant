@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from resonant.brain.text import clip, flat
+from resonant.brain.text import clip, drop_controls, flat
 from resonant.models import ChatMessage, ModelClient, ModelError, SpanFactory
 from resonant.router.prefixes import wrap_untrusted
 from resonant.store import brain as store
@@ -175,7 +175,8 @@ def history_messages(
             {"role": "user", "content": wrap_untrusted(ex.text, max_chars=USER_TURN_CHARS)}
         )
         if ex.reply is not None:
-            messages.append({"role": "assistant", "content": clip(ex.reply, REPLY_TURN_CHARS)})
+            reply = clip(drop_controls(ex.reply), REPLY_TURN_CHARS)
+            messages.append({"role": "assistant", "content": reply})
     return messages
 
 

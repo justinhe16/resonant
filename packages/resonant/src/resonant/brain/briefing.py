@@ -335,5 +335,6 @@ def since_notes(
     found.sort(key=lambda x: x[0])
     lines = [line for _, line in found]
     if len(lines) > limit:  # the newest win
-        return [f"+{len(lines) - limit + 1} earlier", *lines[-(limit - 1) :]]
+        keep = max(0, limit - 1)
+        return [f"+{len(lines) - keep} earlier", *lines[len(lines) - keep :]]
     return lines

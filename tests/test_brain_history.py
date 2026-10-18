@@ -57,6 +57,11 @@ def test_turns_are_capped_and_wrapped(db: sqlite3.Connection) -> None:
     assert len(assistant["content"]) == REPLY_TURN_CHARS and assistant["content"].endswith("…")
 
 
+def test_reply_control_characters_are_dropped(db: sqlite3.Connection) -> None:
+    message(db, "q", reply="ok\x1b[2J\u202edone")
+    assert history_messages(db, OWNER, before_event_id=None)[-1]["content"] == "ok[2Jdone"
+
+
 def test_fast_reply_counts_as_the_reply(db: sqlite3.Connection) -> None:
     eid = message(db, "/status", reply=None)
     db.execute(

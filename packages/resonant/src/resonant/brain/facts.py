@@ -17,16 +17,24 @@ Facts are the owner's own text (only the owner can ``remember``), not untrusted 
 they still go through ``clean``: control and format characters (escape sequences, bidi
 overrides, zero-width) are dropped, so a pasted fact can't hide anything in the prompt.
 Caps: ``FACTS_MAX`` facts, ``DESCRIPTION_MAX`` and ``TEXT_MAX`` characters, ``FILE_MAX``
-bytes read per file (a bigger file is skipped), ``INDEX_MAX_CHARS`` for the rendered index.
+bytes per file (``remember`` refuses a bigger one; a bigger file on disk is skipped),
+``INDEX_MAX_CHARS`` for the rendered index.
 
-Writes are atomic (a temp file in the same dir, then ``os.replace``); the dir is 0700 and
-each file 0600. Nothing here touches the database.
+Writes are atomic and durable (``mkstemp`` in the same dir, fsync, ``os.replace``); the
+dir is 0700 and each file 0600. Reads open with ``O_NOFOLLOW`` and take regular files only.
+
+``remember`` is L3 (D9, the owner's call) and the index sits in every later prompt, so a
+task that read injected text could plant a fact. The brain loop depends on D6: a tainted
+task's calls ask first even at L3. The report line shows the whole description. Nothing
+here touches the database.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import stat
+import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +45,7 @@ FACTS_MAX = 50
 NAME_MAX = 40
 DESCRIPTION_MAX = 120
 TEXT_MAX = 2000
-FILE_MAX = 8192  # bytes read per file; a bigger file is not a fact (skipped)
+FILE_MAX = 16384  # bytes read per file; a bigger file is not a fact (skipped)
 INDEX_MAX_CHARS = 4000  # the index in the prompt; the rest shows as "+N more"
 SUFFIX = ".md"
 
@@ -119,10 +127,14 @@ class FactStore:
         name = path.name.removesuffix(SUFFIX)
         if NAME.fullmatch(name) is None:
             return None
+        try:  # O_NOFOLLOW: a symlink fails to open; fstat: a regular file only
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
         try:
-            if not path.is_file() or path.is_symlink():
-                return None
-            with path.open("rb") as f:
+            with os.fdopen(fd, "rb") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    return None
                 data = f.read(FILE_MAX + 1)
         except OSError:
             return None
@@ -166,12 +178,18 @@ class FactStore:
         if new and len(self.list()) >= FACTS_MAX:
             raise FactError(f"already {FACTS_MAX} facts; forget one first")
         fact = Fact(name=name, description=description, text=text)
+        data = _render(fact).encode("utf-8")
+        if len(data) > FILE_MAX:  # it couldn't be read back
+            raise FactError(f"fact is {len(data)} bytes (at most {FILE_MAX})")
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        tmp = self.root / f".{name}.{os.getpid()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        os.chmod(self.root, 0o700)
+        fd, tmp_name = tempfile.mkstemp(dir=self.root, prefix=f".{name}.", suffix=".tmp")
+        tmp = Path(tmp_name)  # mkstemp: 0600, O_EXCL, a unique name
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(_render(fact))
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
         except BaseException:
             tmp.unlink(missing_ok=True)
@@ -179,11 +197,16 @@ class FactStore:
         return fact, new
 
     def forget(self, name: str) -> Fact:
-        """Delete the fact ``name`` and return what it was."""
-        fact = self.get(name)
-        if fact is None:
+        """Delete the fact ``name`` and return what it was. A file under a valid name that
+        doesn't read as a fact (malformed, oversized, a symlink) is deleted too."""
+        if NAME.fullmatch(name) is None:
             raise FactError(f"no fact {name!r}")
-        self._path(name).unlink(missing_ok=True)
+        path = self._path(name)
+        fact = self._read(path) or Fact(name=name, description="(unreadable)", text="")
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            raise FactError(f"no fact {name!r}") from None
         return fact
 
 
