@@ -85,6 +85,7 @@ from decimal import Decimal, InvalidOperation
 from functools import partial
 from typing import Any, Protocol, cast
 
+from resonant.brain.text import flat
 from resonant.executor import NotAllowedError, ToolResult, idempotency_key
 from resonant.extensions.notify import take_baseline
 from resonant.extensions.scheduler import persist_events
@@ -154,6 +155,8 @@ MODEL_RESULT_MAX_CHARS = 4096  # an extension tool's result, as the model sees i
 TRUNCATED = "…[truncated]"
 FINAL_MAX_TOKENS = 300
 
+TOOL_FAILED_PREFIX = "ToolFailed: "  # executor: a definite failure's error text
+TOOL_ERROR_MAX_CHARS = 300
 TOO_MANY_REPLY = "That needs more steps than I take at once. Ask for one thing at a time."
 NO_ANSWER_REPLY = "I couldn't put together a reliable answer. Try /status or /tasks."
 
@@ -576,6 +579,9 @@ class LocalRunner:
 
     name = NAME
     uses_claude_slot = False
+    # A failed read's ``ToolFailed`` reason goes back to the model (the brain: it can fix a
+    # path and retry). Off here: the intents path's prompts are unchanged.
+    tool_error_detail = False
 
     def __init__(
         self,
@@ -1136,7 +1142,8 @@ class LocalRunner:
                     return CallResult(name, False, None, "not allowed", extension=ext)
                 s.set(ok=result.ok, replayed=result.replayed, duration_ms=result.duration_ms)
                 if not result.ok:
-                    return CallResult(name, False, None, "the tool failed", extension=ext)
+                    why = self._read_error(result)
+                    return CallResult(name, False, None, why, extension=ext)
                 return CallResult(name, True, result.data or {}, None, extension=ext)
 
             # A gated call: pin it before it can run or be prompted.
@@ -1159,6 +1166,18 @@ class LocalRunner:
             return CallResult(
                 name, True, result.data or {}, None, report=result.reply, extension=ext
             )
+
+    def _read_error(self, result: ToolResult) -> str:
+        """What the model sees when a read fails: ``the tool failed``, or with
+        ``tool_error_detail`` (the brain) the tool's own reason for a definite failure
+        (``ToolFailed``: code-built, e.g. ``read_file: … is outside the read roots``), clipped.
+        It goes back in an untrusted tool turn like any result."""
+        error = result.error or ""
+        if self.tool_error_detail and error.startswith(TOOL_FAILED_PREFIX):
+            detail = flat(error.removeprefix(TOOL_FAILED_PREFIX), TOOL_ERROR_MAX_CHARS)
+            if detail:
+                return f"the tool failed: {detail}"
+        return "the tool failed"
 
     async def _final(
         self, messages: list[ChatMessage], text: str, calls: list[CallResult], spans: SpanFactory

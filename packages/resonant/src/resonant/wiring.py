@@ -393,6 +393,7 @@ def build_imessage_stack(
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
+
     # ask_claude (BR-5): a read-only Claude session per question, apart from the worker slots
     asks = AskRunner(
         conn,

@@ -147,7 +147,7 @@ def _loopback_request(scope: Scope) -> bool:
     return host is not None and is_loopback(host)
 
 
-async def _runner_missing(state: DaemonState) -> list[str] | None:
+async def runner_missing(state: DaemonState) -> list[str] | None:
     """The Claude runner's set-up gaps (cached for ``RUNNER_CHECK_TTL_S``), or None when no
     Claude runner is wired in this daemon (iMessage off). A check that raises shows as one
     gap; the dashboard never fails because of it."""
@@ -177,7 +177,7 @@ async def local_snapshot(state: DaemonState) -> Snapshot:
         started_at=state.started_at,
         last_tick=state.loop.last_tick,
         slots=state.loop.slots,
-        runner_missing=await _runner_missing(state),
+        runner_missing=await runner_missing(state),
     )
 
 

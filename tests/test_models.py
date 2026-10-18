@@ -28,8 +28,11 @@ from resonant.models.client import (
     SpanLike,
     has_think,
     has_think_tag,
+    native_messages,
     ollama_root,
+    openai_messages,
     strip_think,
+    text_tool_calls,
     validate_tool_calls,
 )
 from resonant.store.db import kv_get, open_db
@@ -739,3 +742,89 @@ async def test_probe_non_object_body_does_not_raise() -> None:
     async with OllamaClient(CFG, http=http) as client:
         result = await client.probe()
     assert not result.ok and "unreachable" in result.detail
+
+
+# --- BR-1b: native tool turns and text-written calls ----------------------------------------
+
+TOOL_TURNS: list[ChatMessage] = [
+    {"role": "system", "content": "sys"},
+    {"role": "user", "content": "weather in oakland and the time?"},
+    {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"name": "weather", "args": {"city": "Oakland"}}],
+    },
+    {"role": "tool", "tool_name": "weather", "content": "Tool result: sunny"},
+    {"role": "assistant", "content": "", "tool_calls": [{"name": "current_time", "args": {}}]},
+    {"role": "tool", "tool_name": "current_time", "content": "Tool result: 9:00"},
+]
+
+
+def test_native_messages_render_tool_turns() -> None:
+    """The brain replays a call as an assistant turn with ``tool_calls`` and its result as a
+    ``tool`` turn (the chat template's own format), never as ``{"tool_call": …}`` text."""
+    out = native_messages(TOOL_TURNS)
+    assert out[:2] == [dict(m) for m in TOOL_TURNS[:2]]  # plain turns are unchanged
+    assert out[2] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"function": {"name": "weather", "arguments": {"city": "Oakland"}}}],
+    }
+    assert out[3] == {"role": "tool", "content": "Tool result: sunny", "tool_name": "weather"}
+
+
+def test_openai_messages_pair_ids() -> None:
+    out = openai_messages(TOOL_TURNS)
+    assert out[2]["tool_calls"] == [
+        {
+            "id": "call_0",
+            "type": "function",
+            "function": {"name": "weather", "arguments": '{"city": "Oakland"}'},
+        }
+    ]
+    assert out[3] == {"role": "tool", "tool_call_id": "call_0", "content": "Tool result: sunny"}
+    assert out[4]["tool_calls"][0]["id"] == "call_1" and out[5]["tool_call_id"] == "call_1"
+
+
+@pytest.mark.parametrize("api", APIS)
+async def test_chat_tools_sends_tool_turns_in_the_wire_format(api: Api) -> None:
+    fake = FakeOllama([Turn("It's sunny and 9:00.")])
+    async with make(fake, api) as client:
+        reply = await client.chat_tools(TOOL_TURNS, tools=[_weather(), _clock()])
+    assert reply.text == "It's sunny and 9:00."
+    path = "/api/chat" if api == "ollama" else "/v1/chat/completions"
+    (body,) = fake.bodies(path)
+    roles = [m["role"] for m in body["messages"]]
+    assert roles == ["system", "user", "assistant", "tool", "assistant", "tool"]
+    assert body["messages"][2]["tool_calls"][0]["function"]["name"] == "weather"
+    assert "tool_call" not in body["messages"][2]["content"]
+
+
+TEXT_CALLS: list[tuple[str, list[tuple[str, object]]]] = [
+        # the leak the baseline showed: the replay format imitated as text
+        ('{"tool_call":{"args":{"path":"~/code/dori/README.md"},"name":"read_file"}}',
+         [("read_file", {"path": "~/code/dori/README.md"})]),
+        # after prose, and malformed with the name outside
+        ('No pending reminders.  {"tool_call":{"args":{},"name":"list_repos"}}',
+         [("list_repos", {})]),
+        ('{"tool_call":{"args":{"path":"~/code/dori"}},"name":"list_dir"}',
+         [("list_dir", {"path": "~/code/dori"})]),
+        # the template's own format, unparsed
+        ('<tool_call>\n{"name": "prs", "arguments": {}}\n</tool_call>', [("prs", {})]),
+        ('{"name": "pr", "arguments": {"number": 41}}', [("pr", {"number": 41})]),
+        # a known tool's name, alone or with its args
+        ("list_reminders", [("list_reminders", {})]),
+        ('ask_claude:\n{"kind": "email", "question": "q"}',
+         [("ask_claude", {"kind": "email", "question": "q"})]),
+        # not calls
+        ("Canberra.", []),
+        ("hello", []),
+        ('{"name": "x"}', []),
+        ("", []),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(("text", "want"), TEXT_CALLS)
+def test_text_tool_calls(text: str, want: list[tuple[str, object]]) -> None:
+    got = text_tool_calls(text, {"list_reminders", "ask_claude", "hello_tool"})
+    assert [(c.name, c.arguments) for c in got] == want
