@@ -119,9 +119,10 @@ class FakeRunner:
 
 
 @pytest.fixture
-def settings() -> Settings:
+def settings(tmp_path: Path) -> Settings:
     base = load_settings()
-    return base.model_copy(update={"runner": RunnerConfig(repos=REPOS), "dry_run": False})
+    runner = RunnerConfig(repos=REPOS, code_dir=tmp_path / "code")  # never the real ~/code
+    return base.model_copy(update={"runner": runner, "dry_run": False})
 
 
 @pytest.fixture
@@ -594,7 +595,7 @@ async def test_fast_path_runs_reads_inline_and_writes_as_direct_calls(
 
 
 async def test_slash_repos_lists_inline_and_repo_writes_are_direct_calls(
-    components: Components, db: sqlite3.Connection
+    components: Components, db: sqlite3.Connection, settings: Settings
 ) -> None:
     fp = fast(components, db)
     for repo in repo_store.list_all(db):
@@ -603,11 +604,14 @@ async def test_slash_repos_lists_inline_and_repo_writes_are_direct_calls(
     assert res is not None and res.reply_text.startswith("No repos yet.")
     repo_store.add(db, "own/dori", base="main", source="owner", ci=True)
     repo_store.add(db, "up/lib", base="main", source="auto", mode="fork")
+    git_dir = settings.runner.code_dir / "dori" / ".git"  # a checkout of own/dori
+    git_dir.mkdir(parents=True)
+    (git_dir / "config").write_text('[remote "origin"]\n\turl = git@github.com:own/dori.git\n')
     res = await fp.run(parse("/repos"), principal=OWNER, event_id="E2")
     assert res is not None and res.reply_text.splitlines() == [
         "Repos (2):",
-        "- lib · up/lib · fork",
-        "- dori · own/dori · push, CI",
+        "- lib · up/lib · fork · not cloned",
+        f"- dori · own/dori · push, CI · {settings.runner.code_dir / 'dori'}",
     ]
     for text, call_ in (
         ("/repo add me/blog as b", {"tool": "add_repo", "args": {"repo": "me/blog", "name": "b"}}),
