@@ -19,8 +19,9 @@
     ``NewTask(kind="media", runner="media", checkpoint={"title": "media"})`` right after the
     slash commands, in both modes (``runners/media.py``: an image or PDF goes to
     ``ask_claude``, a voice note through whisper). A voice transcript comes back as a
-    message event with ``payload.voice`` and routes like typed text, except that it is
-    never an approval reply: approving stays typed.
+    message event with ``payload.voice`` and goes only to the chat path (the labeler or
+    the brain, whose model-chosen calls are gated): never a slash command or keyword (they
+    run as explicit consent), an approval reply or a worker reply. Those stay typed.
 (c) None for anything else (other sources/types, no principal, empty text and no
     attachments). The Loop consumes the event.
 
@@ -286,7 +287,9 @@ class Router:
 
         # Order: slash commands (so /kill is never read as a reply), approval replies, then
         # keywords and the labeler.
-        cmd = self.fast_path.match(text)
+        # A voice transcript is chat only: never a slash command or keyword (``/restart``
+        # misheard would run as explicit consent), an approval or a worker reply.
+        cmd = None if voice else self.fast_path.match(text)
         if cmd is not None and cmd.slash:
             result = await self.fast_path.run(
                 cmd, principal=principal, event_id=event.id, trace_id=event.trace_id, spans=spans
@@ -352,7 +355,7 @@ class Router:
                 return None  # consumed: the woken runner sends the confirmation
             return reply(answered.reply, None, "job_control", APPROVAL_TITLE)
 
-        direct = self.relay.direct(event, text, principal, stash)
+        direct = None if voice else self.relay.direct(event, text, principal, stash)
         if direct is not None:
             return relayed(direct.reply)
 
@@ -366,7 +369,11 @@ class Router:
         if self.brain_mode == "loop":
             # D1: no labeler (its prefix would evict the brain's from the model's one KV
             # slot). Any free text may still answer an open worker question.
-            free = await self.relay.free(event, text, principal, "question", spans=spans)
+            free = (
+                None
+                if voice
+                else await self.relay.free(event, text, principal, "question", spans=spans)
+            )
             if free is not None:
                 return relayed(free.reply)
             with spans("router.brain", principal=principal):
@@ -381,7 +388,11 @@ class Router:
             )
 
         label = await self.labeler.label(text, spans=spans)
-        free = await self.relay.free(event, text, principal, label.intent, spans=spans)
+        free = (
+            None
+            if voice
+            else await self.relay.free(event, text, principal, label.intent, spans=spans)
+        )
         if free is not None:
             return relayed(free.reply)
         toolset = self.toolset_for(label.intent, principal)

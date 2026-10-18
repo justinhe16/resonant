@@ -418,15 +418,10 @@ async def test_the_pulse_sends_the_rollup_once_and_never_an_all_quiet() -> None:
     async with harness() as h:
         h.settings.runner.mirror_dir = h.settings.home / "runner" / "mirrors"
         t = utcnow().replace(minute=0, second=0, microsecond=0) + 2 * H
-        while t.astimezone(ZoneInfo(h.settings.timezone)).hour in (
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            8,
-        ):  # not quiet, briefing
+        tz = ZoneInfo(h.settings.timezone)
+        busy = (0, 1, 2, 3, 4, 5, 8)  # quiet hours, the briefing's hour
+        # t and the second pulse at t + H must both be ordinary hours
+        while t.astimezone(tz).hour in busy or (t + H).astimezone(tz).hour in busy:
             t += H
         install_github(h.db, t - 30 * 24 * H)
         activate(h.db, t - 30 * 24 * H)

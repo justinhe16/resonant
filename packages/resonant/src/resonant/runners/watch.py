@@ -151,6 +151,13 @@ class WatchRunner:
         if asks is None:
             store.record(self.conn, w, now=self.clock(), ok=True, met=w.last_met)
             return Done({"watch": w.id, "status": "skipped", "why": "ask_claude isn't running"})
+        prior = self.conn.execute(
+            "SELECT id FROM tasks WHERE runner = 'ask' "
+            "AND json_extract(checkpoint, '$.requested_by') = ? LIMIT 1",
+            (task.id,),
+        ).fetchone()
+        if prior is not None:  # a retry after a crash: this check already asked
+            return Done({"watch": w.id, "status": "asked", "ask_task": prior[0]})
         result = asks.enqueue(
             w.question or w.what,
             kind="research",
@@ -186,7 +193,7 @@ class WatchRunner:
     ) -> StepOutcome:
         if v.fire:
             await self._notice(w, f"watch/{w.id}/{w.fired + 1}", store.notice_title(w, v.detail))
-        store.record(
+        ended = store.record(
             self.conn,
             w,
             now=now,
@@ -195,9 +202,10 @@ class WatchRunner:
             baseline=v.baseline,
             fired=v.fire,
             ask_task=ask_task,
+            end_state="fired" if v.fire and w.then == "stop" else None,
         )
-        if v.fire and w.then == "stop":
-            self._end(w, "fired", now)
+        if ended:
+            self._ended(w, "fired")
         with atomic(self.conn):
             audit(
                 self.conn,
@@ -215,9 +223,10 @@ class WatchRunner:
         last = w.fails + 1 >= self.settings.brain.watches.max_fails
         if last:
             await self._notice(w, f"watch/{w.id}/failed", store.failed_title(w, error))
-        store.record(self.conn, w, now=now, ok=False, error=error, ask_task=ask_task)
-        if last:
-            self._end(w, "failed", now, error)
+        ended = store.record(self.conn, w, now=now, ok=False, error=error, ask_task=ask_task,
+                             end_state="failed" if last else None)  # fmt: skip
+        if ended:
+            self._ended(w, "failed")
         return Done({"watch": w.id, "status": "failed" if last else "check_failed"})
 
     async def _notice(self, w: store.Watch, key: str, title: str) -> None:
@@ -238,10 +247,11 @@ class WatchRunner:
         self, w: store.Watch, state: store.State, now: datetime, error: str | None = None
     ) -> None:
         if store.end(self.conn, w.id, state, now, error):
-            with atomic(self.conn):
-                audit(
-                    self.conn, "watch.ended", requested_by=w.principal, decision=state, watch=w.id
-                )
+            self._ended(w, state)
+
+    def _ended(self, w: store.Watch, state: store.State) -> None:
+        with atomic(self.conn):
+            audit(self.conn, "watch.ended", requested_by=w.principal, decision=state, watch=w.id)
 
 
 def _paused(conn: sqlite3.Connection) -> bool:

@@ -968,6 +968,8 @@ class AskRunner:
         if isinstance(watch, int) and not isinstance(watch, bool):
             if self.on_watch is not None:  # idempotent: the watch remembers this ask's id
                 await self.on_watch(watch, task.id, status, reply)
+            else:
+                log.warning("ask: a watch answer with no watch runner", extra={"watch": watch})
             return Done({"status": status, "kind": cp.get("kind"), "watch": watch,
                          "untrusted": True, "proposed": False})  # fmt: skip
         key = cp.get("dedupe_key")

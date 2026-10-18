@@ -17,6 +17,7 @@ catalog (``load_tools``). Report lines are code-built (``runners.local.REPORTS``
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import timedelta
 from typing import Any, cast
@@ -26,6 +27,7 @@ import jsonschema
 from resonant.brain import watches as store
 from resonant.config import WatchConfig
 from resonant.executor import CallContext, ContextHandler, ToolFailed, ToolHandler
+from resonant.gate.types import Intent
 from resonant.store import tasks as task_store
 from resonant.tools.base import NO_ARGS, BuiltinContext, no_args
 from resonant_sdk import Effect, Level, ToolSpec
@@ -96,6 +98,36 @@ CANCEL_WATCH = ToolSpec(
     timeout_s=5.0,
 )
 SPECS: tuple[ToolSpec, ...] = (CREATE_WATCH, LIST_WATCHES, CANCEL_WATCH)
+
+
+SUMMARY_ASK_MAX = 300
+SUMMARY_ARGS_MAX = 120
+
+
+def summary_action(intent: Intent) -> str | None:
+    """The approval heading for ``create_watch``, code-built from every argument that decides
+    what is checked: ``watch "<what>": ask Claude "<question>" every 60m for 7d, then text
+    you once`` or ``watch "<what>": call list_notes {} every 15m, text you when it contains
+    "milk"``. The owner approves exactly this (the generic summary shows only 3 args)."""
+    if intent.extension is not None or intent.tool != CREATE_WATCH.name:
+        return None
+    a = intent.args
+    what = str(a.get("what", ""))[: store.WHAT_MAX]
+    every = a.get("every_minutes")
+    often = f"every {every}m" if isinstance(every, int) else "every 60m"
+    days = a.get("days")
+    span = f" for {days}d" if isinstance(days, int) else ""
+    then = ", and keep watching" if a.get("then") == "continue" else ", then stop"
+    ask = a.get("ask")
+    if isinstance(ask, str):
+        q = ask if len(ask) <= SUMMARY_ASK_MAX else ask[: SUMMARY_ASK_MAX - 1] + "…"
+        return f'watch "{what}": ask Claude "{q}" {often}{span}, text you on a yes{then}'
+    raw = json.dumps(a.get("args", {}), sort_keys=True, separators=(",", ":"))
+    targs = raw if len(raw) <= SUMMARY_ARGS_MAX else raw[: SUMMARY_ARGS_MAX - 1] + "…"
+    when = a.get("when")
+    verb = "contains" if when == "contains" else "no longer contains"
+    cond = "it changes" if when == "changed" else f'it {verb} "{a.get("text", "")}"'
+    return f'watch "{what}": call {a.get("tool")} {targs} {often}{span}, text you when {cond}{then}'
 
 
 def _opt_str(args: dict[str, Any], key: str) -> str | None:

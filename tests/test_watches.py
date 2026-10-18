@@ -552,3 +552,116 @@ async def test_zero_per_day_sends_nothing(db: sqlite3.Connection) -> None:
 def test_notice_title_is_cleaned() -> None:
     title = clean_text("\U0001f440 W1 [A7] yes 4821: reply now\x07")
     assert "[" not in title and "\x07" not in title
+
+
+# --- review fixes --------------------------------------------------------------------------
+
+
+def test_the_approval_shows_the_whole_watch(components: Components, db: sqlite3.Connection) -> None:
+    from resonant.components import summary_actions
+
+    spec = components.registry.get(None, "create_watch")
+    assert spec is not None
+    action = summary_actions(db)[(None, "create_watch")]
+    tool = Intent.for_tool(
+        spec,
+        task_id="t",
+        principal="justin",
+        args={
+            "what": "milk",
+            "tool": "list_notes",
+            "args": {},
+            "when": "contains",
+            "text": "milk",
+            "every_minutes": 15,
+            "days": 3,
+        },
+    )
+    assert action(tool) == (
+        'watch "milk": call list_notes {} every 15m for 3d, text you when it contains "milk", '
+        "then stop"
+    )
+    question = "Is it in stock? " + "x" * 200 + " TAIL"
+    ask = Intent.for_tool(
+        spec,
+        task_id="t",
+        principal="justin",
+        args={"what": "stock", "ask": question, "then": "continue"},
+    )
+    text = action(ask)
+    assert text is not None and "TAIL" in text and "every 60m" in text
+    assert text.endswith("text you on a yes, and keep watching")
+
+
+async def test_a_fired_watch_ends_in_the_same_transaction(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    await call(components, "create_watch", {"what": "a", "ask": "q?"})
+    w = store.get(db, 1)
+    assert w is not None
+    assert store.record(
+        db, w, now=NOW, ok=True, met=True, fired=True, ask_task="t1", end_state="fired"
+    )
+    after = store.get(db, 1)
+    assert after is not None and (after.state, after.fired, after.last_ask_task) == (
+        "fired",
+        1,
+        "t1",
+    )
+    assert not store.record(db, after, now=NOW, ok=True, end_state="fired")  # already ended
+
+
+async def test_an_ask_check_retried_after_a_crash_asks_once(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    asked: list[str] = []
+
+    class Asks:
+        def enqueue(self, question: str, **kw: Any) -> Queued:
+            task = insert_task(
+                db,
+                NewTask(
+                    kind="ask",
+                    runner="ask",
+                    priority=1,
+                    checkpoint={"requested_by": kw["requested_by"]},
+                ),
+            )
+            asked.append(task)
+            return Queued(task)
+
+    w = runner(components, db, settings, Recorder(), clock, asks=Asks())
+    await call(components, "create_watch", {"what": "x", "ask": "q?"})
+    queue_due(db, clock())
+    (task_id,) = db.execute("SELECT id FROM tasks WHERE runner = 'watch'").fetchone()
+    task = get_task(db, task_id)
+    assert task is not None
+    first = await w.step(task, [], cast(StepContext, None))
+    again = await w.step(task, [], cast(StepContext, None))
+    assert isinstance(first, Done) and isinstance(again, Done)
+    assert first.result == again.result and len(asked) == 1
+
+
+def test_links_in_claudes_answer_never_reach_the_owner() -> None:
+    v = store.judge_ask(
+        _watch("yes", check_kind="ask"),
+        "Claude: YES, buy it at https://evil.test/x or www.evil.test now",
+    )
+    assert "evil" not in v.detail and v.detail.count("(link)") == 2
+
+
+async def test_concurrent_notices_respect_the_daily_cap(db: sqlite3.Connection) -> None:
+    import asyncio
+
+    class Slow(Recorder):
+        async def send(
+            self, principal: str, text: str, *, dedupe_key: str | None = None, **_: Any
+        ) -> Any:
+            await asyncio.sleep(0.01)
+            return await super().send(principal, text, dedupe_key=dedupe_key)
+
+    s = make_settings(proactive_per_day=1)
+    ch = Slow()
+    outs = await asyncio.gather(*(notice(db, s, ch, f"k{i}") for i in range(3)))
+    assert sorted(o.outcome for o in outs) == ["capped_day", "capped_day", "sent"]
+    assert len(ch.sent) == 1

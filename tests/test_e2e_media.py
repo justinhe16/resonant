@@ -237,3 +237,16 @@ async def test_an_ask_watch_texts_once_when_claude_says_yes(
         (cp,) = ask_rows(b)
         assert cp["watch"] == 1 and cp["kind"] == "research"
         assert [a["decision"] for a in b.audits("brain.notice")] == ["sent"]
+
+
+async def test_a_spoken_slash_command_is_only_chat(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    whisper = fake_whisper(tmp_path, "/restart")
+    async with start(resonant_home, chat, tmp_path, brain={"whisper_path": str(whisper)}) as b:
+        b.model.push("Type /restart if you want that.")
+        voice = attach(b, "Audio Message.caf", b"caff")
+        (reply,) = await send(b, "￼", [FakeAttachment(str(voice), "audio/x-caf")], 1)
+        assert reply == "Type /restart if you want that."
+        assert b.rows("SELECT * FROM tasks WHERE kind = 'command'") == []
+        assert [a for a in b.audits("gate.evaluate") if a["tool"] == "restart_resonant"] == []

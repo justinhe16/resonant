@@ -29,8 +29,10 @@ by this: a down model matters more than the budget).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
+import weakref
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -92,6 +94,22 @@ def item_key(key: str) -> str:
     return (KEY_PREFIX + clean)[: items.KEY_MAX]
 
 
+# One notice decides at a time: the count, the send and the ``sent`` audit row must not
+# interleave (two watches firing together would both see room under the cap). One daemon,
+# one event loop.
+_LOCKS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _LOCKS.get(loop)
+    if lock is None:
+        lock = _LOCKS[loop] = asyncio.Lock()
+    return lock
+
+
 async def send_notice(
     conn: sqlite3.Connection,
     channel: Sender,
@@ -105,6 +123,20 @@ async def send_notice(
     """Store the notice as a pulse item and send it now if the caps allow (module
     docstring). Raises a ``ChannelError`` other than a refusal (the caller retries; the
     send is deduped by key)."""
+    async with _lock():
+        return await _send_notice(conn, channel, owner, settings, key=key, title=title, now=now)
+
+
+async def _send_notice(
+    conn: sqlite3.Connection,
+    channel: Sender,
+    owner: str,
+    settings: Settings,
+    *,
+    key: str,
+    title: str,
+    now: datetime,
+) -> Notice:
     pkey = item_key(key)
     dedupe = f"notice:{pkey}"
     clean = clean_text(title)

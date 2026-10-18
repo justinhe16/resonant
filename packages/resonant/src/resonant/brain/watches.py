@@ -48,6 +48,7 @@ VALUE_MAX = 200
 QUESTION_MAX = 1000
 DETAIL_MAX = 140
 TERMINAL_TASK = ("done", "failed", "cancelled")
+_URL = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 _YES = re.compile(r"^\W*(yes|no)\b", re.IGNORECASE)
 
 
@@ -248,8 +249,11 @@ def record(
     fired: bool = False,
     error: str | None = None,
     ask_task: str | None = None,
-) -> None:
-    """One check's outcome: counts, the edge state, the baseline, the failure streak."""
+    end_state: State | None = None,
+) -> bool:
+    """One check's outcome: counts, the edge state, the baseline, the failure streak, and
+    (``end_state``) the end of the watch, all in one transaction: a crash can't leave a
+    fired watch active with its hit already recorded. True when ``end_state`` ended it."""
     with atomic(conn):
         conn.execute(
             """UPDATE brain_watches SET checks = checks + 1, last_checked_at = ?,
@@ -262,6 +266,14 @@ def record(
                WHERE id = ?""",
             (iso(now), ok, ok, error, ok, met, baseline, int(fired), ask_task, w.id),
         )
+        if end_state is None:
+            return False
+        cur = conn.execute(
+            """UPDATE brain_watches SET state = ?, ended_at = ?, open_task_id = NULL
+               WHERE id = ? AND state = 'active'""",
+            (end_state, iso(now), w.id),
+        )
+        return cur.rowcount == 1
 
 
 def release(conn: sqlite3.Connection, w: Watch, task_id: str) -> None:
@@ -320,6 +332,7 @@ def judge_ask(w: Watch, answer: str) -> Verdict:
     met = said is True
     body = answer.removeprefix("Claude:").strip()
     body = _YES.sub("", body, count=1).strip(" .,:;-\n")
+    body = _URL.sub("(link)", body)  # page text chose these words: no links in a text to the owner
     detail = ("Claude: " + " ".join(body.split()))[:DETAIL_MAX] if body else ""
     return Verdict(met, met and not w.last_met, None, detail)
 
