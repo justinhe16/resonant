@@ -118,3 +118,21 @@ pulse:
 #       path: ~/work/dori               # checkout elsewhere than <code_dir>/dori
 #       allow_github_changes: false     # refuses .github/ changes (unset keeps the default: on)
 #       quote_ask: true                 # quote your ask in the PR body (unset keeps the default)
+
+# The brain (docs/brain-plan.md). Defaults shown.
+# brain:
+#   read_roots: [~/code, ~/resonant]    # plus Resonant's logs and run transcripts, always
+#   read_deny: [~/Documents, ~/Library, ~/.ssh, ~/.gnupg, ~/.aws, ".env*", "*.pem", "*.key", "credentials*"]
+#   ask_claude:                         # a read-only Claude session per hard question (BR-5)
+#     enabled: true
+#     concurrency: 1                    # sessions at once, apart from the worker slots
+#     daily_cap: 30                     # asks a day
+#     timeout_s: 120
+#     max_turns: 15
+#     reply_max_chars: 1500
+#     max_budget_usd: 1.0               # only with runner/anthropic_key
+#     connector_tools:                  # exact claude.ai read tool names; all must be present
+#       calendar: [mcp__claude_ai_Google_Calendar__list_events, ...]
+#       email: [mcp__claude_ai_Gmail__search_threads, mcp__claude_ai_Gmail__get_thread]
+#     draft_tools: [mcp__claude_ai_Gmail__create_draft]
+#     attachment_roots: [~/Library/Messages/Attachments]

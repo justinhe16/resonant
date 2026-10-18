@@ -380,6 +380,17 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **Detected effects aren't in the dashboard's relay snapshot** and the per-run text cap (6/h, shared with urgent notes) is in memory, so a restart resets it.
 - **Remote Control: shipped by RC-1, through an undocumented control request.** The TR-1 spike found no documented way (the `--remote-control` flag does nothing in print mode). RC-1 uses what Claude Code 2.1.299 accepts on a `--input-format stream-json` session: `{"type":"control_request","request":{"subtype":"remote_control","enabled":true}}` answered by a `control_response` with the `session_url` (sources: github.com/scharissis/polako/issues/471; upstream anthropics/claude-code #91906, #99364). See RC-1 below.
 
+## BR-5 carry-overs: ask_claude and taint
+
+*Noted 2026-10-18 from BR-5 ([`brain-plan.md`](brain-plan.md#br-5-ask_claude-and-taint-2026-10-18)).*
+
+- **ask_claude: email and calendar.** Probed on Claude Code 2.1.302: under `--restricted` the init event has no claude.ai connector tools (`mcp_servers` empty), so `email` and `calendar` asks are refused. Options: (a) wait for the CLI to load connectors in restricted mode (re-probe after updates: one scratch `claude -p --restricted … --output-format stream-json --verbose` and read the init `tools`); (b) a non-restricted mode for those two kinds: `--tools` the read built-ins, `dontAsk`, `--allowedTools` the read allowlist and `--disallowedTools` every connector write (known names plus, from a cached init event, every discovered tool that reads as a write), with the init check killing the session if a write tool is present but not denied. (b) loads the owner's user settings (their `allow` rules could pre-approve a write), so it needs `--setting-sources` checked first. Owner decision.
+- **Gmail tool names are a guess.** `brain.ask_claude.connector_tools.email` (`search_threads`, `get_thread`) and `draft_tools` (`create_draft`) must be checked against the init event once Gmail is connected in claude.ai and connectors reach the session.
+- **WebFetch can carry data out.** A question (or a page or file Claude reads) can ask it to fetch a URL with something it read in the query string. The deny list keeps secrets out of reach and the roots are the owner's own code, so this was accepted for D8; a WebFetch domain allowlist would narrow it.
+- **Proposals are text only.** A `Proposed:` line is flagged (`result.proposed`) but nothing acts on it; the gated send/event tool is later work (D8).
+- **No transcript.** Ask sessions keep no transcript (only the `ask.done` audit with status, cost and turns); add one under `transcripts/ask-<id>.jsonl` if debugging needs it.
+- **Usage-limit backoff is shared kv, separate from workers.** A worker hitting the limit doesn't stop asks (and vice versa) until each hits it itself.
+
 ## RC-1 carry-overs: live sessions and Remote Control
 
 *Noted 2026-10-17 from RC-1.*

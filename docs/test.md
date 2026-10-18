@@ -84,6 +84,18 @@ Update a row when you try it, with the date and anything odd.
 | 49 | "what's on my Linear" answers with your issues (no asking); "make a Linear ticket for …" and "add a comment on KEY-123 saying …" each ask a plain yes first, `no` → `Not done.` | go-live 12, Optional: Linear 4 | 📱 after 48 |
 | 50 | No Linear key in logs or the DB (`grep -r lin_api ~/.resonant/logs`, `sqlite3` on `audit_log`) | go-live 12, Optional: Linear | 🖥 after 49 |
 
+## Brain: ask_claude and taint (BR-5)
+
+Numbered B1–B5. Needs the brain loop (BR-1) to call `ask_claude` from chat; until then only the unit tests reach it.
+
+| # | Test | Expect | Status |
+|---|---|---|---|
+| B1 | "look up the latest Claude Code release" (research) | `Looking into it…`, then within ~2 min one `Claude: …` reply, terse, under 1500 chars | 📱 after BR-1 |
+| B2 | "what's on my calendar tomorrow" | Today: `Not done: Calendar isn't reachable from Claude's read-only mode (missing …)` (connectors don't load under `--restricted`, followups) | 📱 after BR-1 |
+| B3 | A screenshot with "what's this?" | `Claude: …` about the image (attachment copied from Messages) | 📱 after BR-7 |
+| B4 | `/kill` while an ask runs, then `/resume` | `Stopped: Resonant was paused (/kill).`; no `claude` process left (`pgrep -f -- --restricted`) | 📱 + 🖥 after BR-1 |
+| B5 | A tainted write: after "read ~/code/x/README" ask it to "add a note …" | The note asks first (`[A7] add note … Reply yes / no`), no `yes always` | 📱 after BR-1 |
+
 ## Phase 4: the dashboard
 
 Numbered D1–D6 so they don't collide with other sections' rows. Steps are [`go-live.md`](go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch) step 15.
