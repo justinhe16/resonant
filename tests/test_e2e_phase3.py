@@ -845,6 +845,8 @@ async def test_e12_github_red_green_red_notifies_exactly_once_across_crashes(
         dry_run=False,
         api={"port": free_port()},
         channels={"imessage": {"enabled": True, "db_path": chat.path, "self_handle": SELF}},
+        # off: past 08:00 (the default `at`) core/briefing catches up and texts on run_once
+        briefing={"enabled": False},
     )
     manifest = (GITHUB / "resonant.yaml").read_text()
     pins = {"bin:gh": str(gh.bin / "gh")}
