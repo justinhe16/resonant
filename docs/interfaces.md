@@ -679,7 +679,7 @@ FakeExtProcess(results=[...], respond=None)  .calls   # tests; runs nothing
 A minimal JSON-RPC 2.0 client over newline-delimited stdio (protocol `2025-06-18`; also accepts `2025-03-26` and `2024-11-05`), not the `mcp` SDK: the SDK's stdio transport spawns the server itself with an inherited default env and stderr, and pulls anyio, httpx, starlette and uvicorn into the daemon.
 
 ```python
-strip_schema(schema) -> schema         # keeps type, properties, required, items, enum, const, bounds, pattern, format, $ref/$defs, anyOf/oneOf/allOf/not, additionalProperties …; drops description, title, default, examples, $comment, x-*
+strip_schema(schema) -> schema         # keeps type, properties, required, items, enum, const, bounds, pattern, format, $ref/$defs, anyOf/oneOf/allOf/not, additionalProperties …; drops description, title, default, examples, $comment, x-*; drops uncheckable patterns, rewriting not/oneOf over them so the result is only looser
 input_schema(tool) -> dict             # the stripped inputSchema (must be type object, <= 16 KB); values type-checked:
                                        # type a JSON type (or list), bounds numbers, required/property names <= 64 chars,
                                        # enum (<= 100 scalars) / const / pattern / format strings <= 100 chars, $ref local "#/…"

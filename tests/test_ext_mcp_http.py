@@ -245,12 +245,17 @@ async def test_discover_lists_every_page_and_needs_the_token(fake: Any) -> None:
 
 
 async def test_linear_style_long_pattern_is_pinned_without_it(fake: Any) -> None:
-    """LN-1: Linear's save_issue has slaBreachesAt with zod's 293-char ISO date-time pattern,
-    which once refused the install (``bad 'pattern' value``). It installs; the pattern is
-    neither shown nor enforced here, and the pin is the same on every listing."""
+    """LN-1/LN-2: Linear's save_issue has slaBreachesAt with zod's 293-char ISO date-time
+    pattern as a nullable ``oneOf`` (and the fake adds the same through a ``$ref`` and under a
+    ``not``). It installs; the pattern is neither shown nor enforced here, the ``oneOf``s
+    become ``anyOf``s and the ``not`` goes (only ever looser), and the pin is stable."""
     first = await pins_for(fake.url)
-    sla = first["save_issue"]["input_schema"]["properties"]["slaBreachesAt"]
-    assert sla == {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]}
+    props = first["save_issue"]["input_schema"]["properties"]
+    nullable = {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]}
+    assert props["slaBreachesAt"] == nullable
+    assert props["dueDate"] == {"anyOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]}
+    assert props["cycleId"] == {"type": "string"}
+    assert "pattern" not in json.dumps(first["save_issue"])
     assert first == await pins_for(fake.url)
 
 
@@ -675,6 +680,33 @@ async def test_gate_reads_run_writes_ask(
         assert TOKEN not in json.dumps(res.data)
     finally:
         await host.aclose()
+
+
+async def test_save_issue_with_linear_dates_reaches_the_server(
+    settings: Settings, db: sqlite3.Connection, fake: Any
+) -> None:
+    """LN-2 end to end: the loosened pinned schema accepts what Linear accepts (a date-time
+    with an offset, null) and the call reaches the server; other checks still hold."""
+    await install_linear(settings, db, fake.url)
+    h = ExtensionHost.from_settings(settings, db, ToolRegistry(), runner=FakeExtProcess())
+    h.secrets = SecretStore(FakeKeychain(items={"linear/token": TOKEN}))
+    h.load()
+    try:
+        assert "linear" in h.loaded and not h.refused
+        handler = h.mcp_handlers[("linear", "save_issue")]
+        ctx = CallContext(secrets={}, idempotency_key="k", task_id="t")
+        for args in (
+            {"title": "x", "slaBreachesAt": "2026-07-20T10:00:00+02:00", "cycleId": "c1"},
+            {"title": "y", "slaBreachesAt": None, "dueDate": None},
+            {"title": "z", "dueDate": "2026-07-20T10:00:00Z"},
+        ):
+            await handler(args, ctx)
+        assert len(fake.calls) == 3
+        with pytest.raises(ToolFailed):
+            await handler({"title": "w", "slaBreachesAt": 5}, ctx)  # types still enforced
+        assert len(fake.calls) == 3
+    finally:
+        await h.aclose()
 
 
 # --- the router -----------------------------------------------------------------------------

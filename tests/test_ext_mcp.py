@@ -1186,27 +1186,130 @@ def test_patterns_drop_inside_anyof_items_and_defs() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "prop",
-    [
-        {"type": "string", "not": {"pattern": ZOD_UUID}},
-        {"oneOf": [{"type": "string", "pattern": ZOD_UUID}, {"enum": ["a"]}]},
-        {"oneOf": [{"$ref": "#/$defs/id"}, {"enum": ["a"]}]},  # reached through $ref
-    ],
-)
-def test_a_dropped_pattern_under_not_or_oneof_is_refused(prop: dict[str, Any]) -> None:
-    """Dropping there would reject more, not less (``not: {}`` rejects everything)."""
-    raw = {
-        "type": "object",
-        "properties": {"p": prop},
-        "$defs": {"id": {"type": "string", "pattern": ZOD_UUID}},
+LONG = {"type": "string", "pattern": ZOD_UUID}
+UUID_OK = "123e4567-e89b-12d3-a456-426614174000"
+
+
+def _accepts(schema: dict[str, Any], value: object) -> bool:
+    v: Any = jsonschema.Draft202012Validator(schema)
+    return v.is_valid(value)
+
+
+def _only_looser(raw: dict[str, Any], samples: list[object]) -> dict[str, Any]:
+    """Strip ``raw`` and check every sample the raw schema accepts is still accepted."""
+    out = strip_schema(raw)
+    for sample in samples:
+        if _accepts(raw, sample):
+            assert _accepts(out, sample), sample
+    return out
+
+
+SAMPLES: list[object] = [
+    UUID_OK,
+    "not-a-uuid",
+    "a",
+    "",
+    None,
+    3,
+    "2026-07-20T10:00:00Z",
+    "2026-07-20",
+    [UUID_OK],
+    {},
+]
+
+
+def test_zod_nullable_datetime_under_oneof_becomes_anyof() -> None:
+    """LN-2: zod's nullable ISO date-time (Linear's slaBreachesAt) as a ``oneOf``. Dropping the
+    pattern empties the string branch's constraint; ``oneOf`` then rejects nothing it should,
+    but generally could, so it becomes an ``anyOf`` of the same branches."""
+    sla = {
+        "oneOf": [
+            {"type": "string", "format": "date-time", "pattern": ZOD_DATETIME},
+            {"type": "null"},
+        ]
     }
-    with pytest.raises(ValueError, match="bad 'pattern' value under not or oneOf"):
-        strip_schema(raw)
-    kept = {"type": "object", "properties": {"p": {"not": {"pattern": "^x$"}}}}
-    assert strip_schema(kept) == kept  # a pattern kept under not is fine
-    named = {"type": "object", "properties": {"not": {"type": "string", "pattern": ZOD_UUID}}}
-    assert strip_schema(named) == {"type": "object", "properties": {"not": {"type": "string"}}}
+    raw = {"type": "object", "properties": {"slaBreachesAt": sla}}
+    out = _only_looser(raw, [{"slaBreachesAt": s} for s in SAMPLES])
+    assert out["properties"]["slaBreachesAt"] == {
+        "anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]
+    }
+    unaffected = {"oneOf": [{"type": "string", "pattern": "^x$"}, {"type": "null"}]}
+    assert strip_schema(unaffected) == unaffected  # nothing dropped: oneOf stays
+
+
+@pytest.mark.parametrize(
+    ("prop", "want"),
+    [
+        # not over a dropped pattern: the not is removed
+        ({"type": "string", "not": LONG}, {"type": "string"}),
+        ({"anyOf": [{"type": "null"}, {"type": "string", "not": LONG}]},
+         {"anyOf": [{"type": "null"}, {"type": "string"}]}),
+        # oneOf where both branches could match once loosened ("a" under the old checker)
+        ({"oneOf": [LONG, {"enum": ["a"]}]}, {"anyOf": [{"type": "string"}, {"enum": ["a"]}]}),
+        # reached through $ref into $defs, and a chain of $defs
+        ({"oneOf": [{"$ref": "#/$defs/id"}, {"enum": ["a"]}]},
+         {"anyOf": [{"$ref": "#/$defs/id"}, {"enum": ["a"]}]}),
+        ({"not": {"$ref": "#/$defs/wrap"}}, {}),
+        # a oneOf next to an anyOf keeps both constraints
+        ({"anyOf": [{"type": "string"}, {"type": "null"}], "oneOf": [LONG, {"const": "a"}]},
+         {"anyOf": [{"type": "string"}, {"type": "null"}],
+          "allOf": [{"anyOf": [{"type": "string"}, {"const": "a"}]}]}),
+        # nested: a loosened not inside a oneOf branch loosens the oneOf too
+        ({"oneOf": [{"type": "string", "not": LONG}, {"const": "x"}]},
+         {"anyOf": [{"type": "string"}, {"const": "x"}]}),
+        # a kept pattern under not and an untouched $def leave not/oneOf alone
+        ({"not": {"pattern": "^x$"}}, {"not": {"pattern": "^x$"}}),
+        ({"oneOf": [{"$ref": "#/$defs/short"}, {"type": "null"}]},
+         {"oneOf": [{"$ref": "#/$defs/short"}, {"type": "null"}]}),
+    ],
+)  # fmt: skip
+def test_a_dropped_pattern_only_loosens(prop: dict[str, Any], want: dict[str, Any]) -> None:
+    """LN-2: never refused and never tighter. A ``not`` over a loosened schema is removed; a
+    ``oneOf`` with a loosened branch becomes ``anyOf``; looseness follows ``$ref``."""
+    defs = {
+        "id": LONG,
+        "wrap": {"allOf": [{"$ref": "#/$defs/id"}]},
+        "short": {"type": "string", "pattern": "^x$"},
+    }
+    raw = {"type": "object", "properties": {"p": prop}, "$defs": defs}
+    out = _only_looser(raw, [{"p": s} for s in [*SAMPLES, "x"]])
+    assert out["properties"]["p"] == want
+    assert out["$defs"]["wrap"] == {"allOf": [{"$ref": "#/$defs/id"}]}
+
+
+def test_other_pointers_are_assumed_loosened_when_anything_dropped() -> None:
+    not_d: dict[str, Any] = {"not": {"$ref": "#/properties/d"}}
+    raw: dict[str, Any] = {
+        "type": "object",
+        "properties": {"a": LONG, "b": {"not": {"$ref": "#/properties/a"}}, "c": not_d},
+    }
+    out = _only_looser(raw, [{"b": s} for s in SAMPLES])
+    assert out["properties"]["b"] == {} and out["properties"]["c"] == {}
+    clean = {"type": "object", "properties": {"d": {"type": "string"}, "c": not_d}}
+    assert strip_schema(clean) == clean  # nothing dropped: a not over a pointer stays
+    named = {"type": "object", "properties": {"not": LONG, "oneOf": {"type": "null"}}}
+    assert strip_schema(named) == {
+        "type": "object",
+        "properties": {"not": {"type": "string"}, "oneOf": {"type": "null"}},
+    }
+
+
+def test_the_rewrite_is_deterministic_for_the_pin() -> None:
+    tool = {
+        "name": "save_issue",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sla": {"oneOf": [{"$ref": "#/$defs/dt"}, {"type": "null"}]},
+                "id": {"type": "string", "not": LONG},
+            },
+            "$defs": {"dt": {"type": "string", "pattern": ZOD_DATETIME}},
+        },
+    }
+    pin = tool_pin(tool)
+    assert all(tool_pin(json.loads(json.dumps(tool))) == pin for _ in range(3))
+    changed = json.loads(json.dumps(tool).replace("[1-8]", "[1-9]"))  # a dropped pattern moves
+    assert tool_pin(changed) == pin
 
 
 def test_pattern_properties_keys_and_defs_names_are_checked() -> None:
