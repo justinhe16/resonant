@@ -28,6 +28,9 @@ from resonant_sdk import Effect, Level
 
 REPO = Path(__file__).resolve().parents[1]
 NAMES = {
+    "create_watch",
+    "list_watches",
+    "cancel_watch",
     "list_tasks",
     "task_counts",
     "system_status",
@@ -81,6 +84,8 @@ NAMES = {
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {
+    "create_watch": Level.L2,
+    "cancel_watch": Level.L3,
     "add_note": Level.L3,
     "delete_note": Level.L3,
     "clear_notes": Level.L1,

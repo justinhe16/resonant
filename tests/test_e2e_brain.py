@@ -38,6 +38,7 @@ from resonant.runners.brain import (
     BrainRunner,
 )
 from resonant.runners.local import TOO_MANY_REPLY
+from resonant.runners.watch import WatchRunner
 from resonant.secrets import CLAUDE_TOKEN_REF, FakeKeychain, SecretStore
 from resonant.store import brain as brain_store
 from resonant.store import repos as repo_store
@@ -137,6 +138,8 @@ async def start(
     delay_s: float = 0.0,
     seed: Callable[[sqlite3.Connection], None] | None = None,
     mode: str = "loop",
+    ask_args: Sequence[str] = (),
+    brain: dict[str, Any] | None = None,
     **overrides: Any,
 ) -> AsyncGenerator[Brain]:
     (home / "principals.yaml").write_text(PRINCIPALS)
@@ -149,7 +152,7 @@ async def start(
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
         runner={"code_dir": code},
-        brain={"mode": mode, "read_roots": [code], "ask_claude": ask or {}},
+        brain={"mode": mode, "read_roots": [code], "ask_claude": ask or {}, **(brain or {})},
         **overrides,
     )
     osa = RecordingOsaRunner()
@@ -172,13 +175,16 @@ async def start(
         secrets=SecretStore(keychain),
         owner="justin",
         create_task=daemon.loop.create_task,
-        claude_cmd=[sys.executable, str(FAKE_CLAUDE), "--notes", str(notes)],
+        claude_cmd=[sys.executable, str(FAKE_CLAUDE), "--notes", str(notes), *ask_args],
         home=tmp_path / "claude-home",
         poll_s=0.05,
         kill_grace_s=0.5,
     )
     daemon.state.components.runners[asks.name] = asks
     daemon.loop.runners[asks.name] = asks
+    watcher = daemon.state.components.runners.get("watch")
+    if isinstance(watcher, WatchRunner):  # ask watches' answers (BR-7), as wiring does
+        asks.on_watch = watcher.ask_answered
     if seed is not None:
         seed(daemon.conn)
     run = asyncio.create_task(daemon.run())

@@ -408,6 +408,21 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **Number guard is log-only.** BR-6's evals should read `Done.result.number_guard` and decide whether a hard guard comes back for the loop.
 - **Progress before an approval.** A slow turn that ends in an approval prompt can send `On it…` right before the prompt.
 
+## BR-7 carry-overs: media, links, watches, proactive
+
+*Noted 2026-10-18 from BR-7 ([`brain-plan.md`](brain-plan.md#br-7-media-links-watches-proactive-2026-10-18)).*
+
+- **Voice needs a local whisper.** The Claude API documents no audio input and Claude Code's Read reads text, images, PDFs and notebooks only, so without `brain.whisper_path` a voice note is answered "type it instead". Installing whisper.cpp and a model on the Mini is an owner step (test.md M5). The default args are whisper.cpp's `whisper-cli`; another whisper needs `brain.whisper_args`.
+- **A voice transcript is trusted as typed text** for everything but approvals (it can start runs, change notes, answer worker questions). A misheard command still goes through the gate (writes ask or report), but if that is too loose, route voice text with `origin` `inferred` only and never as a slash command.
+- **Images go straight to Claude.** The local model never sees an image (qwen3 has no vision); a screenshot of an error is always an ask, counted against `brain.ask_claude.daily_cap`. A local vision model could answer simple ones.
+- **Attachments of members** are ignored (members can't use `ask_claude`). A grant for media would need a per-principal `ask_claude` grant first.
+- **A watch's checks don't see the conversation.** The tool and args are fixed at creation; "watch it" after a long thread depends on the model filling them in. The approval prompt shows exactly what will be checked (code-built), so a wrong watch is caught there.
+- **Ask watches cost an ask each check** (24 a day at the hourly minimum, against a cap of 30). Raising `ask_min_interval_minutes` or a separate watch budget may be needed once there are a few.
+- **Expired watches end silently** (no text; `list_watches` shows them for a week). A low pulse item for the briefing ("W3 ended unfired") would close the loop.
+- **Watch checks run at most every 5 minutes** (`core/watches`) and queue behind owner chat (background priority).
+- **Health is not a brain notice.** The `HealthMonitor` already texts on a degrade and on the recovery; it stays outside the daily cap on purpose. The rollup's stalls stay in the hourly pulse.
+- **The e2e test wakes the loop by hand** after queueing a watch check; in the daemon the next tick picks it up (at most `loop.tick_s`).
+
 ## RC-1 carry-overs: live sessions and Remote Control
 
 *Noted 2026-10-17 from RC-1.*

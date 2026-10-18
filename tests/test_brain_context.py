@@ -56,7 +56,7 @@ CATALOG = [
 ]
 # The stable prefix with CORE and CATALOG and no facts. Changing BRAIN_SYSTEM, the catalog
 # rendering or the prefix layout changes this on purpose: update it in the same change.
-PINNED_PREFIX_HASH = "459e7c3a193185eb"
+PINNED_PREFIX_HASH = "025b329b22351d0b"
 
 
 @pytest.fixture

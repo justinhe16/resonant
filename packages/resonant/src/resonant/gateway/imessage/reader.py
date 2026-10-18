@@ -31,12 +31,18 @@ after ``chat.db-wal`` changes, which is checked every 250ms.
 5. Resonant's own handle (``self_handle``) is skipped, so it is never audited as unknown.
 6. Anything not in a 1:1 chat is skipped and audited ``imessage.group_ignored``.
 7. A body that is in neither ``text`` nor a parseable ``attributedBody`` is audited
-   ``imessage.parse_failed``. Empty bodies (attachments only) are skipped.
+   ``imessage.parse_failed``. An empty body is skipped, unless it is the owner's and has
+   attachments (step 10).
 8. The handle (emails lowercased, E.164 kept) is resolved with
    ``Principals.resolve("imessage:<handle>")``. Unknown senders are audited
    ``imessage.unknown_sender`` and dropped.
 9. More than ``inbound_per_minute`` messages from one principal within 60s are dropped and
    audited ``imessage.rate_limited``.
+10. **Attachments** (BR-7): for the owner's messages only, the images, PDFs and voice notes
+    (``attachments.read_attachments``: types, size and count capped) go in
+    ``payload.attachments`` as ``[{path, kind, name, bytes}]`` with
+    ``payload.attachments_skipped``; the files are never opened here. A chat.db without the
+    attachment tables gives none. A member's attachment-only message is skipped as before.
 
 Surviving rows become ``Event(source="imessage", type="message", principal=...,
 dedupe_key="imessage:<guid>")`` and go to ``submit``. The cursor advances only past rows
@@ -70,6 +76,7 @@ from typing import Any
 
 from resonant.config import IMessageConfig
 from resonant.gateway.channel import Submit
+from resonant.gateway.imessage.attachments import has_tables, read_attachments
 from resonant.gateway.imessage.attributed_body import parse_attributed_body
 from resonant.principals import Principals
 from resonant.store.audit import audit
@@ -188,6 +195,7 @@ class IMessageReader:
         clock: Clock = utcnow,
         *,
         cursor_key: str = CURSOR_KEY,
+        home: Path | None = None,
     ) -> None:
         self.config = config
         # A second reader (``resonant selftest imessage`` next to a running daemon) uses its
@@ -203,6 +211,8 @@ class IMessageReader:
         self._last_read_at: datetime | None = None
         self._last_error: str | None = None
         self._fda_ok = True
+        self.home = home  # where a ``~/`` attachment path points (None: the real home)
+        self._attachments: bool | None = None  # chat.db has the attachment tables
 
     # --- public API --------------------------------------------------------------------
 
@@ -340,11 +350,18 @@ class IMessageReader:
         if parse_failed:
             audits.append(("imessage.parse_failed", {"guid": guid, "handle": handle}))
             return None
-        if not text:
-            return None
         principal = self.principals.resolve(f"imessage:{handle}")
         if principal is None:
-            audits.append(("imessage.unknown_sender", {"guid": guid, "handle": handle}))
+            if text:
+                audits.append(("imessage.unknown_sender", {"guid": guid, "handle": handle}))
+            return None
+        files: list[dict[str, Any]] = []
+        skipped = 0
+        owner = self.principals.principals.get(principal)
+        if owner is not None and owner.role == "owner":
+            found, skipped = self._read_attachments(int(row["rowid"]))
+            files = [a.to_json() for a in found]
+        if not text and not files:
             return None
         if not self._allow(principal):
             audits.append(
@@ -360,21 +377,37 @@ class IMessageReader:
         truncated = len(text) > self.config.max_body_chars
         if truncated:
             text = text[: self.config.max_body_chars]
+        payload: dict[str, Any] = {
+            "text": text,
+            "guid": guid,
+            "handle": handle,
+            "chat_guid": row["chat_guid"],
+            "at": iso(at),
+            "truncated": truncated,
+        }
+        if files or skipped:
+            payload["attachments"] = files
+            payload["attachments_skipped"] = skipped
         return Event(
             source="imessage",
             type="message",
             principal=principal,
-            payload={
-                "text": text,
-                "guid": guid,
-                "handle": handle,
-                "chat_guid": row["chat_guid"],
-                "at": iso(at),
-                "truncated": truncated,
-            },
+            payload=payload,
             dedupe_key=f"imessage:{guid}",
             occurred_at=at,
         )
+
+    def _read_attachments(self, rowid: int) -> tuple[list[Any], int]:
+        chat = self._chat
+        if chat is None:
+            return [], 0
+        if self._attachments is None:
+            self._attachments = has_tables(chat)
+            if not self._attachments:
+                log.warning("imessage: chat.db has no attachment tables; attachments ignored")
+        if not self._attachments:
+            return [], 0
+        return read_attachments(chat, rowid, home=self.home)
 
     def _allow(self, principal: str) -> bool:
         now = self.clock()
@@ -423,6 +456,7 @@ class IMessageReader:
         return chat
 
     def _close(self) -> None:
+        self._attachments = None
         if self._chat is not None:
             with contextlib.suppress(sqlite3.Error):
                 self._chat.close()

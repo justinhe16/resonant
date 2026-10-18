@@ -482,10 +482,10 @@ def test_copy_rechecks_the_opened_file(tmp_path: Path) -> None:
     scope = AskScope((code,), (str(secret),)).attach()
     (code / "dir").symlink_to(secret)  # as if swapped in after the check passed
     with pytest.raises(OSError, match=r"deny list|may read"):
-        ask_mod._copy_in(code / "dir" / "id", tmp_path / "out", scope)  # pyright: ignore[reportPrivateUsage]
+        ask_mod.copy_in(code / "dir" / "id", tmp_path / "out", scope)
     assert not (tmp_path / "out").exists()
     (code / "ok.txt").write_text("hi")
-    ask_mod._copy_in(code / "ok.txt", tmp_path / "out2", scope)  # pyright: ignore[reportPrivateUsage]
+    ask_mod.copy_in(code / "ok.txt", tmp_path / "out2", scope)
     assert (tmp_path / "out2").read_text() == "hi"
 
 

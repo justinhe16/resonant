@@ -131,8 +131,17 @@ class CoreDeps:
 
 CoreJobFactory = Callable[[CoreDeps], CoreJob | None]
 
+
+def watches_job(deps: CoreDeps) -> CoreJob | None:
+    """``core/watches`` (BR-7, ``runners/watch.py``), imported late: the runners import the
+    gate and the router, which this module must not pull in at import time."""
+    from resonant.runners.watch import watches_job as factory
+
+    return factory(deps)
+
+
 # Built-in jobs, one factory each.
-CORE_JOBS: tuple[CoreJobFactory, ...] = (briefing_job, pulse_job)
+CORE_JOBS: tuple[CoreJobFactory, ...] = (briefing_job, pulse_job, watches_job)
 
 
 @dataclass(frozen=True)
