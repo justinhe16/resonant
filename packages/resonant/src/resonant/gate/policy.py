@@ -238,7 +238,7 @@ class PolicyGate:
         if self.registry.get(intent.extension, intent.tool) != intent.spec:
             # Static reasons: the audit row already names the tool, extension and principal.
             return Deny("tool is not registered with this spec"), None
-        if not self.principals.can(intent.principal, "request", intent.extension):
+        if not self.principals.may_request(intent.principal, intent.spec):
             return Deny("not permitted to request this tool"), None
         unsafe = unsafe_args(intent.args)
         if unsafe:

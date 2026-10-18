@@ -576,6 +576,89 @@ class RunnerConfig(_Section):
         return _absolute(v, "runner binary paths")
 
 
+# Refused by the read tools even inside a read root, always (docs/brain-plan.md D5);
+# ``brain.read_deny`` adds to these. An entry starting with ``/`` or ``~`` is a path (it and
+# everything under it); anything else is a glob matched against consecutive path components
+# (``*.pem`` against every name, ``.git/config`` against every pair).
+DEFAULT_READ_DENY: tuple[str, ...] = (
+    "~/Documents",
+    "~/Library",  # Mail, Messages, the Keychains, app data
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.config/gh",
+    "~/.docker",
+    "~/.kube",
+    ".env*",
+    "*.env",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.keychain*",
+    "id_*",
+    "credentials",
+    "credentials.*",
+    ".credentials*",
+    "*_credentials.json",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git/config",
+    # The same credential dirs anywhere (a copy in a repo, a mounted home).
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".pgpass",
+    ".htpasswd",
+    "*.p8",
+    "*.jks",
+    "*.keystore",
+    "*.tfstate",
+    "*.tfstate.*",
+    "service-account*.json",
+    ".*_history",
+)
+
+
+class BrainConfig(_Section):
+    """The brain (docs/brain-plan.md). BR-2: where the read tools (``tools/files.py``) look."""
+
+    # Where read_file, list_dir and search may look. Unset: runner.code_dir, ~/resonant (and
+    # ops.repo_path), and Resonant's logs, docs and run transcripts. Set: exactly these.
+    read_roots: list[Path] | None = None
+    # Added to DEFAULT_READ_DENY (which always applies), checked before the roots. Resonant's
+    # own secrets (the DB, run-secrets, ext-data, run dirs) are refused whatever this says.
+    read_deny: list[str] = Field(default_factory=list[str])
+    # ripgrep for `search`, by absolute path. Missing: a bounded Python search instead.
+    rg_path: Path | None = Path("/opt/homebrew/bin/rg")
+
+    @field_validator("read_roots")
+    @classmethod
+    def _roots(cls, v: list[Path] | None) -> list[Path] | None:
+        if v is None:
+            return None
+        return [_absolute(p.expanduser(), "brain.read_roots entries") for p in v]
+
+    @field_validator("read_deny")
+    @classmethod
+    def _deny(cls, v: list[str]) -> list[str]:
+        for entry in v:
+            if not entry.strip() or "\0" in entry or entry.strip() != entry:
+                raise ValueError(
+                    "brain.read_deny entries must be non-empty, without NUL or edge spaces"
+                )
+        return v
+
+    @field_validator("rg_path")
+    @classmethod
+    def _rg(cls, v: Path | None) -> Path | None:
+        return _absolute(v, "brain.rg_path") if v is not None else None
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="RESONANT_",
@@ -604,6 +687,7 @@ class Settings(BaseSettings):
     pulse: PulseConfig = PulseConfig()
     runner: RunnerConfig = RunnerConfig()
     trust: TrustConfig = TrustConfig()
+    brain: BrainConfig = BrainConfig()
 
     @field_validator("home")
     @classmethod

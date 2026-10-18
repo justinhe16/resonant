@@ -83,6 +83,7 @@ The owner texts Resonant like an employee ([`employee-plan.md`](employee-plan.md
 | Notes (`/note`, `/notes [clear]`, `/unnote`; soft delete) | `resonant/tools/notes.py` | Phase 2 ✅ |
 | Reminders (`/remind`, `/reminders`, `/unremind`; durable tasks, `ReminderRunner`, loop next-wake) | `resonant/tools/reminders.py`, `resonant/tools/when.py`, `resonant/runners/reminder.py` | Phase 2 ✅ |
 | Mini ops (`/restart ollama\|resonant`, `/update`, `/disk`, `/logs`; "back up" after a restart) | `resonant/tools/ops.py`, `resonant/ops/` | Phase 2 ✅ |
+| Read tools for the brain (`read_file`, `list_dir`, `search`, `tail_log`, `read_transcript`): L0, real-path resolved, deny list before the read roots (`brain.read_roots`, `brain.read_deny`), symlink escapes and binaries refused, capped, secrets redacted, results `untrusted` (taint, D6); owner-only unless a member is granted `builtin:files` | `resonant/tools/files.py` | Phase 6a (BR-2) ✅ |
 | `/projects`: all work in progress by state | `resonant/tools/projects.py` | Phase 2 ✅ |
 | Command registry: every slash command, `/help [word]`, "did you mean" suggestions that never execute, `list_commands` | `resonant/router/commands.py`, `resonant/router/fast_path.py` | Phase 2 ✅ |
 | Chat intents `notes`, `reminders`, `ops`, `updates` (model-chosen calls are `inferred`; `updates` reads the pulse and briefing, so plain words reach every read command) | `resonant/router/intents.py`, `resonant/router/prefixes.py` | Phase 2 ✅ |

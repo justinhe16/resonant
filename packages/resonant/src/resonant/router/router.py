@@ -32,8 +32,9 @@ fast path uses ``evaluate``/``consume``/``pending_for``, the inbox ``resolve_rep
 and is what ``/projects`` shows; it never contains message text.
 
 Priority always comes from the principal (owner or member), never from the model. The
-toolset is filtered by ``principals.can(principal, "request", extension)`` before anything
-reaches the model, so a member never sees global builtins.
+toolset is filtered by ``principals.may_request(principal, spec)`` before anything
+reaches the model, so a member never sees global builtins (except a granted read,
+``ToolSpec.grant``).
 
 **Extension intents** (Phase 3). ``intents`` is built once at construction from the loaded
 extensions (``intents.intent_set``). ``extension:<name>`` gets only that extension's chat
@@ -130,7 +131,7 @@ def toolset_for(
 
     A builtin intent maps to builtins (``INTENT_TOOLS``); unregistered names are skipped.
     ``extension:<name>`` maps to that extension's chat tools from the host, never its job
-    specs. Either way each tool needs ``principals.can(principal, "request", extension)``.
+    specs. Either way each tool needs ``principals.may_request(principal, spec)``.
     """
     specs: list[ToolSpec] = []
     ext = extension_of(intent)
@@ -144,7 +145,7 @@ def toolset_for(
         specs = [
             s for s in extensions.tool_specs(ext) if s.extension == ext and not extensions.is_job(s)
         ]
-    allowed = [s for s in specs if principals.can(principal, "request", s.extension)]
+    allowed = [s for s in specs if principals.may_request(principal, s)]
     return chat_toolset(allowed, builtin_names(registry))
 
 

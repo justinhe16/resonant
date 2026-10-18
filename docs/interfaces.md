@@ -86,6 +86,8 @@ class ToolSpec(BaseModel, frozen=True, extra="forbid"):
     timeout_s: float = 30
     secrets: tuple[str, ...]
     commit: bool = False    # send/pay/delete: always pauses inside a computer-use scope
+    untrusted: bool = False # BR-2: the result is outside content (files, logs, transcripts); a loop taints the task (brain-plan D6)
+    grant: str | None = None  # BR-2: ^[a-z][a-z0-9_-]{0,31}$; a member may request it with grants {"builtin:<grant>": [request]}
     effective_level: Level  # property
 ```
 
@@ -93,6 +95,7 @@ These invariants are enforced at registration:
 - `pay` is always L1.
 - `read` without secrets is always L0.
 - A `commit` tool must have a side effect.
+- Only a builtin (`extension=None`) L0 read without secrets can carry a `grant`.
 
 The model supplies only the tool name and args. Effect and level always come from the registry.
 
@@ -142,14 +145,16 @@ secrets:  [<name>, ...]          # ^[a-z][a-z0-9_]{0,31}$; every tool and job se
 principals:
   justin:    {role: owner, identities: ["imessage:+15551234567", "slack:U01"]}
   cofounder: {identities: ["slack:U02"], grants: {dori: [request, approve]}}
+  family:    {identities: ["imessage:+15557654321"], grants: {"builtin:files": [request]}}   # BR-2
 ```
 
 - An identity is `imessage:<E.164 | lowercase email>` or `slack:<user id>`. An email handle must start with a letter or digit (never `-`, which osascript could read as an option).
 - There is exactly one owner, and an identity can belong to only one principal.
-- `can(principal, action, extension)`:
+- `can(principal, action, extension, *, grant=None)`:
   - The owner can do everything.
-  - `admin` and global scope (`extension=None`) are owner-only.
+  - `admin` and global scope (`extension=None`) are owner-only, except a global `request` whose `grant` (the tool's `ToolSpec.grant`) the member holds as `"builtin:<grant>": [request]` (BR-2). A `builtin:` grant may list only `request`.
   - Everyone else can do only what their grants list.
+- `may_request(principal, spec)` is `can(principal, "request", spec.extension, grant=spec.grant)`: what the gate, the dry-run gate, the router's toolsets and the command list check.
 - The local CLI acts as the owner (`owner:cli`).
 
 ## Tool registry: `resonant.tools.ToolRegistry`
@@ -429,12 +434,12 @@ resonant.secrets.FakeKeychain                # in-memory SecurityRunner for test
 
 ## Built-in tools: `resonant.tools.builtin`
 
-Global tools (`extension=None`, `source="builtin"`): L0 reads, plus the notes writes (`add_note` and `delete_note` L3, `clear_notes` L1), the reminder writes (`add_reminder` and `cancel_reminder` L3) the ops writes (`restart_ollama` L3, `restart_resonant` and `update_resonant` L2), `mute_extension` (L3), the run and worker tools (`start_run`, `cancel_run`, `answer_worker`, `message_worker` L3; `merge_run` L2, or L3 per call through `merge_level`), the repo tools (`add_repo`, `forget_repo` L3; `create_repo`, `add_ci`, `merge_ci_pr` L2) and the trust tools (`add_trust_rule` L3; `allow_trust_rule`, `remove_trust_rule` L2). Global scope is owner-only, so a member principal is denied them. `register_builtins(registry, conn, state, *, principals, clock=utcnow, ops_runner=None) -> {(None, name): handler}` registers the specs and returns the handlers.
+Global tools (`extension=None`, `source="builtin"`): L0 reads, plus the notes writes (`add_note` and `delete_note` L3, `clear_notes` L1), the reminder writes (`add_reminder` and `cancel_reminder` L3) the ops writes (`restart_ollama` L3, `restart_resonant` and `update_resonant` L2), `mute_extension` (L3), the run and worker tools (`start_run`, `cancel_run`, `answer_worker`, `message_worker` L3; `merge_run` L2, or L3 per call through `merge_level`), the repo tools (`add_repo`, `forget_repo` L3; `create_repo`, `add_ci`, `merge_ci_pr` L2) and the trust tools (`add_trust_rule` L3; `allow_trust_rule`, `remove_trust_rule` L2). Global scope is owner-only, so a member principal is denied them, except the read tools (`files`, BR-2) for a member granted `builtin:files`. `register_builtins(registry, conn, state, *, principals, clock=utcnow, ops_runner=None) -> {(None, name): handler}` registers the specs and returns the handlers.
 
-- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`, `notes`, `reminders`, `projects`, `ops`, `ext`, `updates`, `runs`, `repos`, `trust`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
+- **Modules.** Each tool area is a module under `resonant.tools` (`tasks`, `system`, `commands`, `notes`, `reminders`, `projects`, `ops`, `ext`, `updates`, `runs`, `repos`, `trust`, `files`) that exports `SPECS: tuple[ToolSpec, ...]` and `handlers(ctx: BuiltinContext) -> {name: handler}` (the `BuiltinModule` protocol in `tools/base.py`). `builtin.BUILTIN_MODULES` lists them and `register_builtins` iterates it, so a new area is one module plus one line in that tuple. `BUILTIN_SPECS` is every module's specs, in order.
 - `BuiltinContext(conn, state, registry, principals, clock=utcnow, ops_runner=None)` is what a module gets. `registry` is the full registry, read at call time. `clock` returns aware UTC (tests pass a fake). `ops_runner` runs the ops tools' subprocesses (`None`: the real `SubprocessRunner`; tests pass `FakeOpsRunner`). New fields get defaults.
 
-Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, note text that is empty or over 1000 characters, a missing or already-deleted note id, or any arg to a no-arg tool). No tool returns message bodies, checkpoints, task results, or file contents, except the notes and reminder tools, which return the owner's own text, `projects`, which reads only the code-built `checkpoint.title` and a reminder's own text, and `recent_logs`, which returns a few scrubbed lines of Resonant's own log.
+Handlers return JSON-serializable dicts and never raise for "no data". Bad args raise `ToolFailed` (unknown keys, a bad `status`, a non-integer `limit`, note text that is empty or over 1000 characters, a missing or already-deleted note id, or any arg to a no-arg tool). No tool returns message bodies, checkpoints or task results. File contents come only from the read tools (`read_file`, `list_dir`, `search`, `tail_log`, `read_transcript`; [Read tools](#read-tools-resonanttoolsfiles-br-2)): inside the read roots, past the deny list, redacted, `untrusted`. Otherwise the notes and reminder tools return the owner's own text, `projects` reads only the code-built `checkpoint.title` and a reminder's own text, and `recent_logs` returns a few scrubbed lines of Resonant's own log.
 
 | Tool | Args | Returns |
 |---|---|---|
@@ -478,6 +483,7 @@ Handlers return JSON-serializable dicts and never raise for "no data". Bad args 
 | `briefing_preview` | none | `{text}`: the briefing as it would be sent now (`briefing.gather` + `render`) in `settings.timezone`, with the approvals line as a count (`N approvals waiting, see /approvals`; the sent briefing still lists codes). Read-only: nothing is sent or marked told. |
 | `list_extensions` (`/ext list`) | none | `{extensions: [{name, status, reason, commit, digest, tools, jobs: [{id, schedule, level, next_due, next_due_text, last_run_at, last_run_text, last_outcome, fail_streak}], muted_until, muted_until_text, health}], count, core: [<job>]}`, by name. `core` lists the core jobs in the same job shape: `briefing` (`L0`, cron `briefing.schedule(settings.briefing)` in `settings.timezone`, last run from the `core/briefing` `ext_jobs` row) while `briefing.enabled`, then `pulse` (`L0`, `0 * * * *`) while `pulse.enabled`, else empty. `status` is the row's (`enabled`, `disabled`, `disabled_tampered`), or `refused` for an enabled row the host didn't load (`reason` from `host.refused`). `commit` and `digest` are 8 chars. `next_due` comes from the manifest cron (`cron.parse_schedule(schedule, job tz or settings.timezone).next_after(now)`), since an `ext_jobs` row exists only after the first due time; last run and `fail_streak` come from `ext_jobs`. `health` is `health_snapshot(conn)["ext:<name>"].state`, null until it has run. `muted_until` is `notify.muted_until`. `*_text` are `format_due` in `settings.timezone`. Names only, never manifest strings. |
 | `mute_extension` (L3, `/ext mute`) | `extension`: an installed name; `until`: ISO with an offset, in the future, at most 7 days ahead; or `off: true` | `{extension, muted_until, until_text}` or `{extension, muted_until: null, was_muted}`. Through `notify.mute` / `notify.unmute` (kv `ext.<name>.muted_until`, ISO UTC; audited `ext.notify_muted {until}` / `ext.notify_unmuted {was_muted}` with `requested_by` the owner). The notifier holds that extension's notifications while it is in the future. |
+| `read_file`, `list_dir`, `search`, `tail_log`, `read_transcript` (BR-2) | see [Read tools](#read-tools-resonanttoolsfiles-br-2) | `untrusted: true` on every result and spec |
 | `recent_logs` | `n?`: int 1..20, default 10; larger is capped at 20 | `{lines, count, n}`: the last `n` records of `logs/resonant.jsonl`, oldest first, each as `15:04:05 warning resonant.daemon: event k=v`. URLs → `<url>`, emails and phone numbers → `<handle>`, at most 300 chars a line. Reads at most the last 256 KB. No log yet: `lines: []`. |
 
 - `system_status`: `cpu_percent` is measured since the previous call (primed at registration), so it never blocks. `memory_pressure` comes from `sysctl kern.memorystatus_vm_pressure_level` and `memory_pressure -Q` with a 500ms timeout, best effort; off macOS, or when they are missing or slow, it is `{level: "unknown", free_pct: null}`. `disk` lists `/` and `RESONANT_HOME`; an unreadable path has null numbers.
@@ -528,6 +534,27 @@ async back_up(conn, channel, owner, *, clock=utcnow) -> bool
 - **dry_run.** Ops tools are never exempt: the gate returns `Dry run: would restart Ollama` (`restart Resonant`, `update Resonant`) and nothing runs. `tools.ops.summary_action(intent)` gives those headings for approval prompts too.
 - **Reports** (`runners.local.REPORTS`): `Restarted Ollama.`, `Restarting Resonant…`, `Updated a1b2c3d → e4f5a6b, restarting…`, `Already up to date (a1b2c3d).`, and `Updated a1b2c3d → e4f5a6b, but uv sync failed (exit 1): not restarting. Fix it on the Mini.` Read templates: `router.render.render_disk` and `render_logs` (newest lines within one 2000-char chunk).
 - **Trust.** Owner-only (global scope), two fixed launchd labels, one configured repo. `/update` runs whatever is on the repo's `main` upstream, fast-forward only, from a clean tree: remote code execution from the owner's own repo, accepted (plan §5).
+
+## Read tools: `resonant.tools.files` (BR-2)
+
+The brain's general reads ([`brain-plan.md`](brain-plan.md) D5). Five global L0 reads, each `untrusted=True` (the brain loop taints the task that calls one, D6) and `grant="files"` (owner-only unless a member holds `"builtin:files": [request]`). Not in any `INTENT_TOOLS` toolset yet: BR-1's loop lists them as core tools.
+
+- **Scope** (`ReadScope.from_settings`). Roots: `brain.read_roots`, or by default `runner.code_dir`, `~/resonant`, `ops.repo_path`, `<home>/logs`, `<home>/docs` and `<runner state>/transcripts`, all real paths. Deny: `config.DEFAULT_READ_DENY` (`~/Documents`, `~/Library`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gh`, `~/.docker`, `~/.kube`, `.env*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keychain*`, `id_*`, `credentials`, `credentials.*`, `.credentials*`, `*_credentials.json`, `.git-credentials`, `.netrc`, `.npmrc`, `.pypirc`, `.git/config`, and anywhere `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, `.pgpass`, `.htpasswd`, `*.p8`, `*.jks`, `*.keystore`, `*.tfstate*`, `service-account*.json`, `.*_history`) plus `brain.read_deny`, plus Resonant's own secrets whatever the config says (`resonant.db` and its `-wal`/`-shm`/`-journal`, `principals.yaml`, `ext-data/`, `run-secrets/`, `runner.secrets_dir`, `runner.mirror_dir`, `runner.work_dir`). A deny entry starting with `/` or `~` is a path and everything under it; any other is a glob over consecutive path components.
+- **Check order** (`ReadScope.check`): a string, absolute or `~/…`, at most 1024 chars, no `..` component → the deny list on the path as given → `realpath` → the deny list on the real path → the real path inside a root (else `outside the read roots`, or `a symlink out of the read roots` when the given path was inside one). Comparisons are NFC and case-folded. The file is then opened `O_NOFOLLOW | O_NONBLOCK`, must be a regular file (a directory for `list_dir`), and its `F_GETPATH` path is checked again. Every refusal is a `ToolFailed` naming the path and the reason.
+- **Text only.** A NUL or invalid UTF-8 in the first 8 KB (not just a character cut at the end) is `binary` and refused.
+- **Redaction** (`redact_secrets`, pattern-based: the tools don't know the values): private key blocks (`LineRedactor` blanks every line of one, keeping line numbers), `ghp_`/`github_pat_`/`sk-`/`xox?-`/`AKIA`/`AIza`/`glpat-`/`npm_`/`lin_api_`/`sb_secret_` tokens, JWTs, `Bearer`/`Basic` values, URL credentials, and a credential-named key (`…password`, `…secret`, `…token`, `…api_key`, …) with a literal value (quoted, or a bare 8+ char token with a letter and a digit). A `password`/`secret` key's bare value needs only 6 characters. Calls (`token = get_token()`) are left alone. Text is redacted before it is clipped, and at most the clip plus 256 characters of it is scanned (`redact_clip`), with every regex run bounded, so a huge line stays linear. A search hit that is nothing but 32+ base64 characters is `[redacted]` (it may be inside a key block).
+
+| Tool | Args | Returns |
+|---|---|---|
+| `read_file` | `path`; `offset?`: line ≥ 1 (default 1); `limit?`: 1..500 lines (default 200, larger capped) | `{path (real), size_bytes, start, end, content: "N: line\n…", more, untrusted, note?}`. Lines clipped to 500 chars, `content` to 12000 (`note: cut at 12000 characters; read on with offset`); at most 8 MB scanned. Past the end: `content: ""`, `note: the file has N lines`. A directory: `is a directory (use list_dir)`. |
+| `list_dir` | `path` | `{path, entries: [{name, type: file\|dir\|link\|other, size?}], count, truncated, untrusted}` by name, at most 200 (of the first 5000 the directory yields); symlinks shown as `link`, never followed; denied names left out (and not counted). |
+| `search` | `pattern`: 1..200 chars; `path?` (a dir or file; default every top-level root); `glob?` (`*.py`; with a `/` it matches the path under the root); `regex?` (default literal); `limit?`: 1..50 (default 20) | `{pattern, roots, hits: [{path, line, text (≤ 200)}], count, more, engine: rg\|python\|none, untrusted, partial?}`. Smart case. `rg` at `brain.rg_path` when it is an executable file: `--no-config --null --smart-case --max-filesize=2M --max-count=10 --max-columns=500`, the deny globs as `--glob=!…` after the caller's, `PATH=/usr/bin:/bin`, 10 s, 1 MB of output; it honours `.gitignore`, skips hidden and binary files and doesn't follow symlinks. Otherwise a Python walk, literal only (`regex` is refused: Python's `re` backtracks): hidden names, lines over 10000 chars, `node_modules`, `__pycache__`, `venv`, `dist`, `build`, `target`, symlinks, files over 2 MB and binary files skipped; at most 20000 files, 64 MB, 5 s (`partial: the search budget ran out`). Every hit is re-checked against the scope. |
+| `tail_log` | `name?`: a file directly in `<home>/logs` (default `resonant.jsonl`); `n?`: 1..100 (default 20); `contains?`: up to 100 chars, case-insensitive | `{found: true, name, lines, count, n, contains, untrusted}`, oldest first, from the last 1 MB. `.jsonl` lines as `recent_logs` (`ops.log_line`, with the secret scrub before the clip); others scrubbed the same way (URLs → `<url>`, handles → `<handle>`), 300 chars. A symlink is refused. Missing: `{found: false, name, logs: [names]}`. |
+| `read_transcript` | `code`: `R<n>`; `n?`: 1..50 (default 20) | `{found: true, code, entries: [{kind: said\|call\|result\|turn ended\|session ended, text}], count, more, untrusted}` from the last 512 KB (`activity.read_tail`, `O_NOFOLLOW`): calls as `activity.describe_call`, every text scrubbed then `activity.clip` (`clean_external`: codes masked, brackets and non-ASCII dropped): said 400, result 200, call 100. No transcript: `{found: false, code, text: "No transcript for R9."}`. |
+
+The `builtin:files` grant is all or nothing: a granted member can read everything in the roots, every run's transcript and the daemon's logs.
+
+`brain:` config (`BrainConfig`): `read_roots` (absolute after `~`; unset: the defaults above), `read_deny` (added to the defaults, never replacing them), `rg_path` (absolute; default `/opt/homebrew/bin/rg`, missing → the Python walk).
 
 ## Extension store: `resonant.store.extensions` (migrations 004, 012)
 
