@@ -224,6 +224,7 @@ def make_world(
         },
         # not this checkout: the daemon's own repo would be registered as "resonant"
         ops={"repo_path": None},
+        brain={"mode": "intents"},  # chat asks are labeled run_project (loop is the default)
         runner={
             "guard": guard,
             "github_app": {"app_id": APP_ID, "installation_id": INSTALLATION_ID},

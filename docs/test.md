@@ -91,7 +91,7 @@ Update a row when you try it, with the date and anything odd.
 
 ## Brain: ask_claude and taint (BR-5)
 
-Numbered B1–B5. Needs `brain.mode: loop` (BR-1, L1 below) to call `ask_claude` from chat.
+Numbered B1–B5. Needs `brain.mode: loop` (the default since BR-8; L1 below) to call `ask_claude` from chat.
 
 | # | Test | Expect | Status |
 |---|---|---|---|
@@ -116,7 +116,7 @@ Numbered D1–D6 so they don't collide with other sections' rows. Steps are [`go
 
 ## Phase 6a: the brain's read tools (BR-2)
 
-Numbered F1–F4. The tools reach chat only through the brain loop (`brain.mode: loop`, L1 below).
+Numbered F1–F4. The tools reach chat only through the brain loop (`brain.mode: loop`, the default; L1 below).
 
 | # | Test | Expect | Status |
 |---|---|---|---|
@@ -137,11 +137,11 @@ Numbered F1–F4. The tools reach chat only through the brain loop (`brain.mode:
 
 ## Brain loop (BR-1)
 
-Numbered L1–L7. `brain.mode` defaults to `intents`; L1 turns the loop on (BR-8 makes it the default once the evals pass).
+Numbered L1–L7. `brain.mode` defaults to `loop` since BR-8; L1 checks it is on (a config that sets `brain: {mode: intents}` keeps the labeler).
 
 | # | Test | Expect | Status |
 |---|---|---|---|
-| L1 | Add `brain: {mode: loop}` to `~/.resonant/config.yaml`, restart, text "hey" | A short reply; `sqlite3 ~/.resonant/resonant.db "select runner, kind from tasks order by rowid desc limit 1"` shows `brain|chat`; `ping` and `/status` still answer at once | 📱 + 🖥 |
+| L1 | With no `brain.mode` in `~/.resonant/config.yaml` (or `brain: {mode: loop}`), restart, text "hey" | A short reply; `sqlite3 ~/.resonant/resonant.db "select runner, kind from tasks order by rowid desc limit 1"` shows `brain|chat`; `ping` and `/status` still answer at once | 📱 + 🖥 |
 | L2 | "what's R4 doing" while a run is open | From `run_activity` (a core tool), no labeler call | 📱 after L1 |
 | L3 | "how much disk is free?" | The model calls `disk` (a stub: not a core tool) and answers; a `runner.local.tool` span with `tool: "disk"`, and no other tool in its place | 📱 + 🖥 after L1 |
 | L4 | A question that needs a few reads ("which repo has the flaky test?") | `On it…` once if it takes over 6 s, then the answer; never more than 8 `runner.brain.round` spans for the task | 📱 after L1 |
@@ -170,7 +170,7 @@ Numbered M1–M9. Attachments work in either `brain.mode`; links and watches nee
 | # | Test | Where | Status |
 |---|---|---|---|
 | 47 | Router evals on 30–50 real texts (≥ 90%) | go-live 9, [`followups.md`](followups.md#router-evals-on-real-texts-go-live-step-9) | deferred |
-| 53 | Task evals, real model: `resonant eval task --mode both` (BR-6). `[loop]` ≥ 85%, `unapproved 0`; record accuracy, escalation rate and p50/p95 for BR-8 | go-live 9 "Task evals", [`evals/README.md`](../evals/README.md#task-eval) | 🖥 |
+| 53 | Task evals, real model: `resonant eval task --mode both` (BR-6). `[loop]` ≥ 85%, `unapproved 0`; record accuracy, escalation rate and p50/p95 (the loop is the default since BR-8) | go-live 9 "Task evals", [`evals/README.md`](../evals/README.md#task-eval) | 🖥 |
 | 54 | `resonant bench e2e --model real --n 20` with the `loop` path: `loop` p50 ≤ 5 s | go-live 9 | 🖥 |
 
 ## Done

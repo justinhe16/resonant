@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Resonant Architecture</title>
-<meta name="description" content="Interactive map of the Resonant agent harness: ingress, loop, the local brain and Claude workers, gate, executor, store, extensions. Phases 0–7 and the employee model (EM-1..EM-9).">
+<meta name="description" content="Interactive map of the Resonant agent harness: ingress, loop, the local brain and Claude workers, gate, executor, store, extensions. Phases 0–7, the employee model (EM-1..EM-9) and the brain loop (BR-1..BR-8).">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -316,8 +316,8 @@ const GROUPS = [
    desc:"An event-driven and ticking scheduler over the durable task envelope. It routes unrouted events, wakes due tasks, cancels stuck steps, and dispatches runnable tasks in priority order. It does not know what any task is for.",
    children:["looptick","router","tasks","slots"]},
   {id:"runners", col:3, title:"Brain & workers", sub:"local brain · Claude workers · thin guard", icon:"cpu",
-   desc:"The employee model (docs/employee-plan.md). The local brain (qwen3 on Ollama) reads every message, answers what it can and routes the rest to tools. When work needs engineering or ops it spawns a Claude worker with start_run and acks \"On it: R4 · <repo>.\" Workers run like the owner at the keyboard, in a git worktree of the real checkout ~/code/<repo> (or a scratch dir), under the thin guard, which only protects Resonant itself. Up to 4 run at once. All runners share one contract (Runner.step); a task's runner field picks which one runs it.",
-   children:["runner_local","ollama","runner_claude","runner_sandbox","repos","runner_cu"]},
+   desc:"The employee model (docs/employee-plan.md). The local brain (qwen3 on Ollama) reads every message in one agent loop (brain.mode: loop, the default since BR-8): it reads files, logs and Resonant's state, calls tools through the gate, and hands email, calendar, the web, links and images to a read-only Claude (ask_claude). brain.mode: intents keeps the older labeler and one intent's toolset as an opt-in. When work needs engineering or ops it spawns a Claude worker with start_run and acks \"On it: R4 · <repo>.\" Workers run like the owner at the keyboard, in a git worktree of the real checkout ~/code/<repo> (or a scratch dir), under the thin guard, which only protects Resonant itself. Up to 4 run at once. All runners share one contract (Runner.step); a task's runner field picks which one runs it.",
+   children:["runner_brain","runner_local","ollama","runner_claude","runner_sandbox","repos","runner_cu"]},
   {id:"desk", col:3, title:"Worker desk", sub:"ask · note · check · relay · reports", icon:"msg",
    desc:"How a running worker and the owner talk. The worker calls resonant ask, note and check over its run's socket. The relay routes the owner's replies and \"tell R4 …\" messages to the right worker. Trust rules decide which checks ask the owner. Worker reports go out now or in the hourly digest, by urgency.",
    children:["worker_cli","relay","trust_rules","reports"]},
@@ -447,16 +447,17 @@ can(principal, action ∈ {request, approve, admin}, extension | None) -> bool`,
     inv:["One transaction per step: outcome + checkpoint + consumed events","Crash mid-step: no partial state, and the task resumes from its last checkpoint","Retryable failures keep their events and back off 5s·2ⁿ (max 300s)","Graceful shutdown gives in-flight steps a 10s grace period. The rest resume on the next start"],
     files:["packages/resonant/src/resonant/loop/loop.py","tests/test_loop.py"]},
   router:{label:"Router", phase:"1 / EM-8", status:"built",
-    what:"The Loop's router hook: the brain's front door. It turns an unrouted iMessage event into a task for the local runner. Order: slash commands; the relay's clash rule (a plain yes/no while a worker question is open); the approval inbox; the relay's direct step (R4 …, tell R4 …, an exact option); the status and ping keywords; then one LLM intent label, with the toolset for that intent filtered by principal before the model sees it; then the relay's free step for run_project, question or unknown labels. The run_project intent covers any job for a Claude worker, runs and repos (EM-8); rules covers trust rules (EM-4).",
-    iface:`Router(conn, *, principals, registry, gate, handlers, model).route(event) -> NewTask | None
+    what:"The Loop's router hook: the brain's front door. It turns an unrouted iMessage event into a task. Order: slash commands; an owner message with attachments (to the media runner); the relay's clash rule (a plain yes/no while a worker question is open); the approval inbox; the relay's direct step (R4 …, tell R4 …, an exact option); the status and ping keywords. Then, with brain.mode: loop (the default since BR-8), no labeler: the relay's free step (a reply to an open worker question), else a brain task. With brain.mode: intents (opt-in), one LLM intent label, with the toolset for that intent filtered by principal before the model sees it, then the relay's free step for run_project, question or unknown labels.",
+    iface:`Router(conn, *, principals, registry, gate, handlers, model, brain_mode).route(event)
 fast:    NewTask(kind="reply", runner="local", checkpoint={fast_reply, tool_used, intent})
+loop:    NewTask(kind="chat",  runner="brain", checkpoint={title: "chat"})   # default
 labeled: NewTask(kind="chat",  runner="local", checkpoint={intent, confidence, toolset, fallback})
 intents: question | job_control | system | updates | notes | reminders | ops
          | run_project | rules | extension:<name> | unknown
 /run [<repo>] <ask> [--merge] · /runs · /cancel · /merge · /repos · /repo … · /rules
 prompt prefix = fixed per (intent, principal scope)   # KV-cache reuse`,
     inv:["/kill and /resume are deterministic and owner-only, never decided by the model","A co-founder message can never reach global or personal tools, even through prompt injection","Priority comes from the principal, never the model","/run's first word is a repo only when Resonant already knows it (or it ends with :), so a scratch ask is never misread","Router eval after EM-8: 96.8% (184/190), run_project 33/33"],
-    links:[{to:"relay",label:"worker replies and messages"},{to:"runner_local",label:"chat tasks"},{to:"approvals",label:"approval replies"}],
+    links:[{to:"relay",label:"worker replies and messages"},{to:"runner_brain",label:"chat tasks (loop)"},{to:"runner_local",label:"chat tasks (intents)"},{to:"approvals",label:"approval replies"}],
     files:["packages/resonant/src/resonant/router/router.py","packages/resonant/src/resonant/router/fast_path.py","packages/resonant/src/resonant/router/labeler.py","packages/resonant/src/resonant/router/intents.py","packages/resonant/src/resonant/router/prefixes.py","packages/resonant/src/resonant/router/commands.py","tests/test_router.py"]},
   tasks:{label:"Task envelope", phase:"0", status:"built",
     what:"A hand-rolled durable envelope with no workflow engine. The work content is opaque (checkpoint); only the lifecycle is typed.",
@@ -479,8 +480,21 @@ release(task_id)`,
     inv:["Non-on-call work only uses the unreserved slots, no matter what on-call holds","A usage-limit hit sets kv.claude_usage_reset_at, parks every claude task in waiting(usage_reset), and sends one notification (Phase 5)"],
     files:["packages/resonant/src/resonant/loop/slots.py","tests/test_slots.py"]},
   /* ---- runners */
-  runner_local:{label:"Local brain (qwen3)", phase:"1 / EM", status:"built",
-    what:"The brain. It answers routed chat tasks with the local model: up to 3 tool calls, each through the gate and the executor, then one JSON answer sent over the channel. It doesn't do engineering itself: work that needs code, ops or research becomes a Claude worker through start_run, from plain words or /run. The run_project intent carries the run, worker and repo tools; the rules intent carries the trust-rule tools. A model asking for more than three calls ends the task with a templated reply.",
+  runner_brain:{label:"Brain loop (qwen3)", phase:"BR-1 / BR-8", status:"built",
+    what:"The brain, and the default chat path since BR-8 (brain.mode: loop). One agent loop on the local model, modeled on Claude Code's: a fixed system prompt, ~17 core tools with schemas and every other tool the principal may use as a one-line stub, a facts index, rolling history as real turns (older ones folded into a summary), and a per-turn briefing (time, repos, runs, extensions, health) before the message. Up to 8 rounds: reads run freely, writes go through the gate; after reading outside content (files, logs, transcripts, extensions, ask_claude) the task is tainted and every later write asks. Email, calendar, the web, links and images go to ask_claude (\"Looking into it…\", the answer later). A stuck turn escalates to ask_claude; a down model falls back to the intents path for that turn. Task eval on the example set: 91.0% (live qwen3, 3 runs, 0 unapproved writes).",
+    iface:`BrainRunner(LocalRunner)                     # name="brain"
+build_context → prefix (system · tools + stubs · catalog · facts) | history | turn (briefing · message)
+≤ 8 × chat_tools round: reads → result as a native tool turn
+                        writes → gate (origin tainted after outside content) → executor
+                        claimed change with no tool / unnamed target → one check round
+ask_claude → "Looking into it…" (runner="ask")  · stuck → ask_claude · model down → intents path
+"On it…" past 6 s · reply ≤ 1500 chars · history fold in the background
+first turn ≈ 5.2k prompt tokens: ~4.3 s when Ollama's cache is cold, ~0.05 s prefill warm`,
+    inv:["Every tool call goes through the gate and the executor, as on the intents path","A tainted task's writes always ask (standing allows don't apply); the approval text is code-built","Side effects ≤ 3 and one approval per task","The labeler never runs in loop mode: its prefix would evict the brain's from Ollama's one KV slot","The number guard only counts in loop mode; the prompt says to state only what was read"],
+    links:[{to:"ollama",label:"model calls"},{to:"runner_claude",label:"start_run spawns a worker"},{to:"runner_local",label:"fallback for a turn"},{to:"gate",label:"every write"}],
+    files:["packages/resonant/src/resonant/runners/brain.py","packages/resonant/src/resonant/brain/context.py","packages/resonant/src/resonant/runners/ask.py","packages/resonant/src/resonant/tools/files.py","tests/test_e2e_brain.py","evals/task.example.jsonl"]},
+  runner_local:{label:"Local runner (intents path)", phase:"1 / EM", status:"built",
+    what:"The intents path: an opt-in with brain.mode: intents, and the brain loop's fallback for a turn when the model fails. It answers a labeled chat task with the local model: up to 3 tool calls, each through the gate and the executor, then one JSON answer sent over the channel. It doesn't do engineering itself: work that needs code, ops or research becomes a Claude worker through start_run, from plain words or /run. The run_project intent carries the run, worker and repo tools; the rules intent carries the trust-rule tools. A model asking for more than three calls ends the task with a templated reply.",
     iface:`LocalRunner(conn, *, model, channel, gate, executor, registry, max_step_s)  # name="local"
 step: resend saved reply | fast_reply | fallback/escalate
       | ≤3 × (Intent.for_tool → gate.evaluate → executor.execute) → chat_json {reply}

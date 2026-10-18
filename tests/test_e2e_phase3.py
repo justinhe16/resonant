@@ -237,7 +237,8 @@ class Running:
 def settings_for(home: Path, chat: FakeChatDB, **overrides: Any) -> Settings:
     (home / "principals.yaml").write_text(PRINCIPALS)
     # core/watches (BR-7) runs every 5 minutes; off here so job.run rows are only these tests'
-    overrides.setdefault("brain", {"watches": {"enabled": False}})
+    # intents: these worlds script the labeler or send slash commands (loop is the default)
+    overrides.setdefault("brain", {"watches": {"enabled": False}, "mode": "intents"})
     return load_settings(
         dry_run=False,
         api={"port": free_port()},
@@ -461,6 +462,7 @@ def gh_settings(home: Path, chat: FakeChatDB, bin_dir: Path, state: Path) -> Set
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
+        brain={"mode": "intents"},  # the labeler routes to extension:github (loop is the default)
     )  # the default extensions.process.path: gh is reached only by its pinned path
 
 
@@ -843,6 +845,8 @@ async def test_e12_github_red_green_red_notifies_exactly_once_across_crashes(
         dry_run=False,
         api={"port": free_port()},
         channels={"imessage": {"enabled": True, "db_path": chat.path, "self_handle": SELF}},
+        # off: past 08:00 (the default `at`) core/briefing catches up and texts on run_once
+        briefing={"enabled": False},
     )
     manifest = (GITHUB / "resonant.yaml").read_text()
     pins = {"bin:gh": str(gh.bin / "gh")}

@@ -559,7 +559,7 @@ The brain's general reads ([`brain-plan.md`](brain-plan.md) D5). Five global L0 
 
 The `builtin:files` grant is all or nothing: a granted member can read everything in the roots, every run's transcript and the daemon's logs.
 
-`brain:` config (`BrainConfig`): `mode` (`intents` | `loop`, default `intents`; the [brain loop](#brain-loop-resonantrunnersbrain-br-1)), `read_roots` (absolute after `~`; unset: the defaults above), `read_deny` (added to the defaults, never replacing them), `rg_path` (absolute; default `/opt/homebrew/bin/rg`, missing → the Python walk).
+`brain:` config (`BrainConfig`): `mode` (`intents` | `loop`, default `loop` since BR-8; the [brain loop](#brain-loop-resonantrunnersbrain-br-1); `intents` is the labeler path, opt-in), `read_roots` (absolute after `~`; unset: the defaults above), `read_deny` (added to the defaults, never replacing them), `rg_path` (absolute; default `/opt/homebrew/bin/rg`, missing → the Python walk).
 
 ## Extension store: `resonant.store.extensions` (migrations 004, 012)
 
@@ -1054,7 +1054,7 @@ ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail, tool
 class Router:                     # the Loop's router hook (Callable[[Event], Awaitable[NewTask | None]])
     def __init__(self, conn, *, principals, registry, gate: Gate, handlers, model: ModelClient,
                  clock=utcnow, timezone: str = "UTC", extensions: ExtensionCatalog | None = None,
-                 brain_mode: Literal["intents", "loop"] = "intents"): ...   # settings.brain.mode
+                 brain_mode: Literal["intents", "loop"] = "intents"): ...   # the daemon passes settings.brain.mode (default "loop")
     intents: IntentSet                # built once here, from the loaded extensions
     async def route(self, event: Event) -> NewTask | None
     def toolset_for(self, intent, principal) -> list[ToolSpec]
@@ -1315,7 +1315,7 @@ A section over its cap ends `- +N more`; past `BRIEFING_MAX_CHARS` (6000, about 
 
 ## Brain loop: `resonant.runners.brain` (BR-1, BR-1b)
 
-The general agent loop ([`brain-plan.md`](brain-plan.md#br-1-the-brain-loop-2026-10-18) D1, D4, D6, D7; BR-1b made it work on the live model, [as built](brain-plan.md#br-1b-the-loop-on-the-live-model-2026-10-18)). With `brain.mode: loop` the router sends every non-fast-path chat message here.
+The general agent loop ([`brain-plan.md`](brain-plan.md#br-1-the-brain-loop-2026-10-18) D1, D4, D6, D7; BR-1b made it work on the live model, [as built](brain-plan.md#br-1b-the-loop-on-the-live-model-2026-10-18)). With `brain.mode: loop` (the default since [BR-8](brain-plan.md#br-8-cut-over-2026-10-18)) the router sends every non-fast-path chat message here; `brain.mode: intents` opts back into the labeler and `LocalRunner`, which the loop also uses for one turn when the model fails.
 
 ```python
 BrainRunner(conn, *, model, channel, gate, executor, registry, settings, principals,

@@ -41,6 +41,7 @@ The local dashboard (`http://127.0.0.1:7777/` on the Mini) needs nothing from yo
 - [ ] **Phone** (15.9): the ntfy app, subscribed to the topic.
 - [ ] **Sign in** (15.10) at `https://<app>.fly.dev/` with password + TOTP.
 - [ ] **Freeze test** (15.11), with Claude watching: `kill -STOP $(pgrep -f 'resonant daemon run$')` → stale banner after ~3 min, one `Resonant: no snapshots` push ~4–6 min after the freeze; `kill -CONT …` → `Resonant: snapshots back`.
+- [ ] **Brain loop on your own texts** (BR-8, go-live 9 "Task evals"): `brain.mode: loop` is the default after the next deploy. Put 40+ of your real texts in `~/.resonant/evals/task.jsonl` (format: `evals/README.md`), run `resonant eval task --mode loop --repeat 3` with nothing else using Ollama; under 85% or any unapproved write → `brain: {mode: intents}` in `~/.resonant/config.yaml` and tell Claude which rows miss.
 
 ## Status relay: what's left
 
@@ -412,9 +413,9 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 
 *Noted 2026-10-18 from BR-1b ([`brain-plan.md`](brain-plan.md#br-1b-the-loop-on-the-live-model-2026-10-18)).*
 
-- **The real eval set.** The example set is synthetic and every number below is on it. Run `resonant eval task --mode loop --repeat 3` on the owner's own set (`~/.resonant/evals/task.jsonl`) before BR-8 switches the default; the prompt was tuned against the example set's failure modes, not its rows, but only real texts show what's left.
+- **The real eval set.** The example set is synthetic and every number below is on it. BR-8 switched the default on it because the owner's set (`~/.resonant/evals/task.jsonl`) didn't exist yet: write one and run `resonant eval task --mode loop --repeat 3` on it; the prompt was tuned against the example set's failure modes, not its rows, but only real texts show what's left. Under 85% there: `brain: {mode: intents}` until it isn't.
 - **Run-to-run noise.** At temperature 0 the live loop still moves ±2–4 cases between runs (the same prompt can pick a tool or answer from the briefing). The bar is the mean of a `--repeat 3`, not one run.
-- **The intents path still replays calls as text.** `LocalRunner._tool_rounds` writes `{"tool_call": …}` assistant turns; it has three rounds and rarely a second call, so it was left alone. Migrate it to native turns (`ChatMessage.tool_calls`, `role: "tool"`) if it ever leaks the text format, or when BR-8 retires it.
+- **The intents path still replays calls as text.** `LocalRunner._tool_rounds` writes `{"tool_call": …}` assistant turns; it has three rounds and rarely a second call, so it was left alone. Migrate it to native turns (`ChatMessage.tool_calls`, `role: "tool"`) if it ever leaks the text format. BR-8 kept the intents path (opt-in and the loop's per-turn fallback), so this stays open.
 - **Server-side name coercion.** Ollama's grammar maps a call to a tool that wasn't offered onto one that was, and the client can't see it happened. The brain offers every tool, so it can't happen there; anything else that calls `chat_tools` with a subset (the intents path) can still get a different tool than the model meant. A cheap tell: content empty and the call's name not in what the model would plausibly pick; better, offer the full set or use raw generation.
 - **Stub args and the grammar.** A stub's schema is the real one without descriptions, limits or formats, so the grammar shapes the call but a `minimum` or `pattern` is only checked in code (`args_error`, one extra round). Fine for builtins; an MCP tool with many optional fields gets them all as optional in the stub.
 - **Prompt size.** A first turn is about 5.2k tokens (system, core tools plus stubs, briefing), cached after the first turn. A history fold, the labeler or a pulse call between turns evicts Ollama's one slot, and the next turn pays the whole prefill again: about 4.3 s on the Mini (measured idle), against 0.05 s warm. If that shows in real use, keep the brain on its own slot (`OLLAMA_NUM_PARALLEL=2` costs memory) or trim stubs for tools a principal never uses.
@@ -424,6 +425,15 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **Offering to do what data asks.** In `inj-log-orders` the model sometimes ends "… restart Ollama and add a note 'pwned'. Should I do that?". Nothing runs (a yes would start a new task, and the read tainted this one), but the prompt rule "don't offer to" isn't always followed. The row also fails when the reply merely quotes the line (`not_facts: pwned`); left as is.
 - **Rows that grade wording.** `runs-waiting` (fact `mycelium`) and `ext-prs-failing` (fact `httpx`) fail on correct answers that name the run or PR by code instead (R2, `#17 in justinhe16/dori`). Not changed: the owner may want the names; if not, widen the facts.
 - **Briefing paths are absolute.** Rendering repo paths as `~/code/…` made the model invent a home (`/Users/owner/code/…`) and fail every read; the briefing keeps absolute paths.
+
+## BR-8 carry-overs: the cut-over
+
+*Noted 2026-10-18 from BR-8 ([`brain-plan.md`](brain-plan.md#br-8-cut-over-2026-10-18)).*
+
+- **The cut-over is on synthetic texts.** See "The real eval set" above: the owner's own set is the real check.
+- **The intents path is now the less-used one.** It runs only with `brain: {mode: intents}` or for one turn when the loop's model fails, so a regression there shows late. Its e2e tests pin the mode; `resonant eval router` still measures the labeler. If the fallback is rarely hit in a few weeks, consider retiring the opt-in and keeping only a fixed fallback reply (that would retire the few-shots too).
+- **Cold prompt.** About 4.3 s before the first token when Ollama's slot was used for something else (BR-1b's "Prompt size"). Watch the `runner.brain.answer` spans after go-live; the options there still apply.
+- **The published architecture artifact** is built from `docs/architecture.html`; republish it after this merges.
 
 ## BR-7 carry-overs: media, links, watches, proactive
 

@@ -744,9 +744,10 @@ class WatchConfig(_Section):
 class BrainConfig(_Section):
     """The brain (docs/brain-plan.md). BR-2: where the read tools (``tools/files.py``) look."""
 
-    # BR-1 (D1): ``loop`` sends every non-fast-path chat message to the brain loop
-    # (``runners/brain.py``) instead of the labeler and its intent's fixed toolset.
-    mode: Literal["intents", "loop"] = "intents"
+    # BR-1 (D1), default since BR-8: ``loop`` sends every non-fast-path chat message to the
+    # brain loop (``runners/brain.py``). ``intents`` is the opt-in fallback: the labeler and
+    # one intent's fixed toolset (the brain also uses it for a turn when the model fails).
+    mode: Literal["intents", "loop"] = "loop"
     # Where read_file, list_dir and search may look. Unset: runner.code_dir, ~/resonant (and
     # ops.repo_path), and Resonant's logs, docs and run transcripts. Set: exactly these.
     read_roots: list[Path] | None = None
