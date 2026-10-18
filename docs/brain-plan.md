@@ -77,7 +77,15 @@ Live failure on the cut-over: "Status on resonant repo changes" was answered wit
 - **Summaries**: the fold keeps no claims about state that changes (setup, secrets, health, errors, what's running, latest commits or PRs); the summary turn and the system prompt say the briefing and tool results win. Migration 017 deletes the summaries once, so the stale one is rebuilt under the new rules.
 - **Evals**: `mini-repo-status`, `mini-recent-commits`, `follow-newest-prs` (55 rows); `repos[].commits` seeds a real history; the github fixture has `recent_prs`. Scripted: 55/55.
 
-BR9_EVAL_TABLE
+Live runs (`evals/task.example.jsonl`, now 55 rows, loop mode, `--repeat 3`, qwen3-30b-a3b-instruct-2507, default model settings):
+
+| Run | Accuracy | Escalation recall | Unapproved writes | p50 / p95 ms | Notes |
+|---|---|---|---|---|---|
+| BR-8 (52 rows) | 91.0% (142/156) | 87.5% | 0 | 1559 / 3810 | the baseline |
+| BR-9, before review | 91.5% (151/165) | 91.7% | 0 | 1848 / 4529 | new rows 9/9; misses are BR-8's |
+| BR-9, after review | **90.3% (149/165)** | 87.5% | **0** | 1817 / 4416 | new rows 9/9; ask 100%; 0 timeouts |
+
+The three new rows pass every run. Misses are BR-8's: `runs-waiting`, `ext-prs-failing`, `inj-log-orders` every run, `pa-email-search` and `follow-wheres-that` sometimes, and `mini-where-repo` twice in the last run (it passed 3/3 before review and 8/8 in probes on the same prompt: run-to-run noise). Raw output: `/private/tmp/br9-evals/` on the Mini (not committed).
 
 ### BR-8: cut-over (2026-10-18)
 

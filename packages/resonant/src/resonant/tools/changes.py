@@ -49,6 +49,8 @@ SUBJECT_MAX = 160
 AUTHOR_MAX = 60
 GIT_TIMEOUT_S = 10.0
 OUT_MAX_BYTES = 256 * 1024
+ALTERNATES_MAX_BYTES = 4096  # .git/objects/info/alternates: refused past this
+SCAN_MAX = 10_000  # entries per .git/objects dir checked for symlinks
 SELF_NAMES = frozenset({"resonant", "resonant itself", "self"})
 _SEP = "\x1f"
 _FORMAT = _SEP.join(("%h", "%cI", "%an", "%s"))
@@ -163,15 +165,27 @@ def check_git_dir(scope: ReadScope, real: Path, given: str) -> None:
         raise ToolFailed(f"{tool}: {given} is a linked worktree; name its main checkout")
     objects = gitdir / "objects"
     scope.check(tool, str(objects))
-    alternates = objects / "info" / "alternates"
-    if alternates.is_symlink():
-        raise ToolFailed(f"{tool}: {given} has a symlinked alternates file")
-    if alternates.exists():
+    # No symlink where git looks for objects: the fan-out dirs, pack and info.
+    for d in (objects, objects / "pack", objects / "info"):
         try:
-            lines = alternates.read_text(errors="replace").splitlines()[:20]
+            with os.scandir(d) as it:
+                for n, entry in enumerate(it):
+                    if n > SCAN_MAX or entry.is_symlink():
+                        raise ToolFailed(f"{tool}: {given}'s .git/objects has a symlink")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise ToolFailed(f"{tool}: {given}'s .git/objects can't be read") from None
+    alternates = objects / "info" / "alternates"
+    if alternates.exists():
+        # Every entry, as git reads them all: a big file is refused, never truncated.
+        try:
+            raw = alternates.read_bytes()
         except OSError:
             raise ToolFailed(f"{tool}: {given}'s alternates can't be read") from None
-        for line in (x.strip() for x in lines):
+        if len(raw) > ALTERNATES_MAX_BYTES:
+            raise ToolFailed(f"{tool}: {given}'s alternates file is too large")
+        for line in (x.strip() for x in raw.decode(errors="replace").splitlines()):
             if line and not line.startswith("#"):
                 scope.check(tool, os.path.normpath(objects / line))
 

@@ -180,7 +180,9 @@ def test_the_hardening_is_what_stops_the_repo_config(tmp_path: Path) -> None:
     assert marker.exists()
 
 
-@pytest.mark.parametrize("how", ["gitfile", "symlink", "commondir", "alternates", "objects"])
+@pytest.mark.parametrize(
+    "how", ["gitfile", "symlink", "commondir", "alternates", "padded", "objects", "pack"]
+)
 def test_a_dot_git_pointing_outside_the_roots_is_refused(
     db: sqlite3.Connection, world: tuple[Settings, ReadScope, Path], tmp_path: Path, how: str
 ) -> None:
@@ -197,8 +199,15 @@ def test_a_dot_git_pointing_outside_the_roots_is_refused(
             dot.symlink_to(outside / ".git")
     elif how == "commondir":
         (dot / "commondir").write_text(str(outside / ".git"))
-    elif how == "alternates":
-        (dot / "objects" / "info" / "alternates").write_text(f"{outside / '.git' / 'objects'}\n")
+    elif how in ("alternates", "padded"):
+        pad = "#\n\n" * 25 if how == "padded" else ""  # git reads every line, so must we
+        (dot / "objects" / "info").mkdir(exist_ok=True)
+        (dot / "objects" / "info" / "alternates").write_text(
+            f"{pad}{outside / '.git' / 'objects'}\n"
+        )
+    elif how == "pack":
+        shutil.rmtree(dot / "objects" / "pack")
+        (dot / "objects" / "pack").symlink_to(outside / ".git" / "objects" / "pack")
     else:
         shutil.rmtree(dot / "objects")
         (dot / "objects").symlink_to(outside / ".git" / "objects")
