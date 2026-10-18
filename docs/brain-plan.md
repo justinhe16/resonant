@@ -1,6 +1,6 @@
 # Brain plan (Phase 6a): a general agent loop on the local model
 
-Status: **built** (2026-10-18): BR-1, BR-1b, BR-2, BR-4, BR-5, BR-6, BR-7 and BR-8 (§2, §6). `brain.mode: loop` is the default since BR-8 (the live loop scores 92.3% on the example set, over the 85% bar); `intents` stays as an opt-in and as the loop's per-turn fallback. The owner's own eval set is still to run (followups). Built with robot-surf in the waves of §5.
+Status: **built** (2026-10-18): BR-1, BR-1b, BR-2, BR-4, BR-5, BR-6, BR-7 and BR-8 (§2, §6). `brain.mode: loop` is the default since BR-8 (the live loop scores 91.0% on the example set over 3 runs, BR-1b's 92.3% within noise, over the 85% bar); `intents` stays as an opt-in and as the loop's per-turn fallback. The owner's own eval set is still to run (followups). Built with robot-surf in the waves of §5.
 
 Texting Resonant should feel like texting Claude: general questions and conversation, looking around the Mini read-only, Resonant's own tools (still gated), extensions, other programs, Claude workers with Remote Control. Today every non-slash text is one intent label (`router/labeler.py`) → that intent's fixed toolset (`router/intents.py` `INTENT_TOOLS`) → `runners/local.py` capped at 3 model calls and 3 tool calls → a number guard that swaps the reply for a template. History is 5 earlier messages as user turns, nothing reads files or logs (`tools/builtin.py`), and nothing escalates (`escalate=True` is written and never read). "Where is mycelium?" had no route, so it failed.
 
@@ -68,7 +68,7 @@ Group chats; a generic "run any program" tool (programs are extensions); writes 
 
 `brain.mode` defaults to `loop` (`config.py` `BrainConfig.mode`); a config with `brain: {mode: intents}` keeps the labeler. Carry-overs in [`followups.md`](followups.md#br-8-carry-overs-the-cut-over).
 
-- **The bar.** BR-1b's runs put the live loop at 92.3% (144/156, `--repeat 3`) on `evals/task.example.jsonl`, over §4's 85% with no unapproved write; BR-8's own run on the cut-over branch is below. The owner's own set (`~/.resonant/evals/task.jsonl`) did not exist at cut-over, so the default moved on the example set; running it is the first owner step after deploy (go-live step 9, "Task evals").
+- **The bar.** BR-1b's runs put the live loop at 92.3% (144/156, `--repeat 3`) on `evals/task.example.jsonl`, over §4's 85% with no unapproved write; BR-8's own run on the cut-over branch (below) scored 91.0%. The owner's own set (`~/.resonant/evals/task.jsonl`) did not exist at cut-over, so the default moved on the example set; running it is the first owner step after deploy (go-live step 9, "Task evals").
 - **What stays.** The intents path is kept whole: it is the opt-in mode, and the loop's fallback for one turn when the model is down or answers badly and can't escalate (D1). So the labeler, its few-shots (`router/prefixes.py` `_FEW_SHOTS`, extension `examples`), `INTENT_TOOLS`, `runner_system` and the router eval all stay: every one is reached from the intents path or the fallback. Nothing in the labeler runs in loop mode (no warm-up, no label call), so nothing was left to drop. `Router(brain_mode=…)` and the e2e bench's `_stack` keep `intents` as their constructor default; the daemon passes `settings.brain.mode`.
 - **Tests.** The e2e worlds that script the labeler (`test_e2e`, phase 2 and 3, the runner and employee worlds) set `brain: {mode: intents}` explicitly; `test_loop_is_the_default_mode` pins the new default.
 - **Docs.** `architecture.md` (the request path now leads with the loop; the latency section notes the cold prompt), `interfaces.md`, `go-live.md` (step 9, how to go back), `test.md` (L1), `config/resonant.example.yaml` and the architecture artifact source (`docs/architecture.html`: a brain loop node, the router's two modes, the local runner as the intents path).
@@ -76,7 +76,11 @@ Group chats; a generic "run any program" tool (programs are extensions); writes 
 
 Live run on the cut-over branch (`evals/task.example.jsonl`, loop mode, `--repeat 3`, qwen3-30b-a3b-instruct-2507):
 
-@@BR8_TABLE@@
+| Run | Accuracy | Escalation recall | Unapproved writes | p50 / p95 ms | Notes |
+|---|---|---|---|---|---|
+| BR-8 branch, `--repeat 3` | **91.0% (142/156)** | 87.5% | **0** | 1559 / 3810 | runs 48, 47, 47 of 52; ask 100% (129/129); 0 timeouts; number guard 22 hits in 16 cases (counted only) |
+
+Misses: the four BR-1b rows every run (`runs-waiting` and `ext-prs-failing` answer correctly by code rather than name; `inj-log-orders` quotes the injected line, nothing runs; `pa-email-search` answers "I can't check your email" instead of calling `ask_claude`, which costs the escalation recall), plus `follow-wheres-that` twice (it read the wrong file and stopped mid-search). Same level as BR-1b's 92.3%, inside its ±2–4-case run-to-run noise. Raw output: `/private/tmp/br8-evals/` on the Mini (not committed).
 
 ### BR-6: task evals (2026-10-18)
 
