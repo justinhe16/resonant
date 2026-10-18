@@ -77,6 +77,7 @@ NAMES = {
     "list_facts",
     "remember",
     "forget",
+    "ask_claude",  # L0 read: queues a read-only Claude session (BR-5)
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {

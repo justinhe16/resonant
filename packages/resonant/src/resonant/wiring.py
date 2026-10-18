@@ -45,6 +45,10 @@ off there is no router hook: extension events wait unrouted, as messages would.
 Extension health. The monitor gets ``extensions.host.ExtensionHealth`` as its dynamic
 ``ext:<name>`` checks (health commands, job fail streaks, load refusals, tampering).
 
+Ask Claude. ``runner="ask"`` (``runners.ask.AskRunner``, BR-5) runs one read-only ``claude -p``
+per ``ask_claude`` call and texts the answer, so it is registered here; the tool reaches it as
+``components.runners["ask"]``. With iMessage off the tool answers that it isn't running.
+
 Claude workers. ``runner="claude"`` (``runners.claude.ClaudeRunner``) runs a Claude session
 under the thin guard in a worktree of the owner's checkout (or a scratch dir) and reports the
 PR or the answer; it replies over the channel, so it is registered here. The daemon calls its
@@ -91,6 +95,7 @@ from resonant.monitor import HealthMonitor
 from resonant.ops import SubprocessRunner, back_up
 from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
+from resonant.runners.ask import AskRunner, AskScope
 from resonant.runners.claude import ClaudeRunner
 from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
@@ -347,6 +352,21 @@ def build_imessage_stack(
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
+    # ask_claude (BR-5): a read-only Claude session per question, apart from the worker slots
+    asks = AskRunner(
+        conn,
+        cfg=settings.brain.ask_claude,
+        scope=AskScope.from_settings(settings),  # the read tools' roots and deny list (BR-2)
+        ask_root=settings.home / "ask",
+        channel=channel,
+        secrets=components.executor.secrets or SecretStore(),
+        owner=components.principals.owner,
+        guard=settings.runner.guard,
+        timezone=settings.timezone,
+        create_task=loop.create_task,
+    )
+    components.runners[asks.name] = asks
+    loop.runners[asks.name] = asks
     router.fast_path.runs_killed = lambda: claude.last_killed
     router.relay.workers = lambda: claude  # owner replies to worker questions (EM-5)
 

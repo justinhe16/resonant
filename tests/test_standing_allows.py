@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -229,6 +230,20 @@ def test_kill_switch_and_explicit_and_scheduled(db: sqlite3.Connection, gate: Po
     kv_set(db, "autonomy", "off")
     d = gate.evaluate(call(db, RESTART))
     assert isinstance(d, NeedsApproval) and not d.allow_always
+
+
+def test_never_for_a_tainted_call(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    """D6: a standing allow needs ``inferred``, so a tainted call of the same tool asks, and
+    its prompt offers no ``yes always`` (text the task read can't widen trust)."""
+    allow(db, "*", "tool:restart_resonant")
+    assert isinstance(gate.evaluate(call(db, RESTART)), Allow)
+    d = gate.evaluate(call(db, RESTART, origin="tainted"))
+    assert isinstance(d, NeedsApproval) and not d.allow_always
+    row = db.execute(
+        "SELECT detail FROM audit_log WHERE action = 'gate.evaluate' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    detail = json.loads(row["detail"])
+    assert detail["origin"] == "tainted" and detail["standing"] is None
 
 
 def test_dry_run_wins(db: sqlite3.Connection, gate: PolicyGate) -> None:

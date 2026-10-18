@@ -1,6 +1,6 @@
 # Brain plan (Phase 6a): a general agent loop on the local model
 
-Status: **planned** (2026-10-18). Built with robot-surf in the waves of §5.
+Status: **in progress** (2026-10-18): BR-5 built (§6). Built with robot-surf in the waves of §5.
 
 Texting Resonant should feel like texting Claude: general questions and conversation, looking around the Mini read-only, Resonant's own tools (still gated), extensions, other programs, Claude workers with Remote Control. Today every non-slash text is one intent label (`router/labeler.py`) → that intent's fixed toolset (`router/intents.py` `INTENT_TOOLS`) → `runners/local.py` capped at 3 model calls and 3 tool calls → a number guard that swaps the reply for a template. History is 5 earlier messages as user turns, nothing reads files or logs (`tools/builtin.py`), and nothing escalates (`escalate=True` is written and never read). "Where is mycelium?" had no route, so it failed.
 
@@ -61,3 +61,13 @@ Group chats; a generic "run any program" tool (programs are extensions); writes 
 2. Wave 2: **BR-1 Brain loop**: `runners/brain.py`, `brain.mode`, core and deferred tools with `load_tools`, limits, taint tracking, fallback, the scripted fake (D1, D4, D7).
 3. Wave 3, in parallel: **BR-6 Task evals** (§4); **BR-7 Media, links, watches, proactive** (D10).
 4. Wave 4: **BR-8 Cut-over**: default `loop` once the evals pass, docs (architecture, interfaces, go-live), drop unused intent few-shots, the architecture artifact.
+
+## 6. As built
+
+### BR-5: `ask_claude` and taint (2026-10-18)
+
+- **Taint (D6).** `Origin` gains `"tainted"`; `policy.rule` asks for L2 and L3 when the origin is tainted (L0 allows, L1 asks with a code, a `levels` override to L3 still asks). Standing allows already required `inferred`, so a tainted call never gets one and its prompt offers no `yes always`. The audit row carries the origin. Nothing sets `tainted` yet: BR-1 does, for every model-chosen call after the task read untrusted content (and after `ask_claude`).
+- **`ask_claude` (D8)** is `tools/ask.py` (L0, `Effect.READ`: read-only by construction, bounded by the cap; a tainted task may call it) and `runners/ask.py` (`runner="ask"`, task kind `ask`, `uses_claude_slot=False`). Interfaces: [`interfaces.md`](interfaces.md#ask-claude-resonantrunnersask-resonanttoolsask-br-5-docsbrain-planmd-d8). The tool returns `"Looking into it…"` as its text; the loop (BR-1) sends it. The answer goes to the calling task's principal as `Claude: …` and the ask task's result carries `untrusted: true`.
+- **Probe (Claude Code 2.1.302, the Mini's login, one run in a scratch dir).** `--restricted`, `--tools`, `--permission-mode dontAsk`, `--allowedTools`/`--disallowedTools`, `--add-dir` and `--no-session-persistence` all exist. With `claude -p --restricted --tools Read,Grep,Glob,WebSearch,WebFetch --permission-mode dontAsk --no-session-persistence --output-format stream-json --verbose`, the `init` event listed exactly `Glob, Grep, Read, WebFetch, WebSearch`, `mcp_servers` was empty and `permissionMode` was `dontAsk`: **claude.ai connectors (Gmail, Calendar) do not load under `--restricted`.** So `email` and `calendar` asks are refused by the init check with `Not done: Calendar isn't reachable from Claude's read-only mode (missing …)`. The allowlist, write-name filter and draft rule are built and tested against fake connector tools, so they work unchanged if a later CLI loads connectors there. Getting email and calendar needs a decision (followups: "ask_claude: email and calendar").
+- **Read roots.** One source with the read tools (BR-2): `AskScope.from_settings` takes `brain.read_roots` (or `files.default_roots`), `DEFAULT_READ_DENY` + `brain.read_deny` and Resonant's own secrets; `--add-dir` gets the real top roots and the deny list becomes `Read(...)` rules passed in `--settings`. The ask's cwd moved to `<RESONANT_HOME>/ask` since `runner.work_dir` is always denied.
+- **Attachments** (for BR-7): absolute paths under a read root or `brain.ask_claude.attachment_roots` (`~/Library/Messages/Attachments`, carved out of the `~/Library` deny), checked at enqueue and again when copied into the session's empty cwd.
