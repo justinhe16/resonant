@@ -401,3 +401,21 @@ async def test_a_digest_rule_holds_a_listed_event(db: sqlite3.Connection) -> Non
     assert ch.texts == ["[github] ✗ app#1 CI failed"]
     (row,) = audit_rows(db, "ext.notify_held")
     assert row["idempotency_key"] == "ext:github:a:failed" and '"rule"' in row["detail"]
+
+
+async def test_worker_event_names_never_override_an_extension(db: sqlite3.Connection) -> None:
+    """A rule taught for worker runs ("text me when dori runs fail") never wakes an
+    extension's event that happens to share the name."""
+    ch = DedupeChannel()
+    n = notifier(db, ch)
+    n.manifest_of = lambda ext: QUIET if ext == "github" else None  # pyright: ignore[reportUnknownLambdaType]
+    for action in ("failed", "merged", "done"):
+        notify_rule(db, "dori", action, "notify_now")
+    store_repo_events(
+        db,
+        ("failed", "x failed", "w:1", "own/dori"),
+        ("merged", "x merged", "w:2", "own/dori"),
+        ("done", "x done", "w:3", "own/dori"),
+    )
+    await make_loop(db, n).run_once()
+    assert ch.texts == []

@@ -6,10 +6,13 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import pytest
 
 from resonant.extensions import pulse_job
 from resonant.extensions import rollup as ru
@@ -17,7 +20,7 @@ from resonant.extensions.scheduler import persist_events
 from resonant.store import extensions as ext_store
 from resonant.store import pulse as ps
 from resonant.store import runs as runs_store
-from resonant.store.db import iso, transaction, utcnow
+from resonant.store.db import iso, kv_set, transaction, utcnow
 from resonant.store.runs import Run
 
 H = timedelta(hours=1)
@@ -193,6 +196,24 @@ def test_queued_and_ready_runs_stall_waiting_ones_never(db: sqlite3.Connection) 
     assert pending(db, now) == {}
 
 
+@pytest.fixture(autouse=True)
+def long_active(request: pytest.FixtureRequest) -> None:
+    """The rollup ran long before these tests' data (an upgrade's floor is its own test)."""
+    if "db" in request.fixturenames:
+        activate(request.getfixturevalue("db"), datetime(2026, 1, 1, tzinfo=UTC))
+
+
+def activate(db: sqlite3.Connection, at: datetime) -> None:
+    with transaction(db):
+        kv_set(db, ru.ACTIVATED_KEY, iso(at))
+
+
+def fresh(db: sqlite3.Connection, at: datetime, outcome: str = "ok") -> None:
+    """The github watch's last run, at ``at``."""
+    with transaction(db):
+        ext_store.record_run(db, "github", "watch", at=at, outcome=outcome, ok=outcome == "ok")
+
+
 def install_github(db: sqlite3.Connection, at: datetime, status: str = "enabled") -> None:
     ext_store.save_extension(
         db,
@@ -223,6 +244,7 @@ def pr(n: int, title: str = "", repo: str = "own/dori", **extra: Any) -> dict[st
 def test_github_merges_work_and_stalls_join_the_rollup(db: sqlite3.Connection) -> None:
     now = utcnow().replace(microsecond=0) + H
     install_github(db, now - 30 * 24 * H)
+    fresh(db, now - timedelta(minutes=5))
     watch(
         db,
         ("pr_merged", "m40", pr(40, "fix login", merged_at=iso(now - 2 * H))),
@@ -230,6 +252,7 @@ def test_github_merges_work_and_stalls_join_the_rollup(db: sqlite3.Connection) -
         ("pr_active", "a41", pr(41, "cache layer", active_at=iso(now - 6 * H))),
         ("pr_active", "a42", pr(42, "add x", active_at=iso(now - H))),
         ("pr_active", "a43", pr(43, active_at=iso(now - 9 * H))),
+        ("pr_active", "a44", pr(44, active_at=iso(now - 9 * H), draft=True)),  # parked
         ("pr_closed", "c43", pr(43)),  # closed after: not stalled
         ("review_requested", "r9a", pr(9, "bump deps", repo="own/app")),
         ("review_requested", "r9b", pr(9, "bump deps", repo="own/app")),  # a new push: once
@@ -243,8 +266,10 @@ def test_github_merges_work_and_stalls_join_the_rollup(db: sqlite3.Connection) -
     roll = ru.gather(db, now, [])
     assert roll.working == ("dori#42 add x",)
     tell(db, now)
+    fresh(db, now + H)
     ru.refresh(db, now + H)  # nothing new: no news, no message
     assert pending(db, now + H) == {}
+    fresh(db, now + 3 * H)
     ru.refresh(db, now + 3 * H)  # 42 went quiet too
     assert pending(db, now + 3 * H) == {"stall/pr:own/dori:42": "dori#42 add x (~4h quiet)"}
     assert ru.gather(db, now + 3 * H, []).working == ()
@@ -255,6 +280,7 @@ def test_github_state_from_before_the_install_is_never_announced(
 ) -> None:
     now = utcnow().replace(microsecond=0) + H
     install_github(db, now - 2 * H)
+    fresh(db, now)
     watch(
         db,
         ("pr_active", "a1", pr(1, active_at=iso(now - 30 * H))),  # quiet before install
@@ -300,6 +326,69 @@ def test_bad_watch_data_is_skipped(db: sqlite3.Connection) -> None:
     assert len(titles) == 1 and "[" not in titles[0] and "yes A7" not in titles[0]
 
 
+def test_an_upgrade_never_floods_with_what_was_already_there(db: sqlite3.Connection) -> None:
+    """An existing install gets this code: its backlog (old merges, PRs and runs already
+    quiet) is written told on the first refresh; what happens after is news."""
+    with transaction(db):
+        db.execute("DELETE FROM kv WHERE key = ?", (ru.ACTIVATED_KEY,))
+    now = utcnow().replace(microsecond=0)
+    install_github(db, now - 30 * 24 * H)  # installed long ago: no baseline helps here
+    fresh(db, now)
+    make_run(db, ask="pr waits", status="ready", ended_at=iso(now - 6 * H))
+    watch(
+        db,
+        ("pr_merged", "m1", pr(1, merged_at=iso(now - H))),
+        ("pr_active", "a2", pr(2, active_at=iso(now - 6 * H))),
+        ("review_requested", "r3", pr(3)),
+    )
+    now = utcnow()  # the first refresh with this code: after the backlog was stored
+    ru.refresh(db, now)
+    assert pending(db, now) == {}
+    assert ps.get(db, "core", "stall/run-r1") is not None  # tracked, told
+    time.sleep(0.01)  # stored strictly after the activation (millisecond stamps)
+    watch(db, ("pr_merged", "m4", pr(4, merged_at=iso(now))))  # after the upgrade: news
+    ru.refresh(db, now + timedelta(minutes=10))
+    assert pending(db, now + H) == {"merged/pr:own/dori:4": "dori#4 change 4"}
+
+
+def test_a_merge_is_final_unless_the_pr_moved_after_it(db: sqlite3.Connection) -> None:
+    now = utcnow().replace(microsecond=0) + H
+    install_github(db, now - 30 * 24 * H)
+    fresh(db, now)
+    watch(
+        db,
+        ("pr_merged", "m5", pr(5, merged_at=iso(now - 6 * H))),
+        ("pr_active", "a5", pr(5, active_at=iso(now - 7 * H))),  # the same watch saw it open
+        ("pr_closed", "c6", pr(6, closed_at=iso(now - 7 * H))),
+        ("pr_active", "a6", pr(6, active_at=iso(now - H))),  # reopened and moved since
+    )
+    prs = {p.number: p for p in ru.github_prs(db, now)[0]}
+    assert prs[5].state == "merged" and prs[6].state == "open"
+    ru.refresh(db, now)
+    assert "stall/pr:own/dori:5" not in pending(db, now)
+    assert ru.gather(db, now, []).working == ("dori#6 change 6",)
+
+
+def test_a_stale_watch_says_nothing_about_prs(db: sqlite3.Connection) -> None:
+    """PR activity is what the watch last stored: when it stopped running or fails, every PR
+    would look quiet. No new PR stalls, no PRs being worked on, and known ones stay put."""
+    now = utcnow().replace(microsecond=0) + H
+    install_github(db, now - 30 * 24 * H)
+    watch(db, ("pr_active", "a7", pr(7, active_at=iso(now - 6 * H))),
+          ("pr_active", "a8", pr(8, active_at=iso(now - H))))  # fmt: skip
+    ru.refresh(db, now)  # never ran
+    assert pending(db, now) == {} and ru.gather(db, now, []).working == ()
+    fresh(db, now - timedelta(minutes=5))
+    ru.refresh(db, now)
+    assert list(pending(db, now)) == ["stall/pr:own/dori:7"]
+    assert ru.gather(db, now, []).working == ("dori#8 change 8",)
+    fresh(db, now + H, outcome="failed")
+    ru.refresh(db, now + H)
+    stall = ps.get(db, "core", "stall/pr:own/dori:7")
+    assert stall is not None and not stall.cleared  # left as it was
+    assert ru.gather(db, now + H, []).working == ()
+
+
 # --- through the pulse -----------------------------------------------------------------------
 
 
@@ -321,6 +410,8 @@ async def test_the_pulse_sends_the_rollup_once_and_never_an_all_quiet() -> None:
         ):  # not quiet, briefing
             t += H
         install_github(h.db, t - 30 * 24 * H)
+        activate(h.db, t - 30 * 24 * H)
+        fresh(h.db, t - timedelta(minutes=5))
         make_run(h.db, ask="add dark mode", status="merged", pr_number=12, pr_url=URL)
         runs_store.update(h.db, "R1", ended_at=iso(t - H))
         from resonant.runners.reports import WorkerReports, end_title

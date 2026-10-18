@@ -460,6 +460,12 @@ def test_watch_reports_merged_and_closed_prs(gh: FakeGh) -> None:
         ("pr_closed", f"{RESONANT}#39:closed:2026-10-14T03:00:00Z", "closed resonant#39 Change 39"),
     ]
     assert r.events[0]["data"]["merged_at"] == "2026-10-14T02:00:00Z"
+    # merged between the open search and the closed one: closed only, never active again
+    gh.state["mine"] = [pr_node(38, "s1"), pr_node(41, "t1")]
+    both = gh.run("watch").events
+    assert [e["dedupe_key"] for e in both if e["type"] == "pr_active"] == [
+        f"{RESONANT}#41:active:2026-10-13T00:00:00Z"
+    ]
     query = next(c["argv"] for c in gh.calls() if any("is:closed" in a for a in c["argv"]))
     q = next(a for a in query if a.startswith("q="))
     assert "author:octo" in q and f"repo:{RESONANT}" in q and "closed:>=" in q

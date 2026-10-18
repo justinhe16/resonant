@@ -67,13 +67,16 @@ from resonant.store import repos as repos_store
 from resonant.store import trust as trust_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
-from resonant.trust.policy import NotifyDecision, scope_rank
+from resonant.trust.policy import URGENT_EVENTS, NotifyDecision, scope_rank
 from resonant.trust.policy import notify_level as trust_notify_level
 from resonant_sdk import Event, Manifest
 
 log = logging.getLogger(__name__)
 
 SOURCE_PREFIX = "ext:"
+# The worker events notify rules already name (``runners/reports.py``): an extension event of
+# the same type is never overridden by them (GH-2).
+WORKER_EVENTS: frozenset[str] = URGENT_EVENTS | {"done", "pr", "merged", "note"}
 OVERFLOW_KEY = "ext.notify.overflow"  # kv: {ext: [hour iso, ...]} with capped events
 FLUSH_EVERY_S = 60.0
 
@@ -306,9 +309,13 @@ class Notifier:
         """The owner's override for this event (GH-2), or None: a ``notify_now`` or
         ``notify_digest`` trust rule whose action is the event type itself (``ci_failed``;
         a ``*`` action never matches, so "text me everything" can't wake every event an
-        extension stores). Matched like a standing allow, system = the extension, against
+        extension stores; nor does a worker event's name, ``WORKER_EVENTS``). A rule scoped
+        to a repo covers that event type from any extension reporting on the repo ("CI fails
+        in dori"). Matched like a standing allow, system = the extension, against
         the event's ``data.repo``: its registered name, else ``owner/name`` and ``name``
         (the most specific rule wins). Unreadable: None."""
+        if etype in WORKER_EVENTS:
+            return None  # "text me when dori runs fail" is about workers, never an extension
         try:
             action = trust_store.slug(etype)
             rules = [r for r in trust_store.list_rules(self.conn) if r.action == action]

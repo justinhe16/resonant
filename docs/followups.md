@@ -405,3 +405,6 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **No index for the rollup's read.** `rollup.github_prs` scans `events` for `ext:github` rows of the last week each hour; `events` has no `(source, occurred_at)` index and is never pruned. Add one (a migration) if the table grows large.
 - **`/pulse` doesn't refresh.** The preview is read-only, so a stall that began since the last pulse run shows only after the next one (the same holds for approval re-mentions).
 - **Review requests: once per PR.** A review request is said once per PR (until its told row is pruned a week later), not per push; one re-requested after you reviewed isn't said again within that week.
+- **Wording for a waiting PR.** A `ready` run's PR quiet for 4h reads "got dropped", though it waits on the owner's merge; a run queued behind the slot limit reads the same. A "waiting on you to merge" phrasing would be kinder.
+- **Quiet ones leave the status.** Once a stall is told, the run or PR is left out of `Still working on` and not named again until it moves. A `Quiet: …` status line could keep it visible.
+- **A long mute and old merges.** An untold `merged/` item is kept up to 30 days, so a long mute could say a stale merge later; news age isn't checked at send time.

@@ -37,7 +37,7 @@ Optional: `~/.resonant/ext-data/github/config.json`.
 ## Quiet by default (GH-2)
 
 The manifest has no `notify:` block, so nothing this extension emits texts you right away. Instead:
-- The hourly pulse's `Workers:` section is a progress rollup (`resonant/extensions/rollup.py`): `Merged: … dori#40 fix login`, `Looks like dori#41 cache layer (~5h quiet) got dropped. You should take a look.`, `Review requested: app#9 bump deps`, and your recently active PRs under `Still working on:`. Each merge, review request and stall is said once; a stall again only after new activity and a new quiet stretch (`pulse.stall_after`, default `4h`). A PR that was already quiet when you installed the extension is never announced.
+- The hourly pulse's `Workers:` section is a progress rollup (`resonant/extensions/rollup.py`): `Merged: … dori#40 fix login`, `Looks like dori#41 cache layer (~5h quiet) got dropped. You should take a look.`, `Review requested: app#9 bump deps`, and your recently active PRs under `Still working on:`. Each merge, review request and stall is said once; a stall again only after new activity and a new quiet stretch (`pulse.stall_after`, default `4h`). A PR that was already quiet when you installed the extension (or when you updated to this version) is never announced, nor is a draft. If `watch` hasn't succeeded in the last 30 minutes (expired token, `gh` gone, paused), the rollup says nothing about which PRs are active or quiet rather than guess.
 - CI is on demand: `/github prs`, "any of my PRs failing CI?", `show PR 40 in justinhe16/resonant`.
 - The 08:00 briefing still has the `github/summary` line.
 

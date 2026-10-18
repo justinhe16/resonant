@@ -558,8 +558,11 @@ def cmd_watch(gh: Gh) -> dict[str, Any]:
         key = f"{pr['repo']}#{pr['number']}:{pr['head_sha']}:review"
         text = f"👀 {ref(pr)} review requested: {pr['title']}"
         events.append(event("review_requested", text, key, pr_data(pr)))
-    events += closed_events(search_closed(gh))
-    events += active_events(mine)
+    closed = closed_events(search_closed(gh))
+    # A PR merged between the two searches is in both: it is closed, never active again.
+    done = {(_d(e["data"]).get("repo"), _d(e["data"]).get("number")) for e in closed}
+    events += closed
+    events += active_events([p for p in mine if (p["repo"], p["number"]) not in done])
     summary = f"{len(mine)} PRs watched, {len(events)} events"
     return emit({"summary": summary, "prs": len(mine), "events_found": len(events)}, events)
 

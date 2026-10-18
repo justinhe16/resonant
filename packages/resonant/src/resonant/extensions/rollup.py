@@ -35,8 +35,13 @@ run's end (its PR waits for the owner's merge). A run waiting (for the owner's a
 usage reset) is never a stall: the first is on the owner, the second on a clock. A PR's
 activity is the extension's ``active_at``: its ``updatedAt`` (commits, comments, reviews) or
 its latest check, whichever is later. A stall that began before the github extension was
-installed is written told: state that existed before the install is never announced, like
-the notifier's baseline.
+installed, or before the rollup first ran (kv ``rollup.activated_at``: an upgrade of an
+existing install), is written told, and a merge or review request stored before that is not
+news: state that existed before is never announced, like the notifier's baseline. PR data is
+only what the watch last stored, so PR stalls and ``Still working on`` PRs need its last run
+to have succeeded in the last ``WATCH_FRESH``; a stale watch leaves PR stalls as they are.
+A merged or closed PR stays so unless a later ``pr_active`` moved after it (a reopen). A
+draft PR is never a stall (it is often parked on purpose); it still counts as work.
 
 Rendering is pure (:func:`entries`): at most ``LINES_MAX`` lines under the header, each at
 most ``LINE_MAX``; a combined line names what fits and ends ``+N more`` (those items stay
@@ -62,7 +67,7 @@ from resonant.extensions.pulse import render_item
 from resonant.store import extensions as ext_store
 from resonant.store import pulse as store
 from resonant.store import runs as runs_store
-from resonant.store.db import atomic, iso
+from resonant.store.db import atomic, iso, kv_get, kv_set
 from resonant.store.runs import Run
 
 log = logging.getLogger(__name__)
@@ -79,6 +84,8 @@ NEWS_WINDOW = timedelta(hours=48)  # a merge or review request older than this i
 PR_WINDOW = timedelta(days=7)  # the github events read; a PR quiet longer drops out
 READY_WINDOW = timedelta(days=7)  # a ready run's PR older than this is no longer watched
 STALL_AFTER = timedelta(hours=4)  # the default of ``pulse.stall_after``
+WATCH_FRESH = timedelta(minutes=30)  # three missed 10-minute watches: PR data is stale
+ACTIVATED_KEY = "rollup.activated_at"  # kv: when the rollup first ran (an upgrade's floor)
 ITEM_TTL_S = 7 * 24 * 3600
 LINES_MAX = 6
 LINE_MAX = 200
@@ -118,6 +125,9 @@ class Pr:
     active_at: datetime | None = None
     merged_at: datetime | None = None
     baseline: bool = False  # what was said about it came from the install's first watch
+    ended_at: datetime | None = None  # when it was merged or closed
+    seen_at: datetime | None = None  # when the event that left it so was stored
+    draft: bool = False
 
     @property
     def ref(self) -> str:
@@ -351,17 +361,53 @@ def github_prs(
             "open",
             baseline=payload.get("baseline") is True,
         )
+        base = replace(base, seen_at=_when(occurred))
         kind = str(etype).removeprefix(f"ext.{GITHUB}.")
         if kind == "pr_active":
-            prs[key] = replace(base, active_at=_when(d.get("active_at")))
+            active = _when(d.get("active_at"))
+            if before is not None and before.state != "open" and not _reopened(before, active):
+                continue  # merged or closed is final unless it moved after (a reopen)
+            prs[key] = replace(base, active_at=active, draft=d.get("draft") is True)
         elif kind == "pr_merged":
             merged_at = _when(d.get("merged_at")) or _when(occurred)
-            prs[key] = replace(base, state="merged", merged_at=merged_at)
+            prs[key] = replace(base, state="merged", merged_at=merged_at, ended_at=merged_at)
         elif kind == "pr_closed":
-            prs[key] = replace(base, state="closed")
+            closed_at = _when(d.get("closed_at")) or _when(occurred)
+            prs[key] = replace(base, state="closed", ended_at=closed_at)
         elif (at := _when(occurred)) is not None:
             reviews[key] = (base, at)
     return list(prs.values()), list(reviews.values())
+
+
+def _reopened(ended: Pr, active: datetime | None) -> bool:
+    """A ``pr_active`` after a merge or close counts only when it moved after that (a reopen):
+    one watch can see a PR open and then merged, and must not undo the merge."""
+    return active is not None and ended.ended_at is not None and active > ended.ended_at
+
+
+def watch_fresh(conn: sqlite3.Connection, now: datetime) -> bool:
+    """The github watch's last run succeeded within ``WATCH_FRESH``. PR activity is only
+    what the watch last stored, so a failing or paused watch would make every PR look
+    quiet: without a fresh one, no PR is called stalled or still being worked on."""
+    job = ext_store.get_job(conn, GITHUB, "watch")
+    return (
+        job is not None
+        and job.last_outcome == "ok"
+        and job.last_run_at is not None
+        and now - job.last_run_at <= WATCH_FRESH
+    )
+
+
+def activated(conn: sqlite3.Connection, now: datetime) -> datetime:
+    """When this rollup first ran (kv ``rollup.activated_at``, set then): a stall that began
+    before it, or a merge or review request stored before it, is old news on an upgrade."""
+    raw: object = kv_get(conn, ACTIVATED_KEY)
+    at = _when(raw)
+    if at is None:
+        kv_set(conn, ACTIVATED_KEY, iso(now))
+        at = _when(iso(now))  # as stored (milliseconds), so every refresh sees the same
+        assert at is not None
+    return at
 
 
 def _run_pr_urls(runs: Iterable[Run]) -> set[str]:
@@ -389,7 +435,7 @@ def gather(
         if i.source == CORE and i.key.startswith(STALL_PREFIX + "run-")
     )
     working: list[str] = []
-    if github_installed(conn) is not None:
+    if github_installed(conn) is not None and watch_fresh(conn, now):
         prs, _reviews = github_prs(conn, now)
         ours = _run_pr_urls(runs_store.recent(conn, 200))
         working = [
@@ -417,43 +463,52 @@ def refresh(
     ``stall_after`` (and cleared silently for the rest), ``merged/…`` and ``review/…`` for
     the github watch's news. Called by the pulse and the briefing before they compose."""
     live: dict[str, tuple[str, datetime, bool]] = {}  # key -> (title, quiet since, silent)
-    recent = runs_store.recent(conn, 200)
-    watched = [*runs_store.active(conn), *runs_store.ended_since(conn, "ready", now - READY_WINDOW)]
-    for run in watched:
-        at = last_activity(run, transcripts, now)
-        if at is not None and now - at >= stall_after:
-            title = f"{label(run)} ({quiet_text(now - at)} quiet)"
-            live[stall_key("run-", run.code)] = (title, at, False)
-    installed = github_installed(conn)
     with atomic(conn):
+        since = activated(conn, now)
+        recent = runs_store.recent(conn, 200)
+        watched = [*runs_store.active(conn),
+                   *runs_store.ended_since(conn, "ready", now - READY_WINDOW)]  # fmt: skip
+        for run in watched:
+            at = last_activity(run, transcripts, now)
+            if at is not None and now - at >= stall_after:
+                title = f"{label(run)} ({quiet_text(now - at)} quiet)"
+                live[stall_key("run-", run.code)] = (title, at, at + stall_after <= since)
+        installed = github_installed(conn)
+        fresh = installed is not None and watch_fresh(conn, now)
         if installed is not None:
+            floor = max(installed, since)
             prs, reviews = github_prs(conn, now)
             ours = _run_pr_urls(recent)
             for pr in prs:
                 if pr.url in ours:
                     continue  # the run's own item says it
-                if pr.state == "open" and pr.active_at is not None:
+                if pr.state == "open" and pr.active_at is not None and fresh and not pr.draft:
                     quiet = now - pr.active_at
                     if quiet >= stall_after:
                         title = f"{pr.name} ({quiet_text(quiet)} quiet)"
-                        silent = pr.active_at + stall_after <= installed
+                        silent = pr.active_at + stall_after <= floor
                         key = stall_key("pr:", f"{pr.repo}:{pr.number}")
                         live[key] = (title, pr.active_at, silent)
-                elif _merged_news(pr, now):
+                elif _merged_news(pr, now, since):
                     _once(conn, pr_key(MERGED_PREFIX, pr), pr.name, now)
             for pr, at in reviews:
-                if not pr.baseline and now - at < NEWS_WINDOW:
+                if not pr.baseline and now - at < NEWS_WINDOW and at > since:
                     _once(conn, pr_key(REVIEW_PREFIX, pr), pr.name, now)
-        _sync_stalls(conn, live, now)
+        # a stale watch says nothing new about PRs: their stalls are left as they are
+        keep = () if fresh or installed is None else (STALL_PREFIX + "pr:",)
+        _sync_stalls(conn, live, now, keep=keep)
 
 
-def _merged_news(pr: Pr, now: datetime) -> bool:
-    """A merge to say: seen after the install's first watch, within ``NEWS_WINDOW``."""
+def _merged_news(pr: Pr, now: datetime, since: datetime) -> bool:
+    """A merge to say: seen after the install's first watch and the rollup's activation,
+    within ``NEWS_WINDOW``."""
     return (
         pr.state == "merged"
         and not pr.baseline
         and pr.merged_at is not None
         and now - pr.merged_at < NEWS_WINDOW
+        and pr.seen_at is not None
+        and pr.seen_at > since
     )
 
 
@@ -465,10 +520,15 @@ def _once(conn: sqlite3.Connection, key: str, title: str, now: datetime) -> None
 
 
 def _sync_stalls(
-    conn: sqlite3.Connection, live: Mapping[str, tuple[str, datetime, bool]], now: datetime
+    conn: sqlite3.Connection,
+    live: Mapping[str, tuple[str, datetime, bool]],
+    now: datetime,
+    *,
+    keep: tuple[str, ...] = (),
 ) -> None:
     """Make the open ``stall/`` items match ``live``. The state is when the quiet began, so a
-    stall is news once; one that ends is cleared silently (cleared and told)."""
+    stall is news once; one that ends is cleared silently (cleared and told). Open items
+    under a ``keep`` prefix are left alone (what we know about them is stale)."""
     for key, (title, since, silent) in live.items():
         state = {"since": iso(since)}
         _change, item = store.upsert(conn, CORE, key, title, "normal", state, False,
@@ -477,6 +537,8 @@ def _sync_stalls(
             store.mark_told(conn, [item], now)
     for item in store.open_items(conn, now):
         if item.source != CORE or not item.key.startswith(STALL_PREFIX) or item.key in live:
+            continue
+        if keep and item.key.startswith(keep):
             continue
         _change, cleared = store.upsert(conn, CORE, item.key, item.title, "normal",
                                         {"ended": True}, True, ITEM_TTL_S, now)  # fmt: skip
