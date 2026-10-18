@@ -14,8 +14,16 @@
 (b') Brain loop (``brain_mode="loop"``, ``brain.mode``; docs/brain-plan.md D1): no labeler,
     ``NewTask(kind="chat", runner="brain", checkpoint={"title": "chat"})``. The fast path,
     approval replies and the relay run first, unchanged.
-(c) None for anything else (other sources/types, no principal, empty text). The Loop
-    consumes the event.
+(b'') Media (BR-7, docs/brain-plan.md D10): an owner's message with attachments
+    (``payload.attachments``: images, PDFs, voice notes, written by the reader) gives
+    ``NewTask(kind="media", runner="media", checkpoint={"title": "media"})`` right after the
+    slash commands, in both modes (``runners/media.py``: an image or PDF goes to
+    ``ask_claude``, a voice note through whisper). A voice transcript comes back as a
+    message event with ``payload.voice`` and goes only to the chat path (the labeler or
+    the brain, whose model-chosen calls are gated): never a slash command or keyword (they
+    run as explicit consent), an approval reply or a worker reply. Those stay typed.
+(c) None for anything else (other sources/types, no principal, empty text and no
+    attachments). The Loop consumes the event.
 
 Order: slash commands first (so ``/kill`` is never read as a reply), then approval replies
 (``router/approvals.py``: the parser, then ``gate.resolve_reply``), then the relay's direct
@@ -64,6 +72,7 @@ from typing import Any, Literal
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.gate import Gate
 from resonant.gate.replies import parse_reply
+from resonant.gateway.imessage.attachments import from_payload
 from resonant.loop.types import PRIORITY_MEMBER, PRIORITY_OWNER, NewTask
 from resonant.models import ModelClient, SpanFactory
 from resonant.observability.spans import span
@@ -95,6 +104,9 @@ BRAIN_TITLE = "chat"
 KIND_REPLY = "reply"
 KIND_CHAT = "chat"
 KIND_COMMAND = "command"
+MEDIA_RUNNER = "media"
+KIND_MEDIA = "media"
+MEDIA_TITLE = "media"
 APPROVAL_TITLE = "approval reply"
 RELAY_TITLE = "worker reply"
 
@@ -244,10 +256,13 @@ class Router:
         if principal is None or principal not in self.principals.principals:
             return None
         text: Any = event.payload.get("text")
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(text, str):
             return None
-
         is_owner = self.principals.principals[principal].role == "owner"
+        media = is_owner and bool(from_payload(event.payload))
+        if not text.strip() and not media:
+            return None
+        voice = event.payload.get("voice") is True
         priority = PRIORITY_OWNER if is_owner else PRIORITY_MEMBER
         spans: SpanFactory = partial(span, self.conn, trace_id=event.trace_id)
         channel_ref = _channel_ref(event, principal)
@@ -272,7 +287,9 @@ class Router:
 
         # Order: slash commands (so /kill is never read as a reply), approval replies, then
         # keywords and the labeler.
-        cmd = self.fast_path.match(text)
+        # A voice transcript is chat only: never a slash command or keyword (``/restart``
+        # misheard would run as explicit consent), an approval or a worker reply.
+        cmd = None if voice else self.fast_path.match(text)
         if cmd is not None and cmd.slash:
             result = await self.fast_path.run(
                 cmd, principal=principal, event_id=event.id, trace_id=event.trace_id, spans=spans
@@ -293,6 +310,18 @@ class Router:
             if result is not None:
                 return reply(result.reply_text, result.tool_used, result.intent, result.command)
 
+        if media:
+            with spans("router.media", principal=principal):
+                pass
+            return NewTask(
+                kind=KIND_MEDIA,
+                runner=MEDIA_RUNNER,
+                priority=priority,
+                principal=principal,
+                channel_ref=channel_ref,
+                checkpoint={"title": MEDIA_TITLE},
+            )
+
         def relayed(text: str) -> NewTask:
             return reply(text, None, "run_project", RELAY_TITLE)
 
@@ -300,7 +329,10 @@ class Router:
         # question competes; with both open, it binds neither (relay.py, "approval clash"),
         # unless the one question open can't take a yes/no (it offers other options).
         skip_inbox = False
-        plain = parse_reply(text, truncated=event.payload.get("truncated") is True)
+        # A voice transcript never answers an approval (approving stays typed).
+        plain = (
+            None if voice else parse_reply(text, truncated=event.payload.get("truncated") is True)
+        )
         opens = (
             self.relay.open_for(event, principal)
             if plain is not None and plain.code is None
@@ -316,13 +348,14 @@ class Router:
             if plain_reply_clashes(sent, opens, check=check):
                 return relayed(clash_text(sent, opens))
             skip_inbox = not sent
+        skip_inbox = skip_inbox or voice
         answered = None if skip_inbox else self.inbox.handle(event, text, principal, spans=spans)
         if answered is not None:
             if answered.reply is None:
                 return None  # consumed: the woken runner sends the confirmation
             return reply(answered.reply, None, "job_control", APPROVAL_TITLE)
 
-        direct = self.relay.direct(event, text, principal, stash)
+        direct = None if voice else self.relay.direct(event, text, principal, stash)
         if direct is not None:
             return relayed(direct.reply)
 
@@ -336,7 +369,11 @@ class Router:
         if self.brain_mode == "loop":
             # D1: no labeler (its prefix would evict the brain's from the model's one KV
             # slot). Any free text may still answer an open worker question.
-            free = await self.relay.free(event, text, principal, "question", spans=spans)
+            free = (
+                None
+                if voice
+                else await self.relay.free(event, text, principal, "question", spans=spans)
+            )
             if free is not None:
                 return relayed(free.reply)
             with spans("router.brain", principal=principal):
@@ -351,7 +388,11 @@ class Router:
             )
 
         label = await self.labeler.label(text, spans=spans)
-        free = await self.relay.free(event, text, principal, label.intent, spans=spans)
+        free = (
+            None
+            if voice
+            else await self.relay.free(event, text, principal, label.intent, spans=spans)
+        )
         if free is not None:
             return relayed(free.reply)
         toolset = self.toolset_for(label.intent, principal)

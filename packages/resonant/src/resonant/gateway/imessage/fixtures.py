@@ -16,13 +16,20 @@ Conventions mirrored from the real database:
 - ``associated_message_type`` is 0 for ordinary messages and 2000+ for tapbacks.
 - The database is in WAL mode, like the real one.
 
-``omit`` drops columns to simulate an unexpected schema from a future macOS.
+``omit`` drops columns to simulate an unexpected schema from a future macOS (a table whose
+columns are all omitted isn't created).
+
+Attachments (BR-7)::
+
+    chat.add_message(handle=OWNER, text="what's this?",
+                     attachments=[FakeAttachment("/tmp/x/IMG_1.HEIC", "image/heic")])
 """
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -73,6 +80,22 @@ _SCHEMA: dict[str, list[tuple[str, str]]] = {
         ("message_id", "INTEGER REFERENCES message (ROWID) ON DELETE CASCADE"),
         ("message_date", "INTEGER DEFAULT 0"),
     ],
+    "attachment": [
+        ("ROWID", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+        ("guid", "TEXT UNIQUE NOT NULL"),
+        ("created_date", "INTEGER DEFAULT 0"),
+        ("filename", "TEXT"),
+        ("uti", "TEXT"),
+        ("mime_type", "TEXT"),
+        ("transfer_state", "INTEGER DEFAULT 0"),
+        ("is_outgoing", "INTEGER DEFAULT 0"),
+        ("transfer_name", "TEXT"),
+        ("total_bytes", "INTEGER DEFAULT 0"),
+    ],
+    "message_attachment_join": [
+        ("message_id", "INTEGER REFERENCES message (ROWID) ON DELETE CASCADE"),
+        ("attachment_id", "INTEGER REFERENCES attachment (ROWID) ON DELETE CASCADE"),
+    ],
     "chat_handle_join": [
         ("chat_id", "INTEGER REFERENCES chat (ROWID) ON DELETE CASCADE"),
         ("handle_id", "INTEGER REFERENCES handle (ROWID) ON DELETE CASCADE"),
@@ -86,6 +109,18 @@ def to_apple_ns(dt: datetime) -> int:
     return (delta.days * 86_400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1_000
 
 
+@dataclass(frozen=True)
+class FakeAttachment:
+    """One ``attachment`` row: ``filename`` as Messages writes it (``~/Library/...``, or an
+    absolute test path)."""
+
+    filename: str
+    mime_type: str | None = None
+    uti: str | None = None
+    name: str | None = None
+    total_bytes: int = 1024
+
+
 class FakeChatDB:
     """A writable stand-in for ``chat.db``. The reader under test opens it read-only."""
 
@@ -96,7 +131,8 @@ class FakeChatDB:
         omit = omit or {}
         for table, columns in _SCHEMA.items():
             cols = ", ".join(f"{c} {d}" for c, d in columns if c not in omit.get(table, set()))
-            self.conn.execute(f"CREATE TABLE {table} ({cols})")
+            if cols:
+                self.conn.execute(f"CREATE TABLE {table} ({cols})")
         self._handles: dict[tuple[str, str], int] = {}
         self._chats: dict[str, int] = {}
         self._group_seq = 0
@@ -143,6 +179,7 @@ class FakeChatDB:
         in_chat: bool = True,
         at: datetime | None = None,
         guid: str | None = None,
+        attachments: Sequence[FakeAttachment] = (),
     ) -> int:
         """Insert one message (and its handle/chat as needed). Returns its ROWID."""
         handle_id = self.handle(handle, service)
@@ -183,6 +220,20 @@ class FakeChatDB:
                 "INSERT INTO chat_message_join (chat_id, message_id, message_date) "
                 "VALUES (?, ?, ?)",
                 (chat_id, rowid, date),
+            )
+        for a in attachments:
+            cur = self.conn.execute(
+                "INSERT INTO attachment (guid, filename, uti, mime_type, transfer_state, "
+                "transfer_name, total_bytes) VALUES (?, ?, ?, ?, 5, ?, ?)",
+                (new_id(), a.filename, a.uti, a.mime_type, a.name, a.total_bytes),
+            )
+            self.conn.execute(
+                "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (?, ?)",
+                (rowid, int(cur.lastrowid or 0)),
+            )
+        if attachments:
+            self.conn.execute(
+                "UPDATE message SET cache_has_attachments = 1 WHERE ROWID = ?", (rowid,)
             )
         return rowid
 

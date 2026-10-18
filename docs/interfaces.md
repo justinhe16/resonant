@@ -808,7 +808,7 @@ Scheduler.from_components(settings, conn, components, *, started_at, channel=Non
 ScheduledJob(ext, job_id, spec, schedule, call, catchup=None, core=False)  .label  .inline
 CoreJob(id, schedule, run: JobCall, catchup=None, timeout_s=300)   # cron in settings.timezone
 CoreDeps(settings, conn, components, channel, owner)
-CORE_JOBS: tuple[Callable[[CoreDeps], CoreJob | None], ...] = (briefing_job,)
+CORE_JOBS: tuple[Callable[[CoreDeps], CoreJob | None], ...] = (briefing_job, pulse_job, watches_job)
 JobCall = (args: dict, ctx: CallContext) -> Awaitable[dict]        # ExtensionHandler fits
 persist_events(conn, ext, events, *, trace_id=None, baseline=False) -> int
 read_paused(conn) -> bool                     # unknown counts as paused
@@ -1074,6 +1074,7 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
 | Side-effecting slash command (no model call) | `kind="command"`, `runner="local"` | `{direct_call: {extension, tool, args}, intent, title}` (`extension` None or absent for builtins) |
 | Labeled (one `chat_json` call) | `kind="chat"`, `runner="local"` | `{intent, confidence, toolset: [{extension, name}], fallback: bool, toolset_prefix_hash, title}` |
 | Brain loop (`brain_mode="loop"`, BR-1; no labeler) | `kind="chat"`, `runner="brain"` | `{title: "chat"}` |
+| Media (BR-7; an owner message with `payload.attachments`, either mode, right after slash commands) | `kind="media"`, `runner="media"` | `{title: "media"}` |
 
 In loop mode the labeler never runs (docs/brain-plan.md D1): after slash commands, approval replies, the relay's direct step and the keywords, the relay's free-text step gets the message as a `question`, and anything it doesn't take becomes a brain task (span `router.brain`, principal only).
 
@@ -1418,6 +1419,50 @@ AskRunner(conn, *, cfg: AskClaudeConfig, scope: AskScope, ask_root, channel, sec
 - **Reply.** `Claude: ` + the final `result` text: NFKC, redacted (runner secrets; again after the character strip), control/bidi/zero-width and line-separator characters dropped (newlines kept, at most one blank line), approval-code look-alikes masked (`gate.codes.mask_codes`), clipped to `reply_max_chars` (1500) with `…`. Everything else is a code-built `Not done: …` / `Stopped: …` line. Audit: `ask.queued` (kind, attachment count), `ask.done` (status, kind, proposed, chars, cost, turns); never the question or answer text.
 - **Config** (`brain:`): the read tools' `read_roots` and `read_deny` (BR-2) are the ask's too, through `AskScope.from_settings(settings)`: roots `brain.read_roots` or `files.default_roots`, deny `DEFAULT_READ_DENY` + `brain.read_deny`, plus `files.resonant_secrets` always. `--add-dir` gets the real top-level roots (`ReadScope.top_roots`); the deny paths (as given and real) and globs become `Read(//<path>)`, `Read(//<path>/**)`, `Read(**/<glob>)`, `Read(**/<glob>/**)` in `--settings {"permissions":{"deny":[…]}}` (a JSON list: entries may hold spaces or commas). Attachments use `AskScope.attach()`: the roots plus `attachment_roots`, minus deny paths that contain an attachment root (`~/Library`). The ask's cwd is `<RESONANT_HOME>/ask/<task id>` (not `runner.work_dir`, which is always denied). `ask_claude: {enabled, concurrency 1, daily_cap 30, timeout_s 120, max_turns 15, reply_max_chars 1500, max_budget_usd 1, connector_tools, draft_tools, attachment_roots [~/Library/Messages/Attachments]}`.
 - **Tests.** `tests/fakes/claude` with `--restricted` runs its ask mode (`--scenario answer|usage_limit|hang|escapee|error|maxturns|noresult`, `--connectors`, `--drop`, `--answer`, `--notes DIR`); `tests/test_ask_claude.py`.
+
+## Media, links, watches, notices (BR-7, docs/brain-plan.md D10, migration 016)
+
+```python
+# chat.db (gateway/imessage/attachments.py): for the owner's messages only
+Event.payload.attachments = [{"path": abs, "kind": "image"|"pdf"|"voice", "name", "bytes"}]  # <= 4
+Event.payload.attachments_skipped = int        # other types (link previews, cards, video), > 20 MB, > 4
+Event.payload.voice = True                     # a voice transcript re-submitted by the media runner
+# router: an owner message with attachments, after the slash commands, in both brain.modes
+NewTask(kind="media", runner="media", checkpoint={"title": "media"})
+
+MediaRunner(LocalRunner)  .name == "media"   # runners/media.py
+  # image/pdf: checkpoint.direct_call = ask_claude{question: text or a default, kind: "image",
+  #   attachments: [paths]} (origin explicit); the reply is ask_claude's text
+  # voice (no image/pdf) + brain.whisper_path: transcribe, Loop.submit(Event(... payload.voice=True,
+  #   dedupe_key="<message's>:voice")); the task itself replies nothing (Done{path: "voice"})
+  # voice, no whisper: VOICE_NEEDS_WHISPER
+convert.heic_to_jpeg(src, sips) / to_wav(src, dest, afconvert) / transcribe(cfg, src, work)  # runners/convert.py
+
+# watches (brain/watches.py store, tools/watches.py, runners/watch.py)
+create_watch{what, tool?, args?, when?: contains|missing|changed, text?, ask?, every_minutes? (15..1440),
+             days? (1..max_days), then?: stop|continue}            # L2 write: asks the owner first
+  -> {id: "W1", what, state, check, every_minutes, then, expires_at, next_at, checks, fired, created: true}
+list_watches{} -> {watches: [...], active, max_active}             # L0; ended in the last 7 days too
+cancel_watch{id: "W3"|"3"} -> {id, what, cancelled, state}          # L3
+core/watches   # CORE_JOBS, */5 * * * *, catch-up 10m: queue_due(conn, now) -> {queued, expired}
+NewTask(kind="watch", runner="watch", priority=3, principal, checkpoint={"watch": id, "title": "watch W1"})
+WatchRunner.step -> Done{watch, status: checked|fired|asked|skipped|check_failed|failed|expired|paused|ended}
+WatchRunner.ask_answered(watch_id, ask_task_id, status, reply)    # AskRunner.on_watch
+AskRunner.enqueue(..., watch=id)   # checkpoint.watch; WATCH_HINT first in the prompt; no text to anyone
+
+# notices (brain/notices.py)
+await send_notice(conn, channel, owner, settings, *, key, title, now) -> Notice(outcome, key)
+  # outcome: sent | paused | quiet | capped_hour | capped_day | unreachable
+sent_today(conn, now, tz) -> int
+```
+
+- **Attachments.** `attachment.filename` (`~/Library/Messages/Attachments/...`, `~` expanded) joined by `message_attachment_join`; kind by MIME type, else suffix: image (JPEG, PNG, GIF, WebP, HEIC/HEIF), pdf, voice (caf, m4a, mp3, aac, amr, wav). A chat.db without those tables gives none (logged once). A member's attachments are never read; an attachment-only member message is skipped as before. The files are never opened by the reader. The media runner waits up to 30 s for a file Messages is still downloading, then uses what's there (`NOT_READY` if nothing). The ask runner checks each path again (`AskScope.attach()`: the read roots plus `brain.ask_claude.attachment_roots`) and copies it into the ask's folder; a HEIC copy becomes a JPEG there (`sips -s format jpeg -Z 2048`), since Claude takes JPEG, PNG, GIF and WebP only.
+- **Voice.** The note is checked like an attachment, copied to `<RESONANT_HOME>/media/<task>` (removed after), converted with `afconvert -f WAVE -d LEI16@16000 -c 1` (missing or failing: the original), and run as `<whisper_path> [-m <whisper_model>] <whisper_args with {input}>` with a minimal environment and `whisper_timeout_s`; stdout, with `[BLANK_AUDIO]`-style tags and control characters dropped, is the transcript (at most `channels.imessage.max_body_chars`). A `payload.voice` message goes only to the chat path (the labeler or the brain, whose model-chosen calls are gated): never a slash command or keyword (they run as explicit consent), an approval reply or a worker reply (the relay); those stay typed. Without whisper the reply is "I can't play voice notes …": the Claude API documents no audio input and Claude Code's Read reads text, images, PDFs and notebooks only.
+- **Links.** No router intent: `BRAIN_SYSTEM` tells the brain to call `ask_claude` with `kind: "link"` and the whole URL for a message that is mostly a link or asks to summarise one (`KIND_HINTS["link"]`: WebFetch). The hint changes the stable prefix (`PINNED_PREFIX_HASH`).
+- **Watches.** Migration 016 `brain_watches` (see the SQL). `create_watch` refuses: neither or both of `tool`/`ask`; a tool that isn't an L0 `Effect.READ` builtin or loaded extension chat tool the principal may use (never `ask_claude` or the watch tools); `args` that don't validate against the tool's schema; `when` missing (or `text` missing for contains/missing); `every_minutes` under `brain.watches.min_interval_minutes` (tool) or `ask_min_interval_minutes` (ask); `days` over `max_days`; `max_active` active already. Default every 60 minutes, 7 days. A check: tool checks through `gate.evaluate` (origin `scheduled`, the watch's principal, the check task's id) and `executor.execute`; the condition over the result's canonical JSON (`contains`/`missing`: case-insensitive; `changed`: sha256 against the first check's baseline). Ask checks: `AskRunner.enqueue(question, kind="research", watch=id)` (refused = a skipped check); the answer's first word YES/NO (`parse_yes`). A hit (an edge: met now, not met at the last check) sends one notice `👀 W1 <what>: <detail>` (detail code-built: `saw "<text>"`, `"<text>" is gone`, `it changed`, or `Claude: <the rest of the answer>` with links replaced by `(link)`, clipped to 140) and ends the watch unless `then: continue`. `max_fails` failed checks in a row: `⚠ Stopped watch W1 <what>: its check failed 3 times (<why>)` and `failed`. Expired: `expired`, no text. Audits: `watch.checked` (decision fired|met|not_met), `watch.ended` (decision = state).
+- **Notices.** A pulse item `core` / `notice/<key>` (24 h TTL), title through `notify.clean_text`. Paused or in `pulse.quiet_hours`: held `normal` (the hourly pulse carries it). `extensions.notify.max_per_hour` sent this clock hour: held `normal`. `brain.proactive_per_day` sent today (local date): held `low` (the briefing). Else sent to the owner, dedupe `notice:notice/<key>`, marked told. Each decision is audited `brain.notice` with `decision` `sent|held`, `reason`, `key`, and for sends `hour`, `day` and `today`; the caps count distinct keys audited `sent` by those detail fields (the hourly one counts brain notices only, against the same number extensions get each). One notice decides at a time (a lock per event loop), so two watches firing together can't both slip under a cap. The approval for `create_watch` is a code-built heading with every deciding argument (`tools.watches.summary_action`): `watch "<what>": call <tool> <args JSON> every 15m for 3d, text you when it contains "<text>", then stop` or `watch "<what>": ask Claude "<question, 300 chars>" every 60m for 7d, text you on a yes, then stop` (with no `every_minutes` or `days` given: `at the default interval`, `for the default days`). A fired or failed watch ends in the same transaction as the check that ended it; a retried ask check finds the ask it already queued. Stalls stay the rollup's and health the `HealthMonitor`'s; neither goes through here.
+- **Config** (`brain:`): `whisper_path` / `whisper_model` (absolute, optional), `whisper_args` (`["-nt", "-np", "-f", "{input}"]`, exactly one `{input}`), `whisper_timeout_s` 120, `proactive_per_day` 3 (0: every notice waits for the briefing), `watches: {enabled, max_active 10, min_interval_minutes 15, ask_min_interval_minutes 60, default_days 7, max_days 30, max_fails 3}`.
+- **Tests.** `tests/test_media.py` (reader, classify, conversions with fake sips and whisper, config, the ask runner's HEIC and watch handling), `tests/test_watches.py` (tools, decisions, `queue_due`, checks through the real gate and executor, the ask hook, notices and their caps), `tests/test_e2e_media.py` (the daemon: a screenshot in intents mode, a PDF alone, a refused path, voice with and without whisper, a spoken "yes" that doesn't approve, a link, an ask watch firing once).
 
 ## Relay: `resonant.router.relay` (EM-5)
 

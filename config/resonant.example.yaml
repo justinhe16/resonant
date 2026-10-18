@@ -113,6 +113,23 @@ pulse:
 #       email: [mcp__claude_ai_Gmail__search_threads, mcp__claude_ai_Gmail__get_thread]
 #     draft_tools: [mcp__claude_ai_Gmail__create_draft]
 #     attachment_roots: [~/Library/Messages/Attachments]
+#   # BR-7: media, watches, proactive notices (docs/brain-plan.md D10)
+#   whisper_path: null                  # a local whisper.cpp whisper-cli (absolute) for voice notes;
+#                                       #   null: a voice note gets "type it instead" (Claude takes no audio)
+#   whisper_model: null                 # passed as -m <model> when set
+#   whisper_args: ["-nt", "-np", "-f", "{input}"]   # {input}: a 16 kHz WAV (afconvert); stdout is the text
+#   whisper_timeout_s: 120
+#   proactive_per_day: 3                # texts Resonant starts on its own (a watch firing) per day,
+#                                       #   on top of extensions.notify.max_per_hour; the rest wait for
+#                                       #   the hourly pulse or the briefing
+#   watches:                            # "watch X and tell me when Y": create_watch asks first (L2)
+#     enabled: true
+#     max_active: 10
+#     min_interval_minutes: 15          # a read tool check
+#     ask_min_interval_minutes: 60      # a Claude check (counts against ask_claude.daily_cap)
+#     default_days: 7                   # a watch that never fires ends after this
+#     max_days: 30
+#     max_fails: 3                      # failed checks in a row end it, with one notice
 
 # Claude workers (docs/employee-plan.md, go-live step 14). Every key has a default except
 # github_app, which runs need (Claude adds it when you give it the IDs). Defaults shown;
