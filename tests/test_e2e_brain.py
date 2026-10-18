@@ -771,7 +771,10 @@ async def test_most_recent_commits_read_the_git_log(
     """BR-9 live failure 2: "Most recent commits/PRs?" had no tool (prs is open-only, pr
     needs a number), so the model guessed pr{number: 1}. recent_changes is core now."""
     seed = _resonant_repo(tmp_path / "code")
-    async with start(resonant_home, chat, tmp_path, seed=seed) as b:
+    # Resonant itself is this repo: the daemon registers its own checkout (ops.repo_path), and
+    # on CI the package checkout is a "justinhe16/resonant" of its own, outside the roots.
+    own = {"repo_path": str(tmp_path / "code" / "resonant")}
+    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own) as b:
         b.model.push([("recent_changes", {"repo": "resonant"})], "Newest: BR-8 (#104).")
         assert await b.say("Most recent commits/PRs?") == ["Newest: BR-8 (#104)."]
         first, second = b.model.requests
@@ -788,7 +791,10 @@ async def test_a_repo_status_question_with_no_tool_gets_one_lookup_round(
     """BR-9 live failure 1: "Status on resonant repo changes" was answered from context with
     no tool call. A live-state answer with no tool goes back once with LOOKUP_NUDGE."""
     seed = _resonant_repo(tmp_path / "code")
-    async with start(resonant_home, chat, tmp_path, seed=seed) as b:
+    # Resonant itself is this repo: the daemon registers its own checkout (ops.repo_path), and
+    # on CI the package checkout is a "justinhe16/resonant" of its own, outside the roots.
+    own = {"repo_path": str(tmp_path / "code" / "resonant")}
+    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own) as b:
         b.model.push(
             "Nothing new; secrets aren't configured.",  # made up from stale context
             [("recent_changes", {"repo": "resonant"})],
@@ -818,7 +824,10 @@ async def test_newest_ones_follow_up_no_guessed_identifiers(
     the newest" fumbled through guesses. A read whose identifier is nowhere in the message,
     history, briefing or results goes back unrun (GUESS_CHECK); the history is there."""
     seed = _resonant_repo(tmp_path / "code")
-    async with start(resonant_home, chat, tmp_path, seed=seed) as b:
+    # Resonant itself is this repo: the daemon registers its own checkout (ops.repo_path), and
+    # on CI the package checkout is a "justinhe16/resonant" of its own, outside the roots.
+    own = {"repo_path": str(tmp_path / "code" / "resonant")}
+    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own) as b:
         b.model.push("PR #1 from Oct 8 is the latest.", "PR #1 from Oct 8 is the latest.")
         assert await b.say("Most recent PRs?") == ["PR #1 from Oct 8 is the latest."]
         b.model.push(
