@@ -542,7 +542,7 @@ async back_up(conn, channel, owner, *, clock=utcnow) -> bool
 
 ## Read tools: `resonant.tools.files` (BR-2)
 
-The brain's general reads ([`brain-plan.md`](brain-plan.md) D5). Five global L0 reads, each `untrusted=True` (the brain loop taints the task that calls one, D6) and `grant="files"` (owner-only unless a member holds `"builtin:files": [request]`). Not in any `INTENT_TOOLS` toolset yet: BR-1's loop lists them as core tools.
+The brain's general reads ([`brain-plan.md`](brain-plan.md) D5). Five global L0 reads, each `untrusted=True` (the brain loop taints the task that calls one, D6) and `grant="files"` (owner-only unless a member holds `"builtin:files": [request]`). Not in any `INTENT_TOOLS` toolset: the brain loop (BR-1) loads them as core tools.
 
 - **Scope** (`ReadScope.from_settings`). Roots: `brain.read_roots`, or by default `runner.code_dir`, `~/resonant`, `ops.repo_path`, `<home>/logs`, `<home>/docs` and `<runner state>/transcripts`, all real paths. Deny: `config.DEFAULT_READ_DENY` (`~/Documents`, `~/Library`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gh`, `~/.docker`, `~/.kube`, `.env*`, `*.env`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keychain*`, `id_*`, `credentials`, `credentials.*`, `.credentials*`, `*_credentials.json`, `.git-credentials`, `.netrc`, `.npmrc`, `.pypirc`, `.git/config`, and anywhere `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`, `.pgpass`, `.htpasswd`, `*.p8`, `*.jks`, `*.keystore`, `*.tfstate*`, `service-account*.json`, `.*_history`) plus `brain.read_deny`, plus Resonant's own secrets whatever the config says (`resonant.db` and its `-wal`/`-shm`/`-journal`, `principals.yaml`, `ext-data/`, `run-secrets/`, `runner.secrets_dir`, `runner.mirror_dir`, `runner.work_dir`). A deny entry starting with `/` or `~` is a path and everything under it; any other is a glob over consecutive path components.
 - **Check order** (`ReadScope.check`): a string, absolute or `~/…`, at most 1024 chars, no `..` component → the deny list on the path as given → `realpath` → the deny list on the real path → the real path inside a root (else `outside the read roots`, or `a symlink out of the read roots` when the given path was inside one). Comparisons are NFC and case-folded. The file is then opened `O_NOFOLLOW | O_NONBLOCK`, must be a regular file (a directory for `list_dir`), and its `F_GETPATH` path is checked again. Every refusal is a `ToolFailed` naming the path and the reason.
@@ -559,7 +559,7 @@ The brain's general reads ([`brain-plan.md`](brain-plan.md) D5). Five global L0 
 
 The `builtin:files` grant is all or nothing: a granted member can read everything in the roots, every run's transcript and the daemon's logs.
 
-`brain:` config (`BrainConfig`): `read_roots` (absolute after `~`; unset: the defaults above), `read_deny` (added to the defaults, never replacing them), `rg_path` (absolute; default `/opt/homebrew/bin/rg`, missing → the Python walk).
+`brain:` config (`BrainConfig`): `mode` (`intents` | `loop`, default `intents`; the [brain loop](#brain-loop-resonantrunnersbrain-br-1)), `read_roots` (absolute after `~`; unset: the defaults above), `read_deny` (added to the defaults, never replacing them), `rg_path` (absolute; default `/opt/homebrew/bin/rg`, missing → the Python walk).
 
 ## Extension store: `resonant.store.extensions` (migrations 004, 012)
 
@@ -1047,7 +1047,8 @@ ProbeResult(ok, model_present, ctx_ok, thinking_off_ok, latency_ms, detail, tool
 ```python
 class Router:                     # the Loop's router hook (Callable[[Event], Awaitable[NewTask | None]])
     def __init__(self, conn, *, principals, registry, gate: Gate, handlers, model: ModelClient,
-                 clock=utcnow, timezone: str = "UTC", extensions: ExtensionCatalog | None = None): ...
+                 clock=utcnow, timezone: str = "UTC", extensions: ExtensionCatalog | None = None,
+                 brain_mode: Literal["intents", "loop"] = "intents"): ...   # settings.brain.mode
     intents: IntentSet                # built once here, from the loaded extensions
     async def route(self, event: Event) -> NewTask | None
     def toolset_for(self, intent, principal) -> list[ToolSpec]
@@ -1072,6 +1073,9 @@ classify(text, labeler, *, spans=None) -> Classification(intent, path: "fast" | 
 | Fast (no model call) | `kind="reply"`, `runner="local"` | `{fast_reply: str, tool_used: str \| None, intent, title}` |
 | Side-effecting slash command (no model call) | `kind="command"`, `runner="local"` | `{direct_call: {extension, tool, args}, intent, title}` (`extension` None or absent for builtins) |
 | Labeled (one `chat_json` call) | `kind="chat"`, `runner="local"` | `{intent, confidence, toolset: [{extension, name}], fallback: bool, toolset_prefix_hash, title}` |
+| Brain loop (`brain_mode="loop"`, BR-1; no labeler) | `kind="chat"`, `runner="brain"` | `{title: "chat"}` |
+
+In loop mode the labeler never runs (docs/brain-plan.md D1): after slash commands, approval replies, the relay's direct step and the keywords, the relay's free-text step gets the message as a `question`, and anything it doesn't take becomes a brain task (span `router.brain`, principal only).
 
 `title` is code-built for `/projects`: the fast-path command name (`/status`, `ping`, `/unknown`) plus a subcommand word (`/notes clear`, `/restart ollama`), `approval reply`, or `chat: <intent>`. Never message text.
 
@@ -1194,6 +1198,10 @@ LocalRunner(conn, *, model: ModelClient, channel: Channel, gate: RunnerGate, exe
             registry, max_step_s=30.0, now=utcnow, timezone="UTC",
             extensions: ExtensionCatalog | None = None,
             model_result_max_chars=4096)   # name="local", uses_claude_slot=False
+# hooks for the brain loop (BR-1), unused on the intents path:
+#   _call_tool(..., origin="inferred" | "tainted", pin={extra checkpoint keys})  # never "explicit"
+#   _pinned_origin(cp, pinned) -> Origin       # explicit (is_explicit) | inferred; brain: | tainted
+#   Answer.meta -> merged into Done.result and reply_meta; after_effects/with_report(..., limit)
 # ToolExecutor: execute(intent, decision, *, step_no, call_index) and recorded(key)
 ```
 
@@ -1237,7 +1245,7 @@ PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: Chan
 
 ## Brain context and memory: `resonant.brain` (BR-4, migration 015)
 
-Context and memory for the brain loop ([`brain-plan.md`](brain-plan.md) D2, D3, D9). Nothing calls it yet: BR-1's `runners/brain.py` builds each turn with `build_context` and folds history after the reply. The intents path (`runners/local.py`) is unchanged.
+Context and memory for the brain loop ([`brain-plan.md`](brain-plan.md) D2, D3, D9). The brain loop (`runners/brain.py`, BR-1) builds each turn with `build_context` and folds history after the reply. The intents path (`runners/local.py`) doesn't use it.
 
 ```python
 build_context(conn, settings, *, principal, principals, text, event_id, started_at,
@@ -1297,6 +1305,41 @@ A section over its cap ends `- +N more`; past `BRIEFING_MAX_CHARS` (6000, about 
 **Since we last talked.** `last_talked` is the `occurred_at` of the principal's previous `message` event from `source` (any, task or not). `since_notes` lists what changed in `(since, now]`, `since` clamped to the last 7 days, oldest first: `R4 (dori) is ready, PR #12 (15:04)`, `finished`, `failed: <failure, 80>`, `was cancelled`, `ended with no changes`, `was merged, PR #9` (a merged run by `updated_at`), `Approval expired: <summary>`, `R6 asked: "<question>"` (open asks). More than 8: the newest 7 after `+N earlier`. Owner only; a member and first contact get none.
 
 **Facts** (`brain/facts.py`, D9). `<home>/brain/facts/<name>.md`: `---`, `name: <name>`, `description: <one line>`, `---`, then optional text. The file name is the truth (a disagreeing `name:` line is ignored). Reads open with `O_NOFOLLOW`, take regular files only and skip what isn't a fact (no frontmatter or description, a bad name, a symlink, over 16 KB); at most 50, by name. `remember` refuses a fact over 16 KB encoded, so a saved fact always reads back. `forget` deletes the file under a valid name even when it doesn't parse. Text is the owner's and not untrusted, but `clean` drops control and format characters (Cc, Cf) and tabs; the description is one line. Writes are atomic and durable (`mkstemp` in the dir, fsync, `os.replace`), the dir 0700 and files 0600. `remember` is L3 (D9) and the index is in every later prompt, so a task that read injected text could plant a fact: the brain loop relies on D6 (a tainted task's calls ask first, L3 included), and the report line shows the whole description. `render_index` angle-brackets out descriptions and stops at 4000 chars with `- +N more (list_facts)`. The tools are in [Built-in tools](#built-in-tools-resonanttoolsbuiltin).
+
+## Brain loop: `resonant.runners.brain` (BR-1)
+
+The general agent loop ([`brain-plan.md`](brain-plan.md#br-1-the-brain-loop-2026-10-18) D1, D4, D6, D7). With `brain.mode: loop` the router sends every non-fast-path chat message here.
+
+```python
+BrainRunner(conn, *, model, channel, gate, executor, registry, settings, principals,
+            facts: FactStore | None = None, started_at=None, last_tick=lambda: None,
+            slots: SlotPool | None = None, max_step_s=None, now=utcnow, extensions=None,
+            model_result_max_chars=4096, progress_after_s=6.0)
+    # LocalRunner subclass: name="brain", uses_claude_slot=False
+    .tools_for(principal) -> (core, deferred)   # may_request-filtered, chat_toolset-unique
+    .idle()                                     # await background history folds
+CORE_TOOLS; NOT_IN_BRAIN = {"mute_extension"}; LOAD_TOOLS (ToolSpec, never registered)
+MAX_ROUNDS = 8; MAX_CALLS = 24; MAX_LOADED = 8; MAX_REPLY_CHARS = 1500; PROGRESS_TEXT = "On it…"
+taints(spec) -> bool                            # spec.untrusted or an extension/MCP tool
+wiring.brain_step_limit(model, tools) = max((MAX_ROUNDS + 1) * model.timeout_s, longest tool) + 15
+```
+
+`wiring.build_imessage_stack(..., started_at=)` builds it (always, in both modes) with `FactStore(facts_dir(home))`, `loop.last_tick` and `loop.slots`; `IMessageStack.brain`.
+
+A checkpoint with any of the local runner's keys (`call`, `direct_call`, `fast_reply`, `fallback`, `intent`) goes to `LocalRunner._answer` unchanged: the pinned-call resume after an approval, a crash retry, the resend. Otherwise one turn:
+
+1. **Tools.** `registry.specs()` minus job specs and `NOT_IN_BRAIN`, filtered by `principals.may_request`, made unique by `router.chat_toolset`. Builtins named in `CORE_TOOLS` are sent every round; the rest is the catalog (`brain.catalog_entries`, in the stable prefix). `load_tools{names: [str] (1..8)}` is offered only with a non-empty catalog. It is handled in the loop (no gate, no executor, no call index) and adds catalog tools, at most 8 per task, to every later round (tools are sent sorted by name). The result is `{loaded, unknown?, not_loaded?, note?}`. A call to a catalog tool that isn't loaded, or to any other name, goes back as a tool error.
+2. **Context.** `build_context(conn, settings, principal, principals, text, event_id=task.origin_event_id, started_at, catalog, facts, now, last_tick, slots)`; span `runner.brain.context` (`core`, `catalog`, `history_turns`, `prefix_hash`).
+3. **Rounds.** Up to `MAX_ROUNDS` `chat_tools` calls (`max_tokens=1024`; span `runner.brain.round`: `outcome` `tools | answer | empty | bad_output`). No tool calls and non-empty text: that is the answer. Bad output or an empty reply counts an error; the second error is "stuck". Each tool call: `_call_tool(..., origin=inferred|tainted, pin={"tainted": bool})`, so reads run and return their result as an untrusted user turn, and side effects are pinned, gated and reported as on the intents path. A non-`CallResult` (a wait, a refusal, a dry run) ends the turn after the report lines so far. After `MAX_SIDE_EFFECTS` side effects, one `chat_json` (`{reply}`, 700 tokens) narrates; the report lines are always in the reply (alone if the model fails).
+4. **Taint (D6).** After a call to a spec where `taints(spec)` (its result or error came from outside content), every later call in the task is `tainted` (span `runner.brain.taint`). A pinned gated call carries `checkpoint.tainted`; `_pinned_origin` gates its resume with it. The gate then asks for L2 and L3 (no standing allow, no `yes always`).
+5. **ask_claude.** Queued (`data.queued is true`): the reply is its `text` and the turn ends (`path: "ask"`, `escalate: true`). Not queued: the refusal goes back to the model.
+6. **Stuck** (the round cap, two errors, or `MAX_CALLS`): when the registry has `ask_claude` and the principal may request it, it is called through `_call_tool` with `{question: <message> + "\n\n(Resonant's local model ran out of steps|couldn't produce an answer; it tried: <tools>)"}` (span `runner.brain.stuck`: `cap`, `calls`, `escalated`). Queued: its text is the reply (`path: "escalate"`). Otherwise the report lines if a side effect ran; else the round cap replies `TOO_MANY_REPLY` (`path: "escalate"`) and two errors take the intents path.
+7. **Answer.** Clipped to 1500 (`clip_reply`). Number guard log-only: `unsupported_numbers(reply, every prompt and tool-result turn)`; a count goes to `Done.result.number_guard` and span `runner.brain.answer`. `Done.result` adds `tool_calls` and `tainted` (`Answer.meta`).
+8. **Fallback.** `ModelUnavailableError` (no side effect yet), and two errors that can't escalate: the labeler labels the message and `LocalRunner._answer` answers it with that intent's toolset, inside this task (span `runner.brain.fallback`; `Done.result.brain_fallback`). The intents prompt doesn't hold the loop's tool results, so it is untainted.
+9. **Progress.** A timer runs with the turn; at `progress_after_s` with no answer, `channel.send(principal, "On it…", dedupe_key="progress:<task id>")`, once. The turn waits for a send in flight before replying. A send error is logged.
+10. **After the reply.** `step` returns the local runner's `Done`; then, when `history.fold_due`, `history.fold` runs as an asyncio task.
+
+Spans also include the local runner's `runner.local.tool`, `runner.local.call`, `runner.local.approval` and `runner.brain` / `runner.brain.send` (from `f"runner.{name}"`). No span or log carries message or reply text.
 
 ## Claude runner: `resonant.runners.claude`, `resonant.runner`, `resonant.sandbox`, `resonant.store.runs` (employee mode; migrations 006, 009, 011, 014)
 
@@ -1365,7 +1408,7 @@ AskRunner(conn, *, cfg: AskClaudeConfig, scope: AskScope, ask_root, channel, sec
 # AskScope(roots, deny, always, attachment_roots).from_settings / .read() / .attach() / .add_dirs() / .deny_rules()
 ```
 
-- **Task.** `NewTask(kind="ask", runner="ask", principal=<requester>, priority owner 1 / member 2, checkpoint={question, kind, attachments (real paths), requested_by?})`. The step saves `{pid, created, marker}` as soon as the session starts and `{reply, status, proposed}` before sending, so a crash reaps the old session first and a retry only re-sends (dedupe `ask:<task id>`). `Done.result = {status, kind, reply, untrusted: true, proposed, requested_by?}`; `status` is `answered | refused | timeout | killed | paused | usage_limit | failed | not_set_up`. **BR-1:** treat `reply` as untrusted data in later turns, and set `origin="tainted"` on calls the model makes after it called `ask_claude`.
+- **Task.** `NewTask(kind="ask", runner="ask", principal=<requester>, priority owner 1 / member 2, checkpoint={question, kind, attachments (real paths), requested_by?})`. The step saves `{pid, created, marker}` as soon as the session starts and `{reply, status, proposed}` before sending, so a crash reaps the old session first and a retry only re-sends (dedupe `ask:<task id>`). `Done.result = {status, kind, reply, untrusted: true, proposed, requested_by?}`; `status` is `answered | refused | timeout | killed | paused | usage_limit | failed | not_set_up`. The brain loop (BR-1) ends its turn when `ask_claude` queued (the tool's `text` is the reply) and taints the task (`untrusted=True`); later turns don't see the ask's answer yet (followups).
 - **Argv** (question on stdin): `claude -p --restricted --tools Read,Grep,Glob,WebSearch,WebFetch --permission-mode dontAsk --allowedTools <built-ins + kind's connector reads [+ draft tools]> --disallowedTools <connector writes by name> --settings <Read() deny rules, below> --add-dir <root>… --no-session-persistence --output-format stream-json --verbose --max-turns 15 --append-system-prompt <ASK_PROMPT> [--max-budget-usd N on the API key]`. cwd: an empty `<RESONANT_HOME>/ask/<task id>` with the attachments copied in as `attachment-<n><ext>`, removed after. Env: built from nothing (`claude_auth.status_env`) plus one credential (token, else key, else none: the owner's login, guard off only) and `RESONANT_RUN=ask-<task id>`.
 - **Allowlist.** Only `email` and `calendar` asks get connector tools: `brain.ask_claude.connector_tools[kind]` (every one required in the init event) and, for email, `draft_tools` (allowed, never required). Config names must look like `mcp__<server>__<snake_case>` (refused at load otherwise). A name whose own part (after `__`, split at `_`, `-` and camelCase humps) has a write word or stem (send, create, update, delete, remove, respond, reply, forward, modify, trash, archive, label, draft, …; `sendmessage` too) is never allowed and is denied by name; a draft tool is allowed only when its own name is exactly `create_draft` or `drafts`. A draft is the one write an email ask can make (the D8 design): an email Claude reads could steer what goes into a draft, never a send.
 - **Init check.** The `system/init` event's `tools` must contain every required tool, else the process group is killed and the reply is `Not done: Calendar isn't reachable from Claude's read-only mode (missing list_events, …). …` (or `Claude's read tools are missing (…)` for a built-in).

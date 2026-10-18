@@ -753,13 +753,18 @@ def test_scheduled_l0_and_l3_run(
 
 
 def test_chat_paths_never_set_scheduled() -> None:
-    """Only the scheduler and the job runner may set ``scheduled``; the router and the local
-    runner (model and slash-command paths) never do."""
+    """Only the scheduler and the job runner may set ``scheduled``; the router, the local
+    runner (model and slash-command paths) and the brain loop never do."""
     import resonant.router
+    import resonant.runners.brain
     import resonant.runners.local
 
     router_dir = Path(resonant.router.__file__).parent
-    sources = [Path(resonant.runners.local.__file__), *sorted(router_dir.glob("*.py"))]
+    sources = [
+        Path(resonant.runners.local.__file__),
+        Path(resonant.runners.brain.__file__),
+        *sorted(router_dir.glob("*.py")),
+    ]
     for path in sources:
         assert '"scheduled"' not in path.read_text(), path.name
 

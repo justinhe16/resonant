@@ -78,8 +78,8 @@ import logging
 import re
 import sqlite3
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from functools import partial
@@ -92,6 +92,7 @@ from resonant.gate import Allow, Decision, Deny, DryRun, Intent, NeedsApproval, 
 from resonant.gate.codes import clean_external
 from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
 from resonant.gate.summary import summarize as summarize_args
+from resonant.gate.types import Origin
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import Done, Fail, StepContext, StepOutcome, Task, Wait
 from resonant.models import (
@@ -260,7 +261,7 @@ _RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {
 
 
 @dataclass(frozen=True)
-class _Call:
+class CallResult:
     tool: str
     ok: bool
     data: dict[str, Any] | None
@@ -269,7 +270,7 @@ class _Call:
     extension: str | None = None
 
 
-def summarize(calls: list[_Call]) -> str:
+def summarize(calls: list[CallResult]) -> str:
     """Templated reply over the tool results: no model involved, every number from a tool."""
     lines: list[str] = []
     for c in calls:
@@ -285,7 +286,7 @@ def summarize(calls: list[_Call]) -> str:
                 lines.append(render(c.data))
             except Exception:
                 lines.append(f"{c.tool}: ok")
-    return _clip("\n".join(lines)) if lines else NO_ANSWER_REPLY
+    return clip_reply("\n".join(lines)) if lines else NO_ANSWER_REPLY
 
 
 def _extension_summary(ext: str, tool: str, data: dict[str, Any]) -> str:
@@ -296,7 +297,7 @@ def _extension_summary(ext: str, tool: str, data: dict[str, Any]) -> str:
     return f"{ext} {tool}: {clean or 'ok'}"
 
 
-def _clip(text: str, limit: int = MAX_REPLY_CHARS) -> str:
+def clip_reply(text: str, limit: int = MAX_REPLY_CHARS) -> str:
     text = text.strip()
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
@@ -495,7 +496,7 @@ def _failure_reply(intent: Intent, result: ToolResult) -> str:
 
 
 @dataclass
-class _Answer:
+class Answer:
     reply: str
     # "fast" | "llm" | "summary" | "fallback" | "escalate" for answers; for a gated call
     # "done" | "replay" | "failed" | "ambiguous" | "refused" | "dry_run".
@@ -503,10 +504,12 @@ class _Answer:
     tools_used: list[str]
     escalate: bool = False
     data: dict[str, Any] | None = None  # a gated call's result, for the number guard
+    # Extra keys for ``Done.result`` and ``reply_meta`` (the brain loop's counters); empty here.
+    meta: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 # A step either answers (the reply is saved, then sent) or ends early (Wait or Fail).
-_Result = _Answer | Wait | Fail
+StepResult = Answer | Wait | Fail
 
 
 @dataclass(frozen=True)
@@ -615,26 +618,33 @@ class LocalRunner:
         saved_reply = cp.get("reply")
         if isinstance(saved_reply, str):
             meta = _as_dict(cp.get("reply_meta"))
-            answer = _Answer(
+            answer = Answer(
                 saved_reply,
                 str(meta.get("path", "resend")),
                 [str(t) for t in cast(list[Any], meta.get("tools_used") or [])],
                 meta.get("escalate") is True,
+                meta=_as_dict(meta.get("meta")),
             )
             return await self._send(task, principal, answer, start, spans, resend=True)
 
-        with spans("runner.local", kind=task.kind) as s:
+        with spans(f"runner.{self.name}", kind=task.kind) as s:
             result = await self._answer(task, principal, events, ctx, spans)
-            if isinstance(result, _Answer):
+            if isinstance(result, Answer):
                 s.set(path=result.path, tools_used=result.tools_used, escalate=result.escalate)
             else:
                 s.set(path="wait" if isinstance(result, Wait) else "fail")
-        if not isinstance(result, _Answer):
+        if not isinstance(result, Answer):
             return result
         answer = result
         latest = get_task(self.conn, task.id)  # a mid-step save may have pinned ``call``
         cp = latest.checkpoint if latest is not None else cp
-        meta = {"path": answer.path, "tools_used": answer.tools_used, "escalate": answer.escalate}
+        meta: dict[str, Any] = {
+            "path": answer.path,
+            "tools_used": answer.tools_used,
+            "escalate": answer.escalate,
+        }
+        if answer.meta:
+            meta["meta"] = answer.meta
         if not ctx.save(checkpoint={**cp, "reply": answer.reply, "reply_meta": meta}):
             return Fail("task is no longer running")
         return await self._send(task, principal, answer, start, spans)
@@ -643,13 +653,13 @@ class LocalRunner:
         self,
         task: Task,
         principal: str,
-        answer: _Answer,
+        answer: Answer,
         start: float,
         spans: SpanFactory,
         *,
         resend: bool = False,
     ) -> StepOutcome:
-        with spans("runner.local.send", reply_len=len(answer.reply), resend=resend) as s:
+        with spans(f"runner.{self.name}.send", reply_len=len(answer.reply), resend=resend) as s:
             try:
                 await self.channel.send(principal, answer.reply, dedupe_key=f"reply:{task.id}")
             except ChannelRefused as e:
@@ -667,6 +677,7 @@ class LocalRunner:
                 "latency_ms": latency_ms,
                 "path": answer.path,
                 "escalate": answer.escalate,
+                **answer.meta,
             }
         )
 
@@ -679,13 +690,13 @@ class LocalRunner:
         events: list[Event],
         ctx: StepContext,
         spans: SpanFactory,
-    ) -> _Result:
+    ) -> StepResult:
         cp = task.checkpoint
         if "call" in cp:
             pinned = PinnedCall.from_json(cp.get("call"))
             if pinned is None:
                 return Fail("checkpoint.call is malformed")
-            return _after_effects(
+            return after_effects(
                 _effects(cp), await self._resume(task, principal, pinned, cp, spans)
             )
         if "direct_call" in cp:
@@ -693,40 +704,40 @@ class LocalRunner:
         fast = cp.get("fast_reply")
         if isinstance(fast, str) and fast.strip():
             tool = cp.get("tool_used")
-            return _Answer(fast, "fast", [tool] if isinstance(tool, str) else [])
+            return Answer(fast, "fast", [tool] if isinstance(tool, str) else [])
         if cp.get("fallback") is True:
-            return _Answer(FALLBACK_REPLY, "fallback", [])
+            return Answer(FALLBACK_REPLY, "fallback", [])
         intent = parse_intent(cp.get("intent"), self.intents) or UNKNOWN
 
         text = self._current_text(task, events)
         if text is None:
-            return _Answer(NO_ANSWER_REPLY, "fallback", [])
+            return Answer(NO_ANSWER_REPLY, "fallback", [])
         toolset = self._toolset(cp, intent)
         with spans("runner.local.context", intent=intent, toolset=[t.name for t in toolset]) as s:
             messages = self._context(task, principal, intent, text)
             s.set(history_turns=len(messages) - 2)
 
-        calls: list[_Call] = []
+        calls: list[CallResult] = []
         try:
             stop = await self._tool_loop(task, principal, messages, toolset, calls, ctx, spans)
             if isinstance(stop, Wait | Fail):
                 return stop
-            if isinstance(stop, _Answer):
+            if isinstance(stop, Answer):
                 if stop.path != "done":
                     return stop  # refused, dry run, failed or ambiguous: templated only
                 # The side effects ran: the model may narrate, the report lines are code's.
-                return _with_report(await self._final(messages, text, calls, spans), stop)
+                return with_report(await self._final(messages, text, calls, spans), stop)
             if stop:
-                return _Answer(TOO_MANY_REPLY, "escalate", _used(calls), escalate=True)
+                return Answer(TOO_MANY_REPLY, "escalate", used_tools(calls), escalate=True)
             return await self._final(messages, text, calls, spans)
         except ModelUnavailableError:
             log.warning("model unavailable for task %s; sending fallback", task.id)
             reports = [c.report for c in calls if c.report is not None]
             if reports:
-                return _Answer(_clip("\n".join(reports)), "done", _used(calls))
+                return Answer(clip_reply("\n".join(reports)), "done", used_tools(calls))
             if calls:
-                return _Answer(summarize(calls), "fallback", _used(calls))
-            return _Answer(FALLBACK_REPLY, "fallback", [])
+                return Answer(summarize(calls), "fallback", used_tools(calls))
+            return Answer(FALLBACK_REPLY, "fallback", [])
 
     async def _direct(
         self,
@@ -735,14 +746,14 @@ class LocalRunner:
         cp: dict[str, Any],
         ctx: StepContext,
         spans: SpanFactory,
-    ) -> _Result:
+    ) -> StepResult:
         """A slash command's call: pinned, then gated with ``origin="explicit"``."""
         direct = _direct_call(cp)
         if direct is None:
             return Fail("checkpoint.direct_call is malformed")
         ext, tool, args = direct
         if self.registry.get(ext, tool) is None:
-            return _Answer(NOT_AVAILABLE_REPLY, "refused", [])
+            return Answer(NOT_AVAILABLE_REPLY, "refused", [])
         pinned = PinnedCall(tool, ext, args, task.step_no, 0)
         cp = {**cp, "call": pinned.to_json()}
         if not ctx.save(checkpoint=cp):
@@ -756,12 +767,12 @@ class LocalRunner:
         pinned: PinnedCall,
         cp: dict[str, Any],
         spans: SpanFactory,
-    ) -> _Result:
+    ) -> StepResult:
         """Run the pinned call exactly once: what ``executions`` holds first, then the gate."""
         spec = self.registry.get(pinned.extension, pinned.tool)
         if spec is None:
-            return _Answer(NOT_AVAILABLE_REPLY, "refused", [])
-        origin = "explicit" if is_explicit(cp, pinned) else "inferred"
+            return Answer(NOT_AVAILABLE_REPLY, "refused", [])
+        origin = self._pinned_origin(cp, pinned)
         with spans(
             "runner.local.call", tool=pinned.tool, extension=pinned.extension, origin=origin
         ) as s:
@@ -776,7 +787,7 @@ class LocalRunner:
                 )
             except (TypeError, ValueError):
                 s.set(decision="bad_args")
-                return _Answer("Not done: invalid arguments.", "refused", [])
+                return Answer("Not done: invalid arguments.", "refused", [])
             key = idempotency_key(task.id, pinned.step_no, pinned.call_index, intent.hash)
             prior = self.executor.recorded(key)
             if prior is not None:
@@ -792,6 +803,11 @@ class LocalRunner:
             s.set(decision=type(decision).__name__)
             return await self._decided(intent, decision, pinned, cp, spans)
 
+    def _pinned_origin(self, cp: dict[str, Any], pinned: PinnedCall) -> Origin:
+        """The origin a pinned call is gated with: ``explicit`` only for the router's
+        ``direct_call`` (``is_explicit``), else ``inferred``. The brain loop adds ``tainted``."""
+        return "explicit" if is_explicit(cp, pinned) else "inferred"
+
     async def _decided(
         self,
         intent: Intent,
@@ -799,7 +815,7 @@ class LocalRunner:
         pinned: PinnedCall,
         cp: dict[str, Any],
         spans: SpanFactory,
-    ) -> _Result:
+    ) -> StepResult:
         """Act on the gate's decision for a pinned call (``cp`` already holds ``call``)."""
         if isinstance(decision, NeedsApproval):
             return await self._ask(intent.task_id, decision, cp, spans)
@@ -810,11 +826,11 @@ class LocalRunner:
                 intent, decision, step_no=pinned.step_no, call_index=pinned.call_index
             )
         except NotAllowedError:
-            return _Answer(refusal_reply(intent, Deny(APPROVAL_USED)), "refused", [])
+            return Answer(refusal_reply(intent, Deny(APPROVAL_USED)), "refused", [])
         answer = _outcome(intent, result)
         added = self._rule_added(decision.approval_id)
         if added is not None and answer.path in ("done", "replay"):
-            answer = replace(answer, reply=_clip(f"{answer.reply}\n{added}"))
+            answer = replace(answer, reply=clip_reply(f"{answer.reply}\n{added}"))
         spec = self.registry.get(intent.extension, intent.tool)
         job = self._job_id(spec) if spec is not None else None
         if job is None or intent.extension is None:
@@ -993,10 +1009,10 @@ class LocalRunner:
         principal: str,
         messages: list[ChatMessage],
         toolset: list[ToolSpec],
-        calls: list[_Call],
+        calls: list[CallResult],
         ctx: StepContext,
         spans: SpanFactory,
-    ) -> bool | _Result:
+    ) -> bool | StepResult:
         """Run tool calls into ``messages`` and ``calls``.
 
         Returns True if the model wanted too many calls, False when it is done, the
@@ -1012,8 +1028,8 @@ class LocalRunner:
             if not reports:
                 return stop
             data = next((c.data for c in reversed(calls) if c.report is not None), None)
-            return _Answer(_clip("\n".join(reports)), "done", _used(calls), data=data)
-        return _after_effects(reports, stop)
+            return Answer(clip_reply("\n".join(reports)), "done", used_tools(calls), data=data)
+        return after_effects(reports, stop)
 
     async def _tool_rounds(
         self,
@@ -1021,10 +1037,10 @@ class LocalRunner:
         principal: str,
         messages: list[ChatMessage],
         toolset: list[ToolSpec],
-        calls: list[_Call],
+        calls: list[CallResult],
         ctx: StepContext,
         spans: SpanFactory,
-    ) -> bool | _Result:
+    ) -> bool | StepResult:
         """The model's tool rounds for ``_tool_loop``: True for too many calls, False when
         done or at the side-effect cap, or a gated call's result that ends the loop."""
         for _ in range(MAX_TOOL_ITERATIONS):
@@ -1041,7 +1057,7 @@ class LocalRunner:
                 call = await self._call_tool(
                     task, principal, toolset, tc.name, tc.args, len(calls), ctx, spans, effects
                 )
-                if not isinstance(call, _Call):
+                if not isinstance(call, CallResult):
                     return call
                 calls.append(call)
                 messages.append(
@@ -1054,7 +1070,7 @@ class LocalRunner:
                         ),
                     }
                 )
-                turn = _tool_turn(call, self.model_result_max_chars)
+                turn = tool_turn(call, self.model_result_max_chars)
                 messages.append({"role": "user", "content": turn})
                 if sum(c.report is not None for c in calls) >= MAX_SIDE_EFFECTS:
                     return False
@@ -1071,70 +1087,83 @@ class LocalRunner:
         ctx: StepContext,
         spans: SpanFactory,
         effects: list[str] | None = None,
-    ) -> _Call | Wait | Fail | _Answer:
-        """One model tool call. An allowed read returns its ``_Call``. Anything else is a
-        gated call: an executed side effect returns a ``_Call`` with ``report`` set, and a
+        *,
+        origin: Origin = "inferred",
+        pin: Mapping[str, Any] | None = None,
+    ) -> CallResult | Wait | Fail | Answer:
+        """One model tool call. An allowed read returns its ``CallResult``. Anything else is a
+        gated call: an executed side effect returns a ``CallResult`` with ``report`` set, and a
         refusal, dry run or wait returns that result. ``effects``: the report lines of the
         side effects this task already ran, pinned with the call so a resume replies with
-        them too."""
+        them too. ``origin`` is ``inferred`` (the brain loop passes ``tainted``; never
+        ``explicit``) and ``pin`` adds keys to the pinned checkpoint (the brain's taint)."""
         with spans("runner.local.tool", tool=name, call_index=call_index) as s:
             # Only the routed toolset; the spec (effect, level) comes from the registry.
             spec = next((t for t in toolset if t.name == name), None)
             if spec is None:
                 s.set(decision="unavailable", ok=False)
-                return _Call(name, False, None, "tool not available")
+                return CallResult(name, False, None, "tool not available")
             ext = spec.extension
             s.set(extension=ext)
             try:
-                # Always "inferred": the model can never claim the owner typed this.
+                # Never "explicit": the model can never claim the owner typed this.
+                if origin == "explicit":
+                    raise ValueError("a model-chosen call is never explicit")
                 intent = Intent.for_tool(
                     spec,
                     task_id=task.id,
                     principal=principal,
                     args=args,
                     trace_id=task.trace_id,
-                    origin="inferred",
+                    origin=origin,
                 )
             except (TypeError, ValueError):
                 s.set(decision="bad_args", ok=False)
-                return _Call(name, False, None, "invalid arguments")
+                return CallResult(name, False, None, "invalid arguments")
             decision = self.gate.evaluate(intent)
             s.set(decision=type(decision).__name__)
             read = spec.effect is Effect.READ
             if read and not isinstance(decision, NeedsApproval):
                 if not isinstance(decision, Allow):
                     s.set(ok=False)
-                    return _Call(name, False, None, _refusal(decision), extension=ext)
+                    return CallResult(name, False, None, _refusal(decision), extension=ext)
                 try:
                     result = await self.executor.execute(
                         intent, decision, step_no=task.step_no, call_index=call_index
                     )
                 except NotAllowedError:
                     s.set(ok=False)
-                    return _Call(name, False, None, "not allowed", extension=ext)
+                    return CallResult(name, False, None, "not allowed", extension=ext)
                 s.set(ok=result.ok, replayed=result.replayed, duration_ms=result.duration_ms)
                 if not result.ok:
-                    return _Call(name, False, None, "the tool failed", extension=ext)
-                return _Call(name, True, result.data or {}, None, extension=ext)
+                    return CallResult(name, False, None, "the tool failed", extension=ext)
+                return CallResult(name, True, result.data or {}, None, extension=ext)
 
             # A gated call: pin it before it can run or be prompted.
             s.set(gated=True)
             if not isinstance(decision, Allow | NeedsApproval):
                 return _not_run(intent, decision)
             pinned = PinnedCall(spec.name, spec.extension, intent.args, task.step_no, call_index)
-            cp = {**task.checkpoint, "call": pinned.to_json(), "effects": list(effects or [])}
+            cp = {
+                **task.checkpoint,
+                **(pin or {}),
+                "call": pinned.to_json(),
+                "effects": list(effects or []),
+            }
             if not ctx.save(checkpoint=cp):
                 return Fail("task is no longer running")
             result = await self._decided(intent, decision, pinned, cp, spans)
             # "replay": an earlier attempt already ran it; it still counts as the side effect.
-            if not isinstance(result, _Answer) or result.path not in ("done", "replay"):
+            if not isinstance(result, Answer) or result.path not in ("done", "replay"):
                 return result
-            return _Call(name, True, result.data or {}, None, report=result.reply, extension=ext)
+            return CallResult(
+                name, True, result.data or {}, None, report=result.reply, extension=ext
+            )
 
     async def _final(
-        self, messages: list[ChatMessage], text: str, calls: list[_Call], spans: SpanFactory
-    ) -> _Answer:
-        used = _used(calls)
+        self, messages: list[ChatMessage], text: str, calls: list[CallResult], spans: SpanFactory
+    ) -> Answer:
+        used = used_tools(calls)
         with spans("runner.local.final", tool_results=len(calls)) as s:
             try:
                 reply = await self.model.chat_json(
@@ -1145,44 +1174,44 @@ class LocalRunner:
                 )
             except ModelOutputError:
                 s.set(outcome="bad_output")
-                return _Answer(summarize(calls), "summary", used)
+                return Answer(summarize(calls), "summary", used)
             raw: Any = (reply.json or {}).get("reply")
-            candidate = _clip(raw) if isinstance(raw, str) else ""
+            candidate = clip_reply(raw) if isinstance(raw, str) else ""
             if not candidate:
                 s.set(outcome="empty")
-                return _Answer(summarize(calls), "summary", used)
+                return Answer(summarize(calls), "summary", used)
             sources = [text, *(canonical_json(c.data) for c in calls if c.data is not None)]
             bad = unsupported_numbers(candidate, sources)
             if bad:
                 s.set(outcome="number_guard", unsupported=len(bad))
-                return _Answer(summarize(calls), "summary", used)
+                return Answer(summarize(calls), "summary", used)
             s.set(outcome="ok")
-            return _Answer(candidate, "llm", used)
+            return Answer(candidate, "llm", used)
 
 
-def _not_run(intent: Intent, decision: Decision) -> _Answer:
+def _not_run(intent: Intent, decision: Decision) -> Answer:
     """The templated reply for a gated call the gate didn't allow (and isn't asking about)."""
     if isinstance(decision, DryRun):
-        return _Answer(dry_run_reply(decision), "dry_run", [])
+        return Answer(dry_run_reply(decision), "dry_run", [])
     if isinstance(decision, Deny):
-        return _Answer(refusal_reply(intent, decision), "refused", [])
-    return _Answer(DONE_NOT_APPROVED, "refused", [])  # Veto: never returned in Phase 2
+        return Answer(refusal_reply(intent, decision), "refused", [])
+    return Answer(DONE_NOT_APPROVED, "refused", [])  # Veto: never returned in Phase 2
 
 
-def _outcome(intent: Intent, result: ToolResult) -> _Answer:
+def _outcome(intent: Intent, result: ToolResult) -> Answer:
     """The templated reply for a gated call that ran (or was recorded as run)."""
     if not result.ok:
         path = "ambiguous" if result.ambiguous else "failed"
-        return _Answer(_failure_reply(intent, result), path, [])
+        return Answer(_failure_reply(intent, result), path, [])
     data = result.data or {}
     if intent.effect is Effect.READ:
-        reply = summarize([_Call(intent.tool, True, data, None, extension=intent.extension)])
+        reply = summarize([CallResult(intent.tool, True, data, None, extension=intent.extension)])
     else:
         reply = report_line(intent, data)
-    return _Answer(reply, "replay" if result.replayed else "done", [intent.tool], data=data)
+    return Answer(reply, "replay" if result.replayed else "done", [intent.tool], data=data)
 
 
-def _job_answer(intent: Intent, job: str, result: ToolResult, answer: _Answer) -> _Answer:
+def _job_answer(intent: Intent, job: str, result: ToolResult, answer: Answer) -> Answer:
     """``github/watch: done: 3 PRs watched, 0 events`` (as a scheduled job's report);
     a definite failure ``github/watch failed: <reason>``; anything else as ``answer``."""
     label = f"{intent.extension}/{job}"
@@ -1193,15 +1222,15 @@ def _job_answer(intent: Intent, job: str, result: ToolResult, answer: _Answer) -
     return answer
 
 
-def _with_report(narration: _Answer, done: _Answer) -> _Answer:
+def with_report(narration: Answer, done: Answer, limit: int = MAX_REPLY_CHARS) -> Answer:
     """The model's narration with the side effect's code-built report line in it."""
     if narration.path != "llm":
         return done
     text = narration.reply
     if done.reply not in text:
-        room = MAX_REPLY_CHARS - len(done.reply) - 1
-        text = f"{_clip(text, room)}\n{done.reply}" if room > 0 else done.reply
-    return _Answer(text, "llm", done.tools_used)
+        room = limit - len(done.reply) - 1
+        text = f"{clip_reply(text, room)}\n{done.reply}" if room > 0 else done.reply
+    return Answer(text, "llm", done.tools_used, meta=narration.meta)
 
 
 def _effects(cp: dict[str, Any]) -> list[str]:
@@ -1211,14 +1240,16 @@ def _effects(cp: dict[str, Any]) -> list[str]:
     return [e for e in cast(list[Any], raw) if isinstance(e, str)] if isinstance(raw, list) else []
 
 
-def _after_effects(effects: list[str], result: _Result) -> _Result:
+def after_effects(
+    effects: list[str], result: StepResult, limit: int = MAX_REPLY_CHARS
+) -> StepResult:
     """``result``'s reply after the report lines of the side effects that already ran."""
-    if not effects or not isinstance(result, _Answer):
+    if not effects or not isinstance(result, Answer):
         return result
-    return replace(result, reply=_clip("\n".join([*effects, result.reply])))
+    return replace(result, reply=clip_reply("\n".join([*effects, result.reply]), limit))
 
 
-def _used(calls: list[_Call]) -> list[str]:
+def used_tools(calls: list[CallResult]) -> list[str]:
     return [c.tool for c in calls if c.ok]
 
 
@@ -1240,7 +1271,7 @@ def _refusal(decision: Decision) -> str:
     return "not run"
 
 
-def _tool_turn(call: _Call, max_chars: int = MODEL_RESULT_MAX_CHARS) -> str:
+def tool_turn(call: CallResult, max_chars: int = MODEL_RESULT_MAX_CHARS) -> str:
     """A tool result as a user turn. Tool output is untrusted data, like the message. An
     extension tool's result is clipped to ``max_chars`` (it is stored in full, redacted)."""
     if call.ok and call.data is not None:

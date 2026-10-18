@@ -120,6 +120,7 @@ class Daemon:
                 daemon_healthy=self.healthy,
                 model=model,
                 osa_runner=osa_runner,
+                started_at=self.state.started_at,
             )
             self.state.monitor = self.imessage.monitor
         self.scheduler = Scheduler.from_components(
