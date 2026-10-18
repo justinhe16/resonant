@@ -10,7 +10,7 @@ Linear for Resonant, through **Linear's hosted MCP server** (`https://mcp.linear
 | `list_projects` | L0 | Projects, optionally by team or query. |
 | `list_teams` | L0 | Teams and their keys. |
 | `save_issue` | L2 | Create an issue (no id: title and team) or update one (with its id). Asks a plain yes first. |
-| `create_comment` | L2 | Add a comment to an issue. Asks a plain yes first. |
+| `save_comment` | L2 | Add a comment to an issue (or edit one, with its id). Asks a plain yes first. |
 
 The server offers more tools (documents, cycles, initiatives, …). Resonant never registers or calls a tool this manifest doesn't list; `ext add` shows them as a note.
 
@@ -23,7 +23,7 @@ Linear's MCP docs (<https://linear.app/docs/mcp>) say the server accepts "OAuth 
 
 ## Install (owner, in the Mini's terminal)
 
-1. In Linear's settings, under your account's security / API section, create a **personal API key**. Pick the permissions you want (Read only, or Read + Write for `save_issue` and `create_comment`) and the teams it may see.
+1. In Linear's settings, under your account's security / API section, create a **personal API key**. Pick the permissions you want (Read only, or Read + Write for `save_issue` and `save_comment`) and the teams it may see.
 2. `resonant secret set linear/token` and paste the key.
 3. `resonant ext add repo:linear`. Listing the server's tools needs the key, so it first asks `Send linear/token to mcp.linear.app now?`; answer `y`. It then shows every tool with the pin of what the server reports (`sha256` of its name and the stripped input and output schemas, what the model sees), the server's unlisted tools as a note, and the escalations (`mcp server "linear" calls https://mcp.linear.app/mcp (http, network), sends secret token as its bearer token`, the two writes at L2). Type `linear` to install. The daemon restarts and texts you.
 4. Try it: "what's on my Linear", "make a Linear ticket for the flaky login test" (asks first).
@@ -32,7 +32,9 @@ Linear's MCP docs (<https://linear.app/docs/mcp>) say the server accepts "OAuth 
 
 Linear names its tools and changes their descriptions and schemas without notice. Each daemon start, and each `tools/list_changed` from the server, re-lists the tools: one whose pin changed is **disabled** (hidden from the model, refused on call) and you get one text, `linear: MCP tool <tool> changed since you approved it; disabled. resonant ext update linear to review`. `resonant ext update linear` shows the old and new pins; confirm to re-pin.
 
-If `ext add` or `ext update` says `mcp server linear has no tool <name>`, Linear renamed it (for example a comment tool named `save_comment` instead of `create_comment`): change the name in `resonant.yaml`, commit, and run the command again. The names here were checked against public listings of the hosted server in October 2026; the live `tools/list` is the source of truth.
+If `ext add` or `ext update` says `mcp server linear has no tool <name> (renamed? it has <names>)`, Linear renamed it (in 2026 `create_comment` became `save_comment`): change the name in `resonant.yaml`, commit, and run the command again. The install refuses rather than skipping the tool, because the manifest is your typed list of what each tool is. The names here were checked in October 2026 against public listings built from the live server (Glama's connector changelog, Speakeasy's catalog), not a live `tools/list` with a key; the live `tools/list` is the source of truth.
+
+Linear's schemas are generated with zod and carry long ECMA-262 `pattern`s (for example `save_issue`'s `slaBreachesAt`, a 293-character ISO date-time regex). Resonant drops a pattern that is over 100 characters or that Python's `re` can't compile: the model doesn't see it and it isn't checked locally, and Linear still validates. Before LN-1 such a pattern refused the install with `its schema has a bad 'pattern' value`.
 
 ## Not here
 

@@ -20,6 +20,8 @@ Design (carried from ``followups.md``):
   called. The model sees the manifest's description, never the server's; the server's input
   schema is stripped to an allowlist of validation keywords (``description``, ``title``,
   ``default``, ``examples`` and anything unknown are dropped) and its annotations are ignored.
+  A ``pattern`` that is long, unprintable or not a Python regex (ECMA-262 syntax ``re``
+  refuses) is dropped too: not shown, not enforced locally; the server validates (LN-1).
 - **Pins.** Each tool is pinned as ``sha256(name, stripped input schema, stripped output
   schema)`` (pin version 2, GT-1): only what the model sees and what arguments are checked
   against. The server's description and annotations never reach the model, so a reworded
@@ -52,10 +54,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -160,6 +164,8 @@ def strip_schema(schema: object, depth: int = 0) -> Any:
                 out[key] = strip_schema(value, depth + 1)
         elif key in _SCHEMA_LISTS and isinstance(value, list):
             out[key] = [strip_schema(v, depth + 1) for v in cast(list[Any], value)]
+        elif key == "pattern" and isinstance(value, str) and not _checkable_pattern(value):
+            continue  # not shown, not enforced here; the server still validates (LN-1)
         elif key in _SCHEMA_VALUES:
             out[key] = _schema_value(key, value)
     for name in cast(dict[str, Any], out.get("properties", {})):
@@ -180,6 +186,25 @@ ENUM_MAX = 100
 
 def _short(v: object, limit: int = TEXT_MAX) -> bool:
     return isinstance(v, str) and len(v) <= limit and v.isprintable()
+
+
+def _checkable_pattern(p: str) -> bool:
+    """Whether a string ``pattern`` is kept: short and printable (the model reads it) and one
+    Python's ``re`` compiles (``jsonschema`` checks arguments with ``re.search``).
+
+    A JSON Schema pattern is an ECMA-262 regex. Generated schemas carry long ones (zod's
+    UUID and ISO datetime patterns are well over ``TEXT_MAX``) and ECMA-only syntax
+    (``\\p{L}``, ``(?<name>…)``, ``[^]``) that ``re`` refuses. Such a
+    pattern is dropped rather than refused or translated: a dropped pattern only loosens the
+    local check (the server validates its own schema), it carries no text to the model, and
+    dropping is deterministic, so the pin is stable. A non-string pattern is still refused."""
+    if not _short(p):
+        return False
+    try:
+        re.compile(p)
+    except Exception:  # re.error, and OverflowError/RecursionError on pathological ones
+        return False
+    return True
 
 
 def _scalar(v: object) -> bool:
@@ -325,17 +350,33 @@ def approve(server_id: str, listed: tuple[str, ...], tools: list[dict[str, Any]]
             continue
         by_name[name] = t
     pins: dict[str, McpToolPin] = {}
+    ignored = sorted(n for n in by_name if n not in listed)
     for name in listed:
         tool = by_name.get(name)
         if tool is None:
-            problems.append(f"mcp server {server_id} has no tool {name}")
+            problems.append(_missing(server_id, name, ignored))
             continue
         try:
             pins[name] = McpToolPin(server_id, tool_pin(tool), input_schema(tool))
         except ValueError as e:
             problems.append(f"mcp tool {name}: {e}")
-    ignored = sorted(n for n in by_name if n not in listed)
     return Discovered(pins, problems, ignored)
+
+
+_TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")  # resonant_sdk's TOOL_NAME_PATTERN
+
+
+def _missing(server_id: str, name: str, unlisted: list[str]) -> str:
+    """Why ``ext add`` refuses a manifest-listed tool the server doesn't offer, with the
+    server's closest unlisted names (only ones a manifest could list, so no server text
+    beyond a tool name reaches the terminal). Install still refuses: the manifest is the
+    owner's typed list of what each tool is, and a tool is only disabled after approval."""
+    names = [n for n in unlisted if _TOOL_NAME.match(n)]
+    close = difflib.get_close_matches(name, names, n=3, cutoff=0.6)
+    hint = f" (renamed? it has {', '.join(close)})" if close else ""
+    return (
+        f"mcp server {server_id} has no tool {name}{hint}; fix or remove it in the manifest's tools"
+    )
 
 
 def server_argv(

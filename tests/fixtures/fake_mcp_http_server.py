@@ -6,7 +6,7 @@
 to end a session. It wants ``Authorization: Bearer <token>`` (else 401).
 
 Tools are Linear-like (``list_issues``, ``get_issue``, ``list_comments``, ``list_projects``,
-``list_teams``, ``save_issue``, ``create_comment``) plus test tools:
+``list_teams``, ``save_issue``, ``save_comment``) plus test tools:
 
 - ``leak``: returns the bearer token it got.
 - ``sleep {seconds}``: sleeps (a ``notifications/cancelled`` for it is recorded).
@@ -50,6 +50,12 @@ def _tool(name: str, desc: str, props: dict[str, Any], required: list[str]) -> d
 
 
 STR = {"type": "string", "description": "server text, stripped"}
+SLA_PATTERN = (
+    r"^(?:(?:\d\d[2468][048]|\d\d[13579][26]|\d\d0[48]|[02468][048]00|[13579][26]00)-02-29"
+    r"|\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\d|30)"
+    r"|(?:02)-(?:0[1-9]|1\d|2[0-8])))T(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?"
+    r"(?:Z|([+-](?:[01]\d|2[0-3]):[0-5]\d)))$"
+)
 
 
 class FakeHttpMcp:
@@ -138,10 +144,27 @@ class FakeHttpMcp:
             _tool(
                 "save_issue",
                 "Create or update",
-                {"id": STR, "title": STR, "team": STR, "description": STR},
+                {
+                    "id": STR,
+                    "title": STR,
+                    "team": STR,
+                    "description": STR,
+                    # Linear's live field (LN-1): zod's iso.datetime({offset: true}), 293 chars
+                    "slaBreachesAt": {
+                        "anyOf": [
+                            {"type": "string", "format": "date-time", "pattern": SLA_PATTERN},
+                            {"type": "null"},
+                        ]
+                    },
+                },
                 [],
             ),
-            _tool("create_comment", "Comment", {"issueId": STR, "body": STR}, ["issueId", "body"]),
+            _tool(
+                "save_comment",
+                "Create or update a comment",
+                {"id": STR, "issueId": STR, "documentId": STR, "body": STR},
+                [],
+            ),
             _tool("leak", "leak", {}, []),
             _tool("sleep", "sleep", {"seconds": {"type": "number"}}, []),
             _tool("big", "big", {}, []),
@@ -302,7 +325,7 @@ class FakeHttpMcp:
             key = str(args.get("id") or f"ENG-{len(self.issues) + 1}")
             self.issues[key] = {"id": key, "title": args.get("title", ""), "assignee": "me"}
             return text(json.dumps(self.issues[key]))
-        if name == "create_comment":
+        if name == "save_comment":
             return text("commented")
         if name == "leak":
             auth = h.headers.get("Authorization", "")

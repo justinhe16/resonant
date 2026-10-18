@@ -80,8 +80,8 @@ Update a row when you try it, with the date and anything odd.
 | 46 | First fork run: the fork appears, the App mints its token, `external_pr` asks, the upstream PR appears only after `yes` | go-live 14, first run | 📱 after 35 and 39 |
 | 51 | Workers load your Claude setup (guard off): a run's transcript `init` line lists your MCP servers and skills; with no `runner/claude_token` set, `/runs` doesn't ask for one and a run works on your `claude` login | go-live 14, terminal 2 and first run | 🖥 (Claude) after 31–32 |
 | 52 | Work on Resonant itself: "spawn a claude to fix the typo in the README in resonant" → `On it: R… · resonant.`, worktree `~/code/.worktrees/resonant/R…`, `~/resonant` untouched, a PR; "spawn a claude to restart resonant and check it came back" → `Back up (…)`, the same run resumes and finishes; without "restart" in the ask its `resonant restart` asks `[K…] R… wants to restart on resonant …` first | go-live 14, iMessage 12 | 📱 after 39 |
-| 48 | Optional Linear: API key → `resonant secret set linear/token`; `resonant ext add repo:linear` asks before sending the token, lists every tool with a pin (writes `L2: asks`) | go-live 12, Optional: Linear 1–3 | 🖥 |
-| 49 | "what's on my Linear" answers with your issues (no asking); "make a Linear ticket for …" asks a plain yes first, `no` → `Not done.` | go-live 12, Optional: Linear 4 | 📱 after 48 |
+| 48 | Optional Linear: API key → `resonant secret set linear/token`; `resonant ext add repo:linear` asks before sending the token, lists every tool with a pin (`save_issue` and `save_comment` `L2: asks`), no `bad 'pattern' value` or `has no tool` refusal | go-live 12, Optional: Linear 1–3 | 🖥 |
+| 49 | "what's on my Linear" answers with your issues (no asking); "make a Linear ticket for …" and "add a comment on KEY-123 saying …" each ask a plain yes first, `no` → `Not done.` | go-live 12, Optional: Linear 4 | 📱 after 48 |
 | 50 | No Linear key in logs or the DB (`grep -r lin_api ~/.resonant/logs`, `sqlite3` on `audit_log`) | go-live 12, Optional: Linear | 🖥 after 49 |
 
 ## Phase 4: the dashboard
