@@ -22,6 +22,7 @@ from resonant.runner.resolve import (
     NoAccess,
     NotFound,
     NotPushable,
+    OfflineGitHub,
     RepoInfo,
     Resolved,
     Resolver,
@@ -215,7 +216,9 @@ open("@LOG@", "a").write(json.dumps({"argv": argv, "env": sorted(os.environ)}) +
 path = argv[1].lower()
 hosts = open(os.path.join(os.environ["GH_CONFIG_DIR"], "hosts.yml")).read()
 assert "ghp_secret" in hosts
-if path == "repos/me/proj":
+if path == "repos/me/proj" and argv[2:] == ["--jq", ".size"]:
+    print("2048")
+elif path == "repos/me/proj":
     print(json.dumps({"full_name": "Me/Proj", "default_branch": "dev", "private": True,
                       "permissions": {"push": True}}))
 elif path == "repos/me/proj/contents/.github/workflows":
@@ -263,6 +266,25 @@ async def test_gh_client_reads_access_and_ci_without_the_token_in_argv(tmp_path:
     assert "ghp_secret" not in json.dumps(calls)
     assert all("GH_CONFIG_DIR" in c["env"] and "GH_TOKEN" not in c["env"] for c in calls)
     assert list((tmp_path / "state" / "secrets").iterdir()) == []  # the throwaway dir is gone
+
+
+async def test_size_kb_from_each_client_never_raises(tmp_path: Path) -> None:
+    """RP-1: how big a repo is, so an add can leave a huge clone to the first run."""
+    client = make_client(tmp_path)
+    assert await client.size_kb("me/proj") == 2048
+    assert await client.size_kb("me/missing") is None  # a gh failure is unknown
+    assert await client.size_kb("me/boom") is None
+    api = FakePublicApi({"octo/lib": {**public("octo/lib"), "size": 77}})
+    assert await api.github().size_kb("octo/lib") == 77
+    assert await api.github().size_kb("octo/none") is None
+    api.repos["octo/odd"] = {**public("octo/odd"), "size": "big"}
+    assert await api.github().size_kb("octo/odd") is None
+    api.status = 403
+    assert await api.github().size_kb("octo/lib") is None
+    assert await OfflineGitHub().size_kb("me/proj") is None
+    fake = FakeGitHub()
+    fake.sizes["me/proj"] = 5
+    assert await fake.size_kb("Me/Proj") == 5 and await fake.size_kb("me/x") is None
 
 
 class SlowGitHub(FakeGitHub):

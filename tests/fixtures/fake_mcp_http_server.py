@@ -36,17 +36,22 @@ from typing import Any
 PROTOCOL = "2025-06-18"
 
 
-def _tool(name: str, desc: str, props: dict[str, Any], required: list[str]) -> dict[str, Any]:
-    return {
-        "name": name,
-        "description": desc,
-        "inputSchema": {
-            "type": "object",
-            "properties": props,
-            "required": required,
-            "additionalProperties": False,
-        },
+def _tool(
+    name: str,
+    desc: str,
+    props: dict[str, Any],
+    required: list[str],
+    defs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": False,
     }
+    if defs:
+        schema["$defs"] = defs
+    return {"name": name, "description": desc, "inputSchema": schema}
 
 
 STR = {"type": "string", "description": "server text, stripped"}
@@ -149,15 +154,20 @@ class FakeHttpMcp:
                     "title": STR,
                     "team": STR,
                     "description": STR,
-                    # Linear's live field (LN-1): zod's iso.datetime({offset: true}), 293 chars
+                    # Linear's live field: zod's iso.datetime({offset: true}), 293 chars, made
+                    # nullable as a oneOf (LN-2: the shape that was refused after LN-1)
                     "slaBreachesAt": {
-                        "anyOf": [
+                        "oneOf": [
                             {"type": "string", "format": "date-time", "pattern": SLA_PATTERN},
                             {"type": "null"},
                         ]
                     },
+                    # the same through a $ref, and a not over a long pattern
+                    "dueDate": {"oneOf": [{"$ref": "#/$defs/dateTime"}, {"type": "null"}]},
+                    "cycleId": {"type": "string", "not": {"pattern": SLA_PATTERN}},
                 },
                 [],
+                {"dateTime": {"type": "string", "format": "date-time", "pattern": SLA_PATTERN}},
             ),
             _tool(
                 "save_comment",
