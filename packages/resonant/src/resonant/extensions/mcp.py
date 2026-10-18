@@ -155,11 +155,14 @@ def strip_schema(schema: object, depth: int = 0) -> Any:
 
     The result must only ever be **looser** than the server's schema: the server validates,
     and a local check stricter than it would refuse calls the server accepts. A schema is
-    loosened when it loses an asserting keyword: a string ``pattern`` that can't be checked
-    (``_checkable_pattern``), or any keyword Draft 2020-12 enforces that isn't kept
-    (``if``/``then``/``else``, ``dependentRequired``, ``unevaluated*``, ``minContains``, …).
-    Annotations and unknown keywords change nothing (``format`` too: no format checker).
-    Every kept keyword is monotone in its subschemas except ``not`` and ``oneOf``, so (LN-2):
+    loosened (LN-2) when it:
+
+    - drops a string ``pattern`` that can't be checked (``_checkable_pattern``);
+    - drops any key that isn't a pure annotation (``_ANNOTATIONS``, ``x-*``): ``if``,
+      ``dependencies``, ``unevaluated*``, ``minContains``, vendor keywords, …;
+    - keeps a ``format``: shown to the model, but no format checker runs here.
+
+    Every kept keyword is monotone in its subschemas except ``not`` and ``oneOf``, so:
 
     - a ``oneOf`` with a loosened branch becomes an ``anyOf`` of the same branches (each
       branch only accepts more, and ``anyOf`` accepts whatever ``oneOf`` did);
@@ -193,9 +196,16 @@ class _StripCtx:
 
 _DEF_POINTER = re.compile(r"^#/(?:\$defs|definitions)/[^/~%]+$")  # no escapes to decode
 
-# Keywords the local validator (Draft 2020-12, no format checker) asserts; dropping one
-# loosens. minContains/maxContains are enforced inside ``contains``.
-_ENFORCED = frozenset(jsonschema.Draft202012Validator.VALIDATORS) | {"minContains", "maxContains"}
+# Keywords that assert nothing in any draft. Dropping one of these (or an ``x-*``) leaves
+# the schema as strict as it was; dropping any other key counts as loosening, whatever
+# draft the server validates with (``dependencies``, ``if``, ``unevaluated*``, vendor
+# keywords). A literal list, so a jsonschema upgrade can't move a pin.
+_ANNOTATIONS = frozenset(
+    {
+        "description", "title", "default", "examples", "$comment", "deprecated", "readOnly",
+        "writeOnly", "$schema", "$id", "$anchor", "$dynamicAnchor", "$vocabulary",
+    }
+)  # fmt: skip
 
 
 def _ref_loose(ref: object, ctx: _StripCtx) -> bool:
@@ -250,12 +260,15 @@ def _strip(schema: object, depth: int, ctx: _StripCtx, root: bool = False) -> tu
             out[key] = _schema_value(key, value)
             if key == "$ref" and _ref_loose(value, ctx):
                 loose = True
+            elif key == "format":  # shown, but no format checker runs here; the server's may
+                ctx.dropped = loose = True
         elif key == "$id" and not root:
             raise ValueError("its schema has a nested $id")
-        elif key in _ENFORCED:  # an asserting keyword we don't keep: the result accepts more
-            ctx.dropped = loose = True
+        elif key not in _ANNOTATIONS and not key.startswith("x-"):
+            ctx.dropped = loose = True  # a keyword we don't keep may assert: we accept more
     if "minContains" in cast(dict[str, Any], schema) and "contains" in out:
-        del out["contains"]  # without minContains (0 made it optional) contains would tighten
+        # minContains is dropped (any value): 0 made contains optional, so contains goes too
+        del out["contains"]
     if one_loose:  # ``anyOf`` of the loosened branches accepts whatever ``oneOf`` did
         branches = out.pop("oneOf")
         if "anyOf" in out:  # both present: keep both constraints, side by side

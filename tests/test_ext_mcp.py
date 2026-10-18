@@ -1341,6 +1341,30 @@ def test_only_looser_for_every_dropped_assertion(raw: dict[str, Any], want: dict
     assert _only_looser(raw, SAMPLES) == want
 
 
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [
+        # format is shown but not checked here; a server that checks it makes these exclusive
+        ({"oneOf": [{"format": "email"}, {"type": "string"}]},
+         {"anyOf": [{"format": "email"}, {"type": "string"}]}),
+        ({"not": {"format": "email"}}, {}),
+        # older-draft and vendor keywords we don't keep loosen too (whatever the server's draft)
+        ({"not": {"dependencies": {"a": ["b"]}}}, {}),
+        ({"not": {"$recursiveRef": "#"}}, {}),
+        ({"oneOf": [{"type": "string", "errorMessage": "x"}, {"const": "a"}]},
+         {"anyOf": [{"type": "string"}, {"const": "a"}]}),
+    ],
+)  # fmt: skip
+def test_format_and_unkept_keywords_loosen(raw: dict[str, Any], want: dict[str, Any]) -> None:
+    """The server (say Ajv with formats) checks ``format``; this validator doesn't."""
+    out = strip_schema(raw)
+    assert out == want
+    server: Any = jsonschema.Draft202012Validator(raw, format_checker=jsonschema.FormatChecker())
+    for sample in [*SAMPLES, "me@example.com", "zz"]:
+        if server.is_valid(sample):
+            assert _accepts(out, sample), sample
+
+
 def test_a_nested_id_is_refused() -> None:
     """It would change what a ``#/…`` pointer under it means; a root ``$id`` doesn't."""
     with pytest.raises(ValueError, match="nested"):
