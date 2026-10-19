@@ -85,7 +85,7 @@ from resonant.runners.local import (
 )
 from resonant.store.tasks import get_task
 from resonant.tools import ToolRegistry
-from resonant_sdk import Effect, ToolSpec
+from resonant_sdk import Effect, Level, ToolSpec
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +100,7 @@ RESULT_MAX_CHARS = 16_000  # a read's result, as Claude sees it
 LINE_MAX = 1024 * 1024
 DESCRIPTION_CHARS = 600
 
+UNSURE = "error: Resonant hit an error; it may or may not have run. Check before retrying."
 PAUSED = "not run: Resonant is paused (/kill); nothing runs until the owner resumes it."
 PENDING = (
     "not run: this task is already waiting on the owner's answer for {what}, and a task "
@@ -266,15 +267,18 @@ class ClaudeTools:
         first, up to ``CLOSE_WAIT_S``, so its report line isn't lost; any call after that is
         refused, and open connections are closed (a late call must never prompt the owner
         directly or run outside the session's accounting)."""
+        idle = False
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._lock.acquire(), CLOSE_WAIT_S)
             self._closed = True
             self._lock.release()
+            idle = True
         self._closed = True
         for writer in list(self._writers):
             writer.close()
-        self.caller.live.discard(self.task.id)
-        self.caller.deferred.pop(self.task.id, None)
+        if idle:  # a call still stuck keeps deferring: it can never prompt the owner itself
+            self.caller.live.discard(self.task.id)
+            self.caller.deferred.pop(self.task.id, None)
         if self._server is not None:
             self._server.close()
             with contextlib.suppress(Exception):
@@ -355,7 +359,7 @@ class ClaudeTools:
                         text, error = await self.call(req.get("name"), req.get("args"))
                     except Exception as e:  # one bad call never kills the session's relay
                         log.warning("ask: tool call failed", extra={"error": type(e).__name__})
-                        text, error = "not run: Resonant hit an error running that", True
+                        text, error = UNSURE, True
                     await _write(writer, {"id": rid, "text": text, "error": error})
                 else:
                     await _write(writer, {"id": rid, "text": "unknown op", "error": True})
@@ -405,11 +409,11 @@ class ClaudeTools:
             return BAD_ARGS.format(why=why, name=spec.name, schema=schema), True
         if self._paused():
             return PAUSED, True
-        if change:
-            if self.pending is not None:
-                return PENDING.format(what=self.pending), True
-            if len(self.reports) >= MAX_SIDE_EFFECTS:
-                return CAPPED, True
+        # a pending call's pin must stay: nothing else that could be pinned runs after it
+        if self.pending is not None and (change or spec.effective_level is not Level.L0):
+            return PENDING.format(what=self.pending), True
+        if change and len(self.reports) >= MAX_SIDE_EFFECTS:
+            return CAPPED, True
         if self.outside:
             self.tainted = True
         origin: Origin = "tainted" if self.tainted else "inferred"

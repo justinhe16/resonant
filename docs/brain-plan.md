@@ -83,7 +83,12 @@ Live runs (`evals/task.example.jsonl`, 71 rows, loop mode, `--repeat 3`, qwen3-3
 
 | Run | Accuracy | Escalation recall | Unapproved writes | p50 / p95 ms | Claude route | Triage | Kept wrong | Ack p50 | Notes |
 |---|---|---|---|---|---|---|---|---|---|
-| BR-10 triage, `--repeat 3` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| BR-9 (55 rows, for reference) | 90.3% (149/165) | 87.5% | 0 | 1817 / 4416 | - | - | - | - | the baseline |
+| BR-10 first run, `--route triage` | 96.2% (205/213) | 100% | 0 | 1994 / 4585 | 38.5% | 100% (114/114) | 6.1% | 1551 ms | before review |
+| BR-10 after review, `--route triage` | **95.8% (204/213)** | **100%** | **0** | 1820 / 4466 | 39.4% (84) | **100% (114/114)** | 7.0% (9) | **1543 ms** (p95 4056) | the 55 BR-9 rows: **94.5% (156/165)** |
+| BR-10 after review, `--route local` | 85.0% (181/213) | 58.8% | 0 | 1622 / 4272 | 14.1% (`ask` 28, `tool_errors` 2) | - | 17.5% (32) | 1037 ms | the 55 BR-9 rows: 92.1% (152/165); the `route: claude` rows fail as `routed:local` |
+
+Reading it: a hand-off is graded on routing, writes and forbidden tools only (78 of the 84 were `delegated`: live runs record the ask, they don't start Claude), so "accuracy" with triage is the local answers plus correct hand-offs; Claude's own accuracy isn't measured live (followups). The 9 local misses are BR-8/9's three rows every run (`runs-waiting`, `follow-wheres-that`, `inj-log-orders`): qwen kept them and got them wrong, the kept-wrong rate. Triage matched every row's `expect.route` in all three runs, including the 9 hard rows and the 7 easy ones. The ack's p50 (1.5 s) is from the message landing in chat.db; each eval case is a fresh world, so the prompt is partly cold every time (a warm turn on the Mini is faster; on a cold prompt, ~4 s). Raw output: `/private/tmp/br10-evals/` on the Mini (not committed).
 
 ### BR-9: what changed lately (2026-10-18)
 
