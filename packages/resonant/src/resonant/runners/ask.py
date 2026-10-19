@@ -56,7 +56,8 @@ built-ins (no Edit, Write or Bash) and the connector reads. The reply is Claude'
 the code-built report line of every change that ran. A change the gate asked about is pinned
 during the session; after the answer goes out the owner is prompted and the task waits
 (``phase: approval``): ``yes`` runs it once and reports, ``no`` or expiry drops it (the local
-runner's resume, ``ToolCaller.step``). A session a crash cut short after a change was pinned
+runner's resume: ``resumer``, a ``LocalRunner`` named ``ask``, whose ``ToolCore.resume``
+runs the pinned call). A session a crash cut short after a change was pinned
 is not run again (``INTERRUPTED``). The prompt carries the last few exchanges as context.
 
 **Images** (BR-7): a HEIC/HEIF attachment is converted to JPEG inside the ask's folder
@@ -138,13 +139,14 @@ from resonant.runners.ask_tools import (
     ClaudeTools,
     McpServer,
     McpSetup,
+    NoModel,
     ToolAccess,
-    ToolCaller,
     listing,
 )
 from resonant.runners.claude import LimitHit, read_lines, usage_limit, wake_time
 from resonant.runners.claude_session import ClaudeSession, TurnOutcome
 from resonant.runners.convert import SIPS, heic_to_jpeg
+from resonant.runners.local import LocalRunner
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.sandbox import resolve_tool
 from resonant.secrets import SecretError, SecretStore, load_runner_secrets
@@ -795,7 +797,25 @@ class AskRunner:
         )
         self.on_watch = on_watch  # a watch ask's answer (runners/watch.py), never texted
         self.tools = tools
-        self.caller = ToolCaller(conn, tools, channel) if tools is not None else None
+        # The bridge's tool call path (TC-1: ``ToolCore``), and the approval resume of a change
+        # it pinned: the local runner's step (resend, resume the pinned call, reply).
+        self.caller = tools.core if tools is not None else None
+        self.resumer = (
+            LocalRunner(
+                conn,
+                model=cast(Any, NoModel()),
+                channel=channel,
+                gate=tools.core.gate,
+                executor=tools.core.executor,
+                registry=tools.core.registry,
+                max_step_s=None,
+                timezone=tools.timezone,
+                extensions=tools.extensions,
+                name=NAME,
+            )
+            if tools is not None
+            else None
+        )
         self._notes: set[asyncio.Task[None]] = set()
         self.sips = sips
         self.clock = clock
@@ -1048,9 +1068,9 @@ class AskRunner:
         if principal is None or not isinstance(question, str) or kind not in KINDS:
             return Fail("ask checkpoint is malformed")
         if cp.get("phase") == "approval":  # BR-10: a change waits on the owner (or resumes)
-            if self.caller is None:
+            if self.resumer is None:
                 return Fail("an ask waits on an approval but has no tool bridge")
-            return await self.caller.step(task, events, ctx)
+            return await self.resumer.step(task, events, ctx)
         if isinstance(cp.get("reply"), str):  # answered before a crash or a send failure
             return await self._deliver(task, cp, ctx)
         left = await self._reap_left(task, cp)
@@ -1608,14 +1628,14 @@ class AskRunner:
         self._note_answer(cp, reply, status)
         if (
             cp.get("pending") is True
-            and self.caller is not None
+            and self.resumer is not None
             and isinstance(cp.get("call"), dict)
         ):  # BR-10: now prompt the owner and wait, as the local runner does
             nxt = {k: v for k, v in cp.items() if k not in ("reply", "dedupe_key", "pending")}
             nxt.update(phase="approval", answer=reply, effects=[])  # effects were in the reply
             if not ctx.save(checkpoint=nxt):
                 return Fail("task is no longer running")
-            return await self.caller.step(replace(task, checkpoint=nxt), [], ctx)
+            return await self.resumer.step(replace(task, checkpoint=nxt), [], ctx)
         result: dict[str, Any] = {
             "status": status,
             "kind": cp.get("kind"),

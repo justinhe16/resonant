@@ -4,10 +4,11 @@ here instead of to the labeler; the fast path, approval replies, the relay and `
 unchanged.
 
 It is a ``LocalRunner`` with a different answer step, so everything after "the model picked a
-tool" is the local runner's: ``_call_tool`` (registry spec, ``gate.evaluate``, executor), the
-pinned gated call and its resume after an approval, the code-built report lines
-(``REPORTS``), at most ``MAX_SIDE_EFFECTS`` side effects without asking and one approval per
-task, and the resend of a saved reply. A checkpoint that holds ``call`` (or any of the local
+tool" is the shared tool call path (TC-1, ``resonant.toolcore``, through ``_call_tool``):
+registry spec, schema check, ``gate.evaluate``, executor, the pinned gated call and its resume
+after an approval, the code-built report lines (``REPORTS``), at most ``MAX_SIDE_EFFECTS``
+side effects without asking; plus the local runner's one approval per task and the resend of
+a saved reply. A checkpoint that holds ``call`` (or any of the local
 runner's keys) is handed to ``LocalRunner._answer`` as is.
 
 **One turn** (a ``kind="chat"`` task with no ``call``):
@@ -87,8 +88,6 @@ from datetime import datetime
 from functools import partial
 from typing import Any, cast
 
-import jsonschema
-
 from resonant.brain import triage
 from resonant.brain.context import build_context, catalog_entries
 from resonant.brain.facts import FactStore
@@ -114,7 +113,6 @@ from resonant.router.intents import ExtensionCatalog
 from resonant.router.labeler import Labeler
 from resonant.router.router import builtin_names, chat_toolset, toolset_entries, toolset_for
 from resonant.runners.local import (
-    MAX_SIDE_EFFECTS,
     MODEL_RESULT_MAX_CHARS,
     NO_ANSWER_REPLY,
     REPLY_SCHEMA,
@@ -122,9 +120,7 @@ from resonant.runners.local import (
     Answer,
     CallResult,
     LocalRunner,
-    RunnerGate,
     StepResult,
-    ToolExecutor,
     after_effects,
     clip_reply,
     tool_turn,
@@ -133,6 +129,8 @@ from resonant.runners.local import (
     with_report,
 )
 from resonant.store.db import utcnow
+from resonant.toolcore import MAX_SIDE_EFFECTS, RunnerGate, ToolExecutor
+from resonant.toolcore import args_error as args_error  # moved here (TC-1); re-exported
 from resonant.tools import ToolRegistry
 from resonant.tools.ask import ASK_CLAUDE, ASKING_HOPS, QUESTION_MAX
 from resonant_sdk import Effect, Event, ToolSpec
@@ -384,16 +382,6 @@ def stub(spec: ToolSpec) -> ToolSpec:
     return ToolSpec(
         name=spec.name, description=entry.summary, args_schema=schema, effect=Effect.READ
     )
-
-
-def args_error(spec: ToolSpec, args: dict[str, Any]) -> str | None:
-    """Why ``args`` don't fit ``spec`` (a short reason, no values), or None."""
-    try:
-        jsonschema.validate(args, spec.args_schema)
-    except jsonschema.ValidationError as e:
-        where = "/".join(str(p) for p in e.path)
-        return f"{e.validator}{' at ' + where if where else ''}"
-    return None
 
 
 @dataclass
@@ -1107,6 +1095,7 @@ class BrainRunner(LocalRunner):
                 st.reports,
                 origin=st.origin,
                 pin=st.pin(),
+                check_schema=True,  # checked above (``_one``); ToolCore checks again
             )
         st.executed += 1
         session = (

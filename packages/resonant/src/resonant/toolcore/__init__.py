@@ -1,0 +1,70 @@
+"""The shared tool call path (TC-1): ``ToolCore.call(target, args, scope) -> CallOutcome``.
+
+See ``toolcore/core.py``. Every caller (the local, brain, media, job and watch runners, the
+Claude bridge and the approval resume) goes through it; nothing else calls ``gate.evaluate``
+or ``Executor.execute`` (``tests/test_toolcore_boundary.py``).
+"""
+
+from resonant.toolcore.core import (
+    CAPPED_REPLY,
+    MAX_SIDE_EFFECTS,
+    Asked,
+    CallOutcome,
+    CallScope,
+    Failed,
+    InlineGate,
+    PinnedCall,
+    Ran,
+    Refused,
+    RefusedWhy,
+    RunnerGate,
+    ToolCore,
+    ToolExecutor,
+    allow_inline,
+    args_error,
+    direct_call,
+    is_explicit,
+    pinned_origin,
+)
+from resonant.toolcore.reports import (
+    DONE_NOT_APPROVED,
+    NOT_AVAILABLE_REPLY,
+    REPORTS,
+    dry_run_reply,
+    failure_reply,
+    not_run_reply,
+    refusal_reply,
+    report_line,
+    summarize_intent,
+)
+
+__all__ = [
+    "CAPPED_REPLY",
+    "DONE_NOT_APPROVED",
+    "MAX_SIDE_EFFECTS",
+    "NOT_AVAILABLE_REPLY",
+    "REPORTS",
+    "Asked",
+    "CallOutcome",
+    "CallScope",
+    "Failed",
+    "InlineGate",
+    "PinnedCall",
+    "Ran",
+    "Refused",
+    "RefusedWhy",
+    "RunnerGate",
+    "ToolCore",
+    "ToolExecutor",
+    "allow_inline",
+    "args_error",
+    "direct_call",
+    "dry_run_reply",
+    "failure_reply",
+    "is_explicit",
+    "not_run_reply",
+    "pinned_origin",
+    "refusal_reply",
+    "report_line",
+    "summarize_intent",
+]
