@@ -1173,9 +1173,13 @@ def eval_task(
         Path | None,
         typer.Option(help="Where the summary JSON goes. Default: ~/.resonant/evals/results/."),
     ] = None,
+    route: Annotated[
+        str,
+        typer.Option(help="brain.route for the run: triage (default), local or claude (BR-10)."),
+    ] = "triage",
 ) -> None:
     """Run each text through the brain in a fresh, hermetic home; grade tools, escalation,
-    asks and facts (docs/brain-plan.md §4).
+    asks, facts and (BR-10) who answered (docs/brain-plan.md §4).
 
     Each case gets a temp home with its seeded world: never your state, ~/code or the
     Keychain. Writes other than notes, reminders and facts are recorded, not run, and
@@ -1193,6 +1197,9 @@ def eval_task(
     if modes is None:
         typer.echo("--mode must be 'loop', 'intents' or 'both'", err=True)
         raise typer.Exit(2)
+    if route not in task_eval.ROUTES:
+        typer.echo("--route must be 'triage', 'local' or 'claude'", err=True)
+        raise typer.Exit(2)
     code = task_eval.run(
         load_settings(),
         set_path=set_path,
@@ -1205,6 +1212,7 @@ def eval_task(
         out_dir=out,
         echo=typer.echo,
         echo_err=lambda s: typer.echo(s, err=True),
+        route=route,
     )
     raise typer.Exit(code)
 

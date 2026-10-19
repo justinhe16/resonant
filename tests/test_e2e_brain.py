@@ -25,6 +25,7 @@ import pytest
 from brain_seed import message
 
 from resonant.brain import TURN_NUDGE
+from resonant.brain.triage import CANNED_ACKS
 from resonant.config import DEFAULT_READ_DENY, load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
@@ -453,13 +454,15 @@ async def test_round_cap_escalates_to_ask_claude(
 ) -> None:
     script: list[Scripted] = [[("list_notes", {})]] * MAX_ROUNDS
     async with start(resonant_home, chat, tmp_path, script) as b:
-        assert await b.say("dig into everything", replies=2) == ["Looking into it…", ANSWER]
+        ack, answer = await b.say("keep counting my notes", replies=2)
+        assert ack in CANNED_ACKS and answer == ANSWER  # BR-10: a varied, canned ack
         assert len(b.model.requests) == MAX_ROUNDS
         (task,) = b.brain_tasks()
-        assert b.result(task)["path"] == "escalate" and b.result(task)["escalate"] is True
+        assert b.result(task)["path"] == "claude" and b.result(task)["escalate"] is True
+        assert b.result(task)["handoff"] == "cap"
         (ask,) = b.rows("SELECT * FROM tasks WHERE runner = 'ask'")
         question = json.loads(ask["checkpoint"])["question"]
-        assert question.startswith("dig into everything")
+        assert question.startswith("keep counting my notes")
         assert "ran out of steps; it tried: list_notes" in question
 
 
@@ -468,7 +471,8 @@ async def test_two_bad_outputs_escalate(
 ) -> None:
     script: list[Scripted] = [ModelOutputError("bad"), ModelOutputError("bad")]
     async with start(resonant_home, chat, tmp_path, script) as b:
-        assert await b.say("hmm?", replies=2) == ["Looking into it…", ANSWER]
+        ack, answer = await b.say("hmm?", replies=2)
+        assert ack in CANNED_ACKS and answer == ANSWER
         (ask,) = b.rows("SELECT * FROM tasks WHERE runner = 'ask'")
         assert "couldn't produce an answer" in json.loads(ask["checkpoint"])["question"]
 
@@ -612,10 +616,25 @@ async def test_a_claimed_change_gets_one_corrective_round(
 async def test_the_corrective_round_is_once_per_task(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
+    """BR-10: a second claim goes to Claude; only when Claude can't take it (here the daily
+    cap) does it go out as is."""
     script: list[Scripted] = ["I've saved that.", "I've saved that, really."]
-    async with start(resonant_home, chat, tmp_path, script) as b:
+    async with start(resonant_home, chat, tmp_path, script, ask={"daily_cap": 0}) as b:
         assert await b.say("remember my standup is at 9:30") == ["I've saved that, really."]
         assert len(b.model.requests) == 2
+
+
+async def test_a_second_claim_goes_to_claude(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    script: list[Scripted] = ["I've saved that.", "I've saved that, really."]
+    async with start(resonant_home, chat, tmp_path, script) as b:
+        ack, answer = await b.say("remember my standup is at 9:30", replies=2)
+        assert ack in CANNED_ACKS and answer == ANSWER
+        (task,) = b.brain_tasks()
+        assert b.result(task)["handoff"] == "guard"
+        (ask,) = b.rows("SELECT * FROM tasks WHERE runner = 'ask'")
+        assert "kept guessing" in json.loads(ask["checkpoint"])["question"]
 
 
 async def test_answers_that_claim_nothing_go_straight_out(
@@ -827,7 +846,10 @@ async def test_newest_ones_follow_up_no_guessed_identifiers(
     # Resonant itself is this repo: the daemon registers its own checkout (ops.repo_path), and
     # on CI the package checkout is a "justinhe16/resonant" of its own, outside the roots.
     own = {"repo_path": str(tmp_path / "code" / "resonant")}
-    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own) as b:
+    # Claude out of reach: BR-10 would hand the second lookup guard to it, and this test needs
+    # the old wrong answer in the history.
+    cap = {"daily_cap": 0}
+    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own, ask=cap) as b:
         b.model.push("PR #1 from Oct 8 is the latest.", "PR #1 from Oct 8 is the latest.")
         assert await b.say("Most recent PRs?") == ["PR #1 from Oct 8 is the latest."]
         b.model.push(
@@ -849,8 +871,9 @@ async def test_a_lookup_round_doesnt_use_up_the_claim_check(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     """Review of BR-9: the lookup and claim corrective rounds are separate, so a claim made
-    after a lookup round is still checked."""
-    async with start(resonant_home, chat, tmp_path) as b:
+    after a lookup round is still checked (with Claude out of reach: else BR-10 hands the
+    second guard to it)."""
+    async with start(resonant_home, chat, tmp_path, ask={"daily_cap": 0}) as b:
         b.model.push("Nothing new.", "Done, merged the newest PR.", "I can't merge from here.")
         assert await b.say("any newest PRs to merge?") == ["I can't merge from here."]
         kinds = [r.messages[-1]["content"] for r in b.model.requests[1:]]

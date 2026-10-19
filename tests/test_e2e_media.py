@@ -19,6 +19,7 @@ from test_e2e_brain import ANSWER, Brain, start
 
 from resonant.brain import watches as watch_store
 from resonant.brain.context import BRAIN_SYSTEM
+from resonant.brain.triage import CANNED_ACKS
 from resonant.e2e import wait_until
 from resonant.gateway.imessage.fixtures import FakeAttachment, FakeChatDB
 from resonant.runners.media import VOICE_NEEDS_WHISPER
@@ -191,13 +192,26 @@ async def test_a_link_goes_to_claude_as_kind_link(
     assert "kind link" in BRAIN_SYSTEM
     async with start(resonant_home, chat, tmp_path) as b:
         url = "https://example.com/posts/agents"
+        # BR-10: the triage hands a link to Claude whatever the model says (kind link)
+        ack, answer = await b.say(url, replies=2)
+        assert ack in CANNED_ACKS and answer == ANSWER
+        assert b.model.requests == [] and b.model.calls["triage"] == 1
+        (cp,) = ask_rows(b)
+        assert cp["kind"] == "link" and url in cp["question"]
+        assert "Fetch the link with WebFetch" in notes(tmp_path)["prompt"]
+
+
+async def test_with_the_local_route_the_model_sends_a_link_to_claude(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path, brain={"route": "local"}) as b:
+        url = "https://example.com/posts/agents"
         b.model.push([("ask_claude", {"question": f"Summarise {url}", "kind": "link"})])
         assert await b.say(url, replies=2) == ["Looking into it…", ANSWER]
         (req,) = b.model.requests
         assert "kind link" in req.messages[0]["content"]
         (cp,) = ask_rows(b)
         assert cp["kind"] == "link" and url in cp["question"]
-        assert "Fetch the link with WebFetch" in notes(tmp_path)["prompt"]
 
 
 # --- watches -------------------------------------------------------------------------------

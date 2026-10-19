@@ -101,6 +101,9 @@ class CallContext:
     idempotency_key: str
     task_id: str
     events: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    # Who chose the call (``Intent.origin``). ``ask_claude`` starts a tainted task's Claude
+    # session tainted (BR-10).
+    origin: str = "inferred"
 
 
 class ContextHandler(ABC):
@@ -204,7 +207,9 @@ class Executor:
             raise NotAllowedError(_USED)
 
         start = time.monotonic()
-        ctx = CallContext(secrets=env, idempotency_key=key, task_id=intent.task_id)
+        ctx = CallContext(
+            secrets=env, idempotency_key=key, task_id=intent.task_id, origin=intent.origin
+        )
         tail: str | None = None
         try:
             data = await self._run(intent, ctx)

@@ -12,7 +12,12 @@ daily cap, a bad attachment) is a normal result, ``{"queued": false, "text": <wh
   read root); each is checked against ``brain.read_roots``, ``attachment_roots`` and
   ``read_deny`` here and again when it is copied into the session's folder.
 
-Level: L0 with ``Effect.READ``. The session is read-only by construction (``--restricted``,
+**Resonant's tools** (BR-10): when the calling task is a brain turn (``runner="brain"``: its
+triage, the model's own call, an escalation), the ask gets Resonant's tools through the gate
+(``runners/ask_tools.py``), starting tainted when the call's origin was ``tainted``. Code sets
+both from the calling task and the executor's ``CallContext``; the model can't ask for them.
+
+Level: L0 with ``Effect.READ``. Claude's own tools are read-only by construction (``--restricted``,
 the read built-ins, connector read tools only, ``dontAsk``): nothing it can do changes
 anything, so it needs no approval, and a ``tainted`` task may call it (the gate asks only for
 L2 and L3). What it costs is bounded by the concurrency and the daily cap. It is a global
@@ -34,6 +39,7 @@ if TYPE_CHECKING:
     from resonant.runners.ask import AskRefused, Kind, Queued
 
 RUNNER = "ask"
+BRAIN_RUNNER = "brain"  # runners.brain.NAME
 QUESTION_MAX = 4000  # runners.ask.QUESTION_MAX (a test checks they agree)
 ATTACH_MAX = 4  # runners.ask.ATTACH_MAX
 KIND_VALUES = ("general", "research", "email", "calendar", "image", "link")  # runners.ask.KINDS
@@ -42,12 +48,11 @@ NOT_RUNNING = "ask_claude isn't available: the ask runner isn't running (iMessag
 ASK_CLAUDE = ToolSpec(
     name="ask_claude",
     description=(
-        "Hand a question to Claude (read-only) when you're stuck or it needs the web, email, "
-        "calendar, an image or a link. It answers the owner by text in a minute or two; you "
-        "get back only that it's queued, so tell the owner you're looking into it. `kind`: "
-        "research (web), email, calendar, image (with `attachments`), link, or general. "
-        "Claude never sends or changes anything; a send or event change comes back as a "
-        "proposal."
+        "Hand a question to Claude when you're stuck or it needs the web, email, calendar, an "
+        "image or a link. It answers the owner by text in a minute or two; you get back only "
+        "that it's queued, so tell the owner you're looking into it. `kind`: research (web), "
+        "email, calendar, image (with `attachments`), link, or general. Claude uses Resonant's "
+        "tools through the same approvals as yours; it never sends email or changes events."
     ),
     args_schema={
         "type": "object",
@@ -86,6 +91,8 @@ class AskApi(Protocol):
         requested_by: str | None = None,
         channel_ref: dict[str, Any] | None = None,
         trace_id: str | None = None,
+        tools: bool = False,
+        tainted: bool = False,
     ) -> Queued | AskRefused: ...
 
 
@@ -131,12 +138,15 @@ class AskClaude(ContextHandler):
         if runner is None:
             return {"queued": False, "text": NOT_RUNNING}
         principal, channel_ref, trace_id, requested_by = runner.owner, None, None, None
+        tools, tainted = False, False
         if ctx is not None:
             task = task_store.get_task(self.ctx.conn, ctx.task_id)
             if task is not None:
                 requested_by = task.id
                 principal = task.principal or runner.owner
                 channel_ref, trace_id = task.channel_ref, task.trace_id
+                tools = task.runner == BRAIN_RUNNER  # BR-10: the brain's asks get its tools
+                tainted = ctx.origin == "tainted"
         result = runner.enqueue(
             question,
             kind=cast("Kind", kind),
@@ -145,6 +155,8 @@ class AskClaude(ContextHandler):
             requested_by=requested_by,
             channel_ref=channel_ref,
             trace_id=trace_id,
+            tools=tools,
+            tainted=tainted,
         )
         task_id: object = getattr(result, "task_id", None)
         if isinstance(task_id, str):

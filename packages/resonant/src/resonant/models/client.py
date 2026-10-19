@@ -148,7 +148,12 @@ class ModelClient(Protocol):
         max_tokens: int = 512,
         temperature: float = 0.0,
         spans: SpanFactory | None = None,
-    ) -> ModelReply: ...
+        tools: list[ToolSpec] | None = None,
+    ) -> ModelReply:
+        """A JSON reply for ``schema``. ``tools`` are only shown, never called: the prompt
+        then starts like a ``chat_tools`` call's, so the model's prompt cache holds (BR-10's
+        triage)."""
+        ...
 
     async def chat_tools(
         self,
@@ -718,15 +723,21 @@ class OllamaClient:
         max_tokens: int = 512,
         temperature: float = 0.0,
         spans: SpanFactory | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelReply:
         with (spans or self._spans)("llm.call", kind="json", **self._attrs()) as s:
             start = self._clock()
             convo: list[ChatMessage] = list(messages)
             prompt_tokens = completion_tokens = 0
             raw: RawReply | None = None
+            shown = openai_tools(tools) if tools else None
             for attempt in (1, 2):
                 raw = await self._complete(
-                    convo, max_tokens=max_tokens, temperature=temperature, schema=schema
+                    convo,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    schema=schema,
+                    tools=shown,
                 )
                 prompt_tokens += raw.prompt_tokens or 0
                 completion_tokens += raw.completion_tokens or 0

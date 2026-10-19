@@ -23,6 +23,11 @@ calls work as above, so a turn that falls back to the intents path still labels.
 ``chat_tools`` request is kept in ``requests`` (messages and tool names), for asserting on
 the prompt and the toolset.
 
+**Triage** (BR-10): a ``chat_json`` call with the triage schema (``brain.triage.SCHEMA``)
+answers the next item of ``triages`` (a dict, or an exception to raise), else ``triage``
+(default ``{"handler": "local", ...}``: the turn stays local, so scripts written before
+BR-10 run unchanged). Each request is kept in ``triage_requests``.
+
 Each call can sleep ``delay_s`` first, to stand in for model latency.
 
 ``RecordingOsaRunner`` records every osascript argv (handle, text, monotonic time) instead of
@@ -40,6 +45,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, cast
 
+from resonant.brain.triage import SCHEMA as TRIAGE_SCHEMA
 from resonant.gateway.imessage.sender import OSASCRIPT, OsaResult
 from resonant.models import ChatMessage, ModelReply, ProbeResult, SpanFactory, ToolCall
 from resonant.router.prefixes import LABEL_SCHEMA
@@ -81,6 +87,7 @@ Scripted = Sequence[ToolCall | tuple[str, dict[str, Any]]] | str | BaseException
 _REMIND = re.compile(r"remind me in (\d+) minutes? to (.+?)</message>", re.IGNORECASE | re.DOTALL)
 _NOW = re.compile(r"^Current time: (\S+) ", re.MULTILINE)
 DEFAULT_FINAL_REPLY = "Here's the rundown from the task list: all good."
+LOCAL_TRIAGE: dict[str, Any] = {"handler": "local", "kind": "general", "say": ""}
 
 
 class ScriptedModel:
@@ -100,6 +107,9 @@ class ScriptedModel:
         self.calls: dict[str, int] = {"label": 0, "tools": 0, "answer": 0, "probe": 0}
         self.script: list[Scripted] | None = None if script is None else list(script)
         self.requests: list[ToolsRequest] = []
+        self.triage: dict[str, Any] = dict(LOCAL_TRIAGE)
+        self.triages: list[dict[str, Any] | BaseException] = []
+        self.triage_requests: list[ToolsRequest] = []
 
     def push(self, *items: Scripted) -> None:
         """Append to the script (and switch to scripted mode)."""
@@ -119,12 +129,21 @@ class ScriptedModel:
         max_tokens: int = 512,
         temperature: float = 0.0,
         spans: SpanFactory | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelReply:
         await self._wait()
+        if schema == TRIAGE_SCHEMA:
+            self.calls["triage"] = self.calls.get("triage", 0) + 1
+            self.triage_requests.append(ToolsRequest(list(messages), [t.name for t in tools or []]))
+            item = self.triages.pop(0) if self.triages else self.triage
+            if isinstance(item, BaseException):
+                raise item
+            data: dict[str, Any] = dict(item)
+            return ModelReply(json.dumps(data), [], data, 1, 10, 5)
         if _is_label_schema(schema):
             self.calls["label"] += 1
             intent = self.label_for(messages[-1]["content"], _enum(schema))
-            data: dict[str, Any] = {"intent": intent, "confidence": 0.9}
+            data = {"intent": intent, "confidence": 0.9}
         elif schema == REPLY_SCHEMA:
             self.calls["answer"] += 1
             data = {"reply": self.final_reply}

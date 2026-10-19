@@ -93,17 +93,28 @@ pulse:
 #   mode: loop                          # default since BR-8: every chat message goes to the brain
 #                                       #   loop (core tools plus stubs, ask_claude, taint); intents:
 #                                       #   the labeler and one intent's fixed tools instead
+#   route: triage                       # BR-10, loop mode: triage (the local model's first call picks
+#                                       #   itself or Claude; Claude gets an instant ack first), local
+#                                       #   (as before BR-10: Claude only when the loop asks or is stuck),
+#                                       #   claude (every chat turn to Claude, after a local ack)
+#   triage:
+#     bias: normal                      # normal: easy ones stay local; claude: only status, notes,
+#                                       #   reminders and small talk stay local
+#     timeout_s: 8                      # past it the turn goes to Claude with a canned ack
 #   read_roots: null                    # null: runner.code_dir, ~/resonant, ops.repo_path and
 #                                       #   Resonant's logs, docs and run transcripts; a list replaces them
 #   read_deny: []                       # added to the built-in deny list (~/Documents, ~/Library, ~/.ssh,
 #                                       #   ~/.aws, .env*, *.pem, *.key, id_*, credentials, .git/config, ...);
 #                                       #   "/abs" or "~/x" is a path, anything else a glob ("*.secret")
 #   rg_path: /opt/homebrew/bin/rg       # ripgrep for search; missing: a bounded Python search
-#   ask_claude:                         # a read-only Claude session per hard question (BR-5);
-#                                       #   it reads the same roots and deny list
+#   ask_claude:                         # a Claude session per hard question (BR-5); it reads the
+#                                       #   same roots and deny list (its own tools stay read-only)
 #     enabled: true
+#     resonant_tools: true              # BR-10: an ask the brain hands over also gets Resonant's tools
+#                                       #   over a per-task MCP bridge, every call through the gate;
+#                                       #   false: those asks are read-only, as in BR-5
 #     concurrency: 1                    # sessions at once, apart from the worker slots
-#     daily_cap: 30                     # asks a day
+#     daily_cap: 30                     # asks a day; with route: triage every handed-over turn counts
 #     timeout_s: 120
 #     max_turns: 15
 #     reply_max_chars: 1500

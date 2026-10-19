@@ -79,8 +79,8 @@ BRAIN_SYSTEM = (
     "or free time (calendar), the web, news, prices or anything current (research), a link "
     "(link), a photo, screenshot or file the owner sent (image: Claude gets the attachment "
     "even when you can't see it), a hard question (general). Never say you can't reach "
-    "email, calendar, the web or images: ask Claude. ask_claude "
-    "only reads; it never creates or changes anything.\n"
+    "email, calendar, the web or images: ask Claude. Claude uses Resonant's tools with the "
+    "same approvals as yours; it never sends email or changes calendar events.\n"
     "- Ambiguous question: make your best guess, look it up and say what you assumed.\n"
     "- Changes need a clear target. When the message names no specific item and more than "
     'one could fit ("stop it" while R3 and R5 are both active, "drop that note" with several '

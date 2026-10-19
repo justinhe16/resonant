@@ -88,6 +88,7 @@ from typing import Any, cast
 
 import jsonschema
 
+from resonant.brain import triage
 from resonant.brain.context import build_context, catalog_entries
 from resonant.brain.facts import FactStore
 from resonant.brain.history import fold, fold_due
@@ -151,6 +152,8 @@ PROGRESS_TEXT = "On it…"
 RUNNER_GAPS_TTL_S = 60.0  # as the dashboard's runner check (api.RUNNER_CHECK_TTL_S)
 RUNNER_GAPS_TIMEOUT_S = 30.0  # a background check; never on the reply path
 TRIED_MAX_CHARS = 300  # the "what was tried" note in an escalated question
+MAX_GUARDS = 1  # BR-10: a guard firing again hands the turn to Claude instead
+MAX_TOOL_FAILURES = 2  # BR-10: failed calls in a row before the loop hands it to Claude
 
 # Always loaded (D4): the read tools, facts, ask_claude, notes and reminders, runs, the Mini.
 CORE_TOOLS: frozenset[str] = frozenset(
@@ -411,6 +414,9 @@ class _Turn:
     text: str = ""  # the owner's message (the target check)
     target_checked: bool = False  # the one target check was used
     guess_checked: bool = False  # the one guessed-identifier check was used
+    guards: int = 0  # BR-10: claim, lookup and guess checks fired (the next one escalates)
+    failures: int = 0  # BR-10: failed tool calls since the last one that worked
+    meta: dict[str, Any] = field(default_factory=dict[str, Any])  # route, handoff, ack
     tools: list[ToolSpec] = field(default_factory=list[ToolSpec])
 
     def __post_init__(self) -> None:
@@ -684,6 +690,15 @@ class BrainRunner(LocalRunner):
             )
             st = _Turn(context.messages(), events, core, {d.name: d for d in deferred}, text=text)
             s.set(history_turns=len(context.history), prefix_hash=context.prefix_hash(st.toolset()))
+        routed = await self._triage(task, principal, text, st, spans)
+        if routed is not None:
+            handed = await self._hand_off(
+                task, principal, text, st, ctx, spans, why="triage", kind=routed.kind,
+                ack=routed.ack,
+            )  # fmt: skip
+            if handed is not None:
+                return handed
+            st.meta["route"] = "local"  # Claude refused (cap, off, paused): answer here
         try:
             return await self._rounds(task, principal, text, st, ctx, spans)
         except ModelUnavailableError:
@@ -693,6 +708,131 @@ class BrainRunner(LocalRunner):
                     clip_reply("\n".join(st.reports), MAX_REPLY_CHARS), "done", used_tools(st.calls)
                 )
             return await self._intents(task, principal, text, events, ctx, spans)
+
+    # --- triage and hand-off (BR-10) -------------------------------------------------------
+
+    def _claude_spec(self, principal: str) -> ToolSpec | None:
+        """``ask_claude``'s spec when ``principal`` may use it and it is on, else None."""
+        if not self.settings.brain.ask_claude.enabled:
+            return None
+        spec = self.registry.get(None, ASK_CLAUDE.name)
+        if spec is None or not self.principals.may_request(principal, spec):
+            return None
+        return spec
+
+    async def _triage(
+        self, task: Task, principal: str, text: str, st: _Turn, spans: SpanFactory
+    ) -> triage.Triage | None:
+        """BR-10: who answers this turn. None: the local loop. A ``Triage`` with route
+        ``claude``: hand it over, with its ack (None: a canned one). One ``chat_json`` call
+        over the turn's own messages and toolset, so the prompt cache holds. A bad or late
+        answer, or a model that's down, goes to Claude (in doubt, Claude)."""
+        brain = self.settings.brain
+        st.meta["route"] = "local"
+        if brain.route == "local" or self._claude_spec(principal) is None:
+            return None
+        ask: ChatMessage = {"role": "user", "content": triage.instruction(brain.triage.bias)}
+        messages: list[ChatMessage] = [*st.messages, ask]
+        start = time.monotonic()
+        decided: triage.Triage | None = None
+        why = "model"
+        with spans("runner.brain.triage", route_mode=brain.route) as s:
+            try:
+                reply = await asyncio.wait_for(
+                    self.model.chat_json(
+                        messages,
+                        schema=triage.SCHEMA,
+                        max_tokens=triage.TRIAGE_MAX_TOKENS,
+                        spans=spans,
+                        tools=st.toolset(),
+                    ),
+                    brain.triage.timeout_s,
+                )
+                decided = triage.parse(reply.json)
+                if decided is None:
+                    why = "bad_output"
+            except ModelOutputError:
+                why = "bad_output"
+            except ModelUnavailableError:
+                why = "model_down"
+            except TimeoutError:
+                why = "timeout"
+            if decided is None:  # in doubt: Claude, with a canned ack
+                decided = triage.Triage("claude", "general", None)
+            if brain.route == "claude" and decided.route != "claude":
+                decided = triage.Triage("claude", decided.kind, None)
+            if decided.route == "local" and triage.has_link(text):
+                decided = triage.Triage("claude", "link", None)  # links need WebFetch
+                why = "link"
+            elif decided.route == "local" and triage.looks_hard(text):
+                decided = triage.Triage("claude", decided.kind, None)  # why/how, debugging
+                why = "hard_shape"
+            ms = round((time.monotonic() - start) * 1000)
+            s.set(route=decided.route, kind=decided.kind, why=why, ack=decided.ack is not None,
+                  latency_ms=ms)  # fmt: skip
+        st.meta["triage"] = {"route": decided.route, "why": why, "ms": ms}
+        return decided if decided.route == "claude" else None
+
+    async def _hand_off(
+        self,
+        task: Task,
+        principal: str,
+        text: str,
+        st: _Turn,
+        ctx: StepContext,
+        spans: SpanFactory,
+        *,
+        why: str,
+        kind: str = "general",
+        ack: str | None = None,
+        note: str = "",
+    ) -> StepResult | None:
+        """Hand the turn to Claude: ``ask_claude`` through the gate and executor (origin as
+        the task's, so a tainted turn starts a tainted session), and the ack is the reply.
+        None when it couldn't be queued (the principal may not, it is off, refused)."""
+        spec = self._claude_spec(principal)
+        if spec is None:
+            return None
+        question = text[: QUESTION_MAX - len(note)] + note
+        args: dict[str, Any] = {"question": question}
+        if kind != "general":
+            args["kind"] = kind
+        with spans("runner.brain.handoff", why=why, kind=kind) as s:
+            done = await self._call_tool(
+                task,
+                principal,
+                [spec],
+                spec.name,
+                args,
+                st.executed,
+                ctx,
+                spans,
+                st.reports,
+                origin=st.origin,
+                pin={"tainted": st.tainted},
+            )
+            st.executed += 1
+            queued = (
+                isinstance(done, CallResult) and done.ok and (done.data or {}).get("queued") is True
+            )
+            s.set(queued=queued)
+        if not queued:
+            return None
+        assert isinstance(done, CallResult)
+        st.calls.append(done)
+        st.tainted = True  # its answer is outside content (D6)
+        reply = ack or triage.canned_ack(task.id)
+        st.meta.update(route="claude", handoff=why, ack="model" if ack else "canned")
+        answer = Answer(reply, "claude", used_tools(st.calls), escalate=True, meta=dict(st.meta))
+        return after_effects(st.reports, answer, MAX_REPLY_CHARS)
+
+    def _guard_fired(self, kind: str, st: _Turn, spans: SpanFactory) -> bool:
+        """Count a guard (claim, lookup, guess). True when one already fired in this task: the
+        turn then goes to Claude instead of trying again."""
+        with spans("runner.brain.guard", kind=kind, again=st.guards >= MAX_GUARDS):
+            pass
+        st.guards += 1
+        return st.guards > MAX_GUARDS
 
     async def _rounds(
         self,
@@ -709,9 +849,26 @@ class BrainRunner(LocalRunner):
             if reply is None or not calls:
                 answer = (reply.text or "").strip() if reply is not None else ""
                 if answer:
+                    # gave up after failed calls (a question back to the owner is fine)
+                    if st.failures >= MAX_TOOL_FAILURES and not _ASKS_BACK.search(answer):
+                        handed = await self._hand_off(
+                            task, principal, text, st, ctx, spans, why="tool_errors",
+                            note=self._tried(st, "couldn't recover from tool errors"),
+                        )  # fmt: skip
+                        if handed is not None:
+                            return handed
                     nudge = self._nudge(answer, st)
                     if nudge is None:
                         return self._answered(answer, st, spans)
+                    if self._guard_fired(nudge[0], st, spans):
+                        handed = await self._hand_off(
+                            task, principal, text, st, ctx, spans, why="guard",
+                            note=self._tried(st, "kept guessing"),
+                        )  # fmt: skip
+                        if handed is not None:
+                            return handed
+                    if (nudge[0] == "claim" and st.nudged) or (nudge[0] == "lookup" and st.looked):
+                        return self._answered(answer, st, spans)  # once each, as before
                     if nudge[0] == "claim":
                         st.nudged = True
                     else:
@@ -765,24 +922,27 @@ class BrainRunner(LocalRunner):
         return out
 
     def _nudge(self, answer: str, st: _Turn) -> tuple[str, str] | None:
-        """The corrective rounds, each once per task: an answer that claims a change while no
-        side effect ran (``claim``), and a live-state question answered with no tool at all
-        (``lookup``, BR-9). ``(kind, text)`` or None."""
-        # Once each: a second answer goes out as is, even if it still claims (the code-built
-        # report lines are the owner's record of what ran).
+        """The corrective rounds: an answer that claims a change while no side effect ran
+        (``claim``), and a live-state question answered with no tool at all (``lookup``,
+        BR-9). ``(kind, text)`` or None. Each round runs once per task; a guard that fires
+        again hands the turn to Claude (BR-10, ``_rounds``), and only when that can't happen
+        does the second answer go out as is (the code-built report lines are the owner's
+        record of what ran)."""
         if st.reports:
             return None
-        if not st.nudged and claims_change(answer):
+        if claims_change(answer):
             return ("claim", CLAIM_NUDGE)
         # A question back to the owner is fine as is.
-        if (
-            not st.looked
-            and not st.calls
-            and asks_live_state(st.text)
-            and not _ASKS_BACK.search(answer)
-        ):
+        if not st.calls and asks_live_state(st.text) and not _ASKS_BACK.search(answer):
             return ("lookup", LOOKUP_NUDGE)
         return None
+
+    @staticmethod
+    def _tried(st: _Turn, why: str) -> str:
+        """The note an escalated question carries: why, and which tools ran."""
+        tried = ", ".join(dict.fromkeys(c.tool for c in st.calls)) or "nothing"
+        ran = "; changes already made, don't repeat them" if st.reports else ""
+        return f"\n\n(Resonant's local model {why}; it tried: {tried}{ran})"[:TRIED_MAX_CHARS]
 
     async def _round(self, n: int, st: _Turn, spans: SpanFactory) -> ModelReply | None:
         """One ``chat_tools`` call; None on bad output. ``ModelUnavailableError`` propagates."""
@@ -818,13 +978,16 @@ class BrainRunner(LocalRunner):
         if not isinstance(args, dict):
             call = CallResult(name, False, None, "invalid arguments: pass a JSON object")
             args = {}
+            st.failures += 1
         elif spec is None:
             call = CallResult(name, False, None, NO_SUCH_TOOL.format(name=flat(name, 64)))
+            st.failures += 1
         elif (why := args_error(spec, cast(dict[str, Any], args))) is not None:
             schema = json.dumps(spec.args_schema, sort_keys=True, separators=(",", ":"))
             call = CallResult(
                 name, False, None, BAD_STUB_ARGS.format(why=why, name=name, schema=schema)
             )
+            st.failures += 1
         elif not st.target_checked and (
             target := unnamed_target(spec, cast(dict[str, Any], args), st.text)
         ):
@@ -832,46 +995,90 @@ class BrainRunner(LocalRunner):
             with spans("runner.brain.target_check", tool=name):
                 pass
             call = CallResult(name, False, None, TARGET_CHECK.format(target=target, name=name))
-        elif not st.guess_checked and (
-            target := guessed_arg(spec, cast(dict[str, Any], args), st.text, st.seen())
-        ):
+        elif target := guessed_arg(spec, cast(dict[str, Any], args), st.text, st.seen()):
+            if self._guard_fired("guess", st, spans):  # BR-10: a guard again: Claude
+                handed = await self._hand_off(
+                    task, principal, st.text, st, ctx, spans, why="guard",
+                    note=self._tried(st, "kept guessing"),
+                )  # fmt: skip
+                if handed is not None:
+                    return handed
+            if st.guess_checked:  # once per task, as before: run it
+                return await self._run_one(task, principal, name, args, spec, st, ctx, spans)
             st.guess_checked = True
             with spans("runner.brain.guess_check", tool=name):
                 pass
             call = CallResult(name, False, None, GUESS_CHECK.format(target=target, name=name))
         else:
-            args = cast(dict[str, Any], args)
-            done = await self._call_tool(
-                task,
-                principal,
-                [spec],
-                name,
-                args,
-                st.executed,
-                ctx,
-                spans,
-                st.reports,
-                origin=st.origin,
-                pin={"tainted": st.tainted},
-            )
-            st.executed += 1
-            if taints(spec) and not st.tainted:
-                st.tainted = True
-                with spans("runner.brain.taint", tool=name, extension=spec.extension):
-                    pass
-            if not isinstance(done, CallResult):
-                return after_effects(st.reports, done, MAX_REPLY_CHARS)
-            call = done
-            data = call.data or {}
-            if name == ASK_CLAUDE.name and data.get("queued") is True:
-                st.calls.append(call)
-                said = data.get("text")
-                reply = said if isinstance(said, str) and said else "Looking into it…"
-                answer = Answer(reply, "ask", used_tools(st.calls), escalate=True)
-                return after_effects(st.reports, answer, MAX_REPLY_CHARS)
+            return await self._run_one(task, principal, name, args, spec, st, ctx, spans)
         st.calls.append(call)
-        # Native tool turns: the assistant's call, then its result as a ``tool`` message
-        # (still labeled untrusted data), so the chat template renders them as it was trained.
+        self._tool_turns(name, args, call, st)
+        return await self._still_failing(task, principal, st, ctx, spans)
+
+    async def _still_failing(
+        self, task: Task, principal: str, st: _Turn, ctx: StepContext, spans: SpanFactory
+    ) -> StepResult | None:
+        """BR-10: more than ``MAX_TOOL_FAILURES`` failed calls in a row hands the turn over."""
+        if st.failures <= MAX_TOOL_FAILURES:
+            return None
+        return await self._hand_off(
+            task, principal, st.text, st, ctx, spans, why="tool_errors",
+            note=self._tried(st, "couldn't recover from tool errors"),
+        )  # fmt: skip
+
+    async def _run_one(
+        self,
+        task: Task,
+        principal: str,
+        name: str,
+        args: Any,
+        spec: ToolSpec,
+        st: _Turn,
+        ctx: StepContext,
+        spans: SpanFactory,
+    ) -> StepResult | None:
+        """Run one checked call through the gate and executor into ``st``."""
+        args = cast(dict[str, Any], args)
+        done = await self._call_tool(
+            task,
+            principal,
+            [spec],
+            name,
+            args,
+            st.executed,
+            ctx,
+            spans,
+            st.reports,
+            origin=st.origin,
+            pin={"tainted": st.tainted},
+        )
+        st.executed += 1
+        if taints(spec) and not st.tainted:
+            st.tainted = True
+            with spans("runner.brain.taint", tool=name, extension=spec.extension):
+                pass
+        if not isinstance(done, CallResult):
+            return after_effects(st.reports, done, MAX_REPLY_CHARS)
+        call = done
+        data = call.data or {}
+        if name == ASK_CLAUDE.name and data.get("queued") is True:
+            st.calls.append(call)
+            said = data.get("text")
+            reply = said if isinstance(said, str) and said else "Looking into it…"
+            st.meta.update(route="claude", handoff="ask", ack="tool")
+            meta = dict(st.meta)
+            answer = Answer(reply, "ask", used_tools(st.calls), escalate=True, meta=meta)
+            return after_effects(st.reports, answer, MAX_REPLY_CHARS)
+        # BR-10: a tool that failed (not a gate refusal: Claude has the same gate) counts
+        failed = not call.ok and (call.error or "").startswith("the tool failed")
+        st.failures = 0 if call.ok else st.failures + int(failed)
+        st.calls.append(call)
+        self._tool_turns(name, args, call, st)
+        return await self._still_failing(task, principal, st, ctx, spans)
+
+    def _tool_turns(self, name: str, args: Any, call: CallResult, st: _Turn) -> None:
+        """Native tool turns: the assistant's call, then its result as a ``tool`` message
+        (still labeled untrusted data), so the chat template renders them as trained."""
         st.messages.append(
             {"role": "assistant", "content": "", "tool_calls": [{"name": name, "args": args}]}
         )
@@ -882,7 +1089,6 @@ class BrainRunner(LocalRunner):
                 "content": tool_turn(call, self.model_result_max_chars),
             }
         )
-        return None
 
     def _answered(self, answer: str, st: _Turn, spans: SpanFactory) -> Answer:
         """The model's answer: clipped, the number guard counted (log-only), and the code-built
@@ -890,7 +1096,7 @@ class BrainRunner(LocalRunner):
         reply = clip_reply(answer, MAX_REPLY_CHARS)
         sources = [m["content"] for m in st.messages]
         bad = unsupported_numbers(reply, sources)
-        meta: dict[str, Any] = {"tool_calls": len(st.calls), "tainted": st.tainted}
+        meta: dict[str, Any] = {"tool_calls": len(st.calls), "tainted": st.tainted, **st.meta}
         if bad:
             meta["number_guard"] = len(bad)
             log.info("brain: %d number(s) in the reply not found in the context", len(bad))
@@ -933,46 +1139,18 @@ class BrainRunner(LocalRunner):
         *,
         cap: bool,
     ) -> StepResult:
-        """Auto-escalation (D8): hand the message to ``ask_claude`` with a note of what was
-        tried. When that isn't possible: the round cap says so, bad output takes the intents
-        path (unless a side effect ran, then its report lines)."""
+        """Auto-escalation (D8): hand the message to Claude with a note of what was tried
+        (``_hand_off``, a canned ack). When that isn't possible: the round cap says so, bad
+        output takes the intents path (unless a side effect ran, then its report lines)."""
         why = "ran out of steps" if cap else "couldn't produce an answer"
         with spans("runner.brain.stuck", cap=cap, calls=len(st.calls)) as s:
-            spec = self.registry.get(None, ASK_CLAUDE.name)
-            queued: CallResult | None = None
-            if spec is not None and self.principals.may_request(principal, spec):
-                tried = ", ".join(dict.fromkeys(c.tool for c in st.calls)) or "nothing"
-                ran = "; changes already made, don't repeat them" if st.reports else ""
-                note = f"\n\n(Resonant's local model {why}; it tried: {tried}{ran})"
-                note = note[:TRIED_MAX_CHARS]
-                question = text[: QUESTION_MAX - len(note)] + note
-                done = await self._call_tool(
-                    task,
-                    principal,
-                    [spec],
-                    spec.name,
-                    {"question": question},
-                    st.executed,
-                    ctx,
-                    spans,
-                    st.reports,
-                    origin=st.origin,
-                    pin={"tainted": st.tainted},
-                )
-                st.executed += 1
-                if (
-                    isinstance(done, CallResult)
-                    and done.ok
-                    and (done.data or {}).get("queued") is True
-                ):
-                    queued = done
-            s.set(escalated=queued is not None)
-        if queued is not None:
-            st.calls.append(queued)
-            said = (queued.data or {}).get("text")
-            reply = said if isinstance(said, str) and said else "Looking into it…"
-            answer = Answer(reply, "escalate", used_tools(st.calls), escalate=True)
-            return after_effects(st.reports, answer, MAX_REPLY_CHARS)
+            handed = await self._hand_off(
+                task, principal, text, st, ctx, spans, why="cap" if cap else "bad_output",
+                note=self._tried(st, why),
+            )  # fmt: skip
+            s.set(escalated=handed is not None)
+        if handed is not None:
+            return handed
         if st.reports:
             reports = clip_reply("\n".join(st.reports), MAX_REPLY_CHARS)
             return Answer(reports, "done", used_tools(st.calls), escalate=True)
