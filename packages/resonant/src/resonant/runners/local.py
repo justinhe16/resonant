@@ -141,23 +141,23 @@ from resonant.toolcore import (
     CallOutcome,
     CallScope,
     Failed,
-    PinnedCall,
     Ran,
     Refused,
     ToolCore,
     direct_call,
-    report_line,
 )
 
 # Moved to ``resonant.toolcore`` (TC-1); re-exported for the runners and tests that import
 # them from here.
 from resonant.toolcore import MAX_SIDE_EFFECTS as MAX_SIDE_EFFECTS
 from resonant.toolcore import REPORTS as REPORTS
+from resonant.toolcore import PinnedCall as PinnedCall
 from resonant.toolcore import RunnerGate as RunnerGate
 from resonant.toolcore import ToolExecutor as ToolExecutor
 from resonant.toolcore import dry_run_reply as dry_run_reply
 from resonant.toolcore import is_explicit as is_explicit
 from resonant.toolcore import refusal_reply as refusal_reply
+from resonant.toolcore import report_line as report_line
 from resonant.toolcore import summarize_intent as summarize_intent
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect, Event, ToolSpec
