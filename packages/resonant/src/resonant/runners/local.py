@@ -85,6 +85,7 @@ from decimal import Decimal, InvalidOperation
 from functools import partial
 from typing import Any, Protocol, cast
 
+from resonant.brain.history import reply_tainted
 from resonant.brain.text import flat
 from resonant.executor import NotAllowedError, ToolResult, idempotency_key
 from resonant.extensions.notify import take_baseline
@@ -759,8 +760,15 @@ class LocalRunner:
             return Answer(NO_ANSWER_REPLY, "fallback", [])
         toolset = self._toolset(cp, intent)
         with spans("runner.local.context", intent=intent, toolset=[t.name for t in toolset]) as s:
-            messages = self._context(task, principal, intent, text)
-            s.set(history_turns=len(messages) - 2)
+            messages, tainted = self._context(task, principal, intent, text)
+            s.set(history_turns=len(messages) - 2, tainted=tainted)
+        if tainted and cp.get("tainted") is not True:
+            # BR-10b: a replayed reply was written after outside content. Saved, so the calls
+            # are gated and pinned ``tainted`` and the next turn's history sees it.
+            cp = {**cp, "tainted": True}
+            if not ctx.save(checkpoint=cp):
+                return Fail("task is no longer running")
+            task = replace(task, checkpoint=cp)
 
         calls: list[CallResult] = []
         try:
@@ -850,8 +858,11 @@ class LocalRunner:
 
     def _pinned_origin(self, cp: dict[str, Any], pinned: PinnedCall) -> Origin:
         """The origin a pinned call is gated with: ``explicit`` only for the router's
-        ``direct_call`` (``is_explicit``), else ``inferred``. The brain loop adds ``tainted``."""
-        return "explicit" if is_explicit(cp, pinned) else "inferred"
+        ``direct_call`` (``is_explicit``), else ``tainted`` when it was pinned so (D6, BR-10b),
+        else ``inferred``."""
+        if is_explicit(cp, pinned):
+            return "explicit"
+        return "tainted" if cp.get("tainted") is True else "inferred"
 
     async def _decided(
         self,
@@ -1017,9 +1028,12 @@ class LocalRunner:
 
     def _context(
         self, task: Task, principal: str, intent: IntentLabel, text: str
-    ) -> list[ChatMessage]:
+    ) -> tuple[list[ChatMessage], bool]:
+        """The intents prompt, and whether a reply it replays was written by a tainted task
+        (BR-10b: ``history.reply_tainted``; then this task's calls are tainted too)."""
         system = runner_system(intent, self.intents)
         messages: list[ChatMessage] = [{"role": "system", "content": system}]
+        tainted = False
         if task.origin_event_id is not None:
             thread = principal_thread(
                 self.conn,
@@ -1042,11 +1056,12 @@ class LocalRunner:
                 if reply is not None:  # untrusted: it may quote extension output
                     wrapped = wrap_prior_reply(reply, max_chars=MAX_HISTORY_CHARS)
                     messages.append({"role": "user", "content": wrapped})
+                    tainted = tainted or reply_tainted(origin_cp)
         current = current_turn(
             intent, text, now=self.now(), tz=self.timezone, max_chars=MAX_MESSAGE_CHARS
         )
         messages.append({"role": "user", "content": current})
-        return messages
+        return messages, tainted
 
     async def _tool_loop(
         self,
@@ -1088,6 +1103,8 @@ class LocalRunner:
     ) -> bool | StepResult:
         """The model's tool rounds for ``_tool_loop``: True for too many calls, False when
         done or at the side-effect cap, or a gated call's result that ends the loop."""
+        # The brain's fallback for a tainted turn (BR-10b): its calls stay tainted.
+        tainted = task.checkpoint.get("tainted") is True
         for _ in range(MAX_TOOL_ITERATIONS):
             try:
                 reply = await self.model.chat_tools(messages, tools=toolset, spans=spans)
@@ -1100,8 +1117,10 @@ class LocalRunner:
                     return True
                 effects = [c.report for c in calls if c.report is not None]
                 call = await self._call_tool(
-                    task, principal, toolset, tc.name, tc.args, len(calls), ctx, spans, effects
-                )
+                    task, principal, toolset, tc.name, tc.args, len(calls), ctx, spans, effects,
+                    origin="tainted" if tainted else "inferred",
+                    pin={"tainted": True} if tainted else None,
+                )  # fmt: skip
                 if not isinstance(call, CallResult):
                     return call
                 calls.append(call)

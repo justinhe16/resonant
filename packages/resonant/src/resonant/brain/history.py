@@ -8,6 +8,17 @@ was handed to Claude (BR-10) the reply is the ack, and Claude's answer, once it 
 (``<claude_answer>``): a later follow-up sees what Claude said, labeled as outside text.
 Messages that started no task (approval replies) are skipped, as in the local runner.
 
+**Replayed outside text** (BR-10b). An exchange is ``untrusted`` when it holds Claude's
+answer (Claude reads files, the web and connectors) or its reply was written by a tainted
+task (``reply_meta.meta.tainted``, or ``tainted`` pinned on the checkpoint: the turn had read
+outside content, D6). ``replayed`` returns the history with the reason when any exchange in
+the window is untrusted, and the brain starts that turn tainted, exactly as after an
+untrusted read: a model-chosen change asks. Once the exchange leaves the window (folded, or
+past ``MAX_EXCHANGES``) the turn is clean again, because the **fold never keeps outside
+text**: an untrusted exchange is folded as the principal's message plus a fixed marker
+(``OUTSIDE_REPLY``), never its reply or Claude's answer, so the summary only holds the
+principal's own words and untainted replies, and it never taints a turn.
+
 **Window.** History is every exchange after the summary's cursor (``through_event_id``), at
 most ``MAX_EXCHANGES``, as ``user`` turns (the message, ``wrap_untrusted``) and ``assistant``
 turns (the reply), each capped. A fold runs once ``KEEP_EXCHANGES + FOLD_BATCH`` exchanges
@@ -31,7 +42,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from resonant.brain.text import clip, drop_controls, flat
 from resonant.models import ChatMessage, ModelClient, ModelError, SpanFactory
@@ -48,6 +59,8 @@ REPLY_TURN_CHARS = 800
 SUMMARY_MAX_CHARS = 1200
 FOLD_LINE_CHARS = 80  # each side of an exchange in the fallback summary
 FOLD_MAX_TOKENS = 400
+# What the fold keeps of an untrusted exchange's answer (BR-10b): never the text itself.
+OUTSIDE_REPLY = "(answered from outside content; not kept)"
 _SCAN = 4 * (KEEP_EXCHANGES + MAX_FOLD)  # message events read to find the exchanges
 
 FOLD_SYSTEM = (
@@ -75,6 +88,26 @@ class Exchange:
     text: str
     reply: str | None
     claude: str | None = None  # BR-10: Claude's answer to a turn handed over
+    tainted: bool = False  # BR-10b: the reply was written after outside content
+
+    @property
+    def untrusted(self) -> str | None:
+        """Why this exchange replays outside text (BR-10b), or None."""
+        if self.claude is not None:
+            return "claude_answer"
+        return "tainted_reply" if self.tainted else None
+
+
+def reply_tainted(cp: dict[str, Any]) -> bool:
+    """The task read outside content before its reply: the brain's ``reply_meta`` says so,
+    or a gated call was pinned ``tainted``."""
+    if cp.get("tainted") is True:
+        return True
+    meta: Any = cp.get("reply_meta")
+    if not isinstance(meta, dict):
+        return False
+    inner: Any = cast(dict[str, Any], meta).get("meta")
+    return isinstance(inner, dict) and cast(dict[str, Any], inner).get("tainted") is True
 
 
 def reply_of(cp: dict[str, Any] | None) -> str | None:
@@ -98,7 +131,8 @@ def _exchanges(rows: list[tuple[Any, dict[str, Any] | None]]) -> list[Exchange]:
             continue
         claude = cp.get("claude_reply")
         said = claude if isinstance(claude, str) and claude.strip() else None
-        out.append(Exchange(event.id, event.occurred_at, body, reply_of(cp), said))
+        reply = reply_of(cp)
+        out.append(Exchange(event.id, event.occurred_at, body, reply, said, reply_tainted(cp)))
     return out
 
 
@@ -158,6 +192,14 @@ def summary_turn(summary: str) -> ChatMessage:
     }
 
 
+@dataclass(frozen=True)
+class History:
+    messages: list[ChatMessage]
+    # BR-10b: why the window replays outside text (``Exchange.untrusted``), or None. The
+    # turn that sees it starts tainted.
+    untrusted: str | None = None
+
+
 def history_messages(
     conn: sqlite3.Connection,
     principal: str,
@@ -165,9 +207,22 @@ def history_messages(
     before_event_id: str | None,
     source: str = "imessage",
 ) -> list[ChatMessage]:
+    """``replayed``'s turns only."""
+    return replayed(conn, principal, before_event_id=before_event_id, source=source).messages
+
+
+def replayed(
+    conn: sqlite3.Connection,
+    principal: str,
+    *,
+    before_event_id: str | None,
+    source: str = "imessage",
+) -> History:
     """The summary turn (when there is one), then each unfolded exchange as a ``user`` turn
-    (wrapped) and, when it was answered, an ``assistant`` turn. Oldest first."""
+    (wrapped) and, when it was answered, an ``assistant`` turn (then Claude's answer as
+    data). Oldest first. ``untrusted``: the reason of the newest untrusted exchange in it."""
     messages: list[ChatMessage] = []
+    untrusted: str | None = None
     summary = store.get_summary(conn, principal)
     if summary is not None and summary.summary.strip():
         messages.append(summary_turn(summary.summary))
@@ -188,7 +243,8 @@ def history_messages(
             messages.append({"role": "assistant", "content": reply})
         if ex.claude is not None:
             messages.append(claude_turn(ex.claude))
-    return messages
+        untrusted = ex.untrusted or untrusted
+    return History(messages, untrusted)
 
 
 def claude_turn(answer: str) -> ChatMessage:
@@ -228,20 +284,23 @@ def fallback_summary(previous: str, exchanges: list[Exchange]) -> str:
     parts = [flat(previous)] if previous.strip() else []
     for ex in exchanges:
         said = clip(flat(ex.text), FOLD_LINE_CHARS)
-        reply = clip(flat(ex.reply), FOLD_LINE_CHARS) if ex.reply else "(no reply)"
-        claude = f" / Claude: {clip(flat(ex.claude), FOLD_LINE_CHARS)}" if ex.claude else ""
-        parts.append(f"owner: {said} / you: {reply}{claude}")
+        parts.append(f"owner: {said} / you: {_fold_reply(ex, FOLD_LINE_CHARS)}")
     text = " | ".join(parts)
     if len(text) <= SUMMARY_MAX_CHARS:
         return text
     return "…" + text[-(SUMMARY_MAX_CHARS - 1) :].lstrip()
 
 
+def _fold_reply(ex: Exchange, limit: int) -> str:
+    """An exchange's answer as a fold sees it: never outside text (BR-10b)."""
+    if ex.untrusted is not None:
+        return OUTSIDE_REPLY
+    return clip(flat(ex.reply), limit) if ex.reply else "(no reply)"
+
+
 def _fold_messages(previous: str, exchanges: list[Exchange]) -> list[ChatMessage]:
     lines = [
-        f"owner: {clip(flat(ex.text), USER_TURN_CHARS)}\n"
-        f"you: {clip(flat(ex.reply), REPLY_TURN_CHARS) if ex.reply else '(no reply)'}"
-        + (f"\nClaude: {clip(flat(ex.claude), REPLY_TURN_CHARS)}" if ex.claude else "")
+        f"owner: {clip(flat(ex.text), USER_TURN_CHARS)}\nyou: {_fold_reply(ex, REPLY_TURN_CHARS)}"
         for ex in exchanges
     ]
     prev = flat(previous) or "(none)"

@@ -803,6 +803,11 @@ class AskRunner:
         marker = f"ask-{task.id}"
         env[MARKER_ENV] = marker
         bridge = self._bridge(task, ctx, cp)
+        history: list[str] = []
+        if bridge is not None:
+            history, untrusted = self._history(task, cp)
+            if untrusted is not None:  # BR-10b: the history replays outside text
+                bridge.taint("history", why=untrusted)
         mcp: McpSetup | None = None
         ask_dir = self.ask_root / task.id
         try:
@@ -819,7 +824,6 @@ class AskRunner:
             except OSError as e:
                 log.warning("ask attachments not copied", extra={"task": task.id, "error": str(e)})
                 return await self._finish(task, ctx, cp, "failed", FAILED.format(why="attachments"))
-            history = self._history(task, cp) if bridge is not None else []
             prompt = self._prompt(question, kind, names, watch=isinstance(cp.get("watch"), int),
                                   history=history)  # fmt: skip
             try:
@@ -869,29 +873,33 @@ class AskRunner:
         return ClaudeTools(self.conn, self.tools, self.caller, task, ctx,
                            tainted=cp.get("tainted") is True)  # fmt: skip
 
-    def _history(self, task: Task, cp: dict[str, Any]) -> list[str]:
+    def _history(self, task: Task, cp: dict[str, Any]) -> tuple[list[str], str | None]:
         """The last few exchanges before the asking turn, as ``Owner:`` / ``Resonant:``
-        lines (context for a follow-up). Owner only, like the briefing's history."""
+        lines (context for a follow-up). Owner only, like the briefing's history. With the
+        reason when one of them holds outside text (BR-10b: the session starts tainted, as
+        the brain's turn would)."""
         principal = task.principal
         if principal is None or principal != self.owner:
-            return []
+            return [], None
         asking = cp.get("requested_by")
         source = get_task(self.conn, asking) if isinstance(asking, str) else None
         if source is None or source.origin_event_id is None:
-            return []
+            return [], None
         try:
             found = unfolded(self.conn, principal, before_event_id=source.origin_event_id,
                              limit=HISTORY_EXCHANGES)  # fmt: skip
         except sqlite3.Error:
-            return []
+            return [], None
         lines: list[str] = []
+        untrusted: str | None = None
         for ex in found:
             lines.append(f"Owner: {flat(ex.text, HISTORY_LINE_CHARS)}")
             if ex.reply:
                 lines.append(f"Resonant: {flat(ex.reply, HISTORY_LINE_CHARS)}")
             if ex.claude:
                 lines.append(f"You (Claude) answered: {flat(ex.claude, HISTORY_LINE_CHARS)}")
-        return lines
+            untrusted = ex.untrusted or untrusted
+        return lines, untrusted
 
     def _prepare_dir(self, ask_dir: Path, attachments: object) -> list[str]:
         """An empty cwd for the session with the checked attachments copied in, by number."""
