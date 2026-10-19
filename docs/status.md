@@ -48,27 +48,30 @@ Latest task eval (synthetic set, live qwen): 95.8%, 0 unapproved writes, triage 
   - "dont ask for perms for linear tickets".
 - Branch protection on the repos you care about; relay go-live (step 15).
 
-## Open work
+## Open work: Phase 6b, harden and prove
 
-The ranked list with urgency is in [`followups.md`](followups.md) under "Recommended next". The main open items:
+Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant project (Personal team). The ranked background is in [`followups.md`](followups.md) under "Recommended next".
 
-1. 🔴 Owner eval set from real texts (`~/.resonant/evals/task.jsonl`).
-2. 🟠 Shorter taint window, or exempting low-risk writes. A Claude answer taints about 24 turns.
-3. 🟡 Live Claude eval in a scratch home.
-4. 🟡 Branch protection; relay go-live.
-5. 🟢 Flaky tests:
-   - scheduled jobs firing mid-test around 08:00/10:00 local;
-   - the Q9 approval code;
-   - the watchdog;
-   - e2e ConnectErrors;
-   - `test_kill_switch_stops_running_sessions`.
-6. 🟢 Retire the intents path, whisper, and prune worktrees.
-7. Direct MCP for the Claude brain on owner-granted servers (e.g. Linear), with `--permission-prompt-tool` deciding each call. Deferred: batch approvals solved the immediate pain. Probed 2026-10-19 on Claude Code 2.1.302: headless `claude -p` loads no claude.ai connectors at all, even without `--restricted`, so this would need the servers configured directly, not the connectors.
+| Wave | Ticket | What |
+|---|---|---|
+| 1 | PER-245 🟠 | Taint: about 3-turn window; notes, reminders and facts exempt |
+| 1 | PER-246 | Fix flaky tests |
+| 1 | PER-247 | Scheduler inline L0 jobs through the tool core. Not alongside PER-245 |
+| 2 | PER-248 🔴 | Real eval set drafted from the owner's past texts |
+| 2 | PER-249 | Known eval misses (after PER-245) |
+| 2 | PER-250 | Live Claude eval (after PER-248) |
+| Owner | PER-252 | Phone tests (incl. `resonant ext update github`) |
+| Owner | PER-251 | Relay go-live (step 15) |
+| Owner | PER-253 | Dogfood: set up mycelium from scratch by texting Resonant. mycelium is registered but not cloned yet |
+| Backlog | PER-254, PER-255, PER-256 | Batch as one dashboard row, `yes 1,3`, retire intents (after PER-248) |
 
-Dropped: calendar integration (CAL-1, PR #112 closed unmerged, 2026-10-19). The owner gets calendar reminders elsewhere. Email and calendar asks stay as before BR-10 (connectors don't load; Claude says it can't reach them).
-8. Dashboard: show a batch as one row.
+**Roadmap after 6b:** 5b Slack, 6 on-call, 7 life lane (Gmail read/draft, browser, computer use).
 
-Each ticket's carry-overs are in `followups.md` and `brain-plan.md`.
+**Deferred:** direct MCP for the Claude brain (batch approvals covered the need). Headless `claude -p` loads no claude.ai connectors, so this would need directly configured servers.
+
+**Dropped:**
+- Calendar integration (CAL-1, PR #112 closed, 2026-10-19). Email and calendar asks get "can't reach it".
+- Branch protection is rolling (protect each repo as it's added); no ticket.
 
 ## Where things are
 
