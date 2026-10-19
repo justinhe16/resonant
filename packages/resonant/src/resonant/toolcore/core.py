@@ -44,13 +44,13 @@ import contextlib
 import sqlite3
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 import jsonschema
 
 from resonant.executor import NotAllowedError, ToolResult, idempotency_key
-from resonant.gate import Allow, Decision, Deny, DryRun, Intent, NeedsApproval
-from resonant.gate.policy import APPROVAL_USED
+from resonant.gate import Allow, ApprovalBatch, Decision, Deny, DryRun, Intent, NeedsApproval
+from resonant.gate.policy import APPROVAL_USED, batch_line, widens_trust
 from resonant.gate.types import Origin
 from resonant.loop.types import StepContext
 from resonant.models import SpanFactory
@@ -68,9 +68,18 @@ from resonant.tools import ToolRegistry
 from resonant.tools.registry import ToolKey
 from resonant_sdk import Effect, ToolSpec
 
-MAX_SIDE_EFFECTS = 3  # gated side effects allowed without asking, per task (GT-1)
+# Gated side effects that run without asking (L3, a standing allow), per task (GT-1; BA-1
+# raised it from 3 so "update these 4 Linear tickets" fits under a standing rule). Changes
+# that ask don't count: they wait in the task's batch, up to ``gate.batch_max``.
+MAX_SIDE_EFFECTS = 5
 CAPPED_REPLY = f"Not done: at most {MAX_SIDE_EFFECTS} changes per task."
 STOPPED = "task is no longer running"  # the pin couldn't be saved
+
+
+def batch_capped_reply(limit: int) -> str:
+    """A change past ``gate.batch_max`` in one batch (BA-1)."""
+    return f"Not done: at most {limit} changes can wait on one yes."
+
 
 SPAN_CALL = "runner.local.tool"  # pre-TC-1 names: dashboards and the task eval read them
 SPAN_RESUME = "runner.local.call"
@@ -80,6 +89,23 @@ class RunnerGate(Protocol):
     """The part of the gate ToolCore uses. The executor consumes the token."""
 
     def evaluate(self, intent: Intent) -> Decision: ...
+
+
+@runtime_checkable
+class BatchGate(Protocol):
+    """BA-1: the part of the gate a task's batch of approvals uses (``PolicyGate``). A gate
+    without it (``DryRunGate``) never batches: one approval ends the task, as before."""
+
+    batch_max: int
+
+    @property
+    def owner(self) -> str: ...
+
+    def open_batch(self, principal: str, approval_ids: Sequence[str]) -> ApprovalBatch: ...
+
+    def approval_states(self, approval_ids: Sequence[str]) -> Mapping[str, str]: ...
+
+    def drop(self, approval_ids: Sequence[str], *, reason: str) -> None: ...
 
 
 class ToolExecutor(Protocol):
@@ -134,6 +160,45 @@ class PinnedCall:
         ):
             return None
         return cls(tool, ext, cast(dict[str, Any], args), step_no, call_index)
+
+
+@dataclass(frozen=True)
+class BatchItem:
+    """BA-1: one change in a task's batch (``checkpoint.batch``): a call the gate asks about,
+    pinned while the task goes on, with its approval and the code-built line the batch prompt
+    shows. ``tainted``: the origin it was asked with (its resume keeps it)."""
+
+    call: PinnedCall
+    approval_id: str
+    summary: str
+    tainted: bool = False
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            **self.call.to_json(),
+            "approval_id": self.approval_id,
+            "summary": self.summary,
+            "tainted": self.tainted,
+        }
+
+    @classmethod
+    def from_json(cls, value: Any) -> BatchItem | None:
+        call = PinnedCall.from_json(value)
+        d = cast(dict[str, Any], value) if isinstance(value, dict) else {}
+        approval_id, summary, tainted = d.get("approval_id"), d.get("summary"), d.get("tainted")
+        if call is None or not isinstance(approval_id, str) or not isinstance(summary, str):
+            return None
+        return cls(call, approval_id, summary, tainted is True)
+
+
+def batch_items(cp: Mapping[str, Any]) -> list[BatchItem] | None:
+    """``checkpoint.batch`` as items, in order; None when an entry is malformed."""
+    raw = cp.get("batch")
+    if not isinstance(raw, list):
+        return None
+    items = [BatchItem.from_json(v) for v in cast(list[Any], raw)]
+    out = [i for i in items if i is not None]
+    return out if len(out) == len(items) else None
 
 
 def direct_call(cp: Mapping[str, Any]) -> tuple[str | None, str, dict[str, Any]] | None:
@@ -191,7 +256,9 @@ class CallScope:
     it (None: nothing to pin, e.g. a job). ``effects`` is the side-effect counter: the report
     lines of the changes this task already ran, pinned with the call so a resume replies with
     them. ``pin`` adds keys to the pinned checkpoint (the brain's taint). ``tools`` is what
-    the caller offered, for a call by bare name."""
+    the caller offered, for a call by bare name. ``batch`` (BA-1; None: off) is the task's
+    batch so far: a call the gate asks about joins it (``Asked.item``) instead of ending the
+    task, and every pin keeps it."""
 
     task_id: str
     principal: str
@@ -206,6 +273,7 @@ class CallScope:
     pin: Mapping[str, Any] | None = None
     tools: Sequence[ToolSpec] = ()
     check_schema: bool = True
+    batch: Sequence[BatchItem] | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +301,7 @@ class Asked:
     decision: NeedsApproval
     checkpoint: dict[str, Any]
     gated: bool = True
+    item: BatchItem | None = None  # BA-1: the batch entry it joined (or already was)
 
     @property
     def summary(self) -> str:
@@ -302,6 +371,8 @@ class ToolCore:
         self.registry = registry
         self.gate = gate
         self.executor = executor
+        # BA-1: batches need the gate's batch half; without it a task asks once, as before.
+        self.batch_gate: BatchGate | None = gate if isinstance(gate, BatchGate) else None
 
     def spec(self, target: ToolSpec | ToolKey | str, scope: CallScope) -> ToolSpec | None:
         """The registry's spec for ``target``: a bare name only among ``scope.tools``."""
@@ -384,6 +455,9 @@ class ToolCore:
                 return _refused(intent, decision, gated=True)
             pinned = PinnedCall(spec.name, spec.extension, intent.args, scope.step_no,
                                 scope.call_index)  # fmt: skip
+            batching = scope.batch is not None and self.batch_gate is not None
+            if batching and isinstance(decision, NeedsApproval):
+                return self._join(intent, decision, pinned, scope)
             cp = dict(scope.checkpoint)
             if scope.steps is not None:
                 cp = {
@@ -392,9 +466,42 @@ class ToolCore:
                     "call": pinned.to_json(),
                     "effects": list(scope.effects),
                 }
+                if batching:  # the batch so far stays pinned under an allowed call
+                    cp["batch"] = [i.to_json() for i in scope.batch or ()]
                 if not scope.steps.save(checkpoint=cp):
                     return Failed(STOPPED, True, intent, decision=decision)
             return await self._decided(intent, decision, pinned, cp)
+
+    def _join(
+        self, intent: Intent, decision: NeedsApproval, pinned: PinnedCall, scope: CallScope
+    ) -> Asked | Refused | Failed:
+        """BA-1: a call the gate asks about joins the task's batch (pinned there, not
+        prompted): the same approval again is the entry it already has; past ``batch_max``
+        it is refused and its approval dropped (never prompted, so nothing could bind it)."""
+        assert self.batch_gate is not None and scope.batch is not None
+        items = list(scope.batch)
+        same = next((i for i in items if i.approval_id == decision.approval_id), None)
+        if same is not None:
+            return Asked(intent, decision, dict(scope.checkpoint), item=same)
+        limit = self.batch_gate.batch_max
+        if len(items) >= limit:
+            self.batch_gate.drop([decision.approval_id], reason="batch_cap")
+            return Refused("capped", batch_capped_reply(limit), True, intent, decision)
+        line = batch_line(decision.summary, offered=decision.allow_always,
+                          widens=widens_trust(pinned.tool, pinned.extension))  # fmt: skip
+        item = BatchItem(pinned, decision.approval_id, line, scope.origin == "tainted")
+        cp = dict(scope.checkpoint)
+        if scope.steps is not None:
+            # ``call`` (an earlier allowed call, done by now) gives way to the batch.
+            cp = {
+                **{k: v for k, v in scope.checkpoint.items() if k != "call"},
+                **(scope.pin or {}),
+                "batch": [i.to_json() for i in [*items, item]],
+                "effects": list(scope.effects),
+            }
+            if not scope.steps.save(checkpoint=cp):
+                return Failed(STOPPED, True, intent, decision=decision)
+        return Asked(intent, decision, cp, item=item)
 
     async def resume(self, pinned: PinnedCall, scope: CallScope) -> CallOutcome:
         """Run the pinned call exactly once: what ``executions`` holds first, then the gate

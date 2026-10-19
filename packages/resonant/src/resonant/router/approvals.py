@@ -193,7 +193,34 @@ def approvals_reply(
     row = ap.get_approval(conn, match.approval_id) if match is not None else None
     if row is None:
         return f"Nothing is waiting with code {code}."
+    batch = ap.batches_of(conn, [row.id]).get(row.id)
+    if batch is not None and batch.used_at is None:
+        members = [m for m in (ap.get_approval(conn, i) for i in batch.approval_ids) if m]
+        return render_batch_detail(conn, members, now)
     return render_detail(row, ap.intent_args(conn, row), now)
+
+
+BATCH_ARGS_CHARS = 200  # each change's args in /approvals <code> for a batch
+
+
+def render_batch_detail(
+    conn: sqlite3.Connection, members: Sequence[ap.Approval], now: datetime
+) -> str:
+    """``/approvals <code>`` for a batch (BA-1): each change with its tool and full args
+    (clipped), then the one answer for all of them."""
+    head = members[0]
+    lines = [f"[{head.code}] {len(members)} changes, all or none:"]
+    for i, a in enumerate(members, 1):
+        tool = f"{a.extension}: {a.tool}" if a.extension else a.tool
+        args = ap.intent_args(conn, a)
+        shown = "(not recorded)" if args is None else json.dumps(args, ensure_ascii=False)
+        if len(shown) > BATCH_ARGS_CHARS:
+            shown = shown[:BATCH_ARGS_CHARS] + "… (truncated)"
+        lines.append(f"{i}. {tool} ({a.level.value}): {shown}")
+    answer = f"yes {head.code}" if any(a.require_code for a in members) else "yes"
+    left = _left(min(a.expires_at for a in members), now)
+    lines.append(f"Expires in {left}. Reply {answer} / no {head.code}")
+    return _clip("\n".join(lines))
 
 
 def _left(expires_at: datetime, now: datetime) -> str:

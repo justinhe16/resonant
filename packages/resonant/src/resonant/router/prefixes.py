@@ -239,7 +239,8 @@ _INTENT_RULES: dict[IntentLabel, str] = {
         "or failed; digest only instead is allow_trust_rule with effect notify_digest. To "
         'forget a rule ("forget that rule") call remove_trust_rule with its number from the '
         "earlier Rule added reply; if you can't tell which, call list_trust_rules first. "
-        '"what are my rules" is list_trust_rules.'
+        '"what are my rules" is list_trust_rules. Not asking before Resonant\'s own changes '
+        '("don\'t ask for Linear tickets") is allow_tools(tools=[linear]).'
     ),
 }
 

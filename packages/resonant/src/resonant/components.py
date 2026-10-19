@@ -109,9 +109,14 @@ def deny_all_principals() -> Principals:
     return Principals(principals={FALLBACK_OWNER: Principal(role="owner")})
 
 
-def summary_actions(conn: sqlite3.Connection) -> dict[ToolKey, SummaryAction]:
+def summary_actions(
+    conn: sqlite3.Connection,
+    registry: ToolRegistry | None = None,
+    ext_tools: trust_tools.ExtTools = trust_tools.no_ext_tools,
+) -> dict[ToolKey, SummaryAction]:
     """Code-built approval and dry-run headings per builtin tool (``delete all 4 notes``,
-    ``restart Ollama``)."""
+    ``restart Ollama``). ``registry`` and ``ext_tools`` (the loaded extensions' chat tools):
+    for ``allow_tools``, whose prompt names exactly the tools that would stop asking."""
 
     def clear_notes(intent: Intent) -> str | None:
         return notes_tools.summary_action(conn, intent)
@@ -132,6 +137,13 @@ def summary_actions(conn: sqlite3.Connection) -> dict[ToolKey, SummaryAction]:
         actions[(None, spec.name)] = trust_rule
     actions[(None, repos_tools.MERGE_CI_PR.name)] = repos_tools.summary_action
     actions[(None, watch_tools.CREATE_WATCH.name)] = watch_tools.summary_action
+    if registry is not None:
+        reg = registry
+
+        def allow_tools(intent: Intent) -> str | None:
+            return trust_tools.allow_tools_action(intent, registry=reg, ext_tools=ext_tools)
+
+        actions[(None, trust_tools.ALLOW_TOOLS.name)] = allow_tools
     return actions
 
 
@@ -183,10 +195,11 @@ def build_components(
         registry,
         dry_run=settings.dry_run,
         approval_ttl_s=settings.gate.approval_ttl_s,
-        actions=summary_actions(conn),
+        actions=summary_actions(conn, registry, host.tool_specs),
         approvers_for=host.approvers_for,
         levels=level_overrides(conn),
         standing=StandingAllows(conn),
+        batch_max=settings.gate.batch_max,
     )
     merged: dict[HandlerKey, Handler] = {**handlers, **host.handlers, **host.mcp_handlers}
     executor = Executor(

@@ -559,6 +559,7 @@ def approvals_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> 
     with contextlib.closing(_open_store(settings, readonly=True)) as conn:
         now = utcnow()
         pending = ap.pending_for(conn, owner, now)
+        batches = ap.batches_of(conn, [a.id for a in pending])  # BA-1
     if as_json:
         typer.echo(json.dumps([_approval_dict(a, now) for a in pending], indent=2))
         return
@@ -566,9 +567,12 @@ def approvals_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> 
         typer.echo("no pending approvals")
         return
     for a in pending:
+        batch = batches.get(a.id)
+        # a batch is one decision: approving or denying any row of it decides all of them
+        note = f"  [batch of {len(batch.approval_ids)}: decides all]" if batch else ""
         typer.echo(
             f"{a.code or '--':<4} {_tool_name(a):<24} {_expires_in(a.expires_at, now):>6}  "
-            f"{a.summary}  ({a.id})"
+            f"{a.summary}  ({a.id}){note}"
         )
 
 

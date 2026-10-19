@@ -107,7 +107,13 @@ INTENT_TOOLS: dict[BuiltinIntent, tuple[str, ...]] = {
         "run_activity",
         "start_run",
     ),
-    "rules": ("add_trust_rule", "allow_trust_rule", "list_trust_rules", "remove_trust_rule"),
+    "rules": (
+        "add_trust_rule",
+        "allow_tools",
+        "allow_trust_rule",
+        "list_trust_rules",
+        "remove_trust_rule",
+    ),
     "unknown": (),
 }
 

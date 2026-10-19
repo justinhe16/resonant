@@ -187,6 +187,20 @@ Since BR-11 the hard texts above all go to **one** Claude session that stays up 
   4. `/kill`: `/status` shows `Claude brain: down`; `/resume`, then a hard text: it starts again.
   5. Optional, with `remote_control: true`: the link on `/status` opens the session in the Claude app.
 
+### Batch approvals (BA-1)
+
+Since BA-1 a text that needs several changes asks **once**: Claude (or the local model) keeps proposing, every change that needs your yes waits, and after the answer one prompt lists them all. `yes` runs each once, in order, and replies with a line per change; `no` (or 30 minutes of nothing) runs none. One change still gets the old single prompt. Up to 10 changes wait on one yes (`gate.batch_max`), and up to 5 changes that don't need asking (L3, or a standing "don't ask") run per text.
+
+- **Over iMessage** (needs the Linear extension, step 12 Optional; or swap in any two notes, watches or merges):
+  1. "close RES-12, RES-14, RES-15 and RES-19" (real keys from your Linear, ones you're happy to close): an ack, then `Claude: …` saying it's waiting on your yes (no code in it), then **one** message: `[D7] 4 changes, all or none:` with `1. linear: save issue id="RES-12", state="Done"` … `4. …` and `Reply yes / no`.
+  2. `/approvals` shows it as one line (`D7 · 4 changes: …`); `/approvals D7` lists each change with its args.
+  3. `yes`: one reply with four `Done: linear: save issue …` lines; Linear shows the four closed. `yes` again: `Nothing is waiting for approval.`
+  4. Repeat with "comment 'test' on RES-12 and delete RES-14" (if you add an L1 tool) or any batch with a destructive change: the prompt ends `Some can't be undone. Reply yes D7 / no`; a plain `yes` gets `Reply yes D7 to confirm.`
+  5. Repeat (1), then `no`: `Not done.`, nothing changes in Linear.
+  6. "dont ask for perms for linear tickets": an approval prompt naming exactly what stops asking (`stop asking before linear.save_comment and linear.save_issue when you ask in chat …? Reply yes / no`); `yes` → `Rules: don't ask before running linear.save_comment in linear (rule N); … linear.save_issue … (rule M). Changes after outside content still ask.` `/rules` lists both.
+  7. Then (1) again: no prompt; Claude's answer ends with the four `Done: linear: save issue …` lines. (If Claude read the tickets first, e.g. "read RES-12 and close it", the saves still ask, as one batch: it read outside content.) `/rules forget <N>` (each) goes back to asking.
+  8. `/kill` between a batch prompt and your `yes`: `Not done: Resonant is paused (/kill), so none of the 4 changes ran.`; `/resume` after.
+
 ## 10. Remote dashboard access
 
 On the Mini, the dashboard is at `http://127.0.0.1:7777/` and needs no setup. The API binds to `127.0.0.1` only (config validation enforces it), so from anywhere else you use the remote copy, which the status relay feeds: set it up in [step 15](#15-phase-4-the-remote-dashboard-and-the-dead-man-switch). iMessage doesn't need it.

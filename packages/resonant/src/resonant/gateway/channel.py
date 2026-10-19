@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from resonant.gate.codes import approval_text
+from resonant.gate.codes import approval_text, batch_text
 from resonant_sdk import Effect, Event, Level
 
 
@@ -43,10 +43,21 @@ class ApprovalPrompt:
     expires_at: datetime
     require_code: bool = False  # L1 (destructive or pay): only "yes <code>" counts
     always: bool = False  # a worker's trust check: the prompt offers "yes always"
+    # BA-1: a batch prompt (``approval_id`` is the batch's id): one code-built line per change,
+    # answered with one code; ``destructive``: one of them is an L1 write.
+    lines: tuple[str, ...] = ()
+    destructive: bool = False
 
     def text(self) -> str:
         """The prompt as sent: the destructive variant for L1 writes, the pay variant for pay,
-        the ``yes always`` variant for a worker's trust check."""
+        the ``yes always`` variant for a worker's trust check; a batch lists its changes."""
+        if self.lines:
+            return batch_text(
+                self.code,
+                self.lines,
+                require_code=self.require_code,
+                destructive=self.destructive,
+            )
         destructive = self.level == Level.L1.value and self.effect != Effect.PAY.value
         return approval_text(
             self.code,

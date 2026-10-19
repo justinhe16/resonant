@@ -49,6 +49,7 @@ CHAT_WRITES = {
     "merge_ci_pr",
     # Trust rules (EM-4): add tightens (L3); allow and forget can widen trust, so chat asks yes.
     "add_trust_rule",
+    "allow_tools",
     "allow_trust_rule",
     "remove_trust_rule",
 }

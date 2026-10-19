@@ -35,8 +35,9 @@ One step does the whole task, unless it has to wait for an approval:
    or run. Allowed without asking (L3, or an L2 tool with the owner's standing allow), it
    runs and the loop goes on, up to ``MAX_SIDE_EFFECTS`` per task (GT-1); each has its own
    ``call_index``, so each is idempotent on its own. Anything that needs approval is pinned
-   and the task waits: one approval per task, and after it the task ends. Refused, the reply
-   says so (after the report lines of what already ran).
+   and the task waits: one approval per task on this path, and after it the task ends (the
+   brain loop and the Claude bridge batch them instead, BA-1: **Batches** below). Refused,
+   the reply says so (after the report lines of what already ran).
 8. **Answer.** ``chat_json`` with ``{reply: string}``, cut to ``MAX_REPLY_CHARS``. Code
    computes and text narrates: every number in the reply must appear in a tool result or
    in the user's message. Otherwise the reply is replaced by a templated summary of the
@@ -57,6 +58,14 @@ One step does the whole task, unless it has to wait for an approval:
   send failure is a retryable ``Fail``.
 - ``DryRun``: ``Dry run: would <summary>``. ``Deny``: a templated refusal (``Not done.``,
   expired, already used).
+
+**Batches** (BA-1, ``checkpoint.batch``; the brain loop and the Claude bridge): the changes a
+turn's gate asked about, pinned while the turn went on (``_call_tool(batch=…)``, then
+``close_batch``). One change: the plain single prompt above. Several: one prompt for all of
+them (``gate.open_batch``, ``prompt_batch``), then ``Wait("approval")``; once answered each
+approved change runs once, in order (``ToolCore.resume``: a restart mid-batch replays what
+ran and never re-runs one), a failure doesn't stop the rest, and the reply has a line per
+change. ``no`` or expiry: none run; paused (/kill): none run.
 
 Failures: ``ModelUnavailableError`` sends one templated fallback (the tool summary when
 tools already ran, else ``FALLBACK_REPLY``) and the task is done. ``ModelOutputError``
@@ -85,13 +94,23 @@ from decimal import Decimal, InvalidOperation
 from functools import partial
 from typing import Any, cast
 
+from resonant import killswitch
 from resonant.brain.history import reply_tainted, taint_hops
 from resonant.brain.text import flat
 from resonant.executor import ToolResult
 from resonant.extensions.notify import take_baseline
 from resonant.extensions.scheduler import persist_events
-from resonant.gate import Decision, Deny, DryRun, Intent, NeedsApproval, canonical_json
+from resonant.gate import (
+    ApprovalBatch,
+    Decision,
+    Deny,
+    DryRun,
+    Intent,
+    NeedsApproval,
+    canonical_json,
+)
 from resonant.gate.codes import clean_external
+from resonant.gate.policy import batch_line, widens_trust
 from resonant.gate.types import Origin
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import Done, Fail, StepContext, StepOutcome, Task, Wait
@@ -128,7 +147,7 @@ from resonant.router.render import (
     render_runs,
 )
 from resonant.router.router import builtin_names, chat_toolset
-from resonant.runners.approve import prompt_approvers
+from resonant.runners.approve import prompt_approvers, prompt_batch
 from resonant.runners.job import SUMMARY_MAX, done_text, failed_text
 from resonant.store import extensions as ext_store
 from resonant.store.audit import audit
@@ -138,12 +157,14 @@ from resonant.toolcore import (
     DONE_NOT_APPROVED,
     NOT_AVAILABLE_REPLY,
     Asked,
+    BatchItem,
     CallOutcome,
     CallScope,
     Failed,
     Ran,
     Refused,
     ToolCore,
+    batch_items,
     direct_call,
 )
 
@@ -167,6 +188,7 @@ log = logging.getLogger(__name__)
 NAME = "local"
 MAX_TOOL_ITERATIONS = 3  # chat_tools calls per task
 MAX_TOOL_CALLS = 3  # tool executions per task
+INTENTS_SIDE_EFFECTS = min(MAX_SIDE_EFFECTS, MAX_TOOL_CALLS)  # the intents path stops here
 MAX_REPLY_CHARS = 600
 MAX_MESSAGE_CHARS = 2000  # the current message, as the labeler sees it
 MAX_HISTORY_CHARS = 500  # each earlier message or reply
@@ -295,6 +317,21 @@ class CallResult:
     error: str | None
     report: str | None = None  # set for the task's one executed side effect
     extension: str | None = None
+    asked: BatchItem | None = None  # BA-1: the gate asks; it joined the task's batch
+    decision: NeedsApproval | None = None  # with ``asked``: the gate's ask (for its prompt)
+
+
+ASKED_NOTE = (
+    "Nothing ran yet: the owner is asked about it after this turn, and it runs only if they "
+    "say yes. Don't call it again."
+)
+BATCH_REPLY_CHARS = 1500  # a batch's results: one line per change
+BATCH_PAUSED = "Not done: Resonant is paused (/kill), so none of the {n} changes ran."
+BATCH_STOPPED = "Stopped: Resonant was paused (/kill) before the rest ran."
+BATCH_EXPIRED = "Not done: the approval for those {n} changes expired."
+# The ending answers of a turn whose reply is already code-built (report lines and why it
+# stopped): kept as is under a batch. Any other (the model's own words) gives way to it.
+GATED_PATHS = frozenset({"refused", "dry_run", "failed", "ambiguous"})
 
 
 def summarize(calls: list[CallResult]) -> str:
@@ -479,6 +516,8 @@ class LocalRunner:
         spans: SpanFactory,
     ) -> StepResult:
         cp = task.checkpoint
+        if "batch" in cp:  # BA-1: changes that wait on one prompt (before any ``call``)
+            return await self._batch(task, principal, cp, ctx, spans)
         if "call" in cp:
             pinned = PinnedCall.from_json(cp.get("call"))
             if pinned is None:
@@ -672,6 +711,213 @@ class LocalRunner:
         # The Wait replaces the stored checkpoint, so ``cp`` must hold the pinned ``call``.
         return Wait("approval", checkpoint=cp, wake_at=decision.expires_at)
 
+    # --- batches (BA-1) ------------------------------------------------------------------
+
+    async def close_batch(
+        self,
+        task: Task,
+        principal: str,
+        items: list[BatchItem],
+        lines: list[str],
+        ctx: StepContext,
+        spans: SpanFactory,
+        pin: Mapping[str, Any] | None = None,
+        decision: NeedsApproval | None = None,
+    ) -> StepResult:
+        """The turn is over and changes wait on the owner: pin the batch with the turn's
+        code-built ``lines`` (what ran, and why it stopped) and ask (``_batch``). ``pin``:
+        the turn's taint, kept for the next turn's history. ``decision``: one change, and the
+        gate's ask for it this turn: prompted as is (the plain single prompt, as before BA-1)."""
+        latest = get_task(self.conn, task.id)
+        stored = latest.checkpoint if latest is not None else task.checkpoint
+        cp = {k: v for k, v in stored.items() if k != "call"}  # an allowed call: done by now
+        cp.update(pin or {})
+        if (
+            len(items) == 1
+            and decision is not None
+            and decision.approval_id == items[0].approval_id
+        ):
+            cp.update(call=items[0].call.to_json(), effects=lines)
+            cp.pop("batch", None)
+            if items[0].tainted:
+                cp["tainted"] = True
+            if not ctx.save(checkpoint=cp):
+                return Fail("task is no longer running")
+            return after_effects(lines, await self._ask(task.id, decision, cp, spans))
+        cp.update(batch=[i.to_json() for i in items], effects=lines)
+        if not ctx.save(checkpoint=cp):
+            return Fail("task is no longer running")
+        return await self._batch(task, principal, cp, ctx, spans)
+
+    async def _batch(
+        self,
+        task: Task,
+        principal: str,
+        cp: dict[str, Any],
+        ctx: StepContext,
+        spans: SpanFactory,
+    ) -> StepResult:
+        """The task's batch (``checkpoint.batch``) after its turn. One change: the plain
+        single prompt (``call``). Several: one prompt for all of them and a wait; once the
+        owner answered (or it expired), each approved change runs once, in order."""
+        gate = self.core.batch_gate
+        items = batch_items(cp)
+        if items is None or gate is None:
+            return Fail("checkpoint.batch is malformed")
+        effects = _effects(cp)
+        if isinstance(cp.get("call"), dict):  # an allowed call a crash cut short: settle it
+            settled = await self._settle_call(task, principal, cp, items, effects, spans)
+            if isinstance(settled, Fail):
+                return settled
+            cp = {k: v for k, v in cp.items() if k != "call"}
+            cp.update(batch=[i.to_json() for i in items], effects=effects)
+            if not ctx.save(checkpoint=cp):
+                return Fail("task is no longer running")
+        if not items:
+            return Answer(clip_reply("\n".join(effects) or DONE_NOT_APPROVED), "done", [])
+        if len(items) == 1 and "batch_id" not in cp:
+            item = items[0]
+            single = {k: v for k, v in cp.items() if k != "batch"}
+            single["call"] = item.call.to_json()
+            if item.tainted:
+                single["tainted"] = True
+            if not ctx.save(checkpoint=single):
+                return Fail("task is no longer running")
+            return after_effects(
+                effects, await self._resume(task, principal, item.call, single, spans)
+            )
+        ids = [i.approval_id for i in items]
+        states = gate.approval_states(ids)
+        pending = [i for i in ids if states.get(i) == "pending"]
+        if pending and len(pending) < len(ids):
+            # Part of it was decided on its own (a race): it can't be asked as one any more.
+            gate.drop(pending, reason="batch_split")
+            states = gate.approval_states(ids)
+            pending = []
+        if pending:
+            try:
+                batch = gate.open_batch(gate.owner, ids)
+            except ValueError as e:
+                log.warning("batch not opened for task %s: %s", task.id, e)
+                gate.drop(ids, reason="batch_refused")
+                states = gate.approval_states(ids)
+            else:
+                return await self._ask_batch(task.id, batch, {**cp, "batch_id": batch.batch_id},
+                                             spans)  # fmt: skip
+        return await self._run_batch(task, principal, cp, items, states, effects, spans)
+
+    async def _settle_call(
+        self,
+        task: Task,
+        principal: str,
+        cp: dict[str, Any],
+        items: list[BatchItem],
+        effects: list[str],
+        spans: SpanFactory,
+    ) -> Fail | None:
+        """``checkpoint.call`` next to a batch: an allowed call that was running when the
+        turn was cut short. Its outcome joins ``effects`` (run once: the executor's key), or,
+        if the gate now asks about it, it joins ``items``."""
+        pinned = PinnedCall.from_json(cp.get("call"))
+        if pinned is None:
+            return Fail("checkpoint.call is malformed")
+        scope = CallScope(task.id, principal, task.trace_id, task.step_no, spans=spans,
+                          checkpoint=cp)  # fmt: skip
+        outcome = await self.core.resume(pinned, scope)
+        if isinstance(outcome, Asked):
+            if all(i.approval_id != outcome.decision.approval_id for i in items):
+                d = outcome.decision
+                line = batch_line(d.summary, offered=d.allow_always,
+                                  widens=widens_trust(pinned.tool, pinned.extension))  # fmt: skip
+                items.append(BatchItem(pinned, d.approval_id, line, cp.get("tainted") is True))
+            return None
+        done = await self._gated(outcome, spans)
+        if isinstance(done, Answer) and done.reply not in effects:
+            effects.append(done.reply)
+        return None
+
+    async def _ask_batch(
+        self, task_id: str, batch: ApprovalBatch, cp: dict[str, Any], spans: SpanFactory
+    ) -> Wait | Fail:
+        """Send the batch's one prompt (idempotent: the channel dedupes by its id), then
+        wait until it is answered or expires."""
+        with spans(
+            "runner.local.approval",
+            approvers=len(batch.approvers),
+            level=batch.level.value,
+            batch=len(batch.approval_ids),
+        ) as s:
+            sent = await prompt_batch(self.conn, self.channel, batch, now=self.now)
+            s.set(reached=len(sent.reached), unreachable=len(sent.unreachable))
+            if sent.retry:
+                s.set(ok=False, error=type(sent.error).__name__)
+                return Fail(f"approval prompt failed: {sent.error}", retryable=True)
+            if sent.none_reachable:
+                s.set(ok=False, error="ChannelRefused")
+                return Fail("approval prompt refused: no approver is reachable")
+            s.set(ok=True)
+        assert batch.expires_at is not None
+        return Wait("approval", checkpoint=cp, wake_at=batch.expires_at)
+
+    async def _run_batch(
+        self,
+        task: Task,
+        principal: str,
+        cp: dict[str, Any],
+        items: list[BatchItem],
+        states: Mapping[str, str],
+        effects: list[str],
+        spans: SpanFactory,
+    ) -> Answer | Fail:
+        """The answered batch: every approved change once, in order (``ToolCore.resume``:
+        what ``executions`` holds first, so a restart mid-batch never runs one twice); one
+        failing doesn't stop the rest. ``no`` or expiry: none. Paused (/kill): none, or none
+        after the pause."""
+        approved = [i for i in items if states.get(i.approval_id) == "approved"]
+        meta: dict[str, Any] = {"batch": len(items), "batch_approved": len(approved)}
+        if not approved:
+            rejected = any(states.get(i.approval_id) == "rejected" for i in items)
+            text = DONE_NOT_APPROVED if rejected else BATCH_EXPIRED.format(n=len(items))
+            reply = clip_reply("\n".join([*effects, text]), BATCH_REPLY_CHARS)
+            return Answer(reply, "refused", [], meta=meta)
+        if self._paused():
+            reply = clip_reply("\n".join([*effects, BATCH_PAUSED.format(n=len(approved))]),
+                               BATCH_REPLY_CHARS)  # fmt: skip
+            return Answer(reply, "refused", [], meta=meta)
+        lines: list[str] = []
+        used: list[str] = []
+        for n, item in enumerate(items):
+            if states.get(item.approval_id) != "approved":
+                lines.append(f"Not done: {item.summary} (not approved).")
+                continue
+            if n and self._paused():
+                lines.append(BATCH_STOPPED)
+                break
+            item_cp = {**cp, "tainted": True} if item.tainted else cp
+            scope = CallScope(task.id, principal, task.trace_id, task.step_no, spans=spans,
+                              checkpoint=item_cp)  # fmt: skip
+            outcome = await self.core.resume(item.call, scope)
+            if isinstance(outcome, Asked):  # never once approved; fail closed all the same
+                lines.append(f"Not done: {item.summary} (still waiting).")
+                continue
+            done = await self._gated(outcome, spans)
+            if not isinstance(done, Answer):
+                lines.append(f"Not done: {item.summary}.")
+                continue
+            lines.append(done.reply)
+            if done.path in ("done", "replay"):
+                used.extend(done.tools_used)
+        meta["batch_ran"] = len(used)
+        reply = clip_reply("\n".join([*effects, *lines]), BATCH_REPLY_CHARS)
+        return Answer(reply, "done" if used else "failed", used, meta=meta)
+
+    def _paused(self) -> bool:
+        """The kill switch's pause (an unreadable flag counts as paused)."""
+        try:
+            return killswitch.is_paused(self.conn)
+        except killswitch.PausedStateUnknownError:
+            return True
+
     def _current_text(self, task: Task, events: list[Event]) -> str | None:
         event = next((e for e in events if e.id == task.origin_event_id), None)
         if event is None and task.origin_event_id is not None:
@@ -820,7 +1066,8 @@ class LocalRunner:
                 )
                 turn = tool_turn(call, self.model_result_max_chars)
                 messages.append({"role": "user", "content": turn})
-                if sum(c.report is not None for c in calls) >= MAX_SIDE_EFFECTS:
+                # at most MAX_TOOL_CALLS calls here, so the cap is the smaller of the two
+                if sum(c.report is not None for c in calls) >= INTENTS_SIDE_EFFECTS:
                     return False
         return False
 
@@ -839,6 +1086,7 @@ class LocalRunner:
         origin: Origin = "inferred",
         pin: Mapping[str, Any] | None = None,
         check_schema: bool = False,
+        batch: list[BatchItem] | None = None,
     ) -> CallResult | Wait | Fail | Answer:
         """One model tool call through ``ToolCore.call``. An allowed read returns its
         ``CallResult``. Anything else is a gated call: an executed side effect returns a
@@ -847,7 +1095,11 @@ class LocalRunner:
         the call so a resume replies with them too. ``origin`` is ``inferred`` (the brain loop
         passes ``tainted``; never ``explicit``) and ``pin`` adds keys to the pinned checkpoint
         (the brain's taint). ``check_schema``: the brain's calls (the intents path never
-        checked the schema; TC-1 kept that)."""
+        checked the schema; TC-1 kept that). ``batch`` (BA-1, the brain loop): the task's
+        batch so far; a call the gate asks about joins it and comes back as a ``CallResult``
+        with ``asked`` set (the model sees that it waits on the owner) instead of a wait."""
+        if self.core.batch_gate is None:
+            batch = None  # a gate without batches: one approval ends the task
         scope = CallScope(
             task.id,
             principal,
@@ -862,10 +1114,16 @@ class LocalRunner:
             pin=pin,
             tools=toolset,
             check_schema=check_schema,
+            batch=batch,
         )
         outcome = await self.core.call(name, args, scope)
         if not outcome.gated:
             return model_result(outcome, name, detail=self.tool_error_detail)
+        if isinstance(outcome, Asked) and outcome.item is not None:
+            ext = outcome.intent.extension
+            data = {"status": "asked the owner", "change": outcome.item.summary, "note": ASKED_NOTE}
+            return CallResult(name, True, data, None, extension=ext, asked=outcome.item,
+                              decision=outcome.decision)  # fmt: skip
         result = await self._gated(outcome, spans)
         # "replay": an earlier attempt already ran it; it still counts as the side effect.
         if not isinstance(result, Answer) or result.path not in ("done", "replay"):

@@ -718,6 +718,7 @@ def test_intent_toolsets_name_registered_builtins() -> None:
     assert set(INTENT_TOOLS["rules"]) == {
         "list_trust_rules",
         "add_trust_rule",
+        "allow_tools",
         "allow_trust_rule",
         "remove_trust_rule",
     }
