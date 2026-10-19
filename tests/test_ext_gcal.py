@@ -498,6 +498,8 @@ def test_stage_asks_before_sending_the_refresh_token_and_pins_only_listed_tools(
         ) in esc
         for name in WRITES:
             assert any(e.startswith(f'  ! mcp tool "{name}" ("calendar") write L2') for e in esc)
+            assert any(f"{name}" in line and "write L2 commit never-yes-always:" in line
+                       for line in lines)  # fmt: skip
         assert any("never exposed" in n and "hidden" in n and "list_colors" in n
                    for n in staged.notes)  # fmt: skip
         assert "IGNORE" not in "\n".join(lines)
@@ -787,7 +789,12 @@ async def test_calendar_read_runs_create_asks_then_yes_runs_it_once(
 async def test_an_untainted_calendar_write_still_asks_without_yes_always(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path, google: Any, loopback: None
 ) -> None:
+    from resonant.store import trust as trust_store
+
     async with start(resonant_home, chat, tmp_path, google) as w:
+        # an allow rule for the tool (as /rules allow would save) still never runs it unasked
+        trust_store.add_rule(w.conn, scope="gcal", action="tool:gcal.create_event",
+                             effect="allow", created_from="command", now=utcnow())  # fmt: skip
         w.model.triage = CALENDAR
         w.claude(calls=[{"name": "create_event", "args": CREATE}], answer="{r0}")
         _, answer, prompt = await w.say("put lunch with Sam on my calendar friday at noon", 3)

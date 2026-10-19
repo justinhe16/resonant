@@ -317,6 +317,7 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
     lines.append("Tools:" if m.tools or m.mcp else "Tools: none")
     for spec in m.tool_specs():
         flag = " commit" if spec.commit else ""
+        flag += " never-yes-always" if not spec.standing else ""
         lines.append(
             f"  {_s(spec.name, 40)} {spec.effect.value} {spec.effective_level.value}{flag}"
             f": {_s(spec.description or '-')}"

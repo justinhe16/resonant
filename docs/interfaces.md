@@ -112,12 +112,13 @@ jobs:     [{id, schedule (5-field cron), tz?, critical?, run,
             effect? (default write), level?, secrets?, timeout_s? (<= 1800, default 300),
             catchup? (none | duration <= 24h, default none)}]
 tools:    {<name>: {run, description?, effect, level?, args: {<arg>: string|integer|number|boolean},
-                    secrets?, commit?, timeout_s? (<= 300)}}   # {placeholders} in run must be declared args
+                    secrets?, commit?, standing?, timeout_s? (<= 300)}}   # {placeholders} in run must be declared args
 mcp:      {servers: {<id>: {transport: stdio, command, args?: [<literal>, ...],
                              tools: [{name, description?, effect, level?, commit?, standing?, secrets?, timeout_s? (<= 300)}]}
                        | {transport: http, url: https://…, auth?: bearer|oauth, secret?: <declared secret>,
                              oauth?: {token_url: https://…, client_id, client_secret, refresh_token},  # declared secrets
-                             tools: [{name, description?, effect, level?, commit?, timeout_s? (<= 300)}]}}}
+                             tools: [{name, description?, effect, level?, commit?, standing?, timeout_s? (<= 300)}]}}}
+          # standing: false (CAL-1): never a standing allow; its prompt never offers yes always
           # id ^[a-z][a-z0-9_-]{0,31}$; only listed MCP tools are ever exposed
 notify:   {on: [<event>, ...], channel: imessage|slack}   # "item" is reserved (pulse reports): refused here
 report:   {max_urgency: urgent|normal|low}   # optional; the highest urgency report() may use (no section: reports refused)
