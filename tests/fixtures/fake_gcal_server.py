@@ -9,7 +9,8 @@ endpoint at ``/token`` (refresh-token grant, form-encoded, RFC 6749 §6):
   {"error": "invalid_grant", "error_description": <text that must never surface>}``.
   ``token_status`` makes the next answer that HTTP status instead.
 - ``/mcp/v1`` wants ``Authorization: Bearer <an issued, unrevoked token>`` (else 401);
-  ``revoke()`` drops every issued token.
+  ``revoke()`` drops every issued token; ``stateless`` answers ``initialize`` with no
+  ``Mcp-Session-Id`` and takes requests without one.
 
 Tools: ``list_calendars``, ``list_events``, ``get_event``, ``search_events``,
 ``suggest_time``, ``create_event``, ``update_event``, ``delete_event``, ``respond_to_event``
@@ -53,6 +54,7 @@ class FakeGoogle(_base.FakeHttpMcp):  # type: ignore[misc]
         super().__init__(token="unused")  # pyright: ignore[reportUnknownMemberType]
         self.ttl: Any = 3600
         self.token_status: int | None = None
+        self.stateless = False  # no Mcp-Session-Id: every request stands alone
         self.issued: list[str] = []
         self.valid: set[str] = set()
         self.token_requests: list[dict[str, str]] = []
@@ -80,6 +82,19 @@ class FakeGoogle(_base.FakeHttpMcp):  # type: ignore[misc]
 
     def mcp_requests(self) -> list[dict[str, Any]]:
         return [r for r in self.requests if r["method"] in ("POST", "GET", "DELETE")]
+
+    def _answer(
+        self,
+        h: BaseHTTPRequestHandler,
+        rid: Any,
+        result: dict[str, Any] | None,
+        headers: dict[str, str] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        if self.stateless and headers and "Mcp-Session-Id" in headers:
+            headers = {k: v for k, v in headers.items() if k != "Mcp-Session-Id"}
+            self.sessions.add(None)  # requests without a session id are accepted
+        super()._answer(h, rid, result, headers, error)  # pyright: ignore[reportUnknownMemberType]
 
     # --- OAuth ------------------------------------------------------------------------------
 

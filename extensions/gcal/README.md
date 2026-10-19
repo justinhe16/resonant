@@ -78,7 +78,7 @@ You need a Google account and about 15 minutes. All browser steps are on Google'
    resonant secret list gcal          # all three present
    ```
 8. **Install:** `resonant ext add repo:gcal`.
-   - Listing Google's tools needs an access token, so it asks first: `MCP server calendar at https://oauth2.googleapis.com/token needs gcal/refresh_token to list its tools. Send gcal/refresh_token to oauth2.googleapis.com now?`. Answer `y`.
+   - Listing Google's tools needs an access token, so it asks first: `MCP server calendar at https://oauth2.googleapis.com/token needs gcal/refresh_token to list its tools. Send gcal/refresh_token to oauth2.googleapis.com now?`. Answer `y`: that sends the client ID and client secret to the same Google token endpoint, and nowhere else.
    - The review then shows every tool with its pin, the unlisted tools as a note, and the escalations: `mcp server "calendar" calls "https://calendarmcp.googleapis.com/mcp/v1" (http, network), sends secrets client_id, client_secret, refresh_token to "https://oauth2.googleapis.com/token" (oauth) and the access token it gets as its bearer token`, and the four writes at L2.
    - Type `gcal` to install. The daemon restarts and texts you.
 9. **Try it** by text:

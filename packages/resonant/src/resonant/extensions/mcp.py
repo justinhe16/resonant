@@ -1007,12 +1007,14 @@ class McpServerRuntime:
             oauth: OAuthToken | None = None
             if self.http.oauth is not None:
                 o = self.http.oauth
-                creds = OAuthCredentials(
-                    token_url=o.token_url,
-                    client_id=env_secrets.get(env_name(o.client_id), ""),
-                    client_secret=env_secrets.get(env_name(o.client_secret), ""),
-                    refresh_token=env_secrets.get(env_name(o.refresh_token), ""),
-                )
+                values = [env_secrets.get(env_name(n)) or "" for n in o.secrets]
+                if not all(values):  # never post an empty credential
+                    raise McpError(
+                        "a secret this MCP server needs is missing or unreadable "
+                        f"(resonant secret list {self.ext})"
+                    )
+                client_id, client_secret, refresh_token = values
+                creds = OAuthCredentials(o.token_url, client_id, client_secret, refresh_token)
                 if self._oauth is None or self._oauth.creds != creds:  # first, or rotated
                     self._oauth = OAuthToken(creds)
                 oauth = self._oauth

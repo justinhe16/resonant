@@ -383,7 +383,8 @@ class McpHttpSession(RpcSession):
                 failure = self._status_failure(resp, had_session)
                 if resp.status_code == 401 and self._oauth is not None:
                     self._oauth.expire(sent_token)  # the next request gets a new one
-                    if had_session:  # refused, so nothing ran: a new session retries once
+                    if method != "initialize":  # refused, so nothing ran: a new session
+                        # (fresh token) retries once, with or without a session id
                         failure = McpSessionExpired("access token refused")
                 if failure is None:
                     if method == "initialize":

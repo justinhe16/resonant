@@ -351,6 +351,17 @@ async def test_a_revoked_access_token_gets_a_new_one_and_retries_once(
     assert [c[0] for c in google.calls] == ["list_calendars", "list_calendars"]
 
 
+async def test_a_stateless_server_retries_a_refused_token_once_too(
+    runtime: McpServerRuntime, google: Any
+) -> None:
+    google.stateless = True  # a server that never issues Mcp-Session-Id
+    await runtime.call("list_calendars", {}, 10)
+    assert all("Mcp-Session-Id" not in r["headers"] for r in google.requests)
+    google.revoke()
+    assert "primary" in (await runtime.call("list_calendars", {}, 10))["text"]
+    assert len(google.token_requests) == 2 and len(google.calls) == 2
+
+
 async def test_a_bad_refresh_token_in_the_keychain_runs_nothing(
     google: Any, runtime: McpServerRuntime
 ) -> None:
@@ -758,6 +769,31 @@ async def test_calendar_asks_keep_the_connector_path_without_the_extension(
         assert cp["kind"] == "calendar" and "calendar_ext" not in cp
         assert cp.get("session") is not True
         assert google.calls == []
+
+
+def test_calendar_routing_needs_the_extensions_calendar_read() -> None:
+    """A loaded gcal whose MCP tools aren't offered (only the local draft_event) keeps the
+    connector path: draft_event alone can't say what's on the calendar."""
+    from types import SimpleNamespace
+
+    from resonant.runners.ask import AskRunner as Runner
+    from resonant_sdk import ToolSpec
+
+    def spec(name: str) -> ToolSpec:
+        return ToolSpec(name=name, effect=Effect.READ, extension="gcal", source="ext:gcal")
+
+    offered: list[ToolSpec] = [spec("draft_event")]
+
+    def tools_for(_principal: str) -> list[ToolSpec]:
+        return offered
+
+    fake = SimpleNamespace(
+        cfg=SimpleNamespace(calendar_extension="gcal", resonant_tools=True),
+        tools=SimpleNamespace(tools_for=tools_for),
+    )
+    assert Runner._calendar_extension(fake, "justin") is None  # type: ignore[arg-type]
+    offered.append(spec("list_events"))
+    assert Runner._calendar_extension(fake, "justin") == "gcal"  # type: ignore[arg-type]
 
 
 async def test_calendar_extension_off_in_config_keeps_the_old_path(
