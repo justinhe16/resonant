@@ -24,6 +24,8 @@ What never gets a standing allow (``scope`` returns None, so the prompt doesn't 
 - the tools that loosen trust (``allow_trust_rule``, ``remove_trust_rule``): loosening is
   always the owner's own reply to that one change;
 - ``merge_run``, whose level already follows the merge trust rules and flagged paths;
+- a tool whose manifest says ``standing: false`` (CAL-1: gcal's writes, which can email
+  other people);
 - an action or scope that isn't a valid slug (too long, odd characters).
 
 The gate (``PolicyGate``) applies it only to the owner's own ``inferred`` calls of a tool at
@@ -83,8 +85,8 @@ class StandingAllows:
 
     def scope(self, intent: Intent) -> ToolScope | None:
         """The rule a ``yes always`` on this call would save, or None if it can't have one."""
-        if intent.extension is None and intent.tool in NEVER:
-            return None
+        if (intent.extension is None and intent.tool in NEVER) or not intent.spec.standing:
+            return None  # standing: false (CAL-1, the manifest's): always asks
         action = tool_action(intent.extension, intent.tool)
         if action is None:
             return None

@@ -129,10 +129,38 @@ def test_shipped_manifest_levels() -> None:
     for name in WRITES:  # every change asks a plain yes; each can email people
         spec = specs[name]
         assert spec.effect is Effect.WRITE and spec.effective_level is Level.L2
-        assert spec.commit
+        assert spec.commit and not spec.standing  # never "yes always"
     assert all(s.secrets == () for s in specs.values())  # no tool process gets a secret
     assert dir_errors(EXT, m) == []
     assert "calendar" in m.description.lower() and m.examples
+
+
+def test_calendar_writes_never_take_a_standing_allow(db: sqlite3.Connection) -> None:
+    """standing: false: no "yes always" offer, and even an allow rule for the tool (from
+    /rules allow, or one saved before) never lets it run unasked. Other tools still can."""
+    from datetime import UTC, datetime
+
+    from resonant.gate.types import Intent
+    from resonant.store import trust as trust_store
+    from resonant.trust.tools import StandingAllows
+
+    specs = {s.name: s for s in load_manifest(EXT / "resonant.yaml").tool_specs()}
+    now = datetime(2026, 10, 19, tzinfo=UTC)
+    for name in WRITES:
+        trust_store.add_rule(db, scope="gcal", action=f"tool:gcal.{name}", effect="allow",
+                             created_from="command", now=now)  # fmt: skip
+    standing = StandingAllows(db)
+    for name in WRITES:
+        intent = Intent.for_tool(specs[name], task_id="t", principal="justin", args={})
+        assert standing.scope(intent) is None
+        assert standing.offer(intent) is None and standing.allows(intent) is None
+    other = specs["create_event"].model_copy(update={"standing": True})
+    intent = Intent.for_tool(other, task_id="t", principal="justin", args={})
+    assert standing.allows(intent) is not None  # the same rule widens a standing tool
+    with pytest.raises(ValidationError, match="side effect"):
+        specs["list_events"].model_validate(
+            {**specs["list_events"].model_dump(), "standing": False}
+        )
 
 
 def test_draft_event_is_local_and_has_no_secrets() -> None:
@@ -754,6 +782,20 @@ async def test_calendar_read_runs_create_asks_then_yes_runs_it_once(
         assert w.google_calls("create_event") == 1
         (_, args) = next(c for c in google.calls if c[0] == "create_event")
         assert args == CREATE
+
+
+async def test_an_untainted_calendar_write_still_asks_without_yes_always(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path, google: Any, loopback: None
+) -> None:
+    async with start(resonant_home, chat, tmp_path, google) as w:
+        w.model.triage = CALENDAR
+        w.claude(calls=[{"name": "create_event", "args": CREATE}], answer="{r0}")
+        _, answer, prompt = await w.say("put lunch with Sam on my calendar friday at noon", 3)
+        assert "asked the owner:" in answer
+        assert "Reply yes" in prompt and "yes always" not in prompt
+        (ask,) = w.ask_tasks()
+        assert json.loads(ask["checkpoint"])["tainted"] is False  # no read before it
+        assert w.google_calls("create_event") == 0
 
 
 async def test_calendar_asks_keep_the_connector_path_without_the_extension(

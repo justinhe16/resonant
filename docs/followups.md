@@ -273,7 +273,6 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 
 *Noted 2026-10-19 from CAL-1 ([`extensions/gcal`](../extensions/gcal/README.md)).*
 
-- **`yes always` can widen an invite-sending tool.** The four gcal writes are L2 (a plain yes), as the owner asked, and each can email other people. An untainted owner call's prompt offers `yes always`, after which later chat calls of that tool run unasked. Most calendar changes follow a read in the same turn (tainted: no `yes always` offered), but not all. Fix: a per-tool manifest flag (e.g. `standing: false`) that `trust/tools.StandingAllows.scope` honours. It touches `trust/` (TC-1's area), so it was left out of CAL-1.
 - **The tool names and schemas are from Google's reference, not a live `tools/list`.** No Google auth was used in CAL-1. The first `ext add repo:gcal` is the real check: a rename refuses the install with the server's closest names.
 - **Developer Preview.** Google lists the Calendar MCP server as a Developer Preview that needs program membership. If it goes GA or moves (`mcp.googleapis.com`), change `url` in the manifest and `ext update gcal`.
 - **Session and token rotation.** Each request carries the current access token, refreshed inside a long session. If Google ever binds an MCP session to one token, the first call after a refresh gets a `401`/`404` and retries once in a new session (nothing ran). Watch for `mcp http` retries in the logs after the first hour.

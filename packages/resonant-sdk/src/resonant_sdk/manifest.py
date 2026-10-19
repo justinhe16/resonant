@@ -189,6 +189,7 @@ class CliTool(_Strict):
     args: dict[str, ArgType] = Field(default_factory=dict[str, ArgType])
     secrets: tuple[SecretName, ...] = ()
     commit: bool = False
+    standing: bool = True  # false: never a standing allow (``yes always``); always asks
     timeout_s: float = Field(default=30.0, gt=0, le=TOOL_TIMEOUT_MAX_S)
 
     @model_validator(mode="after")
@@ -223,6 +224,7 @@ class McpTool(_Strict):
     effect: Effect
     level: Level | None = None
     commit: bool = False
+    standing: bool = True  # false: never a standing allow (``yes always``); always asks
     secrets: tuple[SecretName, ...] = ()
     timeout_s: float = Field(default=30.0, gt=0, le=TOOL_TIMEOUT_MAX_S)
 
@@ -548,6 +550,7 @@ class Manifest(BaseModel):
                 timeout_s=t.timeout_s,
                 secrets=t.secrets,
                 commit=t.commit,
+                standing=t.standing,
             )
             for name, t in self.tools.items()
         ]
@@ -565,6 +568,7 @@ class Manifest(BaseModel):
                     timeout_s=t.timeout_s,
                     secrets=t.secrets,
                     commit=t.commit,
+                    standing=t.standing,
                 )
                 for _, t in self.mcp.tools()
             ]

@@ -12,17 +12,17 @@ There is almost no code here. The manifest lists the server tools Resonant may u
 | `search_events` | L0 | Events matching some text (a title, a person, a place). |
 | `suggest_time` | L0 | Free/busy: open slots for you and others in a range. Google's server has no separate free/busy tool; this one reads free/busy and writes nothing. |
 | `draft_event` | L0 | Local only: checks a proposed event (times, attendee emails) and says what `create_event` would do and who would get an invite. It never contacts Google and gets no secrets. |
-| `create_event` | L2, commit | Add an event. Asks a plain yes first. |
-| `update_event` | L2, commit | Change an event. Asks first. |
-| `delete_event` | L2, commit | Delete an event. Asks first. |
-| `respond_to_event` | L2, commit | Accept, decline or tentatively accept an invite. Asks first. |
+| `create_event` | L2, commit, never `yes always` | Add an event. Asks a plain yes first. |
+| `update_event` | L2, commit, never `yes always` | Change an event. Asks first. |
+| `delete_event` | L2, commit, never `yes always` | Delete an event. Asks first. |
+| `respond_to_event` | L2, commit, never `yes always` | Accept, decline or tentatively accept an invite. Asks first. |
 
 Why these levels:
 
 - **Reads are L0.** They change nothing. Every result counts as outside content, since an invite's title or notes can come from anyone (`brain.taints`: extension and MCP results always taint). So after any calendar read in a turn, a change asks the owner, and the prompt offers no `yes always`.
 - **Drafting is L0.** `suggest_time` and `draft_event` write nothing anywhere. L3 means "act, then report", which fits a reversible write; there is no write here to report.
-- **Writes are L2 with `commit: true`.** The model's choice always asks a plain yes. A slash command you type yourself (`/gcal create_event …`) runs, because typing it is your consent. `commit` marks the four writes as irreversible to the outside world: each can email people (invites, updates, cancellations, an RSVP to the organizer), and an email can't be unsent.
-- **Invites to other people ask too, at L2 rather than L1.** By convention L1 (`yes <code>`) is for destructive actions. Sending an invite isn't destructive, and a level belongs to a tool, not an argument, so L1 would put a code on every personal event too. One case doesn't ask: if you answer `yes always` to a write that wasn't tainted, later chat calls of that tool run without asking (GT-1). If you want every invite asked about, don't answer `yes always` to these four. If you already did, `/rules` lists the rule and `/rules forget <n>` removes it. A manifest flag that turns `yes always` off for one tool is in [`docs/followups.md`](../../docs/followups.md).
+- **Writes are L2 with `commit: true` and `standing: false`.** The model's choice always asks a plain yes. A slash command you type yourself (`/gcal create_event …`) runs, because typing it is your consent. `commit` marks the four writes as irreversible to the outside world: each can email people (invites, updates, cancellations, an RSVP to the organizer), and an email can't be unsent.
+- **Writes never take `yes always` (`standing: false`).** Each of the four can email other people, so every model-chosen calendar change asks, every time. Their prompt doesn't offer `yes always`, and an `allow` rule for one of them (`/rules allow running gcal.create_event`) never makes it run unasked. The level is still L2, a plain `yes`, not L1's `yes <code>`: by convention the code is for destructive actions, and a level belongs to the whole tool, so L1 would put a code on every personal event too.
 
 The server offers tools this manifest doesn't list (Google can add more). Resonant never registers or calls a tool that isn't listed. `ext add` shows the unlisted ones as a note, and nothing is ever mapped to L0 automatically.
 

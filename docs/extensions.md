@@ -82,7 +82,7 @@ The gate weighs the level (the risk) against **who chose the action**. A slash c
 
 While the kill switch is on (`/kill`), everything above L0 asks first, and L1 still needs the code. There are no veto windows ("doing X in N min unless you stop") yet; they are deferred past Phase 3.
 
-Pick the lowest level you'd be comfortable with if the model misunderstood a request. Mark irreversible, user-visible actions (send, pay, delete) with `commit: true`.
+Pick the lowest level you'd be comfortable with if the model misunderstood a request. Mark irreversible, user-visible actions (send, pay, delete) with `commit: true`. A write that reaches other people and must ask every time sets `standing: false` (CLI or MCP tool): its L2 prompt never offers `yes always`, and no `allow` rule makes it run unasked ([`extensions/gcal`](../extensions/gcal/README.md)'s writes).
 
 ### CLI tools (default)
 

@@ -114,7 +114,7 @@ jobs:     [{id, schedule (5-field cron), tz?, critical?, run,
 tools:    {<name>: {run, description?, effect, level?, args: {<arg>: string|integer|number|boolean},
                     secrets?, commit?, timeout_s? (<= 300)}}   # {placeholders} in run must be declared args
 mcp:      {servers: {<id>: {transport: stdio, command, args?: [<literal>, ...],
-                             tools: [{name, description?, effect, level?, commit?, secrets?, timeout_s? (<= 300)}]}
+                             tools: [{name, description?, effect, level?, commit?, standing?, secrets?, timeout_s? (<= 300)}]}
                        | {transport: http, url: https://…, auth?: bearer|oauth, secret?: <declared secret>,
                              oauth?: {token_url: https://…, client_id, client_secret, refresh_token},  # declared secrets
                              tools: [{name, description?, effect, level?, commit?, timeout_s? (<= 300)}]}}}

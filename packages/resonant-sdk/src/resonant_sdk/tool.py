@@ -13,6 +13,9 @@ Invariants, enforced here at registration:
 - ``untrusted=True`` marks a tool whose result carries outside content (file text, logs, a
   worker's transcript): a loop that sees one treats the task as tainted (docs/brain-plan.md
   D6). Extension and MCP results are outside content whatever the flag says.
+- ``standing=False`` (CAL-1) means no standing allow ever covers the tool: its prompt never
+  offers ``yes always`` and no ``allow`` rule makes it run unasked (``trust.tools``). For
+  writes that reach other people (calendar invites). Only side-effecting tools may set it.
 - ``grant`` names a builtin a member may request through ``grants: {"builtin:<grant>":
   [request]}`` (``resonant.principals``). Only global L0 reads can carry one.
 """
@@ -66,6 +69,7 @@ class ToolSpec(BaseModel):
     secrets: tuple[str, ...] = ()
     commit: bool = False
     untrusted: bool = False
+    standing: bool = True
     grant: str | None = Field(default=None, pattern=GRANT_PATTERN)
 
     @model_validator(mode="after")
@@ -76,6 +80,8 @@ class ToolSpec(BaseModel):
             raise ValueError(f"{self.name}: read tools without secrets are always L0")
         if self.commit and self.effect is Effect.READ:
             raise ValueError(f"{self.name}: commit tools must have a side effect")
+        if not self.standing and self.effect is Effect.READ:
+            raise ValueError(f"{self.name}: standing: false is for tools with a side effect")
         if self.grant is not None and (
             self.extension is not None or self.effect is not Effect.READ or self.secrets
         ):

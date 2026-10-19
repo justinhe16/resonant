@@ -65,7 +65,8 @@ mcp:
           effect: read
         # Writes: L2, a plain yes first (the owner's own typed /gcal command runs). commit:
         # each can email people (invites, updates, cancellations, an RSVP to the organizer)
-        # and that can't be unsent.
+        # and that can't be unsent. standing: false: never "yes always", and no allow rule
+        # makes one run unasked; every model-chosen calendar change asks.
         - name: create_event
           description: >-
             Add an event (summary, startTime, endTime; attendees get an email invite unless
@@ -73,6 +74,7 @@ mcp:
           effect: write
           level: L2
           commit: true
+          standing: false
           timeout_s: 60
         - name: update_event
           description: >-
@@ -81,6 +83,7 @@ mcp:
           effect: write
           level: L2
           commit: true
+          standing: false
           timeout_s: 60
         - name: delete_event
           description: >-
@@ -89,6 +92,7 @@ mcp:
           effect: write
           level: L2
           commit: true
+          standing: false
           timeout_s: 60
         - name: respond_to_event
           description: >-
@@ -97,4 +101,5 @@ mcp:
           effect: write
           level: L2
           commit: true
+          standing: false
           timeout_s: 60
