@@ -14,7 +14,7 @@ stdio transport spawns the process itself (inheriting a default env and stderr) 
 anyio, httpx, starlette and uvicorn into the daemon, so it would be fought on exactly those
 points.
 
-Design (carried from ``followups.md``):
+Design (carried from ``backlog.md``):
 
 - **Listed tools only.** A server tool the manifest doesn't list is never registered or
   called. The model sees the manifest's description, never the server's; the server's input

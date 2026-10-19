@@ -366,7 +366,7 @@ approvals = buttons (non-pay) · typed "yes A7" for pay`,
     what:"A generic inbound endpoint for machine events.",
     iface:`POST /hooks/<name>   # transport is an open follow-up
 X-Signature: HMAC-SHA256(body)`,
-    inv:["Never a public port on the Mini","HMAC-signed","How third parties reach it without a public port is an open follow-up (docs/followups.md#inbound-webhooks)"],
+    inv:["Never a public port on the Mini","HMAC-signed","How third parties reach it without a public port is an open follow-up (docs/backlog.md#inbound-webhooks)"],
     files:[]},
   notifier:{label:"Slack notifier (out-only)", phase:"ext", status:"planned",
     what:"An outbound-only Slack poster. It was planned for Phase 1, but Slack stays out of core: health alerts go to the owner over iMessage, and the dead-man /fail ping carries the reason when iMessage itself is down. A Slack notifier, if any, belongs to an extension.",

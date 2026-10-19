@@ -6,7 +6,7 @@ Status: **implemented** (2026-10-15; P5A-1 to P5A-7 merged, see As built). The o
 
 **Goal.** The owner texts "fix the flaky test in resonant" from anywhere. A Claude Code session on the Mini does the work in a throwaway clone, inside a macOS sandbox, and Resonant texts back a PR link. Merging is the one approval. While it runs, the hourly pulse says it is still going; `/runs` shows it; `/kill` stops it.
 
-The sandbox is **a wall, not a gate**: no new approvals, a few milliseconds per process, and Claude runs with permission checks off inside it. It closes the gap in the [trust model](architecture.md#trust-model): "same-user processes can run `resonant approvals approve`, write `resonant.db` and read the Keychain". With it, a Claude session can do none of the three, whatever a malicious repo file talks it into. Extension processes move under the sandbox later, opt-in ([`followups.md`](followups.md#seatbelt-sandbox-for-extension-processes)).
+The sandbox is **a wall, not a gate**: no new approvals, a few milliseconds per process, and Claude runs with permission checks off inside it. It closes the gap in the [trust model](architecture.md#trust-model): "same-user processes can run `resonant approvals approve`, write `resonant.db` and read the Keychain". With it, a Claude session can do none of the three, whatever a malicious repo file talks it into. Extension processes move under the sandbox later, opt-in ([`backlog.md`](backlog.md#seatbelt-sandbox-for-extension-processes)).
 
 **Revised after review (2026-10-15).** A code-review agent read the first draft. Its four blockers are fixed here: launchd, window server and input injection are denied unconditionally with a probe each (D1), port denies cover every address and unix sockets are deny-default (D1), a PR branch that changes what CI runs is flagged to the owner (D3), and every descendant process is reaped, including after a crash, with a re-check before anything is published (D4). The extension profile moved out of this build, and the router wiring is split so most of the entry-point work doesn't wait for the NL-intents PR (§4).
 
@@ -54,7 +54,7 @@ The GitHub token **never enters the sandbox**, and once the session has started 
 
 `sandbox-exec -f <profile> -D KEY=VALUE … <argv>` with a profile generated from a template and parameters. No string-built paths in SBPL: every path goes in as a `-D` parameter, is `os.path.realpath`-ed first (`/tmp`, `/var` and `/etc` are symlinks into `/private`, and SBPL matches real paths), must be absolute, and is refused if it contains `"`, `\`, `)` or a control character. `sandbox-exec` is deprecated but present on macOS 27.0.1; `resonant sandbox check` (D6) re-proves it after every OS update.
 
-One profile, `runner` (Claude sessions). The deny-default `extension` profile is a follow-up ([`followups.md`](followups.md#seatbelt-sandbox-for-extension-processes)); the module is built so a second profile is a new template, not a redesign.
+One profile, `runner` (Claude sessions). The deny-default `extension` profile is a follow-up ([`backlog.md`](backlog.md#seatbelt-sandbox-for-extension-processes)); the module is built so a second profile is a new template, not a redesign.
 
 | | `runner` |
 |---|---|
@@ -266,7 +266,7 @@ P5A-3 review changes:
 - A session counts (and is resumed with `--resume`) only after Claude's system message with the session id arrived; otherwise the next start is a fresh `--session-id`. The saved process is cleared only once the tree is really gone; if it won't die the run fails.
 - The watchdog also covers the shared runner cache: over `runner.max_cache_gb`, the run is killed. The daily cleanup also runs with no repos configured when the work or cache dir exists.
 - `pr list` uses `--state all`, so a PR merged or closed in between is reused, not duplicated. During a usage wait the pulse item reads "waiting for usage reset".
-- Busy/full/paused keep `Wait("usage_reset")`; a `resource` reason is a follow-up ([followups.md](followups.md#a-resource-wait-reason-for-runner-runs)).
+- Busy/full/paused keep `Wait("usage_reset")`; a `resource` reason is a follow-up ([followups.md](backlog.md#a-resource-wait-reason-for-runner-runs)).
 - `--max-turns` is hidden and undocumented in Claude Code's help; confirm on the first real run (test.md row 34). `--setting-sources project` makes Claude obey the repo's own `.claude/settings.json` inside the sandbox (accepted, as in D2). Whether `sandbox.enabled: false` takes effect is an owner step (test.md row 34). The redundant `autoUpdates` setting was dropped (`DISABLE_AUTOUPDATER=1` is in the env).
 
 ### P5A-4 and P5A-5 (run tools, commands and the `run_project` intent)

@@ -9,7 +9,7 @@ checked on Claude Code 2.1.299) and, once idle, waits for more input until stdin
 Resonant decides when a session ends (:meth:`LiveInput.end`): Remote Control off (best
 effort), then stdin closed, after which the CLI exits once its turn is over.
 
-Control requests are undocumented (Claude Code 2.1.x; see docs/followups.md): a line
+Control requests are undocumented (Claude Code 2.1.x; see docs/backlog.md): a line
 ``{"type": "control_request", "request_id": …, "request": {"subtype": "remote_control",
 "enabled": true}}`` is answered on stdout by ``{"type": "control_response", "response":
 {"subtype": "success", "request_id": …, "response": {"session_url": …}}}`` or by ``subtype``

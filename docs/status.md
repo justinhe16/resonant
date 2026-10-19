@@ -50,7 +50,7 @@ Latest task eval (synthetic set, live qwen): 95.8%, 0 unapproved writes, triage 
 
 ## Open work: Phase 6b, harden and prove
 
-Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant project (Personal team). The ranked background is in [`followups.md`](followups.md) under "Recommended next".
+Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant project (Personal team). Your own to-dos are in [`followups.md`](followups.md); deferred design notes and carry-overs in [`backlog.md`](backlog.md).
 
 | Wave | Ticket | What |
 |---|---|---|
