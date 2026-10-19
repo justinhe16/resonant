@@ -135,7 +135,7 @@ from resonant.store import tasks as task_store
 from resonant.store.db import iso, kv_set, open_db, transaction, utcnow
 from resonant.tools import notes as notes_tools
 from resonant.tools import reminders as reminder_tools
-from resonant.wiring import IMessageStack, build_imessage_stack, tool_access
+from resonant.wiring import IMessageStack, build_imessage_stack, close_asks, tool_access
 from resonant_sdk import Effect, Event, ToolSpec
 
 log = logging.getLogger(__name__)
@@ -677,6 +677,7 @@ class EvalAsk:
         trace_id: str | None = None,
         tools: bool = False,
         tainted: bool = False,
+        taint_hops: int | None = None,
     ) -> Queued | AskRefused:
         self.asks.append(
             {"kind": kind, "attachments": len(attachments), "tools": tools, "tainted": tainted}
@@ -1121,6 +1122,7 @@ async def _run_in(
         loop.stop()
         with contextlib.suppress(Exception):
             await loop_task
+        await close_asks(components)  # BR-11: the Claude brain, when the case used it
         await stack.aclose()
         conn.close()
         chat.close()
@@ -1155,6 +1157,7 @@ def _fake_claude(
         claude_cmd=[sys.executable, "-I", str(FAKE_CLAUDE), "--script", str(plan)],
         home=root / "claude-home",
         tools=tool_access(components, brain, settings),
+        session=settings.brain.claude_session,  # BR-11: the Claude brain, as on the Mini
         poll_s=0.05,
         kill_grace_s=0.5,
     )

@@ -258,7 +258,9 @@ async def test_daemon_status(db: sqlite3.Connection, components: Components) -> 
         "autonomy",
         "paused",
         "runs",
+        "claude_brain",  # BR-11 (None before the Claude brain first starts)
     }
+    assert out["claude_brain"] is None
     assert out["dry_run"] is True and out["paused"] is True and out["autonomy"] == "on"
     assert out["inflight"] == 0 and out["last_tick"] is None and out["uptime_s"] >= 0
 

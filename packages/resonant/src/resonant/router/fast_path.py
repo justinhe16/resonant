@@ -112,6 +112,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# A Remote Control link as RC-1 stores it (runners/live.py), checked again before /status shows it.
+_SESSION_URL = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]{1,200}")
+
 NOT_ALLOWED = "not allowed"
 KILL_REPLY = "kill switch engaged"
 RESUME_REPLY = "resumed: autonomy on, unpaused"
@@ -175,8 +178,30 @@ def render_status(d: dict[str, Any]) -> str:
     if d.get("dry_run") is True:
         parts.append("dry run")
     text = " · ".join(parts)
-    runs = _runs_line(d.get("runs"))
-    return f"{text}\n{runs}" if runs else text
+    lines = [text]
+    if runs := _runs_line(d.get("runs")):
+        lines.append(runs)
+    if brain := _claude_brain_line(d.get("claude_brain")):
+        lines.append(brain)
+    return "\n".join(lines)
+
+
+def _claude_brain_line(value: Any) -> str:
+    """BR-11: ``Claude brain: up · 12 turns · Remote Control: <url>`` (nothing before its
+    first start). Only a claude.ai session URL is shown (``live.session_url`` checked it
+    when it was stored; checked again here)."""
+    d = _as_dict(value)
+    if not d:
+        return ""
+    state = "up" if d.get("state") == "up" else "down"
+    bits = [f"Claude brain: {state}"]
+    turns = d.get("turns")
+    if isinstance(turns, int) and not isinstance(turns, bool):
+        bits.append(f"{turns} turn{'' if turns == 1 else 's'}")
+    url = d.get("remote_url")
+    if state == "up" and isinstance(url, str) and _SESSION_URL.fullmatch(url):
+        bits.append(f"Remote Control: {url}")
+    return " · ".join(bits)
 
 
 def _runs_line(value: Any) -> str:

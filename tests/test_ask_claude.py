@@ -16,6 +16,7 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import psutil
 import pytest
@@ -166,6 +167,7 @@ def make(
     cfg: dict[str, Any] | None = None,
     login: bool = False,
     channel: FakeChannel | None = None,
+    session: Any = None,
 ) -> Harness:
     notes = tmp_path / "notes"
     notes.mkdir(parents=True, exist_ok=True)
@@ -195,6 +197,7 @@ def make(
         claude_cmd=cmd,
         home=tmp_path / "home",
         login_check=login_check,
+        session=session,
         kill_grace_s=0.5,
         poll_s=0.05,
     )
@@ -381,7 +384,10 @@ def test_scope_is_the_read_tools_scope(tmp_path: Path) -> None:
 
 def test_config_defaults_and_validation() -> None:
     s = load_settings()
-    assert s.brain.ask_claude.concurrency == 1 and s.brain.ask_claude.daily_cap == 30
+    assert s.brain.ask_claude.concurrency == 1 and s.brain.ask_claude.daily_cap == 0
+    cs = s.brain.claude_session  # BR-11: the Claude brain
+    assert cs.enabled and not cs.remote_control and cs.max_per_hour == 60
+    assert (cs.rotate_turns, cs.rotate_hours, cs.queue_max) == (50, 12.0, 3)
     assert s.brain.ask_claude.timeout_s == 120 and s.brain.ask_claude.max_turns == 15
     assert s.brain.read_roots is None and s.brain.read_deny == []  # BR-2's defaults
     assert s.brain.ask_claude.attachment_roots == [Path.home() / "Library/Messages/Attachments"]
@@ -640,7 +646,10 @@ async def test_usage_limit_backs_off_and_tells_the_owner_once(
     assert isinstance(out2, Done) and isinstance(out3, Done)
     assert not (h.notes / "argv.json").exists()
     owner_texts = [t for p, t, _ in h.channel.sent if p == "justin"]
-    assert len(owner_texts) == 1 and "usage limit; ask_claude is off until" in owner_texts[0]
+    assert len(owner_texts) == 1
+    assert owner_texts[0].startswith(
+        "Hit the Claude usage limit; answering locally until it resets at"
+    )
     assert [t for p, t, _ in h.channel.sent if p == "cofounder"] == [ask_mod.LIMIT_OTHER]
     refused = h.runner.enqueue("q4", principal="justin")
     assert isinstance(refused, AskRefused) and "usage limit until" in refused.text
@@ -694,7 +703,45 @@ async def test_daily_cap(db: sqlite3.Connection, tmp_path: Path) -> None:
     assert isinstance(h.runner.enqueue("b", principal="justin"), Queued)
     third = h.runner.enqueue("c", principal="justin")
     assert third == AskRefused("I've asked Claude 2 times today, the daily cap.")
+    assert h.runner.enqueue("d", principal="cofounder") == third
     assert h.runner.asked_today() == 2
+    await h.runner.idle()  # BR-11: the owner hears it once that day, through the channel
+    assert h.channel.sent == [
+        ("justin", "Hit today's Claude cap (2); answering locally until midnight.",
+         f"ask:cap:{utcnow().astimezone(ZoneInfo('America/Los_Angeles')).date().isoformat()}")
+    ]  # fmt: skip
+
+
+async def test_no_daily_cap_by_default(db: sqlite3.Connection, tmp_path: Path) -> None:
+    h = make(db, tmp_path)
+    for i in range(40):
+        assert isinstance(h.runner.enqueue(f"q{i}", principal="justin"), Queued)
+
+
+async def test_the_runaway_guard_pauses_for_the_hour(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """BR-11: ``claude_session.max_per_hour`` over every ask; the owner is told once."""
+    from resonant.config import ClaudeSessionConfig
+
+    h = make(db, tmp_path, session=ClaudeSessionConfig(max_per_hour=3))
+    for i in range(3):
+        assert isinstance(h.runner.enqueue(f"q{i}", principal="justin"), Queued)
+    for _ in range(2):
+        refused = h.runner.enqueue("again", principal="justin")
+        assert refused == AskRefused(
+            "Claude is paused for runaway protection (3 messages this hour)."
+        )
+    await h.runner.idle()
+    (notice,) = h.channel.sent
+    assert notice[0] == "justin" and notice[2] is not None and notice[2].startswith("ask:runaway:")
+    assert notice[1].startswith(
+        "Claude brain paused for runaway protection (3 msgs/hr); answering locally until "
+    )
+    # next hour: asks again (the guard counts this clock hour only)
+    db.execute("UPDATE tasks SET created_at = '2020-01-01T00:00:00Z'")
+    db.commit()
+    assert isinstance(h.runner.enqueue("later", principal="justin"), Queued)
 
 
 def test_enqueue_refusals(db: sqlite3.Connection, tmp_path: Path) -> None:
@@ -794,8 +841,9 @@ async def test_tool_queues_for_the_calling_task(db: sqlite3.Connection, tmp_path
 async def test_tool_refusals(db: sqlite3.Connection, tmp_path: Path) -> None:
     missing = ask_tool.AskClaude(_tool_ctx(db, None))
     assert await missing({"question": "q"}) == {"queued": False, "text": ask_tool.NOT_RUNNING}
-    h = make(db, tmp_path, cfg={"daily_cap": 0})
+    h = make(db, tmp_path, cfg={"daily_cap": 1})
     tool = ask_tool.AskClaude(_tool_ctx(db, h.runner))
+    assert (await tool({"question": "q"}))["queued"] is True
     out = await tool({"question": "q"})
     assert out["queued"] is False and "daily cap" in out["text"]
     from resonant.executor import ToolFailed

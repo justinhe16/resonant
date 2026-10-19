@@ -46,6 +46,7 @@ from resonant.monitor import EXT_CHECK_PREFIX, health_snapshot
 from resonant.store import approvals, pulse, questions, repos, runs, trust
 from resonant.store import extensions as ext_store
 from resonant.store import tasks as task_store
+from resonant.store.claude_brain import status_of as claude_status
 from resonant.store.db import kv_get, utcnow
 from resonant.store.extensions import ExtensionStatus
 from resonant.store.pulse import Urgency
@@ -201,6 +202,15 @@ class Runner(_Model):
     missing: list[str] | None = _local()  # what to set up, in words
 
 
+class ClaudeBrain(_Model):
+    """BR-11: the Claude brain's session (local tier only, like the rest of the claude
+    details): up or down, its turns, and its Remote Control link while one is on."""
+
+    state: Literal["up", "down"]
+    turns: int
+    remote_url: str | None = _local()
+
+
 class TrustRule(_Model):
     n: int  # the rule's id, as ``/trust`` lists it
     text: str
@@ -245,6 +255,7 @@ class Snapshot(_Model):
     runner: Runner
     trust_rules: list[TrustRule] | None = _local()
     repos: list[RepoItem] | None = _local()
+    claude_brain: ClaudeBrain | None = _local()  # BR-11; None before its first start
 
 
 # --- tiers --------------------------------------------------------------------------------
@@ -512,6 +523,23 @@ def build_snapshot(
         repos=[
             RepoItem(name=r.name, mode=r.mode, base=r.base, ci=r.ci) for r in repos.list_all(conn)
         ],
+        claude_brain=_claude_brain(conn),
+    )
+
+
+_RC_URL = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]{1,200}")
+
+
+def _claude_brain(conn: sqlite3.Connection) -> ClaudeBrain | None:
+    found = claude_status(conn)
+    if found is None:
+        return None
+    url = found.get("remote_url")
+    up = found.get("state") == "up"
+    return ClaudeBrain(
+        state="up" if up else "down",
+        turns=int(found.get("turns") or 0),
+        remote_url=url if up and isinstance(url, str) and _RC_URL.fullmatch(url) else None,
     )
 
 

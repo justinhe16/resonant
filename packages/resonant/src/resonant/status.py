@@ -11,6 +11,7 @@ from resonant.config import Settings
 from resonant.monitor import health_snapshot
 from resonant.store import approvals, runs
 from resonant.store import tasks as repo
+from resonant.store.claude_brain import status_of as claude_status
 from resonant.store.db import iso, kv_get, utcnow
 
 
@@ -37,4 +38,6 @@ def collect_status(
         "inflight": inflight,
         "runs": dict(runs.count_by_status(conn)),
         "health": health_snapshot(conn),
+        # BR-11: the Claude brain's session (None until it first starts)
+        "claude_brain": claude_status(conn),
     }

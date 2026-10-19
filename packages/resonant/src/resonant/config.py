@@ -622,7 +622,10 @@ class AskClaudeConfig(_Section):
 
     enabled: bool = True
     concurrency: int = Field(default=1, ge=1, le=4)  # sessions at once
-    daily_cap: int = Field(default=30, ge=0, le=500)  # asks a day (settings.timezone)
+    # Messages to Claude a day (settings.timezone): Claude brain turns, one-shot asks, media
+    # and watch checks alike. 0 (the default): no daily cap; ``claude_session.max_per_hour``
+    # is the runaway guard. Hit: the owner hears it once that day and qwen answers.
+    daily_cap: int = Field(default=0, ge=0, le=5000)
     timeout_s: float = Field(default=120.0, gt=0, le=900)
     max_turns: int = Field(default=15, ge=1, le=50)
     reply_max_chars: int = Field(default=1500, ge=200, le=4000)
@@ -724,6 +727,30 @@ DEFAULT_READ_DENY: tuple[str, ...] = (
 )
 
 
+class ClaudeSessionConfig(_Section):
+    """BR-11: the Claude brain, one long-lived ``claude`` session (``--input-format
+    stream-json``, stdin kept open) for the owner's hard texts (``runners/claude_session.py``).
+    Each hand-off is one user message into it; one turn at a time, the rest queue in order.
+    Off: every hand-off is its own one-shot ``claude -p`` (BR-10)."""
+
+    enabled: bool = True
+    # Ask the session for Remote Control when it starts (RC-1's control request); the URL
+    # shows on /status and the dashboard. Off by default.
+    remote_control: bool = False
+    # A backstop to Claude Code's own auto-compaction: a fresh session (primed from
+    # Resonant's history) after this many turns or hours, whichever comes first.
+    rotate_turns: int = Field(default=50, ge=1, le=1000)
+    rotate_hours: float = Field(default=12.0, gt=0, le=168)
+    # One turn's budget; past it the session is killed (a hang) and restarts on the next.
+    turn_timeout_s: float = Field(default=240.0, gt=0, le=900)
+    # Hard texts waiting behind the one in flight; past it the owner is told it's busy.
+    queue_max: int = Field(default=3, ge=0, le=20)
+    # Runaway guard: messages to Claude per clock hour (the brain, one-shot asks, media and
+    # watch checks); past it the owner hears it once and qwen answers until the next hour.
+    # 0: off.
+    max_per_hour: int = Field(default=60, ge=0, le=1000)
+
+
 class TriageConfig(_Section):
     """BR-10: the local model's first call on a chat turn decides who answers it.
 
@@ -785,6 +812,8 @@ class BrainConfig(_Section):
     rg_path: Path | None = Path("/opt/homebrew/bin/rg")
     # ask_claude (BR-5, docs/brain-plan.md D8): reads the same roots and deny list.
     ask_claude: AskClaudeConfig = Field(default_factory=AskClaudeConfig)
+    # BR-11: the Claude brain (one persistent session for the owner's hard texts).
+    claude_session: ClaudeSessionConfig = Field(default_factory=ClaudeSessionConfig)
     # BR-7 (D10). Voice notes: a local whisper binary (whisper.cpp's ``whisper-cli``, by
     # absolute path). Unset: a voice note gets "voice needs whisper" (Claude takes no audio).
     whisper_path: Path | None = None

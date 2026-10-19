@@ -84,16 +84,33 @@ def insert_task(conn: sqlite3.Connection, spec: NewTask) -> str:
     return task_id
 
 
-def note_claude_reply(conn: sqlite3.Connection, task_id: str, reply: str) -> bool:
+def note_claude_reply(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reply: str,
+    *,
+    session: bool = False,
+    hops: int | None = None,
+) -> bool:
     """BR-10: Claude's answer to a turn the brain handed over, kept on that (finished) brain
     task's checkpoint as ``claude_reply`` so the history shows it. A task still running is
-    left alone (its own save would overwrite it). True when it was written."""
+    left alone (its own save would overwrite it). True when it was written. ``session``
+    (BR-11): it came from the Claude brain, whose turn was tainted ``hops`` turns from
+    outside content (``claude_hops``; None: clean)."""
     with atomic(conn):
-        cur = conn.execute(
-            "UPDATE tasks SET checkpoint = json_set(COALESCE(checkpoint, '{}'), "
-            "'$.claude_reply', ?) WHERE id = ? AND status IN ('done', 'failed', 'cancelled')",
-            (reply, task_id),
-        )
+        if session:
+            cur = conn.execute(
+                "UPDATE tasks SET checkpoint = json_set(COALESCE(checkpoint, '{}'), "
+                "'$.claude_reply', ?, '$.claude_session', json('true'), '$.claude_hops', ?) "
+                "WHERE id = ? AND status IN ('done', 'failed', 'cancelled')",
+                (reply, hops, task_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET checkpoint = json_set(COALESCE(checkpoint, '{}'), "
+                "'$.claude_reply', ?) WHERE id = ? AND status IN ('done', 'failed', 'cancelled')",
+                (reply, task_id),
+            )
     return cur.rowcount == 1
 
 

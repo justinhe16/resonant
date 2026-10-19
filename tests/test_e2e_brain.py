@@ -31,6 +31,7 @@ from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.e2e.fakes import DEFAULT_FINAL_REPLY, Scripted
 from resonant.gateway.imessage.fixtures import FakeChatDB
+from resonant.loop.types import NewTask
 from resonant.models import ModelOutputError, ModelUnavailableError
 from resonant.runners.ask import AskRunner, AskScope
 from resonant.runners.brain import (
@@ -48,7 +49,8 @@ from resonant.runners.watch import WatchRunner
 from resonant.secrets import CLAUDE_TOKEN_REF, FakeKeychain, SecretStore
 from resonant.store import brain as brain_store
 from resonant.store import repos as repo_store
-from resonant.store.db import iso, kv_set, utcnow
+from resonant.store import tasks as task_store
+from resonant.store.db import atomic, iso, kv_set, utcnow
 from resonant.tools import notes as notes_tools
 
 OWNER_PHONE = "+15551234567"
@@ -147,9 +149,14 @@ async def start(
     mode: str = "loop",
     ask_args: Sequence[str] = (),
     brain: dict[str, Any] | None = None,
+    full_cap: bool | str = False,
     **overrides: Any,
 ) -> AsyncGenerator[Brain]:
+    """``full_cap``: Claude is out of reach, at its daily cap (1, already used today);
+    ``"told"``: and the owner already heard about it today."""
     (home / "principals.yaml").write_text(PRINCIPALS)
+    if full_cap:
+        ask = {**(ask or {}), "daily_cap": 1}
     code = tmp_path / "code"
     code.mkdir(exist_ok=True)
     settings = load_settings(
@@ -167,6 +174,11 @@ async def start(
     daemon = Daemon(settings, model=model, osa_runner=osa)
     kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
     kv_set(daemon.conn, "autonomy", "on")
+    if full_cap:  # today's one ask, already answered
+        with atomic(daemon.conn):
+            used = task_store.insert_task(daemon.conn, NewTask(kind="ask", runner="ask", priority=1,
+                                                               principal="justin"))  # fmt: skip
+            daemon.conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (used,))
     assert daemon.imessage is not None and daemon.state.components is not None
     assert daemon.imessage.brain is not None
     assert daemon.imessage.brain.runner_gaps is not None  # the daemon wires the runner check
@@ -192,6 +204,9 @@ async def start(
     )
     daemon.state.components.runners[asks.name] = asks
     daemon.loop.runners[asks.name] = asks
+    if full_cap == "told":
+        day = utcnow().astimezone(asks.tz).date().isoformat()
+        asks._noticed.add(f"ask:cap:{day}")  # pyright: ignore[reportPrivateUsage]
     watcher = daemon.state.components.runners.get("watch")
     if isinstance(watcher, WatchRunner):  # ask watches' answers (BR-7), as wiring does
         asks.on_watch = watcher.ask_answered
@@ -481,12 +496,13 @@ async def test_at_the_daily_cap_bad_output_falls_back_to_intents(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     script: list[Scripted] = [ModelOutputError("bad"), ModelOutputError("bad")]
-    async with start(resonant_home, chat, tmp_path, script, ask={"daily_cap": 0}) as b:
-        assert await b.say("hmm?") == [DEFAULT_FINAL_REPLY]
+    async with start(resonant_home, chat, tmp_path, script, full_cap=True) as b:
+        notice = "Hit today's Claude cap (1); answering locally until midnight."
+        assert await b.say("hmm?", replies=2) == [notice, DEFAULT_FINAL_REPLY]
         assert b.model.calls["label"] == 1 and b.model.calls["answer"] == 1
         (task,) = b.brain_tasks()
         assert b.result(task)["brain_fallback"] is True
-        assert b.rows("SELECT 1 FROM tasks WHERE runner = 'ask'") == []
+        assert len(b.rows("SELECT 1 FROM tasks WHERE runner = 'ask'")) == 1  # the used one
 
 
 # --- D1/D7: fallback, progress, the prefix and the fold -----------------------------------
@@ -619,7 +635,7 @@ async def test_the_corrective_round_is_once_per_task(
     """BR-10: a second claim goes to Claude; only when Claude can't take it (here the daily
     cap) does it go out as is."""
     script: list[Scripted] = ["I've saved that.", "I've saved that, really."]
-    async with start(resonant_home, chat, tmp_path, script, ask={"daily_cap": 0}) as b:
+    async with start(resonant_home, chat, tmp_path, script, full_cap="told") as b:
         assert await b.say("remember my standup is at 9:30") == ["I've saved that, really."]
         assert len(b.model.requests) == 2
 
@@ -848,8 +864,7 @@ async def test_newest_ones_follow_up_no_guessed_identifiers(
     own = {"repo_path": str(tmp_path / "code" / "resonant")}
     # Claude out of reach: BR-10 would hand the second lookup guard to it, and this test needs
     # the old wrong answer in the history.
-    cap = {"daily_cap": 0}
-    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own, ask=cap) as b:
+    async with start(resonant_home, chat, tmp_path, seed=seed, ops=own, full_cap="told") as b:
         b.model.push("PR #1 from Oct 8 is the latest.", "PR #1 from Oct 8 is the latest.")
         assert await b.say("Most recent PRs?") == ["PR #1 from Oct 8 is the latest."]
         b.model.push(
@@ -873,7 +888,7 @@ async def test_a_lookup_round_doesnt_use_up_the_claim_check(
     """Review of BR-9: the lookup and claim corrective rounds are separate, so a claim made
     after a lookup round is still checked (with Claude out of reach: else BR-10 hands the
     second guard to it)."""
-    async with start(resonant_home, chat, tmp_path, ask={"daily_cap": 0}) as b:
+    async with start(resonant_home, chat, tmp_path, full_cap="told") as b:
         b.model.push("Nothing new.", "Done, merged the newest PR.", "I can't merge from here.")
         assert await b.say("any newest PRs to merge?") == ["I can't merge from here."]
         kinds = [r.messages[-1]["content"] for r in b.model.requests[1:]]

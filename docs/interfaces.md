@@ -1481,18 +1481,26 @@ runner.last_killed                                # runs the last kill switch en
 # channel_ref and trace get the answer, and its id is recorded; with no task, the owner)
 ask_claude{question: str (1..4000), kind?: "general"|"research"|"email"|"calendar"|"image"|"link",
            attachments?: [abs path] (<= 4)}
-  -> {"queued": true, "task_id", "kind", "text": "Looking into it…"}
-   | {"queued": false, "text": <code-built why>}          # off, paused, usage limit, daily cap, bad attachment
+  -> {"queued": true, "task_id", "kind", "text": "Looking into it…", "session"?: true, "after"?: str}
+   | {"queued": false, "text": <code-built why>, "busy"?: true}   # off, paused, usage limit, caps,
+                                                                    # bad attachment; busy: BR-11 queue full
 # ToolFailed: unknown keys, an empty or long question, a bad kind, attachments not a list of <= 4 strings
 
 AskRunner(conn, *, cfg: AskClaudeConfig, scope: AskScope, ask_root, channel, secrets, owner, guard="off",
-          timezone="UTC", create_task=None, claude_cmd=None, home=None, login_check=None, ...)
-  .name == "ask"; .uses_claude_slot == False; .max_step_s == timeout_s + 60
+          timezone="UTC", create_task=None, claude_cmd=None, home=None, login_check=None,
+          tools=None, session: ClaudeSessionConfig | None = None, ...)
+  .name == "ask"; .uses_claude_slot == False
+  .max_step_s == max(timeout_s, 2 * claude_session.turn_timeout_s when the brain is on) + 60
   .enqueue(question, *, kind="general", attachments=(), principal, requested_by=None,
-           channel_ref=None, trace_id=None, watch=None, tools=False, tainted=False)
-    -> Queued(task_id, text) | AskRefused(text)          # tools, tainted: BR-10, set by code
+           channel_ref=None, trace_id=None, watch=None, tools=False, tainted=False,
+           taint_hops=None)
+    -> Queued(task_id, text, session=False, after=None) | AskRefused(text, busy=False)
+       # tools, tainted (BR-10) and taint_hops (BR-11) are set by code; session/after/busy: BR-11
   .limited_until() -> datetime | None        # kv brain.ask_claude.limited_until
   .asked_today() -> int                       # ask tasks since local midnight
+  .asked_this_hour() -> int                   # BR-11: since the start of this clock hour
+  .brain: ClaudeSession | None                # BR-11, below
+  .idle(); .aclose()                          # background notes/notices; shutdown (the session)
 # pure helpers: toolset(cfg, kind) -> Toolset(allowed, required, blocked); check_init(tools, ts, kind);
 # is_write_tool(name); is_draft_tool(name); ask_argv(head, cfg=, scope=, kind=, api_billing=);
 # answer_text(text, red, limit); check_attachment(raw, scope.attach()) -> (real path | None, why | None)
@@ -1503,10 +1511,44 @@ AskRunner(conn, *, cfg: AskClaudeConfig, scope: AskScope, ask_root, channel, sec
 - **Argv** (question on stdin): `claude -p --restricted --tools Read,Grep,Glob,WebSearch,WebFetch --permission-mode dontAsk --allowedTools <built-ins + kind's connector reads [+ draft tools]> --disallowedTools <connector writes by name> --settings <Read() deny rules, below> --add-dir <root>… --no-session-persistence --output-format stream-json --verbose --max-turns 15 --append-system-prompt <ASK_PROMPT> [--max-budget-usd N on the API key]`. A brain ask with tools (BR-10) adds `--mcp-config <file> --strict-mcp-config`, `mcp__resonant__<name>` per tool in `--allowedTools` and `TOOLS_PROMPT` for `ASK_PROMPT`; Claude's own tools are the same. cwd: an empty `<RESONANT_HOME>/ask/<task id>` with the attachments copied in as `attachment-<n><ext>`, removed after. Env: built from nothing (`claude_auth.status_env`) plus one credential (token, else key, else none: the owner's login, guard off only) and `RESONANT_RUN=ask-<task id>`.
 - **Allowlist.** Only `email` and `calendar` asks get connector tools: `brain.ask_claude.connector_tools[kind]` (every one required in the init event) and, for email, `draft_tools` (allowed, never required). Config names must look like `mcp__<server>__<snake_case>` (refused at load otherwise). A name whose own part (after `__`, split at `_`, `-` and camelCase humps) has a write word or stem (send, create, update, delete, remove, respond, reply, forward, modify, trash, archive, label, draft, …; `sendmessage` too) is never allowed and is denied by name; a draft tool is allowed only when its own name is exactly `create_draft` or `drafts`. A draft is the one write an email ask can make (the D8 design): an email Claude reads could steer what goes into a draft, never a send.
 - **Init check.** The `system/init` event's `tools` must contain every required tool, else the process group is killed and the reply is `Not done: Calendar isn't reachable from Claude's read-only mode (missing list_events, …). …` (or `Claude's read tools are missing (…)` for a built-in).
-- **Limits.** `brain.ask_claude.concurrency` sessions (busy: `Wait("usage_reset", +5 s)`), `daily_cap` at enqueue, `timeout_s` then the group is reaped (`reaper.reap`, also on `/kill`, polled each 0.25 s, and on task cancel). A usage limit sets kv `brain.ask_claude.limited_until` (`runners.claude.wake_time`), tells the owner once (`Claude hit its usage limit; ask_claude is off until 3:05pm.`, dedupe `ask:limit:<iso>`), answers a member `Not done: Claude is at its usage limit; try again later.`, and refuses new asks until then.
+- **Limits.** `brain.ask_claude.concurrency` one-shot sessions (busy: `Wait("usage_reset", +5 s)`), `timeout_s` then the group is reaped (`reaper.reap`, also on `/kill`, polled each 0.25 s, and on task cancel). **Caps** (BR-11), checked at enqueue over every ask task: `daily_cap` (0, the default: none; refused `I've asked Claude N times today, the daily cap.`) and `claude_session.max_per_hour` (60; refused `Claude is paused for runaway protection (N messages this hour).`); the owner is texted once through the channel, in the background (`Hit today's Claude cap (N); answering locally until midnight.`, dedupe `ask:cap:<local date>`; `Claude brain paused for runaway protection (N msgs/hr); answering locally until 4:00pm.`, dedupe `ask:runaway:<hour iso>`; audit `ask.notice`). A usage limit sets kv `brain.ask_claude.limited_until` (`runners.claude.wake_time`) and `brain.ask_claude.limit_reset_known`, tells the owner once (`Hit the Claude usage limit; answering locally until it resets at 3:05pm.`, or `… until it resets.` when Claude gave no time; dedupe `ask:limit:<iso>`), answers a member `Not done: Claude is at its usage limit; try again later.`, and refuses new asks until then (the brain answers locally).
 - **Reply.** `Claude: ` + the final `result` text: NFKC, redacted (runner secrets; again after the character strip), control/bidi/zero-width and line-separator characters dropped (newlines kept, at most one blank line), approval-code look-alikes masked (`gate.codes.mask_codes`), clipped to `reply_max_chars` (1500) with `…`. Everything else is a code-built `Not done: …` / `Stopped: …` line. Audit: `ask.queued` (kind, attachment count), `ask.done` (status, kind, proposed, chars, cost, turns); never the question or answer text.
-- **Config** (`brain:`): the read tools' `read_roots` and `read_deny` (BR-2) are the ask's too, through `AskScope.from_settings(settings)`: roots `brain.read_roots` or `files.default_roots`, deny `DEFAULT_READ_DENY` + `brain.read_deny`, plus `files.resonant_secrets` always. `--add-dir` gets the real top-level roots (`ReadScope.top_roots`); the deny paths (as given and real) and globs become `Read(//<path>)`, `Read(//<path>/**)`, `Read(**/<glob>)`, `Read(**/<glob>/**)` in `--settings {"permissions":{"deny":[…]}}` (a JSON list: entries may hold spaces or commas). Attachments use `AskScope.attach()`: the roots plus `attachment_roots`, minus deny paths that contain an attachment root (`~/Library`). The ask's cwd is `<RESONANT_HOME>/ask/<task id>` (not `runner.work_dir`, which is always denied). `ask_claude: {enabled, resonant_tools true (BR-10), concurrency 1, daily_cap 30, timeout_s 120, max_turns 15, reply_max_chars 1500, max_budget_usd 1, connector_tools, draft_tools, attachment_roots [~/Library/Messages/Attachments]}`.
+- **Config** (`brain:`): the read tools' `read_roots` and `read_deny` (BR-2) are the ask's too, through `AskScope.from_settings(settings)`: roots `brain.read_roots` or `files.default_roots`, deny `DEFAULT_READ_DENY` + `brain.read_deny`, plus `files.resonant_secrets` always. `--add-dir` gets the real top-level roots (`ReadScope.top_roots`); the deny paths (as given and real) and globs become `Read(//<path>)`, `Read(//<path>/**)`, `Read(**/<glob>)`, `Read(**/<glob>/**)` in `--settings {"permissions":{"deny":[…]}}` (a JSON list: entries may hold spaces or commas). Attachments use `AskScope.attach()`: the roots plus `attachment_roots`, minus deny paths that contain an attachment root (`~/Library`). The ask's cwd is `<RESONANT_HOME>/ask/<task id>` (not `runner.work_dir`, which is always denied). `ask_claude: {enabled, resonant_tools true (BR-10), concurrency 1, daily_cap 0 (BR-11: none), timeout_s 120, max_turns 15, reply_max_chars 1500, max_budget_usd 1, connector_tools, draft_tools, attachment_roots [~/Library/Messages/Attachments]}`.
 - **Tests.** `tests/fakes/claude` with `--restricted` runs its ask mode (`--scenario answer|usage_limit|hang|escapee|error|maxturns|noresult`, `--connectors`, `--drop`, `--answer`, `--notes DIR`); `tests/test_ask_claude.py`.
+
+## The Claude brain: `resonant.runners.claude_session` (BR-11)
+
+```python
+ClaudeSession(conn, *, cfg: ClaudeSessionConfig, cwd: Path, server: McpServer, clock=utcnow,
+              poll_s=0.25, kill_grace_s=2.0, rc_timeout_s=15.0, end_wait_s=3.0)
+  .turn(*, argv: (session_id, resume) -> list[str], env, message, primer: () -> str,
+        observe, check_init, paused, may_retry: () -> bool, started=None) -> TurnOutcome
+  .busy -> bool                      # a turn holds .lock (one at a time)
+  .inherited_hops() -> int | None    # last turn's hops + 1 while < MAX_TAINT_HOPS, else None
+  .record(hops: int | None)          # this turn's taint hops (None: clean)
+  .stop(keep=True); .aclose()        # RC off, stdin closed, end_wait_s, group reaped
+TurnOutcome(status: "answered"|"crashed"|"timeout"|"killed"|"refused", result, refusal, fresh, retried)
+
+McpServer(*, python=sys.executable, idle_listing=None)    # runners/ask_tools.py
+  .start() -> Path (the MCP config; idempotent); .bind(tools); .unbind(tools); .aclose()
+ClaudeTools(..., server: McpServer | None = None)          # None: owns its own (one-shot)
+  .read_outside: bool   # outside content came in this session/turn (hop 0)
+  .changes: int         # change calls that reached the gate (a crash retry needs 0)
+
+session_argv(head, *, cfg, scope, api_billing, mcp, session_id, resume) -> list[str]   # runners/ask.py
+history.primer(conn, principal, *, before_event_id, limit=6) -> str                   # brain/history.py
+store.claude_brain: SESSION_KV = "brain.claude_session"; session_state(conn); status_of(conn)
+tools.ask.ASKING_HOPS: ContextVar[int | None]    # the asking brain turn's hops, set around its call
+store.tasks.note_claude_reply(conn, task_id, reply, *, session=False, hops=None)
+```
+
+- **Which asks.** `enqueue` marks `checkpoint.session` when the brain is on, `tools` (a brain hand-off with `resonant_tools`), the principal is the owner, the kind is `general`, `research` or `link`, there are no attachments and it isn't a watch. Everything else is the one-shot path above. Past `queue_max` unanswered session asks (the one in flight included in the count's head) → `AskRefused(BUSY, busy=True)`; with any ahead, `Queued.after` is `after "<first six words of the oldest>"[ and N more], then this` and the brain appends it to the ack in parentheses.
+- **Step.** A session ask waits (`Wait("usage_reset", +1 s)`) unless it is the oldest unanswered one (`status` queued/running/waiting, no `phase`, no `reply`, by rowid) and no turn is in flight. Then `_turn`: a `ClaudeTools` bound to the session's server (`tainted` from the asking turn, `taint("session", hops=…)` from `inherited_hops`), the message (`New text from the owner, through Resonant:` + the kind's hint + the text; the primer first in a new session), `check_init` against `toolset(cfg, "general")`, `may_retry` = no change reached the gate and nothing pending. Once written, the checkpoint gets `session_turn: true` (a daemon crash with a pinned call → `INTERRUPTED`). After: `record(hops)` with hops 0 if `read_outside`, else the asking turn's `taint_hops` (0 if unknown) or the inherited hops, else None; the checkpoint keeps `claude_hops` and `fresh`; the rest is BR-10's wrap-up (report lines, usage limit, a pending approval). Outcomes map to `Stopped: …` (killed), `Not done: Claude took over 4m; stopped.` (timeout), `Not done: Claude's session ended mid-answer[, after it had started a change, so it wasn't run again]; it restarts on your next text.` (crashed), the init refusal, or `classify(result)`.
+- **History.** `_note_answer` writes `claude_reply`, `claude_session: true` and `claude_hops` on the asking brain task; `Exchange.untrusted` counts that answer only when `claude_hops` is under `MAX_TAINT_HOPS` (one-shot answers always count). The brain's hand-off to a session turn doesn't call `_Turn.outside()` (its reply carries the turn's own taint), and `Answer.meta.claude_session` is set.
+- **kv `brain.claude_session`**: `{session_id, started_at, turns, written, pid?, created?, marker?, remote_url?, hops?}`. `written` once a `result` came back (resume allowed); emptied on a crash, a hang, an init refusal, a rotation or a lost resume (the next start is new and primed). Audit `brain.session_start` (session id prefix, pid), `brain.session_remote` (ok).
+- **Status.** `collect_status()["claude_brain"]` and `daemon_status` → `{state: up|down, turns, remote_url?}` (None before the first start); `/status` adds `Claude brain: up · N turns[ · Remote Control: <url>]`. Dashboard: `Snapshot.claude_brain: ClaudeBrain{state, turns, remote_url (local)}`, local tier only.
+- **Config** `brain.claude_session: {enabled true, remote_control false, rotate_turns 50 (1..1000), rotate_hours 12 (≤168), turn_timeout_s 240 (≤900), queue_max 3 (0..20), max_per_hour 60 (0 off)}`.
+- **Tests.** `tests/test_e2e_claude_session.py`; the fake is `e2e/fake_claude.py`'s session mode.
 
 ## Media, links, watches, notices (BR-7, docs/brain-plan.md D10, migration 016)
 
