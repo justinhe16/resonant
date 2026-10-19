@@ -5,11 +5,13 @@ The scheduler creates the task (``kind="job"``, ``wake_at`` = the due time, chec
 
 1. **Finished already** (``checkpoint.finished``): only (re)send the reports.
 2. **Pinned call.** ``job_<id> {due_at}`` with ``origin="scheduled"`` and the task's owner as
-   principal, keyed ``idempotency_key(task_id, 0, 0, intent.hash)``. ``executor.recorded``
-   first: succeeded is replayed, started is ambiguous (never re-run), failed is the
-   definite failure. So a crash anywhere runs the job at most once.
+   principal, keyed ``idempotency_key(task_id, 0, 0, intent.hash)``, through the shared tool
+   call path (TC-1, ``ToolCore``). ``ToolCore.recorded`` first: succeeded is replayed, started
+   is ambiguous (never re-run), failed is the definite failure. So a crash anywhere runs the
+   job at most once.
 3. **Paused** (kill switch): nothing runs; ``job.skipped_paused``.
-4. **Gate.** ``Allow``: ``executor.execute``. ``NeedsApproval``: ``prompt_approvers`` (as
+4. **Gate** (``ToolCore.call``). ``Allow``: the executor runs it. ``NeedsApproval``:
+   ``prompt_approvers`` (as
    the local runner: unreachable approvers skipped, none reachable fails, a transient error
    retries), then ``Wait("approval", wake_at=expires_at)``; an unanswered prompt expires
    and the next step gets ``Deny``. ``Deny``/``DryRun``: not run.
@@ -43,7 +45,7 @@ from datetime import datetime
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
-from resonant.executor import NotAllowedError, ToolResult, idempotency_key
+from resonant.executor import ToolResult
 from resonant.extensions.notify import take_baseline
 from resonant.extensions.scheduler import (
     JOB_RUNNER,
@@ -52,7 +54,7 @@ from resonant.extensions.scheduler import (
     persist_events,
     read_paused,
 )
-from resonant.gate import Allow, Decision, Deny, DryRun, Gate, Intent, NeedsApproval
+from resonant.gate import Decision, Deny, Gate, Intent, NeedsApproval
 from resonant.gate.codes import clean_external
 from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
@@ -63,6 +65,7 @@ from resonant.store import extensions as store
 from resonant.store.audit import audit
 from resonant.store.db import transaction, utcnow
 from resonant.store.tasks import save_progress
+from resonant.toolcore import Asked, CallScope, Refused, ToolCore
 from resonant.tools import ToolRegistry
 from resonant_sdk import Event
 from resonant_sdk.manifest import JOB_TIMEOUT_MAX_S
@@ -107,6 +110,16 @@ def failed_text(label: str, error: str | None) -> str:
     return f"{label} failed: {_clip(reason)}"
 
 
+def _refusal_reason(refused: Refused) -> str:
+    """The ``denied`` reason for a job's refusal: the gate's, ``approval already used`` (the
+    executor refused the token), else ``refused``."""
+    if refused.why == "not_allowed":
+        return APPROVAL_USED
+    if isinstance(refused.decision, Deny):
+        return refused.decision.reason
+    return "refused"
+
+
 class JobRunner:
     """``runner="job"``. ``recipients(ext)`` is the gate's approvers (owner first)."""
 
@@ -130,6 +143,7 @@ class JobRunner:
         self.gate = gate
         self.executor = executor
         self.registry = registry
+        self.core = ToolCore(conn, registry=registry, gate=gate, executor=executor)
         self.channel = channel
         self.recipients = recipients
         self.tz = ZoneInfo(timezone)
@@ -148,35 +162,31 @@ class JobRunner:
         spec = self.registry.get(ext, job_spec_name(job_id))
         if spec is None:
             return await self._done(task, ext, label, "failed", error="job is not installed")
-        intent = Intent.for_tool(
-            spec,
-            task_id=task.id,
-            principal=task.principal,
-            args={"due_at": due_at},
-            trace_id=task.trace_id,
-            origin="scheduled",
+        args: dict[str, Any] = {"due_at": due_at}
+        # Step 0, call 0: one key per task. No pin (nothing to resume but this same call),
+        # no spans of the tool path's own (``runner.job`` is this runner's).
+        scope = CallScope(
+            task.id, task.principal, task.trace_id, 0, 0, "scheduled", check_schema=False
         )
         with span(self.conn, "runner.job", trace_id=task.trace_id, task_id=task.id) as s:
-            key = idempotency_key(task.id, 0, 0, intent.hash)
-            result = self.executor.recorded(key)
+            result = self.core.recorded(spec, args, scope)
             s.set(recorded=result is not None)
             if result is None:
                 if read_paused(self.conn):
                     s.set(decision="paused")
                     return await self._done(task, ext, label, "skipped_paused")
-                decision = self.gate.evaluate(intent)
-                s.set(decision=type(decision).__name__)
-                if isinstance(decision, NeedsApproval):
-                    return await self._ask(task, decision)
-                if isinstance(decision, DryRun):
-                    return await self._done(task, ext, label, "dry_run")
-                if not isinstance(decision, Allow):
-                    reason = decision.reason if isinstance(decision, Deny) else "refused"
+                called = await self.core.call(spec, args, scope)
+                if called.decision is not None:
+                    s.set(decision=type(called.decision).__name__)
+                if isinstance(called, Asked):
+                    return await self._ask(task, called.decision)
+                if isinstance(called, Refused):
+                    if called.why == "dry_run":
+                        return await self._done(task, ext, label, "dry_run")
+                    reason = _refusal_reason(called)
                     return await self._done(task, ext, label, "denied", error=reason)
-                try:
-                    result = await self.executor.execute(intent, decision, step_no=0, call_index=0)
-                except NotAllowedError:
-                    return await self._done(task, ext, label, "denied", error=APPROVAL_USED)
+                assert called.result is not None  # unpinned: ran (ok, failed or ambiguous)
+                result = called.result
             outcome = _outcome(result)
             s.set(outcome=outcome)
         return await self._done(task, ext, label, outcome, result=result)

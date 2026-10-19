@@ -147,6 +147,7 @@ async def test_all_ok_first_round(env: Env) -> None:
         "imessage": "ok",
         "loop": "ok",
         "store": "ok",
+        "backup": "unknown",  # no backup_check wired here
     }
     assert snap["model"]["since"] == iso(T0)
     assert env.sent == []
@@ -162,7 +163,7 @@ async def test_all_ok_first_round(env: Env) -> None:
 
 async def test_health_unknown_without_monitor(db: sqlite3.Connection) -> None:
     snap = health_snapshot(db)
-    assert set(snap) == {"model", "imessage", "loop", "store"}
+    assert set(snap) == {"model", "imessage", "loop", "store", "backup"}
     assert all(s["state"] == "unknown" and s["since"] is None for s in snap.values())
 
 

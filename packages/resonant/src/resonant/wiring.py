@@ -87,8 +87,10 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from typing import Any
 
+from resonant.backup import health_check as backup_health
 from resonant.brain.facts import FactStore, facts_dir
 from resonant.components import Components
 from resonant.config import ModelConfig, Settings
@@ -251,9 +253,7 @@ def tool_access(components: Components, brain: BrainRunner, settings: Settings) 
         return [*core, *deferred]
 
     return ToolAccess(
-        gate=components.gate,
-        executor=components.executor,
-        registry=components.registry,
+        core=brain.core,  # the brain's ToolCore: the components' registry, gate and executor
         tools_for=tools_for,
         taints=taints,
         extensions=components.extensions,
@@ -506,6 +506,7 @@ def build_imessage_stack(
         daemon_healthy=daemon_healthy,
         db_path=settings.db_path,
         model_meta={"model": settings.model.name, "api": settings.model.api},
+        backup_check=partial(backup_health, conn, settings),
         ext_checks=(
             None
             if host is None

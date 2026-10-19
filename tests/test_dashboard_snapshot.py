@@ -374,7 +374,7 @@ def test_empty_db(db: sqlite3.Connection) -> None:
     data = s.model_dump(mode="json")
     assert data["schema"] == 1 and data["tier"] == "local"
     assert data["autonomy"] == "on" and data["paused"] is False and data["dry_run"] is True
-    assert [h["name"] for h in data["health"]] == ["model", "imessage", "loop", "store"]
+    assert [h["name"] for h in data["health"]] == ["model", "imessage", "loop", "store", "backup"]
     assert {h["state"] for h in data["health"]} == {"unknown"}
     assert all("reason" not in h for h in data["health"])
     assert data["tasks"] == {"by_state": {}}

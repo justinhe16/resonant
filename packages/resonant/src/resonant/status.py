@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 from resonant import __version__
+from resonant.backup import status_of as backup_status
 from resonant.config import Settings
 from resonant.monitor import health_snapshot
 from resonant.store import approvals, runs
@@ -40,4 +41,6 @@ def collect_status(
         "health": health_snapshot(conn),
         # BR-11: the Claude brain's session (None until it first starts)
         "claude_brain": claude_status(conn),
+        # BK-1: the last daily backup (``resonant.backup.status_of``)
+        "backup": backup_status(conn, now),
     }
