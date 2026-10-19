@@ -89,7 +89,8 @@ backup:
   keep_weekly: 4                        # plus the newest N Sunday copies
   alert_after_hours: 36                 # no good copy this long: the `backup` health check alerts once
   # extra_dir: /Volumes/Backup/resonant # optional second copy (another disk, an iCloud Drive folder);
-  #                                     #   must already exist, never created; Resonant never uploads
+  #                                     #   must already exist, never created; Resonant never uploads;
+  #                                     #   use a folder of its own (old copies there are pruned too)
 
 pulse:
   enabled: true                         # hourly "btw" messages and urgent interrupts

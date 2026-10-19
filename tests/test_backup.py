@@ -166,12 +166,47 @@ def test_a_stale_temp_file_from_a_crash_is_replaced(
     assert not (daily / ".resonant-2026-10-19.db.tmp").exists()
 
 
-def test_a_second_backup_at_once_is_refused(store: tuple[Settings, sqlite3.Connection]) -> None:
-    settings, _ = store
+def test_a_second_backup_at_once_is_skipped_not_failed(
+    store: tuple[Settings, sqlite3.Connection],
+) -> None:
+    settings, conn = store
     daily = settings.backups_dir / "daily"
-    backup.ensure_dir(daily)
-    with backup._locked(daily), pytest.raises(backup.BackupError, match="another backup"):  # pyright: ignore[reportPrivateUsage]
-        backup.make_copy(settings.db_path, daily, "resonant-2026-10-19.db")
+    locked = backup._locked(daily)  # pyright: ignore[reportPrivateUsage]
+    with locked, pytest.raises(backup.BackupBusy, match="another backup"):
+        backup.run_backup(conn, settings, now=T0)
+    assert kv_get(conn, backup.KV_LAST_ERROR) is None  # not a failure: no alert noise
+    assert (
+        conn.execute("SELECT COUNT(*) FROM audit_log WHERE action = 'backup.failed'").fetchone()[0]
+        == 0
+    )
+
+
+def test_a_prune_failure_keeps_the_good_backup(
+    store: tuple[Settings, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, conn = store
+
+    def broken(directory: Path, **_kw: int) -> list[Path]:
+        raise PermissionError("nope")
+
+    monkeypatch.setattr(backup, "prune", broken)
+    result = backup.run_backup(conn, settings, now=T0)
+    assert result.prune_error == "PermissionError: nope"
+    assert kv_get(conn, backup.KV_LAST_OK)["file"] == "resonant-2026-10-19.db"
+
+
+def test_an_unexpected_error_is_recorded(
+    store: tuple[Settings, sqlite3.Connection], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, conn = store
+
+    def boom(_now: datetime, _tz: str) -> date:
+        raise KeyError("tz")
+
+    monkeypatch.setattr(backup, "local_day", boom)
+    with pytest.raises(backup.BackupError, match="KeyError"):
+        backup.run_backup(conn, settings, now=T0)
+    assert "KeyError" in kv_get(conn, backup.KV_LAST_ERROR)["error"]
 
 
 # --- retention ---------------------------------------------------------------------------
@@ -459,8 +494,12 @@ def daemon(monkeypatch: pytest.MonkeyPatch, *, api: bool, loaded: bool) -> None:
     def is_loaded(_label: str) -> bool:
         return loaded
 
+    def pids() -> list[int]:
+        return []  # never the owner's real daemon on this machine
+
     monkeypatch.setattr(cli, "_fetch_status", fetch)
     monkeypatch.setattr(launchd, "is_loaded", is_loaded)
+    monkeypatch.setattr(cli, "_daemon_pids", pids)
 
 
 @pytest.fixture
@@ -523,6 +562,7 @@ def test_cli_restore_puts_the_backup_back_and_saves_the_old_store(
     r = CliRunner().invoke(app, ["backup", "restore", str(path), "--yes"])
     assert r.exit_code == 0, r.output
     assert "integrity ok" in r.output and "the old store was saved to" in r.output
+    assert "PAUSED" in r.output
     conn = open_db(settings.db_path)
     try:
         assert kv_get(conn, "marker") == "before"
@@ -556,6 +596,55 @@ def test_cli_restore_refuses_a_bad_file(home: Path, stopped: None) -> None:
     assert r.exit_code == 1 and "not a file" in r.output
     r = CliRunner().invoke(app, ["backup", "restore", str(settings.db_path), "--yes"])
     assert r.exit_code == 1 and "live store itself" in r.output
+    link = home / "hardlink.db"
+    os.link(settings.db_path, link)
+    r = CliRunner().invoke(app, ["backup", "restore", str(link), "--yes"])
+    assert r.exit_code == 1 and "live store itself" in r.output
+
+
+def test_restore_works_when_the_live_store_is_corrupt(home: Path, stopped: None) -> None:
+    settings = settings_for(home)
+    conn = open_db(settings.db_path)
+    with atomic(conn):
+        kv_set(conn, "marker", "good")
+    path = backup.run_backup(conn, settings, now=T0).path
+    conn.close()
+    calls = {"n": 0}
+
+    def check(c: sqlite3.Connection) -> str:
+        calls["n"] += 1  # verify_file, then the pre-restore copy of the "corrupt" live store
+        return "*** corrupt" if calls["n"] == 2 else backup.integrity_check(c)
+
+    saved = backup.restore(settings, path, now=T0, check=check)
+    assert saved is not None and saved.is_dir()  # raw files, not a checked copy
+    assert (saved / "resonant.db").is_file() and mode(saved / "resonant.db") == 0o600
+    conn = open_db(settings.db_path)
+    try:
+        assert kv_get(conn, "marker") == "good"
+        assert killswitch.is_paused(conn)  # comes up paused
+        assert kv_get(conn, backup.KV_ARMED) == iso(T0)
+    finally:
+        conn.close()
+
+
+def test_is_daemon_argv() -> None:
+    assert cli.is_daemon_argv(["python3.15", "resonant", "daemon", "run"])
+    assert cli.is_daemon_argv(["python", "-m", "resonant", "daemon", "run"])
+    assert not cli.is_daemon_argv(["resonant", "daemon", "install"])
+    assert not cli.is_daemon_argv(["resonant", "backup", "restore", "x.db"])
+
+
+def test_restore_refuses_a_foreground_daemon(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = settings_for(home)
+    open_db(settings.db_path).close()
+    daemon(monkeypatch, api=False, loaded=False)
+
+    def pids() -> list[int]:
+        return [4242]
+
+    monkeypatch.setattr(cli, "_daemon_pids", pids)
+    r = CliRunner().invoke(app, ["backup", "restore", str(home / "x.db"), "--yes"])
+    assert r.exit_code == 1 and "pid 4242" in r.output
 
 
 def test_cli_restore_asks_first(home: Path, stopped: None) -> None:

@@ -249,7 +249,39 @@ def _daemon_running(settings: Settings) -> str | None:
         return "the daemon is running (its API answers)"
     if launchd.is_loaded(launchd.DAEMON_LABEL):
         return f"the daemon's LaunchAgent ({launchd.DAEMON_LABEL}) is loaded"
+    if pids := _daemon_pids():
+        return f"a `resonant daemon run` process is running (pid {pids[0]})"
     return None
+
+
+def _daemon_pids() -> list[int]:
+    """Processes of this user running ``resonant daemon run`` (a foreground daemon, or one
+    whose API is hung), other than this one."""
+    import psutil
+
+    found: list[int] = []
+    me = os.getpid()
+    for proc in psutil.process_iter(["pid", "uids", "cmdline"]):
+        try:
+            info = proc.info
+            cmdline = cast(list[str], info.get("cmdline") or [])
+            argv = [os.path.basename(a) for a in cmdline]
+            uids = info.get("uids")
+        except (psutil.Error, OSError):
+            continue
+        if info.get("pid") == me or uids is None or uids.real != os.getuid():
+            continue
+        if is_daemon_argv(argv):
+            found.append(int(info["pid"]))
+    return found
+
+
+def is_daemon_argv(argv: list[str]) -> bool:
+    """``…/resonant daemon run`` or ``python -m resonant daemon run`` (basenames)."""
+    return any(
+        arg in ("resonant", "__main__.py") and argv[i + 1 : i + 3] == ["daemon", "run"]
+        for i, arg in enumerate(argv)
+    )
 
 
 def _size(n: int) -> str:
@@ -276,6 +308,9 @@ def backup_now() -> None:
         raise typer.Exit(1) from None
     try:
         result = backup.run_backup(conn, settings, actor=_CLI_ACTOR)
+    except backup.BackupBusy as e:
+        typer.echo(f"not now: {e}; try again in a minute", err=True)
+        raise typer.Exit(1) from None
     except backup.BackupError as e:
         typer.echo(f"backup FAILED: {e} (older copies kept)", err=True)
         raise typer.Exit(1) from None
@@ -284,6 +319,8 @@ def backup_now() -> None:
     typer.echo(f"backup ok: {result.path} ({_size(result.bytes)}, integrity ok, {result.ms} ms)")
     if result.pruned:
         typer.echo(f"pruned {len(result.pruned)}: {', '.join(result.pruned)}")
+    if result.prune_error is not None:
+        typer.echo(f"retention FAILED (the new copy is fine): {result.prune_error}", err=True)
     if result.extra is not None:
         typer.echo(f"extra copy: {result.extra}")
     elif result.extra_error is not None:
@@ -329,6 +366,7 @@ def _restore_steps(file: Path) -> list[str]:
         "   (the current store is copied to backups/pre-restore/ first)",
         "3. Start it again: resonant daemon install",
         "4. Check: resonant status (and scripts/bootstrap.sh --check)",
+        "5. It comes up paused: /resume (or resonant resume) when it looks right",
     ]
 
 
@@ -365,7 +403,8 @@ def backup_restore(
     typer.echo(f"restored {settings.db_path} from {file.name}")
     if version < latest_version():
         typer.echo(f"schema v{version}: the daemon migrates it on start")
-    typer.echo("next: resonant daemon install, then resonant status")
+    typer.echo("the restored store is PAUSED (kill switch on): its own state may be older")
+    typer.echo("next: resonant daemon install, resonant status, then /resume when it looks right")
 
 
 @app.command()

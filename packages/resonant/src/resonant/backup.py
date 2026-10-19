@@ -171,6 +171,11 @@ def prune(directory: Path, *, keep_daily: int, keep_weekly: int) -> list[Path]:
 # --- making a copy ---------------------------------------------------------------------
 
 
+class BackupBusy(BackupError):
+    """Another backup holds the lock (``resonant backup now`` at 03:30, or a run the
+    scheduler timed out whose thread is still copying). Not a failure: nothing is recorded."""
+
+
 def ensure_dir(path: Path) -> None:
     """Create ``path`` (and missing parents) 0700, and tighten it to 0700 if it exists."""
     path.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
@@ -179,12 +184,15 @@ def ensure_dir(path: Path) -> None:
 
 @contextlib.contextmanager
 def _locked(directory: Path) -> Generator[None]:
+    """One backup or restore at a time: ``flock`` on ``<directory>/.lock`` (the daily dir;
+    never in ``extra_dir``, which may be a synced folder)."""
+    ensure_dir(directory)
     fd = os.open(directory / LOCK_NAME, os.O_CREAT | os.O_RDWR, FILE_MODE)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise BackupError("another backup is running") from None
+            raise BackupBusy("another backup is running") from None
         yield
     finally:
         os.close(fd)
@@ -226,67 +234,67 @@ def make_copy(
     check: IntegrityCheck = integrity_check,
 ) -> Path:
     """Back ``db_path`` up to ``directory/name`` (see the module doc). Blocking: run it in a
-    thread. Raises :class:`BackupError` and leaves ``directory`` as it was on failure."""
-    ensure_dir(directory)
+    thread, under :func:`_locked`. Raises :class:`BackupError` and leaves ``directory`` as it
+    was on failure."""
     final = directory / name
     tmp = directory / f".{name}.tmp"
-    with _locked(directory):
+    try:
+        ensure_dir(directory)
         _new_temp(tmp)
+        src = _source(db_path)
         try:
-            src = _source(db_path)
+            dst = sqlite3.connect(tmp, isolation_level=None)
             try:
-                dst = sqlite3.connect(tmp, isolation_level=None)
-                try:
-                    src.backup(dst)  # pages=-1: the whole database in one consistent step
-                    dst.execute("PRAGMA journal_mode=DELETE")
-                    result = check(dst)
-                finally:
-                    dst.close()
+                src.backup(dst)  # pages=-1: the whole database in one consistent step
+                dst.execute("PRAGMA journal_mode=DELETE")
+                result = check(dst)
             finally:
-                src.close()
-            if result != "ok":
-                raise BackupError(f"integrity check failed: {result}")
-            os.chmod(tmp, FILE_MODE)
-            _fsync(tmp)
-            os.replace(tmp, final)
-            _fsync(directory)
-        except BackupError:
-            _cleanup(tmp)
-            raise
-        except (sqlite3.Error, OSError) as e:
-            _cleanup(tmp)
-            raise BackupError(f"{type(e).__name__}: {e}") from e
+                dst.close()
+        finally:
+            src.close()
+        if result != "ok":
+            raise BackupError(f"integrity check failed: {result}")
+        os.chmod(tmp, FILE_MODE)
+        _fsync(tmp)
+        os.replace(tmp, final)
+        _fsync(directory)
+    except BackupError:
+        _cleanup(tmp)
+        raise
+    except (sqlite3.Error, OSError) as e:
+        _cleanup(tmp)
+        raise BackupError(f"{type(e).__name__}: {e}") from e
     return final
 
 
 def copy_verified(path: Path, directory: Path, *, check: IntegrityCheck = integrity_check) -> Path:
     """Copy a finished backup file into an existing ``directory`` (``backup.extra_dir``):
-    temp name, integrity check of the copy, rename, 0600."""
+    temp name, integrity check of the copy, rename, 0600. Called under the daily dir's lock,
+    so the finished file can't be replaced while it is read."""
     if not directory.is_dir():
         raise BackupError("extra_dir does not exist (disk not mounted?)")
     final = directory / path.name
     tmp = directory / f".{path.name}.tmp"
-    with _locked(directory):
+    try:
         _new_temp(tmp)
+        shutil.copyfile(path, tmp)
+        os.chmod(tmp, FILE_MODE)
+        conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
         try:
-            shutil.copyfile(path, tmp)
-            os.chmod(tmp, FILE_MODE)
-            conn = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
-            try:
-                result = check(conn)
-            finally:
-                conn.close()
-            if result != "ok":
-                raise BackupError(f"integrity check of the extra copy failed: {result}")
-            _fsync(tmp)
-            os.replace(tmp, final)
-            _fsync(directory)
-        except BackupError:
-            _cleanup(tmp)
-            raise
-        except (sqlite3.Error, OSError) as e:
-            _cleanup(tmp)
-            raise BackupError(f"{type(e).__name__}: {e}") from e
+            result = check(conn)
+        finally:
+            conn.close()
+        if result != "ok":
+            raise BackupError(f"integrity check of the extra copy failed: {result}")
+        _fsync(tmp)
+        os.replace(tmp, final)
+        _fsync(directory)
+    except BackupError:
+        _cleanup(tmp)
+        raise
+    except (sqlite3.Error, OSError) as e:
+        _cleanup(tmp)
+        raise BackupError(f"{type(e).__name__}: {e}") from e
     return final
 
 
@@ -301,6 +309,7 @@ class BackupResult:
     pruned: tuple[str, ...]
     extra: Path | None = None
     extra_error: str | None = None
+    prune_error: str | None = None  # retention failed; the new copy is still good
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -310,6 +319,7 @@ class BackupResult:
             "pruned": list(self.pruned),
             "extra": self.extra is not None,
             "extra_error": self.extra_error,
+            "prune_error": self.prune_error,
         }
 
 
@@ -317,28 +327,54 @@ def _clip(text: str) -> str:
     return text if len(text) <= ERROR_MAX else text[: ERROR_MAX - 3] + "..."
 
 
+def _describe(e: BaseException) -> str:
+    """A short, code-built error: a BackupError's own text, else ``<Type>: <message>``."""
+    return _clip(str(e) if isinstance(e, BackupError) else f"{type(e).__name__}: {e}")
+
+
+def _prune(directory: Path, keep: dict[str, int]) -> tuple[list[str], str | None]:
+    try:
+        return [p.name for p in prune(directory, **keep)], None
+    except OSError as e:
+        return [], _describe(e)
+
+
 def create_backup(
     settings: Settings, *, now: datetime, check: IntegrityCheck = integrity_check
 ) -> BackupResult:
-    """The file work of one run (blocking): today's copy, retention, the extra copy.
-    Writes nothing to the store; :func:`record` does."""
+    """The file work of one run (blocking): today's copy, retention, the extra copy, all
+    under the daily dir's lock. Writes nothing to the store; :func:`record` does. Raises
+    :class:`BackupBusy` when another run holds the lock, :class:`BackupError` otherwise;
+    only the main copy failing fails the run."""
     cfg = settings.backup
     start = time.monotonic()
-    name = backup_name(local_day(now, settings.timezone))
-    ensure_dir(settings.backups_dir)
-    path = make_copy(settings.db_path, daily_dir(settings), name, check=check)
-    keep = {"keep_daily": cfg.keep_daily, "keep_weekly": cfg.keep_weekly}
-    pruned = [p.name for p in prune(daily_dir(settings), **keep)]
-    extra: Path | None = None
-    extra_error: str | None = None
-    if cfg.extra_dir is not None:
+    daily = daily_dir(settings)
+    try:
+        name = backup_name(local_day(now, settings.timezone))
+        ensure_dir(settings.backups_dir)
+        ensure_dir(daily)
+    except (OSError, ValueError) as e:
+        raise BackupError(_describe(e)) from e
+    with _locked(daily):
+        path = make_copy(settings.db_path, daily, name, check=check)
+        keep = {"keep_daily": cfg.keep_daily, "keep_weekly": cfg.keep_weekly}
+        pruned, prune_error = _prune(daily, keep)
+        extra: Path | None = None
+        extra_error: str | None = None
+        if cfg.extra_dir is not None:
+            try:
+                extra = copy_verified(path, cfg.extra_dir, check=check)
+            except BackupError as e:
+                extra_error = _describe(e)
+            else:
+                _, extra_prune_error = _prune(cfg.extra_dir, keep)
+                prune_error = prune_error or extra_prune_error
         try:
-            extra = copy_verified(path, cfg.extra_dir, check=check)
-            prune(cfg.extra_dir, **keep)
-        except (BackupError, OSError) as e:
-            extra_error = _clip(str(e) if isinstance(e, BackupError) else type(e).__name__)
+            size = path.stat().st_size
+        except OSError:
+            size = 0
     ms = int((time.monotonic() - start) * 1000)
-    return BackupResult(path, path.stat().st_size, ms, tuple(pruned), extra, extra_error)
+    return BackupResult(path, size, ms, tuple(pruned), extra, extra_error, prune_error)
 
 
 def record(
@@ -369,6 +405,7 @@ def record(
             bytes=result.bytes,
             ms=result.ms,
             pruned=len(result.pruned),
+            prune_error=result.prune_error,
         )
         if result.extra is not None:
             kv_set(conn, KV_EXTRA_OK, {"at": iso(now), "file": result.extra.name})
@@ -386,20 +423,27 @@ def run_backup(
     check: IntegrityCheck = integrity_check,
     actor: str = "core/backup",
 ) -> BackupResult:
-    """One blocking backup with its kv and audit rows (``resonant backup now``)."""
+    """One blocking backup with its kv and audit rows (``resonant backup now``). A failure
+    of any kind is recorded and raised as :class:`BackupError`; :class:`BackupBusy` is
+    raised without recording anything."""
     at = now or utcnow()
     try:
         result = create_backup(settings, now=at, check=check)
-    except BackupError as e:
-        record(conn, now=at, error=str(e), actor=actor)
+    except BackupBusy:
         raise
+    except Exception as e:
+        record(conn, now=at, error=_describe(e), actor=actor)
+        if isinstance(e, BackupError):
+            raise
+        raise BackupError(_describe(e)) from e
     record(conn, now=at, result=result, actor=actor)
     return result
 
 
 def arm(conn: sqlite3.Connection, cfg: BackupConfig, now: datetime) -> None:
     """Note when backups were enabled (the 36h clock before the first copy). Cleared while
-    disabled, so turning them back on doesn't alert at once for the time they were off."""
+    disabled, so turning them back on doesn't alert at once for the time they were off.
+    Read at daemon start: changing ``backup.*`` needs a restart, like other config."""
     with atomic(conn):
         if not cfg.enabled:
             conn.execute("DELETE FROM kv WHERE key = ?", (KV_ARMED,))
@@ -430,9 +474,11 @@ def backup_job(
         now = clock()
         try:
             result = await asyncio.to_thread(create_backup, settings, now=now, check=check)
-        except BackupError as e:
-            record(conn, now=now, error=str(e))
-            raise
+        except BackupBusy:
+            return {"skipped": "another backup is running"}
+        except Exception as e:
+            record(conn, now=now, error=_describe(e))
+            raise BackupError(_describe(e)) from e
         record(conn, now=now, result=result)
         return result.as_dict()
 
@@ -542,6 +588,26 @@ def verify_file(path: Path, *, check: IntegrityCheck = integrity_check) -> int:
     return version
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _raw_save(db_path: Path, directory: Path) -> Path:
+    """The pre-restore save when the live store can't be backed up (it is corrupt, which
+    is when a restore is needed): the file and its ``-wal``/``-shm`` copied as they are."""
+    ensure_dir(directory)
+    for suffix in ("", "-wal", "-shm"):
+        src = db_path.with_name(db_path.name + suffix)
+        if src.is_file():
+            dst = directory / src.name
+            shutil.copyfile(src, dst)
+            os.chmod(dst, FILE_MODE)
+    return directory
+
+
 def restore(
     settings: Settings,
     path: Path,
@@ -550,45 +616,59 @@ def restore(
     check: IntegrityCheck = integrity_check,
 ) -> Path | None:
     """Replace the store's contents with ``path`` (the daemon must be stopped; the CLI
-    checks). The current store is first copied to ``backups/pre-restore/`` (returned; None
-    when there was no store). The copy goes through SQLite's backup API into the live file,
-    so its WAL and shared-memory files stay consistent."""
+    checks). The current store is first saved to ``backups/pre-restore/`` (returned; None
+    when there was no store): a checked backup, or, when the live store is too damaged for
+    one, its raw files in ``pre-restore/resonant-<stamp>/``. The copy goes through SQLite's
+    backup API into the live file, so its WAL and shared-memory files stay consistent.
+    The restored store comes up **paused** (the copy's kill-switch state may predate the
+    owner's last ``/kill``) and with a fresh ``backup.armed_at``."""
     at = now or utcnow()
-    if settings.db_path.exists() and path.resolve() == settings.db_path.resolve():
+    db = settings.db_path
+    live = [db.with_name(db.name + s) for s in ("", "-wal", "-shm")]
+    if any(_same_file(path, p) for p in live):
         raise BackupError("that is the live store itself")
     verify_file(path, check=check)
-    saved: Path | None = None
-    if settings.db_path.is_file():
-        ensure_dir(settings.backups_dir)
-        stamp = at.astimezone(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d-%H%M%S")
-        saved = make_copy(
-            settings.db_path, pre_restore_dir(settings), f"resonant-{stamp}.db", check=check
-        )
+    from resonant import killswitch
     from resonant.store.db import connect
 
-    try:
-        src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        try:
-            dst = connect(settings.db_path)
+    saved: Path | None = None
+    with _locked(daily_dir(settings)):
+        if db.is_file():
+            stamp = at.astimezone(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d-%H%M%S")
+            pre = pre_restore_dir(settings)
             try:
-                src.backup(dst)
-                result = check(dst)
-                if result != "ok":
-                    raise BackupError(f"integrity check after restore failed: {result}")
-                with atomic(dst):
-                    audit(dst, "backup.restored", requested_by="owner:cli", file=path.name)
+                saved = make_copy(db, pre, f"resonant-{stamp}.db", check=check)
+            except BackupError:
+                try:
+                    saved = _raw_save(db, pre / f"resonant-{stamp}")
+                except OSError as e:
+                    raise BackupError(f"could not save the current store: {_describe(e)}") from e
+        try:
+            src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                dst = connect(db)
+                try:
+                    src.backup(dst)
+                    result = check(dst)
+                    if result != "ok":
+                        raise BackupError(f"integrity check after restore failed: {result}")
+                    with atomic(dst):
+                        audit(dst, "backup.restored", requested_by="owner:cli", file=path.name)
+                        kv_set(dst, KV_ARMED, iso(at))
+                    killswitch.engage(dst, actor="owner:cli", reason="backup restored")
+                finally:
+                    dst.close()
             finally:
-                dst.close()
-        finally:
-            src.close()
-    except sqlite3.Error as e:
-        raise BackupError(f"restore failed ({type(e).__name__}: {e})") from e
+                src.close()
+        except sqlite3.Error as e:
+            raise BackupError(f"restore failed ({type(e).__name__}: {e})") from e
     return saved
 
 
 __all__ = [
     "CATCHUP",
     "JOB_ID",
+    "BackupBusy",
     "BackupError",
     "BackupResult",
     "backup_job",

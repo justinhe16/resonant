@@ -44,7 +44,7 @@ FileVault disables auto-login. After a power loss or a crash reboot, the Mini wa
 
 The daemon backs `~/.resonant/resonant.db` up every day at 03:30 (`backup.daily_at`, your timezone) to `~/.resonant/backups/daily/resonant-YYYY-MM-DD.db`. It keeps the newest 7 copies plus the newest 4 Sunday ones, and runs while paused. Each copy is made with SQLite's backup API and checked before it replaces anything, so a bad copy never pushes out a good one. Nothing is texted on success. After 36h with no good copy you get one `hey, some issues here: backup: no successful backup in 37h …` and later a `resolved: backup is healthy again`. Copies you made yourself (for example before a migration) are never pruned, wherever they are.
 
-- **Optional, a second disk:** create a folder on another disk (or in iCloud Drive), then tell Claude to set `backup.extra_dir: /Volumes/<disk>/resonant` and restart. Resonant never creates that folder, so an unplugged disk shows up as `backup  DEGRADED … extra copy failing: extra_dir does not exist (disk not mounted?)` within 36h instead of silently writing to the boot disk. An iCloud Drive folder is uploaded by macOS, not by Resonant. The copy holds your messages, tasks and approvals, so pick a place you trust.
+- **Optional, a second disk:** create a folder on another disk (or in iCloud Drive), then tell Claude to set `backup.extra_dir: /Volumes/<disk>/resonant` and restart. Resonant never creates that folder, so an unplugged disk shows up as `backup  DEGRADED … extra copy failing: extra_dir does not exist (disk not mounted?)` within 36h instead of silently writing to the boot disk. An iCloud Drive folder is uploaded by macOS, not by Resonant. The copy holds your messages, tasks and approvals, so pick a place you trust. Use a folder of its own: retention deletes old `resonant-YYYY-MM-DD.db` files there too.
 - **Verify:** `resonant backup now`, then `resonant backup list` and `resonant status`.
 - **Expected:** `backup ok: …/backups/daily/resonant-<today>.db (<size>, integrity ok, <n> ms)`; `list` shows that file; `status` shows `backup      <time> (0h ago)` and, once the health monitor has run, `backup  ok`. `ls -ld ~/.resonant/backups/daily` shows `drwx------`, and the file `-rw-------`.
 
@@ -54,9 +54,9 @@ Only if the store is damaged or a bad change has to be undone. Everything since 
 
 1. Pick a copy: `resonant backup list`.
 2. Stop the daemon so launchd doesn't restart it: `resonant daemon uninstall --no-ollama --no-keep-awake`. `resonant status` shows `daemon  DOWN (launchd: False)`. `resonant backup restore` refuses while the daemon's API answers or its LaunchAgent is loaded, and prints these steps.
-3. Restore: `resonant backup restore ~/.resonant/backups/daily/resonant-<date>.db`. It checks the file (integrity, a Resonant store, a schema this code knows), asks, copies the current store to `~/.resonant/backups/pre-restore/resonant-<time>.db` (never pruned), and restores. Expected: `<file>: integrity ok, schema v<n>`, `the old store was saved to …`, `restored …`.
+3. Restore: `resonant backup restore ~/.resonant/backups/daily/resonant-<date>.db`. It checks the file (integrity, a Resonant store, a schema this code knows), asks, saves the current store to `~/.resonant/backups/pre-restore/` (never pruned; the raw files in a folder if the store is too damaged to copy), and restores. Expected: `<file>: integrity ok, schema v<n>`, `the old store was saved to …`, `restored …`, `the restored store is PAUSED …`.
 4. Start it again: `resonant daemon install`. An older copy is migrated on start.
-5. Check: `resonant status` (`daemon  up`) and `scripts/bootstrap.sh --check`, then text `/status`.
+5. Check: `resonant status` (`daemon  up`, `autonomy off  (PAUSED)`) and `scripts/bootstrap.sh --check`, then text `/status`. When it looks right, text `/resume` (or `resonant resume`): the restored store always starts paused, because the copy's own kill-switch state may be older than your last `/kill`.
 
 - **Rollback:** restore the `pre-restore` copy the same way.
 

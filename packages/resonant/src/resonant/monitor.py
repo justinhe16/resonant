@@ -519,7 +519,7 @@ class HealthMonitor:
             return None
         try:
             return self.backup_check(now)
-        except sqlite3.Error as e:
+        except Exception as e:  # the check must never take the monitor down
             return CheckResult(False, f"backup state unreadable ({type(e).__name__})")
 
     # --- state machine -------------------------------------------------------------------
