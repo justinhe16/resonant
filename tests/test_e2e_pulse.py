@@ -24,7 +24,7 @@ import socket
 import sqlite3
 from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -100,7 +100,8 @@ def make_settings(home: Path, chat: FakeChatDB, **overrides: Any) -> Settings:
     )
     conn = open_db(settings.db_path)
     try:
-        for name, grant in (("dori", "urgent"), ("trader", "normal"), ("rogue", None)):
+        exts = (("dori", "urgent"), ("trader", "normal"), ("rogue", None), ("github", "low"))
+        for name, grant in exts:
             install_fixture(settings, conn, manifest(name, grant), {"cli.py": "# stub\n"})
     finally:
         conn.close()
@@ -166,12 +167,19 @@ class World:
         state: dict[str, Any] | None = None,
         clear: bool = False,
         ttl: str = "24h",
+        quiet: bool | None = None,
         when: datetime | None = None,
+        data: dict[str, Any] | None = None,
     ) -> Event:
-        """A ``report()`` stored the way ``scheduler.persist_events`` stores it."""
+        """A ``report()`` stored the way ``scheduler.persist_events`` stores it. ``quiet``
+        None: the field is left out (an extension older than BF-1). ``data``: the event's
+        data as an extension built it (the other fields are then unused)."""
         when = when or self.clock.now
         self._seq += 1  # every report() has a unique dedupe key; the pulse decides what is news
-        data = {"key": key, "urgency": urgency, "state": state, "clear": clear, "ttl": ttl}
+        if data is None:
+            data = {"key": key, "urgency": urgency, "state": state, "clear": clear, "ttl": ttl}
+            if quiet is not None:
+                data["quiet"] = quiet
         event = Event(
             source=f"ext:{ext}",
             type=f"ext.{ext}.item",
@@ -337,7 +345,7 @@ async def test_u5_briefing_always_sends_with_updates_and_the_8am_pulse_does_not(
         assert len(w.texts()) == 1  # told in the briefing: not again
         # Another day with nothing to say: the briefing still sends.
         await w.tick(at(11, 8))
-        assert w.texts()[1:] == ["Nothing on today."]
+        assert w.texts()[1:] == [briefing.nothing_line(date(2031, 6, 11))]
 
 
 # --- U6: paused ------------------------------------------------------------------------------
@@ -674,3 +682,102 @@ async def test_unsent_records_are_finished_oldest_first_and_a_corrupt_one_is_dro
             is None
         )
         pulse_job.prune_inflight(w.conn, now)  # a corrupt record never breaks pruning
+
+
+# --- BF-1: items with nothing to say are left out --------------------------------------------
+
+GITHUB_CLI = Path(__file__).resolve().parents[1] / "extensions/github/cli.py"
+
+
+def github_summary(w: World, mine: int, failing: int, review: int, when: datetime) -> Event:
+    """The github digest's ``github/summary`` item, built by the extension's own code."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("github_cli_bf1", GITHUB_CLI)
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    state = {"open": mine, "failing": failing, "review_requested": review}
+    line = f"{mine} open PRs, {failing} failing CI, {review} awaiting your review"
+    e = cli.report_event("github/summary", line, state, quiet=not any(state.values()))
+    return w.put("github", "github/summary", e["text"], data=e["data"], when=when)
+
+
+async def test_bf1_all_zero_github_summary_is_left_out_and_the_briefing_is_one_line(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    async with world(resonant_home, chat, at(10, 7, 0)) as w:
+        github_summary(w, 0, 0, 0, at(10, 7, 50))
+        await w.tick(at(10, 7, 50))
+        await w.tick(at(10, 8))
+        (text,) = w.texts()
+        assert text == briefing.nothing_line(date(2031, 6, 10))
+        assert text in briefing.NOTHING_LINES and "\n" not in text
+        item = w.item("github", "github/summary")
+        assert item.cleared and not item.changed  # closed without a word
+        (held,) = w.audits("pulse.held")
+        assert json.loads(held["detail"])["reason"] == "quiet"
+        await w.tick(at(10, 9))
+        assert len(w.texts()) == 1  # and never in a pulse either
+
+
+async def test_bf1_mixed_briefing_keeps_only_the_items_with_something_to_say(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    async with world(resonant_home, chat, at(10, 7, 0)) as w:
+        await w.report("trader", "pnl", "PnL +$1k", state={"b": 1}, when=at(10, 7, 30))
+        await w.report("dori", "digest", "3 PRs open", urgency="low", when=at(10, 7, 31))
+        await w.report("dori", "empty", "0 incidents", urgency="low", quiet=True)
+        github_summary(w, 0, 0, 0, at(10, 7, 50))
+        await w.tick(at(10, 8))
+        (text,) = w.texts()
+        assert text.startswith("Updates:\n")
+        assert "[trader] PnL +$1k" in text and "[dori] 3 PRs open" in text
+        assert "github" not in text and "0 " not in text
+
+
+async def test_bf1_github_with_something_open_is_still_in_the_briefing(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    async with world(resonant_home, chat, at(10, 7, 0)) as w:
+        github_summary(w, 0, 0, 0, at(10, 7, 50))
+        await w.tick(at(10, 7, 50))
+        await w.tick(at(10, 8))
+        # The next day a PR is open: the quiet item opens again as news.
+        github_summary(w, 1, 0, 0, at(11, 7, 50))
+        await w.tick(at(11, 7, 50))
+        await w.tick(at(11, 8))
+        assert w.texts()[1:] == [
+            "Updates:\n[github] 1 open PRs, 0 failing CI, 0 awaiting your review"
+        ]
+        # Back to zero: no "✓ 0 open PRs", just the morning line.
+        github_summary(w, 0, 0, 0, at(12, 7, 50))
+        await w.tick(at(12, 7, 50))
+        await w.tick(at(12, 8))
+        assert w.texts()[2:] == [briefing.nothing_line(date(2031, 6, 12))]
+
+
+async def test_bf1_an_extension_without_the_quiet_field_still_works(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    async with world(resonant_home, chat, at(10, 7, 0)) as w:
+        # An old github (before BF-1): its all-zero summary has no quiet field and is shown.
+        line = "0 open PRs, 0 failing CI, 0 awaiting your review"
+        state = {"open": 0, "failing": 0, "review_requested": 0}
+        await w.report("github", "github/summary", line, urgency="low", state=state, ttl="30h")
+        await w.tick(at(10, 8))
+        assert w.texts() == [f"Updates:\n[github] {line}"]
+        assert w.audits("pulse.refused") == []
+
+
+async def test_bf1_a_quiet_item_makes_no_hourly_pulse(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    async with world(resonant_home, chat, at(10, 10, 0)) as w:
+        await w.report("trader", "pnl", "PnL $0", state={"b": 0}, quiet=True)
+        await w.report("dori", "inc", "no incidents", urgency="urgent", quiet=True)
+        await w.tick(at(10, 11))
+        assert w.texts() == []  # nothing to say: no text, urgent or hourly
+        await w.report("trader", "pnl", "PnL +$1k", state={"b": 1})
+        await w.tick(at(10, 12))
+        assert w.texts() == ["btw:\n[trader] PnL +$1k"]

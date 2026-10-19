@@ -6,7 +6,7 @@ Status: **implemented** (2026-10-14): P35-1 to P35-6, PRs #50 and #52 to #55 and
 - **Urgent** reports text right away, at any hour. Example: "Dori is failing, triaging".
 - **Normal** reports are batched into an hourly "btw" message. Example: PnL moved.
 - **Low** reports wait for the 08:00 briefing.
-- The 08:00 briefing always sends, even when it's `Nothing on today.`
+- The 08:00 briefing always sends, even when it has nothing: one short line, `Morning. Nothing for today.` (or a variant).
 - Nothing is said twice: an item is mentioned again only when its state changes.
 
 Any extension can report items, so future extensions (Dori on-call, a trading bot) plug in with no core changes.
@@ -23,6 +23,7 @@ Any extension can report items, so future extensions (Dori on-call, a trading bo
 - **Stale reports.** A retried older report (row `updated_at` newer than the event's `occurred_at`) is dropped (`pulse.stale`).
 - **Held urgent items ride the pulse** (paused, muted, capped), including after a mute ends, unless their `ttl` expired.
 - **Tool runs don't persist fd-3 events**, so reporters must be jobs; the example's `incident` is a job plus a tool that writes its state.
+- **Quiet items (BF-1).** A report can say it has nothing to say: `report(..., quiet=True)` (github's all-zero `github/summary`). Ingest stores it cleared and told at once, so the briefing's Updates and the hourly pulse leave it out, with no `✓`; the next report that isn't quiet opens it again as news. Without the field a report is not quiet, so older extensions work as before. The briefing, empty after that, is one line (`briefing.nothing_line`, a few variants by date); the hourly pulse with nothing pending sends nothing, as before. The Workers and approvals sections were already left out when empty.
 - **Workers (EM-6, [`employee-plan.md`](employee-plan.md#d5-reporting-and-urgency)).** Claude workers report through `core` items keyed `run/<code>`, rendered in a `Workers:` section after the other lines of the pulse (and of the briefing, which otherwise skips `core` items). When a pulse has news, it also lists the workers still running, already told, for status; they never make a pulse send on their own. A full message drops worker lines first (the section is last, unless it holds an urgent line, then it goes first) and never ends on a bare header; `+N more` counts news left out, not headers or status lines.
 
 ---
@@ -88,7 +89,7 @@ CREATE TABLE pulse_items (
 - Old rows (cleared or expired for 7 days) are pruned by the hourly job.
 
 ### D2. SDK and manifest
-- `resonant_sdk/emit.py`: `report(key, title, *, urgency="normal", state=None, clear=False, ttl="24h")`, stdlib only, copied next to the script like `emit()`. It writes one `{"type": "item", ...}` event with a unique dedupe key, so re-reporting is never dropped at ingest. The pulse does the dedupe.
+- `resonant_sdk/emit.py`: `report(key, title, *, urgency="normal", state=None, clear=False, ttl="24h", quiet=False)` (`quiet`: BF-1, above), stdlib only, copied next to the script like `emit()`. It writes one `{"type": "item", ...}` event with a unique dedupe key, so re-reporting is never dropped at ingest. The pulse does the dedupe.
 - Manifest: `report: {max_urgency: urgent | normal | low}` (default absent: reports are refused and audited `pulse.refused`). `item` is a reserved event type: it can't be in `notify.on`. `ext validate` and the install screen show the grant: `may interrupt you any time (urgent)`.
 - Config: `pulse: {enabled: true, quiet_hours: "00:00-06:00", remention_after: "10m"}`.
 

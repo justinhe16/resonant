@@ -6,7 +6,9 @@ no iMessage channel, or no ``principals.yaml`` owner: not scheduled. Catch-up is
 daemon that was down at 08:00 and comes back by 11:00 sends it once.
 
 The text is built by code from builtin reads, one line per section, and a section with
-nothing to say is left out (``Nothing on today.`` when all are):
+nothing to say is left out. When all are, it still arrives, as one short line
+(:func:`nothing_line`: ``Morning. Nothing for today.`` or one of a few variants, picked by
+the date):
 
 - ``⏰ 2 reminders: 9:30am stretch, 3:00pm call mom``: the owner's pending reminders due
   today (``list_reminders``), in local time.
@@ -23,6 +25,8 @@ nothing to say is left out (``Nothing on today.`` when all are):
   ``+N more``. The items listed are marked told after the send (a manual run too), so the
   next pulse doesn't repeat them. github's morning summary is one of these
   (``[github] 3 open PRs, 1 failing CI, 2 awaiting your review``, reported at low urgency).
+  An item with nothing to say (github's all-zero summary) is reported ``quiet`` and never
+  gets here (BF-1, ``extensions/pulse.py``).
 
 For example::
 
@@ -89,7 +93,14 @@ TIMEOUT_S = 60.0
 MAX_CHARS = 1000
 UPDATES_SHOWN = 8
 UPDATES_HEADER = "Updates:"
-NOTHING = "Nothing on today."
+# The whole briefing when every section is empty: terse, like a coworker's "morning".
+NOTHING_LINES = (
+    "Morning. Nothing for today.",
+    "Morning. Clear day, nothing on.",
+    "Morning. Nothing on the list today.",
+    "Morning. All quiet today.",
+)
+NOTHING = NOTHING_LINES[0]  # the line when no date is known (a Briefing built without one)
 REMINDERS_SHOWN = 3
 REMINDER_TEXT_MAX = 30
 CODES_SHOWN = 5
@@ -125,6 +136,13 @@ class Briefing:
     updates: tuple[pulse_store.Item, ...] = ()  # open pulse items, most changed first
     workers: tuple[pulse_store.Item, ...] = ()  # running workers, and finished ones untold
     roll: rollup.Rollup = field(default_factory=rollup.Rollup)  # the Workers rollup's names
+    day: date | None = None  # the local date (picks the empty briefing's line)
+
+
+def nothing_line(day: date | None) -> str:
+    """The empty briefing: one of ``NOTHING_LINES``, by date (the same all day, so a rerun
+    of the day's key says the same thing)."""
+    return NOTHING if day is None else NOTHING_LINES[day.toordinal() % len(NOTHING_LINES)]
 
 
 def _plural(n: int, word: str) -> str:
@@ -205,7 +223,7 @@ def render_full(b: Briefing) -> tuple[str, list[pulse_store.Item]]:
     lines += workers
     used = len("\n".join(workers)) + (1 if workers else 0)
     extra, shown = _updates_lines(b, room - used)
-    text = "\n".join([*lines, *extra]) or NOTHING
+    text = "\n".join([*lines, *extra]) or nothing_line(b.day)
     text = text if len(text) <= MAX_CHARS else text[: MAX_CHARS - 1].rstrip() + "…"
     return text, [*listed, *shown]
 
@@ -215,13 +233,16 @@ def render(b: Briefing) -> str:
 
 
 def sections(b: Briefing) -> list[str]:
-    """Names of the non-empty sections (the run's result; no content)."""
+    """Names of the non-empty sections (the run's result; no content). Workers counts only
+    when the rollup has a line to show."""
+    news = [i for i in b.workers if i.changed]
+    going = [i for i in b.workers if not i.changed]
     named = {
         "reminders": _reminders_line(b),
         "work": _work_line(b),
         "approvals": approvals_line(b),
         "health": _health_line(b),
-        "workers": "x" if b.workers else None,
+        "workers": "x" if worker_entries(news, context=going, roll=b.roll) else None,
         "updates": "x" if b.updates else None,
     }
     return [name for name, line in named.items() if line]
@@ -303,6 +324,7 @@ def gather(
         updates=_updates(conn, now),
         workers=workers,
         roll=rollup.gather(conn, now, workers, stall_after=stall_after),
+        day=day,
     )
 
 
@@ -432,11 +454,13 @@ __all__ = [
     "JOB_ID",
     "MAX_CHARS",
     "NOTHING",
+    "NOTHING_LINES",
     "Briefing",
     "briefing_job",
     "dedupe_key",
     "gather",
     "manual_dedupe_key",
+    "nothing_line",
     "render",
     "render_full",
     "run_briefing_now",

@@ -608,18 +608,27 @@ def summary_line(mine: list[dict[str, Any]], review: list[dict[str, Any]]) -> st
 
 
 def report_event(
-    key: str, title: str, state: dict[str, Any], *, urgency: str = "low"
+    key: str, title: str, state: dict[str, Any], *, urgency: str = "low", quiet: bool = False
 ) -> dict[str, Any]:
     """A pulse item (what ``resonant_sdk.emit.report`` sends), built inline: this file can't
     import the SDK. Every call gets a unique dedupe key; Resonant decides whether it's news
-    from the fingerprint of ``state``."""
-    data = {"key": key, "urgency": urgency, "state": state, "clear": False, "ttl": "30h"}
+    from the fingerprint of ``state``. ``quiet``: nothing to say, so Resonant closes the
+    item without a word (left out of the briefing and the pulse)."""
+    data = {
+        "key": key,
+        "urgency": urgency,
+        "state": state,
+        "clear": False,
+        "ttl": "30h",
+        "quiet": quiet,
+    }
     return event("item", title, f"item:{key}:{time.time_ns():x}", data)
 
 
 def cmd_digest(gh: Gh) -> dict[str, Any]:
     """Reports ``github/summary`` (low: the 08:00 briefing's Updates section). The state is
-    the counts, so an unchanged day is not news."""
+    the counts, so an unchanged day is not news. All zero: reported ``quiet``, so the
+    briefing leaves it out instead of saying ``0 open PRs, 0 failing CI, ...``."""
     mine, review, _ = search(gh)
     line = summary_line(mine, review)
     state = {
@@ -627,7 +636,8 @@ def cmd_digest(gh: Gh) -> dict[str, Any]:
         "failing": sum(1 for p in mine if p["ci"] == "failing"),
         "review_requested": len(review),
     }
-    return emit({"summary": line}, [report_event("github/summary", line, state)])
+    quiet = not any(state.values())  # state holds only counts: all zero is nothing to say
+    return emit({"summary": line}, [report_event("github/summary", line, state, quiet=quiet)])
 
 
 def cmd_health(gh: Gh) -> dict[str, Any]:

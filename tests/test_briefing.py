@@ -12,7 +12,7 @@ import itertools
 import sqlite3
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -232,9 +232,22 @@ def degrade(db: sqlite3.Connection, check: str) -> None:
 # --- render: pure --------------------------------------------------------------------------
 
 
-def test_nothing_on_today_when_every_section_is_empty() -> None:
-    assert bf.render(bf.Briefing()) == "Nothing on today."
+def test_an_empty_briefing_is_one_short_line() -> None:
+    assert bf.render(bf.Briefing()) == bf.NOTHING == "Morning. Nothing for today."
     assert bf.sections(bf.Briefing()) == []
+    days = [date(2026, 10, 13) + timedelta(days=n) for n in range(len(bf.NOTHING_LINES))]
+    said = [bf.render(bf.Briefing(day=d)) for d in days]
+    assert sorted(said) == sorted(bf.NOTHING_LINES)  # a few variants, one per day in turn
+    assert all("\n" not in s and len(s) <= 40 and s.startswith("Morning.") for s in said)
+    assert bf.render(bf.Briefing(day=days[0])) == bf.nothing_line(days[0])  # same all day
+
+
+def test_empty_workers_and_approvals_sections_are_left_out() -> None:
+    assert bf.render(bf.Briefing(approvals=(), workers=(), day=date(2026, 10, 13))) == (
+        bf.nothing_line(date(2026, 10, 13))
+    )
+    assert "Workers:" not in bf.render(bf.Briefing(running=1))
+    assert bf.sections(bf.Briefing(running=1)) == ["work"]
 
 
 def test_example_briefing_and_empty_sections_are_omitted() -> None:
@@ -354,7 +367,8 @@ async def test_e13_fires_at_eight_local_within_a_tick() -> None:
         await h.tick(local(10, 13, 7, 59))
         assert h.channel.sent == []
         await h.tick(T0 + timedelta(seconds=h.settings.loop.tick_s))
-        assert h.channel.sent == [(OWNER, "Nothing on today.", "briefing:2026-10-13")]
+        empty = bf.nothing_line(date(2026, 10, 13))
+        assert h.channel.sent == [(OWNER, empty, "briefing:2026-10-13")]
         (run,) = h.audits("job.run")
         assert run["extension"] == "core"
         assert h.audits("gate.evaluate") == []
