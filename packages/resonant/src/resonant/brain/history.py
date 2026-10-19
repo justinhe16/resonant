@@ -13,11 +13,15 @@ answer (Claude reads files, the web and connectors) or its reply was written by 
 task (``reply_meta.meta.tainted``, or ``tainted`` pinned on the checkpoint: the turn had read
 outside content, D6). ``replayed`` returns the history with the reason when any exchange in
 the window is untrusted, and the brain starts that turn tainted, exactly as after an
-untrusted read: a model-chosen change asks. Once the exchange leaves the window (folded, or
-past ``MAX_EXCHANGES``) the turn is clean again, because the **fold never keeps outside
-text**: an untrusted exchange is folded as the principal's message plus a fixed marker
-(``OUTSIDE_REPLY``), never its reply or Claude's answer, so the summary only holds the
-principal's own words and untainted replies, and it never taints a turn.
+untrusted read: a model-chosen change asks. That turn's own reply is tainted in turn, one
+**hop** further from the outside text (``taint_hops``: 0 for a task that read it itself or
+handed off to Claude); a replayed reply taints only under ``MAX_TAINT_HOPS``, so the chain
+can't carry itself for good. Once the source leaves the window (folded, or past
+``MAX_EXCHANGES``) and the chain runs out, turns are clean again, because the **fold never
+keeps outside text**: a tainted exchange (any hop) or one with Claude's answer is folded as
+the principal's message plus a fixed marker (``OUTSIDE_REPLY``), never its reply or
+Claude's answer, so the summary only holds the principal's own words and untainted replies,
+and it never taints a turn.
 
 **Window.** History is every exchange after the summary's cursor (``through_event_id``), at
 most ``MAX_EXCHANGES``, as ``user`` turns (the message, ``wrap_untrusted``) and ``assistant``
@@ -61,6 +65,9 @@ FOLD_LINE_CHARS = 80  # each side of an exchange in the fallback summary
 FOLD_MAX_TOKENS = 400
 # What the fold keeps of an untrusted exchange's answer (BR-10b): never the text itself.
 OUTSIDE_REPLY = "(answered from outside content; not kept)"
+# A reply tainted only by what it replayed taints the next turn while it is fewer than this
+# many replays from the outside text itself (BR-10b): the text can't be carried for good.
+MAX_TAINT_HOPS = 2
 _SCAN = 4 * (KEEP_EXCHANGES + MAX_FOLD)  # message events read to find the exchanges
 
 FOLD_SYSTEM = (
@@ -89,25 +96,48 @@ class Exchange:
     reply: str | None
     claude: str | None = None  # BR-10: Claude's answer to a turn handed over
     tainted: bool = False  # BR-10b: the reply was written after outside content
+    hops: int = 0  # replays between that outside content and this reply (0: read it itself)
 
     @property
     def untrusted(self) -> str | None:
-        """Why this exchange replays outside text (BR-10b), or None."""
+        """Why this exchange replays outside text (BR-10b), or None. A tainted reply counts
+        only within ``MAX_TAINT_HOPS`` replays of the outside text, so taint doesn't carry
+        itself from reply to reply for good."""
         if self.claude is not None:
             return "claude_answer"
-        return "tainted_reply" if self.tainted else None
+        return "tainted_reply" if self.tainted and self.hops < MAX_TAINT_HOPS else None
+
+    @property
+    def untrusted_hops(self) -> int:
+        """The hops of what makes it untrusted: a Claude answer is outside text itself."""
+        return 0 if self.claude is not None else self.hops
+
+
+def _meta(cp: dict[str, Any]) -> dict[str, Any]:
+    meta: Any = cp.get("reply_meta")
+    inner: Any = cast(dict[str, Any], meta).get("meta") if isinstance(meta, dict) else None
+    return cast(dict[str, Any], inner) if isinstance(inner, dict) else {}
+
+
+def taint_hops(cp: dict[str, Any]) -> int | None:
+    """None when the task's reply wasn't written after outside content; else how many
+    replays away that content was (``taint_hops`` on the checkpoint or in ``reply_meta``;
+    0 when missing: the task read it itself). Tainted: a gated call was pinned ``tainted``,
+    or the brain's ``reply_meta`` says so."""
+    meta = _meta(cp)
+    if cp.get("tainted") is not True and meta.get("tainted") is not True:
+        return None
+    for source in (cp, meta):
+        hops = source.get("taint_hops")
+        if isinstance(hops, int) and not isinstance(hops, bool) and hops >= 0:
+            return hops
+    return 0
 
 
 def reply_tainted(cp: dict[str, Any]) -> bool:
-    """The task read outside content before its reply: the brain's ``reply_meta`` says so,
-    or a gated call was pinned ``tainted``."""
-    if cp.get("tainted") is True:
-        return True
-    meta: Any = cp.get("reply_meta")
-    if not isinstance(meta, dict):
-        return False
-    inner: Any = cast(dict[str, Any], meta).get("meta")
-    return isinstance(inner, dict) and cast(dict[str, Any], inner).get("tainted") is True
+    """The task's reply replays outside text within ``MAX_TAINT_HOPS`` (BR-10b)."""
+    hops = taint_hops(cp)
+    return hops is not None and hops < MAX_TAINT_HOPS
 
 
 def reply_of(cp: dict[str, Any] | None) -> str | None:
@@ -131,8 +161,11 @@ def _exchanges(rows: list[tuple[Any, dict[str, Any] | None]]) -> list[Exchange]:
             continue
         claude = cp.get("claude_reply")
         said = claude if isinstance(claude, str) and claude.strip() else None
-        reply = reply_of(cp)
-        out.append(Exchange(event.id, event.occurred_at, body, reply, said, reply_tainted(cp)))
+        hops = taint_hops(cp)
+        out.append(
+            Exchange(event.id, event.occurred_at, body, reply_of(cp), said,
+                     tainted=hops is not None, hops=hops or 0)
+        )  # fmt: skip
     return out
 
 
@@ -198,6 +231,9 @@ class History:
     # BR-10b: why the window replays outside text (``Exchange.untrusted``), or None. The
     # turn that sees it starts tainted.
     untrusted: str | None = None
+    # The fewest hops from outside text among the untrusted exchanges (0 for a Claude
+    # answer or a reply that read it); the turn is one hop further.
+    hops: int = 0
 
 
 def history_messages(
@@ -220,9 +256,11 @@ def replayed(
 ) -> History:
     """The summary turn (when there is one), then each unfolded exchange as a ``user`` turn
     (wrapped) and, when it was answered, an ``assistant`` turn (then Claude's answer as
-    data). Oldest first. ``untrusted``: the reason of the newest untrusted exchange in it."""
+    data). Oldest first. ``untrusted`` and ``hops``: of the untrusted exchange closest to the
+    outside text (the newest on a tie)."""
     messages: list[ChatMessage] = []
     untrusted: str | None = None
+    hops = 0
     summary = store.get_summary(conn, principal)
     if summary is not None and summary.summary.strip():
         messages.append(summary_turn(summary.summary))
@@ -243,8 +281,10 @@ def replayed(
             messages.append({"role": "assistant", "content": reply})
         if ex.claude is not None:
             messages.append(claude_turn(ex.claude))
-        untrusted = ex.untrusted or untrusted
-    return History(messages, untrusted)
+        why = ex.untrusted
+        if why is not None and (untrusted is None or ex.untrusted_hops <= hops):
+            untrusted, hops = why, ex.untrusted_hops
+    return History(messages, untrusted, hops)
 
 
 def claude_turn(answer: str) -> ChatMessage:
@@ -292,8 +332,8 @@ def fallback_summary(previous: str, exchanges: list[Exchange]) -> str:
 
 
 def _fold_reply(ex: Exchange, limit: int) -> str:
-    """An exchange's answer as a fold sees it: never outside text (BR-10b)."""
-    if ex.untrusted is not None:
+    """An exchange's answer as a fold sees it: never outside text (BR-10b), at any hop."""
+    if ex.claude is not None or ex.tainted:
         return OUTSIDE_REPLY
     return clip(flat(ex.reply), limit) if ex.reply else "(no reply)"
 

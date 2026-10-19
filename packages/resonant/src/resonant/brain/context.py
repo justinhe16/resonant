@@ -185,6 +185,7 @@ class BrainContext:
     # BR-10b: the history replays outside text (a Claude answer, a tainted task's reply):
     # the reason, and the turn starts tainted. None: clean.
     untrusted: str | None = None
+    taint_hops: int = 0  # how far the turn is from that text (its replies record it)
 
     def messages(self) -> list[ChatMessage]:
         return [*self.prefix, *self.history, self.turn]
@@ -242,4 +243,5 @@ def build_context(
         history=tuple(history.messages),
         turn={"role": "user", "content": turn},
         untrusted=history.untrusted,
+        taint_hops=history.hops + 1 if history.untrusted is not None else 0,
     )

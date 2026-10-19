@@ -279,6 +279,33 @@ def test_a_tainted_reply_in_the_window_is_untrusted(db: sqlite3.Connection) -> N
     assert replayed(db, OWNER, before_event_id=None).untrusted == "tainted_reply"
 
 
+def test_taint_carries_a_bounded_number_of_hops(db: sqlite3.Connection) -> None:
+    """A reply tainted only by what it replayed records its hops; it taints the next turn
+    under ``MAX_TAINT_HOPS``, so taint can't carry itself from reply to reply for good."""
+    assert history.MAX_TAINT_HOPS == 2
+    one = {"reply_meta": {"meta": {"tainted": True, "taint_hops": 1}}}
+    two = {"reply_meta": {"meta": {"tainted": True, "taint_hops": 2}}}
+    message(db, "a", reply="x", checkpoint=two)
+    assert replayed(db, OWNER, before_event_id=None).untrusted is None
+    message(db, "b", reply="y", checkpoint=one)
+    found = replayed(db, OWNER, before_event_id=None)
+    assert (found.untrusted, found.hops) == ("tainted_reply", 1)
+    message(db, "c", reply="z", checkpoint=TAINTED)  # read it itself: 0 hops, the nearest
+    found = replayed(db, OWNER, before_event_id=None)
+    assert (found.untrusted, found.hops) == ("tainted_reply", 0)
+    # a pinned call's hops count too
+    assert history.taint_hops({"tainted": True, "taint_hops": 2}) == 2
+    assert not history.reply_tainted({"tainted": True, "taint_hops": 2})
+    assert history.taint_hops({"reply_meta": {"meta": {"tainted": False}}}) is None
+
+
+def test_the_fold_drops_a_tainted_reply_at_any_hop() -> None:
+    now = utcnow()
+    far = history.Exchange("e1", now, "and then?", "it says pwned", tainted=True, hops=5)
+    assert far.untrusted is None  # no longer taints a turn
+    assert fallback_summary("", [far]) == f"owner: and then? / you: {history.OUTSIDE_REPLY}"
+
+
 def test_another_principals_claude_answer_doesnt_taint(db: sqlite3.Connection) -> None:
     message(db, "why?", reply="on it", principal="cofounder", checkpoint={"claude_reply": "x"})
     current = message(db, "note: buy milk")
