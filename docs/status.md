@@ -18,7 +18,6 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 18, two extensi
 | Backups (BK-1) | Daily SQLite backup at 03:30, 7 daily + 4 weekly, 36h alert, `resonant backup now/list/restore` | #110 |
 | Quiet briefing (BF-1) | All-zero items dropped; an empty briefing is one line | #111 |
 | Batch approvals (BA-1) | One yes/no prompt for all of a task's changes; `allow_tools` lets "don't ask for X" set standing allows for extension tools | #113 |
-| Calendar (CAL-1) | Google's official Calendar MCP server as the `gcal` extension (reads run, writes ask, never `yes always`) | #112 (in review at time of writing) |
 
 Latest task eval (synthetic set, live qwen): 95.8%, 0 unapproved writes, triage 100%. Claude's own answers are not graded yet.
 
@@ -43,7 +42,6 @@ Latest task eval (synthetic set, live qwen): 95.8%, 0 unapproved writes, triage 
 ## Owner to-dos
 
 - `resonant ext update github`: picks up `recent_prs` (BR-9) and the quiet flag (BF-1).
-- Calendar setup once CAL-1 is merged: `extensions/gcal/README.md`, which covers the Google Cloud project, OAuth Playground refresh token, three `resonant secret set gcal/...` and `resonant ext add repo:gcal`.
 - Phone tests to run:
   - the Claude brain (go-live "The Claude brain");
   - a Linear batch ("close RES-…, RES-…");
@@ -65,7 +63,9 @@ The ranked list with urgency is in [`followups.md`](followups.md) under "Recomme
    - e2e ConnectErrors;
    - `test_kill_switch_stops_running_sessions`.
 6. 🟢 Retire the intents path, whisper, and prune worktrees.
-7. Direct MCP for the Claude brain on owner-granted servers (Linear, gcal), with `--permission-prompt-tool` deciding each call. Needs a feasibility probe first. Deferred: batch approvals solved the immediate pain.
+7. Direct MCP for the Claude brain on owner-granted servers (e.g. Linear), with `--permission-prompt-tool` deciding each call. Deferred: batch approvals solved the immediate pain. Probed 2026-10-19 on Claude Code 2.1.302: headless `claude -p` loads no claude.ai connectors at all, even without `--restricted`, so this would need the servers configured directly, not the connectors.
+
+Dropped: calendar integration (CAL-1, PR #112 closed unmerged, 2026-10-19). The owner gets calendar reminders elsewhere. Email and calendar asks stay as before BR-10 (connectors don't load; Claude says it can't reach them).
 8. Dashboard: show a batch as one row.
 
 Each ticket's carry-overs are in `followups.md` and `brain-plan.md`.

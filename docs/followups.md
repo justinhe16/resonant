@@ -8,7 +8,7 @@ Ranked by how much it matters. Urgency: 🔴 high (do soon), 🟠 med-high, 🟡
 
 | | Item | Why | Urgency | Status |
 |---|---|---|---|---|
-| 1 | **CAL-1: Calendar for the Claude brain** | claude.ai connectors (Calendar, Gmail) don't load in the `--restricted` session. Options: load just the Calendar connector there, or add Google Calendar as a Resonant extension (own OAuth, reads and drafts gated). Email stays off for now. | 🔴 High | Owner is looking into it |
+| 1 | ~~CAL-1: Calendar for the Claude brain~~ | Dropped by the owner on 2026-10-19 (PR #112 closed unmerged): calendar reminders come from elsewhere. | — | Dropped |
 | 2 | **Owner eval set** from real texts (`~/.resonant/evals/task.jsonl`) | Every score so far is on the synthetic `evals/task.example.jsonl`. Real texts are what matter and catch regressions. | 🔴 High | Open |
 | 3 | **Daily DB backup** | Backups only happened before migrations. A bad disk or corrupt write loses tasks, approvals and history. | 🟠 Med-high | Done (BK-1): `core/backup` daily at 03:30, 7 daily + 4 weekly kept, 36h alert, `resonant backup now\|list\|restore`. Owner: optionally set `backup.extra_dir` to another disk |
 | 4 | **Shorter taint window** (2–3 texts) or exempt low-risk writes (notes, reminders) | BR-10b taints about 24 turns after a Claude answer, so cheap changes ask "yes?" often. | 🟠 Med-high | Open |
