@@ -4,7 +4,8 @@ That is the "can't skip the gate" guarantee: every tool call goes through ``Tool
 registry spec, the schema check, the origin, ``gate.evaluate``, the pin, the executor's
 idempotency key). The scan is over the AST of every module in the package: a call of
 ``evaluate`` or ``consume`` on something named like a gate (``gate``, ``self.gate``,
-``core.gate``), or of ``execute`` or ``recorded`` on something named like an executor.
+``core.gate``), or of ``execute`` or ``recorded`` on something named like an executor; any
+access counts, so a bound method or one passed to ``to_thread`` is caught too.
 """
 
 from __future__ import annotations
@@ -45,10 +46,12 @@ def direct_calls(source: str) -> list[str]:
     """``line: receiver.method`` for each direct gate or executor call in ``source``."""
     found: list[str] = []
     for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        # Any access, not only a call: a bound method (``ev = gate.evaluate``) or one handed
+        # on (``asyncio.to_thread(executor.execute, …)``) counts too.
+        if not isinstance(node, ast.Attribute):
             continue
-        method = node.func.attr
-        name = (_receiver_name(node.func.value) or "").lower()
+        method = node.attr
+        name = (_receiver_name(node.value) or "").lower()
         if (method in GATE_CALLS and "gate" in name) or (
             method in EXECUTOR_CALLS and "executor" in name
         ):
@@ -89,6 +92,7 @@ def f(self, gate, intent, executor):
     self.core.gate.consume("t", "h")
     self.executor.execute(intent, None, step_no=0)
     executor.recorded("k")
+    asyncio.to_thread(self.executor.execute, intent)
     self.conn.execute("SELECT 1")  # not an executor
     super().execute(intent)  # an Executor subclass calling its own base
 """
@@ -97,4 +101,5 @@ def f(self, gate, intent, executor):
         "4: gate.consume",
         "5: executor.execute",
         "6: executor.recorded",
+        "7: executor.execute",
     ]
