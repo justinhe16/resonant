@@ -1158,7 +1158,9 @@ class AskRunner:
             if not pending:
                 cp.pop("batch", None)  # never prompted: nothing waits
                 gate = self.caller.batch_gate if self.caller is not None else None
-                if bridge.asked and gate is not None:  # no answer: drop what it asked about
+                # no answer: drop what it asked about, unless a usage limit re-runs this task
+                # (its retry asks for the same changes and reuses these approvals)
+                if bridge.asked and gate is not None and outcome[0] != "usage_limit":
                     gate.drop([i.approval_id for i in bridge.asked], reason="no_answer")
         status, text, result = outcome
         if status == "usage_limit" and result is not None:
