@@ -763,6 +763,7 @@ class BrainRunner(LocalRunner):
                 decided = triage.Triage("claude", decided.kind, None)
             if decided.route == "local" and triage.has_link(text):
                 decided = triage.Triage("claude", "link", None)  # links need WebFetch
+                why = "link"
             elif decided.route == "local" and triage.looks_hard(text):
                 decided = triage.Triage("claude", decided.kind, None)  # why/how, debugging
                 why = "hard_shape"
@@ -1068,7 +1069,9 @@ class BrainRunner(LocalRunner):
             meta = dict(st.meta)
             answer = Answer(reply, "ask", used_tools(st.calls), escalate=True, meta=meta)
             return after_effects(st.reports, answer, MAX_REPLY_CHARS)
-        st.failures = 0 if call.ok else st.failures + 1  # BR-10: no recovery: Claude
+        # BR-10: a tool that failed (not a gate refusal: Claude has the same gate) counts
+        failed = not call.ok and (call.error or "").startswith("the tool failed")
+        st.failures = 0 if call.ok else st.failures + int(failed)
         st.calls.append(call)
         self._tool_turns(name, args, call, st)
         return await self._still_failing(task, principal, st, ctx, spans)

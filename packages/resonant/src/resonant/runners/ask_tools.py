@@ -232,6 +232,8 @@ class ClaudeTools:
         self._seen: Counter[str] = Counter()
         self._used: Counter[str] = Counter()
         self._stream = asyncio.Event()
+        self._closed = False  # after aclose: every call is refused (review: late calls)
+        self._writers: set[asyncio.StreamWriter] = set()
         self._spans: SpanFactory = partial(span, conn, trace_id=task.trace_id, task_id=task.id)
 
     # -- lifecycle --
@@ -261,10 +263,16 @@ class ClaudeTools:
 
     async def aclose(self) -> None:
         """Stop serving. A call still running (the session was killed mid-call) finishes
-        first, up to ``CLOSE_WAIT_S``, so its report line isn't lost."""
+        first, up to ``CLOSE_WAIT_S``, so its report line isn't lost; any call after that is
+        refused, and open connections are closed (a late call must never prompt the owner
+        directly or run outside the session's accounting)."""
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._lock.acquire(), CLOSE_WAIT_S)
+            self._closed = True
             self._lock.release()
+        self._closed = True
+        for writer in list(self._writers):
+            writer.close()
         self.caller.live.discard(self.task.id)
         self.caller.deferred.pop(self.task.id, None)
         if self._server is not None:
@@ -323,6 +331,10 @@ class ClaudeTools:
     # -- the relay's requests --
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self._closed:
+            writer.close()
+            return
+        self._writers.add(writer)
         try:
             hello = _loads(await reader.readline())
             token = hello.get("token") if hello is not None else None
@@ -339,13 +351,18 @@ class ClaudeTools:
                 if op == "list":
                     await _write(writer, {"id": rid, "tools": self.listing()})
                 elif op == "call":
-                    text, error = await self.call(req.get("name"), req.get("args"))
+                    try:
+                        text, error = await self.call(req.get("name"), req.get("args"))
+                    except Exception as e:  # one bad call never kills the session's relay
+                        log.warning("ask: tool call failed", extra={"error": type(e).__name__})
+                        text, error = "not run: Resonant hit an error running that", True
                     await _write(writer, {"id": rid, "text": text, "error": error})
                 else:
                     await _write(writer, {"id": rid, "text": "unknown op", "error": True})
         except (OSError, ValueError, asyncio.LimitOverrunError, asyncio.IncompleteReadError):
             pass
         finally:
+            self._writers.discard(writer)
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
@@ -370,9 +387,14 @@ class ClaudeTools:
                 return text, error
 
     async def _call(self, name: Any, args: Any) -> tuple[str, bool]:
+        if self._closed:
+            return "not run: the session ended", True
         spec = self.specs.get(name) if isinstance(name, str) else None
         if spec is None:
             return NO_SUCH_TOOL.format(name=flat(str(name), 64)), True
+        change = spec.effect is not Effect.READ
+        if change:  # first, so every tool_use of a change is consumed even if refused
+            await self._synced(spec.name)
         if not isinstance(args, dict):
             return "not run: invalid arguments: pass a JSON object", True
         args = cast(dict[str, Any], args)
@@ -383,9 +405,7 @@ class ClaudeTools:
             return BAD_ARGS.format(why=why, name=spec.name, schema=schema), True
         if self._paused():
             return PAUSED, True
-        change = spec.effect is not Effect.READ
         if change:
-            await self._synced(spec.name)
             if self.pending is not None:
                 return PENDING.format(what=self.pending), True
             if len(self.reports) >= MAX_SIDE_EFFECTS:

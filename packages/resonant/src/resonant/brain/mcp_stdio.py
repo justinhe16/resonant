@@ -19,6 +19,7 @@ Wire to the daemon: newline-delimited JSON. First ``{"token": ...}``, answered
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -73,10 +74,20 @@ class Daemon:
         return cast(dict[str, Any], obj)
 
     def ask(self, op: str, **kw: Any) -> dict[str, Any]:
-        self._connect()
-        self.n += 1
-        self._send({"id": self.n, "op": op, **kw})
-        return self._read()
+        try:
+            self._connect()
+            self.n += 1
+            self._send({"id": self.n, "op": op, **kw})
+            return self._read()
+        except (OSError, ValueError):
+            self.reset()  # the next request reconnects
+            raise
+
+    def reset(self) -> None:
+        if self.sock is not None:
+            with contextlib.suppress(OSError):
+                self.sock.close()
+        self.sock, self.buf = None, b""
 
 
 def out(obj: dict[str, Any]) -> None:

@@ -210,6 +210,8 @@ TOOLS_PROMPT = (
 )
 HISTORY_EXCHANGES = 4  # earlier exchanges in a tools ask's prompt
 HISTORY_LINE_CHARS = 300
+NOTE_TRIES = 10  # the asking brain task still running: note Claude's answer later
+NOTE_RETRY_S = 1.0
 INTERRUPTED = (
     "Not done: Resonant restarted while Claude was working on that, after it had started a "
     "change, so it wasn't run again.{done} Check, then ask again if anything is missing."
@@ -640,6 +642,7 @@ class AskRunner:
         self.on_watch = on_watch  # a watch ask's answer (runners/watch.py), never texted
         self.tools = tools
         self.caller = ToolCaller(conn, tools, channel) if tools is not None else None
+        self._notes: set[asyncio.Task[None]] = set()
         self.sips = sips
         self.clock = clock
         self.poll_s = poll_s
@@ -801,17 +804,16 @@ class AskRunner:
         env[MARKER_ENV] = marker
         bridge = self._bridge(task, ctx, cp)
         mcp: McpSetup | None = None
-        if bridge is not None:
-            try:
-                mcp = await bridge.start()
-            except OSError as e:
-                await bridge.aclose()
-                log.warning("ask: tool bridge didn't start", extra={"error": type(e).__name__})
-                return await self._finish(task, ctx, cp, "failed", FAILED.format(why="tools"))
-        argv = ask_argv(head, cfg=self.cfg, scope=self.scope, kind=kind,
-                        api_billing=source == "api_key", mcp=mcp)  # fmt: skip
         ask_dir = self.ask_root / task.id
         try:
+            if bridge is not None:
+                try:
+                    mcp = await bridge.start()
+                except OSError as e:
+                    log.warning("ask: tool bridge didn't start", extra={"error": type(e).__name__})
+                    return await self._finish(task, ctx, cp, "failed", FAILED.format(why="tools"))
+            argv = ask_argv(head, cfg=self.cfg, scope=self.scope, kind=kind,
+                            api_billing=source == "api_key", mcp=mcp)  # fmt: skip
             try:
                 names = await asyncio.to_thread(self._prepare_dir, ask_dir, cp.get("attachments"))
             except OSError as e:
@@ -843,7 +845,7 @@ class AskRunner:
         if status == "usage_limit" and result is not None:
             hit = usage_limit(result)
             assert hit is not None
-            return await self._limit(task, ctx, cp, hit)
+            return await self._limit(task, ctx, cp, hit, reports)
         reply = with_reports(text if status != "answered" else None, text, reports, redactor,
                              self.cfg.reply_max_chars)  # fmt: skip
         extra: dict[str, Any] = {}
@@ -1073,20 +1075,27 @@ class AskRunner:
         return "answered", text, result
 
     async def _limit(
-        self, task: Task, ctx: StepContext, cp: dict[str, Any], hit: LimitHit
+        self,
+        task: Task,
+        ctx: StepContext,
+        cp: dict[str, Any],
+        hit: LimitHit,
+        reports: Sequence[str] = (),
     ) -> StepOutcome:
-        """Back off until the reset and tell the owner once (deduped per reset)."""
+        """Back off until the reset and tell the owner once (deduped per reset). The report
+        lines of changes the session already made still go to the asker (BR-10)."""
+        done = "".join(f"\n{r}" for r in reports if r)
         # Two sessions hitting the limit together keep one reset time (and one notice).
         until = self.limited_until() or wake_time(hit, self.clock())
         with atomic(self.conn):
             kv_set(self.conn, LIMIT_KV, iso(until))
         text = self._limit_text(until)
         if task.principal == self.owner:
-            return await self._finish(task, ctx, cp, "usage_limit", text,
-                                      dedupe_key=_limit_key(until))  # fmt: skip
+            key = _limit_key(until) if not done else None  # with changes: its own message
+            return await self._finish(task, ctx, cp, "usage_limit", text + done, dedupe_key=key)
         with contextlib.suppress(ChannelError):
             await self.channel.send(self.owner, text, dedupe_key=_limit_key(until))
-        return await self._finish(task, ctx, cp, "usage_limit", LIMIT_OTHER)
+        return await self._finish(task, ctx, cp, "usage_limit", LIMIT_OTHER + done)
 
     def _limit_text(self, until: datetime | None = None) -> str:
         until = until or self.limited_until() or self.clock()
@@ -1143,6 +1152,7 @@ class AskRunner:
             return Fail(f"ask reply refused: {e}")
         except ChannelError as e:
             return Fail(f"ask reply failed: {e}", retryable=True, checkpoint=cp)
+        self._note_answer(cp, reply, status)
         if (
             cp.get("pending") is True
             and self.caller is not None
@@ -1153,12 +1163,6 @@ class AskRunner:
             if not ctx.save(checkpoint=nxt):
                 return Fail("task is no longer running")
             return await self.caller.step(replace(task, checkpoint=nxt), [], ctx)
-        asking = cp.get("requested_by")
-        if isinstance(asking, str) and cp.get("tools") is True:  # BR-10: for follow-ups
-            try:
-                task_store.note_claude_reply(self.conn, asking, reply)
-            except sqlite3.Error:
-                log.warning("ask: answer not noted on the asking task")
         result: dict[str, Any] = {
             "status": status,
             "kind": cp.get("kind"),
@@ -1171,6 +1175,33 @@ class AskRunner:
         return Done(result)
 
     # -- helpers --
+
+    def _note_answer(self, cp: dict[str, Any], reply: str, status: str) -> None:
+        """BR-10: Claude's answer on the asking brain task, for follow-ups (history). Only a
+        real answer (not a ``Not done: …``). The brain task may still be finishing (its
+        save would overwrite the note): then try again a few times in the background."""
+        asking = cp.get("requested_by")
+        if not isinstance(asking, str) or cp.get("tools") is not True or status != "answered":
+            return
+        if self._try_note(asking, reply):
+            return
+        job = asyncio.get_running_loop().create_task(self._note_later(asking, reply))
+        self._notes.add(job)
+        job.add_done_callback(self._notes.discard)
+
+    def _try_note(self, asking: str, reply: str) -> bool:
+        try:
+            return task_store.note_claude_reply(self.conn, asking, reply)
+        except sqlite3.Error:
+            log.warning("ask: answer not noted on the asking task")
+            return True  # don't retry a broken store
+
+    async def _note_later(self, asking: str, reply: str) -> None:
+        for _ in range(NOTE_TRIES):
+            await asyncio.sleep(NOTE_RETRY_S)
+            if self._try_note(asking, reply):
+                return
+        log.info("ask: the asking task never finished; answer not in history")
 
     async def _reap_left(self, task: Task, cp: dict[str, Any]) -> bool:
         """A session a crash left running (its pid is in the checkpoint): end it first. True

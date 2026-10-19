@@ -610,3 +610,68 @@ async def test_history_reaches_claude_as_context(
         await w.say("why is it so slow to build?", replies=2)
         prompt = w.session()["prompt"]
         assert "Owner: where is mycelium?" in prompt and "Resonant: mycelium is in code." in prompt
+
+
+async def test_claudes_answer_is_in_the_next_local_turn(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Even when the turn ended waiting on an approval (review of BR-10)."""
+    async with start(resonant_home, chat, tmp_path) as w:
+        await _ask_for_watch(w)
+        await wait_until(
+            lambda: any(
+                "claude_reply" in json.loads(r["checkpoint"])
+                for r in w.rows("SELECT checkpoint FROM tasks WHERE runner = 'brain'")
+            ),
+            10,
+        )
+        w.model.triage = {"handler": "local", "kind": "general", "say": ""}
+        w.model.push("It's waiting on your yes.")
+        await w.say("what's that waiting on?")
+        turns = [m["content"] for m in w.model.requests[-1].messages]
+        assert any("<claude_answer>Claude: Asked you about it" in t for t in turns)
+
+
+async def test_a_refused_change_still_uses_up_its_tool_use(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Review of BR-10: a change refused before the gate (bad args) consumes its tool_use,
+    so a later change still waits for its own and sees a web read in between (tainted)."""
+    async with start(resonant_home, chat, tmp_path) as w:
+        bridge = _bridge(w, _task(w, "justin"))
+        await bridge.start()
+        try:
+            bridge.observe(_use("add_note"))
+            text, error = await bridge.call("add_note", {"bogus": 1})
+            assert error and "invalid arguments" in text
+            web: dict[str, Any] = {"type": "tool_use", "id": "w", "name": "WebFetch", "input": {}}
+            bridge.observe({"type": "assistant", "message": {"content": [web]}})
+            bridge.observe(_use("add_note"))
+            text, error = await bridge.call("add_note", {"text": "x"})
+            assert not error and text.startswith("asked the owner")
+            assert bridge.tainted is True and w.executions("add_note") == []
+        finally:
+            await bridge.aclose()
+
+
+async def test_no_call_runs_after_the_session_ends(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path) as w:
+        bridge = _bridge(w, _task(w, "justin"))
+        await bridge.start()
+        await bridge.aclose()
+        bridge.observe(_use("add_note"))
+        text, error = await bridge.call("add_note", {"text": "late"})
+        assert error and "session ended" in text
+        assert w.executions("add_note") == [] and w.rows("SELECT 1 FROM approvals") == []
+
+
+def test_the_relay_reconnects_after_an_error(tmp_path: Path) -> None:
+    from resonant.brain import mcp_stdio
+
+    daemon = mcp_stdio.Daemon(str(tmp_path / "missing.sock"), "t")
+    msg: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    reply = mcp_stdio.handle(daemon, msg)
+    assert reply is not None and "error" in reply
+    assert daemon.sock is None and daemon.buf == b""  # the next request starts afresh

@@ -454,7 +454,7 @@ async def test_round_cap_escalates_to_ask_claude(
 ) -> None:
     script: list[Scripted] = [[("list_notes", {})]] * MAX_ROUNDS
     async with start(resonant_home, chat, tmp_path, script) as b:
-        ack, answer = await b.say("dig into everything", replies=2)
+        ack, answer = await b.say("keep counting my notes", replies=2)
         assert ack in CANNED_ACKS and answer == ANSWER  # BR-10: a varied, canned ack
         assert len(b.model.requests) == MAX_ROUNDS
         (task,) = b.brain_tasks()
@@ -462,7 +462,7 @@ async def test_round_cap_escalates_to_ask_claude(
         assert b.result(task)["handoff"] == "cap"
         (ask,) = b.rows("SELECT * FROM tasks WHERE runner = 'ask'")
         question = json.loads(ask["checkpoint"])["question"]
-        assert question.startswith("dig into everything")
+        assert question.startswith("keep counting my notes")
         assert "ran out of steps; it tried: list_notes" in question
 
 

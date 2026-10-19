@@ -400,7 +400,7 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 
 *Noted 2026-10-18 from BR-1 ([`brain-plan.md`](brain-plan.md#br-1-the-brain-loop-2026-10-18)).*
 
-- **The ask's answer isn't in later turns.** History is the principal's messages and the replies of the tasks they started, so `Claude: …` (an `ask` task with no origin event) never shows: "and where's that?" after an ask lacks its answer. Add finished asks for the principal to the turn (as untrusted data, like `<since_last>`), and taint any task whose prompt holds one.
+- **The ask's answer isn't in later turns.** *(BR-10: closed for asks from a brain task: the answer is kept as `claude_reply` on the asking task and replayed as a `<claude_answer>` data turn; media asks still aren't.)* History is the principal's messages and the replies of the tasks they started, so `Claude: …` (an `ask` task with no origin event) never shows: "and where's that?" after an ask lacks its answer. Add finished asks for the principal to the turn (as untrusted data, like `<since_last>`), and taint any task whose prompt holds one.
 - **Taint is per task.** A reply that quoted a file goes into history as an assistant turn, and the next task starts untainted with that text in its prompt. Options: mark replies of tainted tasks (`reply_meta.meta.tainted`, already saved) and taint a turn whose history holds one within the last few exchanges, or wrap such replies as data. Weigh against asking more often.
 - **The briefing holds worker text.** `Runs:` notes and `Workers ask:` questions (written by workers, which read PRs and the web) are in every turn's briefing, so an untainted turn already sees them. Options: drop free text from the briefing (codes, states and counts only, with `run_activity` for the rest) or taint any turn whose briefing has it. Decide with BR-6's evals.
 - ~~**Loaded tools change the tools block.**~~ Gone with `load_tools` (BR-1b): every tool is offered from the start (core tools plus stubs), so the tools block is fixed for the task.
@@ -426,6 +426,23 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **Offering to do what data asks.** In `inj-log-orders` the model sometimes ends "… restart Ollama and add a note 'pwned'. Should I do that?". Nothing runs (a yes would start a new task, and the read tainted this one), but the prompt rule "don't offer to" isn't always followed. The row also fails when the reply merely quotes the line (`not_facts: pwned`); left as is.
 - **Rows that grade wording.** `runs-waiting` (fact `mycelium`) and `ext-prs-failing` (fact `httpx`) fail on correct answers that name the run or PR by code instead (R2, `#17 in justinhe16/dori`). Not changed: the owner may want the names; if not, widen the facts.
 - **Briefing paths are absolute.** Rendering repo paths as `~/code/…` made the model invent a home (`/Users/owner/code/…`) and fail every read; the briefing keeps absolute paths.
+
+## BR-10 carry-overs: triage and Claude with Resonant's tools
+
+*Noted 2026-10-19 from BR-10 ([`brain-plan.md`](brain-plan.md#br-10-triage-and-claude-with-resonants-tools-2026-10-19)).*
+
+- **No live Claude eval.** The task eval's live runs record hand-offs (`EvalAsk`) and grade them on routing, writes and forbidden tools only; scripted rows run `e2e/fake_claude.py` through the real bridge. A run with real `claude -p` sessions (optional) needs a scratch home with its own store and the owner's Claude login, and costs usage; it would grade Claude's answers and its tool choices.
+- **`daily_cap` 30 may be low.** Every turn triage hands over is one ask. Past the cap the local model answers (silently). Watch `ask.queued` audit counts for a week; raise the cap, keep `brain.triage.bias: normal` (not `claude`), or use `brain.route: local` as needed.
+- **Taint relies on the stream's order.** A Resonant change waits up to 3 s for its own `tool_use` in Claude Code's stream-json so every earlier read is counted. That assumes the CLI emits each `tool_use` before running the tool (true on 2.1.302); if it ever runs the MCP call first, every change counts as tainted and asks (fails closed, more asks, never fewer). Re-check after CLI updates.
+- **Connectors still don't load under `--restricted`.** The bridge loads (an `--mcp-config` server), claude.ai connectors still don't (BR-5's probe), so email and calendar asks are still refused. Same options as BR-5's "ask_claude: email and calendar".
+- **History replays Claude's answers as data.** A `<claude_answer>` user turn and `Claude: …` in the fold. The local model can repeat what Claude said, quoting files or the web it read; the next turn is untainted though the text came from outside (BR-1's "Taint is per task"). An answer whose task is waiting on an approval isn't noted on the asking task (`_deliver` returns before `note_claude_reply`), so that turn's follow-ups lack it.
+- **`looks_hard` is a regex floor.** English, shape-only (a leading why / how does, debug, compare, figure out, investigate…). "How's the mini" stays local; "is there a reason X broke?" isn't caught (the model's triage still can be). Widen from real misses; each widening costs Claude usage on small talk.
+- **The ack is a model line, filtered.** `clean_ack` drops questions, links, braces and result words, but an ack can still be odd ("on it, checking the moon"). Canned acks are the fallback; if model acks look wrong in practice, use canned only.
+- **One approval and three changes per Claude task.** A second gated change in the same session is refused (`PENDING`); Claude is told to say the owner can ask again. Batch approvals (`yes all`) would lift it.
+- **Media and watch asks stay read-only.** Only asks from a `brain` task get the tools (`tools/ask.py` checks the caller's runner); an image ask from `runner="media"` can't add a note from a screenshot.
+- **The bridge's Python.** The MCP config runs `sys.executable -I brain/mcp_stdio.py`; a daemon running from a venv that moves (an update mid-session) breaks that session's tools only.
+- **Triage holds the slot for one more call.** On a busy model, a turn that would have been local now pays the triage call first (80 tokens out, on the cached prefix); measure in the BR-10 eval row (ack p50, local p50).
+- **The published architecture artifact** is built from `docs/architecture.html` (the brain node now shows triage, the ack and the MCP bridge); republish it after this merges.
 
 ## BR-9 carry-overs: what changed lately
 

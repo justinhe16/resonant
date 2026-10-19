@@ -136,6 +136,24 @@ Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:3
 - **Verify:** `resonant eval task --mode both` (after step 8, model warm; about 10–20 minutes for both modes). Without `--set` it uses `~/.resonant/evals/task.jsonl` when you have one, else the repo's `evals/task.example.jsonl`. `--only <id or category>` reruns a slice.
 - **Expected:** `[loop]` accuracy ≥ 85% with `unapproved 0` and no timeouts (exit 0), and the loop ahead of `[intents]` on `assistant`, `research`, `followup` and `mini`. Escalations are counted apart (rate, precision, recall), so a loop that hands everything to Claude doesn't pass on `assistant` alone. Read the failed cases (text, tools, reply) printed under each mode. The summary goes to `~/.resonant/evals/results/task-<ts>.json` (no texts); compare runs there after a prompt or model change. Record the loop's accuracy and p50/p95 latency in `docs/brain-plan.md` §6. If `[loop]` is under 85% on your own set, switch to `brain: {mode: intents}` until it isn't, and note which rows miss.
 - **Cold prompt.** The loop's first turn after anything else used the model (a restart, a fold, the pulse, an eval run) prefills about 5.2k tokens: about 4.3 s on the Mini before the first token, against about 0.05 s warm. Texting "hey" once after a restart warms it.
+- **Routing (BR-10).** The report adds `route` (how many turns went to Claude, by hand-off), accuracy per route, `kept wrong` (turns the local model kept and got wrong: they should have gone to Claude), triage accuracy on rows with an expected route, and the ack's p50/p95. A live run never starts Claude: a handed-over turn is graded on routing, writes and forbidden tools only (`delegated`). `--route local` measures the loop alone (as before BR-10), `--route claude` checks every turn hands over cleanly. Record the BR-10 row in `docs/brain-plan.md` §6.
+
+### Triage and Claude with Resonant's tools (BR-10)
+
+Since BR-10 the local model's first call on each chat turn decides who answers it (`brain.route: triage`, the default). Easy turns (a status, a note or reminder, one obvious lookup, small talk) stay local: ~1–5 s, free. Everything else goes to Claude: an ack goes out first (~1 s warm, ~4–5 s on a cold prompt), then Claude's answer in ~5–20 s, longer when it uses tools. Claude now has Resonant's tools (runs, PRs, notes, reminders, logs, extensions…) through the same gate, approvals and trust rules as the local model; its own tools stay read-only, and it never sends email or changes calendar events.
+
+- **Knobs** (`~/.resonant/config.yaml`, then `resonant restart`): `brain.route` (`triage` | `local` | `claude`), `brain.triage.bias` (`normal`, or `claude` to keep only status, notes, reminders and small talk local), `brain.triage.timeout_s` (8: past it the turn goes to Claude with a canned ack), `brain.ask_claude.resonant_tools` (true).
+- **Usage.** Every handed-over turn is one `ask_claude` on your Claude subscription and counts against `brain.ask_claude.daily_cap` (30 a day). With triage that can run out on a busy day: past the cap the local model answers instead (no error). Raise the cap if you hit it and your plan's usage limits allow; when Claude hits a usage limit, asks pause until it resets and the local model answers meanwhile.
+- **How to go back.** `brain: {route: local}` restores the BR-9 behavior (Claude only when the loop asks or gets stuck). `brain: {ask_claude: {resonant_tools: false}}` keeps triage but makes Claude read-only again, as in BR-5. Both take effect after `resonant restart`.
+- **Over iMessage** (the phone test list for BR-10; check `/approvals` and the replies):
+  1. "what's R4 doing" or "remind me in 10 minutes to stretch": answered locally, no ack, a few seconds.
+  2. "why did the last resonant PR change the router?": an ack (a short lowercase line, no question) within a few seconds, then `Claude: …` naming the PR and what changed.
+  3. A link ("summarise https://…"): an ack, then Claude's summary.
+  4. "compare what R3 and R4 did and add a note with the differences": an ack, then Claude's answer with `Added note …` as a report line (or, if it read a page or a file first, an approval prompt after the answer: `yes` adds it once, `no` replies `Not done.`).
+  5. With `brain: {route: claude}` for the test, "merge R3" (a run with a ready PR; L2 asks): Claude's answer says it's waiting on your yes, the approval prompt follows it (no code in Claude's text), `no` replies `Not done.` (`yes` merges once). Set `route` back after.
+  6. A follow-up after (2): "and who merged it?": the local model or Claude answers using Claude's earlier answer.
+  7. `/kill`, then a turn triage would hand over: no Claude session starts (asks are refused while paused) and nothing changes; `/resume` after.
+  8. From a member's phone (if you have one): no ack and no Claude; the local loop answers as before.
 
 ## 10. Remote dashboard access
 
