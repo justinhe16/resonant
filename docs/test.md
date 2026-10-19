@@ -18,8 +18,8 @@ Update a row when you try it, with the date and anything odd.
 | 2 | `/pulse now` | `Nothing new to send.` | 📱 |
 | 3 | `/ext list` | `core · built in` with `briefing`, `pulse` and `watches` (BR-7), each with a next time | 📱 |
 | 4 | `/github prs` (before install) | `github isn't installed. On the Mini: resonant ext add repo:github` | 📱 |
-| 5 | `/ext run core/briefing` | The briefing, or `Nothing on today.`, then `Briefing sent.` | 📱 |
-| 6 | The 08:00 briefing arrives on its own | One message, every day, even if it's `Nothing on today.` | 📱 (wait for it) |
+| 5 | `/ext run core/briefing` | The briefing, or one short line (`Morning. Nothing for today.`), then `Briefing sent.` | 📱 |
+| 6 | The 08:00 briefing arrives on its own | One message, every day, even if it's just `Morning. Nothing for today.` (no all-zero `[github]` line) | 📱 (wait for it) |
 | 7 | Chat asks first (Stage B step 3): "please restart resonant" | `[A7] restart Resonant (yes always = don't ask before running restart_resonant). Reply yes / yes always / no`; `no` → `Not done.` | 📱 ❓ |
 | 8 | Approval re-mention: around **:35–:45** past an hour, send "please restart resonant" and **don't answer** | At the top of the hour: `btw:` / `✋ A7 still waiting: restart Resonant`. Then reply `no` (or let it expire at 30 minutes). Only approvals asked :30–:50 are caught (follow-up: an expiry reminder). | 📱 |
 | 9 | Kill switch and pulse: `/kill`, `/pulse now`, `/resume` | `Paused: pulse not sent.`; `/resume` → `resumed: autonomy on, unpaused` | 📱 |

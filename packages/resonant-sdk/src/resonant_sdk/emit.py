@@ -23,6 +23,14 @@ one, else of ``title``. So keep ``state`` coarse (bucket the PnL, leave timestam
     report("dori/incident/inc-412", "Dori failing: checkout 5xx", urgency="urgent",
            state={"status": "triaging"})
     report("dori/incident/inc-412", "Dori recovered", state={"status": "resolved"}, clear=True)
+
+``quiet=True`` says there is nothing worth saying right now (every count is 0, an empty
+digest): Resonant closes the item without a word, so the briefing and the hourly pulse
+leave it out, and the next report that isn't quiet opens it again as news. Use ``clear``
+instead when the owner should hear that something is over. Daemons older than ``quiet``
+ignore the field (the item is then shown as before).
+
+    report("github/summary", "0 open PRs", urgency="low", state=counts, quiet=True)
 """
 
 from __future__ import annotations
@@ -70,13 +78,16 @@ def report(
     state: dict[str, Any] | None = None,
     clear: bool = False,
     ttl: str = "24h",
+    quiet: bool = False,
 ) -> bool:
     """Report a pulse item. False when not running under Resonant (no events fd).
 
     ``key`` is 1..120 characters of ``[a-z0-9/._:-]``. ``ttl`` (``30m``, ``24h``; 1 minute to
     ``168h``, 7 days) is how long the item stays open without a new report. ``clear=True`` says
     the thing is over; a clear, like an urgency change, always counts as news, and is
-    then dropped. ``state`` is at most 2,000 bytes of JSON. Every call gets a unique
+    then dropped. ``quiet=True``: nothing to say (all-zero counts, an empty section); the
+    item is closed silently and left out of the briefing and the pulse, never sent.
+    ``state`` is at most 2,000 bytes of JSON. Every call gets a unique
     dedupe key, so a repeat is never dropped at ingest: Resonant decides whether it is news.
     """
     if not _ITEM_KEY.fullmatch(key):
@@ -99,6 +110,7 @@ def report(
         "state": state,
         "clear": clear,
         "ttl": ttl,
+        "quiet": quiet,
     }
     # `item:` + key (<= 120) + `:` + time_ns in hex (<= 16) stays well under the 200 limit.
     return emit("item", title, f"item:{key}:{time.time_ns():x}", data)

@@ -457,8 +457,10 @@ def test_report_writes_an_item_event_with_a_unique_dedupe_key(
         assert report("dori/incident/inc-412", "Dori failing", urgency="urgent", state={"s": 1})
         assert report("dori/incident/inc-412", "Dori failing", urgency="urgent", state={"s": 1})
         assert report("k" * 120, "t", clear=True, ttl="30m")
+        assert report("github/summary", "0 open PRs", urgency="low", quiet=True)
 
-    first, second, third = _captured_events(monkeypatch, go)
+    first, second, third, fourth = _captured_events(monkeypatch, go)
+    assert fourth["data"]["quiet"] is True and fourth["data"]["clear"] is False
     assert first["type"] == "item" and first["text"] == "Dori failing"
     assert first["data"] == {
         "key": "dori/incident/inc-412",
@@ -466,6 +468,7 @@ def test_report_writes_an_item_event_with_a_unique_dedupe_key(
         "state": {"s": 1},
         "clear": False,
         "ttl": "24h",
+        "quiet": False,
     }
     assert first["dedupe_key"].startswith("item:dori/incident/inc-412:")
     assert first["dedupe_key"] != second["dedupe_key"]  # a repeat is never dropped at ingest

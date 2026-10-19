@@ -570,6 +570,7 @@ def test_digest_reports_the_summary_item(gh: FakeGh) -> None:
         "state": {"open": 3, "failing": 2, "review_requested": 2},
         "clear": False,
         "ttl": "30h",
+        "quiet": False,
     }
     assert r.out["summary"] == line
 
@@ -588,19 +589,31 @@ def test_report_event_matches_the_sdk_report(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("RESONANT_EVENTS_FD", str(w))
     state = {"open": 3, "failing": 1, "review_requested": 2}
     assert report("github/summary", "3 open PRs", urgency="low", state=state, ttl="30h")
+    assert report("github/summary", "0 open PRs", urgency="low", state=state, ttl="30h", quiet=True)
     os.close(w)
     with os.fdopen(r) as f:
-        sdk = json.loads(f.read())
+        sdk, sdk_quiet = (json.loads(line) for line in f.read().splitlines())
     mine = cli.report_event("github/summary", "3 open PRs", state)
     assert mine["type"] == sdk["type"] and mine["text"] == sdk["text"]
     assert mine["data"] == sdk["data"]
+    quiet = cli.report_event("github/summary", "0 open PRs", state, quiet=True)
+    assert quiet["data"] == sdk_quiet["data"] and quiet["data"]["quiet"] is True
     assert mine["dedupe_key"].startswith("item:github/summary:")
 
 
-def test_digest_with_nothing_open(gh: FakeGh) -> None:
+def test_digest_with_nothing_open_is_quiet(gh: FakeGh) -> None:
+    """All zero: reported quiet (BF-1), so the briefing leaves it out instead of texting it."""
     r = gh.run("digest")
     assert r.events[0]["text"] == "0 open PRs, 0 failing CI, 0 awaiting your review"
     assert r.events[0]["data"]["state"] == {"open": 0, "failing": 0, "review_requested": 0}
+    assert r.events[0]["data"]["quiet"] is True
+
+
+@pytest.mark.parametrize("which", ["mine", "review"])
+def test_digest_with_any_count_is_not_quiet(gh: FakeGh, which: str) -> None:
+    gh.state[which] = [pr_node(41, "a", contexts=[check("test")])]
+    r = gh.run("digest")
+    assert r.events[0]["data"]["quiet"] is False
 
 
 def test_health(gh: FakeGh) -> None:
