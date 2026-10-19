@@ -15,11 +15,11 @@ order and records each sent ref on the approval with its send time:
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from resonant.gate import NeedsApproval
+from resonant.gate import ApprovalBatch, NeedsApproval
 from resonant.gateway.channel import ApprovalPrompt, Channel, ChannelError, ChannelRefused
 from resonant.store import approvals as ap
 from resonant.store.audit import audit
@@ -54,6 +54,22 @@ def approval_prompt(decision: NeedsApproval) -> ApprovalPrompt:
     )
 
 
+def batch_prompt(batch: ApprovalBatch) -> ApprovalPrompt:
+    """BA-1: one prompt for a batch (deduped per approver by the batch's id)."""
+    assert batch.expires_at is not None
+    return ApprovalPrompt(
+        approval_id=batch.batch_id,
+        code=batch.code,
+        summary=f"{len(batch.lines)} changes",
+        effect=batch.effect.value,
+        level=batch.level.value,
+        expires_at=batch.expires_at,
+        require_code=batch.require_code,
+        lines=batch.lines,
+        destructive=batch.destructive,
+    )
+
+
 async def prompt_approvers(
     conn: sqlite3.Connection,
     channel: Channel,
@@ -63,11 +79,41 @@ async def prompt_approvers(
     now: Callable[[], datetime],
 ) -> PromptResult:
     """Prompt every approver; see the module docstring for the failure rules."""
-    prompt = approval_prompt(decision)
+    return await _prompt(
+        conn, channel, approval_prompt(decision), decision.approvers, (decision.approval_id,),
+        task_id=task_id, now=now,
+    )  # fmt: skip
+
+
+async def prompt_batch(
+    conn: sqlite3.Connection,
+    channel: Channel,
+    batch: ApprovalBatch,
+    *,
+    now: Callable[[], datetime],
+) -> PromptResult:
+    """BA-1: send a batch's one prompt to its approver (the owner), recording the sent ref on
+    every approval in it (the sent-before rule reads each). Same failure rules."""
+    return await _prompt(
+        conn, channel, batch_prompt(batch), batch.approvers, batch.approval_ids,
+        task_id=batch.task_id, now=now,
+    )  # fmt: skip
+
+
+async def _prompt(
+    conn: sqlite3.Connection,
+    channel: Channel,
+    prompt: ApprovalPrompt,
+    approvers: Sequence[str],
+    approval_ids: Sequence[str],
+    *,
+    task_id: str,
+    now: Callable[[], datetime],
+) -> PromptResult:
     reached: list[str] = []
     unreachable: list[str] = []
     error: ChannelError | None = None
-    for approver in decision.approvers:
+    for approver in approvers:
         try:
             ref = await channel.request_approval(approver, prompt)
         except ChannelRefused as e:
@@ -78,7 +124,7 @@ async def prompt_approvers(
                     "approval.unreachable",
                     task_id=task_id,
                     requested_by=approver,
-                    approval_id=decision.approval_id,
+                    approval_id=prompt.approval_id,
                     channel=channel.name,
                     error=type(e).__name__,
                 )
@@ -87,8 +133,8 @@ async def prompt_approvers(
             error = error or e
             continue
         reached.append(approver)
+        at = now()
         with transaction(conn):
-            ap.add_channel_ref(
-                conn, decision.approval_id, ref=ref.ref, at=now(), principal=approver
-            )
+            for approval_id in approval_ids:
+                ap.add_channel_ref(conn, approval_id, ref=ref.ref, at=at, principal=approver)
     return PromptResult(tuple(reached), tuple(unreachable), error)

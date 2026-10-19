@@ -494,6 +494,84 @@ def resolve_result(approvals: Sequence[Approval]) -> ResolveResult:
     return ResolveResult(ok=True, resolved=tuple(a.resolved() for a in approvals))
 
 
+# --- batches (BA-1, the approval_batches table of migration 002) ---------------------------
+
+
+@dataclass(frozen=True)
+class BatchRow:
+    """One batch prompt: several pending approvals of one task asked about as one message,
+    answered with one code (its first approval's). ``principal`` is who it was asked of
+    (the owner); ``used_at`` is when a reply (or ``resolve``) decided it."""
+
+    id: str
+    principal: str
+    approval_ids: tuple[str, ...]
+    created_at: datetime
+    used_at: datetime | None
+
+
+def _row_to_batch(r: sqlite3.Row) -> BatchRow:
+    created = _dt(r["created_at"])
+    assert created is not None
+    return BatchRow(
+        id=r["id"],
+        principal=r["principal"],
+        approval_ids=tuple(json.loads(r["approval_ids"])),
+        created_at=created,
+        used_at=_dt(r["used_at"]),
+    )
+
+
+def insert_batch(
+    conn: sqlite3.Connection, principal: str, approval_ids: Sequence[str], now: datetime
+) -> BatchRow:
+    """A new batch over ``approval_ids`` (in order) for ``principal``."""
+    batch_id = new_id()
+    conn.execute(
+        "INSERT INTO approval_batches (id, principal, approval_ids, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (batch_id, principal, json.dumps(list(approval_ids)), iso(now)),
+    )
+    return BatchRow(batch_id, principal, tuple(approval_ids), now, None)
+
+
+def get_batch(conn: sqlite3.Connection, batch_id: str) -> BatchRow | None:
+    r = conn.execute("SELECT * FROM approval_batches WHERE id = ?", (batch_id,)).fetchone()
+    return None if r is None else _row_to_batch(r)
+
+
+def batches_of(conn: sqlite3.Connection, approval_ids: Sequence[str]) -> dict[str, BatchRow]:
+    """``approval id -> the batch it is in`` for each of ``approval_ids`` in one (an
+    approval is in at most one batch: ``open_batch`` checks)."""
+    if not approval_ids:
+        return {}
+    marks = ",".join("?" * len(approval_ids))
+    rows = conn.execute(
+        f"""SELECT b.*, j.value AS member FROM approval_batches b, json_each(b.approval_ids) j
+            WHERE j.value IN ({marks})""",  # noqa: S608 - only placeholders are interpolated
+        tuple(approval_ids),
+    ).fetchall()
+    return {r["member"]: _row_to_batch(r) for r in rows}
+
+
+def mark_batch_used(conn: sqlite3.Connection, batch_id: str, now: datetime) -> bool:
+    """The batch was answered. True the first time."""
+    cur = conn.execute(
+        "UPDATE approval_batches SET used_at = ? WHERE id = ? AND used_at IS NULL",
+        (iso(now), batch_id),
+    )
+    return cur.rowcount == 1
+
+
+def set_expiry(conn: sqlite3.Connection, approval_ids: Sequence[str], at: datetime) -> None:
+    """One expiry for a batch's pending approvals, so they expire together."""
+    for approval_id in approval_ids:
+        conn.execute(
+            "UPDATE approvals SET expires_at = ? WHERE id = ? AND status = 'pending'",
+            (iso(at), approval_id),
+        )
+
+
 def intent_args(conn: sqlite3.Connection, approval: Approval) -> dict[str, Any] | None:
     """The full args of the intent that created ``approval``, from its ``gate.evaluate``
     audit row. None if that row is missing. For the owner only: the summary masks them.

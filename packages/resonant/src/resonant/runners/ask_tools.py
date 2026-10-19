@@ -83,8 +83,18 @@ from resonant.observability.spans import span
 from resonant.router.intents import ExtensionCatalog
 from resonant.runners.local import gated_answer, model_result
 from resonant.store.tasks import get_task
-from resonant.toolcore import MAX_SIDE_EFFECTS, Asked, CallScope, ToolCore, args_error
-from resonant_sdk import Effect, Level, ToolSpec
+from resonant.toolcore import (
+    MAX_SIDE_EFFECTS,
+    Asked,
+    BatchItem,
+    CallOutcome,
+    CallScope,
+    Ran,
+    Refused,
+    ToolCore,
+    args_error,
+)
+from resonant_sdk import Effect, ToolSpec
 
 log = logging.getLogger(__name__)
 
@@ -101,17 +111,14 @@ DESCRIPTION_CHARS = 600
 
 UNSURE = "error: Resonant hit an error; it may or may not have run. Check before retrying."
 PAUSED = "not run: Resonant is paused (/kill); nothing runs until the owner resumes it."
-PENDING = (
-    "not run: this task is already waiting on the owner's answer for {what}, and a task "
-    "asks once. Tell the owner they can ask for it again after."
-)
 CAPPED = (
     f"not run: at most {MAX_SIDE_EFFECTS} changes per task, and they already ran. Tell the "
     "owner what ran and that they can ask for the rest separately."
 )
 ASKED = (
     "asked the owner: {what}. Nothing ran yet: it runs only if they say yes, after your "
-    "answer. Tell them it's waiting on their yes; don't call it again."
+    "answer (every change that asks goes into one prompt, so go on with the rest). Tell "
+    "them it's waiting on their yes; don't call it again."
 )
 NO_SUCH_TOOL = "not run: there is no Resonant tool named {name}"
 NOT_BOUND = "not run: no message from the owner is being answered right now"
@@ -186,7 +193,9 @@ class ClaudeTools:
         specs = [s for s in access.tools_for(self.principal) if s.name != "ask_claude"]
         self.specs: dict[str, ToolSpec] = {s.name: s for s in sorted(specs, key=lambda s: s.name)}
         self.reports: list[str] = []
-        self.pending: str | None = None  # the code-built summary of the call waiting
+        # BA-1: the changes the gate asked about, pinned in ``checkpoint.batch`` (in order);
+        # after the answer the owner gets one prompt for all of them.
+        self.asked: list[BatchItem] = []
         self.calls = 0
         self.outside = False  # a tool of Claude's own ran (outside content)
         # BR-11: outside content came in during this session itself (one of Claude's own
@@ -319,9 +328,6 @@ class ClaudeTools:
             return BAD_ARGS.format(why=why, name=spec.name, schema=schema), True
         if self._paused():
             return PAUSED, True
-        # a pending call's pin must stay: nothing else that could be pinned runs after it
-        if self.pending is not None and (change or spec.effective_level is not Level.L0):
-            return PENDING.format(what=self.pending), True
         if change and len(self.reports) >= MAX_SIDE_EFFECTS:
             return CAPPED, True
         if self.outside:
@@ -345,13 +351,16 @@ class ClaudeTools:
             steps=self.ctx,
             effects=list(self.reports),
             pin={"tainted": self.tainted},
+            batch=self.asked,
         )
         outcome = await self.core.call(spec, args, scope)
-        if self.access.taints(spec):
+        if self.access.taints(spec) and _shows_outside(spec, outcome):
             self.tainted = self.read_outside = True
         if isinstance(outcome, Asked):
-            # Pinned, not prompted: the owner is asked after Claude's answer goes out.
-            self.pending = outcome.summary
+            # Pinned in the batch, not prompted: the owner is asked after Claude's answer.
+            item = outcome.item
+            if item is not None and all(i.approval_id != item.approval_id for i in self.asked):
+                self.asked.append(item)
             return ASKED.format(what=outcome.summary), False
         if outcome.gated:
             done = gated_answer(outcome)
@@ -380,6 +389,18 @@ class ClaudeTools:
             return killswitch.is_paused(self.conn)
         except killswitch.PausedStateUnknownError:
             return True
+
+
+def _shows_outside(spec: ToolSpec, outcome: CallOutcome) -> bool:
+    """Whether what Claude got back from this tainting tool carries outside content (D6). A
+    read does (its result). A call that didn't run (asked, refused) doesn't. An extension's
+    change that ran doesn't either (BA-1): Claude gets only its code-built report line
+    (``Done: linear: save issue id=…``, from the args Claude chose), never the result; a
+    failed one does (its reason may be the extension's own text)."""
+    if isinstance(outcome, Asked | Refused):
+        return False
+    change = spec.effect is not Effect.READ
+    return not (change and spec.extension is not None and isinstance(outcome, Ran))
 
 
 def listing(specs: Iterable[ToolSpec]) -> list[dict[str, Any]]:

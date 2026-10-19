@@ -588,10 +588,11 @@ def test_resolve_checks_approver_and_wakes_the_task(
     assert json.loads(rows[0]["detail"])["reason"] == "not an approver"
 
 
-def test_batches_are_deferred(gate: PolicyGate) -> None:
+def test_a_batch_needs_two_pending_approvals(gate: PolicyGate) -> None:
+    """BA-1 (batches in test_batch_approvals.py): an empty or one-approval batch is refused."""
     contract: Gate = gate  # PolicyGate satisfies the Gate protocol
     assert contract is gate
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="at least two"):
         gate.open_batch("justin", [])
 
 

@@ -109,6 +109,21 @@ def _rule_added(d: dict[str, Any]) -> str | None:
     return line + "."
 
 
+def _tools_allowed(d: dict[str, Any]) -> str | None:
+    """``allow_tools``: each rule it saved, by number (BA-1)."""
+    rules = d.get("rules")
+    if not isinstance(rules, list) or not rules:
+        return None
+    parts: list[str] = []
+    for r in cast(list[Any], rules):
+        rd = cast(dict[str, Any], r) if isinstance(r, dict) else {}
+        rule_id, text = rd.get("id"), rd.get("text")
+        if not isinstance(rule_id, int) or not isinstance(text, str):
+            return None
+        parts.append(f"{text} (rule {rule_id}{', already there' if rd.get('existed') else ''})")
+    return "Rules: " + "; ".join(parts) + ". Changes after outside content still ask."
+
+
 def _rule_removed(d: dict[str, Any]) -> str | None:
     rule_id, text = d.get("id"), d.get("text")
     if d.get("removed") is not True or not isinstance(rule_id, int) or not isinstance(text, str):
@@ -179,6 +194,7 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "forget_repo": _run_text,
     "add_trust_rule": _rule_added,
     "allow_trust_rule": _rule_added,
+    "allow_tools": _tools_allowed,
     "remove_trust_rule": _rule_removed,
     "remember": _fact_saved,
     "forget": _fact_forgotten,

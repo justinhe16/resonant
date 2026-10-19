@@ -94,7 +94,7 @@ from resonant.brain.facts import FactStore
 from resonant.brain.history import fold, fold_due
 from resonant.brain.text import flat
 from resonant.config import Settings
-from resonant.gate.types import Origin
+from resonant.gate.types import NeedsApproval, Origin
 from resonant.gateway.channel import Channel
 from resonant.loop.slots import SlotPool
 from resonant.loop.types import Done, StepContext, StepOutcome, Task
@@ -113,6 +113,7 @@ from resonant.router.intents import ExtensionCatalog
 from resonant.router.labeler import Labeler
 from resonant.router.router import builtin_names, chat_toolset, toolset_entries, toolset_for
 from resonant.runners.local import (
+    GATED_PATHS,
     MODEL_RESULT_MAX_CHARS,
     NO_ANSWER_REPLY,
     REPLY_SCHEMA,
@@ -129,7 +130,7 @@ from resonant.runners.local import (
     with_report,
 )
 from resonant.store.db import utcnow
-from resonant.toolcore import MAX_SIDE_EFFECTS, RunnerGate, ToolExecutor
+from resonant.toolcore import MAX_SIDE_EFFECTS, BatchItem, RunnerGate, ToolExecutor
 from resonant.toolcore import args_error as args_error  # moved here (TC-1); re-exported
 from resonant.tools import ToolRegistry
 from resonant.tools.ask import ASK_CLAUDE, ASKING_HOPS, QUESTION_MAX
@@ -393,6 +394,8 @@ class _Turn:
     core: list[ToolSpec]
     deferred: dict[str, ToolSpec]  # by model-facing name; offered as stubs
     calls: list[CallResult] = field(default_factory=list[CallResult])
+    batch: list[BatchItem] = field(default_factory=list[BatchItem])  # BA-1: waits on the owner
+    decisions: dict[str, NeedsApproval] = field(default_factory=dict[str, NeedsApproval])
     tainted: bool = False
     hops: int = 0  # BR-10b: replays from the outside text (0: this task read it itself)
     errors: int = 0
@@ -589,7 +592,9 @@ class BrainRunner(LocalRunner):
         spans: SpanFactory,
     ) -> StepResult:
         cp = task.checkpoint
-        if any(k in cp for k in ("call", "direct_call", "fast_reply", "fallback", "intent")):
+        if any(
+            k in cp for k in ("batch", "call", "direct_call", "fast_reply", "fallback", "intent")
+        ):
             return await super()._answer(task, principal, events, ctx, spans)
         text = self._current_text(task, events)
         if text is None:
@@ -699,6 +704,23 @@ class BrainRunner(LocalRunner):
                        hops=st.hops):  # fmt: skip
                 pass
         result = await self._route(task, principal, text, st, ctx, spans)
+        if st.batch and isinstance(result, Answer):
+            # BA-1: changes wait on the owner: one prompt for all of them, then the task waits.
+            # The model's own words give way to the code-built lines (what ran, why it
+            # stopped); the reply after the owner's answer is code-built too.
+            lines = [result.reply] if result.path in GATED_PATHS else st.reports
+            with spans("runner.brain.batch", changes=len(st.batch), ran=len(st.reports)):
+                pass
+            return await self.close_batch(
+                task,
+                principal,
+                st.batch,
+                list(lines),
+                ctx,
+                spans,
+                pin=st.pin(),
+                decision=st.decisions.get(st.batch[0].approval_id),
+            )
         if isinstance(result, Answer):  # the next turn's history reads it (BR-10b)
             result.meta["tainted"] = result.meta.get("tainted") is True or st.tainted
             if st.tainted:
@@ -730,7 +752,7 @@ class BrainRunner(LocalRunner):
             return await self._rounds(task, principal, text, st, ctx, spans)
         except ModelUnavailableError:
             log.warning("model unavailable for brain task %s", task.id)
-            if st.reports:
+            if st.reports or st.batch:
                 return Answer(
                     clip_reply("\n".join(st.reports), MAX_REPLY_CHARS), "done", used_tools(st.calls)
                 )
@@ -816,9 +838,10 @@ class BrainRunner(LocalRunner):
     ) -> StepResult | None:
         """Hand the turn to Claude: ``ask_claude`` through the gate and executor (origin as
         the task's, so a tainted turn starts a tainted session), and the ack is the reply.
-        None when it couldn't be queued (the principal may not, it is off, refused)."""
+        None when it couldn't be queued (the principal may not, it is off, refused), or when
+        changes already wait on the owner in this turn's batch (BA-1: the turn asks first)."""
         spec = self._claude_spec(principal)
-        if spec is None:
+        if spec is None or st.batch:
             return None
         question = text[: QUESTION_MAX - len(note)] + note
         args: dict[str, Any] = {"question": question}
@@ -932,6 +955,8 @@ class BrainRunner(LocalRunner):
                 if ended is not None:
                     return ended
                 if len(st.reports) >= MAX_SIDE_EFFECTS:
+                    if st.batch:  # the batch's reply is code-built: no narration
+                        return Answer("\n".join(st.reports), "done", used_tools(st.calls))
                     return await self._narrate(st, spans)
         return await self._stuck(task, principal, text, st, ctx, spans, cap=True)
 
@@ -970,8 +995,8 @@ class BrainRunner(LocalRunner):
         BR-9). ``(kind, text)`` or None. Each round runs once per task; a guard that fires
         again hands the turn to Claude (BR-10, ``_rounds``), and only when that can't happen
         does the second answer go out as is (the code-built report lines are the owner's
-        record of what ran)."""
-        if st.reports:
+        record of what ran). Not with a batch waiting (BA-1): the answer gives way to it."""
+        if st.reports or st.batch:
             return None
         if claims_change(answer):
             return ("claim", CLAIM_NUDGE)
@@ -1096,6 +1121,7 @@ class BrainRunner(LocalRunner):
                 origin=st.origin,
                 pin=st.pin(),
                 check_schema=True,  # checked above (``_one``); ToolCore checks again
+                batch=st.batch,
             )
         st.executed += 1
         session = (
@@ -1103,7 +1129,15 @@ class BrainRunner(LocalRunner):
             and isinstance(done, CallResult)
             and (done.data or {}).get("session") is True
         )  # BR-11: a Claude brain turn records its own taint with its answer
-        if taints(spec) and not session:
+        asked = done.asked if isinstance(done, CallResult) else None
+        if asked is not None:  # BA-1: it waits on the owner; nothing ran, nothing was read
+            if all(i.approval_id != asked.approval_id for i in st.batch):
+                st.batch.append(asked)
+                if isinstance(done, CallResult) and done.decision is not None:
+                    st.decisions[asked.approval_id] = done.decision
+            with spans("runner.brain.asked", tool=name, batch=len(st.batch)):
+                pass
+        elif taints(spec) and not session:
             if not st.tainted or st.hops:
                 with spans("runner.brain.taint", tool=name, extension=spec.extension):
                     pass
@@ -1206,7 +1240,7 @@ class BrainRunner(LocalRunner):
             s.set(escalated=handed is not None)
         if handed is not None:
             return handed
-        if st.reports:
+        if st.reports or st.batch:
             reports = clip_reply("\n".join(st.reports), MAX_REPLY_CHARS)
             return Answer(reports, "done", used_tools(st.calls), escalate=True)
         if cap:

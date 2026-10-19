@@ -392,22 +392,22 @@ async def test_an_untainted_l3_write_runs_with_its_report_line(
         assert answer == 'Claude: Noted.\nSaved note 1: "renew passport"'
 
 
-async def test_one_approval_per_task_and_the_change_cap(
+async def test_the_change_cap_without_asking(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
+    """At most MAX_SIDE_EFFECTS (5, BA-1) changes run without asking per task; past it even
+    a change that would ask is refused (batches of asked changes: test_e2e_batch.py)."""
     async with start(resonant_home, chat, tmp_path) as w:
         w.model.triage = CLAUDE
         calls: list[dict[str, Any]] = [
-            {"name": "add_note", "args": {"text": "one"}},
-            {"name": "add_note", "args": {"text": "two"}},
-            {"name": "add_note", "args": {"text": "three"}},
-            {"name": "add_note", "args": {"text": "four"}},
-            {"name": "create_watch", "args": WATCH},
+            {"name": "add_note", "args": {"text": t}}
+            for t in ("one", "two", "three", "four", "five", "six")
         ]
-        w.claude(calls=calls, answer="{r3} | {r4}")
-        _ack, answer = await w.say("add four notes and a watch", replies=2)
-        assert "not run: at most 3 changes" in answer
-        assert len(w.executions("add_note")) == 3 and w.rows("SELECT 1 FROM approvals") == []
+        calls.append({"name": "create_watch", "args": WATCH})
+        w.claude(calls=calls, answer="{r5} | {r6}")
+        _ack, answer = await w.say("add six notes and a watch", replies=2)
+        assert answer.count("not run: at most 5 changes") == 2
+        assert len(w.executions("add_note")) == 5 and w.rows("SELECT 1 FROM approvals") == []
 
 
 async def test_the_kill_switch_asks_for_everything(

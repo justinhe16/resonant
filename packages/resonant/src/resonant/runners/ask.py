@@ -1040,7 +1040,7 @@ class AskRunner:
         left = await self._reap_left(task, cp)
         if cp.get("session_turn") is True:  # BR-11: a Claude brain turn a crash cut short
             left = True
-        if left and isinstance(cp.get("call"), dict):  # a change may have run: never again
+        if left and (isinstance(cp.get("call"), dict) or "batch" in cp):  # never run again
             effects = [e for e in cast(list[Any], cp.get("effects") or []) if isinstance(e, str)]
             done = f" Done before it: {'; '.join(effects)}." if effects else ""
             return await self._finish(task, ctx, cp, "interrupted", INTERRUPTED.format(done=done))
@@ -1151,9 +1151,12 @@ class AskRunner:
             cp.pop("session_turn", None)
             cp.update(keep or {})
             reports = list(bridge.reports)
-            pending = bridge.pending is not None and outcome[0] == "answered"
+            pending = bool(bridge.asked) and outcome[0] == "answered"
+            # Every allowed call ran by now: ``call`` never waits (BA-1: the changes that
+            # ask are in ``batch``, prompted after the answer, or dropped with it).
+            cp.pop("call", None)
             if not pending:
-                cp.pop("call", None)  # ran, refused, or never prompted: nothing waits
+                cp.pop("batch", None)  # never prompted: nothing waits
         status, text, result = outcome
         if status == "usage_limit" and result is not None:
             hit = usage_limit(result)
@@ -1255,7 +1258,7 @@ class AskRunner:
                 observe=bridge.observe,
                 check_init=lambda names: check_init(names, ts, "general"),
                 paused=self._paused,
-                may_retry=lambda: bridge.changes == 0 and bridge.pending is None,
+                may_retry=lambda: bridge.changes == 0 and not bridge.asked,
                 started=started,
                 fingerprint=",".join(mcp.allowed),
                 hops_of=hops_of,
@@ -1593,7 +1596,7 @@ class AskRunner:
         if (
             cp.get("pending") is True
             and self.resumer is not None
-            and isinstance(cp.get("call"), dict)
+            and (isinstance(cp.get("call"), dict) or isinstance(cp.get("batch"), list))
         ):  # BR-10: now prompt the owner and wait, as the local runner does
             nxt = {k: v for k, v in cp.items() if k not in ("reply", "dedupe_key", "pending")}
             nxt.update(phase="approval", answer=reply, effects=[])  # effects were in the reply

@@ -55,6 +55,15 @@ approval that offered it (``allow_always``: a worker's trust check or an owner's
 call; never ``require_code``) and only from the owner, else ``always_unsupported``.
 Resolution is idempotent per reply event (``resolved_event_id``).
 
+Batches (BA-1, ``open_batch``): a task that collected several changes needing approval asks
+the owner once. ``open_batch`` stores the snapshot in ``approval_batches`` (its approvals, in
+order), gives them one expiry and returns the batch, whose code is its first approval's. For
+binding, a batch is one unit: its code is the only one that names it, a plain yes/no counts
+it as one pending item, it needs the code when any of its approvals does (the strictest
+level), ``yes always`` is refused for it, and only the owner it was asked of can answer it
+(a member who approves one of its extensions gets ``nothing_pending``). Resolving it
+resolves every approval in it in one transaction (all or none), by text or by id.
+
 Expiry is lazy: every entry point first runs ``expire_due``. Every ``evaluate`` writes one
 ``gate.evaluate`` audit row; every resolution attempt writes one ``approval.resolve`` row.
 """
@@ -66,6 +75,7 @@ import logging
 import secrets
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
@@ -106,6 +116,11 @@ NO_TASK = "approvals need a task"
 
 # Channels whose text replies may bind approvals. The iMessage reader already drops SMS.
 REPLY_CHANNELS = frozenset({"imessage"})
+
+# BA-1: at most this many changes wait on the owner in one batch (``gate.batch_max``).
+DEFAULT_BATCH_MAX = 10
+ALWAYS_NOTE = " (yes always = "  # how a standing allow's offer starts in a summary
+BATCH_SUMMARY_CHARS = 200  # a batch as one line (``pending_for``: /approvals, re-asks)
 
 Rule = Literal["allow", "ask", "ask_code"]
 
@@ -190,6 +205,7 @@ class PolicyGate:
         levels: Mapping[ToolKey, LevelFor] | None = None,
         standing: Standing | None = None,
         clock: Callable[[], datetime] = utcnow,
+        batch_max: int = DEFAULT_BATCH_MAX,
     ) -> None:
         self.conn = conn
         self.principals = principals
@@ -201,7 +217,12 @@ class PolicyGate:
         self.levels = dict(levels or {})
         self.standing = standing
         self.clock = clock
+        self.batch_max = batch_max
         self._tokens: dict[str, str] = {}
+
+    @property
+    def owner(self) -> str:
+        return self.principals.owner
 
     # --- evaluate ----------------------------------------------------------------------
 
@@ -377,31 +398,150 @@ class PolicyGate:
     # --- approvals ---------------------------------------------------------------------
 
     def pending_for(self, principal: str) -> Sequence[PendingApproval]:
+        """The principal's pending approvals, a batch as one entry (its code, its first
+        approval's id, a one-line summary of all of it, its strictest level)."""
         now = self.clock()
         with atomic(self.conn):
             ap.expire_due(self.conn, now)
             rows = ap.pending_for(self.conn, principal, now)
-        return tuple(
-            PendingApproval(
-                approval_id=a.id,
-                code=a.code or "",
-                task_id=a.task_id or "",
-                summary=a.summary,
-                effect=a.effect,
-                level=a.level,
-                require_code=a.require_code,
-                expires_at=a.expires_at,
+            units = self._units(rows, principal)
+        return tuple(u.pending() for u in units)
+
+    def approval_states(self, approval_ids: Sequence[str]) -> dict[str, ap.ApprovalStatus]:
+        """BA-1: each approval's status now (after lazy expiry); a missing one is left out."""
+        now = self.clock()
+        out: dict[str, ap.ApprovalStatus] = {}
+        with atomic(self.conn):
+            ap.expire_due(self.conn, now)
+            for approval_id in approval_ids:
+                row = ap.get_approval(self.conn, approval_id)
+                if row is not None:
+                    out[approval_id] = row.status
+        return out
+
+    def drop(self, approval_ids: Sequence[str], *, reason: str) -> None:
+        """BA-1: expire these pending approvals (a batch that can't be asked as one; a change
+        past the batch cap), so no reply can bind them. Audited ``approval.expired``."""
+        now = self.clock()
+        with atomic(self.conn):
+            for approval_id in approval_ids:
+                ap.expire_one(self.conn, approval_id, now, reason=reason)
+
+    def open_batch(self, principal: str, approval_ids: Sequence[str]) -> ApprovalBatch:
+        """Ask ``principal`` (the owner) about these pending approvals of one task as one
+        batch: the snapshot is stored (``approval_batches``, in order) and they get one expiry,
+        ``now + approval_ttl_s``. The same set again returns the batch already open (a
+        re-prompt), unchanged. ``ValueError`` for fewer than two or more than ``batch_max``
+        approvals, anyone but the owner, an approval that isn't pending, another task's, one
+        the owner can't approve, or one already in another batch."""
+        ids = tuple(dict.fromkeys(approval_ids))
+        if len(ids) < 2:
+            raise ValueError("a batch has at least two approvals")
+        if len(ids) > self.batch_max:
+            raise ValueError(f"a batch has at most {self.batch_max} approvals")
+        if principal != self.principals.owner:
+            raise ValueError("batches are asked of the owner")
+        now = self.clock()
+        with atomic(self.conn):
+            ap.expire_due(self.conn, now)
+            rows = [ap.get_approval(self.conn, i) for i in ids]
+            found = [r for r in rows if r is not None]
+            if len(found) != len(ids) or any(r.status != "pending" for r in found):
+                raise ValueError("every approval in a batch must be pending")
+            if len({r.task_id for r in found}) != 1 or found[0].task_id is None:
+                raise ValueError("a batch is one task's approvals")
+            if not all(
+                principal in r.approvers and self.principals.can(principal, "approve", r.extension)
+                for r in found
+            ):
+                raise ValueError("the owner can't approve every approval in it")
+            index = ap.batches_of(self.conn, ids)
+            if index:
+                existing = index.get(ids[0])
+                same = existing is not None and existing.approval_ids == ids
+                if not same or existing is None or existing.used_at is not None:
+                    raise ValueError("an approval is already in another batch")
+                return _Unit(tuple(found), existing).as_batch()
+            row = ap.insert_batch(self.conn, principal, ids, now)
+            ap.set_expiry(self.conn, ids, now + self.ttl)
+            members = tuple(a for a in (ap.get_approval(self.conn, i) for i in ids) if a)
+            unit = _Unit(members, row)
+            audit(
+                self.conn,
+                "approval.batch",
+                task_id=found[0].task_id,
+                requested_by=principal,
+                batch_id=row.id,
+                approval_ids=list(ids),
+                code=unit.code,
+                level=unit.level.value,
+                require_code=unit.require_code,
             )
-            for a in rows
-        )
+        return unit.as_batch()
+
+    def _units(self, rows: Sequence[ap.Approval], actor: str) -> list[_Unit]:
+        """``rows`` (open approvals, oldest first) as what one reply can answer: each lone
+        approval, and each batch whose approvals are all in ``rows`` and that was asked of
+        ``actor``, in place of its first approval. A batch asked of someone else, or with an
+        approval missing from ``rows``, is left out: ``actor`` can't answer it."""
+        index = ap.batches_of(self.conn, [a.id for a in rows])
+        by_id = {a.id: a for a in rows}
+        out: list[_Unit] = []
+        seen: set[str] = set()
+        for a in rows:
+            batch = index.get(a.id)
+            if batch is None:
+                out.append(_Unit((a,)))
+                continue
+            if batch.id in seen:
+                continue
+            seen.add(batch.id)
+            members = tuple(by_id.get(i) for i in batch.approval_ids)
+            if batch.principal != actor or any(m is None for m in members):
+                continue
+            out.append(_Unit(tuple(m for m in members if m is not None), batch))
+        return out
+
+    def _resolve_unit(
+        self,
+        unit: _Unit,
+        *,
+        approved: bool,
+        actor: str,
+        now: datetime,
+        event_id: str | None = None,
+        always: bool = False,
+    ) -> str | None:
+        """Resolve a lone approval, or every approval of a batch (all or none: one refused
+        rolls the others back). None on success, else the store's reason."""
+        if unit.batch is None:
+            return ap.resolve(
+                self.conn, unit.head.id, approved=approved, decided_by=actor, now=now,
+                event_id=event_id, always=always,
+            )  # fmt: skip
+        try:
+            with atomic(self.conn):
+                for m in unit.members:
+                    why = ap.resolve(
+                        self.conn, m.id, approved=approved, decided_by=actor, now=now,
+                        event_id=event_id,
+                    )  # fmt: skip
+                    if why is not None:
+                        raise _BatchRefused(why)
+                ap.mark_batch_used(self.conn, unit.batch.id, now)
+        except _BatchRefused as e:
+            return e.reason
+        return None
 
     def resolve(self, resolution: ApprovalResolution) -> ResolveResult:
-        """Resolve one approval by id (CLI or button) and wake its task, in one transaction."""
+        """Resolve one approval by id (CLI or button) and wake its task, in one transaction.
+        An approval in an open batch resolves the whole batch (one decision for it)."""
         now = self.clock()
         with atomic(self.conn):
             ap.expire_due(self.conn, now)
             approval = ap.get_approval(self.conn, resolution.approval_id)
             reason: str | None
+            unit: _Unit | None = None
             if approval is None or approval.task_id is None:
                 reason = "not_found"
             elif resolution.actor not in approval.approvers or not self.principals.can(
@@ -409,20 +549,19 @@ class PolicyGate:
             ):
                 reason = "not an approver"
             else:
-                reason = ap.resolve(
-                    self.conn,
-                    approval.id,
-                    approved=resolution.approved,
-                    decided_by=resolution.actor,
-                    now=now,
-                )
+                unit = self._unit_of(approval)
+                if unit.batch is not None and unit.batch.principal != resolution.actor:
+                    reason = "not an approver"  # a batch is the owner's to answer
+                else:
+                    reason = self._resolve_unit(
+                        unit, approved=resolution.approved, actor=resolution.actor, now=now
+                    )
             # A non-approver can't tell an existing approval from a missing one.
             shown = "not_found" if reason == "not an approver" else reason
             result = ResolveResult(ok=False, reason=shown)
-            if reason is None and approval is not None:
-                done = ap.get_approval(self.conn, approval.id)
-                assert done is not None
-                result = ap.resolve_result([done])
+            if reason is None and unit is not None:
+                done = [ap.get_approval(self.conn, m.id) for m in unit.members]
+                result = ap.resolve_result([d for d in done if d is not None])
                 ap.wake_resolved(self.conn, result, now, principal=resolution.actor)
             audit(
                 self.conn,
@@ -438,6 +577,8 @@ class PolicyGate:
                 else "refused",
                 requested="approve" if resolution.approved else "deny",
                 approval_id=resolution.approval_id,
+                batch_id=unit.batch.id if unit is not None and unit.batch is not None else None,
+                approval_ids=[m.id for m in unit.members] if unit is not None else None,
                 actor_identity=resolution.actor_identity,
                 path=resolution.path,
                 comments=resolution.comments,
@@ -445,6 +586,16 @@ class PolicyGate:
                 reason=reason,
             )
         return result
+
+    def _unit_of(self, approval: ap.Approval) -> _Unit:
+        """``approval`` alone, or the open batch it is in (its approvals, in order)."""
+        batch = ap.batches_of(self.conn, [approval.id]).get(approval.id)
+        if batch is None or batch.used_at is not None:
+            return _Unit((approval,))
+        members = tuple(
+            a for a in (ap.get_approval(self.conn, i) for i in batch.approval_ids) if a is not None
+        )
+        return _Unit(members, batch)
 
     def resolve_reply(self, reply: ApprovalReply) -> ResolveResult:
         """Bind a text reply to one approval, resolve it and wake its task, in one
@@ -462,25 +613,26 @@ class PolicyGate:
                 if all(a.decided_by == reply.actor for a in earlier):
                     return ap.resolve_result(earlier)
                 return ResolveResult(ok=False, reason="nothing_pending")
-            target, reason = self._bind(reply, now)
-            if target is not None:
-                reason = ap.resolve(
-                    self.conn,
-                    target.id,
+            unit, reason = self._bind(reply, now)
+            target = unit.head if unit is not None else None
+            if unit is not None:
+                reason = self._resolve_unit(
+                    unit,
                     approved=reply.decision == "approve",
-                    decided_by=reply.actor,
+                    actor=reply.actor,
                     now=now,
                     event_id=reply.event_id,
                     always=reply.always,
                 )
             result = ResolveResult(ok=False, reason=reason)
-            if reason is None and target is not None:
-                done = ap.get_approval(self.conn, target.id)
-                assert done is not None
-                result = ap.resolve_result([done])
+            if reason is None and unit is not None:
+                rows = [ap.get_approval(self.conn, m.id) for m in unit.members]
+                done_rows = [d for d in rows if d is not None]
+                result = ap.resolve_result(done_rows)
+                done = done_rows[0]
                 if reply.comments and reply.decision == "approve":
                     _add_comments(self.conn, done, reply)
-                if done.always and done.always_scope and done.always_action:
+                if unit.batch is None and done.always and done.always_scope and done.always_action:
                     _add_standing_rule(self.conn, done, reply.actor, now)
                 ap.wake_resolved(self.conn, result, now, principal=reply.actor)
             audit(
@@ -497,6 +649,8 @@ class PolicyGate:
                 else "refused",
                 requested=reply.decision,
                 approval_id=target.id if target else None,
+                batch_id=unit.batch.id if unit is not None and unit.batch is not None else None,
+                approval_ids=[m.id for m in unit.members] if unit is not None else None,
                 actor_identity=reply.actor_identity,
                 channel=reply.channel,
                 path=reply.path,
@@ -513,8 +667,9 @@ class PolicyGate:
 
     def _bind(
         self, reply: ApprovalReply, now: datetime
-    ) -> tuple[ap.Approval | None, ReplyRefusal | None]:
-        """The approval this reply binds to, or why it binds none."""
+    ) -> tuple[_Unit | None, ReplyRefusal | None]:
+        """What this reply binds to (one approval, or a batch as one unit), or why it binds
+        none."""
         if (
             reply.channel not in REPLY_CHANNELS
             or reply.path != "parser"
@@ -522,37 +677,42 @@ class PolicyGate:
             or reply.batch_id is not None
         ):
             return None, "unsupported"
-        mine = [
-            a for a in ap.pending_for(self.conn, reply.actor, now) if self._may_approve(reply, a)
-        ]
+        mine = self._units(
+            [a for a in ap.pending_for(self.conn, reply.actor, now) if self._may_approve(reply, a)],
+            reply.actor,
+        )
         if not mine:
             return None, "nothing_pending"  # also what a non-approver always gets
         if reply.code is not None:
             code = reply.code.upper()
-            target = next((a for a in mine if a.code == code), None)
+            target = next((u for u in mine if u.code == code), None)
             if target is None:
                 return None, "unknown_code"
         elif len(mine) > 1:
             return None, "ambiguous"
         else:
             target = mine[0]
-        if not _sent_before(target, reply):
+        if not all(_sent_before(m, reply) for m in target.members):
             return None, "not_sent_before"
         if reply.always and (
-            not target.allow_always or target.require_code or reply.actor != self.principals.owner
+            target.batch is not None
+            or not target.head.allow_always
+            or target.require_code
+            or reply.actor != self.principals.owner
         ):
-            # Never read as a plain yes: "always" asked for more than this approval offers,
-            # and only the owner widens trust.
+            # Never read as a plain yes: "always" asked for more than this approval offers
+            # (a batch never offers it), and only the owner widens trust.
             return None, "always_unsupported"
         if reply.code is None:
             # Judge a plain reply against what the actor had been shown when they sent it,
             # so an old reply re-routed later can't bind what has since become the only one.
-            seen = [
-                a.id
+            opened = [
+                a
                 for a in ap.open_at(self.conn, reply.actor, reply.occurred_at)
                 if self._may_approve(reply, a) and _sent_before(a, reply)
             ]
-            if seen != [target.id]:
+            seen = [u.head.id for u in self._units(opened, reply.actor)]
+            if seen != [target.head.id]:
                 return None, "ambiguous"
             if target.require_code and reply.decision == "approve":
                 return None, "code_required"
@@ -565,8 +725,102 @@ class PolicyGate:
             and self.principals.can(reply.actor, "approve", a.extension)
         )
 
-    def open_batch(self, principal: str, approval_ids: Sequence[str]) -> ApprovalBatch:
-        raise NotImplementedError("batch approvals are deferred")
+
+class _BatchRefused(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _strictest(levels: Sequence[Level]) -> Level:
+    """L1 (the code) over L2 over L3 (L0 never asks)."""
+    order = (Level.L1, Level.L2, Level.L3, Level.L0)
+    return min(levels, key=order.index)
+
+
+def batch_line(summary: str) -> str:
+    """An approval's summary as a batch line: without its ``yes always`` offer (a batch never
+    offers one)."""
+    return summary.split(ALWAYS_NOTE, 1)[0]
+
+
+@dataclass(frozen=True)
+class _Unit:
+    """What one reply answers: a lone approval, or every approval of a batch (BA-1)."""
+
+    members: tuple[ap.Approval, ...]
+    batch: ap.BatchRow | None = None
+
+    @property
+    def head(self) -> ap.Approval:
+        return self.members[0]
+
+    @property
+    def code(self) -> str | None:
+        return self.head.code
+
+    @property
+    def require_code(self) -> bool:
+        return any(m.require_code for m in self.members)
+
+    @property
+    def level(self) -> Level:
+        return _strictest([m.level for m in self.members])
+
+    @property
+    def destructive(self) -> bool:
+        return any(m.level is Level.L1 and m.effect is not Effect.PAY for m in self.members)
+
+    @property
+    def effect(self) -> Effect:
+        effects = {m.effect for m in self.members}
+        return Effect.PAY if Effect.PAY in effects else self.head.effect
+
+    def pending(self) -> PendingApproval:
+        a = self.head
+        if self.batch is None:
+            return PendingApproval(
+                approval_id=a.id,
+                code=a.code or "",
+                task_id=a.task_id or "",
+                summary=a.summary,
+                effect=a.effect,
+                level=a.level,
+                require_code=a.require_code,
+                expires_at=a.expires_at,
+            )
+        summary = f"{len(self.members)} changes: " + "; ".join(
+            batch_line(m.summary) for m in self.members
+        )
+        if len(summary) > BATCH_SUMMARY_CHARS:
+            summary = summary[: BATCH_SUMMARY_CHARS - 1].rstrip() + "…"
+        return PendingApproval(
+            approval_id=a.id,
+            code=a.code or "",
+            task_id=a.task_id or "",
+            summary=summary,
+            effect=self.effect,
+            level=self.level,
+            require_code=self.require_code,
+            expires_at=min(m.expires_at for m in self.members),
+        )
+
+    def as_batch(self) -> ApprovalBatch:
+        assert self.batch is not None
+        return ApprovalBatch(
+            batch_id=self.batch.id,
+            principal=self.batch.principal,
+            approval_ids=self.batch.approval_ids,
+            created_at=self.batch.created_at,
+            code=self.code or "",
+            task_id=self.head.task_id or "",
+            expires_at=min(m.expires_at for m in self.members),
+            lines=tuple(batch_line(m.summary) for m in self.members),
+            require_code=self.require_code,
+            destructive=self.destructive,
+            level=self.level,
+            effect=self.effect,
+        )
 
 
 def _sent_before(a: ap.Approval, reply: ApprovalReply) -> bool:

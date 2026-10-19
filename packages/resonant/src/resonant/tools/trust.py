@@ -27,8 +27,9 @@ executor's own rows.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.gate.types import Intent
@@ -36,6 +37,8 @@ from resonant.store import trust as store
 from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.tools.base import NO_ARGS, BuiltinContext, no_args
+from resonant.tools.registry import ToolRegistry
+from resonant.trust.tools import allow_targets, tool_action, tool_name
 from resonant_sdk import Effect, Level, ToolSpec
 
 TIGHTEN: tuple[store.Effect, ...] = ("ask", "notify_now")
@@ -123,12 +126,124 @@ REMOVE_TRUST_RULE = ToolSpec(
     timeout_s=5.0,
 )
 
+ALLOW_TOOLS = ToolSpec(
+    name="allow_tools",
+    description=(
+        "Stop asking the owner before Resonant's own tools that change things, when the owner "
+        'asks for them in chat (asks the owner first): "don\'t ask for Linear tickets" is '
+        "tools [linear] (an extension's name covers its changes: tickets and comments); one "
+        "tool is linear.save_comment or create_watch. Changes after outside content still ask."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {
+            "tools": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 80},
+                "minItems": 1,
+                "maxItems": 8,
+                "description": "extension names (linear) or tools (linear.save_issue)",
+            },
+            "note": _NOTE,
+        },
+        "required": ["tools"],
+        "additionalProperties": False,
+    },
+    effect=Effect.WRITE,
+    level=Level.L2,
+    timeout_s=5.0,
+)
+
 SPECS: tuple[ToolSpec, ...] = (
     LIST_TRUST_RULES,
     ADD_TRUST_RULE,
     ALLOW_TRUST_RULE,
+    ALLOW_TOOLS,
     REMOVE_TRUST_RULE,
 )
+
+ExtTools = Callable[[str], Sequence[ToolSpec]]  # an extension's loaded chat tools
+
+
+def no_ext_tools(_extension: str) -> Sequence[ToolSpec]:
+    return ()
+
+
+def _tool_names(args: Mapping[str, Any]) -> list[str] | None:
+    raw = args.get("tools")
+    if not isinstance(raw, list):
+        return None
+    names = [n for n in cast(list[Any], raw) if isinstance(n, str) and n.strip()]
+    return names if names and len(names) == len(cast(list[Any], raw)) else None
+
+
+def allow_tools(
+    conn: sqlite3.Connection,
+    args: dict[str, Any],
+    *,
+    registry: ToolRegistry,
+    ext_tools: ExtTools,
+    now: datetime,
+) -> dict[str, Any]:
+    """BA-1: a standing allow per named tool (``trust.tools.allow_targets``): ``allow
+    tool:<ext>.<name>`` on the extension (a builtin's on ``*``), ``created_from="chat"``, the
+    same rule ``yes always`` saves. The gate then runs the owner's own model-chosen calls of
+    them without asking (never tainted ones, never L1, never under the kill switch)."""
+    name = ALLOW_TOOLS.name
+    _check_keys(name, args, {"tools", "note"})
+    names = _tool_names(args)
+    if names is None:
+        raise ToolFailed(f"{name}: tools must be a list of tool or extension names")
+    specs, why = allow_targets(names, registry=registry, ext_tools=ext_tools)
+    if why is not None:
+        raise ToolFailed(f"{name}: {why}")
+    note = _str_arg(name, args, "note", required=False)
+    out: list[dict[str, Any]] = []
+    with atomic(conn):
+        for spec in specs:
+            action = tool_action(spec.extension, spec.name)
+            assert action is not None  # can_stand checked it
+            added = store.add_rule(
+                conn,
+                scope=spec.extension or store.ANY,
+                action=action,
+                effect="allow",
+                created_from="chat",
+                now=now,
+                note=note,
+            )
+            if not added.existed:
+                audit(
+                    conn,
+                    "trust.rule_added",
+                    tool=name,
+                    rule_id=added.rule.id,
+                    scope=added.rule.scope,
+                    action_kind=added.rule.action,
+                    effect=added.rule.effect,
+                    created_from="chat",
+                    replaced=store.rule_fields(added.replaced),
+                )
+            out.append({**_rule_dict(added.rule), "existed": added.existed})
+    return {"rules": out, "tools": [tool_name(s) for s in specs]}
+
+
+def allow_tools_action(
+    intent: Intent, *, registry: ToolRegistry, ext_tools: ExtTools
+) -> str | None:
+    """The approval heading for ``allow_tools``: exactly the tools that would stop asking,
+    from the registry (``stop asking before linear.save_issue and linear.save_comment when
+    you ask in chat``), or None (a name that covers nothing: the default summary, and the
+    call fails if approved)."""
+    names = _tool_names(intent.args)
+    if names is None:
+        return None
+    specs, why = allow_targets(names, registry=registry, ext_tools=ext_tools)
+    if why is not None or not specs:
+        return None
+    shown = [tool_name(s) for s in specs]
+    listed = shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
+    return f"stop asking before {listed} when you ask in chat"
 
 
 def _rule_dict(r: store.Rule) -> dict[str, Any]:
@@ -289,9 +404,17 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
     async def _remove(args: dict[str, Any]) -> dict[str, Any]:
         return remove_trust_rule(conn, args)
 
+    async def _allow_tools(args: dict[str, Any]) -> dict[str, Any]:
+        components = ctx.state.components
+        host = components.extensions if components is not None else None
+        ext_tools: ExtTools = host.tool_specs if host is not None else no_ext_tools
+        return allow_tools(conn, args, registry=ctx.registry, ext_tools=ext_tools,
+                           now=ctx.clock())  # fmt: skip
+
     return {
         LIST_TRUST_RULES.name: _list,
         ADD_TRUST_RULE.name: _add,
         ALLOW_TRUST_RULE.name: _allow,
+        ALLOW_TOOLS.name: _allow_tools,
         REMOVE_TRUST_RULE.name: _remove,
     }

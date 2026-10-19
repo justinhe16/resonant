@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import secrets
 import unicodedata
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 
 # No look-alikes: no 0/O, 1/I/L, 5/S, 2/Z, 8/B.
 CODE_LETTERS = "ACDEFGHJKMNPQTUVWXY"  # no R: run codes are R<n> (R3), see tools/runs.py
@@ -90,3 +90,34 @@ def approval_text(
     if require_code:
         return f"[{code}] {summary}? Reply exactly: yes {code} / no {code}"
     return f"[{code}] {summary}? Reply yes / no"
+
+
+BATCH_LINE_CHARS = 140  # one change in a batch prompt
+
+
+def batch_text(
+    code: str,
+    lines: Sequence[str],
+    *,
+    require_code: bool = False,
+    destructive: bool = False,
+) -> str:
+    """One prompt for a batch of changes (BA-1): a numbered line per change (each a code-built
+    summary, clipped), then one answer for all of them. The batch takes its strictest
+    change's level: ``destructive`` (an L1 write) or ``require_code`` (L1, pay) means only
+    ``yes <code>`` approves.
+
+    ``[D7] 4 changes, all or none:\\n1. linear: save issue id="RES-12" …\\n…\\nReply yes / no``
+    """
+    shown = [
+        f"{i}. {line if len(line) <= BATCH_LINE_CHARS else line[: BATCH_LINE_CHARS - 1] + '…'}"
+        for i, line in enumerate(lines, 1)
+    ]
+    head = f"[{code}] {len(lines)} changes, all or none:"
+    if destructive:
+        tail = f"Some can't be undone. Reply yes {code} / no"
+    elif require_code:
+        tail = f"Reply exactly: yes {code} / no {code}"
+    else:
+        tail = "Reply yes / no"
+    return "\n".join([head, *shown, tail])

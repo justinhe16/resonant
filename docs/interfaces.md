@@ -184,9 +184,11 @@ class Gate(TokenVerifier, Protocol):
     def evaluate(self, intent: Intent) -> Decision: ...
     def consume(self, token: str, intent_hash: str) -> bool: ...   # single-use; executor calls it
     def pending_for(self, principal: str) -> Sequence[PendingApproval]: ...
-    def open_batch(self, principal: str, approval_ids: Sequence[str]) -> ApprovalBatch: ...
+    def open_batch(self, principal: str, approval_ids: Sequence[str]) -> ApprovalBatch: ...  # BA-1
     def resolve(self, resolution: ApprovalResolution) -> ResolveResult: ...   # by id: button / CLI
     def resolve_reply(self, reply: ApprovalReply) -> ResolveResult: ...      # text reply: gate binds it
+# PolicyGate only (BA-1, toolcore.BatchGate): batch_max; owner; approval_states(ids) -> {id: status}
+#   (after lazy expiry); drop(ids, reason=) expires pending ones (audited approval.expired)
 ```
 
 **Origin** says who chose the action. Code sets `"explicit"` in exactly one place, the local runner's `direct_call` path, whose checkpoint only the router's deterministic command parser writes. Everything the model chooses is `"inferred"`. A job that fired on its schedule is `"scheduled"`: only the scheduler and the job runner set it, and the gate treats it like `"inferred"`, so it is **never explicit**. The router and the local runner never set it (a test scans them). A call the model chose in a task that has read untrusted content (files, logs, transcripts, the web, email, extension results, `ask_claude` output; docs/brain-plan.md D6) is `"tainted"`: the gate asks for L2 **and L3**, an L0 read still runs, an L1 still needs its code, and no standing allow applies (they need `inferred`), so text the task read can't get a write through without the owner. Only runner code that tracks taint sets it (the brain loop, BR-1); the approval summary is code-built either way. Origin is never read from model output.
@@ -236,12 +238,13 @@ STORE_INTERNAL_TOOLS, is_store_internal(spec)             # resonant.tools
   - Approved and unused: `Allow(token, approval_id)`.
   - Any rejected approval for the intent: `Deny(NOT_APPROVED)`, even if the table would now Allow (the owner's "no" holds for that intent).
   - Expired: `Deny(APPROVAL_EXPIRED)`. Used: `Deny(APPROVAL_USED)`; a used approval never yields another Allow.
-  - So an intent gets at most one approval per task: after it expires, is rejected or is used, the gate never re-asks (one approval per local task). A retry needs a new task.
+  - So an intent gets at most one approval per task: after it expires, is rejected or is used, the gate never re-asks. A retry needs a new task. (Different intents of one task each get their own approval; since BA-1 a task asks about several at once as a **batch**, below.)
   - An Allow by the table (L3, explicit, or a standing allow) still spends an approved, unused approval for the same intent, if there is one (the `yes always` that just made the call L3).
 - **Lazy expiry:** `evaluate`, `pending_for` and `resolve` first run `expire_due(now)`. The waiting task's `wake_at = expires_at` is the backstop that wakes it.
 - `resolve(resolution)` (CLI, button): the actor must be in `approvers` and hold `approve`; then `store.approvals.resolve` and `wake_resolved` in one transaction, audited `approval.resolve`. Refusal reasons: `not_found` (also for a non-approver, so ids aren't confirmed; the audit row says `not an approver`) or the store's reason. A refused attempt is audited `decision="refused"`. This authenticated path approves L1 without typing the code.
-- `resolve_reply(reply)` (text replies) binds the reply to one approval (see **Binding** below), then `store.approvals.resolve(..., event_id=reply.event_id)` and `wake_resolved` in one transaction. Every attempt writes one `approval.resolve` audit row with every reply field (raw text, event id, `occurred_at`, code, path, channel, actor identity, comments) and the reason. `open_batch` raises `NotImplementedError` (deferred).
-- `pending_for(principal)` lists unexpired pending approvals as `PendingApproval`.
+- `resolve_reply(reply)` (text replies) binds the reply to one approval or one batch (see **Binding** below), then `store.approvals.resolve(..., event_id=reply.event_id)` (for a batch: each of its approvals, all or none) and `wake_resolved` in one transaction. Every attempt writes one `approval.resolve` audit row with every reply field (raw text, event id, `occurred_at`, code, path, channel, actor identity, comments), the reason, and for a batch `batch_id` and `approval_ids`.
+- `pending_for(principal)` lists unexpired pending approvals as `PendingApproval`, a batch as **one** entry: its first approval's id and code, the summary `N changes: <line>; <line>…` (200 chars), its strictest level and effect, `require_code` if any approval needs it, the earliest expiry. A batch asked of someone else is left out.
+- **Batches (BA-1).** `open_batch(principal, approval_ids)` asks the owner about several pending approvals **of one task** as one prompt: it stores the snapshot (`approval_batches`, migration 002: `id, principal, approval_ids` in order, `created_at`, `used_at` when answered), sets every approval's `expires_at` to `now + approval_ttl_s` (they expire together) and audits `approval.batch` (batch id, ids, code, level, `require_code`). The same set again returns the batch already open, unchanged (a re-prompt). `ValueError` for fewer than 2 or more than `batch_max` (`gate.batch_max`, 10) approvals, a `principal` who isn't the owner, an approval that isn't pending, another task's, one the owner can't approve, or one already in another batch. `ApprovalBatch(batch_id, principal, approval_ids, created_at, code, task_id, expires_at, lines, require_code, destructive, level, effect)`: `code` is its first approval's, `lines` each approval's summary without its `yes always` offer, `approvers == (principal,)`. **One unit for binding:** only its code names it (its other approvals' codes are never shown and are `unknown_code`), a plain yes/no counts it as one pending item, it needs `yes <code>` when any approval does (L1, pay: the strictest level), `yes always` is `always_unsupported`, and only the owner it was asked of can answer it (a member who approves its extension gets `nothing_pending`, even with the code). `resolve` by id of any approval in an open batch resolves the whole batch (the owner only). A batch whose approvals aren't all pending any more (one decided on its own: a race) can't bind; the runner drops the rest (`drop(reason="batch_split")`).
 
 **Allow tokens.** Every `Allow` carries a single-use token that the gate issued for one intent hash. After an approval, the runner re-evaluates the intent on wake and gets an `Allow(token, approval_id)`. Tokens live in memory, so after a restart the runner simply re-evaluates.
 
@@ -268,19 +271,20 @@ Request (`resonant.gate.codes`):
   - A worker's trust check (`always=True`, EM-4; never with the other two): `"[K4] R4 wants to deploy on dori-api: \"deploy to prod\" (new kind of action; yes always = don't ask before deploy in dori-api). Reply yes / yes always / no"`.
   - L1 (`destructive=True`): `"[D7] <summary>? This can't be undone. Reply yes D7 / no"`. It takes precedence over `require_code`.
   - Pay (`require_code=True`): `"[P3] <summary>? Reply exactly: yes P3 / no P3"`.
+- `batch_text(code, lines, *, require_code=False, destructive=False)` (BA-1, `ApprovalPrompt.lines` set): `"[D7] 4 changes, all or none:\n1. linear: save issue id=\"RES-12\", state=\"Done\"\n…\nReply yes / no"`; each line clipped to 140 chars; with an L1 write `Some can't be undone. Reply yes D7 / no`; with pay (no L1 write) `Reply exactly: yes D7 / no D7`. `ApprovalPrompt` gains `lines` and `destructive`; a batch prompt's `approval_id` is the batch's id (the channel's dedupe key).
 - The summary is built by code from intent fields. Every external string goes through `sanitize_external`, which quotes it, collapses whitespace and newlines, strips code-like tokens, and truncates to 60 characters. `clean_external` does the same without truncating or quoting.
 - `resonant.gate.summary`:
   - `summarize(intent, *, action=None)` returns `<extension>: <tool name> key="value", …` (underscores become spaces; no extension prefix for builtins), e.g. `add note text="buy milk"`. `action` is an optional code-built heading (`delete all 4 notes`) that replaces the tool name; it is cleaned too and never comes from a model.
   - `describe_args(args)`: sorted keys, at most 3 shown, then `+N more args`. Keys (≤ 20 chars) and values (≤ 40 chars) go through `clean_external`; a clipped value gets `(truncated)`, and a value that lost non-ASCII characters gets `(non-ASCII hidden)`. Numbers, booleans and null print as JSON; lists and objects print as `(list, N items)` / `(object, N keys)`.
   - Masking is lossy on purpose: `"vitamin d3"` shows as `"vitamin ?"`. The full args are available to the owner via `/approvals <code>`.
   - `unsafe_args(args)` returns the JSON paths (`$.text`, `$.items[1]`, `$.<key>`) of keys or strings containing control characters other than tab/newline/CR, format characters (bidi overrides and isolates, zero-width characters, BOM) line/paragraph separators, or lone surrogates. Variation selectors and private-use characters are allowed. The gate denies such intents rather than sanitizing them, so what runs always matches what was shown.
-- Config (`gate:`): `approval_ttl_s` (default 1800, 60–86400) is how long a prompt stays answerable.
+- Config (`gate:`): `approval_ttl_s` (default 1800, 60–86400) is how long a prompt stays answerable; `batch_max` (default 10, 2–20, BA-1) is how many changes wait on one batch prompt.
 
 **Binding** (`PolicyGate.resolve_reply`). A reply resolves an approval only if all of these hold:
 - It comes from an authenticated identity whose principal is in the approval's `approvers` list and holds `approve` for the extension.
 - It arrived as iMessage (`channel="imessage"`, not SMS) via the parser. Slack comes later. The router never builds a reply from a `truncated` payload.
 - **Sent-before.** The approval's prompt was sent to the actor (`Approval.sent_at(actor)`) strictly before the reply's `occurred_at`, with or without a code. A reply never binds a prompt sent after it.
-- With a code, it names one of the actor's pending, unexpired approvals. Without a code, exactly one approval is pending for the actor, both now and among those open and already sent to the actor at `occurred_at`. So an old plain reply re-routed later can't bind what has since become the only pending approval. If it's ambiguous, re-ask and never guess.
+- With a code, it names one of the actor's pending, unexpired approvals (or a batch, by its code). Without a code, exactly one approval (or one batch: BA-1 counts a batch as one) is pending for the actor, both now and among those open and already sent to the actor at `occurred_at`. So an old plain reply re-routed later can't bind what has since become the only pending approval. If it's ambiguous, re-ask and never guess.
 - `require_code` (L1, pay): only `yes <code>` approves. A plain `no` may deny under the single-pending rule.
 - **Idempotent per event.** If `reply.event_id` already resolved an approval (`resolved_event_id`), the gate returns that original result with no write, wake or audit. A replay under another actor gets `nothing_pending`.
 - `yes always` (EM-4, GT-1) binds by the same rules (code or single pending, sent-before), but only to an approval with `allow_always` and only from the owner. Two kinds offer it: a worker's trust check (`trust.checks`; not when an owner's `ask` rule made the check ask, and not when the system is an area of a system already seen or a rule's scope) and an owner's L2 chat tool call that can take a standing allow (see **Standing allows** under Gate). Never `require_code`. For any other approval, or from a member, it is refused as `always_unsupported`, never read as a plain `yes`. The store's conditional UPDATE re-checks it. A bound `yes always` sets `approvals.always`; for a check the waiting check adds the rule, for a tool approval the gate saves its `always_scope`/`always_action` rule in the same transaction.
@@ -296,7 +300,7 @@ Refusals are closed (`ReplyRefusal`, `REPLY_REFUSALS` in `resonant.gate.types`):
 | `unknown_code` | The code matches none of the actor's pending approvals. |
 | `code_required` | A plain `yes` for a `require_code` approval. |
 | `not_sent_before` | The prompt wasn't sent to the actor before the reply. |
-| `unsupported` | Not an iMessage parser reply, or a batch reply (deferred). |
+| `unsupported` | Not an iMessage parser reply, or a `yes all` reply (`all_in_batch`, `batch_id`: not offered). |
 | `always_unsupported` | `yes always` for an approval that doesn't offer it, or from a member. Reply: `Not done: yes always isn't offered for that one. Reply yes or no.` (or `Reply yes <code> to confirm.` for a coded one). |
 | `already_resolved`, `expired`, `task_not_waiting`, `not_found` | The store's conditional UPDATE refused (a race, or the task moved on). |
 
@@ -320,9 +324,10 @@ MAX_COMMENTS_LEN = 500
 - Anything else returns None: `y`, `ok`, `sure`, `yes?`, `yes all`, `yes A7 and C4`, a pasted prompt, or text with invisible characters. A `truncated` payload is never a reply.
 - The parser only reads text. Binding (approvers, single pending, `require_code`, sent-before) is the gate's job.
 
-**Deferred** (C4): the approval classifier, `resonant eval approvals`, and batch approvals (`yes all`). `open_batch` stays `NotImplementedError`, and `ApprovalReply.path` is always `"parser"` for now. With several approvals pending, a plain `yes` gets a re-ask that lists the codes. The design kept for later:
+**Batches** (BA-1) replace the deferred `yes all` design: a batch is one task's changes asked about together (above, `open_batch`), answered with its own code like any approval; there is no `yes all` across tasks, and `ApprovalReply.all_in_batch` / `batch_id` stay refused (`unsupported`). The snapshot is stored, so a reply approves exactly the approvals in it, never one that arrived later; the audit row records the batch id and each approval it resolved. A subset (`yes 1,3`) isn't supported ([`followups.md`](followups.md#batch-subsets-yes-13)).
+
+**Deferred** (C4): the approval classifier and `resonant eval approvals`. `ApprovalReply.path` is always `"parser"` for now. With several approvals pending, a plain `yes` gets a re-ask that lists the codes (a batch as one). The design kept for later:
 - **Classifier**, only if the parser fails. It is separate from the router and uses a small, focused prompt. Its input is the reply text and the summary, and nothing else. Its output is `{decision: approve|deny|unclear, approval_code, comments, confidence}`. It approves only if `decision == approve` and `confidence >= 0.9`; anything else gets a re-ask.
-- **Batch approvals:** one batch message lists an approver's pending codes, and its snapshot is stored. `yes all` approves **exactly the approvals in that snapshot**: never ones that arrived later, never pay, and never any the replier isn't an approver for. The audit log records the batch id and each approval it resolved.
 
 **Concurrency:** resolution is atomic (`UPDATE approvals … WHERE status = 'pending'`), so the first valid reply on any channel wins. On-call pages (Phase 6) go to iMessage and Slack together with one dedupe key; the other channel's message is updated to "resolved by X via Y".
 
@@ -340,7 +345,8 @@ ApprovalReply(actor, actor_identity, channel, raw_text, decision: approve|deny,
 ApprovalResolution(approval_id, approved, actor, actor_identity, path: button|cli, comments=None)
 ResolveResult(ok, reason, resolved: tuple[ResolvedApproval(approval_id, task_id, intent_hash, approved), ...])
 PendingApproval(approval_id, code, task_id, summary, effect, level, require_code, expires_at)
-ApprovalBatch(batch_id, principal, approval_ids, created_at)   # stored in approval_batches
+ApprovalBatch(batch_id, principal, approval_ids, created_at, code, task_id, expires_at, lines,
+              require_code, destructive, level, effect)   # stored in approval_batches (BA-1)
 ```
 
 `ResolveResult.resolved` tells the caller which tasks to wake.
@@ -366,6 +372,10 @@ mark_used(conn, id, now) -> bool                     # True exactly once
 expire_due(conn, now) -> int                         # audits approval.expired
 wake_resolved(conn, result, now, *, principal=None) -> int
 intent_args(conn, approval) -> dict | None           # full args, from its gate.evaluate audit row
+# batches (BA-1, approval_batches): BatchRow(id, principal, approval_ids, created_at, used_at)
+insert_batch(conn, principal, approval_ids, now) -> BatchRow; get_batch(conn, id)
+batches_of(conn, approval_ids) -> {approval id: BatchRow}   # an approval is in at most one
+mark_batch_used(conn, id, now) -> bool; set_expiry(conn, approval_ids, at)   # pending ones only
 ```
 
 - `resolve` is one conditional UPDATE: the row must be pending, `expires_at > now`, and its task `waiting` or `running`. It records `decided_by`, `decided_at` and `resolved_event_id`. The refusal reason is read afterwards and is informational.
@@ -1171,7 +1181,7 @@ In loop mode the labeler never runs (docs/brain-plan.md D1): after slash command
   - **Reads** (`effect=read`) run inline and reply from a template (`COMMAND_RENDERS`). **Side effects** never run here: the router returns a `kind="command"` task with `checkpoint.direct_call = {tool, args}`, and the local runner pins exactly that call and gates it with `origin="explicit"` (the only place that origin comes from). The args, note and reminder text included, are kept in the task checkpoint, as on the model path; the title never has them. The task's intent is the command's (`notes`, `reminders`, `ops`, …). The gate decides as for any call: explicit L3 and L2 run and reply with a code-built report (`Saved note 1: "buy milk"`, `⏰ Reminder 3 set for Tue 3:00pm: "stretch"`, `Cancelled reminder 3.`, `Restarting Resonant…`), L1 asks for a code, the kill switch asks for everything, and dry_run replies `Dry run: would restart Ollama` for ops while notes and reminders run.
   - An unknown `/word` gets `Unknown command /remnd. Did you mean /remind?` (`difflib.get_close_matches`, n=3, cutoff 0.6, over the names of the commands the asker may use, keeping those within 0.1 of the closest), or `Unknown command /word. Try /help.` when nothing is close. A member is never pointed at an owner-only command. A suggestion never executes, even one letter away. Text that isn't a `/word` gets `Unknown command. Try /help.`
   - `/help` lists the commands the asking principal may use (no tool call, so members get it too), plus the keyword hint for principals who can use global tools. `/help <word>` keeps the ones whose name or description contains the word, else a `difflib` match over names and description words; none gives `No command matches "<word>". Try /help.`
-  - `/approvals` lists the owner's pending approvals from `gate.pending_for`, oldest first: `- A7 · restart Resonant · expires in 29m`, then `Reply yes <code> or no <code>. /approvals <code> shows the details.` (or `Nothing is waiting for approval.`). `/approvals <code>` adds the tool, level, effect and the intent's full args (`store.approvals.intent_args`, pretty JSON, clipped at 1500 characters), since the summary masks them. A code outside the approval alphabet gets the usage line; one that isn't pending gets `Nothing is waiting with code Q9.`
+  - `/approvals` lists the owner's pending approvals from `gate.pending_for`, oldest first: `- A7 · restart Resonant · expires in 29m`, then `Reply yes <code> or no <code>. /approvals <code> shows the details.` (or `Nothing is waiting for approval.`). `/approvals <code>` adds the tool, level, effect and the intent's full args (`store.approvals.intent_args`, pretty JSON, clipped at 1500 characters), since the summary masks them; for a batch (BA-1) every change with its tool, level and args (each clipped at 200), then `Expires in 29m. Reply yes / no D7`. A code outside the approval alphabet gets the usage line; one that isn't pending gets `Nothing is waiting with code Q9.`
   - **Extension commands** (Phase 3, `commands.commands_for(extensions, registry)`, built once at start like the intents). One `/<ext>` per loaded extension with chat tools; each tool is a subcommand, by name. Job specs never become subcommands (`/github job_watch` is unknown), and a tool named like a builtin tool is left out, as in chat. Arguments are positional in the manifest's declared order (the store keeps the snapshot's key order), split with `shlex` (curly quotes count as quotes) and typed: `integer` (`40` or `#40`), `number`, `boolean` (`yes`/`no`, `true`/`false`), `string` (at most 1000 chars); a one-argument tool takes the rest of the text. Values fill the declared order; trailing optional args (not in the schema's `required`) may be left out, shown `[<name>]` in the usage. Backslashes are literal. A bad value gets `<hint>. Usage: /github pr <repo> <number>`; an unknown tool word gets `Unknown command /github prz. Did you mean /github prs?` (or `Try /help github.`) and runs nothing. Every `/<ext> <tool>`, reads included, becomes `direct_call = {extension, tool, args}` (title `/<ext> <tool>`, intent `extension:<ext>`): the executor injects the tool's secrets and redacts, and the runner gates it as explicit (L0 runs, L3 runs and reports, L2 runs for the owner, L1 asks `[D7] …? This can't be undone. Reply yes D7 / no`). A member needs `request` on the extension, checked before arguments. `/help` lists `/<ext> <tool> [args]: <description>` for the extensions the asker may use, and `/help <ext>` lists `/<ext> <tool> <args>: <description> (<level>)`, descriptions through `clean_external`, at most 120 chars. Suggestions for an unknown `/word` include them.
   - **`/ext run <ext>/<job>`** (owner only). Paused: `Paused: nothing runs until /resume.` Otherwise the loaded manifest's job, by id: `direct_call = {extension, tool: job_<id>, args: {due_at: <now ISO>}}`, titled `/ext run <ext>/<job>`, gated as explicit at the job's own level (D7). Unknown: `No job github/xyz. Try /ext list.` `/ext run core/<job>` runs the core job's on-demand entry inline (`FastPath.core_jobs`, filled by `wiring`: `core/briefing` is `briefing.run_briefing_now`, keyed per minute so it never uses up the 08:00 one) and replies with its result (`Briefing sent.`, `Paused: briefing not sent.`, `Can't send: no channel/owner.`); audited `job.run` (or `job.failed`) with `manual: true`.
   - Only read tools run inline here. A keyword never names a side effect (if one did, it would fall through to the labeler).
@@ -1242,18 +1252,24 @@ ToolCore(conn, *, registry: ToolRegistry, gate: RunnerGate, executor: ToolExecut
   .spec(target, scope) -> ToolSpec | None                              # the registry's, never the caller's
 CallScope(task_id, principal, trace_id, step_no, call_index=0, origin="inferred",
           spans=None, checkpoint={}, steps: StepContext | None = None, effects=(), pin=None,
-          tools=(), check_schema=True)
+          tools=(), check_schema=True, batch: Sequence[BatchItem] | None = None)   # batch: BA-1
 CallOutcome = Ran | Asked | Refused | Failed      # each has .gated
 Ran(intent, result: ToolResult, gated, report=None, rule_added=None, recorded=False, decision=None)
-Asked(intent, decision: NeedsApproval, checkpoint)  .summary   # code-built, never the code
+Asked(intent, decision: NeedsApproval, checkpoint, item: BatchItem | None = None)
+  .summary   # code-built, never the code
 Refused(why, text, gated, intent=None, decision=None)
   # why: unavailable | bad_args | capped | denied | dry_run | not_allowed; text: "Not done: …"
 Failed(text, gated, intent=None, result=None, recorded=False, decision=None)  # result None: the pin wasn't saved
 PinnedCall(tool, extension, args, step_no, call_index)  .to_json() / .from_json(v)
+BatchItem(call: PinnedCall, approval_id, summary, tainted=False)  .to_json() / .from_json(v)  # BA-1
+batch_items(cp) -> list[BatchItem] | None        # checkpoint.batch; None: malformed
+BatchGate   # Protocol (runtime-checkable): batch_max, owner, open_batch, approval_states, drop
+ToolCore.batch_gate: BatchGate | None            # the gate's batch half; None: never batches
+batch_capped_reply(limit) -> "Not done: at most N changes can wait on one yes."
 is_explicit(cp, pinned) -> bool; pinned_origin(cp, pinned) -> Origin; direct_call(cp)
 args_error(spec, args) -> str | None             # jsonschema; a short reason, no values
 allow_inline(gate, intent) -> bool               # evaluate, then consume the Allow's token
-MAX_SIDE_EFFECTS = 3
+MAX_SIDE_EFFECTS = 5   # BA-1 (was 3): changes that run without asking, per task
 # reports: report_line(intent, data), REPORTS, refusal_reply, dry_run_reply, not_run_reply,
 #          failure_reply, summarize_intent, DONE_NOT_APPROVED, NOT_AVAILABLE_REPLY
 ```
@@ -1263,7 +1279,7 @@ MAX_SIDE_EFFECTS = 3
 2. **Args.** With `check_schema` (the brain loop and the Claude bridge, which check first for their own messages; the intents path, jobs and watches pass False, as before TC-1), `args_error` against the spec's schema; then `Intent.for_tool` (JSON only). `origin="explicit"` is refused here: it only comes from a pinned `direct_call` on resume. Bad: `Refused("bad_args")`.
 3. **Cap.** A change when `scope.effects` (the report lines of the changes this task already ran) holds `MAX_SIDE_EFFECTS`: `Refused("capped")`.
 4. **Gate.** `gate.evaluate`. A read that isn't asked about is ungated: `Allow` runs (`executor.execute(step_no, call_index)`) → `Ran` / `Failed`; anything else → `Refused` (`denied`, `dry_run`); the executor refusing the token → `Refused("not_allowed")`.
-5. **Pin.** Everything else is gated. Refused or dry run comes back as is. Allowed or asked, with `scope.steps` it is pinned first: `steps.save(checkpoint={**checkpoint, **pin, "call": PinnedCall, "effects": effects})` (a failed save: `Failed(result=None)`). No `steps` (jobs): nothing is pinned.
+5. **Pin.** Everything else is gated. Refused or dry run comes back as is. Allowed or asked, with `scope.steps` it is pinned first: `steps.save(checkpoint={**checkpoint, **pin, "call": PinnedCall, "effects": effects})` (a failed save: `Failed(result=None)`). No `steps` (jobs): nothing is pinned. **Batch mode** (BA-1: `scope.batch` set and the gate has its batch half): an allowed call's pin also keeps `batch` (the items so far); a call the gate asks about **joins the batch** instead (`_join`): the same approval again returns its existing item (`Asked.item`, nothing saved); past `batch_max` items it is `Refused("capped", batch_capped_reply(n), gated=True)` and its approval is dropped (`drop(reason="batch_cap")`: never prompted, nothing can bind it); else `BatchItem(pinned, approval_id, batch_line(summary), tainted=origin=="tainted")` is pinned as `checkpoint.batch = [*items, item]` (with `effects` and `pin`; a stale `call` is dropped: the allowed call before it is done) and returned as `Asked(item=…)`. The caller adds it to its batch and goes on; nothing is prompted.
 6. **Run.** `NeedsApproval` → `Asked` (the caller prompts with `decision`, or defers). `Allow` → `executor.execute` with the pinned `step_no`/`call_index` → `Ran` (a change's `report` = `report_line`; `rule_added` after a `yes always` that saved a standing allow) or `Failed` (`failure_reply`).
 
 `resume(pinned, scope)`: spec missing → `Refused("unavailable")`; origin `pinned_origin(scope.checkpoint, pinned)` (`explicit` only for the router's `direct_call`, `tainted` when pinned so, else `inferred`); `executor.recorded(key)` first (succeeded → `Ran(recorded=True)`, started or failed → `Failed(recorded=True)`, no gate); else the gate and step 6. Never pinned again.
@@ -1320,6 +1336,8 @@ Failures: `ModelUnavailableError` sends one templated fallback (the report lines
 ```python
 approval_prompt(decision: NeedsApproval) -> ApprovalPrompt
 async prompt_approvers(conn, channel, decision: NeedsApproval, *, task_id, now) -> PromptResult
+batch_prompt(batch: ApprovalBatch) -> ApprovalPrompt            # BA-1: lines, the batch id as approval_id
+async prompt_batch(conn, channel, batch, *, now) -> PromptResult  # to the owner; the ref on every approval
 PromptResult(reached: tuple[str, ...], unreachable: tuple[str, ...], error: ChannelError | None)
     .retry            # a transient ChannelError: Fail(retryable=True)
     .none_reachable   # no error and nobody reached: fail for good

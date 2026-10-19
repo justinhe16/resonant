@@ -37,15 +37,21 @@ approved ``allow_trust_rule``), never by extension output.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from resonant.gate.types import Intent
 from resonant.store import repos as repos_store
 from resonant.store import trust as store
+from resonant.tools.registry import ToolRegistry
 from resonant.trust.policy import matching_trust_rule
+from resonant_sdk import Effect, Level, ToolSpec
 
 # Builtins that never take a standing allow (see the module docstring).
-NEVER: frozenset[str] = frozenset({"allow_trust_rule", "remove_trust_rule", "merge_run"})
+NEVER: frozenset[str] = frozenset(
+    {"allow_trust_rule", "allow_tools", "remove_trust_rule", "merge_run"}
+)
+MCP_PREFIX = "mcp__resonant__"  # how Claude names Resonant's tools (runners/ask_tools.py)
 
 BUILTIN_SYSTEM = "resonant"  # the system a builtin's call is matched as
 
@@ -73,6 +79,66 @@ def tool_action(extension: str | None, tool: str) -> str | None:
         return store.slug(f"{store.TOOL_PREFIX}{name}")
     except ValueError:
         return None
+
+
+def can_stand(spec: ToolSpec) -> bool:
+    """A tool a standing allow can cover: a change the gate asks a plain yes for (L2), never
+    L1 or pay, never one of ``NEVER``, with a valid action slug."""
+    if spec.effect is Effect.READ or spec.effective_level is not Level.L2:
+        return False
+    if spec.extension is None and spec.name in NEVER:
+        return False
+    return tool_action(spec.extension, spec.name) is not None
+
+
+def allow_targets(
+    names: Sequence[str],
+    *,
+    registry: ToolRegistry,
+    ext_tools: Callable[[str], Sequence[ToolSpec]],
+) -> tuple[list[ToolSpec], str | None]:
+    """BA-1: the tools ``allow_tools`` names, as the specs a standing allow would cover, or
+    why not (the first name that names nothing a rule can cover). Each name is:
+
+    - an extension (``linear``): every chat tool of it that can stand (``can_stand``: its L2
+      changes; for linear ``save_issue`` and ``save_comment``), as loaded now;
+    - ``<extension>.<tool>`` (``linear.save_comment``): that one;
+    - a tool's own name (``create_watch``, ``save_issue``, also as Claude spells it,
+      ``mcp__resonant__save_issue``): a builtin of that name, else the one extension tool.
+
+    Read from the registry and the loaded extensions, never from the model; the approval
+    prompt and the rules saved both come from here."""
+    found: list[ToolSpec] = []
+    for raw in names:
+        name = raw.strip().lower().removeprefix(MCP_PREFIX)
+        picked: list[ToolSpec]
+        if "." in name:
+            ext, tool = name.split(".", 1)
+            picked = [s for s in ext_tools(ext) if s.name == tool]
+        elif ext_tools(name):
+            picked = [s for s in ext_tools(name) if can_stand(s)]
+            if not picked:
+                return [], f"{name} has no changes that ask first"
+        else:
+            builtin = registry.get(None, name)
+            if builtin is not None:
+                picked = [builtin]
+            else:
+                picked = [
+                    s for s in registry.specs() if s.extension and s.name == name
+                ]  # an extension tool by its own name: only when one extension has it
+                picked = [s for s in picked if s in ext_tools(s.extension or "")]
+                if len(picked) > 1:
+                    return [], f"{name} is a tool of several extensions; name one"
+        if not picked or not all(can_stand(s) for s in picked):
+            return [], f"{name} isn't a change that asks first"
+        found.extend(s for s in picked if s not in found)
+    return found, None
+
+
+def tool_name(spec: ToolSpec) -> str:
+    """``linear.save_issue`` or ``create_watch``: a tool as a rule names it."""
+    return spec.name if spec.extension is None else f"{spec.extension}.{spec.name}"
 
 
 class StandingAllows:
