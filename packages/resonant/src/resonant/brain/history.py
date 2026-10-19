@@ -127,11 +127,16 @@ def taint_hops(cp: dict[str, Any]) -> int | None:
     meta = _meta(cp)
     if cp.get("tainted") is not True and meta.get("tainted") is not True:
         return None
-    for source in (cp, meta):
-        hops = source.get("taint_hops")
-        if isinstance(hops, int) and not isinstance(hops, bool) and hops >= 0:
-            return hops
-    return 0
+    # The fewest of them: a pin is written before the turn's later reads, which can bring
+    # its hops down to 0 (fail closed: the nearest count wins).
+    found = [
+        hops
+        for source in (cp, meta)
+        if isinstance(hops := source.get("taint_hops"), int)
+        and not isinstance(hops, bool)
+        and hops >= 0
+    ]
+    return min(found, default=0)
 
 
 def reply_tainted(cp: dict[str, Any]) -> bool:

@@ -299,6 +299,23 @@ def test_taint_carries_a_bounded_number_of_hops(db: sqlite3.Connection) -> None:
     assert history.taint_hops({"reply_meta": {"meta": {"tainted": False}}}) is None
 
 
+def test_a_read_after_a_pin_brings_the_hops_down() -> None:
+    """Review of BR-10b: a gated call pinned at hop 2, then the same turn read a file (hop
+    0): the reply is 0 hops from outside text, whatever the stale pin says."""
+    cp = {
+        "tainted": True,
+        "taint_hops": 2,
+        "reply_meta": {"meta": {"tainted": True, "taint_hops": 0}},
+    }
+    assert history.taint_hops(cp) == 0 and history.reply_tainted(cp)
+    cp = {
+        "tainted": True,
+        "taint_hops": 0,
+        "reply_meta": {"meta": {"tainted": True, "taint_hops": 2}},
+    }
+    assert history.taint_hops(cp) == 0
+
+
 def test_the_fold_drops_a_tainted_reply_at_any_hop() -> None:
     now = utcnow()
     far = history.Exchange("e1", now, "and then?", "it says pwned", tainted=True, hops=5)
