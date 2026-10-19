@@ -32,7 +32,19 @@
   may run without an approval (any other one that ran is a failure: the injection check);
   ``facts`` substrings that must all be in the reply (case-insensitive, ``a|b`` for any),
   ``facts_re`` regexes, ``not_facts`` substrings that must not be; ``max_rounds`` model
-  rounds at most.
+  rounds at most; ``route`` (BR-10): ``local`` (the local model must keep it) or ``claude``
+  (it must be handed to Claude, by the triage or later); unset, either is fine.
+
+  BR-10 rows may also say ``triage`` (what the scripted model's triage call answers, e.g.
+  ``{"handler": "claude", "kind": "general", "say": "on it"}``; default local) and ``claude``
+  (a scripted Claude session: ``{"reads": [...], "calls": [{"name", "args"}], "answer"}``,
+  run by ``e2e/fake_claude.py`` through the real MCP relay, bridge, gate and executor).
+
+  **Grading a hand-off.** A turn handed to Claude is graded on routing (``route``), the
+  writes that ran (none without an approval) and the tools the local model must not call.
+  When Claude really ran (a scripted ``claude`` plan) its tool calls and answer are graded
+  like the local model's; when it didn't (live runs: ``EvalAsk``), the rest is Claude's job
+  and isn't graded here (``delegated``). ``escalate`` grades only turns the local model kept.
 
 - **World.** Every case gets a fresh, hermetic home in a temp dir: its own store, a fake
   chat.db, a recording osascript, ``runner.*`` dirs, ``brain.read_roots`` and
@@ -55,9 +67,12 @@
   (CI and the harness tests; it never calls a real model).
 
 - **Output.** Accuracy overall and per category (a case is correct when every expectation
-  holds), escalation rate (and its precision and recall against ``expect.escalate``), ask
-  correctness, unapproved writes, number-guard hits, p50/p95 latency (the message landing
-  in chat.db to the first reply that isn't ``On it…``) and rounds, per mode. ``--mode
+  holds); BR-10: the route each case took, accuracy per route, the kept-it-wrong rate (local
+  answers that were wrong: should have gone to Claude), triage accuracy against
+  ``expect.route``, and the ack's latency; escalation rate (and its precision and recall
+  against ``expect.escalate``), ask correctness, unapproved writes, number-guard hits,
+  p50/p95 latency (the message landing in chat.db to the first reply that isn't ``On it…``)
+  and rounds, per mode. ``--mode
   both`` runs ``loop`` and ``intents`` and prints both. The summary JSON (no texts, no
   replies: cases by id and line) goes to ``--out`` (default
   ``~/.resonant/evals/results/``), ``task-<ts>.json``. Exit 0 when every mode run reached
@@ -76,18 +91,20 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Generator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
 from resonant.api import DaemonState
 from resonant.brain.facts import FactStore, facts_dir
-from resonant.components import build_components
+from resonant.brain.triage import SCHEMA as TRIAGE_SCHEMA
+from resonant.components import Components, build_components
 from resonant.config import (
     BrainConfig,
     ChannelsConfig,
@@ -109,15 +126,16 @@ from resonant.loop.echo import EchoRunner
 from resonant.loop.types import Fail, StepContext, StepOutcome, Task
 from resonant.models import ChatMessage, ModelClient, ModelReply, ProbeResult, SpanFactory
 from resonant.models.bench import percentile
-from resonant.runners.ask import AskRefused, Queued
+from resonant.runners.ask import AskRefused, AskRunner, AskScope, Queued
 from resonant.runners.brain import MAX_ROUNDS, PROGRESS_TEXT, BrainRunner
+from resonant.secrets import CLAUDE_TOKEN_REF, FakeKeychain, SecretStore
 from resonant.store import repos as repo_store
 from resonant.store import runs as run_store
 from resonant.store import tasks as task_store
 from resonant.store.db import iso, kv_set, open_db, transaction, utcnow
 from resonant.tools import notes as notes_tools
 from resonant.tools import reminders as reminder_tools
-from resonant.wiring import build_imessage_stack
+from resonant.wiring import IMessageStack, build_imessage_stack, tool_access
 from resonant_sdk import Effect, Event, ToolSpec
 
 log = logging.getLogger(__name__)
@@ -162,10 +180,16 @@ REAL_WRITES: frozenset[str] = frozenset(
 
 EXPECT_KEYS = frozenset(
     {"tools", "tools_not", "escalate", "ask", "writes", "facts", "facts_re", "not_facts",
-     "max_rounds"}
+     "max_rounds", "route"}
 )  # fmt: skip
 RUN_STATUSES: tuple[str, ...] = get_args(run_store.Status)
-ROW_KEYS = frozenset({"id", "category", "text", "history", "world", "expect", "script", "note"})
+ROW_KEYS = frozenset(
+    {"id", "category", "text", "history", "world", "expect", "script", "note", "triage", "claude"}
+)
+Route = Literal["triage", "local", "claude"]
+ROUTES: tuple[Route, ...] = get_args(Route)
+FAKE_CLAUDE = Path(__file__).resolve().parent.parent / "e2e" / "fake_claude.py"
+FAKE_TOKEN = "sk-ant-oat01-EVALFAKETOKEN0000000000"  # noqa: S105 - a fake Keychain's
 WORLD_KEYS = frozenset({"repos", "files", "runs", "notes", "reminders", "facts", "extensions"})
 
 
@@ -200,6 +224,7 @@ class Expect:
     facts_re: tuple[str, ...] = ()
     not_facts: tuple[str, ...] = ()
     max_rounds: int | None = None
+    route: Literal["local", "claude"] | None = None
 
 
 @dataclass(frozen=True)
@@ -212,6 +237,8 @@ class TaskCase:
     world: dict[str, Any]
     expect: Expect
     script: list[Any] | None
+    triage: dict[str, Any] | None = None  # the scripted model's triage answer (BR-10)
+    claude: dict[str, Any] | None = None  # a scripted Claude session (BR-10)
 
 
 def _strs(v: Any, where: str) -> tuple[str, ...]:
@@ -248,6 +275,9 @@ def parse_expect(raw: Any) -> Expect:
         not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 1
     ):
         raise ValueError("expect.max_rounds must be a positive integer")
+    route = d.get("route")
+    if route not in (None, "local", "claude"):
+        raise ValueError("expect.route must be 'local' or 'claude'")
     facts_re = _strs(d.get("facts_re"), "expect.facts_re")
     for pattern in facts_re:
         try:
@@ -264,6 +294,7 @@ def parse_expect(raw: Any) -> Expect:
         facts_re=facts_re,
         not_facts=_strs(d.get("not_facts"), "expect.not_facts"),
         max_rounds=rounds,
+        route=route,
     )
 
 
@@ -395,6 +426,34 @@ def _script(raw: Any) -> list[Any] | None:
     return cast(list[Any], raw)
 
 
+def _triage(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or cast(dict[str, Any], raw).get("handler") not in (
+        "local",
+        "claude",
+    ):
+        raise ValueError("'triage' is {handler: local|claude, kind?, say?}")
+    d = cast(dict[str, Any], raw)
+    return {"handler": d["handler"], "kind": d.get("kind", "general"), "say": d.get("say", "")}
+
+
+def _claude(raw: Any) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(cast(dict[str, Any], raw)) - {"reads", "calls", "answer"}:
+        raise ValueError("'claude' is {reads?, calls?, answer?}")
+    d = cast(dict[str, Any], raw)
+    calls: Any = d.get("calls", [])
+    ok = isinstance(calls, list) and all(
+        isinstance(c, dict) and isinstance(cast(dict[str, Any], c).get("name"), str)
+        for c in cast(list[Any], calls)
+    )
+    if not ok or not isinstance(d.get("answer", ""), str):
+        raise ValueError("'claude.calls' is a list of {name, args}; 'answer' a string")
+    return d
+
+
 def load_set(path: Path) -> list[TaskCase]:
     """Parse a JSONL task set. Raises ``EvalSetError`` naming the line (never the text)."""
     try:
@@ -439,6 +498,8 @@ def load_set(path: Path) -> list[TaskCase]:
                 world=_world(row.get("world")),
                 expect=parse_expect(row.get("expect")),
                 script=_script(row.get("script")),
+                triage=_triage(row.get("triage")),
+                claude=_claude(row.get("claude")),
             )
         except ValueError as e:
             raise EvalSetError(f"{path}:{n}: {e}") from None
@@ -614,8 +675,12 @@ class EvalAsk:
         requested_by: str | None = None,
         channel_ref: dict[str, Any] | None = None,
         trace_id: str | None = None,
+        tools: bool = False,
+        tainted: bool = False,
     ) -> Queued | AskRefused:
-        self.asks.append({"kind": kind, "attachments": len(attachments)})
+        self.asks.append(
+            {"kind": kind, "attachments": len(attachments), "tools": tools, "tainted": tainted}
+        )
         return Queued(f"eval-ask-{len(self.asks)}", LOOKING)
 
     async def step(self, task: Task, events: list[Event], ctx: StepContext) -> StepOutcome:
@@ -624,7 +689,7 @@ class EvalAsk:
 
 @dataclass
 class Round:
-    kind: Literal["tools", "json"]
+    kind: Literal["tools", "json", "triage"]
     tools: list[str]  # the calls the model chose (tools rounds)
 
 
@@ -646,10 +711,16 @@ class RecordingModel:
         max_tokens: int = 512,
         temperature: float = 0.0,
         spans: SpanFactory | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelReply:
-        self.rounds.append(Round("json", []))
+        self.rounds.append(Round("triage" if schema == TRIAGE_SCHEMA else "json", []))
         return await self.inner.chat_json(
-            messages, schema=schema, max_tokens=max_tokens, temperature=temperature, spans=spans
+            messages,
+            schema=schema,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            spans=spans,
+            tools=tools,
         )
 
     async def chat_tools(
@@ -711,9 +782,12 @@ def fill(value: Any, root: Path, now: datetime | None = None) -> Any:
     return value
 
 
-def eval_settings(root: Path, chat_db: Path, mode: Mode, base: Settings | None) -> Settings:
-    """Settings for one case's home: everything under ``root``; the model and timezone come
-    from ``base`` (the owner's config, live runs only)."""
+def eval_settings(
+    root: Path, chat_db: Path, mode: Mode, base: Settings | None, route: Route = "triage"
+) -> Settings:
+    """Settings for one case's home: everything under ``root``; the model, timezone and the
+    triage's bias come from ``base`` (the owner's config, live runs only); ``route`` is
+    ``brain.route`` (BR-10)."""
     code = root / "code"
     ref = base or IsolatedSettings(home=root)
     return IsolatedSettings(
@@ -741,6 +815,8 @@ def eval_settings(root: Path, chat_db: Path, mode: Mode, base: Settings | None) 
         ops=OpsConfig(repo_path=None),
         brain=BrainConfig(
             mode=mode,
+            route=route,
+            triage=ref.brain.triage,
             read_roots=[code, root / "logs", root / "docs", root / "runner" / "transcripts"],
             rg_path=ref.brain.rg_path,
         ),
@@ -931,6 +1007,10 @@ class Outcome:
     error: str | None = None
     stuck: bool = False  # the loop gave up (round cap, bad output) and nothing was queued
     stubbed: list[str] = field(default_factory=list[str])  # writes recorded, not run
+    route: str = "local"  # BR-10: who answered: local, or claude (handed over)
+    handoff: str | None = None  # why it was handed over: triage, ask, guard, cap, ...
+    triage: str | None = None  # the triage call's decision (None: no triage ran)
+    claude_reply: str | None = None  # Claude's answer, when a scripted session ran
 
 
 @dataclass
@@ -956,13 +1036,14 @@ async def run_case(
     base: Settings | None = None,
     timeout_s: float = SCRIPTED_TIMEOUT_S,
     clock: Callable[[], float] = time.monotonic,
+    route: Route = "triage",
 ) -> Outcome:
     """Run one case in a fresh temp home through the real router, runners, gate and channel."""
     model.reset()
     with tempfile.TemporaryDirectory(prefix="resonant-task-eval-") as tmp:
         root = Path(await asyncio.to_thread(os.path.realpath, tmp))
         with world_home(root):
-            return await _run_in(case, mode, model, root, base, timeout_s, clock)
+            return await _run_in(case, mode, model, root, base, timeout_s, clock, route)
 
 
 async def _run_in(
@@ -973,11 +1054,12 @@ async def _run_in(
     base: Settings | None,
     timeout_s: float,
     clock: Callable[[], float],
+    route: Route = "triage",
 ) -> Outcome:
     """``run_case`` inside its temp home ``root``."""
     (root / "principals.yaml").write_text(PRINCIPALS_YAML)
     chat = FakeChatDB(root / "chat.db")
-    settings = eval_settings(root, chat.path, mode, base)
+    settings = eval_settings(root, chat.path, mode, base, route)
     now = utcnow()
     if isinstance(model.inner, ScriptedRoot):
         model.inner.bind(root, now)
@@ -1013,8 +1095,11 @@ async def _run_in(
         # the claude CLI (the real check, ClaudeRunner.setup_gaps, is the daemon's).
         brain.runner_gaps = None
     asks = EvalAsk(components.principals.owner)
-    components.runners[asks.name] = asks
-    loop.runners[asks.name] = asks
+    runner: EvalAsk | AskRunner = asks
+    if case.claude is not None and isinstance(brain, BrainRunner):  # a scripted Claude
+        runner = _fake_claude(settings, conn, components, brain, stack, loop, case, root, now)
+    components.runners[runner.name] = runner
+    loop.runners[runner.name] = runner
     baseline = int(conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM tasks").fetchone()[0])
     await stack.start(loop)
     loop_task = asyncio.create_task(loop.run(), name="task-eval-loop")
@@ -1039,6 +1124,40 @@ async def _run_in(
         await stack.aclose()
         conn.close()
         chat.close()
+
+
+def _fake_claude(
+    settings: Settings,
+    conn: sqlite3.Connection,
+    components: Components,
+    brain: BrainRunner,
+    stack: IMessageStack,
+    loop: Loop,
+    case: TaskCase,
+    root: Path,
+    now: datetime,
+) -> AskRunner:
+    """The real ask runner, with Resonant's tools, over ``e2e/fake_claude.py`` acting out the
+    case's ``claude`` plan (a fake Keychain holds a fake token; nothing reaches claude)."""
+    plan = root / "claude-plan.json"
+    plan.write_text(json.dumps(fill(case.claude, root, now)))
+    keychain = FakeKeychain()
+    keychain.items[CLAUDE_TOKEN_REF] = FAKE_TOKEN
+    return AskRunner(
+        conn,
+        cfg=settings.brain.ask_claude,
+        scope=AskScope.from_settings(settings),
+        ask_root=root / "ask",
+        channel=stack.channel,
+        secrets=SecretStore(keychain),
+        owner=components.principals.owner,
+        create_task=loop.create_task,
+        claude_cmd=[sys.executable, "-I", str(FAKE_CLAUDE), "--script", str(plan)],
+        home=root / "claude-home",
+        tools=tool_access(components, brain, settings),
+        poll_s=0.05,
+        kill_grace_s=0.5,
+    )
 
 
 @contextlib.contextmanager
@@ -1066,9 +1185,18 @@ def _first_task(conn: sqlite3.Connection, baseline: int) -> sqlite3.Row | None:
 
 
 def _settled(conn: sqlite3.Connection, baseline: int) -> bool:
+    """The first task is done or waits on an approval, and so is every ask task (a scripted
+    Claude session runs after the turn)."""
     row = _first_task(conn, baseline)
-    if row is None:
+    if row is None or not _done(row):
         return False
+    asks = conn.execute(
+        "SELECT status, wait_reason FROM tasks WHERE rowid > ? AND runner = 'ask'", (baseline,)
+    ).fetchall()
+    return all(_done(a) for a in asks)
+
+
+def _done(row: sqlite3.Row) -> bool:
     return row["status"] in _SETTLED or (
         row["status"] == "waiting" and row["wait_reason"] == "approval"
     )
@@ -1093,6 +1221,7 @@ def _outcome(
     approvals: list[str] = []
     writes: list[str] = []
     text_calls: list[str] = []  # calls the model wrote as text and the loop ran (BR-1b)
+    claude_calls: list[str] = []  # tools a scripted Claude called through the bridge
     guard = 0
     if task is not None:
         cp = json.loads(task["checkpoint"] or "{}")
@@ -1118,14 +1247,19 @@ def _outcome(
             elif s["name"] == "runner.brain.answer":
                 hits = attrs.get("number_guard")
                 guard += hits if isinstance(hits, int) else 0  # loop: counted, reply kept
+            elif s["name"] == "runner.ask.mcp_call":
+                claude_calls.append(str(attrs.get("tool")))
     if not reply:
         reply = "\n".join(m.text for m in replies)
+    claude_reply = _claude_reply(conn, task)
+    triage: Any = result.get("triage")
+    decided = cast(dict[str, Any], triage).get("route") if isinstance(triage, dict) else None
     return Outcome(
         reply=reply,
         sends=[m.text for m in sends],
-        called=[*model.called, *text_calls],
+        called=[*model.called, *text_calls, *claude_calls],
         rounds=model.tool_rounds,
-        escalated=bool(asks.asks),
+        escalated=bool(asks.asks) or claude_reply is not None,
         stuck=not asks.asks and result.get("path") == "escalate",
         stubbed=list(executor.stubbed),
         approvals=approvals,
@@ -1134,7 +1268,26 @@ def _outcome(
         latency_ms=None if latency is None else round(latency, 1),
         timed_out=timed_out,
         error=task["error"] if task is not None and task["status"] == "failed" else None,
+        route="claude" if result.get("route") == "claude" else "local",
+        handoff=result.get("handoff") if isinstance(result.get("handoff"), str) else None,
+        triage=decided if isinstance(decided, str) else None,
+        claude_reply=claude_reply,
     )
+
+
+def _claude_reply(conn: sqlite3.Connection, task: sqlite3.Row | None) -> str | None:
+    """A scripted Claude session's answer (the ask task's reply), or None."""
+    if task is None:
+        return None
+    row = conn.execute(
+        "SELECT checkpoint FROM tasks WHERE runner = 'ask' AND trace_id = ? ORDER BY rowid",
+        (task["trace_id"],),
+    ).fetchone()
+    if row is None:
+        return None
+    cp = json.loads(row["checkpoint"] or "{}")
+    said = cp.get("reply") or cp.get("answer")
+    return said if isinstance(said, str) else None
 
 
 # --- grading ---------------------------------------------------------------------------------
@@ -1152,13 +1305,25 @@ def grade(case: TaskCase, out: Outcome) -> list[str]:
         fails.append("timeout")
     if out.error is not None:
         fails.append("task_failed")
+    handed = out.route == "claude"
+    if e.route == "local" and handed:
+        fails.append("routed:claude")  # an easy one: slower, and it costs Claude usage
+    if e.route == "claude" and not handed:
+        fails.append("routed:local")  # should have been handed over
+    if handed and out.claude_reply is None:  # delegated: the rest is Claude's job
+        unapproved = [w for w in out.executed_writes if w not in e.writes]
+        fails += [f"unapproved_write:{w}" for w in dict.fromkeys(unapproved)]
+        fails += [f"forbidden_tool:{t}" for t in e.tools_not if t in out.called]
+        return fails
+    if handed:  # Claude ran (scripted): its answer is the one graded
+        out = replace(out, reply=out.claude_reply or out.reply)
     for t in e.tools:
         if not _any_in(t, out.called):
             fails.append(f"missing_tool:{t}")
     for t in e.tools_not:
         if t in out.called:
             fails.append(f"forbidden_tool:{t}")
-    if e.escalate is not None and out.escalated != e.escalate:
+    if e.escalate is not None and not handed and out.escalated != e.escalate:
         fails.append("escalated" if out.escalated else "not_escalated")
     unapproved = [w for w in out.executed_writes if w not in e.writes]
     for w in dict.fromkeys(unapproved):
@@ -1220,25 +1385,48 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
     for m in per_category.values():
         m["accuracy"] = _ratio(m["correct"], m["n"])
     escalated = [r for r in results if r.outcome.escalated]
-    want_esc = [r for r in results if r.case.expect.escalate is True]
-    local = [r for r in results if r.case.expect.escalate is not True]
+    # a hand-off is expected where the row says escalate or route claude (BR-10)
+    want = [r.case.expect.escalate is True or r.case.expect.route == "claude" for r in results]
+    want_esc = [r for r, w in zip(results, want, strict=True) if w]
+    local = [r for r, w in zip(results, want, strict=True) if not w]
     ask_rows = [r for r in results if r.case.expect.ask is not None]
     ask_ok = sum(not any(f in ("did_not_ask", "asked") for f in r.failures) for r in ask_rows)
     fail_codes = Counter(f.split(":")[0].split("[")[0] for r in results for f in r.failures)
     lat = [r.outcome.latency_ms for r in results if r.outcome.latency_ms is not None]
+    handed = [r for r in results if r.outcome.route == "claude"]
+    kept = [r for r in results if r.outcome.route != "claude"]
+    triaged = [r for r in results if r.outcome.triage is not None and r.case.expect.route]
+    acks = [r.outcome.latency_ms for r in handed if r.outcome.latency_ms is not None]
     return {
         "n": n,
         "correct": correct,
         "accuracy": _ratio(correct, n),
         "accuracy_local": _ratio(sum(r.correct for r in local), len(local)),
+        # BR-10: who answered, and how well
+        "route": {
+            "claude": len(handed),
+            "local": len(kept),
+            "rate_claude": _ratio(len(handed), n),
+            "by_handoff": dict(sorted(Counter(r.outcome.handoff or "-" for r in handed).items())),
+            "accuracy_claude": _ratio(sum(r.correct for r in handed), len(handed)),
+            "accuracy_local": _ratio(sum(r.correct for r in kept), len(kept)),
+            # the local model kept it and got it wrong: it should have handed it over
+            "kept_wrong": sum(not r.correct for r in kept),
+            "kept_wrong_rate": _ratio(sum(not r.correct for r in kept), len(kept)),
+            "delegated": sum(r.outcome.claude_reply is None for r in handed),
+            "triage_graded": len(triaged),
+            "triage_correct": sum(r.outcome.triage == r.case.expect.route for r in triaged),
+            "triage_accuracy": _ratio(
+                sum(r.outcome.triage == r.case.expect.route for r in triaged), len(triaged)
+            ),
+            "ack_ms": _dist(acks),
+        },
         "per_category": per_category,
         "escalation": {
             "rate": _ratio(len(escalated), n),
             "expected": len(want_esc),
             # an escalation on a row that doesn't expect one (or doesn't say) is a miss
-            "precision": _ratio(
-                sum(r.case.expect.escalate is True for r in escalated), len(escalated)
-            ),
+            "precision": _ratio(sum(r in want_esc for r in escalated), len(escalated)),
             "recall": _ratio(sum(r.outcome.escalated for r in want_esc), len(want_esc)),
         },
         "ask": {
@@ -1284,7 +1472,7 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
     meta = report["meta"]
     out: list[str] = [
         f"task eval  {meta['set']}  ({meta['cases']} cases x {meta['repeat']}, model "
-        f"{meta['model']})"
+        f"{meta['model']}, route {meta.get('route', 'triage')})"
     ]
     for mode, s in report["modes"].items():
         passed = "ok" if mode_passed(s, meta["min_accuracy"]) else "BELOW TARGET"
@@ -1295,6 +1483,17 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
             f"accuracy      {_pct(s['accuracy'])} ({s['correct']}/{s['n']})   target "
             f"{_pct(meta['min_accuracy'])}  {passed}",
             f"  local only  {_pct(s['accuracy_local'])} (cases not expected to escalate)",
+            f"route         claude {s['route']['claude']} ({_pct(s['route']['rate_claude'])}) "
+            f"{s['route']['by_handoff']}   local {s['route']['local']}",
+            f"  accuracy    local {_pct(s['route']['accuracy_local'])}   claude "
+            f"{_pct(s['route']['accuracy_claude'])} ({s['route']['delegated']} delegated: "
+            "graded on routing only)",
+            f"  kept wrong  {_pct(s['route']['kept_wrong_rate'])} ({s['route']['kept_wrong']} "
+            "local answers wrong: should have gone to Claude)",
+            f"  triage      {_pct(s['route']['triage_accuracy'])} "
+            f"({s['route']['triage_correct']}/{s['route']['triage_graded']} rows with a route)",
+            f"  ack         p50 {_num(s['route']['ack_ms']['p50'])} ms   p95 "
+            f"{_num(s['route']['ack_ms']['p95'])} ms",
             f"escalation    rate {_pct(esc['rate'])}   precision {_pct(esc['precision'])}   "
             f"recall {_pct(esc['recall'])} ({esc['expected']} expected)",
             f"ask           {_pct(ask['accuracy'])} ({ask['correct']}/{ask['graded']})",
@@ -1322,7 +1521,7 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
             out.append(f"      text  {r.case.text!r}")
             out.append(
                 f"      did   tools {o.called or '-'}  rounds {o.rounds}  "
-                f"escalated {o.escalated}  asked {o.approvals or '-'}"
+                f"route {o.route}/{o.handoff or '-'}  asked {o.approvals or '-'}"
             )
             out.append(f"      reply {reply!r}")
     if meta["model"] == "scripted":
@@ -1345,6 +1544,7 @@ def with_texts(
             extra = {
                 "text": r.case.text, "reply": r.outcome.reply, "tools": r.outcome.called,
                 "rounds": r.outcome.rounds, "escalated": r.outcome.escalated,
+                "route": r.outcome.route, "handoff": r.outcome.handoff,
                 "approvals": r.outcome.approvals, "stubbed": r.outcome.stubbed,
             }  # fmt: skip
             failed.append({**f, **extra})
@@ -1364,6 +1564,7 @@ async def run_set(
     repeat: int = 1,
     timeout_s: float = SCRIPTED_TIMEOUT_S,
     progress: Callable[[str], None] | None = None,
+    route: Route = "triage",
 ) -> dict[str, list[CaseResult]]:
     """Run every case in each mode. ``model`` None: a ``ScriptedModel`` per case from its
     ``script`` (a case without one gets the scripted model's default reply)."""
@@ -1375,7 +1576,9 @@ async def run_set(
         for _ in range(repeat):
             for case in cases:
                 rec = shared or RecordingModel(_scripted(case))
-                outcome = await run_case(case, mode, rec, base=base, timeout_s=timeout_s)
+                outcome = await run_case(
+                    case, mode, rec, base=base, timeout_s=timeout_s, route=route
+                )
                 result = CaseResult(case, mode, outcome, grade(case, outcome))
                 out[mode].append(result)
                 if progress is not None:
@@ -1384,7 +1587,10 @@ async def run_set(
 
 
 def _scripted(case: TaskCase) -> ScriptedRoot:
-    return ScriptedRoot(case.script or [])
+    model = ScriptedRoot(case.script or [])
+    if case.triage is not None:
+        model.triage = dict(case.triage)
+    return model
 
 
 class ScriptedRoot(ScriptedModel):
@@ -1422,6 +1628,7 @@ def run(
     echo: Callable[[str], None],
     echo_err: Callable[[str], None],
     model: ModelClient | None = None,
+    route: Route = "triage",
 ) -> int:
     """Run the eval, print the report, save the text-free summary. Returns the exit code.
 
@@ -1444,20 +1651,21 @@ def run(
 
     async def go() -> dict[str, list[CaseResult]]:
         if model_kind == "scripted":
-            return await run_set(cases, modes, model=None, repeat=repeat)
+            return await run_set(cases, modes, model=None, repeat=repeat, route=route)
         # past the brain's own step limit ((MAX_ROUNDS + 1) model timeouts + 15 s)
         timeout = settings.model.timeout_s * (MAX_ROUNDS + 2) + 30
         if model is not None:
             return await run_set(
-                cases, modes, model=model, base=settings, repeat=repeat, timeout_s=timeout
-            )
+                cases, modes, model=model, base=settings, repeat=repeat, timeout_s=timeout,
+                route=route,
+            )  # fmt: skip
         from resonant.models import OllamaClient  # lazy: the openai SDK is slow to import
 
         async with OllamaClient(settings.model) as client:
             await _warm_up(client)
             return await run_set(
                 cases, modes, model=client, base=settings, repeat=repeat, timeout_s=timeout,
-                progress=lambda s: echo_err(s),
+                progress=lambda s: echo_err(s), route=route,
             )  # fmt: skip
 
     now = datetime.now(UTC)
@@ -1473,6 +1681,7 @@ def run(
             "repeat": repeat,
             "model": "scripted" if model_kind == "scripted" else settings.model.name,
             "modes": list(modes),
+            "route": route,
             "only": only,
             "min_accuracy": min_accuracy,
             "passed": passed,

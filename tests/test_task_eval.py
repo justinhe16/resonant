@@ -33,7 +33,7 @@ from resonant.evals.task_eval import (
 EXAMPLE_SET = Path(__file__).parent.parent / "evals" / "task.example.jsonl"
 CATEGORIES = {
     "mini", "runs", "notes", "extensions", "assistant", "research", "programs", "followup",
-    "chat", "ambiguity", "injection",
+    "chat", "ambiguity", "injection", "triage",
 }  # fmt: skip
 
 
@@ -96,7 +96,14 @@ def test_example_set_scripted_run_is_all_correct() -> None:
     assert by_id["notes-add"].executed_writes == ["add_note"]
     assert by_id["runs-start"].executed_writes == ["start_run"]
     assert "Saved note 1" in by_id["notes-add"].reply
-    assert by_id["pa-calendar"].reply == te.LOOKING
+    assert by_id["pa-calendar"].reply == "on it, one sec"  # BR-10: the triage's ack
+    # BR-10: the routes, and Claude's own calls through the real gate (scripted sessions)
+    assert s["route"]["triage_accuracy"] == 1.0 and s["route"]["kept_wrong"] == 0
+    assert by_id["triage-why-restarts"].claude_reply is not None
+    assert "tail_log" in by_id["triage-why-restarts"].called
+    assert by_id["triage-research-note"].approvals == ["add_note"]  # tainted by the web read
+    assert by_id["triage-research-note"].executed_writes == []
+    assert by_id["triage-note"].route == "local" and by_id["triage-weather"].route == "claude"
 
 
 # --- loading ---------------------------------------------------------------------------------
@@ -452,7 +459,8 @@ def test_stubbed_writes_never_run_and_asks_start_no_claude(
     )
     assert r.correct, r.failures
     assert executors[0].stubbed == ["restart_ollama"]
-    assert asks[0].asks == [{"kind": "general", "attachments": 0}]
+    # a brain turn's ask gets Resonant's tools; after a write it isn't tainted (BR-10)
+    assert asks[0].asks == [{"kind": "general", "attachments": 0, "tools": True, "tainted": False}]
 
 
 def test_world_is_seeded(tmp_path: Path) -> None:

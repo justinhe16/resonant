@@ -72,6 +72,7 @@ class Model:
         max_tokens: int = 512,
         temperature: float = 0.0,
         spans: SpanFactory | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelReply:
         self.label_calls += 1
         out = {"intent": "question", "confidence": 0.9}

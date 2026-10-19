@@ -24,6 +24,7 @@ from resonant.models import ChatMessage, ModelReply, SpanFactory
 from resonant.store import pulse as pulse_store
 from resonant.store import questions as qs
 from resonant.store.db import iso, utcnow
+from resonant_sdk import ToolSpec
 
 __all__ = ["chat"]  # the fixture
 
@@ -44,6 +45,7 @@ class RelayModel(test_e2e_runner.RunModel):
         max_tokens: int = 512,
         temperature: float = 0.0,
         spans: SpanFactory | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelReply:
         if "run" not in schema.get("properties", {}):
             return await super().chat_json(

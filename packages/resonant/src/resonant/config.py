@@ -639,6 +639,10 @@ class AskClaudeConfig(_Section):
     draft_tools: list[str] = Field(default_factory=_draft_tools)
     # Where attachments (screenshots, photos) may come from besides ``brain.read_roots``.
     attachment_roots: list[Path] = Field(default_factory=_attachment_roots, validate_default=True)
+    # BR-10: an ask the brain hands over (triage, its own ask_claude call, an escalation)
+    # also gets Resonant's tools through a per-task MCP server, every call through the same
+    # gate and executor as the local model's. Off: those asks are read-only, as in BR-5.
+    resonant_tools: bool = True
 
     @field_validator("attachment_roots")
     @classmethod
@@ -720,6 +724,24 @@ DEFAULT_READ_DENY: tuple[str, ...] = (
 )
 
 
+class TriageConfig(_Section):
+    """BR-10: the local model's first call on a chat turn decides who answers it.
+
+    Latency and usage: a local answer is ~1-5 s and free; a Claude answer takes ~5-20 s
+    (longer with tools) and draws on the owner's Claude subscription (``ask_claude``'s
+    daily cap and usage limits apply). The ack goes out first, within ~1 s on a warm model.
+    """
+
+    # ``normal``: the local model keeps the easy ones (a status, a note or reminder, one
+    # lookup with an obvious tool, small talk, a follow-up already answered) and hands the
+    # rest over, choosing Claude when in doubt. ``claude``: only a status, a note or reminder
+    # and small talk stay local.
+    bias: Literal["normal", "claude"] = "normal"
+    # The triage call's budget; past it (a cold prompt on a busy model) the turn goes to
+    # Claude with a canned ack.
+    timeout_s: float = Field(default=8.0, gt=0, le=60)
+
+
 class WatchConfig(_Section):
     """Watches (BR-7, docs/brain-plan.md D10): ``create_watch`` registers a periodic check,
     run by ``core/watches`` and ``runners/watch.py``."""
@@ -748,6 +770,11 @@ class BrainConfig(_Section):
     # brain loop (``runners/brain.py``). ``intents`` is the opt-in fallback: the labeler and
     # one intent's fixed toolset (the brain also uses it for a turn when the model fails).
     mode: Literal["intents", "loop"] = "loop"
+    # BR-10, loop mode only. ``triage``: the local model's first call routes each turn to
+    # itself or to Claude (with an ack). ``local``: the loop as before (Claude only when it
+    # asks or gets stuck). ``claude``: every turn goes to Claude, after a local ack.
+    route: Literal["triage", "local", "claude"] = "triage"
+    triage: TriageConfig = Field(default_factory=TriageConfig)
     # Where read_file, list_dir and search may look. Unset: runner.code_dir, ~/resonant (and
     # ops.repo_path), and Resonant's logs, docs and run transcripts. Set: exactly these.
     read_roots: list[Path] | None = None

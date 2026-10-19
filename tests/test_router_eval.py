@@ -32,7 +32,7 @@ from resonant.router import Labeler, match_fast_path
 from resonant.router import router as router_mod
 from resonant.router.intents import BUILTIN_INTENTS, IntentLabel, IntentSet
 from resonant.router.relay import parse_addressed
-from resonant_sdk import Manifest
+from resonant_sdk import Manifest, ToolSpec
 from resonant_sdk.manifest import parse_yaml
 
 EXAMPLE_SET = Path(__file__).resolve().parents[1] / "evals" / "router.example.jsonl"
@@ -66,6 +66,7 @@ class FakeModel:
         max_tokens: int = 512,
         temperature: float = 0.0,
         spans: SpanFactory | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelReply:
         m = _MESSAGE.match(messages[-1]["content"])
         assert m is not None

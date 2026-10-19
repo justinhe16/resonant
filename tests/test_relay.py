@@ -33,7 +33,7 @@ from resonant.router.router import RELAY_TITLE, classify
 from resonant.runners.claude import Refused
 from resonant.runners.worker_desk import OpenQuestion, Relayed
 from resonant.worker_text import owner_question_text, worker_text
-from resonant_sdk import Event
+from resonant_sdk import Event, ToolSpec
 
 __all__ = ["make"]  # the fixture
 
@@ -192,6 +192,7 @@ class Brain:
         max_tokens: int = 512,
         temperature: float = 0.0,
         spans: SpanFactory | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelReply:
         self.calls.append(messages)
         if self.pick is None:

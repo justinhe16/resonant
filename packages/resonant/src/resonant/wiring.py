@@ -109,7 +109,8 @@ from resonant.ops import SubprocessRunner, back_up
 from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
 from resonant.runners.ask import AskRunner, AskScope
-from resonant.runners.brain import MAX_ROUNDS, BrainRunner
+from resonant.runners.ask_tools import ToolAccess
+from resonant.runners.brain import MAX_ROUNDS, BrainRunner, taints
 from resonant.runners.claude import ClaudeRunner
 from resonant.runners.job import JobRunner
 from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
@@ -239,6 +240,25 @@ class IMessageStack:
         close, self._close_model = self._close_model, None
         if close is not None:
             await close()
+
+
+def tool_access(components: Components, brain: BrainRunner, settings: Settings) -> ToolAccess:
+    """Resonant's tools for a Claude brain session (BR-10): what the brain loop offers the
+    principal, through the same gate and executor as the local model's calls."""
+
+    def tools_for(principal: str) -> list[ToolSpec]:
+        core, deferred = brain.tools_for(principal)
+        return [*core, *deferred]
+
+    return ToolAccess(
+        gate=components.gate,
+        executor=components.executor,
+        registry=components.registry,
+        tools_for=tools_for,
+        taints=taints,
+        extensions=components.extensions,
+        timezone=settings.timezone,
+    )
 
 
 def _ask_runner(components: Components) -> AskRunner | None:
@@ -420,6 +440,7 @@ def build_imessage_stack(
         guard=settings.runner.guard,
         timezone=settings.timezone,
         create_task=loop.create_task,
+        tools=tool_access(components, brain, settings),  # BR-10: the brain's asks
     )
     components.runners[asks.name] = asks
     loop.runners[asks.name] = asks

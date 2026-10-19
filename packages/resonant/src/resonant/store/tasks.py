@@ -84,6 +84,19 @@ def insert_task(conn: sqlite3.Connection, spec: NewTask) -> str:
     return task_id
 
 
+def note_claude_reply(conn: sqlite3.Connection, task_id: str, reply: str) -> bool:
+    """BR-10: Claude's answer to a turn the brain handed over, kept on that (finished) brain
+    task's checkpoint as ``claude_reply`` so the history shows it. A task still running is
+    left alone (its own save would overwrite it). True when it was written."""
+    with atomic(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET checkpoint = json_set(COALESCE(checkpoint, '{}'), "
+            "'$.claude_reply', ?) WHERE id = ? AND status IN ('done', 'failed', 'cancelled')",
+            (reply, task_id),
+        )
+    return cur.rowcount == 1
+
+
 def get_task(conn: sqlite3.Connection, task_id: str) -> Task | None:
     r = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return None if r is None else row_to_task(r)

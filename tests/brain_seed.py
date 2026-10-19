@@ -68,6 +68,7 @@ class SummaryModel:
         max_tokens: int = 512,
         temperature: float = 0.0,
         spans: SpanFactory | None = None,
+        tools: list[ToolSpec] | None = None,
     ) -> ModelReply:
         self.calls.append(messages)
         if self.error is not None:
