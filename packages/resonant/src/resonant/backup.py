@@ -628,39 +628,76 @@ def restore(
     if any(_same_file(path, p) for p in live):
         raise BackupError("that is the live store itself")
     verify_file(path, check=check)
-    from resonant import killswitch
-    from resonant.store.db import connect
-
     saved: Path | None = None
     with _locked(daily_dir(settings)):
         if db.is_file():
             stamp = at.astimezone(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d-%H%M%S")
             pre = pre_restore_dir(settings)
+            raw = pre / f"resonant-{stamp}"
+            # Raw files first, before SQLite opens a possibly damaged store (closing it can
+            # delete a WAL SQLite can't use); kept only if a checked copy can't be made.
+            try:
+                _raw_save(db, raw)
+            except OSError as e:
+                raise BackupError(f"could not save the current store: {_describe(e)}") from e
             try:
                 saved = make_copy(db, pre, f"resonant-{stamp}.db", check=check)
             except BackupError:
-                try:
-                    saved = _raw_save(db, pre / f"resonant-{stamp}")
-                except OSError as e:
-                    raise BackupError(f"could not save the current store: {_describe(e)}") from e
+                saved = raw
+            else:
+                shutil.rmtree(raw, ignore_errors=True)
+        # Build the restored store in a fresh file next to the live one, so a damaged live
+        # file or WAL is never opened or replayed, then swap it in (the daemon is stopped).
+        tmp = db.with_name(f".{db.name}.restore.tmp")
+        ensure_dir(db.parent)
+        _cleanup(tmp)
+        for suffix in ("-wal", "-shm"):
+            _cleanup(tmp.with_name(tmp.name + suffix))
         try:
+            _new_temp(tmp)
             src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             try:
-                dst = connect(db)
+                dst = sqlite3.connect(tmp, isolation_level=None)
+                dst.row_factory = sqlite3.Row
                 try:
                     src.backup(dst)
+                    dst.execute("PRAGMA journal_mode=DELETE")
                     result = check(dst)
                     if result != "ok":
                         raise BackupError(f"integrity check after restore failed: {result}")
+                    # One transaction: the restored store is never visible unpaused.
                     with atomic(dst):
-                        audit(dst, "backup.restored", requested_by="owner:cli", file=path.name)
+                        before = {
+                            "autonomy": kv_get(dst, "autonomy"),
+                            "paused": kv_get(dst, "paused"),
+                        }
+                        kv_set(dst, "autonomy", "off")
+                        kv_set(dst, "paused", True)
                         kv_set(dst, KV_ARMED, iso(at))
-                    killswitch.engage(dst, actor="owner:cli", reason="backup restored")
+                        audit(dst, "backup.restored", requested_by="owner:cli", file=path.name)
+                        audit(
+                            dst,
+                            "killswitch.engage",
+                            requested_by="owner:cli",
+                            reason="backup restored",
+                            before=before,
+                        )
                 finally:
                     dst.close()
             finally:
                 src.close()
-        except sqlite3.Error as e:
+            os.chmod(tmp, FILE_MODE)
+            _fsync(tmp)
+            for suffix in ("-wal", "-shm"):  # saved above; never replayed over the restore
+                with contextlib.suppress(FileNotFoundError):
+                    db.with_name(db.name + suffix).unlink()
+            os.replace(tmp, db)
+            _fsync(db.parent)
+        except BackupError:
+            _cleanup(tmp)
+            raise
+        except (sqlite3.Error, OSError) as e:
+            _cleanup(tmp)
             raise BackupError(f"restore failed ({type(e).__name__}: {e})") from e
     return saved
 

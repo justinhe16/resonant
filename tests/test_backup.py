@@ -607,24 +607,55 @@ def test_restore_works_when_the_live_store_is_corrupt(home: Path, stopped: None)
     conn = open_db(settings.db_path)
     with atomic(conn):
         kv_set(conn, "marker", "good")
+        kv_set(conn, "paused", False)  # the backup was taken unpaused
+    path = backup.run_backup(conn, settings, now=T0).path
+    conn.close()
+    garbage = os.urandom(64 * 1024)
+    settings.db_path.write_bytes(garbage)
+    wal = settings.db_path.with_name("resonant.db-wal")
+    wal.write_bytes(os.urandom(8 * 1024))
+    saved = backup.restore(settings, path, now=T0)
+    assert saved is not None and saved.is_dir()  # raw files, not a checked copy
+    assert (saved / "resonant.db").read_bytes() == garbage
+    assert (saved / "resonant.db-wal").is_file() and mode(saved / "resonant.db") == 0o600
+    assert not wal.exists()  # the damaged WAL is never replayed over the restore
+    assert not list(home.glob(".resonant.db.restore.tmp*"))
+    conn = open_db(settings.db_path)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert kv_get(conn, "marker") == "good"
+        assert killswitch.is_paused(conn)  # comes up paused although the copy wasn't
+        assert kv_get(conn, "autonomy") == "off"
+        assert kv_get(conn, backup.KV_ARMED) == iso(T0)
+        engaged = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'killswitch.engage'"
+        ).fetchone()[0]
+        assert engaged == 1
+    finally:
+        conn.close()
+
+
+def test_a_failed_restore_leaves_the_live_store_alone(home: Path, stopped: None) -> None:
+    settings = settings_for(home)
+    conn = open_db(settings.db_path)
+    with atomic(conn):
+        kv_set(conn, "marker", "live")
     path = backup.run_backup(conn, settings, now=T0).path
     conn.close()
     calls = {"n": 0}
 
     def check(c: sqlite3.Connection) -> str:
-        calls["n"] += 1  # verify_file, then the pre-restore copy of the "corrupt" live store
-        return "*** corrupt" if calls["n"] == 2 else backup.integrity_check(c)
+        calls["n"] += 1  # verify, pre-restore copy, then the restored temp file fails
+        return "*** bad" if calls["n"] == 3 else backup.integrity_check(c)
 
-    saved = backup.restore(settings, path, now=T0, check=check)
-    assert saved is not None and saved.is_dir()  # raw files, not a checked copy
-    assert (saved / "resonant.db").is_file() and mode(saved / "resonant.db") == 0o600
+    with pytest.raises(backup.BackupError, match="after restore"):
+        backup.restore(settings, path, now=T0, check=check)
     conn = open_db(settings.db_path)
     try:
-        assert kv_get(conn, "marker") == "good"
-        assert killswitch.is_paused(conn)  # comes up paused
-        assert kv_get(conn, backup.KV_ARMED) == iso(T0)
+        assert kv_get(conn, "marker") == "live"
     finally:
         conn.close()
+    assert not list(home.glob(".resonant.db.restore.tmp*"))
 
 
 def test_is_daemon_argv() -> None:
