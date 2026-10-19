@@ -10,6 +10,8 @@
   ``selftest_retry_s`` (30 min) while the last one failed.
 - ``loop``: ``Daemon.healthy()``, dead-lettered events and failed tasks in the last hour.
 - ``store``: the DB is writable and free disk is above ``min_free_bytes`` (2GB).
+- ``backup`` (BK-1, ``resonant.backup.health_check``): a successful daily backup within
+  ``backup.alert_after_hours`` (36h). Its detail is the last backup's time.
 - ``ext:<name>`` (dynamic, one per extension): from ``ext_checks``
   (``extensions.host.ExtensionHealth``): the extension's health command, job fail streaks,
   and load refusals or tampering. A removed extension's check is dropped.
@@ -49,8 +51,8 @@ from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 
 log = logging.getLogger(__name__)
 
-CheckName = Literal["model", "imessage", "loop", "store"]
-CHECKS: tuple[CheckName, ...] = ("model", "imessage", "loop", "store")
+CheckName = Literal["model", "imessage", "loop", "store", "backup"]
+CHECKS: tuple[CheckName, ...] = ("model", "imessage", "loop", "store", "backup")
 HEALTH_KV_PREFIX = "health."
 EXT_CHECK_PREFIX = "ext:"
 MODEL_PROBE_KV = "model.probe"  # same key and shape as `resonant model probe`
@@ -273,6 +275,7 @@ class HealthMonitor:
         max_failed_tasks_1h: int = 2,
         send_failures_for_deadman: int = 3,
         ext_checks: DynamicChecks | None = None,
+        backup_check: Callable[[datetime], CheckResult | None] | None = None,
     ) -> None:
         self.conn = conn
         self.model = model
@@ -296,6 +299,7 @@ class HealthMonitor:
         self.max_dead_letters_1h = max_dead_letters_1h
         self.max_failed_tasks_1h = max_failed_tasks_1h
         self.ext_checks = ext_checks
+        self.backup_check = backup_check
         self.states: dict[str, CheckState] | None = None  # loaded on first evaluate
         self._model_result: CheckResult | None = None
         self._model_probed_at: datetime | None = None
@@ -330,6 +334,7 @@ class HealthMonitor:
             "imessage": await self._check_imessage(now),
             "loop": self._check_loop(now),
             "store": self._check_store(),
+            "backup": self._check_backup(now),
         }
         for name, result in results.items():
             if result is not None:
@@ -508,6 +513,14 @@ class HealthMonitor:
                 if free < self.min_free_bytes:
                     problems.append(f"low disk: {free / GB:.1f}GB free")
         return CheckResult(not problems, "; ".join(problems) or "ok")
+
+    def _check_backup(self, now: datetime) -> CheckResult | None:
+        if self.backup_check is None:
+            return None
+        try:
+            return self.backup_check(now)
+        except Exception as e:  # the check must never take the monitor down
+            return CheckResult(False, f"backup state unreadable ({type(e).__name__})")
 
     # --- state machine -------------------------------------------------------------------
 
