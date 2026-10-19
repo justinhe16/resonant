@@ -6,10 +6,11 @@ the slash commands; the reader only attaches files to the owner's messages.
   downloading them: up to ``file_wait_s``, polled), the step writes a code-built
   ``direct_call`` of ``ask_claude{question: <the message text, or a default>, kind: "image",
   attachments: [paths]}`` into the checkpoint and runs it like a slash command's call
-  (``LocalRunner._direct``: pinned, gated with ``origin="explicit"`` since the owner sent the
-  file, run by the executor). The reply is ask_claude's own text (``Looking into it…``, or the
-  refusal); the answer comes later from the ask runner. The ask runner checks each path
-  against ``brain.ask_claude.attachment_roots`` again and converts HEIC to JPEG.
+  (``LocalRunner._direct``: pinned, then ``ToolCore.resume`` gates it with
+  ``origin="explicit"`` since the owner sent the file, and the executor runs it). The reply is
+  ask_claude's own text (``Looking into it…``, or the refusal); the answer comes later from
+  the ask runner. The ask runner checks each path against ``brain.ask_claude.attachment_roots``
+  again and converts HEIC to JPEG.
 - **A voice note** (when there is no image or PDF): with ``brain.whisper_path`` set, it is
   checked like an attachment, copied into ``<RESONANT_HOME>/media/<task>``, converted to a
   16 kHz WAV and transcribed (``runners/convert.py``); the transcript is submitted as a new
@@ -42,16 +43,10 @@ from resonant.principals import Principals
 from resonant.router.intents import ExtensionCatalog
 from resonant.runners import convert
 from resonant.runners.ask import AskScope, check_attachment, copy_in
-from resonant.runners.local import (
-    NOT_AVAILABLE_REPLY,
-    Answer,
-    LocalRunner,
-    RunnerGate,
-    StepResult,
-    ToolExecutor,
-)
+from resonant.runners.local import Answer, LocalRunner, StepResult
 from resonant.store.db import utcnow
 from resonant.store.tasks import get_event
+from resonant.toolcore import NOT_AVAILABLE_REPLY, RunnerGate, ToolExecutor
 from resonant.tools import ToolRegistry
 from resonant.tools.ask import ASK_CLAUDE, QUESTION_MAX
 from resonant_sdk import Event

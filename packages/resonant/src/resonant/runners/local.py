@@ -83,17 +83,15 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from functools import partial
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 from resonant.brain.history import reply_tainted, taint_hops
 from resonant.brain.text import flat
-from resonant.executor import NotAllowedError, ToolResult, idempotency_key
+from resonant.executor import ToolResult
 from resonant.extensions.notify import take_baseline
 from resonant.extensions.scheduler import persist_events
-from resonant.gate import Allow, Decision, Deny, DryRun, Intent, NeedsApproval, canonical_json
+from resonant.gate import Decision, Deny, DryRun, Intent, NeedsApproval, canonical_json
 from resonant.gate.codes import clean_external
-from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
-from resonant.gate.summary import summarize as summarize_args
 from resonant.gate.types import Origin
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import Done, Fail, StepContext, StepOutcome, Task, Wait
@@ -132,14 +130,36 @@ from resonant.router.render import (
 from resonant.router.router import builtin_names, chat_toolset
 from resonant.runners.approve import prompt_approvers
 from resonant.runners.job import SUMMARY_MAX, done_text, failed_text
-from resonant.store import approvals as ap
 from resonant.store import extensions as ext_store
-from resonant.store import trust as trust_store
 from resonant.store.audit import audit
 from resonant.store.db import transaction, utcnow
 from resonant.store.tasks import get_event, get_task, principal_thread
+from resonant.toolcore import (
+    DONE_NOT_APPROVED,
+    NOT_AVAILABLE_REPLY,
+    Asked,
+    CallOutcome,
+    CallScope,
+    Failed,
+    PinnedCall,
+    Ran,
+    Refused,
+    ToolCore,
+    direct_call,
+    report_line,
+)
+
+# Moved to ``resonant.toolcore`` (TC-1); re-exported for the runners and tests that import
+# them from here.
+from resonant.toolcore import MAX_SIDE_EFFECTS as MAX_SIDE_EFFECTS
+from resonant.toolcore import REPORTS as REPORTS
+from resonant.toolcore import RunnerGate as RunnerGate
+from resonant.toolcore import ToolExecutor as ToolExecutor
+from resonant.toolcore import dry_run_reply as dry_run_reply
+from resonant.toolcore import is_explicit as is_explicit
+from resonant.toolcore import refusal_reply as refusal_reply
+from resonant.toolcore import summarize_intent as summarize_intent
 from resonant.tools import ToolRegistry
-from resonant.tools.ops import summary_action as ops_action
 from resonant_sdk import Effect, Event, ToolSpec
 
 log = logging.getLogger(__name__)
@@ -147,17 +167,16 @@ log = logging.getLogger(__name__)
 NAME = "local"
 MAX_TOOL_ITERATIONS = 3  # chat_tools calls per task
 MAX_TOOL_CALLS = 3  # tool executions per task
-MAX_SIDE_EFFECTS = 3  # gated side effects allowed without asking, per task (GT-1)
 MAX_REPLY_CHARS = 600
 MAX_MESSAGE_CHARS = 2000  # the current message, as the labeler sees it
 MAX_HISTORY_CHARS = 500  # each earlier message or reply
 THREAD_EVENTS = 6  # the current message plus up to 5 earlier ones
 MODEL_RESULT_MAX_CHARS = 4096  # an extension tool's result, as the model sees it
 TRUNCATED = "…[truncated]"
-FINAL_MAX_TOKENS = 300
-
 TOOL_FAILED_PREFIX = "ToolFailed: "  # executor: a definite failure's error text
 TOOL_ERROR_MAX_CHARS = 300
+FINAL_MAX_TOKENS = 300
+
 TOO_MANY_REPLY = "That needs more steps than I take at once. Ask for one thing at a time."
 NO_ANSWER_REPLY = "I couldn't put together a reliable answer. Try /status or /tasks."
 
@@ -174,20 +193,6 @@ REPLY_SCHEMA: dict[str, Any] = {
 
 # Integers and decimals, with optional thousands separators: 3, 1,024, 63.2.
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
-
-
-class RunnerGate(Protocol):
-    """The part of the gate the runner uses. The executor consumes the token."""
-
-    def evaluate(self, intent: Intent) -> Decision: ...
-
-
-class ToolExecutor(Protocol):
-    async def execute(
-        self, intent: Intent, decision: Decision, *, step_no: int, call_index: int = 0
-    ) -> ToolResult: ...
-
-    def recorded(self, key: str) -> ToolResult | None: ...
 
 
 # --- number guard ------------------------------------------------------------------------
@@ -324,217 +329,6 @@ def clip_reply(text: str, limit: int = MAX_REPLY_CHARS) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-# --- gated call replies ----------------------------------------------------------------
-
-DONE_NOT_APPROVED = "Not done."
-NOT_AVAILABLE_REPLY = "Not done: that tool isn't available."
-NOTE_TEXT_CHARS = 60
-
-
-def _note_saved(d: dict[str, Any]) -> str | None:
-    note_id, text = d.get("id"), d.get("text")
-    if not isinstance(note_id, int) or not isinstance(text, str):
-        return None
-    shown = text if len(text) <= NOTE_TEXT_CHARS else text[: NOTE_TEXT_CHARS - 1] + "…"
-    return f'Saved note {note_id}: "{shown}"'
-
-
-def _note_deleted(d: dict[str, Any]) -> str | None:
-    note_id = d.get("id")
-    return f"Deleted note {note_id}." if isinstance(note_id, int) else None
-
-
-def _notes_cleared(d: dict[str, Any]) -> str | None:
-    n = d.get("cleared")
-    if not isinstance(n, int):
-        return None
-    return f"Cleared {n} note{'' if n == 1 else 's'}."
-
-
-def _reminder_set(d: dict[str, Any]) -> str | None:
-    n, due, text = d.get("id"), d.get("due"), d.get("text")
-    if not isinstance(n, int) or not isinstance(due, str) or not isinstance(text, str):
-        return None
-    shown = text if len(text) <= NOTE_TEXT_CHARS else text[: NOTE_TEXT_CHARS - 1] + "…"
-    return f'⏰ Reminder {n} set for {due}: "{shown}"'
-
-
-def _reminder_cancelled(d: dict[str, Any]) -> str | None:
-    n = d.get("id")
-    return f"Cancelled reminder {n}." if d.get("cancelled") is True and isinstance(n, int) else None
-
-
-def _ollama_restarted(d: dict[str, Any]) -> str | None:
-    return "Restarted Ollama." if d.get("restarted") is True else None
-
-
-def _resonant_restarting(d: dict[str, Any]) -> str | None:
-    return "Restarting Resonant…" if d.get("restarting") is True else None
-
-
-def _updated(d: dict[str, Any]) -> str | None:
-    old, new = d.get("old"), d.get("new")
-    if not isinstance(old, str) or not isinstance(new, str):
-        return None
-    if d.get("updated") is False:
-        return f"Already up to date ({new})."
-    if d.get("restarting") is True:
-        return f"Updated {old} → {new}, restarting…"
-    if d.get("synced") is False:
-        error = clean_external(str(d.get("sync_error") or "failed"))[:60]
-        return (
-            f"Updated {old} → {new}, but uv sync failed ({error}): not restarting. "
-            "Fix it on the Mini."
-        )
-    return None
-
-
-def _run_text(d: dict[str, Any]) -> str | None:
-    """A run tool's result is already the code-built reply (``Started.text``, a refusal)."""
-    text = d.get("text")
-    return text if isinstance(text, str) and text else None
-
-
-def _muted(d: dict[str, Any]) -> str | None:
-    ext, until = d.get("extension"), d.get("until_text")
-    if not isinstance(ext, str):
-        return None
-    if isinstance(until, str):
-        return f"Muted {ext} until {until}."
-    return f"Unmuted {ext}." if d.get("muted_until") is None else None
-
-
-def _rule_added(d: dict[str, Any]) -> str | None:
-    rule_id, text = d.get("id"), d.get("text")
-    if not isinstance(rule_id, int) or not isinstance(text, str):
-        return None
-    if d.get("existed") is True:
-        return f"Rule already there: {text} (rule {rule_id})."
-    line = f"Rule added: {text} (rule {rule_id})"
-    old = d.get("replaced")
-    if isinstance(old, dict):
-        old_d = cast(dict[str, Any], old)
-        line += f", replacing rule {old_d.get('id', '?')} ({old_d.get('text', '')})"
-    return line + "."
-
-
-def _rule_removed(d: dict[str, Any]) -> str | None:
-    rule_id, text = d.get("id"), d.get("text")
-    if d.get("removed") is not True or not isinstance(rule_id, int) or not isinstance(text, str):
-        return None
-    return f"Rule removed: {text} (rule {rule_id})."
-
-
-def _fact_saved(d: dict[str, Any]) -> str | None:
-    name, description = d.get("name"), d.get("description")
-    if not isinstance(name, str) or not isinstance(description, str):
-        return None
-    # The whole description (at most 120): the owner sees exactly what went into the prompt.
-    verb = "Remembered" if d.get("created") is True else "Updated fact"
-    return f'{verb} {name}: "{description}"'
-
-
-def _fact_forgotten(d: dict[str, Any]) -> str | None:
-    name = d.get("name")
-    return f"Forgot {name}." if d.get("forgotten") is True and isinstance(name, str) else None
-
-
-def _watch_created(d: dict[str, Any]) -> str | None:
-    code, what, every = d.get("id"), d.get("what"), d.get("every_minutes")
-    if d.get("created") is not True or not isinstance(code, str) or not isinstance(what, str):
-        return None
-    often = f"{every // 60}h" if isinstance(every, int) and every % 60 == 0 else f"{every}m"
-    until = d.get("expires_at")
-    end = f" until {until[:10]}" if isinstance(until, str) else ""
-    return f"Watching {code}: {what}, every {often}{end}."
-
-
-def _watch_cancelled(d: dict[str, Any]) -> str | None:
-    code, what = d.get("id"), d.get("what")
-    if not isinstance(code, str) or not isinstance(what, str):
-        return None
-    if d.get("cancelled") is True:
-        return f"Stopped watch {code}: {what}."
-    return f"Watch {code} had already ended ({d.get('state')})."
-
-
-def summarize_intent(intent: Intent) -> str:
-    """The code-built phrase for ``intent`` in replies: the ops heading (``update Resonant``)
-    when there is one, as in approval prompts and dry-run replies, else the generic summary."""
-    return summarize_args(intent, action=ops_action(intent))
-
-
-# Code-built report lines for builtin side effects, keyed by tool name. Anything else
-# reports ``Done: <summary>``. A renderer returns None for a result it doesn't recognize.
-REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
-    "add_note": _note_saved,
-    "delete_note": _note_deleted,
-    "clear_notes": _notes_cleared,
-    "add_reminder": _reminder_set,
-    "cancel_reminder": _reminder_cancelled,
-    "restart_ollama": _ollama_restarted,
-    "restart_resonant": _resonant_restarting,
-    "update_resonant": _updated,
-    "mute_extension": _muted,
-    "start_run": _run_text,
-    "cancel_run": _run_text,
-    "merge_run": _run_text,
-    "answer_worker": _run_text,
-    "message_worker": _run_text,
-    "create_repo": _run_text,
-    "add_ci": _run_text,
-    "merge_ci_pr": _run_text,
-    "add_repo": _run_text,
-    "forget_repo": _run_text,
-    "add_trust_rule": _rule_added,
-    "allow_trust_rule": _rule_added,
-    "remove_trust_rule": _rule_removed,
-    "remember": _fact_saved,
-    "forget": _fact_forgotten,
-    "create_watch": _watch_created,
-    "cancel_watch": _watch_cancelled,
-}
-
-
-def report_line(intent: Intent, data: dict[str, Any]) -> str:
-    """The code-built line that says what a side effect did. Never from a model."""
-    render = REPORTS.get(intent.tool) if intent.extension is None else None
-    line = render(data) if render is not None else None
-    return line or f"Done: {summarize_intent(intent)}"
-
-
-def refusal_reply(intent: Intent, decision: Deny) -> str:
-    if decision.reason == NOT_APPROVED:
-        return DONE_NOT_APPROVED
-    if decision.reason == APPROVAL_EXPIRED:
-        return f"Not done: the approval for {summarize_intent(intent)} expired."
-    if decision.reason == APPROVAL_USED:
-        return "Not done: that approval was already used."
-    return f"Not done: {decision.reason}."
-
-
-def dry_run_reply(decision: DryRun) -> str:
-    return f"Dry run: would {decision.would}"
-
-
-def _failure_reply(intent: Intent, result: ToolResult) -> str:
-    if result.notice is not None:  # code-built by the executor (a missing secret)
-        return result.notice
-    if result.ambiguous:
-        return (
-            f"Not sure whether {summarize_intent(intent)} ran: it has no recorded outcome. "
-            "Check before trying again."
-        )
-    text = f"Failed: {summarize_intent(intent)}"
-    # Only a handler's ToolFailed message is meant for the user; other errors stay in audit.
-    error = result.error or ""
-    if error.startswith("ToolFailed: "):
-        detail = clean_external(error.removeprefix("ToolFailed: "))[:120]
-        if detail:
-            text += f" ({detail})"
-    return text
-
-
 # --- runner ------------------------------------------------------------------------------
 
 
@@ -553,65 +347,6 @@ class Answer:
 
 # A step either answers (the reply is saved, then sent) or ends early (Wait or Fail).
 StepResult = Answer | Wait | Fail
-
-
-@dataclass(frozen=True)
-class PinnedCall:
-    """``checkpoint.call``: the task's one gated call and its pinned idempotency inputs."""
-
-    tool: str
-    extension: str | None
-    args: dict[str, Any]
-    step_no: int
-    call_index: int
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "tool": self.tool,
-            "extension": self.extension,
-            "args": self.args,
-            "step_no": self.step_no,
-            "call_index": self.call_index,
-        }
-
-    @classmethod
-    def from_json(cls, value: Any) -> PinnedCall | None:
-        d = _as_dict(value)
-        tool, ext, args = d.get("tool"), d.get("extension"), d.get("args")
-        step_no, call_index = d.get("step_no"), d.get("call_index")
-        if (
-            not isinstance(tool, str)
-            or not (ext is None or isinstance(ext, str))
-            or not isinstance(args, dict)
-            or not isinstance(step_no, int)
-            or not isinstance(call_index, int)
-        ):
-            return None
-        return cls(tool, ext, cast(dict[str, Any], args), step_no, call_index)
-
-
-def _direct_call(cp: dict[str, Any]) -> tuple[str | None, str, dict[str, Any]] | None:
-    """``checkpoint.direct_call`` as ``(extension, tool, args)``. A missing ``extension``
-    (older checkpoints) is a builtin."""
-    d = _as_dict(cp.get("direct_call"))
-    ext, tool, args = d.get("extension"), d.get("tool"), d.get("args", {})
-    if not (ext is None or isinstance(ext, str)) or not isinstance(tool, str):
-        return None
-    if not isinstance(args, dict):
-        return None
-    return ext, tool, cast(dict[str, Any], args)
-
-
-def is_explicit(cp: dict[str, Any], pinned: PinnedCall) -> bool:
-    """The one place ``origin="explicit"`` comes from: a router-written ``direct_call``
-    that is exactly the pinned call (extension, tool and args). A call the model chose is
-    never explicit."""
-    direct = _direct_call(cp)
-    return (
-        direct is not None
-        and pinned.call_index == 0
-        and direct == (pinned.extension, pinned.tool, pinned.args)
-    )
 
 
 class LocalRunner:
@@ -638,13 +373,19 @@ class LocalRunner:
         timezone: str = "UTC",
         extensions: ExtensionCatalog | None = None,
         model_result_max_chars: int = MODEL_RESULT_MAX_CHARS,
+        name: str | None = None,
     ) -> None:
+        """``name`` overrides the runner's name (its span names): the ask runner's approval
+        resume is a ``LocalRunner`` named ``ask``."""
+        if name is not None:
+            self.name = name
         self.conn = conn
         self.model = model
         self.channel = channel
-        self.gate = gate
+        self.gate = gate  # kept for wiring checks; every call goes through ``core``
         self.executor = executor
         self.registry = registry
+        self.core = ToolCore(conn, registry=registry, gate=gate, executor=executor)
         self.max_step_s = max_step_s
         self.clock = clock
         self.now = now
@@ -805,7 +546,7 @@ class LocalRunner:
         spans: SpanFactory,
     ) -> StepResult:
         """A slash command's call: pinned, then gated with ``origin="explicit"``."""
-        direct = _direct_call(cp)
+        direct = direct_call(cp)
         if direct is None:
             return Fail("checkpoint.direct_call is malformed")
         ext, tool, args = direct
@@ -825,97 +566,32 @@ class LocalRunner:
         cp: dict[str, Any],
         spans: SpanFactory,
     ) -> StepResult:
-        """Run the pinned call exactly once: what ``executions`` holds first, then the gate."""
-        spec = self.registry.get(pinned.extension, pinned.tool)
-        if spec is None:
-            return Answer(NOT_AVAILABLE_REPLY, "refused", [])
-        origin = self._pinned_origin(cp, pinned)
-        with spans(
-            "runner.local.call", tool=pinned.tool, extension=pinned.extension, origin=origin
-        ) as s:
-            try:
-                intent = Intent.for_tool(
-                    spec,
-                    task_id=task.id,
-                    principal=principal,
-                    args=pinned.args,
-                    trace_id=task.trace_id,
-                    origin=origin,
-                )
-            except (TypeError, ValueError):
-                s.set(decision="bad_args")
-                return Answer("Not done: invalid arguments.", "refused", [])
-            key = idempotency_key(task.id, pinned.step_no, pinned.call_index, intent.hash)
-            prior = self.executor.recorded(key)
-            if prior is not None:
-                s.set(recorded=True, ok=prior.ok, ambiguous=prior.ambiguous)
-                job = self._job_id(spec)
-                answer = _outcome(intent, prior)
-                if job is None or spec.extension is None:
-                    return answer
-                if not self._job_recorded(task.id):  # a crash after execute, before recording
-                    self._record_job(intent, spec.extension, job, prior)
-                return _job_answer(intent, job, prior, answer)
-            decision = self.gate.evaluate(intent)
-            s.set(decision=type(decision).__name__)
-            return await self._decided(intent, decision, pinned, cp, spans)
+        """Run the pinned call exactly once (``ToolCore.resume``: what ``executions`` holds
+        first, then the gate with the pinned origin)."""
+        scope = CallScope(
+            task.id, principal, task.trace_id, task.step_no, spans=spans, checkpoint=cp
+        )
+        return await self._gated(await self.core.resume(pinned, scope), spans)
 
-    def _pinned_origin(self, cp: dict[str, Any], pinned: PinnedCall) -> Origin:
-        """The origin a pinned call is gated with: ``explicit`` only for the router's
-        ``direct_call`` (``is_explicit``), else ``tainted`` when it was pinned so (D6, BR-10b),
-        else ``inferred``."""
-        if is_explicit(cp, pinned):
-            return "explicit"
-        return "tainted" if cp.get("tainted") is True else "inferred"
-
-    async def _decided(
-        self,
-        intent: Intent,
-        decision: Decision,
-        pinned: PinnedCall,
-        cp: dict[str, Any],
-        spans: SpanFactory,
-    ) -> StepResult:
-        """Act on the gate's decision for a pinned call (``cp`` already holds ``call``)."""
-        if isinstance(decision, NeedsApproval):
-            return await self._ask(intent.task_id, decision, cp, spans)
-        if not isinstance(decision, Allow):
-            return _not_run(intent, decision)
-        try:
-            result = await self.executor.execute(
-                intent, decision, step_no=pinned.step_no, call_index=pinned.call_index
-            )
-        except NotAllowedError:
-            return Answer(refusal_reply(intent, Deny(APPROVAL_USED)), "refused", [])
-        answer = _outcome(intent, result)
-        added = self._rule_added(decision.approval_id)
-        if added is not None and answer.path in ("done", "replay"):
-            answer = replace(answer, reply=clip_reply(f"{answer.reply}\n{added}"))
-        spec = self.registry.get(intent.extension, intent.tool)
-        job = self._job_id(spec) if spec is not None else None
-        if job is None or intent.extension is None:
+    async def _gated(self, outcome: CallOutcome, spans: SpanFactory) -> StepResult:
+        """A gated call's outcome as this runner's step result: the prompt and the wait for
+        an approval, the templated reply otherwise, and an on-demand job's report."""
+        if isinstance(outcome, Asked):
+            task_id = outcome.intent.task_id
+            return await self._ask(task_id, outcome.decision, outcome.checkpoint, spans)
+        answer = gated_answer(outcome)
+        if not isinstance(answer, Answer) or not isinstance(outcome, Ran | Failed):
             return answer
-        if not result.replayed:
+        intent, result = outcome.intent, outcome.result
+        if intent is None or result is None or intent.extension is None:
+            return answer
+        job = self._job_id(intent.spec)
+        if job is None:
+            return answer
+        # recorded: a crash after execute, before recording; else not if the run replayed
+        if not (self._job_recorded(intent.task_id) if outcome.recorded else result.replayed):
             self._record_job(intent, intent.extension, job, result)
         return _job_answer(intent, job, result, answer)
-
-    def _rule_added(self, approval_id: str | None) -> str | None:
-        """``Rule added: don't ask before running X in Y (rule 7)`` when the call ran on a
-        ``yes always`` that saved a standing allow (the gate saved it with the approval)."""
-        if approval_id is None:
-            return None
-        row = ap.get_approval(self.conn, approval_id)
-        if row is None or not row.always or not row.always_scope or not row.always_action:
-            return None
-        rule = next(
-            (
-                r
-                for r in trust_store.rules_for(self.conn, row.always_scope, row.always_action)
-                if r.effect == "allow"
-            ),
-            None,
-        )
-        return f"Rule added: {rule.text} (rule {rule.id})" if rule is not None else None
 
     def _job_id(self, spec: ToolSpec) -> str | None:
         """The manifest job id when ``spec`` is an extension's job spec (``/ext run``)."""
@@ -1162,88 +838,40 @@ class LocalRunner:
         *,
         origin: Origin = "inferred",
         pin: Mapping[str, Any] | None = None,
+        check_schema: bool = False,
     ) -> CallResult | Wait | Fail | Answer:
-        """One model tool call. An allowed read returns its ``CallResult``. Anything else is a
-        gated call: an executed side effect returns a ``CallResult`` with ``report`` set, and a
-        refusal, dry run or wait returns that result. ``effects``: the report lines of the
-        side effects this task already ran, pinned with the call so a resume replies with
-        them too. ``origin`` is ``inferred`` (the brain loop passes ``tainted``; never
-        ``explicit``) and ``pin`` adds keys to the pinned checkpoint (the brain's taint)."""
-        with spans("runner.local.tool", tool=name, call_index=call_index) as s:
-            # Only the routed toolset; the spec (effect, level) comes from the registry.
-            spec = next((t for t in toolset if t.name == name), None)
-            if spec is None:
-                s.set(decision="unavailable", ok=False)
-                return CallResult(name, False, None, "tool not available")
-            ext = spec.extension
-            s.set(extension=ext)
-            try:
-                # Never "explicit": the model can never claim the owner typed this.
-                if origin == "explicit":
-                    raise ValueError("a model-chosen call is never explicit")
-                intent = Intent.for_tool(
-                    spec,
-                    task_id=task.id,
-                    principal=principal,
-                    args=args,
-                    trace_id=task.trace_id,
-                    origin=origin,
-                )
-            except (TypeError, ValueError):
-                s.set(decision="bad_args", ok=False)
-                return CallResult(name, False, None, "invalid arguments")
-            decision = self.gate.evaluate(intent)
-            s.set(decision=type(decision).__name__)
-            read = spec.effect is Effect.READ
-            if read and not isinstance(decision, NeedsApproval):
-                if not isinstance(decision, Allow):
-                    s.set(ok=False)
-                    return CallResult(name, False, None, _refusal(decision), extension=ext)
-                try:
-                    result = await self.executor.execute(
-                        intent, decision, step_no=task.step_no, call_index=call_index
-                    )
-                except NotAllowedError:
-                    s.set(ok=False)
-                    return CallResult(name, False, None, "not allowed", extension=ext)
-                s.set(ok=result.ok, replayed=result.replayed, duration_ms=result.duration_ms)
-                if not result.ok:
-                    why = self._read_error(result)
-                    return CallResult(name, False, None, why, extension=ext)
-                return CallResult(name, True, result.data or {}, None, extension=ext)
-
-            # A gated call: pin it before it can run or be prompted.
-            s.set(gated=True)
-            if not isinstance(decision, Allow | NeedsApproval):
-                return _not_run(intent, decision)
-            pinned = PinnedCall(spec.name, spec.extension, intent.args, task.step_no, call_index)
-            cp = {
-                **task.checkpoint,
-                **(pin or {}),
-                "call": pinned.to_json(),
-                "effects": list(effects or []),
-            }
-            if not ctx.save(checkpoint=cp):
-                return Fail("task is no longer running")
-            result = await self._decided(intent, decision, pinned, cp, spans)
-            # "replay": an earlier attempt already ran it; it still counts as the side effect.
-            if not isinstance(result, Answer) or result.path not in ("done", "replay"):
-                return result
-            return CallResult(
-                name, True, result.data or {}, None, report=result.reply, extension=ext
-            )
-
-    def _read_error(self, result: ToolResult) -> str:
-        """What the model sees when a read fails: ``the tool failed``, or with
-        ``tool_error_detail`` (the brain) the tool's own reason for a definite failure
-        (``ToolFailed``: code-built, e.g. ``read_file: … is outside the read roots``), clipped.
-        It goes back in an untrusted tool turn like any result."""
-        error = result.error or ""
-        if self.tool_error_detail and error.startswith(TOOL_FAILED_PREFIX):
-            detail = flat(error.removeprefix(TOOL_FAILED_PREFIX), TOOL_ERROR_MAX_CHARS)
-            if detail:
-                return f"the tool failed: {detail}"
-        return "the tool failed"
+        """One model tool call through ``ToolCore.call``. An allowed read returns its
+        ``CallResult``. Anything else is a gated call: an executed side effect returns a
+        ``CallResult`` with ``report`` set, and a refusal, dry run or wait returns that result.
+        ``effects``: the report lines of the side effects this task already ran, pinned with
+        the call so a resume replies with them too. ``origin`` is ``inferred`` (the brain loop
+        passes ``tainted``; never ``explicit``) and ``pin`` adds keys to the pinned checkpoint
+        (the brain's taint). ``check_schema``: the brain's calls (the intents path never
+        checked the schema; TC-1 kept that)."""
+        scope = CallScope(
+            task.id,
+            principal,
+            task.trace_id,
+            task.step_no,
+            call_index,
+            origin,
+            spans=spans,
+            checkpoint=task.checkpoint,
+            steps=ctx,
+            effects=list(effects or []),
+            pin=pin,
+            tools=toolset,
+            check_schema=check_schema,
+        )
+        outcome = await self.core.call(name, args, scope)
+        if not outcome.gated:
+            return model_result(outcome, name, detail=self.tool_error_detail)
+        result = await self._gated(outcome, spans)
+        # "replay": an earlier attempt already ran it; it still counts as the side effect.
+        if not isinstance(result, Answer) or result.path not in ("done", "replay"):
+            return result
+        ext = outcome.intent.extension if outcome.intent is not None else None
+        return CallResult(name, True, result.data or {}, None, report=result.reply, extension=ext)
 
     async def _final(
         self, messages: list[ChatMessage], text: str, calls: list[CallResult], spans: SpanFactory
@@ -1274,26 +902,66 @@ class LocalRunner:
             return Answer(candidate, "llm", used)
 
 
-def _not_run(intent: Intent, decision: Decision) -> Answer:
-    """The templated reply for a gated call the gate didn't allow (and isn't asking about)."""
-    if isinstance(decision, DryRun):
-        return Answer(dry_run_reply(decision), "dry_run", [])
-    if isinstance(decision, Deny):
-        return Answer(refusal_reply(intent, decision), "refused", [])
-    return Answer(DONE_NOT_APPROVED, "refused", [])  # Veto: never returned in Phase 2
-
-
-def _outcome(intent: Intent, result: ToolResult) -> Answer:
-    """The templated reply for a gated call that ran (or was recorded as run)."""
-    if not result.ok:
-        path = "ambiguous" if result.ambiguous else "failed"
-        return Answer(_failure_reply(intent, result), path, [])
+def gated_answer(outcome: CallOutcome) -> Answer | Fail:
+    """The templated reply for a gated call's outcome (``Asked`` aside: the caller prompts or
+    defers). A side effect that ran replies with its code-built report line (and ``Rule
+    added: …`` after a ``yes always``); a read with the summary of its result."""
+    if isinstance(outcome, Refused):
+        return Answer(outcome.text, "dry_run" if outcome.why == "dry_run" else "refused", [])
+    if isinstance(outcome, Asked):  # never here: the caller handles it first
+        return Answer(DONE_NOT_APPROVED, "refused", [])
+    if isinstance(outcome, Failed):
+        if outcome.result is None:  # its pin couldn't be saved
+            return Fail(outcome.text)
+        return Answer(outcome.text, "ambiguous" if outcome.result.ambiguous else "failed", [])
+    intent, result = outcome.intent, outcome.result
     data = result.data or {}
     if intent.effect is Effect.READ:
         reply = summarize([CallResult(intent.tool, True, data, None, extension=intent.extension)])
     else:
-        reply = report_line(intent, data)
+        reply = outcome.report or report_line(intent, data)
+    if outcome.rule_added is not None:
+        reply = clip_reply(f"{reply}\n{outcome.rule_added}")
     return Answer(reply, "replay" if result.replayed else "done", [intent.tool], data=data)
+
+
+def model_result(outcome: CallOutcome, name: str, *, detail: bool = False) -> CallResult:
+    """An ungated outcome (a read the gate allowed or refused, or a call refused before the
+    gate) as the ``CallResult`` that goes back to the model. ``detail``: a failed read's own
+    ``ToolFailed`` reason (``read_error``)."""
+    ext = outcome.intent.extension if outcome.intent is not None else None
+    if isinstance(outcome, Ran):
+        return CallResult(name, True, outcome.result.data or {}, None, extension=ext)
+    if isinstance(outcome, Failed):
+        why = read_error(outcome.result, detail) if outcome.result is not None else "not run"
+        return CallResult(name, False, None, why, extension=ext)
+    if isinstance(outcome, Asked):  # never here: an approval is always gated
+        return CallResult(name, False, None, "not run", extension=ext)
+    match outcome.why:
+        case "unavailable":
+            return CallResult(name, False, None, "tool not available")
+        case "bad_args":
+            return CallResult(name, False, None, "invalid arguments")
+        case "capped":
+            return CallResult(name, False, None, "not run: too many changes", extension=ext)
+        case "not_allowed":
+            return CallResult(name, False, None, "not allowed", extension=ext)
+        case _:
+            assert outcome.decision is not None
+            return CallResult(name, False, None, _refusal(outcome.decision), extension=ext)
+
+
+def read_error(result: ToolResult, detail: bool = False) -> str:
+    """What the model sees when a read fails: ``the tool failed``, or with ``detail`` (the
+    brain, Claude) the tool's own reason for a definite failure (``ToolFailed``: code-built,
+    e.g. ``read_file: … is outside the read roots``), clipped. It goes back in an untrusted
+    tool turn like any result."""
+    error = result.error or ""
+    if detail and error.startswith(TOOL_FAILED_PREFIX):
+        reason = flat(error.removeprefix(TOOL_FAILED_PREFIX), TOOL_ERROR_MAX_CHARS)
+        if reason:
+            return f"the tool failed: {reason}"
+    return "the tool failed"
 
 
 def _job_answer(intent: Intent, job: str, result: ToolResult, answer: Answer) -> Answer:
