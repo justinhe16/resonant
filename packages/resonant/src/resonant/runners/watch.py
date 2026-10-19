@@ -12,9 +12,9 @@ scheduler skips it while paused (no catch-up), so nothing is checked during ``/k
 **One check** (``WatchRunner.step``):
 
 - ``tool``: the registry spec is looked up again (still an L0 read the principal may use,
-  else the watch fails), gated with ``origin="scheduled"`` on this task and run by the
-  executor (recorded under the task's idempotency key). Its result never reaches a model:
-  ``watches.judge_tool`` decides in code.
+  else the watch fails), through ``ToolCore.call`` (TC-1): gated with ``origin="scheduled"``
+  on this task and run by the executor (recorded under the task's idempotency key). Its
+  result never reaches a model: ``watches.judge_tool`` decides in code.
 - ``ask``: ``AskRunner.enqueue(question, kind="research", watch=id)``; the ask runner hands
   the answer to :meth:`WatchRunner.ask_answered` instead of texting it (YES/NO first). A
   refused ask (the daily cap, the usage limit, off) is a skipped check, not a failure.
@@ -38,15 +38,14 @@ from resonant import killswitch
 from resonant.brain import watches as store
 from resonant.brain.notices import send_notice
 from resonant.config import Settings
-from resonant.gate import Allow, Intent
 from resonant.gate.types import Deny
 from resonant.gateway.channel import Channel, ChannelError
 from resonant.loop.types import PRIORITY_BACKGROUND, Done, Fail, NewTask, StepContext, Task
 from resonant.principals import Principals
-from resonant.runners.local import RunnerGate, ToolExecutor
 from resonant.store.audit import audit
 from resonant.store.db import atomic, utcnow
 from resonant.store.tasks import insert_task
+from resonant.toolcore import Asked, CallScope, Ran, Refused, RunnerGate, ToolCore, ToolExecutor
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect, Event, Level
 
@@ -91,6 +90,7 @@ class WatchRunner:
         self.gate = gate
         self.executor = executor
         self.registry = registry
+        self.core = ToolCore(conn, registry=registry, gate=gate, executor=executor)
         self.principals = principals
         self.channel = channel
         self.settings = settings
@@ -128,22 +128,23 @@ class WatchRunner:
             or not self.principals.may_request(w.principal, spec)
         ):
             return await self._failed(w, now, "its tool is gone or no longer a read")
-        intent = Intent.for_tool(
-            spec,
-            task_id=task.id,
-            principal=w.principal,
-            args=w.args,
-            trace_id=task.trace_id,
-            origin="scheduled",
+        scope = CallScope(
+            task.id, w.principal, task.trace_id, task.step_no, 0, "scheduled", check_schema=False
         )
-        decision = self.gate.evaluate(intent)
-        if not isinstance(decision, Allow):
-            why = decision.reason if isinstance(decision, Deny) else type(decision).__name__
+        called = await self.core.call(spec, w.args, scope)
+        if isinstance(called, Asked | Refused):
+            decision = called.decision
+            if isinstance(decision, Deny):
+                why = decision.reason
+            elif decision is not None:
+                why = type(decision).__name__
+            else:  # refused before the gate (no decision)
+                why = called.why if isinstance(called, Refused) else "refused"
             return await self._failed(w, now, f"not allowed: {why}")
-        result = await self.executor.execute(intent, decision, step_no=task.step_no)
-        if not result.ok:
-            return await self._failed(w, now, result.error or "failed")
-        verdict = store.judge_tool(w, result.data or {})
+        if not isinstance(called, Ran):
+            error = called.result.error if called.result is not None else None
+            return await self._failed(w, now, error or "failed")
+        verdict = store.judge_tool(w, called.result.data or {})
         return await self._settle(w, verdict, now)
 
     def _ask(self, task: Task, w: store.Watch) -> StepOutcome:

@@ -12,7 +12,7 @@ Ranked by how much it matters. Urgency: 🔴 high (do soon), 🟠 med-high, 🟡
 | 2 | **Owner eval set** from real texts (`~/.resonant/evals/task.jsonl`) | Every score so far is on the synthetic `evals/task.example.jsonl`. Real texts are what matter and catch regressions. | 🔴 High | Open |
 | 3 | **Daily DB backup** | Backups only happened before migrations. A bad disk or corrupt write loses tasks, approvals and history. | 🟠 Med-high | Done (BK-1): `core/backup` daily at 03:30, 7 daily + 4 weekly kept, 36h alert, `resonant backup now\|list\|restore`. Owner: optionally set `backup.extra_dir` to another disk |
 | 4 | **Shorter taint window** (2–3 texts) or exempt low-risk writes (notes, reminders) | BR-10b taints about 24 turns after a Claude answer, so cheap changes ask "yes?" often. | 🟠 Med-high | Open |
-| 5 | **TC-1: tool core package** (`resonant/toolcore/`) | The shared call path (`LocalRunner._call_tool`, `gate/`, `trust/`, `executor.py`) is spread over four places and the Claude bridge reaches it by subclassing `LocalRunner`. One package with one entry point; behaviour unchanged. | 🟡 Medium | In progress (TC-1) |
+| 5 | **TC-1: tool core package** (`resonant/toolcore/`) | The shared call path (`LocalRunner._call_tool`, `gate/`, `trust/`, `executor.py`) is spread over four places and the Claude bridge reaches it by subclassing `LocalRunner`. One package with one entry point; behaviour unchanged. | 🟡 Medium | ✅ Done (TC-1); carry-overs [below](#scheduler-inline-jobs-onto-toolcore) |
 | 6 | **Live Claude eval** in a scratch home | Live evals grade routing and writes only; Claude's own answers have never been graded. | 🟡 Medium | Open |
 | 7 | **Branch protection** per repo (PR + CI required, app not in bypass) | Workers merge on standing trust; protection is the backstop for a bad merge. | 🟡 Medium | Owner, open |
 | 8 | **Relay go-live** (Supabase/Fly, go-live step 15) | A phone alert when the Mini or the daemon dies. Today a dead Mini just goes silent. | 🟡 Medium | Owner, open |
@@ -446,6 +446,14 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **Offering to do what data asks.** In `inj-log-orders` the model sometimes ends "… restart Ollama and add a note 'pwned'. Should I do that?". Nothing runs (a yes would start a new task, and the read tainted this one), but the prompt rule "don't offer to" isn't always followed. The row also fails when the reply merely quotes the line (`not_facts: pwned`); left as is.
 - **Rows that grade wording.** `runs-waiting` (fact `mycelium`) and `ext-prs-failing` (fact `httpx`) fail on correct answers that name the run or PR by code instead (R2, `#17 in justinhe16/dori`). Not changed: the owner may want the names; if not, widen the facts.
 - **Briefing paths are absolute.** Rendering repo paths as `~/code/…` made the model invent a home (`/Users/owner/code/…`) and fail every read; the briefing keeps absolute paths.
+
+## Scheduler inline jobs onto ToolCore
+
+TC-1 put every tool call on `resonant/toolcore/`, except one: the scheduler's inline L0 jobs (`extensions/scheduler.py`, `_call`) still call `gate.evaluate` and `gate.consume` themselves and then run the job without the executor (no `executions` row, by design: no task exists). It is the one listed exception in `tests/test_toolcore_boundary.py`; TC-1 left the file alone while BK-1 worked in it.
+
+- **Open:** a `ToolCore` entry for an inline, unrecorded call (gate, token spent, no executor) that both the scheduler and the router's fast path use (the fast path already goes through `toolcore.allow_inline`), then drop the exception.
+- **Maybe:** check args against the schema on the intents path too (`check_schema=True`; it is False there today so TC-1 changed nothing). Small, but a behavior change: its own ticket with an eval run.
+- **Done when:** `ALLOWED` in the boundary test is empty.
 
 ## BR-11 carry-overs: the Claude brain
 

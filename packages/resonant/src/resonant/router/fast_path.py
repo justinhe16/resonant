@@ -78,7 +78,7 @@ from resonant import killswitch
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.extensions.briefing import run_briefing_now
 from resonant.extensions.pulse_job import run_pulse_now
-from resonant.gate import Allow, Decision, Intent, PendingApproval
+from resonant.gate import Decision, Intent, PendingApproval
 from resonant.models import SpanFactory
 from resonant.models.client import null_spans
 from resonant.principals import Principals
@@ -104,6 +104,7 @@ from resonant.store import extensions as ext_store
 from resonant.store import repos as repo_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, utcnow
+from resonant.toolcore import allow_inline
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect
 
@@ -551,8 +552,7 @@ class FastPath:
         intent = Intent.for_tool(
             spec, task_id=f"route:{event_id}", principal=principal, args=cmd.args, trace_id=trace_id
         )
-        decision = self.gate.evaluate(intent)
-        if not isinstance(decision, Allow) or not self.gate.consume(decision.token, intent.hash):
+        if not allow_inline(self.gate, intent):  # TC-1: the gate, through the tool core
             return self._result(cmd, NOT_ALLOWED) if cmd.slash else None
         try:
             data = await asyncio.wait_for(handler(dict(cmd.args)), timeout=spec.timeout_s)

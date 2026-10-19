@@ -253,9 +253,7 @@ def tool_access(components: Components, brain: BrainRunner, settings: Settings) 
         return [*core, *deferred]
 
     return ToolAccess(
-        gate=components.gate,
-        executor=components.executor,
-        registry=components.registry,
+        core=brain.core,  # the brain's ToolCore: the components' registry, gate and executor
         tools_for=tools_for,
         taints=taints,
         extensions=components.extensions,

@@ -7,8 +7,8 @@ The relay forwards ``tools/list`` and ``tools/call`` here; this side checks the 
 every call **bound to the ask task** (its principal, id, trace, step and checkpoint), so one
 task's session can't act as another, whatever Claude or the relay sends.
 
-Every call goes through :class:`ToolCaller`, which *is* the local runner's call path
-(``LocalRunner._call_tool``): the registry spec (never the model's), ``gate.evaluate`` with
+Every call goes through ``ToolCore.call`` (TC-1, ``resonant.toolcore``), the same path as the
+local model's: the registry spec (never the model's), the schema check, ``gate.evaluate`` with
 the same levels, trust rules, standing allows, principal checks and kill switch, the pinned
 gated call, the executor and its idempotency keys, the code-built report lines. Nothing here
 decides whether a call may run.
@@ -26,7 +26,8 @@ decides whether a call may run.
   not prompted during the session: Claude gets ``asked the owner: <code-built summary>`` and
   never an approval code. When the session ends its answer goes out first, then the prompt,
   then the task waits; ``yes`` runs the pinned call exactly once (the executor's key), ``no``
-  or expiry drops it (``AskRunner``, the local runner's resume). One approval per task: after
+  or expiry drops it (``AskRunner``: a ``LocalRunner`` named ``ask`` resumes the pinned call
+  through ``ToolCore.resume``). One approval per task: after
   it, every other change is refused. At most ``MAX_SIDE_EFFECTS`` changes run per task.
 - **Kill switch.** Paused: every call is refused here (the session itself is killed by the
   ask runner); autonomy off: the gate asks for everything above L0, as for the local model.
@@ -68,10 +69,9 @@ from typing import Any, cast
 
 from resonant import killswitch
 from resonant.brain.text import flat
-from resonant.gate import NeedsApproval, canonical_json
+from resonant.gate import canonical_json
 from resonant.gate.types import Origin
-from resonant.gateway.channel import Channel
-from resonant.loop.types import Fail, StepContext, Task, Wait
+from resonant.loop.types import Fail, StepContext, Task
 from resonant.models import (
     ChatMessage,
     ModelReply,
@@ -81,18 +81,9 @@ from resonant.models import (
 )
 from resonant.observability.spans import span
 from resonant.router.intents import ExtensionCatalog
-from resonant.runners.local import (
-    MAX_SIDE_EFFECTS,
-    Answer,
-    CallResult,
-    LocalRunner,
-    PinnedCall,
-    RunnerGate,
-    ToolExecutor,
-    is_explicit,
-)
+from resonant.runners.local import gated_answer, model_result
 from resonant.store.tasks import get_task
-from resonant.tools import ToolRegistry
+from resonant.toolcore import MAX_SIDE_EFFECTS, Asked, CallScope, ToolCore, args_error
 from resonant_sdk import Effect, Level, ToolSpec
 
 log = logging.getLogger(__name__)
@@ -130,21 +121,20 @@ CHANGE_NOTE = " (A change: Resonant's approval rules apply; it may ask the owner
 
 @dataclass(frozen=True)
 class ToolAccess:
-    """What the bridge needs from the daemon: the gate, the executor, the registry and the
-    brain's tool list for a principal (``BrainRunner.tools_for``, flattened, minus
-    ``ask_claude``)."""
+    """What the bridge needs from the daemon: the shared tool call path (``ToolCore``: the
+    registry, gate and executor) and the brain's tool list for a principal
+    (``BrainRunner.tools_for``, flattened, minus ``ask_claude``)."""
 
-    gate: RunnerGate
-    executor: ToolExecutor
-    registry: ToolRegistry
+    core: ToolCore
     tools_for: Callable[[str], Sequence[ToolSpec]]
     taints: Callable[[ToolSpec], bool]
     extensions: ExtensionCatalog | None = None
     timezone: str = "UTC"
 
 
-class _NoModel:
-    """The caller never asks a model; a stray call fails like a model that's down."""
+class NoModel:
+    """The ask runner's approval resume never asks a model; a stray call fails like a model
+    that's down."""
 
     async def chat_json(self, messages: list[ChatMessage], **kw: Any) -> ModelReply:
         raise ModelUnavailableError("no model in the Claude tool bridge")
@@ -154,44 +144,6 @@ class _NoModel:
 
     async def probe(self) -> ProbeResult:
         return ProbeResult(False, False, False, False, None, "no model", False)
-
-
-class ToolCaller(LocalRunner):
-    """The local runner's call path for Claude's calls. Two differences: a call the gate asks
-    about while its task's session is live is pinned and recorded, not prompted (the prompt
-    goes out after Claude's answer, ``live``/``deferred``); and a pinned call keeps the taint
-    it was pinned with, as in the brain loop."""
-
-    name = "ask"
-    tool_error_detail = True  # a read's own reason goes back (Claude can fix a path)
-
-    def __init__(self, conn: sqlite3.Connection, access: ToolAccess, channel: Channel) -> None:
-        super().__init__(
-            conn,
-            model=cast(Any, _NoModel()),
-            channel=channel,
-            gate=access.gate,
-            executor=access.executor,
-            registry=access.registry,
-            max_step_s=None,
-            timezone=access.timezone,
-            extensions=access.extensions,
-        )
-        self.live: set[str] = set()  # task ids with a session running
-        self.deferred: dict[str, NeedsApproval] = {}
-
-    async def _ask(
-        self, task_id: str, decision: NeedsApproval, cp: dict[str, Any], spans: SpanFactory
-    ) -> Wait | Fail:
-        if task_id in self.live:
-            self.deferred[task_id] = decision
-            return Wait("approval", checkpoint=cp, wake_at=decision.expires_at)
-        return await super()._ask(task_id, decision, cp, spans)
-
-    def _pinned_origin(self, cp: dict[str, Any], pinned: PinnedCall) -> Origin:
-        if is_explicit(cp, pinned):  # never for a Claude call: no direct_call here
-            return "explicit"
-        return "tainted" if cp.get("tainted") is True else "inferred"
 
 
 @dataclass(frozen=True)
@@ -210,7 +162,7 @@ class ClaudeTools:
         self,
         conn: sqlite3.Connection,
         access: ToolAccess,
-        caller: ToolCaller,
+        core: ToolCore,
         task: Task,
         ctx: StepContext,
         *,
@@ -224,7 +176,7 @@ class ClaudeTools:
         assert task.principal is not None
         self.conn = conn
         self.access = access
-        self.caller = caller
+        self.core = core
         self.task = task
         self.principal: str = task.principal
         self.ctx = ctx
@@ -259,26 +211,21 @@ class ClaudeTools:
         the shared one, bound to it until :meth:`aclose`."""
         config = await self.server.start()
         self.server.bind(self)
-        self.caller.live.add(self.task.id)
         return McpSetup(config, tuple(PREFIX + n for n in self.specs))
 
     async def aclose(self) -> None:
         """Stop serving. A call still running (the session was killed mid-call) finishes
         first, up to ``CLOSE_WAIT_S``, so its report line isn't lost; any call after that is
-        refused, and (own server) open connections are closed (a late call must never prompt
-        the owner directly or run outside the session's accounting). A shared server stays
-        up for the next turn, unbound from this one."""
-        idle = False
+        refused, and (own server) open connections are closed (a late call must never run
+        outside the session's accounting). The bridge never prompts the owner itself: a call
+        the gate asks about is only pinned, and the ask runner prompts after the answer. A
+        shared server stays up for the next turn, unbound from this one."""
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._lock.acquire(), CLOSE_WAIT_S)
             self._closed = True
             self._lock.release()
-            idle = True
         self._closed = True
         self.server.unbind(self)
-        if idle:  # a call still stuck keeps deferring: it can never prompt the owner itself
-            self.caller.live.discard(self.task.id)
-            self.caller.deferred.pop(self.task.id, None)
         if not self._shared:
             await self.server.aclose()
 
@@ -367,8 +314,6 @@ class ClaudeTools:
         if not isinstance(args, dict):
             return "not run: invalid arguments: pass a JSON object", True
         args = cast(dict[str, Any], args)
-        from resonant.runners.brain import args_error  # no import cycle at module load
-
         if (why := args_error(spec, args)) is not None:
             schema = json.dumps(spec.args_schema, sort_keys=True, separators=(",", ":"))
             return BAD_ARGS.format(why=why, name=spec.name, schema=schema), True
@@ -387,39 +332,39 @@ class ClaudeTools:
         self.calls += 1
         index = self._index
         self._index += 1
-        done = await self.caller._call_tool(  # pyright: ignore[reportPrivateUsage]
-            self._view(),
+        view = self._view()
+        scope = CallScope(
+            view.id,
             self.principal,
-            [spec],
-            spec.name,
-            args,
+            view.trace_id,
+            view.step_no,
             index,
-            self.ctx,
-            self._spans,
-            list(self.reports),
-            origin=origin,
+            origin,
+            spans=self._spans,
+            checkpoint=view.checkpoint,
+            steps=self.ctx,
+            effects=list(self.reports),
             pin={"tainted": self.tainted},
         )
+        outcome = await self.core.call(spec, args, scope)
         if self.access.taints(spec):
             self.tainted = self.read_outside = True
-        return self._result(done)
-
-    def _result(self, done: CallResult | Wait | Fail | Answer) -> tuple[str, bool]:
-        if isinstance(done, Wait):
-            decision = self.caller.deferred.pop(self.task.id, None)
-            what = decision.summary if decision is not None else "the change"
-            self.pending = what
-            return ASKED.format(what=what), False
-        if isinstance(done, Fail):
-            return f"not run: {flat(done.error, 200)}", True
-        if isinstance(done, Answer):  # refused, dry run, failed, ambiguous: code-built
-            return f"not run: {done.reply}", True
-        if done.report is not None:
-            self.reports.append(done.report)
-            return f"done: {done.report}", False
-        if not done.ok:
-            return f"error: {done.error or 'the tool failed'}", True
-        body = canonical_json(done.data or {})
+        if isinstance(outcome, Asked):
+            # Pinned, not prompted: the owner is asked after Claude's answer goes out.
+            self.pending = outcome.summary
+            return ASKED.format(what=outcome.summary), False
+        if outcome.gated:
+            done = gated_answer(outcome)
+            if isinstance(done, Fail):
+                return f"not run: {flat(done.error, 200)}", True
+            if done.path not in ("done", "replay"):  # refused, dry run, failed, ambiguous
+                return f"not run: {done.reply}", True
+            self.reports.append(done.reply)
+            return f"done: {done.reply}", False
+        read = model_result(outcome, spec.name, detail=True)
+        if not read.ok:
+            return f"error: {read.error or 'the tool failed'}", True
+        body = canonical_json(read.data or {})
         if len(body) > RESULT_MAX_CHARS:
             body = body[: RESULT_MAX_CHARS - 13] + "…[truncated]"
         return body, False
@@ -588,6 +533,6 @@ __all__ = [
     "ClaudeTools",
     "McpServer",
     "McpSetup",
+    "NoModel",
     "ToolAccess",
-    "ToolCaller",
 ]
