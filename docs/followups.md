@@ -2,6 +2,25 @@
 
 Work we've decided to do eventually but have deferred. Each entry says why it was deferred, what is open, and what "done" looks like. When an item is picked up, ticket it and remove it from here.
 
+## Recommended next (2026-10-19)
+
+Ranked by how much it matters. Urgency: 🔴 high (do soon), 🟠 med-high, 🟡 medium, 🟢 low. Tick off or move into a ticket when picked up.
+
+| | Item | Why | Urgency | Status |
+|---|---|---|---|---|
+| 1 | **CAL-1: Calendar for the Claude brain** | claude.ai connectors (Calendar, Gmail) don't load in the `--restricted` session. Options: load just the Calendar connector there, or add Google Calendar as a Resonant extension (own OAuth, reads and drafts gated). Email stays off for now. | 🔴 High | Owner is looking into it |
+| 2 | **Owner eval set** from real texts (`~/.resonant/evals/task.jsonl`) | Every score so far is on the synthetic `evals/task.example.jsonl`. Real texts are what matter and catch regressions. | 🔴 High | Open |
+| 3 | **Daily DB backup** | Backups only happen before migrations. A bad disk or corrupt write loses tasks, approvals and history. | 🟠 Med-high | In progress (BK-1) |
+| 4 | **Shorter taint window** (2–3 texts) or exempt low-risk writes (notes, reminders) | BR-10b taints about 24 turns after a Claude answer, so cheap changes ask "yes?" often. | 🟠 Med-high | Open |
+| 5 | **TC-1: tool core package** (`resonant/toolcore/`) | The shared call path (`LocalRunner._call_tool`, `gate/`, `trust/`, `executor.py`) is spread over four places and the Claude bridge reaches it by subclassing `LocalRunner`. One package with one entry point; behaviour unchanged. | 🟡 Medium | In progress (TC-1) |
+| 6 | **Live Claude eval** in a scratch home | Live evals grade routing and writes only; Claude's own answers have never been graded. | 🟡 Medium | Open |
+| 7 | **Branch protection** per repo (PR + CI required, app not in bypass) | Workers merge on standing trust; protection is the backstop for a bad merge. | 🟡 Medium | Owner, open |
+| 8 | **Relay go-live** (Supabase/Fly, go-live step 15) | A phone alert when the Mini or the daemon dies. Today a dead Mini just goes silent. | 🟡 Medium | Owner, open |
+| 9 | **Flaky tests** (Q9 approval code in `test_router_approvals`, `test_watchdog_quiet_while_beating`, e2e ConnectErrors, scheduled jobs firing mid-test around 08:00/10:00 local in `test_e2e_phase3` / `test_e2e_pulse`) | They slow every PR and hide real failures. | 🟢 Low-med | Open |
+| 10 | **Retire the intents path** once the loop has proven itself on real texts | Less code to keep working. | 🟢 Low | Open |
+| 11 | **Whisper** for voice notes (`brain.whisper_path`) | Only if voice notes get used. | 🟢 Low | Open |
+| 12 | **Prune stale worktrees and branches** | Housekeeping (one agent worktree left under `.claude/worktrees/`). | 🟢 Low | Open |
+
 ## Owner to-dos (human, at the Mini)
 
 Only you can do these: tokens, GitHub settings and the first real runs. Claude never enters a secret, and no secret goes in a command line or a chat. Do them in this order. The full steps and expected output are [`go-live.md`](go-live.md) step 14 (step 12 for the github extension, step 15 for the remote dashboard); status rows are in [`test.md`](test.md). Tick them off here.
