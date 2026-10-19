@@ -85,8 +85,9 @@ def tool_action(extension: str | None, tool: str) -> str | None:
 
 def can_stand(spec: ToolSpec) -> bool:
     """A tool a standing allow can cover: a change the gate asks a plain yes for (L2), never
-    L1 or pay, never one of ``NEVER``, with a valid action slug."""
-    if spec.effect is Effect.READ or spec.effective_level is not Level.L2:
+    L1 or pay, never one of ``NEVER`` or a ``standing: false`` tool (CAL-1), with a valid
+    action slug."""
+    if spec.effect is Effect.READ or spec.effective_level is not Level.L2 or not spec.standing:
         return False
     if spec.extension is None and spec.name in NEVER:
         return False
@@ -119,6 +120,8 @@ def allow_targets(
             picked = [s for s in ext_tools(ext) if s.name == tool]
         elif ext_tools(name):
             picked = [s for s in ext_tools(name) if can_stand(s)]
+            if not picked and any(not s.standing for s in ext_tools(name)):
+                return [], f"{name}'s changes always ask; no rule can cover them"
             if not picked:
                 return [], f"{name} has no changes that ask first"
         else:
@@ -132,6 +135,8 @@ def allow_targets(
                 picked = [s for s in picked if s in ext_tools(s.extension or "")]
                 if len(picked) > 1:
                     return [], f"{name} is a tool of several extensions; name one"
+        if any(not s.standing for s in picked):
+            return [], f"{name} always asks; no rule can cover it"
         if not picked or not all(can_stand(s) for s in picked):
             return [], f"{name} isn't a change that asks first"
         found.extend(s for s in picked if s not in found)

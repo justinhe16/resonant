@@ -163,6 +163,30 @@ def test_calendar_writes_never_take_a_standing_allow(db: sqlite3.Connection) -> 
         )
 
 
+def test_allow_tools_never_covers_calendar_writes() -> None:
+    """BA-1's allow_tools ("don't ask about calendar"): gcal, gcal.create_event or a write's
+    bare name are all refused, so no rule is proposed or saved for a calendar write."""
+    from resonant.tools import ToolRegistry
+    from resonant.trust.tools import allow_targets, can_stand
+
+    specs = load_manifest(EXT / "resonant.yaml").tool_specs()
+    registry = ToolRegistry()
+    for spec in specs:
+        registry.register(spec)
+
+    def targets(*names: str) -> tuple[list[Any], str | None]:
+        return allow_targets(
+            names, registry=registry, ext_tools=lambda e: specs if e == "gcal" else []
+        )
+
+    assert not any(can_stand(s) for s in specs)
+    assert targets("gcal") == ([], "gcal's changes always ask; no rule can cover them")
+    for name in WRITES:
+        assert targets(f"gcal.{name}") == ([], f"gcal.{name} always asks; no rule can cover it")
+        assert targets(name) == ([], f"{name} always asks; no rule can cover it")
+        assert targets(f"mcp__resonant__{name}")[0] == []
+
+
 def test_draft_event_is_local_and_has_no_secrets() -> None:
     m = load_manifest(EXT / "resonant.yaml")
     tool = m.tools["draft_event"]
