@@ -100,7 +100,7 @@ NOTHING_LINES = (
     "Morning. Nothing on the list today.",
     "Morning. All quiet today.",
 )
-NOTHING = NOTHING_LINES[0]
+NOTHING = NOTHING_LINES[0]  # the line when no date is known (a Briefing built without one)
 REMINDERS_SHOWN = 3
 REMINDER_TEXT_MAX = 30
 CODES_SHOWN = 5

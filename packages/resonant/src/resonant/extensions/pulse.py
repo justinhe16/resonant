@@ -29,7 +29,9 @@ A ``quiet`` report (``data.quiet: true``, BF-1) says there is nothing worth sayi
 count is 0, an empty digest): the item is stored cleared and marked told at once, so it drops
 out of the briefing's Updates and the hourly pulse without a word (audit ``pulse.held``
 ``reason=quiet``), whatever its urgency. The next report that isn't quiet opens it again as
-news. A report without the field (an extension older than BF-1) is not quiet.
+news. A report without the field (an extension older than BF-1) is not quiet. A quiet report
+also replaces an earlier report of the same key that the owner never heard (an urgent one held
+while paused, say): the extension's latest word is that there is nothing to say.
 
 A report whose stored row is newer than the event (``updated_at`` > ``occurred_at``: a
 retry of an older report after a later one was routed) is stale: audit ``pulse.stale``, no

@@ -636,7 +636,7 @@ def cmd_digest(gh: Gh) -> dict[str, Any]:
         "failing": sum(1 for p in mine if p["ci"] == "failing"),
         "review_requested": len(review),
     }
-    quiet = not any(state.values())
+    quiet = not any(state.values())  # state holds only counts: all zero is nothing to say
     return emit({"summary": line}, [report_event("github/summary", line, state, quiet=quiet)])
 
 
