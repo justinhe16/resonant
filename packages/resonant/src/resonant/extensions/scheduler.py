@@ -6,6 +6,8 @@ Each job's tick calls ``cron.decide`` over its ``ext_jobs`` state, then:
 
 - **Pause wins.** Paused (kv ``paused``; unknown counts as paused), every due time is
   skipped (``job.skipped_paused``) and ``last_due`` moves past it: no catch-up on resume.
+  The one exception is a core job with ``runs_while_paused`` (``core/backup``: read-only,
+  nothing sent or spawned), which runs as if unpaused.
 - **Catch-up.** Only the latest due time can run: on time (within ``tick_s`` plus a
   minute), or within the job's ``catchup`` while the daemon was down (``Downtime`` from
   the previous run's last tick, kv ``scheduler.last_tick``, to this start). Every other one
@@ -116,6 +118,9 @@ class CoreJob:
     run: JobCall
     catchup: timedelta | None = None
     timeout_s: float = 300.0
+    # Runs while the kill switch is engaged. Only for a job that reads the store and writes
+    # nothing outside Resonant's home, sends nothing and spawns nothing (core/backup).
+    runs_while_paused: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,13 @@ class CoreDeps:
 CoreJobFactory = Callable[[CoreDeps], CoreJob | None]
 
 
+def backup_job(deps: CoreDeps) -> CoreJob | None:
+    """``core/backup`` (BK-1, ``resonant.backup``), imported late like ``watches_job``."""
+    from resonant.backup import backup_job as factory
+
+    return factory(deps)
+
+
 def watches_job(deps: CoreDeps) -> CoreJob | None:
     """``core/watches`` (BR-7, ``runners/watch.py``), imported late: the runners import the
     gate and the router, which this module must not pull in at import time."""
@@ -141,7 +153,7 @@ def watches_job(deps: CoreDeps) -> CoreJob | None:
 
 
 # Built-in jobs, one factory each.
-CORE_JOBS: tuple[CoreJobFactory, ...] = (briefing_job, pulse_job, watches_job)
+CORE_JOBS: tuple[CoreJobFactory, ...] = (briefing_job, pulse_job, watches_job, backup_job)
 
 
 @dataclass(frozen=True)
@@ -153,6 +165,7 @@ class ScheduledJob:
     call: JobCall
     catchup: timedelta | None = None
     core: bool = False
+    runs_while_paused: bool = False
 
     @property
     def key(self) -> tuple[str, str]:
@@ -301,7 +314,16 @@ class Scheduler:
                     timeout_s=core.timeout_s,
                 )
                 jobs.append(
-                    ScheduledJob(CORE_EXT, core.id, spec, schedule, core.run, core.catchup, True)
+                    ScheduledJob(
+                        CORE_EXT,
+                        core.id,
+                        spec,
+                        schedule,
+                        core.run,
+                        core.catchup,
+                        True,
+                        runs_while_paused=core.runs_while_paused,
+                    )
                 )
         return cls(
             conn,
@@ -429,7 +451,7 @@ class Scheduler:
             job.schedule,
             now=now,
             last_due=last_due,
-            paused=paused,
+            paused=paused and not job.runs_while_paused,
             catchup=job.catchup,
             downtime=self.downtime,
             busy=busy,
@@ -528,7 +550,7 @@ class Scheduler:
     async def _run_inline(self, job: ScheduledJob, d: Decision) -> None:
         assert d.due is not None
         async with self._sem:
-            if read_paused(self.conn):
+            if not job.runs_while_paused and read_paused(self.conn):
                 result = _Result("skipped_paused")
             else:
                 result = await self._call(job, d.due)

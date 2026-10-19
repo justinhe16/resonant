@@ -62,7 +62,7 @@ async def test_channels_and_health_without_monitor(db: sqlite3.Connection) -> No
             "last_selftest": None,
         }
     ]
-    assert set(status["health"]) == {"model", "imessage", "loop", "store"}
+    assert set(status["health"]) == {"model", "imessage", "loop", "store", "backup"}
     assert status["health"]["model"] == {
         "state": "unknown",
         "since": None,

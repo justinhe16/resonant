@@ -183,7 +183,30 @@ def render_status(d: dict[str, Any]) -> str:
         lines.append(runs)
     if brain := _claude_brain_line(d.get("claude_brain")):
         lines.append(brain)
+    if backup := _backup_line(d.get("backup")):
+        lines.append(backup)
     return "\n".join(lines)
+
+
+def _backup_line(value: Any) -> str:
+    """BK-1: ``Last backup: 6h ago`` (``none yet``; ``· last try failed`` after a failure
+    newer than the last good copy). Nothing when the status carries no backup section."""
+    d = _as_dict(value)
+    if not d:
+        return ""
+    age = d.get("age_h")
+    if isinstance(age, int) and not isinstance(age, bool):
+        text = "Last backup: under 1h ago" if age < 1 else f"Last backup: {_hours(age)} ago"
+    else:
+        text = "Last backup: none yet"
+    err_at, ok_at = d.get("last_error_at"), d.get("last_ok_at")
+    if isinstance(err_at, str) and (not isinstance(ok_at, str) or err_at > ok_at):
+        text += " · last try failed"
+    return text
+
+
+def _hours(h: int) -> str:
+    return f"{h}h" if h < 48 else f"{h // 24}d"
 
 
 def _claude_brain_line(value: Any) -> str:

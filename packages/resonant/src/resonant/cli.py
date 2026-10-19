@@ -68,6 +68,7 @@ from resonant.store.db import (
     StoreUnavailableError,
     atomic,
     iso,
+    latest_version,
     open_db,
     open_existing,
     utcnow,
@@ -81,6 +82,8 @@ daemon_app = typer.Typer(no_args_is_help=True, help="Run and supervise the daemo
 app.add_typer(daemon_app, name="daemon")
 ext_app = typer.Typer(no_args_is_help=True, help="Extensions (see docs/extensions.md).")
 app.add_typer(ext_app, name="ext")
+backup_app = typer.Typer(no_args_is_help=True, help="Store backups (see docs/go-live.md).")
+app.add_typer(backup_app, name="backup")
 
 EX_TEMPFAIL = 75
 _CLI_ACTOR = "owner:cli"
@@ -202,9 +205,22 @@ def status(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
     typer.echo(f"tasks       {tasks}")
     if waiting:
         typer.echo("waiting     " + ", ".join(f"{k}={v}" for k, v in waiting.items()))
+    echo_backup(data.get("backup"))
     echo_health(data.get("health"), live=up)
     if not up:
         raise typer.Exit(1)
+
+
+def echo_backup(raw: object) -> None:
+    """``backup      2026-10-19T10:30:00.000+00:00 (6h ago)``, or ``none yet``."""
+    if not isinstance(raw, dict):
+        return
+    b = cast(dict[str, Any], raw)
+    line = "none yet" if b.get("last_ok_at") is None else f"{b['last_ok_at']} ({b['age_h']}h ago)"
+    err_at, ok_at = b.get("last_error_at"), b.get("last_ok_at")
+    if isinstance(err_at, str) and (not isinstance(ok_at, str) or err_at > ok_at):
+        line += f"; last try FAILED at {err_at}: {b.get('last_error')}"
+    typer.echo(f"backup      {line}")
 
 
 def echo_health(health: object, *, live: bool) -> None:
@@ -221,6 +237,135 @@ def echo_health(health: object, *, live: bool) -> None:
         if state == "degraded" and h.get("detail"):
             line += f": {h['detail']}"
         typer.echo(line)
+
+
+# --- backups (BK-1) ---------------------------------------------------------------------
+
+
+def _daemon_running(settings: Settings) -> str | None:
+    """Why the daemon counts as running (its API answers, or launchd has it loaded, so it
+    would be restarted), or None."""
+    if _fetch_status(settings) is not None:
+        return "the daemon is running (its API answers)"
+    if launchd.is_loaded(launchd.DAEMON_LABEL):
+        return f"the daemon's LaunchAgent ({launchd.DAEMON_LABEL}) is loaded"
+    return None
+
+
+def _size(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    value = n / 1024
+    for unit in ("KB", "MB"):
+        if value < 1024:
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}GB"
+
+
+@backup_app.command("now")
+def backup_now() -> None:
+    """Back the store up now (safe while the daemon runs). Replaces today's copy."""
+    from resonant import backup
+
+    settings = load_settings()
+    try:
+        conn = open_existing(settings.db_path)
+    except StoreUnavailableError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1) from None
+    try:
+        result = backup.run_backup(conn, settings, actor=_CLI_ACTOR)
+    except backup.BackupError as e:
+        typer.echo(f"backup FAILED: {e} (older copies kept)", err=True)
+        raise typer.Exit(1) from None
+    finally:
+        conn.close()
+    typer.echo(f"backup ok: {result.path} ({_size(result.bytes)}, integrity ok, {result.ms} ms)")
+    if result.pruned:
+        typer.echo(f"pruned {len(result.pruned)}: {', '.join(result.pruned)}")
+    if result.extra is not None:
+        typer.echo(f"extra copy: {result.extra}")
+    elif result.extra_error is not None:
+        typer.echo(f"extra copy FAILED: {result.extra_error}", err=True)
+
+
+@backup_app.command("list")
+def backup_list() -> None:
+    """List the daily copies (and the extra_dir and pre-restore ones) and the last result."""
+    from resonant import backup
+
+    settings = load_settings()
+    cfg = settings.backup
+    with contextlib.suppress(StoreUnavailableError, sqlite3.Error):
+        conn = open_existing(settings.db_path, readonly=True)
+        try:
+            echo_backup(backup.status_of(conn))
+        finally:
+            conn.close()
+    dirs: list[tuple[str, Path]] = [("daily", backup.daily_dir(settings))]
+    if cfg.extra_dir is not None:
+        dirs.append(("extra", cfg.extra_dir))
+    for label, directory in dirs:
+        found = backup.copies(directory)
+        typer.echo(f"{label} ({directory}): {len(found) or 'none'}")
+        sundays = backup.keep_days(
+            (d for d, _ in found if d.weekday() == backup.SUNDAY),
+            keep_daily=0,
+            keep_weekly=cfg.keep_weekly,
+        )
+        for day, path in found:
+            tag = "  weekly" if day in sundays else ""
+            typer.echo(f"  {path.name}  {_size(path.stat().st_size)}{tag}")
+    pre = backup.pre_restore_dir(settings)
+    if pre.is_dir() and (saved := sorted(p.name for p in pre.glob("resonant-*.db"))):
+        typer.echo(f"pre-restore ({pre}, never pruned): {', '.join(saved)}")
+
+
+def _restore_steps(file: Path) -> list[str]:
+    return [
+        "1. Stop the daemon: resonant daemon uninstall --no-ollama --no-keep-awake",
+        f"2. Restore: resonant backup restore {file}",
+        "   (the current store is copied to backups/pre-restore/ first)",
+        "3. Start it again: resonant daemon install",
+        "4. Check: resonant status (and scripts/bootstrap.sh --check)",
+    ]
+
+
+@backup_app.command("restore")
+def backup_restore(
+    file: Annotated[Path, typer.Argument(help="A backup file, e.g. from `resonant backup list`.")],
+    yes: Annotated[bool, typer.Option("--yes", help="Don't ask for confirmation.")] = False,
+) -> None:
+    """Replace the store with a backup. Refuses while the daemon runs."""
+    from resonant import backup
+
+    settings = load_settings()
+    file = file.expanduser().absolute()
+    if (running := _daemon_running(settings)) is not None:
+        typer.echo(f"refused: {running}. Restore with the daemon stopped:", err=True)
+        for line in _restore_steps(file):
+            typer.echo(line, err=True)
+        raise typer.Exit(1)
+    try:
+        version = backup.verify_file(file)
+    except backup.BackupError as e:
+        typer.echo(f"refused: {e}", err=True)
+        raise typer.Exit(1) from None
+    typer.echo(f"{file}: integrity ok, schema v{version}")
+    if not yes and not typer.confirm(f"Replace {settings.db_path} with it?"):
+        raise typer.Exit(1)
+    try:
+        saved = backup.restore(settings, file)
+    except backup.BackupError as e:
+        typer.echo(f"restore FAILED: {e}", err=True)
+        raise typer.Exit(1) from None
+    if saved is not None:
+        typer.echo(f"the old store was saved to {saved}")
+    typer.echo(f"restored {settings.db_path} from {file.name}")
+    if version < latest_version():
+        typer.echo(f"schema v{version}: the daemon migrates it on start")
+    typer.echo("next: resonant daemon install, then resonant status")
 
 
 @app.command()
