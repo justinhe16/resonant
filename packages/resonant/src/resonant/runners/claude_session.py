@@ -191,10 +191,8 @@ class ClaudeSession:
         """A turn's taint (None: clean), for the next one."""
         if not session_state(self.conn).get("session_id"):
             return
-        if hops == 0:  # read outside content: the context holds it until a fresh start
-            self._save(hops=0, outside=True)
-        elif hops is not None:
-            self._save(hops=hops)
+        if hops is not None:  # tainted: the context may hold outside text until a fresh start
+            self._save(hops=hops, outside=True)
         else:
             self._drop("hops")
 

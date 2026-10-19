@@ -602,6 +602,13 @@ def test_the_session_chain_lifts_after_the_hop_window(
     assert session.inherited_hops() is None
     session.record(None)
     assert session.inherited_hops() is None and "hops" not in session_state(conn)
+    # a turn tainted only through the asking turn marks the context too, so it goes stale
+    kv_set(conn, SESSION_KV, {"session_id": "s2", "turns": 1})
+    session.record(1)
+    stale = session._stale  # pyright: ignore[reportPrivateUsage]
+    assert session_state(conn)["outside"] is True and not stale(session_state(conn))
+    session.record(2)
+    assert stale(session_state(conn))
 
 
 # --- the kill switch, caps, limits, members ------------------------------------------------

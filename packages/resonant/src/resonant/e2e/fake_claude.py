@@ -170,8 +170,10 @@ class Fake:
 
     def notes(self, **extra: Any) -> None:
         if self.a.notes:
-            with open(os.path.join(self.a.notes, "session.json"), "w") as f:
+            path = os.path.join(self.a.notes, "session.json")
+            with open(path + ".tmp", "w") as f:  # atomic: a test may read it mid-turn
                 json.dump({"argv": sys.argv[1:], "tools": self.listed, **extra}, f)
+            os.replace(path + ".tmp", path)
 
     def close(self) -> None:
         for server in self.servers.values():
