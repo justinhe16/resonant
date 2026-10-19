@@ -1,0 +1,100 @@
+# gcal: Google Calendar through Google's own remote MCP server (CAL-1, docs/extensions.md
+# "MCP tools", "Remote servers over HTTP"). Resonant speaks MCP over streamable HTTP to the
+# fixed URL below. auth: oauth: the daemon posts the Keychain secrets gcal/client_id,
+# gcal/client_secret and gcal/refresh_token (your own Google Cloud OAuth client) to Google's
+# token endpoint, and nowhere else, for a one-hour access token kept only in memory and sent
+# to calendarmcp.googleapis.com as the bearer. Tool names are Google's (the MCP reference at
+# developers.google.com/workspace/calendar/api/v3/reference/mcp, endpoint /mcp/v1, checked
+# October 2026). Descriptions are ours: the server's own text never reaches the model. Every
+# result is outside content (an event's title or notes can carry text from anyone who
+# invites you), so a calendar read taints the turn and a change after it always asks.
+name: gcal
+version: 1
+description: Your Google Calendar; what's on it, free time, find a slot, add, move, cancel or answer events.
+examples:
+  - what's on my calendar tomorrow
+  - when am I free thursday afternoon
+  - put lunch with Sam on my calendar friday at noon
+approvers: [owner]
+secrets: [client_id, client_secret, refresh_token]
+
+tools:
+  # Drafting: a proposed event checked and laid out, never written anywhere (L0).
+  draft_event:
+    description: >-
+      Draft an event without touching the calendar: checks the times and attendee emails and
+      says what create_event would do (who would get an invite). Nothing is saved or sent.
+    run: ./cli.py draft --summary {summary} --start {start} --end {end} --attendees {attendees}
+    effect: read
+    args: {summary: string, start: string, end: string, attendees: string}
+
+mcp:
+  servers:
+    calendar:
+      transport: http
+      url: https://calendarmcp.googleapis.com/mcp/v1
+      auth: oauth
+      oauth:
+        token_url: https://oauth2.googleapis.com/token
+        client_id: client_id
+        client_secret: client_secret
+        refresh_token: refresh_token
+      tools:
+        # Reads: L0, no asking. Results taint the turn (extension output is outside content).
+        - name: list_calendars
+          description: The calendars you can see (yours, shared and subscribed), with their ids.
+          effect: read
+        - name: list_events
+          description: >-
+            Events in a time range (startTime, endTime as ISO 8601) on one calendar (calendarId,
+            default your primary), optionally matching fullText; "what's on my calendar" lands here.
+          effect: read
+        - name: get_event
+          description: One event by its id (eventId, calendarId), with attendees and details.
+          effect: read
+        - name: search_events
+          description: Search your events by text (query), like a title, person or place.
+          effect: read
+        # Free/busy and drafting a time: Google's server has no separate free/busy tool;
+        # suggest_time reads free/busy for you and the attendees and proposes slots. It
+        # writes nothing (Google marks it read-only), so it is a read: L0.
+        - name: suggest_time
+          description: >-
+            Free/busy: find open slots for you and others (attendeeEmails) between startTime
+            and endTime, of durationMinutes, optionally within working hours. Writes nothing.
+          effect: read
+        # Writes: L2, a plain yes first (the owner's own typed /gcal command runs). commit:
+        # each can email people (invites, updates, cancellations, an RSVP to the organizer)
+        # and that can't be unsent.
+        - name: create_event
+          description: >-
+            Add an event (summary, startTime, endTime; attendees get an email invite unless
+            notificationLevel is NONE). Resonant asks the owner first.
+          effect: write
+          level: L2
+          commit: true
+          timeout_s: 60
+        - name: update_event
+          description: >-
+            Change an event (eventId): time, title, place, attendees. Attendees are emailed
+            unless notificationLevel is NONE. Resonant asks the owner first.
+          effect: write
+          level: L2
+          commit: true
+          timeout_s: 60
+        - name: delete_event
+          description: >-
+            Delete an event (eventId); attendees of an event you organize get a cancellation.
+            Resonant asks the owner first.
+          effect: write
+          level: L2
+          commit: true
+          timeout_s: 60
+        - name: respond_to_event
+          description: >-
+            Answer an invite (eventId, responseStatus accepted, tentative or declined, optional
+            responseComment); the organizer is told. Resonant asks the owner first.
+          effect: write
+          level: L2
+          commit: true
+          timeout_s: 60

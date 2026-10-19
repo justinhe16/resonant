@@ -87,6 +87,7 @@ from resonant.extensions.process import (
 from resonant.redact import Redactor
 from resonant.secrets import SecretError, SecretStore, env_name, values_of
 from resonant_sdk import ToolSpec
+from resonant_sdk.manifest import McpOAuth
 
 log = logging.getLogger(__name__)
 
@@ -901,10 +902,12 @@ def disabled_text(ext: str, tool: str) -> str:
 @dataclass(frozen=True)
 class HttpTarget:
     """An MCP server over streamable HTTP: its fixed URL and the declared secret sent as its
-    bearer token (None: no auth)."""
+    bearer token (None: no auth), or the declared OAuth secrets (``auth: oauth``) whose
+    access token is."""
 
     url: str
     secret: str | None = None
+    oauth: McpOAuth | None = None
 
 
 @dataclass(eq=False)
@@ -936,6 +939,7 @@ class McpServerRuntime:
     disabled: dict[str, str] = field(default_factory=dict[str, str])  # tool -> why
     session: RpcSession | None = None
     _redactor: Redactor = field(default_factory=Redactor)
+    _oauth: Any = None  # mcp_http.OAuthToken: kept across sessions, so a restart reuses it
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _verified: asyncio.Event = field(default_factory=asyncio.Event)
     _dirty: bool = False
@@ -995,11 +999,23 @@ class McpServerRuntime:
     def _new_session(self, env_secrets: dict[str, str], redactor: Redactor) -> Any:
         """A not-yet-started session for this server's transport."""
         if self.http is not None:
-            from resonant.extensions.mcp_http import McpHttpSession
+            from resonant.extensions.mcp_http import McpHttpSession, OAuthCredentials, OAuthToken
 
             token = None
             if self.http.secret is not None:
                 token = env_secrets.get(env_name(self.http.secret))
+            oauth: OAuthToken | None = None
+            if self.http.oauth is not None:
+                o = self.http.oauth
+                creds = OAuthCredentials(
+                    token_url=o.token_url,
+                    client_id=env_secrets.get(env_name(o.client_id), ""),
+                    client_secret=env_secrets.get(env_name(o.client_secret), ""),
+                    refresh_token=env_secrets.get(env_name(o.refresh_token), ""),
+                )
+                if self._oauth is None or self._oauth.creds != creds:  # first, or rotated
+                    self._oauth = OAuthToken(creds)
+                oauth = self._oauth
             return McpHttpSession(
                 self.http.url,
                 token=token,
@@ -1007,6 +1023,7 @@ class McpServerRuntime:
                 tracker=self.tracker,
                 redact=redactor.text,
                 message_cap=self.message_cap,
+                oauth=oauth,
             )
         ensure_data_dir(self.data_dir)
         env = scratch_env(
@@ -1054,7 +1071,8 @@ class McpServerRuntime:
             except (McpError, McpAmbiguous) as e:
                 e.stderr_tail = session.stderr_tail()
                 raise
-            return redactor.deep(result)
+            result = redactor.deep(result)
+            return self._oauth.deep(result) if self._oauth is not None else result
         raise McpError("session expired")  # unreachable: the loop returns or raises
 
     async def aclose(self) -> None:

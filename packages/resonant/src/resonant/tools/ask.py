@@ -60,7 +60,7 @@ ASK_CLAUDE = ToolSpec(
         "image or a link. It answers the owner by text in a minute or two; you get back only "
         "that it's queued, so tell the owner you're looking into it. `kind`: research (web), "
         "email, calendar, image (with `attachments`), link, or general. Claude uses Resonant's "
-        "tools through the same approvals as yours; it never sends email or changes events."
+        "tools through the same approvals as yours; it never sends email."
     ),
     args_schema={
         "type": "object",

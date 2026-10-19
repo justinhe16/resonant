@@ -343,7 +343,7 @@ class ExtensionHost:
             argv: tuple[str, ...] = ()
             http: HttpTarget | None = None
             if isinstance(server, McpHttpServer):
-                http = HttpTarget(server.url, server.secret)
+                http = HttpTarget(server.url, server.secret, server.oauth)
             else:
                 try:
                     argv = server_argv(

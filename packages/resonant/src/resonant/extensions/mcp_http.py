@@ -24,6 +24,14 @@ What it adds over the spec, for an extension's tools:
   extension secret; sent only as ``Authorization: Bearer``; never logged; every response
   is redacted with it before anything else sees it. A value that isn't a valid header value
   is refused before anything is sent.
+- **OAuth** (``auth: oauth``, CAL-1). The declared client id, client secret and refresh
+  token are posted (form-encoded, RFC 6749 §6) to the manifest's fixed ``oauth.token_url``
+  and nowhere else, under the same rules as ``url`` (https, no redirects, no proxies). The
+  access token that comes back lives only in memory (``OAuthToken``), is sent to ``url`` as
+  the bearer, is refreshed ``OAUTH_EARLY_S`` before it expires (checked before every
+  request) and after a ``401``, and every one issued is redacted from everything the
+  server sends. Nothing is written to disk. A refused or unreachable token endpoint is
+  definite (``McpError``): nothing reached the MCP server.
 - **Caps.** One message (a JSON body or one SSE event) at most ``message_cap`` bytes, one
   ``POST`` response at most ``STREAM_CAP_FACTOR`` times that; past either the call is
   ``McpAmbiguous("output too large")`` and the session is ended. Connect timeout
@@ -43,7 +51,10 @@ import asyncio
 import contextlib
 import json
 import logging
-from typing import Any
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, cast
 
 import httpx
 
@@ -57,6 +68,7 @@ from resonant.extensions.mcp import (
     RpcSession,
 )
 from resonant.extensions.process import ExtFailed, ProcessTracker, RedactFn
+from resonant.redact import Redactor
 
 log = logging.getLogger(__name__)
 
@@ -70,12 +82,162 @@ SESSION_ID_MAX = 256
 LISTEN_BACKOFF_S = (1.0, 5.0, 30.0, 60.0)
 
 
+OAUTH_TIMEOUT_S = 10.0  # one token request, connect to last byte
+OAUTH_BODY_CAP = 64 * 1024
+OAUTH_EARLY_S = 120.0  # refresh this long before the access token expires
+OAUTH_TTL_DEFAULT_S = 3600.0  # no expires_in in the answer
+OAUTH_TTL_MIN_S, OAUTH_TTL_MAX_S = 60.0, 86400.0
+OAUTH_REDACT_KEEP = 8  # issued access tokens remembered for redaction
+TOKEN_MAX = 4096
+# RFC 6749 §5.2 error codes: the only server text that is ever shown (they are code-like).
+OAUTH_ERRORS = frozenset(
+    {
+        "invalid_request",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+        "unsupported_grant_type",
+        "invalid_scope",
+    }
+)
+
+
 class _TooLarge(Exception):
     pass
 
 
 def _valid_header(value: str, limit: int) -> bool:
     return 0 < len(value) <= limit and all(0x21 <= ord(c) <= 0x7E for c in value)
+
+
+@dataclass(frozen=True)
+class OAuthCredentials:
+    """What a refresh-token grant posts: read from the Keychain, never logged (``repr``
+    shows only the URL)."""
+
+    token_url: str
+    client_id: str
+    client_secret: str
+    refresh_token: str
+
+    def __repr__(self) -> str:
+        return f"OAuthCredentials(token_url={self.token_url!r})"
+
+
+class OAuthToken:
+    """Short-lived access tokens from one refresh token (``auth: oauth``). ``get`` returns
+    the cached one until ``OAUTH_EARLY_S`` before it expires, else posts the grant to
+    ``token_url``. Raises ``McpError`` (definite: nothing reached the MCP server) with
+    code-built text: the endpoint's own text never surfaces, only an RFC 6749 error code.
+    ``text``/``deep`` redact every access token issued (the last ``OAUTH_REDACT_KEEP``)."""
+
+    def __init__(
+        self,
+        creds: OAuthCredentials,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.creds = creds
+        self._transport = transport  # tests only
+        self._clock = clock
+        self._lock = asyncio.Lock()
+        self._token: str | None = None
+        self._expires_at = 0.0
+        self._issued: list[str] = []
+        self._redactor = Redactor()
+        self.fetches = 0  # token requests made (tests)
+
+    def __repr__(self) -> str:
+        return f"OAuthToken(token_url={self.creds.token_url!r})"
+
+    async def get(self) -> str:
+        async with self._lock:
+            if self._token is not None and self._clock() < self._expires_at - OAUTH_EARLY_S:
+                return self._token
+            token, ttl = await self._fetch()
+            self._token, self._expires_at = token, self._clock() + ttl
+            self._issued = [*self._issued, token][-OAUTH_REDACT_KEEP:]
+            self._redactor = Redactor(self._issued)
+            return token
+
+    def expire(self, token: str | None) -> None:
+        """``token`` was refused: the next ``get`` fetches a new one."""
+        if token is not None and token == self._token:
+            self._token = None
+
+    def text(self, text: str) -> str:
+        return self._redactor.text(text)
+
+    def deep[T](self, obj: T) -> T:
+        return self._redactor.deep(obj)
+
+    async def _fetch(self) -> tuple[str, float]:
+        url = self.creds.token_url
+        if err := mcp_url_error(url):
+            raise McpError(f"oauth token_url refused: {err}")
+        form = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.creds.refresh_token,
+            "client_id": self.creds.client_id,
+            "client_secret": self.creds.client_secret,
+        }
+        self.fetches += 1
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=False,
+                trust_env=False,
+                timeout=httpx.Timeout(OAUTH_TIMEOUT_S),
+                transport=self._transport,
+                headers={"User-Agent": f"resonant/{__version__}"},
+            ) as client:
+                req = client.build_request(
+                    "POST", url, data=form, headers={"Accept": "application/json"}
+                )
+                async with asyncio.timeout(OAUTH_TIMEOUT_S):
+                    resp = await client.send(req, stream=True)
+                    try:
+                        body = bytearray()
+                        async for chunk in resp.aiter_bytes():
+                            body += chunk
+                            if len(body) > OAUTH_BODY_CAP:
+                                raise McpError("the OAuth token endpoint's answer is too large")
+                    finally:
+                        await resp.aclose()
+        except McpError:
+            raise
+        except (httpx.HTTPError, TimeoutError, OSError):
+            raise McpError("the OAuth token endpoint is not reachable") from None
+        return _token_answer(resp.status_code, bytes(body))
+
+
+def _token_answer(status: int, body: bytes) -> tuple[str, float]:
+    """``(access token, lifetime in s)`` from a token endpoint's answer, or ``McpError``."""
+    if 300 <= status < 400:
+        raise McpError(
+            f"the OAuth token endpoint redirected (http {status}); redirects are refused"
+        )
+    parsed: Any = None
+    with contextlib.suppress(ValueError):
+        parsed = json.loads(body)
+    data = cast(dict[str, object], parsed) if isinstance(parsed, dict) else None
+    if status != 200:
+        code = data.get("error") if data is not None else None
+        if isinstance(code, str) and code in OAUTH_ERRORS:
+            raise McpError(f"the OAuth token endpoint refused the refresh token ({code})")
+        raise McpError(f"the OAuth token endpoint failed (http {status})")
+    if data is None:
+        raise McpError("the OAuth token endpoint sent a malformed answer")
+    token, kind, ttl = data.get("access_token"), data.get("token_type"), data.get("expires_in")
+    if not isinstance(token, str) or not _valid_header(token, TOKEN_MAX):
+        raise McpError("the OAuth token endpoint sent no usable access token")
+    if kind is not None and (not isinstance(kind, str) or kind.lower() != "bearer"):
+        raise McpError("the OAuth token endpoint sent a token that isn't a bearer token")
+    if isinstance(ttl, bool) or not isinstance(ttl, int | float):
+        seconds = OAUTH_TTL_DEFAULT_S
+    else:
+        seconds = min(max(float(ttl), OAUTH_TTL_MIN_S), OAUTH_TTL_MAX_S)
+    return token, seconds
 
 
 class McpHttpSession(RpcSession):
@@ -92,13 +254,24 @@ class McpHttpSession(RpcSession):
         message_cap: int = HTTP_MESSAGE_CAP,
         on_list_changed: Any = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        oauth: OAuthToken | None = None,
     ) -> None:
+        if oauth is not None and token is not None:
+            raise ValueError("a session's token is static or OAuth, not both")
+
+        def redact_all(text: str) -> str:
+            return oauth.text(redact(text)) if oauth is not None else redact(text)
+
         super().__init__(
-            label=label, redact=redact, message_cap=message_cap, on_list_changed=on_list_changed
+            label=label,
+            redact=redact_all,
+            message_cap=message_cap,
+            on_list_changed=on_list_changed,
         )
         self.url = url
         self.tracker = tracker
         self._token = token
+        self._oauth = oauth
         self._transport = transport  # tests only: an in-process transport
         self._client: httpx.AsyncClient | None = None
         self._session_id: str | None = None
@@ -113,8 +286,10 @@ class McpHttpSession(RpcSession):
             raise ExtFailed("paused")
         if err := mcp_url_error(self.url):
             raise McpError(f"mcp url refused: {err}")
-        if self._token is not None and not _valid_header(self._token, 4096):
+        if self._token is not None and not _valid_header(self._token, TOKEN_MAX):
             raise McpError("the bearer token is not a valid header value")
+        if self._oauth is not None:
+            self._token = await self._oauth.get()  # McpError: nothing was sent to url
         self._client = httpx.AsyncClient(
             follow_redirects=False,
             trust_env=False,
@@ -136,6 +311,12 @@ class McpHttpSession(RpcSession):
             raise
 
     # --- transport ---------------------------------------------------------------------------
+
+    async def _fresh(self) -> None:
+        """An OAuth session's access token, refreshed when it is about to expire (cached
+        otherwise: no request)."""
+        if self._oauth is not None:
+            self._token = await self._oauth.get()
 
     def _headers(self, accept: str) -> dict[str, str]:
         h = {"Accept": accept}
@@ -170,6 +351,7 @@ class McpHttpSession(RpcSession):
     async def _post_oneway(self, body: bytes) -> int:
         """POST a message that gets no answer; its body is never read (no cap needed)."""
         assert self._client is not None
+        await self._fresh()
         headers = {
             **self._headers("application/json, text/event-stream"),
             "Content-Type": "application/json",
@@ -184,6 +366,13 @@ class McpHttpSession(RpcSession):
         failure, definite or not, as an exception."""
         assert self._client is not None
         had_session = self._session_id is not None
+        try:
+            await self._fresh()
+        except McpError as e:  # nothing was sent to the server
+            if not fut.done():
+                fut.set_exception(e)
+            return
+        sent_token = self._token
         headers = {
             **self._headers("application/json, text/event-stream"),
             "Content-Type": "application/json",
@@ -192,6 +381,10 @@ class McpHttpSession(RpcSession):
         try:
             async with self._client.stream("POST", self.url, content=body, headers=headers) as resp:
                 failure = self._status_failure(resp, had_session)
+                if resp.status_code == 401 and self._oauth is not None:
+                    self._oauth.expire(sent_token)  # the next request gets a new one
+                    if had_session:  # refused, so nothing ran: a new session retries once
+                        failure = McpSessionExpired("access token refused")
                 if failure is None:
                     if method == "initialize":
                         failure = self._take_session_id(resp)
@@ -312,6 +505,7 @@ class McpHttpSession(RpcSession):
         while self.alive and self._client is not None:
             opened = loop.time()
             try:
+                await self._fresh()
                 async with self._client.stream(
                     "GET",
                     self.url,
@@ -327,7 +521,7 @@ class McpHttpSession(RpcSession):
             except _TooLarge:
                 self._spawn(self.close("output too large"))
                 return
-            except httpx.HTTPError:
+            except (httpx.HTTPError, McpError):
                 pass
             except Exception:
                 log.warning("mcp http listener failed", extra={"label": self.label})
@@ -377,16 +571,26 @@ class McpHttpSession(RpcSession):
 
 async def discover_http(
     url: str,
-    token: str | None,
+    token: str | OAuthCredentials | None,
     *,
     label: str = "mcp",
     timeout_s: float = START_TIMEOUT_S,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> list[dict[str, Any]]:
-    """Connect once, list the server's tools, end the session (``ext add``)."""
+    """Connect once, list the server's tools, end the session (``ext add``). ``token``: a
+    static bearer, or OAuth credentials exchanged at their ``token_url`` first."""
     tracker = ProcessTracker(sample_s=0.5, grace_s=1.0)
+    oauth = None
+    if isinstance(token, OAuthCredentials):
+        oauth, token = OAuthToken(token, transport=transport), None
     session = McpHttpSession(
-        url, token=token, label=label, tracker=tracker, redact=lambda t: t, transport=transport
+        url,
+        token=token,
+        label=label,
+        tracker=tracker,
+        redact=lambda t: t,
+        transport=transport,
+        oauth=oauth,
     )
     try:
         await session.start(timeout_s)
@@ -395,4 +599,10 @@ async def discover_http(
         await session.close()
 
 
-__all__ = ["HTTP_MESSAGE_CAP", "McpHttpSession", "discover_http"]
+__all__ = [
+    "HTTP_MESSAGE_CAP",
+    "McpHttpSession",
+    "OAuthCredentials",
+    "OAuthToken",
+    "discover_http",
+]

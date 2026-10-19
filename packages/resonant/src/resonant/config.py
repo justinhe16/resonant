@@ -646,6 +646,11 @@ class AskClaudeConfig(_Section):
     # also gets Resonant's tools through a per-task MCP server, every call through the same
     # gate and executor as the local model's. Off: those asks are read-only, as in BR-5.
     resonant_tools: bool = True
+    # CAL-1: the extension whose tools answer calendar asks (extensions/gcal). While it is
+    # loaded and the asker may use it, a ``calendar`` ask is an ordinary ask with Resonant's
+    # tools (the Claude brain's session for the owner); otherwise, or with null, calendar
+    # asks take the connector path above.
+    calendar_extension: str | None = Field(default="gcal", pattern=r"^[a-z][a-z0-9-]{0,31}$")
 
     @field_validator("attachment_roots")
     @classmethod

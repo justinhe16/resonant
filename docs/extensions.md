@@ -182,6 +182,30 @@ Everything above applies (listed tools only, your descriptions, stripped and enf
 - **Kill switch.** `/kill` ends every session at once: in-flight calls end as `maybe happened` for writes, and no session starts until `/resume`.
 - **Failures.** Not connected (DNS, refused, TLS, connect timeout), `401`/`403` (the token was refused), any other `4xx` or a redirect: nothing ran. A `5xx`, a dropped connection mid-call or a malformed answer: a failure for a read, **maybe happened** for a write.
 
+##### OAuth (`auth: oauth`)
+
+For a server that takes short-lived OAuth 2.0 access tokens from your own OAuth client (Google's): [`extensions/gcal`](../extensions/gcal/README.md) is the worked example.
+
+```yaml
+secrets: [client_id, client_secret, refresh_token]
+mcp:
+  servers:
+    calendar:
+      transport: http
+      url: https://calendarmcp.googleapis.com/mcp/v1
+      auth: oauth
+      oauth:
+        token_url: https://oauth2.googleapis.com/token   # fixed; https only
+        client_id: client_id                              # declared secrets, by name
+        client_secret: client_secret
+        refresh_token: refresh_token
+```
+
+- The daemon reads the three secrets from the Keychain when a session starts and posts them (the refresh-token grant, RFC 6749 §6) only to `token_url`, under the same rules as `url` (https, no redirects, no proxies or `.netrc`). The access token it gets lives only in memory, is sent only to `url` as the bearer, is refreshed 2 minutes before it expires (and once after a `401`, which starts a new session and retries: nothing ran), and every one issued is redacted from what the server sends. Nothing is written to disk and no process gets any of them.
+- A refused grant is definite (nothing reached the server) and shows only the RFC 6749 error code: `the OAuth token endpoint refused the refresh token (invalid_grant)`. Re-set the secret; the next session reads it.
+- `ext add` asks `Send <ext>/<refresh_token> to <token host> now?` (the refresh token is what goes there; the access token then goes to `url`). The escalation reads `… sends secrets <client_id>, <client_secret>, <refresh_token> to "<token_url>" (oauth) and the access token it gets as its bearer token`.
+- Getting the refresh token is up to you (Resonant has no interactive OAuth flow): the gcal README uses Google's OAuth 2.0 Playground with your own client.
+
 ## 5. Secrets
 
 - Declare secret names in `secrets:` and give each tool or job the ones it needs. Names are lowercase with underscores (`token`, `api_key`).

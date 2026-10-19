@@ -109,6 +109,9 @@ def dir_errors(root: Path, manifest: Manifest) -> list[str]:
         for sid, server in manifest.mcp.servers.items():
             if isinstance(server, McpHttpServer):
                 err = mcp_url_error(server.url)
+                oauth = server.oauth
+                if err is None and oauth and (token_err := mcp_url_error(oauth.token_url)):
+                    err = f"oauth token_url: {token_err}"
             else:
                 err = mcp_command_error(root, server.command)
             if err:

@@ -51,7 +51,7 @@ from resonant.extensions.checks import (
     resolve_mcp_command,
 )
 from resonant.extensions.mcp import approve, discover, pins_digest, pins_json, server_argv
-from resonant.extensions.mcp_http import discover_http
+from resonant.extensions.mcp_http import OAuthCredentials, discover_http
 from resonant.extensions.pin import (
     CopyState,
     TreeEntries,
@@ -78,7 +78,7 @@ from resonant.store import repos
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, kv_set, utcnow
 from resonant_sdk import Manifest, load_manifest
-from resonant_sdk.manifest import McpHttpServer
+from resonant_sdk.manifest import McpHttpServer, McpOAuth
 from resonant_sdk.tool import Level
 
 MANIFEST_FILE = "resonant.yaml"
@@ -93,11 +93,13 @@ def _discover_sync(req: ExtRequest) -> list[dict[str, Any]]:
     return asyncio.run(discover(req, python=sys.executable))
 
 
-# (url, bearer token or None, label) -> the server's tools/list
-HttpDiscoverFn = Callable[[str, "str | None", str], list[dict[str, Any]]]
+# (url, bearer token or OAuth credentials or None, label) -> the server's tools/list
+HttpDiscoverFn = Callable[[str, "str | OAuthCredentials | None", str], list[dict[str, Any]]]
 
 
-def _discover_http_sync(url: str, token: str | None, label: str) -> list[dict[str, Any]]:
+def _discover_http_sync(
+    url: str, token: str | OAuthCredentials | None, label: str
+) -> list[dict[str, Any]]:
     return asyncio.run(discover_http(url, token, label=label))
 
 
@@ -237,6 +239,12 @@ def _mcp_escalations(manifest: Manifest, pins: Mapping[str, Any]) -> list[str]:
     for sid, server in manifest.mcp.servers.items():
         if isinstance(server, McpHttpServer):
             token = f", sends secret {server.secret} as its bearer token" if server.secret else ""
+            if (o := server.oauth) is not None:
+                token = (
+                    f", sends secrets {o.client_id}, {o.client_secret}, {o.refresh_token} to "
+                    f"{_s(o.token_url, 160)} (oauth) and the access token it gets as its "
+                    "bearer token"
+                )
             out.append(f"mcp server {_s(sid)} calls {_s(server.url, 160)} (http, network){token}")
             continue
         line = shlex.join([server.command, *server.args])
@@ -599,10 +607,15 @@ class ExtensionManager:
             raise ManagerError(f"{manifest.name}: refused", problems)
         return dict(sorted(pins.items())), tuple(notes)
 
-    def _http_token(self, ext: str, sid: str, server: McpHttpServer, confirmed: bool) -> str | None:
-        """The bearer token to list an http server's tools with: None without auth. The
-        owner allows it per staging (``allow_token``), or confirmed this exact manifest
-        (its URL included). Raises ``_NoToken``."""
+    def _http_token(
+        self, ext: str, sid: str, server: McpHttpServer, confirmed: bool
+    ) -> str | OAuthCredentials | None:
+        """The bearer token (or, for ``auth: oauth``, the credentials to get one) to list an
+        http server's tools with: None without auth. The owner allows it per staging
+        (``allow_token``; for OAuth, asked for the token URL, where the refresh token goes),
+        or confirmed this exact manifest (its URLs included). Raises ``_NoToken``."""
+        if (o := server.oauth) is not None:
+            return self._oauth_creds(ext, sid, o, confirmed)
         if server.secret is None:
             return None
         ref = secret_ref(ext, server.secret)
@@ -614,6 +627,22 @@ class ExtensionManager:
                 f"needs {ref} to list its tools; store it first: resonant secret set {ref}"
             )
         return value
+
+    def _oauth_creds(self, ext: str, sid: str, o: McpOAuth, confirmed: bool) -> OAuthCredentials:
+        refs = [secret_ref(ext, n) for n in o.secrets]
+        ref = secret_ref(ext, o.refresh_token)
+        if not confirmed and not self.allow_token(sid, o.token_url, ref):
+            raise _NoToken(f"needs {ref} to list its tools, and you didn't allow sending it")
+        values: list[str] = []
+        for r in refs:
+            value = self.secret_value(r)
+            if value is None:
+                raise _NoToken(
+                    f"needs {r} to list its tools; store it first: resonant secret set {r}"
+                )
+            values.append(value)
+        client_id, client_secret, refresh_token = values
+        return OAuthCredentials(o.token_url, client_id, client_secret, refresh_token)
 
     def registered_slugs(self) -> frozenset[str]:
         """Lowercase slugs in the repo registry, for flagging unfamiliar repo links."""

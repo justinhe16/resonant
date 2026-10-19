@@ -82,7 +82,7 @@ BRAIN_SYSTEM = (
     "(link), a photo, screenshot or file the owner sent (image: Claude gets the attachment "
     "even when you can't see it), a hard question (general). Never say you can't reach "
     "email, calendar, the web or images: ask Claude. Claude uses Resonant's tools with the "
-    "same approvals as yours; it never sends email or changes calendar events.\n"
+    "same approvals as yours; it never sends email.\n"
     "- Ambiguous question: make your best guess, look it up and say what you assumed.\n"
     "- Changes need a clear target. When the message names no specific item and more than "
     'one could fit ("stop it" while R3 and R5 are both active, "drop that note" with several '

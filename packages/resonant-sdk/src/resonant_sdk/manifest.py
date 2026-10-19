@@ -298,15 +298,48 @@ def mcp_url_problem(url: str) -> str | None:
     return "url must be https"
 
 
+class McpOAuth(_Strict):
+    """``auth: oauth``: an OAuth 2.0 refresh-token grant (RFC 6749 §6) at one fixed
+    ``token_url``. The three names are declared secrets: the daemon posts them to
+    ``token_url`` (and nowhere else) for a short-lived access token, which it sends to the
+    server's ``url`` as ``Authorization: Bearer <token>``. Access tokens live only in the
+    daemon's memory; nothing is written to disk."""
+
+    token_url: str = Field(min_length=1, max_length=MCP_ARG_MAX)
+    client_id: SecretName
+    client_secret: SecretName
+    refresh_token: SecretName
+
+    @field_validator("token_url")
+    @classmethod
+    def _url(cls, v: str) -> str:
+        if problem := mcp_url_problem(v):
+            raise ValueError(f"token_url: {problem}")
+        return v
+
+    @model_validator(mode="after")
+    def _distinct(self) -> Self:
+        if len({self.client_id, self.client_secret, self.refresh_token}) != 3:
+            raise ValueError("oauth client_id, client_secret and refresh_token must differ")
+        return self
+
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        return (self.client_id, self.client_secret, self.refresh_token)
+
+
 class McpHttpServer(_Strict):
     """A remote MCP server over streamable HTTP at one fixed ``url``. With ``auth: bearer``,
     ``secret`` (a declared secret) is sent as ``Authorization: Bearer <value>`` to that URL
-    and nowhere else. Its tools declare no secrets of their own."""
+    and nowhere else. With ``auth: oauth`` (``oauth``: ``McpOAuth``), a refresh token is
+    exchanged at ``oauth.token_url`` for the access token sent to ``url``. Its tools declare
+    no secrets of their own."""
 
     transport: Literal["http"]
     url: str = Field(min_length=1, max_length=MCP_ARG_MAX)
-    auth: Literal["bearer"] | None = None
+    auth: Literal["bearer", "oauth"] | None = None
     secret: SecretName | None = None
+    oauth: McpOAuth | None = None
     tools: tuple[McpTool, ...] = Field(min_length=1, max_length=MCP_TOOLS_MAX)
 
     @field_validator("url")
@@ -330,11 +363,16 @@ class McpHttpServer(_Strict):
     def _auth(self) -> Self:
         if (self.auth == "bearer") != (self.secret is not None):
             raise ValueError("auth: bearer needs secret: <name>, and secret needs auth: bearer")
+        if (self.auth == "oauth") != (self.oauth is not None):
+            raise ValueError("auth: oauth needs an oauth: block, and oauth needs auth: oauth")
         return self
 
     @property
     def secrets(self) -> tuple[str, ...]:
-        """The bearer secret, if any: all this server is ever sent."""
+        """The bearer secret, or the OAuth client and refresh token: all this server's
+        session ever uses (the OAuth ones go only to ``oauth.token_url``)."""
+        if self.oauth is not None:
+            return self.oauth.secrets
         return (self.secret,) if self.secret else ()
 
 

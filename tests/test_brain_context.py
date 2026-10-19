@@ -53,7 +53,7 @@ PRINCIPALS = Principals(
 CORE = [s for s in BUILTIN_SPECS if s.name in ("list_runs", "remember", "system_status")]
 # The stable prefix with CORE and no facts. Changing BRAIN_SYSTEM or the prefix layout changes
 # this on purpose: update it in the same change.
-PINNED_PREFIX_HASH = "9323e11a21226adc"  # BR-10: Claude acts through the same gate
+PINNED_PREFIX_HASH = "2f2a18ec45fd0a50"  # CAL-1: Claude may change the calendar (gated)
 
 
 @pytest.fixture
