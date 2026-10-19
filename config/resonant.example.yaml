@@ -47,6 +47,7 @@ power:
 
 gate:
   approval_ttl_s: 1800                  # an approval prompt stays answerable this long (60..86400)
+  batch_max: 10                         # at most this many changes wait on one batch prompt (2..20)
 
 trust:
   cost_ask_over_usd: 20.0               # a worker check costing more than this asks you; at or under, cost alone doesn't

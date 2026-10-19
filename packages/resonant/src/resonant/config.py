@@ -201,6 +201,11 @@ class GateConfig(_Section):
     # How long an approval prompt stays answerable. The waiting task wakes at expiry and
     # tells the owner it wasn't done.
     approval_ttl_s: float = Field(default=1800.0, ge=60, le=86400)
+    # BA-1: at most this many changes wait on one yes. A task (a Claude brain turn, the local
+    # loop, a one-shot ask) collects the changes that need approval and asks once for all of
+    # them; past this, the next one is refused. Changes that run without asking (L3, a
+    # standing allow) are capped apart, at toolcore.MAX_SIDE_EFFECTS (5) per task.
+    batch_max: int = Field(default=10, ge=2, le=20)
 
 
 class TrustConfig(_Section):

@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Literal, cast
 
@@ -492,6 +492,109 @@ def resolve_result(approvals: Sequence[Approval]) -> ResolveResult:
     Check for an empty list first: it means the event resolved nothing, not that it is done.
     """
     return ResolveResult(ok=True, resolved=tuple(a.resolved() for a in approvals))
+
+
+# --- batches (BA-1, the approval_batches table of migration 002) ---------------------------
+
+
+@dataclass(frozen=True)
+class BatchRow:
+    """One batch prompt: several pending approvals of one task asked about as one message,
+    answered with one code (its first approval's). ``principal`` is who it was asked of
+    (the owner); ``used_at`` is when a reply (or ``resolve``) decided it."""
+
+    id: str
+    principal: str
+    approval_ids: tuple[str, ...]
+    created_at: datetime
+    used_at: datetime | None
+
+
+def _row_to_batch(r: sqlite3.Row) -> BatchRow:
+    created = _dt(r["created_at"])
+    assert created is not None
+    return BatchRow(
+        id=r["id"],
+        principal=r["principal"],
+        approval_ids=tuple(json.loads(r["approval_ids"])),
+        created_at=created,
+        used_at=_dt(r["used_at"]),
+    )
+
+
+def insert_batch(
+    conn: sqlite3.Connection, principal: str, approval_ids: Sequence[str], now: datetime
+) -> BatchRow:
+    """A new batch over ``approval_ids`` (in order) for ``principal``."""
+    batch_id = new_id()
+    conn.execute(
+        "INSERT INTO approval_batches (id, principal, approval_ids, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (batch_id, principal, json.dumps(list(approval_ids)), iso(now)),
+    )
+    return BatchRow(batch_id, principal, tuple(approval_ids), now, None)
+
+
+def get_batch(conn: sqlite3.Connection, batch_id: str) -> BatchRow | None:
+    r = conn.execute("SELECT * FROM approval_batches WHERE id = ?", (batch_id,)).fetchone()
+    return None if r is None else _row_to_batch(r)
+
+
+def batches_of(conn: sqlite3.Connection, approval_ids: Sequence[str]) -> dict[str, BatchRow]:
+    """``approval id -> the batch it is in`` for each of ``approval_ids`` in one (an
+    approval is in at most one batch: ``open_batch`` checks)."""
+    if not approval_ids:
+        return {}
+    marks = ",".join("?" * len(approval_ids))
+    rows = conn.execute(
+        f"""SELECT b.*, j.value AS member FROM approval_batches b, json_each(b.approval_ids) j
+            WHERE j.value IN ({marks})""",  # noqa: S608 - only placeholders are interpolated
+        tuple(approval_ids),
+    ).fetchall()
+    return {r["member"]: _row_to_batch(r) for r in rows}
+
+
+def answerable(conn: sqlite3.Connection, principal: str, now: datetime) -> list[Approval]:
+    """``pending_for`` with a batch (BA-1) once, as its first approval with the summary ``N
+    changes: …`` (its code is the batch's), and a batch asked of someone else left out. For
+    reminders (the pulse, the briefing): codes that bind."""
+    rows = pending_for(conn, principal, now)
+    index = batches_of(conn, [a.id for a in rows])
+    by_id = {a.id: a for a in rows}
+    out: list[Approval] = []
+    seen: set[str] = set()
+    for a in rows:
+        batch = index.get(a.id)
+        if batch is None:
+            out.append(a)
+            continue
+        if batch.id in seen or batch.principal != principal:
+            continue
+        seen.add(batch.id)
+        members = [by_id[i] for i in batch.approval_ids if i in by_id]
+        if len(members) != len(batch.approval_ids):
+            continue
+        summary = f"{len(members)} changes: " + "; ".join(m.summary for m in members)
+        out.append(replace(members[0], summary=summary))
+    return out
+
+
+def mark_batch_used(conn: sqlite3.Connection, batch_id: str, now: datetime) -> bool:
+    """The batch was answered. True the first time."""
+    cur = conn.execute(
+        "UPDATE approval_batches SET used_at = ? WHERE id = ? AND used_at IS NULL",
+        (iso(now), batch_id),
+    )
+    return cur.rowcount == 1
+
+
+def set_expiry(conn: sqlite3.Connection, approval_ids: Sequence[str], at: datetime) -> None:
+    """One expiry for a batch's pending approvals, so they expire together."""
+    for approval_id in approval_ids:
+        conn.execute(
+            "UPDATE approvals SET expires_at = ? WHERE id = ? AND status = 'pending'",
+            (iso(at), approval_id),
+        )
 
 
 def intent_args(conn: sqlite3.Connection, approval: Approval) -> dict[str, Any] | None:

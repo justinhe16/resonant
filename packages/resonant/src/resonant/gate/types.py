@@ -202,12 +202,30 @@ class PendingApproval:
 
 @dataclass(frozen=True)
 class ApprovalBatch:
-    """A batch message listing several codes. "yes all" approves exactly these, never pay."""
+    """One prompt for several pending approvals of one task (BA-1, ``open_batch``).
+
+    ``code`` (its first approval's) answers all of them: ``yes <code>`` approves every one,
+    ``no`` rejects every one, and they expire together at ``expires_at``. It takes the
+    strictest of its approvals: ``require_code`` when any needs the code (L1, pay),
+    ``destructive`` when any is an L1 write. ``lines`` are the approvals' code-built
+    summaries, in order. Asked only of ``principal`` (the owner)."""
 
     batch_id: str
     principal: str
     approval_ids: tuple[str, ...]
     created_at: datetime
+    code: str = ""
+    task_id: str = ""
+    expires_at: datetime | None = None
+    lines: tuple[str, ...] = ()
+    require_code: bool = False
+    destructive: bool = False
+    level: Level = Level.L2
+    effect: Effect = Effect.WRITE
+
+    @property
+    def approvers(self) -> tuple[str, ...]:
+        return (self.principal,)
 
 
 @dataclass(frozen=True)
