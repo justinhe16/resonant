@@ -148,6 +148,9 @@ class ClaudeSession:
         self._refusal: str | None = None
         self._output = False  # the process wrote anything (a resume that took)
         self._stopping: asyncio.Task[None] | None = None
+        self._stops: set[asyncio.Task[None]] = set()  # pause-hook stops (never in _tasks)
+        self._killed = False  # /kill landed during this turn: never a crash, never retried
+        self._fingerprint = ""
         self._unhook: Callable[[], None] | None = None
 
     # -- state --
@@ -188,10 +191,21 @@ class ClaudeSession:
         """A turn's taint (None: clean), for the next one."""
         if not session_state(self.conn).get("session_id"):
             return
-        if hops is not None:
+        if hops == 0:  # read outside content: the context holds it until a fresh start
+            self._save(hops=0, outside=True)
+        elif hops is not None:
             self._save(hops=hops)
         else:
             self._drop("hops")
+
+    def _stale(self, st: dict[str, Any]) -> bool:
+        """The context holds outside content whose taint has lifted (review of BR-11): the
+        next turn starts a fresh, primed session, so what the session holds lifts with the
+        taint instead of outliving it."""
+        if st.get("outside") is not True:
+            return False
+        hops = st.get("hops")
+        return not (isinstance(hops, int) and not isinstance(hops, bool) and hops < MAX_TAINT_HOPS)
 
     def _drop(self, key: str) -> None:
         st = session_state(self.conn)
@@ -227,35 +241,50 @@ class ClaudeSession:
         paused: Callable[[], bool],
         may_retry: Callable[[], bool],
         started: Callable[[], None] | None = None,
+        fingerprint: str = "",
+        hops_of: Callable[[TurnOutcome], int | None] | None = None,
     ) -> TurnOutcome:
         """One owner message into the session (started, resumed or rotated first as
         needed): wait for its ``result``. ``primer`` is prepended in a new session.
         ``may_retry``: whether a crash may be retried in a fresh session (no change ran).
-        ``started`` runs once the message is written."""
+        ``started`` runs once the message is written. ``fingerprint``: the tool names the
+        argv allows; a change restarts the session (its allowlist is fixed at spawn).
+        ``hops_of``: the turn's taint hops, recorded before the lock is released."""
         async with self.lock:
-            fresh = await self._ready(argv, env)
+            self._killed = False
+            self._check = check_init  # before the spawn: an early init is checked too
+            fresh = await self._ready(argv, env, fingerprint)
             out = await self._exchange(message, primer, fresh, observe, check_init, paused,
                                        started)  # fmt: skip
-            if out.status == "crashed" and not paused() and may_retry():
+            if out.status == "crashed" and not paused() and not self._killed and may_retry():
                 log.warning("claude brain: the session ended mid-turn; retrying fresh")
                 await self._kill()
                 self._forget()
-                fresh = await self._ready(argv, env)
+                self._check = check_init
+                fresh = await self._ready(argv, env, fingerprint)
                 out = await self._exchange(message, primer, fresh, observe, check_init, paused,
                                            None)  # fmt: skip
                 out = TurnOutcome(out.status, out.result, out.refusal, out.fresh, retried=True)
             if out.status in ("crashed", "timeout", "refused"):
                 await self._kill()
                 self._forget()  # the next turn starts fresh, with the primer
+            elif hops_of is not None:
+                self.record(hops_of(out))
+            self._check = None
             return out
 
-    async def _ready(self, argv: Argv, env: dict[str, str]) -> bool:
-        """A live process for the next turn; True when it is a new session (prime it)."""
+    async def _ready(self, argv: Argv, env: dict[str, str], fingerprint: str = "") -> bool:
+        """A live process for the next turn; True when it is a new session (prime it). A
+        session is rotated (stopped, the next one new and primed) after ``rotate_turns`` or
+        ``rotate_hours``, when its tools changed, or once outside content it holds has
+        passed the hop window (``_stale``)."""
         st = session_state(self.conn)
         if self.alive():
-            if not self._rotate_due(st):
+            changed = fingerprint != self._fingerprint
+            if not (self._rotate_due(st) or self._stale(st) or changed):
                 return False
-            log.info("claude brain: rotating the session", extra={"turns": st.get("turns")})
+            log.info("claude brain: rotating the session",
+                     extra={"turns": st.get("turns"), "tools_changed": changed})  # fmt: skip
             await self.stop(keep=False)
             st = {}
         await self._reap_left(st)
@@ -263,10 +292,11 @@ class ClaudeSession:
             isinstance(st.get("session_id"), str)
             and st.get("written") is True
             and not self._rotate_due(st)
+            and not self._stale(st)
         )
         if resume:
             sid = str(st["session_id"])
-            ok = await self._spawn(argv(sid, True), env, sid)
+            ok = await self._spawn(argv(sid, True), env, sid, fingerprint)
             if ok and await self._resumed():
                 return False
             log.warning("claude brain: the resume didn't take; starting a new session")
@@ -275,7 +305,7 @@ class ClaudeSession:
         with atomic(self.conn):
             kv_set(self.conn, SESSION_KV, {"session_id": sid, "started_at": iso(self.clock()),
                                            "turns": 0})  # fmt: skip
-        await self._spawn(argv(sid, False), env, sid)
+        await self._spawn(argv(sid, False), env, sid, fingerprint)
         return True
 
     async def _resumed(self) -> bool:
@@ -287,8 +317,11 @@ class ClaudeSession:
         done, _ = await asyncio.wait({exited}, timeout=min(1.0, self.end_wait_s))
         return not done
 
-    async def _spawn(self, argv: list[str], env: dict[str, str], sid: str) -> bool:
+    async def _spawn(
+        self, argv: list[str], env: dict[str, str], sid: str, fingerprint: str = ""
+    ) -> bool:
         self.cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._fingerprint = fingerprint
         marker = f"brain-{sid}"
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -359,7 +392,7 @@ class ClaudeSession:
                 done, _ = await asyncio.wait({result, exited}, timeout=self.poll_s)
                 if result in done or result.done():
                     break
-                if paused():  # first: a /kill ends the process, which is not a crash
+                if self._killed or paused():  # first: a /kill's stop is not a crash
                     await self.stop(keep=True)
                     return TurnOutcome("killed", fresh=fresh)
                 if self._refusal is not None:
@@ -439,9 +472,14 @@ class ClaudeSession:
 
     def _on_pause(self, conn: sqlite3.Connection, paused: bool) -> None:
         """``/kill``: stop the session (a turn in flight sees the pause itself)."""
-        if paused and self.alive() and self._stopping is None:
+        if not paused:
+            return
+        self._killed = True
+        if self.alive() and self._stopping is None:
             with contextlib.suppress(RuntimeError):  # no running loop: nothing to stop
-                self._track(self.stop(keep=True))
+                job = asyncio.ensure_future(self.stop(keep=True))
+                self._stops.add(job)
+                job.add_done_callback(self._stops.discard)
 
     async def stop(self, *, keep: bool = True) -> None:
         """End the session the RC-1 way: Remote Control off, stdin closed, then the group
@@ -468,8 +506,9 @@ class ClaudeSession:
 
     async def _kill(self) -> None:
         """The process group gone now (reaped), the readers finished, kv cleared of it."""
-        proc, target, live = self.proc, self.target, self.live
+        proc, target, live, exited = self.proc, self.target, self.live, self._exited
         self.proc = self.target = self.live = None
+        self._exited = None
         if live is not None:
             live.close()
         if target is not None:
@@ -479,15 +518,14 @@ class ClaudeSession:
                 proc.kill()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(proc.wait(), 5)
-        exited, self._exited = self._exited, None
         if exited is not None:
             exited.cancel()
-        jobs = list(self._tasks)
+        jobs = [j for j in self._tasks if j is not asyncio.current_task()]
         if jobs:
             _, pending = await asyncio.wait(jobs, timeout=5)
             for j in pending:
                 j.cancel()
-        if session_state(self.conn):
+        if session_state(self.conn) and self.proc is None:  # not a newer process's
             self._save(pid=None, created=None, marker=None, remote_url=None)
 
     def _kill_now(self) -> None:

@@ -528,6 +528,7 @@ def session_argv(
     mcp: McpSetup,
     session_id: str,
     resume: bool,
+    budget_turns: int = 50,
 ) -> list[str]:
     """The Claude brain's argv (BR-11): ``ask_argv``'s rules for a ``general`` ask with
     Resonant's tools (the read built-ins under ``--restricted`` and ``dontAsk``, the same
@@ -536,7 +537,7 @@ def session_argv(
     stdin kept open), ``--session-id`` for a new session or ``--resume`` for one already
     written, and no ``--no-session-persistence`` or ``--max-turns`` (a turn is bounded by
     ``claude_session.turn_timeout_s``). API billing: ``--max-budget-usd`` is the session's,
-    ``max_budget_usd`` per turn up to ``rotate_turns`` (the followups)."""
+    ``max_budget_usd`` per turn for ``budget_turns`` (``rotate_turns``) turns."""
     ts = toolset(cfg, "general")
     denied = [*dict.fromkeys([*cfg_writes(cfg), *ts.blocked])]
     argv = [
@@ -569,7 +570,7 @@ def session_argv(
         SESSION_PROMPT.replace("{max_chars}", str(cfg.reply_max_chars)),
     ]
     if api_billing:
-        argv += ["--max-budget-usd", f"{cfg.max_budget_usd * 50:g}"]
+        argv += ["--max-budget-usd", f"{cfg.max_budget_usd * budget_turns:g}"]
     return argv
 
 
@@ -879,6 +880,8 @@ class AskRunner:
                 if len(ahead) > self.session_cfg.queue_max:
                     return AskRefused(BUSY.format(n=len(ahead)), busy=True)
                 cp["session"] = True
+                if (said := self._owner_words(requested_by)) is not None:
+                    cp["owner_text"] = said  # the queue label: the owner's own words
                 after = after_label([q for _, q in ahead]) if ahead else None
         task_id = self._create_task(
             NewTask(
@@ -945,7 +948,8 @@ class AskRunner:
         """The Claude brain's turns not yet answered, oldest first: ``(task id, question)``.
         A turn waiting on an approval is done with the session and doesn't count."""
         rows = self.conn.execute(
-            """SELECT id, json_extract(checkpoint, '$.question') FROM tasks
+            """SELECT id, COALESCE(json_extract(checkpoint, '$.owner_text'),
+                                   json_extract(checkpoint, '$.question')) FROM tasks
                WHERE runner = ? AND kind = ? AND status IN ('queued', 'running', 'waiting')
                  AND json_extract(checkpoint, '$.session') = 1
                  AND json_extract(checkpoint, '$.phase') IS NULL
@@ -954,6 +958,17 @@ class AskRunner:
             (NAME, TASK_KIND),
         ).fetchall()
         return [(str(r[0]), str(r[1] or "")) for r in rows]
+
+    def _owner_words(self, requested_by: str | None) -> str | None:
+        """The owner's message that started the asking turn (never model-written text)."""
+        source = get_task(self.conn, requested_by) if requested_by is not None else None
+        if source is None or source.origin_event_id is None:
+            return None
+        row = self.conn.execute(
+            "SELECT json_extract(payload, '$.text') FROM events WHERE id = ?",
+            (source.origin_event_id,),
+        ).fetchone()
+        return str(row[0]) if row is not None and isinstance(row[0], str) else None
 
     def _hour_start(self) -> datetime:
         local = self.clock().astimezone(self.tz)
@@ -1190,7 +1205,15 @@ class AskRunner:
 
         def argv(session_id: str, resume: bool) -> list[str]:
             return session_argv(head, cfg=self.cfg, scope=self.scope, api_billing=api_billing,
-                                mcp=mcp, session_id=session_id, resume=resume)  # fmt: skip
+                                mcp=mcp, session_id=session_id, resume=resume,
+                                budget_turns=brain.cfg.rotate_turns)  # fmt: skip
+
+        def hops_of(out: TurnOutcome) -> int | None:
+            if bridge.read_outside:
+                return 0
+            if out.fresh:  # a new session holds no earlier turn's text: only this one counts
+                return self._asking_hops(cp) if asking else None
+            return start
 
         def prime() -> str:
             try:
@@ -1214,13 +1237,12 @@ class AskRunner:
                 paused=self._paused,
                 may_retry=lambda: bridge.changes == 0 and bridge.pending is None,
                 started=started,
+                fingerprint=",".join(mcp.allowed),
+                hops_of=hops_of,
             )
         finally:
             await bridge.aclose()
-        if out.fresh:  # a new session holds no earlier turn's text: only this one counts
-            start = self._asking_hops(cp) if asking else None
-        hops = 0 if bridge.read_outside else start
-        brain.record(hops)
+        hops = hops_of(out)  # recorded by the session, under its lock
         seen = {"status": out.status, "fresh": out.fresh, "retried": out.retried}
         log.info("claude brain turn", extra={"task": task.id, **seen, "tainted": hops is not None})
         outcome = self._turn_outcome(out, bridge)

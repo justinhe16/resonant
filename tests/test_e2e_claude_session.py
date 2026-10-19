@@ -578,6 +578,9 @@ async def test_an_outside_read_taints_the_next_turns_then_lifts(
             if cp["claude_hops"] is None:
                 break
         assert hops[-1] is None and len(hops) < 40 and set(hops[:-1]) <= {1, 2}
+        # the context held the page past the window: the session was restarted, primed
+        assert len(w.audits("brain.session_start")) >= 2
+        assert w.session()["messages"][0].startswith("Context: you are picking up")
         w.claude(calls=[{"name": "add_note", "args": {"text": "buy oat milk"}}], answer="{r0}")
         _, answer = await _hard(w, "add a note: buy oat milk")
         assert 'done: Saved note 1: "buy oat milk"' in answer
@@ -611,7 +614,7 @@ async def test_kill_stops_the_session(
         await _hard(w, "why is R4 slow?", answer="ok")
         pid = w.session()["pid"]
         await w.say("/kill")
-        await wait_until(lambda: not _alive(pid), 10)
+        await wait_until(lambda: not _alive(pid), 2.5)  # at once: the stop never waits on itself
         await wait_until(lambda: "pid" not in session_state(w.conn), 10)
         assert session_state(w.conn)["session_id"]  # kept: it may resume after /resume
         killswitch.release(w.conn, actor="justin")
