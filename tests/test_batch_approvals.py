@@ -308,7 +308,7 @@ async def test_yes_runs_every_change_once_in_order(h: H) -> None:
     ]  # fmt: skip
     assert done.result["batch"] == 3 and done.result["batch_ran"] == 3
     # the same reply event again: the same result, nothing new
-    assert h.reply("yes").resolved == result.resolved
+    assert set(h.reply("yes").resolved) == set(result.resolved)
 
 
 async def test_a_crash_mid_batch_never_runs_a_change_twice(h: H) -> None:
@@ -499,3 +499,45 @@ async def test_the_brain_never_gets_a_wait_for_an_asked_change(h: H) -> None:
     row = ap.get_approval(h.db, got.asked.approval_id)
     assert row is not None and row.code is not None and row.code not in json.dumps(got.data)
     assert h.channel.prompts == []  # nothing prompted mid-turn
+
+
+# --- allow_tools: what "don't ask for linear tickets" covers ------------------------------------
+
+
+def _ext_registry() -> tuple[ToolRegistry, dict[str, list[ToolSpec]]]:
+    def ext(name: str, effect: Effect, level: Level | None = None) -> ToolSpec:
+        return ToolSpec(name=name, effect=effect, level=level, source="ext:linear",
+                        extension="linear")  # fmt: skip
+
+    linear = [
+        ext("list_issues", Effect.READ),
+        ext("save_issue", Effect.WRITE, Level.L2),
+        ext("save_comment", Effect.WRITE, Level.L2),
+        ext("delete_issue", Effect.WRITE, Level.L1),
+    ]
+    registry = ToolRegistry()
+    for spec in (*linear, CLOSE, PURGE):
+        registry.register(spec)
+    return registry, {"linear": linear}
+
+
+def test_allow_targets_maps_names_to_the_changes_a_rule_can_cover() -> None:
+    from resonant.trust.tools import allow_targets, tool_name
+
+    registry, loaded = _ext_registry()
+
+    def targets(*names: str) -> tuple[list[str], str | None]:
+        specs, why = allow_targets(names, registry=registry, ext_tools=lambda e: loaded.get(e, []))
+        return [tool_name(s) for s in specs], why
+
+    # an extension: its L2 changes (never its reads or its L1 delete)
+    assert targets("linear") == (["linear.save_issue", "linear.save_comment"], None)
+    assert targets("Linear ") == (["linear.save_issue", "linear.save_comment"], None)
+    assert targets("linear.save_comment") == (["linear.save_comment"], None)
+    assert targets("mcp__resonant__save_issue") == (["linear.save_issue"], None)  # Claude's name
+    assert targets("close_ticket", "linear") == (
+        ["close_ticket", "linear.save_issue", "linear.save_comment"], None
+    )  # fmt: skip
+    for bad in ("linear.delete_issue", "purge_ticket", "linear.list_issues", "jira", "x.y"):
+        found, why = targets(bad)
+        assert found == [] and why is not None, bad

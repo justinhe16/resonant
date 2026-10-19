@@ -35,8 +35,9 @@ One step does the whole task, unless it has to wait for an approval:
    or run. Allowed without asking (L3, or an L2 tool with the owner's standing allow), it
    runs and the loop goes on, up to ``MAX_SIDE_EFFECTS`` per task (GT-1); each has its own
    ``call_index``, so each is idempotent on its own. Anything that needs approval is pinned
-   and the task waits: one approval per task, and after it the task ends. Refused, the reply
-   says so (after the report lines of what already ran).
+   and the task waits: one approval per task on this path, and after it the task ends (the
+   brain loop and the Claude bridge batch them instead, BA-1: **Batches** below). Refused,
+   the reply says so (after the report lines of what already ran).
 8. **Answer.** ``chat_json`` with ``{reply: string}``, cut to ``MAX_REPLY_CHARS``. Code
    computes and text narrates: every number in the reply must appear in a tool result or
    in the user's message. Otherwise the reply is replaced by a templated summary of the
@@ -57,6 +58,14 @@ One step does the whole task, unless it has to wait for an approval:
   send failure is a retryable ``Fail``.
 - ``DryRun``: ``Dry run: would <summary>``. ``Deny``: a templated refusal (``Not done.``,
   expired, already used).
+
+**Batches** (BA-1, ``checkpoint.batch``; the brain loop and the Claude bridge): the changes a
+turn's gate asked about, pinned while the turn went on (``_call_tool(batch=…)``, then
+``close_batch``). One change: the plain single prompt above. Several: one prompt for all of
+them (``gate.open_batch``, ``prompt_batch``), then ``Wait("approval")``; once answered each
+approved change runs once, in order (``ToolCore.resume``: a restart mid-batch replays what
+ran and never re-runs one), a failure doesn't stop the rest, and the reply has a line per
+change. ``no`` or expiry: none run; paused (/kill): none run.
 
 Failures: ``ModelUnavailableError`` sends one templated fallback (the tool summary when
 tools already ran, else ``FALLBACK_REPLY``) and the task is done. ``ModelOutputError``

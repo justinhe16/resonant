@@ -260,6 +260,7 @@ def test_rules_allow_command() -> None:
 def test_rules_intent() -> None:
     assert INTENT_TOOLS["rules"] == (
         "add_trust_rule",
+        "allow_tools",
         "allow_trust_rule",
         "list_trust_rules",
         "remove_trust_rule",

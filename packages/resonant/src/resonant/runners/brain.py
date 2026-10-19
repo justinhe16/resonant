@@ -7,9 +7,10 @@ It is a ``LocalRunner`` with a different answer step, so everything after "the m
 tool" is the shared tool call path (TC-1, ``resonant.toolcore``, through ``_call_tool``):
 registry spec, schema check, ``gate.evaluate``, executor, the pinned gated call and its resume
 after an approval, the code-built report lines (``REPORTS``), at most ``MAX_SIDE_EFFECTS``
-side effects without asking; plus the local runner's one approval per task and the resend of
-a saved reply. A checkpoint that holds ``call`` (or any of the local
-runner's keys) is handed to ``LocalRunner._answer`` as is.
+side effects without asking; plus the resend of a saved reply. Changes the gate asks about
+join the turn's batch (BA-1) and the model goes on; when the turn ends the owner gets one
+prompt for all of them (``LocalRunner.close_batch``). A checkpoint that holds ``batch`` or
+``call`` (or any of the local runner's keys) is handed to ``LocalRunner._answer`` as is.
 
 **One turn** (a ``kind="chat"`` task with no ``call``):
 
@@ -202,6 +203,9 @@ FINAL_INSTRUCTION = (
 )
 NO_SUCH_TOOL = "there is no tool named {name}; use one of the tools you were given"
 BAD_STUB_ARGS = "invalid arguments ({why}). {name} takes: {schema}. Call it again with those."
+ASK_AFTER_BATCH = (
+    "not run: changes already wait on the owner's yes in this turn; finish your answer instead"
+)
 
 # The corrective round (once per task): an answer that claims a change no tool made.
 CLAIM_NUDGE = (
@@ -1107,6 +1111,13 @@ class BrainRunner(LocalRunner):
     ) -> StepResult | None:
         """Run one checked call through the gate and executor into ``st``."""
         args = cast(dict[str, Any], args)
+        if name == ASK_CLAUDE.name and st.batch:
+            # BA-1: changes already wait on the owner: this turn asks first (a hand-off's ack
+            # would give way to the batch prompt).
+            call = CallResult(name, False, None, ASK_AFTER_BATCH)
+            st.calls.append(call)
+            self._tool_turns(name, args, call, st)
+            return None
         with _asking(st):
             done = await self._call_tool(
                 task,

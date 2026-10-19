@@ -525,3 +525,21 @@ async def test_approval_codes_never_reach_claude(
         seen = json.dumps(w.session())
         for code in codes:
             assert re.search(rf"(?<![A-Za-z0-9]){code}(?![0-9])", seen) is None
+
+
+async def test_qwen_doesnt_hand_off_once_changes_wait(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """With a change waiting in the turn's batch, an ask_claude call is refused to the model
+    (its ack would give way to the prompt); the turn asks about the change as usual."""
+    async with start(resonant_home, chat, tmp_path) as w:
+        w.model.push(
+            [("save_issue", {"id": "RES-12", "state": "Done"})],
+            [("ask_claude", {"question": "why is RES-12 stuck?"})],
+            "Asked you.",
+        )
+        (prompt,) = await w.say("close RES-12 and tell me why it was stuck")
+        assert 'linear: save issue id="RES-12", state="Done"' in prompt and "changes" not in prompt
+        assert w.rows("SELECT 1 FROM tasks WHERE runner = 'ask'") == []
+        seen = json.dumps([r.messages for r in w.model.requests])
+        assert "changes already wait on the owner" in seen

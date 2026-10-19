@@ -195,13 +195,13 @@ This is the opposite of a reminder the owner sets: Resonant decides what's worth
 
 **Done when.** Misses get a classifier decision or a re-ask, never a wrong approval, and the eval reports precision on approvals.
 
-## Batch approvals (`yes all`)
+## Batch subsets (`yes 1,3`)
 
-*Deferred 2026-10-13, from Phase 2. With one gated side effect per task, several pending approvals are rare, and a re-ask with codes covers it.*
+*Noted 2026-10-19 from BA-1 ([`brain-plan.md`](brain-plan.md#ba-1-batch-approvals-2026-10-19)). "Batch approvals (`yes all`)" is closed: BA-1 built batches as one task's changes under one code.*
 
-**What.** `yes all` approves exactly the approvals listed in one stored batch message (`approval_batches`), never L1 or pay. `open_batch` stays `NotImplementedError` until then.
+**What.** Approve part of a batch: `yes 1,3` (or `no 2`) runs the numbered changes and drops the rest. Left out of BA-1 on purpose: the parser would need a new grammar that can't be confused with a code reply, the gate would resolve some approvals of a batch and reject the others in one transaction, and the owner can already say `no` and ask again for the subset.
 
-**Done when.** `yes all` approves a snapshot and nothing that arrived after it.
+**Done when.** `yes 1,3 D7` (the code stays required for an L1 batch) approves exactly those approvals of that batch, rejects the others, and the reply reports each.
 
 ## Note undo
 
@@ -384,7 +384,7 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 *Noted 2026-10-16 from GT-1 ([`employee-plan.md`](employee-plan.md#gt-1-gates-sufficient-not-excessive)).*
 
 - **Standing allows are per tool and scope only.** A `yes always` on `github.merge_pr` in a repo covers every PR there; there is no per-argument rule (a branch, a size). Narrow it with an `ask` rule if needed.
-- **Injection budget is three effects.** One injected read in a chat task can now steer up to three side effects that run unasked (L3, or tools with a standing allow). Revisit if extension reads grow; a per-task cap after an extension read is a cheap tightening.
+- **Injection budget is five effects** (three until BA-1). One injected read in a chat task can steer up to five side effects that run unasked (L3, or tools with a standing allow); a tainted task's changes all ask (in one batch). Revisit if extension reads grow; a per-task cap after an extension read is a cheap tightening.
 - **Anonymously registered repos stay `push`.** `add_repo` without the daemon token can't see push access, so a public repo the owner can't push to is registered `push` and its runs fail to push; re-add with the token to get fork mode. The anonymous lookups share GitHub's 60/h per-IP limit.
 - **Narrowed flagged paths.** Makefile, justfile, Dockerfiles, `conftest.py`, `tox.ini` and new executables merge without asking now; they run only when someone runs them. Lifecycle scripts in `package.json`/`setup.py` run on the next install and are listed (`deps changed`), not flagged. Add any back to `runner/checks.py` if that proves too loose.
 - **Restart and update take `yes always`.** `restart_resonant` and `update_resonant` are L2 builtins the owner can give a standing allow (scope `*`), by the ticket's "any L2 approval". With one, a steered chat model can restart or update the daemon unasked (update only pulls `main`, which the owner controls). Forget the rule (`/rules forget <n>`) to go back to asking, or add them to `trust.tools.NEVER`.
@@ -495,17 +495,29 @@ TC-1 put every tool call on `resonant/toolcore/`, except one: the scheduler's in
 - **Taint relies on the stream's order.** A Resonant change waits up to 3 s for its own `tool_use` in Claude Code's stream-json so every earlier read is counted. That assumes the CLI emits each `tool_use` before running the tool (true on 2.1.302); if it ever runs the MCP call first, every change counts as tainted and asks (fails closed, more asks, never fewer). Re-check after CLI updates.
 - **Connectors still don't load under `--restricted`.** The bridge loads (an `--mcp-config` server), claude.ai connectors still don't (BR-5's probe), so email and calendar asks are still refused. Same options as BR-5's "ask_claude: email and calendar".
 - **History replays Claude's answers as data.** *(BR-10b: the taint half is closed: a turn whose window holds a `claude_reply` starts tainted, and the fold no longer keeps Claude's text.)* A `<claude_answer>` user turn. The answer is noted after the send (also when the turn waits on an approval), retried for ~10 s while the brain task finishes; past that it's missing from history.
-- **Approval TTL starts in the session.** The gate creates the approval when Claude calls the tool; the owner is prompted after the answer. A session longer than `gate.approval_ttl_s` (30 min) would see it expire before the prompt (dropped, safe). Not reachable with `timeout_s` 120.
-- **Caps across a hand-off.** The 3-change cap is per task: a brain turn can run 3 changes, hand off, and the Claude task 3 more (the escalation note tells Claude what already ran; nothing enforces it).
+- **Approval TTL starts in the session.** The gate creates the approval when Claude calls the tool; the owner is prompted after the answer. A session longer than `gate.approval_ttl_s` (30 min) would see it expire before the prompt (dropped, safe). Not reachable with `timeout_s` 120. (BA-1: a batch's expiry restarts when it is prompted; a lone change's still starts in the session.)
+- **Caps across a hand-off.** The 3-change (5 since BA-1) cap is per task: a brain turn can run 3 changes, hand off, and the Claude task 3 more (the escalation note tells Claude what already ran; nothing enforces it).
 - **A down model spends the daily cap.** With qwen down, every turn goes to Claude with a canned ack and counts against `daily_cap`.
 - **Stale bridge dirs.** A hard daemon crash mid-session leaves an `rsn-mcp-*` dir in the temp dir (a socket and a config with a dead token); sweep at startup if they pile up.
 - **`looks_hard` is a regex floor.** English, shape-only (a leading why / how does, debug, compare, figure out, investigate…). "How's the mini" stays local; "is there a reason X broke?" isn't caught (the model's triage still can be). Widen from real misses; each widening costs Claude usage on small talk.
 - **The ack is a model line, filtered.** `clean_ack` drops questions, links, braces and result words, but an ack can still be odd ("on it, checking the moon"). Canned acks are the fallback; if model acks look wrong in practice, use canned only.
-- **One approval and three changes per Claude task.** A second gated change in the same session is refused (`PENDING`); Claude is told to say the owner can ask again. Batch approvals (`yes all`) would lift it.
+- **One approval and three changes per Claude task.** *(Closed by BA-1: the changes that ask wait in one batch prompt, and 5 run unasked.)*
 - **Media and watch asks stay read-only.** Only asks from a `brain` task get the tools (`tools/ask.py` checks the caller's runner); an image ask from `runner="media"` can't add a note from a screenshot.
 - **The bridge's Python.** The MCP config runs `sys.executable -I brain/mcp_stdio.py`; a daemon running from a venv that moves (an update mid-session) breaks that session's tools only.
 - **Triage holds the slot for one more call.** On a busy model, a turn that would have been local now pays the triage call first (80 tokens out, on the cached prefix); measure in the BR-10 eval row (ack p50, local p50).
 - **The published architecture artifact** is built from `docs/architecture.html` (the brain node now shows triage, the ack and the MCP bridge); republish it after this merges.
+
+## BA-1 carry-overs: batch approvals
+
+*Noted 2026-10-19 from BA-1 ([`brain-plan.md`](brain-plan.md#ba-1-batch-approvals-2026-10-19)).*
+
+- **qwen still sees an extension change's raw result.** In the local loop a change that ran goes back to the model as its result (a created ticket's key, say), so it taints the rest of the turn: with a standing rule for linear, the first save runs and the next ones ask (in one batch). Claude's bridge only ever shows the code-built `Done: …` line, so its saves don't taint (BA-1). Showing qwen only the report line would make them consistent, at the cost of the key in the answer.
+- **qwen's own words give way to a batch.** When a local turn ends with changes waiting, its answer isn't sent (the prompt is, then the code-built results), as with one approval before. A turn that also answered a question ("what's on my Linear, and close RES-12") loses that answer; Claude's turns send theirs first.
+- **The owner answers every batch.** A batch goes to the owner only, even when a member approves every extension in it (a lone change still goes to all its approvers). A member's own task's changes batch to the owner too.
+- **Partly decided batches are dropped.** A batch approval resolved on its own (`resonant approvals approve <id>` resolves the whole batch, so only a race does this) leaves the rest unbindable: they're expired (`batch_split`) and that turn's changes don't run.
+- **`allow_tools` reads the registry twice.** The prompt and the saved rules both come from the loaded extensions; an extension update between them (owner-only, at the Mini) could change the set. The report line lists exactly what was saved.
+- **A capped change isn't asked.** Past `gate.batch_max` (10) a change is refused (`at most 10 changes can wait on one yes`), and past `MAX_SIDE_EFFECTS` (5) unasked ones are refused even when the next one would only have asked. Either could join the batch instead.
+- **The kill switch only blocks on `paused`.** An approved batch runs with autonomy off but not paused (the gate asks for everything, and the owner said yes); `/kill` sets both.
 
 ## BR-9 carry-overs: what changed lately
 

@@ -22,13 +22,14 @@ decides whether a call may run.
   Glob, the web, connectors) seen in the session's stream. A change waits until the stream
   shows Claude's ``tool_use`` for it, so every read before it is counted; if the stream
   doesn't show it within ``SYNC_S`` the call counts as tainted (fails closed).
-- **Approvals.** A call the gate asks about is pinned (``checkpoint.call``) but the owner is
-  not prompted during the session: Claude gets ``asked the owner: <code-built summary>`` and
-  never an approval code. When the session ends its answer goes out first, then the prompt,
-  then the task waits; ``yes`` runs the pinned call exactly once (the executor's key), ``no``
-  or expiry drops it (``AskRunner``: a ``LocalRunner`` named ``ask`` resumes the pinned call
-  through ``ToolCore.resume``). One approval per task: after
-  it, every other change is refused. At most ``MAX_SIDE_EFFECTS`` changes run per task.
+- **Approvals** (BA-1: batches). A call the gate asks about joins the task's batch
+  (``checkpoint.batch``, :attr:`ClaudeTools.asked`) but the owner is not prompted during the
+  session: Claude gets ``asked the owner: <code-built summary>`` (never an approval code) and
+  goes on. When the session ends its answer goes out first, then one prompt for every change
+  in the batch (one change: the plain prompt), then the task waits; ``yes`` runs each once,
+  in order (the executor's keys), ``no`` or expiry drops them all (``AskRunner``: a
+  ``LocalRunner`` named ``ask`` runs the batch step through ``ToolCore.resume``). At most
+  ``gate.batch_max`` changes wait and ``MAX_SIDE_EFFECTS`` run unasked per task.
 - **Kill switch.** Paused: every call is refused here (the session itself is killed by the
   ask runner); autonomy off: the gate asks for everything above L0, as for the local model.
 
