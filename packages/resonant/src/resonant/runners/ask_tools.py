@@ -290,6 +290,14 @@ class ClaudeTools:
 
     # -- the stream (taint) --
 
+    def taint(self, source: str, **attrs: Any) -> None:
+        """Taint the session from now on (once; a span says why)."""
+        if self.tainted:
+            return
+        self.tainted = True
+        with self._spans("runner.ask.taint", source=source, **attrs):
+            pass
+
     def observe(self, msg: dict[str, Any]) -> None:
         """One stream-json message of the session: count Claude's tool uses. A tool of its own
         (anything but ours) reads outside content: the session is tainted from then on."""

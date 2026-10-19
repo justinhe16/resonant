@@ -25,9 +25,10 @@ def message(
     at: datetime | None = None,
     task: bool = True,
     source: str = "imessage",
+    checkpoint: dict[str, Any] | None = None,
 ) -> str:
     """Store one message event (and, with ``task``, the task it started, whose checkpoint
-    holds ``reply``). Returns the event id."""
+    holds ``reply`` and any ``checkpoint`` keys). Returns the event id."""
     extra: dict[str, Any] = {} if at is None else {"occurred_at": at}
     event = Event(
         source=source, type="message", principal=principal, payload={"text": text}, **extra
@@ -36,6 +37,7 @@ def message(
         repo.insert_event(db, event)
         if task:
             cp: dict[str, Any] = {} if reply is None else {"reply": reply}
+            cp.update(checkpoint or {})
             task_id = repo.insert_task(
                 db,
                 NewTask(

@@ -10,8 +10,10 @@ turn, so everything that changes per turn goes after them. ``build_context`` ret
 3. **Facts**, one ``user`` turn, present only when there are facts: the facts index
    (``facts.render_index``; changes on ``remember`` or ``forget``). A user turn rather than
    a second system message, so every template keeps it after the tools.
-4. **History** (``history.history_messages``): the running summary, then the recent
-   exchanges as real user and assistant turns. Append-only between folds.
+4. **History** (``history.replayed``): the running summary, then the recent exchanges as
+   real user and assistant turns. Append-only between folds. When an exchange in it holds
+   outside text (a Claude answer, a tainted task's reply), ``BrainContext.untrusted`` says
+   why and the brain starts the turn tainted (BR-10b).
 5. **The current turn**, one ``user`` turn, always last: ``<briefing>…</briefing>``, then
    ``<since_last>…</since_last>`` when something changed since the principal's previous
    message, then ``Current time: …``, then the message (``wrap_untrusted``), then
@@ -36,7 +38,7 @@ from datetime import datetime
 
 from resonant.brain.briefing import gather_briefing, last_talked, since_notes
 from resonant.brain.facts import FactStore, render_index
-from resonant.brain.history import history_messages
+from resonant.brain.history import History, replayed
 from resonant.brain.text import flat
 from resonant.config import Settings
 from resonant.loop.slots import SlotPool
@@ -180,6 +182,10 @@ class BrainContext:
     prefix: tuple[ChatMessage, ...]  # stable: system, then facts
     history: tuple[ChatMessage, ...]  # summary and recent exchanges
     turn: ChatMessage  # briefing, notes, time and the message: always last
+    # BR-10b: the history replays outside text (a Claude answer, a tainted task's reply):
+    # the reason, and the turn starts tainted. None: clean.
+    untrusted: str | None = None
+    taint_hops: int = 0  # how far the turn is from that text (its replies record it)
 
     def messages(self) -> list[ChatMessage]:
         return [*self.prefix, *self.history, self.turn]
@@ -214,10 +220,10 @@ def build_context(
     owner = principal == principals.owner
     index = render_index(facts.list()) if facts is not None and owner else ""
     prefix = stable_prefix(facts_index=index)
-    history: list[ChatMessage] = []
+    history = History([])
     notes: list[str] = []
     if event_id is not None:
-        history = history_messages(conn, principal, before_event_id=event_id, source=source)
+        history = replayed(conn, principal, before_event_id=event_id, source=source)
         since = last_talked(conn, principal, before_event_id=event_id, source=source)
         if since is not None:
             notes = since_notes(conn, owner=owner, since=since, now=now, tz=settings.timezone)
@@ -233,5 +239,9 @@ def build_context(
     )
     turn = current_turn(text, briefing=briefing, notes=notes, now=now, tz=settings.timezone)
     return BrainContext(
-        prefix=prefix, history=tuple(history), turn={"role": "user", "content": turn}
+        prefix=prefix,
+        history=tuple(history.messages),
+        turn={"role": "user", "content": turn},
+        untrusted=history.untrusted,
+        taint_hops=history.hops + 1 if history.untrusted is not None else 0,
     )

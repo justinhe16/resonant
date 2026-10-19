@@ -85,6 +85,7 @@ from decimal import Decimal, InvalidOperation
 from functools import partial
 from typing import Any, Protocol, cast
 
+from resonant.brain.history import reply_tainted, taint_hops
 from resonant.brain.text import flat
 from resonant.executor import NotAllowedError, ToolResult, idempotency_key
 from resonant.extensions.notify import take_baseline
@@ -759,8 +760,19 @@ class LocalRunner:
             return Answer(NO_ANSWER_REPLY, "fallback", [])
         toolset = self._toolset(cp, intent)
         with spans("runner.local.context", intent=intent, toolset=[t.name for t in toolset]) as s:
-            messages = self._context(task, principal, intent, text)
-            s.set(history_turns=len(messages) - 2)
+            messages, hops = self._context(task, principal, intent, text)
+            s.set(history_turns=len(messages) - 2, tainted=hops is not None)
+        if hops is not None and cp.get("tainted") is not True:
+            # BR-10b: a replayed reply was written after outside content. Saved (onto the
+            # stored checkpoint only, so a retry starts as before), so the calls are gated
+            # and pinned ``tainted`` and the next turn's history sees it, one hop further.
+            taint = {"tainted": True, "taint_hops": hops}
+            latest = get_task(self.conn, task.id)
+            stored = latest.checkpoint if latest is not None else cp
+            if not ctx.save(checkpoint={**stored, **taint}):
+                return Fail("task is no longer running")
+            cp = {**cp, **taint}
+            task = replace(task, checkpoint=cp)
 
         calls: list[CallResult] = []
         try:
@@ -850,8 +862,11 @@ class LocalRunner:
 
     def _pinned_origin(self, cp: dict[str, Any], pinned: PinnedCall) -> Origin:
         """The origin a pinned call is gated with: ``explicit`` only for the router's
-        ``direct_call`` (``is_explicit``), else ``inferred``. The brain loop adds ``tainted``."""
-        return "explicit" if is_explicit(cp, pinned) else "inferred"
+        ``direct_call`` (``is_explicit``), else ``tainted`` when it was pinned so (D6, BR-10b),
+        else ``inferred``."""
+        if is_explicit(cp, pinned):
+            return "explicit"
+        return "tainted" if cp.get("tainted") is True else "inferred"
 
     async def _decided(
         self,
@@ -1017,9 +1032,13 @@ class LocalRunner:
 
     def _context(
         self, task: Task, principal: str, intent: IntentLabel, text: str
-    ) -> list[ChatMessage]:
+    ) -> tuple[list[ChatMessage], int | None]:
+        """The intents prompt, and when a reply it replays was written by a tainted task
+        (BR-10b: ``history.reply_tainted``) this task's taint hops (one more than the
+        nearest such reply's); then its calls are tainted too. None: clean."""
         system = runner_system(intent, self.intents)
         messages: list[ChatMessage] = [{"role": "system", "content": system}]
+        hops: int | None = None
         if task.origin_event_id is not None:
             thread = principal_thread(
                 self.conn,
@@ -1042,11 +1061,14 @@ class LocalRunner:
                 if reply is not None:  # untrusted: it may quote extension output
                     wrapped = wrap_prior_reply(reply, max_chars=MAX_HISTORY_CHARS)
                     messages.append({"role": "user", "content": wrapped})
+                    if reply_tainted(origin_cp):
+                        mine = (taint_hops(origin_cp) or 0) + 1
+                        hops = mine if hops is None else min(hops, mine)
         current = current_turn(
             intent, text, now=self.now(), tz=self.timezone, max_chars=MAX_MESSAGE_CHARS
         )
         messages.append({"role": "user", "content": current})
-        return messages
+        return messages, hops
 
     async def _tool_loop(
         self,
@@ -1088,6 +1110,9 @@ class LocalRunner:
     ) -> bool | StepResult:
         """The model's tool rounds for ``_tool_loop``: True for too many calls, False when
         done or at the side-effect cap, or a gated call's result that ends the loop."""
+        # A task tainted by a replayed reply (BR-10b, ``_answer``): its calls are tainted, and
+        # the pin keeps ``taint_hops`` (already on the checkpoint).
+        tainted = task.checkpoint.get("tainted") is True
         for _ in range(MAX_TOOL_ITERATIONS):
             try:
                 reply = await self.model.chat_tools(messages, tools=toolset, spans=spans)
@@ -1100,8 +1125,10 @@ class LocalRunner:
                     return True
                 effects = [c.report for c in calls if c.report is not None]
                 call = await self._call_tool(
-                    task, principal, toolset, tc.name, tc.args, len(calls), ctx, spans, effects
-                )
+                    task, principal, toolset, tc.name, tc.args, len(calls), ctx, spans, effects,
+                    origin="tainted" if tainted else "inferred",
+                    pin={"tainted": True} if tainted else None,
+                )  # fmt: skip
                 if not isinstance(call, CallResult):
                     return call
                 calls.append(call)

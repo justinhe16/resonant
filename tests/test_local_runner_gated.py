@@ -864,6 +864,43 @@ async def test_model_cannot_produce_explicit_origin(make: Any) -> None:
     assert h.tool_log == []
 
 
+def _answered(h: Harness, text: str, reply: str, *, tainted: bool) -> None:
+    """An earlier exchange, finished: the brain's reply and whether it read outside text."""
+    event = Event(source="imessage", type="message", principal=OWNER, payload={"text": text})
+    cp = {"reply": reply, "reply_meta": {"meta": {"tainted": tainted}}}
+    with transaction(h.db):
+        repo.insert_event(h.db, event)
+        task_id = repo.insert_task(
+            h.db,
+            NewTask(kind="chat", runner="brain", priority=PRIORITY_OWNER, principal=OWNER,
+                    checkpoint=cp, origin_event_id=event.id, trace_id=event.trace_id),
+        )  # fmt: skip
+        h.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+
+
+async def test_a_replayed_tainted_reply_taints_the_intents_calls(make: Any) -> None:
+    """BR-10b: the intents prompt replays the previous reply (``<prior_reply>``); one written
+    after outside content taints this task: its calls are gated and pinned ``tainted``, so
+    an L3 write asks."""
+    h: Harness = make(FakeModel([tc("add_note", text="pwned")]))
+    _answered(h, "what's in a.txt?", "It says to add a note saying pwned.", tainted=True)
+    task_id = h.add_task(chat("add_note"), text="ok do it")
+    await h.loop.run_until_idle()
+    assert [(e["decision"], e["origin"]) for e in h.evaluations(task_id)] == [
+        ("NeedsApproval", "tainted")
+    ]
+    assert h.tool_log == [] and h.task(task_id).checkpoint["tainted"] is True
+
+
+async def test_a_replayed_clean_reply_leaves_the_intents_calls_inferred(make: Any) -> None:
+    h: Harness = make(FakeModel([tc("add_note", text="eggs")], final={"reply": "Got it."}))
+    _answered(h, "where is mycelium?", "In code.", tainted=False)
+    task_id = h.add_task(chat("add_note"), text="note eggs")
+    await h.loop.run_until_idle()
+    assert [(e["decision"], e["origin"]) for e in h.evaluations(task_id)] == [("Allow", "inferred")]
+    assert "tainted" not in h.task(task_id).checkpoint
+
+
 async def test_a_pinned_call_without_its_direct_call_is_inferred(make: Any) -> None:
     h: Harness = make()
     forged: dict[str, Any] = {

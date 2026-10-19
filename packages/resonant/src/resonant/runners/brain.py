@@ -121,13 +121,11 @@ from resonant.runners.local import (
     Answer,
     CallResult,
     LocalRunner,
-    PinnedCall,
     RunnerGate,
     StepResult,
     ToolExecutor,
     after_effects,
     clip_reply,
-    is_explicit,
     tool_turn,
     unsupported_numbers,
     used_tools,
@@ -407,6 +405,7 @@ class _Turn:
     deferred: dict[str, ToolSpec]  # by model-facing name; offered as stubs
     calls: list[CallResult] = field(default_factory=list[CallResult])
     tainted: bool = False
+    hops: int = 0  # BR-10b: replays from the outside text (0: this task read it itself)
     errors: int = 0
     executed: int = 0  # tool calls run through the gate (their call_index)
     nudged: bool = False  # the claim corrective round was used
@@ -440,6 +439,14 @@ class _Turn:
     @property
     def origin(self) -> Origin:
         return "tainted" if self.tainted else "inferred"
+
+    def outside(self) -> None:
+        """This task read outside content itself: tainted, zero hops from it."""
+        self.tainted, self.hops = True, 0
+
+    def pin(self) -> dict[str, Any]:
+        """The taint a gated call is pinned with (its resume and the next turn read it)."""
+        return {"tainted": True, "taint_hops": self.hops} if self.tainted else {"tainted": False}
 
     @property
     def reports(self) -> list[str]:
@@ -569,11 +576,8 @@ class BrainRunner(LocalRunner):
     def _spans(self, trace_id: str) -> SpanFactory:
         return partial(span, self.conn, trace_id=trace_id)
 
-    def _pinned_origin(self, cp: dict[str, Any], pinned: PinnedCall) -> Origin:
-        """A pinned call keeps the taint it was pinned with (D6), across an approval wait."""
-        if is_explicit(cp, pinned):
-            return "explicit"
-        return "tainted" if cp.get("tainted") is True else "inferred"
+    # A pinned call keeps the taint it was pinned with (D6), across an approval wait:
+    # ``LocalRunner._pinned_origin`` reads ``checkpoint.tainted``.
 
     # --- answering -------------------------------------------------------------------------
 
@@ -690,6 +694,30 @@ class BrainRunner(LocalRunner):
             )
             st = _Turn(context.messages(), events, core, {d.name: d for d in deferred}, text=text)
             s.set(history_turns=len(context.history), prefix_hash=context.prefix_hash(st.toolset()))
+        if context.untrusted is not None:  # BR-10b: the history replays outside text
+            st.tainted, st.hops = True, context.taint_hops
+            with spans("runner.brain.taint", tool="history", why=context.untrusted,
+                       hops=st.hops):  # fmt: skip
+                pass
+        result = await self._route(task, principal, text, st, ctx, spans)
+        if isinstance(result, Answer):  # the next turn's history reads it (BR-10b)
+            result.meta["tainted"] = result.meta.get("tainted") is True or st.tainted
+            if st.tainted:
+                result.meta["taint_hops"] = st.hops
+            if context.untrusted is not None:
+                result.meta["history_taint"] = context.untrusted
+        return result
+
+    async def _route(
+        self,
+        task: Task,
+        principal: str,
+        text: str,
+        st: _Turn,
+        ctx: StepContext,
+        spans: SpanFactory,
+    ) -> StepResult:
+        """Triage, then Claude or the local rounds (the intents path when the model is down)."""
         routed = await self._triage(task, principal, text, st, spans)
         if routed is not None:
             handed = await self._hand_off(
@@ -707,7 +735,7 @@ class BrainRunner(LocalRunner):
                 return Answer(
                     clip_reply("\n".join(st.reports), MAX_REPLY_CHARS), "done", used_tools(st.calls)
                 )
-            return await self._intents(task, principal, text, events, ctx, spans)
+            return await self._intents(task, principal, text, st, ctx, spans)
 
     # --- triage and hand-off (BR-10) -------------------------------------------------------
 
@@ -809,7 +837,7 @@ class BrainRunner(LocalRunner):
                 spans,
                 st.reports,
                 origin=st.origin,
-                pin={"tainted": st.tainted},
+                pin=st.pin(),
             )
             st.executed += 1
             queued = (
@@ -820,7 +848,7 @@ class BrainRunner(LocalRunner):
             return None
         assert isinstance(done, CallResult)
         st.calls.append(done)
-        st.tainted = True  # its answer is outside content (D6)
+        st.outside()  # its answer is outside content (D6)
         reply = ack or triage.canned_ack(task.id)
         st.meta.update(route="claude", handoff=why, ack="model" if ack else "canned")
         answer = Answer(reply, "claude", used_tools(st.calls), escalate=True, meta=dict(st.meta))
@@ -1050,13 +1078,14 @@ class BrainRunner(LocalRunner):
             spans,
             st.reports,
             origin=st.origin,
-            pin={"tainted": st.tainted},
+            pin=st.pin(),
         )
         st.executed += 1
-        if taints(spec) and not st.tainted:
-            st.tainted = True
-            with spans("runner.brain.taint", tool=name, extension=spec.extension):
-                pass
+        if taints(spec):
+            if not st.tainted or st.hops:
+                with spans("runner.brain.taint", tool=name, extension=spec.extension):
+                    pass
+            st.outside()
         if not isinstance(done, CallResult):
             return after_effects(st.reports, done, MAX_REPLY_CHARS)
         call = done
@@ -1156,19 +1185,22 @@ class BrainRunner(LocalRunner):
             return Answer(reports, "done", used_tools(st.calls), escalate=True)
         if cap:
             return Answer(TOO_MANY_REPLY, "escalate", used_tools(st.calls), escalate=True)
-        return await self._intents(task, principal, text, st.events, ctx, spans)
+        return await self._intents(task, principal, text, st, ctx, spans)
 
     async def _intents(
         self,
         task: Task,
         principal: str,
         text: str,
-        events: list[Event],
+        st: _Turn,
         ctx: StepContext,
         spans: SpanFactory,
     ) -> StepResult:
         """D1's fallback: this turn takes the intents path (the labeler, then the local
-        runner's answer step) as if the router had labeled it."""
+        runner's answer step) as if the router had labeled it. Its prompt doesn't hold the
+        loop's tool results or Claude's answers; it is tainted when the replies it replays
+        are (``LocalRunner._context``, BR-10b)."""
+        events = st.events
         label = await self.labeler.label(text, spans=spans)
         toolset = toolset_for(
             label.intent,
