@@ -31,6 +31,14 @@ decides whether a call may run.
 - **Kill switch.** Paused: every call is refused here (the session itself is killed by the
   ask runner); autonomy off: the gate asks for everything above L0, as for the local model.
 
+**One server, many turns** (BR-11). The socket and its token are an :class:`McpServer`. A
+one-shot ask's ``ClaudeTools`` owns one for its session. The Claude brain's long-lived session
+keeps one server for its whole life (the relay Claude Code started holds its socket and token)
+and each turn's ``ClaudeTools`` **binds** to it for that turn only (``McpServer.bind``): every
+call is served by the binding current when it arrives (that turn's task, principal, trace and
+origin), a call between turns is refused (``NOT_BOUND``), and a binding that ended refuses
+too. One owner turn's calls can't be attributed to another's.
+
 Results go back as text: a read's JSON (clipped), a change's code-built report line, or a
 ``not run: …`` refusal. Approval codes never appear: the gate's summary is code-built without
 one, and the read tools keep them out as they do for the local model (``/approvals`` shows
@@ -52,7 +60,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
@@ -115,6 +123,7 @@ ASKED = (
     "answer. Tell them it's waiting on their yes; don't call it again."
 )
 NO_SUCH_TOOL = "not run: there is no Resonant tool named {name}"
+NOT_BOUND = "not run: no message from the owner is being answered right now"
 BAD_ARGS = "not run: invalid arguments ({why}). {name} takes: {schema}"
 CHANGE_NOTE = " (A change: Resonant's approval rules apply; it may ask the owner first.)"
 
@@ -208,7 +217,10 @@ class ClaudeTools:
         tainted: bool,
         sync_s: float = SYNC_S,
         python: str = sys.executable,
+        server: McpServer | None = None,
     ) -> None:
+        """``server`` (BR-11): the Claude brain's long-lived server, bound to this turn by
+        :meth:`start` and released by :meth:`aclose`; None: this bridge owns its own."""
         assert task.principal is not None
         self.conn = conn
         self.access = access
@@ -225,48 +237,37 @@ class ClaudeTools:
         self.pending: str | None = None  # the code-built summary of the call waiting
         self.calls = 0
         self.outside = False  # a tool of Claude's own ran (outside content)
+        # BR-11: outside content came in during this session itself (one of Claude's own
+        # tools, a tainting Resonant tool, an unsynced change), as opposed to ``tainted``
+        # carried in from the asking turn or an earlier turn: the session's taint hops.
+        self.read_outside = False
+        self.changes = 0  # change calls that reached the gate (a crash retry must not repeat)
         self._index = 0
-        self._token = secrets.token_urlsafe(32)
-        self._dir: Path | None = None
-        self._server: asyncio.Server | None = None
+        self._shared = server is not None
+        self.server = server if server is not None else McpServer(python=python)
         self._lock = asyncio.Lock()
         self._seen: Counter[str] = Counter()
         self._used: Counter[str] = Counter()
         self._stream = asyncio.Event()
         self._closed = False  # after aclose: every call is refused (review: late calls)
-        self._writers: set[asyncio.StreamWriter] = set()
         self._spans: SpanFactory = partial(span, conn, trace_id=task.trace_id, task_id=task.id)
 
     # -- lifecycle --
 
     async def start(self) -> McpSetup:
-        """The socket, its server and the MCP config (both in a fresh 0700 dir)."""
-        self._dir = Path(tempfile.mkdtemp(prefix="rsn-mcp-"))
-        os.chmod(self._dir, 0o700)
-        sock = self._dir / "s"
-        self._server = await asyncio.start_unix_server(self._serve, path=str(sock), limit=LINE_MAX)
-        os.chmod(sock, 0o600)
-        config = {
-            "mcpServers": {
-                SERVER: {
-                    "command": self.python,
-                    "args": ["-I", str(STDIO)],
-                    "env": {SOCKET_ENV: str(sock), TOKEN_ENV: self._token},
-                }
-            }
-        }
-        path = self._dir / "mcp.json"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(config, f)
+        """Serve this task: its own server (socket and MCP config in a fresh 0700 dir), or
+        the shared one, bound to it until :meth:`aclose`."""
+        config = await self.server.start()
+        self.server.bind(self)
         self.caller.live.add(self.task.id)
-        return McpSetup(path, tuple(PREFIX + n for n in self.specs))
+        return McpSetup(config, tuple(PREFIX + n for n in self.specs))
 
     async def aclose(self) -> None:
         """Stop serving. A call still running (the session was killed mid-call) finishes
         first, up to ``CLOSE_WAIT_S``, so its report line isn't lost; any call after that is
-        refused, and open connections are closed (a late call must never prompt the owner
-        directly or run outside the session's accounting)."""
+        refused, and (own server) open connections are closed (a late call must never prompt
+        the owner directly or run outside the session's accounting). A shared server stays
+        up for the next turn, unbound from this one."""
         idle = False
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._lock.acquire(), CLOSE_WAIT_S)
@@ -274,19 +275,12 @@ class ClaudeTools:
             self._lock.release()
             idle = True
         self._closed = True
-        for writer in list(self._writers):
-            writer.close()
+        self.server.unbind(self)
         if idle:  # a call still stuck keeps deferring: it can never prompt the owner itself
             self.caller.live.discard(self.task.id)
             self.caller.deferred.pop(self.task.id, None)
-        if self._server is not None:
-            self._server.close()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(self._server.wait_closed(), 2)
-            self._server = None
-        if self._dir is not None:
-            await asyncio.to_thread(shutil.rmtree, self._dir, True)
-            self._dir = None
+        if not self._shared:
+            await self.server.aclose()
 
     # -- the stream (taint) --
 
@@ -317,7 +311,7 @@ class ClaudeTools:
             if isinstance(name, str) and name.startswith(PREFIX):
                 self._seen[name] += 1
             elif not self.outside:
-                self.outside = True
+                self.outside = self.read_outside = True
                 with self._spans("runner.ask.taint", source="claude_tool"):
                     pass
         self._stream.set()
@@ -330,6 +324,7 @@ class ClaudeTools:
         while self._seen[key] <= self._used[key]:
             left = deadline - time.monotonic()
             if left <= 0:
+                self.read_outside = True  # fail closed: as if it read something
                 if not self.tainted:
                     self.tainted = True
                     with self._spans("runner.ask.taint", source="unsynced"):
@@ -342,52 +337,14 @@ class ClaudeTools:
 
     # -- the relay's requests --
 
-    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if self._closed:
-            writer.close()
-            return
-        self._writers.add(writer)
-        try:
-            hello = _loads(await reader.readline())
-            token = hello.get("token") if hello is not None else None
-            if not isinstance(token, str) or not hmac.compare_digest(token, self._token):
-                with self._spans("runner.ask.mcp", refused=True):
-                    pass
-                return
-            await _write(writer, {"ok": True})
-            while line := await reader.readline():
-                req = _loads(line)
-                if req is None:
-                    break
-                rid, op = req.get("id"), req.get("op")
-                if op == "list":
-                    await _write(writer, {"id": rid, "tools": self.listing()})
-                elif op == "call":
-                    try:
-                        text, error = await self.call(req.get("name"), req.get("args"))
-                    except Exception as e:  # one bad call never kills the session's relay
-                        log.warning("ask: tool call failed", extra={"error": type(e).__name__})
-                        text, error = UNSURE, True
-                    await _write(writer, {"id": rid, "text": text, "error": error})
-                else:
-                    await _write(writer, {"id": rid, "text": "unknown op", "error": True})
-        except (OSError, ValueError, asyncio.LimitOverrunError, asyncio.IncompleteReadError):
-            pass
-        finally:
-            self._writers.discard(writer)
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
-
     def listing(self) -> list[dict[str, Any]]:
         """The MCP ``tools`` list: name, a cleaned one-paragraph description, full schema."""
-        out: list[dict[str, Any]] = []
-        for spec in self.specs.values():
-            text = flat(spec.description, DESCRIPTION_CHARS)
-            if spec.effect is not Effect.READ:
-                text += CHANGE_NOTE
-            out.append({"name": spec.name, "description": text, "inputSchema": spec.args_schema})
-        return out
+        return listing(self.specs.values())
+
+    def refused(self) -> None:
+        """A relay connection with a bad token (a span on this task's trace)."""
+        with self._spans("runner.ask.mcp", refused=True):
+            pass
 
     async def call(self, name: Any, args: Any) -> tuple[str, bool]:
         """One tool call from Claude: ``(text, is_error)``. One at a time (pins and call
@@ -424,6 +381,8 @@ class ClaudeTools:
             return CAPPED, True
         if self.outside:
             self.tainted = True
+        if change:
+            self.changes += 1
         origin: Origin = "tainted" if self.tainted else "inferred"
         self.calls += 1
         index = self._index
@@ -442,7 +401,7 @@ class ClaudeTools:
             pin={"tainted": self.tainted},
         )
         if self.access.taints(spec):
-            self.tainted = True
+            self.tainted = self.read_outside = True
         return self._result(done)
 
     def _result(self, done: CallResult | Wait | Fail | Answer) -> tuple[str, bool]:
@@ -478,6 +437,136 @@ class ClaudeTools:
             return True
 
 
+def listing(specs: Iterable[ToolSpec]) -> list[dict[str, Any]]:
+    """The MCP ``tools`` list of ``specs``: name, a cleaned one-paragraph description and the
+    full schema; a change says Resonant's approvals apply."""
+    out: list[dict[str, Any]] = []
+    for spec in specs:
+        text = flat(spec.description, DESCRIPTION_CHARS)
+        if spec.effect is not Effect.READ:
+            text += CHANGE_NOTE
+        out.append({"name": spec.name, "description": text, "inputSchema": spec.args_schema})
+    return out
+
+
+class McpServer:
+    """The daemon end of the relay: a unix socket (0600) in a fresh 0700 temp dir, a random
+    token, and the MCP config that starts ``brain/mcp_stdio.py`` with both. Each request is
+    served by the :class:`ClaudeTools` bound when it arrives (:meth:`bind`). None bound: a
+    ``list`` gets ``idle_listing`` (the Claude brain may list its tools between turns) and a
+    ``call`` is refused (``NOT_BOUND``). :meth:`start` is idempotent; :meth:`aclose` removes
+    it all."""
+
+    def __init__(
+        self,
+        *,
+        python: str = sys.executable,
+        idle_listing: Callable[[], list[dict[str, Any]]] | None = None,
+    ) -> None:
+        self.python = python
+        self.idle_listing = idle_listing
+        self.bound: ClaudeTools | None = None
+        self.config: Path | None = None
+        self._token = secrets.token_urlsafe(32)
+        self._dir: Path | None = None
+        self._server: asyncio.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
+
+    def bind(self, tools: ClaudeTools) -> None:
+        self.bound = tools
+
+    def unbind(self, tools: ClaudeTools) -> None:
+        """Release ``tools``, only if it is still the one bound."""
+        if self.bound is tools:
+            self.bound = None
+
+    async def start(self) -> Path:
+        """The socket, its server and the MCP config (both in a fresh 0700 dir): the
+        config's path."""
+        if self.config is not None:
+            return self.config
+        self._dir = Path(tempfile.mkdtemp(prefix="rsn-mcp-"))
+        os.chmod(self._dir, 0o700)
+        sock = self._dir / "s"
+        self._server = await asyncio.start_unix_server(self._serve, path=str(sock), limit=LINE_MAX)
+        os.chmod(sock, 0o600)
+        config = {
+            "mcpServers": {
+                SERVER: {
+                    "command": self.python,
+                    "args": ["-I", str(STDIO)],
+                    "env": {SOCKET_ENV: str(sock), TOKEN_ENV: self._token},
+                }
+            }
+        }
+        path = self._dir / "mcp.json"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f)
+        self.config = path
+        return path
+
+    async def aclose(self) -> None:
+        self.bound = None
+        server, self._server = self._server, None
+        for writer in list(self._writers):
+            writer.close()
+        if server is not None:
+            server.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(server.wait_closed(), 2)
+        if self._dir is not None:
+            await asyncio.to_thread(shutil.rmtree, self._dir, True)
+            self._dir = None
+        self.config = None
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self._server is None:
+            writer.close()
+            return
+        self._writers.add(writer)
+        try:
+            hello = _loads(await reader.readline())
+            token = hello.get("token") if hello is not None else None
+            if not isinstance(token, str) or not hmac.compare_digest(token, self._token):
+                if (bound := self.bound) is not None:
+                    bound.refused()
+                log.warning("ask: an MCP connection with a bad token was refused")
+                return
+            await _write(writer, {"ok": True})
+            while line := await reader.readline():
+                req = _loads(line)
+                if req is None:
+                    break
+                rid, op = req.get("id"), req.get("op")
+                bound = self.bound  # the turn current when the request arrives
+                if op == "list":
+                    if bound is not None:
+                        tools = bound.listing()
+                    else:
+                        tools = self.idle_listing() if self.idle_listing is not None else []
+                    await _write(writer, {"id": rid, "tools": tools})
+                elif op == "call":
+                    if bound is None:
+                        text, error = NOT_BOUND, True
+                    else:
+                        try:
+                            text, error = await bound.call(req.get("name"), req.get("args"))
+                        except Exception as e:  # one bad call never kills the relay
+                            log.warning("ask: tool call failed", extra={"error": type(e).__name__})
+                            text, error = UNSURE, True
+                    await _write(writer, {"id": rid, "text": text, "error": error})
+                else:
+                    await _write(writer, {"id": rid, "text": "unknown op", "error": True})
+        except (OSError, ValueError, asyncio.LimitOverrunError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            self._writers.discard(writer)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+
 def _loads(line: bytes) -> dict[str, Any] | None:
     if not line.strip():
         return None
@@ -497,6 +586,7 @@ __all__ = [
     "PREFIX",
     "SERVER",
     "ClaudeTools",
+    "McpServer",
     "McpSetup",
     "ToolAccess",
     "ToolCaller",

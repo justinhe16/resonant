@@ -1,10 +1,18 @@
 import { Alert } from "@/components/ui/alert";
 import { Ago, Counts, Dot, Empty, Row, Rows, Section, StateBadge } from "@/components/bits";
-import { ACTIVE_RUN_STATES, ACTIVE_TASK_STATES, RUN_STATE_ORDER, ordered, sum, worstHealth } from "@/lib/snapshot";
+import {
+  ACTIVE_RUN_STATES,
+  ACTIVE_TASK_STATES,
+  RUN_STATE_ORDER,
+  ordered,
+  safeHttpsUrl,
+  sum,
+  worstHealth,
+} from "@/lib/snapshot";
 import { duration } from "@/lib/time";
 import { healthTone, runTone } from "@/lib/tone";
 import { cn } from "@/lib/utils";
-import type { Snapshot } from "@/types";
+import type { ClaudeBrain, Snapshot } from "@/types";
 
 interface Props {
   snap: Snapshot;
@@ -138,7 +146,33 @@ export function Overview({ snap, now, go, stale = false }: Props) {
           </div>
         )}
       </Section>
+
+      {snap.claude_brain && <ClaudeBrainSection brain={snap.claude_brain} />}
     </div>
+  );
+}
+
+function ClaudeBrainSection({ brain }: { brain: ClaudeBrain }) {
+  const remoteUrl = brain.state === "up" ? safeHttpsUrl(brain.remote_url) : null;
+  return (
+    <Section title="Claude brain">
+      <div className="flex flex-wrap items-center gap-3 text-sm">
+        <StateBadge tone={brain.state === "up" ? "ok" : "neutral"}>{brain.state}</StateBadge>
+        <span className="text-muted-foreground">
+          {brain.turns} turn{brain.turns === 1 ? "" : "s"}
+        </span>
+        {remoteUrl && (
+          <a
+            href={remoteUrl}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="font-medium text-info underline-offset-2 hover:underline"
+          >
+            Remote Control
+          </a>
+        )}
+      </div>
+    </Section>
   );
 }
 

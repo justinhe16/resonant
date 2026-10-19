@@ -105,6 +105,14 @@ export interface Runner {
   missing?: string[];
 }
 
+/** BR-11: the Claude brain's long-lived session (local tier only). */
+export interface ClaudeBrain {
+  state: "up" | "down";
+  turns: number;
+  /** while Remote Control is on */
+  remote_url?: string;
+}
+
 export interface TrustRule {
   n: number;
   text: string;
@@ -142,6 +150,8 @@ export interface Snapshot {
   trust_rules?: TrustRule[];
   /** local only */
   repos?: Repo[];
+  /** local only; absent before the Claude brain first starts */
+  claude_brain?: ClaudeBrain;
 }
 
 /** Runtime config read from config.json next to index.html. */

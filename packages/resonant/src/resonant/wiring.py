@@ -267,6 +267,18 @@ def _ask_runner(components: Components) -> AskRunner | None:
     return found if isinstance(found, AskRunner) else None
 
 
+async def close_asks(components: Components | None) -> None:
+    """Shutdown (BR-11): end the Claude brain's session, RC-1's way, keeping its id for a
+    ``--resume`` after the restart. A failure is logged, never raised."""
+    asks = _ask_runner(components) if components is not None else None
+    if asks is None:
+        return
+    try:
+        await asks.aclose()
+    except Exception:
+        log.exception("claude brain: shutdown failed")
+
+
 class _DryRunOps:
     """A worker's restart or update under ``dry_run``: refused the way the gate would say."""
 
@@ -441,6 +453,7 @@ def build_imessage_stack(
         timezone=settings.timezone,
         create_task=loop.create_task,
         tools=tool_access(components, brain, settings),  # BR-10: the brain's asks
+        session=settings.brain.claude_session,  # BR-11: the Claude brain
     )
     components.runners[asks.name] = asks
     loop.runners[asks.name] = asks

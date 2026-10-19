@@ -271,6 +271,9 @@ class Daemon:
         if self.imessage is not None:
             if self.imessage.claude is not None:
                 await self.imessage.claude.aclose()
+            from resonant.wiring import close_asks
+
+            await close_asks(self.state.components)  # BR-11: the Claude brain's session
             await self.imessage.aclose()
         self.conn.close()
         log.info("resonant daemon stopped")

@@ -75,12 +75,13 @@ Message bodies are PII: spans and logs carry lengths, names and counts, never te
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import partial
@@ -133,7 +134,7 @@ from resonant.runners.local import (
 )
 from resonant.store.db import utcnow
 from resonant.tools import ToolRegistry
-from resonant.tools.ask import ASK_CLAUDE, QUESTION_MAX
+from resonant.tools.ask import ASK_CLAUDE, ASKING_HOPS, QUESTION_MAX
 from resonant_sdk import Effect, Event, ToolSpec
 
 log = logging.getLogger(__name__)
@@ -451,6 +452,16 @@ class _Turn:
     @property
     def reports(self) -> list[str]:
         return [c.report for c in self.calls if c.report is not None]
+
+
+@contextlib.contextmanager
+def _asking(st: _Turn) -> Generator[None]:
+    """BR-11: this turn's taint hops for an ``ask_claude`` it calls (``tools.ask.ASKING_HOPS``)."""
+    token = ASKING_HOPS.set(st.hops if st.tainted else None)
+    try:
+        yield
+    finally:
+        ASKING_HOPS.reset(token)
 
 
 def taints(spec: ToolSpec) -> bool:
@@ -825,7 +836,7 @@ class BrainRunner(LocalRunner):
         args: dict[str, Any] = {"question": question}
         if kind != "general":
             args["kind"] = kind
-        with spans("runner.brain.handoff", why=why, kind=kind) as s:
+        with spans("runner.brain.handoff", why=why, kind=kind) as s, _asking(st):
             done = await self._call_tool(
                 task,
                 principal,
@@ -844,12 +855,28 @@ class BrainRunner(LocalRunner):
                 isinstance(done, CallResult) and done.ok and (done.data or {}).get("queued") is True
             )
             s.set(queued=queued)
+        data = (done.data or {}) if isinstance(done, CallResult) else {}
         if not queued:
+            if data.get("busy") is True and isinstance(said := data.get("text"), str):
+                # BR-11: the Claude brain's queue is full: say so (code-built) and stop
+                assert isinstance(done, CallResult)
+                st.calls.append(done)
+                st.meta.update(route="claude", handoff=why, ack="busy")
+                busy = Answer(said, "claude", used_tools(st.calls), escalate=True,
+                              meta=dict(st.meta))  # fmt: skip
+                return after_effects(st.reports, busy, MAX_REPLY_CHARS)
             return None
         assert isinstance(done, CallResult)
         st.calls.append(done)
-        st.outside()  # its answer is outside content (D6)
+        if data.get("session") is True:
+            # BR-11: the Claude brain records its own turn's taint with the answer, so this
+            # turn's reply (the ack) carries only what the turn itself had seen
+            st.meta["claude_session"] = True
+        else:
+            st.outside()  # its answer is outside content (D6)
         reply = ack or triage.canned_ack(task.id)
+        if isinstance(after := data.get("after"), str):  # BR-11: others are ahead of it
+            reply = f"{reply} ({flat(after, 120)})"
         st.meta.update(route="claude", handoff=why, ack="model" if ack else "canned")
         answer = Answer(reply, "claude", used_tools(st.calls), escalate=True, meta=dict(st.meta))
         return after_effects(st.reports, answer, MAX_REPLY_CHARS)
@@ -1067,21 +1094,27 @@ class BrainRunner(LocalRunner):
     ) -> StepResult | None:
         """Run one checked call through the gate and executor into ``st``."""
         args = cast(dict[str, Any], args)
-        done = await self._call_tool(
-            task,
-            principal,
-            [spec],
-            name,
-            args,
-            st.executed,
-            ctx,
-            spans,
-            st.reports,
-            origin=st.origin,
-            pin=st.pin(),
-        )
+        with _asking(st):
+            done = await self._call_tool(
+                task,
+                principal,
+                [spec],
+                name,
+                args,
+                st.executed,
+                ctx,
+                spans,
+                st.reports,
+                origin=st.origin,
+                pin=st.pin(),
+            )
         st.executed += 1
-        if taints(spec):
+        session = (
+            name == ASK_CLAUDE.name
+            and isinstance(done, CallResult)
+            and (done.data or {}).get("session") is True
+        )  # BR-11: a Claude brain turn records its own taint with its answer
+        if taints(spec) and not session:
             if not st.tainted or st.hops:
                 with spans("runner.brain.taint", tool=name, extension=spec.extension):
                     pass
@@ -1094,6 +1127,10 @@ class BrainRunner(LocalRunner):
             st.calls.append(call)
             said = data.get("text")
             reply = said if isinstance(said, str) and said else "Looking into it…"
+            if isinstance(after := data.get("after"), str):  # BR-11: others are ahead
+                reply = f"{reply} ({flat(after, 120)})"
+            if session:
+                st.meta["claude_session"] = True
             st.meta.update(route="claude", handoff="ask", ack="tool")
             meta = dict(st.meta)
             answer = Answer(reply, "ask", used_tools(st.calls), escalate=True, meta=meta)

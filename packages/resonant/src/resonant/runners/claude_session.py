@@ -1,0 +1,529 @@
+"""The Claude brain (BR-11): one long-lived ``claude`` session that answers the owner's hard
+texts, one user message per text (docs/brain-plan.md, BR-11 as built).
+
+Before BR-11 every hand-off was its own ``claude -p`` (``runners/ask.py``); now an owner's
+hand-off with Resonant's tools is a *turn* of this session. The ask task stays what it was
+(the queue entry, the bridge, the approvals, the reply and the history note); only where the
+answer comes from changes. :class:`ClaudeSession` owns the process and its stdin; the ask
+runner owns everything a turn decides.
+
+**The process** is RC-1's live machinery (``runners/live.py``): ``claude -p
+--input-format stream-json --output-format stream-json`` with stdin kept open, the ask's
+read-only built-ins under ``--restricted``, ``dontAsk`` and the same allow, deny and read
+rules (``runners.ask.session_argv``), and Resonant's MCP server. Each turn is one ``user``
+line; its end is the ``result`` line. Nothing is written mid-turn.
+
+**The MCP server lives as long as the session** (the relay Claude Code started holds its
+socket and token), and each turn binds its own ``ClaudeTools`` to it for that turn only
+(``ask_tools.McpServer``), so a call is always that turn's task, principal, trace and origin.
+
+**Serial.** :meth:`turn` holds ``lock``: one turn at a time, in one process. The ask runner
+keeps the queue (``AskRunner`` orders the waiting turns).
+
+**Lifecycle.**
+
+- Started lazily by the first turn. The session id is kv ``SESSION_KV``; once a turn has
+  been written (a ``result`` came back) the next start, after a daemon restart, is
+  ``--resume <id>``. A resume that doesn't take (the process ends before answering) and any
+  fresh start begin a new id with the **primer**: a short summary from Resonant's own
+  history (``brain.history.primer``: the fold's rules, so never Claude's text or anything a
+  tainted turn wrote), prepended to that turn's message.
+- **Health**: before every turn the process must be alive and its reader running, else it
+  restarts. A turn past ``turn_timeout_s`` is a hang: the session is killed and the next turn
+  starts fresh. A crash mid-turn (the process ends with no ``result``) restarts it fresh; the
+  turn is tried once more there only if no change reached the gate (``may_retry``), so a
+  change never runs twice.
+- **Rotate**: after ``rotate_turns`` turns or ``rotate_hours`` the next turn starts a fresh
+  session (primed), a backstop to Claude Code's auto-compaction.
+- **Ends** the RC-1 way (:meth:`stop`): Remote Control off (best effort), stdin closed, a
+  short wait, then the process group reaped. ``/kill`` (a pause hook) stops it; so does
+  daemon shutdown (:meth:`aclose`, the id kept for a resume). The process's pid, start time
+  and marker are in kv, so one a crashed daemon left is reaped before the next start.
+
+**Remote Control** (``claude_session.remote_control``, default off): the RC-1 control
+request goes first; the claude.ai URL (validated, ``live.session_url``) is kept in kv for
+/status and the dashboard, and cleared when the session ends.
+
+**Taint across turns** (``inherited_hops`` / ``record``): the session remembers the last
+turn's taint hops (kv). The next turn starts tainted only while that is within
+``MAX_TAINT_HOPS`` (BR-10b's rule), so taint lifts after the hop window however long the
+session lives; a fresh session (primed from clean records) starts clean.
+
+Message bodies are PII: logs and spans carry ids, counts and states, never text.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import signal
+import sqlite3
+import time
+import uuid
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Literal, cast
+
+import psutil
+
+from resonant import killswitch
+from resonant.brain.history import MAX_TAINT_HOPS
+from resonant.config import ClaudeSessionConfig
+from resonant.runners import reaper
+from resonant.runners.ask_tools import McpServer
+from resonant.runners.claude import read_lines
+from resonant.runners.live import RC_TIMEOUT_S, ControlReply, LiveInput, session_url
+from resonant.runners.reaper import MARKER_ENV, Target
+from resonant.store.audit import audit
+from resonant.store.claude_brain import SESSION_KV, session_state, status_of
+from resonant.store.db import atomic, iso, kv_set, utcnow
+
+log = logging.getLogger(__name__)
+
+END_WAIT_S = 3.0  # after stdin closes, before the group is reaped
+POLL_S = 0.25
+
+Status = Literal["answered", "crashed", "timeout", "killed", "refused"]
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """How a turn ended: ``answered`` (``result`` is the final stream-json ``result``, which
+    may still be an error or a usage limit), ``crashed`` (the process ended first),
+    ``timeout``, ``killed`` (the kill switch) or ``refused`` (the init check said no:
+    ``refusal``). ``fresh``: the turn ran in a new session (primed)."""
+
+    status: Status
+    result: dict[str, Any] | None = None
+    refusal: str | None = None
+    fresh: bool = False
+    retried: bool = False
+
+
+Argv = Callable[[str, bool], list[str]]  # (session id, resume) -> argv
+Observe = Callable[[dict[str, Any]], None]
+InitCheck = Callable[[Sequence[str]], str | None]
+
+
+class ClaudeSession:
+    """The Claude brain's process. Public: :meth:`turn`, :meth:`stop`, :meth:`aclose`,
+    :meth:`inherited_hops`, :meth:`record`, ``server`` and ``busy``."""
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        cfg: ClaudeSessionConfig,
+        cwd: Path,
+        server: McpServer,
+        clock: Callable[[], datetime] = utcnow,
+        poll_s: float = POLL_S,
+        kill_grace_s: float = 2.0,
+        rc_timeout_s: float = RC_TIMEOUT_S,
+        end_wait_s: float = END_WAIT_S,
+    ) -> None:
+        self.conn = conn
+        self.cfg = cfg
+        self.cwd = cwd
+        self.server = server
+        self.clock = clock
+        self.poll_s = poll_s
+        self.kill_grace_s = kill_grace_s
+        self.rc_timeout_s = rc_timeout_s
+        self.end_wait_s = end_wait_s
+        self.lock = asyncio.Lock()  # one turn at a time
+        self.proc: asyncio.subprocess.Process | None = None
+        self.live: LiveInput | None = None
+        self.target: Target | None = None
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._exited: asyncio.Task[int] | None = None
+        self._result: asyncio.Future[dict[str, Any]] | None = None
+        self._observe: Observe | None = None
+        self._check: InitCheck | None = None
+        self._refusal: str | None = None
+        self._output = False  # the process wrote anything (a resume that took)
+        self._stopping: asyncio.Task[None] | None = None
+        self._unhook: Callable[[], None] | None = None
+
+    # -- state --
+
+    @property
+    def busy(self) -> bool:
+        return self.lock.locked()
+
+    def alive(self) -> bool:
+        if self.proc is None or self.proc.returncode is not None:
+            return False
+        return self._exited is not None and not self._exited.done()
+
+    def _save(self, **update: Any) -> dict[str, Any]:
+        st = session_state(self.conn)
+        st.update(update)
+        st = {k: v for k, v in st.items() if v is not None}
+        with atomic(self.conn):
+            kv_set(self.conn, SESSION_KV, st)
+        return st
+
+    def _forget(self) -> None:
+        """No resume: the next start is a new session (primed). The taint chain goes with
+        it: the primer holds only clean records."""
+        with atomic(self.conn):
+            kv_set(self.conn, SESSION_KV, {})
+
+    def inherited_hops(self) -> int | None:
+        """The hops a turn starts tainted with from the session's earlier turns, or None
+        (clean): the last turn was tainted ``h`` turns from outside content, and ``h <
+        MAX_TAINT_HOPS``: this one is ``h + 1``. Lifts after the hop window."""
+        hops = session_state(self.conn).get("hops")
+        if not isinstance(hops, int) or isinstance(hops, bool) or hops < 0:
+            return None
+        return hops + 1 if hops < MAX_TAINT_HOPS else None
+
+    def record(self, hops: int | None) -> None:
+        """A turn's taint (None: clean), for the next one."""
+        if not session_state(self.conn).get("session_id"):
+            return
+        if hops is not None:
+            self._save(hops=hops)
+        else:
+            self._drop("hops")
+
+    def _drop(self, key: str) -> None:
+        st = session_state(self.conn)
+        if key in st:
+            st.pop(key)
+            with atomic(self.conn):
+                kv_set(self.conn, SESSION_KV, st)
+
+    def _rotate_due(self, st: dict[str, Any]) -> bool:
+        turns = st.get("turns")
+        if isinstance(turns, int) and turns >= self.cfg.rotate_turns:
+            return True
+        started = st.get("started_at")
+        if isinstance(started, str):
+            try:
+                at = datetime.fromisoformat(started)
+            except ValueError:
+                return True
+            return self.clock() - at >= timedelta(hours=self.cfg.rotate_hours)
+        return False
+
+    # -- a turn --
+
+    async def turn(
+        self,
+        *,
+        argv: Argv,
+        env: dict[str, str],
+        message: str,
+        primer: Callable[[], str],
+        observe: Observe,
+        check_init: InitCheck,
+        paused: Callable[[], bool],
+        may_retry: Callable[[], bool],
+        started: Callable[[], None] | None = None,
+    ) -> TurnOutcome:
+        """One owner message into the session (started, resumed or rotated first as
+        needed): wait for its ``result``. ``primer`` is prepended in a new session.
+        ``may_retry``: whether a crash may be retried in a fresh session (no change ran).
+        ``started`` runs once the message is written."""
+        async with self.lock:
+            fresh = await self._ready(argv, env)
+            out = await self._exchange(message, primer, fresh, observe, check_init, paused,
+                                       started)  # fmt: skip
+            if out.status == "crashed" and not paused() and may_retry():
+                log.warning("claude brain: the session ended mid-turn; retrying fresh")
+                await self._kill()
+                self._forget()
+                fresh = await self._ready(argv, env)
+                out = await self._exchange(message, primer, fresh, observe, check_init, paused,
+                                           None)  # fmt: skip
+                out = TurnOutcome(out.status, out.result, out.refusal, out.fresh, retried=True)
+            if out.status in ("crashed", "timeout", "refused"):
+                await self._kill()
+                self._forget()  # the next turn starts fresh, with the primer
+            return out
+
+    async def _ready(self, argv: Argv, env: dict[str, str]) -> bool:
+        """A live process for the next turn; True when it is a new session (prime it)."""
+        st = session_state(self.conn)
+        if self.alive():
+            if not self._rotate_due(st):
+                return False
+            log.info("claude brain: rotating the session", extra={"turns": st.get("turns")})
+            await self.stop(keep=False)
+            st = {}
+        await self._reap_left(st)
+        resume = (
+            isinstance(st.get("session_id"), str)
+            and st.get("written") is True
+            and not self._rotate_due(st)
+        )
+        if resume:
+            sid = str(st["session_id"])
+            ok = await self._spawn(argv(sid, True), env, sid)
+            if ok and await self._resumed():
+                return False
+            log.warning("claude brain: the resume didn't take; starting a new session")
+            await self._kill()
+        sid = str(uuid.uuid4())
+        with atomic(self.conn):
+            kv_set(self.conn, SESSION_KV, {"session_id": sid, "started_at": iso(self.clock()),
+                                           "turns": 0})  # fmt: skip
+        await self._spawn(argv(sid, False), env, sid)
+        return True
+
+    async def _resumed(self) -> bool:
+        """A resumed process that is still up a moment after starting took the session (a
+        bad id makes the CLI exit at once)."""
+        exited = self._exited
+        if exited is None:
+            return False
+        done, _ = await asyncio.wait({exited}, timeout=min(1.0, self.end_wait_s))
+        return not done
+
+    async def _spawn(self, argv: list[str], env: dict[str, str], sid: str) -> bool:
+        self.cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = f"brain-{sid}"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=self.cwd,
+                env={**env, MARKER_ENV: marker},
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as e:
+            log.warning("claude brain: couldn't start (%s)", e.strerror)
+            return False
+        try:
+            created: float | None = psutil.Process(proc.pid).create_time()
+        except psutil.Error:
+            created = None
+        assert proc.stdin and proc.stdout and proc.stderr
+        self.proc = proc
+        self.target = Target(proc.pid, proc.pid, created, marker=marker)
+        self.live = LiveInput(proc.stdin)
+        self._output = False
+        self._refusal = None
+        self._exited = asyncio.ensure_future(proc.wait())
+        self._track(self._pump_out(proc, self.live))
+        self._track(self._pump_err(proc))
+        self._save(pid=proc.pid, created=created, marker=marker, remote_url=None)
+        if self._unhook is None:
+            self._unhook = killswitch.add_pause_hook(self._on_pause)
+        with atomic(self.conn):
+            audit(self.conn, "brain.session_start", session=sid[:8], pid=proc.pid)
+        if self.cfg.remote_control:
+            async with self.live.lock:  # first, as the CLI expects it (RC-1)
+                self.live.remote = True
+                ask = await self.live.control({"subtype": "remote_control", "enabled": True})
+            if ask is not None:
+                self._track(self._remote(self.live, ask))
+        return True
+
+    async def _exchange(
+        self,
+        message: str,
+        primer: Callable[[], str],
+        fresh: bool,
+        observe: Observe,
+        check_init: InitCheck,
+        paused: Callable[[], bool],
+        started: Callable[[], None] | None,
+    ) -> TurnOutcome:
+        live, exited = self.live, self._exited
+        if not self.alive() or live is None or exited is None:
+            return TurnOutcome("crashed", fresh=fresh)
+        if fresh and (context := primer()):
+            message = f"{context}\n\n{message}"
+        loop = asyncio.get_running_loop()
+        result: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._result, self._observe, self._check = result, observe, check_init
+        begun = time.monotonic()
+        try:
+            async with live.lock:
+                wrote = await live.write_user(message)
+            if not wrote:
+                return TurnOutcome("crashed", fresh=fresh)
+            if started is not None:
+                started()
+            while True:
+                done, _ = await asyncio.wait({result, exited}, timeout=self.poll_s)
+                if result in done or result.done():
+                    break
+                if paused():  # first: a /kill ends the process, which is not a crash
+                    await self.stop(keep=True)
+                    return TurnOutcome("killed", fresh=fresh)
+                if self._refusal is not None:
+                    return TurnOutcome("refused", refusal=self._refusal, fresh=fresh)
+                if done:  # the process ended with no result
+                    return TurnOutcome("crashed", fresh=fresh)
+                if self.target is not None:
+                    reaper.sample(self.target)
+                if time.monotonic() - begun >= self.cfg.turn_timeout_s:
+                    log.warning("claude brain: turn timed out; killing the session")
+                    return TurnOutcome("timeout", fresh=fresh)
+        except asyncio.CancelledError:
+            self._kill_now()  # the step was cancelled mid-turn: never leave it answering
+            raise
+        finally:
+            self._result, self._observe, self._check = None, None, None
+        res = result.result()
+        turns: Any = session_state(self.conn).get("turns")
+        self._save(turns=(turns if isinstance(turns, int) else 0) + 1, written=True)
+        return TurnOutcome("answered", result=res, fresh=fresh)
+
+    # -- the process's output --
+
+    def _track(self, coro: Any) -> None:
+        job = asyncio.ensure_future(coro)
+        self._tasks.add(job)
+        job.add_done_callback(self._tasks.discard)
+
+    async def _pump_out(self, proc: asyncio.subprocess.Process, live: LiveInput) -> None:
+        assert proc.stdout
+        async for raw, truncated in read_lines(proc.stdout):
+            if truncated or not raw.startswith(b"{"):
+                continue
+            try:
+                msg: Any = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            m = cast(dict[str, Any], msg)
+            self._output = True
+            if live.feed(m):
+                continue
+            kind = m.get("type")
+            if kind == "system" and m.get("subtype") == "init":
+                tools = m.get("tools")
+                names = [t for t in cast(list[Any], tools) if isinstance(t, str)] if (
+                    isinstance(tools, list)) else []  # fmt: skip
+                check = self._check
+                if check is not None and self._refusal is None:
+                    self._refusal = check(names)
+                continue
+            if self._observe is not None:
+                self._observe(m)
+            if kind == "result" and self._result is not None and not self._result.done():
+                self._result.set_result(m)
+
+    async def _pump_err(self, proc: asyncio.subprocess.Process) -> None:
+        assert proc.stderr
+        async for _raw, _truncated in read_lines(proc.stderr, 8192):
+            pass  # drained, never logged: it can quote what Claude read
+
+    async def _remote(self, live: LiveInput, ask: asyncio.Future[ControlReply]) -> None:
+        """The Remote Control answer (RC-1): a valid URL is kept for /status and the
+        dashboard; an error or no answer leaves the session going without it."""
+        reply = await live.reply(ask, self.rc_timeout_s)
+        url = session_url(reply) if reply is not None and reply.ok else None
+        if url is None:
+            live.remote = False  # nothing to turn off at the end
+        if live is not self.live:
+            return  # that process is gone
+        self._save(remote_url=url)
+        with atomic(self.conn):
+            audit(self.conn, "brain.session_remote", ok=url is not None)
+
+    # -- ending --
+
+    def _on_pause(self, conn: sqlite3.Connection, paused: bool) -> None:
+        """``/kill``: stop the session (a turn in flight sees the pause itself)."""
+        if paused and self.alive() and self._stopping is None:
+            with contextlib.suppress(RuntimeError):  # no running loop: nothing to stop
+                self._track(self.stop(keep=True))
+
+    async def stop(self, *, keep: bool = True) -> None:
+        """End the session the RC-1 way: Remote Control off, stdin closed, then the group
+        reaped after ``end_wait_s``. ``keep``: the id stays for a later ``--resume``."""
+        if self._stopping is not None:
+            await asyncio.shield(self._stopping)
+            return
+        self._stopping = asyncio.ensure_future(self._stop())
+        try:
+            await asyncio.shield(self._stopping)
+        finally:
+            self._stopping = None
+        if not keep:
+            self._forget()
+
+    async def _stop(self) -> None:
+        live, exited = self.live, self._exited
+        if live is not None:
+            await live.end(rc_timeout=min(self.rc_timeout_s, 3.0))
+        if exited is not None and not exited.done():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(exited), self.end_wait_s)
+        await self._kill()
+
+    async def _kill(self) -> None:
+        """The process group gone now (reaped), the readers finished, kv cleared of it."""
+        proc, target, live = self.proc, self.target, self.live
+        self.proc = self.target = self.live = None
+        if live is not None:
+            live.close()
+        if target is not None:
+            await reaper.reap(target, grace_s=self.kill_grace_s)
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), 5)
+        exited, self._exited = self._exited, None
+        if exited is not None:
+            exited.cancel()
+        jobs = list(self._tasks)
+        if jobs:
+            _, pending = await asyncio.wait(jobs, timeout=5)
+            for j in pending:
+                j.cancel()
+        if session_state(self.conn):
+            self._save(pid=None, created=None, marker=None, remote_url=None)
+
+    def _kill_now(self) -> None:
+        """Synchronous kill (a cancelled step): the group is signalled; reaping and the kv
+        follow on the next start (``_reap_left``)."""
+        proc, live = self.proc, self.live
+        if live is not None:
+            live.close()
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+
+    async def _reap_left(self, st: dict[str, Any]) -> None:
+        """A session process a crashed daemon (or a cancelled step) left: end it first."""
+        pid, created, marker = st.get("pid"), st.get("created"), st.get("marker")
+        if not isinstance(pid, int):
+            return
+        if self.proc is not None and self.proc.pid == pid:
+            await self._kill()
+            return
+        target = Target(pid, pid, float(created) if isinstance(created, (int, float)) else None,
+                        marker=marker if isinstance(marker, str) else None)  # fmt: skip
+        await reaper.reap(target, grace_s=self.kill_grace_s)
+        self._save(pid=None, created=None, marker=None, remote_url=None)
+        log.warning("claude brain: reaped a session left behind")
+
+    async def aclose(self) -> None:
+        """Daemon shutdown: end the session (the id is kept for a resume), the server too."""
+        if self._unhook is not None:
+            self._unhook()
+            self._unhook = None
+        if self.alive():
+            await self.stop(keep=True)
+        else:
+            await self._kill()
+        await self.server.aclose()
+
+
+__all__ = ["SESSION_KV", "ClaudeSession", "TurnOutcome", "session_state", "status_of"]

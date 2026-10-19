@@ -114,7 +114,8 @@ pulse:
 #                                       #   over a per-task MCP bridge, every call through the gate;
 #                                       #   false: those asks are read-only, as in BR-5
 #     concurrency: 1                    # sessions at once, apart from the worker slots
-#     daily_cap: 30                     # asks a day; with route: triage every handed-over turn counts
+#     daily_cap: 0                      # messages to Claude a day (brain turns, asks, media, watch
+#                                       #   checks); 0: none (BR-11). Hit: you're told once, qwen answers
 #     timeout_s: 120
 #     max_turns: 15
 #     reply_max_chars: 1500
@@ -124,6 +125,15 @@ pulse:
 #       email: [mcp__claude_ai_Gmail__search_threads, mcp__claude_ai_Gmail__get_thread]
 #     draft_tools: [mcp__claude_ai_Gmail__create_draft]
 #     attachment_roots: [~/Library/Messages/Attachments]
+#   claude_session:                     # BR-11: the Claude brain, one long-lived session for your hard
+#                                       #   texts (stream-json, read-only built-ins + Resonant's tools)
+#     enabled: true                     # false: a separate claude -p per hard text (BR-10)
+#     remote_control: false             # true: a Remote Control link on /status and the dashboard
+#     rotate_turns: 50                  # a fresh session (primed from Resonant's history) after this
+#     rotate_hours: 12                  #   many turns or hours (Claude Code also auto-compacts)
+#     turn_timeout_s: 240               # a turn past this is a hang: killed, the next starts fresh
+#     queue_max: 3                      # hard texts waiting behind the one in flight
+#     max_per_hour: 60                  # runaway guard over every message to Claude; 0: off
 #   # BR-7: media, watches, proactive notices (docs/brain-plan.md D10)
 #   whisper_path: null                  # a local whisper.cpp whisper-cli (absolute) for voice notes;
 #                                       #   null: a voice note gets "type it instead" (Claude takes no audio)

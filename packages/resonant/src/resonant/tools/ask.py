@@ -5,6 +5,8 @@ D8, ``runners/ask.py``).
 at once with ``{"queued": true, "task_id", "text": "Looking into it…"}``; the answer reaches
 the requester as its own message when Claude is done. A refusal (off, paused, usage limit,
 daily cap, a bad attachment) is a normal result, ``{"queued": false, "text": <why>}``.
+BR-11: a turn of the Claude brain adds ``"session": true`` and, when others are ahead of it,
+``"after"`` (``after "why is R4 slow", then this``); a full queue is ``"busy": true``.
 
 - ``kind``: ``general`` (default), ``research``, ``email``, ``calendar``, ``image``, ``link``.
   Only ``email`` and ``calendar`` asks get connector tools, and only their read tools.
@@ -28,6 +30,7 @@ whoever the calling task belongs to. Its answer is untrusted, so the spec is
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from resonant.executor import CallContext, ContextHandler, ToolFailed, ToolHandler
@@ -39,6 +42,11 @@ if TYPE_CHECKING:
     from resonant.runners.ask import AskRefused, Kind, Queued
 
 RUNNER = "ask"
+# BR-11: the calling brain turn's taint hops (BR-10b), set by the brain around its
+# ask_claude call (the executor's handler runs in a copy of that context). A Claude brain
+# turn is tainted as many hops from outside content as the turn that asked, so the
+# chain can't sustain itself. None: not set (or the turn is clean).
+ASKING_HOPS: ContextVar[int | None] = ContextVar("asking_hops", default=None)
 BRAIN_RUNNER = "brain"  # runners.brain.NAME
 QUESTION_MAX = 4000  # runners.ask.QUESTION_MAX (a test checks they agree)
 ATTACH_MAX = 4  # runners.ask.ATTACH_MAX
@@ -93,6 +101,7 @@ class AskApi(Protocol):
         trace_id: str | None = None,
         tools: bool = False,
         tainted: bool = False,
+        taint_hops: int | None = None,
     ) -> Queued | AskRefused: ...
 
 
@@ -157,11 +166,22 @@ class AskClaude(ContextHandler):
             trace_id=trace_id,
             tools=tools,
             tainted=tainted,
+            taint_hops=ASKING_HOPS.get() if tainted else None,
         )
         task_id: object = getattr(result, "task_id", None)
         if isinstance(task_id, str):
-            return {"queued": True, "task_id": task_id, "kind": kind, "text": result.text}
-        return {"queued": False, "text": result.text}
+            out: dict[str, Any] = {"queued": True, "task_id": task_id, "kind": kind,
+                                   "text": result.text}  # fmt: skip
+            if getattr(result, "session", False) is True:  # BR-11: a Claude brain turn
+                out["session"] = True
+                after: object = getattr(result, "after", None)
+                if isinstance(after, str):
+                    out["after"] = after
+            return out
+        refused: dict[str, Any] = {"queued": False, "text": result.text}
+        if getattr(result, "busy", False) is True:  # BR-11: the Claude brain's queue is full
+            refused["busy"] = True
+        return refused
 
 
 def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:

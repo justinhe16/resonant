@@ -80,6 +80,43 @@
       "title": "Approvals",
       "type": "object"
     },
+    "ClaudeBrain": {
+      "additionalProperties": false,
+      "description": "BR-11: the Claude brain's session (local tier only, like the rest of the claude\ndetails): up or down, its turns, and its Remote Control link while one is on.",
+      "properties": {
+        "remote_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Remote Url",
+          "x-tier": "local"
+        },
+        "state": {
+          "enum": [
+            "up",
+            "down"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "turns": {
+          "title": "Turns",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "state",
+        "turns"
+      ],
+      "title": "ClaudeBrain",
+      "type": "object"
+    },
     "Extension": {
       "additionalProperties": false,
       "properties": {
@@ -724,6 +761,18 @@
       ],
       "title": "Autonomy",
       "type": "string"
+    },
+    "claude_brain": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClaudeBrain"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "x-tier": "local"
     },
     "dry_run": {
       "title": "Dry Run",

@@ -130,7 +130,8 @@ def daemon_status(state: DaemonState) -> dict[str, Any]:
         last_tick=state.loop.last_tick,
         inflight=state.loop.inflight,
     )
-    keys = ("version", "uptime_s", "last_tick", "inflight", "dry_run", "autonomy", "paused", "runs")
+    keys = ("version", "uptime_s", "last_tick", "inflight", "dry_run", "autonomy", "paused", "runs",
+            "claude_brain")  # fmt: skip
     return {k: s[k] for k in keys}
 
 

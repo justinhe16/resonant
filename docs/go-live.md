@@ -143,7 +143,7 @@ Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:3
 Since BR-10 the local model's first call on each chat turn decides who answers it (`brain.route: triage`, the default). Easy turns (a status, a note or reminder, one obvious lookup, small talk) stay local: ~1–5 s, free. Everything else goes to Claude: an ack goes out first (~1 s warm, ~4–5 s on a cold prompt), then Claude's answer in ~5–20 s, longer when it uses tools. Claude now has Resonant's tools (runs, PRs, notes, reminders, logs, extensions…) through the same gate, approvals and trust rules as the local model; its own tools stay read-only, and it never sends email or changes calendar events.
 
 - **Knobs** (`~/.resonant/config.yaml`, then `resonant restart`): `brain.route` (`triage` | `local` | `claude`), `brain.triage.bias` (`normal`, or `claude` to keep only status, notes, reminders and small talk local), `brain.triage.timeout_s` (8: past it the turn goes to Claude with a canned ack), `brain.ask_claude.resonant_tools` (true).
-- **Usage.** Every handed-over turn is one `ask_claude` on your Claude subscription and counts against `brain.ask_claude.daily_cap` (30 a day). With triage that can run out on a busy day: past the cap the local model answers instead (no error). Raise the cap if you hit it and your plan's usage limits allow; when Claude hits a usage limit, asks pause until it resets and the local model answers meanwhile.
+- **Usage.** Every handed-over turn is one message to Claude on your Claude subscription. Since BR-11 there is no daily cap by default (`brain.ask_claude.daily_cap: 0`; set a number to have one) and a runaway guard of 60 messages an hour (`brain.claude_session.max_per_hour`). Past either, you get one text saying so and the local model answers until midnight or the next hour. When Claude hits a usage limit you get one text (`Hit the Claude usage limit; answering locally until it resets at …`), the local model answers meanwhile, and Claude comes back on its own after the reset.
 - **How to go back.** `brain: {route: local}` restores the BR-9 behavior (Claude only when the loop asks or gets stuck). `brain: {ask_claude: {resonant_tools: false}}` keeps triage but makes Claude read-only again, as in BR-5. Both take effect after `resonant restart`.
 - **Over iMessage** (the phone test list for BR-10; check `/approvals` and the replies):
   1. "what's R4 doing" or "remind me in 10 minutes to stretch": answered locally, no ack, a few seconds.
@@ -154,6 +154,18 @@ Since BR-10 the local model's first call on each chat turn decides who answers i
   6. A follow-up after (2): "and who merged it?": the local model or Claude answers using Claude's earlier answer.
   7. `/kill`, then a turn triage would hand over: no Claude session starts (asks are refused while paused) and nothing changes; `/resume` after.
   8. From a member's phone (if you have one): no ack and no Claude; the local loop answers as before.
+
+### The Claude brain: one long-lived session (BR-11)
+
+Since BR-11 the hard texts above all go to **one** Claude session that stays up (the "Claude brain"): it remembers the conversation itself, so a follow-up doesn't have to restate things, and it skips a cold start per text. It still has only the read-only built-ins plus Resonant's tools through the gate; nothing about approvals changes. It starts on the first hard text after a restart (resuming the same conversation when it can), restarts itself after a crash or a hang (primed with a short summary from Resonant's own records), and starts a fresh one after 50 turns or 12 hours. One text at a time: a second hard text while one is in flight gets an ack like `on it, checking (after "why is R4 slow", then this)`, and past 3 waiting you're told it's busy.
+
+- **Knobs** (`~/.resonant/config.yaml`, then `resonant restart`): `brain.claude_session: {enabled: true, remote_control: false, rotate_turns: 50, rotate_hours: 12, turn_timeout_s: 240, queue_max: 3, max_per_hour: 60}`. `enabled: false` goes back to a separate `claude -p` per hard text (BR-10). `remote_control: true` asks the session for a Remote Control link when it starts: `/status` and the dashboard's Overview show it (`Claude brain: up · N turns · Remote Control: https://claude.ai/code/…`), so you can open the same conversation in the Claude app.
+- **Over iMessage** (BR-11 phone tests, after the BR-10 list):
+  1. "why is R4 slow?", then "and how do I fix it?": two acks and two `Claude: …` answers; the second clearly knows the first. `/status` shows `Claude brain: up · 2 turns`.
+  2. Two hard texts back to back: the second ack says `(after "…", then this)`; the answers come in order.
+  3. `resonant restart`, then a follow-up: the answer still knows the earlier question (the session resumed).
+  4. `/kill`: `/status` shows `Claude brain: down`; `/resume`, then a hard text: it starts again.
+  5. Optional, with `remote_control: true`: the link on `/status` opens the session in the Claude app.
 
 ## 10. Remote dashboard access
 

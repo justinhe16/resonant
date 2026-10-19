@@ -129,13 +129,25 @@ def test_local_only_fields_are_marked() -> None:
     # The §3 local-only fields, so a rename can't silently move one to the remote tier.
     marked = {
         (m.__name__, f)
-        for m in (Snapshot, HealthRow, Runs, RunItem, Approvals, Questions, Pulse, Runner)
+        for m in (
+            Snapshot,
+            HealthRow,
+            Runs,
+            RunItem,
+            Approvals,
+            Questions,
+            Pulse,
+            Runner,
+            snap.ClaudeBrain,
+        )
         for f in m.model_fields
         if snap.is_local_only(m, f)
     }
     assert marked == {
         ("Snapshot", "trust_rules"),
         ("Snapshot", "repos"),
+        ("Snapshot", "claude_brain"),  # BR-11
+        ("ClaudeBrain", "remote_url"),
         ("HealthRow", "reason"),
         ("Runs", "items"),
         ("RunItem", "remote_url"),
