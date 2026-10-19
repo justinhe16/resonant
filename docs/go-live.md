@@ -40,6 +40,26 @@ FileVault disables auto-login. After a power loss or a crash reboot, the Mini wa
 - **Verify:** `fdesetup status`, `defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates`, `pmset -g | grep -E ' sleep|autorestart'` and `pmset -g assertions | grep caffeinate`
 - **Expected:** `FileVault is On.`, `0`, `sleep 0` and `autorestart 1`, and caffeinate holding `PreventSystemSleep` / `PreventUserIdleSystemSleep`. `--check` shows `keep-awake  PASS` (advisory). If the key doesn't exist, check System Settings directly. `--check` shows `FileVault  PASS  on`. Confirm the UPS by pulling its wall plug for a few seconds: the Mini stays on.
 
+### Backups of the store (BK-1)
+
+The daemon backs `~/.resonant/resonant.db` up every day at 03:30 (`backup.daily_at`, your timezone) to `~/.resonant/backups/daily/resonant-YYYY-MM-DD.db`. It keeps the newest 7 copies plus the newest 4 Sunday ones, and runs while paused. Each copy is made with SQLite's backup API and checked before it replaces anything, so a bad copy never pushes out a good one. Nothing is texted on success. After 36h with no good copy you get one `hey, some issues here: backup: no successful backup in 37h …` and later a `resolved: backup is healthy again`. Copies you made yourself (for example before a migration) are never pruned, wherever they are.
+
+- **Optional, a second disk:** create a folder on another disk (or in iCloud Drive), then tell Claude to set `backup.extra_dir: /Volumes/<disk>/resonant` and restart. Resonant never creates that folder, so an unplugged disk shows up as `backup  DEGRADED … extra copy failing: extra_dir does not exist (disk not mounted?)` within 36h instead of silently writing to the boot disk. An iCloud Drive folder is uploaded by macOS, not by Resonant. The copy holds your messages, tasks and approvals, so pick a place you trust. Use a folder of its own: retention deletes old `resonant-YYYY-MM-DD.db` files there too.
+- **Verify:** `resonant backup now`, then `resonant backup list` and `resonant status`.
+- **Expected:** `backup ok: …/backups/daily/resonant-<today>.db (<size>, integrity ok, <n> ms)`; `list` shows that file; `status` shows `backup      <time> (0h ago)` and, once the health monitor has run, `backup  ok`. `ls -ld ~/.resonant/backups/daily` shows `drwx------`, and the file `-rw-------`.
+
+#### Restoring the store
+
+Only if the store is damaged or a bad change has to be undone. Everything since the backup (tasks, approvals, runs, kv state) is lost.
+
+1. Pick a copy: `resonant backup list`.
+2. Stop the daemon so launchd doesn't restart it: `resonant daemon uninstall --no-ollama --no-keep-awake`. `resonant status` shows `daemon  DOWN (launchd: False)`. `resonant backup restore` refuses while the daemon's API answers or its LaunchAgent is loaded, and prints these steps.
+3. Restore: `resonant backup restore ~/.resonant/backups/daily/resonant-<date>.db`. It checks the file (integrity, a Resonant store, a schema this code knows), asks, saves the current store to `~/.resonant/backups/pre-restore/` (never pruned; the raw files in a folder if the store is too damaged to copy), and restores. Expected: `<file>: integrity ok, schema v<n>`, `the old store was saved to …`, `restored …`, `the restored store is PAUSED …`.
+4. Start it again: `resonant daemon install`. An older copy is migrated on start.
+5. Check: `resonant status` (`daemon  up`, `autonomy off  (PAUSED)`) and `scripts/bootstrap.sh --check`, then text `/status`. When it looks right, text `/resume` (or `resonant resume`): the restored store always starts paused, because the copy's own kill-switch state may be older than your last `/kill`.
+
+- **Rollback:** restore the `pre-restore` copy the same way.
+
 ## 3. Resonant's Apple ID
 
 Resonant has its own Apple ID so that it can text you, and you can text it.
@@ -261,7 +281,7 @@ Codes (`A7`, `D7`), times, pins, PR numbers and counts below are examples.
 6. **Watch.** `/ext run github/watch` → `github/watch: done: 3 PRs watched, 5 events` (CI events plus one `pr_active` per open PR). Nothing arrives: the watch never texts on its own (GH-2), and the first run after install is a baseline, so PRs that were already quiet or merged aren't announced by the rollup either.
 7. **CI goes red, quietly.** Push a commit that fails CI to a scratch PR. No text. "any of my PRs failing CI?" → the scratch PR with its failing check. Merge another PR of yours: the next top of the hour, `btw:` / `Workers:` / `Merged: resonant#40 <title>`. Leave a PR untouched for 4 hours: once, `Looks like resonant#41 <title> (~4h quiet) got dropped. You should take a look.`
 8. **A text for one repo, then mute.** "text me right away when CI fails in resonant" → `Rule added: text right away on ci_failed in resonant (rule N).`. Break CI again: within about 10 minutes, once, `[github] ✗ resonant#41 CI failed (<workflow>)`. `/ext mute github 1h` → `Muted github until 3:45pm.`; break it again: nothing arrives, then or later. `/ext mute github off` → `Unmuted github.`, and `/rules forget N`.
-9. **Briefing.** `/ext run core/briefing` → the briefing (one line per section with something in it, e.g. `▶ 1 running, 1 waiting (approval)`, or `Nothing on today.`), then `Briefing sent.`. The next morning it arrives by itself at 08:00, with the 07:50 github summary under `Updates:` (`[github] 3 open PRs, 1 failing CI, 2 awaiting your review`).
+9. **Briefing.** `/ext run core/briefing` → the briefing (one line per section with something in it, e.g. `▶ 1 running, 1 waiting (approval)`, or one short line such as `Morning. Nothing for today.`), then `Briefing sent.`. The next morning it arrives by itself at 08:00, with the 07:50 github summary under `Updates:` (`[github] 3 open PRs, 1 failing CI, 2 awaiting your review`).
 10. **Kill switch.** `/kill` → `kill switch engaged`. Due jobs are skipped: `sqlite3 ~/.resonant/resonant.db "SELECT at, extension, tool FROM audit_log WHERE action = 'job.skipped_paused' ORDER BY id DESC LIMIT 3"` shows the next `job_watch`. Any extension process still running is killed (`job.killed`), and no notifications or briefing are sent. `/ext run github/watch` → `Paused: nothing runs until /resume.`. `/resume` → `resumed: autonomy on, unpaused`; the skipped runs are not caught up, and the next `watch` runs on time.
 11. **Tamper.** On the Mini: `chmod u+w ~/.resonant/extensions/github/README.md && echo x >> ~/.resonant/extensions/github/README.md`, then `/restart resonant`. After `Back up …` you get, once: `github changed on disk since you approved it; disabled. resonant ext update github to review`. `/ext list` shows `github · disabled_tampered · …`, and `/github prs` no longer exists. In the terminal, `resonant ext update github` shows the changed file and the full review; type `github`. `Back up …` / `Updated github`, and `/ext list` shows it `enabled` again.
 
@@ -319,7 +339,7 @@ Times, codes and figures below are examples.
 
 ### What to expect
 
-- Urgent items text immediately at any hour, at most 20 an hour per extension. Normal items go out in one `btw:` message at the top of each hour, never between 00:00 and 06:00 (the 06:00 pulse carries what was held), and never in the 08:00 hour (the briefing covers it). The briefing always sends, even as `Nothing on today.`.
+- Urgent items text immediately at any hour, at most 20 an hour per extension. Normal items go out in one `btw:` message at the top of each hour, never between 00:00 and 06:00 (the 06:00 pulse carries what was held), and never in the 08:00 hour (the briefing covers it). The briefing always sends, even as one short line (`Morning. Nothing for today.`).
 - An item the owner has heard is not told again until its state changes (`A`, `B`, `A` is three tellings).
 - An approval asked between :30 and :50 past an hour and still waiting at the top of the hour is mentioned once in that `btw:` (re-mentions need it 10 minutes old, and approvals expire after 30). Others expire before a pulse sees them.
 

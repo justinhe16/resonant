@@ -10,7 +10,7 @@ GitHub for Resonant: your open pull requests with CI and review state, a quiet w
 | `rerun_failed {repo, number}` | tool | L3 | Re-runs the failed jobs of each workflow whose latest run on the PR's head failed. |
 | `merge_pr {repo, number, head_sha}` | tool | L2, commit | Squash-merges the PR if its head is still `head_sha`. Runs when you ask for it; otherwise asks a plain yes. |
 | `watch` | job, every 10 min | L0 | Emits `ci_failed`, `ci_fixed`, `review_requested`, `pr_active`, `pr_merged` and `pr_closed` events. None of them texts on its own (GH-2): the hourly rollup reads them. |
-| `digest` | job, 07:50 | L0 | Reports the pulse item `github/summary` (`3 open PRs, 1 failing CI, 2 awaiting your review`, urgency `low`, state = the three counts). It shows under the briefing's Updates once per change and never texts on its own. Needs the manifest's `report: {max_urgency: low}` grant. |
+| `digest` | job, 07:50 | L0 | Reports the pulse item `github/summary` (`3 open PRs, 1 failing CI, 2 awaiting your review`, urgency `low`, state = the three counts). It shows under the briefing's Updates once per change and never texts on its own. When all three counts are 0 it is reported `quiet` (BF-1), so the briefing leaves it out instead of saying `0 open PRs, 0 failing CI, 0 awaiting your review`. Needs the manifest's `report: {max_urgency: low}` grant. |
 | health | every 30 min | | `gh api user` succeeds. |
 
 ## Token
@@ -40,7 +40,7 @@ Optional: `~/.resonant/ext-data/github/config.json`.
 The manifest has no `notify:` block, so nothing this extension emits texts you right away. Instead:
 - The hourly pulse's `Workers:` section is a progress rollup (`resonant/extensions/rollup.py`): `Merged: … dori#40 fix login`, `Looks like dori#41 cache layer (~5h quiet) got dropped. You should take a look.`, `Review requested: app#9 bump deps`, and your recently active PRs under `Still working on:`. Each merge, review request and stall is said once; a stall again only after new activity and a new quiet stretch (`pulse.stall_after`, default `4h`). A PR that was already quiet when you installed the extension (or when you updated to this version) is never announced, nor is a draft. If `watch` hasn't succeeded in the last 30 minutes (expired token, `gh` gone, paused), the rollup says nothing about which PRs are active or quiet rather than guess.
 - CI is on demand: `/github prs`, "any of my PRs failing CI?", `show PR 40 in justinhe16/resonant`.
-- The 08:00 briefing still has the `github/summary` line.
+- The 08:00 briefing still has the `github/summary` line, except when every count is 0 (then it is left out). After updating to the BF-1 version, run `resonant ext update github` so the installed copy reports the all-zero summary as quiet.
 
 To get a text again for one kind of event, teach a trust rule: "text me right away when CI fails in resonant" makes a `notify_now` rule with action `ci_failed` and scope `resonant` (the repo's registered name, its `owner/name` or its name), or scope `github` for every repo. Only a rule naming the event type counts: a `*` action never wakes these events. "just put dori's CI fixes in the digest" (`notify_digest`) does the reverse for a type that texts. `/rules` lists them and `/rules forget <n>` removes one. After updating to this version, run `resonant ext update github` on the Mini (it re-pins the new manifest).
 

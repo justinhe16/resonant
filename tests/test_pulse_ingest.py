@@ -99,10 +99,13 @@ def report(
     clear: bool = False,
     ttl: str = "24h",
     baseline: bool = False,
+    quiet: bool | None = None,
     seq: list[int] = [0],  # noqa: B006 - unique dedupe keys across calls
 ) -> None:
     seq[0] += 1
     data = {"key": key, "urgency": urgency, "state": state, "clear": clear, "ttl": ttl}
+    if quiet is not None:  # None: an extension older than BF-1 (no field)
+        data["quiet"] = quiet
     with transaction(db):
         persist_events(
             db,
@@ -165,6 +168,7 @@ def item(db: sqlite3.Connection, key: str = "dori/inc-1") -> items.Item:
         ({"key": "a", "urgency": "urgent", "ttl": "forever"}, "ttl"),
         ({"key": "a", "urgency": "urgent", "ttl": "99999h"}, "ttl"),
         ({"key": "a", "urgency": "urgent", "clear": "yes"}, "clear"),
+        ({"key": "a", "urgency": "urgent", "quiet": 1}, "quiet"),
         ({"key": 5, "urgency": "urgent"}, "key"),
         (None, "key"),
     ],
@@ -523,3 +527,36 @@ async def test_clamped_clear_of_urgent_waits_and_never_told_clear_sends(
     report(db, "dori/b", "recovered", urgency="urgent", clear=True)
     await make_loop(db, make_pulse(db, ch)).run_once()
     assert ch.texts == ["[dori] \u2713 recovered"]
+
+
+# --- quiet (BF-1) ------------------------------------------------------------------------
+
+
+async def test_quiet_is_closed_without_a_word_at_any_urgency(db: sqlite3.Connection) -> None:
+    ch = DedupeChannel()
+    pulse = make_pulse(db, ch)
+    report(db, "dori/inc-1", "Dori failing")  # told at once (urgent)
+    await make_loop(db, pulse).run_once()
+    assert ch.texts == ["[dori] \U0001f534 Dori failing"]
+    report(db, "dori/inc-1", "no incidents", quiet=True)  # an urgent item going quiet: no ✓
+    report(db, "dori/n", "0 open", urgency="normal", quiet=True)
+    await make_loop(db, pulse).run_once()
+    assert len(ch.sent) == 1
+    for key in ("dori/inc-1", "dori/n"):
+        assert item(db, key).cleared and not item(db, key).changed
+    assert items.pending(db, items.URGENCIES, T0) == []
+    assert items.open_items(db, T0) == []
+    assert all("quiet" in r["detail"] for r in audit_rows(db, "pulse.held"))
+    # Something to say again: news, and texted (urgent).
+    report(db, "dori/inc-1", "Dori failing again")
+    await make_loop(db, pulse).run_once()
+    assert ch.texts[-1] == "[dori] \U0001f534 Dori failing again"
+
+
+async def test_without_the_quiet_field_a_report_is_as_before(db: sqlite3.Connection) -> None:
+    ch = DedupeChannel()
+    report(db, "dori/n", "0 open", urgency="normal")
+    report(db, "dori/m", "0 open", urgency="normal", quiet=False)
+    await make_loop(db, make_pulse(db, ch)).run_once()
+    assert ch.sent == [] and audit_rows(db, "pulse.held") == []
+    assert {i.key for i in items.pending(db, ("normal",), T0)} == {"dori/n", "dori/m"}

@@ -343,6 +343,40 @@ class BriefingConfig(_Section):
         return time(int(hour), int(minute))
 
 
+class BackupConfig(_Section):
+    """The daily store backup (``core/backup``, BK-1): an online SQLite backup to
+    ``<home>/backups/daily/resonant-YYYY-MM-DD.db``, checked, then renamed into place."""
+
+    enabled: bool = True
+    # Local time in `settings.timezone`, 24-hour "HH:MM". A quiet hour.
+    daily_at: str = "03:30"
+    # Retention: the newest `keep_daily` copies plus the newest `keep_weekly` Sunday copies.
+    keep_daily: int = Field(default=7, ge=1, le=366)
+    keep_weekly: int = Field(default=4, ge=0, le=104)
+    # Optional second copy (another disk, an iCloud Drive folder). The directory must
+    # already exist: Resonant never creates it (an unmounted disk would otherwise end up
+    # as a folder on the boot disk). Same names and retention. Never uploaded by Resonant.
+    extra_dir: Path | None = None
+    # No successful backup for this long: the `backup` health check degrades and alerts.
+    alert_after_hours: int = Field(default=36, ge=25, le=24 * 14)
+
+    @field_validator("daily_at")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        if not _HHMM.fullmatch(v):
+            raise ValueError('backup.daily_at must be 24-hour "HH:MM", e.g. "03:30"')
+        return v
+
+    @field_validator("extra_dir")
+    @classmethod
+    def _extra(cls, v: Path | None) -> Path | None:
+        return None if v is None else _absolute(v.expanduser(), "backup.extra_dir")
+
+    @property
+    def local_time(self) -> time:
+        return _hhmm_time(self.daily_at)
+
+
 _QUIET_HOURS = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
 
 
@@ -893,6 +927,7 @@ class Settings(BaseSettings):
     extensions: ExtensionsConfig = ExtensionsConfig()
     secrets: SecretsConfig = SecretsConfig()
     briefing: BriefingConfig = BriefingConfig()
+    backup: BackupConfig = BackupConfig()
     pulse: PulseConfig = PulseConfig()
     runner: RunnerConfig = RunnerConfig()
     trust: TrustConfig = TrustConfig()
@@ -915,6 +950,11 @@ class Settings(BaseSettings):
     @property
     def db_path(self) -> Path:
         return self.home / "resonant.db"
+
+    @property
+    def backups_dir(self) -> Path:
+        """Store backups (BK-1): ``daily/`` and ``pre-restore/``."""
+        return self.home / "backups"
 
     @property
     def logs_dir(self) -> Path:

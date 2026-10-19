@@ -82,6 +82,16 @@ briefing:
   enabled: true                         # the daily briefing to the owner (core/briefing)
   at: "08:00"                           # local time in `timezone`, 24-hour HH:MM
 
+backup:
+  enabled: true                         # the daily store backup (core/backup); runs while paused too
+  daily_at: "03:30"                     # local time in `timezone`, 24-hour HH:MM (a quiet hour)
+  keep_daily: 7                         # the newest N copies in ~/.resonant/backups/daily/
+  keep_weekly: 4                        # plus the newest N Sunday copies
+  alert_after_hours: 36                 # no good copy this long: the `backup` health check alerts once
+  # extra_dir: /Volumes/Backup/resonant # optional second copy (another disk, an iCloud Drive folder);
+  #                                     #   must already exist, never created; Resonant never uploads;
+  #                                     #   use a folder of its own (old copies there are pruned too)
+
 pulse:
   enabled: true                         # hourly "btw" messages and urgent interrupts
   quiet_hours: "00:00-06:00"            # local time in `timezone`; only urgent items go out inside it

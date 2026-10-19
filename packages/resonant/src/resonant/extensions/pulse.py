@@ -25,6 +25,14 @@ For one event, in order:
    with the reason, and the hourly pulse carries it.
 5. Normal and low items are only stored: pending for the hourly pulse and the briefing.
 
+A ``quiet`` report (``data.quiet: true``, BF-1) says there is nothing worth saying (every
+count is 0, an empty digest): the item is stored cleared and marked told at once, so it drops
+out of the briefing's Updates and the hourly pulse without a word (audit ``pulse.held``
+``reason=quiet``), whatever its urgency. The next report that isn't quiet opens it again as
+news. A report without the field (an extension older than BF-1) is not quiet. A quiet report
+also replaces an earlier report of the same key that the owner never heard (an urgent one held
+while paused, say): the extension's latest word is that there is nothing to say.
+
 A report whose stored row is newer than the event (``updated_at`` > ``occurred_at``: a
 retry of an older report after a later one was routed) is stale: audit ``pulse.stale``, no
 upsert, no send. Rows are stamped with the event's ``occurred_at`` for this reason.
@@ -147,10 +155,11 @@ class Pulse:
         if stored is None:
             self._audit("pulse.stale", ext, event, reason="newer report already stored")
             return None
-        item, urgency = stored
-        if event.payload.get("baseline") is True:
+        item, urgency, quiet = stored
+        if quiet or event.payload.get("baseline") is True:
             items.mark_told(self.conn, [item], now)
-            self._audit("pulse.held", ext, event, reason="baseline", key=item.key)
+            reason = "quiet" if quiet else "baseline"
+            self._audit("pulse.held", ext, event, reason=reason, key=item.key)
             return None
         if urgency != "urgent" or not item.changed:
             return None  # normal and low wait for the pulse; the owner already heard this one
@@ -186,27 +195,33 @@ class Pulse:
 
     def _store(
         self, ext: str, event: Event, grant: items.Urgency
-    ) -> tuple[items.Item, items.Urgency] | None:
+    ) -> tuple[items.Item, items.Urgency, bool] | None:
         """Validate and upsert the report; ``ValueError`` for a bad one, None for a stale
-        one (the stored row is newer than this event: a retry of an older report)."""
+        one (the stored row is newer than this event: a retry of an older report). The bool
+        is ``quiet``: the item was stored cleared, for the caller to mark told unsaid."""
         text: object = event.payload.get("text")
         raw: object = event.payload.get("data")
         data = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
         key, urgency = data.get("key"), data.get("urgency", "normal")
         clear = data.get("clear", False)
+        quiet = data.get("quiet", False)
         if not isinstance(key, str):
             raise ValueError("key must be a string")
         if urgency not in items.URGENCIES:
             raise ValueError(f"urgency must be one of {items.URGENCIES}")
         if not isinstance(clear, bool):
             raise ValueError("clear must be true or false")
+        if not isinstance(quiet, bool):
+            raise ValueError("quiet must be true or false")
         if not isinstance(text, str):
             raise ValueError("title must be a string")
         title = clean_text(text)
         before = items.get(self.conn, ext, key)
         if before is not None and before.updated_at > event.occurred_at:
             return None
-        if clear and before is not None and before.urgency == "urgent":
+        if quiet:
+            clear = True  # closed without a word: out of every listing once marked told
+        elif clear and before is not None and before.urgency == "urgent":
             urgency = "urgent"  # the all-clear for an urgent thing is immediate too
         granted = clamp(urgency, grant)
         _change, item = items.upsert(
@@ -220,7 +235,7 @@ class Pulse:
             _ttl_s(data.get("ttl")),
             event.occurred_at,
         )
-        return item, granted
+        return item, granted, quiet
 
     def _audit(self, action: str, ext: str, event: Event, **detail: Any) -> None:
         with atomic(self.conn):
