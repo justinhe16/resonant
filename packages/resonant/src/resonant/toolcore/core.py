@@ -50,7 +50,7 @@ import jsonschema
 
 from resonant.executor import NotAllowedError, ToolResult, idempotency_key
 from resonant.gate import Allow, ApprovalBatch, Decision, Deny, DryRun, Intent, NeedsApproval
-from resonant.gate.policy import APPROVAL_USED, batch_line
+from resonant.gate.policy import APPROVAL_USED, batch_line, widens_trust
 from resonant.gate.types import Origin
 from resonant.loop.types import StepContext
 from resonant.models import SpanFactory
@@ -487,8 +487,9 @@ class ToolCore:
         if len(items) >= limit:
             self.batch_gate.drop([decision.approval_id], reason="batch_cap")
             return Refused("capped", batch_capped_reply(limit), True, intent, decision)
-        item = BatchItem(pinned, decision.approval_id, batch_line(decision.summary),
-                         scope.origin == "tainted")  # fmt: skip
+        line = batch_line(decision.summary, offered=decision.allow_always,
+                          widens=widens_trust(pinned.tool, pinned.extension))  # fmt: skip
+        item = BatchItem(pinned, decision.approval_id, line, scope.origin == "tainted")
         cp = dict(scope.checkpoint)
         if scope.steps is not None:
             # ``call`` (an earlier allowed call, done by now) gives way to the batch.

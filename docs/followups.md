@@ -518,6 +518,7 @@ TC-1 put every tool call on `resonant/toolcore/`, except one: the scheduler's in
 - **`allow_tools` reads the registry twice.** The prompt and the saved rules both come from the loaded extensions; an extension update between them (owner-only, at the Mini) could change the set. The report line lists exactly what was saved.
 - **A capped change isn't asked.** Past `gate.batch_max` (10) a change is refused (`at most 10 changes can wait on one yes`), and past `MAX_SIDE_EFFECTS` (5) unasked ones are refused even when the next one would only have asked. Either could join the batch instead.
 - **The kill switch only blocks on `paused`.** An approved batch runs with autonomy off but not paused (the gate asks for everything, and the owner said yes); `/kill` sets both.
+- **Other approval lists show batch members as rows.** `resonant approvals` marks each row of a batch (`[batch of 4: decides all]`), and approving any row approves all of them; the dashboard snapshot (`pending_all`) still lists the members without that mark. The briefing and the pulse re-mention show a batch once, by its code (`approvals.answerable`).
 
 ## BR-9 carry-overs: what changed lately
 

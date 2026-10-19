@@ -1157,6 +1157,9 @@ class AskRunner:
             cp.pop("call", None)
             if not pending:
                 cp.pop("batch", None)  # never prompted: nothing waits
+                gate = self.caller.batch_gate if self.caller is not None else None
+                if bridge.asked and gate is not None:  # no answer: drop what it asked about
+                    gate.drop([i.approval_id for i in bridge.asked], reason="no_answer")
         status, text, result = outcome
         if status == "usage_limit" and result is not None:
             hit = usage_limit(result)

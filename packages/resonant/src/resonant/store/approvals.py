@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Literal, cast
 
@@ -552,6 +552,31 @@ def batches_of(conn: sqlite3.Connection, approval_ids: Sequence[str]) -> dict[st
         tuple(approval_ids),
     ).fetchall()
     return {r["member"]: _row_to_batch(r) for r in rows}
+
+
+def answerable(conn: sqlite3.Connection, principal: str, now: datetime) -> list[Approval]:
+    """``pending_for`` with a batch (BA-1) once, as its first approval with the summary ``N
+    changes: …`` (its code is the batch's), and a batch asked of someone else left out. For
+    reminders (the pulse, the briefing): codes that bind."""
+    rows = pending_for(conn, principal, now)
+    index = batches_of(conn, [a.id for a in rows])
+    by_id = {a.id: a for a in rows}
+    out: list[Approval] = []
+    seen: set[str] = set()
+    for a in rows:
+        batch = index.get(a.id)
+        if batch is None:
+            out.append(a)
+            continue
+        if batch.id in seen or batch.principal != principal:
+            continue
+        seen.add(batch.id)
+        members = [by_id[i] for i in batch.approval_ids if i in by_id]
+        if len(members) != len(batch.approval_ids):
+            continue
+        summary = f"{len(members)} changes: " + "; ".join(m.summary for m in members)
+        out.append(replace(members[0], summary=summary))
+    return out
 
 
 def mark_batch_used(conn: sqlite3.Connection, batch_id: str, now: datetime) -> bool:

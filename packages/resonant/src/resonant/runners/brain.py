@@ -98,7 +98,7 @@ from resonant.config import Settings
 from resonant.gate.types import NeedsApproval, Origin
 from resonant.gateway.channel import Channel
 from resonant.loop.slots import SlotPool
-from resonant.loop.types import Done, StepContext, StepOutcome, Task
+from resonant.loop.types import Done, Fail, StepContext, StepOutcome, Task
 from resonant.models import (
     ChatMessage,
     ModelClient,
@@ -708,6 +708,10 @@ class BrainRunner(LocalRunner):
                        hops=st.hops):  # fmt: skip
                 pass
         result = await self._route(task, principal, text, st, ctx, spans)
+        gate = self.core.batch_gate
+        if st.batch and isinstance(result, Fail) and not result.retryable and gate is not None:
+            # the turn failed for good before asking: nothing can bind what it pinned
+            gate.drop([i.approval_id for i in st.batch], reason="turn_ended")
         if st.batch and isinstance(result, Answer):
             # BA-1: changes wait on the owner: one prompt for all of them, then the task waits.
             # The model's own words give way to the code-built lines (what ran, why it

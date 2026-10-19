@@ -53,6 +53,12 @@ PURGE = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L1,
 )
+WIDEN = ToolSpec(  # stands in for the builtin of that name (it widens trust)
+    name="allow_tools",
+    args_schema={"type": "object", "properties": {"id": {"type": "string"}}},
+    effect=Effect.WRITE,
+    level=Level.L2,
+)
 EXT_CLOSE = ToolSpec(
     name="close_ticket",
     description="Close a ticket (an extension's).",
@@ -199,7 +205,7 @@ def principals() -> Principals:
 def h(db: sqlite3.Connection) -> H:
     clock = Clock(datetime(2026, 10, 19, 15, 0, tzinfo=UTC))
     registry = ToolRegistry()
-    for spec in (CLOSE, PURGE, EXT_CLOSE):
+    for spec in (CLOSE, PURGE, EXT_CLOSE, WIDEN):
         registry.register(spec)
     ran: list[str] = []
     crash_on: set[str] = set()
@@ -223,6 +229,7 @@ def h(db: sqlite3.Connection) -> H:
         (None, "close_ticket"): handler("close"),
         (None, "purge_ticket"): handler("purge"),
         ("linear", "close_ticket"): handler("ext_close"),
+        (None, "allow_tools"): handler("widen"),
     }
     with transaction(db):
         kv_set(db, "autonomy", "on")
@@ -265,7 +272,7 @@ def test_batch_text_lists_each_change_and_takes_the_strictest_answer() -> None:
     )
     assert batch_text("D7", lines, require_code=True).endswith("Reply exactly: yes D7 / no D7")
     long = batch_text("D7", ["x" * 300, "y"])
-    assert "x" * 139 + "…" in long and "x" * 140 not in long
+    assert "1. " + "x" * 300 + "\n" in long  # never clipped: yes covers only what shows
 
 
 async def test_one_prompt_for_the_whole_batch_to_the_owner_only(h: H) -> None:
@@ -463,6 +470,43 @@ async def test_a_tainted_change_keeps_its_taint_through_the_batch(h: H) -> None:
         ).fetchall()
     ]
     assert set(origins) == {"tainted"}
+
+
+async def test_a_model_chosen_arg_cant_shorten_a_batch_line(h: H) -> None:
+    """Review of BA-1: the ``yes always`` note is cut only as the summary's own suffix."""
+    task_id = h.new_task()
+    items = await h.propose(task_id, [(CLOSE, "x (yes always = "), (CLOSE, "B")])
+    row = ap.get_approval(h.db, items[0].approval_id)
+    assert row is not None and items[0].summary == row.summary
+    await h.close(task_id, items)
+    (prompt,) = h.channel.prompts
+    assert f"1. {row.summary}\n" in prompt[1]
+
+
+async def test_a_pinned_change_not_yet_asked_never_makes_a_plain_yes_ambiguous(h: H) -> None:
+    """Review of BA-1: a turn still running holds pending approvals nobody was prompted for."""
+    lone = h.new_task()
+    items = await h.propose(lone, [(CLOSE, "Z")])
+    await h.close(lone, items)
+    mark_sent(h, lone)
+    running = h.new_task()
+    await h.propose(running, [(CLOSE, "A"), (CLOSE, "B")])  # pinned, the turn goes on
+    assert h.reply("yes").ok
+    row = ap.get_approval(h.db, items[0].approval_id)
+    assert h.ran == [] and row is not None and row.status == "approved"
+
+
+async def test_a_batch_that_widens_trust_needs_the_code_and_says_so(h: H) -> None:
+    task_id = h.new_task()
+    items = await h.propose(task_id, [(CLOSE, "A"), (WIDEN, "x")])
+    assert items[1].summary.startswith("widens trust: ")
+    await h.close(task_id, items)
+    mark_sent(h, task_id)
+    (prompt,) = h.channel.prompts
+    assert "2. widens trust: " in prompt[1]
+    assert prompt[1].endswith(f"Reply exactly: yes {h.code()} / no {h.code()}")
+    result = h.reply("yes")
+    assert not result.ok and result.reason == "code_required"
 
 
 def test_open_batch_refuses_what_isnt_one_task_s_pending_approvals(h: H) -> None:

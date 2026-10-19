@@ -92,9 +92,6 @@ def approval_text(
     return f"[{code}] {summary}? Reply yes / no"
 
 
-BATCH_LINE_CHARS = 140  # one change in a batch prompt
-
-
 def batch_text(
     code: str,
     lines: Sequence[str],
@@ -102,17 +99,16 @@ def batch_text(
     require_code: bool = False,
     destructive: bool = False,
 ) -> str:
-    """One prompt for a batch of changes (BA-1): a numbered line per change (each a code-built
-    summary, clipped), then one answer for all of them. The batch takes its strictest
-    change's level: ``destructive`` (an L1 write) or ``require_code`` (L1, pay) means only
-    ``yes <code>`` approves.
+    """One prompt for a batch of changes (BA-1): a numbered line per change, then one answer
+    for all of them. Lines are never clipped: each is the whole code-built summary a lone
+    prompt would show (already bounded: at most 3 args, each clipped and marked), so a yes
+    covers only what the owner saw. The batch takes its strictest change's level:
+    ``destructive`` (an L1 write) or ``require_code`` (L1, pay, or a change that widens trust)
+    means only ``yes <code>`` approves.
 
     ``[D7] 4 changes, all or none:\\n1. linear: save issue id="RES-12" …\\n…\\nReply yes / no``
     """
-    shown = [
-        f"{i}. {line if len(line) <= BATCH_LINE_CHARS else line[: BATCH_LINE_CHARS - 1] + '…'}"
-        for i, line in enumerate(lines, 1)
-    ]
+    shown = [f"{i}. {line}" for i, line in enumerate(lines, 1)]
     head = f"[{code}] {len(lines)} changes, all or none:"
     if destructive:
         tail = f"Some can't be undone. Reply yes {code} / no"

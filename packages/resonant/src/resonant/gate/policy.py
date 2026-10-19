@@ -683,15 +683,18 @@ class PolicyGate:
         )
         if not mine:
             return None, "nothing_pending"  # also what a non-approver always gets
+        # A plain reply is judged among the prompts the actor got: an approval pinned in a turn
+        # that hasn't asked yet (BA-1) can't be answered and mustn't make it ambiguous.
+        prompted = [u for u in mine if u.head.sent_at(reply.actor) is not None]
         if reply.code is not None:
             code = reply.code.upper()
             target = next((u for u in mine if u.code == code), None)
             if target is None:
                 return None, "unknown_code"
-        elif len(mine) > 1:
+        elif len(prompted) > 1 or (not prompted and len(mine) > 1):
             return None, "ambiguous"
         else:
-            target = mine[0]
+            target = prompted[0] if prompted else mine[0]
         if not all(_sent_before(m, reply) for m in target.members):
             return None, "not_sent_before"
         if reply.always and (
@@ -738,10 +741,27 @@ def _strictest(levels: Sequence[Level]) -> Level:
     return min(levels, key=order.index)
 
 
-def batch_line(summary: str) -> str:
-    """An approval's summary as a batch line: without its ``yes always`` offer (a batch never
-    offers one)."""
-    return summary.split(ALWAYS_NOTE, 1)[0]
+# Builtins that widen trust (loosening asks the owner for that change): in a batch they are
+# marked, and the batch needs its code, so a plain yes never widens trust along with the rest.
+WIDENS_TRUST: frozenset[str] = frozenset({"allow_tools", "allow_trust_rule", "remove_trust_rule"})
+
+
+def widens_trust(tool: str, extension: str | None) -> bool:
+    return extension is None and tool in WIDENS_TRUST
+
+
+def batch_line(summary: str, *, offered: bool, widens: bool = False) -> str:
+    """An approval's summary as a batch line: without the ``yes always`` offer its prompt
+    would have carried (a batch never offers one). Only an approval that ``offered`` it has
+    one, as the summary's code-built suffix, so only that suffix is cut: model-chosen args can
+    never shorten the line. ``widens``: a trust-widening change, marked."""
+    if offered and summary.endswith(")") and ALWAYS_NOTE in summary:
+        summary = summary.rsplit(ALWAYS_NOTE, 1)[0]
+    return f"widens trust: {summary}" if widens else summary
+
+
+def _line(a: ap.Approval) -> str:
+    return batch_line(a.summary, offered=a.allow_always, widens=widens_trust(a.tool, a.extension))
 
 
 @dataclass(frozen=True)
@@ -761,6 +781,9 @@ class _Unit:
 
     @property
     def require_code(self) -> bool:
+        """Any approval needs its code, or (a batch) one of them widens trust."""
+        if self.batch is not None and any(widens_trust(m.tool, m.extension) for m in self.members):
+            return True
         return any(m.require_code for m in self.members)
 
     @property
@@ -789,9 +812,7 @@ class _Unit:
                 require_code=a.require_code,
                 expires_at=a.expires_at,
             )
-        summary = f"{len(self.members)} changes: " + "; ".join(
-            batch_line(m.summary) for m in self.members
-        )
+        summary = f"{len(self.members)} changes: " + "; ".join(_line(m) for m in self.members)
         if len(summary) > BATCH_SUMMARY_CHARS:
             summary = summary[: BATCH_SUMMARY_CHARS - 1].rstrip() + "…"
         return PendingApproval(
@@ -815,7 +836,7 @@ class _Unit:
             code=self.code or "",
             task_id=self.head.task_id or "",
             expires_at=min(m.expires_at for m in self.members),
-            lines=tuple(batch_line(m.summary) for m in self.members),
+            lines=tuple(_line(m) for m in self.members),
             require_code=self.require_code,
             destructive=self.destructive,
             level=self.level,

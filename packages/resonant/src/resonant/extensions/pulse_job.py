@@ -63,7 +63,7 @@ from resonant.executor import CallContext
 from resonant.extensions import notify, rollup
 from resonant.extensions.pulse import render_item
 from resonant.store import pulse as store
-from resonant.store.approvals import pending_for
+from resonant.store.approvals import answerable as pending_for  # BA-1: codes that bind
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.tools.projects import clip
 from resonant.tools.when import format_due

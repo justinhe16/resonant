@@ -110,7 +110,7 @@ from resonant.gate import (
     canonical_json,
 )
 from resonant.gate.codes import clean_external
-from resonant.gate.policy import batch_line
+from resonant.gate.policy import batch_line, widens_trust
 from resonant.gate.types import Origin
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import Done, Fail, StepContext, StepOutcome, Task, Wait
@@ -826,9 +826,10 @@ class LocalRunner:
         outcome = await self.core.resume(pinned, scope)
         if isinstance(outcome, Asked):
             if all(i.approval_id != outcome.decision.approval_id for i in items):
-                items.append(BatchItem(pinned, outcome.decision.approval_id,
-                                       batch_line(outcome.summary),
-                                       cp.get("tainted") is True))  # fmt: skip
+                d = outcome.decision
+                line = batch_line(d.summary, offered=d.allow_always,
+                                  widens=widens_trust(pinned.tool, pinned.extension))  # fmt: skip
+                items.append(BatchItem(pinned, d.approval_id, line, cp.get("tainted") is True))
             return None
         done = await self._gated(outcome, spans)
         if isinstance(done, Answer) and done.reply not in effects:

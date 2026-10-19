@@ -70,7 +70,7 @@ from resonant.extensions.pulse_job import (
 )
 from resonant.monitor import health_snapshot
 from resonant.store import pulse as pulse_store
-from resonant.store.approvals import pending_for
+from resonant.store.approvals import answerable as pending_for  # BA-1: codes that bind
 from resonant.store.db import kv_get, utcnow
 from resonant.tools.projects import clip, projects
 from resonant.tools.reminders import list_reminders
