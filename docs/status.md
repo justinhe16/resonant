@@ -51,7 +51,7 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 | Who | Tickets |
 |---|---|
 | Owner | PER-252 phone tests (incl. `resonant ext update github`), PER-253 mycelium by text, PER-265 design decisions (webhooks, worker text in the briefing, nudges, bare yes/no, `/update` trust) |
-| Build | PER-254 batch as one dashboard row, PER-255 `yes 1,3`, PER-256 retire intents, PER-259 store upkeep, PER-260 ops and inbound hardening, PER-261 approvals polish, PER-262 Claude session upkeep, PER-263 relay snapshot, PER-264 small gaps, PER-266 pulse wording |
+| Build | PER-254 batch as one dashboard row, PER-255 `yes 1,3`, PER-256 retire intents, PER-259 store upkeep, PER-260 ops and inbound hardening, PER-261 approvals polish, PER-262 Claude session upkeep, PER-263 relay snapshot, PER-264 small gaps, PER-266 pulse wording, PER-267 disk watchdog (in progress) |
 
 Order: 254 → 255 → 261 → 266, and 254 → 263. PER-264's turn budget lands after PER-256.
 
