@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import errno
 import fcntl
+import logging
 import os
 import re
 import stat
@@ -21,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, NamedTuple
 
+log = logging.getLogger(__name__)
 RUN_CODE = re.compile(r"R[1-9][0-9]*")
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 DAY_S = 86400.0
@@ -214,6 +216,7 @@ def free_bytes(path: Path) -> int | None:
 
 DiskLimit = Literal["cap", "free"]  # which one a watcher hit: its own cap or the volume's floor
 PARTIAL_CHECKS = 3  # partial counts in a row before ``on_partial`` is told (once)
+GROW_MIN = 1024 * 1024  # what counts as growing for the free-space floor (a log line doesn't)
 
 
 async def watch_disk(
@@ -234,13 +237,14 @@ async def watch_disk(
 
     - ``"cap"``: the counted bytes are over ``max_bytes`` (``value`` is the count). A partial
       count is never over on its own account, only by what it did count.
-    - ``"free"``: the volume has under ``min_free_bytes`` free and the count grew since the
-      last check (``value`` is the free bytes). A tree that isn't growing isn't what's
-      filling the disk, so it's left alone.
+    - ``"free"``: the volume has under ``min_free_bytes`` free and the count grew by at least
+      ``GROW_MIN`` since the last check (``value`` is the free bytes). A tree that isn't
+      growing isn't what's filling the disk, so it's left alone, and so is a jump that came
+      from a folder turning readable (the count went from partial to whole or back).
 
     A count that stays partial for ``PARTIAL_CHECKS`` checks in a row is passed to
     ``on_partial`` once."""
-    last = (await asyncio.to_thread(dir_size, path)).bytes
+    last = await asyncio.to_thread(dir_size, path)
     partial_runs = 0
     while True:
         await asyncio.sleep(interval_s)
@@ -248,7 +252,8 @@ async def watch_disk(
         if size.bytes > max_bytes:
             await on_exceeded("cap", size.bytes)
             return
-        grew, last = size.bytes > last, size.bytes
+        grew = size.bytes - last.bytes >= GROW_MIN and size.partial == last.partial
+        last = size
         if grew and min_free_bytes > 0:
             left = await asyncio.to_thread(free, path)
             if left is not None and left < min_free_bytes:
@@ -256,7 +261,10 @@ async def watch_disk(
                 return
         partial_runs = partial_runs + 1 if size.partial else 0
         if partial_runs == PARTIAL_CHECKS and on_partial is not None:
-            await on_partial(size)
+            try:
+                await on_partial(size)
+            except Exception:  # a failed note must not end the watch
+                log.warning("disk watchdog: partial note failed", exc_info=True)
 
 
 def delete_run_dir(work_dir: Path, code: str) -> bool:

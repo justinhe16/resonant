@@ -1096,7 +1096,10 @@ async def test_watch_disk_stops_only_a_growing_tree_on_a_full_disk(tmp_path: Pat
     task = watch()  # not growing: left alone, and the free space isn't even read
     await asyncio.sleep(0.15)
     assert seen == [] and frees == [] and not task.done()
-    (tmp_path / "g").write_bytes(b"x" * 100_000)
+    (tmp_path / "g").write_bytes(b"x" * 100_000)  # under GROW_MIN: not growing yet
+    await asyncio.sleep(0.15)
+    assert seen == [] and not task.done()
+    (tmp_path / "h").write_bytes(b"x" * cleanup_mod.GROW_MIN)
     await asyncio.wait_for(task, 5)
     assert seen == [("free", 1024**3)] and frees == [tmp_path]
 

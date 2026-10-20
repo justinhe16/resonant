@@ -563,9 +563,9 @@ def work(resumed: bool) -> bool:
         time.sleep(1.5)
         os.chmod(locked, 0o700)
     if scenario == "diskgrow":  # a little more every tick, well under any cap
-        for i in range(300):
+        for i in range(30):
             with open(os.path.join(tmp, f"grow{i}.bin"), "wb") as f:
-                f.write(b"\0" * 100_000)
+                f.write(b"\0" * 1_100_000)
             time.sleep(0.1)
 
     if args.sleep:
