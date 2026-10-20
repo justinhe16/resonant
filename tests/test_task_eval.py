@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -746,3 +747,127 @@ def test_the_linear_fixture_takes_the_args_the_real_extension_does() -> None:
     schemas = {s.name: s.args_schema for s in m.tool_specs()}
     assert schemas["list_issues"]["required"] == []
     assert schemas["save_issue"]["required"] == ["team", "title"]
+
+
+# --- PER-250: live Claude (the fake claude stands in; nothing reaches the real one) ----------
+
+
+def _fake_live(tmp_path: Path, answer: str) -> te.LiveClaude:
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"answer": answer}))
+
+    async def logged_in() -> bool:
+        return True
+
+    cmd = (sys.executable, "-I", str(te.FAKE_CLAUDE), "--script", str(plan))
+    return te.LiveClaude(cmd, tmp_path / "claude-home", login_check=logged_in)
+
+
+def test_live_claude_grades_the_hard_rows_answers(tmp_path: Path) -> None:
+    """``--route claude --live-claude``: only the hard rows, at most ``limit``, each handed to
+    a Claude brain session (here the fake claude, through the real ask runner, bridge and
+    gate) and graded on its answer, with the ack-to-answer latency and usage per row."""
+    lines: list[str] = []
+    errs: list[str] = []
+    code = te.run(
+        Settings(home=tmp_path / "owner"),
+        set_path=EXAMPLE_SET,
+        model_kind="scripted",
+        modes=["loop"],
+        repeat=1,
+        only=None,
+        as_json=True,
+        min_accuracy=0.85,
+        out_dir=tmp_path / "r",
+        echo=lines.append,
+        echo_err=errs.append,
+        route="claude",
+        live_claude=True,
+        limit=2,
+        claude=_fake_live(tmp_path, "Nothing on it tomorrow."),
+    )
+    assert code == te.EXIT_OK, lines
+    data = json.loads(lines[0])
+    assert data["meta"]["claude"] == "live" and data["meta"]["cases"] == 2
+    c = data["modes"]["loop"]["claude"]
+    assert c["n"] == 2 and c["accuracy"] == 1.0 and c["answer_ms"]["n"] == 2
+    assert c["tokens"]["input_tokens"] == 2400 and c["tokens"]["output_tokens"] == 160
+    assert [r["id"] for r in c["rows"]] == ["pa-calendar", "pa-email-draft"]
+    assert all(r["usage"]["turns"] == 1 for r in c["rows"])
+    assert any("first 2 of" in e for e in errs)
+    (saved,) = (tmp_path / "r").glob("task-*.json")
+    assert "Nothing on it" not in saved.read_text()  # the summary has no replies
+    assert not (tmp_path / "owner" / "resonant.db").exists()
+
+
+def test_live_claude_text_report_shows_answers_and_usage(tmp_path: Path) -> None:
+    row = {
+        "id": "hard",
+        "category": "triage",
+        "text": "why did the build break?",
+        "expect": {"route": "claude", "writes": [], "facts": ["lockfile"]},
+        "triage": {"handler": "claude", "kind": "general", "say": "looking"},
+    }
+    path = write_set(tmp_path / "s.jsonl", [row, {**row, "id": "easy", "expect": {}}])
+    lines: list[str] = []
+    code = te.run(
+        Settings(home=tmp_path / "owner"),
+        set_path=path,
+        model_kind="scripted",
+        modes=["loop"],
+        repeat=1,
+        only=None,
+        as_json=False,
+        min_accuracy=0.85,
+        out_dir=tmp_path / "r",
+        echo=lines.append,
+        echo_err=lambda _s: None,
+        route="claude",
+        live_claude=True,
+        claude=_fake_live(tmp_path, "The build broke on a stale cache."),
+    )
+    assert code == te.EXIT_BELOW_MIN  # the answer misses the fact
+    out = lines[0]
+    assert "claude live" in out and "answered 1" in out and "ack to answer" in out
+    assert "line   1 hard" in out and "fact[0]" in out and "stale cache" in out
+
+
+def test_live_claude_needs_route_claude_and_hard_rows(tmp_path: Path) -> None:
+    result = _invoke(
+        "--set", str(EXAMPLE_SET), "--live-claude", "--model", "scripted", "--out", str(tmp_path)
+    )
+    assert result.exit_code == 2 and "--route claude" in result.output
+    path = write_set(tmp_path / "s.jsonl", [{"id": "e", "category": "chat", "text": "hi"}])
+    result = _invoke(
+        "--set", str(path), "--route", "claude", "--live-claude", "--model", "scripted",
+        "--out", str(tmp_path),
+    )  # fmt: skip
+    assert result.exit_code == 2 and "route claude" in result.output
+
+
+def test_a_claude_answer_is_graded_without_the_handoff_tool() -> None:
+    """When Claude answered, the hand-off is the ``ask_claude`` a row expects; its other
+    tools, facts and asks are graded on what Claude did."""
+    e = Expect(tools=("ask_claude", "read_file|ask_claude", "tail_log"), facts=("canberra",))
+    handed = outcome(route="claude", claude_reply="Canberra.", called=["read_file", "tail_log"],
+                     claude_status="answered")  # fmt: skip
+    assert grade(case(e), handed) == []
+    assert grade(case(e), replace(handed, called=[])) == [
+        "missing_tool:read_file", "missing_tool:tail_log"
+    ]  # fmt: skip
+
+
+def test_a_claude_session_that_never_answered_is_its_own_failure() -> None:
+    e = Expect(tools=("tail_log",), facts=("canberra",))
+    timed = outcome(route="claude", claude_reply="Claude timed out.", claude_status="timeout")
+    assert grade(case(e), timed) == ["claude_failed:timeout"]
+    s = te.claude_answers([te.CaseResult(case(e), "loop", timed, grade(case(e), timed))])
+    assert s["failed"] == 1 and s["accuracy"] == 0.0
+
+
+def test_limit_takes_the_first_cases(tmp_path: Path) -> None:
+    result = _invoke(
+        "--model", "scripted", "--set", str(EXAMPLE_SET), "--limit", "3", "--json",
+        "--out", str(tmp_path),
+    )  # fmt: skip
+    assert json.loads(result.output)["meta"]["cases"] == 3

@@ -866,3 +866,18 @@ def test_tainted_task_may_still_ask(db: sqlite3.Connection) -> None:
     intent = Intent.for_tool(ask_tool.ASK_CLAUDE, task_id=task_id, principal="justin",
                              args={"question": "q"}, origin="tainted")  # fmt: skip
     assert isinstance(gate.evaluate(intent), Allow)
+
+
+def test_usage_of_keeps_token_counts_and_duration() -> None:
+    from resonant.runners.ask import usage_of
+
+    result = {
+        "usage": {"input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 5,
+                  "server_tool_use": {"web_search_requests": 1},
+                  "cache_creation_input_tokens": True},
+        "duration_ms": 900,
+    }  # fmt: skip
+    assert usage_of(result) == {
+        "input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 5, "duration_ms": 900
+    }  # fmt: skip
+    assert usage_of({"result": "hi"}) is None

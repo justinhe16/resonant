@@ -17,6 +17,7 @@ import pytest
 from resonant.config import LoopConfig
 from resonant.executor import Executor, HandlerKey, ToolHandler
 from resonant.gate import PendingApproval, PolicyGate
+from resonant.gate.codes import new_code
 from resonant.gate.replies import parse_reply
 from resonant.gateway.channel import (
     ApprovalPrompt,
@@ -543,8 +544,9 @@ async def test_approvals_lists_and_shows_full_args_to_the_owner(
         'Args: {\n "text": "vitamin d3 and zinc"\n}\n'
         f"Expires in 29m. Reply yes / no {code}"
     )
-    await h.say("/approvals Q9")
-    assert h.channel.replies()[-1] == "Nothing is waiting with code Q9."
+    other = new_code({code})  # a fixed "Q9" was this approval's own code 1 time in 95
+    await h.say(f"/approvals {other}")
+    assert h.channel.replies()[-1] == f"Nothing is waiting with code {other}."
     await h.say("/approvals 12")
     assert h.channel.replies()[-1] == "that's not an approval code. Usage: /approvals [code]"
 

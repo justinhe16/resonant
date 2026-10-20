@@ -7,6 +7,7 @@ import httpx
 
 from resonant.config import load_settings
 from resonant.daemon import Daemon
+from resonant.e2e import wait_until
 from resonant.tools.builtin import BUILTIN_SPECS
 
 
@@ -16,22 +17,21 @@ def free_port() -> int:
         return int(s.getsockname()[1])
 
 
-async def wait_healthy(port: int) -> httpx.Response:
-    async with httpx.AsyncClient() as client:
-        for _ in range(200):
-            try:
-                return await client.get(f"http://127.0.0.1:{port}/healthz")
-            except httpx.ConnectError:
-                await asyncio.sleep(0.02)
-    raise AssertionError("daemon never became healthy")
+async def wait_listening(daemon: Daemon, run: asyncio.Task[int]) -> None:
+    """Until the API socket listens (uvicorn's ``started``). Polling with ConnectError
+    retries gave up after a fixed 4s, which a loaded machine's startup could outlast."""
+    await wait_until(lambda: daemon.server.started or run.done(), 30)
+    if run.done():
+        raise AssertionError(f"daemon exited during startup: {run.result()!r}")
 
 
 async def test_daemon_serves_and_stops_cleanly() -> None:
     port = free_port()
     daemon = Daemon(load_settings(api={"port": port}))
     run = asyncio.create_task(daemon.run())
-    assert (await wait_healthy(port)).json() == {"ok": True}
+    await wait_listening(daemon, run)
     async with httpx.AsyncClient() as client:
+        assert (await client.get(f"http://127.0.0.1:{port}/healthz")).json() == {"ok": True}
         status = (await client.get(f"http://127.0.0.1:{port}/api/status")).json()
         tools = (await client.get(f"http://127.0.0.1:{port}/api/tools")).json()
     assert status["last_tick"] is not None

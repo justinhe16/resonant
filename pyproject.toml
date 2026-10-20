@@ -57,5 +57,8 @@ testpaths = ["tests", "relay/tests"]
 pythonpath = ["relay"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-markers = ["integration: needs a real external system (Ollama, Messages.app); run with -m integration"]
+markers = [
+    "integration: needs a real external system (Ollama, Messages.app); run with -m integration",
+    "wall_clock_jobs: the Daemon keeps its core jobs on the real clock (tests/conftest.py)",
+]
 addopts = "-m 'not integration'"
