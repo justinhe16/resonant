@@ -164,8 +164,8 @@ START_RUN = ToolSpec(
 LIST_RUNS = ToolSpec(
     name="list_runs",
     description=(
-        "Claude runs, active ones first: code, repo, status and PR. Give `code` for one run. "
-        "Read only."
+        "Claude runs, active ones first: code, name (code and repo), status, ask and PR. "
+        "Give `code` for one run. Read only."
     ),
     args_schema={
         "type": "object",
@@ -363,9 +363,11 @@ def _clip(text: str | None, limit: int) -> str | None:
 def run_json(run: Run, question: str | None = None) -> dict[str, Any]:
     """One run for the model and the reply templates. The ask is the owner's own text; the
     summary and failure can carry Claude's or a command's output, so they are cleaned, and
-    so is the run's open ``question`` (the worker's words)."""
+    so is the run's open ``question`` (the worker's words). ``name`` is the run as the owner
+    knows it, its code with its repo (PER-249: replies name it that way, not by code alone)."""
     return {
         "code": run.code,
+        "name": f"{run.code} ({_clip(run.repo, REPO_MAX) or 'no repo'})",
         "repo": run.repo,
         "status": run.status,
         "ask": _clip(run.ask, ASK_SHOWN),
@@ -397,7 +399,7 @@ def pick_run(recent: list[Run], repo: str | None) -> Run | str:
         return active[0]
     if not active:
         return recent[0]
-    named = ", ".join(f"{r.code} {r.repo or 'no repo'}" for r in active[:5])
+    named = ", ".join(f"{r.code} ({r.repo or 'no repo'})" for r in active[:5])
     return f"Which run? {named}."
 
 

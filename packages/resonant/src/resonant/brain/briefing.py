@@ -12,10 +12,11 @@ Owner briefing, in order (empty sections are left out):
 - ``Resonant <version>, up 3h 12m.`` plus the flags that aren't the default (dry run,
   paused, autonomy off) and the Claude slots in use.
 - ``Unhealthy:`` each health row that is degraded or failing, with its detail.
-- ``Runs:`` active runs, then the ones that ended in the last ``RECENT_RUN_HOURS``: code,
-  state (and why it waits), repo, ask, PR, the Remote Control link of a running session
+- ``Runs:`` active runs, then the ones that ended in the last ``RECENT_RUN_HOURS``: code
+  with its repo (``R2 (mycelium)``: PER-249, so the reply names the run as the owner knows
+  it), state (and why it waits), ask, PR, the Remote Control link of a running session
   (``runs.remote_url``), the worker's last note.
-- ``Workers ask:`` open worker questions with their options.
+- ``Workers ask:`` open worker questions with their options, by code and repo.
 - ``Waiting on the owner:`` open approvals by their code-built summary and expiry, never
   their codes (codes are for the owner's eyes only).
 - ``Repos:`` name, its GitHub ``owner/name``, checkout path (a NULL ``path`` means
@@ -150,7 +151,7 @@ def _run_line(r: RunItem, now: datetime, tz: ZoneInfo) -> str:
     state = str(r.state)
     if r.state == "waiting" and r.waiting_reason is not None:
         state = f"waiting ({'your answer' if r.waiting_reason == 'question' else 'usage reset'})"
-    parts = [f"{r.code} {state}", r.repo or "no repo", f'"{_clean(r.ask, ASK_CHARS)}"']
+    parts = [f"{run_name(r.code, r.repo)} {state}", f'"{_clean(r.ask, ASK_CHARS)}"']
     if r.started_at is not None and r.ended_at is None:
         parts.append(f"for {_duration((now - r.started_at).total_seconds())}")
     if r.ended_at is not None:
@@ -162,6 +163,11 @@ def _run_line(r: RunItem, now: datetime, tz: ZoneInfo) -> str:
     if r.last_note:
         parts.append(f"note: {_clean(r.last_note, NOTE_CHARS)}")
     return " · ".join(parts)
+
+
+def run_name(code: str, repo: str | None) -> str:
+    """A run as the owner knows it: its code with its repo, ``R2 (mycelium)`` (PER-249)."""
+    return f"{code} ({_clean(repo, 60) if repo else 'no repo'})"
 
 
 def repo_path(name: str, path: Path | None, code_dir: Path) -> Path:
@@ -217,8 +223,9 @@ def render_briefing(
         if r.state in ("queued", "running", "waiting")
         or (r.ended_at is not None and r.ended_at >= recent)
     ]
+    repo_of = {r.code: r.repo for r in snapshot.runs.items or []}
     asks = [
-        f'{q.run_code} asks: "{_clean(q.text, QUESTION_CHARS)}"'
+        f'{run_name(q.run_code, repo_of.get(q.run_code))} asks: "{_clean(q.text, QUESTION_CHARS)}"'
         + (f" [{' / '.join(_clean(o, 40) for o in q.options)}]" if q.options else "")
         for q in snapshot.questions.items or []
     ]
@@ -336,14 +343,15 @@ def since_notes(
     zone = ZoneInfo(tz)
     since = max(since, now - SINCE_LOOKBACK)
     found: list[tuple[datetime, str]] = []
-    for r in runs.recent(conn, limit=50):
+    recent = runs.recent(conn, limit=50)
+    for r in recent:
         if r.status == "merged" and since < r.updated_at <= now:
             at, verb = r.updated_at, _ENDED_TEXT["merged"]
         elif r.ended_at is not None and since < r.ended_at <= now and r.status in _ENDED_TEXT:
             at, verb = r.ended_at, _ENDED_TEXT[r.status]
         else:
             continue
-        line = f"{r.code} ({r.repo or 'no repo'}) {verb}"
+        line = f"{run_name(r.code, r.repo)} {verb}"
         if r.status == "failed" and r.failure:
             line += f": {_clean(r.failure, NOTE_CHARS)}"
         elif r.pr_number is not None and r.status in ("ready", "merged"):
@@ -351,10 +359,15 @@ def since_notes(
         found.append((at, f"{line} ({_when(at, now, zone)})"))
     for a in brain_store.expired_since(conn, since, now):
         found.append((a.expired_at, f"Approval expired: {_clean(a.summary, ITEM_MAX_CHARS)}"))
+    repo_of: dict[str, str | None] = {r.code: r.repo for r in recent}
     for q in questions.open_asks(conn):
         if since < q.asked_at <= now:
             text = _clean(q.question, QUESTION_CHARS)
-            found.append((q.asked_at, f'{q.run_code} asked: "{text}"'))
+            if q.run_code not in repo_of:  # an old active run past ``recent``'s limit
+                run = runs.get(conn, q.run_code)
+                repo_of[q.run_code] = run.repo if run is not None else None
+            name = run_name(q.run_code, repo_of[q.run_code])
+            found.append((q.asked_at, f'{name} asked: "{text}"'))
     found.sort(key=lambda x: x[0])
     lines = [line for _, line in found]
     if len(lines) > limit:  # the newest win

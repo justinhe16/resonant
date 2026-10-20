@@ -75,3 +75,14 @@ def test_route_defaults() -> None:
     brain = load_settings().brain
     assert brain.route == "triage" and brain.triage.bias == "normal"
     assert brain.ask_claude.resonant_tools is True
+
+
+@pytest.mark.parametrize("bias", ["normal", "claude"])
+def test_email_and_calendar_are_local_and_out_of_reach(bias: str) -> None:
+    """PER-249: CAL-1 was dropped, so nobody here reads email or calendar: the triage keeps
+    those asks local (the runner enforces it on the kind) and the local model says so."""
+    text = triage.instruction(bias)
+    assert "kind email or calendar" in text and "can reach them" in text
+    claude_line = next(line for line in text.splitlines() if line.startswith("claude:"))
+    assert "email" not in claude_line and "calendar" not in claude_line
+    assert triage.OUT_OF_REACH == {"email", "calendar"} <= set(triage.KINDS)
