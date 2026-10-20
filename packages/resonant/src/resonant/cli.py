@@ -1339,7 +1339,8 @@ def eval_task(
         Path | None,
         typer.Option(
             "--set",
-            help="JSONL set. Default: ~/.resonant/evals/task.jsonl, else evals/task.example.jsonl.",
+            help="JSONL set, or 'owner' (~/.resonant/evals/task.jsonl). Default: the owner's"
+            " set, else evals/task.example.jsonl.",
         ),
     ] = None,
     model: Annotated[
@@ -1401,6 +1402,48 @@ def eval_task(
         echo=typer.echo,
         echo_err=lambda s: typer.echo(s, err=True),
         route=route,
+    )
+    raise typer.Exit(code)
+
+
+@eval_app.command("draft")
+def eval_draft(
+    from_history: Annotated[
+        bool, typer.Option("--from-history", help="Draft from your past texts in the store.")
+    ] = False,
+    since: Annotated[
+        str | None,
+        typer.Option(help="Only texts since: a date (2026-09-01), an ISO time, or 30d/12h/2w."),
+    ] = None,
+    limit: Annotated[int, typer.Option(min=1, help="Draft at most N new rows (newest).")] = 200,
+    out: Annotated[
+        Path | None,
+        typer.Option(help="The set to write. Default: ~/.resonant/evals/task.jsonl."),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Draft task-eval rows from your past texts, each marked review: true (PER-248).
+
+    Reads the store read-only: your chat texts, the tools each turn called (the audit log),
+    the approvals you answered and the reply. Writes suggested expectations and a world to
+    replay against; skips approval replies, texts holding a credential and near-duplicates;
+    strips approval codes and other people's handles. Rows already in the file are kept as
+    they are. Nothing leaves the Mini. Prints counts only, never a text. Exit 2 if there is
+    no store or the existing set is malformed.
+    """
+    from resonant.evals import history
+
+    if not from_history:
+        typer.echo("only --from-history is supported: resonant eval draft --from-history", err=True)
+        raise typer.Exit(2)
+    code = history.run(
+        load_settings(),
+        since=since,
+        limit=limit,
+        out=out,
+        as_json=as_json,
+        echo=typer.echo,
+        echo_err=lambda s: typer.echo(s, err=True),
     )
     raise typer.Exit(code)
 
