@@ -284,7 +284,10 @@ def test_request_folds_a_leading_cd_and_names_the_repo(
         "shown": call.args["shown"],
         "repo": "r",
     }
-    assert call.args["shown"].endswith("[reda…")  # redacted, then clipped to 160
+    shown = call.args["shown"]  # redacted, then clipped to 160 (the tmp path's length varies)
+    assert len(shown) <= 160 and "feat" not in shown and shown.startswith("cd ")
+    full = command.replace("feat", "[redacted]")
+    assert shown == full or (shown.endswith("…") and full.startswith(shown[:-1]))
     assert call.spec == "shell" and call.verdict.level is Level.L3
     wt = policy.request("Bash", {"command": "git commit -m x"}, str(tree["wt"]), str)
     assert wt.args["repo"] == "r"  # a worktree is named after its main repo
