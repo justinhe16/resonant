@@ -109,7 +109,7 @@ def make_settings(home: Path, chat: FakeChatDB, **overrides: Any) -> Settings:
 
 
 class World:
-    """One daemon (restartable) on a fake clock, with the scheduler's core jobs on that clock."""
+    """One daemon (restartable) on a fake clock: the loop, the scheduler and its core jobs."""
 
     def __init__(self, settings: Settings, osa: RecordingOsaRunner, clock: Clock) -> None:
         self.settings, self.osa, self.clock = settings, osa, clock
@@ -141,6 +141,9 @@ class World:
             clock=self.clock,
         )
         d.loop.scheduler = d.scheduler
+        # The loop ticks the scheduler too (run_once): on the real clock, a real 08:00 sent the
+        # briefing and any real hour's on-time pulse fired in the middle of a test.
+        d.loop.clock = self.clock
         kv_set(d.conn, "paused", False)
         return d
 
@@ -724,7 +727,8 @@ async def test_bf1_all_zero_github_summary_is_left_out_and_the_briefing_is_one_l
 async def test_bf1_mixed_briefing_keeps_only_the_items_with_something_to_say(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
-    async with world(resonant_home, chat, at(10, 7, 0)) as w:
+    # From 07:30: the reports go through the loop, and at 07:00 its tick runs that hour's pulse.
+    async with world(resonant_home, chat, at(10, 7, 30)) as w:
         await w.report("trader", "pnl", "PnL +$1k", state={"b": 1}, when=at(10, 7, 30))
         await w.report("dori", "digest", "3 PRs open", urgency="low", when=at(10, 7, 31))
         await w.report("dori", "empty", "0 incidents", urgency="low", quiet=True)

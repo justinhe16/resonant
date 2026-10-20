@@ -252,6 +252,12 @@ async def start_daemon(
     assert r.daemon.imessage is not None
     channel = r.daemon.imessage.channel
     await wait_until(lambda: channel.health()["last_read_at"] is not None, 10)
+    # The reader starts before the API task is created (Daemon.run): its first read says
+    # nothing about the API, and status() got a ConnectError. uvicorn sets ``started`` once
+    # the socket listens.
+    await wait_until(lambda: r.daemon.server.started or run.done(), 30)
+    if run.done():
+        raise AssertionError(f"daemon exited during startup: {run.result()!r}")
     try:
         yield r
     finally:

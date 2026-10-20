@@ -20,14 +20,21 @@ def test_watchdog_fires_on_stall() -> None:
 
 
 def test_watchdog_quiet_while_beating() -> None:
-    hb = Heartbeat()
+    # A fake clock: on the real one, a test process descheduled for 0.2s between two beats
+    # (a loaded CI runner) looked like a stall. Each step moves time half of stale_s and
+    # beats, so no check ever sees an age past stale_s, however the threads interleave.
+    now = [0.0]
+    hb = Heartbeat(clock=lambda: now[0])
     fired = threading.Event()
-    wd = Watchdog(hb, stale_s=0.2, check_every_s=0.01, on_stall=fired.set)
+    wd = Watchdog(hb, stale_s=10, check_every_s=0.01, on_stall=fired.set)
     wd.start()
     for _ in range(30):
+        now[0] += 5.0
         hb.beat()
         assert not fired.wait(0.01)
     wd.halt()
+    wd.join(1)
+    assert not wd.is_alive() and not fired.is_set()
 
 
 async def test_deadman_pings_success_and_fail() -> None:

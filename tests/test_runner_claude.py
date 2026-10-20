@@ -1383,6 +1383,9 @@ async def test_kill_switch_stops_running_sessions(tmp_path: Path, db: sqlite3.Co
     assert h.runner.last_killed == 2
     await asyncio.wait_for(t, 30)
     await until(lambda: not any(live(p) for p in pids), 15, "the whole tree to die")
+    # The hook marks both runs cancelled at once (so the loop task ends right away); each
+    # run's cleanup (reap, delete its dir, then the reply) finishes in the background after.
+    await until(lambda: len(h.chan.texts()) == 2, 15, "both cleanups to finish")
     for c in (code, queued):
         assert h.run(c).status == "cancelled" and h.run(c).pgid is None
     assert not h.code_dir(code).exists()
@@ -1742,6 +1745,7 @@ async def test_happy_path_under_the_real_sandbox(tmp_path: Path, db: sqlite3.Con
 # --- the daemon ------------------------------------------------------------------------------
 
 
+@pytest.mark.wall_clock_jobs  # it only builds the daemon: nothing ticks
 async def test_the_daemon_registers_the_runner_and_the_cleanup_job(
     tmp_path: Path, resonant_home: Path
 ) -> None:

@@ -151,15 +151,11 @@ async def test_imessage_disabled_daemon_runs_without_channel_or_monitor() -> Non
     port = free_port()
     daemon = Daemon(load_settings(api={"port": port}))
     run = asyncio.create_task(daemon.run())
+    # Until the socket listens: ConnectError retries gave up after a fixed 4s.
+    await wait_until(lambda: daemon.server.started or run.done(), 30)
+    assert not run.done(), run.result()
     async with httpx.AsyncClient() as client:
-        for _ in range(200):
-            try:
-                channels = (await client.get(f"http://127.0.0.1:{port}/api/channels")).json()
-                break
-            except httpx.ConnectError:
-                await asyncio.sleep(0.02)
-        else:
-            raise AssertionError("daemon never came up")
+        channels = (await client.get(f"http://127.0.0.1:{port}/api/channels")).json()
     assert channels[0]["enabled"] is False and channels[0]["ok"] is None
     daemon.stop()
     assert await asyncio.wait_for(run, 5) == 0
