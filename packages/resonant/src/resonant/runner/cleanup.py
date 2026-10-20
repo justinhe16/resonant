@@ -12,15 +12,17 @@ import asyncio
 import contextlib
 import errno
 import fcntl
+import logging
 import os
 import re
 import stat
-import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, NamedTuple
 
+log = logging.getLogger(__name__)
 RUN_CODE = re.compile(r"R[1-9][0-9]*")
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 DAY_S = 86400.0
@@ -42,7 +44,7 @@ def _entries(fd: int) -> list[tuple[str, os.stat_result]]:
     return out
 
 
-MAX_DEPTH = 256  # deeper trees are refused (deleted never, counted as over any limit)
+MAX_DEPTH = 256  # deeper trees are refused by deletes and counted only down to it by sizes
 
 
 def _clear_flags(dir_fd: int, name: str) -> None:
@@ -139,25 +141,37 @@ def rmtree_nofollow(path: Path) -> bool:
         os.close(parent_fd)
 
 
-UNMEASURABLE = sys.maxsize
+class DirSize(NamedTuple):
+    """What ``dir_size`` counted. ``partial``: some of the tree couldn't be read (a directory
+    that won't open, or one nested deeper than ``MAX_DEPTH``), so the real size is larger."""
+
+    bytes: int
+    partial: bool
 
 
-def dir_size(path: Path) -> int:
+def dir_size(path: Path) -> DirSize:
     """Bytes in use under ``path`` (allocated blocks), not following symlinks. 0 if missing.
 
-    A tree that can't be measured (a directory that won't open, or one nested deeper than
-    ``MAX_DEPTH``) returns ``UNMEASURABLE``, which is over any limit: the disk watchdog must
-    not be beaten by hiding files where it can't look.
+    Counts what it can read: a directory that won't open is skipped, a tree deeper than
+    ``MAX_DEPTH`` is counted down to that depth, and a directory that disappears mid-walk is
+    skipped (it's gone, so the count stays whole). Workers are unguarded, so the watchdog is a
+    net for a runaway fill, not a wall: a partial count is never treated as over a limit.
     """
     try:
         root = _open_dir(str(path), None)
     except (FileNotFoundError, NotADirectoryError):
-        return 0
+        return DirSize(0, False)
     except OSError:
-        return UNMEASURABLE
+        return DirSize(0, True)
     total = 0
-    stack: list[tuple[int, list[tuple[str, os.stat_result]]]] = [(root, _entries(root))]
+    partial = False
+    stack: list[tuple[int, list[tuple[str, os.stat_result]]]] = []
     try:
+        try:
+            stack.append((root, _entries(root)))
+        except OSError:
+            os.close(root)
+            return DirSize(0, True)
         while stack:
             fd, pending = stack[-1]
             if not pending:
@@ -166,42 +180,91 @@ def dir_size(path: Path) -> int:
                 continue
             name, st = pending.pop()
             total += st.st_blocks * 512
-            if stat.S_ISDIR(st.st_mode):
-                if len(stack) >= MAX_DEPTH:
-                    return UNMEASURABLE
-                try:
-                    child = _open_dir(name, fd)
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    return UNMEASURABLE
-                try:
-                    stack.append((child, _entries(child)))
-                except OSError:
-                    os.close(child)
-                    return UNMEASURABLE
-        return total
+            if not stat.S_ISDIR(st.st_mode):
+                continue
+            if len(stack) >= MAX_DEPTH:
+                partial = True
+                continue
+            try:
+                child = _open_dir(name, fd)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                partial = True
+                continue
+            try:
+                stack.append((child, _entries(child)))
+            except FileNotFoundError:
+                os.close(child)
+            except OSError:
+                os.close(child)
+                partial = True
+        return DirSize(total, partial)
     finally:
         for fd, _ in stack:
             os.close(fd)
 
 
+def free_bytes(path: Path) -> int | None:
+    """Free space for an unprivileged writer on ``path``'s volume. None if it can't be read."""
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize
+
+
+DiskLimit = Literal["cap", "free"]  # which one a watcher hit: its own cap or the volume's floor
+PARTIAL_CHECKS = 3  # partial counts in a row before ``on_partial`` is told (once)
+GROW_MIN = 1024 * 1024  # what counts as growing for the free-space floor (a log line doesn't)
+
+
 async def watch_disk(
-    run_dir: Path,
+    path: Path,
     max_bytes: int,
-    on_exceeded: Callable[[int], Awaitable[None]],
+    on_exceeded: Callable[[DiskLimit, int], Awaitable[None]],
     *,
     interval_s: float = 60.0,
+    min_free_bytes: int = 0,
+    on_partial: Callable[[DirSize], Awaitable[None]] | None = None,
+    free: Callable[[Path], int | None] = free_bytes,
 ) -> None:
-    """Check the run dir's size every ``interval_s`` until cancelled. When it's over
-    ``max_bytes``, await ``on_exceeded(size)`` once and return (the caller kills the run).
-    Run it as a task next to the session and cancel it when the session ends."""
+    """Check ``path``'s size every ``interval_s`` until cancelled. Run it as a task next to
+    the session and cancel it when the session ends.
+
+    Two limits, and on the first hit ``on_exceeded(limit, value)`` is awaited once and the
+    watch returns (the caller kills the run):
+
+    - ``"cap"``: the counted bytes are over ``max_bytes`` (``value`` is the count). A partial
+      count is never over on its own account, only by what it did count.
+    - ``"free"``: the volume has under ``min_free_bytes`` free and the count grew by at least
+      ``GROW_MIN`` since the last check (``value`` is the free bytes). A tree that isn't
+      growing isn't what's filling the disk, so it's left alone, and so is a jump that came
+      from a folder turning readable (the count went from partial to whole or back).
+
+    A count that stays partial for ``PARTIAL_CHECKS`` checks in a row is passed to
+    ``on_partial`` once."""
+    last = await asyncio.to_thread(dir_size, path)
+    partial_runs = 0
     while True:
         await asyncio.sleep(interval_s)
-        size = await asyncio.to_thread(dir_size, run_dir)
-        if size > max_bytes:
-            await on_exceeded(size)
+        size = await asyncio.to_thread(dir_size, path)
+        if size.bytes > max_bytes:
+            await on_exceeded("cap", size.bytes)
             return
+        grew = size.bytes - last.bytes >= GROW_MIN and size.partial == last.partial
+        last = size
+        if grew and min_free_bytes > 0:
+            left = await asyncio.to_thread(free, path)
+            if left is not None and left < min_free_bytes:
+                await on_exceeded("free", left)
+                return
+        partial_runs = partial_runs + 1 if size.partial else 0
+        if partial_runs == PARTIAL_CHECKS and on_partial is not None:
+            try:
+                await on_partial(size)
+            except Exception:  # a failed note must not end the watch
+                log.warning("disk watchdog: partial note failed", exc_info=True)
 
 
 def delete_run_dir(work_dir: Path, code: str) -> bool:

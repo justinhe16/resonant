@@ -251,6 +251,7 @@ def test_runner_repos_default_empty(resonant_home: Path) -> None:
     s = load_settings()
     assert s.runner.repos == {}
     assert s.runner.max_run_dir_mb == 5000
+    assert s.runner.min_free_disk_mb == 10240
     assert s.runner.max_minutes == 45
     assert s.runner.work_dir == Path("~/resonant-runs").expanduser()
     assert s.runner.mirror_dir == Path("~/.resonant/runner/mirrors").expanduser()
@@ -1048,24 +1049,83 @@ def test_dir_size_counts_and_ignores_links(tmp_path: Path) -> None:
     (run / "a").write_bytes(b"x" * 100_000)
     (run / "link").symlink_to(big)
     size = cleanup_mod.dir_size(run)
-    assert 100_000 <= size < 500_000
-    assert cleanup_mod.dir_size(tmp_path / "missing") == 0
+    assert 100_000 <= size.bytes < 500_000 and not size.partial
+    assert cleanup_mod.dir_size(tmp_path / "missing") == (0, False)
 
 
 async def test_watch_disk_fires_once_over_the_cap(tmp_path: Path) -> None:
     (tmp_path / "f").write_bytes(b"x" * 200_000)
-    seen: list[int] = []
+    seen: list[tuple[str, int]] = []
 
-    async def exceeded(size: int) -> None:
-        seen.append(size)
+    async def exceeded(limit: cleanup_mod.DiskLimit, value: int) -> None:
+        seen.append((limit, value))
 
     await asyncio.wait_for(cleanup_mod.watch_disk(tmp_path, 100_000, exceeded, interval_s=0.01), 5)
-    assert len(seen) == 1 and seen[0] > 100_000
+    assert len(seen) == 1 and seen[0][0] == "cap" and seen[0][1] > 100_000
 
     task = asyncio.create_task(cleanup_mod.watch_disk(tmp_path, 10**9, exceeded, interval_s=0.01))
     await asyncio.sleep(0.05)
     task.cancel()
     assert len(seen) == 1
+
+
+async def test_watch_disk_stops_only_a_growing_tree_on_a_full_disk(tmp_path: Path) -> None:
+    (tmp_path / "f").write_bytes(b"x" * 100_000)
+    seen: list[tuple[str, int]] = []
+    frees: list[Path] = []
+
+    async def exceeded(limit: cleanup_mod.DiskLimit, value: int) -> None:
+        seen.append((limit, value))
+
+    def nearly_full(path: Path) -> int:
+        frees.append(path)
+        return 1024**3
+
+    def watch() -> asyncio.Task[None]:
+        return asyncio.create_task(
+            cleanup_mod.watch_disk(
+                tmp_path,
+                10**9,
+                exceeded,
+                interval_s=0.02,
+                min_free_bytes=10 * 1024**3,
+                free=nearly_full,
+            )
+        )
+
+    task = watch()  # not growing: left alone, and the free space isn't even read
+    await asyncio.sleep(0.15)
+    assert seen == [] and frees == [] and not task.done()
+    (tmp_path / "g").write_bytes(b"x" * 100_000)  # under GROW_MIN: not growing yet
+    await asyncio.sleep(0.15)
+    assert seen == [] and not task.done()
+    (tmp_path / "h").write_bytes(b"x" * cleanup_mod.GROW_MIN)
+    await asyncio.wait_for(task, 5)
+    assert seen == [("free", 1024**3)] and frees == [tmp_path]
+
+
+async def test_watch_disk_says_once_when_a_count_stays_partial(tmp_path: Path) -> None:
+    _unmeasurable(tmp_path / "R1")
+    seen: list[str] = []
+    partials: list[cleanup_mod.DirSize] = []
+
+    async def exceeded(limit: cleanup_mod.DiskLimit, _value: int) -> None:
+        seen.append(limit)
+
+    async def partial(size: cleanup_mod.DirSize) -> None:
+        partials.append(size)
+
+    try:
+        task = asyncio.create_task(
+            cleanup_mod.watch_disk(
+                tmp_path / "R1", 10**8, exceeded, interval_s=0.01, on_partial=partial
+            )
+        )
+        await asyncio.sleep(0.2)  # many more than PARTIAL_CHECKS checks
+        task.cancel()
+    finally:
+        _relock(tmp_path / "R1")
+    assert seen == [] and len(partials) == 1 and partials[0].partial
 
 
 def test_prune_cache_removes_least_recently_used(tmp_path: Path) -> None:
@@ -1317,10 +1377,12 @@ def _deep(root: Path, depth: int) -> None:
     os.close(fd)
 
 
-def test_deep_tree_is_unmeasurable_and_not_deleted(tmp_path: Path) -> None:
+def test_deep_tree_is_counted_to_max_depth_and_not_deleted(tmp_path: Path) -> None:
     run = tmp_path / "R1"
     _deep(run, cleanup_mod.MAX_DEPTH + 20)
-    assert cleanup_mod.dir_size(run) == cleanup_mod.UNMEASURABLE
+    (run / "f").write_bytes(b"x" * 100_000)
+    size = cleanup_mod.dir_size(run)
+    assert size.partial and 100_000 <= size.bytes < 1_000_000
     with pytest.raises(OSError, match="too deep"):
         cleanup_mod.rmtree_nofollow(run)
 
@@ -1328,20 +1390,71 @@ def test_deep_tree_is_unmeasurable_and_not_deleted(tmp_path: Path) -> None:
 def test_moderately_deep_tree_is_measured_and_deleted(tmp_path: Path) -> None:
     run = tmp_path / "R1"
     _deep(run, 100)
-    assert cleanup_mod.dir_size(run) < cleanup_mod.UNMEASURABLE
+    assert not cleanup_mod.dir_size(run).partial
     assert cleanup_mod.rmtree_nofollow(run) is True
     assert not run.exists()
 
 
-def test_unopenable_dir_counts_as_over_the_limit(tmp_path: Path) -> None:
+def test_unopenable_dir_is_skipped_and_the_count_partial(tmp_path: Path) -> None:
     run = tmp_path / "R1"
     (run / "hidden").mkdir(parents=True)
-    (run / "hidden" / "big").write_bytes(b"x" * 10_000)
+    (run / "hidden" / "big").write_bytes(b"x" * 1_000_000)
+    (run / "seen").write_bytes(b"x" * 100_000)
     (run / "hidden").chmod(0)
     try:
-        assert cleanup_mod.dir_size(run) == cleanup_mod.UNMEASURABLE
+        size = cleanup_mod.dir_size(run)
     finally:
         (run / "hidden").chmod(0o700)
+    assert size.partial and 100_000 <= size.bytes < 1_000_000
+    root = tmp_path / "locked"
+    root.mkdir(mode=0)
+    try:
+        assert cleanup_mod.dir_size(root) == (0, True)
+    finally:
+        root.chmod(0o700)
+
+
+def _unmeasurable(run: Path) -> None:
+    """What Resonant's own tests leave in a worker's tmp: a tree deeper than ``MAX_DEPTH``
+    and a ``chmod 0`` folder (``_relock`` undoes the lock)."""
+    run.mkdir()
+    _deep(run / "deep", cleanup_mod.MAX_DEPTH + 20)
+    (run / "locked").mkdir()
+    (run / "locked" / "f").write_bytes(b"x" * 10_000)
+    (run / "locked").chmod(0)
+
+
+def _relock(run: Path) -> None:
+    (run / "locked").chmod(0o700)
+
+
+async def test_unmeasurable_trees_and_100mb_dont_kill_a_run(tmp_path: Path) -> None:
+    run = tmp_path / "R1"
+    _unmeasurable(run)
+    (run / "tmp").mkdir()
+    (run / "tmp" / "data.bin").write_bytes(b"\0" * 100 * 1024**2)
+    seen: list[str] = []
+
+    async def exceeded(limit: cleanup_mod.DiskLimit, _value: int) -> None:
+        seen.append(limit)
+
+    try:
+        size = cleanup_mod.dir_size(run)
+        assert size.partial and 100 * 1024**2 <= size.bytes < 110 * 1024**2
+        task = asyncio.create_task(
+            cleanup_mod.watch_disk(run, 5000 * 1024**2, exceeded, interval_s=0.01)
+        )
+        await asyncio.sleep(0.2)
+        assert not task.done()
+        task.cancel()
+        assert seen == []
+        (run / "tmp" / "more.bin").write_bytes(b"\0" * 2 * 1024**2)  # a run past a cap still is
+        await asyncio.wait_for(
+            cleanup_mod.watch_disk(run, 101 * 1024**2, exceeded, interval_s=0.01), 5
+        )
+        assert seen == ["cap"]
+    finally:
+        _relock(run)
 
 
 def test_rmtree_clears_uchg(tmp_path: Path) -> None:

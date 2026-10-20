@@ -107,8 +107,11 @@ from resonant.runner.checks import CheckFailed, GitError
 from resonant.runner.claude_auth import LOGIN_HOW, LoginCheck, auth_source
 from resonant.runner.cleanup import (
     RUN_CODE,
+    DirSize,
+    DiskLimit,
     cleanup,
     delete_run_dir,
+    free_bytes,
     rmtree_nofollow,
     watch_disk,
     wipe_secret_dirs,
@@ -768,6 +771,7 @@ class ClaudeRunner:
         disk_interval_s: float = 60.0,
         disk_limit_bytes: int | None = None,
         cache_limit_bytes: int | None = None,
+        disk_free: Callable[[Path], int | None] = free_bytes,
         defer_s: float = DEFER_S,
         refresh_s: float = TOKEN_REFRESH_S,
         merge_wait_s: float = MERGE_WAIT_S,
@@ -845,6 +849,9 @@ class ClaudeRunner:
         self.disk_interval_s = disk_interval_s
         self.disk_limit_bytes = disk_limit_bytes or runner.max_run_dir_mb * 1024 * 1024
         self.cache_limit_bytes = cache_limit_bytes or runner.max_cache_gb * 1024**3
+        self.min_free_bytes = runner.min_free_disk_mb * 1024 * 1024
+        self._disk_free = disk_free
+        self._disk_hit: dict[str, tuple[DiskLimit, int]] = {}  # run code -> the limit and value
         self.cancel_grace_s = min(kill_grace_s, CANCEL_GRACE_S)
         self.rc_timeout_s = rc_timeout_s
         self.rc_off_timeout_s = rc_off_timeout_s
@@ -2173,6 +2180,7 @@ class ClaudeRunner:
         self._live[run.code] = target
         runs.set_process(self.conn, run.code, proc.pid, proc.pid, created)
         stop = await self._supervise(w, run, p, proc, target, writer, state, prompt, server)
+        disk_hit = self._disk_hit.pop(run.code, ("cap", 0))
         used = run.session_seconds + (time.monotonic() - started)
         result = state.result
         usage: dict[str, Any] = {}
@@ -2195,19 +2203,23 @@ class ClaudeRunner:
             raise _Cancelled
         if stop == "timeout":
             return await self._timed_out(run, w)
-        if stop == "disk":
-            over = _size(self.disk_limit_bytes)
-            return await self._fail(
-                run, f"used over {over} of disk (work kept: /runs {run.code})", w.redactor
-            )
-        if stop == "cache":
-            over = _size(self.cache_limit_bytes)
-            return await self._fail(
-                run, f"the runner cache grew over {over} (work kept: /runs {run.code})", w.redactor
-            )
+        if stop in ("disk", "cache"):
+            why, which = self._disk_text(stop, *disk_hit)
+            text = f"{why} ({which}; work kept: /runs {run.code})"
+            return await self._fail(run, text, w.redactor)
         if result is not None and (hit := usage_limit(result)) is not None:
             return self._wait_for_limit(w, run, hit)
         return await self._after_exit(w, run, proc.returncode, result, ended=state.ended)
+
+    def _disk_text(self, stop: str, limit: DiskLimit, value: int) -> tuple[str, str]:
+        """Why the disk watchdog stopped a run, and which limit it hit."""
+        if limit == "free":
+            floor = _size(self.min_free_bytes)
+            return "the disk is nearly full", f"{_size(value)} free, under the {floor} floor"
+        if stop == "cache":
+            return f"the runner cache grew over {_size(self.cache_limit_bytes)}", "the cache cap"
+        mib = f"{round(self.disk_limit_bytes / 1024**2, 1):g} MiB"
+        return f"used over {_size(self.disk_limit_bytes)} of disk", f"{mib} folder cap"
 
     async def _supervise(
         self,
@@ -2281,34 +2293,44 @@ class ClaudeRunner:
             async for raw, truncated in read_lines(proc.stderr, 8192):
                 writer.note("stderr", text=raw.decode(errors="replace"), truncated=truncated)
 
-        async def disk_exceeded(_size: int) -> None:
-            nonlocal stop
-            stop = stop or "disk"
+        def watch(path: Path, what: str, max_bytes: int, kind: str) -> asyncio.Task[None]:
+            async def exceeded(limit: DiskLimit, value: int) -> None:
+                nonlocal stop
+                if stop is None:
+                    stop = kind
+                    self._disk_hit[run.code] = (limit, value)
 
-        async def cache_exceeded(_size: int) -> None:
-            nonlocal stop
-            stop = stop or "cache"
+            async def partial(size: DirSize) -> None:
+                # Something in it can't be read (a test's chmod 0 dir, a too-deep tree): said
+                # once, never texted, and only what was counted counts against the cap.
+                log.warning(
+                    "disk watchdog: a partial count",
+                    extra={"run": run.code, "path": str(path), "counted": size.bytes},
+                )
+                writer.note("disk_partial", what=what, counted_bytes=size.bytes)
+                with atomic(self.conn):
+                    audit(
+                        self.conn, "run.disk_partial", run=run.code, what=what, counted=size.bytes
+                    )
+
+            return asyncio.create_task(
+                watch_disk(
+                    path,
+                    max_bytes,
+                    exceeded,
+                    interval_s=self.disk_interval_s,
+                    min_free_bytes=self.min_free_bytes,
+                    on_partial=partial,
+                    free=self._disk_free,
+                )
+            )
 
         runs.update(self.conn, run.code, remote_url=None)  # an earlier session's URL is gone
         pumps = [asyncio.create_task(c) for c in (feed(), pump_out(), pump_err())]
-        disk = asyncio.create_task(
-            watch_disk(
-                p.run_dir, self.disk_limit_bytes, disk_exceeded, interval_s=self.disk_interval_s
-            )
-        )
-        work_disk = asyncio.create_task(  # the worktree or scratch dir, on the same limit
-            watch_disk(
-                p.workspace, self.disk_limit_bytes, disk_exceeded, interval_s=self.disk_interval_s
-            )
-        )
-        cache = asyncio.create_task(
-            watch_disk(
-                self.cfg.cache_dir,
-                self.cache_limit_bytes,
-                cache_exceeded,
-                interval_s=self.disk_interval_s,
-            )
-        )
+        disk = watch(p.run_dir, "run folder", self.disk_limit_bytes, "disk")
+        # The worktree or scratch dir, on the same cap.
+        work_disk = watch(p.workspace, "worktree", self.disk_limit_bytes, "disk")
+        cache = watch(self.cfg.cache_dir, "runner cache", self.cache_limit_bytes, "cache")
         exited = asyncio.create_task(proc.wait())
         began = time.monotonic()
         last_save = began
@@ -3359,7 +3381,10 @@ def _int(value: object) -> int | None:
 
 
 def _size(n: int) -> str:
-    return f"{n / 1e9:g} GB" if n >= 1_000_000_000 else f"{n // 1_000_000} MB"
+    """Binary units, as the caps are set: 5000 MiB is ``4.9 GiB``."""
+    if n >= 1024**3:
+        return f"{round(n / 1024**3, 1):g} GiB"
+    return f"{round(n / 1024**2, 1):g} MiB"
 
 
 def _same(a: Path, b: Path) -> bool:
