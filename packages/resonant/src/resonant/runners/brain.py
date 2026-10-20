@@ -197,6 +197,14 @@ NOT_IN_BRAIN: frozenset[str] = frozenset({"mute_extension"})
 
 TOOL_ERROR_CHARS = 300  # a failed tool's reason, as the model sees it
 
+# PER-249: after a triage that saw an email or calendar ask (CAL-1 was dropped).
+OUT_OF_REACH_HINT = (
+    "Resonant note: this looks like a question about the owner's email or calendar. Neither "
+    "you nor Claude can read them, so don't call ask_claude: if it asks what is in their "
+    "email, on their calendar or when they're free, reply in one line that you can't reach "
+    'it ("I can\'t reach your email." or "I can\'t reach your calendar."). If it asks you '
+    "to save a note, reminder or fact, call that tool as usual."
+)
 FINAL_INSTRUCTION = (
     "Now answer the owner's message from what you read. Reply with only a JSON object: "
     f'{{"reply": "<plain text, at most {MAX_REPLY_CHARS} characters>"}}.'
@@ -807,6 +815,9 @@ class BrainRunner(LocalRunner):
             if handed is not None:
                 return handed
             st.meta["route"] = "local"  # Claude refused (cap, off, paused): answer here
+        elif st.meta.get("triage", {}).get("why") == "out_of_reach":
+            # PER-249: told only on these turns, so the rule doesn't sit in every prompt
+            st.messages.append({"role": "user", "content": OUT_OF_REACH_HINT})
         try:
             return await self._rounds(task, principal, text, st, ctx, spans)
         except ModelUnavailableError:
