@@ -1,6 +1,6 @@
 # Phase 4 plan: dashboard, status relay, and MCP for extensions
 
-Status: **implemented** (2026-10-16). The owner asked for the base dashboard (UI and backend) and MCP for extensions and the brain. Built with robot-surf, a worktree and PR per ticket, in the waves of §5. Hosting (Supabase, Fly, the ntfy app) is the owner's [go-live step 15](go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch); until then the relay is off and the dashboard runs locally.
+Status: **implemented** (2026-10-16). The owner asked for the base dashboard (UI and backend) and MCP for extensions and the brain. Built with robot-surf, a worktree and PR per ticket, in the waves of §5. Hosting (Supabase, Fly, the ntfy app) is the owner's [go-live step 15](go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch); done 2026-10-20: the relay is on (Fly app `resonant-relay-jhe`).
 
 **As built.**
 - **Local** (DB-1, DB-2): the daemon serves the committed `dashboard/dist` at `127.0.0.1:7777/` with `GET /api/dashboard` (the `local` tier). Read-only, no setup, no Node on the Mini.

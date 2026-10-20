@@ -1,4 +1,4 @@
-# Status (2026-10-19)
+# Status (2026-10-20)
 
 The starting point for a new session. What's live, how we work, what's open. Detail lives in the linked docs; this page stays short. Update it at the end of each working session.
 
@@ -9,7 +9,7 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 18, two extensi
 | Area | What it does | PRs |
 |---|---|---|
 | Core (Phases 0–3.5) | iMessage in/out, event loop, policy gate, executor, store, scheduler, extensions, pulse and 08:00 briefing, kill switch | #1–#86 |
-| Dashboard and relay (Phase 4) | Local read-only dashboard on 127.0.0.1:7777; Supabase/Fly relay built but off (go-live step 15) | #85–#88 |
+| Dashboard and relay (Phase 4) | Local read-only dashboard on 127.0.0.1:7777. Remote copy live since 2026-10-20: the daemon pushes to Supabase `resonant-relay` (ref `lqebsuuskxndfyunffhd`), Fly app `resonant-relay-jhe` serves https://resonant-relay-jhe.fly.dev/ (password + TOTP) and is the dead-man switch (ntfy to the owner's phone; freeze test passed) | #85–#88 |
 | Workers (employee mode) | Claude Code workers in worktrees, unguarded, per-run GitHub App tokens, worker desk (ask/note/check), trust rules, Remote Control and live input (RC-1), transcript reading | #89–#92 |
 | Repos | Registry; adding a repo clones it to `~/code/<name>` (RP-1) | #96 |
 | GitHub and Linear | Quiet github with an employee-style rollup (GH-2); Linear MCP extension (LN-1, LN-2) | #93–#95 |
@@ -41,12 +41,7 @@ Latest task eval (synthetic set, live qwen): 95.8%, 0 unapproved writes, triage 
 
 ## Owner to-dos
 
-- `resonant ext update github`: picks up `recent_prs` (BR-9) and the quiet flag (BF-1).
-- Phone tests to run:
-  - the Claude brain (go-live "The Claude brain");
-  - a Linear batch ("close RES-…, RES-…");
-  - "dont ask for perms for linear tickets".
-- Branch protection on the repos you care about; relay go-live (step 15).
+The list lives in [`followups.md`](followups.md). The next ones: `resonant ext update github`, the phone tests (PER-252), and mycelium by text (PER-253).
 
 ## Open work: Phase 6b, harden and prove
 
@@ -61,7 +56,6 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 | 2 | PER-249 | Known eval misses (after PER-245) |
 | 2 | PER-250 | Live Claude eval (after PER-248) |
 | Owner | PER-252 | Phone tests (incl. `resonant ext update github`) |
-| Owner | PER-251 | Relay go-live (step 15) |
 | Owner | PER-253 | Dogfood: set up mycelium from scratch by texting Resonant. mycelium is registered but not cloned yet |
 | Backlog | PER-254, PER-255, PER-256 | Batch as one dashboard row, `yes 1,3`, retire intents (after PER-248) |
 
@@ -78,3 +72,4 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 - Architecture: [`architecture.md`](architecture.md) and `architecture.html`. Published as an artifact with System and Modules tabs: https://claude.ai/artifact/3iezGdhqteYUx8dRc6bv4q
 - Contracts: [`interfaces.md`](interfaces.md). Brain design and as-built notes: [`brain-plan.md`](brain-plan.md). Go-live: [`go-live.md`](go-live.md).
 - Runtime state: `~/.resonant` (config.yaml, resonant.db, logs/, backups/).
+- Hosted: Supabase project `resonant-relay` and Fly app `resonant-relay-jhe` (both reachable from Claude Code: the Supabase MCP and `fly`). Rollback is in go-live step 15.

@@ -8,10 +8,6 @@ Only the things that need you, the owner, at the Mini or on your phone. Planned 
 - [ ] **Phone tests:** [PER-252](https://linear.app/doriapp/issue/PER-252). The Claude brain (follow-up, two texts back to back, restart, `/kill`), a Linear batch, "dont ask for perms for linear tickets", and the worker tests from go-live step 14 (spawn, a question and your reply, `yes always`, a merge rule, a scratch run, cancel, `/kill`).
 - [ ] **Mycelium by text:** [PER-253](https://linear.app/doriapp/issue/PER-253). Set it up from scratch by texting Resonant. You put the Plaid keys in its `.env.local` yourself, then run `resonant ext add path:…` for its extension.
 
-## When you have ~45 minutes
-
-- [ ] **Relay go-live:** [PER-251](https://linear.app/doriapp/issue/PER-251), go-live [step 15](go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch). This gives you a remote status page and a phone alert if the Mini or the daemon dies. It needs a Supabase project, Fly, the ntfy app, two tokens made in the terminal, and the freeze test.
-
 ## Ongoing
 
 - **Branch protection as repos are added.** On GitHub, protect each repo you care about: require a PR and CI on the base branch, and keep the app out of the bypass list. Say "no CI edits in <repo>" where Actions secrets matter.
@@ -27,4 +23,4 @@ Only the things that need you, the owner, at the Mini or on your phone. Planned 
 
 ## Done
 
-The github and Linear extensions are installed. The Claude login works, and the GitHub App and Resonant's own token are set. Daily backups run at 03:30. The old-runner leftovers are gone.
+The github and Linear extensions are installed. The Claude login works, and the GitHub App and Resonant's own token are set. Daily backups run at 03:30. The old-runner leftovers are gone. The relay is live (PER-251, 2026-10-20): remote dashboard at https://resonant-relay-jhe.fly.dev/ and ntfy alerts if the Mini goes quiet.
