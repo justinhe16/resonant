@@ -1,7 +1,8 @@
 """Task eval (BR-6, docs/brain-plan.md §4): does the brain do the right thing with a text?
 
 ``resonant eval task [--set PATH] [--model live|scripted] [--mode loop|intents|both]
-[--repeat N] [--only ID_OR_CATEGORY] [--json] [--min-accuracy 0.85] [--out DIR]``
+[--repeat N] [--only ID_OR_CATEGORY] [--limit N] [--json] [--min-accuracy 0.85] [--out DIR]
+[--route triage|local|claude] [--live-claude]``
 
 - **Input.** JSONL, one case per line (blank lines skipped)::
 
@@ -84,6 +85,14 @@
   (where the row came from) is kept for the owner and ignored here. ``--set owner`` is
   ``<home>/evals/task.jsonl``.
 
+- **Live Claude (PER-250).** ``--route claude --live-claude [--limit N]``: the hard rows
+  (``expect.route`` claude; the first ``LIVE_CLAUDE_LIMIT`` unless ``--limit``) each go to a
+  real Claude brain session (``LiveClaude``: the production ``AskRunner`` over the real
+  ``claude`` with the owner's login, its cwd and Resonant's tools in the case's world) and
+  its answer is graded (``ask_claude`` in ``tools`` is the hand-off itself). The report adds
+  ``claude``: accuracy, ack-to-answer latency and approximate usage (cost estimate, tokens)
+  in all and per row. Manual only: tests use ``e2e/fake_claude.py``.
+
 Texts and replies are PII: they appear only in what the CLI prints for failing cases.
 """
 
@@ -101,7 +110,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -132,8 +141,10 @@ from resonant.loop.echo import EchoRunner
 from resonant.loop.types import Fail, StepContext, StepOutcome, Task
 from resonant.models import ChatMessage, ModelClient, ModelReply, ProbeResult, SpanFactory
 from resonant.models.bench import percentile
+from resonant.runner.claude_auth import LOGIN_HOW, login_status
 from resonant.runners.ask import AskRefused, AskRunner, AskScope, Queued
 from resonant.runners.brain import MAX_ROUNDS, PROGRESS_TEXT, BrainRunner
+from resonant.sandbox import resolve_tool
 from resonant.secrets import CLAUDE_TOKEN_REF, FakeKeychain, SecretStore
 from resonant.store import repos as repo_store
 from resonant.store import runs as run_store
@@ -198,6 +209,22 @@ ROUTES: tuple[Route, ...] = get_args(Route)
 FAKE_CLAUDE = Path(__file__).resolve().parent.parent / "e2e" / "fake_claude.py"
 FAKE_TOKEN = "sk-ant-oat01-EVALFAKETOKEN0000000000"  # noqa: S105 - a fake Keychain's
 WORLD_KEYS = frozenset({"repos", "files", "runs", "notes", "reminders", "facts", "extensions"})
+LIVE_CLAUDE_LIMIT = 5  # PER-250: a live Claude run takes this many hard rows unless --limit
+USAGE_SUMS = ("input_tokens", "output_tokens", "cache_read_input_tokens",
+              "cache_creation_input_tokens")  # fmt: skip
+
+
+@dataclass(frozen=True)
+class LiveClaude:
+    """PER-250: hand-offs go to a real Claude brain session (``--live-claude``) instead of
+    ``EvalAsk``. ``cmd`` is the ``claude`` argv head (the real CLI; tests pass
+    ``e2e/fake_claude.py``), ``home`` the ``HOME`` it runs with (the owner's, for their
+    ``claude`` login: the case's ``RESONANT_HOME`` and the session's cwd stay in its temp
+    dir), ``login_check`` a seam for tests (default: ``claude auth status`` for ``home``)."""
+
+    cmd: tuple[str, ...]
+    home: Path
+    login_check: Callable[[], Awaitable[bool]] | None = None
 
 
 OWNER_SET = "owner"  # ``--set owner``: the owner's own set (``owner_set_path``)
@@ -1049,7 +1076,10 @@ class Outcome:
     route: str = "local"  # BR-10: who answered: local, or claude (handed over)
     handoff: str | None = None  # why it was handed over: triage, ask, guard, cap, ...
     triage: str | None = None  # the triage call's decision (None: no triage ran)
-    claude_reply: str | None = None  # Claude's answer, when a scripted session ran
+    claude_reply: str | None = None  # Claude's answer, when a session ran (scripted or live)
+    claude_status: str | None = None  # how that session ended: answered, timeout, crashed...
+    answer_ms: float | None = None  # PER-250: the ack's send to Claude's answer's send
+    usage: dict[str, Any] | None = None  # PER-250: the session's cost, turns, calls, tokens
 
 
 @dataclass
@@ -1076,13 +1106,15 @@ async def run_case(
     timeout_s: float = SCRIPTED_TIMEOUT_S,
     clock: Callable[[], float] = time.monotonic,
     route: Route = "triage",
+    claude: LiveClaude | None = None,
 ) -> Outcome:
-    """Run one case in a fresh temp home through the real router, runners, gate and channel."""
+    """Run one case in a fresh temp home through the real router, runners, gate and channel.
+    ``claude``: hand-offs go to a live Claude brain session (PER-250)."""
     model.reset()
     with tempfile.TemporaryDirectory(prefix="resonant-task-eval-") as tmp:
         root = Path(await asyncio.to_thread(os.path.realpath, tmp))
         with world_home(root):
-            return await _run_in(case, mode, model, root, base, timeout_s, clock, route)
+            return await _run_in(case, mode, model, root, base, timeout_s, clock, route, claude)
 
 
 async def _run_in(
@@ -1094,6 +1126,7 @@ async def _run_in(
     timeout_s: float,
     clock: Callable[[], float],
     route: Route = "triage",
+    claude: LiveClaude | None = None,
 ) -> Outcome:
     """``run_case`` inside its temp home ``root``."""
     (root / "principals.yaml").write_text(PRINCIPALS_YAML)
@@ -1135,7 +1168,9 @@ async def _run_in(
         brain.runner_gaps = None
     asks = EvalAsk(components.principals.owner)
     runner: EvalAsk | AskRunner = asks
-    if case.claude is not None and isinstance(brain, BrainRunner):  # a scripted Claude
+    if claude is not None and isinstance(brain, BrainRunner):  # PER-250: a live Claude
+        runner = _claude_runner(settings, conn, components, brain, stack, loop, root, claude)
+    elif case.claude is not None and isinstance(brain, BrainRunner):  # a scripted Claude
         runner = _fake_claude(settings, conn, components, brain, stack, loop, case, root, now)
     components.runners[runner.name] = runner
     loop.runners[runner.name] = runner
@@ -1181,8 +1216,31 @@ def _fake_claude(
     case's ``claude`` plan (a fake Keychain holds a fake token; nothing reaches claude)."""
     plan = root / "claude-plan.json"
     plan.write_text(json.dumps(fill(case.claude, root, now)))
+    fake = LiveClaude((sys.executable, "-I", str(FAKE_CLAUDE), "--script", str(plan)),
+                      root / "claude-home")  # fmt: skip
+    return _claude_runner(settings, conn, components, brain, stack, loop, root, fake,
+                          token=FAKE_TOKEN)  # fmt: skip
+
+
+def _claude_runner(
+    settings: Settings,
+    conn: sqlite3.Connection,
+    components: Components,
+    brain: BrainRunner,
+    stack: IMessageStack,
+    loop: Loop,
+    root: Path,
+    claude: LiveClaude,
+    *,
+    token: str | None = None,
+) -> AskRunner:
+    """The real ask runner with Resonant's tools and the Claude brain (BR-11, as on the
+    Mini) over ``claude.cmd``. The Keychain is an in-memory fake: with ``token`` it holds
+    that token, else nothing, so a live session uses the owner's ``claude`` login (as
+    ``runner.guard: off`` does on the Mini). Its cwd and ask dirs are under ``root``."""
     keychain = FakeKeychain()
-    keychain.items[CLAUDE_TOKEN_REF] = FAKE_TOKEN
+    if token is not None:
+        keychain.items[CLAUDE_TOKEN_REF] = token
     return AskRunner(
         conn,
         cfg=settings.brain.ask_claude,
@@ -1191,11 +1249,15 @@ def _fake_claude(
         channel=stack.channel,
         secrets=SecretStore(keychain),
         owner=components.principals.owner,
+        guard="off",
+        timezone=settings.timezone,
         create_task=loop.create_task,
-        claude_cmd=[sys.executable, "-I", str(FAKE_CLAUDE), "--script", str(plan)],
-        home=root / "claude-home",
+        claude_cmd=list(claude.cmd),
+        home=claude.home,
+        login_check=claude.login_check,
         tools=tool_access(components, brain, settings),
-        session=settings.brain.claude_session,  # BR-11: the Claude brain, as on the Mini
+        session=settings.brain.claude_session,
+        taint_hops=settings.brain.taint_hops,
         poll_s=0.05,
         kill_grace_s=0.5,
     )
@@ -1292,7 +1354,13 @@ def _outcome(
                 claude_calls.append(str(attrs.get("tool")))
     if not reply:
         reply = "\n".join(m.text for m in replies)
-    claude_reply = _claude_reply(conn, task)
+    claude_reply, claude_status = _claude_reply(conn, task)
+    answer_ms: float | None = None
+    if claude_reply is not None:
+        # the answer: the first send that starts Claude's reply; the ack, the first before it
+        at = next((i for i, m in enumerate(replies) if _starts(m.text, claude_reply)), None)
+        if at:  # None: not sent; 0: no ack went before it
+            answer_ms = round((replies[at].at - replies[0].at) * 1000, 1)
     triage: Any = result.get("triage")
     decided = cast(dict[str, Any], triage).get("route") if isinstance(triage, dict) else None
     return Outcome(
@@ -1313,22 +1381,59 @@ def _outcome(
         handoff=result.get("handoff") if isinstance(result.get("handoff"), str) else None,
         triage=decided if isinstance(decided, str) else None,
         claude_reply=claude_reply,
+        claude_status=claude_status,
+        answer_ms=answer_ms,
+        usage=_claude_usage(conn, task) if claude_reply is not None else None,
     )
 
 
-def _claude_reply(conn: sqlite3.Connection, task: sqlite3.Row | None) -> str | None:
-    """A scripted Claude session's answer (the ask task's reply), or None."""
+def _starts(sent: str, reply: str) -> bool:
+    """A send is the start of Claude's reply (the channel may split a long one)."""
+    head = sent.strip()[:40]
+    return bool(head) and reply.strip().startswith(head)
+
+
+def _claude_usage(conn: sqlite3.Connection, task: sqlite3.Row | None) -> dict[str, Any] | None:
+    """The Claude session's cost, turns, tool calls and token counts (its ``ask.done`` audit
+    row), or None."""
     if task is None:
         return None
+    row = conn.execute(
+        "SELECT detail FROM audit_log WHERE action = 'ask.done' AND trace_id = ?"
+        " ORDER BY rowid DESC LIMIT 1",
+        (task["trace_id"],),
+    ).fetchone()
+    if row is None:
+        return None
+    detail: Any = json.loads(row["detail"] or "{}")
+    if not isinstance(detail, dict):
+        return None
+    d = cast(dict[str, Any], detail)
+    out: dict[str, Any] = {k: d.get(k) for k in ("cost_usd", "turns", "tool_calls")}
+    usage: Any = d.get("usage")
+    if isinstance(usage, dict):
+        out.update(cast(dict[str, Any], usage))
+    return out
+
+
+def _claude_reply(
+    conn: sqlite3.Connection, task: sqlite3.Row | None
+) -> tuple[str | None, str | None]:
+    """A Claude session's reply (the ask task's) and how it ended (``answered``, or
+    ``timeout``, ``crashed``, ``not_set_up``...: the reply is then Resonant's notice), or
+    ``(None, None)``."""
+    if task is None:
+        return None, None
     row = conn.execute(
         "SELECT checkpoint FROM tasks WHERE runner = 'ask' AND trace_id = ? ORDER BY rowid",
         (task["trace_id"],),
     ).fetchone()
     if row is None:
-        return None
+        return None, None
     cp = json.loads(row["checkpoint"] or "{}")
     said = cp.get("reply") or cp.get("answer")
-    return said if isinstance(said, str) else None
+    status = cp.get("status")
+    return (said if isinstance(said, str) else None), (status if isinstance(status, str) else None)
 
 
 # --- grading ---------------------------------------------------------------------------------
@@ -1356,9 +1461,20 @@ def grade(case: TaskCase, out: Outcome) -> list[str]:
         fails += [f"unapproved_write:{w}" for w in dict.fromkeys(unapproved)]
         fails += [f"forbidden_tool:{t}" for t in e.tools_not if t in out.called]
         return fails
-    if handed:  # Claude ran (scripted): its answer is the one graded
+    if handed and out.claude_status not in (None, "answered"):
+        # Claude never answered (timed out, crashed, not set up...): nothing else to grade
+        fails.append(f"claude_failed:{out.claude_status}")
+        unapproved = [w for w in out.executed_writes if w not in e.writes]
+        fails += [f"unapproved_write:{w}" for w in dict.fromkeys(unapproved)]
+        return fails
+    tools = e.tools
+    if handed:  # Claude ran (scripted or live): its answer is the one graded
         out = replace(out, reply=out.claude_reply or out.reply)
-    for t in e.tools:
+        # the hand-off is the ``ask_claude`` a row expects (PER-250): drop it from each
+        # alternation; one that held only it is met
+        alts = [[a.strip() for a in t.split("|") if a.strip() != "ask_claude"] for t in tools]
+        tools = tuple("|".join(a) for a in alts if a)
+    for t in tools:
         if not _any_in(t, out.called):
             fails.append(f"missing_tool:{t}")
     for t in e.tools_not:
@@ -1462,6 +1578,8 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
             ),
             "ack_ms": _dist(acks),
         },
+        # PER-250: the turns Claude answered (a live or scripted session), graded on its answer
+        "claude": claude_answers([r for r in handed if r.outcome.claude_reply is not None]),
         "per_category": per_category,
         "escalation": {
             "rate": _ratio(len(escalated), n),
@@ -1498,6 +1616,37 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
     }
 
 
+def claude_answers(results: Sequence[CaseResult]) -> dict[str, Any]:
+    """Claude's answers (PER-250): accuracy, ack-to-answer latency and approximate usage
+    (``total_cost_usd``, the API-priced estimate even on a subscription, and tokens), in all
+    and per row (by id and line, never the text)."""
+    usages = [r.outcome.usage or {} for r in results]
+    costs = [c for u in usages if isinstance(c := u.get("cost_usd"), (int, float))]
+    tokens = {k: sum(int(u.get(k) or 0) for u in usages) for k in USAGE_SUMS}
+    correct = sum(r.correct for r in results)
+    return {
+        "n": len(results),
+        "correct": correct,
+        "accuracy": _ratio(correct, len(results)),
+        "answer_ms": _dist([a for r in results if (a := r.outcome.answer_ms) is not None]),
+        "cost_usd": round(sum(costs), 4) if costs else None,
+        # sessions that ended without an answer (timeout, crash, not set up): graded wrong
+        "failed": sum(r.outcome.claude_status not in (None, "answered") for r in results),
+        "tokens": tokens,
+        "rows": [
+            {
+                "id": r.case.id,
+                "line": r.case.line,
+                "correct": r.correct,
+                "failures": r.failures,
+                "answer_ms": r.outcome.answer_ms,
+                "usage": r.outcome.usage,
+            }
+            for r in results
+        ],
+    }
+
+
 # --- rendering (terminal only: the one place texts appear) -----------------------------------
 
 
@@ -1513,7 +1662,8 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
     meta = report["meta"]
     out: list[str] = [
         f"task eval  {meta['set']}  ({meta['cases']} cases x {meta['repeat']}, model "
-        f"{meta['model']}, route {meta.get('route', 'triage')})"
+        f"{meta['model']}, route {meta.get('route', 'triage')}"
+        f"{', claude live' if meta.get('claude') == 'live' else ''})"
     ]
     pending: dict[str, Any] = meta.get("review") or {}
     if pending.get("pending"):
@@ -1544,6 +1694,7 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
             f"({s['route']['triage_correct']}/{s['route']['triage_graded']} rows with a route)",
             f"  ack         p50 {_num(s['route']['ack_ms']['p50'])} ms   p95 "
             f"{_num(s['route']['ack_ms']['p95'])} ms",
+            *_render_claude(s.get("claude")),
             f"escalation    rate {_pct(esc['rate'])}   precision {_pct(esc['precision'])}   "
             f"recall {_pct(esc['recall'])} ({esc['expected']} expected)",
             f"ask           {_pct(ask['accuracy'])} ({ask['correct']}/{ask['graded']})",
@@ -1563,7 +1714,7 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
         out.append(f"failed ({len(failed)})")
         for r in failed:
             o = r.outcome
-            reply = o.reply.replace("\n", " ")
+            reply = (o.claude_reply or o.reply).replace("\n", " ")  # Claude's, when it answered
             reply = reply if len(reply) <= 160 else reply[:159] + "…"
             out.append(
                 f"  line {r.case.line:>3} {r.case.id} [{r.case.category}] {', '.join(r.failures)}"
@@ -1581,6 +1732,34 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
     return "\n".join(out)
 
 
+def _render_claude(c: Mapping[str, Any] | None) -> list[str]:
+    """PER-250: Claude's answers, when any ran: accuracy, ack to answer, usage per row."""
+    if not c or not c["n"]:
+        return []
+    t = c["tokens"]
+    cost = "-" if c["cost_usd"] is None else f"${c['cost_usd']:.4f}"
+    out = [
+        f"claude        answered {c['n']}   accuracy {_pct(c['accuracy'])} "
+        f"({c['correct']}/{c['n']})   no answer {c['failed']}",
+        f"  answer      p50 {_num(c['answer_ms']['p50'])} ms   p95 "
+        f"{_num(c['answer_ms']['p95'])} ms (ack to answer)",
+        f"  usage       {cost} (estimate)   tokens in {t['input_tokens']} out "
+        f"{t['output_tokens']} cache read {t['cache_read_input_tokens']} write "
+        f"{t['cache_creation_input_tokens']}",
+    ]
+    for row in c["rows"]:
+        u: dict[str, Any] = row["usage"] or {}
+        rc = u.get("cost_usd")
+        out.append(
+            f"    line {row['line']:>3} {row['id']:<28} {'ok' if row['correct'] else 'FAIL':<4} "
+            f"{_num(row['answer_ms'])} ms  "
+            f"{'-' if not isinstance(rc, (int, float)) else f'${rc:.4f}'}  "
+            f"turns {_num(u.get('turns'))}  calls {_num(u.get('tool_calls'))}  "
+            f"in {_num(u.get('input_tokens'))} out {_num(u.get('output_tokens'))}"
+        )
+    return out
+
+
 def with_texts(
     report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResult]]
 ) -> dict[str, Any]:
@@ -1592,7 +1771,9 @@ def with_texts(
         failed: list[dict[str, Any]] = []
         for f, r in zip(s["failed"], wrong, strict=True):
             extra = {
-                "text": r.case.text, "reply": r.outcome.reply, "tools": r.outcome.called,
+                "text": r.case.text, "reply": r.outcome.claude_reply or r.outcome.reply,
+                "ack": r.outcome.reply if r.outcome.claude_reply is not None else None,
+                "tools": r.outcome.called,
                 "rounds": r.outcome.rounds, "escalated": r.outcome.escalated,
                 "route": r.outcome.route, "handoff": r.outcome.handoff,
                 "approvals": r.outcome.approvals, "stubbed": r.outcome.stubbed,
@@ -1615,9 +1796,11 @@ async def run_set(
     timeout_s: float = SCRIPTED_TIMEOUT_S,
     progress: Callable[[str], None] | None = None,
     route: Route = "triage",
+    claude: LiveClaude | None = None,
 ) -> dict[str, list[CaseResult]]:
     """Run every case in each mode. ``model`` None: a ``ScriptedModel`` per case from its
-    ``script`` (a case without one gets the scripted model's default reply)."""
+    ``script`` (a case without one gets the scripted model's default reply). ``claude``:
+    hand-offs go to a live Claude brain session (PER-250)."""
     if repeat < 1:
         raise ValueError("repeat must be >= 1")
     cases, _ = split_review(cases)  # PER-248: a row awaiting review is never graded
@@ -1628,7 +1811,7 @@ async def run_set(
             for case in cases:
                 rec = shared or RecordingModel(_scripted(case))
                 outcome = await run_case(
-                    case, mode, rec, base=base, timeout_s=timeout_s, route=route
+                    case, mode, rec, base=base, timeout_s=timeout_s, route=route, claude=claude
                 )
                 result = CaseResult(case, mode, outcome, grade(case, outcome))
                 out[mode].append(result)
@@ -1680,11 +1863,21 @@ def run(
     echo_err: Callable[[str], None],
     model: ModelClient | None = None,
     route: Route = "triage",
+    live_claude: bool = False,
+    limit: int | None = None,
+    claude: LiveClaude | None = None,
 ) -> int:
     """Run the eval, print the report, save the text-free summary. Returns the exit code.
 
     ``settings`` is the owner's config: only its model, timezone and (for the default set
-    and results dir) home are used. ``model`` overrides the live client (tests)."""
+    and results dir) home are used. ``model`` overrides the live client (tests).
+    ``live_claude`` (PER-250, with ``route`` claude): only the hard rows (``expect.route``
+    claude), at most ``limit`` (default ``LIVE_CLAUDE_LIMIT``), each handed to a real Claude
+    brain session whose answer is graded; ``claude`` overrides the real CLI (tests).
+    ``limit`` alone: the first N cases."""
+    if live_claude and route != "claude":
+        echo_err("error: --live-claude needs --route claude")
+        return EXIT_BAD_SET
     path = resolve_set_path(settings, set_path)
     try:
         cases = load_set(path)
@@ -1710,16 +1903,42 @@ def run(
             f'Check each row\'s expect in {path}, then set "review": false.'
         )
         return EXIT_BAD_SET
+    if live_claude:
+        hard = [c for c in cases if c.expect.route == "claude"]
+        if not hard:
+            echo_err("error: no reviewed case expects route claude (the hard rows)")
+            return EXIT_BAD_SET
+        n = limit or LIVE_CLAUDE_LIMIT
+        if len(hard) > n:
+            echo_err(f"live Claude: the first {n} of {len(hard)} hard rows (--limit to change)")
+        cases = hard[:n]
+        if claude is None:
+            found = resolve_tool("claude")
+            if found is None:
+                echo_err("error: claude isn't installed (needed for --live-claude)")
+                return EXIT_BAD_SET
+            if not login_status([str(found)], Path.home()):
+                echo_err(f"error: claude isn't logged in ({LOGIN_HOW})")
+                return EXIT_BAD_SET
+            claude = LiveClaude((str(found),), Path.home())  # the owner's claude login
+    elif limit:
+        cases = cases[:limit]
+    live = claude if live_claude else None
+    # a hand-off waits for Claude's turn (a crash may retry it once)
+    extra_s = 2 * BrainConfig().claude_session.turn_timeout_s if live is not None else 0.0
+    progress: Callable[[str], None] | None = echo_err if live is not None else None
 
     async def go() -> dict[str, list[CaseResult]]:
         if model_kind == "scripted":
-            return await run_set(cases, modes, model=None, repeat=repeat, route=route)
+            return await run_set(cases, modes, model=None, repeat=repeat, route=route,
+                                 timeout_s=SCRIPTED_TIMEOUT_S + extra_s, progress=progress,
+                                 claude=live)  # fmt: skip
         # past the brain's own step limit ((MAX_ROUNDS + 1) model timeouts + 15 s)
-        timeout = settings.model.timeout_s * (MAX_ROUNDS + 2) + 30
+        timeout = settings.model.timeout_s * (MAX_ROUNDS + 2) + 30 + extra_s
         if model is not None:
             return await run_set(
                 cases, modes, model=model, base=settings, repeat=repeat, timeout_s=timeout,
-                route=route,
+                route=route, progress=progress, claude=live,
             )  # fmt: skip
         from resonant.models import OllamaClient  # lazy: the openai SDK is slow to import
 
@@ -1727,7 +1946,7 @@ def run(
             await _warm_up(client)
             return await run_set(
                 cases, modes, model=client, base=settings, repeat=repeat, timeout_s=timeout,
-                progress=lambda s: echo_err(s), route=route,
+                progress=lambda s: echo_err(s), route=route, claude=live,
             )  # fmt: skip
 
     now = datetime.now(UTC)
@@ -1745,6 +1964,8 @@ def run(
             "model": "scripted" if model_kind == "scripted" else settings.model.name,
             "modes": list(modes),
             "route": route,
+            "claude": "live" if live is not None else None,  # PER-250
+            "limit": limit,
             "only": only,
             "min_accuracy": min_accuracy,
             "passed": passed,
@@ -1795,9 +2016,11 @@ __all__ = [
     "EvalExecutor",
     "EvalSetError",
     "Expect",
+    "LiveClaude",
     "Outcome",
     "RecordingModel",
     "TaskCase",
+    "claude_answers",
     "grade",
     "load_set",
     "owner_set_path",
