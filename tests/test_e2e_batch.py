@@ -21,7 +21,7 @@ from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -516,15 +516,30 @@ async def test_members_cant_approve_the_owners_batch(
         assert len(done.splitlines()) == 4 and len(w.runs("save_issue")) == 4
 
 
+def shows_code(session: Any, code: str) -> bool:
+    """Whether ``code`` appears in what Claude saw, outside the tool descriptions: those are
+    fixed text, and cancel_watch's ("like W3") is a valid approval code 1 time in 95."""
+
+    def strip(node: object) -> object:
+        if isinstance(node, dict):
+            items = cast(dict[str, object], node).items()
+            return {k: strip(v) for k, v in items if k != "description"}
+        if isinstance(node, list):
+            return [strip(v) for v in cast(list[object], node)]
+        return node
+
+    seen = json.dumps(strip(session))
+    return re.search(rf"(?<![A-Za-z0-9]){code}(?![0-9])", seen) is not None
+
+
 async def test_approval_codes_never_reach_claude(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as w:
         await _claude_batch(w, saves(*KEYS), "close these four")
         codes = [str(r["code"]) for r in w.rows("SELECT code FROM approvals")]
-        seen = json.dumps(w.session())
         for code in codes:
-            assert re.search(rf"(?<![A-Za-z0-9]){code}(?![0-9])", seen) is None
+            assert not shows_code(w.session(), code)
 
 
 async def test_qwen_doesnt_hand_off_once_changes_wait(
