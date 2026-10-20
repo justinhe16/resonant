@@ -369,6 +369,19 @@ Ticketed: Linear PER-247.
 - **Daily cap off by default.** `daily_cap: 0` means unlimited (the owner's change); the runaway guard (60 an hour across the brain, one-shot asks, media and watch checks) is the only automatic stop besides Claude's own usage limits. Watch `ask.queued` and `ask.notice` audit counts.
 - **Live Claude eval.** As BR-10: the live task eval records hand-offs (`EvalAsk`), so it grades routing and writes, not Claude's answers in the session.
 
+## PER-258 carry-overs: the Claude brain's own tools
+
+*Noted 2026-10-20 from PER-258 ([`brain-plan.md`](brain-plan.md#per-258-the-claude-brain-gets-full-tools-2026-10-20)).*
+
+- **Most shell changes will ask.** A Bash read taints the turn once its output comes back, so "commit and push this" after a `git status` asks, by design. If the asks get noisy, a small set of outputs that carry no outside text (`rev-list --count`, `rev-parse`, `branch --show-current`) could be left out of taint.
+- **A repo's own config runs on reads.** `git status` or `git log` in a repo whose `.git/config` sets `core.fsmonitor`, a pager or an external diff runs that command. The brain's repos are the owner's own, as for workers; Resonant never runs git itself to judge a command (it reads `.git` files).
+- **The tracked directory is a heuristic.** It follows `cd` and Claude Code's `Shell cwd was reset to …`, not every way a shell can move (a `cd` inside a compound with `||`, `pushd`). A wrong directory only changes the approval line and the repo a standing allow matches; the grant also keys on it, so a mismatch asks again rather than running. The prompt asks Claude to start every change with `cd <repo> &&`.
+- **Compound changes are always L2.** `git add -A && git commit -m x` asks even untainted. Splitting a compound into its segments and taking the strictest level would let some run.
+- **One-line commands.** A heredoc commit message (`$(cat <<EOF …)`) is a substitution: it asks. The prompt asks for one line.
+- **The relay's SQL guard.** `brain_activity` is counts only, so the relay's `relay_ingest` needs no new check; `claude_brain.tools` is inside the local-only `claude_brain` (stripped by `to_remote`). Add `claude_brain` to the SQL guard's list next time the migration changes.
+- **Review notes left open.** `ps aux` (pre-allowed) shows other processes' command lines, which can hold a secret passed as an argument. A submodule checkout counts as a linked worktree for edits. The scratch dirs include the whole system temp dir. A script Claude runs (`bash x.sh`) asks with only its path shown; writing one to scratch asks too, but an existing script's content is never shown.
+- **Grants.** A grant lives 30 minutes, keyed on the exact command and directory; an approved change Claude doesn't rerun just expires. An edit's grant needs the identical edit (its digest), which Claude usually remembers in the session.
+
 ## PER-245 carry-overs: shorter taint, exempt writes
 
 *Noted 2026-10-20 from PER-245 ([`brain-plan.md`](brain-plan.md#per-245-shorter-taint-exempt-low-risk-writes-2026-10-20)).*

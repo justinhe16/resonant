@@ -197,7 +197,7 @@ class Gate(TokenVerifier, Protocol):
 Evaluation order (Phase 2, `resonant.gate.PolicyGate`):
 1. **Registration:** if `registry.get(extension, tool) != intent.spec`, Deny. An intent can't claim an effect or level its tool wasn't registered with.
 2. **Permission:** if `can(principal, "request", extension)` is false, Deny.
-3. **Unsafe args:** if `unsafe_args(args)` finds anything, Deny. The reason gives only a count, never the keys or values.
+3. **Unsafe args:** if `unsafe_args(args)` finds anything, Deny. The reason gives only a count, never the keys or values. Then the tool's `refusals` hook, if it has one: a reason means Deny with it, never an ask (the shell family's never-list, PER-258).
 4. **dry_run:** a tool that is neither an L0 read nor store-internal becomes `DryRun(would=<summary>)`. The summary uses the tool's code-built heading when it has one (`restart Ollama`), as approval prompts do.
 5. **Level × origin × autonomy** (`policy.rule`):
 
@@ -219,7 +219,10 @@ PolicyGate(conn, principals, registry, *, dry_run: bool, approval_ttl_s: float,
            actions: {(extension, tool): (Intent) -> str | None} = {},
            approvers_for: ApproversFor = no_manifest_approvers,
            levels: {(extension, tool): LevelFor} = {},
-           standing: Standing | None = None, clock=utcnow)
+           standing: Standing | None = None, clock=utcnow, batch_max=10,
+           refusals: {(extension, tool): RefusalFor} = {},     # PER-258
+           summaries: {(extension, tool): SummaryAction} = {})  # PER-258: the whole line
+RefusalFor = Callable[[Intent], str | None]     # why a call is never allowed (Deny, no ask)
 Standing  # Protocol: allows(intent) -> rule | None; offer(intent) -> StandingScope | None
 ApproversFor = Callable[[str], Sequence[str]]   # extension -> the names its manifest lists
 LevelFor = Callable[[Intent], Level | None]     # per-call level; may only pick L2 or L3 for a
@@ -1507,7 +1510,8 @@ AskRunner.caller = access.core                 # the bridge's ToolCore (TC-1; wa
 AskRunner.resumer = LocalRunner(..., model=NoModel(), name="ask")   # the approval resume: resend, ToolCore.resume, reply
 ClaudeTools(conn, access, core: ToolCore, task, ctx, *, tainted, sync_s=3.0, python=sys.executable)
   await .start() -> McpSetup(config: Path, allowed: ("mcp__resonant__<name>", ...))
-  .observe(stream_json_msg)            # counts tool_use blocks; any non-mcp__resonant__ one taints
+  .observe(stream_json_msg)            # counts tool_use blocks; Claude's own reads taint on use,
+                                       # Bash on its result, Edit/Write never (PER-258)
   await .call(name, args) -> (text, is_error)    # one at a time
   .listing() -> [{name, description, inputSchema}]
   .reports, .asked (BA-1: [BatchItem], was .pending), .calls, .tainted
@@ -1636,6 +1640,11 @@ ClaudeTools(..., server: McpServer | None = None)          # None: owns its own 
   .changes: int         # change calls that reached the gate (a crash retry needs 0)
 
 session_argv(head, *, cfg, scope, api_billing, mcp, session_id, resume) -> list[str]   # runners/ask.py
+  # PER-258: --tools BRAIN_BUILTINS --setting-sources '' --permission-mode default
+  #   --permission-prompts host --permission-prompt-tool mcp__resonant__permission
+  #   --allowedTools <read built-ins, gate.shell.READ_RULES, mcp__resonant__*>
+  #   --settings {"permissions": {"deny": <Read() rules>, "ask": gate.shell.ASK_RULES}}
+  #   --append-system-prompt SESSION_PROMPT + SHELL_PROMPT     (no --restricted)
 history.primer(conn, principal, *, before_event_id, limit=6) -> str                   # brain/history.py
 store.claude_brain: SESSION_KV = "brain.claude_session"; session_state(conn); status_of(conn)
 tools.ask.ASKING_HOPS: ContextVar[int | None]    # the asking brain turn's hops, set around its call
@@ -1646,9 +1655,45 @@ store.tasks.note_claude_reply(conn, task_id, reply, *, session=False, hops=None)
 - **Step.** A session ask waits (`Wait("usage_reset", +1 s)`) unless it is the oldest unanswered one (`status` queued/running/waiting, no `phase`, no `reply`, by rowid) and no turn is in flight. Then `_turn`: a `ClaudeTools` bound to the session's server (`tainted` from the asking turn, `taint("session", hops=…)` from `inherited_hops`), the message (`New text from the owner, through Resonant:` + the kind's hint + the text; the primer first in a new session), `check_init` against `toolset(cfg, "general")`, `may_retry` = no change reached the gate and nothing pending. Once written, the checkpoint gets `session_turn: true` (a daemon crash with a pinned call → `INTERRUPTED`). After: `record(hops)` with hops 0 if `read_outside`, else the asking turn's `taint_hops` (0 if unknown) or the inherited hops, else None; the checkpoint keeps `claude_hops` and `fresh`; the rest is BR-10's wrap-up (report lines, usage limit, a pending approval). Outcomes map to `Stopped: …` (killed), `Not done: Claude took over 4m; stopped.` (timeout), `Not done: Claude's session ended mid-answer[, after it had started a change, so it wasn't run again]; it restarts on your next text.` (crashed), the init refusal, or `classify(result)`.
 - **History.** `_note_answer` writes `claude_reply`, `claude_session: true` and `claude_hops` on the asking brain task; `Exchange.taint_at` counts that answer only when its turn was tainted (`claude_hops` set), within the window like any source (one-shot answers count as hop 0). The brain's hand-off to a session turn doesn't call `_Turn.outside()` (its reply carries the turn's own taint), and `Answer.meta.claude_session` is set.
 - **kv `brain.claude_session`**: `{session_id, started_at, turns, written, pid?, created?, marker?, remote_url?, hops?}`. `written` once a `result` came back (resume allowed); emptied on a crash, a hang, an init refusal, a rotation or a lost resume (the next start is new and primed). Audit `brain.session_start` (session id prefix, pid), `brain.session_remote` (ok).
-- **Status.** `collect_status()["claude_brain"]` and `daemon_status` → `{state: up|down, turns, remote_url?}` (None before the first start); `/status` adds `Claude brain: up · N turns[ · Remote Control: <url>]`. Dashboard: `Snapshot.claude_brain: ClaudeBrain{state, turns, remote_url (local)}`, local tier only.
-- **Config** `brain.claude_session: {enabled true, remote_control false, rotate_turns 50 (1..1000), rotate_hours 12 (≤168), turn_timeout_s 240 (≤900), queue_max 3 (0..20), max_per_hour 60 (0 off)}`.
+- **Status.** `collect_status()["claude_brain"]` and `daemon_status` → `{state: up|down, turns, remote_url?}` (None before the first start); `/status` adds `Claude brain: up · N turns[ · Remote Control: <url>]`. Dashboard: `Snapshot.claude_brain: ClaudeBrain{state, turns, remote_url (local), tools: [BrainTool]}`, local tier only; `Snapshot.brain_activity` in both tiers (PER-258, below).
+- **Config** `brain.claude_session: {enabled true, remote_control false, rotate_turns 50 (1..1000), rotate_hours 12 (≤168), turn_timeout_s 240 (≤900), queue_max 3 (0..20), max_per_hour 60 (0 off), progress_texts true}`.
 - **Tests.** `tests/test_e2e_claude_session.py`; the fake is `e2e/fake_claude.py`'s session mode.
+
+### The Claude brain's own tools: `resonant.gate.shell`, `resonant.tools.shell` (PER-258)
+
+The session has Claude Code's file, shell and web built-ins; every permission prompt is a call to Resonant's permission tool, decided through the gate ([`brain-plan.md`](brain-plan.md#per-258-the-claude-brain-gets-full-tools-2026-10-20)).
+
+```python
+ShellPolicy(*, read_ok: (path) -> bool, home: Path, scratch: [Path], user_home=None,
+            daemon_pid=None, temps=None)       # components.shell_policy(settings); Components.shell
+  .request(tool, input, cwd, shown) -> Call(args, verdict)   # the bridge: Claude Code's request
+  .judge(args) -> Verdict(kind: "read"|"write"|"never", level: Level, verb, why)
+  .level(args) / .refusal(args) / .summary(args)   # the gate's levels, refusals and summaries hooks
+  .cwd_after(command, cwd, output) -> str; .did(args, output) -> str
+READ_RULES, ASK_RULES                         # Claude Code rules for --allowedTools / --settings ask
+git_facts(path) -> GitFacts(top, name, branch, default, linked) | None   # from .git files only
+tools.shell: SHELL ("shell", WRITE, L2), SHELL_READ ("shell_read", L0); INTERNAL   # builtins,
+  # never offered to a model (runners.brain.NOT_IN_BRAIN, Components.chat_specs)
+ToolAccess(..., shell: ShellPolicy | None = None)       # wiring.tool_access: components.shell
+ShellCwd(path)                                           # ClaudeSession.shell, reset at each spawn
+ClaudeTools(..., shell: ShellCwd | None = None, redactor: Redactor | None = None)
+  .progress: [str]                                       # the changes of Claude's own that ran
+PERMISSION = "permission"; PERMISSION_TOOL = "mcp__resonant__permission"
+store.claude_brain: GRANTS_KV = "brain.shell_grants", GRANT_TTL = 30 min,
+  add_grant(conn, args, *, task_id, now); take_grant(conn, args, *, task_id, now) -> bool;
+  grant_key(args)   # sha256 of tool, command, cwd, digest
+  TOOL_ACTION = "brain.tool"; recent_tools(conn, limit=20); tool_counts(conn, since)
+AskRunner.enqueue(..., approved=False)    # code only: Resonant's turn running approved changes
+```
+
+- **The request.** Claude Code calls `permission` with `{tool_name, input, tool_use_id}` and reads the text result as `{"behavior": "allow", "updatedInput": <input>}` or `{"behavior": "deny", "message": …}` (probed on 2.1.304). The bridge first waits (`SYNC_S`) for the stream to show a `tool_use` with that id, name and input; else `not run: that request doesn't match a tool call in this turn` (Claude calling the tool itself gets nothing). Paused → the pause text. No shell context (a one-shot ask) → `not run: Claude's own changes aren't available in this session`. Between turns the server answers a deny (`NOT_BOUND`).
+- **Args.** `ShellPolicy.request` builds `{tool, command, cwd, shown, verb, dir?, repo?, digest?, script?}`: for Bash, `command` is the whole command exactly as Claude Code will run it (what's judged and approved is what runs), `cwd` the session's tracked dir and `dir` where it runs after a leading `cd <dir> &&` (found from the tokens, never a regex); for Edit, Write and NotebookEdit, `command` is the absolute path, `digest` a hash of the whole input (an approval covers one exact edit) and `script` marks a Write starting `#!`; `shown` is the command redacted with the runner's secrets and clipped to 160; `repo` is the repo's name from its `.git` (a worktree's main repo). The intent hash covers all of them.
+- **Through the gate.** A read is `shell_read` (L0: runs, audited). Anything else is `shell` (L2): the `levels` hook picks L3 for one simple command that is local branch work (`git add/commit/fetch/switch/stash`, `checkout -b`, a new branch or tag, each with a known set of flags and plain names; `fetch` from a configured remote), a push of a plain non-default branch to a configured remote (verb `git-push`; a default or `release*` branch is `git-push-default`, a force, delete, tag, URL, glob or odd flag `git-push-force`, both L2), `gh pr create` (not `--body-file`), or an edit in a linked worktree or a scratch dir (`<RESONANT_HOME>/ask`, the temp dirs; never a hook or build file, nor a script in scratch); the `refusals` hook denies the never-list; the `summaries` hook writes the line `run `<shown>` in <cwd>` (`~` for home), `edit <path>`, `write <path>`. Origin `tainted` once the turn read outside content (a Read, Grep, Glob, web or connector use, or the output of any Bash call that ran). Any `{ }`, `$`, backtick, backslash, a later `cd` or an unknown directory makes a command neither a read nor L3. Standing allows: `tool:shell.<verb>` on the repo, for `git-*` and `gh-*` verbs only, never `git-push-force` (`trust.tools.StandingAllows`); the prompt never offers `yes always`.
+- **Answers.** Ran → `allow` (the handler runs nothing; Claude Code runs it). `Asked` → joins the batch, `deny` with `asked the owner: <summary>. Nothing ran. If they say yes, Resonant sends you a new message to run it then. …`. Refused or dry run → `deny` with `not run: <reason> Never try another way to do it.`. A grant (below) → `allow` without the gate.
+- **After a yes.** The batch resume runs the `shell` item (its handler: the gate's grant, once; report `Approved: `<shown>`; Claude runs it now.`). Then `AskRunner._approved_run`: one new session turn (`enqueue(approved=True)`, once per task: kv `brain.shell_followups`) and, for each `shell` item whose execution succeeded, a one-shot grant for that turn's task only (`add_grant`, 30 min) whose message is `From Resonant: the owner said yes to what you asked about. Run each now, exactly as written …` plus `1. Bash, from <cwd>: <command>`. When Claude asks for that exact change in that turn, `take_grant(task_id=)` spends it and the bridge allows. A request for one of Resonant's own tools (or the permission tool) is denied. Audit `brain.shell_approved`. If the turn can't be queued the owner is told once.
+- **Every call.** On each `tool_result` in the stream: an audit row `brain.tool` (`tool`, `decision`: `allowed` (the read list), `read`, `gate`, `granted`, `asked`, `refused`, `denied` (Claude Code's own deny rule), `resonant` (one of Resonant's tools); detail `command` (redacted, 200), `cwd`, `status` ok|error, `exit`, `write`), and a span `runner.ask.brain_tool` (no command). Bash's tracked dir follows a lone `cd <dir>` or a leading `cd <dir> &&`, and Claude Code's `Shell cwd was reset to <dir>`.
+- **Progress line.** With `progress_texts` on, a turn whose own changes ran (gate or grant, `ok`) ends its reply with one code-built line, `Did: pushed feat in r, opened PR #120 in r` (`ShellPolicy.did`; reads add nothing).
+- **Dashboard.** `ClaudeBrain.tools`: the last 20 `brain.tool` rows (local tier only); `Snapshot.brain_activity: {calls_today, writes_today}` (`settings.timezone`), counts only, in both tiers.
 
 ## Media, links, watches, notices (BR-7, docs/brain-plan.md D10, migration 016)
 
@@ -1824,6 +1869,7 @@ All endpoints are loopback only. Remote status goes through the push-only status
 - **Tiers.** Every local-only field is declared with `LOCAL_ONLY` (`"x-tier": "local"` in the schema), is optional and is left out of the JSON when null. `to_remote` clears every such field at any depth. Local-only: `health[].reason`, `runs.items` (and its `remote_url`, RC-1), `approvals.items`, `questions.items`, `pulse.items`, `runner.missing`, `trust_rules`, `repos`. Every string the remote tier keeps, dict keys included, is an enum, a date-time, or an identifier matching `^[a-z][a-z0-9:_-]{0,63}$` (check names, extension names, job ids; `version` matches `^[0-9A-Za-z.+-]{1,40}$`). Extension names and job ids are owner-chosen slugs: they show which integrations are installed, never message content. Tests check this over the schema, over random snapshots and stores, and over the UI's fixtures (`dashboard/src/test/fixtures/*.json` must validate, and `remote.json` must be a true remote tier).
 - **Fail soft.** A health row, extension or job whose identifier doesn't match is left out, and counts keep only the known task and run states, so one stale row never breaks the endpoint. A runner check that raises shows as one `missing` entry.
 - **Fields.** As in the plan's §3, with: `pulse.items[]` adds `source`, and its `state` is `new` (the owner hasn't heard this version) or `told`; `repos[]` is `{name, mode, base, ci}` (`ci`: CI seen, null when not checked; there is no stored `protected` flag); `trust_rules[].n` is the rule id; `runs.items` is `runs.recent(limit=50)` (active first) and `waiting_reason` is set only while a run waits; `questions.items` are the open asks of active runs; `approvals.items` are every unexpired pending approval (`asked_at` is when it was created); `extensions[].health` is its `ext:<name>` check; a job's `next_due` comes from the approved manifest's cron (null when the extension is disabled or the schedule doesn't parse); `last_outcome` is one of the scheduler's outcomes or `other`. `health[].state` allows `failing` for the relay (DB-3); the monitor writes only `ok`, `degraded` and `unknown`.
+- **The Claude brain (PER-258).** `claude_brain.tools[]` is `{at, tool, decision, command, cwd, status, write}` from the `brain.tool` audit rows (local only, inside `claude_brain`). `brain_activity` (both tiers, counts only) is `{calls_today, writes_today}` over the last 1000 calls.
 - **Live state.** `started_at` (when the daemon started) is required and never null. `slots` is the loop's Claude `SlotPool` (`in_use`, `capacity`). The tick period isn't in the snapshot; the UI's 120 s loop-stall threshold assumes the default `loop.tick_s`. `runner.set_up` comes from `ClaudeRunner.setup_gaps()` (secrets by name, never a value), cached for 60 s by the API; with no Claude runner in the daemon (iMessage off) it is `false`. `version` is the checkout's git sha (8 hex, read once per process), else the package version.
 
 ## Status relay: `resonant.dashboard.pusher`, `supabase/migrations` (DB-3)

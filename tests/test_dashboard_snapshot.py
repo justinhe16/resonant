@@ -46,6 +46,8 @@ from resonant.store import approvals as ap
 from resonant.store import extensions as ext_store
 from resonant.store import pulse, questions, repos, runs, trust
 from resonant.store import tasks as task_store
+from resonant.store.audit import audit
+from resonant.store.claude_brain import SESSION_KV, TOOL_ACTION
 from resonant.store.db import iso, kv_set, utcnow
 from resonant.store.runs import Status as RunStatus
 from resonant_sdk import Effect, Level
@@ -353,6 +355,28 @@ def test_remote_control_url_is_local_only(db: sqlite3.Connection) -> None:
     remote = to_remote(s)
     _check_remote(remote)
     assert "claude.ai" not in json.dumps(remote.model_dump(mode="json"))
+
+
+def test_brain_tool_calls_are_local_and_their_counts_remote(db: sqlite3.Connection) -> None:
+    """PER-258: the Claude brain's last tool calls (command, cwd, decision) show on the local
+    dashboard only; the remote tier carries today's counts."""
+    now = utcnow()
+    kv_set(db, SESSION_KV, {"session_id": "s", "turns": 2, "pid": 1})
+    for command, write, status in [("git log -1", False, "ok"), (f"git push {SECRET}", True, "ok"),
+                                   ("rm -rf x", True, "error")]:  # fmt: skip
+        audit(db, TOOL_ACTION, tool="Bash", decision="gate" if write else "allowed",
+              command=command, cwd="/Users/x/code/r", status=status, write=write)  # fmt: skip
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="deadbeef")
+    local = s.model_dump(mode="json")
+    tools = local["claude_brain"]["tools"]
+    assert [t["command"] for t in tools] == ["rm -rf x", f"git push {SECRET}", "git log -1"]
+    assert tools[1]["decision"] == "gate" and tools[1]["write"] is True
+    assert local["brain_activity"] == {"calls_today": 3, "writes_today": 1}
+    remote = to_remote(s)
+    _check_remote(remote)
+    dumped = remote.model_dump(mode="json")
+    assert dumped["brain_activity"] == {"calls_today": 3, "writes_today": 1}
+    assert "git push" not in json.dumps(dumped) and SECRET not in json.dumps(dumped)
 
 
 @pytest.mark.parametrize("seed", range(300))

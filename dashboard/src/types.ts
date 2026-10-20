@@ -106,11 +106,32 @@ export interface Runner {
 }
 
 /** BR-11: the Claude brain's long-lived session (local tier only). */
+/** One of the Claude brain's tool calls (PER-258). */
+export interface BrainTool {
+  at: Timestamp;
+  tool: string;
+  /** allowed (the read list), read, gate, granted, asked, refused, denied, resonant */
+  decision: string;
+  /** redacted and clipped */
+  command: string;
+  cwd: string;
+  status: "ok" | "error";
+  write: boolean;
+}
+
 export interface ClaudeBrain {
   state: "up" | "down";
   turns: number;
   /** while Remote Control is on */
   remote_url?: string;
+  /** its last tool calls, newest first */
+  tools?: BrainTool[];
+}
+
+/** The Claude brain's tool calls today: counts, in both tiers. */
+export interface BrainActivity {
+  calls_today: number;
+  writes_today: number;
 }
 
 export interface TrustRule {
@@ -152,6 +173,8 @@ export interface Snapshot {
   repos?: Repo[];
   /** local only; absent before the Claude brain first starts */
   claude_brain?: ClaudeBrain;
+  /** absent in snapshots from before PER-258 */
+  brain_activity?: BrainActivity;
 }
 
 /** Runtime config read from config.json next to index.html. */

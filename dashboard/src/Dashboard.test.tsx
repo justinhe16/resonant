@@ -86,6 +86,54 @@ describe("Dashboard, local tier", () => {
   });
 });
 
+const BRAIN = {
+  state: "up" as const,
+  turns: 3,
+  tools: [
+    {
+      at: "2026-10-16T08:59:50Z",
+      tool: "Bash",
+      decision: "gate",
+      command: "git push origin feat",
+      cwd: "/Users/x/code/r",
+      status: "ok" as const,
+      write: true,
+    },
+    {
+      at: "2026-10-16T08:59:40Z",
+      tool: "Bash",
+      decision: "allowed",
+      command: "git rev-list --count HEAD",
+      cwd: "/Users/x/code/r",
+      status: "ok" as const,
+      write: false,
+    },
+  ],
+};
+const ACTIVITY = { calls_today: 4, writes_today: 1 };
+
+describe("Dashboard, the Claude brain's tool calls", () => {
+  it("lists each call on the local tier", async () => {
+    mount(clone(local, { claude_brain: BRAIN, brain_activity: ACTIVITY }));
+    expect(await screen.findByText("git push origin feat")).toBeInTheDocument();
+    expect(screen.getByText("git rev-list --count HEAD")).toBeInTheDocument();
+    expect(screen.getByText("gate")).toBeInTheDocument();
+    expect(screen.getByTestId("brain-activity")).toHaveTextContent("4 tool calls today, 1 change");
+  });
+
+  it("shows only the counts on the remote tier, even if calls were sent", async () => {
+    mount(clone(local, { tier: "remote", claude_brain: BRAIN, brain_activity: ACTIVITY }));
+    expect(await screen.findByTestId("brain-activity")).toHaveTextContent("4 tool calls today");
+    expect(screen.getByText("Its tool calls are shown on the local dashboard only.")).toBeInTheDocument();
+    expect(screen.queryByText("git push origin feat")).not.toBeInTheDocument();
+  });
+
+  it("shows the counts from a remote snapshot", async () => {
+    mount(clone(remote, { brain_activity: ACTIVITY }));
+    expect(await screen.findByTestId("brain-activity")).toHaveTextContent("1 change");
+  });
+});
+
 describe("Dashboard, remote tier", () => {
   it("hides what the tier doesn't carry", async () => {
     mount(remote);

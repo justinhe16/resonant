@@ -116,6 +116,7 @@ from resonant.brain.history import DEFAULT_TAINT_HOPS, primer, unfolded
 from resonant.brain.text import flat
 from resonant.config import DEFAULT_READ_DENY, AskClaudeConfig, ClaudeSessionConfig, Settings
 from resonant.gate.codes import mask_codes
+from resonant.gate.shell import ASK_RULES, READ_RULES, TOOL_WRITE
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import (
     PRIORITY_MEMBER,
@@ -132,6 +133,8 @@ from resonant.redact import Redactor
 from resonant.runner.claude_auth import LoginCheck, auth_source, status_env
 from resonant.runners import reaper
 from resonant.runners.ask_tools import (
+    PERMISSION_LISTING,
+    PERMISSION_TOOL,
     ClaudeTools,
     McpServer,
     McpSetup,
@@ -148,8 +151,10 @@ from resonant.sandbox import resolve_tool
 from resonant.secrets import SecretError, SecretStore, load_runner_secrets
 from resonant.store import tasks as task_store
 from resonant.store.audit import audit
+from resonant.store.claude_brain import add_grant
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.store.tasks import get_task
+from resonant.toolcore import CallScope, PinnedCall, batch_items
 from resonant.tools.files import ReadScope, default_roots, resonant_secrets
 
 log = logging.getLogger(__name__)
@@ -160,6 +165,9 @@ Kind = Literal["general", "research", "email", "calendar", "image", "link"]
 KINDS: tuple[Kind, ...] = get_args(Kind)
 CONNECTOR_KINDS: frozenset[str] = frozenset({"email", "calendar"})
 READ_BUILTINS = ("Read", "Grep", "Glob", "WebSearch", "WebFetch")
+# PER-258: the Claude brain's built-ins: files, the shell and the web. Not the ones that act
+# outside the turn's stream (subagents, cron, remote triggers, push notifications, worktrees).
+BRAIN_BUILTINS = ("Bash", "Edit", "Write", "NotebookEdit", *READ_BUILTINS)
 QUESTION_MAX = 4000
 ATTACH_MAX = 4
 ATTACH_BYTES = 20 * 1024 * 1024
@@ -258,6 +266,26 @@ SESSION_PROMPT = (
     "Answer like a terse coworker: plain text for a phone, no preamble, no headings, at "
     "most {max_chars} characters. Say what you assumed when the text was ambiguous."
 )
+# PER-258: the Claude brain's own shell and edits (kept apart from SESSION_PROMPT).
+SHELL_PROMPT = (
+    "You also have a shell and file edits (Bash, Edit, Write). Read freely: git log, show, "
+    "diff, status and rev-list, gh pr, issue and run view and list, ls, cat, rg and the like "
+    "run without asking (cd into the repo first, or use git -C <dir>). Anything that changes "
+    "something goes through the owner's approvals like Resonant's tools: a denial starting "
+    "'asked the owner:' means it waits on their yes, so say so and stop (on a yes Resonant "
+    "sends you a message to run it); 'not run:' means it didn't happen. Never work around a "
+    "refused or pending command with another command, a script, an edit or a Resonant tool. "
+    "Keep a command to one line and one action, and start one that changes something with "
+    "cd <absolute repo dir> &&. For real multi-file code work, start a worker (start_run) "
+    'instead of editing yourself. "Don\'t ask for git push in resonant" is '
+    "allow_trust_rule with action tool:shell.git-push (the verb: git-push, git-commit, "
+    "gh-pr-create, ...) and the repo as scope."
+)
+APPROVED_HEAD = (
+    "From Resonant: the owner said yes to what you asked about. Run each now, exactly as "
+    "written and from the same directory (an edit: make the same edit again), then say what "
+    "happened:"
+)
 # The kinds a Claude brain turn takes (its allowlist is fixed for the session: the read
 # built-ins and Resonant's tools). Email and calendar (connector reads) and images (files in
 # the ask's own folder) stay one-shot.
@@ -309,6 +337,9 @@ RUNAWAY_REFUSED = "Claude is paused for runaway protection ({cap} messages this 
 BUSY = "Claude has {n} waiting already; send that again once those are answered."
 CRASHED = "Not done: Claude's session ended mid-answer{changed}; it restarts on your next text."
 CRASHED_CHANGE = ", after it had started a change, so it wasn't run again"
+APPROVED_NOT_RUN = "Approved, but Claude can't run it now ({why}) Ask again in a bit."
+FOLLOWUPS_KV = "brain.shell_followups"  # ask tasks whose approved changes got their turn
+FOLLOWUPS_KEEP = 200
 TOOLS_CHANGED = "Not done: Claude's read tools are missing ({names}); its CLI may have changed."
 NOT_REACHABLE = (
     "Not done: {what} isn't reachable from Claude's read-only mode (missing {names}). "
@@ -532,9 +563,14 @@ def session_argv(
     resume: bool,
     budget_turns: int = 50,
 ) -> list[str]:
-    """The Claude brain's argv (BR-11): ``ask_argv``'s rules for a ``general`` ask with
-    Resonant's tools (the read built-ins under ``--restricted`` and ``dontAsk``, the same
-    allow, deny and ``Read`` rules, ``--add-dir`` roots, ``--strict-mcp-config``), but a
+    """The Claude brain's argv (BR-11): ``ask_argv``'s allow, deny and ``Read`` rules for a
+    ``general`` ask with Resonant's tools (``--add-dir`` roots, ``--strict-mcp-config``), but
+    with Claude Code's full file, shell and web built-ins (PER-258, ``BRAIN_BUILTINS``; no
+    ``--restricted``, and ``--setting-sources ''`` so no settings file of the owner's or a
+    repo's widens it): ``default`` permission mode, and every prompt goes to Resonant's
+    permission tool (``--permission-prompts host --permission-prompt-tool
+    mcp__resonant__permission``), which decides through the gate (``runners/ask_tools.py``).
+    The reads in ``gate.shell.READ_RULES`` never prompt; ``ASK_RULES`` always do. A
     long-lived session: ``--input-format stream-json`` (RC-1: each turn is a user line on the
     stdin kept open), ``--session-id`` for a new session or ``--resume`` for one already
     written, and no ``--no-session-persistence`` or ``--max-turns`` (a turn is bounded by
@@ -542,20 +578,26 @@ def session_argv(
     ``max_budget_usd`` per turn for ``budget_turns`` (``rotate_turns``) turns."""
     ts = toolset(cfg, "general")
     denied = [*dict.fromkeys([*cfg_writes(cfg), *ts.blocked])]
+    rules = {"deny": scope.deny_rules(), "ask": list(ASK_RULES)}
     argv = [
         *head,
         "-p",
-        "--restricted",
         "--tools",
-        ",".join(READ_BUILTINS),
+        ",".join(BRAIN_BUILTINS),
+        "--setting-sources",
+        "",
         "--permission-mode",
-        "dontAsk",
+        "default",
+        "--permission-prompts",
+        "host",
+        "--permission-prompt-tool",
+        PERMISSION_TOOL,
         "--allowedTools",
-        ",".join([*ts.allowed, *mcp.allowed]),
+        ",".join([*ts.allowed, *READ_RULES, *mcp.allowed]),
         "--disallowedTools",
         ",".join(denied),
         "--settings",
-        json.dumps({"permissions": {"deny": scope.deny_rules()}}),
+        json.dumps({"permissions": rules}),
     ]
     for root in scope.add_dirs():
         argv += ["--add-dir", str(root)]
@@ -569,11 +611,24 @@ def session_argv(
         "stream-json",
         "--verbose",
         "--append-system-prompt",
-        SESSION_PROMPT.replace("{max_chars}", str(cfg.reply_max_chars)),
+        f"{SESSION_PROMPT} {SHELL_PROMPT}".replace("{max_chars}", str(cfg.reply_max_chars)),
     ]
     if api_billing:
         argv += ["--max-budget-usd", f"{cfg.max_budget_usd * budget_turns:g}"]
     return argv
+
+
+def progress_line(did: Sequence[str]) -> str:
+    """PER-258: the changes of Claude's own that ran this turn, in one code-built line."""
+    return "Did: " + ", ".join(dict.fromkeys(flat(d, 80) for d in did))
+
+
+def approved_line(n: int, args: dict[str, Any]) -> str:
+    """One approved change in the approved turn's message (Claude's own command, exactly)."""
+    tool, command, cwd = args.get("tool"), args.get("command"), args.get("cwd")
+    if tool == "Bash":
+        return f"{n}. Bash, from {cwd}: {command}"
+    return f"{n}. {tool} {command}"
 
 
 def cfg_writes(cfg: AskClaudeConfig) -> list[str]:
@@ -821,7 +876,8 @@ class AskRunner:
 
             def idle_listing() -> list[dict[str, Any]]:
                 specs = [s for s in owner_tools.tools_for(owner) if s.name != "ask_claude"]
-                return listing(sorted(specs, key=lambda s: s.name))
+                listed = listing(sorted(specs, key=lambda s: s.name))
+                return [*listed, PERMISSION_LISTING] if owner_tools.shell is not None else listed
 
             self.brain = ClaudeSession(
                 conn,
@@ -854,6 +910,7 @@ class AskRunner:
         tools: bool = False,
         tainted: bool = False,
         taint_hops: int | None = None,
+        approved: bool = False,
     ) -> Queued | AskRefused:
         """Queue an ask for ``principal`` (who gets the answer). Refused, with a code-built
         reason, when ask_claude is off, paused, at its usage limit or daily cap, or an
@@ -861,7 +918,8 @@ class AskRunner:
         ``watch``: a watch's scheduled check; its answer goes to ``on_watch``. ``tools``
         (BR-10, set by code for the brain's asks): the session gets Resonant's tools,
         starting ``tainted`` when the asking turn was (``taint_hops`` from outside
-        content, BR-10b; BR-11 keeps it for a Claude brain turn)."""
+        content, BR-10b; BR-11 keeps it for a Claude brain turn). ``approved`` (PER-258,
+        code only): Resonant's own turn running the shell changes the owner said yes to."""
         if not self.cfg.enabled:
             return AskRefused("ask_claude is off (brain.ask_claude.enabled).")
         question = question.strip()
@@ -904,6 +962,8 @@ class AskRunner:
                 if len(ahead) > self.session_cfg.queue_max:
                     return AskRefused(BUSY.format(n=len(ahead)), busy=True)
                 cp["session"] = True
+                if approved:
+                    cp["approved"] = True
                 if (said := self._owner_words(requested_by)) is not None:
                     cp["owner_text"] = said  # the queue label: the owner's own words
                 after = after_label([q for _, q in ahead]) if ahead else None
@@ -1038,7 +1098,7 @@ class AskRunner:
         if cp.get("phase") == "approval":  # BR-10: a change waits on the owner (or resumes)
             if self.resumer is None:
                 return Fail("an ask waits on an approval but has no tool bridge")
-            return await self.resumer.step(task, events, ctx)
+            return await self._resume(task, events, ctx)
         if isinstance(cp.get("reply"), str):  # answered before a crash or a send failure
             return await self._deliver(task, cp, ctx)
         left = await self._reap_left(task, cp)
@@ -1155,6 +1215,8 @@ class AskRunner:
             cp.pop("session_turn", None)
             cp.update(keep or {})
             reports = list(bridge.reports)
+            if bridge.progress and self.session_cfg is not None and self.session_cfg.progress_texts:
+                reports.append(progress_line(bridge.progress))
             pending = bool(bridge.asked) and outcome[0] == "answered"
             # Every allowed call ran by now: ``call`` never waits (BA-1: the changes that
             # ask are in ``batch``, prompted after the answer, or dropped with it).
@@ -1216,7 +1278,8 @@ class AskRunner:
         asking = cp.get("tainted") is True
         chain = brain.inherited_hops()
         bridge = ClaudeTools(self.conn, tools, caller, task, ctx, tainted=asking,
-                             server=brain.server)  # fmt: skip
+                             server=brain.server, shell=brain.shell,
+                             redactor=redactor)  # fmt: skip
         # Carried in: the asking turn (as many hops from outside content as it was: Claude
         # sees only its text, so no further) or the session's last turn (one more). Read in
         # this turn: 0 (``read_outside``). Unknown hops for a tainted ask: 0 (fail closed).
@@ -1263,7 +1326,7 @@ class AskRunner:
             out = await brain.turn(
                 argv=argv,
                 env=env,
-                message=self._turn_message(question, kind),
+                message=self._turn_message(question, kind, approved=cp.get("approved") is True),
                 primer=prime,
                 observe=bridge.observe,
                 check_init=lambda names: check_init(names, ts, "general"),
@@ -1303,8 +1366,11 @@ class AskRunner:
         return classify(out.result)
 
     @staticmethod
-    def _turn_message(question: str, kind: Kind) -> str:
-        """One owner text as the session's user message: the kind's hint, then the text."""
+    def _turn_message(question: str, kind: Kind, *, approved: bool = False) -> str:
+        """One owner text as the session's user message: the kind's hint, then the text. An
+        approved run (PER-258) is Resonant's own message, never the owner's words."""
+        if approved:
+            return f"{APPROVED_HEAD}\n{question}"
         parts = ["New text from the owner, through Resonant:"]
         if hint := KIND_HINTS.get(kind):
             parts.append(hint)
@@ -1613,7 +1679,7 @@ class AskRunner:
             nxt.update(phase="approval", answer=reply, effects=[])  # effects were in the reply
             if not ctx.save(checkpoint=nxt):
                 return Fail("task is no longer running")
-            return await self.resumer.step(replace(task, checkpoint=nxt), [], ctx)
+            return await self._resume(replace(task, checkpoint=nxt), [], ctx)
         result: dict[str, Any] = {
             "status": status,
             "kind": cp.get("kind"),
@@ -1624,6 +1690,56 @@ class AskRunner:
         if isinstance(cp.get("requested_by"), str):
             result["requested_by"] = cp["requested_by"]
         return Done(result)
+
+    # -- approved shell changes (PER-258) --
+
+    async def _resume(self, task: Task, events: list[Any], ctx: StepContext) -> StepOutcome:
+        """The approval step (the local runner's: prompt, wait, run what was approved), then
+        the Claude brain's approved changes of its own as a new turn."""
+        assert self.resumer is not None
+        out = await self.resumer.step(task, events, ctx)
+        if isinstance(out, Done):
+            self._approved_run(task)
+        return out
+
+    def _approved_run(self, task: Task) -> None:
+        """The shell changes the owner said yes to (their ``shell`` handler ran: the gate's
+        grant, once): a one-shot grant each and one new turn asking Claude to run them, so
+        it runs exactly what was approved and sees what happened. Once per task."""
+        caller, principal = self.caller, task.principal
+        if caller is None or principal is None or self.brain is None:
+            return
+        cp = task.checkpoint
+        pins = [i.call for i in batch_items(cp) or []]
+        if (single := PinnedCall.from_json(cp.get("call"))) is not None:
+            pins.append(single)
+        ran: list[PinnedCall] = []
+        for p in pins:
+            if p.extension is not None or p.tool != TOOL_WRITE:
+                continue
+            scope = CallScope(task.id, principal, task.trace_id, p.step_no, p.call_index)
+            got = caller.recorded((None, TOOL_WRITE), p.args, scope)
+            if got is not None and got.ok:
+                ran.append(p)
+        if not ran:
+            return
+        done = kv_get(self.conn, FOLLOWUPS_KV)
+        seen = [t for t in cast(list[Any], done) if isinstance(t, str)] if isinstance(
+            done, list) else []  # fmt: skip
+        if task.id in seen:
+            return
+        lines = [approved_line(n, p.args) for n, p in enumerate(ran, 1)]
+        queued = self.enqueue("\n".join(lines), principal=principal, tools=True, approved=True,
+                              trace_id=task.trace_id)  # fmt: skip
+        with atomic(self.conn):  # the grants are for that turn alone
+            kv_set(self.conn, FOLLOWUPS_KV, [*seen, task.id][-FOLLOWUPS_KEEP:])
+            if isinstance(queued, Queued):
+                for p in ran:
+                    add_grant(self.conn, p.args, task_id=queued.task_id, now=self.clock())
+            audit(self.conn, "brain.shell_approved", task_id=task.id, trace_id=task.trace_id,
+                  changes=len(ran), queued=isinstance(queued, Queued))  # fmt: skip
+        if isinstance(queued, AskRefused):
+            self._notice(APPROVED_NOT_RUN.format(why=queued.text), f"ask:approved:{task.id}")
 
     # -- helpers --
 

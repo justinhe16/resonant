@@ -1,5 +1,6 @@
 import { Alert } from "@/components/ui/alert";
-import { Ago, Counts, Dot, Empty, Row, Rows, Section, StateBadge } from "@/components/bits";
+import { Ago, Counts, Dot, Empty, LocalOnly, Row, Rows, Section, StateBadge } from "@/components/bits";
+import type { BadgeTone } from "@/components/ui/badge";
 import {
   ACTIVE_RUN_STATES,
   ACTIVE_TASK_STATES,
@@ -12,7 +13,7 @@ import {
 import { duration } from "@/lib/time";
 import { healthTone, runTone } from "@/lib/tone";
 import { cn } from "@/lib/utils";
-import type { ClaudeBrain, Snapshot } from "@/types";
+import type { BrainActivity, ClaudeBrain, Snapshot } from "@/types";
 
 interface Props {
   snap: Snapshot;
@@ -147,30 +148,95 @@ export function Overview({ snap, now, go, stale = false }: Props) {
         )}
       </Section>
 
-      {snap.claude_brain && <ClaudeBrainSection brain={snap.claude_brain} />}
+      {(snap.claude_brain || snap.brain_activity) && (
+        <ClaudeBrainSection
+          brain={snap.claude_brain}
+          activity={snap.brain_activity}
+          local={snap.tier === "local"}
+          now={now}
+        />
+      )}
     </div>
   );
 }
 
-function ClaudeBrainSection({ brain }: { brain: ClaudeBrain }) {
-  const remoteUrl = brain.state === "up" ? safeHttpsUrl(brain.remote_url) : null;
+const DECISION_TONE: Record<string, BadgeTone> = {
+  allowed: "neutral",
+  read: "neutral",
+  resonant: "neutral",
+  gate: "ok",
+  granted: "ok",
+  asked: "warn",
+  refused: "bad",
+  denied: "bad",
+};
+
+function ClaudeBrainSection({
+  brain,
+  activity,
+  local,
+  now,
+}: {
+  brain?: ClaudeBrain;
+  activity?: BrainActivity;
+  local: boolean;
+  now: number;
+}) {
+  const remoteUrl = brain?.state === "up" ? safeHttpsUrl(brain.remote_url) : null;
+  const tools = brain?.tools ?? [];
   return (
     <Section title="Claude brain">
-      <div className="flex flex-wrap items-center gap-3 text-sm">
-        <StateBadge tone={brain.state === "up" ? "ok" : "neutral"}>{brain.state}</StateBadge>
-        <span className="text-muted-foreground">
-          {brain.turns} turn{brain.turns === 1 ? "" : "s"}
-        </span>
-        {remoteUrl && (
-          <a
-            href={remoteUrl}
-            target="_blank"
-            rel="noreferrer noopener"
-            className="font-medium text-info underline-offset-2 hover:underline"
-          >
-            Remote Control
-          </a>
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          {brain && (
+            <>
+              <StateBadge tone={brain.state === "up" ? "ok" : "neutral"}>{brain.state}</StateBadge>
+              <span className="text-muted-foreground">
+                {brain.turns} turn{brain.turns === 1 ? "" : "s"}
+              </span>
+            </>
+          )}
+          {activity && (
+            <span className="text-muted-foreground" data-testid="brain-activity">
+              {activity.calls_today} tool call{activity.calls_today === 1 ? "" : "s"} today,{" "}
+              {activity.writes_today} change{activity.writes_today === 1 ? "" : "s"}
+            </span>
+          )}
+          {remoteUrl && (
+            <a
+              href={remoteUrl}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="font-medium text-info underline-offset-2 hover:underline"
+            >
+              Remote Control
+            </a>
+          )}
+        </div>
+        {local && tools.length > 0 && (
+          <Rows>
+            {tools.map((t, i) => (
+              <Row key={`${t.at}-${i}`} className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="font-mono text-sm break-all">
+                    <span className="text-muted-foreground">{t.tool}</span> {t.command}
+                  </p>
+                  {t.cwd && <p className="mt-0.5 truncate text-xs text-muted-foreground">{t.cwd}</p>}
+                </div>
+                <div className="flex shrink-0 flex-col items-end gap-1">
+                  <StateBadge tone={t.status === "error" ? "bad" : (DECISION_TONE[t.decision] ?? "neutral")}>
+                    {t.decision}
+                    {t.status === "error" ? " · error" : ""}
+                  </StateBadge>
+                  <span className="text-xs text-muted-foreground">
+                    <Ago iso={t.at} now={now} />
+                  </span>
+                </div>
+              </Row>
+            ))}
+          </Rows>
         )}
+        {!local && <LocalOnly what="Its tool calls" />}
       </div>
     </Section>
   );

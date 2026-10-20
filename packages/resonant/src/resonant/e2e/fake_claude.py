@@ -12,6 +12,14 @@ command, args and env). Then it acts out the plan:
 - ``calls``: each is a ``tool_use`` of ``mcp__resonant__<name>`` in the stream, then the MCP
   ``tools/call`` through the relay, then its ``tool_result``; ``"after_read": true`` puts a
   ``WebFetch`` use right before it.
+- ``shell`` (PER-258): Claude Code's own tools, after the calls: each ``{"tool": "Bash",
+  "command": ...}`` (or ``Edit``/``Write`` with their input) is a ``tool_use`` in the stream;
+  a command that a ``Bash(<prefix>:*)`` rule on ``--allowedTools`` covers (one simple
+  command, no ``ask`` rule in ``--settings``) runs at once, anything else is a permission
+  request to ``--permission-prompt-tool`` (``{tool_name, input, tool_use_id}``) and runs
+  only on ``{"behavior": "allow"}``. It really runs: ``bash -c`` in the fake's shell
+  directory (a lone ``cd <dir>`` moves it, as Claude Code's Bash does), or the file edit.
+  Its result text joins the call results.
 - ``answer``: the final result text; ``{r0}``, ``{r1}``... are replaced by the calls' result
   texts (clipped to 200 characters). In a session, ``{prev}`` is the previous message this
   session saw (its last line, clipped to 200), ``{n}`` how many it has seen.
@@ -39,9 +47,12 @@ approval code must never be in it). Standard library only.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -115,6 +126,12 @@ class Fake:
                 self.listed += tools
                 self.names += [f"mcp__{name}__{t['name']}" for t in tools]
         self.tools = [t for t in a.tools.split(",") if t] + self.names
+        self.cwd = os.getcwd()
+        self.allowed = [t for t in (a.allowedTools or "").split(",") if t]
+        settings: dict[str, Any] = json.loads(a.settings) if a.settings else {}
+        perms = cast(dict[str, Any], settings.get("permissions") or {})
+        asks: Any = perms.get("ask") or []
+        self.ask_rules = [str(r) for r in cast(list[Any], asks)]
 
     def plan(self, message: str) -> dict[str, Any]:
         plan: dict[str, Any] = json.loads(Path(self.a.script).read_text())
@@ -162,6 +179,84 @@ class Fake:
                 {"type": "tool_result", "tool_use_id": tid, "content": text}]}})  # fmt: skip
         return results
 
+    def shell(self, plan: dict[str, Any], results: list[str]) -> None:
+        """The plan's own tool uses (PER-258): pre-allowed, or asked of the permission tool."""
+        for step in cast(list[dict[str, Any]], plan.get("shell") or []):
+            tool = str(step.get("tool", "Bash"))
+            given = {k: v for k, v in step.items() if k != "tool"}
+            tid = self.use(tool, given)
+            if tool == "Bash" and self._preallowed(str(given.get("command", ""))):
+                text, error = self._run(tool, given)
+            else:
+                verdict = self._ask(tool, given, tid)
+                if verdict.get("behavior") == "allow":
+                    text, error = self._run(tool, verdict.get("updatedInput") or given)
+                else:
+                    text, error = str(verdict.get("message", "denied")), True
+            results.append(text)
+            out({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": tid, "content": text,
+                 "is_error": error}]}})  # fmt: skip
+
+    def _preallowed(self, command: str) -> bool:
+        if re.search(r"&&|\|\||[;|&<>`\n]|\$\(", command):
+            return False  # Claude Code asks for anything compound
+        if any(fnmatch.fnmatchcase(command, r[5:-1]) for r in self.ask_rules
+               if r.startswith("Bash(")):  # fmt: skip
+            return False
+        for rule in self.allowed:
+            m = re.fullmatch(r"Bash\((.*)\)", rule)
+            if m is None:
+                continue
+            body = m.group(1)
+            if body.endswith(":*") and (
+                command == body[:-2] or command.startswith(body[:-2] + " ")
+            ):
+                return True
+            if command == body:
+                return True
+        return False
+
+    def _ask(self, tool: str, given: dict[str, Any], tid: str) -> dict[str, Any]:
+        name = (self.a.permission_prompt_tool or "").removeprefix("mcp__resonant__")
+        server = self.servers.get("resonant")
+        if not name or server is None:
+            return {"behavior": "deny", "message": "no permission tool"}
+        reply = server.request("tools/call", {"name": name, "arguments": {
+            "tool_name": tool, "input": given, "tool_use_id": tid}})  # fmt: skip
+        content = reply.get("result", {}).get("content") or [{"text": "{}"}]
+        try:
+            return cast(dict[str, Any], json.loads(str(content[0].get("text", "{}"))))
+        except ValueError:
+            return {"behavior": "deny", "message": "bad permission answer"}
+
+    def _run(self, tool: str, given: dict[str, Any]) -> tuple[str, bool]:
+        if tool == "Bash":
+            command = str(given.get("command", ""))
+            words = shlex.split(command) if command.startswith("cd ") else []
+            if len(words) == 2 and words[0] == "cd" and os.path.isdir(words[1]):
+                self.cwd = os.path.join(self.cwd, words[1])
+                return "", False
+            done = subprocess.run(  # noqa: S603 - the plan the test wrote
+                ["/bin/bash", "-c", command], cwd=self.cwd, capture_output=True, text=True,
+                timeout=60, check=False,
+            )  # fmt: skip
+            text = (done.stdout + done.stderr).strip()
+            if done.returncode:
+                return f"Exit code {done.returncode}\n{text}", True
+            return text or "(Bash completed with no output)", False
+        path = Path(str(given.get("file_path", "")))
+        if tool == "Write":
+            path.write_text(str(given.get("content", "")))
+            return f"File created successfully at: {path}", False
+        if tool == "Edit":
+            old = path.read_text()
+            path.write_text(
+                old.replace(str(given.get("old_string")), str(given.get("new_string")), 1)
+            )
+            return f"The file {path} has been updated.", False
+        return f"{tool} isn't something the fake runs", True
+
     @staticmethod
     def answer(plan: dict[str, Any], results: list[str], **fill: str) -> str:
         answer = str(plan.get("answer", "Done looking."))
@@ -189,6 +284,7 @@ class Fake:
         self.init("fake-brain")
         plan = self.plan(prompt)
         results = self.act(plan)
+        self.shell(plan, results)
         self.close()
         self.notes(prompt=prompt, results=results)
         out({"type": "result", "subtype": "success", "is_error": False,
@@ -232,6 +328,7 @@ class Fake:
             self.init(sid)
             plan = self.plan(text.splitlines()[-1] if text else "")  # the owner's text
             results = self.act(plan)
+            self.shell(plan, results)
             self.notes(prompt=text, results=results, session_id=sid, resumed=bool(a.resume),
                        pid=os.getpid(), messages=messages)  # fmt: skip
             crash = plan.get("crash")
@@ -275,6 +372,9 @@ def main() -> int:
     ap.add_argument("--input-format")
     ap.add_argument("--session-id")
     ap.add_argument("--resume")
+    ap.add_argument("--allowedTools")
+    ap.add_argument("--settings")
+    ap.add_argument("--permission-prompt-tool")
     a, _rest = ap.parse_known_args()
     fake = Fake(a)
     if a.input_format == "stream-json":

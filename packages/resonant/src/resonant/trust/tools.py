@@ -26,6 +26,11 @@ What never gets a standing allow (``scope`` returns None, so the prompt doesn't 
 - ``merge_run``, whose level already follows the merge trust rules and flagged paths;
 - an action or scope that isn't a valid slug (too long, odd characters).
 
+The Claude brain's shell changes (``shell``, PER-258) are matched per verb and repo: the
+action is ``tool:shell.<verb>`` (``tool:shell.git-push``) on the repo the command runs in, so
+"don't ask for git push in resonant" is ``allow_trust_rule(scope=resonant,
+action=tool:shell.git-push)``. Their prompt never offers ``yes always``.
+
 The gate (``PolicyGate``) applies it only to the owner's own ``inferred`` calls of a tool at
 L2, never at L1, never under the kill switch (autonomy off asks for everything) and never
 in dry run (which comes first). The slash-only control commands (``/kill``, ``/resume``,
@@ -36,6 +41,7 @@ approved ``allow_trust_rule``), never by extension output.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -54,6 +60,9 @@ NEVER: frozenset[str] = frozenset(
 MCP_PREFIX = "mcp__resonant__"  # how Claude names Resonant's tools (runners/ask_tools.py)
 
 BUILTIN_SYSTEM = "resonant"  # the system a builtin's call is matched as
+SHELL = "shell"  # the Claude brain's shell changes (tools/shell.py): matched per verb
+# Only a git or gh verb can stand (never a compound, a script, an interpreter or a force push).
+SHELL_VERB = re.compile(r"(git|gh)-[a-z][a-z-]*")
 
 
 @dataclass(frozen=True)
@@ -152,6 +161,10 @@ class StandingAllows:
         if intent.extension is None and intent.tool in NEVER:
             return None
         action = tool_action(intent.extension, intent.tool)
+        if intent.extension is None and intent.tool == SHELL:
+            verb = intent.args.get("verb")
+            ok = isinstance(verb, str) and SHELL_VERB.fullmatch(verb) and verb != "git-push-force"
+            action = tool_action(None, f"{SHELL}.{verb}") if ok else None
         if action is None:
             return None
         repo_arg = intent.args.get("repo")
@@ -189,6 +202,8 @@ class StandingAllows:
         """The rule to offer with ``yes always`` on this call's prompt: None when the tool
         can't have one or an owner's ``ask`` rule decided it (changed over chat, not from a
         prompt)."""
+        if intent.extension is None and intent.tool == SHELL:
+            return None  # a shell change's rule is made over chat, never by ``yes always``
         found = self.decider(intent)
         if found is None:
             return None

@@ -33,6 +33,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, cast, get_args
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from pydantic.config import JsonDict
@@ -46,6 +47,7 @@ from resonant.monitor import EXT_CHECK_PREFIX, health_snapshot
 from resonant.store import approvals, pulse, questions, repos, runs, trust
 from resonant.store import extensions as ext_store
 from resonant.store import tasks as task_store
+from resonant.store.claude_brain import recent_tools, tool_counts
 from resonant.store.claude_brain import status_of as claude_status
 from resonant.store.db import kv_get, utcnow
 from resonant.store.extensions import ExtensionStatus
@@ -56,6 +58,7 @@ from resonant.store.runs import WaitReason
 
 SCHEMA_VERSION: Final = 1
 RUN_ITEMS = 50  # active runs first, then the most recent (``runs.recent``)
+BRAIN_TOOL_ITEMS = 20  # the Claude brain's last tool calls (PER-258)
 
 # A field only the local tier carries. ``to_remote`` clears it; None is left out of the output.
 LOCAL_ONLY: Final[JsonDict] = {"x-tier": "local"}
@@ -202,13 +205,35 @@ class Runner(_Model):
     missing: list[str] | None = _local()  # what to set up, in words
 
 
+class BrainTool(_Model):
+    """PER-258: one of the Claude brain's tool calls (its ``brain.tool`` audit row)."""
+
+    at: datetime
+    tool: str
+    decision: str  # allowed (the read list), read, gate, granted, asked, refused, denied, resonant
+    command: str  # redacted and clipped by the bridge
+    cwd: str
+    status: Literal["ok", "error"]
+    write: bool
+
+
 class ClaudeBrain(_Model):
     """BR-11: the Claude brain's session (local tier only, like the rest of the claude
-    details): up or down, its turns, and its Remote Control link while one is on."""
+    details): up or down, its turns, its Remote Control link while one is on, and its last
+    tool calls (PER-258)."""
 
     state: Literal["up", "down"]
     turns: int
     remote_url: str | None = _local()
+    tools: list[BrainTool] = Field(default_factory=list[BrainTool])
+
+
+class BrainActivity(_Model):
+    """PER-258: the Claude brain's tool calls today (``settings.timezone``), counts only, so
+    the remote tier has them too: every call, and the changes that ran."""
+
+    calls_today: int
+    writes_today: int
 
 
 class TrustRule(_Model):
@@ -256,6 +281,8 @@ class Snapshot(_Model):
     trust_rules: list[TrustRule] | None = _local()
     repos: list[RepoItem] | None = _local()
     claude_brain: ClaudeBrain | None = _local()  # BR-11; None before its first start
+    brain_activity: BrainActivity = Field(default_factory=lambda: BrainActivity(
+        calls_today=0, writes_today=0))  # fmt: skip
 
 
 # --- tiers --------------------------------------------------------------------------------
@@ -524,6 +551,7 @@ def build_snapshot(
             RepoItem(name=r.name, mode=r.mode, base=r.base, ci=r.ci) for r in repos.list_all(conn)
         ],
         claude_brain=_claude_brain(conn),
+        brain_activity=_brain_activity(conn, settings, now),
     )
 
 
@@ -540,7 +568,35 @@ def _claude_brain(conn: sqlite3.Connection) -> ClaudeBrain | None:
         state="up" if up else "down",
         turns=int(found.get("turns") or 0),
         remote_url=url if up and isinstance(url, str) and _RC_URL.fullmatch(url) else None,
+        tools=_brain_tools(conn),
     )
+
+
+def _brain_tools(conn: sqlite3.Connection) -> list[BrainTool]:
+    out: list[BrainTool] = []
+    for row in recent_tools(conn, BRAIN_TOOL_ITEMS):
+        try:
+            out.append(
+                BrainTool(
+                    at=datetime.fromisoformat(str(row.get("at"))),
+                    tool=str(row.get("tool") or "?")[:64],
+                    decision=str(row.get("decision") or "?")[:16],
+                    command=str(row.get("command") or "")[:200],
+                    cwd=str(row.get("cwd") or "")[:300],
+                    status="error" if row.get("status") == "error" else "ok",
+                    write=row.get("write") is True,
+                )
+            )
+        except ValueError:
+            continue
+    return out
+
+
+def _brain_activity(conn: sqlite3.Connection, settings: Settings, now: datetime) -> BrainActivity:
+    local = now.astimezone(ZoneInfo(settings.timezone))
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    counts = tool_counts(conn, midnight)
+    return BrainActivity(calls_today=counts["calls"], writes_today=counts["writes"])
 
 
 if __name__ == "__main__":

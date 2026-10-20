@@ -39,6 +39,7 @@ from resonant.tools import (
     reminders,
     repos,
     runs,
+    shell,
     system,
     tasks,
     trust,
@@ -88,6 +89,7 @@ BUILTIN_MODULES: tuple[BuiltinModule, ...] = (
     facts,
     ask,
     watches,
+    shell,
 )
 BUILTIN_SPECS: tuple[ToolSpec, ...] = tuple(s for m in BUILTIN_MODULES for s in m.SPECS)
 
