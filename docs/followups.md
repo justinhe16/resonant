@@ -11,7 +11,7 @@ Only the things that need you, the owner, at the Mini or on your phone. Planned 
 ## Ongoing
 
 - **Branch protection as repos are added.** On GitHub, protect each repo you care about: require a PR and CI on the base branch, and keep the app out of the bypass list. Say "no CI edits in <repo>" where Actions secrets matter.
-- **Review the drafted eval rows** once PER-248 lands. I'll draft them from your past texts, and you fix the expected answers.
+- **Review the drafted eval rows** (PER-248). Once Claude has run `resonant eval draft --from-history` with your OK, open `~/.resonant/evals/task.jsonl`; for each row fix `expect`, add the `facts` a right answer must contain, read the `note` (what can't be replayed) and set `"review": false`. Then `resonant eval task --set owner --repeat 3`. Rows still marked `review: true` are listed, not graded. How it drafts: [`evals/README.md`](../evals/README.md#drafting-from-your-texts).
 
 ## Optional
 

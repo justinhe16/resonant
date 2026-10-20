@@ -78,6 +78,12 @@
   ``~/.resonant/evals/results/``), ``task-<ts>.json``. Exit 0 when every mode run reached
   ``--min-accuracy`` (0.85, the cut-over bar), 1 below it, 2 for a bad set.
 
+- **Review gate (PER-248).** A row with ``review: true`` (drafted from the owner's past
+  texts by ``resonant eval draft --from-history``, ``evals/history.py``) is listed as
+  awaiting review and neither run nor graded until the owner sets it to false. ``draft``
+  (where the row came from) is kept for the owner and ignored here. ``--set owner`` is
+  ``<home>/evals/task.jsonl``.
+
 Texts and replies are PII: they appear only in what the CLI prints for failing cases.
 """
 
@@ -184,8 +190,9 @@ EXPECT_KEYS = frozenset(
 )  # fmt: skip
 RUN_STATUSES: tuple[str, ...] = get_args(run_store.Status)
 ROW_KEYS = frozenset(
-    {"id", "category", "text", "history", "world", "expect", "script", "note", "triage", "claude"}
-)
+    {"id", "category", "text", "history", "world", "expect", "script", "note", "triage", "claude",
+     "review", "draft"}
+)  # fmt: skip
 Route = Literal["triage", "local", "claude"]
 ROUTES: tuple[Route, ...] = get_args(Route)
 FAKE_CLAUDE = Path(__file__).resolve().parent.parent / "e2e" / "fake_claude.py"
@@ -193,13 +200,30 @@ FAKE_TOKEN = "sk-ant-oat01-EVALFAKETOKEN0000000000"  # noqa: S105 - a fake Keych
 WORLD_KEYS = frozenset({"repos", "files", "runs", "notes", "reminders", "facts", "extensions"})
 
 
+OWNER_SET = "owner"  # ``--set owner``: the owner's own set (``owner_set_path``)
+
+
+def owner_set_path(settings: Settings) -> Path:
+    """``<home>/evals/task.jsonl``: the owner's set, drafted by ``resonant eval draft``."""
+    return settings.home / "evals" / "task.jsonl"
+
+
 def default_set_path(settings: Settings) -> Path:
     """``~/.resonant/evals/task.jsonl`` when the owner has built one, else the repo's
     synthetic ``evals/task.example.jsonl``."""
-    own = settings.home / "evals" / "task.jsonl"
+    own = owner_set_path(settings)
     if own.exists() or settings.ops.repo_path is None:
         return own
     return settings.ops.repo_path / "evals" / "task.example.jsonl"
+
+
+def resolve_set_path(settings: Settings, set_path: Path | None) -> Path:
+    """``--set``: a path, ``owner`` (the owner's set), or nothing (the default)."""
+    if set_path is None:
+        return default_set_path(settings)
+    if str(set_path) == OWNER_SET:
+        return owner_set_path(settings)
+    return set_path.expanduser()
 
 
 def results_dir(settings: Settings) -> Path:
@@ -239,6 +263,7 @@ class TaskCase:
     script: list[Any] | None
     triage: dict[str, Any] | None = None  # the scripted model's triage answer (BR-10)
     claude: dict[str, Any] | None = None  # a scripted Claude session (BR-10)
+    review: bool = False  # PER-248: a drafted row the owner hasn't checked; not graded
 
 
 def _strs(v: Any, where: str) -> tuple[str, ...]:
@@ -489,6 +514,11 @@ def load_set(path: Path) -> list[TaskCase]:
                 raise ValueError("'category' must be a short lowercase word")
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("'text' must be a non-empty string")
+            review = row.get("review", False)
+            if not isinstance(review, bool):
+                raise ValueError("'review' must be true or false")
+            if row.get("draft") is not None and not isinstance(row.get("draft"), dict):
+                raise ValueError("'draft' must be an object")
             case = TaskCase(
                 line=n,
                 id=cid,
@@ -500,6 +530,7 @@ def load_set(path: Path) -> list[TaskCase]:
                 script=_script(row.get("script")),
                 triage=_triage(row.get("triage")),
                 claude=_claude(row.get("claude")),
+                review=review,
             )
         except ValueError as e:
             raise EvalSetError(f"{path}:{n}: {e}") from None
@@ -1477,6 +1508,15 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
         f"task eval  {meta['set']}  ({meta['cases']} cases x {meta['repeat']}, model "
         f"{meta['model']}, route {meta.get('route', 'triage')})"
     ]
+    pending: dict[str, Any] = meta.get("review") or {}
+    if pending.get("pending"):
+        out += [
+            "",
+            f"awaiting review ({pending['pending']}): drafted rows still marked review: true,"
+            " not run or graded",
+        ]
+        cases: list[dict[str, Any]] = pending["cases"]
+        out += [f"  line {c['line']:>3} {c['id']}" for c in cases]
     for mode, s in report["modes"].items():
         passed = "ok" if mode_passed(s, meta["min_accuracy"]) else "BELOW TARGET"
         esc, ask = s["escalation"], s["ask"]
@@ -1637,20 +1677,31 @@ def run(
 
     ``settings`` is the owner's config: only its model, timezone and (for the default set
     and results dir) home are used. ``model`` overrides the live client (tests)."""
-    path = (set_path or default_set_path(settings)).expanduser()
+    path = resolve_set_path(settings, set_path)
     try:
         cases = load_set(path)
         digest = set_digest(path)
     except EvalSetError as e:
         echo_err(f"error: {e}")
-        if set_path is None:
-            echo_err("build your set first, or pass --set evals/task.example.jsonl")
+        if set_path is None or str(set_path) == OWNER_SET:
+            echo_err(
+                "build your set first (resonant eval draft --from-history), "
+                "or pass --set evals/task.example.jsonl"
+            )
         return EXIT_BAD_SET
     if only:
         cases = [c for c in cases if only in (c.id, c.category)]
         if not cases:
             echo_err(f"error: no case has id or category {only!r}")
             return EXIT_BAD_SET
+    cases, pending = split_review(cases)
+    review = {"pending": len(pending), "cases": [{"id": c.id, "line": c.line} for c in pending]}
+    if not cases:
+        echo(
+            f"awaiting review ({len(pending)}): every case is still marked review: true. "
+            f'Check each row\'s expect in {path}, then set "review": false.'
+        )
+        return EXIT_BAD_SET
 
     async def go() -> dict[str, list[CaseResult]]:
         if model_kind == "scripted":
@@ -1681,6 +1732,7 @@ def run(
             "set": str(path),
             "set_sha256": digest,
             "cases": len(cases),
+            "review": review,
             "repeat": repeat,
             "model": "scripted" if model_kind == "scripted" else settings.model.name,
             "modes": list(modes),
@@ -1699,6 +1751,11 @@ def run(
     else:
         echo(render_text(report, by_mode))
     return EXIT_OK if passed else EXIT_BELOW_MIN
+
+
+def split_review(cases: Sequence[TaskCase]) -> tuple[list[TaskCase], list[TaskCase]]:
+    """The cases to grade, and the drafted ones still awaiting the owner's review."""
+    return [c for c in cases if not c.review], [c for c in cases if c.review]
 
 
 def mode_passed(summary: Mapping[str, Any], min_accuracy: float) -> bool:
@@ -1735,9 +1792,12 @@ __all__ = [
     "TaskCase",
     "grade",
     "load_set",
+    "owner_set_path",
+    "resolve_set_path",
     "run",
     "run_case",
     "run_set",
     "seed_world",
+    "split_review",
     "summarize",
 ]

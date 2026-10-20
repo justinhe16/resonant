@@ -1,6 +1,6 @@
 # evals
 
-The example sets here are synthetic. Your real sets, built from your own texts, live outside the public repo in `~/.resonant/evals/` and are passed with `--set`.
+The example sets here are synthetic. Your real sets, built from your own texts, live outside the public repo in `~/.resonant/evals/` and are passed with `--set`. `resonant eval draft --from-history` drafts the task set from your past texts (see [Drafting from your texts](#drafting-from-your-texts)).
 
 - `router.example.jsonl`: `{text, intent}` pairs for the router. Run with `resonant eval router`.
 - `router.extensions.example.jsonl`: rows for the repo's extensions (`extension:github`, `extension:linear`) and near-misses. It only loads when those extensions are installed (the eval reads extension intents from the store): `resonant eval router --set evals/router.extensions.example.jsonl`. `tests/test_ext_mcp_http.py` checks it against the manifests.
@@ -72,7 +72,7 @@ The synthetic `router.example.jsonl` only proves the pipeline works (tests run i
 ## Task eval
 
 ```sh
-resonant eval task [--set PATH] [--model live|scripted] [--mode loop|intents|both]
+resonant eval task [--set PATH|owner] [--model live|scripted] [--mode loop|intents|both]
                    [--repeat N] [--only ID|CATEGORY] [--json] [--min-accuracy 0.85] [--out DIR]
 ```
 
@@ -114,6 +114,9 @@ One JSON object per line (blank lines skipped):
   - `writes`: the side effects allowed to run without an approval. Any other one that ran fails the case (`unapproved_write`): the injection check.
   - `facts`: substrings that must all be in the reply (case-insensitive; `a|b` = either); `facts_re`: regexes; `not_facts`: substrings that must not be.
   - `max_rounds`: model rounds at most.
+- `review` (optional, default `false`): `true` on a drafted row you haven't checked yet. Such a row is listed under "awaiting review" by id and line, and is neither run nor graded until you set it to `false`. A set where every row still awaits review exits 2.
+- `note` (optional): free text for you, ignored by the eval. A drafted row uses it to say what can't be replayed faithfully.
+- `draft` (optional): where a drafted row came from (`task`, `at`, `status`, `reply`: the reply you got then). Ignored by the eval.
 - `script` (for `--model scripted`): a list of rounds. A list of `[tool, args]` pairs is one round of tool calls, a string is the final reply. `{root}` is the world root and `{in:N}` the time N minutes from now (for `add_reminder`).
 
 The whole row, world included, is checked when the set loads: a load error names the line, never the text.
@@ -130,4 +133,30 @@ The cases run with settings built from their arguments only (`IsolatedSettings`)
 
 ### Your own set
 
-`~/.resonant/evals/task.jsonl` is the default when it exists (else the example set). Start from the example set: replace its texts with ones you actually send, keep the worlds small, and write facts that any correct answer must contain (a path, a PR number, a run code), not wording. Rows for your own extensions need a fixture in `resonant.evals.task_eval.FIXTURES`. A failing case is the point: read what it called and what it said before changing a prompt.
+`~/.resonant/evals/task.jsonl` is the default when it exists (else the example set); `--set owner` always means that file. Draft it from your texts (below), or start from the example set: replace its texts with ones you actually send, keep the worlds small, and write facts that any correct answer must contain (a path, a PR number, a run code), not wording. Rows for your own extensions need a fixture in `resonant.evals.task_eval.FIXTURES`. A failing case is the point: read what it called and what it said before changing a prompt.
+
+### Drafting from your texts
+
+```sh
+resonant eval draft --from-history [--since 30d|2026-09-01] [--limit 200] [--out PATH] [--json]
+resonant eval task --set owner [--repeat 3]
+```
+
+`eval draft` reads the store (read-only) and appends one row per past text to `~/.resonant/evals/task.jsonl`, newest texts first up to `--limit`, written oldest first. For each of your chat texts it reads the message, the tools the turn called (the `gate.evaluate` audit rows on its trace, the local model's and the Claude brain's), the approvals you answered, the reply you got and the route it took, and suggests:
+
+- `route`: `local` or `claude`, as it went (none on the old intents path).
+- `tools`: every tool called, except `ask_claude` (the route covers it) and the ones you refused.
+- `tools_not`: the writes you said no to, or the gate denied.
+- `ask`: `"approval"` when the gate asked you, `true` when the reply asked you back and nothing ran, else `false`.
+- `writes`: the writes that ran without asking you (trust rules, standing allows, L3).
+
+`facts` are left for you: write what a correct answer must contain. Every row gets `review: true`.
+
+**The world** is the store as it was when the text came in: the repos registered then; when the turn used them, the runs (with their status at that moment), the notes and the pending reminders; the facts (as they are now); and the eval's extension fixtures with their canned defaults. Real files, git history, run transcripts and extensions with no fixture aren't copied, and the brain's rolling summary isn't replayed (up to 3 earlier texts within 30 minutes are seeded as `history`). The row's `note` lists what's missing, so you can add it or drop the row.
+
+**What it leaves out.** Approval replies (`yes`, `no K4`…) are skipped, and so is any text holding something credential-shaped (a token, a key, `password=…`). In what's kept (texts, earlier turns, replies, run asks, notes) anything that could pass for an approval code becomes `?`, and every principal's handles, emails, phone numbers and `@mentions` become `[handle]`. The command prints counts and the path, never a text.
+
+**Dedupe.** Texts that are the same once case, punctuation and emoji are dropped, or at least 90% similar, are drafted once (the newest). A rerun keeps every row already in the file as it is, your edits included, and adds only texts it hasn't drafted (by task id and by text).
+
+**Reviewing.** For each row: fix the `expect` (the draft copies what happened, which isn't always what should have happened), add `facts`, check the `note`, then set `"review": false`. `resonant eval task --set owner` grades only those; the rest are listed. The file stays on the Mini (0600, under `~/.resonant/evals/`); nothing is sent anywhere.
+
