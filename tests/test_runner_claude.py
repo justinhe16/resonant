@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -1097,7 +1098,8 @@ subprocess.run([sys.executable, "-c", middle], check=True)
 open({str(pids)!r} + ".kid", "w").write(str(kid.pid))
 time.sleep(600)
 """
-    leader = spawn(leader_code, env={"RESONANT_RUN": "R7"})
+    marker = f"session-{uuid.uuid4()}"  # machine-wide: unique, like a real session id
+    leader = spawn(leader_code, env={"RESONANT_RUN": marker})
     await until(lambda: (tmp_path / "pids.kid").exists() and pids.exists())
     kid, orphan = int((tmp_path / "pids.kid").read_text()), int(pids.read_text())
     started = psutil.Process(leader.pid).create_time()
@@ -1105,7 +1107,7 @@ time.sleep(600)
     # The orphan is no descendant and not in the leader's group: only the marker finds it.
     assert orphan not in {c.pid for c in psutil.Process(leader.pid).children(recursive=True)}
     assert os.getpgid(orphan) != leader.pid
-    target = Target(leader.pid, leader.pid, started, run_dir=tmp_path / "nowhere", marker="R7")
+    target = Target(leader.pid, leader.pid, started, run_dir=tmp_path / "nowhere", marker=marker)
     assert await reaper.reap(target, grace_s=0.5) >= 3
     leader.wait(timeout=5)
     await until(lambda: not (live(kid) or live(orphan)), 5, "escapees to die")
@@ -1794,11 +1796,15 @@ async def test_the_daemon_registers_the_runner_and_the_cleanup_job(
 
 async def test_reap_marker_is_the_session_id_not_the_run_code(tmp_path: Path) -> None:
     """Another daemon instance's R1 (same code, other session) is not ours to kill."""
+    # The reaper looks for the marker machine-wide: a fixed one also matched the sleeper of
+    # this same test in another pytest process (two worktrees testing at once), so it is
+    # unique per test, as a real session id is.
+    session = f"session-{uuid.uuid4()}"
     other = spawn(SLEEPER, env={"RESONANT_RUN": "R1"})
-    mine = spawn(SLEEPER, env={"RESONANT_RUN": "session-uuid-1"})
+    mine = spawn(SLEEPER, env={"RESONANT_RUN": session})
     try:
         await until(lambda: live(other.pid) and live(mine.pid))
-        t = Target(None, None, None, marker="session-uuid-1")
+        t = Target(None, None, None, marker=session)
         assert await reaper.reap(t, grace_s=0.3) == 1
         mine.wait(timeout=5)
         assert other.poll() is None
