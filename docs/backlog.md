@@ -345,10 +345,6 @@ The real model misses 6 of 190 (95 rows ×2, EM-8: 96.8%, still above the 90% ba
 - **Rows that grade wording.** `runs-waiting` (fact `mycelium`) and `ext-prs-failing` (fact `httpx`) fail on correct answers that name the run or PR by code instead (R2, `#17 in justinhe16/dori`). Not changed: the owner may want the names; if not, widen the facts.
 - **Briefing paths are absolute.** Rendering repo paths as `~/code/…` made the model invent a home (`/Users/owner/code/…`) and fail every read; the briefing keeps absolute paths.
 
-## Scheduler inline jobs onto ToolCore
-
-Ticketed: Linear PER-247.
-
 ## BR-11 carry-overs: the Claude brain
 
 *Noted 2026-10-19 from BR-11 ([`brain-plan.md`](brain-plan.md#br-11-the-claude-brain-one-long-lived-session-2026-10-19)).*

@@ -192,3 +192,22 @@ async def test_refuses_inside_transaction(db: sqlite3.Connection, task_id: str) 
     i = make(task_id)
     with pytest.raises(RuntimeError, match="inside a transaction"), transaction(db):
         await ex.execute(i, gate.allow(i), step_no=1)
+
+
+async def test_inline_executor_only_spends_the_token(db: sqlite3.Connection, task_id: str) -> None:
+    """PER-247: the scheduler's inline L0 jobs go through ToolCore over an InlineExecutor,
+    which spends the Allow's token once and writes nothing (the scheduler runs the job)."""
+    from resonant.toolcore import InlineExecutor
+
+    gate = FakeGate()
+    ex = InlineExecutor(gate)
+    i = make(task_id, READ)
+    allow = gate.allow(i)
+    result = await ex.execute(i, allow, step_no=0)
+    assert result.ok and result.data == {} and gate.tokens == {}
+    with pytest.raises(NotAllowedError):
+        await ex.execute(i, allow, step_no=0)  # spent
+    with pytest.raises(NotAllowedError):
+        await ex.execute(i, DryRun(would="peek"), step_no=0)
+    assert ex.recorded("any") is None
+    assert db.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0

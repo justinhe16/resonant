@@ -18,8 +18,9 @@ Each job's tick calls ``cron.decide`` over its ``ext_jobs`` state, then:
 Execution by effective level (origin ``scheduled``, principal the owner):
 
 - **L0** (and core jobs): no task row. It runs inline as a background coroutine, at most
-  ``extensions.max_concurrent_jobs`` at once. An extension job is gated with
-  ``task_id="job:<ext>/<id>:<due>"`` (the gate audits it); there is no executor row. Its
+  ``extensions.max_concurrent_jobs`` at once. An extension job is gated through the tool
+  core (``ToolCore.call`` with ``task_id="job:<ext>/<id>:<due>"``; the gate audits it) over
+  an ``InlineExecutor``, which only spends the token: there is no executor row. Its
   secrets come from the ``SecretStore`` here, and its result and events are redacted. When
   it ends, ``mark_due``, ``record_run``, its events and the ``job.run`` (or ``job.failed``,
   ``job.killed``) audit row are written in one transaction. A run cut short by shutdown
@@ -76,7 +77,8 @@ from resonant.extensions.cron import (
 from resonant.extensions.notify import take_baseline
 from resonant.extensions.process import ExtAmbiguous, ExtFailed, ProcessTracker
 from resonant.extensions.pulse_job import pulse_job
-from resonant.gate import Allow, DryRun, Gate, Intent
+from resonant.gate import Gate
+from resonant.gate.policy import APPROVAL_USED
 from resonant.gate.types import Deny
 from resonant.loop.types import PRIORITY_BACKGROUND, NewTask
 from resonant.redact import Redactor
@@ -85,6 +87,8 @@ from resonant.store import extensions as store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set, transaction, utcnow
 from resonant.store.tasks import insert_event, insert_task
+from resonant.toolcore import Asked, CallScope, InlineExecutor, Refused, ToolCore
+from resonant.tools import ToolRegistry
 from resonant_sdk import Effect, Event, Level, ToolSpec, new_id
 
 if TYPE_CHECKING:
@@ -244,6 +248,7 @@ class Scheduler:
         jobs: Sequence[ScheduledJob],
         *,
         gate: Gate,
+        registry: ToolRegistry,
         owner: str,
         secrets: SecretStore | None = None,
         tracker: ProcessTracker | None = None,
@@ -253,10 +258,10 @@ class Scheduler:
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         """``started_at`` (the daemon's start) with kv ``scheduler.last_tick`` gives the
-        downtime that ``catchup`` may cover."""
+        downtime that ``catchup`` may cover. An extension job's spec is the ``registry``'s."""
         self.conn = conn
         self.jobs = tuple(jobs)
-        self.gate = gate
+        self.core = ToolCore(conn, registry=registry, gate=gate, executor=InlineExecutor(gate))
         self.owner = owner
         self.secrets = secrets
         self.tracker = tracker
@@ -329,6 +334,7 @@ class Scheduler:
             conn,
             jobs,
             gate=components.gate,
+            registry=components.registry,
             owner=owner,
             secrets=components.executor.secrets,
             tracker=None if host is None else host.tracker,
@@ -559,17 +565,8 @@ class Scheduler:
     async def _call(self, job: ScheduledJob, due: datetime) -> _Result:
         task_id = f"job:{job.label}:{iso(due)}"
         args: dict[str, Any] = {"due_at": iso(due)}
-        if not job.core:
-            intent = Intent.for_tool(
-                job.spec, task_id=task_id, principal=self.owner, args=args, origin="scheduled"
-            )
-            decision = self.gate.evaluate(intent)
-            if isinstance(decision, DryRun):
-                return _Result("dry_run")
-            if not isinstance(decision, Allow):
-                reason = decision.reason if isinstance(decision, Deny) else type(decision).__name__
-                return _Result("denied", error=reason)
-            self.gate.consume(decision.token, intent.hash)  # no executor: spend it here
+        if not job.core and (refused := await self._admit(job, task_id, args)) is not None:
+            return refused
         env: dict[str, str] = {}
         if job.spec.secrets:
             try:
@@ -610,6 +607,24 @@ class Scheduler:
             stderr_tail=None if not tail else redactor.text(tail),
             duration_ms=ms,
         )
+
+    async def _admit(self, job: ScheduledJob, task_id: str, args: dict[str, Any]) -> _Result | None:
+        """Gate an extension job through the tool core (origin ``scheduled``, no pin, no
+        spans); the ``InlineExecutor`` spends the token. None: allowed, run it here."""
+        scope = CallScope(task_id, self.owner, None, 0, 0, "scheduled", check_schema=False)
+        called = await self.core.call(job.spec, args, scope)
+        if isinstance(called, Asked):
+            return _Result("denied", error=type(called.decision).__name__)
+        if isinstance(called, Refused):
+            if called.why == "dry_run":
+                return _Result("dry_run")
+            if called.why == "unavailable":
+                return _Result("failed", error="job is not installed")
+            if called.why == "not_allowed":
+                return _Result("denied", error=APPROVAL_USED)
+            d = called.decision
+            return _Result("denied", error=d.reason if isinstance(d, Deny) else called.why)
+        return None
 
     def _finish(self, job: ScheduledJob, d: Decision, r: _Result) -> None:
         assert d.due is not None and d.last_due is not None
