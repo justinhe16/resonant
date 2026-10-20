@@ -505,6 +505,7 @@ class BrainRunner(LocalRunner):
             timezone=settings.timezone,
             extensions=extensions,
             model_result_max_chars=model_result_max_chars,
+            taint_hops=settings.brain.taint_hops,
         )
         self.settings = settings
         self.principals = principals

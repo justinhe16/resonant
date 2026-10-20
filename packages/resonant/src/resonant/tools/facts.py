@@ -2,7 +2,8 @@
 
 The store is ``brain.facts.FactStore`` over ``<home>/brain/facts`` (files, no migration).
 ``remember`` and ``forget`` are L3: they run without asking and the reply reports them with
-a code-built line (``runners.local.REPORTS``). Like every builtin they are global scope, so
+a code-built line (``runners.local.REPORTS``). Both are ``taint_exempt`` (PER-245): they
+run in a tainted task too. Like every builtin they are global scope, so
 only the owner may call them. No intent in ``router/intents.py`` offers them; the brain loop
 (BR-1) does.
 
@@ -64,6 +65,7 @@ REMEMBER = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=5.0,
+    taint_exempt=True,  # PER-245: runs on its level even when tainted
 )
 FORGET = ToolSpec(
     name="forget",
@@ -77,6 +79,7 @@ FORGET = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=5.0,
+    taint_exempt=True,  # PER-245: runs on its level even when tainted
 )
 
 SPECS: tuple[ToolSpec, ...] = (LIST_FACTS, REMEMBER, FORGET)

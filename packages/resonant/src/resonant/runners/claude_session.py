@@ -45,9 +45,9 @@ request goes first; the claude.ai URL (validated, ``live.session_url``) is kept 
 /status and the dashboard, and cleared when the session ends.
 
 **Taint across turns** (``inherited_hops`` / ``record``): the session remembers the last
-turn's taint hops (kv). The next turn starts tainted only while that is within
-``MAX_TAINT_HOPS`` (BR-10b's rule), so taint lifts after the hop window however long the
-session lives; a fresh session (primed from clean records) starts clean.
+turn's taint hops (kv). The next turn starts tainted only while it is within
+``brain.taint_hops`` turns (BR-10b's rule, PER-245), so taint lifts after the hop window
+however long the session lives; a fresh session (primed from clean records) starts clean.
 
 Message bodies are PII: logs and spans carry ids, counts and states, never text.
 """
@@ -72,7 +72,7 @@ from typing import Any, Literal, cast
 import psutil
 
 from resonant import killswitch
-from resonant.brain.history import MAX_TAINT_HOPS
+from resonant.brain.history import DEFAULT_TAINT_HOPS
 from resonant.config import ClaudeSessionConfig
 from resonant.runners import reaper
 from resonant.runners.ask_tools import McpServer
@@ -126,9 +126,11 @@ class ClaudeSession:
         kill_grace_s: float = 2.0,
         rc_timeout_s: float = RC_TIMEOUT_S,
         end_wait_s: float = END_WAIT_S,
+        taint_hops: int = DEFAULT_TAINT_HOPS,
     ) -> None:
         self.conn = conn
         self.cfg = cfg
+        self.taint_hops = taint_hops  # brain.taint_hops
         self.cwd = cwd
         self.server = server
         self.clock = clock
@@ -180,12 +182,12 @@ class ClaudeSession:
 
     def inherited_hops(self) -> int | None:
         """The hops a turn starts tainted with from the session's earlier turns, or None
-        (clean): the last turn was tainted ``h`` turns from outside content, and ``h <
-        MAX_TAINT_HOPS``: this one is ``h + 1``. Lifts after the hop window."""
+        (clean): the last turn was tainted ``h`` turns from outside content, and ``h + 1``
+        is within ``taint_hops``: this one is ``h + 1``. Lifts after the hop window."""
         hops = session_state(self.conn).get("hops")
         if not isinstance(hops, int) or isinstance(hops, bool) or hops < 0:
             return None
-        return hops + 1 if hops < MAX_TAINT_HOPS else None
+        return hops + 1 if hops < self.taint_hops else None
 
     def record(self, hops: int | None) -> None:
         """A turn's taint (None: clean), for the next one."""
@@ -203,7 +205,7 @@ class ClaudeSession:
         if st.get("outside") is not True:
             return False
         hops = st.get("hops")
-        return not (isinstance(hops, int) and not isinstance(hops, bool) and hops < MAX_TAINT_HOPS)
+        return not (isinstance(hops, int) and not isinstance(hops, bool) and hops < self.taint_hops)
 
     def _drop(self, key: str) -> None:
         st = session_state(self.conn)

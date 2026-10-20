@@ -351,6 +351,7 @@ def build_imessage_stack(
         channel=channel,
         timezone=settings.timezone,
         model_result_max_chars=settings.extensions.model_result_max_chars,
+        taint_hops=settings.brain.taint_hops,
     )
     runner.max_step_s = local_step_limit(settings.model, components.chat_specs())
     loop.runners[runner.name] = runner
@@ -454,6 +455,7 @@ def build_imessage_stack(
         create_task=loop.create_task,
         tools=tool_access(components, brain, settings),  # BR-10: the brain's asks
         session=settings.brain.claude_session,  # BR-11: the Claude brain
+        taint_hops=settings.brain.taint_hops,
     )
     components.runners[asks.name] = asks
     loop.runners[asks.name] = asks

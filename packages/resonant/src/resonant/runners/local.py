@@ -95,7 +95,7 @@ from functools import partial
 from typing import Any, cast
 
 from resonant import killswitch
-from resonant.brain.history import reply_tainted, taint_hops
+from resonant.brain.history import DEFAULT_TAINT_HOPS, reply_taint
 from resonant.brain.text import flat
 from resonant.executor import ToolResult
 from resonant.extensions.notify import take_baseline
@@ -411,13 +411,15 @@ class LocalRunner:
         extensions: ExtensionCatalog | None = None,
         model_result_max_chars: int = MODEL_RESULT_MAX_CHARS,
         name: str | None = None,
+        taint_hops: int = DEFAULT_TAINT_HOPS,
     ) -> None:
         """``name`` overrides the runner's name (its span names): the ask runner's approval
-        resume is a ``LocalRunner`` named ``ask``."""
+        resume is a ``LocalRunner`` named ``ask``. ``taint_hops``: ``brain.taint_hops``."""
         if name is not None:
             self.name = name
         self.conn = conn
         self.model = model
+        self.taint_hops = taint_hops
         self.channel = channel
         self.gate = gate  # kept for wiring checks; every call goes through ``core``
         self.executor = executor
@@ -829,7 +831,8 @@ class LocalRunner:
                 d = outcome.decision
                 line = batch_line(d.summary, offered=d.allow_always,
                                   widens=widens_trust(pinned.tool, pinned.extension))  # fmt: skip
-                items.append(BatchItem(pinned, d.approval_id, line, cp.get("tainted") is True))
+                items.append(BatchItem(pinned, d.approval_id, line,
+                                       outcome.intent.origin == "tainted"))  # fmt: skip
             return None
         done = await self._gated(outcome, spans)
         if isinstance(done, Answer) and done.reply not in effects:
@@ -956,11 +959,13 @@ class LocalRunner:
         self, task: Task, principal: str, intent: IntentLabel, text: str
     ) -> tuple[list[ChatMessage], int | None]:
         """The intents prompt, and when a reply it replays was written by a tainted task
-        (BR-10b: ``history.reply_tainted``) this task's taint hops (one more than the
-        nearest such reply's); then its calls are tainted too. None: clean."""
+        (BR-10b: ``history.reply_taint``, within ``taint_hops`` turns) this task's taint
+        hops (the nearest such reply's, plus how many turns back it is); then its calls are
+        tainted too. None: clean."""
         system = runner_system(intent, self.intents)
         messages: list[ChatMessage] = [{"role": "system", "content": system}]
         hops: int | None = None
+        replies: list[dict[str, Any]] = []  # each exchange's checkpoint, oldest first
         if task.origin_event_id is not None:
             thread = principal_thread(
                 self.conn,
@@ -980,12 +985,14 @@ class LocalRunner:
                     {"role": "user", "content": wrap_untrusted(body, max_chars=MAX_HISTORY_CHARS)}
                 )
                 reply = _prior_reply(origin_cp)
+                replies.append(origin_cp if reply is not None else {})
                 if reply is not None:  # untrusted: it may quote extension output
                     wrapped = wrap_prior_reply(reply, max_chars=MAX_HISTORY_CHARS)
                     messages.append({"role": "user", "content": wrapped})
-                    if reply_tainted(origin_cp):
-                        mine = (taint_hops(origin_cp) or 0) + 1
-                        hops = mine if hops is None else min(hops, mine)
+        for i, origin_cp in enumerate(replies):
+            mine = reply_taint(origin_cp, len(replies) - i, self.taint_hops)
+            if mine is not None:
+                hops = mine if hops is None else min(hops, mine)
         current = current_turn(
             intent, text, now=self.now(), tz=self.timezone, max_chars=MAX_MESSAGE_CHARS
         )

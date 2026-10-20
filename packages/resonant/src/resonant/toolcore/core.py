@@ -17,8 +17,10 @@ can skip the gate. The gate (``gate/``), the trust rules (``trust/``) and the ex
    Bad: ``Refused("bad_args")``.
 3. **Side-effect cap.** A change when ``scope.effects`` already holds ``MAX_SIDE_EFFECTS``
    report lines: ``Refused("capped")`` (GT-1).
-4. **Gate.** ``gate.evaluate``. A read the gate allows runs and comes back ungated
-   (``Ran``/``Failed``/``Refused`` with ``gated=False``).
+4. **Gate.** ``gate.evaluate``, with ``gated_origin``: a tainted call to a ``taint_exempt``
+   spec (notes, reminders, facts) is gated as ``inferred`` (PER-245), here and on resume.
+   A read the gate allows runs and comes back ungated (``Ran``/``Failed``/``Refused`` with
+   ``gated=False``).
 5. **Pin.** Anything else is a gated call: refused or dry-run comes back as is; allowed or
    asked, it is pinned first (``checkpoint.call`` = :class:`PinnedCall`, plus
    ``scope.effects`` and ``scope.pin``, saved through ``scope.steps``). A scope with no
@@ -234,6 +236,13 @@ def pinned_origin(cp: Mapping[str, Any], pinned: PinnedCall) -> Origin:
     return "tainted" if cp.get("tainted") is True else "inferred"
 
 
+def gated_origin(spec: ToolSpec, origin: Origin) -> Origin:
+    """The origin the gate sees for a call to ``spec``: a ``tainted`` call to a
+    ``taint_exempt`` spec (a note, a reminder, a fact: PER-245) is gated as ``inferred``, so
+    it runs on its level's rule. Every other call keeps its origin."""
+    return "inferred" if origin == "tainted" and spec.taint_exempt else origin
+
+
 def args_error(spec: ToolSpec, args: dict[str, Any]) -> str | None:
     """Why ``args`` don't fit ``spec``'s JSON schema (a short reason, no values), or None."""
     try:
@@ -413,13 +422,16 @@ class ToolCore:
                 s.set(decision="unavailable", ok=False)
                 return Refused("unavailable", NOT_AVAILABLE_REPLY, False)
             s.set(extension=spec.extension)
+            if scope.origin == "tainted" and spec.taint_exempt:
+                s.set(taint_exempt=True)
             try:
                 # Never "explicit": a model can never claim the owner typed this.
                 if scope.origin == "explicit":
                     raise ValueError("a model-chosen call is never explicit")
                 if scope.check_schema and args_error(spec, args) is not None:
                     raise ValueError("args don't fit the schema")
-                intent = self._intent(spec, args, scope, scope.origin)
+                origin = gated_origin(spec, scope.origin)
+                intent = self._intent(spec, args, scope, origin)
             except (TypeError, ValueError):
                 s.set(decision="bad_args", ok=False)
                 return Refused("bad_args", BAD_ARGS_REPLY, False)
@@ -489,7 +501,7 @@ class ToolCore:
             return Refused("capped", batch_capped_reply(limit), True, intent, decision)
         line = batch_line(decision.summary, offered=decision.allow_always,
                           widens=widens_trust(pinned.tool, pinned.extension))  # fmt: skip
-        item = BatchItem(pinned, decision.approval_id, line, scope.origin == "tainted")
+        item = BatchItem(pinned, decision.approval_id, line, intent.origin == "tainted")
         cp = dict(scope.checkpoint)
         if scope.steps is not None:
             # ``call`` (an earlier allowed call, done by now) gives way to the batch.
@@ -509,7 +521,7 @@ class ToolCore:
         spec = self.registry.get(pinned.extension, pinned.tool)
         if spec is None:
             return Refused("unavailable", NOT_AVAILABLE_REPLY, True)
-        origin = pinned_origin(scope.checkpoint, pinned)
+        origin = gated_origin(spec, pinned_origin(scope.checkpoint, pinned))
         spans = scope.spans or _no_span
         with spans(SPAN_RESUME, tool=pinned.tool, extension=pinned.extension, origin=origin) as s:
             try:
