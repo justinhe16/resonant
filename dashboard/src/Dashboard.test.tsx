@@ -19,70 +19,110 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+const headings = (testId: string) =>
+  within(screen.getByTestId(testId))
+    .getAllByRole("heading", { level: 2 })
+    .map((h) => h.textContent);
+
 describe("Dashboard, local tier", () => {
-  it("shows the overview at a glance", async () => {
+  it("shows the system status at a glance", async () => {
     mount(local);
     expect(await screen.findByRole("heading", { name: "Something is degraded" })).toBeInTheDocument();
     expect(screen.getByText("imessage degraded · ext:github unknown")).toBeInTheDocument();
     expect(screen.getByText("autonomy on")).toBeInTheDocument();
     expect(screen.getByText("jobs running")).toBeInTheDocument();
     expect(screen.getByText("dry run off")).toBeInTheDocument();
-    expect(screen.getByRole("meter", { name: "Slots in use" })).toHaveAttribute("aria-valuenow", "2");
-    expect(screen.getByText("self-test timed out after 90s")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Slots in use" })).toHaveAttribute("aria-valuetext", "2 of 5");
     expect(screen.getByTestId("last-seen")).toHaveTextContent("seen 20s ago");
     expect(screen.getByText("22s ago")).toBeInTheDocument(); // last tick
     expect(screen.queryByTestId("stale-banner")).not.toBeInTheDocument();
   });
 
-  it("navigates to every local page", async () => {
+  it("keeps per-component health in a collapsed list", async () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
     mount(local);
-    const nav = await screen.findByRole("navigation", { name: "Sections" });
+    const toggle = await screen.findByRole("button", { name: /Component health/ });
+    expect(toggle).toHaveTextContent("3 of 5 ok");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("self-test timed out after 90s")).not.toBeInTheDocument();
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("self-test timed out after 90s")).toBeInTheDocument();
+    expect(screen.getByText("loop")).toBeInTheDocument();
+  });
 
-    await user.click(within(nav).getByRole("link", { name: /Workers/ }));
-    expect(await screen.findByText(/Add a dashboard job to CI/)).toBeInTheDocument();
-    expect(screen.getByText(/drops Python 3.11/)).toBeInTheDocument();
-    expect(screen.getByText("(a) bump runtime")).toBeInTheDocument();
+  it("lays out two columns in order", async () => {
+    mount(local);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(headings("column-left")).toEqual(["Slots", "Active runs", "Active tasks"]);
+    expect(headings("column-right")).toEqual([
+      "Waiting on you",
+      "Runs and tasks",
+      "Claude",
+      "Extensions",
+      "Pulse",
+      "Rules and repos",
+    ]);
+    // The status card's headline is the page's one h1.
+    expect(within(screen.getByTestId("column-left")).getByRole("heading", { level: 1 })).toBeInTheDocument();
+  });
+
+  it("shows every section's local detail on one page", async () => {
+    mount(local);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+
+    // Active runs on the left, finished ones on the right.
+    const left = screen.getByTestId("column-left");
+    const right = screen.getByTestId("column-right");
+    expect(within(left).getByText(/drops Python 3.11|Add a dashboard job to CI/)).toBeInTheDocument();
+    expect(within(left).getByText("waiting (question)")).toBeInTheDocument();
+    expect(within(right).getByText("R10")).toBeInTheDocument(); // ready
+    expect(within(left).queryByText("R10")).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "PR #81" })).toHaveAttribute(
       "href",
       "https://github.com/example/resonant/pull/81",
     );
-    expect(screen.getByText("waiting (question)")).toBeInTheDocument();
 
-    await user.click(within(nav).getByRole("link", { name: /Approvals/ }));
-    expect(await screen.findByText("merge_pr github: example/resonant#81")).toBeInTheDocument();
+    expect(screen.getByText(/drops Python 3.11/)).toBeInTheDocument();
+    expect(screen.getByText("(a) bump runtime")).toBeInTheDocument();
+    expect(screen.getByText("merge_pr github: example/resonant#81")).toBeInTheDocument();
     expect(screen.getByText("L1")).toBeInTheDocument();
     expect(screen.getByText("expires in 50 min")).toBeInTheDocument();
+    expect(screen.getByText("2 open")).toBeInTheDocument(); // one approval + one question
 
-    await user.click(within(nav).getByRole("link", { name: /Pulse/ }));
-    await screen.findByText("Rain after 4pm");
-    const pulse = within(screen.getByRole("main")).getAllByRole("listitem");
-    expect(pulse[0]).toHaveTextContent("R11 asked a question"); // urgent first
+    const pulse = screen.getByText("Rain after 4pm").closest("ul")!;
+    expect(within(pulse).getAllByRole("listitem")[0]).toHaveTextContent("R11 asked a question"); // urgent first
+    expect(screen.getByText("3 open")).toBeInTheDocument();
 
-    await user.click(within(nav).getByRole("link", { name: /Extensions/ }));
-    expect(await screen.findByText("2 fails in a row")).toBeInTheDocument();
+    expect(screen.getByText("2 fails in a row")).toBeInTheDocument();
     expect(screen.getByText("No scheduled jobs.")).toBeInTheDocument();
 
-    await user.click(within(nav).getByRole("link", { name: /Rules/ }));
-    expect(await screen.findByText("ask merge on trading")).toBeInTheDocument();
+    expect(screen.getByText("ask merge on trading")).toBeInTheDocument();
     expect(screen.getByText("no CI")).toBeInTheDocument();
-  });
-
-  it("shows open counts on the tabs", async () => {
-    mount(local);
-    const nav = await screen.findByRole("navigation", { name: "Sections" });
-    expect(within(nav).getByRole("link", { name: "Approvals, 1 open" })).toBeInTheDocument();
-    expect(within(nav).getByRole("link", { name: "Pulse, 3 open" })).toBeInTheDocument();
   });
 
   it("refuses non-https PR links", async () => {
     const snap = clone(local);
     snap.runs.items![0]!.pr_url = "javascript:alert(1)";
     snap.runs.items![0]!.pr_number = 99;
-    window.location.hash = "/workers";
     mount(snap);
     await screen.findByText(/Add a dashboard job/);
     expect(screen.queryByRole("link", { name: "PR #99" })).not.toBeInTheDocument();
+  });
+
+  it("toggles dark mode, light first", async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    localStorage.clear();
+    document.documentElement.classList.remove("dark");
+    mount(local);
+    const toggle = await screen.findByRole("button", { name: "Switch to dark mode" });
+    expect(document.documentElement).not.toHaveClass("dark");
+    await user.click(toggle);
+    expect(document.documentElement).toHaveClass("dark");
+    expect(localStorage.getItem("resonant.theme")).toBe("dark");
+    await user.click(screen.getByRole("button", { name: "Switch to light mode" }));
+    expect(document.documentElement).not.toHaveClass("dark");
+    expect(localStorage.getItem("resonant.theme")).toBeNull();
   });
 });
 
@@ -136,31 +176,24 @@ describe("Dashboard, the Claude brain's tool calls", () => {
 
 describe("Dashboard, remote tier", () => {
   it("hides what the tier doesn't carry", async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
     mount(remote);
-    const nav = await screen.findByRole("navigation", { name: "Sections" });
-    expect(within(nav).queryByRole("link", { name: /Rules/ })).not.toBeInTheDocument();
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(screen.queryByRole("heading", { name: "Rules and repos" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Component health/ }));
     expect(screen.queryByText("self-test timed out after 90s")).not.toBeInTheDocument();
     expect(screen.getByText("imessage")).toBeInTheDocument();
   });
 
-  it("shows counts but not texts on Workers, Approvals and Pulse", async () => {
-    window.location.hash = "/workers";
+  it("shows counts but not texts for runs, approvals, questions and pulse", async () => {
     mount(remote);
-    expect(await screen.findByText("Run details are shown on the local dashboard only.")).toBeInTheDocument();
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(screen.getAllByText("Run details are shown on the local dashboard only.")).toHaveLength(2);
     expect(screen.getByText("Question texts are shown on the local dashboard only.")).toBeInTheDocument();
-    expect(screen.getByText("running")).toBeInTheDocument();
+    expect(screen.getByText("Approval texts are shown on the local dashboard only.")).toBeInTheDocument();
+    expect(screen.getByText("Pulse titles are shown on the local dashboard only.")).toBeInTheDocument();
+    expect(screen.getAllByText("running").length).toBeGreaterThan(0);
     expect(screen.queryByText(/Add a dashboard job/)).not.toBeInTheDocument();
-
-    act(() => {
-      window.location.hash = "/approvals";
-    });
-    expect(await screen.findByText("Approval texts are shown on the local dashboard only.")).toBeInTheDocument();
-  });
-
-  it("falls back to the overview for a local-only route", async () => {
-    window.location.hash = "/rules";
-    mount(remote);
-    expect(await screen.findByRole("heading", { name: "Something is degraded" })).toBeInTheDocument();
   });
 });
 
@@ -177,20 +210,14 @@ describe("Dashboard, empty and failure states", () => {
     expect(screen.getByText("Missing: claude, gh auth")).toBeInTheDocument();
   });
 
-  it("shows empty lists on each page", async () => {
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  it("shows empty lists in each section", async () => {
     mount(empty);
-    const nav = await screen.findByRole("navigation", { name: "Sections" });
-    await user.click(within(nav).getByRole("link", { name: /Workers/ }));
     expect(await screen.findByText("No worker is waiting on you.")).toBeInTheDocument();
-    await user.click(within(nav).getByRole("link", { name: /Approvals/ }));
-    expect(await screen.findByText("Nothing waiting for a yes.")).toBeInTheDocument();
-    await user.click(within(nav).getByRole("link", { name: /Pulse/ }));
-    expect(await screen.findByText("All quiet.")).toBeInTheDocument();
-    await user.click(within(nav).getByRole("link", { name: /Extensions/ }));
-    expect(await screen.findByText("No extensions installed.")).toBeInTheDocument();
-    await user.click(within(nav).getByRole("link", { name: /Rules/ }));
-    expect(await screen.findByText(/No rules yet/)).toBeInTheDocument();
+    expect(screen.getByText("Nothing waiting for a yes.")).toBeInTheDocument();
+    expect(screen.getByText("No runs in flight.")).toBeInTheDocument();
+    expect(screen.getByText("All quiet.")).toBeInTheDocument();
+    expect(screen.getByText("No extensions installed.")).toBeInTheDocument();
+    expect(screen.getByText(/No rules yet/)).toBeInTheDocument();
   });
 
   it("shows a stale banner when taken_at is old", async () => {
@@ -201,7 +228,7 @@ describe("Dashboard, empty and failure states", () => {
     expect(screen.getByTestId("last-seen")).toHaveTextContent("seen 10 min ago");
   });
 
-  it("says 'last known' on the overview while stale", async () => {
+  it("says 'last known' in the status card while stale", async () => {
     mount(clone(remote, { taken_at: "2026-10-16T08:50:00+00:00" }));
     expect(await screen.findByRole("heading", { name: "Last known: something is degraded" })).toBeInTheDocument();
   });
@@ -212,22 +239,23 @@ describe("Dashboard, empty and failure states", () => {
   });
 
   it("never shows local-only texts on the remote tier, even if sent", async () => {
-    window.location.hash = "/workers";
     mount(clone(local, { tier: "remote" }));
-    expect(await screen.findByText("Run details are shown on the local dashboard only.")).toBeInTheDocument();
+    expect((await screen.findAllByText("Run details are shown on the local dashboard only.")).length).toBe(2);
     expect(screen.queryByText(/Add a dashboard job/)).not.toBeInTheDocument();
     expect(screen.queryByText(/drops Python 3.11/)).not.toBeInTheDocument();
-    const nav = screen.getByRole("navigation", { name: "Sections" });
-    expect(within(nav).queryByRole("link", { name: /Rules/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("merge_pr github: example/resonant#81")).not.toBeInTheDocument();
+    expect(screen.queryByText("Rain after 4pm")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Rules and repos" })).not.toBeInTheDocument();
   });
 
-  it("contains a render error to the page", async () => {
+  it("contains a render error to its section", async () => {
     const bad = clone(local);
     (bad.extensions[0]!.jobs as unknown) = null;
-    window.location.hash = "/extensions";
     mount(bad);
     expect(await screen.findByText("This section couldn't be shown")).toBeInTheDocument();
-    expect(screen.getByRole("navigation", { name: "Sections" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Something is degraded" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Pulse" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Extensions" })).not.toBeInTheDocument();
   });
 
   it("goes stale while the page sits open", async () => {

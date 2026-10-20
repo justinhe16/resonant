@@ -107,7 +107,7 @@ Numbered D1–D6 so they don't collide with other sections' rows. Steps are [`go
 
 | # | Test | Expect | Status |
 |---|---|---|---|
-| D1 | Local dashboard: open `http://127.0.0.1:7777/` on the Mini | Overview with health, autonomy, slots and counts, "last seen" under a minute; Workers, Approvals, Pulse, Extensions and Rules & repos tabs with the local detail; no setup needed | 🖥 |
+| D1 | Local dashboard: open `http://127.0.0.1:7777/` on the Mini | One page, light by default: System status (expand Component health), slots, active runs and tasks on the left; Waiting on you, Runs and tasks, Claude, Extensions, Pulse and Rules and repos on the right, with the local detail; "last seen" under a minute; no setup needed | 🖥 |
 | D2 | `--check` after go-live 15.7 | `relay pushing  PASS  ok since …`, `relay secret relay/supabase_key  PASS`, `dead-man switch  PASS  relay on: …`; a row a minute in Supabase's `snapshots` | 🖥 after 15.1–15.7 |
 | D3 | Remote sign-in at `https://<app>.fly.dev/` with password + TOTP | Status only (health, counts, states, times): no asks, texts, repo names or rules; a wrong TOTP code or no TOTP reads nothing | 📱 after 15.8 |
 | D4 | Freeze: `kill -STOP $(pgrep -f 'resonant daemon run$')` | Remote dashboard: red `No fresh data for …` banner after ~3 min; phone: one `Resonant: no snapshots` push ~4–6 min after the freeze, and no repeats | 🖥 + 📱 after D3 and 15.9 |
