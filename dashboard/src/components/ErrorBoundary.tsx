@@ -1,11 +1,12 @@
 import { Component, type ReactNode } from "react";
-import { Alert } from "@/components/ui/alert";
+import { TriangleAlert } from "lucide-react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 interface State {
   error: Error | null;
 }
 
-/** Keeps one bad page from blanking the whole dashboard. */
+/** Keeps one bad section from blanking the whole dashboard. */
 interface Props {
   children: ReactNode;
   /** A new value clears the error and retries, e.g. the next snapshot. */
@@ -26,11 +27,10 @@ export class ErrorBoundary extends Component<Props, State> {
   render() {
     if (this.state.error) {
       return (
-        <Alert tone="bad">
-          <div className="min-w-0">
-            <p className="font-medium">This section couldn't be shown</p>
-            <p className="break-words text-muted-foreground">{this.state.error.message}</p>
-          </div>
+        <Alert variant="bad">
+          <TriangleAlert />
+          <AlertTitle>This section couldn't be shown</AlertTitle>
+          <AlertDescription className="break-words">{this.state.error.message}</AlertDescription>
         </Alert>
       );
     }

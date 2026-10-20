@@ -1,22 +1,78 @@
-import { cva, type VariantProps } from "class-variance-authority";
-import type { HTMLAttributes } from "react";
-import { cn } from "@/lib/utils";
+import * as React from "react"
+import { cva, type VariantProps } from "class-variance-authority"
+import { cn } from "@/lib/utils"
 
-const alertVariants = cva("flex items-start gap-3 rounded-lg border px-4 py-3 text-sm", {
-  variants: {
-    tone: {
-      neutral: "bg-card",
-      warn: "border-warn/40 bg-warn/10",
-      bad: "border-bad/40 bg-bad/10",
+// radix-nova's alert, plus warn and bad variants for the dashboard's banners.
+const alertVariants = cva(
+  "group/alert relative grid w-full gap-0.5 rounded-lg border px-2.5 py-2 text-left text-sm has-data-[slot=alert-action]:relative has-data-[slot=alert-action]:pr-18 has-[>svg]:grid-cols-[auto_1fr] has-[>svg]:gap-x-2 *:[svg]:row-span-2 *:[svg]:translate-y-0.5 *:[svg]:text-current *:[svg:not([class*='size-'])]:size-4",
+  {
+    variants: {
+      variant: {
+        default: "bg-card text-card-foreground",
+        destructive:
+          "bg-card text-destructive *:data-[slot=alert-description]:text-destructive/90 *:[svg]:text-current",
+        warn: "border-warn/40 bg-warn/10 text-foreground *:[svg]:text-warn-foreground",
+        bad: "border-bad/30 bg-bad/5 text-foreground *:[svg]:text-bad",
+      },
     },
-  },
-  defaultVariants: { tone: "neutral" },
-});
+    defaultVariants: {
+      variant: "default",
+    },
+  }
+)
 
-export function Alert({
+function Alert({
   className,
-  tone,
+  variant,
   ...props
-}: HTMLAttributes<HTMLDivElement> & VariantProps<typeof alertVariants>) {
-  return <div role="alert" className={cn(alertVariants({ tone }), className)} {...props} />;
+}: React.ComponentProps<"div"> & VariantProps<typeof alertVariants>) {
+  return (
+    <div
+      data-slot="alert"
+      role="alert"
+      className={cn(alertVariants({ variant }), className)}
+      {...props}
+    />
+  )
 }
+
+function AlertTitle({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="alert-title"
+      className={cn(
+        "font-medium group-has-[>svg]/alert:col-start-2 [&_a]:underline [&_a]:underline-offset-3 [&_a]:hover:text-foreground",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function AlertDescription({
+  className,
+  ...props
+}: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="alert-description"
+      className={cn(
+        "text-sm text-balance text-muted-foreground md:text-pretty [&_a]:underline [&_a]:underline-offset-3 [&_a]:hover:text-foreground [&_p:not(:last-child)]:mb-4",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function AlertAction({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="alert-action"
+      className={cn("absolute top-2 right-2", className)}
+      {...props}
+    />
+  )
+}
+
+export { Alert, AlertTitle, AlertDescription, AlertAction }

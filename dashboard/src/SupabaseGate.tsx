@@ -1,8 +1,9 @@
+import { TriangleAlert } from "lucide-react";
 import { type FormEvent, type ReactNode, useCallback, useEffect, useState } from "react";
 import { Dashboard } from "@/Dashboard";
-import { Alert } from "@/components/ui/alert";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import type { AuthStage, RemoteClient } from "@/lib/supabase";
@@ -80,7 +81,7 @@ export function SupabaseGate({ client }: { client: RemoteClient }) {
               Two-factor authentication isn't set up for this account, so the dashboard stays locked.
               Enrol an authenticator as the go-live checklist describes, then sign in again.
             </p>
-            <Button variant="outline" className="w-full" onClick={signOut}>
+            <Button type="button" variant="outline" size="lg" className="w-full" onClick={signOut}>
               Sign out
             </Button>
           </div>
@@ -98,11 +99,16 @@ function Shell({ children, error }: { children: ReactNode; error?: string | null
           <p className="text-sm text-muted-foreground">Status dashboard</p>
         </div>
         {error && (
-          <Alert tone="bad">
-            <p className="break-words">{error}</p>
+          <Alert variant="bad">
+            <TriangleAlert />
+            <AlertDescription className="break-words text-foreground">{error}</AlertDescription>
           </Alert>
         )}
-        {children && <Card className="p-5">{children}</Card>}
+        {children && (
+          <Card className="[--card-spacing:--spacing(6)]">
+            <CardContent>{children}</CardContent>
+          </Card>
+        )}
       </div>
     </div>
   );
@@ -142,7 +148,7 @@ function PasswordForm({ onSubmit }: { onSubmit: (email: string, password: string
           onChange={(e) => setPassword(e.target.value)}
         />
       </div>
-      <Button type="submit" className="w-full" disabled={busy}>
+      <Button type="submit" size="lg" className="w-full" disabled={busy}>
         {busy ? "Signing in…" : "Sign in"}
       </Button>
     </form>
@@ -185,10 +191,10 @@ function CodeForm({
           onChange={(e) => setCode(e.target.value.replace(/\D/g, ""))}
         />
       </div>
-      <Button type="submit" className="w-full" disabled={busy || code.length !== 6}>
+      <Button type="submit" size="lg" className="w-full" disabled={busy || code.length !== 6}>
         {busy ? "Checking…" : "Verify"}
       </Button>
-      <Button variant="ghost" className="w-full" onClick={onCancel}>
+      <Button type="button" variant="ghost" size="lg" className="w-full" onClick={onCancel}>
         Sign out
       </Button>
     </form>

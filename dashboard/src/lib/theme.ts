@@ -1,44 +1,38 @@
 import { useCallback, useEffect, useState } from "react";
 
-export type ThemePref = "system" | "light" | "dark";
+export type Theme = "light" | "dark";
 const KEY = "resonant.theme";
 
-function readPref(): ThemePref {
+/** Light unless the owner picked dark (the OS setting is not followed). */
+function readTheme(): Theme {
   try {
-    const v = localStorage.getItem(KEY);
-    return v === "light" || v === "dark" ? v : "system";
+    return localStorage.getItem(KEY) === "dark" ? "dark" : "light";
   } catch {
-    return "system";
+    return "light";
   }
 }
 
-function systemDark(): boolean {
-  return typeof matchMedia === "function" && matchMedia("(prefers-color-scheme: dark)").matches;
+/** Browser chrome colour per theme; theme-init.js uses the same values before first paint. */
+const CHROME = { light: "#fafafa", dark: "#0a0a0a" } as const;
+
+export function applyTheme(theme: Theme = readTheme()): void {
+  document.documentElement.classList.toggle("dark", theme === "dark");
+  document.getElementById("theme-color")?.setAttribute("content", CHROME[theme]);
 }
 
-export function applyTheme(pref: ThemePref = readPref()): void {
-  const dark = pref === "dark" || (pref === "system" && systemDark());
-  document.documentElement.classList.toggle("dark", dark);
-}
-
-/** Cycles system → light → dark; follows the OS while on "system". */
-export function useTheme(): [ThemePref, () => void] {
-  const [pref, setPref] = useState<ThemePref>(readPref);
+/** Toggles light ↔ dark and remembers the choice. */
+export function useTheme(): [Theme, () => void] {
+  const [theme, setTheme] = useState<Theme>(readTheme);
 
   useEffect(() => {
-    applyTheme(pref);
-    if (pref !== "system" || typeof matchMedia !== "function") return;
-    const mq = matchMedia("(prefers-color-scheme: dark)");
-    const on = () => applyTheme("system");
-    mq.addEventListener("change", on);
-    return () => mq.removeEventListener("change", on);
-  }, [pref]);
+    applyTheme(theme);
+  }, [theme]);
 
-  const cycle = useCallback(() => {
-    setPref((p) => {
-      const next: ThemePref = p === "system" ? "light" : p === "light" ? "dark" : "system";
+  const toggle = useCallback(() => {
+    setTheme((t) => {
+      const next: Theme = t === "light" ? "dark" : "light";
       try {
-        if (next === "system") localStorage.removeItem(KEY);
+        if (next === "light") localStorage.removeItem(KEY);
         else localStorage.setItem(KEY, next);
       } catch {
         // Storage can be blocked; the choice then lasts for this page only.
@@ -47,5 +41,5 @@ export function useTheme(): [ThemePref, () => void] {
     });
   }, []);
 
-  return [pref, cycle];
+  return [theme, toggle];
 }
