@@ -22,6 +22,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from resonant.brain.history import DEFAULT_TAINT_HOPS
 from resonant.config import Settings
 from resonant.executor import Executor, Handler, HandlerKey, ToolHandler
 from resonant.extensions.host import ExtensionHost
@@ -83,6 +84,7 @@ class Components:
         channel: Channel,
         timezone: str = "UTC",
         model_result_max_chars: int = MODEL_RESULT_MAX_CHARS,
+        taint_hops: int = DEFAULT_TAINT_HOPS,
     ) -> LocalRunner:
         """Build ``runner="local"`` from these components and add it to ``runners``.
 
@@ -99,6 +101,7 @@ class Components:
             timezone=timezone,
             extensions=self.extensions,
             model_result_max_chars=model_result_max_chars,
+            taint_hops=taint_hops,
         )
         self.runners[runner.name] = runner
         return runner

@@ -10,7 +10,8 @@ Evaluation order:
    (``tools.is_store_internal``) becomes ``DryRun(would=<summary>)``.
 5. Level x origin x autonomy (``rule``). ``scheduled`` is never explicit; ``tainted``
    (the model chose it after reading untrusted content, docs/brain-plan.md D6) asks for
-   everything above L0:
+   everything above L0. The gate never exempts anything: ToolCore sends a tainted call to a
+   ``taint_exempt`` spec (notes, reminders, facts; PER-245) as ``inferred``:
 
    | level | autonomy on, explicit | on, inferred / scheduled | on, tainted   | autonomy off |
    |-------|-----------------------|--------------------------|---------------|--------------|
