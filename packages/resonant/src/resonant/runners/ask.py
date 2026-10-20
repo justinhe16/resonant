@@ -576,30 +576,6 @@ def session_argv(
     return argv
 
 
-USAGE_KEYS = (
-    "input_tokens",
-    "output_tokens",
-    "cache_read_input_tokens",
-    "cache_creation_input_tokens",
-)
-
-
-def usage_of(result: dict[str, Any]) -> dict[str, int] | None:
-    """The token counts of a ``result`` line's ``usage`` (the known keys, ints only), with
-    its ``duration_ms``; None when it has neither."""
-    raw: Any = result.get("usage")
-    usage = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
-    out = {
-        k: v
-        for k in USAGE_KEYS
-        if isinstance(v := usage.get(k), int) and not isinstance(v, bool) and v >= 0
-    }
-    ms = result.get("duration_ms")
-    if isinstance(ms, int) and not isinstance(ms, bool) and ms >= 0:
-        out["duration_ms"] = ms
-    return out or None
-
-
 def cfg_writes(cfg: AskClaudeConfig) -> list[str]:
     """The known connector write tools, denied by name as well (belt and braces: ``dontAsk``
     already denies everything not allowed): each configured connector's prefix with the
@@ -1727,6 +1703,30 @@ class AskRunner:
     def _insert_task(self, spec: NewTask) -> str:
         with atomic(self.conn):
             return task_store.insert_task(self.conn, spec)
+
+
+USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def usage_of(result: dict[str, Any]) -> dict[str, int] | None:
+    """The token counts of a ``result`` line's ``usage`` (the known keys, ints only), with
+    its ``duration_ms``; None when it has neither."""
+    raw: Any = result.get("usage")
+    usage = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+    out = {
+        k: v
+        for k in USAGE_KEYS
+        if isinstance(v := usage.get(k), int) and not isinstance(v, bool) and v >= 0
+    }
+    ms = result.get("duration_ms")
+    if isinstance(ms, int) and not isinstance(ms, bool) and ms >= 0:
+        out["duration_ms"] = ms
+    return out or None
 
 
 def classify(result: dict[str, Any]) -> tuple[str, str, dict[str, Any] | None]:

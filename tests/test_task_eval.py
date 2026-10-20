@@ -846,9 +846,20 @@ def test_a_claude_answer_is_graded_without_the_handoff_tool() -> None:
     """When Claude answered, the hand-off is the ``ask_claude`` a row expects; its other
     tools, facts and asks are graded on what Claude did."""
     e = Expect(tools=("ask_claude", "read_file|ask_claude", "tail_log"), facts=("canberra",))
-    handed = outcome(route="claude", claude_reply="Canberra.", called=["tail_log"])
+    handed = outcome(route="claude", claude_reply="Canberra.", called=["read_file", "tail_log"],
+                     claude_status="answered")  # fmt: skip
     assert grade(case(e), handed) == []
-    assert grade(case(e), replace(handed, called=[])) == ["missing_tool:tail_log"]
+    assert grade(case(e), replace(handed, called=[])) == [
+        "missing_tool:read_file", "missing_tool:tail_log"
+    ]  # fmt: skip
+
+
+def test_a_claude_session_that_never_answered_is_its_own_failure() -> None:
+    e = Expect(tools=("tail_log",), facts=("canberra",))
+    timed = outcome(route="claude", claude_reply="Claude timed out.", claude_status="timeout")
+    assert grade(case(e), timed) == ["claude_failed:timeout"]
+    s = te.claude_answers([te.CaseResult(case(e), "loop", timed, grade(case(e), timed))])
+    assert s["failed"] == 1 and s["accuracy"] == 0.0
 
 
 def test_limit_takes_the_first_cases(tmp_path: Path) -> None:

@@ -141,6 +141,7 @@ from resonant.loop.echo import EchoRunner
 from resonant.loop.types import Fail, StepContext, StepOutcome, Task
 from resonant.models import ChatMessage, ModelClient, ModelReply, ProbeResult, SpanFactory
 from resonant.models.bench import percentile
+from resonant.runner.claude_auth import LOGIN_HOW, login_status
 from resonant.runners.ask import AskRefused, AskRunner, AskScope, Queued
 from resonant.runners.brain import MAX_ROUNDS, PROGRESS_TEXT, BrainRunner
 from resonant.sandbox import resolve_tool
@@ -1076,6 +1077,7 @@ class Outcome:
     handoff: str | None = None  # why it was handed over: triage, ask, guard, cap, ...
     triage: str | None = None  # the triage call's decision (None: no triage ran)
     claude_reply: str | None = None  # Claude's answer, when a session ran (scripted or live)
+    claude_status: str | None = None  # how that session ended: answered, timeout, crashed...
     answer_ms: float | None = None  # PER-250: the ack's send to Claude's answer's send
     usage: dict[str, Any] | None = None  # PER-250: the session's cost, turns, calls, tokens
 
@@ -1352,12 +1354,13 @@ def _outcome(
                 claude_calls.append(str(attrs.get("tool")))
     if not reply:
         reply = "\n".join(m.text for m in replies)
-    claude_reply = _claude_reply(conn, task)
+    claude_reply, claude_status = _claude_reply(conn, task)
     answer_ms: float | None = None
-    if claude_reply is not None and replies:
-        # the ack is the first reply; the answer, the first send after it that is Claude's
-        answer = next((m for m in replies[1:] if _part_of(m.text, claude_reply)), None)
-        answer_ms = None if answer is None else round((answer.at - replies[0].at) * 1000, 1)
+    if claude_reply is not None:
+        # the answer: the first send that starts Claude's reply; the ack, the first before it
+        at = next((i for i, m in enumerate(replies) if _starts(m.text, claude_reply)), None)
+        if at:  # None: not sent; 0: no ack went before it
+            answer_ms = round((replies[at].at - replies[0].at) * 1000, 1)
     triage: Any = result.get("triage")
     decided = cast(dict[str, Any], triage).get("route") if isinstance(triage, dict) else None
     return Outcome(
@@ -1378,15 +1381,16 @@ def _outcome(
         handoff=result.get("handoff") if isinstance(result.get("handoff"), str) else None,
         triage=decided if isinstance(decided, str) else None,
         claude_reply=claude_reply,
+        claude_status=claude_status,
         answer_ms=answer_ms,
         usage=_claude_usage(conn, task) if claude_reply is not None else None,
     )
 
 
-def _part_of(sent: str, reply: str) -> bool:
-    """A send is (the start of a piece of) Claude's reply: the channel may split a long one."""
+def _starts(sent: str, reply: str) -> bool:
+    """A send is the start of Claude's reply (the channel may split a long one)."""
     head = sent.strip()[:40]
-    return bool(head) and head in reply
+    return bool(head) and reply.strip().startswith(head)
 
 
 def _claude_usage(conn: sqlite3.Connection, task: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -1412,19 +1416,24 @@ def _claude_usage(conn: sqlite3.Connection, task: sqlite3.Row | None) -> dict[st
     return out
 
 
-def _claude_reply(conn: sqlite3.Connection, task: sqlite3.Row | None) -> str | None:
-    """A scripted Claude session's answer (the ask task's reply), or None."""
+def _claude_reply(
+    conn: sqlite3.Connection, task: sqlite3.Row | None
+) -> tuple[str | None, str | None]:
+    """A Claude session's reply (the ask task's) and how it ended (``answered``, or
+    ``timeout``, ``crashed``, ``not_set_up``...: the reply is then Resonant's notice), or
+    ``(None, None)``."""
     if task is None:
-        return None
+        return None, None
     row = conn.execute(
         "SELECT checkpoint FROM tasks WHERE runner = 'ask' AND trace_id = ? ORDER BY rowid",
         (task["trace_id"],),
     ).fetchone()
     if row is None:
-        return None
+        return None, None
     cp = json.loads(row["checkpoint"] or "{}")
     said = cp.get("reply") or cp.get("answer")
-    return said if isinstance(said, str) else None
+    status = cp.get("status")
+    return (said if isinstance(said, str) else None), (status if isinstance(status, str) else None)
 
 
 # --- grading ---------------------------------------------------------------------------------
@@ -1452,11 +1461,19 @@ def grade(case: TaskCase, out: Outcome) -> list[str]:
         fails += [f"unapproved_write:{w}" for w in dict.fromkeys(unapproved)]
         fails += [f"forbidden_tool:{t}" for t in e.tools_not if t in out.called]
         return fails
+    if handed and out.claude_status not in (None, "answered"):
+        # Claude never answered (timed out, crashed, not set up...): nothing else to grade
+        fails.append(f"claude_failed:{out.claude_status}")
+        unapproved = [w for w in out.executed_writes if w not in e.writes]
+        fails += [f"unapproved_write:{w}" for w in dict.fromkeys(unapproved)]
+        return fails
     tools = e.tools
     if handed:  # Claude ran (scripted or live): its answer is the one graded
         out = replace(out, reply=out.claude_reply or out.reply)
-        # the hand-off is the ``ask_claude`` a row expects (PER-250)
-        tools = tuple(t for t in tools if "ask_claude" not in (a.strip() for a in t.split("|")))
+        # the hand-off is the ``ask_claude`` a row expects (PER-250): drop it from each
+        # alternation; one that held only it is met
+        alts = [[a.strip() for a in t.split("|") if a.strip() != "ask_claude"] for t in tools]
+        tools = tuple("|".join(a) for a in alts if a)
     for t in tools:
         if not _any_in(t, out.called):
             fails.append(f"missing_tool:{t}")
@@ -1613,6 +1630,8 @@ def claude_answers(results: Sequence[CaseResult]) -> dict[str, Any]:
         "accuracy": _ratio(correct, len(results)),
         "answer_ms": _dist([a for r in results if (a := r.outcome.answer_ms) is not None]),
         "cost_usd": round(sum(costs), 4) if costs else None,
+        # sessions that ended without an answer (timeout, crash, not set up): graded wrong
+        "failed": sum(r.outcome.claude_status not in (None, "answered") for r in results),
         "tokens": tokens,
         "rows": [
             {
@@ -1721,7 +1740,7 @@ def _render_claude(c: Mapping[str, Any] | None) -> list[str]:
     cost = "-" if c["cost_usd"] is None else f"${c['cost_usd']:.4f}"
     out = [
         f"claude        answered {c['n']}   accuracy {_pct(c['accuracy'])} "
-        f"({c['correct']}/{c['n']})",
+        f"({c['correct']}/{c['n']})   no answer {c['failed']}",
         f"  answer      p50 {_num(c['answer_ms']['p50'])} ms   p95 "
         f"{_num(c['answer_ms']['p95'])} ms (ack to answer)",
         f"  usage       {cost} (estimate)   tokens in {t['input_tokens']} out "
@@ -1897,6 +1916,9 @@ def run(
             found = resolve_tool("claude")
             if found is None:
                 echo_err("error: claude isn't installed (needed for --live-claude)")
+                return EXIT_BAD_SET
+            if not login_status([str(found)], Path.home()):
+                echo_err(f"error: claude isn't logged in ({LOGIN_HOW})")
                 return EXIT_BAD_SET
             claude = LiveClaude((str(found),), Path.home())  # the owner's claude login
     elif limit:
