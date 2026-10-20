@@ -60,6 +60,12 @@ principals:
 """
 
 
+def due_in(seconds: float) -> datetime:
+    """``seconds`` from now at the store's resolution (``iso``: milliseconds). The task's
+    ``wake_at`` is truncated to that, so a reminder fires up to 1ms before a finer due."""
+    return datetime.fromisoformat(iso(utcnow() + timedelta(seconds=seconds)))
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -332,7 +338,7 @@ async def test_fast_path_read_still_allowed(running: Running) -> None:
 
 async def test_e15_dry_run_runs_store_tools_and_holds_back_the_rest(running: Running) -> None:
     r = running
-    due = utcnow() + timedelta(seconds=1)
+    due = due_in(1)
     calls = await r.run_script(
         {"tool": "add_note", "args": {"text": "buy milk"}},
         {"tool": "add_reminder", "args": {"at": due.isoformat(), "text": "stretch"}},
@@ -792,7 +798,7 @@ async def test_e7_reminder_survives_a_restart_before_it_is_due(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
     async with start_daemon(resonant_home, chat) as r:
-        due = utcnow() + timedelta(seconds=4)
+        due = due_in(4)
         await r.run_script({"tool": "add_reminder", "args": {"at": due.isoformat(), "text": "x"}})
     assert utcnow() < due  # stopped before it was due
 

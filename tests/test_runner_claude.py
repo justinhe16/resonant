@@ -1777,7 +1777,10 @@ async def test_the_daemon_registers_the_runner_and_the_cleanup_job(
         assert daemon.loop.runners["claude"] is claude and claude.uses_claude_slot
         assert daemon.state.components and daemon.state.components.runners["claude"] is claude
         assert claude.max_runs == 4  # claude.max_concurrent 5, one slot reserved for on-call
-        assert ("core", "run-cleanup") in {(j.ext, j.job_id) for j in daemon.scheduler.jobs}
+        jobs = {(j.ext, j.job_id) for j in daemon.scheduler.jobs}
+        # tests/conftest.py drops these from every other test's daemon: check they're wired
+        core = {"briefing", "pulse", "watches", "backup", "run-cleanup"}
+        assert {("core", job) for job in core} <= jobs
         assert await claude.start() == 0  # nothing left over from a crash
         assert claude._unhook is not None  # pyright: ignore[reportPrivateUsage]
         await claude.aclose()
