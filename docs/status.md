@@ -19,7 +19,7 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 18, two extensi
 | Quiet briefing (BF-1) | All-zero items dropped; an empty briefing is one line | #111 |
 | Batch approvals (BA-1) | One yes/no prompt for all of a task's changes; `allow_tools` lets "don't ask for X" set standing allows for extension tools | #113 |
 
-Latest task eval (synthetic set, live qwen): 95.8%, 0 unapproved writes, triage 100%. Claude's own answers are not graded yet.
+Latest task eval (synthetic set, live qwen, PER-249, 3 runs): 99.5%, 0 unapproved writes, triage 100%. Claude's own answers are not graded yet.
 
 ## How we work
 

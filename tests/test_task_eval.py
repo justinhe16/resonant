@@ -100,7 +100,10 @@ def test_example_set_scripted_run_is_all_correct() -> None:
     assert by_id["notes-add"].executed_writes == ["add_note"]
     assert by_id["runs-start"].executed_writes == ["start_run"]
     assert "Saved note 1" in by_id["notes-add"].reply
-    assert by_id["pa-calendar"].reply == "on it, one sec"  # BR-10: the triage's ack
+    assert by_id["research-web"].reply == "on it, one sec"  # BR-10: the triage's ack
+    # PER-249: email and calendar stay local even when the triage says claude
+    for row in ("pa-calendar", "pa-email-search"):
+        assert by_id[row].route == "local" and "can't reach" in by_id[row].reply
     # BR-10: the routes, and Claude's own calls through the real gate (scripted sessions)
     assert s["route"]["triage_accuracy"] == 1.0 and s["route"]["kept_wrong"] == 0
     assert by_id["triage-why-restarts"].claude_reply is not None
@@ -789,7 +792,7 @@ def test_live_claude_grades_the_hard_rows_answers(tmp_path: Path) -> None:
     c = data["modes"]["loop"]["claude"]
     assert c["n"] == 2 and c["accuracy"] == 1.0 and c["answer_ms"]["n"] == 2
     assert c["tokens"]["input_tokens"] == 2400 and c["tokens"]["output_tokens"] == 160
-    assert [r["id"] for r in c["rows"]] == ["pa-calendar", "pa-email-draft"]
+    assert [r["id"] for r in c["rows"]] == ["research-web", "research-link"]  # PER-249
     assert all(r["usage"]["turns"] == 1 for r in c["rows"])
     assert any("first 2 of" in e for e in errs)
     (saved,) = (tmp_path / "r").glob("task-*.json")

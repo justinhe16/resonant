@@ -260,6 +260,37 @@ async def test_a_bad_triage_answer_goes_to_claude_with_a_canned_ack(
         assert ack in CANNED_ACKS and answer == "Claude: Here you go."
 
 
+async def test_email_and_calendar_stay_local_whatever_the_triage_says(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-249: CAL-1 was dropped, so Claude can't reach email or calendar either. A triage
+    of kind email or calendar keeps the turn local, and that turn alone gets the hint."""
+    from resonant.runners.brain import OUT_OF_REACH_HINT
+
+    async with start(resonant_home, chat, tmp_path) as w:
+        w.model.triage = {"handler": "claude", "kind": "email", "say": "checking your email"}
+        w.model.push("I can't reach your email.")
+        (reply,) = await w.say("did the landlord email me?")
+        assert reply == "I can't reach your email."
+        assert w.ask_tasks() == []
+        (req,) = w.model.requests
+        assert req.messages[-1] == {"role": "user", "content": OUT_OF_REACH_HINT}
+        (brain,) = w.rows("SELECT * FROM tasks WHERE runner = 'brain'")
+        result = json.loads(brain["result"])
+        assert result["route"] == "local" and result["triage"]["why"] == "out_of_reach"
+        # a hard-shaped question about an email feature still goes to Claude
+        w.model.triage = {"handler": "claude", "kind": "email", "say": "checking the parser"}
+        w.claude(answer="The parser drops the header.")
+        ack, _ = await w.say("why does the email parser in mycelium fail?", replies=2)
+        assert ack == "checking the parser" and len(w.ask_tasks()) == 1
+        await w.settled()
+        # an ordinary local turn gets no hint
+        w.model.triage = {"handler": "local", "kind": "general", "say": ""}
+        w.model.push("Hi.")
+        await w.say("hi")
+        assert all(m["content"] != OUT_OF_REACH_HINT for m in w.model.requests[-1].messages)
+
+
 async def test_an_easy_text_stays_local(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:

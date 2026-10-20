@@ -56,11 +56,11 @@ NOT_RUNNING = "ask_claude isn't available: the ask runner isn't running (iMessag
 ASK_CLAUDE = ToolSpec(
     name="ask_claude",
     description=(
-        "Hand a question to Claude when you're stuck or it needs the web, email, calendar, an "
-        "image or a link. It answers the owner by text in a minute or two; you get back only "
-        "that it's queued, so tell the owner you're looking into it. `kind`: research (web), "
-        "email, calendar, image (with `attachments`), link, or general. Claude uses Resonant's "
-        "tools through the same approvals as yours; it never sends email or changes events."
+        "Hand a question to Claude when you're stuck or it needs the web, an image or a link. "
+        "It answers the owner by text in a minute or two; you get back only that it's queued, "
+        "so tell the owner you're looking into it. `kind`: research (web), image (with "
+        "`attachments`), link, or general. Claude uses Resonant's tools through the same "
+        "approvals as yours. Claude can't reach the owner's email or calendar either."
     ),
     args_schema={
         "type": "object",
