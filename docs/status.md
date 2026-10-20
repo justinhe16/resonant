@@ -52,6 +52,7 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 | 1 | PER-245 🟠 | Taint: about 3-turn window; notes, reminders and facts exempt |
 | 1 | PER-246 | Fix flaky tests |
 | 1 | PER-247 | Scheduler inline L0 jobs through the tool core. Not alongside PER-245 |
+| 2 | PER-258 🟠 | Claude brain gets full tools; shell writes ask by text, every call logged, progress texts (after PER-245) |
 | 2 | PER-248 🔴 | Real eval set drafted from the owner's past texts |
 | 2 | PER-249 | Known eval misses (after PER-245) |
 | 2 | PER-250 | Live Claude eval (after PER-248) |
