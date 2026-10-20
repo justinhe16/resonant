@@ -54,7 +54,7 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 | Owner | PER-253 | Dogfood: set up mycelium from scratch by texting Resonant. mycelium is registered but not cloned yet |
 | Backlog | PER-254, PER-255, PER-256 | Batch as one dashboard row, `yes 1,3`, retire intents |
 
-**Roadmap after 6b:** 5b Slack, 6 on-call, 7 life lane (Gmail read/draft, browser, computer use).
+**Roadmap after 6b:** 5b Slack → 6 on-call → 7 life lane (Gmail, browser, computer use). One card per phase on the Roadmap tab of `architecture.html`.
 
 **Deferred:** direct MCP for the Claude brain (batch approvals covered the need). Headless `claude -p` loads no claude.ai connectors, so this would need directly configured servers.
 
