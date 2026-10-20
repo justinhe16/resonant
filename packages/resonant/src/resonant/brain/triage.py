@@ -27,6 +27,8 @@ Route = Literal["local", "claude"]
 ACK_MAX_CHARS = 80
 TRIAGE_MAX_TOKENS = 80
 KINDS = ("general", "research", "email", "calendar", "link")
+# Nobody here can reach these since CAL-1 was dropped (PER-249): the local model says so.
+OUT_OF_REACH = frozenset({"email", "calendar"})
 
 SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -44,24 +46,29 @@ _LOCAL = {
         "local: you can fully and correctly handle it yourself right now: a status check, "
         "adding or listing notes or reminders, remembering a fact, one lookup with an "
         "obvious tool (one run, one list, where a repo is), small talk or general knowledge, "
-        "or a follow-up already answered above."
+        "or a follow-up already answered above. Also email, calendar or free time (kind "
+        "email or calendar): neither you nor Claude can reach them, so you say so."
     ),
-    "claude": ("local: only a status check, adding or listing notes or reminders, or small talk."),
+    "claude": (
+        "local: only a status check, adding or listing notes or reminders, small talk, or "
+        "email, calendar or free time (kind email or calendar: nobody here can reach them, "
+        "so you say so)."
+    ),
 }
 _CLAUDE = (
     "claude: anything else: more than one step, a why or how question, code or a repo's "
     "history (commits, PRs, what changed), debugging, research, the web or news, a link, "
-    "email, calendar, a photo or file, or anything you aren't sure you can get right. When "
-    "in doubt, choose claude."
+    "a photo or file, or anything you aren't sure you can get right. When in doubt, choose "
+    "claude."
 )
 _FORMAT = (
-    "Reply with only a JSON object: handler (local or claude), kind (for claude: research "
-    "for the web, email, calendar, link for a URL, else general; for local: general), and "
-    "say. For claude, say is a short text to the owner while Claude works, terse coworker "
-    "style, lowercase, under 60 characters, naming what is being checked, never an answer "
-    'and never a question, e.g. "on it, digging through resonant\'s history", "checking '
-    'R4\'s logs", "one sec, reading that page", "looking at your calendar". For local, say '
-    'is "".'
+    "Reply with only a JSON object: handler (local or claude), kind (email or calendar for "
+    "an email, calendar or free-time ask; else for claude: research for the web, link for a "
+    "URL, else general; for local: general), and say. For claude, say is a short text to "
+    "the owner while Claude works, terse coworker style, lowercase, under 60 characters, "
+    "naming what is being checked, never an answer and never a question,"
+    ' e.g. "on it, digging through resonant\'s history", "checking '
+    'R4\'s logs", "one sec, reading that page". For local, say is "".'
 )
 
 
@@ -155,6 +162,7 @@ __all__ = [
     "ACK_MAX_CHARS",
     "CANNED_ACKS",
     "KINDS",
+    "OUT_OF_REACH",
     "SCHEMA",
     "TRIAGE_MAX_TOKENS",
     "Route",

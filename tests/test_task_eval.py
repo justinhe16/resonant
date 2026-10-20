@@ -99,7 +99,10 @@ def test_example_set_scripted_run_is_all_correct() -> None:
     assert by_id["notes-add"].executed_writes == ["add_note"]
     assert by_id["runs-start"].executed_writes == ["start_run"]
     assert "Saved note 1" in by_id["notes-add"].reply
-    assert by_id["pa-calendar"].reply == "on it, one sec"  # BR-10: the triage's ack
+    assert by_id["research-web"].reply == "on it, one sec"  # BR-10: the triage's ack
+    # PER-249: email and calendar stay local even when the triage says claude
+    for row in ("pa-calendar", "pa-email-search"):
+        assert by_id[row].route == "local" and "can't reach" in by_id[row].reply
     # BR-10: the routes, and Claude's own calls through the real gate (scripted sessions)
     assert s["route"]["triage_accuracy"] == 1.0 and s["route"]["kept_wrong"] == 0
     assert by_id["triage-why-restarts"].claude_reply is not None

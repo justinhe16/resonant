@@ -344,6 +344,52 @@ def claims_change(reply: str) -> bool:
     return _CLAIM.search(reply) is not None
 
 
+# PER-249: an answer that passes on or offers an action named in what a read returned ("a
+# log line says to restart ollama", "want me to add that note?"): that text is data, not the
+# owner's request, so its sentences are dropped and the owner hears that it was ignored.
+RELAY_NOTE = "One line in what I read held instructions; I ignored them."
+_SEGMENTS = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _action_pattern(name: str) -> re.Pattern[str] | None:
+    """``restart_ollama`` as written in a tool name or in words ("restart ollama", "add a
+    note"); None for a one-word name (too common in plain text to mean the tool)."""
+    words = [w for w in re.split(r"[_\W]+", name.lower()) if w]
+    if len(words) < 2:
+        return None
+    gap = r"[\s_]+(?:(?:an?|the|new)\s+)*"
+    return re.compile(r"(?<![a-z0-9])" + gap.join(map(re.escape, words)) + r"(?![a-z0-9])",
+                      re.IGNORECASE)  # fmt: skip
+
+
+def drop_relayed(reply: str, *, read: str, message: str, actions: list[str]) -> tuple[str, int]:
+    """``reply`` without its sentences (or lines) that name one of ``actions`` (the side
+    effect tools) also named in ``read`` (what read tools returned) but not in the owner's
+    ``message``, and how many were dropped. When some were, ``RELAY_NOTE`` closes the reply
+    (or is the reply, when nothing else is left)."""
+    named: list[re.Pattern[str]] = []
+    for action in actions:
+        pattern = _action_pattern(action)
+        if pattern is not None and pattern.search(read) and not pattern.search(message):
+            named.append(pattern)
+    if not named:
+        return reply, 0
+    kept: list[str] = []
+    dropped = 0
+    for line in reply.splitlines():
+        parts = [p for p in _SEGMENTS.split(line) if p.strip()]
+        keep = [p for p in parts if not any(n.search(p) for n in named)]
+        dropped += len(parts) - len(keep)
+        if keep or not parts:
+            kept.append(" ".join(keep))
+    if not dropped:
+        return reply, 0
+    rest = "\n".join(kept).strip()
+    if "ignored" in rest.lower():
+        return rest, dropped
+    return (f"{rest}\n{RELAY_NOTE}" if rest else RELAY_NOTE), dropped
+
+
 _SLIM_KEYS = ("type", "enum", "items", "properties", "required")
 
 
@@ -457,6 +503,10 @@ def _asking(st: _Turn) -> Generator[None]:
         yield
     finally:
         ASKING_HOPS.reset(token)
+
+
+def _is_read(spec: ToolSpec | None) -> bool:
+    return spec is not None and spec.effect is Effect.READ
 
 
 def taints(spec: ToolSpec) -> bool:
@@ -784,7 +834,8 @@ class BrainRunner(LocalRunner):
         """BR-10: who answers this turn. None: the local loop. A ``Triage`` with route
         ``claude``: hand it over, with its ack (None: a canned one). One ``chat_json`` call
         over the turn's own messages and toolset, so the prompt cache holds. A bad or late
-        answer, or a model that's down, goes to Claude (in doubt, Claude)."""
+        answer, or a model that's down, goes to Claude (in doubt, Claude). An email or calendar
+        kind stays local whatever the route says (PER-249): Claude can't reach them either."""
         brain = self.settings.brain
         st.meta["route"] = "local"
         if brain.route == "local" or self._claude_spec(principal) is None:
@@ -819,7 +870,11 @@ class BrainRunner(LocalRunner):
                 decided = triage.Triage("claude", "general", None)
             if brain.route == "claude" and decided.route != "claude":
                 decided = triage.Triage("claude", decided.kind, None)
-            if decided.route == "local" and triage.has_link(text):
+            if decided.kind in triage.OUT_OF_REACH and not triage.has_link(text):
+                # PER-249: Claude can't reach email or calendar either: say so here
+                decided = triage.Triage("local", decided.kind, None)
+                why = "out_of_reach"
+            elif decided.route == "local" and triage.has_link(text):
                 decided = triage.Triage("claude", "link", None)  # links need WebFetch
                 why = "link"
             elif decided.route == "local" and triage.looks_hard(text):
@@ -1198,14 +1253,25 @@ class BrainRunner(LocalRunner):
     def _answered(self, answer: str, st: _Turn, spans: SpanFactory) -> Answer:
         """The model's answer: clipped, the number guard counted (log-only), and the code-built
         report lines of any side effects in it."""
-        reply = clip_reply(answer, MAX_REPLY_CHARS)
+        read = "\n".join(
+            str(m.get("content") or "")
+            for m in st.messages
+            if m.get("role") == "tool" and _is_read(st.lookup(str(m.get("tool_name") or "")))
+        )
+        actions = [s.name for s in (*st.core, *st.deferred.values()) if s.effect is not Effect.READ]
+        reply, relayed = drop_relayed(answer, read=read, message=st.text, actions=actions)
+        reply = clip_reply(reply, MAX_REPLY_CHARS)
         sources = [m["content"] for m in st.messages]
         bad = unsupported_numbers(reply, sources)
         meta: dict[str, Any] = {"tool_calls": len(st.calls), "tainted": st.tainted, **st.meta}
+        if relayed:
+            meta["relay_guard"] = relayed
+            log.info("brain: dropped %d sentence(s) relaying an action from read content", relayed)
         if bad:
             meta["number_guard"] = len(bad)
             log.info("brain: %d number(s) in the reply not found in the context", len(bad))
-        with spans("runner.brain.answer", reply_len=len(reply), number_guard=len(bad)):
+        with spans("runner.brain.answer", reply_len=len(reply), number_guard=len(bad),
+                   relay_guard=relayed):  # fmt: skip
             pass
         narration = Answer(reply, "llm", used_tools(st.calls), meta=meta)
         if not st.reports:

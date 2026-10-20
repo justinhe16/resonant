@@ -158,8 +158,8 @@ async def test_run_activity_by_code_repo_or_the_only_active_run(
     other = make_run(db, status="waiting")
     out = await call(components, "run_activity", {})
     assert out["found"] is False
-    assert out["text"] == f"Which run? {other.code} resonant, {live.code} resonant." or (
-        out["text"] == f"Which run? {live.code} resonant, {other.code} resonant."
+    assert out["text"] == f"Which run? {other.code} (resonant), {live.code} (resonant)." or (
+        out["text"] == f"Which run? {live.code} (resonant), {other.code} (resonant)."
     )
     out = await call(components, "run_activity", {"code": "R99"})
     assert out == {"found": False, "code": "R99", "text": "No run R99."}
