@@ -18,8 +18,9 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 18, two extensi
 | Backups (BK-1) | Daily SQLite backup at 03:30, 7 daily + 4 weekly, 36h alert, `resonant backup now/list/restore` | #110 |
 | Quiet briefing (BF-1) | All-zero items dropped; an empty briefing is one line | #111 |
 | Batch approvals (BA-1) | One yes/no prompt for all of a task's changes; `allow_tools` lets "don't ask for X" set standing allows for extension tools | #113 |
+| Phase 6b (PER-245…250, 258) | Taint lasts 3 turns, with notes/reminders/facts exempt. Flaky tests fixed (test daemons run no wall-clock jobs). Scheduler goes through the tool core (no boundary exceptions). `resonant eval draft --from-history` and `--set owner` with a review gate. `--route claude --live-claude` grades Claude's answers. qwen names things by title, drops relayed injected actions, refuses email/calendar. The Claude brain has full tools: reads run, shell changes run-and-report or ask by text (see brain-plan.md), the never-list is refused, and every call is audited | #114–#120 |
 
-Latest task eval (synthetic set, live qwen, PER-249, 3 runs): 99.5%, 0 unapproved writes, triage 100%. Claude's own answers are not graded yet.
+Latest task eval (synthetic set, live qwen, PER-249, 3 runs): 99.5%, 0 unapproved writes, triage 100%. Live Claude eval (PER-250, 5 hard rows): 5/5, p50 14.7s ack to answer, about $0.60. Most synthetic hard rows have no facts, so the owner set is the real test.
 
 ## How we work
 
@@ -41,24 +42,17 @@ Latest task eval (synthetic set, live qwen, PER-249, 3 runs): 99.5%, 0 unapprove
 
 ## Owner to-dos
 
-The list lives in [`followups.md`](followups.md). The next ones: `resonant ext update github`, the phone tests (PER-252), and mycelium by text (PER-253).
+The list lives in [`followups.md`](followups.md). The next ones: OK and review the owner eval set (`resonant eval draft --from-history`, then set `review: false`, then `resonant eval task --set owner --repeat 3`), `resonant ext update github`, the phone tests (PER-252, now including a brain shell approval), and mycelium by text (PER-253).
 
 ## Open work: Phase 6b, harden and prove
 
-Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant project (Personal team). Your own to-dos are in [`followups.md`](followups.md); deferred design notes and carry-overs in [`backlog.md`](backlog.md).
+Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant project (Personal team). The build tickets merged on 2026-10-20 (#114–#120). Your own to-dos are in [`followups.md`](followups.md); deferred design notes and carry-overs, including the review nits from this wave, are in [`backlog.md`](backlog.md).
 
-| Wave | Ticket | What |
+| Who | Ticket | What |
 |---|---|---|
-| 1 | PER-245 🟠 | Taint: about 3-turn window; notes, reminders and facts exempt |
-| 1 | PER-246 | Fix flaky tests |
-| 1 | PER-247 | Scheduler inline L0 jobs through the tool core. Not alongside PER-245 |
-| 2 | PER-258 🟠 | Claude brain gets full tools; shell writes ask by text, every call logged, progress texts (after PER-245) |
-| 2 | PER-248 🔴 | Real eval set drafted from the owner's past texts |
-| 2 | PER-249 | Known eval misses (after PER-245) |
-| 2 | PER-250 | Live Claude eval (after PER-248) |
 | Owner | PER-252 | Phone tests (incl. `resonant ext update github`) |
 | Owner | PER-253 | Dogfood: set up mycelium from scratch by texting Resonant. mycelium is registered but not cloned yet |
-| Backlog | PER-254, PER-255, PER-256 | Batch as one dashboard row, `yes 1,3`, retire intents (after PER-248) |
+| Backlog | PER-254, PER-255, PER-256 | Batch as one dashboard row, `yes 1,3`, retire intents |
 
 **Roadmap after 6b:** 5b Slack, 6 on-call, 7 life lane (Gmail read/draft, browser, computer use).
 
