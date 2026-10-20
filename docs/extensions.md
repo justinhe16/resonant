@@ -309,3 +309,68 @@ The digest is sha256 over the sorted `(path, file/executable/symlink, sha256(con
 - [ ] Events carry `dedupe_key`.
 - [ ] Each approver holds the `approve` grant in `principals.yaml`.
 - [ ] Anything that moves money or places orders runs inside your extension with its own risk controls. Core only sees read tools, events and the kill switch, as trade-jev does.
+
+## 11. Deferred designs
+
+Designed, not built. Each waits for a consumer or a prerequisite. Planned work is in Linear; known limits are in [`limits.md`](limits.md).
+
+### Seatbelt sandbox for extension processes
+
+> **Flag.** The owner's rule is that Claude workers stay unguarded and nobody proposes sandbox layers for them. This design is for **extension processes only**, not workers. Confirm with the owner before ticketing it.
+
+It must land before any third-party or network source, and needs its own security review. `resonant/sandbox/` today has only the allow-default thin guard for workers. This adds a second template: a deny-default `extension` profile, opt-in per extension (`sandbox: true`), proven with `gh api` and the example extension, then on by default. It can reuse the thin guard's mach and port denies.
+
+- Deny `lsopen`, `launchctl`, `open`, `shortcuts`, and `mach-lookup` of `securityd` / `com.apple.SecurityServer`.
+- Deny `process-info` and `signal` on other processes.
+- Deny loopback (Ollama `:11434`, the API `:7777`) and unix sockets, except mDNSResponder.
+- Deny the pasteboard, Apple Events, and exec from the data dir or `TMPDIR`.
+- Deny `file-read*` under `$HOME` outside the extension and data dirs.
+- Go CLIs such as `gh` need `trustd` for TLS. `sandbox-exec` is deprecated but works; verify per macOS release.
+
+**Done when.** A copied `security` binary, ctypes `SecItemCopyMatching` and a read of `~/Library/Mail` are all denied, and the github digest and the pulse reporters still run under it.
+
+### Critical-job LaunchAgents and `job-guard`
+
+Deferred with their only consumer (trade-jev). `ext add` refuses `critical: true`. Critical jobs must be Allow-only (L0, or L3 with a report). `job-guard` stays the parent (no exec) so it can redact the job's output; it checks `autonomy` and `paused`, the extension row, the job and the pin, and fails closed (exit 75). The command comes from the approved manifest snapshot, never the plist.
+
+**Done when.** A critical job fires with the daemon down, is skipped while paused, and refuses a tampered copy.
+
+### Git and network sources, Python deps
+
+`git+https://…` sources and extensions with dependencies (a per-extension venv). They need the extension sandbox, clone hardening (no hooks, no submodules, pinned commits, never tags) and a `uv sync --locked` review first: install-time code must not run unreviewed.
+
+### iMessage `/ext add|update|remove`
+
+A terminal confirmation is enough for first-party code and keeps remote installs out of the threat model.
+
+**Done when.** A reviewed design binds a remote approval to `{source, commit, tree_digest, manifest_sha}` with a typed confirmation. It ships only after the sandbox.
+
+### MCP stdio servers: env-token binaries and secret-gated discovery
+
+- A stdio server that reads its token only from an env var can't be used: secrets go on fd 4, never the env. Options: a per-server "env secrets" grant shown as an escalation, or the server's HTTP endpoint (bearer held in the daemon).
+- `ext add` lists a stdio server's tools with no secrets, so one that needs its token to list tools can't be installed. Option: the http servers' ask-then-send, with the secrets on fd 4 after the owner confirms the command line.
+
+**Done when.** Each is decided, and built or dropped. No server needs either today.
+
+### Extension runtime extras
+
+- **A local push endpoint** (an HTTP `emit()`) for long-running processes, instead of a job period (5 minutes at best). Loopback only, a per-extension Keychain token, the same `report()` payload and pulse path.
+- Per-extension network allowlists (an `srt`-style proxy).
+- A separate macOS user for extensions.
+- CPU and memory limits.
+
+### Veto windows for unattended jobs
+
+"Doing X in 10 min unless you stop": a scheduled L2 returns `Veto`, parks in `waiting(veto)` with `wake_at` at the deadline, and runs unless the owner replies `stop`. `Veto` is in the gate contract and never returned today; asking jobs fire at most hourly, so asking works for now.
+
+- A `stop` with `occurred_at` ≤ the deadline wins even if ingested after it, and so does one within a short late-stop grace if the call hasn't started.
+- An ambiguous `stop` (several vetoes pending) converts them all to asks.
+- A veto may run only if its prompt was recorded as sent at least the window before. Late (daemon down past the window) or under `/kill`, it converts to an ask.
+
+**Done when.** A job's L2 action runs after its window with no reply, never after `stop` or `/kill`, and a missed window asks.
+
+### Approval classifier and `resonant eval approvals`
+
+The parser covers the replies people send. For the ones it misses ("sure go ahead", "nah"), a small model call that sees only the reply and the code-built summary, approves only at confidence ≥ 0.9, and never for L1 or pay. `resonant eval approvals` scores it on `evals/approvals.example.jsonl` and a real set in `~/.resonant/evals/`.
+
+**Done when.** Misses get a classifier decision or a re-ask, never a wrong approval, and the eval reports precision on approvals.

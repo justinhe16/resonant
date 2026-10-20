@@ -272,7 +272,7 @@ Each ticket is one PR (~200–600 lines including tests), run through robot-surf
   - `⚠ ext:github degraded` (`health_snapshot`)
   - `github: 3 open PRs, #41 ✗ lint 2d` (the text of today's latest `ext.github.digest` event, sanitized; github schedules `digest` at 07:50)
 - Sent with `dedupe_key=briefing:<local date>`. Skipped while paused. Catch-up: 3h.
-- This is the seed for [proactive nudges](backlog.md#proactive-nudges-btw-). Ranking and model use are later.
+- This is the seed for [proactive nudges](https://linear.app/doriapp/issue/PER-265) (an owner design call). Ranking and model use are later.
 
 ### D13. Interim trust bar (stated plainly)
 - Phase 3 extensions are **first-party, owner-installed code** from this repo or a local path. They run **as the same macOS user** and **inherit the daemon's Full Disk Access**. They can read `~/.resonant/resonant.db`, chat.db and the Keychain via `security` like any same-user process ([trust model](architecture.md#trust-model)).

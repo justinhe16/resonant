@@ -138,7 +138,7 @@ Ollama runs as a LaunchAgent, and bootstrap pulls `model.name` (default `qwen3:3
 
 ## 9. Router evals
 
-*Deferred: needs real texts labelled by hand (see [`backlog.md`](backlog.md#router-evals-on-real-texts-go-live-step-9)).* The synthetic set in `evals/` only proves the pipeline. Gate on your own texts.
+*Deferred: needs real texts labelled by hand (superseded by the owner eval set, PER-248: see [`evals/README.md`](../evals/README.md#drafting-from-your-texts)).* The synthetic set in `evals/` only proves the pipeline. Gate on your own texts.
 
 - Put real messages (anonymised as you like) in `~/.resonant/evals/router.jsonl`, in the same format as `evals/*.example.jsonl`. That directory is outside the repo and is never committed.
 - **Verify:** `resonant eval router --set ~/.resonant/evals/router.jsonl`

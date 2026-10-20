@@ -33,7 +33,7 @@ Any extension can report items, so future extensions (Dori on-call, a trading bo
 | # | Question | Decision |
 |---|---|---|
 | Q1 | Interruptions | `urgent` texts immediately, **including in quiet hours**. `normal` goes in the next hourly pulse. `low` waits for 08:00. |
-| Q2 | Stale detection | Rules, not a model: a key plus a fingerprint of the item's state. A model can rank later (the [nudges follow-up](backlog.md#proactive-nudges-btw-)). |
+| Q2 | Stale detection | Rules, not a model: a key plus a fingerprint of the item's state. A model can rank later (the nudges design, [PER-265](https://linear.app/doriapp/issue/PER-265)). |
 | Q3 | Quiet hours | 00:00–06:00 local. Only `urgent` goes out. Normal items held over show in the 06:00 pulse. |
 | Q4 | Hourly cap | None. A pulse is one message an hour at most, and only when something changed. (The existing 20/h per-extension cap on immediate sends stays, as flood protection against a broken extension.) |
 | Q5 | Re-mentions | A pending approval is mentioned again once by the next hourly pulse after 10 minutes. (Planned as 4 hours; as built it is capped at half of `gate.approval_ttl_s` (30 minutes), or the approval would expire first.) |

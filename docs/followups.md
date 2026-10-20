@@ -1,6 +1,6 @@
 # Follow-ups: your to-dos
 
-Only the things that need you, the owner, at the Mini or on your phone. Planned code work is in Linear (Resonant project, epic [PER-257](https://linear.app/doriapp/issue/PER-257)). Deferred design notes and per-ticket carry-overs are in [`backlog.md`](backlog.md). Claude never enters a secret, and no secret goes in a chat or a text.
+Only the things that need you, the owner, at the Mini or on your phone. Planned code work is in Linear (Resonant project, epic [PER-257](https://linear.app/doriapp/issue/PER-257)). Known limits are in [`limits.md`](limits.md). Claude never enters a secret, and no secret goes in a chat or a text.
 
 ## Now
 
@@ -21,6 +21,8 @@ Only the things that need you, the owner, at the Mini or on your phone. Planned 
 - **PRs to other people's public repos:** a classic token with only `public_repo`, then `resonant secret set runner/github_public_token`, then a first fork run with Claude watching.
 - **`brain.taint_hops`:** how many turns stay careful after Resonant reads outside text (the web, a file, a log, a Claude answer). Default 3. Notes, reminders and facts never ask because of it; other changes do.
 - **Voice notes:** install whisper.cpp and tell Claude the path (`brain.whisper_path`).
+- **An external uptime check** on https://resonant-relay-jhe.fly.dev/healthz (it returns 503 when the checker stalls). A Fly outage is otherwise silent.
+- **The ntfy alert channel:** the default is a public `ntfy.sh` topic, and the long random topic is the password. If missed pushes or that bother you, move to a protected topic (`NTFY_TOKEN`), your own ntfy server (`NTFY_URL`) or a webhook (`WEBHOOK_URL`) into SMS or email. No code change.
 
 ## Done
 

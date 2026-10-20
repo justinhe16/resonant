@@ -1,6 +1,6 @@
 # Test tracker
 
-What still needs a human to try, in one place. The full steps and expected replies are in [`go-live.md`](go-live.md). This file only tracks **status**. Deferred work (not tests) is in [`backlog.md`](backlog.md).
+What still needs a human to try, in one place. The full steps and expected replies are in [`go-live.md`](go-live.md). This file only tracks **status**. Planned work (not tests) is in Linear (epic [PER-257](https://linear.app/doriapp/issue/PER-257)); known limits are in [`limits.md`](limits.md).
 
 Legend:
 - ✅ done.
@@ -169,7 +169,7 @@ Numbered M1–M9. Attachments work in either `brain.mode`; links and watches nee
 
 | # | Test | Where | Status |
 |---|---|---|---|
-| 47 | Router evals on 30–50 real texts (≥ 90%) | go-live 9, [`backlog.md`](backlog.md#router-evals-on-real-texts-go-live-step-9) | deferred |
+| 47 | Router evals on 30–50 real texts (≥ 90%) | go-live 9; superseded by the owner eval set (PER-248, [`evals/README.md`](../evals/README.md#drafting-from-your-texts)) | deferred |
 | 53 | Task evals, real model: `resonant eval task --mode both` (BR-6). `[loop]` ≥ 85%, `unapproved 0`; record accuracy, escalation rate and p50/p95 (the loop is the default since BR-8) | go-live 9 "Task evals", [`evals/README.md`](../evals/README.md#task-eval) | 🖥 |
 | 54 | `resonant bench e2e --model real --n 20` with the `loop` path: `loop` p50 ≤ 5 s | go-live 9 | 🖥 |
 
