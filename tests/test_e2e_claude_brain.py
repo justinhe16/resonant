@@ -278,6 +278,12 @@ async def test_email_and_calendar_stay_local_whatever_the_triage_says(
         (brain,) = w.rows("SELECT * FROM tasks WHERE runner = 'brain'")
         result = json.loads(brain["result"])
         assert result["route"] == "local" and result["triage"]["why"] == "out_of_reach"
+        # a hard-shaped question about an email feature still goes to Claude
+        w.model.triage = {"handler": "claude", "kind": "email", "say": "checking the parser"}
+        w.claude(answer="The parser drops the header.")
+        ack, _ = await w.say("why does the email parser in mycelium fail?", replies=2)
+        assert ack == "checking the parser" and len(w.ask_tasks()) == 1
+        await w.settled()
         # an ordinary local turn gets no hint
         w.model.triage = {"handler": "local", "kind": "general", "say": ""}
         w.model.push("Hi.")

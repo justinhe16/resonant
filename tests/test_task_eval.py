@@ -792,7 +792,7 @@ def test_live_claude_grades_the_hard_rows_answers(tmp_path: Path) -> None:
     c = data["modes"]["loop"]["claude"]
     assert c["n"] == 2 and c["accuracy"] == 1.0 and c["answer_ms"]["n"] == 2
     assert c["tokens"]["input_tokens"] == 2400 and c["tokens"]["output_tokens"] == 160
-    assert [r["id"] for r in c["rows"]] == ["pa-calendar", "pa-email-draft"]
+    assert [r["id"] for r in c["rows"]] == ["research-web", "research-link"]  # PER-249
     assert all(r["usage"]["turns"] == 1 for r in c["rows"])
     assert any("first 2 of" in e for e in errs)
     (saved,) = (tmp_path / "r").glob("task-*.json")

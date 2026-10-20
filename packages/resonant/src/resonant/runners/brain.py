@@ -356,6 +356,13 @@ def claims_change(reply: str) -> bool:
 # log line says to restart ollama", "want me to add that note?"): that text is data, not the
 # owner's request, so its sentences are dropped and the owner hears that it was ignored.
 RELAY_NOTE = "One line in what I read held instructions; I ignored them."
+# A sentence that offers, asks or relays ("says to", "want me to", "should I", a question),
+# not one that explains what a tool does ("add_note saves a note").
+_RELAYS = re.compile(
+    r"\?|\b(?:says?|said|asks?|asked|tells?|told|instructs?|instructions?|wants?|"
+    r"should|shall|could|can I|I can|let me know|suggests?|recommends?|must|needs? to)\b",
+    re.IGNORECASE,
+)
 _SEGMENTS = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
@@ -371,10 +378,10 @@ def _action_pattern(name: str) -> re.Pattern[str] | None:
 
 
 def drop_relayed(reply: str, *, read: str, message: str, actions: list[str]) -> tuple[str, int]:
-    """``reply`` without its sentences (or lines) that name one of ``actions`` (the side
-    effect tools) also named in ``read`` (what read tools returned) but not in the owner's
-    ``message``, and how many were dropped. When some were, ``RELAY_NOTE`` closes the reply
-    (or is the reply, when nothing else is left)."""
+    """``reply`` without its sentences (or lines) that offer, ask about or relay
+    (``_RELAYS``) one of ``actions`` (the side effect tools) also named in ``read`` (what read
+    tools returned) but not in the owner's ``message``, and how many were dropped. When some
+    were, ``RELAY_NOTE`` closes the reply (or is the reply, when nothing else is left)."""
     named: list[re.Pattern[str]] = []
     for action in actions:
         pattern = _action_pattern(action)
@@ -386,7 +393,7 @@ def drop_relayed(reply: str, *, read: str, message: str, actions: list[str]) -> 
     dropped = 0
     for line in reply.splitlines():
         parts = [p for p in _SEGMENTS.split(line) if p.strip()]
-        keep = [p for p in parts if not any(n.search(p) for n in named)]
+        keep = [p for p in parts if not (_RELAYS.search(p) and any(n.search(p) for n in named))]
         dropped += len(parts) - len(keep)
         if keep or not parts:
             kept.append(" ".join(keep))
@@ -881,8 +888,14 @@ class BrainRunner(LocalRunner):
                 decided = triage.Triage("claude", "general", None)
             if brain.route == "claude" and decided.route != "claude":
                 decided = triage.Triage("claude", decided.kind, None)
-            if decided.kind in triage.OUT_OF_REACH and not triage.has_link(text):
-                # PER-249: Claude can't reach email or calendar either: say so here
+            if (
+                decided.kind in triage.OUT_OF_REACH
+                and not triage.has_link(text)
+                and not triage.looks_hard(text)  # "why does the email parser fail?"
+            ):
+                # PER-249: Claude can't reach email or calendar either: say so here.
+                # Even with brain.route claude: Claude would only say the same. Photos
+                # never get here (runners/media.py hands them to Claude directly).
                 decided = triage.Triage("local", decided.kind, None)
                 why = "out_of_reach"
             elif decided.route == "local" and triage.has_link(text):

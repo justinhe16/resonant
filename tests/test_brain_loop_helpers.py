@@ -264,6 +264,10 @@ def test_drop_relayed_drops_actions_from_read_content(reply: str) -> None:
 def test_drop_relayed_leaves_clean_replies_alone() -> None:
     clean = "Ollama is slow (4.1 s probe); github/watch was rate limited."
     assert drop_relayed(clean, read=LOG, message="logs?", actions=ACTIONS) == (clean, 0)
+    # explaining a tool named in a doc it read isn't an offer
+    docs = "add_note saves a note; restart_ollama restarts the local model."
+    out = drop_relayed(docs, read=LOG, message="what tools are there?", actions=ACTIONS)
+    assert out == (docs, 0)
     # the action isn't in what was read: an offer of the model's own is the owner's call
     offer = "R2 looks stuck. Want me to cancel the run?"
     assert drop_relayed(offer, read=LOG, message="what's R2 doing?", actions=ACTIONS) == (
