@@ -39,6 +39,37 @@ def test_commit_requires_side_effect() -> None:
         ToolSpec(name="r", effect=Effect.READ, commit=True)
 
 
+def test_only_builtin_l2_l3_writes_can_be_taint_exempt() -> None:
+    """PER-245: the flag that lets a write run in a tainted task is for Resonant's own
+    low-risk writes; an extension, a read, an L1 or an unleveled write can't carry it."""
+    assert ToolSpec(name="w", effect=Effect.WRITE, level=Level.L3, taint_exempt=True).taint_exempt
+    bad_specs: list[dict[str, Any]] = [
+        {"effect": Effect.WRITE, "level": Level.L3, "extension": "x", "source": "ext:x"},
+        {"effect": Effect.WRITE, "level": Level.L3, "source": "ext:x"},
+        {"effect": Effect.WRITE, "level": Level.L1},
+        {"effect": Effect.WRITE},
+        {"effect": Effect.READ},
+        {"effect": Effect.PAY},
+    ]
+    for bad in bad_specs:
+        with pytest.raises(ValidationError, match="taint exempt"):
+            ToolSpec(name="w", taint_exempt=True, **bad)
+
+
+def test_the_taint_exempt_builtins_are_notes_reminders_and_facts() -> None:
+    import importlib
+    import pkgutil
+
+    import resonant.tools
+
+    exempt: set[str] = set()
+    for mod in pkgutil.iter_modules(resonant.tools.__path__):
+        module = importlib.import_module(f"resonant.tools.{mod.name}")
+        exempt |= {v.name for v in vars(module).values() if isinstance(v, ToolSpec)
+                   and v.taint_exempt}  # fmt: skip
+    assert exempt == {"add_note", "add_reminder", "remember", "forget"}
+
+
 @pytest.mark.parametrize("name", ["Bad", "1x", "has-dash", "x" * 65])
 def test_tool_name_pattern(name: str) -> None:
     with pytest.raises(ValidationError):

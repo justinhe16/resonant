@@ -10,6 +10,9 @@ and returns the recorded result instead of running the handler again.
 
 A note is at most ``TEXT_MAX`` (1000) characters after stripping.
 
+``add_note`` is ``taint_exempt`` (PER-245): it runs in a tainted task too. Deleting or
+clearing notes is not: those still ask.
+
 ``clear_notes`` is destructive, so its approval prompt says how many notes it would
 delete: ``summary_action`` builds that phrase in code, for
 ``gate.summary.summarize(intent, action=...)``.
@@ -51,6 +54,7 @@ ADD_NOTE = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=5.0,
+    taint_exempt=True,  # PER-245: runs on its level even when tainted
 )
 DELETE_NOTE = ToolSpec(
     name="delete_note",

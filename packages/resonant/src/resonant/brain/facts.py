@@ -24,8 +24,10 @@ Writes are atomic and durable (``mkstemp`` in the same dir, fsync, ``os.replace`
 dir is 0700 and each file 0600. Reads open with ``O_NOFOLLOW`` and take regular files only.
 
 ``remember`` is L3 (D9, the owner's call) and the index sits in every later prompt, so a
-task that read injected text could plant a fact. The brain loop depends on D6: a tainted
-task's calls ask first even at L3. The report line shows the whole description. Nothing
+task that read injected text could plant a fact. Since PER-245 (the owner's call) ``remember``
+and ``forget`` are ``taint_exempt``: they run in a tainted task too, so the guard there is
+the model's judgment (the injection evals) and the report line, which shows the whole
+description. The report line shows the whole description. Nothing
 here touches the database.
 """
 

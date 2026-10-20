@@ -841,6 +841,10 @@ class BrainConfig(_Section):
     # asks or gets stuck). ``claude``: every turn goes to Claude, after a local ack.
     route: Literal["triage", "local", "claude"] = "triage"
     triage: TriageConfig = Field(default_factory=TriageConfig)
+    # BR-10b, PER-245: after outside text (web, files, email, logs, extension output, a
+    # Claude answer), this many later turns stay tainted (their model-chosen changes ask,
+    # except notes, reminders and facts). The turn that read it is tainted as well.
+    taint_hops: int = Field(default=3, ge=0, le=20)
     # Where read_file, list_dir and search may look. Unset: runner.code_dir, ~/resonant (and
     # ops.repo_path), and Resonant's logs, docs and run transcripts. Set: exactly these.
     read_roots: list[Path] | None = None

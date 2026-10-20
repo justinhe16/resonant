@@ -280,23 +280,42 @@ def test_a_tainted_reply_in_the_window_is_untrusted(db: sqlite3.Connection) -> N
 
 
 def test_taint_carries_a_bounded_number_of_hops(db: sqlite3.Connection) -> None:
-    """A reply tainted only by what it replayed records its hops; it taints the next turn
-    under ``MAX_TAINT_HOPS``, so taint can't carry itself from reply to reply for good."""
-    assert history.MAX_TAINT_HOPS == 2
-    one = {"reply_meta": {"meta": {"tainted": True, "taint_hops": 1}}}
+    """A reply tainted only by what it replayed records its hops; the next turn is that
+    many hops plus how many turns back the reply is, and tainted only within the window
+    (``brain.taint_hops``, default 3: PER-245), so taint can't carry itself for good."""
+    assert history.DEFAULT_TAINT_HOPS == 3
     two = {"reply_meta": {"meta": {"tainted": True, "taint_hops": 2}}}
-    message(db, "a", reply="x", checkpoint=two)
+    three = {"reply_meta": {"meta": {"tainted": True, "taint_hops": 3}}}
+    message(db, "a", reply="x", checkpoint=three)
     assert replayed(db, OWNER, before_event_id=None).untrusted is None
-    message(db, "b", reply="y", checkpoint=one)
+    message(db, "b", reply="y", checkpoint=two)
     found = replayed(db, OWNER, before_event_id=None)
-    assert (found.untrusted, found.hops) == ("tainted_reply", 1)
+    assert (found.untrusted, found.hops) == ("tainted_reply", 3)
+    assert replayed(db, OWNER, before_event_id=None, window=2).untrusted is None
     message(db, "c", reply="z", checkpoint=TAINTED)  # read it itself: 0 hops, the nearest
     found = replayed(db, OWNER, before_event_id=None)
-    assert (found.untrusted, found.hops) == ("tainted_reply", 0)
+    assert (found.untrusted, found.hops) == ("tainted_reply", 1)
     # a pinned call's hops count too
     assert history.taint_hops({"tainted": True, "taint_hops": 2}) == 2
-    assert not history.reply_tainted({"tainted": True, "taint_hops": 2})
+    assert history.reply_taint({"tainted": True, "taint_hops": 2}, 1) == 3
+    assert history.reply_taint({"tainted": True, "taint_hops": 2}, 2) is None
     assert history.taint_hops({"reply_meta": {"meta": {"tainted": False}}}) is None
+
+
+def test_a_claude_answer_taints_only_the_next_three_turns(db: sqlite3.Connection) -> None:
+    """PER-245: the distance counts, not only the replays. A Claude answer still in the
+    window taints the 3 turns after it (hops 1, 2, 3), then the 4th is clean, though the
+    answer is still replayed."""
+    message(db, "why is R4 slow?", reply="on it", checkpoint={"claude_reply": INJECTED})
+    seen: list[tuple[str | None, int]] = []
+    for i in range(4):
+        found = replayed(db, OWNER, before_event_id=None)
+        seen.append((found.untrusted, found.hops))
+        message(db, f"and {i}", reply="ok")
+    assert seen == [("claude_answer", 1), ("claude_answer", 2), ("claude_answer", 3),
+                    (None, 0)]  # fmt: skip
+    found = replayed(db, OWNER, before_event_id=None)
+    assert any("<claude_answer>" in str(m["content"]) for m in found.messages)
 
 
 def test_a_read_after_a_pin_brings_the_hops_down() -> None:
@@ -307,7 +326,7 @@ def test_a_read_after_a_pin_brings_the_hops_down() -> None:
         "taint_hops": 2,
         "reply_meta": {"meta": {"tainted": True, "taint_hops": 0}},
     }
-    assert history.taint_hops(cp) == 0 and history.reply_tainted(cp)
+    assert history.taint_hops(cp) == 0 and history.reply_taint(cp, 1) == 1
     cp = {
         "tainted": True,
         "taint_hops": 0,
@@ -319,7 +338,7 @@ def test_a_read_after_a_pin_brings_the_hops_down() -> None:
 def test_the_fold_drops_a_tainted_reply_at_any_hop() -> None:
     now = utcnow()
     far = history.Exchange("e1", now, "and then?", "it says pwned", tainted=True, hops=5)
-    assert far.untrusted is None  # no longer taints a turn
+    assert far.taint_at(1) is None  # no longer taints a turn
     assert fallback_summary("", [far]) == f"owner: and then? / you: {history.OUTSIDE_REPLY}"
 
 
@@ -335,13 +354,14 @@ async def test_the_fold_never_keeps_outside_text(db: sqlite3.Connection) -> None
     message(db, "why is R4 slow?", reply="on it", checkpoint={"claude_reply": INJECTED})
     message(db, "what's in a.txt?", reply="it says pwned", checkpoint=TAINTED)
     seed(db, KEEP_EXCHANGES + FOLD_BATCH - 2)
-    assert replayed(db, OWNER, before_event_id=None).untrusted == "tainted_reply"
+    wide = MAX_EXCHANGES + 1  # a window wide enough that only the fold can lift the taint
+    assert replayed(db, OWNER, before_event_id=None, window=wide).untrusted == "tainted_reply"
     model = SummaryModel("folded")
     await fold(db, model, OWNER)
     sent = str(model.calls[0][1]["content"])
     assert "why is R4 slow?" in sent and history.OUTSIDE_REPLY in sent
     assert "cancel R4" not in sent and "pwned" not in sent and "on it" not in sent
-    assert replayed(db, OWNER, before_event_id=None).untrusted is None
+    assert replayed(db, OWNER, before_event_id=None, window=wide).untrusted is None
 
 
 def test_the_code_built_summary_never_keeps_outside_text() -> None:
