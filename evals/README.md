@@ -73,7 +73,8 @@ The synthetic `router.example.jsonl` only proves the pipeline works (tests run i
 
 ```sh
 resonant eval task [--set PATH|owner] [--model live|scripted] [--mode loop|intents|both]
-                   [--repeat N] [--only ID|CATEGORY] [--json] [--min-accuracy 0.85] [--out DIR]
+                   [--repeat N] [--only ID|CATEGORY] [--limit N] [--json] [--min-accuracy 0.85]
+                   [--out DIR] [--route triage|local|claude] [--live-claude]
 ```
 
 The router eval asks "which intent?". The task eval asks "did Resonant do the right thing?": the right tools, Claude when it should (and not when it shouldn't), an approval before a write it shouldn't make alone, and an answer with the facts in it. It is the bar for making `brain.mode: loop` the default (docs/brain-plan.md §4): **≥ 85% of cases graded correct** with the real model.
@@ -84,7 +85,7 @@ Every case gets a **fresh, hermetic home** in a temp dir, seeded with the row's 
 
 - your state: the home, `runner.code_dir`, the run dirs, `brain.read_roots` and `ops.repo_path` are all inside the temp dir; the Keychain is an in-memory fake. Only `--model live` reads `~/.resonant/config.yaml`, for the model and timezone.
 - side effects: notes, reminders, facts, trust rules and `forget_repo` run (they only touch the temp store); everything else the gate allows (`start_run`, `restart_ollama`, `add_repo`, extension writes) is recorded and answered `{"eval": "not run"}`.
-- `ask_claude`: queues nothing and starts no Claude session; it is recorded as an escalation and the reply is `Looking into it…`.
+- `ask_claude`: queues nothing and starts no Claude session; it is recorded as an escalation and the reply is `Looking into it…`. With `--live-claude` it starts a real Claude brain session instead (see [Live Claude](#live-claude-grading-the-claude-brains-answers)).
 - extensions: `github`, `linear` and `trade-jev` are local fixtures with canned results (no network, no secrets).
 
 `--model live` (default) uses the configured local model, one client for the whole run, after one untimed warm-up call. `--model scripted` runs each row's `script` through a `ScriptedModel`; CI runs it to prove the harness and that every example row is satisfiable. It never calls a real model.
@@ -128,9 +129,28 @@ Per mode: accuracy (with the target) and accuracy on the cases not expected to e
 
 Texts and replies appear **only in the command's output**. The summary saved to `--out` (default `~/.resonant/evals/results/task-<ts>.json`) has the metrics, the model, a hash of the set and the failed cases by id, line and failure code, never their text.
 
+`--limit N` runs only the first N cases (after `--only`).
+
 Exit codes: `0` when every mode reached `--min-accuracy` (default `0.85`) **with no unapproved write and no timeout**, `1` otherwise, `2` for a missing or malformed set or a bad option. A `--model scripted` run says it proves the harness, not the model.
 
 The cases run with settings built from their arguments only (`IsolatedSettings`): `RESONANT_*` env vars and `config.yaml` never reach a case's home.
+
+### Live Claude: grading the Claude brain's answers
+
+```sh
+resonant eval task --route claude --live-claude [--set PATH|owner] [--limit 5] [--only ID|CATEGORY]
+```
+
+About 40% of texts go to the Claude brain (BR-10/11). A normal run grades only that the hand-off happened. `--live-claude` hands the **hard rows** (`expect.route: "claude"`) to a real Claude brain session and grades its answer like the local model's: `tools` (the `ask_claude` a row expects is the hand-off itself), `tools_not`, `facts`/`facts_re`/`not_facts`, `ask` and `writes`. It needs `--route claude`.
+
+- **Where it runs.** Each case keeps its hermetic home: a temp `RESONANT_HOME` holding the store, the world and the session's cwd (`ask/session`), with the read roots inside it. The session is the production one (`AskRunner` and `ClaudeSession`, the same argv, MCP bridge, gate and executor as on the Mini), and Resonant's tools behind the MCP bridge read and write the case's world. Writes other than notes, reminders and facts are recorded, not run (`EvalExecutor`). Approvals are asked but never answered.
+- **Auth.** Your own `claude` login: `HOME` is your real one for the `claude` process only, and the Keychain is an in-memory fake (no token is read or written). Claude Code keeps its session file under `~/.claude/projects/` as it does for the daemon's sessions. Nothing reads or writes `~/.resonant` or `~/code`, except `--model live` reading `config.yaml` for the local model. Pass `--out` to keep the summary out of `~/.resonant/evals/results/`.
+- **Small on purpose.** It takes the first 5 hard rows unless `--limit N` says otherwise. Each case is a fresh session, so it costs one session start and one turn. It is opt-in and manual: CI and the tests run it only with `e2e/fake_claude.py`.
+- **The local model still triages** (`--model live`, or each row's `triage` with `--model scripted`). The ack it sends is the start of the answer's latency.
+
+The report adds a `claude` block per mode: accuracy over the turns Claude answered, **ack to answer** latency (the ack's send to the answer's send, p50/p95), and **approximate usage**: Claude Code's `total_cost_usd` (an API-priced estimate, even on a subscription) and the input, output and cache token counts, in total and per row (with turns and tool calls). The saved summary has the same numbers by id and line, never a text or a reply. Failed cases print Claude's reply.
+
+It works on your own set as well (`--set owner`); only reviewed rows with `expect.route: "claude"` run.
 
 ### Your own set
 
