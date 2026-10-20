@@ -12,8 +12,12 @@ function readTheme(): Theme {
   }
 }
 
+/** Browser chrome colour per theme; theme-init.js uses the same values before first paint. */
+const CHROME = { light: "#fafafa", dark: "#0a0a0a" } as const;
+
 export function applyTheme(theme: Theme = readTheme()): void {
   document.documentElement.classList.toggle("dark", theme === "dark");
+  document.getElementById("theme-color")?.setAttribute("content", CHROME[theme]);
 }
 
 /** Toggles light ↔ dark and remembers the choice. */
