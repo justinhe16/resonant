@@ -51,6 +51,25 @@ def never_the_real_claude_login(monkeypatch: pytest.MonkeyPatch) -> list[tuple[s
     return asked
 
 
+@pytest.fixture(autouse=True)
+def no_wall_clock_jobs(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``Daemon`` built in a test schedules no core jobs: they run on the real clock (the
+    08:00 briefing, the hourly pulse, the 03:30 backup, the 04:30 run cleanup, watches every
+    5 minutes), so a test that happened to run at one of those times got extra texts and
+    ``job.run`` rows. Tests that drive core jobs build their own ``Scheduler`` on a fake
+    clock; ``@pytest.mark.wall_clock_jobs`` keeps the daemon's real ones."""
+    if "wall_clock_jobs" in request.keywords:
+        return
+    from resonant import daemon
+    from resonant.extensions.scheduler import CoreDeps, CoreJob
+
+    def no_job(_deps: CoreDeps) -> CoreJob | None:
+        return None
+
+    monkeypatch.setattr(daemon, "CORE_JOBS", ())
+    monkeypatch.setattr(daemon, "cleanup_job", no_job)
+
+
 @pytest.fixture
 def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     conn = open_db(tmp_path / "test.db")
