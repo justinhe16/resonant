@@ -35,7 +35,8 @@ whose ``when`` is in the message (in a session: its last line, the owner's text,
 primer), else the top-level plan. Extra plan keys: ``"crash":
 "once"|"always"`` exits mid-turn after the calls (``once``: only the first time, kept in the
 notes), ``"delay": <s>`` waits before answering, ``"hang": true`` never answers, and
-``"limit": <epoch or null>`` answers with a usage limit error.
+``"limit": <epoch or null>`` answers with a usage limit error. A success ``result`` carries a
+fixed ``usage`` and ``duration_ms`` (``USAGE``).
 
 ``--notes DIR`` writes ``session.json`` after each turn: the argv, the prompt (this turn's
 message), the MCP tool list and every call's result text (what Claude saw), plus in a session
@@ -59,6 +60,8 @@ from pathlib import Path
 from typing import Any, cast
 
 BUILTINS = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]
+# A success ``result`` reports usage as the real CLI does (PER-250: the live eval reads it).
+USAGE: dict[str, Any] = {"usage": {"input_tokens": 1200, "output_tokens": 80}, "duration_ms": 40}
 
 
 class Mcp:
@@ -286,7 +289,7 @@ class Fake:
         self.notes(prompt=prompt, results=results)
         out({"type": "result", "subtype": "success", "is_error": False,
              "result": self.answer(plan, results), "num_turns": 1 + len(results),
-             "total_cost_usd": 0.0})  # fmt: skip
+             "total_cost_usd": 0.0, **USAGE})  # fmt: skip
         return 0
 
     # -- a session (BR-11) --
@@ -344,7 +347,7 @@ class Fake:
             answer = self.answer(plan, results, prev=prev, n=str(len(messages)))
             out({"type": "result", "subtype": "success", "is_error": False, "result": answer,
                  "session_id": sid, "num_turns": 1 + len(results),
-                 "total_cost_usd": 0.0})  # fmt: skip
+                 "total_cost_usd": 0.0, **USAGE})  # fmt: skip
         self.close()
         return 0
 

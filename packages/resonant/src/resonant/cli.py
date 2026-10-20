@@ -1366,16 +1366,31 @@ def eval_task(
         str,
         typer.Option(help="brain.route for the run: triage (default), local or claude (BR-10)."),
     ] = "triage",
+    live_claude: Annotated[
+        bool,
+        typer.Option(
+            "--live-claude",
+            help="With --route claude: hand the hard rows to a real Claude brain session (your"
+            " claude login) and grade its answers. Manual only; never in CI.",
+        ),
+    ] = False,
+    limit: Annotated[
+        int | None,
+        typer.Option(
+            min=1, help="Only the first N cases (with --live-claude: N hard rows, default 5)."
+        ),
+    ] = None,
 ) -> None:
     """Run each text through the brain in a fresh, hermetic home; grade tools, escalation,
     asks, facts and (BR-10) who answered (docs/brain-plan.md §4).
 
     Each case gets a temp home with its seeded world: never your state, ~/code or the
     Keychain. Writes other than notes, reminders and facts are recorded, not run, and
-    ask_claude starts no Claude session. Texts and replies appear only in this command's
-    output; the saved summary refers to cases by id. Exit 1 if a mode's accuracy is below
-    --min-accuracy, a write ran without an approval, or a case timed out; 2 if the set is
-    missing or malformed or an option is bad.
+    ask_claude starts no Claude session, except with --live-claude (PER-250): the hard rows go
+    to a real Claude brain session, with Resonant's tools backed by the case's world. Texts
+    and replies appear only in this command's output; the saved summary refers to cases by
+    id. Exit 1 if a mode's accuracy is below --min-accuracy, a write ran without an approval,
+    or a case timed out; 2 if the set is missing or malformed or an option is bad.
     """
     from resonant.evals import task_eval
 
@@ -1402,6 +1417,8 @@ def eval_task(
         echo=typer.echo,
         echo_err=lambda s: typer.echo(s, err=True),
         route=route,
+        live_claude=live_claude,
+        limit=limit,
     )
     raise typer.Exit(code)
 
