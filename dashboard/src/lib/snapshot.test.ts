@@ -59,7 +59,10 @@ describe("helpers", () => {
 
 describe("forTier", () => {
   it("strips local-only fields from a remote snapshot that carries them", () => {
-    const leaky = clone(local, { tier: "remote" });
+    const leaky = clone(local, {
+      tier: "remote",
+      claude_brain: { state: "up", turns: 3, remote_url: "https://claude.ai/code/x" },
+    });
     const out = forTier(leaky);
     expect(out.runs.items).toBeUndefined();
     expect(out.approvals.items).toBeUndefined();
@@ -68,6 +71,7 @@ describe("forTier", () => {
     expect(out.runner.missing).toBeUndefined();
     expect(out.trust_rules).toBeUndefined();
     expect(out.repos).toBeUndefined();
+    expect(out.claude_brain).toBeUndefined();
     for (const h of out.health) expect(h.reason).toBeUndefined();
     expect(out.approvals.open).toBe(1);
   });

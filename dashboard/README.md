@@ -1,6 +1,8 @@
 # Resonant dashboard
 
-A read-only status page for Resonant ([`docs/dashboard-plan.md`](../docs/dashboard-plan.md)). Vite, React, TypeScript, Tailwind and shadcn/ui-style components (in `src/components/ui`). Mobile first, light and dark.
+A read-only status page for Resonant ([`docs/dashboard-plan.md`](../docs/dashboard-plan.md)). Vite, React, TypeScript, Tailwind v4 and shadcn/ui (style `radix-nova`, base color neutral, lucide icons, the `radix-ui` package, tw-animate-css; see `components.json`, components in `src/components/ui`). Light by default with a dark toggle.
+
+One page, two columns (one on narrow screens). Left: the System status card (the overall state is the worst component health; per-component health is in a collapsible list inside it), then Slots, Active runs, Active tasks. Right: Waiting on you (approvals and worker questions), Runs and tasks (every state, finished runs), Claude (worker runner and brain), Extensions, Pulse, Rules and repos (local only). Each card has its own error boundary. Sections live in `src/sections`.
 
 The daemon serves the committed build in `dist/` at `http://127.0.0.1:7777/`, so the Mini never needs Node (D7). Node is only used here, to build and test.
 

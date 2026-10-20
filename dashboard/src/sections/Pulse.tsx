@@ -1,4 +1,5 @@
 import { Ago, Empty, LocalOnly, Meta, Row, Rows, Section, StateBadge } from "@/components/bits";
+import { Badge } from "@/components/ui/badge";
 import { urgencyTone } from "@/lib/tone";
 import type { PulseItem, Snapshot } from "@/types";
 
@@ -13,7 +14,11 @@ export function Pulse({ snap, now }: { snap: Snapshot; now: number }) {
       )
     : undefined;
   return (
-    <Section title="Pulse" description={`${snap.pulse.open} open`}>
+    <Section
+      title="Pulse"
+      description="What Resonant is keeping an eye on"
+      action={<Badge variant="neutral">{snap.pulse.open} open</Badge>}
+    >
       {sorted === undefined ? (
         snap.pulse.open === 0 ? <Empty>All quiet.</Empty> : <LocalOnly what="Pulse titles" />
       ) : sorted.length === 0 ? (

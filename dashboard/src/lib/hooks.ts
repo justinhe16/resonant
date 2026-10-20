@@ -79,18 +79,3 @@ export function useNow(intervalMs: number = POLL_MS): number {
   }, [intervalMs]);
   return now;
 }
-
-/** Current hash route, e.g. "#/workers" → "workers". */
-export function useHashRoute(fallback: string): [string, (r: string) => void] {
-  const read = () => window.location.hash.replace(/^#\/?/, "") || fallback;
-  const [route, setRoute] = useState(read);
-  useEffect(() => {
-    const on = () => setRoute(window.location.hash.replace(/^#\/?/, "") || fallback);
-    window.addEventListener("hashchange", on);
-    return () => window.removeEventListener("hashchange", on);
-  }, [fallback]);
-  const go = useCallback((r: string) => {
-    window.location.hash = `/${r}`;
-  }, []);
-  return [route, go];
-}

@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { Dashboard } from "@/Dashboard";
 import { SupabaseGate } from "@/SupabaseGate";
-import { Alert } from "@/components/ui/alert";
+import { TriangleAlert } from "lucide-react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { loadConfig } from "@/lib/config";
 import { loadLocal } from "@/lib/local";
 import { createRemoteClient, type RemoteClient } from "@/lib/supabase";
@@ -49,11 +50,10 @@ export function App({ makeRemote = createRemoteClient }: AppProps) {
     case "error":
       return (
         <div className="mx-auto max-w-md px-4 pt-[15vh]">
-          <Alert tone="bad">
-            <div>
-              <p className="font-medium">The dashboard couldn't start</p>
-              <p className="text-muted-foreground">{state.message}</p>
-            </div>
+          <Alert variant="bad">
+            <TriangleAlert />
+            <AlertTitle>The dashboard couldn't start</AlertTitle>
+            <AlertDescription>{state.message}</AlertDescription>
           </Alert>
         </div>
       );

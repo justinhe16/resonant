@@ -142,5 +142,6 @@ export function forTier(snap: Snapshot): Snapshot {
     runner: { set_up: snap.runner.set_up },
     trust_rules: undefined,
     repos: undefined,
+    claude_brain: undefined,
   };
 }
