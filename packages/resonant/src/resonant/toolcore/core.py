@@ -2,7 +2,8 @@
 
 Every runner that calls a tool goes through :class:`ToolCore`: the local runner (the intents
 path), the brain loop, the Claude bridge (``runners/ask_tools.py``), the job and watch runners,
-the media runner and the approval resume of a pinned call. Nothing outside this package calls
+the media runner, the scheduler's inline L0 jobs (over an ``InlineExecutor``) and the approval
+resume of a pinned call. Nothing outside this package calls
 ``gate.evaluate`` or ``Executor.execute`` (``tests/test_toolcore_boundary.py``), so no caller
 can skip the gate. The gate (``gate/``), the trust rules (``trust/``) and the executor
 (``executor.py``) stay their own modules; ToolCore is built over them.
@@ -51,7 +52,16 @@ from typing import Any, Literal, Protocol, cast, runtime_checkable
 import jsonschema
 
 from resonant.executor import NotAllowedError, ToolResult, idempotency_key
-from resonant.gate import Allow, ApprovalBatch, Decision, Deny, DryRun, Intent, NeedsApproval
+from resonant.gate import (
+    Allow,
+    ApprovalBatch,
+    Decision,
+    Deny,
+    DryRun,
+    Intent,
+    NeedsApproval,
+    TokenVerifier,
+)
 from resonant.gate.policy import APPROVAL_USED, batch_line, widens_trust
 from resonant.gate.types import Origin
 from resonant.loop.types import StepContext
@@ -363,6 +373,26 @@ def allow_inline(gate: InlineGate, intent: Intent) -> bool:
     allows it, and its single-use token is then spent here."""
     decision = gate.evaluate(intent)
     return isinstance(decision, Allow) and gate.consume(decision.token, intent.hash)
+
+
+class InlineExecutor:
+    """The executor for a caller that runs the tool itself (the scheduler's inline L0 jobs):
+    ``execute`` only spends the Allow's single-use token and returns an empty success, so
+    nothing goes to ``executions`` (``recorded`` is always None). The caller runs the tool
+    after a ``Ran``."""
+
+    def __init__(self, gate: TokenVerifier) -> None:
+        self.gate = gate
+
+    async def execute(
+        self, intent: Intent, decision: Decision, *, step_no: int, call_index: int = 0
+    ) -> ToolResult:
+        if not isinstance(decision, Allow) or not self.gate.consume(decision.token, intent.hash):
+            raise NotAllowedError(APPROVAL_USED)
+        return ToolResult(ok=True, data={})
+
+    def recorded(self, key: str) -> ToolResult | None:
+        return None
 
 
 class ToolCore:

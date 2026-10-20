@@ -20,14 +20,10 @@ PACKAGE = Path(resonant.__file__).resolve().parent
 # The gate and the executor themselves, and the tool core built over them.
 OWNERS = ("toolcore/", "gate/", "executor.py")
 
-# Known exceptions, each with why. Keep this list shrinking; an entry that no longer calls
-# anything fails the test so it is removed.
-ALLOWED: dict[str, str] = {
-    # The scheduler's inline (L0) jobs: gated with origin="scheduled" and the token spent
-    # there, then run without the executor (no executions row). Moving it onto ToolCore is
-    # a follow-up (TC-1 left extensions/scheduler.py alone: BK-1 works in it).
-    "extensions/scheduler.py": "inline jobs (follow-up)",
-}
+# Known exceptions, each with why. Keep it empty: an entry that no longer calls anything
+# fails the test so it is removed. (The scheduler's inline L0 jobs were the last one: PER-247
+# moved them onto ToolCore.)
+ALLOWED: dict[str, str] = {}
 
 GATE_CALLS = {"evaluate", "consume"}
 EXECUTOR_CALLS = {"execute", "recorded"}
