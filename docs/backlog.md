@@ -154,10 +154,6 @@ Ticketed: Linear PER-255.
 
 **Done when.** The reader clamps `occurred_at` to at most a little past its own read time, and a test covers a skewed clock both ways.
 
-## Timing-flaky tests
-
-Ticketed with the other flakes: Linear PER-246.
-
 ## Labeler near-misses
 
 *Noted 2026-10-13, from the Phase 2 router eval on the real model.*
