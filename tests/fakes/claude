@@ -13,7 +13,7 @@ Like the real session (docs/repos-plan.md D10) it pushes its branch to ``origin`
 and ``--no-pr`` skip those, and ``--ci-fixes N`` makes it push N more commits as if CI had failed.
 
 Scenarios: happy, nochanges, slow, hang, hang_then_ok, escapee, usage_limit, error, maxturns,
-maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, makefile, github, noresult, tokens,
+maxbudget, preinit_hang, stubborn, cachefill, longline, leak, disk, diskgrow, diskpartial, makefile, github, noresult, tokens,
 scratch (a run with no repo: writes notes in its cwd and reports), sticky (a scratch run that
 never exits on its own, not even when stdin closes).
 
@@ -556,6 +556,17 @@ def work(resumed: bool) -> bool:
         with open(os.path.join(tmp, "big.bin"), "wb") as f:
             f.write(b"\0" * 4_000_000)
         time.sleep(30)
+    if scenario == "diskpartial":  # a folder the watchdog can't read for a while, then the work
+        locked = os.path.join(tmp, "locked")
+        os.mkdir(locked)
+        os.chmod(locked, 0)
+        time.sleep(1.5)
+        os.chmod(locked, 0o700)
+    if scenario == "diskgrow":  # a little more every tick, well under any cap
+        for i in range(300):
+            with open(os.path.join(tmp, f"grow{i}.bin"), "wb") as f:
+                f.write(b"\0" * 100_000)
+            time.sleep(0.1)
 
     if args.sleep:
         time.sleep(args.sleep)

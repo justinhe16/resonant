@@ -403,6 +403,14 @@ def seed_remote(root: Path, name: str, *, ci: bool = True) -> Path:
     return remote
 
 
+def plenty_free(_path: Path) -> int:
+    return 1 << 50
+
+
+def nearly_full(_path: Path) -> int:
+    return 5 * 1024**3
+
+
 def build(
     root: Path,
     conn: sqlite3.Connection,
@@ -475,6 +483,7 @@ def build(
         "kill_grace_s": 0.5,
         "defer_s": 0.1,
         "max_runs": 2,
+        "disk_free": plenty_free,  # the host's own free space never stops a test run
         **kw,
     }
     runner = ClaudeRunner(conn, **options)
@@ -921,8 +930,34 @@ async def test_the_disk_watchdog_kills_the_run(tmp_path: Path, db: sqlite3.Conne
     await h.start()
     await h.drain()
     run = h.run()
-    assert run.status == "failed" and (run.failure or "").startswith("used over 1 MB of disk")
-    assert h.processes_of("R1") == [] and dir_size(h.code_dir("R1")) > 1_000_000
+    assert run.failure is not None
+    assert run.failure.startswith("used over 1 MiB of disk (1 MiB folder cap; work kept: /runs R1)")
+    assert h.processes_of("R1") == [] and dir_size(h.code_dir("R1")).bytes > 1_000_000
+
+
+async def test_a_partial_count_is_noted_once_and_never_kills(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="diskpartial", disk_interval_s=0.1)
+    await h.start()
+    await h.drain()
+    assert h.run().status == "ready"
+    rows = db.execute("SELECT detail FROM audit_log WHERE action = 'run.disk_partial'").fetchall()
+    assert len(rows) == 1 and json.loads(rows[0][0])["what"] == "run folder"
+    assert not any("disk" in t or "measure" in t for t in h.chan.texts())  # never texted
+
+
+async def test_a_growing_run_is_stopped_when_the_disk_is_nearly_full(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="diskgrow", disk_interval_s=0.2, disk_free=nearly_full)
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed" and h.processes_of("R1") == []
+    assert run.failure == (
+        "the disk is nearly full (5 GiB free, under the 10 GiB floor; work kept: /runs R1)"
+    )
 
 
 async def test_checks_refuse_a_github_change_and_tokens(
@@ -1901,7 +1936,9 @@ async def test_the_shared_cache_is_watched_too(tmp_path: Path, db: sqlite3.Conne
     await h.start()
     await h.drain()
     run = h.run()
-    assert run.status == "failed" and (run.failure or "").startswith("the runner cache grew over")
+    assert run.status == "failed" and (run.failure or "").startswith(
+        "the runner cache grew over 1 MiB (the cache cap"
+    )
     assert h.processes_of("R1") == []
 
 

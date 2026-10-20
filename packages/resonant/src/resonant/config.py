@@ -560,7 +560,11 @@ class RunnerConfig(_Section):
     # Extra paths a session may neither read nor write, on top of the thin guard's own
     # (run-secrets, Messages, the Keychain; resonant/sandbox/runner.sb).
     deny_read: list[Path] = Field(default_factory=list[Path])
+    # The disk watchdog (docs/employee-plan.md D1): each run's folder and worktree (MiB) and
+    # the shared cache (GiB) are capped, and a growing run is stopped when its volume has
+    # under min_free_disk_mb (MiB) free. What can't be read is skipped, never over a cap.
     max_run_dir_mb: int = Field(default=5000, ge=100)
+    min_free_disk_mb: int = Field(default=10240, ge=0)
     max_cache_gb: int = Field(default=20, ge=1)
     max_minutes: int = Field(default=45, ge=1, le=600)
     max_budget_usd: float | None = Field(default=None, gt=0)
