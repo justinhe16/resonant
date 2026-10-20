@@ -7,6 +7,9 @@ survives restarts with the ``tasks`` row, and a missed one fires once on start, 
 
 A reminder's text is at most ``TEXT_MAX`` (1000) characters, whitespace collapsed.
 
+``add_reminder`` is ``taint_exempt`` (PER-245): it runs in a tainted task too. Cancelling
+one is not.
+
 Each reminder gets a short number from kv ``reminders.seq`` (``/unremind 3``), kept in the
 task checkpoint as ``n`` with ``text`` and ``at`` (ISO, UTC). Handlers don't see the
 requester; the gate lets only the owner call global builtins, so reminders belong to the
@@ -61,6 +64,7 @@ ADD_REMINDER = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=5.0,
+    taint_exempt=True,  # PER-245: runs on its level even when tainted
 )
 LIST_REMINDERS = ToolSpec(
     name="list_reminders",

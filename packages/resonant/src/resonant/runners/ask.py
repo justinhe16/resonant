@@ -112,7 +112,7 @@ from zoneinfo import ZoneInfo
 import psutil
 
 from resonant import killswitch
-from resonant.brain.history import primer, unfolded
+from resonant.brain.history import DEFAULT_TAINT_HOPS, primer, unfolded
 from resonant.brain.text import flat
 from resonant.config import DEFAULT_READ_DENY, AskClaudeConfig, ClaudeSessionConfig, Settings
 from resonant.gate.codes import mask_codes
@@ -753,6 +753,7 @@ class AskRunner:
         on_watch: WatchHook | None = None,
         tools: ToolAccess | None = None,
         session: ClaudeSessionConfig | None = None,
+        taint_hops: int = DEFAULT_TAINT_HOPS,
         sips: str = SIPS,
         clock: Callable[[], datetime] = utcnow,
         poll_s: float = POLL_S,
@@ -767,7 +768,9 @@ class AskRunner:
         seams for tests. ``tools`` (BR-10): Resonant's tools for asks the brain hands over;
         None: every ask is read-only. ``session`` (BR-11, ``brain.claude_session``): the
         Claude brain for the owner's hand-offs (with ``tools``; None or off: one-shot asks
-        only); its ``max_per_hour`` is the runaway guard either way."""
+        only); its ``max_per_hour`` is the runaway guard either way. ``taint_hops``:
+        ``brain.taint_hops`` (PER-245), for the session's and a one-shot ask's history."""
+        self.taint_hops = taint_hops
         self.conn = conn
         self.cfg = cfg
         self.scope = scope
@@ -828,6 +831,7 @@ class AskRunner:
                 clock=clock,
                 poll_s=poll_s,
                 kill_grace_s=kill_grace_s,
+                taint_hops=taint_hops,
             )
             longest = max(longest, 2 * session.turn_timeout_s)  # a crash may retry once
         self.max_step_s: float | None = longest + STEP_SLACK_S
@@ -1334,13 +1338,14 @@ class AskRunner:
             return [], None
         lines: list[str] = []
         untrusted: str | None = None
-        for ex in found:
+        for i, ex in enumerate(found):
             lines.append(f"Owner: {flat(ex.text, HISTORY_LINE_CHARS)}")
             if ex.reply:
                 lines.append(f"Resonant: {flat(ex.reply, HISTORY_LINE_CHARS)}")
             if ex.claude:
                 lines.append(f"You (Claude) answered: {flat(ex.claude, HISTORY_LINE_CHARS)}")
-            untrusted = ex.untrusted or untrusted
+            taint = ex.taint_at(len(found) - i, self.taint_hops)
+            untrusted = taint[1] if taint is not None else untrusted
         return lines, untrusted
 
     def _prepare_dir(self, ask_dir: Path, attachments: object) -> list[str]:

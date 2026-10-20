@@ -13,6 +13,9 @@ Invariants, enforced here at registration:
 - ``untrusted=True`` marks a tool whose result carries outside content (file text, logs, a
   worker's transcript): a loop that sees one treats the task as tainted (docs/brain-plan.md
   D6). Extension and MCP results are outside content whatever the flag says.
+- ``taint_exempt=True`` (PER-245) marks a low-risk, owner-scoped builtin write (a note, a
+  reminder, a fact) that runs on its own level's rule even in a tainted task: ToolCore gates
+  it as ``inferred``. Only builtin writes below L1 can carry it; never an extension's.
 - ``grant`` names a builtin a member may request through ``grants: {"builtin:<grant>":
   [request]}`` (``resonant.principals``). Only global L0 reads can carry one.
 """
@@ -66,6 +69,7 @@ class ToolSpec(BaseModel):
     secrets: tuple[str, ...] = ()
     commit: bool = False
     untrusted: bool = False
+    taint_exempt: bool = False
     grant: str | None = Field(default=None, pattern=GRANT_PATTERN)
 
     @model_validator(mode="after")
@@ -76,6 +80,13 @@ class ToolSpec(BaseModel):
             raise ValueError(f"{self.name}: read tools without secrets are always L0")
         if self.commit and self.effect is Effect.READ:
             raise ValueError(f"{self.name}: commit tools must have a side effect")
+        if self.taint_exempt and (
+            self.extension is not None
+            or self.source != "builtin"
+            or self.effect is not Effect.WRITE
+            or self.level in (None, Level.L1)
+        ):
+            raise ValueError(f"{self.name}: only builtin L2/L3 writes can be taint exempt")
         if self.grant is not None and (
             self.extension is not None or self.effect is not Effect.READ or self.secrets
         ):

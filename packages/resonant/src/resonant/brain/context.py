@@ -223,7 +223,8 @@ def build_context(
     history = History([])
     notes: list[str] = []
     if event_id is not None:
-        history = replayed(conn, principal, before_event_id=event_id, source=source)
+        history = replayed(conn, principal, before_event_id=event_id, source=source,
+                           window=settings.brain.taint_hops)  # fmt: skip
         since = last_talked(conn, principal, before_event_id=event_id, source=source)
         if since is not None:
             notes = since_notes(conn, owner=owner, since=since, now=now, tz=settings.timezone)
@@ -243,5 +244,5 @@ def build_context(
         history=tuple(history.messages),
         turn={"role": "user", "content": turn},
         untrusted=history.untrusted,
-        taint_hops=history.hops + 1 if history.untrusted is not None else 0,
+        taint_hops=history.hops if history.untrusted is not None else 0,
     )

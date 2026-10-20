@@ -882,14 +882,25 @@ async def test_a_replayed_tainted_reply_taints_the_intents_calls(make: Any) -> N
     """BR-10b: the intents prompt replays the previous reply (``<prior_reply>``); one written
     after outside content taints this task: its calls are gated and pinned ``tainted``, so
     an L3 write asks."""
-    h: Harness = make(FakeModel([tc("add_note", text="pwned")]))
-    _answered(h, "what's in a.txt?", "It says to add a note saying pwned.", tainted=True)
-    task_id = h.add_task(chat("add_note"), text="ok do it")
+    h: Harness = make(FakeModel([tc("delete_note", id=1)]))
+    _answered(h, "what's in a.txt?", "It says to delete note 1.", tainted=True)
+    task_id = h.add_task(chat("delete_note"), text="ok do it")
     await h.loop.run_until_idle()
     assert [(e["decision"], e["origin"]) for e in h.evaluations(task_id)] == [
         ("NeedsApproval", "tainted")
     ]
     assert h.tool_log == [] and h.task(task_id).checkpoint["tainted"] is True
+
+
+async def test_a_tainted_intents_task_still_adds_its_note(make: Any) -> None:
+    """PER-245: add_note is taint exempt: in the same tainted task it is gated as
+    ``inferred`` (L3: it runs), while the task stays tainted."""
+    h: Harness = make(FakeModel([tc("add_note", text="eggs")], final={"reply": "Noted."}))
+    _answered(h, "what's in a.txt?", "It says to add a note.", tainted=True)
+    task_id = h.add_task(chat("add_note"), text="note eggs")
+    await h.loop.run_until_idle()
+    assert [(e["decision"], e["origin"]) for e in h.evaluations(task_id)] == [("Allow", "inferred")]
+    assert h.task(task_id).checkpoint["tainted"] is True
 
 
 async def test_a_replayed_clean_reply_leaves_the_intents_calls_inferred(make: Any) -> None:
