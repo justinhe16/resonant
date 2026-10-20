@@ -160,7 +160,8 @@ async def test_a_feature_branch_push_runs_and_reports(
         assert shell_gated(w) == [("Allow", "inferred")]  # an untainted L3: no ask
         (row,) = tools(w)
         assert (row["decision"], row["status"], row["write"]) == ("gate", "ok", True)
-        assert row["command"] == "git push -q origin feat" and row["cwd"] == str(repo)
+        assert row["command"] == f"cd {repo} && git push -q origin feat"
+        assert row["cwd"] == str(repo)  # where it ran
 
 
 async def test_a_push_to_main_asks_and_yes_runs_it_in_a_new_turn(
@@ -179,21 +180,23 @@ async def test_a_push_to_main_asks_and_yes_runs_it_in_a_new_turn(
             answer="{r0}",
         )  # fmt: skip
         _, answer, prompt = await w.say("push main", replies=3)
-        assert answer.startswith("Claude: asked the owner: run `git push -q origin main` in ")
-        assert prompt.startswith("[") and "run `git push -q origin main` in" in prompt
-        assert str(tmp_path.name) in prompt or "/code/r" in prompt  # the cwd is shown
+        assert answer.startswith("Claude: asked the owner: run `cd ")
+        assert prompt.startswith("[") and "&& git push -q origin main` in" in prompt
+        assert prompt.rsplit("? Reply", 1)[0].endswith("/code/r")  # where it runs
         assert "Reply yes" in prompt and "yes always" not in prompt
         assert remote_head(remote, "main") != git(repo, "rev-parse", "main")  # not run
         assert shell_gated(w) == [("NeedsApproval", "inferred")] * 2  # in the turn, prompted
         await prompt_recorded(w)
         approved, ran = await w.say("yes", replies=2)
-        assert approved == "Approved: `git push -q origin main`; Claude runs it now."
+        assert approved.startswith("Approved: `cd ") and approved.endswith(
+            "&& git push -q origin main`; Claude runs it now."
+        )
         assert ran == "Claude: Pushed main: (Bash completed with no output)\nDid: pushed main in r"
         await w.settled()
         assert remote_head(remote, "main") == git(repo, "rev-parse", "main")
         # the approved turn's message is Resonant's, naming the exact command and its dir
         assert w.session()["prompt"].startswith("From Resonant: the owner said yes")
-        assert f"1. Bash, from {repo}: git push -q origin main" in w.session()["prompt"]
+        assert f": {push}" in w.session()["prompt"] and "1. Bash, from " in w.session()["prompt"]
         decisions = [r["decision"] for r in tools(w)]
         assert decisions == ["asked", "granted"]
         assert kv_get(w.conn, GRANTS_KV) == {}  # spent
@@ -309,15 +312,15 @@ async def test_claude_cant_call_the_permission_tool_itself(
 async def test_a_standing_allow_for_a_verb_in_a_repo(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
-    """ "Don't ask for git push in r": ``allow tool:shell.git-push in r`` lets a push to main
-    run without asking there (an untainted turn), and nowhere else."""
+    """ "Don't ask for git push to main in r": ``allow tool:shell.git-push-default in r``
+    lets a push to main run without asking there (an untainted turn)."""
     repo, remote = scratch_repo(tmp_path)
     git(repo, "checkout", "-q", "main")
     git(repo, "commit", "-q", "--allow-empty", "-m", "three")
     async with start(resonant_home, chat, tmp_path) as w:
         with atomic(w.conn):
-            trust_store.add_rule(w.conn, scope="r", action="tool:shell.git-push", effect="allow",
-                                 created_from="chat", now=utcnow())  # fmt: skip
+            trust_store.add_rule(w.conn, scope="r", action="tool:shell.git-push-default",
+                                 effect="allow", created_from="chat", now=utcnow())  # fmt: skip
         w.model.triage = CLAUDE
         w.claude(shell=[{"tool": "Bash", "command": f"cd {repo} && git push -q origin main"}],
                  answer="Pushed.")  # fmt: skip

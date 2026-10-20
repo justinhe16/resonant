@@ -65,23 +65,28 @@ def grant_key(args: Mapping[str, Any]) -> str:
 def add_grant(
     conn: sqlite3.Connection, args: Mapping[str, Any], *, task_id: str, now: datetime
 ) -> None:
-    """A one-shot grant: the owner said yes to this change after its turn ended, so the next
-    identical request runs once without asking (``take_grant``), within ``GRANT_TTL``. Call
-    inside a transaction."""
+    """A one-shot grant: the owner said yes to this change after its turn ended, so the same
+    request in ``task_id`` (the approved turn) runs once without asking (``take_grant``),
+    within ``GRANT_TTL``. Call inside a transaction."""
     grants = _grants(conn, now)
     grants[grant_key(args)] = {"task": task_id, "expires": iso(now + GRANT_TTL)}
     kv_set(conn, GRANTS_KV, grants)
 
 
-def take_grant(conn: sqlite3.Connection, args: Mapping[str, Any], *, now: datetime) -> str | None:
-    """Spend the grant for this change, if there is one: the task that was approved."""
+def take_grant(
+    conn: sqlite3.Connection, args: Mapping[str, Any], *, task_id: str, now: datetime
+) -> bool:
+    """Spend the grant for this change, if there is one for this task (the approved turn's:
+    no other turn can spend it)."""
     with atomic(conn):
         grants = _grants(conn, now)
-        found = grants.pop(grant_key(args), None)
-        if found is not None:
-            kv_set(conn, GRANTS_KV, grants)
-    task = found.get("task") if found is not None else None
-    return task if isinstance(task, str) else None
+        key = grant_key(args)
+        found = grants.get(key)
+        if found is None or found.get("task") != task_id:
+            return False
+        grants.pop(key)
+        kv_set(conn, GRANTS_KV, grants)
+    return True
 
 
 def _grants(conn: sqlite3.Connection, now: datetime) -> dict[str, dict[str, Any]]:

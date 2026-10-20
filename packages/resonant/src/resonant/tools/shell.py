@@ -36,6 +36,8 @@ _SCHEMA: dict[str, Any] = {
         "verb": {"type": "string", "maxLength": 64},
         "repo": {"type": "string", "maxLength": 200},
         "digest": {"type": "string", "maxLength": 64},
+        "dir": {"type": "string", "maxLength": 4096},
+        "script": {"type": "string", "maxLength": 8},
     },
     "required": ["tool", "command", "cwd", "shown", "verb"],
     "additionalProperties": False,

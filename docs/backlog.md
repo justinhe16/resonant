@@ -379,6 +379,7 @@ Ticketed: Linear PER-247.
 - **Compound changes are always L2.** `git add -A && git commit -m x` asks even untainted. Splitting a compound into its segments and taking the strictest level would let some run.
 - **One-line commands.** A heredoc commit message (`$(cat <<EOF …)`) is a substitution: it asks. The prompt asks for one line.
 - **The relay's SQL guard.** `brain_activity` is counts only, so the relay's `relay_ingest` needs no new check; `claude_brain.tools` is inside the local-only `claude_brain` (stripped by `to_remote`). Add `claude_brain` to the SQL guard's list next time the migration changes.
+- **Review notes left open.** `ps aux` (pre-allowed) shows other processes' command lines, which can hold a secret passed as an argument. A submodule checkout counts as a linked worktree for edits. The scratch dirs include the whole system temp dir. A script Claude runs (`bash x.sh`) asks with only its path shown; writing one to scratch asks too, but an existing script's content is never shown.
 - **Grants.** A grant lives 30 minutes, keyed on the exact command and directory; an approved change Claude doesn't rerun just expires. An edit's grant needs the identical edit (its digest), which Claude usually remembers in the session.
 
 ## PER-245 carry-overs: shorter taint, exempt writes

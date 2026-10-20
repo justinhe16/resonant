@@ -487,6 +487,8 @@ class ClaudeTools:
         policy, shell = self.policy, self.shell
         if policy is None or shell is None:
             return _deny(SHELL_OFF)
+        if tool.startswith(PREFIX):  # Resonant's own tools (and this one) never ask here
+            return _deny(SHELL_UNMATCHED)
         if not await self._use_seen(tid, tool, given):
             return _deny(SHELL_UNMATCHED)
         if self._paused():
@@ -499,7 +501,10 @@ class ClaudeTools:
         if self.outside:
             self.tainted = True
         write = call.verdict.kind != "read"
-        if call.verdict.kind == "write" and take_grant(self.conn, call.args, now=utcnow()):
+        granted = call.verdict.kind == "write" and take_grant(
+            self.conn, call.args, task_id=self.task.id, now=utcnow()
+        )
+        if granted:
             self._decided[tid] = ("granted", call)
             with self._spans("runner.ask.shell", decision="granted", verb=call.args["verb"]):
                 pass
@@ -583,7 +588,7 @@ class ClaudeTools:
             decision = decided[0] if decided is not None else ("denied" if denied else "allowed")
             raw = call.args.get("command") if call is not None else _what(name, given)
             shown = flat(self._shown(str(raw)), 200)
-            cwd = str(call.args.get("cwd")) if call is not None else (
+            cwd = str(call.args.get("dir") or call.args.get("cwd")) if call is not None else (
                 self.shell.path if self.shell is not None else "")  # fmt: skip
         write = call is not None and call.verdict.kind == "write"
         status = "error" if error else "ok"

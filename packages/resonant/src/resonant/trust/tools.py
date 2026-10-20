@@ -41,6 +41,7 @@ approved ``allow_trust_rule``), never by extension output.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -60,6 +61,8 @@ MCP_PREFIX = "mcp__resonant__"  # how Claude names Resonant's tools (runners/ask
 
 BUILTIN_SYSTEM = "resonant"  # the system a builtin's call is matched as
 SHELL = "shell"  # the Claude brain's shell changes (tools/shell.py): matched per verb
+# Only a git or gh verb can stand (never a compound, a script, an interpreter or a force push).
+SHELL_VERB = re.compile(r"(git|gh)-[a-z][a-z-]*")
 
 
 @dataclass(frozen=True)
@@ -160,7 +163,8 @@ class StandingAllows:
         action = tool_action(intent.extension, intent.tool)
         if intent.extension is None and intent.tool == SHELL:
             verb = intent.args.get("verb")
-            action = tool_action(None, f"{SHELL}.{verb}") if isinstance(verb, str) else None
+            ok = isinstance(verb, str) and SHELL_VERB.fullmatch(verb) and verb != "git-push-force"
+            action = tool_action(None, f"{SHELL}.{verb}") if ok else None
         if action is None:
             return None
         repo_arg = intent.args.get("repo")

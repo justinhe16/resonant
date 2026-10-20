@@ -133,11 +133,19 @@ ASK_RULES: tuple[str, ...] = (
     "Bash(find *-ok*)",
     "Bash(find *-fprint*)",
     "Bash(find *-fls*)",
+    "Bash(git diff *--no-index*)",
+    "Bash(git diff *--ext-diff*)",
+    "Bash(git log *--ext-diff*)",
+    "Bash(git show *--ext-diff*)",
+    "Bash(rg *--hostname-bin*)",
 )
 
 _OPS = frozenset({"&&", "||", ";", "|", "&", "|&", "\n", ";;", ";&"})
 _PUNCT = "();<>|&\n"
 _SUBST = ("$(", "`", "<(", ">(", "<<")
+# Anything the shell expands or that quoting could hide (braces, variables, escapes, ``~``
+# after ``=`` or ``:``): never a read and never L3, so what's judged is what runs.
+_EXPANDS = ("{", "}", "$", "`", "\\", "=~", ":~")
 _ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _WRAPPERS = frozenset({
     "sudo", "doas", "env", "nohup", "time", "xargs", "exec", "command", "builtin", "nice",
@@ -174,7 +182,39 @@ _PUSH_RISKY = frozenset({
     "--force-if-includes", "--atomic",
 })  # fmt: skip
 _PUSH_RISKY_OPTS = ("--force", "--repo", "--receive-pack", "--exec")
-_DEFAULT_BRANCHES = frozenset({"main", "master"})
+_DEFAULT_BRANCHES = frozenset({"main", "master", "develop", "trunk", "production", "prod"})
+_NAME = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")  # a plain branch, tag or remote name
+# Flags an L3 git command may carry (anything else asks): the value-taking ones are listed
+# in ``_GIT_VALUE``.
+_GIT_L3_FLAGS: Mapping[str, frozenset[str]] = {
+    "add": frozenset({"-A", "--all", "-u", "--update", "-N", "--intent-to-add", "-v", "--"}),
+    "commit": frozenset({"-m", "--message", "-a", "--all", "-q", "--quiet", "--no-edit",
+                         "--amend", "-s", "--signoff", "--allow-empty", "-v"}),
+    "fetch": frozenset({"-q", "--quiet", "--prune", "-p", "--all", "--tags", "--no-tags"}),
+    "switch": frozenset({"-c", "--create", "-q", "--quiet"}),
+    "checkout": frozenset({"-b", "-q", "--quiet"}),
+    "stash": frozenset({"-m", "--message", "-u", "--include-untracked", "-q", "--quiet"}),
+    "branch": frozenset(),
+    "tag": frozenset(),
+    "push": frozenset({"-u", "--set-upstream", "-q", "--quiet", "-v", "--verbose",
+                       "--no-verify", "--dry-run", "-n"}),
+}  # fmt: skip
+_GIT_VALUE = frozenset({"-m", "--message"})
+_GH_RISKY = frozenset({"-F", "--body-file", "-T", "--template", "--recover"})
+_HOOK_FILES = frozenset({
+    ".husky", ".githooks", "hooks", ".pre-commit-config.yaml", "lefthook.yml", "lefthook.yaml",
+    ".lefthook.yml", "Makefile", "package.json", ".envrc", ".gitattributes", ".gitmodules",
+    "setup.py", "pyproject.toml", "conftest.py", ".npmrc",
+})  # fmt: skip
+_SCRIPT_EXT = (".sh", ".bash", ".zsh", ".py", ".js", ".mjs", ".ts", ".rb", ".pl", ".command")
+_FIND_VALUES = frozenset({"-name", "-iname", "-path", "-ipath", "-regex", "-iregex",
+                          "-wholename", "-type", "-maxdepth", "-mindepth", "-size", "-mtime",
+                          "-newer", "-user", "-group", "-perm"})  # fmt: skip
+_GREP_VALUES = frozenset({"-e", "--regexp", "-g", "--glob", "-t", "--type", "-m", "-A", "-B",
+                          "-C"})  # fmt: skip
+_REMOTE = re.compile(r'^\s*\[remote "([^"]+)"\]', re.M)
+UNKNOWN_CWD = "?"  # the shell's directory after a cd we couldn't follow
+_HOMEISH = re.compile(r"(^|/)(\.resonant|Keychains)(/|$)")
 _CWD_RESET = re.compile(r"Shell cwd was reset to (/[^\n]+)")
 _PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/(\d+)")
 HOME_WRITE = "writes under ~/.resonant or the keychains aren't allowed"
@@ -209,14 +249,14 @@ class _Seg:
     argv: list[str] = field(default_factory=list[str])
     redirects: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
     cwd: str = ""
+    after: str = ""  # the operator after it
 
 
 @dataclass(frozen=True)
 class _Parsed:
     segs: list[_Seg]
     cwd: str  # after a leading ``cd <dir> &&``
-    complex: bool  # substitution, heredoc, subshell or an odd operator
-    core: str  # the command after the leading cd (what the args hold)
+    complex: bool  # substitution, expansion, heredoc, subshell, a later cd, an odd operator
 
 
 @dataclass(frozen=True)
@@ -268,22 +308,28 @@ class ShellPolicy:
         if tool == "Bash":
             command = raw.get("command")
             text = command if isinstance(command, str) else ""
-            parsed = self._parse(text, cwd)
-            core = parsed.core if parsed is not None else text
-            where = parsed.cwd if parsed is not None else cwd
-            args: dict[str, Any] = {"tool": tool, "command": core, "cwd": where}
+            # The args hold the whole command as Claude Code will run it: what's judged and
+            # approved is exactly what runs. ``dir`` is where it runs (after a leading cd).
+            args: dict[str, Any] = {"tool": tool, "command": text, "cwd": cwd}
+            parsed = self._parse(text, cwd) if cwd.startswith("/") else None
+            if parsed is not None and parsed.cwd != cwd:
+                args["dir"] = parsed.cwd
         elif tool in FILE_TOOLS:
             path = raw.get(FILE_TOOLS[tool])
             target = self._abs(path, cwd) if isinstance(path, str) else ""
             digest = hashlib.sha256(json.dumps(dict(raw), sort_keys=True, default=str)
                                     .encode()).hexdigest()[:16]  # fmt: skip
             args = {"tool": tool, "command": target, "cwd": cwd, "digest": digest}
+            content = raw.get("content")
+            if tool == "Write" and isinstance(content, str) and content.startswith("#!"):
+                args["script"] = "yes"
         else:
             args = {"tool": tool, "command": _brief(raw), "cwd": cwd}
         verdict = self.judge(args)
         args["verb"] = verdict.verb
         args["shown"] = _clip(shown(str(args["command"])), SHOWN_CHARS)
-        facts = git_facts(str(args["cwd"]) if tool == "Bash" else str(args["command"]))
+        where = str(args.get("dir") or args["cwd"])
+        facts = git_facts(where if tool == "Bash" else str(args["command"]))
         if facts is not None:
             args["repo"] = facts.name
         return Call(args, verdict)
@@ -298,7 +344,7 @@ class ShellPolicy:
         if tool == "Bash":
             return self._bash(command, cwd)
         if tool in FILE_TOOLS:
-            return self._file(tool, command)
+            return self._file(tool, command, script=args.get("script") == "yes")
         if tool in OWN_READS:
             return Verdict("never", Level.L2, tool.lower(),
                            "outside the folders Claude may read")  # fmt: skip
@@ -318,7 +364,8 @@ class ShellPolicy:
 
     def summary(self, args: Mapping[str, Any]) -> str:
         """The approval line: what runs and where (redacted, clipped)."""
-        tool, shown, cwd = args.get("tool"), args.get("shown"), args.get("cwd")
+        tool, shown = args.get("tool"), args.get("shown")
+        cwd = args.get("dir") or args.get("cwd")
         what = shown if isinstance(shown, str) else "?"
         where = self._tilde(cwd) if isinstance(cwd, str) else "?"
         if tool == "Bash":
@@ -337,25 +384,27 @@ class ShellPolicy:
         (``Shell cwd was reset to <dir>``)."""
         if m := _CWD_RESET.search(output):
             return m.group(1).strip()
-        parsed = self._parse(command, cwd)
+        parsed = self._parse(command, cwd) if cwd.startswith("/") else None
         if parsed is None:
             return cwd
         segs = parsed.segs
         if len(segs) == 1 and segs[0].argv[:1] == ["cd"] and len(segs[0].argv) == 2:
-            return self._abs(segs[0].argv[1], parsed.cwd) or cwd
+            return self._abs(segs[0].argv[1], parsed.cwd) or UNKNOWN_CWD
+        if any(s.argv[:1] in (["cd"], ["pushd"], ["popd"]) for s in segs):
+            return UNKNOWN_CWD  # a cd we can't follow: nothing relative is trusted after it
         return parsed.cwd
 
     def did(self, args: Mapping[str, Any], output: str) -> str:
         """A change that ran, in a few code-built words for the progress line."""
         tool, verb = args.get("tool"), args.get("verb")
-        shown, cwd = str(args.get("shown") or "?"), str(args.get("cwd") or "")
+        shown, cwd = str(args.get("shown") or "?"), str(args.get("dir") or args.get("cwd") or "")
         repo = args.get("repo")
         where = f" in {repo}" if isinstance(repo, str) and repo else ""
         if tool in ("Edit", "MultiEdit", "NotebookEdit"):
             return f"edited {self._tilde(shown)}"
         if tool == "Write":
             return f"wrote {self._tilde(shown)}"
-        if verb == "git-push":
+        if verb in ("git-push", "git-push-default"):
             facts = git_facts(cwd)
             branch = f" {facts.branch}" if facts is not None and facts.branch else ""
             return f"pushed{branch}{where}"
@@ -368,7 +417,7 @@ class ShellPolicy:
 
     # -- files --
 
-    def _file(self, tool: str, path: str) -> Verdict:
+    def _file(self, tool: str, path: str, *, script: bool = False) -> Verdict:
         verb = "write" if tool == "Write" else "edit"
         if not path.startswith("/"):
             return Verdict("write", Level.L2, verb)
@@ -378,7 +427,11 @@ class ShellPolicy:
         parts = Path(real).parts
         if ".git" in parts or ".claude" in parts:
             return Verdict("write", Level.L2, verb)
+        if any(p in _HOOK_FILES for p in parts):
+            return Verdict("write", Level.L2, verb)  # code a later git commit or build runs
         if any(_within(real, s) for s in self.scratch):
+            if script or real.endswith(_SCRIPT_EXT):
+                return Verdict("write", Level.L2, verb)  # a script to run next
             return Verdict("write", Level.L3, verb)
         facts = git_facts(str(Path(real).parent))
         if facts is not None and facts.linked:
@@ -390,7 +443,8 @@ class ShellPolicy:
     def _bash(self, command: str, cwd: str) -> Verdict:
         if not command.strip():
             return Verdict("never", Level.L2, "empty", "an empty command")
-        parsed = self._parse(command, cwd)
+        known = cwd.startswith("/")
+        parsed = self._parse(command, cwd if known else "/")
         if parsed is None:  # doesn't tokenize: the never-list on the raw text
             never = self._never_text(command)
             if never is not None:
@@ -399,22 +453,31 @@ class ShellPolicy:
         for seg in parsed.segs:
             if (why := self._never_seg(seg.argv, seg.cwd)) is not None:
                 return Verdict("never", Level.L2, "never", why)
+        complex_ = parsed.complex or not known
         writes = [s for s in parsed.segs if not self._read_seg(s)]
-        if not writes and not parsed.complex:
-            outside = [s for s in parsed.segs if not self._in_scope(s)]
-            if outside:
-                return Verdict("never", Level.L2, _verb(outside[0].argv),
+        if not writes and not complex_:
+            scopes = [self._in_scope(s) for s in parsed.segs]
+            if "outside" in scopes:
+                seg = parsed.segs[scopes.index("outside")]
+                return Verdict("never", Level.L2, _verb(seg.argv),
                                "outside the folders Claude may read")  # fmt: skip
-            return Verdict("read", Level.L0, _verb(parsed.segs[0].argv) if parsed.segs else "cd")
+            if "unsure" not in scopes:
+                return Verdict("read", Level.L0,
+                               _verb(parsed.segs[0].argv) if parsed.segs else "cd")  # fmt: skip
         for seg in parsed.segs:
-            if self._writes_home(seg):
+            if self._writes_home(seg, known=known and not parsed.complex):
                 return Verdict("never", Level.L2, "never", HOME_WRITE)
-        if len(parsed.segs) != 1 or parsed.complex:
+        if len(parsed.segs) != 1 or complex_:
             return Verdict("write", Level.L2, "compound")
         seg = parsed.segs[0]
         verb = _verb(seg.argv) if seg.argv else "redirect"
         if any(not _quiet(op, target) for op, target in seg.redirects) or not seg.argv:
             return Verdict("write", Level.L2, verb)
+        if verb == "git-push":
+            kind = self._push_kind(seg)
+            if kind != "feature":
+                return Verdict("write", Level.L2, f"git-push-{kind}")
+            return Verdict("write", Level.L3, verb)
         return Verdict("write", self._write_level(seg), verb)
 
     def _parse(self, command: str, cwd: str) -> _Parsed | None:
@@ -427,13 +490,14 @@ class ShellPolicy:
             tokens = list(lex)
         except ValueError:
             return None
-        complex_ = any(m in command for m in _SUBST)
+        complex_ = any(m in command for m in (*_SUBST, *_EXPANDS))
         segs: list[_Seg] = []
         cur = _Seg()
         i = 0
         while i < len(tokens):
             t = tokens[i]
             if t in _OPS:
+                cur.after = t
                 segs.append(cur)
                 cur = _Seg()
             elif t in ("(", ")"):
@@ -441,6 +505,7 @@ class ShellPolicy:
             elif t and all(c in "<>&|;" for c in t):
                 if not any(c in "<>" for c in t):
                     complex_ = True  # an operator we don't know
+                    cur.after = t
                     segs.append(cur)
                     cur = _Seg()
                 else:
@@ -453,24 +518,21 @@ class ShellPolicy:
         segs.append(cur)
         segs = [s for s in segs if s.argv or s.redirects]
         where = cwd
-        core = command.strip()
         # a leading ``cd <dir> &&`` (or several) moves the directory for the rest
-        while len(segs) > 1 and segs[0].argv[:1] == ["cd"] and len(segs[0].argv) == 2 \
-                and not segs[0].redirects:  # fmt: skip
-            m = re.match(r"\s*cd\s+(\S+|'[^']*'|\"[^\"]*\")\s*&&\s*", core)
-            if m is None:
-                break
+        while (len(segs) > 1 and segs[0].argv[:1] == ["cd"] and len(segs[0].argv) == 2
+               and not segs[0].redirects and segs[0].after == "&&"):  # fmt: skip
             target = self._abs(segs[0].argv[1], where)
             if not target:
                 break
             where = target
-            core = core[m.end():]  # fmt: skip
             segs = segs[1:]
+        if len(segs) > 1 and any(s.argv[:1] in (["cd"], ["pushd"], ["popd"]) for s in segs):
+            complex_ = True  # a directory change we don't follow
         for s in segs:
             s.cwd = where
             if s.argv[:1] == ["git"]:
                 s.cwd = self._git_dir_arg(s.argv, where)
-        return _Parsed(segs, where, complex_, core)
+        return _Parsed(segs, where, complex_)
 
     def _git_dir_arg(self, argv: list[str], cwd: str) -> str:
         i = 1
@@ -521,23 +583,23 @@ class ShellPolicy:
                     return "`resonant secret` is only for the owner at the keyboard"
                 if rest[:1] == ["ext"] and rest[1:2] in (["add"], ["update"]):
                     return "`resonant ext add/update` is only for the owner at the keyboard"
+                if rest[:1] in (["approvals"], ["approve"], ["deny"]):
+                    return "Claude can't answer the owner's approvals"
         word = os.path.basename(argv[0])
         if word == "security":
             return "the login keychain (`security`) is off limits"
-        if word in _KILLERS:
-            for a in argv[1:]:
-                if "resonant" in a.lower() or a.lstrip("-") in (str(self.daemon_pid), "1"):
-                    return "stopping Resonant's daemon isn't allowed"
+        if word in _KILLERS and self._kills_daemon(word, argv[1:]):
+            return "stopping Resonant's daemon isn't allowed"
         if (
             word == "launchctl"
             and any("com.resonant" in a for a in argv)
             and any(a in _LAUNCHCTL_STOP for a in argv[1:])
         ):
             return "stopping Resonant's daemon isn't allowed"
-        if word in _SHELLS and "-c" in argv:
-            k = argv.index("-c")
-            if k + 1 < len(argv):
-                return self._never_nested(argv[k + 1], cwd, depth)
+        if word in _SHELLS:
+            for k, a in enumerate(argv[1:], 1):  # ``-c``, ``-lc``, ``-ic`` ...
+                if a.startswith("-") and not a.startswith("--") and "c" in a and k + 1 < len(argv):
+                    return self._never_nested(argv[k + 1], cwd, depth)
         if word == "eval":
             return self._never_nested(" ".join(argv[1:]), cwd, depth)
         if (
@@ -551,6 +613,17 @@ class ShellPolicy:
                     return why
         return None
 
+    def _kills_daemon(self, word: str, args: list[str]) -> bool:
+        """``kill`` of the daemon's pid or of every process (``-1``); ``pkill``/``killall``
+        of anything that could match the daemon (``resonant``, ``python``, ``uv``)."""
+        if word == "kill":
+            targets = [a for a in args if not a.startswith("-") or a in ("-1", "--")]
+            if args[-1:] == ["-1"] or ("--" in args and args[args.index("--") + 1 :] == ["-1"]):
+                return True
+            return any(t.lstrip("-") == str(self.daemon_pid) for t in targets)
+        text = " ".join(args).lower()
+        return any(name in text for name in ("resonant", "python", "uv"))
+
     def _never_nested(self, text: str, cwd: str, depth: int) -> str | None:
         parsed = self._parse(text, cwd)
         if parsed is None:
@@ -558,7 +631,7 @@ class ShellPolicy:
         for seg in parsed.segs:
             if (why := self._never_seg(seg.argv, seg.cwd, depth + 1)) is not None:
                 return why
-            if self._writes_home(seg):
+            if self._writes_home(seg, known=False):
                 return HOME_WRITE
         return None
 
@@ -568,18 +641,24 @@ class ShellPolicy:
             return True
         return _within(real, self.home) and not any(_within(real, s) for s in self.own)
 
-    def _writes_home(self, seg: _Seg) -> bool:
-        """A write that touches ``RESONANT_HOME``: run from inside it, or naming a path in
-        it (an argument, an ``--opt=path`` value or a redirect target)."""
-        if self._under_home(_real(seg.cwd)):
+    def _writes_home(self, seg: _Seg, *, known: bool = True) -> bool:
+        """A write that touches ``RESONANT_HOME`` or the keychains: run from inside it, or
+        naming a path in it (an argument, an ``--opt=path`` value or a redirect target).
+        Every name is resolved from the directory; one that can't be (a variable, an
+        unknown directory) is never allowed to name ``.resonant`` or ``Keychains``."""
+        if known and self._under_home(_real(seg.cwd)):
             return True
-        names = [*seg.argv[1:], *(t for _, t in seg.redirects)]
+        names = [*seg.argv, *(t for _, t in seg.redirects)]  # the command word too (``a${IFS}b``)
         for tok in names:
-            for part in (tok, tok.split("=", 1)[-1]):
-                if "/" not in part and not part.startswith("~") and not part.startswith("$"):
-                    continue
-                p = self._abs(part, seg.cwd)
-                if p and self._under_home(_real(p)):
+            for part in dict.fromkeys((tok, tok.split("=", 1)[-1])):
+                if _HOMEISH.search(part) and not known:
+                    return True
+                p = self._abs(part, seg.cwd) if known else ""
+                if p:
+                    hits = glob.glob(p)[:GLOB_MAX] if any(c in part for c in "*?[") else [p]
+                    if any(self._under_home(_real(h)) for h in [p, *hits]):
+                        return True
+                elif _HOMEISH.search(part):
                     return True
         return False
 
@@ -613,32 +692,33 @@ class ShellPolicy:
             return not any(c in a for a in argv[1:] for c in "eE")
         return True
 
-    def _in_scope(self, seg: _Seg) -> bool:
-        """Every path a read names, and the directory it runs in, may be read."""
+    def _in_scope(self, seg: _Seg) -> Literal["ok", "outside", "unsure"]:
+        """Every path a read names, and the directory it runs in, may be read: ``ok``, or
+        ``outside`` (refused, as the read tools do), or ``unsure`` (asked)."""
         argv = seg.argv
         if not argv or argv[0] in _NO_PATHS:
-            return True
+            return "ok"
         if not self._readable(seg.cwd):
-            return False
-        names = [a for a in argv[1:] if not a.startswith("-")]
-        if argv[0] == "cd":
-            names = argv[1:]
+            return "outside"
+        names = _path_args(argv)
         names += [t for op, t in seg.redirects if op == "<"]
         for raw in names:
             if raw.startswith("+"):
                 continue
             p = self._abs(raw, seg.cwd)
             if not p:
-                return False  # a variable: can't tell where it reads
+                return "unsure"
             looks = "/" in raw or raw.startswith(("~", ".")) or os.path.lexists(p)
             if any(c in raw for c in "*?["):
                 found = glob.glob(p, include_hidden=True)[: GLOB_MAX + 1]
-                if len(found) > GLOB_MAX or not all(self._readable(f) for f in found):
-                    return False
+                if len(found) > GLOB_MAX:
+                    return "unsure"
+                if not all(self._readable(f) for f in found):
+                    return "outside"
                 continue
             if looks and not self._readable(p):
-                return False
-        return True
+                return "outside"
+        return "ok"
 
     def _readable(self, path: str) -> bool:
         real = _real(path)
@@ -655,62 +735,73 @@ class ShellPolicy:
         if argv[0] == "git":
             return self._git_level(argv, seg.cwd)
         if argv[0] == "gh" and argv[1:3] == ["pr", "create"]:
-            return Level.L3
+            risky = any(a.split("=", 1)[0] in _GH_RISKY for a in argv[3:])
+            return Level.L2 if risky else Level.L3
         return Level.L2
 
     def _git_level(self, argv: list[str], cwd: str) -> Level:
+        """L3 only for local branch work with known flags and plain names; else L2."""
         sub, rest = _git_sub(argv)
-        if sub is None:
+        if sub is None or sub == "push" or sub not in _GIT_L3_FLAGS:
             return Level.L2
-        flags = [a for a in rest if a.startswith("-")]
-        plain = [a for a in rest if not a.startswith("-")]
-        if sub in ("add", "commit", "fetch", "switch"):
-            return Level.L3
-        if sub == "stash" and (not plain or plain[0] in ("push", "save", "list", "show")):
-            return Level.L3
-        if sub == "checkout" and any(f in ("-b", "-B") for f in flags):
-            return Level.L3
-        if sub in ("branch", "tag") and len(plain) in (1, 2) and not flags:
-            return Level.L3  # a new branch or tag (no -d, -D, -m, -f)
-        if sub == "push":
-            return self._push_level(rest, cwd)
-        return Level.L2
+        flags, plain = _flags(rest)
+        if flags is None or not flags <= _GIT_L3_FLAGS[sub]:
+            return Level.L2
+        if sub in ("add", "commit"):
+            return Level.L3 if all(not p.startswith("/") for p in plain) else Level.L2
+        if not all(_NAME.fullmatch(p) for p in plain):
+            return Level.L2
+        if sub == "fetch":
+            remotes = git_remotes(cwd)
+            return Level.L3 if not plain or (plain[0] in remotes and len(plain) == 1) else Level.L2
+        if sub == "switch":
+            return Level.L3 if len(plain) == 1 else Level.L2
+        if sub == "checkout":
+            return Level.L3 if "-b" in flags and len(plain) in (1, 2) else Level.L2
+        if sub == "stash":
+            return Level.L3 if not plain or plain[0] in ("push", "save", "list", "show") else (
+                Level.L2)  # fmt: skip
+        return Level.L3 if len(plain) in (1, 2) else Level.L2  # a new branch or tag
 
-    def _push_level(self, rest: list[str], cwd: str) -> Level:
-        if any(a in _PUSH_RISKY or a.startswith(_PUSH_RISKY_OPTS) for a in rest):
-            return Level.L2
-        plain: list[str] = []
-        skip = False
-        for a in rest:
-            if skip:
-                skip = False
-                continue
-            if a in ("-o", "--push-option"):
-                skip = True
-                continue
-            if not a.startswith("-"):
-                plain.append(a)
-        facts = git_facts(cwd)
+    def _push_kind(self, seg: _Seg) -> Literal["feature", "default", "force"]:
+        """A push: ``feature`` (L3: a plain non-default branch to a configured remote, known
+        flags only), ``default`` (to a default branch, or one we can't tell) or ``force``
+        (force, delete, mirror, odd flags or refspecs)."""
+        _, rest = _git_sub(seg.argv)
+        flags, plain = _flags(rest)
+        if flags is None or not flags <= _GIT_L3_FLAGS["push"]:
+            return "force"
+        facts = git_facts(seg.cwd)
         if facts is None:
-            return Level.L2
-        refspecs = plain[1:]
+            return "default"
+        remotes = git_remotes(seg.cwd)
+        if plain and plain[0] not in remotes:
+            return "force"  # a URL or path, not a configured remote
         defaults: set[str] = set(_DEFAULT_BRANCHES)
         if facts.default:
             defaults.add(facts.default)
         targets: list[str | None] = []
+        refspecs = plain[1:]
         if not refspecs:
-            targets.append(facts.branch)
+            upstream = git_upstream(seg.cwd, facts.branch)
+            targets.append(facts.branch if upstream in (None, facts.branch) else None)
         for spec in refspecs:
-            if spec.startswith("+") or spec.startswith(":"):
-                return Level.L2  # a force or a delete
-            dst = spec.split(":", 1)[1] if ":" in spec else spec
+            src, _, dst = spec.partition(":")
+            dst = dst or src
+            if not src or src.startswith("+") or spec == "tag":
+                return "force"  # a delete, a force or a tag push
+            if not (src == "HEAD" or _NAME.fullmatch(src)) or not _NAME.fullmatch(dst):
+                return "force"
             if dst == "HEAD":
                 targets.append(facts.branch)
-            else:
-                targets.append(dst.removeprefix("refs/heads/"))
-        if any(t is None or t in defaults or not t for t in targets):
-            return Level.L2
-        return Level.L3
+                continue
+            for prefix in ("refs/heads/", "heads/"):
+                dst = dst.removeprefix(prefix)
+            targets.append(None if dst.startswith("refs/") else dst)
+        for t in targets:
+            if t is None or t in defaults or t.startswith("release"):
+                return "default"
+        return "feature"
 
 
 # --- helpers ---------------------------------------------------------------------------------
@@ -753,6 +844,95 @@ def _git_read(argv: list[str]) -> bool:
     if sub == "tag":
         return not plain or "-l" in rest or "--list" in rest
     return True
+
+
+def _flags(rest: list[str]) -> tuple[frozenset[str] | None, list[str]]:
+    """``rest`` as its flags (combined short ones split: ``-fu`` is ``-f -u``; a
+    ``--name=value`` by its name) and its plain words, past a ``-m``'s value. None when a
+    flag can't be read."""
+    flags: set[str] = set()
+    plain: list[str] = []
+    skip = False
+    for a in rest:
+        if skip:
+            skip = False
+            continue
+        if a == "--" or not a.startswith("-"):
+            plain.append(a)
+            continue
+        if a.startswith("--"):
+            name = a.split("=", 1)[0]
+            flags.add(name)
+            skip = name in _GIT_VALUE and "=" not in a
+            continue
+        letters = a[1:]
+        if not letters.isalpha():
+            return None, plain
+        for k, c in enumerate(letters):
+            flags.add(f"-{c}")
+            if f"-{c}" in _GIT_VALUE:
+                skip = k == len(letters) - 1  # ``-mfix``: the rest is the value
+                break
+    return frozenset(flags), plain
+
+
+def _path_args(argv: list[str]) -> list[str]:
+    """The words of a read that may name a path: not flags, not ``find``'s patterns, not
+    ``grep``'s or ``rg``'s pattern."""
+    out: list[str] = []
+    skip = False
+    pattern_done = argv[0] not in ("grep", "rg") or any(
+        a in ("-e", "--regexp", "-f", "--file") or a.startswith("--regexp=") for a in argv
+    )
+    for a in argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-"):
+            grep = argv[0] in ("grep", "rg") and a in _GREP_VALUES
+            skip = (argv[0] == "find" and a in _FIND_VALUES) or grep
+            continue
+        if argv[0] == "cd" or pattern_done:
+            out.append(a)
+        else:
+            pattern_done = True
+    return out
+
+
+def git_remotes(path: str) -> frozenset[str]:
+    """The remotes configured for the repo at ``path`` (from its config file)."""
+    return frozenset(m.group(1) for m in _REMOTE.finditer(_git_config(path)))
+
+
+def git_upstream(path: str, branch: str | None) -> str | None:
+    """The branch ``branch`` pushes to when its upstream says so (``branch.<b>.merge``)."""
+    if branch is None:
+        return None
+    text = _git_config(path)
+    m = re.search(rf'\[branch "{re.escape(branch)}"\]([^\[]*)', text)
+    merge = re.search(r"^\s*merge\s*=\s*(\S+)", m.group(1), re.M) if m else None
+    return merge.group(1).removeprefix("refs/heads/") if merge else None
+
+
+def _git_config(path: str) -> str:
+    p = Path(path)
+    for d in [p, *p.parents]:
+        dot = d / ".git"
+        try:
+            if dot.is_dir():
+                return (dot / "config").read_text(errors="replace")
+            if dot.is_file():
+                text = dot.read_text(errors="replace").strip().removeprefix("gitdir:").strip()
+                gitdir = Path(text) if Path(text).is_absolute() else (d / text).resolve()
+                common = gitdir
+                cfile = gitdir / "commondir"
+                if cfile.is_file():
+                    c = Path(cfile.read_text(errors="replace").strip())
+                    common = c if c.is_absolute() else (gitdir / c).resolve()
+                return (common / "config").read_text(errors="replace")
+        except OSError:
+            return ""
+    return ""
 
 
 def _verb(argv: list[str]) -> str:

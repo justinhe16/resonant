@@ -1722,20 +1722,19 @@ class AskRunner:
                 ran.append(p)
         if not ran:
             return
-        now = self.clock()
-        with atomic(self.conn):
-            done = kv_get(self.conn, FOLLOWUPS_KV)
-            seen = [t for t in cast(list[Any], done) if isinstance(t, str)] if isinstance(
-                done, list) else []  # fmt: skip
-            if task.id in seen:
-                return
-            kv_set(self.conn, FOLLOWUPS_KV, [*seen, task.id][-FOLLOWUPS_KEEP:])
-            for p in ran:
-                add_grant(self.conn, p.args, task_id=task.id, now=now)
+        done = kv_get(self.conn, FOLLOWUPS_KV)
+        seen = [t for t in cast(list[Any], done) if isinstance(t, str)] if isinstance(
+            done, list) else []  # fmt: skip
+        if task.id in seen:
+            return
         lines = [approved_line(n, p.args) for n, p in enumerate(ran, 1)]
         queued = self.enqueue("\n".join(lines), principal=principal, tools=True, approved=True,
                               trace_id=task.trace_id)  # fmt: skip
-        with atomic(self.conn):
+        with atomic(self.conn):  # the grants are for that turn alone
+            kv_set(self.conn, FOLLOWUPS_KV, [*seen, task.id][-FOLLOWUPS_KEEP:])
+            if isinstance(queued, Queued):
+                for p in ran:
+                    add_grant(self.conn, p.args, task_id=queued.task_id, now=self.clock())
             audit(self.conn, "brain.shell_approved", task_id=task.id, trace_id=task.trace_id,
                   changes=len(ran), queued=isinstance(queued, Queued))  # fmt: skip
         if isinstance(queued, AskRefused):
