@@ -199,10 +199,16 @@ def test_rows_get_suggested_expectations_from_what_happened(
     chat(store, "any PRs failing?", calls=[{"tool": "prs", "extension": "github"}])
     chat(store, "what's on the calendar", calls=[{"tool": "events", "extension": "gcal"}])
     chat(store, "tail the daemon log", calls=[{"tool": "tail_log"}])
+    chat(
+        store,
+        "restart ollama then list runs",
+        calls=[{"tool": "restart_ollama", "effect": "write", "decision": "Deny"},
+               {"tool": "list_runs"}],
+    )  # fmt: skip
     chat(store, "hi", minutes_ago=10, runner="local", route=None, reply="Hi!")
     drafted = draft(home)
 
-    assert len(drafted) == 10
+    assert len(drafted) == 11
     assert all(r["review"] is True and r["id"].startswith("own-") for r in drafted)
     te.load_set(te.owner_set_path(settings(home)))  # the file is a valid task set
 
@@ -219,9 +225,13 @@ def test_rows_get_suggested_expectations_from_what_happened(
     assert jot["writes"] == ["add_note"] and jot["ask"] is False
 
     run = by_text(drafted, "kick off a run")
-    assert run["expect"]["tools"] == ["list_repos"]
-    assert run["expect"]["tools_not"] == ["start_run"]  # the owner said no
-    assert run["category"] == "runs"
+    # the owner said no: asking was right, so it's an approval row, not a forbidden tool
+    assert run["expect"] == {"route": "local", "tools": ["list_repos", "start_run"],
+                             "ask": "approval"}  # fmt: skip
+    assert "you said no to start_run" in run["note"] and run["category"] == "runs"
+
+    denied = by_text(drafted, "restart ollama")["expect"]
+    assert denied["tools_not"] == ["restart_ollama"] and denied["tools"] == ["list_runs"]
 
     research = by_text(drafted, "mycelium")
     assert research["expect"]["route"] == "claude" and research["category"] == "research"
@@ -288,6 +298,57 @@ def test_redaction_drops_codes_secrets_and_other_peoples_handles(
     ]
     assert "redacted: code, handle" in asked["note"]
     assert by_text(drafted, "back")["text"] == "call [handle] back"
+
+
+def test_unicode_tricks_are_normalized_before_redaction(
+    home: Path, store: sqlite3.Connection
+) -> None:
+    chat(store, "approve \uff21\uff17 and text fri\u200bend@example.org", minutes_ago=3)
+    path = hist.draft(settings(home)).path
+    (row,) = rows(path)
+    assert row["text"] == "approve ? and text [handle]"
+
+
+def test_a_line_separator_in_a_text_stays_on_its_row(home: Path, store: sqlite3.Connection) -> None:
+    chat(store, "first line\u2028second\u2029third\x85end", minutes_ago=3)
+    chat(store, "what's running?", minutes_ago=2)
+    path = hist.draft(settings(home)).path
+    assert len(path.read_text().split("\n")) == 3  # two rows and the final newline
+    assert next(r.text for r in te.load_set(path)) == "first line\u2028second\u2029third\x85end"
+    assert hist.draft(settings(home)).drafted == 0  # and the next draft reads it back
+
+
+def test_context_holding_a_credential_is_left_out(home: Path, store: sqlite3.Connection) -> None:
+    chat(store, "my key is sk-ant-abcdefghijklmnopqrstuvwxyz", minutes_ago=5, reply="Got it.")
+    chat(store, "yes", minutes_ago=4, reply="Done.")
+    chat(store, "and the deploy?", minutes_ago=3,
+         reply="Use token ghp_abcdefghijklmnopqrstuvwxyz0123456789")  # fmt: skip
+    path = hist.draft(settings(home)).path
+    raw = path.read_text()
+    assert "sk-ant" not in raw and "ghp_" not in raw
+    row = by_text(rows(path), "deploy")
+    assert "history" not in row  # the secret turn and the approval reply are both dropped
+    assert row["draft"]["reply"] == hist.WITHHELD
+
+
+def test_unreadable_principals_exit_2_without_their_values(
+    home: Path, store: sqlite3.Connection
+) -> None:
+    chat(store, "what's running?")
+    (home / "principals.yaml").write_text("principals:\n  x: {role: owner, identities: 5550199}\n")
+    result = CliRunner().invoke(app, ["eval", "draft", "--from-history"])
+    assert result.exit_code == 2 and "cannot read" in result.output
+    assert "5550199" not in result.output
+    (home / "principals.yaml").write_text("principals: [unclosed\n")
+    result = CliRunner().invoke(app, ["eval", "draft", "--from-history"])
+    assert result.exit_code == 2 and "cannot read" in result.output
+
+
+def test_run_set_never_grades_a_row_awaiting_review() -> None:
+    reviewed = te.TaskCase(1, "a", "chat", "hi", (), {}, te.Expect(), ["Hi."])
+    pending = te.TaskCase(2, "b", "chat", "yo", (), {}, te.Expect(), ["Yo."], review=True)
+    out = asyncio.run(te.run_set([reviewed, pending], ["loop"], model=None))
+    assert [r.case.id for r in out["loop"]] == ["a"]
 
 
 def test_near_identical_texts_are_drafted_once_newest_kept(

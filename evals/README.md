@@ -145,8 +145,8 @@ resonant eval task --set owner [--repeat 3]
 `eval draft` reads the store (read-only) and appends one row per past text to `~/.resonant/evals/task.jsonl`, newest texts first up to `--limit`, written oldest first. For each of your chat texts it reads the message, the tools the turn called (the `gate.evaluate` audit rows on its trace, the local model's and the Claude brain's), the approvals you answered, the reply you got and the route it took, and suggests:
 
 - `route`: `local` or `claude`, as it went (none on the old intents path).
-- `tools`: every tool called, except `ask_claude` (the route covers it) and the ones you refused.
-- `tools_not`: the writes you said no to, or the gate denied.
+- `tools`: every tool called, except `ask_claude` (the route covers it) and the ones the gate denied.
+- `tools_not`: the calls the gate denied. A write you said no to stays an `ask: "approval"` row (asking was right); the `note` says you said no.
 - `ask`: `"approval"` when the gate asked you, `true` when the reply asked you back and nothing ran, else `false`.
 - `writes`: the writes that ran without asking you (trust rules, standing allows, L3).
 
@@ -154,7 +154,7 @@ resonant eval task --set owner [--repeat 3]
 
 **The world** is the store as it was when the text came in: the repos registered then; when the turn used them, the runs (with their status at that moment), the notes and the pending reminders; the facts (as they are now); and the eval's extension fixtures with their canned defaults. Real files, git history, run transcripts and extensions with no fixture aren't copied, and the brain's rolling summary isn't replayed (up to 3 earlier texts within 30 minutes are seeded as `history`). The row's `note` lists what's missing, so you can add it or drop the row.
 
-**What it leaves out.** Approval replies (`yes`, `no K4`…) are skipped, and so is any text holding something credential-shaped (a token, a key, `password=…`). In what's kept (texts, earlier turns, replies, run asks, notes) anything that could pass for an approval code becomes `?`, and every principal's handles, emails, phone numbers and `@mentions` become `[handle]`. The command prints counts and the path, never a text.
+**What it leaves out.** Approval replies (`yes`, `no K4`…) are skipped, and so is any text holding something credential-shaped (a token, a key, `password=…`); such an earlier turn is left out of `history`, and such a reply is withheld. Text is NFKC-normalized and stripped of zero-width characters first. In what's kept (texts, earlier turns, replies, run asks, notes) anything that could pass for an approval code becomes `?`, and every principal's handles, emails, phone numbers and `@mentions` become `[handle]`. The command prints counts and the path, never a text.
 
 **Dedupe.** Texts that are the same once case, punctuation and emoji are dropped, or at least 90% similar, are drafted once (the newest). A rerun keeps every row already in the file as it is, your edits included, and adds only texts it hasn't drafted (by task id and by text).
 

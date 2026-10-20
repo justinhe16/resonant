@@ -55,7 +55,14 @@ import yaml
 
 from resonant.brain.facts import FactStore, facts_dir
 from resonant.config import Settings
-from resonant.evals.task_eval import FIXTURES, EvalSetError, load_set, owner_set_path
+from resonant.evals.task_eval import (
+    FIXTURES,
+    EvalSetError,
+    load_set,
+    owner_set_path,
+    parse_case,
+    set_lines,
+)
 from resonant.gate.codes import mask_codes
 from resonant.gate.replies import parse_reply
 from resonant.principals import load_principals
@@ -258,6 +265,7 @@ _EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]
 _PHONE = re.compile(r"(?<![\w+])\+?\(?\d[\d\s().-]{7,20}\d(?!\w)")
 _MENTION = re.compile(r"(?<![\w@])@[A-Za-z0-9_][A-Za-z0-9_.-]{0,38}")
 HANDLE = "[handle]"
+WITHHELD = "[withheld: it held a credential]"
 
 
 @dataclass
@@ -279,7 +287,10 @@ class Scrubber:
         return found
 
     def __call__(self, text: str) -> str:
-        out = text
+        # NFKC first, as the reply parser does: a fullwidth A7 is A7; format characters
+        # (zero-width spaces, joiners, bidi marks) go, so they can't split a handle or a code.
+        norm = unicodedata.normalize("NFKC", text)
+        out = "".join(ch for ch in norm if unicodedata.category(ch) != "Cf")
         if self._known is not None:
             out = self._sub(self._known, HANDLE, out, "handle")
         cleaned = redact_secrets(out)
@@ -407,7 +418,9 @@ def category(chat: Chat, history: bool) -> str:
 def suggest_expect(chat: Chat) -> dict[str, Any]:
     """Expectations from what happened: the owner checks them (``review: true``)."""
     asked = list(dict.fromkeys(c.tool for c in chat.calls if c.decision == "NeedsApproval"))
-    refused = set(chat.rejected) | {c.tool for c in chat.calls if c.decision == "Deny"}
+    # The gate's Deny is a call the brain shouldn't have made. The owner's "no" to an
+    # approval isn't: asking was right (ask: approval), so it isn't forbidden here.
+    refused = {c.tool for c in chat.calls if c.decision == "Deny"}
     tools = [
         t for t in dict.fromkeys(c.tool for c in chat.calls) if t != ASK_CLAUDE and t not in refused
     ]
@@ -565,11 +578,15 @@ def draft_row(
     turns: list[dict[str, str]] = []
     for h in history:
         user, reply = scrub(h.text).strip(), _clip(scrub(h.reply).strip())
+        turn_found = scrub.reset()
+        if "secret" in turn_found or parse_reply(h.text) is not None:
+            continue  # a turn that held a credential, or an approval reply: left out
         if user and reply:
             turns.append({"user": user, "reply": reply})
-    found |= scrub.reset()
+            found |= turn_found
     reply = _clip(scrub(chat.reply).strip())
-    scrub.reset()
+    if "secret" in scrub.reset():
+        reply = WITHHELD
 
     w: dict[str, Any] = {}
     if repos := world.repos(chat.at):
@@ -607,6 +624,8 @@ def draft_row(
         notes.append("the turn read outside text (tainted)")
     if chat.voice:
         notes.append("a voice note's transcript")
+    if rejected := sorted(set(chat.rejected)):
+        notes.append(f"you said no to {', '.join(rejected)}")
     if chat.status != "done":
         notes.append(f"the task ended {chat.status}")
     if found:
@@ -657,7 +676,7 @@ def read_existing(path: Path) -> Existing:
     if not path.exists() or not path.read_text(encoding="utf-8").strip():
         return Existing([], set(), [], set())  # nothing yet (an empty file is nothing)
     load_set(path)  # raises EvalSetError (line numbers only) on a bad set
-    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    lines = [ln for ln in set_lines(path.read_text(encoding="utf-8")) if ln.strip()]
     ids: set[str] = set()
     texts: list[str] = []
     tasks: set[str] = set()
@@ -687,6 +706,10 @@ def write_set(path: Path, lines: Sequence[str]) -> None:
         raise
 
 
+class DraftError(RuntimeError):
+    """Drafting can't start (the message names no text or handle)."""
+
+
 @dataclass
 class DraftReport:
     path: Path
@@ -696,6 +719,7 @@ class DraftReport:
     skipped: dict[str, int] = field(
         default_factory=lambda: {
             "duplicate": 0, "approval_reply": 0, "secret": 0, "already_drafted": 0,
+            "invalid": 0,
         }
     )  # fmt: skip
 
@@ -725,7 +749,10 @@ def draft(
     existing = read_existing(path)
     report = DraftReport(path)
     principals = settings.principals_path
-    owner = load_principals(principals).owner if principals.exists() else "owner"
+    try:
+        owner = load_principals(principals).owner if principals.exists() else "owner"
+    except (OSError, ValueError, yaml.YAMLError):
+        raise DraftError(f"cannot read {principals}") from None  # never echo its values
     scrub = Scrubber(principal_handles(principals))
     conn = open_store(settings.db_path)
     try:
@@ -765,7 +792,13 @@ def draft(
             if row["id"] in existing.ids:
                 report.skipped["already_drafted"] += 1
                 continue
-            rows.append(json.dumps(row, ensure_ascii=False))
+            try:
+                parse_case(row, 0)  # one bad row is skipped, never the whole batch
+            except ValueError:
+                report.skipped["invalid"] += 1
+                continue
+            # ASCII-escaped: U+2028 and friends stay inside the JSON string on one line
+            rows.append(json.dumps(row, ensure_ascii=True))
     finally:
         conn.close()
     lines = existing.lines + rows
@@ -818,6 +851,9 @@ def run(
     except EvalSetError as e:
         echo_err(f"error: the existing set is malformed, left as is: {e}")
         return EXIT_BAD
+    except DraftError as e:
+        echo_err(f"error: {e}")
+        return EXIT_BAD
     except (ValueError, sqlite3.Error) as e:
         echo_err(f"error: {e}")
         return EXIT_BAD
@@ -831,7 +867,8 @@ def run(
     )
     echo(
         f"skipped: {s['duplicate']} near-duplicate, {s['approval_reply']} approval reply, "
-        f"{s['secret']} with a credential, {s['already_drafted']} already drafted"
+        f"{s['secret']} with a credential, {s['already_drafted']} already drafted, "
+        f"{s['invalid']} invalid"
     )
     if report.pending_review:
         echo(

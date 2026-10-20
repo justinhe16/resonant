@@ -479,6 +479,43 @@ def _claude(raw: Any) -> dict[str, Any] | None:
     return d
 
 
+def parse_case(row: Mapping[str, Any], line: int) -> TaskCase:
+    """One row as a case. Raises ``ValueError`` (never naming the text)."""
+    unknown = set(row) - ROW_KEYS
+    if unknown:
+        raise ValueError(f"unknown keys: {sorted(unknown)}")
+    cid, category, text = row.get("id"), row.get("category"), row.get("text")
+    if not isinstance(cid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", cid):
+        raise ValueError("'id' must be a short lowercase slug")
+    if not isinstance(category, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", category):
+        raise ValueError("'category' must be a short lowercase word")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("'text' must be a non-empty string")
+    review = row.get("review", False)
+    if not isinstance(review, bool):
+        raise ValueError("'review' must be true or false")
+    if row.get("draft") is not None and not isinstance(row.get("draft"), dict):
+        raise ValueError("'draft' must be an object")
+    return TaskCase(
+        line=line,
+        id=cid,
+        category=category,
+        text=text,
+        history=_history(row.get("history")),
+        world=_world(row.get("world")),
+        expect=parse_expect(row.get("expect")),
+        script=_script(row.get("script")),
+        triage=_triage(row.get("triage")),
+        claude=_claude(row.get("claude")),
+        review=review,
+    )
+
+
+def set_lines(raw: str) -> list[str]:
+    """A JSONL set's lines: split on ``\\n`` only (a U+2028 inside a JSON string is text)."""
+    return raw.split("\n")
+
+
 def load_set(path: Path) -> list[TaskCase]:
     """Parse a JSONL task set. Raises ``EvalSetError`` naming the line (never the text)."""
     try:
@@ -489,7 +526,7 @@ def load_set(path: Path) -> list[TaskCase]:
         raise EvalSetError(f"{path}: cannot read ({type(e).__name__})") from None
     cases: list[TaskCase] = []
     seen: set[str] = set()
-    for n, line in enumerate(raw.splitlines(), start=1):
+    for n, line in enumerate(set_lines(raw), start=1):
         if not line.strip():
             continue
         try:
@@ -498,43 +535,13 @@ def load_set(path: Path) -> list[TaskCase]:
             raise EvalSetError(f"{path}:{n}: not valid JSON") from None
         if not isinstance(obj, dict):
             raise EvalSetError(f"{path}:{n}: expected a JSON object")
-        row = cast(dict[str, Any], obj)
         try:
-            unknown = set(row) - ROW_KEYS
-            if unknown:
-                raise ValueError(f"unknown keys: {sorted(unknown)}")
-            cid, category, text = row.get("id"), row.get("category"), row.get("text")
-            if not isinstance(cid, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", cid):
-                raise ValueError("'id' must be a short lowercase slug")
-            if cid in seen:
-                raise ValueError(f"duplicate id {cid!r}")
-            if not isinstance(category, str) or not re.fullmatch(
-                r"[a-z][a-z0-9_-]{0,31}", category
-            ):
-                raise ValueError("'category' must be a short lowercase word")
-            if not isinstance(text, str) or not text.strip():
-                raise ValueError("'text' must be a non-empty string")
-            review = row.get("review", False)
-            if not isinstance(review, bool):
-                raise ValueError("'review' must be true or false")
-            if row.get("draft") is not None and not isinstance(row.get("draft"), dict):
-                raise ValueError("'draft' must be an object")
-            case = TaskCase(
-                line=n,
-                id=cid,
-                category=category,
-                text=text,
-                history=_history(row.get("history")),
-                world=_world(row.get("world")),
-                expect=parse_expect(row.get("expect")),
-                script=_script(row.get("script")),
-                triage=_triage(row.get("triage")),
-                claude=_claude(row.get("claude")),
-                review=review,
-            )
+            case = parse_case(cast(dict[str, Any], obj), n)
+            if case.id in seen:
+                raise ValueError(f"duplicate id {case.id!r}")
         except ValueError as e:
             raise EvalSetError(f"{path}:{n}: {e}") from None
-        seen.add(cid)
+        seen.add(case.id)
         cases.append(case)
     if not cases:
         raise EvalSetError(f"{path}: no cases")
@@ -1613,6 +1620,7 @@ async def run_set(
     ``script`` (a case without one gets the scripted model's default reply)."""
     if repeat < 1:
         raise ValueError("repeat must be >= 1")
+    cases, _ = split_review(cases)  # PER-248: a row awaiting review is never graded
     out: dict[str, list[CaseResult]] = {m: [] for m in modes}
     for mode in modes:
         shared = None if model is None else RecordingModel(model)
@@ -1793,6 +1801,7 @@ __all__ = [
     "grade",
     "load_set",
     "owner_set_path",
+    "parse_case",
     "resolve_set_path",
     "run",
     "run_case",
