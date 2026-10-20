@@ -258,6 +258,7 @@ def tool_access(components: Components, brain: BrainRunner, settings: Settings) 
         taints=taints,
         extensions=components.extensions,
         timezone=settings.timezone,
+        shell=components.shell,
     )
 
 

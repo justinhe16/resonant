@@ -5,7 +5,8 @@ Evaluation order:
 1. Registration: the intent's spec must be the one registered for (extension, tool).
 2. Permission: ``can(principal, "request", extension)``.
 3. Unsafe args (control, bidi, zero-width characters): Deny, so what runs always matches
-   what was shown.
+   what was shown. Then the tool's ``refusals`` hook, if it has one: a call it names is
+   denied outright, never asked (the shell family's never-list, PER-258).
 4. dry_run: a tool that is neither an L0 read nor store-internal
    (``tools.is_store_internal``) becomes ``DryRun(would=<summary>)``.
 5. Level x origin x autonomy (``rule``). ``scheduled`` is never explicit; ``tainted``
@@ -80,7 +81,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
-from resonant.gate.codes import new_code
+from resonant.gate.codes import clean_external, new_code
 from resonant.gate.summary import summarize, unsafe_args
 from resonant.gate.types import (
     Allow,
@@ -133,6 +134,10 @@ SummaryAction = Callable[[Intent], str | None]
 # rules). None keeps the registered level. Only L2 and L3 may be chosen, and only for a tool
 # registered at one of them: an override never makes a tool skip the L1 code or the L0 path.
 LevelFor = Callable[[Intent], Level | None]
+
+# Why one call is never allowed (denied, never asked), or None: the shell family's never-list
+# (PER-258, ``gate/shell.py``). Code-built; it becomes the Deny reason.
+RefusalFor = Callable[[Intent], str | None]
 
 # The approver names an extension's manifest declares (``Manifest.approvers``). Untrusted:
 # the gate keeps only names that hold the approve grant for that extension.
@@ -207,7 +212,12 @@ class PolicyGate:
         standing: Standing | None = None,
         clock: Callable[[], datetime] = utcnow,
         batch_max: int = DEFAULT_BATCH_MAX,
+        refusals: Mapping[ToolKey, RefusalFor] | None = None,
+        summaries: Mapping[ToolKey, SummaryAction] | None = None,
     ) -> None:
+        """``refusals``: per-call never-lists; ``summaries``: a tool's whole approval line,
+        code-built (the shell family's ``run `<command>` in <dir>``), cleaned like any
+        other."""
         self.conn = conn
         self.principals = principals
         self.registry = registry
@@ -219,6 +229,8 @@ class PolicyGate:
         self.standing = standing
         self.clock = clock
         self.batch_max = batch_max
+        self.refusals = dict(refusals or {})
+        self.summaries = dict(summaries or {})
         self._tokens: dict[str, str] = {}
 
     @property
@@ -270,6 +282,9 @@ class PolicyGate:
         if unsafe:
             # Never echo the offending keys or values: they are what's unsafe to show.
             return Deny(f"args contain unsafe characters ({len(unsafe)} found)"), None
+        refuse = self.refusals.get((intent.extension, intent.tool))
+        if refuse is not None and (why := refuse(intent)) is not None:
+            return Deny(why), None
         l0_read = intent.effect is Effect.READ and intent.level is Level.L0
         if self.dry_run and not l0_read and not is_store_internal(intent.spec):
             return DryRun(would=self._summary(intent)), None
@@ -319,6 +334,9 @@ class PolicyGate:
 
     def _summary(self, intent: Intent) -> str:
         """The code-built summary, with the tool's action heading if it has one."""
+        whole = self.summaries.get((intent.extension, intent.tool))
+        if whole is not None and (line := whole(intent)):
+            return clean_external(line) or intent.tool
         action = self.actions.get((intent.extension, intent.tool))
         return summarize(intent, action=action(intent) if action else None)
 

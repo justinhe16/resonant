@@ -18,6 +18,7 @@ keep working.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -28,7 +29,8 @@ from resonant.executor import Executor, Handler, HandlerKey, ToolHandler
 from resonant.extensions.host import ExtensionHost
 from resonant.extensions.process import ExtRunner
 from resonant.gate import Gate, Intent, PolicyGate
-from resonant.gate.policy import LevelFor, SummaryAction
+from resonant.gate.policy import LevelFor, RefusalFor, SummaryAction
+from resonant.gate.shell import ShellPolicy
 from resonant.gateway.channel import Channel
 from resonant.loop.types import Runner
 from resonant.models import ModelClient
@@ -40,9 +42,11 @@ from resonant.tools import notes as notes_tools
 from resonant.tools import ops as ops_tools
 from resonant.tools import repos as repos_tools
 from resonant.tools import runs as runs_tools
+from resonant.tools import shell as shell_tools
 from resonant.tools import trust as trust_tools
 from resonant.tools import watches as watch_tools
 from resonant.tools.builtin import register_builtins
+from resonant.tools.files import ReadScope
 from resonant.tools.registry import ToolKey
 from resonant.trust.tools import StandingAllows
 from resonant_sdk import Level, ToolSpec
@@ -69,12 +73,18 @@ class Components:
     runners: dict[str, Runner] = field(default_factory=dict[str, Runner])  # name -> runner
     extensions: ExtensionHost | None = None  # None only in tests that build by hand
     ops_runner: OpsRunner | None = None  # the ops tools' subprocesses (None: the real one)
+    shell: ShellPolicy | None = None  # PER-258: the Claude brain's own tool calls (gate/shell)
 
     def chat_specs(self) -> list[ToolSpec]:
         """Every registered spec a chat step can call: builtins and extension tools, never
         extension job specs."""
         host = self.extensions
-        return [s for s in self.registry.specs() if host is None or not host.hidden(s)]
+        return [
+            s
+            for s in self.registry.specs()
+            if (host is None or not host.hidden(s))
+            and not (s.extension is None and s.name in shell_tools.INTERNAL)
+        ]
 
     def register_local_runner(
         self,
@@ -150,6 +160,41 @@ def summary_actions(
     return actions
 
 
+def shell_policy(settings: Settings) -> ShellPolicy:
+    """PER-258: the shell family's rules for this install: the read tools' roots and deny
+    list, ``RESONANT_HOME`` (never written) and the brain's own dir (``<home>/ask``)."""
+    scope = ReadScope.from_settings(settings)
+
+    def read_ok(path: str) -> bool:
+        return not scope.denied(path) and scope.inside(os.path.realpath(path))
+
+    return ShellPolicy(read_ok=read_ok, home=settings.home, scratch=[settings.home / "ask"])
+
+
+@dataclass(frozen=True)
+class ShellHooks:
+    levels: dict[ToolKey, LevelFor]
+    refusals: dict[ToolKey, RefusalFor]
+    summaries: dict[ToolKey, SummaryAction]
+
+
+def shell_hooks(policy: ShellPolicy) -> ShellHooks:
+    """The gate's hooks for ``shell`` and ``shell_read`` (PER-258): the level and never-list
+    of a change, and both specs' approval line, from the call's args."""
+    key, read = (None, shell_tools.SHELL.name), (None, shell_tools.SHELL_READ.name)
+
+    def level(intent: Intent) -> Level | None:
+        return policy.level(intent.args)
+
+    def refusal(intent: Intent) -> str | None:
+        return policy.refusal(intent.args)
+
+    def summary(intent: Intent) -> str | None:
+        return policy.summary(intent.args)
+
+    return ShellHooks({key: level}, {key: refusal, read: refusal}, {key: summary, read: summary})
+
+
 def level_overrides(conn: sqlite3.Connection) -> dict[ToolKey, LevelFor]:
     """Builtin tools whose level depends on the call: ``merge_run`` follows the trust rules
     (docs/employee-plan.md D4)."""
@@ -185,6 +230,8 @@ def build_components(
         log.warning("%s missing: denying all channel principals", path)
         principals, loaded = deny_all_principals(), False
     registry = ToolRegistry()
+    shell = shell_policy(settings)
+    hooks = shell_hooks(shell)
     handlers = register_builtins(
         registry, conn, state, principals=principals, ops_runner=ops_runner
     )
@@ -200,9 +247,11 @@ def build_components(
         approval_ttl_s=settings.gate.approval_ttl_s,
         actions=summary_actions(conn, registry, host.tool_specs),
         approvers_for=host.approvers_for,
-        levels=level_overrides(conn),
+        levels={**level_overrides(conn), **hooks.levels},
         standing=StandingAllows(conn),
         batch_max=settings.gate.batch_max,
+        refusals=hooks.refusals,
+        summaries=hooks.summaries,
     )
     merged: dict[HandlerKey, Handler] = {**handlers, **host.handlers, **host.mcp_handlers}
     executor = Executor(
@@ -221,4 +270,5 @@ def build_components(
         principals_loaded=loaded,
         ops_runner=ops_runner,
         extensions=host,
+        shell=shell,
     )

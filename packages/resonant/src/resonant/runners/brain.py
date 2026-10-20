@@ -193,7 +193,8 @@ TAINTING_BUILTINS: frozenset[str] = frozenset(
     }
 )
 # Control-plane tools that stay slash-only (``/ext mute``), as on the intents path.
-NOT_IN_BRAIN: frozenset[str] = frozenset({"mute_extension"})
+# ``shell`` and ``shell_read`` (PER-258): the Claude brain's own tool calls, gated by the bridge.
+NOT_IN_BRAIN: frozenset[str] = frozenset({"mute_extension", "shell", "shell_read"})
 
 TOOL_ERROR_CHARS = 300  # a failed tool's reason, as the model sees it
 

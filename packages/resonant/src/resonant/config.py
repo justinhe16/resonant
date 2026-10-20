@@ -788,6 +788,9 @@ class ClaudeSessionConfig(_Section):
     # watch checks); past it the owner hears it once and qwen answers until the next hour.
     # 0: off.
     max_per_hour: int = Field(default=60, ge=0, le=1000)
+    # PER-258: a turn whose own shell changes or edits ran ends its reply with one
+    # code-built "Did: ..." line (no line for reads).
+    progress_texts: bool = True
 
 
 class TriageConfig(_Section):

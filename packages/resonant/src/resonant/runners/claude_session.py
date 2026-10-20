@@ -8,9 +8,11 @@ answer comes from changes. :class:`ClaudeSession` owns the process and its stdin
 runner owns everything a turn decides.
 
 **The process** is RC-1's live machinery (``runners/live.py``): ``claude -p
---input-format stream-json --output-format stream-json`` with stdin kept open, the ask's
-read-only built-ins under ``--restricted``, ``dontAsk`` and the same allow, deny and read
-rules (``runners.ask.session_argv``), and Resonant's MCP server. Each turn is one ``user``
+--input-format stream-json --output-format stream-json`` with stdin kept open, Claude Code's
+file, shell and web built-ins with every permission prompt sent to Resonant's permission tool
+(PER-258; the reads on ``gate.shell.READ_RULES`` never prompt), the ask's deny and read rules
+(``runners.ask.session_argv``), and Resonant's MCP server. ``shell`` tracks where its Bash
+is (``ask_tools.ShellCwd``). Each turn is one ``user``
 line; its end is the ``result`` line. Nothing is written mid-turn.
 
 **The MCP server lives as long as the session** (the relay Claude Code started holds its
@@ -75,7 +77,7 @@ from resonant import killswitch
 from resonant.brain.history import DEFAULT_TAINT_HOPS
 from resonant.config import ClaudeSessionConfig
 from resonant.runners import reaper
-from resonant.runners.ask_tools import McpServer
+from resonant.runners.ask_tools import McpServer, ShellCwd
 from resonant.runners.claude import read_lines
 from resonant.runners.live import RC_TIMEOUT_S, ControlReply, LiveInput, session_url
 from resonant.runners.reaper import MARKER_ENV, Target
@@ -139,6 +141,7 @@ class ClaudeSession:
         self.rc_timeout_s = rc_timeout_s
         self.end_wait_s = end_wait_s
         self.lock = asyncio.Lock()  # one turn at a time
+        self.shell = ShellCwd(str(cwd))  # PER-258: where its Bash is (reset at each start)
         self.proc: asyncio.subprocess.Process | None = None
         self.live: LiveInput | None = None
         self.target: Target | None = None
@@ -322,6 +325,7 @@ class ClaudeSession:
     ) -> bool:
         self.cwd.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._fingerprint = fingerprint
+        self.shell.path = str(self.cwd)  # a new process's Bash starts in its cwd
         marker = f"brain-{sid}"
         try:
             proc = await asyncio.create_subprocess_exec(

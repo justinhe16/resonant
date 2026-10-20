@@ -33,6 +33,23 @@ decides whether a call may run.
 - **Kill switch.** Paused: every call is refused here (the session itself is killed by the
   ask runner); autonomy off: the gate asks for everything above L0, as for the local model.
 
+**Claude's own tools** (PER-258, the Claude brain only). The session runs Claude Code's full
+built-ins with ``--permission-prompt-tool mcp__resonant__permission``: a read on the
+pre-allowed list runs without asking; anything else is a permission request to this bridge
+(``{tool_name, input, tool_use_id}``; probed on 2.1.304). It must match a ``tool_use`` the
+stream showed (same id, name and input), so Claude can't call the tool itself to get a grant,
+and every read before it has been counted for taint. Then ``ShellPolicy.request``
+(``gate/shell.py``) builds the gate's args and the call goes through ``ToolCore`` as
+``shell_read`` (L0) or ``shell`` (the gate's levels, never-list, taint, standing allows and
+batches), and the answer is Claude Code's ``{"behavior": "allow", "updatedInput": ...}`` or
+``{"behavior": "deny", "message": ...}``. A change the gate asks about joins the batch like
+any other (the turn ends; ``AskRunner`` runs it in a new turn after the owner's yes, through
+a one-shot grant, ``store.claude_brain.take_grant``). Every tool call in the stream (read or
+write, Claude's own or Resonant's) gets a ``brain.tool`` audit row (tool, the command
+redacted and clipped, cwd, decision, status) and a span; the changes that ran make the
+turn's progress line (``progress``). The session's shell directory is tracked from the
+stream (``ShellCwd``: a ``cd`` persists in Claude Code's Bash).
+
 **One server, many turns** (BR-11). The socket and its token are an :class:`McpServer`. A
 one-shot ask's ``ClaudeTools`` owns one for its session. The Claude brain's long-lived session
 keeps one server for its whole life (the relay Claude Code started holds its socket and token)
@@ -55,6 +72,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -71,6 +89,7 @@ from typing import Any, cast
 from resonant import killswitch
 from resonant.brain.text import flat
 from resonant.gate import canonical_json
+from resonant.gate.shell import Call, ShellPolicy
 from resonant.gate.types import Origin
 from resonant.loop.types import Fail, StepContext, Task
 from resonant.models import (
@@ -81,8 +100,12 @@ from resonant.models import (
     SpanFactory,
 )
 from resonant.observability.spans import span
+from resonant.redact import Redactor
 from resonant.router.intents import ExtensionCatalog
 from resonant.runners.local import gated_answer, model_result
+from resonant.store.audit import audit
+from resonant.store.claude_brain import TOOL_ACTION, take_grant
+from resonant.store.db import atomic, utcnow
 from resonant.store.tasks import get_task
 from resonant.toolcore import (
     MAX_SIDE_EFFECTS,
@@ -125,6 +148,38 @@ NO_SUCH_TOOL = "not run: there is no Resonant tool named {name}"
 NOT_BOUND = "not run: no message from the owner is being answered right now"
 BAD_ARGS = "not run: invalid arguments ({why}). {name} takes: {schema}"
 CHANGE_NOTE = " (A change: Resonant's approval rules apply; it may ask the owner first.)"
+# PER-258: Claude Code's permission prompt tool (``--permission-prompt-tool``).
+PERMISSION = "permission"
+PERMISSION_TOOL = PREFIX + PERMISSION
+PERMISSION_LISTING: dict[str, Any] = {
+    "name": PERMISSION,
+    "description": (
+        "Internal: Claude Code's permission check for Claude's own tools; Resonant's approval "
+        "rules decide. Never call it yourself."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "tool_name": {"type": "string"},
+            "input": {"type": "object"},
+            "tool_use_id": {"type": "string"},
+        },
+        "required": ["tool_name", "input"],
+    },
+}
+SHELL_ASKED = (
+    "asked the owner: {what}. Nothing ran. If they say yes, Resonant sends you a new message "
+    "to run it then. Until then don't run it, retry it or work around it (another command, a "
+    "script, an edit): tell them it's waiting on their yes."
+)
+SHELL_REFUSED = "not run: {why} Never try another way to do it."
+SHELL_UNMATCHED = "not run: that request doesn't match a tool call in this turn"
+SHELL_OFF = "not run: Claude's own changes aren't available in this session"
+SHELL_RESULT_CHARS = 4000  # of a tool result, for the cwd and the progress line
+# Claude's own tools whose use reads nothing first: Bash taints once its output comes back
+# (a ``git log`` reads commit messages), an edit or a write not at all (its input is
+# Claude's own; Claude Code makes it Read a file before editing it, and that taints).
+OWN_CHANGES = frozenset({"Bash", "Edit", "MultiEdit", "Write", "NotebookEdit"})
 
 
 @dataclass(frozen=True)
@@ -138,6 +193,15 @@ class ToolAccess:
     taints: Callable[[ToolSpec], bool]
     extensions: ExtensionCatalog | None = None
     timezone: str = "UTC"
+    shell: ShellPolicy | None = None  # PER-258: the Claude brain's own tool calls
+
+
+@dataclass
+class ShellCwd:
+    """The Claude brain's shell directory (PER-258): where its Bash is now. The session owns
+    it (reset at each start: the CLI starts in its cwd); each turn's bridge updates it."""
+
+    path: str
 
 
 class NoModel:
@@ -178,9 +242,14 @@ class ClaudeTools:
         sync_s: float = SYNC_S,
         python: str = sys.executable,
         server: McpServer | None = None,
+        shell: ShellCwd | None = None,
+        redactor: Redactor | None = None,
     ) -> None:
         """``server`` (BR-11): the Claude brain's long-lived server, bound to this turn by
-        :meth:`start` and released by :meth:`aclose`; None: this bridge owns its own."""
+        :meth:`start` and released by :meth:`aclose`; None: this bridge owns its own.
+        ``shell`` (PER-258): the session's shell directory; with ``access.shell`` it serves
+        Claude Code's permission requests (None: every one is denied). ``redactor``: the
+        runner's secrets, out of every command shown or audited."""
         assert task.principal is not None
         self.conn = conn
         self.access = access
@@ -213,6 +282,13 @@ class ClaudeTools:
         self._stream = asyncio.Event()
         self._closed = False  # after aclose: every call is refused (review: late calls)
         self._spans: SpanFactory = partial(span, conn, trace_id=task.trace_id, task_id=task.id)
+        # PER-258: Claude's own tool calls.
+        self.shell = shell if access.shell is not None else None
+        self.policy = access.shell
+        self.redactor = redactor or Redactor(())
+        self.progress: list[str] = []  # the changes of Claude's own that ran, in words
+        self._uses: dict[str, tuple[str, dict[str, Any]]] = {}  # tool_use id -> name, input
+        self._decided: dict[str, tuple[str, Call | None]] = {}  # id -> decision, the call
 
     # -- lifecycle --
 
@@ -251,7 +327,11 @@ class ClaudeTools:
 
     def observe(self, msg: dict[str, Any]) -> None:
         """One stream-json message of the session: count Claude's tool uses. A tool of its own
-        (anything but ours) reads outside content: the session is tainted from then on."""
+        (anything but ours) reads outside content: the session is tainted from then on. A
+        tool result closes its call's audit row (PER-258)."""
+        if msg.get("type") == "user":
+            self._results(msg)
+            return
         if msg.get("type") != "assistant":
             return
         inner = msg.get("message")
@@ -265,13 +345,22 @@ class ClaudeTools:
             if b.get("type") != "tool_use":
                 continue
             name = b.get("name")
+            bid, given = b.get("id"), b.get("input")
+            if isinstance(bid, str) and isinstance(name, str):
+                self._uses[bid] = (name, cast(dict[str, Any], given) if isinstance(given, dict)
+                                   else {})  # fmt: skip
             if isinstance(name, str) and name.startswith(PREFIX):
                 self._seen[name] += 1
-            elif not self.outside:
-                self.outside = self.read_outside = True
-                with self._spans("runner.ask.taint", source="claude_tool"):
-                    pass
+            elif name not in OWN_CHANGES:
+                self._outside_read()
         self._stream.set()
+
+    def _outside_read(self) -> None:
+        """One of Claude's own tools read something: tainted from now on (once, a span)."""
+        if not self.outside:
+            self.outside = self.read_outside = True
+            with self._spans("runner.ask.taint", source="claude_tool"):
+                pass
 
     async def _synced(self, name: str) -> None:
         """Wait until the stream shows Claude's ``tool_use`` for this call, so every tool it
@@ -295,8 +384,10 @@ class ClaudeTools:
     # -- the relay's requests --
 
     def listing(self) -> list[dict[str, Any]]:
-        """The MCP ``tools`` list: name, a cleaned one-paragraph description, full schema."""
-        return listing(self.specs.values())
+        """The MCP ``tools`` list: name, a cleaned one-paragraph description, full schema
+        (and the permission tool, for the Claude brain)."""
+        out = listing(self.specs.values())
+        return [*out, PERMISSION_LISTING] if self.shell is not None else out
 
     def refused(self) -> None:
         """A relay connection with a bad token (a span on this task's trace)."""
@@ -313,6 +404,8 @@ class ClaudeTools:
                 return text, error
 
     async def _call(self, name: Any, args: Any) -> tuple[str, bool]:
+        if name == PERMISSION:
+            return await self._permission(args)
         if self._closed:
             return "not run: the session ended", True
         spec = self.specs.get(name) if isinstance(name, str) else None
@@ -379,6 +472,142 @@ class ClaudeTools:
             body = body[: RESULT_MAX_CHARS - 13] + "…[truncated]"
         return body, False
 
+    # -- Claude's own tools (PER-258) --
+
+    async def _permission(self, raw: Any) -> tuple[str, bool]:
+        """One permission request from Claude Code: the gate's decision, as Claude Code's
+        answer (never an MCP error: an error would read as a denial with no reason)."""
+        if self._closed:
+            return _deny("not run: the session ended")
+        req = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+        tool, given, tid = req.get("tool_name"), req.get("input"), req.get("tool_use_id")
+        if not isinstance(tool, str) or not isinstance(given, dict) or not isinstance(tid, str):
+            return _deny("not run: a malformed permission request")
+        given = cast(dict[str, Any], given)
+        policy, shell = self.policy, self.shell
+        if policy is None or shell is None:
+            return _deny(SHELL_OFF)
+        if not await self._use_seen(tid, tool, given):
+            return _deny(SHELL_UNMATCHED)
+        if self._paused():
+            self._decided[tid] = ("refused", None)
+            return _deny(PAUSED)
+        call = policy.request(tool, given, shell.path, self._shown)
+        spec = self.core.registry.get(None, call.spec)
+        if spec is None:
+            return _deny(SHELL_OFF)
+        if self.outside:
+            self.tainted = True
+        write = call.verdict.kind != "read"
+        if call.verdict.kind == "write" and take_grant(self.conn, call.args, now=utcnow()):
+            self._decided[tid] = ("granted", call)
+            with self._spans("runner.ask.shell", decision="granted", verb=call.args["verb"]):
+                pass
+            return _allow(given)
+        if write:
+            self.changes += 1
+        origin: Origin = "tainted" if self.tainted else "inferred"
+        self.calls += 1
+        index = self._index
+        self._index += 1
+        view = self._view()
+        scope = CallScope(view.id, self.principal, view.trace_id, view.step_no, index, origin,
+                          spans=self._spans, checkpoint=view.checkpoint, steps=self.ctx,
+                          effects=list(self.reports), pin={"tainted": self.tainted},
+                          batch=self.asked)  # fmt: skip
+        outcome = await self.core.call(spec, call.args, scope)
+        if isinstance(outcome, Asked):
+            item = outcome.item
+            if item is not None and all(i.approval_id != item.approval_id for i in self.asked):
+                self.asked.append(item)
+            self._decided[tid] = ("asked", call)
+            return _deny(SHELL_ASKED.format(what=outcome.summary))
+        if isinstance(outcome, Ran) and outcome.result.ok:
+            self._decided[tid] = ("gate" if write else "read", call)
+            return _allow(given)
+        self._decided[tid] = ("refused", call)
+        why = outcome.text if isinstance(outcome, Refused) else "Resonant couldn't check it."
+        why = why.removeprefix("Not done: ")
+        return _deny(SHELL_REFUSED.format(why=flat(why, 300)))
+
+    async def _use_seen(self, tid: str, tool: str, given: dict[str, Any]) -> bool:
+        """The stream showed this ``tool_use`` (same id, tool and input), within ``sync_s``."""
+        deadline = time.monotonic() + self.sync_s
+        while tid not in self._uses:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            self._stream.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stream.wait(), left)
+        name, seen = self._uses[tid]
+        return name == tool and canonical_json(seen) == canonical_json(given)
+
+    def _shown(self, text: str) -> str:
+        return self.redactor.text(text)
+
+    def _results(self, msg: dict[str, Any]) -> None:
+        inner = msg.get("message")
+        content = cast(dict[str, Any], inner).get("content") if isinstance(inner, dict) else None
+        if not isinstance(content, list):
+            return
+        for block in cast(list[Any], content):
+            if not isinstance(block, dict):
+                continue
+            b = cast(dict[str, Any], block)
+            tid = b.get("tool_use_id")
+            if b.get("type") != "tool_result" or not isinstance(tid, str) or tid not in self._uses:
+                continue
+            name, given = self._uses.pop(tid)
+            text = _result_text(b.get("content"))
+            decided = self._decided.pop(tid, None)
+            ran = decided is None or decided[0] not in ("asked", "refused")
+            if name == "Bash" and ran:  # its output is outside content (a commit message...)
+                self._outside_read()
+            self._record(name, given, text, b.get("is_error") is True, decided)
+
+    def _record(
+        self,
+        name: str,
+        given: dict[str, Any],
+        text: str,
+        error: bool,
+        decided: tuple[str, Call | None] | None,
+    ) -> None:
+        """One tool call's audit row and span, the shell directory, the progress line."""
+        call = decided[1] if decided is not None else None
+        if name.startswith(PREFIX):
+            decision, shown, cwd = "resonant", name.removeprefix(PREFIX), ""
+        else:
+            denied = error and "has been denied" in text[:300]
+            decision = decided[0] if decided is not None else ("denied" if denied else "allowed")
+            raw = call.args.get("command") if call is not None else _what(name, given)
+            shown = flat(self._shown(str(raw)), 200)
+            cwd = str(call.args.get("cwd")) if call is not None else (
+                self.shell.path if self.shell is not None else "")  # fmt: skip
+        write = call is not None and call.verdict.kind == "write"
+        status = "error" if error else "ok"
+        exit_code = _EXIT.match(text)
+        with atomic(self.conn):
+            audit(self.conn, TOOL_ACTION, task_id=self.task.id, requested_by=self.principal,
+                  trace_id=self.task.trace_id, tool=flat(name, 64), decision=decision,
+                  command=shown, cwd=cwd, status=status, write=write,
+                  exit=int(exit_code.group(1)) if exit_code else None)  # fmt: skip
+        with self._spans("runner.ask.brain_tool", tool=flat(name, 64), decision=decision,
+                         status=status, write=write):  # fmt: skip
+            pass
+        policy, shell = self.policy, self.shell
+        if name == "Bash" and policy is not None and shell is not None:
+            command = given.get("command")
+            if isinstance(command, str):
+                if not error:
+                    shell.path = policy.cwd_after(command, shell.path, text)
+                elif m := _RESET.search(text):
+                    shell.path = m.group(1).strip()
+        ran = write and not error and decision in ("gate", "granted")
+        if ran and call is not None and policy is not None:
+            self.progress.append(policy.did(call.args, text))
+
     def _view(self) -> Task:
         """The ask task as it is stored now (the session's pid and marker included), so a
         pinned call's checkpoint keeps them."""
@@ -390,6 +619,42 @@ class ClaudeTools:
             return killswitch.is_paused(self.conn)
         except killswitch.PausedStateUnknownError:
             return True
+
+
+_EXIT = re.compile(r"Exit code (\d+)")
+_RESET = re.compile(r"Shell cwd was reset to (/[^\n]+)")
+
+
+def _allow(given: dict[str, Any]) -> tuple[str, bool]:
+    """Claude Code's answer to a permission request: run it as asked."""
+    return json.dumps({"behavior": "allow", "updatedInput": given}), False
+
+
+def _deny(message: str) -> tuple[str, bool]:
+    return json.dumps({"behavior": "deny", "message": message}), False
+
+
+def _result_text(content: Any) -> str:
+    """A tool result's text (a string, or text blocks), clipped."""
+    if isinstance(content, str):
+        return content[:SHELL_RESULT_CHARS]
+    parts: list[str] = []
+    if isinstance(content, list):
+        for c in cast(list[Any], content):
+            if isinstance(c, dict):
+                t = cast(dict[str, Any], c).get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+    return "\n".join(parts)[:SHELL_RESULT_CHARS]
+
+
+def _what(name: str, given: dict[str, Any]) -> str:
+    """What a pre-allowed tool call touched: a command, a path, a pattern or a URL."""
+    for key in ("command", "file_path", "notebook_path", "path", "pattern", "url", "query"):
+        v = given.get(key)
+        if isinstance(v, str):
+            return v
+    return name
 
 
 def _shows_outside(spec: ToolSpec, outcome: CallOutcome) -> bool:
@@ -514,7 +779,9 @@ class McpServer:
                         tools = self.idle_listing() if self.idle_listing is not None else []
                     await _write(writer, {"id": rid, "tools": tools})
                 elif op == "call":
-                    if bound is None:
+                    if bound is None and req.get("name") == PERMISSION:
+                        text, error = _deny(NOT_BOUND)
+                    elif bound is None:
                         text, error = NOT_BOUND, True
                     else:
                         try:

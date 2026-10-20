@@ -83,11 +83,14 @@ NAMES = {
     "remember",
     "forget",
     "ask_claude",  # L0 read: queues a read-only Claude session (BR-5)
+    "shell",  # PER-258: the Claude brain's own changes, internal (never offered to a model)
+    "shell_read",
 }
 # Builtins with a side effect, and their registered levels; every other builtin is an L0 read.
 WRITES = {
     "create_watch": Level.L2,
     "cancel_watch": Level.L3,
+    "shell": Level.L2,
     "add_note": Level.L3,
     "delete_note": Level.L3,
     "clear_notes": Level.L1,

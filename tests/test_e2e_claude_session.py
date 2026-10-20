@@ -260,8 +260,12 @@ async def test_follow_ups_go_into_the_same_session_and_see_prior_context(
         assert "--session-id" in argv and "--resume" not in argv
         assert "--no-session-persistence" not in argv and "--max-turns" not in argv
         assert "--strict-mcp-config" in argv and argv[argv.index("--tools") + 1] == (
-            "Read,Grep,Glob,WebSearch,WebFetch"
-        )  # the same read-only built-ins as a one-shot ask
+            "Bash,Edit,Write,NotebookEdit,Read,Grep,Glob,WebSearch,WebFetch"
+        )  # PER-258: the full file, shell and web built-ins, every prompt to Resonant
+        assert "--restricted" not in argv and argv[argv.index("--permission-mode") + 1] == "default"
+        assert argv[argv.index("--permission-prompt-tool") + 1] == "mcp__resonant__permission"
+        assert argv[argv.index("--setting-sources") + 1] == ""
+        assert "Bash(git rev-list:*)" in argv[argv.index("--allowedTools") + 1].split(",")
         assert "mcp__resonant__add_note" in argv[argv.index("--allowedTools") + 1]
         # the follow-up is a second message into the same process, which saw the first
         _, answer = await _hard(w, "and how do I fix it?", answer="You asked: {prev} ({n})")

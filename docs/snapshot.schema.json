@@ -80,9 +80,79 @@
       "title": "Approvals",
       "type": "object"
     },
+    "BrainActivity": {
+      "additionalProperties": false,
+      "description": "PER-258: the Claude brain's tool calls today (``settings.timezone``), counts only, so\nthe remote tier has them too: every call, and the changes that ran.",
+      "properties": {
+        "calls_today": {
+          "title": "Calls Today",
+          "type": "integer"
+        },
+        "writes_today": {
+          "title": "Writes Today",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "calls_today",
+        "writes_today"
+      ],
+      "title": "BrainActivity",
+      "type": "object"
+    },
+    "BrainTool": {
+      "additionalProperties": false,
+      "description": "PER-258: one of the Claude brain's tool calls (its ``brain.tool`` audit row).",
+      "properties": {
+        "at": {
+          "format": "date-time",
+          "title": "At",
+          "type": "string"
+        },
+        "command": {
+          "title": "Command",
+          "type": "string"
+        },
+        "cwd": {
+          "title": "Cwd",
+          "type": "string"
+        },
+        "decision": {
+          "title": "Decision",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "error"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "tool": {
+          "title": "Tool",
+          "type": "string"
+        },
+        "write": {
+          "title": "Write",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "at",
+        "tool",
+        "decision",
+        "command",
+        "cwd",
+        "status",
+        "write"
+      ],
+      "title": "BrainTool",
+      "type": "object"
+    },
     "ClaudeBrain": {
       "additionalProperties": false,
-      "description": "BR-11: the Claude brain's session (local tier only, like the rest of the claude\ndetails): up or down, its turns, and its Remote Control link while one is on.",
+      "description": "BR-11: the Claude brain's session (local tier only, like the rest of the claude\ndetails): up or down, its turns, its Remote Control link while one is on, and its last\ntool calls (PER-258).",
       "properties": {
         "remote_url": {
           "anyOf": [
@@ -104,6 +174,13 @@
           ],
           "title": "State",
           "type": "string"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/BrainTool"
+          },
+          "title": "Tools",
+          "type": "array"
         },
         "turns": {
           "title": "Turns",
@@ -761,6 +838,9 @@
       ],
       "title": "Autonomy",
       "type": "string"
+    },
+    "brain_activity": {
+      "$ref": "#/$defs/BrainActivity"
     },
     "claude_brain": {
       "anyOf": [

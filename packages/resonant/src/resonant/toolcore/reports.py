@@ -20,6 +20,7 @@ DONE_NOT_APPROVED = "Not done."
 NOT_AVAILABLE_REPLY = "Not done: that tool isn't available."
 BAD_ARGS_REPLY = "Not done: invalid arguments."
 NOTE_TEXT_CHARS = 60
+SHELL_SHOWN_CHARS = 160
 
 
 def _note_saved(d: dict[str, Any]) -> str | None:
@@ -172,7 +173,22 @@ def summarize_intent(intent: Intent) -> str:
 
 # Code-built report lines for builtin side effects, keyed by tool name. Anything else
 # reports ``Done: <summary>``. A renderer returns None for a result it doesn't recognize.
+def _shell_permitted(d: dict[str, Any]) -> str | None:
+    """PER-258: the owner's yes to a Claude brain change after its turn; Claude runs it in a
+    new turn (``runners/ask.py``), and its own line says what ran."""
+    shown = d.get("shown")
+    if d.get("permitted") is not True or not isinstance(shown, str):
+        return None
+    what = clean_external(shown)[:SHELL_SHOWN_CHARS]
+    return (
+        f"Approved: `{what}`; Claude runs it now."
+        if d.get("tool") == "Bash"
+        else (f"Approved: {what}; Claude makes the change now.")
+    )
+
+
 REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
+    "shell": _shell_permitted,
     "add_note": _note_saved,
     "delete_note": _note_deleted,
     "clear_notes": _notes_cleared,
