@@ -632,6 +632,7 @@ async def test_a_run_with_no_repo_works_in_a_scratch_dir(
     assert call["env"]["GH_CONFIG_DIR"].endswith("/gh-none")  # empty: no GitHub login
     prompt = call["argv"][call["argv"].index("--append-system-prompt") + 1]
     assert "scratch directory" in prompt and "no GitHub credentials" in prompt
+    assert "/robot-surf" not in prompt  # no repo: no surf skills
     # a resumed scratch session isn't told to push or open a PR (it has neither)
     resumed = h.runner._turn_prompt(replace(run, sessions=1))  # pyright: ignore[reportPrivateUsage]
     assert "pull request" not in resumed and "closing summary" in resumed
