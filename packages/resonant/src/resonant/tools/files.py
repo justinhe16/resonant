@@ -32,7 +32,8 @@ and ``grant="files"``: owner-only unless a member's grants list ``"builtin:files
   (``WALK_MAX_FILES`` files, ``WALK_MAX_BYTES``, ``WALK_DEADLINE_S``). Every hit is
   checked against the scope again. Literal unless ``regex``; smart case.
 - ``tail_log{name?, n?, contains?}``: the last ``n`` lines of a file directly in
-  ``logs_dir`` (default ``resonant.jsonl``), formatted and scrubbed like ``recent_logs``.
+  ``logs_dir`` (default ``resonant.jsonl``), formatted and cleaned like ``recent_logs``
+  (``tools.ops.clean_line``: secrets, key-shaped tokens and home paths too).
 - ``read_transcript{code, n?}``: a run's transcript tail as ``{kind, text}`` entries,
   described and cleaned like ``runners/activity.py``.
 """
@@ -56,11 +57,10 @@ from typing import Any, cast
 
 from resonant.config import DEFAULT_READ_DENY, Settings
 from resonant.executor import ToolFailed, ToolHandler
-from resonant.redact import REDACTED
+from resonant.redact import REDACT_SLACK, REDACTED, redact_secrets
 from resonant.runners import activity
 from resonant.tools.base import BuiltinContext
-from resonant.tools.ops import LOG_FILE, LOG_LINE_MAX, log_line
-from resonant.tools.ops import scrub as scrub_handles
+from resonant.tools.ops import LOG_FILE, clean_line, log_line
 from resonant_sdk import Effect, ToolSpec
 
 GRANT = "files"  # members: grants: {"builtin:files": [request]}
@@ -98,43 +98,6 @@ TRANSCRIPT_MAX = 50
 SAID_MAX = 400
 RESULT_MAX = 200
 RUN_CODE = re.compile(r"R([1-9][0-9]{0,8})", re.ASCII | re.IGNORECASE)
-
-_SECRET_SCRUBS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----.*?"
-                r"(?:-----END [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|\Z)", re.DOTALL), REDACTED),
-    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-                r"|sk-[A-Za-z0-9_-]{20,}|xox[abprse]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}"
-                r"|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{36}"
-                r"|lin_api_[A-Za-z0-9]{20,}|sb_secret_[A-Za-z0-9_-]{10,})"), REDACTED),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), REDACTED),
-    (re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{12,}"), rf"\1\2{REDACTED}"),
-    (re.compile(r"(\b[a-z][a-z0-9+.-]{0,31}://)[^/\s@'\"]{1,256}@"), rf"\1{REDACTED}@"),
-    # A credential-named key (``GITHUB_TOKEN``, ``"password"``, ``api_key``) with a literal
-    # value: quoted, or a bare token with both a letter and a digit. Calls are left alone.
-    # Every run is bounded, so a long ``a.a.a.…`` line stays linear.
-    (re.compile(r"(?i)\b([A-Za-z0-9_.-]{0,40}(?:password|passwd|pwd|secret|secret[_-]?key|token"
-                r"|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)[\"']?)"
-                r"(\s*[:=]\s*)(\"[^\"\n]{4,256}\"|'[^'\n]{4,256}'"
-                r"|(?=[A-Za-z0-9._~+/=-]{0,256}[0-9])(?=[A-Za-z0-9._~+/=-]{0,256}[A-Za-z])"
-                r"[A-Za-z0-9._~+/=-]{8,256}(?=[\s,;)}\]\"']|$))"), rf"\1\2{REDACTED}"),
-    # A password or secret with any bare value of 6+ characters (no digit needed).
-    (re.compile(r"(?i)\b([A-Za-z0-9_.-]{0,40}(?:password|passwd|secret)[\"']?)(\s*[:=]\s*)"
-                r"(?![\"']|\[redacted\])[^\s,;)}\]\"'(]{6,256}(?=[\s,;)}\]\"']|$)"),
-     rf"\1\2{REDACTED}"),
-)  # fmt: skip
-
-
-REDACT_SLACK = 256  # text past a clip that is still scanned, so a secret across it is seen
-
-
-def redact_secrets(text: str) -> str:
-    """Credential-shaped text replaced by ``[redacted]``. Pattern-based: the read tools
-    don't know the values (``redact.Redactor`` is for known ones). Callers bound the text
-    (``redact_clip``); the patterns are linear but not free."""
-    for pattern, repl in _SECRET_SCRUBS:
-        text = pattern.sub(repl, text)
-    return text
-
 
 _KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----")
 _KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----")
@@ -770,11 +733,6 @@ def _log_names(logs_dir: Path) -> list[str]:
 LOG_RAW_MAX = 64 * 1024  # a longer record is parsed as text, not JSON
 
 
-def _log_clean(text: str) -> str:
-    """``log_line``'s hook: bounded before the scrubs run, so a huge record stays cheap."""
-    return redact_clip(text, LOG_LINE_MAX + REDACT_SLACK)
-
-
 def tail_log(logs_dir: Path, args: Mapping[str, Any]) -> dict[str, Any]:
     tool = "tail_log"
     _known(tool, args, {"name", "n", "contains"})
@@ -803,11 +761,7 @@ def tail_log(logs_dir: Path, args: Mapping[str, Any]) -> dict[str, Any]:
     for raw in reversed(raw_lines):
         if not raw.strip():
             continue
-        line = (
-            log_line(raw[:LOG_RAW_MAX], clean=_log_clean)
-            if name.endswith(".jsonl")
-            else _clip(scrub_handles(redact_clip(raw, LOG_LINE_MAX + REDACT_SLACK)), LOG_LINE_MAX)
-        )
+        line = log_line(raw[:LOG_RAW_MAX]) if name.endswith(".jsonl") else clean_line(raw)
         if needle is not None and needle not in _fold(line):
             continue
         lines.append(line)

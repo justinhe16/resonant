@@ -170,7 +170,7 @@ The owner can run the Mini remotely, keep notes and reminders, and see all work 
 | `restart_resonant` | L2 | `/restart resonant` | Delayed self-restart (D8) |
 | `update_resonant` | L2 | `/update` | D8 |
 | `system_status` (existing) | L0 | `/disk` | Renders only the `disk` part |
-| `recent_logs` `{n ≤ 20}` | L0 | `/logs [n]` | Tail of `logs/resonant.jsonl`. URLs → `<url>`, emails and phones → `<handle>`, at most 300 chars a line. |
+| `recent_logs` `{n ≤ 20}` | L0 | `/logs [n]` | Tail of `logs/resonant.jsonl`. URLs → `<url>`, emails and phones → `<handle>`, at most 300 chars a line. *(PER-260: also secrets, key-shaped tokens and home paths.)* |
 | `projects` `{all?: bool}` | L0 | `/projects`, `/projects all` (`/tasks` aliases it) | D9 |
 | `list_commands` | L0 | `/help` | From the registry (D5) |
 
