@@ -469,6 +469,39 @@ def test_a_batch_is_one_row(db: sqlite3.Connection) -> None:
     assert remote.model_dump(mode="json")["approvals"] == {"open": 3}
 
 
+def test_a_batch_row_expires_with_its_first_expiry(db: sqlite3.Connection) -> None:
+    now = utcnow().replace(microsecond=0)
+    task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    a = _approval(db, task, 1, Level.L3, now - timedelta(minutes=5))
+    b = _approval(db, task, 2, Level.L2, now - timedelta(minutes=10))  # expires first
+    ap.insert_batch(db, "justin", [a, b], now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
+    [row] = s.model_dump(mode="json")["approvals"]["items"]
+    assert row["code"] == "C1"  # the batch's first approval's, though C2 is older
+    assert row["level"] == "L2"
+    assert datetime.fromisoformat(row["expires_at"]) == now + timedelta(minutes=20)
+
+
+def test_a_split_batch_shows_what_is_left_as_lone_rows(db: sqlite3.Connection) -> None:
+    """A batch with an approval decided on its own can't be answered as one: what is left
+    of it shows as lone rows, never as a batch under a code that no longer binds."""
+    now = utcnow().replace(microsecond=0)
+    task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    a = _approval(db, task, 1, Level.L3, now - timedelta(minutes=5))
+    b = _approval(db, task, 2, Level.L2, now - timedelta(minutes=4))
+    c = _approval(db, task, 3, Level.L3, now - timedelta(minutes=3))
+    ap.insert_batch(db, "justin", [a, b, c], now)
+    ap.expire_one(db, a, now, reason="test")
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
+    d = s.model_dump(mode="json")
+    assert d["approvals"]["open"] == 2
+    assert [(i["code"], i["summary"]) for i in d["approvals"]["items"]] == [
+        ("C2", f"change 2 {SECRET}"),
+        ("C3", f"change 3 {SECRET}"),
+    ]
+    assert all("changes" not in i for i in d["approvals"]["items"])
+
+
 def test_empty_db(db: sqlite3.Connection) -> None:
     settings = load_settings()
     s = build_snapshot(db, settings, started_at=utcnow(), version="0.1.0")

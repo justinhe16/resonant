@@ -566,14 +566,17 @@ def _approval_items(
     """``pending`` (oldest first) as what one answer decides: each lone approval, and each
     batch (BA-1) once, where its oldest pending approval is. Approving any approval of a batch
     approves all of it, so it is one row. A batch's code is its first approval's and its
-    changes are in its order (both as its prompt showed them); it expires as one."""
+    changes are in its order (both as its prompt showed them); it expires as one. A batch
+    whose approvals aren't all pending any more (one decided on its own: a race) can't be
+    answered as one (the gate's ``_units``; the runner drops the rest), so what is left of it
+    shows as lone rows, never under a code that no longer binds."""
     index = approvals.batches_of(conn, [a.id for a in pending])
     by_id = {a.id: a for a in pending}
     out: list[ApprovalItem] = []
     seen: set[str] = set()
     for a in pending:
         batch = index.get(a.id)
-        if batch is None:
+        if batch is None or any(i not in by_id for i in batch.approval_ids):
             out.append(
                 ApprovalItem(
                     code=a.code,
@@ -587,7 +590,7 @@ def _approval_items(
         if batch.id in seen:
             continue
         seen.add(batch.id)
-        members = [by_id[i] for i in batch.approval_ids if i in by_id]
+        members = [by_id[i] for i in batch.approval_ids]
         out.append(
             ApprovalItem(
                 code=members[0].code,
