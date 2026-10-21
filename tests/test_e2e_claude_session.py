@@ -775,11 +775,33 @@ async def test_the_next_turn_gets_what_resonant_texted_since_the_last_one(
         _, answer = await _hard(w, "What happened? Why the failure", answer="The token.")
         assert answer == "Claude: The token."
         prompt = w.session()["prompt"]
-        assert prompt.startswith("Resonant texted the owner itself since your last turn")
-        assert "<since_last>" in prompt and "Couldn't merge PR #121" in prompt
+        assert prompt.startswith("Since we last spoke")
+        assert "<since_last>" in prompt and "Resonant texted: " in prompt
+        assert "Couldn't merge PR #121" in prompt
         assert prompt.endswith("What happened? Why the failure")
         await _hard(w, "ok thanks", answer="Sure.")
         assert "<since_last>" not in w.session()["prompt"]  # shown once
+
+
+async def test_a_text_answered_locally_between_two_hand_offs_is_in_the_next_delta(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-270: the session sees the whole thread, not only system texts: what the owner
+    asked qwen and what qwen said, in order, and never its own answers."""
+    async with start(resonant_home, chat, tmp_path) as w:
+        await _hard(w, "why is R3 slow?", answer="R3 ran out of disk.")
+        w.model.triage = LOCAL
+        w.model.push("mycelium is in ~/code.")
+        await w.say("where is mycelium?")
+        await _hard(w, "and R3 now?", answer="Fine now.")
+        prompt = w.session()["prompt"]
+        assert prompt.startswith("Since we last spoke")
+        assert (
+            "Owner: where is mycelium?" in prompt and "Resonant: mycelium is in ~/code." in prompt
+        )
+        assert prompt.index("Owner: where is mycelium?") < prompt.index("Resonant: mycelium")
+        assert "ran out of disk" not in prompt and "why is R3 slow?" not in prompt
+        assert prompt.endswith("and R3 now?")
 
 
 async def test_a_claude_answer_asking_for_a_yes_with_nothing_pending_is_trimmed(

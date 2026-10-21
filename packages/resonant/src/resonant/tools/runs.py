@@ -19,7 +19,8 @@ at call time: the runner is built after the tools are registered) and return cod
   the model does when the owner asks to hear right away; docs/employee-plan.md D5, EM-6).
 - ``list_runs{code?}``: L0, active runs first. Run codes (``R3``) are not approval codes: the
   model sees them, never an approval code. Free text from Claude (summary, failure) is
-  cleaned and clipped.
+  cleaned and clipped. ``known`` (PER-270): the owner was already texted how the run ended
+  (its pulse item is told), so it is not news. ``list_tasks`` is unchanged.
 - ``run_activity{code?, repo?, minutes?}``: L0 (TR-1). What a run is doing now, from its
   transcript's tail (``ClaudeRunner.run_activity``, ``runners/activity.py``): a code-built
   ``headline``, the step, the last few commands (redacted at write time, cleaned and
@@ -57,6 +58,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.gate.codes import clean_external
 from resonant.gate.types import Intent
+from resonant.store import pulse as pulse_store
 from resonant.store import repos as repos_store
 from resonant.store import runs as runs_store
 from resonant.tools.base import BuiltinContext
@@ -166,7 +168,8 @@ START_RUN = ToolSpec(
 LIST_RUNS = ToolSpec(
     name="list_runs",
     description=(
-        "Claude runs, active ones first: code, name (code and repo), status, ask and PR. "
+        "Claude runs, active ones first: code, name (code and repo), status, ask and PR; "
+        "known: true means the owner was already told how it ended. "
         "Give `code` for one run. Read only."
     ),
     args_schema={
@@ -452,6 +455,15 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         return {"started": True, "code": started.code, "repo": started.repo or None,
                 "text": started.text}  # fmt: skip
 
+    def _known(conn: sqlite3.Connection, code: str) -> bool:
+        """PER-270: the owner was already texted how this run ended (its pulse item is
+        cleared and told at its current version): not news, don't announce it again."""
+        try:
+            item = pulse_store.get(conn, "core", pulse_store.run_key(code))
+        except sqlite3.Error:
+            return False
+        return item is not None and item.cleared and item.known
+
     async def _list_runs(args: dict[str, Any]) -> dict[str, Any]:
         unknown = set(args) - {"code"}
         if unknown:
@@ -473,7 +485,9 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             shown, total = found[:RUNS_MAX], len(found)
         asked = {q.run_code: q.question for q in claude.open_questions()}
         out: dict[str, Any] = {
-            "runs": [run_json(r, asked.get(r.code)) for r in shown],
+            "runs": [
+                {**run_json(r, asked.get(r.code)), "known": _known(ctx.conn, r.code)} for r in shown
+            ],
             "count": total,
             "truncated": code is None and total > RUNS_MAX,
             "code": code,

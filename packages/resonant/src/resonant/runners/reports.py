@@ -135,7 +135,7 @@ class NotifyLevel(Protocol):
 
 
 def item_key(code: str) -> str:
-    return f"run/{code.lower()}"
+    return pulse_store.run_key(code)
 
 
 def is_worker_item(item: pulse_store.Item) -> bool:

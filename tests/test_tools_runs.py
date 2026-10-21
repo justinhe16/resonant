@@ -436,6 +436,24 @@ async def test_list_runs(
         await call(components, "list_runs", {"code": "nope"})
 
 
+async def test_list_runs_marks_what_the_owner_was_already_told(
+    components: Components, runner: FakeRunner, db: sqlite3.Connection
+) -> None:
+    """PER-270: ``known`` is true once the run's end item is told at its current version."""
+    from resonant.store import pulse as pulse_store
+
+    make_run(db, status="failed")
+    make_run(db, status="failed")
+    now = utcnow()
+    for code in ("R1", "R2"):
+        _c, item = pulse_store.upsert(db, "core", pulse_store.run_key(code), f"{code} failed",
+                                      "normal", None, True, 3600, now)  # fmt: skip
+        if code == "R1":
+            pulse_store.mark_told(db, [item], now)
+    out = await call(components, "list_runs", {})
+    assert {r["code"]: r["known"] for r in out["runs"]} == {"R1": True, "R2": False}
+
+
 async def test_list_runs_lists_what_workers_cant_do_yet(
     components: Components, runner: FakeRunner, db: sqlite3.Connection
 ) -> None:
