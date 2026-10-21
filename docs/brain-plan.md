@@ -64,6 +64,34 @@ Group chats; a generic "run any program" tool (programs are extensions); writes 
 
 ## 6. As built
 
+### PER-262: Claude brain session upkeep and CLI probes (2026-10-21)
+
+Operational gaps in the long-lived session (BR-11, BR-10, BR-5). Contracts in [`interfaces.md`](interfaces.md#the-claude-brain-resonantrunnersclaude_session-br-11); known limits in [`limits.md`](limits.md#brain-and-claude-session).
+
+- **A pause from outside.** `/kill` in the daemon stops the session through a pause hook, but `resonant pause` from the CLI writes kv `paused` from another process, where no hook fires. A live session now checks the stored flag every `brain.claude_session.pause_check_s` (5 s; unknown counts as paused) and, when idle, stops the RC-1 way (the id kept). A turn in flight already saw the pause on its own 0.25 s poll.
+- **No polling.** A queued turn waited one second (`Wait(…, +1 s)`) and looked again each second. Now the turn ahead wakes it: when a session turn's step ends, the next waiting session turn is set `queued` (`expect=waiting`), and the wakeup every finished step sets dispatches it at once (measured in the e2e test: well under 100 ms from the step's end to the next turn going in). The wait is a 30 s backstop; a turn that looked while the session was idle but the one ahead was still mid-step (it took the session just now, or is sending its answer) re-checks after 0.2 s, so a wake can't miss it.
+- **Startup cleanup** (`wiring.start_asks`, from `Daemon.run` before the loop resumes anything, as the worker runner's own start): the `rsn-mcp-*` bridge dirs a killed daemon left are removed, and a session process it left (pid, start time and marker in kv) is reaped at once instead of on the next turn. A bridge dir now holds an `owner` file (pid and process start time); the sweep removes this user's real dirs older than a minute whose owner is gone (or whose pid was reused), and a dir from before owner files only when nothing listens on its socket. Another live daemon's or a test's dirs stay.
+- **Old transcripts.** Claude Code keeps each session's transcript at `<HOME>/.claude/projects/<the real cwd, every non-alphanumeric as "-">/<id>.jsonl` (checked against 2.1.305's own dirs: `~/.resonant/ask/session` is `-Users-<me>--resonant-ask-session`). Rotations and restarts left the earlier ones (three on the Mini, 1.9 MB). At startup and whenever a new session starts, the brain removes `<uuid>.jsonl` files and `<uuid>/` dirs older than `brain.claude_session.transcript_days` (14; 0 keeps them) from **its own dir only**: never the current session, never a symlink, never another name (`memory/`).
+- **Rate limits** (the optional item). A `rate_limit_event` in the stream is logged with its status, window, reset and utilization (never text); a non-`allowed` one (`allowed_warning`: the limit is near) logs a warning once per window and reset, before the limit hits. The limit itself, once hit, is still read from the turn's `result` (BR-11's usage limit notice).
+- **Probe** (`scripts/probe_claude_rules.py`, Claude Code 2.1.305, haiku, the owner's login with `--setting-sources ''`, `--strict-mcp-config` and no MCP config, `--no-session-persistence`, a scratch tree under the temp dir; each verdict read from the tool results in the stream). The rules as `AskScope.deny_rules` writes them (`Read(//<path>)`, `Read(//<path>/**)`, `Read(**/<glob>)`):
+
+  | Case | Result |
+  |---|---|
+  | Read of an allowed file (control) | read |
+  | Read of a denied file, of a file under a denied dir | blocked (`File is in a directory that is denied by your permission settings.`) |
+  | Grep inside a denied dir | blocked (`Permission to read … has been denied`) |
+  | Grep over a root holding a denied dir, file, link and case variant | runs; every denied file left out (only the allowed files' lines came back) |
+  | Glob inside a denied dir | blocked |
+  | Read and Grep through a symlinked dir whose target is denied; Read of a symlink to a denied file | blocked (links are followed) |
+  | Read of `Mixed.txt` under a path rule written `mixed.txt` | blocked: path rules ignore case |
+  | Read of `.ENV` under the glob rule `**/.env` | **read**: glob rules match by case |
+  | Read of `.EnvX` under `**/.[eE][nN][vV][xX]` | **read**: no character classes |
+  | `--max-turns 2`, stream-json, one message needing 2 sequential tool calls | `error_max_turns` (3 turns) |
+  | `--max-turns 2`, stream-json, two messages needing 1 tool call each | both `success` (2 turns each): the count is **per user message** |
+
+  So: the deny rules bind Grep and Glob and follow symlinks (nothing to change); globs don't ignore case, so `deny_rules` now writes each glob as given, in lower case, upper case and capitalized (`case_variants`: `.env*`, `.ENV*`, `.Env*`; path rules stay single); and the session sets `--max-turns` (`brain.claude_session.max_turns`, 40) since it bounds each turn, not the session. A turn past it gets the one-shot ask's `OUT_OF_TURNS` reply.
+- **Tests.** `tests/test_claude_session_upkeep.py` (the transcript sweep: old ones go, the current, newer, `memory/`, other names and symlinks stay, a linked or missing dir is left alone, only the brain's own dir, `transcript_days: 0`; the bridge sweep: a gone or reused owner and a dead legacy dir go, a live owner, a young dir, a listening legacy socket, a symlink and other names stay; the owner file; the rule list's case variants, also over `DEFAULT_READ_DENY`; a rate-limit warning once). `tests/test_e2e_claude_session.py`: a pause written straight to kv (as the CLI does) stops an idle session within the interval and keeps the id; an unpaused idle session survives the checks; a queued turn goes in under 0.3 s after the step ahead ends (the backstop is 30 s); startup reaps a planted leftover session process and removes a dead bridge dir, keeping the id; `Daemon.run` calls `start_asks`; the session argv carries `--max-turns 40`.
+
 ### PER-268: texts that tell the truth (2026-10-20)
 
 The incident: R4 merged PR #121 as asked and got "⚠ pushed directly to main" plus "failed"; a chat `merge_pr` failed as "exit 1" with the reason only in `audit_log`; "why the failure?" got an answer about R3; qwen looped "Approve it now?" with nothing pending. Contracts in [`interfaces.md`](interfaces.md#brain-context-and-memory-resonantbrain-br-4-migration-015) (system texts, the approval guard), the Claude runner's one end text, the gate's `approval_summary` and the executor's failure reason; limits in [`limits.md`](limits.md).
