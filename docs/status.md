@@ -52,9 +52,9 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 | Who | Tickets |
 |---|---|
 | Owner | PER-252 phone tests, PER-253 mycelium by text, PER-265 design decisions (webhooks, worker text in the briefing, nudges, bare yes/no, `/update` trust) |
-| Build | PER-254 batch as one dashboard row, PER-255 `yes 1,3`, PER-256 retire intents, PER-259 store upkeep, PER-260 ops and inbound hardening, PER-261 approvals polish, PER-262 Claude session upkeep, PER-263 relay snapshot, PER-264 small gaps, PER-266 pulse wording |
+| Build | PER-256 retire intents (after the owner eval set), PER-264 small gaps (its turn budget after PER-256) |
 
-Order: 254 → 255 → 261 → 266, and 254 → 263. PER-264's turn budget lands after PER-256.
+**Merged 2026-10-21, not yet deployed** (overnight fan, #124–#131): PER-254 batch as one dashboard row, PER-260 ops/inbound hardening, PER-259 store upkeep (migration 020, daily prune), PER-255 `yes 1,3`, PER-262 Claude session upkeep, PER-263 relay snapshot, PER-261 approvals polish (migration 021, expiry reminders), PER-266 pulse wording. Deploy: back up first (schema 19 → 21), then `uv sync` and kickstart. PER-263 also needs its Supabase migration applied and a Fly redeploy, both with the owner's OK.
 
 **Roadmap after 6b:** 5b Slack → 6 on-call → 7 life lane (Gmail, browser, computer use). One card per phase on the Roadmap tab of `architecture.html`.
 
