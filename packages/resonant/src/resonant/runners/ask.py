@@ -69,7 +69,7 @@ is a turn of one long-lived session (``runners/claude_session.py``) instead of i
 ``claude -p``: ``enqueue`` marks it ``session``, and the step writes the message into the
 session and waits for its ``result``. The task is otherwise the same ask (the bridge, bound to
 the session's MCP server for this turn only; the approvals; the reply; the history note).
-One turn at a time: the others wait in order (``Wait("usage_reset")``, polled), at most
+One turn at a time: the others wait in order (``Wait("resource")``, polled), at most
 ``queue_max`` behind the one in flight (past it, ``enqueue`` refuses with ``busy``), and
 ``Queued.after`` names what is ahead for the ack. A turn starts tainted when the asking turn
 was or the session's last turn was tainted within the hop window (``inherited_hops``);
@@ -1131,11 +1131,11 @@ class AskRunner:
             queue = self._session_queue()
             if self.brain.busy or not queue or queue[0][0] != task.id:
                 wake = self.clock() + timedelta(seconds=SESSION_POLL_S)
-                return Wait("usage_reset", cp, wake)
+                return Wait("resource", cp, wake)
             return await self._ask(task, ctx, cp, question, kind)
         if len(self._working) >= self.cfg.concurrency:
             wake = self.clock() + timedelta(seconds=self.defer_s)
-            return Wait("usage_reset", cp, wake)  # the only "come back later" reason there is
+            return Wait("resource", cp, wake)  # a busy slot, not a usage limit
         self._working.add(task.id)
         try:
             return await self._ask(task, ctx, cp, question, kind)
