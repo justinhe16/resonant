@@ -322,7 +322,7 @@ const GROUPS = [
    desc:"How a running worker and the owner talk. The worker calls resonant ask, note and check over its run's socket. The relay routes the owner's replies and \"tell R4 …\" messages to the right worker. Trust rules decide which checks ask the owner. Worker reports go out now or in the hourly digest, by urgency.",
    children:["worker_cli","relay","trust_rules","reports"]},
   {id:"extensions", col:2, title:"Extensions", sub:"resonant.yaml · separate repos", icon:"puzzle",
-   desc:"Product logic lives in extensions: first-party ones in this repo (github, the example) today, separate repos (trade-jev, dori, life lane) later. Phase 3 installs only first-party code, from the Mini's terminal. Each one plugs in through a strictly validated manifest and runs in its own process, so a crash never takes down the core.",
+   desc:"Product logic lives in extensions: first-party ones in this repo (github, the example) today, separate repos (mycelium today; trade-jev, dori) later. Phase 3 installs only first-party code, from the Mini's terminal. Each one plugs in through a strictly validated manifest and runs in its own process, so a crash never takes down the core.",
    children:["manifest","extadd","tools_cli","tools_mcp","critjobs"]},
   {id:"gatex", col:4, title:"Gate & Executor", sub:"every side effect passes here", icon:"shield",
    desc:"Every tool call enters through the tool core (TC-1), which checks permissions first, then the level gate, then executes. The executor is the only component that touches secrets. Every action is audited.",
@@ -355,12 +355,12 @@ sqlite3 "file:~/Library/Messages/chat.db?mode=ro"
   text NULL → parse attributedBody (typedstream)`,
     inv:["Self-message guards: only rows with is_from_me = 0 are read, Resonant's own handle is skipped before routing, and self-test messages carry a nonce that only the self-test checker consumes","SMS rows are dropped, because SMS sender IDs can be spoofed","Unknown handles are dropped and audited (imessage.unknown_sender)","Sends are deduped (reply:<task id>), rate-limited per principal, and serialized","A watch on chat.db-wal triggers reads (250ms check, 100ms debounce), with 2s polling as a fallback","Self-test: send a nonce to Resonant's own Apple ID and read the row back; the health monitor runs it and alerts over iMessage or the dead-man /fail","Tests use a FakeChatDB fixture and a fake OsaRunner; bodies never reach logs or audit rows","Needs Full Disk Access (on a pinned interpreter path) plus Automation permission for Messages"],
     files:["packages/resonant/src/resonant/gateway/imessage/reader.py","packages/resonant/src/resonant/gateway/imessage/sender.py","packages/resonant/src/resonant/gateway/imessage/channel.py","packages/resonant/src/resonant/wiring.py","tests/test_e2e.py"]},
-  slack:{label:"Slack channel", phase:"5 (5A)", status:"planned",
+  slack:{label:"Slack channel", phase:"8", status:"planned",
     what:"A two-way channel for both principals: requests, approval buttons, and incident threads. It is the co-founder's only channel and the owner's fallback if iMessage breaks.",
     iface:`slack-bolt · Socket Mode (no inbound port)
 identity  = "slack:<user id>"  → principals.yaml
 approvals = buttons (non-pay) · typed "yes A7" for pay`,
-    inv:["A request is acted on only if it comes from the mapped Slack user ID","Pay approvals on Slack also need a typed code, not a button","Arrives at the start of Phase 5 so the co-founder can request DORI tasks"],
+    inv:["A request is acted on only if it comes from the mapped Slack user ID","Pay approvals on Slack also need a typed code, not a button","Phase 8 (Slack coworker), after trading"],
     files:[]},
   webhook:{label:"Webhook endpoint", phase:"later", status:"planned",
     what:"A generic inbound endpoint for machine events.",
@@ -545,11 +545,11 @@ list_repos (L0) · add_repo, forget_repo (L3) · create_repo, add_ci, merge_ci_p
     inv:["Ambiguous is a question (Which repo? a, b, c), never a guess","add_repo and forget_repo change only Resonant's list; anything that acts on GitHub asks a plain yes from chat and runs when typed","The add-CI merge is stricter than a run's merge: only the hash-checked starter file, green CI on the PR","Historical: docs/repos-plan.md waves RP-2, RP-3, RP-6, RP-7 were replaced by the employee plan; runner.repos is no longer the required list"],
     links:[{to:"runner_claude",label:"checkout for"}],
     files:["packages/resonant/src/resonant/store/repos.py","packages/resonant/src/resonant/runner/resolve.py","packages/resonant/src/resonant/runner/create.py","packages/resonant/src/resonant/tools/repos.py","tests/test_repos_store.py","tests/test_repo_create.py"]},
-  runner_cu:{label:"Computer-use runner", phase:"7", status:"planned",
-    what:"Browser and host computer use in the Mini's auto-login GUI session. It is used by the life lane (Gmail, Calendar, iMessage, payments).",
+  runner_cu:{label:"Computer-use runner", phase:"9", status:"planned",
+    what:"Browser and host computer use in the Mini's auto-login GUI session. Last on the roadmap (Phase 9). No email.",
     iface:`gate.approve_scope(scope) -> scope_id   # declared scope, approved at L1
 commit actions (send / pay / delete): pause + screenshot → approval`,
-    inv:["Each task declares a scope that the owner approves","The runner always pauses before a commit action","Payments use a capped virtual card and are permanently L1","Core supplies the generic cu runner, Scope, and commit-pause. The life lane's wiring stays in a private repo"],
+    inv:["Each task declares a scope that the owner approves","The runner always pauses before a commit action","Payments use a capped virtual card and are permanently L1","Core supplies the generic cu runner, Scope, and commit-pause. Task-specific wiring stays in private repos"],
     files:[]},
   ollama:{label:"Ollama (LaunchAgent)", phase:"0 / 1", status:"built",
     what:"The local model server, running qwen3:30b-a3b-instruct-2507 (Q4, non-thinking), and the ModelClient over it. It is the brain's model; workers can reach Ollama's port too (the thin guard leaves it open). The client defaults to Ollama's native /api/chat (think: false); the OpenAI-compatible /v1 adapter keeps an MLX swap a config change.",
@@ -810,14 +810,16 @@ const PHASES = [
    items:["Local dashboard; remote copy via Supabase + Fly","Dead-man phone alert; MCP extensions (Linear)"]},
   {n:"6a", title:"Brain", status:"built", done:16, total:16,
    items:["qwen triages; hard asks go to one long-lived Claude session","Tool core: one call path through the gate","Taint for outside text, backups, batch approvals"]},
-  {n:"6b", title:"Harden and prove", status:"partial", done:7, total:20,
-   items:["Claude brain gets full tools, changes approved by text","Evals on Claude's answers and real texts","Phone tests and a dogfood setup by text"]},
-  {n:"5b", title:"Slack", status:"planned",
-   items:["Two-way Slack, like iMessage"]},
-  {n:6, title:"On-call", status:"planned",
-   items:["Incidents from Slack, runbooks, forward-fix and auto-revert"]},
-  {n:7, title:"Life lane (private)", status:"planned",
-   items:["Gmail read and draft, browser, computer use"]},
+  {n:"6b", title:"Harden and prove", status:"partial", done:21, total:26,
+   items:["One conversation for both brains; qwen only routes, Claude is the one brain","Evals on Claude's answers and real texts","Phone tests and mycelium set up by text"]},
+  {n:7, title:"Trading (trade-jev)", status:"planned",
+   items:["trade-jev as an extension: positions, P&L and fills as read tools, events, kill switch","Automatic trading inside trade-jev with its own risk limits; orders never go through the loop or gate","Critical jobs (own LaunchAgent + job-guard) and HTTP emit, built for it"]},
+  {n:8, title:"Slack coworker", status:"planned",
+   items:["Two-way Slack, like iMessage: requests, approvals, threads","Acts as a teammate in channels"]},
+  {n:9, title:"Browser + computer use", status:"planned",
+   items:["Scoped browser and computer use, pause before any commit action","Last on the list; no email"]},
+  {n:"later", tag:"PARKED", title:"On-call", status:"planned",
+   items:["Parked: incidents, runbooks, forward-fix and auto-revert"]},
 ];
 
 /* ------------------------------------------------------------- helpers */
@@ -1245,7 +1247,7 @@ function drawTrust(){
   };
   zone(16, 16, 250, 348, "Untrusted content", "never grants anything");
   box(32, 62, 218, "message text", "iMessage / Slack bodies");
-  box(32, 120, 218, "emails · web pages", "life lane, browser");
+  box(32, 120, 218, "web pages", "browser (Phase 9)");
   box(32, 178, 218, "tool output · worker text", "CLI results · asks, notes, checks");
   box(32, 236, 218, "extension events", "emit() payloads");
   box(32, 294, 218, "LLM output", "brain / worker proposals");
@@ -1267,7 +1269,7 @@ function drawTrust(){
   zone(1028, 16, 290, 348, "Outside the core path", "");
   box(1044, 62, 258, "trade-jev order execution", "never via loop or gate");
   box(1044, 120, 258, "daemon-only GitHub tokens", "runner/github_token · public_repo");
-  box(1044, 178, 258, "private repos", "trade-jev · dori · life lane");
+  box(1044, 178, 258, "private repos", "mycelium · trade-jev · dori");
   box(1044, 236, 258, "public repo", "core · SDK · first-party · example");
   box(1044, 294, 258, "secrets", "Keychain only · gitleaks in CI");
 

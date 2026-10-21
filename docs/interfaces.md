@@ -346,7 +346,7 @@ MAX_COMMENTS_LEN = 500
 **Deferred** (C4): the approval classifier and `resonant eval approvals`. `ApprovalReply.path` is always `"parser"` for now. With several approvals pending, a plain `yes` gets a re-ask that lists the codes (a batch as one). The design kept for later:
 - **Classifier**, only if the parser fails. It is separate from the router and uses a small, focused prompt. Its input is the reply text and the summary, and nothing else. Its output is `{decision: approve|deny|unclear, approval_code, comments, confidence}`. It approves only if `decision == approve` and `confidence >= 0.9`; anything else gets a re-ask.
 
-**Concurrency:** resolution is atomic (`UPDATE approvals … WHERE status = 'pending'`), so the first valid reply on any channel wins. On-call pages (Phase 6) go to iMessage and Slack together with one dedupe key; the other channel's message is updated to "resolved by X via Y".
+**Concurrency:** resolution is atomic (`UPDATE approvals … WHERE status = 'pending'`), so the first valid reply on any channel wins. On-call pages (parked) go to iMessage and Slack together with one dedupe key; the other channel's message is updated to "resolved by X via Y".
 
 **Pay:** only a parser match that includes the code (`yes P3`) counts. The classifier is never used for pay, and the same rule applies on Slack.
 
@@ -1099,7 +1099,7 @@ Every adapter must:
   - On a started channel it listens on the running reader (after its first read). Otherwise it polls a private reader with its own cursor, kv `imessage.selftest.cursor` (reset each run), so `resonant selftest imessage` can run next to a live daemon without moving `imessage.cursor`. Both readers drop self-test rows, so they are never routed or answered.
   - The health monitor runs it on its first round after start whenever it is due (no result yet, the last one older than 6h, or a failed one older than 30 min), re-runs it on that schedule, and reports failures (see Health monitor). No Slack.
 
-**Slack:** outbound notifier in Phase 1, two-way Socket Mode in Phase 5b.
+**Slack:** outbound notifier in Phase 1, two-way Socket Mode in Phase 8 (Slack coworker).
 
 ## Model client: `resonant.models`
 

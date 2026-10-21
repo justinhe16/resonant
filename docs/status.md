@@ -57,12 +57,14 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 | Owner | PER-252 phone tests, PER-253 mycelium by text, PER-265 design decisions (webhooks, worker text in the briefing, nudges, bare yes/no, `/update` trust) |
 | Build | PER-256 retire intents + qwen only routes, Claude the one brain (after the owner eval set), PER-264 small gaps (its turn budget after PER-256) |
 
-**Roadmap after 6b:** 5b Slack → 6 on-call → 7 life lane (Gmail, browser, computer use). One card per phase on the Roadmap tab of `architecture.html`.
+**Roadmap after 6b** (owner, 2026-10-21): **7 Trading** (trade-jev: automatic trading as an extension) → **8 Slack coworker** → **9 Browser + computer use** (last). No email. On-call is parked. One card per phase on the Roadmap tab of `architecture.html`. Each phase gets its Linear tickets via `/linear-surf` when it's next.
+
+**Done when 6b closes:** the three base goals: (1) spawn Claude runners by text, with reminders and working cron jobs; (2) reminders and the 08:00 briefing for the day (no calendar: it was dropped); (3) acts like a fellow employee (PER-270 one conversation, PER-256 Claude as the one brain).
 
 **Deferred:** direct MCP for the Claude brain (batch approvals covered the need). Headless `claude -p` loads no claude.ai connectors, so this would need directly configured servers.
 
 **Dropped:**
-- Calendar integration (CAL-1, PR #112 closed, 2026-10-19). Email and calendar asks get "can't reach it".
+- Calendar integration (CAL-1, PR #112 closed, 2026-10-19) and email (owner, 2026-10-21: not planned). Email and calendar asks get "can't reach it".
 - Branch protection is rolling (protect each repo as it's added); no ticket.
 
 ## Where things are

@@ -10,7 +10,7 @@ The local qwen3-30B stays the brain. The harness changes, modeled on Claude Code
 
 - **Use cases:** questions about the Mini; personal assistant (calendar, email, reminders, notes); research and the web; named programs; photos, screenshots and voice; links; long-running asks ("watch X, tell me when Y"); other people with per-person grants (today's principals model). Group chats later.
 - **Fast first, escalate:** the local loop answers; when it's stuck or the ask needs the web or an image, it hands it to a read-only Claude session and sends "looking into it…" first.
-- **Email and calendar:** dropped with CAL-1 (2026-10-19). Neither qwen nor Claude can reach them, so an email or calendar ask gets a clear "I can't reach your email/calendar" from the local model (PER-249). The Gmail read/draft plan moved to the Phase 7 life lane.
+- **Email and calendar:** dropped with CAL-1 (2026-10-19). Neither qwen nor Claude can reach them, so an email or calendar ask gets a clear "I can't reach your email/calendar" from the local model (PER-249). Email is not planned (owner, 2026-10-21).
 - **Programs:** each one a small extension with start, stop and status tools (e.g. trade-jev), not a generic runner.
 - **Memory:** recent turns plus a small store of long-term facts.
 - **Read scope:** `~/code`, `~/resonant`, Resonant's state, logs and docs, run transcripts. Never `~/Documents`, Mail, Messages, the Keychain, `~/.ssh`, `.env`-like files.

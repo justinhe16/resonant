@@ -13,7 +13,7 @@ For an interactive version, open [`architecture.html`](architecture.html), which
  Scheduler / ext emit ─┤                 (event+tick)     │     worktree of ~/code/<repo> or a scratch dir,
  Worker events ────────┘                                  │     guard off by default; resonant ask/note/check
                                                           │     over a per-run socket → worker desk
-                                                          └── runner=cu    : computer use (Phase 7)
+                                                          └── runner=cu    : computer use (Phase 9)
    worker desk ── ask ──> relay ──> owner "R4 asks: …" ──> reply routed back to R4
                ── check ─> trust rules (ok | ask: yes / yes always / no)
    run events ──> reports: now (text) | digest (hourly pulse "Workers:" rollup, with github PRs)
@@ -129,9 +129,10 @@ The owner texts Resonant like an employee ([`employee-plan.md`](employee-plan.md
 | Tool core (TC-1): one call path for every caller (`ToolCore.call` / `.resume`): the registry spec, the schema check, origin pinning and taint, `gate.evaluate`, the pinned gated call, the executor's idempotency keys, the code-built report lines and the side-effect cap; an AST test keeps `gate.evaluate` and `Executor.execute` out of every other module | `resonant/toolcore/` | TC-1 ✅ |
 | Media, links, watches, proactive (BR-7, migration 016): the chat.db reader attaches the owner's images, PDFs and voice notes (types, 20 MB and 4 per message capped; files never opened there); `runner="media"` hands an image or PDF to `ask_claude` (kind image, a code-built direct call; HEIC converted to JPEG with `sips` in the ask's folder) and a voice note to a local whisper (`brain.whisper_path`; the transcript re-enters routing as text and never approves anything), else says voice needs whisper (Claude takes no audio); links: a prompt rule sends them to `ask_claude` kind link; watches: `create_watch` (L2: asks), `list_watches`, `cancel_watch`, checked by `core/watches` every 5 minutes through `runner="watch"` (a read tool through the gate with origin `scheduled`, or a yes/no `ask_claude`), at most 10 active, every ≥15 min (asks ≥60), 7 days by default; a hit is one notice through the pulse, at most `brain.proactive_per_day` (3) texts a day on top of the hourly cap, the rest wait for the pulse or the briefing | `resonant/gateway/imessage/attachments.py`, `resonant/runners/media.py`, `convert.py`, `watch.py`, `ask.py`, `resonant/brain/watches.py`, `notices.py`, `context.py`, `resonant/tools/watches.py` | BR-7 ✅ |
 | Critical-job LaunchAgents and `job-guard` rewrite, veto windows, the Seatbelt sandbox for extension processes, iMessage `/ext add`, git and network sources, Python deps | — | Deferred ([`followups.md`](followups.md)) |
-| Two-way Slack | — | Phase 5b |
-| On-call extension | — | Phase 6 |
-| Life lane: Gmail, Calendar, iMessage, payments, browser, computer use | private repo, with core runner/scope support | Phase 7 |
+| Trading: trade-jev extension (read tools, events, kill switch; orders stay inside trade-jev with its own risk limits), plus the critical jobs and HTTP emit deferred for it | `justinhe16/trade-jev` (private) | Phase 7 |
+| Slack coworker: two-way Slack, like iMessage | — | Phase 8 |
+| Browser and computer use (no email) | core runner/scope support | Phase 9, last |
+| On-call extension | — | Parked |
 
 ## Phase 1 request path and latency
 
