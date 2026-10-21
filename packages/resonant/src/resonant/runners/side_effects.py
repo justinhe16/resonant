@@ -58,6 +58,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
+# Mirrored by ``dashboard.snapshot.EffectKind`` (an import cycle): update both.
 Kind = Literal[
     "push",
     "merge",

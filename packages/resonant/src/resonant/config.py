@@ -813,6 +813,16 @@ class ClaudeSessionConfig(_Section):
     # PER-258: a turn whose own shell changes or edits ran ends its reply with one
     # code-built "Did: ..." line (no line for reads).
     progress_texts: bool = True
+    # PER-262: how often an idle session checks whether another process (the CLI's
+    # `resonant pause`) paused Resonant; a pause stops it within this many seconds.
+    pause_check_s: float = Field(default=5.0, gt=0, le=300)
+    # PER-262: transcripts of the brain's earlier sessions (rotated, restarted) older than
+    # this many days are removed from its own ~/.claude/projects/<cwd> dir. 0: kept.
+    transcript_days: int = Field(default=14, ge=0, le=3650)
+    # PER-262: Claude's own turns (tool rounds) in one owner message; `--max-turns` counts
+    # per user message in a stream-json session (probed on 2.1.305), so it bounds a turn
+    # that loops on tools well before `turn_timeout_s`.
+    max_turns: int = Field(default=40, ge=1, le=200)
 
 
 class TriageConfig(_Section):

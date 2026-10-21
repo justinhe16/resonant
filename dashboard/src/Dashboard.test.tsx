@@ -121,6 +121,13 @@ describe("Dashboard, local tier", () => {
     expect(screen.getByText("no CI")).toBeInTheDocument();
   });
 
+  it("says how many side effects were detected per run (PER-263)", async () => {
+    mount(local);
+    expect(await screen.findByText("2 side effects detected")).toBeInTheDocument();
+    expect(screen.getByText("1 side effect detected")).toBeInTheDocument();
+    expect(screen.getAllByText(/side effects? detected/)).toHaveLength(2); // none for a run with 0
+  });
+
   it("refuses non-https PR links", async () => {
     const snap = clone(local);
     snap.runs.items![0]!.pr_url = "javascript:alert(1)";
@@ -214,6 +221,44 @@ describe("Dashboard, remote tier", () => {
     expect(screen.getByText("Pulse titles are shown on the local dashboard only.")).toBeInTheDocument();
     expect(screen.getAllByText("running").length).toBeGreaterThan(0);
     expect(screen.queryByText(/Add a dashboard job/)).not.toBeInTheDocument();
+  });
+
+  it("shows the pulse's untold count and a muted reporter (PER-263)", async () => {
+    mount(remote);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(screen.getByTestId("pulse-untold")).toHaveTextContent("2 untold");
+    expect(screen.getByTestId("pulse-muted")).toHaveTextContent("weather muted, ends in 3 h");
+    expect(screen.getAllByText("muted")).toHaveLength(1); // the weather extension's badge
+  });
+
+  it("shows detected side effects as counts (PER-263)", async () => {
+    mount(remote);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    const effects = screen.getByTestId("detected-effects");
+    expect(effects).toHaveTextContent("push1");
+    expect(effects).toHaveTextContent("merge1");
+    expect(effects).toHaveTextContent("1 high-impact");
+  });
+
+  it("works with a snapshot from before PER-263", async () => {
+    const old = clone(remote);
+    delete old.pulse.untold;
+    delete old.runs.detected;
+    for (const e of old.extensions) delete e.muted_until;
+    mount(old);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(screen.queryByTestId("pulse-untold")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pulse-muted")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("detected-effects")).not.toBeInTheDocument();
+  });
+
+  it("shows no muted badge once the mute has ended", async () => {
+    const ended = clone(remote);
+    for (const e of ended.extensions) if (e.muted_until) e.muted_until = "2026-10-16T08:00:00+00:00";
+    mount(ended);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(screen.queryByTestId("pulse-muted")).not.toBeInTheDocument();
+    expect(screen.queryByText("muted")).not.toBeInTheDocument();
   });
 });
 

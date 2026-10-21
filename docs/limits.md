@@ -32,7 +32,10 @@ What Resonant does not do, or does on purpose in a way that has a cost. Each was
 - **Images always go to Claude.** qwen3 has no vision. A local vision model could answer simple ones.
 - **A media ask's answer isn't replayed** in later turns; only answers to brain tasks are (`<claude_answer>`). Those are noted after the send and retried for about 10 s; past that they're missing from history.
 - **No daily cap by default.** `daily_cap: 0`; the runaway guard (60 an hour across the brain, one-shot asks, media and watch checks) is the only automatic stop besides Claude's own limits. Watch `ask.queued` and `ask.notice` audit counts.
-- **Live CLI behavior not checked:** whether auto-compaction keeps `--append-system-prompt`. Re-check after CLI updates.
+- **Live CLI behavior not checked:** whether auto-compaction keeps `--append-system-prompt`. Re-check after CLI updates; `scripts/probe_claude_rules.py` re-checks the deny rules and `--max-turns` (PER-262).
+- **Deny globs by case** (PER-262). Claude Code matches glob rules by case and takes no `[eE]` classes, so each glob is written as given, lower, upper and capitalized. Another mix (`.eNv`) gets past Claude's own Read, Grep and Glob; path rules ignore case, the read tools fold case, and `--add-dir` keeps Claude to the roots.
+- **An outside pause lands within `pause_check_s`** (PER-262, 5 s) for an idle session; a `/kill` in the daemon is at once.
+- **Transcript sweep** (PER-262). Only the brain's own `~/.claude/projects/<cwd>` dir, for the `HOME` the CLI runs with. The dir name follows Claude Code's naming as seen on 2.1.305; if a later CLI names it differently, the sweep finds nothing (it never guesses).
 - **Gmail tool names are a guess** (`brain.ask_claude.connector_tools.email`). Check them against the init event once Gmail reaches the session (Phase 7).
 - **Voice transcripts are chat only.** Never a command, approval or worker reply, so `/restart` or `R4 yes` must be typed. Voice approvals would need a confirmation step.
 - **Watches.** A watch's tool and args are fixed at creation, so "watch it" after a long thread depends on the model; the approval prompt shows exactly what will be checked. Checks run at most every 5 minutes, behind owner chat. Brain notices have their own hourly cap (`extensions.notify.max_per_hour`), not shared with extensions.
