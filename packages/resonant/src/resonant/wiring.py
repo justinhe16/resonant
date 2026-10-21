@@ -268,6 +268,19 @@ def _ask_runner(components: Components) -> AskRunner | None:
     return found if isinstance(found, AskRunner) else None
 
 
+async def start_asks(components: Components | None) -> None:
+    """Daemon start (PER-262), before the loop resumes anything: the ask runner's startup
+    cleanup (stale ``rsn-mcp-*`` bridge dirs, a Claude brain session a killed daemon left,
+    old brain transcripts). A failure is logged, never raised."""
+    asks = _ask_runner(components) if components is not None else None
+    if asks is None:
+        return
+    try:
+        await asks.start()
+    except Exception:
+        log.exception("ask: startup cleanup failed")
+
+
 async def close_asks(components: Components | None) -> None:
     """Shutdown (BR-11): end the Claude brain's session, RC-1's way, keeping its id for a
     ``--resume`` after the restart. A failure is logged, never raised."""
