@@ -420,10 +420,13 @@ def test_cli_help_lists_check() -> None:
 
 
 @pytest.fixture(scope="module")
-def ctx() -> Iterator[ProbeContext]:
+def ctx(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ProbeContext]:
     if sys.platform != "darwin":
         pytest.skip("Seatbelt is macOS only")
-    with probe_context(secrets_dir=Path.home() / ".resonant" / "run-secrets") as c:
+    # PER-271: a temp home, never the real one: a module fixture runs before the per-test
+    # HOME redirect, and the probes make run dirs in ~/resonant-runs and use its cache
+    home = tmp_path_factory.mktemp("probe-home")
+    with probe_context(home=home, secrets_dir=home / ".resonant" / "run-secrets") as c:
         yield c
 
 
