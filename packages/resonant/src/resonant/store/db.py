@@ -139,17 +139,30 @@ def _split_statements(sql: str) -> list[str]:
     return [s for s in statements if s]
 
 
+# A migration whose first line is exactly this rebuilds a table other tables point at (SQLite's
+# 12-step ALTER): inside a transaction ``DROP TABLE`` counts as deleting every row, which breaks
+# the children's foreign keys, and ``PRAGMA foreign_keys`` is a no-op inside one. See ``migrate``.
+FOREIGN_KEYS_OFF = "-- migrate: foreign_keys=off"
+
+
 def migrate(conn: sqlite3.Connection, migrations: list[tuple[int, str]] | None = None) -> int:
     """Apply pending migrations atomically. Idempotent and safe across processes.
 
     Each migration runs in its own BEGIN IMMEDIATE transaction. ``user_version`` is
     re-read *after* the write lock is held, so two processes starting together never
     apply the same migration twice. Any failure rolls back that migration completely.
+
+    A migration that starts with :data:`FOREIGN_KEYS_OFF` is applied with foreign-key
+    enforcement off (set before the transaction begins), then ``PRAGMA foreign_key_check``
+    must report nothing before it commits; the connection's earlier setting is restored.
     """
     for version, sql in migrations if migrations is not None else _migrations():
         if version <= schema_version(conn):
             continue
         statements = _split_statements(sql)
+        if sql.split("\n", 1)[0].strip() == FOREIGN_KEYS_OFF:
+            _apply_foreign_keys_off(conn, version, statements)
+            continue
         with transaction(conn):
             if version <= schema_version(conn):
                 continue  # another process applied it while we waited for the lock
@@ -157,6 +170,26 @@ def migrate(conn: sqlite3.Connection, migrations: list[tuple[int, str]] | None =
                 conn.execute(stmt)
             conn.execute(f"PRAGMA user_version = {version:d}")
     return schema_version(conn)
+
+
+def _apply_foreign_keys_off(conn: sqlite3.Connection, version: int, statements: list[str]) -> None:
+    was_on = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(conn):
+            if version <= schema_version(conn):
+                return  # another process applied it while we waited for the lock
+            for stmt in statements:
+                conn.execute(stmt)
+            broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if broken:
+                raise sqlite3.IntegrityError(
+                    f"migration {version:03d} left {len(broken)} foreign key violation(s), "
+                    f"first in table {broken[0][0]!r}"
+                )
+            conn.execute(f"PRAGMA user_version = {version:d}")
+    finally:
+        conn.execute(f"PRAGMA foreign_keys={'ON' if was_on else 'OFF'}")
 
 
 def open_db(path: Path | str) -> sqlite3.Connection:

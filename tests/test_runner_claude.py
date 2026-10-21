@@ -35,7 +35,7 @@ from github_app_fakes import (
 )
 
 from resonant import killswitch
-from resonant.config import GitHubAppConfig, LoopConfig, RunnerConfig, RunnerRepo
+from resonant.config import GitHubAppConfig, LoopConfig, RunnerConfig, RunnerRepo, Settings
 from resonant.extensions import pulse_job
 from resonant.gateway.channel import (
     ApprovalPrompt,
@@ -45,8 +45,9 @@ from resonant.gateway.channel import (
     SelfTestResult,
     Submit,
 )
-from resonant.loop import Loop, SlotPool
+from resonant.loop import Loop, SlotPool, Wait
 from resonant.redact import Redactor
+from resonant.router.fast_path import render_status
 from resonant.runner.cleanup import dir_size
 from resonant.runner.github_app import GitHubApp
 from resonant.runner.resolve import FakeGitHub, RepoInfo
@@ -77,6 +78,7 @@ from resonant.secrets import (
     RunnerSecrets,
     SecretStore,
 )
+from resonant.status import collect_status
 from resonant.store import pulse as pulse_store
 from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
@@ -1552,6 +1554,29 @@ async def test_the_global_limit_caps_sessions(tmp_path: Path, db: sqlite3.Connec
         await asyncio.sleep(0.02)
     await t
     assert peak == 1 and all(h.run(c).status == "ready" for c in codes)
+
+
+async def test_a_run_deferred_for_a_full_runner_waits_on_a_resource(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """PER-259: all slots busy defers with Wait("resource"), saved as waiting/resource (not a
+    usage reset), the run stays queued, and /status says it waits on a resource."""
+    h = build(tmp_path, db, scenario="happy", max_runs=1)
+    code = await h.start()
+    run = h.run(code)
+    task = task_store.get_task(h.conn, cast(str, run.task_id))
+    assert task is not None
+    h.runner._working.add("someone-else")  # pyright: ignore[reportPrivateUsage]
+    out = h.runner._defer(task, "busy")  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(out, Wait) and out.reason == "resource"
+
+    await h.loop.run_until_idle()  # the loop saves the Wait: the CHECK passes on a migrated DB
+    saved = task_store.get_task(h.conn, cast(str, run.task_id))
+    assert saved is not None and saved.status == "waiting" and saved.wait_reason == "resource"
+    assert h.run(code).status == "queued"
+    status = collect_status(h.conn, Settings())
+    assert status["waiting"] == {"resource": 1}
+    assert "waiting: 1 on a resource (all worker slots busy)" in render_status(status)
 
 
 # --- sandbox-exec-free escapes, pulse, merge, replies, cleanup --------------------------------

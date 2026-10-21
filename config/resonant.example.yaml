@@ -93,6 +93,12 @@ backup:
   #                                     #   must already exist, never created; Resonant never uploads;
   #                                     #   use a folder of its own (old copies there are pruned too)
 
+retention:
+  enabled: true                         # the daily prune (core/prune), 30 min after backup.daily_at, only after a good backup
+  events_days: 90                       # consumed events older than this (7..3650); rows still referenced are kept
+  tasks_days: 90                        # finished tasks older than this (7..3650); rows still referenced are kept
+  audit_days: 365                       # audit rows older than this (30..3650); an open task's rows are kept
+
 pulse:
   enabled: true                         # hourly "btw" messages and urgent interrupts
   quiet_hours: "00:00-06:00"            # local time in `timezone`; only urgent items go out inside it

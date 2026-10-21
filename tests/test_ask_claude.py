@@ -693,7 +693,7 @@ async def test_concurrency_waits_without_a_worker_slot(
     assert isinstance(queued, Queued)
     h.runner._working.add("someone-else")  # pyright: ignore[reportPrivateUsage]
     out = await h.runner.step(h.task(queued.task_id), [], Ctx())
-    assert isinstance(out, Wait) and out.reason == "usage_reset"
+    assert isinstance(out, Wait) and out.reason == "resource"
     assert not (h.notes / "argv.json").exists()
 
 

@@ -1823,11 +1823,11 @@ class ClaudeRunner:
             self._working.discard(run.code)
 
     def _defer(self, task: Task, why: str) -> Wait:
-        # The loop has no "resource" wait reason; usage_reset is the closest, and the run's own
-        # status (queued) is what /runs shows.
+        # A busy slot or repo lock is a `resource` wait (PER-259), not a usage reset; the run's
+        # own status (queued) is what /runs shows.
         log.info("run deferred", extra={"task": task.id, "why": why})
         return Wait(
-            "usage_reset", dict(task.checkpoint), self.clock() + timedelta(seconds=self.defer_s)
+            "resource", dict(task.checkpoint), self.clock() + timedelta(seconds=self.defer_s)
         )
 
     async def _drive(self, task: Task, run: Run, ctx: StepContext) -> StepOutcome:

@@ -382,6 +382,24 @@ class BackupConfig(_Section):
         return _hhmm_time(self.daily_at)
 
 
+class RetentionConfig(_Section):
+    """The daily store prune (``core/prune``, PER-259, ``resonant.store_upkeep``): how long
+    rows are kept before they are deleted. Runs half an hour after ``backup.daily_at`` and only
+    when a good backup is under 24 hours old. A row something still points at is never deleted
+    (an open task's events, an approval's resolving event, the brain summary's cursor event, a
+    task with approvals, runs or texts), however old it is."""
+
+    enabled: bool = True
+    # Consumed events older than this. At least 7: the github rollup reads the last 7 days of
+    # events, and the brain's recent history is read from them too.
+    events_days: int = Field(default=90, ge=7, le=3650)
+    # Finished (done, failed, cancelled) tasks not touched for this long. At least 7: the
+    # `system_texts` a task's end text is kept for 7 days, and `/projects` lists recent work.
+    tasks_days: int = Field(default=90, ge=7, le=3650)
+    # Audit rows. Longer by default and at least 30 days: it is the record of what Resonant did.
+    audit_days: int = Field(default=365, ge=30, le=3650)
+
+
 _QUIET_HOURS = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
 
 
@@ -949,6 +967,7 @@ class Settings(BaseSettings):
     secrets: SecretsConfig = SecretsConfig()
     briefing: BriefingConfig = BriefingConfig()
     backup: BackupConfig = BackupConfig()
+    retention: RetentionConfig = RetentionConfig()
     pulse: PulseConfig = PulseConfig()
     runner: RunnerConfig = RunnerConfig()
     trust: TrustConfig = TrustConfig()
