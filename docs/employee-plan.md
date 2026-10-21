@@ -425,6 +425,16 @@ The owner's decision (2026-10-16): "for thin guard, I think we can prob drop… 
 - **Not done.** No per-repo guard choice. `asked_for` reads words, not intent ("don't restart resonant" counts).
 - Tests: `tests/test_runner_guard.py` (env and argv with the guard off, thin still wrapped and isolated, the auth order and login fallback, the login check's cache and env, the `resonant` repo resolving to the daemon's checkout, restart and update via the desk with the run resumed, a requested restart not counted as a crash), `test_bootstrap_check.py` (the rows by mode), `test_sandbox.py` (the check by mode).
 
+### SF-1 (the owner's surf skills as a narrow default)
+
+The owner's ask (2026-10-21): make the surf skills the default for one narrow kind of run, and only that one.
+
+- **When.** `SURF_PROMPT` joins the `--append-system-prompt` text of a push run with the guard off: the only runs that have the owner's `~/.claude` (GD-1) and drive a PR that Resonant may merge. Scratch, local (RX-1) and fork runs and any run under `thin` don't get it. Within those runs the model decides: the default applies only when all three hold, the run has a repo, the ask is a code change and the result is meant to be a merged PR.
+- **The flow.** `/robot-surf` for a Linear ticket, `/robot-surf-prompt` for a freeform ask, or another surf skill when it fits, in the run's own worktree and branch (no new worktree): build, tests, PR, CI green, then the code-reviewer agent until no must-fix is left. The skill's two-hour wait for human review is skipped; the session ends with its summary.
+- **Everything else.** No repo, ops, research, an investigation, a review only, a one-off or unusual ask: no surf skill, just what the ask says. An ask that asks for a different flow always wins.
+- **Merge and trust unchanged.** The runner's rules (one branch, the CI fix attempts, no force-push) still hold. The worker doesn't merge its PR; Resonant does, through its pre-merge checks and the trust rules (`/merge`, `merge_run`, `start_run(merge=true)`'s auto-merge on green CI).
+- Tests: `tests/test_runner_guard.py` (the prompt's text; on a guard-off push run, absent under `thin`), and its absence on scratch (`test_runner_claude.py`), local (`test_runner_capabilities.py`) and fork (`test_runner_fork.py`) runs.
+
 ### GT-1 (gates sufficient, not excessive)
 
 The owner runs Resonant as a trusted employee on the dedicated Mini and asked for gates that are sufficient, not excessive. An audit of main @ 42cec94 found ten over-gates; each is fixed here.

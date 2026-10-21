@@ -111,6 +111,8 @@ async def test_guard_off_is_the_default_and_the_session_runs_as_the_owner(
     assert env["GH_CONFIG_DIR"] == f"{run_dir}/creds/gh"
     prompt = argv[argv.index("--append-system-prompt") + 1]
     assert "`resonant restart`" not in prompt  # no self_ops here: not offered
+    # a push run with the owner's setup is told when to use the surf skills
+    assert claude_mod.SURF_PROMPT.format(branch=run.branch) in prompt
 
 
 async def test_guard_thin_still_wraps_checks_and_isolates(
@@ -133,6 +135,9 @@ async def test_guard_thin_still_wraps_checks_and_isolates(
     await h.drain()
     assert h.run().status == "ready"
     assert len(wrapped) == 1 and len(checked) == 1
+    # no ~/.claude under the guard, so no surf skills to point at
+    [call] = h.argv_log()
+    assert "/robot-surf" not in call["argv"][call["argv"].index("--append-system-prompt") + 1]
     assert wrapped[0].protect is None and wrapped[0].deny_exec  # the daemon's defaults
     [call] = h.argv_log()
     argv, env = call["argv"], call["env"]
@@ -734,6 +739,31 @@ async def test_an_update_with_nothing_new_is_not_a_side_effect(
     assert ops.calls == ["update"] and h.chan.texts() == [] and did_list(db, code) == []
     [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
     assert "did:" not in line.title
+
+
+def test_the_surf_prompt_is_a_narrow_default() -> None:
+    prompt = claude_mod.SURF_PROMPT.format(branch="resonant/r1-x")
+    # only when all three hold: a repo, a code change, a PR meant to be merged
+    assert "only when all three hold" in prompt
+    assert "this run has a repo" in prompt and "the ask is a code change" in prompt
+    assert "a pull request that gets merged" in prompt
+    assert "/robot-surf" in prompt and "/robot-surf-prompt" in prompt
+    assert "another surf skill when it fits" in prompt
+    # the flow: build, tests, PR, CI, the code-reviewer until no must-fix
+    for step in ("run the tests", "open the pull request", "get CI green", "code-reviewer"):
+        assert step in prompt
+    assert "no must-fix left" in prompt
+    # in its worktree and branch, without the skill's long wait for human review
+    assert "on resonant/r1-x (don't create another worktree or branch)" in prompt
+    assert "Skip the skill's wait for human review" in prompt
+    # every other case does what the ask says, and the ask always wins
+    assert "don't invoke a surf skill; just do what the ask says" in prompt
+    for case in ("no repo", "ops", "research", "an investigation", "a review only", "one-off"):
+        assert case in prompt
+    assert "If the ask asks for a different flow, the ask wins." in prompt
+    # merge and trust rules unchanged: Resonant merges, the worker doesn't
+    assert "per the owner's trust rules, so don't merge it yourself" in prompt
+    assert "The rules above still hold." in prompt
 
 
 def test_the_worker_prompt_asks_for_did_notes() -> None:
