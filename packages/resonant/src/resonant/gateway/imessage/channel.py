@@ -273,10 +273,14 @@ class IMessageChannel:
             if dedupe_key is not None and (prev := self._already_sent(dedupe_key)) is not None:
                 return prev  # a concurrent send with the same key finished first
             await self._throttle(principal, len(chunks), dedupe_key)
-            # PER-261: noted before the first chunk goes out, so a crash or a failed later chunk
-            # never leaves a delivered Claude answer unrecorded (a note for a text that didn't
-            # go out only asks a yes for its code).
-            outbound.note(self.conn, principal, text, self.clock(), dedupe_key)
+            # PER-261 (store.outbound): a Claude answer is noted before its first chunk goes out,
+            # so a crash or a failed later chunk never leaves it unrecorded (noting one that
+            # didn't go out only asks a yes for its code). Any other text (a prompt, a reminder)
+            # is noted only once it went out: noting a failed one would hide an earlier answer.
+            claude = text.startswith(outbound.CLAUDE_PREFIX)
+            at = self.clock()
+            if claude:
+                outbound.note(self.conn, principal, text, at, dedupe_key)
             for i, chunk in enumerate(chunks, 1):
                 try:
                     await self.sender.send(handle, chunk)
@@ -313,6 +317,8 @@ class IMessageChannel:
                     chunks=len(chunks),
                     ref=ref.ref,
                 )
+            if not claude:
+                outbound.note(self.conn, principal, text, at, dedupe_key)
         log.info("imessage sent to %s (%d chars, %d part(s))", principal, len(text), len(chunks))
         return ref
 
