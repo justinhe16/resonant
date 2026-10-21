@@ -2762,7 +2762,11 @@ class ClaudeRunner:
         if (
             target is not None
             and pr.state == "MERGED"
-            and (record := action_ids.merge_record(self.conn, *_split_target(target)))
+            and (
+                record := action_ids.merge_record(
+                    self.conn, *_split_target(target), run_code=run.code
+                )
+            )
         ):
             # PER-269: Resonant merged it (merge_pr), or the owner approved the run's merge:
             # the run's work is done and merged, not a merge behind Resonant's back.

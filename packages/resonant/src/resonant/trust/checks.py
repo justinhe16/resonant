@@ -94,7 +94,7 @@ class _Held:
     """PER-269: another path already asks the owner for this action (not this run's check)."""
 
     approval_id: str
-    text: str  # ``Resonant is already asking for this: M6; …`` (code-built)
+    text: str  # ``Resonant is already asking the owner for this…`` (code-built)
 
 
 MAX_PENDING = 3  # pending checks per run; more is approval spam
@@ -261,7 +261,7 @@ class TrustChecks:
                 row = next((a for a in held if a.task_id == task_id and a.tool == CHECK_TOOL),
                            None)  # fmt: skip
                 if row is None and held:
-                    return _Held(held[0].id, action_ids.already_asking(self.conn, held[0]))
+                    return _Held(held[0].id, action_ids.already_asking(held[0]))
             if row is None:
                 pending = self.conn.execute(
                     "SELECT COUNT(*) FROM approvals WHERE task_id = ? AND tool = ?"

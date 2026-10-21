@@ -169,9 +169,10 @@ async def test_a_brain_merge_while_the_runs_check_is_open_points_to_it(h: H) -> 
     out = await h.brain()
     assert isinstance(out, Refused) and out.why == "denied"
     assert out.text == (
-        f"Not done: {h.code} is already asking for this: {prompt.code}; "
-        f"the owner approves it with yes {prompt.code}."
+        f"Not done: {h.code} is already asking the owner for this, so no second prompt went "
+        "out; tell the owner to answer the open prompt for it (/approvals lists it)."
     )
+    assert prompt.code not in out.text  # no tool result carries an approval code
     [only] = h.approvals()  # no second approval
     assert only.id == prompt.approval_id
     assert only.action_key == f"github merge {SLUG}#2" and only.action_target == f"{SLUG}#2"
@@ -189,17 +190,30 @@ async def test_a_check_while_resonant_asks_for_the_merge_is_handled(h: H) -> Non
     assert only.id == asked.decision.approval_id
     last = audits(h.db, "trust.check")[-1]
     assert last["decision"] == "handled" and last["approval_id"] == only.id
-    assert last["reason"] == f"Resonant is already asking for this: {code}; " + (
-        f"the owner approves it with yes {code}"
-    )
+    assert last["reason"].startswith("Resonant is already asking the owner for this")
+    assert code not in last["reason"]
 
 
 async def test_a_second_brain_merge_points_to_the_first(h: H) -> None:
     asked = await h.brain()
     assert isinstance(asked, Asked)
     again = await h.brain(ARGS | {"head_sha": "cd" * 20})  # another turn, a newer head
-    assert isinstance(again, Refused) and asked.decision.code in again.text
+    assert isinstance(again, Refused) and "Resonant is already asking" in again.text
     assert len(h.approvals()) == 1
+
+
+async def test_the_same_task_asking_at_a_newer_head_supersedes_its_own_ask(h: H) -> None:
+    tid = task_store.insert_task(h.db, NewTask(kind="message", runner="claude", priority=1))
+    task_store.set_status(h.db, tid, "running")
+    scope = CallScope(tid, OWNER, None, 0, 0, "inferred")
+    first = await h.core.call(h.spec, dict(ARGS), scope)
+    newer = await h.core.call(h.spec, ARGS | {"head_sha": "cd" * 20}, scope)
+    assert isinstance(first, Asked) and isinstance(newer, Asked)
+    old = ap.get_approval(h.db, first.decision.approval_id)
+    assert old is not None and old.status == "expired"
+    assert audits(h.db, "approval.expired")[-1]["reason"] == ap.SUPERSEDED
+    statuses = {a.id: a.status for a in h.approvals()}
+    assert statuses == {old.id: "expired", newer.decision.approval_id: "pending"}
 
 
 async def test_the_runs_reworded_check_shares_its_open_approval(h: H) -> None:
@@ -257,7 +271,18 @@ async def test_a_pr_merged_or_closed_elsewhere_obsoletes_its_check(h: H, kind: s
     assert audits(h.db, "approval.expired")[-1]["reason"] == ap.OBSOLETE
     h.clock.now += timedelta(seconds=TTL_S / 2 + 1)
     assert await remind_due(h.db, h.channel, h.clock()) == 0
-    assert action_ids.merge_record(h.db, SLUG, 2) is None  # merged, but not by Resonant
+    assert action_ids.merge_record(h.db, SLUG, 2, run_code=h.code) is None  # not by Resonant
+
+
+async def test_only_the_runs_own_approved_check_is_its_merge_record(h: H) -> None:
+    task = h.check()
+    prompt = await h.prompted()
+    h.reply(f"yes {prompt.code}")
+    assert await task == "ok"
+    own = action_ids.merge_record(h.db, SLUG, 2, run_code=h.code)
+    assert own == action_ids.MergeRecord("run", prompt.code)
+    assert action_ids.merge_record(h.db, SLUG, 2, run_code="R99") is None
+    assert action_ids.merge_record(h.db, SLUG, 2) is None
 
 
 async def test_other_extensions_events_obsolete_nothing(h: H) -> None:
@@ -300,7 +325,8 @@ def test_a_batched_approval_is_left_to_its_batch(db: sqlite3.Connection) -> None
         ("merge PR #2", f"{SLUG}#2"),
         ("squash-merge pr 2 into main", f"{SLUG}#2"),
         ("merge pull request 7", f"{SLUG}#7"),
-        ("merge Other/Repo#5 too", "other/repo#5"),
+        ("merge JustinHe16/Mycelium#5 too", f"{SLUG}#5"),
+        ("merge other/repo#5 too", None),  # never another repo's PR
         ("merge it", None),  # no PR named and the run has none yet
     ],
 )

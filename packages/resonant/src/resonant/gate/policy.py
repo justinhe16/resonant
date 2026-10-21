@@ -413,9 +413,16 @@ class PolicyGate:
             return Deny(NO_TASK)  # e.g. the router's fast path: nothing could wait
         # PER-269: one request per action. Another path (a run's check, another task) is
         # already asking for it: point to that one instead of opening a second.
+        # The same task asking again with other args (merge_pr at a newer head_sha)
+        # supersedes its own stale ask, unless that one is in a batch (answered as one).
         action = action_ids.for_intent(self.conn, intent)
-        if action is not None and (held := ap.pending_for_action(self.conn, action.key, now)):
-            return Deny(action_ids.already_asking(self.conn, held[0]))
+        held = ap.pending_for_action(self.conn, action.key, now) if action is not None else []
+        batched = ap.batches_of(self.conn, [a.id for a in held])
+        for stale in [a for a in held if self._own_stale(intent, a) and a.id not in batched]:
+            ap.expire_one(self.conn, stale.id, now, reason=ap.SUPERSEDED)
+            held.remove(stale)
+        if held:
+            return Deny(action_ids.already_asking(held[0]))
         summary = self._summary(intent)
         said = self._phrased(intent, summary)  # PER-268: "OK to merge PR #121 in …? [P3] yes / no"
         always = offer is not None and not require_code
@@ -446,6 +453,16 @@ class PolicyGate:
         created = ap.get_approval(self.conn, approval_id)
         assert created is not None
         return _needs(created)
+
+    @staticmethod
+    def _own_stale(intent: Intent, held: ap.Approval) -> bool:
+        """``held`` is this task's own ask for the same tool, with other args."""
+        return (
+            held.task_id == intent.task_id
+            and held.tool == intent.tool
+            and held.extension == intent.extension
+            and held.intent_hash != intent.hash
+        )
 
     def consume(self, token: str, intent_hash: str) -> bool:
         return self._tokens.pop(token, None) == intent_hash

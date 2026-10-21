@@ -251,6 +251,7 @@ def reply_code(conn: sqlite3.Connection, approval: Approval) -> str | None:
 
 
 OBSOLETE = "obsolete"  # PER-269: what it asked for already happened (its PR merged or closed)
+SUPERSEDED = "superseded"  # PER-269: its task asked again for the same action with other args
 
 
 def obsolete_for_target(conn: sqlite3.Connection, target: str, now: datetime) -> list[str]:
@@ -274,13 +275,16 @@ def obsolete_for_target(conn: sqlite3.Connection, target: str, now: datetime) ->
     return out
 
 
-def approved_for_action(conn: sqlite3.Connection, action_key: str, *, tool: str) -> Approval | None:
-    """PER-269: the newest approved approval of ``tool`` that asked for this action (a run's
-    trust check the owner said yes to, say), for "Resonant has a record of it"."""
+def approved_for_action(
+    conn: sqlite3.Connection, action_key: str, *, tool: str, requested_by: str
+) -> Approval | None:
+    """PER-269: the newest approved approval of ``tool`` by ``requested_by`` that asked for
+    this action (run R8's trust check the owner said yes to), for "Resonant has a record"."""
     r = conn.execute(
-        """SELECT * FROM approvals WHERE action_key = ? AND tool = ? AND status = 'approved'
+        """SELECT * FROM approvals WHERE action_key = ? AND tool = ? AND requested_by = ?
+               AND status = 'approved'
            ORDER BY decided_at DESC, id DESC LIMIT 1""",
-        (action_key, tool),
+        (action_key, tool, requested_by),
     ).fetchone()
     return None if r is None else _row_to_approval(r)
 

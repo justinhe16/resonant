@@ -7,9 +7,11 @@ the brain's tool call, a job) has one identity: the system, the verb and the tar
 
 - Before a new approval for an action opens, the gate (``PolicyGate._ask``) and the trust
   checks (``TrustChecks._approval``) look for an open one with the same key. If there is one,
-  no second approval opens: the brain's call is refused with a pointer
-  (``R8 is already asking for this: Y6; the owner approves it with yes Y6``) and a worker's
-  check is answered ``handled`` (don't do it yourself). One request, one code to answer.
+  no second approval opens: the brain's call is refused with a pointer (``R8 is already
+  asking the owner for this…``; no approval code, as no tool result carries one) and a
+  worker's check is answered ``handled`` (don't do it yourself). One request, one code to
+  answer. The same task asking again for the same action with other args (``merge_pr`` at a
+  newer ``head_sha``) supersedes its own stale ask instead.
 - When a PR is merged or closed (by Resonant's ``merge_pr`` or ``merge_run``, by a run, by
   hand: the github watch's ``pr_merged``/``pr_closed``), the open approvals targeting it
   expire as ``obsolete`` (``approvals.obsolete_for_target``), audited and never texted.
@@ -105,18 +107,24 @@ def for_check(
     conn: sqlite3.Connection, run: runs_store.Run, action: str, what: str
 ) -> Action | None:
     """The action a run's worker check asks for: a merge (``--action merge``) of a PR of the
-    run's repo. The PR is the one ``what`` names (``owner/name#2``, ``#2``, ``PR 2``), else
-    the run's own PR. None for any other check, or when no PR can be named."""
+    run's own registered repo. The PR is the one ``what`` names (``owner/name#2`` for that
+    repo, ``#2``, ``PR 2``), else the run's own PR. None for any other check, when no PR can
+    be named, or when ``what`` names another repo's PR (a worker's words never key an action
+    on a repo that isn't its run's)."""
     if action not in MERGE_VERBS:
         return None
-    if (m := _FULL_REF.search(what)) is not None:
-        target = pr_target(m.group(1), int(m.group(2)))
-        return Action(GITHUB, MERGE, target) if target else None
     slug = _repo_slug(conn, run.repo)
     if slug is None:
         return None
-    m = _PR_REF.search(what)
-    number = int(m.group(1)) if m is not None else run.pr_number
+    number: int | None
+    if (full := _FULL_REF.search(what)) is not None:
+        if full.group(1).lower() != slug.lower():
+            return None
+        number = int(full.group(2))
+    elif (m := _PR_REF.search(what)) is not None:
+        number = int(m.group(1))
+    else:
+        number = run.pr_number
     target = pr_target(slug, number) if number is not None else None
     return Action(GITHUB, MERGE, target) if target else None
 
@@ -128,12 +136,14 @@ def asker(approval: ap.Approval) -> str:
     return "Resonant"
 
 
-def already_asking(conn: sqlite3.Connection, approval: ap.Approval) -> str:
-    """``R8 is already asking for this: Y6; the owner approves it with yes Y6`` (code-built:
-    a run code or "Resonant", and an approval code)."""
-    code = ap.reply_code(conn, approval) or "?"
-    who = asker(approval)
-    return f"{who} is already asking for this: {code}; the owner approves it with yes {code}"
+def already_asking(approval: ap.Approval) -> str:
+    """``R8 is already asking the owner for this; …`` (code-built: a run code or "Resonant").
+    It carries no approval code: it is a tool result, and no tool result carries one (the
+    owner's prompt does)."""
+    return (
+        f"{asker(approval)} is already asking the owner for this, so no second prompt went "
+        "out; tell the owner to answer the open prompt for it (/approvals lists it)"
+    )
 
 
 @dataclass(frozen=True)
@@ -145,8 +155,11 @@ class MergeRecord:
     code: str | None
 
 
-def merge_record(conn: sqlite3.Connection, slug: str, number: int) -> MergeRecord | None:
-    """Did Resonant merge PR ``slug#number``, or approve its merge? None: no record of it."""
+def merge_record(
+    conn: sqlite3.Connection, slug: str, number: int, *, run_code: str | None = None
+) -> MergeRecord | None:
+    """Did Resonant merge PR ``slug#number``, or approve run ``run_code``'s own check to
+    merge it? None: no record of it."""
     target = pr_target(slug, number)
     if target is None:
         return None
@@ -166,7 +179,11 @@ def merge_record(conn: sqlite3.Connection, slug: str, number: int) -> MergeRecor
     if row is not None:
         approval = ap.get_approval(conn, row["approval_id"]) if row["approval_id"] else None
         return MergeRecord("resonant", ap.reply_code(conn, approval) if approval else None)
-    approved = ap.approved_for_action(conn, Action(GITHUB, MERGE, target).key, tool=ap.CHECK_TOOL)
+    if run_code is None:
+        return None
+    approved = ap.approved_for_action(
+        conn, Action(GITHUB, MERGE, target).key, tool=ap.CHECK_TOOL, requested_by=run_code
+    )
     if approved is not None:
         return MergeRecord("run", ap.reply_code(conn, approved))
     return None
