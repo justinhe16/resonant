@@ -501,7 +501,7 @@ Never use the `service_role` key or the JWT secret anywhere outside Supabase. Ea
    - Optional, if your plan has it: **Sessions** → a time-box or inactivity timeout (plan D5's short sessions).
 
    From **Project Settings → API Keys**, note the **project URL** (`https://<ref>.supabase.co`) and the **publishable key** (`sb_publishable_…`; the legacy `anon` JWT also works). Not secrets.
-2. **Apply the migration.** **SQL Editor → New query**, paste all of [`supabase/migrations/20261016000000_relay.sql`](../supabase/migrations/20261016000000_relay.sql), **Run**. (Or with the Supabase CLI from the repo: `supabase link --project-ref <ref> && supabase db push`.) **Table Editor** now shows `snapshots`, empty.
+2. **Apply the migrations,** in order. **SQL Editor → New query**, paste all of [`supabase/migrations/20261016000000_relay.sql`](../supabase/migrations/20261016000000_relay.sql), **Run**; then the same with [`20261021000000_relay_refuse_claude_brain.sql`](../supabase/migrations/20261021000000_relay_refuse_claude_brain.sql) (PER-263: the ingest check also refuses the Claude brain's details). (Or with the Supabase CLI from the repo: `supabase link --project-ref <ref> && supabase db push`.) **Table Editor** now shows `snapshots`, empty. On a project already live, a later migration is applied the same way, on its own; it never touches the stored rows or the tokens.
 3. **Enroll TOTP**, from a machine with Node and a checkout of the repo (your laptop is fine; the Mini doesn't need Node):
 
    ```sh

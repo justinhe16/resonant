@@ -237,6 +237,44 @@
       "title": "ClaudeBrain",
       "type": "object"
     },
+    "DetectedEffects": {
+      "additionalProperties": false,
+      "description": "PER-263: the side effects detected in the commands of the runs the snapshot lists\n(TR-1, the last ``RUN_ITEMS`` runs), counts only, so the remote tier has them too:\nby kind, and how many of them were high-impact (a base push, a publish, a delete).",
+      "properties": {
+        "by_kind": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "push",
+              "merge",
+              "release",
+              "repo",
+              "deploy",
+              "publish",
+              "http",
+              "self",
+              "message",
+              "mcp",
+              "github"
+            ]
+          },
+          "title": "By Kind",
+          "type": "object"
+        },
+        "high": {
+          "title": "High",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "by_kind",
+        "high"
+      ],
+      "title": "DetectedEffects",
+      "type": "object"
+    },
     "Extension": {
       "additionalProperties": false,
       "properties": {
@@ -257,6 +295,18 @@
           "title": "Jobs",
           "type": "array"
         },
+        "muted_until": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Muted Until"
+        },
         "name": {
           "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
           "title": "Name",
@@ -276,6 +326,7 @@
         "name",
         "status",
         "health",
+        "muted_until",
         "jobs"
       ],
       "title": "Extension",
@@ -422,10 +473,15 @@
         "open": {
           "title": "Open",
           "type": "integer"
+        },
+        "untold": {
+          "title": "Untold",
+          "type": "integer"
         }
       },
       "required": [
-        "open"
+        "open",
+        "untold"
       ],
       "title": "Pulse",
       "type": "object"
@@ -604,6 +660,10 @@
           "title": "Code",
           "type": "string"
         },
+        "detected": {
+          "title": "Detected",
+          "type": "integer"
+        },
         "ended_at": {
           "anyOf": [
             {
@@ -720,7 +780,8 @@
         "started_at",
         "ended_at",
         "waiting_reason",
-        "last_note"
+        "last_note",
+        "detected"
       ],
       "title": "RunItem",
       "type": "object"
@@ -778,6 +839,9 @@
           "title": "By State",
           "type": "object"
         },
+        "detected": {
+          "$ref": "#/$defs/DetectedEffects"
+        },
         "items": {
           "anyOf": [
             {
@@ -796,7 +860,8 @@
         }
       },
       "required": [
-        "by_state"
+        "by_state",
+        "detected"
       ],
       "title": "Runs",
       "type": "object"

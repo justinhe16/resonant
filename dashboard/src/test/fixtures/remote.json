@@ -54,6 +54,14 @@
       "ready": 1,
       "merged": 6,
       "failed": 1
+    },
+    "detected": {
+      "by_kind": {
+        "push": 1,
+        "http": 1,
+        "merge": 1
+      },
+      "high": 1
     }
   },
   "approvals": {
@@ -63,13 +71,15 @@
     "open": 1
   },
   "pulse": {
-    "open": 3
+    "open": 3,
+    "untold": 2
   },
   "extensions": [
     {
       "name": "github",
       "status": "enabled",
       "health": "ok",
+      "muted_until": null,
       "jobs": [
         {
           "id": "watch",
@@ -91,6 +101,7 @@
       "name": "weather",
       "status": "enabled",
       "health": "degraded",
+      "muted_until": "2026-10-16T12:00:00+00:00",
       "jobs": [
         {
           "id": "forecast",
@@ -105,6 +116,7 @@
       "name": "notes-sync",
       "status": "disabled",
       "health": "unknown",
+      "muted_until": null,
       "jobs": []
     }
   ],

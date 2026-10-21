@@ -29,7 +29,7 @@ import json
 import re
 import sqlite3
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, cast, get_args
@@ -41,6 +41,7 @@ from pydantic.config import JsonDict
 from resonant import __version__
 from resonant.config import Settings
 from resonant.extensions.cron import CronError, parse_schedule
+from resonant.extensions.notify import muted_until
 from resonant.gate.policy import change_line, strictest
 from resonant.loop.slots import SlotPool
 from resonant.loop.types import TaskStatus
@@ -69,6 +70,13 @@ HealthState = Literal["ok", "degraded", "failing", "unknown"]
 # What ``Scheduler`` records (``_Result.outcome``); anything else shows as ``other``.
 JobOutcome = Literal["ok", "failed", "killed", "denied", "dry_run", "skipped_paused", "other"]
 PulseState = Literal["new", "told"]  # new: the owner hasn't heard this version yet
+# ``runners.side_effects.Kind`` (TR-1), mirrored: importing ``resonant.runners`` here is a cycle
+# (it imports ``brain.briefing``, which imports this module). A test keeps the two equal; a kind
+# missing here is left out of the counts, never an error.
+EffectKind = Literal[
+    "push", "merge", "release", "repo", "deploy", "publish", "http", "self", "message", "mcp",
+    "github",
+]  # fmt: skip
 
 # Identifiers the remote tier may carry: health check names (``model``, ``ext:github``),
 # extension names and job ids (the SDK's slugs, owner-chosen but never message content).
@@ -91,6 +99,8 @@ _OUTCOMES: frozenset[str] = frozenset(get_args(JobOutcome))
 _HEALTH_STATES: frozenset[str] = frozenset(get_args(HealthState))
 _TASK_STATES: frozenset[str] = frozenset(get_args(TaskStatus))
 _RUN_STATES: frozenset[str] = frozenset(get_args(RunStatus))
+_EFFECT_KINDS: frozenset[str] = frozenset(get_args(EffectKind))
+_URGENCIES: tuple[Urgency, ...] = get_args(Urgency)
 
 
 def _ident(value: str) -> bool:
@@ -139,11 +149,22 @@ class RunItem(_Model):
     ended_at: datetime | None
     waiting_reason: WaitReason | None
     last_note: str | None
+    detected: int  # side effects detected in its commands (TR-1, ``run.seen:<code>``)
     remote_url: str | None = _local()  # RC-1: the running session's Remote Control link
+
+
+class DetectedEffects(_Model):
+    """PER-263: the side effects detected in the commands of the runs the snapshot lists
+    (TR-1, the last ``RUN_ITEMS`` runs), counts only, so the remote tier has them too:
+    by kind, and how many of them were high-impact (a base push, a publish, a delete)."""
+
+    by_kind: dict[EffectKind, int]
+    high: int
 
 
 class Runs(_Model):
     by_state: dict[RunStatus, int]
+    detected: DetectedEffects
     items: list[RunItem] | None = _local()
 
 
@@ -199,6 +220,10 @@ class PulseItem(_Model):
 
 class Pulse(_Model):
     open: int
+    # PER-263: items whose latest version the owner hasn't heard (``pulse.pending`` at every
+    # urgency, muted sources included, and cleared items whose last word is owed), so the
+    # remote tier shows a held or muted reporter's backlog without the titles.
+    untold: int
     items: list[PulseItem] | None = _local()
 
 
@@ -214,6 +239,7 @@ class Extension(_Model):
     name: Ident
     status: ExtensionStatus
     health: HealthState  # its ``ext:<name>`` check
+    muted_until: datetime | None  # PER-263: ``/ext mute``'s end while it is muted (notify)
     jobs: list[Job]
 
 
@@ -452,6 +478,7 @@ def _extensions(
                 name=record.name,
                 status=record.status,
                 health="unknown" if check is None else check.state,
+                muted_until=muted_until(conn, record.name, now),
                 jobs=_jobs(record, states, settings, now),
             )
         )
@@ -481,6 +508,8 @@ def build_snapshot(
     pending = _approval_items(conn, approvals.pending_all(conn, now))
     asks = questions.open_asks(conn)
     items = pulse.open_items(conn, now)
+    untold = pulse.pending(conn, _URGENCIES, now)
+    detected = {r.code: _detected(conn, r.code) for r in run_rows}
     autonomy = kv_get(conn, "autonomy", "on")
     if runner_missing is None:
         runner = Runner(set_up=False, missing=["no Claude runner in this daemon (iMessage is off)"])
@@ -504,6 +533,7 @@ def build_snapshot(
         ),
         runs=Runs(
             by_state=_counts(runs.count_by_status(conn), _RUN_STATES),
+            detected=_detected_counts(detected.values()),
             items=[
                 RunItem(
                     code=r.code,
@@ -517,6 +547,7 @@ def build_snapshot(
                     ended_at=r.ended_at,
                     waiting_reason=r.wait_reason if r.status == "waiting" else None,
                     last_note=r.last_note,
+                    detected=len(detected[r.code]),
                     remote_url=r.remote_url if r.status == "running" else None,
                 )
                 for r in run_rows
@@ -537,6 +568,7 @@ def build_snapshot(
         ),
         pulse=Pulse(
             open=len(items),
+            untold=len(untold),
             items=[
                 PulseItem(
                     source=i.source,
@@ -558,6 +590,24 @@ def build_snapshot(
         claude_brain=_claude_brain(conn),
         brain_activity=_brain_activity(conn, settings, now),
     )
+
+
+def _detected(conn: sqlite3.Connection, code: str) -> list[tuple[EffectKind, bool]]:
+    """Run ``code``'s detected side effects as (kind, high), unknown kinds left out."""
+    from resonant.runners.reports import detected_list  # a cycle at import time (EffectKind)
+
+    # ``detected_list`` casts the stored kind unchecked: a stale kv row can hold anything.
+    return [(e.kind, e.high) for e in detected_list(conn, code) if e.kind in _EFFECT_KINDS]
+
+
+def _detected_counts(per_run: Iterable[list[tuple[EffectKind, bool]]]) -> DetectedEffects:
+    by_kind: dict[EffectKind, int] = {}
+    high = 0
+    for effects in per_run:
+        for kind, is_high in effects:
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            high += is_high
+    return DetectedEffects(by_kind=by_kind, high=high)
 
 
 def _approval_items(

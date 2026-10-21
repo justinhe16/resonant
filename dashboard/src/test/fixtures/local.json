@@ -24,6 +24,7 @@
   "slots": { "used": 2, "max": 5 },
   "runs": {
     "by_state": { "running": 1, "waiting": 1, "ready": 1, "merged": 6, "failed": 1 },
+    "detected": { "by_kind": { "push": 1, "http": 1, "merge": 1 }, "high": 1 },
     "items": [
       {
         "code": "R12",
@@ -36,7 +37,8 @@
         "started_at": "2026-10-16T08:47:00+00:00",
         "ended_at": null,
         "waiting_reason": null,
-        "last_note": "Lint and typecheck pass; writing the workflow step now"
+        "last_note": "Lint and typecheck pass; writing the workflow step now",
+        "detected": 2
       },
       {
         "code": "R11",
@@ -49,7 +51,8 @@
         "started_at": "2026-10-16T07:30:00+00:00",
         "ended_at": null,
         "waiting_reason": "question",
-        "last_note": null
+        "last_note": null,
+        "detected": 0
       },
       {
         "code": "R10",
@@ -62,7 +65,8 @@
         "started_at": "2026-10-16T06:02:00+00:00",
         "ended_at": "2026-10-16T06:40:00+00:00",
         "waiting_reason": null,
-        "last_note": "CI green"
+        "last_note": "CI green",
+        "detected": 1
       },
       {
         "code": "R9",
@@ -75,7 +79,8 @@
         "started_at": "2026-10-15T22:10:00+00:00",
         "ended_at": "2026-10-15T22:31:00+00:00",
         "waiting_reason": null,
-        "last_note": "Session hit the usage limit twice; gave up"
+        "last_note": "Session hit the usage limit twice; gave up",
+        "detected": 0
       }
     ]
   },
@@ -116,6 +121,7 @@
   },
   "pulse": {
     "open": 3,
+    "untold": 2,
     "items": [
       {
         "source": "github",
@@ -148,6 +154,7 @@
       "name": "github",
       "status": "enabled",
       "health": "ok",
+      "muted_until": null,
       "jobs": [
         {
           "id": "watch",
@@ -169,6 +176,7 @@
       "name": "weather",
       "status": "enabled",
       "health": "degraded",
+      "muted_until": "2026-10-16T12:00:00+00:00",
       "jobs": [
         {
           "id": "forecast",
@@ -179,7 +187,7 @@
         }
       ]
     },
-    { "name": "notes-sync", "status": "disabled", "health": "unknown", "jobs": [] }
+    { "name": "notes-sync", "status": "disabled", "health": "unknown", "muted_until": null, "jobs": [] }
   ],
   "runner": { "set_up": true, "missing": [] },
   "trust_rules": [

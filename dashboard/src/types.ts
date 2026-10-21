@@ -40,11 +40,23 @@ export interface RunItem {
   ended_at: Timestamp | null;
   waiting_reason: string | null;
   last_note: string | null;
+  /** side effects detected in its commands (TR-1); absent before PER-263 */
+  detected?: number;
   remote_url?: string; // RC-1, local tier only: the running session's Remote Control link
+}
+
+/** PER-263: side effects detected in the listed runs' commands (TR-1), counts in both tiers. */
+export interface DetectedEffects {
+  /** by kind: push, merge, release, repo, deploy, publish, http, self, message, mcp, github */
+  by_kind: Record<string, number>;
+  /** how many were high-impact (a base push, a publish, a delete) */
+  high: number;
 }
 
 export interface Runs {
   by_state: ByState;
+  /** absent in snapshots from before PER-263 */
+  detected?: DetectedEffects;
   /** local only */
   items?: RunItem[];
 }
@@ -94,6 +106,12 @@ export interface OpenList<T> {
   items?: T[];
 }
 
+export interface PulseList extends OpenList<PulseItem> {
+  /** PER-263: items whose latest version the owner hasn't heard (muted sources included), in
+   * both tiers; absent in snapshots from before PER-263 */
+  untold?: number;
+}
+
 export interface Job {
   id: string;
   next_due: Timestamp | null;
@@ -106,6 +124,8 @@ export interface Extension {
   name: string;
   status: "enabled" | "disabled" | "disabled_tampered";
   health: HealthState | string;
+  /** PER-263: when `/ext mute` ends, while muted; absent in snapshots from before it */
+  muted_until?: Timestamp | null;
   jobs: Job[];
 }
 
@@ -174,7 +194,7 @@ export interface Snapshot {
   runs: Runs;
   approvals: OpenList<ApprovalItem>;
   questions: OpenList<QuestionItem>;
-  pulse: OpenList<PulseItem>;
+  pulse: PulseList;
   extensions: Extension[];
   runner: Runner;
   /** local only */

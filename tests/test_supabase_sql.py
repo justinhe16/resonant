@@ -292,6 +292,9 @@ def test_ingest_refuses_everything_until_configured(db: Pg, tmp_path: Path) -> N
         {"pulse": {"open": 0, "items": []}},
         {"runner": {"set_up": False, "missing": ["x"]}},
         {"health": [{"name": "model", "state": "ok", "since": None, "reason": "detail"}]},
+        {"claude_brain": {"state": "up", "turns": 1, "tools": []}},  # PER-263
+        {"claude_brain": None},  # the key alone
+        {"slots": {"used": 0, "max": 1, "remote_url": "https://claude.ai/code/x"}},  # any depth
         {"taken_at": "not a time"},
         {"taken_at": None},
         {"taken_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
@@ -342,11 +345,46 @@ def _busy_dumps(tmp_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return snap.model_dump(mode="json"), to_remote(snap).model_dump(mode="json")
 
 
+def _declared_local_only() -> set[str]:
+    """The names of every LOCAL_ONLY field, from the models reachable from Snapshot."""
+    from pydantic import BaseModel
+
+    from resonant.dashboard.snapshot import Snapshot, is_local_only
+
+    names: set[str] = set()
+    seen: set[type[BaseModel]] = set()
+
+    def walk(model: type[BaseModel]) -> None:
+        if model in seen:
+            return
+        seen.add(model)
+        for name, field in model.model_fields.items():
+            if is_local_only(model, name):
+                names.add(field.alias or name)
+            for sub in _models_in(field.annotation):
+                walk(sub)
+
+    walk(Snapshot)
+    return names
+
+
+def _models_in(annotation: Any) -> list[type[Any]]:
+    from typing import get_args
+
+    from pydantic import BaseModel
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return [annotation]
+    return [m for a in get_args(annotation) for m in _models_in(a)]
+
+
 def test_every_local_only_field_is_refused(db: Pg, tmp_path: Path) -> None:
     local, remote = _busy_dumps(tmp_path)
     paths = _local_only_paths(local, remote)
-    # The busy store fills every local-only field the models declare.
-    assert {p[-1] for p in paths} >= {"reason", "items", "missing", "trust_rules", "repos"}
+    # The busy store fills every local-only field the models declare (outside the lists the
+    # remote tier drops whole), so a new one is refused or this fails.
+    assert {p[-1] for p in paths} >= _declared_local_only() - {"changes", "remote_url"}
+    assert ("claude_brain",) in paths  # PER-263
     for path in paths:
         data = json.loads(json.dumps(remote))
         target, src = data, local
