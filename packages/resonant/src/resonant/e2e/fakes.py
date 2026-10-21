@@ -87,7 +87,12 @@ Scripted = Sequence[ToolCall | tuple[str, dict[str, Any]]] | str | BaseException
 _REMIND = re.compile(r"remind me in (\d+) minutes? to (.+?)</message>", re.IGNORECASE | re.DOTALL)
 _NOW = re.compile(r"^Current time: (\S+) ", re.MULTILINE)
 DEFAULT_FINAL_REPLY = "Here's the rundown from the task list: all good."
-LOCAL_TRIAGE: dict[str, Any] = {"handler": "local", "kind": "general", "say": ""}
+LOCAL_TRIAGE: dict[str, Any] = {
+    "handler": "local",
+    "kind": "general",
+    "message_type": "other",
+    "say": "",
+}
 
 
 class ScriptedModel:

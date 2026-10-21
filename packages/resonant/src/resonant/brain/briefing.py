@@ -34,6 +34,12 @@ and clips every field; the system prompt says the briefing is data.
 **Since we last talked** (``since_notes``): what changed between the principal's previous
 message and now, as short code-built lines: runs that ended or merged, approvals that
 expired, worker questions asked; the newest ``SINCE_MAX``. Owner only (a member gets none).
+
+**What the owner already knows** (PER-270, the pulse's told state): a run whose end the owner
+was texted (its ``core/run/<code>`` item is told at its current version) is not news. The
+notes leave it out, its briefing line ends ``owner told``, and ``known_notes`` lists what was
+told in the last ``KNOWN_HOURS`` (short, one line each, ``KNOWN_MAX``) for the "Already told"
+list, so the model doesn't re-announce it.
 """
 
 from __future__ import annotations
@@ -53,6 +59,7 @@ from resonant.dashboard.snapshot import RunItem, Snapshot, build_snapshot
 from resonant.loop.slots import SlotPool
 from resonant.status import collect_status
 from resonant.store import brain as brain_store
+from resonant.store import pulse as pulse_store
 from resonant.store import questions, runs
 from resonant.store import repos as repo_store
 from resonant.store.db import utcnow
@@ -71,6 +78,9 @@ REPOS_MAX = 20
 EXTENSIONS_MAX = 20
 SINCE_MAX = 8
 SINCE_LOOKBACK = timedelta(days=7)  # a longer silence shows the last week only
+KNOWN_MAX = 5  # PER-270: lines of "Already told"
+KNOWN_HOURS = 24
+KNOWN_TITLE_CHARS = 120
 
 _ENDED_TEXT = {
     "ready": "is ready",
@@ -147,7 +157,7 @@ def _fit(head: str, sections: list[_Section], budget: int) -> str:
     return out
 
 
-def _run_line(r: RunItem, now: datetime, tz: ZoneInfo) -> str:
+def _run_line(r: RunItem, now: datetime, tz: ZoneInfo, *, told: bool = False) -> str:
     state = str(r.state)
     if r.state == "waiting" and r.waiting_reason is not None:
         state = f"waiting ({'your answer' if r.waiting_reason == 'question' else 'usage reset'})"
@@ -156,6 +166,8 @@ def _run_line(r: RunItem, now: datetime, tz: ZoneInfo) -> str:
         parts.append(f"for {_duration((now - r.started_at).total_seconds())}")
     if r.ended_at is not None:
         parts.append(f"ended {_when(r.ended_at, now, tz)}")
+        if told:  # PER-270: the owner was texted this end
+            parts.append("owner told")
     if r.pr_url:
         parts.append(f"PR #{r.pr_number} {r.pr_url}" if r.pr_number else f"PR {r.pr_url}")
     if r.remote_url:
@@ -191,9 +203,10 @@ def render_briefing(
     owner: bool,
     tz: str,
     budget: int = BRIEFING_MAX_CHARS,
+    known_runs: frozenset[str] = frozenset(),
 ) -> str:
     """The briefing text (without the ``<briefing>`` tags). Pure: ``snapshot.taken_at`` is
-    now."""
+    now. ``known_runs``: lowercase codes of ended runs the owner was told about."""
     zone = ZoneInfo(tz)
     now = snapshot.taken_at
     head = [f"Resonant {snapshot.version}"]
@@ -245,7 +258,11 @@ def render_briefing(
     extensions = [f"{e.name} ({e.status}, {e.health})" for e in snapshot.extensions]
     sections = [
         _capped("Unhealthy", health, len(health)),
-        _capped("Runs", [_run_line(r, now, zone) for r in run_items], RUNS_MAX),
+        _capped(
+            "Runs",
+            [_run_line(r, now, zone, told=r.code.lower() in known_runs) for r in run_items],
+            RUNS_MAX,
+        ),
         _capped("Workers ask", asks, QUESTIONS_MAX),
         _capped("Waiting on the owner", approvals, APPROVALS_MAX),
         _capped("Repos", repos, REPOS_MAX),
@@ -301,7 +318,30 @@ def gather_briefing(
             paths[i] = RepoPath(paths[i].name, paths[i].path, paths[i].slug, "Resonant itself")
         else:
             paths.append(RepoPath("resonant", own, note="Resonant itself"))
-    return render_briefing(snapshot, status, repo_paths=paths, owner=owner, tz=settings.timezone)
+    return render_briefing(
+        snapshot,
+        status,
+        repo_paths=paths,
+        owner=owner,
+        tz=settings.timezone,
+        known_runs=_told_runs(conn, now) if owner else frozenset(),
+    )
+
+
+def _told_runs(conn: sqlite3.Connection, now: datetime) -> frozenset[str]:
+    """Lowercase codes of the runs whose end the owner was texted (a cleared ``core/run/``
+    item told at its current version) in the last ``RECENT_RUN_HOURS``."""
+    try:
+        items = pulse_store.known_items(conn, now - timedelta(hours=RECENT_RUN_HOURS), 100)
+    except sqlite3.Error:
+        return frozenset()
+    return frozenset(
+        i.key.removeprefix("run/") for i in items if i.source == "core" and _is_run(i) and i.cleared
+    )
+
+
+def _is_run(item: pulse_store.Item) -> bool:
+    return item.key.startswith("run/")
 
 
 # --- since we last talked ------------------------------------------------------------------
@@ -326,6 +366,20 @@ def last_talked(
     return prev[-1][0].occurred_at if prev else None
 
 
+def _told_end(conn: sqlite3.Connection, r: runs.Run) -> bool:
+    """The owner was texted this run's last change: its pulse item is cleared and told at its
+    current version, and that was after the run last changed (a merge after the end text is
+    still news)."""
+    try:
+        item = pulse_store.get(conn, "core", pulse_store.run_key(r.code))
+    except sqlite3.Error:
+        return False
+    if item is None or not item.cleared or not item.known or item.told_at is None:
+        return False
+    changed = r.updated_at if r.status == "merged" else r.ended_at or r.updated_at
+    return item.told_at >= changed
+
+
 def since_notes(
     conn: sqlite3.Connection,
     *,
@@ -345,6 +399,8 @@ def since_notes(
     found: list[tuple[datetime, str]] = []
     recent = runs.recent(conn, limit=50)
     for r in recent:
+        if _told_end(conn, r):  # the owner was texted this already (PER-270)
+            continue
         if r.status == "merged" and since < r.updated_at <= now:
             at, verb = r.updated_at, _ENDED_TEXT["merged"]
         elif r.ended_at is not None and since < r.ended_at <= now and r.status in _ENDED_TEXT:
@@ -373,4 +429,38 @@ def since_notes(
     if len(lines) > limit:  # the newest win
         keep = max(0, limit - 1)
         return [f"+{len(lines) - keep} earlier", *lines[len(lines) - keep :]]
+    return lines
+
+
+def known_notes(
+    conn: sqlite3.Connection,
+    *,
+    owner: bool,
+    now: datetime,
+    tz: str,
+    limit: int = KNOWN_MAX,
+) -> list[str]:
+    """PER-270: what the owner already knows, newest told first, one short line each:
+    ``title (told 17:33; they replied)``. The pulse items texted in the last ``KNOWN_HOURS``,
+    leaving out approvals (they stay under "Waiting on the owner") and runs that are still
+    running. Only the owner gets any."""
+    if not owner:
+        return []
+    zone = ZoneInfo(tz)
+    try:
+        items = pulse_store.known_items(conn, now - timedelta(hours=KNOWN_HOURS), 4 * limit)
+    except sqlite3.Error:
+        return []
+    lines: list[str] = []
+    for item in items:
+        if item.key.startswith("approval/") or (item.key.startswith("run/") and not item.cleared):
+            continue
+        if item.told_at is None:
+            continue
+        label = "" if item.source == "core" else f"[{_clean(item.source, 40)}] "
+        replied = "; they replied" if item.acked_at is not None else ""
+        title = _clean(item.title, KNOWN_TITLE_CHARS)
+        lines.append(f"{label}{title} (told {_when(item.told_at, now, zone)}{replied})")
+        if len(lines) == limit:
+            break
     return lines

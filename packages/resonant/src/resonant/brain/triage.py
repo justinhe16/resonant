@@ -3,9 +3,11 @@
 One ``chat_json`` call over the turn's own messages and toolset, plus one trailing user turn
 (``instruction``): the cached prompt prefix (system, tools, facts, history, the turn) is the
 same as the first ``chat_tools`` round's, so the local route's next call is warm. The answer
-is ``{"handler": "local" | "claude", "kind": ..., "say": ...}``; Ollama writes an object's keys
-in sorted order, so the keys are named for that order: the route first, then the kind, then
-the ack written for that route.
+is ``{"handler": "local" | "claude", "kind": ..., "message_type": ..., "say": ...}``; Ollama
+writes an object's keys in sorted order, so the keys are named for that order: the route
+first, then the kind, then the type of message (PER-270: a greeting, an ack, a check for
+news, a correction, a question; the same call, no extra one), then the ack written for that
+route.
 
 ``say`` is the instant ack sent while Claude works (``clean_ack``): one short line, no
 question, no claim; anything else, or no answer in time, is a canned variant
@@ -27,6 +29,8 @@ Route = Literal["local", "claude"]
 ACK_MAX_CHARS = 80
 TRIAGE_MAX_TOKENS = 80
 KINDS = ("general", "research", "email", "calendar", "link")
+# PER-270: what kind of message this is, beside who answers it (``Triage.message_type``).
+MESSAGE_TYPES = ("greeting", "ack", "news_check", "correction", "question", "other")
 # Nobody here can reach these since CAL-1 was dropped (PER-249): the local model says so.
 OUT_OF_REACH = frozenset({"email", "calendar"})
 
@@ -35,9 +39,10 @@ SCHEMA: dict[str, Any] = {
     "properties": {
         "handler": {"type": "string", "enum": ["local", "claude"]},
         "kind": {"type": "string", "enum": list(KINDS)},
+        "message_type": {"type": "string", "enum": list(MESSAGE_TYPES)},
         "say": {"type": "string"},  # clipped by ``clean_ack``, never a validation failure
     },
-    "required": ["handler", "kind", "say"],
+    "required": ["handler", "kind", "message_type", "say"],
     "additionalProperties": False,
 }
 
@@ -68,7 +73,12 @@ _FORMAT = (
     "the owner while Claude works, terse coworker style, lowercase, under 60 characters, "
     "naming what is being checked, never an answer and never a question,"
     ' e.g. "on it, digging through resonant\'s history", "checking '
-    'R4\'s logs", "one sec, reading that page". For local, say is "".'
+    'R4\'s logs", "one sec, reading that page". For local, say is "". Also message_type: '
+    "greeting (hi, hey, good morning, nothing else), ack (ok, thanks, that's fine, got it, "
+    "nothing asked), news_check (only a general anything new, anything for me, what do you need "
+    "from me, with no topic), "
+    "correction (disagrees with or corrects something you or Resonant said), question, else "
+    "other."
 )
 
 
@@ -88,6 +98,7 @@ class Triage:
     route: Route
     kind: str
     ack: str | None  # a cleaned ack, or None (use a canned one)
+    message_type: str = "other"  # one of ``MESSAGE_TYPES``
 
 
 def parse(data: dict[str, Any] | None) -> Triage | None:
@@ -98,8 +109,10 @@ def parse(data: dict[str, Any] | None) -> Triage | None:
     if route not in ("local", "claude"):
         return None
     kind = kind if kind in KINDS else "general"
+    mtype = data.get("message_type")
+    message_type = mtype if mtype in MESSAGE_TYPES else "other"
     ack = clean_ack(say) if isinstance(say, str) else None
-    return Triage(route, cast(str, kind), ack)
+    return Triage(route, cast(str, kind), ack, cast(str, message_type))
 
 
 _URL = re.compile(r"https?://|www\.", re.IGNORECASE)
@@ -153,6 +166,18 @@ def looks_hard(text: str) -> bool:
     return _HARD.search(text) is not None
 
 
+# PER-270: asking why a run did (or didn't do) something. Resonant's own records say what
+# happened, not why; the local model invented reasons ("a dry run", a `merge: true` flag).
+_RUN_WHY = re.compile(r"\b(?:why|how come|explain)\b", re.IGNORECASE)
+_RUN_CODE = re.compile(r"\bR\d+\b", re.IGNORECASE)
+
+
+def asks_run_why(text: str) -> bool:
+    """The message asks why or to explain something and names a run (``R9``): Claude, who can
+    read the run's transcript, whatever the triage says."""
+    return _RUN_WHY.search(text) is not None and _RUN_CODE.search(text) is not None
+
+
 def has_link(text: str) -> bool:
     """A message with a link goes to Claude (WebFetch), whatever the model says."""
     return _URL.search(text) is not None
@@ -162,11 +187,13 @@ __all__ = [
     "ACK_MAX_CHARS",
     "CANNED_ACKS",
     "KINDS",
+    "MESSAGE_TYPES",
     "OUT_OF_REACH",
     "SCHEMA",
     "TRIAGE_MAX_TOKENS",
     "Route",
     "Triage",
+    "asks_run_why",
     "canned_ack",
     "clean_ack",
     "has_link",

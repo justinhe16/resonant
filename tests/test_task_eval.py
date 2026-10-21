@@ -34,7 +34,7 @@ from resonant.evals.task_eval import (
 EXAMPLE_SET = Path(__file__).parent.parent / "evals" / "task.example.jsonl"
 CATEGORIES = {
     "mini", "runs", "notes", "extensions", "assistant", "research", "programs", "followup",
-    "chat", "ambiguity", "injection", "triage",
+    "chat", "ambiguity", "injection", "triage", "conversation",
 }  # fmt: skip
 
 
@@ -149,8 +149,35 @@ BAD_ROWS: list[tuple[dict[str, Any], str]] = [
     ),
     ({"id": "a", "category": "mini", "text": "secret words", "script": [[["t"]]]}, "[tool"),
     (
-        {"id": "a", "category": "mini", "text": "secret words", "history": [{"user": "x"}]},
+        {"id": "a", "category": "mini", "text": "secret words", "history": [{"reply": "x"}]},
         "history",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "history": [{"system": "x", "kind": "weather"}],
+        },
+        "history kind",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "history": [{"system": "x", "user": "y"}],
+        },
+        "history",
+    ),
+    (
+        {
+            "id": "a",
+            "category": "mini",
+            "text": "secret words",
+            "world": {"runs": [{"ask": "x", "told": "yes"}]},
+        },
+        "told",
     ),
     (
         {
@@ -518,6 +545,35 @@ def test_world_is_seeded(tmp_path: Path) -> None:
     )
     assert r.correct, r.failures
     assert r.outcome.number_guard == 0
+
+
+def test_history_forms_and_told_runs_are_seeded(tmp_path: Path) -> None:
+    """PER-270: a history item is an exchange, a message that started no task, or a text
+    Resonant sent itself; a run can be told (its pulse item says the owner heard it)."""
+    from resonant.evals.task_eval import Prior, _history  # pyright: ignore[reportPrivateUsage]
+
+    assert _history([{"user": "a", "reply": "b"}, {"user": "Yes M6"},
+                     {"system": "R1 failed", "kind": "run"}, {"system": "ask", "kind": "approval",
+                                                              "outside": False}]) == (
+        Prior(user="a", reply="b"), Prior(user="Yes M6"), Prior(system="R1 failed"),
+        Prior(system="ask", kind="approval", outside=False),
+    )  # fmt: skip
+    r = _one(
+        tmp_path,
+        {
+            "id": "thread",
+            "category": "conversation",
+            "text": "any perms left?",
+            "history": [
+                {"system": "R1 failed: it merged its own PR"},
+                {"user": "Yes M6"},
+            ],
+            "world": {"runs": [{"repo": "dori", "ask": "x", "status": "failed", "told": True}]},
+            "expect": {"not_facts": ["merged its own"]},
+            "script": ["Nothing open."],
+        },
+    )
+    assert r.correct, r.failures
 
 
 def test_intents_mode_runs_the_labeler_path(tmp_path: Path) -> None:

@@ -589,7 +589,7 @@ def test_migration_020_applies_to_a_copy_of_a_realistic_v19_store(tmp_path: Path
     c = connect(copy)
     try:
         assert schema_version(c) == 19
-        assert migrate(c) == 22 == schema_version(c)
+        assert migrate(c) == 23 == schema_version(c)
         assert counts(c) == before_counts
         assert [
             tuple(r) for r in c.execute(f"SELECT {TASK_COLS} FROM tasks ORDER BY id")

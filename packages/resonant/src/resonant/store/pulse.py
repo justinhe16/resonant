@@ -13,6 +13,10 @@ Nothing is said twice because each row remembers the fingerprint the owner last 
 - :func:`pending` lists items whose fingerprint differs from what was told (urgency picks the
   channel: urgent now, normal at the hourly pulse, low at the briefing).
 - :func:`open_items` lists everything still open for the briefing, changed-since-told first.
+- :func:`mark_acked` records that the owner wrote back after a told version (``acked_at``;
+  any later message counts, so it is deterministic and needs no model), and
+  :func:`known_items` lists what was told recently, for the brain's "Already told" list.
+  Acking never re-opens an item; a new told version resets it.
 - :func:`mark_told` records what was said, compare-and-set: it only updates a row whose
   current fingerprint is the one of the *item that was sent*, so a report that lands between
   listing and sending stays pending, and a stale list never overwrites newer told state.
@@ -72,11 +76,17 @@ class Item:
     expires_at: datetime
     told_fingerprint: str | None
     told_at: datetime | None
+    acked_at: datetime | None = None
 
     @property
     def changed(self) -> bool:
         """True when the owner hasn't heard this version (never told, or told another)."""
         return self.told_fingerprint != self.fingerprint
+
+    @property
+    def known(self) -> bool:
+        """True when the owner was told exactly this version."""
+        return self.told_fingerprint == self.fingerprint
 
 
 def fingerprint(
@@ -101,12 +111,18 @@ def fingerprint(
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def run_key(code: str) -> str:
+    """The ``core`` item key of a run (``R8`` -> ``run/r8``)."""
+    return f"run/{code.lower()}"
+
+
 def valid_key(key: str) -> bool:
     return _KEY.fullmatch(key) is not None
 
 
 def _row_to_item(r: sqlite3.Row) -> Item:
     told_at: str | None = r["told_at"]
+    acked_at: str | None = r["acked_at"]
     return Item(
         source=r["source"],
         key=r["key"],
@@ -118,6 +134,7 @@ def _row_to_item(r: sqlite3.Row) -> Item:
         expires_at=datetime.fromisoformat(r["expires_at"]),
         told_fingerprint=r["told_fingerprint"],
         told_at=None if told_at is None else datetime.fromisoformat(told_at),
+        acked_at=None if acked_at is None else datetime.fromisoformat(acked_at),
     )
 
 
@@ -239,14 +256,52 @@ def mark_told(conn: sqlite3.Connection, items: Iterable[Item], at: datetime) -> 
     """Record that the owner heard these versions (the fingerprints in ``items``).
 
     Compare-and-set: a row that was re-reported since the item was read is left pending.
+    Telling a version the owner hadn't heard resets ``acked_at``; telling the same one again
+    keeps it.
     """
     with atomic(conn):
         for item in items:
             conn.execute(
-                "UPDATE pulse_items SET told_fingerprint = ?, told_at = ?"
+                "UPDATE pulse_items SET"
+                " acked_at = CASE WHEN told_fingerprint IS ? THEN acked_at END,"
+                " told_fingerprint = ?, told_at = ?"
                 " WHERE source = ? AND key = ? AND fingerprint = ?",
-                (item.fingerprint, iso(at), item.source, item.key, item.fingerprint),
+                (
+                    item.fingerprint,
+                    item.fingerprint,
+                    iso(at),
+                    item.source,
+                    item.key,
+                    item.fingerprint,
+                ),
             )
+
+
+def mark_acked(conn: sqlite3.Connection, before: datetime, at: datetime) -> int:
+    """The owner wrote at ``before``: ack every item told (at its current version) earlier.
+
+    Returns how many were acked. Items told after ``before`` wait for the next message.
+    """
+    with atomic(conn):
+        cur = conn.execute(
+            "UPDATE pulse_items SET acked_at = ? WHERE acked_at IS NULL"
+            " AND told_fingerprint = fingerprint AND told_at < ?",
+            (iso(at), iso(before)),
+        )
+    return cur.rowcount
+
+
+def known_items(conn: sqlite3.Connection, since: datetime, limit: int) -> list[Item]:
+    """Items told (at their current version) since ``since``, newest told first.
+
+    Cleared ones are included: "R8 failed" is still something the owner knows.
+    """
+    rows = conn.execute(
+        "SELECT * FROM pulse_items WHERE told_fingerprint = fingerprint AND told_at >= ?"
+        " ORDER BY told_at DESC, source, key LIMIT ?",
+        (iso(since), limit),
+    )
+    return [_row_to_item(r) for r in rows]
 
 
 def prune(conn: sqlite3.Connection, now: datetime) -> int:

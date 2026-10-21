@@ -7,12 +7,18 @@
 - **Input.** JSONL, one case per line (blank lines skipped)::
 
     {"id": "where-mycelium", "category": "mini", "text": "where is mycelium?",
-     "history": [{"user": "...", "reply": "..."}],          # optional earlier exchanges
+     "history": [{"user": "...", "reply": "..."}],          # optional earlier thread
      "world": {...},                                        # optional seeded state
      "expect": {"tools": ["read_file|list_dir"], "tools_not": ["start_run"],
                 "escalate": false, "ask": false, "writes": [], "facts": ["code/mycelium"],
                 "facts_re": [], "not_facts": [], "max_rounds": 3},
      "script": [...]}                                       # the scripted model's rounds
+
+  ``history`` (PER-270: the owner's thread, oldest first, two minutes apart): ``{user, reply}``
+  an exchange, ``{user}`` a message that started no task (an approval reply such as "Yes
+  M6"), ``{system, kind?, outside?}`` a text Resonant sent on its own (``kind``: ``run``
+  (default), ``approval`` or ``result``; ``outside``: it came from a tainted task, default
+  true for a run text).
 
   ``world``: ``repos`` (``{name, slug?, path?, base?, commits?}``; the dir is created, and
   with ``commits`` (``{subject, days_ago?}``, oldest first) it is a git checkout with that
@@ -20,7 +26,8 @@
   ``files`` (path relative to the world root → text: ``code/…`` is ``runner.code_dir``,
   ``logs/…`` Resonant's logs, ``docs/…`` its docs, ``runner/transcripts/…`` run
   transcripts), ``runs`` (``{repo, ask, status, minutes_ago?, last_note?, remote_url?,
-  pr_number?, pr_url?, transcript?}``), ``notes`` (strings), ``reminders``
+  pr_number?, pr_url?, transcript?, told?}``; ``told``: the owner was texted how it ended,
+  as its pulse item says), ``notes`` (strings), ``reminders``
   (``{in_minutes, text}``), ``facts`` (``{name, description, text?}``) and ``extensions``
   (name → ``{tool: canned result}``, from ``FIXTURES``: ``github``, ``linear``,
   ``trade-jev``). ``{root}`` in any world text, history or script argument is the world
@@ -37,7 +44,8 @@
   (it must be handed to Claude, by the triage or later); unset, either is fine.
 
   BR-10 rows may also say ``triage`` (what the scripted model's triage call answers, e.g.
-  ``{"handler": "claude", "kind": "general", "say": "on it"}``; default local) and ``claude``
+  ``{"handler": "claude", "kind": "general", "message_type": "greeting", "say": "on it"}``;
+  default local, message_type other) and ``claude``
   (a scripted Claude session: ``{"reads": [...], "calls": [{"name", "args"}], "answer"}``,
   run by ``e2e/fake_claude.py`` through the real MCP relay, bridge, gate and executor).
 
@@ -146,8 +154,10 @@ from resonant.runners.ask import AskRefused, AskRunner, AskScope, Queued
 from resonant.runners.brain import MAX_ROUNDS, PROGRESS_TEXT, BrainRunner
 from resonant.sandbox import resolve_tool
 from resonant.secrets import CLAUDE_TOKEN_REF, FakeKeychain, SecretStore
+from resonant.store import pulse as pulse_store
 from resonant.store import repos as repo_store
 from resonant.store import runs as run_store
+from resonant.store import system_texts
 from resonant.store import tasks as task_store
 from resonant.store.db import iso, kv_set, open_db, transaction, utcnow
 from resonant.tools import notes as notes_tools
@@ -278,13 +288,28 @@ class Expect:
     route: Literal["local", "claude"] | None = None
 
 
+SystemKind = Literal["approval", "result", "run"]
+
+
+@dataclass(frozen=True)
+class Prior:
+    """One earlier item of the owner's thread (PER-270): their message (``user``) with our
+    ``reply`` (none: it started no task), or a text Resonant sent itself (``system``)."""
+
+    user: str | None = None
+    reply: str | None = None
+    system: str | None = None
+    kind: SystemKind = "run"
+    outside: bool | None = None
+
+
 @dataclass(frozen=True)
 class TaskCase:
     line: int
     id: str
     category: str
     text: str
-    history: tuple[tuple[str, str], ...]
+    history: tuple[Prior, ...]
     world: dict[str, Any]
     expect: Expect
     script: list[Any] | None
@@ -350,20 +375,38 @@ def parse_expect(raw: Any) -> Expect:
     )
 
 
-def _history(raw: Any) -> tuple[tuple[str, str], ...]:
+def _history(raw: Any) -> tuple[Prior, ...]:
     if raw is None:
         return ()
     if not isinstance(raw, list):
         raise ValueError("'history' must be a list")
-    out: list[tuple[str, str]] = []
+    out: list[Prior] = []
     for item in cast(list[Any], raw):
         if not isinstance(item, dict):
-            raise ValueError("each history item is {user, reply}")
+            raise ValueError("each history item is {user, reply?} or {system, kind?, outside?}")
         d = cast(dict[str, Any], item)
-        user, reply = d.get("user"), d.get("reply")
-        if not isinstance(user, str) or not user or not isinstance(reply, str) or not reply:
-            raise ValueError("each history item is {user, reply} with non-empty strings")
-        out.append((user, reply))
+        unknown = set(d) - {"user", "reply", "system", "kind", "outside"}
+        if unknown:
+            raise ValueError(f"unknown history keys: {sorted(unknown)}")
+        user, reply, system = d.get("user"), d.get("reply"), d.get("system")
+        if system is not None:
+            kind = d.get("kind", "run")
+            outside = d.get("outside")
+            if not isinstance(system, str) or not system or user is not None or reply is not None:
+                raise ValueError("a history {system} item is a non-empty string, alone")
+            if kind not in get_args(SystemKind):
+                raise ValueError(f"history kind is one of {', '.join(get_args(SystemKind))}")
+            if outside is not None and not isinstance(outside, bool):
+                raise ValueError("history outside is true or false")
+            out.append(Prior(system=system, kind=kind, outside=outside))
+            continue
+        if not isinstance(user, str) or not user:
+            raise ValueError("each history item is {user, reply?} or {system, kind?, outside?}")
+        if reply is not None and (not isinstance(reply, str) or not reply):
+            raise ValueError("a history reply is a non-empty string")
+        if d.get("kind") is not None or d.get("outside") is not None:
+            raise ValueError("kind and outside belong to a history {system} item")
+        out.append(Prior(user=user, reply=reply))
     return tuple(out)
 
 
@@ -427,6 +470,8 @@ def _world(raw: Any) -> dict[str, Any]:
         _opt(run, "repo", str, "runs")
         _opt(run, "minutes_ago", (int, float), "runs")
         _opt(run, "pr_number", int, "runs")
+        if run.get("told") is not None and not isinstance(run["told"], bool):
+            raise ValueError("world.runs[].told is true or false")
         for key in ("last_note", "remote_url", "pr_url", "branch", "summary", "failure"):
             _opt(run, key, str, "runs")
         if run.get("status", "running") not in RUN_STATUSES:
@@ -485,9 +530,14 @@ def _triage(raw: Any) -> dict[str, Any] | None:
         "local",
         "claude",
     ):
-        raise ValueError("'triage' is {handler: local|claude, kind?, say?}")
+        raise ValueError("'triage' is {handler: local|claude, kind?, message_type?, say?}")
     d = cast(dict[str, Any], raw)
-    return {"handler": d["handler"], "kind": d.get("kind", "general"), "say": d.get("say", "")}
+    return {
+        "handler": d["handler"],
+        "kind": d.get("kind", "general"),
+        "message_type": d.get("message_type", "other"),
+        "say": d.get("say", ""),
+    }
 
 
 def _claude(raw: Any) -> dict[str, Any] | None:
@@ -910,7 +960,7 @@ def seed_world(
     settings: Settings,
     conn: sqlite3.Connection,
     world: Mapping[str, Any],
-    history: Sequence[tuple[str, str]],
+    history: Sequence[Prior],
     *,
     now: datetime,
 ) -> None:
@@ -954,7 +1004,7 @@ def seed_world(
         install_fixture(
             settings, conn, fx.manifest, {"cli.py": FIXTURE_CLI, "data.json": json.dumps(canned)}
         )
-    _seed_history(conn, [fill(list(h), root) for h in history], now)
+    _seed_history(conn, [replace_text(h, root) for h in history], now)
 
 
 def seed_commits(git: Path, path: Path, commits: Sequence[Any], now: datetime) -> None:
@@ -1013,6 +1063,8 @@ def _seed_run(
         run_store.update(conn, code, status="running", **fields)
         done: dict[str, Any] = {k: run[k] for k in ("pr_number", "pr_url") if k in run}
         run_store.finish(conn, code, cast(Any, status), failure=run.get("failure"), **done)
+        if run.get("told") is True:  # PER-270: the owner was texted how it ended
+            _seed_told(conn, code, status, run, now)
     lines = [
         _transcript_line(item, started + timedelta(minutes=i), i)
         for i, item in enumerate(cast(list[Any], run.get("transcript") or []))
@@ -1023,19 +1075,51 @@ def _seed_run(
         )
 
 
-def _seed_history(conn: sqlite3.Connection, history: Sequence[Any], now: datetime) -> None:
-    """Earlier exchanges: a message event and the done task holding our reply, oldest first."""
-    for i, (user, reply) in enumerate(history):
+def replace_text(prior: Prior, root: Path) -> Prior:
+    """``prior`` with ``{root}`` filled in its texts."""
+    return Prior(
+        user=None if prior.user is None else str(fill(prior.user, root)),
+        reply=None if prior.reply is None else str(fill(prior.reply, root)),
+        system=None if prior.system is None else str(fill(prior.system, root)),
+        kind=prior.kind,
+        outside=prior.outside,
+    )
+
+
+def _seed_told(
+    conn: sqlite3.Connection, code: str, status: str, run: Mapping[str, Any], now: datetime
+) -> None:
+    """The run's end item in the pulse, told, as ``runners.reports`` leaves it."""
+    title = f"{code} {status} · {run.get('repo') or 'no repo'}"
+    _change, item = pulse_store.upsert(
+        conn, "core", pulse_store.run_key(code), title,
+        "urgent" if status == "failed" else "normal", None, True, pulse_store.DEFAULT_TTL_S, now,
+    )  # fmt: skip
+    pulse_store.mark_told(conn, [item], now)
+
+
+def _seed_history(conn: sqlite3.Connection, history: Sequence[Prior], now: datetime) -> None:
+    """The owner's earlier thread, oldest first: a message event (and, with a reply, the done
+    task holding it; without, a consumed message that started no task) or a system text."""
+    for i, prior in enumerate(history):
         at = now - timedelta(minutes=2 * (len(history) - i))
+        if prior.system is not None:
+            outside = prior.outside if prior.outside is not None else prior.kind == "run"
+            system_texts.record(conn, OWNER, prior.kind, prior.system, ref=f"eval:{i}", now=at,
+                                outside=outside)  # fmt: skip
+            continue
         event = Event(
             source="imessage",
             type="message",
             principal=OWNER,
-            payload={"text": user},
+            payload={"text": prior.user},
             occurred_at=at,
         )
         with transaction(conn):
             task_store.insert_event(conn, event)
+            if prior.reply is None:
+                task_store.consume_events(conn, [event.id])
+                continue
             task_id = task_store.insert_task(
                 conn,
                 NewTask(
@@ -1043,7 +1127,7 @@ def _seed_history(conn: sqlite3.Connection, history: Sequence[Any], now: datetim
                     runner="brain",
                     priority=10,
                     principal=OWNER,
-                    checkpoint={"title": "chat", "reply": reply},
+                    checkpoint={"title": "chat", "reply": prior.reply},
                     origin_event_id=event.id,
                     trace_id=event.trace_id,
                 ),

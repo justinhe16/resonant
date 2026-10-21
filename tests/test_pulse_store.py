@@ -287,3 +287,61 @@ def test_same_key_in_two_sources_is_two_items(db: sqlite3.Connection) -> None:
     report(db, source="a")
     report(db, source="b")
     assert {i.source for i in pulse.pending(db, pulse.URGENCIES, NOW)} == {"a", "b"}
+
+
+# --- acknowledged (PER-270, migration 023) ---------------------------------------------------
+
+
+def test_ack_only_follows_a_told_version(db: sqlite3.Connection) -> None:
+    report(db)
+    assert pulse.mark_acked(db, NOW + HOUR, NOW + HOUR) == 0  # never told: nothing to ack
+    [item] = told(db)
+    assert pulse.mark_acked(db, NOW, NOW) == 0  # a message from before it was told
+    assert pulse.mark_acked(db, NOW + HOUR, NOW + HOUR) == 1
+    got = pulse.get(db, item.source, item.key)
+    assert got is not None and got.acked_at == NOW + HOUR and got.known
+    assert pulse.mark_acked(db, NOW + 2 * HOUR, NOW + 2 * HOUR) == 0  # once
+
+
+def test_acking_never_reopens_an_item(db: sqlite3.Connection) -> None:
+    report(db, clear=True)
+    told(db)
+    pulse.mark_acked(db, NOW + HOUR, NOW + HOUR)
+    assert pulse.pending(db, pulse.URGENCIES, NOW + HOUR) == []
+    assert pulse.open_items(db, NOW + HOUR) == []
+
+
+def test_a_new_told_version_resets_the_ack_and_the_same_one_keeps_it(
+    db: sqlite3.Connection,
+) -> None:
+    report(db)
+    told(db)
+    pulse.mark_acked(db, NOW + HOUR, NOW + HOUR)
+    [same] = [pulse.get(db, "dori", "dori/incident/1")]
+    assert same is not None
+    pulse.mark_told(db, [same], NOW + 2 * HOUR)  # told the same version again
+    kept = pulse.get(db, "dori", "dori/incident/1")
+    assert kept is not None and kept.acked_at == NOW + HOUR
+    report(db, "Dori still failing", now=NOW + 3 * HOUR)  # a new version
+    told(db, NOW + 3 * HOUR)
+    fresh = pulse.get(db, "dori", "dori/incident/1")
+    assert fresh is not None and fresh.acked_at is None
+
+
+def test_known_items_are_the_recently_told_current_versions(db: sqlite3.Connection) -> None:
+    report(db, "A", key="a", source="core", clear=True, now=NOW)
+    told(db, NOW)
+    report(db, "B", key="b", source="core", now=NOW + HOUR)
+    told(db, NOW + HOUR)
+    report(db, "C", key="c", source="core", now=NOW + 2 * HOUR)  # never told
+    report(db, "B again", key="b", source="core", now=NOW + 2 * HOUR)  # changed since told
+    report(db, "D", key="d", source="core", now=NOW + 2 * HOUR)
+    told_d = [i for i in pulse.pending(db, pulse.URGENCIES, NOW + 2 * HOUR) if i.key == "d"]
+    pulse.mark_told(db, told_d, NOW + 2 * HOUR)
+    assert [i.key for i in pulse.known_items(db, NOW - HOUR, 10)] == ["d", "a"]
+    assert [i.key for i in pulse.known_items(db, NOW + HOUR, 10)] == ["d"]
+    assert [i.key for i in pulse.known_items(db, NOW - HOUR, 1)] == ["d"]
+
+
+def test_run_key() -> None:
+    assert pulse.run_key("R8") == "run/r8"

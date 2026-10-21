@@ -359,8 +359,12 @@ async def test_the_answer_goes_out_before_the_batch_prompt_and_stays_in_history(
     assert h.reply("yes").ok
     await h.step(task_id)
     history = replayed(h.db, OWNER, before_event_id=None)
-    (said,) = [m["content"] for m in history.messages if m["role"] == "assistant"]
-    assert said.startswith('RES-12 is blocked on review.\nDone: close ticket id="A"')
+    said = [m["content"] for m in history.messages if m["role"] == "assistant"]
+    # PER-270: the early answer and the batch's result are separate turns of the thread
+    assert said == [
+        "RES-12 is blocked on review.",
+        'Done: close ticket id="A" / Done: close ticket id="B"',
+    ]
 
 
 async def test_a_partial_yes_is_audited_as_partial(h: H) -> None:
