@@ -99,7 +99,7 @@ export function RunsAndTasks({ snap, now }: { snap: Snapshot; now: number }) {
 function DetectedEffects({ detected }: { detected: NonNullable<Snapshot["runs"]["detected"]> }) {
   const by = Object.entries(detected.by_kind).sort(([a, x], [b, y]) => y - x || a.localeCompare(b));
   return (
-    <Group label="Detected side effects" count={sum(detected.by_kind)}>
+    <Group label="Detected side effects, recent runs" count={sum(detected.by_kind)}>
       <div className="space-y-1.5" data-testid="detected-effects">
         <Counts by={by} tone={() => "neutral"} />
         {detected.high > 0 && (
