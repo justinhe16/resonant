@@ -29,7 +29,7 @@
     },
     "ApprovalItem": {
       "additionalProperties": false,
-      "description": "What one answer decides: a lone approval, or a batch (PER-254) as one row with the\nbatch's code (its first approval's), the summary ``N changes, all or none``, its strictest\nlevel, when it was asked and its one expiry. ``changes`` lists a batch's changes in\norder; it is absent for a lone approval.",
+      "description": "What one answer decides: a lone approval, or a batch (PER-254) as one row with the\nbatch's code (its first approval's), the summary ``N changes``, its strictest\nlevel, when it was asked and its one expiry. ``changes`` lists a batch's changes in\norder; it is absent for a lone approval.",
       "properties": {
         "asked_at": {
           "format": "date-time",

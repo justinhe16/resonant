@@ -70,7 +70,7 @@ describe("Dashboard, local tier", () => {
   it("shows an approval batch as one row with its changes", async () => {
     mount(local);
     await screen.findByRole("heading", { name: "Something is degraded" });
-    const row = screen.getByText("3 changes, all or none").closest("li")!;
+    const row = screen.getByText("3 changes").closest("li")!;
     const changes = within(row).getByRole("list", { name: "Changes" });
     expect(within(changes).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
       '1.linear: save issue title="Retry the relay push"L3',
