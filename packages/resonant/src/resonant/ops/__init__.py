@@ -1,6 +1,7 @@
 """Mac mini ops plumbing: the subprocess runner, the detached restart, and "back up".
 
-Every ops subprocess is an argv list (never a shell), with a timeout, through an injectable
+Every ops subprocess is an argv list (never a shell), with a timeout and a minimal fixed env
+(``ops_env``: none of the daemon's own variables), through an injectable
 :class:`OpsRunner`, so tests use :class:`resonant.ops.fakes.FakeOpsRunner` and never run a
 real command. stderr is captured but never logged or shown: it can echo paths and remotes.
 
@@ -50,6 +51,10 @@ RESTART_PENDING_KEY = "ops.restart_pending"
 # clears the marker before the runner starts, so the runner has its own key.
 RESTART_PLANNED_KEY = "ops.restart_planned"
 
+# An ops subprocess gets a fixed env, never the daemon's: os.environ can hold API keys and
+# tokens (and anything a launchd plist or shell added), and git and uv need none of it. Only
+# these are copied, for git's config and credential helper and uv's interpreter lookup.
+_PASS_ENV = ("HOME", "USER", "LOGNAME", "TMPDIR")
 # git and uv never prompt: there is no terminal, and a prompt would only hang to the timeout.
 _ENV = {
     # System dirs only: git and uv run by absolute path, and nothing they spawn is looked up
@@ -90,11 +95,25 @@ class OpsRunner(Protocol):
         ...
 
 
+def ops_env(
+    base: Mapping[str, str] | None = None, extra: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """The minimal, fixed env for an ops subprocess: ``_PASS_ENV`` from ``base`` (default
+    ``os.environ``), then ``_ENV``, then ``extra``. Nothing else of the daemon's env."""
+    base = os.environ if base is None else base
+    return {
+        **{k: base[k] for k in _PASS_ENV if base.get(k)},
+        **_ENV,
+        **(extra or {}),
+    }
+
+
 class SubprocessRunner:
-    """The real runner: ``asyncio.create_subprocess_exec`` and ``subprocess.Popen``."""
+    """The real runner: ``asyncio.create_subprocess_exec`` and ``subprocess.Popen``, with
+    the minimal env of ``ops_env``."""
 
     def __init__(self, env: Mapping[str, str] | None = None) -> None:
-        self.env = {**os.environ, **_ENV, **(env or {})}
+        self.env = ops_env(extra=env)
 
     async def run(
         self, argv: Sequence[str], *, timeout_s: float, cwd: Path | None = None
@@ -279,6 +298,7 @@ __all__ = [
     "clear_restart",
     "kickstart_argv",
     "mark_restart",
+    "ops_env",
     "restart_later_argv",
     "restart_pending",
     "take_planned",

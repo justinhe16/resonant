@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 import pytest
 
+from resonant.config import IMessageConfig
 from resonant.gate import (
     Allow,
     ApprovalReply,
@@ -23,13 +24,16 @@ from resonant.gate import (
 )
 from resonant.gate.policy import NOT_APPROVED
 from resonant.gate.types import REPLY_REFUSALS
+from resonant.gateway.imessage import IMessageReader
+from resonant.gateway.imessage.fixtures import FakeChatDB
+from resonant.gateway.imessage.reader import FUTURE_SKEW
 from resonant.loop import NewTask
 from resonant.principals import Principals
 from resonant.store import approvals as ap
 from resonant.store import tasks as repo
 from resonant.store.db import kv_set, open_db
 from resonant.tools import ToolRegistry
-from resonant_sdk import Effect, Level, ToolSpec
+from resonant_sdk import Effect, Event, Level, ToolSpec
 
 NOW = datetime(2026, 10, 13, 15, 0, tzinfo=UTC)
 SENT = NOW + timedelta(seconds=10)  # when prompts go out
@@ -250,6 +254,42 @@ def test_reply_never_binds_a_prompt_sent_after_it(
 ) -> None:
     asked = ask(db, gate, sent=sent)
     result = reply(gate, code=asked.code if with_code else None)
+    assert not result.ok and result.reason == "not_sent_before"
+    assert status(db, asked) == "pending"
+    assert wakes(db) == []
+
+
+def test_a_yes_from_a_fast_phone_clock_never_binds_a_later_prompt(
+    db: sqlite3.Connection, gate: PolicyGate, clock: Clock, tmp_path: Path
+) -> None:
+    """The owner's phone runs 10 minutes fast. A "yes" sent (and read) before the prompt
+    goes out carries a date after it; the reader clamps it to its read time, so the
+    sent-before rule still refuses it."""
+    owner = "+15551234567"
+    inbound = Principals.model_validate(
+        {"principals": {"justin": {"role": "owner", "identities": [f"imessage:{owner}"]}}}
+    )
+    chat = FakeChatDB(tmp_path / "chat.db")
+    try:
+        config = IMessageConfig(self_handle="resonant@example.com", db_path=chat.path)
+        reader = IMessageReader(config, inbound, db, clock)
+        events: list[Event] = []
+
+        def submit(event: Event) -> bool:
+            events.append(event)
+            return True
+
+        reader.poll_once(submit)  # first start: the cursor goes to the end
+        read_at = SENT - timedelta(seconds=5)
+        clock.now = read_at
+        chat.add_message(handle=owner, text="yes", at=read_at + timedelta(minutes=10))
+        assert reader.poll_once(submit) == 1
+    finally:
+        chat.close()
+    [event] = events
+    assert event.occurred_at == read_at + FUTURE_SKEW < SENT  # unclamped it'd be after SENT
+    asked = ask(db, gate, sent=SENT)
+    result = reply(gate, at=event.occurred_at)
     assert not result.ok and result.reason == "not_sent_before"
     assert status(db, asked) == "pending"
     assert wakes(db) == []

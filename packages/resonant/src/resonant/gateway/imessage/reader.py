@@ -49,6 +49,12 @@ dedupe_key="imessage:<guid>")`` and go to ``submit``. The cursor advances only p
 that were fully handled, once per batch. A crash replays at most one batch, and the
 dedupe key makes that harmless.
 
+**Timestamps.** ``occurred_at`` is the row's ``date``, clamped to at most ``FUTURE_SKEW``
+past the moment the reader read it (``clock()``). A phone whose clock runs fast would
+otherwise stamp a reply later than the prompt it answers, so a "yes" sent before a prompt
+could pass the gate's sent-before rule (``gate.policy._sent_before``). A clock that runs
+behind is left alone: an older stamp can only make a reply bind less.
+
 **PII.** Message bodies never go to logs or audit rows. Audits carry handles, guids and
 counts only.
 
@@ -97,6 +103,8 @@ APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=UTC)
 WAL_CHECK_S = 0.25
 DEBOUNCE_S = 0.1
 _RATE_WINDOW = timedelta(seconds=60)
+# How far past the read time a row's own date may be; anything later is clamped to it.
+FUTURE_SKEW = timedelta(seconds=1)
 _OBJECT_REPLACEMENT = "\ufffc"
 
 FDA_MESSAGE = (
@@ -320,7 +328,8 @@ class IMessageReader:
         # U+FFFC marks an attachment's position; an attachment-only message has no text.
         text = (raw_text or "").replace(_OBJECT_REPLACEMENT, "").strip()
         handle = normalize_handle(row["handle"]) if row["handle"] else None
-        at = from_apple_time(row["date"]) or self.clock()
+        read_at = self.clock()
+        at = min(from_apple_time(row["date"]) or read_at, read_at + FUTURE_SKEW)
 
         if SELFTEST_RE.match(text):
             self._dispatch_selftest(
@@ -552,6 +561,7 @@ __all__ = [
     "BATCH",
     "CURSOR_KEY",
     "FDA_MESSAGE",
+    "FUTURE_SKEW",
     "SELFTEST_PREFIX",
     "SELFTEST_RE",
     "IMessageReader",
