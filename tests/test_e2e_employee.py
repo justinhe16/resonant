@@ -264,7 +264,7 @@ async def test_the_thin_guard_lets_a_worker_read_env_but_not_touch_resonant(
     async with running(w):
         assert (await w.say(f"/run {REPO} fix it")).startswith("On it: R1")
         done = await w.next_text()
-        assert bare(done).startswith("R1 made no changes"), done
+        assert bare(done).startswith("R1 couldn't push: 1 commit saved on "), done
         seen = json.loads((w.tmp() / "guard.json").read_text())
         assert seen["env"] == "ok DATABASE_URL=postgres://owner@localhost/demo", seen
         assert seen["state"].startswith("denied "), seen
