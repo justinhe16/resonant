@@ -27,6 +27,7 @@ from resonant.router.router import toolset_for
 from resonant.runners.claude import MAX_ASK, Cancelled, Merged, MergeQueued, Refused, Started
 from resonant.runners.local import report_line
 from resonant.runners.worker_desk import OpenQuestion, Relayed
+from resonant.store import approvals as ap
 from resonant.store import extensions as ext_store
 from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
@@ -276,6 +277,8 @@ def test_a_chat_merge_asks_when_the_repo_has_no_ci(
         db.execute("UPDATE repos SET ci = ? WHERE name = 'resonant'", (ci,))
         asked = components.gate.evaluate(intent(components, "merge_run", {"code": "R1"}))
         assert isinstance(asked, NeedsApproval) and asked.level is Level.L2
+        # PER-269: one request per action; the next ask (another task) would point to this one
+        ap.expire_one(db, asked.approval_id, utcnow(), reason="test")
     typed = components.gate.evaluate(
         intent(components, "merge_run", {"code": "R1"}, origin="explicit")
     )

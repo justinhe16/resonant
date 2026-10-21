@@ -10,7 +10,10 @@ API for EM-3 (the worker CLI's per-run socket)::
 
 ``request_check`` never raises for a "no": it returns ``"denied"``. ``"busy"`` means the
 check wasn't asked at all, because ``MAX_PENDING`` of the run's checks already wait for the
-owner (the worker is told to wait for those answers, which is not an owner "no"). It raises
+owner (the worker is told to wait for those answers, which is not an owner "no").
+``"handled"`` (PER-269) means it wasn't asked because another path (the brain's tool call, a
+job, another run) already asks the owner for the same action (``gate.actions``): one request
+per action, so the worker is told not to do it itself. It raises
 ``ValueError`` only for a bad ``system`` or ``action`` (not a slug, or ``*``), which the
 CLI should report to the worker as a usage error. ``IMessageStack.trust`` holds the
 daemon's instance.
@@ -58,9 +61,11 @@ import hashlib
 import logging
 import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal
 
+from resonant.gate import actions as action_ids
 from resonant.gate.codes import new_code
 from resonant.gate.types import NeedsApproval, canonical_json
 from resonant.gateway.channel import Channel, ChannelError
@@ -81,7 +86,15 @@ CHECK_TOOL = ap.CHECK_TOOL  # the approvals' tool name; no registered tool has i
 POLL_S = 1.0
 REPROMPT_S = 30.0  # re-send the prompt after a transient channel failure
 
-Answer = Literal["ok", "denied", "busy"]
+Answer = Literal["ok", "denied", "busy", "handled"]
+
+
+@dataclass(frozen=True)
+class _Held:
+    """PER-269: another path already asks the owner for this action (not this run's check)."""
+
+    approval_id: str
+    text: str  # ``Resonant is already asking for this: M6; …`` (code-built)
 
 
 MAX_PENDING = 3  # pending checks per run; more is approval spam
@@ -183,7 +196,7 @@ class TrustChecks:
         if decision.ok:
             return "ok"
         approval = self._approval(
-            run.code,
+            run,
             run.task_id,
             decision,
             system,
@@ -196,6 +209,10 @@ class TrustChecks:
         if approval is None:  # not asked: the worker is told to wait (EM-5), not "no"
             self._audit(run.code, system, action, "busy", "too many pending checks")
             return "busy"
+        if isinstance(approval, _Held):  # one request per action: the other one stands
+            self._audit(run.code, system, action, "handled", approval.text,
+                        approval_id=approval.approval_id)  # fmt: skip
+            return "handled"
         try:
             answer, why = await self._wait(run.code, run.task_id, approval, system, action)
         except asyncio.CancelledError:
@@ -215,7 +232,7 @@ class TrustChecks:
 
     def _approval(
         self,
-        run_code: str,
+        run: runs_store.Run,
         task_id: str,
         decision: TrustDecision,
         system: str,
@@ -225,9 +242,13 @@ class TrustChecks:
         what: str,
         *,
         repo: str | None,
-    ) -> NeedsApproval | None:
-        """The pending approval for this check: reused while one is pending, else new."""
+    ) -> NeedsApproval | _Held | None:
+        """The pending approval for this check: reused while one is pending (this check, or
+        the run's own check for the same action worded otherwise), else new. ``_Held`` when
+        another path already asks for the same action (PER-269)."""
+        run_code = run.code
         shown = clean_what(what)
+        act = action_ids.for_check(self.conn, run, action, what)
         intent_hash = check_hash(
             run_code, system, action, bool(irreversible), float(cost_usd), shown
         )
@@ -235,6 +256,12 @@ class TrustChecks:
         with atomic(self.conn):
             ap.expire_due(self.conn, now)
             row = ap.pending_for_intent(self.conn, task_id, intent_hash, now)
+            if row is None and act is not None:
+                held = ap.pending_for_action(self.conn, act.key, now)
+                row = next((a for a in held if a.task_id == task_id and a.tool == CHECK_TOOL),
+                           None)  # fmt: skip
+                if row is None and held:
+                    return _Held(held[0].id, action_ids.already_asking(self.conn, held[0]))
             if row is None:
                 pending = self.conn.execute(
                     "SELECT COUNT(*) FROM approvals WHERE task_id = ? AND tool = ?"
@@ -267,6 +294,8 @@ class TrustChecks:
                         require_code=False,
                         requested_by=run_code,
                         allow_always=always,
+                        action_key=act.key if act is not None else None,
+                        action_target=act.target if act is not None else None,
                     ),
                     now,
                 )

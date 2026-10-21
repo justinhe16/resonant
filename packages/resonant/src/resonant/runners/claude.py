@@ -89,6 +89,7 @@ import psutil
 from resonant import killswitch
 from resonant.config import RunnerConfig, RunnerRepo
 from resonant.extensions.notify import clean_text
+from resonant.gate import actions as action_ids
 from resonant.gate.codes import clean_external
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import (
@@ -157,6 +158,7 @@ from resonant.runners.live import (
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.runners.reports import (
     HELD_KINDS,
+    MergedBy,
     Report,
     WorkerReports,
     alerts,
@@ -165,11 +167,13 @@ from resonant.runners.reports import (
     detected_list,
     end_event,
     end_title,
+    merged_by_of,
     merged_list,
     merged_names,
     record_detected,
     set_alert,
     set_merged,
+    set_merged_by,
     shown_did,
 )
 from resonant.runners.side_effects import RunContext, SideEffect, detect
@@ -211,6 +215,7 @@ from resonant.secrets import (
     load_runner_secrets,
     missing_runner_secrets,
 )
+from resonant.store import approvals as approvals_store
 from resonant.store import questions as questions_store
 from resonant.store import repos as repo_store
 from resonant.store import runs, system_texts
@@ -500,6 +505,7 @@ def end_parts(
     upstream: str | None = None,
     watching: bool = False,
     merged: Sequence[str] = (),
+    merged_by: MergedBy | None = None,
 ) -> tuple[str, list[str], list[str]] | None:
     """An ended run's headline, its further lines (most important first) and the worker's
     own summary line (``said``, kept apart so a caller can put the side effects before it);
@@ -510,7 +516,9 @@ def end_parts(
     warning), never an auto-merge. ``upstream``: a fork-mode run's original repo (its
     ``done`` names the PR opened there, or why none was). ``watching``: the run merges itself
     once CI is green. ``merged``: the PRs a run merged onto its base (``PR #121``): its
-    ``done`` says so."""
+    ``done`` says so. ``merged_by`` (PER-269): the run's own PR was found merged and Resonant
+    has a record of it: Resonant merged it (``R8's PR #2 is merged into main (you approved it
+    in M6).``), or the run did on the owner's yes to its check."""
     took = fmt_duration(run.session_seconds)
     who = run_who(run)
     said = [f"{run.code}: {run.summary}"] if run.summary else []
@@ -550,9 +558,18 @@ def end_parts(
                 f"{upstream} ({why})."
             )
             return head, [], said
+        case "done" if merged and merged_by is not None and merged_by.by == "resonant":
+            base = run.base_branch or "the base"  # PER-269: Resonant merged the run's PR
+            approved = f" (you approved it in {merged_by.code})" if merged_by.code else ""
+            return f"{run.code}'s {and_list(merged)} is merged into {base}{approved}.", [], said
         case "done" if merged:  # PER-268: it merged a PR onto its base, as asked
             base = run.base_branch or "the base"
-            return f"{who} merged {and_list(merged)} into {base} ({took}).", [], said
+            approved = (
+                f"; you approved it in {merged_by.code}"
+                if merged_by is not None and merged_by.code
+                else ""
+            )
+            return f"{who} merged {and_list(merged)} into {base} ({took}{approved}).", [], said
         case "done" if run.repo:  # RX-1: a run that couldn't push; the work is on its branch
             where = _home(run.checkout) if run.checkout else run.repo
             why = run.failure or "it can't push yet"
@@ -600,10 +617,12 @@ def reply_text(
     upstream: str | None = None,
     watching: bool = False,
     merged: Sequence[str] = (),
+    merged_by: MergedBy | None = None,
 ) -> str | None:
     """The message for an ended run, from :func:`end_parts` (None for a state that has
     none), at most a headline and ``END_EXTRA_LINES`` lines."""
-    parts = end_parts(run, ci, no_ci=no_ci, upstream=upstream, watching=watching, merged=merged)
+    parts = end_parts(run, ci, no_ci=no_ci, upstream=upstream, watching=watching, merged=merged,
+                      merged_by=merged_by)  # fmt: skip
     if parts is None:
         return None
     head, lines, said = parts
@@ -1605,6 +1624,9 @@ class ClaudeRunner:
                 runs.update(self.conn, run.code, status="merged", flagged_paths=checked.flagged)
                 audit(self.conn, "run.merged", run=run.code, pr=run.pr_number, by=by,
                       no_ci=done.no_ci)  # fmt: skip
+                merged = self._pr_target(run, run.pr_number)
+                if merged is not None:  # PER-269: the open asks for it are moot
+                    approvals_store.obsolete_for_target(self.conn, merged, self.clock())
         told = by == "owner" if replied is None else replied
         await self._report_merged(self._must_get(run.code), by_owner=told, deps=checked.deps)
         with contextlib.suppress(Exception):
@@ -2734,7 +2756,26 @@ class ClaudeRunner:
                 f"the session pushed {p.branch} but opened no PR (work kept: /runs {run.code})"
             )
         self._check_stop(run.code)
-        if pr.state == "MERGED":  # the session merged it itself: no check ever ran on it
+        target = self._pr_target(run, pr.number)
+        if target is not None and pr.state in ("MERGED", "CLOSED"):
+            approvals_store.obsolete_for_target(self.conn, target, self.clock())  # PER-269
+        if (
+            target is not None
+            and pr.state == "MERGED"
+            and (record := action_ids.merge_record(self.conn, *_split_target(target)))
+        ):
+            # PER-269: Resonant merged it (merge_pr), or the owner approved the run's merge:
+            # the run's work is done and merged, not a merge behind Resonant's back.
+            set_merged(self.conn, run.code, [f"PR #{pr.number}"])
+            set_merged_by(self.conn, run.code, MergedBy(record.by, record.code))
+            if not runs.finish(self.conn, run.code, "done", step="reply",
+                               pr_number=pr.number, pr_url=pr.url):  # fmt: skip
+                raise _Cancelled
+            with atomic(self.conn):
+                audit(self.conn, "run.done_merged", run=run.code, merged=1, pr=pr.number,
+                      by=record.by, approval=record.code)  # fmt: skip
+            return self._must_get(run.code)
+        if pr.state == "MERGED":  # merged with no record in Resonant: no check ever ran on it
             set_alert(
                 self.conn,
                 run.code,
@@ -3052,6 +3093,12 @@ class ClaudeRunner:
 
     # -- the session's GitHub token --
 
+    def _pr_target(self, run: Run, number: int) -> str | None:
+        """``jhe/dori#2`` for a PR of the run's repo (``gate.actions``); None (never raises)
+        when the repo isn't registered."""
+        repo = repo_store.find(self.conn, run.repo) if run.repo else None
+        return action_ids.pr_target(repo.slug, number) if repo is not None else None
+
     def _slug(self, repo_name: str) -> str:
         repo = repo_store.find(self.conn, repo_name)
         if repo is None:
@@ -3206,8 +3253,9 @@ class ClaudeRunner:
         upstream = repo.slug if repo is not None and repo.mode == "fork" else None
         ci = await self._ci_word(run)
         merged = merged_list(self.conn, run.code) if run.status == "done" else []
+        merged_by = merged_by_of(self.conn, run.code) if merged else None
         parts = end_parts(run, ci, no_ci=no_ci, upstream=upstream, watching=watching,
-                          merged=merged)  # fmt: skip
+                          merged=merged, merged_by=merged_by)  # fmt: skip
         event = end_event(run)
         title = end_title(run, ci, merged=merged)
         # PER-268: one text per outcome. The ⚠ lines (a direct push, a PR merged by the
@@ -3267,7 +3315,7 @@ class ClaudeRunner:
         # be a tainted turn's, a failure quotes GitHub, flagged paths are the worker's): it
         # taints the turn that sees it, as the run tools do.
         bare = end_parts(replace(run, summary=None), ci, no_ci=no_ci, upstream=upstream,
-                         watching=watching, merged=merged)  # fmt: skip
+                         watching=watching, merged=merged, merged_by=merged_by)  # fmt: skip
         if bare is not None:
             said = end_text(bare[0], [*warn, *([note] if note else []), *bare[1]])
             ref = f"run:{run.code}:{run.status}"
@@ -3500,6 +3548,12 @@ def _mergeable(run: Run) -> bool:
         and run.head_sha is not None
         and run.branch is not None
     )
+
+
+def _split_target(target: str) -> tuple[str, int]:
+    """``("jhe/dori", 2)`` for ``jhe/dori#2`` (a ``gate.actions.pr_target``)."""
+    repo, number = target.rsplit("#", 1)
+    return repo, int(number)
 
 
 def _pr_number(run: Run) -> int:

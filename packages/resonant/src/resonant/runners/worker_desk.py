@@ -102,6 +102,11 @@ RESTARTED = (
 CHECK_OK = "ok"
 CHECK_DENIED = "denied"
 CHECK_BUSY = "busy"  # not asked: MAX_PENDING checks already wait for the owner
+CHECK_HANDLED = "handled"  # PER-269: not asked: another request for this action is open
+HANDLED = (
+    "Resonant is already asking the owner for this (one request per action), so don't do it "
+    "yourself; if it is needed, it is done that way."
+)
 BUSY = (
     "Too many pending checks; wait for the owner's answers to those, then run this check "
     "again. This is not a no."
@@ -144,7 +149,7 @@ class TrustChecker(Protocol):
         irreversible: bool = False,
         cost_usd: float = 0.0,
         what: str = "",
-    ) -> Literal["ok", "denied", "busy"]: ...
+    ) -> Literal["ok", "denied", "busy", "handled"]: ...
 
 
 class SelfOps(Protocol):
@@ -601,7 +606,9 @@ class WorkerDesk:
             answer = CHECK_DENIED
         with atomic(self.conn):
             audit(self.conn, "run.check", run=code, system=system, verb=action, answer=answer)
-        recorded = {"ok": CHECK_OK, "busy": CHECK_BUSY}.get(answer, CHECK_DENIED)
+        recorded = {"ok": CHECK_OK, "busy": CHECK_BUSY, "handled": CHECK_HANDLED}.get(
+            answer, CHECK_DENIED
+        )
         if qs.answer(self.conn, qid, recorded, at=self.clock()):
             self._notify(code, qid)
 
@@ -849,6 +856,8 @@ def _check_line(q: qs.Question, *, short: bool = False) -> str:
         return "ok" if short else f"Your check ({clip(q.question, 200)}) is ok: go ahead."
     if q.answer == CHECK_BUSY:
         return BUSY if short else f"Your check ({clip(q.question, 200)}) wasn't asked. {BUSY}"
+    if q.answer == CHECK_HANDLED:
+        return HANDLED if short else f"Your check ({clip(q.question, 200)}) wasn't asked. {HANDLED}"
     denied = "denied: don't do it. Find another way, or stop and say why in your summary."
     return denied if short else f"Your check ({clip(q.question, 200)}) was {denied}"
 

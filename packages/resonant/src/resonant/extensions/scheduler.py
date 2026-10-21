@@ -59,7 +59,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from resonant import killswitch
 from resonant.executor import CallContext, ToolFailed
@@ -78,11 +78,13 @@ from resonant.extensions.notify import take_baseline
 from resonant.extensions.process import ExtAmbiguous, ExtFailed, ProcessTracker
 from resonant.extensions.pulse_job import pulse_job
 from resonant.gate import Gate
+from resonant.gate import actions as action_ids
 from resonant.gate.policy import APPROVAL_USED
 from resonant.gate.types import Deny
 from resonant.loop.types import PRIORITY_BACKGROUND, NewTask
 from resonant.redact import Redactor
 from resonant.secrets import SecretError, SecretStore, values_of
+from resonant.store import approvals
 from resonant.store import extensions as store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set, transaction, utcnow
@@ -248,7 +250,22 @@ def persist_events(
             trace_id=trace_id or new_id(),
         )
         n += insert_event(conn, event)
+        if (target := _closed_pr(ext, etype, payload["data"])) is not None:
+            # PER-269: a PR merged or closed (by any path): its open asks are moot.
+            approvals.obsolete_for_target(conn, target, utcnow())
     return n
+
+
+# The github watch's events for a PR that is no longer open (``extensions/github``).
+_PR_CLOSED_EVENTS = frozenset({"pr_merged", "pr_closed"})
+
+
+def _closed_pr(ext: str, etype: str, data: object) -> str | None:
+    """``jhe/dori#2`` for the github watch's ``pr_merged``/``pr_closed``, else None."""
+    if ext != action_ids.GITHUB or etype not in _PR_CLOSED_EVENTS or not isinstance(data, dict):
+        return None
+    fields = cast(dict[str, object], data)
+    return action_ids.pr_target(fields.get("repo"), fields.get("number"))
 
 
 def read_paused(conn: sqlite3.Connection) -> bool:

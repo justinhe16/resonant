@@ -64,12 +64,14 @@ from resonant.gate import (
     NeedsApproval,
     TokenVerifier,
 )
+from resonant.gate import actions as action_ids
 from resonant.gate.policy import APPROVAL_USED, batch_line, widens_trust
 from resonant.gate.types import Origin
 from resonant.loop.types import StepContext
 from resonant.models import SpanFactory
 from resonant.store import approvals as ap
 from resonant.store import trust as trust_store
+from resonant.store.db import utcnow
 from resonant.toolcore.reports import (
     BAD_ARGS_REPLY,
     NOT_AVAILABLE_REPLY,
@@ -623,6 +625,9 @@ class ToolCore:
                 "not_allowed", refusal_reply(intent, Deny(APPROVAL_USED)), True, intent, decision
             )
         rule = self._rule_added(decision.approval_id) if result.ok else None
+        if result.ok and (merged := action_ids.merged_by(intent)) is not None:
+            # PER-269: the PR is merged; the other open asks for it (a run's check) are moot.
+            ap.obsolete_for_target(self.conn, merged, utcnow())
         return self._ran(intent, result, rule_added=rule, decision=decision)
 
     @staticmethod

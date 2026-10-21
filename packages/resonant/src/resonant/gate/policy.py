@@ -84,6 +84,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
+from resonant.gate import actions as action_ids
 from resonant.gate.codes import clean_external, new_code
 from resonant.gate.summary import phrased, summarize, unsafe_args
 from resonant.gate.types import (
@@ -410,6 +411,11 @@ class PolicyGate:
         task = self.conn.execute("SELECT 1 FROM tasks WHERE id = ?", (intent.task_id,))
         if task.fetchone() is None:
             return Deny(NO_TASK)  # e.g. the router's fast path: nothing could wait
+        # PER-269: one request per action. Another path (a run's check, another task) is
+        # already asking for it: point to that one instead of opening a second.
+        action = action_ids.for_intent(self.conn, intent)
+        if action is not None and (held := ap.pending_for_action(self.conn, action.key, now)):
+            return Deny(action_ids.already_asking(self.conn, held[0]))
         summary = self._summary(intent)
         said = self._phrased(intent, summary)  # PER-268: "OK to merge PR #121 in …? [P3] yes / no"
         always = offer is not None and not require_code
@@ -433,6 +439,8 @@ class PolicyGate:
             always_scope=offer.scope if always and offer is not None else None,
             always_action=offer.action if always and offer is not None else None,
             phrased=said,
+            action_key=action.key if action is not None else None,
+            action_target=action.target if action is not None else None,
         )
         approval_id = ap.insert_approval(self.conn, spec, now)
         created = ap.get_approval(self.conn, approval_id)
