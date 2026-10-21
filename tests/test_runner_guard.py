@@ -135,12 +135,11 @@ async def test_guard_thin_still_wraps_checks_and_isolates(
     await h.drain()
     assert h.run().status == "ready"
     assert len(wrapped) == 1 and len(checked) == 1
-    # no ~/.claude under the guard, so no surf skills to point at
-    [call] = h.argv_log()
-    assert "/robot-surf" not in call["argv"][call["argv"].index("--append-system-prompt") + 1]
     assert wrapped[0].protect is None and wrapped[0].deny_exec  # the daemon's defaults
     [call] = h.argv_log()
     argv, env = call["argv"], call["env"]
+    # no ~/.claude under the guard, so no surf skills to point at
+    assert "/robot-surf" not in argv[argv.index("--append-system-prompt") + 1]
     assert "--strict-mcp-config" in argv
     assert argv[argv.index("--setting-sources") + 1] == "project"
     assert json.loads(argv[argv.index("--settings") + 1]) == {"sandbox": {"enabled": False}}
@@ -752,7 +751,8 @@ def test_the_surf_prompt_is_a_narrow_default() -> None:
     # the flow: build, tests, PR, CI, the code-reviewer until no must-fix
     for step in ("run the tests", "open the pull request", "get CI green", "code-reviewer"):
         assert step in prompt
-    assert "no must-fix left" in prompt
+    assert "no must-fix left, with CI green again after the fixes" in prompt
+    assert "green CI alone is not the place to stop" in prompt
     # in its worktree and branch, without the skill's long wait for human review
     assert "on resonant/r1-x (don't create another worktree or branch)" in prompt
     assert "Skip the skill's wait for human review" in prompt
