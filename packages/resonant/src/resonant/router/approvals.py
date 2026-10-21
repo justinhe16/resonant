@@ -26,7 +26,6 @@ from datetime import datetime
 from typing import Any, Literal
 
 from resonant.gate.replies import ParsedReply, parse_reply
-from resonant.gate.summary import plain
 from resonant.gate.types import ApprovalReply, Gate, PendingApproval
 from resonant.models import SpanFactory
 from resonant.models.client import null_spans
@@ -56,7 +55,7 @@ def ask_codes(pending: Sequence[PendingApproval]) -> str:
     """The re-ask for an ambiguous plain reply: each code with its summary."""
     if not pending:
         return NOTHING_WAITING
-    items = ", ".join(f"{p.code} ({plain(p.summary)})" for p in pending)
+    items = ", ".join(f"{p.code} ({p.summary})" for p in pending)
     return f"Which one? {items}. Reply yes <code> or no <code>."
 
 
@@ -152,7 +151,7 @@ def render_pending(pending: Sequence[PendingApproval], now: datetime) -> str:
         return NOTHING_WAITING
     lines = [f"Waiting for approval ({len(pending)}):"]
     for p in pending:
-        lines.append(f"- {p.code} · {plain(p.summary)} · expires in {_left(p.expires_at, now)}")
+        lines.append(f"- {p.code} · {p.summary} · expires in {_left(p.expires_at, now)}")
     lines.append("Reply yes <code> or no <code>. /approvals <code> shows the details.")
     return _clip("\n".join(lines))
 
@@ -167,7 +166,7 @@ def render_detail(a: ap.Approval, args: dict[str, Any] | None, now: datetime) ->
     return _clip(
         "\n".join(
             [
-                f"[{a.code}] {plain(a.summary)}",
+                f"[{a.code}] {a.summary}",
                 f"Tool: {tool} ({a.level.value}, {a.effect.value})",
                 f"Args: {shown}",
                 f"Expires in {_left(a.expires_at, now)}. Reply {answer} / no {a.code}",

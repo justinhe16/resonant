@@ -160,6 +160,7 @@ from resonant.runners.reports import (
     Report,
     WorkerReports,
     alerts,
+    clear_alerts,
     deps_line,
     detected_list,
     end_event,
@@ -2720,8 +2721,8 @@ class ClaudeRunner:
         pr = await self.workspace.find_pr(run.repo, p.branch, w.secrets)
         if pr is None:
             if await self.workspace.pushed_commits(p, w.secrets) == 0:
-                if merges:  # PER-268: its work was merging a PR, and it did
-                    names = merged_names(detected_list(self.conn, run.code), merges)
+                names = merged_names(detected_list(self.conn, run.code)) if merges else []
+                if names:  # PER-268: its work was merging a PR (its own gh pr merge), and it did
                     set_merged(self.conn, run.code, names)
                     if not runs.finish(self.conn, run.code, "done", step="reply"):
                         raise _Cancelled
@@ -2795,10 +2796,11 @@ class ClaudeRunner:
         it, but a ruleset the app can bypass would not, so the activity feed is always asked
         what the app's bot put on the base during the run, by the type GitHub reports
         (PER-268). A push, force-push or delete fails the run with a ⚠ line in its end text
-        (said now), and it is never merged. A PR merge is not a direct push: it is recorded
-        as a side effect (unless the worker's ``gh pr merge`` already was) and its sha
-        returned, so a run asked to merge a PR ends ``done`` saying so. If the feed can't be
-        read the run fails: it can't be shown clean."""
+        (said now), and it is never merged. A PR merge is not a direct push: its shas are
+        returned (audited ``run.base_merge``), so a run asked to merge a PR, whose own ``gh pr
+        merge`` was read from its commands, ends ``done`` saying so. A bot merge the run
+        didn't make (Resonant merging another run's PR meanwhile) is only audited. If the
+        feed can't be read the run fails: it can't be shown clean."""
         if self.app is None:
             return ()
         try:
@@ -2811,11 +2813,6 @@ class ClaudeRunner:
             short = ", ".join(sha[:7] for sha in found.merges[:5])
             with atomic(self.conn):
                 audit(self.conn, "run.base_merge", run=run.code, base=p.base_branch, shas=short)
-            if not any(e.kind == "merge" for e in detected_list(self.conn, run.code)):
-                for sha in found.merges[:5]:
-                    what = f"merged a PR into {p.base_branch} ({sha[:7]})"
-                    effect = SideEffect("merge", what, True, ("merge", sha[:7]))
-                    record_detected(self.conn, run.code, effect)
         if not found.pushes:
             return found.merges
         short = ", ".join(sha[:7] for sha in found.pushes[:5])
@@ -3263,15 +3260,19 @@ class ClaudeRunner:
         self._unrevoked.pop(run.code, None)  # only now: a retried send says it again
         if item is not None:
             self.reports.told(item)
+        if warn:
+            clear_alerts(self.conn, run.code)
         # PER-268: what the owner was told, for the brains, without the worker's own words
-        # (its summary, its did: notes): those stay behind the run tools, which taint.
+        # (its summary, its did: notes). Still outside content as list_runs is (the ask may
+        # be a tainted turn's, a failure quotes GitHub, flagged paths are the worker's): it
+        # taints the turn that sees it, as the run tools do.
         bare = end_parts(replace(run, summary=None), ci, no_ci=no_ci, upstream=upstream,
                          watching=watching, merged=merged)  # fmt: skip
         if bare is not None:
             said = end_text(bare[0], [*warn, *([note] if note else []), *bare[1]])
             ref = f"run:{run.code}:{run.status}"
             system_texts.record(self.conn, run.principal, "run", said, ref=ref,
-                                task_id=run.task_id)  # fmt: skip
+                                task_id=run.task_id, outside=True)  # fmt: skip
 
     def _still_working(self, run: Run) -> str:
         """``Still working on R5 (public dashboard view).``: the owner's other active runs,

@@ -17,3 +17,6 @@ CREATE TABLE system_texts (
     sent_at   TEXT NOT NULL
 );
 CREATE INDEX system_texts_principal ON system_texts (principal, id);
+-- An approval whose summary is its tool's own phrase (``approval_summary``): its prompt reads
+-- as a question, "OK to merge PR #121 in …? [P3] yes / no". The summary stays the bare phrase.
+ALTER TABLE approvals ADD COLUMN phrased INTEGER NOT NULL DEFAULT 0;

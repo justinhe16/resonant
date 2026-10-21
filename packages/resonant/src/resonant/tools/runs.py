@@ -160,7 +160,8 @@ START_RUN = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=60.0,
-    approval_summary='start a run[ on {repo}]: "{ask}"[{merge} (merges if clean)]',
+    # report (now or digest) only says when the owner hears of it: left out on purpose
+    approval_summary='start a run[ on {repo}]: "{ask}"[{merge} (merges if clean)]{~report}',
 )
 LIST_RUNS = ToolSpec(
     name="list_runs",

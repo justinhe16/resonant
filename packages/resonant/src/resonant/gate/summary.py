@@ -21,7 +21,7 @@ from typing import Any
 
 from resonant.gate.codes import clean_external
 from resonant.gate.types import Intent
-from resonant_sdk.tool import parse_summary
+from resonant_sdk.tool import parse_summary, summary_args
 
 MAX_ARGS = 3  # args shown; the rest become "+N more args"
 MAX_KEY_LEN = 20
@@ -109,15 +109,6 @@ def describe_args(args: Mapping[str, Any]) -> str:
     return text
 
 
-PHRASED = "OK to "  # PER-268: a summary filled from a tool's template reads as a question
-
-
-def plain(summary: str) -> str:
-    """A stored approval summary as a line, not a question: without ``OK to `` (lists, the
-    briefing)."""
-    return summary.removeprefix(PHRASED)
-
-
 def _literal(text: str) -> str:
     """A template's own words, cleaned like any external string but keeping its quotes and
     the spaces around them."""
@@ -153,9 +144,12 @@ def fill_summary(template: str, args: Mapping[str, Any]) -> str | None:
     """A tool's ``approval_summary`` filled from ``args`` (PER-268), e.g. ``merge PR #121 in
     justinhe16/resonant``; None when an arg outside ``[...]`` is unset or the template can't
     be read (the caller falls back to the arg list). Each value is cleaned and clipped like
-    ``describe_args``'s; the template's own words are cleaned too."""
+    ``describe_args``'s; the template's own words are cleaned too. Every set arg the
+    template doesn't name follows in parentheses (``describe_args``), so nothing a call
+    does is hidden; ``{~arg}`` names one left out on purpose."""
     try:
         segments = parse_summary(template)
+        named = summary_args(template)
     except ValueError:
         return None
     out: list[str] = []
@@ -164,6 +158,8 @@ def fill_summary(template: str, args: Mapping[str, Any]) -> str | None:
         for kind, name in pieces:
             if kind == "text":
                 part.append(_literal(name))
+                continue
+            if kind == "hide":
                 continue
             value = _filled(args.get(name))
             if value is None:
@@ -174,6 +170,9 @@ def fill_summary(template: str, args: Mapping[str, Any]) -> str | None:
             part.append(value)
         out.extend(part)
     text = " ".join("".join(out).split())
+    rest = {k: v for k, v in args.items() if k not in named and v is not None}
+    if text and rest:
+        text += f" ({describe_args(rest)})"
     return text or None
 
 

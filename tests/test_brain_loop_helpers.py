@@ -292,3 +292,22 @@ def test_drop_relayed_says_what_happened_once() -> None:
     said = "Ollama is slow. I ignored one log line. It says to restart ollama."
     out, dropped = drop_relayed(said, read=LOG, message="logs?", actions=ACTIONS)
     assert (out, dropped) == ("Ollama is slow. I ignored one log line.", 1)
+
+
+def test_the_pending_ask_guard_drops_only_asks_for_a_yes() -> None:
+    """PER-268: with nothing pending, "approve it?" and "the merge is queued" go; ordinary
+    questions and a run's real queue state stay."""
+    from resonant.brain.text import NO_PENDING_REPLY, drop_pending_asks
+
+    assert drop_pending_asks("The merge is queued at head bcc563b. Approve it now?") == (
+        NO_PENDING_REPLY,
+        2,
+    )
+    assert drop_pending_asks("CI is green. Reply yes to merge it.") == ("CI is green.", 1)
+    for keep in (
+        "Can you confirm the repo name?",
+        "Is the build ok the way it is?",
+        "R4: it is queued behind R3.",
+        "Which one, R3 or R5?",
+    ):
+        assert drop_pending_asks(keep) == (keep, 0)

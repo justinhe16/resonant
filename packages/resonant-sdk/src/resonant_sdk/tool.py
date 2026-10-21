@@ -20,8 +20,11 @@ Invariants, enforced here at registration:
   arg list, filled from the call's args: ``merge PR #{number} in {repo}`` makes ``OK to merge
   PR #121 in justinhe16/resonant? [P3] yes / no``. ``{name}`` is an arg's value (cleaned and
   clipped by the gate); ``[...]`` is a part shown only when every arg in it is set (a boolean
-  arg prints nothing: it is only the condition), e.g. ``[{merge} (merges if clean)]``. An arg
-  outside ``[...]`` that is missing falls back to the arg list. Write it as what the tool
+  arg prints nothing: it is only the condition), e.g. ``[{merge} (merges if clean)]``;
+  ``{~arg}`` names an arg left out on purpose (a guard such as ``head_sha``). Any other arg
+  the call sets is shown after the phrase (``create a repo named x (private=false)``), so
+  a template can't hide what a call does. An arg outside ``[...]`` that is missing falls
+  back to the arg list. Write it as what the tool
   would do, lower case: it follows "OK to", "Couldn't" and "Dry run: would".
 - ``grant`` names a builtin a member may request through ``grants: {"builtin:<grant>":
   [request]}`` (``resonant.principals``). Only global L0 reads can carry one.
@@ -59,10 +62,10 @@ DEFAULT_LEVEL: dict[Effect, Level] = {
 
 TOOL_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 SUMMARY_MAX = 120
-_SUMMARY_TOKEN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}|\[|\]|[^{}\[\]]+")
+_SUMMARY_TOKEN = re.compile(r"\{(~?)([A-Za-z_][A-Za-z0-9_]*)\}|\[|\]|[^{}\[\]]+")
 
 # One part of an approval summary template: literal text, or an arg's name.
-SummaryPiece = tuple[Literal["text", "arg"], str]
+SummaryPiece = tuple[Literal["text", "arg", "hide"], str]
 
 
 def parse_summary(template: str) -> list[tuple[bool, tuple[SummaryPiece, ...]]]:
@@ -86,8 +89,8 @@ def parse_summary(template: str) -> list[tuple[bool, tuple[SummaryPiece, ...]]]:
             if pieces:
                 segments.append((optional, tuple(pieces)))
             pieces, optional = [], part == "["
-        elif m.group(1) is not None:
-            pieces.append(("arg", m.group(1)))
+        elif m.group(2) is not None:
+            pieces.append(("hide" if m.group(1) else "arg", m.group(2)))
         else:
             pieces.append(("text", part))
     if optional:
@@ -98,8 +101,10 @@ def parse_summary(template: str) -> list[tuple[bool, tuple[SummaryPiece, ...]]]:
 
 
 def summary_args(template: str) -> set[str]:
-    """The arg names an ``approval_summary`` uses."""
-    return {name for _, pieces in parse_summary(template) for kind, name in pieces if kind == "arg"}
+    """The arg names an ``approval_summary`` names (shown, or ``{~arg}``: hidden on purpose)."""
+    return {
+        name for _, pieces in parse_summary(template) for kind, name in pieces if kind != "text"
+    }
 
 
 GRANT_PATTERN = r"^[a-z][a-z0-9_-]{0,31}$"

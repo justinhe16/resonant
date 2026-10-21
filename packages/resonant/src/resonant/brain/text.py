@@ -32,9 +32,9 @@ def flat(text: str, limit: int | None = None) -> str:
 # nothing to approve). Only Resonant's own prompt asks for a yes; the model calls the tool.
 NO_PENDING_REPLY = "Nothing is waiting for your yes right now. Say what to do and I'll ask for it."
 _PENDING_ASK = re.compile(
-    r"\b(?:approve|ok|okay|confirm)\s+(?:it|this|that|the\s+\w+)\b[^.!?\n]*\?"
+    r"\b(?:approve|ok|okay)\s+(?:it|this|that)(?:\s+now)?\s*\?"
     r"|\b(?:reply|say|text|send)\s+(?:me\s+)?['\"\u2018\u201c]?yes\b"
-    r"|\b(?:merge|change|request|approval|it|that|this)\s+(?:is|was|has\s+been)\s+queued\b"
+    r"|\b(?:merge|change|request|approval)\s+(?:is|was|has\s+been)\s+queued\b"
     r"|\b(?:waiting|wait)\s+(?:on|for)\s+(?:your\s+)?(?:yes|approval|ok|go-ahead)\b"
     r"|\bawaiting\s+(?:your\s+)?approval\b"
     r"|\bneeds?\s+your\s+(?:yes|approval|ok)\b",

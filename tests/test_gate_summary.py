@@ -127,7 +127,7 @@ def test_ordinary_text_is_safe() -> None:
 
 MERGE_PR = ToolSpec(
     name="merge_pr", effect=Effect.WRITE, level=Level.L2, extension="github",
-    source="ext:github", approval_summary="merge PR #{number} in {repo}",
+    source="ext:github", approval_summary="merge PR #{number} in {repo}{~head_sha}",
 )  # fmt: skip
 
 
@@ -149,6 +149,19 @@ def test_a_template_fills_from_args_and_falls_back_when_it_cant() -> None:
     assert long.endswith('..."') and "A7" not in long and "[" not in long
     assert fill_summary(tpl, {"ask": {"a": 1}}) is None  # an object: the arg list says it
     assert fill_summary("bad {", {}) is None
+
+
+def test_a_template_never_hides_an_arg_it_doesnt_name() -> None:
+    """Review fix: every set arg the template doesn't name follows the phrase, so a public
+    repo or a cancelled Linear issue shows; ``{~arg}`` leaves one out on purpose."""
+    from resonant.tools.repos import CREATE_REPO
+
+    assert summarize(intent(CREATE_REPO, name="garden", private=False)) == (
+        "create a GitHub repo named garden (private=false)"
+    )
+    assert summarize(intent(MERGE_PR, repo="o/r", number=1, head_sha="b" * 40)) == (
+        "merge PR #1 in o/r"
+    )
 
 
 def test_template_syntax_is_checked_at_registration() -> None:
@@ -203,7 +216,7 @@ BUILTIN_PROMPTS = {
 
 
 def test_every_builtin_template_reads_as_a_question() -> None:
-    from resonant.gate.summary import PHRASED, phrased
+    from resonant.gate.summary import phrased
     from resonant.tools.builtin import BUILTIN_SPECS
 
     templated = {s.name: s for s in BUILTIN_SPECS if s.approval_summary is not None}
@@ -211,13 +224,12 @@ def test_every_builtin_template_reads_as_a_question() -> None:
     for name, (args, prompt) in BUILTIN_PROMPTS.items():
         said = phrased(intent(templated[name], **args))
         assert said is not None, name
-        assert approval_text("X6", PHRASED + said) == prompt
+        assert approval_text("X6", said, phrased=True) == prompt
 
 
 def test_extension_templates_and_the_prompt_variants() -> None:
     from pathlib import Path
 
-    from resonant.gate.summary import PHRASED
     from resonant_sdk.manifest import load_manifest
 
     root = Path(__file__).resolve().parents[1] / "extensions"
@@ -231,23 +243,26 @@ def test_extension_templates_and_the_prompt_variants() -> None:
                      "merge PR #121 in justinhe16/resonant"),
         "rerun_failed": ({"repo": "justinhe16/resonant", "number": 121},
                          "re-run the failed CI on PR #121 in justinhe16/resonant"),
-        "save_issue": ({"id": "RES-12", "title": "Flaky login", "team": "RES"},
-                       "save a Linear issue RES-12: \"Flaky login\""),
+        "save_issue": ({"id": "RES-12", "title": "Flaky login", "state": "Done"},
+                       "save a Linear issue RES-12: \"Flaky login\" (state=\"Done\")"),
         "save_comment": ({"issueId": "RES-12", "body": "fixed in #12"},
                          "comment on Linear issue RES-12: \"fixed in #12\""),
     }  # fmt: skip
     for name, (args, said) in cases.items():
         assert summarize(intent(specs[name], **args)) == said, name
     assert summarize(intent(specs["save_issue"], title="New", team="RES")) == (
-        'save a Linear issue: "New"'
+        'save a Linear issue: "New" (team="RES")'
     )
     # the ticket's examples
-    said = PHRASED + summarize(intent(specs["merge_pr"], **cases["merge_pr"][0]))
-    assert approval_text("P3", said) == "OK to merge PR #121 in justinhe16/resonant? [P3] yes / no"
-    assert approval_text("D7", said, destructive=True) == (
+    said = summarize(intent(specs["merge_pr"], **cases["merge_pr"][0]))
+    assert (
+        approval_text("P3", said, phrased=True)
+        == "OK to merge PR #121 in justinhe16/resonant? [P3] yes / no"
+    )
+    assert approval_text("D7", said, destructive=True, phrased=True) == (
         "OK to merge PR #121 in justinhe16/resonant? This can't be undone. [D7] yes D7 / no"
     )
-    assert approval_text("P3", said, require_code=True) == (
+    assert approval_text("P3", said, require_code=True, phrased=True) == (
         "OK to merge PR #121 in justinhe16/resonant? [P3] reply exactly: yes P3 / no P3"
     )
     # no template: the arg list, as before

@@ -631,7 +631,8 @@ async def test_the_feed_is_checked_even_when_the_base_is_protected(h: Harness) -
 
 
 async def test_a_pr_merge_onto_the_base_by_the_bot_is_not_a_direct_push(h: Harness) -> None:
-    """PER-268: GitHub reports a merge as ``pr_merge``; it is a side effect, not a push."""
+    """PER-268: GitHub reports a merge as ``pr_merge``; it is not a push. One the run didn't
+    make itself (Resonant merging another run's PR meanwhile) is only audited."""
     event = push_event("cd" * 20) | {"activity_type": "pr_merge"}
     (h.gh_dir / "activity.json").write_text(json.dumps([event]))
     await h.start(report="now")
@@ -639,8 +640,24 @@ async def test_a_pr_merge_onto_the_base_by_the_bot_is_not_a_direct_push(h: Harne
     run = h.run()
     assert run.status == "ready" and run.failure is None
     [text] = h.chan.texts()
-    assert "⚠" not in text and "pushed directly" not in text
-    assert text.endswith("Along the way: merged a PR into main (cdcdcdc) (detected).")
+    assert "⚠" not in text and "pushed directly" not in text and "merged" not in text
+    rows = h.conn.execute("SELECT 1 FROM audit_log WHERE action = 'run.base_merge'").fetchall()
+    assert len(rows) == 1
+
+
+async def test_a_bot_merge_the_run_didnt_make_is_no_changes_not_done(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """Review fix: a merge in the window that isn't this run's own gh pr merge (Resonant's
+    merge of another run) never makes a run that pushed nothing claim it."""
+    h = build(tmp_path, db, scenario="nochanges")
+    event = push_event("12" * 20) | {"activity_type": "pr_merge"}  # an all-digit short sha
+    (h.gh_dir / "activity.json").write_text(json.dumps([event]))
+    await h.start(report="now")
+    await h.drain()
+    assert h.run().status == "no_changes"
+    [text] = h.chan.texts()
+    assert "merged" not in text and "#1212121" not in text
 
 
 async def test_a_run_asked_to_merge_a_pr_ends_done_with_one_text_naming_it(

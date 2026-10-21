@@ -60,6 +60,7 @@ def approval_prompt(decision: NeedsApproval) -> ApprovalPrompt:
         expires_at=decision.expires_at,
         require_code=decision.require_code,
         always=decision.allow_always,
+        phrased=decision.phrased,
     )
 
 
@@ -150,7 +151,7 @@ async def _prompt(
         # tainted task's args were chosen after outside content, so only a fixed line
         key = approval_dedupe_key(prompt.approval_id, approver)
         task = get_task(conn, task_id) if task_id else None
-        outside = task is not None and task.checkpoint.get("tainted") is True
+        outside = task is not None and system_texts.tainted(task.checkpoint)
         system_texts.record(conn, approver, "approval", prompt.text(), ref=key, task_id=task_id,
                             now=at, outside=outside)  # fmt: skip
     return PromptResult(tuple(reached), tuple(unreachable), error)

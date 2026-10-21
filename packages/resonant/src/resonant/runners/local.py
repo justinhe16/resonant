@@ -504,7 +504,7 @@ class LocalRunner:
         if answer.meta.get("system") is True:
             latest = get_task(self.conn, task.id)
             cp = latest.checkpoint if latest is not None else task.checkpoint
-            outside = cp.get("tainted") is True or answer.meta.get("tainted") is True
+            outside = system_texts.tainted(cp) or answer.meta.get("tainted") is True
             system_texts.record(self.conn, principal, "result", answer.reply,
                                 ref=f"reply:{task.id}", task_id=task.id,
                                 outside=outside)  # fmt: skip

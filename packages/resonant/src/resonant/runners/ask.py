@@ -150,6 +150,7 @@ from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.sandbox import resolve_tool
 from resonant.secrets import SecretError, SecretStore, load_runner_secrets
 from resonant.store import approvals as ap
+from resonant.store import questions as questions_store
 from resonant.store import system_texts
 from resonant.store import tasks as task_store
 from resonant.store.audit import audit
@@ -1243,7 +1244,12 @@ class AskRunner:
             hit = usage_limit(result)
             assert hit is not None
             return await self._limit(task, ctx, cp, hit, reports)
-        if status == "answered" and not pending and not self._approval_pending(task.principal):
+        if (
+            status == "answered"
+            and not pending
+            and not has_proposal(text)  # a Proposed: line is its own yes/no (no gate)
+            and not self._approval_pending(task.principal)
+        ):
             text, asks = drop_pending_asks(text)  # PER-268: no "approve it?" with none open
             if asks:
                 log.info("ask: dropped %d sentence(s) asking for a yes with none pending", asks)
@@ -1263,11 +1269,13 @@ class AskRunner:
                                   and has_proposal(text), pending=pending, **extra)  # fmt: skip
 
     def _approval_pending(self, principal: str | None) -> bool:
-        """Whether an approval is open for ``principal``; True when it can't be read."""
+        """Whether a yes would mean something now: an approval is open for ``principal``, or
+        a worker's question is. True when it can't be read."""
         if principal is None:
             return True
         try:
-            return bool(ap.pending_for(self.conn, principal, self.clock()))
+            pending = ap.pending_for(self.conn, principal, self.clock())
+            return bool(pending) or bool(questions_store.open_asks(self.conn))
         except sqlite3.Error:
             return True
 
@@ -1348,7 +1356,7 @@ class AskRunner:
         approved = cp.get("approved") is True
         message = self._turn_message(question, kind, approved=approved)
         # an approved change's turn is Resonant's own: the texts wait for the owner's next one
-        since, seen, outside = ("", 0, False) if approved else self._since_texts(owner)
+        since, shown_id, outside = ("", 0, False) if approved else self._since_texts(owner)
         if since:  # PER-268: what Resonant texted the owner since the session's last turn
             message = f"{since}\n\n{message}"
         if outside:  # one came from a tainted task: this turn reads it as that reply
@@ -1370,9 +1378,9 @@ class AskRunner:
             )
         finally:
             await bridge.aclose()
-        if seen and out.status != "crashed":  # written to the session: shown once
+        if shown_id and out.status == "answered":  # the session read them: shown once
             with contextlib.suppress(sqlite3.Error), atomic(self.conn):
-                kv_set(self.conn, SINCE_KV, seen)
+                kv_set(self.conn, SINCE_KV, shown_id)
         hops = hops_of(out)  # recorded by the session, under its lock
         seen = {"status": out.status, "fresh": out.fresh, "retried": out.retried}
         log.info("claude brain turn", extra={"task": task.id, **seen, "tainted": hops is not None})

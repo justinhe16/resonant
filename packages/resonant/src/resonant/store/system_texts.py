@@ -17,7 +17,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Any, Literal, cast
 
 from resonant.extensions.notify import clean_text
 from resonant.store.db import atomic, iso, utcnow
@@ -38,6 +38,17 @@ class SystemText:
     task_id: str | None
     sent_at: datetime
     outside: bool = False  # from a tainted task: a turn that sees it is tainted
+
+
+def tainted(checkpoint: dict[str, Any]) -> bool:
+    """Whether a task's texts came after outside content: the task is tainted, or (BA-1) an
+    item of its batch was pinned tainted."""
+    if checkpoint.get("tainted") is True:
+        return True
+    batch: Any = checkpoint.get("batch")
+    items = cast(list[Any], batch) if isinstance(batch, list) else []
+    return any(isinstance(i, dict) and cast(dict[str, Any], i).get("tainted") is True
+               for i in items)  # fmt: skip
 
 
 def flat(text: str) -> str:

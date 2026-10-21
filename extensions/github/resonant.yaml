@@ -51,7 +51,7 @@ tools:
     effect: write
     level: L2                          # runs when you ask for it; otherwise asks a plain yes
     commit: true
-    approval_summary: "merge PR #{number} in {repo}"   # the prompt: OK to merge PR #121 in …?
+    approval_summary: "merge PR #{number} in {repo}{~head_sha}"  # OK to merge PR #121 in …?
     args: {repo: string, number: integer, head_sha: string}
     secrets: [token]
     timeout_s: 120

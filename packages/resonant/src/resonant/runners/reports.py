@@ -244,6 +244,12 @@ def set_alert(conn: sqlite3.Connection, code: str, line: str) -> None:
         kv_set(conn, _ALERT_KEY + code, [*kept, line][-ALERTS_KEEP:])
 
 
+def clear_alerts(conn: sqlite3.Connection, code: str) -> None:
+    """The ⚠ lines went out with the run's end text: a later reply doesn't repeat them."""
+    with atomic(conn):
+        kv_set(conn, _ALERT_KEY + code, [])
+
+
 def alerts(conn: sqlite3.Connection, code: str) -> list[str]:
     value: object = kv_get(conn, _ALERT_KEY + code)
     if not isinstance(value, list):
@@ -264,20 +270,19 @@ def merged_list(conn: sqlite3.Connection, code: str) -> list[str]:
     return [v for v in cast(list[object], value) if isinstance(v, str)]
 
 
-def merged_names(effects: Sequence[SideEffect], shas: Sequence[str]) -> list[str]:
-    """What a run merged onto its base, for its end text: ``PR #121`` for each ``gh pr
-    merge`` read from its commands (its keys are ``("merge", "121")``), else one ``a PR
-    (abc1234)`` per merge the activity feed shows. Code-built."""
+def merged_names(effects: Sequence[SideEffect]) -> list[str]:
+    """What a run merged, for its end text: ``PR #121`` for each ``gh pr merge`` read from
+    its commands (keys ``("merge", "121")``), ``a PR`` for one with no number. Code-built;
+    the caller checks the activity feed shows a merge too."""
     found: list[str] = []
     for e in effects:
-        if e.kind != "merge" or len(e.keys) != 2 or not e.keys[1].isdigit():
+        if e.kind != "merge":
             continue
-        name = f"PR #{e.keys[1]}"
+        n = e.keys[1] if len(e.keys) == 2 and e.keys[1].isdigit() else None
+        name = f"PR #{n}" if n else "a PR"
         if name not in found:
             found.append(name)
-    if found:
-        return found
-    return [f"a PR ({sha[:7]})" if sha != "?" else "a PR" for sha in shas]
+    return found
 
 
 def _names_merge(item: str, names: Sequence[str]) -> bool:
@@ -287,7 +292,7 @@ def _names_merge(item: str, names: Sequence[str]) -> bool:
     if "merge" not in low:
         return False
     return any(re.search(rf"#{re.escape(n[4:])}(?![0-9])", low) for n in names
-               if n.startswith("PR #")) or "a pr into" in low  # fmt: skip
+               if n.startswith("PR #"))  # fmt: skip
 
 
 def did_part(items: list[str], limit: int = DID_IN_TITLE) -> str:
@@ -554,6 +559,7 @@ __all__ = [
     "NOTE_TEXTS_PER_HOUR",
     "WorkerReports",
     "alerts",
+    "clear_alerts",
     "detected_list",
     "did_list",
     "did_of",

@@ -82,7 +82,7 @@ from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
 from resonant.gate.codes import clean_external, new_code
-from resonant.gate.summary import PHRASED, phrased, summarize, unsafe_args
+from resonant.gate.summary import phrased, summarize, unsafe_args
 from resonant.gate.types import (
     Allow,
     ApprovalBatch,
@@ -395,8 +395,7 @@ class PolicyGate:
         if task.fetchone() is None:
             return Deny(NO_TASK)  # e.g. the router's fast path: nothing could wait
         summary = self._summary(intent)
-        if self._phrased(intent, summary):  # PER-268: "OK to merge PR #121 in …? [P3] yes / no"
-            summary = PHRASED + summary
+        said = self._phrased(intent, summary)  # PER-268: "OK to merge PR #121 in …? [P3] yes / no"
         always = offer is not None and not require_code
         if always:
             assert offer is not None
@@ -417,6 +416,7 @@ class PolicyGate:
             allow_always=always,
             always_scope=offer.scope if always and offer is not None else None,
             always_action=offer.action if always and offer is not None else None,
+            phrased=said,
         )
         approval_id = ap.insert_approval(self.conn, spec, now)
         created = ap.get_approval(self.conn, approval_id)
@@ -788,7 +788,6 @@ def batch_line(summary: str, *, offered: bool, widens: bool = False) -> str:
     never shorten the line. ``widens``: a trust-widening change, marked."""
     if offered and summary.endswith(")") and ALWAYS_NOTE in summary:
         summary = summary.rsplit(ALWAYS_NOTE, 1)[0]
-    summary = summary.removeprefix(PHRASED)  # a line, not a question (PER-268)
     return f"widens trust: {summary}" if widens else summary
 
 
@@ -944,4 +943,5 @@ def _needs(a: ap.Approval) -> NeedsApproval:
         level=a.level,
         require_code=a.require_code,
         allow_always=a.allow_always,
+        phrased=a.phrased,
     )

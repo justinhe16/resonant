@@ -131,6 +131,7 @@ from resonant.runners.local import (
     with_report,
 )
 from resonant.store import approvals as ap
+from resonant.store import questions
 from resonant.store.db import utcnow
 from resonant.toolcore import MAX_SIDE_EFFECTS, BatchItem, RunnerGate, ToolExecutor
 from resonant.toolcore import args_error as args_error  # moved here (TC-1); re-exported
@@ -1279,12 +1280,14 @@ class BrainRunner(LocalRunner):
         )
 
     def _approval_pending(self, principal: str) -> bool:
-        """Whether an approval (or a batch) is open for ``principal``; True when it can't be
+        """Whether a yes would mean something now: an approval (or a batch) is open for
+        ``principal``, or a worker's question is (``yes`` answers it). True when it can't be
         read, so the guard never drops a real ask."""
         if not principal:
             return True
         try:
-            return bool(ap.pending_for(self.conn, principal, self.now()))
+            pending = ap.pending_for(self.conn, principal, self.now())
+            return bool(pending) or bool(questions.open_asks(self.conn))
         except sqlite3.Error:
             return True
 
