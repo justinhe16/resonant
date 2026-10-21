@@ -49,6 +49,14 @@ export interface Runs {
   items?: RunItem[];
 }
 
+/** One change of an approval batch: its line in the batch's prompt and its own level. */
+export interface ApprovalChange {
+  summary: string;
+  level: string;
+}
+
+/** What one answer decides: a lone approval, or a batch (PER-254) as one row with the batch's
+ * code, its strictest level and its one expiry. */
 export interface ApprovalItem {
   /** null for an approval sent without a code */
   code: string | null;
@@ -56,6 +64,8 @@ export interface ApprovalItem {
   level: string;
   asked_at: Timestamp;
   expires_at: Timestamp | null;
+  /** a batch's changes, in order; absent for a lone approval (and before PER-254) */
+  changes?: ApprovalChange[];
 }
 
 export interface QuestionItem {

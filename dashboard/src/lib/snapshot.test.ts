@@ -73,7 +73,7 @@ describe("forTier", () => {
     expect(out.repos).toBeUndefined();
     expect(out.claude_brain).toBeUndefined();
     for (const h of out.health) expect(h.reason).toBeUndefined();
-    expect(out.approvals.open).toBe(1);
+    expect(out.approvals.open).toBe(2);
   });
 
   it("leaves a local snapshot alone", () => {

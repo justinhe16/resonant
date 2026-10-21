@@ -36,7 +36,7 @@ Snapshot {
   tasks: {by_state: {state: n}}, slots: {used, max},
   runs: {by_state: {state: n}, items?: [{code, state, repo, ask, branch, pr_url, pr_number,
          started_at, ended_at, waiting_reason, last_note}]},                  # items: local only
-  approvals: {open: n, items?: [{code, summary, level, asked_at, expires_at}]},
+  approvals: {open: n, items?: [{code, summary, level, asked_at, expires_at, changes?}]},  # a batch is one row (PER-254)
   questions: {open: n, items?: [{run_code, text, options, asked_at}]},
   pulse: {open: n, items?: [{source, key, title, urgency, state: new|told, updated_at}]},
   extensions: [{name, status, health, jobs: [{id, next_due, last_run_at, last_outcome, fail_streak}]}],

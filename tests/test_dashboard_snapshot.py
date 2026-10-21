@@ -18,6 +18,7 @@ from resonant import __version__
 from resonant.config import load_settings
 from resonant.dashboard import snapshot as snap
 from resonant.dashboard.snapshot import (
+    ApprovalChange,
     ApprovalItem,
     Approvals,
     Extension,
@@ -242,6 +243,15 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
                     level=rng.choice(["L0", "L1", "L2", "L3"]),
                     asked_at=_dt(rng),
                     expires_at=_dt(rng),
+                    changes=_maybe(
+                        rng,
+                        [
+                            ApprovalChange(
+                                summary=_text(rng), level=rng.choice(["L0", "L1", "L2", "L3"])
+                            )
+                            for _ in n()
+                        ],
+                    ),
                 )
                 for _ in n()
             ],
@@ -390,6 +400,106 @@ def test_remote_carries_no_text_over_random_snapshots(seed: int) -> None:
 
 
 # --- the builder over a store -------------------------------------------------------------
+
+
+def _approval(
+    db: sqlite3.Connection,
+    task_id: str,
+    n: int,
+    level: Level,
+    at: datetime,
+    *,
+    tool: str = "save_issue",
+    extension: str | None = "linear",
+) -> str:
+    return ap.insert_approval(
+        db,
+        ap.NewApproval(
+            task_id=task_id,
+            intent_hash=f"h{n}",
+            tool=tool,
+            effect=Effect.WRITE,
+            level=level,
+            summary=f"change {n} {SECRET}",
+            approvers=("justin",),
+            code=f"C{n}",
+            expires_at=at + timedelta(minutes=30),
+            extension=extension,
+        ),
+        at,
+    )
+
+
+def test_a_batch_is_one_row(db: sqlite3.Connection) -> None:
+    """PER-254: approving any approval of a batch approves all of it, so the dashboard shows
+    the batch as one row: its code, its changes in order, its strictest level, one expiry."""
+    now = utcnow().replace(microsecond=0)
+    lone_task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    batch_task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    _approval(db, lone_task, 1, Level.L3, now - timedelta(minutes=10))
+    a = _approval(db, batch_task, 2, Level.L3, now - timedelta(minutes=5))
+    b = _approval(db, batch_task, 3, Level.L1, now - timedelta(minutes=4))
+    c = _approval(
+        db, batch_task, 4, Level.L2, now - timedelta(minutes=3), tool="allow_tools", extension=None
+    )
+    _approval(db, lone_task, 5, Level.L2, now - timedelta(minutes=1))
+    asked = now - timedelta(minutes=2)
+    batch = ap.insert_batch(db, "justin", [a, b, c], asked)
+    ap.set_expiry(db, batch.approval_ids, asked + timedelta(minutes=20))
+
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
+    d = s.model_dump(mode="json")
+    assert d["approvals"]["open"] == 3
+    items = d["approvals"]["items"]
+    assert [i["code"] for i in items] == ["C1", "C2", "C5"]
+    assert "changes" not in items[0] and "changes" not in items[2]
+    row = items[1]
+    assert row["summary"] == "3 changes, all or none"
+    assert row["level"] == "L1"  # the strictest change's
+    assert datetime.fromisoformat(row["asked_at"]) == asked
+    assert datetime.fromisoformat(row["expires_at"]) == asked + timedelta(minutes=20)
+    assert row["changes"] == [
+        {"summary": f"change 2 {SECRET}", "level": "L3"},
+        {"summary": f"change 3 {SECRET}", "level": "L1"},
+        {"summary": f"widens trust: change 4 {SECRET}", "level": "L2"},
+    ]
+
+    remote = to_remote(s)
+    _check_remote(remote)
+    assert remote.model_dump(mode="json")["approvals"] == {"open": 3}
+
+
+def test_a_batch_row_expires_with_its_first_expiry(db: sqlite3.Connection) -> None:
+    now = utcnow().replace(microsecond=0)
+    task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    a = _approval(db, task, 1, Level.L3, now - timedelta(minutes=5))
+    b = _approval(db, task, 2, Level.L2, now - timedelta(minutes=10))  # expires first
+    ap.insert_batch(db, "justin", [a, b], now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
+    [row] = s.model_dump(mode="json")["approvals"]["items"]
+    assert row["code"] == "C1"  # the batch's first approval's, though C2 is older
+    assert row["level"] == "L2"
+    assert datetime.fromisoformat(row["expires_at"]) == now + timedelta(minutes=20)
+
+
+def test_a_split_batch_shows_what_is_left_as_lone_rows(db: sqlite3.Connection) -> None:
+    """A batch with an approval decided on its own can't be answered as one: what is left
+    of it shows as lone rows, never as a batch under a code that no longer binds."""
+    now = utcnow().replace(microsecond=0)
+    task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    a = _approval(db, task, 1, Level.L3, now - timedelta(minutes=5))
+    b = _approval(db, task, 2, Level.L2, now - timedelta(minutes=4))
+    c = _approval(db, task, 3, Level.L3, now - timedelta(minutes=3))
+    ap.insert_batch(db, "justin", [a, b, c], now)
+    ap.expire_one(db, a, now, reason="test")
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
+    d = s.model_dump(mode="json")
+    assert d["approvals"]["open"] == 2
+    assert [(i["code"], i["summary"]) for i in d["approvals"]["items"]] == [
+        ("C2", f"change 2 {SECRET}"),
+        ("C3", f"change 3 {SECRET}"),
+    ]
+    assert all("changes" not in i for i in d["approvals"]["items"])
 
 
 def test_empty_db(db: sqlite3.Connection) -> None:

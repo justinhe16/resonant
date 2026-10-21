@@ -41,6 +41,7 @@ from pydantic.config import JsonDict
 from resonant import __version__
 from resonant.config import Settings
 from resonant.extensions.cron import CronError, parse_schedule
+from resonant.gate.policy import change_line, strictest
 from resonant.loop.slots import SlotPool
 from resonant.loop.types import TaskStatus
 from resonant.monitor import EXT_CHECK_PREFIX, health_snapshot
@@ -146,16 +147,32 @@ class Runs(_Model):
     items: list[RunItem] | None = _local()
 
 
+ApprovalLevel = Literal["L0", "L1", "L2", "L3"]
+
+
+class ApprovalChange(_Model):
+    """One change of a batch (BA-1): its line in the batch's prompt, and its own level."""
+
+    summary: str
+    level: ApprovalLevel
+
+
 class ApprovalItem(_Model):
+    """What one answer decides: a lone approval, or a batch (PER-254) as one row with the
+    batch's code (its first approval's), the summary ``N changes, all or none``, its strictest
+    level, when it was asked and its one expiry. ``changes`` lists a batch's changes in
+    order; it is absent for a lone approval."""
+
     code: str | None
     summary: str
-    level: Literal["L0", "L1", "L2", "L3"]
+    level: ApprovalLevel
     asked_at: datetime
     expires_at: datetime
+    changes: list[ApprovalChange] | None = _local()
 
 
 class Approvals(_Model):
-    open: int
+    open: int  # rows (what the owner answers): a batch counts once
     items: list[ApprovalItem] | None = _local()
 
 
@@ -461,7 +478,7 @@ def build_snapshot(
     now = now or utcnow()
     health = _health(conn)
     run_rows = runs.recent(conn, limit=RUN_ITEMS)
-    pending = approvals.pending_all(conn, now)
+    pending = _approval_items(conn, approvals.pending_all(conn, now))
     asks = questions.open_asks(conn)
     items = pulse.open_items(conn, now)
     autonomy = kv_get(conn, "autonomy", "on")
@@ -505,19 +522,7 @@ def build_snapshot(
                 for r in run_rows
             ],
         ),
-        approvals=Approvals(
-            open=len(pending),
-            items=[
-                ApprovalItem(
-                    code=a.code,
-                    summary=a.summary,
-                    level=a.level.value,
-                    asked_at=a.created_at,
-                    expires_at=a.expires_at,
-                )
-                for a in pending
-            ],
-        ),
+        approvals=Approvals(open=len(pending), items=pending),
         questions=Questions(
             open=len(asks),
             items=[
@@ -553,6 +558,52 @@ def build_snapshot(
         claude_brain=_claude_brain(conn),
         brain_activity=_brain_activity(conn, settings, now),
     )
+
+
+def _approval_items(
+    conn: sqlite3.Connection, pending: Sequence[approvals.Approval]
+) -> list[ApprovalItem]:
+    """``pending`` (oldest first) as what one answer decides: each lone approval, and each
+    batch (BA-1) once, where its oldest pending approval is. Approving any approval of a batch
+    approves all of it, so it is one row. A batch's code is its first approval's and its
+    changes are in its order (both as its prompt showed them); it expires as one. A batch
+    whose approvals aren't all pending any more (one decided on its own: a race) can't be
+    answered as one (the gate's ``_units``; the runner drops the rest), so what is left of it
+    shows as lone rows, never under a code that no longer binds."""
+    index = approvals.batches_of(conn, [a.id for a in pending])
+    by_id = {a.id: a for a in pending}
+    out: list[ApprovalItem] = []
+    seen: set[str] = set()
+    for a in pending:
+        batch = index.get(a.id)
+        if batch is None or any(i not in by_id for i in batch.approval_ids):
+            out.append(
+                ApprovalItem(
+                    code=a.code,
+                    summary=a.summary,
+                    level=a.level.value,
+                    asked_at=a.created_at,
+                    expires_at=a.expires_at,
+                )
+            )
+            continue
+        if batch.id in seen:
+            continue
+        seen.add(batch.id)
+        members = [by_id[i] for i in batch.approval_ids]
+        out.append(
+            ApprovalItem(
+                code=members[0].code,
+                summary=f"{len(members)} changes, all or none",
+                level=strictest([m.level for m in members]).value,
+                asked_at=batch.created_at,
+                expires_at=min(m.expires_at for m in members),
+                changes=[
+                    ApprovalChange(summary=change_line(m), level=m.level.value) for m in members
+                ],
+            )
+        )
+    return out
 
 
 _RC_URL = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]{1,200}")

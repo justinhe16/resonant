@@ -766,7 +766,7 @@ class _BatchRefused(Exception):
         self.reason = reason
 
 
-def _strictest(levels: Sequence[Level]) -> Level:
+def strictest(levels: Sequence[Level]) -> Level:
     """L1 (the code) over L2 over L3 (L0 never asks)."""
     order = (Level.L1, Level.L2, Level.L3, Level.L0)
     return min(levels, key=order.index)
@@ -791,7 +791,8 @@ def batch_line(summary: str, *, offered: bool, widens: bool = False) -> str:
     return f"widens trust: {summary}" if widens else summary
 
 
-def _line(a: ap.Approval) -> str:
+def change_line(a: ap.Approval) -> str:
+    """``a`` as one line of its batch's prompt (also the dashboard's batch row, PER-254)."""
     return batch_line(a.summary, offered=a.allow_always, widens=widens_trust(a.tool, a.extension))
 
 
@@ -819,7 +820,7 @@ class _Unit:
 
     @property
     def level(self) -> Level:
-        return _strictest([m.level for m in self.members])
+        return strictest([m.level for m in self.members])
 
     @property
     def destructive(self) -> bool:
@@ -843,7 +844,7 @@ class _Unit:
                 require_code=a.require_code,
                 expires_at=a.expires_at,
             )
-        summary = f"{len(self.members)} changes: " + "; ".join(_line(m) for m in self.members)
+        summary = f"{len(self.members)} changes: " + "; ".join(change_line(m) for m in self.members)
         if len(summary) > BATCH_SUMMARY_CHARS:
             summary = summary[: BATCH_SUMMARY_CHARS - 1].rstrip() + "…"
         return PendingApproval(
@@ -867,7 +868,7 @@ class _Unit:
             code=self.code or "",
             task_id=self.head.task_id or "",
             expires_at=min(m.expires_at for m in self.members),
-            lines=tuple(_line(m) for m in self.members),
+            lines=tuple(change_line(m) for m in self.members),
             require_code=self.require_code,
             destructive=self.destructive,
             level=self.level,
