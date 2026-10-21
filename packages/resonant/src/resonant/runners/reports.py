@@ -77,7 +77,7 @@ import re
 import sqlite3
 from collections import deque
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Literal, Protocol, cast
 from zoneinfo import ZoneInfo
@@ -119,6 +119,7 @@ DID_IN_TEXT = 300  # the Did: line of a texted end reply
 SELF_SYSTEM = "resonant"  # the trust system of a worker's restart or update
 _ALERT_KEY = "run.alert:"  # kv: a run's ⚠ lines for its end text (PER-268), oldest first
 _MERGED_KEY = "run.merged:"  # kv: the PRs a run merged onto its base (PER-268)
+_MERGED_BY_KEY = "run.merged_by:"  # kv: who merged a run's own PR, by Resonant's record (PER-269)
 ALERTS_KEEP = 3
 # Detected kinds that are said in the run's one end text, never texted mid-run (PER-268): a
 # merge is the work a run is often asked to do, so its end text names it.
@@ -268,6 +269,33 @@ def merged_list(conn: sqlite3.Connection, code: str) -> list[str]:
     if not isinstance(value, list):
         return []
     return [v for v in cast(list[object], value) if isinstance(v, str)]
+
+
+@dataclass(frozen=True)
+class MergedBy:
+    """PER-269: the run's own PR was found merged, and Resonant has a record of it:
+    ``resonant`` merged it (``github.merge_pr``), or the ``run`` did once the owner approved
+    its check. ``code``: the approval the owner answered (``M6``), when there was one."""
+
+    by: Literal["resonant", "run"]
+    code: str | None
+
+
+def set_merged_by(conn: sqlite3.Connection, code: str, merged_by: MergedBy) -> None:
+    with atomic(conn):
+        kv_set(conn, _MERGED_BY_KEY + code, {"by": merged_by.by, "code": merged_by.code})
+
+
+def merged_by_of(conn: sqlite3.Connection, code: str) -> MergedBy | None:
+    value: object = kv_get(conn, _MERGED_BY_KEY + code)
+    if not isinstance(value, dict):
+        return None
+    fields = cast(dict[str, object], value)
+    by, approval = fields.get("by"), fields.get("code")
+    if by not in ("resonant", "run"):
+        return None
+    return MergedBy("resonant" if by == "resonant" else "run",
+                    approval if isinstance(approval, str) else None)  # fmt: skip
 
 
 def merged_names(effects: Sequence[SideEffect]) -> list[str]:
@@ -557,6 +585,7 @@ __all__ = [
     "DID_PREFIX",
     "HELD_KINDS",
     "NOTE_TEXTS_PER_HOUR",
+    "MergedBy",
     "WorkerReports",
     "alerts",
     "clear_alerts",
@@ -568,11 +597,13 @@ __all__ = [
     "end_title",
     "is_worker_item",
     "item_key",
+    "merged_by_of",
     "merged_list",
     "merged_names",
     "record_detected",
     "record_did",
     "set_alert",
     "set_merged",
+    "set_merged_by",
     "shown_did",
 ]

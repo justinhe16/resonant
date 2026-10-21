@@ -46,6 +46,7 @@ a resume) and attrs: the task eval counts gated writes and approvals from them. 
 from __future__ import annotations
 
 import contextlib
+import logging
 import sqlite3
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -64,12 +65,14 @@ from resonant.gate import (
     NeedsApproval,
     TokenVerifier,
 )
+from resonant.gate import actions as action_ids
 from resonant.gate.policy import APPROVAL_USED, batch_line, widens_trust
 from resonant.gate.types import Origin
 from resonant.loop.types import StepContext
 from resonant.models import SpanFactory
 from resonant.store import approvals as ap
 from resonant.store import trust as trust_store
+from resonant.store.db import utcnow
 from resonant.toolcore.reports import (
     BAD_ARGS_REPLY,
     NOT_AVAILABLE_REPLY,
@@ -81,6 +84,8 @@ from resonant.toolcore.reports import (
 from resonant.tools import ToolRegistry
 from resonant.tools.registry import ToolKey
 from resonant_sdk import Effect, ToolSpec
+
+log = logging.getLogger(__name__)
 
 # Gated side effects that run without asking (L3, a standing allow), per task (GT-1; BA-1
 # raised it from 3 so "update these 4 Linear tickets" fits under a standing rule). Changes
@@ -623,6 +628,13 @@ class ToolCore:
                 "not_allowed", refusal_reply(intent, Deny(APPROVAL_USED)), True, intent, decision
             )
         rule = self._rule_added(decision.approval_id) if result.ok else None
+        if result.ok and (merged := action_ids.merged_by(intent)) is not None:
+            # PER-269: the PR is merged; the other open asks for it (a run's check) are moot.
+            # Housekeeping: a failure here never turns the merge that ran into an error.
+            try:
+                ap.obsolete_for_target(self.conn, merged, utcnow())
+            except sqlite3.Error:
+                log.warning("couldn't obsolete the asks for %s", merged, exc_info=True)
         return self._ran(intent, result, rule_added=rule, decision=decision)
 
     @staticmethod
