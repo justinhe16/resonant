@@ -255,7 +255,7 @@ def test_a_run_behind_the_slot_limit_reads_queued(db: sqlite3.Connection) -> Non
     behind = make_run(db, ask="docs pass")
     defer_on_slots(db, behind)
     plain = make_run(db, ask="never picked")  # its task never deferred: dropped
-    now = behind.created_at + 5 * H
+    now = plain.created_at + 5 * H  # the later run, so neither reads under 5h across a second tick
     ru.refresh(db, now)
     assert pending(db, now) == {
         "stall/run-r1": "R1 docs pass (~5h)",

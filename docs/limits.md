@@ -75,6 +75,9 @@ What Resonant does not do, or does on purpose in a way that has a cost. Each was
 
 - **"Claude answer" is read off the text** (PER-261). The iMessage channel marks a send as a Claude answer when it starts with `Claude: `. Anything else that starts that way also asks a bare yes for its code (fails safe); a Claude answer sent through another channel isn't seen (only iMessage replies bind).
 - **The expiry reminder runs once a minute** (PER-261), so it lands up to a minute after half the TTL; a prompt with under a minute left gets none. One a prompt, never repeated.
+- **One request per action covers PR merges and reruns** (PER-269). Only `github.merge_pr`, `github.rerun_failed`, `merge_run` and a worker's `--action merge` check carry an identity; other duplicate asks (two paths deploying one thing) still each ask. A merge check whose `what` names no PR, from a run with no PR yet, has none.
+- **A batched ask isn't made obsolete** (PER-269). A batch is answered as one unit, so a member whose PR merged meanwhile stays; its merge then fails as already merged.
+- **A worker told `handled` isn't told the outcome** (PER-269). Its check isn't asked because Resonant (or another run) already asks for the same merge; if the owner says no there, the worker only learns it from the PR.
 
 ## Workers
 
