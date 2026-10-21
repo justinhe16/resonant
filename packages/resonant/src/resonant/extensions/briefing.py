@@ -20,8 +20,9 @@ the date):
   the owner hasn't heard (the 08:00 pulse is skipped, so the briefing says it: ended and
   merged runs, merged PRs, stalls, review requests) and what is still going, marked told
   after the send like the Updates.
-- ``Updates:`` then one line per open pulse item (``store.pulse.open_items``: every source
-  including ``core``, every urgency), changed-since-told first, at most 8 lines and
+- ``Updates:`` then one line per open pulse item (``store.pulse.open_items``: every
+  extension, and the ``core`` brain notices not yet told, such as ``W3 iPhone 17 in stock
+  ended without firing``; every urgency), changed-since-told first, at most 8 lines and
   ``+N more``. The items listed are marked told after the send (a manual run too), so the
   next pulse doesn't repeat them. github's morning summary is one of these
   (``[github] 3 open PRs, 1 failing CI, 2 awaiting your review``, reported at low urgency).
@@ -86,6 +87,8 @@ if TYPE_CHECKING:
     from resonant.gateway.channel import Channel
 
 log = logging.getLogger(__name__)
+# ``brain.notices.KEY_PREFIX`` (importing it here is a cycle through the router)
+NOTICE_PREFIX = "notice/"
 
 JOB_ID = "briefing"
 CATCHUP = timedelta(hours=3)
@@ -285,10 +288,15 @@ def _degraded(conn: sqlite3.Connection) -> tuple[str, ...]:
 
 
 def _updates(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item, ...]:
-    """Open pulse items for the Updates section: extension items only (the briefing has its
-    own approvals and health lines) and not from muted extensions (they are neither listed
-    nor marked told)."""
-    items = [i for i in pulse_store.open_items(conn, now) if i.source != "core"]
+    """Open pulse items for the Updates section: extension items (the briefing has its own
+    approvals and health lines) and brain notices the owner hasn't heard (``core`` /
+    ``notice/``: a watch that ended without firing, one held by the daily cap), not from
+    muted extensions (they are neither listed nor marked told)."""
+    items = [
+        i
+        for i in pulse_store.open_items(conn, now)
+        if i.source != "core" or (i.key.startswith(NOTICE_PREFIX) and i.changed)
+    ]
     muted = {s for s in {i.source for i in items} if notify.muted_until(conn, s, now)}
     return tuple(i for i in items if i.source not in muted)
 
@@ -299,7 +307,8 @@ def _workers(conn: sqlite3.Connection, now: datetime) -> tuple[pulse_store.Item,
     pending = pulse_store.pending(conn, ("urgent", "normal", "low"), now)
     finished = rollup.held_while_stale(conn, now, [i for i in pending if is_worker_item(i)])
     keys = {i.key for i in finished}
-    return (*finished, *(i for i in running_workers(conn, now) if i.key not in keys))
+    told = [*running_workers(conn, now), *rollup.quiet_items(conn, now)]
+    return (*finished, *(i for i in told if i.key not in keys))
 
 
 def gather(
