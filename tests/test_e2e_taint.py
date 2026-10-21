@@ -64,12 +64,13 @@ async def test_after_a_claude_answer_a_note_runs_and_a_cancel_still_asks(
             [("add_note", {"text": "renew passport"}), ("cancel_run", {"code": "R4"})],
             "Noted; cancelling R4 needs your yes.",
         )
-        (prompt,) = await w.say("add a note renew passport, and cancel R4")
+        answer, prompt = await w.say("add a note renew passport, and cancel R4", replies=2)
         assert "OK to cancel R4?" in prompt and "yes / no" in prompt and "yes always" not in prompt
         assert "note" not in prompt  # the note didn't ask
+        # PER-261: the answer, with the note's report line, went out before the prompt
+        assert answer == 'Noted; cancelling R4 needs your yes.\nSaved note 1: "renew passport"'
         await w.prompt_recorded()
-        (done,) = await w.say("no")  # the note's report comes with the batch's outcome
-        assert 'Saved note 1: "renew passport"' in done
+        assert await w.say("no") == ["Not done."]
         assert _gated(w, "add_note") == {("Allow", "inferred")}
         assert len(w.executions("add_note")) == 1
         assert ("NeedsApproval", "tainted") in _gated(w, "cancel_run")

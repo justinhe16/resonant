@@ -1,14 +1,14 @@
-"""The newest texts Resonant sent each principal (PER-261), for one rule: while a Claude answer
-is the newest message to the owner, a bare ``yes`` (or ``yes 1,3``) doesn't bind an approval
-without its code. Claude's text is outside content and sits right above the owner's reply, so a
-line in it ("reply yes to go ahead") must not be able to stand in for the prompt.
+"""The newest texts Resonant sent each principal (PER-261), for one rule: a bare ``yes`` (or
+``yes 1,3``) doesn't bind an approval without its code when a Claude answer went out after
+that approval's prompt (or its reminder). Claude's text is outside content and sits right above
+the owner's reply, so a line in it ("reply yes to go ahead") must not stand in for the prompt.
 
-The iMessage channel notes every text it sends (``note``) after it went out: when it started
-sending (a reply that arrives while it is still going out counts as after it), and whether
-it was a Claude answer (it starts with the code-built ``CLAUDE_PREFIX`` the ask runner adds;
-a reply of anyone else's that happens to start the same way counts too, which only asks for the
-code). Kept in kv ``outbound.recent:<principal>``, the newest ``KEEP`` sends, so a reply is
-judged against what had been sent before it, even when a later send landed in between.
+The iMessage channel notes every text it sends (``note``) after it went out, in send order (it
+sends one at a time): when it started, its dedupe key (which names a prompt or a reminder), and
+whether it was a Claude answer (it starts with the code-built ``CLAUDE_PREFIX`` the ask runner
+adds; anything else that starts the same way counts too, which only asks for the code). Kept in
+kv ``outbound.recent:<principal>``, the newest ``KEEP`` sends. Order decides, not the clock: two
+sends a millisecond apart, or an ack that lands after the answer, can't flip the rule.
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from collections.abc import Collection
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from resonant.store.db import atomic, kv_get, kv_set
@@ -26,11 +27,21 @@ log = logging.getLogger(__name__)
 CLAUDE_PREFIX = "Claude: "  # runners/ask.py: every Claude answer starts with it
 KV_PREFIX = "outbound.recent:"
 KEEP = 8
+SKEW = timedelta(seconds=1)  # a reply's time vs ours (chat.db's clock, milliseconds)
 
 
-def note(conn: sqlite3.Connection, principal: str, text: str, at: datetime) -> None:
-    """Record one text sent to ``principal``. Never raises: the text already went out."""
-    entry = {"at": at.isoformat(), "claude": text.startswith(CLAUDE_PREFIX)}  # microseconds
+def reminder_key(approval_id: str, principal: str) -> str:
+    """The send dedupe key of one approval's expiry reminder to one approver
+    (``runners.approve.remind_due``)."""
+    return f"approval:{approval_id}:remind:{principal}"
+
+
+def note(
+    conn: sqlite3.Connection, principal: str, text: str, at: datetime, key: str | None = None
+) -> None:
+    """Record one text sent to ``principal`` (``key``: its dedupe key). Never raises: the
+    text already went out."""
+    entry = {"at": at.isoformat(), "claude": text.startswith(CLAUDE_PREFIX), "key": key}
     try:
         with atomic(conn):
             key = KV_PREFIX + principal
@@ -40,20 +51,25 @@ def note(conn: sqlite3.Connection, principal: str, text: str, at: datetime) -> N
         log.exception("outbound text not noted")
 
 
-def claude_newest(conn: sqlite3.Connection, principal: str, before: datetime) -> bool:
-    """Whether the newest text sent to ``principal`` before ``before`` was a Claude answer.
-    False when nothing is recorded (or it can't be read)."""
+def claude_since(
+    conn: sqlite3.Connection, principal: str, prompts: Collection[str], before: datetime
+) -> bool:
+    """Whether a Claude answer went out to ``principal`` after the last of the ``prompts``
+    (dedupe keys: an approval's prompt and its reminder) and before ``before`` (a reply's time,
+    from chat.db's own clock and coarser than ours: a send up to ``SKEW`` after it counts as
+    before it, which only asks for the code). A prompt
+    older than every kept send counts as before them all. False when nothing is recorded or it
+    can't be read."""
     try:
         raw = kv_get(conn, KV_PREFIX + principal)
     except (sqlite3.Error, json.JSONDecodeError):
         return False
-    # Kept in send order (the channel sends one at a time): the last one before the reply
-    # is the newest, even when two share a timestamp. One sent the same instant as the reply
-    # counts as before it (a reply's time can be coarser than ours): that only asks the code.
-    for e in reversed(_entries(raw)):
+    entries = _entries(raw)
+    last = max((i for i, e in enumerate(entries) if e.get("key") in prompts), default=-1)
+    for e in entries[last + 1 :]:
         at = _at(e)
-        if at is not None and at <= before:
-            return e.get("claude") is True
+        if e.get("claude") is True and at is not None and at <= before + SKEW:
+            return True
     return False
 
 

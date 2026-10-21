@@ -311,7 +311,7 @@ class IMessageChannel:
                     ref=ref.ref,
                 )
             # PER-261: what was sent last (a Claude answer asks a bare yes for its code)
-            outbound.note(self.conn, principal, text, started)
+            outbound.note(self.conn, principal, text, started, dedupe_key)
         log.info("imessage sent to %s (%d chars, %d part(s))", principal, len(text), len(chunks))
         return ref
 

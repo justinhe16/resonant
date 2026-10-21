@@ -73,6 +73,9 @@ What Resonant does not do, or does on purpose in a way that has a cost. Each was
 - **The "approve it?" guard is a phrase list** (PER-268). A model that asks for a yes in other words still gets through; the prompt rule is the backup, and a real ask is never dropped (it only runs with nothing pending).
 - **An extension's stderr reason is replayed untainted** (PER-268). The failure text's reason is the extension's (or GitHub's) last stderr line, cleaned and clipped to 200, and it reaches both brains as a system text. Accepted: it is one short line from Resonant's own extensions.
 
+- **"Claude answer" is read off the text** (PER-261). The iMessage channel marks a send as a Claude answer when it starts with `Claude: `. Anything else that starts that way also asks a bare yes for its code (fails safe); a Claude answer sent through another channel isn't seen (only iMessage replies bind).
+- **The expiry reminder runs once a minute** (PER-261), so it lands up to a minute after half the TTL; a prompt with under a minute left gets none. One a prompt, never repeated.
+
 ## Workers
 
 - **Workers run unguarded** by default, as the owner at the keyboard. The checkout's `.git` is worker-writable, so a planted hook runs on the owner's next `git commit` there. Accepted.

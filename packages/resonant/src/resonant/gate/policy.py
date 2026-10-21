@@ -793,13 +793,22 @@ class PolicyGate:
             if seen != [target.head.id]:
                 return None, "ambiguous"
             if reply.decision == "approve" and (
-                target.needs_code(reply.picks)
-                or outbound.claude_newest(self.conn, reply.actor, reply.occurred_at)
+                target.needs_code(reply.picks) or self._claude_since(target, reply)
             ):
-                # PER-261: right after a Claude answer (outside text, above the reply) a bare
-                # yes, or yes 1,3, needs the code: the answer can't stand in for the prompt.
                 return None, "code_required"
         return target, None
+
+    def _claude_since(self, unit: _Unit, reply: ApprovalReply) -> bool:
+        """PER-261: a Claude answer (outside text, right above the reply) went out after this
+        prompt or its reminder, so a bare yes, or yes 1,3, needs the code: the answer can't
+        stand in for the prompt."""
+        from resonant.gateway.channel import approval_dedupe_key  # the gateway imports the gate
+
+        actor = reply.actor
+        ids = [m.id for m in unit.members] + ([unit.batch.id] if unit.batch is not None else [])
+        keys = {approval_dedupe_key(i, actor) for i in ids}
+        keys |= {outbound.reminder_key(i, actor) for i in ids}
+        return outbound.claude_since(self.conn, actor, keys, reply.occurred_at)
 
     def _may_approve(self, reply: ApprovalReply, a: ap.Approval) -> bool:
         return (

@@ -14,7 +14,7 @@ Any extension can report items, so future extensions (Dori on-call, a trading bo
 
 ### As built (deviations from the design below)
 
-- **Health stays with the monitor.** No `core/health` items: the `HealthMonitor` already alerts on degrade and recovery, so the pulse would only say it twice. The core items are `core/approval/<code>` only.
+- **Health stays with the monitor.** No `core/health` items: the `HealthMonitor` already alerts on degrade and recovery, so the pulse would only say it twice. Approvals are not pulse items since PER-261 (`core/remind` reminds once at half the TTL).
 - **Briefing Updates exclude `core` and muted sources.** They list open extension items at any urgency, changed-since-told first.
 - **Ordering.** Urgent first, then normal, then low; oldest first within each, so an overflow can't starve old items.
 - **Clears of urgent items inherit urgent.** The "recovered" for an urgent item is texted at once however the extension rated the clear (clamped to the grant), including a clear of something the owner never heard.
@@ -108,7 +108,7 @@ The first run after install is a baseline (as for notify): items are stored as t
 - One core job, cron `0 * * * *` in `settings.timezone`, catch-up 50 minutes. It skips the briefing's hour (the briefing covers it), quiet hours, and paused.
 - Core items are refreshed in-process first:
   - Health stays with the monitor, which already alerts (no `core/health` items).
-  - `core/approval/<code>`: an approval pending for `remention_after` (normal), one re-mention. As built: capped at half the approval TTL; with the defaults (10 and 30 minutes) only approvals asked between :30 and :50 past an hour are caught by the next pulse. A proper "expires soon" reminder belongs to the approval runner (follow-up).
+  - `core/approval/<code>`: an approval pending for `remention_after` (normal), one re-mention. As built: capped at half the approval TTL; with the defaults (10 and 30 minutes) only approvals asked between :30 and :50 past an hour are caught by the next pulse. Superseded by PER-261: `core/remind` texts `[A7] still waiting, expires in 15 min` once at half the TTL, and this item is gone.
 - It collects untold `normal` and `urgent` items (the urgent ones were held), from extensions that aren't muted, and sends one message if there are any:
   ```
   btw:

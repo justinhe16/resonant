@@ -41,6 +41,7 @@ from resonant.store import approvals as ap
 from resonant.store import system_texts
 from resonant.store.audit import audit
 from resonant.store.db import atomic, transaction, utcnow
+from resonant.store.outbound import reminder_key
 from resonant.store.tasks import get_task
 
 if TYPE_CHECKING:
@@ -178,11 +179,6 @@ def reminder_text(code: str, left: timedelta) -> str:
     """``[A7] still waiting, expires in 15 min`` (whole minutes, at least 1)."""
     minutes = max(1, round(left.total_seconds() / 60))
     return f"[{code}] still waiting, expires in {minutes} min"
-
-
-def reminder_key(approval_id: str, principal: str) -> str:
-    """The send dedupe key (and system text ref) of one approval's reminder to one approver."""
-    return f"approval:{approval_id}:remind:{principal}"
 
 
 async def remind_due(conn: sqlite3.Connection, channel: Channel, now: datetime) -> int:

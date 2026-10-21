@@ -21,15 +21,16 @@ from test_local_runner_gated import Clock, FakeChannel, FakeModel
 from resonant.brain.history import EARLY_ANSWER, replayed
 from resonant.executor import Executor, HandlerKey, ToolHandler
 from resonant.gate import Intent, NeedsApproval, PolicyGate
-from resonant.gateway.channel import ChannelRefused, ChannelSendError
+from resonant.gateway.channel import ChannelRefused, ChannelSendError, approval_dedupe_key
 from resonant.loop.types import Wait
 from resonant.models.client import null_spans
 from resonant.router.approvals import refusal_reply
-from resonant.runners.approve import remind_due, reminder_key, reminder_text
+from resonant.runners.approve import remind_due, reminder_text
 from resonant.runners.local import LocalRunner
 from resonant.store import approvals as ap
 from resonant.store import outbound
 from resonant.store.db import kv_set, transaction
+from resonant.store.outbound import reminder_key
 from resonant.toolcore import MAX_SIDE_EFFECTS, Asked, BatchItem, CallScope, Ran, Refused
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect, Level, ToolSpec
@@ -276,13 +277,17 @@ async def test_a_bare_yes_right_after_a_claude_answer_needs_the_code(h: H) -> No
     assert h.ran == ["close:A"]
 
 
-async def test_a_bare_no_and_a_later_text_are_unaffected(h: H) -> None:
-    await lone(h)
+async def test_a_later_text_keeps_it_until_the_prompt_is_shown_again(h: H) -> None:
+    _, needs = await lone(h)
+    outbound.note(h.db, OWNER, "[X] prompt", h.clock(), approval_dedupe_key(needs.id, OWNER))
     h.clock.advance(5)
-    outbound.note(h.db, OWNER, "Claude: something", h.clock())
+    outbound.note(h.db, OWNER, "Claude: something", h.clock(), "ask:t1")
     h.clock.advance(5)
-    outbound.note(h.db, OWNER, "Added: milk", h.clock())  # a newer text: not Claude's
-    assert h.reply("yes").ok
+    outbound.note(h.db, OWNER, "on it", h.clock(), "reply:t1")  # an ack after the answer
+    assert h.reply("yes").reason == "code_required"  # Claude's text still came after the prompt
+    h.clock.advance(5)
+    outbound.note(h.db, OWNER, "[X] still waiting", h.clock(), reminder_key(needs.id, OWNER))
+    assert h.reply("yes", event="e2").ok  # the reminder showed the prompt again
     _, other = await lone(h)
     h.clock.advance(5)
     outbound.note(h.db, OWNER, "Claude: something else", h.clock())
@@ -321,8 +326,9 @@ def test_outbound_keeps_the_newest_sends(db: sqlite3.Connection) -> None:
                                      (outbound.KV_PREFIX + OWNER,)).fetchone()[0])) == (
         outbound.KEEP
     )  # fmt: skip
-    assert outbound.claude_newest(db, OWNER, t0 + timedelta(seconds=30)) is False  # dropped
-    assert outbound.claude_newest(db, "nobody", t0) is False
+    later = t0 + timedelta(hours=1)
+    assert outbound.claude_since(db, OWNER, set(), later) is False  # the Claude send was dropped
+    assert outbound.claude_since(db, "nobody", set(), later) is False
 
 
 # --- answers before batches, and the partial decision ------------------------------------------

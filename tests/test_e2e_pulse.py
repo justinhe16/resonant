@@ -43,6 +43,7 @@ from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import NewTask
 from resonant.loop.types import PRIORITY_OWNER
 from resonant.ops.fakes import FakeOpsRunner
+from resonant.runners import approve
 from resonant.secrets import FakeKeychain, SecretStore
 from resonant.store import approvals as ap
 from resonant.store import pulse as items
@@ -137,6 +138,7 @@ class World:
             core_jobs=(
                 functools.partial(briefing.briefing_job, clock=self.clock),
                 functools.partial(pulse_job.pulse_job, clock=self.clock),
+                functools.partial(approve.remind_job, clock=self.clock),  # PER-261
             ),
             clock=self.clock,
         )
@@ -415,10 +417,10 @@ async def test_u8_muted_items_are_skipped_then_told_once_after_the_mute_if_still
         assert len(w.texts()) == 2
 
 
-# --- U9: approval re-mention -----------------------------------------------------------------
+# --- U9: the approval reminder (PER-261: core/remind, never the pulse) -------------------------
 
 
-async def test_u9_a_waiting_approval_is_mentioned_once_before_it_expires(
+async def test_u9_a_waiting_approval_is_reminded_once_at_half_its_ttl(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
     # Defaults: re-mentioned after 10 minutes, by the next hourly pulse; it expires at 30.
@@ -443,10 +445,16 @@ async def test_u9_a_waiting_approval_is_mentioned_once_before_it_expires(
             ),
             at(10, 9, 45),
         )
-        await w.tick(at(10, 10))
-        assert w.texts() == ["btw:\n✋ A7 still waiting: restart Resonant"]
-        for hour in (11, 12):
-            await w.tick(at(10, hour))
+        (row,) = w.conn.execute("SELECT id FROM approvals").fetchall()
+        ap.add_channel_ref(w.conn, row["id"], ref="imessage-out:1", at=at(10, 9, 45),
+                           principal="justin")  # fmt: skip  # the prompt went out
+        w.conn.commit()
+        await w.tick(at(10, 9, 59))
+        assert w.texts() == []  # under half its TTL
+        await w.tick(at(10, 10))  # also the pulse's hour: it says nothing about approvals
+        assert w.texts() == ["[A7] still waiting, expires in 15 min"]
+        for when in (at(10, 10, 1), at(10, 10, 5)):
+            await w.tick(when)
         assert len(w.texts()) == 1  # once
 
 
