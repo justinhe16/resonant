@@ -197,7 +197,7 @@ class Ops:
             last = datetime.fromisoformat(value) if isinstance(value, str) else None
         except ValueError:
             last = None
-        if last is None or not timedelta(0) <= now - last < OLLAMA_COOLDOWN:
+        if last is None or last.tzinfo is None or not timedelta(0) <= now - last < OLLAMA_COOLDOWN:
             return  # never, garbage, a clock that went back, or long enough ago
         ago = (now - last).total_seconds()
         left = (OLLAMA_COOLDOWN - (now - last)).total_seconds()
@@ -301,11 +301,12 @@ _KEY_PREFIXED = re.compile(
     r"\b(?:sk-|pk-|rk-|gh[pousr]_|github_pat_|xox[abprse]-|glpat-|npm_|lin_api_|sb_secret_)"
     r"[A-Za-z0-9_-]{6,}"
 )
-# A long run of key alphabet with an upper, a lower and a digit: base64-ish key material.
-# Lowercase hex (shas), ULIDs (uppercase) and UUIDs don't have all three, so they stay.
+# A long unbroken run of letters and digits with an upper, a lower and a digit: key
+# material. ``/``, ``-`` and ``_`` break a run, so paths and names like
+# ``mistral-nemo-Q4_K_M`` stay; lowercase hex (shas), ULIDs and UUIDs lack one of the three.
 _KEY_SHAPED = re.compile(
-    r"(?<![A-Za-z0-9+/_=-])(?=[A-Za-z0-9+/_=-]{0,256}[A-Z])(?=[A-Za-z0-9+/_=-]{0,256}[a-z])"
-    r"(?=[A-Za-z0-9+/_=-]{0,256}[0-9])[A-Za-z0-9+/_=-]{32,256}(?![A-Za-z0-9+/_=-])"
+    r"(?<![A-Za-z0-9+=])(?=[A-Za-z0-9+=]{0,256}[A-Z])(?=[A-Za-z0-9+=]{0,256}[a-z])"
+    r"(?=[A-Za-z0-9+=]{0,256}[0-9])[A-Za-z0-9+=]{32,256}(?![A-Za-z0-9+=])"
 )
 
 
@@ -334,10 +335,10 @@ def clean_line(text: str) -> str:
     secrets (``redact_secrets``) and key-shaped tokens → ``[redacted]``, home paths → ``~``,
     then ``scrub``, then the clip. Only the first ``LOG_LINE_MAX + REDACT_SLACK`` chars are
     scanned (a huge record stays cheap), and a token cut by the clip was already caught."""
-    text = redact_secrets(text[: LOG_LINE_MAX + REDACT_SLACK])
+    text = strip_home(redact_secrets(text[: LOG_LINE_MAX + REDACT_SLACK]))
     text = _KEY_PREFIXED.sub(REDACTED, text)
     text = _KEY_SHAPED.sub(REDACTED, text)
-    return _clip(scrub(strip_home(text)))
+    return _clip(scrub(text))
 
 
 def log_line(raw: str) -> str:

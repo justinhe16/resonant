@@ -242,6 +242,12 @@ async def test_only_a_kickstart_that_may_have_run_starts_the_cooldown(
         assert (await ops_.restart_ollama())["restarted"] is True
 
 
+async def test_a_garbage_cooldown_stamp_doesnt_block_a_restart(db: sqlite3.Connection) -> None:
+    for stamp in ("2026-10-13T15:00:00", "not a time", 12):  # naive, garbage, wrong type
+        kv_set(db, ops.OLLAMA_RESTARTED_KEY, stamp)
+        assert (await ops_at(db, FakeOpsRunner(), Clock()).restart_ollama())["restarted"]
+
+
 async def test_a_clock_that_went_back_doesnt_block_a_restart(db: sqlite3.Connection) -> None:
     clock = Clock()
     ops_ = ops_at(db, FakeOpsRunner(), clock)
@@ -705,6 +711,10 @@ def test_clean_line_keeps_ids_shas_and_times() -> None:
         "e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3 trace 3f2b8c1e-7d4a-4b9e-9c2f-1a2b3c4d5e6f"
     )
     assert clean_line(kept) == kept
+    model = "model=mistral-nemo-instruct-2407-Q4_K_M_gguf_v2-final-build"
+    assert clean_line(model) == model  # a long name with - and _ isn't key material
+    deep = f"cwd={Path.home()}/resonant-per-260/packages/resonant/src/Resonant2/tools failed"
+    assert clean_line(deep) == "cwd=~/resonant-per-260/packages/resonant/src/Resonant2/tools failed"
     assert clean_line("x" * 1000).endswith("…") and len(clean_line("x" * 1000)) == 300
 
 
