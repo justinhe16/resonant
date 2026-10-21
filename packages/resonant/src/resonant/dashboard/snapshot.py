@@ -159,7 +159,7 @@ class ApprovalChange(_Model):
 
 class ApprovalItem(_Model):
     """What one answer decides: a lone approval, or a batch (PER-254) as one row with the
-    batch's code (its first approval's), the summary ``N changes, all or none``, its strictest
+    batch's code (its first approval's), the summary ``N changes``, its strictest
     level, when it was asked and its one expiry. ``changes`` lists a batch's changes in
     order; it is absent for a lone approval."""
 
@@ -564,8 +564,9 @@ def _approval_items(
     conn: sqlite3.Connection, pending: Sequence[approvals.Approval]
 ) -> list[ApprovalItem]:
     """``pending`` (oldest first) as what one answer decides: each lone approval, and each
-    batch (BA-1) once, where its oldest pending approval is. Approving any approval of a batch
-    approves all of it, so it is one row. A batch's code is its first approval's and its
+    batch (BA-1) once, where its oldest pending approval is. One answer decides all of it
+    (``yes`` / ``no``, or ``yes 1,3`` for some and the rest dropped, PER-255), so it is one
+    row. A batch's code is its first approval's and its
     changes are in its order (both as its prompt showed them); it expires as one. A batch
     whose approvals aren't all pending any more (one decided on its own: a race) can't be
     answered as one (the gate's ``_units``; the runner drops the rest), so what is left of it
@@ -594,7 +595,7 @@ def _approval_items(
         out.append(
             ApprovalItem(
                 code=members[0].code,
-                summary=f"{len(members)} changes, all or none",
+                summary=f"{len(members)} changes",
                 level=strictest([m.level for m in members]).value,
                 asked_at=batch.created_at,
                 expires_at=min(m.expires_at for m in members),

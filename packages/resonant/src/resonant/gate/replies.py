@@ -13,12 +13,14 @@ one of:
 - ``yes always( <code>)?``, ``yes <code> always`` or ``<code> yes always``: approve and
   add a trust rule. Only a worker's trust check offers it; the gate refuses it for any
   other approval (``always_unsupported``), and never reads it as a plain ``yes``.
+- ``(yes|approve) <picks>( <code>)?`` or ``(yes|approve) <code> <picks>`` (PER-255): approve
+  only these changes of a batch (``1,3``: their numbers in its prompt, comma separated) and
+  drop the rest. The gate checks the numbers against the batch it binds.
 
 Anything else is not a reply: ``y``, ``ok``, ``sure``, ``yes?``, ``yes all``, ``always``,
 ``no always``, ``yes A7 and C4``, a pasted prompt, or a code outside the approval alphabet
-(``yes A1``). A message the reader
-truncated is never a reply. There is no classifier and there are no batch replies in
-Phase 2.
+(``yes A1``), ``yes 1 3``, ``no 1,3``, ``yes always 1,3``. A message the reader truncated is
+never a reply. There is no classifier.
 
 The parser only reads text. Binding a reply to an approval (approvers, the sent-before
 rule, single pending, ``require_code``) is the gate's job.
@@ -62,6 +64,15 @@ _ALWAYS = (
     re.compile(rf"yes (?P<code>{_CODE}) always", _FLAGS),
     re.compile(rf"(?P<code>{_CODE}) yes always", _FLAGS),
 )
+# PER-255: "yes 1,3", "yes 1,3 D7" or "yes D7 1,3": change numbers of a batch, 1-20 (a batch
+# has at most 20, ``gate.batch_max``; so "yes 77" stays a look-alike code, not a pick),
+# separated by commas.
+_NUM = r"(?:1[0-9]|20|[1-9])(?![0-9])"
+_PICKS = rf"{_NUM}(?: ?, ?{_NUM})*"
+_SOME = (
+    re.compile(rf"(?:yes|approve) (?P<picks>{_PICKS})(?: (?P<code>{_CODE}))?", _FLAGS),
+    re.compile(rf"(?:yes|approve) (?P<code>{_CODE}) (?P<picks>{_PICKS})", _FLAGS),
+)
 # Trailing periods and exclamation marks (autocorrect, emphasis), never question marks.
 _TRAILING = re.compile(r"[\s.!]+\Z")
 
@@ -74,6 +85,9 @@ class ParsedReply:
     code: str | None = None
     comments: str | None = None
     always: bool = False  # "yes always"
+    # PER-255: "yes 1,3": the batch's change numbers to approve (1-based, sorted, distinct);
+    # None for a reply that answers all of it.
+    picks: tuple[int, ...] | None = None
 
 
 def normalize_reply(text: str) -> str:
@@ -96,6 +110,10 @@ def parse_reply(text: str, *, truncated: bool = False) -> ParsedReply | None:
     for pattern in _ALWAYS:
         if a := pattern.fullmatch(norm):
             return ParsedReply("approve", _upper(a["code"]), always=True)
+    for pattern in _SOME:
+        if p := pattern.fullmatch(norm):
+            picks = tuple(sorted({int(n) for n in re.findall(r"\d+", p["picks"])}))
+            return ParsedReply("approve", _upper(p["code"]), picks=picks)
     m = _WORD_CODE.fullmatch(norm) or _CODE_WORD.fullmatch(norm)
     if m is None:
         return None
