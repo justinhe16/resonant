@@ -158,6 +158,7 @@ async def test_claude_only_repo_with_a_checkout_commits_locally(
     prompt = call["argv"][call["argv"].index("--append-system-prompt") + 1]
     assert "don't push" in prompt and "the GitHub App isn't set up" in prompt
     assert "gh pr create" not in prompt
+    assert "/robot-surf" not in prompt  # no PR to merge: no surf skills
     # nothing the daemon does needs the token: no gh at all, no GitHub lookups
     assert h.gh_calls() == [] and h.gh_calls("api") == []
     [text] = h.chan.texts()

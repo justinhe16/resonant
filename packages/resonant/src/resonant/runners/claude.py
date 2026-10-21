@@ -291,6 +291,23 @@ RUNNER_PROMPT = (
     "out of attempts. End with a 1-3 line summary: what changed, the PR number, whether CI is "
     "green, and anything left undone."
 )
+# SF-1: a push run with the guard off loads the owner's ~/.claude, surf skills included. The
+# runner can't tell a code change from ops or research, so the prompt states when to use them.
+SURF_PROMPT = (
+    "\n\nThe owner's surf skills: use them only when all three hold: this run has a repo, "
+    "the ask is a code change, and the result is meant to be a pull request that gets merged. "
+    "Then work through /robot-surf (for a Linear ticket) or /robot-surf-prompt (for a freeform "
+    "ask), or another surf skill when it fits better, here in this worktree on {branch} (don't "
+    "create another worktree or branch): build the change, run the tests, open the pull "
+    "request, get CI green, then run the code-reviewer agent and fix what it finds until it "
+    "has no must-fix left, with CI green again after the fixes. For these runs green CI alone "
+    "is not the place to stop. Skip the skill's wait for human review: stop then and give the "
+    "summary. The rules above still hold. Merging stays with Resonant: it merges a green pull "
+    "request per the owner's trust rules, so don't merge it yourself. In every other case "
+    "(no repo, ops, research, an investigation, a review only, a one-off or unusual ask) "
+    "don't invoke a surf skill; just do what the ask says. If the ask asks for a different "
+    "flow, the ask wins."
+)
 FORK_PROMPT = (
     "You are working in a git worktree of {fork}, the owner's fork of {upstream} (your current "
     "directory), on branch {branch}, which is already checked out and starts from {upstream}'s "
@@ -2172,7 +2189,8 @@ class ClaudeRunner:
         return argv
 
     def _prompt(self, run: Run, p: Prepared, *, local: str | None = None) -> str:
-        """The session's system prompt: scratch, a push repo's (it drives its own PR), a
+        """The session's system prompt: scratch, a push repo's (it drives its own PR, through
+        the surf skills for a code change when the owner's setup is loaded), a
         fork's (it pushes to the fork and stops; Resonant opens the upstream PR) or a run's
         that can't push yet (``local``, RX-1: it commits and stops)."""
         if p.scratch:
@@ -2204,6 +2222,8 @@ class ClaudeRunner:
             RUNNER_PROMPT.format(
                 repo=repo.slug, branch=p.branch, base=p.base_branch, attempts=MAX_FIX_ATTEMPTS
             )
+            # the skills load only with the owner's setup (GD-1); thin runs never see them
+            + (SURF_PROMPT.format(branch=p.branch) if self.guard == "off" else "")
             + own
         )
 
