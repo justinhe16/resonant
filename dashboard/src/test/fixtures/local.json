@@ -80,7 +80,7 @@
     ]
   },
   "approvals": {
-    "open": 1,
+    "open": 2,
     "items": [
       {
         "code": "K7Q2",
@@ -88,6 +88,18 @@
         "level": "L1",
         "asked_at": "2026-10-16T08:50:00+00:00",
         "expires_at": "2026-10-16T09:50:00+00:00"
+      },
+      {
+        "code": "D7",
+        "summary": "3 changes, all or none",
+        "level": "L2",
+        "asked_at": "2026-10-16T08:55:00+00:00",
+        "expires_at": "2026-10-16T09:55:00+00:00",
+        "changes": [
+          { "summary": "linear: save issue title=\"Retry the relay push\"", "level": "L3" },
+          { "summary": "linear: save comment issue=\"PER-263\"", "level": "L3" },
+          { "summary": "restart resonant", "level": "L2" }
+        ]
       }
     ]
   },
