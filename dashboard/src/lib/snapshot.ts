@@ -29,11 +29,15 @@ export function snapshotProblem(raw: unknown): string | null {
   if (!isObj(s.slots) || typeof s.slots.used !== "number" || typeof s.slots.max !== "number") return "slots";
   if (!isObj(s.runs) || !isCounts(s.runs.by_state)) return "runs.by_state";
   if (s.runs.items !== undefined && !Array.isArray(s.runs.items)) return "runs.items";
+  const detected = s.runs.detected;
+  if (detected !== undefined && !(isObj(detected) && isCounts(detected.by_kind) && typeof detected.high === "number"))
+    return "runs.detected";
   for (const k of ["approvals", "questions", "pulse"]) {
     const v = s[k];
     if (!isObj(v) || typeof v.open !== "number") return `${k}.open`;
     if (v.items !== undefined && !Array.isArray(v.items)) return `${k}.items`;
   }
+  if (isObj(s.pulse) && s.pulse.untold !== undefined && typeof s.pulse.untold !== "number") return "pulse.untold";
   if (!Array.isArray(s.extensions) || !s.extensions.every((e) => isObj(e) && typeof e.name === "string" && Array.isArray(e.jobs)))
     return "extensions";
   if (!isObj(s.runner) || typeof s.runner.set_up !== "boolean") return "runner";
@@ -73,6 +77,14 @@ export function staleness(snap: Snapshot, now: number): Staleness | null {
   const tickAge = ageSeconds(since, Number.isNaN(takenAt) ? now : takenAt);
   if (tickAge !== null && tickAge > LOOP_STALL_S) return { kind: "loop", seconds: tickAge };
   return null;
+}
+
+/** Extensions muted right now (`/ext mute`), with when the mute ends: a muted reporter's
+ * items stay untold, so the Pulse card says whose they are. */
+export function mutedExtensions(snap: Snapshot, now: number): { name: string; until: string }[] {
+  return snap.extensions.flatMap((e) =>
+    e.muted_until && Date.parse(e.muted_until) > now ? [{ name: e.name, until: e.muted_until }] : [],
+  );
 }
 
 /** Only plain https links leave the page (PR links come from the local tier). */
@@ -135,10 +147,10 @@ export function forTier(snap: Snapshot): Snapshot {
   return {
     ...snap,
     health: snap.health.map((h) => ({ name: h.name, state: h.state, since: h.since })),
-    runs: { by_state: snap.runs.by_state },
+    runs: { by_state: snap.runs.by_state, ...(snap.runs.detected && { detected: snap.runs.detected }) },
     approvals: { open: snap.approvals.open },
     questions: { open: snap.questions.open },
-    pulse: { open: snap.pulse.open },
+    pulse: { open: snap.pulse.open, ...(snap.pulse.untold !== undefined && { untold: snap.pulse.untold }) },
     runner: { set_up: snap.runner.set_up },
     trust_rules: undefined,
     repos: undefined,

@@ -1,5 +1,6 @@
 import { Ago, Empty, Row, Rows, Section, StateBadge } from "@/components/bits";
 import { Badge } from "@/components/ui/badge";
+import { absolute } from "@/lib/time";
 import { healthTone, outcomeTone } from "@/lib/tone";
 import type { Extension, Snapshot } from "@/types";
 
@@ -20,6 +21,7 @@ export function Extensions({ snap, now }: { snap: Snapshot; now: number }) {
 }
 
 function ExtensionBlock({ ext, now }: { ext: Extension; now: number }) {
+  const muted = !!ext.muted_until && Date.parse(ext.muted_until) > now;
   return (
     <div className="rounded-lg border px-4 py-3">
       <div className="flex items-center justify-between gap-3">
@@ -27,7 +29,14 @@ function ExtensionBlock({ ext, now }: { ext: Extension; now: number }) {
           <h3 className="font-mono text-sm font-medium">{ext.name}</h3>
           <p className="text-xs text-muted-foreground">{ext.status.replace(/_/g, " ")}</p>
         </div>
-        <StateBadge tone={healthTone(ext.health)}>{ext.health}</StateBadge>
+        <span className="flex shrink-0 items-center gap-1.5">
+          {muted && (
+            <Badge variant="warn" title={`muted until ${absolute(ext.muted_until)}`}>
+              muted
+            </Badge>
+          )}
+          <StateBadge tone={healthTone(ext.health)}>{ext.health}</StateBadge>
+        </span>
       </div>
       <div className="mt-3">
         {ext.jobs.length === 0 ? (
