@@ -9,6 +9,7 @@ local-only and skipped when ``CI`` is set.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import re
@@ -53,7 +54,7 @@ from resonant.runner.github_app import GitHubApp
 from resonant.runner.resolve import FakeGitHub, RepoInfo
 from resonant.runner.workspace import FORK_NEEDS_PUBLIC_REPO, Workspace
 from resonant.runners import claude as claude_mod
-from resonant.runners import reaper
+from resonant.runners import reaper, worker_cli
 from resonant.runners.claude import (
     ClaudeRunner,
     LimitHit,
@@ -1119,6 +1120,71 @@ async def test_startup_wipes_secret_dirs(h: Harness) -> None:
     await h.runner.aclose()
 
 
+def _live_work_dir(h: Harness) -> tuple[Path, Path, Path]:
+    """What a live daemon's runs leave: R9's token, its ctl socket dir and a token file."""
+    creds = h.cfg.work_dir / "R9" / "creds"
+    creds.mkdir(parents=True)
+    (creds / "token").write_text("not-a-real-token\n")
+    ctl = worker_cli.make_ctl_dir(h.cfg.work_dir, "R9")
+    call = h.cfg.secrets_dir / "call-live"
+    call.mkdir(parents=True)
+    return creds, ctl, call
+
+
+async def test_startup_leaves_a_live_daemons_run_dirs_alone(h: Harness) -> None:
+    """PER-271: a runner started while another process (the live daemon) holds the
+    work_dir's lock never reaps or wipes that daemon's runs, and says so."""
+    creds, ctl, call = _live_work_dir(h)
+    fd = os.open(h.cfg.work_dir / claude_mod.WORK_DIR_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the "live daemon"
+        h.runner.lock_wait_s = 0.3
+        await h.runner.start()
+        assert (creds / "token").exists() and ctl.is_dir() and call.is_dir()
+        assert h.api.revoked == []
+        skipped = h.conn.execute(
+            "SELECT 1 FROM audit_log WHERE action = 'run.startup_sweep_skipped'"
+        ).fetchone()
+        assert skipped is not None
+        await h.runner.aclose()
+    finally:
+        os.close(fd)
+
+
+async def test_startup_owns_the_work_dir_until_closed(h: Harness) -> None:
+    """The runner that sweeps holds the lock, so a second runner on the same dirs can't
+    sweep it; after aclose the lock is free again."""
+    await h.runner.start()
+    creds, ctl, call = _live_work_dir(h)
+    fd = os.open(h.cfg.work_dir / claude_mod.WORK_DIR_LOCK, os.O_RDWR)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        await h.runner.aclose()
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+    assert (creds / "token").exists() and ctl.is_dir() and call.is_dir()
+
+
+async def test_unpushed_commits_say_couldnt_push(tmp_path: Path, db: sqlite3.Connection) -> None:
+    """PER-271: a session that committed but couldn't push (no PR, nothing on the remote)
+    didn't make "no changes": the run fails saying where its commits are, and the branch
+    and worktree stay."""
+    h = build(tmp_path, db, extra=["--no-push"])
+    await h.start()
+    await h.drain()
+    run = h.run()
+    assert run.status == "failed"
+    branch = cast(str, run.branch)
+    assert run.failure == f"couldn't push: 1 commit saved on {branch} (/runs R1)"
+    head = h.chan.texts()[0].splitlines()[0]
+    assert head == f"R1 (fix the flaky test) couldn't push: 1 commit saved on {branch} (/runs R1)"
+    assert h.branches() == ["main"]  # nothing reached the remote
+    assert run.workspace is not None
+    assert await asyncio.to_thread(Path(run.workspace).is_dir)  # the work is kept
+
+
 # --- the reaper ------------------------------------------------------------------------------
 
 SLEEPER = "import time; time.sleep(600)"
@@ -1834,7 +1900,8 @@ async def test_happy_path_under_the_real_sandbox(tmp_path: Path, db: sqlite3.Con
     await h.start()
     await h.drain()
     run = h.run()
-    assert run.status == "no_changes", run.failure  # nothing pushed, no PR
+    # nothing pushed, no PR: the local commit is kept and said (PER-271)
+    assert run.status == "failed" and (run.failure or "").startswith("couldn't push: "), run
     assert h.argv_log()[0]["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN
     # inside the sandbox the session read its own token
     seen = json.loads((h.tmp("R1") / "creds.json").read_text())
