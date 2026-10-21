@@ -247,14 +247,25 @@ def env(tmp_path: Path) -> Env:
 # --- config and secrets --------------------------------------------------------------------
 
 
-def test_runner_repos_default_empty(resonant_home: Path) -> None:
+def test_runner_repos_default_empty(resonant_home: Path, user_home: Path) -> None:
     s = load_settings()
     assert s.runner.repos == {}
     assert s.runner.max_run_dir_mb == 5000
     assert s.runner.min_free_disk_mb == 10240
     assert s.runner.max_minutes == 45
-    assert s.runner.work_dir == Path("~/resonant-runs").expanduser()
-    assert s.runner.mirror_dir == Path("~/.resonant/runner/mirrors").expanduser()
+    # PER-271: the run dirs follow HOME when the settings are built (not at import), and
+    # Resonant's own runner state follows the Resonant home
+    assert s.runner.work_dir == (user_home / "resonant-runs").resolve()
+    assert s.runner.code_dir == (user_home / "code").resolve()
+    assert s.runner.mirror_dir == (resonant_home / "runner" / "mirrors").resolve()
+    assert s.runner.secrets_dir == (resonant_home / "run-secrets").resolve()
+
+
+def test_runner_state_dirs_follow_an_explicit_home(tmp_path: Path) -> None:
+    other = tmp_path / "elsewhere"
+    s = load_settings(home=other, runner={"secrets_dir": tmp_path / "mine"})
+    assert s.runner.mirror_dir == (other / "runner" / "mirrors").resolve()
+    assert s.runner.secrets_dir == (tmp_path / "mine").resolve()  # a set dir is kept
 
 
 def test_runner_yaml(resonant_home: Path) -> None:

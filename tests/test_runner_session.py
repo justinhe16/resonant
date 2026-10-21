@@ -361,17 +361,6 @@ async def test_pushed_but_no_pr_fails_with_the_branch(
     assert run.branch in h.branches()
 
 
-async def test_nothing_pushed_and_no_pr_is_no_changes(
-    tmp_path: Path, db: sqlite3.Connection
-) -> None:
-    h = build(tmp_path, db, extra=["--no-push"])  # committed locally, never pushed
-    await h.start()
-    await h.drain()
-    assert h.run().status == "no_changes"
-    assert h.chan.texts()[0].startswith("R1 (fix the flaky test) made no changes")
-    assert h.branches() == ["main"]
-
-
 async def test_the_pr_is_found_by_its_branch_not_by_the_summary(h: Harness) -> None:
     await h.start()
     await h.drain()

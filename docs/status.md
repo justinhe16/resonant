@@ -4,7 +4,7 @@ The starting point for a new session. What's live, how we work, what's open. Det
 
 ## What's live
 
-Main is deployed on the Mac mini (`com.resonant.daemon`), schema 21, two extensions installed (github, linear).
+Main is deployed on the Mac mini (`com.resonant.daemon`), schema 22, two extensions installed (github, linear).
 
 | Area | What it does | PRs |
 |---|---|---|
@@ -21,6 +21,7 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 21, two extensi
 | Phase 6b (PER-245…250, 258) | Taint lasts 3 turns, with notes/reminders/facts exempt. Flaky tests fixed (test daemons run no wall-clock jobs). Scheduler goes through the tool core (no boundary exceptions). `resonant eval draft --from-history` and `--set owner` with a review gate. `--route claude --live-claude` grades Claude's answers. qwen names things by title, drops relayed injected actions, refuses email/calendar. The Claude brain has full tools: reads run, shell changes run-and-report or ask by text (see brain-plan.md), the never-list is refused, and every call is audited | #114–#120 |
 | Dashboard redesign, disk watchdog, truthful texts (R1, PER-267, PER-268) | Two-column shadcn dashboard. The disk watchdog no longer kills a run it can't measure (partial counts, free-space floor, GiB units). A PR merge isn't a direct push; one coworker-style text per run outcome; readable approval prompts with the failure reason; both brains see Resonant's own texts (`system_texts`, migration 019) | #121–#123 |
 | Phase 6b overnight fan (PER-254, 255, 259–263, 266) | Batch as one dashboard row; `yes 1,3 D7` partial approvals; store upkeep (migration 020, daily 04:00 prune after a good backup); ops/inbound hardening (minimal ops env, redaction, Ollama restart cooldown); Claude session upkeep (40-turn cap, stale dir/session cleanup); relay snapshot fields + Supabase guard for `claude_brain`/`remote_url` (applied, Fly redeployed); approval expiry reminders (migration 021); pulse wording. Deployed 2026-10-21 | #124–#131 |
+| One request per action, narrow surf default (PER-269, SF-1) | One open approval per action (`github merge repo#N`), others point to it; asks for a merged/closed PR expire `obsolete`; a run isn't blamed for Resonant's own merge (migration 022). Guard-off push runs use the surf skills only for a repo + code change + PR to merge. Flaky tests fixed (#132). Deployed 2026-10-21 | #132–#134 |
 
 Latest task eval (synthetic set, live qwen, PER-249, 3 runs): 99.5%, 0 unapproved writes, triage 100%. Live Claude eval (PER-250, 5 hard rows): 5/5, p50 14.7s ack to answer, about $0.60. Most synthetic hard rows have no facts, so the owner set is the real test.
 

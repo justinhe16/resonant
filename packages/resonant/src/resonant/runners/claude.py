@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -262,6 +263,14 @@ TOKEN_REFRESH_S = 50 * 60  # installation tokens last an hour: a fresh one after
 MERGE_WAIT_S = 2 * 3600.0  # auto-merge waits this long after the run for CI to finish
 MERGE_POLL_S = 120.0  # ... looking at CI this often
 EXTERNAL_PR = "external_pr"  # the trust action of opening a PR on someone else's repo
+# flock'd by the runner that owns runner.work_dir (the daemon) from start() to aclose():
+# only it sweeps the run dirs' credentials and ctl sockets at startup (PER-271)
+WORK_DIR_LOCK = ".daemon.lock"
+LOCK_WAIT_S = 20.0  # how long start() waits for a predecessor to let go of it
+LOCK_POLL_S = 0.25
+# a push run's session left commits it couldn't push: the run fails with this reason, and
+# the reply leads with it (PER-271: not "made no changes")
+COULDNT_PUSH = "couldn't push: "
 REVOKE_TIMEOUT_S = (
     github_app_mod.ATTEMPTS * github_app_mod.TIMEOUT_S
     + github_app_mod.BACKOFF_S * (2**github_app_mod.ATTEMPTS - 1)
@@ -601,6 +610,8 @@ def end_parts(
                 [],
                 [],
             )
+        case "failed" if run.failure and run.failure.startswith(COULDNT_PUSH):
+            return f"{who} {run.failure}", [], said  # PER-271: the work is on its branch
         case "failed":
             return f"{who} failed: {run.failure or 'unknown error'}", [], []
         case "cancelled":
@@ -991,6 +1002,8 @@ class ClaudeRunner:
         self._background: set[asyncio.Task[Any]] = set()
         self._unhook: Callable[[], None] | None = None
         self.ctl_root = worker_cli.ctl_root(runner.work_dir)
+        self._work_dir_lock: int | None = None  # the fd holding WORK_DIR_LOCK (PER-271)
+        self.lock_wait_s = LOCK_WAIT_S
         self.ask_block_s = ask_block_s
         self._submit: Callable[[Event], bool] = submit or self._insert_event
         self._run_redactors: dict[str, Redactor] = {}
@@ -1125,6 +1138,18 @@ class ClaudeRunner:
             async with self.workspace.mirror_lock(old):
                 await asyncio.to_thread(self._move_mirror, old, new)
         reaped = 0
+        if not await asyncio.to_thread(self._own_work_dir):
+            # PER-271: another live process (the daemon) owns these run dirs. Its sessions'
+            # processes, credentials and sockets are not ours to end or wipe.
+            log.warning(
+                "runner.work_dir %s is owned by another live process; not sweeping its runs",
+                self.cfg.work_dir,
+            )
+            with atomic(self.conn):
+                audit(self.conn, "run.startup_sweep_skipped", work_dir=str(self.cfg.work_dir))
+            if self._unhook is None:
+                self._unhook = killswitch.add_pause_hook(self._on_pause)
+            return reaped
         # A session killed by a restart someone asked for (/restart, /update, a worker's
         # `resonant restart`) isn't a crash of its run: no attempt is spent on it.
         planned = take_planned(self.conn, self.clock())
@@ -1153,6 +1178,45 @@ class ClaudeRunner:
             self._unhook = killswitch.add_pause_hook(self._on_pause)
         return reaped
 
+    def _own_work_dir(self) -> bool:
+        """Take ``<work_dir>/.daemon.lock`` (``flock``, held until ``aclose`` or exit) for
+        this runner, or False when another process holds it: only the runner that owns the
+        run dirs may reap their sessions and wipe their credentials and ctl sockets at
+        startup (PER-271: a test or a second runner must never sweep the live daemon's)."""
+        if self._work_dir_lock is not None:
+            return True
+        self.cfg.work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(self.cfg.work_dir / WORK_DIR_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+                     0o600)  # fmt: skip
+        # A predecessor still exiting (/restart, /update, a kickstart overlap) holds it for
+        # a moment: wait that long before treating the holder as a live daemon.
+        deadline = time.monotonic() + self.lock_wait_s
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        os.close(fd)
+                        return False
+                    time.sleep(LOCK_POLL_S)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._work_dir_lock = fd
+        with contextlib.suppress(OSError):  # who holds it, for a person looking
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        return True
+
+    def _release_work_dir(self) -> None:
+        fd, self._work_dir_lock = self._work_dir_lock, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     async def _sweep_credentials(self) -> None:
         """Revoke and delete the token left in every ``<work_dir>/R*/creds`` (whatever state
         its run is in: a crash can come after the row says the run ended but before the
@@ -1179,14 +1243,17 @@ class ClaudeRunner:
 
     async def aclose(self) -> None:
         """Remove the kill switch hook and wait for the kills it started."""
-        if self._unhook is not None:
-            self._unhook()
-            self._unhook = None
-        await self.desk.aclose()
-        tasks = list(self._background)
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            if self._unhook is not None:
+                self._unhook()
+                self._unhook = None
+            await self.desk.aclose()
+            tasks = list(self._background)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._release_work_dir()
 
     def _target(self, run: Run) -> Target:
         return Target(
@@ -2771,6 +2838,11 @@ class ClaudeRunner:
                     with atomic(self.conn):
                         audit(self.conn, "run.done_merged", run=run.code, merged=len(names))
                     return self._must_get(run.code)
+                if unpushed := await self.workspace.local_commits(p):  # PER-271
+                    raise RunnerError(
+                        f"{COULDNT_PUSH}{_plural(unpushed, 'commit')} saved on {p.branch} "
+                        f"(/runs {run.code})"
+                    )
                 raise NoChanges("the session pushed nothing")
             raise RunnerError(
                 f"the session pushed {p.branch} but opened no PR (work kept: /runs {run.code})"
