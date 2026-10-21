@@ -118,7 +118,7 @@ async def test_claude_only_scratch_run_works(tmp_path: Path, db: sqlite3.Connect
     await h.drain()
     run = h.run()
     assert run.status == "done" and run.failure is None
-    assert h.chan.texts()[0].startswith("R1 done (")
+    assert h.chan.texts()[0].startswith("R1 (how full is the disk?) finished in ")
     assert h.api.issued == 0 and h.gh_calls() == [] and h.gh_calls("api") == []
 
 
@@ -161,9 +161,9 @@ async def test_claude_only_repo_with_a_checkout_commits_locally(
     # nothing the daemon does needs the token: no gh at all, no GitHub lookups
     assert h.gh_calls() == [] and h.gh_calls("api") == []
     [text] = h.chan.texts()
-    assert text.startswith("R1 done (")
+    assert text.startswith("R1 (fix the flaky test) finished in ")
     assert (
-        f"): work is on local branch {branch} in {checkout}; "
+        f": the work is on local branch {branch} in {checkout}; "
         "can't push yet: the GitHub App isn't set up (it started from your checkout's "
         "origin/main, not fetched).\nR1: Fixed it." in text
     )
@@ -339,7 +339,7 @@ def test_local_reply_texts(db: sqlite3.Connection) -> None:
         session_seconds=125.0,
     )
     assert reply_text(run) == (
-        "R1 done (2m): work is on local branch resonant/r1-x in ~/code/proj; "
+        "R1 (x) finished in 2m: the work is on local branch resonant/r1-x in ~/code/proj; "
         "can't push yet: the GitHub App isn't set up."
     )
     assert reply_text(replace(run, checkout="/elsewhere/proj")) is not None

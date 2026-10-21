@@ -150,6 +150,7 @@ from resonant.router.router import builtin_names, chat_toolset
 from resonant.runners.approve import prompt_approvers, prompt_batch
 from resonant.runners.job import SUMMARY_MAX, done_text, failed_text
 from resonant.store import extensions as ext_store
+from resonant.store import system_texts
 from resonant.store.audit import audit
 from resonant.store.db import transaction, utcnow
 from resonant.store.tasks import get_event, get_task, principal_thread
@@ -453,6 +454,9 @@ class LocalRunner:
             )
             return await self._send(task, principal, answer, start, spans, resend=True)
 
+        # PER-268: a reply after an approval (the pinned call, a batch) is code-built: what
+        # the approved call did or why it failed. It is kept as a system text the brains see.
+        resumed = "call" in cp or "batch" in cp
         with spans(f"runner.{self.name}", kind=task.kind) as s:
             result = await self._answer(task, principal, events, ctx, spans)
             if isinstance(result, Answer):
@@ -462,6 +466,8 @@ class LocalRunner:
         if not isinstance(result, Answer):
             return result
         answer = result
+        if resumed:
+            answer = replace(answer, meta={**answer.meta, "system": True})
         latest = get_task(self.conn, task.id)  # a mid-step save may have pinned ``call``
         cp = latest.checkpoint if latest is not None else cp
         meta: dict[str, Any] = {
@@ -495,6 +501,13 @@ class LocalRunner:
                 s.set(ok=False, error=type(e).__name__)
                 return Fail(f"reply send failed: {e}", retryable=True)
             s.set(ok=True)
+        if answer.meta.get("system") is True:
+            latest = get_task(self.conn, task.id)
+            cp = latest.checkpoint if latest is not None else task.checkpoint
+            outside = system_texts.tainted(cp) or answer.meta.get("tainted") is True
+            system_texts.record(self.conn, principal, "result", answer.reply,
+                                ref=f"reply:{task.id}", task_id=task.id,
+                                outside=outside)  # fmt: skip
         latency_ms = round((self.clock() - start) * 1000)
         return Done(
             {

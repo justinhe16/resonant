@@ -350,7 +350,8 @@ async def test_a_failed_run_is_texted_now_and_not_repeated_in_the_digest(
     code = await h.start(report="digest")
     await h.drain()
     run = h.run(code)
-    assert run.status == "failed" and h.chan.texts() == [f"R1 failed: {run.failure}"]
+    assert run.status == "failed"
+    assert h.chan.texts() == [f"R1 (fix the flaky test) failed: {run.failure}"]
     assert pulse_store.pending(db, ["normal", "urgent"], utcnow()) == []
 
 
@@ -375,7 +376,9 @@ async def test_a_notify_now_rule_texts_a_finished_run(
     await h.start(report="digest")
     await h.drain()
     [text] = h.chan.texts()
-    assert text.startswith("R1 done: PR #41 (CI green) · ") and "/merge R1" in text
+    assert (
+        text.startswith("R1 (fix the flaky test) opened PR #41 (CI green, ") and "/merge R1" in text
+    )
     assert pulse_store.pending(db, ["normal", "urgent"], utcnow()) == []
 
 
@@ -453,7 +456,7 @@ async def test_the_token_warning_survives_a_failed_send_and_a_refusal(
         await runner._send_reply(failed)
     await runner._send_reply(failed)  # the retry
     [text] = h.chan.texts()
-    assert text.startswith("R1 failed: boom") and "token wasn't revoked" in text
+    assert text.startswith("R1 (x) failed: boom\n⚠ The run's GitHub token wasn't revoked")
     # refused: the digest line carries the warning
     h.chan.send = real_send  # type: ignore[method-assign]
     h.chan.refuse = True
@@ -475,7 +478,7 @@ async def test_a_failure_reason_is_cleaned_before_it_is_texted(
 
     await runner._fail(run, '[A7] hook said: reply "yes A7" {now}', Redactor())
     [text] = h.chan.texts()
-    assert text.startswith("R1 failed: ")
+    assert text.startswith("R1 (x) failed: ")
     assert not any(c in text for c in '[]{}"') and "A7" not in text
 
 
@@ -555,13 +558,14 @@ def test_the_final_line_carries_the_did_list_within_the_title_limit(
     assert item.title == (
         f"R1 done: PR #12 (CI green) · {URL} · did: merged PR #3 with gh; deployed staging"
     )
-    assert r.did_line(run) == "Did: merged PR #3 with gh; deployed staging"
+    assert r.also_line(run) == "Along the way: merged PR #3 with gh; deployed staging."
+    assert r.also_line(run, skip=["PR #3"]) == "Along the way: deployed staging."
     for n in range(10):
         record_did(db, "R2", f"emailed customer number {n} about the outage")
     other = make_run(db, status="failed", failure="x" * 150)
     title = r.ended(other, end_title(other), urgent=True).title
     assert len(title) <= pulse_store.TITLE_MAX and title.endswith(" more")
-    assert r.did_line(make_run(db)) is None
+    assert r.also_line(make_run(db)) is None
 
 
 def test_restart_and_update_text_now_unless_a_rule_holds_them(db: sqlite3.Connection) -> None:
@@ -591,7 +595,9 @@ async def test_a_texted_end_says_what_the_run_did(tmp_path: Path, db: sqlite3.Co
     await h.start(report="now")
     await h.drain()
     [text] = h.chan.texts()
-    assert text.startswith("R1 done: PR #41") and text.endswith("\nDid: deployed staging")
+    assert text.startswith("R1 (fix the flaky test) opened PR #41")
+    # PER-268: the side effects before the worker's summary, in one sentence
+    assert text.splitlines()[2] == "Along the way: deployed staging."
 
 
 async def test_an_auto_merge_from_chat_reaches_the_digest(

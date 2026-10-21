@@ -26,7 +26,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from resonant_sdk.tool import TOOL_NAME_PATTERN, Effect, Level, ToolSpec
+from resonant_sdk.tool import (
+    TOOL_NAME_PATTERN,
+    Effect,
+    Level,
+    ToolSpec,
+    parse_summary,
+    summary_args,
+)
 
 SLUG = r"^[a-z][a-z0-9-]{0,47}$"
 SECRET_NAME = r"^[a-z][a-z0-9_]{0,31}$"  # noqa: S105 - a pattern, not a secret
@@ -190,6 +197,7 @@ class CliTool(_Strict):
     secrets: tuple[SecretName, ...] = ()
     commit: bool = False
     timeout_s: float = Field(default=30.0, gt=0, le=TOOL_TIMEOUT_MAX_S)
+    approval_summary: str | None = None  # PER-268: see ToolSpec; uses only declared args
 
     @model_validator(mode="after")
     def _placeholders_declared(self) -> Self:
@@ -204,6 +212,9 @@ class CliTool(_Strict):
             raise ValueError(f"run uses undeclared args: {sorted(missing)}")
         if bad := [a for a in self.args if not _IDENT.fullmatch(a)]:
             raise ValueError(f"arg names must be identifiers: {bad}")
+        summary = self.approval_summary
+        if summary is not None and (missing := summary_args(summary) - set(self.args)):
+            raise ValueError(f"approval_summary uses undeclared args: {sorted(missing)}")
         return self
 
 
@@ -225,12 +236,22 @@ class McpTool(_Strict):
     commit: bool = False
     secrets: tuple[SecretName, ...] = ()
     timeout_s: float = Field(default=30.0, gt=0, le=TOOL_TIMEOUT_MAX_S)
+    # PER-268: see ToolSpec. The server's schema is only known at install, so an arg it
+    # names that the call lacks falls back to the arg list.
+    approval_summary: str | None = None
 
     @field_validator("description")
     @classmethod
     def _one_line(cls, v: str) -> str:
         if not v.isprintable():
             raise ValueError("description must be one line with no control characters")
+        return v
+
+    @field_validator("approval_summary")
+    @classmethod
+    def _summary(cls, v: str | None) -> str | None:
+        if v is not None:
+            parse_summary(v)
         return v
 
 
@@ -510,6 +531,7 @@ class Manifest(BaseModel):
                 timeout_s=t.timeout_s,
                 secrets=t.secrets,
                 commit=t.commit,
+                approval_summary=t.approval_summary,
             )
             for name, t in self.tools.items()
         ]
@@ -527,6 +549,7 @@ class Manifest(BaseModel):
                     timeout_s=t.timeout_s,
                     secrets=t.secrets,
                     commit=t.commit,
+                    approval_summary=t.approval_summary,
                 )
                 for _, t in self.mcp.tools()
             ]

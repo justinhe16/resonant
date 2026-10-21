@@ -257,8 +257,8 @@ class Gh:
             tail = self.redact(" ".join(proc.stderr.split()))[-200:]
             if need and any(d in tail.lower() for d in _DENIED):
                 raise Failed(
-                    f"the token can't do this: it needs {need} (see the github extension "
-                    "README); nothing was changed"
+                    f"the github token needs {need} access (see the github extension "
+                    "README). Nothing changed."
                 )
             raise Failed(f"gh {args[0]} failed (exit {proc.returncode}): {tail}")
         return proc.stdout

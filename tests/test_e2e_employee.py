@@ -36,7 +36,7 @@ import pytest
 import test_e2e_runner
 from test_e2e_relay import RelayModel, ask, prompts, text_like
 from test_e2e_runner import PR_URL, REPO, FakeChatDB, World, chat, make_world, running, settled
-from test_runner_claude import FAKE, git, until
+from test_runner_claude import FAKE, bare, git, opened, until
 
 from resonant.models import ChatMessage, ModelReply, SpanFactory, ToolCall
 from resonant.runners import claude as claude_mod
@@ -167,7 +167,7 @@ async def test_three_workers_ask_at_once_then_spawn_a_claude_to_a_pr_in_the_dige
                                 ("R2", CHANGELOG_Q, "drop them"),
                                 ("R3", FLAKY_Q, "rewrite it")):  # fmt: skip
             # three sessions resume at once: a slow CI runner needs more than 30 s
-            await until(lambda c=code: any(t.startswith(f"{c} done: PR #") for t in w.texts()),
+            await until(lambda c=code: any(opened(c)(t) for t in w.texts()),
                         120, f"{code} done")  # fmt: skip
             assert prompts(w, code)[1].startswith(
                 f'The owner answered your question "{q}": {answer}'
@@ -189,7 +189,7 @@ async def test_three_workers_ask_at_once_then_spawn_a_claude_to_a_pr_in_the_dige
             f'The owner answered your question "{SEARCH_Q}": postgres is fine'
         )
         # a chat run's PR is a digest line, not a text
-        assert not [t for t in w.texts() if t.startswith("R4 done")]
+        assert not [t for t in w.texts() if opened("R4")(t)]
         line = f"R4 done: PR #44 (CI green) · {PR_URL[:-2]}44"  # the fourth PR on the fake
         await until(line_is(w, "R4", lambda t: t == line), 20, "R4's digest line")
         assert [i.key for i in pulse_store.pending(w.conn, ["normal"], utcnow())] == ["run/r4"]
@@ -264,7 +264,7 @@ async def test_the_thin_guard_lets_a_worker_read_env_but_not_touch_resonant(
     async with running(w):
         assert (await w.say(f"/run {REPO} fix it")).startswith("On it: R1")
         done = await w.next_text()
-        assert done.startswith("R1: no changes."), done
+        assert bare(done).startswith("R1 made no changes"), done
         seen = json.loads((w.tmp() / "guard.json").read_text())
         assert seen["env"] == "ok DATABASE_URL=postgres://owner@localhost/demo", seen
         assert seen["state"].startswith("denied "), seen
@@ -300,7 +300,7 @@ async def test_a_first_deploy_asks_and_yes_always_means_the_next_one_does_not(
         await asyncio.sleep(1.1)  # chat.db times are whole seconds: reply after the prompt
         added = await ask(w, "yes always", starts("Rule added:"), "the rule")
         assert added == "Rule added: don't ask before deploy in dori-api (rule 1)"
-        await text_like(w, starts("R1 done: PR #41"), "R1 done")
+        await text_like(w, lambda t: bare(t).startswith("R1 opened PR #41"), "R1 done")
         assert prompts(w, "R1")[1].startswith(
             "Your check (deploy on dori-api: deploy dori-api to prod (irreversible)) is ok: "
             "go ahead."
@@ -313,7 +313,7 @@ async def test_a_first_deploy_asks_and_yes_always_means_the_next_one_does_not(
         # the next deploy runs straight through: no prompt, the check answers ok at once
         before = len(w.texts())
         await ask(w, f"/run {REPO} ship the next fix", starts("On it: R2"), "R2 started")
-        await text_like(w, starts("R2 done: PR #"), "R2 done")
+        await text_like(w, opened("R2"), "R2 done")
         [call] = cli_calls(w, "R2")
         assert call["argv"][:5] == ["check", "--system", "dori-api", "--action", "deploy"]
         assert call["rc"] == 0, call
@@ -339,9 +339,9 @@ async def test_a_rule_taught_over_chat_makes_trading_merges_ask_and_only_those(
         assert (rule.scope, rule.action, rule.effect) == ("trading", "merge", "ask")
 
         await ask(w, f"/run {TRADING} fix it", starts(f"On it: R1 · {TRADING}."), "R1 started")
-        await text_like(w, starts("R1 done: PR #41"), "R1 done")
+        await text_like(w, lambda t: bare(t).startswith("R1 opened PR #41"), "R1 done")
         await ask(w, f"/run {REPO} fix it", starts(f"On it: R2 · {REPO}."), "R2 started")
-        await text_like(w, starts("R2 done: PR #42"), "R2 done")
+        await text_like(w, lambda t: bare(t).startswith("R2 opened PR #42"), "R2 done")
 
         # trading-api is in the trading area: a chat merge asks a plain yes, nothing merged
         prompt = await ask(w, "merge R1", lambda t: "merge R1" in t, "the merge ask")
@@ -380,7 +380,7 @@ async def test_a_scratch_run_has_no_repo_no_token_and_reports_in_the_digest(
         assert w.api.mints == [] and w.gh_calls("create") == []
         assert not (w.settings.runner.code_dir / REPO).exists()
         # reported in the digest with Claude's summary, not texted
-        assert not [t for t in w.texts() if t.startswith("R1 done")]
+        assert not [t for t in w.texts() if bare(t).startswith("R1 finished")]
         digest = await ask(w, "/pulse now", starts("btw:"), "the digest")
         assert digest == (
             "btw:\nWorkers:\nR1 done: Checked the disk: 80% full, the biggest dir is ~/Downloads."

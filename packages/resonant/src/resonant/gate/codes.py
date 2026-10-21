@@ -76,13 +76,25 @@ def approval_text(
     require_code: bool = False,
     destructive: bool = False,
     always: bool = False,
+    phrased: bool = False,
 ) -> str:
     """The message sent to approvers. ``summary`` must be built by code from intent fields.
 
     ``destructive`` (L1) and ``require_code`` (pay) both mean only ``yes <code>`` approves;
     ``destructive`` takes precedence when both are set. ``always`` (a worker's trust check,
-    never with the other two) offers ``yes always``.
+    never with the other two) offers ``yes always``. ``phrased`` (PER-268): the summary is the
+    tool's own phrase (``approval_summary``), asked as a question with the code after it:
+    ``OK to merge PR #121 in justinhe16/resonant? [P3] yes / no``.
     """
+    if phrased:
+        summary = f"OK to {summary}"
+        if always and not (destructive or require_code):
+            return f"{summary}? [{code}] yes / yes always / no"
+        if destructive:
+            return f"{summary}? This can't be undone. [{code}] yes {code} / no"
+        if require_code:
+            return f"{summary}? [{code}] reply exactly: yes {code} / no {code}"
+        return f"{summary}? [{code}] yes / no"
     if always and not (destructive or require_code):
         return f"[{code}] {summary}. Reply yes / yes always / no"
     if destructive:

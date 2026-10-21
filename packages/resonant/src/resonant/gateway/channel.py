@@ -47,6 +47,7 @@ class ApprovalPrompt:
     # answered with one code; ``destructive``: one of them is an L1 write.
     lines: tuple[str, ...] = ()
     destructive: bool = False
+    phrased: bool = False  # PER-268: the summary is the tool's own phrase: asked as a question
 
     def text(self) -> str:
         """The prompt as sent: the destructive variant for L1 writes, the pay variant for pay,
@@ -65,6 +66,7 @@ class ApprovalPrompt:
             require_code=self.require_code,
             destructive=destructive,
             always=self.always and not self.require_code and not destructive,
+            phrased=self.phrased,
         )
 
 

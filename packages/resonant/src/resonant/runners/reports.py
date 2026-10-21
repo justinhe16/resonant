@@ -73,6 +73,7 @@ here, so it can't pose as an approval prompt or a reply.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections import deque
 from collections.abc import Callable, Sequence
@@ -116,6 +117,12 @@ DID_ITEM_MAX = 80
 DID_IN_TITLE = 100  # the did part of a digest line
 DID_IN_TEXT = 300  # the Did: line of a texted end reply
 SELF_SYSTEM = "resonant"  # the trust system of a worker's restart or update
+_ALERT_KEY = "run.alert:"  # kv: a run's ⚠ lines for its end text (PER-268), oldest first
+_MERGED_KEY = "run.merged:"  # kv: the PRs a run merged onto its base (PER-268)
+ALERTS_KEEP = 3
+# Detected kinds that are said in the run's one end text, never texted mid-run (PER-268): a
+# merge is the work a run is often asked to do, so its end text names it.
+HELD_KINDS = frozenset({"merge"})
 SELF_EVENTS = frozenset({"restart", "update"})
 
 
@@ -229,6 +236,65 @@ def shown_did(conn: sqlite3.Connection, code: str) -> list[str]:
     return [*did, *seen]
 
 
+def set_alert(conn: sqlite3.Connection, code: str, line: str) -> None:
+    """Keep a ⚠ line (code-built) for run ``code``'s end text: a direct push to its base, a
+    PR it merged by itself. The end text carries it on its own line and goes out now."""
+    with atomic(conn):
+        kept = [a for a in alerts(conn, code) if a != line]
+        kv_set(conn, _ALERT_KEY + code, [*kept, line][-ALERTS_KEEP:])
+
+
+def clear_alerts(conn: sqlite3.Connection, code: str) -> None:
+    """The ⚠ lines went out with the run's end text: a later reply doesn't repeat them."""
+    with atomic(conn):
+        kv_set(conn, _ALERT_KEY + code, [])
+
+
+def alerts(conn: sqlite3.Connection, code: str) -> list[str]:
+    value: object = kv_get(conn, _ALERT_KEY + code)
+    if not isinstance(value, list):
+        return []
+    return [v for v in cast(list[object], value) if isinstance(v, str)]
+
+
+def set_merged(conn: sqlite3.Connection, code: str, names: Sequence[str]) -> None:
+    """The PRs run ``code`` merged onto its base (``PR #121``, code-built), for its end text."""
+    with atomic(conn):
+        kv_set(conn, _MERGED_KEY + code, list(names))
+
+
+def merged_list(conn: sqlite3.Connection, code: str) -> list[str]:
+    value: object = kv_get(conn, _MERGED_KEY + code)
+    if not isinstance(value, list):
+        return []
+    return [v for v in cast(list[object], value) if isinstance(v, str)]
+
+
+def merged_names(effects: Sequence[SideEffect]) -> list[str]:
+    """What a run merged, for its end text: ``PR #121`` for each ``gh pr merge`` read from
+    its commands (keys ``("merge", "121")``), ``a PR`` for one with no number. Code-built;
+    the caller checks the activity feed shows a merge too."""
+    found: list[str] = []
+    for e in effects:
+        if e.kind != "merge":
+            continue
+        n = e.keys[1] if len(e.keys) == 2 and e.keys[1].isdigit() else None
+        name = f"PR #{n}" if n else "a PR"
+        if name not in found:
+            found.append(name)
+    return found
+
+
+def _names_merge(item: str, names: Sequence[str]) -> bool:
+    """Whether a ``did:`` item is a merge the headline already names (``squash-merged PR
+    #121`` for ``PR #121``)."""
+    low = item.lower()
+    if "merge" not in low:
+        return False
+    return any(re.search(rf"#{re.escape(n[4:])}(?![0-9])", low) for n in names
+               if n.startswith("PR #"))  # fmt: skip
+
+
 def did_part(items: list[str], limit: int = DID_IN_TITLE) -> str:
     """``did: merged PR #3 with gh; deployed staging +2 more`` in at most ``limit``
     characters (cleaned parts, oldest first), or "" with none."""
@@ -284,9 +350,12 @@ def deps_line(paths: Sequence[str]) -> str:
     return f"deps changed: {', '.join(names)}" + (f" (+{more} more)" if more > 0 else "")
 
 
-def end_title(run: Run, ci: str | None = None, *, deps: Sequence[str] = ()) -> str:
+def end_title(
+    run: Run, ci: str | None = None, *, deps: Sequence[str] = (), merged: Sequence[str] = ()
+) -> str:
     """The digest line for an ended run (code-built around cleaned parts). ``deps``: a
-    merged run's dependency files, listed after its PR."""
+    merged run's dependency files, listed after its PR. ``merged``: the PRs a ``done`` run
+    merged onto its base (PER-268)."""
     match run.status:
         case "ready":
             label = "no CI" if ci == "none" else f"CI {ci or 'unknown'}"
@@ -294,6 +363,10 @@ def end_title(run: Run, ci: str | None = None, *, deps: Sequence[str] = ()) -> s
             if run.flag_line or run.failure:
                 title += f" · ⚠ /runs {run.code}"
             return title
+        case "done" if merged:  # PER-268: a run that merged a PR onto its base, as asked
+            return (
+                f"{run.code} done: merged {', '.join(merged)} into {run.base_branch or 'the base'}"
+            )
         case "done" if run.repo and run.branch and not run.pr_url and run.head_sha is None:
             # RX-1: a run that couldn't push (a fork run's done always has a checked head)
             return f"{run.code} done: local branch {_part(run.branch)} (not pushed)"
@@ -451,10 +524,18 @@ class WorkerReports:
         sent.append(now)
         return True
 
-    def did_line(self, run: Run) -> str | None:
-        """``Did: …`` for a texted end reply, or None when the run took no side effects."""
-        part = did_part(shown_did(self.conn, run.code), DID_IN_TEXT)
-        return "Did" + part[len("did") :] if part else None
+    def also_line(self, run: Run, *, skip: Sequence[str] = ()) -> str | None:
+        """``Along the way it merged PR #3 with gh; deployed staging.`` for a texted end
+        reply, or None when the run took no side effects (PER-268: one sentence, not a
+        ``Did:`` dump). ``skip``: what the headline already says (``PR #121`` of a run that
+        merged it), left out."""
+        items = shown_did(self.conn, run.code)
+        if skip:
+            items = [i for i in items if not _names_merge(i, skip)]
+        part = did_part(items, DID_IN_TEXT)
+        if not part:
+            return None
+        return f"Along the way: {part[len(DID_PREFIX) :].strip()}."
 
     def self_op_text(self, run: Run, what: str) -> str:
         """``R4 restarted Resonant (abc1234)``: a worker's restart or update, texted now."""
@@ -474,8 +555,11 @@ __all__ = [
     "DETECTED_MARK",
     "DID_KEEP",
     "DID_PREFIX",
+    "HELD_KINDS",
     "NOTE_TEXTS_PER_HOUR",
     "WorkerReports",
+    "alerts",
+    "clear_alerts",
     "detected_list",
     "did_list",
     "did_of",
@@ -484,7 +568,11 @@ __all__ = [
     "end_title",
     "is_worker_item",
     "item_key",
+    "merged_list",
+    "merged_names",
     "record_detected",
     "record_did",
+    "set_alert",
+    "set_merged",
     "shown_did",
 ]

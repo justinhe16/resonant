@@ -35,10 +35,12 @@ from test_runner_claude import (
     FAKE_GH,
     GH_TOKEN,
     GIT,
+    bare,
     check_ok,
     git,
     identity_wrap,
     live,
+    opened,
     seed_remote,
     until,
 )
@@ -342,9 +344,9 @@ async def test_a_worker_check_waits_for_the_owners_yes_across_the_turn(
         assert calls[0]["rc"] == 3  # no decision within the CLI's wait
         await w.say("yes", reply=False)
         done = await w.next_text()
-        while not done.startswith("R1 done"):  # a confirmation may come first
+        while not opened("R1")(done):  # a confirmation may come first
             done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL}"), done
+        assert bare(done).startswith("R1 opened PR #41 (CI green, ") and PR_URL in done, done
         prompts = [c["prompt"] for c in json.loads((w.tmp() / "argv.json").read_text())]
         assert prompts[1].startswith(
             "Your check (deploy on dori-api: deploy dori-api to prod) is ok: go ahead."
@@ -373,7 +375,7 @@ async def test_a_worker_question_reaches_the_owner_and_the_answer_resumes_it(
         assert q.run_code == "R1"
         assert not isinstance(w.runner.answer_question("R1", "just the top one"), Refused)
         done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL}"), done
+        assert bare(done).startswith("R1 opened PR #41 (CI green, ") and PR_URL in done, done
         prompts = [c["prompt"] for c in json.loads((w.tmp() / "argv.json").read_text())]
         assert len(prompts) == 2 and prompts[1].startswith(
             'The owner answered your question "Fix both READMEs or just the top one?": '
@@ -399,7 +401,7 @@ async def test_r1_run_command_to_a_pr_link_with_the_pulse_item(
         assert running_line.startswith("Runs (1 active):\n- R1 demo · running · ")
 
         done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL} · 4 files · "), done
+        assert bare(done).startswith("R1 opened PR #41 (CI green, 4 files, "), done
         assert "/merge R1" in done and "⚠ changes .claude/settings.json\n" in done
         assert pulse_store.pending(w.conn, ["normal"], utcnow()) == []  # cleared, nothing owed
         cleared = pulse_store.get(w.conn, "core", "run/r1")
@@ -438,11 +440,11 @@ async def test_r1_chat_request_starts_a_run(
         assert w.run().ask == "fix the typo in the README" and w.run().principal == "justin"
         detail = (await w.say("/runs R1")).splitlines()
         assert detail[0] == "- R1 demo · ready · PR #41" and PR_URL in detail
-        assert not any(t.startswith("R1 done") for t in w.texts())
+        assert not any(opened("R1")(t) for t in w.texts())
         digest = await w.say("/pulse now")
         assert digest == f"btw:\nWorkers:\nR1 done: PR #41 (CI green) · {PR_URL}"
         assert await w.next_text() == "Pulse sent."
-        assert not any(t.startswith("R1 done") for t in w.texts())  # said once, in the digest
+        assert not any(opened("R1")(t) for t in w.texts())  # said once, in the digest
 
 
 async def test_em6_a_chat_run_that_fails_is_texted_right_away(
@@ -452,7 +454,7 @@ async def test_em6_a_chat_run_that_fails_is_texted_right_away(
     async with running(w):
         assert (await w.say("fix the typo in the README in demo")).endswith("/cancel R1 to stop.")
         failed = await w.next_text()
-        assert failed == f"R1 failed: {w.run().failure}" and w.run().status == "failed"
+        assert bare(failed) == f"R1 failed: {w.run().failure}" and w.run().status == "failed"
         assert pulse_store.pending(w.conn, ["normal", "urgent"], utcnow()) == []
 
 
@@ -465,7 +467,7 @@ async def test_em6_a_notify_now_rule_texts_a_chat_run_when_it_finishes(
                              created_from="chat", now=utcnow())  # fmt: skip
         assert (await w.say("fix the typo in the README in demo")).endswith("/cancel R1 to stop.")
         done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL} · 1 file · ")
+        assert bare(done).startswith("R1 opened PR #41 (CI green, 1 file, ")
         assert pulse_store.pending(w.conn, ["normal", "urgent"], utcnow()) == []
 
 
@@ -507,7 +509,11 @@ async def test_kill_ends_runs_and_the_reply_counts_them(
         await until(lambda: not any(live(p) for p in pids), 15, "the whole tree to die")
         assert w.run().status == "cancelled" and w.branches() == ["main"]
         assert w.gh_calls("create") == []
-        await until(lambda: "R1 cancelled." in w.texts(), 10, "the cancelled reply")
+        await until(
+            lambda: any(bare(t) == "R1 was cancelled." for t in w.texts()),
+            10,
+            "the cancelled reply",
+        )
         # a killed run isn't restarted by /resume, and nothing starts while paused
         await w.say("/resume")
         await until(lambda: RESUME_REPLY in w.texts(), 10, "the resume reply")
@@ -554,7 +560,7 @@ async def test_r6_crash_then_restart_resumes_the_same_session(
         # on start the old tree is reaped, then the task resumes the same session
         await until(lambda: not live(old_pid), 15, "the old session to be reaped")
         done = await w.next_text()
-        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL}"), done
+        assert bare(done).startswith("R1 opened PR #41 (CI green, ") and PR_URL in done, done
         run = w.run()
         assert run.status == "ready" and run.session_id == session and run.sessions == 2
         calls = json.loads((w.tmp() / "argv.json").read_text())
@@ -574,7 +580,7 @@ async def test_r13_merge_by_command_needs_green_ci(
         assert (await w.say("/merge R1")) == "No run R1."
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         done = await w.next_text()
-        assert done.startswith("R1 done: PR #41")
+        assert bare(done).startswith("R1 opened PR #41")
         (w.gh_dir / "checks_rc").write_text("1")
         assert await w.say("/merge R1") == "R1 not merged: CI isn't green"
         assert w.run().status == "ready"
@@ -592,7 +598,7 @@ async def test_r13_merge_by_chat_asks_yes_first(
     w = make_world(tmp_path, resonant_home, chat, monkeypatch, scenario="makefile")
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
-        assert (await w.next_text()).startswith("R1 done: PR #41")
+        assert bare(await w.next_text()).startswith("R1 opened PR #41")
         prompt = await w.say("merge it")
         assert "merge R1: PR #41 in demo " in prompt and PR_URL in prompt, prompt
         assert prompt.endswith("Reply yes / no")
@@ -660,7 +666,9 @@ async def test_no_ci_repo_runs_and_merges_only_on_the_owners_word(
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         done = await w.next_text()
-        assert done.startswith("R1 done: PR #41") and "no CI: demo has no pull_request" in done
+        assert (
+            bare(done).startswith("R1 opened PR #41") and "No CI: demo has no pull_request" in done
+        )
         assert "/merge R1 merges it without CI." in done
         assert w.run().status == "ready" and w.gh_calls("merge") == []
         assert await w.say("/merge R1") == (
@@ -676,8 +684,8 @@ async def test_r4_a_github_change_cannot_be_merged(
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         done = await w.next_text()  # the session pushed and opened the PR itself
-        assert done.startswith(f"R1 done: PR #41 (CI green) · {PR_URL}"), done
-        assert "⚠ it can't be merged as it is: it changes .github/" in done
+        assert bare(done).startswith("R1 opened PR #41 (CI green, ") and PR_URL in done, done
+        assert "⚠ It can't be merged as it is: it changes .github/" in done
         assert w.run().status == "ready" and w.gh_calls("create")
         refused = await w.say("/merge R1")
         assert refused.startswith("R1 not merged: the checks refuse it: it changes .github/")
@@ -709,7 +717,7 @@ async def test_r4_a_token_in_the_diff_cannot_be_merged_and_is_never_echoed(
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         done = await w.next_text()
-        assert done.startswith("R1 done: PR #41") and "a token appears" in done
+        assert bare(done).startswith("R1 opened PR #41") and "a token appears" in done
         refused = await w.say("/merge R1")
         assert refused.startswith("R1 not merged: the checks refuse it: a token appears")
         assert w.gh_calls("merge") == []
@@ -750,7 +758,7 @@ async def test_r1_under_the_real_sandbox(
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         done = await w.next_text()
-        assert done.startswith("R1: no changes."), done
+        assert bare(done).startswith("R1 made no changes"), done
         env = json.loads((w.tmp() / "argv.json").read_text())[0]["env"]
         assert env["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN
         seen = json.loads((w.tmp() / "creds.json").read_text())
@@ -821,9 +829,8 @@ async def test_fork_run_asks_external_pr_and_opens_it_on_yes(
         await asyncio.sleep(1.1)  # the reply must come after the prompt (sent-before rule)
         await w.say("yes", reply=False)
         done = await w.next_text()
-        assert done.startswith(
-            "R1 done: PR #41 on up/stream · https://github.com/up/stream/pull/41"
-        )
+        assert bare(done).startswith("R1 opened PR #41 on up/stream (1 file, ")
+        assert "): https://github.com/up/stream/pull/41\n" in done
         assert "up/stream is upstream; its maintainers merge." in done
         [create] = [c for c in gh_log(w) if c["argv"][:2] == ["pr", "create"]]
         argv = create["argv"]
@@ -849,7 +856,7 @@ async def test_chat_merge_runs_without_asking_by_default(
     w = make_world(tmp_path, resonant_home, chat, monkeypatch)
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
-        assert (await w.next_text()).startswith("R1 done: PR #41")
+        assert bare(await w.next_text()).startswith("R1 opened PR #41")
         # no rule: merge is ok by default, so a chat merge just runs (D4)
         reply = await w.say("merge it")
         assert "R1 merged: PR #41." in reply, reply
@@ -864,7 +871,7 @@ async def test_chat_merge_asks_when_a_rule_says_so(
         trust_store.add_rule(w2.conn, scope=REPO, action="merge", effect="ask",
                              created_from="chat", now=utcnow())  # fmt: skip
         assert (await w2.say("/run demo fix it")).startswith("On it: R1")
-        assert (await w2.next_text()).startswith("R1 done: PR #41")
+        assert bare(await w2.next_text()).startswith("R1 opened PR #41")
         prompt = await w2.say("merge it")
         assert "merge R1: PR #41 in demo " in prompt and prompt.endswith("Reply yes / no")
         assert w2.gh_calls("merge") == []

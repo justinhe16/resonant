@@ -19,6 +19,7 @@ from resonant.runners.reports import (
     NOTE_TEXTS_PER_HOUR,
     WorkerReports,
     detected_list,
+    item_key,
     record_detected,
     record_did,
     shown_did,
@@ -379,8 +380,8 @@ def test_the_did_line_marks_detected_effects_and_drops_ones_the_worker_noted(
         end.title
         == "R1 failed: boom · did: merged PR #3 in dori with gh; pushed to main (detected)"
     )
-    assert reports(db).did_line(run) == (
-        "Did: merged PR #3 in dori with gh; pushed to main (detected)"
+    assert reports(db).also_line(run) == (
+        "Along the way: merged PR #3 in dori with gh; pushed to main (detected)."
     )
 
 
@@ -443,10 +444,14 @@ async def test_a_noted_side_effect_is_not_listed_twice(
     code = await h.start(report="digest")
     await h.drain()
     assert [e.what for e in detected_list(db, code)] == ["merged PR #3 with gh in own/other"]
-    # a merge is high impact (it skips Resonant's merge rules): texted once, listed once
-    assert h.chan.texts() == [f"{code} detected: merged PR #3 with gh in own/other"]
-    [line] = pulse_store.pending(db, ["normal", "urgent"], utcnow())
-    assert line.title.endswith("· did: merged PR #3 in other")
+    # a merge is high impact (it skips Resonant's merge rules): listed once, and said in the
+    # run's one end text (PER-268), which goes out now even for a digest run
+    [text] = h.chan.texts()
+    assert text.startswith(f"{code} (fix the flaky test) opened PR #41")
+    assert "\nAlong the way: merged PR #3 in other." in text
+    line = pulse_store.get(db, "core", item_key(code))
+    assert line is not None and line.title.endswith("· did: merged PR #3 in other")
+    assert pulse_store.pending(db, ["normal", "urgent"], utcnow()) == []  # it was texted
 
 
 async def test_a_notify_digest_rule_keeps_a_detected_push_out_of_texts(

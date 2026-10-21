@@ -55,6 +55,7 @@ ADD_NOTE = ToolSpec(
     level=Level.L3,
     timeout_s=5.0,
     taint_exempt=True,  # PER-245: runs on its level even when tainted
+    approval_summary='add a note: "{text}"',
 )
 DELETE_NOTE = ToolSpec(
     name="delete_note",
@@ -68,6 +69,7 @@ DELETE_NOTE = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=5.0,
+    approval_summary="delete note {id}",
 )
 CLEAR_NOTES = ToolSpec(
     name="clear_notes",

@@ -65,6 +65,7 @@ ADD_REMINDER = ToolSpec(
     level=Level.L3,
     timeout_s=5.0,
     taint_exempt=True,  # PER-245: runs on its level even when tainted
+    approval_summary='remind you at {at}: "{text}"',
 )
 LIST_REMINDERS = ToolSpec(
     name="list_reminders",
@@ -85,6 +86,7 @@ CANCEL_REMINDER = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=5.0,
+    approval_summary="cancel reminder {id}",
 )
 
 SPECS: tuple[ToolSpec, ...] = (ADD_REMINDER, LIST_REMINDERS, CANCEL_REMINDER)

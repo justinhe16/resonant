@@ -587,7 +587,7 @@ async def test_crash_after_started_is_ambiguous_and_never_reruns(make: Any) -> N
     await h.loop.run_until_idle()
     assert len(calls) == 1
     (reply,) = h.channel.replies()
-    assert reply.startswith('Not sure whether add note text="milk" ran')
+    assert reply.startswith('Not sure whether add a note: "milk" ran')
     assert (h.task(task_id).result or {})["path"] == "ambiguous"
     assert len(h.evaluations(task_id)) == 1  # recorded() answered; the gate wasn't asked
 
@@ -987,7 +987,7 @@ def test_report_lines() -> None:
     )
     assert report_line(_intent(delete, id=3), {"id": 3}) == "Deleted note 3."
     assert report_line(_intent(clear), {"cleared": 1}) == "Cleared 1 note."
-    assert report_line(_intent(add, text="x"), {}) == 'Done: add note text="x"'
+    assert report_line(_intent(add, text="x"), {}) == 'Done: add a note: "x"'
     ext = ToolSpec(
         name="add_note", effect=Effect.WRITE, level=Level.L3, source="ext:x", extension="x"
     )
@@ -1003,7 +1003,7 @@ def test_reminder_report_lines_carry_the_due_time() -> None:
     assert report_line(_intent(cancel, id=2), {"cancelled": True, "id": 2}) == (
         "Cancelled reminder 2."
     )
-    assert report_line(_intent(cancel, id=2), {}) == "Done: cancel reminder id=2"
+    assert report_line(_intent(cancel, id=2), {}) == "Done: cancel reminder 2"
 
 
 def test_prompt_text_and_dedupe_key() -> None:

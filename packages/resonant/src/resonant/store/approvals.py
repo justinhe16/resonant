@@ -70,6 +70,7 @@ class NewApproval:
     # ``<scope>`` when the owner answers ``yes always``. None for a worker's check.
     always_scope: str | None = None
     always_action: str | None = None
+    phrased: bool = False  # PER-268: the summary is the tool's approval_summary (migration 019)
 
     def __post_init__(self) -> None:
         if self.allow_always and self.require_code:
@@ -106,6 +107,7 @@ class Approval:
     always: bool = False  # the owner answered ``yes always``
     always_scope: str | None = None  # a tool approval's yes always rule (migration 013)
     always_action: str | None = None
+    phrased: bool = False  # PER-268: the prompt reads "OK to <summary>? [P3] yes / no"
 
     def sent_at(self, principal: str) -> datetime | None:
         """When the prompt was first sent to ``principal`` (None if it never was)."""
@@ -154,6 +156,7 @@ def _row_to_approval(r: sqlite3.Row) -> Approval:
         always=bool(r["always"]),
         always_scope=r["always_scope"],
         always_action=r["always_action"],
+        phrased=bool(r["phrased"]),
     )
 
 
@@ -167,8 +170,8 @@ def insert_approval(conn: sqlite3.Connection, spec: NewApproval, now: datetime) 
     conn.execute(
         """INSERT INTO approvals (id, task_id, intent_hash, extension, tool, effect, level,
                summary, requested_by, approvers, expires_at, require_code, code, created_at,
-               allow_always, always_scope, always_action)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               allow_always, always_scope, always_action, phrased)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             approval_id,
             spec.task_id,
@@ -187,6 +190,7 @@ def insert_approval(conn: sqlite3.Connection, spec: NewApproval, now: datetime) 
             spec.allow_always and not spec.require_code,
             spec.always_scope,
             spec.always_action,
+            spec.phrased,
         ),
     )
     return approval_id

@@ -559,7 +559,7 @@ async def live_ops(resonant_home: Path, chat: FakeChatDB) -> AsyncIterator[Runni
 
 
 def _code(prompt: str) -> str:
-    m = re.match(r"\[([A-Z][0-9])\] ", prompt)
+    m = re.search(r"\[([A-Z][0-9])\] ", prompt)
     assert m, prompt
     return m.group(1)
 
@@ -577,7 +577,7 @@ async def test_e1_note_runs_with_no_prompt(running: Running) -> None:
     assert await r.say("/notes") == ["Notes (1):\n1. buy milk"]
     assert await r.say("/unnote 1") == ["Deleted note 1."]
     assert await r.say("/notes") == ["No notes."]
-    assert await r.say("/unnote 1") == ["Failed: delete note id=1 (delete_note: no note 1)"]
+    assert await r.say("/unnote 1") == ["Couldn't delete note 1: no note 1. Nothing changed."]
     assert await r.say("/unnote one") == ["that's not a note number. Usage: /unnote <n>"]
 
 
@@ -762,7 +762,7 @@ async def test_e5_kill_switch_asks_for_everything_above_l0(live_ops: Running) ->
     # Explicit L3 asks with a plain yes; /kill while it is pending is a command, not a reply.
     (prompt,) = await r.say("/note x")
     code = _code(prompt)
-    assert prompt == f'[{code}] add note text="x"? Reply yes / no'
+    assert prompt == f'OK to add a note: "x"? [{code}] yes / no'
     await r.prompt_recorded()
     assert await r.say("/kill") == [KILL_REPLY]
     assert [a["status"] for a in approvals(r)] == ["pending"]

@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 import test_e2e_runner
 from test_e2e_runner import REPO, FakeChatDB, World, chat, make_world, running, settled
-from test_runner_claude import until
+from test_runner_claude import opened, until
 
 from resonant.models import ChatMessage, ModelReply, SpanFactory
 from resonant.store import pulse as pulse_store
@@ -122,7 +122,7 @@ async def test_two_runs_ask_and_replies_go_by_content_by_code_and_after_which_on
         line = await ask(w, "yes keep the changelog page please", lambda t: t.startswith("→"),
                          "the content pick")  # fmt: skip
         assert line == "→ R2 (Should the docs keep the changelog page?)"
-        await text_like(w, lambda t: t.startswith("R2 done"), "R2 done")
+        await text_like(w, opened("R2"), "R2 done")
         assert prompts(w, "R2")[1].startswith(
             f'The owner answered your question "{DOCS_Q}": yes keep the changelog page please'
         )
@@ -133,11 +133,11 @@ async def test_two_runs_ask_and_replies_go_by_content_by_code_and_after_which_on
         which = await ask(w, "sure", lambda t: t.startswith("For "), "the which-one prompt")
         assert which == f"For R1 ({TYPO_Q}) or R3 ({DOCS_Q})?"
         assert await ask(w, "R1", lambda t: t.startswith("→"), "the stash") == "→ R1"
-        await text_like(w, lambda t: t.startswith("R1 done"), "R1 done")
+        await text_like(w, opened("R1"), "R1 done")
         assert prompts(w, "R1")[1].startswith(f'The owner answered your question "{TYPO_Q}": sure')
         # by code, the code stripped
         assert await ask(w, "R3: drop it", lambda t: t.startswith("→"), "by code") == "→ R3"
-        await text_like(w, lambda t: t.startswith("R3 done"), "R3 done")
+        await text_like(w, opened("R3"), "R3 done")
         answered = f'The owner answered your question "{DOCS_Q}": drop it'
         assert prompts(w, "R3")[1].startswith(answered)
         # every question's pulse item is cleared
@@ -162,7 +162,7 @@ async def test_a_plain_yes_goes_to_the_only_question_and_options_resolve(
         assert await ask(w, "use the second option", lambda t: t.startswith("→"), "answer") == (
             "→ R1"
         )
-        await text_like(w, lambda t: t.startswith("R1 done"), "done")
+        await text_like(w, opened("R1"), "done")
         assert prompts(w, "R1")[1].startswith(
             'The owner answered your question "Which file?": docs/index.md'
         )
@@ -181,7 +181,7 @@ async def test_tell_r1_reaches_a_running_worker_as_a_message(
         line = await ask(w, "tell R1 to also update the README", lambda t: t.startswith("→"),
                          "the message")  # fmt: skip
         assert line == "→ R1 (message)"
-        await text_like(w, lambda t: t.startswith("R1 done"), "done")
+        await text_like(w, opened("R1"), "done")
         # RC-1: written into the live session as a user message
         assert (
             "Message from the owner: also update the README" in (w.tmp() / "turns.json").read_text()
@@ -210,9 +210,9 @@ async def test_a_timed_out_question_and_a_late_answer(
         for _ in range(10):  # nudge the loop until it notices (it may be mid-sleep)
             w.chat.add_message(handle=test_e2e_runner.OWNER_PHONE, text="/runs")
             with contextlib.suppress(AssertionError):
-                await until(lambda: any(t.startswith("R1 done") for t in w.texts()), 3, "done")
+                await until(lambda: any(opened("R1")(t) for t in w.texts()), 3, "done")
                 break
-        await text_like(w, lambda t: t.startswith("R1 done"), "done after the timeout")
+        await text_like(w, opened("R1"), "done after the timeout")
         assert prompts(w, "R1")[1].startswith(f'Your question "{TYPO_Q}": No answer from the owner')
         item = pulse_store.get(w.conn, "core", f"question/r1-{q.id}")
         assert item is not None and item.cleared

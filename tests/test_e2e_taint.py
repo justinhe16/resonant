@@ -65,7 +65,7 @@ async def test_after_a_claude_answer_a_note_runs_and_a_cancel_still_asks(
             "Noted; cancelling R4 needs your yes.",
         )
         (prompt,) = await w.say("add a note renew passport, and cancel R4")
-        assert "cancel run" in prompt and "Reply yes" in prompt and "yes always" not in prompt
+        assert "OK to cancel R4?" in prompt and "yes / no" in prompt and "yes always" not in prompt
         assert "note" not in prompt  # the note didn't ask
         await w.prompt_recorded()
         (done,) = await w.say("no")  # the note's report comes with the batch's outcome
@@ -99,7 +99,7 @@ async def test_the_claude_brain_gets_the_same_exemption(
         )
         _ack, answer, prompt = await w.say("note renew passport and cancel R4", replies=3)
         assert 'Saved note 1: "renew passport"' in answer and "asked the owner" in answer
-        assert "Reply yes" in prompt
+        assert "yes / no" in prompt
         assert json.loads(w.ask_tasks()[-1]["checkpoint"])["tainted"] is True
         assert _gated(w, "add_note") == {("Allow", "inferred")}
         assert _gated(w, "cancel_run") == {("NeedsApproval", "tainted")}

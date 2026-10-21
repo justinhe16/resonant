@@ -186,9 +186,8 @@ async def test_fork_run_asks_then_opens_the_upstream_pr(
     public = [c["argv"][:4] for c in others if c["hosts_token"] == PUBLIC_TOKEN]
     assert all(a[:2] in (["pr", "create"], ["api", "-X"], ["api", f"repos/{FORK}"]) for a in public)
     text = h.chan.texts()[-1]
-    assert text.startswith(
-        f"{code} done: PR #41 on up/stream · https://github.com/up/stream/pull/41"
-    )
+    assert text.startswith(f"{code} (fix the flaky test) opened PR #41 on up/stream (1 file, ")
+    assert "): https://github.com/up/stream/pull/41\n" in text
     assert "up/stream is upstream; its maintainers merge." in text
     assert qs.get(db, check.id) is not None and qs.get(db, check.id).delivered_at is not None  # type: ignore[union-attr]
     # never merged by Resonant
@@ -320,7 +319,7 @@ async def test_auto_merge_waits_for_pending_ci_then_merges(
         h.loop.stop()
         await running
     ready, merged = h.chan.texts()
-    assert ready.startswith(f"{code} done: PR #41 (CI pending)")
+    assert ready.startswith(f"{code} (fix it and merge it) opened PR #41 (CI pending, ")
     assert merged.startswith(f"{code} merged: PR #41 · ")
 
 
@@ -365,8 +364,8 @@ async def test_auto_merge_asks_when_a_rule_says_so(tmp_path: Path, db: sqlite3.C
     await asyncio.sleep(0.3)
     assert run.status == "ready" and h.gh_calls("merge") == []
     [text] = h.chan.texts()
-    assert text.startswith(f"{code} done: PR #41 (CI green)")
-    assert text.endswith(
+    assert text.startswith(f"{code} (fix it and merge it) opened PR #41 (CI green, ")
+    assert text.splitlines()[1] == (
         f"Not merged automatically: a rule says to ask before merging in proj. "
         f"/merge {code} when it's ready."
     )

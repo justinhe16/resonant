@@ -160,6 +160,8 @@ START_RUN = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=60.0,
+    # report (now or digest) only says when the owner hears of it: left out on purpose
+    approval_summary='start a run[ on {repo}]: "{ask}"[{merge} (merges if clean)]{~report}',
 )
 LIST_RUNS = ToolSpec(
     name="list_runs",
@@ -208,6 +210,7 @@ CANCEL_RUN = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=30.0,
+    approval_summary="cancel {code}",
 )
 MERGE_RUN = ToolSpec(
     name="merge_run",
@@ -246,6 +249,7 @@ ANSWER_WORKER = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=15.0,
+    approval_summary='answer {code}: "{text}"',
 )
 MESSAGE_WORKER = ToolSpec(
     name="message_worker",
@@ -262,6 +266,7 @@ MESSAGE_WORKER = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=15.0,
+    approval_summary='send {code} a message: "{text}"',
 )
 
 SPECS: tuple[ToolSpec, ...] = (

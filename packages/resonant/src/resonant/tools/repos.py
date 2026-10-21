@@ -138,6 +138,7 @@ CREATE_REPO = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L2,
     timeout_s=120.0 + CLONE_TIMEOUT_S + 20.0,  # create, then the clone
+    approval_summary="create a GitHub repo named {name}",
 )
 ADD_CI = ToolSpec(
     name="add_ci",
@@ -154,6 +155,7 @@ ADD_CI = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L2,
     timeout_s=120.0,
+    approval_summary="add CI to {repo}",
 )
 MERGE_CI_PR = ToolSpec(
     name="merge_ci_pr",
@@ -200,6 +202,7 @@ ADD_REPO = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=60.0 + SIZE_LOOKUP_S + CLONE_TIMEOUT_S + 10.0,  # resolve, size, then the clone
+    approval_summary="add the repo {repo} for runs",
 )
 FORGET_REPO = ToolSpec(
     name="forget_repo",
@@ -216,6 +219,7 @@ FORGET_REPO = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=15.0,
+    approval_summary="forget the repo {repo}",
 )
 
 SPECS: tuple[ToolSpec, ...] = (

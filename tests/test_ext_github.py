@@ -783,8 +783,8 @@ def test_rerun_failed_permission_error_is_clean(gh: FakeGh) -> None:
     r = gh.run("rerun_failed", "--repo", RESONANT, "--number", "40")
     assert r.code == 1 and r.stdout == "" and TOKEN not in r.err
     assert r.err == (
-        "github: the token can't do this: it needs Actions: write (see the github extension "
-        "README); nothing was changed\n"
+        "github: the github token needs Actions: write access (see the github extension "
+        "README). Nothing changed.\n"
     )
 
 
@@ -873,8 +873,8 @@ def test_merge_pr_permission_and_race_errors_are_clean(gh: FakeGh) -> None:
     r = merge(gh)
     assert r.code == 1 and r.stdout == ""
     assert r.err == (
-        "github: the token can't do this: it needs Contents: write and Pull requests: write "
-        "(see the github extension README); nothing was changed\n"
+        "github: the github token needs Contents: write and Pull requests: write access "
+        "(see the github extension README). Nothing changed.\n"
     )
     # The head moved between the view and the merge: GitHub refuses via --match-head-commit.
     gh.state["fail_on"] = {

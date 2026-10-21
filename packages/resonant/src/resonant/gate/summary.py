@@ -21,6 +21,7 @@ from typing import Any
 
 from resonant.gate.codes import clean_external
 from resonant.gate.types import Intent
+from resonant_sdk.tool import parse_summary, summary_args
 
 MAX_ARGS = 3  # args shown; the rest become "+N more args"
 MAX_KEY_LEN = 20
@@ -108,13 +109,90 @@ def describe_args(args: Mapping[str, Any]) -> str:
     return text
 
 
+def _literal(text: str) -> str:
+    """A template's own words, cleaned like any external string but keeping its quotes and
+    the spaces around them."""
+
+    def clean(part: str) -> str:
+        if not part.strip():
+            return " " if part else ""
+        lead = " " if part[0].isspace() else ""
+        trail = " " if part[-1].isspace() else ""
+        return lead + clean_external(part) + trail
+
+    return '"'.join(clean(part) for part in text.split('"'))
+
+
+def _filled(value: Any) -> str | None:
+    """An arg's value in a filled summary (None: unset). A boolean prints nothing: it is
+    only a ``[...]`` part's condition."""
+    if value is None or value is False or value == "":
+        return None
+    if value is True:
+        return ""
+    if isinstance(value, int | float):
+        return clean_external(repr(value))[:MAX_VALUE_LEN]
+    if isinstance(value, str):
+        flat = clean_external(value)
+        if not flat:
+            return None
+        return flat if len(flat) <= MAX_VALUE_LEN else flat[: MAX_VALUE_LEN - 3].rstrip() + "..."
+    return None  # a list or an object: the arg list says it better
+
+
+def fill_summary(template: str, args: Mapping[str, Any]) -> str | None:
+    """A tool's ``approval_summary`` filled from ``args`` (PER-268), e.g. ``merge PR #121 in
+    justinhe16/resonant``; None when an arg outside ``[...]`` is unset or the template can't
+    be read (the caller falls back to the arg list). Each value is cleaned and clipped like
+    ``describe_args``'s; the template's own words are cleaned too. Every set arg the
+    template doesn't name follows in parentheses (``describe_args``), so nothing a call
+    does is hidden; ``{~arg}`` names one left out on purpose."""
+    try:
+        segments = parse_summary(template)
+        named = summary_args(template)
+    except ValueError:
+        return None
+    out: list[str] = []
+    for optional, pieces in segments:
+        part: list[str] = []
+        for kind, name in pieces:
+            if kind == "text":
+                part.append(_literal(name))
+                continue
+            if kind == "hide":
+                continue
+            value = _filled(args.get(name))
+            if value is None:
+                if not optional:
+                    return None
+                part = []
+                break
+            part.append(value)
+        out.extend(part)
+    text = " ".join("".join(out).split())
+    rest = {k: v for k, v in args.items() if k not in named and v is not None}
+    if text and rest:
+        text += f" ({describe_args(rest)})"
+    return text or None
+
+
+def phrased(intent: Intent) -> str | None:
+    """The intent's summary from its tool's template, or None when it has none or it can't
+    be filled."""
+    template = intent.spec.approval_summary
+    return None if template is None else fill_summary(template, intent.args)
+
+
 def summarize(intent: Intent, *, action: str | None = None) -> str:
     """The approval summary for ``intent``, e.g. ``add note text="buy milk"``.
 
     ``action`` is an optional code-built phrase (e.g. ``delete all 4 notes``) that replaces
     the default ``<extension>: <tool name>`` heading. It must come from code, never a model;
-    it is cleaned like any other string. Args are always appended after it.
+    it is cleaned like any other string. Args are always appended after it. Without one, a
+    tool's ``approval_summary`` (PER-268) is the whole summary when it fills.
     """
+    if action is None and (filled := phrased(intent)) is not None:
+        return filled
     if action is None:
         head = intent.tool.replace("_", " ")
         if intent.extension is not None:

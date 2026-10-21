@@ -45,6 +45,8 @@ What Resonant does not do, or does on purpose in a way that has a cost. Each was
 - **Grants** last 30 minutes, keyed on the exact command and directory (an edit's on its digest).
 - **Residuals from review.** `ps aux` (pre-allowed) shows other processes' arguments. A submodule counts as a linked worktree. The scratch dirs include the whole system temp dir. A script Claude runs asks with only its path shown.
 
+- **System texts the brains see** (PER-268). The Claude brain gets at most 6 of the last 24 h at the top of its next turn and a fresh session starts without the older ones; qwen shows at most 3 between two exchanges. Results and end texts that never went out (a refused send, a digest-level end) aren't recorded. Approval codes in them are masked, as in any forwarded text.
+
 ## Taint
 
 - **Laundering through a note or a fact.** A tainted turn can save a note or a fact without asking, and a later clean turn sees it (the facts index is in every prompt). The report line shows what was saved. If it shows up, make `list_notes` taint, or mark facts saved in a tainted turn and taint the turns that load them.
@@ -64,6 +66,9 @@ What Resonant does not do, or does on purpose in a way that has a cost. Each was
 - **The owner answers every batch,** even when a member could approve every change in it.
 - **A lone change's TTL starts in the session.** A Claude session longer than `gate.approval_ttl_s` would see it expire before the prompt (safe, and not reachable with `timeout_s`). A batch's expiry restarts when it is prompted.
 - **The kill switch blocks on `paused` only.** An approved batch runs with autonomy off. `/kill` sets both.
+- **A template's own words are trusted** (PER-268). Args it doesn't name are shown after it, but `{~arg}` hides one on purpose (`head_sha` in `merge_pr`), and the phrase is the manifest author's (cleaned, owner-approved at install); a misleading one would under-describe its tool. `/approvals <code>` shows the full args.
+- **The "approve it?" guard is a phrase list** (PER-268). A model that asks for a yes in other words still gets through; the prompt rule is the backup, and a real ask is never dropped (it only runs with nothing pending).
+- **An extension's stderr reason is replayed untainted** (PER-268). The failure text's reason is the extension's (or GitHub's) last stderr line, cleaned and clipped to 200, and it reaches both brains as a system text. Accepted: it is one short line from Resonant's own extensions.
 
 ## Workers
 
@@ -73,7 +78,8 @@ What Resonant does not do, or does on purpose in a way that has a cost. Each was
 - **Fork runs.** A fork run pushes before its checks, so a token they find is already public on the fork; rotate it. The PR-open race is caught after the fact (read back, closed). The App covering a new fork is confirmed only on the first real fork run.
 - **Anonymous repo registration.** Without the daemon token (or through an extension's `via` link) a public repo is registered `push`, and its runs fail to push; re-add with the token for fork mode. The lookups share GitHub's 60/h per-IP limit.
 - **Narrowed flagged paths.** Makefiles, Dockerfiles, `conftest.py`, `tox.ini` and new executables merge without asking; lifecycle scripts are listed as `deps changed`. Add any back to `runner/checks.py` if that proves too loose.
-- **Side-effect reporting.** `did:` notes are honor-system. Detection reads command text only: it misses what a script, a program, a subagent or a neutrally named MCP tool does, skips refs in variables, and lists failed commands too. Widen `runners/side_effects.py` from real transcripts. A detected merge is texted even when a `did:` note follows.
+- **Side-effect reporting.** `did:` notes are honor-system. Detection reads command text only: it misses what a script, a program, a subagent or a neutrally named MCP tool does, skips refs in variables, and lists failed commands too. Widen `runners/side_effects.py` from real transcripts. A detected merge is said only in the run's end text (PER-268), so a long run that merges early is heard about when it ends.
+- **A merge-only run is told by the activity feed** (PER-268). A run that pushed nothing ends `done` only when it ran `gh pr merge` itself and the feed shows a PR merge by the app's bot onto its base; a merge by other means (`gh api`, an MCP tool) or with no GitHub App (no feed) ends `no changes`, with the merge on its `did:` list when detected. A `branch_deletion` of the base still counts as a direct push, past the ticket's "push and force_push".
 - **Model-chosen `answer_worker`/`message_worker` run unasked.** A worker's summary could nudge the model into messaging another run; the deterministic paths cover the usual replies.
 - **Small gaps.** Time blocked in `resonant ask` (up to 8 minutes) counts as session time. A renamed repo's checkout isn't moved. `/run blog fix x` with a repo only GitHub knows is a scratch run unless written `/run blog: fix x`. The relay's "which one?" stash and the brain's pick aren't in `/approvals` or `/runs`. No default trust rules and no per-repo auto-merge default ship (owner decisions).
 - **A `runner.repos` entry resets per-repo settings.** It sets `allow_github_changes` and `quote_ask` back to the config defaults.

@@ -78,7 +78,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -88,6 +88,7 @@ import psutil
 
 from resonant import killswitch
 from resonant.config import RunnerConfig, RunnerRepo
+from resonant.extensions.notify import clean_text
 from resonant.gate.codes import clean_external
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import (
@@ -155,12 +156,20 @@ from resonant.runners.live import (
 )
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.runners.reports import (
+    HELD_KINDS,
     Report,
     WorkerReports,
+    alerts,
+    clear_alerts,
     deps_line,
+    detected_list,
     end_event,
     end_title,
+    merged_list,
+    merged_names,
     record_detected,
+    set_alert,
+    set_merged,
     shown_did,
 )
 from resonant.runners.side_effects import RunContext, SideEffect, detect
@@ -204,7 +213,7 @@ from resonant.secrets import (
 )
 from resonant.store import questions as questions_store
 from resonant.store import repos as repo_store
-from resonant.store import runs
+from resonant.store import runs, system_texts
 from resonant.store import tasks as task_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_set, transaction, utcnow
@@ -454,6 +463,135 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
+NAME_MAX = 36  # a run's human name in a text, after its code: ``R4 (fix the login bug)``
+END_EXTRA_LINES = 2  # an end text is a headline and at most this many short lines (PER-268)
+
+
+def run_name(run: Run) -> str:
+    """The run's human name for a text: the first words of its ask, cleaned and clipped at a
+    word (PER-268: a code alone means nothing on a phone)."""
+    flat = clean_text(run.ask or "")
+    if len(flat) <= NAME_MAX:
+        return flat
+    cut = flat[: NAME_MAX - 1]
+    if " " in cut[NAME_MAX // 2 :]:
+        cut = cut[: cut.rindex(" ")]
+    return cut.rstrip(" ,.;:-") + "…"
+
+
+def run_who(run: Run) -> str:
+    """``R4 (fix the login bug)``: the code (replies and /cancel need it) and the name."""
+    name = run_name(run)
+    return f"{run.code} ({name})" if name else run.code
+
+
+def and_list(items: Sequence[str]) -> str:
+    """``PR #1``, ``PR #1 and PR #2``, ``PR #1, PR #2 and PR #3``."""
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def end_parts(
+    run: Run,
+    ci: str | None = None,
+    *,
+    no_ci: bool = False,
+    upstream: str | None = None,
+    watching: bool = False,
+    merged: Sequence[str] = (),
+) -> tuple[str, list[str], list[str]] | None:
+    """An ended run's headline, its further lines (most important first) and the worker's
+    own summary line (``said``, kept apart so a caller can put the side effects before it);
+    None for a state that has none. Written like a short note from a coworker (PER-268):
+    past tense, the code with the run's name. ``ci`` is the PR's CI as a word (``green``, ``red``,
+    ``pending``, ``none``), looked up when the reply is sent. ``no_ci``: the repo has no
+    pull_request workflow: only the owner's ``/merge`` merges it (without CI, with a
+    warning), never an auto-merge. ``upstream``: a fork-mode run's original repo (its
+    ``done`` names the PR opened there, or why none was). ``watching``: the run merges itself
+    once CI is green. ``merged``: the PRs a run merged onto its base (``PR #121``): its
+    ``done`` says so."""
+    took = fmt_duration(run.session_seconds)
+    who = run_who(run)
+    said = [f"{run.code}: {run.summary}"] if run.summary else []
+    files = "" if run.files_changed is None else f", {_plural(run.files_changed, 'file')}"
+    match run.status:
+        case "ready":
+            label = "no CI" if ci == "none" else f"CI {ci or 'unknown'}"
+            head = f"{who} opened PR #{run.pr_number} ({label}{files}, {took}): {run.pr_url}"
+            lines: list[str] = []
+            if run.flag_line:
+                lines.append(run.flag_line)
+            if run.failure:  # the merge-time checks already refuse it
+                lines.append(f"⚠ It can't be merged as it is: {run.failure}")
+            if no_ci:
+                lines.append(
+                    f"No CI: {run.repo} has no pull_request workflow; "
+                    f"/merge {run.code} merges it without CI."
+                )
+            elif watching:
+                lines.append("I'll merge it when CI is green.")
+            else:
+                hint = "to merge it" if ci == "green" else "when CI is green"
+                lines.append(f"/merge {run.code} {hint}.")
+            return head, lines, said
+        case "no_changes":
+            return f"{who} made no changes" + (f": {run.summary}" if run.summary else "."), [], []
+        case "done" if upstream is not None:  # a fork-mode run
+            if run.pr_url:
+                head = (
+                    f"{who} opened PR #{run.pr_number} on {upstream} "
+                    f"({files.removeprefix(', ') + ', ' if files else ''}{took}): {run.pr_url}"
+                )
+                return head, [f"{upstream} is upstream; its maintainers merge."], said
+            why = run.failure or "it wasn't approved"
+            head = (
+                f"{who} finished in {took}: {run.branch} is on your fork, with no PR on "
+                f"{upstream} ({why})."
+            )
+            return head, [], said
+        case "done" if merged:  # PER-268: it merged a PR onto its base, as asked
+            base = run.base_branch or "the base"
+            return f"{who} merged {and_list(merged)} into {base} ({took}).", [], said
+        case "done" if run.repo:  # RX-1: a run that couldn't push; the work is on its branch
+            where = _home(run.checkout) if run.checkout else run.repo
+            why = run.failure or "it can't push yet"
+            head = (
+                f"{who} finished in {took}: the work is on local branch {run.branch} in "
+                f"{where}; {why}."
+            )
+            return head, [], said
+        case "done":  # a run with no repo: Claude's summary is the answer
+            return (
+                f"{who} finished in {took}" + (f": {run.summary}" if run.summary else "."),
+                [],
+                [],
+            )
+        case "failed":
+            return f"{who} failed: {run.failure or 'unknown error'}", [], []
+        case "cancelled":
+            head = f"{who} was cancelled."
+            if run.pr_url:
+                head += f" Its PR was already open: {run.pr_url}"
+            return head, [], []
+        case _:
+            return None
+
+
+def end_text(head: str, lines: Sequence[str], limit: int = END_EXTRA_LINES) -> str:
+    """The headline and at most ``limit`` further lines (PER-268): the ⚠ lines always stay
+    (a direct push is said on its own line), then the rest in order while there is room."""
+    room = limit - sum(1 for line in lines if line.startswith("⚠"))
+    kept: list[str] = []
+    for line in lines:
+        if line.startswith("⚠"):
+            kept.append(line)
+        elif room > 0:
+            kept.append(line)
+            room -= 1
+    return "\n".join([head, *kept])
+
+
 def reply_text(
     run: Run,
     ci: str | None = None,
@@ -461,68 +599,15 @@ def reply_text(
     no_ci: bool = False,
     upstream: str | None = None,
     watching: bool = False,
+    merged: Sequence[str] = (),
 ) -> str | None:
-    """The message for an ended run (None for a state that has none). ``ci`` is the PR's CI
-    as a word (``green``, ``red``, ``pending``, ``none``), looked up when the reply is sent.
-    ``no_ci``: the repo has no pull_request workflow: only the owner's ``/merge`` merges it
-    (without CI, with a warning), never an auto-merge.
-    ``upstream``: a fork-mode run's original repo (its ``done`` names the PR opened there, or
-    why none was). ``watching``: the run merges itself once CI is green."""
-    took = fmt_duration(run.session_seconds)
-    summary = f"\n{run.code}: {run.summary}" if run.summary else ""
-    match run.status:
-        case "ready":
-            label = "no CI" if ci == "none" else f"CI {ci or 'unknown'}"
-            text = f"{run.code} done: PR #{run.pr_number} ({label}) · {run.pr_url}"
-            if run.files_changed is not None:
-                text += f" · {_plural(run.files_changed, 'file')}"
-            text += f" · {took}"
-            if run.flag_line:
-                text += f"\n{run.flag_line}"
-            if run.failure:  # the merge-time checks already refuse it
-                text += f"\n⚠ it can't be merged as it is: {run.failure}"
-            if no_ci:
-                return (
-                    text
-                    + f"\nno CI: {run.repo} has no pull_request workflow; "
-                    + f"/merge {run.code} merges it without CI."
-                    + summary
-                )
-            if watching:
-                return text + "\nI'll merge it when CI is green." + summary
-            hint = "to merge it" if ci == "green" else "when CI is green"
-            return text + f"\n/merge {run.code} {hint}." + summary
-        case "no_changes":
-            return f"{run.code}: no changes." + (f" {run.summary}" if run.summary else "")
-        case "done" if upstream is not None:  # a fork-mode run
-            if run.pr_url:
-                text = f"{run.code} done: PR #{run.pr_number} on {upstream} · {run.pr_url}"
-                if run.files_changed is not None:
-                    text += f" · {_plural(run.files_changed, 'file')}"
-                return text + f" · {took}\n{upstream} is upstream; its maintainers merge." + summary
-            why = run.failure or "it wasn't approved"
-            return (
-                f"{run.code} done ({took}): {run.branch} is on your fork; no PR on {upstream} "
-                f"({why})." + summary
-            )
-        case "done" if run.repo:  # RX-1: a run that couldn't push; the work is on its branch
-            where = _home(run.checkout) if run.checkout else run.repo
-            why = run.failure or "it can't push yet"
-            return (
-                f"{run.code} done ({took}): work is on local branch {run.branch} in {where}; "
-                f"{why}." + summary
-            )
-        case "done":  # a run with no repo: Claude's summary is the answer
-            return f"{run.code} done ({took})" + (f": {run.summary}" if run.summary else ".")
-        case "failed":
-            return f"{run.code} failed: {run.failure or 'unknown error'}"
-        case "cancelled":
-            text = f"{run.code} cancelled."
-            if run.pr_url:
-                text += f" Its PR was already open: {run.pr_url}"
-            return text
-        case _:
-            return None
+    """The message for an ended run, from :func:`end_parts` (None for a state that has
+    none), at most a headline and ``END_EXTRA_LINES`` lines."""
+    parts = end_parts(run, ci, no_ci=no_ci, upstream=upstream, watching=watching, merged=merged)
+    if parts is None:
+        return None
+    head, lines, said = parts
+    return end_text(head, [*lines, *said])
 
 
 def not_set_up_text(missing: Sequence[str], how: Sequence[str]) -> str:
@@ -1686,7 +1771,7 @@ class ClaudeRunner:
             if run is None or run.status != "running":
                 return
             item = self.reports.running(run, _bucket(run.session_seconds))
-            if not effect.high:
+            if not effect.high or effect.kind in HELD_KINDS:  # a merge: said in the end text
                 return
             level = self.reports.level(run, "side_effect", effect.kind)
             self.reports.audit_report(run, "side_effect", level)
@@ -2632,24 +2717,31 @@ class ClaudeRunner:
         still makes the run ``ready``, with the reason, since the PR exists and the owner may
         want to look at it; ``merge_run`` refuses it again."""
         self._check_stop(run.code)
-        await self._check_base_untouched(w, run, p)
+        merges = await self._check_base_untouched(w, run, p)
         pr = await self.workspace.find_pr(run.repo, p.branch, w.secrets)
         if pr is None:
             if await self.workspace.pushed_commits(p, w.secrets) == 0:
+                names = merged_names(detected_list(self.conn, run.code)) if merges else []
+                if names:  # PER-268: its work was merging a PR (its own gh pr merge), and it did
+                    set_merged(self.conn, run.code, names)
+                    if not runs.finish(self.conn, run.code, "done", step="reply"):
+                        raise _Cancelled
+                    with atomic(self.conn):
+                        audit(self.conn, "run.done_merged", run=run.code, merged=len(names))
+                    return self._must_get(run.code)
                 raise NoChanges("the session pushed nothing")
             raise RunnerError(
                 f"the session pushed {p.branch} but opened no PR (work kept: /runs {run.code})"
             )
         self._check_stop(run.code)
         if pr.state == "MERGED":  # the session merged it itself: no check ever ran on it
-            with contextlib.suppress(ChannelError):
-                await self.channel.send(
-                    run.principal,
-                    f"⚠ {run.code}: PR #{pr.number} was already merged, not by Resonant "
-                    f"(the session did it). Look at {self._slug(run.repo)}.",
-                    dedupe_key=f"run:{run.code}:pr-merged",
-                )
-            raise RunnerError(f"PR #{pr.number} was merged by the session, not by Resonant")
+            set_alert(
+                self.conn,
+                run.code,
+                f"⚠ {run.code} merged its own PR #{pr.number}, so none of Resonant's checks "
+                f"ran on it. Look at {self._slug(run.repo)}.",
+            )
+            raise RunnerError(f"it merged its own PR #{pr.number}, not Resonant")
         if pr.state != "OPEN":
             raise RunnerError(f"PR #{pr.number} is {pr.state.lower()}, not open")
         if pr.base != p.base_branch:
@@ -2698,34 +2790,41 @@ class ClaudeRunner:
             audit(self.conn, "run.done_local", run=run.code, branch=p.branch, why=w.local)
         return self._must_get(run.code)
 
-    async def _check_base_untouched(self, w: _Work, run: Run, p: Prepared) -> None:
-        """A push (or PR merge) straight onto the base branch skips every check a merge runs
-        (the base is already live, and the checks only look at what the PR adds). Protection
-        should stop it, but a ruleset the app can bypass would not, so the activity feed is
-        always asked whether the app's bot put anything on the base during the run. If it did,
-        the run fails, the owner is told at once and it is never merged. If the feed can't be
-        read the run fails too: it can't be shown clean."""
+    async def _check_base_untouched(self, w: _Work, run: Run, p: Prepared) -> tuple[str, ...]:
+        """A push straight onto the base branch skips every check a merge runs (the base is
+        already live, and the checks only look at what the PR adds). Protection should stop
+        it, but a ruleset the app can bypass would not, so the activity feed is always asked
+        what the app's bot put on the base during the run, by the type GitHub reports
+        (PER-268). A push, force-push or delete fails the run with a ⚠ line in its end text
+        (said now), and it is never merged. A PR merge is not a direct push: its shas are
+        returned (audited ``run.base_merge``), so a run asked to merge a PR, whose own ``gh pr
+        merge`` was read from its commands, ends ``done`` saying so. A bot merge the run
+        didn't make (Resonant merging another run's PR meanwhile) is only audited. If the
+        feed can't be read the run fails: it can't be shown clean."""
         if self.app is None:
-            return
+            return ()
         try:
             bot = await self.app.bot_login()
         except GitHubAppError as e:
             raise RunnerError(f"couldn't check {p.base_branch} for direct pushes: {e}") from None
         since = (run.started_at or run.created_at) - timedelta(minutes=1)
-        shas = await self.workspace.base_pushes(run.repo, w.secrets, actor=bot, since=since)
-        if not shas:
-            return
-        short = ", ".join(sha[:7] for sha in shas[:5])
+        found = await self.workspace.base_pushes(run.repo, w.secrets, actor=bot, since=since)
+        if found.merges:
+            short = ", ".join(sha[:7] for sha in found.merges[:5])
+            with atomic(self.conn):
+                audit(self.conn, "run.base_merge", run=run.code, base=p.base_branch, shas=short)
+        if not found.pushes:
+            return found.merges
+        short = ", ".join(sha[:7] for sha in found.pushes[:5])
         with atomic(self.conn):
             audit(self.conn, "run.base_push", run=run.code, base=p.base_branch, shas=short)
-        with contextlib.suppress(ChannelError):
-            await self.channel.send(
-                run.principal,
-                f"⚠ {run.code} pushed directly to {p.base_branch}: {short}. "
-                f"Look at {self._slug(run.repo)} now; this run will not be merged.",
-                dedupe_key=f"run:{run.code}:base-push",
-            )
-        raise RunnerError(f"pushed directly to {p.base_branch} ({short}); not merged")
+        set_alert(
+            self.conn,
+            run.code,
+            f"⚠ {run.code} pushed {short} straight to {p.base_branch}, skipping every check. "
+            f"Look at {self._slug(run.repo)} now.",
+        )
+        raise RunnerError(f"it pushed directly to {p.base_branch} ({short}), so it won't be merged")
 
     # -- fork mode (docs/employee-plan.md D6) --
 
@@ -3106,19 +3205,34 @@ class ClaudeRunner:
         no_ci = repo is not None and repo.mode == "push" and repo.ci is False
         upstream = repo.slug if repo is not None and repo.mode == "fork" else None
         ci = await self._ci_word(run)
-        text = reply_text(run, ci, no_ci=no_ci, upstream=upstream, watching=watching)
-        if text is not None and note:
-            text += f"\n{note}"
-        if text is not None and (did := self.reports.did_line(run)) is not None:
-            text += f"\n{did}"
+        merged = merged_list(self.conn, run.code) if run.status == "done" else []
+        parts = end_parts(run, ci, no_ci=no_ci, upstream=upstream, watching=watching,
+                          merged=merged)  # fmt: skip
         event = end_event(run)
-        warned = False
-        title = end_title(run, ci)
-        if text is not None and (expires := self._unrevoked.get(run.code)) is not None:
+        title = end_title(run, ci, merged=merged)
+        # PER-268: one text per outcome. The ⚠ lines (a direct push, a PR merged by the
+        # session) come first, then the auto-merge's note, the headline's own lines and the
+        # side effects; end_text keeps the headline and at most two more (⚠ always).
+        warn = alerts(self.conn, run.code)
+        warned = bool(warn)
+        if (expires := self._unrevoked.get(run.code)) is not None:
             at = expires.astimezone(self.tz).strftime("%H:%M")
-            text += f"\n⚠ the run's GitHub token wasn't revoked; it expires at {at}."
+            warn.append(f"⚠ The run's GitHub token wasn't revoked; it expires at {at}.")
             title += f" · ⚠ token not revoked, expires {at}"
             warned = True
+        text: str | None = None
+        if parts is not None:
+            head, lines, said = parts
+            if run.status != "cancelled" and (still := self._still_working(run)):
+                head += f" {still}"
+            if note:  # the auto-merge's note says how to merge it: no second hint
+                lines = [line for line in lines if not line.startswith(f"/merge {run.code} ")]
+            also = self.reports.also_line(run, skip=merged)
+            extra = [*warn, *([note] if note else []), *lines, *([also] if also else []), *said]
+            text = end_text(head, extra)
+        held = any(
+            e.high and e.kind in HELD_KINDS for e in detected_list(self.conn, run.code)
+        )  # a merge the end text says: the side effect's level applies to it
         if text is None or event is None:
             self.reports.clear_silently(run)
             if text is None:
@@ -3126,6 +3240,12 @@ class ClaudeRunner:
             item = None
         else:
             level = "now" if warned else self.reports.level(run, event)
+            if (
+                level == "digest"
+                and held
+                and self.reports.level(run, "side_effect", "merge") == "now"
+            ):
+                level = "now"
             self.reports.audit_report(run, event, level)
             item = self.reports.ended(run, title, urgent=event == "failed" or warned)
             if level == "digest":
@@ -3140,6 +3260,34 @@ class ClaudeRunner:
         self._unrevoked.pop(run.code, None)  # only now: a retried send says it again
         if item is not None:
             self.reports.told(item)
+        if warn:
+            clear_alerts(self.conn, run.code)
+        # PER-268: what the owner was told, for the brains, without the worker's own words
+        # (its summary, its did: notes). Still outside content as list_runs is (the ask may
+        # be a tainted turn's, a failure quotes GitHub, flagged paths are the worker's): it
+        # taints the turn that sees it, as the run tools do.
+        bare = end_parts(replace(run, summary=None), ci, no_ci=no_ci, upstream=upstream,
+                         watching=watching, merged=merged)  # fmt: skip
+        if bare is not None:
+            said = end_text(bare[0], [*warn, *([note] if note else []), *bare[1]])
+            ref = f"run:{run.code}:{run.status}"
+            system_texts.record(self.conn, run.principal, "run", said, ref=ref,
+                                task_id=run.task_id, outside=True)  # fmt: skip
+
+    def _still_working(self, run: Run) -> str:
+        """``Still working on R5 (public dashboard view).``: the owner's other active runs,
+        by name (at most two, then ``+N more``), or "" when nothing else is running."""
+        try:
+            others = [r for r in runs.active(self.conn) if r.code != run.code
+                      and r.principal == run.principal]  # fmt: skip
+        except Exception:  # the clause is a courtesy: the reply goes out without it
+            return ""
+        if not others:
+            return ""
+        named = [run_who(r) for r in others[:2]]
+        if len(others) > 2:
+            named.append(f"{len(others) - 2} more")
+        return f"Still working on {and_list(named)}."
 
     async def _report_merged(self, run: Run, *, by_owner: bool, deps: Sequence[str] = ()) -> None:
         """A merged run's digest line (it lists the dependency files the PR changed, ``deps``).
