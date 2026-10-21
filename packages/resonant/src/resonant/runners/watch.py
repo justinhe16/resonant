@@ -273,14 +273,18 @@ def note_unfired(conn: sqlite3.Connection, w: store.Watch, now: datetime) -> Non
     """A watch that expired without ever firing leaves a ``low`` core item for the briefing
     (``notice/watch/<id>/ended``, ``W3 … ended without firing``), so it doesn't end in
     silence. It sends nothing and isn't a notice against the daily cap; it expires with its
-    TTL. Call only when this call ended the watch (``store.end`` returned True)."""
+    TTL. Call only when this call ended the watch (``store.end`` returned True). Never
+    raises: the watch has ended either way, and ``queue_due`` goes on with the rest."""
     if w.fired:
         return
     key = notice_key(f"watch/{w.id}/ended")
     title = clean_text(store.ended_title(w))
-    with atomic(conn):
-        pulse_items.upsert(conn, "core", key, title, "low", {"ended": "expired"}, False,
-                           NOTICE_TTL_S, now)  # fmt: skip
+    try:
+        with atomic(conn):
+            pulse_items.upsert(conn, "core", key, title, "low", {"ended": "expired"}, False,
+                               NOTICE_TTL_S, now)  # fmt: skip
+    except (sqlite3.Error, ValueError):
+        log.exception("ended-watch item not written", extra={"watch": w.id})
 
 
 # --- core/watches --------------------------------------------------------------------------
