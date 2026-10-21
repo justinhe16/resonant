@@ -5,7 +5,9 @@ One schema, two tiers (plan D3):
 - ``local`` is served on loopback only (``GET /api/dashboard``). It may carry text: run asks,
   PR links, approval and question texts, pulse titles, trust rules and repos.
 - ``remote`` is what may leave the Mini (the relay, DB-3). It is a strict subset: health,
-  counts, states, identifiers and times only.
+  counts, states, identifiers and times only. Each local-only list of texts (``runs.items``,
+  ``approvals.items``, ...) has a ``brief`` beside it on both tiers: one row per item with its
+  code, kind, state and times and none of its text, so the remote page can list them too.
 
 Every field that only the local tier carries is declared with :data:`LOCAL_ONLY` (it shows as
 ``"x-tier": "local"`` in the JSON schema), defaults to None and is left out of the output when
@@ -59,6 +61,15 @@ from resonant.store.runs import WaitReason
 SCHEMA_VERSION: Final = 1
 RUN_ITEMS = 50  # active runs first, then the most recent (``runs.recent``)
 BRAIN_TOOL_ITEMS = 20  # the Claude brain's last tool calls (PER-258)
+# The briefs' size caps, so the remote tier stays well under the relay's 30 KiB: the first
+# runs (active first, as ``runs.recent`` orders them), the first open approvals and questions,
+# and the most urgent open pulse items. ``tests/test_dashboard_snapshot.py`` fills every one.
+# All of them full take about 10 KiB; the pusher drops them if a snapshot is still too large.
+RUN_BRIEF_ITEMS = 20
+APPROVAL_BRIEF_ITEMS = 10
+QUESTION_BRIEF_ITEMS = 10
+PULSE_BRIEF_ITEMS = 20
+BRAIN_BRIEF_ITEMS = 10  # ``brain_activity.recent``: the newest of ``claude_brain.tools``
 
 # A field only the local tier carries. ``to_remote`` clears it; None is left out of the output.
 LOCAL_ONLY: Final[JsonDict] = {"x-tier": "local"}
@@ -74,6 +85,9 @@ PulseState = Literal["new", "told"]  # new: the owner hasn't heard this version 
 # A row whose identifier doesn't match is left out of the snapshot, never an error.
 IDENT_PATTERN: Final = r"^[a-z][a-z0-9:_-]{0,63}$"
 Ident = Annotated[str, StringConstraints(pattern=IDENT_PATTERN)]
+# A run or watch code (``R3``, ``W2``): a letter and a counter, never content.
+CODE_PATTERN: Final = r"^[A-Z][0-9]{1,6}$"
+Code = Annotated[str, StringConstraints(pattern=CODE_PATTERN)]
 # A git sha (8 hex) or the package version when there is no git checkout.
 VERSION_PATTERN: Final = r"^[0-9A-Za-z.+-]{1,40}$"
 Version = Annotated[str, StringConstraints(pattern=VERSION_PATTERN)]
@@ -86,6 +100,7 @@ RELAY_CHECK: Final = "relay"
 _GIT = "/usr/bin/git"  # SIP-protected; never looked up by name
 _SHA = re.compile(r"[0-9a-f]{40}")
 _IDENT = re.compile(IDENT_PATTERN)
+_CODE = re.compile(CODE_PATTERN)
 _OUTCOMES: frozenset[str] = frozenset(get_args(JobOutcome))
 _HEALTH_STATES: frozenset[str] = frozenset(get_args(HealthState))
 _TASK_STATES: frozenset[str] = frozenset(get_args(TaskStatus))
@@ -94,6 +109,10 @@ _RUN_STATES: frozenset[str] = frozenset(get_args(RunStatus))
 
 def _ident(value: str) -> bool:
     return _IDENT.fullmatch(value) is not None
+
+
+def _code(value: str) -> bool:
+    return _CODE.fullmatch(value) is not None
 
 
 def _counts(counts: Mapping[str, int], known: frozenset[str]) -> dict[Any, int]:
@@ -141,9 +160,22 @@ class RunItem(_Model):
     remote_url: str | None = _local()  # RC-1: the running session's Remote Control link
 
 
+class RunBrief(_Model):
+    """A run on both tiers: no ask, repo, branch, note or link."""
+
+    code: Code
+    state: RunStatus
+    scratch: bool  # no repo
+    has_pr: bool
+    started_at: datetime | None
+    ended_at: datetime | None
+    waiting_reason: WaitReason | None
+
+
 class Runs(_Model):
     by_state: dict[RunStatus, int]
     items: list[RunItem] | None = _local()
+    brief: list[RunBrief] = Field(default_factory=list[RunBrief])
 
 
 class ApprovalItem(_Model):
@@ -154,9 +186,21 @@ class ApprovalItem(_Model):
     expires_at: datetime
 
 
+class ApprovalBrief(_Model):
+    """A pending approval on both tiers: no summary, and not its code (the owner types it to
+    say yes, so it stays on the Mini and iMessage)."""
+
+    level: Literal["L0", "L1", "L2", "L3"]
+    effect: Literal["read", "write", "pay"]
+    needs_code: bool
+    asked_at: datetime
+    expires_at: datetime
+
+
 class Approvals(_Model):
     open: int
     items: list[ApprovalItem] | None = _local()
+    brief: list[ApprovalBrief] = Field(default_factory=list[ApprovalBrief])
 
 
 class QuestionItem(_Model):
@@ -166,9 +210,18 @@ class QuestionItem(_Model):
     asked_at: datetime
 
 
+class QuestionBrief(_Model):
+    """An open worker question on both tiers: whose, how many options, when. No text."""
+
+    run_code: Code
+    options: int
+    asked_at: datetime
+
+
 class Questions(_Model):
     open: int
     items: list[QuestionItem] | None = _local()
+    brief: list[QuestionBrief] = Field(default_factory=list[QuestionBrief])
 
 
 class PulseItem(_Model):
@@ -180,9 +233,19 @@ class PulseItem(_Model):
     updated_at: datetime
 
 
+class PulseBrief(_Model):
+    """An open pulse item on both tiers: who reported it, how urgent, when. No key or title."""
+
+    source: Ident  # ``core``, the extension, or ``other``
+    urgency: Urgency
+    state: PulseState
+    updated_at: datetime
+
+
 class Pulse(_Model):
     open: int
     items: list[PulseItem] | None = _local()
+    brief: list[PulseBrief] = Field(default_factory=list[PulseBrief])
 
 
 class Job(_Model):
@@ -203,6 +266,7 @@ class Extension(_Model):
 class Runner(_Model):
     set_up: bool
     missing: list[str] | None = _local()  # what to set up, in words
+    gaps: int = 0  # how many
 
 
 class BrainTool(_Model):
@@ -228,12 +292,33 @@ class ClaudeBrain(_Model):
     tools: list[BrainTool] = Field(default_factory=list[BrainTool])
 
 
+BrainDecision = Literal[
+    "allowed", "read", "gate", "granted", "asked", "refused", "denied", "resonant", "other"
+]
+
+
+class BrainToolBrief(_Model):
+    """One of the Claude brain's tool calls on both tiers: the tool's kind (``bash``,
+    ``read``, ``mcp``; ``other`` for a name that isn't a plain slug), the decision and the
+    outcome. Never its command or directory."""
+
+    at: datetime
+    tool: Ident
+    decision: BrainDecision
+    status: Literal["ok", "error"]
+    write: bool
+
+
 class BrainActivity(_Model):
     """PER-258: the Claude brain's tool calls today (``settings.timezone``), counts only, so
-    the remote tier has them too: every call, and the changes that ran."""
+    the remote tier has them too: every call, and the changes that ran. With its session's
+    state and turns (None before its first start) and its last calls, briefly."""
 
     calls_today: int
     writes_today: int
+    state: Literal["up", "down"] | None = None
+    turns: int = 0
+    recent: list[BrainToolBrief] = Field(default_factory=list[BrainToolBrief])
 
 
 class TrustRule(_Model):
@@ -283,6 +368,8 @@ class Snapshot(_Model):
     claude_brain: ClaudeBrain | None = _local()  # BR-11; None before its first start
     brain_activity: BrainActivity = Field(default_factory=lambda: BrainActivity(
         calls_today=0, writes_today=0))  # fmt: skip
+    trust_rule_count: int = 0  # the rules and repos themselves are local only
+    repo_count: int = 0
 
 
 # --- tiers --------------------------------------------------------------------------------
@@ -465,10 +552,19 @@ def build_snapshot(
     asks = questions.open_asks(conn)
     items = pulse.open_items(conn, now)
     autonomy = kv_get(conn, "autonomy", "on")
+    brain = _claude_brain(conn)
     if runner_missing is None:
-        runner = Runner(set_up=False, missing=["no Claude runner in this daemon (iMessage is off)"])
+        runner = Runner(
+            set_up=False, missing=["no Claude runner in this daemon (iMessage is off)"], gaps=1
+        )
     else:
-        runner = Runner(set_up=not runner_missing, missing=list(runner_missing) or None)
+        runner = Runner(
+            set_up=not runner_missing,
+            missing=list(runner_missing) or None,
+            gaps=len(runner_missing),
+        )
+    rules = trust.list_rules(conn)
+    repo_rows = repos.list_all(conn)
     return Snapshot(
         schema=SCHEMA_VERSION,
         tier="local",
@@ -504,6 +600,18 @@ def build_snapshot(
                 )
                 for r in run_rows
             ],
+            brief=[
+                RunBrief(
+                    code=r.code,
+                    state=r.status,
+                    scratch=not r.repo,
+                    has_pr=r.pr_url is not None or r.pr_number is not None,
+                    started_at=r.started_at,
+                    ended_at=r.ended_at,
+                    waiting_reason=r.wait_reason if r.status == "waiting" else None,
+                )
+                for r in [r for r in run_rows if _code(r.code)][:RUN_BRIEF_ITEMS]
+            ],
         ),
         approvals=Approvals(
             open=len(pending),
@@ -517,6 +625,16 @@ def build_snapshot(
                 )
                 for a in pending
             ],
+            brief=[
+                ApprovalBrief(
+                    level=a.level.value,
+                    effect=a.effect.value,
+                    needs_code=a.require_code,
+                    asked_at=a.created_at,
+                    expires_at=a.expires_at,
+                )
+                for a in pending[:APPROVAL_BRIEF_ITEMS]
+            ],
         ),
         questions=Questions(
             open=len(asks),
@@ -528,6 +646,10 @@ def build_snapshot(
                     asked_at=q.asked_at,
                 )
                 for q in asks
+            ],
+            brief=[
+                QuestionBrief(run_code=q.run_code, options=len(q.options), asked_at=q.asked_at)
+                for q in [q for q in asks if _code(q.run_code)][:QUESTION_BRIEF_ITEMS]
             ],
         ),
         pulse=Pulse(
@@ -543,16 +665,30 @@ def build_snapshot(
                 )
                 for i in items
             ],
+            brief=[
+                PulseBrief(
+                    source=i.source if _ident(i.source) else "other",
+                    urgency=i.urgency,
+                    state="new" if i.changed else "told",
+                    updated_at=i.updated_at,
+                )
+                for i in sorted(
+                    items, key=lambda i: (_URGENCY_RANK[i.urgency], -i.updated_at.timestamp())
+                )[:PULSE_BRIEF_ITEMS]
+            ],
         ),
         extensions=_extensions(conn, health, settings, now),
         runner=runner,
-        trust_rules=[TrustRule(n=r.id, text=r.text) for r in trust.list_rules(conn)],
-        repos=[
-            RepoItem(name=r.name, mode=r.mode, base=r.base, ci=r.ci) for r in repos.list_all(conn)
-        ],
-        claude_brain=_claude_brain(conn),
-        brain_activity=_brain_activity(conn, settings, now),
+        trust_rules=[TrustRule(n=r.id, text=r.text) for r in rules],
+        repos=[RepoItem(name=r.name, mode=r.mode, base=r.base, ci=r.ci) for r in repo_rows],
+        claude_brain=brain,
+        brain_activity=_brain_activity(conn, settings, now, brain),
+        trust_rule_count=len(rules),
+        repo_count=len(repo_rows),
     )
+
+
+_URGENCY_RANK: Final[Mapping[str, int]] = {u: n for n, u in enumerate(pulse.URGENCIES)}
 
 
 _RC_URL = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]{1,200}")
@@ -592,11 +728,42 @@ def _brain_tools(conn: sqlite3.Connection) -> list[BrainTool]:
     return out
 
 
-def _brain_activity(conn: sqlite3.Connection, settings: Settings, now: datetime) -> BrainActivity:
+_DECISIONS: frozenset[str] = frozenset(get_args(BrainDecision))
+
+
+def _tool_kind(name: str) -> str:
+    """A tool's name as a slug for the remote tier: ``Bash`` is ``bash``, every MCP tool is
+    ``mcp`` (its server and tool names stay local), anything else not a slug is ``other``."""
+    if name.startswith("mcp__"):
+        return "mcp"
+    kind = name.lower()
+    return kind if _ident(kind) else "other"
+
+
+def _brain_activity(
+    conn: sqlite3.Connection, settings: Settings, now: datetime, brain: ClaudeBrain | None
+) -> BrainActivity:
     local = now.astimezone(ZoneInfo(settings.timezone))
     midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
     counts = tool_counts(conn, midnight)
-    return BrainActivity(calls_today=counts["calls"], writes_today=counts["writes"])
+    return BrainActivity(
+        calls_today=counts["calls"],
+        writes_today=counts["writes"],
+        state=None if brain is None else brain.state,
+        turns=0 if brain is None else brain.turns,
+        recent=[]
+        if brain is None
+        else [
+            BrainToolBrief(
+                at=t.at,
+                tool=_tool_kind(t.tool),
+                decision=cast(BrainDecision, t.decision if t.decision in _DECISIONS else "other"),
+                status=t.status,
+                write=t.write,
+            )
+            for t in brain.tools[:BRAIN_BRIEF_ITEMS]
+        ],
+    )
 
 
 if __name__ == "__main__":

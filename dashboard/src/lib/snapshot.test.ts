@@ -76,6 +76,20 @@ describe("forTier", () => {
     expect(out.approvals.open).toBe(1);
   });
 
+  it("keeps the briefs but only their known fields", () => {
+    const leaky = clone(local, { tier: "remote" });
+    (leaky.runs.brief![0] as unknown as Record<string, unknown>).ask = "leaked ask";
+    (leaky.brain_activity!.recent![0] as unknown as Record<string, unknown>).command = "git push";
+    const out = forTier(leaky);
+    expect(out.runs.brief).toHaveLength(4);
+    expect(out.runs.brief![0]).not.toHaveProperty("ask");
+    expect(out.approvals.brief).toHaveLength(1);
+    expect(out.questions.brief?.[0]?.run_code).toBe("R11");
+    expect(out.pulse.brief).toHaveLength(3);
+    expect(out.brain_activity!.recent![0]).not.toHaveProperty("command");
+    expect(JSON.stringify(out)).not.toContain("leaked ask");
+  });
+
   it("leaves a local snapshot alone", () => {
     expect(forTier(local)).toBe(local);
   });

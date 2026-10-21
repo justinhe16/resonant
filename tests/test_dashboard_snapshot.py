@@ -16,19 +16,27 @@ from pydantic import BaseModel, Field, ValidationError
 
 from resonant import __version__
 from resonant.config import load_settings
+from resonant.dashboard import pusher as pusher_mod
 from resonant.dashboard import snapshot as snap
+from resonant.dashboard.pusher import data_size
 from resonant.dashboard.snapshot import (
+    ApprovalBrief,
     ApprovalItem,
     Approvals,
+    BrainActivity,
+    BrainToolBrief,
     Extension,
     HealthRow,
     Job,
     JobOutcome,
     Pulse,
+    PulseBrief,
     PulseItem,
+    QuestionBrief,
     QuestionItem,
     Questions,
     RepoItem,
+    RunBrief,
     RunItem,
     Runner,
     Runs,
@@ -100,7 +108,7 @@ def _remote_strings(schema: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 
 
 def test_remote_strings_are_never_free_text() -> None:
-    """Every string the remote tier keeps is an enum, a date-time or one of the two short
+    """Every string the remote tier keeps is an enum, a date-time or one of the three short
     identifier patterns (never just any pattern: ``^.*$`` would be free text)."""
     strings = _remote_strings(Snapshot.model_json_schema())
     assert strings  # the walk found the remote fields
@@ -108,12 +116,16 @@ def test_remote_strings_are_never_free_text() -> None:
         path
         for path, node in strings
         if not ("enum" in node or "const" in node or node.get("format") == "date-time")
-        and node.get("pattern") not in (snap.IDENT_PATTERN, snap.VERSION_PATTERN)
+        and node.get("pattern") not in (snap.IDENT_PATTERN, snap.VERSION_PATTERN, snap.CODE_PATTERN)
     ]
     assert loose == []
     by_path = {p: n.get("pattern") for p, n in strings}
     assert by_path["$.version"] == snap.VERSION_PATTERN  # used only where meant
     assert [p for p, pat in by_path.items() if pat == snap.VERSION_PATTERN] == ["$.version"]
+    assert sorted(p for p, pat in by_path.items() if pat == snap.CODE_PATTERN) == [
+        "$.questions.brief[].run_code",
+        "$.runs.brief[].code",
+    ]
 
 
 def test_the_walk_flags_free_text() -> None:
@@ -175,6 +187,10 @@ def _ident(rng: random.Random) -> str:
     )
 
 
+def _code(rng: random.Random) -> str:
+    return rng.choice("RW") + str(rng.randint(1, 999999))
+
+
 def _dt(rng: random.Random) -> datetime:
     return datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=rng.randint(0, 10**8))
 
@@ -232,6 +248,18 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
                 )
                 for _ in n()
             ],
+            brief=[
+                RunBrief(
+                    code=_code(rng),
+                    state=rng.choice(run_states),
+                    scratch=rng.random() < 0.5,
+                    has_pr=rng.random() < 0.5,
+                    started_at=_maybe(rng, _dt(rng)),
+                    ended_at=_maybe(rng, _dt(rng)),
+                    waiting_reason=cast(Any, _maybe(rng, rng.choice(["usage_reset", "question"]))),
+                )
+                for _ in n()
+            ],
         ),
         approvals=Approvals(
             open=rng.randint(0, 9),
@@ -240,6 +268,16 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
                     code=_maybe(rng, _text(rng)),
                     summary=_text(rng),
                     level=rng.choice(["L0", "L1", "L2", "L3"]),
+                    asked_at=_dt(rng),
+                    expires_at=_dt(rng),
+                )
+                for _ in n()
+            ],
+            brief=[
+                ApprovalBrief(
+                    level=rng.choice(["L0", "L1", "L2", "L3"]),
+                    effect=rng.choice(["read", "write", "pay"]),
+                    needs_code=rng.random() < 0.5,
                     asked_at=_dt(rng),
                     expires_at=_dt(rng),
                 )
@@ -257,6 +295,10 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
                 )
                 for _ in n()
             ],
+            brief=[
+                QuestionBrief(run_code=_code(rng), options=rng.randint(0, 4), asked_at=_dt(rng))
+                for _ in n()
+            ],
         ),
         pulse=Pulse(
             open=rng.randint(0, 9),
@@ -265,6 +307,15 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
                     source=_text(rng),
                     key=_text(rng),
                     title=_text(rng),
+                    urgency=rng.choice(["urgent", "normal", "low"]),
+                    state=rng.choice(["new", "told"]),
+                    updated_at=_dt(rng),
+                )
+                for _ in n()
+            ],
+            brief=[
+                PulseBrief(
+                    source=_ident(rng),
                     urgency=rng.choice(["urgent", "normal", "low"]),
                     state=rng.choice(["new", "told"]),
                     updated_at=_dt(rng),
@@ -290,7 +341,29 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
             )
             for _ in n(4)
         ],
-        runner=Runner(set_up=rng.random() < 0.5, missing=_maybe(rng, [_text(rng) for _ in n(3)])),
+        runner=Runner(
+            set_up=rng.random() < 0.5,
+            missing=_maybe(rng, [_text(rng) for _ in n(3)]),
+            gaps=rng.randint(0, 3),
+        ),
+        brain_activity=BrainActivity(
+            calls_today=rng.randint(0, 99),
+            writes_today=rng.randint(0, 9),
+            state=cast(Any, _maybe(rng, rng.choice(["up", "down"]))),
+            turns=rng.randint(0, 99),
+            recent=[
+                BrainToolBrief(
+                    at=_dt(rng),
+                    tool=_ident(rng),
+                    decision=rng.choice(get_args(snap.BrainDecision)),
+                    status=rng.choice(["ok", "error"]),
+                    write=rng.random() < 0.5,
+                )
+                for _ in n()
+            ],
+        ),
+        trust_rule_count=rng.randint(0, 9),
+        repo_count=rng.randint(0, 9),
         trust_rules=_maybe(rng, [TrustRule(n=i, text=_text(rng)) for i in n()]),
         repos=_maybe(
             rng,
@@ -327,6 +400,7 @@ def _check_remote(remote: Snapshot) -> None:
         assert (
             _DATE_TIME.match(s)
             or re.fullmatch(r"[a-z][a-z0-9:_-]{0,63}", s)  # identifiers, enums, keys
+            or re.fullmatch(r"[A-Z][0-9]{1,6}", s)  # run codes
             or re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", s)  # version
         ), s
     # No local-only key at all, at any depth (left out, not null).
@@ -371,12 +445,39 @@ def test_brain_tool_calls_are_local_and_their_counts_remote(db: sqlite3.Connecti
     tools = local["claude_brain"]["tools"]
     assert [t["command"] for t in tools] == ["rm -rf x", f"git push {SECRET}", "git log -1"]
     assert tools[1]["decision"] == "gate" and tools[1]["write"] is True
-    assert local["brain_activity"] == {"calls_today": 3, "writes_today": 1}
+    activity = local["brain_activity"]
+    assert (activity["calls_today"], activity["writes_today"]) == (3, 1)
+    assert (activity["state"], activity["turns"]) == ("up", 2)
+    assert [(t["tool"], t["decision"], t["status"], t["write"]) for t in activity["recent"]] == [
+        ("bash", "gate", "error", True),
+        ("bash", "gate", "ok", True),
+        ("bash", "allowed", "ok", False),
+    ]
     remote = to_remote(s)
     _check_remote(remote)
     dumped = remote.model_dump(mode="json")
-    assert dumped["brain_activity"] == {"calls_today": 3, "writes_today": 1}
+    assert dumped["brain_activity"] == activity
+    assert "claude_brain" not in dumped
     assert "git push" not in json.dumps(dumped) and SECRET not in json.dumps(dumped)
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"),
+    [("Bash", "bash"), ("Read", "read"), ("mcp__claude_ai_Gmail__send", "mcp"),
+     ("Web Fetch", "other"), (f"{SECRET}/x", "other")],
+)  # fmt: skip
+def test_brain_tool_names_are_generalized(name: str, kind: str) -> None:
+    assert snap._tool_kind(name) == kind  # pyright: ignore[reportPrivateUsage]
+
+
+def test_pulse_brief_sources_are_slugs_and_most_urgent_first(db: sqlite3.Connection) -> None:
+    now = utcnow()
+    pulse.upsert(db, "core", "a", f"low {SECRET}", "low", None, False, 3600, now)
+    pulse.upsert(db, "core", "b", f"urgent {SECRET}", "urgent", None, False, 3600, now)
+    db.execute("UPDATE pulse_items SET source = 'Not A Slug' WHERE key = 'a'")
+    s = build_snapshot(db, load_settings(), started_at=now, now=now)
+    assert [(p.source, p.urgency) for p in s.pulse.brief] == [("core", "urgent"), ("other", "low")]
+    _check_remote(to_remote(s))
 
 
 @pytest.mark.parametrize("seed", range(300))
@@ -403,13 +504,18 @@ def test_empty_db(db: sqlite3.Connection) -> None:
     assert all("reason" not in h for h in data["health"])
     assert data["tasks"] == {"by_state": {}}
     assert data["slots"] == {"used": 0, "max": settings.claude.max_concurrent}
-    assert data["runs"] == {"by_state": {}, "items": []}
-    assert data["approvals"] == {"open": 0, "items": []}
-    assert data["questions"] == {"open": 0, "items": []}
-    assert data["pulse"] == {"open": 0, "items": []}
+    assert data["runs"] == {"by_state": {}, "items": [], "brief": []}
+    assert data["approvals"] == {"open": 0, "items": [], "brief": []}
+    assert data["questions"] == {"open": 0, "items": [], "brief": []}
+    assert data["pulse"] == {"open": 0, "items": [], "brief": []}
     assert data["extensions"] == []
     assert data["runner"]["set_up"] is False and data["runner"]["missing"]
+    assert data["runner"]["gaps"] == 1
     assert data["trust_rules"] == [] and data["repos"] == []
+    assert data["trust_rule_count"] == 0 and data["repo_count"] == 0
+    assert data["brain_activity"] == {
+        "calls_today": 0, "writes_today": 0, "state": None, "turns": 0, "recent": []
+    }  # fmt: skip
     _check_remote(to_remote(s))
 
 
@@ -546,23 +652,106 @@ def test_busy_db(db: sqlite3.Connection) -> None:
     morning_due = datetime.fromisoformat(jobs["morning"]["next_due"])
     assert (morning_due.hour, morning_due.minute) == (8, 0)
 
-    assert d["runner"] == {"set_up": True}
+    assert d["runner"] == {"set_up": True, "gaps": 0}
     assert d["trust_rules"] == [{"n": 1, "text": "ask before merge in dori"}]
     assert d["repos"] == [{"name": "dori", "mode": "push", "base": "main", "ci": True}]
 
     remote = to_remote(s)
     _check_remote(remote)
     rd = remote.model_dump(mode="json")
-    # The remote tier keeps the counts, states and times.
-    assert rd["runs"] == {"by_state": {"waiting": 1, "ready": 1}}
-    assert rd["approvals"] == {"open": 1}
-    assert rd["questions"] == {"open": 1}
-    assert rd["pulse"] == {"open": 1}
-    assert rd["runner"] == {"set_up": True}
+
+    # The remote tier keeps the counts, states, codes, kinds and times, and nothing else.
+    def at(d: dict[str, Any], *keys: str) -> dict[str, Any]:
+        return d | dict.fromkeys(keys)
+
+    assert [at(r, "started_at", "ended_at") for r in rd["runs"]["brief"]] == [
+        {"code": "R1", "state": "waiting", "scratch": False, "has_pr": False,
+         "started_at": None, "ended_at": None, "waiting_reason": "question"},
+        {"code": "R2", "state": "ready", "scratch": True, "has_pr": True,
+         "started_at": None, "ended_at": None, "waiting_reason": None},
+    ]  # fmt: skip
+    assert rd["runs"]["by_state"] == {"waiting": 1, "ready": 1}
+    assert rd["runs"].keys() == {"by_state", "brief"}
+    assert rd["approvals"]["open"] == 1
+    assert [at(a, "asked_at", "expires_at") for a in rd["approvals"]["brief"]] == [
+        {"level": "L2", "effect": "write", "needs_code": False,
+         "asked_at": None, "expires_at": None},
+    ]  # fmt: skip
+    assert "K4" not in json.dumps(rd)  # the approval's code stays local
+    assert rd["questions"]["open"] == 1
+    assert [at(q, "asked_at") for q in rd["questions"]["brief"]] == [
+        {"run_code": "R1", "options": 2, "asked_at": None}
+    ]
+    assert rd["pulse"]["open"] == 1
+    assert [at(p, "updated_at") for p in rd["pulse"]["brief"]] == [
+        {"source": "github", "urgency": "urgent", "state": "new", "updated_at": None}
+    ]
+    assert "ci/dori" not in json.dumps(rd) and "dori" not in json.dumps(rd)
+    assert rd["runner"] == {"set_up": True, "gaps": 0}
+    assert (rd["trust_rule_count"], rd["repo_count"]) == (1, 1)
     assert rd["extensions"] == d["extensions"]
     assert [h | {"reason": None} for h in rd["health"]] == [
         h | {"reason": None} for h in d["health"]
     ]
+
+
+def test_remote_tier_stays_under_the_relay_cap(db: sqlite3.Connection) -> None:
+    """Every brief list past its cap, the longest slugs, ten extensions: the remote tier still
+    fits the relay's 30 KiB with room to spare, as the pusher measures it (``data::text``)."""
+    now = utcnow()
+    task_id = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    for i in range(60):
+        r = runs.create(db, repo="r", ask=f"a{i}", principal="justin", session_id=f"s{i}",
+                        max_seconds=60)  # fmt: skip
+        runs.update(db, r.code, status="waiting", wait_reason="question", pr_number=i)
+        questions.ask(db, r.code, "ask", f"q{i}?", options=["a", "b", "c"], at=now)
+    for i in range(60):
+        ap.insert_approval(
+            db,
+            ap.NewApproval(
+                task_id=task_id,
+                intent_hash=f"h{i}",
+                tool="t",
+                effect=Effect.WRITE,
+                level=Level.L2,
+                summary="s",
+                approvers=("justin",),
+                code=f"K{i}",
+                expires_at=now + timedelta(minutes=30),
+            ),
+            now,
+        )
+    long = "x" * 63
+    for i in range(60):
+        pulse.upsert(db, f"s{long}", f"k/{i}", "t", "urgent", None, False, 3600, now)
+    for i in range(10):
+        name = f"x{i:02d}".ljust(60, "x")  # ``ext:<name>`` is 64 too
+        kv_set(db, f"health.ext:{name}", {"state": "degraded", "since": iso(now), "detail": "x"})
+        ext_store.save_extension(
+            db,
+            ext_store.ExtensionRecord(
+                name=name, source="repo:x", commit="c", tree_digest="d", manifest_sha="m",
+                manifest={"name": name, "jobs": [
+                    {"id": f"j{j}".ljust(64, "x"), "schedule": "*/5 * * * *"} for j in range(3)
+                ]},
+                installed_at=now, installed_by="justin",
+            ),
+        )  # fmt: skip
+    kv_set(db, SESSION_KV, {"session_id": "s", "turns": 999, "pid": 1})
+    for _ in range(40):
+        audit(db, TOOL_ACTION, tool=long, decision="granted", command="c", cwd="/x",
+              status="error", write=True)  # fmt: skip
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="deadbeef")
+    remote = to_remote(s)
+    _check_remote(remote)
+    data = remote.model_dump(mode="json")
+    assert len(data["runs"]["brief"]) == snap.RUN_BRIEF_ITEMS
+    assert len(data["approvals"]["brief"]) == snap.APPROVAL_BRIEF_ITEMS
+    assert len(data["questions"]["brief"]) == snap.QUESTION_BRIEF_ITEMS
+    assert len(data["pulse"]["brief"]) == snap.PULSE_BRIEF_ITEMS
+    assert len(data["brain_activity"]["recent"]) == snap.BRAIN_BRIEF_ITEMS
+    assert len(data["extensions"]) == 10 and len(data["health"]) >= 10
+    assert data_size(data) < 0.75 * pusher_mod.MAX_BYTES
 
 
 @pytest.mark.parametrize("seed", range(20))

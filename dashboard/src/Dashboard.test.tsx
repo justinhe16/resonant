@@ -179,14 +179,48 @@ describe("Dashboard, remote tier", () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
     mount(remote);
     await screen.findByRole("heading", { name: "Something is degraded" });
-    expect(screen.queryByRole("heading", { name: "Rules and repos" })).not.toBeInTheDocument();
+    // Rules and repos only as counts.
+    expect(screen.getByRole("heading", { name: "Rules and repos" })).toBeInTheDocument();
+    expect(screen.getByText("The rules and repo names are shown on the local dashboard only.")).toBeInTheDocument();
+    expect(screen.queryByText("trading-bot")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Component health/ }));
     expect(screen.queryByText("self-test timed out after 90s")).not.toBeInTheDocument();
     expect(screen.getByText("imessage")).toBeInTheDocument();
   });
 
-  it("shows counts but not texts for runs, approvals, questions and pulse", async () => {
+  it("lists runs, approvals, questions, pulse and brain calls by code, kind and time, without texts", async () => {
     mount(remote);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    const left = screen.getByTestId("column-left");
+    expect(within(left).getByText("R12")).toBeInTheDocument(); // active
+    expect(within(left).getByText("R11")).toBeInTheDocument();
+    expect(within(left).queryByText("R10")).not.toBeInTheDocument();
+    const right = screen.getByTestId("column-right");
+    expect(within(right).getByText("R10")).toBeInTheDocument(); // finished
+    expect(within(right).getByText("took 38 min")).toBeInTheDocument();
+    expect(screen.getAllByText("Asks, repos and links are shown on the local dashboard only.")).toHaveLength(2);
+    expect(screen.getByText("A change, needs its code")).toBeInTheDocument();
+    expect(screen.getByText("Approval texts and codes are shown on the local dashboard only.")).toBeInTheDocument();
+    expect(screen.getByText("2 options")).toBeInTheDocument();
+    expect(screen.getByText("Question texts are shown on the local dashboard only.")).toBeInTheDocument();
+    expect(screen.getByText("core")).toBeInTheDocument(); // a pulse source
+    expect(screen.getByText("Pulse titles are shown on the local dashboard only.")).toBeInTheDocument();
+    expect(screen.getAllByText("bash")).toHaveLength(2);
+    expect(screen.getByText("Its commands are shown on the local dashboard only.")).toBeInTheDocument();
+    expect(screen.getByTestId("brain-activity")).toHaveTextContent("4 tool calls today, 1 change");
+    expect(screen.getByText("3 turns")).toBeInTheDocument();
+    expect(screen.queryByText(/Add a dashboard job/)).not.toBeInTheDocument();
+    expect(screen.queryByText("r12-dashboard-ci")).not.toBeInTheDocument();
+    expect(screen.queryByText("K7Q2", { exact: false })).not.toBeInTheDocument();
+  });
+
+  it("shows counts only from a snapshot sent before the briefs", async () => {
+    const old = clone(remote);
+    delete old.runs.brief;
+    delete old.approvals.brief;
+    delete old.questions.brief;
+    delete old.pulse.brief;
+    mount(old);
     await screen.findByRole("heading", { name: "Something is degraded" });
     expect(screen.getAllByText("Run details are shown on the local dashboard only.")).toHaveLength(2);
     expect(screen.getByText("Question texts are shown on the local dashboard only.")).toBeInTheDocument();
@@ -239,13 +273,15 @@ describe("Dashboard, empty and failure states", () => {
   });
 
   it("never shows local-only texts on the remote tier, even if sent", async () => {
-    mount(clone(local, { tier: "remote" }));
-    expect((await screen.findAllByText("Run details are shown on the local dashboard only.")).length).toBe(2);
+    mount(clone(local, { tier: "remote", claude_brain: BRAIN }));
+    expect((await screen.findAllByText("Asks, repos and links are shown on the local dashboard only.")).length).toBe(2);
     expect(screen.queryByText(/Add a dashboard job/)).not.toBeInTheDocument();
     expect(screen.queryByText(/drops Python 3.11/)).not.toBeInTheDocument();
     expect(screen.queryByText("merge_pr github: example/resonant#81")).not.toBeInTheDocument();
     expect(screen.queryByText("Rain after 4pm")).not.toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Rules and repos" })).not.toBeInTheDocument();
+    expect(screen.queryByText("git push origin feat")).not.toBeInTheDocument();
+    expect(screen.queryByText("r10-quiet-hours")).not.toBeInTheDocument();
+    expect(screen.queryByText("Lint and typecheck pass; writing the workflow step now", { exact: false })).not.toBeInTheDocument();
   });
 
   it("contains a render error to its section", async () => {

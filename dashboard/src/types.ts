@@ -3,7 +3,9 @@
 //
 // One type covers both tiers. Fields marked "local only" are absent from a `remote`
 // snapshot (what leaves the Mini): no message bodies, asks, task contents, repo names or
-// URLs. The UI hides whatever the tier doesn't carry.
+// URLs. Each local-only `items` list has a `brief` beside it on both tiers (codes, kinds,
+// states and times, no text), so the remote page can still list them. The UI hides
+// whatever the tier doesn't carry.
 
 /** ISO 8601 timestamp, e.g. "2026-10-16T09:30:00+00:00". */
 export type Timestamp = string;
@@ -43,10 +45,24 @@ export interface RunItem {
   remote_url?: string; // RC-1, local tier only: the running session's Remote Control link
 }
 
+/** A run without its texts: no ask, repo, branch, note or link. Both tiers. */
+export interface RunBrief {
+  code: string;
+  state: string;
+  /** no repo */
+  scratch: boolean;
+  has_pr: boolean;
+  started_at: Timestamp | null;
+  ended_at: Timestamp | null;
+  waiting_reason: string | null;
+}
+
 export interface Runs {
   by_state: ByState;
   /** local only */
   items?: RunItem[];
+  /** both tiers; absent in snapshots from before it */
+  brief?: RunBrief[];
 }
 
 export interface ApprovalItem {
@@ -58,10 +74,28 @@ export interface ApprovalItem {
   expires_at: Timestamp | null;
 }
 
+/** A pending approval without its summary or code. Both tiers. */
+export interface ApprovalBrief {
+  level: string;
+  effect: "read" | "write" | "pay" | string;
+  /** the owner has to type its code to say yes */
+  needs_code: boolean;
+  asked_at: Timestamp;
+  expires_at: Timestamp | null;
+}
+
 export interface QuestionItem {
   run_code: string;
   text: string;
   options: string[];
+  asked_at: Timestamp;
+}
+
+/** A worker question without its text or options. Both tiers. */
+export interface QuestionBrief {
+  run_code: string;
+  /** how many options it offers */
+  options: number;
   asked_at: Timestamp;
 }
 
@@ -78,10 +112,21 @@ export interface PulseItem {
   updated_at: Timestamp;
 }
 
-export interface OpenList<T> {
+/** An open pulse item without its key or title. Both tiers. */
+export interface PulseBrief {
+  /** "core", the extension, or "other" */
+  source: string;
+  urgency: Urgency | string;
+  state: "new" | "told";
+  updated_at: Timestamp;
+}
+
+export interface OpenList<T, B> {
   open: number;
   /** local only */
   items?: T[];
+  /** both tiers; absent in snapshots from before it */
+  brief?: B[];
 }
 
 export interface Job {
@@ -103,9 +148,10 @@ export interface Runner {
   set_up: boolean;
   /** local only */
   missing?: string[];
+  /** how many things are missing (both tiers) */
+  gaps?: number;
 }
 
-/** BR-11: the Claude brain's long-lived session (local tier only). */
 /** One of the Claude brain's tool calls (PER-258). */
 export interface BrainTool {
   at: Timestamp;
@@ -119,6 +165,7 @@ export interface BrainTool {
   write: boolean;
 }
 
+/** BR-11: the Claude brain's long-lived session (local tier only). */
 export interface ClaudeBrain {
   state: "up" | "down";
   turns: number;
@@ -128,10 +175,24 @@ export interface ClaudeBrain {
   tools?: BrainTool[];
 }
 
-/** The Claude brain's tool calls today: counts, in both tiers. */
+/** A Claude brain tool call without its command or directory. Both tiers. */
+export interface BrainToolBrief {
+  at: Timestamp;
+  /** the tool's kind: "bash", "read", "mcp", ... or "other" */
+  tool: string;
+  decision: string;
+  status: "ok" | "error";
+  write: boolean;
+}
+
+/** The Claude brain's tool calls today, its session's state and its last calls, briefly. Both tiers. */
 export interface BrainActivity {
   calls_today: number;
   writes_today: number;
+  /** null before its first start */
+  state?: "up" | "down" | null;
+  turns?: number;
+  recent?: BrainToolBrief[];
 }
 
 export interface TrustRule {
@@ -162,9 +223,9 @@ export interface Snapshot {
   tasks: { by_state: ByState };
   slots: Slots;
   runs: Runs;
-  approvals: OpenList<ApprovalItem>;
-  questions: OpenList<QuestionItem>;
-  pulse: OpenList<PulseItem>;
+  approvals: OpenList<ApprovalItem, ApprovalBrief>;
+  questions: OpenList<QuestionItem, QuestionBrief>;
+  pulse: OpenList<PulseItem, PulseBrief>;
   extensions: Extension[];
   runner: Runner;
   /** local only */
@@ -175,6 +236,9 @@ export interface Snapshot {
   claude_brain?: ClaudeBrain;
   /** absent in snapshots from before PER-258 */
   brain_activity?: BrainActivity;
+  /** how many trust rules and repos (both tiers; the rules and repos are local only) */
+  trust_rule_count?: number;
+  repo_count?: number;
 }
 
 /** Runtime config read from config.json next to index.html. */

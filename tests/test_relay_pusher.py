@@ -293,6 +293,26 @@ async def test_snapshot_too_large_is_not_sent(
     assert fake.requests == []
 
 
+async def test_too_large_with_briefs_goes_without_them(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _busy(db, utcnow())
+    full = to_remote(build_snapshot(db, load_settings(), started_at=T0, now=utcnow(),
+                                    version="abcdef12")).model_dump(mode="json")  # fmt: skip
+    bare = pusher_mod.drop_briefs(full)
+    assert data_size(bare) < data_size(full)
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", data_size(bare) + 50)
+    fake = FakeSupabase()
+    outcome = await make_pusher(db, fake).push_once()
+    assert outcome.ok, outcome
+    data = json.loads(fake.requests[0].content)["p_data"]
+    for part in ("runs", "approvals", "questions", "pulse"):
+        assert data[part]["brief"] == []
+    assert data["brain_activity"]["recent"] == []
+    assert data["runs"]["by_state"] == full["runs"]["by_state"]
+    assert data["pulse"]["open"] == full["pulse"]["open"] == 1
+
+
 async def test_a_broken_snapshot_is_a_failed_push(db: sqlite3.Connection) -> None:
     async def broken() -> Snapshot:
         raise sqlite3.OperationalError(f"disk I/O error {LEAK}")
