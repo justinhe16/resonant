@@ -8,3 +8,6 @@
 {"reply": "what's the weather tomorrow?", "pending": ["A7"], "expect": {"decision": "unclear", "note": "unrelated"}}
 {"reply": "yes", "pending": ["P3"], "pay": true, "expect": {"decision": "unclear", "reason": "pay requires exact 'yes P3'"}}
 {"reply": "yes P3", "pending": ["P3"], "pay": true, "expect": {"decision": "approve", "code": "P3", "path": "parser"}}
+{"reply": "yes 1,3 D7", "pending": ["D7"], "expect": {"decision": "approve", "code": "D7", "path": "parser"}}
+{"reply": "yes 1,3", "pending": ["D7"], "expect": {"decision": "approve", "code": null, "path": "parser"}}
+{"reply": "yes 1 and 3", "pending": ["D7"], "expect": {"decision": "unclear"}}

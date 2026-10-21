@@ -64,7 +64,10 @@ binding, a batch is one unit: its code is the only one that names it, a plain ye
 it as one pending item, it needs the code when any of its approvals does (the strictest
 level), ``yes always`` is refused for it, and only the owner it was asked of can answer it
 (a member who approves one of its extensions gets ``nothing_pending``). Resolving it
-resolves every approval in it in one transaction (all or none), by text or by id.
+resolves every approval in it in one transaction (one refused rolls back the rest), by text
+or by id. ``yes 1,3 <code>`` (PER-255, text only) approves those changes and rejects the
+others; the code is needed when any picked change needs it (the strictest of the picks), and
+numbers that aren't the batch's changes, or picks for a lone approval, are refused.
 
 Expiry is lazy: every entry point first runs ``expire_due``. Every ``evaluate`` writes one
 ``gate.evaluate`` audit row; every resolution attempt writes one ``approval.resolve`` row.
@@ -542,9 +545,11 @@ class PolicyGate:
         now: datetime,
         event_id: str | None = None,
         always: bool = False,
+        picks: tuple[int, ...] | None = None,
     ) -> str | None:
-        """Resolve a lone approval, or every approval of a batch (all or none: one refused
-        rolls the others back). None on success, else the store's reason."""
+        """Resolve a lone approval, or every approval of a batch (one transaction: one refused
+        rolls the others back). ``picks`` (a batch's change numbers, PER-255): approve only
+        those and reject the rest. None on success, else the store's reason."""
         if unit.batch is None:
             return ap.resolve(
                 self.conn, unit.head.id, approved=approved, decided_by=actor, now=now,
@@ -552,9 +557,10 @@ class PolicyGate:
             )  # fmt: skip
         try:
             with atomic(self.conn):
-                for m in unit.members:
+                for n, m in enumerate(unit.members, 1):
+                    yes = approved and (picks is None or n in picks)
                     why = ap.resolve(
-                        self.conn, m.id, approved=approved, decided_by=actor, now=now,
+                        self.conn, m.id, approved=yes, decided_by=actor, now=now,
                         event_id=event_id,
                     )  # fmt: skip
                     if why is not None:
@@ -654,6 +660,7 @@ class PolicyGate:
                     now=now,
                     event_id=reply.event_id,
                     always=reply.always,
+                    picks=reply.picks,
                 )
             result = ResolveResult(ok=False, reason=reason)
             if reason is None and unit is not None:
@@ -682,6 +689,9 @@ class PolicyGate:
                 approval_id=target.id if target else None,
                 batch_id=unit.batch.id if unit is not None and unit.batch is not None else None,
                 approval_ids=[m.id for m in unit.members] if unit is not None else None,
+                picks=list(reply.picks) if reply.picks is not None else None,
+                approved_ids=_picked(unit, reply.picks, True),
+                rejected_ids=_picked(unit, reply.picks, False),
                 actor_identity=reply.actor_identity,
                 channel=reply.channel,
                 path=reply.path,
@@ -728,6 +738,11 @@ class PolicyGate:
             target = prompted[0] if prompted else mine[0]
         if not all(_sent_before(m, reply) for m in target.members):
             return None, "not_sent_before"
+        if reply.picks is not None:
+            if target.batch is None:
+                return None, "not_a_batch"
+            if any(n < 1 or n > len(target.members) for n in reply.picks):
+                return None, "unknown_pick"
         if reply.always and (
             target.batch is not None
             or not target.head.allow_always
@@ -748,7 +763,7 @@ class PolicyGate:
             seen = [u.head.id for u in self._units(opened, reply.actor)]
             if seen != [target.head.id]:
                 return None, "ambiguous"
-            if target.require_code and reply.decision == "approve":
+            if reply.decision == "approve" and target.needs_code(reply.picks):
                 return None, "code_required"
         return target, None
 
@@ -758,6 +773,14 @@ class PolicyGate:
             and reply.actor in a.approvers
             and self.principals.can(reply.actor, "approve", a.extension)
         )
+
+
+def _picked(unit: _Unit | None, picks: tuple[int, ...] | None, approved: bool) -> list[str] | None:
+    """For a ``yes 1,3`` reply's audit row (PER-255): the approvals it approves (``approved``)
+    or rejects, so each approval's decision is on record. None for any other reply."""
+    if unit is None or picks is None:
+        return None
+    return [m.id for n, m in enumerate(unit.members, 1) if (n in picks) == approved]
 
 
 class _BatchRefused(Exception):
@@ -814,9 +837,15 @@ class _Unit:
     @property
     def require_code(self) -> bool:
         """Any approval needs its code, or (a batch) one of them widens trust."""
-        if self.batch is not None and any(widens_trust(m.tool, m.extension) for m in self.members):
+        return self.needs_code(None)
+
+    def needs_code(self, picks: tuple[int, ...] | None) -> bool:
+        """Whether approving ``picks`` (a batch's change numbers; None: all of it) needs the
+        code: the strictest of those changes (L1, pay), or (a batch) one of them widens trust."""
+        chosen = [m for n, m in enumerate(self.members, 1) if picks is None or n in picks]
+        if self.batch is not None and any(widens_trust(m.tool, m.extension) for m in chosen):
             return True
-        return any(m.require_code for m in self.members)
+        return any(m.require_code for m in chosen)
 
     @property
     def level(self) -> Level:
@@ -856,6 +885,7 @@ class _Unit:
             level=self.level,
             require_code=self.require_code,
             expires_at=min(m.expires_at for m in self.members),
+            changes=len(self.members),
         )
 
     def as_batch(self) -> ApprovalBatch:

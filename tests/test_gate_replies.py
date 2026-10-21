@@ -45,6 +45,57 @@ def test_grammar(text: str, expected: ParsedReply) -> None:
     assert parse_reply(text) == expected
 
 
+# --- yes 1,3 (PER-255): approve some changes of a batch ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("yes 1,3", ParsedReply("approve", picks=(1, 3))),
+        ("yes 1,3 D7", ParsedReply("approve", "D7", picks=(1, 3))),
+        ("yes D7 1,3", ParsedReply("approve", "D7", picks=(1, 3))),
+        ("approve 2", ParsedReply("approve", picks=(2,))),
+        ("Yes 3, 1 d7.", ParsedReply("approve", "D7", picks=(1, 3))),  # sorted, case, period
+        ("yes 1 , 3", ParsedReply("approve", picks=(1, 3))),
+        ("yes 2,2,1", ParsedReply("approve", picks=(1, 2))),  # distinct
+        ("yes 9", ParsedReply("approve", picks=(9,))),  # the gate refuses numbers off the list
+        ("yes 20 A7", ParsedReply("approve", "A7", picks=(20,))),
+        ("\uff59\uff45\uff53 \uff11,\uff13", ParsedReply("approve", picks=(1, 3))),  # NFKC
+    ],
+)
+def test_picks(text: str, expected: ParsedReply) -> None:
+    assert parse_reply(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "yes 1 3",  # commas only, so a code or a stray number is never read as a pick
+        "yes 1,,3",
+        "yes ,1",
+        "yes 1,",
+        "yes 133",
+        "yes 0",
+        "yes 21",
+        "yes 01",
+        "yes 1,3?",
+        "no 1,3",
+        "deny 2",
+        "👍 1,3",
+        "yes always 1,3",
+        "yes 1,3 always",
+        "yes 1,3 A1",  # a look-alike code
+        "yes 1,3 D7 C4",
+        "1,3 yes",
+        "D7 yes 1,3",
+        "yes 1,3 with comments: ok",
+        "yes one and three",
+    ],
+)
+def test_bad_picks_are_not_replies(text: str) -> None:
+    assert parse_reply(text) is None
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

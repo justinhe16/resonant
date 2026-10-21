@@ -199,6 +199,7 @@ class PendingApproval:
     level: Level
     require_code: bool
     expires_at: datetime
+    changes: int = 1  # a batch's number of changes (BA-1); 1 for a lone approval
 
 
 @dataclass(frozen=True)
@@ -206,8 +207,9 @@ class ApprovalBatch:
     """One prompt for several pending approvals of one task (BA-1, ``open_batch``).
 
     ``code`` (its first approval's) answers all of them: ``yes <code>`` approves every one,
-    ``no`` rejects every one, and they expire together at ``expires_at``. It takes the
-    strictest of its approvals: ``require_code`` when any needs the code (L1, pay),
+    ``no`` rejects every one, ``yes 1,3 <code>`` (PER-255) approves only those and rejects the
+    rest, and they expire together at ``expires_at``. It takes the strictest of its approvals
+    (of the picked ones, for ``yes 1,3``): ``require_code`` when any needs the code (L1, pay),
     ``destructive`` when any is an L1 write. ``lines`` are the approvals' code-built
     summaries, in order. Asked only of ``principal`` (the owner)."""
 
@@ -256,8 +258,10 @@ class ApprovalReply:
     ``require_code`` approval (L1, pay) is approved only by ``yes <code>``; a plain ``no``
     may deny it. ``always`` (``yes always``) binds like a plain or coded yes, but only to an
     approval that offered it (``allow_always``: a worker's trust check, never
-    ``require_code``); for any other it is refused, never read as a plain yes. Anything
-    else is refused with a ``ReplyRefusal`` and Resonant re-asks.
+    ``require_code``); for any other it is refused, never read as a plain yes. ``picks``
+    (``yes 1,3``, PER-255) binds only to a batch: those changes are approved and the rest
+    rejected, and the code is required when any picked change needs it. Anything else is
+    refused with a ``ReplyRefusal`` and Resonant re-asks.
     ``all_in_batch``, ``batch_id``, ``confidence`` and ``path="classifier"`` are deferred
     (C4) and refused.
     """
@@ -276,12 +280,17 @@ class ApprovalReply:
     confidence: float | None = None
     comments: str | None = None
     always: bool = False  # "yes always": approve and add a trust rule (trust checks only)
+    # PER-255: "yes 1,3": the batch's change numbers (1-based) to approve; the rest are
+    # rejected. None: the reply answers the whole approval or batch.
+    picks: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.occurred_at.tzinfo is None:
             raise ValueError("occurred_at must be timezone-aware")
         if self.always and self.decision != "approve":
             raise ValueError("always is an approval")
+        if self.picks is not None and (self.decision != "approve" or self.always or not self.picks):
+            raise ValueError("picks are a plain approval of some changes")
 
 
 # Why ``resolve_reply`` refused a reply. A closed set the router maps to its replies:
@@ -292,9 +301,11 @@ class ApprovalReply:
 # - unknown_code: the code matches none of the actor's pending approvals.
 # - code_required: a plain "yes" for a require_code approval.
 # - not_sent_before: the approval's prompt was not sent to the actor before the reply.
-# - unsupported: not an iMessage parser reply, or a batch reply (deferred).
+# - unsupported: not an iMessage parser reply, or a ``yes all`` reply (not offered).
 # - always_unsupported: "yes always" for an approval that doesn't offer it (anything but a
 #   worker's trust check, and never a require_code one).
+# - not_a_batch: "yes 1,3" for a lone approval (PER-255).
+# - unknown_pick: "yes 1,3" with a number that isn't one of the batch's changes (PER-255).
 # - not_found, already_resolved, expired, task_not_waiting: the store refused (a race).
 ReplyRefusal = Literal[
     "nothing_pending",
@@ -304,6 +315,8 @@ ReplyRefusal = Literal[
     "not_sent_before",
     "unsupported",
     "always_unsupported",
+    "not_a_batch",
+    "unknown_pick",
     "not_found",
     "already_resolved",
     "expired",

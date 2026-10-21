@@ -454,7 +454,7 @@ def test_a_batch_is_one_row(db: sqlite3.Connection) -> None:
     assert [i["code"] for i in items] == ["C1", "C2", "C5"]
     assert "changes" not in items[0] and "changes" not in items[2]
     row = items[1]
-    assert row["summary"] == "3 changes, all or none"
+    assert row["summary"] == "3 changes"
     assert row["level"] == "L1"  # the strictest change's
     assert datetime.fromisoformat(row["asked_at"]) == asked
     assert datetime.fromisoformat(row["expires_at"]) == asked + timedelta(minutes=20)

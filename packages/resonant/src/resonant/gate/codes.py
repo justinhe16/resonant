@@ -104,6 +104,11 @@ def approval_text(
     return f"[{code}] {summary}? Reply yes / no"
 
 
+def pick_example(n: int) -> str:
+    """The ``yes 1,3`` example a batch of ``n`` changes shows (PER-255): numbers it has."""
+    return "1,3" if n >= 3 else "1"
+
+
 def batch_text(
     code: str,
     lines: Sequence[str],
@@ -111,21 +116,24 @@ def batch_text(
     require_code: bool = False,
     destructive: bool = False,
 ) -> str:
-    """One prompt for a batch of changes (BA-1): a numbered line per change, then one answer
-    for all of them. Lines are never clipped: each is the whole code-built summary a lone
-    prompt would show (already bounded: at most 3 args, each clipped and marked), so a yes
-    covers only what the owner saw. The batch takes its strictest change's level:
-    ``destructive`` (an L1 write) or ``require_code`` (L1, pay, or a change that widens trust)
-    means only ``yes <code>`` approves.
+    """One prompt for a batch of changes (BA-1): a numbered line per change, then the answer.
+    Lines are never clipped: each is the whole code-built summary a lone prompt would show
+    (already bounded: at most 3 args, each clipped and marked), so a yes covers only what the
+    owner saw. ``yes`` / ``no`` answer all of them; ``yes 1,3 <code>`` (PER-255) approves only
+    those and drops the rest. The batch takes its strictest change's level: ``destructive``
+    (an L1 write) or ``require_code`` (L1, pay, or a change that widens trust) means only
+    ``yes <code>`` approves all of it.
 
-    ``[D7] 4 changes, all or none:\\n1. linear: save issue id="RES-12" …\\n…\\nReply yes / no``
+    ``[D7] OK to make these 4 changes?\n1. linear: save issue id="RES-12" …\n…\n``
+    ``Reply yes / no, or yes 1,3 D7 for just those.``
     """
     shown = [f"{i}. {line}" for i, line in enumerate(lines, 1)]
-    head = f"[{code}] {len(lines)} changes, all or none:"
+    head = f"[{code}] OK to make these {len(lines)} changes?"
+    some = f"or yes {pick_example(len(lines))} {code} for just those."
     if destructive:
-        tail = f"Some can't be undone. Reply yes {code} / no"
+        tail = f"Some can't be undone. Reply yes {code} / no, {some}"
     elif require_code:
-        tail = f"Reply exactly: yes {code} / no {code}"
+        tail = f"Reply exactly: yes {code} / no {code}, {some}"
     else:
-        tail = "Reply yes / no"
+        tail = f"Reply yes / no, {some}"
     return "\n".join([head, *shown, tail])
