@@ -463,3 +463,33 @@ def test_stall_after_is_a_bounded_duration() -> None:
     for bad in ("30m", "169h", "4 hours"):
         with pytest.raises(ValidationError):
             PulseConfig(stall_after=bad)
+
+
+def test_the_weekly_github_scan_uses_the_source_time_index(db: sqlite3.Connection) -> None:
+    """PER-259: ``github_prs``'s query was a full scan of ``events`` (migration 020 adds
+    ``events_source_time``). The plan is read from the same SQL and parameters it runs with."""
+    now = utcnow().replace(microsecond=0) + H
+    install_github(db, now - 30 * 24 * H)
+    watch(
+        db,
+        ("pr_merged", "m1", pr(1, merged_at=iso(now - H))),
+        ("pr_active", "a2", pr(2, active_at=iso(now - 6 * H))),
+    )
+    with transaction(db):  # unrelated rows around them, so the index has something to skip
+        for i in range(50):
+            db.execute(
+                "INSERT INTO events (id, source, type, occurred_at, received_at, trace_id)"
+                " VALUES (?, 'imessage', 'message', ?, ?, 't')",
+                (f"msg{i}", iso(now - i * H), iso(now - i * H)),
+            )
+    params = (
+        f"ext:{ru.GITHUB}",
+        *(f"ext.{ru.GITHUB}.{t}" for t in ru.PR_EVENTS),
+        iso(now - ru.PR_WINDOW),
+    )
+    plan = [r["detail"] for r in db.execute("EXPLAIN QUERY PLAN " + ru._PR_SQL, params)]  # pyright: ignore[reportPrivateUsage]
+    assert any("USING INDEX events_source_time (source=? AND occurred_at>?)" in d for d in plan), (
+        plan
+    )
+    assert not any(d.startswith("SCAN events") for d in plan), plan
+    assert {p.number for p in ru.github_prs(db, now)[0]} == {1, 2}

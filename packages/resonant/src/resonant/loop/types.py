@@ -20,7 +20,9 @@ from typing import Any, Literal, Protocol
 from resonant_sdk import Event
 
 TaskStatus = Literal["queued", "running", "waiting", "done", "failed", "cancelled"]
-WaitReason = Literal["approval", "human_reply", "usage_reset", "ci", "veto"]
+# ``resource``: deferred because a worker slot, repo lock or turn is busy (PER-259), not because
+# of a usage limit or a person.
+WaitReason = Literal["approval", "human_reply", "usage_reset", "ci", "veto", "resource"]
 TERMINAL: frozenset[TaskStatus] = frozenset({"done", "failed", "cancelled"})
 
 # Priority comes from lane/principal, never from the model. Lower runs first.

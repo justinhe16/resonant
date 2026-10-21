@@ -664,6 +664,21 @@ def test_status_gets_a_runs_line() -> None:
     assert text.splitlines()[1] == "runs: 1 running, 2 queued, 1 ready to merge"
 
 
+def test_status_gets_a_waiting_line() -> None:
+    base = {"uptime_s": 60, "inflight": 0, "autonomy": "on", "paused": False}
+    assert "\n" not in render_status({**base, "waiting": {}})
+    assert "\n" not in render_status(base)
+    text = render_status({**base, "waiting": {"approval": 1, "resource": 1}})
+    assert text.splitlines()[1] == (
+        "waiting: 1 on a resource (all worker slots busy), 1 for approval"
+    )
+    every = {"approval": 1, "human_reply": 2, "usage_reset": 3, "ci": 4, "veto": 5, "odd": 6}
+    assert render_status({**base, "waiting": every}).splitlines()[1] == (
+        "waiting: 1 for approval, 2 for a reply, 3 on a usage reset, 4 on CI,"
+        " 5 in a veto window, 6 odd"
+    )
+
+
 async def test_status_tool_reports_runs(components: Components, db: sqlite3.Connection) -> None:
     make_run(db, status="ready")
     out = await call(components, "daemon_status", {})
