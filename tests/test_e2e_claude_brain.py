@@ -367,13 +367,17 @@ def _the_incident(w: World) -> None:
                       session_id="s1", max_seconds=60)  # fmt: skip
     runs.update(w.conn, run.code, status="running")
     runs.finish(w.conn, run.code, "failed", failure="it merged its own PR #2")
+    # Fixed times, well before the owner's texts (the fake chat.db rounds their time).
+    w.conn.execute("UPDATE runs SET ended_at = ?, updated_at = ? WHERE code = ?",
+                   (iso(now - timedelta(seconds=12)), iso(now - timedelta(seconds=12)),
+                    run.code))  # fmt: skip
     other = runs.create(w.conn, repo="mycelium", ask="Make the prompt", principal="justin",
                         session_id="s2", max_seconds=60)  # fmt: skip
     runs.update(w.conn, other.code, status="running")
     _c, item = pulse_store.upsert(w.conn, "core", pulse_store.run_key(run.code),
                                   "R1 failed · mycelium", "normal", None, True, 3600,
-                                  utcnow())  # fmt: skip
-    pulse_store.mark_told(w.conn, [item], utcnow())
+                                  now - timedelta(seconds=11))  # fmt: skip
+    pulse_store.mark_told(w.conn, [item], now - timedelta(seconds=10))
     message(
         w.conn, "review the surf prompt PR", reply="Started R1.", at=now - timedelta(minutes=25)
     )
