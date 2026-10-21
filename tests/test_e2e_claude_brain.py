@@ -443,8 +443,8 @@ async def test_an_untainted_l3_write_runs_with_its_report_line(
 async def test_the_change_cap_without_asking(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
-    """At most MAX_SIDE_EFFECTS (5, BA-1) changes run without asking per task; past it even
-    a change that would ask is refused (batches of asked changes: test_e2e_batch.py)."""
+    """At most MAX_SIDE_EFFECTS (5, BA-1) changes run without asking per task; past it
+    (PER-261) every change asks, in the batch (more in test_e2e_batch.py)."""
     async with start(resonant_home, chat, tmp_path) as w:
         w.model.triage = CLAUDE
         calls: list[dict[str, Any]] = [
@@ -453,9 +453,11 @@ async def test_the_change_cap_without_asking(
         ]
         calls.append({"name": "create_watch", "args": WATCH})
         w.claude(calls=calls, answer="{r5} | {r6}")
-        _ack, answer = await w.say("add six notes and a watch", replies=2)
-        assert answer.count("not run: at most 5 changes") == 2
-        assert len(w.executions("add_note")) == 5 and w.rows("SELECT 1 FROM approvals") == []
+        _ack, answer, prompt = await w.say("add six notes and a watch", replies=3)
+        assert answer.count("asked the owner:") == 2 and "not run" not in answer
+        assert "OK to make these 2 changes?" in prompt and 'add a note: "six"' in prompt
+        assert len(w.executions("add_note")) == 5
+        assert len(w.rows("SELECT 1 FROM approvals WHERE status = 'pending'")) == 2
 
 
 async def test_the_kill_switch_asks_for_everything(
@@ -720,7 +722,7 @@ async def test_a_claude_answer_in_history_makes_the_next_local_write_ask(
         )
         # "ok do it" doesn't name R4: the target check sends the first call back once
         w.model.push([("cancel_run", {"code": "R4"})], [("cancel_run", {"code": "R4"})])
-        (prompt,) = await w.say("ok do it")
+        (prompt,) = await w.say("ok do it")  # tainted: no early answer
         turns = [str(m["content"]) for m in w.model.requests[-1].messages]
         assert any("<claude_answer>" in t and "cancel R4" in t for t in turns)
         assert "yes / no" in prompt and "yes always" not in prompt
@@ -795,7 +797,7 @@ async def test_a_reply_after_an_untrusted_read_taints_the_next_turn(
         await w.say("what's in todo.txt?")
         # "ok do it" doesn't name note 1: the target check sends the first call back once
         w.model.push([("delete_note", {"id": 1})], [("delete_note", {"id": 1})])
-        (prompt,) = await w.say("ok do it")
+        (prompt,) = await w.say("ok do it")  # tainted: no early answer
         assert "yes / no" in prompt
         assert w.executions("delete_note") == []
         assert _gated(w, "delete_note") == {("NeedsApproval", "tainted")}

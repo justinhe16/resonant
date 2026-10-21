@@ -273,20 +273,27 @@ async def test_preview_is_the_pending_text_and_read_only() -> None:
 # --- core items ---------------------------------------------------------------------------------
 
 
-async def test_approval_is_mentioned_once_after_the_remention_delay() -> None:
+async def test_a_pending_approval_is_never_a_pulse_item() -> None:
+    """PER-261: ``core/remind`` texts the reminder at half the TTL; the pulse says nothing."""
     async with harness() as h:
         base = local(10, 13, 9)
         approval(h.db, "A7", base)  # created at `base`, expires an hour later
         h.settings.pulse.remention_after = "30m"
-        await pulse(h, base + timedelta(minutes=10), now=base + timedelta(minutes=10))
-        assert h.channel.sent == []  # too young
+        for minutes in (10, 40, 50):
+            at = base + timedelta(minutes=minutes)
+            await pulse(h, at, now=at)
+        assert h.channel.sent == []
+        assert [i.key for i in ps.open_items(h.db, base + timedelta(minutes=50))
+                if i.key.startswith("approval/")] == []  # fmt: skip
+
+
+async def test_an_approval_item_from_before_is_cleared_silently() -> None:
+    async with harness() as h:
+        base = local(10, 13, 9)
+        approval(h.db, "A7", base)
+        report(h, "core", "approval/a7", "✋ A7 still waiting: restart Resonant")
         await pulse(h, base + timedelta(minutes=40), now=base + timedelta(minutes=40))
-        assert h.channel.texts() == ["btw:\n✋ A7 still waiting: restart Resonant"]
-        await pulse(h, base + timedelta(minutes=50), now=base + timedelta(minutes=50))
-        assert len(h.channel.sent) == 1  # once
-        # Resolved (expired here): the item clears without a message.
-        await pulse(h, base + timedelta(hours=2), now=base + timedelta(hours=2))
-        assert len(h.channel.sent) == 1
+        assert h.channel.sent == []
         item = ps.get(h.db, "core", "approval/a7")
         assert item is not None and item.cleared and not item.changed
 

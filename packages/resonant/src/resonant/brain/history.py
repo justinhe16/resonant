@@ -108,6 +108,15 @@ class Exchange:
     # (``claude_hops``; None: a clean turn). A one-shot answer always counts as outside.
     claude_session: bool = False
     claude_hops: int | None = None
+    # PER-261: the turn's answer that went out before its batch prompt (``EARLY_ANSWER``);
+    # ``reply`` is then the batch's result, once it was answered.
+    answer: str | None = None
+
+    @property
+    def said(self) -> str | None:
+        """Everything we replied: the early answer, then the reply."""
+        parts = [p for p in (self.answer, self.reply) if p]
+        return "\n".join(parts) if parts else None
 
     def _sources(self) -> list[tuple[int, str]]:
         found: list[tuple[int, str]] = []
@@ -165,6 +174,11 @@ def reply_taint(cp: dict[str, Any], distance: int, window: int = DEFAULT_TAINT_H
     return hops + distance
 
 
+# PER-261: the checkpoint key of a brain turn's answer sent before its batch prompt
+# (``LocalRunner.close_batch``).
+EARLY_ANSWER = "early_answer"
+
+
 def reply_of(cp: dict[str, Any] | None) -> str | None:
     """The reply a task sent (``reply``, else ``fast_reply``), as ``local._prior_reply``."""
     if cp is None:
@@ -186,6 +200,7 @@ def _exchanges(rows: list[tuple[Any, dict[str, Any] | None]]) -> list[Exchange]:
             continue
         claude = cp.get("claude_reply")
         said = claude if isinstance(claude, str) and claude.strip() else None
+        early: Any = cp.get(EARLY_ANSWER)
         hops = taint_hops(cp)
         raw_hops: Any = cp.get("claude_hops")
         c_hops = raw_hops if isinstance(raw_hops, int) and not isinstance(raw_hops, bool) else None
@@ -193,7 +208,8 @@ def _exchanges(rows: list[tuple[Any, dict[str, Any] | None]]) -> list[Exchange]:
             Exchange(event.id, event.occurred_at, body, reply_of(cp), said,
                      tainted=hops is not None, hops=hops or 0,
                      claude_session=cp.get("claude_session") is True,
-                     claude_hops=None if c_hops is None else max(c_hops, 0))
+                     claude_hops=None if c_hops is None else max(c_hops, 0),
+                     answer=early if isinstance(early, str) and early.strip() else None)
         )  # fmt: skip
     return out
 
@@ -306,8 +322,8 @@ def replayed(
         messages.append(
             {"role": "user", "content": wrap_untrusted(ex.text, max_chars=USER_TURN_CHARS)}
         )
-        if ex.reply is not None:
-            reply = clip(drop_controls(ex.reply), REPLY_TURN_CHARS)
+        if ex.said is not None:
+            reply = clip(drop_controls(ex.said), REPLY_TURN_CHARS)
             messages.append({"role": "assistant", "content": reply})
         if ex.claude is not None:
             messages.append(claude_turn(ex.claude))
@@ -414,7 +430,7 @@ def _fold_reply(ex: Exchange, limit: int) -> str:
     """An exchange's answer as a fold sees it: never outside text (BR-10b), at any hop."""
     if ex.claude is not None or ex.tainted:
         return OUTSIDE_REPLY
-    return clip(flat(ex.reply), limit) if ex.reply else "(no reply)"
+    return clip(flat(ex.said), limit) if ex.said else "(no reply)"
 
 
 PRIMER_EXCHANGES = 6

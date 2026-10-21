@@ -95,7 +95,7 @@ from functools import partial
 from typing import Any, cast
 
 from resonant import killswitch
-from resonant.brain.history import DEFAULT_TAINT_HOPS, reply_taint
+from resonant.brain.history import DEFAULT_TAINT_HOPS, EARLY_ANSWER, reply_taint
 from resonant.brain.text import flat
 from resonant.executor import ToolResult
 from resonant.extensions.notify import take_baseline
@@ -531,6 +531,10 @@ class LocalRunner:
         spans: SpanFactory,
     ) -> StepResult:
         cp = task.checkpoint
+        if ("batch" in cp or "call" in cp) and (
+            failed := await self._answer_first(task, principal, cp, spans)
+        ) is not None:
+            return failed  # PER-261: a retried step sends the turn's answer before its prompt
         if "batch" in cp:  # BA-1: changes that wait on one prompt (before any ``call``)
             return await self._batch(task, principal, cp, ctx, spans)
         if "call" in cp:
@@ -738,15 +742,20 @@ class LocalRunner:
         spans: SpanFactory,
         pin: Mapping[str, Any] | None = None,
         decision: NeedsApproval | None = None,
+        answer: str | None = None,
     ) -> StepResult:
         """The turn is over and changes wait on the owner: pin the batch with the turn's
         code-built ``lines`` (what ran, and why it stopped) and ask (``_batch``). ``pin``:
         the turn's taint, kept for the next turn's history. ``decision``: one change, and the
-        gate's ask for it this turn: prompted as is (the plain single prompt, as before BA-1)."""
+        gate's ask for it this turn: prompted as is (the plain single prompt, as before BA-1).
+        ``answer`` (PER-261): the model's answer to the rest of the message, pinned as
+        ``early_answer`` and sent before the prompt (``_answer_first``)."""
         latest = get_task(self.conn, task.id)
         stored = latest.checkpoint if latest is not None else task.checkpoint
         cp = {k: v for k, v in stored.items() if k != "call"}  # an allowed call: done by now
         cp.update(pin or {})
+        if answer is not None:
+            cp[EARLY_ANSWER] = answer
         if (
             len(items) == 1
             and decision is not None
@@ -758,11 +767,36 @@ class LocalRunner:
                 cp["tainted"] = True
             if not ctx.save(checkpoint=cp):
                 return Fail("task is no longer running")
+            if (failed := await self._answer_first(task, principal, cp, spans)) is not None:
+                return failed
             return after_effects(lines, await self._ask(task.id, decision, cp, spans))
         cp.update(batch=[i.to_json() for i in items], effects=lines)
         if not ctx.save(checkpoint=cp):
             return Fail("task is no longer running")
+        if (failed := await self._answer_first(task, principal, cp, spans)) is not None:
+            return failed
         return await self._batch(task, principal, cp, ctx, spans)
+
+    async def _answer_first(
+        self, task: Task, principal: str, cp: Mapping[str, Any], spans: SpanFactory
+    ) -> Fail | None:
+        """PER-261: send the turn's ``early_answer`` (pinned with its batch or call), once:
+        the channel dedupes it (``answer:<task id>``), so every later step of the task may
+        call this. A Fail when it can't go out (retryable when the channel says so)."""
+        text = cp.get(EARLY_ANSWER)
+        if not isinstance(text, str) or not text.strip():
+            return None
+        with spans(f"runner.{self.name}.answer_first", reply_len=len(text)) as s:
+            try:
+                await self.channel.send(principal, text, dedupe_key=f"answer:{task.id}")
+            except ChannelRefused as e:
+                s.set(ok=False, error=type(e).__name__)
+                return Fail(f"reply refused: {e}")
+            except ChannelError as e:
+                s.set(ok=False, error=type(e).__name__)
+                return Fail(f"reply send failed: {e}", retryable=True)
+            s.set(ok=True)
+        return None
 
     async def _batch(
         self,

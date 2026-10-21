@@ -241,6 +241,13 @@ class ApprovalResolution:
     actor_identity: str  # e.g. "slack:U01" or "cli"
     path: ApprovalPath
     comments: str | None = None
+    # PER-261 (``resonant approvals approve --always``): approve and save the ``yes always``
+    # rule the prompt offered; refused (``always_unsupported``) for one that offered none.
+    always: bool = False
+
+    def __post_init__(self) -> None:
+        if self.always and not self.approved:
+            raise ValueError("always is an approval")
 
 
 @dataclass(frozen=True)

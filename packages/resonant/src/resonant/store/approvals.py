@@ -18,7 +18,7 @@ import json
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal, cast
 
 from resonant.gate.types import ResolvedApproval, ResolveResult
@@ -108,6 +108,7 @@ class Approval:
     always_scope: str | None = None  # a tool approval's yes always rule (migration 013)
     always_action: str | None = None
     phrased: bool = False  # PER-268: the prompt reads "OK to <summary>? [P3] yes / no"
+    reminded_at: datetime | None = None  # PER-261: its expiry reminder went out (migration 021)
 
     def sent_at(self, principal: str) -> datetime | None:
         """When the prompt was first sent to ``principal`` (None if it never was)."""
@@ -157,6 +158,7 @@ def _row_to_approval(r: sqlite3.Row) -> Approval:
         always_scope=r["always_scope"],
         always_action=r["always_action"],
         phrased=bool(r["phrased"]),
+        reminded_at=_dt(r["reminded_at"]),
     )
 
 
@@ -598,6 +600,72 @@ def set_expiry(conn: sqlite3.Connection, approval_ids: Sequence[str], at: dateti
         conn.execute(
             "UPDATE approvals SET expires_at = ? WHERE id = ? AND status = 'pending'",
             (iso(at), approval_id),
+        )
+
+
+# PER-261: no reminder when less than this is left (it would land as the approval expires).
+REMIND_MIN_LEFT = timedelta(minutes=1)
+
+
+@dataclass(frozen=True)
+class Reminder:
+    """One prompt whose expiry reminder is due (``reminders_due``): a lone approval, or a
+    batch as one (its code, every approval in it). ``to``: who got the prompt."""
+
+    approval_ids: tuple[str, ...]
+    code: str
+    task_id: str | None
+    expires_at: datetime
+    to: tuple[str, ...]
+
+
+def reminders_due(conn: sqlite3.Connection, now: datetime) -> list[Reminder]:
+    """Prompts that are past half their TTL, still pending and not yet reminded, oldest
+    first. The TTL runs from the approval's creation, or for a batch from when it was opened
+    (``open_batch`` gives its approvals one new expiry). An approval nobody was prompted for
+    yet (pinned in a turn that hasn't asked) is left out, as is one with under
+    ``REMIND_MIN_LEFT`` to go."""
+    rows = [
+        _row_to_approval(r)
+        for r in conn.execute(
+            """SELECT * FROM approvals WHERE status = 'pending' AND expires_at > ?
+                   AND reminded_at IS NULL AND code IS NOT NULL
+               ORDER BY created_at, id""",
+            (iso(now),),
+        ).fetchall()
+    ]
+    index = batches_of(conn, [a.id for a in rows])
+    by_id = {a.id: a for a in rows}
+    out: list[Reminder] = []
+    seen: set[str] = set()
+    for a in rows:
+        batch = index.get(a.id)
+        if batch is not None and batch.used_at is None:
+            if batch.id in seen:
+                continue
+            seen.add(batch.id)
+            members = [by_id[i] for i in batch.approval_ids if i in by_id]
+            if len(members) != len(batch.approval_ids):
+                continue  # one was decided or reminded on its own: not one prompt any more
+            start, head = batch.created_at, members[0]
+            to = (batch.principal,) if head.sent_at(batch.principal) is not None else ()
+        else:
+            members, start, head = [a], a.created_at, a
+            to = tuple(p for p in a.approvers if a.sent_at(p) is not None)
+        expires = min(m.expires_at for m in members)
+        if not to or now < start + (expires - start) / 2 or expires - now < REMIND_MIN_LEFT:
+            continue
+        assert head.code is not None
+        out.append(Reminder(tuple(m.id for m in members), head.code, head.task_id, expires, to))
+    return out
+
+
+def mark_reminded(conn: sqlite3.Connection, approval_ids: Sequence[str], now: datetime) -> None:
+    """Record that these approvals' expiry reminder went out (once: never overwritten)."""
+    for approval_id in approval_ids:
+        conn.execute(
+            "UPDATE approvals SET reminded_at = ? WHERE id = ? AND reminded_at IS NULL",
+            (iso(now), approval_id),
         )
 
 

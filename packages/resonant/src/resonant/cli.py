@@ -482,6 +482,7 @@ _REFUSALS = {
     "already_resolved": "already resolved",
     "expired": "expired",
     "task_not_waiting": "its task is no longer waiting",
+    "always_unsupported": "it doesn't offer yes always",
 }
 
 
@@ -606,7 +607,7 @@ def approvals_show(
     typer.echo(f"args        {shown}")
 
 
-def _resolve(key: str, *, approved: bool) -> None:
+def _resolve(key: str, *, approved: bool, always: bool = False) -> None:
     verb = "approved" if approved else "denied"
     settings = load_settings()
     principals = _principals(settings)
@@ -627,6 +628,7 @@ def _resolve(key: str, *, approved: bool) -> None:
                 actor=principals.owner,
                 actor_identity="cli",
                 path="cli",
+                always=always,
             )
         )
         if not result.ok:
@@ -635,13 +637,40 @@ def _resolve(key: str, *, approved: bool) -> None:
                 reason = f"already {cur.status}"
             typer.echo(f"error: not {verb}: {reason}", err=True)
             raise typer.Exit(1)
+        rule = _rule_saved(conn, a.id) if always else None
+    if always:
+        verb += " (yes always)"
     typer.echo(f"{verb}; task woken (the daemon picks it up on its next tick)")
+    if rule:
+        typer.echo(rule)
+
+
+def _rule_saved(conn: sqlite3.Connection, approval_id: str) -> str | None:
+    """``rule added: <text> (rule 7)`` for the standing allow a ``yes always`` saved."""
+    from resonant.store import trust as trust_store
+
+    row = ap.get_approval(conn, approval_id)
+    if row is None or not row.always_scope or not row.always_action:
+        return None  # a worker's trust check: its run reads the answer
+    rules = trust_store.rules_for(conn, row.always_scope, row.always_action)
+    rule = next((r for r in rules if r.effect == "allow"), None)
+    return f"rule added: {rule.text} (rule {rule.id})" if rule is not None else None
 
 
 @approvals_app.command("approve")
-def approvals_approve(key: ApprovalKey) -> None:
+def approvals_approve(
+    key: ApprovalKey,
+    always: Annotated[
+        bool,
+        typer.Option(
+            "--always",
+            help="Approve and save the yes always rule its prompt offered (as a 'yes always' "
+            "reply). Refused for one that offered none.",
+        ),
+    ] = False,
+) -> None:
     """Approve a pending approval and wake its task. Exit 1 if refused."""
-    _resolve(key, approved=True)
+    _resolve(key, approved=True, always=always)
 
 
 @approvals_app.command("deny")

@@ -11,6 +11,14 @@ system text the brains see, PER-268):
   channel dedupes by ``approval_dedupe_key``.
 - ``reached`` empty with no transient error means no approver is reachable: the caller
   fails for good.
+
+``remind_due`` (PER-261, the ``core/remind`` job, every minute) sends each prompt one
+reminder at half its TTL, to whoever got it: ``[A7] still waiting, expires in 15 min``. A
+batch is one prompt (its code, timed from when it was opened). Deduped per approval and
+approver (``approval:<id>:remind:<principal>``), recorded on the approvals (``reminded_at``,
+once the send is settled: sent, or refused for good) and as a system text the brains see. It
+carries the code and the time only, never args, so it never taints a turn. It replaces the
+pulse's ``core/approval/<code>`` re-mention.
 """
 
 from __future__ import annotations
@@ -18,7 +26,8 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any
 
 from resonant.gate import ApprovalBatch, NeedsApproval
 from resonant.gateway.channel import (
@@ -31,8 +40,17 @@ from resonant.gateway.channel import (
 from resonant.store import approvals as ap
 from resonant.store import system_texts
 from resonant.store.audit import audit
-from resonant.store.db import transaction
+from resonant.store.db import atomic, transaction, utcnow
+from resonant.store.outbound import reminder_key
 from resonant.store.tasks import get_task
+
+if TYPE_CHECKING:
+    from resonant.executor import CallContext
+    from resonant.extensions.scheduler import CoreDeps, CoreJob
+
+REMIND_JOB_ID = "remind"
+REMIND_SCHEDULE = "* * * * *"
+REMIND_CATCHUP = timedelta(minutes=2)
 
 
 @dataclass(frozen=True)
@@ -155,3 +173,62 @@ async def _prompt(
         system_texts.record(conn, approver, "approval", prompt.text(), ref=key, task_id=task_id,
                             now=at, outside=outside)  # fmt: skip
     return PromptResult(tuple(reached), tuple(unreachable), error)
+
+
+def reminder_text(code: str, left: timedelta) -> str:
+    """``[A7] still waiting, expires in 15 min`` (whole minutes, at least 1)."""
+    minutes = max(1, round(left.total_seconds() / 60))
+    return f"[{code}] still waiting, expires in {minutes} min"
+
+
+async def remind_due(conn: sqlite3.Connection, channel: Channel, now: datetime) -> int:
+    """Send every due expiry reminder (``store.approvals.reminders_due``) once; how many
+    went out. A prompt is marked reminded once each of its approvers got the reminder or is
+    unreachable for good (``ChannelRefused``); after a transient failure it is tried again on
+    the next run (the ones already sent are deduped)."""
+    with atomic(conn):
+        ap.expire_due(conn, now)
+        due = ap.reminders_due(conn, now)
+    sent = 0
+    for r in due:
+        settled = True
+        text = reminder_text(r.code, r.expires_at - now)
+        head = ap.get_approval(conn, r.approval_ids[0])
+        if head is None or head.status != "pending":
+            continue  # answered while the earlier reminders went out: nothing waits
+        for principal in r.to:
+            key = reminder_key(r.approval_ids[0], principal)
+            try:
+                await channel.send(principal, text, dedupe_key=key)
+            except ChannelRefused:
+                continue
+            except ChannelError:
+                settled = False
+                continue
+            sent += 1
+            system_texts.record(conn, principal, "approval", text, ref=key, task_id=r.task_id,
+                                now=now)  # fmt: skip
+        if settled:
+            with atomic(conn):
+                ap.mark_reminded(conn, r.approval_ids, now)
+                audit(conn, "approval.reminded", task_id=r.task_id, code=r.code,
+                      approval_ids=list(r.approval_ids), to=list(r.to),
+                      expires_at=r.expires_at.isoformat())  # fmt: skip
+    return sent
+
+
+def remind_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> CoreJob | None:
+    """The ``CORE_JOBS`` factory for ``core/remind``. None with no channel or no owner."""
+    from resonant.extensions.scheduler import CoreJob
+
+    channel = deps.channel
+    if channel is None or deps.owner is None:
+        return None
+    conn = deps.conn
+
+    async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
+        del args, ctx
+        return {"reminded": await remind_due(conn, channel, clock())}
+
+    return CoreJob(id=REMIND_JOB_ID, schedule=REMIND_SCHEDULE, run=run, catchup=REMIND_CATCHUP,
+                   timeout_s=30.0)  # fmt: skip

@@ -295,6 +295,30 @@ async def test_request_approval_failure_is_not_recorded(
     assert len(runner.calls) == 1
 
 
+async def test_outbound_notes_a_claude_answer_before_and_a_prompt_only_after_sending(
+    principals: Principals, db: sqlite3.Connection, ft: FakeTime
+) -> None:
+    """PER-261: a failed send of a prompt or reminder must not count as shown again (it would
+    hide an earlier Claude answer); a failed Claude answer still counts (asks the code)."""
+    from resonant.store import outbound
+
+    def keys() -> list[object]:
+        raw = db.execute("SELECT value FROM kv WHERE key = ?", (outbound.KV_PREFIX + "justin",))
+        row = raw.fetchone()
+        return [e["key"] for e in json.loads(row[0])] if row else []
+
+    good = make(principals, db, FakeRunner(), ft)
+    await good.send("justin", "[A7] OK to close?", dedupe_key="approval:a7:prompt:justin")
+    bad = make(principals, db, FakeRunner(result=OsaResult(1, "", "boom")), ft)
+    with pytest.raises(ChannelSendError):
+        await bad.send("justin", "Claude: reply yes to go ahead", dedupe_key="ask:t1")
+    with pytest.raises(ChannelSendError):
+        await bad.send("justin", "[A7] still waiting", dedupe_key="approval:a7:remind:justin")
+    assert keys() == ["approval:a7:prompt:justin", "ask:t1"]  # the failed reminder: never
+    keys_a7 = {"approval:a7:prompt:justin", "approval:a7:remind:justin"}
+    assert outbound.claude_since(db, "justin", keys_a7, ft.now + timedelta(minutes=1))
+
+
 # --- outbound allowlist -------------------------------------------------------------------
 
 
