@@ -5,8 +5,10 @@ said like an employee's update rather than one line per event::
     Merged: R4 add dark mode (#12), resonant#40 fix login
     R7 done: PR #16 (CI green) · https://github.com/…/pull/16
     Looks like R3 add retries (~5h quiet) got dropped. You should take a look.
+    Waiting on you to merge: R5 fix login (#16, ~6h)
     Review requested: dori#12 bump deps
     Still working on: R8 api refactor, R9 docs pass (waiting for your answer), dori#41 cache
+    Quiet: R2 cache layer (~9h)
 
 It combines Resonant's own runs (the ``core`` / ``run/<code>`` items of
 ``runners/reports.py``) with, when the github extension is installed and enabled, the
@@ -24,10 +26,21 @@ the pulse's exactly-once delivery cover it):
 - ``stall/<run or pr>``: a run or open PR with no activity for ``pulse.stall_after`` (4h).
   Its state is when the quiet began, so it is said once, and again only after new activity
   and a new quiet stretch. It is cleared silently when the activity resumes or the run ends.
+  How it reads depends on what the quiet means (PER-266): a ``ready`` run's PR waits on the
+  owner (``Waiting on you to merge: …``), a queued run whose task waits on ``resource``
+  (every worker slot busy, PER-259) is ``Queued behind other runs: …``, and anything else
+  ``Looks like … got dropped``. The key and state are the same for all three, so the
+  wording never makes an old stall news again.
 
 **Context** (listed when there is news, never a reason to send): ``Still working on``, the
 runs going (their items, which are told as they are written) and the open PRs with activity
-inside the stall window. A stalled one is left out of it.
+inside the stall window. A stalled one is left out of it; once told it stays visible
+(:func:`quiet_items`) on the last line, ``Quiet: R3 add retries (~6h)`` (or on the waiting
+or queued line, by its kind), until it moves.
+
+An untold ``merged/`` item written more than ``OLD_MERGE`` ago (held through quiet hours, a
+pause or a long silence) is dropped at the next refresh, cleared and told without a word: a
+merge from days ago isn't news.
 
 Activity: a running run's transcript (``<state>/transcripts/R<n>.jsonl``: every stream line,
 the worker's notes and commands included) or its start; a queued run's creation; a ``ready``
@@ -82,6 +95,7 @@ GITHUB = "github"
 PR_EVENTS = ("pr_active", "pr_merged", "pr_closed", "review_requested")
 NEWS_WINDOW = timedelta(hours=48)  # a merge or review request older than this isn't news
 PR_WINDOW = timedelta(days=7)  # the github events read; a PR quiet longer drops out
+OLD_MERGE = timedelta(days=3)  # an untold merged/ item older than this is dropped, not said
 READY_WINDOW = timedelta(days=7)  # a ready run's PR older than this is no longer watched
 STALL_AFTER = timedelta(hours=4)  # the default of ``pulse.stall_after``
 WATCH_FRESH = timedelta(minutes=30)  # three missed 10-minute watches: PR data is stale
@@ -95,6 +109,7 @@ _MERGED = re.compile(r"^(R\d+) merged: PR #(\d+) · \S+(?: · (.+))?$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 _BAD_KEY_CHARS = re.compile(r"[^a-z0-9/._:-]")
 _WAITING = ("waiting for your answer", "waiting for usage reset")
+_QUIET_SUFFIX = " quiet)"
 # Only placeholders are interpolated; every value is bound.
 _PR_SQL = (
     "SELECT type, payload, occurred_at FROM events WHERE source = ? AND type IN"  # noqa: S608
@@ -105,12 +120,16 @@ _PR_SQL = (
 @dataclass(frozen=True)
 class Rollup:
     """What the pure rendering needs beyond the items: ``labels`` (run code ->
-    ``R4 add dark mode``), ``working`` (open PRs with recent activity, named) and
-    ``stalled`` (run codes with an open stall item, left out of ``Still working on``)."""
+    ``R4 add dark mode``), ``working`` (open PRs with recent activity, named),
+    ``stalled`` (run codes with an open stall item, left out of ``Still working on``), and
+    the stalled runs whose quiet is the owner's merge (``ready``) or the slot limit
+    (``queued``)."""
 
     labels: Mapping[str, str] = field(default_factory=dict[str, str])
     working: tuple[str, ...] = ()
     stalled: frozenset[str] = frozenset()
+    ready: frozenset[str] = frozenset()
+    queued: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -170,6 +189,12 @@ def quiet_text(quiet: timedelta) -> str:
 
 def _code(item: store.Item) -> str:
     return item.key.removeprefix(RUN_PREFIX).upper()
+
+
+def _stall_code(item: store.Item) -> str | None:
+    """``R3`` for a run's stall item (``stall/run-r3``), None for a PR's."""
+    rest = item.key.removeprefix(STALL_PREFIX)
+    return rest.removeprefix("run-").upper() if rest.startswith("run-") else None
 
 
 def _key(prefix: str, name: str) -> str:
@@ -258,14 +283,37 @@ def entries(
         named = set(line[1])
         out += [d for d in details if d[1][0] in named]
     out += [(worker_line(i), (i,)) for i in others if i.urgency != "urgent"]
-    stalls = [(i.title, i) for i in mine if i.key.startswith(STALL_PREFIX)]
-    if line := joined("Looks like ", stalls, " got dropped. You should take a look."):
+    stalls: dict[str, list[tuple[str, store.Item | None]]] = {"dropped": [], "ready": [],
+                                                               "queued": []}  # fmt: skip
+    for i in mine:
+        if i.key.startswith(STALL_PREFIX):
+            stalls[_stall_kind(i, r)].append((i.title, i))
+    told = sorted(context, key=lambda i: (i.updated_at, i.key))
+    quiet: list[tuple[str, store.Item | None]] = []
+    for i in told:
+        if not i.key.startswith(STALL_PREFIX) or i.cleared or (i.source, i.key) in keys:
+            continue
+        kind = _stall_kind(i, r)
+        name = (
+            i.title.removesuffix(_QUIET_SUFFIX) + ")"
+            if i.title.endswith(_QUIET_SUFFIX)
+            else i.title
+        )
+        (quiet if kind == "dropped" else stalls[kind]).append((name, None))
+    if line := joined("Looks like ", stalls["dropped"], " got dropped. You should take a look."):
         out.append(line)
+    status: list[Entry] = []  # lines with no news: after the news, dropped first
+    for kind, head in (
+        ("ready", "Waiting on you to merge: "),
+        ("queued", "Queued behind other runs: "),
+    ):
+        if line := joined(head, _news_first(stalls[kind])):
+            (out if line[1] else status).append(line)
     reviews = [(i.title, i) for i in mine if i.key.startswith(REVIEW_PREFIX)]
     if line := joined("Review requested: ", reviews):
         out.append(line)
     going: list[tuple[str, store.Item | None]] = []
-    for item in sorted(context, key=lambda i: (i.updated_at, i.key)):
+    for item in told:
         if not item.key.startswith(RUN_PREFIX) or item.cleared or (item.source, item.key) in keys:
             continue
         code = _code(item)
@@ -275,8 +323,25 @@ def entries(
         going.append((f"{r.labels.get(code, code)}{wait}", None))
     going += [(name, None) for name in r.working]
     if line := joined("Still working on: ", going):
-        out.append(line)
-    return out[:LINES_MAX]
+        status.insert(0, line)
+    if line := joined("Quiet: ", quiet):
+        status.append(line)
+    return [*out, *status][:LINES_MAX]
+
+
+def _stall_kind(item: store.Item, r: Rollup) -> str:
+    """What a stall's quiet means: ``ready`` (a PR waiting on the owner's merge), ``queued``
+    (behind the slot limit) or ``dropped``."""
+    code = _stall_code(item)
+    if code in r.ready:
+        return "ready"
+    return "queued" if code in r.queued else "dropped"
+
+
+def _news_first(
+    names: Sequence[tuple[str, store.Item | None]],
+) -> list[tuple[str, store.Item | None]]:
+    return sorted(names, key=lambda n: n[1] is None)
 
 
 # --- reads -----------------------------------------------------------------------------------
@@ -306,6 +371,42 @@ def last_activity(run: Run, transcripts: Path | None, now: datetime) -> datetime
             return run.ended_at
         case _:
             return None
+
+
+def behind_slots(conn: sqlite3.Connection, run: Run) -> bool:
+    """A queued run whose task is deferred on ``resource`` (PER-259: every worker slot, a
+    repo lock or a turn was busy): it waits behind the slot limit, not dropped."""
+    if run.status != "queued" or run.task_id is None:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND status = 'waiting' AND wait_reason = 'resource'",
+        (run.task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def stall_title(conn: sqlite3.Connection, run: Run, quiet: timedelta) -> str:
+    """``R3 add retries (~5h quiet)``; ``R5 fix login (#16, ~6h)`` for a ``ready`` run (its
+    line says it waits on the owner's merge), ``R9 docs pass (~5h)`` for one queued behind
+    the slot limit."""
+    if run.status == "ready":
+        pr = f"#{run.pr_number}, " if run.pr_number else ""
+        return f"{label(run)} ({pr}{quiet_text(quiet)})"
+    if behind_slots(conn, run):
+        return f"{label(run)} ({quiet_text(quiet)})"
+    return f"{label(run)} ({quiet_text(quiet)} quiet)"
+
+
+def quiet_items(conn: sqlite3.Connection, now: datetime) -> list[store.Item]:
+    """Open stalls the owner already heard of: context for the ``Quiet:`` line (and the
+    waiting and queued lines), never news. PR stalls are left out while the watch is
+    stale (:func:`held_while_stale`)."""
+    told = [
+        i
+        for i in store.open_items(conn, now)
+        if i.source == CORE and i.key.startswith(STALL_PREFIX) and not i.cleared and not i.changed
+    ]
+    return held_while_stale(conn, now, told)
 
 
 def github_installed(conn: sqlite3.Connection) -> datetime | None:
@@ -445,6 +546,16 @@ def gather(
         for i in store.open_items(conn, now)
         if i.source == CORE and i.key.startswith(STALL_PREFIX + "run-")
     )
+    ready: set[str] = set()
+    queued: set[str] = set()
+    for code in {c for i in items if i.source == CORE and (c := _stall_code(i))}:
+        run = runs_store.get(conn, code)
+        if run is None:
+            continue
+        if run.status == "ready":
+            ready.add(code)
+        elif behind_slots(conn, run):
+            queued.add(code)
     working: list[str] = []
     if github_installed(conn) is not None and watch_fresh(conn, now):
         prs, _reviews = github_prs(conn, now)
@@ -457,7 +568,13 @@ def gather(
             and p.active_at is not None
             and now - p.active_at < stall_after
         ]
-    return Rollup(labels=labels, working=tuple(working), stalled=stalled)
+    return Rollup(
+        labels=labels,
+        working=tuple(working),
+        stalled=stalled,
+        ready=frozenset(ready),
+        queued=frozenset(queued),
+    )
 
 
 # --- writes ----------------------------------------------------------------------------------
@@ -482,7 +599,7 @@ def refresh(
         for run in watched:
             at = last_activity(run, transcripts, now)
             if at is not None and now - at >= stall_after:
-                title = f"{label(run)} ({quiet_text(now - at)} quiet)"
+                title = stall_title(conn, run, now - at)
                 live[stall_key("run-", run.code)] = (title, at, at + stall_after <= since)
         installed = github_installed(conn)
         fresh = installed is not None and watch_fresh(conn, now)
@@ -508,6 +625,19 @@ def refresh(
         # a stale watch says nothing new about PRs: their stalls are left as they are
         keep = () if fresh or installed is None else (STALL_PREFIX + "pr:",)
         _sync_stalls(conn, live, now, keep=keep)
+        _drop_old_merges(conn, now)
+
+
+def _drop_old_merges(conn: sqlite3.Connection, now: datetime) -> None:
+    """An untold ``merged/`` item written more than ``OLD_MERGE`` ago is told without a word
+    (a long hold, through quiet hours or a pause, would otherwise say a stale merge)."""
+    old = [
+        i
+        for i in store.pending(conn, ("normal",), now)
+        if i.source == CORE and i.key.startswith(MERGED_PREFIX) and now - i.updated_at > OLD_MERGE
+    ]
+    if old:
+        store.mark_told(conn, old, now)
 
 
 def _merged_news(pr: Pr, now: datetime, since: datetime) -> bool:
@@ -559,8 +689,10 @@ def _sync_stalls(
 
 __all__ = [
     "LINES_MAX",
+    "OLD_MERGE",
     "Pr",
     "Rollup",
+    "behind_slots",
     "entries",
     "gather",
     "github_prs",
@@ -568,8 +700,10 @@ __all__ = [
     "joined",
     "label",
     "last_activity",
+    "quiet_items",
     "quiet_text",
     "refresh",
     "short",
+    "stall_title",
     "transcripts_dir",
 ]

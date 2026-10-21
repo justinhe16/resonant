@@ -669,3 +669,74 @@ async def test_concurrent_notices_respect_the_daily_cap(db: sqlite3.Connection) 
     outs = await asyncio.gather(*(notice(db, s, ch, f"k{i}") for i in range(3)))
     assert sorted(o.outcome for o in outs) == ["capped_day", "capped_day", "sent"]
     assert len(ch.sent) == 1
+
+
+# --- an ended watch (PER-266) ----------------------------------------------------------------
+
+
+def _ended_item(db: sqlite3.Connection) -> items.Item | None:
+    return items.get(db, "core", "notice/watch/1/ended")
+
+
+async def test_a_watch_that_expires_unfired_leaves_a_low_item_for_the_briefing(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    from zoneinfo import ZoneInfo
+
+    from resonant.extensions import briefing as bf
+
+    await call(components, "create_watch", {"what": "iPhone 17 in stock", "ask": "q?", "days": 1})
+    queue_due(db, NOW)
+    db.execute("UPDATE tasks SET status = 'done' WHERE runner = 'watch'")
+    at = NOW + timedelta(days=2)
+    assert queue_due(db, at) == {"queued": 0, "expired": 1}
+    item = _ended_item(db)
+    assert item is not None and item.urgency == "low" and item.changed
+    assert item.title == "W1 iPhone 17 in stock ended without firing"
+    assert items.pending(db, ("urgent", "normal"), at) == []  # the hourly pulse says nothing
+    b = bf.gather(db, owner="justin", now=at, day=at.date(), tz=ZoneInfo("UTC"))
+    assert [i.key for i in b.updates] == ["notice/watch/1/ended"]
+    assert "Updates:\nW1 iPhone 17 in stock ended without firing" in bf.render(b)
+    assert queue_due(db, at + timedelta(hours=1)) == {"queued": 0, "expired": 0}  # once
+    # it expires with its TTL: gone from the briefing a day later, never said
+    later = at + timedelta(seconds=notices.TTL_S + 60)
+    assert items.open_items(db, later) == [] and items.pending(db, ("low",), later) == []
+    assert (
+        bf.gather(db, owner="justin", now=later, day=later.date(), tz=ZoneInfo("UTC")).updates == ()
+    )
+
+
+async def test_a_check_that_finds_its_watch_expired_leaves_the_item_too(
+    components: Components, db: sqlite3.Connection, settings: Settings, clock: Clock
+) -> None:
+    ch = Recorder()
+    w = runner(components, db, settings, ch, clock)
+    spec: dict[str, Any] = {"what": "milk", "tool": "list_notes", "args": {}, "when": "contains"}
+    await call(components, "create_watch", {**spec, "text": "milk", "days": 1})
+    queue_due(db, NOW)
+    (task_id,) = db.execute("SELECT id FROM tasks WHERE runner = 'watch'").fetchone()
+    task = get_task(db, task_id)
+    assert task is not None
+    clock.now = NOW + timedelta(days=2)
+    out = await w.step(task, [], cast(StepContext, None))
+    assert isinstance(out, Done) and out.result["status"] == "expired" and ch.sent == []
+    item = _ended_item(db)
+    assert item is not None and item.title == "W1 milk ended without firing"
+
+
+async def test_a_watch_that_fired_ends_without_the_item(
+    components: Components, db: sqlite3.Connection
+) -> None:
+    await call(components, "create_watch", {"what": "a", "ask": "q?", "days": 1})
+    db.execute("UPDATE brain_watches SET fired = 1")  # then="continue": it fired before
+    assert queue_due(db, NOW + timedelta(days=2)) == {"queued": 0, "expired": 1}
+    assert _ended_item(db) is None
+    await call(components, "create_watch", {"what": "b", "ask": "q?", "days": 1})
+    await call(components, "cancel_watch", {"id": "W2"})  # cancelled: the owner knows
+    assert items.get(db, "core", "notice/watch/2/ended") is None
+
+
+def test_the_briefing_reads_notices_by_their_prefix() -> None:
+    from resonant.extensions import briefing as bf
+
+    assert bf.NOTICE_PREFIX == notices.KEY_PREFIX

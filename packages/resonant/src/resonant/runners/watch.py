@@ -2,8 +2,9 @@
 ``brain/watches.py``).
 
 **Queueing: ``core/watches``** (``scheduler.CORE_JOBS``, every 5 minutes in
-``settings.timezone``, no model): an expired watch ends (``expired``, no text); every other
-due watch whose previous check task has ended gets a ``NewTask(kind="watch",
+``settings.timezone``, no model): an expired watch ends (``expired``, no text; one that
+never fired leaves a low item for the briefing, :func:`note_unfired`); every other due
+watch whose previous check task has ended gets a ``NewTask(kind="watch",
 runner="watch", priority=background, checkpoint={"watch": id})``, and ``next_at`` moves one
 interval on, in one transaction (``claim`` is compare-and-set, so a watch is never queued
 twice). Not scheduled with ``brain.watches.enabled: false``, iMessage off or no owner. The
@@ -36,12 +37,16 @@ from typing import TYPE_CHECKING, Any
 
 from resonant import killswitch
 from resonant.brain import watches as store
+from resonant.brain.notices import TTL_S as NOTICE_TTL_S
+from resonant.brain.notices import item_key as notice_key
 from resonant.brain.notices import send_notice
 from resonant.config import Settings
+from resonant.extensions.notify import clean_text
 from resonant.gate.types import Deny
 from resonant.gateway.channel import Channel, ChannelError
 from resonant.loop.types import PRIORITY_BACKGROUND, Done, Fail, NewTask, StepContext, Task
 from resonant.principals import Principals
+from resonant.store import pulse as pulse_items
 from resonant.store.audit import audit
 from resonant.store.db import atomic, utcnow
 from resonant.store.tasks import insert_task
@@ -249,6 +254,8 @@ class WatchRunner:
     ) -> None:
         if store.end(self.conn, w.id, state, now, error):
             self._ended(w, state)
+            if state == "expired":
+                note_unfired(self.conn, w, now)
 
     def _ended(self, w: store.Watch, state: store.State) -> None:
         with atomic(self.conn):
@@ -260,6 +267,20 @@ def _paused(conn: sqlite3.Connection) -> bool:
         return killswitch.is_paused(conn)
     except killswitch.PausedStateUnknownError:
         return True
+
+
+def note_unfired(conn: sqlite3.Connection, w: store.Watch, now: datetime) -> None:
+    """A watch that expired without ever firing leaves a ``low`` core item for the briefing
+    (``notice/watch/<id>/ended``, ``W3 … ended without firing``), so it doesn't end in
+    silence. It sends nothing and isn't a notice against the daily cap; it expires with its
+    TTL. Call only when this call ended the watch (``store.end`` returned True)."""
+    if w.fired:
+        return
+    key = notice_key(f"watch/{w.id}/ended")
+    title = clean_text(store.ended_title(w))
+    with atomic(conn):
+        pulse_items.upsert(conn, "core", key, title, "low", {"ended": "expired"}, False,
+                           NOTICE_TTL_S, now)  # fmt: skip
 
 
 # --- core/watches --------------------------------------------------------------------------
@@ -280,6 +301,7 @@ def queue_due(conn: sqlite3.Connection, now: datetime) -> dict[str, Any]:
                         decision="expired",
                         watch=w.id,
                     )
+                note_unfired(conn, w, now)
             continue
         try:
             with atomic(conn):
@@ -320,4 +342,4 @@ def watches_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> Co
     return CoreJob(id=JOB_ID, schedule=SCHEDULE, run=run, catchup=CATCHUP, timeout_s=30.0)
 
 
-__all__ = ["JOB_ID", "NAME", "WatchRunner", "queue_due", "watches_job"]
+__all__ = ["JOB_ID", "NAME", "WatchRunner", "note_unfired", "queue_due", "watches_job"]

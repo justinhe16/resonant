@@ -15,6 +15,9 @@ and what counts as Y. Two kinds of check:
 On a hit the watch sends **one** notice (``brain/notices.py``, through the pulse, capped per
 day) and ends (``then="stop"``, the default); ``then="continue"`` keeps it and fires again
 only after the condition was false in between (or, for ``changed``, on the next change).
+A watch that expires without ever firing leaves a ``low`` core item for the next briefing,
+``W3 iPhone 17 in stock ended without firing`` (``notice/watch/<id>/ended``, no text of its
+own), which expires with its 24h TTL.
 
 Limits (``brain.watches``): ``max_active`` active watches, ``min_interval_minutes`` (15)
 between checks, ``default_days`` (7) to expiry, ``max_days`` (30) at most, ``max_fails``
@@ -343,6 +346,12 @@ def notice_title(w: Watch, detail: str) -> str:
     return f"{head}: {detail}" if detail else head
 
 
+def ended_title(w: Watch) -> str:
+    """``W3 iPhone 17 in stock ended without firing``: the briefing's line for a watch that
+    expired with no hit (PER-266)."""
+    return f"{w.code} {w.what} ended without firing"
+
+
 def failed_title(w: Watch, error: str | None) -> str:
     why = f" ({error[:80]})" if error else ""
     return f"⚠ Stopped watch {w.code} {w.what}: its check failed {w.fails + 1} times{why}"
@@ -381,6 +390,7 @@ __all__ = [
     "describe",
     "due",
     "end",
+    "ended_title",
     "failed_title",
     "get",
     "judge_ask",

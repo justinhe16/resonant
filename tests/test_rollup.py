@@ -17,11 +17,13 @@ import pytest
 from resonant.extensions import pulse_job
 from resonant.extensions import rollup as ru
 from resonant.extensions.scheduler import persist_events
+from resonant.loop.types import NewTask
 from resonant.store import extensions as ext_store
 from resonant.store import pulse as ps
 from resonant.store import runs as runs_store
 from resonant.store.db import iso, kv_set, transaction, utcnow
 from resonant.store.runs import Run
+from resonant.store.tasks import insert_task
 
 H = timedelta(hours=1)
 NOW = datetime(2026, 10, 18, 15, 0, tzinfo=UTC)
@@ -126,6 +128,46 @@ def test_names_are_short_clean_and_code_built() -> None:
     assert ru.quiet_text(50 * H) == "~2d"
 
 
+def test_a_waiting_pr_a_queued_run_and_quiet_ones_read_for_what_they_are() -> None:
+    """PER-266: a ready run's quiet PR waits on the owner, a run behind the slot limit is
+    queued, and stalls already told stay on a ``Quiet:`` status line after the news."""
+    news = [
+        item("run/r7", f"R7 done: PR #16 (CI green) · {URL}", cleared=True),
+        item("stall/run-r2", "R2 pr waits (#12, ~6h)"),
+        item("stall/run-r5", "R5 docs pass (~5h)"),
+    ]
+    told = [
+        item("stall/run-r3", "R3 add retries (~9h quiet)", told=True),
+        item("stall/pr:own/dori:41", "dori#41 cache layer (~6h quiet)", told=True),
+        item("stall/run-r4", "R4 old pr (#9, ~2d)", told=True),
+        item("run/r8", "R8 still running · proj · started 13:00", told=True),
+    ]
+    roll = ru.Rollup(labels={"R8": "R8 api refactor"}, stalled=frozenset({"R2", "R3", "R4", "R5"}),
+                     ready=frozenset({"R2", "R4"}), queued=frozenset({"R5"}))  # fmt: skip
+    entries = ru.entries(news, told, roll)
+    assert [line for line, _ in entries] == [
+        f"R7 done: PR #16 (CI green) · {URL}",
+        "Waiting on you to merge: R2 pr waits (#12, ~6h), R4 old pr (#9, ~2d)",
+        "Queued behind other runs: R5 docs pass (~5h)",
+        "Still working on: R8 api refactor",
+        "Quiet: dori#41 cache layer (~6h), R3 add retries (~9h)",
+    ]
+    said = {i.key for _, items in entries for i in items}
+    assert said == {"run/r7", "stall/run-r2", "stall/run-r5"}  # the told ones are status
+    # without news about them, the waiting line is status too, after the news
+    assert [line for line, _ in ru.entries(news[:1], told, roll)] == [
+        f"R7 done: PR #16 (CI green) · {URL}",
+        "Still working on: R8 api refactor",
+        "Waiting on you to merge: R4 old pr (#9, ~2d)",
+        "Quiet: dori#41 cache layer (~6h), R3 add retries (~9h)",
+    ]
+    # the news always fits: status lines are the ones LINES_MAX drops
+    many = [item(f"run/r{n}", f"R{n} failed: x", cleared=True) for n in range(10, 15)]
+    lines_ = [line for line, _ in ru.entries(many, told, roll)]
+    assert len(lines_) == ru.LINES_MAX and lines_[-1] == "Still working on: R8 api refactor"
+    assert pulse_job.compose([], told, roll) is None  # quiet ones never send on their own
+
+
 # --- the derived items -----------------------------------------------------------------------
 
 
@@ -190,10 +232,79 @@ def test_queued_and_ready_runs_stall_waiting_ones_never(db: sqlite3.Connection) 
     ru.refresh(db, now, stall_after=4 * H)
     assert pending(db, now) == {
         "stall/run-r1": "R1 queued thing (~5h quiet)",
-        "stall/run-r2": "R2 pr waits (~6h quiet)",
+        "stall/run-r2": "R2 pr waits (#12, ~6h)",
     }
+    roll = ru.gather(db, now, ps.pending(db, ("normal",), now))
+    assert roll.ready == {"R2"} and roll.queued == frozenset()
     ru.refresh(db, now, stall_after=8 * H)  # the threshold is configurable
     assert pending(db, now) == {}
+
+
+def defer_on_slots(db: sqlite3.Connection, run: Run) -> None:
+    """The run's task deferred because every worker slot is busy (PER-259)."""
+    with transaction(db):
+        task = NewTask(kind="run", runner="claude", priority=10, principal="owner",
+                       checkpoint={"run": run.code})  # fmt: skip
+        task_id = insert_task(db, task)
+        db.execute("UPDATE tasks SET status = 'waiting', wait_reason = 'resource', wake_at = ?"
+                   " WHERE id = ?", (iso(run.created_at + H), task_id))  # fmt: skip
+    runs_store.update(db, run.code, task_id=task_id)
+
+
+def test_a_run_behind_the_slot_limit_reads_queued(db: sqlite3.Connection) -> None:
+    behind = make_run(db, ask="docs pass")
+    defer_on_slots(db, behind)
+    plain = make_run(db, ask="never picked")  # its task never deferred: dropped
+    now = behind.created_at + 5 * H
+    ru.refresh(db, now)
+    assert pending(db, now) == {
+        "stall/run-r1": "R1 docs pass (~5h)",
+        "stall/run-r2": "R2 never picked (~5h quiet)",
+    }
+    news = ps.pending(db, ("normal",), now)
+    roll = ru.gather(db, now, news)
+    assert roll.queued == {"R1"} and roll.ready == frozenset()
+    assert [line for line, _ in ru.entries(news, (), roll)] == [
+        "Looks like R2 never picked (~5h quiet) got dropped. You should take a look.",
+        "Queued behind other runs: R1 docs pass (~5h)",
+    ]
+    assert ru.behind_slots(db, plain) is False
+
+
+def test_a_told_stall_stays_on_the_quiet_line(db: sqlite3.Connection) -> None:
+    run = make_run(db, ask="add retries")
+    now = run.created_at + 5 * H
+    ru.refresh(db, now)
+    assert ru.quiet_items(db, now) == []  # untold: news, not status
+    tell(db, now)
+    later = now + 2 * H
+    ru.refresh(db, later)
+    assert [(i.key, i.title) for i in ru.quiet_items(db, later)] == [
+        ("stall/run-r1", "R1 add retries (~7h quiet)")
+    ]
+    runs_store.update(db, run.code, status="cancelled", ended_at=iso(later))
+    ru.refresh(db, later + H)  # it ended: cleared, off the line
+    assert ru.quiet_items(db, later + H) == []
+
+
+def test_an_old_merge_still_untold_is_dropped_not_said(db: sqlite3.Connection) -> None:
+    now = utcnow().replace(microsecond=0) + H
+    install_github(db, now - 30 * 24 * H)
+    fresh(db, now)
+    watch(db, ("pr_merged", "m40", pr(40, "fix login", merged_at=iso(now - H))))
+    ru.refresh(db, now)
+    assert pending(db, now) == {"merged/pr:own/dori:40": "dori#40 fix login"}
+    # held (a long pause, quiet hours, a muted pulse) past OLD_MERGE: dropped at the refresh
+    late = now + ru.OLD_MERGE - timedelta(minutes=1)
+    fresh(db, late)
+    ru.refresh(db, late)
+    assert "merged/pr:own/dori:40" in pending(db, late)  # a few days old: still said
+    later = now + ru.OLD_MERGE + H
+    fresh(db, later)
+    ru.refresh(db, later)
+    assert pending(db, later) == {}
+    dropped = ps.get(db, "core", "merged/pr:own/dori:40")
+    assert dropped is not None and not dropped.changed  # told without a word, not re-made
 
 
 @pytest.fixture(autouse=True)
@@ -450,6 +561,16 @@ async def test_the_pulse_sends_the_rollup_once_and_never_an_all_quiet() -> None:
         result = await pulse(h, t + H)  # nothing new: no "all quiet" message
         assert result["sent"] is False and result["skipped"] == "nothing"
         assert len(h.channel.texts()) == 1
+        # news later: the stall already told stays visible on the Quiet line
+        fresh(h.db, t + 2 * H - timedelta(minutes=5))
+        watch(h.db, ("pr_merged", "m42", pr(42, "add x", merged_at=iso(t + H))))
+        assert (await pulse(h, t + 2 * H))["sent"] is True
+        assert h.channel.texts()[-1] == (
+            "btw:\nWorkers:\n"
+            "Merged: dori#42 add x\n"
+            "Still working on: R2 api refactor\n"
+            "Quiet: dori#41 cache layer (~7h)"
+        )
 
 
 def test_stall_after_is_a_bounded_duration() -> None:

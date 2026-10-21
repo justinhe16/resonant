@@ -19,9 +19,10 @@ or no ``principals.yaml`` owner: not scheduled. Each run:
 Claude workers' items (``core`` / ``run/<code>``, EM-6) and the rollup's derived items
 (``stall/``, ``merged/``, ``review/``, GH-2) go in a ``Workers:`` section after the rest, as
 the progress rollup's lines (``extensions/rollup.py``: ``Merged: …``, ``Looks like … got
-dropped``, ``Still working on: …``); when there is news, the workers still running (already
-told) and the github PRs still being worked on are listed with them, for status (they never
-make a pulse send on their own). Each run first refreshes the derived items
+dropped``, ``Waiting on you to merge: …``, ``Still working on: …``, ``Quiet: …``); when
+there is news, the workers still running (already told), the github PRs still being worked on
+and the stalls already told are listed with them, for status (they never make a pulse send
+on their own). Each run first refreshes the derived items
 (:func:`refresh_rollup`, ``pulse.stall_after``).
 
 The message is at most ``MAX_CHARS`` (1,000). Items that don't fit are not marked told and ride
@@ -282,7 +283,7 @@ def _compose_now(
     """:func:`compose` over the store: the pending items, the running workers and the
     rollup's names for them. Read-only."""
     items = rollup.held_while_stale(conn, now, _pending(conn, now, hide_approvals=hide_approvals))
-    going = running_workers(conn, now)
+    going = [*running_workers(conn, now), *rollup.quiet_items(conn, now)]
     roll = rollup.gather(conn, now, [*items, *going], stall_after=stall_after)
     return compose(items, going, roll)
 
