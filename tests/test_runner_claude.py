@@ -1138,6 +1138,7 @@ async def test_startup_leaves_a_live_daemons_run_dirs_alone(h: Harness) -> None:
     fd = os.open(h.cfg.work_dir / claude_mod.WORK_DIR_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the "live daemon"
+        h.runner.lock_wait_s = 0.3
         await h.runner.start()
         assert (creds / "token").exists() and ctl.is_dir() and call.is_dir()
         assert h.api.revoked == []

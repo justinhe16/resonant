@@ -266,6 +266,8 @@ EXTERNAL_PR = "external_pr"  # the trust action of opening a PR on someone else'
 # flock'd by the runner that owns runner.work_dir (the daemon) from start() to aclose():
 # only it sweeps the run dirs' credentials and ctl sockets at startup (PER-271)
 WORK_DIR_LOCK = ".daemon.lock"
+LOCK_WAIT_S = 20.0  # how long start() waits for a predecessor to let go of it
+LOCK_POLL_S = 0.25
 # a push run's session left commits it couldn't push: the run fails with this reason, and
 # the reply leads with it (PER-271: not "made no changes")
 COULDNT_PUSH = "couldn't push: "
@@ -1001,6 +1003,7 @@ class ClaudeRunner:
         self._unhook: Callable[[], None] | None = None
         self.ctl_root = worker_cli.ctl_root(runner.work_dir)
         self._work_dir_lock: int | None = None  # the fd holding WORK_DIR_LOCK (PER-271)
+        self.lock_wait_s = LOCK_WAIT_S
         self.ask_block_s = ask_block_s
         self._submit: Callable[[Event], bool] = submit or self._insert_event
         self._run_redactors: dict[str, Redactor] = {}
@@ -1185,17 +1188,26 @@ class ClaudeRunner:
         self.cfg.work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(self.cfg.work_dir / WORK_DIR_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
                      0o600)  # fmt: skip
+        # A predecessor still exiting (/restart, /update, a kickstart overlap) holds it for
+        # a moment: wait that long before treating the holder as a live daemon.
+        deadline = time.monotonic() + self.lock_wait_s
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            return False
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        os.close(fd)
+                        return False
+                    time.sleep(LOCK_POLL_S)
         except BaseException:
             os.close(fd)
             raise
-        os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode())  # who holds it, for a person looking
         self._work_dir_lock = fd
+        with contextlib.suppress(OSError):  # who holds it, for a person looking
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
         return True
 
     def _release_work_dir(self) -> None:
@@ -1231,15 +1243,17 @@ class ClaudeRunner:
 
     async def aclose(self) -> None:
         """Remove the kill switch hook and wait for the kills it started."""
-        if self._unhook is not None:
-            self._unhook()
-            self._unhook = None
-        await self.desk.aclose()
-        tasks = list(self._background)
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        self._release_work_dir()
+        try:
+            if self._unhook is not None:
+                self._unhook()
+                self._unhook = None
+            await self.desk.aclose()
+            tasks = list(self._background)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._release_work_dir()
 
     def _target(self, run: Run) -> Target:
         return Target(

@@ -23,7 +23,13 @@ _REAL_HOMES = tuple(
 # What no test may create, delete, change, run a process in or connect to: the live run
 # dirs, the owner's checkouts and Resonant's state (the daemon may be running beside us).
 PROTECTED = tuple(
-    os.path.join(h, name) for h in _REAL_HOMES for name in ("resonant-runs", "code", ".resonant")
+    dict.fromkeys(
+        root
+        for h in _REAL_HOMES
+        for name in ("resonant-runs", "code", ".resonant")
+        # the link and its target: ~/code may be a symlink to another volume
+        for root in (os.path.join(h, name), os.path.realpath(os.path.join(h, name)))
+    )
 )
 # ... except the checkout these tests run from (a worker runs them in its worktree under
 # ~/code/.worktrees: pytest's cache, __pycache__, the venv) and the temp dir (a worker's
