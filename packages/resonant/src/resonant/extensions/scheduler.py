@@ -148,6 +148,13 @@ def backup_job(deps: CoreDeps) -> CoreJob | None:
     return factory(deps)
 
 
+def store_upkeep_job(deps: CoreDeps) -> CoreJob | None:
+    """``core/prune`` (PER-259, ``resonant.store_upkeep``), imported late like ``backup_job``."""
+    from resonant.store_upkeep import store_upkeep_job as factory
+
+    return factory(deps)
+
+
 def watches_job(deps: CoreDeps) -> CoreJob | None:
     """``core/watches`` (BR-7, ``runners/watch.py``), imported late: the runners import the
     gate and the router, which this module must not pull in at import time."""
@@ -157,7 +164,13 @@ def watches_job(deps: CoreDeps) -> CoreJob | None:
 
 
 # Built-in jobs, one factory each.
-CORE_JOBS: tuple[CoreJobFactory, ...] = (briefing_job, pulse_job, watches_job, backup_job)
+CORE_JOBS: tuple[CoreJobFactory, ...] = (
+    briefing_job,
+    pulse_job,
+    watches_job,
+    backup_job,
+    store_upkeep_job,
+)
 
 
 @dataclass(frozen=True)

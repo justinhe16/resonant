@@ -5,7 +5,16 @@ from pathlib import Path
 
 import pytest
 
-from resonant.store.db import kv_get, kv_set, migrate, now_iso, open_db, schema_version, transaction
+from resonant.store.db import (
+    FOREIGN_KEYS_OFF,
+    kv_get,
+    kv_set,
+    migrate,
+    now_iso,
+    open_db,
+    schema_version,
+    transaction,
+)
 
 TABLES = {
     "tasks",
@@ -113,3 +122,86 @@ def test_transaction_not_reentrant(db: sqlite3.Connection) -> None:
     with pytest.raises(RuntimeError, match="reentrant"), transaction(db), transaction(db):
         pass
     assert not db.in_transaction
+
+
+# --- migrations that rebuild a parent table (PER-259) -----------------------------------------
+
+PARENT_CHILD = """\
+CREATE TABLE parent (id TEXT PRIMARY KEY, label TEXT NOT NULL);
+CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id TEXT REFERENCES parent (id));
+INSERT INTO parent VALUES ('p1', 'one');
+INSERT INTO child VALUES (1, 'p1');
+"""
+
+
+def _fk_on(conn: sqlite3.Connection) -> bool:
+    return bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+
+
+def test_foreign_keys_off_migration_rebuilds_a_table_children_point_at(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "fk.db")
+    v = schema_version(conn)
+    base = [(i, "") for i in range(1, v + 1)]
+    rebuild = f"""{FOREIGN_KEYS_OFF}
+CREATE TABLE parent_new (id TEXT PRIMARY KEY, label TEXT NOT NULL, extra TEXT);
+INSERT INTO parent_new (id, label) SELECT id, label FROM parent;
+DROP TABLE parent;
+ALTER TABLE parent_new RENAME TO parent;
+"""
+    assert migrate(conn, [*base, (v + 1, PARENT_CHILD)]) == v + 1
+    # the same rebuild without the marker fails: DROP TABLE deletes rows the child points at
+    with pytest.raises(sqlite3.IntegrityError):
+        migrate(conn, [*base, (v + 1, PARENT_CHILD), (v + 2, rebuild.split("\n", 1)[1])])
+    assert schema_version(conn) == v + 1 and _fk_on(conn) and not conn.in_transaction
+    assert migrate(conn, [*base, (v + 1, PARENT_CHILD), (v + 2, rebuild)]) == v + 2
+    assert _fk_on(conn) and not conn.in_transaction
+    assert [tuple(r) for r in conn.execute("SELECT id, label, extra FROM parent")] == [
+        ("p1", "one", None)
+    ]
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    with pytest.raises(sqlite3.IntegrityError):  # the child's foreign key still works
+        conn.execute("INSERT INTO child VALUES (2, 'nope')")
+
+
+def test_foreign_keys_off_migration_with_a_violation_rolls_back(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "fk.db")
+    v = schema_version(conn)
+    base = [(i, "") for i in range(1, v + 1)]
+    migrate(conn, [*base, (v + 1, PARENT_CHILD)])
+    bad = f"{FOREIGN_KEYS_OFF}\nINSERT INTO child VALUES (2, 'missing');\nCREATE TABLE half (x);\n"
+    with pytest.raises(sqlite3.IntegrityError, match="foreign key"):
+        migrate(conn, [*base, (v + 1, PARENT_CHILD), (v + 2, bad)])
+    assert schema_version(conn) == v + 1
+    assert _fk_on(conn) and not conn.in_transaction
+    assert conn.execute("SELECT COUNT(*) FROM child").fetchone()[0] == 1
+    names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+    assert "half" not in names
+
+
+def test_foreign_keys_off_migration_restores_a_connection_that_had_them_off(
+    tmp_path: Path,
+) -> None:
+    conn = open_db(tmp_path / "fk.db")
+    v = schema_version(conn)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    migrate(conn, [*[(i, "") for i in range(1, v + 1)], (v + 1, f"{FOREIGN_KEYS_OFF}\nSELECT 1;")])
+    assert not _fk_on(conn)
+
+
+def test_audit_delete_window_only_opens_for_rows_before_the_cutoff(db: sqlite3.Connection) -> None:
+    ins = "INSERT INTO audit_log (at, action) VALUES (?, 'x')"
+    db.execute(ins, ("2026-01-01T00:00:00.000+00:00",))
+    db.execute(ins, ("2026-06-01T00:00:00.000+00:00",))
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db.execute("DELETE FROM audit_log")  # no window: nothing can go
+    with transaction(db):
+        kv_set(db, "store.prune_audit_before", "2026-03-01T00:00:00.000+00:00")
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            db.execute("DELETE FROM audit_log")  # includes a row newer than the cutoff
+        db.execute("DELETE FROM audit_log WHERE at < '2026-03-01'")
+        db.execute("DELETE FROM kv WHERE key = 'store.prune_audit_before'")
+    assert [r[0] for r in db.execute("SELECT at FROM audit_log")] == [
+        "2026-06-01T00:00:00.000+00:00"
+    ]
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db.execute("DELETE FROM audit_log")

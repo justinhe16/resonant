@@ -182,6 +182,8 @@ def render_status(d: dict[str, Any]) -> str:
     lines = [text]
     if runs := _runs_line(d.get("runs")):
         lines.append(runs)
+    if waiting := _waiting_line(d.get("waiting")):
+        lines.append(waiting)
     if brain := _claude_brain_line(d.get("claude_brain")):
         lines.append(brain)
     if backup := _backup_line(d.get("backup")):
@@ -226,6 +228,32 @@ def _claude_brain_line(value: Any) -> str:
     if state == "up" and isinstance(url, str) and _SESSION_URL.fullmatch(url):
         bits.append(f"Remote Control: {url}")
     return " · ".join(bits)
+
+
+# In the order /status lists them (what needs the machine first, then what needs a person).
+_WAIT_LABELS = {
+    "resource": "on a resource (all worker slots busy)",
+    "approval": "for approval",
+    "human_reply": "for a reply",
+    "usage_reset": "on a usage reset",
+    "ci": "on CI",
+    "veto": "in a veto window",
+}
+
+
+def _waiting_line(value: Any) -> str:
+    """``waiting: 1 on a resource (all worker slots busy), 1 for approval``: task counts by
+    wait reason, known reasons in a fixed order, then any other as itself. Nothing when none
+    waits."""
+    counts = {
+        str(reason): n
+        for reason, n in _as_dict(value).items()
+        if isinstance(n, int) and not isinstance(n, bool) and n > 0
+    }
+    known = [r for r in _WAIT_LABELS if r in counts]
+    other = sorted(r for r in counts if r not in _WAIT_LABELS)
+    bits = [f"{counts[r]} {_WAIT_LABELS.get(r, r)}" for r in (*known, *other)]
+    return f"waiting: {', '.join(bits)}" if bits else ""
 
 
 def _runs_line(value: Any) -> str:
