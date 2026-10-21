@@ -90,6 +90,7 @@ from resonant.gateway.imessage.reader import (
 )
 from resonant.gateway.imessage.sender import IMessageSender, OsaRunner, SendError
 from resonant.principals import Principals
+from resonant.store import outbound
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant_sdk import Event, new_id
@@ -272,6 +273,7 @@ class IMessageChannel:
             if dedupe_key is not None and (prev := self._already_sent(dedupe_key)) is not None:
                 return prev  # a concurrent send with the same key finished first
             await self._throttle(principal, len(chunks), dedupe_key)
+            started = self.clock()  # PER-261: when it began going out (store.outbound)
             for i, chunk in enumerate(chunks, 1):
                 try:
                     await self.sender.send(handle, chunk)
@@ -308,6 +310,8 @@ class IMessageChannel:
                     chunks=len(chunks),
                     ref=ref.ref,
                 )
+            # PER-261: what was sent last (a Claude answer asks a bare yes for its code)
+            outbound.note(self.conn, principal, text, started)
         log.info("imessage sent to %s (%d chars, %d part(s))", principal, len(text), len(chunks))
         return ref
 

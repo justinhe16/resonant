@@ -103,6 +103,7 @@ from resonant.gate.types import (
 )
 from resonant.principals import Principals
 from resonant.store import approvals as ap
+from resonant.store import outbound
 from resonant.store import trust as trust_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, utcnow
@@ -242,12 +243,15 @@ class PolicyGate:
 
     # --- evaluate ----------------------------------------------------------------------
 
-    def evaluate(self, intent: Intent) -> Decision:
+    def evaluate(self, intent: Intent, *, capped: bool = False) -> Decision:
+        """The decision for ``intent``. ``capped`` (PER-261, the tool core): the task already
+        ran its ``MAX_SIDE_EFFECTS`` changes without asking, so a change this would allow
+        asks instead (it joins the task's batch). A read, and what is refused, are unchanged."""
         now = self.clock()
         with atomic(self.conn):
             ap.expire_due(self.conn, now)
             autonomy = autonomy_on(self.conn)
-            decision, standing = self._decide(intent, now, autonomy)
+            decision, standing = self._decide(intent, now, autonomy, capped=capped)
             audit(
                 self.conn,
                 "gate.evaluate",
@@ -268,12 +272,13 @@ class PolicyGate:
                 ),
                 reason=decision.reason if isinstance(decision, Deny) else None,
                 standing=standing,
+                capped=capped or None,
                 args=intent.args,
             )
         return decision
 
     def _decide(
-        self, intent: Intent, now: datetime, autonomy: bool
+        self, intent: Intent, now: datetime, autonomy: bool, *, capped: bool = False
     ) -> tuple[Decision, bool | None]:
         """The decision, and whether a standing allow made the call L3 (None: not asked)."""
         if self.registry.get(intent.extension, intent.tool) != intent.spec:
@@ -299,6 +304,8 @@ class PolicyGate:
             if standing:
                 level = Level.L3
         verdict = rule(level, intent.origin, autonomy)
+        if capped and verdict == "allow" and not l0_read:
+            verdict = "ask"  # past the task's unasked changes: this one asks (no yes always)
         if verdict == "allow" and intent.level is Level.L0:
             return self._allow(intent), standing
         if ap.was_rejected(self.conn, intent.task_id, intent.hash):
@@ -310,7 +317,13 @@ class PolicyGate:
             approved = ap.approved_unused(self.conn, intent.task_id, intent.hash)
             return self._allow(intent, approved.id if approved else None), standing
         offer = None
-        if verdict == "ask" and level is Level.L2 and autonomy and self._standing_eligible(intent):
+        if (
+            verdict == "ask"
+            and not capped
+            and level is Level.L2
+            and autonomy
+            and self._standing_eligible(intent)
+        ):
             assert self.standing is not None
             offer = self.standing.offer(intent)
         decision = self._ask(intent, now, last, require_code=verdict == "ask_code", offer=offer)
@@ -589,16 +602,33 @@ class PolicyGate:
                 unit = self._unit_of(approval)
                 if unit.batch is not None and unit.batch.principal != resolution.actor:
                     reason = "not an approver"  # a batch is the owner's to answer
+                elif resolution.always and (
+                    unit.batch is not None
+                    or not approval.allow_always
+                    or approval.require_code
+                    or resolution.actor != self.principals.owner
+                ):
+                    reason = "always_unsupported"  # as for "yes always" by text
                 else:
                     reason = self._resolve_unit(
-                        unit, approved=resolution.approved, actor=resolution.actor, now=now
-                    )
+                        unit, approved=resolution.approved, actor=resolution.actor, now=now,
+                        always=resolution.always,
+                    )  # fmt: skip
             # A non-approver can't tell an existing approval from a missing one.
             shown = "not_found" if reason == "not an approver" else reason
             result = ResolveResult(ok=False, reason=shown)
             if reason is None and unit is not None:
                 done = [ap.get_approval(self.conn, m.id) for m in unit.members]
                 result = ap.resolve_result([d for d in done if d is not None])
+                head = done[0]
+                if (
+                    unit.batch is None
+                    and head is not None
+                    and head.always
+                    and head.always_scope
+                    and head.always_action
+                ):
+                    _add_standing_rule(self.conn, head, resolution.actor, now)
                 ap.wake_resolved(self.conn, result, now, principal=resolution.actor)
             audit(
                 self.conn,
@@ -619,6 +649,7 @@ class PolicyGate:
                 actor_identity=resolution.actor_identity,
                 path=resolution.path,
                 comments=resolution.comments,
+                always=resolution.always,
                 ok=result.ok,
                 reason=reason,
             )
@@ -682,9 +713,7 @@ class PolicyGate:
                 tool=target.tool if target else None,
                 extension=target.extension if target else None,
                 intent_hash=target.intent_hash if target else None,
-                decision=("approved" if reply.decision == "approve" else "rejected")
-                if result.ok
-                else "refused",
+                decision=_decision(reply, result.ok),
                 requested=reply.decision,
                 approval_id=target.id if target else None,
                 batch_id=unit.batch.id if unit is not None and unit.batch is not None else None,
@@ -763,7 +792,12 @@ class PolicyGate:
             seen = [u.head.id for u in self._units(opened, reply.actor)]
             if seen != [target.head.id]:
                 return None, "ambiguous"
-            if reply.decision == "approve" and target.needs_code(reply.picks):
+            if reply.decision == "approve" and (
+                target.needs_code(reply.picks)
+                or outbound.claude_newest(self.conn, reply.actor, reply.occurred_at)
+            ):
+                # PER-261: right after a Claude answer (outside text, above the reply) a bare
+                # yes, or yes 1,3, needs the code: the answer can't stand in for the prompt.
                 return None, "code_required"
         return target, None
 
@@ -773,6 +807,16 @@ class PolicyGate:
             and reply.actor in a.approvers
             and self.principals.can(reply.actor, "approve", a.extension)
         )
+
+
+def _decision(reply: ApprovalReply, ok: bool) -> str:
+    """A reply's ``approval.resolve`` decision: ``approved``, ``rejected``, ``partial`` (a
+    ``yes 1,3`` that approved some of a batch and rejected the rest, PER-261) or ``refused``."""
+    if not ok:
+        return "refused"
+    if reply.decision != "approve":
+        return "rejected"
+    return "partial" if reply.picks is not None else "approved"
 
 
 def _picked(unit: _Unit | None, picks: tuple[int, ...] | None, approved: bool) -> list[str] | None:

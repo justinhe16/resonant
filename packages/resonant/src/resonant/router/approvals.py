@@ -72,7 +72,11 @@ def refusal_reply(
     if reason == "ambiguous":
         return ask_codes(sent)
     if reason == "code_required":
-        coded = [p for p in sent if p.require_code]
+        # The one that needs its code; else (PER-261: a bare yes right after a Claude answer)
+        # the only one the reply could mean.
+        coded = [p for p in sent if p.require_code] or [
+            p for p in sent if code is None or p.code == code
+        ]
         target = coded[0].code if len(coded) == 1 else "<code>"
         if picks:
             return f"Reply yes {','.join(map(str, picks))} {target} to confirm."

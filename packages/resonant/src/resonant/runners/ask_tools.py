@@ -29,7 +29,8 @@ decides whether a call may run.
   in the batch (one change: the plain prompt), then the task waits; ``yes`` runs each once,
   in order (the executor's keys), ``no`` or expiry drops them all (``AskRunner``: a
   ``LocalRunner`` named ``ask`` runs the batch step through ``ToolCore.resume``). At most
-  ``gate.batch_max`` changes wait and ``MAX_SIDE_EFFECTS`` run unasked per task.
+  ``gate.batch_max`` changes wait and ``MAX_SIDE_EFFECTS`` run unasked per task; a change
+  past that asks (PER-261), in the batch.
 - **Kill switch.** Paused: every call is refused here (the session itself is killed by the
   ask runner); autonomy off: the gate asks for everything above L0, as for the local model.
 
@@ -422,8 +423,8 @@ class ClaudeTools:
             return BAD_ARGS.format(why=why, name=spec.name, schema=schema), True
         if self._paused():
             return PAUSED, True
-        if change and len(self.reports) >= MAX_SIDE_EFFECTS:
-            return CAPPED, True
+        if change and len(self.reports) >= MAX_SIDE_EFFECTS and self.core.batch_gate is None:
+            return CAPPED, True  # with batches (PER-261) it asks instead, in the batch
         if self.outside:
             self.tainted = True
         if change:
@@ -448,6 +449,8 @@ class ClaudeTools:
             batch=self.asked,
         )
         outcome = await self.core.call(spec, args, scope)
+        if isinstance(outcome, Refused) and outcome.why == "capped" and not outcome.gated:
+            return CAPPED, True
         if self.access.taints(spec) and _shows_outside(spec, outcome):
             self.tainted = self.read_outside = True
         if isinstance(outcome, Asked):

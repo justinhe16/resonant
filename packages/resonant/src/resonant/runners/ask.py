@@ -156,6 +156,7 @@ from resonant.store import tasks as task_store
 from resonant.store.audit import audit
 from resonant.store.claude_brain import add_grant
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
+from resonant.store.outbound import CLAUDE_PREFIX
 from resonant.store.tasks import get_task
 from resonant.toolcore import CallScope, PinnedCall, batch_items
 from resonant.tools.files import ReadScope, default_roots, resonant_secrets
@@ -182,7 +183,7 @@ DEFER_S = 5.0  # a busy ask (concurrency) looks again this soon
 KILL_GRACE_S = 2.0
 POLL_S = 0.25
 STEP_SLACK_S = 60.0  # attachments, the reply and the reap on top of timeout_s
-PREFIX = "Claude: "
+PREFIX = CLAUDE_PREFIX  # the reply guard (store.outbound) reads it
 LOOKING = "Looking into it…"
 PROPOSED = "Proposed:"
 

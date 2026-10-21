@@ -524,6 +524,18 @@ def _asking(st: _Turn) -> Generator[None]:
         ASKING_HOPS.reset(token)
 
 
+def _ran_extension_change(spec: ToolSpec, done: object) -> bool:
+    """An extension's change that ran (its ``CallResult`` has the report line): what qwen
+    sees of it is that code-built line alone, which carries no outside content."""
+    return (
+        spec.extension is not None
+        and spec.effect is not Effect.READ
+        and isinstance(done, CallResult)
+        and done.ok
+        and done.report is not None
+    )
+
+
 def _is_read(spec: ToolSpec | None) -> bool:
     return spec is not None and spec.effect is Effect.READ
 
@@ -788,7 +800,21 @@ class BrainRunner(LocalRunner):
             # The model's own words give way to the code-built lines (what ran, why it
             # stopped); the reply after the owner's answer is code-built too.
             lines = [result.reply] if result.path in GATED_PATHS else st.reports
-            with spans("runner.brain.batch", changes=len(st.batch), ran=len(st.reports)):
+            # PER-261: the model's answer to the rest of the message (with the report lines
+            # of what ran) goes out first, then the batch prompt; the reply after the owner's
+            # answer is then the batch's lines alone.
+            # Not when it claims a change while nothing ran: everything it did waits on a yes.
+            answer = (
+                result.reply
+                if result.path == "llm"
+                and result.reply.strip()
+                and (st.reports or not claims_change(result.reply))
+                else None
+            )
+            if answer is not None:
+                lines = []
+            with spans("runner.brain.batch", changes=len(st.batch), ran=len(st.reports),
+                       answer_first=answer is not None):  # fmt: skip
                 pass
             return await self.close_batch(
                 task,
@@ -799,6 +825,7 @@ class BrainRunner(LocalRunner):
                 spans,
                 pin=st.pin(),
                 decision=st.decisions.get(st.batch[0].approval_id),
+                answer=answer,
             )
         if isinstance(result, Answer):  # the next turn's history reads it (BR-10b)
             result.meta["tainted"] = result.meta.get("tainted") is True or st.tainted
@@ -1047,7 +1074,9 @@ class BrainRunner(LocalRunner):
                 ended = await self._one(task, principal, name, args, st, ctx, spans)
                 if ended is not None:
                     return ended
-                if len(st.reports) >= MAX_SIDE_EFFECTS:
+                if len(st.reports) >= MAX_SIDE_EFFECTS and self.core.batch_gate is None:
+                    # Without batches the cap ends the turn. With them (PER-261) the turn goes
+                    # on: a change past the cap asks, in the batch (ToolCore gates it capped).
                     if st.batch:  # the batch's reply is code-built: no narration
                         return Answer("\n".join(st.reports), "done", used_tools(st.calls))
                     return await self._narrate(st, spans)
@@ -1237,7 +1266,7 @@ class BrainRunner(LocalRunner):
                     st.decisions[asked.approval_id] = done.decision
             with spans("runner.brain.asked", tool=name, batch=len(st.batch)):
                 pass
-        elif taints(spec) and not session:
+        elif taints(spec) and not session and not _ran_extension_change(spec, done):
             if not st.tainted or st.hops:
                 with spans("runner.brain.taint", tool=name, extension=spec.extension):
                     pass
@@ -1262,7 +1291,14 @@ class BrainRunner(LocalRunner):
         failed = not call.ok and (call.error or "").startswith("the tool failed")
         st.failures = 0 if call.ok else st.failures + int(failed)
         st.calls.append(call)
-        self._tool_turns(name, args, call, st)
+        # PER-261: an extension's change that ran shows qwen only its code-built report line
+        # (as Claude's bridge does), never the result, so one save doesn't taint the turn.
+        shown = (
+            replace(call, data={"done": call.report})
+            if _ran_extension_change(spec, call) and call.report is not None
+            else call
+        )
+        self._tool_turns(name, args, shown, st)
         return await self._still_failing(task, principal, st, ctx, spans)
 
     def _tool_turns(self, name: str, args: Any, call: CallResult, st: _Turn) -> None:

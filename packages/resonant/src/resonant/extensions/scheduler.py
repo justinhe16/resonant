@@ -155,6 +155,14 @@ def store_upkeep_job(deps: CoreDeps) -> CoreJob | None:
     return factory(deps)
 
 
+def remind_job(deps: CoreDeps) -> CoreJob | None:
+    """``core/remind`` (PER-261, ``runners/approve.py``: the expiry reminder), imported late
+    like ``watches_job``."""
+    from resonant.runners.approve import remind_job as factory
+
+    return factory(deps)
+
+
 def watches_job(deps: CoreDeps) -> CoreJob | None:
     """``core/watches`` (BR-7, ``runners/watch.py``), imported late: the runners import the
     gate and the router, which this module must not pull in at import time."""
@@ -170,6 +178,7 @@ CORE_JOBS: tuple[CoreJobFactory, ...] = (
     watches_job,
     backup_job,
     store_upkeep_job,
+    remind_job,
 )
 
 
