@@ -193,6 +193,9 @@ async def remind_due(conn: sqlite3.Connection, channel: Channel, now: datetime) 
     for r in due:
         settled = True
         text = reminder_text(r.code, r.expires_at - now)
+        head = ap.get_approval(conn, r.approval_ids[0])
+        if head is None or head.status != "pending":
+            continue  # answered while the earlier reminders went out: nothing waits
         for principal in r.to:
             key = reminder_key(r.approval_ids[0], principal)
             try:

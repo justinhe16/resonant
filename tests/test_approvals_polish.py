@@ -317,17 +317,21 @@ async def test_yes_some_right_after_a_claude_answer_needs_the_code(h: H) -> None
     assert h.ran == ["close:A", "close:C"]
 
 
-def test_outbound_keeps_the_newest_sends(db: sqlite3.Connection) -> None:
+def test_outbound_fails_closed_when_the_prompt_fell_out_of_the_window(
+    db: sqlite3.Connection,
+) -> None:
     t0 = datetime(2026, 10, 19, 15, 0, tzinfo=UTC)
-    outbound.note(db, OWNER, "Claude: first", t0)
-    for n in range(1, outbound.KEEP + 3):
-        outbound.note(db, OWNER, f"text {n}", t0 + timedelta(minutes=n))
-    assert len(json.loads(db.execute("SELECT value FROM kv WHERE key = ?",
-                                     (outbound.KV_PREFIX + OWNER,)).fetchone()[0])) == (
-        outbound.KEEP
-    )  # fmt: skip
     later = t0 + timedelta(hours=1)
-    assert outbound.claude_since(db, OWNER, set(), later) is False  # the Claude send was dropped
+    outbound.note(db, OWNER, "[A7] OK to close?", t0, "approval:a7:prompt:justin")
+    outbound.note(db, OWNER, "Claude: first", t0 + timedelta(seconds=1), "ask:t1")
+    for n in range(1, outbound.KEEP + 3):
+        outbound.note(db, OWNER, f"text {n}", t0 + timedelta(minutes=n), f"reply:{n}")
+    kept = db.execute("SELECT value FROM kv WHERE key = ?", (outbound.KV_PREFIX + OWNER,))
+    assert len(json.loads(kept.fetchone()[0])) == outbound.KEEP
+    # both the prompt and Claude's answer were pushed out: the last Claude answer still counts
+    assert outbound.claude_since(db, OWNER, {"approval:a7:prompt:justin"}, later) is True
+    outbound.note(db, OWNER, "[A7] still waiting", later, "approval:a7:remind:justin")
+    assert outbound.claude_since(db, OWNER, {"approval:a7:remind:justin"}, later) is False
     assert outbound.claude_since(db, "nobody", set(), later) is False
 
 

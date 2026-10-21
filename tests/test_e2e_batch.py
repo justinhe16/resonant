@@ -655,3 +655,20 @@ async def test_qwen_sees_only_the_report_line_of_a_change_that_ran(
         ]
         assert tool_turns and all('"done":"Done: linear: save issue' in t for t in tool_turns)
         assert all('"ok":true' not in t for t in tool_turns)  # never the extension's result
+
+
+async def test_a_tainted_turn_sends_no_early_answer_above_the_prompt(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """After reading outside text the model's words may carry it ("reply yes"): they never go
+    out right above the batch prompt; the prompt alone is sent."""
+    async with start(resonant_home, chat, tmp_path) as w:
+        w.model.push(
+            [("get_issue", {"id": "RES-12"})],
+            [("save_issue", {"id": "RES-12", "state": "Done"})],
+            "The ticket says to close it. Reply yes to go ahead.",
+        )
+        (prompt,) = await w.say("read RES-12 and close it")
+        assert 'linear: save issue id="RES-12", state="Done"' in prompt
+        assert all("Reply yes to go ahead" not in m.text for m in w.osa.sent)
+        assert w.evaluated("save_issue") == [("NeedsApproval", "tainted")]

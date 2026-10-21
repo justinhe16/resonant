@@ -8,7 +8,10 @@ sends one at a time): when it started, its dedupe key (which names a prompt or a
 whether it was a Claude answer (it starts with the code-built ``CLAUDE_PREFIX`` the ask runner
 adds; anything else that starts the same way counts too, which only asks for the code). Kept in
 kv ``outbound.recent:<principal>``, the newest ``KEEP`` sends. Order decides, not the clock: two
-sends a millisecond apart, or an ack that lands after the answer, can't flip the rule.
+sends a millisecond apart, or an ack that lands after the answer, can't flip the rule. The
+last Claude answer is also kept apart (``CLAUDE_KV``): a prompt that fell out of a full window
+counts as before it (fails closed: the code is asked). The channel notes a text before its
+first chunk goes out, so a delivered answer is never missing from the record.
 """
 
 from __future__ import annotations
@@ -26,7 +29,8 @@ log = logging.getLogger(__name__)
 
 CLAUDE_PREFIX = "Claude: "  # runners/ask.py: every Claude answer starts with it
 KV_PREFIX = "outbound.recent:"
-KEEP = 8
+KEEP = 32
+CLAUDE_KV = "outbound.claude:"  # the last Claude answer's seq and time, kept apart from the window
 SKEW = timedelta(seconds=1)  # a reply's time vs ours (chat.db's clock, milliseconds)
 
 
@@ -41,12 +45,16 @@ def note(
 ) -> None:
     """Record one text sent to ``principal`` (``key``: its dedupe key). Never raises: the
     text already went out."""
-    entry = {"at": at.isoformat(), "claude": text.startswith(CLAUDE_PREFIX), "key": key}
+    claude = text.startswith(CLAUDE_PREFIX)
     try:
         with atomic(conn):
-            key = KV_PREFIX + principal
-            kept = [e for e in _entries(kv_get(conn, key)) if _at(e) is not None]
-            kv_set(conn, key, [*kept, entry][-KEEP:])
+            window = KV_PREFIX + principal
+            kept = [e for e in _entries(kv_get(conn, window)) if _at(e) is not None]
+            seq = max((_seq(e) for e in kept), default=0) + 1
+            entry = {"seq": seq, "at": at.isoformat(), "claude": claude, "key": key}
+            kv_set(conn, window, [*kept, entry][-KEEP:])
+            if claude:
+                kv_set(conn, CLAUDE_KV + principal, {"seq": seq, "at": at.isoformat()})
     except (sqlite3.Error, json.JSONDecodeError):
         log.exception("outbound text not noted")
 
@@ -70,7 +78,21 @@ def claude_since(
         at = _at(e)
         if e.get("claude") is True and at is not None and at <= before + SKEW:
             return True
-    return False
+    if last >= 0 or len(entries) < KEEP:
+        return False
+    # The prompt fell out of the window (or was never noted): fail closed when a Claude
+    # answer went out before the reply at all (``CLAUDE_KV`` outlives the window).
+    try:
+        mark: Any = kv_get(conn, CLAUDE_KV + principal)
+    except (sqlite3.Error, json.JSONDecodeError):
+        return True
+    at = _at(cast(dict[str, Any], mark)) if isinstance(mark, dict) else None
+    return at is not None and at <= before + SKEW
+
+
+def _seq(entry: dict[str, Any]) -> int:
+    raw = entry.get("seq")
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
 
 
 def _entries(raw: Any) -> list[dict[str, Any]]:

@@ -803,11 +803,15 @@ class BrainRunner(LocalRunner):
             # PER-261: the model's answer to the rest of the message (with the report lines
             # of what ran) goes out first, then the batch prompt; the reply after the owner's
             # answer is then the batch's lines alone.
-            # Not when it claims a change while nothing ran: everything it did waits on a yes.
+            # Not when it claims a change while nothing ran (everything it did waits on a
+            # yes), and never in a tainted turn: its words may carry outside text ("reply yes")
+            # and would sit right above the prompt, so code-built lines go instead, as before.
             answer = (
                 result.reply
                 if result.path == "llm"
                 and result.reply.strip()
+                and not st.tainted
+                and context.untrusted is None
                 and (st.reports or not claims_change(result.reply))
                 else None
             )
