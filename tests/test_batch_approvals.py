@@ -24,7 +24,7 @@ from resonant.loop import NewTask
 from resonant.loop.types import Fail, StepOutcome, Task, Wait
 from resonant.models.client import null_spans
 from resonant.principals import Principal, Principals
-from resonant.router.approvals import ApprovalInbox, approvals_reply
+from resonant.router.approvals import ApprovalInbox, approvals_reply, refusal_reply
 from resonant.runners.local import Answer, LocalRunner
 from resonant.store import approvals as ap
 from resonant.store import tasks as repo
@@ -175,6 +175,7 @@ class H:
     def reply(
         self, text: str, *, actor: str = OWNER, identity: str = OWNER_ID, event: str = "e1",
         code: str | None = None, decision: str = "approve", always: bool = False,
+        picks: tuple[int, ...] | None = None,
     ) -> Any:  # fmt: skip
         return self.gate.resolve_reply(
             ApprovalReply(
@@ -182,6 +183,7 @@ class H:
                 decision=decision,  # pyright: ignore[reportArgumentType]
                 path="parser", event_id=event,
                 occurred_at=self.clock.now + timedelta(seconds=1), code=code, always=always,
+                picks=picks,
             )
         )  # fmt: skip
 
@@ -264,13 +266,16 @@ async def asked_batch(h: H, keys: tuple[str, ...] = ("A", "B", "C")) -> tuple[st
 def test_batch_text_lists_each_change_and_takes_the_strictest_answer() -> None:
     lines = ['close ticket id="A"', 'close ticket id="B"']
     assert batch_text("D7", lines) == (
-        '[D7] 2 changes, all or none:\n1. close ticket id="A"\n2. close ticket id="B"\n'
-        "Reply yes / no"
+        '[D7] OK to make these 2 changes?\n1. close ticket id="A"\n2. close ticket id="B"\n'
+        "Reply yes / no, or yes 1 D7 for just those."
     )
     assert batch_text("D7", lines, destructive=True).endswith(
-        "Some can't be undone. Reply yes D7 / no"
+        "Some can't be undone. Reply yes D7 / no, or yes 1 D7 for just those."
     )
-    assert batch_text("D7", lines, require_code=True).endswith("Reply exactly: yes D7 / no D7")
+    assert batch_text("D7", lines, require_code=True).endswith(
+        "Reply exactly: yes D7 / no D7, or yes 1 D7 for just those."
+    )
+    assert batch_text("D7", [*lines, "z"]).endswith("Reply yes / no, or yes 1,3 D7 for just those.")
     long = batch_text("D7", ["x" * 300, "y"])
     assert "1. " + "x" * 300 + "\n" in long  # never clipped: yes covers only what shows
 
@@ -279,7 +284,7 @@ async def test_one_prompt_for_the_whole_batch_to_the_owner_only(h: H) -> None:
     task_id, ids = await asked_batch(h)
     (prompt,) = h.channel.prompts
     assert prompt[0] == OWNER  # not the member, though they approve linear's tools
-    assert prompt[1].startswith(f"[{h.code()}] 3 changes, all or none:")
+    assert prompt[1].startswith(f"[{h.code()}] OK to make these 3 changes?")
     rows = [ap.get_approval(h.db, i) for i in ids]
     assert {r.expires_at for r in rows if r} == {h.clock.now - timedelta(seconds=1) + timedelta(
         seconds=TTL_S)}  # fmt: skip  # one expiry for all of them, from the prompt
@@ -393,7 +398,7 @@ async def test_an_l1_in_the_batch_needs_the_code(h: H) -> None:
     await h.close(task_id, items)
     mark_sent(h, task_id)
     (prompt,) = h.channel.prompts
-    assert prompt[1].endswith(f"Reply yes {h.code()} / no")
+    assert f"Reply yes {h.code()} / no, or yes 1 {h.code()} " in prompt[1]
     result = h.reply("yes")
     assert not result.ok and result.reason == "code_required"
     assert h.reply("no", decision="deny", event="e2").ok  # a plain no may still deny
@@ -504,7 +509,9 @@ async def test_a_batch_that_widens_trust_needs_the_code_and_says_so(h: H) -> Non
     mark_sent(h, task_id)
     (prompt,) = h.channel.prompts
     assert "2. widens trust: " in prompt[1]
-    assert prompt[1].endswith(f"Reply exactly: yes {h.code()} / no {h.code()}")
+    assert prompt[1].endswith(
+        f"Reply exactly: yes {h.code()} / no {h.code()}, or yes 1 {h.code()} for just those."
+    )
     result = h.reply("yes")
     assert not result.ok and result.reason == "code_required"
 
@@ -525,9 +532,9 @@ async def test_approvals_detail_for_a_batch_shows_every_change(h: H) -> None:
     pending = h.gate.pending_for(OWNER)
     text = approvals_reply(h.db, pending, h.code(), is_owner=True, now=h.clock.now)
     assert text is not None
-    assert text.startswith(f"[{h.code()}] 3 changes, all or none:")
+    assert text.startswith(f"[{h.code()}] 3 changes:")
     assert '1. close_ticket (L2): {"id": "A"}' in text
-    assert text.endswith(f"Reply yes / no {h.code()}")
+    assert text.endswith(f"Reply yes / no {h.code()}, or yes 1,3 {h.code()} for just those.")
 
 
 async def test_the_brain_never_gets_a_wait_for_an_asked_change(h: H) -> None:
@@ -563,6 +570,206 @@ def _ext_registry() -> tuple[ToolRegistry, dict[str, list[ToolSpec]]]:
     for spec in (*linear, CLOSE, PURGE):
         registry.register(spec)
     return registry, {"linear": linear}
+
+
+# --- yes 1,3 (PER-255) -----------------------------------------------------------------------
+
+
+def audit_rows(h: H, event: str = "approval.resolve") -> list[dict[str, Any]]:
+    rows = h.db.execute(
+        "SELECT requested_by, detail FROM audit_log WHERE action = ? ORDER BY id", (event,)
+    ).fetchall()
+    return [{**json.loads(r["detail"] or "{}"), "requested_by": r["requested_by"]} for r in rows]
+
+
+async def test_yes_some_runs_only_those_once_and_drops_the_rest(h: H) -> None:
+    task_id, ids = await asked_batch(h, ("A", "B", "C", "D"))
+    code = h.code()
+    result = h.reply(f"yes 1,3 {code}", code=code, picks=(1, 3))
+    assert result.ok
+    assert {r.approval_id: r.approved for r in result.resolved} == {
+        ids[0]: True, ids[1]: False, ids[2]: True, ids[3]: False,
+    }  # fmt: skip
+    rows = [ap.get_approval(h.db, i) for i in ids]
+    assert [r.status for r in rows if r] == ["approved", "rejected", "approved", "rejected"]
+    assert all(r is not None and r.decided_by == OWNER for r in rows)
+    batch = h.db.execute("SELECT used_at FROM approval_batches").fetchone()
+    assert batch["used_at"] is not None  # answered: nothing of it can bind again
+    done = await h.step(task_id)
+    assert h.ran == ["close:A", "close:C"]
+    assert h.channel.replies()[-1].splitlines() == [
+        'Done: close ticket id="A"',
+        'Not done: close ticket id="B" (not approved).',
+        'Done: close ticket id="C"',
+        'Not done: close ticket id="D" (not approved).',
+    ]
+    assert done.result["batch"] == 4 and done.result["batch_approved"] == 2
+    assert done.result["batch_ran"] == 2
+    # the same reply event again: the same split, nothing new resolved or run
+    again = h.reply(f"yes 1,3 {code}", code=code, picks=(1, 3))
+    assert set(again.resolved) == set(result.resolved)
+    assert h.reply("yes", event="e2").reason == "nothing_pending"
+    await h.step(task_id)
+    assert h.ran == ["close:A", "close:C"]
+    # one audit row, with each approval's decision on record
+    (row,) = [r for r in audit_rows(h) if r.get("ok")]
+    assert row["picks"] == [1, 3] and row["batch_id"] is not None
+    assert row["approved_ids"] == [ids[0], ids[2]] and row["rejected_ids"] == [ids[1], ids[3]]
+    assert row["approval_ids"] == ids and row["raw_text"] == f"yes 1,3 {code}"
+
+
+async def test_yes_some_without_the_code_binds_like_a_plain_yes(h: H) -> None:
+    task_id, _ = await asked_batch(h)
+    assert h.reply("yes 2", picks=(2,)).ok
+    await h.step(task_id)
+    assert h.ran == ["close:B"]
+
+
+async def test_picking_every_change_is_a_plain_yes(h: H) -> None:
+    task_id, _ = await asked_batch(h)
+    assert h.reply("yes 1,2,3", picks=(1, 2, 3)).ok
+    await h.step(task_id)
+    assert h.ran == ["close:A", "close:B", "close:C"]
+
+
+async def test_the_strictest_rule_applies_to_the_picked_changes(h: H) -> None:
+    task_id = h.new_task()
+    items = await h.propose(task_id, [(CLOSE, "A"), (PURGE, "B"), (WIDEN, "x")])
+    await h.close(task_id, items)
+    mark_sent(h, task_id)
+    code = h.code()
+    for text, picks in (("yes 2", (2,)), ("yes 1,2", (1, 2)), ("yes 3", (3,))):
+        result = h.reply(text, picks=picks, event=f"e-{text}")  # L1, or widens trust
+        assert not result.ok and result.reason == "code_required", text
+    inbox = ApprovalInbox(h.db, principals=principals(), gate=h.gate)
+    sent = inbox.sent_pending(OWNER)
+    assert refusal_reply("code_required", None, sent, (1, 2)) == f"Reply yes 1,2 {code} to confirm."
+    assert h.reply("yes 1", picks=(1,), event="e-1").ok  # only the L2 change: no code needed
+    await h.step(task_id)
+    assert h.ran == ["close:A"]
+    lines = h.channel.replies()[-1].splitlines()
+    assert lines[1].startswith('Not done: purge ticket id="B"') and lines[2].startswith(
+        "Not done: widens trust: "
+    )
+
+
+async def test_an_l1_pick_with_the_code_runs(h: H) -> None:
+    task_id = h.new_task()
+    items = await h.propose(task_id, [(CLOSE, "A"), (PURGE, "B")])
+    await h.close(task_id, items)
+    mark_sent(h, task_id)
+    code = h.code()
+    assert h.reply(f"yes 2 {code}", code=code, picks=(2,)).ok
+    await h.step(task_id)
+    assert h.ran == ["purge:B"]
+
+
+async def test_numbers_off_the_list_and_picks_for_a_lone_approval_are_refused(h: H) -> None:
+    task_id, ids = await asked_batch(h)
+    code = h.code()
+    for picks in ((4,), (1, 9), (20,)):
+        result = h.reply("yes", code=code, picks=picks, event=f"e-{picks}")
+        assert not result.ok and result.reason == "unknown_pick"
+    assert all(s == "pending" for s in h.gate.approval_states(ids).values())  # nothing decided
+    inbox = ApprovalInbox(h.db, principals=principals(), gate=h.gate)
+    sent = inbox.sent_pending(OWNER)
+    assert refusal_reply("unknown_pick", code, sent, (4,)) == (
+        f"Not done: {code} has 3 changes. Reply yes 1,3 {code} with numbers from its list."
+    )
+    assert h.reply("no", decision="deny", event="e-no").ok
+    await h.step(task_id)
+    lone = h.new_task()
+    items = await h.propose(lone, [(CLOSE, "Z")])
+    await h.close(lone, items)
+    mark_sent(h, lone)
+    result = h.reply("yes 1", picks=(1,), event="e-lone")
+    assert not result.ok and result.reason == "not_a_batch"
+    assert refusal_reply("not_a_batch", None, inbox.sent_pending(OWNER)) == (
+        "That one is a single change. Reply yes or no."
+    )
+    row = ap.get_approval(h.db, items[0].approval_id)
+    assert row is not None and row.status == "pending"
+
+
+async def test_a_member_can_never_pick_from_the_owners_batch(h: H) -> None:
+    task_id = h.new_task()
+    items = await h.propose(task_id, [(EXT_CLOSE, "A"), (EXT_CLOSE, "B")])
+    await h.close(task_id, items)
+    mark_sent(h, task_id)
+    code = h.code()
+    for c in (None, code):
+        result = h.reply("yes 1", actor=MEMBER, identity=MEMBER_ID, code=c, picks=(1,),
+                         event=f"m-{c}")  # fmt: skip
+        assert not result.ok and result.reason == "nothing_pending"
+    states = h.gate.approval_states([i.approval_id for i in items])
+    assert set(states.values()) == {"pending"}
+    refused = [r for r in audit_rows(h) if r.get("requested_by") == MEMBER]
+    assert len(refused) == 2 and all(not r["ok"] for r in refused)
+    assert all(r["approved_ids"] is None for r in refused)  # nothing bound, nothing split
+    assert h.reply("yes 2", picks=(2,)).ok
+
+
+async def test_a_refused_member_of_the_batch_rolls_the_whole_reply_back(h: H) -> None:
+    """One approval of the batch can't be resolved any more (its row was decided under the
+    gate, a race): the reply resolves none of it, so no change runs half-approved."""
+    task_id, ids = await asked_batch(h)
+    with transaction(h.db):
+        h.db.execute("UPDATE approvals SET status = 'rejected' WHERE id = ?", (ids[2],))
+    result = h.reply("yes 1,2", picks=(1, 2))
+    assert not result.ok
+    states = h.gate.approval_states(ids)
+    assert states[ids[0]] == "pending" and states[ids[1]] == "pending"
+    await h.step(task_id)  # the runner drops what is left of a split batch
+    assert h.ran == []
+
+
+async def test_yes_some_after_expiry_runs_nothing(h: H) -> None:
+    task_id, ids = await asked_batch(h)
+    h.clock.advance(TTL_S + 1)
+    result = h.reply("yes 1,3", picks=(1, 3))
+    assert not result.ok and result.reason == "nothing_pending"
+    assert set(h.gate.approval_states(ids).values()) == {"expired"}
+    await h.step(task_id)
+    assert h.ran == []
+    assert h.channel.replies()[-1] == "Not done: the approval for those 3 changes expired."
+
+
+async def test_a_crash_after_yes_some_never_runs_a_change_twice_or_a_dropped_one(h: H) -> None:
+    task_id, _ = await asked_batch(h, ("A", "B", "C", "D"))
+    assert h.reply("yes 1,3,4", picks=(1, 3, 4)).ok
+    h.crash_on.add("C")
+    with pytest.raises(Crash):
+        await h.step(task_id)  # A ran, B was dropped, C was running when the process died
+    assert h.ran == ["close:A", "close:C:crashed"]
+    await h.step(task_id)  # restarted: A replays, B stays dropped, C is ambiguous, D runs
+    assert h.ran == ["close:A", "close:C:crashed", "close:D"]
+    lines = h.channel.replies()[-1].splitlines()
+    assert lines[0] == 'Done: close ticket id="A"'
+    assert lines[1] == 'Not done: close ticket id="B" (not approved).'
+    assert lines[2].startswith('Not sure whether close ticket id="C" ran')
+    assert lines[3] == 'Done: close ticket id="D"'
+    n = h.db.execute("SELECT COUNT(*) FROM executions WHERE task_id = ?", (task_id,)).fetchone()
+    assert n[0] == 3  # B never got an execution row
+
+
+async def test_the_inbox_reads_yes_some_from_text(h: H) -> None:
+    task_id, _ = await asked_batch(h)
+    code = h.code()
+    inbox = ApprovalInbox(h.db, principals=principals(), gate=h.gate)
+    event = Event(source="imessage", type="message", principal=OWNER,
+                  payload={"text": f"Yes 3, 1 {code.lower()}.", "handle": "+15550000000"},
+                  occurred_at=h.clock.now + timedelta(seconds=1))  # fmt: skip
+    got = inbox.handle(event, f"Yes 3, 1 {code.lower()}.", OWNER)
+    assert got is not None and got.outcome == "resolved" and got.reply is None
+    await h.step(task_id)
+    assert h.ran == ["close:A", "close:C"]
+    bad = Event(source="imessage", type="message", principal=OWNER,
+                payload={"text": "yes 7", "handle": "+15550000000"},
+                occurred_at=h.clock.now + timedelta(seconds=1))  # fmt: skip
+    await asked_batch(h)  # a second batch, asked after the first was answered
+    refused = inbox.handle(bad, "yes 7", OWNER)
+    assert refused is not None and refused.outcome == "refused"
+    assert refused.reason == "unknown_pick" and "has 3 changes" in (refused.reply or "")
 
 
 def test_allow_targets_maps_names_to_the_changes_a_rule_can_cover() -> None:

@@ -285,10 +285,10 @@ async def test_four_linear_saves_in_one_claude_turn_ask_once_and_yes_runs_each_o
         assert reply.count("asked the owner:") == 4 and "not run" not in reply
         # ONE prompt, listing every change with its code-built summary
         code = w.batch_code()
-        assert prompt.startswith(f"[{code}] 4 changes, all or none:")
+        assert prompt.startswith(f"[{code}] OK to make these 4 changes?")
         for i, key in enumerate(KEYS, 1):
             assert f'{i}. linear: save issue id="{key}", state="Done"' in prompt
-        assert prompt.endswith("Reply yes / no")
+        assert prompt.endswith(f"Reply yes / no, or yes 1,3 {code} for just those.")
         assert len(w.rows("SELECT 1 FROM approvals WHERE status = 'pending'")) == 4
         assert w.runs("save_issue") == []
         (done,) = await w.say("yes")
@@ -342,7 +342,7 @@ async def test_a_mixed_l2_and_l1_batch_needs_the_code(
         calls = [*saves("RES-12"), {"name": "delete_issue", "args": {"id": "RES-14"}}]
         _reply, prompt = await _claude_batch(w, calls, "close RES-12 and delete RES-14")
         code = w.batch_code()
-        assert prompt.endswith(f"Some can't be undone. Reply yes {code} / no")
+        assert f"Some can't be undone. Reply yes {code} / no, or yes " in prompt
         assert await w.say("yes") == [f"Reply yes {code} to confirm."]
         assert w.runs("save_issue") == w.runs("delete_issue") == []
         (done,) = await w.say(f"yes {code}")
@@ -380,7 +380,7 @@ async def test_a_tainted_batch_still_asks_even_with_a_standing_rule(
                                  effect="allow", created_from="chat", now=utcnow())  # fmt: skip
         calls = [{"name": "get_issue", "args": {"id": "RES-12"}}, *saves("RES-12", "RES-14")]
         reply, prompt = await _claude_batch(w, calls, "read RES-12 and close it and RES-14")
-        assert reply.count("asked the owner:") == 2 and "2 changes, all or none" in prompt
+        assert reply.count("asked the owner:") == 2 and "OK to make these 2 changes?" in prompt
         assert w.evaluated("save_issue") == [("NeedsApproval", "tainted")] * 2
         assert w.runs("save_issue") == []
         (done,) = await w.say("yes")
@@ -458,7 +458,7 @@ async def test_qwen_batches_its_changes_into_one_prompt(
             "I've asked you about both.",
         )
         (prompt,) = await w.say("close RES-12 and comment shipped")
-        assert "2 changes, all or none" in prompt
+        assert "OK to make these 2 changes?" in prompt
         assert '1. linear: save issue id="RES-12", state="Done"' in prompt
         assert '2. linear: save comment body="shipped", issue="RES-12"' in prompt
         # the model saw it waits on the owner (and no code), then kept going
@@ -491,7 +491,7 @@ async def test_the_batch_cap_is_enforced(
         reply, prompt = await _claude_batch(w, saves(*KEYS), "close these four")
         assert reply.count("asked the owner:") == 3
         assert "not run: Not done: at most 3 changes can wait on one yes." in reply
-        assert "3 changes, all or none" in prompt and "RES-19" not in prompt
+        assert "OK to make these 3 changes?" in prompt and "RES-19" not in prompt
         statuses = [r["status"] for r in w.rows("SELECT status FROM approvals ORDER BY rowid")]
         assert statuses == ["pending", "pending", "pending", "expired"]  # never prompted
         (done,) = await w.say("yes")
