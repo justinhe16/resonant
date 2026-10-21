@@ -17,7 +17,10 @@ Every verdict is read from the tool results in the stream (did the token in the 
 back), never from what the model says. Safe by construction: ``--setting-sources ''`` (no
 settings, hooks or MCP of the owner's), ``--strict-mcp-config`` with no MCP config (no
 connectors: nothing can send), ``--no-session-persistence`` (no transcript), the scratch
-tree under the system temp dir, removed at the end unless ``--keep``.
+tree under the system temp dir, removed at the end unless ``--keep``. It runs on the owner's
+login (a scratch ``CLAUDE_CONFIG_DIR`` isn't logged in), so the CLI may still note the scratch
+cwd in ``~/.claude`` (a project entry, no transcript); it never touches ``~/.resonant`` or
+``~/code``.
 """
 
 from __future__ import annotations

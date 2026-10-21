@@ -1085,6 +1085,17 @@ class AskRunner:
         ).fetchall()
         return [(str(r[0]), str(r[1] or "")) for r in rows]
 
+    async def _refuse_queued(
+        self, task: Task, ctx: StepContext, cp: dict[str, Any], principal: str
+    ) -> StepOutcome:
+        """An ask queued before Resonant was paused or Claude hit its usage limit."""
+        if self._paused() or (until := self.limited_until()) is None:
+            return await self._finish(task, ctx, cp, "paused", PAUSED)
+        if principal != self.owner:
+            return await self._finish(task, ctx, cp, "usage_limit", LIMIT_OTHER)
+        return await self._finish(task, ctx, cp, "usage_limit", self._limit_text(until),
+                                  dedupe_key=_limit_key(until))  # fmt: skip
+
     def _settle_s(self, queue: list[tuple[str, str]]) -> float:
         """How long a turn that isn't next waits while the session is idle: briefly when the
         turn ahead is mid-step (it took the session just now, or answered and is wrapping up:
@@ -1177,13 +1188,12 @@ class AskRunner:
             effects = [e for e in cast(list[Any], cp.get("effects") or []) if isinstance(e, str)]
             done = f" Done before it: {'; '.join(effects)}." if effects else ""
             return await self._finish(task, ctx, cp, "interrupted", INTERRUPTED.format(done=done))
-        if self._paused():
-            return await self._finish(task, ctx, cp, "paused", PAUSED)
-        if (until := self.limited_until()) is not None:  # queued before the limit was hit
-            if principal != self.owner:
-                return await self._finish(task, ctx, cp, "usage_limit", LIMIT_OTHER)
-            return await self._finish(task, ctx, cp, "usage_limit", self._limit_text(until),
-                                      dedupe_key=_limit_key(until))  # fmt: skip
+        if self._paused() or self.limited_until() is not None:
+            try:
+                return await self._refuse_queued(task, ctx, cp, principal)
+            finally:
+                if self._is_turn(cp):  # PER-262: the next turn hears it now, not at the backstop
+                    self._wake_next_turn(task.id)
         if self._is_turn(cp):  # BR-11: one turn at a time, oldest first
             assert self.brain is not None
             queue = self._session_queue()

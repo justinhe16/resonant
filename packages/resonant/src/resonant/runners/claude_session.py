@@ -389,6 +389,8 @@ class ClaudeSession:
         if self._unhook is None:
             self._unhook = killswitch.add_pause_hook(self._on_pause)
         if self.paused is not None:
+            if self._watch is not None:  # an earlier process's (it ended without _kill)
+                self._watch.cancel()
             self._watch = asyncio.ensure_future(self._watch_pause(proc))
         with atomic(self.conn):
             audit(self.conn, "brain.session_start", session=sid[:8], pid=proc.pid)
