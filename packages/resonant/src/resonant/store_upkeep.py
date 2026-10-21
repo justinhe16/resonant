@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -59,6 +60,7 @@ JOB_ID = "prune"
 OFFSET = timedelta(minutes=30)  # after the backup, so the copy it needs exists
 CATCHUP = timedelta(hours=20)
 TIMEOUT_S = 1800.0
+DEADLINE_MARGIN_S = 60.0  # stop between chunks this long before the job's timeout
 CHUNK = 2000
 BACKUP_MAX_AGE = timedelta(hours=24)
 KV_AUDIT_BEFORE = "store.prune_audit_before"  # read by the audit_log_no_delete trigger
@@ -85,6 +87,14 @@ class PruneResult:
             "executions": self.executions,
             "audit": self.audit,
         }
+
+    def plus(self, other: PruneResult) -> PruneResult:
+        return PruneResult(
+            self.events + other.events,
+            self.tasks + other.tasks,
+            self.executions + other.executions,
+            self.audit + other.audit,
+        )
 
 
 # --- what is still referenced ----------------------------------------------------------
@@ -133,6 +143,8 @@ _EVENT_DELETABLE = """
     AND e.id NOT IN (SELECT value FROM json_each(:keep))
     AND e.id NOT IN (SELECT resolved_event_id FROM approvals WHERE resolved_event_id IS NOT NULL)
     AND e.id NOT IN (SELECT through_event_id FROM brain_summaries)
+    AND NOT EXISTS (SELECT 1 FROM brain_summaries b JOIN events c ON c.id = b.through_event_id
+                    WHERE b.principal = e.principal AND e.rowid > c.rowid)
 """
 
 # A finished task nothing needs, past retention (``t``): its events are only the ones the event
@@ -194,17 +206,31 @@ def prune(
     *,
     dry_run: bool = False,
     chunk: int = CHUNK,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> PruneResult:
     """Delete what is past retention and unreferenced; returns the counts (what *would* go,
-    with ``dry_run``). ``conn`` must have foreign keys on and no transaction open."""
-    open_ids, refs = open_references(conn)
-    params = _params(now, cfg, open_ids, refs)
+    with ``dry_run``). ``conn`` must have foreign keys on and no transaction open.
+
+    Each chunk is one write transaction that re-reads the open tasks' references and picks its
+    rows under the write lock, so a reference a writer added between chunks is always seen.
+    ``deadline`` (``time.monotonic()``): stop between chunks once it passes; the rest goes on
+    the next run."""
     if dry_run:
-        return _count_deletable(conn, params)
-    events = _delete_events(conn, params, chunk)
-    tasks, executions = _delete_tasks(conn, params, chunk)
-    audit_rows = _delete_audit(conn, params, chunk)
-    return PruneResult(events, tasks, executions, audit_rows)
+        return _count_deletable(conn, _params(now, cfg, *open_references(conn)))
+    result = PruneResult(0, 0, 0, 0)
+    for step in (_events_chunk, _tasks_chunk, _audit_chunk):
+        while True:
+            if deadline is not None and monotonic() >= deadline:
+                log.info("prune stopped at its deadline; the rest goes next run")
+                return result
+            with transaction(conn):
+                params: dict[str, Any] = {**_params(now, cfg, *open_references(conn)), "n": chunk}
+                got, rows = step(conn, params)
+            result = result.plus(got)
+            if rows < chunk:
+                break
+    return result
 
 
 def _count_deletable(conn: sqlite3.Connection, params: dict[str, str]) -> PruneResult:
@@ -219,49 +245,32 @@ def _count_deletable(conn: sqlite3.Connection, params: dict[str, str]) -> PruneR
     )
 
 
-def _delete_events(conn: sqlite3.Connection, params: dict[str, str], chunk: int) -> int:
-    args = {**params, "n": chunk}
-    total = 0
-    while True:
-        with transaction(conn):
-            n = conn.execute(_DELETE_EVENTS, args).rowcount
-        total += n
-        if n < chunk:
-            return total
+def _events_chunk(conn: sqlite3.Connection, params: dict[str, Any]) -> tuple[PruneResult, int]:
+    n = conn.execute(_DELETE_EVENTS, params).rowcount
+    return PruneResult(n, 0, 0, 0), n
 
 
-def _delete_tasks(conn: sqlite3.Connection, params: dict[str, str], chunk: int) -> tuple[int, int]:
-    args = {**params, "n": chunk}
-    tasks = executions = 0
-    while True:
-        ids = [r[0] for r in conn.execute(_PICK_TASKS, args)]
-        if not ids:
-            return tasks, executions
-        batch = json.dumps(ids)
-        with transaction(conn):
-            executions += conn.execute(
-                "DELETE FROM executions WHERE task_id IN (SELECT value FROM json_each(?))", (batch,)
-            ).rowcount
-            tasks += conn.execute(
-                "DELETE FROM tasks WHERE id IN (SELECT value FROM json_each(?))", (batch,)
-            ).rowcount
-        if len(ids) < chunk:
-            return tasks, executions
+def _tasks_chunk(conn: sqlite3.Connection, params: dict[str, Any]) -> tuple[PruneResult, int]:
+    """Picks and deletes in the same transaction: the ids deleted are exactly those checked."""
+    ids = [r[0] for r in conn.execute(_PICK_TASKS, params)]
+    if not ids:
+        return PruneResult(0, 0, 0, 0), 0
+    batch = json.dumps(ids)
+    executions = conn.execute(
+        "DELETE FROM executions WHERE task_id IN (SELECT value FROM json_each(?))", (batch,)
+    ).rowcount
+    tasks = conn.execute(
+        "DELETE FROM tasks WHERE id IN (SELECT value FROM json_each(?))", (batch,)
+    ).rowcount
+    return PruneResult(0, tasks, executions, 0), len(ids)
 
 
-def _delete_audit(conn: sqlite3.Connection, params: dict[str, str], chunk: int) -> int:
-    """Each chunk opens the trigger's window, deletes and closes it in one transaction."""
-    cut = params["audit_cut"]
-    args = {**params, "n": chunk}
-    total = 0
-    while True:
-        with transaction(conn):
-            kv_set(conn, KV_AUDIT_BEFORE, cut)
-            n = conn.execute(_DELETE_AUDIT, args).rowcount
-            conn.execute("DELETE FROM kv WHERE key = ?", (KV_AUDIT_BEFORE,))
-        total += n
-        if n < chunk:
-            return total
+def _audit_chunk(conn: sqlite3.Connection, params: dict[str, Any]) -> tuple[PruneResult, int]:
+    """Opens the trigger's window, deletes and closes it, inside the chunk's transaction."""
+    kv_set(conn, KV_AUDIT_BEFORE, params["audit_cut"])
+    n = conn.execute(_DELETE_AUDIT, params).rowcount
+    conn.execute("DELETE FROM kv WHERE key = ?", (KV_AUDIT_BEFORE,))
+    return PruneResult(0, 0, 0, n), n
 
 
 # --- the job ---------------------------------------------------------------------------
@@ -284,7 +293,13 @@ def run_prune(settings: Settings, now: datetime) -> dict[str, Any]:
     the ``store.pruned`` audit row (only when something went)."""
     conn = connect(settings.db_path)
     try:
-        result = prune(conn, now, settings.retention, dry_run=settings.dry_run)
+        result = prune(
+            conn,
+            now,
+            settings.retention,
+            dry_run=settings.dry_run,
+            deadline=time.monotonic() + TIMEOUT_S - DEADLINE_MARGIN_S,
+        )
         if settings.dry_run:
             log.info("prune dry run: would delete %s", result.as_dict())
             return {**result.as_dict(), "dry_run": True}

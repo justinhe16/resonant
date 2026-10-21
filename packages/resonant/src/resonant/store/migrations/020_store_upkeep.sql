@@ -13,6 +13,9 @@
 --     as its DELETE and removes again before committing. No other connection ever sees the key,
 --     and a row at or after the cutoff can never be deleted. The update trigger is unchanged.
 CREATE INDEX events_source_time ON events (source, occurred_at);
+-- The prune's "does this task still have events" check and the FK check on deleting a task
+-- (events_pending is partial, so it can't serve either).
+CREATE INDEX events_task ON events (task_id);
 
 CREATE TABLE tasks_new (
     id                TEXT PRIMARY KEY,
@@ -47,7 +50,7 @@ INSERT INTO tasks_new (id, kind, runner, extension, principal, lane, priority, s
 SELECT id, kind, runner, extension, principal, lane, priority, status,
     wait_reason, wake_at, attempts, step_no, checkpoint, claude_session_id, worktree_path, scope,
     origin_event_id, channel_ref, trace_id, result, error, created_at, updated_at
-FROM tasks;
+FROM tasks ORDER BY rowid;
 DROP TABLE tasks;
 ALTER TABLE tasks_new RENAME TO tasks;
 CREATE INDEX tasks_runnable ON tasks (status, priority, created_at);

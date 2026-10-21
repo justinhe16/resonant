@@ -74,11 +74,21 @@ def event(
     consumed: bool = True,
     source: str = "imessage",
     type: str = "message",
+    principal: str | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO events (id, task_id, source, type, payload, occurred_at, received_at,"
-        " trace_id, consumed_at) VALUES (?, ?, ?, ?, '{}', ?, ?, 'tr', ?)",
-        (id, task_id, source, type, ago(days), ago(days), ago(days) if consumed else None),
+        "INSERT INTO events (id, task_id, source, type, principal, payload, occurred_at,"
+        " received_at, trace_id, consumed_at) VALUES (?, ?, ?, ?, ?, '{}', ?, ?, 'tr', ?)",
+        (
+            id,
+            task_id,
+            source,
+            type,
+            principal,
+            ago(days),
+            ago(days),
+            ago(days) if consumed else None,
+        ),
     )
 
 
@@ -612,3 +622,67 @@ def test_migration_020_applies_to_a_copy_of_a_realistic_v19_store(tmp_path: Path
         assert c.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         c.close()
+
+
+# --- review round 1: history tail, per-chunk references, deadline, index ---------------------
+
+
+def test_the_brain_history_after_its_summary_cursor_is_kept(db: sqlite3.Connection) -> None:
+    """``thread_after`` reads every event after the cursor: those exchanges aren't folded into
+    the summary yet, so pruning them would lose them. Another principal's are fair game."""
+    event(db, "before", principal="p", days=OLD + 2)
+    event(db, "cursor", principal="p", days=OLD + 1)
+    event(db, "after", principal="p", days=OLD)
+    event(db, "other", principal="q", days=OLD)
+    summary(db, "cursor")
+    prune(db)
+    assert ids(db, "events") == {"cursor", "after"}
+    assert_intact(db)
+
+
+def test_each_chunk_sees_references_added_since_the_last(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A task opened between chunks that points at an old task keeps it: the references are
+    read again inside each chunk's transaction, not once up front."""
+    for i in range(4):
+        event(db, f"e{i}")
+    task(db, "old")
+    real = store_upkeep.open_references
+    calls = 0
+
+    def spy(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # after the first events chunk: a writer opens a task pointing at "old"
+            conn.execute("SAVEPOINT w")
+            task(conn, "new", status="queued", days=0, checkpoint={"asking_task": "old"})
+            conn.execute("RELEASE w")
+        return real(conn)
+
+    monkeypatch.setattr(store_upkeep, "open_references", spy)
+    r = prune(db, chunk=2)
+    assert r.events == 4 and r.tasks == 0
+    assert ids(db, "tasks") == {"old", "new"}
+    assert_intact(db)
+
+
+def test_a_passed_deadline_stops_between_chunks(db: sqlite3.Connection) -> None:
+    for i in range(6):
+        event(db, f"e{i}")
+    ticks = iter([0.0, 10.0])  # one chunk, then past the deadline
+    r = prune(db, chunk=2, deadline=5.0, monotonic=lambda: next(ticks))
+    assert r == store_upkeep.PruneResult(events=2)
+    assert len(ids(db, "events")) == 4
+    assert_intact(db)
+    assert prune(db).events == 4  # the rest goes next run
+
+
+def test_the_task_prune_finds_a_tasks_events_by_index(db: sqlite3.Connection) -> None:
+    """Without ``events_task`` each candidate task (and the FK check on its delete) scans
+    every event: minutes on a real backlog, under the write lock."""
+    plan = " ".join(
+        str(r["detail"])
+        for r in db.execute("EXPLAIN QUERY PLAN SELECT 1 FROM events WHERE task_id = ?", ("t",))
+    )
+    assert "events_task" in plan
