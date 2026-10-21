@@ -902,4 +902,6 @@ async def test_the_daemon_runs_the_ask_startup_before_the_loop(
 
     monkeypatch.setattr(wiring, "start_asks", recording)
     async with start(resonant_home, chat, tmp_path):
+        # start() returns once the chat reader is up; the startup runs just after it
+        await wait_until(lambda: bool(calls), 10)
         assert calls == [True]
