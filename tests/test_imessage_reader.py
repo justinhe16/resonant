@@ -21,6 +21,7 @@ from resonant.gateway.imessage.attributed_body import parse_attributed_body
 from resonant.gateway.imessage.fixtures import TAPBACK_LOVE, FakeChatDB, to_apple_ns
 from resonant.gateway.imessage.reader import (
     CURSOR_KEY,
+    FUTURE_SKEW,
     from_apple_time,
     normalize_handle,
 )
@@ -585,6 +586,36 @@ async def test_run_survives_errors(
 
 
 # --- helpers and config -----------------------------------------------------------------
+
+
+# --- timestamps -------------------------------------------------------------------------
+
+
+def test_a_clock_that_runs_ahead_is_clamped_to_the_read_time(
+    chat: FakeChatDB, principals: Principals, db: sqlite3.Connection, clock: FakeClock
+) -> None:
+    reader = make_reader(chat, principals, db, clock)
+    reader.poll_once(Sink(db))
+    chat.add_message(handle=OWNER_PHONE, text="yes", at=clock.now + timedelta(minutes=5))
+    chat.add_message(handle=OWNER_PHONE, text="ok", at=clock.now + FUTURE_SKEW / 2)
+    sink = Sink(db)
+    assert reader.poll_once(sink) == 2
+    ahead, slight = sink.events
+    assert ahead.occurred_at == clock.now + FUTURE_SKEW  # five minutes ahead: clamped
+    assert ahead.payload["at"] == ahead.occurred_at.isoformat(timespec="milliseconds")
+    assert slight.occurred_at == clock.now + FUTURE_SKEW / 2  # within the skew: kept
+
+
+def test_a_clock_that_runs_behind_is_kept(
+    chat: FakeChatDB, principals: Principals, db: sqlite3.Connection, clock: FakeClock
+) -> None:
+    reader = make_reader(chat, principals, db, clock)
+    reader.poll_once(Sink(db))
+    behind = clock.now - timedelta(minutes=5)
+    chat.add_message(handle=OWNER_PHONE, text="yes", at=behind)
+    sink = Sink(db)
+    assert reader.poll_once(sink) == 1
+    assert sink.events[0].occurred_at == behind
 
 
 def test_normalize_handle() -> None:
