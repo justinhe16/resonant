@@ -64,7 +64,8 @@ BRAIN_TOOL_ITEMS = 20  # the Claude brain's last tool calls (PER-258)
 # The briefs' size caps, so the remote tier stays well under the relay's 30 KiB: the first
 # runs (active first, as ``runs.recent`` orders them), the first open approvals and questions,
 # and the most urgent open pulse items. ``tests/test_dashboard_snapshot.py`` fills every one.
-# All of them full take about 10 KiB; the pusher drops them if a snapshot is still too large.
+# All of them full take about 10 KB (about 18 KB with ten extensions, in the test); the pusher
+# drops them if a snapshot is still too large.
 RUN_BRIEF_ITEMS = 20
 APPROVAL_BRIEF_ITEMS = 10
 QUESTION_BRIEF_ITEMS = 10

@@ -79,7 +79,8 @@ export function ActiveRuns({ snap, now }: { snap: Snapshot; now: number }) {
   return (
     <Section title="Active runs" description={`${count} running, waiting or queued`}>
       {items === undefined ? (
-        brief !== undefined ? (
+        // An empty brief with active runs counted is a snapshot sent without its briefs.
+        brief !== undefined && (brief.length > 0 || count === 0) ? (
           <BriefRuns runs={brief} now={now} empty="No runs in flight." />
         ) : count === 0 ? (
           <Empty>No runs in flight.</Empty>
@@ -118,6 +119,8 @@ export function ActiveTasks({ snap }: { snap: Snapshot }) {
 export function RunsAndTasks({ snap, now }: { snap: Snapshot; now: number }) {
   const finished = snap.runs.items?.filter((r) => !isActive(r));
   const finishedBrief = snap.runs.brief?.filter((r) => !isActive(r));
+  const finishedCount =
+    sum(snap.runs.by_state) - sum(snap.runs.by_state, ACTIVE_RUN_STATES);
   return (
     <Section title="Runs and tasks">
       <div className="space-y-5">
@@ -129,7 +132,7 @@ export function RunsAndTasks({ snap, now }: { snap: Snapshot; now: number }) {
         </Group>
         <Group label="Recent runs">
           {finished === undefined ? (
-            finishedBrief !== undefined ? (
+            finishedBrief !== undefined && (finishedBrief.length > 0 || finishedCount === 0) ? (
               <BriefRuns runs={finishedBrief} now={now} empty="No finished runs yet." />
             ) : (
               <LocalOnly what="Run details" />

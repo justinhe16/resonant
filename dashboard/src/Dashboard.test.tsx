@@ -229,6 +229,22 @@ describe("Dashboard, remote tier", () => {
     expect(screen.getAllByText("running").length).toBeGreaterThan(0);
     expect(screen.queryByText(/Add a dashboard job/)).not.toBeInTheDocument();
   });
+
+  it("never says 'none' when the pusher dropped the briefs to fit the relay", async () => {
+    const bare = clone(remote);
+    bare.runs.brief = [];
+    bare.approvals.brief = [];
+    bare.questions.brief = [];
+    bare.pulse.brief = [];
+    bare.brain_activity = { ...bare.brain_activity!, recent: [] };
+    mount(bare);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(screen.queryByText("No runs in flight.")).not.toBeInTheDocument();
+    expect(screen.queryByText("No finished runs yet.")).not.toBeInTheDocument();
+    expect(screen.queryByText("All quiet.")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Run details are shown on the local dashboard only.")).toHaveLength(2);
+    expect(screen.getByText("Its tool calls are shown on the local dashboard only.")).toBeInTheDocument();
+  });
 });
 
 describe("Dashboard, empty and failure states", () => {
