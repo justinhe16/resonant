@@ -361,7 +361,7 @@ async def test_a_partial_failure_is_reported_and_the_rest_still_run(
         (done,) = await w.say("yes")
         assert done.splitlines() == [
             'Done: linear: save issue id="RES-12", state="Done"',
-            'Failed: linear: save issue id="RES-99", state="Done" (exit 1)',
+            'Failed: linear: save issue id="RES-99", state="Done": locked',  # its stderr
             'Done: linear: save issue id="RES-19", state="Done"',
         ]
         assert len(w.runs("save_issue")) == 3

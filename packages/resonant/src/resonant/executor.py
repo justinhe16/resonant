@@ -47,6 +47,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from abc import ABC, abstractmethod
@@ -54,6 +55,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from resonant.gate.codes import clean_external
 from resonant.gate.types import Allow, Decision, Intent, TokenVerifier
 from resonant.redact import Redactor
 from resonant.secrets import SecretError, SecretMissing, SecretStore, values_of
@@ -73,6 +75,31 @@ def _stderr_tail(error: BaseException) -> str | None:
     """The redacted stderr tail an extension failure carries, for the audit row only."""
     tail: object = getattr(error, "stderr_tail", None)
     return tail if isinstance(tail, str) else None
+
+
+REASON_MAX = 200
+# Lines of a stderr tail that are never the reason: a traceback's frames and markers.
+_NOISE = re.compile(r"^(Traceback |File \"|During handling|The above exception|\^+$|~+$)")
+
+
+def stderr_reason(tail: str | None, extension: str | None = None) -> str | None:
+    """The reason a failed extension call gives (PER-268): the last meaningful line of its
+    stderr tail, without the ``<extension>: `` prefix it prints, cleaned with
+    ``clean_external`` and clipped to ``REASON_MAX``. None when there is none. The tail is
+    already redacted."""
+    if not tail:
+        return None
+    lines = [line.strip() for line in tail.splitlines() if line.strip()]
+    lines = [line for line in lines if not _NOISE.match(line)]
+    if not lines:
+        return None
+    last = lines[-1]
+    if extension and last.lower().startswith(f"{extension.lower()}: "):
+        last = last[len(extension) + 2 :]
+    flat = clean_external(last)
+    if len(flat) > REASON_MAX:
+        flat = flat[: REASON_MAX - 3].rstrip() + "..."
+    return flat or None
 
 
 def idempotency_key(task_id: str, step_no: int, call_index: int, intent_hash: str) -> str:
@@ -127,6 +154,9 @@ class ToolResult:
     idempotency_key: str | None = None
     events: tuple[dict[str, Any], ...] = ()  # a ContextHandler's events, redacted
     notice: str | None = None  # a code-built reply for a definite failure (missing secret)
+    # PER-268: a failed extension call's own reason, the last meaningful line of its stderr
+    # (redacted, cleaned and clipped: ``stderr_reason``), for the failure reply.
+    reason: str | None = None
 
 
 def secret_notice(error: SecretError) -> str:
@@ -319,6 +349,9 @@ class Executor:
         detail: dict[str, Any] = {}
         if stderr_tail:
             detail["stderr_tail"] = redactor.text(stderr_tail)
+            if not outcome.ok:
+                reason = stderr_reason(detail["stderr_tail"], intent.extension)
+                outcome = replace(outcome, reason=reason)
         with transaction(self.conn):
             if not outcome.ambiguous:  # ambiguous rows stay 'started' until resolved
                 self.conn.execute(

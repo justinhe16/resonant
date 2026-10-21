@@ -50,6 +50,7 @@ from zoneinfo import ZoneInfo
 from resonant.brain.text import flat
 from resonant.config import Settings
 from resonant.dashboard.snapshot import RunItem, Snapshot, build_snapshot
+from resonant.gate.summary import plain
 from resonant.loop.slots import SlotPool
 from resonant.status import collect_status
 from resonant.store import brain as brain_store
@@ -230,7 +231,7 @@ def render_briefing(
         for q in snapshot.questions.items or []
     ]
     approvals = [
-        f"{a.summary} ({a.level}, expires {_when(a.expires_at, now, zone)})"
+        f"{plain(a.summary)} ({a.level}, expires {_when(a.expires_at, now, zone)})"
         for a in snapshot.approvals.items or []
     ]
     known = {r.name: r for r in snapshot.repos or []}
@@ -358,7 +359,9 @@ def since_notes(
             line += f", PR #{r.pr_number}"
         found.append((at, f"{line} ({_when(at, now, zone)})"))
     for a in brain_store.expired_since(conn, since, now):
-        found.append((a.expired_at, f"Approval expired: {_clean(a.summary, ITEM_MAX_CHARS)}"))
+        found.append(
+            (a.expired_at, f"Approval expired: {_clean(plain(a.summary), ITEM_MAX_CHARS)}")
+        )
     repo_of: dict[str, str | None] = {r.code: r.repo for r in recent}
     for q in questions.open_asks(conn):
         if since < q.asked_at <= now:

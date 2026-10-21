@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -267,6 +268,17 @@ def live(pid: int) -> bool:
         return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
     except psutil.Error:
         return False
+
+
+def bare(text: str) -> str:
+    """An end text's first line without the run's name (PER-268): ``R1 opened PR #41 …``."""
+    first = text.splitlines()[0] if text else ""
+    return re.sub(r"^(R[0-9]+) \(.*?\) ", r"\1 ", first)
+
+
+def opened(code: str) -> Callable[[str], bool]:
+    """Whether a text is run ``code``'s end text with its PR opened."""
+    return lambda t: bare(t).startswith(f"{code} opened PR #")
 
 
 async def until(cond: Callable[[], bool], limit_s: float = 20.0, what: str = "condition") -> None:
@@ -531,8 +543,9 @@ async def test_happy_path_ends_in_a_pr(h: Harness) -> None:
     assert run.summary == "Fixed it. Added claude-fix.txt."
     [(who, text)] = h.chan.sent
     assert who == "owner"
-    assert text.startswith(
-        "R1 done: PR #41 (CI green) · https://github.com/own/proj/pull/41 · 1 file · "
+    assert (
+        text.startswith("R1 (fix the flaky test) opened PR #41 (CI green, 1 file, ")
+        and "): https://github.com/own/proj/pull/41\n" in text
     )
     assert "/merge R1" in text and "R1: Fixed it" in text
     assert "⚠" not in text
@@ -623,8 +636,8 @@ async def test_a_run_with_no_repo_works_in_a_scratch_dir(
     assert h.api.issued == 0  # no GitHub token minted
     assert h.gh_calls() == [] and h.gh_calls("api") == []
     [text] = [t for t in h.chan.texts() if t.startswith("R1 ")]
-    assert text.startswith("R1 done (") and text.endswith(
-        "): Checked the disk: 80% full, the biggest dir is ~/Downloads."
+    assert text.startswith("R1 (how full is the disk?) finished in ") and text.endswith(
+        ": Checked the disk: 80% full, the biggest dir is ~/Downloads."
     )
     assert not h.checkout().exists() and h.branches() == ["main"]
     # cleanup after keep_days removes the scratch dir
@@ -690,7 +703,7 @@ async def test_no_changes_ends_without_a_pr(tmp_path: Path, db: sqlite3.Connecti
     await h.start()
     await h.drain()
     assert h.run().status == "no_changes"
-    assert h.chan.texts() == ["R1: no changes. Nothing to change."]
+    assert h.chan.texts() == ["R1 (fix the flaky test) made no changes: Nothing to change."]
     assert h.gh_calls("create") == [] and h.branches() == ["main"]
     assert h.api.live == set()  # the token died with the session
     task = task_store.get_task(h.conn, cast(str, h.run().task_id))
@@ -855,7 +868,7 @@ async def test_a_repo_without_ci_still_runs_and_the_reply_says_so(
     run = h.run()
     assert run.status == "ready"
     [text] = h.chan.texts()
-    assert "no CI: proj has no pull_request workflow; /merge R1 merges it without CI." in text
+    assert "\nNo CI: proj has no pull_request workflow; /merge R1 merges it without CI." in text
     repo = repo_store.find(db, "proj")
     assert repo is not None and repo.ci is False
 
@@ -885,7 +898,7 @@ async def test_the_reply_is_code_built_and_clipped(tmp_path: Path, db: sqlite3.C
     assert run.status == "failed"
     assert run.failure == "Claude failed (exit 1) (work kept: /runs R1)"
     assert h.code_dir("R1").exists()  # work kept
-    assert h.chan.texts() == [f"R1 failed: {run.failure}"]
+    assert h.chan.texts() == [f"R1 (fix the flaky test) failed: {run.failure}"]
     assert "boom" not in h.chan.texts()[0]
     assert h.branches() == ["main"] and h.gh_calls() == []
 
@@ -970,7 +983,7 @@ async def test_checks_refuse_a_github_change_and_tokens(
     run = h.run()
     assert run.status == "ready" and ".github" in (run.failure or "")
     assert run.pr_number == 41 and run.branch in h.branches()
-    assert "⚠ it can't be merged as it is" in h.chan.texts()[0]
+    assert "\n⚠ It can't be merged as it is" in h.chan.texts()[0]
     res = await h.runner.merge_run("R1")
     assert isinstance(res, Refused) and ".github" in res.reason
     assert h.gh_calls("merge") == [] and h.run().status == "ready"
@@ -1334,7 +1347,8 @@ async def test_cancel_before_the_run_starts(h: Harness) -> None:
     task = task_store.get_task(h.conn, cast(str, run.task_id))
     assert task is not None and task.status == "cancelled"
     await h.drain()
-    assert h.chan.texts() == ["R1 cancelled."] and not (h.tmp(code)).exists()
+    assert h.chan.texts() == ["R1 (fix the flaky test) was cancelled."]
+    assert not (h.tmp(code)).exists()
     assert isinstance(await h.runner.cancel_run(code), Refused)  # twice
     assert isinstance(await h.runner.cancel_run("R99"), Refused)
 
@@ -1357,7 +1371,8 @@ async def test_cancel_during_the_session_ends_the_tree_and_deletes_the_dir(
     assert run.workspace is None and not h.worktree(code).exists()  # removed, then forgotten
     assert (h.checkout() / "README.md").exists()  # the checkout stays
     assert run.branch and run.branch not in git(h.checkout(), "branch", "--format=%(refname:short)")
-    assert h.chan.texts() == ["R1 cancelled."]  # once, whichever path got there first
+    # once, whichever path got there first
+    assert h.chan.texts() == ["R1 (fix the flaky test) was cancelled."]
     assert h.branches() == ["main"] and h.gh_calls() == []
     item = pulse_store.get(h.conn, "core", "run/r1")
     assert item is not None and item.cleared and not item.changed
@@ -1394,7 +1409,7 @@ async def test_cancel_at_each_step_ends_the_run(
     run = h.run(code)
     assert run.status == "cancelled"
     assert not h.code_dir(code).exists()
-    assert h.chan.texts()[0].startswith("R1 cancelled.")
+    assert h.chan.texts()[0].startswith("R1 (fix the flaky test) was cancelled.")
     assert h.processes_of(code) == []
     assert h.api.live == set()
     if phase == "prepare":  # no session ran: nothing was pushed
@@ -1427,7 +1442,10 @@ async def test_kill_switch_stops_running_sessions(tmp_path: Path, db: sqlite3.Co
         assert h.run(c).status == "cancelled" and h.run(c).pgid is None
     assert not h.code_dir(code).exists()
     assert h.branches() == ["main"] and h.gh_calls() == []
-    assert sorted(h.chan.texts()) == ["R1 cancelled.", "R2 cancelled."]
+    assert sorted(h.chan.texts()) == [
+        "R1 (fix the flaky test) was cancelled.",
+        "R2 (fix the flaky test) was cancelled.",
+    ]
     assert (await h.runner.start_run("proj", "again", "owner")) == Refused(
         "Resonant is paused. /resume first."
     )
@@ -1632,6 +1650,8 @@ async def test_list_runs_orders_active_first(h: Harness) -> None:
 
 
 def test_reply_texts() -> None:
+    from dataclasses import replace
+
     base = runs_store.Run(
         code="R3", task_id=None, principal="owner", repo="proj", ask="", status="ready",
         step="reply", branch=None, base_branch=None, base_sha=None, head_sha=None,
@@ -1642,28 +1662,48 @@ def test_reply_texts() -> None:
         flagged_paths=("Makefile", "package.json"), summary=None, failure=None,
         created_at=utcnow(), started_at=None, ended_at=None, updated_at=utcnow(),
     )  # fmt: skip
-    from dataclasses import replace
-
+    # PER-268: every end text pinned. A headline like a coworker's note, then at most 2 lines.
+    base = replace(base, ask="fix the flaky login test on main")
+    who = "R3 (fix the flaky login test on main)"
+    url = "https://github.com/o/r/pull/41"
     assert reply_text(base, "red") == (
-        "R3 done: PR #41 (CI red) · https://github.com/o/r/pull/41 · 3 files · 12m\n"
+        f"{who} opened PR #41 (CI red, 3 files, 12m): {url}\n"
         "⚠ changes Makefile, package.json\n/merge R3 when CI is green."
     )
-    green = reply_text(base, "green") or ""
-    assert green.splitlines()[0].startswith("R3 done: PR #41 (CI green) ·")
-    assert green.endswith("/merge R3 to merge it.")
-    assert "(CI pending)" in (reply_text(base, "pending") or "")
-    assert "(no CI)" in (reply_text(base, "none") or "")
-    assert "(CI unknown)" in (reply_text(base) or "")
+    assert reply_text(replace(base, flagged_paths=(), summary="Fixed it."), "green") == (
+        f"{who} opened PR #41 (CI green, 3 files, 12m): {url}\n"
+        "/merge R3 to merge it.\nR3: Fixed it."
+    )
+    assert "(CI pending, " in (reply_text(base, "pending") or "")
+    assert "(no CI, " in (reply_text(base, "none") or "")
+    assert "(CI unknown, " in (reply_text(base) or "")
     refused = reply_text(replace(base, failure="it changes .github/ (workflows)"), "green") or ""
-    assert "⚠ it can't be merged as it is: it changes .github/" in refused
+    assert "⚠ It can't be merged as it is: it changes .github/" in refused
+    assert len(refused.splitlines()) == 3  # the ⚠ lines and the hint; nothing more fits
     assert reply_text(replace(base, status="no_changes", summary="Already fine.")) == (
-        "R3: no changes. Already fine."
+        f"{who} made no changes: Already fine."
     )
     assert reply_text(replace(base, status="failed", failure="timed out at 45m")) == (
-        "R3 failed: timed out at 45m"
+        f"{who} failed: timed out at 45m"
     )
-    assert reply_text(replace(base, status="cancelled", pr_url=None)) == "R3 cancelled."
+    merged = replace(base, status="done", pr_number=None, pr_url=None, base_branch="main",
+                     summary="Reviewed it: clean.")  # fmt: skip
+    assert reply_text(merged, merged=["PR #121"]) == (
+        f"{who} merged PR #121 into main (12m).\nR3: Reviewed it: clean."
+    )
+    assert reply_text(merged, merged=["PR #1", "PR #2", "PR #3"]).startswith(  # type: ignore[union-attr]
+        f"{who} merged PR #1, PR #2 and PR #3 into main"
+    )
+    scratch = replace(base, repo="", status="done", summary="Disk is 80% full.")
+    assert reply_text(scratch) == f"{who} finished in 12m: Disk is 80% full."
+    assert reply_text(replace(base, status="cancelled", pr_url=None)) == f"{who} was cancelled."
+    assert reply_text(replace(base, ask="")) is not None
+    assert reply_text(replace(base, ask="", status="cancelled", pr_url=None)) == "R3 was cancelled."
     assert reply_text(replace(base, status="running")) is None
+    long = claude_mod.run_name(
+        replace(base, ask="Review PR #121 (branch resonant/r1-robot) and merge")
+    )
+    assert long == "Review PR #121 (branch…" and len(long) <= claude_mod.NAME_MAX
     assert claude_mod.fmt_duration(30) == "30s" and claude_mod.fmt_duration(3900) == "1h05m"
 
 

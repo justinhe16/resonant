@@ -18,7 +18,7 @@ GitHub for Resonant: your open pull requests with CI and review state, a quiet w
 A **fine-grained personal access token**, read-only, limited to the repos you want watched:
 - Repository permissions: Metadata, Contents, Pull requests, Checks and Actions, all **read**.
 
-The two write tools need more, and **only** they do. Leave the token read-only if you don't want them: they then fail cleanly (`Not done: … the token can't do this: it needs …; nothing was changed`) and everything else keeps working. To enable them, edit the token and add:
+The two write tools need more, and **only** they do. Leave the token read-only if you don't want them: they then fail cleanly (`Couldn't merge PR #12 in owner/repo: the github token needs … access (see the github extension README). Nothing changed.`) and everything else keeps working. To enable them, edit the token and add:
 - `rerun_failed`: Actions **read and write**.
 - `merge_pr`: Contents **read and write** and Pull requests **read and write**.
 

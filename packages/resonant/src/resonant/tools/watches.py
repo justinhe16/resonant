@@ -96,6 +96,7 @@ CANCEL_WATCH = ToolSpec(
     effect=Effect.WRITE,
     level=Level.L3,
     timeout_s=5.0,
+    approval_summary="cancel watch {id}",
 )
 SPECS: tuple[ToolSpec, ...] = (CREATE_WATCH, LIST_WATCHES, CANCEL_WATCH)
 

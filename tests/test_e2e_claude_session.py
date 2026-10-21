@@ -568,7 +568,7 @@ async def test_an_outside_read_taints_the_next_turns_then_lifts(
         w.claude(calls=[{"name": "delete_note", "args": {"id": 1}}], answer="{r0}")
         w.model.triage = CLAUDE
         _, answer, prompt = await w.say("ok do it", replies=3)
-        assert "asked the owner" in answer and "Reply yes" in prompt
+        assert "asked the owner" in answer and "yes / no" in prompt
         assert set(w.gated("delete_note")) == {("NeedsApproval", "tainted")}
         assert w.executions("delete_note") == []
         await w.settled()
@@ -742,3 +742,46 @@ async def test_session_off_keeps_the_one_shot_path(
         argv = w.session()["argv"]
         assert "--input-format" not in argv and "--no-session-persistence" in argv
         assert w.asks.brain is None
+
+
+# --- PER-268: the Claude brain sees what Resonant said ---------------------------------------
+
+
+async def test_the_next_turn_gets_what_resonant_texted_since_the_last_one(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    from resonant.store import system_texts
+
+    failure = (
+        "Couldn't merge PR #121 in justinhe16/resonant: the github token needs Contents: "
+        "write and Pull requests: write access. Nothing changed."
+    )
+    async with start(resonant_home, chat, tmp_path) as w:
+        await _hard(w, "why is R3 slow?", answer="R3 ran out of disk.")
+        # an approved merge failed after that turn: a code-built text the session didn't see
+        system_texts.record(
+            w.conn,
+            "justin",
+            "approval",
+            "OK to merge PR #121 in justinhe16/resonant? [P3] yes / no",
+            ref="p",
+        )
+        system_texts.record(w.conn, "justin", "result", failure, ref="r")  # fmt: skip
+        _, answer = await _hard(w, "What happened? Why the failure", answer="The token.")
+        assert answer == "Claude: The token."
+        prompt = w.session()["prompt"]
+        assert prompt.startswith("Resonant texted the owner itself since your last turn")
+        assert "<since_last>" in prompt and "Couldn't merge PR #121" in prompt
+        assert prompt.endswith("What happened? Why the failure")
+        await _hard(w, "ok thanks", answer="Sure.")
+        assert "<since_last>" not in w.session()["prompt"]  # shown once
+
+
+async def test_a_claude_answer_asking_for_a_yes_with_nothing_pending_is_trimmed(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path) as w:
+        _, answer = await _hard(
+            w, "merge PR 121", answer="CI is green on PR #121. The merge is queued. Approve it now?"
+        )
+        assert answer == "Claude: CI is green on PR #121."

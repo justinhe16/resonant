@@ -64,6 +64,15 @@ Group chats; a generic "run any program" tool (programs are extensions); writes 
 
 ## 6. As built
 
+### PER-268: texts that tell the truth (2026-10-20)
+
+The incident: R4 merged PR #121 as asked and got "⚠ pushed directly to main" plus "failed"; a chat `merge_pr` failed as "exit 1" with the reason only in `audit_log`; "why the failure?" got an answer about R3; qwen looped "Approve it now?" with nothing pending. Contracts in [`interfaces.md`](interfaces.md#brain-context-and-memory-resonantbrain-br-4-migration-015) (system texts, the approval guard), the Claude runner's one end text, the gate's `approval_summary` and the executor's failure reason; limits in [`limits.md`](limits.md).
+
+- **A merge isn't a push.** The base's activity feed is sorted by GitHub's own type: `push`, `force_push`, `branch_deletion` fail the run; `pr_merge`, `merge_queue_merge` are a side effect, and a run that pushed nothing but merged ends `done`: `R4 (Review PR #121…) merged PR #121 into main (9m).`
+- **One text per outcome**, a headline and at most 2 lines, in a coworker's words (part E): ⚠ lines first and always, then the headline's own, `Along the way: …`, the worker's summary. Mid-run merge detections are held for it.
+- **Readable prompts and failures.** `ToolSpec.approval_summary` (and the manifest key) on the builtins' writes and github/linear's: `OK to merge PR #121 in justinhe16/resonant? [P3] yes / no`; a failure says the extension's own reason: `Couldn't merge PR #121 in …: the github token needs … access (…). Nothing changed.`
+- **D, as built: the brain sees what Resonant said.** Code-built texts are recorded after they go out (`system_texts`, migration 019): approval prompts, the result of a task resumed after an approval, a run's texted end without the worker's words. They are data and don't taint, except one from a tainted task (`outside`: its args were chosen after outside content), which taints like that task's reply. qwen sees them as a `<system_text>` turn after the exchange they followed (at most 3 per gap, so the cached turns don't move); the one-shot ask's history lists them; the Claude brain gets the new ones as `<since_last>` at the top of its next turn (a kv cursor, so each shows once). The guard: with no approval pending, a reply's sentences asking for a yes or claiming something is queued are dropped (`drop_pending_asks`, both brains), with the rule in `BRAIN_SYSTEM` and `SESSION_PROMPT` as backup. The prefix hash moved (`68c039f33e7ead02`).
+
 ### PER-258: the Claude brain gets full tools (2026-10-20)
 
 The brain session ran `--restricted` with read-only built-ins, so "how many commits does resonant have?" was answered off the GitHub page. Now it has Claude Code's Bash, Edit, Write and web built-ins, and its changes keep the owner's approvals. Contracts in [`interfaces.md`](interfaces.md#the-claude-brains-own-tools-resonantgateshell-resonanttoolsshell-per-258); known limits in [`limits.md`](limits.md#brain-and-claude-session).

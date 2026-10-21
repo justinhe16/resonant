@@ -2,7 +2,8 @@
 the job runner.
 
 ``prompt_approvers`` sends one ``ApprovalPrompt`` to each of ``NeedsApproval.approvers`` in
-order and records each sent ref on the approval with its send time:
+order and records each sent ref on the approval with its send time (and the prompt as a
+system text the brains see, PER-268):
 - A ``ChannelRefused`` approver (no identity on the channel) is skipped and audited
   ``approval.unreachable``. The others still get the prompt.
 - Any other ``ChannelError`` is transient: the rest are still tried, and the result carries
@@ -20,10 +21,18 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from resonant.gate import ApprovalBatch, NeedsApproval
-from resonant.gateway.channel import ApprovalPrompt, Channel, ChannelError, ChannelRefused
+from resonant.gateway.channel import (
+    ApprovalPrompt,
+    Channel,
+    ChannelError,
+    ChannelRefused,
+    approval_dedupe_key,
+)
 from resonant.store import approvals as ap
+from resonant.store import system_texts
 from resonant.store.audit import audit
 from resonant.store.db import transaction
+from resonant.store.tasks import get_task
 
 
 @dataclass(frozen=True)
@@ -137,4 +146,11 @@ async def _prompt(
         with transaction(conn):
             for approval_id in approval_ids:
                 ap.add_channel_ref(conn, approval_id, ref=ref.ref, at=at, principal=approver)
+        # PER-268: the brains see what was asked ("approve it?" is the prompt's job); a
+        # tainted task's args were chosen after outside content, so only a fixed line
+        key = approval_dedupe_key(prompt.approval_id, approver)
+        task = get_task(conn, task_id) if task_id else None
+        outside = task is not None and task.checkpoint.get("tainted") is True
+        system_texts.record(conn, approver, "approval", prompt.text(), ref=key, task_id=task_id,
+                            now=at, outside=outside)  # fmt: skip
     return PromptResult(tuple(reached), tuple(unreachable), error)

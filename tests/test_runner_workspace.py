@@ -1841,26 +1841,28 @@ async def test_base_protected_and_base_pushes(env: Env) -> None:
         ev("a" * 40, "push", "bot[bot]", now),  # a repeat
         ev("c" * 40, "push", "someone", now),
         ev("d" * 40, "push", "bot[bot]", now - timedelta(hours=2)),
-        ev("e" * 40, "pr_merge", "bot[bot]", now),  # a merge onto base counts too
+        ev("e" * 40, "pr_merge", "bot[bot]", now),  # a merge onto base: a merge, not a push
         ev("f" * 40, "branch_creation", "bot[bot]", now),
     ]))  # fmt: skip
     found = await env.ws.base_pushes(
         "proj", SECRETS, actor="bot[bot]", since=now - timedelta(hours=1)
     )
-    assert found == ["a" * 40, "b" * 40, "e" * 40]
+    assert found.pushes == ("a" * 40, "b" * 40)
+    assert found.merges == ("e" * 40,)
     # one query per type, filtered by actor on GitHub's side (a busy branch can't hide it)
     queries = [
         c["argv"][1]
         for c in env.gh_calls()
         if c["argv"][0] == "api" and "/activity" in c["argv"][1]
     ]
-    assert len(queries) == 4
+    assert len(queries) == 5
     assert all("actor=bot%5Bbot%5D" in q and "ref=refs/heads/main" in q for q in queries)
     assert {q.split("activity_type=")[1].split("&")[0] for q in queries} == {
         "push",
         "force_push",
         "branch_deletion",
         "pr_merge",
+        "merge_queue_merge",
     }
     # anything it can't read fails closed
     odd = ev("a" * 40, "push", "bot[bot]", now) | {"timestamp": "yesterday"}
@@ -1871,6 +1873,41 @@ async def test_base_protected_and_base_pushes(env: Env) -> None:
     env.gh_set("activity_rc", "1")
     with pytest.raises(RunnerError, match="activity"):
         await env.ws.base_pushes("proj", SECRETS, actor="bot[bot]", since=now)
+
+
+def test_classify_activity_sorts_direct_pushes_from_merges() -> None:
+    """PER-268: only a push, force-push or delete of the base is a direct push; a PR merge
+    (or the merge queue's) is a merge; other kinds, other actors and older events are
+    ignored; a page or event it can't read raises."""
+    from datetime import UTC, datetime, timedelta
+
+    from resonant.runner.workspace import BaseActivity, classify_activity
+
+    now = datetime.now(UTC)
+
+    def ev(sha: str, kind: str, actor: str = "bot[bot]", when: datetime = now) -> dict[str, object]:
+        return {"after": sha, "activity_type": kind, "actor": {"login": actor},
+                "timestamp": when.isoformat()}  # fmt: skip
+
+    since = now - timedelta(minutes=5)
+    events = [
+        ev("a" * 40, "push"),
+        ev("b" * 40, "force_push"),
+        ev("c" * 40, "branch_deletion"),
+        ev("d" * 40, "pr_merge"),
+        ev("e" * 40, "merge_queue_merge"),
+        ev("f" * 40, "branch_creation"),
+        ev("1" * 40, "push", actor="someone"),
+        ev("2" * 40, "pr_merge", when=now - timedelta(hours=1)),
+        ev("not-a-sha", "pr_merge", actor="BOT[bot]"),
+    ]
+    assert classify_activity(events, actor="bot[bot]", since=since) == BaseActivity(
+        pushes=("a" * 40, "b" * 40, "c" * 40), merges=("d" * 40, "e" * 40, "?")
+    )
+    assert classify_activity([], actor="bot[bot]", since=since) == BaseActivity()
+    for bad in ({"message": "nope"}, None, [{"junk": True}]):
+        with pytest.raises(RunnerError, match="activity couldn't be read"):
+            classify_activity(bad, actor="bot[bot]", since=since, base="main")
 
 
 # --- the add-CI PR (EM-8: merge_ci_pr) ---------------------------------------------------------

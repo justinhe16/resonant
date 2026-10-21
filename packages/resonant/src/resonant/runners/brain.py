@@ -93,7 +93,7 @@ from resonant.brain import triage
 from resonant.brain.context import build_context, catalog_entries
 from resonant.brain.facts import FactStore
 from resonant.brain.history import fold, fold_due
-from resonant.brain.text import flat
+from resonant.brain.text import drop_pending_asks, flat
 from resonant.config import Settings
 from resonant.gate.types import NeedsApproval, Origin
 from resonant.gateway.channel import Channel
@@ -130,6 +130,7 @@ from resonant.runners.local import (
     used_tools,
     with_report,
 )
+from resonant.store import approvals as ap
 from resonant.store.db import utcnow
 from resonant.toolcore import MAX_SIDE_EFFECTS, BatchItem, RunnerGate, ToolExecutor
 from resonant.toolcore import args_error as args_error  # moved here (TC-1); re-exported
@@ -469,6 +470,7 @@ class _Turn:
     nudged: bool = False  # the claim corrective round was used
     looked: bool = False  # the lookup corrective round was used (BR-9)
     text: str = ""  # the owner's message (the target check)
+    principal: str = ""  # whose turn (PER-268: the pending-approval guard)
     target_checked: bool = False  # the one target check was used
     guess_checked: bool = False  # the one guessed-identifier check was used
     guards: int = 0  # BR-10: claim, lookup and guess checks fired (the next one escalates)
@@ -767,7 +769,8 @@ class BrainRunner(LocalRunner):
                 slots=self.slots,
                 runner_missing=missing,
             )
-            st = _Turn(context.messages(), events, core, {d.name: d for d in deferred}, text=text)
+            st = _Turn(context.messages(), events, core, {d.name: d for d in deferred}, text=text,
+                       principal=principal)  # fmt: skip
             s.set(history_turns=len(context.history), prefix_hash=context.prefix_hash(st.toolset()))
         if context.untrusted is not None:  # BR-10b: the history replays outside text
             st.tainted, st.hops = True, context.taint_hops
@@ -1275,6 +1278,16 @@ class BrainRunner(LocalRunner):
             }
         )
 
+    def _approval_pending(self, principal: str) -> bool:
+        """Whether an approval (or a batch) is open for ``principal``; True when it can't be
+        read, so the guard never drops a real ask."""
+        if not principal:
+            return True
+        try:
+            return bool(ap.pending_for(self.conn, principal, self.now()))
+        except sqlite3.Error:
+            return True
+
     def _answered(self, answer: str, st: _Turn, spans: SpanFactory) -> Answer:
         """The model's answer: clipped, the number guard counted (log-only), and the code-built
         report lines of any side effects in it."""
@@ -1285,10 +1298,16 @@ class BrainRunner(LocalRunner):
         )
         actions = [s.name for s in (*st.core, *st.deferred.values()) if s.effect is not Effect.READ]
         reply, relayed = drop_relayed(answer, read=read, message=st.text, actions=actions)
+        asks = 0
+        if not st.batch and not self._approval_pending(st.principal):
+            reply, asks = drop_pending_asks(reply)  # PER-268: no "approve it?" with none open
         reply = clip_reply(reply, MAX_REPLY_CHARS)
         sources = [m["content"] for m in st.messages]
         bad = unsupported_numbers(reply, sources)
         meta: dict[str, Any] = {"tool_calls": len(st.calls), "tainted": st.tainted, **st.meta}
+        if asks:
+            meta["approval_guard"] = asks
+            log.info("brain: dropped %d sentence(s) asking for a yes with none pending", asks)
         if relayed:
             meta["relay_guard"] = relayed
             log.info("brain: dropped %d sentence(s) relaying an action from read content", relayed)

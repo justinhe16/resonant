@@ -92,7 +92,9 @@ async def test_a_token_that_cant_be_minted_fails_the_run_before_the_session(h: H
     assert run.status == "failed"
     assert "HTTP 404" in (run.failure or "") and "installed on proj" in (run.failure or "")
     assert not (h.tmp("R1") / "argv.json").exists()  # Claude never started
-    assert h.chan.texts()[0].startswith("R1 failed: minting the run's GitHub token failed")
+    assert h.chan.texts()[0].startswith(
+        "R1 (fix the flaky test) failed: minting the run's GitHub token failed"
+    )
 
 
 # --- what the session finds ------------------------------------------------------------------
@@ -321,8 +323,8 @@ async def test_a_revoke_that_fails_is_logged_and_does_not_stop_the_run(
     deletes = [r for r in h.api.requests if r[0] == "DELETE"]
     assert len(deletes) == 3
     reply = h.chan.texts()[0]
-    assert reply.startswith("R1 done: PR #41")
-    assert "⚠ the run's GitHub token wasn't revoked; it expires at " in reply
+    assert reply.startswith("R1 (fix the flaky test) opened PR #41")
+    assert "\n⚠ The run's GitHub token wasn't revoked; it expires at " in reply
     assert not any(t in reply for t in h.api.tokens)
 
 
@@ -366,7 +368,7 @@ async def test_nothing_pushed_and_no_pr_is_no_changes(
     await h.start()
     await h.drain()
     assert h.run().status == "no_changes"
-    assert h.chan.texts()[0].startswith("R1: no changes.")
+    assert h.chan.texts()[0].startswith("R1 (fix the flaky test) made no changes")
     assert h.branches() == ["main"]
 
 
@@ -407,7 +409,7 @@ async def test_the_reply_says_how_ci_stands(
     (h.gh_dir / "checks_rc").write_text(rc)
     await h.start()
     await h.drain()
-    assert h.chan.texts()[0].startswith(f"R1 done: PR #41 (CI {word}) · ")
+    assert h.chan.texts()[0].startswith(f"R1 (fix the flaky test) opened PR #41 (CI {word}, ")
 
 
 async def test_a_pr_without_checks_says_no_ci(tmp_path: Path, db: sqlite3.Connection) -> None:
@@ -416,7 +418,7 @@ async def test_a_pr_without_checks_says_no_ci(tmp_path: Path, db: sqlite3.Connec
     (h.gh_dir / "checks_err").write_text("no checks reported on the 'x' branch")
     await h.start()
     await h.drain()
-    assert h.chan.texts()[0].startswith("R1 done: PR #41 (no CI) · ")
+    assert h.chan.texts()[0].startswith("R1 (fix the flaky test) opened PR #41 (no CI, ")
 
 
 # --- the checks before a merge ---------------------------------------------------------------
@@ -605,13 +607,12 @@ async def test_a_direct_push_to_the_base_fails_the_run_and_tells_the_owner(
     await h.drain()
     run = h.run()
     assert run.status == "failed"
-    assert run.failure == "pushed directly to main (abababa); not merged"
-    texts = h.chan.texts()
-    assert texts[0] == (
-        "⚠ R1 pushed directly to main: abababa. Look at own/proj now; this run will not be merged."
-    )
-    assert texts[1].startswith("R1 failed: pushed directly to main")
-    assert "cdcdcdc" not in "".join(texts) and "efefefe" not in "".join(texts)
+    assert run.failure == "it pushed directly to main (abababa), so it won't be merged"
+    # PER-268: one text, the ⚠ on its own line
+    assert h.chan.texts() == [
+        "R1 (fix the flaky test) failed: it pushed directly to main (abababa), so it won't be "
+        "merged\n⚠ R1 pushed abababa straight to main, skipping every check. Look at own/proj now."
+    ]
     res = await h.runner.merge_run("R1")
     assert isinstance(res, Refused) and h.gh_calls("merge") == []
     assert h.api.live == set()
@@ -625,15 +626,40 @@ async def test_the_feed_is_checked_even_when_the_base_is_protected(h: Harness) -
     await h.drain()  # protected is the default in the fake
     run = h.run()
     assert run.status == "failed" and "pushed directly to main" in (run.failure or "")
-    assert h.chan.texts()[0].startswith("⚠ R1 pushed directly to main: abababa.")
+    [text] = h.chan.texts()
+    assert "\n⚠ R1 pushed abababa straight to main" in text
 
 
-async def test_a_pr_merge_onto_the_base_by_the_bot_is_a_violation(h: Harness) -> None:
+async def test_a_pr_merge_onto_the_base_by_the_bot_is_not_a_direct_push(h: Harness) -> None:
+    """PER-268: GitHub reports a merge as ``pr_merge``; it is a side effect, not a push."""
     event = push_event("cd" * 20) | {"activity_type": "pr_merge"}
     (h.gh_dir / "activity.json").write_text(json.dumps([event]))
-    await h.start()
+    await h.start(report="now")
     await h.drain()
-    assert h.run().status == "failed" and "pushed directly to main" in (h.run().failure or "")
+    run = h.run()
+    assert run.status == "ready" and run.failure is None
+    [text] = h.chan.texts()
+    assert "⚠" not in text and "pushed directly" not in text
+    assert text.endswith("Along the way: merged a PR into main (cdcdcdc) (detected).")
+
+
+async def test_a_run_asked_to_merge_a_pr_ends_done_with_one_text_naming_it(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """PER-268's incident: R4 reviewed PR #121 and squash-merged it with gh. It pushed nothing
+    of its own, so it ends done, with ONE end text that names the merge and no ⚠."""
+    h = build(tmp_path, db, scenario="nochanges", extra=["--bash", "gh pr merge 121 --squash"])
+    event = push_event("cd" * 20) | {"activity_type": "pr_merge"}
+    (h.gh_dir / "activity.json").write_text(json.dumps([event]))
+    await h.start(report="digest")  # the merge is said now even when the end is a digest
+    await h.drain()
+    run = h.run()
+    assert run.status == "done" and run.failure is None
+    [text] = h.chan.texts()
+    assert text.startswith("R1 (fix the flaky test) merged PR #121 into main (")
+    assert "⚠" not in text and "Along the way" not in text and len(text.splitlines()) <= 3
+    rows = db.execute("SELECT 1 FROM audit_log WHERE action = 'run.done_merged'").fetchall()
+    assert len(rows) == 1
 
 
 async def test_a_pr_the_session_merged_itself_fails_loudly_and_is_never_resonants(
@@ -652,10 +678,11 @@ async def test_a_pr_the_session_merged_itself_fails_loudly_and_is_never_resonant
     h.ws.find_pr = merged  # type: ignore[method-assign]
     await h.drain()
     run = h.run()
-    assert run.status == "failed" and "merged by the session, not by Resonant" in (
-        run.failure or ""
+    assert run.status == "failed" and run.failure == "it merged its own PR #41, not Resonant"
+    [text] = h.chan.texts()
+    assert text.endswith(
+        "\n⚠ R1 merged its own PR #41, so none of Resonant's checks ran on it. Look at own/proj."
     )
-    assert h.chan.texts()[0].startswith("⚠ R1: PR #41 was already merged, not by Resonant")
     res = await h.runner.merge_run("R1")
     assert isinstance(res, Refused) and h.gh_calls("merge") == []
     assert run.status != "merged"
@@ -671,7 +698,7 @@ async def test_an_unprotected_base_with_a_clean_feed_runs_normally(
     await h.drain()
     assert h.run().status == "ready"
     lookups = [c for c in h.gh_calls("api") if "/activity" in c["argv"][1]]
-    assert len(lookups) == 4  # push, force_push, branch_deletion, pr_merge
+    assert len(lookups) == 5  # push, force_push, branch_deletion, pr_merge, merge_queue_merge
     assert all("ref=refs/heads/main" in c["argv"][1] for c in lookups)
     assert h.api.requests.count(("GET", "/app")) == 1  # the bot's login, asked once
 

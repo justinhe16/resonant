@@ -66,6 +66,7 @@ REMEMBER = ToolSpec(
     level=Level.L3,
     timeout_s=5.0,
     taint_exempt=True,  # PER-245: runs on its level even when tainted
+    approval_summary='remember {name}: "{description}"',
 )
 FORGET = ToolSpec(
     name="forget",
@@ -80,6 +81,7 @@ FORGET = ToolSpec(
     level=Level.L3,
     timeout_s=5.0,
     taint_exempt=True,  # PER-245: runs on its level even when tainted
+    approval_summary="forget the fact {name}",
 )
 
 SPECS: tuple[ToolSpec, ...] = (LIST_FACTS, REMEMBER, FORGET)

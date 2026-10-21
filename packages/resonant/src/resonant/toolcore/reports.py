@@ -13,6 +13,7 @@ from resonant.executor import ToolResult
 from resonant.gate import Decision, Deny, DryRun, Intent
 from resonant.gate.codes import clean_external
 from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
+from resonant.gate.summary import phrased
 from resonant.gate.summary import summarize as summarize_args
 from resonant.tools.ops import summary_action as ops_action
 
@@ -251,7 +252,11 @@ def not_run_reply(intent: Intent, decision: Decision) -> str:
 
 def failure_reply(intent: Intent, result: ToolResult) -> str:
     """A gated call that ran and failed: the executor's notice (a missing secret), the
-    ambiguous warning, or ``Failed: <summary>`` with a handler's own ``ToolFailed`` reason."""
+    ambiguous warning, or what failed and why (PER-268): ``Couldn't merge PR #121 in
+    owner/repo: <reason>. Nothing changed.`` for a tool with an ``approval_summary``, else
+    ``Failed: <summary>: <reason>``. The reason is the extension's own last stderr line
+    (``ToolResult.reason``), else a handler's ``ToolFailed`` message. ``Nothing changed`` is
+    said only for a definite failure (``ToolFailed``: it did not take effect)."""
     if result.notice is not None:  # code-built by the executor (a missing secret)
         return result.notice
     if result.ambiguous:
@@ -259,11 +264,22 @@ def failure_reply(intent: Intent, result: ToolResult) -> str:
             f"Not sure whether {summarize_intent(intent)} ran: it has no recorded outcome. "
             "Check before trying again."
         )
-    text = f"Failed: {summarize_intent(intent)}"
-    # Only a handler's ToolFailed message is meant for the user; other errors stay in audit.
+    # Only a handler's ToolFailed message (or the extension's stderr reason) is meant for the
+    # user; other errors stay in audit.
     error = result.error or ""
-    if error.startswith("ToolFailed: "):
-        detail = clean_external(error.removeprefix("ToolFailed: "))[:120]
-        if detail:
-            text += f" ({detail})"
+    definite = error.startswith("ToolFailed: ")
+    detail = clean_external(error.removeprefix("ToolFailed: "))[:120] if definite else ""
+    reason = result.reason or detail
+    said = phrased(intent) if ops_action(intent) is None else None
+    if said is not None:
+        reason = reason.removeprefix(f"{intent.tool}: ")  # the handler's own "delete_note: …"
+        text = f"Couldn't {said}" + (f": {reason.rstrip('.')}." if reason else ".")
+        if definite and "nothing" not in reason.lower():
+            text += " Nothing changed."
+        return text
+    text = f"Failed: {summarize_intent(intent)}"
+    if result.reason:
+        return f"{text}: {result.reason}"
+    if detail:
+        text += f" ({detail})"
     return text

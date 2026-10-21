@@ -82,7 +82,7 @@ from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
 from resonant.gate.codes import clean_external, new_code
-from resonant.gate.summary import summarize, unsafe_args
+from resonant.gate.summary import PHRASED, phrased, summarize, unsafe_args
 from resonant.gate.types import (
     Allow,
     ApprovalBatch,
@@ -340,6 +340,16 @@ class PolicyGate:
         action = self.actions.get((intent.extension, intent.tool))
         return summarize(intent, action=action(intent) if action else None)
 
+    def _phrased(self, intent: Intent, summary: str) -> bool:
+        """The summary is the tool's own template, filled (no whole line or action heading)."""
+        whole = self.summaries.get((intent.extension, intent.tool))
+        if whole is not None and whole(intent):
+            return False
+        action = self.actions.get((intent.extension, intent.tool))
+        if action is not None and action(intent):
+            return False
+        return summary == phrased(intent)
+
     def approvers(self, extension: str | None) -> tuple[str, ...]:
         """Who may approve a call to this extension's tools: the owner first, then each
         manifest-named principal that holds ``approve`` for it. Builtins are owner-only."""
@@ -385,6 +395,8 @@ class PolicyGate:
         if task.fetchone() is None:
             return Deny(NO_TASK)  # e.g. the router's fast path: nothing could wait
         summary = self._summary(intent)
+        if self._phrased(intent, summary):  # PER-268: "OK to merge PR #121 in …? [P3] yes / no"
+            summary = PHRASED + summary
         always = offer is not None and not require_code
         if always:
             assert offer is not None
@@ -776,6 +788,7 @@ def batch_line(summary: str, *, offered: bool, widens: bool = False) -> str:
     never shorten the line. ``widens``: a trust-widening change, marked."""
     if offered and summary.endswith(")") and ALWAYS_NOTE in summary:
         summary = summary.rsplit(ALWAYS_NOTE, 1)[0]
+    summary = summary.removeprefix(PHRASED)  # a line, not a question (PER-268)
     return f"widens trust: {summary}" if widens else summary
 
 

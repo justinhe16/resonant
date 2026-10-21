@@ -127,7 +127,13 @@ _ANON_REFUSED = re.compile(
 )
 _ERR_CLIP = 300
 CREDS_DIR = "creds"
-_PUSH_KINDS = ("push", "force_push", "branch_deletion", "pr_merge")
+# The base branch's activity feed (PER-268): a push, a force-push or a delete of the base by
+# the app's bot is a direct push (it skipped every check); a PR merge (``pr_merge``, or the
+# merge queue's) is the merge a run may have been asked to do, reported as such. Other kinds
+# (``branch_creation``) are ignored.
+DIRECT_KINDS = ("push", "force_push", "branch_deletion")
+MERGE_KINDS = ("pr_merge", "merge_queue_merge")
+_FEED_KINDS = DIRECT_KINDS + MERGE_KINDS
 _PR_FIELDS = "state,headRefName,headRefOid,baseRefName,isCrossRepository,title,body"
 WORKTREES = ".worktrees"  # <code_dir>/.worktrees/<name>/R<n>
 SCRATCH = ".scratch"  # <code_dir>/.scratch/R<n>
@@ -185,6 +191,43 @@ class CiPending(MergeRefused):
     """The PR's checks passed and CI is still running (or, for an owner's merge in a repo
     that has CI, hasn't reported yet): not merged now. An owner's ``/merge`` waits for it
     (``ClaudeRunner.merge_run``); anything else treats it as a refusal."""
+
+
+@dataclass(frozen=True)
+class BaseActivity:
+    """What the app's bot put on the base branch during a run (``Workspace.base_pushes``):
+    the ``after`` sha of each direct push (``pushes``) and of each PR merge (``merges``),
+    oldest kind first, deduped; ``"?"`` for a sha GitHub didn't give."""
+
+    pushes: tuple[str, ...] = ()
+    merges: tuple[str, ...] = ()
+
+
+def classify_activity(
+    events: object, *, actor: str, since: datetime, base: str = "the base"
+) -> BaseActivity:
+    """Sort one page of the activity feed into ``actor``'s direct pushes and PR merges at or
+    after ``since`` (pure). Raises ``RunnerError`` when the page or an event can't be
+    understood: the base can't be shown clean."""
+    if not isinstance(events, list):
+        raise RunnerError(f"{base}'s activity couldn't be read")
+    pushes: list[str] = []
+    merges: list[str] = []
+    for event in cast(list[Any], events):
+        try:
+            login = str(event["actor"]["login"])
+            when = datetime.fromisoformat(str(event["timestamp"]))
+            kind, after = str(event["activity_type"]), str(event["after"])
+        except (KeyError, TypeError, ValueError):
+            raise RunnerError(f"{base}'s activity couldn't be read") from None
+        if login.lower() != actor.lower() or when < since:
+            continue
+        sha = after if _SHA.fullmatch(after) else "?"
+        if kind in DIRECT_KINDS:
+            pushes.append(sha)
+        elif kind in MERGE_KINDS:
+            merges.append(sha)
+    return BaseActivity(tuple(dict.fromkeys(pushes)), tuple(dict.fromkeys(merges)))
 
 
 @dataclass(frozen=True)
@@ -1363,15 +1406,17 @@ class Workspace:
 
     async def base_pushes(
         self, repo_name: str, secrets: RunnerSecrets, *, actor: str, since: datetime
-    ) -> list[str]:
-        """The commits ``actor`` (the app's bot) put on the base branch since ``since``: the
-        ``after`` sha of each push, force-push, branch deletion and PR merge in the repo's
-        activity feed. One query per activity type, filtered by actor on GitHub's side, so a
-        busy branch can't push the bot's event out of the first page. Raises ``RunnerError``
-        when the feed can't be read or an event can't be understood: it can't be shown clean."""
+    ) -> BaseActivity:
+        """What ``actor`` (the app's bot) put on the base branch since ``since``, from the
+        repo's activity feed, by the type GitHub reports (``classify_activity``): pushes,
+        force-pushes and deletes are direct pushes, PR merges are merges. One query per
+        activity type, filtered by actor on GitHub's side, so a busy branch can't push the
+        bot's event out of the first page. Raises ``RunnerError`` when the feed can't be read
+        or an event can't be understood: it can't be shown clean."""
         repo = self._repo(repo_name)
-        found: list[str] = []
-        for kind in _PUSH_KINDS:
+        pushes: list[str] = []
+        merges: list[str] = []
+        for kind in _FEED_KINDS:
             query = (
                 f"ref=refs/heads/{repo.base}&actor={quote(actor)}&activity_type={kind}&per_page=100"
             )
@@ -1379,21 +1424,13 @@ class Workspace:
             if res.returncode != 0:
                 raise RunnerError(f"couldn't read {repo.base}'s activity: {res.stderr[-120:]}")
             try:
-                events = json.loads(res.stdout)
+                events: object = json.loads(res.stdout)
             except ValueError:
                 events = None
-            if not isinstance(events, list):
-                raise RunnerError(f"{repo.base}'s activity couldn't be read")
-            for event in cast(list[Any], events):
-                try:
-                    login = str(event["actor"]["login"])
-                    when = datetime.fromisoformat(str(event["timestamp"]))
-                    event_kind, after = str(event["activity_type"]), str(event["after"])
-                except (KeyError, TypeError, ValueError):
-                    raise RunnerError(f"{repo.base}'s activity couldn't be read") from None
-                if login.lower() == actor.lower() and when >= since and event_kind in _PUSH_KINDS:
-                    found.append(after if _SHA.fullmatch(after) else "?")
-        return list(dict.fromkeys(found))
+            found = classify_activity(events, actor=actor, since=since, base=repo.base)
+            pushes += found.pushes
+            merges += found.merges
+        return BaseActivity(tuple(dict.fromkeys(pushes)), tuple(dict.fromkeys(merges)))
 
     # -- what the session left --
 

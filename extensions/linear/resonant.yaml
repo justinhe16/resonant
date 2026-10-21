@@ -47,6 +47,7 @@ mcp:
             id): title, description, state, assignee, priority, project or labels.
           effect: write
           level: L2
+          approval_summary: 'save a Linear issue[ {id}][: "{title}"]'
           timeout_s: 60
         - name: save_comment
           description: >-
@@ -54,4 +55,5 @@ mcp:
             edit a comment (with its id).
           effect: write
           level: L2
+          approval_summary: 'comment on Linear issue {issueId}[: "{body}"]'
           timeout_s: 60

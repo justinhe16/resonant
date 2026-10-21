@@ -700,7 +700,7 @@ async def test_a_second_claim_goes_to_claude(
 async def test_answers_that_claim_nothing_go_straight_out(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
-    script: list[Scripted] = ["Set a reminder to rotate the token? Say yes and I will."]
+    script: list[Scripted] = ["Set a reminder to rotate the token? I can do that."]
     async with start(resonant_home, chat, tmp_path, script) as b:
         assert await b.say("what does setup say") == [script[0]]
         assert len(b.model.requests) == 1
@@ -937,3 +937,41 @@ async def test_a_lookup_round_doesnt_use_up_the_claim_check(
         assert await b.say("any newest PRs to merge?") == ["I can't merge from here."]
         kinds = [r.messages[-1]["content"] for r in b.model.requests[1:]]
         assert kinds == [LOOKUP_NUDGE, CLAIM_NUDGE]
+
+
+# --- PER-268: the brain sees what Resonant said -------------------------------------------
+
+
+async def test_after_an_approval_the_next_turn_sees_the_prompt_and_the_result(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path) as b:
+        b.model.push([("create_watch", WATCH)])
+        (prompt,) = await b.say("watch my notes and tell me when they change")
+        assert "Reply yes" in prompt  # create_watch's own code-built heading, not a template
+        await b.prompt_recorded()
+        (done,) = await b.say("yes")
+        assert done.startswith("Watching W1: notes change")
+        b.model.push("You approved the notes watch.")
+        (answer,) = await b.say("what did I just ok?")
+        assert answer == "You approved the notes watch."
+        seen = "\n".join(str(m.get("content")) for m in b.model.requests[-1].messages)
+        assert "<system_text>" in seen and "notes change" in seen  # the prompt it sent
+        assert done in seen  # the approved call's result, its exchange's reply
+
+
+async def test_a_reply_asking_for_a_yes_with_nothing_pending_doesnt_go_out_as_is(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path) as b:
+        b.model.push("The merge is queued at head bcc563b. Approve it now?")
+        (reply,) = await b.say("merge it")
+        assert (
+            reply
+            == "Nothing is waiting for your yes right now. Say what to do and I'll ask for it."
+        )
+        b.model.push("CI is green on PR #121. Reply yes to merge it.")
+        (reply,) = await b.say("how is PR 121")
+        assert reply == "CI is green on PR #121."
+        (task,) = b.brain_tasks()[-1:]
+        assert b.result(task)["approval_guard"] == 1

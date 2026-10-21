@@ -534,12 +534,12 @@ async def test_approvals_lists_and_shows_full_args_to_the_owner(
     await h.say("/approvals")
     assert h.channel.replies()[-1] == (
         "Waiting for approval (1):\n"
-        f'- {code} · add note text="vitamin ? and zinc" · expires in 29m\n'
+        f'- {code} · add a note: "vitamin ? and zinc" · expires in 29m\n'
         "Reply yes <code> or no <code>. /approvals <code> shows the details."
     )
     await h.say(f"/approvals {code.lower()}")
     assert h.channel.replies()[-1] == (
-        f'[{code}] add note text="vitamin ? and zinc"\n'
+        f'[{code}] add a note: "vitamin ? and zinc"\n'
         "Tool: add_note (L3, write)\n"
         'Args: {\n "text": "vitamin d3 and zinc"\n}\n'
         f"Expires in 29m. Reply yes / no {code}"

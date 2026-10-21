@@ -664,7 +664,9 @@ async def test_e2_e14_github_commands_over_imessage(
         # merge_pr is L2 (GT-1): the owner asked for it explicitly, so it runs with no prompt.
         # The extension's own head-SHA check then refuses the stale abc1234, merging nothing.
         reply = await say("/github merge_pr resonant 40 abc1234")
-        assert reply.startswith("Failed: github: merge pr "), reply
+        # PER-268: its own template and the extension's own reason
+        assert reply.startswith("Couldn't merge PR #40 in resonant: "), reply
+        assert reply.endswith("Nothing changed."), reply
         assert manual("merge_pr") == [("merge_pr", "Allow", "explicit")]
 
         # A member without the github grant: not allowed, before any argument parsing.
