@@ -5,7 +5,12 @@ Every subprocess is an argv list through the injectable ``OpsRunner`` (``resonan
 no shell, a timeout each, stderr never logged or returned. The restarts act only on the two
 fixed launchd labels, and ``update_resonant`` only in ``settings.ops.repo_path``.
 
-- ``restart_ollama``: ``launchctl kickstart -k gui/<uid>/com.resonant.ollama`` (15 s).
+- ``restart_ollama``: ``launchctl kickstart -k gui/<uid>/com.resonant.ollama`` (15 s), at
+  most once per ``OLLAMA_COOLDOWN`` (5 min; kv ``ops.ollama_restarted_at``, so it holds
+  across a daemon restart). One inside it is refused with when it can run again:
+  ``Failed: restart Ollama (I restarted it 2m ago; I can restart it again in 3m)``. A
+  kickstart that timed out may have restarted it, so it starts the cooldown too; one that
+  exited non-zero or couldn't start doesn't.
 - ``restart_resonant``: writes the restart marker, spawns the detached helper that kickstarts
   the daemon after 3 s, and returns at once, so the runner's reply goes out first
   (``resonant.ops``). A replayed task returns the recorded result: no second restart.
@@ -15,7 +20,9 @@ fixed launchd labels, and ``update_resonant`` only in ``settings.ops.repo_path``
   new commit, the running process is unaffected). A good sync restarts as above.
 - ``disk``: free space on ``/`` and ``RESONANT_HOME``.
 - ``recent_logs``: the last ``n`` (≤ 20) lines of ``logs/resonant.jsonl``, one short line
-  each, with URLs → ``<url>`` and emails and phone numbers → ``<handle>``, ≤ 300 chars.
+  each, ≤ 300 chars, cleaned like ``tail_log`` (``clean_line``): credential-shaped text
+  (``redact.redact_secrets``) and key-shaped tokens → ``[redacted]``, ``$HOME`` and any
+  ``/Users/<name>`` → ``~``, URLs → ``<url>``, emails and phone numbers → ``<handle>``.
 
 None of these is exempt from dry_run: they act on the system, so under dry_run the gate
 answers ``Dry run: would restart Ollama`` and the handler never runs.
@@ -24,11 +31,12 @@ answers ``Dry run: would restart Ollama`` and the handler never runs.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -47,6 +55,8 @@ from resonant.ops import (
     mark_restart,
     restart_later_argv,
 )
+from resonant.redact import REDACT_SLACK, REDACTED, redact_secrets
+from resonant.store.db import iso, kv_get, kv_set
 from resonant.tools.base import NO_ARGS, BuiltinContext, no_args
 from resonant.tools.system import disk_usage
 from resonant_sdk import Effect, Level, ToolSpec
@@ -61,6 +71,11 @@ PULL_TIMEOUT_S = 60.0
 SYNC_TIMEOUT_S = 240.0
 # Every step of an update, plus slack, so the executor's timeout never fires first.
 UPDATE_TIMEOUT_S = 4 * GIT_TIMEOUT_S + PULL_TIMEOUT_S + SYNC_TIMEOUT_S + 20.0  # 360 s
+
+# A restart loop (a model retrying, or an owner tapping /restart_ollama) can't keep Ollama
+# down: one kickstart per window.
+OLLAMA_COOLDOWN = timedelta(minutes=5)
+OLLAMA_RESTARTED_KEY = "ops.ollama_restarted_at"
 
 LOG_FILE = "resonant.jsonl"
 LOGS_DEFAULT = 10
@@ -173,16 +188,36 @@ class Ops:
     async def _head(self) -> str:
         return await self._git("rev-parse", "--short=7", "HEAD")
 
+    def _ollama_cooldown(self, now: datetime) -> None:
+        """Refuse a restart within ``OLLAMA_COOLDOWN`` of the last one, saying when."""
+        from resonant.router.render import duration  # the router imports this module
+
+        value: object = kv_get(self.conn, OLLAMA_RESTARTED_KEY)
+        try:
+            last = datetime.fromisoformat(value) if isinstance(value, str) else None
+        except ValueError:
+            last = None
+        if last is None or not timedelta(0) <= now - last < OLLAMA_COOLDOWN:
+            return  # never, garbage, a clock that went back, or long enough ago
+        ago = (now - last).total_seconds()
+        left = (OLLAMA_COOLDOWN - (now - last)).total_seconds()
+        wait = duration(math.ceil(left / 60) * 60 if left >= 60 else math.ceil(left))
+        raise ToolFailed(f"I restarted it {duration(ago)} ago; I can restart it again in {wait}")
+
     async def restart_ollama(self) -> dict[str, Any]:
+        now = self.clock()
+        self._ollama_cooldown(now)
         argv = kickstart_argv(OLLAMA_LABEL, self.uid)
         try:
             res = await self.runner.run(argv, timeout_s=KICKSTART_TIMEOUT_S)
         except TimeoutError:
+            kv_set(self.conn, OLLAMA_RESTARTED_KEY, iso(now))  # it may have restarted
             raise ToolFailed(f"launchctl timed out after {KICKSTART_TIMEOUT_S:g}s") from None
         except OSError as e:
             raise ToolFailed(f"launchctl couldn't start ({type(e).__name__})") from None
         if res.returncode != 0:
             raise ToolFailed(f"launchctl kickstart failed (exit {res.returncode})")
+        kv_set(self.conn, OLLAMA_RESTARTED_KEY, iso(now))
         return {"label": OLLAMA_LABEL, "restarted": True}
 
     def _restart_later(self, commit: str | None) -> None:
@@ -259,6 +294,19 @@ _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 # E.164 (``+15551234567``) and North American formats (``(555) 123-4567``, ``555.123.4567``).
 _PHONE = re.compile(r"\+\d[\d\s().-]{6,}\d|\(?\b\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b")
 _SPACE = re.compile(r"\s+")
+# Any user's home dir (``/Users/<name>``), not only the daemon's own $HOME.
+_USERS_PATH = re.compile(r"/Users/[^/\s\"'`,;:()\[\]{}<>]+")
+# A token with a known key prefix, shorter than ``redact_secrets`` needs (it wants 20+).
+_KEY_PREFIXED = re.compile(
+    r"\b(?:sk-|pk-|rk-|gh[pousr]_|github_pat_|xox[abprse]-|glpat-|npm_|lin_api_|sb_secret_)"
+    r"[A-Za-z0-9_-]{6,}"
+)
+# A long run of key alphabet with an upper, a lower and a digit: base64-ish key material.
+# Lowercase hex (shas), ULIDs (uppercase) and UUIDs don't have all three, so they stay.
+_KEY_SHAPED = re.compile(
+    r"(?<![A-Za-z0-9+/_=-])(?=[A-Za-z0-9+/_=-]{0,256}[A-Z])(?=[A-Za-z0-9+/_=-]{0,256}[a-z])"
+    r"(?=[A-Za-z0-9+/_=-]{0,256}[0-9])[A-Za-z0-9+/_=-]{32,256}(?![A-Za-z0-9+/_=-])"
+)
 
 
 def scrub(text: str) -> str:
@@ -269,20 +317,38 @@ def scrub(text: str) -> str:
     return _SPACE.sub(" ", text).strip()
 
 
+def strip_home(text: str, home: str | None = None) -> str:
+    """``$HOME`` (default ``Path.home()``) and any other ``/Users/<name>`` → ``~``."""
+    home = str(Path.home()) if home is None else home
+    if home.rstrip("/"):
+        text = text.replace(home.rstrip("/"), "~")
+    return _USERS_PATH.sub("~", text)
+
+
 def _clip(text: str) -> str:
     return text if len(text) <= LOG_LINE_MAX else text[: LOG_LINE_MAX - 1] + "…"
 
 
-def log_line(raw: str, *, clean: Callable[[str], str] | None = None) -> str:
-    """One log record as ``15:04:05 warning resonant.daemon: event k=v``, scrubbed, clipped.
-    ``clean`` (``tail_log``'s secret scrub) runs on the whole line before the clip."""
-    clean = clean or (lambda text: text)
+def clean_line(text: str) -> str:
+    """One log line made safe to show, for ``recent_logs`` (``/logs``) and ``tail_log``:
+    secrets (``redact_secrets``) and key-shaped tokens → ``[redacted]``, home paths → ``~``,
+    then ``scrub``, then the clip. Only the first ``LOG_LINE_MAX + REDACT_SLACK`` chars are
+    scanned (a huge record stays cheap), and a token cut by the clip was already caught."""
+    text = redact_secrets(text[: LOG_LINE_MAX + REDACT_SLACK])
+    text = _KEY_PREFIXED.sub(REDACTED, text)
+    text = _KEY_SHAPED.sub(REDACTED, text)
+    return _clip(scrub(strip_home(text)))
+
+
+def log_line(raw: str) -> str:
+    """One log record as ``15:04:05 warning resonant.daemon: event k=v``, cleaned
+    (``clean_line``) and clipped."""
     try:
         rec: object = json.loads(raw)
     except ValueError:
         rec = None
     if not isinstance(rec, dict):
-        return _clip(scrub(clean(raw)))
+        return clean_line(raw)
     d = cast(dict[str, Any], rec)
     ts = str(d.pop("timestamp", ""))
     clock = ts[11:19] if len(ts) >= 19 else ts
@@ -293,7 +359,7 @@ def log_line(raw: str, *, clean: Callable[[str], str] | None = None) -> str:
     rest = " ".join(
         f"{k}={v if isinstance(v, str) else json.dumps(v, default=str)}" for k, v in d.items()
     )
-    return _clip(scrub(clean(" ".join(p for p in (head, event, rest) if p))))
+    return clean_line(" ".join(p for p in (head, event, rest) if p))
 
 
 def tail_lines(path: Path, n: int) -> list[str]:

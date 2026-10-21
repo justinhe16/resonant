@@ -33,6 +33,7 @@ from resonant.ops import (
     back_up_text,
     kickstart_argv,
     mark_restart,
+    ops_env,
     restart_later,
     restart_later_argv,
     restart_pending,
@@ -46,6 +47,7 @@ from resonant.store.tasks import insert_task
 from resonant.tools import ToolRegistry, ops
 from resonant.tools.ops import (
     GIT,
+    OLLAMA_COOLDOWN,
     PULL_TIMEOUT_S,
     RESTART_OLLAMA,
     RESTART_RESONANT,
@@ -53,9 +55,11 @@ from resonant.tools.ops import (
     UPDATE_RESONANT,
     UV_CACHE,
     Ops,
+    clean_line,
     log_line,
     recent_logs,
     scrub,
+    strip_home,
 )
 
 OWNER = "justin"
@@ -176,6 +180,74 @@ async def test_restart_ollama_failures(
     with pytest.raises(ToolFailed, match=re.escape(message)) as e:
         await make_ops(db, runner, None).restart_ollama()
     assert "Could not find" not in str(e.value)  # stderr is never shown
+
+
+class Clock:
+    def __init__(self, now: datetime = T0) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def ops_at(db: sqlite3.Connection, runner: FakeOpsRunner, clock: Clock) -> Ops:
+    return Ops(db, load_settings(), runner, owner=OWNER, clock=clock, uid=UID)
+
+
+async def test_a_second_restart_ollama_inside_the_cooldown_is_refused(
+    db: sqlite3.Connection,
+) -> None:
+    runner, clock = FakeOpsRunner(), Clock()
+    ops_ = ops_at(db, runner, clock)
+    assert (await ops_.restart_ollama())["restarted"] is True
+    clock.now = T0 + timedelta(minutes=2, seconds=10)
+    with pytest.raises(ToolFailed) as e:
+        await ops_.restart_ollama()
+    assert str(e.value) == "I restarted it 2m ago; I can restart it again in 3m"
+    clock.now = T0 + OLLAMA_COOLDOWN - timedelta(seconds=20)
+    with pytest.raises(ToolFailed, match=r"again in 20s$"):
+        await ops_.restart_ollama()
+    assert len(runner.calls) == 1  # neither refusal ran launchctl
+    clock.now = T0 + OLLAMA_COOLDOWN
+    assert (await ops_.restart_ollama())["restarted"] is True
+    assert len(runner.calls) == 2
+
+
+async def test_the_cooldown_holds_across_a_daemon_restart(db: sqlite3.Connection) -> None:
+    clock = Clock()
+    await ops_at(db, FakeOpsRunner(), clock).restart_ollama()
+    clock.now = T0 + timedelta(minutes=1)
+    with pytest.raises(ToolFailed, match="again in 4m"):
+        await ops_at(db, FakeOpsRunner(), clock).restart_ollama()  # a fresh Ops (new daemon)
+
+
+@pytest.mark.parametrize(
+    ("result", "cools"),
+    [(TimeoutError(), True), (ProcResult(113, "", ""), False), (FileNotFoundError(), False)],
+    ids=["timed-out", "exit-113", "couldnt-start"],
+)
+async def test_only_a_kickstart_that_may_have_run_starts_the_cooldown(
+    db: sqlite3.Connection, result: ProcResult | BaseException, cools: bool
+) -> None:
+    clock = Clock()
+    runner = FakeOpsRunner().on(LAUNCHCTL, results=[result, ok()])
+    ops_ = ops_at(db, runner, clock)
+    with pytest.raises(ToolFailed):
+        await ops_.restart_ollama()
+    clock.now = T0 + timedelta(seconds=30)
+    if cools:
+        with pytest.raises(ToolFailed, match="I restarted it 30s ago"):
+            await ops_.restart_ollama()
+    else:
+        assert (await ops_.restart_ollama())["restarted"] is True
+
+
+async def test_a_clock_that_went_back_doesnt_block_a_restart(db: sqlite3.Connection) -> None:
+    clock = Clock()
+    ops_ = ops_at(db, FakeOpsRunner(), clock)
+    await ops_.restart_ollama()
+    clock.now = T0 - timedelta(hours=1)
+    assert (await ops_.restart_ollama())["restarted"] is True
 
 
 # --- restart_resonant --------------------------------------------------------------------
@@ -473,6 +545,37 @@ async def test_subprocess_runner_kills_on_timeout(tmp_path: Path) -> None:
     assert runner.env["GIT_TERMINAL_PROMPT"] == "0"
 
 
+async def test_no_daemon_env_var_reaches_an_ops_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real runner, a harmless argv (python printing its env): only the fixed keys."""
+    for name in ("ANTHROPIC_API_KEY", "GITHUB_TOKEN", "RESONANT_HOME", "PYTHONPATH", "DYLD_X"):
+        monkeypatch.setenv(name, "daemon-only-value")
+    monkeypatch.setenv("PATH", "/opt/homebrew/bin:/usr/bin:/bin")
+    runner = SubprocessRunner()
+    dump = "import json, os; print(json.dumps(dict(os.environ)))"
+    child: dict[str, str] = json.loads(
+        (await runner.run([sys.executable, "-c", dump], timeout_s=10, cwd=tmp_path)).stdout
+    )
+    # Added by the child itself, not passed down: macOS's __CF_USER_TEXT_ENCODING, and
+    # LC_CTYPE from Python's C-locale coercion (PEP 538) when no locale is set.
+    child.pop("__CF_USER_TEXT_ENCODING", None)
+    if child.get("LC_CTYPE") in {"UTF-8", "C.UTF-8"}:
+        del child["LC_CTYPE"]
+    assert "daemon-only-value" not in child.values()
+    assert set(child) <= {"HOME", "USER", "LOGNAME", "TMPDIR"} | set(ops_env({}))
+    assert child["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"
+    assert child["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_ops_env_is_fixed() -> None:
+    daemon = {"HOME": "/Users/x", "TMPDIR": "/tmp/x", "AWS_SECRET": "s", "PATH": "/evil:/bin"}
+    env = ops_env(daemon)
+    assert env["HOME"] == "/Users/x" and env["TMPDIR"] == "/tmp/x"
+    assert "AWS_SECRET" not in env and env["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"
+    assert ops_env(daemon, {"PATH": "/bin"})["PATH"] == "/bin"  # an explicit extra wins
+
+
 def test_back_up_text() -> None:
     marker = {"by": OWNER, "at": "2026-10-13T15:00:00.000+00:00", "commit": "abc1234"}
     assert back_up_text(marker, T0 + timedelta(seconds=75)) == "Back up (abc1234), down 1m"
@@ -564,6 +667,61 @@ def test_recent_logs_reads_only_the_tail_of_a_big_file(tmp_path: Path) -> None:
     log.write_text(line * 5000 + json.dumps({"event": "last", "level": "info"}) + "\n")
     out = recent_logs(tmp_path, {"n": 2})
     assert out["lines"][-1] == "info last" and out["lines"][0].startswith("info xxx")
+
+
+def fake_token(prefix: str, n: int = 36) -> str:
+    """Built at runtime, so no token-shaped literal sits in the source."""
+    return prefix + ("Ab3" * n)[:n]
+
+
+def test_recent_logs_has_no_home_paths_or_tokens(tmp_path: Path) -> None:
+    home = str(Path.home())
+    sk, ghp, short = fake_token("sk-" + "ant-"), fake_token("gh" + "p_"), fake_token("sk-", 8)
+    blob = ("Q9" + "x" * 10 + "Zk3") * 3  # 45 chars of base64-ish key material
+    records = [
+        {"event": "worker started", "cwd": f"{home}/code/resonant", "level": "info"},
+        {"event": f"read /Users/someone/.ssh/id_ed25519 and {home}/.resonant/x"},
+        {"event": f"auth with {sk}", "level": "warning"},
+        {"event": "github push", "token": ghp, "header": f"Bearer {ghp}"},
+        {"event": f"short key {short}", "key": blob},
+        {"event": f"GITHUB_TOKEN={ghp} {home}/Library"},
+    ]
+    log = tmp_path / "resonant.jsonl"
+    log.write_text("".join(json.dumps(r) + "\n" for r in records) + f"plain {sk} at {home}\n")
+    lines = recent_logs(tmp_path, {"n": 20})["lines"]
+    assert len(lines) == len(records) + 1
+    text = "\n".join(lines)
+    assert "/Users/" not in text and home not in text
+    assert not re.search(r"\bsk-|\bghp_", text), text
+    assert blob not in text and short not in text
+    assert lines[0] == "info worker started cwd=~/code/resonant"
+    assert lines[1] == "read ~/.ssh/id_ed25519 and ~/.resonant/x"
+    assert lines[2] == "warning auth with [redacted]"
+
+
+def test_clean_line_keeps_ids_shas_and_times() -> None:
+    kept = (
+        "2026-10-13T15:00:00.123Z task 01JABCDEFGHJKMNPQRSTVWXYZ0 sha "
+        "e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3 trace 3f2b8c1e-7d4a-4b9e-9c2f-1a2b3c4d5e6f"
+    )
+    assert clean_line(kept) == kept
+    assert clean_line("x" * 1000).endswith("…") and len(clean_line("x" * 1000)) == 300
+
+
+def test_strip_home() -> None:
+    assert strip_home("/Users/a/x and /Users/bob.smith/y", home="/Users/a") == "~/x and ~/y"
+    assert strip_home("/opt/x /var/root", home="/var/root") == "/opt/x ~"
+    assert strip_home("/opt/x", home="/") == "/opt/x"
+
+
+def test_tail_log_is_cleaned_the_same_way(tmp_path: Path) -> None:
+    from resonant.tools.files import tail_log
+
+    home, ghp = str(Path.home()), fake_token("gh" + "p_")
+    (tmp_path / "resonant.jsonl").write_text(json.dumps({"event": f"{home}/x {ghp}"}) + "\n")
+    (tmp_path / "daemon.log").write_text(f"boot {home}/y {ghp}\n")
+    assert tail_log(tmp_path, {})["lines"] == ["~/x [redacted]"]
+    assert tail_log(tmp_path, {"name": "daemon.log"})["lines"] == ["boot ~/y [redacted]"]
 
 
 def test_render_logs_keeps_the_newest_within_one_chunk() -> None:

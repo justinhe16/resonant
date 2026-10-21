@@ -139,3 +139,42 @@ class Redactor:
         if isinstance(obj, tuple):
             return tuple(self._deep(v) for v in cast(tuple[object, ...], obj))
         return obj
+
+
+# --- pattern-based (values unknown) ---------------------------------------------------
+
+_SECRET_SCRUBS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----.*?"
+                r"(?:-----END [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|\Z)", re.DOTALL), REDACTED),
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+                r"|sk-[A-Za-z0-9_-]{20,}|xox[abprse]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}"
+                r"|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{36}"
+                r"|lin_api_[A-Za-z0-9]{20,}|sb_secret_[A-Za-z0-9_-]{10,})"), REDACTED),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), REDACTED),
+    (re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{12,}"), rf"\1\2{REDACTED}"),
+    (re.compile(r"(\b[a-z][a-z0-9+.-]{0,31}://)[^/\s@'\"]{1,256}@"), rf"\1{REDACTED}@"),
+    # A credential-named key (``GITHUB_TOKEN``, ``"password"``, ``api_key``) with a literal
+    # value: quoted, or a bare token with both a letter and a digit. Calls are left alone.
+    # Every run is bounded, so a long ``a.a.a.…`` line stays linear.
+    (re.compile(r"(?i)\b([A-Za-z0-9_.-]{0,40}(?:password|passwd|pwd|secret|secret[_-]?key|token"
+                r"|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)[\"']?)"
+                r"(\s*[:=]\s*)(\"[^\"\n]{4,256}\"|'[^'\n]{4,256}'"
+                r"|(?=[A-Za-z0-9._~+/=-]{0,256}[0-9])(?=[A-Za-z0-9._~+/=-]{0,256}[A-Za-z])"
+                r"[A-Za-z0-9._~+/=-]{8,256}(?=[\s,;)}\]\"']|$))"), rf"\1\2{REDACTED}"),
+    # A password or secret with any bare value of 6+ characters (no digit needed).
+    (re.compile(r"(?i)\b([A-Za-z0-9_.-]{0,40}(?:password|passwd|secret)[\"']?)(\s*[:=]\s*)"
+                r"(?![\"']|\[redacted\])[^\s,;)}\]\"'(]{6,256}(?=[\s,;)}\]\"']|$)"),
+     rf"\1\2{REDACTED}"),
+)  # fmt: skip
+
+
+REDACT_SLACK = 256  # text past a clip that is still scanned, so a secret across it is seen
+
+
+def redact_secrets(text: str) -> str:
+    """Credential-shaped text replaced by ``[redacted]``. Pattern-based: the read tools
+    don't know the values (``redact.Redactor`` is for known ones). Callers bound the text
+    (``redact_clip``); the patterns are linear but not free."""
+    for pattern, repl in _SECRET_SCRUBS:
+        text = pattern.sub(repl, text)
+    return text
