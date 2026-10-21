@@ -67,6 +67,26 @@ describe("Dashboard, local tier", () => {
     expect(within(screen.getByTestId("column-left")).getByRole("heading", { level: 1 })).toBeInTheDocument();
   });
 
+  it("shows an approval batch as one row with its changes", async () => {
+    mount(local);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    const row = screen.getByText("3 changes, all or none").closest("li")!;
+    const changes = within(row).getByRole("list", { name: "Changes" });
+    expect(within(changes).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      '1.linear: save issue title="Retry the relay push"L3',
+      '2.linear: save comment issue="PER-263"L3',
+      "3.restart resonantL2",
+    ]);
+    expect(within(row).getByText("code D7")).toBeInTheDocument();
+    expect(within(row).getByText("one answer for all")).toBeInTheDocument();
+    expect(within(row).getByText("expires in 55 min")).toBeInTheDocument();
+    expect(within(row).getAllByText("L2")).toHaveLength(2); // the batch's strictest, and change 3
+    // A lone approval has no change list.
+    const lone = screen.getByText("merge_pr github: example/resonant#81").closest("li")!;
+    expect(within(lone).queryByRole("list", { name: "Changes" })).not.toBeInTheDocument();
+    expect(within(lone).queryByText("one answer for all")).not.toBeInTheDocument();
+  });
+
   it("shows every section's local detail on one page", async () => {
     mount(local);
     await screen.findByRole("heading", { name: "Something is degraded" });
@@ -88,11 +108,11 @@ describe("Dashboard, local tier", () => {
     expect(screen.getByText("merge_pr github: example/resonant#81")).toBeInTheDocument();
     expect(screen.getByText("L1")).toBeInTheDocument();
     expect(screen.getByText("expires in 50 min")).toBeInTheDocument();
-    expect(screen.getByText("2 open")).toBeInTheDocument(); // one approval + one question
+    // Waiting on you: two approval rows (one a batch) and one question; Pulse: three items.
+    expect(screen.getAllByText("3 open")).toHaveLength(2);
 
     const pulse = screen.getByText("Rain after 4pm").closest("ul")!;
     expect(within(pulse).getAllByRole("listitem")[0]).toHaveTextContent("R11 asked a question"); // urgent first
-    expect(screen.getByText("3 open")).toBeInTheDocument();
 
     expect(screen.getByText("2 fails in a row")).toBeInTheDocument();
     expect(screen.getByText("No scheduled jobs.")).toBeInTheDocument();
