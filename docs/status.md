@@ -22,6 +22,7 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 22, two extensi
 | Dashboard redesign, disk watchdog, truthful texts (R1, PER-267, PER-268) | Two-column shadcn dashboard. The disk watchdog no longer kills a run it can't measure (partial counts, free-space floor, GiB units). A PR merge isn't a direct push; one coworker-style text per run outcome; readable approval prompts with the failure reason; both brains see Resonant's own texts (`system_texts`, migration 019) | #121–#123 |
 | Phase 6b overnight fan (PER-254, 255, 259–263, 266) | Batch as one dashboard row; `yes 1,3 D7` partial approvals; store upkeep (migration 020, daily 04:00 prune after a good backup); ops/inbound hardening (minimal ops env, redaction, Ollama restart cooldown); Claude session upkeep (40-turn cap, stale dir/session cleanup); relay snapshot fields + Supabase guard for `claude_brain`/`remote_url` (applied, Fly redeployed); approval expiry reminders (migration 021); pulse wording. Deployed 2026-10-21 | #124–#131 |
 | One request per action, narrow surf default (PER-269, SF-1) | One open approval per action (`github merge repo#N`), others point to it; asks for a merged/closed PR expire `obsolete`; a run isn't blamed for Resonant's own merge (migration 022). Guard-off push runs use the surf skills only for a repo + code change + PR to merge. Flaky tests fixed (#132). Deployed 2026-10-21 | #132–#134 |
+| One conversation, live-run safety (PER-270, PER-271) | Both brains read one transcript in true order (Resonant's texts as its own turns, approval replies included; Claude gets a 'since we last spoke' delta); told/acked state (migration 023) splits News from Already told; triage labels greeting/ack/check-in/correction/question; no claims without a tool result. Tests use a temp HOME and a guard forbids touching ~/resonant-runs, ~/code, ~/.resonant; the startup sweep needs the runner lock; unpushed work ends 'couldn't push: N commits saved'. Eval 97.9% (no regression vs main). Deployed 2026-10-21 | #135–#136 |
 
 Latest task eval (synthetic set, live qwen, PER-249, 3 runs): 99.5%, 0 unapproved writes, triage 100%. Live Claude eval (PER-250, 5 hard rows): 5/5, p50 14.7s ack to answer, about $0.60. Most synthetic hard rows have no facts, so the owner set is the real test.
 
@@ -54,7 +55,7 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 | Who | Tickets |
 |---|---|
 | Owner | PER-252 phone tests, PER-253 mycelium by text, PER-265 design decisions (webhooks, worker text in the briefing, nudges, bare yes/no, `/update` trust) |
-| Build | PER-256 retire intents (after the owner eval set), PER-264 small gaps (its turn budget after PER-256) |
+| Build | PER-256 retire intents + qwen only routes, Claude the one brain (after the owner eval set), PER-264 small gaps (its turn budget after PER-256) |
 
 **Roadmap after 6b:** 5b Slack → 6 on-call → 7 life lane (Gmail, browser, computer use). One card per phase on the Roadmap tab of `architecture.html`.
 
