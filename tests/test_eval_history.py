@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterator
@@ -283,12 +284,13 @@ def test_redaction_drops_codes_secrets_and_other_peoples_handles(
     chat(store, "my github token is ghp_abcdefghijklmnopqrstuvwxyz0123456789", minutes_ago=60)
     chat(store, f"call {OWNER_HANDLE} back", minutes_ago=59)
     report = hist.draft(settings(home))
-    raw = report.path.read_text()
+    drafted = rows(report.path)
+    # Mask ULIDs before scanning: a random one can contain "K4" (or any short code) by chance.
+    raw = re.sub(r"\b[0-9A-HJKMNP-TV-Z]{26}\b", "<ulid>", report.path.read_text())
     for leaked in (FRIEND_HANDLE, "010-0177", "@alice", "bob@example.com", "ghp_", OWNER_HANDLE,
                    "K4"):  # fmt: skip
         assert leaked not in raw, leaked
     assert report.skipped["secret"] == 1
-    drafted = rows(report.path)
     asked = by_text(drafted, "about PR 42")
     assert asked["text"] == (
         "text [handle] and [handle] and ask [handle] about PR 42 on 2026-10-01"
