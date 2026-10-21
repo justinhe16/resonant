@@ -42,6 +42,24 @@ keeps the queue (``AskRunner`` orders the waiting turns).
   daemon shutdown (:meth:`aclose`, the id kept for a resume). The process's pid, start time
   and marker are in kv, so one a crashed daemon left is reaped before the next start.
 
+**Upkeep** (PER-262):
+
+- **A pause from outside.** ``/kill`` in this process stops the session through a pause
+  hook; a pause another process writes (``resonant pause`` from the CLI) has no hook here,
+  so a live session checks ``paused`` every ``pause_check_s`` and, when idle, stops the same
+  way (a turn in flight sees the pause on its own poll).
+- **Startup** (:meth:`startup`, before the loop resumes anything): a session process a killed
+  daemon left (its pid, start time and marker are in kv) is reaped at once, not on the next
+  turn, and old transcripts are swept.
+- **Old transcripts.** Claude Code keeps each session's transcript in
+  ``<home>/.claude/projects/<the real cwd, every non-alphanumeric as "-">/<id>.jsonl``.
+  Rotations and restarts leave the earlier ones; those older than ``transcript_days`` are
+  removed (:func:`sweep_transcripts`) at startup and whenever a new session starts. Only in
+  the brain's own dir, only UUID-named entries, never the current session, never a symlink.
+- **Rate limits.** A ``rate_limit_event`` in the stream is logged (its status, window and
+  reset, never text), and a warning one (``allowed_warning``: the limit is near) once per
+  window and reset, before the limit hits.
+
 **Remote Control** (``claude_session.remote_control``, default off): the RC-1 control
 request goes first; the claude.ai URL (validated, ``live.session_url``) is kept in kv for
 /status and the dashboard, and cleared when the session ends.
@@ -61,6 +79,8 @@ import contextlib
 import json
 import logging
 import os
+import re
+import shutil
 import signal
 import sqlite3
 import time
@@ -89,6 +109,7 @@ log = logging.getLogger(__name__)
 
 END_WAIT_S = 3.0  # after stdin closes, before the group is reaped
 POLL_S = 0.25
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 Status = Literal["answered", "crashed", "timeout", "killed", "refused"]
 
@@ -129,8 +150,16 @@ class ClaudeSession:
         rc_timeout_s: float = RC_TIMEOUT_S,
         end_wait_s: float = END_WAIT_S,
         taint_hops: int = DEFAULT_TAINT_HOPS,
+        paused: Callable[[], bool] | None = None,
+        home: Path | None = None,
     ) -> None:
+        """``paused``: the kill switch as stored (unknown counts as paused), checked every
+        ``cfg.pause_check_s`` while the session is up (PER-262). ``home``: the ``HOME`` the
+        CLI runs with, whose ``.claude/projects`` holds this session's transcripts; None:
+        transcripts are never swept."""
         self.conn = conn
+        self.paused = paused
+        self.home = home
         self.cfg = cfg
         self.taint_hops = taint_hops  # brain.taint_hops
         self.cwd = cwd
@@ -157,6 +186,8 @@ class ClaudeSession:
         self._killed = False  # /kill landed during this turn: never a crash, never retried
         self._fingerprint = ""
         self._unhook: Callable[[], None] | None = None
+        self._watch: asyncio.Task[None] | None = None  # the pause check (PER-262)
+        self._limit_warned: set[str] = set()  # rate-limit warnings logged (window, reset)
 
     # -- state --
 
@@ -308,6 +339,7 @@ class ClaudeSession:
         with atomic(self.conn):
             kv_set(self.conn, SESSION_KV, {"session_id": sid, "started_at": iso(self.clock()),
                                            "turns": 0})  # fmt: skip
+        await self.sweep(keep=sid)  # the session just left behind may be old enough now
         await self._spawn(argv(sid, False), env, sid, fingerprint)
         return True
 
@@ -356,6 +388,8 @@ class ClaudeSession:
         self._save(pid=proc.pid, created=created, marker=marker, remote_url=None)
         if self._unhook is None:
             self._unhook = killswitch.add_pause_hook(self._on_pause)
+        if self.paused is not None:
+            self._watch = asyncio.ensure_future(self._watch_pause(proc))
         with atomic(self.conn):
             audit(self.conn, "brain.session_start", session=sid[:8], pid=proc.pid)
         if self.cfg.remote_control:
@@ -441,6 +475,9 @@ class ClaudeSession:
             if live.feed(m):
                 continue
             kind = m.get("type")
+            if kind == "rate_limit_event":
+                self.note_rate_limit(m)
+                continue
             if kind == "system" and m.get("subtype") == "init":
                 tools = m.get("tools")
                 names = [t for t in cast(list[Any], tools) if isinstance(t, str)] if (
@@ -458,6 +495,29 @@ class ClaudeSession:
         assert proc.stderr
         async for _raw, _truncated in read_lines(proc.stderr, 8192):
             pass  # drained, never logged: it can quote what Claude read
+
+    def note_rate_limit(self, m: dict[str, Any]) -> None:
+        """A ``rate_limit_event`` (PER-262): logged with its status, window and reset; a
+        warning one (the limit is near) once per window and reset. The limit itself, once
+        hit, comes back in the turn's ``result`` (``runners.claude.usage_limit``)."""
+        raw: Any = m.get("rate_limit_info")
+        info = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+        status, window, resets = (info.get(k) for k in ("status", "rateLimitType", "resetsAt"))
+        status = status if isinstance(status, str) else "unknown"
+        seen = {
+            "status": status,
+            "window": window if isinstance(window, str) else None,
+            "resets_at": resets if isinstance(resets, (int, float, str)) else None,
+            "utilization": u if isinstance(u := info.get("utilization"), (int, float)) else None,
+        }
+        if status == "allowed":
+            log.debug("claude brain: rate limit", extra=seen)
+            return
+        key = f"{seen['window']}:{seen['resets_at']}:{status}"
+        if key in self._limit_warned:
+            return
+        self._limit_warned.add(key)
+        log.warning("claude brain: near a Claude rate limit (%s)", status, extra=seen)
 
     async def _remote(self, live: LiveInput, ask: asyncio.Future[ControlReply]) -> None:
         """The Remote Control answer (RC-1): a valid URL is kept for /status and the
@@ -484,6 +544,22 @@ class ClaudeSession:
                 job = asyncio.ensure_future(self.stop(keep=True))
                 self._stops.add(job)
                 job.add_done_callback(self._stops.discard)
+
+    async def _watch_pause(self, proc: asyncio.subprocess.Process) -> None:
+        """PER-262: a pause written by another process (no hook fires here) stops an idle
+        session within ``pause_check_s``. A turn in flight checks the pause on its own."""
+        paused = self.paused
+        assert paused is not None
+        while True:
+            await asyncio.sleep(self.cfg.pause_check_s)
+            if self.proc is not proc or not self.alive():
+                return  # that process is gone
+            if self.busy or self._stopping is not None:
+                continue
+            if paused():
+                log.info("claude brain: paused from outside; stopping the session")
+                self._on_pause(self.conn, True)
+                return
 
     async def stop(self, *, keep: bool = True) -> None:
         """End the session the RC-1 way: Remote Control off, stdin closed, then the group
@@ -513,6 +589,9 @@ class ClaudeSession:
         proc, target, live, exited = self.proc, self.target, self.live, self._exited
         self.proc = self.target = self.live = None
         self._exited = None
+        watch, self._watch = self._watch, None
+        if watch is not None and watch is not asyncio.current_task():
+            watch.cancel()
         if live is not None:
             live.close()
         if target is not None:
@@ -556,6 +635,43 @@ class ClaudeSession:
         self._save(pid=None, created=None, marker=None, remote_url=None)
         log.warning("claude brain: reaped a session left behind")
 
+    # -- upkeep (PER-262) --
+
+    def transcripts(self) -> Path | None:
+        """This session's transcript dir: ``<home>/.claude/projects/<encoded real cwd>``."""
+        if self.home is None:
+            return None
+        return self.home / ".claude" / "projects" / project_dir_name(self.cwd)
+
+    async def sweep(self, *, keep: str | None = None) -> int:
+        """Remove the brain's earlier transcripts older than ``transcript_days`` (never
+        ``keep`` nor the kv session). The count removed; a failure is logged, never raised."""
+        where, days = self.transcripts(), self.cfg.transcript_days
+        if where is None or days <= 0:
+            return 0
+        current = session_state(self.conn).get("session_id")
+        spare = {k for k in (keep, current) if isinstance(k, str)}
+        cutoff = time.time() - days * 86400
+        try:
+            n = await asyncio.to_thread(sweep_transcripts, where, cutoff, spare)
+        except OSError as e:
+            log.warning("claude brain: transcript sweep failed (%s)", type(e).__name__)
+            return 0
+        if n:
+            log.info("claude brain: removed %d old transcript(s)", n)
+        return n
+
+    async def startup(self) -> None:
+        """Daemon start (PER-262), before the loop resumes anything: reap a session a killed
+        daemon left (kv), then sweep old transcripts. Never raises."""
+        try:
+            st = session_state(self.conn)
+            if isinstance(st.get("pid"), int) and self.proc is None:
+                await self._reap_left(st)
+        except Exception:
+            log.exception("claude brain: startup reap failed")
+        await self.sweep()
+
     async def aclose(self) -> None:
         """Daemon shutdown: end the session (the id is kept for a resume), the server too."""
         if self._unhook is not None:
@@ -568,4 +684,52 @@ class ClaudeSession:
         await self.server.aclose()
 
 
-__all__ = ["SESSION_KV", "ClaudeSession", "TurnOutcome", "session_state", "status_of"]
+def project_dir_name(cwd: Path) -> str:
+    """Claude Code's name for a cwd's dir under ``~/.claude/projects``: the real path with
+    every character but ASCII letters and digits as ``-`` (``/Users/me/.resonant/ask/session``
+    -> ``-Users-me--resonant-ask-session``; checked against 2.1.305's own dirs)."""
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd))
+
+
+def sweep_transcripts(where: Path, cutoff: float, keep: set[str]) -> int:
+    """Remove the session transcripts in ``where`` last changed before ``cutoff`` (epoch
+    seconds): ``<uuid>.jsonl`` files and ``<uuid>/`` dirs (a session's tool results), never
+    an id in ``keep``, a symlink, another name (``memory/``) or anything outside ``where``.
+    ``where`` itself must be a real dir (not a link). The count removed."""
+    try:
+        if not where.is_dir() or where.is_symlink():
+            return 0
+        entries = list(os.scandir(where))
+    except FileNotFoundError:
+        return 0
+    removed = 0
+    for entry in entries:
+        name = entry.name
+        sid = name[: -len(".jsonl")] if name.endswith(".jsonl") else name
+        if not _UUID.match(sid) or sid in keep or entry.is_symlink():
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if st.st_mtime >= cutoff:
+            continue
+        if name.endswith(".jsonl") and entry.is_file(follow_symlinks=False):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(entry.path)
+            removed += 1
+        elif name == sid and entry.is_dir(follow_symlinks=False):
+            shutil.rmtree(entry.path, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+__all__ = [
+    "SESSION_KV",
+    "ClaudeSession",
+    "TurnOutcome",
+    "project_dir_name",
+    "session_state",
+    "status_of",
+    "sweep_transcripts",
+]

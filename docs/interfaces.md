@@ -1641,22 +1641,36 @@ AskRunner(conn, *, cfg: AskClaudeConfig, scope: AskScope, ask_root, channel, sec
 
 ```python
 ClaudeSession(conn, *, cfg: ClaudeSessionConfig, cwd: Path, server: McpServer, clock=utcnow,
-              poll_s=0.25, kill_grace_s=2.0, rc_timeout_s=15.0, end_wait_s=3.0, taint_hops=3)
+              poll_s=0.25, kill_grace_s=2.0, rc_timeout_s=15.0, end_wait_s=3.0, taint_hops=3,
+              paused: (() -> bool) | None = None,   # PER-262: checked every pause_check_s while up
+              home: Path | None = None)             # PER-262: HOME whose .claude/projects it sweeps
   .turn(*, argv: (session_id, resume) -> list[str], env, message, primer: () -> str,
         observe, check_init, paused, may_retry: () -> bool, started=None) -> TurnOutcome
   .busy -> bool                      # a turn holds .lock (one at a time)
   .inherited_hops() -> int | None    # last turn's hops + 1 while <= taint_hops (brain.taint_hops), else None
   .record(hops: int | None)          # this turn's taint hops (None: clean)
   .stop(keep=True); .aclose()        # RC off, stdin closed, end_wait_s, group reaped
+  .startup()                         # PER-262, daemon start: reap the kv leftover, then .sweep()
+  .transcripts() -> Path | None      # <home>/.claude/projects/<project_dir_name(cwd)>
+  .sweep(*, keep=None) -> int        # transcripts older than transcript_days (not keep / kv id)
+  .note_rate_limit(event)            # a rate_limit_event: logged; non-"allowed" warns once/window
+project_dir_name(cwd) -> str         # realpath, every non-[A-Za-z0-9] as "-" (Claude Code's naming)
+sweep_transcripts(where, cutoff, keep: set[str]) -> int   # <uuid>.jsonl / <uuid>/ only, no links
 TurnOutcome(status: "answered"|"crashed"|"timeout"|"killed"|"refused", result, refusal, fresh, retried)
 
 McpServer(*, python=sys.executable, idle_listing=None)    # runners/ask_tools.py
   .start() -> Path (the MCP config; idempotent); .bind(tools); .unbind(tools); .aclose()
+  # PER-262: its rsn-mcp-* dir holds `owner` ({pid, created}, 0600)
+sweep_bridge_dirs(base=None, *, grace_s=60) -> int    # daemon start: dirs whose owner is gone
+AskRunner(..., bridge_root: Path | None = None).start()   # sweep_bridge_dirs + brain.startup()
+wiring.start_asks(components)                             # Daemon.run, before the loop
 ClaudeTools(..., server: McpServer | None = None)          # None: owns its own (one-shot)
   .read_outside: bool   # outside content came in this session/turn (hop 0)
   .changes: int         # change calls that reached the gate (a crash retry needs 0)
 
-session_argv(head, *, cfg, scope, api_billing, mcp, session_id, resume) -> list[str]   # runners/ask.py
+session_argv(head, *, cfg, scope, api_billing, mcp, session_id, resume, budget_turns=50,
+             max_turns=None) -> list[str]                                        # runners/ask.py
+  # PER-262: --max-turns <claude_session.max_turns> (counts per user message, probed)
   # PER-258: --tools BRAIN_BUILTINS --setting-sources '' --permission-mode default
   #   --permission-prompts host --permission-prompt-tool mcp__resonant__permission
   #   --allowedTools <read built-ins, gate.shell.READ_RULES, mcp__resonant__*>
@@ -1669,11 +1683,11 @@ store.tasks.note_claude_reply(conn, task_id, reply, *, session=False, hops=None)
 ```
 
 - **Which asks.** `enqueue` marks `checkpoint.session` when the brain is on, `tools` (a brain hand-off with `resonant_tools`), the principal is the owner, the kind is `general`, `research` or `link`, there are no attachments and it isn't a watch. Everything else is the one-shot path above. Past `queue_max` unanswered session asks (the one in flight included in the count's head) → `AskRefused(BUSY, busy=True)`; with any ahead, `Queued.after` is `after "<first six words of the oldest>"[ and N more], then this` and the brain appends it to the ack in parentheses.
-- **Step.** A session ask waits (`Wait("usage_reset", +1 s)`) unless it is the oldest unanswered one (`status` queued/running/waiting, no `phase`, no `reply`, by rowid) and no turn is in flight. Then `_turn`: a `ClaudeTools` bound to the session's server (`tainted` from the asking turn, `taint("session", hops=…)` from `inherited_hops`), the message (`New text from the owner, through Resonant:` + the kind's hint + the text; the primer first in a new session; PER-268: before all of it, the system texts Resonant sent the owner since the last turn the session saw, newest 6 of the last 24 h, as `Resonant texted the owner itself since your last turn (…):\n<since_last>\n- 15:31 <text>\n</since_last>`, the cursor in kv `brain.claude_session.texts_seen` moved once the message is written), `check_init` against `toolset(cfg, "general")`, `may_retry` = no change reached the gate and nothing pending. Once written, the checkpoint gets `session_turn: true` (a daemon crash with a pinned call → `INTERRUPTED`). After: `record(hops)` with hops 0 if `read_outside`, else the asking turn's `taint_hops` (0 if unknown) or the inherited hops, else None; the checkpoint keeps `claude_hops` and `fresh`; the rest is BR-10's wrap-up (report lines, usage limit, a pending approval). Outcomes map to `Stopped: …` (killed), `Not done: Claude took over 4m; stopped.` (timeout), `Not done: Claude's session ended mid-answer[, after it had started a change, so it wasn't run again]; it restarts on your next text.` (crashed), the init refusal, or `classify(result)`.
+- **Step.** A session ask waits unless it is the oldest unanswered one (`status` queued/running/waiting, no `phase`, no `reply`, by rowid) and no turn is in flight: `Wait("usage_reset", +30 s)` (a backstop), or `+0.2 s` when the session is idle and the turn ahead is mid-step. PER-262: when a session turn's step ends (`finally`), the oldest other unanswered session ask is set `queued` if it is `waiting` (`_wake_next_turn`), and the loop's wakeup after the step dispatches it. Then `_turn`: a `ClaudeTools` bound to the session's server (`tainted` from the asking turn, `taint("session", hops=…)` from `inherited_hops`), the message (`New text from the owner, through Resonant:` + the kind's hint + the text; the primer first in a new session; PER-268: before all of it, the system texts Resonant sent the owner since the last turn the session saw, newest 6 of the last 24 h, as `Resonant texted the owner itself since your last turn (…):\n<since_last>\n- 15:31 <text>\n</since_last>`, the cursor in kv `brain.claude_session.texts_seen` moved once the message is written), `check_init` against `toolset(cfg, "general")`, `may_retry` = no change reached the gate and nothing pending. Once written, the checkpoint gets `session_turn: true` (a daemon crash with a pinned call → `INTERRUPTED`). After: `record(hops)` with hops 0 if `read_outside`, else the asking turn's `taint_hops` (0 if unknown) or the inherited hops, else None; the checkpoint keeps `claude_hops` and `fresh`; the rest is BR-10's wrap-up (report lines, usage limit, a pending approval). Outcomes map to `Stopped: …` (killed), `Not done: Claude took over 4m; stopped.` (timeout), `Not done: Claude's session ended mid-answer[, after it had started a change, so it wasn't run again]; it restarts on your next text.` (crashed), the init refusal, or `classify(result)`.
 - **History.** `_note_answer` writes `claude_reply`, `claude_session: true` and `claude_hops` on the asking brain task; `Exchange.taint_at` counts that answer only when its turn was tainted (`claude_hops` set), within the window like any source (one-shot answers count as hop 0). The brain's hand-off to a session turn doesn't call `_Turn.outside()` (its reply carries the turn's own taint), and `Answer.meta.claude_session` is set.
 - **kv `brain.claude_session`**: `{session_id, started_at, turns, written, pid?, created?, marker?, remote_url?, hops?}`. `written` once a `result` came back (resume allowed); emptied on a crash, a hang, an init refusal, a rotation or a lost resume (the next start is new and primed). Audit `brain.session_start` (session id prefix, pid), `brain.session_remote` (ok).
 - **Status.** `collect_status()["claude_brain"]` and `daemon_status` → `{state: up|down, turns, remote_url?}` (None before the first start); `/status` adds `Claude brain: up · N turns[ · Remote Control: <url>]`. Dashboard: `Snapshot.claude_brain: ClaudeBrain{state, turns, remote_url (local), tools: [BrainTool]}`, local tier only; `Snapshot.brain_activity` in both tiers (PER-258, below).
-- **Config** `brain.claude_session: {enabled true, remote_control false, rotate_turns 50 (1..1000), rotate_hours 12 (≤168), turn_timeout_s 240 (≤900), queue_max 3 (0..20), max_per_hour 60 (0 off), progress_texts true}`.
+- **Config** `brain.claude_session: {enabled true, remote_control false, rotate_turns 50 (1..1000), rotate_hours 12 (≤168), turn_timeout_s 240 (≤900), queue_max 3 (0..20), max_per_hour 60 (0 off), progress_texts true, pause_check_s 5 (>0, ≤300), transcript_days 14 (0 keeps), max_turns 40 (1..200)}`. `AskScope.deny_rules()` writes each deny glob in its `case_variants` (as given, lower, upper, capitalized; PER-262).
 - **Tests.** `tests/test_e2e_claude_session.py`; the fake is `e2e/fake_claude.py`'s session mode.
 
 ### The Claude brain's own tools: `resonant.gate.shell`, `resonant.tools.shell` (PER-258)

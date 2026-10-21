@@ -69,7 +69,8 @@ is a turn of one long-lived session (``runners/claude_session.py``) instead of i
 ``claude -p``: ``enqueue`` marks it ``session``, and the step writes the message into the
 session and waits for its ``result``. The task is otherwise the same ask (the bridge, bound to
 the session's MCP server for this turn only; the approvals; the reply; the history note).
-One turn at a time: the others wait in order (``Wait("usage_reset")``, polled), at most
+One turn at a time: the others wait in order (``Wait("usage_reset")``; the turn ahead wakes
+the next when its step ends, PER-262, with a 30 s backstop), at most
 ``queue_max`` behind the one in flight (past it, ``enqueue`` refuses with ``busy``), and
 ``Queued.after`` names what is ahead for the ack. A turn starts tainted when the asking turn
 was or the session's last turn was tainted within the hop window (``inherited_hops``);
@@ -141,6 +142,7 @@ from resonant.runners.ask_tools import (
     NoModel,
     ToolAccess,
     listing,
+    sweep_bridge_dirs,
 )
 from resonant.runners.claude import LimitHit, read_lines, usage_limit, wake_time
 from resonant.runners.claude_session import ClaudeSession, TurnOutcome
@@ -301,7 +303,11 @@ APPROVED_HEAD = (
 # built-ins and Resonant's tools). Email and calendar (connector reads) and images (files in
 # the ask's own folder) stay one-shot.
 SESSION_KINDS: frozenset[str] = frozenset({"general", "research", "link"})
-SESSION_POLL_S = 1.0  # a queued turn looks again this soon
+# PER-262: a queued turn doesn't poll. The turn ahead of it wakes it when its step ends
+# (``_wake_next_turn``); these are the backstop, and the short re-check for a turn that
+# looked while the one ahead was between its turn and the end of its step.
+SESSION_POLL_S = 30.0
+SESSION_SETTLE_S = 0.2
 AFTER_WORDS = 6
 HISTORY_EXCHANGES = 4  # earlier exchanges in a tools ask's prompt
 HISTORY_LINE_CHARS = 300
@@ -477,11 +483,14 @@ class AskScope:
         return [r for r in self.read().top_roots() if r.is_dir()]
 
     def deny_rules(self) -> list[str]:
-        # The CLI may match these literally while the read tools fold case; --add-dir keeps
-        # it to the roots, and the followups note the residual (a ``.ENV`` in a root).
         """The deny list as ``Read(...)`` permission rules for ``--settings``: a path (as
         given and real; ``//`` marks an absolute path) and all under it, a glob anywhere and
-        all under it."""
+        all under it, each glob in its case variants (:func:`case_variants`).
+
+        Probed on 2.1.305 (PER-262, docs/brain-plan.md): the rules bind Read, Grep and Glob
+        (a Grep over a root leaves the denied files out) and follow symlinks; an absolute
+        path rule ignores case, a glob rule doesn't (``**/.env`` let ``.ENV`` through) and
+        takes no ``[eE]`` classes, so globs are written out per case."""
         rules: list[str] = []
         paths = [Path(e).expanduser() for e in self.deny if e.startswith(("/", "~"))]
         for p in [*paths, *self.always]:
@@ -489,8 +498,19 @@ class AskScope:
                 rules += [f"Read(/{q})", f"Read(/{q}/**)"]
         for e in self.deny:
             if not e.startswith(("/", "~")) and (g := e.strip("/")):
-                rules += [f"Read(**/{g})", f"Read(**/{g}/**)"]
+                for v in case_variants(g):
+                    rules += [f"Read(**/{v})", f"Read(**/{v}/**)"]
         return list(dict.fromkeys(rules))
+
+
+def case_variants(glob: str) -> list[str]:
+    """A deny glob as given, lower case, upper case and capitalized (``.env*``, ``.ENV*``,
+    ``.Env*``): the CLI matches globs by case and takes no classes (PER-262). Another mix
+    (``.eNv``) isn't covered; the read tools fold case, and ``--add-dir`` keeps Claude's
+    own reads to the roots."""
+    i = next((n for n, c in enumerate(glob) if c.isalpha()), None)
+    cap = glob if i is None else glob[:i] + glob[i].upper() + glob[i + 1 :].lower()
+    return list(dict.fromkeys([glob, glob.lower(), glob.upper(), cap]))
 
 
 @dataclass(frozen=True)
@@ -573,6 +593,7 @@ def session_argv(
     session_id: str,
     resume: bool,
     budget_turns: int = 50,
+    max_turns: int | None = None,
 ) -> list[str]:
     """The Claude brain's argv (BR-11): ``ask_argv``'s allow, deny and ``Read`` rules for a
     ``general`` ask with Resonant's tools (``--add-dir`` roots, ``--strict-mcp-config``), but
@@ -584,8 +605,10 @@ def session_argv(
     The reads in ``gate.shell.READ_RULES`` never prompt; ``ASK_RULES`` always do. A
     long-lived session: ``--input-format stream-json`` (RC-1: each turn is a user line on the
     stdin kept open), ``--session-id`` for a new session or ``--resume`` for one already
-    written, and no ``--no-session-persistence`` or ``--max-turns`` (a turn is bounded by
-    ``claude_session.turn_timeout_s``). API billing: ``--max-budget-usd`` is the session's,
+    written, and no ``--no-session-persistence``. ``max_turns``
+    (``claude_session.max_turns``): ``--max-turns``, which counts per user message in a
+    stream-json session (probed on 2.1.305, PER-262); a turn is also bounded by
+    ``claude_session.turn_timeout_s``. API billing: ``--max-budget-usd`` is the session's,
     ``max_budget_usd`` per turn for ``budget_turns`` (``rotate_turns``) turns."""
     ts = toolset(cfg, "general")
     denied = [*dict.fromkeys([*cfg_writes(cfg), *ts.blocked])]
@@ -624,6 +647,8 @@ def session_argv(
         "--append-system-prompt",
         f"{SESSION_PROMPT} {SHELL_PROMPT}".replace("{max_chars}", str(cfg.reply_max_chars)),
     ]
+    if max_turns is not None:
+        argv += ["--max-turns", str(max_turns)]
     if api_billing:
         argv += ["--max-budget-usd", f"{cfg.max_budget_usd * budget_turns:g}"]
     return argv
@@ -825,6 +850,7 @@ class AskRunner:
         poll_s: float = POLL_S,
         kill_grace_s: float = KILL_GRACE_S,
         defer_s: float = DEFER_S,
+        bridge_root: Path | None = None,
     ) -> None:
         """``scope``: what an ask may read (``AskScope.from_settings``, the read tools'
         sources). ``ask_root``: where each ask gets an empty cwd (``<RESONANT_HOME>/ask``: not
@@ -835,8 +861,11 @@ class AskRunner:
         None: every ask is read-only. ``session`` (BR-11, ``brain.claude_session``): the
         Claude brain for the owner's hand-offs (with ``tools``; None or off: one-shot asks
         only); its ``max_per_hour`` is the runaway guard either way. ``taint_hops``:
-        ``brain.taint_hops`` (PER-245), for the session's and a one-shot ask's history."""
+        ``brain.taint_hops`` (PER-245), for the session's and a one-shot ask's history.
+        ``bridge_root``: where the tool bridges' ``rsn-mcp-*`` dirs are swept at startup
+        (PER-262; None: the system temp dir, where ``McpServer`` makes them)."""
         self.taint_hops = taint_hops
+        self.bridge_root = bridge_root
         self.conn = conn
         self.cfg = cfg
         self.scope = scope
@@ -899,6 +928,8 @@ class AskRunner:
                 poll_s=poll_s,
                 kill_grace_s=kill_grace_s,
                 taint_hops=taint_hops,
+                paused=self._paused,  # PER-262: a pause from the CLI stops it while idle
+                home=self.home,  # its transcripts: <home>/.claude/projects/<cwd>
             )
             longest = max(longest, 2 * session.turn_timeout_s)  # a crash may retry once
         self.max_step_s: float | None = longest + STEP_SLACK_S
@@ -1054,6 +1085,33 @@ class AskRunner:
         ).fetchall()
         return [(str(r[0]), str(r[1] or "")) for r in rows]
 
+    def _settle_s(self, queue: list[tuple[str, str]]) -> float:
+        """How long a turn that isn't next waits while the session is idle: briefly when the
+        turn ahead is mid-step (it took the session just now, or answered and is wrapping up:
+        it may end its step before this one is waiting, so its wake would miss), else the
+        backstop (the turn ahead wakes this one when its step ends)."""
+        if not queue:
+            return SESSION_POLL_S
+        head = get_task(self.conn, queue[0][0])
+        return SESSION_SETTLE_S if head is not None and head.status == "running" else (
+            SESSION_POLL_S)  # fmt: skip
+
+    def _wake_next_turn(self, done: str) -> None:
+        """PER-262: a session turn's step is ending: the next turn in line, if it is
+        waiting, is queued now (the loop dispatches it on the wakeup every finished step
+        sets), instead of polling for the session."""
+        try:
+            nxt = next((tid for tid, _ in self._session_queue() if tid != done), None)
+            if nxt is None:
+                return
+            with atomic(self.conn):
+                woke = task_store.set_status(self.conn, nxt, "queued", expect=("waiting",))
+        except sqlite3.Error:
+            log.warning("ask: couldn't wake the next Claude brain turn", exc_info=True)
+            return
+        if woke:
+            log.debug("ask: woke the next Claude brain turn", extra={"task": nxt})
+
     def _owner_words(self, requested_by: str | None) -> str | None:
         """The owner's message that started the asking turn (never model-written text)."""
         source = get_task(self.conn, requested_by) if requested_by is not None else None
@@ -1130,9 +1188,12 @@ class AskRunner:
             assert self.brain is not None
             queue = self._session_queue()
             if self.brain.busy or not queue or queue[0][0] != task.id:
-                wake = self.clock() + timedelta(seconds=SESSION_POLL_S)
-                return Wait("usage_reset", cp, wake)
-            return await self._ask(task, ctx, cp, question, kind)
+                wait = SESSION_POLL_S if self.brain.busy else self._settle_s(queue)
+                return Wait("usage_reset", cp, self.clock() + timedelta(seconds=wait))
+            try:
+                return await self._ask(task, ctx, cp, question, kind)
+            finally:
+                self._wake_next_turn(task.id)
         if len(self._working) >= self.cfg.concurrency:
             wake = self.clock() + timedelta(seconds=self.defer_s)
             return Wait("usage_reset", cp, wake)  # the only "come back later" reason there is
@@ -1333,7 +1394,8 @@ class AskRunner:
         def argv(session_id: str, resume: bool) -> list[str]:
             return session_argv(head, cfg=self.cfg, scope=self.scope, api_billing=api_billing,
                                 mcp=mcp, session_id=session_id, resume=resume,
-                                budget_turns=brain.cfg.rotate_turns)  # fmt: skip
+                                budget_turns=brain.cfg.rotate_turns,
+                                max_turns=brain.cfg.max_turns)  # fmt: skip
 
         def hops_of(out: TurnOutcome) -> int | None:
             if bridge.read_outside:
@@ -1883,6 +1945,19 @@ class AskRunner:
         """Wait for background notes and notices (tests)."""
         while jobs := [j for j in self._notes if not j.done()]:
             await asyncio.gather(*jobs, return_exceptions=True)
+
+    async def start(self) -> None:
+        """Daemon start (PER-262), before the loop resumes anything: the Claude brain's
+        leftovers (a session process a killed daemon left, old transcripts) and the
+        ``rsn-mcp-*`` bridge dirs whose daemon is gone. Never raises."""
+        try:
+            n = await asyncio.to_thread(sweep_bridge_dirs, self.bridge_root)
+            if n:
+                log.info("ask: removed %d stale tool bridge dir(s)", n)
+        except Exception:
+            log.exception("ask: bridge dir sweep failed")
+        if self.brain is not None:
+            await self.brain.startup()
 
     async def aclose(self) -> None:
         """Daemon shutdown: end the Claude brain the RC-1 way (its id kept for a resume)."""
