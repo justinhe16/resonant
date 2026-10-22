@@ -27,21 +27,28 @@ owner's own text and the call's args; the model's say-so is never enough:
      or hypothetical about it ("should I merge #41?", "if CI passes …"), and the change's
      verb not negated ("don't merge it").
    - ``merge_run{code}``: the verb ``merge`` and the run named: its code (``R3``), its PR
-     (``#41``, ``pr 41``) or a word of its ask or repo ("the dark mode pr"), and no other
-     ready run named the same way (ambiguous: "which PR?" asks).
+     (``#41``, ``pr 41``), or words: every content word of the text is a word of its ask or
+     repo, two or more, or the repo's name ("the dark mode pr", "the site pr"); no other
+     ready or still-working run named the same way (ambiguous: "which PR?" asks); and not a
+     run with flagged paths or in a repo an ``ask merge`` rule covers (the prompt shows
+     those).
    - ``linear.save_issue`` creating an issue (no ``id``): a filing verb (file, make, create,
-     open, add, log, raise) and a ticket word (ticket, issue, bug, linear), and the title's
-     words in the text (at least two, and most of them). An update by id (close, edit)
-     still asks.
-   - ``allow_tools{tools}``: a "don't ask" phrase ("don't ask", "stop asking", "without
-     asking") and every tool or extension the call names, named in the text ("linear",
-     "merging" for ``merge_run``).
+     open, add, log, raise) and a ticket word (ticket, issue, bug, linear), the title's words
+     in the text (at least two, and most of them), and no args but title, team,
+     description, priority and labels. An update by id (close, edit) still asks.
+   - ``allow_tools{tools}``: a standing "don't ask" phrase ("don't ask me before …", "stop
+     asking before …", "no more prompts"; never a one-off "without asking") and every tool
+     it names in the text: ``ext.tool`` by the extension and the tool's words, a bare
+     extension by its name and a kind of change ("linear tickets"), a builtin by its words
+     ("merging" for ``merge_run``).
+   - one change per tool per message: a second one asks.
 
 A call that passes runs as an approval would (``PolicyGate._owner_asked``): an approval row
 already ``approved`` by the owner (``decided_by`` ``owner_asked``), an ``approval.resolve``
 audit row with ``decision: owner_asked`` and the event id, and the executor spends it like
-any other approval, so the report line, ``/approvals`` history, the dashboard and the
-briefing see it like a yes. Anything that fails a check asks the plain yes, as before.
+any other approval, so the report line and the audit trail read like a yes. Its ``Allow`` is
+strict (``unattended``): the owner saw no prompt with the call's details. Anything that
+fails a check asks the plain yes, as before.
 """
 
 from __future__ import annotations
