@@ -153,7 +153,11 @@ def test_decide_a_short_reply_to_a_question_or_a_go_ahead_is_claudes() -> None:
     """A "sure" that answers Resonant's question, or a "do it", is consent to something in
     the conversation: Claude's, never a thumbs up."""
     assert triage.decide("sure", T("g", "ack"), asked_back=True) == "claude"
-    assert triage.decide("sure", T("g", "ack")) == "small_talk"
+    assert triage.decide("ok", T("g", "ack"), asked_back=True) == "claude"
+    assert triage.decide("ok", T("g", "ack")) == "small_talk"
+    # an offer without a "?" ("say the word and I'll merge it"): a yes is still Claude's
+    for text in ("sure", "yes", "yeah sure", "yep"):
+        assert triage.decide(text, T("g", "ack")) == "claude", text
     for text in ("go ahead", "ok do it", "yes please", "sounds good, go for it", "ship it"):
         assert triage.decide(text, T("g", "ack")) == "claude", text
 

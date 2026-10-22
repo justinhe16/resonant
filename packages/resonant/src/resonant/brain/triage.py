@@ -237,12 +237,14 @@ def _vocab(words: str) -> frozenset[str]:
 
 
 # Every word of a greeting or an ack is one of these (emoji and punctuation aside): "thanks,
-# remind me later" or "ok but that's wrong" is a request or a correction, Claude's.
+# remind me later" or "ok but that's wrong" is a request or a correction, Claude's. No "yes",
+# "sure" or "yeah": after an offer ("say the word and I'll merge it") that is consent, and
+# only Claude has the thread.
 _SMALL_TALK_VOCAB = _vocab(
     "hi hey hello yo sup hiya howdy morning good gm gn night evening afternoon thanks thank "
     "you thx ty tysm ok okay k kk cool nice great awesome perfect got it lol haha lmao love "
     "appreciate appreciated cheers np no worries sweet work job well done ah oh wow neat noted "
-    "sure yep yes ya yeah yup alright right fair enough amazing much so very a lot all there "
+    "amazing much so very a lot all there "
     "again back u man dude friend buddy everyone guys"
 )
 # Every word of a plain "what's new" is one of these: "anything new with my flight?" has a
