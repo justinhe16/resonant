@@ -15,8 +15,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from test_local_runner_gated import Clock, FakeChannel, FakeModel
+from test_local_runner_gated import Clock, FakeChannel
 
+from resonant.e2e.fakes import ScriptedModel
 from resonant.executor import Executor, HandlerKey, ToolFailed, ToolHandler
 from resonant.gate import ApprovalReply, ApprovalResolution, NeedsApproval, PolicyGate
 from resonant.gate.codes import batch_text
@@ -241,7 +242,7 @@ def h(db: sqlite3.Connection) -> H:
                       batch_max=4)  # fmt: skip
     executor = Executor(db, gate, handlers)
     channel = FakeChannel()
-    runner = LocalRunner(db, model=FakeModel(), channel=channel, gate=gate, executor=executor,
+    runner = LocalRunner(db, model=ScriptedModel(), channel=channel, gate=gate, executor=executor,
                          registry=registry, now=clock)  # fmt: skip
     return H(db, clock, gate, runner, channel, ran, crash_on, fail_on)
 

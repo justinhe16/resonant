@@ -160,6 +160,28 @@ def test_old_runner_config_still_loads(resonant_home: Path) -> None:
     assert load_settings().runner.max_bundle_mb == 80
 
 
+def test_old_brain_config_still_loads_with_a_warning(
+    resonant_home: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PER-256: ``brain.mode`` (the intents path is gone), ``brain.route: local`` and
+    ``brain.triage.bias`` load, are ignored (``local`` reads as ``triage``), and say so."""
+    (resonant_home / "config.yaml").write_text(
+        "brain:\n  mode: intents\n  route: local\n  triage:\n    bias: claude\n"
+    )
+    with caplog.at_level("WARNING", logger="resonant.config"):
+        s = load_settings()
+    assert s.brain.route == "triage"
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    assert "brain.mode is deprecated" in warned and "route: local is deprecated" in warned
+    assert "triage.bias is deprecated" in warned
+    # a clean config says nothing, and route claude is kept
+    caplog.clear()
+    (resonant_home / "config.yaml").write_text("brain:\n  route: claude\n")
+    with caplog.at_level("WARNING", logger="resonant.config"):
+        assert load_settings().brain.route == "claude"
+    assert not [r for r in caplog.records if r.name == "resonant.config"]
+
+
 def test_phase3_from_yaml_and_env(resonant_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (resonant_home / "config.yaml").write_text(
         "briefing:\n  enabled: false\n  at: '07:45'\n"

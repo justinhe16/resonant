@@ -1,12 +1,16 @@
 """The brain loop's prompt, in cache order (docs/brain-plan.md D2).
 
+PER-256: the local model no longer runs a tool loop, so nothing sends this prompt to a model.
+``BrainRunner`` still builds it for one thing, the history's taint (``BrainContext.untrusted``:
+the turn starts tainted when the history replays outside text, BR-10b). The rest is kept as
+it was and pinned by its tests; retiring it is a follow-up.
+
 Qwen's chat template renders the first system message and then the tool definitions in one
 turn, so everything that changes per turn goes after them. ``build_context`` returns:
 
 1. **System** (``BRAIN_SYSTEM``, constant): role, style and rules.
-2. *(the tools: the caller passes them to ``chat_tools``; they render here. The core tools
-   with their schemas and every other tool as a one-line stub, ``runners.brain.stub``,
-   whose summary comes from ``catalog_entries``; they change on an extension install)*
+2. *(the tools: the caller passes them to ``chat_tools``; they render here. Deferred tools
+   were one-line stubs whose summary comes from ``catalog_entries``)*
 3. **Facts**, one ``user`` turn, present only when there are facts: the facts index
    (``facts.render_index``; changes on ``remember`` or ``forget``). A user turn rather than
    a second system message, so every template keeps it after the tools.

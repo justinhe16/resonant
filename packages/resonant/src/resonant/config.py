@@ -9,6 +9,7 @@ only by the daemon (the executor for extensions, the runner for ``runner/*``).
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 import re
 from datetime import time, timedelta
@@ -33,6 +34,9 @@ DEFAULT_HOME = Path("~/.resonant")
 
 def resonant_home() -> Path:
     return Path(os.environ.get("RESONANT_HOME", DEFAULT_HOME)).expanduser()
+
+
+log = logging.getLogger(__name__)
 
 
 class _Section(BaseModel):
@@ -298,7 +302,8 @@ class ExtensionsConfig(_Section):
     max_concurrent_jobs: int = Field(default=4, ge=1, le=16)
     # A tool or job result is stored (redacted) up to this many bytes...
     result_max_bytes: int = Field(default=32 * 1024, ge=1024, le=256 * 1024)
-    # ...and the model sees at most this many characters of it, as untrusted data.
+    # ...and the local model saw at most this many characters of it, as untrusted data
+    # (unused since PER-256: the local model calls no tool; Claude's bridge has its own cap).
     model_result_max_chars: int = Field(default=4096, ge=256, le=32 * 1024)
     process: ProcessConfig = Field(default_factory=ProcessConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
@@ -686,7 +691,7 @@ class AskClaudeConfig(_Section):
     concurrency: int = Field(default=1, ge=1, le=4)  # sessions at once
     # Messages to Claude a day (settings.timezone): Claude brain turns, one-shot asks, media
     # and watch checks alike. 0 (the default): no daily cap; ``claude_session.max_per_hour``
-    # is the runaway guard. Hit: the owner hears it once that day and qwen answers.
+    # is the runaway guard. Hit: the owner hears it once that day; approvals and /status still work.
     daily_cap: int = Field(default=0, ge=0, le=5000)
     timeout_s: float = Field(default=120.0, gt=0, le=900)
     max_turns: int = Field(default=15, ge=1, le=50)
@@ -805,11 +810,18 @@ class ClaudeSessionConfig(_Section):
     rotate_hours: float = Field(default=12.0, gt=0, le=168)
     # One turn's budget; past it the session is killed (a hang) and restarts on the next.
     turn_timeout_s: float = Field(default=240.0, gt=0, le=900)
-    # Hard texts waiting behind the one in flight; past it the owner is told it's busy.
-    queue_max: int = Field(default=3, ge=0, le=20)
+    # Texts waiting behind the one in flight; past it the owner is told it's busy. (PER-256:
+    # Claude answers every substantive text now, so the queue is deeper than it was.)
+    queue_max: int = Field(default=5, ge=0, le=20)
+    # PER-256: the one short ack ("On it") goes out only when the answer takes longer than
+    # this; a fast answer arrives alone.
+    ack_after_s: float = Field(default=8.0, ge=0, le=120)
+    # PER-256: when Claude is unavailable (a crash, a hang) the owner hears so once and the
+    # turn is tried again after this long.
+    retry_after_s: float = Field(default=60.0, gt=0, le=3600)
     # Runaway guard: messages to Claude per clock hour (the brain, one-shot asks, media and
-    # watch checks); past it the owner hears it once and qwen answers until the next hour.
-    # 0: off.
+    # watch checks); past it the owner hears it once and approvals and /status still work
+    # until the next hour. 0: off.
     max_per_hour: int = Field(default=60, ge=0, le=1000)
     # PER-258: a turn whose own shell changes or edits ran ends its reply with one
     # code-built "Did: ..." line (no line for reads).
@@ -827,20 +839,19 @@ class ClaudeSessionConfig(_Section):
 
 
 class TriageConfig(_Section):
-    """BR-10: the local model's first call on a chat turn decides who answers it.
+    """BR-10, PER-256: the local model only routes. Its one call on a chat turn types the
+    message (greeting, ack, news check, ...); only a greeting, an ack or a code-built news
+    check is answered without Claude. Everything else goes to Claude, which answers.
 
-    Latency and usage: a local answer is ~1-5 s and free; a Claude answer takes ~5-20 s
-    (longer with tools) and draws on the owner's Claude subscription (``ask_claude``'s
-    daily cap and usage limits apply). The ack goes out first, within ~1 s on a warm model.
+    Latency and usage: a Claude answer takes ~5-20 s (longer with tools) and draws on the
+    owner's Claude subscription (``ask_claude``'s daily cap and usage limits apply).
     """
 
-    # ``normal``: the local model keeps the easy ones (a status, a note or reminder, one
-    # lookup with an obvious tool, small talk, a follow-up already answered) and hands the
-    # rest over, choosing Claude when in doubt. ``claude``: only a status, a note or reminder
-    # and small talk stay local.
-    bias: Literal["normal", "claude"] = "normal"
+    # Deprecated and ignored (PER-256: the local model no longer keeps any substantive
+    # turn); accepted so old config files load.
+    bias: Literal["normal", "claude"] | None = None
     # The triage call's budget; past it (a cold prompt on a busy model) the turn goes to
-    # Claude with a canned ack.
+    # Claude.
     timeout_s: float = Field(default=8.0, gt=0, le=60)
 
 
@@ -868,13 +879,13 @@ class WatchConfig(_Section):
 class BrainConfig(_Section):
     """The brain (docs/brain-plan.md). BR-2: where the read tools (``tools/files.py``) look."""
 
-    # BR-1 (D1), default since BR-8: ``loop`` sends every non-fast-path chat message to the
-    # brain loop (``runners/brain.py``). ``intents`` is the opt-in fallback: the labeler and
-    # one intent's fixed toolset (the brain also uses it for a turn when the model fails).
-    mode: Literal["intents", "loop"] = "loop"
-    # BR-10, loop mode only. ``triage``: the local model's first call routes each turn to
-    # itself or to Claude (with an ack). ``local``: the loop as before (Claude only when it
-    # asks or gets stuck). ``claude``: every turn goes to Claude, after a local ack.
+    # Deprecated and ignored (PER-256 retired the intents path: the labeler and its fixed
+    # toolsets); accepted so old config files load, with a warning.
+    mode: Literal["intents", "loop"] | None = None
+    # BR-10, PER-256. ``triage``: the local model's one call types each message; small talk
+    # and code-built news checks are answered here, everything else goes to Claude. ``claude``:
+    # even small talk and news checks go to Claude. ``local`` is deprecated: read as
+    # ``triage``, with a warning.
     route: Literal["triage", "local", "claude"] = "triage"
     triage: TriageConfig = Field(default_factory=TriageConfig)
     # BR-10b, PER-245: after outside text (web, files, email, logs, extension output, a
@@ -906,6 +917,18 @@ class BrainConfig(_Section):
     # top of extensions.notify.max_per_hour. Over it, a notice waits for the briefing.
     proactive_per_day: int = Field(default=3, ge=0, le=50)
     watches: WatchConfig = Field(default_factory=WatchConfig)
+
+    @model_validator(mode="after")
+    def _deprecated(self) -> Self:
+        """PER-256: keys that no longer do anything load with a warning."""
+        if self.mode is not None:
+            log.warning("brain.mode is deprecated and ignored: the intents path is gone")
+        if self.triage.bias is not None:
+            log.warning("brain.triage.bias is deprecated and ignored")
+        if self.route == "local":
+            log.warning("brain.route: local is deprecated; reading it as triage")
+            self.route = "triage"
+        return self
 
     @field_validator("whisper_path", "whisper_model")
     @classmethod

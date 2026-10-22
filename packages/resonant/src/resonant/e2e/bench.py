@@ -1,8 +1,8 @@
 """``resonant bench e2e``: text-in to send-call latency, through the real Phase 1 stack.
 
 What runs is production code end to end: the chat.db reader (WAL watch and polling), the
-loop, the router (fast path or LLM label), the local runner (tools through gate and
-executor), and ``IMessageChannel.send``. Three things are stand-ins, so the bench never
+loop, the router (fast path, or the brain's triage), the runners, and
+``IMessageChannel.send``. Three things are stand-ins, so the bench never
 texts anyone and never touches the live daemon's state:
 
 - ``chat.db`` is a ``FakeChatDB`` in a temporary home; each prompt is one inserted row.
@@ -13,13 +13,13 @@ texts anyone and never touches the live daemon's state:
 Latency is measured from the row insert to the osascript call, per path:
 
 - ``fast``: slash commands and the `status`/`ping` keywords (no model call).
-- ``llm``: one label call, then the runner's tool loop and answer.
-- ``loop``: ``brain.mode: loop`` (BR-1), in its own home: the brain loop's rounds (the fake
-  model reads one directory, then answers) and its reply.
+- ``route`` (PER-256): a greeting through the brain: one triage call from the local model,
+  then the reply it routes to itself. (Everything else goes to Claude, whose latency is
+  Claude's, not this bench's.)
 
 Messages.app delivery and osascript's own run time are not included (the iMessage self-test
-covers that path). Exit criterion on the Mini: ``fast`` p50 <= 1s, ``llm`` p50 <= 3s and
-``loop`` p50 <= 5s (docs/brain-plan.md §4).
+covers that path). Exit criterion on the Mini: ``fast`` p50 <= 1s and ``route`` p50 <= 3s
+(docs/brain-plan.md §4).
 Prompts are synthetic; no real message bodies.
 """
 
@@ -55,29 +55,18 @@ from resonant.models.bench import percentile
 from resonant.store.db import open_db, utcnow
 from resonant.wiring import build_imessage_stack
 
-BenchPath = Literal["fast", "llm", "loop"]
-PATHS: tuple[BenchPath, ...] = ("fast", "llm", "loop")
+BenchPath = Literal["fast", "route"]
+PATHS: tuple[BenchPath, ...] = ("fast", "route")
 
 OWNER_HANDLE = "+15550100100"
-# loop: docs/brain-plan.md §4, "a simple loop read ~5 s"
-TARGET_P50_MS: dict[BenchPath, int] = {"fast": 1000, "llm": 3000, "loop": 5000}
+TARGET_P50_MS: dict[BenchPath, int] = {"fast": 1000, "route": 3000}
 FAST_PROMPTS = ("status", "ping", "/status", "/tasks", "/help")
-LLM_PROMPTS = (
-    "anything queued up right now?",
-    "how many tasks finished today?",
-    "is the mini under a lot of memory pressure?",
-    "which jobs are waiting on something?",
-)
-LOOP_PROMPTS = (
-    "where is the resonant repo checked out?",
-    "what's in the resonant readme?",
-    "list what's in my code folder",
-)
+ROUTE_PROMPTS = ("hey", "good morning", "hi there", "hello")
 PROMPTS: dict[BenchPath, tuple[str, ...]] = {
     "fast": FAST_PROMPTS,
-    "llm": LLM_PROMPTS,
-    "loop": LOOP_PROMPTS,
+    "route": ROUTE_PROMPTS,
 }
+GREETING_TRIAGE = {"handler": "local", "kind": "general", "message_type": "greeting", "say": "Hey!"}
 READY_TIMEOUT_S = 10.0
 FAKE_SEND_TIMEOUT_S = 10.0
 
@@ -133,8 +122,6 @@ def bench_settings(
     home: Path,
     chat_db: Path,
     base: Settings | None = None,
-    *,
-    mode: Literal["intents", "loop"] = "intents",
 ) -> Settings:
     """Settings for an isolated bench home. ``model`` comes from ``base`` (the user's config).
 
@@ -155,7 +142,7 @@ def bench_settings(
             cache_dir=home / "runs-cache",
         ),
         ops=OpsConfig(repo_path=None),
-        brain=BrainConfig(mode=mode, read_roots=[code, home / "logs"]),
+        brain=BrainConfig(read_roots=[code, home / "logs"]),
         channels=ChannelsConfig(
             imessage=IMessageConfig(
                 enabled=True,
@@ -181,24 +168,18 @@ async def run_e2e_bench(
 
     ``model`` None uses a ``ScriptedModel``; pass an ``OllamaClient`` for the real thing.
     One untimed prompt per path warms things up first (a cold model load is not latency).
-    ``fast`` and ``llm`` run with ``brain.mode: intents``; ``loop`` gets its own home with
-    ``brain.mode: loop`` (the fake model reads one directory, then answers).
     """
     if send_timeout_s is None:
         timeout = FAKE_SEND_TIMEOUT_S if model is None else (base or Settings()).model.timeout_s * 5
     else:
         timeout = send_timeout_s
     results: list[PathResult] = []
-    intents: list[BenchPath] = [p for p in paths if p != "loop"]
-    if intents:
-        fake = ScriptedModel() if model is None else None
-        async with _stack("intents", model or cast(ModelClient, fake), base, clock) as b:
-            for path in intents:
-                results.append(await _run_path(b, path, n, timeout, warmup, None))
-    if "loop" in paths:
-        fake = ScriptedModel(script=[]) if model is None else None
-        async with _stack("loop", model or cast(ModelClient, fake), base, clock) as b:
-            results.append(await _run_path(b, "loop", n, timeout, warmup, fake))
+    fake = ScriptedModel() if model is None else None
+    if fake is not None:
+        fake.triage = dict(GREETING_TRIAGE)
+    async with _stack(model or cast(ModelClient, fake), base, clock) as b:
+        for path in paths:
+            results.append(await _run_path(b, path, n, timeout, warmup))
     return results
 
 
@@ -213,7 +194,6 @@ class _Bench:
 
 @contextlib.asynccontextmanager
 async def _stack(
-    mode: Literal["intents", "loop"],
     model: ModelClient,
     base: Settings | None,
     clock: Callable[[], float],
@@ -222,7 +202,7 @@ async def _stack(
         home = Path(tmp)
         (home / "principals.yaml").write_text(PRINCIPALS_YAML)
         chat = FakeChatDB(home / "chat.db")
-        settings = bench_settings(home, chat.path, base, mode=mode)
+        settings = bench_settings(home, chat.path, base)
         code = settings.runner.code_dir
         (code / "resonant").mkdir(parents=True, exist_ok=True)
         (code / "resonant" / "README.md").write_text("# resonant\n")
@@ -266,15 +246,11 @@ async def _run_path(
     n: int,
     timeout_s: float,
     warmup: bool,
-    fake: ScriptedModel | None,
 ) -> PathResult:
     prompts = PROMPTS[path]
     result = PathResult(path)
 
     async def one(text: str) -> float:
-        if fake is not None:  # the loop's fake: one read, then the answer
-            fake.script = []  # drop what a timed-out prompt left, so prompts stay aligned
-            fake.push([("list_dir", {"path": str(b.code)})], "resonant is in ~/code/resonant.")
         return await _one(b.chat, b.osa, text, timeout_s, b.clock)
 
     if warmup:
@@ -291,7 +267,7 @@ async def _run_path(
             result.failures += 1
             continue
         result.latencies_ms.append(ms)
-        # the loop path may send "On it…" first: let the turn finish before the next one
+        # let the turn finish before the next one
         with contextlib.suppress(TimeoutError):
             await wait_until(lambda: b.loop.inflight == 0, timeout_s)
     return result

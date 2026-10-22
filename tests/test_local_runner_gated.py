@@ -4,7 +4,6 @@ templated reports, refusals and dry-run replies. Uses the real PolicyGate and Ex
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -15,6 +14,7 @@ from typing import Any
 import pytest
 
 from resonant.config import LoopConfig, load_settings
+from resonant.e2e.fakes import ScriptedModel
 from resonant.executor import Executor, HandlerKey, ToolFailed, ToolHandler
 from resonant.gate import ApprovalReply, ApprovalResolution, Deny, DryRun, Intent, PolicyGate
 from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
@@ -30,19 +30,12 @@ from resonant.gateway.channel import (
 from resonant.launchd import DAEMON_LABEL
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.loop.types import PRIORITY_OWNER, StepContext, Task
-from resonant.models import (
-    ChatMessage,
-    ModelReply,
-    ModelUnavailableError,
-    ProbeResult,
-    SpanFactory,
-    ToolCall,
-)
 from resonant.ops import RESTART_DELAY_S, restart_later_argv, restart_pending
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.principals import Principal, Principals
 from resonant.runners.local import (
     LocalRunner,
+    PinnedCall,
     dry_run_reply,
     refusal_reply,
     report_line,
@@ -74,50 +67,6 @@ class Clock:
 
     def advance(self, seconds: float) -> None:
         self.now += timedelta(seconds=seconds)
-
-
-class FakeModel:
-    """Scripted ``chat_tools`` replies (then none) and one ``chat_json`` reply."""
-
-    def __init__(
-        self,
-        tool_replies: list[list[ToolCall]] | None = None,
-        final: dict[str, Any] | Exception | None = None,
-    ) -> None:
-        self.tool_replies = list(tool_replies or [])
-        self.final = final if final is not None else {"reply": "ok"}
-        self.tool_calls_made = 0
-        self.json_calls: list[list[ChatMessage]] = []
-
-    async def chat_tools(
-        self,
-        messages: list[ChatMessage],
-        *,
-        tools: list[ToolSpec],
-        max_tokens: int = 512,
-        spans: SpanFactory | None = None,
-    ) -> ModelReply:
-        self.tool_calls_made += 1
-        out = self.tool_replies.pop(0) if self.tool_replies else []
-        return ModelReply(None, out, None, 5, 10, 3)
-
-    async def chat_json(
-        self,
-        messages: list[ChatMessage],
-        *,
-        schema: dict[str, Any],
-        max_tokens: int = 512,
-        temperature: float = 0.0,
-        spans: SpanFactory | None = None,
-        tools: list[ToolSpec] | None = None,
-    ) -> ModelReply:
-        self.json_calls.append(list(messages))
-        if isinstance(self.final, Exception):
-            raise self.final
-        return ModelReply(json.dumps(self.final), [], self.final, 5, 10, 3)
-
-    async def probe(self) -> ProbeResult:
-        raise AssertionError("runner never probes")
 
 
 @dataclass
@@ -184,7 +133,6 @@ class FakeChannel:
 class Harness:
     db: sqlite3.Connection
     clock: Clock
-    model: FakeModel
     channel: FakeChannel
     gate: PolicyGate
     executor: Executor
@@ -257,7 +205,6 @@ class Harness:
 @pytest.fixture
 def make(db: sqlite3.Connection) -> Any:
     def _make(
-        model: FakeModel | None = None,
         *,
         dry_run: bool = False,
         restart: ToolHandler | None = None,
@@ -306,11 +253,10 @@ def make(db: sqlite3.Connection) -> Any:
             clock=clock,
         )
         executor = Executor(db, gate, handlers)
-        model = model or FakeModel()
         channel = FakeChannel()
         runner = LocalRunner(
             db,
-            model=model,
+            model=ScriptedModel(),
             channel=channel,
             gate=gate,
             executor=executor,
@@ -324,7 +270,7 @@ def make(db: sqlite3.Connection) -> Any:
             SlotPool(5, 1),
             clock=clock,
         )
-        return Harness(db, clock, model, channel, gate, executor, runner, loop, tool_log)
+        return Harness(db, clock, channel, gate, executor, runner, loop, tool_log)
 
     return _make
 
@@ -333,12 +279,10 @@ def direct(tool: str, **args: Any) -> dict[str, Any]:
     return {"direct_call": {"tool": tool, "args": args}, "title": f"/{tool}"}
 
 
-def chat(*toolset: str) -> dict[str, Any]:
-    return {"intent": "question", "confidence": 0.9, "toolset": list(toolset), "fallback": False}
-
-
-def tc(name: str, **args: Any) -> list[ToolCall]:
-    return [ToolCall(name, args)]
+def inferred(tool: str, **args: Any) -> dict[str, Any]:
+    """A model-chosen call pinned before the gate, as the Claude bridge leaves it (PER-256: the
+    local model chooses none): the runner resumes it with ``origin="inferred"``."""
+    return {"call": PinnedCall(tool, None, args, 0, 0).to_json()}
 
 
 @dataclass
@@ -397,7 +341,6 @@ async def test_explicit_l3_runs_with_no_prompt(make: Any) -> None:
     t = h.task(task_id)
     assert t.status == "done"
     assert t.checkpoint["call"]["step_no"] == 0 and t.checkpoint["call"]["call_index"] == 0
-    assert h.model.tool_calls_made == 0 and h.model.json_calls == []
 
 
 async def test_explicit_l2_runs_with_no_prompt(make: Any) -> None:
@@ -444,8 +387,8 @@ async def test_unknown_direct_call_tool_runs_nothing(make: Any) -> None:
 
 
 async def test_inferred_l2_asks_waits_until_expiry_then_runs_once_on_yes(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_resonant")], final={"reply": "Restarting."}))
-    task_id = h.add_task(chat("restart_resonant"), text="please restart resonant")
+    h: Harness = make()
+    task_id = h.add_task(inferred("restart_resonant"), text="please restart resonant")
     await h.loop.run_until_idle()
 
     (approval,) = h.approvals(task_id)
@@ -460,8 +403,7 @@ async def test_inferred_l2_asks_waits_until_expiry_then_runs_once_on_yes(make: A
     h.resolve(task_id, approved=True)
     await h.loop.run_until_idle()
     assert h.tool_log == ["restart_resonant"]
-    assert h.channel.replies() == ["Done: restart Resonant"]  # templated: no model round
-    assert h.model.tool_calls_made == 1 and h.model.json_calls == []
+    assert h.channel.replies() == ["Done: restart Resonant"]  # templated
     assert h.task(task_id).status == "done"
     assert [e["origin"] for e in h.evaluations(task_id)] == ["inferred", "inferred"]
 
@@ -472,8 +414,8 @@ async def test_inferred_l2_asks_waits_until_expiry_then_runs_once_on_yes(make: A
 
 
 async def test_no_gives_not_done(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_resonant")]))
-    task_id = h.add_task(chat("restart_resonant"))
+    h: Harness = make()
+    task_id = h.add_task(inferred("restart_resonant"))
     await h.loop.run_until_idle()
     h.resolve(task_id, approved=False)
     await h.loop.run_until_idle()
@@ -483,8 +425,8 @@ async def test_no_gives_not_done(make: Any) -> None:
 
 
 async def test_expiry_wakes_the_task_and_says_so(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_resonant")]))
-    task_id = h.add_task(chat("restart_resonant"))
+    h: Harness = make()
+    task_id = h.add_task(inferred("restart_resonant"))
     await h.loop.run_until_idle()
     h.clock.advance(TTL_S - 1)
     await h.loop.run_until_idle()
@@ -498,8 +440,8 @@ async def test_expiry_wakes_the_task_and_says_so(make: Any) -> None:
 
 
 async def test_spurious_wake_reprompts_idempotently(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_resonant")]))
-    task_id = h.add_task(chat("restart_resonant"))
+    h: Harness = make()
+    task_id = h.add_task(inferred("restart_resonant"))
     await h.loop.run_until_idle()
     wake_at = h.task(task_id).wake_at
 
@@ -511,13 +453,12 @@ async def test_spurious_wake_reprompts_idempotently(make: Any) -> None:
     assert len(approval.channel_refs) == 1 and approval.channel_refs[0].at == T0
     t = h.task(task_id)
     assert (t.status, t.wake_at) == ("waiting", wake_at)
-    assert h.model.tool_calls_made == 1
 
 
 async def test_prompt_send_failure_is_retryable(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_resonant")]))
+    h: Harness = make()
     h.channel.fail_prompt.append(ChannelSendError("Messages is not running"))
-    task_id = h.add_task(chat("restart_resonant"))
+    task_id = h.add_task(inferred("restart_resonant"))
     await h.loop.run_until_idle()
     t = h.task(task_id)
     assert t.status == "queued" and t.error is not None and "approval prompt" in t.error
@@ -527,30 +468,29 @@ async def test_prompt_send_failure_is_retryable(make: Any) -> None:
     await h.loop.run_until_idle()
     assert len(h.channel.prompts) == 1
     assert h.task(task_id).status == "waiting"
-    assert h.model.tool_calls_made == 1
     assert len(h.approvals(task_id)) == 1
 
 
 async def test_refused_prompt_fails_for_good(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_resonant")]))
+    h: Harness = make()
     h.channel.fail_prompt.append(ChannelRefused("no imessage identity"))
-    task_id = h.add_task(chat("restart_resonant"))
+    task_id = h.add_task(inferred("restart_resonant"))
     await h.loop.run_until_idle()
     assert h.task(task_id).status == "failed"
     assert h.approvals(task_id)[0].status == "expired"  # orphaned with the task
 
 
 async def test_crash_between_save_and_prompt_prompts_on_retry(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_resonant")]))
-    task_id = h.add_task(chat("restart_resonant"))
-    await crash_step(h, task_id, pinned_only)
+    h: Harness = make()
+    h.channel.fail_prompt.append(Crash())  # the process dies as the prompt goes out
+    task_id = h.add_task(inferred("restart_resonant"))
+    await crash_step(h, task_id, lambda _cp: False)
     assert h.channel.prompts == []
 
     await h.loop.run_until_idle()
     assert len(h.channel.prompts) == 1
     assert len(h.approvals(task_id)) == 1  # the pending approval was reused
     assert h.task(task_id).status == "waiting"
-    assert h.model.tool_calls_made == 1  # resumed from the pinned call, not the model
 
 
 # --- exactly once ------------------------------------------------------------------------
@@ -651,108 +591,28 @@ async def test_definite_failure_is_reported_not_retried(make: Any) -> None:
     assert h.task(task_id).status == "done"
 
 
-# --- the model path ----------------------------------------------------------------------
+# --- a model-chosen call (pinned before the gate) ----------------------------------------
 
 
-async def test_inferred_l3_runs_and_the_report_line_is_always_there(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("add_note", text="eggs")], final={"reply": "Got it."}))
-    task_id = h.add_task(chat("add_note", "list_notes"), text="note eggs")
+async def test_inferred_l3_runs_and_the_report_line_is_the_reply(make: Any) -> None:
+    h: Harness = make()
+    task_id = h.add_task(inferred("add_note", text="eggs"), text="note eggs")
     await h.loop.run_until_idle()
-    assert h.channel.replies() == ['Got it.\nSaved note 1: "eggs"']
+    assert h.channel.replies() == ['Saved note 1: "eggs"']
     assert h.channel.prompts == []
     assert (h.task(task_id).result or {})["tools_used"] == ["add_note"]
-    assert h.model.tool_calls_made == 2  # one more round: the model may chain (GT-1)
 
 
-async def test_report_line_is_not_repeated_when_the_model_says_it(make: Any) -> None:
-    model = FakeModel([tc("add_note", text="eggs")], final={"reply": 'Saved note 1: "eggs"'})
-    h: Harness = make(model)
-    h.add_task(chat("add_note"))
+async def test_an_l1_call_asks_with_a_code_and_no_does_nothing(make: Any) -> None:
+    # clear_notes is L1: it asks with a code and offers no "yes always".
+    h: Harness = make()
+    task_id = h.add_task(inferred("clear_notes"))
     await h.loop.run_until_idle()
-    assert h.channel.replies() == ['Saved note 1: "eggs"']
-
-
-async def test_model_down_after_the_side_effect_sends_the_report(make: Any) -> None:
-    model = FakeModel([tc("add_note", text="eggs")], final=ModelUnavailableError("gone"))
-    h: Harness = make(model)
-    h.add_task(chat("add_note"))
-    await h.loop.run_until_idle()
-    assert h.channel.replies() == ['Saved note 1: "eggs"']
-
-
-async def test_allowed_side_effects_chain_then_an_approval_stops_the_task(make: Any) -> None:
-    # GT-1: side effects allowed without asking run one after another (each its own
-    # call_index); the first one that needs approval is pinned with the reports so far.
-    model = FakeModel(
-        [
-            [ToolCall("add_note", {"text": "a"}), ToolCall("add_note", {"text": "b"})],
-            tc("restart_resonant"),
-        ]
-    )
-    h: Harness = make(model)
-    task_id = h.add_task(chat("add_note", "restart_resonant"))
-    await h.loop.run_until_idle()
-    assert sorted(h.notes()) == ["a", "b"]
-    assert h.tool_log == ["add_note", "add_note"]
-    assert h.executions(task_id) == 2
-    (approval,) = h.approvals(task_id)
-    assert h.channel.prompts == [(OWNER, f"[{approval.code}] restart resonant? Reply yes / no")]
-    cp = h.task(task_id).checkpoint
-    assert cp["call"]["tool"] == "restart_resonant" and cp["call"]["call_index"] == 2
-    assert cp["effects"] == ['Saved note 1: "a"', 'Saved note 2: "b"']
-
-    h.resolve(task_id, approved=True)
-    await h.loop.run_until_idle()
-    assert h.tool_log == ["add_note", "add_note", "restart_resonant"]
-    assert h.channel.replies() == ['Saved note 1: "a"\nSaved note 2: "b"\nDone: restart Resonant']
-    assert h.task(task_id).status == "done"
-    assert h.model.tool_calls_made == 2  # one approval per task: no rounds after it
-
-
-async def test_side_effects_stop_at_the_cap(make: Any) -> None:
-    model = FakeModel(
-        [
-            [ToolCall("add_note", {"text": t}) for t in ("a", "b", "c")],
-            tc("add_note", text="d"),
-        ],
-        final={"reply": "Saved."},
-    )
-    h: Harness = make(model)
-    task_id = h.add_task(chat("add_note"))
-    await h.loop.run_until_idle()
-    assert sorted(h.notes()) == ["a", "b", "c"]
-    assert h.executions(task_id) == 3
-    assert h.model.tool_calls_made == 1  # at the cap: no more rounds
-    (reply,) = h.channel.replies()
-    assert reply.startswith("Saved.\n") and 'Saved note 3: "c"' in reply
-
-
-async def test_a_refusal_after_a_side_effect_keeps_its_report(make: Any) -> None:
-    model = FakeModel([[ToolCall("add_note", {"text": "a"}), ToolCall("clear_notes", {})]])
-    h: Harness = make(model)
-    task_id = h.add_task(chat("add_note", "clear_notes"))
-    await h.loop.run_until_idle()
-    # clear_notes is L1: it asks with a code; the note already saved is reported after "no".
     (approval,) = h.approvals(task_id)
     assert approval.require_code and not approval.allow_always
     h.resolve(task_id, approved=False)
     await h.loop.run_until_idle()
-    (reply,) = h.channel.replies()
-    assert reply.startswith('Saved note 1: "a"\n') and h.notes() == ["a"]
-
-
-async def test_crash_after_a_chained_side_effect_replays_its_report(make: Any) -> None:
-    model = FakeModel([[ToolCall("add_note", {"text": "a"}), ToolCall("add_note", {"text": "b"})]])
-    h: Harness = make(model)
-    task_id = h.add_task(chat("add_note"))
-    # Crash once the second call is pinned (its checkpoint carries the first report).
-    await crash_step(h, task_id, lambda cp: cp.get("call", {}).get("call_index") == 1)
-    h.skip_backoff(task_id)
-    await h.loop.run_until_idle()
-    assert sorted(h.notes()) == ["a", "b"]  # each call ran exactly once
-    assert h.executions(task_id) == 2
-    (reply,) = h.channel.replies()
-    assert reply == 'Saved note 1: "a"\nSaved note 2: "b"'
+    assert h.channel.replies() == ["Not done."] and h.notes() == []
 
 
 def _always_reply(h: Harness, code: str, *, actor: str = OWNER, event: str = "ev1") -> Any:
@@ -773,8 +633,8 @@ def _always_reply(h: Harness, code: str, *, actor: str = OWNER, event: str = "ev
 
 
 async def test_yes_always_on_an_l2_chat_tool_saves_a_standing_allow(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_resonant")]), standing=True)
-    task_id = h.add_task(chat("restart_resonant"), text="restart resonant")
+    h: Harness = make(standing=True)
+    task_id = h.add_task(inferred("restart_resonant"), text="restart resonant")
     await h.loop.run_until_idle()
     (approval,) = h.approvals(task_id)
     assert approval.allow_always and not approval.require_code
@@ -802,8 +662,7 @@ async def test_yes_always_on_an_l2_chat_tool_saves_a_standing_allow(make: Any) -
     )
 
     # The next chat call of the same tool runs as L3: no prompt, just the report.
-    h.model.tool_replies.append(tc("restart_resonant"))
-    task2 = h.add_task(chat("restart_resonant"), text="restart resonant again")
+    task2 = h.add_task(inferred("restart_resonant"), text="restart resonant again")
     await h.loop.run_until_idle()
     assert h.approvals(task2) == []
     assert h.tool_log == ["restart_resonant", "restart_resonant"]
@@ -812,104 +671,33 @@ async def test_yes_always_on_an_l2_chat_tool_saves_a_standing_allow(make: Any) -
     # The kill switch still wins: autonomy off asks, and offers no yes always.
     with transaction(h.db):
         kv_set(h.db, "autonomy", "off")
-    h.model.tool_replies.append(tc("restart_resonant"))
-    task3 = h.add_task(chat("restart_resonant"), text="restart once more")
+    task3 = h.add_task(inferred("restart_resonant"), text="restart once more")
     await h.loop.run_until_idle()
     (asked,) = h.approvals(task3)
     assert not asked.allow_always and asked.always_action is None
 
 
 async def test_plain_yes_saves_no_rule_and_the_next_call_asks_again(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_resonant"), tc("restart_resonant")]), standing=True)
-    first = h.add_task(chat("restart_resonant"))
+    h: Harness = make(standing=True)
+    first = h.add_task(inferred("restart_resonant"))
     await h.loop.run_until_idle()
     h.resolve(first, approved=True)
     await h.loop.run_until_idle()
     assert h.db.execute("SELECT COUNT(*) FROM trust_rules").fetchone()[0] == 0
-    second = h.add_task(chat("restart_resonant"))
+    second = h.add_task(inferred("restart_resonant"))
     await h.loop.run_until_idle()
     assert len(h.approvals(second)) == 1
 
 
 async def test_l1_never_offers_yes_always(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("clear_notes")]), standing=True)
-    task_id = h.add_task(chat("clear_notes"))
+    h: Harness = make(standing=True)
+    task_id = h.add_task(inferred("clear_notes"))
     await h.loop.run_until_idle()
     (approval,) = h.approvals(task_id)
     assert approval.require_code and not approval.allow_always
     assert approval.code is not None
     h.clock.advance(1)
     assert _always_reply(h, approval.code).reason == "always_unsupported"
-
-
-async def test_reads_before_the_side_effect_still_run(make: Any) -> None:
-    model = FakeModel([tc("task_counts"), tc("add_note", text="x")], final={"reply": "7 tasks."})
-    h: Harness = make(model)
-    task_id = h.add_task(chat("add_note", "task_counts"))
-    await h.loop.run_until_idle()
-    assert h.tool_log == ["task_counts", "add_note"]
-    assert h.channel.replies() == ['7 tasks.\nSaved note 1: "x"']
-    assert h.executions(task_id) == 2
-
-
-async def test_model_cannot_produce_explicit_origin(make: Any) -> None:
-    # Whatever the model sends, its calls are "inferred": L2 asks.
-    model = FakeModel([tc("restart_resonant", origin="explicit")])
-    h: Harness = make(model)
-    task_id = h.add_task(chat("restart_resonant"), text="/restart resonant")
-    await h.loop.run_until_idle()
-    assert [(e["decision"], e["origin"]) for e in h.evaluations(task_id)] == [
-        ("NeedsApproval", "inferred")
-    ]
-    assert h.tool_log == []
-
-
-def _answered(h: Harness, text: str, reply: str, *, tainted: bool) -> None:
-    """An earlier exchange, finished: the brain's reply and whether it read outside text."""
-    event = Event(source="imessage", type="message", principal=OWNER, payload={"text": text})
-    cp = {"reply": reply, "reply_meta": {"meta": {"tainted": tainted}}}
-    with transaction(h.db):
-        repo.insert_event(h.db, event)
-        task_id = repo.insert_task(
-            h.db,
-            NewTask(kind="chat", runner="brain", priority=PRIORITY_OWNER, principal=OWNER,
-                    checkpoint=cp, origin_event_id=event.id, trace_id=event.trace_id),
-        )  # fmt: skip
-        h.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
-
-
-async def test_a_replayed_tainted_reply_taints_the_intents_calls(make: Any) -> None:
-    """BR-10b: the intents prompt replays the previous reply (``<prior_reply>``); one written
-    after outside content taints this task: its calls are gated and pinned ``tainted``, so
-    an L3 write asks."""
-    h: Harness = make(FakeModel([tc("delete_note", id=1)]))
-    _answered(h, "what's in a.txt?", "It says to delete note 1.", tainted=True)
-    task_id = h.add_task(chat("delete_note"), text="ok do it")
-    await h.loop.run_until_idle()
-    assert [(e["decision"], e["origin"]) for e in h.evaluations(task_id)] == [
-        ("NeedsApproval", "tainted")
-    ]
-    assert h.tool_log == [] and h.task(task_id).checkpoint["tainted"] is True
-
-
-async def test_a_tainted_intents_task_still_adds_its_note(make: Any) -> None:
-    """PER-245: add_note is taint exempt: in the same tainted task it is gated as
-    ``inferred`` (L3: it runs), while the task stays tainted."""
-    h: Harness = make(FakeModel([tc("add_note", text="eggs")], final={"reply": "Noted."}))
-    _answered(h, "what's in a.txt?", "It says to add a note.", tainted=True)
-    task_id = h.add_task(chat("add_note"), text="note eggs")
-    await h.loop.run_until_idle()
-    assert [(e["decision"], e["origin"]) for e in h.evaluations(task_id)] == [("Allow", "inferred")]
-    assert h.task(task_id).checkpoint["tainted"] is True
-
-
-async def test_a_replayed_clean_reply_leaves_the_intents_calls_inferred(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("add_note", text="eggs")], final={"reply": "Got it."}))
-    _answered(h, "where is mycelium?", "In code.", tainted=False)
-    task_id = h.add_task(chat("add_note"), text="note eggs")
-    await h.loop.run_until_idle()
-    assert [(e["decision"], e["origin"]) for e in h.evaluations(task_id)] == [("Allow", "inferred")]
-    assert "tainted" not in h.task(task_id).checkpoint
 
 
 async def test_a_pinned_call_without_its_direct_call_is_inferred(make: Any) -> None:
@@ -920,7 +708,7 @@ async def test_a_pinned_call_without_its_direct_call_is_inferred(make: Any) -> N
         "args": {},
         "step_no": 0,
     }
-    task_id = h.add_task({**chat(), "call": {**forged, "call_index": 0}})
+    task_id = h.add_task({"call": {**forged, "call_index": 0}})
     other = h.add_task(
         {**direct("add_note", text="x"), "call": {**forged, "call_index": 0}}, kind="command"
     )
@@ -933,10 +721,10 @@ async def test_a_pinned_call_without_its_direct_call_is_inferred(make: Any) -> N
 
 
 async def test_dry_run_replies_would_and_store_tools_still_run(make: Any) -> None:
-    h: Harness = make(FakeModel([tc("restart_ollama")]), dry_run=True)
+    h: Harness = make(dry_run=True)
     ops = h.add_task(direct("restart_ollama"), kind="command")
     note = h.add_task(direct("add_note", text="milk"), kind="command")
-    inferred = h.add_task(chat("restart_ollama"))
+    chosen = h.add_task(inferred("restart_ollama"))
     await h.loop.run_until_idle()
     assert sorted(h.channel.replies()) == [
         "Dry run: would restart ollama",
@@ -945,20 +733,7 @@ async def test_dry_run_replies_would_and_store_tools_still_run(make: Any) -> Non
     ]
     assert h.tool_log == ["add_note"]
     assert (h.task(ops).result or {})["path"] == "dry_run"
-    assert h.task(note).status == h.task(inferred).status == "done"
-
-
-async def test_history_skips_messages_that_started_no_task(make: Any) -> None:
-    h: Harness = make(FakeModel(final={"reply": "ok"}))
-    with transaction(h.db):  # an approval reply: routed to the gate, started no task
-        repo.insert_event(
-            h.db,
-            Event(source="imessage", type="message", principal=OWNER, payload={"text": "yes"}),
-        )
-    h.add_task(chat(), text="what now?")
-    await h.loop.run_until_idle()
-    users = [m["content"] for m in h.model.json_calls[0] if m["role"] == "user"]
-    assert not any(re.search(r"\byes\b", u) for u in users)
+    assert h.task(note).status == h.task(chosen).status == "done"
 
 
 # --- templates ---------------------------------------------------------------------------
@@ -1202,10 +977,8 @@ async def test_builtin_approvals_stay_owner_only(make: Any) -> None:
         calls.append(ext)
         return [MEMBER]
 
-    h: Harness = make(
-        FakeModel([tc("restart_resonant")]), principals=team(), approvers_for=approvers_for
-    )
-    task_id = h.add_task(chat("restart_resonant"))
+    h: Harness = make(principals=team(), approvers_for=approvers_for)
+    task_id = h.add_task(inferred("restart_resonant"))
     await h.loop.run_until_idle()
     (approval,) = h.approvals(task_id)
     assert approval.approvers == (OWNER,)

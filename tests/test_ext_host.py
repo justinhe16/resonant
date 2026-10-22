@@ -21,7 +21,6 @@ from resonant.gate import PolicyGate
 from resonant.gateway.channel import ChannelError, ChannelRefused
 from resonant.loop import Loop, SlotPool
 from resonant.ops.fakes import FakeOpsRunner
-from resonant.runners.local import MAX_TOOL_ITERATIONS
 from resonant.secrets import FakeKeychain, SecretStore
 from resonant.store.db import kv_get, utcnow
 from resonant.store.extensions import get_extension
@@ -335,16 +334,14 @@ def test_step_limit_ignores_jobs_and_caps_extension_tools(
     loop = Loop(db, {}, settings.loop, SlotPool(2, 1))
     state = DaemonState(settings, db, loop, started_at=utcnow())
     builtin_only = local_step_limit(
-        settings.model,
         build_components(settings, db, state, ops_runner=FakeOpsRunner()).chat_specs(),
     )
     install_fixture(settings, db, MANIFEST, {"cli.py": CLI})
     c = build_components(settings, db, state, ops_runner=FakeOpsRunner())
     assert any(s.timeout_s == 1800 for s in c.registry.specs())  # the job is registered
-    assert local_step_limit(settings.model, c.chat_specs()) == builtin_only  # 1800s ignored
+    assert local_step_limit(c.chat_specs()) == builtin_only  # 1800s ignored
     long_tool = ToolSpec(name="t", effect=Effect.READ, extension="x", timeout_s=1000)
-    model_s = (MAX_TOOL_ITERATIONS + 1) * settings.model.timeout_s
-    assert local_step_limit(settings.model, [long_tool]) == max(model_s, 300) + 15
+    assert local_step_limit([long_tool]) == 300 + 15
 
 
 def test_no_extensions_dir_is_fine(settings: Settings, db: sqlite3.Connection) -> None:

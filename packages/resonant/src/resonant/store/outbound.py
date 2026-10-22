@@ -5,8 +5,10 @@ the owner's reply, so a line in it ("reply yes to go ahead") must not stand in f
 
 The iMessage channel notes every text it sends (``note``) after it went out, in send order (it
 sends one at a time): when it started, its dedupe key (which names a prompt or a reminder), and
-whether it was a Claude answer (it starts with the code-built ``CLAUDE_PREFIX`` the ask runner
-adds; anything else that starts the same way counts too, which only asks for the code). Kept in
+whether it was a Claude answer. PER-256 dropped the visible ``Claude: `` prefix, so the marker is
+the dedupe key: the ask runner sends every answer under ``ask:<task id>`` (``CLAUDE_KEY``;
+``is_claude_send``). Its other texts under ``ask:`` (the limit and cap notices) count too,
+which only asks for the code; the ack (``ask:ack:``) does not. Kept in
 kv ``outbound.recent:<principal>``, the newest ``KEEP`` sends. Order decides, not the clock: two
 sends a millisecond apart, or an ack that lands after the answer, can't flip the rule. The
 last Claude answer is also kept apart (``CLAUDE_KV``): a prompt that fell out of a full window
@@ -27,7 +29,8 @@ from resonant.store.db import atomic, kv_get, kv_set
 
 log = logging.getLogger(__name__)
 
-CLAUDE_PREFIX = "Claude: "  # runners/ask.py: every Claude answer starts with it
+CLAUDE_KEY = "ask:"  # runners/ask.py: every Claude answer is sent under a key that starts so
+ACK_KEY = "ask:ack:"  # the short "On it" while Claude works: not an answer
 KV_PREFIX = "outbound.recent:"
 KEEP = 32
 CLAUDE_KV = "outbound.claude:"  # the last Claude answer's seq and time, kept apart from the window
@@ -40,12 +43,16 @@ def reminder_key(approval_id: str, principal: str) -> str:
     return f"approval:{approval_id}:remind:{principal}"
 
 
-def note(
-    conn: sqlite3.Connection, principal: str, text: str, at: datetime, key: str | None = None
-) -> None:
-    """Record one text sent to ``principal`` (``key``: its dedupe key). Never raises: the
-    text already went out."""
-    claude = text.startswith(CLAUDE_PREFIX)
+def is_claude_send(key: str | None) -> bool:
+    """Whether a text sent under the dedupe ``key`` is a Claude answer (or another text of
+    the ask runner's, which fails closed): ``ask:`` but not the ack. No key: not."""
+    return key is not None and key.startswith(CLAUDE_KEY) and not key.startswith(ACK_KEY)
+
+
+def note(conn: sqlite3.Connection, principal: str, at: datetime, key: str | None = None) -> None:
+    """Record one text sent to ``principal`` (``key``: its dedupe key, which says whether it
+    was a Claude answer, ``is_claude_send``). Never raises: the text already went out."""
+    claude = is_claude_send(key)
     try:
         with atomic(conn):
             window = KV_PREFIX + principal

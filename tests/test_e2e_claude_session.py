@@ -21,6 +21,7 @@ import sys
 import time
 from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +133,11 @@ class World:
         await self.osa.wait_for(n + replies, 20)
         return [m.text for m in self.osa.sent[n : n + replies]]
 
+    def sends_with(self, prefix: str) -> list[str]:
+        """The dedupe keys of the channel's sends that start with ``prefix``."""
+        keys = [str(a.get("idempotency_key") or "") for a in self.audits("imessage.sent")]
+        return [k for k in keys if k.startswith(prefix)]
+
     async def more(self, replies: int) -> list[str]:
         """The next ``replies`` texts out, after those already seen."""
         n = len(self.osa.sent)
@@ -176,14 +182,13 @@ async def start(
         },
         runner={"code_dir": code},
         brain={
-            "mode": "loop",
             "read_roots": [code],
             "claude_session": session or {},
             "ask_claude": ask or {},
         },
     )
     osa = RecordingOsaRunner()
-    model = ScriptedModel(script=[])
+    model = ScriptedModel()
     daemon = Daemon(settings, model=model, osa_runner=osa)
     kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
     kv_set(daemon.conn, "autonomy", "on")
@@ -208,6 +213,7 @@ async def start(
         channel=daemon.imessage.channel,
         secrets=SecretStore(keychain),
         owner="justin",
+        timezone=settings.timezone,
         create_task=daemon.loop.create_task,
         claude_cmd=[sys.executable, "-I", str(FAKE), "--script", str(plan), "--notes", str(notes)],
         home=tmp_path / "claude-home",
@@ -231,14 +237,14 @@ async def start(
         assert await asyncio.wait_for(run, 20) == 0
 
 
-async def _hard(w: World, text: str, **plan: Any) -> tuple[str, str]:
-    """One text triage hands to Claude: its ack and Claude's answer."""
+async def _hard(w: World, text: str, **plan: Any) -> str:
+    """One text triage hands to Claude: Claude's answer (a fast one arrives alone, PER-256)."""
     w.model.triage = CLAUDE
     if plan:
         w.claude(**plan)
-    ack, answer = await w.say(text, replies=2)
+    (answer,) = await w.say(text)
     await w.settled()
-    return ack, answer
+    return answer
 
 
 def _alive(pid: int) -> bool:
@@ -255,8 +261,8 @@ async def test_follow_ups_go_into_the_same_session_and_see_prior_context(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as w:
-        ack, answer = await _hard(w, "why is R4 slow?", answer="R4 waits on CI.")
-        assert (ack, answer) == (ACK, "Claude: R4 waits on CI.")
+        answer = await _hard(w, "why is R4 slow?", answer="R4 waits on CI.")
+        assert answer == "R4 waits on CI."
         first = w.session()
         argv = first["argv"]
         assert argv[argv.index("--input-format") + 1] == "stream-json"
@@ -273,9 +279,9 @@ async def test_follow_ups_go_into_the_same_session_and_see_prior_context(
         assert "Bash(git rev-list:*)" in argv[argv.index("--allowedTools") + 1].split(",")
         assert "mcp__resonant__add_note" in argv[argv.index("--allowedTools") + 1]
         # the follow-up is a second message into the same process, which saw the first
-        _, answer = await _hard(w, "and how do I fix it?", answer="You asked: {prev} ({n})")
+        answer = await _hard(w, "and how do I fix it?", answer="You asked: {prev}")
         second = w.session()
-        assert answer == "Claude: You asked: why is R4 slow? (2)"
+        assert answer == "You asked: why is R4 slow?"
         assert second["pid"] == first["pid"] and second["session_id"] == first["session_id"]
         assert second["prompt"].endswith("and how do I fix it?")
         assert "Owner:" not in second["prompt"]  # no one-shot history replay: it has context
@@ -297,12 +303,12 @@ async def test_two_hard_texts_back_to_back_queue_in_order(
         w.model.triage = CLAUDE
         w.claude(turns=[{"when": "slow", "delay": 1.5, "answer": "first"},
                         {"when": "fix", "answer": "second"}])  # fmt: skip
-        (ack1,) = await w.say("why is R4 slow?")
+        w.chat.add_message(handle=OWNER_PHONE, text="why is R4 slow?")
         await wait_until(lambda: w.session_proc.busy, 10)
-        (ack2,) = await w.say("how do I fix the build?")
-        assert ack1 == ACK
-        assert ack2 == f'{ACK} (after "why is R4 slow", then this)'
-        assert await w.more(2) == ["Claude: first", "Claude: second"]
+        # queued behind the first: its ack goes at once, naming what is ahead (PER-256)
+        (ack,) = await w.say("how do I fix the build?")
+        assert ack == f'{ACK} (after "why is R4 slow", then this)'
+        assert await w.more(2) == ["first", "second"]
         assert [m.splitlines()[-1] for m in w.session()["messages"]] == [
             "why is R4 slow?",
             "how do I fix the build?",
@@ -316,11 +322,11 @@ async def test_past_the_queue_cap_it_says_so(
     async with start(resonant_home, chat, tmp_path, session={"queue_max": 0}) as w:
         w.model.triage = CLAUDE
         w.claude(delay=1.5, answer="first")
-        await w.say("why is R4 slow?")
+        w.chat.add_message(handle=OWNER_PHONE, text="why is R4 slow?")
         await wait_until(lambda: w.session_proc.busy, 10)
         (busy,) = await w.say("and why is R5 slow?")
         assert busy == "Claude has 1 waiting already; send that again once those are answered."
-        assert await w.more(1) == ["Claude: first"]
+        assert await w.more(1) == ["first"]
         assert len(w.ask_tasks()) == 1
 
 
@@ -336,7 +342,7 @@ async def test_a_crash_after_a_change_restarts_primed_and_never_reruns_it(
         w.claude(turns=[{"when": "note", "crash": "once",
                          "calls": [{"name": "add_note", "args": {"text": "buy oat milk"}}]}],
                  answer="fine")  # fmt: skip
-        _, reply = await _hard(w, "note to self: buy oat milk")
+        reply = await _hard(w, "note to self: buy oat milk")
         assert reply.startswith(
             "Not done: Claude's session ended mid-answer, after it had started a change, so "
             "it wasn't run again; it restarts on your next text."
@@ -345,9 +351,9 @@ async def test_a_crash_after_a_change_restarts_primed_and_never_reruns_it(
         assert len(w.executions("add_note")) == 1
         assert not _alive(old)
         # the next text starts a new session, primed from Resonant's own records
-        _, answer = await _hard(w, "what did I just ask?", answer="fresh")
+        answer = await _hard(w, "what did I just ask?", answer="fresh")
         s = w.session()
-        assert answer == "Claude: fresh" and s["pid"] != old
+        assert answer == "fresh" and s["pid"] != old
         assert "--resume" not in s["argv"]
         first = s["messages"][0]
         assert first.startswith("Context: you are picking up a conversation")
@@ -361,22 +367,35 @@ async def test_a_crash_before_any_change_is_retried_in_a_fresh_session(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as w:
-        _, answer = await _hard(w, "why is R4 slow?", crash="once", answer="made it")
-        assert answer == "Claude: made it"
+        answer = await _hard(w, "why is R4 slow?", crash="once", answer="recovered")
+        assert answer == "recovered"
         assert len(w.audits("brain.session_start")) == 2
 
 
-async def test_a_hung_turn_times_out_and_the_next_starts_fresh(
+async def test_a_hung_turn_says_claude_is_down_retries_once_then_says_so_again(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
-    async with start(resonant_home, chat, tmp_path, session={"turn_timeout_s": 3}) as w:
+    """PER-256: a hang with nothing changed: the owner hears it once (with the retry), the
+    turn runs again after ``retry_after_s``, and a second failure ends with the canned
+    reply. Never a model-written answer."""
+    from resonant.runners.ask import UNAVAILABLE_REPLY, UNAVAILABLE_RETRY
+
+    async with start(
+        resonant_home, chat, tmp_path, session={"turn_timeout_s": 2, "retry_after_s": 0.2}
+    ) as w:
+        w.model.triage = CLAUDE
         w.claude(turns=[{"when": "slow", "hang": True}], answer="ok")
-        _, reply = await _hard(w, "why is R4 slow?")
-        assert reply == "Not done: Claude took over 3s; stopped."
-        hung = json.loads((w.notes / "session.json").read_text())["pid"]
+        (first,) = await w.say("why is R4 slow?")
+        assert first == UNAVAILABLE_RETRY
+        assert await w.more(1) == [UNAVAILABLE_REPLY]
+        await w.settled()
+        (ask,) = w.ask_tasks()
+        assert json.loads(ask["checkpoint"])["retried"] is True
+        assert w.sends_with("ask:down:") == [f"ask:down:{ask['id']}"]
+        assert len(w.audits("brain.session_start")) == 2
+        hung = w.session()["pid"]
         assert not _alive(hung)
-        _, answer = await _hard(w, "and R5?")
-        assert answer == "Claude: ok" and w.session()["pid"] != hung
+        assert await _hard(w, "and R5?") == "ok" and w.session()["pid"] != hung
 
 
 async def test_a_daemon_restart_resumes_the_session(
@@ -390,18 +409,18 @@ async def test_a_daemon_restart_resumes_the_session(
     assert st["written"] is True and "pid" not in st
     assert not _alive(first["pid"])
     async with start(resonant_home, chat, tmp_path) as w:
-        _, answer = await _hard(w, "and how do I fix it?", answer="You asked: {prev}")
+        answer = await _hard(w, "and how do I fix it?", answer="You asked: {prev}")
         s = w.session()
-        assert answer == "Claude: You asked: why is R4 slow?"
+        assert answer == "You asked: why is R4 slow?"
         argv = s["argv"]
         assert argv[argv.index("--resume") + 1] == first["session_id"]
         assert s["resumed"] is True and "Context:" not in s["prompt"]  # no primer on a resume
     # a resume that doesn't take (the CLI lost it): a new session, primed
     (w.notes / f"history-{first['session_id']}.json").unlink()
     async with start(resonant_home, chat, tmp_path) as w:
-        _, answer = await _hard(w, "anything else?", answer="fresh")
+        answer = await _hard(w, "anything else?", answer="fresh")
         s = w.session()
-        assert answer == "Claude: fresh" and s["session_id"] != first["session_id"]
+        assert answer == "fresh" and s["session_id"] != first["session_id"]
         assert s["messages"][0].startswith("Context: you are picking up a conversation")
 
 
@@ -541,7 +560,7 @@ async def test_a_clean_turn_doesnt_taint_the_next_one(
     async with start(resonant_home, chat, tmp_path) as w:
         await _hard(w, "why is R4 slow?", calls=[{"name": "list_notes", "args": {}}],
                     answer="No notes.")  # fmt: skip
-        _, answer = await _hard(w, "add a note: buy oat milk",
+        answer = await _hard(w, "add a note: buy oat milk",
                                 calls=[{"name": "add_note", "args": {"text": "buy oat milk"}}],
                                 answer="{r0}")  # fmt: skip
         assert 'done: Saved note 1: "buy oat milk"' in answer
@@ -550,9 +569,8 @@ async def test_a_clean_turn_doesnt_taint_the_next_one(
         cp = json.loads(brain[0]["checkpoint"])
         assert cp["claude_session"] is True and cp["claude_hops"] is None
         assert json.loads(brain[1]["result"])["tainted"] is False
-        # a local follow-up after it isn't tainted either
-        w.model.triage = LOCAL
-        w.model.push([("add_note", {"text": "and eggs"})], "Noted.")
+        # a follow-up after it isn't tainted either
+        w.claude(calls=[{"name": "add_note", "args": {"text": "and eggs"}}], answer="Noted.")
         (reply,) = await w.say("also eggs")
         assert 'Saved note 2: "and eggs"' in reply
         assert w.gated("add_note")[-1] == ("Allow", "inferred")
@@ -572,7 +590,7 @@ async def test_an_outside_read_taints_the_next_turns_then_lifts(
         # the next turn's change asks (tainted), and nothing runs
         w.claude(calls=[{"name": "delete_note", "args": {"id": 1}}], answer="{r0}")
         w.model.triage = CLAUDE
-        _, answer, prompt = await w.say("ok do it", replies=3)
+        answer, prompt = await w.say("ok do it", replies=2)
         assert "asked the owner" in answer and "yes / no" in prompt
         assert set(w.gated("delete_note")) == {("NeedsApproval", "tainted")}
         assert w.executions("delete_note") == []
@@ -592,7 +610,7 @@ async def test_an_outside_read_taints_the_next_turns_then_lifts(
         assert len(w.audits("brain.session_start")) >= 2
         assert w.session()["messages"][0].startswith("Context: you are picking up")
         w.claude(calls=[{"name": "add_note", "args": {"text": "buy oat milk"}}], answer="{r0}")
-        _, answer = await _hard(w, "add a note: buy oat milk")
+        answer = await _hard(w, "add a note: buy oat milk")
         assert 'done: Saved note 1: "buy oat milk"' in answer
         assert w.gated("add_note")[-1] == ("Allow", "inferred")
 
@@ -651,7 +669,7 @@ async def test_kill_mid_turn_stops_it(
     async with start(resonant_home, chat, tmp_path) as w:
         w.model.triage = CLAUDE
         w.claude(hang=True)
-        await w.say("why is R4 slow?")
+        w.chat.add_message(handle=OWNER_PHONE, text="why is R4 slow?")
         await wait_until(lambda: (w.notes / "session.json").exists(), 10)
         pid = w.session()["pid"]
         killswitch.engage(w.conn, actor="justin")
@@ -665,57 +683,74 @@ async def test_kill_mid_turn_stops_it(
 async def test_the_daily_cap_notice_goes_out_once(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
+    from resonant.runners.ask import UNAVAILABLE_REPLY
+
     async with start(resonant_home, chat, tmp_path, ask={"daily_cap": 1}) as w:
         await _hard(w, "why is R4 slow?", answer="ok")
-        w.model.push("R5 is idle.")
-        notice, local = await w.say("why is R5 slow?", replies=2)
-        assert notice == "Hit today's Claude cap (1); answering locally until midnight."
-        assert local == "R5 is idle."
-        w.model.push("R6 is idle.")
-        assert await w.say("why is R6 slow?") == ["R6 is idle."]  # no second notice
+        notice = "Hit today's Claude cap (1); approvals and /status still work until midnight."
+        sent = await w.say("why is R5 slow?", replies=2)
+        assert sorted(sent) == sorted([notice, UNAVAILABLE_REPLY])  # never a made-up answer
+        assert await w.say("why is R6 slow?") == [UNAVAILABLE_REPLY]  # no second notice
         await w.asks.idle()
-        sent = [m.text for m in w.osa.sent]
-        assert sent.count(notice) == 1 and len(w.ask_tasks()) == 1
+        assert [m.text for m in w.osa.sent].count(notice) == 1 and len(w.ask_tasks()) == 1
+        assert w.model.calls.get("answer", 0) == 0  # the local model wrote nothing
 
 
-async def test_the_runaway_guard_texts_once_and_answers_locally(
+async def test_the_runaway_guard_texts_once_and_says_claude_is_unavailable(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
+    from resonant.runners.ask import UNAVAILABLE_REPLY
+
     async with start(resonant_home, chat, tmp_path, session={"max_per_hour": 1}) as w:
         await _hard(w, "why is R4 slow?", answer="ok")
-        w.model.push("R5 is idle.")
-        notice, local = await w.say("why is R5 slow?", replies=2)
+        sent = await w.say("why is R5 slow?", replies=2)
+        assert UNAVAILABLE_REPLY in sent
+        (notice,) = [t for t in sent if t != UNAVAILABLE_REPLY]
         assert notice.startswith(
-            "Claude brain paused for runaway protection (1 msgs/hr); answering locally until "
+            "Claude brain paused for runaway protection (1 msgs/hr); approvals and /status "
+            "still work until "
         )
-        assert local == "R5 is idle."
-        w.model.push("R6 is idle.")
-        assert await w.say("why is R6 slow?") == ["R6 is idle."]
+        assert await w.say("why is R6 slow?") == [UNAVAILABLE_REPLY]
 
 
-async def test_a_usage_limit_tells_the_owner_once_then_answers_locally(
+async def test_a_usage_limit_tells_the_owner_once_then_briefly(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
+    from zoneinfo import ZoneInfo
+
+    from resonant.runners.ask import clock_text
+
     reset = int(utcnow().timestamp()) + 3600
     async with start(resonant_home, chat, tmp_path) as w:
-        _, reply = await _hard(w, "why is R4 slow?", limit=reset)
-        assert reply.startswith("Hit the Claude usage limit; answering locally until it resets at")
-        w.model.push("R5 is idle.")
-        assert await w.say("why is R5 slow?") == ["R5 is idle."]
+        reply = await _hard(w, "why is R4 slow?", limit=reset)
+        when = clock_text(
+            datetime.fromtimestamp(reset + 60, UTC),
+            ZoneInfo(w.daemon.settings.timezone),
+            utcnow(),
+        )
+        assert reply == (
+            f"I'm at my Claude limit until {when}; I can still do approvals and /status."
+        )
+        # the next texts hear the short line, never an answer from the local model
+        (short,) = await w.say("why is R5 slow?")
+        assert short == f"Still at my Claude limit until {when}."
         assert len(w.ask_tasks()) == 1
+        # approvals and /status still work
+        assert "Claude brain" in (await w.say("/status"))[0]
         # it resumes once the limit resets
         kv_set(w.conn, "brain.ask_claude.limited_until", iso(utcnow()))
-        _, answer = await _hard(w, "why is R6 slow?", answer="back")
-        assert answer == "Claude: back"
+        answer = await _hard(w, "why is R6 slow?", answer="back")
+        assert answer == "back"
 
 
 async def test_members_never_reach_the_session(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
+    from resonant.runners.brain import MEMBER_REPLY
+
     async with start(resonant_home, chat, tmp_path) as w:
         w.model.triage = CLAUDE
-        w.model.push("hello")
-        assert await w.say("why is it slow?", phone=MEMBER_PHONE) == ["hello"]
+        assert await w.say("why is it slow?", phone=MEMBER_PHONE) == [MEMBER_REPLY]
         assert w.ask_tasks() == [] and not (w.notes / "session.json").exists()
         # and an ask for a member (were one granted) is a one-shot, never a turn
         queued = w.asks.enqueue("q", principal="cofounder", tools=True)
@@ -742,8 +777,8 @@ async def test_session_off_keeps_the_one_shot_path(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path, session={"enabled": False}) as w:
-        _, answer = await _hard(w, "why is R4 slow?", answer="one shot")
-        assert answer == "Claude: one shot"
+        answer = await _hard(w, "why is R4 slow?", answer="one shot")
+        assert answer == "one shot"
         argv = w.session()["argv"]
         assert "--input-format" not in argv and "--no-session-persistence" in argv
         assert w.asks.brain is None
@@ -772,8 +807,8 @@ async def test_the_next_turn_gets_what_resonant_texted_since_the_last_one(
             ref="p",
         )
         system_texts.record(w.conn, "justin", "result", failure, ref="r")  # fmt: skip
-        _, answer = await _hard(w, "What happened? Why the failure", answer="The token.")
-        assert answer == "Claude: The token."
+        answer = await _hard(w, "What happened? Why the failure", answer="The token.")
+        assert answer == "The token."
         prompt = w.session()["prompt"]
         assert prompt.startswith("Since we last spoke")
         assert "<since_last>" in prompt and "Resonant texted: " in prompt
@@ -786,20 +821,18 @@ async def test_the_next_turn_gets_what_resonant_texted_since_the_last_one(
 async def test_a_text_answered_locally_between_two_hand_offs_is_in_the_next_delta(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
-    """PER-270: the session sees the whole thread, not only system texts: what the owner
-    asked qwen and what qwen said, in order, and never its own answers."""
+    """PER-270: the session sees the whole thread, not only system texts: what the owner said
+    to the router and what it said back, in order, and never its own answers."""
     async with start(resonant_home, chat, tmp_path) as w:
         await _hard(w, "why is R3 slow?", answer="R3 ran out of disk.")
-        w.model.triage = LOCAL
-        w.model.push("mycelium is in ~/code.")
-        await w.say("where is mycelium?")
+        w.model.triage = {"handler": "local", "kind": "general", "message_type": "greeting",
+                          "say": ""}  # fmt: skip
+        assert await w.say("hi there") == ["Hey!"]
         await _hard(w, "and R3 now?", answer="Fine now.")
         prompt = w.session()["prompt"]
         assert prompt.startswith("Since we last spoke")
-        assert (
-            "Owner: where is mycelium?" in prompt and "Resonant: mycelium is in ~/code." in prompt
-        )
-        assert prompt.index("Owner: where is mycelium?") < prompt.index("Resonant: mycelium")
+        assert "Owner: hi there" in prompt and "Resonant: Hey!" in prompt
+        assert prompt.index("Owner: hi there") < prompt.index("Resonant: Hey!")
         assert "ran out of disk" not in prompt and "why is R3 slow?" not in prompt
         assert prompt.endswith("and R3 now?")
 
@@ -808,10 +841,10 @@ async def test_a_claude_answer_asking_for_a_yes_with_nothing_pending_is_trimmed(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as w:
-        _, answer = await _hard(
+        answer = await _hard(
             w, "merge PR 121", answer="CI is green on PR #121. The merge is queued. Approve it now?"
         )
-        assert answer == "Claude: CI is green on PR #121."
+        assert answer == "CI is green on PR #121."
 
 
 # --- upkeep (PER-262) ---------------------------------------------------------------------------
@@ -867,10 +900,11 @@ async def test_a_queued_turn_starts_as_soon_as_the_one_ahead_finishes(
         w.model.triage = CLAUDE
         w.claude(turns=[{"when": "slow", "delay": 1.0, "answer": "first"},
                         {"when": "fix", "answer": "second"}])  # fmt: skip
-        await w.say("why is R4 slow?")
+        w.chat.add_message(handle=OWNER_PHONE, text="why is R4 slow?")
         await wait_until(lambda: w.session_proc.busy, 10)
-        await w.say("how do I fix the build?")
-        assert await w.more(2) == ["Claude: first", "Claude: second"]
+        (ack,) = await w.say("how do I fix the build?")
+        assert ack.startswith(ACK)
+        assert await w.more(2) == ["first", "second"]
         first = w.ask_tasks()[0]["id"]
         assert len(turns) == 2
         gap = turns[1] - ended[first]

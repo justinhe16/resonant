@@ -21,9 +21,7 @@ from resonant.gate import Allow, Deny, DryRun, Intent, NeedsApproval
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.router import commands
 from resonant.router.fast_path import FastPath, kill_reply, match_fast_path, render_status
-from resonant.router.intents import INTENT_TOOLS
 from resonant.router.render import render_runs
-from resonant.router.router import toolset_for
 from resonant.runners.claude import MAX_ASK, Cancelled, Merged, MergeQueued, Refused, Started
 from resonant.runners.local import report_line
 from resonant.runners.worker_desk import OpenQuestion, Relayed
@@ -706,35 +704,23 @@ async def test_status_tool_reports_runs(components: Components, db: sqlite3.Conn
     assert out["runs"] == {"ready": 1}
 
 
-# --- the run_project intent --------------------------------------------------------------
+# --- the run tools Claude is offered -----------------------------------------------------------
 
 
-def test_run_project_toolset(components: Components) -> None:
-    assert INTENT_TOOLS["run_project"] == (
-        "add_ci",
-        "add_repo",
-        "answer_worker",
-        "cancel_run",
-        "create_repo",
-        "forget_repo",
-        "list_repos",
-        "list_runs",
-        "merge_ci_pr",
-        "merge_run",
-        "message_worker",
-        "run_activity",
-        "start_run",
-    )
-    owner = toolset_for(
-        "run_project", OWNER, registry=components.registry, principals=components.principals
-    )
-    assert [s.name for s in owner] == list(INTENT_TOOLS["run_project"])
+def test_run_tools_are_offered_to_the_owner_only(components: Components) -> None:
+    """PER-256: no per-intent toolsets. The run tools are there for the owner (Claude's bridge
+    offers what ``BrainRunner.tools_for`` lists, filtered by ``may_request``) and not for a
+    member."""
+    names = {s.name for s in components.registry.specs() if s.extension is None}
+    run_tools = {"start_run", "list_runs", "cancel_run", "merge_run", "run_activity", "list_repos"}
+    assert run_tools <= names
+    owner = [s for s in components.registry.specs() if components.principals.may_request(OWNER, s)]
     start = next(s for s in owner if s.name == "start_run")
     assert "enum" not in start.args_schema["properties"]["repo"]
-    member = toolset_for(
-        "run_project", MEMBER, registry=components.registry, principals=components.principals
-    )
-    assert member == []
+    member = [
+        s for s in components.registry.specs() if components.principals.may_request(MEMBER, s)
+    ]
+    assert not run_tools & {s.name for s in member}
 
 
 # --- answer_worker and message_worker (EM-5) --------------------------------------------------

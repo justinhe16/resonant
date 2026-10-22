@@ -28,14 +28,14 @@ from resonant.gateway.channel import (
 )
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.loop.types import PRIORITY_OWNER
-from resonant.models import ChatMessage, ModelReply, ProbeResult, SpanFactory, ToolCall
+from resonant.models import ChatMessage, ModelReply, ProbeResult, SpanFactory
 from resonant.principals import Principal, Principals
 from resonant.router import Router
 from resonant.router.approvals import NOTHING_WAITING, ask_codes, refusal_reply
 from resonant.router.commands import approvals_args
 from resonant.router.fast_path import KILL_REPLY, NOT_ALLOWED
 from resonant.router.router import APPROVAL_TITLE
-from resonant.runners.local import LocalRunner
+from resonant.runners.local import LocalRunner, PinnedCall
 from resonant.store import approvals as ap
 from resonant.store import tasks as repo
 from resonant.store.db import kv_get, kv_set, transaction
@@ -59,11 +59,11 @@ class Clock:
 
 
 class Model:
-    """The labeler always says ``question``; ``chat_tools`` replays scripted tool calls."""
+    """PER-256: the router and the local runner call no model for chat. Only the relay's
+    free-text step does (a worker question open); this one says nothing usable."""
 
     def __init__(self) -> None:
-        self.tool_replies: list[list[ToolCall]] = []
-        self.label_calls = 0
+        self.calls = 0
 
     async def chat_json(
         self,
@@ -75,20 +75,11 @@ class Model:
         spans: SpanFactory | None = None,
         tools: list[ToolSpec] | None = None,
     ) -> ModelReply:
-        self.label_calls += 1
-        out = {"intent": "question", "confidence": 0.9}
-        return ModelReply(json.dumps(out), [], out, 5, 10, 3)
+        self.calls += 1
+        return ModelReply("{}", [], {}, 5, 10, 3)
 
-    async def chat_tools(
-        self,
-        messages: list[ChatMessage],
-        *,
-        tools: list[ToolSpec],
-        max_tokens: int = 512,
-        spans: SpanFactory | None = None,
-    ) -> ModelReply:
-        out = self.tool_replies.pop(0) if self.tool_replies else []
-        return ModelReply(None, out, None, 5, 10, 3)
+    async def chat_tools(self, messages: list[ChatMessage], **kw: Any) -> ModelReply:
+        raise AssertionError("nothing calls chat_tools any more")
 
     async def probe(self) -> ProbeResult:
         raise AssertionError("never probed")
@@ -181,12 +172,11 @@ class Harness:
         return task_id
 
     async def ask(self, tool: str = "restart_resonant") -> tuple[str, ap.Approval]:
-        """A chat task whose model calls ``tool``: it prompts and waits."""
+        """A task with a pinned, model-chosen ``tool`` call (what the Claude bridge leaves): the
+        local runner's resume gates it, prompts and waits."""
         self.clock.now += timedelta(seconds=1)  # approvals are ordered by creation time
-        self.model.tool_replies.append([ToolCall(tool, {})])
-        task_id = self.add_task(
-            {"intent": "question", "confidence": 0.9, "toolset": [tool], "fallback": False}
-        )
+        pinned = PinnedCall(tool, None, {}, 0, 0)  # a model-chosen call, pinned before the gate
+        task_id = self.add_task({"call": pinned.to_json()})
         await self.loop.run_until_idle()
         (approval,) = self.approvals(task_id)
         return task_id, approval
@@ -343,7 +333,7 @@ async def test_plain_yes_with_one_pending_resolves_wakes_and_runs_once(
     assert h.channel.replies() == ["Done: restart Resonant"]
     assert h.tasks("reply") == []  # the reply started no task of its own
     assert h.task_status(task_id) == "done"
-    assert h.model.label_calls == 0  # never reached the labeler
+    assert h.model.calls == 0  # never reached the model
 
 
 async def test_plain_no_denies(make: Callable[[], Harness]) -> None:
@@ -411,7 +401,7 @@ async def test_yes_with_nothing_pending(make: Callable[[], Harness]) -> None:
     h = make()
     await h.say("yes")
     assert h.channel.replies() == [NOTHING_WAITING]
-    assert h.model.label_calls == 0
+    assert h.model.calls == 0
 
 
 async def test_non_approver_gets_the_generic_reply(make: Callable[[], Harness]) -> None:
@@ -441,7 +431,7 @@ async def test_pasted_prompt_is_not_a_reply_and_routes_normally(
     prompt = h.channel.prompts()[0]
     task = await h.router.route(h.message(prompt))
     assert task is not None and task.kind == "chat"
-    assert h.model.label_calls == 1
+    assert task.runner == "brain" and h.model.calls == 0  # to the brain, no model call here
     assert h.status(approval) == "pending" and h.resolve_audits() == 0
 
 
@@ -520,12 +510,10 @@ async def test_approvals_lists_and_shows_full_args_to_the_owner(
     make: Callable[[], Harness],
 ) -> None:
     h = make()
-    h.model.tool_replies.append([ToolCall("add_note", {"text": "vitamin d3 and zinc"})])
     with transaction(h.db):
         kv_set(h.db, "autonomy", "off")  # so an L3 call asks
-    task_id = h.add_task(
-        {"intent": "question", "confidence": 0.9, "toolset": ["add_note"], "fallback": False}
-    )
+    pinned = PinnedCall("add_note", None, {"text": "vitamin d3 and zinc"}, 0, 0)
+    task_id = h.add_task({"call": pinned.to_json()})
     await h.loop.run_until_idle()
     (approval,) = h.approvals(task_id)
     code = approval.code

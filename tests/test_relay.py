@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from test_router_approvals import OWNER, OWNER_HANDLE, Harness, make
@@ -29,7 +29,7 @@ from resonant.router.relay import (
     plain_reply_clashes,
     yes_no_fits,
 )
-from resonant.router.router import RELAY_TITLE, classify
+from resonant.router.router import RELAY_TITLE
 from resonant.runners.claude import Refused
 from resonant.runners.worker_desk import OpenQuestion, Relayed
 from resonant.worker_text import owner_question_text, worker_text
@@ -100,17 +100,6 @@ def test_option_picks(text: str, answer: str) -> None:
 def test_not_option_picks(text: str) -> None:
     assert match_option(text, OPTS) is None
     assert match_option("a", ()) is None
-
-
-def test_eval_classifies_addressed_messages_without_the_model() -> None:
-    class NoModel:
-        async def label(self, text: str, *, spans: SpanFactory | None = None) -> Any:
-            raise AssertionError("no model call")
-
-    import asyncio
-
-    got = asyncio.run(classify("tell R6 to skip the docs", cast(Any, NoModel())))
-    assert (got.intent, got.path) == ("run_project", "fast")
 
 
 # --- the owner's view of a question -----------------------------------------------------------

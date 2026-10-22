@@ -29,7 +29,6 @@ from resonant.extensions.manager import (
     ExtensionManager,
     ManagerError,
     Pin,
-    Staged,
     confirm_lines,
     heading,
     report_grant,
@@ -823,29 +822,6 @@ def _typed_confirm(name: str, verb: str) -> None:
         raise typer.Exit(1)
 
 
-def _router_check(settings: Settings, conn: sqlite3.Connection, staged: Staged) -> None:
-    """Advisory only (docs/phase3-plan.md D2): the router eval on the repo's example set
-    with and without ``extension:<name>``, printing builtin accuracy before and after. A
-    drop is a warning, never a refusal; no model or no set skips it with one line."""
-    from resonant.evals import router_eval
-
-    m = staged.manifest
-    if not m.description or not (m.tools or m.mcp):
-        typer.echo(
-            f"Router: no description or tools, so chat won't route to {staged.name}; "
-            f"/{staged.name} works."
-        )
-        return
-    typer.echo(f"Router: new intent extension:{staged.name}")
-    try:
-        before = router_eval.installed_intents(conn, exclude=staged.name)
-        lines = router_eval.advisory(settings, m, before=before)
-    except Exception as e:  # advisory: never blocks an install or update
-        lines = [f"Router: advisory eval skipped ({type(e).__name__})"]
-    for line in lines:
-        typer.echo(line)
-
-
 @ext_app.command("add")
 def ext_add(
     source: Annotated[str, typer.Argument(help="repo:<name> or path:/abs/dir (a git work tree)")],
@@ -869,7 +845,6 @@ def ext_add(
                 raise AdoptRequired(f"{staged.name}: leftovers from another source", reasons)
             for line in confirm_lines(staged, mgr.registered_slugs()):
                 typer.echo(line)
-            _router_check(settings, conn, staged)
             _typed_confirm(staged.name, "install")
         finally:
             mgr.discard(staged)
@@ -909,7 +884,6 @@ def ext_update(name: Annotated[str, typer.Argument(help="An installed extension"
             typer.echo("")
             for line in confirm_lines(staged, mgr.registered_slugs()):
                 typer.echo(line)
-            _router_check(settings, conn, staged)
             _typed_confirm(name, "update")
         finally:
             mgr.discard(staged)
@@ -1330,38 +1304,6 @@ eval_app = typer.Typer(no_args_is_help=True, help="Evals on your own sets (see e
 app.add_typer(eval_app, name="eval")
 
 
-@eval_app.command("router")
-def eval_router(
-    set_path: Annotated[
-        Path | None,
-        typer.Option("--set", help="JSONL set. Default: ~/.resonant/evals/router.jsonl."),
-    ] = None,
-    repeat: Annotated[int, typer.Option(min=1, help="Run the whole set N times.")] = 1,
-    as_json: Annotated[bool, typer.Option("--json")] = False,
-    min_accuracy: Annotated[
-        float, typer.Option(min=0.0, max=1.0, help="Exit 1 if accuracy is below this.")
-    ] = 0.9,
-) -> None:
-    """Route each text through the production router; print accuracy, confusion and latency.
-
-    Texts appear only in this command's output. The summary saved to
-    ~/.resonant/evals/results/<ts>.json refers to examples by line number. Exit 1 if
-    accuracy < --min-accuracy, 2 if the set is missing or malformed.
-    """
-    from resonant.evals import router_eval
-
-    code = router_eval.run(
-        load_settings(),
-        set_path=set_path,
-        repeat=repeat,
-        as_json=as_json,
-        min_accuracy=min_accuracy,
-        echo=typer.echo,
-        echo_err=lambda s: typer.echo(s, err=True),
-    )
-    raise typer.Exit(code)
-
-
 @eval_app.command("task")
 def eval_task(
     set_path: Annotated[
@@ -1376,16 +1318,13 @@ def eval_task(
         str,
         typer.Option(help="live: the configured local model. scripted: each case's script (CI)."),
     ] = "live",
-    mode: Annotated[
-        str, typer.Option(help="loop, intents, or both (runs the set once per mode).")
-    ] = "loop",
     repeat: Annotated[int, typer.Option(min=1, help="Run the whole set N times.")] = 1,
     only: Annotated[
         str | None, typer.Option(help="Only the case with this id, or this category.")
     ] = None,
     as_json: Annotated[bool, typer.Option("--json")] = False,
     min_accuracy: Annotated[
-        float, typer.Option(min=0.0, max=1.0, help="Exit 1 if a mode's accuracy is below this.")
+        float, typer.Option(min=0.0, max=1.0, help="Exit 1 if accuracy is below this.")
     ] = 0.85,
     out: Annotated[
         Path | None,
@@ -1393,7 +1332,7 @@ def eval_task(
     ] = None,
     route: Annotated[
         str,
-        typer.Option(help="brain.route for the run: triage (default), local or claude (BR-10)."),
+        typer.Option(help="brain.route for the run: triage (default) or claude (BR-10)."),
     ] = "triage",
     live_claude: Annotated[
         bool,
@@ -1418,7 +1357,7 @@ def eval_task(
     ask_claude starts no Claude session, except with --live-claude (PER-250): the hard rows go
     to a real Claude brain session, with Resonant's tools backed by the case's world. Texts
     and replies appear only in this command's output; the saved summary refers to cases by
-    id. Exit 1 if a mode's accuracy is below --min-accuracy, a write ran without an approval,
+    id. Exit 1 if the accuracy is below --min-accuracy, a write ran without an approval,
     or a case timed out; 2 if the set is missing or malformed or an option is bad.
     """
     from resonant.evals import task_eval
@@ -1426,18 +1365,13 @@ def eval_task(
     if model not in ("live", "scripted"):
         typer.echo("--model must be 'live' or 'scripted'", err=True)
         raise typer.Exit(2)
-    modes = {"loop": ["loop"], "intents": ["intents"], "both": ["loop", "intents"]}.get(mode)
-    if modes is None:
-        typer.echo("--mode must be 'loop', 'intents' or 'both'", err=True)
-        raise typer.Exit(2)
     if route not in task_eval.ROUTES:
-        typer.echo("--route must be 'triage', 'local' or 'claude'", err=True)
+        typer.echo("--route must be 'triage' or 'claude'", err=True)
         raise typer.Exit(2)
     code = task_eval.run(
         load_settings(),
         set_path=set_path,
         model_kind=model,
-        modes=cast("list[task_eval.Mode]", modes),
         repeat=repeat,
         only=only,
         as_json=as_json,
@@ -1513,7 +1447,7 @@ def bench_e2e(
 
     Runs in a throwaway home with a fake chat.db and a recording osascript runner, so it
     never texts anyone and is safe next to a live daemon. Exit 1 if a prompt got no reply
-    or a p50 misses its target (fast <= 1s, llm <= 3s, loop <= 5s with brain.mode loop);
+    or a p50 misses its target (fast <= 1s, route <= 3s);
     2 for a bad --model.
     """
     import asyncio

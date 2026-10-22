@@ -307,11 +307,11 @@ def test_judge_changed_sets_a_baseline_first() -> None:
 @pytest.mark.parametrize(
     ("answer", "said"),
     [
-        ("Claude: YES, in stock.", True),
-        ("Claude: no. Sold out.", False),
+        ("YES, in stock.", True),
+        ("no. Sold out.", False),
         ("yes", True),
-        ("Claude: Maybe?", None),
-        ("Claude: **YES** it is", True),
+        ("Maybe?", None),
+        ("**YES** it is", True),
     ],
 )
 def test_parse_yes(answer: str, said: bool | None) -> None:
@@ -319,8 +319,8 @@ def test_parse_yes(answer: str, said: bool | None) -> None:
 
 
 def test_judge_ask_detail_is_the_rest_of_the_answer() -> None:
-    v = store.judge_ask(_watch("yes", check_kind="ask"), "Claude: YES. The Pro is in stock.")
-    assert (v.met, v.fire, v.detail) == (True, True, "Claude: The Pro is in stock")
+    v = store.judge_ask(_watch("yes", check_kind="ask"), "YES. The Pro is in stock.")
+    assert (v.met, v.fire, v.detail) == (True, True, "The Pro is in stock")
 
 
 # --- core/watches and the checks ----------------------------------------------------------
@@ -462,14 +462,14 @@ async def test_an_ask_watch_answers_through_the_hook(
     assert out.result == {"watch": 1, "status": "asked", "ask_task": "ask1"}
     assert asked[0]["watch"] == 1 and asked[0]["kind"] == "research"
     assert asked[0]["question"] == "Is the Pro in stock?" and asked[0]["principal"] == "justin"
-    await w.ask_answered(1, "ask1", "answered", "Claude: NO, sold out.")
+    await w.ask_answered(1, "ask1", "answered", "NO, sold out.")
     assert ch.sent == []
     clock.now += timedelta(hours=1)
     await run_due(db, w, clock)
-    await w.ask_answered(1, "ask2", "answered", "Claude: YES. In stock at the Fifth Ave store.")
-    await w.ask_answered(1, "ask2", "answered", "Claude: YES. In stock at the Fifth Ave store.")
+    await w.ask_answered(1, "ask2", "answered", "YES. In stock at the Fifth Ave store.")
+    await w.ask_answered(1, "ask2", "answered", "YES. In stock at the Fifth Ave store.")
     (sent,) = ch.sent
-    assert sent.text == "\U0001f440 W1 Pro in stock: Claude: In stock at the Fifth Ave store"
+    assert sent.text == "\U0001f440 W1 Pro in stock: In stock at the Fifth Ave store"
     watch = store.get(db, 1)
     assert watch is not None and watch.state == "fired"
 
@@ -649,7 +649,7 @@ async def test_an_ask_check_retried_after_a_crash_asks_once(
 def test_links_in_claudes_answer_never_reach_the_owner() -> None:
     v = store.judge_ask(
         _watch("yes", check_kind="ask"),
-        "Claude: YES, buy it at https://evil.test/x or www.evil.test now",
+        "YES, buy it at https://evil.test/x or www.evil.test now",
     )
     assert "evil" not in v.detail and v.detail.count("(link)") == 2
 

@@ -13,8 +13,8 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 22, two extensi
 | Workers (employee mode) | Claude Code workers in worktrees, unguarded, per-run GitHub App tokens, worker desk (ask/note/check), trust rules, Remote Control and live input (RC-1), transcript reading | #89–#92 |
 | Repos | Registry; adding a repo clones it to `~/code/<name>` (RP-1) | #96 |
 | GitHub and Linear | Quiet github with an employee-style rollup (GH-2); Linear MCP extension (LN-1, LN-2) | #93–#95 |
-| Brain (BR-1…BR-11) | qwen3-30B triages each text: easy ones answered locally, hard ones get an instant ack and go to one long-lived Claude session that has Resonant's tools through the gate. Read tools, facts memory, rolling summaries, media/links/watches, taint rules for outside text | #97–#108 |
-| Tool core (TC-1) | `resonant/toolcore/`: the single call path (registry → gate → executor) for qwen, the Claude brain, jobs and watches; a boundary test enforces it | #109 |
+| Brain (BR-1…BR-11, PER-256) | qwen3-30B only routes (greeting or ack reply, code-built news, else Claude) and never writes a fact; Claude, one long-lived session with Resonant's tools through the gate, is the one voice: no `Claude:` prefix, one short ack only if the answer takes over 8 s. The number guard enforces on Claude's answers (unsourced number, empty claim of a change, empty "got it", tool-call text: redo once, then a short fallback). Usage limit said once per reset, Claude down gets a canned reply and a retry. Model tiering skipped (no measured need). Read tools, facts memory, rolling summaries, media/links/watches, taint rules for outside text | #97–#108 |
+| Tool core (TC-1) | `resonant/toolcore/`: the single call path (registry → gate → executor) for the Claude brain, the local runner, jobs and watches; a boundary test enforces it | #109 |
 | Backups (BK-1) | Daily SQLite backup at 03:30, 7 daily + 4 weekly, 36h alert, `resonant backup now/list/restore` | #110 |
 | Quiet briefing (BF-1) | All-zero items dropped; an empty briefing is one line | #111 |
 | Batch approvals (BA-1) | One yes/no prompt for all of a task's changes; `allow_tools` lets "don't ask for X" set standing allows for extension tools | #113 |
@@ -55,7 +55,7 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 | Who | Tickets |
 |---|---|
 | Owner | PER-252 phone tests, PER-253 mycelium by text, PER-265 design decisions (webhooks, worker text in the briefing, nudges, bare yes/no, `/update` trust) |
-| Build | PER-256 retire intents + qwen only routes, Claude the one brain (after the owner eval set), PER-264 small gaps (its turn budget after PER-256) |
+| Build | PER-256 retire intents + qwen only routes, Claude the one brain (built; PER-272 explicit-ask-as-approval is next), PER-264 small gaps (its turn budget after PER-256) |
 
 **Roadmap after 6b** (owner, 2026-10-21): **7 Trading** (trade-jev: automatic trading as an extension) → **8 Slack coworker** → **9 Browser + computer use** (last). No email. On-call is parked. One card per phase on the Roadmap tab of `architecture.html`. Each phase gets its Linear tickets via `/linear-surf` when it's next.
 

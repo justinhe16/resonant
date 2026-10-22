@@ -26,13 +26,13 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+from chat_claude import attach_claude
 
 from resonant.api import DaemonState
 from resonant.components import Components, build_components
 from resonant.config import load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
-from resonant.e2e.fakes import DEFAULT_FINAL_REPLY
 from resonant.gate import Allow, DryRun, Intent, NeedsApproval, PolicyGate
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.gateway.imessage.sender import OsaResult
@@ -125,6 +125,11 @@ class Running:
     port: int
     script: ScriptRunner
     ops: FakeOpsRunner
+    plan: Path
+
+    def claude(self, **plan: Any) -> None:
+        """What the fake Claude brain does with the next plain-words text."""
+        self.plan.write_text(json.dumps(plan))
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -218,8 +223,6 @@ def build_daemon(
     """A daemon with iMessage on, fakes for osascript, the model and ops subprocesses."""
     (home / "principals.yaml").write_text(PRINCIPALS)
     port = free_port()
-    # scripted labels (loop is the default); a caller's brain override may still set mode
-    overrides["brain"] = {"mode": "intents", **overrides.get("brain", {})}
     settings = load_settings(
         dry_run=dry_run,
         api={"port": port},
@@ -235,7 +238,8 @@ def build_daemon(
     assert components is not None
     script = ScriptRunner(components)
     daemon.loop.runners[script.name] = script
-    return Running(daemon, osa, chat, port, script, ops_runner)
+    plan = attach_claude(daemon, root=home)  # plain words go to Claude (PER-256)
+    return Running(daemon, osa, chat, port, script, ops_runner, plan)
 
 
 @contextlib.asynccontextmanager
@@ -433,46 +437,62 @@ def reply(r: Running, text: str) -> None:
     r.chat.add_message(handle=OWNER_PHONE, text=text, at=utcnow() + timedelta(seconds=1))
 
 
-def chat_task(r: Running, intent: str) -> sqlite3.Row:
-    (task,) = r.rows("SELECT * FROM tasks WHERE kind = 'chat'")
-    assert json.loads(task["checkpoint"])["intent"] == intent
+def ask_task(r: Running) -> sqlite3.Row:
+    """The one Claude brain turn a plain-words text made."""
+    (task,) = r.rows("SELECT * FROM tasks WHERE runner = 'ask'")
     return task
+
+
+def gated(r: Running, tool: str) -> list[dict[str, Any]]:
+    return [a for a in r.audits("gate.evaluate") if a["tool"] == tool]
+
+
+async def ask_restart(r: Running) -> Any:
+    """Plain words: Claude calls restart_resonant, which asks. Claude's answer is the first
+    send and the approval prompt the second; returns the prompt."""
+    r.claude(calls=[{"name": "restart_resonant", "args": {}}], answer="Asked you.")
+    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
+    assert (await r.osa.wait_for(1, 10)).text == "Asked you."
+    return await r.osa.wait_for(2, 10)
 
 
 async def test_natural_language_reminder_is_set_with_its_due_time(live: Running) -> None:
     r = live
+    due_at = utcnow() + timedelta(minutes=20)
+    r.claude(
+        calls=[{"name": "add_reminder", "args": {"at": due_at.isoformat(), "text": "stretch"}}],
+        answer="Will do.",
+    )
     r.chat.add_message(handle=OWNER_PHONE, text="remind me in 20 minutes to stretch")
     sent = await r.osa.wait_for(1, 10)
 
-    task = chat_task(r, "reminders")
-    (call,) = r.audits("gate.evaluate")
-    assert (call["tool"], call["decision"]) == ("add_reminder", "Allow")
-    assert call["detail"]["origin"] == "inferred"  # the model chose it: L3 runs and reports
+    (call,) = gated(r, "add_reminder")
+    assert call["decision"] == "Allow"
+    assert call["detail"]["origin"] == "inferred"  # Claude chose it: L3 runs and reports
 
     (reminder,) = r.rows("SELECT * FROM tasks WHERE runner = 'reminder'")
     cp = json.loads(reminder["checkpoint"])
     assert cp["text"] == "stretch"
     due = datetime.fromisoformat(cp["at"])
-    # The model computed ``at`` from the "Current time" line.
     assert timedelta(minutes=19) <= due - utcnow() <= timedelta(minutes=20)
     assert reminder["status"] == "queued"
 
-    # The reply carries the code-built report with the due time, in the owner's zone.
+    # The reply is Claude's answer and the code-built report with the due time, in the
+    # owner's zone.
     when = format_due(due, now=utcnow(), tz=r.daemon.settings.timezone)
     assert sent.handle == OWNER_PHONE
+    assert sent.text.startswith("Will do.")
     assert f'⏰ Reminder 1 set for {when}: "stretch"' in sent.text
-    assert json.loads(task["checkpoint"])["call"]["tool"] == "add_reminder"
-    (ex,) = r.rows("SELECT status FROM executions")
-    assert ex["status"] == "succeeded"
+    (ex,) = [a for a in r.audits("executor.result") if a["tool"] == "add_reminder"]
+    assert ex["detail"].get("ok", True) is not False
 
 
 async def test_chat_restart_resonant_asks_and_runs_only_after_yes(live: Running) -> None:
     r = live
-    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
-    prompt = await r.osa.wait_for(1, 10)
+    prompt = await ask_restart(r)
 
-    await wait_until(lambda: chat_task(r, "ops")["status"] == "waiting", 10)
-    assert chat_task(r, "ops")["wait_reason"] == "approval"
+    await wait_until(lambda: ask_task(r)["status"] == "waiting", 10)
+    assert ask_task(r)["wait_reason"] == "approval"
     # GT-1: the first ask also offers a standing allow for the tool.
     match = re.fullmatch(
         r"\[([A-Z]\d)\] restart Resonant \(yes always = don't ask before running "
@@ -480,63 +500,64 @@ async def test_chat_restart_resonant_asks_and_runs_only_after_yes(live: Running)
         prompt.text,
     )
     assert match is not None, prompt.text
-    (audit,) = r.audits("gate.evaluate")
-    assert (audit["tool"], audit["decision"]) == ("restart_resonant", "NeedsApproval")
-    assert audit["detail"]["origin"] == "inferred"
+    asked = gated(r, "restart_resonant")  # the bridge's call, and the batch prompt's re-check
+    assert {a["decision"] for a in asked} == {"NeedsApproval"}
+    assert {a["detail"]["origin"] for a in asked} == {"inferred"}
     await asyncio.sleep(0.2)
     assert r.ops.spawned == []  # nothing ran yet
     assert restart_pending(r.conn) is None
 
     reply(r, "yes")
-    done = await r.osa.wait_for(2, 10)
+    done = await r.osa.wait_for(3, 10)
     assert done.text == "Restarting Resonant…"
     assert len(r.ops.spawned) == 1  # the detached helper, exactly once
     assert restart_pending(r.conn) is not None
-    await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+    await wait_until(lambda: ask_task(r)["status"] == "done", 10)
     assert r.rows("SELECT status FROM approvals")[0]["status"] == "approved"
 
 
 async def test_what_can_you_do_lists_real_commands(live: Running) -> None:
     r = live
+    r.claude(calls=[{"name": "list_commands", "args": {}}], answer="Here is what I can do.")
     r.chat.add_message(handle=OWNER_PHONE, text="what can you do?")
     sent = await r.osa.wait_for(1, 10)
-    assert sent.text == DEFAULT_FINAL_REPLY  # the scripted model's narration
+    assert sent.text == "Here is what I can do."  # Claude's answer, no prefix
 
-    chat_task(r, "system")
-    (audit,) = r.audits("gate.evaluate")
-    assert (audit["tool"], audit["decision"]) == ("list_commands", "Allow")
-    (ex,) = r.rows("SELECT status, result FROM executions")
-    assert ex["status"] == "succeeded"
+    (audit,) = gated(r, "list_commands")
+    assert audit["decision"] == "Allow"
+    rows = r.rows("SELECT result FROM executions WHERE result LIKE '%\"commands\"%'")
+    (ex,) = rows
     listed = [c["name"] for c in json.loads(ex["result"])["commands"]]
     assert listed == [c.name for c in commands.COMMANDS]  # the registry, owner's view
-    # The model got that registry output (as untrusted data) before it answered.
+    # The local model only routed it.
     assert r.daemon.imessage is not None
     model = r.daemon.imessage.model
     assert isinstance(model, ScriptedModel)
-    assert model.calls["tools"] == 2 and model.calls["answer"] == 1
+    assert model.calls["triage"] == 1
 
 
 async def test_chat_clear_notes_needs_the_code(live: Running) -> None:
     r = live
     await r.run_script({"tool": "add_note", "args": {"text": "buy milk"}})
+    r.claude(calls=[{"name": "clear_notes", "args": {}}], answer="Asked you.")
     r.chat.add_message(handle=OWNER_PHONE, text="clear my notes")
-    prompt = await r.osa.wait_for(1, 10)
+    assert (await r.osa.wait_for(1, 10)).text == "Asked you."
+    prompt = await r.osa.wait_for(2, 10)
     match = re.fullmatch(
         r"\[([A-Z]\d)\] delete all 1 note\? This can't be undone\. Reply yes \1 / no",
         prompt.text,
     )
     assert match is not None, prompt.text
-    await wait_until(lambda: chat_task(r, "notes")["status"] == "waiting", 10)
-    audit = r.audits("gate.evaluate")[-1]
-    assert (audit["tool"], audit["detail"]["origin"]) == ("clear_notes", "inferred")
+    await wait_until(lambda: ask_task(r)["status"] == "waiting", 10)
+    assert {a["detail"]["origin"] for a in gated(r, "clear_notes")} == {"inferred"}
 
     reply(r, "yes")  # a plain yes never approves L1
-    refused = await r.osa.wait_for(2, 10)
+    refused = await r.osa.wait_for(3, 10)
     assert refused.text == f"Reply yes {match.group(1)} to confirm."
-    assert chat_task(r, "notes")["status"] == "waiting"
+    assert ask_task(r)["status"] == "waiting"
 
     reply(r, f"yes {match.group(1)}")
-    done = await r.osa.wait_for(3, 10)
+    done = await r.osa.wait_for(4, 10)
     assert done.text == "Cleared 1 note."
 
 
@@ -846,13 +867,12 @@ async def test_e12_restart_mid_approval_runs_exactly_once(
     resonant_home: Path, chat: FakeChatDB
 ) -> None:
     async with start_daemon(resonant_home, chat, dry_run=False) as r:
-        r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
-        prompt = await r.osa.wait_for(1, 10)
+        prompt = await ask_restart(r)
         assert prompt.text.endswith(
             "restart Resonant (yes always = don't ask before running restart_resonant). "
             "Reply yes / yes always / no"
         )
-        await wait_until(lambda: chat_task(r, "ops")["status"] == "waiting", 10)
+        await wait_until(lambda: ask_task(r)["status"] == "waiting", 10)
         await r.prompt_recorded()
         assert r.ops.spawned == []
     # SIGTERM (a graceful stop); then a new stack on the same store and chat.db.
@@ -864,25 +884,23 @@ async def test_e12_restart_mid_approval_runs_exactly_once(
         reply(r, "yes")
         done = await r.osa.wait_for(1, 10)
         assert done.text == "Restarting Resonant…"
-        await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+        await wait_until(lambda: ask_task(r)["status"] == "done", 10)
         await asyncio.sleep(0.3)
         assert len(r.ops.spawned) == 1 and len(r.osa.sent) == 1
-        (ex,) = r.rows("SELECT status FROM executions")
-        assert ex["status"] == "succeeded"
+        assert [a["tool"] for a in r.audits("executor.result")].count("restart_resonant") == 1
         assert [a["status"] for a in approvals(r)] == ["approved"]
         assert approvals(r)[0]["used_at"] is not None
 
 
 async def test_e13_the_same_row_routed_twice_resolves_once(live: Running) -> None:
     r = live
-    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
-    await r.osa.wait_for(1, 10)
+    await ask_restart(r)
     await r.prompt_recorded()
     rowid = r.chat.add_message(
         handle=OWNER_PHONE, text="yes", at=utcnow() + timedelta(seconds=1), guid="yes-guid"
     )
-    await r.osa.wait_for(2, 10)
-    await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+    await r.osa.wait_for(3, 10)
+    await wait_until(lambda: ask_task(r)["status"] == "done", 10)
     assert len(resolutions(r)) == 1
 
     # A router retry of the same event: the original result, no write and no reply.
@@ -895,16 +913,15 @@ async def test_e13_the_same_row_routed_twice_resolves_once(live: Running) -> Non
     kv_set(r.conn, "imessage.cursor", rowid - 1)
     await wait_until(lambda: kv_get(r.conn, "imessage.cursor") == rowid, 10)
     await asyncio.sleep(0.3)
-    assert len(r.osa.sent) == 2
+    assert len(r.osa.sent) == 3
     assert len(resolutions(r)) == 1
     assert len(r.ops.spawned) == 1
-    assert len(r.rows("SELECT status FROM executions")) == 1
+    assert len(r.audits("executor.result")) == 2  # ask_claude's hand-off, and the restart
 
 
 async def test_e13_two_yes_in_one_poll_resolve_and_run_once(live: Running) -> None:
     r = live
-    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
-    await r.osa.wait_for(1, 10)
+    await ask_restart(r)
     await r.prompt_recorded()
     at = utcnow() + timedelta(seconds=1)
     r.chat.conn.execute("BEGIN")
@@ -912,24 +929,23 @@ async def test_e13_two_yes_in_one_poll_resolve_and_run_once(live: Running) -> No
     r.chat.add_message(handle=OWNER_PHONE, text="yes", at=at)
     r.chat.conn.execute("COMMIT")
 
-    await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+    await wait_until(lambda: ask_task(r)["status"] == "done", 10)
     await asyncio.sleep(0.3)
-    texts = [m.text for m in r.osa.sent[1:]]
+    texts = [m.text for m in r.osa.sent[2:]]
     assert texts.count("Restarting Resonant…") == 1
     assert set(texts) <= {"Restarting Resonant…", NOTHING_WAITING}
     assert len(resolutions(r)) == 1
     assert len(r.ops.spawned) == 1
-    assert len(r.rows("SELECT status FROM executions")) == 1
+    assert len(r.audits("executor.result")) == 2
 
 
 async def test_e13_a_reply_from_before_the_prompt_never_binds(live: Running) -> None:
     r = live
-    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
-    await r.osa.wait_for(1, 10)
+    await ask_restart(r)
     await r.prompt_recorded()
     # A late-delivered "yes" timestamped before the prompt went out.
     r.chat.add_message(handle=OWNER_PHONE, text="yes", at=utcnow() - timedelta(minutes=1))
-    refused = await r.osa.wait_for(2, 10)
+    refused = await r.osa.wait_for(3, 10)
     assert refused.text == "That reply came before the question. Reply again to answer it."
     assert resolutions(r) == []
     assert [a["status"] for a in approvals(r)] == ["pending"]
@@ -954,13 +970,12 @@ async def test_e14_cancelling_a_task_orphans_its_approval(running: Running) -> N
 
 async def test_e14_a_used_approval_never_allows_again(live: Running) -> None:
     r = live
-    r.chat.add_message(handle=OWNER_PHONE, text="restart resonant")
-    await r.osa.wait_for(1, 10)
+    await ask_restart(r)
     await r.prompt_recorded()
     reply(r, "yes")
-    await r.osa.wait_for(2, 10)
-    task = chat_task(r, "ops")
-    await wait_until(lambda: chat_task(r, "ops")["status"] == "done", 10)
+    await r.osa.wait_for(3, 10)
+    task = ask_task(r)
+    await wait_until(lambda: ask_task(r)["status"] == "done", 10)
     (approval,) = approvals(r)
     assert approval["status"] == "approved" and approval["used_at"] is not None
 

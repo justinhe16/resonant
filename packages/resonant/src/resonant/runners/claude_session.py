@@ -87,7 +87,7 @@ import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -103,7 +103,7 @@ from resonant.runners.live import RC_TIMEOUT_S, ControlReply, LiveInput, session
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.store.audit import audit
 from resonant.store.claude_brain import SESSION_KV, session_state, status_of
-from resonant.store.db import atomic, iso, kv_set, utcnow
+from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +112,10 @@ POLL_S = 0.25
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 Status = Literal["answered", "crashed", "timeout", "killed", "refused"]
+# The usage limit's reset (iso): asks refuse until then (``runners.ask``, which re-exports
+# these). A rejected ``rate_limit_event`` sets it before the next turn hits the wall (PER-256).
+LIMIT_KV = "brain.ask_claude.limited_until"
+LIMIT_KNOWN_KV = "brain.ask_claude.limit_reset_known"  # the reset time came from Claude
 
 
 @dataclass(frozen=True)
@@ -515,11 +519,36 @@ class ClaudeSession:
         if status == "allowed":
             log.debug("claude brain: rate limit", extra=seen)
             return
+        if status == "rejected":
+            self._limited(resets)
         key = f"{seen['window']}:{seen['resets_at']}:{status}"
         if key in self._limit_warned:
             return
         self._limit_warned.add(key)
         log.warning("claude brain: near a Claude rate limit (%s)", status, extra=seen)
+
+    def _limited(self, resets: object) -> None:
+        """PER-256: a rejected rate limit with a reset time in the future stops asks until
+        then, so the next text hears so once (``ask.LIMIT_OWNER``) instead of failing a turn.
+        An earlier or equal stored reset stays."""
+        if not isinstance(resets, (int, float)) or isinstance(resets, bool):
+            return
+        try:
+            until = datetime.fromtimestamp(float(resets), UTC)
+        except (OverflowError, OSError, ValueError):
+            return
+        if until <= self.clock():
+            return
+        try:
+            with atomic(self.conn):
+                raw = kv_get(self.conn, LIMIT_KV)
+                held = datetime.fromisoformat(raw) if isinstance(raw, str) else None
+                if held is not None and held.tzinfo is not None and held >= until:
+                    return
+                kv_set(self.conn, LIMIT_KV, iso(until))
+                kv_set(self.conn, LIMIT_KNOWN_KV, True)
+        except (sqlite3.Error, ValueError):
+            log.warning("claude brain: usage limit not recorded", exc_info=True)
 
     async def _remote(self, live: LiveInput, ask: asyncio.Future[ControlReply]) -> None:
         """The Remote Control answer (RC-1): a valid URL is kept for /status and the

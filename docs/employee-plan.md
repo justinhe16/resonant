@@ -1,3 +1,5 @@
+> **Superseded in part by PER-256** (2026-10-22): the labeler, the intents and their toolsets described here are deleted; the local model only routes and Claude calls the tools. See [`brain-plan.md`](brain-plan.md#per-256-qwen-only-routes-claude-is-the-one-brain-2026-10-22).
+
 # Employee plan: Resonant works like a coworker at the Mini
 
 Status: **Implemented** (EM-1 to EM-10 merged, 2026-10). This replaced the remaining waves of [`repos-plan.md`](repos-plan.md) (RP-2, RP-3, RP-6, RP-7) and the RP-10 "grants" idea. [`phase5a-plan.md`](phase5a-plan.md) and `repos-plan.md` are historical. Known limits are in [`limits.md`](limits.md#workers).

@@ -14,15 +14,14 @@ Lifecycle (the daemon drives it)::
     ...                      # the loop drains in-flight steps; replies can still be sent
     await stack.aclose()     # close the model client's HTTP pool
 
-Step limit. ``LocalRunner`` defaults to ``max_step_s=30`` but one step can make up to
-``MAX_TOOL_ITERATIONS + 1`` model calls of ``model.timeout_s`` (60s) each, or run one tool
-for up to its ``timeout_s`` (``update_resonant``: 360s; an extension tool at most 300s; job
-specs never run in a chat step, so they don't count). A step limit below either would
-cancel a slow-but-healthy step: before the model client's own timeout could turn it into the
-templated fallback reply, or mid-``/update`` into an ambiguous outcome. So the step limit is
-the larger of the two plus slack (``local_step_limit``): the model client and the executor
-time out first and the user always gets an answer; the loop's stuck check stays a backstop
-for a wedged step.
+Step limit. ``LocalRunner`` defaults to ``max_step_s=30`` but one step can run one tool for
+up to its ``timeout_s`` (``update_resonant``: 360s; an extension tool at most 300s; job specs
+never run in a chat step, so they don't count). A step limit below that would cancel a
+slow-but-healthy step mid-``/update`` into an ambiguous outcome. So the step limit is the
+longest tool timeout plus slack (``local_step_limit``; PER-256: the local runner makes no
+model call, the brain's one triage call adds ``model.timeout_s``, ``brain_step_limit``): the
+executor times out first and the user always gets an answer; the loop's stuck check stays a
+backstop for a wedged step.
 
 Back up. After a restart the owner asked for (``restart_resonant``, ``update_resonant``),
 ``IMessageStack.start`` sends ``Back up (<commit>), down Ns`` once (``resonant.ops.back_up``).
@@ -45,10 +44,11 @@ off there is no router hook: extension events wait unrouted, as messages would.
 Extension health. The monitor gets ``extensions.host.ExtensionHealth`` as its dynamic
 ``ext:<name>`` checks (health commands, job fail streaks, load refusals, tampering).
 
-Brain loop. ``runner="brain"`` (``runners.brain.BrainRunner``, BR-1) is always registered, so a
-brain task outlives a switch back to ``brain.mode: intents``; the router sends chat to it only
-with ``brain.mode: loop``. It gets the daemon's ``started_at``, ``loop.last_tick`` and the slot
-pool for the briefing, and the owner's facts store. Its step limit is ``brain_step_limit``.
+Brain. ``runner="brain"`` (``runners.brain.BrainRunner``, BR-1, PER-256) is the router's
+chat target: the local model only routes (small talk and code-built news are answered there),
+everything else is handed to Claude. It gets the daemon's ``started_at``, ``loop.last_tick``
+and the slot pool for the context, and the owner's facts store. Its step limit is
+``brain_step_limit``.
 
 Ask Claude. ``runner="ask"`` (``runners.ask.AskRunner``, BR-5) runs one read-only ``claude -p``
 per ``ask_claude`` call and texts the answer, so it is registered here; the tool reaches it as
@@ -112,10 +112,10 @@ from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
 from resonant.runners.ask import AskRunner, AskScope
 from resonant.runners.ask_tools import ToolAccess
-from resonant.runners.brain import MAX_ROUNDS, BrainRunner, taints
+from resonant.runners.brain import BrainRunner, taints
 from resonant.runners.claude import ClaudeRunner
 from resonant.runners.job import JobRunner
-from resonant.runners.local import MAX_TOOL_ITERATIONS, LocalRunner
+from resonant.runners.local import LocalRunner
 from resonant.runners.media import MediaRunner
 from resonant.runners.reminder import ReminderRunner
 from resonant.runners.watch import WatchRunner
@@ -132,12 +132,11 @@ log = logging.getLogger(__name__)
 STEP_SLACK_S = 15.0  # sends, tool reads and bookkeeping on top of the model calls
 
 
-def local_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> float:
-    """``max_step_s`` for the local runner: every model call it may make, or the longest
-    tool timeout (so ``/update`` is never cancelled mid-run), whichever is larger, plus
-    slack. Pass chat tools only (``Components.chat_specs()``: no job specs); an extension
-    tool counts at most ``TOOL_TIMEOUT_MAX_S`` (300s)."""
-    model_s = (MAX_TOOL_ITERATIONS + 1) * model.timeout_s
+def local_step_limit(tools: Iterable[ToolSpec] = ()) -> float:
+    """``max_step_s`` for the local runner (PER-256: it makes no model call): the longest
+    tool timeout (so ``/update`` is never cancelled mid-run) plus slack. Pass chat tools only
+    (``Components.chat_specs()``: no job specs); an extension tool counts at most
+    ``TOOL_TIMEOUT_MAX_S`` (300s)."""
     tool_s = max(
         (
             t.timeout_s if t.extension is None else min(t.timeout_s, TOOL_TIMEOUT_MAX_S)
@@ -145,14 +144,13 @@ def local_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> floa
         ),
         default=0.0,
     )
-    return max(model_s, tool_s) + STEP_SLACK_S
+    return tool_s + STEP_SLACK_S
 
 
 def brain_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> float:
-    """``max_step_s`` for the brain runner: as ``local_step_limit``, with ``MAX_ROUNDS``
-    tool rounds and one final call (the intents fallback makes fewer)."""
-    rounds_s = (MAX_ROUNDS + 1) * model.timeout_s
-    return max(rounds_s, local_step_limit(model, tools) - STEP_SLACK_S) + STEP_SLACK_S
+    """``max_step_s`` for the brain runner: its one triage call (``model.timeout_s`` at most)
+    on top of ``local_step_limit`` (a resumed approval runs a tool)."""
+    return local_step_limit(tools) + model.timeout_s
 
 
 RouteFn = Callable[[Event], Awaitable[NewTask | None]]
@@ -245,12 +243,11 @@ class IMessageStack:
 
 
 def tool_access(components: Components, brain: BrainRunner, settings: Settings) -> ToolAccess:
-    """Resonant's tools for a Claude brain session (BR-10): what the brain loop offers the
-    principal, through the same gate and executor as the local model's calls."""
+    """Resonant's tools for a Claude brain session (BR-10): what the brain offers the
+    principal, through the same gate and executor as every other tool call."""
 
     def tools_for(principal: str) -> list[ToolSpec]:
-        core, deferred = brain.tools_for(principal)
-        return [*core, *deferred]
+        return brain.tools_for(principal)
 
     return ToolAccess(
         core=brain.core,  # the brain's ToolCore: the components' registry, gate and executor
@@ -357,7 +354,6 @@ def build_imessage_stack(
         model=model,
         timezone=settings.timezone,
         extensions=components.extensions,
-        brain_mode=settings.brain.mode,
     )
     runner = components.register_local_runner(
         conn,
@@ -367,7 +363,7 @@ def build_imessage_stack(
         model_result_max_chars=settings.extensions.model_result_max_chars,
         taint_hops=settings.brain.taint_hops,
     )
-    runner.max_step_s = local_step_limit(settings.model, components.chat_specs())
+    runner.max_step_s = local_step_limit(components.chat_specs())
     loop.runners[runner.name] = runner
     brain = BrainRunner(
         conn,

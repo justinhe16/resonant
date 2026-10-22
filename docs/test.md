@@ -91,13 +91,13 @@ Update a row when you try it, with the date and anything odd.
 
 ## Brain: ask_claude and taint (BR-5)
 
-Numbered B1–B5. Needs `brain.mode: loop` (the default since BR-8; L1 below) to call `ask_claude` from chat.
+Numbered B1–B5. Claude answers every substantive text since PER-256 (L1 below checks the routing).
 
 | # | Test | Expect | Status |
 |---|---|---|---|
-| B1 | "look up the latest Claude Code release" (research) | `Looking into it…`, then within ~2 min one `Claude: …` reply, terse, under 1500 chars | 📱 after L1 |
-| B2 | "what's on my calendar tomorrow" | Today: `Not done: Calendar isn't reachable from Claude's read-only mode (missing …)` (connectors don't load under `--restricted`, followups) | 📱 after L1 |
-| B3 | A screenshot with "what's this?" | `Claude: …` about the image (attachment copied from Messages) | 📱 after BR-7 |
+| B1 | "look up the latest Claude Code release" (research) | Within ~2 min one reply, terse, under 1500 chars, no `Claude:` prefix (an ack like `on it` first only if it took over ~8 s) | 📱 after L1 |
+| B2 | "what's on my calendar tomorrow" | One line saying it can't reach your calendar (Claude answers; connectors don't load, followups) | 📱 after L1 |
+| B3 | A screenshot with "what's this?" | `Looking into it…`, then a reply about the image (attachment copied from Messages), no prefix | 📱 after BR-7 |
 | B4 | `/kill` while an ask runs, then `/resume` | `Stopped: Resonant was paused (/kill).`; no `claude` process left (`pgrep -f -- --restricted`) | 📱 + 🖥 after BR-1 |
 | B5 | A tainted write: after "read ~/code/x/README" ask it to "add a note …" | The note asks first (`[A7] add note … Reply yes / no`), no `yes always` | 📱 after L1 |
 
@@ -116,7 +116,7 @@ Numbered D1–D6 so they don't collide with other sections' rows. Steps are [`go
 
 ## Phase 6a: the brain's read tools (BR-2)
 
-Numbered F1–F4. The tools reach chat only through the brain loop (`brain.mode: loop`, the default; L1 below).
+Numbered F1–F4. The tools reach chat through Claude (L1 below).
 
 | # | Test | Expect | Status |
 |---|---|---|---|
@@ -125,7 +125,7 @@ Numbered F1–F4. The tools reach chat only through the brain loop (`brain.mode:
 | F3 | "what did R4 say last", "any errors in the log?" | Lines from `read_transcript` / `tail_log`, URLs and handles removed, no tokens | 📱 after L1 |
 | F4 | Optional: `brew install ripgrep` (`brain.rg_path`, default `/opt/homebrew/bin/rg`); without it `search` uses the slower bounded Python walk | `/opt/homebrew/bin/rg --version` works | 🖥 |
 
-## Brain (with `brain.mode: loop`)
+## Brain
 
 | # | Test | Expect | Status |
 |---|---|---|---|
@@ -135,34 +135,35 @@ Numbered F1–F4. The tools reach chat only through the brain loop (`brain.mode:
 | B4 | Start a run, wait for it to finish without texting, then text "hey" | The reply can mention the run ended (the `since we last talked` notes) | 📱 after L1 |
 | B5 | A long thread (16+ texts), then "what did I ask you earlier about X?" | Answers from the summary; `sqlite3 ~/.resonant/resonant.db "select folded, source from brain_summaries"` shows `source=model` | 📱 + 🖥 after BR-1 |
 
-## Brain loop (BR-1)
+## Brain: the local model routes, Claude answers (BR-1, PER-256)
 
-Numbered L1–L7. `brain.mode` defaults to `loop` since BR-8; L1 checks it is on (a config that sets `brain: {mode: intents}` keeps the labeler).
+Numbered L1–L8. Since PER-256 the local model only routes; `brain.mode` and `brain.triage.bias` are ignored (a warning at start if they are set) and `brain.route: local` reads as `triage`.
 
 | # | Test | Expect | Status |
 |---|---|---|---|
-| L1 | With no `brain.mode` in `~/.resonant/config.yaml` (or `brain: {mode: loop}`), restart, text "hey" | A short reply; `sqlite3 ~/.resonant/resonant.db "select runner, kind from tasks order by rowid desc limit 1"` shows `brain|chat`; `ping` and `/status` still answer at once | 📱 + 🖥 |
-| L2 | "what's R4 doing" while a run is open | From `run_activity` (a core tool), no labeler call | 📱 after L1 |
-| L3 | "how much disk is free?" | The model calls `disk` (a stub: not a core tool) and answers; a `runner.local.tool` span with `tool: "disk"`, and no other tool in its place | 📱 + 🖥 after L1 |
-| L4 | A question that needs a few reads ("which repo has the flaky test?") | `On it…` once if it takes over 6 s, then the answer; never more than 8 `runner.brain.round` spans for the task | 📱 after L1 |
-| L5 | "remember that dori deploys on fridays"; then "read ~/code/dori/README.md and remember what it says about deploys" | The first runs (`Remembered …`); the second asks first (`[A7] … Reply yes / no`, no `yes always`) because the file read tainted the task | 📱 after L1 |
-| L6 | Something the local model can't finish ("compare the last ten runs' failures and summarise the causes") | Either an answer, or `Looking into it…` and then `Claude: …` (auto-escalation) | 📱 after L1 |
-| L7 | `brew services stop ollama`, text "hey", then `brew services start ollama` | `I'm having trouble thinking right now. …` (the intents fallback), no crash; after the restart replies come back | 📱 + 🖥 after L1 |
+| L1 | Restart, text "hey", then "what's R4 doing" | "hey": a short canned or one-line reply from the local model (`Hey!`), no Claude. "what's R4 doing": one Claude answer (no prefix, no `Claude:`), from `run_activity`; `sqlite3 ~/.resonant/resonant.db "select runner, kind from tasks order by rowid desc limit 3"` shows `brain|chat` then `ask|ask`; `ping` and `/status` still answer at once | 📱 + 🖥 |
+| L2 | "anything new?" | Built from code: `Nothing new, and nothing waits on you.` or the list of what ended or waits (nothing you were already texted about) | 📱 after L1 |
+| L3 | "how much disk is free?" | One Claude answer from `disk` or `system_status`; a `runner.ask.mcp_call` span with the tool | 📱 + 🖥 after L1 |
+| L4 | A question that needs a few reads ("which repo has the flaky test?") | One answer; if it takes over ~8 s one short ack (`on it…`) first, never two | 📱 after L1 |
+| L5 | "remember that dori deploys on fridays"; then "read ~/code/dori/README.md and remember what it says about deploys" | The first runs (Claude calls `remember`; the reply confirms after it did); the second asks first (`[A7] … Reply yes / no`, no `yes always`) because the file read tainted the turn | 📱 after L1 |
+| L6 | "how much did I spend last week" with no money tool | Never an invented amount: Claude says it can't check, or `I couldn't check that just now.` (the number guard stopped it twice); no `$` figure that no tool returned | 📱 after L1 |
+| L7 | "don't ask me before making linear tickets" | `allow_tools` asked (`[A7] stop asking before linear.save_issue …`) and a reply that it waits on your yes; never a bare "Got it" | 📱 after L1 |
+| L8 | `brew services stop ollama`, text "hey" and a question, then `brew services start ollama` | Triage fails over to Claude (no triage label): both get Claude's answer, no crash; replies keep working after the restart. With Claude down too (`claude` logged out): `Claude is unavailable right now; approvals and /status still work. I'll try again in a minute.` then a retry | 📱 + 🖥 after L1 |
 
 ## Media, links, watches, proactive (BR-7)
 
-Numbered M1–M9. Attachments work in either `brain.mode`; links and watches need the loop (L1). Messages' attachments stay where Messages put them; Resonant copies one into `~/.resonant/ask/<task>` only for the length of an ask.
+Numbered M1–M9. Links and watches need L1. Messages' attachments stay where Messages put them; Resonant copies one into `~/.resonant/ask/<task>` only for the length of an ask.
 
 | # | Test | Expect | Status |
 |---|---|---|---|
-| M1 | Send a screenshot with "what's this?" | `Looking into it…`, then `Claude: …` about the picture; `sqlite3 ~/.resonant/resonant.db "select runner, status from tasks order by rowid desc limit 3"` shows `media|done` and `ask|done` | 📱 + 🖥 |
+| M1 | Send a screenshot with "what's this?" | `Looking into it…`, then a reply about the picture; `sqlite3 ~/.resonant/resonant.db "select runner, status from tasks order by rowid desc limit 3"` shows `media|done` and `ask|done` | 📱 + 🖥 |
 | M2 | Send an iPhone photo (HEIC) with no text | `Looking into it…`, then a description (the HEIC went to Claude as a JPEG: `sips`) | 📱 |
 | M3 | Send a PDF with no text | `Looking into it…`, then a short summary | 📱 |
 | M4 | A voice note, no whisper set up | `I can't play voice notes: Claude takes no audio and no local whisper is set up (brain.whisper_path). Type it instead?` | 📱 |
 | M5 | Optional: `brew install whisper-cpp`, download a model (`ggml-base.en.bin`), set `brain: {whisper_path: /opt/homebrew/bin/whisper-cli, whisper_model: <model path>}`, restart, send a voice note "where is mycelium" | The same answer as the typed question; no reply about the voice note itself; an approval prompt answered by voice stays pending (type `yes`) | 📱 + 🖥 |
-| M6 | A link alone ("https://…") or "summarise https://…" | `Looking into it…`, then `Claude: …` summarising the page (an `ask` task with `kind: link`) | 📱 after L1 |
+| M6 | A link alone ("https://…") or "summarise https://…" | `Looking into it…`, then a reply summarising the page (an `ask` task with `kind: link`) | 📱 after L1 |
 | M7 | "watch my notes and tell me when milk is on them", approve, then `/note milk` | `[A7] create watch …? Reply yes / no` → `Watching W1: …, every 1h until …`; within an hour (checks every 5 minutes, at the watch's interval) one `👀 W1 …: saw "milk"`; "list my watches" shows it `fired` | 📱 after L1 |
-| M8 | "watch https://<a page> and tell me when it says <X>" | Proposes an ask watch (every 60 minutes); when Claude answers YES, one `👀 W… : Claude: …` text; ask tasks in `select kind, checkpoint from tasks where runner='ask'` carry `"watch"` | 📱 after L1 |
+| M8 | "watch https://<a page> and tell me when it says <X>" | Proposes an ask watch (every 60 minutes); when Claude answers YES, one `👀 W… : …` text; ask tasks in `select kind, checkpoint from tasks where runner='ask'` carry `"watch"` | 📱 after L1 |
 | M9 | Three watches that all fire on the same day, then a fourth | Three texts; the fourth waits (`brain.proactive_per_day: 3`) and shows in the next morning's briefing; `select decision, json_extract(detail,'$.reason') from audit_log where action='brain.notice'` shows `held|capped_day` | 📱 + 🖥 after M7 |
 
 ## Needs real data or effort

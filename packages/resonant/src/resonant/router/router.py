@@ -8,54 +8,39 @@
     run``) instead gives ``NewTask(kind="command", runner="local", checkpoint={"direct_call":
     {"extension", "tool", "args"}, "intent": ..., "title": command})``: the local runner
     runs that one call with ``origin="explicit"``.
-(b) Labeled (one model call): ``NewTask(kind="chat", runner="local", checkpoint={"intent",
-    "confidence", "toolset": [{"extension", "name"}], "fallback", "toolset_prefix_hash",
-    "title"})``.
-(b') Brain loop (``brain_mode="loop"``, ``brain.mode``; docs/brain-plan.md D1): no labeler,
-    ``NewTask(kind="chat", runner="brain", checkpoint={"title": "chat"})``. The fast path,
-    approval replies and the relay run first, unchanged.
-(b'') Media (BR-7, docs/brain-plan.md D10): an owner's message with attachments
+(b) Brain (PER-256: the labeler and the intents path are gone): any other text gives
+    ``NewTask(kind="chat", runner="brain", checkpoint={"title": "chat"})``. The brain's local
+    model only routes it (small talk and code-built news checks are answered there, the rest
+    goes to Claude, ``runners/brain.py``). The fast path, approval replies and the relay run
+    first, unchanged.
+(b') Media (BR-7, docs/brain-plan.md D10): an owner's message with attachments
     (``payload.attachments``: images, PDFs, voice notes, written by the reader) gives
     ``NewTask(kind="media", runner="media", checkpoint={"title": "media"})`` right after the
-    slash commands, in both modes (``runners/media.py``: an image or PDF goes to
-    ``ask_claude``, a voice note through whisper). A voice transcript comes back as a
-    message event with ``payload.voice`` and goes only to the chat path (the labeler or
-    the brain, whose model-chosen calls are gated): never a slash command or keyword (they
-    run as explicit consent), an approval reply or a worker reply. Those stay typed.
+    slash commands (``runners/media.py``: an image or PDF goes to ``ask_claude``, a voice
+    note through whisper). A voice transcript comes back as a message event with
+    ``payload.voice`` and goes only to the brain, whose model-chosen calls are gated: never
+    a slash command or keyword (they run as explicit consent), an approval reply or a worker
+    reply. Those stay typed.
 (c) None for anything else (other sources/types, no principal, empty text and no
     attachments). The Loop consumes the event.
 
 Order: slash commands first (so ``/kill`` is never read as a reply), then approval replies
 (``router/approvals.py``: the parser, then ``gate.resolve_reply``), then the relay's direct
 step (``router/relay.py``: ``R4 …``, an option pick, the answer to ``For R4 or R6?``), then
-keywords and the labeler, then the relay's free-text step (the brain picks the question a
-reply answers). A plain ``yes``/``no`` while a worker question is open goes to the relay
-when no approval prompt is open, and gets "which one?" when one is (EM-5). Relay replies are
-code-built ``fast_reply`` tasks titled ``worker reply``. A reply that resolves an approval
-returns None (consumed; the woken runner sends the confirmation). A refused reply gets a
-code-built ``fast_reply`` titled ``approval reply``. Text the parser doesn't recognize
-routes normally.
+keywords, then the relay's free-text step (the brain picks the question a reply answers). A
+plain ``yes``/``no`` while a worker question is open goes to the relay when no approval
+prompt is open, and gets "which one?" when one is (EM-5). Relay replies are code-built
+``fast_reply`` tasks titled ``worker reply``. A reply that resolves an approval returns None
+(consumed; the woken runner sends the confirmation). A refused reply gets a code-built
+``fast_reply`` titled ``approval reply``. Text the parser doesn't recognize routes normally.
 
 ``gate`` is the full ``Gate`` (``PolicyGate``, or ``DryRunGate`` before it is wired): the
 fast path uses ``evaluate``/``consume``/``pending_for``, the inbox ``resolve_reply``.
 
-``title`` is code-built (the command name with any subcommand word, or ``chat: <intent>``)
-and is what ``/projects`` shows; it never contains message text.
+``title`` is code-built (the command name with any subcommand word, or ``chat``) and is what
+``/projects`` shows; it never contains message text.
 
-Priority always comes from the principal (owner or member), never from the model. The
-toolset is filtered by ``principals.may_request(principal, spec)`` before anything
-reaches the model, so a member never sees global builtins (except a granted read,
-``ToolSpec.grant``).
-
-**Extension intents** (Phase 3). ``intents`` is built once at construction from the loaded
-extensions (``intents.intent_set``). ``extension:<name>`` gets only that extension's chat
-tools from the host (``host.tool_specs(name)``: never registry-wide, never job specs),
-filtered by the same ``request`` grant. Tools reach the model by bare name, so a toolset
-never holds two tools with one name, and an extension tool named like a builtin tool is
-refused (left out, logged): ``chat_toolset``.
-
-``classify(text, labeler)`` is the side-effect-free entry point for evals: it returns the
-predicted intent and the path (``fast`` | ``llm``) without running tools or the kill switch.
+Priority always comes from the principal (owner or member), never from the model.
 """
 
 from __future__ import annotations
@@ -64,10 +49,9 @@ import logging
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
-from typing import Any, Literal
+from typing import Any
 
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.gate import Gate
@@ -79,20 +63,9 @@ from resonant.observability.spans import span
 from resonant.principals import Principals
 from resonant.router.approvals import ApprovalInbox
 from resonant.router.commands import commands_for
-from resonant.router.fast_path import FastPath, match_fast_path
-from resonant.router.intents import (
-    BUILTIN_INTENTS,
-    INTENT_TOOLS,
-    ExtensionCatalog,
-    IntentLabel,
-    IntentSet,
-    builtin_intent,
-    extension_of,
-    intent_set,
-)
-from resonant.router.labeler import Labeler
-from resonant.router.prefixes import toolset_prefix_hash
-from resonant.router.relay import Relay, clash_text, parse_addressed, plain_reply_clashes
+from resonant.router.fast_path import FastPath
+from resonant.router.intents import ExtensionCatalog, IntentLabel
+from resonant.router.relay import Relay, clash_text, plain_reply_clashes
 from resonant.store import approvals as ap
 from resonant.store.db import utcnow
 from resonant.tools import ToolRegistry
@@ -136,67 +109,6 @@ def chat_toolset(specs: Iterable[ToolSpec], builtins: frozenset[str]) -> list[To
     return sorted(out, key=lambda s: s.name)
 
 
-def toolset_for(
-    intent: IntentLabel,
-    principal: str,
-    *,
-    registry: ToolRegistry,
-    principals: Principals,
-    extensions: ExtensionCatalog | None = None,
-) -> list[ToolSpec]:
-    """The tools ``principal`` may request for ``intent``, sorted by name.
-
-    A builtin intent maps to builtins (``INTENT_TOOLS``); unregistered names are skipped.
-    ``extension:<name>`` maps to that extension's chat tools from the host, never its job
-    specs. Either way each tool needs ``principals.may_request(principal, spec)``.
-    """
-    specs: list[ToolSpec] = []
-    ext = extension_of(intent)
-    builtin = builtin_intent(intent)
-    if builtin is not None:
-        for name in INTENT_TOOLS[builtin]:
-            spec = registry.get(None, name)
-            if spec is not None:
-                specs.append(spec)
-    elif ext is not None and extensions is not None:
-        specs = [
-            s for s in extensions.tool_specs(ext) if s.extension == ext and not extensions.is_job(s)
-        ]
-    allowed = [s for s in specs if principals.may_request(principal, s)]
-    return chat_toolset(allowed, builtin_names(registry))
-
-
-def toolset_entries(toolset: Iterable[ToolSpec]) -> list[dict[str, str | None]]:
-    """The checkpoint form of a toolset: ``[{"extension", "name"}]``."""
-    return [{"extension": s.extension, "name": s.name} for s in toolset]
-
-
-@dataclass(frozen=True)
-class Classification:
-    intent: IntentLabel
-    path: Literal["fast", "llm"]
-    confidence: float  # 1.0 on the fast path
-    fallback: bool = False
-    command: str | None = None  # the fast-path command, if any
-
-
-async def classify(
-    text: str, labeler: Labeler, *, spans: SpanFactory | None = None
-) -> Classification:
-    """Predict intent and path the way production does, from the owner's point of view.
-
-    Uses the production fast-path matcher and labeler, but runs no tools and never touches
-    the kill switch, so evals can call it on any text.
-    """
-    cmd = match_fast_path(text)
-    if cmd is not None:
-        return Classification(cmd.intent, "fast", 1.0, command=cmd.name)
-    if parse_addressed(text) is not None:  # "R4 …": the relay's direct step, no model call
-        return Classification("run_project", "fast", 1.0, command="relay")
-    label = await labeler.label(text, spans=spans)
-    return Classification(label.intent, "llm", label.confidence, fallback=label.fallback)
-
-
 class Router:
     def __init__(
         self,
@@ -210,17 +122,11 @@ class Router:
         clock: Callable[[], datetime] = utcnow,
         timezone: str = "UTC",
         extensions: ExtensionCatalog | None = None,
-        brain_mode: Literal["intents", "loop"] = "intents",
     ) -> None:
         self.conn = conn
-        self.brain_mode = brain_mode
         self.principals = principals
         self.registry = registry
         self.extensions = extensions
-        # Built once: the labeler prefix changes only with an install, remove or restart.
-        self.intents: IntentSet = (
-            intent_set(extensions) if extensions is not None else BUILTIN_INTENTS
-        )
         self.fast_path = FastPath(
             conn,
             principals=principals,
@@ -230,21 +136,11 @@ class Router:
             clock=clock,
             timezone=timezone,
             extensions=extensions,
-            command_table=commands_for(extensions, registry),  # built once, like intents
+            command_table=commands_for(extensions, registry),  # built once
         )
         self.inbox = ApprovalInbox(conn, principals=principals, gate=gate)
         # Worker questions and messages (EM-5); wiring sets relay.workers to the runner.
         self.relay = Relay(conn, principals=principals, model=model, clock=clock)
-        self.labeler = Labeler(model, self.intents)
-
-    def toolset_for(self, intent: IntentLabel, principal: str) -> list[ToolSpec]:
-        return toolset_for(
-            intent,
-            principal,
-            registry=self.registry,
-            principals=self.principals,
-            extensions=self.extensions,
-        )
 
     async def __call__(self, event: Event) -> NewTask | None:
         return await self.route(event)
@@ -286,7 +182,7 @@ class Router:
         stash = self.relay.take_stash(principal)
 
         # Order: slash commands (so /kill is never read as a reply), approval replies, then
-        # keywords and the labeler.
+        # keywords.
         # A voice transcript is chat only: never a slash command or keyword (``/restart``
         # misheard would run as explicit consent), an approval or a worker reply.
         cmd = None if voice else self.fast_path.match(text)
@@ -366,60 +262,23 @@ class Router:
             if result is not None:
                 return reply(result.reply_text, result.tool_used, result.intent, result.command)
 
-        if self.brain_mode == "loop":
-            # D1: no labeler (its prefix would evict the brain's from the model's one KV
-            # slot). Any free text may still answer an open worker question.
-            free = (
-                None
-                if voice
-                else await self.relay.free(event, text, principal, "question", spans=spans)
-            )
-            if free is not None:
-                return relayed(free.reply)
-            with spans("router.brain", principal=principal):
-                pass
-            return NewTask(
-                kind=KIND_CHAT,
-                runner=BRAIN_RUNNER,
-                priority=priority,
-                principal=principal,
-                channel_ref=channel_ref,
-                checkpoint={"title": BRAIN_TITLE},
-            )
-
-        label = await self.labeler.label(text, spans=spans)
+        # Any free text may still answer an open worker question.
         free = (
             None
             if voice
-            else await self.relay.free(event, text, principal, label.intent, spans=spans)
+            else await self.relay.free(event, text, principal, "question", spans=spans)
         )
         if free is not None:
             return relayed(free.reply)
-        toolset = self.toolset_for(label.intent, principal)
-        prefix_hash = toolset_prefix_hash(label.intent, toolset, self.intents)
-        with spans(
-            "router.toolset",
-            intent=label.intent,
-            principal=principal,
-            toolset=[s.name for s in toolset],
-            extension=extension_of(label.intent),
-            toolset_prefix_hash=prefix_hash,
-        ):
+        with spans("router.brain", principal=principal):
             pass
         return NewTask(
             kind=KIND_CHAT,
-            runner=RUNNER,
+            runner=BRAIN_RUNNER,
             priority=priority,
             principal=principal,
             channel_ref=channel_ref,
-            checkpoint={
-                "intent": label.intent,
-                "confidence": label.confidence,
-                "toolset": toolset_entries(toolset),
-                "fallback": label.fallback,
-                "toolset_prefix_hash": prefix_hash,
-                "title": f"chat: {label.intent}",
-            },
+            checkpoint={"title": BRAIN_TITLE},
         )
 
 

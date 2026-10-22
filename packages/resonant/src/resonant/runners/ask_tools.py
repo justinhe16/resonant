@@ -291,6 +291,10 @@ class ClaudeTools:
         self.policy = access.shell
         self.redactor = redactor or Redactor(())
         self.progress: list[str] = []  # the changes of Claude's own that ran, in words
+        # PER-256: what the turn read, for the number guard (``brain.guard``): the text of every
+        # result Claude got (Resonant's tools and its own), and the Resonant tools it called.
+        self.sources: list[str] = []
+        self._called: set[str] = set()
         self._uses: dict[str, tuple[str, dict[str, Any]]] = {}  # tool_use id -> name, input
         self._decided: dict[str, tuple[str, Call | None]] = {}  # id -> decision, the call
 
@@ -405,7 +409,16 @@ class ClaudeTools:
             with self._spans("runner.ask.mcp_call", tool=flat(str(name), 64)) as s:
                 text, error = await self._call(name, args)
                 s.set(error=error, tainted=self.tainted)
+                if name != PERMISSION:
+                    self.sources.append(text)
+                    if isinstance(name, str):
+                        self._called.add(name)
                 return text, error
+
+    @property
+    def called(self) -> frozenset[str]:
+        """The Resonant tools Claude called in this turn (whatever came of them)."""
+        return frozenset(self._called)
 
     async def _call(self, name: Any, args: Any) -> tuple[str, bool]:
         if name == PERMISSION:
@@ -570,6 +583,7 @@ class ClaudeTools:
             if b.get("type") != "tool_result" or not isinstance(tid, str) or tid not in self._uses:
                 continue
             name, given = self._uses.pop(tid)
+            self.sources.append(_result_text(b.get("content"), RESULT_MAX_CHARS))
             text = _result_text(b.get("content"))
             decided = self._decided.pop(tid, None)
             ran = decided is None or decided[0] not in ("asked", "refused")
@@ -645,10 +659,10 @@ def _deny(message: str) -> tuple[str, bool]:
     return json.dumps({"behavior": "deny", "message": message}), False
 
 
-def _result_text(content: Any) -> str:
+def _result_text(content: Any, limit: int = SHELL_RESULT_CHARS) -> str:
     """A tool result's text (a string, or text blocks), clipped."""
     if isinstance(content, str):
-        return content[:SHELL_RESULT_CHARS]
+        return content[:limit]
     parts: list[str] = []
     if isinstance(content, list):
         for c in cast(list[Any], content):
@@ -656,7 +670,7 @@ def _result_text(content: Any) -> str:
                 t = cast(dict[str, Any], c).get("text")
                 if isinstance(t, str):
                     parts.append(t)
-    return "\n".join(parts)[:SHELL_RESULT_CHARS]
+    return "\n".join(parts)[:limit]
 
 
 def _what(name: str, given: dict[str, Any]) -> str:

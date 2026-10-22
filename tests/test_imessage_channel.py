@@ -311,7 +311,7 @@ async def test_outbound_notes_a_claude_answer_before_and_a_prompt_only_after_sen
     await good.send("justin", "[A7] OK to close?", dedupe_key="approval:a7:prompt:justin")
     bad = make(principals, db, FakeRunner(result=OsaResult(1, "", "boom")), ft)
     with pytest.raises(ChannelSendError):
-        await bad.send("justin", "Claude: reply yes to go ahead", dedupe_key="ask:t1")
+        await bad.send("justin", "reply yes to go ahead", dedupe_key="ask:t1")
     with pytest.raises(ChannelSendError):
         await bad.send("justin", "[A7] still waiting", dedupe_key="approval:a7:remind:justin")
     assert keys() == ["approval:a7:prompt:justin", "ask:t1"]  # the failed reminder: never
