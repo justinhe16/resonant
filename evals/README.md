@@ -86,7 +86,7 @@ Every case gets a **fresh, hermetic home** in a temp dir, seeded with the row's 
 - your state: the home, `runner.code_dir`, the run dirs, `brain.read_roots` and `ops.repo_path` are all inside the temp dir; the Keychain is an in-memory fake. Only `--model live` reads `~/.resonant/config.yaml`, for the model and timezone.
 - side effects: notes, reminders, facts, trust rules and `forget_repo` run (they only touch the temp store); everything else the gate allows (`start_run`, `restart_ollama`, `add_repo`, extension writes) is recorded and answered `{"eval": "not run"}`.
 - `ask_claude`: queues nothing and starts no Claude session; it is recorded as an escalation and the reply is `Looking into it…`. With `--live-claude` it starts a real Claude brain session instead (see [Live Claude](#live-claude-grading-the-claude-brains-answers)).
-- extensions: `github`, `linear` and `trade-jev` are local fixtures with canned results (no network, no secrets).
+- extensions: `github`, `linear`, `trade-jev` and `mycelium` (money: read-only, its results are outside content) are local fixtures with canned results (no network, no secrets, no bank data).
 
 `--model live` (default) uses the configured local model, one client for the whole run, after one untimed warm-up call. `--model scripted` runs each row's `script` through a `ScriptedModel`; CI runs it to prove the harness and that every example row is satisfiable. It never calls a real model.
 
@@ -119,6 +119,7 @@ One JSON object per line (blank lines skipped):
 - `review` (optional, default `false`): `true` on a drafted row you haven't checked yet. Such a row is listed under "awaiting review" by id and line, and is neither run nor graded until you set it to `false`. A set where every row still awaits review exits 2.
 - `note` (optional): free text for you, ignored by the eval. A drafted row uses it to say what can't be replayed faithfully.
 - `draft` (optional): where a drafted row came from (`task`, `at`, `status`, `reply`: the reply you got then). Ignored by the eval.
+- `synthetic` (optional, `true` or `false`): a row written by hand rather than drafted from one of your texts (its `draft.reply` is then a suggested good answer). Ignored by the eval.
 - `script` (for `--model scripted`): a list of rounds. A list of `[tool, args]` pairs is one round of tool calls, a string is the final reply. `{root}` is the world root and `{in:N}` the time N minutes from now (for `add_reminder`).
 
 The whole row, world included, is checked when the set loads: a load error names the line, never the text.

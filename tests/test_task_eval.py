@@ -927,3 +927,117 @@ def test_limit_takes_the_first_cases(tmp_path: Path) -> None:
         "--out", str(tmp_path),
     )  # fmt: skip
     assert json.loads(result.output)["meta"]["cases"] == 3
+
+
+# --- the mycelium fixture: the owner's money, read-only ---------------------------------------
+
+# The real extension's tools (mycelium/resonant-extension/resonant.yaml) and their args.
+MYCELIUM_TOOLS: dict[str, dict[str, str]] = {
+    "net_worth": {},
+    "account_balances": {},
+    "recent_transactions": {"days": "integer"},
+    "spending_summary": {"period": "string"},
+    "search_transactions": {"query": "string", "period": "string"},
+    "merchant_totals": {"period": "string", "limit": "integer"},
+}
+MYCELIUM_RUN = {  # the real CLI's flags (--x={x} keeps a value starting with "-" a value)
+    "recent_transactions": "--days {days}",
+    "spending_summary": "--period {period}",
+    "search_transactions": "--query={query} --period={period}",
+    "merchant_totals": "--period={period} --limit={limit}",
+}
+
+
+def test_the_mycelium_fixture_mirrors_the_real_extension() -> None:
+    """Same tool names, args (with types) and flags as the real manifest (checked by hand:
+    CI can't read mycelium's repo), every one an L0 read (the real one has
+    no writes and no approvers), and a default for each so an unseeded call answers in the
+    real CLI's shape with nothing in it, never a number."""
+    import yaml
+
+    from resonant_sdk import Effect, Level
+    from resonant_sdk.manifest import Manifest
+
+    fx = te.FIXTURES["mycelium"]
+    m = Manifest.model_validate(yaml.safe_load(fx.manifest))
+    specs = {s.name: s for s in m.tool_specs()}
+    args = {
+        n: {k: v["type"] for k, v in s.args_schema["properties"].items()} for n, s in specs.items()
+    }
+    assert args == MYCELIUM_TOOLS
+    assert all(
+        sorted(s.args_schema["required"]) == sorted(MYCELIUM_TOOLS[n]) for n, s in specs.items()
+    )
+    tools = yaml.safe_load(fx.manifest)["tools"]
+    assert all(tools[n]["run"].endswith(flags) for n, flags in MYCELIUM_RUN.items())
+    assert all(s.effect is Effect.READ and s.effective_level is Level.L0 for s in specs.values())
+    assert set(fx.defaults) == set(MYCELIUM_TOOLS)
+    assert all(d["untrusted"] is True for d in fx.defaults.values())
+    assert fx.defaults["spending_summary"]["spend"] == 0.0
+
+
+SPEND = {
+    "period": "last_7_days",
+    "start": "2026-10-15",
+    "end": "2026-10-21",
+    "income": 0.0,
+    "spend": 412.37,
+    "top_merchants": [{"merchant": "Kettle & Crumb", "spent": 88.4, "count": 2}],
+    "untrusted": True,
+}
+
+
+def test_a_money_question_reads_the_mycelium_fixture(tmp_path: Path) -> None:
+    """The seeded result is what the tool prints, and a reply with its numbers is graded
+    correct: the case the fixture exists for (qwen used to invent the total)."""
+    r = _one(
+        tmp_path,
+        {
+            "id": "spend",
+            "category": "money",
+            "text": "how much did i spend last week",
+            "world": {"extensions": {"mycelium": {"spending_summary": SPEND}}},
+            "expect": {"tools": ["spending_summary"], "facts": ["412.37"], "ask": False},
+            "script": [
+                [["spending_summary", {"period": "last_7_days"}]],
+                "$412.37 last week; most at Kettle & Crumb.",
+            ],
+        },
+    )
+    assert r.correct, r.failures
+    assert r.outcome.called == ["spending_summary"]
+
+
+def test_a_mycelium_result_is_outside_content(tmp_path: Path) -> None:
+    """Merchant names come from banks: after a mycelium read, even an L3 run asks first, as
+    on the Mini (no write runs off the back of a bank result)."""
+    r = _one(
+        tmp_path,
+        {
+            "id": "taint",
+            "category": "money",
+            "text": "how much did i spend last week",
+            "world": {
+                "repos": [{"name": "dori"}],
+                "extensions": {"mycelium": {"spending_summary": SPEND}},
+            },
+            "expect": {"tools": ["spending_summary", "start_run"], "ask": "approval"},
+            "script": [
+                [["spending_summary", {"period": "last_7_days"}]],
+                [["start_run", {"repo": "dori", "ask": "audit spending"}]],
+                "Asked you first.",
+            ],
+        },
+    )
+    assert r.correct, r.failures
+    assert r.outcome.executed_writes == []
+
+
+def test_a_synthetic_row_loads_and_must_say_so_with_a_bool(tmp_path: Path) -> None:
+    """``synthetic`` marks a hand-written owner row (not drafted from a text); the eval
+    ignores it, like ``note`` and ``draft``."""
+    row = {"id": "s", "category": "chat", "text": "hey", "synthetic": True, "review": True}
+    (case,) = load_set(write_set(tmp_path / "s.jsonl", [row]))
+    assert case.review
+    with pytest.raises(EvalSetError, match="'synthetic' must be true or false"):
+        load_set(write_set(tmp_path / "b.jsonl", [{**row, "synthetic": "yes"}]))
