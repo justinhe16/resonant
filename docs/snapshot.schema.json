@@ -1,6 +1,54 @@
 {
   "$comment": "Generated from resonant/dashboard/snapshot.py; do not edit.",
   "$defs": {
+    "ApprovalBrief": {
+      "additionalProperties": false,
+      "description": "A pending approval on both tiers: no summary, and not its code (the owner types it to\nsay yes, so it stays on the Mini and iMessage). A batch (PER-254) is one brief, like its row.",
+      "properties": {
+        "asked_at": {
+          "format": "date-time",
+          "title": "Asked At",
+          "type": "string"
+        },
+        "effect": {
+          "enum": [
+            "read",
+            "write",
+            "pay"
+          ],
+          "title": "Effect",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "level": {
+          "enum": [
+            "L0",
+            "L1",
+            "L2",
+            "L3"
+          ],
+          "title": "Level",
+          "type": "string"
+        },
+        "needs_code": {
+          "title": "Needs Code",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "level",
+        "effect",
+        "needs_code",
+        "asked_at",
+        "expires_at"
+      ],
+      "title": "ApprovalBrief",
+      "type": "object"
+    },
     "ApprovalChange": {
       "additionalProperties": false,
       "description": "One change of a batch (BA-1): its line in the batch's prompt, and its own level.",
@@ -96,6 +144,13 @@
     "Approvals": {
       "additionalProperties": false,
       "properties": {
+        "brief": {
+          "items": {
+            "$ref": "#/$defs/ApprovalBrief"
+          },
+          "title": "Brief",
+          "type": "array"
+        },
         "items": {
           "anyOf": [
             {
@@ -125,10 +180,38 @@
     },
     "BrainActivity": {
       "additionalProperties": false,
-      "description": "PER-258: the Claude brain's tool calls today (``settings.timezone``), counts only, so\nthe remote tier has them too: every call, and the changes that ran.",
+      "description": "PER-258: the Claude brain's tool calls today (``settings.timezone``), counts only, so\nthe remote tier has them too: every call, and the changes that ran. With its session's\nstate and turns (None before its first start) and its last calls, briefly.",
       "properties": {
         "calls_today": {
           "title": "Calls Today",
+          "type": "integer"
+        },
+        "recent": {
+          "items": {
+            "$ref": "#/$defs/BrainToolBrief"
+          },
+          "title": "Recent",
+          "type": "array"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "enum": [
+                "up",
+                "down"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State"
+        },
+        "turns": {
+          "default": 0,
+          "title": "Turns",
           "type": "integer"
         },
         "writes_today": {
@@ -191,6 +274,58 @@
         "write"
       ],
       "title": "BrainTool",
+      "type": "object"
+    },
+    "BrainToolBrief": {
+      "additionalProperties": false,
+      "description": "One of the Claude brain's tool calls on both tiers: the tool's kind (``bash``,\n``read``, ``mcp``; ``other`` for a name that isn't a plain slug), the decision and the\noutcome. Never its command or directory.",
+      "properties": {
+        "at": {
+          "format": "date-time",
+          "title": "At",
+          "type": "string"
+        },
+        "decision": {
+          "enum": [
+            "allowed",
+            "read",
+            "gate",
+            "granted",
+            "asked",
+            "refused",
+            "denied",
+            "resonant",
+            "other"
+          ],
+          "title": "Decision",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "error"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "tool": {
+          "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+          "title": "Tool",
+          "type": "string"
+        },
+        "write": {
+          "title": "Write",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "at",
+        "tool",
+        "decision",
+        "status",
+        "write"
+      ],
+      "title": "BrainToolBrief",
       "type": "object"
     },
     "ClaudeBrain": {
@@ -454,6 +589,13 @@
     "Pulse": {
       "additionalProperties": false,
       "properties": {
+        "brief": {
+          "items": {
+            "$ref": "#/$defs/PulseBrief"
+          },
+          "title": "Brief",
+          "type": "array"
+        },
         "items": {
           "anyOf": [
             {
@@ -484,6 +626,47 @@
         "untold"
       ],
       "title": "Pulse",
+      "type": "object"
+    },
+    "PulseBrief": {
+      "additionalProperties": false,
+      "description": "An open pulse item on both tiers: who reported it, how urgent, when. No key or title.",
+      "properties": {
+        "source": {
+          "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+          "title": "Source",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "new",
+            "told"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        },
+        "urgency": {
+          "enum": [
+            "urgent",
+            "normal",
+            "low"
+          ],
+          "title": "Urgency",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "urgency",
+        "state",
+        "updated_at"
+      ],
+      "title": "PulseBrief",
       "type": "object"
     },
     "PulseItem": {
@@ -535,6 +718,33 @@
       "title": "PulseItem",
       "type": "object"
     },
+    "QuestionBrief": {
+      "additionalProperties": false,
+      "description": "An open worker question on both tiers: whose, how many options, when. No text.",
+      "properties": {
+        "asked_at": {
+          "format": "date-time",
+          "title": "Asked At",
+          "type": "string"
+        },
+        "options": {
+          "title": "Options",
+          "type": "integer"
+        },
+        "run_code": {
+          "pattern": "^[A-Z][0-9]{1,6}$",
+          "title": "Run Code",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_code",
+        "options",
+        "asked_at"
+      ],
+      "title": "QuestionBrief",
+      "type": "object"
+    },
     "QuestionItem": {
       "additionalProperties": false,
       "properties": {
@@ -571,6 +781,13 @@
     "Questions": {
       "additionalProperties": false,
       "properties": {
+        "brief": {
+          "items": {
+            "$ref": "#/$defs/QuestionBrief"
+          },
+          "title": "Brief",
+          "type": "array"
+        },
         "items": {
           "anyOf": [
             {
@@ -636,6 +853,90 @@
         "ci"
       ],
       "title": "RepoItem",
+      "type": "object"
+    },
+    "RunBrief": {
+      "additionalProperties": false,
+      "description": "A run on both tiers: no ask, repo, branch, note or link.",
+      "properties": {
+        "code": {
+          "pattern": "^[A-Z][0-9]{1,6}$",
+          "title": "Code",
+          "type": "string"
+        },
+        "ended_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Ended At"
+        },
+        "has_pr": {
+          "title": "Has Pr",
+          "type": "boolean"
+        },
+        "scratch": {
+          "title": "Scratch",
+          "type": "boolean"
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Started At"
+        },
+        "state": {
+          "enum": [
+            "queued",
+            "running",
+            "waiting",
+            "ready",
+            "merged",
+            "failed",
+            "cancelled",
+            "no_changes",
+            "done"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "waiting_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "usage_reset",
+                "question"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Waiting Reason"
+        }
+      },
+      "required": [
+        "code",
+        "state",
+        "scratch",
+        "has_pr",
+        "started_at",
+        "ended_at",
+        "waiting_reason"
+      ],
+      "title": "RunBrief",
       "type": "object"
     },
     "RunItem": {
@@ -789,6 +1090,11 @@
     "Runner": {
       "additionalProperties": false,
       "properties": {
+        "gaps": {
+          "default": 0,
+          "title": "Gaps",
+          "type": "integer"
+        },
         "missing": {
           "anyOf": [
             {
@@ -819,6 +1125,13 @@
     "Runs": {
       "additionalProperties": false,
       "properties": {
+        "brief": {
+          "items": {
+            "$ref": "#/$defs/RunBrief"
+          },
+          "title": "Brief",
+          "type": "array"
+        },
         "by_state": {
           "additionalProperties": {
             "type": "integer"
@@ -1002,6 +1315,11 @@
     "questions": {
       "$ref": "#/$defs/Questions"
     },
+    "repo_count": {
+      "default": 0,
+      "title": "Repo Count",
+      "type": "integer"
+    },
     "repos": {
       "anyOf": [
         {
@@ -1052,6 +1370,11 @@
       ],
       "title": "Tier",
       "type": "string"
+    },
+    "trust_rule_count": {
+      "default": 0,
+      "title": "Trust Rule Count",
+      "type": "integer"
     },
     "trust_rules": {
       "anyOf": [

@@ -81,6 +81,18 @@ def data_size(data: Any) -> int:
     return len(json.dumps(data, ensure_ascii=False, separators=(", ", ": ")).encode())
 
 
+def drop_briefs(data: dict[str, Any]) -> dict[str, Any]:
+    """``data`` without its per-item lists (each ``brief`` and ``brain_activity.recent``),
+    for a remote tier over the cap: the page still gets every count, state and health row."""
+    out = dict(data)
+    for section in ("runs", "approvals", "questions", "pulse"):
+        if isinstance(out.get(section), dict):
+            out[section] = out[section] | {"brief": []}
+    if isinstance(out.get("brain_activity"), dict):
+        out["brain_activity"] = out["brain_activity"] | {"recent": []}
+    return out
+
+
 def clear_relay_health(conn: sqlite3.Connection) -> None:
     """Drop the ``relay`` health row (the relay is off: no row, rather than a stale one)."""
     try:
@@ -161,6 +173,9 @@ class SnapshotPusher:
         except Exception as e:
             return PushOutcome(False, False, f"snapshot failed ({type(e).__name__})")
         size = data_size(data)
+        if size > MAX_BYTES:
+            data = drop_briefs(data)  # the counts and health still go out
+            size = data_size(data)
         if size > MAX_BYTES:
             return PushOutcome(False, True, f"snapshot too large ({size} > {MAX_BYTES} bytes)")
         try:

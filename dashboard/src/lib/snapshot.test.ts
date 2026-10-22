@@ -86,8 +86,23 @@ describe("forTier", () => {
     delete old.pulse.untold;
     delete old.runs.detected;
     const out = forTier(old);
-    expect(out.pulse).toEqual({ open: 3 });
+    expect(out.pulse).not.toHaveProperty("untold");
+    expect(out.pulse.open).toBe(3);
     expect(out.runs).not.toHaveProperty("detected");
+  });
+
+  it("keeps the briefs but only their known fields", () => {
+    const leaky = clone(local, { tier: "remote" });
+    (leaky.runs.brief![0] as unknown as Record<string, unknown>).ask = "leaked ask";
+    (leaky.brain_activity!.recent![0] as unknown as Record<string, unknown>).command = "git push";
+    const out = forTier(leaky);
+    expect(out.runs.brief).toHaveLength(4);
+    expect(out.runs.brief![0]).not.toHaveProperty("ask");
+    expect(out.approvals.brief).toHaveLength(1);
+    expect(out.questions.brief?.[0]?.run_code).toBe("R11");
+    expect(out.pulse.brief).toHaveLength(3);
+    expect(out.brain_activity!.recent![0]).not.toHaveProperty("command");
+    expect(JSON.stringify(out)).not.toContain("leaked ask");
   });
 
   it("leaves a local snapshot alone", () => {

@@ -7,6 +7,7 @@ Status: **implemented** (2026-10-16). The owner asked for the base dashboard (UI
 - **Push** (DB-3): with `relay.enabled`, `resonant/dashboard/pusher.py` POSTs `to_remote(snapshot)` every 60 s to the `relay_ingest(p_token, p_data)` RPC with the public anon key and the ingest token from Keychain `relay/supabase_key`. Health row `relay`. Not a custom JWT role: a random token whose SHA-256 sits in `relay_private.config`, checked by `SECURITY DEFINER` functions; the SQL also refuses any local-only field, rate-limits and keeps 7 days.
 - **Remote** (DB-4): `relay/` on one Fly machine, Python standard library only, serves the same build in Supabase mode (password + TOTP, `aal2`, owner-only RLS; TOTP is enrolled once with `supabase/enroll_mfa.mjs`, never in the UI) and runs the dead-man checker through `relay_status(token)` with its own status token: alerts to ntfy or a webhook on stale (5 min), failing and read-error incidents, once each way.
 - **Go-live** (DB-5): step 15 is the ordered owner walkthrough, ending with the freeze test. The relay supersedes `health.healthchecks_url` as the dead-man switch (kept as an option); `--check` has one advisory `dead-man switch` row. Leftovers are in [PER-263](https://linear.app/doriapp/issue/PER-263) and [`limits.md`](limits.md#relay-and-dashboard).
+- **Remote view** (R3, R5): the remote page shows what the local one does, without text: each local-only `items` list has a `brief` beside it on both tiers (runs, approvals, worker questions, pulse items), plus the brain's state, turns and last tool calls by kind (`brain_activity`), `runner.gaps`, `trust_rule_count` and `repo_count`. Each section names what stays local ("Its commands are shown on the local dashboard only."). Fields in §3, notes in `interfaces.md` (Dashboard snapshot, Briefs).
 - **MCP** (MCP-1, MCP-2): stdio and streamable-HTTP servers as extension tools ([`extensions.md`](extensions.md)), with the Linear example in `extensions/linear/` (go-live step 12, optional).
 
 ## 1. Decisions
@@ -36,15 +37,24 @@ Snapshot {
   tasks: {by_state: {state: n}}, slots: {used, max},
   runs: {by_state: {state: n}, detected: {by_kind: {kind: n}, high: n},      # detected: PER-263
          items?: [{code, state, repo, ask, branch, pr_url, pr_number,
-         started_at, ended_at, waiting_reason, last_note, detected}]},        # items: local only
-  approvals: {open: n, items?: [{code, summary, level, asked_at, expires_at, changes?}]},  # a batch is one row (PER-254)
-  questions: {open: n, items?: [{run_code, text, options, asked_at}]},
-  pulse: {open: n, untold: n, items?: [{source, key, title, urgency, state: new|told, updated_at}]},
+         started_at, ended_at, waiting_reason, last_note, detected}],         # items: local only
+         brief: [{code, state, scratch, has_pr, started_at, ended_at, waiting_reason}]},
+  approvals: {open: n, items?: [{code, summary, level, asked_at, expires_at, changes?}],  # a batch is one row (PER-254)
+              brief: [{level, effect, needs_code, asked_at, expires_at}]},             # one per row
+  questions: {open: n, items?: [{run_code, text, options, asked_at}],
+              brief: [{run_code, options: n, asked_at}]},
+  pulse: {open: n, untold: n, items?: [{source, key, title, urgency, state: new|told, updated_at}],
+          brief: [{source, urgency, state, updated_at}]},
   extensions: [{name, status, health, muted_until, jobs: [{id, next_due, last_run_at, last_outcome, fail_streak}]}],
-  runner: {set_up: bool, missing?: [str]},
-  trust_rules?: [{n, text}], repos?: [{name, mode, base, ci}]                   # local only
+  runner: {set_up: bool, missing?: [str], gaps: n},
+  brain_activity: {calls_today, writes_today, state, turns,
+                   recent: [{at, tool, decision, status, write}]},
+  trust_rules?: [{n, text}], repos?: [{name, mode, base, ci}],                  # local only
+  trust_rule_count: n, repo_count: n
 }
 ```
+
+Every `items` list is local only; the `brief` beside it is on both tiers: one row per item with its code, kind, state and times and none of its text, so the remote page lists runs, approvals, questions, pulse items and the brain's last tool calls too. An approval's code is not in its brief (the owner types it to say yes).
 
 Field names may be adjusted by DB-1 with the UI ticket told; `remote` never gains a text field without a plan change. DB-1 changed: `pulse.items[]` gained `source` and `state` is `new|told`; `repos[].protected` became `ci` (protection isn't stored, only a GitHub call knows it); `extensions[].status` is `enabled|disabled|disabled_tampered`; `approvals.items[].code` may be null; `started_at` is never null. The UI's types and fixtures follow, and a Python test validates the fixtures against the models. The exact shape is `docs/snapshot.schema.json`; the field notes are in `interfaces.md` (Dashboard snapshot).
 

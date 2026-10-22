@@ -43,7 +43,27 @@ export function Pulse({ snap, now }: { snap: Snapshot; now: number }) {
         </p>
       )}
       {sorted === undefined ? (
-        snap.pulse.open === 0 && !untold ? <Empty>All quiet.</Empty> : <LocalOnly what="Pulse titles" />
+        snap.pulse.brief !== undefined && snap.pulse.brief.length > 0 ? (
+          <div className="space-y-3">
+            <Rows>
+              {snap.pulse.brief.map((p, i) => (
+                <Row key={`${p.source}-${p.updated_at}-${i}`} className="flex items-start justify-between gap-3">
+                  <Meta>
+                    <span className="font-mono">{p.source}</span>
+                    {p.state === "new" && <span>new</span>}
+                    <Ago iso={p.updated_at} now={now} prefix="updated " />
+                  </Meta>
+                  <StateBadge tone={urgencyTone(p.urgency)}>{p.urgency}</StateBadge>
+                </Row>
+              ))}
+            </Rows>
+            <LocalOnly what="Pulse titles" />
+          </div>
+        ) : snap.pulse.open === 0 && !untold ? (
+          <Empty>All quiet.</Empty>
+        ) : (
+          <LocalOnly what="Pulse titles" />
+        )
       ) : sorted.length === 0 ? (
         <Empty>All quiet.</Empty>
       ) : (

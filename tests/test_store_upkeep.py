@@ -32,6 +32,7 @@ from resonant.store.db import (
     migrate,
     open_db,
     schema_version,
+    utcnow,
 )
 
 # 03:30 PDT on Wednesday 2026-10-21 is 10:30 UTC; the prune runs at 04:00 PDT.
@@ -493,7 +494,9 @@ async def test_the_job_is_off_when_retention_is_disabled(resonant_home: Path) ->
 async def test_the_scheduler_runs_it_as_core_prune(resonant_home: Path) -> None:
     async with harness(resonant_home) as h:
         event(h.db, "e-old")
-        good_backup(h.db, 1)
+        # The scheduler builds the job without this test's clock, so the job reads the backup's
+        # age against the real clock: stamp it from that, not from NOW (else it goes stale).
+        kv_set(h.db, "backup.last_ok", {"at": iso(utcnow() - timedelta(hours=1)), "file": "f"})
         kv_set(h.db, "paused", False)
         due = datetime(2026, 10, 21, 11, 0, tzinfo=UTC)  # 04:00 PDT
         s = Scheduler.from_components(

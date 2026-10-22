@@ -12,7 +12,7 @@ import { healthTone } from "@/lib/tone";
 import { Claude } from "@/sections/Claude";
 import { Extensions } from "@/sections/Extensions";
 import { Pulse } from "@/sections/Pulse";
-import { Rules } from "@/sections/Rules";
+import { Rules, RulesCount } from "@/sections/Rules";
 import { SystemStatus } from "@/sections/SystemStatus";
 import { WaitingOnYou } from "@/sections/WaitingOnYou";
 import { ActiveRuns, ActiveTasks, RunsAndTasks, Slots } from "@/sections/Work";
@@ -101,8 +101,10 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
               {guard(<Claude snap={snap} now={now} />)}
               {guard(<Extensions snap={snap} now={now} />)}
               {guard(<Pulse snap={snap} now={now} />)}
-              {/* Rules and repos exist only in the local tier. */}
-              {snap.tier === "local" && guard(<Rules rules={snap.trust_rules ?? []} repos={snap.repos ?? []} />)}
+              {/* The rules and repos themselves exist only in the local tier; the remote one counts them. */}
+              {snap.tier === "local"
+                ? guard(<Rules rules={snap.trust_rules ?? []} repos={snap.repos ?? []} />)
+                : snap.trust_rule_count !== undefined && guard(<RulesCount snap={snap} />)}
             </div>
           </div>
         )}

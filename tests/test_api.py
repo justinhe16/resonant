@@ -225,7 +225,7 @@ async def test_a_failing_runner_check_doesnt_break_the_dashboard(
         first = await client.get("/api/dashboard")
         second = await client.get("/api/dashboard")
     assert first.status_code == 200 and second.status_code == 200
-    assert first.json()["runner"] == {"set_up": False, "missing": [RUNNER_CHECK_FAILED]}
+    assert first.json()["runner"] == {"set_up": False, "missing": [RUNNER_CHECK_FAILED], "gaps": 1}
     assert boom.calls == 1  # cached like a successful check
 
 
