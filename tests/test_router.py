@@ -283,7 +283,7 @@ def test_match_fast_path(text: str, command: str) -> None:
         "what's the status of the dori deploy",
         "status of my tasks please",
         "ping me tomorrow",
-        # Plain words go through an intent (the labeler), not a keyword.
+        # Plain words go to the brain (triage), not a keyword.
         "what's running?",
         f"What{CURLY}s  running",
         "how's the mini",

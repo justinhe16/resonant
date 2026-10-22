@@ -290,6 +290,8 @@ NUMBER_FALLBACK = "I couldn't check that just now."
 CLAIM_FALLBACK = "I didn't save that; nothing changed."
 ALLOW_FALLBACK = "I didn't save that; nothing changed."
 CALL_FALLBACK = "I couldn't do that just now; nothing changed."
+# When a change ran or waits on the owner, its code-built report lines follow this.
+ACTED_FALLBACK = "I couldn't check the rest of my answer just now."
 FALLBACKS: dict[str, str] = {
     "numbers": NUMBER_FALLBACK,
     "claim": CLAIM_FALLBACK,
@@ -299,12 +301,24 @@ FALLBACKS: dict[str, str] = {
 NUMBERS_SHOWN = 6
 
 
+NO_REPEAT = " Don't repeat a change that already ran."
+
+
 def redo(problem: Problem) -> str:
     """The message for the redo turn: Resonant's own words, never the owner's."""
     if problem.kind == "numbers":
         shown = ", ".join(problem.numbers[:NUMBERS_SHOWN])
-        return NUMBER_REDO.format(numbers=shown)
-    return {"claim": CLAIM_REDO, "allow": ALLOW_REDO, "call": CALL_REDO}[problem.kind]
+        return NUMBER_REDO.format(numbers=shown) + NO_REPEAT
+    return {"claim": CLAIM_REDO, "allow": ALLOW_REDO, "call": CALL_REDO}[problem.kind] + NO_REPEAT
+
+
+def fallback(problem: Problem, *, changed: bool) -> str:
+    """The code-built text that goes out instead of a reply the guard stopped twice (or once,
+    when a change ran or waits: no redo then). ``changed``: report lines follow it, so it
+    never says "nothing changed"."""
+    if changed:
+        return NUMBER_FALLBACK if problem.kind == "numbers" else ACTED_FALLBACK
+    return FALLBACKS[problem.kind]
 
 
 def check(
@@ -345,6 +359,7 @@ def span_fields(problem: Problem | None) -> dict[str, Any]:
 
 
 __all__ = [
+    "ACTED_FALLBACK",
     "ALLOW_FALLBACK",
     "ALLOW_REDO",
     "CALL_FALLBACK",
@@ -362,6 +377,7 @@ __all__ = [
     "claims_allow",
     "claims_change",
     "claims_done",
+    "fallback",
     "is_call_text",
     "numbers_in",
     "redo",

@@ -1616,7 +1616,10 @@ class AskRunner:
         log.info("claude brain turn", extra={"task": task.id, **seen, "tainted": hops is not None})
         outcome = self._turn_outcome(out, bridge)
         if flagged is not None:  # the redo failed too: a short code-built fallback
-            outcome = ("guarded", guard.FALLBACKS[flagged.kind], out.result)
+            text = guard.fallback(flagged, changed=self._acted(bridge))
+            # A change waiting on the owner keeps its prompt: the fallback stands in for the
+            # answer, and the yes/no still follows it.
+            outcome = ("answered" if bridge.asked else "guarded", text, out.result)
         elif (
             outcome[0] in DOWN
             and bridge.changes == 0
@@ -1643,10 +1646,11 @@ class AskRunner:
         """PER-256: check Claude's answer (``brain.guard.check``) before anything is sent. A
         problem sends the turn back once with a message that says why (the sources add up
         across it); a second problem is returned for the caller's code-built fallback. A
-        turn with a change waiting on the owner (``bridge.asked``) is its own record and
-        passes. Spans carry kinds and counts only."""
+        turn that ran a change, or has one waiting on the owner, is still checked but never
+        redone (a redo could repeat the change): a problem there goes straight to the
+        fallback, with the report lines. Spans carry kinds and counts only."""
         redone = False
-        while out.status == "answered" and not bridge.asked:
+        while out.status == "answered":
             outcome = self._turn_outcome(out, bridge)
             if outcome[0] != "answered":
                 break
@@ -1672,11 +1676,18 @@ class AskRunner:
                 pass
             if problem is None:
                 return out, None
-            if redone:
+            if redone or self._acted(bridge):
+                # A change ran or waits on the owner: a redo could repeat it, so the
+                # code-built fallback goes out with the report lines instead.
                 return out, problem
             redone = True
             out = await run(guard.redo(problem))
         return out, None
+
+    @staticmethod
+    def _acted(bridge: ClaudeTools) -> bool:
+        """The turn ran a change or one waits on the owner (no redo then)."""
+        return bool(bridge.reports or bridge.progress or bridge.changes or bridge.asked)
 
     def _sources(
         self,

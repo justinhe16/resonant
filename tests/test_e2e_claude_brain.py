@@ -446,7 +446,8 @@ async def test_a_news_reply_that_names_an_untold_run_tells_it(
     from resonant.store import runs
 
     async with start(resonant_home, chat, tmp_path) as w:
-        message(w.conn, "earlier", reply="ok", at=utcnow() - timedelta(minutes=30))
+        # no task: a queued one with a saved reply would be resent and race the reply below
+        message(w.conn, "earlier", at=utcnow() - timedelta(minutes=30), task=False)
         run = runs.create(w.conn, repo="mycelium", ask="x", principal="justin", session_id="s",
                           max_seconds=60)  # fmt: skip
         runs.update(w.conn, run.code, status="running")

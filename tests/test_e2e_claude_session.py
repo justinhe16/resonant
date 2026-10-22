@@ -1,6 +1,6 @@
 """BR-11: the Claude brain, one long-lived Claude session for the owner's hard texts, end to end.
 
-The whole daemon in process (``brain.mode: loop``, ``brain.route: triage``, the default
+The whole daemon in process (``brain.route: triage``, the default
 ``brain.claude_session``): chat.db is a FakeChatDB, osascript a RecordingOsaRunner (every
 text, notices included, goes through the real channel to it; nothing reaches Messages), the
 local model a ScriptedModel, and the Claude session ``resonant/e2e/fake_claude.py`` in its

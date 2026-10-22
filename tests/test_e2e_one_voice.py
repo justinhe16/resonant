@@ -339,6 +339,42 @@ async def test_a_redo_that_really_makes_the_change_is_sent_with_its_report(
         assert texts == ['Saved it.\nSaved note 1: "buy oat milk"']
 
 
+async def test_an_unsourced_number_after_a_change_is_never_redone(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Review of #139: a redo could repeat the change. A turn that ran one goes straight to
+    the fallback, with the report line, and the note is saved once."""
+    async with start(resonant_home, chat, tmp_path) as w:
+        texts = await ask_claude(
+            w,
+            "add a note: buy oat milk",
+            calls=[{"name": "add_note", "args": {"text": "buy oat milk"}}],
+            answer="Saved. You now have 4817 notes.",
+        )
+        assert len(w.session()["messages"]) == 1  # no redo
+        assert texts == [f'{guard.NUMBER_FALLBACK}\nSaved note 1: "buy oat milk"']
+        assert len(w.executions("add_note")) == 1
+
+
+async def test_the_guard_still_checks_a_turn_that_waits_on_the_owner(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """Review of #139: a change waiting on a yes no longer waives the number check; the
+    invented figure never goes out, there is no redo (it could ask twice), and the approval
+    prompt still follows the fallback."""
+    async with start(resonant_home, chat, tmp_path) as w:
+        w.model.triage = CLAUDE
+        w.claude(
+            calls=[{"name": "allow_tools", "args": {"tools": ["create_watch"]}}],
+            answer="Asked you. That saves you 4817 prompts a week.",
+        )
+        answer, prompt = await w.say("don't ask me before creating watches", replies=2)
+        assert answer == guard.NUMBER_FALLBACK and "create_watch" in prompt  # the yes/no stays
+        assert all("4817" not in m.text for m in w.osa.sent)
+        assert len(w.session()["messages"]) == 1
+        assert w.executions("allow_tools") == []
+
+
 async def test_a_literal_tool_call_reply_is_never_sent(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
@@ -440,6 +476,17 @@ def test_a_rejected_rate_limit_event_sets_the_limit_before_the_next_turn_hits_it
     session.note_rate_limit(event("rejected", int(utcnow().timestamp()) - 5))  # already past
     assert kv_get(db, LIMIT_KV) == iso(until)
     kv_set(db, LIMIT_KV, None)
+
+
+def test_the_fallback_never_says_nothing_changed_when_something_did() -> None:
+    for kind in ("claim", "allow", "call"):
+        assert "nothing changed" in guard.fallback(guard.Problem(kind), changed=False)
+        assert "nothing changed" not in guard.fallback(guard.Problem(kind), changed=True)
+    numbers = guard.Problem("numbers", ("4817",))
+    assert guard.fallback(numbers, changed=True) == guard.NUMBER_FALLBACK
+    assert "Don't repeat" in guard.redo(numbers) and "Don't repeat" in guard.redo(
+        guard.Problem("claim")
+    )
 
 
 def test_the_guard_checks_in_order() -> None:

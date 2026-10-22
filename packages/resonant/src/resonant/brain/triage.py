@@ -145,6 +145,13 @@ _STATE_WORDS = re.compile(
 CANNED_SMALL_TALK = {"greeting": "Hey!", "ack": "\U0001f44d"}
 
 
+# "Sure, I'll look into it": a promise of work nobody will do (the turn ends here).
+_PROMISE = re.compile(
+    r"\b(?:I'?ll|I will|I'm going to|let me|look(?:ing)? into|check(?:ing)?|on it|working)\b",
+    re.IGNORECASE,
+)
+
+
 def clean_small_talk(raw: str, message_type: str) -> str:
     """The reply to a greeting or an ack: the model's line when it is one short line with no
     digit, question, link or claim of a change, else a canned one. Never a fact."""
@@ -154,6 +161,7 @@ def clean_small_talk(raw: str, message_type: str) -> str:
         and len(text) <= SMALL_TALK_REPLY_CHARS
         and not claims_change(text)
         and _STATE_WORDS.search(text) is None
+        and _PROMISE.search(text) is None
     ):
         return text
     return CANNED_SMALL_TALK.get(message_type, CANNED_SMALL_TALK["ack"])
@@ -219,6 +227,39 @@ _QUESTION_WORD = re.compile(
 )
 
 
+def _squash(word: str) -> str:
+    """``heyy`` -> ``hey``, ``thx`` stays: runs of a letter fold to one (on both sides)."""
+    return re.sub(r"(.)\1+", r"\1", word.lower().replace("'", ""))
+
+
+def _vocab(words: str) -> frozenset[str]:
+    return frozenset(_squash(w) for w in words.split())
+
+
+# Every word of a greeting or an ack is one of these (emoji and punctuation aside): "thanks,
+# remind me later" or "ok but that's wrong" is a request or a correction, Claude's.
+_SMALL_TALK_VOCAB = _vocab(
+    "hi hey hello yo sup hiya howdy morning good gm gn night evening afternoon thanks thank "
+    "you thx ty tysm ok okay k kk cool nice great awesome perfect got it lol haha lmao love "
+    "appreciate appreciated cheers np no worries sweet work job well done ah oh wow neat noted "
+    "sure yep yes ya yeah yup alright right fair enough amazing much so very a lot all there "
+    "again back u man dude friend buddy everyone guys"
+)
+# Every word of a plain "what's new" is one of these: "anything new with my flight?" has a
+# topic, so it is Claude's.
+_NEWS_VOCAB = _vocab(
+    "ok okay so hey hi any anything is are there new news update updates for me i need to do "
+    "address handle approve perms perm permissions approvals approval asks open left or and "
+    "else what whats did miss missed catch up you u from today rn now the my action items "
+    "should know"
+)
+_WORD = re.compile(r"[A-Za-z']+")
+
+
+def _only_words(text: str, vocab: frozenset[str]) -> bool:
+    return all(_squash(w) in vocab for w in _WORD.findall(text))
+
+
 def is_small_talk(text: str) -> bool:
     """Short enough to be only a greeting or an ack: a few words, no digit (a code, a number,
     a ticket), nothing asked, and not an order ("ok merge it")."""
@@ -230,6 +271,7 @@ def is_small_talk(text: str) -> bool:
         and re.search(r"\d", body) is None
         and not asks_change(body)
         and _QUESTION_WORD.match(body) is None
+        and _only_words(body, _SMALL_TALK_VOCAB)
     )
 
 
@@ -255,6 +297,7 @@ def is_plain_news_check(text: str) -> bool:
         0 < len(body) <= NEWS_MAX_CHARS
         and _NEWS.search(body) is not None
         and _TOPIC.search(body) is None
+        and _only_words(body, _NEWS_VOCAB)
     )
 
 

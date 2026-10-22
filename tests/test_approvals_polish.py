@@ -283,6 +283,8 @@ def test_only_the_ask_runners_answers_are_claude_sends() -> None:
     other text are not; the ask runner's other texts (limit notices) fail closed."""
     assert outbound.is_claude_send("ask:t1")
     assert outbound.is_claude_send("ask:limit:2026-10-22T22:00:00+00:00")  # fails closed
+    assert outbound.is_claude_send("ask:down:t1")  # Claude-down and cap notices count too
+    assert outbound.is_claude_send("ask:cap:2026-10-22")
     assert not outbound.is_claude_send("ask:ack:t1")
     assert not outbound.is_claude_send("reply:t1")
     assert not outbound.is_claude_send("approval:a7:prompt:justin")
