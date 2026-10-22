@@ -1,3 +1,5 @@
+> **Superseded in part by PER-256** (2026-10-22): the labeler, the intents and their toolsets described here are deleted; the local model only routes and Claude calls the tools. See [`brain-plan.md`](brain-plan.md#per-256-qwen-only-routes-claude-is-the-one-brain-2026-10-22).
+
 # Phase 3 plan (v2): first-party extensions, scheduled jobs, secrets, the daily briefing
 
 Status: **implemented** (P3-1 to P3-16, 2026-10-14). The live checks are [`go-live.md`](go-live.md#12-phase-3-extensions-jobs-and-the-briefing) step 12; what was deferred is in [`followups.md`](followups.md). This is v2 of the plan, after the architecture and security reviews and the owner's decisions. Scope: the extension manager from [`architecture.md`](architecture.md#components), cut down to **first-party, owner-installed** extensions: CLI tools, scheduled jobs and notifications. Also in scope:

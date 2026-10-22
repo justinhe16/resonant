@@ -1,7 +1,7 @@
 """The router's approval inbox: text replies to approval prompts, and ``/approvals``.
 
 ``ApprovalInbox.handle(event, text, principal)`` runs after slash commands (so ``/kill`` is
-never read as a reply) and before keywords and the labeler:
+never read as a reply) and before keywords and the brain:
 
 1. ``parse_reply(text, truncated=payload.truncated)``. Text that doesn't parse returns None
    and routes normally; it is never swallowed.

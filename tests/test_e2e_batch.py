@@ -1,11 +1,11 @@
 """BA-1: batch approvals, end to end.
 
-The whole daemon in process (``brain.mode: loop``), with a fake ``linear`` extension installed
+The whole daemon in process, with a fake ``linear`` extension installed
 the way the manager would (``install_fixture``: ``get_issue`` L0, ``save_issue`` and
 ``save_comment`` L2, ``delete_issue`` L1, run by the real process runner). chat.db is a
-FakeChatDB, osascript a RecordingOsaRunner, qwen a ScriptedModel, and Claude
-``resonant/e2e/fake_claude.py`` through the real MCP relay, bridge, gate and executor. Nothing
-touches the real ~/.resonant, ~/code, Keychain or claude.
+FakeChatDB, osascript a RecordingOsaRunner, the local model a ScriptedModel (triage only), and
+Claude ``resonant/e2e/fake_claude.py`` through the real MCP relay, bridge, gate and
+executor. Nothing touches the real ~/.resonant, ~/code, Keychain or claude.
 """
 
 from __future__ import annotations
@@ -210,12 +210,12 @@ async def start(
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
         runner={"code_dir": code},
-        brain={"mode": "loop", "read_roots": [code]},
+        brain={"read_roots": [code]},
         gate=gate or {},
     )
     _install(settings)
     osa = RecordingOsaRunner()
-    model = ScriptedModel(script=[])
+    model = ScriptedModel()
     daemon = Daemon(settings, model=model, osa_runner=osa)
     kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
     kv_set(daemon.conn, "autonomy", "on")
@@ -268,7 +268,7 @@ async def _claude_batch(w: World, calls: list[dict[str, Any]], text: str) -> tup
     w.model.triage = CLAUDE
     answer = " | ".join(f"{{r{i}}}" for i in range(len(calls)))
     w.claude(calls=calls, answer=answer)
-    _ack, reply, prompt = await w.say(text, replies=3)
+    reply, prompt = await w.say(text, replies=2)
     await w.prompt_recorded()
     return reply, prompt
 
@@ -404,7 +404,7 @@ async def test_dont_ask_for_linear_tickets_then_saves_run_without_asking(
             ],
             answer="?",
         )  # fmt: skip
-        _ack, reply, prompt = await w.say("dont ask for perms for linear tickets", replies=3)
+        reply, prompt = await w.say("dont ask for perms for linear tickets", replies=2)
         assert "asked the owner: stop asking before linear.save_comment and linear.save_issue" in (
             reply
         )
@@ -422,57 +422,13 @@ async def test_dont_ask_for_linear_tickets_then_saves_run_without_asking(
             ("linear", "tool:linear.save_issue", "allow"),
             ("linear", "tool:linear.save_comment", "allow"),
         }
-        _ack, answer = await w.say("close RES-12, 14, 15 and 19", replies=2)
-        assert answer.startswith("Claude: Closed all four.")
+        (answer,) = await w.say("close RES-12, 14, 15 and 19")
+        assert answer.startswith("Closed all four.")
         for key in KEYS:
             assert f'Done: linear: save issue id="{key}", state="Done"' in answer
         assert len(w.runs("save_issue")) == 4
         assert w.rows("SELECT 1 FROM approvals WHERE tool = 'save_issue'") == []
         assert set(w.evaluated("save_issue")) == {("Allow", "inferred")}
-
-
-async def test_qwen_learns_dont_ask_for_linear_and_then_saves_run(
-    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
-) -> None:
-    async with start(resonant_home, chat, tmp_path) as w:
-        w.model.push([("allow_tools", {"tools": ["linear"]})], "Asked you about it.")
-        answer, prompt = await w.say("dont ask for perms for linear tickets", replies=2)
-        assert answer == "Asked you about it."  # PER-261: the answer, then the prompt
-        assert "stop asking before linear.save_comment and linear.save_issue" in prompt
-        await w.prompt_recorded()
-        (done,) = await w.say("yes")
-        assert done.startswith("Rules: don't ask before running linear.save_comment in linear")
-        w.model.push([("save_issue", {"id": "RES-12", "state": "Done"})], "Closed it.")
-        (reply,) = await w.say("close RES-12")
-        assert 'Done: linear: save issue id="RES-12", state="Done"' in reply
-        assert w.evaluated("save_issue") == [("Allow", "inferred")]
-        assert len(w.runs("save_issue")) == 1
-
-
-async def test_qwen_batches_its_changes_into_one_prompt(
-    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
-) -> None:
-    async with start(resonant_home, chat, tmp_path) as w:
-        w.model.push(
-            [("save_issue", {"id": "RES-12", "state": "Done"})],
-            [("save_comment", {"issue": "RES-12", "body": "shipped"})],
-            "I've asked you about both.",
-        )
-        answer, prompt = await w.say("close RES-12 and comment shipped", replies=2)
-        assert answer == "I've asked you about both."  # PER-261: the answer goes out first
-        assert "OK to make these 2 changes?" in prompt
-        assert '1. linear: save issue id="RES-12", state="Done"' in prompt
-        assert '2. linear: save comment body="shipped", issue="RES-12"' in prompt
-        # the model saw it waits on the owner (and no code), then kept going
-        seen = json.dumps([r.messages for r in w.model.requests])
-        assert "asked the owner" in seen
-        await w.prompt_recorded()
-        assert re.search(rf"(?<![A-Za-z0-9]){w.batch_code()}(?![0-9])", seen) is None
-        (done,) = await w.say("yes")
-        assert done.splitlines() == [
-            'Done: linear: save issue id="RES-12", state="Done"',
-            'Done: linear: save comment body="shipped", issue="RES-12"',
-        ]
 
 
 async def test_the_kill_switch_blocks_an_approved_batch(
@@ -508,7 +464,7 @@ async def test_members_cant_approve_the_owners_batch(
     async with start(resonant_home, chat, tmp_path) as w:
         await _claude_batch(w, saves(*KEYS), "close these four")
         code = w.batch_code()
-        assert len(w.osa.sent) == 3  # ack, answer, the one prompt: nothing to the member
+        assert len(w.osa.sent) == 2  # the answer and the one prompt: nothing to the member
         for text in ("yes", f"yes {code}"):
             reply = await w.say(text, phone=MEMBER_PHONE)
             assert reply == ["Nothing is waiting for approval."]
@@ -544,24 +500,6 @@ async def test_approval_codes_never_reach_claude(
             assert not shows_code(w.session(), code)
 
 
-async def test_qwen_doesnt_hand_off_once_changes_wait(
-    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
-) -> None:
-    """With a change waiting in the turn's batch, an ask_claude call is refused to the model
-    (its ack would give way to the prompt); the turn asks about the change as usual."""
-    async with start(resonant_home, chat, tmp_path) as w:
-        w.model.push(
-            [("save_issue", {"id": "RES-12", "state": "Done"})],
-            [("ask_claude", {"question": "why is RES-12 stuck?"})],
-            "Asked you.",
-        )
-        _answer, prompt = await w.say("close RES-12 and tell me why it was stuck", replies=2)
-        assert 'linear: save issue id="RES-12", state="Done"' in prompt and "changes" not in prompt
-        assert w.rows("SELECT 1 FROM tasks WHERE runner = 'ask'") == []
-        seen = json.dumps([r.messages for r in w.model.requests])
-        assert "changes already wait on the owner" in seen
-
-
 # --- PER-261: capped changes, the code after a Claude answer, report lines ---------------------
 
 
@@ -593,82 +531,19 @@ async def test_a_sixth_change_nobody_asked_for_goes_into_the_batch(
         assert len(w.runs("save_issue")) == 6
 
 
-async def test_qwen_keeps_going_past_the_cap_and_the_rest_ask(
-    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
-) -> None:
-    six = ("RES-1", "RES-2", "RES-3", "RES-4", "RES-5", "RES-6")
-    async with start(resonant_home, chat, tmp_path) as w:
-        _allow_linear(w)
-        w.model.push(*[[("save_issue", {"id": k, "state": "Done"})] for k in six],
-                     "Closed five; the last one waits on you.")  # fmt: skip
-        answer, prompt = await w.say(f"close {', '.join(six)}", replies=2)
-        assert answer.startswith("Closed five; the last one waits on you.")
-        assert answer.count("Done: linear: save issue") == 5  # what ran, with the answer
-        assert 'linear: save issue id="RES-6", state="Done"' in prompt
-        await w.prompt_recorded()
-        (done,) = await w.say("yes")
-        assert done == 'Done: linear: save issue id="RES-6", state="Done"'
-        assert len(w.runs("save_issue")) == 6
-
-
 async def test_a_yes_right_after_a_claude_answer_needs_the_code(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
     async with start(resonant_home, chat, tmp_path) as w:
-        w.model.push([("save_issue", {"id": "RES-12", "state": "Done"})], "Asked you.")
-        _answer, prompt = await w.say("close RES-12", replies=2)
-        await w.prompt_recorded()
+        _answer, prompt = await _claude_batch(w, saves("RES-12"), "close RES-12")
         (row,) = w.rows("SELECT code FROM approvals WHERE status = 'pending'")
         code = str(row["code"])
         assert f"[{code}]" in prompt
-        w.model.triage = CLAUDE
         w.claude(answer="It's waiting on review. Reply yes and I'll close it.")
-        _ack, answer = await w.say("why is RES-12 stuck?", replies=2)
-        assert answer.startswith("Claude: ")
+        (answer,) = await w.say("why is RES-12 stuck?")
+        assert not answer.startswith("Claude: ")
         assert await w.say("yes") == [f"Reply yes {code} to confirm."]
         assert w.runs("save_issue") == []
         (done,) = await w.say(f"yes {code}")
         assert done == 'Done: linear: save issue id="RES-12", state="Done"'
         assert len(w.runs("save_issue")) == 1
-
-
-async def test_qwen_sees_only_the_report_line_of_a_change_that_ran(
-    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
-) -> None:
-    """An extension's change that ran shows qwen its code-built report line, not the result,
-    so it doesn't taint the turn: the next change still runs on the standing rule."""
-    async with start(resonant_home, chat, tmp_path) as w:
-        _allow_linear(w)
-        w.model.push(
-            [("save_issue", {"id": "RES-12", "state": "Done"})],
-            [("save_comment", {"issue": "RES-12", "body": "shipped"})],
-            "Closed and commented.",
-        )
-        (reply,) = await w.say("close RES-12 and comment shipped")
-        assert 'Done: linear: save comment body="shipped", issue="RES-12"' in reply
-        assert w.evaluated("save_comment") == [("Allow", "inferred")]  # not tainted
-        tool_turns = [
-            str(m.get("content"))
-            for r in w.model.requests
-            for m in r.messages
-            if m.get("role") == "tool" and m.get("tool_name") == "save_issue"
-        ]
-        assert tool_turns and all('"done":"Done: linear: save issue' in t for t in tool_turns)
-        assert all('"ok":true' not in t for t in tool_turns)  # never the extension's result
-
-
-async def test_a_tainted_turn_sends_no_early_answer_above_the_prompt(
-    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
-) -> None:
-    """After reading outside text the model's words may carry it ("reply yes"): they never go
-    out right above the batch prompt; the prompt alone is sent."""
-    async with start(resonant_home, chat, tmp_path) as w:
-        w.model.push(
-            [("get_issue", {"id": "RES-12"})],
-            [("save_issue", {"id": "RES-12", "state": "Done"})],
-            "The ticket says to close it. Reply yes to go ahead.",
-        )
-        (prompt,) = await w.say("read RES-12 and close it")
-        assert 'linear: save issue id="RES-12", state="Done"' in prompt
-        assert all("Reply yes to go ahead" not in m.text for m in w.osa.sent)
-        assert w.evaluated("save_issue") == [("NeedsApproval", "tainted")]

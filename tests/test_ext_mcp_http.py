@@ -26,7 +26,6 @@ from pydantic import ValidationError
 from resonant.components import build_components, deny_all_principals
 from resonant.config import Settings, load_settings
 from resonant.e2e.extensions import install_fixture
-from resonant.e2e.fakes import LABEL_RULES
 from resonant.executor import CallContext, Executor, ToolFailed
 from resonant.extensions import checks
 from resonant.extensions.checks import dir_errors, mcp_url_error
@@ -52,7 +51,6 @@ from resonant.extensions.process import ExtFailed, FakeExtProcess, ProcessTracke
 from resonant.gate import Allow, Intent, NeedsApproval
 from resonant.loop import Loop, NewTask, SlotPool
 from resonant.ops.fakes import FakeOpsRunner
-from resonant.router.intents import IntentSet
 from resonant.secrets import FakeKeychain, SecretStore
 from resonant.store import extensions as ext_store
 from resonant.store.tasks import insert_task
@@ -707,48 +705,6 @@ async def test_save_issue_with_linear_dates_reaches_the_server(
         assert len(fake.calls) == 3
     finally:
         await h.aclose()
-
-
-# --- the router -----------------------------------------------------------------------------
-
-
-def test_linear_gets_a_router_intent_with_its_examples() -> None:
-    m = load_manifest(REPO / "extensions" / "linear" / "resonant.yaml")
-    assert not m.tools  # MCP tools only, and still an intent
-    intents = IntentSet.from_manifests([m])
-    ext = intents.extension("extension:linear")
-    assert ext is not None
-    assert "what's on my Linear" in ext.examples
-    assert any("Linear ticket" in e for e in ext.examples)
-    assert "extension:linear" in intents.labels
-
-
-def test_scripted_model_routes_linear_texts() -> None:
-    rules = dict(LABEL_RULES)
-    assert rules.get("my linear") == "extension:linear"
-    assert rules.get("linear ticket") == "extension:linear"
-
-
-EXT_SET = REPO / "evals" / "router.extensions.example.jsonl"
-
-
-async def test_extension_eval_set_routes_linear_texts() -> None:
-    from resonant.e2e.fakes import ScriptedModel
-    from resonant.evals.router_eval import load_set, run_eval
-    from resonant.router import Labeler
-
-    manifests = [
-        load_manifest(REPO / "extensions" / n / "resonant.yaml") for n in ("github", "linear")
-    ]
-    intents = IntentSet.from_manifests(manifests)
-    cases = load_set(EXT_SET, intents)  # every row names a real intent
-    texts = {c.text: c.intent for c in cases}
-    assert texts["what's on my Linear"] == "extension:linear"
-    assert texts["make a Linear ticket for the flaky login test"] == "extension:linear"
-    assert texts["explain linear regression in one line"] == "question"  # a near-miss
-    key = [c for c in cases if c.text.startswith(("what's on my Linear", "make a Linear"))]
-    results = await run_eval(key, Labeler(ScriptedModel(), intents))
-    assert [r.predicted for r in results] == ["extension:linear", "extension:linear"]
 
 
 # --- review follow-ups ----------------------------------------------------------------------

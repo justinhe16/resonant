@@ -26,13 +26,11 @@ from resonant.config import ModelConfig, Settings, load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.e2e.bench import report, run_e2e_bench
-from resonant.e2e.fakes import DEFAULT_FINAL_REPLY
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop.echo import EchoRunner
-from resonant.runners.local import MAX_TOOL_ITERATIONS
 from resonant.store.db import iso, kv_set, utcnow
 from resonant.tools.ops import RESTART_OLLAMA, UPDATE_RESONANT
-from resonant.wiring import local_step_limit
+from resonant.wiring import brain_step_limit, local_step_limit
 
 OWNER_PHONE = "+15551234567"
 STRANGER = "+15559999999"
@@ -106,7 +104,6 @@ async def running(resonant_home: Path, chat: FakeChatDB) -> AsyncIterator[Runnin
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
-        brain={"mode": "intents"},  # these tests script the labeler (loop is the default)
     )
     osa, model = RecordingOsaRunner(), ScriptedModel()
     daemon = Daemon(settings, model=model, osa_runner=osa)
@@ -173,7 +170,7 @@ async def test_enabled_daemon_wires_router_runner_and_monitor(running: Running) 
     assert d.state.components is not None
     assert d.state.components.runners["local"] is d.imessage.runner
     specs = d.state.components.registry.specs()
-    assert d.imessage.runner.max_step_s == local_step_limit(d.settings.model, specs)
+    assert d.imessage.runner.max_step_s == local_step_limit(specs)
     # /update (the longest tool) is never cancelled mid-run.
     limit = d.imessage.runner.max_step_s
     assert limit is not None and limit >= UPDATE_RESONANT.timeout_s + 15
@@ -183,20 +180,14 @@ async def test_enabled_daemon_wires_router_runner_and_monitor(running: Running) 
     assert channels[0]["enabled"] is True and channels[0]["ok"] is True
 
 
-def test_step_limit_outlasts_every_model_call() -> None:
-    cfg = ModelConfig(timeout_s=60)
-    assert local_step_limit(cfg) > (MAX_TOOL_ITERATIONS + 1) * cfg.timeout_s
-    assert local_step_limit(ModelConfig(timeout_s=5)) < local_step_limit(cfg)
-
-
 def test_step_limit_outlasts_the_longest_tool() -> None:
-    short = ModelConfig(timeout_s=5)
-    assert local_step_limit(short, [UPDATE_RESONANT, RESTART_OLLAMA]) == (
-        UPDATE_RESONANT.timeout_s + 15
-    )
-    # The model-based limit wins when it is longer.
-    long = ModelConfig(timeout_s=120)
-    assert local_step_limit(long, [UPDATE_RESONANT]) == (MAX_TOOL_ITERATIONS + 1) * 120 + 15
+    assert local_step_limit([UPDATE_RESONANT, RESTART_OLLAMA]) == UPDATE_RESONANT.timeout_s + 15
+    assert local_step_limit() == 15
+
+
+def test_brain_step_limit_adds_the_triage_call() -> None:
+    cfg = ModelConfig(timeout_s=60)
+    assert brain_step_limit(cfg, [UPDATE_RESONANT]) == local_step_limit([UPDATE_RESONANT]) + 60
 
 
 # --- the "/tasks" flow (fast path) --------------------------------------------
@@ -216,7 +207,7 @@ async def test_tasks_command_end_to_end(running: Running) -> None:
     assert len(r.osa.sent) == 1
     assert sent.handle == OWNER_PHONE
     assert sent.text == "No tasks yet."
-    assert sum(r.model.calls[k] for k in ("label", "tools", "answer")) == 0
+    assert r.model.calls["triage"] == 0
 
     # The event: only the owner's message became one, and it was consumed.
     events = r.rows("SELECT * FROM events")
@@ -259,37 +250,32 @@ async def test_tasks_command_end_to_end(running: Running) -> None:
         assert "/tasks" not in (row["detail"] or "")
 
 
-# --- the labeled path: tools through gate -> executor ----------------------------------
+# --- the brain's small talk: the local model only routes ---------------------------------
 
 
-async def test_labeled_question_runs_tools_through_gate_and_executor(running: Running) -> None:
+async def test_greeting_is_routed_and_answered_without_claude(running: Running) -> None:
     r = running
-    r.chat.add_message(handle=OWNER_PHONE, text="anything queued up right now?")
+    r.model.triage = {
+        "handler": "local",
+        "kind": "general",
+        "message_type": "greeting",
+        "say": "Hey!",
+    }
+    r.chat.add_message(handle=OWNER_PHONE, text="hey")
 
     sent = await r.osa.wait_for(1, 10)
     await r.idle()
     await asyncio.sleep(0.2)
 
     assert len(r.osa.sent) == 1
-    assert (sent.handle, sent.text) == (OWNER_PHONE, DEFAULT_FINAL_REPLY)
-    assert r.model.calls["label"] == 1 and r.model.calls["answer"] == 1
+    assert (sent.handle, sent.text) == (OWNER_PHONE, "Hey!")
+    assert r.model.calls["triage"] == 1
 
     (task,) = r.rows("SELECT * FROM tasks")
-    assert (task["kind"], task["runner"], task["status"]) == ("chat", "local", "done")
-    cp = json.loads(task["checkpoint"])
-    assert cp["intent"] == "job_control" and [e["name"] for e in cp["toolset"]] == [
-        "list_tasks",
-        "projects",
-        "task_counts",
-    ]
+    assert (task["kind"], task["runner"], task["status"]) == ("chat", "brain", "done")
     result = json.loads(task["result"])
-    assert result["path"] == "llm" and result["tools_used"] == ["task_counts"]
-
-    gate = [a for a in r.audits("gate.evaluate") if a["task_id"] == task["id"]]
-    assert [(a["tool"], a["decision"]) for a in gate] == [("task_counts", "Allow")]
-    executed = r.audits("executor.result")
-    assert [(a["tool"], a["task_id"]) for a in executed] == [("task_counts", task["id"])]
-    assert r.rows("SELECT * FROM executions WHERE task_id = ?", task["id"])
+    assert result["path"] == "small_talk" and result["route"] == "local"
+    assert r.audits("gate.evaluate") == []  # no tool ran
     sends = r.audits("imessage.sent")
     assert [a["idempotency_key"] for a in sends] == [f"reply:{task['id']}"]
 
@@ -326,7 +312,7 @@ async def test_sigterm_stops_channel_monitor_and_loop(
 async def test_bench_e2e_with_fakes() -> None:
     results = await run_e2e_bench(2, warmup=False)
     data = report(results, model_name="fake")
-    assert [r["path"] for r in data["results"]] == ["fast", "llm", "loop"]
+    assert [r["path"] for r in data["results"]] == ["fast", "route"]
     for r in data["results"]:
         assert r["n"] == 2 and r["failures"] == 0 and r["p50_ms"] <= r["p95_ms"]
     assert data["pass"] is True

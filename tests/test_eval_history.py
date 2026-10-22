@@ -22,6 +22,7 @@ from typer.testing import CliRunner
 
 from resonant.cli import app
 from resonant.config import Settings
+from resonant.e2e.fakes import ScriptedModel
 from resonant.evals import history as hist
 from resonant.evals import task_eval as te
 from resonant.loop import NewTask
@@ -347,9 +348,9 @@ def test_unreadable_principals_exit_2_without_their_values(
 
 
 def test_run_set_never_grades_a_row_awaiting_review() -> None:
-    reviewed = te.TaskCase(1, "a", "chat", "hi", (), {}, te.Expect(), ["Hi."])
-    pending = te.TaskCase(2, "b", "chat", "yo", (), {}, te.Expect(), ["Yo."], review=True)
-    out = asyncio.run(te.run_set([reviewed, pending], ["loop"], model=None))
+    reviewed = te.TaskCase(1, "a", "chat", "hi", (), {}, te.Expect(), None)
+    pending = te.TaskCase(2, "b", "chat", "yo", (), {}, te.Expect(), None, review=True)
+    out = asyncio.run(te.run_set([reviewed, pending], model=None))
     assert [r.case.id for r in out["loop"]] == ["a"]
 
 
@@ -519,7 +520,11 @@ def test_rows_awaiting_review_are_listed_not_graded(home: Path, store: sqlite3.C
     path = te.owner_set_path(settings(home))
     drafted = rows(path)
     drafted[0]["review"] = False
-    drafted[0]["script"] = [[["list_notes", {}]], "No notes yet."]
+    drafted[0]["expect"].pop("route", None)  # drafted from a turn the old local model answered
+    drafted[0]["claude"] = {
+        "calls": [{"name": "list_notes", "args": {}}],
+        "answer": "No notes yet.",
+    }
     path.write_text("".join(json.dumps(r) + "\n" for r in drafted))
     result = _task("--set", "owner", "--out", str(out), "--json")
     assert result.exit_code == 0, result.output
@@ -552,24 +557,30 @@ def test_set_owner_resolves_to_the_owners_file(tmp_path: Path) -> None:
 
 def test_e2e_a_real_turn_drafts_a_row_that_replays(home: Path) -> None:
     """The store comes from the real stack (router, brain, gate, executor, channel) running
-    one text with a scripted model in this home; the draft reads it back; the row, once
+    one text with a scripted Claude in this home; the draft reads it back; the row, once
     reviewed, replays through ``eval task --set owner`` and passes."""
+    plan: dict[str, Any] = {
+        "calls": [
+            {"name": "list_notes", "args": {}},
+            {"name": "add_note", "args": {"text": "renew passport"}},
+        ],
+        "answer": "Saved: renew passport.",
+    }
     case = te.TaskCase(
         line=1, id="seed", category="notes", text="save a note: renew passport", history=(),
-        world={"notes": ["milk"]}, expect=te.Expect(), script=None,
+        world={"notes": ["milk"]}, expect=te.Expect(), script=None, claude=plan,
     )  # fmt: skip
-    script: list[Any] = [[["list_notes", {}]], [["add_note", {"text": "renew passport"}]],
-                         "Saved: renew passport."]  # fmt: skip
-    model = te.RecordingModel(te.ScriptedRoot(script))
+    model = te.RecordingModel(ScriptedModel())
 
     async def go() -> te.Outcome:
         with te.world_home(home):
             return await te._run_in(  # pyright: ignore[reportPrivateUsage]
-                case, "loop", model, home, None, te.SCRIPTED_TIMEOUT_S, lambda: 0.0
+                case, model, home, None, te.SCRIPTED_TIMEOUT_S, lambda: 0.0
             )
 
     outcome = asyncio.run(go())
-    assert outcome.reply.startswith("Saved: renew passport."), outcome
+    assert outcome.claude_reply is not None
+    assert outcome.claude_reply.startswith("Saved: renew passport."), outcome
 
     result = CliRunner().invoke(app, ["eval", "draft", "--from-history", "--json"])
     assert result.exit_code == 0, result.output
@@ -584,7 +595,7 @@ def test_e2e_a_real_turn_drafts_a_row_that_replays(home: Path) -> None:
     assert row["draft"]["reply"].startswith("Saved: renew passport.")
 
     row["review"] = False
-    row["script"] = script
+    row["claude"] = plan
     path.write_text(json.dumps(row) + "\n")
     result = _task("--set", "owner", "--out", str(home / "results"), "--json")
     assert result.exit_code == 0, result.output

@@ -317,7 +317,7 @@ async def test_a_watch_ask_goes_to_the_hook_not_the_owner(
         "untrusted": True,
         "proposed": False,
     }
-    assert seen == [(3, queued.task_id, "answered", "Claude: YES. It's in stock.")]
+    assert seen == [(3, queued.task_id, "answered", "YES. It's in stock.")]
     assert h.channel.sent == []
     assert h.argv_notes()["prompt"].startswith(WATCH_HINT)
     cp = json.loads(

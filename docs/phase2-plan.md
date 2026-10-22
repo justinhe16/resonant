@@ -1,3 +1,5 @@
+> **Superseded in part by PER-256** (2026-10-22): the labeler, the intents and their toolsets described here are deleted; the local model only routes and Claude calls the tools. See [`brain-plan.md`](brain-plan.md#per-256-qwen-only-routes-claude-is-the-one-brain-2026-10-22).
+
 # Phase 2 plan (v3): risk × who chose it, approvals, and real tools
 
 Status: **implemented** (P2-1 to P2-17, PRs #17 onward; go-live per [`go-live.md`](go-live.md) step 11). v3, after the owner's feedback. Scope: the real gate, text-reply approvals and the kill switch from [`architecture.md`](architecture.md#components), plus the first real tools: notes, reminders, Mini ops, projects and command discovery. Veto windows and Keychain injection move to Phase 3 ([§7](#7-deferred-and-out-of-scope)). Deviations from the frozen [`interfaces.md`](interfaces.md) are listed under [Contract changes](#contract-changes-flagged).

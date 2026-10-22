@@ -92,6 +92,7 @@ DEFAULT_TAINT_HOPS = 3
 _SCAN = 4 * (KEEP_EXCHANGES + MAX_FOLD)  # message events read to find the exchanges
 SYSTEM_PER_GAP = 3  # PER-268: system texts shown between two exchanges, the newest
 OWNER_PER_GAP = 3  # PER-270: task-less owner messages shown between two exchanges, the newest
+MAX_THREAD_TEXTS = 60  # exchanges ``thread_texts`` reads
 SINCE_ITEMS = 8  # PER-270: lines of the Claude brain's "since we last spoke"
 SINCE_LINE_CHARS = 200
 
@@ -675,6 +676,26 @@ def since_last(
         f"<since_last>\n{body}\n</since_last>",
         outside,
     )
+
+
+def thread_texts(
+    conn: sqlite3.Connection,
+    principal: str,
+    *,
+    before_event_id: str | None,
+    since: datetime,
+    source: str = "imessage",
+) -> list[str]:
+    """PER-256: every text of ``principal``'s thread after ``since`` and before the current
+    message, whole (the owner's, Resonant's replies and system texts, Claude's answers): what
+    the Claude brain session may already know, so the number guard counts a figure it read
+    in an earlier answer as sourced. Not for a prompt."""
+    found = thread(conn, principal, after_event_id=None, before_event_id=before_event_id,
+                   source=source, start=since, limit=MAX_THREAD_TEXTS)  # fmt: skip
+    texts = [s.text for s in found.said]
+    for ex in found.exchanges:
+        texts += [t for t in (ex.text, ex.said, ex.claude) if t]
+    return texts
 
 
 # --- fold ------------------------------------------------------------------------------------

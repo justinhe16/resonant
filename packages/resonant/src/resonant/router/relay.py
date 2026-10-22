@@ -15,7 +15,7 @@ The router calls it at three points (``router.py``):
    A plain ``yes``/``no`` with no approval prompt open goes to the questions instead of
    "Nothing is waiting for approval".
    Approvals keep their exact-code and ``yes``/``no`` semantics; everything else here is free text.
-2. **``direct``** (after the inbox, before keywords and the labeler; no model call):
+2. **``direct``** (after the inbox, before keywords and the brain; no model call):
 
    - An addressed message: ``R4 …``, ``R4: …``, ``tell R4 (to) …``, ``for R4, …``. The
      code is stripped. R4 with an open question (asked before the message was sent) gets
@@ -26,7 +26,7 @@ The router calls it at three points (``router.py``):
      within ``PENDING_S``. Any other message drops that stash.
    - An exact option (``a``, ``1``, ``the second option`` or the option's text) that fits
      exactly one open question.
-3. **``free``** (after the labeler, only for ``run_project``, ``question`` and ``unknown``):
+3. **``free``** (after the keywords, for free text only; ``router`` passes ``question``):
    the brain (one small ``chat_json`` call, ``RELAY_SYSTEM``) decides whether the message
    answers an open question and which. One open question: an answer unless the brain is
    sure it's a new request; when the brain is unsure or down, a short reply to a recent
@@ -393,7 +393,7 @@ class Relay:
             return RelayResult(f"{run.code} isn't running ({run.status}); nothing sent.",
                                "refused", run.code)  # fmt: skip
         if not a.tell and a.rest.rstrip().endswith("?"):
-            return None  # "R4 done yet?": a question about the run, for the labeler
+            return None  # "R4 done yet?": a question about the run, for the brain
         if not a.tell and _BARE.fullmatch(normalize(a.rest)):
             return RelayResult(
                 f"{run.code} has no open question (it may have timed out), so nothing was sent. "
@@ -429,7 +429,7 @@ class Relay:
         *,
         spans: SpanFactory | None = None,
     ) -> RelayResult | None:
-        """A free-text reply after the labeler: an answer, ``For R4 or R6?``, or None."""
+        """A free-text reply: an answer, ``For R4 or R6?``, or None."""
         if intent not in CANDIDATES:
             return None
         workers = self.workers()

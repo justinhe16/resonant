@@ -1,32 +1,15 @@
 """Fakes for the end-to-end harness: a scripted ``ModelClient`` and a recording ``OsaRunner``.
 
-``ScriptedModel`` behaves like a well-behaved local model, deterministically:
+PER-256: the local model only routes, so ``ScriptedModel`` answers the triage call and the
+history fold, nothing else.
 
-- Label calls (a schema with an ``intent`` property: ``LABEL_SCHEMA`` or the schema for a
-  set with extension intents): the intent comes from keyword rules over the user's message
-  (``LABEL_RULES``, first match wins, default ``question``), confidence 0.9. A rule's intent
-  outside the schema's enum (an extension that isn't loaded) is skipped.
-- ``chat_tools``: the first call asks for one tool, later calls ask for nothing. The tool is
-  the first ``TOOL_RULES`` match over the current message whose tool is in the toolset, else
-  ``task_counts`` if it is in the toolset, else the first tool. Args are none, except
-  ``add_reminder``: "remind me in N minutes to X" becomes ``{at: <Current time> + N min, text:
-  X}``, using the ``Current time:`` line the runner puts before the message.
-- Answer calls (``schema == REPLY_SCHEMA``): ``{"reply": final_reply}``. A history fold
-  (``{summary}``) gets a fixed summary.
+- **Triage** (a ``chat_json`` call with the triage schema, ``brain.triage.SCHEMA``): answers
+  the next item of ``triages`` (a dict, or an exception to raise), else ``triage`` (default
+  ``DEFAULT_TRIAGE``: a ``claude`` handler and the type ``other``, so the turn is Claude's).
+  Each request is kept in ``triage_requests``.
+- A history fold (``{summary}``) gets a fixed summary.
+- ``chat_tools`` is never called by the runners any more; calling it is a test bug.
 - ``probe()``: always ok.
-
-**Scripted mode** (the brain loop, BR-1): ``ScriptedModel(script=[...])``, or ``push(...)``
-per test. Each ``chat_tools`` call takes the next item: a list of ``ToolCall`` (or
-``(name, args)`` pairs) is one round of tool calls, a string is the final reply (``text``,
-no calls), an exception is raised. An empty script answers ``final_reply``. Label and answer
-calls work as above, so a turn that falls back to the intents path still labels. Every
-``chat_tools`` request is kept in ``requests`` (messages and tool names), for asserting on
-the prompt and the toolset.
-
-**Triage** (BR-10): a ``chat_json`` call with the triage schema (``brain.triage.SCHEMA``)
-answers the next item of ``triages`` (a dict, or an exception to raise), else ``triage``
-(default ``{"handler": "local", ...}``: the turn stays local, so scripts written before
-BR-10 run unchanged). Each request is kept in ``triage_requests``.
 
 Each call can sleep ``delay_s`` first, to stand in for model latency.
 
@@ -38,57 +21,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Any, cast
 
 from resonant.brain.triage import SCHEMA as TRIAGE_SCHEMA
 from resonant.gateway.imessage.sender import OSASCRIPT, OsaResult
-from resonant.models import ChatMessage, ModelReply, ProbeResult, SpanFactory, ToolCall
-from resonant.router.prefixes import LABEL_SCHEMA
-from resonant.runners.local import REPLY_SCHEMA
+from resonant.models import ChatMessage, ModelReply, ProbeResult, SpanFactory
 from resonant_sdk import ToolSpec
 
-LABEL_RULES: tuple[tuple[str, str], ...] = (
-    ("my prs", "extension:github"),  # only when github is loaded (in the schema's enum)
-    ("time is it in", "extension:example"),
-    ("my linear", "extension:linear"),  # only when linear is loaded
-    ("linear ticket", "extension:linear"),
-    ("remind me in", "reminders"),
-    ("restart", "ops"),
-    ("what can you do", "system"),
-    ("clear my notes", "notes"),
-    ("queue", "job_control"),
-    ("task", "job_control"),
-    ("job", "job_control"),
-    ("mini", "system"),
-    ("cpu", "system"),
-    ("memory", "system"),
-    ("model", "system"),
-    ("refactor", "run_project"),
-    ("open a pr", "run_project"),
-)
-# (keyword in the current message, tool). First match whose tool is in the toolset wins.
-TOOL_RULES: tuple[tuple[str, str], ...] = (
-    ("my prs", "prs"),
-    ("my linear", "list_issues"),
-    ("linear ticket", "save_issue"),
-    ("remind me in", "add_reminder"),
-    ("restart resonant", "restart_resonant"),
-    ("restart ollama", "restart_ollama"),
-    ("what can you do", "list_commands"),
-    ("clear my notes", "clear_notes"),
-)
-Scripted = Sequence[ToolCall | tuple[str, dict[str, Any]]] | str | BaseException
-
-_REMIND = re.compile(r"remind me in (\d+) minutes? to (.+?)</message>", re.IGNORECASE | re.DOTALL)
-_NOW = re.compile(r"^Current time: (\S+) ", re.MULTILINE)
-DEFAULT_FINAL_REPLY = "Here's the rundown from the task list: all good."
-LOCAL_TRIAGE: dict[str, Any] = {
-    "handler": "local",
+DEFAULT_TRIAGE: dict[str, Any] = {
+    "handler": "claude",
     "kind": "general",
     "message_type": "other",
     "say": "",
@@ -98,29 +42,12 @@ LOCAL_TRIAGE: dict[str, Any] = {
 class ScriptedModel:
     """A deterministic ``ModelClient``. ``calls`` counts every chat call by kind."""
 
-    def __init__(
-        self,
-        *,
-        final_reply: str = DEFAULT_FINAL_REPLY,
-        delay_s: float = 0.0,
-        rules: Sequence[tuple[str, str]] = LABEL_RULES,
-        script: Sequence[Scripted] | None = None,
-    ) -> None:
-        self.final_reply = final_reply
+    def __init__(self, *, delay_s: float = 0.0) -> None:
         self.delay_s = delay_s
-        self.rules = tuple(rules)
-        self.calls: dict[str, int] = {"label": 0, "tools": 0, "answer": 0, "probe": 0}
-        self.script: list[Scripted] | None = None if script is None else list(script)
-        self.requests: list[ToolsRequest] = []
-        self.triage: dict[str, Any] = dict(LOCAL_TRIAGE)
+        self.calls: dict[str, int] = {"triage": 0, "fold": 0, "probe": 0}
+        self.triage: dict[str, Any] = dict(DEFAULT_TRIAGE)
         self.triages: list[dict[str, Any] | BaseException] = []
         self.triage_requests: list[ToolsRequest] = []
-
-    def push(self, *items: Scripted) -> None:
-        """Append to the script (and switch to scripted mode)."""
-        if self.script is None:
-            self.script = []
-        self.script.extend(items)
 
     async def _wait(self) -> None:
         if self.delay_s > 0:
@@ -138,26 +65,18 @@ class ScriptedModel:
     ) -> ModelReply:
         await self._wait()
         if schema == TRIAGE_SCHEMA:
-            self.calls["triage"] = self.calls.get("triage", 0) + 1
+            self.calls["triage"] += 1
             self.triage_requests.append(ToolsRequest(list(messages), [t.name for t in tools or []]))
             item = self.triages.pop(0) if self.triages else self.triage
             if isinstance(item, BaseException):
                 raise item
             data: dict[str, Any] = dict(item)
             return ModelReply(json.dumps(data), [], data, 1, 10, 5)
-        if _is_label_schema(schema):
-            self.calls["label"] += 1
-            intent = self.label_for(messages[-1]["content"], _enum(schema))
-            data = {"intent": intent, "confidence": 0.9}
-        elif schema == REPLY_SCHEMA:
-            self.calls["answer"] += 1
-            data = {"reply": self.final_reply}
-        elif _props(schema) == {"summary"}:  # the brain's history fold
-            self.calls["fold"] = self.calls.get("fold", 0) + 1
+        if _props(schema) == {"summary"}:  # the brain's history fold
+            self.calls["fold"] += 1
             data = {"summary": "Earlier: the owner and Resonant talked."}
-        else:
-            raise ValueError("ScriptedModel: unexpected schema")
-        return ModelReply(json.dumps(data), [], data, 1, 10, 5)
+            return ModelReply(json.dumps(data), [], data, 1, 10, 5)
+        raise ValueError("ScriptedModel: unexpected schema")
 
     async def chat_tools(
         self,
@@ -167,81 +86,20 @@ class ScriptedModel:
         max_tokens: int = 512,
         spans: SpanFactory | None = None,
     ) -> ModelReply:
-        await self._wait()
-        self.calls["tools"] += 1
-        self.requests.append(ToolsRequest(list(messages), [t.name for t in tools]))
-        if self.script is not None:
-            return self._scripted()
-        already = any(
-            m["role"] == "tool"
-            or m.get("tool_calls")
-            or (m["role"] == "assistant" and m["content"].startswith('{"tool_call"'))
-            for m in messages
-        )
-        if already or not tools:
-            return ModelReply(None, [], None, 1, 10, 5)
-        names = [t.name for t in tools]
-        current = next(
-            (m["content"] for m in reversed(messages) if "<message>" in m["content"]), ""
-        )
-        lowered = current.lower()
-        name = next(
-            (t for k, t in TOOL_RULES if k in lowered and t in names),
-            "task_counts" if "task_counts" in names else names[0],
-        )
-        args = reminder_args(current) if name == "add_reminder" else {}
-        return ModelReply(None, [ToolCall(name, args)], None, 1, 10, 5)
-
-    def _scripted(self) -> ModelReply:
-        assert self.script is not None
-        if not self.script:
-            return ModelReply(self.final_reply, [], None, 1, 10, 5)
-        item = self.script.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        if isinstance(item, str):
-            return ModelReply(item, [], None, 1, 10, 5)
-        calls = [c if isinstance(c, ToolCall) else ToolCall(c[0], dict(c[1])) for c in item]
-        return ModelReply(None, calls, None, 1, 10, 5)
+        raise AssertionError("ScriptedModel: the local model no longer calls tools (PER-256)")
 
     async def probe(self) -> ProbeResult:
         self.calls["probe"] += 1
         return ProbeResult(True, True, True, True, 1, "scripted model")
-
-    def label_for(self, wrapped: str, allowed: Sequence[str] | None = None) -> str:
-        text = wrapped.lower()
-        for keyword, intent in self.rules:
-            if keyword in text and (allowed is None or intent in allowed):
-                return intent
-        return "question"
-
-
-def _enum(schema: dict[str, Any]) -> list[str]:
-    props = cast(dict[str, Any], schema.get("properties") or {})
-    intent = cast(dict[str, Any], props.get("intent") or {})
-    return [str(v) for v in cast(list[Any], intent.get("enum") or [])]
 
 
 def _props(schema: dict[str, Any]) -> set[str]:
     return set(cast(dict[str, Any], schema.get("properties") or {}))
 
 
-def _is_label_schema(schema: dict[str, Any]) -> bool:
-    return schema == LABEL_SCHEMA or bool(_enum(schema))
-
-
-def reminder_args(turn: str) -> dict[str, Any]:
-    """``add_reminder`` args for "remind me in N minutes to X", from the turn's current time."""
-    now, ask = _NOW.search(turn), _REMIND.search(turn)
-    if now is None or ask is None:
-        return {}
-    at = datetime.fromisoformat(now.group(1)) + timedelta(minutes=int(ask.group(1)))
-    return {"at": at.isoformat(), "text": ask.group(2).strip()}
-
-
 @dataclass(frozen=True)
 class ToolsRequest:
-    """One ``chat_tools`` call as the scripted model saw it."""
+    """One model call as the scripted model saw it."""
 
     messages: list[ChatMessage]
     tools: list[str]  # names, in the order sent

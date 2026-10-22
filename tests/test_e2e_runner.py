@@ -2,7 +2,9 @@
 iMessage in, the real ``Daemon`` (router, tools, gate, loop, ``ClaudeRunner``), iMessage out.
 
 The pieces that would leave the machine are fakes: chat.db is a ``FakeChatDB``, osascript a
-``RecordingOsaRunner``, the model a ``ScriptedModel`` that knows two run phrasings, ``claude``
+``RecordingOsaRunner``, the model a ``ScriptedModel`` (it only routes: PER-256), a
+plain-words request goes to the fake Claude brain (``World.claude`` scripts it), the worker
+``claude``
 is ``tests/fakes/claude``, the remote a local bare repo and ``gh`` a script. The sandbox is the
 identity (its own tests are ``test_sandbox*.py``) except in the one test that runs the session
 under the real ``sandbox-exec``, which is local-only. The runner-level R-tests (escapees,
@@ -46,18 +48,18 @@ from test_runner_claude import (
 )
 
 from resonant import killswitch
-from resonant.config import Settings, load_settings
+from resonant.config import DEFAULT_READ_DENY, Settings, load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import Loop
-from resonant.models import ChatMessage, ModelReply, SpanFactory, ToolCall
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.router.fast_path import RESUME_REPLY
 from resonant.runner.github_app import GitHubApp
 from resonant.runner.workspace import Workspace
 from resonant.runners import claude as claude_mod
 from resonant.runners import reaper
+from resonant.runners.ask import AskRunner, AskScope
 from resonant.runners.claude import ClaudeRunner, Refused
 from resonant.secrets import (
     CLAUDE_TOKEN_REF,
@@ -72,7 +74,7 @@ from resonant.store import runs as runs_store
 from resonant.store import trust as trust_store
 from resonant.store.db import iso, kv_set, utcnow
 from resonant.store.repos import Repo
-from resonant_sdk import ToolSpec
+from resonant.wiring import tool_access
 
 OWNER_PHONE = "+15551234567"
 SELF = "resonant.agent@icloud.com"
@@ -84,42 +86,17 @@ principals:
 """
 REPO = "demo"
 PR_URL = "https://github.com/own/demo/pull/41"
+FAKE_ASK = Path(__file__).parent.parent / "packages/resonant/src/resonant/e2e/fake_claude.py"
+
+
+def start_run_plan(ask: str = "fix the typo in the README") -> dict[str, Any]:
+    return {"calls": [{"name": "start_run", "args": {"repo": REPO, "ask": ask}}],
+            "answer": "Working on it."}  # fmt: skip
 
 
 class RunModel(ScriptedModel):
-    """The scripted model plus what the runner model does for the two run phrasings: it
-    picks ``start_run`` (repo and ask taken from the message) or ``merge_run`` for R1."""
-
-    def __init__(self) -> None:
-        super().__init__(
-            rules=(("typo", "run_project"), ("merge it", "run_project")),
-            final_reply="Working on it.",
-        )
-
-    async def chat_tools(
-        self,
-        messages: list[ChatMessage],
-        *,
-        tools: list[ToolSpec],
-        max_tokens: int = 512,
-        spans: SpanFactory | None = None,
-    ) -> ModelReply:
-        names = {t.name for t in tools}
-        current = next(
-            (m["content"] for m in reversed(messages) if "<message>" in m["content"]), ""
-        ).lower()
-        asked = any(
-            m["role"] == "assistant" and m["content"].startswith('{"tool_call"') for m in messages
-        )
-        call: ToolCall | None = None
-        if not asked and "merge it" in current and "merge_run" in names:
-            call = ToolCall("merge_run", {"code": "R1"})
-        elif not asked and "typo" in current and "start_run" in names:
-            call = ToolCall("start_run", {"repo": REPO, "ask": "fix the typo in the README"})
-        if call is None:
-            return await super().chat_tools(messages, tools=tools, max_tokens=max_tokens)
-        self.calls["tools"] += 1
-        return ModelReply(None, [call], None, 1, 10, 5)
+    """The scripted model: it only routes (everything but small talk is Claude's). Subclassed
+    by the relay and employee tests for the relay's pick."""
 
 
 def free_port() -> int:
@@ -140,6 +117,14 @@ class World:
     api: FakeGitHubApi
     daemon: Daemon | None = None
     said: int = 0
+
+    @property
+    def plan(self) -> Path:
+        return self.root / "claude-plan.json"
+
+    def claude(self, **plan: Any) -> None:
+        """What the fake Claude brain does with the next plain-words text."""
+        self.plan.write_text(json.dumps(plan))
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -226,7 +211,6 @@ def make_world(
         },
         # not this checkout: the daemon's own repo would be registered as "resonant"
         ops={"repo_path": None},
-        brain={"mode": "intents"},  # chat asks are labeled run_project (loop is the default)
         runner={
             "guard": guard,
             "github_app": {"app_id": APP_ID, "installation_id": INSTALLATION_ID},
@@ -289,7 +273,37 @@ def new_daemon(world: World) -> Daemon:
         secrets=SecretStore(world.keychain),
     )
     kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
+    attach_claude(world, daemon)
     return daemon
+
+
+def attach_claude(world: World, daemon: Daemon) -> None:
+    """Plain-words texts go to Claude (PER-256): the ask runner over ``e2e/fake_claude.py``,
+    acting out ``World.claude``'s plan through the real MCP bridge, gate and executor."""
+    assert daemon.imessage is not None and daemon.state.components is not None
+    brain = daemon.imessage.brain
+    assert brain is not None
+    brain.runner_gaps = None
+    if not world.plan.exists():
+        world.claude(answer="Working on it.")
+    settings = world.settings
+    asks = AskRunner(
+        daemon.conn,
+        cfg=settings.brain.ask_claude,
+        scope=AskScope((settings.runner.code_dir,), DEFAULT_READ_DENY),
+        ask_root=world.root / "ask",
+        channel=daemon.imessage.channel,
+        secrets=SecretStore(world.keychain),
+        owner="justin",
+        create_task=daemon.loop.create_task,
+        claude_cmd=[sys.executable, "-I", str(FAKE_ASK), "--script", str(world.plan)],
+        home=world.root / "claude-home",
+        tools=tool_access(daemon.state.components, brain, settings),
+        poll_s=0.05,
+        kill_grace_s=0.5,
+    )
+    daemon.state.components.runners[asks.name] = asks
+    daemon.loop.runners[asks.name] = asks
 
 
 @contextlib.asynccontextmanager
@@ -433,6 +447,7 @@ async def test_r1_chat_request_starts_a_run(
 ) -> None:
     w = make_world(tmp_path, resonant_home, chat, monkeypatch)
     async with running(w):
+        w.claude(**start_run_plan())
         started = await w.say("fix the typo in the README in demo")
         assert started.endswith("On it: R1 · demo. Up to 45m. /runs to check, /cancel R1 to stop.")
         # EM-6: a run asked for in plain words reports in the digest, not with a text
@@ -452,6 +467,7 @@ async def test_em6_a_chat_run_that_fails_is_texted_right_away(
 ) -> None:
     w = make_world(tmp_path, resonant_home, chat, monkeypatch, scenario="error")
     async with running(w):
+        w.claude(**start_run_plan())
         assert (await w.say("fix the typo in the README in demo")).endswith("/cancel R1 to stop.")
         failed = await w.next_text()
         assert bare(failed) == f"R1 failed: {w.run().failure}" and w.run().status == "failed"
@@ -465,6 +481,7 @@ async def test_em6_a_notify_now_rule_texts_a_chat_run_when_it_finishes(
     async with running(w):
         trust_store.add_rule(w.conn, scope=REPO, action="done", effect="notify_now",
                              created_from="chat", now=utcnow())  # fmt: skip
+        w.claude(**start_run_plan())
         assert (await w.say("fix the typo in the README in demo")).endswith("/cancel R1 to stop.")
         done = await w.next_text()
         assert bare(done).startswith("R1 opened PR #41 (CI green, 1 file, ")
@@ -599,7 +616,9 @@ async def test_r13_merge_by_chat_asks_yes_first(
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         assert bare(await w.next_text()).startswith("R1 opened PR #41")
-        prompt = await w.say("merge it")
+        w.claude(calls=[{"name": "merge_run", "args": {"code": "R1"}}], answer="Asked you.")
+        assert await w.say("merge it") == "Asked you."  # Claude's answer, then the prompt
+        prompt = await w.next_text()
         assert "merge R1: PR #41 in demo " in prompt and PR_URL in prompt, prompt
         assert prompt.endswith("Reply yes / no")
         assert "changes .claude/settings.json" in prompt
@@ -633,7 +652,6 @@ async def test_r14_not_set_up_names_what_is_missing(
         assert runs.startswith(reply + "\nNo push or PRs yet: the GitHub App isn't set up")
         assert "runner/github_token isn't set" in runs
         # The runner never starts anything.
-        await w.say("fix the typo in the README in demo")
         assert runs_store.recent(w.conn, 10) == []
 
 
@@ -648,8 +666,6 @@ async def test_r14_missing_token_only(
             "The runner isn't set up: a Claude login (or secret runner/claude_token"
         )
         assert "runner/github_token" not in reply
-        reply = await w.say("fix the typo in the README in demo")
-        assert "The runner isn't set up: a Claude login (or secret runner/claude_token" in reply
         assert runs_store.recent(w.conn, 10) == []
 
 
@@ -850,17 +866,21 @@ async def test_fork_run_asks_external_pr_and_opens_it_on_yes(
         assert PUBLIC_TOKEN not in w.everything()
 
 
-async def test_chat_merge_runs_without_asking_by_default(
+async def test_chat_merge_after_the_workers_report_asks(
     tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """PER-256: the Claude brain reads the thread since its last turn, and the worker's own
+    report in it is outside text (D6), so the turn is tainted and a chat merge asks, rule or
+    no rule. (The default for an untainted turn is the gate's, tested in test_gate*.)"""
     w = make_world(tmp_path, resonant_home, chat, monkeypatch)
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         assert bare(await w.next_text()).startswith("R1 opened PR #41")
-        # no rule: merge is ok by default, so a chat merge just runs (D4)
-        reply = await w.say("merge it")
-        assert "R1 merged: PR #41." in reply, reply
-        assert len(w.gh_calls("merge")) == 1
+        w.claude(calls=[{"name": "merge_run", "args": {"code": "R1"}}], answer="Asked you.")
+        assert await w.say("merge it") == "Asked you."
+        prompt = await w.next_text()
+        assert "merge R1: PR #41 in demo " in prompt and prompt.endswith("Reply yes / no")
+        assert w.gh_calls("merge") == []
 
 
 async def test_chat_merge_asks_when_a_rule_says_so(
@@ -872,6 +892,8 @@ async def test_chat_merge_asks_when_a_rule_says_so(
                              created_from="chat", now=utcnow())  # fmt: skip
         assert (await w2.say("/run demo fix it")).startswith("On it: R1")
         assert bare(await w2.next_text()).startswith("R1 opened PR #41")
-        prompt = await w2.say("merge it")
+        w2.claude(calls=[{"name": "merge_run", "args": {"code": "R1"}}], answer="Asked you.")
+        assert await w2.say("merge it") == "Asked you."
+        prompt = await w2.next_text()
         assert "merge R1: PR #41 in demo " in prompt and prompt.endswith("Reply yes / no")
         assert w2.gh_calls("merge") == []

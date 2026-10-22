@@ -14,7 +14,7 @@ Exit criteria (docs/phase3-plan.md §1) and where each is covered:
 - E1, E2, E9.2: ``test_e1_e2_e9_example_install_restart_commands_and_repo_update`` (the
   install screen's details and ``--adopt``: ``test_ext_manager.py``)
 - E2, E14: ``test_e2_e14_github_commands_over_imessage``, ``test_ext_commands.py``
-- E3: ``test_e3_show_my_prs_routes_to_github_and_runs_prs``, ``test_router_extensions.py``
+- E3: ``test_e3_show_my_prs_reaches_github_through_claudes_tools``, ``test_router_extensions.py``
 - E4: ``test_e4_morning_ping_first_run_is_baseline_then_sends_once``, ``test_scheduler.py``
 - E5, E6, E11: ``test_scheduler.py`` (fake clock, ``FakeExtProcess``)
 - E7: ``test_e7_*``; E8: ``test_e8_*`` here and in ``test_scheduler.py``
@@ -48,6 +48,7 @@ from zoneinfo import ZoneInfo
 
 import psutil
 import pytest
+from chat_claude import attach_claude
 from typer.testing import CliRunner
 
 import resonant_sdk.emit
@@ -57,7 +58,6 @@ from resonant.config import Settings, load_settings
 from resonant.daemon import Daemon
 from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.e2e.extensions import install_fixture
-from resonant.e2e.fakes import DEFAULT_FINAL_REPLY
 from resonant.extensions.host import tampered_text
 from resonant.extensions.notify import mute
 from resonant.extensions.pin import tree_digest
@@ -66,7 +66,6 @@ from resonant.gate import Allow, Intent
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop import NewTask
 from resonant.loop.types import PRIORITY_OWNER, Done, StepContext, StepOutcome, Task
-from resonant.models import ChatMessage, ModelReply, SpanFactory
 from resonant.monitor import health_snapshot
 from resonant.ops.fakes import FakeOpsRunner
 from resonant.router.fast_path import KILL_REPLY, RESUME_REPLY
@@ -75,7 +74,7 @@ from resonant.store import trust as trust_store
 from resonant.store.db import iso, kv_get, kv_set, open_db, transaction, utcnow
 from resonant.store.extensions import get_extension, get_job, mark_due
 from resonant.store.tasks import unrouted_events
-from resonant_sdk import Event, ToolSpec
+from resonant_sdk import Event
 
 OWNER_PHONE = "+15551234567"
 SELF = "resonant.agent@icloud.com"
@@ -210,6 +209,7 @@ class Running:
     daemon: Daemon
     osa: RecordingOsaRunner
     script: ExtScriptRunner
+    plan: Path | None = None  # the fake Claude brain's plan (start_daemon's claude_root)
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -237,8 +237,7 @@ class Running:
 def settings_for(home: Path, chat: FakeChatDB, **overrides: Any) -> Settings:
     (home / "principals.yaml").write_text(PRINCIPALS)
     # core/watches (BR-7) runs every 5 minutes; off here so job.run rows are only these tests'
-    # intents: these worlds script the labeler or send slash commands (loop is the default)
-    overrides.setdefault("brain", {"watches": {"enabled": False}, "mode": "intents"})
+    overrides.setdefault("brain", {"watches": {"enabled": False}})
     return load_settings(
         dry_run=False,
         api={"port": free_port()},
@@ -249,26 +248,6 @@ def settings_for(home: Path, chat: FakeChatDB, **overrides: Any) -> Settings:
     )
 
 
-class RecordingModel(ScriptedModel):
-    """A ``ScriptedModel`` that keeps each ``chat_tools`` prompt and the tool names offered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.tool_turns: list[tuple[list[ChatMessage], list[str]]] = []
-
-    async def chat_tools(
-        self,
-        messages: list[ChatMessage],
-        *,
-        tools: list[ToolSpec],
-        max_tokens: int = 512,
-        spans: SpanFactory | None = None,
-    ) -> ModelReply:
-        if not any(m["content"].startswith('{"tool_call"') for m in messages):
-            self.tool_turns.append((list(messages), [t.name for t in tools]))
-        return await super().chat_tools(messages, tools=tools, max_tokens=max_tokens, spans=spans)
-
-
 @contextlib.asynccontextmanager
 async def start_daemon(
     settings: Settings,
@@ -276,6 +255,7 @@ async def start_daemon(
     osa: RecordingOsaRunner | None = None,
     *,
     model: ScriptedModel | None = None,
+    claude_root: Path | None = None,
 ) -> AsyncGenerator[Running]:
     osa = osa or RecordingOsaRunner()
     daemon = Daemon(
@@ -289,12 +269,13 @@ async def start_daemon(
     assert daemon.state.components is not None
     script = ExtScriptRunner(daemon.state.components)
     daemon.loop.runners[script.name] = script
+    plan = attach_claude(daemon, root=claude_root) if claude_root is not None else None
     run = asyncio.create_task(daemon.run())
     assert daemon.imessage is not None
     channel = daemon.imessage.channel
     await wait_until(lambda: channel.health()["last_read_at"] is not None, 10)
     try:
-        yield Running(daemon, osa, script)
+        yield Running(daemon, osa, script, plan)
     finally:
         daemon.stop()
         assert await asyncio.wait_for(run, 10) == 0
@@ -462,24 +443,24 @@ def gh_settings(home: Path, chat: FakeChatDB, bin_dir: Path, state: Path) -> Set
         channels={
             "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
         },
-        brain={"mode": "intents"},  # the labeler routes to extension:github (loop is the default)
     )  # the default extensions.process.path: gh is reached only by its pinned path
 
 
-async def test_e3_show_my_prs_routes_to_github_and_runs_prs(
+async def test_e3_show_my_prs_reaches_github_through_claudes_tools(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
+    """PER-256: plain words go to Claude, whose bridge offers github's chat tools (never its
+    jobs, watch and digest) through the same gate as every call."""
     state = tmp_path / "gh" / "state.json"
     settings = gh_settings(resonant_home, chat, tmp_path / "bin", state)
     install_github(settings, tmp_path)
     keychain = FakeKeychain(items={"github/token": GH_TOKEN})
     osa = RecordingOsaRunner()
-    model = RecordingModel()
-    async with start_daemon(settings, keychain, osa, model=model) as r:
-        chat.add_message(handle=OWNER_PHONE, text="what can you do?")
-        await osa.wait_for(1, 20)
+    async with start_daemon(settings, keychain, osa, claude_root=tmp_path / "claude") as r:
+        assert r.plan is not None
+        r.plan.write_text(json.dumps({"calls": [{"name": "prs", "args": {}}], "answer": "One PR."}))
         chat.add_message(handle=OWNER_PHONE, text="show my PRs")
-        await osa.wait_for(2, 20)
+        assert (await osa.wait_for(1, 20)).text == "One PR."
         await wait_until(
             lambda: (
                 r.conn.execute(
@@ -489,16 +470,6 @@ async def test_e3_show_my_prs_routes_to_github_and_runs_prs(
             ),
             10,
         )
-
-        rows = r.conn.execute("SELECT checkpoint, status FROM tasks ORDER BY created_at").fetchall()
-        cp = json.loads(rows[-1]["checkpoint"])
-        assert rows[-1]["status"] == "done"
-        assert cp["intent"] == "extension:github" and cp["title"] == "chat: extension:github"
-        # Only github's chat tools: never its jobs (watch, digest), never a builtin.
-        assert cp["toolset"] == [
-            {"extension": "github", "name": n}
-            for n in ("merge_pr", "pr", "prs", "recent_prs", "rerun_failed")
-        ]
         # prs ran through the gate as a model-chosen (inferred) call, with the token.
         gate = r.conn.execute(
             "SELECT extension, tool, decision, detail FROM audit_log "
@@ -518,13 +489,12 @@ async def test_e3_show_my_prs_routes_to_github_and_runs_prs(
         ]
         assert sum("1 open PRs" in res for res in results) == 1
         assert GH_TOKEN not in everything_stored(r.conn)
-        # The earlier reply went back to the model wrapped as untrusted, never as an
-        # assistant turn; the toolset the model saw was github's alone.
-        messages, tools = model.tool_turns[-1]
-        assert tools == ["merge_pr", "pr", "prs", "recent_prs", "rerun_failed"]
-        history = messages[1:-1]
-        assert [m["role"] for m in history] == ["user", "user"]
-        assert history[1]["content"] == f"<prior_reply>{DEFAULT_FINAL_REPLY}</prior_reply>"
+        # Claude's tool list: github's chat tools, none of its jobs.
+        assert r.daemon.imessage is not None and r.daemon.imessage.brain is not None
+        offered = {
+            t.name for t in r.daemon.imessage.brain.tools_for("justin") if t.extension == "github"
+        }
+        assert offered == {"merge_pr", "pr", "prs", "recent_prs", "rerun_failed"}
 
 
 # --- E4 / E8 / E11: scheduled jobs and the kill switch -----------------------------------

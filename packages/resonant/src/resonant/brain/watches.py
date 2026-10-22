@@ -324,19 +324,18 @@ def judge_tool(w: Watch, data: object) -> Verdict:
 
 
 def parse_yes(answer: str) -> bool | None:
-    """``YES`` / ``NO`` at the start of Claude's answer (after the ``Claude:`` prefix), or
-    None when it said neither."""
-    m = _YES.match(answer.removeprefix("Claude:").strip())
+    """``YES`` / ``NO`` at the start of Claude's answer, or None when it said neither."""
+    m = _YES.match(answer.strip())
     return None if m is None else m.group(1).lower() == "yes"
 
 
 def judge_ask(w: Watch, answer: str) -> Verdict:
     said = parse_yes(answer)
     met = said is True
-    body = answer.removeprefix("Claude:").strip()
+    body = answer.strip()
     body = _YES.sub("", body, count=1).strip(" .,:;-\n")
     body = _URL.sub("(link)", body)  # page text chose these words: no links in a text to the owner
-    detail = ("Claude: " + " ".join(body.split()))[:DETAIL_MAX] if body else ""
+    detail = " ".join(body.split())[:DETAIL_MAX] if body else ""
     return Verdict(met, met and not w.last_met, None, detail)
 
 

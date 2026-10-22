@@ -17,8 +17,6 @@ from resonant.loop import NewTask
 from resonant.principals import Principals
 from resonant.router import commands
 from resonant.router.commands import ParseContext, UsageError
-from resonant.router.intents import INTENT_TOOLS
-from resonant.router.prefixes import runner_system
 from resonant.router.render import render_rules
 from resonant.runners.local import report_line
 from resonant.store import tasks as repo
@@ -257,15 +255,13 @@ def test_rules_allow_command() -> None:
             cmd.resolve(bad, ctx)
 
 
-def test_rules_intent() -> None:
-    assert INTENT_TOOLS["rules"] == (
-        "add_trust_rule",
-        "allow_tools",
-        "allow_trust_rule",
-        "list_trust_rules",
-        "remove_trust_rule",
-    )
-    system = runner_system("rules")
-    assert "allow_trust_rule(scope=dori-staging, action=deploy)" in system
-    assert "add_trust_rule(scope=trading, action=merge, effect=ask)" in system
-    assert "effect=notify_now" in system
+def test_the_claude_brain_is_told_how_to_call_the_rules_tools() -> None:
+    """PER-256: what the rules intent's prompt taught the local model is in the Claude
+    brain's tool notes now."""
+    from resonant.runners.ask import TOOL_NOTES
+
+    for tool in ("allow_trust_rule", "add_trust_rule", "allow_tools", "remove_trust_rule"):
+        assert tool in TOOL_NOTES
+    assert "allow_trust_rule(scope=dori-staging, action=deploy)" in TOOL_NOTES
+    assert "add_trust_rule(scope=trading, action=merge, effect=ask)" in TOOL_NOTES
+    assert "effect=notify_now" in TOOL_NOTES

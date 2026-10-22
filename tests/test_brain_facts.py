@@ -30,7 +30,6 @@ from resonant.executor import ToolFailed, ToolHandler
 from resonant.gate import Intent
 from resonant.loop import Loop, SlotPool
 from resonant.principals import Principal, Principals
-from resonant.router.intents import INTENT_TOOLS
 from resonant.runners.local import report_line
 from resonant.store.db import utcnow
 from resonant.tools import ToolRegistry, builtin
@@ -181,8 +180,6 @@ def test_specs_levels_and_registration() -> None:
         assert specs[name].effect is Effect.WRITE and specs[name].level is Level.L3
         assert specs[name].extension is None  # global: owner-only
     assert set(specs) <= {s.name for s in builtin.BUILTIN_SPECS}
-    # No intent offers them: the intents path is unchanged (the brain loop will).
-    assert not set(specs) & {t for tools in INTENT_TOOLS.values() for t in tools}
 
 
 async def test_tools_round_trip(handlers: dict[str, ToolHandler], resonant_home: Path) -> None:

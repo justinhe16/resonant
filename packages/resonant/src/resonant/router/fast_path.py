@@ -52,7 +52,7 @@ nothing runs.
 
 ``/kill`` and ``/resume`` are never decided by the LLM. A non-owner gets "not allowed".
 A slash command whose tool the principal can't request gets "not allowed"; a keyword in
-that case falls through to the labeler (``run`` returns None).
+that case falls through to the brain (``run`` returns None).
 
 Tool reads go through the gate (registration and permission checks, audited) like any other
 call. No task exists yet at route time, so the fast path consumes the Allow token and calls
@@ -356,7 +356,7 @@ COMMAND_RENDERS: dict[str, Render] = {
     "/rules": render_rules,
 }
 
-# The only keywords: everything else in plain words goes through an intent (the labeler).
+# The only keywords: everything else in plain words goes to the brain (PER-256).
 KEYWORDS: dict[str, FastCommand] = {
     "status": FastCommand("status", "system", False, tool="daemon_status", render=render_status),
     "ping": FastCommand("ping", "system", False, tool="daemon_status", render=render_ping),
@@ -496,7 +496,7 @@ class FastPath:
         trace_id: str | None = None,
         spans: SpanFactory | None = None,
     ) -> FastPathResult | None:
-        """Answer ``cmd`` for ``principal``; None means "not mine, let the labeler try"."""
+        """Answer ``cmd`` for ``principal``; None means "not mine, let the brain try"."""
         start = time.monotonic()
         with (spans or null_spans)("router.fast_path", command=cmd.name) as s:
             result = await self._run(cmd, principal, event_id, trace_id)

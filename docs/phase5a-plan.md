@@ -1,3 +1,5 @@
+> **Superseded in part by PER-256** (2026-10-22): the labeler, the intents and their toolsets described here are deleted; the local model only routes and Claude calls the tools. See [`brain-plan.md`](brain-plan.md#per-256-qwen-only-routes-claude-is-the-one-brain-2026-10-22).
+
 # Phase 5a plan: the Seatbelt sandbox and the Claude runner
 
 > **Historical.** This describes the first runner model: fresh clones per run, the bundle handback, the deny-all-of-home Seatbelt profile and no secrets in a worker's env. Employee mode replaced it (EM-1 to EM-10). For what exists now, read [`employee-plan.md`](employee-plan.md), [`architecture.md`](architecture.md) and [`interfaces.md`](interfaces.md). What carried over: kill and cancel, budgets and time limits, transcripts, usage-limit waits, the reaper, pulse progress items and resume after restart.

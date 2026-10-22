@@ -277,10 +277,10 @@ class IMessageChannel:
             # so a crash or a failed later chunk never leaves it unrecorded (noting one that
             # didn't go out only asks a yes for its code). Any other text (a prompt, a reminder)
             # is noted only once it went out: noting a failed one would hide an earlier answer.
-            claude = text.startswith(outbound.CLAUDE_PREFIX)
+            claude = outbound.is_claude_send(dedupe_key)
             at = self.clock()
             if claude:
-                outbound.note(self.conn, principal, text, at, dedupe_key)
+                outbound.note(self.conn, principal, at, dedupe_key)
             for i, chunk in enumerate(chunks, 1):
                 try:
                     await self.sender.send(handle, chunk)
@@ -318,7 +318,7 @@ class IMessageChannel:
                     ref=ref.ref,
                 )
             if not claude:
-                outbound.note(self.conn, principal, text, at, dedupe_key)
+                outbound.note(self.conn, principal, at, dedupe_key)
         log.info("imessage sent to %s (%d chars, %d part(s))", principal, len(text), len(chunks))
         return ref
 

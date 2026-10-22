@@ -1,5 +1,5 @@
 """MediaRunner (``runner="media"``, task kind ``media``): an owner's message with attachments
-(BR-7, docs/brain-plan.md D10). The router sends it here in both ``brain.mode``s, right after
+(BR-7, docs/brain-plan.md D10). The router sends it here right after
 the slash commands; the reader only attaches files to the owner's messages.
 
 - **Images and PDFs** (up to 4): once the files are on disk (Messages may still be

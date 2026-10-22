@@ -16,9 +16,10 @@ from typing import Any
 
 import pytest
 from test_batch_approvals import CLOSE, MEMBER, OWNER, TTL_S, Ctx, H, principals
-from test_local_runner_gated import Clock, FakeChannel, FakeModel
+from test_local_runner_gated import Clock, FakeChannel
 
 from resonant.brain.history import EARLY_ANSWER, replayed
+from resonant.e2e.fakes import ScriptedModel
 from resonant.executor import Executor, HandlerKey, ToolHandler
 from resonant.gate import Intent, NeedsApproval, PolicyGate
 from resonant.gateway.channel import ChannelRefused, ChannelSendError, approval_dedupe_key
@@ -72,7 +73,7 @@ def h(db: sqlite3.Connection) -> H:
                       batch_max=3)  # fmt: skip
     executor = Executor(db, gate, handlers)
     channel = FakeChannel()
-    runner = LocalRunner(db, model=FakeModel(), channel=channel, gate=gate, executor=executor,
+    runner = LocalRunner(db, model=ScriptedModel(), channel=channel, gate=gate, executor=executor,
                          registry=registry, now=clock)  # fmt: skip
     return H(db, clock, gate, runner, channel, ran, set(), set())
 
@@ -266,7 +267,7 @@ def test_reminder_text() -> None:
 async def test_a_bare_yes_right_after_a_claude_answer_needs_the_code(h: H) -> None:
     task_id, needs = await lone(h)
     h.clock.advance(5)
-    outbound.note(h.db, OWNER, "Claude: Looks fine. Reply yes to go ahead.", h.clock())
+    outbound.note(h.db, OWNER, h.clock(), "ask:t1")  # a Claude answer: its key marks it
     refused = h.reply("yes")
     assert (refused.ok, refused.reason) == (False, "code_required")
     sent = [p for p in h.gate.pending_for(OWNER)]
@@ -277,20 +278,41 @@ async def test_a_bare_yes_right_after_a_claude_answer_needs_the_code(h: H) -> No
     assert h.ran == ["close:A"]
 
 
+def test_only_the_ask_runners_answers_are_claude_sends() -> None:
+    """PER-256: no visible prefix; the dedupe key marks a Claude answer. The ack and every
+    other text are not; the ask runner's other texts (limit notices) fail closed."""
+    assert outbound.is_claude_send("ask:t1")
+    assert outbound.is_claude_send("ask:limit:2026-10-22T22:00:00+00:00")  # fails closed
+    assert outbound.is_claude_send("ask:down:t1")  # Claude-down and cap notices count too
+    assert outbound.is_claude_send("ask:cap:2026-10-22")
+    assert not outbound.is_claude_send("ask:ack:t1")
+    assert not outbound.is_claude_send("reply:t1")
+    assert not outbound.is_claude_send("approval:a7:prompt:justin")
+    assert not outbound.is_claude_send(None)
+
+
+async def test_an_ack_does_not_make_a_bare_yes_need_the_code(h: H) -> None:
+    _, needs = await lone(h)
+    outbound.note(h.db, OWNER, h.clock(), approval_dedupe_key(needs.id, OWNER))
+    h.clock.advance(5)
+    outbound.note(h.db, OWNER, h.clock(), "ask:ack:t1")  # "On it": not Claude's answer
+    assert h.reply("yes").ok
+
+
 async def test_a_later_text_keeps_it_until_the_prompt_is_shown_again(h: H) -> None:
     _, needs = await lone(h)
-    outbound.note(h.db, OWNER, "[X] prompt", h.clock(), approval_dedupe_key(needs.id, OWNER))
+    outbound.note(h.db, OWNER, h.clock(), approval_dedupe_key(needs.id, OWNER))
     h.clock.advance(5)
-    outbound.note(h.db, OWNER, "Claude: something", h.clock(), "ask:t1")
+    outbound.note(h.db, OWNER, h.clock(), "ask:t1")
     h.clock.advance(5)
-    outbound.note(h.db, OWNER, "on it", h.clock(), "reply:t1")  # an ack after the answer
+    outbound.note(h.db, OWNER, h.clock(), "ask:ack:t1")  # an ack after the answer
     assert h.reply("yes").reason == "code_required"  # Claude's text still came after the prompt
     h.clock.advance(5)
-    outbound.note(h.db, OWNER, "[X] still waiting", h.clock(), reminder_key(needs.id, OWNER))
+    outbound.note(h.db, OWNER, h.clock(), reminder_key(needs.id, OWNER))
     assert h.reply("yes", event="e2").ok  # the reminder showed the prompt again
     _, other = await lone(h)
     h.clock.advance(5)
-    outbound.note(h.db, OWNER, "Claude: something else", h.clock())
+    outbound.note(h.db, OWNER, h.clock(), "ask:t2")
     assert h.reply("no", decision="deny", event="e3").ok
     assert other.code
 
@@ -298,14 +320,14 @@ async def test_a_later_text_keeps_it_until_the_prompt_is_shown_again(h: H) -> No
 async def test_a_yes_sent_before_the_claude_answer_still_binds(h: H) -> None:
     _, _needs = await lone(h)
     later = h.clock.now + timedelta(seconds=30)
-    outbound.note(h.db, OWNER, "Claude: arrived after the owner's yes", later)
+    outbound.note(h.db, OWNER, later, "ask:t1")
     assert h.reply("yes").ok  # judged by what had been sent when the reply was
 
 
 async def test_yes_some_right_after_a_claude_answer_needs_the_code(h: H) -> None:
     task_id, _ = await batch_of(h)
     h.clock.advance(5)
-    outbound.note(h.db, OWNER, "Claude: done looking", h.clock())
+    outbound.note(h.db, OWNER, h.clock(), "ask:t1")
     refused = h.reply("yes 1,3", picks=(1, 3))
     assert refused.reason == "code_required"
     code = h.code()
@@ -322,15 +344,15 @@ def test_outbound_fails_closed_when_the_prompt_fell_out_of_the_window(
 ) -> None:
     t0 = datetime(2026, 10, 19, 15, 0, tzinfo=UTC)
     later = t0 + timedelta(hours=1)
-    outbound.note(db, OWNER, "[A7] OK to close?", t0, "approval:a7:prompt:justin")
-    outbound.note(db, OWNER, "Claude: first", t0 + timedelta(seconds=1), "ask:t1")
+    outbound.note(db, OWNER, t0, "approval:a7:prompt:justin")
+    outbound.note(db, OWNER, t0 + timedelta(seconds=1), "ask:t1")
     for n in range(1, outbound.KEEP + 3):
-        outbound.note(db, OWNER, f"text {n}", t0 + timedelta(minutes=n), f"reply:{n}")
+        outbound.note(db, OWNER, t0 + timedelta(minutes=n), f"reply:{n}")
     kept = db.execute("SELECT value FROM kv WHERE key = ?", (outbound.KV_PREFIX + OWNER,))
     assert len(json.loads(kept.fetchone()[0])) == outbound.KEEP
     # both the prompt and Claude's answer were pushed out: the last Claude answer still counts
     assert outbound.claude_since(db, OWNER, {"approval:a7:prompt:justin"}, later) is True
-    outbound.note(db, OWNER, "[A7] still waiting", later, "approval:a7:remind:justin")
+    outbound.note(db, OWNER, later, "approval:a7:remind:justin")
     assert outbound.claude_since(db, OWNER, {"approval:a7:remind:justin"}, later) is False
     assert outbound.claude_since(db, "nobody", set(), later) is False
 

@@ -4,9 +4,12 @@ D8, ``runners/ask.py``).
 ``ask_claude{question, kind?, attachments?}`` queues an ask task (``runner="ask"``) and returns
 at once with ``{"queued": true, "task_id", "text": "Looking into it…"}``; the answer reaches
 the requester as its own message when Claude is done. A refusal (off, paused, usage limit,
-daily cap, a bad attachment) is a normal result, ``{"queued": false, "text": <why>}``.
-BR-11: a turn of the Claude brain adds ``"session": true`` and, when others are ahead of it,
-``"after"`` (``after "why is R4 slow", then this``); a full queue is ``"busy": true``.
+daily cap, a bad attachment) is a normal result, ``{"queued": false, "text": <why>, "reason":
+<code>}`` (and ``"until"``, an iso time, for a usage limit): the brain answers from the code,
+never from the text. BR-11: a turn of the Claude brain adds ``"session": true`` and, when
+others are ahead of it, ``"after"`` (``after "why is R4 slow", then this``); a full queue is
+``"busy": true``. PER-256: the brain's one deferred ack travels in ``ASKING_ACK`` (set by
+code around the call), never as a model argument.
 
 - ``kind``: ``general`` (default), ``research``, ``email``, ``calendar``, ``image``, ``link``.
   Only ``email`` and ``calendar`` asks get connector tools, and only their read tools.
@@ -31,6 +34,7 @@ whoever the calling task belongs to. Its answer is untrusted, so the spec is
 from __future__ import annotations
 
 from contextvars import ContextVar
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from resonant.executor import CallContext, ContextHandler, ToolFailed, ToolHandler
@@ -47,6 +51,9 @@ RUNNER = "ask"
 # turn is tainted as many hops from outside content as the turn that asked, so the
 # chain can't sustain itself. None: not set (or the turn is clean).
 ASKING_HOPS: ContextVar[int | None] = ContextVar("asking_hops", default=None)
+# PER-256: the one short ack the asking brain turn wants sent if the answer is slow (set by
+# code around its call, like ``ASKING_HOPS``). None: no ack.
+ASKING_ACK: ContextVar[str | None] = ContextVar("asking_ack", default=None)
 BRAIN_RUNNER = "brain"  # runners.brain.NAME
 QUESTION_MAX = 4000  # runners.ask.QUESTION_MAX (a test checks they agree)
 ATTACH_MAX = 4  # runners.ask.ATTACH_MAX
@@ -56,11 +63,10 @@ NOT_RUNNING = "ask_claude isn't available: the ask runner isn't running (iMessag
 ASK_CLAUDE = ToolSpec(
     name="ask_claude",
     description=(
-        "Hand a question to Claude when you're stuck or it needs the web, an image or a link. "
-        "It answers the owner by text in a minute or two; you get back only that it's queued, "
-        "so tell the owner you're looking into it. `kind`: research (web), image (with "
-        "`attachments`), link, or general. Claude uses Resonant's tools through the same "
-        "approvals as yours. Claude can't reach the owner's email or calendar either."
+        "Hand a message to Claude, which answers the owner by text in a minute or two. "
+        "`kind`: research (web), image (with `attachments`), link, or general. Claude uses "
+        "Resonant's tools through the same approvals as yours. Claude can't reach the owner's "
+        "email or calendar."
     ),
     args_schema={
         "type": "object",
@@ -102,6 +108,7 @@ class AskApi(Protocol):
         tools: bool = False,
         tainted: bool = False,
         taint_hops: int | None = None,
+        ack: str | None = None,
     ) -> Queued | AskRefused: ...
 
 
@@ -145,7 +152,7 @@ class AskClaude(ContextHandler):
         question, kind, attachments = parse_args(args)
         runner = self._runner()
         if runner is None:
-            return {"queued": False, "text": NOT_RUNNING}
+            return {"queued": False, "text": NOT_RUNNING, "reason": "not_running"}
         principal, channel_ref, trace_id, requested_by = runner.owner, None, None, None
         tools, tainted = False, False
         if ctx is not None:
@@ -167,6 +174,7 @@ class AskClaude(ContextHandler):
             tools=tools,
             tainted=tainted,
             taint_hops=ASKING_HOPS.get() if tainted else None,
+            ack=ASKING_ACK.get() if tools else None,
         )
         task_id: object = getattr(result, "task_id", None)
         if isinstance(task_id, str):
@@ -179,6 +187,12 @@ class AskClaude(ContextHandler):
                     out["after"] = after
             return out
         refused: dict[str, Any] = {"queued": False, "text": result.text}
+        reason: object = getattr(result, "reason", None)
+        if isinstance(reason, str):  # PER-256: the brain answers from this, not from the text
+            refused["reason"] = reason
+        until: object = getattr(result, "until", None)
+        if isinstance(until, datetime):
+            refused["until"] = until.isoformat()
         if getattr(result, "busy", False) is True:  # BR-11: the Claude brain's queue is full
             refused["busy"] = True
         return refused

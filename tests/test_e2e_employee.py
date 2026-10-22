@@ -35,15 +35,23 @@ from typing import Any
 import pytest
 import test_e2e_runner
 from test_e2e_relay import RelayModel, ask, prompts, text_like
-from test_e2e_runner import PR_URL, REPO, FakeChatDB, World, chat, make_world, running, settled
+from test_e2e_runner import (
+    PR_URL,
+    REPO,
+    FakeChatDB,
+    World,
+    chat,
+    make_world,
+    running,
+    settled,
+    start_run_plan,
+)
 from test_runner_claude import FAKE, bare, git, opened, until
 
-from resonant.models import ChatMessage, ModelReply, SpanFactory, ToolCall
 from resonant.runners import claude as claude_mod
 from resonant.store import pulse as pulse_store
 from resonant.store import trust as trust_store
 from resonant.store.db import utcnow
-from resonant_sdk import ToolSpec
 
 __all__ = ["chat"]  # the fixture
 
@@ -51,53 +59,9 @@ TRADING = "trading-api"
 
 
 class EmployeeModel(RelayModel):
-    """The relay's model plus the employee plan's phrasings: "spawn a claude to <ask> in
-    <repo>" and "do a manual db update …" (no repo) start runs, "always ask before merging in
-    <area>" adds a rule, and "merge R<n>" merges that run."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.rules = (
-            ("spawn a claude", "run_project"),
-            ("manual db update", "run_project"),
-            ("always ask before", "rules"),
-            ("merge r", "run_project"),
-            *self.rules,
-        )
-
-    async def chat_tools(
-        self,
-        messages: list[ChatMessage],
-        *,
-        tools: list[ToolSpec],
-        max_tokens: int = 512,
-        spans: SpanFactory | None = None,
-    ) -> ModelReply:
-        names = {t.name for t in tools}
-        current = next(
-            (m["content"] for m in reversed(messages) if "<message>" in m["content"]), ""
-        )
-        text = current.split("<message>", 1)[-1].split("</message>", 1)[0].strip()
-        asked = any(
-            m["role"] == "assistant" and m["content"].startswith('{"tool_call"') for m in messages
-        )
-        call: ToolCall | None = None
-        if not asked:
-            if (m := re.match(r"spawn a claude to (.+) in (\S+)$", text)) and "start_run" in names:
-                call = ToolCall("start_run", {"repo": m[2], "ask": m[1]})
-            elif text.startswith("do a manual db update") and "start_run" in names:
-                call = ToolCall("start_run", {"ask": text})
-            elif (m := re.match(r"always ask before merging in (\S+)$", text)) and (
-                "add_trust_rule" in names
-            ):
-                call = ToolCall("add_trust_rule", {"scope": m[1], "action": "merge",
-                                                   "effect": "ask"})  # fmt: skip
-            elif (m := re.match(r"merge (R\d+)$", text)) and "merge_run" in names:
-                call = ToolCall("merge_run", {"code": m[1]})
-        if call is None:
-            return await super().chat_tools(messages, tools=tools, max_tokens=max_tokens)
-        self.calls["tools"] += 1
-        return ModelReply(None, [call], None, 1, 10, 5)
+    """The relay's model; the employee plan's phrasings ("spawn a claude to <ask> in <repo>",
+    "do a manual db update …", "always ask before merging in <area>", "merge R<n>") are the
+    fake Claude brain's (PER-256): each test scripts it with ``World.claude``."""
 
 
 @pytest.fixture(autouse=True)
@@ -175,8 +139,15 @@ async def test_three_workers_ask_at_once_then_spawn_a_claude_to_a_pr_in_the_dige
         assert w.runner.open_questions() == []
 
         # "spawn a claude to build out XYZ": the ack, the question, the answer, the PR
-        started = await ask(w, f"spawn a claude to build out the search page in {REPO}",
-                            starts("Working on it."), "the ack")  # fmt: skip
+        # PER-256: the thread holds the workers' reports (outside text), so Claude's turn is
+        # tainted and starting the run asks first: the answer, then the prompt, then a yes
+        w.claude(**start_run_plan("build out the search page"))
+        answer = await ask(w, f"spawn a claude to build out the search page in {REPO}",
+                           starts("Working on it."), "Claude's answer")  # fmt: skip
+        assert answer == "Working on it."
+        await text_like(w, lambda t: "OK to start a run on" in t, "the start ask")
+        await asyncio.sleep(1.1)  # chat.db times have one-second resolution (the binding rule)
+        started = await ask(w, "yes", starts("On it: R4"), "the run")
         assert started.endswith(
             f"On it: R4 · {REPO}. Up to 45m. /runs to check, /cancel R4 to stop."
         )
@@ -332,6 +303,9 @@ async def test_a_rule_taught_over_chat_makes_trading_merges_ask_and_only_those(
         update={"remote": f"github.com/own/{TRADING}"}
     )
     async with running(w):
+        w.claude(calls=[{"name": "add_trust_rule", "args": {"scope": "trading", "action": "merge",
+                                                           "effect": "ask"}}],
+                 answer="Done.")  # fmt: skip
         taught = await ask(w, "always ask before merging in trading", lambda t: "Rule" in t,
                            "the rule")  # fmt: skip
         assert "Rule added: ask before merge in trading (rule 1)." in taught, taught
@@ -344,14 +318,17 @@ async def test_a_rule_taught_over_chat_makes_trading_merges_ask_and_only_those(
         await text_like(w, lambda t: bare(t).startswith("R2 opened PR #42"), "R2 done")
 
         # trading-api is in the trading area: a chat merge asks a plain yes, nothing merged
-        prompt = await ask(w, "merge R1", lambda t: "merge R1" in t, "the merge ask")
+        w.claude(calls=[{"name": "merge_run", "args": {"code": "R1"}}], answer="Asked you.")
+        prompt = await ask(w, "merge R1", lambda t: "merge R1:" in t, "the merge ask")
         assert f"merge R1: PR #41 in {TRADING} " in prompt and prompt.endswith("Reply yes / no")
         assert w.gh_calls("merge") == [] and w.run("R1").status == "ready"
         await asyncio.sleep(1.1)
         assert await ask(w, "no", lambda t: t == "Not done.", "the no") == "Not done."
         assert w.run("R1").status == "ready"
-        # demo isn't: the same words merge it without asking
-        merged = await ask(w, "merge R2", lambda t: "R2 merged" in t, "the demo merge")
+        # demo isn't in the trading area: the rule doesn't touch it (/merge is the owner's own
+        # word; a chat merge here would ask anyway, the worker reports in the thread are
+        # outside text for Claude's turn)
+        merged = await ask(w, "/merge R2", lambda t: "R2 merged" in t, "the demo merge")
         assert "R2 merged: PR #42." in merged
         assert len(w.gh_calls("merge")) == 1 and w.run("R2").status == "merged"
 
@@ -364,6 +341,8 @@ async def test_a_scratch_run_has_no_repo_no_token_and_reports_in_the_digest(
 ) -> None:
     w = make_world(tmp_path, resonant_home, chat, monkeypatch, scenario="scratch")
     async with running(w):
+        manual = "do a manual db update in dori: end acme's trial on friday"
+        w.claude(calls=[{"name": "start_run", "args": {"ask": manual}}], answer="Working on it.")
         started = await ask(w, "do a manual db update in dori: end acme's trial on friday",
                             starts("Working on it."), "the ack")  # fmt: skip
         assert started.endswith(

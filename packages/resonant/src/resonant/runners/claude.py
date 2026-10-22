@@ -400,6 +400,8 @@ SCRATCH_RESUME_PROMPT = (
 
 _LIMIT = re.compile(r"usage limit|rate limit|hit your limit|limit reached", re.IGNORECASE)
 _EPOCH = re.compile(r"\|\s*(\d{10})\b")
+# "5-hour limit reached ∙ resets 3pm", "resets at 3:30 PM": a clock time, no date (PER-256).
+_RESETS = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b", re.IGNORECASE)
 
 
 # --- results of the public API -------------------------------------------------------------
@@ -822,11 +824,31 @@ class LimitHit:
     reset_at: datetime | None
 
 
-def usage_limit(result: Mapping[str, Any]) -> LimitHit | None:
+def reset_clock(text: str, tz: ZoneInfo, now: datetime) -> datetime | None:
+    """The next occurrence, after ``now``, of the clock time a limit message names
+    (``resets 3pm``) in ``tz``, or None when it names none."""
+    m = _RESETS.search(text)
+    if m is None:
+        return None
+    hour, minute = int(m[1]), int(m[2] or 0)
+    if not (1 <= hour <= 12 and minute < 60):
+        return None
+    hour = hour % 12 + (12 if m[3].lower() == "p" else 0)
+    local = now.astimezone(tz)
+    at = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if at <= local:
+        at += timedelta(days=1)
+    return at.astimezone(UTC)
+
+
+def usage_limit(
+    result: Mapping[str, Any], *, tz: ZoneInfo | None = None, now: datetime | None = None
+) -> LimitHit | None:
     """Whether a final stream-json ``result`` is a usage or rate limit, and when it resets.
 
     The shape is Claude Code's, read defensively: an error result whose subtype or text names
-    a limit; the reset is an epoch in ``resets_at``/``reset_at`` or after a ``|`` in the text.
+    a limit; the reset is an epoch in ``resets_at``/``reset_at`` or after a ``|`` in the text,
+    or (with ``tz``) a clock time in it (``resets 3pm``: the next one in ``tz``, after ``now``).
     """
     if result.get("is_error") is not True:
         return None
@@ -840,6 +862,9 @@ def usage_limit(result: Mapping[str, Any]) -> LimitHit | None:
             epoch = float(value)
     if epoch is None and (m := _EPOCH.search(text)):
         epoch = float(m[1])
+    if epoch is None and tz is not None:
+        at = reset_clock(text, tz, now or datetime.now(UTC))
+        return LimitHit(at)
     return LimitHit(None if epoch is None else datetime.fromtimestamp(epoch, UTC))
 
 

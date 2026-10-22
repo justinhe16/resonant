@@ -60,7 +60,7 @@ trust:
 extensions:
   max_concurrent_jobs: 4                # L0 jobs running at once (1..16)
   result_max_bytes: 32768               # a tool or job result is stored (redacted) up to this
-  model_result_max_chars: 4096          # the model sees this much of it, as untrusted data
+  model_result_max_chars: 4096          # unused since PER-256 (the local model calls no tool)
   process:
     # An extension process's whole PATH. System dirs only: Claude workers can write
     # /opt/homebrew/bin. gh and git are pinned by absolute path at install (argv[0], or a
@@ -107,17 +107,13 @@ pulse:
 # The brain's read tools (docs/brain-plan.md D5; read_file, list_dir, search, tail_log,
 # read_transcript) and ask_claude (D8). Defaults shown commented out:
 # brain:
-#   mode: loop                          # default since BR-8: every chat message goes to the brain
-#                                       #   loop (core tools plus stubs, ask_claude, taint); intents:
-#                                       #   the labeler and one intent's fixed tools instead
-#   route: triage                       # BR-10, loop mode: triage (the local model's first call picks
-#                                       #   itself or Claude; Claude gets an instant ack first), local
-#                                       #   (as before BR-10: Claude only when the loop asks or is stuck),
-#                                       #   claude (every chat turn to Claude, after a local ack)
+#   route: triage                       # PER-256: the local model only routes. triage: it types each text;
+#                                       #   a greeting, an ack and a plain "anything new?" are answered
+#                                       #   here (the news from code), everything else goes to Claude,
+#                                       #   the one voice. claude: even those go to Claude.
+#                                       #   (mode: and route: local are deprecated: ignored, with a warning)
 #   triage:
-#     bias: normal                      # normal: easy ones stay local; claude: only status, notes,
-#                                       #   reminders and small talk stay local
-#     timeout_s: 8                      # past it the turn goes to Claude with a canned ack
+#     timeout_s: 8                      # past it the turn goes to Claude (bias: is deprecated, ignored)
 #   read_roots: null                    # null: runner.code_dir, ~/resonant, ops.repo_path and
 #                                       #   Resonant's logs, docs and run transcripts; a list replaces them
 #   read_deny: []                       # added to the built-in deny list (~/Documents, ~/Library, ~/.ssh,
@@ -132,7 +128,8 @@ pulse:
 #                                       #   false: those asks are read-only, as in BR-5
 #     concurrency: 1                    # sessions at once, apart from the worker slots
 #     daily_cap: 0                      # messages to Claude a day (brain turns, asks, media, watch
-#                                       #   checks); 0: none (BR-11). Hit: you're told once, qwen answers
+#                                       #   checks); 0: none (BR-11). Hit: you're told once; approvals
+#                                       #   and /status still work
 #     timeout_s: 120
 #     max_turns: 15
 #     reply_max_chars: 1500
@@ -149,7 +146,9 @@ pulse:
 #     rotate_turns: 50                  # a fresh session (primed from Resonant's history) after this
 #     rotate_hours: 12                  #   many turns or hours (Claude Code also auto-compacts)
 #     turn_timeout_s: 240               # a turn past this is a hang: killed, the next starts fresh
-#     queue_max: 3                      # hard texts waiting behind the one in flight
+#     queue_max: 5                      # texts waiting behind the one in flight (Claude answers them all)
+#     ack_after_s: 8                    # the one short "on it" goes out only if the answer takes longer
+#     retry_after_s: 60                 # Claude down: you're told once, the text is tried again after this
 #     max_per_hour: 60                  # runaway guard over every message to Claude; 0: off
 #     pause_check_s: 5                  # an idle session stops this soon after a CLI pause
 #     transcript_days: 14               # its earlier sessions' transcripts kept this long; 0: kept

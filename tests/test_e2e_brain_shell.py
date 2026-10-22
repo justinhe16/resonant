@@ -108,9 +108,9 @@ async def test_a_commit_count_is_a_read_that_never_asks(
             ],
             answer="resonant has {r1} commits ({r2} on main)",
         )
-        _, answer = await w.say("how many commits does resonant have?", replies=2)
+        (answer,) = await w.say("how many commits does resonant have?")
         await w.settled()
-        assert answer == "Claude: resonant has 2 commits (1 on main)"
+        assert answer == "resonant has 2 commits (1 on main)"
         assert w.rows("SELECT 1 FROM approvals") == []
         rows = tools(w)
         assert [(r["tool"], r["decision"], r["status"]) for r in rows] == [
@@ -134,7 +134,7 @@ async def test_a_read_outside_the_read_roots_is_refused(
         secret.write_text("SECRET-OUTSIDE")
         w.model.triage = CLAUDE
         w.claude(shell=[{"tool": "Bash", "command": f"cat {secret} | head -1"}], answer="{r0}")
-        _, answer = await w.say("what's in that file?", replies=2)
+        (answer,) = await w.say("what's in that file?")
         await w.settled()
         assert "SECRET-OUTSIDE" not in answer and "outside the folders" in answer
         assert w.rows("SELECT 1 FROM approvals") == []
@@ -153,9 +153,9 @@ async def test_a_feature_branch_push_runs_and_reports(
         w.model.triage = CLAUDE
         w.claude(shell=[{"tool": "Bash", "command": f"cd {repo} && git push -q origin feat"}],
                  answer="Pushed.")  # fmt: skip
-        _, answer = await w.say("push feat", replies=2)
+        (answer,) = await w.say("push feat")
         await w.settled()
-        assert answer == "Claude: Pushed.\nDid: pushed feat in r"
+        assert answer == "Pushed.\nDid: pushed feat in r"
         assert remote_head(remote, "feat") == git(repo, "rev-parse", "feat")
         assert shell_gated(w) == [("Allow", "inferred")]  # an untainted L3: no ask
         (row,) = tools(w)
@@ -179,8 +179,8 @@ async def test_a_push_to_main_asks_and_yes_runs_it_in_a_new_turn(
             shell=[{"tool": "Bash", "command": push}],
             answer="{r0}",
         )  # fmt: skip
-        _, answer, prompt = await w.say("push main", replies=3)
-        assert answer.startswith("Claude: asked the owner: run `cd ")
+        answer, prompt = await w.say("push main", replies=2)
+        assert answer.startswith("asked the owner: run `cd ")
         assert prompt.startswith("[") and "&& git push -q origin main` in" in prompt
         assert prompt.rsplit("? Reply", 1)[0].endswith("/code/r")  # where it runs
         assert "Reply yes" in prompt and "yes always" not in prompt
@@ -191,7 +191,7 @@ async def test_a_push_to_main_asks_and_yes_runs_it_in_a_new_turn(
         assert approved.startswith("Approved: `cd ") and approved.endswith(
             "&& git push -q origin main`; Claude runs it now."
         )
-        assert ran == "Claude: Pushed main: (Bash completed with no output)\nDid: pushed main in r"
+        assert ran == "Pushed main: (Bash completed with no output)\nDid: pushed main in r"
         await w.settled()
         assert remote_head(remote, "main") == git(repo, "rev-parse", "main")
         # the approved turn's message is Resonant's, naming the exact command and its dir
@@ -211,7 +211,7 @@ async def test_no_means_it_never_runs(
         w.model.triage = CLAUDE
         w.claude(shell=[{"tool": "Bash", "command": f"cd {repo} && git push -q origin main"}],
                  answer="{r0}")  # fmt: skip
-        await w.say("push main", replies=3)
+        await w.say("push main", replies=2)
         await prompt_recorded(w)
         assert await w.say("no") == ["Not done."]
         await w.settled()
@@ -235,9 +235,9 @@ async def test_the_never_list_is_refused_without_asking(
     async with start(resonant_home, chat, tmp_path) as w:
         w.model.triage = CLAUDE
         w.claude(shell=[{"tool": "Bash", "command": command}], answer="{r0}")
-        _, answer = await w.say("do the thing", replies=2)
+        (answer,) = await w.say("do the thing")
         await w.settled()
-        assert answer.startswith("Claude: not run: ") and "Never try another way" in answer
+        assert answer.startswith("not run: ") and "Never try another way" in answer
         assert w.rows("SELECT 1 FROM approvals") == []
         assert [d for d, _ in shell_gated(w)] == ["Deny"]
         (row,) = tools(w)
@@ -255,7 +255,7 @@ async def test_a_write_to_resonant_home_is_refused(
             {"tool": "Write", "file_path": str(config), "content": "autonomy: on"},
             {"tool": "Bash", "command": f"echo x >> {config}"},
         ], answer="{r0} | {r1}")  # fmt: skip
-        _, answer = await w.say("fix my config", replies=2)
+        (answer,) = await w.say("fix my config")
         await w.settled()
         assert answer.count("not run: writes under ~/.resonant or the keychains aren't") == 2
         assert (config.read_text() if config.exists() else None) == before
@@ -270,7 +270,7 @@ async def test_a_compound_command_asks_and_isnt_a_read(
         w.model.triage = CLAUDE
         w.claude(shell=[{"tool": "Bash", "command": f"cd {repo} && git log -1 && git push -q"}],
                  answer="{r0}")  # fmt: skip
-        _, answer, prompt = await w.say("log then push", replies=3)
+        answer, prompt = await w.say("log then push", replies=2)
         assert "asked the owner" in answer and "git log -1 && git push -q" in prompt
         assert shell_gated(w)[0] == ("NeedsApproval", "inferred")
         assert remote_head(remote, "feat") is None
@@ -287,7 +287,7 @@ async def test_a_tainted_turn_asks_before_a_shell_write(
             {"tool": "Bash", "command": f"git -C {repo} log -1"},
             {"tool": "Bash", "command": f"cd {repo} && git push -q origin feat"},
         ], answer="{r1}")  # fmt: skip
-        _, answer, prompt = await w.say("check the log, then push feat", replies=3)
+        answer, prompt = await w.say("check the log, then push feat", replies=2)
         assert "asked the owner" in answer and "Reply yes" in prompt
         assert set(shell_gated(w)) == {("NeedsApproval", "tainted")}
         assert remote_head(remote, "feat") is None
@@ -302,7 +302,7 @@ async def test_claude_cant_call_the_permission_tool_itself(
         fake = {"tool_name": "Bash", "input": {"command": f"cd {repo} && git push -q origin feat"},
                 "tool_use_id": "t-made-up"}  # fmt: skip
         w.claude(calls=[{"name": "permission", "args": fake}], answer="{r0}")
-        _, answer = await w.say("push feat", replies=2)
+        (answer,) = await w.say("push feat")
         await w.settled()
         assert "doesn't match a tool call" in answer
         assert shell_gated(w) == []
@@ -324,9 +324,9 @@ async def test_a_standing_allow_for_a_verb_in_a_repo(
         w.model.triage = CLAUDE
         w.claude(shell=[{"tool": "Bash", "command": f"cd {repo} && git push -q origin main"}],
                  answer="Pushed.")  # fmt: skip
-        _, answer = await w.say("push main", replies=2)
+        (answer,) = await w.say("push main")
         await w.settled()
-        assert answer == "Claude: Pushed.\nDid: pushed main in r"
+        assert answer == "Pushed.\nDid: pushed main in r"
         assert remote_head(remote, "main") == git(repo, "rev-parse", "main")
         (row,) = [a for a in w.audits("gate.evaluate") if a["tool"] == "shell"]
         assert (row["decision"], row["detail"]["standing"]) == ("Allow", True)

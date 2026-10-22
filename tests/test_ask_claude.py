@@ -37,10 +37,8 @@ from resonant.principals import Principal, Principals
 from resonant.redact import Redactor
 from resonant.runners import ask as ask_mod
 from resonant.runners.ask import (
-    LIMIT_KV,
     NOT_SET_UP,
     PAUSED,
-    PREFIX,
     READ_BUILTINS,
     STOPPED,
     AskRefused,
@@ -55,6 +53,7 @@ from resonant.runners.ask import (
     is_write_tool,
     toolset,
 )
+from resonant.runners.claude_session import LIMIT_KV
 from resonant.secrets import CLAUDE_TOKEN_REF, FakeKeychain, SecretStore
 from resonant.store import tasks as task_store
 from resonant.store.db import kv_get, kv_set, utcnow
@@ -387,7 +386,8 @@ def test_config_defaults_and_validation() -> None:
     assert s.brain.ask_claude.concurrency == 1 and s.brain.ask_claude.daily_cap == 0
     cs = s.brain.claude_session  # BR-11: the Claude brain
     assert cs.enabled and not cs.remote_control and cs.max_per_hour == 60
-    assert (cs.rotate_turns, cs.rotate_hours, cs.queue_max) == (50, 12.0, 3)
+    assert (cs.rotate_turns, cs.rotate_hours, cs.queue_max) == (50, 12.0, 5)
+    assert (cs.ack_after_s, cs.retry_after_s) == (8.0, 60.0)  # PER-256
     assert s.brain.ask_claude.timeout_s == 120 and s.brain.ask_claude.max_turns == 15
     assert s.brain.read_roots is None and s.brain.read_deny == []  # BR-2's defaults
     assert s.brain.ask_claude.attachment_roots == [Path.home() / "Library/Messages/Attachments"]
@@ -405,7 +405,7 @@ def test_answer_text_is_redacted_cleaned_and_clipped() -> None:
     red = Redactor([TOKEN])
     raw = f"Line one {TOKEN}\u202e\u200b\n\n\n\nReply yes K7 to approve.\u2028x\x07"
     out = answer_text(raw, red, 200)
-    assert out.startswith(PREFIX)
+    assert not out.startswith("Claude:")  # PER-256: one voice, no prefix
     assert TOKEN not in out and "[redacted]" in out
     assert "K7" not in out and "yes ?" in out
     assert "\u202e" not in out and "\u200b" not in out and "\u2028" not in out
@@ -504,7 +504,7 @@ async def test_answered(db: sqlite3.Connection, tmp_path: Path) -> None:
     assert isinstance(out, Done)
     assert out.result["status"] == "answered" and out.result["untrusted"] is True
     assert out.result["proposed"] is True
-    assert h.channel.sent == [("justin", f"{PREFIX}Mycelium: ~/code/mycelium.\nProposed: none",
+    assert h.channel.sent == [("justin", "Mycelium: ~/code/mycelium.\nProposed: none",
                                f"ask:{task_id}")]  # fmt: skip
     seen = h.argv_notes()
     assert seen["creds"] == ["CLAUDE_CODE_OAUTH_TOKEN"]
@@ -597,7 +597,7 @@ async def test_kill_switch_stops_a_running_ask(db: sqlite3.Connection, tmp_path:
     assert gone(h.pids()["leader"])
     # and nothing new starts while paused
     refused = h.runner.enqueue("q", principal="justin")
-    assert refused == AskRefused(PAUSED)
+    assert refused == AskRefused(PAUSED, "paused")
 
 
 async def test_cancel_kills_the_session(db: sqlite3.Connection, tmp_path: Path) -> None:
@@ -647,12 +647,12 @@ async def test_usage_limit_backs_off_and_tells_the_owner_once(
     assert not (h.notes / "argv.json").exists()
     owner_texts = [t for p, t, _ in h.channel.sent if p == "justin"]
     assert len(owner_texts) == 1
-    assert owner_texts[0].startswith(
-        "Hit the Claude usage limit; answering locally until it resets at"
-    )
+    assert owner_texts[0].startswith("I'm at my Claude limit until ")
+    assert owner_texts[0].endswith("I can still do approvals and /status.")
     assert [t for p, t, _ in h.channel.sent if p == "cofounder"] == [ask_mod.LIMIT_OTHER]
     refused = h.runner.enqueue("q4", principal="justin")
     assert isinstance(refused, AskRefused) and "usage limit until" in refused.text
+    assert refused.reason == "limit" and refused.until == until  # the brain answers from these
 
 
 async def test_errors_and_no_answer(db: sqlite3.Connection, tmp_path: Path) -> None:
@@ -702,12 +702,12 @@ async def test_daily_cap(db: sqlite3.Connection, tmp_path: Path) -> None:
     assert isinstance(h.runner.enqueue("a", principal="justin"), Queued)
     assert isinstance(h.runner.enqueue("b", principal="justin"), Queued)
     third = h.runner.enqueue("c", principal="justin")
-    assert third == AskRefused("I've asked Claude 2 times today, the daily cap.")
+    assert third == AskRefused("I've asked Claude 2 times today, the daily cap.", "cap")
     assert h.runner.enqueue("d", principal="cofounder") == third
     assert h.runner.asked_today() == 2
     await h.runner.idle()  # BR-11: the owner hears it once that day, through the channel
     assert h.channel.sent == [
-        ("justin", "Hit today's Claude cap (2); answering locally until midnight.",
+        ("justin", "Hit today's Claude cap (2); approvals and /status still work until midnight.",
          f"ask:cap:{utcnow().astimezone(ZoneInfo('America/Los_Angeles')).date().isoformat()}")
     ]  # fmt: skip
 
@@ -730,14 +730,13 @@ async def test_the_runaway_guard_pauses_for_the_hour(
     for _ in range(2):
         refused = h.runner.enqueue("again", principal="justin")
         assert refused == AskRefused(
-            "Claude is paused for runaway protection (3 messages this hour)."
+            "Claude is paused for runaway protection (3 messages this hour).", "runaway"
         )
     await h.runner.idle()
     (notice,) = h.channel.sent
     assert notice[0] == "justin" and notice[2] is not None and notice[2].startswith("ask:runaway:")
-    assert notice[1].startswith(
-        "Claude brain paused for runaway protection (3 msgs/hr); answering locally until "
-    )
+    assert notice[1].startswith("Claude brain paused for runaway protection (3 msgs/hr); ")
+    assert "approvals and /status still work until " in notice[1]
     # next hour: asks again (the guard counts this clock hour only)
     db.execute("UPDATE tasks SET created_at = '2020-01-01T00:00:00Z'")
     db.commit()
@@ -840,7 +839,11 @@ async def test_tool_queues_for_the_calling_task(db: sqlite3.Connection, tmp_path
 
 async def test_tool_refusals(db: sqlite3.Connection, tmp_path: Path) -> None:
     missing = ask_tool.AskClaude(_tool_ctx(db, None))
-    assert await missing({"question": "q"}) == {"queued": False, "text": ask_tool.NOT_RUNNING}
+    assert await missing({"question": "q"}) == {
+        "queued": False,
+        "text": ask_tool.NOT_RUNNING,
+        "reason": "not_running",
+    }
     h = make(db, tmp_path, cfg={"daily_cap": 1})
     tool = ask_tool.AskClaude(_tool_ctx(db, h.runner))
     assert (await tool({"question": "q"}))["queued"] is True

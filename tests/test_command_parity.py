@@ -1,14 +1,15 @@
 """Slash commands and chat tools must not drift apart.
 
-Every builtin command that only reads is backed by a tool some intent can reach, so plain
-words get what the slash command gets (``/pulse`` is ``pulse_preview``, which the ``updates``
-intent offers). Control-plane commands stay slash-only: the model never reaches them.
+Every builtin command that only reads is backed by a tool Claude can reach, so plain words
+get what the slash command gets (``/pulse`` is ``pulse_preview``). PER-256 retired the intents
+and their fixed toolsets: Claude is offered every builtin tool but ``NOT_IN_BRAIN``. The
+control-plane commands stay slash-only: nothing model-chosen reaches them.
 """
 
 from __future__ import annotations
 
 from resonant.router import commands
-from resonant.router.intents import INTENT_TOOLS
+from resonant.runners.brain import NOT_IN_BRAIN
 from resonant.tools.builtin import BUILTIN_SPECS
 from resonant_sdk import Effect
 
@@ -21,9 +22,9 @@ SLASH_ONLY = {
     "/approvals",  # control plane: codes and args are for the owner's explicit eyes
     "/help",  # answered from the registry; chat has list_commands
 }
-# The only non-read tools an intent may reach (all chat-gated: L3 runs and reports, L2 asks,
-# L1 needs a code). A new write tool in an intent must be added here deliberately; control
-# plane (`mute_extension`, kill, resume, approvals) never is. The fast path also keeps
+# The only non-read tools Claude may reach (all chat-gated: L3 runs and reports, L2 asks,
+# L1 needs a code). A new write tool must be added here deliberately; control plane
+# (`mute_extension`, kill, resume, approvals) never is. The fast path also keeps
 # `/pulse now` and `/ext run` as tool-less subcommands.
 CHAT_WRITES = {
     "add_note",
@@ -52,23 +53,27 @@ CHAT_WRITES = {
     "allow_tools",
     "allow_trust_rule",
     "remove_trust_rule",
+    # Facts and watches (BR-3, BR-7): the owner's own store; watches ask first (L2).
+    "remember",
+    "forget",
+    "create_watch",
+    "cancel_watch",
 }
 
 SPECS = {s.name: s for s in BUILTIN_SPECS}
-REACHABLE = {t for tools in INTENT_TOOLS.values() for t in tools}
+REACHABLE = {s.name for s in BUILTIN_SPECS if s.name not in NOT_IN_BRAIN}
 
 
 def test_every_read_command_has_a_reachable_tool() -> None:
     for cmd in commands.COMMANDS:
         if not cmd.tools:
             assert cmd.name in SLASH_ONLY, (
-                f"{cmd.name} has no tool: add a read tool to an intent in "
-                "router/intents.py, or list it in SLASH_ONLY with a reason"
+                f"{cmd.name} has no tool: add a read tool, or list it in SLASH_ONLY with a reason"
             )
             continue
         for tool in cmd.tools:
             if SPECS[tool].effect is Effect.READ:
-                assert tool in REACHABLE, f"{cmd.name}: read tool {tool} is in no intent"
+                assert tool in REACHABLE, f"{cmd.name}: read tool {tool} is not offered to Claude"
 
 
 def test_slash_only_commands_have_no_tool() -> None:
@@ -89,5 +94,5 @@ def test_control_plane_is_not_reachable_by_the_model() -> None:
 
 
 def test_updates_tools_are_reads() -> None:
-    for tool in INTENT_TOOLS["updates"]:
+    for tool in ("briefing_preview", "open_items", "pulse_preview"):
         assert SPECS[tool].effect is Effect.READ

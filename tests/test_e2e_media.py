@@ -18,8 +18,6 @@ import pytest
 from test_e2e_brain import ANSWER, Brain, start
 
 from resonant.brain import watches as watch_store
-from resonant.brain.context import BRAIN_SYSTEM
-from resonant.brain.triage import CANNED_ACKS
 from resonant.e2e import wait_until
 from resonant.gateway.imessage.fixtures import FakeAttachment, FakeChatDB
 from resonant.runners.media import VOICE_NEEDS_WHISPER
@@ -78,14 +76,14 @@ def fake_whisper(tmp_path: Path, said: str) -> Path:
 # --- images and PDFs -----------------------------------------------------------------------
 
 
-async def test_a_screenshot_goes_to_claude_in_intents_mode(
+async def test_a_screenshot_goes_to_claude(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
-    async with start(resonant_home, chat, tmp_path, mode="intents") as b:
+    async with start(resonant_home, chat, tmp_path) as b:
         shot = attach(b, "Screenshot.png")
         replies = await send(b, "what's this error?", [FakeAttachment(str(shot), "image/png")], 2)
         assert replies == ["Looking into it…", ANSWER]
-        assert b.model.requests == [] and b.model.calls["label"] == 0  # no model on the way
+        assert b.model.calls["triage"] == 0  # no model on the way
         (cp,) = ask_rows(b)
         assert cp["kind"] == "image" and cp["question"] == "what's this error?"
         assert cp["attachments"] == [str(shot.resolve())]
@@ -106,7 +104,8 @@ async def test_a_pdf_alone_gets_a_default_question(
         replies = await send(b, "￼", [FakeAttachment(str(pdf), "application/pdf")], 2)
         assert replies == ["Looking into it…", ANSWER]
         (cp,) = ask_rows(b)
-        assert cp["question"] == "Summarise this PDF briefly." and b.model.requests == []
+        assert cp["question"] == "Summarise this PDF briefly."
+        assert b.model.calls["triage"] == 0
 
 
 async def test_a_file_outside_the_allowed_roots_is_refused(
@@ -129,7 +128,8 @@ async def test_voice_without_whisper_says_so(
     async with start(resonant_home, chat, tmp_path) as b:
         voice = attach(b, "Audio Message.caf", b"caff")
         (reply,) = await send(b, "￼", [FakeAttachment(str(voice), "audio/x-caf")], 1)
-        assert reply == VOICE_NEEDS_WHISPER and ask_rows(b) == [] and b.model.requests == []
+        assert reply == VOICE_NEEDS_WHISPER and ask_rows(b) == []
+        assert b.model.calls["triage"] == 0
 
 
 async def test_voice_is_transcribed_and_answered_like_text(
@@ -138,10 +138,9 @@ async def test_voice_is_transcribed_and_answered_like_text(
     whisper = fake_whisper(tmp_path, " Where is mycelium? ")
     async with start(resonant_home, chat, tmp_path, brain={"whisper_path": str(whisper)}) as b:
         voice = attach(b, "Audio Message.caf", b"caff")
-        b.model.push("It's in ~/code/mycelium.")
         (reply,) = await send(b, "￼", [FakeAttachment(str(voice), "audio/x-caf")], 1)
-        assert reply == "It's in ~/code/mycelium."
-        (req,) = b.model.requests
+        assert reply == ANSWER  # routed to Claude like typed text; no ack for a fast answer
+        (req,) = b.model.triage_requests
         assert "Where is mycelium?" in req.messages[-1]["content"]
         (event,) = b.rows("SELECT payload, dedupe_key FROM events WHERE dedupe_key LIKE '%:voice'")
         assert json.loads(event["payload"])["voice"] is True
@@ -155,32 +154,16 @@ async def test_a_spoken_yes_never_approves(
 ) -> None:
     whisper = fake_whisper(tmp_path, "yes")
     async with start(resonant_home, chat, tmp_path, brain={"whisper_path": str(whisper)}) as b:
-        b.model.push(
-            [
-                (
-                    "create_watch",
-                    {
-                        "what": "milk noted",
-                        "tool": "list_notes",
-                        "args": {},
-                        "when": "contains",
-                        "text": "milk",
-                    },
-                )
-            ],
-        )
-        _answer, prompt = await b.say("tell me when milk is on my notes", replies=2)
-        assert "Reply yes" in prompt
+        await b.say("/note milk")
+        (prompt,) = await b.say("/notes clear")
+        code = prompt.split("]")[0].lstrip("[")
         await b.prompt_recorded()
-        b.model.push("Type yes to approve it.")
         voice = attach(b, "Audio Message.caf", b"caff")
         (reply,) = await send(b, "￼", [FakeAttachment(str(voice), "audio/x-caf")], 1)
-        assert reply == "Type yes to approve it."
+        assert reply == ANSWER  # the transcript is only chat: Claude answers it
         assert b.rows("SELECT status FROM approvals")[0]["status"] == "pending"
-        (done,) = await b.say("yes")
-        assert done.startswith("Watching W1: milk noted, every 1h until ")
-        w = watch_store.get(b.conn, 1)
-        assert w is not None and w.state == "active"
+        (done,) = await b.say(f"yes {code}")  # typed, with the code: this approves
+        assert done == "Cleared 1 note."
 
 
 # --- links ---------------------------------------------------------------------------------
@@ -189,29 +172,14 @@ async def test_a_spoken_yes_never_approves(
 async def test_a_link_goes_to_claude_as_kind_link(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
-    assert "kind link" in BRAIN_SYSTEM
     async with start(resonant_home, chat, tmp_path) as b:
         url = "https://example.com/posts/agents"
-        # BR-10: the triage hands a link to Claude whatever the model says (kind link)
-        ack, answer = await b.say(url, replies=2)
-        assert ack in CANNED_ACKS and answer == ANSWER
-        assert b.model.requests == [] and b.model.calls["triage"] == 1
+        # BR-10: a link goes to Claude whatever the model says (kind link)
+        assert await b.say(url) == [ANSWER]
+        assert b.model.calls["triage"] == 1
         (cp,) = ask_rows(b)
         assert cp["kind"] == "link" and url in cp["question"]
         assert "Fetch the link with WebFetch" in notes(tmp_path)["prompt"]
-
-
-async def test_with_the_local_route_the_model_sends_a_link_to_claude(
-    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
-) -> None:
-    async with start(resonant_home, chat, tmp_path, brain={"route": "local"}) as b:
-        url = "https://example.com/posts/agents"
-        b.model.push([("ask_claude", {"question": f"Summarise {url}", "kind": "link"})])
-        assert await b.say(url, replies=2) == ["Looking into it…", ANSWER]
-        (req,) = b.model.requests
-        assert "kind link" in req.messages[0]["content"]
-        (cp,) = ask_rows(b)
-        assert cp["kind"] == "link" and url in cp["question"]
 
 
 # --- watches -------------------------------------------------------------------------------
@@ -223,28 +191,23 @@ async def test_an_ask_watch_texts_once_when_claude_says_yes(
     async with start(
         resonant_home, chat, tmp_path, ask_args=("--answer", "YES. Back in stock."), **not_quiet()
     ) as b:
-        b.model.push(
-            [
-                (
-                    "create_watch",
-                    {"what": "Pro in stock", "ask": "Is the Pro in stock at https://x.test?"},
-                )
-            ],
+        now = utcnow()
+        watch_store.create(
+            b.conn,
+            principal="justin",
+            what="Pro in stock",
+            check_kind="ask",
+            op="yes",
+            interval_s=3600,
+            now=now,
+            expires_at=now + timedelta(days=7),
+            question="Is the Pro in stock at https://x.test?",
         )
-        _answer, prompt = await b.say(
-            "watch the Pro page and tell me when it's in stock", replies=2
-        )  # PER-261: the answer goes out first
-        assert "Reply yes" in prompt
-        await b.prompt_recorded()
-        (done,) = await b.say("yes")
-        assert done.startswith("Watching W1: Pro in stock")
         n = len(b.osa.sent)
         assert queue_due(b.conn, utcnow()) == {"queued": 1, "expired": 0}
         b.daemon.loop._wakeup.set()  # pyright: ignore[reportPrivateUsage]
         await b.osa.wait_for(n + 1, 15)
-        assert [m.text for m in b.osa.sent[n:]] == [
-            "\U0001f440 W1 Pro in stock: Claude: Back in stock"
-        ]
+        assert [m.text for m in b.osa.sent[n:]] == ["\U0001f440 W1 Pro in stock: Back in stock"]
         await wait_until(
             lambda: (w := watch_store.get(b.conn, 1)) is not None and w.state == "fired", 10
         )
@@ -258,9 +221,8 @@ async def test_a_spoken_slash_command_is_only_chat(
 ) -> None:
     whisper = fake_whisper(tmp_path, "/restart")
     async with start(resonant_home, chat, tmp_path, brain={"whisper_path": str(whisper)}) as b:
-        b.model.push("Type /restart if you want that.")
         voice = attach(b, "Audio Message.caf", b"caff")
         (reply,) = await send(b, "￼", [FakeAttachment(str(voice), "audio/x-caf")], 1)
-        assert reply == "Type /restart if you want that."
+        assert reply == ANSWER  # Claude answers the words; /restart never runs
         assert b.rows("SELECT * FROM tasks WHERE kind = 'command'") == []
         assert [a for a in b.audits("gate.evaluate") if a["tool"] == "restart_resonant"] == []
