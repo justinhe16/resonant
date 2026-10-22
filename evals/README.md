@@ -86,7 +86,7 @@ Every case gets a **fresh, hermetic home** in a temp dir, seeded with the row's 
 - your state: the home, `runner.code_dir`, the run dirs, `brain.read_roots` and `ops.repo_path` are all inside the temp dir; the Keychain is an in-memory fake. Only `--model live` reads `~/.resonant/config.yaml`, for the model and timezone.
 - side effects: notes, reminders, facts, trust rules and `forget_repo` run (they only touch the temp store); everything else the gate allows (`start_run`, `restart_ollama`, `add_repo`, extension writes) is recorded and answered `{"eval": "not run"}`.
 - `ask_claude`: queues nothing and starts no Claude session; it is recorded as an escalation and the reply is `Looking into it…`. With `--live-claude` it starts a real Claude brain session instead (see [Live Claude](#live-claude-grading-the-claude-brains-answers)).
-- extensions: `github`, `linear` and `trade-jev` are local fixtures with canned results (no network, no secrets).
+- extensions: `github`, `linear`, `trade-jev` and `mycelium` (money: read-only, its results are outside content) are local fixtures with canned results (no network, no secrets, no bank data).
 
 `--model live` (default) uses the configured local model, one client for the whole run, after one untimed warm-up call. `--model scripted` runs each row's `script` through a `ScriptedModel`; CI runs it to prove the harness and that every example row is satisfiable. It never calls a real model.
 

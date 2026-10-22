@@ -30,8 +30,8 @@
   as its pulse item says), ``notes`` (strings), ``reminders``
   (``{in_minutes, text}``), ``facts`` (``{name, description, text?}``) and ``extensions``
   (name → ``{tool: canned result}``, from ``FIXTURES``: ``github``, ``linear``,
-  ``trade-jev``). ``{root}`` in any world text, history or script argument is the world
-  root; ``{in:N}`` in a script argument is the time N minutes from now.
+  ``trade-jev``, ``mycelium``). ``{root}`` in any world text, history or script argument is
+  the world root; ``{in:N}`` in a script argument is the time N minutes from now.
 
   ``expect`` (every key optional): ``tools`` must all be called by the model (``a|b``: any
   of them), ``tools_not`` never; ``escalate`` (``ask_claude`` was queued, by the model or
@@ -736,6 +736,124 @@ tools:
     level: L2
 """,
         {"trade_jev_status": {"running": False, "since": None, "last_log": "stopped by owner"}},
+    ),
+    # The owner's money (mycelium's resonant-extension): every tool an L0 read and every
+    # result outside content (bank and merchant names), so it taints the task as the real one
+    # does. The defaults are the real CLI's shapes with nothing in them; a row seeds numbers.
+    "mycelium": Fixture(
+        """\
+name: mycelium
+version: 1
+description: Your money from mycelium; net worth, account balances, transactions, spending.
+examples: ["what's my net worth?", "who did I spend the most with last month?"]
+tools:
+  net_worth:
+    description: >-
+      Net worth now (assets minus liabilities) with its change over 1 day, 30 days and the
+      year.
+    run: python3 cli.py net_worth
+    effect: read
+  account_balances:
+    description: >-
+      Every linked account with its current balance; credit and loan balances are amounts
+      owed.
+    run: python3 cli.py account_balances
+    effect: read
+  recent_transactions:
+    description: >-
+      Transactions from the last N days (1-90), newest first, at most 30 shown; amount > 0 is
+      money in.
+    run: python3 cli.py recent_transactions --days {days}
+    effect: read
+    args: {days: integer}
+  spending_summary:
+    description: >-
+      Income, spend (net of refunds; Venmo/Zelle paybacks are refunds), top categories and
+      merchants for a period, transfers excluded; also invested (net into investment accounts)
+      and unmatched_card_payments (to a card that isn't linked): this_month, last_month,
+      last_7_days, last_30_days, last_12_months, ytd, all, YYYY-MM, or YYYY-MM-DD..YYYY-MM-DD.
+    run: python3 cli.py spending_summary --period {period}
+    effect: read
+    args: {period: string}
+  search_transactions:
+    description: >-
+      Totals (count, money in, money out, net, first and last date) and the newest 25 rows for
+      transactions whose merchant, name or category contains query (case-insensitive), in a
+      period (as spending_summary; "all" for everything). Totals cover every match. Transfers
+      excluded.
+    run: python3 cli.py search_transactions --query={query} --period={period}
+    effect: read
+    args: {query: string, period: string}
+  merchant_totals:
+    description: >-
+      Spend (net of refunds, so Venmo paybacks offset Venmo spend) and income per merchant for
+      a period (as spending_summary), biggest spend first, with counts; limit 1-100 merchants
+      (use 25 if unsure). Transfers excluded.
+    run: python3 cli.py merchant_totals --period={period} --limit={limit}
+    effect: read
+    args: {period: string, limit: integer}
+""",
+        {
+            "net_worth": {
+                "as_of": None,
+                "net_worth": 0.0,
+                "assets": 0.0,
+                "liabilities": 0.0,
+                "changes": {},
+                "last_sync": None,
+                "untrusted": True,
+            },
+            "account_balances": {
+                "accounts": [],
+                "count": 0,
+                "assets": 0.0,
+                "liabilities": 0.0,
+                "last_sync": None,
+                "untrusted": True,
+            },
+            "recent_transactions": {
+                "since": None,
+                "transactions": [],
+                "shown": 0,
+                "total": 0,
+                "untrusted": True,
+            },
+            "spending_summary": {
+                "income": 0.0,
+                "spend": 0.0,
+                "refunds": 0.0,
+                "net": 0.0,
+                "spend_transactions": 0,
+                "invested": 0.0,
+                "unmatched_card_payments": {"count": 0, "total": 0.0},
+                "by_category": [],
+                "top_merchants": [],
+                "untrusted": True,
+            },
+            "search_transactions": {
+                "count": 0,
+                "money_in": 0.0,
+                "money_out": 0.0,
+                "net": 0.0,
+                "first_date": None,
+                "last_date": None,
+                "transfers_included": False,
+                "shown": 0,
+                "truncated": False,
+                "transactions": [],
+                "untrusted": True,
+            },
+            "merchant_totals": {
+                "spend": 0.0,
+                "income": 0.0,
+                "merchant_count": 0,
+                "shown": 0,
+                "truncated": False,
+                "transfers_included": False,
+                "merchants": [],
+                "untrusted": True,
+            },
+        },
     ),
 }
 
