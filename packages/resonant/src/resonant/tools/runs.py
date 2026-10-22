@@ -53,9 +53,10 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
-from resonant.executor import ToolFailed, ToolHandler
+from resonant.executor import CallContext, ContextHandler, ToolFailed, ToolHandler
 from resonant.gate.codes import clean_external
 from resonant.gate.types import Intent
 from resonant.store import pulse as pulse_store
@@ -113,7 +114,9 @@ class RunnerApi(Protocol):
 
     async def cancel_run(self, code: str, *, reason: str = "cancelled") -> Cancelled | Refused: ...
 
-    async def merge_run(self, code: str) -> Merged | MergeQueued | Refused: ...
+    async def merge_run(
+        self, code: str, *, unattended: bool = False
+    ) -> Merged | MergeQueued | Refused: ...
 
     def open_questions(self) -> list[OpenQuestion]: ...
 
@@ -307,6 +310,21 @@ def summary_action(conn: sqlite3.Connection, intent: Intent) -> str | None:
     if run.flagged_paths:
         head += f", changes {', '.join(run.flagged_paths)}"
     return head
+
+
+def merge_standable(conn: sqlite3.Connection, intent: Intent) -> bool:
+    """PER-272: whether a standing allow on ``merge_run`` may cover this call: a run that
+    flagged no sensitive paths, in a push-mode repo that no ``ask merge`` rule covers. A
+    merge that then runs on the allow is unattended (green CI, CLEAN, always texted:
+    ``ClaudeRunner.merge_run``). True for another tool (nothing to say about it)."""
+    if intent.extension is not None or intent.tool != MERGE_RUN.name:
+        return True
+    code = _code(intent.args.get("code"))
+    run = runs_store.get(conn, code) if code is not None else None
+    repo = repos_store.find(conn, run.repo) if run is not None and run.repo else None
+    if run is None or repo is None or repo.mode != "push" or run.flagged_paths:
+        return False
+    return merge_decision(conn, repo.name) == "ok"
 
 
 def merge_level(conn: sqlite3.Connection, intent: Intent) -> Level | None:
@@ -540,12 +558,14 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"cancelled": False, "code": code, "text": reason}
         return {"cancelled": True, "code": code, "text": cast("Cancelled", result).text}
 
-    async def _merge_run(args: dict[str, Any]) -> dict[str, Any]:
+    async def _merge_run(args: dict[str, Any], ctx: CallContext | None = None) -> dict[str, Any]:
         code = _need_code("merge_run", args)
         claude = runner()
         if claude is None:
             return {"merged": False, "code": code, "text": missing()}
-        result = await claude.merge_run(code)
+        # PER-272: on nobody's word for this call (a standing allow, a trust rule): stricter
+        unattended = ctx is not None and ctx.unattended
+        result = await claude.merge_run(code, unattended=unattended)
         if (reason := _refusal(result)) is not None:
             return {"merged": False, "code": code, "text": reason}
         from resonant.runners.claude import MergeQueued
@@ -615,5 +635,20 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
         LIST_RUNS.name: _list_runs,
         RUN_ACTIVITY.name: _run_activity,
         CANCEL_RUN.name: _cancel_run,
-        MERGE_RUN.name: _merge_run,
+        MERGE_RUN.name: cast(ToolHandler, _WithContext(_merge_run)),
     }
+
+
+class _WithContext(ContextHandler):
+    """A builtin handler that reads the executor's ``CallContext`` (``unattended``); called
+    with args alone (a test, a direct call) it gets None."""
+
+    def __init__(
+        self, fn: Callable[[dict[str, Any], CallContext | None], Awaitable[dict[str, Any]]]
+    ) -> None:
+        self.fn = fn
+
+    async def __call__(
+        self, args: dict[str, Any], ctx: CallContext | None = None
+    ) -> dict[str, Any]:
+        return await self.fn(args, ctx)

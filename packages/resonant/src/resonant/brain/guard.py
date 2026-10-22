@@ -227,7 +227,7 @@ def asks_standing_allow(text: str) -> bool:
 
 def claims_allow(reply: str) -> bool:
     """``reply`` says the owner won't be asked any more, or that a change was made. Not when
-    it says it can't ("I can't make merge_run stand")."""
+    it says it can't ("I can't make trust changes stand")."""
     if _CANT.search(reply) is not None and re.search(r"got\s+it", reply, re.I) is None:
         return False
     return _ALLOW_CLAIM.search(reply) is not None or claims_change(reply)
@@ -278,9 +278,9 @@ CLAIM_REDO = (
 ALLOW_REDO = (
     "Your last answer was not sent: the owner asked you to stop asking before changes, and "
     "no allow_tools call backs what you said. If it can stand (an L2 change such as linear "
-    "tickets), call allow_tools; it asks the owner first, so say it waits on their yes. "
-    "If it can't (start_run already runs without asking; merge_run and trust changes always "
-    "ask), say so plainly. Never answer with a bare 'Got it'."
+    "tickets, or merge_run), call allow_tools (owner_asked: true when the owner's message "
+    "said it) and report what its result says. If it can't (start_run already runs without "
+    "asking; trust changes always ask), say so plainly. Never answer with a bare 'Got it'."
 )
 CALL_REDO = (
     "Your last answer was not sent: it was the text of a tool call, not an answer. Call the "

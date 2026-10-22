@@ -64,6 +64,19 @@ ORIGINS: tuple[Origin, ...] = get_args(Origin)
 
 
 @dataclass(frozen=True)
+class OwnerAsk:
+    """PER-272: the owner's own message this turn, for a call the brain marked
+    ``owner_asked`` (``trust/asked.py``). Set only by code: the Claude bridge reads ``text``
+    from the inbound message event that started the turn (``event_id``), never from the model.
+    ``lookups``: the Resonant reads that tainted the turn (``list_runs``), when nothing else
+    did; empty when the turn is untainted. The gate decides whether it is the approval."""
+
+    text: str
+    event_id: str
+    lookups: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class Intent:
     """A request to run one registered tool with specific args. Build it with ``for_tool``.
 
@@ -71,7 +84,8 @@ class Intent:
     ``hash`` is recomputed on every access over everything that matters, so changing
     ``args`` after approval changes the hash and the approval no longer matches.
     ``origin`` is deliberately not hashed: an approval binds to what runs, not to who
-    asked for it.
+    asked for it. Nor is ``asked`` (PER-272: the owner's own text, when the brain marked the
+    call as the owner's direct ask; only ``ToolCore.call`` sets it, from the bridge).
     """
 
     task_id: str
@@ -81,6 +95,7 @@ class Intent:
     scope_id: str | None = None
     trace_id: str | None = None
     origin: Origin = "inferred"
+    asked: OwnerAsk | None = None
 
     def __post_init__(self) -> None:
         if self.origin not in ORIGINS:
@@ -99,8 +114,9 @@ class Intent:
         scope_id: str | None = None,
         trace_id: str | None = None,
         origin: Origin = "inferred",
+        asked: OwnerAsk | None = None,
     ) -> Intent:
-        return cls(task_id, principal, spec, args, scope_id, trace_id, origin)
+        return cls(task_id, principal, spec, args, scope_id, trace_id, origin, asked)
 
     @property
     def tool(self) -> str:
@@ -144,6 +160,10 @@ class Intent:
 class Allow:
     token: str  # single-use, issued by the gate for one intent hash
     approval_id: str | None = None
+    # PER-272: a change that runs on nobody's word for this exact call (no approval, not a
+    # slash command): an L3, a standing allow, a trust rule. ``merge_run`` merges stricter
+    # then (green CI, no flagged paths, CLEAN); the executor passes it on (``CallContext``).
+    unattended: bool = False
 
 
 @dataclass(frozen=True)

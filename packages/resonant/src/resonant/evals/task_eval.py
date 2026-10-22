@@ -30,8 +30,10 @@
   as its pulse item says), ``notes`` (strings), ``reminders``
   (``{in_minutes, text}``), ``facts`` (``{name, description, text?}``) and ``extensions``
   (name → ``{tool: canned result}``, from ``FIXTURES``: ``github``, ``linear``,
-  ``trade-jev``, ``mycelium``). ``{root}`` in any world text, history or script argument is
-  the world root; ``{in:N}`` in a script argument is the time N minutes from now.
+  ``trade-jev``, ``mycelium``; ``linear`` is an MCP stdio fixture like the real one, so
+  ``save_issue`` with an ``id`` updates; the others are CLI). ``{root}`` in any world text,
+  history or script argument is the world root; ``{in:N}`` in a script argument is the time N
+  minutes from now.
 
   ``expect`` (every key optional): ``tools`` must all be called by Claude (``a|b``: any of
   them; PER-256: the local model calls no tool), ``tools_not`` never; ``escalate``
@@ -126,6 +128,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
+import yaml
+
 from resonant.api import DaemonState
 from resonant.brain.facts import FactStore, facts_dir
 from resonant.brain.triage import CANNED_ACKS
@@ -142,6 +146,7 @@ from resonant.e2e.bench import IsolatedSettings
 from resonant.e2e.extensions import install_fixture
 from resonant.e2e.fakes import RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.executor import Executor, ToolResult
+from resonant.extensions.mcp import approve, pins_json
 from resonant.gate import Intent
 from resonant.gate.types import Decision
 from resonant.gateway.imessage.fixtures import FakeChatDB
@@ -658,10 +663,103 @@ print(json.dumps(data.get(tool, {"ok": True})))
 """
 
 
+def _mcp_tool(name: str, props: dict[str, Any], required: tuple[str, ...] = ()) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "object", "properties": props}
+    if required:
+        schema["required"] = list(required)
+    return {"name": name, "description": name, "inputSchema": schema}
+
+
+_STR: dict[str, Any] = {"type": "string"}
+# What the fake Linear MCP server lists (Linear-like: filters and save_* fields optional).
+LINEAR_MCP_TOOLS: tuple[dict[str, Any], ...] = (
+    _mcp_tool(
+        "list_issues",
+        {k: _STR for k in ("query", "team", "project", "state", "assignee")},
+    ),
+    _mcp_tool("get_issue", {"id": _STR}, ("id",)),
+    _mcp_tool("list_comments", {"issueId": _STR}, ("issueId",)),
+    _mcp_tool("list_projects", {"team": _STR, "query": _STR}),
+    _mcp_tool("list_teams", {"query": _STR}),
+    _mcp_tool(
+        "save_issue",
+        {
+            "id": _STR,
+            "title": _STR,
+            "team": _STR,
+            "description": _STR,
+            "state": _STR,
+            "assignee": _STR,
+            "priority": {"type": "number"},
+            "project": _STR,
+            "labels": {"type": "array", "items": _STR},
+        },
+    ),
+    _mcp_tool("save_comment", {"id": _STR, "issueId": _STR, "body": _STR}),
+)
+
+# The fake MCP server (stdlib, newline-delimited JSON-RPC over stdio, run under python -I -S):
+# a tool answers data.json[tool] as one JSON text block, else {"ok": true}; save_issue and
+# save_comment echo what they were given (an id, or PER-999 for a new issue).
+FIXTURE_MCP_SERVER = """\
+import json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+def load(name):
+    with open(os.path.join(HERE, name)) as f:
+        return json.load(f)
+TOOLS, DATA = load("tools.json"), load("data.json")
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\\n")
+    sys.stdout.flush()
+def answer(name, args):
+    if name in DATA:
+        return DATA[name]
+    if name == "save_issue":
+        return {"id": args.get("id") or "PER-999", "title": args.get("title"),
+                "state": args.get("state") or "Todo"}
+    if name == "save_comment":
+        return {"id": "c-1", "issueId": args.get("issueId"), "body": args.get("body")}
+    return {"ok": True}
+for raw in sys.stdin:
+    try:
+        msg = json.loads(raw)
+    except ValueError:
+        continue
+    method, rid = msg.get("method"), msg.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fake-linear", "version": "1"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+    elif method == "tools/call":
+        p = msg.get("params") or {}
+        text = json.dumps(answer(p.get("name"), p.get("arguments") or {}))
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
+    elif rid is not None and method is not None:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "no"}})
+"""
+
+
 @dataclass(frozen=True)
 class Fixture:
+    """A fake extension: CLI tools (``cli.py`` prints ``data.json[tool]``) or, with
+    ``mcp_server``, an MCP stdio server listing ``mcp_tools`` (pinned statically at seed)."""
+
     manifest: str
     defaults: dict[str, Any]
+    mcp_server: str = ""
+    mcp_tools: tuple[dict[str, Any], ...] = ()
+
+    @property
+    def tool_names(self) -> frozenset[str]:
+        m = cast(dict[str, Any], yaml.safe_load(self.manifest))
+        names = set(cast(dict[str, Any], m.get("tools") or {}))
+        mcp = cast(dict[str, Any], m.get("mcp") or {})
+        servers = cast(dict[str, Any], mcp.get("servers") or {})
+        for server in servers.values():
+            names.update(str(t["name"]) for t in cast(list[dict[str, Any]], server["tools"]))
+        return frozenset(names)
 
 
 FIXTURES: dict[str, Fixture] = {
@@ -706,6 +804,10 @@ tools:
 """,
         {"prs": {"mine": [], "review_requested": []}, "recent_prs": {"prs": []}},
     ),
+    # The real linear extension is an MCP server (extensions/linear/resonant.yaml): a stdio
+    # fake with the same tool names, effects, levels and summaries and Linear-like schemas
+    # (``save_issue`` with an ``id`` updates; no key is required), so a live Claude can close
+    # a ticket. Its tools are one constant (``LINEAR_MCP_TOOLS``) for the server and the pins.
     "linear": Fixture(
         """\
 name: linear
@@ -715,24 +817,49 @@ description: >-
   updates and comments.
 examples: ["what's on my linear", "make a linear ticket for the login bug"]
 approvers: [owner]
-tools:
-  list_issues:
-    description: Your open Linear issues with key, title, state and priority.
-    run: python3 cli.py list_issues
-    effect: read
-  get_issue:
-    description: One Linear issue by its id or key (like ENG-123), with its details.
-    run: python3 cli.py get_issue {id}
-    effect: read
-    args: {id: string}
-  save_issue:
-    description: Create a Linear issue in a team (its key, like ENG) with a title.
-    run: python3 cli.py save_issue
-    effect: write
-    level: L2
-    args: {title: string, team: string}
+mcp:
+  servers:
+    linear:
+      transport: stdio
+      command: ./server.py
+      tools:
+        - name: list_issues
+          description: >-
+            List or search Linear issues. Filter by query text, team, project, state or
+            assignee; assignee "me" lists your own issues.
+          effect: read
+        - name: get_issue
+          description: One Linear issue by its id or key (like ENG-123), with its details.
+          effect: read
+        - name: list_comments
+          description: The comments on one Linear issue.
+          effect: read
+        - name: list_projects
+          description: Linear projects, optionally filtered by team or query text.
+          effect: read
+        - name: list_teams
+          description: The Linear teams in the workspace, with their keys.
+          effect: read
+        - name: save_issue
+          description: >-
+            Create a Linear issue (no id; needs a title and team) or update one (with its
+            id): title, description, state, assignee, priority, project or labels.
+          effect: write
+          level: L2
+          approval_summary: 'save a Linear issue[ {id}][: "{title}"]'
+          timeout_s: 60
+        - name: save_comment
+          description: >-
+            Add a comment (markdown body) to one Linear issue (issueId, like ENG-123), or
+            edit a comment (with its id).
+          effect: write
+          level: L2
+          approval_summary: 'comment on Linear issue {issueId}[: "{body}"]'
+          timeout_s: 60
 """,
         {"list_issues": {"issues": []}},
+        mcp_server="linear",
+        mcp_tools=LINEAR_MCP_TOOLS,
     ),
     "trade-jev": Fixture(
         """\
@@ -1128,8 +1255,21 @@ def seed_world(
     for name, data in cast(dict[str, dict[str, Any]], w.get("extensions") or {}).items():
         fx = FIXTURES[name]
         canned = {**fx.defaults, **data}
+        files = {"cli.py": FIXTURE_CLI, "data.json": json.dumps(canned)}
+        if not fx.mcp_server:
+            install_fixture(settings, conn, fx.manifest, files)
+            continue
+        files |= {"server.py": FIXTURE_MCP_SERVER, "tools.json": json.dumps(fx.mcp_tools)}
+        found = approve(fx.mcp_server, tuple(t["name"] for t in fx.mcp_tools), list(fx.mcp_tools))
+        assert not found.problems, found.problems
         install_fixture(
-            settings, conn, fx.manifest, {"cli.py": FIXTURE_CLI, "data.json": json.dumps(canned)}
+            settings,
+            conn,
+            fx.manifest,
+            files,
+            argv0_paths={f"mcp:{fx.mcp_server}": str(settings.extensions_dir / name / "server.py")},
+            executable=("server.py",),
+            mcp_pins=pins_json(found.pins),
         )
     _seed_history(conn, [replace_text(h, root) for h in history], now)
 

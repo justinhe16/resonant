@@ -67,7 +67,7 @@ from resonant.gate import (
 )
 from resonant.gate import actions as action_ids
 from resonant.gate.policy import APPROVAL_USED, batch_line, widens_trust
-from resonant.gate.types import Origin
+from resonant.gate.types import Origin, OwnerAsk
 from resonant.loop.types import StepContext
 from resonant.models import SpanFactory
 from resonant.store import approvals as ap
@@ -312,6 +312,10 @@ class CallScope:
     tools: Sequence[ToolSpec] = ()
     check_schema: bool = True
     batch: Sequence[BatchItem] | None = None
+    # PER-272: the owner's own text, for a call the brain marked as their direct ask (the
+    # Claude bridge sets it, from the turn's message event); the gate decides
+    # (``trust.asked``). Only ``call`` uses it: a resume runs on its approval.
+    asked: OwnerAsk | None = None
 
 
 @dataclass(frozen=True)
@@ -446,7 +450,12 @@ class ToolCore:
         return self.registry.get(*key)
 
     def _intent(
-        self, spec: ToolSpec, args: dict[str, Any], scope: CallScope, origin: Origin
+        self,
+        spec: ToolSpec,
+        args: dict[str, Any],
+        scope: CallScope,
+        origin: Origin,
+        asked: OwnerAsk | None = None,
     ) -> Intent:
         return Intent.for_tool(
             spec,
@@ -455,6 +464,7 @@ class ToolCore:
             args=args,
             trace_id=scope.trace_id,
             origin=origin,
+            asked=asked,
         )
 
     async def call(
@@ -480,7 +490,7 @@ class ToolCore:
                 if scope.check_schema and args_error(spec, args) is not None:
                     raise ValueError("args don't fit the schema")
                 origin = gated_origin(spec, scope.origin)
-                intent = self._intent(spec, args, scope, origin)
+                intent = self._intent(spec, args, scope, origin, scope.asked)
             except (TypeError, ValueError):
                 s.set(decision="bad_args", ok=False)
                 return Refused("bad_args", BAD_ARGS_REPLY, False)

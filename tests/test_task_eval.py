@@ -807,18 +807,67 @@ def test_home_is_the_world_root_during_a_case(tmp_path: Path) -> None:
     assert os.environ.get("HOME") == before
 
 
-def test_the_linear_fixture_takes_the_args_the_real_extension_does() -> None:
-    """The real linear extension is MCP (Linear's own schemas: list filters optional, create
-    needs a title and a team). The CLI fixture can't mark args optional, so it declares only
-    what a call needs; ``save_issue`` used to require ``id`` even to create."""
+def test_the_linear_fixture_mirrors_the_real_extension() -> None:
+    """The real linear extension is an MCP server: the fixture lists the same tools with the
+    same effects, levels, summaries and timeouts, and its Linear-like schemas let
+    ``save_issue`` create ({title, team}) or update ({id, state}) with no key required."""
+    import jsonschema
     import yaml
 
+    from resonant.extensions.mcp import input_schema
     from resonant_sdk.manifest import Manifest
 
-    m = Manifest.model_validate(yaml.safe_load(te.FIXTURES["linear"].manifest))
-    schemas = {s.name: s.args_schema for s in m.tool_specs()}
-    assert schemas["list_issues"]["required"] == []
-    assert schemas["save_issue"]["required"] == ["team", "title"]
+    real_path = Path(__file__).parent.parent / "extensions" / "linear" / "resonant.yaml"
+    real = Manifest.model_validate(yaml.safe_load(real_path.read_text()))
+    fx = te.FIXTURES["linear"]
+    mine = Manifest.model_validate(yaml.safe_load(fx.manifest))
+    assert real.mcp is not None and mine.mcp is not None
+    assert not mine.tools and not mine.secrets
+    assert mine.mcp.servers["linear"].transport == "stdio"
+    fields = ("name", "description", "effect", "level", "approval_summary", "timeout_s")
+    real_tools = [t.model_dump(include=set(fields)) for _, t in real.mcp.tools()]
+    mine_tools = [t.model_dump(include=set(fields)) for _, t in mine.mcp.tools()]
+    assert mine_tools == real_tools
+    assert fx.tool_names == {t["name"] for t in fx.mcp_tools}
+    schemas = {t["name"]: input_schema(t) for t in fx.mcp_tools}
+    assert schemas["get_issue"]["required"] == ["id"]
+    assert "required" not in schemas["save_issue"] and "required" not in schemas["list_issues"]
+    for args in ({"id": "PER-301", "state": "Done"}, {"title": "x", "team": "ENG"}):
+        jsonschema.validate(args, schemas["save_issue"])
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"id": "PER-301", "priority": "high"}, schemas["save_issue"])
+
+
+def test_the_linear_mcp_fixture_runs_end_to_end(tmp_path: Path) -> None:
+    """A scripted Claude reads a ticket then closes it: both go through the stdio fake over
+    the real relay, gate and executor; the L2 write asks and does not run."""
+    row = {
+        "id": "close",
+        "category": "extensions",
+        "text": "close PER-301, shipped the fix",
+        "world": {
+            "extensions": {
+                "linear": {"get_issue": {"id": "PER-301", "title": "Flaky login", "state": "Todo"}}
+            }
+        },
+        "expect": {
+            "tools": ["get_issue", "save_issue"],
+            "ask": "approval",
+            "writes": [],
+            "route": "claude",
+        },
+        "claude": {
+            "calls": [
+                {"name": "get_issue", "args": {"id": "PER-301"}},
+                {"name": "save_issue", "args": {"id": "PER-301", "state": "Done"}},
+            ],
+            "answer": "Asked you to approve closing PER-301.",
+        },
+    }
+    r = _one(tmp_path, row)
+    assert r.correct, r.failures
+    assert r.outcome.called == ["get_issue", "save_issue"]
+    assert r.outcome.executed_writes == []
 
 
 # --- PER-250: live Claude (the fake claude stands in; nothing reaches the real one) ----------

@@ -21,9 +21,14 @@ owner's ``ask`` rule that is at least as specific (``ask * in trading``) still a
 What never gets a standing allow (``scope`` returns None, so the prompt doesn't offer
 ``yes always`` and no rule matches):
 
-- the tools that loosen trust (``allow_trust_rule``, ``remove_trust_rule``): loosening is
-  always the owner's own reply to that one change;
-- ``merge_run``, whose level already follows the merge trust rules and flagged paths;
+- the tools that loosen trust (``allow_trust_rule``, ``allow_tools``, ``remove_trust_rule``):
+  loosening is always the owner's own word for that one change (a reply, or since PER-272
+  their own direct ask, ``trust.asked``);
+- a call its tool's ``stands`` hook refuses: ``merge_run`` (standable since PER-272, "stop
+  asking before merging run PRs, just merge when green") stands only for a run with no
+  flagged paths in a repo no ``ask merge`` rule covers (``tools.runs.merge_standable``); a
+  merge that runs on it is unattended (``Allow.unattended``), so it needs green CI (it waits
+  while CI runs), a CLEAN merge state and ``--match-head-commit``, and is always texted;
 - an action or scope that isn't a valid slug (too long, odd characters).
 
 The Claude brain's shell changes (``shell``, PER-258) are matched per verb and repo: the
@@ -43,7 +48,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from resonant.gate.types import Intent
@@ -54,9 +59,7 @@ from resonant.trust.policy import matching_trust_rule
 from resonant_sdk import Effect, Level, ToolSpec
 
 # Builtins that never take a standing allow (see the module docstring).
-NEVER: frozenset[str] = frozenset(
-    {"allow_trust_rule", "allow_tools", "remove_trust_rule", "merge_run"}
-)
+NEVER: frozenset[str] = frozenset({"allow_trust_rule", "allow_tools", "remove_trust_rule"})
 MCP_PREFIX = "mcp__resonant__"  # how Claude names Resonant's tools (runners/ask_tools.py)
 
 BUILTIN_SYSTEM = "resonant"  # the system a builtin's call is matched as
@@ -153,12 +156,23 @@ def tool_name(spec: ToolSpec) -> str:
 class StandingAllows:
     """The gate's view of the owner's standing allows for chat tools."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        stands: Mapping[tuple[str | None, str], Callable[[Intent], bool]] | None = None,
+    ) -> None:
+        """``stands``: per tool, whether this one call may take a standing allow at all
+        (``merge_run``: ``tools.runs.merge_standable``)."""
         self.conn = conn
+        self.stands = dict(stands or {})
 
     def scope(self, intent: Intent) -> ToolScope | None:
         """The rule a ``yes always`` on this call would save, or None if it can't have one."""
         if intent.extension is None and intent.tool in NEVER:
+            return None
+        stands = self.stands.get((intent.extension, intent.tool))
+        if stands is not None and not stands(intent):
             return None
         action = tool_action(intent.extension, intent.tool)
         if intent.extension is None and intent.tool == SHELL:

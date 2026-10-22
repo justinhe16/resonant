@@ -98,6 +98,10 @@ elif args[:1] == ["api"]:
         if rc("activity_rc"):
             sys.exit(rc("activity_rc"))
         print(text("activity.json", "[]"))
+elif args[:2] == ["pr", "view"] and "mergeStateStatus" in args:
+    state = os.path.join(d, "merge_state")
+    print(json.dumps({"mergeStateStatus": open(state).read().strip()
+                      if os.path.exists(state) else "CLEAN"}))
 elif args[:2] == ["pr", "view"]:
     view = os.path.join(d, "view.json")
     if not os.path.exists(view):
@@ -841,6 +845,32 @@ async def test_merge_needs_green_ci_and_matches_head(env: Env) -> None:
     assert "--squash" in argv
     assert argv[argv.index("--match-head-commit") + 1] == sha
     assert merge["hosts_token"] == GH_TOKEN
+
+
+async def test_an_unattended_merge_needs_a_clean_merge_state(env: Env) -> None:
+    """PER-272: a merge on a standing allow (``require_clean``) reads ``mergeStateStatus``
+    after CI is green and merges only when it is CLEAN."""
+    p, sha = await env.open_pr()
+    env.gh_set("checks_rc", "0")
+    for state, shown in (("BEHIND", "behind"), ("BLOCKED", "blocked"), ("x y", "unreadable")):
+        env.gh_set("merge_state", state)
+        with pytest.raises(MergeRefused, match=f"merge state is {shown}, not clean"):
+            await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch, require_clean=True)
+    assert not env.gh_calls("merge")
+    env.gh_set("checks_rc", "1")  # red CI refuses first, whatever the state
+    with pytest.raises(MergeRefused, match="isn't green"):
+        await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch, require_clean=True)
+    env.gh_set("checks_rc", "0")
+    env.ws.clean_retry_s = 0
+    env.gh_set("merge_state", "UNKNOWN")  # still computing: read again, then refuse
+    with pytest.raises(MergeRefused, match="merge state is unknown, not clean"):
+        await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch, require_clean=True)
+    views = [c for c in env.gh_calls("view") if "mergeStateStatus" in c["argv"]]
+    assert len(views) >= 3
+    env.gh_set("merge_state", "CLEAN")
+    await env.ws.merge("proj", 41, sha, SECRETS, branch=p.branch, require_clean=True)
+    argv = env.gh_calls("merge")[0]["argv"]
+    assert isinstance(argv, list) and "--match-head-commit" in argv
 
 
 async def test_merge_failure_and_bad_input(env: Env) -> None:

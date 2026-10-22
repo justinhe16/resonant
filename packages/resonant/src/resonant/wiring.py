@@ -256,7 +256,16 @@ def tool_access(components: Components, brain: BrainRunner, settings: Settings) 
         extensions=components.extensions,
         timezone=settings.timezone,
         shell=components.shell,
+        askable=owner_askable(components),
     )
+
+
+def owner_askable(components: Components) -> Callable[[ToolSpec], bool] | None:
+    """PER-272: which tools the Claude bridge offers the ``owner_asked`` mark on (the gate's
+    ``OwnerAsks``), or None when the gate has none."""
+    gate = components.gate
+    asks = gate.owner_asks if isinstance(gate, PolicyGate) else None
+    return asks.askable if asks is not None else None
 
 
 def _ask_runner(components: Components) -> AskRunner | None:

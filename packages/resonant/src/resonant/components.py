@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -48,6 +49,7 @@ from resonant.tools import watches as watch_tools
 from resonant.tools.builtin import register_builtins
 from resonant.tools.files import ReadScope
 from resonant.tools.registry import ToolKey
+from resonant.trust.asked import OwnerAsks
 from resonant.trust.tools import StandingAllows
 from resonant_sdk import Level, ToolSpec
 
@@ -195,6 +197,16 @@ def shell_hooks(policy: ShellPolicy) -> ShellHooks:
     return ShellHooks({key: level}, {key: refusal, read: refusal}, {key: summary, read: summary})
 
 
+def standable(conn: sqlite3.Connection) -> dict[ToolKey, Callable[[Intent], bool]]:
+    """Builtins whose standing allow depends on the call (PER-272): ``merge_run``'s covers a
+    run with no flagged paths in a repo no rule asks before merging in."""
+
+    def merge_run(intent: Intent) -> bool:
+        return runs_tools.merge_standable(conn, intent)
+
+    return {(None, runs_tools.MERGE_RUN.name): merge_run}
+
+
 def level_overrides(conn: sqlite3.Connection) -> dict[ToolKey, LevelFor]:
     """Builtin tools whose level depends on the call: ``merge_run`` follows the trust rules
     (docs/employee-plan.md D4)."""
@@ -248,10 +260,11 @@ def build_components(
         actions=summary_actions(conn, registry, host.tool_specs),
         approvers_for=host.approvers_for,
         levels={**level_overrides(conn), **hooks.levels},
-        standing=StandingAllows(conn),
+        standing=StandingAllows(conn, stands=standable(conn)),
         batch_max=settings.gate.batch_max,
         refusals=hooks.refusals,
         summaries=hooks.summaries,
+        owner_asks=OwnerAsks(conn, host.tool_specs),
     )
     merged: dict[HandlerKey, Handler] = {**handlers, **host.handlers, **host.mcp_handlers}
     executor = Executor(

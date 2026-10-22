@@ -134,6 +134,8 @@ CREDS_DIR = "creds"
 DIRECT_KINDS = ("push", "force_push", "branch_deletion")
 MERGE_KINDS = ("pr_merge", "merge_queue_merge")
 _FEED_KINDS = DIRECT_KINDS + MERGE_KINDS
+CLEAN_TRIES = 3  # reads of mergeStateStatus while GitHub answers UNKNOWN (PER-272)
+CLEAN_RETRY_S = 2.0
 _PR_FIELDS = "state,headRefName,headRefOid,baseRefName,isCrossRepository,title,body"
 WORKTREES = ".worktrees"  # <code_dir>/.worktrees/<name>/R<n>
 SCRATCH = ".scratch"  # <code_dir>/.scratch/R<n>
@@ -715,6 +717,7 @@ class Workspace:
         self.conn = conn  # the repo registry (store.repos)
         # The git URL of a repo. Always https without credentials; tests point it at a path.
         self._url_for: Callable[[Repo], str] = url_for or _https_url
+        self.clean_retry_s = CLEAN_RETRY_S  # PER-272: GitHub still computing the merge state
         # ... and of the owner's fork of a fork-mode repo, by its ``owner/name``.
         self._fork_url_for: Callable[[str], str] = fork_url_for or _slug_url
         self.fork_wait_s = fork_wait_s
@@ -1486,6 +1489,28 @@ class Workspace:
                 return 0
         return int(out.decode().strip() or 0)
 
+    async def _require_clean(self, repo: Repo, pr_number: int, secrets: RunnerSecrets) -> None:
+        """``MergeRefused`` unless the PR's ``mergeStateStatus`` is ``CLEAN`` (PER-272).
+        GitHub answers ``UNKNOWN`` while it is still computing it: read again a few times."""
+        state = ""
+        for attempt in range(CLEAN_TRIES):
+            if attempt:
+                await asyncio.sleep(self.clean_retry_s)
+            viewed = await self._gh(
+                ["pr", "view", str(pr_number), "--repo", repo.slug, "--json",
+                 "mergeStateStatus"],
+                secrets,
+            )  # fmt: skip
+            state = ""
+            if viewed.returncode == 0:
+                with contextlib.suppress(ValueError, TypeError, AttributeError):
+                    state = str(json.loads(viewed.stdout).get("mergeStateStatus") or "")
+            if state != "UNKNOWN":
+                break
+        if state != "CLEAN":
+            shown = state.lower() if re.fullmatch(r"[A-Z_]{1,20}", state) else "unreadable"
+            raise MergeRefused(f"its merge state is {shown}, not clean")
+
     async def ci_state(self, repo_name: str, pr_number: int, secrets: RunnerSecrets) -> CiState:
         """The PR's checks: ``gh pr checks`` exits 0 (green), 8 (pending) or 1 (red, or none
         reported)."""
@@ -1821,6 +1846,7 @@ class Workspace:
         allow_flagged: bool = True,
         allow_no_ci: bool = False,
         starter_ci: bool = False,
+        require_clean: bool = False,
     ) -> MergeDone:
         """Squash-merge a PR whose CI is green, only if its head is still ``head_sha``.
 
@@ -1844,7 +1870,11 @@ class Workspace:
         (``adds_only_starter_ci``), whether or not the repo has CI. The checks then allow
         ``.github/`` (whatever ``allow_github_changes`` says) but the net diff must be that one
         file and nothing else may be flagged, so a branch that also touched anything else is
-        refused."""
+        refused.
+
+        ``require_clean`` (PER-272: an unattended merge, on a standing allow): once CI is
+        green the PR's ``mergeStateStatus`` must be ``CLEAN`` (not behind, blocked, dirty or
+        unstable), read just before the merge."""
         from resonant.runner.create import CI_BRANCH_PREFIX, CI_PATH
 
         repo = self._repo(repo_name)
@@ -1903,6 +1933,8 @@ class Workspace:
                 raise MergeRefused("couldn't read the CI checks (gh pr checks errored)")
             case "green":
                 no_ci = False  # it has CI after all, and it passed
+        if require_clean:
+            await self._require_clean(repo, pr_number, secrets)
         merged = await self._gh(
             ["pr", "merge", number, "--repo", repo.slug, "--squash",
              "--match-head-commit", head_sha],
