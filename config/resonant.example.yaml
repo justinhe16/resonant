@@ -93,6 +93,12 @@ backup:
   #                                     #   must already exist, never created; Resonant never uploads;
   #                                     #   use a folder of its own (old copies there are pruned too)
 
+retention:
+  enabled: true                         # the daily prune (core/prune), 30 min after backup.daily_at, only after a good backup
+  events_days: 90                       # consumed events older than this (7..3650); rows still referenced are kept
+  tasks_days: 90                        # finished tasks older than this (7..3650); rows still referenced are kept
+  audit_days: 365                       # audit rows older than this (30..3650); an open task's rows are kept
+
 pulse:
   enabled: true                         # hourly "btw" messages and urgent interrupts
   quiet_hours: "00:00-06:00"            # local time in `timezone`; only urgent items go out inside it
@@ -145,6 +151,9 @@ pulse:
 #     turn_timeout_s: 240               # a turn past this is a hang: killed, the next starts fresh
 #     queue_max: 3                      # hard texts waiting behind the one in flight
 #     max_per_hour: 60                  # runaway guard over every message to Claude; 0: off
+#     pause_check_s: 5                  # an idle session stops this soon after a CLI pause
+#     transcript_days: 14               # its earlier sessions' transcripts kept this long; 0: kept
+#     max_turns: 40                     # Claude's tool rounds per owner text (--max-turns)
 #   # BR-7: media, watches, proactive notices (docs/brain-plan.md D10)
 #   whisper_path: null                  # a local whisper.cpp whisper-cli (absolute) for voice notes;
 #                                       #   null: a voice note gets "type it instead" (Claude takes no audio)

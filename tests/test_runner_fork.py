@@ -159,6 +159,7 @@ async def test_fork_run_asks_then_opens_the_upstream_pr(
     session = h.argv_log(code)[0]["argv"]
     prompt = session[session.index("--append-system-prompt") + 1]
     assert "do not open a pull request" in prompt and FORK in prompt and UPSTREAM in prompt
+    assert "/robot-surf" not in prompt  # upstream's maintainers merge: no surf skills
     # nothing opened upstream before the owner's yes; the ask names the change
     assert upstream_calls(h) == []
     [prompt_sent] = prompts(h)

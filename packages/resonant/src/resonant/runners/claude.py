@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -89,6 +90,7 @@ import psutil
 from resonant import killswitch
 from resonant.config import RunnerConfig, RunnerRepo
 from resonant.extensions.notify import clean_text
+from resonant.gate import actions as action_ids
 from resonant.gate.codes import clean_external
 from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
 from resonant.loop.types import (
@@ -157,6 +159,7 @@ from resonant.runners.live import (
 from resonant.runners.reaper import MARKER_ENV, Target
 from resonant.runners.reports import (
     HELD_KINDS,
+    MergedBy,
     Report,
     WorkerReports,
     alerts,
@@ -165,11 +168,13 @@ from resonant.runners.reports import (
     detected_list,
     end_event,
     end_title,
+    merged_by_of,
     merged_list,
     merged_names,
     record_detected,
     set_alert,
     set_merged,
+    set_merged_by,
     shown_did,
 )
 from resonant.runners.side_effects import RunContext, SideEffect, detect
@@ -211,6 +216,7 @@ from resonant.secrets import (
     load_runner_secrets,
     missing_runner_secrets,
 )
+from resonant.store import approvals as approvals_store
 from resonant.store import questions as questions_store
 from resonant.store import repos as repo_store
 from resonant.store import runs, system_texts
@@ -257,6 +263,14 @@ TOKEN_REFRESH_S = 50 * 60  # installation tokens last an hour: a fresh one after
 MERGE_WAIT_S = 2 * 3600.0  # auto-merge waits this long after the run for CI to finish
 MERGE_POLL_S = 120.0  # ... looking at CI this often
 EXTERNAL_PR = "external_pr"  # the trust action of opening a PR on someone else's repo
+# flock'd by the runner that owns runner.work_dir (the daemon) from start() to aclose():
+# only it sweeps the run dirs' credentials and ctl sockets at startup (PER-271)
+WORK_DIR_LOCK = ".daemon.lock"
+LOCK_WAIT_S = 20.0  # how long start() waits for a predecessor to let go of it
+LOCK_POLL_S = 0.25
+# a push run's session left commits it couldn't push: the run fails with this reason, and
+# the reply leads with it (PER-271: not "made no changes")
+COULDNT_PUSH = "couldn't push: "
 REVOKE_TIMEOUT_S = (
     github_app_mod.ATTEMPTS * github_app_mod.TIMEOUT_S
     + github_app_mod.BACKOFF_S * (2**github_app_mod.ATTEMPTS - 1)
@@ -278,6 +292,23 @@ RUNNER_PROMPT = (
     "again. Stop when CI is green or you are "
     "out of attempts. End with a 1-3 line summary: what changed, the PR number, whether CI is "
     "green, and anything left undone."
+)
+# SF-1: a push run with the guard off loads the owner's ~/.claude, surf skills included. The
+# runner can't tell a code change from ops or research, so the prompt states when to use them.
+SURF_PROMPT = (
+    "\n\nThe owner's surf skills: use them only when all three hold: this run has a repo, "
+    "the ask is a code change, and the result is meant to be a pull request that gets merged. "
+    "Then work through /robot-surf (for a Linear ticket) or /robot-surf-prompt (for a freeform "
+    "ask), or another surf skill when it fits better, here in this worktree on {branch} (don't "
+    "create another worktree or branch): build the change, run the tests, open the pull "
+    "request, get CI green, then run the code-reviewer agent and fix what it finds until it "
+    "has no must-fix left, with CI green again after the fixes. For these runs green CI alone "
+    "is not the place to stop. Skip the skill's wait for human review: stop then and give the "
+    "summary. The rules above still hold. Merging stays with Resonant: it merges a green pull "
+    "request per the owner's trust rules, so don't merge it yourself. In every other case "
+    "(no repo, ops, research, an investigation, a review only, a one-off or unusual ask) "
+    "don't invoke a surf skill; just do what the ask says. If the ask asks for a different "
+    "flow, the ask wins."
 )
 FORK_PROMPT = (
     "You are working in a git worktree of {fork}, the owner's fork of {upstream} (your current "
@@ -500,6 +531,7 @@ def end_parts(
     upstream: str | None = None,
     watching: bool = False,
     merged: Sequence[str] = (),
+    merged_by: MergedBy | None = None,
 ) -> tuple[str, list[str], list[str]] | None:
     """An ended run's headline, its further lines (most important first) and the worker's
     own summary line (``said``, kept apart so a caller can put the side effects before it);
@@ -510,7 +542,9 @@ def end_parts(
     warning), never an auto-merge. ``upstream``: a fork-mode run's original repo (its
     ``done`` names the PR opened there, or why none was). ``watching``: the run merges itself
     once CI is green. ``merged``: the PRs a run merged onto its base (``PR #121``): its
-    ``done`` says so."""
+    ``done`` says so. ``merged_by`` (PER-269): the run's own PR was found merged and Resonant
+    has a record of it: Resonant merged it (``R8's PR #2 is merged into main (you approved it
+    in M6).``), or the run did on the owner's yes to its check."""
     took = fmt_duration(run.session_seconds)
     who = run_who(run)
     said = [f"{run.code}: {run.summary}"] if run.summary else []
@@ -550,9 +584,18 @@ def end_parts(
                 f"{upstream} ({why})."
             )
             return head, [], said
+        case "done" if merged and merged_by is not None and merged_by.by == "resonant":
+            base = run.base_branch or "the base"  # PER-269: Resonant merged the run's PR
+            approved = f" (you approved it in {merged_by.code})" if merged_by.code else ""
+            return f"{run.code}'s {and_list(merged)} is merged into {base}{approved}.", [], said
         case "done" if merged:  # PER-268: it merged a PR onto its base, as asked
             base = run.base_branch or "the base"
-            return f"{who} merged {and_list(merged)} into {base} ({took}).", [], said
+            approved = (
+                f"; you approved it in {merged_by.code}"
+                if merged_by is not None and merged_by.code
+                else ""
+            )
+            return f"{who} merged {and_list(merged)} into {base} ({took}{approved}).", [], said
         case "done" if run.repo:  # RX-1: a run that couldn't push; the work is on its branch
             where = _home(run.checkout) if run.checkout else run.repo
             why = run.failure or "it can't push yet"
@@ -567,6 +610,8 @@ def end_parts(
                 [],
                 [],
             )
+        case "failed" if run.failure and run.failure.startswith(COULDNT_PUSH):
+            return f"{who} {run.failure}", [], said  # PER-271: the work is on its branch
         case "failed":
             return f"{who} failed: {run.failure or 'unknown error'}", [], []
         case "cancelled":
@@ -600,10 +645,12 @@ def reply_text(
     upstream: str | None = None,
     watching: bool = False,
     merged: Sequence[str] = (),
+    merged_by: MergedBy | None = None,
 ) -> str | None:
     """The message for an ended run, from :func:`end_parts` (None for a state that has
     none), at most a headline and ``END_EXTRA_LINES`` lines."""
-    parts = end_parts(run, ci, no_ci=no_ci, upstream=upstream, watching=watching, merged=merged)
+    parts = end_parts(run, ci, no_ci=no_ci, upstream=upstream, watching=watching, merged=merged,
+                      merged_by=merged_by)  # fmt: skip
     if parts is None:
         return None
     head, lines, said = parts
@@ -955,6 +1002,8 @@ class ClaudeRunner:
         self._background: set[asyncio.Task[Any]] = set()
         self._unhook: Callable[[], None] | None = None
         self.ctl_root = worker_cli.ctl_root(runner.work_dir)
+        self._work_dir_lock: int | None = None  # the fd holding WORK_DIR_LOCK (PER-271)
+        self.lock_wait_s = LOCK_WAIT_S
         self.ask_block_s = ask_block_s
         self._submit: Callable[[Event], bool] = submit or self._insert_event
         self._run_redactors: dict[str, Redactor] = {}
@@ -1089,6 +1138,18 @@ class ClaudeRunner:
             async with self.workspace.mirror_lock(old):
                 await asyncio.to_thread(self._move_mirror, old, new)
         reaped = 0
+        if not await asyncio.to_thread(self._own_work_dir):
+            # PER-271: another live process (the daemon) owns these run dirs. Its sessions'
+            # processes, credentials and sockets are not ours to end or wipe.
+            log.warning(
+                "runner.work_dir %s is owned by another live process; not sweeping its runs",
+                self.cfg.work_dir,
+            )
+            with atomic(self.conn):
+                audit(self.conn, "run.startup_sweep_skipped", work_dir=str(self.cfg.work_dir))
+            if self._unhook is None:
+                self._unhook = killswitch.add_pause_hook(self._on_pause)
+            return reaped
         # A session killed by a restart someone asked for (/restart, /update, a worker's
         # `resonant restart`) isn't a crash of its run: no attempt is spent on it.
         planned = take_planned(self.conn, self.clock())
@@ -1117,6 +1178,45 @@ class ClaudeRunner:
             self._unhook = killswitch.add_pause_hook(self._on_pause)
         return reaped
 
+    def _own_work_dir(self) -> bool:
+        """Take ``<work_dir>/.daemon.lock`` (``flock``, held until ``aclose`` or exit) for
+        this runner, or False when another process holds it: only the runner that owns the
+        run dirs may reap their sessions and wipe their credentials and ctl sockets at
+        startup (PER-271: a test or a second runner must never sweep the live daemon's)."""
+        if self._work_dir_lock is not None:
+            return True
+        self.cfg.work_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(self.cfg.work_dir / WORK_DIR_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC,
+                     0o600)  # fmt: skip
+        # A predecessor still exiting (/restart, /update, a kickstart overlap) holds it for
+        # a moment: wait that long before treating the holder as a live daemon.
+        deadline = time.monotonic() + self.lock_wait_s
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        os.close(fd)
+                        return False
+                    time.sleep(LOCK_POLL_S)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._work_dir_lock = fd
+        with contextlib.suppress(OSError):  # who holds it, for a person looking
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+        return True
+
+    def _release_work_dir(self) -> None:
+        fd, self._work_dir_lock = self._work_dir_lock, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     async def _sweep_credentials(self) -> None:
         """Revoke and delete the token left in every ``<work_dir>/R*/creds`` (whatever state
         its run is in: a crash can come after the row says the run ended but before the
@@ -1143,14 +1243,17 @@ class ClaudeRunner:
 
     async def aclose(self) -> None:
         """Remove the kill switch hook and wait for the kills it started."""
-        if self._unhook is not None:
-            self._unhook()
-            self._unhook = None
-        await self.desk.aclose()
-        tasks = list(self._background)
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            if self._unhook is not None:
+                self._unhook()
+                self._unhook = None
+            await self.desk.aclose()
+            tasks = list(self._background)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._release_work_dir()
 
     def _target(self, run: Run) -> Target:
         return Target(
@@ -1605,6 +1708,9 @@ class ClaudeRunner:
                 runs.update(self.conn, run.code, status="merged", flagged_paths=checked.flagged)
                 audit(self.conn, "run.merged", run=run.code, pr=run.pr_number, by=by,
                       no_ci=done.no_ci)  # fmt: skip
+                merged = self._pr_target(run, run.pr_number)
+                if merged is not None:  # PER-269: the open asks for it are moot
+                    approvals_store.obsolete_for_target(self.conn, merged, self.clock())
         told = by == "owner" if replied is None else replied
         await self._report_merged(self._must_get(run.code), by_owner=told, deps=checked.deps)
         with contextlib.suppress(Exception):
@@ -1823,11 +1929,11 @@ class ClaudeRunner:
             self._working.discard(run.code)
 
     def _defer(self, task: Task, why: str) -> Wait:
-        # The loop has no "resource" wait reason; usage_reset is the closest, and the run's own
-        # status (queued) is what /runs shows.
+        # A busy slot or repo lock is a `resource` wait (PER-259), not a usage reset; the run's
+        # own status (queued) is what /runs shows.
         log.info("run deferred", extra={"task": task.id, "why": why})
         return Wait(
-            "usage_reset", dict(task.checkpoint), self.clock() + timedelta(seconds=self.defer_s)
+            "resource", dict(task.checkpoint), self.clock() + timedelta(seconds=self.defer_s)
         )
 
     async def _drive(self, task: Task, run: Run, ctx: StepContext) -> StepOutcome:
@@ -2097,7 +2203,8 @@ class ClaudeRunner:
         return argv
 
     def _prompt(self, run: Run, p: Prepared, *, local: str | None = None) -> str:
-        """The session's system prompt: scratch, a push repo's (it drives its own PR), a
+        """The session's system prompt: scratch, a push repo's (it drives its own PR, through
+        the surf skills for a code change when the owner's setup is loaded), a
         fork's (it pushes to the fork and stops; Resonant opens the upstream PR) or a run's
         that can't push yet (``local``, RX-1: it commits and stops)."""
         if p.scratch:
@@ -2129,6 +2236,8 @@ class ClaudeRunner:
             RUNNER_PROMPT.format(
                 repo=repo.slug, branch=p.branch, base=p.base_branch, attempts=MAX_FIX_ATTEMPTS
             )
+            # the skills load only with the owner's setup (GD-1); thin runs never see them
+            + (SURF_PROMPT.format(branch=p.branch) if self.guard == "off" else "")
             + own
         )
 
@@ -2729,12 +2838,40 @@ class ClaudeRunner:
                     with atomic(self.conn):
                         audit(self.conn, "run.done_merged", run=run.code, merged=len(names))
                     return self._must_get(run.code)
+                if unpushed := await self.workspace.local_commits(p):  # PER-271
+                    raise RunnerError(
+                        f"{COULDNT_PUSH}{_plural(unpushed, 'commit')} saved on {p.branch} "
+                        f"(/runs {run.code})"
+                    )
                 raise NoChanges("the session pushed nothing")
             raise RunnerError(
                 f"the session pushed {p.branch} but opened no PR (work kept: /runs {run.code})"
             )
         self._check_stop(run.code)
-        if pr.state == "MERGED":  # the session merged it itself: no check ever ran on it
+        target = self._pr_target(run, pr.number)
+        if target is not None and pr.state in ("MERGED", "CLOSED"):
+            approvals_store.obsolete_for_target(self.conn, target, self.clock())  # PER-269
+        if (
+            target is not None
+            and pr.state == "MERGED"
+            and (
+                record := action_ids.merge_record(
+                    self.conn, *_split_target(target), run_code=run.code
+                )
+            )
+        ):
+            # PER-269: Resonant merged it (merge_pr), or the owner approved the run's merge:
+            # the run's work is done and merged, not a merge behind Resonant's back.
+            set_merged(self.conn, run.code, [f"PR #{pr.number}"])
+            set_merged_by(self.conn, run.code, MergedBy(record.by, record.code))
+            if not runs.finish(self.conn, run.code, "done", step="reply",
+                               pr_number=pr.number, pr_url=pr.url):  # fmt: skip
+                raise _Cancelled
+            with atomic(self.conn):
+                audit(self.conn, "run.done_merged", run=run.code, merged=1, pr=pr.number,
+                      by=record.by, approval=record.code)  # fmt: skip
+            return self._must_get(run.code)
+        if pr.state == "MERGED":  # merged with no record in Resonant: no check ever ran on it
             set_alert(
                 self.conn,
                 run.code,
@@ -3052,6 +3189,12 @@ class ClaudeRunner:
 
     # -- the session's GitHub token --
 
+    def _pr_target(self, run: Run, number: int) -> str | None:
+        """``jhe/dori#2`` for a PR of the run's repo (``gate.actions``); None (never raises)
+        when the repo isn't registered."""
+        repo = repo_store.find(self.conn, run.repo) if run.repo else None
+        return action_ids.pr_target(repo.slug, number) if repo is not None else None
+
     def _slug(self, repo_name: str) -> str:
         repo = repo_store.find(self.conn, repo_name)
         if repo is None:
@@ -3206,8 +3349,9 @@ class ClaudeRunner:
         upstream = repo.slug if repo is not None and repo.mode == "fork" else None
         ci = await self._ci_word(run)
         merged = merged_list(self.conn, run.code) if run.status == "done" else []
+        merged_by = merged_by_of(self.conn, run.code) if merged else None
         parts = end_parts(run, ci, no_ci=no_ci, upstream=upstream, watching=watching,
-                          merged=merged)  # fmt: skip
+                          merged=merged, merged_by=merged_by)  # fmt: skip
         event = end_event(run)
         title = end_title(run, ci, merged=merged)
         # PER-268: one text per outcome. The ⚠ lines (a direct push, a PR merged by the
@@ -3267,7 +3411,7 @@ class ClaudeRunner:
         # be a tainted turn's, a failure quotes GitHub, flagged paths are the worker's): it
         # taints the turn that sees it, as the run tools do.
         bare = end_parts(replace(run, summary=None), ci, no_ci=no_ci, upstream=upstream,
-                         watching=watching, merged=merged)  # fmt: skip
+                         watching=watching, merged=merged, merged_by=merged_by)  # fmt: skip
         if bare is not None:
             said = end_text(bare[0], [*warn, *([note] if note else []), *bare[1]])
             ref = f"run:{run.code}:{run.status}"
@@ -3500,6 +3644,12 @@ def _mergeable(run: Run) -> bool:
         and run.head_sha is not None
         and run.branch is not None
     )
+
+
+def _split_target(target: str) -> tuple[str, int]:
+    """``("jhe/dori", 2)`` for ``jhe/dori#2`` (a ``gate.actions.pr_target``)."""
+    repo, number = target.rsplit("#", 1)
+    return repo, int(number)
 
 
 def _pr_number(run: Run) -> int:

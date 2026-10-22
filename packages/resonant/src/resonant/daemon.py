@@ -208,6 +208,10 @@ class Daemon:
                 await self.imessage.claude.start()
             except Exception:
                 log.exception("runner startup failed")
+        if self.imessage is not None:
+            from resonant.wiring import start_asks
+
+            await start_asks(self.state.components)  # PER-262: the brain's leftovers
         loop_task = asyncio.create_task(self.loop.run(), name="loop")
         server_task = asyncio.create_task(self._serve(), name="api")
         stop_task = asyncio.create_task(self._stop.wait(), name="stop")

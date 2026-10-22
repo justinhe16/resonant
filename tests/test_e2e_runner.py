@@ -758,7 +758,7 @@ async def test_r1_under_the_real_sandbox(
     async with running(w):
         assert (await w.say("/run demo fix it")).startswith("On it: R1")
         done = await w.next_text()
-        assert bare(done).startswith("R1 made no changes"), done
+        assert bare(done).startswith("R1 couldn't push: 1 commit saved on "), done
         env = json.loads((w.tmp() / "argv.json").read_text())[0]["env"]
         assert env["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN
         seen = json.loads((w.tmp() / "creds.json").read_text())

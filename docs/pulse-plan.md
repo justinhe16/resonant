@@ -14,7 +14,7 @@ Any extension can report items, so future extensions (Dori on-call, a trading bo
 
 ### As built (deviations from the design below)
 
-- **Health stays with the monitor.** No `core/health` items: the `HealthMonitor` already alerts on degrade and recovery, so the pulse would only say it twice. The core items are `core/approval/<code>` only.
+- **Health stays with the monitor.** No `core/health` items: the `HealthMonitor` already alerts on degrade and recovery, so the pulse would only say it twice. Approvals are not pulse items since PER-261 (`core/remind` reminds once at half the TTL).
 - **Briefing Updates exclude `core` and muted sources.** They list open extension items at any urgency, changed-since-told first.
 - **Ordering.** Urgent first, then normal, then low; oldest first within each, so an overflow can't starve old items.
 - **Clears of urgent items inherit urgent.** The "recovered" for an urgent item is texted at once however the extension rated the clear (clamped to the grant), including a clear of something the owner never heard.
@@ -24,6 +24,7 @@ Any extension can report items, so future extensions (Dori on-call, a trading bo
 - **Held urgent items ride the pulse** (paused, muted, capped), including after a mute ends, unless their `ttl` expired.
 - **Tool runs don't persist fd-3 events**, so reporters must be jobs; the example's `incident` is a job plus a tool that writes its state.
 - **Quiet items (BF-1).** A report can say it has nothing to say: `report(..., quiet=True)` (github's all-zero `github/summary`). Ingest stores it cleared and told at once, so the briefing's Updates and the hourly pulse leave it out, with no `✓`; the next report that isn't quiet opens it again as news. Without the field a report is not quiet, so older extensions work as before. The briefing, empty after that, is one line (`briefing.nothing_line`, a few variants by date); the hourly pulse with nothing pending sends nothing, as before. The Workers and approvals sections were already left out when empty.
+- **Wording (PER-266).** A `ready` run's quiet PR reads `Waiting on you to merge: R5 fix login (#16, ~6h)` and a run queued behind the slot limit (its task waits on `resource`) `Queued behind other runs: R9 docs pass (~5h)`, not "got dropped"; the stall keys and state are unchanged, so the new wording never re-announces. Stalls already told stay visible on a `Quiet: …` status line (never a reason to send). An untold `merged/` item more than 3 days old when the pulse or briefing refreshes (a long pause, say) is dropped, not said. A watch that expires without firing leaves a low `core/notice/watch/<id>/ended` item, `W3 iPhone 17 in stock ended without firing`, which the briefing's Updates lists (the only core items it shows: untold brain notices) and which expires with its 24h TTL.
 - **Workers (EM-6, [`employee-plan.md`](employee-plan.md#d5-reporting-and-urgency)).** Claude workers report through `core` items keyed `run/<code>`, rendered in a `Workers:` section after the other lines of the pulse (and of the briefing, which otherwise skips `core` items). When a pulse has news, it also lists the workers still running, already told, for status; they never make a pulse send on their own. A full message drops worker lines first (the section is last, unless it holds an urgent line, then it goes first) and never ends on a bare header; `+N more` counts news left out, not headers or status lines.
 
 ---
@@ -108,7 +109,7 @@ The first run after install is a baseline (as for notify): items are stored as t
 - One core job, cron `0 * * * *` in `settings.timezone`, catch-up 50 minutes. It skips the briefing's hour (the briefing covers it), quiet hours, and paused.
 - Core items are refreshed in-process first:
   - Health stays with the monitor, which already alerts (no `core/health` items).
-  - `core/approval/<code>`: an approval pending for `remention_after` (normal), one re-mention. As built: capped at half the approval TTL; with the defaults (10 and 30 minutes) only approvals asked between :30 and :50 past an hour are caught by the next pulse. A proper "expires soon" reminder belongs to the approval runner (follow-up).
+  - `core/approval/<code>`: an approval pending for `remention_after` (normal), one re-mention. As built: capped at half the approval TTL; with the defaults (10 and 30 minutes) only approvals asked between :30 and :50 past an hour are caught by the next pulse. Superseded by PER-261: `core/remind` texts `[A7] still waiting, expires in 15 min` once at half the TTL, and this item is gone.
 - It collects untold `normal` and `urgent` items (the urgent ones were held), from extensions that aren't muted, and sends one message if there are any:
   ```
   btw:

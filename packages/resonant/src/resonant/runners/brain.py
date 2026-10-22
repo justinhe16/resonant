@@ -131,8 +131,10 @@ from resonant.runners.local import (
     with_report,
 )
 from resonant.store import approvals as ap
+from resonant.store import pulse as pulse_store
 from resonant.store import questions
 from resonant.store.db import utcnow
+from resonant.store.tasks import get_event
 from resonant.toolcore import MAX_SIDE_EFFECTS, BatchItem, RunnerGate, ToolExecutor
 from resonant.toolcore import args_error as args_error  # moved here (TC-1); re-exported
 from resonant.tools import ToolRegistry
@@ -208,6 +210,40 @@ OUT_OF_REACH_HINT = (
     'it ("I can\'t reach your email." or "I can\'t reach your calendar."). If it asks you '
     "to save a note, reminder or fact, call that tool as usual."
 )
+# PER-270: told only on the turns triage typed so, like ``OUT_OF_REACH_HINT``.
+_AS_USUAL = " If it also asks you to do, save or check something, call that tool as usual."
+TYPE_HINTS = {
+    "greeting": "Resonant note: this is a greeting. Reply with one short friendly line; no "
+    "status, runs or news unless they ask." + _AS_USUAL,
+    "ack": "Resonant note: this acknowledges something. Reply in a few words; don't repeat "
+    "what they were told." + _AS_USUAL,
+    "news_check": "Resonant note: they ask what's new or what waits on them. Don't repeat the "
+    "<known> items; if nothing is new or waiting on them, say so in one line.",
+}
+# Greetings and acks are short: a longer message typed so still gets the usual turn.
+SMALL_TALK_MAX_CHARS = 40
+
+
+_OUTCOME = re.compile(
+    r"\b(?:fail\w*|merged|ready|done|finished|ended|stopped|cancel\w*|no changes|made no|"
+    r"complete\w*|crash\w*|timed out)\b",
+    re.IGNORECASE,
+)
+
+
+def _reports(sentence: str, code: str) -> bool:
+    """The sentence names the run ``code`` (``r8``) and says how it went."""
+    return re.search(rf"\b{re.escape(code)}\b", sentence, re.IGNORECASE) is not None and (
+        _OUTCOME.search(sentence) is not None
+    )
+
+
+def is_small_talk(text: str) -> bool:
+    """Short enough to be only a greeting or an ack, and not a question."""
+    body = text.strip()
+    return len(body) <= SMALL_TALK_MAX_CHARS and "?" not in body
+
+
 FINAL_INSTRUCTION = (
     "Now answer the owner's message from what you read. Reply with only a JSON object: "
     f'{{"reply": "<plain text, at most {MAX_REPLY_CHARS} characters>"}}.'
@@ -524,6 +560,18 @@ def _asking(st: _Turn) -> Generator[None]:
         ASKING_HOPS.reset(token)
 
 
+def _ran_extension_change(spec: ToolSpec, done: object) -> bool:
+    """An extension's change that ran (its ``CallResult`` has the report line): what qwen
+    sees of it is that code-built line alone, which carries no outside content."""
+    return (
+        spec.extension is not None
+        and spec.effect is not Effect.READ
+        and isinstance(done, CallResult)
+        and done.ok
+        and done.report is not None
+    )
+
+
 def _is_read(spec: ToolSpec | None) -> bool:
     return spec is not None and spec.effect is Effect.READ
 
@@ -755,6 +803,7 @@ class BrainRunner(LocalRunner):
     ) -> StepResult:
         core, deferred = self.tools_for(principal)
         missing = self._runner_missing()
+        self._ack_told(task, principal)
         with spans("runner.brain.context", core=len(core), catalog=len(deferred)) as s:
             context = build_context(
                 self.conn,
@@ -788,7 +837,25 @@ class BrainRunner(LocalRunner):
             # The model's own words give way to the code-built lines (what ran, why it
             # stopped); the reply after the owner's answer is code-built too.
             lines = [result.reply] if result.path in GATED_PATHS else st.reports
-            with spans("runner.brain.batch", changes=len(st.batch), ran=len(st.reports)):
+            # PER-261: the model's answer to the rest of the message (with the report lines
+            # of what ran) goes out first, then the batch prompt; the reply after the owner's
+            # answer is then the batch's lines alone.
+            # Not when it claims a change while nothing ran (everything it did waits on a
+            # yes), and never in a tainted turn: its words may carry outside text ("reply yes")
+            # and would sit right above the prompt, so code-built lines go instead, as before.
+            answer = (
+                result.reply
+                if result.path == "llm"
+                and result.reply.strip()
+                and not st.tainted
+                and context.untrusted is None
+                and (st.reports or not claims_change(result.reply))
+                else None
+            )
+            if answer is not None:
+                lines = []
+            with spans("runner.brain.batch", changes=len(st.batch), ran=len(st.reports),
+                       answer_first=answer is not None):  # fmt: skip
                 pass
             return await self.close_batch(
                 task,
@@ -799,6 +866,7 @@ class BrainRunner(LocalRunner):
                 spans,
                 pin=st.pin(),
                 decision=st.decisions.get(st.batch[0].approval_id),
+                answer=answer,
             )
         if isinstance(result, Answer):  # the next turn's history reads it (BR-10b)
             result.meta["tainted"] = result.meta.get("tainted") is True or st.tainted
@@ -807,6 +875,65 @@ class BrainRunner(LocalRunner):
             if context.untrusted is not None:
                 result.meta["history_taint"] = context.untrusted
         return result
+
+    @staticmethod
+    def _type_hint(text: str, message_type: object) -> str | None:
+        """PER-270: the note for the turn's type of message (``TYPE_HINTS``). A greeting or
+        an ack only when the message is that short: the model types commands "ack" too."""
+        if message_type in ("greeting", "ack") and not is_small_talk(text):
+            return None
+        return TYPE_HINTS.get(str(message_type))
+
+    def _ack_told(self, task: Task, principal: str) -> None:
+        """PER-270: the owner wrote, so what they were told before this message is
+        acknowledged (``pulse.mark_acked``: any later message counts). Best effort."""
+        if principal != self.principals.owner or task.origin_event_id is None:
+            return
+        with contextlib.suppress(sqlite3.Error):
+            event = get_event(self.conn, task.origin_event_id)
+            if event is not None:
+                pulse_store.mark_acked(self.conn, event.occurred_at, self.now())
+
+    async def _send(
+        self,
+        task: Task,
+        principal: str,
+        answer: Answer,
+        start: float,
+        spans: SpanFactory,
+        *,
+        resend: bool = False,
+    ) -> StepOutcome:
+        outcome = await super()._send(task, principal, answer, start, spans, resend=resend)
+        if isinstance(outcome, Done) and principal == self.principals.owner:
+            self._mark_told_by(answer)
+        return outcome
+
+    def _mark_told_by(self, answer: Answer) -> None:
+        """PER-270: a reply that says how an ended run the owner hadn't been told about ended
+        (its code and an outcome word in one sentence; naming it in a question isn't enough)
+        tells them, so the pulse and the briefing skip it. Not an ack, not a tainted reply,
+        not a code-built system text (those record themselves). Best effort."""
+        if (
+            answer.meta.get("system") is True
+            or answer.meta.get("route") == "claude"
+            or answer.meta.get("tainted") is True
+        ):
+            return
+        sentences = [x for x in re.split(r"[.!?\n]+", answer.reply) if x.strip()]
+        try:
+            now = self.now()
+            urgencies = pulse_store.URGENCIES
+            named = [
+                i
+                for i in pulse_store.pending(self.conn, urgencies, now)
+                if i.source == "core" and i.cleared and i.key.startswith("run/")
+                and any(_reports(x, i.key.removeprefix("run/")) for x in sentences)
+            ]  # fmt: skip
+            if named:
+                pulse_store.mark_told(self.conn, named, now)
+        except sqlite3.Error:
+            log.warning("brain: told state not recorded", exc_info=True)
 
     async def _route(
         self,
@@ -830,6 +957,8 @@ class BrainRunner(LocalRunner):
         elif st.meta.get("triage", {}).get("why") == "out_of_reach":
             # PER-249: told only on these turns, so the rule doesn't sit in every prompt
             st.messages.append({"role": "user", "content": OUT_OF_REACH_HINT})
+        elif hint := self._type_hint(st.text, st.meta.get("triage", {}).get("message_type")):
+            st.messages.append({"role": "user", "content": hint})  # PER-270
         try:
             return await self._rounds(task, principal, text, st, ctx, spans)
         except ModelUnavailableError:
@@ -892,7 +1021,7 @@ class BrainRunner(LocalRunner):
             if decided is None:  # in doubt: Claude, with a canned ack
                 decided = triage.Triage("claude", "general", None)
             if brain.route == "claude" and decided.route != "claude":
-                decided = triage.Triage("claude", decided.kind, None)
+                decided = triage.Triage("claude", decided.kind, None, decided.message_type)
             if (
                 decided.kind in triage.OUT_OF_REACH
                 and not triage.has_link(text)
@@ -901,18 +1030,45 @@ class BrainRunner(LocalRunner):
                 # PER-249: Claude can't reach email or calendar either: say so here.
                 # Even with brain.route claude: Claude would only say the same. Photos
                 # never get here (runners/media.py hands them to Claude directly).
-                decided = triage.Triage("local", decided.kind, None)
+                decided = triage.Triage("local", decided.kind, None, decided.message_type)
                 why = "out_of_reach"
             elif decided.route == "local" and triage.has_link(text):
-                decided = triage.Triage("claude", "link", None)  # links need WebFetch
+                decided = triage.Triage("claude", "link", None, decided.message_type)  # WebFetch
                 why = "link"
+            elif decided.route == "local" and triage.asks_run_why(text):
+                # PER-270: why a run did something is in its transcript, not our records
+                decided = triage.Triage("claude", decided.kind, None, decided.message_type)
+                why = "run_why"
             elif decided.route == "local" and triage.looks_hard(text):
-                decided = triage.Triage("claude", decided.kind, None)  # why/how, debugging
+                # why/how, debugging
+                decided = triage.Triage("claude", decided.kind, None, decided.message_type)
                 why = "hard_shape"
+            elif decided.route == "local" and decided.message_type == "correction":
+                # PER-270: disagreeing with something Resonant said needs more than a status line
+                decided = triage.Triage("claude", decided.kind, None, decided.message_type)
+                why = "correction"
+            elif (
+                decided.route == "claude"
+                and decided.message_type in ("greeting", "ack")
+                and brain.route != "claude"
+                and why == "model"
+                and not triage.has_link(text)
+                and not triage.looks_hard(text)
+                and not triage.asks_run_why(text)
+                and is_small_talk(text)
+            ):
+                # PER-270: small talk is answered here, whatever the model chose
+                decided = triage.Triage("local", decided.kind, None, decided.message_type)
+                why = "small_talk"
             ms = round((time.monotonic() - start) * 1000)
             s.set(route=decided.route, kind=decided.kind, why=why, ack=decided.ack is not None,
                   latency_ms=ms)  # fmt: skip
-        st.meta["triage"] = {"route": decided.route, "why": why, "ms": ms}
+        st.meta["triage"] = {
+            "route": decided.route,
+            "why": why,
+            "ms": ms,
+            "message_type": decided.message_type,
+        }
         return decided if decided.route == "claude" else None
 
     async def _hand_off(
@@ -1047,7 +1203,9 @@ class BrainRunner(LocalRunner):
                 ended = await self._one(task, principal, name, args, st, ctx, spans)
                 if ended is not None:
                     return ended
-                if len(st.reports) >= MAX_SIDE_EFFECTS:
+                if len(st.reports) >= MAX_SIDE_EFFECTS and self.core.batch_gate is None:
+                    # Without batches the cap ends the turn. With them (PER-261) the turn goes
+                    # on: a change past the cap asks, in the batch (ToolCore gates it capped).
                     if st.batch:  # the batch's reply is code-built: no narration
                         return Answer("\n".join(st.reports), "done", used_tools(st.calls))
                     return await self._narrate(st, spans)
@@ -1237,7 +1395,7 @@ class BrainRunner(LocalRunner):
                     st.decisions[asked.approval_id] = done.decision
             with spans("runner.brain.asked", tool=name, batch=len(st.batch)):
                 pass
-        elif taints(spec) and not session:
+        elif taints(spec) and not session and not _ran_extension_change(spec, done):
             if not st.tainted or st.hops:
                 with spans("runner.brain.taint", tool=name, extension=spec.extension):
                     pass
@@ -1262,7 +1420,14 @@ class BrainRunner(LocalRunner):
         failed = not call.ok and (call.error or "").startswith("the tool failed")
         st.failures = 0 if call.ok else st.failures + int(failed)
         st.calls.append(call)
-        self._tool_turns(name, args, call, st)
+        # PER-261: an extension's change that ran shows qwen only its code-built report line
+        # (as Claude's bridge does), never the result, so one save doesn't taint the turn.
+        shown = (
+            replace(call, data={"done": call.report})
+            if _ran_extension_change(spec, call) and call.report is not None
+            else call
+        )
+        self._tool_turns(name, args, shown, st)
         return await self._still_failing(task, principal, st, ctx, spans)
 
     def _tool_turns(self, name: str, args: Any, call: CallResult, st: _Turn) -> None:

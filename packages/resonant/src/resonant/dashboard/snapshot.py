@@ -31,7 +31,7 @@ import json
 import re
 import sqlite3
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, cast, get_args
@@ -43,6 +43,8 @@ from pydantic.config import JsonDict
 from resonant import __version__
 from resonant.config import Settings
 from resonant.extensions.cron import CronError, parse_schedule
+from resonant.extensions.notify import muted_until
+from resonant.gate.policy import change_line, strictest, widens_trust
 from resonant.loop.slots import SlotPool
 from resonant.loop.types import TaskStatus
 from resonant.monitor import EXT_CHECK_PREFIX, health_snapshot
@@ -80,6 +82,13 @@ HealthState = Literal["ok", "degraded", "failing", "unknown"]
 # What ``Scheduler`` records (``_Result.outcome``); anything else shows as ``other``.
 JobOutcome = Literal["ok", "failed", "killed", "denied", "dry_run", "skipped_paused", "other"]
 PulseState = Literal["new", "told"]  # new: the owner hasn't heard this version yet
+# ``runners.side_effects.Kind`` (TR-1), mirrored: importing ``resonant.runners`` here is a cycle
+# (it imports ``brain.briefing``, which imports this module). A test keeps the two equal; a kind
+# missing here is left out of the counts, never an error.
+EffectKind = Literal[
+    "push", "merge", "release", "repo", "deploy", "publish", "http", "self", "message", "mcp",
+    "github",
+]  # fmt: skip
 
 # Identifiers the remote tier may carry: health check names (``model``, ``ext:github``),
 # extension names and job ids (the SDK's slugs, owner-chosen but never message content).
@@ -106,6 +115,8 @@ _OUTCOMES: frozenset[str] = frozenset(get_args(JobOutcome))
 _HEALTH_STATES: frozenset[str] = frozenset(get_args(HealthState))
 _TASK_STATES: frozenset[str] = frozenset(get_args(TaskStatus))
 _RUN_STATES: frozenset[str] = frozenset(get_args(RunStatus))
+_EFFECT_KINDS: frozenset[str] = frozenset(get_args(EffectKind))
+_URGENCIES: tuple[Urgency, ...] = get_args(Urgency)
 
 
 def _ident(value: str) -> bool:
@@ -158,6 +169,7 @@ class RunItem(_Model):
     ended_at: datetime | None
     waiting_reason: WaitReason | None
     last_note: str | None
+    detected: int  # side effects detected in its commands (TR-1, ``run.seen:<code>``)
     remote_url: str | None = _local()  # RC-1: the running session's Remote Control link
 
 
@@ -173,25 +185,51 @@ class RunBrief(_Model):
     waiting_reason: WaitReason | None
 
 
+class DetectedEffects(_Model):
+    """PER-263: the side effects detected in the commands of the runs the snapshot lists
+    (TR-1, the last ``RUN_ITEMS`` runs), counts only, so the remote tier has them too:
+    by kind, and how many of them were high-impact (a base push, a publish, a delete)."""
+
+    by_kind: dict[EffectKind, int]
+    high: int
+
+
 class Runs(_Model):
     by_state: dict[RunStatus, int]
+    detected: DetectedEffects
     items: list[RunItem] | None = _local()
     brief: list[RunBrief] = Field(default_factory=list[RunBrief])
 
 
+ApprovalLevel = Literal["L0", "L1", "L2", "L3"]
+
+
+class ApprovalChange(_Model):
+    """One change of a batch (BA-1): its line in the batch's prompt, and its own level."""
+
+    summary: str
+    level: ApprovalLevel
+
+
 class ApprovalItem(_Model):
+    """What one answer decides: a lone approval, or a batch (PER-254) as one row with the
+    batch's code (its first approval's), the summary ``N changes``, its strictest
+    level, when it was asked and its one expiry. ``changes`` lists a batch's changes in
+    order; it is absent for a lone approval."""
+
     code: str | None
     summary: str
-    level: Literal["L0", "L1", "L2", "L3"]
+    level: ApprovalLevel
     asked_at: datetime
     expires_at: datetime
+    changes: list[ApprovalChange] | None = _local()
 
 
 class ApprovalBrief(_Model):
     """A pending approval on both tiers: no summary, and not its code (the owner types it to
-    say yes, so it stays on the Mini and iMessage)."""
+    say yes, so it stays on the Mini and iMessage). A batch (PER-254) is one brief, like its row."""
 
-    level: Literal["L0", "L1", "L2", "L3"]
+    level: ApprovalLevel
     effect: Literal["read", "write", "pay"]
     needs_code: bool
     asked_at: datetime
@@ -199,7 +237,7 @@ class ApprovalBrief(_Model):
 
 
 class Approvals(_Model):
-    open: int
+    open: int  # rows (what the owner answers): a batch counts once
     items: list[ApprovalItem] | None = _local()
     brief: list[ApprovalBrief] = Field(default_factory=list[ApprovalBrief])
 
@@ -245,6 +283,10 @@ class PulseBrief(_Model):
 
 class Pulse(_Model):
     open: int
+    # PER-263: items whose latest version the owner hasn't heard (``pulse.pending`` at every
+    # urgency, muted sources included, and cleared items whose last word is owed), so the
+    # remote tier shows a held or muted reporter's backlog without the titles.
+    untold: int
     items: list[PulseItem] | None = _local()
     brief: list[PulseBrief] = Field(default_factory=list[PulseBrief])
 
@@ -261,6 +303,7 @@ class Extension(_Model):
     name: Ident
     status: ExtensionStatus
     health: HealthState  # its ``ext:<name>`` check
+    muted_until: datetime | None  # PER-263: ``/ext mute``'s end while it is muted (notify)
     jobs: list[Job]
 
 
@@ -523,6 +566,7 @@ def _extensions(
                 name=record.name,
                 status=record.status,
                 health="unknown" if check is None else check.state,
+                muted_until=muted_until(conn, record.name, now),
                 jobs=_jobs(record, states, settings, now),
             )
         )
@@ -549,9 +593,11 @@ def build_snapshot(
     now = now or utcnow()
     health = _health(conn)
     run_rows = runs.recent(conn, limit=RUN_ITEMS)
-    pending = approvals.pending_all(conn, now)
+    pending = _approval_items(conn, approvals.pending_all(conn, now))
     asks = questions.open_asks(conn)
     items = pulse.open_items(conn, now)
+    untold = pulse.pending(conn, _URGENCIES, now)
+    detected = {r.code: _detected(conn, r.code) for r in run_rows}
     autonomy = kv_get(conn, "autonomy", "on")
     brain = _claude_brain(conn)
     if runner_missing is None:
@@ -584,6 +630,7 @@ def build_snapshot(
         ),
         runs=Runs(
             by_state=_counts(runs.count_by_status(conn), _RUN_STATES),
+            detected=_detected_counts(detected.values()),
             items=[
                 RunItem(
                     code=r.code,
@@ -597,6 +644,7 @@ def build_snapshot(
                     ended_at=r.ended_at,
                     waiting_reason=r.wait_reason if r.status == "waiting" else None,
                     last_note=r.last_note,
+                    detected=len(detected[r.code]),
                     remote_url=r.remote_url if r.status == "running" else None,
                 )
                 for r in run_rows
@@ -616,26 +664,8 @@ def build_snapshot(
         ),
         approvals=Approvals(
             open=len(pending),
-            items=[
-                ApprovalItem(
-                    code=a.code,
-                    summary=a.summary,
-                    level=a.level.value,
-                    asked_at=a.created_at,
-                    expires_at=a.expires_at,
-                )
-                for a in pending
-            ],
-            brief=[
-                ApprovalBrief(
-                    level=a.level.value,
-                    effect=a.effect.value,
-                    needs_code=a.require_code,
-                    asked_at=a.created_at,
-                    expires_at=a.expires_at,
-                )
-                for a in pending[:APPROVAL_BRIEF_ITEMS]
-            ],
+            items=[item for item, _ in pending],
+            brief=[brief for _, brief in pending[:APPROVAL_BRIEF_ITEMS]],
         ),
         questions=Questions(
             open=len(asks),
@@ -655,6 +685,7 @@ def build_snapshot(
         ),
         pulse=Pulse(
             open=len(items),
+            untold=len(untold),
             items=[
                 PulseItem(
                     source=i.source,
@@ -686,6 +717,89 @@ def build_snapshot(
         brain_activity=_brain_activity(conn, settings, now, brain),
         trust_rule_count=len(rules),
         repo_count=len(repo_rows),
+    )
+
+
+def _detected(conn: sqlite3.Connection, code: str) -> list[tuple[EffectKind, bool]]:
+    """Run ``code``'s detected side effects as (kind, high), unknown kinds left out."""
+    from resonant.runners.reports import detected_list  # a cycle at import time (EffectKind)
+
+    # ``detected_list`` casts the stored kind unchecked: a stale kv row can hold anything.
+    return [(e.kind, e.high) for e in detected_list(conn, code) if e.kind in _EFFECT_KINDS]
+
+
+def _detected_counts(per_run: Iterable[list[tuple[EffectKind, bool]]]) -> DetectedEffects:
+    by_kind: dict[EffectKind, int] = {}
+    high = 0
+    for effects in per_run:
+        for kind, is_high in effects:
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            high += is_high
+    return DetectedEffects(by_kind=by_kind, high=high)
+
+
+def _approval_items(
+    conn: sqlite3.Connection, pending: Sequence[approvals.Approval]
+) -> list[tuple[ApprovalItem, ApprovalBrief]]:
+    """``pending`` (oldest first) as what one answer decides, each row with its text-free
+    brief for both tiers (R5; a batch's brief takes its strictest level and effect, and needs
+    the code as the gate does): each lone approval, and each
+    batch (BA-1) once, where its oldest pending approval is. One answer decides all of it
+    (``yes`` / ``no``, or ``yes 1,3`` for some and the rest dropped, PER-255), so it is one
+    row. A batch's code is its first approval's and its
+    changes are in its order (both as its prompt showed them); it expires as one. A batch
+    whose approvals aren't all pending any more (one decided on its own: a race) can't be
+    answered as one (the gate's ``_units``; the runner drops the rest), so what is left of it
+    shows as lone rows, never under a code that no longer binds."""
+    index = approvals.batches_of(conn, [a.id for a in pending])
+    by_id = {a.id: a for a in pending}
+    out: list[tuple[ApprovalItem, ApprovalBrief]] = []
+    seen: set[str] = set()
+    for a in pending:
+        batch = index.get(a.id)
+        if batch is None or any(i not in by_id for i in batch.approval_ids):
+            item = ApprovalItem(
+                code=a.code,
+                summary=a.summary,
+                level=a.level.value,
+                asked_at=a.created_at,
+                expires_at=a.expires_at,
+            )
+            out.append((item, _approval_brief(item, [a], batch=False)))
+            continue
+        if batch.id in seen:
+            continue
+        seen.add(batch.id)
+        members = [by_id[i] for i in batch.approval_ids]
+        item = ApprovalItem(
+            code=members[0].code,
+            summary=f"{len(members)} changes",
+            level=strictest([m.level for m in members]).value,
+            asked_at=batch.created_at,
+            expires_at=min(m.expires_at for m in members),
+            changes=[ApprovalChange(summary=change_line(m), level=m.level.value) for m in members],
+        )
+        out.append((item, _approval_brief(item, members, batch=True)))
+    return out
+
+
+_EFFECT_RANK: Final[Mapping[str, int]] = {"read": 0, "write": 1, "pay": 2}
+
+
+def _approval_brief(
+    item: ApprovalItem, members: Sequence[approvals.Approval], *, batch: bool
+) -> ApprovalBrief:
+    """``item``'s row on both tiers: its level and times, the strictest effect of its
+    approvals, and whether a yes needs the code (as the gate's ``_Unit.needs_code``: any
+    approval needs it, or a batch has a change that widens trust). No summary and no code."""
+    effect = max((m.effect.value for m in members), key=_EFFECT_RANK.__getitem__)
+    return ApprovalBrief(
+        level=item.level,
+        effect=cast(Literal["read", "write", "pay"], effect),
+        needs_code=any(m.require_code for m in members)
+        or (batch and any(widens_trust(m.tool, m.extension) for m in members)),
+        asked_at=item.asked_at,
+        expires_at=item.expires_at,
     )
 
 

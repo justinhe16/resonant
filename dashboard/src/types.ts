@@ -42,7 +42,17 @@ export interface RunItem {
   ended_at: Timestamp | null;
   waiting_reason: string | null;
   last_note: string | null;
+  /** side effects detected in its commands (TR-1); absent before PER-263 */
+  detected?: number;
   remote_url?: string; // RC-1, local tier only: the running session's Remote Control link
+}
+
+/** PER-263: side effects detected in the listed runs' commands (TR-1), counts in both tiers. */
+export interface DetectedEffects {
+  /** by kind: push, merge, release, repo, deploy, publish, http, self, message, mcp, github */
+  by_kind: Record<string, number>;
+  /** how many were high-impact (a base push, a publish, a delete) */
+  high: number;
 }
 
 /** A run without its texts: no ask, repo, branch, note or link. Both tiers. */
@@ -59,12 +69,22 @@ export interface RunBrief {
 
 export interface Runs {
   by_state: ByState;
+  /** absent in snapshots from before PER-263 */
+  detected?: DetectedEffects;
   /** local only */
   items?: RunItem[];
   /** both tiers; absent in snapshots from before it */
   brief?: RunBrief[];
 }
 
+/** One change of an approval batch: its line in the batch's prompt and its own level. */
+export interface ApprovalChange {
+  summary: string;
+  level: string;
+}
+
+/** What one answer decides: a lone approval, or a batch (PER-254) as one row with the batch's
+ * code, its strictest level and its one expiry. */
 export interface ApprovalItem {
   /** null for an approval sent without a code */
   code: string | null;
@@ -72,6 +92,8 @@ export interface ApprovalItem {
   level: string;
   asked_at: Timestamp;
   expires_at: Timestamp | null;
+  /** a batch's changes, in order; absent for a lone approval (and before PER-254) */
+  changes?: ApprovalChange[];
 }
 
 /** A pending approval without its summary or code. Both tiers. */
@@ -129,6 +151,12 @@ export interface OpenList<T, B> {
   brief?: B[];
 }
 
+export interface PulseList extends OpenList<PulseItem, PulseBrief> {
+  /** PER-263: items whose latest version the owner hasn't heard (muted sources included), in
+   * both tiers; absent in snapshots from before PER-263 */
+  untold?: number;
+}
+
 export interface Job {
   id: string;
   next_due: Timestamp | null;
@@ -141,6 +169,8 @@ export interface Extension {
   name: string;
   status: "enabled" | "disabled" | "disabled_tampered";
   health: HealthState | string;
+  /** PER-263: when `/ext mute` ends, while muted; absent in snapshots from before it */
+  muted_until?: Timestamp | null;
   jobs: Job[];
 }
 
@@ -225,7 +255,7 @@ export interface Snapshot {
   runs: Runs;
   approvals: OpenList<ApprovalItem, ApprovalBrief>;
   questions: OpenList<QuestionItem, QuestionBrief>;
-  pulse: OpenList<PulseItem, PulseBrief>;
+  pulse: PulseList;
   extensions: Extension[];
   runner: Runner;
   /** local only */

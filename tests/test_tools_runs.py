@@ -27,6 +27,7 @@ from resonant.router.router import toolset_for
 from resonant.runners.claude import MAX_ASK, Cancelled, Merged, MergeQueued, Refused, Started
 from resonant.runners.local import report_line
 from resonant.runners.worker_desk import OpenQuestion, Relayed
+from resonant.store import approvals as ap
 from resonant.store import extensions as ext_store
 from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
@@ -276,6 +277,8 @@ def test_a_chat_merge_asks_when_the_repo_has_no_ci(
         db.execute("UPDATE repos SET ci = ? WHERE name = 'resonant'", (ci,))
         asked = components.gate.evaluate(intent(components, "merge_run", {"code": "R1"}))
         assert isinstance(asked, NeedsApproval) and asked.level is Level.L2
+        # PER-269: one request per action; the next ask (another task) would point to this one
+        ap.expire_one(db, asked.approval_id, utcnow(), reason="test")
     typed = components.gate.evaluate(
         intent(components, "merge_run", {"code": "R1"}, origin="explicit")
     )
@@ -431,6 +434,24 @@ async def test_list_runs(
     assert render_runs(await call(components, "list_runs", {"code": "R9"})) == "No run R9."
     with pytest.raises(ToolFailed):
         await call(components, "list_runs", {"code": "nope"})
+
+
+async def test_list_runs_marks_what_the_owner_was_already_told(
+    components: Components, runner: FakeRunner, db: sqlite3.Connection
+) -> None:
+    """PER-270: ``known`` is true once the run's end item is told at its current version."""
+    from resonant.store import pulse as pulse_store
+
+    make_run(db, status="failed")
+    make_run(db, status="failed")
+    now = utcnow()
+    for code in ("R1", "R2"):
+        _c, item = pulse_store.upsert(db, "core", pulse_store.run_key(code), f"{code} failed",
+                                      "normal", None, True, 3600, now)  # fmt: skip
+        if code == "R1":
+            pulse_store.mark_told(db, [item], now)
+    out = await call(components, "list_runs", {})
+    assert {r["code"]: r["known"] for r in out["runs"]} == {"R1": True, "R2": False}
 
 
 async def test_list_runs_lists_what_workers_cant_do_yet(
@@ -662,6 +683,21 @@ def test_status_gets_a_runs_line() -> None:
     assert "\n" not in render_status({**base, "runs": {"merged": 4, "failed": 1}})
     text = render_status({**base, "runs": {"running": 1, "queued": 2, "ready": 1, "failed": 5}})
     assert text.splitlines()[1] == "runs: 1 running, 2 queued, 1 ready to merge"
+
+
+def test_status_gets_a_waiting_line() -> None:
+    base = {"uptime_s": 60, "inflight": 0, "autonomy": "on", "paused": False}
+    assert "\n" not in render_status({**base, "waiting": {}})
+    assert "\n" not in render_status(base)
+    text = render_status({**base, "waiting": {"approval": 1, "resource": 1}})
+    assert text.splitlines()[1] == (
+        "waiting: 1 on a resource (all worker slots busy), 1 for approval"
+    )
+    every = {"approval": 1, "human_reply": 2, "usage_reset": 3, "ci": 4, "veto": 5, "odd": 6}
+    assert render_status({**base, "waiting": every}).splitlines()[1] == (
+        "waiting: 1 for approval, 2 for a reply, 3 on a usage reset, 4 on CI,"
+        " 5 in a veto window, 6 odd"
+    )
 
 
 async def test_status_tool_reports_runs(components: Components, db: sqlite3.Connection) -> None:

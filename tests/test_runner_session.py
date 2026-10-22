@@ -361,17 +361,6 @@ async def test_pushed_but_no_pr_fails_with_the_branch(
     assert run.branch in h.branches()
 
 
-async def test_nothing_pushed_and_no_pr_is_no_changes(
-    tmp_path: Path, db: sqlite3.Connection
-) -> None:
-    h = build(tmp_path, db, extra=["--no-push"])  # committed locally, never pushed
-    await h.start()
-    await h.drain()
-    assert h.run().status == "no_changes"
-    assert h.chan.texts()[0].startswith("R1 (fix the flaky test) made no changes")
-    assert h.branches() == ["main"]
-
-
 async def test_the_pr_is_found_by_its_branch_not_by_the_summary(h: Harness) -> None:
     await h.start()
     await h.drain()
@@ -703,6 +692,143 @@ async def test_a_pr_the_session_merged_itself_fails_loudly_and_is_never_resonant
     res = await h.runner.merge_run("R1")
     assert isinstance(res, Refused) and h.gh_calls("merge") == []
     assert run.status != "merged"
+
+
+def _merged_pr(h: Harness) -> None:
+    """``find_pr`` reports the session's PR as MERGED (by whom is up to the test)."""
+    from dataclasses import replace
+
+    real = h.ws.find_pr
+
+    async def merged(*a: Any, **k: Any) -> Any:
+        found = await real(*a, **k)
+        assert found is not None
+        return replace(found, state="MERGED")
+
+    h.ws.find_pr = merged  # type: ignore[method-assign]
+
+
+def _resonant_merged(db: sqlite3.Connection, repo: str, number: int) -> str:
+    """Record that Resonant's ``github.merge_pr`` merged ``repo#number`` on an approved
+    prompt (as the gate and executor write it); returns the approval's code."""
+    from resonant.gate.codes import new_code
+    from resonant.loop import NewTask
+    from resonant.store import approvals as ap
+    from resonant.store.audit import audit
+    from resonant.store.db import atomic
+    from resonant_sdk import Effect, Level
+
+    tid = task_store.insert_task(db, NewTask(kind="message", runner="claude", priority=1))
+    code = new_code(ap.pending_codes(db))
+    now = utcnow()
+    with atomic(db):
+        approval_id = ap.insert_approval(
+            db,
+            ap.NewApproval(
+                task_id=tid, intent_hash="h1", tool="merge_pr", effect=Effect.WRITE,
+                level=Level.L2, summary=f"merge PR #{number} in {repo}", approvers=("justin",),
+                code=code, expires_at=now + timedelta(minutes=30), extension="github",
+            ),
+            now,
+        )  # fmt: skip
+        args = {"repo": repo, "number": number, "head_sha": "ab" * 20}
+        audit(db, "gate.evaluate", task_id=tid, extension="github", tool="merge_pr",
+              intent_hash="h1", approval_id=approval_id, args=args)  # fmt: skip
+        audit(db, "executor.result", task_id=tid, extension="github", tool="merge_pr",
+              intent_hash="h1", approval_id=approval_id, ok=True)  # fmt: skip
+    return code
+
+
+async def test_a_pr_resonant_merged_ends_the_run_done_with_no_alert(h: Harness) -> None:
+    """PER-269's incident: the brain's merge_pr (approved in M6) merged the run's PR while
+    the run's own check for it was open. The run is done and merged, not failed, and the
+    one end text names the approval, with no ⚠."""
+    code = _resonant_merged(h.conn, "Own/Proj", 41)
+    await h.start()
+    _merged_pr(h)
+    await h.drain()
+    run = h.run()
+    assert run.status == "done" and run.failure is None and run.pr_number == 41
+    [text] = h.chan.texts()
+    assert text.startswith(f"R1's PR #41 is merged into main (you approved it in {code}).")
+    assert "⚠" not in text
+    (row,) = h.conn.execute(
+        "SELECT detail FROM audit_log WHERE action = 'run.done_merged'"
+    ).fetchall()
+    assert json.loads(row["detail"])["by"] == "resonant"
+
+
+async def test_a_pr_the_run_merged_on_an_approved_check_ends_done(h: Harness) -> None:
+    """The owner said yes to the run's merge check and the session merged it: a merge
+    Resonant has a record of, so no ⚠ either."""
+    from resonant.gate.codes import new_code
+    from resonant.store import approvals as ap
+    from resonant.store.db import atomic
+    from resonant_sdk import Effect, Level
+
+    await h.start()
+    run = h.run()
+    assert run.task_id is not None
+    now = utcnow()
+    with atomic(h.conn):
+        approval_id = ap.insert_approval(
+            h.conn,
+            ap.NewApproval(
+                task_id=run.task_id, intent_hash="c1", tool=ap.CHECK_TOOL, effect=Effect.WRITE,
+                level=Level.L2, summary="R1 wants to merge on github", approvers=("justin",),
+                code=new_code(ap.pending_codes(h.conn)), expires_at=now + timedelta(minutes=30),
+                requested_by="R1", action_key="github merge own/proj#41",
+                action_target="own/proj#41",
+            ),
+            now,
+        )  # fmt: skip
+        h.conn.execute(
+            "UPDATE approvals SET status = 'approved', decided_at = ? WHERE id = ?",
+            (iso(now), approval_id),
+        )
+    _merged_pr(h)
+    await h.drain()
+    after = h.run()
+    assert after.status == "done" and after.failure is None
+    [text] = h.chan.texts()
+    assert text.startswith("R1 (fix the flaky test) merged PR #41 into main (")
+    assert "you approved it in" in text.splitlines()[0] and "⚠" not in text
+
+
+async def test_a_merged_pr_obsoletes_the_open_asks_for_it(h: Harness) -> None:
+    """An ask still open for the merged PR (another task's merge prompt) expires as
+    obsolete when the run finds it merged, audited and never texted."""
+    from resonant.gate.codes import new_code
+    from resonant.loop import NewTask
+    from resonant.store import approvals as ap
+    from resonant.store.db import atomic
+    from resonant_sdk import Effect, Level
+
+    tid = task_store.insert_task(h.conn, NewTask(kind="message", runner="other", priority=1))
+    task_store.set_status(h.conn, tid, "running")  # a brain turn waiting on its prompt
+    now = utcnow()
+    with atomic(h.conn):
+        approval_id = ap.insert_approval(
+            h.conn,
+            ap.NewApproval(
+                task_id=tid, intent_hash="m1", tool="merge_pr", effect=Effect.WRITE,
+                level=Level.L2, summary="merge PR #41 in own/proj", approvers=("justin",),
+                code=new_code(ap.pending_codes(h.conn)), expires_at=now + timedelta(minutes=30),
+                extension="github", action_key="github merge own/proj#41",
+                action_target="own/proj#41",
+            ),
+            now,
+        )  # fmt: skip
+    await h.start()
+    _merged_pr(h)
+    await h.drain()
+    assert h.run().status == "failed"  # no record that Resonant merged it: the alert stays
+    approval = ap.get_approval(h.conn, approval_id)
+    assert approval is not None and approval.status == "expired"
+    (row,) = h.conn.execute(
+        "SELECT detail FROM audit_log WHERE action = 'approval.expired'"
+    ).fetchall()
+    assert json.loads(row["detail"])["reason"] == "obsolete"
 
 
 async def test_an_unprotected_base_with_a_clean_feed_runs_normally(

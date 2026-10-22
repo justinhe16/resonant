@@ -1,4 +1,5 @@
 import { Ago, Counts, Empty, ExternalLink, Group, LocalOnly, Meta, Row, Rows, Section, StateBadge } from "@/components/bits";
+import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { ACTIVE_RUN_STATES, ACTIVE_TASK_STATES, RUN_STATE_ORDER, ordered, safeHttpsUrl, sum } from "@/lib/snapshot";
 import { runTone } from "@/lib/tone";
@@ -130,6 +131,7 @@ export function RunsAndTasks({ snap, now }: { snap: Snapshot; now: number }) {
         <Group label="Tasks">
           <Counts by={ordered(snap.tasks.by_state, ACTIVE_TASK_STATES)} tone={runTone} />
         </Group>
+        {snap.runs.detected && <DetectedEffects detected={snap.runs.detected} />}
         <Group label="Recent runs">
           {finished === undefined ? (
             finishedBrief !== undefined && (finishedBrief.length > 0 || finishedCount === 0) ? (
@@ -149,6 +151,23 @@ export function RunsAndTasks({ snap, now }: { snap: Snapshot; now: number }) {
         </Group>
       </div>
     </Section>
+  );
+}
+
+/** PER-263: what the listed runs did outside their own branch and PR, read from their commands. */
+function DetectedEffects({ detected }: { detected: NonNullable<Snapshot["runs"]["detected"]> }) {
+  const by = Object.entries(detected.by_kind).sort(([a, x], [b, y]) => y - x || a.localeCompare(b));
+  return (
+    <Group label="Detected side effects, recent runs" count={sum(detected.by_kind)}>
+      <div className="space-y-1.5" data-testid="detected-effects">
+        <Counts by={by} tone={() => "neutral"} />
+        {detected.high > 0 && (
+          <p className="text-xs text-muted-foreground">
+            <Badge variant="bad">{detected.high} high-impact</Badge> a base-branch push, a publish or a delete
+          </p>
+        )}
+      </div>
+    </Group>
   );
 }
 
@@ -178,6 +197,11 @@ function RunRow({ run, now }: { run: RunItem; now: number }) {
           <Ago iso={run.started_at} now={now} prefix="started " />
         )}
         {run.branch && <span className="truncate font-mono">{run.branch}</span>}
+        {!!run.detected && (
+          <span>
+            {run.detected} side effect{run.detected === 1 ? "" : "s"} detected
+          </span>
+        )}
         {prUrl && <ExternalLink href={prUrl}>PR #{run.pr_number ?? "?"}</ExternalLink>}
         {remoteUrl && <ExternalLink href={remoteUrl}>Remote Control</ExternalLink>}
       </Meta>

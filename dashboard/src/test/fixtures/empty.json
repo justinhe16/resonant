@@ -18,6 +18,7 @@
   },
   "runs": {
     "by_state": {},
+    "detected": { "by_kind": {}, "high": 0 },
     "items": []
   },
   "approvals": {
@@ -30,6 +31,7 @@
   },
   "pulse": {
     "open": 0,
+    "untold": 0,
     "items": []
   },
   "extensions": [],

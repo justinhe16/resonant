@@ -37,6 +37,8 @@ describe("helpers", () => {
     expect(() => assertSnapshot({ ...local, pulse: { open: "3" } })).toThrow("(pulse.open)");
     expect(() => assertSnapshot({ ...local, extensions: [{ name: "x" }] })).toThrow("(extensions)");
     expect(() => assertSnapshot({ ...local, repos: {} })).toThrow("(repos)");
+    expect(() => assertSnapshot({ ...local, pulse: { open: 3, untold: "2" } })).toThrow("(pulse.untold)");
+    expect(() => assertSnapshot({ ...local, runs: { by_state: {}, detected: { high: 0 } } })).toThrow("(runs.detected)");
   });
 
   it("ranks health", () => {
@@ -73,7 +75,20 @@ describe("forTier", () => {
     expect(out.repos).toBeUndefined();
     expect(out.claude_brain).toBeUndefined();
     for (const h of out.health) expect(h.reason).toBeUndefined();
-    expect(out.approvals.open).toBe(1);
+    expect(out.approvals.open).toBe(2);
+    // PER-263: the remote counts stay.
+    expect(out.pulse.untold).toBe(2);
+    expect(out.runs.detected).toEqual({ by_kind: { push: 1, http: 1, merge: 1 }, high: 1 });
+  });
+
+  it("adds no PER-263 keys to an older remote snapshot", () => {
+    const old = clone(remote);
+    delete old.pulse.untold;
+    delete old.runs.detected;
+    const out = forTier(old);
+    expect(out.pulse).not.toHaveProperty("untold");
+    expect(out.pulse.open).toBe(3);
+    expect(out.runs).not.toHaveProperty("detected");
   });
 
   it("keeps the briefs but only their known fields", () => {

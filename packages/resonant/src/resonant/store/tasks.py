@@ -91,25 +91,29 @@ def note_claude_reply(
     *,
     session: bool = False,
     hops: int | None = None,
+    at: datetime | None = None,
 ) -> bool:
     """BR-10: Claude's answer to a turn the brain handed over, kept on that (finished) brain
-    task's checkpoint as ``claude_reply`` so the history shows it. A task still running is
-    left alone (its own save would overwrite it). True when it was written. ``session``
+    task's checkpoint as ``claude_reply`` so the history shows it, with ``claude_reply_at``
+    (PER-270: ``at``, else now) so the transcript puts it where it was sent. A task still
+    running is left alone (its own save would overwrite it). True when it was written. ``session``
     (BR-11): it came from the Claude brain, whose turn was tainted ``hops`` turns from
     outside content (``claude_hops``; None: clean)."""
+    stamp = iso(at) if at is not None else now_iso()
     with atomic(conn):
         if session:
             cur = conn.execute(
                 "UPDATE tasks SET checkpoint = json_set(COALESCE(checkpoint, '{}'), "
-                "'$.claude_reply', ?, '$.claude_session', json('true'), '$.claude_hops', ?) "
-                "WHERE id = ? AND status IN ('done', 'failed', 'cancelled')",
-                (reply, hops, task_id),
+                "'$.claude_reply', ?, '$.claude_reply_at', ?, '$.claude_session', json('true'), "
+                "'$.claude_hops', ?) WHERE id = ? AND status IN ('done', 'failed', 'cancelled')",
+                (reply, stamp, hops, task_id),
             )
         else:
             cur = conn.execute(
                 "UPDATE tasks SET checkpoint = json_set(COALESCE(checkpoint, '{}'), "
-                "'$.claude_reply', ?) WHERE id = ? AND status IN ('done', 'failed', 'cancelled')",
-                (reply, task_id),
+                "'$.claude_reply', ?, '$.claude_reply_at', ?) "
+                "WHERE id = ? AND status IN ('done', 'failed', 'cancelled')",
+                (reply, stamp, task_id),
             )
     return cur.rowcount == 1
 

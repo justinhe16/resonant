@@ -17,7 +17,9 @@ can skip the gate. The gate (``gate/``), the trust rules (``trust/``) and the ex
    first; then ``Intent.for_tool`` (JSON only). A model-chosen call is never ``explicit``.
    Bad: ``Refused("bad_args")``.
 3. **Side-effect cap.** A change when ``scope.effects`` already holds ``MAX_SIDE_EFFECTS``
-   report lines: ``Refused("capped")`` (GT-1).
+   report lines (GT-1): with a batch (BA-1) it is gated ``capped`` (PER-261: what the gate
+   would allow asks instead) and joins the batch like any ask, still under ``gate.batch_max``;
+   without one, ``Refused("capped")``.
 4. **Gate.** ``gate.evaluate``, with ``gated_origin``: a tainted call to a ``taint_exempt``
    spec (notes, reminders, facts) is gated as ``inferred`` (PER-245), here and on resume.
    A read the gate allows runs and comes back ungated (``Ran``/``Failed``/``Refused`` with
@@ -44,6 +46,7 @@ a resume) and attrs: the task eval counts gated writes and approvals from them. 
 from __future__ import annotations
 
 import contextlib
+import logging
 import sqlite3
 from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -62,12 +65,14 @@ from resonant.gate import (
     NeedsApproval,
     TokenVerifier,
 )
+from resonant.gate import actions as action_ids
 from resonant.gate.policy import APPROVAL_USED, batch_line, widens_trust
 from resonant.gate.types import Origin
 from resonant.loop.types import StepContext
 from resonant.models import SpanFactory
 from resonant.store import approvals as ap
 from resonant.store import trust as trust_store
+from resonant.store.db import utcnow
 from resonant.toolcore.reports import (
     BAD_ARGS_REPLY,
     NOT_AVAILABLE_REPLY,
@@ -80,9 +85,12 @@ from resonant.tools import ToolRegistry
 from resonant.tools.registry import ToolKey
 from resonant_sdk import Effect, ToolSpec
 
+log = logging.getLogger(__name__)
+
 # Gated side effects that run without asking (L3, a standing allow), per task (GT-1; BA-1
 # raised it from 3 so "update these 4 Linear tickets" fits under a standing rule). Changes
-# that ask don't count: they wait in the task's batch, up to ``gate.batch_max``.
+# that ask don't count: they wait in the task's batch, up to ``gate.batch_max``; so does a
+# change past this cap (PER-261), as an ask.
 MAX_SIDE_EFFECTS = 5
 CAPPED_REPLY = f"Not done: at most {MAX_SIDE_EFFECTS} changes per task."
 STOPPED = "task is no longer running"  # the pin couldn't be saved
@@ -119,6 +127,10 @@ class BatchGate(Protocol):
 
     def drop(self, approval_ids: Sequence[str], *, reason: str) -> None: ...
 
+    def evaluate(self, intent: Intent, *, capped: bool = False) -> Decision:
+        """``capped`` (PER-261): what the gate would allow asks instead."""
+        ...
+
 
 class ToolExecutor(Protocol):
     async def execute(
@@ -141,22 +153,28 @@ class InlineGate(Protocol):
 
 @dataclass(frozen=True)
 class PinnedCall:
-    """``checkpoint.call``: a task's gated call and its pinned idempotency inputs."""
+    """``checkpoint.call``: a task's gated call and its pinned idempotency inputs.
+    ``capped`` (PER-261): it came past ``MAX_SIDE_EFFECTS``, so its resume is gated capped
+    too (it runs only on its own approval, never on the rule that would have allowed it)."""
 
     tool: str
     extension: str | None
     args: dict[str, Any]
     step_no: int
     call_index: int
+    capped: bool = False
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "tool": self.tool,
             "extension": self.extension,
             "args": self.args,
             "step_no": self.step_no,
             "call_index": self.call_index,
         }
+        if self.capped:
+            out["capped"] = True
+        return out
 
     @classmethod
     def from_json(cls, value: Any) -> PinnedCall | None:
@@ -171,7 +189,8 @@ class PinnedCall:
             or not isinstance(call_index, int)
         ):
             return None
-        return cls(tool, ext, cast(dict[str, Any], args), step_no, call_index)
+        return cls(tool, ext, cast(dict[str, Any], args), step_no, call_index,
+                   d.get("capped") is True)  # fmt: skip
 
 
 @dataclass(frozen=True)
@@ -466,10 +485,14 @@ class ToolCore:
                 s.set(decision="bad_args", ok=False)
                 return Refused("bad_args", BAD_ARGS_REPLY, False)
             read = spec.effect is Effect.READ
-            if not read and len(scope.effects) >= MAX_SIDE_EFFECTS:
+            batching = scope.batch is not None and self.batch_gate is not None
+            capped = not read and len(scope.effects) >= MAX_SIDE_EFFECTS
+            if capped and not batching:
                 s.set(decision="capped", ok=False)
                 return Refused("capped", CAPPED_REPLY, False, intent)
-            decision = self.gate.evaluate(intent)
+            if capped:
+                s.set(capped=True)  # PER-261: it asks, and joins the batch
+            decision = self._evaluate(intent, capped=capped)
             s.set(decision=type(decision).__name__)
             if read and not isinstance(decision, NeedsApproval):
                 if not isinstance(decision, Allow):
@@ -496,8 +519,7 @@ class ToolCore:
             if not isinstance(decision, Allow | NeedsApproval):
                 return _refused(intent, decision, gated=True)
             pinned = PinnedCall(spec.name, spec.extension, intent.args, scope.step_no,
-                                scope.call_index)  # fmt: skip
-            batching = scope.batch is not None and self.batch_gate is not None
+                                scope.call_index, capped)  # fmt: skip
             if batching and isinstance(decision, NeedsApproval):
                 return self._join(intent, decision, pinned, scope)
             cp = dict(scope.checkpoint)
@@ -564,9 +586,18 @@ class ToolCore:
             if prior is not None:
                 s.set(recorded=True, ok=prior.ok, ambiguous=prior.ambiguous)
                 return self._ran(intent, prior, recorded=True)
-            decision = self.gate.evaluate(intent)
+            decision = self._evaluate(intent, capped=pinned.capped)
             s.set(decision=type(decision).__name__)
             return await self._decided(intent, decision, pinned, dict(scope.checkpoint))
+
+    def _evaluate(self, intent: Intent, *, capped: bool) -> Decision:
+        """The gate's decision; ``capped`` (PER-261) asks the batch gate to ask instead of
+        allow. A capped call without a batch gate can't happen (it was refused): fail closed."""
+        if not capped:
+            return self.gate.evaluate(intent)
+        if self.batch_gate is None:
+            return Deny("capped")
+        return self.batch_gate.evaluate(intent, capped=True)
 
     def recorded(
         self, target: ToolSpec | ToolKey, args: dict[str, Any], scope: CallScope
@@ -597,6 +628,13 @@ class ToolCore:
                 "not_allowed", refusal_reply(intent, Deny(APPROVAL_USED)), True, intent, decision
             )
         rule = self._rule_added(decision.approval_id) if result.ok else None
+        if result.ok and (merged := action_ids.merged_by(intent)) is not None:
+            # PER-269: the PR is merged; the other open asks for it (a run's check) are moot.
+            # Housekeeping: a failure here never turns the merge that ran into an error.
+            try:
+                ap.obsolete_for_target(self.conn, merged, utcnow())
+            except sqlite3.Error:
+                log.warning("couldn't obsolete the asks for %s", merged, exc_info=True)
         return self._ran(intent, result, rule_added=rule, decision=decision)
 
     @staticmethod

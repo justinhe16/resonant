@@ -194,7 +194,7 @@ class IMessageConfig(_Section):
 
 
 class ChannelsConfig(_Section):
-    imessage: IMessageConfig = IMessageConfig()
+    imessage: IMessageConfig = Field(default_factory=IMessageConfig)
 
 
 class GateConfig(_Section):
@@ -300,8 +300,8 @@ class ExtensionsConfig(_Section):
     result_max_bytes: int = Field(default=32 * 1024, ge=1024, le=256 * 1024)
     # ...and the model sees at most this many characters of it, as untrusted data.
     model_result_max_chars: int = Field(default=4096, ge=256, le=32 * 1024)
-    process: ProcessConfig = ProcessConfig()
-    notify: NotifyConfig = NotifyConfig()
+    process: ProcessConfig = Field(default_factory=ProcessConfig)
+    notify: NotifyConfig = Field(default_factory=NotifyConfig)
 
     @model_validator(mode="after")
     def _model_view_fits(self) -> Self:
@@ -380,6 +380,24 @@ class BackupConfig(_Section):
     @property
     def local_time(self) -> time:
         return _hhmm_time(self.daily_at)
+
+
+class RetentionConfig(_Section):
+    """The daily store prune (``core/prune``, PER-259, ``resonant.store_upkeep``): how long
+    rows are kept before they are deleted. Runs half an hour after ``backup.daily_at`` and only
+    when a good backup is under 24 hours old. A row something still points at is never deleted
+    (an open task's events, an approval's resolving event, the brain summary's cursor event, a
+    task with approvals, runs or texts), however old it is."""
+
+    enabled: bool = True
+    # Consumed events older than this. At least 7: the github rollup reads the last 7 days of
+    # events, and the brain's recent history is read from them too.
+    events_days: int = Field(default=90, ge=7, le=3650)
+    # Finished (done, failed, cancelled) tasks not touched for this long. At least 7: the
+    # `system_texts` a task's end text is kept for 7 days, and `/projects` lists recent work.
+    tasks_days: int = Field(default=90, ge=7, le=3650)
+    # Audit rows. Longer by default and at least 30 days: it is the record of what Resonant did.
+    audit_days: int = Field(default=365, ge=30, le=3650)
 
 
 _QUIET_HOURS = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
@@ -552,6 +570,7 @@ class RunnerConfig(_Section):
     # runs with no repo at <code_dir>/.scratch/R<n> (docs/employee-plan.md D1).
     code_dir: Path = Field(default=Path("~/code"), validate_default=True)
     # Bare mirrors, daemon-only: what the pre-merge checks read (a checkout is worker-writable).
+    # This and secrets_dir default into the Resonant home (Settings._runner_state_in_home).
     mirror_dir: Path = Field(default=Path("~/.resonant/runner/mirrors"), validate_default=True)
     # Per-call token files for git and gh (0700, daemon-only, never sandbox-readable).
     secrets_dir: Path = Field(default=Path("~/.resonant/run-secrets"), validate_default=True)
@@ -795,6 +814,16 @@ class ClaudeSessionConfig(_Section):
     # PER-258: a turn whose own shell changes or edits ran ends its reply with one
     # code-built "Did: ..." line (no line for reads).
     progress_texts: bool = True
+    # PER-262: how often an idle session checks whether another process (the CLI's
+    # `resonant pause`) paused Resonant; a pause stops it within this many seconds.
+    pause_check_s: float = Field(default=5.0, gt=0, le=300)
+    # PER-262: transcripts of the brain's earlier sessions (rotated, restarted) older than
+    # this many days are removed from its own ~/.claude/projects/<cwd> dir. 0: kept.
+    transcript_days: int = Field(default=14, ge=0, le=3650)
+    # PER-262: Claude's own turns (tool rounds) in one owner message; `--max-turns` counts
+    # per user message in a stream-json session (probed on 2.1.305), so it bounds a turn
+    # that loops on tools well before `turn_timeout_s`.
+    max_turns: int = Field(default=40, ge=1, le=200)
 
 
 class TriageConfig(_Section):
@@ -925,29 +954,46 @@ class Settings(BaseSettings):
     # Safe by default: the gate logs side effects instead of executing them.
     dry_run: bool = True
 
-    model: ModelConfig = ModelConfig()
-    api: ApiConfig = ApiConfig()
-    health: HealthConfig = HealthConfig()
-    relay: RelayConfig = RelayConfig()
-    loop: LoopConfig = LoopConfig()
-    claude: ClaudeConfig = ClaudeConfig()
-    channels: ChannelsConfig = ChannelsConfig()
-    gate: GateConfig = GateConfig()
-    ops: OpsConfig = OpsConfig()
-    power: PowerConfig = PowerConfig()
-    extensions: ExtensionsConfig = ExtensionsConfig()
-    secrets: SecretsConfig = SecretsConfig()
-    briefing: BriefingConfig = BriefingConfig()
-    backup: BackupConfig = BackupConfig()
-    pulse: PulseConfig = PulseConfig()
-    runner: RunnerConfig = RunnerConfig()
-    trust: TrustConfig = TrustConfig()
+    model: ModelConfig = Field(default_factory=ModelConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
+    health: HealthConfig = Field(default_factory=HealthConfig)
+    relay: RelayConfig = Field(default_factory=RelayConfig)
+    loop: LoopConfig = Field(default_factory=LoopConfig)
+    claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
+    channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+    gate: GateConfig = Field(default_factory=GateConfig)
+    ops: OpsConfig = Field(default_factory=OpsConfig)
+    power: PowerConfig = Field(default_factory=PowerConfig)
+    extensions: ExtensionsConfig = Field(default_factory=ExtensionsConfig)
+    secrets: SecretsConfig = Field(default_factory=SecretsConfig)
+    briefing: BriefingConfig = Field(default_factory=BriefingConfig)
+    backup: BackupConfig = Field(default_factory=BackupConfig)
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    pulse: PulseConfig = Field(default_factory=PulseConfig)
+    runner: RunnerConfig = Field(default_factory=RunnerConfig)
+    trust: TrustConfig = Field(default_factory=TrustConfig)
     brain: BrainConfig = Field(default_factory=BrainConfig)
 
     @field_validator("home")
     @classmethod
     def _expand_home(cls, v: Path) -> Path:
         return v.expanduser()
+
+    @model_validator(mode="after")
+    def _runner_state_in_home(self) -> Self:
+        """``runner.mirror_dir`` and ``runner.secrets_dir`` are Resonant's own state: unless
+        they are set, they live in the Resonant home (``<home>/runner/mirrors`` and
+        ``<home>/run-secrets``), so ``RESONANT_HOME`` or ``home=`` moves them too (PER-271:
+        a test's isolated home never reaches the real ``~/.resonant``)."""
+        unset = {"mirror_dir", "secrets_dir"} - self.runner.model_fields_set
+        if unset:
+            defaults = {
+                "mirror_dir": self.home / "runner" / "mirrors",
+                "secrets_dir": self.home / "run-secrets",
+            }
+            given = self.runner.model_dump(exclude_unset=True)
+            self.runner = RunnerConfig.model_validate(given | {k: defaults[k] for k in unset})
+        return self
 
     @field_validator("timezone")
     @classmethod

@@ -18,7 +18,7 @@ import json
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal, cast
 
 from resonant.gate.types import ResolvedApproval, ResolveResult
@@ -71,6 +71,10 @@ class NewApproval:
     always_scope: str | None = None
     always_action: str | None = None
     phrased: bool = False  # PER-268: the summary is the tool's approval_summary (migration 019)
+    # PER-269: the action it asks for (``gate.actions``, migration 022), when one is named:
+    # ``github merge jhe/dori#2`` and its target ``jhe/dori#2``.
+    action_key: str | None = None
+    action_target: str | None = None
 
     def __post_init__(self) -> None:
         if self.allow_always and self.require_code:
@@ -79,6 +83,8 @@ class NewApproval:
             raise ValueError("always_scope and always_action go together")
         if self.always_action is not None and not self.allow_always:
             raise ValueError("a yes always rule needs allow_always")
+        if (self.action_key is None) != (self.action_target is None):
+            raise ValueError("action_key and action_target go together")
 
 
 @dataclass(frozen=True)
@@ -108,6 +114,9 @@ class Approval:
     always_scope: str | None = None  # a tool approval's yes always rule (migration 013)
     always_action: str | None = None
     phrased: bool = False  # PER-268: the prompt reads "OK to <summary>? [P3] yes / no"
+    reminded_at: datetime | None = None  # PER-261: its expiry reminder went out (migration 021)
+    action_key: str | None = None  # PER-269: the action it asks for (migration 022)
+    action_target: str | None = None
 
     def sent_at(self, principal: str) -> datetime | None:
         """When the prompt was first sent to ``principal`` (None if it never was)."""
@@ -157,6 +166,9 @@ def _row_to_approval(r: sqlite3.Row) -> Approval:
         always_scope=r["always_scope"],
         always_action=r["always_action"],
         phrased=bool(r["phrased"]),
+        reminded_at=_dt(r["reminded_at"]),
+        action_key=r["action_key"],
+        action_target=r["action_target"],
     )
 
 
@@ -170,8 +182,8 @@ def insert_approval(conn: sqlite3.Connection, spec: NewApproval, now: datetime) 
     conn.execute(
         """INSERT INTO approvals (id, task_id, intent_hash, extension, tool, effect, level,
                summary, requested_by, approvers, expires_at, require_code, code, created_at,
-               allow_always, always_scope, always_action, phrased)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               allow_always, always_scope, always_action, phrased, action_key, action_target)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             approval_id,
             spec.task_id,
@@ -191,6 +203,8 @@ def insert_approval(conn: sqlite3.Connection, spec: NewApproval, now: datetime) 
             spec.always_scope,
             spec.always_action,
             spec.phrased,
+            spec.action_key,
+            spec.action_target,
         ),
     )
     return approval_id
@@ -209,6 +223,68 @@ def pending_for_intent(
         """SELECT * FROM approvals WHERE task_id = ? AND intent_hash = ?
                AND status = 'pending' AND expires_at > ?""",
         (task_id, intent_hash, iso(now)),
+    ).fetchone()
+    return None if r is None else _row_to_approval(r)
+
+
+def pending_for_action(conn: sqlite3.Connection, action_key: str, now: datetime) -> list[Approval]:
+    """PER-269: the unexpired pending approvals that ask for this action (``action_key``,
+    ``gate.actions``), whoever opened them (a run's trust check, the brain, a job). Oldest
+    first: the one to point to."""
+    rows = conn.execute(
+        """SELECT * FROM approvals WHERE action_key = ? AND status = 'pending'
+               AND expires_at > ? ORDER BY created_at, id""",
+        (action_key, iso(now)),
+    ).fetchall()
+    return [_row_to_approval(r) for r in rows]
+
+
+def reply_code(conn: sqlite3.Connection, approval: Approval) -> str | None:
+    """The code the owner replies (or replied) with for ``approval``: its own, or its
+    batch's (the batch's first approval's), since a member's own code names nothing alone."""
+    batch = batches_of(conn, [approval.id]).get(approval.id)
+    if batch is not None and batch.approval_ids:
+        first = get_approval(conn, batch.approval_ids[0])
+        if first is not None and first.code is not None:
+            return first.code
+    return approval.code
+
+
+OBSOLETE = "obsolete"  # PER-269: what it asked for already happened (its PR merged or closed)
+SUPERSEDED = "superseded"  # PER-269: its task asked again for the same action with other args
+
+
+def obsolete_for_target(conn: sqlite3.Connection, target: str, now: datetime) -> list[str]:
+    """PER-269: pending -> expired (reason ``obsolete``, audited) for each approval whose
+    action targets ``target`` (``jhe/dori#2``): that PR was merged or closed, so the ask is
+    moot. Nothing is texted; the reminders and prompts list only pending approvals. An
+    approval in an open batch is left alone: the batch is answered as one unit, and one
+    member decided on its own would leave the rest unanswerable. Returns the ids expired."""
+    out: list[str] = []
+    with atomic(conn):
+        rows = conn.execute(
+            "SELECT id FROM approvals WHERE action_target = ? AND status = 'pending'"
+            " ORDER BY created_at, id",
+            (target,),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        batched = {i for i, b in batches_of(conn, ids).items() if b.used_at is None}
+        for approval_id in ids:
+            if approval_id not in batched and expire_one(conn, approval_id, now, reason=OBSOLETE):
+                out.append(approval_id)
+    return out
+
+
+def approved_for_action(
+    conn: sqlite3.Connection, action_key: str, *, tool: str, requested_by: str
+) -> Approval | None:
+    """PER-269: the newest approved approval of ``tool`` by ``requested_by`` that asked for
+    this action (run R8's trust check the owner said yes to), for "Resonant has a record"."""
+    r = conn.execute(
+        """SELECT * FROM approvals WHERE action_key = ? AND tool = ? AND requested_by = ?
+               AND status = 'approved'
+           ORDER BY decided_at DESC, id DESC LIMIT 1""",
+        (action_key, tool, requested_by),
     ).fetchone()
     return None if r is None else _row_to_approval(r)
 
@@ -598,6 +674,72 @@ def set_expiry(conn: sqlite3.Connection, approval_ids: Sequence[str], at: dateti
         conn.execute(
             "UPDATE approvals SET expires_at = ? WHERE id = ? AND status = 'pending'",
             (iso(at), approval_id),
+        )
+
+
+# PER-261: no reminder when less than this is left (it would land as the approval expires).
+REMIND_MIN_LEFT = timedelta(minutes=1)
+
+
+@dataclass(frozen=True)
+class Reminder:
+    """One prompt whose expiry reminder is due (``reminders_due``): a lone approval, or a
+    batch as one (its code, every approval in it). ``to``: who got the prompt."""
+
+    approval_ids: tuple[str, ...]
+    code: str
+    task_id: str | None
+    expires_at: datetime
+    to: tuple[str, ...]
+
+
+def reminders_due(conn: sqlite3.Connection, now: datetime) -> list[Reminder]:
+    """Prompts that are past half their TTL, still pending and not yet reminded, oldest
+    first. The TTL runs from the approval's creation, or for a batch from when it was opened
+    (``open_batch`` gives its approvals one new expiry). An approval nobody was prompted for
+    yet (pinned in a turn that hasn't asked) is left out, as is one with under
+    ``REMIND_MIN_LEFT`` to go."""
+    rows = [
+        _row_to_approval(r)
+        for r in conn.execute(
+            """SELECT * FROM approvals WHERE status = 'pending' AND expires_at > ?
+                   AND reminded_at IS NULL AND code IS NOT NULL
+               ORDER BY created_at, id""",
+            (iso(now),),
+        ).fetchall()
+    ]
+    index = batches_of(conn, [a.id for a in rows])
+    by_id = {a.id: a for a in rows}
+    out: list[Reminder] = []
+    seen: set[str] = set()
+    for a in rows:
+        batch = index.get(a.id)
+        if batch is not None and batch.used_at is None:
+            if batch.id in seen:
+                continue
+            seen.add(batch.id)
+            members = [by_id[i] for i in batch.approval_ids if i in by_id]
+            if len(members) != len(batch.approval_ids):
+                continue  # one was decided or reminded on its own: not one prompt any more
+            start, head = batch.created_at, members[0]
+            to = (batch.principal,) if head.sent_at(batch.principal) is not None else ()
+        else:
+            members, start, head = [a], a.created_at, a
+            to = tuple(p for p in a.approvers if a.sent_at(p) is not None)
+        expires = min(m.expires_at for m in members)
+        if not to or now < start + (expires - start) / 2 or expires - now < REMIND_MIN_LEFT:
+            continue
+        assert head.code is not None
+        out.append(Reminder(tuple(m.id for m in members), head.code, head.task_id, expires, to))
+    return out
+
+
+def mark_reminded(conn: sqlite3.Connection, approval_ids: Sequence[str], now: datetime) -> None:
+    """Record that these approvals' expiry reminder went out (once: never overwritten)."""
+    for approval_id in approval_ids:
+        conn.execute(
+            "UPDATE approvals SET reminded_at = ? WHERE id = ? AND reminded_at IS NULL",
+            (iso(now), approval_id),
         )
 
 

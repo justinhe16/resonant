@@ -18,10 +18,24 @@ def test_parse_reads_the_route_kind_and_a_clean_ack() -> None:
     assert triage.parse(None) is None
 
 
+def test_parse_reads_the_message_type_and_falls_back_to_other() -> None:
+    """PER-270: the same call also labels the message; a missing or unknown label is "other"."""
+    base = {"handler": "local", "kind": "general", "say": ""}
+    for label in triage.MESSAGE_TYPES:
+        got = triage.parse({**base, "message_type": label})
+        assert got is not None and got.message_type == label
+    for bad in ({**base}, {**base, "message_type": "chitchat"}, {**base, "message_type": 3}):
+        got = triage.parse(bad)
+        assert got is not None and got.message_type == "other"
+    assert "message_type" in triage.SCHEMA["required"]
+    assert "greeting" in triage.instruction() and "correction" in triage.instruction()
+
+
 def test_schema_keys_sort_route_first() -> None:
     """Ollama writes an object's keys sorted: the route is decided before the ack."""
     keys = list(triage.SCHEMA["properties"])
     assert sorted(keys) == keys and keys[0] == "handler"
+    assert keys == ["handler", "kind", "message_type", "say"]
 
 
 @pytest.mark.parametrize(
@@ -86,3 +100,17 @@ def test_email_and_calendar_are_local_and_out_of_reach(bias: str) -> None:
     claude_line = next(line for line in text.splitlines() if line.startswith("claude:"))
     assert "email" not in claude_line and "calendar" not in claude_line
     assert triage.OUT_OF_REACH == {"email", "calendar"} <= set(triage.KINDS)
+
+
+@pytest.mark.parametrize(
+    ("text", "asked"),
+    [
+        ("Why did R9 make no changes", True),
+        ("explain what r12 did", True),
+        ("R4 failed, how come?", True),
+        ("why is the mini slow", False),
+        ("what's R9 doing", False),
+    ],
+)
+def test_run_why_questions(text: str, asked: bool) -> None:
+    assert triage.asks_run_why(text) is asked

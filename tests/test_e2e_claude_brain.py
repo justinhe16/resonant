@@ -291,6 +291,203 @@ async def test_email_and_calendar_stay_local_whatever_the_triage_says(
         assert all(m["content"] != OUT_OF_REACH_HINT for m in w.model.requests[-1].messages)
 
 
+async def test_a_correction_goes_to_claude_and_small_talk_stays_local(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-270: triage also labels the message. Disagreeing with something Resonant said
+    goes to Claude even when triage said local; a greeting stays here even when triage said
+    Claude, and gets its hint."""
+    from resonant.runners.brain import TYPE_HINTS
+
+    async with start(resonant_home, chat, tmp_path) as w:
+        w.model.triage = {"handler": "local", "kind": "general", "message_type": "correction",
+                          "say": ""}  # fmt: skip
+        w.claude(answer="You're right, it merged itself.")
+        ack, answer = await w.say("that's wrong, technically it didn't fail", replies=2)
+        assert answer == "Claude: You're right, it merged itself."
+        (brain,) = w.rows("SELECT * FROM tasks WHERE runner = 'brain'")
+        triaged = json.loads(brain["result"])["triage"]
+        assert triaged["why"] == "correction" and triaged["message_type"] == "correction"
+        await w.settled()
+        w.model.triage = {"handler": "claude", "kind": "general", "message_type": "greeting",
+                          "say": "on it"}  # fmt: skip
+        w.model.push("Hi!")
+        (reply,) = await w.say("Hi")
+        assert reply == "Hi!" and len(w.ask_tasks()) == 1
+        assert w.model.requests[-1].messages[-1] == {
+            "role": "user",
+            "content": TYPE_HINTS["greeting"],
+        }
+        result = json.loads(
+            w.rows("SELECT * FROM tasks WHERE runner = 'brain' ORDER BY rowid")[-1]["result"]
+        )
+        assert result["triage"]["why"] == "small_talk" and result["route"] == "local"
+        assert ack  # the correction was acked while Claude worked
+
+
+def test_small_talk_is_short_and_not_a_question() -> None:
+    from resonant.runners.brain import SMALL_TALK_MAX_CHARS, TYPE_HINTS, BrainRunner, is_small_talk
+
+    assert is_small_talk("Hi") and is_small_talk("ok thanks")
+    assert not is_small_talk("what's up?") and not is_small_talk("x" * (SMALL_TALK_MAX_CHARS + 1))
+    # a longer message typed as small talk still gets the usual turn: no hint
+    long_ack = "ok sounds good, now note: buy oat milk and remind me tomorrow"
+    assert BrainRunner._type_hint(long_ack, "ack") is None  # pyright: ignore[reportPrivateUsage]
+    assert BrainRunner._type_hint("ok", "ack") == TYPE_HINTS["ack"]  # pyright: ignore[reportPrivateUsage]
+    assert BrainRunner._type_hint(long_ack, "news_check") == TYPE_HINTS["news_check"]  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_small_talk_never_overrides_a_run_question_or_a_long_message(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path) as w:
+        w.model.triage = {"handler": "claude", "kind": "general", "message_type": "ack",
+                          "say": "on it"}  # fmt: skip
+        w.claude(answer="Because it ran out of turns.")
+        await w.say("ok, why did R9 stop", replies=2)
+        await w.settled()
+        await w.say("ok sounds good, now note: buy oat milk and remind me tomorrow", replies=2)
+        await w.settled()
+        rows = w.rows("SELECT result FROM tasks WHERE runner = 'brain' ORDER BY rowid")
+        results = [json.loads(r["result"]) for r in rows]
+        assert [r["route"] for r in results] == ["claude", "claude"]
+        assert all(r["triage"]["why"] != "small_talk" for r in results)
+
+
+def _the_incident(w: World) -> None:
+    """2026-10-21, 17:33: R1 (R8 in the real thread) failed, Resonant texted it and the pulse
+    item is told; earlier the owner answered approvals that started no task."""
+    from brain_seed import message
+
+    from resonant.store import pulse as pulse_store
+    from resonant.store import runs, system_texts
+
+    now = utcnow()
+    run = runs.create(w.conn, repo="mycelium", ask="Review PR #1", principal="justin",
+                      session_id="s1", max_seconds=60)  # fmt: skip
+    runs.update(w.conn, run.code, status="running")
+    runs.finish(w.conn, run.code, "failed", failure="it merged its own PR #2")
+    # Fixed times, well before the owner's texts (the fake chat.db rounds their time).
+    w.conn.execute("UPDATE runs SET ended_at = ?, updated_at = ? WHERE code = ?",
+                   (iso(now - timedelta(seconds=12)), iso(now - timedelta(seconds=12)),
+                    run.code))  # fmt: skip
+    other = runs.create(w.conn, repo="mycelium", ask="Make the prompt", principal="justin",
+                        session_id="s2", max_seconds=60)  # fmt: skip
+    runs.update(w.conn, other.code, status="running")
+    _c, item = pulse_store.upsert(w.conn, "core", pulse_store.run_key(run.code),
+                                  "R1 failed · mycelium", "normal", None, True, 3600,
+                                  now - timedelta(seconds=11))  # fmt: skip
+    pulse_store.mark_told(w.conn, [item], now - timedelta(seconds=10))
+    message(
+        w.conn, "review the surf prompt PR", reply="Started R1.", at=now - timedelta(minutes=25)
+    )
+    message(w.conn, "Yes M6", task=False, at=now - timedelta(minutes=20))
+    message(w.conn, "No W9", task=False, at=now - timedelta(minutes=19))
+    w.conn.execute("UPDATE tasks SET status = 'done' WHERE runner = 'local'")  # nothing to run
+    w.conn.execute("UPDATE events SET consumed_at = ? WHERE task_id IS NULL", (iso(now),))
+    system_texts.record(
+        w.conn,
+        "justin",
+        "run",
+        "R1 (/robot-surf-prompt Review PR #1 in mycelium) failed: it merged its own PR #2, not "
+        "Resonant\nStill working on R2 (/robot-surf-prompt Make the prompt).\n"
+        "R1 merged its own PR #2, so none of Resonant's checks ran on it.",
+        ref="run:R1:failed",
+        now=now - timedelta(seconds=10),
+        outside=True,
+    )
+
+
+async def test_the_2026_10_21_thread_doesnt_repeat_the_run_failure(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-270, the incident: Resonant texted that a run failed, the owner asked "any perms
+    left?", said "that's fine, technically it didn't fail", then "Hi", and qwen answered all
+    three with the same failure line. Now: the failure is Resonant's own earlier text in the
+    thread and sits in "Already told", not in the news; the correction goes to Claude; the
+    greeting gets a greeting."""
+    from resonant.runners.brain import TYPE_HINTS
+
+    async with start(resonant_home, chat, tmp_path) as w:
+        _the_incident(w)
+        w.model.triages = [
+            {"handler": "local", "kind": "general", "message_type": "news_check", "say": ""}
+        ]
+        w.model.push("Nothing open on you right now.")
+        (reply,) = await w.say("Ok any perms left or open asks I need to address!")
+        assert reply == "Nothing open on you right now."
+        first = w.model.requests[-1].messages
+        roles = [(m["role"], str(m["content"])) for m in first[:-2]]
+        spoke = [t for r, t in roles if r == "assistant"]
+        assert any("merged its own PR #2" in t for t in spoke)  # it said that, earlier
+        users = [t for r, t in roles if r == "user"]
+        assert "<message>Yes M6</message>" in users and "<message>No W9</message>" in users
+        assert users.index("<message>Yes M6</message>") < users.index("<message>No W9</message>")
+        turn = str(first[-2]["content"])
+        news, known = turn.split("<known>")
+        assert "R1" not in news.split("</briefing>")[-1]  # not news
+        assert "R1 failed" in known and "R2" not in known
+        assert "owner told" in turn.split("</briefing>")[0]
+        assert first[-1] == {"role": "user", "content": TYPE_HINTS["news_check"]}
+        row = w.rows("SELECT acked_at FROM pulse_items WHERE key = 'run/r1'")[0]
+        assert row["acked_at"] is not None  # their message acknowledged what they were told
+
+        w.model.triages = [
+            {"handler": "local", "kind": "general", "message_type": "correction", "say": ""}
+        ]
+        w.claude(answer="Fair: it merged its own PR, not a failed run.")
+        _ack, answer = await w.say(
+            "That's fine, technically it didnt fail. What action items do u need from me",
+            replies=2,
+        )
+        assert answer.startswith("Claude: Fair")
+        result = [
+            json.loads(r["result"])
+            for r in w.rows("SELECT result FROM tasks WHERE runner = 'brain' ORDER BY rowid")
+        ]
+        assert result[-1]["triage"]["why"] == "correction" and len(w.ask_tasks()) == 1
+        await w.settled()
+
+        w.model.triages = [
+            {"handler": "local", "kind": "general", "message_type": "greeting", "say": ""}
+        ]
+        w.model.push("Hi!")
+        (greeting,) = await w.say("Hi")
+        assert greeting == "Hi!"
+        third = w.model.requests[-1].messages
+        assert third[-1] == {"role": "user", "content": TYPE_HINTS["greeting"]}
+        assert third[: len(first) - 2] == first[:-2]  # the history only grew at the end
+
+
+async def test_a_reply_that_names_an_untold_run_tells_it(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-270: what the brain says counts as told, so the pulse doesn't say it again."""
+    from resonant.store import pulse as pulse_store
+    from resonant.store import runs
+
+    async with start(resonant_home, chat, tmp_path) as w:
+        run = runs.create(w.conn, repo="mycelium", ask="x", principal="justin", session_id="s",
+                          max_seconds=60)  # fmt: skip
+        runs.update(w.conn, run.code, status="running")
+        runs.finish(w.conn, run.code, "done")
+        pulse_store.upsert(w.conn, "core", pulse_store.run_key(run.code), "R1 finished", "normal",
+                           None, True, 3600, utcnow())  # fmt: skip
+        assert [i.key for i in pulse_store.pending(w.conn, pulse_store.URGENCIES, utcnow())] == [
+            "run/r1"
+        ]
+        w.model.push("Which one, R1?")  # naming a run isn't telling how it went
+        await w.say("what happened with the last run?")
+        assert [i.key for i in pulse_store.pending(w.conn, pulse_store.URGENCIES, utcnow())] == [
+            "run/r1"
+        ]
+        w.model.push("R1 finished.")
+        await w.say("what happened with R1?")
+        assert pulse_store.pending(w.conn, pulse_store.URGENCIES, utcnow()) == []
+        item = pulse_store.get(w.conn, "core", "run/r1")
+        assert item is not None and item.known
+
+
 async def test_an_easy_text_stays_local(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
@@ -443,8 +640,8 @@ async def test_an_untainted_l3_write_runs_with_its_report_line(
 async def test_the_change_cap_without_asking(
     resonant_home: Path, chat: FakeChatDB, tmp_path: Path
 ) -> None:
-    """At most MAX_SIDE_EFFECTS (5, BA-1) changes run without asking per task; past it even
-    a change that would ask is refused (batches of asked changes: test_e2e_batch.py)."""
+    """At most MAX_SIDE_EFFECTS (5, BA-1) changes run without asking per task; past it
+    (PER-261) every change asks, in the batch (more in test_e2e_batch.py)."""
     async with start(resonant_home, chat, tmp_path) as w:
         w.model.triage = CLAUDE
         calls: list[dict[str, Any]] = [
@@ -453,9 +650,11 @@ async def test_the_change_cap_without_asking(
         ]
         calls.append({"name": "create_watch", "args": WATCH})
         w.claude(calls=calls, answer="{r5} | {r6}")
-        _ack, answer = await w.say("add six notes and a watch", replies=2)
-        assert answer.count("not run: at most 5 changes") == 2
-        assert len(w.executions("add_note")) == 5 and w.rows("SELECT 1 FROM approvals") == []
+        _ack, answer, prompt = await w.say("add six notes and a watch", replies=3)
+        assert answer.count("asked the owner:") == 2 and "not run" not in answer
+        assert "OK to make these 2 changes?" in prompt and 'add a note: "six"' in prompt
+        assert len(w.executions("add_note")) == 5
+        assert len(w.rows("SELECT 1 FROM approvals WHERE status = 'pending'")) == 2
 
 
 async def test_the_kill_switch_asks_for_everything(
@@ -720,7 +919,7 @@ async def test_a_claude_answer_in_history_makes_the_next_local_write_ask(
         )
         # "ok do it" doesn't name R4: the target check sends the first call back once
         w.model.push([("cancel_run", {"code": "R4"})], [("cancel_run", {"code": "R4"})])
-        (prompt,) = await w.say("ok do it")
+        (prompt,) = await w.say("ok do it")  # tainted: no early answer
         turns = [str(m["content"]) for m in w.model.requests[-1].messages]
         assert any("<claude_answer>" in t and "cancel R4" in t for t in turns)
         assert "yes / no" in prompt and "yes always" not in prompt
@@ -795,7 +994,7 @@ async def test_a_reply_after_an_untrusted_read_taints_the_next_turn(
         await w.say("what's in todo.txt?")
         # "ok do it" doesn't name note 1: the target check sends the first call back once
         w.model.push([("delete_note", {"id": 1})], [("delete_note", {"id": 1})])
-        (prompt,) = await w.say("ok do it")
+        (prompt,) = await w.say("ok do it")  # tainted: no early answer
         assert "yes / no" in prompt
         assert w.executions("delete_note") == []
         assert _gated(w, "delete_note") == {("NeedsApproval", "tainted")}

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+from resonant.gate.codes import pick_example
 from resonant.gate.replies import ParsedReply, parse_reply
 from resonant.gate.types import ApprovalReply, Gate, PendingApproval
 from resonant.models import SpanFactory
@@ -59,15 +60,40 @@ def ask_codes(pending: Sequence[PendingApproval]) -> str:
     return f"Which one? {items}. Reply yes <code> or no <code>."
 
 
-def refusal_reply(reason: str | None, code: str | None, sent: Sequence[PendingApproval]) -> str:
+def refusal_reply(
+    reason: str | None,
+    code: str | None,
+    sent: Sequence[PendingApproval],
+    picks: Sequence[int] | None = None,
+) -> str:
     """The reply to a refused approval reply. ``sent``: the actor's pending approvals whose
-    prompts they have already seen. Unknown reasons get the generic reply."""
+    prompts they have already seen; ``picks``: the reply's ``yes 1,3`` numbers, if any.
+    Unknown reasons get the generic reply."""
     if reason == "ambiguous":
         return ask_codes(sent)
     if reason == "code_required":
-        coded = [p for p in sent if p.require_code]
+        # The one that needs its code; else (PER-261: a bare yes right after a Claude answer)
+        # the only one the reply could mean.
+        coded = [p for p in sent if p.require_code] or [
+            p for p in sent if code is None or p.code == code
+        ]
         target = coded[0].code if len(coded) == 1 else "<code>"
+        if picks:
+            return f"Reply yes {','.join(map(str, picks))} {target} to confirm."
         return f"Reply yes {target} to confirm."
+    if reason == "not_a_batch":
+        return "That one is a single change. Reply yes or no."
+    if reason == "unknown_pick":
+        batches = [p for p in sent if p.changes > 1 and (code is None or p.code == code)]
+        if len(batches) != 1:
+            return (
+                "Not done: those numbers aren't on the list. Reply yes 1,3 <code> with its numbers."
+            )
+        b = batches[0]
+        return (
+            f"Not done: {b.code} has {b.changes} changes. "
+            f"Reply yes {pick_example(b.changes)} {b.code} with numbers from its list."
+        )
     if reason == "unknown_code":
         return f"Nothing is waiting with code {code}."
     if reason == "expired":
@@ -123,13 +149,14 @@ class ApprovalInbox:
                 code=parsed.code,
                 comments=parsed.comments,
                 always=parsed.always,
+                picks=parsed.picks,
             )
         )
         if result.ok:
             return InboxResult(None, "replay" if replay else "resolved")
         sent = self.sent_pending(principal)
         return InboxResult(
-            refusal_reply(result.reason, parsed.code, sent), "refused", result.reason
+            refusal_reply(result.reason, parsed.code, sent, parsed.picks), "refused", result.reason
         )
 
     def sent_pending(self, principal: str) -> list[PendingApproval]:
@@ -207,9 +234,9 @@ def render_batch_detail(
     conn: sqlite3.Connection, members: Sequence[ap.Approval], now: datetime
 ) -> str:
     """``/approvals <code>`` for a batch (BA-1): each change with its tool and full args
-    (clipped), then the one answer for all of them."""
+    (clipped), then the answer: for all of them, or (PER-255) for some by number."""
     head = members[0]
-    lines = [f"[{head.code}] {len(members)} changes, all or none:"]
+    lines = [f"[{head.code}] {len(members)} changes:"]
     for i, a in enumerate(members, 1):
         tool = f"{a.extension}: {a.tool}" if a.extension else a.tool
         args = ap.intent_args(conn, a)
@@ -219,7 +246,8 @@ def render_batch_detail(
         lines.append(f"{i}. {tool} ({a.level.value}): {shown}")
     answer = f"yes {head.code}" if any(a.require_code for a in members) else "yes"
     left = _left(min(a.expires_at for a in members), now)
-    lines.append(f"Expires in {left}. Reply {answer} / no {head.code}")
+    some = f"yes {pick_example(len(members))} {head.code}"
+    lines.append(f"Expires in {left}. Reply {answer} / no {head.code}, or {some} for just those.")
     return _clip("\n".join(lines))
 
 

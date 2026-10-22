@@ -64,7 +64,10 @@ binding, a batch is one unit: its code is the only one that names it, a plain ye
 it as one pending item, it needs the code when any of its approvals does (the strictest
 level), ``yes always`` is refused for it, and only the owner it was asked of can answer it
 (a member who approves one of its extensions gets ``nothing_pending``). Resolving it
-resolves every approval in it in one transaction (all or none), by text or by id.
+resolves every approval in it in one transaction (one refused rolls back the rest), by text
+or by id. ``yes 1,3 <code>`` (PER-255, text only) approves those changes and rejects the
+others; the code is needed when any picked change needs it (the strictest of the picks), and
+numbers that aren't the batch's changes, or picks for a lone approval, are refused.
 
 Expiry is lazy: every entry point first runs ``expire_due``. Every ``evaluate`` writes one
 ``gate.evaluate`` audit row; every resolution attempt writes one ``approval.resolve`` row.
@@ -81,6 +84,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, Protocol
 
+from resonant.gate import actions as action_ids
 from resonant.gate.codes import clean_external, new_code
 from resonant.gate.summary import phrased, summarize, unsafe_args
 from resonant.gate.types import (
@@ -100,6 +104,7 @@ from resonant.gate.types import (
 )
 from resonant.principals import Principals
 from resonant.store import approvals as ap
+from resonant.store import outbound
 from resonant.store import trust as trust_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, utcnow
@@ -239,12 +244,15 @@ class PolicyGate:
 
     # --- evaluate ----------------------------------------------------------------------
 
-    def evaluate(self, intent: Intent) -> Decision:
+    def evaluate(self, intent: Intent, *, capped: bool = False) -> Decision:
+        """The decision for ``intent``. ``capped`` (PER-261, the tool core): the task already
+        ran its ``MAX_SIDE_EFFECTS`` changes without asking, so a change this would allow
+        asks instead (it joins the task's batch). A read, and what is refused, are unchanged."""
         now = self.clock()
         with atomic(self.conn):
             ap.expire_due(self.conn, now)
             autonomy = autonomy_on(self.conn)
-            decision, standing = self._decide(intent, now, autonomy)
+            decision, standing = self._decide(intent, now, autonomy, capped=capped)
             audit(
                 self.conn,
                 "gate.evaluate",
@@ -265,12 +273,13 @@ class PolicyGate:
                 ),
                 reason=decision.reason if isinstance(decision, Deny) else None,
                 standing=standing,
+                capped=capped or None,
                 args=intent.args,
             )
         return decision
 
     def _decide(
-        self, intent: Intent, now: datetime, autonomy: bool
+        self, intent: Intent, now: datetime, autonomy: bool, *, capped: bool = False
     ) -> tuple[Decision, bool | None]:
         """The decision, and whether a standing allow made the call L3 (None: not asked)."""
         if self.registry.get(intent.extension, intent.tool) != intent.spec:
@@ -296,6 +305,8 @@ class PolicyGate:
             if standing:
                 level = Level.L3
         verdict = rule(level, intent.origin, autonomy)
+        if capped and verdict == "allow" and not l0_read:
+            verdict = "ask"  # past the task's unasked changes: this one asks (no yes always)
         if verdict == "allow" and intent.level is Level.L0:
             return self._allow(intent), standing
         if ap.was_rejected(self.conn, intent.task_id, intent.hash):
@@ -307,7 +318,13 @@ class PolicyGate:
             approved = ap.approved_unused(self.conn, intent.task_id, intent.hash)
             return self._allow(intent, approved.id if approved else None), standing
         offer = None
-        if verdict == "ask" and level is Level.L2 and autonomy and self._standing_eligible(intent):
+        if (
+            verdict == "ask"
+            and not capped
+            and level is Level.L2
+            and autonomy
+            and self._standing_eligible(intent)
+        ):
             assert self.standing is not None
             offer = self.standing.offer(intent)
         decision = self._ask(intent, now, last, require_code=verdict == "ask_code", offer=offer)
@@ -394,6 +411,18 @@ class PolicyGate:
         task = self.conn.execute("SELECT 1 FROM tasks WHERE id = ?", (intent.task_id,))
         if task.fetchone() is None:
             return Deny(NO_TASK)  # e.g. the router's fast path: nothing could wait
+        # PER-269: one request per action. Another path (a run's check, another task) is
+        # already asking for it: point to that one instead of opening a second.
+        # The same task asking again with other args (merge_pr at a newer head_sha)
+        # supersedes its own stale ask, unless that one is in a batch (answered as one).
+        action = action_ids.for_intent(self.conn, intent)
+        held = ap.pending_for_action(self.conn, action.key, now) if action is not None else []
+        batched = ap.batches_of(self.conn, [a.id for a in held])
+        for stale in [a for a in held if self._own_stale(intent, a) and a.id not in batched]:
+            ap.expire_one(self.conn, stale.id, now, reason=ap.SUPERSEDED)
+            held.remove(stale)
+        if held:
+            return Deny(action_ids.already_asking(held[0]))
         summary = self._summary(intent)
         said = self._phrased(intent, summary)  # PER-268: "OK to merge PR #121 in …? [P3] yes / no"
         always = offer is not None and not require_code
@@ -417,11 +446,23 @@ class PolicyGate:
             always_scope=offer.scope if always and offer is not None else None,
             always_action=offer.action if always and offer is not None else None,
             phrased=said,
+            action_key=action.key if action is not None else None,
+            action_target=action.target if action is not None else None,
         )
         approval_id = ap.insert_approval(self.conn, spec, now)
         created = ap.get_approval(self.conn, approval_id)
         assert created is not None
         return _needs(created)
+
+    @staticmethod
+    def _own_stale(intent: Intent, held: ap.Approval) -> bool:
+        """``held`` is this task's own ask for the same tool, with other args."""
+        return (
+            held.task_id == intent.task_id
+            and held.tool == intent.tool
+            and held.extension == intent.extension
+            and held.intent_hash != intent.hash
+        )
 
     def consume(self, token: str, intent_hash: str) -> bool:
         return self._tokens.pop(token, None) == intent_hash
@@ -542,9 +583,11 @@ class PolicyGate:
         now: datetime,
         event_id: str | None = None,
         always: bool = False,
+        picks: tuple[int, ...] | None = None,
     ) -> str | None:
-        """Resolve a lone approval, or every approval of a batch (all or none: one refused
-        rolls the others back). None on success, else the store's reason."""
+        """Resolve a lone approval, or every approval of a batch (one transaction: one refused
+        rolls the others back). ``picks`` (a batch's change numbers, PER-255): approve only
+        those and reject the rest. None on success, else the store's reason."""
         if unit.batch is None:
             return ap.resolve(
                 self.conn, unit.head.id, approved=approved, decided_by=actor, now=now,
@@ -552,9 +595,10 @@ class PolicyGate:
             )  # fmt: skip
         try:
             with atomic(self.conn):
-                for m in unit.members:
+                for n, m in enumerate(unit.members, 1):
+                    yes = approved and (picks is None or n in picks)
                     why = ap.resolve(
-                        self.conn, m.id, approved=approved, decided_by=actor, now=now,
+                        self.conn, m.id, approved=yes, decided_by=actor, now=now,
                         event_id=event_id,
                     )  # fmt: skip
                     if why is not None:
@@ -583,16 +627,33 @@ class PolicyGate:
                 unit = self._unit_of(approval)
                 if unit.batch is not None and unit.batch.principal != resolution.actor:
                     reason = "not an approver"  # a batch is the owner's to answer
+                elif resolution.always and (
+                    unit.batch is not None
+                    or not approval.allow_always
+                    or approval.require_code
+                    or resolution.actor != self.principals.owner
+                ):
+                    reason = "always_unsupported"  # as for "yes always" by text
                 else:
                     reason = self._resolve_unit(
-                        unit, approved=resolution.approved, actor=resolution.actor, now=now
-                    )
+                        unit, approved=resolution.approved, actor=resolution.actor, now=now,
+                        always=resolution.always,
+                    )  # fmt: skip
             # A non-approver can't tell an existing approval from a missing one.
             shown = "not_found" if reason == "not an approver" else reason
             result = ResolveResult(ok=False, reason=shown)
             if reason is None and unit is not None:
                 done = [ap.get_approval(self.conn, m.id) for m in unit.members]
                 result = ap.resolve_result([d for d in done if d is not None])
+                head = done[0]
+                if (
+                    unit.batch is None
+                    and head is not None
+                    and head.always
+                    and head.always_scope
+                    and head.always_action
+                ):
+                    _add_standing_rule(self.conn, head, resolution.actor, now)
                 ap.wake_resolved(self.conn, result, now, principal=resolution.actor)
             audit(
                 self.conn,
@@ -613,6 +674,7 @@ class PolicyGate:
                 actor_identity=resolution.actor_identity,
                 path=resolution.path,
                 comments=resolution.comments,
+                always=resolution.always,
                 ok=result.ok,
                 reason=reason,
             )
@@ -654,6 +716,7 @@ class PolicyGate:
                     now=now,
                     event_id=reply.event_id,
                     always=reply.always,
+                    picks=reply.picks,
                 )
             result = ResolveResult(ok=False, reason=reason)
             if reason is None and unit is not None:
@@ -675,13 +738,14 @@ class PolicyGate:
                 tool=target.tool if target else None,
                 extension=target.extension if target else None,
                 intent_hash=target.intent_hash if target else None,
-                decision=("approved" if reply.decision == "approve" else "rejected")
-                if result.ok
-                else "refused",
+                decision=_decision(reply, result.ok),
                 requested=reply.decision,
                 approval_id=target.id if target else None,
                 batch_id=unit.batch.id if unit is not None and unit.batch is not None else None,
                 approval_ids=[m.id for m in unit.members] if unit is not None else None,
+                picks=list(reply.picks) if reply.picks is not None else None,
+                approved_ids=_picked(unit, reply.picks, True),
+                rejected_ids=_picked(unit, reply.picks, False),
                 actor_identity=reply.actor_identity,
                 channel=reply.channel,
                 path=reply.path,
@@ -728,6 +792,11 @@ class PolicyGate:
             target = prompted[0] if prompted else mine[0]
         if not all(_sent_before(m, reply) for m in target.members):
             return None, "not_sent_before"
+        if reply.picks is not None:
+            if target.batch is None:
+                return None, "not_a_batch"
+            if any(n < 1 or n > len(target.members) for n in reply.picks):
+                return None, "unknown_pick"
         if reply.always and (
             target.batch is not None
             or not target.head.allow_always
@@ -748,9 +817,23 @@ class PolicyGate:
             seen = [u.head.id for u in self._units(opened, reply.actor)]
             if seen != [target.head.id]:
                 return None, "ambiguous"
-            if target.require_code and reply.decision == "approve":
+            if reply.decision == "approve" and (
+                target.needs_code(reply.picks) or self._claude_since(target, reply)
+            ):
                 return None, "code_required"
         return target, None
+
+    def _claude_since(self, unit: _Unit, reply: ApprovalReply) -> bool:
+        """PER-261: a Claude answer (outside text, right above the reply) went out after this
+        prompt or its reminder, so a bare yes, or yes 1,3, needs the code: the answer can't
+        stand in for the prompt."""
+        from resonant.gateway.channel import approval_dedupe_key  # the gateway imports the gate
+
+        actor = reply.actor
+        ids = [m.id for m in unit.members] + ([unit.batch.id] if unit.batch is not None else [])
+        keys = {approval_dedupe_key(i, actor) for i in ids}
+        keys |= {outbound.reminder_key(i, actor) for i in ids}
+        return outbound.claude_since(self.conn, actor, keys, reply.occurred_at)
 
     def _may_approve(self, reply: ApprovalReply, a: ap.Approval) -> bool:
         return (
@@ -760,13 +843,31 @@ class PolicyGate:
         )
 
 
+def _decision(reply: ApprovalReply, ok: bool) -> str:
+    """A reply's ``approval.resolve`` decision: ``approved``, ``rejected``, ``partial`` (a
+    ``yes 1,3`` that approved some of a batch and rejected the rest, PER-261) or ``refused``."""
+    if not ok:
+        return "refused"
+    if reply.decision != "approve":
+        return "rejected"
+    return "partial" if reply.picks is not None else "approved"
+
+
+def _picked(unit: _Unit | None, picks: tuple[int, ...] | None, approved: bool) -> list[str] | None:
+    """For a ``yes 1,3`` reply's audit row (PER-255): the approvals it approves (``approved``)
+    or rejects, so each approval's decision is on record. None for any other reply."""
+    if unit is None or picks is None:
+        return None
+    return [m.id for n, m in enumerate(unit.members, 1) if (n in picks) == approved]
+
+
 class _BatchRefused(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
 
 
-def _strictest(levels: Sequence[Level]) -> Level:
+def strictest(levels: Sequence[Level]) -> Level:
     """L1 (the code) over L2 over L3 (L0 never asks)."""
     order = (Level.L1, Level.L2, Level.L3, Level.L0)
     return min(levels, key=order.index)
@@ -791,7 +892,8 @@ def batch_line(summary: str, *, offered: bool, widens: bool = False) -> str:
     return f"widens trust: {summary}" if widens else summary
 
 
-def _line(a: ap.Approval) -> str:
+def change_line(a: ap.Approval) -> str:
+    """``a`` as one line of its batch's prompt (also the dashboard's batch row, PER-254)."""
     return batch_line(a.summary, offered=a.allow_always, widens=widens_trust(a.tool, a.extension))
 
 
@@ -813,13 +915,19 @@ class _Unit:
     @property
     def require_code(self) -> bool:
         """Any approval needs its code, or (a batch) one of them widens trust."""
-        if self.batch is not None and any(widens_trust(m.tool, m.extension) for m in self.members):
+        return self.needs_code(None)
+
+    def needs_code(self, picks: tuple[int, ...] | None) -> bool:
+        """Whether approving ``picks`` (a batch's change numbers; None: all of it) needs the
+        code: the strictest of those changes (L1, pay), or (a batch) one of them widens trust."""
+        chosen = [m for n, m in enumerate(self.members, 1) if picks is None or n in picks]
+        if self.batch is not None and any(widens_trust(m.tool, m.extension) for m in chosen):
             return True
-        return any(m.require_code for m in self.members)
+        return any(m.require_code for m in chosen)
 
     @property
     def level(self) -> Level:
-        return _strictest([m.level for m in self.members])
+        return strictest([m.level for m in self.members])
 
     @property
     def destructive(self) -> bool:
@@ -843,7 +951,7 @@ class _Unit:
                 require_code=a.require_code,
                 expires_at=a.expires_at,
             )
-        summary = f"{len(self.members)} changes: " + "; ".join(_line(m) for m in self.members)
+        summary = f"{len(self.members)} changes: " + "; ".join(change_line(m) for m in self.members)
         if len(summary) > BATCH_SUMMARY_CHARS:
             summary = summary[: BATCH_SUMMARY_CHARS - 1].rstrip() + "…"
         return PendingApproval(
@@ -855,6 +963,7 @@ class _Unit:
             level=self.level,
             require_code=self.require_code,
             expires_at=min(m.expires_at for m in self.members),
+            changes=len(self.members),
         )
 
     def as_batch(self) -> ApprovalBatch:
@@ -867,7 +976,7 @@ class _Unit:
             code=self.code or "",
             task_id=self.head.task_id or "",
             expires_at=min(m.expires_at for m in self.members),
-            lines=tuple(_line(m) for m in self.members),
+            lines=tuple(change_line(m) for m in self.members),
             require_code=self.require_code,
             destructive=self.destructive,
             level=self.level,

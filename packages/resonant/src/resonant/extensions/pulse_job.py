@@ -4,14 +4,12 @@ A core job (``scheduler.CORE_JOBS``): L0, no model, run inline at ``0 * * * *`` 
 ``settings.timezone`` with a 50 minute catch-up. ``pulse.enabled: false``, no iMessage channel
 or no ``principals.yaml`` owner: not scheduled. Each run:
 
-1. prunes old items and refreshes the **core items** (source ``core``) from the store:
-   ``approval/<code>`` (a pending approval older than :func:`remention_delay`, which is
-   ``pulse.remention_after`` capped at half the approval TTL; with the defaults, 10 and 30
-   minutes, only approvals asked between :30 and :50 are still open and old enough at the
-   next pulse:
-   ``✋ A7 still waiting: <label>``, said once; it is cleared without a message when it is
-   resolved, the owner has seen that). Health stays with the HealthMonitor, which already
-   alerts on degrade and recovery;
+1. prunes old items and refreshes the **core items** (source ``core``) from the store: an
+   open worker question is news again after :func:`remention_delay`. Pending approvals are
+   not pulse items (PER-261): ``core/remind`` texts each one reminder at half its TTL
+   (``runners/approve.py``), and any ``core/approval/*`` item left from before is cleared
+   without a message. Health stays with the HealthMonitor, which already alerts on degrade
+   and recovery;
 2. unless it is the briefing's hour (the briefing covers it), inside the quiet hours, or
    paused: lists the untold ``urgent`` and ``normal`` items of sources that aren't muted
    (urgent ones only get here when they were held), oldest first, urgent first, and sends
@@ -21,9 +19,10 @@ or no ``principals.yaml`` owner: not scheduled. Each run:
 Claude workers' items (``core`` / ``run/<code>``, EM-6) and the rollup's derived items
 (``stall/``, ``merged/``, ``review/``, GH-2) go in a ``Workers:`` section after the rest, as
 the progress rollup's lines (``extensions/rollup.py``: ``Merged: …``, ``Looks like … got
-dropped``, ``Still working on: …``); when there is news, the workers still running (already
-told) and the github PRs still being worked on are listed with them, for status (they never
-make a pulse send on their own). Each run first refreshes the derived items
+dropped``, ``Waiting on you to merge: …``, ``Still working on: …``, ``Quiet: …``); when
+there is news, the workers still running (already told), the github PRs still being worked on
+and the stalls already told are listed with them, for status (they never make a pulse send
+on their own). Each run first refreshes the derived items
 (:func:`refresh_rollup`, ``pulse.stall_after``).
 
 The message is at most ``MAX_CHARS`` (1,000). Items that don't fit are not marked told and ride
@@ -50,7 +49,6 @@ after its send is not rerun: the scheduler consumes its due time). Records are p
 from __future__ import annotations
 
 import logging
-import re
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -63,9 +61,7 @@ from resonant.executor import CallContext
 from resonant.extensions import notify, rollup
 from resonant.extensions.pulse import render_item
 from resonant.store import pulse as store
-from resonant.store.approvals import answerable as pending_for  # BA-1: codes that bind
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
-from resonant.tools.projects import clip
 from resonant.tools.when import format_due
 
 if TYPE_CHECKING:
@@ -87,10 +83,8 @@ INFLIGHT = "pulse.inflight:"  # kv: one record per dedupe key, see deliver()
 INFLIGHT_KEEP = timedelta(days=2)
 UNSENT_MAX_AGE = timedelta(hours=2)  # an unsent record older than this is abandoned
 ITEM_TTL_S = 24 * 3600
-LABEL_MAX = 60
 WORKER_PREFIX = "run/"
 WORKERS_HEADER = "Workers:"
-_BAD_KEY_CHARS = re.compile(r"[^a-z0-9/._:-]")
 
 
 def schedule() -> str:
@@ -289,7 +283,7 @@ def _compose_now(
     """:func:`compose` over the store: the pending items, the running workers and the
     rollup's names for them. Read-only."""
     items = rollup.held_while_stale(conn, now, _pending(conn, now, hide_approvals=hide_approvals))
-    going = running_workers(conn, now)
+    going = [*running_workers(conn, now), *rollup.quiet_items(conn, now)]
     roll = rollup.gather(conn, now, [*items, *going], stall_after=stall_after)
     return compose(items, going, roll)
 
@@ -328,10 +322,6 @@ def preview_text(
 
 
 # --- core items ------------------------------------------------------------------------------
-
-
-def _key(prefix: str, name: str) -> str:
-    return prefix + "/" + _BAD_KEY_CHARS.sub("-", name.lower())[: store.KEY_MAX - len(prefix) - 1]
 
 
 def _sync(
@@ -377,17 +367,12 @@ def remention_delay(settings: Settings) -> timedelta:
 def refresh_core_items(
     conn: sqlite3.Connection, owner: str, settings: Settings, now: datetime
 ) -> None:
-    """Refresh ``core/approval/<code>`` from the store."""
-    waiting: dict[str, str] = {}
-    delay = remention_delay(settings)
-    for a in pending_for(conn, owner, now):
-        if now - a.created_at < delay:
-            continue
-        code = notify.clean_text(a.code or a.id[:8])
-        label = clip(notify.clean_text(a.summary), LABEL_MAX)
-        waiting[_key("approval", a.code or a.id)] = f"✋ {code} still waiting: {label}"
-    _sync(conn, now, "approval", waiting, lambda item: None)
-    remention_questions(conn, now, delay)
+    """Refresh the core items from the store: worker questions are re-mentioned. Approvals
+    are never pulse items (PER-261, ``core/remind`` reminds instead); an open
+    ``core/approval/*`` item from before is cleared silently."""
+    del owner
+    _sync(conn, now, "approval", {}, lambda item: None)
+    remention_questions(conn, now, remention_delay(settings))
 
 
 QUESTION_PREFIX = "question/"  # worker_desk.question_item_key

@@ -169,7 +169,7 @@ async def test_a_spoken_yes_never_approves(
                 )
             ],
         )
-        (prompt,) = await b.say("tell me when milk is on my notes")
+        _answer, prompt = await b.say("tell me when milk is on my notes", replies=2)
         assert "Reply yes" in prompt
         await b.prompt_recorded()
         b.model.push("Type yes to approve it.")
@@ -231,7 +231,9 @@ async def test_an_ask_watch_texts_once_when_claude_says_yes(
                 )
             ],
         )
-        (prompt,) = await b.say("watch the Pro page and tell me when it's in stock")
+        _answer, prompt = await b.say(
+            "watch the Pro page and tell me when it's in stock", replies=2
+        )  # PER-261: the answer goes out first
         assert "Reply yes" in prompt
         await b.prompt_recorded()
         (done,) = await b.say("yes")

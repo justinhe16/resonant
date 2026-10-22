@@ -29,7 +29,8 @@ decides whether a call may run.
   in the batch (one change: the plain prompt), then the task waits; ``yes`` runs each once,
   in order (the executor's keys), ``no`` or expiry drops them all (``AskRunner``: a
   ``LocalRunner`` named ``ask`` runs the batch step through ``ToolCore.resume``). At most
-  ``gate.batch_max`` changes wait and ``MAX_SIDE_EFFECTS`` run unasked per task.
+  ``gate.batch_max`` changes wait and ``MAX_SIDE_EFFECTS`` run unasked per task; a change
+  past that asks (PER-261), in the batch.
 - **Kill switch.** Paused: every call is refused here (the session itself is killed by the
   ask runner); autonomy off: the gate asks for everything above L0, as for the local model.
 
@@ -75,6 +76,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -85,6 +87,8 @@ from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
+
+import psutil
 
 from resonant import killswitch
 from resonant.brain.text import flat
@@ -422,8 +426,8 @@ class ClaudeTools:
             return BAD_ARGS.format(why=why, name=spec.name, schema=schema), True
         if self._paused():
             return PAUSED, True
-        if change and len(self.reports) >= MAX_SIDE_EFFECTS:
-            return CAPPED, True
+        if change and len(self.reports) >= MAX_SIDE_EFFECTS and self.core.batch_gate is None:
+            return CAPPED, True  # with batches (PER-261) it asks instead, in the batch
         if self.outside:
             self.tainted = True
         if change:
@@ -448,6 +452,8 @@ class ClaudeTools:
             batch=self.asked,
         )
         outcome = await self.core.call(spec, args, scope)
+        if isinstance(outcome, Refused) and outcome.why == "capped" and not outcome.gated:
+            return CAPPED, True
         if self.access.taints(spec) and _shows_outside(spec, outcome):
             self.tainted = self.read_outside = True
         if isinstance(outcome, Asked):
@@ -722,8 +728,9 @@ class McpServer:
         config's path."""
         if self.config is not None:
             return self.config
-        self._dir = Path(tempfile.mkdtemp(prefix="rsn-mcp-"))
+        self._dir = Path(tempfile.mkdtemp(prefix=BRIDGE_PREFIX))
         os.chmod(self._dir, 0o700)
+        _write_owner(self._dir)  # PER-262: a killed daemon's dir is swept at the next start
         sock = self._dir / "s"
         self._server = await asyncio.start_unix_server(self._serve, path=str(sock), limit=LINE_MAX)
         os.chmod(sock, 0o600)
@@ -821,6 +828,103 @@ async def _write(writer: asyncio.StreamWriter, obj: dict[str, Any]) -> None:
     await writer.drain()
 
 
+# -- stale bridge dirs (PER-262) --
+
+BRIDGE_PREFIX = "rsn-mcp-"
+OWNER_FILE = "owner"
+GRACE_S = 60.0  # a dir this young may not have its owner file or socket yet
+
+
+def _write_owner(path: Path) -> None:
+    """Who made a bridge dir: this process's pid and start time (pid reuse can't fake it)."""
+    try:
+        created: float | None = psutil.Process().create_time()
+    except psutil.Error:
+        created = None
+    fd = os.open(path / OWNER_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"pid": os.getpid(), "created": created}, f)
+
+
+def _owner_alive(path: Path) -> bool | None:
+    """Whether the process that made the bridge dir ``path`` is still running; None when
+    the dir has no readable owner file."""
+    try:
+        fd = os.open(path / OWNER_FILE, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd) as f:
+            raw: Any = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    owner = cast(dict[str, Any], raw)
+    pid, created = owner.get("pid"), owner.get("created")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        started = psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True  # can't tell: keep it
+    # a start time that differs: the pid was reused, the owner is gone
+    return not (isinstance(created, (int, float)) and abs(started - created) > 1.0)
+
+
+def _listening(sock: Path) -> bool:
+    """Whether a server still listens on the bridge socket ``sock`` (a dir from before
+    owner files). Connecting is all: the server refuses it for want of a token."""
+    if not os.path.lexists(sock):
+        return False  # no socket at all
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    try:
+        s.connect(str(sock))
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        return True  # can't tell: keep it
+    finally:
+        s.close()
+    return True
+
+
+def sweep_bridge_dirs(base: Path | None = None, *, grace_s: float = GRACE_S) -> int:
+    """Daemon start (PER-262): remove the ``rsn-mcp-*`` dirs in ``base`` (the temp dir
+    ``McpServer`` uses) that a killed daemon left: this user's real dirs (never a symlink),
+    older than ``grace_s``, whose owner process is gone, or (a dir from before owner files)
+    whose socket nothing listens on. A live process's dirs (another daemon's, a test's)
+    stay. The count removed."""
+    root = base if base is not None else Path(tempfile.gettempdir())
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return 0
+    removed = 0
+    now = time.time()
+    for entry in entries:
+        if not entry.name.startswith(BRIDGE_PREFIX):
+            continue
+        try:
+            st = entry.stat(follow_symlinks=False)
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        if st.st_uid != os.getuid():
+            continue
+        if now - st.st_mtime < grace_s:
+            continue
+        alive = _owner_alive(Path(entry.path))
+        if alive is None:
+            alive = _listening(Path(entry.path) / "s")
+        if alive:
+            continue
+        shutil.rmtree(entry.path, ignore_errors=True)
+        removed += 1
+    return removed
+
+
 __all__ = [
     "PREFIX",
     "SERVER",
@@ -829,4 +933,5 @@ __all__ = [
     "McpSetup",
     "NoModel",
     "ToolAccess",
+    "sweep_bridge_dirs",
 ]

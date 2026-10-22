@@ -67,6 +67,26 @@ describe("Dashboard, local tier", () => {
     expect(within(screen.getByTestId("column-left")).getByRole("heading", { level: 1 })).toBeInTheDocument();
   });
 
+  it("shows an approval batch as one row with its changes", async () => {
+    mount(local);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    const row = screen.getByText("3 changes").closest("li")!;
+    const changes = within(row).getByRole("list", { name: "Changes" });
+    expect(within(changes).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      '1.linear: save issue title="Retry the relay push"L3',
+      '2.linear: save comment issue="PER-263"L3',
+      "3.restart resonantL2",
+    ]);
+    expect(within(row).getByText("code D7")).toBeInTheDocument();
+    expect(within(row).getByText("one answer for all")).toBeInTheDocument();
+    expect(within(row).getByText("expires in 55 min")).toBeInTheDocument();
+    expect(within(row).getAllByText("L2")).toHaveLength(2); // the batch's strictest, and change 3
+    // A lone approval has no change list.
+    const lone = screen.getByText("merge_pr github: example/resonant#81").closest("li")!;
+    expect(within(lone).queryByRole("list", { name: "Changes" })).not.toBeInTheDocument();
+    expect(within(lone).queryByText("one answer for all")).not.toBeInTheDocument();
+  });
+
   it("shows every section's local detail on one page", async () => {
     mount(local);
     await screen.findByRole("heading", { name: "Something is degraded" });
@@ -88,17 +108,24 @@ describe("Dashboard, local tier", () => {
     expect(screen.getByText("merge_pr github: example/resonant#81")).toBeInTheDocument();
     expect(screen.getByText("L1")).toBeInTheDocument();
     expect(screen.getByText("expires in 50 min")).toBeInTheDocument();
-    expect(screen.getByText("2 open")).toBeInTheDocument(); // one approval + one question
+    // Waiting on you: two approval rows (one a batch) and one question; Pulse: three items.
+    expect(screen.getAllByText("3 open")).toHaveLength(2);
 
     const pulse = screen.getByText("Rain after 4pm").closest("ul")!;
     expect(within(pulse).getAllByRole("listitem")[0]).toHaveTextContent("R11 asked a question"); // urgent first
-    expect(screen.getByText("3 open")).toBeInTheDocument();
 
     expect(screen.getByText("2 fails in a row")).toBeInTheDocument();
     expect(screen.getByText("No scheduled jobs.")).toBeInTheDocument();
 
     expect(screen.getByText("ask merge on trading")).toBeInTheDocument();
     expect(screen.getByText("no CI")).toBeInTheDocument();
+  });
+
+  it("says how many side effects were detected per run (PER-263)", async () => {
+    mount(local);
+    expect(await screen.findByText("2 side effects detected")).toBeInTheDocument();
+    expect(screen.getByText("1 side effect detected")).toBeInTheDocument();
+    expect(screen.getAllByText(/side effects? detected/)).toHaveLength(2); // none for a run with 0
   });
 
   it("refuses non-https PR links", async () => {
@@ -244,6 +271,44 @@ describe("Dashboard, remote tier", () => {
     expect(screen.queryByText("All quiet.")).not.toBeInTheDocument();
     expect(screen.getAllByText("Run details are shown on the local dashboard only.")).toHaveLength(2);
     expect(screen.getByText("Its tool calls are shown on the local dashboard only.")).toBeInTheDocument();
+  });
+
+  it("shows the pulse's untold count and a muted reporter (PER-263)", async () => {
+    mount(remote);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(screen.getByTestId("pulse-untold")).toHaveTextContent("2 untold");
+    expect(screen.getByTestId("pulse-muted")).toHaveTextContent("weather muted, ends in 3 h");
+    expect(screen.getAllByText("muted")).toHaveLength(1); // the weather extension's badge
+  });
+
+  it("shows detected side effects as counts (PER-263)", async () => {
+    mount(remote);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    const effects = screen.getByTestId("detected-effects");
+    expect(effects).toHaveTextContent("push1");
+    expect(effects).toHaveTextContent("merge1");
+    expect(effects).toHaveTextContent("1 high-impact");
+  });
+
+  it("works with a snapshot from before PER-263", async () => {
+    const old = clone(remote);
+    delete old.pulse.untold;
+    delete old.runs.detected;
+    for (const e of old.extensions) delete e.muted_until;
+    mount(old);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(screen.queryByTestId("pulse-untold")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("pulse-muted")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("detected-effects")).not.toBeInTheDocument();
+  });
+
+  it("shows no muted badge once the mute has ended", async () => {
+    const ended = clone(remote);
+    for (const e of ended.extensions) if (e.muted_until) e.muted_until = "2026-10-16T08:00:00+00:00";
+    mount(ended);
+    await screen.findByRole("heading", { name: "Something is degraded" });
+    expect(screen.queryByTestId("pulse-muted")).not.toBeInTheDocument();
+    expect(screen.queryByText("muted")).not.toBeInTheDocument();
   });
 });
 

@@ -266,7 +266,7 @@ P5A-3 review changes:
 - A session counts (and is resumed with `--resume`) only after Claude's system message with the session id arrived; otherwise the next start is a fresh `--session-id`. The saved process is cleared only once the tree is really gone; if it won't die the run fails.
 - The watchdog also covers the shared runner cache: over `runner.max_cache_gb`, the run is killed. The daily cleanup also runs with no repos configured when the work or cache dir exists.
 - `pr list` uses `--state all`, so a PR merged or closed in between is reused, not duplicated. During a usage wait the pulse item reads "waiting for usage reset".
-- Busy/full/paused keep `Wait("usage_reset")`; a `resource` reason is a follow-up ([PER-259](https://linear.app/doriapp/issue/PER-259)).
+- Busy/full/paused defer with `Wait("resource")` (PER-259), so `/status` shows them as waiting on a resource, not a usage reset.
 - `--max-turns` is hidden and undocumented in Claude Code's help; confirm on the first real run (test.md row 34). `--setting-sources project` makes Claude obey the repo's own `.claude/settings.json` inside the sandbox (accepted, as in D2). Whether `sandbox.enabled: false` takes effect is an owner step (test.md row 34). The redundant `autoUpdates` setting was dropped (`DISABLE_AUTOUPDATER=1` is in the env).
 
 ### P5A-4 and P5A-5 (run tools, commands and the `run_project` intent)

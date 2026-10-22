@@ -35,16 +35,17 @@ Snapshot {
   autonomy: "on"|"off", paused: bool, dry_run: bool,
   health: [{name, state: ok|degraded|failing|unknown, since, reason?}],     # reason: local only
   tasks: {by_state: {state: n}}, slots: {used, max},
-  runs: {by_state: {state: n}, items?: [{code, state, repo, ask, branch, pr_url, pr_number,
-         started_at, ended_at, waiting_reason, last_note}]},                  # items: local only
+  runs: {by_state: {state: n}, detected: {by_kind: {kind: n}, high: n},      # detected: PER-263
+         items?: [{code, state, repo, ask, branch, pr_url, pr_number,
+         started_at, ended_at, waiting_reason, last_note, detected}],         # items: local only
          brief: [{code, state, scratch, has_pr, started_at, ended_at, waiting_reason}]},
-  approvals: {open: n, items?: [{code, summary, level, asked_at, expires_at}],
-              brief: [{level, effect, needs_code, asked_at, expires_at}]},
+  approvals: {open: n, items?: [{code, summary, level, asked_at, expires_at, changes?}],  # a batch is one row (PER-254)
+              brief: [{level, effect, needs_code, asked_at, expires_at}]},             # one per row
   questions: {open: n, items?: [{run_code, text, options, asked_at}],
               brief: [{run_code, options: n, asked_at}]},
-  pulse: {open: n, items?: [{source, key, title, urgency, state: new|told, updated_at}],
+  pulse: {open: n, untold: n, items?: [{source, key, title, urgency, state: new|told, updated_at}],
           brief: [{source, urgency, state, updated_at}]},
-  extensions: [{name, status, health, jobs: [{id, next_due, last_run_at, last_outcome, fail_streak}]}],
+  extensions: [{name, status, health, muted_until, jobs: [{id, next_due, last_run_at, last_outcome, fail_streak}]}],
   runner: {set_up: bool, missing?: [str], gaps: n},
   brain_activity: {calls_today, writes_today, state, turns,
                    recent: [{at, tool, decision, status, write}]},

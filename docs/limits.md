@@ -32,8 +32,11 @@ What Resonant does not do, or does on purpose in a way that has a cost. Each was
 - **Images always go to Claude.** qwen3 has no vision. A local vision model could answer simple ones.
 - **A media ask's answer isn't replayed** in later turns; only answers to brain tasks are (`<claude_answer>`). Those are noted after the send and retried for about 10 s; past that they're missing from history.
 - **No daily cap by default.** `daily_cap: 0`; the runaway guard (60 an hour across the brain, one-shot asks, media and watch checks) is the only automatic stop besides Claude's own limits. Watch `ask.queued` and `ask.notice` audit counts.
-- **Live CLI behavior not checked:** whether auto-compaction keeps `--append-system-prompt`. Re-check after CLI updates.
-- **Gmail tool names are a guess** (`brain.ask_claude.connector_tools.email`). Check them against the init event once Gmail reaches the session (Phase 7).
+- **Live CLI behavior not checked:** whether auto-compaction keeps `--append-system-prompt`. Re-check after CLI updates; `scripts/probe_claude_rules.py` re-checks the deny rules and `--max-turns` (PER-262).
+- **Deny globs by case** (PER-262). Claude Code matches glob rules by case and takes no `[eE]` classes, so each glob is written as given, lower, upper and capitalized. Another mix (`.eNv`) gets past Claude's own Read, Grep and Glob; path rules ignore case, the read tools fold case, and `--add-dir` keeps Claude to the roots.
+- **An outside pause lands within `pause_check_s`** (PER-262, 5 s) for an idle session; a `/kill` in the daemon is at once.
+- **Transcript sweep** (PER-262). Only the brain's own `~/.claude/projects/<cwd>` dir, for the `HOME` the CLI runs with. The dir name follows Claude Code's naming as seen on 2.1.305; if a later CLI names it differently, the sweep finds nothing (it never guesses).
+- **Gmail tool names are a guess** (`brain.ask_claude.connector_tools.email`). Moot unless email is ever added (not planned as of 2026-10-21).
 - **Voice transcripts are chat only.** Never a command, approval or worker reply, so `/restart` or `R4 yes` must be typed. Voice approvals would need a confirmation step.
 - **Watches.** A watch's tool and args are fixed at creation, so "watch it" after a long thread depends on the model; the approval prompt shows exactly what will be checked. Checks run at most every 5 minutes, behind owner chat. Brain notices have their own hourly cap (`extensions.notify.max_per_hour`), not shared with extensions.
 
@@ -69,6 +72,12 @@ What Resonant does not do, or does on purpose in a way that has a cost. Each was
 - **A template's own words are trusted** (PER-268). Args it doesn't name are shown after it, but `{~arg}` hides one on purpose (`head_sha` in `merge_pr`), and the phrase is the manifest author's (cleaned, owner-approved at install); a misleading one would under-describe its tool. `/approvals <code>` shows the full args.
 - **The "approve it?" guard is a phrase list** (PER-268). A model that asks for a yes in other words still gets through; the prompt rule is the backup, and a real ask is never dropped (it only runs with nothing pending).
 - **An extension's stderr reason is replayed untainted** (PER-268). The failure text's reason is the extension's (or GitHub's) last stderr line, cleaned and clipped to 200, and it reaches both brains as a system text. Accepted: it is one short line from Resonant's own extensions.
+
+- **"Claude answer" is read off the text** (PER-261). The iMessage channel marks a send as a Claude answer when it starts with `Claude: `. Anything else that starts that way also asks a bare yes for its code (fails safe); a Claude answer sent through another channel isn't seen (only iMessage replies bind).
+- **The expiry reminder runs once a minute** (PER-261), so it lands up to a minute after half the TTL; a prompt with under a minute left gets none. One a prompt, never repeated.
+- **One request per action covers PR merges and reruns** (PER-269). Only `github.merge_pr`, `github.rerun_failed`, `merge_run` and a worker's `--action merge` check carry an identity; other duplicate asks (two paths deploying one thing) still each ask. A merge check whose `what` names no PR, from a run with no PR yet, has none.
+- **A batched ask isn't made obsolete** (PER-269). A batch is answered as one unit, so a member whose PR merged meanwhile stays; its merge then fails as already merged.
+- **A worker told `handled` isn't told the outcome** (PER-269). Its check isn't asked because Resonant (or another run) already asks for the same merge; if the owner says no there, the worker only learns it from the PR.
 
 ## Workers
 

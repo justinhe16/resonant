@@ -14,9 +14,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import socket
 import sqlite3
 import sys
+import time
 from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -213,6 +215,7 @@ async def start(
         session=settings.brain.claude_session,
         poll_s=0.05,
         kill_grace_s=0.5,
+        bridge_root=tmp_path / "bridges",
     )
     components.runners[asks.name] = asks
     daemon.loop.runners[asks.name] = asks
@@ -258,7 +261,9 @@ async def test_follow_ups_go_into_the_same_session_and_see_prior_context(
         argv = first["argv"]
         assert argv[argv.index("--input-format") + 1] == "stream-json"
         assert "--session-id" in argv and "--resume" not in argv
-        assert "--no-session-persistence" not in argv and "--max-turns" not in argv
+        assert "--no-session-persistence" not in argv
+        # PER-262: --max-turns counts per user message in a stream-json session (probed)
+        assert argv[argv.index("--max-turns") + 1] == "40"
         assert "--strict-mcp-config" in argv and argv[argv.index("--tools") + 1] == (
             "Bash,Edit,Write,NotebookEdit,Read,Grep,Glob,WebSearch,WebFetch"
         )  # PER-258: the full file, shell and web built-ins, every prompt to Resonant
@@ -770,11 +775,33 @@ async def test_the_next_turn_gets_what_resonant_texted_since_the_last_one(
         _, answer = await _hard(w, "What happened? Why the failure", answer="The token.")
         assert answer == "Claude: The token."
         prompt = w.session()["prompt"]
-        assert prompt.startswith("Resonant texted the owner itself since your last turn")
-        assert "<since_last>" in prompt and "Couldn't merge PR #121" in prompt
+        assert prompt.startswith("Since we last spoke")
+        assert "<since_last>" in prompt and "Resonant texted: " in prompt
+        assert "Couldn't merge PR #121" in prompt
         assert prompt.endswith("What happened? Why the failure")
         await _hard(w, "ok thanks", answer="Sure.")
         assert "<since_last>" not in w.session()["prompt"]  # shown once
+
+
+async def test_a_text_answered_locally_between_two_hand_offs_is_in_the_next_delta(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-270: the session sees the whole thread, not only system texts: what the owner
+    asked qwen and what qwen said, in order, and never its own answers."""
+    async with start(resonant_home, chat, tmp_path) as w:
+        await _hard(w, "why is R3 slow?", answer="R3 ran out of disk.")
+        w.model.triage = LOCAL
+        w.model.push("mycelium is in ~/code.")
+        await w.say("where is mycelium?")
+        await _hard(w, "and R3 now?", answer="Fine now.")
+        prompt = w.session()["prompt"]
+        assert prompt.startswith("Since we last spoke")
+        assert (
+            "Owner: where is mycelium?" in prompt and "Resonant: mycelium is in ~/code." in prompt
+        )
+        assert prompt.index("Owner: where is mycelium?") < prompt.index("Resonant: mycelium")
+        assert "ran out of disk" not in prompt and "why is R3 slow?" not in prompt
+        assert prompt.endswith("and R3 now?")
 
 
 async def test_a_claude_answer_asking_for_a_yes_with_nothing_pending_is_trimmed(
@@ -785,3 +812,118 @@ async def test_a_claude_answer_asking_for_a_yes_with_nothing_pending_is_trimmed(
             w, "merge PR 121", answer="CI is green on PR #121. The merge is queued. Approve it now?"
         )
         assert answer == "Claude: CI is green on PR #121."
+
+
+# --- upkeep (PER-262) ---------------------------------------------------------------------------
+
+
+async def test_a_pause_written_by_another_process_stops_an_idle_session(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path, session={"pause_check_s": 0.2}) as w:
+        await _hard(w, "why is R4 slow?", answer="ok")
+        pid = w.session()["pid"]
+        assert _alive(pid)
+        kv_set(w.conn, "paused", True)  # as the CLI writes it: no pause hook in this process
+        began = time.monotonic()
+        await wait_until(lambda: not _alive(pid), 5)
+        assert time.monotonic() - began < 0.2 + 3.5  # the check interval + the RC-1 stop
+        await wait_until(lambda: "pid" not in session_state(w.conn), 10)
+        assert not w.session_proc.alive()
+        assert session_state(w.conn)["session_id"]  # kept: it resumes after a resume
+        kv_set(w.conn, "paused", False)
+
+
+async def test_an_idle_session_survives_while_not_paused(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    async with start(resonant_home, chat, tmp_path, session={"pause_check_s": 0.05}) as w:
+        await _hard(w, "why is R4 slow?", answer="ok")
+        pid = w.session()["pid"]
+        await asyncio.sleep(0.4)  # several checks
+        assert _alive(pid) and w.session_proc.alive()
+
+
+async def test_a_queued_turn_starts_as_soon_as_the_one_ahead_finishes(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with start(resonant_home, chat, tmp_path) as w:
+        ended: dict[str, float] = {}  # a task's step ended
+        turns: list[float] = []  # a turn went into the session
+        step, turn = w.asks.step, w.session_proc.turn
+
+        async def timed_step(task: Task, events: list[Any], ctx: Any) -> Any:
+            try:
+                return await step(task, events, ctx)
+            finally:
+                ended.setdefault(task.id, time.monotonic())
+
+        async def timed_turn(**kw: Any) -> Any:
+            turns.append(time.monotonic())
+            return await turn(**kw)
+
+        monkeypatch.setattr(w.asks, "step", timed_step)
+        monkeypatch.setattr(w.session_proc, "turn", timed_turn)
+        w.model.triage = CLAUDE
+        w.claude(turns=[{"when": "slow", "delay": 1.0, "answer": "first"},
+                        {"when": "fix", "answer": "second"}])  # fmt: skip
+        await w.say("why is R4 slow?")
+        await wait_until(lambda: w.session_proc.busy, 10)
+        await w.say("how do I fix the build?")
+        assert await w.more(2) == ["Claude: first", "Claude: second"]
+        first = w.ask_tasks()[0]["id"]
+        assert len(turns) == 2
+        gap = turns[1] - ended[first]
+        assert 0 <= gap < 0.3, gap  # woken, not polled (the backstop is 30 s)
+
+
+async def test_startup_reaps_a_session_a_killed_daemon_left_and_sweeps_its_dirs(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    from resonant.runners.reaper import MARKER_ENV
+
+    async with start(resonant_home, chat, tmp_path) as w:
+        marker = "brain-left-behind"
+        left = await asyncio.create_subprocess_exec(  # the session a killed daemon left
+            sys.executable, "-c", "import time; time.sleep(60)",
+            env={MARKER_ENV: marker}, start_new_session=True,
+        )  # fmt: skip
+        try:
+            created = psutil.Process(left.pid).create_time()
+            kv_set(w.conn, SESSION_KV, {"session_id": "c0ffee00-0000-4000-8000-000000000000",
+                                        "written": True, "pid": left.pid, "created": created,
+                                        "marker": marker})  # fmt: skip
+            bridges = tmp_path / "bridges"
+            stale = bridges / "rsn-mcp-stale"
+            stale.mkdir(parents=True)
+            (stale / "owner").write_text(json.dumps({"pid": left.pid, "created": 1.0}))
+            old = time.time() - 3600
+            os.utime(stale, (old, old))
+            await w.asks.start()
+            assert await asyncio.wait_for(left.wait(), 5) is not None  # reaped
+            st = session_state(w.conn)
+            assert "pid" not in st and st["session_id"]  # the id stays for a resume
+            assert not stale.exists()
+        finally:
+            if left.returncode is None:
+                left.kill()
+                await left.wait()
+
+
+async def test_the_daemon_runs_the_ask_startup_before_the_loop(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import resonant.wiring as wiring
+
+    calls: list[bool] = []
+    real = wiring.start_asks
+
+    async def recording(components: Any) -> None:
+        calls.append(True)
+        await real(components)
+
+    monkeypatch.setattr(wiring, "start_asks", recording)
+    async with start(resonant_home, chat, tmp_path):
+        # start() returns once the chat reader is up; the startup runs just after it
+        await wait_until(lambda: bool(calls), 10)
+        assert calls == [True]

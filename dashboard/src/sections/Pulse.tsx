@@ -1,5 +1,6 @@
 import { Ago, Empty, LocalOnly, Meta, Row, Rows, Section, StateBadge } from "@/components/bits";
 import { Badge } from "@/components/ui/badge";
+import { mutedExtensions } from "@/lib/snapshot";
 import { urgencyTone } from "@/lib/tone";
 import type { PulseItem, Snapshot } from "@/types";
 
@@ -7,6 +8,8 @@ const RANK: Record<string, number> = { urgent: 0, normal: 1, low: 2 };
 
 export function Pulse({ snap, now }: { snap: Snapshot; now: number }) {
   const items = snap.pulse.items;
+  const untold = snap.pulse.untold;
+  const muted = mutedExtensions(snap, now);
   const sorted = items
     ? [...items].sort(
         (a: PulseItem, b: PulseItem) =>
@@ -17,8 +20,28 @@ export function Pulse({ snap, now }: { snap: Snapshot; now: number }) {
     <Section
       title="Pulse"
       description="What Resonant is keeping an eye on"
-      action={<Badge variant="neutral">{snap.pulse.open} open</Badge>}
+      action={
+        <span className="flex gap-1.5">
+          <Badge variant="neutral">{snap.pulse.open} open</Badge>
+          {untold !== undefined && untold > 0 && (
+            <Badge variant="warn" data-testid="pulse-untold" title="Items you haven't heard yet, muted ones included">
+              {untold} untold
+            </Badge>
+          )}
+        </span>
+      }
     >
+      {muted.length > 0 && (
+        <p className="mb-3 text-xs text-muted-foreground" data-testid="pulse-muted">
+          {muted.map((m, i) => (
+            <span key={m.name}>
+              {i > 0 && ", "}
+              <span className="font-mono text-foreground">{m.name}</span> muted, ends{" "}
+              <Ago iso={m.until} now={now} />
+            </span>
+          ))}
+        </p>
+      )}
       {sorted === undefined ? (
         snap.pulse.brief !== undefined && snap.pulse.brief.length > 0 ? (
           <div className="space-y-3">
@@ -36,7 +59,7 @@ export function Pulse({ snap, now }: { snap: Snapshot; now: number }) {
             </Rows>
             <LocalOnly what="Pulse titles" />
           </div>
-        ) : snap.pulse.open === 0 ? (
+        ) : snap.pulse.open === 0 && !untold ? (
           <Empty>All quiet.</Empty>
         ) : (
           <LocalOnly what="Pulse titles" />

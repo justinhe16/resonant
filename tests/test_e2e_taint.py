@@ -64,6 +64,7 @@ async def test_after_a_claude_answer_a_note_runs_and_a_cancel_still_asks(
             [("add_note", {"text": "renew passport"}), ("cancel_run", {"code": "R4"})],
             "Noted; cancelling R4 needs your yes.",
         )
+        # tainted: the model's words never go out above the prompt (PER-261)
         (prompt,) = await w.say("add a note renew passport, and cancel R4")
         assert "OK to cancel R4?" in prompt and "yes / no" in prompt and "yes always" not in prompt
         assert "note" not in prompt  # the note didn't ask

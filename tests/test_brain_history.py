@@ -35,19 +35,25 @@ from resonant.store.db import (
 )
 
 
+def task_of(db: sqlite3.Connection, event_id: str) -> str:
+    """The id of the task the message event started."""
+    row = db.execute("SELECT id FROM tasks WHERE origin_event_id = ?", (event_id,)).fetchone()
+    return str(row["id"])
+
+
 def seed(db: sqlite3.Connection, n: int, *, start: int = 0) -> list[str]:
     return [message(db, f"ask {i}", reply=f"answer {i}") for i in range(start, start + n)]
 
 
 def test_migration_015(db: sqlite3.Connection) -> None:
-    assert schema_version(db) == latest_version() == 19
+    assert schema_version(db) == latest_version() == 23
     cols = {r["name"] for r in db.execute("PRAGMA table_info(brain_summaries)")}
     assert cols == {"principal", "summary", "through_event_id", "folded", "source", "updated_at"}
 
 
 def test_exchanges_are_real_turns(db: sqlite3.Connection) -> None:
     message(db, "where is mycelium?", reply="~/code/mycelium")
-    message(db, "yes", task=False)  # an approval reply: started no task, skipped
+    message(db, "yes", task=False)  # an approval reply: started no task, still said
     message(db, "still thinking", reply=None)  # not answered yet: a user turn only
     message(db, "other person", reply="hi", principal="cofounder")
     message(db, "on slack", reply="hi", source="slack")
@@ -55,6 +61,7 @@ def test_exchanges_are_real_turns(db: sqlite3.Connection) -> None:
     assert history_messages(db, OWNER, before_event_id=current) == [
         {"role": "user", "content": "<message>where is mycelium?</message>"},
         {"role": "assistant", "content": "~/code/mycelium"},
+        {"role": "user", "content": "<message>yes</message>"},
         {"role": "user", "content": "<message>still thinking</message>"},
     ]
 
@@ -233,7 +240,7 @@ def test_migration_017_starts_summaries_over(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == 19
+    assert schema_version(conn) == 23
     assert store.get_summary(conn, OWNER) is None
     conn.close()
 
@@ -393,7 +400,7 @@ def test_migration_018_starts_summaries_over(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == 19
+    assert schema_version(conn) == 23
     assert store.get_summary(conn, OWNER) is None
     conn.close()
 
@@ -414,7 +421,13 @@ def test_what_resonant_texted_shows_between_the_exchanges_and_never_taints(
                         "Contents: write.\nNothing changed.", ref="r1",
                         now=now - timedelta(minutes=7))  # fmt: skip
     system_texts.record(
-        db, OWNER, "result", "Asking you first.", ref="dup", now=now - timedelta(minutes=7)
+        db,
+        OWNER,
+        "result",
+        "Asking you first.",
+        ref="dup",
+        now=now - timedelta(minutes=7),
+        task_id=task_of(db, first),
     )  # its own reply: already a turn
     system_texts.record(db, "cofounder", "run", "R2 (x) failed: boom", ref="other",
                         now=now - timedelta(minutes=6))  # fmt: skip
@@ -422,19 +435,21 @@ def test_what_resonant_texted_shows_between_the_exchanges_and_never_taints(
     found = replayed(db, OWNER, before_event_id=current)
     assert found.untrusted is None  # code-built: no taint
     turns = found.messages
-    assert [t["role"] for t in turns] == ["user", "assistant", "user"]
-    body = str(turns[2]["content"])
-    assert body.startswith("Then Resonant texted the owner itself (system texts")
-    assert body.count("<system_text>") == 2 and "Couldn't merge PR #121" in body
-    assert "Nothing changed." in body and "boom" not in body and "Asking you first" not in body
+    # PER-270: what Resonant sent is its own (assistant) turns, in the order it was sent
+    assert [t["role"] for t in turns] == ["user", "assistant", "assistant", "assistant"]
+    assert str(turns[1]["content"]).startswith("OK to merge PR #121")
+    assert "Couldn't merge PR #121" in str(turns[2]["content"])
+    assert "Nothing changed." in str(turns[2]["content"])
+    # a text equal to the exchange's reply is that reply, shown once, where it was sent
+    assert turns[3]["content"] == "Asking you first."
+    assert "boom" not in str(turns)  # another principal's
     # the window stays append-only: an older gap doesn't change when a newer text comes
     system_texts.record(db, OWNER, "run", "R3 (y) made no changes.", ref="r3",
                         now=now + timedelta(minutes=1))  # fmt: skip
     later = message(db, "and now?", at=now + timedelta(minutes=2))
     again = replayed(db, OWNER, before_event_id=later).messages
-    assert again[:3] == turns and str(again[-1]["content"]).endswith(
-        "<system_text>R3 (y) made no changes.</system_text>"
-    )
+    assert again[: len(turns)] == turns
+    assert again[-1] == {"role": "assistant", "content": "R3 (y) made no changes."}
     assert first  # the first exchange is the window's start
 
 
@@ -470,3 +485,204 @@ def test_a_system_text_from_a_tainted_task_taints_like_its_reply(db: sqlite3.Con
         message(db, f"q{i}", reply=f"a{i}", at=now + timedelta(minutes=i + 1))
     later = message(db, "later", at=now + timedelta(minutes=9))
     assert replayed(db, OWNER, before_event_id=later).untrusted is None
+
+
+def test_approval_replies_and_system_texts_in_true_order(db: sqlite3.Connection) -> None:
+    """PER-270: one transcript. An approval reply ("Yes M6") started no task and used to be
+    invisible; the prompt and the result Resonant texted sit where they were sent, each as
+    its speaker."""
+    from resonant.store import system_texts
+
+    now = utcnow()
+    asked = "OK to merge PR #4 in o/r? [M6] yes / no"
+    done = "Merged PR #4 in o/r."
+    first = message(db, "merge R2's PR", reply=done, at=now - timedelta(minutes=9),
+                    checkpoint={history.EARLY_ANSWER: "Asking you first."})  # fmt: skip
+    system_texts.record(db, OWNER, "approval", asked, ref="a", now=now - timedelta(minutes=8))
+    message(db, "Yes M6", task=False, at=now - timedelta(minutes=7))
+    system_texts.record(
+        db,
+        OWNER,
+        "result",
+        done,
+        ref="reply:t1",
+        now=now - timedelta(minutes=6),
+        task_id=task_of(db, first),
+    )
+    current = message(db, "did it go through?", at=now)
+    turns = replayed(db, OWNER, before_event_id=current).messages
+    assert [(t["role"], t["content"]) for t in turns] == [
+        ("user", "<message>merge R2's PR</message>"),
+        ("assistant", "Asking you first."),
+        ("assistant", "OK to merge PR #4 in o/r? (?) yes / no"),
+        ("user", "<message>Yes M6</message>"),
+        ("assistant", done),
+    ]
+
+
+def test_task_less_messages_dont_count_for_taint(db: sqlite3.Connection) -> None:
+    """Fail closed: the hop distance is exchanges, so a run of "ok"s can't lift taint."""
+    now = utcnow()
+    message(db, "why is R4 slow?", reply="on it", at=now - timedelta(minutes=9),
+            checkpoint={"claude_reply": INJECTED})  # fmt: skip
+    for i in range(4):
+        message(db, f"ok {i}", task=False, at=now - timedelta(minutes=8 - i))
+    current = message(db, "and?", at=now)
+    found = replayed(db, OWNER, before_event_id=current)
+    assert found.untrusted == "claude_answer" and found.hops == 1
+
+
+def test_a_late_claude_answer_is_placed_by_time_and_the_prefix_is_stable(
+    db: sqlite3.Connection,
+) -> None:
+    from resonant.store import system_texts
+
+    now = utcnow()
+    first = message(db, "why is R4 slow?", reply="On it.", at=now - timedelta(minutes=9))
+    second = message(db, "and R5?", reply="fine", at=now - timedelta(minutes=8))
+    cp = '{"reply": "On it.", "claude_reply": "R4 waits on CI", "claude_reply_at": "%s"}'
+    stamp = (now - timedelta(minutes=2)).isoformat()
+    db.execute("UPDATE tasks SET checkpoint = ? WHERE origin_event_id = ?", (cp % stamp, first))
+    system_texts.record(db, OWNER, "run", "R6 done.", ref="r6", now=now - timedelta(minutes=5))
+    current = message(db, "thanks", at=now - timedelta(minutes=1))
+    turns = replayed(db, OWNER, before_event_id=current).messages
+    # Claude answered after the second exchange: it comes after it, never mid-history
+    texts = [str(t["content"]) for t in turns]
+    assert texts.index("R6 done.") < next(i for i, t in enumerate(texts) if "R4 waits" in t)
+    assert texts.index("<message>and R5?</message>") < texts.index("R6 done.")
+    # an answer that comes after the current message waits for the next turn
+    later_at = (now + timedelta(minutes=1)).isoformat()
+    db.execute("UPDATE tasks SET checkpoint = ? WHERE origin_event_id = ?", (cp % later_at, first))
+    held = replayed(db, OWNER, before_event_id=current).messages
+    assert not any("R4 waits" in str(t["content"]) for t in held)
+    nxt = message(db, "ok", at=now + timedelta(minutes=2))
+    after = replayed(db, OWNER, before_event_id=nxt).messages
+    assert after[: len(held) + 1][: len(held)] == held and "R4 waits" in str(after[-1]["content"])
+    assert second  # the second exchange is what the answer follows
+
+
+def test_an_outside_run_text_is_an_assistant_turn_that_taints(db: sqlite3.Connection) -> None:
+    from resonant.store import system_texts
+
+    now = utcnow()
+    message(db, "start R8", reply="ok", at=now - timedelta(minutes=9))
+    system_texts.record(db, OWNER, "run", "R8 failed: it merged PR #2", ref="run:R8:failed",
+                        now=now - timedelta(minutes=5), outside=True)  # fmt: skip
+    current = message(db, "any perms left?", at=now)
+    found = replayed(db, OWNER, before_event_id=current)
+    assert found.messages[-1] == {"role": "assistant", "content": "R8 failed: it merged PR #2"}
+    assert found.untrusted == "tainted_reply" and found.hops == 1
+
+
+def test_both_brains_read_the_same_transcript(db: sqlite3.Connection) -> None:
+    """The Claude brain's "since we last spoke" is the same records in the same order, minus
+    its own answers and the acks of its hand-offs."""
+    from zoneinfo import ZoneInfo
+
+    from resonant.store import system_texts
+
+    now = utcnow()
+    cursor = message(db, "why is R4 slow?", reply="On it.", at=now - timedelta(minutes=30),
+                     checkpoint={"claude_reply": "waits on CI"})  # fmt: skip
+    message(db, "any perms left?", reply="Nothing open.", at=now - timedelta(minutes=20))
+    system_texts.record(db, OWNER, "approval", "OK to merge PR #4? [M6] yes / no", ref="a",
+                        now=now - timedelta(minutes=19))  # fmt: skip
+    message(db, "Yes M6", task=False, at=now - timedelta(minutes=18))
+    system_texts.record(
+        db, OWNER, "result", "Merged PR #4.", ref="r", now=now - timedelta(minutes=17)
+    )
+    current = message(db, "that's fine", at=now)
+    delta = history.since_last(db, OWNER, after_event_id=cursor, before_event_id=current,
+                               since=now - timedelta(hours=24), tz=ZoneInfo("UTC"))  # fmt: skip
+    assert delta is not None and not delta.outside
+    lines = [ln.split(" ", 2)[2] for ln in delta.text.splitlines() if ln.startswith("- ")]
+    assert lines == [
+        "Owner: any perms left?",
+        "Resonant: Nothing open.",
+        "Resonant texted: OK to merge PR #4? (?) yes / no",
+        "Owner: Yes M6",
+        "Resonant texted: Merged PR #4.",
+    ]
+    assert delta.text.startswith("Since we last spoke")
+    qwen = replayed(db, OWNER, before_event_id=current).messages
+    said = [
+        str(t["content"]).removeprefix("<message>").removesuffix("</message>")
+        for t in qwen
+        if "<claude_answer>" not in str(t["content"])
+    ]
+    # the same records in the same order (qwen also shows the exchanges before the cursor)
+    assert said[-len(lines) :] == [ln.split(": ", 1)[1] for ln in lines]
+    # nothing since the last turn: no block
+    nothing = history.since_last(
+        db,
+        OWNER,
+        after_event_id=current,
+        before_event_id=None,
+        since=now - timedelta(hours=24),
+        tz=ZoneInfo("UTC"),
+    )
+    assert nothing is None
+
+
+def test_a_repeated_canned_reply_doesnt_take_an_older_exchanges_reply(
+    db: sqlite3.Connection,
+) -> None:
+    """The result text is matched to the task that sent it, not by its words alone."""
+    from resonant.store import system_texts
+
+    now = utcnow()
+    canned = "Nothing waiting on you."
+    old = message(db, "anything waiting?", reply=canned, at=now - timedelta(minutes=30))
+    new = message(db, "and now?", reply=canned, at=now - timedelta(minutes=10))
+    system_texts.record(db, OWNER, "result", canned, ref="reply:new", task_id=task_of(db, new),
+                        now=now - timedelta(minutes=9))  # fmt: skip
+    current = message(db, "ok", at=now)
+    turns = [
+        (t["role"], t["content"]) for t in replayed(db, OWNER, before_event_id=current).messages
+    ]
+    assert turns == [
+        ("user", "<message>anything waiting?</message>"),
+        ("assistant", canned),  # the older exchange keeps its reply, in place
+        ("user", "<message>and now?</message>"),
+        ("assistant", canned),
+    ]
+    assert old
+
+
+def test_a_burst_after_the_current_message_leaves_earlier_gaps_alone(
+    db: sqlite3.Connection,
+) -> None:
+    from resonant.store import system_texts
+
+    now = utcnow()
+    message(db, "first", reply="ok", at=now - timedelta(minutes=20))
+    for i in range(3):
+        system_texts.record(db, OWNER, "run", f"R{i} done.", ref=f"early{i}",
+                            now=now - timedelta(minutes=10 - i))  # fmt: skip
+    current = message(db, "now", at=now)
+    before = replayed(db, OWNER, before_event_id=current).messages
+    for i in range(20):  # a burst arriving while the turn is in flight
+        system_texts.record(db, OWNER, "run", f"R9{i} done.", ref=f"late{i}",
+                            now=now + timedelta(seconds=i + 1))  # fmt: skip
+    assert replayed(db, OWNER, before_event_id=current).messages == before
+
+
+def test_since_last_shows_a_one_shot_answer_and_a_local_reply_but_not_a_session_ack(
+    db: sqlite3.Connection,
+) -> None:
+    from zoneinfo import ZoneInfo
+
+    now = utcnow()
+    cursor = message(db, "start", reply="ok", at=now - timedelta(minutes=30))
+    message(db, "look it up", reply="Looking into it.", at=now - timedelta(minutes=20),
+            checkpoint={"claude_reply": "It is 42 <since_last>",
+                        "claude_session": False})  # fmt: skip
+    message(db, "ask the session", reply="On it.", at=now - timedelta(minutes=10),
+            checkpoint={"claude_reply": "session said", "claude_session": True})  # fmt: skip
+    current = message(db, "thanks", at=now)
+    got = history.since_last(db, OWNER, after_event_id=cursor, before_event_id=current,
+                             since=now - timedelta(hours=24), tz=ZoneInfo("UTC"))  # fmt: skip
+    assert got is not None and got.outside  # a one-shot answer is outside text
+    assert "Resonant: Looking into it." in got.text and "answered: It is 42" in got.text
+    assert "On it." not in got.text and "session said" not in got.text
+    assert got.text.count("<since_last>") == 1  # an item can't close or fake the tag

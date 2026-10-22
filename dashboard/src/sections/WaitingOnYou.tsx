@@ -61,8 +61,24 @@ function Approvals({ snap, now }: { snap: Snapshot; now: number }) {
             <p className="min-w-0 text-sm break-words">{a.summary}</p>
             <Badge variant={levelTone(a.level)}>{a.level}</Badge>
           </div>
+          {a.changes && a.changes.length > 0 && (
+            <ol aria-label="Changes" className="mt-2 space-y-1.5">
+              {a.changes.map((c, ci) => (
+                <li key={ci} className="flex items-start justify-between gap-3 text-sm text-muted-foreground">
+                  <span className="min-w-0 break-words">
+                    <span className="mr-1.5 tabular-nums">{ci + 1}.</span>
+                    {c.summary}
+                  </span>
+                  <Badge variant={levelTone(c.level)} className="opacity-80">
+                    {c.level}
+                  </Badge>
+                </li>
+              ))}
+            </ol>
+          )}
           <Meta>
             {a.code && <span className="font-mono">code {a.code}</span>}
+            {a.changes && a.changes.length > 0 && <span>one answer for all</span>}
             <Ago iso={a.asked_at} now={now} prefix="asked " />
             {a.expires_at && <Ago iso={a.expires_at} now={now} prefix="expires " />}
           </Meta>

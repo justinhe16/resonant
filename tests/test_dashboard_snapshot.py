@@ -21,10 +21,13 @@ from resonant.dashboard import snapshot as snap
 from resonant.dashboard.pusher import data_size
 from resonant.dashboard.snapshot import (
     ApprovalBrief,
+    ApprovalChange,
     ApprovalItem,
     Approvals,
     BrainActivity,
     BrainToolBrief,
+    ClaudeBrain,
+    DetectedEffects,
     Extension,
     HealthRow,
     Job,
@@ -48,8 +51,12 @@ from resonant.dashboard.snapshot import (
     schema_json,
     to_remote,
 )
+from resonant.extensions import notify
 from resonant.loop import SlotPool
 from resonant.loop.types import NewTask, TaskStatus
+from resonant.runners import side_effects
+from resonant.runners.reports import record_detected
+from resonant.runners.side_effects import SideEffect
 from resonant.store import approvals as ap
 from resonant.store import extensions as ext_store
 from resonant.store import pulse, questions, repos, runs, trust
@@ -172,6 +179,11 @@ def test_local_only_fields_are_marked() -> None:
     }
 
 
+def test_effect_kinds_mirror_the_detector() -> None:
+    """``EffectKind`` copies ``runners.side_effects.Kind`` (an import cycle stops a reuse)."""
+    assert get_args(snap.EffectKind) == get_args(side_effects.Kind)
+
+
 # --- tier filtering, property-checked over random snapshots ------------------------------
 
 
@@ -245,9 +257,15 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
                     ended_at=_maybe(rng, _dt(rng)),
                     waiting_reason=_maybe(rng, rng.choice(["usage_reset", "question"])),
                     last_note=_maybe(rng, _text(rng)),
+                    detected=rng.randint(0, 20),
+                    remote_url=_maybe(rng, _text(rng)),
                 )
                 for _ in n()
             ],
+            detected=DetectedEffects(
+                by_kind=_counts(rng, cast(tuple[snap.EffectKind, ...], get_args(snap.EffectKind))),
+                high=rng.randint(0, 9),
+            ),
             brief=[
                 RunBrief(
                     code=_code(rng),
@@ -270,6 +288,15 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
                     level=rng.choice(["L0", "L1", "L2", "L3"]),
                     asked_at=_dt(rng),
                     expires_at=_dt(rng),
+                    changes=_maybe(
+                        rng,
+                        [
+                            ApprovalChange(
+                                summary=_text(rng), level=rng.choice(["L0", "L1", "L2", "L3"])
+                            )
+                            for _ in n()
+                        ],
+                    ),
                 )
                 for _ in n()
             ],
@@ -302,6 +329,7 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
         ),
         pulse=Pulse(
             open=rng.randint(0, 9),
+            untold=rng.randint(0, 9),
             items=[
                 PulseItem(
                     source=_text(rng),
@@ -328,6 +356,7 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
                 name=_ident(rng),
                 status=rng.choice(["enabled", "disabled", "disabled_tampered"]),
                 health=rng.choice(["ok", "degraded", "unknown"]),
+                muted_until=_maybe(rng, _dt(rng)),
                 jobs=[
                     Job(
                         id=_ident(rng),
@@ -377,6 +406,14 @@ def _random_snapshot(rng: random.Random) -> Snapshot:
                 for _ in n()
             ],
         ),
+        claude_brain=_maybe(
+            rng,
+            ClaudeBrain(
+                state=rng.choice(["up", "down"]),
+                turns=rng.randint(0, 99),
+                remote_url=_maybe(rng, _text(rng)),
+            ),
+        ),
     )
 
 
@@ -404,7 +441,8 @@ def _check_remote(remote: Snapshot) -> None:
             or re.fullmatch(r"[0-9A-Za-z.+-]{1,40}", s)  # version
         ), s
     # No local-only key at all, at any depth (left out, not null).
-    for key in ("reason", "items", "missing", "trust_rules", "repos", "remote_url"):
+    for key in ("reason", "items", "missing", "trust_rules", "repos", "remote_url",
+                "claude_brain"):  # fmt: skip
         assert f'"{key}"' not in json.dumps(data), key
     # It is still a valid snapshot (the schema DB-3 pushes).
     assert Snapshot.model_validate(data) == remote
@@ -493,6 +531,132 @@ def test_remote_carries_no_text_over_random_snapshots(seed: int) -> None:
 # --- the builder over a store -------------------------------------------------------------
 
 
+def _approval(
+    db: sqlite3.Connection,
+    task_id: str,
+    n: int,
+    level: Level,
+    at: datetime,
+    *,
+    tool: str = "save_issue",
+    extension: str | None = "linear",
+) -> str:
+    return ap.insert_approval(
+        db,
+        ap.NewApproval(
+            task_id=task_id,
+            intent_hash=f"h{n}",
+            tool=tool,
+            effect=Effect.WRITE,
+            level=level,
+            summary=f"change {n} {SECRET}",
+            approvers=("justin",),
+            code=f"C{n}",
+            expires_at=at + timedelta(minutes=30),
+            extension=extension,
+        ),
+        at,
+    )
+
+
+def test_a_batch_is_one_row(db: sqlite3.Connection) -> None:
+    """PER-254: approving any approval of a batch approves all of it, so the dashboard shows
+    the batch as one row: its code, its changes in order, its strictest level, one expiry."""
+    now = utcnow().replace(microsecond=0)
+    lone_task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    batch_task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    _approval(db, lone_task, 1, Level.L3, now - timedelta(minutes=10))
+    a = _approval(db, batch_task, 2, Level.L3, now - timedelta(minutes=5))
+    b = _approval(db, batch_task, 3, Level.L1, now - timedelta(minutes=4))
+    c = _approval(
+        db, batch_task, 4, Level.L2, now - timedelta(minutes=3), tool="allow_tools", extension=None
+    )
+    _approval(db, lone_task, 5, Level.L2, now - timedelta(minutes=1))
+    asked = now - timedelta(minutes=2)
+    batch = ap.insert_batch(db, "justin", [a, b, c], asked)
+    ap.set_expiry(db, batch.approval_ids, asked + timedelta(minutes=20))
+
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
+    d = s.model_dump(mode="json")
+    assert d["approvals"]["open"] == 3
+    items = d["approvals"]["items"]
+    assert [i["code"] for i in items] == ["C1", "C2", "C5"]
+    assert "changes" not in items[0] and "changes" not in items[2]
+    row = items[1]
+    assert row["summary"] == "3 changes"
+    assert row["level"] == "L1"  # the strictest change's
+    assert datetime.fromisoformat(row["asked_at"]) == asked
+    assert datetime.fromisoformat(row["expires_at"]) == asked + timedelta(minutes=20)
+    assert row["changes"] == [
+        {"summary": f"change 2 {SECRET}", "level": "L3"},
+        {"summary": f"change 3 {SECRET}", "level": "L1"},
+        {"summary": f"widens trust: change 4 {SECRET}", "level": "L2"},
+    ]
+
+    remote = to_remote(s)
+    _check_remote(remote)
+    ra = remote.model_dump(mode="json")["approvals"]
+    assert ra.keys() == {"open", "brief"} and ra["open"] == 3
+    # R5: the batch is one brief too, like its row: strictest level, one time and expiry,
+    # and it needs the code (one change widens trust), as the gate decides.
+    assert [(b["level"], b["effect"], b["needs_code"]) for b in ra["brief"]] == [
+        ("L3", "write", False), ("L1", "write", True), ("L2", "write", False)
+    ]  # fmt: skip
+    assert datetime.fromisoformat(ra["brief"][1]["asked_at"]) == asked
+    assert datetime.fromisoformat(ra["brief"][1]["expires_at"]) == asked + timedelta(minutes=20)
+    assert SECRET not in json.dumps(ra) and "C2" not in json.dumps(ra)
+
+
+def test_a_batch_row_expires_with_its_first_expiry(db: sqlite3.Connection) -> None:
+    now = utcnow().replace(microsecond=0)
+    task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    a = _approval(db, task, 1, Level.L3, now - timedelta(minutes=5))
+    b = _approval(db, task, 2, Level.L2, now - timedelta(minutes=10))  # expires first
+    ap.insert_batch(db, "justin", [a, b], now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
+    [row] = s.model_dump(mode="json")["approvals"]["items"]
+    assert row["code"] == "C1"  # the batch's first approval's, though C2 is older
+    assert row["level"] == "L2"
+    assert datetime.fromisoformat(row["expires_at"]) == now + timedelta(minutes=20)
+
+
+def test_a_split_batch_shows_what_is_left_as_lone_rows(db: sqlite3.Connection) -> None:
+    """A batch with an approval decided on its own can't be answered as one: what is left
+    of it shows as lone rows, never as a batch under a code that no longer binds."""
+    now = utcnow().replace(microsecond=0)
+    task = task_store.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    a = _approval(db, task, 1, Level.L3, now - timedelta(minutes=5))
+    b = _approval(db, task, 2, Level.L2, now - timedelta(minutes=4))
+    c = _approval(db, task, 3, Level.L3, now - timedelta(minutes=3))
+    ap.insert_batch(db, "justin", [a, b, c], now)
+    ap.expire_one(db, a, now, reason="test")
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="0.1.0")
+    d = s.model_dump(mode="json")
+    assert d["approvals"]["open"] == 2
+    assert [(i["code"], i["summary"]) for i in d["approvals"]["items"]] == [
+        ("C2", f"change 2 {SECRET}"),
+        ("C3", f"change 3 {SECRET}"),
+    ]
+    assert all("changes" not in i for i in d["approvals"]["items"])
+
+
+def test_untold_counts_what_the_owner_has_not_heard(db: sqlite3.Connection) -> None:
+    """PER-263: ``pulse.untold`` counts every item whose latest version is untold, muted
+    sources and owed last words included, and nothing already heard. The remote tier keeps it."""
+    now = utcnow()
+    _, told = pulse.upsert(db, "github", "ci/a", "told", "normal", None, False, 3600, now)
+    pulse.mark_told(db, [told], now)
+    pulse.upsert(db, "github", "ci/b", "new", "low", None, False, 3600, now)
+    pulse.upsert(db, "linear", "x", "muted", "urgent", None, False, 3600, now)
+    notify.mute(db, "linear", now + timedelta(hours=1), by="justin")
+    pulse.upsert(db, "core", "gone", "cleared, owed", "normal", None, True, 3600, now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, version="deadbeef")
+    assert (s.pulse.open, s.pulse.untold) == (3, 3)
+    rp = to_remote(s).model_dump(mode="json")["pulse"]
+    assert (rp["open"], rp["untold"]) == (3, 3)
+    assert rp.keys() == {"open", "untold", "brief"}
+
+
 def test_empty_db(db: sqlite3.Connection) -> None:
     settings = load_settings()
     s = build_snapshot(db, settings, started_at=utcnow(), version="0.1.0")
@@ -504,10 +668,12 @@ def test_empty_db(db: sqlite3.Connection) -> None:
     assert all("reason" not in h for h in data["health"])
     assert data["tasks"] == {"by_state": {}}
     assert data["slots"] == {"used": 0, "max": settings.claude.max_concurrent}
-    assert data["runs"] == {"by_state": {}, "items": [], "brief": []}
+    assert data["runs"] == {
+        "by_state": {}, "detected": {"by_kind": {}, "high": 0}, "items": [], "brief": []
+    }  # fmt: skip
     assert data["approvals"] == {"open": 0, "items": [], "brief": []}
     assert data["questions"] == {"open": 0, "items": [], "brief": []}
-    assert data["pulse"] == {"open": 0, "items": [], "brief": []}
+    assert data["pulse"] == {"open": 0, "untold": 0, "items": [], "brief": []}
     assert data["extensions"] == []
     assert data["runner"]["set_up"] is False and data["runner"]["missing"]
     assert data["runner"]["gaps"] == 1
@@ -548,6 +714,10 @@ def _busy(db: sqlite3.Connection, now: datetime) -> None:
                      max_seconds=60)  # fmt: skip
     runs.update(db, r2.code, status="ready", pr_url=f"https://x/{SECRET}", pr_number=7)
     questions.ask(db, r1.code, "ask", f"which db {SECRET}?", options=["a", SECRET], at=now)
+    record_detected(db, r1.code, SideEffect("push", f"pushed to main {SECRET}", high=True))
+    record_detected(db, r1.code, SideEffect("http", f"POST {SECRET}"))
+    record_detected(db, r2.code, SideEffect("push", f"pushed to dev {SECRET}"))
+    kv_set(db, SESSION_KV, {"session_id": "s", "turns": 2, "pid": 1})  # the brain's session
 
     ap.insert_approval(
         db,
@@ -585,6 +755,7 @@ def _busy(db: sqlite3.Connection, now: datetime) -> None:
         ),
     )
     ext_store.record_run(db, "github", "ci-watch", at=now, outcome="failed", ok=False)
+    notify.mute(db, "github", now + timedelta(hours=1), by="justin")
     ext_store.record_run(db, "github", "morning", at=now, outcome=f"weird {SECRET}", ok=True)
     trust.add_rule(db, scope="dori", action="merge", effect="ask", created_from="chat", now=now)
     repos.add(db, "justinhe16/dori", base="main", source="test", name="dori", ci=True)
@@ -622,6 +793,8 @@ def test_busy_db(db: sqlite3.Connection) -> None:
     assert by_code["R1"]["last_note"] == f"note {SECRET}"
     assert by_code["R2"]["repo"] == "" and by_code["R2"]["pr_number"] == 7
     assert d["runs"]["items"][0]["code"] == "R1"  # active first
+    assert (by_code["R1"]["detected"], by_code["R2"]["detected"]) == (2, 1)
+    assert d["runs"]["detected"] == {"by_kind": {"push": 2, "http": 1}, "high": 1}
 
     assert d["approvals"]["open"] == 1
     assert d["approvals"]["items"][0] | {"asked_at": None, "expires_at": None} == {
@@ -634,7 +807,7 @@ def test_busy_db(db: sqlite3.Connection) -> None:
     assert d["questions"]["open"] == 1
     assert d["questions"]["items"][0]["text"] == f"which db {SECRET}?"
     assert d["questions"]["items"][0]["options"] == ["a", SECRET]
-    assert d["pulse"]["open"] == 1
+    assert d["pulse"]["open"] == 1 and d["pulse"]["untold"] == 1
     item = d["pulse"]["items"][0]
     assert (item["source"], item["key"], item["urgency"], item["state"]) == (
         "github",
@@ -645,6 +818,8 @@ def test_busy_db(db: sqlite3.Connection) -> None:
 
     [ext] = d["extensions"]
     assert (ext["name"], ext["status"], ext["health"]) == ("github", "enabled", "ok")
+    muted = datetime.fromisoformat(ext["muted_until"]) - (now + timedelta(hours=1))
+    assert abs(muted) < timedelta(seconds=1)  # stored in milliseconds
     jobs = {j["id"]: j for j in ext["jobs"]}
     assert jobs["ci-watch"]["last_outcome"] == "failed" and jobs["ci-watch"]["fail_streak"] == 1
     assert jobs["morning"]["last_outcome"] == "other"  # unknown outcomes never pass through
@@ -671,7 +846,8 @@ def test_busy_db(db: sqlite3.Connection) -> None:
          "started_at": None, "ended_at": None, "waiting_reason": None},
     ]  # fmt: skip
     assert rd["runs"]["by_state"] == {"waiting": 1, "ready": 1}
-    assert rd["runs"].keys() == {"by_state", "brief"}
+    assert rd["runs"]["detected"] == {"by_kind": {"push": 2, "http": 1}, "high": 1}
+    assert rd["runs"].keys() == {"by_state", "detected", "brief"}
     assert rd["approvals"]["open"] == 1
     assert [at(a, "asked_at", "expires_at") for a in rd["approvals"]["brief"]] == [
         {"level": "L2", "effect": "write", "needs_code": False,
@@ -683,10 +859,12 @@ def test_busy_db(db: sqlite3.Connection) -> None:
         {"run_code": "R1", "options": 2, "asked_at": None}
     ]
     assert rd["pulse"]["open"] == 1
+    assert rd["pulse"]["untold"] == 1  # PER-263: a held reporter shows remotely
     assert [at(p, "updated_at") for p in rd["pulse"]["brief"]] == [
         {"source": "github", "urgency": "urgent", "state": "new", "updated_at": None}
     ]
     assert "ci/dori" not in json.dumps(rd) and "dori" not in json.dumps(rd)
+    assert "claude_brain" in d and "claude_brain" not in rd
     assert rd["runner"] == {"set_up": True, "gaps": 0}
     assert (rd["trust_rule_count"], rd["repo_count"]) == (1, 1)
     assert rd["extensions"] == d["extensions"]

@@ -13,7 +13,7 @@ The relay (docs/dashboard-plan.md D4–D6) pushes the `remote` tier of the dashb
 The full, ordered walkthrough (Supabase, the Mini, Fly, the phone and the freeze test) is [docs/go-live.md step 15](../docs/go-live.md#15-phase-4-the-remote-dashboard-and-the-dead-man-switch). The Supabase part, in short:
 
 1. Create the project. Under Authentication: sign-ups off, TOTP on, and the one user (Auto Confirm). Note the project URL and the publishable key.
-2. Apply [`migrations/20261016000000_relay.sql`](migrations/20261016000000_relay.sql) in the SQL editor (or `supabase link` and `supabase db push`).
+2. Apply the files in [`migrations/`](migrations/) in order, in the SQL editor (or `supabase link` and `supabase db push`): [`20261016000000_relay.sql`](migrations/20261016000000_relay.sql), then [`20261021000000_relay_refuse_claude_brain.sql`](migrations/20261021000000_relay_refuse_claude_brain.sql) (PER-263; on the live project, applying it is a deploy step that needs the owner's OK).
 3. `node supabase/enroll_mfa.mjs --url https://<ref>.supabase.co --anon-key <key> --email <you>` (after `npm ci` in `dashboard/`). It prints the user id.
 4. Make the ingest token on the Mini (into the Keychain as `relay/supabase_key`) and the status token (into `fly secrets` as `RELAY_STATUS_TOKEN`), each from a shell variable so neither reaches history or the screen; only their SHA-256 hex is printed.
 5. In the SQL editor:

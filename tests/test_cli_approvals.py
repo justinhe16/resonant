@@ -209,3 +209,72 @@ def test_missing_store_is_not_created(resonant_home: Path, args: list[str]) -> N
     assert code == EX_TEMPFAIL
     assert "does not exist" in err
     assert not (resonant_home / "resonant.db").exists()
+
+
+# --- approve --always (PER-261) ----------------------------------------------------------
+
+
+def offered(db: sqlite3.Connection, *, scope: str | None = "linear") -> str:
+    """A waiting task with one pending approval whose prompt offered ``yes always`` (an L2
+    chat tool's standing allow, or with ``scope=None`` a worker's trust check)."""
+    task_id = repo.insert_task(db, NewTask(kind="chat", runner="local", priority=1))
+    now = utcnow()
+    approval_id = ap.insert_approval(
+        db,
+        ap.NewApproval(
+            task_id=task_id,
+            intent_hash="h-always",
+            tool="save_issue",
+            effect=Effect.WRITE,
+            level=Level.L2,
+            summary="linear: save issue id=RES-1",
+            approvers=("justin",),
+            code="K4",
+            expires_at=now + timedelta(minutes=30),
+            extension="linear",
+            requested_by="justin",
+            allow_always=True,
+            always_scope=scope,
+            always_action="tool:linear.save_issue" if scope else None,
+        ),
+        now,
+    )
+    repo.set_status(db, task_id, "waiting", wait_reason="approval")
+    db.commit()
+    return approval_id
+
+
+def test_approve_always_saves_the_offered_rule(db: sqlite3.Connection) -> None:
+    from resonant.store import trust as trust_store
+
+    approval_id = offered(db)
+    code, out, err = run("approve", "K4", "--always")
+    assert (code, err) == (0, "")
+    assert "approved (yes always); task woken" in out
+    assert "rule added: don't ask before running linear.save_issue in linear (rule 1)" in out
+    a = get(db, approval_id)
+    assert (a.status, a.always) == ("approved", True)
+    rules = [(r.scope, r.action, r.effect) for r in trust_store.list_rules(db)]
+    assert rules == [("linear", "tool:linear.save_issue", "allow")]
+    (row,) = db.execute("SELECT detail FROM audit_log WHERE action = 'approval.resolve'").fetchall()
+    assert json.loads(row["detail"])["always"] is True
+
+
+def test_approve_always_on_a_trust_check_records_it_without_a_rule(
+    db: sqlite3.Connection,
+) -> None:
+    approval_id = offered(db, scope=None)
+    code, out, _ = run("approve", approval_id, "--always")
+    assert code == 0 and "rule added" not in out
+    assert get(db, approval_id).always is True
+
+
+def test_approve_always_is_refused_where_not_offered(
+    db: sqlite3.Connection, gate: PolicyGate
+) -> None:
+    approval_id = ask(db, gate)  # an L2 change with no standing allow on offer
+    code, _, err = run("approve", approval_id, "--always")
+    assert code == 1 and "not approved: it doesn't offer yes always" in err
+    assert get(db, approval_id).status == "pending"
+    wipe = ask(db, gate, WIPE)  # L1: never
+    assert run("approve", wipe, "--always")[0] == 1

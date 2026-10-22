@@ -19,6 +19,7 @@
   "slots": { "used": 2, "max": 5 },
   "runs": {
     "by_state": { "running": 1, "waiting": 1, "ready": 1, "merged": 6, "failed": 1 },
+    "detected": { "by_kind": { "push": 1, "http": 1, "merge": 1 }, "high": 1 },
     "brief": [
       {
         "code": "R12",
@@ -76,6 +77,7 @@
   },
   "pulse": {
     "open": 3,
+    "untold": 2,
     "brief": [
       {
         "source": "core",
@@ -102,6 +104,7 @@
       "name": "github",
       "status": "enabled",
       "health": "ok",
+      "muted_until": null,
       "jobs": [
         {
           "id": "watch",
@@ -123,6 +126,7 @@
       "name": "weather",
       "status": "enabled",
       "health": "degraded",
+      "muted_until": "2026-10-16T12:00:00+00:00",
       "jobs": [
         {
           "id": "forecast",
@@ -133,7 +137,7 @@
         }
       ]
     },
-    { "name": "notes-sync", "status": "disabled", "health": "unknown", "jobs": [] }
+    { "name": "notes-sync", "status": "disabled", "health": "unknown", "muted_until": null, "jobs": [] }
   ],
   "runner": { "set_up": true, "gaps": 0 },
   "brain_activity": {
