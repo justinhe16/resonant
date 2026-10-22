@@ -932,18 +932,25 @@ def test_limit_takes_the_first_cases(tmp_path: Path) -> None:
 # --- the mycelium fixture: the owner's money, read-only ---------------------------------------
 
 # The real extension's tools (mycelium/resonant-extension/resonant.yaml) and their args.
-MYCELIUM_TOOLS = {
-    "net_worth": [],
-    "account_balances": [],
-    "recent_transactions": ["days"],
-    "spending_summary": ["period"],
-    "search_transactions": ["period", "query"],
-    "merchant_totals": ["limit", "period"],
+MYCELIUM_TOOLS: dict[str, dict[str, str]] = {
+    "net_worth": {},
+    "account_balances": {},
+    "recent_transactions": {"days": "integer"},
+    "spending_summary": {"period": "string"},
+    "search_transactions": {"query": "string", "period": "string"},
+    "merchant_totals": {"period": "string", "limit": "integer"},
+}
+MYCELIUM_RUN = {  # the real CLI's flags (--x={x} keeps a value starting with "-" a value)
+    "recent_transactions": "--days {days}",
+    "spending_summary": "--period {period}",
+    "search_transactions": "--query={query} --period={period}",
+    "merchant_totals": "--period={period} --limit={limit}",
 }
 
 
 def test_the_mycelium_fixture_mirrors_the_real_extension() -> None:
-    """Same tool names and args as the real manifest, every one an L0 read (the real one has
+    """Same tool names, args (with types) and flags as the real manifest (checked by hand:
+    CI can't read mycelium's repo), every one an L0 read (the real one has
     no writes and no approvers), and a default for each so an unseeded call answers in the
     real CLI's shape with nothing in it, never a number."""
     import yaml
@@ -954,7 +961,15 @@ def test_the_mycelium_fixture_mirrors_the_real_extension() -> None:
     fx = te.FIXTURES["mycelium"]
     m = Manifest.model_validate(yaml.safe_load(fx.manifest))
     specs = {s.name: s for s in m.tool_specs()}
-    assert {n: sorted(s.args_schema["required"]) for n, s in specs.items()} == MYCELIUM_TOOLS
+    args = {
+        n: {k: v["type"] for k, v in s.args_schema["properties"].items()} for n, s in specs.items()
+    }
+    assert args == MYCELIUM_TOOLS
+    assert all(
+        sorted(s.args_schema["required"]) == sorted(MYCELIUM_TOOLS[n]) for n, s in specs.items()
+    )
+    tools = yaml.safe_load(fx.manifest)["tools"]
+    assert all(tools[n]["run"].endswith(flags) for n, flags in MYCELIUM_RUN.items())
     assert all(s.effect is Effect.READ and s.effective_level is Level.L0 for s in specs.values())
     assert set(fx.defaults) == set(MYCELIUM_TOOLS)
     assert all(d["untrusted"] is True for d in fx.defaults.values())
@@ -1016,3 +1031,13 @@ def test_a_mycelium_result_is_outside_content(tmp_path: Path) -> None:
     )
     assert r.correct, r.failures
     assert r.outcome.executed_writes == []
+
+
+def test_a_synthetic_row_loads_and_must_say_so_with_a_bool(tmp_path: Path) -> None:
+    """``synthetic`` marks a hand-written owner row (not drafted from a text); the eval
+    ignores it, like ``note`` and ``draft``."""
+    row = {"id": "s", "category": "chat", "text": "hey", "synthetic": True, "review": True}
+    (case,) = load_set(write_set(tmp_path / "s.jsonl", [row]))
+    assert case.review
+    with pytest.raises(EvalSetError, match="'synthetic' must be true or false"):
+        load_set(write_set(tmp_path / "b.jsonl", [{**row, "synthetic": "yes"}]))

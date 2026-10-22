@@ -119,6 +119,7 @@ One JSON object per line (blank lines skipped):
 - `review` (optional, default `false`): `true` on a drafted row you haven't checked yet. Such a row is listed under "awaiting review" by id and line, and is neither run nor graded until you set it to `false`. A set where every row still awaits review exits 2.
 - `note` (optional): free text for you, ignored by the eval. A drafted row uses it to say what can't be replayed faithfully.
 - `draft` (optional): where a drafted row came from (`task`, `at`, `status`, `reply`: the reply you got then). Ignored by the eval.
+- `synthetic` (optional, `true` or `false`): a row written by hand rather than drafted from one of your texts (its `draft.reply` is then a suggested good answer). Ignored by the eval.
 - `script` (for `--model scripted`): a list of rounds. A list of `[tool, args]` pairs is one round of tool calls, a string is the final reply. `{root}` is the world root and `{in:N}` the time N minutes from now (for `add_reminder`).
 
 The whole row, world included, is checked when the set loads: a load error names the line, never the text.

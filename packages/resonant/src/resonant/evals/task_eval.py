@@ -212,7 +212,7 @@ EXPECT_KEYS = frozenset(
 RUN_STATUSES: tuple[str, ...] = get_args(run_store.Status)
 ROW_KEYS = frozenset(
     {"id", "category", "text", "history", "world", "expect", "script", "note", "triage", "claude",
-     "review", "draft"}
+     "review", "draft", "synthetic"}
 )  # fmt: skip
 Route = Literal["triage", "local", "claude"]
 ROUTES: tuple[Route, ...] = get_args(Route)
@@ -573,6 +573,8 @@ def parse_case(row: Mapping[str, Any], line: int) -> TaskCase:
         raise ValueError("'review' must be true or false")
     if row.get("draft") is not None and not isinstance(row.get("draft"), dict):
         raise ValueError("'draft' must be an object")
+    if not isinstance(row.get("synthetic", False), bool):
+        raise ValueError("'synthetic' must be true or false")
     return TaskCase(
         line=line,
         id=cid,
@@ -739,7 +741,10 @@ tools:
     ),
     # The owner's money (mycelium's resonant-extension): every tool an L0 read and every
     # result outside content (bank and merchant names), so it taints the task as the real one
-    # does. The defaults are the real CLI's shapes with nothing in them; a row seeds numbers.
+    # does (an extension result taints the task; ``untrusted`` only says so, as the real CLI
+    # does). The defaults are the real CLI's main keys with nothing in them; a row seeds
+    # numbers. CI can't read mycelium's repo: check the tools against its resonant.yaml by
+    # hand when it changes (``test_the_mycelium_fixture_mirrors_the_real_extension``).
     "mycelium": Fixture(
         """\
 name: mycelium
