@@ -5,7 +5,8 @@ into a running summary per principal.
 thread, in true order with the real speaker, built from the stores that already hold it:
 the owner's messages (``events``, task-less ones such as an approval reply "Yes M6" included),
 Resonant's replies (``checkpoint.reply``/``fast_reply``/``early_answer``), what Resonant texted
-on its own (``system_texts``: approval prompts, results, run reports; a result that is also
+on its own (``system_texts``: approval prompts, results, run reports, and since PER-274 the
+hourly pulse and the briefing, shown whole; a result that is also
 the reply of the task that waited for it is shown once, where it was sent) and Claude's
 answers (``checkpoint.claude_reply`` at ``claude_reply_at``). Both brains read it: qwen's
 history (``replayed``) as turns, the Claude brain's session (it can't be rewritten) as a
@@ -330,6 +331,9 @@ class History:
     untrusted: str | None = None
     # The turn's own hops: the fewest turns between it and that outside text (PER-245).
     hops: int = 0
+    # PER-274: when the pulse and briefing texts it shows were sent, which is the told_at of
+    # the items they told (``pulse_job.deliver``): "Already told" leaves those items out.
+    told: frozenset[datetime] = frozenset()
 
 
 def history_messages(
@@ -350,7 +354,8 @@ Speaker = Literal["owner", "resonant", "system", "claude"]
 class Said:
     """One item of the transcript. ``gap`` is the index of the exchange it follows (-1: before
     the first one shown); ``outside``: a system text from a tainted task; ``exchange``: the
-    exchange it belongs to (its message, its reply, the Claude answer to it)."""
+    exchange it belongs to (its message, its reply, the Claude answer to it); ``kind``: a
+    system text's (``system_texts.Kind``)."""
 
     speaker: Speaker
     text: str
@@ -358,6 +363,7 @@ class Said:
     gap: int
     outside: bool = False
     exchange: Exchange | None = None
+    kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -463,10 +469,10 @@ def thread(
         by_gap.setdefault(gap_of(t.sent_at), []).append(t)
     for g, found in by_gap.items():
         for t in found[-SYSTEM_PER_GAP:]:
-            add(Said("system", t.text, t.sent_at, g, t.outside))
+            add(Said("system", t.text, t.sent_at, g, t.outside, kind=t.kind))
     for t in moved.values():
         if end is None or t.sent_at <= end:
-            add(Said("system", t.text, t.sent_at, gap_of(t.sent_at), t.outside))
+            add(Said("system", t.text, t.sent_at, gap_of(t.sent_at), t.outside, kind=t.kind))
     owner_by_gap: dict[int, list[tuple[datetime, str]]] = {}
     for g, event, body in owner:
         owner_by_gap.setdefault(g, []).append((event.occurred_at, body))
@@ -510,7 +516,8 @@ def replayed(
     oldest first: the owner's messages ``user`` (wrapped), what Resonant said and texted
     ``assistant``, Claude's answers as ``user`` data. ``untrusted`` and ``hops``: the next
     turn's taint, from the item nearest the outside text within ``window`` turns (the
-    newest on a tie)."""
+    newest on a tie). ``told``: when the pulse and briefing texts shown were sent (PER-274;
+    each is shown whole)."""
     messages: list[ChatMessage] = []
     summary = store.get_summary(conn, principal)
     if summary is not None and summary.summary.strip():
@@ -527,11 +534,14 @@ def replayed(
             reply = clip(drop_controls(s.text), REPLY_TURN_CHARS)
             messages.append({"role": "assistant", "content": reply})
         elif s.speaker == "system":
-            messages.append({"role": "assistant", "content": flat(s.text, REPLY_TURN_CHARS)})
+            limit = max(REPLY_TURN_CHARS, system_texts.max_chars(s.kind))
+            messages.append({"role": "assistant", "content": flat(s.text, limit)})
         else:
             messages.append(claude_turn(s.text))
     untrusted, hops = _taint(found, window)
-    return History(messages, untrusted, hops)
+    told = frozenset(s.at for s in found.said if s.speaker == "system"
+                     and s.kind in system_texts.LONG_KINDS)  # fmt: skip
+    return History(messages, untrusted, hops, told)
 
 
 def _taint(found: Thread, window: int) -> tuple[str | None, int]:
@@ -656,7 +666,8 @@ def since_last(
         if s.speaker == "claude" and handed:
             continue  # the session wrote it itself
         when = s.at.astimezone(tz).strftime("%H:%M")
-        text = flat(s.text, SINCE_LINE_CHARS)
+        long = s.speaker == "system" and s.kind in system_texts.LONG_KINDS  # PER-274: whole
+        text = flat(s.text, system_texts.LONG_MAX if long else SINCE_LINE_CHARS)
         if s.speaker == "owner":
             lines.append(f"- {when} Owner: {text}")
         elif s.speaker == "system":

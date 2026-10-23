@@ -53,6 +53,16 @@ those items told, compare-and-set, so an item that arrived since stays pending. 
 that is done makes the rerun a ``duplicate``. A new key first finishes any other unsent record
 (under 2 hours old, items unchanged; else it is abandoned) the same way (a run that raised
 after its send is not rerun: the scheduler consumes its due time). Records are pruned after 2 days.
+
+What was sent is a system text (PER-274, ``store.system_texts``, kind ``pulse`` or ``briefing``
+from the key): recorded in the same transaction as the items' told marks, ``ref`` = the dedupe
+key (a rerun or resend records nothing new), the text as sent (Claude's or the code-built one,
+without a bare ``No action needed.``), and ``now`` as its time, which is the items' ``told_at``,
+so the brains' "Already told" can leave out what a text shown in the transcript said.
+``outside`` (decided when the text is built and kept in the record; a record without it
+counts as outside): the text lists an item that isn't a code-built core notice (a worker's
+item, the rollup's PR lines, a worker question, an extension's item), or a briefing names a
+worker; the turn that sees it is tainted, as after a run's outcome.
 """
 
 from __future__ import annotations
@@ -71,6 +81,7 @@ from resonant.executor import CallContext
 from resonant.extensions import notify, rollup
 from resonant.extensions.pulse import render_item
 from resonant.store import pulse as store
+from resonant.store import system_texts
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.tools.when import format_due
 
@@ -96,6 +107,7 @@ UNSENT_MAX_AGE = timedelta(hours=2)  # an unsent record older than this is aband
 ITEM_TTL_S = 24 * 3600
 WORKER_PREFIX = "run/"
 WORKERS_HEADER = "Workers:"
+NOTICE_PREFIX = "notice/"  # a brain notice (``brain/notices.py``): code-built, not outside
 
 
 def schedule() -> str:
@@ -450,6 +462,17 @@ def _rec_at(rec: Any) -> datetime | None:
     return at if at.utcoffset() is not None else None
 
 
+def is_outside(items: Sequence[store.Item]) -> bool:
+    """Whether a text listing ``items`` carries outside content (PER-274): any item but a
+    core notice (a worker's item or question, the rollup's PR lines, an extension's item)."""
+    return any(i.source != CORE or not i.key.startswith(NOTICE_PREFIX) for i in items)
+
+
+def text_kind(key: str) -> system_texts.Kind:
+    """The system text kind of a delivery's dedupe key: ``briefing:…`` or the pulse's."""
+    return "briefing" if key.startswith("briefing:") else "pulse"
+
+
 def prune_inflight(conn: sqlite3.Connection, now: datetime) -> None:
     """Drop delivery records (done, or never finished) older than ``INFLIGHT_KEEP``, and
     any whose ``at`` is corrupt."""
@@ -473,6 +496,7 @@ async def deliver(
     build: Callable[[], tuple[str, list[store.Item]] | None],
     *,
     rewrite: Callable[[str, list[store.Item]], Awaitable[str]] | None = None,
+    outside: Callable[[list[store.Item]], bool] = is_outside,
 ) -> tuple[str, int]:
     """Send one message to ``owner`` exactly once for dedupe key ``key``.
 
@@ -485,6 +509,9 @@ async def deliver(
     before the record is stored, only for a new key, and gets the code-built text and the
     items. It may return the text unchanged; if it raises, the code-built text is sent. A
     cancel during it leaves no record and sends nothing.
+
+    ``outside`` says from the listed items whether the text carries outside content (kept in
+    the record for the system text, PER-274; default :func:`is_outside`).
     """
     rkey = INFLIGHT + key
     raw: Any = kv_get(conn, rkey)
@@ -508,6 +535,7 @@ async def deliver(
             "sent": False,
             "at": iso(now),
             "voice": voiced,
+            "outside": outside(listed),
         }
         with atomic(conn):
             kv_set(conn, rkey, rec)
@@ -524,14 +552,21 @@ async def _send_recorded(
     rec: dict[str, Any],
     now: datetime,
 ) -> int:
-    """Send the stored text under its own dedupe key and mark exactly its items told."""
+    """Send the stored text under its own dedupe key, mark exactly its items told and record
+    it as a system text (PER-274, once per key)."""
+    # late: ``resonant.brain`` imports the router, which imports this module
+    from resonant.brain.voice import record_text
+
     recorded = cast(list[list[str]], rec["items"])
-    await channel.send(owner, str(rec["text"]), dedupe_key=key)
+    text = str(rec["text"])
+    await channel.send(owner, text, dedupe_key=key)
     with atomic(conn):
         for source, ikey, fp in recorded:
             item = store.get(conn, source, ikey)
             if item is not None:
                 store.mark_told(conn, [replace(item, fingerprint=fp)], now)
+        system_texts.record(conn, owner, text_kind(key), record_text(text), ref=key, now=now,
+                            outside=rec.get("outside") is not False)  # fmt: skip
         kv_set(conn, INFLIGHT + key, {**rec, "sent": True})
     return len(recorded)
 
@@ -726,6 +761,7 @@ __all__ = [
     "dedupe_key",
     "deliver",
     "fit_lines",
+    "is_outside",
     "item_line",
     "manual_dedupe_key",
     "open_summary",

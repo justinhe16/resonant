@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -439,11 +439,14 @@ def known_notes(
     now: datetime,
     tz: str,
     limit: int = KNOWN_MAX,
+    shown: Collection[datetime] = (),
 ) -> list[str]:
     """PER-270: what the owner already knows, newest told first, one short line each:
     ``title (told 17:33; they replied)``. The pulse items texted in the last ``KNOWN_HOURS``,
     leaving out approvals (they stay under "Waiting on the owner") and runs that are still
-    running. Only the owner gets any."""
+    running. Only the owner gets any. ``shown`` (PER-274, ``History.told``): when the pulse
+    and briefing texts in the turn's transcript were sent; an item told by one of them (its
+    ``told_at``) is left out, since the transcript already says it."""
     if not owner:
         return []
     zone = ZoneInfo(tz)
@@ -455,7 +458,7 @@ def known_notes(
     for item in items:
         if item.key.startswith("approval/") or (item.key.startswith("run/") and not item.cleared):
             continue
-        if item.told_at is None:
+        if item.told_at is None or item.told_at in shown:
             continue
         label = "" if item.source == "core" else f"[{_clean(item.source, 40)}] "
         replied = "; they replied" if item.acked_at is not None else ""

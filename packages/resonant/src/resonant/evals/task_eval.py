@@ -17,8 +17,8 @@
   ``history`` (PER-270: the owner's thread, oldest first, two minutes apart): ``{user, reply}``
   an exchange, ``{user}`` a message that started no task (an approval reply such as "Yes
   M6"), ``{system, kind?, outside?}`` a text Resonant sent on its own (``kind``: ``run``
-  (default), ``approval`` or ``result``; ``outside``: it came from a tainted task, default
-  true for a run text).
+  (default), ``approval``, ``result``, ``pulse`` or ``briefing``; ``outside``: it came from
+  a tainted task or outside content, default true for a run text).
 
   ``world``: ``repos`` (``{name, slug?, path?, base?, commits?}``; the dir is created, and
   with ``commits`` (``{subject, days_ago?}``, oldest first) it is a git checkout with that
@@ -338,7 +338,7 @@ class Expect:
     reason: str | None = None  # a voice row: the voice's reason starts with this
 
 
-SystemKind = Literal["approval", "result", "run"]
+SystemKind = system_texts.Kind  # PER-274: pulse and briefing too
 
 
 @dataclass(frozen=True)

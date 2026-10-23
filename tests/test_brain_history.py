@@ -46,7 +46,7 @@ def seed(db: sqlite3.Connection, n: int, *, start: int = 0) -> list[str]:
 
 
 def test_migration_015(db: sqlite3.Connection) -> None:
-    assert schema_version(db) == latest_version() == 23
+    assert schema_version(db) == latest_version() == 24
     cols = {r["name"] for r in db.execute("PRAGMA table_info(brain_summaries)")}
     assert cols == {"principal", "summary", "through_event_id", "folded", "source", "updated_at"}
 
@@ -240,7 +240,7 @@ def test_migration_017_starts_summaries_over(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == 23
+    assert schema_version(conn) == 24
     assert store.get_summary(conn, OWNER) is None
     conn.close()
 
@@ -400,7 +400,7 @@ def test_migration_018_starts_summaries_over(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == 23
+    assert schema_version(conn) == 24
     assert store.get_summary(conn, OWNER) is None
     conn.close()
 

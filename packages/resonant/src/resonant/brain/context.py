@@ -254,7 +254,8 @@ def build_context(
         since = last_talked(conn, principal, before_event_id=event_id, source=source)
         if since is not None:
             notes = since_notes(conn, owner=owner, since=since, now=now, tz=settings.timezone)
-        known = known_notes(conn, owner=owner, now=now, tz=settings.timezone)
+        known = known_notes(conn, owner=owner, now=now, tz=settings.timezone,
+                            shown=history.told)  # fmt: skip
     briefing = gather_briefing(
         conn,
         settings,
