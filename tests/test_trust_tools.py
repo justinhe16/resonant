@@ -84,6 +84,24 @@ async def test_add_list_remove(db: sqlite3.Connection, handlers: dict[str, Any])
     }
 
 
+async def test_a_shell_allow_the_gate_never_applies_is_refused(
+    db: sqlite3.Connection, handlers: dict[str, Any]
+) -> None:
+    # only git-*/gh-* shell verbs take a standing allow (trust.tools.SHELL_VERB): a rule for
+    # bc or echo would be saved and never match, so the prompt would keep coming
+    for action in ("tool:shell.bc", "tool:shell.echo", "Tool:Shell.compound",
+                   "tool:shell.git-push-force"):  # fmt: skip
+        with pytest.raises(ToolFailed, match="only git and gh shell commands"):
+            await handlers["allow_trust_rule"]({"scope": "*", "action": action})
+    assert store.list_rules(db) == []
+    ok = await handlers["allow_trust_rule"]({"scope": "r", "action": "tool:shell.git-push"})
+    assert ok["action"] == "tool:shell.git-push"
+    asked = await handlers["add_trust_rule"](
+        {"scope": "*", "action": "tool:shell.bc", "effect": "ask"}
+    )
+    assert asked["effect"] == "ask"  # tightening is never refused
+
+
 async def test_add_only_tightens(handlers: dict[str, Any]) -> None:
     for effect in ("allow", "notify_digest"):
         with pytest.raises(ToolFailed, match="effect"):

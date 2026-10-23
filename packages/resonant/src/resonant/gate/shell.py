@@ -18,7 +18,10 @@ directory (``git -C <dir>`` does the same for that segment). Then:
   process substitution, no heredoc, no redirect except to ``/dev/null``, no ``VAR=value``
   prefix, and every path it names (and its working directory) inside the read roots and
   off the deny list. A read that names a path outside them is refused, never asked: the
-  same rule as the read tools.
+  same rule as the read tools. Calculator math is a read too: ``bc`` with only ``-l``,
+  ``-q``, ``-s``, ``-w`` and ``-e``/``--expression`` (no file, no ``-f``, no ``<``), alone
+  or fed by ``echo``/``printf`` (``echo "1+1" | bc``); a pipe into anything that isn't a
+  read (``echo x | sh``) is a compound write as before.
 - **never** (refused outright, never asked): ``resonant secret ...``, ``resonant ext
   add|update``, ``security`` (the login keychain), a write under ``RESONANT_HOME`` (except
   the brain's own scratch dir), ``kill``/``pkill``/``killall`` of the daemon (or of every
@@ -36,7 +39,8 @@ directory (``git -C <dir>`` does the same for that segment). Then:
 
 The verb (``git-push``, ``gh-pr-create``, ``edit``, ``compound``...) and the repo name are in
 the call's args: a standing allow is ``allow tool:shell.<verb> in <repo>``
-(``trust.tools.StandingAllows``).
+(``trust.tools.StandingAllows``), for ``git-*`` and ``gh-*`` verbs only and never for a
+tainted call (``allow_trust_rule`` refuses any other ``tool:shell`` verb).
 
 Classification is conservative by design: when in doubt a command is a write, and a write
 that might be compound is L2. Nothing here runs a command (git facts are read from the
@@ -159,9 +163,13 @@ _LAUNCHCTL_STOP = frozenset({"bootout", "kill", "stop", "remove", "unload", "dis
 # Reads: the command's first word (and for git and gh, its subcommand).
 _PLAIN_READS = frozenset({
     "ls", "wc", "cat", "head", "tail", "find", "rg", "grep", "du", "df", "ps", "date",
-    "which", "pwd", "echo", "true",
+    "which", "pwd", "echo", "printf", "true",
 })  # fmt: skip
-_NO_PATHS = frozenset({"ps", "date", "which", "pwd", "echo", "true", "df"})
+_NO_PATHS = frozenset({"ps", "date", "which", "pwd", "echo", "printf", "true", "df", "bc"})
+# ``bc``: a calculator read only with these flags (no file arguments, no ``-f``/``--file``):
+# the expression comes from ``-e``/``--expression`` or a pipe (``echo "1+1" | bc``).
+_BC_FLAGS = frozenset({"-l", "--mathlib", "-q", "--quiet", "-s", "--standard", "-w", "--warn"})
+_BC_SHORT = re.compile(r"-[lqsw]*(e.*)?")
 _GIT_READS = frozenset({
     "log", "show", "diff", "status", "rev-list", "blame", "ls-files", "rev-parse",
     "describe", "shortlog", "branch", "remote", "stash", "tag",
@@ -680,8 +688,12 @@ class ShellPolicy:
             return len(argv) >= 3 and argv[2] in _GH_READS.get(argv[1], frozenset())
         if os.path.basename(word) == "resonant":
             return argv[1:] == ["status"]
+        if word == "bc":
+            return _bc_read(argv[1:]) and not any(op == "<" for op, _ in seg.redirects)
         if word not in _PLAIN_READS:
             return False
+        if word == "printf":  # ``-v var`` assigns a shell variable
+            return not any(a.startswith("-v") for a in argv[1:2])
         if word == "find":
             return not any(a.startswith(_FIND_WRITES) for a in argv[1:])
         if word == "rg":
@@ -844,6 +856,28 @@ def _git_read(argv: list[str]) -> bool:
     if sub == "tag":
         return not plain or "-l" in rest or "--list" in rest
     return True
+
+
+def _bc_read(args: list[str]) -> bool:
+    """``bc`` args that only compute: known flags and ``-e``/``--expression`` values, no
+    file to read (a positional word, ``-f``/``--file``) and nothing else."""
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in _BC_FLAGS:
+            continue
+        if a == "--expression":
+            skip = True
+            continue
+        if a.startswith("--expression="):
+            continue
+        m = _BC_SHORT.fullmatch(a)
+        if m is None or a == "-":
+            return False  # a file, ``-f``, ``-i`` or anything unknown
+        skip = m.group(1) == "e"  # ``-le`` takes the next word; ``-e1+1`` holds it
+    return not skip
 
 
 def _flags(rest: list[str]) -> tuple[frozenset[str] | None, list[str]]:
