@@ -55,6 +55,9 @@ exactly.
 On demand (P3-14's ``/ext run core/briefing``): ``run_briefing_now(deps)``. It is keyed
 ``briefing:manual:<local date>:<HHMM>``, so it sends at most once a minute and never uses up
 the scheduled one.
+
+The text that went out is a system text, kind ``briefing`` (PER-274, ``pulse_job.deliver``),
+so both brains read it in the transcript as Resonant's own turn.
 """
 
 from __future__ import annotations
@@ -72,9 +75,11 @@ from resonant import killswitch
 from resonant.executor import CallContext
 from resonant.extensions import notify, rollup
 from resonant.extensions.pulse_job import (
+    NOTICE_PREFIX,
     deliver,
     fit_entries,
     fit_lines,
+    is_outside,
     is_worker_item,
     item_line,
     prune_inflight,
@@ -98,7 +103,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 # ``brain.notices.KEY_PREFIX`` (importing it here is a cycle through the router)
-NOTICE_PREFIX = "notice/"
 
 JOB_ID = "briefing"
 CATCHUP = timedelta(hours=3)
@@ -451,7 +455,13 @@ async def send_briefing(
         facts = briefing_facts(conn, b, listed, text)
         return text if facts is None else (await voice.write(facts, text, ref=key)).text
 
-    await deliver(conn, channel, owner, key, now, build, rewrite=rewrite if voice else None)
+    # PER-274: its system text is outside content when it names a worker (the Workers lines,
+    # running ones included) or lists an extension's item; reminders and counts are ours.
+    def outside(listed: list[pulse_store.Item]) -> bool:
+        return bool(b.workers) or is_outside(listed)
+
+    await deliver(conn, channel, owner, key, now, build, rewrite=rewrite if voice else None,
+                  outside=outside)  # fmt: skip
     rec: Any = kv_get(conn, "pulse.inflight:" + key)
     text = str(cast(dict[str, Any], rec)["text"]) if isinstance(rec, dict) else ""
     return {
@@ -532,6 +542,7 @@ __all__ = [
     "MAX_CHARS",
     "NOTHING",
     "NOTHING_LINES",
+    "NOTICE_PREFIX",
     "Briefing",
     "briefing_facts",
     "briefing_job",
