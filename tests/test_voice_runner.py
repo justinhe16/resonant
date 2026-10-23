@@ -380,3 +380,27 @@ async def test_the_default_login_check_reaches_the_owner_login(
     out = await v.write(facts(), FALLBACK)
     assert out.reason == "not_set_up"  # the probe says "not logged in"
     assert never_the_real_claude_login == [("claude-cmd", str(tmp_path / "home"))]
+
+
+async def test_without_claude_the_voice_reads_no_secret_and_probes_no_login(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """No ``claude`` to run: not_set_up before the Keychain or the login probe is touched."""
+    r = Rig(tmp_path, db)
+    touched: list[str] = []
+
+    async def probe() -> bool:
+        touched.append("login")
+        return True
+
+    class Spy(SecretStore):
+        async def get(self, ref: str) -> str:
+            touched.append(ref)
+            return await super().get(ref)
+
+    v = ClaudeVoice(
+        db, cfg=VoiceConfig(), secrets=Spy(r.keychain), cwd=tmp_path / "v", login_check=probe
+    )  # no claude_cmd: default_claude_cmd is patched to None by conftest
+    out = await v.write(facts(), FALLBACK)
+    assert (out.text, out.used, out.reason) == (FALLBACK, False, "not_set_up")
+    assert touched == [] and not (tmp_path / "v").exists()

@@ -319,6 +319,9 @@ class ClaudeVoice:
             return self._unused(fallback, "limited")
         if cfg.daily_cap and self.calls_today() >= cfg.daily_cap:
             return self._unused(fallback, "cap")
+        head = self._head()
+        if head is None:  # no claude: no Keychain read, no login probe, no process
+            return self._unused(fallback, "not_set_up")
         try:
             secrets = await load_runner_secrets(self.secrets, claude=False)
         except SecretError:
@@ -329,8 +332,7 @@ class ClaudeVoice:
             and await self._login_ok()
         )
         source = auth_source(secrets, login_ok=login)
-        head = self._head()
-        if source is None or head is None:
+        if source is None:
             return self._unused(fallback, "not_set_up")
         env = status_env(self.home)
         if source == "token" and secrets.claude_token:
