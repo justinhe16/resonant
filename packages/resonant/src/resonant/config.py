@@ -695,7 +695,7 @@ class VoiceConfig(_Section):
         default_factory=lambda: ["outcome", "pulse", "briefing"]
     )
     # One call's wall clock; past it the call is killed and the code-built text goes out.
-    timeout_s: float = Field(default=25.0, gt=0, le=40)
+    timeout_s: float = Field(default=25.0, gt=0, le=30)
     # Calls a day (settings.timezone), separate from ``ask_claude.daily_cap``. 0: no cap.
     daily_cap: int = Field(default=40, ge=0, le=500)
     # The prose's length; the whole text (tail and closing line included) may run 400 over.

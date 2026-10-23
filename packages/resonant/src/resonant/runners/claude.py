@@ -3473,8 +3473,9 @@ class ClaudeRunner:
             self.reports.told(item)
         if warn:
             clear_alerts(self.conn, run.code)
-        # PER-268: what the owner was told, for the brains, without the worker's own words
-        # (its summary, its did: notes). Still outside content as list_runs is (the ask may
+        # PER-268: what the owner was told, for the brains. Code-built, it leaves out the
+        # worker's own words (summary, did: notes); a voiced text (PER-273) paraphrases the
+        # summary. Still outside content as list_runs is (the ask may
         # be a tainted turn's, a failure quotes GitHub, flagged paths are the worker's): it
         # taints the turn that sees it, as the run tools do.
         bare = end_parts(replace(run, summary=None), ci, no_ci=no_ci, upstream=upstream,

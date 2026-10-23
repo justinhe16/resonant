@@ -56,7 +56,7 @@ from resonant.brain import voice
 from resonant.brain.voice import Facts, VoiceResult
 from resonant.config import VoiceConfig
 from resonant.redact import Redactor
-from resonant.runner.claude_auth import auth_source, status_env
+from resonant.runner.claude_auth import LoginCheck, auth_source, status_env
 from resonant.runners import reaper
 from resonant.runners.ask import usage_of
 from resonant.runners.claude import LimitHit, read_lines, usage_limit, wake_time
@@ -152,7 +152,8 @@ class ClaudeVoice:
     """The :class:`~resonant.brain.voice.Voice` that asks Claude (see the module docstring).
 
     ``claude_cmd``/``call``/``login_check`` are seams for tests; by default the ``claude``
-    on the PATH, a real subprocess and the owner's login check (``runner.guard: off`` only).
+    on the PATH, a real subprocess and ``LoginCheck`` over it (the owner's login, used only
+    with ``runner.guard: off`` and no token or key).
     ``home`` is the ``HOME`` the call runs with (the owner's, for their login)."""
 
     def __init__(
@@ -181,7 +182,9 @@ class ClaudeVoice:
         self.tz = ZoneInfo(timezone)
         self._claude_cmd = None if claude_cmd is None else tuple(claude_cmd)
         self.home = home or Path.home()
-        self._login_check = login_check
+        self._login_check: Callable[[], Awaitable[bool]] = login_check or LoginCheck(
+            self._head, self.home
+        )
         self._call: Call = call or self.spawn
         self.clock = clock
         self.poll_s = poll_s
@@ -340,7 +343,8 @@ class ClaudeVoice:
         calls = self._count()  # before the spawn: a crash can't make it free
         out = await self._call(argv, env, self.cwd, prompt, cfg.timeout_s)
         result = self._finish(out, facts, fallback, Redactor(secrets.values()))
-        self._keep(ref, digest, result)
+        if result.used or result.reason.startswith("guard:"):  # not a transient trouble
+            self._keep(ref, digest, result)
         with atomic(self.conn):
             audit(
                 self.conn,
@@ -381,8 +385,6 @@ class ClaudeVoice:
                 return VoiceResult(fallback, False, reason.get(status, "failed"), usage)
 
     async def _login_ok(self) -> bool:
-        if self._login_check is None:
-            return False
         try:
             return await self._login_check()
         except Exception:
@@ -475,6 +477,8 @@ class ClaudeVoice:
             except asyncio.CancelledError:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(proc.pid, signal.SIGKILL)
+                for t in (*pumps, exited):
+                    t.cancel()
                 raise
             finally:
                 if proc.returncode is None:  # our own unreaped child: its pid can't be reused

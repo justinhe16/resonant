@@ -692,3 +692,12 @@ async def test_a_cancel_during_the_call_leaves_no_record_and_sends_nothing() -> 
         assert kv_get(h.db, KEY) is None and h.channel.sent == []
         assert ps.get(h.db, "core", "run/r1") is not None
         assert [i.key for i in ps.pending(h.db, ("urgent", "normal"), T9)] == ["run/r1"]
+
+
+async def test_the_pulse_voice_call_is_kept_under_the_key_for_a_catch_up() -> None:
+    async with harness() as h:
+        failed_run(h)
+        script = Script(PROSE)
+        use_voice(h, script)
+        await pulse(h, T9)
+        assert kv_get(h.db, "voice.out:pulse:2026-10-13:09") is not None

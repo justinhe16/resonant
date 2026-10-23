@@ -1899,7 +1899,7 @@ worker_facts(conn, listed, going, roll) -> WorkerFacts(items, tail, going) | Non
 - `VoiceResult.reason`: `ok`, `cached`, `disabled`, `paused`, `limited`, `cap`, `not_set_up`, `timeout`, `refused`, `failed` or `guard:<kind>`. `used` False means `text` is exactly the `fallback`.
 - `Components.voice: Voice | None` (set by `build_imessage_stack` when `brain.voice.enabled`); `ClaudeRunner(..., voice=)`; `pulse_job.deliver(..., rewrite=)`, `send_pulse(..., voice=)`, `voiced_pulse`, `pulse_facts`; `briefing.send_briefing(..., voice=)`, `briefing_facts`; `ClaudeRunner._report_merged(..., title=)`. `rollup.merged_parts(title)`, `rollup.stall_kind(item, roll)` are public now.
 - kv: `voice.calls:<YYYY-MM-DD>` (calls that day, 7 days kept), `voice.out:<ref>` (`{digest, text, used, reason, at}`, 2 days; the digest is of the prompt and the fallback, so changed facts call again). `pulse.inflight:<key>` records gain `voice` (bool).
-- Config `brain.voice`: `enabled`, `kinds`, `timeout_s` (1..40, 25), `daily_cap` (0..500, 40; 0 none), `max_chars` (200..900, 600), `model`, `max_budget_usd` (0.10).
+- Config `brain.voice`: `enabled`, `kinds`, `timeout_s` (1..30, 25), `daily_cap` (0..500, 40; 0 none), `max_chars` (200..900, 600), `model`, `max_budget_usd` (0.10).
 - Audit `voice.write {kind, used, reason, calls_today}`. Tests patch `runners.voice.default_claude_cmd` to None (`tests/conftest.py`).
 - Eval: `evals/task_eval.py` rows with `kind: voice` (`VoiceCase`, `run_voice_case`, `grade_voice`, `voice_summary`); `e2e/fake_claude.py` one-shot honors `limit`, `delay`, `hang`, `crash` and `init_tools`.
 

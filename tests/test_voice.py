@@ -442,3 +442,15 @@ def test_merged_facts() -> None:
     )  # fmt: skip
     assert f.items[0].outcome == "merged" and f.items[0].title == "PER-272: An explicit ask"
     assert f.tail == ("deps changed: uv.lock", "Along the way: x.")
+
+
+def test_claim_verbs_are_not_whitelisted_by_keys_or_enum_values() -> None:
+    """The facts' JSON holds ``merged_onto_base`` and ``owner_approved``; those names must not
+    make "merged" or "approved" claimable for an item that only opened a PR."""
+    merged = Item(ref="R2", outcome="merged_onto_base", merged=("PR #3",), owner_approved=True)
+    f = Facts("pulse", (opened(), merged))
+    ok = "R14 opened PR #18 and R2 merged PR #3."
+    assert problem(ok, f, FALLBACK) is None  # a merged item backs "merged"
+    only = Facts("pulse", (opened(), Item(ref="R2", outcome="no_changes", ask="tidy up")))
+    assert kind("R14 opened PR #18 and R2 merged nothing; the owner approved.", only) == "claim"
+    assert kind("R14 opened PR #18, approved by you, and R2 is done.", only) == "claim"

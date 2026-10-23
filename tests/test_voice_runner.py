@@ -352,3 +352,31 @@ def test_voice_argv_has_no_tools_or_servers() -> None:
     assert argv[i + 1] == ""
     assert "--mcp-config" not in argv and "--add-dir" not in argv and "--allowedTools" not in argv
     assert argv[argv.index("--append-system-prompt") + 1].count("300 characters") == 1
+
+
+async def test_transient_results_are_not_kept_for_a_retry(rig: Rig) -> None:
+    with atomic(rig.db):
+        kv_set(rig.db, LIMIT_KV, iso(NOW + timedelta(hours=1)))
+    first = await rig.voice.write(facts(), FALLBACK, ref="run:R14:ready")
+    assert first.reason == "limited" and kv_get(rig.db, OUT_KV + "run:R14:ready") is None
+    rig.now = NOW + timedelta(hours=2)  # the limit cleared: the same text can be voiced
+    again = await rig.voice.write(facts(), FALLBACK, ref="run:R14:ready")
+    assert again.used and len(rig.calls) == 1
+    rig.plan({"crash": "always"})
+    await rig.voice.write(facts(), FALLBACK + "!", ref="run:R15:ready")
+    assert kv_get(rig.db, OUT_KV + "run:R15:ready") is None  # a crash isn't kept either
+
+
+async def test_the_default_login_check_reaches_the_owner_login(
+    tmp_path: Path, db: sqlite3.Connection, never_the_real_claude_login: list[tuple[str, ...]]
+) -> None:
+    """Built as ``build_imessage_stack`` builds it (no ``login_check``), with guard off and no
+    token, the voice asks the owner-login probe (stubbed by conftest: never the real CLI)."""
+    r = Rig(tmp_path, db, token=False)
+    v = ClaudeVoice(
+        db, cfg=VoiceConfig(), secrets=SecretStore(r.keychain), cwd=tmp_path / "v",
+        claude_cmd=["claude-cmd"], home=tmp_path / "home",
+    )  # fmt: skip
+    out = await v.write(facts(), FALLBACK)
+    assert out.reason == "not_set_up"  # the probe says "not logged in"
+    assert never_the_real_claude_login == [("claude-cmd", str(tmp_path / "home"))]

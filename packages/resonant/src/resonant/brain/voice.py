@@ -550,6 +550,17 @@ def _clock_keys(text: str) -> set[tuple[int, int, str]]:
     return {(int(m[1]), int(m[2] or 0), m[3].lower()) for m in _CLOCK.finditer(text)}
 
 
+def _free_words(facts: Facts) -> set[str]:
+    """Words of the facts' free text (asks, titles, summaries, failures, names, reminders),
+    never its keys or outcome names."""
+    texts: list[str] = [*facts.going]
+    for i in facts.items:
+        texts += [t for t in (i.ask, i.title, i.summary, i.failure, *i.merged) if t]
+    if facts.day is not None:
+        texts += [r for _t, r in facts.day.reminders]
+    return {w for t in texts for w in _WORD.findall(t.lower())}
+
+
 def check(
     raw: str,
     prose: str,
@@ -605,7 +616,7 @@ def check(
     if extra:
         return Problem("numbers", len(extra))
     allowed = {v for i in facts.items for v in OUTCOME_VERBS[i.outcome]}
-    allowed |= set(_WORD.findall(low_known))
+    allowed |= _free_words(facts)
     if any(w in CLAIM_VERBS and w not in allowed for w in _WORD.findall(prose.lower())):
         return Problem("claim")
     return None

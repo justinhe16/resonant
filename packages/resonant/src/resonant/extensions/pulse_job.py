@@ -607,14 +607,14 @@ def pulse_facts(composed: Composed, conn: sqlite3.Connection) -> Facts | None:
 
 
 async def voiced_pulse(
-    voice: Voice, conn: sqlite3.Connection, composed: Composed, text: str
+    voice: Voice, conn: sqlite3.Connection, composed: Composed, text: str, *, ref: str | None = None
 ) -> str:
     """``text`` (the code-built pulse) said in Claude's voice, or ``text`` itself: with no
     workers' news, or whenever the voice falls back."""
     facts = pulse_facts(composed, conn)
     if facts is None:
         return text
-    return (await voice.write(facts, text)).text
+    return (await voice.write(facts, text, ref=ref)).text
 
 
 async def send_pulse(
@@ -659,7 +659,7 @@ async def send_pulse(
 
     async def rewrite(text: str, _listed: list[store.Item]) -> str:
         assert voice is not None
-        return await voiced_pulse(voice, conn, composed[-1], text)
+        return await voiced_pulse(voice, conn, composed[-1], text, ref=key)
 
     status, count = await deliver(
         conn, channel, owner, key, now, build, rewrite=rewrite if voice is not None else None

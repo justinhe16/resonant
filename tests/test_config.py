@@ -289,7 +289,7 @@ def test_brain_voice_defaults_and_bounds(resonant_home: Path) -> None:
     assert v.model is None and v.max_budget_usd == 0.10
     for key, bad in (
         ("timeout_s", 0),
-        ("timeout_s", 41),
+        ("timeout_s", 31),
         ("daily_cap", -1),
         ("daily_cap", 501),
         ("max_chars", 199),

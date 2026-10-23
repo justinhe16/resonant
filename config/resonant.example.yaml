@@ -161,7 +161,7 @@ pulse:
 #                                       #   Claude, sends the plain code-built text as before
 #     enabled: true                     # false: every one of those texts stays code-built
 #     kinds: [outcome, pulse, briefing] # drop one to keep that text code-built
-#     timeout_s: 25                     # past it the call is killed and the plain text goes out (1..40)
+#     timeout_s: 25                     # past it the call is killed and the plain text goes out (1..30)
 #     daily_cap: 40                     # calls a day, apart from ask_claude.daily_cap; 0: none
 #     max_chars: 600                    # the prose's length (the whole text may run 400 over)
 #     model: null                       # claude --model; null: the CLI's default

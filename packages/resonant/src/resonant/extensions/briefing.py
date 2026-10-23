@@ -449,7 +449,7 @@ async def send_briefing(
     async def rewrite(text: str, listed: list[pulse_store.Item]) -> str:
         assert voice is not None
         facts = briefing_facts(conn, b, listed, text)
-        return text if facts is None else (await voice.write(facts, text)).text
+        return text if facts is None else (await voice.write(facts, text, ref=key)).text
 
     await deliver(conn, channel, owner, key, now, build, rewrite=rewrite if voice else None)
     rec: Any = kv_get(conn, "pulse.inflight:" + key)
