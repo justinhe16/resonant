@@ -279,3 +279,28 @@ def test_pulse_invalid_values_rejected(resonant_home: Path, yaml_text: str) -> N
     (resonant_home / "config.yaml").write_text(yaml_text)
     with pytest.raises(ValidationError):
         load_settings()
+
+
+def test_brain_voice_defaults_and_bounds(resonant_home: Path) -> None:
+    """PER-273: Claude writes Resonant's own texts by default; the call is bounded."""
+    v = load_settings().brain.voice
+    assert v.enabled is True and v.kinds == ["outcome", "pulse", "briefing"]
+    assert (v.timeout_s, v.daily_cap, v.max_chars) == (25.0, 40, 600)
+    assert v.model is None and v.max_budget_usd == 0.10
+    for key, bad in (
+        ("timeout_s", 0),
+        ("timeout_s", 31),
+        ("daily_cap", -1),
+        ("daily_cap", 501),
+        ("max_chars", 199),
+        ("max_chars", 901),
+        ("max_budget_usd", 0),
+        ("max_budget_usd", 2.5),
+        ("kinds", ["weather"]),
+        ("whatever", 1),
+    ):
+        with pytest.raises(ValidationError):
+            load_settings(brain={"voice": {key: bad}})
+    ok = load_settings(brain={"voice": {"enabled": False, "kinds": ["pulse"], "daily_cap": 0}})
+    assert ok.brain.voice.enabled is False and ok.brain.voice.kinds == ["pulse"]
+    assert ok.brain.voice.daily_cap == 0  # no cap

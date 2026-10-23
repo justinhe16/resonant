@@ -530,8 +530,8 @@ async def test_the_pulse_sends_the_rollup_once_and_never_an_all_quiet() -> None:
         h.settings.runner.mirror_dir = h.settings.home / "runner" / "mirrors"
         t = utcnow().replace(minute=0, second=0, microsecond=0) + 2 * H
         tz = ZoneInfo(h.settings.timezone)
-        # both pulses (t and t + H) outside quiet hours and the 08:00 briefing hour
-        while any((t + k * H).astimezone(tz).hour in (0, 1, 2, 3, 4, 5, 8) for k in (0, 1)):
+        # all three pulses (t, t + H, t + 2H) outside quiet hours and the 08:00 briefing hour
+        while any((t + k * H).astimezone(tz).hour in (0, 1, 2, 3, 4, 5, 8) for k in (0, 1, 2)):
             t += H
         install_github(h.db, t - 30 * 24 * H)
         activate(h.db, t - 30 * 24 * H)

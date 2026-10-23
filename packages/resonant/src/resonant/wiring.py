@@ -41,6 +41,11 @@ which is unchanged. The notifier sends to the same recipients as job reports, an
 ``run`` (started by the daemon) sends the end-of-hour ``+N more updates``. With iMessage
 off there is no router hook: extension events wait unrouted, as messages would.
 
+Voice (PER-273). With ``brain.voice.enabled`` (the default) one ``runners.voice.ClaudeVoice``
+is built before the Claude runner and set as ``components.voice``: the runner uses it for a
+run's outcome text, and the core pulse and briefing jobs (built later from the same
+components) for theirs. Off: those texts stay code-built.
+
 Extension health. The monitor gets ``extensions.host.ExtensionHealth`` as its dynamic
 ``ext:<name>`` checks (health commands, job fail streaks, load refusals, tampering).
 
@@ -118,6 +123,7 @@ from resonant.runners.job import JobRunner
 from resonant.runners.local import LocalRunner
 from resonant.runners.media import MediaRunner
 from resonant.runners.reminder import ReminderRunner
+from resonant.runners.voice import ClaudeVoice
 from resonant.runners.watch import WatchRunner
 from resonant.runners.worker_desk import SelfOps
 from resonant.secrets import SecretStore
@@ -439,6 +445,22 @@ def build_imessage_stack(
         cost_ask_over_usd=settings.trust.cost_ask_over_usd,
     )
     owner_name = components.principals.owner if components.principals_loaded else None
+    # PER-273: Claude writes the prose of the texts Resonant sends on its own. The pulse and
+    # the briefing reach it through ``components.voice`` (the scheduler is built later, from
+    # the same components); the runner gets it directly for run outcomes.
+    voice = (
+        ClaudeVoice(
+            conn,
+            cfg=settings.brain.voice,
+            secrets=components.executor.secrets or SecretStore(),
+            cwd=settings.home / "voice",
+            guard=settings.runner.guard,
+            timezone=settings.timezone,
+        )
+        if settings.brain.voice.enabled
+        else None
+    )
+    components.voice = voice
     claude = ClaudeRunner(
         conn,
         runner=settings.runner,
@@ -456,6 +478,7 @@ def build_imessage_stack(
         self_ops=_worker_ops(conn, settings, components, owner_name),
         owner=owner_name,
         self_repo=settings.ops.repo_path,
+        voice=voice,
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude

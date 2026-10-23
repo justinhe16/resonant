@@ -1859,6 +1859,50 @@ await TrustChecks(conn, channel, principals, approval_ttl_s=...).request_check(
 - **`allow_tools` (BA-1).** "don't ask for perms for linear tickets": the model calls `allow_tools{tools: [linear]}` (its description and the `rules` intent's prompt say how; Claude and qwen alike). It is L2 and in `NEVER`, so a model-chosen call always asks a plain yes, and the prompt names exactly what stops asking, from the registry and the loaded extensions (`components.summary_actions(conn, registry, host.tool_specs)`): `[K3] stop asking before linear.save_comment and linear.save_issue when you ask in chat tools=(list, 1 items)? Reply yes / no`. An extension's name covers its chat tools that `can_stand` (L2 changes: never L1, pay, reads, job specs or `NEVER`); a name that covers nothing (or an L1 tool) gives the default summary and fails when run. `yes` saves one `allow tool:<ext>.<name>` rule per tool on the extension (a builtin's on `*`), `created_from="chat"`, audited `trust.rule_added`, the same rule `yes always` saves, and reports `Rules: don't ask before running linear.save_comment in linear (rule 1); … (rule 2). Changes after outside content still ask.` From then on `StandingAllows` makes the owner's own `inferred` calls of those tools L3 (run, then report) from qwen and from Claude over MCP; tainted calls, members, L1, the kill switch and dry run still ask. The tools are read when the prompt is built and again when it runs: an extension update in between (owner-only, at the Mini's terminal) could change the set; the report line lists what was saved.
 - **Audit.** `trust.evaluate` (each check), `trust.check` (each `request_check` outcome), `trust.merge`, `trust.rule_added` (with any replaced rule's fields), `trust.rule_removed` (the removed rule's fields), `approval.expired` with a `reason`, plus the approval's own rows.
 
+## Voice: `resonant.brain.voice`, `resonant.runners.voice`, `resonant.extensions.voice_facts` (PER-273)
+
+Claude writes the prose of Resonant's own texts; code keeps the facts, the warnings and the closing line (docs/brain-plan.md, PER-273).
+
+```python
+# resonant.brain.voice (pure)
+TextKind = Literal["outcome", "pulse", "briefing"]
+Item(ref, outcome, repo=None, ask=None, title=None, summary=None, failure=None, pr=None, pr_url=None,
+     ci=None, base=None, merged=(), took=None, quiet=None, owner_approved=False, urgent=False,
+     needs=None)                                  # needs: code-built, closing line only
+Day(weekday, reminders=((clock, text), ...), running=0, waiting=0, queued=0)
+Facts(kind, items, going=(), day=None, approvals=(), tail=())
+    .prompt_json() -> str                          # sorted JSON; no approvals, tail or needs
+    Facts.from_json(raw) -> Facts                  # ValueError names the key
+Voice.write(facts, fallback, *, ref=None) -> VoiceResult(text, used, reason, usage=None)   # never raises
+system_prompt(max_chars) -> str ; prompt(facts, max_chars) -> str
+normalize(raw) -> str ; strip_closing(prose) -> str ; closing_line(facts) -> str
+finish(prose, facts) -> str                        # prose, tail lines, closing line
+check(raw, prose, facts, fallback, *, now, tz, max_chars) -> Problem | None   # kinds: empty format call too_long question ask command promise code url missing numbers claim
+compose(raw, facts, fallback, *, now, tz, max_chars, limit) -> VoiceResult     # reason ok | guard:<kind>
+run_item(run, *, ci, no_ci, upstream, watching, merged, merged_by, why) -> Item | None   # None: a cancel
+outcome_facts(run, ..., warn, note, lines, also, going) -> Facts | None ; merged_facts(run, *, title, deps_line, also) -> Facts
+record_text(text) -> str                           # what system_texts keeps of a voiced text
+
+# resonant.runners.voice
+ClaudeVoice(conn, *, cfg: VoiceConfig, secrets, cwd, guard="off", timezone="UTC", claude_cmd=None,
+            home=None, login_check=None, call: Call | None = None, clock=utcnow, poll_s=0.1,
+            kill_grace_s=2.0)
+    .write(facts, fallback, *, ref=None) -> VoiceResult
+    .calls_today() -> int ; .limited_until() -> datetime | None ; .spawn(argv, env, cwd, prompt, timeout_s) -> CallResult
+voice_argv(head, cfg, *, api_billing) -> list[str] ; default_claude_cmd() -> list[str] | None
+CallResult(status: answered | usage_limit | failed | timeout | refused | killed, text="", result=None)
+
+# resonant.extensions.voice_facts
+worker_facts(conn, listed, going, roll) -> WorkerFacts(items, tail, going) | None
+```
+
+- `VoiceResult.reason`: `ok`, `cached`, `disabled`, `paused`, `limited`, `cap`, `not_set_up`, `timeout`, `refused`, `failed` or `guard:<kind>`. `used` False means `text` is exactly the `fallback`.
+- `Components.voice: Voice | None` (set by `build_imessage_stack` when `brain.voice.enabled`); `ClaudeRunner(..., voice=)`; `pulse_job.deliver(..., rewrite=)`, `send_pulse(..., voice=)`, `voiced_pulse`, `pulse_facts`; `briefing.send_briefing(..., voice=)`, `briefing_facts`; `ClaudeRunner._report_merged(..., title=)`. `rollup.merged_parts(title)`, `rollup.stall_kind(item, roll)` are public now.
+- kv: `voice.calls:<YYYY-MM-DD>` (calls that day, 7 days kept), `voice.out:<ref>` (`{digest, text, used, reason, at}`, 2 days; the digest is of the prompt and the fallback, so changed facts call again). `pulse.inflight:<key>` records gain `voice` (bool).
+- Config `brain.voice`: `enabled`, `kinds`, `timeout_s` (1..30, 25), `daily_cap` (0..500, 40; 0 none), `max_chars` (200..900, 600), `model`, `max_budget_usd` (0.10).
+- Audit `voice.write {kind, used, reason, calls_today}`. Tests patch `runners.voice.default_claude_cmd` to None (`tests/conftest.py`).
+- Eval: `evals/task_eval.py` rows with `kind: voice` (`VoiceCase`, `run_voice_case`, `grade_voice`, `voice_summary`); `e2e/fake_claude.py` one-shot honors `limit`, `delay`, `hang`, `crash` and `init_tools`.
+
 ## Daemon wiring: `resonant.wiring`, `resonant.daemon`
 
 ```python

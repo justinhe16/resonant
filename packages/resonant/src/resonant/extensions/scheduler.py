@@ -131,7 +131,8 @@ class CoreJob:
 
 @dataclass(frozen=True)
 class CoreDeps:
-    """What a core job factory gets at daemon start."""
+    """What a core job factory gets at daemon start. ``components.voice`` (PER-273) is how the
+    pulse and the briefing get Claude to write their prose (None: code-built)."""
 
     settings: Settings
     conn: sqlite3.Connection

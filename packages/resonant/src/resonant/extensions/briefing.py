@@ -44,6 +44,14 @@ The whole message is at most 1,000 characters (the Updates lines are dropped, wi
 ``dedupe_key=briefing:<local date>``, so a restart, a catch-up or an on-demand run never
 sends a second one that day. Skipped while paused.
 
+In Claude's voice (PER-273, ``brain.voice``): when the briefing has reminders, open work or
+workers' news, Claude writes its prose (``Morning. You've got ...``) from the same data as
+facts, and the text is the prose, then the lines code keeps verbatim (⚠ health, the Updates
+items, the workers' side-effect lines, ``+N more``), then a code-built closing line
+(``Needs you: approve A7.`` or ``No action needed.``: approval codes are never shown to
+Claude). The empty briefing, no Claude, or a text the guard stops is the code-built one above,
+exactly.
+
 On demand (P3-14's ``/ext run core/briefing``): ``run_briefing_now(deps)``. It is keyed
 ``briefing:manual:<local date>:<HHMM>``, so it sends at most once a minute and never uses up
 the scheduled one.
@@ -52,6 +60,7 @@ the scheduled one.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -82,6 +91,7 @@ from resonant.tools.reminders import list_reminders
 from resonant.tools.when import clock_time
 
 if TYPE_CHECKING:
+    from resonant.brain.voice import Facts, Voice
     from resonant.config import BriefingConfig, Settings
     from resonant.extensions.scheduler import CoreDeps, CoreJob
     from resonant.gateway.channel import Channel
@@ -337,6 +347,54 @@ def gather(
     )
 
 
+# --- Claude's voice ------------------------------------------------------------------------
+
+_MORE = re.compile(r"\+\d+ more")
+
+
+def briefing_facts(
+    conn: sqlite3.Connection, b: Briefing, listed: list[pulse_store.Item], text: str
+) -> Facts | None:
+    """The briefing's facts for Claude (PER-273): today's reminders and open work, and the
+    workers' news as items. The health line, the Updates items, side-effect lines and ``+N
+    more`` are the tail, kept code-built; approval codes are the closing line's only. None
+    when there is nothing to say (the empty briefing) or an item can't be said."""
+    # late: ``resonant.brain`` imports the router, which imports this module
+    from resonant.brain import voice as voice_mod
+    from resonant.brain.voice import Day, Facts
+    from resonant.extensions import voice_facts
+
+    if b.day is None:
+        return None
+    going = [i for i in b.workers if not i.changed]
+    found = voice_facts.worker_facts(conn, listed, going, b.roll)
+    if found is None:
+        return None
+    reminders = tuple(
+        (t, voice_mod.fact_text(r, voice_mod.REMINDER_MAX) or "reminder")
+        for t, r in b.reminders[:REMINDERS_SHOWN]
+    )
+    if not (found.items or reminders or b.running or b.waiting or b.queued):
+        return None
+    tail = [*found.tail]
+    if (health := _health_line(b)) is not None:
+        tail.append(health)
+    tail += [item_line(i) for i in listed if not is_worker_item(i)]
+    if (more := len(b.reminders) - REMINDERS_SHOWN) > 0:
+        tail.append(f"+{more} more reminders")
+    last = text.rsplit("\n", 1)[-1]
+    if _MORE.fullmatch(last):
+        tail.append(last)
+    return Facts(
+        "briefing",
+        found.items,
+        going=found.going,
+        day=Day(b.day.strftime("%A"), reminders, b.running, len(b.waiting), b.queued),
+        approvals=b.approvals,
+        tail=tuple(tail),
+    )
+
+
 # --- sending -------------------------------------------------------------------------------
 
 
@@ -357,13 +415,16 @@ async def send_briefing(
     due: datetime | None = None,
     manual: bool = False,
     settings: Settings | None = None,
+    voice: Voice | None = None,
 ) -> dict[str, Any]:
     """Build and send the briefing for the local date of ``due`` (else ``now``), deduped
     per date (``briefing:<date>``). ``manual`` (on demand): keyed
     ``briefing:manual:<date>:<HHMM>`` instead, so it never uses up the scheduled one and
     sends at most once a minute. Returns ``{sent, date, sections, chars}``; never the text.
     ``sent`` means handed to the channel: a repeat key is dropped there. Paused: not sent.
-    ``settings``: refresh the Workers rollup's derived items first (``pulse.stall_after``)."""
+    ``settings``: refresh the Workers rollup's derived items first (``pulse.stall_after``).
+    ``voice`` (PER-273): Claude writes the prose (:func:`briefing_facts`); the code-built text
+    is the fallback."""
     zone = ZoneInfo(tz)
     local_now = (due or now).astimezone(zone)
     day = local_now.date()
@@ -385,7 +446,12 @@ async def send_briefing(
 
     # Stored intent first: a rerun of this key resends the same text and marks only the
     # items it listed (a new item stays pending).
-    await deliver(conn, channel, owner, key, now, build)
+    async def rewrite(text: str, listed: list[pulse_store.Item]) -> str:
+        assert voice is not None
+        facts = briefing_facts(conn, b, listed, text)
+        return text if facts is None else (await voice.write(facts, text, ref=key)).text
+
+    await deliver(conn, channel, owner, key, now, build, rewrite=rewrite if voice else None)
     rec: Any = kv_get(conn, "pulse.inflight:" + key)
     text = str(cast(dict[str, Any], rec)["text"]) if isinstance(rec, dict) else ""
     return {
@@ -410,6 +476,7 @@ async def run_briefing_now(deps: CoreDeps, *, now: datetime | None = None) -> di
         now=now or utcnow(),
         manual=True,
         settings=deps.settings,
+        voice=deps.components.voice,
     )
 
 
@@ -447,6 +514,7 @@ def briefing_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> C
             now=clock(),
             due=_due(args),
             settings=settings,
+            voice=deps.components.voice,
         )
 
     return CoreJob(
@@ -465,6 +533,7 @@ __all__ = [
     "NOTHING",
     "NOTHING_LINES",
     "Briefing",
+    "briefing_facts",
     "briefing_job",
     "dedupe_key",
     "gather",

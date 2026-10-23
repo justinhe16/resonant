@@ -1117,3 +1117,187 @@ def test_a_synthetic_row_loads_and_must_say_so_with_a_bool(tmp_path: Path) -> No
     assert case.review
     with pytest.raises(EvalSetError, match="'synthetic' must be true or false"):
         load_set(write_set(tmp_path / "b.jsonl", [{**row, "synthetic": "yes"}]))
+
+
+# --- PER-273: voice rows ---------------------------------------------------------------------
+
+VOICE_SET = Path(__file__).parent.parent / "evals" / "voice.example.jsonl"
+VOICE_ROW: dict[str, Any] = {
+    "id": "v1",
+    "category": "voice",
+    "kind": "voice",
+    "voice": {
+        "facts": {"kind": "outcome", "items": [{"ref": "R11", "outcome": "merged", "pr": 140}]},
+        "fallback": "R11 merged: PR #140",
+    },
+    "claude": {"answer": "I merged PR #140 for R11."},
+    "expect": {"used": True, "closing": "No action needed."},
+}
+
+
+def test_voice_rows_load_without_a_text(tmp_path: Path) -> None:
+    cases = load_set(write_set(tmp_path / "s.jsonl", [VOICE_ROW]))
+    (c,) = cases
+    assert c.kind == "voice" and c.voice is not None and c.text == "[outcome text]"
+    assert c.voice.facts.items[0].ref == "R11" and c.voice.fallback == "R11 merged: PR #140"
+    assert c.expect.used is True and c.expect.closing == "No action needed."
+    shipped = load_set(VOICE_SET)
+    assert len(shipped) == 14 and {x.kind for x in shipped} == {"voice"}
+    assert {x.id for x in shipped} >= {"voice-replay-r8-failed", "voice-replay-r9-no-changes"}
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ({"kind": "chat"}, "'kind'"),
+        ({"voice": None}, "'voice'"),
+        (
+            {"voice": {"facts": {"kind": "weather", "items": []}, "fallback": "x"}},
+            "voice.facts.kind",
+        ),
+        ({"voice": {"facts": {"kind": "outcome", "items": []}, "fallback": ""}}, "voice.fallback"),
+        (
+            {"voice": {"facts": {"kind": "outcome", "items": []}, "fallback": "x", "now": "noon"}},
+            "voice.now",
+        ),
+        (
+            {
+                "voice": {
+                    "facts": {"kind": "outcome", "items": []},
+                    "fallback": "x",
+                    "tz": "Mars/Base",
+                }
+            },
+            "voice.tz",
+        ),
+        ({"expect": {"tools": ["x"]}}, "expect keys that don't apply"),
+        ({"world": {"notes": ["x"]}}, "'world' doesn't apply"),
+        ({"claude": {"answer": "x", "tools": []}}, "'claude'"),
+        ({"expect": {"used": "yes"}}, "expect.used"),
+    ],
+)
+def test_bad_voice_rows_name_the_line(tmp_path: Path, patch: dict[str, Any], message: str) -> None:
+    path = write_set(tmp_path / "s.jsonl", [VOICE_ROW, {**VOICE_ROW, "id": "v2", **patch}])
+    with pytest.raises(EvalSetError, match=rf"s\.jsonl:2: .*{message}"):
+        load_set(path)
+
+
+def test_voice_keys_are_not_for_task_rows(tmp_path: Path) -> None:
+    row = {"id": "t", "category": "chat", "text": "hi", "expect": {"closing": "No action needed."}}
+    with pytest.raises(EvalSetError, match="voice row"):
+        load_set(write_set(tmp_path / "s.jsonl", [row]))
+    row = {"id": "t", "category": "chat", "text": "hi", "voice": VOICE_ROW["voice"]}
+    with pytest.raises(EvalSetError, match="'voice'"):
+        load_set(write_set(tmp_path / "s.jsonl", [row]))
+
+
+def test_the_voice_example_set_is_all_correct_and_guard_rows_fall_back_exactly() -> None:
+    cases = load_set(VOICE_SET)
+    results = asyncio.run(run_set(cases, model=None))["loop"]
+    assert [r.failures for r in results if not r.correct] == []
+    by_id = {r.case.id: r for r in results}
+    for name, reason in {
+        "voice-guard-invented-number": "guard:numbers",
+        "voice-guard-header": "guard:format",
+        "voice-guard-missing-item": "guard:missing",
+        "voice-usage-limit": "limited",
+    }.items():
+        r = by_id[name]
+        assert r.case.voice is not None
+        assert r.outcome.voice_used is False and r.outcome.voice_reason == reason
+        assert r.outcome.reply == r.case.voice.fallback  # exactly the code-built text
+    assert by_id["voice-guard-question-command"].outcome.voice_reason == "guard:question"
+    assert by_id["voice-briefing"].outcome.reply.endswith("Needs you: approve A7.")
+    assert "A7" not in by_id["voice-briefing"].outcome.reply.splitlines()[0]
+
+
+def test_a_voice_row_is_graded_on_what_went_out() -> None:
+    c = te.parse_case(VOICE_ROW, 1)
+    assert c.voice is not None
+    good = outcome(reply="I merged PR #140 for R11.\nNo action needed.", voice_used=True,
+                   voice_reason="ok")  # fmt: skip
+    assert grade(c, good) == []
+    assert grade(c, replace(good, voice_used=False, voice_reason="failed")) == [
+        "voice_used", "fallback_changed",
+    ]  # fmt: skip
+    assert grade(c, replace(good, reply="btw: I merged PR #140 for R11.\nNo action needed.")) == [
+        "voice_header",
+        "voice_unsourced:format",
+    ]  # fmt: skip
+    assert grade(c, replace(good, reply="I merged PR #140 for R11 and...\nNo action needed.")) == [
+        "voice_ellipsis",
+        "voice_unsourced:format",
+    ]  # fmt: skip
+    assert grade(c, replace(good, reply="I merged PR #140 for R11.\nNeeds you: x.")) == [
+        "voice_closing"
+    ]
+    assert grade(c, replace(good, reply="I merged PR #140 for R11 and changed 7 files.\n"
+                            "No action needed.")) == ["voice_unsourced:numbers"]  # fmt: skip
+    wrong_reason = replace(c, expect=replace(c.expect, used=False, reason="guard:"))
+    assert grade(wrong_reason, replace(good, voice_used=False, reply=c.voice.fallback,
+                                       voice_reason="failed")) == ["voice_reason"]  # fmt: skip
+
+
+def test_the_summary_has_a_voice_block_without_texts(tmp_path: Path) -> None:
+    results = asyncio.run(run_set(load_set(VOICE_SET), model=None))["loop"]
+    s = summarize(results)
+    v = s["voice"]
+    assert v["cases"] == 14 and v["correct"] == 14 and v["used"] == 9
+    assert v["fallback_reasons"] == {
+        "guard:format": 1, "guard:missing": 1, "guard:numbers": 1, "guard:question": 1,
+        "limited": 1,
+    }  # fmt: skip
+    assert v["tokens"]["input_tokens"] > 0 and "explicit" not in json.dumps(v["tokens"])
+    assert v["latency_ms"]["n"] == 14
+    blob = json.dumps(s)
+    assert "explicit ask" not in blob and "Needs you" not in blob and "A7" not in blob
+    # task-only summaries keep their shape
+    assert "voice" not in summarize([])
+
+
+def test_a_failed_voice_case_prints_its_text_and_reason(tmp_path: Path) -> None:
+    row = {**VOICE_ROW, "expect": {"used": False}}
+    lines: list[str] = []
+    code = te.run(
+        Settings(home=tmp_path / "owner"),
+        set_path=write_set(tmp_path / "s.jsonl", [row]),
+        model_kind="scripted",
+        repeat=1,
+        only=None,
+        as_json=False,
+        min_accuracy=0.85,
+        out_dir=tmp_path / "r",
+        echo=lines.append,
+        echo_err=lambda _s: None,
+    )
+    assert code == te.EXIT_BELOW_MIN
+    assert "voice_used" in lines[0] and "voice used True  reason ok" in lines[0]
+    assert "I merged PR #140 for R11." in lines[0]
+    (saved,) = (tmp_path / "r").glob("task-*.json")
+    assert "I merged PR #140" not in saved.read_text()
+
+
+def test_live_claude_runs_voice_rows_through_the_given_claude(tmp_path: Path) -> None:
+    """``--route claude --live-claude`` with a voice set: the voice rows are the hard rows and
+    go through the live Claude's command (here the fake) with its login, not the row's plan."""
+    row = {**VOICE_ROW, "claude": {"answer": "never used"}}
+    lines: list[str] = []
+    code = te.run(
+        Settings(home=tmp_path / "owner"),
+        set_path=write_set(tmp_path / "s.jsonl", [row]),
+        model_kind="live",  # an all-voice set never builds the local model's client
+        repeat=1,
+        only=None,
+        as_json=True,
+        min_accuracy=0.85,
+        out_dir=tmp_path / "r",
+        echo=lines.append,
+        echo_err=lambda _s: None,
+        route="claude",
+        live_claude=True,
+        claude=_fake_live(tmp_path, "I merged PR #140 for R11."),
+    )
+    assert code == te.EXIT_OK, lines
+    data = json.loads(lines[0])
+    assert data["meta"]["claude"] == "live" and data["meta"]["cases"] == 1
+    assert data["modes"]["loop"]["voice"]["used"] == 1

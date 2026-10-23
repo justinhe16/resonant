@@ -223,3 +223,13 @@ def brew_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (prefix / "bin" / "gh").symlink_to(real)
     monkeypatch.setattr(profile, "HOST_TOOL_DIRS", (str(prefix / "bin"), "/usr/bin", "/bin"))
     return prefix / "bin"
+
+
+@pytest.fixture(autouse=True)
+def never_the_real_claude_voice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PER-273: no test's proactive-text voice finds the real ``claude`` on the PATH (it would
+    spend the owner's Claude usage): the lookup answers "not installed". Tests that exercise
+    the voice pass ``claude_cmd`` (``e2e/fake_claude.py``) or a ``call``."""
+    from resonant.runners import voice
+
+    monkeypatch.setattr(voice, "default_claude_cmd", lambda: None)
