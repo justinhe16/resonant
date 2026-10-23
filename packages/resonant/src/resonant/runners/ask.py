@@ -349,8 +349,9 @@ TOOL_NOTES = (
 # PER-258: the Claude brain's own shell and edits (kept apart from SESSION_PROMPT).
 SHELL_PROMPT = (
     "You also have a shell and file edits (Bash, Edit, Write). Read freely: git log, show, "
-    "diff, status and rev-list, gh pr, issue and run view and list, ls, cat, rg and the like "
-    "run without asking (cd into the repo first, or use git -C <dir>). Anything that changes "
+    "diff, status and rev-list, gh pr, issue and run view and list, ls, cat, rg and the like, "
+    'and math with bc (bc -e "1+1", echo "1+1" | bc), run without asking (cd into the '
+    "repo first, or use git -C <dir>). Anything that changes "
     "something goes through the owner's approvals like Resonant's tools: a denial starting "
     "'asked the owner:' means it waits on their yes, so say so and stop (on a yes Resonant "
     "sends you a message to run it); 'not run:' means it didn't happen. Never work around a "

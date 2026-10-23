@@ -87,6 +87,57 @@ def test_reads(policy: ShellPolicy, tree: dict[str, Path], command: str, verb: s
 
 
 @pytest.mark.parametrize(
+    ("command", "verb"),
+    [
+        ('bc -e "1+1"', "bc"),
+        ("bc -l", "bc"),
+        ("bc -le '4*a(1)'", "bc"),
+        ("bc -q --expression=2^10", "bc"),
+        ('echo "1+1" | bc', "echo"),
+        ("echo '11700-(11414.16-2091.60); 220000/24' | bc", "echo"),
+        ("echo 'scale=2; 10/3' | bc -l", "echo"),
+        ("printf '1+1' | bc", "printf"),
+        ("echo 1+1 | bc >/dev/null", "echo"),
+    ],
+)
+def test_calculator_math_is_a_read(
+    policy: ShellPolicy, tree: dict[str, Path], command: str, verb: str
+) -> None:
+    # from the brain's own dir (not a repo) as from a repo: L0, so it never asks, tainted or not
+    for cwd in (tree["rh"] / "ask" / "session", tree["repo"]):
+        assert judge(policy, command, cwd) == ("read", Level.L0, verb)
+
+
+@pytest.mark.parametrize(
+    ("command", "verb"),
+    [
+        ("echo x | sh", "compound"),
+        ("echo 1+1 | bc | sh", "compound"),
+        ("echo x > file", "echo"),
+        ("echo 1+1 | bc > out", "compound"),
+        ("bc file", "bc"),
+        ("bc -l file", "bc"),
+        ("bc -f file", "bc"),
+        ("bc --file=file", "bc"),
+        ("bc < file", "bc"),
+        ("bc -", "bc"),
+        ("bc -e", "bc"),
+        ("bc -i", "bc"),
+        ("echo $(cmd) | bc", "compound"),
+        ("echo `cmd` | bc", "compound"),
+        ("bc <<< 1+1", "compound"),
+        ("bc <<EOF\n1+1\nEOF", "compound"),
+        ("X=1 bc -e 1+1", "env"),
+        ("printf -v x 1", "printf"),
+    ],
+)
+def test_calculator_lookalikes_still_ask(
+    policy: ShellPolicy, tree: dict[str, Path], command: str, verb: str
+) -> None:
+    assert judge(policy, command, tree["rh"] / "ask" / "session") == ("write", Level.L2, verb)
+
+
+@pytest.mark.parametrize(
     "command",
     [
         "git log && git push",  # a compound write never counts as a read

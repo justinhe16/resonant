@@ -38,7 +38,7 @@ from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.tools.base import NO_ARGS, BuiltinContext, no_args
 from resonant.tools.registry import ToolRegistry
-from resonant.trust.tools import allow_targets, tool_action, tool_name
+from resonant.trust.tools import SHELL, allow_targets, shell_verb_stands, tool_action, tool_name
 from resonant_sdk import Effect, Level, ToolSpec
 
 TIGHTEN: tuple[store.Effect, ...] = ("ask", "notify_now")
@@ -290,6 +290,15 @@ def add_rule(
     action = _str_arg(name, args, "action")
     note = _str_arg(name, args, "note", required=False)
     assert scope is not None and action is not None
+    shell = f"{store.TOOL_PREFIX}{SHELL}."
+    slug = "-".join(action.strip().lower().split())  # as ``store.slug`` saves it
+    stands = shell_verb_stands(slug.removeprefix(shell))
+    if effect == "allow" and slug.startswith(shell) and not stands:  # never applied by the gate
+        raise ToolFailed(
+            f"{name}: only git and gh shell commands (tool:shell.git-push, "
+            f"tool:shell.gh-pr-create, ...) can run without asking; reads and math "
+            f"(ls, cat, echo ... | bc) already do, and anything else always asks"
+        )
     try:
         with atomic(conn):
             added = store.add_rule(

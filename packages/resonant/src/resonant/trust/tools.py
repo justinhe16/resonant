@@ -68,6 +68,11 @@ SHELL = "shell"  # the Claude brain's shell changes (tools/shell.py): matched pe
 SHELL_VERB = re.compile(r"(git|gh)-[a-z][a-z-]*")
 
 
+def shell_verb_stands(verb: object) -> bool:
+    """A shell verb a standing allow can cover (``git-*``/``gh-*``, never a force push)."""
+    return isinstance(verb, str) and bool(SHELL_VERB.fullmatch(verb)) and verb != "git-push-force"
+
+
 @dataclass(frozen=True)
 class ToolScope:
     """What a standing allow for one call would cover: the rule's ``scope`` and ``action``,
@@ -177,8 +182,7 @@ class StandingAllows:
         action = tool_action(intent.extension, intent.tool)
         if intent.extension is None and intent.tool == SHELL:
             verb = intent.args.get("verb")
-            ok = isinstance(verb, str) and SHELL_VERB.fullmatch(verb) and verb != "git-push-force"
-            action = tool_action(None, f"{SHELL}.{verb}") if ok else None
+            action = tool_action(None, f"{SHELL}.{verb}") if shell_verb_stands(verb) else None
         if action is None:
             return None
         repo_arg = intent.args.get("repo")
