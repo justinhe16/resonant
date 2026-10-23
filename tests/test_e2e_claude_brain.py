@@ -464,6 +464,9 @@ async def test_a_news_reply_that_names_an_untold_run_tells_it(
         why = [
             (r["status"], r["result"]) for r in w.rows("SELECT * FROM tasks WHERE runner = 'brain'")
         ]
+        if "R1" not in reply:  # printed in full (an assertion message is truncated)
+            for row in w.rows("SELECT * FROM tasks"):
+                print(dict(row))
         assert "R1" in reply and "finished" in reply, (reply, why, w.model.calls)
         assert pulse_store.pending(w.conn, pulse_store.URGENCIES, utcnow()) == []
         item = pulse_store.get(w.conn, "core", "run/r1")
