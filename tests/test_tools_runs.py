@@ -49,6 +49,7 @@ class FakeRunner:
         self.conn = conn
         self.missing = missing
         self.calls: list[tuple[Any, ...]] = []
+        self.unattended: list[bool] = []
         self.reports: list[str] = []
         self.merge_result: Merged | MergeQueued | Refused = Merged("R1", 41, (".mcp.json",))
         self.questions: list[OpenQuestion] = []
@@ -85,8 +86,11 @@ class FakeRunner:
         self.calls.append(("cancel", code))
         return Cancelled(code) if self.get_run(code) else Refused(f"No run {code}.")
 
-    async def merge_run(self, code: str) -> Merged | MergeQueued | Refused:
+    async def merge_run(
+        self, code: str, *, unattended: bool = False
+    ) -> Merged | MergeQueued | Refused:
         self.calls.append(("merge", code))
+        self.unattended.append(unattended)
         return self.merge_result
 
     def open_questions(self) -> list[OpenQuestion]:
@@ -510,6 +514,7 @@ async def test_merge_run(
     runner.merge_result = Merged("R1", 41, (), ("package.json", "uv.lock"), no_ci="resonant")
     out = await call(components, "merge_run", {"code": "R1"})
     assert out["deps_changed"] == ["package.json", "uv.lock"] and out["merged_without_ci"]
+    assert runner.unattended == [False, False]  # args alone: no CallContext, attended
     assert out["text"] == (
         "R1 merged: PR #41.\n⚠ merged without CI: resonant has no CI checks\n"
         "deps changed: package.json, uv.lock\nhttps://github.com/own/resonant/pull/41"

@@ -55,7 +55,7 @@ Linear epic [PER-257](https://linear.app/doriapp/issue/PER-257) in the Resonant 
 | Who | Tickets |
 |---|---|
 | Owner | PER-252 phone tests, PER-253 mycelium by text, PER-265 design decisions (webhooks, worker text in the briefing, nudges, bare yes/no, `/update` trust) |
-| Build | PER-256 retire intents + qwen only routes, Claude the one brain (built; PER-272 explicit-ask-as-approval is next), PER-264 small gaps (its turn budget after PER-256) |
+| Build | PER-256 retire intents + qwen only routes, Claude the one brain (built), PER-272 explicit ask is the approval + merge_run standable (PR open), PER-264 small gaps (its turn budget after PER-256) |
 
 **Roadmap after 6b** (owner, 2026-10-21): **7 Trading** (trade-jev: automatic trading as an extension) → **8 Slack coworker** → **9 Browser + computer use** (last). No email. On-call is parked. One card per phase on the Roadmap tab of `architecture.html`. Each phase gets its Linear tickets via `/linear-surf` when it's next.
 

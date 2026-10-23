@@ -131,6 +131,9 @@ class CallContext:
     # Who chose the call (``Intent.origin``). ``ask_claude`` starts a tainted task's Claude
     # session tainted (BR-10).
     origin: str = "inferred"
+    # PER-272: the gate allowed it on nobody's word for this exact call (``Allow.unattended``:
+    # an L3, a standing allow, a trust rule): ``merge_run`` then merges only when it's clean.
+    unattended: bool = False
 
 
 class ContextHandler(ABC):
@@ -238,7 +241,11 @@ class Executor:
 
         start = time.monotonic()
         ctx = CallContext(
-            secrets=env, idempotency_key=key, task_id=intent.task_id, origin=intent.origin
+            secrets=env,
+            idempotency_key=key,
+            task_id=intent.task_id,
+            origin=intent.origin,
+            unattended=decision.unattended,
         )
         tail: str | None = None
         try:

@@ -111,7 +111,7 @@ from resonant.store.db import atomic, kv_get, utcnow
 from resonant.store.tasks import insert_event
 from resonant.tools import ToolRegistry, is_store_internal
 from resonant.tools.registry import ToolKey
-from resonant_sdk import Effect, Event, Level
+from resonant_sdk import Effect, Event, Level, ToolSpec
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +120,9 @@ NOT_APPROVED = "not approved"
 APPROVAL_EXPIRED = "approval expired"
 APPROVAL_USED = "approval already used"
 NO_TASK = "approvals need a task"
+# PER-272: how an approval the owner's own direct ask gave is recorded (``decided_by``,
+# ``approval.resolve`` ``decision`` and ``path``).
+OWNER_ASKED = "owner_asked"
 
 # Channels whose text replies may bind approvals. The iMessage reader already drops SMS.
 REPLY_CHANNELS = frozenset({"imessage"})
@@ -160,6 +163,19 @@ class StandingScope(Protocol):
 
     @property
     def text(self) -> str: ...
+
+
+class OwnerAskCheck(Protocol):
+    """PER-272: whether an ``owner_asked`` call is the owner's direct ask
+    (``trust.asked.OwnerAsks``)."""
+
+    def check(self, intent: Intent) -> str | None:
+        """Why it isn't (a short reason for the audit), or None when it is."""
+        ...
+
+    def askable(self, spec: ToolSpec) -> bool:
+        """Whether a call of ``spec`` can be the owner's direct ask at all."""
+        ...
 
 
 class Standing(Protocol):
@@ -219,6 +235,7 @@ class PolicyGate:
         batch_max: int = DEFAULT_BATCH_MAX,
         refusals: Mapping[ToolKey, RefusalFor] | None = None,
         summaries: Mapping[ToolKey, SummaryAction] | None = None,
+        owner_asks: OwnerAskCheck | None = None,
     ) -> None:
         """``refusals``: per-call never-lists; ``summaries``: a tool's whole approval line,
         code-built (the shell family's ``run `<command>` in <dir>``), cleaned like any
@@ -236,6 +253,7 @@ class PolicyGate:
         self.batch_max = batch_max
         self.refusals = dict(refusals or {})
         self.summaries = dict(summaries or {})
+        self.owner_asks = owner_asks
         self._tokens: dict[str, str] = {}
 
     @property
@@ -252,7 +270,7 @@ class PolicyGate:
         with atomic(self.conn):
             ap.expire_due(self.conn, now)
             autonomy = autonomy_on(self.conn)
-            decision, standing = self._decide(intent, now, autonomy, capped=capped)
+            decision, standing, asked = self._decide(intent, now, autonomy, capped=capped)
             audit(
                 self.conn,
                 "gate.evaluate",
@@ -274,29 +292,40 @@ class PolicyGate:
                 reason=decision.reason if isinstance(decision, Deny) else None,
                 standing=standing,
                 capped=capped or None,
+                owner_asked=asked,
                 args=intent.args,
             )
         return decision
 
     def _decide(
         self, intent: Intent, now: datetime, autonomy: bool, *, capped: bool = False
-    ) -> tuple[Decision, bool | None]:
-        """The decision, and whether a standing allow made the call L3 (None: not asked)."""
+    ) -> tuple[Decision, bool | None, str | None]:
+        """The decision, whether a standing allow made the call L3 (None: not asked), and
+        for a call marked as the owner's ask (PER-272): ``owner_asked`` when it ran as one,
+        else why not (None: not marked, or never got that far)."""
+        decision, standing, asked = self._decide_inner(intent, now, autonomy, capped=capped)
+        if asked is None and intent.asked is not None:
+            asked = "not reached"
+        return decision, standing, asked
+
+    def _decide_inner(
+        self, intent: Intent, now: datetime, autonomy: bool, *, capped: bool = False
+    ) -> tuple[Decision, bool | None, str | None]:
         if self.registry.get(intent.extension, intent.tool) != intent.spec:
             # Static reasons: the audit row already names the tool, extension and principal.
-            return Deny("tool is not registered with this spec"), None
+            return Deny("tool is not registered with this spec"), None, None
         if not self.principals.may_request(intent.principal, intent.spec):
-            return Deny("not permitted to request this tool"), None
+            return Deny("not permitted to request this tool"), None, None
         unsafe = unsafe_args(intent.args)
         if unsafe:
             # Never echo the offending keys or values: they are what's unsafe to show.
-            return Deny(f"args contain unsafe characters ({len(unsafe)} found)"), None
+            return Deny(f"args contain unsafe characters ({len(unsafe)} found)"), None, None
         refuse = self.refusals.get((intent.extension, intent.tool))
         if refuse is not None and (why := refuse(intent)) is not None:
-            return Deny(why), None
+            return Deny(why), None, None
         l0_read = intent.effect is Effect.READ and intent.level is Level.L0
         if self.dry_run and not l0_read and not is_store_internal(intent.spec):
-            return DryRun(would=self._summary(intent)), None
+            return DryRun(would=self._summary(intent)), None, None
         level = self._level(intent)
         standing: bool | None = None
         if level is Level.L2 and autonomy and self._standing_eligible(intent):
@@ -308,15 +337,39 @@ class PolicyGate:
         if capped and verdict == "allow" and not l0_read:
             verdict = "ask"  # past the task's unasked changes: this one asks (no yes always)
         if verdict == "allow" and intent.level is Level.L0:
-            return self._allow(intent), standing
+            return self._allow(intent), standing, None
         if ap.was_rejected(self.conn, intent.task_id, intent.hash):
-            return Deny(NOT_APPROVED), standing  # the owner's "no" holds for this intent
+            return Deny(NOT_APPROVED), standing, None  # the owner's "no" holds for this intent
         last = ap.latest_for_intent(self.conn, intent.task_id, intent.hash)
         if verdict == "allow":
             # An approval already given for this intent is still spent (single use), e.g.
             # the yes always that just made the call L3.
             approved = ap.approved_unused(self.conn, intent.task_id, intent.hash)
-            return self._allow(intent, approved.id if approved else None), standing
+            unattended = (approved is None and intent.origin != "explicit") or (
+                approved is not None and approved.decided_by == OWNER_ASKED
+            )
+            return (
+                self._allow(intent, approved.id if approved else None, unattended=unattended),
+                standing,
+                None,
+            )
+        asked: str | None = None
+        if verdict == "ask" and intent.asked is not None:
+            # L3 here is a tainted call (``rule`` asks for it): the lookups check decides
+            if capped or level not in (Level.L2, Level.L3) or not autonomy:
+                asked = "capped" if capped else ("autonomy off" if not autonomy else "level")
+            elif not self._owner_ask_eligible(intent):
+                asked = "not eligible"
+            elif last is not None:
+                asked = "asked before"  # one approval per intent: the earlier one decides
+            else:
+                assert self.owner_asks is not None
+                asked = self.owner_asks.check(intent)
+                if asked is None:
+                    ran = self._owner_asked(intent, now)
+                    if ran is not None:
+                        return ran, standing, "owner_asked"
+                    asked = "couldn't record"
         offer = None
         if (
             verdict == "ask"
@@ -328,7 +381,87 @@ class PolicyGate:
             assert self.standing is not None
             offer = self.standing.offer(intent)
         decision = self._ask(intent, now, last, require_code=verdict == "ask_code", offer=offer)
-        return decision, standing
+        return decision, standing, asked
+
+    def _owner_ask_eligible(self, intent: Intent) -> bool:
+        """PER-272: an owner's ask may apply: the owner's own model-chosen call (``inferred``,
+        or ``tainted`` only by the Resonant lookups ``OwnerAsks.check`` allows) of an L2
+        write, never pay, never a job's (``scheduled``) or a slash command's."""
+        return (
+            self.owner_asks is not None
+            and intent.asked is not None
+            and intent.origin in ("inferred", "tainted")
+            and intent.principal == self.principals.owner
+            and intent.level is Level.L2
+            and intent.effect is Effect.WRITE
+        )
+
+    def _owner_asked(self, intent: Intent, now: datetime) -> Allow | None:
+        """PER-272: run the call on the owner's own ask, recorded as an approval would be:
+        an approval row approved by the owner (``decided_by`` ``owner_asked``), its
+        ``approval.resolve`` audit row (``decision: owner_asked``, the message's event id), and
+        an ``Allow`` the executor spends it with. None when another path already asks for the
+        same action (PER-269) or it can't be recorded: the call asks instead."""
+        ask = intent.asked
+        assert ask is not None
+        if self._asked_already(ask.event_id, intent):
+            return None  # one change per tool per message: a second one asks
+        if ap.pending_for_intent(self.conn, intent.task_id, intent.hash, now) is not None:
+            return None
+        action = action_ids.for_intent(self.conn, intent)
+        if action is not None and ap.pending_for_action(self.conn, action.key, now):
+            return None
+        summary = self._summary(intent)
+        spec = ap.NewApproval(
+            task_id=intent.task_id,
+            intent_hash=intent.hash,
+            tool=intent.tool,
+            effect=intent.effect,
+            level=intent.level,
+            summary=summary,
+            approvers=(self.owner,),
+            code=new_code(ap.pending_codes(self.conn)),
+            expires_at=now + self.ttl,
+            extension=intent.extension,
+            requested_by=intent.principal,
+            phrased=self._phrased(intent, summary),
+            action_key=action.key if action is not None else None,
+            action_target=action.target if action is not None else None,
+        )
+        approval_id = ap.insert_approval(self.conn, spec, now)
+        refused = ap.resolve(self.conn, approval_id, approved=True, decided_by=OWNER_ASKED, now=now)
+        if refused is not None:
+            ap.expire_one(self.conn, approval_id, now, reason="owner_asked_refused")
+            return None
+        audit(
+            self.conn,
+            "approval.resolve",
+            task_id=intent.task_id,
+            requested_by=intent.principal,
+            approved_by=self.owner,
+            tool=intent.tool,
+            extension=intent.extension,
+            intent_hash=intent.hash,
+            decision=OWNER_ASKED,
+            requested="approve",
+            approval_id=approval_id,
+            event_id=ask.event_id,
+            lookups=sorted(ask.lookups) or None,
+            path=OWNER_ASKED,
+        )
+        # strict: the owner never saw this call's details (``merge_run`` merges as unattended)
+        return self._allow(intent, approval_id, unattended=True)
+
+    def _asked_already(self, event_id: str, intent: Intent) -> bool:
+        """The owner's message already gave an ask for this tool (one change per tool per
+        message: "file tickets for X and Y" asks for the second)."""
+        row = self.conn.execute(
+            """SELECT 1 FROM audit_log WHERE action = 'approval.resolve'
+                   AND decision = ? AND tool = ? AND extension IS ?
+                   AND json_extract(detail, '$.event_id') = ? LIMIT 1""",
+            (OWNER_ASKED, intent.tool, intent.extension, event_id),
+        ).fetchone()
+        return row is not None
 
     def _standing_eligible(self, intent: Intent) -> bool:
         """A standing allow may apply: the owner's own model-chosen call of a tool at L2."""
@@ -386,10 +519,12 @@ class PolicyGate:
             found.append(name)
         return tuple(found)
 
-    def _allow(self, intent: Intent, approval_id: str | None = None) -> Allow:
+    def _allow(
+        self, intent: Intent, approval_id: str | None = None, *, unattended: bool = False
+    ) -> Allow:
         token = secrets.token_urlsafe(16)
         self._tokens[token] = intent.hash
-        return Allow(token=token, approval_id=approval_id)
+        return Allow(token=token, approval_id=approval_id, unattended=unattended)
 
     def _ask(
         self,
@@ -401,8 +536,9 @@ class PolicyGate:
         offer: StandingScope | None = None,
     ) -> Decision:
         approved = ap.approved_unused(self.conn, intent.task_id, intent.hash)
-        if approved is not None:
-            return self._allow(intent, approved.id)
+        if approved is not None:  # an owner's ask resumed after a crash stays strict
+            return self._allow(intent, approved.id,
+                               unattended=approved.decided_by == OWNER_ASKED)  # fmt: skip
         pending = ap.pending_for_intent(self.conn, intent.task_id, intent.hash, now)
         if pending is not None:
             return _needs(pending)

@@ -173,7 +173,10 @@ elif args[:2] == ["pr", "view"]:
     pr = [p for p in prs if p["number"] == int(args[2])]
     if not pr:
         sys.exit(1)
-    print(json.dumps(keep(pr[0], opt("--json"))))
+    state = os.path.join(d, "merge_state")
+    found = {**pr[0], "mergeStateStatus": open(state).read().strip()
+             if os.path.exists(state) else "CLEAN"}
+    print(json.dumps(keep(found, opt("--json"))))
 elif args[:2] == ["pr", "checks"]:
     if "--watch" in args:  # the session pushed more commits: GitHub moves the PR's head
         run = lambda *a: subprocess.run(["git", *a], capture_output=True, text=True).stdout.strip()
@@ -1694,6 +1697,44 @@ async def test_merge_runs_through_the_workspace(h: Harness) -> None:
     assert h.run(code).status == "merged" and not h.code_dir(code).exists()
     assert not h.worktree(code).exists() and (h.checkout() / "README.md").exists()
     assert isinstance(await h.runner.merge_run(code), Refused)  # only once
+
+
+async def test_an_unattended_merge_is_strict_and_always_texted(h: Harness) -> None:
+    """PER-272: a merge on a standing allow (``unattended``) needs green CI and a CLEAN merge
+    state, refuses flagged paths, waits while CI runs, and the merge that waited is texted
+    even when the trust rules put merges in the digest."""
+    code = await h.start()
+    await h.drain()
+    (h.gh_dir / "checks_rc").write_text("1")
+    res = await h.runner.merge_run(code, unattended=True)
+    assert res == Refused("R1 not merged: CI isn't green")
+    (h.gh_dir / "checks_rc").write_text("0")
+    (h.gh_dir / "merge_state").write_text("BEHIND")
+    res = await h.runner.merge_run(code, unattended=True)
+    assert res == Refused("R1 not merged: its merge state is behind, not clean")
+    assert h.gh_calls("merge") == [] and h.run(code).status == "ready"
+    (h.gh_dir / "merge_state").write_text("CLEAN")
+    (h.gh_dir / "checks_rc").write_text("8")  # CI still running: the merge waits for it
+    res = await h.runner.merge_run(code, unattended=True)
+    assert isinstance(res, claude_mod.MergeQueued)
+    watch = task_store.get_task(h.conn, h.run(code).task_id or "")
+    assert watch is not None and watch.checkpoint.get("unattended") is True
+    sent = len(h.chan.texts())
+    (h.gh_dir / "checks_rc").write_text("0")
+    await h.drain()
+    assert h.run(code).status == "merged" and len(h.gh_calls("merge")) == 1
+    assert any("R1 merged" in t for t in h.chan.texts()[sent:])  # texted, not left to the digest
+
+
+async def test_an_unattended_merge_refuses_flagged_paths(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db, scenario="makefile")
+    code = await h.start()
+    await h.drain()
+    res = await h.runner.merge_run(code, unattended=True)
+    assert isinstance(res, Refused) and "changes .claude/settings.json" in res.reason
+    assert h.gh_calls("merge") == []
 
 
 async def test_merge_repeats_the_flagged_paths(tmp_path: Path, db: sqlite3.Connection) -> None:

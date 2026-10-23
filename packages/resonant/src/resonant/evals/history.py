@@ -383,12 +383,7 @@ class Deduper:
 def _fixture_tools() -> dict[str, frozenset[str]]:
     out: dict[str, frozenset[str]] = {}
     for name, fx in FIXTURES.items():
-        manifest: Any = yaml.safe_load(fx.manifest)
-        tools: Any = (
-            cast(dict[str, Any], manifest).get("tools") if isinstance(manifest, dict) else None
-        )
-        names = cast(dict[str, Any], tools) if isinstance(tools, dict) else {}
-        out[name] = frozenset(names)
+        out[name] = fx.tool_names
     return out
 
 

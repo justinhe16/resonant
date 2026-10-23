@@ -1621,7 +1621,9 @@ class ClaudeRunner:
             audit(self.conn, "run.auto_merge_stopped", run=run.code)
         return True
 
-    async def merge_run(self, code: str) -> Merged | MergeQueued | Refused:
+    async def merge_run(
+        self, code: str, *, unattended: bool = False
+    ) -> Merged | MergeQueued | Refused:
         """Squash-merge a ready run's PR (``--match-head-commit``, CI must be green). Whether
         to ask first is the caller's (the gate: ``/merge`` is explicit; chosen from chat it
         follows ``merge_decision``); the flagged paths and dependency files are in the
@@ -1632,7 +1634,13 @@ class ClaudeRunner:
         CI still running is not a refusal but a wait (``MergeQueued``: the run's merge watch,
         the auto-merge's bounded wait, merges it once CI is green and reports it the way an
         auto-merge does), and a repo with no CI at all merges with a warning in the reply.
-        Red CI and the checks still refuse it."""
+        Red CI and the checks still refuse it.
+
+        ``unattended`` (PER-272): the gate let it run on nobody's word for this call (a
+        standing allow on ``merge_run``, a trust rule). Then it is as strict as the auto-merge
+        and more: green CI (a repo or PR with no CI is refused; running CI still waits), no
+        flagged paths, a CLEAN merge state and ``--match-head-commit``; and a merge that
+        waited for CI is always texted, never left to the digest."""
         run = runs.get(self.conn, code)
         if run is None:
             return Refused(f"No run {code}.")
@@ -1647,17 +1655,22 @@ class ClaudeRunner:
             return Refused("The runner's secrets can't be read.")
         if secrets.github_token is None:
             return Refused(needs_github_token(f"Merging {run.code}"))
-        result = await self._merge(run.code, secrets, by="owner", allow_no_ci=True, wait_ci=True)
+        result = await self._merge(
+            run.code, secrets, by="owner", allow_flagged=not unattended,
+            allow_no_ci=not unattended, wait_ci=True, require_clean=unattended,
+        )  # fmt: skip
         if isinstance(result, MergeQueued):
-            self._watch_merge(self._must_get(run.code))
+            self._watch_merge(self._must_get(run.code), unattended=unattended)
         return result
 
-    def _watch_merge(self, run: Run) -> None:
+    def _watch_merge(self, run: Run, *, unattended: bool = False) -> None:
         """Start the owner's merge watch for a ready run whose CI is still running: a task
         (checkpoint ``merge``, ``watch``, ``by: owner``, ``since``) that ``_auto_merge`` steps
         like an auto-merge's, with the owner's looser rules (``_owner_merge_blocker``) and
         ``merge_wait_s`` counted from now. An auto-merge watch already waiting on the run is
-        replaced; an owner's watch already waiting is kept."""
+        replaced; an owner's watch already waiting is kept. ``unattended`` (PER-272): the
+        merge it waits for ran on a standing allow, so it stays strict and is always
+        texted."""
         task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
         # A watch caught mid-step (running) is replaced too: Loop.cancel cancels its step, else
         # it would go on beside the owner's watch.
@@ -1684,6 +1697,7 @@ class ClaudeRunner:
                 "watch": True,
                 "by": "owner",
                 "since": self.clock().isoformat(),
+                **({"unattended": True} if unattended else {}),
             },
         )
         task_id = self._create_task(spec)
@@ -1701,6 +1715,8 @@ class ClaudeRunner:
         allow_no_ci: bool = False,
         wait_ci: bool = False,
         replied: bool | None = None,
+        require_clean: bool = False,
+        always_text: bool = False,
     ) -> Merged | MergeQueued | Refused:
         """The one merge path of both ``merge_run`` and the auto-merge, one at a time per run
         (the row is read again under the lock, so two merges of one PR can't both go).
@@ -1709,7 +1725,8 @@ class ClaudeRunner:
         owner's merge (a repo with no CI merges, with a warning); ``wait_ci``: CI still
         running is ``MergeQueued``, not a refusal. ``replied``: the owner already got the
         reply (default: ``by == "owner"``), so the merged digest line is marked told;
-        otherwise it goes by the ``merged`` level."""
+        otherwise it goes by the ``merged`` level, or (``always_text``, PER-272: an unattended
+        merge) is always texted. ``require_clean``: the PR's merge state must be CLEAN."""
         async with self._merge_locks.setdefault(code, asyncio.Lock()):
             run = runs.get(self.conn, code)
             if run is None or not _mergeable(run):
@@ -1720,6 +1737,7 @@ class ClaudeRunner:
                 done = await self.workspace.merge(
                     run.repo, run.pr_number, run.head_sha, secrets, branch=run.branch,
                     allow_flagged=allow_flagged, allow_no_ci=allow_no_ci,
+                    require_clean=require_clean,
                 )  # fmt: skip
             except CiPending as e:
                 if wait_ci:
@@ -1737,7 +1755,8 @@ class ClaudeRunner:
                 if merged is not None:  # PER-269: the open asks for it are moot
                     approvals_store.obsolete_for_target(self.conn, merged, self.clock())
         told = by == "owner" if replied is None else replied
-        await self._report_merged(self._must_get(run.code), by_owner=told, deps=checked.deps)
+        await self._report_merged(self._must_get(run.code), by_owner=told, deps=checked.deps,
+                                  always_text=always_text)  # fmt: skip
         with contextlib.suppress(Exception):
             await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
         await self._remove_workspace(run)
@@ -3142,6 +3161,7 @@ class ClaudeRunner:
         line by the ``merged`` level, a stop as a text."""
         done = Done({"run": run.code, "status": run.status})
         owner = task.checkpoint.get("by") == "owner"
+        unattended = owner and task.checkpoint.get("unattended") is True  # PER-272
         why = self._owner_merge_blocker(run) if owner else self._auto_merge_blocker(run)
         state: str | None = None
         secrets: RunnerSecrets | None = None
@@ -3170,8 +3190,9 @@ class ClaudeRunner:
             why = "CI is red"
         if why is None and secrets is not None:
             merged = await self._merge(
-                run.code, secrets, by="owner" if owner else "auto", allow_flagged=owner,
-                allow_no_ci=owner, wait_ci=owner, replied=False,
+                run.code, secrets, by="owner" if owner else "auto",
+                allow_flagged=owner and not unattended, allow_no_ci=owner and not unattended,
+                wait_ci=owner, replied=False, require_clean=unattended, always_text=unattended,
             )  # fmt: skip
             if isinstance(merged, MergeQueued):  # CI restarted between the look and the merge
                 checkpoint = {**task.checkpoint, "watch": True}
@@ -3458,18 +3479,21 @@ class ClaudeRunner:
             named.append(f"{len(others) - 2} more")
         return f"Still working on {and_list(named)}."
 
-    async def _report_merged(self, run: Run, *, by_owner: bool, deps: Sequence[str] = ()) -> None:
+    async def _report_merged(
+        self, run: Run, *, by_owner: bool, deps: Sequence[str] = (), always_text: bool = False
+    ) -> None:
         """A merged run's digest line (it lists the dependency files the PR changed, ``deps``).
         ``by_owner``: the merge answered the owner's own ``/merge`` (or a yes), which already
         got the reply, so the line is marked told. Otherwise (EM-7's merge per trust rules,
-        or an owner's merge that waited for CI) it goes by the ``merged`` level."""
+        or an owner's merge that waited for CI) it goes by the ``merged`` level; an unattended
+        merge (``always_text``, PER-272) is texted whatever the level."""
         item = self.reports.ended(run, end_title(run, deps=deps), urgent=False)
         if by_owner:
             self.reports.told(item)
             return
         level = self.reports.level(run, "merged")
         self.reports.audit_report(run, "merged", level)
-        if level == "digest":
+        if level == "digest" and not always_text:
             return
         try:
             await self.channel.send(run.principal, item.title,  # with its did: list
