@@ -683,6 +683,29 @@ def _attachment_roots() -> list[Path]:
     return [Path("~/Library/Messages/Attachments")]
 
 
+class VoiceConfig(_Section):
+    """``brain.voice`` (PER-273, ``brain/voice.py``, ``runners/voice.py``): Claude writes the
+    prose of the texts Resonant sends on its own (a run's outcome, the hourly pulse, the
+    briefing) with one one-shot ``claude -p`` call each. Code keeps the facts, the ⚠ lines,
+    the side-effect lines and the closing line; a text the guard stops, or any trouble with
+    Claude, sends the code-built text instead."""
+
+    enabled: bool = True
+    kinds: list[Literal["outcome", "pulse", "briefing"]] = Field(
+        default_factory=lambda: ["outcome", "pulse", "briefing"]
+    )
+    # One call's wall clock; past it the call is killed and the code-built text goes out.
+    timeout_s: float = Field(default=25.0, gt=0, le=40)
+    # Calls a day (settings.timezone), separate from ``ask_claude.daily_cap``. 0: no cap.
+    daily_cap: int = Field(default=40, ge=0, le=500)
+    # The prose's length; the whole text (tail and closing line included) may run 400 over.
+    max_chars: int = Field(default=600, ge=200, le=900)
+    # ``claude --model``; unset: the CLI's default.
+    model: str | None = None
+    # API billing only (``runner/anthropic_key``): ``--max-budget-usd`` per call.
+    max_budget_usd: float = Field(default=0.10, gt=0, le=2)
+
+
 class AskClaudeConfig(_Section):
     """``ask_claude`` (docs/brain-plan.md D8, ``runners/ask.py``): a read-only ``claude -p``
     session per question, its own task, apart from the worker slots."""
@@ -902,6 +925,8 @@ class BrainConfig(_Section):
     rg_path: Path | None = Path("/opt/homebrew/bin/rg")
     # ask_claude (BR-5, docs/brain-plan.md D8): reads the same roots and deny list.
     ask_claude: AskClaudeConfig = Field(default_factory=AskClaudeConfig)
+    # PER-273: Claude writes the prose of Resonant's own texts (outcomes, pulse, briefing).
+    voice: VoiceConfig = Field(default_factory=VoiceConfig)
     # BR-11: the Claude brain (one persistent session for the owner's hard texts).
     claude_session: ClaudeSessionConfig = Field(default_factory=ClaudeSessionConfig)
     # BR-7 (D10). Voice notes: a local whisper binary (whisper.cpp's ``whisper-cli``, by

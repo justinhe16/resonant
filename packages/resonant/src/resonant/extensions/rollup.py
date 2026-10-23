@@ -287,13 +287,13 @@ def entries(
                                                                "queued": []}  # fmt: skip
     for i in mine:
         if i.key.startswith(STALL_PREFIX):
-            stalls[_stall_kind(i, r)].append((i.title, i))
+            stalls[stall_kind(i, r)].append((i.title, i))
     told = sorted(context, key=lambda i: (i.updated_at, i.key))
     quiet: list[tuple[str, store.Item | None]] = []
     for i in told:
         if not i.key.startswith(STALL_PREFIX) or i.cleared or (i.source, i.key) in keys:
             continue
-        kind = _stall_kind(i, r)
+        kind = stall_kind(i, r)
         name = (
             i.title.removesuffix(_QUIET_SUFFIX) + ")"
             if i.title.endswith(_QUIET_SUFFIX)
@@ -329,13 +329,22 @@ def entries(
     return [*out, *status][:LINES_MAX]
 
 
-def _stall_kind(item: store.Item, r: Rollup) -> str:
+def stall_kind(item: store.Item, r: Rollup) -> str:
     """What a stall's quiet means: ``ready`` (a PR waiting on the owner's merge), ``queued``
     (behind the slot limit) or ``dropped``."""
     code = _stall_code(item)
     if code in r.ready:
         return "ready"
     return "queued" if code in r.queued else "dropped"
+
+
+def merged_parts(title: str) -> tuple[str, int, str | None] | None:
+    """``(code, PR number, extra)`` of a merged run's item title (``R4 merged: PR #12 · <url>
+    · deps changed: …``), or None. ``extra``: the deps and side-effect part."""
+    m = _MERGED.match(title)
+    if m is None:
+        return None
+    return m.group(1), int(m.group(2)), m.group(3)
 
 
 def _news_first(

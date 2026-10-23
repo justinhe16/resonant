@@ -88,6 +88,7 @@ from zoneinfo import ZoneInfo
 import psutil
 
 from resonant import killswitch
+from resonant.brain.voice import Voice, VoiceResult, merged_facts, outcome_facts, record_text
 from resonant.config import RunnerConfig, RunnerRepo
 from resonant.extensions.notify import clean_text
 from resonant.gate import actions as action_ids
@@ -945,6 +946,7 @@ class ClaudeRunner:
         rc_timeout_s: float = RC_TIMEOUT_S,
         rc_off_timeout_s: float = RC_OFF_TIMEOUT_S,
         end_grace_s: float = END_GRACE_S,
+        voice: Voice | None = None,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -971,7 +973,11 @@ class ClaudeRunner:
 
         RC-1: ``rc_timeout_s`` is how long a session's Remote Control request waits for its
         answer and ``rc_off_timeout_s`` turning it off at the end; ``end_grace_s`` is how long
-        a session whose stdin Resonant closed may stay quiet before it is killed."""
+        a session whose stdin Resonant closed may stay quiet before it is killed.
+
+        PER-273: ``voice`` writes the prose of a run's outcome text (``brain/voice.py``): the
+        code-built text stays the fallback and the ⚠ lines, side effects and the closing
+        line stay code-built. None: every text is code-built."""
         self.conn = conn
         self.cfg = runner
         self.channel = channel
@@ -1048,6 +1054,8 @@ class ClaudeRunner:
             on_restart=self._on_self_restart,
             on_self_op=self._on_self_op,
         )
+        self.voice = voice
+        self.owner = owner
         self.home = home or Path.home()
         self._login_check: Callable[[], Awaitable[bool]] = login_check or LoginCheck(
             self._claude_argv, self.home
@@ -1756,7 +1764,7 @@ class ClaudeRunner:
                     approvals_store.obsolete_for_target(self.conn, merged, self.clock())
         told = by == "owner" if replied is None else replied
         await self._report_merged(self._must_get(run.code), by_owner=told, deps=checked.deps,
-                                  always_text=always_text)  # fmt: skip
+                                  always_text=always_text, title=checked.title)  # fmt: skip
         with contextlib.suppress(Exception):
             await asyncio.to_thread(delete_run_dir, self.cfg.work_dir, run.code)
         await self._remove_workspace(run)
@@ -3411,6 +3419,7 @@ class ClaudeRunner:
             title += f" · ⚠ token not revoked, expires {at}"
             warned = True
         text: str | None = None
+        also: str | None = None
         if parts is not None:
             head, lines, said = parts
             if run.status != "cancelled" and (still := self._still_working(run)):
@@ -3441,6 +3450,18 @@ class ClaudeRunner:
             if level == "digest":
                 self._unrevoked.pop(run.code, None)  # the line carries the warning
                 return
+        voiced: VoiceResult | None = None
+        if self.voice is not None and parts is not None and self._voiced(run):
+            # PER-273: Claude writes the prose; the ⚠ lines, side effects and the closing
+            # line stay code-built. Any trouble sends ``text`` as it is (the fallback).
+            facts = outcome_facts(run, ci=ci, no_ci=no_ci, upstream=upstream, watching=watching,
+                                  merged=merged, merged_by=merged_by, warn=warn, note=note,
+                                  lines=parts[1], also=also,
+                                  going=self._still_names(run))  # fmt: skip
+            if facts is not None:
+                voiced = await self.voice.write(facts, text, ref=f"run:{run.code}:{run.status}")
+                if voiced.used:
+                    text = voiced.text
         try:
             await self.channel.send(run.principal, text, dedupe_key=f"run:{run.code}:{run.status}")
         except ChannelRefused:  # nobody took it: the digest carries the line (and warning)
@@ -3460,33 +3481,51 @@ class ClaudeRunner:
                          watching=watching, merged=merged, merged_by=merged_by)  # fmt: skip
         if bare is not None:
             said = end_text(bare[0], [*warn, *([note] if note else []), *bare[1]])
+            if voiced is not None and voiced.used:
+                said = record_text(text)  # PER-273: what the owner read
             ref = f"run:{run.code}:{run.status}"
             system_texts.record(self.conn, run.principal, "run", said, ref=ref,
                                 task_id=run.task_id, outside=True)  # fmt: skip
 
-    def _still_working(self, run: Run) -> str:
-        """``Still working on R5 (public dashboard view).``: the owner's other active runs,
-        by name (at most two, then ``+N more``), or "" when nothing else is running."""
+    def _voiced(self, run: Run) -> bool:
+        """Whether ``run``'s outcome text is written by the voice: the owner's, not a
+        cancel (the owner did it, the text is one line of ours)."""
+        return run.status != "cancelled" and (self.owner is None or run.principal == self.owner)
+
+    def _still_names(self, run: Run) -> list[str]:
+        """The owner's other active runs, by name (at most two, then ``N more``); [] when
+        nothing else is running or the lookup fails."""
         try:
             others = [r for r in runs.active(self.conn) if r.code != run.code
                       and r.principal == run.principal]  # fmt: skip
         except Exception:  # the clause is a courtesy: the reply goes out without it
-            return ""
-        if not others:
-            return ""
+            return []
         named = [run_who(r) for r in others[:2]]
         if len(others) > 2:
             named.append(f"{len(others) - 2} more")
-        return f"Still working on {and_list(named)}."
+        return named
+
+    def _still_working(self, run: Run) -> str:
+        """``Still working on R5 (public dashboard view).``: the owner's other active runs,
+        by name (at most two, then ``+N more``), or "" when nothing else is running."""
+        named = self._still_names(run)
+        return f"Still working on {and_list(named)}." if named else ""
 
     async def _report_merged(
-        self, run: Run, *, by_owner: bool, deps: Sequence[str] = (), always_text: bool = False
+        self,
+        run: Run,
+        *,
+        by_owner: bool,
+        deps: Sequence[str] = (),
+        always_text: bool = False,
+        title: str | None = None,
     ) -> None:
         """A merged run's digest line (it lists the dependency files the PR changed, ``deps``).
         ``by_owner``: the merge answered the owner's own ``/merge`` (or a yes), which already
         got the reply, so the line is marked told. Otherwise (EM-7's merge per trust rules,
         or an owner's merge that waited for CI) it goes by the ``merged`` level; an unattended
-        merge (``always_text``, PER-272) is texted whatever the level."""
+        merge (``always_text``, PER-272) is texted whatever the level. ``title``: the PR's
+        first commit subject, for the voiced text (PER-273)."""
         item = self.reports.ended(run, end_title(run, deps=deps), urgent=False)
         if by_owner:
             self.reports.told(item)
@@ -3495,13 +3534,24 @@ class ClaudeRunner:
         self.reports.audit_report(run, "merged", level)
         if level == "digest" and not always_text:
             return
+        text = item.title  # with its did: list
+        voiced: VoiceResult | None = None
+        if self.voice is not None and self._voiced(run):
+            facts = merged_facts(run, title=title, deps_line=deps_line(deps) or None,
+                                 also=self.reports.also_line(run))  # fmt: skip
+            voiced = await self.voice.write(facts, text, ref=f"run:{run.code}:merged")
+            if voiced.used:
+                text = voiced.text
         try:
-            await self.channel.send(run.principal, item.title,  # with its did: list
-                                    dedupe_key=f"run:{run.code}:merged")  # fmt: skip
+            await self.channel.send(run.principal, text, dedupe_key=f"run:{run.code}:merged")
         except ChannelError as e:
             log.warning("merge not texted", extra={"run": run.code, "reason": str(e)})
             return
         self.reports.told(item)
+        if voiced is not None and voiced.used:
+            system_texts.record(self.conn, run.principal, "run", record_text(text),
+                                ref=f"run:{run.code}:merged", task_id=run.task_id,
+                                outside=True)  # fmt: skip
 
     async def _finish_cancelled(self, code: str, *, send: bool = True) -> None:
         """What a cancelled run still needs once its processes are gone: its dir deleted, its

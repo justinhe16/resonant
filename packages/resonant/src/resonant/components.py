@@ -55,6 +55,7 @@ from resonant_sdk import Level, ToolSpec
 
 if TYPE_CHECKING:
     from resonant.api import DaemonState
+    from resonant.brain.voice import Voice
     from resonant.ops import OpsRunner
 
 log = logging.getLogger(__name__)
@@ -76,6 +77,9 @@ class Components:
     extensions: ExtensionHost | None = None  # None only in tests that build by hand
     ops_runner: OpsRunner | None = None  # the ops tools' subprocesses (None: the real one)
     shell: ShellPolicy | None = None  # PER-258: the Claude brain's own tool calls (gate/shell)
+    # PER-273: writes the prose of Resonant's own texts (outcomes, pulse, briefing); None:
+    # they stay code-built. Set by ``wiring.build_imessage_stack``, read by the core jobs.
+    voice: Voice | None = None
 
     def chat_specs(self) -> list[ToolSpec]:
         """Every registered spec a chat step can call: builtins and extension tools, never

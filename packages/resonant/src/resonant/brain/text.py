@@ -31,7 +31,7 @@ def flat(text: str, limit: int | None = None) -> str:
 # when no approval is pending (qwen looped "The merge is queued. Approve it now?" with
 # nothing to approve). Only Resonant's own prompt asks for a yes; the model calls the tool.
 NO_PENDING_REPLY = "Nothing is waiting for your yes right now. Say what to do and I'll ask for it."
-_PENDING_ASK = re.compile(
+PENDING_ASK = re.compile(
     r"\b(?:approve|ok|okay)\s+(?:it|this|that)(?:\s+now)?\s*\?"
     r"|\b(?:reply|say|text|send)\s+(?:me\s+)?['\"\u2018\u201c]?yes\b"
     r"|\b(?:merge|change|request|approval)\s+(?:is|was|has\s+been)\s+queued\b"
@@ -51,7 +51,7 @@ def drop_pending_asks(reply: str) -> tuple[str, int]:
     dropped = 0
     for line in reply.splitlines():
         parts = [p for p in _SENTENCES.split(line) if p.strip()]
-        keep = [p for p in parts if not _PENDING_ASK.search(p)]
+        keep = [p for p in parts if not PENDING_ASK.search(p)]
         dropped += len(parts) - len(keep)
         if keep or not parts:
             kept.append(" ".join(keep))

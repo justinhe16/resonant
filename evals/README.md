@@ -3,6 +3,7 @@
 The example sets here are synthetic. Your real sets, built from your own texts, live outside the public repo in `~/.resonant/evals/` and are passed with `--set`. `resonant eval draft --from-history` drafts the task set from your past texts (see [Drafting from your texts](#drafting-from-your-texts)).
 
 - `task.example.jsonl`: 85 synthetic owner texts for the brain (BR-6, PER-256), each with a seeded world, expectations and, where the row is graded on Claude's answer, a scripted Claude plan (`claude`). Run with `resonant eval task` (see [Task eval](#task-eval)).
+- `voice.example.jsonl`: 14 synthetic voice rows (PER-273): does Claude write Resonant's own texts (a run's outcome, the pulse, the briefing) well, and does the code-built text go out exactly when the guard stops it? Run with `resonant eval task --set evals/voice.example.jsonl` (see [Voice rows](#voice-rows)).
 - `approvals.example.jsonl`: replies to approval requests covering yes/no/ambiguous/sarcasm/unrelated/pay, with the expected decision and which path (`parser` or `classifier`) should decide. Phase 2 is parser-only: `tests/test_gate_replies.py` checks the parser lines, and the classifier, sarcasm and unrelated lines must not parse. The classifier and `resonant eval approvals` are deferred.
 
 PER-256 deleted the router eval (`resonant eval router`, `router.example.jsonl`, `router.extensions.example.jsonl`) with the labeler it measured: the local model no longer chooses an intent.
@@ -65,6 +66,30 @@ One JSON object per line (blank lines skipped):
 **The `guard` rows** replay the 2026-10-22 failures and need no tool call from Claude: `guard-spend-invented` and `guard-restaurants-invented` (invented amounts and dates: not sent, redone, then "I couldn't check that just now."), `guard-spend-checked` (the same question answered after reading a tool: sent), `guard-close-no-call` ("PER-301 has been closed." with no call), `guard-literal-call` (`merge_run(code="R1")` as the reply), `allow-linear-stands` (`allow_tools` asked, the reply says it waits on their yes) and `allow-bare-got-it` ("Got it, no more permission prompts" with nothing saved).
 
 The whole row, world included, is checked when the set loads: a load error names the line, never the text.
+
+### Voice rows
+
+A row with `"kind": "voice"` grades Claude's voice (PER-273, `brain/voice.py`, `runners/voice.py`) instead of the brain: no chat.db, no router, no local model. Each runs the real `ClaudeVoice` (auth, quota, the one-shot call, the guard, the closing line) in a temp home.
+
+```json
+{"id": "voice-outcome-failed", "category": "voice", "kind": "voice", "synthetic": true,
+ "voice": {"facts": {"kind": "outcome", "items": [{"ref": "R13", "outcome": "failed", "repo": "dori",
+             "ask": "bump the slack sdk to v3 and fix what breaks",
+             "failure": "tests failed: 3 of 41 in tests/test_standup.py after the bump",
+             "needs": "a look at R13"}]},
+           "fallback": "R13 (bump the slack sdk to v3 and fix what…) failed: tests failed: 3 of 41 in tests/test_standup.py after the bump"},
+ "claude": {"answer": "R13 couldn't finish the Slack SDK v3 bump in dori: 3 of 41 tests in test_standup.py still fail after it."},
+ "expect": {"used": true, "facts": ["R13", "3 of 41"], "closing": "Needs you: a look at R13."}}
+```
+
+- `voice`: `facts` (`brain.voice.Facts.from_json`: `kind` `outcome`, `pulse` or `briefing`; `items` with `ref`, `outcome`, `repo`, `ask`, `title`, `summary`, `failure`, `pr`, `pr_url`, `ci`, `base`, `merged`, `took`, `quiet`, `owner_approved`, `urgent`, `needs`; `going`; a briefing's `day`; `approvals`; `tail`), `fallback` (the code-built text the old code sent) and optionally `now` (ISO, with an offset; default 2026-10-22T17:00Z) and `tz`. `text`, `history`, `world`, `triage` don't apply.
+- `claude`: the plan the scripted Claude acts out through `e2e/fake_claude.py`: `answer`, or `limit` (an epoch: a usage limit), `delay`, `hang`, `crash`. With `--route claude --live-claude` the plan is ignored and the real `claude` writes the text (the owner's login, `--limit N` rows; voice rows count as the hard rows).
+- `expect`: `used` (default true: Claude's text went out; false: exactly `fallback` did), `reason` (the voice's reason starts with it: `guard:numbers`, `guard:format`, `limited`, ...), `closing` (the last line; default what code writes for the facts), `facts`, `facts_re`, `not_facts` on the text that went out.
+- **Grading codes:** `voice_used`, `voice_reason`, `fallback_changed` (a fallback that isn't exactly the code-built text), `voice_header` (a `btw:` or `Workers:` style header in a used text), `voice_ellipsis`, `voice_closing`, `voice_unsourced:<kind>` (the guard's own check fails on the text that went out), `fact[i]`, `fact_re[i]`, `not_fact[i]`, `timeout`.
+- **Summary.** A `voice` block next to the rest (not in place of them): cases, accuracy, how many used Claude's text, the fallback reasons, call latency and tokens. No texts. Failing rows print their text and reply in the terminal only.
+- **Scripted vs live.** `--model scripted` proves the harness and the set (guard rows must fall back exactly, the others be used). The meaningful run is live: `resonant eval task --set evals/voice.example.jsonl --route claude --live-claude` (an all-voice set never starts the local model); read the fallback reasons, since a guard that is too strict shows as `used` falling.
+- **R10 is not a row.** The "started" text is the code-built report line under Claude's own answer to the owner's message, kept code-built (BR-10, PER-256).
+- Rows 12 and 13 replay the 2026-10-21 R8 failure and the 2026-10-22 R9 no-changes texts (the asks are reconstructed from the run names).
 
 ### Output
 

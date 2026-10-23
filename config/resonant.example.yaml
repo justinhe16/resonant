@@ -153,6 +153,19 @@ pulse:
 #     pause_check_s: 5                  # an idle session stops this soon after a CLI pause
 #     transcript_days: 14               # its earlier sessions' transcripts kept this long; 0: kept
 #     max_turns: 40                     # Claude's tool rounds per owner text (--max-turns)
+#   voice:                              # PER-273: Claude writes the prose of the texts Resonant sends on
+#                                       #   its own (a run's outcome, the hourly pulse, the briefing), one
+#                                       #   short claude -p call each. Code keeps the facts, the warnings,
+#                                       #   the side-effect lines and the "No action needed." / "Needs
+#                                       #   you: ..." line; anything the guard stops, or any trouble with
+#                                       #   Claude, sends the plain code-built text as before
+#     enabled: true                     # false: every one of those texts stays code-built
+#     kinds: [outcome, pulse, briefing] # drop one to keep that text code-built
+#     timeout_s: 25                     # past it the call is killed and the plain text goes out (1..40)
+#     daily_cap: 40                     # calls a day, apart from ask_claude.daily_cap; 0: none
+#     max_chars: 600                    # the prose's length (the whole text may run 400 over)
+#     model: null                       # claude --model; null: the CLI's default
+#     max_budget_usd: 0.10              # only with runner/anthropic_key
 #   # BR-7: media, watches, proactive notices (docs/brain-plan.md D10)
 #   whisper_path: null                  # a local whisper.cpp whisper-cli (absolute) for voice notes;
 #                                       #   null: a voice note gets "type it instead" (Claude takes no audio)

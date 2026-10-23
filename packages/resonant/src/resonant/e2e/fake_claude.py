@@ -25,6 +25,10 @@ command, args and env). Then it acts out the plan:
   session saw (its last line, clipped to 200), ``{n}`` how many it has seen.
 
 **One-shot** (no ``--input-format``): the question is all of stdin, one plan, one result.
+The plan's ``"crash"``, ``"delay"``, ``"hang"`` and ``"limit"`` (below) apply to it too
+(PER-273: the proactive-text voice is a one-shot), and ``"init_tools": ["Bash"]`` lists tools
+in the ``init`` event (a voice call that sees tools must be refused). An answer may use
+``{prompt}`` for the whole stdin.
 
 **Session** (``--input-format stream-json``, BR-11): stdin stays open; every ``user`` line is
 one turn and gets an ``init`` then its own ``result``; ``control_request`` lines get a
@@ -56,6 +60,7 @@ import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -140,8 +145,9 @@ class Fake:
                 return turn
         return plan
 
-    def init(self, session_id: str) -> None:
-        out({"type": "system", "subtype": "init", "session_id": session_id, "tools": self.tools,
+    def init(self, session_id: str, extra_tools: Sequence[str] = ()) -> None:
+        out({"type": "system", "subtype": "init", "session_id": session_id,
+             "tools": [*self.tools, *extra_tools],
              "mcp_servers": [{"name": n, "status": "connected"} for n in self.servers],
              "permissionMode": "dontAsk"})  # fmt: skip
 
@@ -281,14 +287,26 @@ class Fake:
 
     def one_shot(self) -> int:
         prompt = sys.stdin.read()
-        self.init("fake-brain")
         plan = self.plan(prompt)
+        listed = cast(list[Any], plan.get("init_tools") or [])
+        self.init("fake-brain", [str(t) for t in listed])
         results = self.act(plan)
         self.shell(plan, results)
         self.close()
         self.notes(prompt=prompt, results=results)
+        if plan.get("crash") == "always":
+            os._exit(1)  # mid-call: no result
+        if delay := plan.get("delay"):
+            time.sleep(float(delay))
+        if plan.get("hang"):
+            time.sleep(3600)
+        if "limit" in plan:
+            reset = plan.get("limit")
+            out({"type": "result", "subtype": "error_usage_limit", "is_error": True,
+                 "result": "usage limit reached" + (f" | {reset}" if reset else "")})  # fmt: skip
+            return 1
         out({"type": "result", "subtype": "success", "is_error": False,
-             "result": self.answer(plan, results), "num_turns": 1 + len(results),
+             "result": self.answer(plan, results, prompt=prompt), "num_turns": 1 + len(results),
              "total_cost_usd": 0.0, **USAGE})  # fmt: skip
         return 0
 

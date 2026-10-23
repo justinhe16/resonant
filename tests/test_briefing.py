@@ -16,6 +16,9 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pytest
+from voice_script import Script, scripted_voice
+
 from resonant import killswitch
 from resonant.api import DaemonState
 from resonant.components import Components, build_components
@@ -32,6 +35,7 @@ from resonant.secrets import FakeKeychain, SecretStore
 from resonant.store import approvals as ap
 from resonant.store import extensions as ext_store
 from resonant.store import pulse as pulse_store
+from resonant.store import runs as runs_store
 from resonant.store import tasks as repo
 from resonant.store.db import atomic, iso, kv_set, open_db
 from resonant.tools.reminders import add_reminder
@@ -504,3 +508,118 @@ async def test_on_demand_sends_nothing_while_paused_or_unreachable() -> None:
             "skipped": "unreachable",
         }
         assert h.channel.sent == []
+
+
+# --- Claude's voice (PER-273) --------------------------------------------------------------
+
+
+async def run_job(h: Harness, due: datetime, *, now: datetime | None = None) -> dict[str, Any]:
+    """The scheduled job (the path that hands ``components.voice`` to the briefing)."""
+    job = bf.briefing_job(h.deps(h.channel), clock=h.clock)
+    assert job is not None
+    h.clock.now = now or due
+    return await job.run({"due_at": due.isoformat()}, CTX)
+
+
+MORNING = (
+    "Morning. You've got stretch at 9:30am and call mom at 3pm. R1 couldn't finish adding "
+    "retries to the notion client in dori: its tests still fail."
+)
+
+
+def seed_day(h: Harness) -> None:
+    """Two reminders, a failed worker nobody heard of, an approval, a degraded check and an
+    extension item: every kind of line the briefing can hold."""
+    remind(h.db, local(10, 13, 15), "call mom", now=T0)
+    remind(h.db, local(10, 13, 9, 30), "stretch", now=T0)
+    run = runs_store.create(
+        h.db, repo="dori", ask="add retries to the notion client", principal=OWNER,
+        session_id="s", max_seconds=600,
+    )  # fmt: skip
+    runs_store.update(h.db, run.code, status="running")
+    runs_store.finish(h.db, run.code, "failed", failure="tests failed", step="reply")
+    pulse_store.upsert(
+        h.db, "core", pulse_store.run_key(run.code), f"{run.code} failed: tests failed",
+        "urgent", {"status": "failed"}, True, 24 * 3600, T0,
+    )  # fmt: skip
+    approval(h.db, "A7", T0)
+    degrade(h.db, "imessage")
+    pulse_store.upsert(h.db, "dori", "k", "Dori recovered", "normal", None, False, 24 * 3600, T0)
+
+
+async def test_the_briefing_is_prose_the_kept_lines_then_the_closing_line() -> None:
+    async with harness() as h:
+        seed_day(h)
+        script = Script(MORNING)
+        h.components.voice = scripted_voice(
+            h.db, h.settings.home, script, clock=h.clock, timezone=TZ
+        )
+        out = await run_job(h, T0)
+        assert out["sent"] is True
+        assert h.channel.texts() == [
+            f"{MORNING}\n⚠ imessage degraded\n[dori] Dori recovered\n"
+            "Needs you: approve A7; a look at R1."
+        ]
+        prompt = script.prompts[0]
+        assert "A7" not in prompt and "SECRET" not in prompt  # approval codes never reach Claude
+        assert "Tuesday" in prompt and "9:30am" in prompt and "stretch" in prompt
+        assert "degraded" not in prompt and "Dori recovered" not in prompt  # the tail is ours
+        assert not pulse_store.pending(h.db, ("urgent", "normal"), T0)  # items told, as before
+
+
+async def test_a_rerun_of_the_days_key_says_the_same_thing_without_calling_again() -> None:
+    async with harness() as h:
+        seed_day(h)
+        script = Script(MORNING)
+        h.components.voice = scripted_voice(
+            h.db, h.settings.home, script, clock=h.clock, timezone=TZ
+        )
+        await run_job(h, T0)
+        again = await run_job(h, T0, now=T0 + timedelta(minutes=5))
+        assert again["sent"] is True and len(h.channel.sent) == 1 and script.calls == 1
+        assert again["chars"] == len(h.channel.texts()[0])
+
+
+async def test_the_empty_briefing_makes_no_call() -> None:
+    async with harness() as h:
+        script = Script(MORNING)
+        h.components.voice = scripted_voice(
+            h.db, h.settings.home, script, clock=h.clock, timezone=TZ
+        )
+        await run_job(h, T0)
+        assert h.channel.texts() == [bf.nothing_line(date(2026, 10, 13))] and script.calls == 0
+
+
+async def test_a_briefing_of_only_health_and_updates_makes_no_call() -> None:
+    async with harness() as h:
+        degrade(h.db, "imessage")
+        pulse_store.upsert(h.db, "dori", "k", "Dori recovered", "normal", None, False, 3600, T0)
+        script = Script(MORNING)
+        h.components.voice = scripted_voice(
+            h.db, h.settings.home, script, clock=h.clock, timezone=TZ
+        )
+        await run_job(h, T0)
+        assert script.calls == 0
+        assert h.channel.texts()[0] == ("⚠ imessage degraded\nUpdates:\n[dori] Dori recovered")
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Morning. Stretch at 9:30am. R1 failed.",  # the 3pm reminder is left out
+        "Morning! Stretch at 9:30am, call mom at 3pm, R1 failed. Reply yes to retry.",
+        "Morning. Stretch at 9:30am, call mom at 3pm, and R1 failed after 47 retries.",
+    ],
+)
+async def test_a_guard_miss_sends_exactly_the_code_built_briefing(answer: str) -> None:
+    async with harness() as plain:
+        seed_day(plain)
+        await run_job(plain, T0)
+        expected = plain.channel.texts()[0]
+    async with harness() as h:
+        seed_day(h)
+        h.components.voice = scripted_voice(
+            h.db, h.settings.home, Script(answer), clock=h.clock, timezone=TZ
+        )
+        await run_job(h, T0)
+        assert h.channel.texts() == [expected]

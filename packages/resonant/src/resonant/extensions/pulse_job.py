@@ -36,6 +36,15 @@ On demand: ``run_pulse_now(deps)`` (P35-5's ``/pulse now``, ``/ext run core/puls
 pause. ``preview(conn, now)`` is the pure text of what the next pulse would say.
 Results carry counts and reasons, never text.
 
+In Claude's voice (PER-273, ``brain.voice``, ``brain/voice.py``): when the pulse has workers'
+news, Claude writes its prose from the same items as facts and the text is the prose, then
+the lines code keeps verbatim (a ⚠ line, a run's side effects, extension items and worker
+questions, ``+N more``), then a code-built closing line (``No action needed.`` or ``Needs
+you: ...``). No ``btw:`` header or section labels. A pulse of only extension items or
+questions, no Claude (down, at its usage limit, over ``brain.voice.daily_cap``, paused) or a
+text the guard stops is the code-built pulse above, exactly. ``/pulse`` and ``pulse_preview``
+are always the code-built preview.
+
 Exactly once (``deliver``, shared with the briefing): before ``channel.send`` the exact text and
 the (source, key, fingerprint) of the items in it are stored in kv ``pulse.inflight:<dedupe
 key>``. A rerun of the same key (a crash between send and mark, a catch-up, a restart) never
@@ -49,9 +58,10 @@ after its send is not rerun: the scheduler consumes its due time). Records are p
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
-from collections.abc import Callable, Sequence
-from dataclasses import replace
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
@@ -65,6 +75,7 @@ from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.tools.when import format_due
 
 if TYPE_CHECKING:
+    from resonant.brain.voice import Facts, Voice
     from resonant.config import Settings
     from resonant.extensions.scheduler import CoreDeps, CoreJob
     from resonant.gateway.channel import Channel
@@ -274,18 +285,30 @@ def preview(
     only refreshed by a run)."""
     at = now or utcnow()
     composed = _compose_now(conn, at, stall_after, hide_approvals=hide_approvals)
-    return None if composed is None else composed[0]
+    return None if composed is None else composed.text
+
+
+@dataclass(frozen=True)
+class Composed:
+    """A composed pulse: the code-built ``text``, the items it ``listed``, and what the voice
+    needs to say it again (PER-273): the workers still ``going`` and the rollup's names."""
+
+    text: str
+    listed: list[store.Item]
+    going: list[store.Item]
+    roll: rollup.Rollup
 
 
 def _compose_now(
     conn: sqlite3.Connection, now: datetime, stall_after: timedelta, *, hide_approvals: bool
-) -> tuple[str, list[store.Item]] | None:
+) -> Composed | None:
     """:func:`compose` over the store: the pending items, the running workers and the
     rollup's names for them. Read-only."""
     items = rollup.held_while_stale(conn, now, _pending(conn, now, hide_approvals=hide_approvals))
     going = [*running_workers(conn, now), *rollup.quiet_items(conn, now)]
     roll = rollup.gather(conn, now, [*items, *going], stall_after=stall_after)
-    return compose(items, going, roll)
+    built = compose(items, going, roll)
+    return None if built is None else Composed(built[0], built[1], going, roll)
 
 
 def open_summary(conn: sqlite3.Connection, now: datetime, tz: str) -> str | None:
@@ -448,6 +471,8 @@ async def deliver(
     key: str,
     now: datetime,
     build: Callable[[], tuple[str, list[store.Item]] | None],
+    *,
+    rewrite: Callable[[str, list[store.Item]], Awaitable[str]] | None = None,
 ) -> tuple[str, int]:
     """Send one message to ``owner`` exactly once for dedupe key ``key``.
 
@@ -455,6 +480,11 @@ async def deliver(
     stored before the send; a rerun resends the stored text and marks exactly the stored
     items told (see the module docstring). Returns ``("sent", n)``, ``("nothing", 0)`` or
     ``("duplicate", 0)``.
+
+    ``rewrite`` (PER-273) may say the built text another way (Claude's voice); it runs once,
+    before the record is stored, only for a new key, and gets the code-built text and the
+    items. It may return the text unchanged; if it raises, the code-built text is sent. A
+    cancel during it leaves no record and sends nothing.
     """
     rkey = INFLIGHT + key
     raw: Any = kv_get(conn, rkey)
@@ -465,11 +495,19 @@ async def deliver(
         if built is None:
             return "nothing", 0
         text, listed = built
+        voiced = False
+        if rewrite is not None:
+            try:
+                new = await rewrite(text, listed)
+                voiced, text = new != text, new
+            except Exception:
+                log.exception("pulse: voice failed; sending the code-built text")
         rec = {
             "text": text,
             "items": [[i.source, i.key, i.fingerprint] for i in listed],
             "sent": False,
             "at": iso(now),
+            "voice": voiced,
         }
         with atomic(conn):
             kv_set(conn, rkey, rec)
@@ -546,6 +584,39 @@ def _still_current(conn: sqlite3.Connection, rec: dict[str, Any]) -> bool:
     return True
 
 
+_MORE = re.compile(r"\+\d+ more")
+
+
+def pulse_facts(composed: Composed, conn: sqlite3.Connection) -> Facts | None:
+    """The pulse's facts (PER-273): the workers' news as items; the extension items and
+    worker questions, the ⚠ and side-effect lines and ``+N more`` as the tail, which stays
+    code-built. None when the pulse has no workers' news (nothing for Claude to say)."""
+    # late: ``resonant.brain`` imports the router, which imports this module
+    from resonant.brain.voice import Facts
+    from resonant.extensions import voice_facts
+
+    found = voice_facts.worker_facts(conn, composed.listed, composed.going, composed.roll)
+    if found is None or not found.items:
+        return None
+    others = _order([i for i in composed.listed if not is_worker_item(i)])
+    tail = [*found.tail, *(item_line(i) for i in others)]
+    last = composed.text.rsplit("\n", 1)[-1]
+    if _MORE.fullmatch(last):
+        tail.append(last)
+    return Facts("pulse", found.items, going=found.going, tail=tuple(tail))
+
+
+async def voiced_pulse(
+    voice: Voice, conn: sqlite3.Connection, composed: Composed, text: str
+) -> str:
+    """``text`` (the code-built pulse) said in Claude's voice, or ``text`` itself: with no
+    workers' news, or whenever the voice falls back."""
+    facts = pulse_facts(composed, conn)
+    if facts is None:
+        return text
+    return (await voice.write(facts, text)).text
+
+
 async def send_pulse(
     conn: sqlite3.Connection,
     channel: Channel,
@@ -555,11 +626,13 @@ async def send_pulse(
     now: datetime,
     due: datetime | None = None,
     manual: bool = False,
+    voice: Voice | None = None,
 ) -> dict[str, Any]:
     """Prune, refresh the core items and, if it is time, send the pulse.
 
     Returns ``{sent, count, skipped?}`` (``skipped``: ``paused``, ``briefing``, ``quiet``,
-    ``nothing``, ``duplicate``); never the text. ``manual`` ignores the briefing hour and the
+    ``nothing``, ``duplicate``); never the text. ``voice`` (PER-273): Claude writes the prose
+    (:func:`voiced_pulse`). ``manual`` ignores the briefing hour and the
     quiet hours (not pause) and uses the per-minute manual key.
     """
     local = (due or now).astimezone(ZoneInfo(settings.timezone))
@@ -575,13 +648,21 @@ async def send_pulse(
         if settings.pulse.in_quiet(local.time()):
             return {"sent": False, "count": 0, "skipped": "quiet"}
     key = manual_dedupe_key(local) if manual else dedupe_key(local)
+    composed: list[Composed] = []
+
+    def build() -> tuple[str, list[store.Item]] | None:
+        built = _compose_now(conn, now, settings.pulse.stall, hide_approvals=False)
+        if built is None:
+            return None
+        composed.append(built)
+        return built.text, built.listed
+
+    async def rewrite(text: str, _listed: list[store.Item]) -> str:
+        assert voice is not None
+        return await voiced_pulse(voice, conn, composed[-1], text)
+
     status, count = await deliver(
-        conn,
-        channel,
-        owner,
-        key,
-        now,
-        lambda: _compose_now(conn, now, settings.pulse.stall, hide_approvals=False),
+        conn, channel, owner, key, now, build, rewrite=rewrite if voice is not None else None
     )
     if status == "sent":
         return {"sent": True, "count": count}
@@ -601,6 +682,7 @@ async def run_pulse_now(deps: CoreDeps, *, now: datetime | None = None) -> dict[
         settings=deps.settings,
         now=now or utcnow(),
         manual=True,
+        voice=deps.components.voice,
     )
 
 
@@ -629,8 +711,9 @@ def pulse_job(deps: CoreDeps, *, clock: Callable[[], datetime] = utcnow) -> Core
 
     async def run(args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         return await send_pulse(
-            conn, channel, owner, settings=settings, now=clock(), due=_due(args)
-        )
+            conn, channel, owner, settings=settings, now=clock(), due=_due(args),
+            voice=deps.components.voice,
+        )  # fmt: skip
 
     return CoreJob(id=JOB_ID, schedule=SCHEDULE, run=run, catchup=CATCHUP, timeout_s=TIMEOUT_S)
 
@@ -647,9 +730,11 @@ __all__ = [
     "manual_dedupe_key",
     "open_summary",
     "preview",
+    "pulse_facts",
     "pulse_job",
     "refresh_core_items",
     "run_pulse_now",
     "schedule",
     "send_pulse",
+    "voiced_pulse",
 ]

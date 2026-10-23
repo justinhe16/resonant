@@ -6,26 +6,35 @@ and a fake channel that dedupes by key like the iMessage adapter.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 from datetime import datetime, timedelta
 from typing import Any
 
+import pytest
 from test_briefing import (
     CTX,
     LA,
     OWNER,
     TZ,
+    FakeChannel,
     Harness,
     approval,
     harness,
     local,
 )
+from voice_script import Script, scripted_voice
 
+from resonant.brain.voice import Facts, VoiceResult
+from resonant.config import VoiceConfig
 from resonant.extensions import briefing as bf
 from resonant.extensions import notify
 from resonant.extensions import pulse_job as pj
 from resonant.extensions.scheduler import CORE_JOBS, Scheduler
+from resonant.gateway.channel import ChannelError, MessageRef
+from resonant.runners.voice import CallResult
 from resonant.store import pulse as ps
+from resonant.store import runs as runs_store
 from resonant.store.db import atomic, kv_get, kv_set
 
 T9 = local(10, 13, 9)  # 09:00 PDT: a normal hour
@@ -475,3 +484,211 @@ def test_remention_delay_is_capped_at_half_the_approval_ttl() -> None:
     assert delay("10m", 1800) == timedelta(minutes=10)  # the defaults
     assert delay("4h", 1800) == timedelta(minutes=15)  # would never fire uncapped
     assert delay("4h", 86400) == timedelta(hours=4)
+
+
+# --- Claude's voice (PER-273) ------------------------------------------------------------------
+
+KEY = "pulse.inflight:pulse:2026-10-13:09"
+PROSE = "R1 couldn't finish adding retries to the notion client in dori: its tests still fail."
+
+
+class Flaky(FakeChannel):
+    """A channel that can be down: a send then raises, as a refused osascript would."""
+
+    down: bool = False
+
+    async def send(self, principal: str, text: str, **kw: Any) -> MessageRef:
+        if self.down:
+            raise ChannelError("imessage down")
+        return await super().send(principal, text, **kw)
+
+
+def failed_run(h: Harness, at: datetime = T9) -> str:
+    """A worker that failed, the way the runner leaves it: a run row and its urgent item."""
+    run = runs_store.create(
+        h.db, repo="dori", ask="add retries to the notion client", principal=OWNER,
+        session_id="s", max_seconds=600,
+    )  # fmt: skip
+    runs_store.update(h.db, run.code, status="running")
+    runs_store.finish(h.db, run.code, "failed", failure="tests failed", step="reply")
+    ps.upsert(
+        h.db, "core", ps.run_key(run.code), f"{run.code} failed: tests failed", "urgent",
+        {"status": "failed"}, True, 24 * 3600, at,
+    )  # fmt: skip
+    return run.code
+
+
+def use_voice(h: Harness, script: Script) -> None:
+    h.components.voice = scripted_voice(h.db, h.settings.home, script, clock=h.clock, timezone=TZ)
+
+
+async def test_the_pulse_is_prose_then_the_closing_line() -> None:
+    async with harness() as h:
+        code = failed_run(h)
+        code_built = pj.preview(h.db, T9)
+        assert code_built is not None and code_built.startswith("btw:")
+        script = Script(PROSE)
+        use_voice(h, script)
+        out = await pulse(h, T9)
+        assert out == {"sent": True, "count": 1}
+        assert h.channel.texts() == [f"{PROSE}\nNeeds you: a look at {code}."]
+        assert script.calls == 1 and "btw:" not in script.prompts[0]
+        rec = kv_get(h.db, KEY)
+        assert rec["voice"] is True and rec["text"] == h.channel.texts()[0]
+        assert told(h, "core", ps.run_key(code))
+        # the preview and /pulse stay code-built
+        assert pj.preview(h.db, T9 + timedelta(minutes=1)) is None
+        assert script.calls == 1
+
+
+async def test_a_rerun_of_the_same_key_never_calls_claude_again() -> None:
+    async with harness() as h:
+        failed_run(h)
+        script = Script(PROSE)
+        use_voice(h, script)
+        await pulse(h, T9)
+        out = await pulse(h, T9, now=T9 + timedelta(minutes=5))  # a catch-up rerun
+        assert out["skipped"] == "duplicate" and script.calls == 1 and len(h.channel.sent) == 1
+
+
+async def test_a_send_that_failed_is_resent_with_the_stored_voiced_text() -> None:
+    async with harness() as h:
+        h.channel = Flaky()
+        failed_run(h)
+        script = Script(PROSE)
+        use_voice(h, script)
+        h.channel.down = True
+        with pytest.raises(ChannelError):
+            await pulse(h, T9)
+        record = kv_get(h.db, KEY)
+        assert record["sent"] is False and record["voice"] is True
+        h.channel.down = False
+        out = await pulse(h, T9)  # the same key: the stored text, no new call
+        assert out["sent"] is True and script.calls == 1
+        assert h.channel.texts() == [record["text"]]
+
+
+async def test_another_hours_unsent_voiced_text_is_finished_not_rewritten() -> None:
+    async with harness() as h:
+        h.channel = Flaky()
+        code = failed_run(h)
+        script = Script(PROSE)
+        use_voice(h, script)
+        h.channel.down = True
+        with pytest.raises(ChannelError):
+            await pulse(h, T9)
+        h.channel.down = False
+        report(h, "a", "k", "x", at=T9 + timedelta(minutes=50))
+        await pulse(h, T9 + timedelta(hours=1))  # the next hour finishes the old one first
+        assert h.channel.texts()[0] == f"{PROSE}\nNeeds you: a look at {code}."
+        assert h.channel.texts()[1] == "btw:\n[a] x" and script.calls == 1
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["btw: R1 failed.", "R1 failed in dori. Want me to look?", "A different run entirely.", ""],
+)
+async def test_a_guard_miss_sends_exactly_the_code_built_pulse(answer: str) -> None:
+    async with harness() as h:
+        failed_run(h)
+        expected = pj.preview(h.db, T9)
+        use_voice(h, Script(answer))
+        await pulse(h, T9)
+        assert h.channel.texts() == [expected]
+        assert kv_get(h.db, KEY)["voice"] is False
+
+
+async def test_claude_down_over_quota_or_at_its_limit_sends_exactly_the_code_built_pulse() -> None:
+    cases: list[Script] = [
+        Script(CallResult("failed")),
+        Script(CallResult("timeout")),
+        Script(CallResult("usage_limit", result={"is_error": True, "result": "limit reached"})),
+    ]  # fmt: skip
+    for n, script in enumerate(cases):
+        async with harness() as h:
+            failed_run(h)
+            expected = pj.preview(h.db, T9)
+            use_voice(h, script)
+            await pulse(h, T9)
+            assert h.channel.texts() == [expected], n
+    async with harness() as h:  # over the daily cap
+        failed_run(h)
+        expected = pj.preview(h.db, T9)
+        script = Script(PROSE)
+        h.components.voice = scripted_voice(
+            h.db, h.settings.home, script, cfg=VoiceConfig(daily_cap=1), clock=h.clock, timezone=TZ
+        )
+        with atomic(h.db):
+            kv_set(h.db, "voice.calls:2026-10-13", 1)
+        await pulse(h, T9)
+        assert h.channel.texts() == [expected] and script.calls == 0
+
+
+class Boom:
+    async def write(self, facts: Facts, fallback: str, *, ref: str | None = None) -> VoiceResult:
+        raise RuntimeError("boom")
+
+
+async def test_a_voice_that_raises_sends_the_code_built_pulse() -> None:
+    async with harness() as h:
+        failed_run(h)
+        expected = pj.preview(h.db, T9)
+        h.components.voice = Boom()
+        await pulse(h, T9)
+        assert h.channel.texts() == [expected]
+        assert kv_get(h.db, KEY)["voice"] is False
+
+
+async def test_extension_items_and_the_overflow_stay_code_built() -> None:
+    async with harness() as h:
+        code = failed_run(h)
+        for n in range(8):
+            report(h, "dori", f"k{n}", f"incident {n} " + "x" * 150, at=T9 - timedelta(minutes=n))
+        expected = pj.preview(h.db, T9)
+        assert expected is not None and "more" in expected.splitlines()[-1]
+        script = Script(PROSE)
+        use_voice(h, script)
+        out = await pulse(h, T9)
+        text = h.channel.texts()[0]
+        lines = text.splitlines()
+        assert out["sent"] is True and script.calls == 1
+        assert lines[0] == PROSE and lines[-1] == f"Needs you: a look at {code}."
+        assert lines[-2].endswith(" more") and lines[-2].startswith("+")  # +N more, verbatim
+        shown = [line for line in lines[1:-2]]
+        assert shown and all(line.startswith("[dori] ") for line in shown)  # [name] prefixes
+        assert len(text) <= pj.MAX_CHARS
+        untold = [n for n in range(8) if not told(h, "dori", f"k{n}")]
+        assert untold  # what did not fit waits for the next pulse
+
+
+async def test_a_pulse_of_only_extension_items_makes_no_call() -> None:
+    async with harness() as h:
+        report(h, "dori", "k", "Dori recovered", clear=True)
+        script = Script(PROSE)
+        use_voice(h, script)
+        await pulse(h, T9)
+        assert h.channel.texts() == ["btw:\n[dori] ✓ Dori recovered"] and script.calls == 0
+
+
+async def test_a_cancel_during_the_call_leaves_no_record_and_sends_nothing() -> None:
+    async with harness() as h:
+        failed_run(h)
+        started = asyncio.Event()
+
+        class Slow:
+            async def write(
+                self, facts: Facts, fallback: str, *, ref: str | None = None
+            ) -> VoiceResult:
+                started.set()
+                await asyncio.sleep(3600)
+                raise AssertionError("not reached")
+
+        h.components.voice = Slow()
+        task = asyncio.ensure_future(pulse(h, T9))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert kv_get(h.db, KEY) is None and h.channel.sent == []
+        assert ps.get(h.db, "core", "run/r1") is not None
+        assert [i.key for i in ps.pending(h.db, ("urgent", "normal"), T9)] == ["run/r1"]

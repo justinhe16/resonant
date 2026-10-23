@@ -34,19 +34,29 @@ from github_app_fakes import (
     FakeGitHubApi,
     private_pem_one_line,
 )
+from voice_script import Script, scripted_voice
 
 from resonant import killswitch
-from resonant.config import GitHubAppConfig, LoopConfig, RunnerConfig, RunnerRepo, Settings
+from resonant.config import (
+    GitHubAppConfig,
+    LoopConfig,
+    RunnerConfig,
+    RunnerRepo,
+    Settings,
+    VoiceConfig,
+)
 from resonant.extensions import pulse_job
 from resonant.gateway.channel import (
     ApprovalPrompt,
     Channel,
+    ChannelError,
     ChannelRefused,
     MessageRef,
     SelfTestResult,
     Submit,
 )
 from resonant.loop import Loop, SlotPool, Wait
+from resonant.loop import loop as loop_mod
 from resonant.redact import Redactor
 from resonant.router.fast_path import render_status
 from resonant.runner.cleanup import dir_size
@@ -68,7 +78,8 @@ from resonant.runners.claude import (
     wake_time,
 )
 from resonant.runners.reaper import Target
-from resonant.runners.reports import Report
+from resonant.runners.reports import Report, record_did
+from resonant.runners.voice import CallResult
 from resonant.sandbox import SandboxParams
 from resonant.secrets import (
     ANTHROPIC_KEY_REF,
@@ -83,8 +94,9 @@ from resonant.status import collect_status
 from resonant.store import pulse as pulse_store
 from resonant.store import repos as repo_store
 from resonant.store import runs as runs_store
+from resonant.store import system_texts
 from resonant.store import tasks as task_store
-from resonant.store.db import iso, utcnow
+from resonant.store.db import atomic, iso, kv_set, utcnow
 
 GIT = "/usr/bin/git"
 FAKE = Path(__file__).parent / "fakes" / "claude"
@@ -237,6 +249,7 @@ class Chan:
         self.sent: list[tuple[str, str]] = []
         self.keys: set[str] = set()
         self.refuse = False
+        self.fail = 0  # sends that raise a ChannelError before one goes through
 
     async def start(self, submit: Submit) -> None: ...
 
@@ -252,6 +265,9 @@ class Chan:
     ) -> MessageRef:
         if self.refuse:
             raise ChannelRefused("no")
+        if self.fail > 0:
+            self.fail -= 1
+            raise ChannelError("down")
         if dedupe_key is None or dedupe_key not in self.keys:
             self.sent.append((principal, text))
         if dedupe_key is not None:
@@ -2148,3 +2164,189 @@ async def test_a_config_clash_does_not_stop_startup(tmp_path: Path, db: sqlite3.
     )
     await h.runner.start()
     assert not h.runner._blocked  # pyright: ignore[reportPrivateUsage]
+
+
+# --- Claude's voice (PER-273) --------------------------------------------------------------
+
+NO_CHANGES_PROSE = "R1 looked at the flaky test and found nothing to change."
+CODE_BUILT_NO_CHANGES = "R1 (fix the flaky test) made no changes: Nothing to change."
+
+
+def voiced(h_root: Path, conn: sqlite3.Connection, script: Script) -> Any:
+    return scripted_voice(conn, h_root, script)
+
+
+def system_text(conn: sqlite3.Connection) -> list[tuple[str, bool]]:
+    return [(t.text, t.outside) for t in system_texts.between(conn, "owner")]
+
+
+async def test_a_voiced_outcome_is_prose_plus_the_closing_line_and_is_recorded(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    script = Script(NO_CHANGES_PROSE)
+    h = build(tmp_path, db, scenario="nochanges", voice=voiced(tmp_path, db, script))
+    await h.start()
+    await h.drain()
+    assert h.chan.texts() == [f"{NO_CHANGES_PROSE}\nNo action needed."]
+    assert script.calls == 1 and '"outcome":"no_changes"' in script.prompts[0]
+    # the brains see what the owner read (without the closing line when nothing is asked),
+    # as outside content
+    assert system_text(db) == [(NO_CHANGES_PROSE, True)]
+
+
+async def test_a_guard_miss_sends_and_records_exactly_what_it_did_before(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    script = Script("R1 made no changes: Want me to try again?")
+    h = build(tmp_path, db, scenario="nochanges", voice=voiced(tmp_path, db, script))
+    await h.start()
+    await h.drain()
+    assert h.chan.texts() == [CODE_BUILT_NO_CHANGES]
+    assert system_text(db) == [
+        ("R1 (fix the flaky test) made no changes.", True)
+    ]  # bare, as before
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        CallResult("failed"),
+        CallResult("timeout"),
+        CallResult("refused"),
+        CallResult("usage_limit", result={"is_error": True, "result": "usage limit reached"}),
+    ],
+)
+async def test_claude_down_or_limited_sends_the_code_built_text(
+    tmp_path: Path, db: sqlite3.Connection, result: CallResult
+) -> None:
+    h = build(tmp_path, db, scenario="nochanges", voice=voiced(tmp_path, db, Script(result)))
+    await h.start()
+    await h.drain()
+    assert h.chan.texts() == [CODE_BUILT_NO_CHANGES]
+
+
+async def test_over_the_quota_or_paused_sends_the_code_built_text(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    script = Script(NO_CHANGES_PROSE)
+    capped = scripted_voice(db, tmp_path, script, cfg=VoiceConfig(daily_cap=1))
+    with atomic(db):
+        kv_set(db, "voice.calls:" + utcnow().date().isoformat(), 1)  # the day's call is spent
+    h = build(tmp_path, db, scenario="nochanges", voice=capped)
+    await h.start()
+    await h.drain()
+    assert h.chan.texts() == [CODE_BUILT_NO_CHANGES] and script.calls == 0
+
+
+async def test_a_digest_level_outcome_and_a_cancel_make_no_call(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    script = Script(NO_CHANGES_PROSE)
+    h = build(tmp_path, db, scenario="nochanges", voice=voiced(tmp_path, db, script))
+    await h.start(report="digest")
+    await h.drain()
+    assert h.chan.texts() == [] and script.calls == 0  # left to the digest
+    code = await h.start()
+    await h.runner.cancel_run(code)
+    await h.drain()
+    assert h.chan.texts() == ["R2 (fix the flaky test) was cancelled."] and script.calls == 0
+
+
+async def test_warnings_and_side_effects_stay_code_built_after_the_prose(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    prose = "R1 opened PR #41 in proj: it fixes the flaky test and touches the settings file."
+    script = Script(prose)
+    h = build(tmp_path, db, scenario="makefile", voice=voiced(tmp_path, db, script))
+    code = await h.start()
+    record_did(h.conn, code, "merged PR #3 with gh")  # a side effect the worker reported
+    await h.drain()
+    lines = h.chan.texts()[0].splitlines()
+    assert lines[0] == prose
+    assert lines[1] == "⚠ changes .claude/settings.json"
+    assert lines[2] == "Along the way: merged PR #3 with gh."
+    assert lines[3].startswith("Needs you: /merge R1 ")
+    assert len(lines) == 4
+    assert ".claude/settings.json" not in script.prompts[0] or "flagged" not in script.prompts[0]
+    assert "/merge" not in script.prompts[0]  # commands are the closing line's only
+
+
+async def test_a_member_s_run_is_not_voiced(tmp_path: Path, db: sqlite3.Connection) -> None:
+    script = Script(NO_CHANGES_PROSE)
+    h = build(tmp_path, db, scenario="nochanges", voice=voiced(tmp_path, db, script), owner="boss")
+    await h.start()
+    await h.drain()
+    assert h.chan.texts() == [CODE_BUILT_NO_CHANGES] and script.calls == 0
+
+
+async def test_an_unattended_merge_is_voiced_and_recorded(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    prose = "I merged PR #41 into proj, the flaky test fix."
+    script = Script(prose)
+    h = build(tmp_path, db, voice=voiced(tmp_path, db, script))
+    code = await h.start()
+    await h.drain()
+    (h.gh_dir / "checks_rc").write_text("8")  # CI still running: the merge waits for it
+    res = await h.runner.merge_run(code, unattended=True)
+    assert isinstance(res, claude_mod.MergeQueued)
+    sent = len(h.chan.texts())
+    (h.gh_dir / "checks_rc").write_text("0")
+    await h.drain()
+    assert h.run(code).status == "merged"
+    assert h.chan.texts()[sent:] == [f"{prose}\nNo action needed."]
+    prompt = script.prompts[-1]
+    assert '"outcome":"merged"' in prompt and '"pr":41' in prompt and '"title"' in prompt
+    assert "deps changed" not in prompt  # code keeps that line (voice tests: merged_facts)
+    assert system_text(db)[-1] == (prose, True)
+
+
+async def test_a_retried_send_reuses_the_voiced_text_with_one_call(
+    tmp_path: Path, db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+
+    def quick(attempt: int) -> timedelta:
+        return timedelta(seconds=0.1 * attempt)
+
+    monkeypatch.setattr(loop_mod, "retry_backoff", quick)
+    script = Script(NO_CHANGES_PROSE)
+    h = build(tmp_path, db, scenario="nochanges", voice=voiced(tmp_path, db, script))
+    h.chan.fail = 1  # the first send raises ChannelError: the step fails and is retried
+    await h.start()
+    await h.drain()
+    assert h.chan.texts() == []
+    await asyncio.sleep(0.3)
+    await h.drain()
+    assert h.chan.texts() == [f"{NO_CHANGES_PROSE}\nNo action needed."]
+    assert script.calls == 1  # the retry reused the text kept under the same ref
+
+
+async def test_replay_r8_failed_reads_naturally(tmp_path: Path, db: sqlite3.Connection) -> None:
+    """2026-10-21: R8 (review PR #2 and merge it if it's good) failed, and the text was
+    ``R8 (review PR #2 and merge it if it's…) failed: <reason>``."""
+    db.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('runs', 7)")
+    prose = "R8 failed before it could review PR #2 and merge it: the session ended with an error."
+    script = Script(prose)
+    h = build(tmp_path, db, scenario="error", voice=voiced(tmp_path, db, script))
+    code = await h.start(ask="review PR #2 and merge it if it's good")
+    assert code == "R8"
+    await h.drain()
+    text = h.chan.texts()[0]
+    assert text == f"{prose}\nNeeds you: a look at R8."
+    assert not text.startswith("R8 (") and "btw:" not in text and "failed: " not in text
+    assert "R8" in script.prompts[0] and '"outcome":"failed"' in script.prompts[0]
+
+
+async def test_replay_r9_no_changes_reads_naturally(tmp_path: Path, db: sqlite3.Connection) -> None:
+    """2026-10-22: R9 (/robot-surf-prompt Make the pulse say which repo each run is in) made no
+    changes, and the text was ``R9 (/robot-surf-prompt Make the...) made no changes.``"""
+    db.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('runs', 8)")
+    prose = "R9 worked on making the pulse say which repo each run is in, but changed nothing."
+    script = Script(prose)
+    h = build(tmp_path, db, scenario="nochanges", voice=voiced(tmp_path, db, script))
+    code = await h.start(ask="/robot-surf-prompt Make the pulse say which repo each run is in")
+    assert code == "R9"
+    await h.drain()
+    assert h.chan.texts() == [f"{prose}\nNo action needed."]
+    assert "/robot-surf-prompt" not in script.prompts[0]  # a command never reaches Claude
+    assert "Make the pulse say which repo each run is in" in script.prompts[0]

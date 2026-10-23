@@ -104,6 +104,20 @@
   ``claude``: accuracy, ack-to-answer latency and approximate usage (cost estimate, tokens)
   in all and per row. Manual only: tests use ``e2e/fake_claude.py``.
 
+- **Voice rows (PER-273).** ``"kind": "voice"``: does Claude write Resonant's own texts well
+  (``brain/voice.py``)? A row has ``voice: {facts, fallback, now?, tz?}`` (``facts`` as
+  ``Facts.from_json``: ``kind`` outcome, pulse or briefing, ``items``, ``going``, ``day``,
+  ``approvals``, ``tail``; ``fallback`` is the code-built text; ``now`` an ISO time, ``tz`` a
+  zone) and no ``text``; ``claude`` is the plan the scripted Claude acts out (``answer``, or
+  ``limit``/``delay``/``hang``/``crash``). The row runs the real ``ClaudeVoice`` (auth, quota,
+  the call, the guard, the closing line) over ``e2e/fake_claude.py``, or with ``--route claude
+  --live-claude`` over the real ``claude``. ``expect``: ``used`` (default true: Claude's text
+  went out; false: exactly ``fallback`` did), ``reason`` (the reason starts with it), ``closing``
+  (the last line; default: what code writes for the facts), plus ``facts``/``facts_re``/
+  ``not_facts`` on the text. A voice row is also graded on a changed fallback, a header, an
+  ellipsis, a wrong closing line and on the guard's own check passing again. The summary adds a
+  ``voice`` block: accuracy, how often Claude's text was used, why not, latency and tokens.
+
 Texts and replies are PII: they appear only in what the CLI prints for failing cases.
 """
 
@@ -127,12 +141,15 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
+from zoneinfo import ZoneInfo
 
 import yaml
 
 from resonant.api import DaemonState
+from resonant.brain import voice as brain_voice
 from resonant.brain.facts import FactStore, facts_dir
 from resonant.brain.triage import CANNED_ACKS
+from resonant.brain.voice import Facts
 from resonant.components import Components, build_components
 from resonant.config import (
     BrainConfig,
@@ -141,6 +158,7 @@ from resonant.config import (
     OpsConfig,
     RunnerConfig,
     Settings,
+    VoiceConfig,
 )
 from resonant.e2e.bench import IsolatedSettings
 from resonant.e2e.extensions import install_fixture
@@ -158,6 +176,7 @@ from resonant.models.bench import percentile
 from resonant.runner.claude_auth import LOGIN_HOW, login_status
 from resonant.runners.ask import AskRefused, AskRunner, AskScope, Queued
 from resonant.runners.brain import BrainRunner
+from resonant.runners.voice import ClaudeVoice
 from resonant.sandbox import resolve_tool
 from resonant.secrets import CLAUDE_TOKEN_REF, FakeKeychain, SecretStore
 from resonant.store import pulse as pulse_store
@@ -212,12 +231,15 @@ REAL_WRITES: frozenset[str] = frozenset(
 
 EXPECT_KEYS = frozenset(
     {"tools", "tools_not", "escalate", "ask", "writes", "facts", "facts_re", "not_facts",
-     "max_rounds", "route"}
+     "max_rounds", "route", "used", "closing", "reason"}
 )  # fmt: skip
+VOICE_EXPECT_KEYS = frozenset({"facts", "facts_re", "not_facts", "used", "closing", "reason"})
+VOICE_PLAN_KEYS = frozenset({"answer", "limit", "delay", "hang", "crash"})
+VOICE_NOW = datetime(2026, 10, 22, 17, 0, tzinfo=UTC)
 RUN_STATUSES: tuple[str, ...] = get_args(run_store.Status)
 ROW_KEYS = frozenset(
     {"id", "category", "text", "history", "world", "expect", "script", "note", "triage", "claude",
-     "review", "draft", "synthetic"}
+     "review", "draft", "synthetic", "kind", "voice"}
 )  # fmt: skip
 Route = Literal["triage", "claude"]
 ROUTES: tuple[Route, ...] = get_args(Route)
@@ -311,6 +333,9 @@ class Expect:
     not_facts: tuple[str, ...] = ()
     max_rounds: int | None = None
     route: Literal["local", "claude"] | None = None
+    used: bool | None = None  # a voice row: Claude's text went out (default true)
+    closing: str | None = None  # a voice row: the text's last line
+    reason: str | None = None  # a voice row: the voice's reason starts with this
 
 
 SystemKind = Literal["approval", "result", "run"]
@@ -329,6 +354,17 @@ class Prior:
 
 
 @dataclass(frozen=True)
+class VoiceCase:
+    """A voice row's input (PER-273): the facts, the code-built fallback, and the clock and
+    zone the guard checks numbers against."""
+
+    facts: Facts
+    fallback: str
+    now: datetime = VOICE_NOW
+    tz: str = "America/Los_Angeles"
+
+
+@dataclass(frozen=True)
 class TaskCase:
     line: int
     id: str
@@ -341,6 +377,8 @@ class TaskCase:
     triage: dict[str, Any] | None = None  # the scripted model's triage answer (BR-10)
     claude: dict[str, Any] | None = None  # a scripted Claude session (BR-10)
     review: bool = False  # PER-248: a drafted row the owner hasn't checked; not graded
+    kind: Literal["task", "voice"] = "task"  # PER-273
+    voice: VoiceCase | None = None
 
 
 def _strs(v: Any, where: str) -> tuple[str, ...]:
@@ -355,6 +393,12 @@ def _opt_bool(v: Any, where: str) -> bool | None:
     if v is None or isinstance(v, bool):
         return v
     raise ValueError(f"{where} must be true, false or null")
+
+
+def _opt_str(v: Any, where: str) -> str | None:
+    if v is None or (isinstance(v, str) and v):
+        return v
+    raise ValueError(f"{where} must be a non-empty string")
 
 
 def _ask(v: Any) -> bool | Literal["approval"] | None:
@@ -397,6 +441,9 @@ def parse_expect(raw: Any) -> Expect:
         not_facts=_strs(d.get("not_facts"), "expect.not_facts"),
         max_rounds=rounds,
         route=route,
+        used=_opt_bool(d.get("used"), "expect.used"),
+        closing=_opt_str(d.get("closing"), "expect.closing"),
+        reason=_opt_str(d.get("reason"), "expect.reason"),
     )
 
 
@@ -568,8 +615,10 @@ def _triage(raw: Any) -> dict[str, Any] | None:
 def _claude(raw: Any) -> dict[str, Any] | None:
     if raw is None:
         return None
-    if not isinstance(raw, dict) or set(cast(dict[str, Any], raw)) - {"reads", "calls", "answer"}:
-        raise ValueError("'claude' is {reads?, calls?, answer?}")
+    allowed = {"reads", "calls", "answer", *VOICE_PLAN_KEYS}
+    if not isinstance(raw, dict) or set(cast(dict[str, Any], raw)) - allowed:
+        raise ValueError("'claude' is {reads?, calls?, answer?} (a voice row: also limit, delay,"
+                         " hang, crash)")  # fmt: skip
     d = cast(dict[str, Any], raw)
     calls: Any = d.get("calls", [])
     ok = isinstance(calls, list) and all(
@@ -579,6 +628,41 @@ def _claude(raw: Any) -> dict[str, Any] | None:
     if not ok or not isinstance(d.get("answer", ""), str):
         raise ValueError("'claude.calls' is a list of {name, args}; 'answer' a string")
     return d
+
+
+def _voice(raw: Any) -> VoiceCase:
+    """A voice row's ``voice`` block: ``{facts, fallback, now?, tz?}``."""
+    if not isinstance(raw, dict):
+        raise ValueError("'voice' must be {facts, fallback, now?, tz?}")
+    d = cast(dict[str, Any], raw)
+    unknown = set(d) - {"facts", "fallback", "now", "tz"}
+    if unknown:
+        raise ValueError(f"unknown voice keys: {sorted(unknown)}")
+    fallback = d.get("fallback")
+    if not isinstance(fallback, str) or not fallback.strip():
+        raise ValueError("voice.fallback must be a non-empty string")
+    facts_raw = d.get("facts")
+    if not isinstance(facts_raw, dict):
+        raise ValueError("voice.facts must be an object")
+    now = d.get("now")
+    when = VOICE_NOW
+    if now is not None:
+        try:
+            when = datetime.fromisoformat(str(now))
+        except ValueError:
+            raise ValueError("voice.now must be an ISO time") from None
+        if when.utcoffset() is None:
+            raise ValueError("voice.now needs a UTC offset")
+    tz = d.get("tz", "America/Los_Angeles")
+    try:
+        ZoneInfo(str(tz))
+    except (ValueError, KeyError, OSError):
+        raise ValueError("voice.tz must be a time zone name") from None
+    try:
+        facts = Facts.from_json(cast(dict[str, Any], facts_raw))
+    except ValueError as e:
+        raise ValueError(f"voice.{e}") from None
+    return VoiceCase(facts, fallback, when, str(tz))
 
 
 def parse_case(row: Mapping[str, Any], line: int) -> TaskCase:
@@ -591,8 +675,18 @@ def parse_case(row: Mapping[str, Any], line: int) -> TaskCase:
         raise ValueError("'id' must be a short lowercase slug")
     if not isinstance(category, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", category):
         raise ValueError("'category' must be a short lowercase word")
+    kind = row.get("kind", "task")
+    if kind not in ("task", "voice"):
+        raise ValueError("'kind' must be 'task' or 'voice'")
+    if kind == "voice":
+        return _voice_case(row, line, cid, category, text)
+    if row.get("voice") is not None:
+        raise ValueError('\'voice\' belongs to a row with "kind": "voice"')
     if not isinstance(text, str) or not text.strip():
         raise ValueError("'text' must be a non-empty string")
+    expect = parse_expect(row.get("expect"))
+    if (expect.used, expect.closing, expect.reason) != (None, None, None):
+        raise ValueError("expect.used, closing and reason belong to a voice row")
     review = row.get("review", False)
     if not isinstance(review, bool):
         raise ValueError("'review' must be true or false")
@@ -607,11 +701,48 @@ def parse_case(row: Mapping[str, Any], line: int) -> TaskCase:
         text=text,
         history=_history(row.get("history")),
         world=_world(row.get("world")),
-        expect=parse_expect(row.get("expect")),
+        expect=expect,
         script=_script(row.get("script")),
         triage=_triage(row.get("triage")),
         claude=_claude(row.get("claude")),
         review=review,
+    )
+
+
+def _voice_case(
+    row: Mapping[str, Any], line: int, cid: str, category: str, text: object
+) -> TaskCase:
+    """A voice row (PER-273): ``voice`` is required, ``text`` is optional (it only labels the
+    row in a failure), ``claude`` is the scripted plan and ``expect`` takes the voice keys."""
+    for key in ("history", "world", "script", "triage"):
+        if row.get(key) is not None:
+            raise ValueError(f"'{key}' doesn't apply to a voice row")
+    if text is not None and not isinstance(text, str):
+        raise ValueError("'text' must be a string")
+    raw_expect = row.get("expect")
+    if isinstance(raw_expect, dict):
+        extra = set(cast(dict[str, Any], raw_expect)) - VOICE_EXPECT_KEYS
+        if extra:
+            raise ValueError(f"expect keys that don't apply to a voice row: {sorted(extra)}")
+    voice_case = _voice(row.get("voice"))
+    review = row.get("review", False)
+    if not isinstance(review, bool):
+        raise ValueError("'review' must be true or false")
+    if not isinstance(row.get("synthetic", False), bool):
+        raise ValueError("'synthetic' must be true or false")
+    return TaskCase(
+        line=line,
+        id=cid,
+        category=category,
+        text=(text or "").strip() or f"[{voice_case.facts.kind} text]",
+        history=(),
+        world={},
+        expect=parse_expect(raw_expect),
+        script=None,
+        claude=_claude(row.get("claude")),
+        review=review,
+        kind="voice",
+        voice=voice_case,
     )
 
 
@@ -1430,6 +1561,8 @@ class Outcome:
     claude_status: str | None = None  # how that session ended: answered, timeout, crashed...
     answer_ms: float | None = None  # PER-250: the ack's send to Claude's answer's send
     usage: dict[str, Any] | None = None  # PER-250: the session's cost, turns, calls, tokens
+    voice_used: bool | None = None  # PER-273: a voice row: Claude's text went out
+    voice_reason: str | None = None  # ... and why not (the voice's reason)
 
 
 @dataclass
@@ -1466,6 +1599,63 @@ async def run_case(
         root = Path(await asyncio.to_thread(os.path.realpath, tmp))
         with world_home(root):
             return await _run_in(case, model, root, base, timeout_s, clock, route, claude)
+
+
+async def run_voice_case(
+    case: TaskCase, *, claude: LiveClaude | None = None, timeout_s: float = SCRIPTED_TIMEOUT_S
+) -> Outcome:
+    """Run one voice row (PER-273) in a temp home: the real ``ClaudeVoice`` (quota, auth, the
+    call, the guard, the closing line) over ``e2e/fake_claude.py`` acting out the row's
+    ``claude`` plan, or over the real ``claude`` with ``claude`` (``--live-claude``). The
+    outcome's ``reply`` is the text that would be sent."""
+    assert case.voice is not None
+    v = case.voice
+    with tempfile.TemporaryDirectory(prefix="resonant-voice-eval-") as tmp:
+        root = Path(await asyncio.to_thread(os.path.realpath, tmp))
+        conn = open_db(root / "eval.db")
+        try:
+            keychain = FakeKeychain()
+            if claude is None:
+                plan = root / "plan.json"
+                plan.write_text(json.dumps(case.claude or {}), encoding="utf-8")
+                keychain.items[CLAUDE_TOKEN_REF] = FAKE_TOKEN
+                voice = ClaudeVoice(
+                    conn,
+                    cfg=VoiceConfig(daily_cap=0, timeout_s=20),
+                    secrets=SecretStore(keychain),
+                    cwd=root / "voice",
+                    timezone=v.tz,
+                    claude_cmd=[sys.executable, "-I", str(FAKE_CLAUDE), "--script", str(plan)],
+                    home=root,
+                    clock=lambda: v.now,
+                )
+            else:  # the owner's own claude login, as the daemon uses it with the guard off
+                voice = ClaudeVoice(
+                    conn,
+                    cfg=VoiceConfig(daily_cap=0),
+                    secrets=SecretStore(keychain),
+                    cwd=root / "voice",
+                    guard="off",
+                    timezone=v.tz,
+                    claude_cmd=list(claude.cmd),
+                    home=claude.home,
+                    login_check=claude.login_check,
+                    clock=lambda: v.now,
+                )
+            started = time.monotonic()
+            try:
+                result = await asyncio.wait_for(voice.write(v.facts, v.fallback), timeout_s)
+            except TimeoutError:
+                return Outcome(v.fallback, [], [], 0, False, [], [], 0, None, timed_out=True,
+                               voice_used=False, voice_reason="timeout")  # fmt: skip
+            took_ms = (time.monotonic() - started) * 1000
+            return Outcome(
+                result.text, [], [], 0, False, [], [], 0, round(took_ms, 1),
+                usage=dict(result.usage) if result.usage else None,
+                voice_used=result.used, voice_reason=result.reason,
+            )  # fmt: skip
+        finally:
+            conn.close()
 
 
 async def _run_in(
@@ -1795,8 +1985,66 @@ def _any_in(alternatives: str, haystack: Sequence[str]) -> bool:
     return any(a.strip() in haystack for a in alternatives.split("|"))
 
 
+def _grade_text(e: Expect, reply: str) -> list[str]:
+    """The ``facts``, ``facts_re`` and ``not_facts`` that failed on ``reply``, by index."""
+    fails: list[str] = []
+    lowered = reply.lower()
+    for i, fact in enumerate(e.facts):
+        if not any(alt.strip().lower() in lowered for alt in fact.split("|")):
+            fails.append(f"fact[{i}]")
+    for i, pattern in enumerate(e.facts_re):
+        if re.search(pattern, reply, re.IGNORECASE) is None:
+            fails.append(f"fact_re[{i}]")
+    for i, bad in enumerate(e.not_facts):
+        if bad.lower() in lowered:
+            fails.append(f"not_fact[{i}]")
+    return fails
+
+
+def grade_voice(case: TaskCase, out: Outcome) -> list[str]:
+    """A voice row's failures (PER-273), as short codes: ``voice_used`` (Claude's text went
+    out, or didn't, against ``expect.used``), ``voice_reason``, ``fallback_changed`` (a
+    fallback that isn't exactly the code-built text), ``voice_header`` and ``voice_ellipsis``
+    (what the guard should have stopped), ``voice_closing`` (not the closing line),
+    ``voice_unsourced:<kind>`` (the guard's check fails on the text that went out) and the
+    ``facts`` codes of a task row."""
+    assert case.voice is not None
+    v, e = case.voice, case.expect
+    fails: list[str] = []
+    if out.timed_out:
+        fails.append("timeout")
+    if bool(out.voice_used) != (True if e.used is None else e.used):
+        fails.append("voice_used")
+    if e.reason is not None and not (out.voice_reason or "").startswith(e.reason):
+        fails.append("voice_reason")
+    if not out.voice_used:
+        if out.reply != v.fallback:
+            fails.append("fallback_changed")
+        return fails + _grade_text(e, out.reply)
+    lines = out.reply.splitlines()
+    heads = tuple(h.lower() for h in brain_voice.HEADERS)
+    if any(line.strip().lower().startswith(heads) for line in lines):
+        fails.append("voice_header")
+    first = lines[0] if lines else ""
+    if "\u2026" in first or "..." in first:
+        fails.append("voice_ellipsis")
+    want = e.closing or brain_voice.closing_line(v.facts)
+    if not lines or lines[-1] != want:
+        fails.append("voice_closing")
+    prose = brain_voice.strip_closing(brain_voice.normalize(first))
+    problem = brain_voice.check(
+        first, prose, v.facts, v.fallback, now=v.now, tz=v.tz,
+        max_chars=VoiceConfig().max_chars,
+    )  # fmt: skip
+    if problem is not None:
+        fails.append(f"voice_unsourced:{problem.kind}")
+    return fails + _grade_text(e, out.reply)
+
+
 def grade(case: TaskCase, out: Outcome) -> list[str]:
     """Every expectation that failed, as short codes. No texts: facts by index."""
+    if case.kind == "voice":
+        return grade_voice(case, out)
     e = case.expect
     fails: list[str] = []
     if out.timed_out:
@@ -1847,16 +2095,7 @@ def grade(case: TaskCase, out: Outcome) -> list[str]:
             fails.append("did_not_ask")
     elif e.ask is False and out.approvals:
         fails.append("asked")
-    lowered = out.reply.lower()
-    for i, fact in enumerate(e.facts):
-        if not any(alt.strip().lower() in lowered for alt in fact.split("|")):
-            fails.append(f"fact[{i}]")
-    for i, pattern in enumerate(e.facts_re):
-        if re.search(pattern, out.reply, re.IGNORECASE) is None:
-            fails.append(f"fact_re[{i}]")
-    for i, bad in enumerate(e.not_facts):
-        if bad.lower() in lowered:
-            fails.append(f"not_fact[{i}]")
+    fails += _grade_text(e, out.reply)
     if e.max_rounds is not None and out.rounds > e.max_rounds:
         fails.append(f"rounds:{out.rounds}>{e.max_rounds}")
     return fails
@@ -1880,19 +2119,25 @@ def _dist(values: Sequence[float]) -> dict[str, Any]:
 
 
 def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
-    """Metrics for one mode's results. Cases by id and line, never their text."""
-    n = len(results)
-    correct = sum(r.correct for r in results)
-    cats = sorted({r.case.category for r in results})
+    """Metrics for one mode's results. Cases by id and line, never their text. Voice rows
+    (PER-273) count in the totals, the categories and the failures; the route, escalation,
+    ask and Claude-session metrics are the task rows', and the ``voice`` block is theirs."""
+    everything = results
+    n = len(everything)
+    correct = sum(r.correct for r in everything)
+    cats = sorted({r.case.category for r in everything})
     per_category: dict[str, dict[str, Any]] = {
         c: {
-            "n": sum(r.case.category == c for r in results),
-            "correct": sum(r.correct for r in results if r.case.category == c),
+            "n": sum(r.case.category == c for r in everything),
+            "correct": sum(r.correct for r in everything if r.case.category == c),
         }
         for c in cats
     }
     for m in per_category.values():
         m["accuracy"] = _ratio(m["correct"], m["n"])
+    voiced = [r for r in everything if r.case.kind == "voice"]
+    results = [r for r in everything if r.case.kind == "task"]
+    task_n = len(results)
     escalated = [r for r in results if r.outcome.escalated]
     # a hand-off is expected where the row says escalate or route claude (BR-10)
     want = [r.case.expect.escalate is True or r.case.expect.route == "claude" for r in results]
@@ -1900,7 +2145,7 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
     local = [r for r, w in zip(results, want, strict=True) if not w]
     ask_rows = [r for r in results if r.case.expect.ask is not None]
     ask_ok = sum(not any(f in ("did_not_ask", "asked") for f in r.failures) for r in ask_rows)
-    fail_codes = Counter(f.split(":")[0].split("[")[0] for r in results for f in r.failures)
+    fail_codes = Counter(f.split(":")[0].split("[")[0] for r in everything for f in r.failures)
     lat = [r.outcome.latency_ms for r in results if r.outcome.latency_ms is not None]
     handed = [r for r in results if r.outcome.route == "claude"]
     kept = [r for r in results if r.outcome.route != "claude"]
@@ -1911,11 +2156,12 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
         "correct": correct,
         "accuracy": _ratio(correct, n),
         "accuracy_local": _ratio(sum(r.correct for r in local), len(local)),
+        **({"voice": voice_summary(voiced)} if voiced else {}),
         # BR-10: who answered, and how well
         "route": {
             "claude": len(handed),
             "local": len(kept),
-            "rate_claude": _ratio(len(handed), n),
+            "rate_claude": _ratio(len(handed), task_n),
             "by_handoff": dict(sorted(Counter(r.outcome.handoff or "-" for r in handed).items())),
             "accuracy_claude": _ratio(sum(r.correct for r in handed), len(handed)),
             "accuracy_local": _ratio(sum(r.correct for r in kept), len(kept)),
@@ -1934,7 +2180,7 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
         "claude": claude_answers([r for r in handed if r.outcome.claude_reply is not None]),
         "per_category": per_category,
         "escalation": {
-            "rate": _ratio(len(escalated), n),
+            "rate": _ratio(len(escalated), task_n),
             "expected": len(want_esc),
             # an escalation on a row that doesn't expect one (or doesn't say) is a miss
             "precision": _ratio(sum(r in want_esc for r in escalated), len(escalated)),
@@ -1952,7 +2198,7 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
         "number_guard_cases": sum(r.outcome.number_guard > 0 for r in results),
         "latency_ms": _dist(lat),
         "rounds": _dist([float(r.outcome.rounds) for r in results]),
-        "timeouts": sum(r.outcome.timed_out for r in results),
+        "timeouts": sum(r.outcome.timed_out for r in everything),
         "failure_codes": dict(sorted(fail_codes.items())),
         "failed": [
             {
@@ -1961,6 +2207,29 @@ def summarize(results: Sequence[CaseResult]) -> dict[str, Any]:
                 "category": r.case.category,
                 "failures": r.failures,
             }
+            for r in everything
+            if not r.correct
+        ],
+    }
+
+
+def voice_summary(results: Sequence[CaseResult]) -> dict[str, Any]:
+    """The voice rows (PER-273): accuracy, how often Claude's text was used, why it wasn't
+    (the fallback reasons), the call's latency and tokens. By id and line, never a text."""
+    used = [r for r in results if r.outcome.voice_used]
+    usages = [r.outcome.usage or {} for r in results]
+    reasons = Counter(r.outcome.voice_reason or "-" for r in results if not r.outcome.voice_used)
+    return {
+        "cases": len(results),
+        "correct": sum(r.correct for r in results),
+        "accuracy": _ratio(sum(r.correct for r in results), len(results)),
+        "used": len(used),
+        "used_rate": _ratio(len(used), len(results)),
+        "fallback_reasons": dict(sorted(reasons.items())),
+        "latency_ms": _dist([x for r in results if (x := r.outcome.latency_ms) is not None]),
+        "tokens": {k: sum(int(u.get(k) or 0) for u in usages) for k in USAGE_SUMS},
+        "failed": [
+            {"id": r.case.id, "line": r.case.line, "failures": r.failures}
             for r in results
             if not r.correct
         ],
@@ -2046,6 +2315,7 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
             f"  ack         p50 {_num(s['route']['ack_ms']['p50'])} ms   p95 "
             f"{_num(s['route']['ack_ms']['p95'])} ms",
             *_render_claude(s.get("claude")),
+            *_render_voice(s.get("voice")),
             f"escalation    rate {_pct(esc['rate'])}   precision {_pct(esc['precision'])}   "
             f"recall {_pct(esc['recall'])} ({esc['expected']} expected)",
             f"ask           {_pct(ask['accuracy'])} ({ask['correct']}/{ask['graded']})",
@@ -2072,16 +2342,36 @@ def render_text(report: dict[str, Any], by_mode: Mapping[str, Sequence[CaseResul
                 f"  line {r.case.line:>3} {r.case.id} [{r.case.category}] {', '.join(r.failures)}"
             )
             out.append(f"      text  {r.case.text!r}")
-            out.append(
-                f"      did   tools {o.called or '-'}  "
-                f"route {o.route}/{o.handoff or '-'}  asked {o.approvals or '-'}"
-            )
+            if r.case.kind == "voice":
+                out.append(f"      did   voice used {o.voice_used}  reason {o.voice_reason or '-'}")
+            else:
+                out.append(
+                    f"      did   tools {o.called or '-'}  "
+                    f"route {o.route}/{o.handoff or '-'}  asked {o.approvals or '-'}"
+                )
             out.append(f"      reply {reply!r}")
     if meta["model"] == "scripted":
         out += ["", "scripted model: this proves the harness and the set, not the model"]
     if meta.get("saved_to"):
         out += ["", f"summary saved to {meta['saved_to']} (no texts)"]
     return "\n".join(out)
+
+
+def _render_voice(v: Mapping[str, Any] | None) -> list[str]:
+    """PER-273: the voice rows' accuracy, how often Claude's text was used and why not."""
+    if not v:
+        return []
+    t = v["tokens"]
+    reasons = ", ".join(f"{k} {n}" for k, n in v["fallback_reasons"].items()) or "-"
+    return [
+        f"voice         {v['cases']} cases   accuracy {_pct(v['accuracy'])} "
+        f"({v['correct']}/{v['cases']})   claude's text used {_pct(v['used_rate'])} "
+        f"({v['used']}/{v['cases']})",
+        f"  fell back   {reasons}",
+        f"  latency     p50 {_num(v['latency_ms']['p50'])} ms   p95 "
+        f"{_num(v['latency_ms']['p95'])} ms   tokens in {t['input_tokens']} out "
+        f"{t['output_tokens']}",
+    ]
 
 
 def _render_claude(c: Mapping[str, Any] | None) -> list[str]:
@@ -2159,10 +2449,13 @@ async def run_set(
     shared = None if model is None else RecordingModel(model)
     for _ in range(repeat):
         for case in cases:
-            rec = shared or RecordingModel(_scripted(case))
-            outcome = await run_case(
-                case, rec, base=base, timeout_s=timeout_s, route=route, claude=claude
-            )
+            if case.kind == "voice":  # PER-273: no brain, no model: the voice alone
+                outcome = await run_voice_case(case, claude=claude, timeout_s=timeout_s)
+            else:
+                rec = shared or RecordingModel(_scripted(case))
+                outcome = await run_case(
+                    case, rec, base=base, timeout_s=timeout_s, route=route, claude=claude
+                )
             result = CaseResult(case, outcome, grade(case, outcome))
             out[MODE].append(result)
             if progress is not None:
@@ -2235,7 +2528,7 @@ def run(
         )
         return EXIT_BAD_SET
     if live_claude:
-        hard = [c for c in cases if c.expect.route == "claude"]
+        hard = [c for c in cases if c.kind == "voice" or c.expect.route == "claude"]
         if not hard:
             echo_err("error: no reviewed case expects route claude (the hard rows)")
             return EXIT_BAD_SET
@@ -2261,6 +2554,10 @@ def run(
 
     async def go() -> dict[str, list[CaseResult]]:
         if model_kind == "scripted":
+            return await run_set(cases, model=None, repeat=repeat, route=route,
+                                 timeout_s=SCRIPTED_TIMEOUT_S + extra_s, progress=progress,
+                                 claude=live)  # fmt: skip
+        if all(c.kind == "voice" for c in cases):  # PER-273: no local model to warm up
             return await run_set(cases, model=None, repeat=repeat, route=route,
                                  timeout_s=SCRIPTED_TIMEOUT_S + extra_s, progress=progress,
                                  claude=live)  # fmt: skip
@@ -2351,8 +2648,10 @@ __all__ = [
     "Outcome",
     "RecordingModel",
     "TaskCase",
+    "VoiceCase",
     "claude_answers",
     "grade",
+    "grade_voice",
     "load_set",
     "owner_set_path",
     "parse_case",
@@ -2360,7 +2659,9 @@ __all__ = [
     "run",
     "run_case",
     "run_set",
+    "run_voice_case",
     "seed_world",
     "split_review",
     "summarize",
+    "voice_summary",
 ]
