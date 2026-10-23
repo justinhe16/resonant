@@ -460,14 +460,7 @@ async def test_a_news_reply_that_names_an_untold_run_tells_it(
         w.model.triage = {"handler": "local", "kind": "general", "message_type": "news_check",
                           "say": ""}  # fmt: skip
         (reply,) = await w.say("anything new?")
-        # a failure here must say why the turn left the code-built path (triage, news or hand-off)
-        why = [
-            (r["status"], r["result"]) for r in w.rows("SELECT * FROM tasks WHERE runner = 'brain'")
-        ]
-        if "R1" not in reply:  # printed in full (an assertion message is truncated)
-            for row in w.rows("SELECT * FROM tasks"):
-                print(dict(row))
-        assert "R1" in reply and "finished" in reply, (reply, why, w.model.calls)
+        assert "R1" in reply and "finished" in reply
         assert pulse_store.pending(w.conn, pulse_store.URGENCIES, utcnow()) == []
         item = pulse_store.get(w.conn, "core", "run/r1")
         assert item is not None and item.known

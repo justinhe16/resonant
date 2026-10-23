@@ -9,7 +9,7 @@ from typing import Any
 from resonant.loop import NewTask
 from resonant.models import ChatMessage, ModelOutputError, ModelReply, ProbeResult, SpanFactory
 from resonant.store import tasks as repo
-from resonant.store.db import transaction
+from resonant.store.db import iso, transaction
 from resonant_sdk import Event, ToolSpec
 
 OWNER = "justin"
@@ -28,13 +28,21 @@ def message(
     checkpoint: dict[str, Any] | None = None,
 ) -> str:
     """Store one message event (and, with ``task``, the task it started, whose checkpoint
-    holds ``reply`` and any ``checkpoint`` keys). Returns the event id."""
+    holds ``reply`` and any ``checkpoint`` keys). Returns the event id. Without ``task`` the
+    event is stored consumed, in the same transaction: a message that started no task was
+    already handled, and a running daemon's loop must not route it as a new one (it would
+    race the test's next message for the scripted triage)."""
     extra: dict[str, Any] = {} if at is None else {"occurred_at": at}
     event = Event(
         source=source, type="message", principal=principal, payload={"text": text}, **extra
     )
     with transaction(db):
         repo.insert_event(db, event)
+        if not task:
+            db.execute(
+                "UPDATE events SET consumed_at = ? WHERE id = ?",
+                (iso(event.occurred_at), event.id),
+            )
         if task:
             cp: dict[str, Any] = {} if reply is None else {"reply": reply}
             cp.update(checkpoint or {})
