@@ -24,7 +24,7 @@ from resonant.extensions import pulse_job as pj
 from resonant.gateway.channel import ChannelError
 from resonant.store import pulse as ps
 from resonant.store import system_texts
-from resonant.store.db import connect, migrate, schema_version
+from resonant.store.db import atomic, connect, kv_set, migrate, schema_version
 from resonant.store.system_texts import SystemText
 
 KEY = "pulse:2026-10-13:09"
@@ -156,6 +156,23 @@ async def test_a_failed_send_records_nothing_until_it_goes_out() -> None:
         await pulse(h, T9 + timedelta(hours=1))  # finishes the unsent record first
         assert [t.text for t in rows(h.db)] == [system_texts.flat("btw:\n[a] x")]
         assert h.db.execute("SELECT ref FROM system_texts").fetchone()[0] == KEY
+
+
+async def test_an_inflight_record_from_before_counts_as_outside() -> None:
+    """A record stored before PER-274 has no ``outside``: its text fails closed."""
+    async with harness() as h:
+        report(h, "core", "notice/w1", "Your watch ended without firing")
+        item = ps.get(h.db, "core", "notice/w1")
+        assert item is not None
+        with atomic(h.db):
+            kv_set(h.db, pj.INFLIGHT + KEY, {
+                "text": "btw:\nYour watch ended without firing",
+                "items": [["core", "notice/w1", item.fingerprint]],
+                "sent": False, "at": T9.isoformat(), "voice": False,
+            })  # fmt: skip
+        await pulse(h, T9)
+        ((t,),) = [rows(h.db)]
+        assert t.kind == "pulse" and t.outside
 
 
 async def test_a_voiced_pulse_is_recorded_as_sent_and_is_outside() -> None:

@@ -75,6 +75,7 @@ from resonant import killswitch
 from resonant.executor import CallContext
 from resonant.extensions import notify, rollup
 from resonant.extensions.pulse_job import (
+    NOTICE_PREFIX,
     deliver,
     fit_entries,
     fit_lines,
@@ -102,7 +103,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 # ``brain.notices.KEY_PREFIX`` (importing it here is a cycle through the router)
-NOTICE_PREFIX = "notice/"
 
 JOB_ID = "briefing"
 CATCHUP = timedelta(hours=3)
@@ -542,6 +542,7 @@ __all__ = [
     "MAX_CHARS",
     "NOTHING",
     "NOTHING_LINES",
+    "NOTICE_PREFIX",
     "Briefing",
     "briefing_facts",
     "briefing_job",

@@ -757,6 +757,7 @@ __all__ = [
     "CATCHUP",
     "JOB_ID",
     "MAX_CHARS",
+    "NOTICE_PREFIX",
     "compose",
     "dedupe_key",
     "deliver",
