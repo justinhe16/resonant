@@ -9,7 +9,7 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 22, two extensi
 | Area | What it does | PRs |
 |---|---|---|
 | Core (Phases 0–3.5) | iMessage in/out, event loop, policy gate, executor, store, scheduler, extensions, pulse and 08:00 briefing, kill switch | #1–#86 |
-| Dashboard and relay (Phase 4) | Local read-only dashboard on 127.0.0.1:7777. Remote copy live since 2026-10-20: the daemon pushes to Supabase `resonant-relay` (ref `lqebsuuskxndfyunffhd`), Fly app `resonant-relay-jhe` serves https://resonant-relay-jhe.fly.dev/ (password + TOTP) and is the dead-man switch (ntfy to the owner's phone; freeze test passed) | #85–#88 |
+| Dashboard and relay (Phase 4) | Local read-only dashboard on 127.0.0.1:7777. Remote copy live since 2026-10-20: the daemon pushes to Supabase `resonant-relay` (ref `pnyqnlrnjmzgxyxiykpu`), Fly app `resonant-relay-jhe` serves https://resonant-relay-jhe.fly.dev/ (password + TOTP) and is the dead-man switch (ntfy to the owner's phone; freeze test passed) | #85–#88 |
 | Workers (employee mode) | Claude Code workers in worktrees, unguarded, per-run GitHub App tokens, worker desk (ask/note/check), trust rules, Remote Control and live input (RC-1), transcript reading | #89–#92 |
 | Repos | Registry; adding a repo clones it to `~/code/<name>` (RP-1) | #96 |
 | GitHub and Linear | Quiet github with an employee-style rollup (GH-2); Linear MCP extension (LN-1, LN-2) | #93–#95 |
