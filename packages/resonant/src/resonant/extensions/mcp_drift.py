@@ -85,6 +85,8 @@ def repin_summary(ext: str, tool: str, change: SchemaChange) -> str:
         parts.append(f"no longer required: {_names(change.unrequired)}")
     if change.other:
         parts.append("other input rules changed")
+    if change.unplain:
+        parts.append("new field text needs a look")
     what = "; ".join(parts) or "what it takes changed"
     return clean_text(f"{ext.capitalize()} changed {tool} ({what}). Accept")
 
@@ -179,14 +181,13 @@ async def _settle(
             runtime.disable(tool, "declined")
             text = f"Okay: {tool} is off until you run resonant ext update {ext}."
             event = "ext.mcp_repin_declined"
-        elif runtime.approved.get(tool) == row.intent_hash or runtime.accept_pending(
-            tool, row.intent_hash
+        elif runtime.approved.get(tool) == row.intent_hash or host.accept_answered(
+            ext, tool, row.intent_hash, row.id
         ):
             text, event = f"Re-pinned {tool}.", ""  # the save audited itself (ext.mcp_repinned)
-        elif runtime.verified_once:
-            _spend(conn, row, now, "ext.mcp_repin_stale")  # moved on or changed again
-            done += 1
-            continue
+        elif runtime.verified_once:  # moved on or changed again: say the yes didn't apply
+            text = f"{tool} changed again or is off, so that yes didn't apply."
+            event = "ext.mcp_repin_stale"
         else:
             continue  # not verified yet this process: the first check will accept it
         if not await _say(conn, channel, owner, text, f"mcp-repin:{row.id}:decided", now):

@@ -136,6 +136,8 @@ from resonant_sdk.manifest import Job, McpHttpServer, duration_s, load_manifest
 log = logging.getLogger(__name__)
 
 ALERTS_KEY = "ext.alerts"  # kv: {name: {text, dedupe_key}}, sent to the owner on start
+CAPPED_KEY = "ext.mcp_repin_capped"  # kv: {"<ext>/<tool>": live pin of the last capped audit}
+REPIN_MAX_PER_DAY = 3  # new re-pin questions per (extension, tool) per 24 h
 MCP_DRIFT_KEY = "ext.mcp_drift"  # kv: {"<ext>/<tool>": dedupe key of the last alert}
 JOB_ARGS = frozenset({"due_at"})
 PINNED_COMMANDS = ALLOWED_COMMANDS - {"python3"}
@@ -477,6 +479,18 @@ class ExtensionHost:
             return None
         return next((r for r in loaded.mcp.values() if tool in r.approved), None)
 
+    def accept_answered(self, ext: str, tool: str, live_pin: str, approval_id: str) -> bool:
+        """The owner's yes (approval ``approval_id``) to the change ``live_pin``: re-pin it,
+        with the approval on the audit row. False when nothing is pending for that pin."""
+        runtime = self._runtime(ext, tool)
+        if runtime is None:
+            return False
+        self._accepting[(ext, tool)] = approval_id
+        try:
+            return runtime.accept_pending(tool, live_pin)
+        finally:
+            self._accepting.pop((ext, tool), None)
+
     def declined(self, record: store.ExtensionRecord, tool: str) -> bool:
         """The owner said no to a re-pin of ``tool`` since this install (one indexed read)."""
         rows = ap.repin_rows(self.conn, record.name, tool, since=record.installed_at)
@@ -587,6 +601,10 @@ class ExtensionHost:
             if self.owner is None:
                 log.warning("mcp tool changed but no owner to ask", extra={"tool": tool})
                 return "keep", None
+            window = now - timedelta(seconds=REPIN_TTL_S)
+            if sum(r.created_at > window for r in rows) >= REPIN_MAX_PER_DAY:
+                self._capped(record, sid, tool, live)  # keep it as it is, no more texts
+                return "keep", None
             for r in rows:
                 if r.status == "pending":
                     ap.expire_one(self.conn, r.id, now, reason=ap.SUPERSEDED)
@@ -621,6 +639,24 @@ class ExtensionHost:
                 change=change.to_json(),
             )
         return "keep", approval_id
+
+    def _capped(self, record: store.ExtensionRecord, sid: str, tool: str, live: str) -> None:
+        """Too many questions about one tool today: audit it once per live pin, ask nothing."""
+        key = f"{record.name}/{tool}"
+        seen = kv_get(self.conn, CAPPED_KEY)
+        seen_map = cast(dict[str, object], seen) if isinstance(seen, dict) else {}
+        log.warning("mcp re-pin questions capped", extra={"extension": record.name, "tool": tool})
+        if seen_map.get(key) == live:
+            return
+        kv_set(self.conn, CAPPED_KEY, {**seen_map, key: live})
+        audit(
+            self.conn,
+            "ext.mcp_repin_capped",
+            extension=record.name,
+            server=sid,
+            tool=tool,
+            live_pin=live,
+        )
 
     def _runtime_pin(self, ext: str, tool: str) -> str | None:
         runtime = self._runtime(ext, tool)

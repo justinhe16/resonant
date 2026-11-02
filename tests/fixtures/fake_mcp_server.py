@@ -18,7 +18,7 @@ JSON-RPC 2.0 and offers:
 ``$HOME/sleep_variant`` changes the write tool ``sleep`` at the next ``tools/list`` (PER-275):
 ``optional`` adds an optional ``note`` property, ``required`` a required ``team``, ``retype``
 makes ``seconds`` a string, ``gone`` omits it, ``dup`` lists it twice, ``output`` adds an
-``outputSchema``.
+``outputSchema``, ``req:<name>`` adds a required property of that name.
 
 ``$HOME/variant`` (any text) changes ``echo``'s description and annotations at the next
 ``tools/list`` (not pinned); ``$HOME/schema`` (any text) adds a property to its input schema.
@@ -83,6 +83,9 @@ def sleep_tools() -> list[dict[str, Any]]:
         return []
     if v == "optional":
         props["note"] = {"type": "string"}
+    elif v.startswith("req:"):  # a required property with this name
+        props[v[4:]] = {"type": "string"}
+        tool["inputSchema"]["required"] = [v[4:]]
     elif v == "required":
         props["team"] = {"type": "string"}
         tool["inputSchema"]["required"] = ["team"]

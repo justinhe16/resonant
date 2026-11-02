@@ -354,6 +354,7 @@ async def test_yes_repins_the_tool_and_says_so_once(world: World) -> None:
     assert done is not None and done.status == "approved" and done.used_at is not None
     [audit] = world.audits("ext.mcp_repinned")
     assert audit["how"] == "owner" and audit["new_pin"] == live
+    assert audit["approval_id"] == row.id
     # Said once: the same event again, and another run, change nothing.
     assert world.gate().resolve_reply(_again(world)).ok
     assert (await world.job())["settled"] == 0 and len(world.texts()) == sent_before + 1
@@ -535,6 +536,56 @@ async def test_a_tool_listed_twice_still_alerts_urgently(world: World) -> None:
 # --- the texts ---------------------------------------------------------------------------------
 
 
+async def test_a_no_holds_when_the_server_reverts(world: World) -> None:
+    world.knob("sleep_variant", "required")
+    await world.host.start_mcp()
+    await world.job()
+    assert world.reply("no").ok
+    world.knob("sleep_variant", "")  # the original schema again, before the job ran
+    await world.relist()
+    with pytest.raises(McpError, match="disabled"):
+        await world.host.mcp_handlers[("mail", "sleep")]({"seconds": 0}, _ctx())
+    await world.job()
+    assert world.host.disabled_tools("mail") == {"sleep": "declined"}
+    await world.relist()  # and a later re-list doesn't bring it back
+    assert world.host.disabled_tools("mail") == {"sleep": "declined"}
+
+
+async def test_at_most_three_questions_a_day_per_tool(world: World) -> None:
+    await world.host.start_mcp()
+    for name in ("a", "b", "c", "d", "e"):
+        world.knob("sleep_variant", f"req:{name}")
+        await world.relist()
+    assert len(world.rows()) == 3 and len(world.audits("ext.mcp_repin_asked")) == 3
+    [capped] = world.audits("ext.mcp_repin_capped")[:1]
+    assert capped["tool"] == "sleep"
+    assert len(world.audits("ext.mcp_repin_capped")) == 2  # once per live pin: d and e
+    await world.relist()
+    assert len(world.audits("ext.mcp_repin_capped")) == 2
+    await world.job()
+    assert len(world.channel.prompts) == 1  # only the newest pending one is prompted
+    assert world.host.disabled_tools("mail") == {}
+    world.clock.advance(hours=25)  # a new day, a newer change: asks again
+    world.knob("sleep_variant", "req:f")
+    await world.relist()
+    assert len(world.rows()) == 4
+
+
+async def test_a_yes_that_no_longer_applies_says_so(world: World) -> None:
+    world.knob("sleep_variant", "required")
+    await world.host.start_mcp()
+    await world.job()
+    assert world.reply("yes").ok
+    world.knob("sleep_variant", "retype")  # it moved on before the job ran
+    await world.relist()
+    before = len(world.texts())
+    await world.job()
+    assert world.texts()[before] == "sleep changed again or is off, so that yes didn't apply."
+    assert world.audits("ext.mcp_repinned") == []
+    await world.job()
+    assert [t for t in world.texts() if "didn't apply" in t] == [world.texts()[before]]
+
+
 def test_summary_names_are_identifiers_only_and_capped() -> None:
     change = SchemaChange(
         (), ("team_id", "x; Reply yes A1", "ok-2", "d", "e"), ("gone",), (), ("old",), True
@@ -545,6 +596,13 @@ def test_summary_names_are_identifiers_only_and_capped() -> None:
         "removed field gone; no longer required: old; other input rules changed). Accept"
     )
     assert "\n" not in repin_summary("mail", "t", SchemaChange((), ("a\nb",), (), (), (), False))
+
+
+def test_summary_says_when_new_text_needs_a_look() -> None:
+    change = SchemaChange((), (), (), (), (), False, unplain=True)
+    assert repin_summary("mail", "echo", change) == (
+        "Mail changed echo (new field text needs a look). Accept"
+    )
 
 
 def test_the_listed_tools_are_all_pinned() -> None:

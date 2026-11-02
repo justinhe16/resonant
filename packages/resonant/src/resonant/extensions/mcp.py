@@ -464,12 +464,21 @@ class SchemaChange:
     changed: tuple[str, ...]  # an existing property whose subschema differs
     unrequired: tuple[str, ...]  # was required, no longer
     other: bool  # any other top-level keyword differs (additionalProperties, anyOf, type, ...)
+    # A string the change ADDS anywhere in the schema (a property name, an enum or const
+    # value, a pattern or format) isn't plain: new server text the model would read.
+    unplain: bool = False
 
     @property
     def benign(self) -> bool:
-        """Only new optional properties (or nothing): what an old call still satisfies."""
+        """Only new optional properties (or nothing), all in plain words: what an old call
+        still satisfies and nothing new for the model to read."""
         return not (
-            self.added_required or self.removed or self.changed or self.unrequired or self.other
+            self.added_required
+            or self.removed
+            or self.changed
+            or self.unrequired
+            or self.other
+            or self.unplain
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -480,6 +489,7 @@ class SchemaChange:
             "changed": list(self.changed),
             "unrequired": list(self.unrequired),
             "other": self.other,
+            "unplain": self.unplain,
         }
 
 
@@ -496,6 +506,66 @@ def _names(schema: Mapping[str, Any]) -> set[str]:
     return {x for x in cast(list[Any], v) if isinstance(x, str)} if isinstance(v, list) else set()
 
 
+_PLAIN = re.compile(r"^[A-Za-z0-9_.\- ]{1,40}$")
+_NAME_MAPS = ("properties", "patternProperties", "$defs", "definitions")
+
+
+def _canon(value: object) -> str:
+    """Canonical JSON: ``1``, ``1.0`` and ``true`` differ here, as they do for a validator."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _same(a: object, b: object) -> bool:
+    return _canon(a) == _canon(b)
+
+
+def _strings(schema: object, out: set[tuple[str, str]]) -> None:
+    """Every string of a stripped schema the model could read, by kind: names (property,
+    ``$defs`` and ``required`` entries), values (``enum``/``const``) and patterns/formats."""
+    if isinstance(schema, list):
+        for item in cast(list[Any], schema):
+            _strings(item, out)
+        return
+    if not isinstance(schema, dict):
+        return
+    for key, value in cast(dict[str, Any], schema).items():
+        if key in _NAME_MAPS and isinstance(value, dict):
+            for name, sub in cast(dict[str, Any], value).items():
+                out.add(("pattern" if key == "patternProperties" else "name", name))
+                _strings(sub, out)
+        elif key == "required" and isinstance(value, list):
+            out |= {("name", x) for x in cast(list[Any], value) if isinstance(x, str)}
+        elif key in ("enum", "const"):
+            _values(value, out)
+        elif key in ("pattern", "format") and isinstance(value, str):
+            out.add(("pattern", value))
+        else:
+            _strings(value, out)
+
+
+def _values(value: object, out: set[tuple[str, str]]) -> None:
+    if isinstance(value, str):
+        out.add(("value", value))
+    elif isinstance(value, list):
+        for item in cast(list[Any], value):
+            _values(item, out)
+    elif isinstance(value, dict):
+        for k, v in cast(dict[str, Any], value).items():
+            out.add(("value", k))
+            _values(v, out)
+
+
+def new_strings_plain(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
+    """Whether every string ``new`` adds to ``old`` is plain: a name or enum/const value of
+    at most 40 letters, digits, ``_ . -`` and spaces. A new pattern, format or
+    ``patternProperties`` key is never plain (conservative: regex text can say anything)."""
+    before: set[tuple[str, str]] = set()
+    after: set[tuple[str, str]] = set()
+    _strings(old, before)
+    _strings(new, after)
+    return all(kind != "pattern" and _PLAIN.match(text) for kind, text in after - before)
+
+
 def diff_input(old: Mapping[str, Any], new: Mapping[str, Any]) -> SchemaChange:
     """Compare two stripped input schemas. Properties by key, ``required`` as sets, every
     other keyword by value; ``$defs`` may only grow (a new optional property may ``$ref`` a
@@ -507,16 +577,17 @@ def diff_input(old: Mapping[str, Any], new: Mapping[str, Any]) -> SchemaChange:
     for key in sorted((set(old) | set(new)) - {"properties", "required"}):
         if key in _DEFS:
             do, dn = _map(old, key), _map(new, key)
-            other = other or any(dn.get(k) != v for k, v in do.items())
-        elif old.get(key) != new.get(key):
+            other = other or any(k not in dn or not _same(dn[k], v) for k, v in do.items())
+        elif not _same(old.get(key), new.get(key)):
             other = True
     return SchemaChange(
         added_optional=tuple(p for p in added if p not in rn),
         added_required=tuple(sorted(rn - ro)),
         removed=tuple(sorted(set(po) - set(pn))),
-        changed=tuple(sorted(p for p in set(po) & set(pn) if po[p] != pn[p])),
+        changed=tuple(sorted(p for p in set(po) & set(pn) if not _same(po[p], pn[p]))),
         unrequired=tuple(sorted(ro - rn)),
         other=other,
+        unplain=not new_strings_plain(old, new),
     )
 
 
@@ -1189,7 +1260,9 @@ class McpServerRuntime:
                     self._migrate(tool, cast(str, got))
                     continue
             elif got == pin:
-                self.pending.pop(tool, None)  # the server went back to what was approved
+                held = self.pending.pop(tool, None)  # the server went back to what was approved
+                if held is not None and self.declined is not None and self.declined(tool):
+                    self.disable(tool, "declined")  # a no holds until ext update
                 continue
             elif (
                 entry is not None
@@ -1211,7 +1284,10 @@ class McpServerRuntime:
         old = self.schemas.get(tool)
         change = diff_input(old, new) if old is not None else SchemaChange((), (), (), (), (), True)
         effect = self.effects.get(tool)
-        if effect == "read" or (effect in ("write", "pay") and change.benign):
+        # New server text the model would read is never accepted unseen, a read tool too.
+        if (effect == "read" and not change.unplain) or (
+            effect in ("write", "pay") and change.benign
+        ):
             return self._accept(tool, got, new, change, "auto")
         held = self.pending.get(tool)
         if held is not None and held.pin == got:
@@ -1406,6 +1482,7 @@ __all__ = [
     "disabled_text",
     "discover",
     "input_schema",
+    "new_strings_plain",
     "parse_pins",
     "pins_digest",
     "pins_json",
