@@ -60,21 +60,37 @@ def run_events(
 ) -> dict[str, list[tuple[datetime, str]]]:
     """``run code -> [(at, action)]``, oldest first, the last ``per_run`` of each run's
     ``run.*`` audit rows (``run.start``, ``run.ready``, ...). The log keeps 365 days and has
-    no index on ``detail``, so the scan is bounded twice: from the oldest ``run.start`` of
-    these runs' tasks (``audit_task`` index; a run with no task adds nothing, and without any
-    the scan starts at the beginning) and at ``RUN_EVENT_SCAN`` rows, newest first."""
+    no index on ``detail``, so the scan starts at a floor: the lowest of the oldest
+    ``run.start`` of the runs' tasks (``audit_task`` index) and, for a run with no task, the
+    first audit row at or after its ``runs.created_at`` (a run's rows are never older than
+    it); a run unknown to ``runs`` and without a task has no floor (0). The rows read are
+    capped at ``RUN_EVENT_SCAN`` matching rows, newest first, so a busy log can cut the
+    oldest events of a run."""
     if not runs:
         return {}
     codes = [code for code, _ in runs]
     task_ids = [t for _, t in runs if t is not None]
-    floor = 0
-    if task_ids and len(task_ids) == len(runs):
+    floors: list[int] = []
+    if task_ids:
         row = conn.execute(
             "SELECT MIN(id) FROM audit_log WHERE action = 'run.start'"
             " AND task_id IN (SELECT value FROM json_each(?))",
             (json.dumps(task_ids),),
         ).fetchone()
-        floor = int(row[0] or 0)
+        floors.append(int(row[0] or 0))
+    taskless = [code for code, t in runs if t is None]
+    if taskless:
+        row = conn.execute(
+            "SELECT MIN(created_at) FROM runs WHERE code IN (SELECT value FROM json_each(?))",
+            (json.dumps(taskless),),
+        ).fetchone()
+        first = None
+        if row is not None and row[0] is not None:
+            first = conn.execute(
+                "SELECT id FROM audit_log WHERE at >= ? ORDER BY id LIMIT 1", (row[0],)
+            ).fetchone()
+        floors.append(0 if row is None or row[0] is None else int(first[0]) if first else 1 << 62)
+    floor = min(floors)
     rows = conn.execute(
         """SELECT at, action, json_extract(detail, '$.run') FROM audit_log
                WHERE id >= ? AND action LIKE 'run.%'

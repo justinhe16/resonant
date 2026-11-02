@@ -11,12 +11,15 @@ import pytest
 
 from resonant.redact import (
     CUT_MARK,
+    RC_LINK_SQL,
+    RC_MARK,
     REDACT_SLACK,
     REDACTED,
     SECRET_SQL_FAMILY,
     Redactor,
     clip_text,
     redact_secrets,
+    scrub_rc_links,
 )
 
 MIGRATION = (
@@ -163,3 +166,12 @@ def test_sql_pattern_leaves_ordinary_text_alone() -> None:
         "9f2c1e7ab3d4" * 5,
     ):
         assert not SQL_RE.search(text), text
+
+
+def test_remote_control_links_are_scrubbed_and_the_migration_refuses_them() -> None:
+    url = "https://claude.ai/code/session_" + "01AbC-xyz"
+    assert scrub_rc_links(f"a {url}, b {url}!") == f"a {RC_MARK}, b {RC_MARK}!"
+    assert clip_text(f"see {url} please", 100) == f"see {RC_MARK} please"
+    assert "https://claude.ai/code/" not in (clip_text("x" * 290 + url, 295) or "")
+    assert f"p_data::text ~ '{RC_LINK_SQL}'" in MIGRATION.read_text()
+    assert re.search(RC_LINK_SQL.replace("\\.", "."), url)

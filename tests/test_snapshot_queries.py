@@ -128,3 +128,28 @@ def test_task_events(db: sqlite3.Connection) -> None:
     assert [x for _, x in events[a]] == [f"x.e{i}" for i in range(11, 15)]
     assert [x for _, x in events[b]] == ["y.only"] and "none" not in events
     assert audit_store.task_events(db, [], per_task=4) == {}
+
+
+def test_run_events_floor_covers_taskless_runs_by_created_at(db: sqlite3.Connection) -> None:
+    t1 = _task(db)
+    audit(db, "run.start", run="R9")  # an old run's row, before everything below
+    old = runs.create(db, repo="", ask="old", principal="j", session_id="s0", max_seconds=60)
+    db.execute(
+        "UPDATE runs SET created_at = '2000-01-01T00:00:00.000Z' WHERE code = ?", (old.code,)
+    )
+    audit(db, "run.start", task_id=t1, run="R2")
+    audit(db, "run.ready", run="R2")
+    # Mixed: a task-less run with an old created_at keeps the floor low, so its row is found.
+    ev = audit_store.run_events(db, [(old.code, None), ("R2", t1)], per_run=5)
+    assert [a for _, a in ev["R2"]] == ["run.start", "run.ready"]
+    audit(db, "run.start", run=old.code)
+    assert [a for _, a in audit_store.run_events(db, [(old.code, None), ("R2", t1)])[old.code]] == [
+        "run.start"
+    ]
+    # A task-less run created after the log's rows: the floor skips what came before it.
+    new = runs.create(db, repo="", ask="new", principal="j", session_id="s1", max_seconds=60)
+    db.execute(
+        "UPDATE runs SET created_at = '2999-01-01T00:00:00.000Z' WHERE code = ?", (new.code,)
+    )
+    audit(db, "run.start", run=new.code)
+    assert audit_store.run_events(db, [(new.code, None)]).get(new.code, []) == []

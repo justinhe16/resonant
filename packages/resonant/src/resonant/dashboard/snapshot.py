@@ -945,12 +945,18 @@ def build_snapshot(
     passes must also remove (the relay pusher's token and key).
     """
     now = now or utcnow()
-    t = _Text(redactor)
+    run_rows = runs.recent(conn, limit=RUN_ITEMS)
+    # Every Remote Control link we hold is also a known value (a worker may echo one into a
+    # text; ``clip_text`` scrubs the shape, this catches the exact value whatever its shape).
+    links = [r.remote_url for r in run_rows if r.remote_url]
+    session = claude_status(conn)
+    if session is not None and isinstance(session.get("remote_url"), str):
+        links.append(session["remote_url"])
+    t = _Text(Redactor([*(redactor.values if redactor else ()), *links]))
     health = _health(conn, t)
     ctx = _Context(conn, now)
 
     task_rows = task_store.recent(conn, TASK_ITEMS)
-    run_rows = runs.recent(conn, limit=RUN_ITEMS)
     asks = questions.open_asks(conn)
     pending_rows = approvals.pending_all(conn, now)
     recent_rows = approvals.recent_decided(

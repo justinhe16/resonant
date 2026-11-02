@@ -960,14 +960,32 @@ def _seed_texts(db: sqlite3.Connection, now: datetime, text: Any) -> None:
     ap.insert_batch(db, "justin", [a, b], now)
     pulse.upsert(db, "core", "k/1", text().strip() or "t", "normal", None, False, 3600, now)
     pulse.upsert(db, "github", "k/2", text().strip() or "t", "low", None, False, 3600, now)
-    audit(db, TOOL_ACTION, tool="Bash", decision="gate", command=text(), cwd=text(),
+    audit(db, TOOL_ACTION, tool=text(), decision=text(), command=text(), cwd=text(),
           status="ok", write=True)  # fmt: skip
+    # The approval's decided_by, tool and extension; a pulse item's source and key; a repo's
+    # name, base and slug: stored past their validators, as a hand-edited row would be.
+    db.execute(
+        "UPDATE approvals SET status = 'approved', decided_at = ?, decided_by = ?, tool = ?,"
+        " extension = ? WHERE id = ?",
+        (iso(now), text(), text(), text(), a),
+    )
+    db.execute(
+        "INSERT INTO pulse_items (source, key, title, urgency, fingerprint, cleared, updated_at,"
+        " expires_at) VALUES (?, ?, 't', 'low', 'f', 0, ?, ?)",
+        (text(), text() or "k", iso(now), iso(now + timedelta(hours=1))),
+    )
+    repos.add(db, "me/dori", base="main", source="test", name="dori")
+    db.execute(
+        "UPDATE repos SET name = ?, base = ?, slug = ? WHERE name = 'dori'",
+        (text() or "n", text(), text() or "s"),
+    )
     ext_store.save_extension(
         db,
         ext_store.ExtensionRecord(
             name="github", source="repo:github", commit="abc1234", tree_digest="d",
             manifest_sha="m", installed_at=now, installed_by="justin",
             manifest={"name": "github", "description": text(), "repos": [text()],
+                      "jobs": [{"id": "j", "schedule": text(), "tz": text()}],
                       "tools": {"t": {"effect": "read", "description": text()}},
                       "mcp": {"servers": {"m": {"transport": "stdio", "tools": [
                           {"name": "u", "effect": "read", "description": text()}]}}}},
@@ -988,6 +1006,7 @@ def test_every_text_is_capped_over_random_unicode(db: sqlite3.Connection, seed: 
     now = utcnow()
     _seed_texts(db, now, lambda: _unicode(rng))
     s = build_snapshot(db, load_settings(), started_at=now, now=now,
+                       core_jobs=[("pulse", _unicode(rng), _unicode(rng))],
                        runner_missing=[_unicode(rng) for _ in range(12)])  # fmt: skip
     data = s.model_dump(mode="json")
 
@@ -1061,15 +1080,53 @@ def test_no_secret_reaches_either_tier(db: sqlite3.Connection, family: str) -> N
     secret, raw = SECRET_SAMPLES[family]
     now = utcnow()
     seed_secret(db, now, secret, FAKE_TOKEN)
+    leak = f"leak {secret} {FAKE_TOKEN}"
     s = build_snapshot(
         db, load_settings(), started_at=now, now=now, redactor=Redactor([FAKE_TOKEN]),
-        runner_missing=[f"leak {secret} {FAKE_TOKEN}"],
+        runner_missing=[leak], core_jobs=[("pulse", leak, leak)],
     )  # fmt: skip
     for tier in (s, to_remote(s)):
         text = json.dumps(tier.model_dump(mode="json"), ensure_ascii=False)
         assert raw not in text and FAKE_TOKEN not in text
         assert "leak" in text  # the texts are there, cleaned
         assert redact_secrets(text) == text  # nothing credential-shaped is left
+
+
+RC = "https://claude.ai/code/session_" + "AbC123xyz"
+
+
+def test_remote_control_links_in_text_never_ship(db: sqlite3.Connection) -> None:
+    """A worker or the brain may echo a Remote Control link into any text: it is scrubbed from
+    both tiers (the link fields themselves stay on the local tier only)."""
+    now = utcnow()
+    kv_set(db, SESSION_KV, {"session_id": "s", "turns": 1, "pid": 1, "remote_url": RC})
+    _seed_texts(db, now, lambda: f"open {RC} now")
+    odd = "https://claude.ai/code/odd" + "-link"  # held as a value, whatever its shape
+    run = runs.create(db, repo="", ask=f"x {odd}", principal="j", session_id="s2", max_seconds=60)
+    runs.update(db, run.code, status="running", remote_url=odd)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, runner_missing=[RC])
+    local = _local_view(s.model_dump(mode="json"))
+    assert "open [remote control link] now" in json.dumps(local)
+    for dump in (local, to_remote(s).model_dump(mode="json")):
+        text = json.dumps(dump)
+        assert "claude.ai/code" not in text and "AbC123xyz" not in text and "odd-link" not in text
+
+
+def test_remote_dumps_have_no_link_key_and_no_approval_code(db: sqlite3.Connection) -> None:
+    now = utcnow()
+    kv_set(db, SESSION_KV, {"session_id": "s", "turns": 1, "pid": 1, "remote_url": RC})
+    _seed_texts(db, now, lambda: "x")
+    run = runs.create(db, repo="", ask="y", principal="j", session_id="s2", max_seconds=60)
+    runs.update(db, run.code, status="running", remote_url=RC)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now)
+    local = s.model_dump(mode="json")
+    assert any(r.get("remote_url") for r in local["runs"]["items"])
+    assert local["claude_brain"]["remote_url"] == RC
+    assert any(a.get("code") for a in local["approvals"]["items"])
+    remote = to_remote(s).model_dump(mode="json")
+    assert '"remote_url"' not in json.dumps(remote)
+    for key in ("items", "recent"):
+        assert all(a.get("code") is None and "code" not in a for a in remote["approvals"][key])
 
 
 # --- sizes ---------------------------------------------------------------------------------

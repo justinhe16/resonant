@@ -109,10 +109,11 @@ export function useHashRoute(): Route | null {
   return parseHash(hash);
 }
 
-/** Closes the dialog: drops the hash without scrolling, and tells listeners. */
+/** Closes the dialog: drops the hash without scrolling, and tells listeners. It replaces the
+ *  history entry rather than adding one, so Back does not reopen the dialog just closed. */
 export function closeRoute(): void {
   try {
-    window.history.pushState(null, "", window.location.pathname + window.location.search);
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
   } catch {
     window.location.hash = "";
     return;

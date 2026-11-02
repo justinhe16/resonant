@@ -47,7 +47,7 @@ import httpx
 from resonant.config import RelayConfig
 from resonant.dashboard.snapshot import RELAY_HEALTH_KV, Snapshot, to_remote
 from resonant.monitor import scrub
-from resonant.redact import Redactor, redact_secrets
+from resonant.redact import Redactor, redact_secrets, scrub_rc_links
 from resonant.secrets import SecretError, SecretMissing, SecretStore, secret_ref
 from resonant.store.db import iso, kv_get, kv_set, utcnow
 
@@ -216,7 +216,7 @@ def _scrub(data: dict[str, Any], known: Redactor) -> dict[str, Any]:
 
     def walk(node: Any) -> Any:
         if isinstance(node, str):
-            return redact_secrets(node)
+            return redact_secrets(scrub_rc_links(node))
         if isinstance(node, dict):
             return {k: walk(v) for k, v in cast(dict[str, Any], node).items()}
         if isinstance(node, list):

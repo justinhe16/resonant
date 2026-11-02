@@ -528,6 +528,14 @@ def test_ingest_refuses_secret_shaped_text(db: Pg, tmp_path: Path, secret: str) 
     assert count(db) == 0 and count_latest(db) == 0
 
 
+def test_ingest_refuses_a_remote_control_link_in_text(db: Pg, tmp_path: Path) -> None:
+    link = "see https://claude.ai/code/session_" + "abc123 now"
+    change: dict[str, Any] = {"runs": {"by_state": {}, "items": [{"code": "R1", "summary": link}]}}
+    r = ingest(db, remote_snapshot(tmp_path, **change))
+    assert r.sqlstate == "PT400" and "remote control link" in r.err, r.err
+    assert count(db) == 0 and count_latest(db) == 0
+
+
 @pytest.mark.parametrize(
     "text",
     [

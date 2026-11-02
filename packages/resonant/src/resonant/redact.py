@@ -91,6 +91,7 @@ class Redactor:
 
     def __init__(self, values: Iterable[str] = ()) -> None:
         unique = sorted({v for v in values if v}, key=len, reverse=True)
+        self.values: tuple[str, ...] = tuple(unique)
         self._patterns = [p for v in unique for p in _patterns(v)]
 
     def __bool__(self) -> bool:
@@ -207,16 +208,28 @@ SECRET_SQL_FAMILY: Final = "".join((  # joined: ruff's S105 reads a literal as a
 ))  # fmt: skip
 
 
+# A Claude Remote Control link (whoever holds it can drive the session): never published in
+# any text. ``relay_ingest`` refuses the same shape (``RC_LINK_SQL``).
+RC_LINK = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]+")
+RC_LINK_SQL: Final = "https://claude\\.ai/code/"
+RC_MARK: Final = "[remote control link]"
+
+
+def scrub_rc_links(text: str) -> str:
+    return RC_LINK.sub(RC_MARK, text)
+
+
 def clip_text(text: str | None, cap: int, *, known: Redactor | None = None) -> str | None:
     """``text`` made safe to publish, at most ``cap`` characters: credential-shaped text
     replaced (``redact_secrets`` over the first ``cap`` + ``REDACT_SLACK`` characters, so a
-    secret that straddles the cut is whole when it is seen), then each value ``known`` (a
-    ``Redactor``) replaced, then cut to ``cap`` with ``CUT_MARK`` as the last characters
-    (counted inside ``cap``) when anything was cut. None stays None."""
+    secret that straddles the cut is whole when it is seen; a Remote Control link is replaced
+    first, ``scrub_rc_links``), then each value ``known`` (a ``Redactor``) replaced, then cut
+    to ``cap`` with ``CUT_MARK`` as the last characters (counted inside ``cap``) when anything
+    was cut. None stays None."""
     if text is None:
         return None
     head = text[: cap + REDACT_SLACK]
-    out = redact_secrets(head)
+    out = redact_secrets(scrub_rc_links(head))
     if known:
         out = known.text(out)
     if len(out) > cap or len(head) < len(text):

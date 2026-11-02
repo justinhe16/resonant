@@ -122,6 +122,11 @@ begin
     raise exception 'relay: secret-shaped text' using errcode = 'PT400';
   end if;
 
+  -- A Remote Control link inside a text (redact.RC_LINK_SQL): it can drive a session.
+  if p_data::text ~ 'https://claude\.ai/code/' then
+    raise exception 'relay: remote control link' using errcode = 'PT400';
+  end if;
+
   begin
     t := (p_data ->> 'taken_at')::timestamptz;
   exception when others then
