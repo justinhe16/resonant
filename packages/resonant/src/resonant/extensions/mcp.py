@@ -1288,6 +1288,9 @@ class McpServerRuntime:
     def _drifted(self, tool: str, entry: Mapping[str, Any], got: str) -> bool:
         """A usable live schema with a new pin: re-pin it, or ask. False: turn it off (the
         save lost)."""
+        if self.declined is not None and self.declined(tool):
+            self.disable(tool, "declined")  # a no holds until ext update, whatever comes next
+            return True
         new = input_schema(entry)  # usable: ``got`` is not INVALID_PIN
         old = self.schemas.get(tool)
         change = (

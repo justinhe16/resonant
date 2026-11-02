@@ -565,6 +565,19 @@ async def test_a_no_holds_across_a_restart_with_the_server_already_reverted(
         await world.host.mcp_handlers[("mail", "sleep")]({"seconds": 0}, _ctx())
 
 
+async def test_a_no_holds_when_a_later_change_is_benign(world: World) -> None:
+    world.knob("sleep_variant", "required")
+    await world.host.start_mcp()
+    await world.job()
+    assert world.reply("no").ok
+    world.knob("sleep_variant", "optional")  # old schema + a plain optional field
+    await world.restart()  # no job ran
+    assert world.host.disabled_tools("mail") == {"sleep": "declined"}
+    assert world.audits("ext.mcp_repinned") == []
+    with pytest.raises(McpError, match="disabled"):
+        await world.host.mcp_handlers[("mail", "sleep")]({"seconds": 0}, _ctx())
+
+
 async def test_at_most_three_questions_a_day_per_tool(world: World) -> None:
     await world.host.start_mcp()
     for name in ("a", "b", "c", "d", "e"):

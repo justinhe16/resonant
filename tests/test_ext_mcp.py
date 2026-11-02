@@ -840,6 +840,22 @@ async def test_read_tool_new_text_is_asked_unless_plain(
         assert set(runtime.schemas["echo"]["properties"]) == {"text", "description"}
 
 
+@pytest.mark.parametrize("variant", ["read", "write"])
+async def test_a_declined_tool_is_never_auto_repinned(
+    runtime: McpServerRuntime, tmp_path: Path, variant: str
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    tools = await discover(request(runtime.root, data))
+    tool = "echo" if variant == "read" else "sleep"
+    entry = next(t for t in tools if t["name"] == tool)
+    entry["inputSchema"]["properties"]["plain_extra"] = {"type": "integer"}  # benign, plain
+    runtime.declined = lambda t: t == tool
+    runtime._check(tools)  # pyright: ignore[reportPrivateUsage]
+    assert list(cast(RepinLog, runtime.on_repin)) == []
+    assert runtime.disabled == {tool: "declined"}
+
+
 async def test_accept_pending_swaps_the_schema_and_a_revert_clears_it(
     runtime: McpServerRuntime, tmp_path: Path
 ) -> None:
