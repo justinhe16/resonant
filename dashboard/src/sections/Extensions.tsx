@@ -1,33 +1,39 @@
-import { Ago, Empty, Row, Rows, Section, StateBadge } from "@/components/bits";
+import { CollapsibleSection } from "@/components/CollapsibleSection";
+import { Ago, Empty, Meta, Row, RouteLink, Rows, StateBadge } from "@/components/bits";
 import { Badge } from "@/components/ui/badge";
 import { absolute } from "@/lib/time";
 import { healthTone, outcomeTone } from "@/lib/tone";
-import type { Extension, Snapshot } from "@/types";
+import type { Extension, Job, Snapshot } from "@/types";
 
 export function Extensions({ snap, now }: { snap: Snapshot; now: number }) {
   return (
-    <Section title="Extensions" description={`${snap.extensions.length} installed`}>
-      {snap.extensions.length === 0 ? (
-        <Empty>No extensions installed.</Empty>
-      ) : (
-        <div className="space-y-3">
-          {snap.extensions.map((ext) => (
-            <ExtensionBlock key={ext.name} ext={ext} now={now} />
-          ))}
-        </div>
-      )}
-    </Section>
+    <CollapsibleSection
+      id="extensions"
+      title="Extensions"
+      total={snap.extensions.length}
+      rows={snap.extensions}
+      render={(ext) => <ExtensionRow key={ext.name} ext={ext} now={now} />}
+      empty="No extensions installed."
+      explainer="extensions"
+      previewCount={3}
+    />
   );
 }
 
-function ExtensionBlock({ ext, now }: { ext: Extension; now: number }) {
+function ExtensionRow({ ext, now }: { ext: Extension; now: number }) {
   const muted = !!ext.muted_until && Date.parse(ext.muted_until) > now;
   return (
-    <div className="rounded-lg border px-4 py-3">
+    <Row className="relative">
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="font-mono text-sm font-medium">{ext.name}</h3>
-          <p className="text-xs text-muted-foreground">{ext.status.replace(/_/g, " ")}</p>
+          <h3 className="text-sm font-medium">
+            <RouteLink to={{ kind: "extension", name: ext.name }} stretch className="font-mono">
+              {ext.name}
+            </RouteLink>
+          </h3>
+          <p className="text-xs text-muted-foreground">
+            {ext.status.replace(/_/g, " ")} · {ext.tools.length} tool{ext.tools.length === 1 ? "" : "s"}
+          </p>
         </div>
         <span className="flex shrink-0 items-center gap-1.5">
           {muted && (
@@ -38,31 +44,46 @@ function ExtensionBlock({ ext, now }: { ext: Extension; now: number }) {
           <StateBadge tone={healthTone(ext.health)}>{ext.health}</StateBadge>
         </span>
       </div>
-      <div className="mt-3">
+      {ext.description && (
+        <p className="mt-1.5 text-xs text-muted-foreground">{ext.description}</p>
+      )}
+      <div className="mt-2">
         {ext.jobs.length === 0 ? (
           <Empty>No scheduled jobs.</Empty>
         ) : (
           <Rows>
             {ext.jobs.map((j) => (
-              <Row key={j.id} className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 py-2.5 text-sm">
-                <span className="font-mono text-xs">{j.id}</span>
-                <span className="flex items-center justify-end gap-1.5">
-                  {j.fail_streak > 0 && (
-                    <Badge variant="bad">
-                      {j.fail_streak} fail{j.fail_streak === 1 ? "" : "s"} in a row
-                    </Badge>
-                  )}
-                  <Badge variant={outcomeTone(j.last_outcome)}>{j.last_outcome ?? "not run"}</Badge>
-                </span>
-                <span className="col-span-2 flex flex-wrap gap-x-3 text-xs text-muted-foreground">
-                  <Ago iso={j.last_run_at} now={now} prefix="last " />
-                  {j.next_due && <Ago iso={j.next_due} now={now} prefix="next " />}
-                </span>
-              </Row>
+              <JobRow key={j.id} job={j} ext={ext.name} now={now} />
             ))}
           </Rows>
         )}
       </div>
-    </div>
+    </Row>
+  );
+}
+
+/** One scheduled job (an extension's or a core one). */
+export function JobRow({ job: j, ext, now }: { job: Job; ext: string; now: number }) {
+  return (
+    <Row className="relative grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 py-2.5 text-sm">
+      <RouteLink to={{ kind: "job", ext, id: j.id }} stretch className="font-mono text-xs">
+        {j.id}
+      </RouteLink>
+      <span className="flex items-center justify-end gap-1.5">
+        {j.fail_streak > 0 && (
+          <Badge variant="bad">
+            {j.fail_streak} fail{j.fail_streak === 1 ? "" : "s"} in a row
+          </Badge>
+        )}
+        <Badge variant={outcomeTone(j.last_outcome)}>{j.last_outcome ?? "not run"}</Badge>
+      </span>
+      <div className="col-span-2">
+        <Meta>
+          {j.schedule && <span className="font-mono">{j.schedule}</span>}
+          <Ago iso={j.last_run_at} now={now} prefix="last " />
+          {j.next_due && <Ago iso={j.next_due} now={now} prefix="next " />}
+        </Meta>
+      </div>
+    </Row>
   );
 }

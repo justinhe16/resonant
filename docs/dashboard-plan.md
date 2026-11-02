@@ -7,14 +7,14 @@ Status: **implemented** (2026-10-16). The owner asked for the base dashboard (UI
 - **Push** (DB-3): with `relay.enabled`, `resonant/dashboard/pusher.py` POSTs `to_remote(snapshot)` every 60 s to the `relay_ingest(p_token, p_data)` RPC with the public anon key and the ingest token from Keychain `relay/supabase_key`. Health row `relay`. Not a custom JWT role: a random token whose SHA-256 sits in `relay_private.config`, checked by `SECURITY DEFINER` functions; the SQL also refuses any local-only field, rate-limits and keeps 7 days.
 - **Remote** (DB-4): `relay/` on one Fly machine, Python standard library only, serves the same build in Supabase mode (password + TOTP, `aal2`, owner-only RLS; TOTP is enrolled once with `supabase/enroll_mfa.mjs`, never in the UI) and runs the dead-man checker through `relay_status(token)` with its own status token: alerts to ntfy or a webhook on stale (5 min), failing and read-error incidents, once each way.
 - **Go-live** (DB-5): step 15 is the ordered owner walkthrough, ending with the freeze test. The relay supersedes `health.healthchecks_url` as the dead-man switch (kept as an option); `--check` has one advisory `dead-man switch` row. Leftovers are in [PER-263](https://linear.app/doriapp/issue/PER-263) and [`limits.md`](limits.md#relay-and-dashboard).
-- **Remote view** (R3, R5): the remote page shows what the local one does, without text: each local-only `items` list has a `brief` beside it on both tiers (runs, approvals, worker questions, pulse items), plus the brain's state, turns and last tool calls by kind (`brain_activity`), `runner.gaps`, `trust_rule_count` and `repo_count`. Each section names what stays local ("Its commands are shown on the local dashboard only."). Fields in §3, notes in `interfaces.md` (Dashboard snapshot, Briefs).
+- **Full remote view** (PER-276, supersedes R3/R5 and D3's text-free tier): the remote page shows what the local one does, text included: the relay stores the whole schema-2 snapshot in `snapshot_latest` (one row, up to 256 KiB; owner-only reads with MFA) and a slim row per push in the history. The page's sections are collapsible and every row opens a detail dialog with a deep link (`#/runs/R12`); each section has an (i) explainer; texts from workers, extensions and web pages carry an "outside" badge. Exactly two things stay on the Mini: the Remote Control links and an approval's code. Secrets are kept out of the text twice (the daemon's one redaction and truncation pass; the relay's SQL refuses secret-shaped text). Fields in §3, notes in `interfaces.md` (Dashboard snapshot, Status relay).
 - **MCP** (MCP-1, MCP-2): stdio and streamable-HTTP servers as extension tools ([`extensions.md`](extensions.md)), with the Linear example in `extensions/linear/` (go-live step 12, optional).
 
 ## 1. Decisions
 
 - **D1. One UI, two data sources.** A Vite + React + TypeScript + Tailwind + shadcn/ui app in `dashboard/`. Served by the daemon on `127.0.0.1:7777/` from the committed build in `dashboard/dist`, reading `/api/dashboard`. The same build, deployed on Fly, reads the latest snapshot from Supabase instead. The data source is picked at runtime from a small `config.json` next to `index.html`.
 - **D2. Read-only.** The dashboard only shows status. Approvals, `/kill` and every other action stay on iMessage. No POST routes.
-- **D3. Two tiers of data.** `local` (loopback only) can show run asks, PR links, approval and question texts, pulse titles, trust rules and repos. `remote` (what leaves the Mini) is health, counts, states, codes and times only; no message bodies, asks, task contents, repo names or URLs. Both are typed in one schema (§3), `remote` a strict subset. A test proves the pusher sends only `remote` fields.
+- **D3. Two tiers of data.** *Superseded by PER-276; the original decision follows.* `local` (loopback only) can show run asks, PR links, approval and question texts, pulse titles, trust rules and repos. `remote` (what leaves the Mini) is health, counts, states, codes and times only; no message bodies, asks, task contents, repo names or URLs. Both are typed in one schema (§3), `remote` a strict subset. A test proves the pusher sends only `remote` fields. **As of PER-276 the tiers carry the same data** (schema 2): the remote snapshot is read only by the owner, signed in with a password and TOTP, so the owner gets the same page from their phone. Two things stay local (`LOCAL_ONLY`): a Remote Control link (it can drive a session) and an approval's code (the L1 second factor). Free text goes through one redaction and truncation pass (every field has a cap, nothing is over 800 characters; text that came from outside the owner's conversation is marked `outside`), the daemon scans the dump again for the relay's secrets, and `relay_ingest` refuses anything secret-shaped. The relay's size cap is 256 KiB and the pusher trims a bigger dump in fixed steps (`trimmed`).
 - **D4. Push, never pull.** The daemon writes a `remote` snapshot to Supabase every minute when `relay.enabled`. Nothing connects into the Mini; the loopback-only rule stays.
 - **D5. Auth on the remote side.** Supabase Auth, sign-ups off, exactly one user, TOTP MFA required (AAL2), short sessions. RLS lets only the owner's user id read; the daemon writes with its own credential that can only insert into `snapshots`.
 - **D6. Dead-man switch on Fly.** A small checker on Fly alerts when snapshots stop (default: none for 5 minutes) or a snapshot reports a failing health row, and once more on recovery. Channel: ntfy (push to the phone, no account needed; the topic is a secret) or a generic webhook URL. It never goes through the Mini.
@@ -30,33 +30,45 @@ Writes from the dashboard; a command path from the relay back to the Mini; inbou
 `resonant/dashboard/snapshot.py` builds it; `dashboard/src/types.ts` mirrors it; `docs/snapshot.schema.json` is generated from the Pydantic models and checked in CI.
 
 ```
-Snapshot {
-  schema: 1, tier: "local" | "remote", taken_at, version (git sha, 8), started_at, last_tick,
+Snapshot {                                                       # schema 2 (PER-276); texts capped, see interfaces.md
+  schema: 2, tier: "local" | "remote", taken_at, version (git sha, 8), started_at, last_tick,
   autonomy: "on"|"off", paused: bool, dry_run: bool,
-  health: [{name, state: ok|degraded|failing|unknown, since, reason?}],     # reason: local only
-  tasks: {by_state: {state: n}}, slots: {used, max},
-  runs: {by_state: {state: n}, detected: {by_kind: {kind: n}, high: n},      # detected: PER-263
-         items?: [{code, state, repo, ask, branch, pr_url, pr_number,
-         started_at, ended_at, waiting_reason, last_note, detected}],         # items: local only
-         brief: [{code, state, scratch, has_pr, started_at, ended_at, waiting_reason}]},
-  approvals: {open: n, items?: [{code, summary, level, asked_at, expires_at, changes?}],  # a batch is one row (PER-254)
-              brief: [{level, effect, needs_code, asked_at, expires_at}]},             # one per row
-  questions: {open: n, items?: [{run_code, text, options, asked_at}],
-              brief: [{run_code, options: n, asked_at}]},
-  pulse: {open: n, untold: n, items?: [{source, key, title, urgency, state: new|told, updated_at}],
-          brief: [{source, urgency, state, updated_at}]},
-  extensions: [{name, status, health, muted_until, jobs: [{id, next_due, last_run_at, last_outcome, fail_streak}]}],
-  runner: {set_up: bool, missing?: [str], gaps: n},
-  brain_activity: {calls_today, writes_today, state, turns,
-                   recent: [{at, tool, decision, status, write}]},
-  trust_rules?: [{n, text}], repos?: [{name, mode, base, ci}],                  # local only
+  trimmed: none|history|lists|detail|items,                      # how far the pusher cut the lists to fit the relay
+  limits: {runs: 50, run_detail: 20, tasks: 50, task_detail: 20, approvals_recent: 20,
+           approvals_pending: 20, questions: 20, pulse: 60, brain_tools: 20},
+  health: [{name, state: ok|degraded|failing|unknown, since, reason?, outside}],
+  tasks: {by_state: {state: n}, items: [{id, kind, runner, extension, status, wait_reason, wake_at, attempts,
+          step_no, created_at, updated_at, label, error, run_code, history: [{at, event}], approval_ids, outside}]},
+  slots: {used, max},
+  runs: {by_state: {state: n}, detected: {by_kind: {kind: n}, high: n},
+         items: [{code, state, waiting_reason, started_at, ended_at, detected, repo, ask, branch, base_branch,
+                  head_sha, pr_url, pr_number, github_repo, created_at, remote_url?,       # remote_url: local only
+                  task_id, step, attempts, sessions, exit_code, cost_usd, tokens_in, tokens_out,
+                  session_seconds, wait_seconds, files_changed, flagged_paths, summary, failure, last_note,
+                  did, effects: [{kind, what, high}], merged, merged_by, history: [{at, event}],
+                  approval_ids, question_ids, linear_ids, detail, outside}]},
+  approvals: {open: n, items: [<pending>], recent: [<decided in the last 7 days>]},  # a batch is one row (PER-254)
+      # <row> = {id, member_ids, code?, summary, level, effect, needs_code, tool, extension, status, asked_at,
+      #          expires_at, decided_at, decided_by, task_id, run_code, changes?: [{summary, level}], outside}
+      #          code: local only
+  questions: {open: n, items: [{id, run_code, kind, text, options, urgent, asked_at, outside}]},
+  pulse: {open: n, untold: n, items: [{source, key, title, urgency, state: new|told, updated_at, expires_at,
+          told_at, run_code, outside}]},
+  extensions: [{name, status, health, muted_until, jobs: [<job>], description, source_kind, commit, installed_at,
+                tools: [{name, via, server, effect, level, description}], mcp_servers: [{id, transport, host}],
+                secrets (names), report_max, repos}],
+  core_jobs: [<job>],        # <job> = {id, schedule, tz, effect, level, next_due, last_run_at, last_outcome, fail_streak}
+  runner: {set_up: bool, missing: [str], gaps: n},
+  claude_brain?: {state, turns, remote_url?, tools: [{at, tool, decision, command, cwd, status, write, outside}]},
+  brain_activity: {calls_today, writes_today, state, turns},
+  trust_rules: [{n, text}], repos: [{name, mode, base, ci, slug}],
   trust_rule_count: n, repo_count: n
 }
 ```
 
-Every `items` list is local only; the `brief` beside it is on both tiers: one row per item with its code, kind, state and times and none of its text, so the remote page lists runs, approvals, questions, pulse items and the brain's last tool calls too. An approval's code is not in its brief (the owner types it to say yes).
+The two tiers are the same but for `RunItem.remote_url`, `ClaudeBrain.remote_url` and `ApprovalItem.code` (`LOCAL_ONLY`). Schema 1 (a text-free remote tier with `brief` lists, `brain_activity.recent`, no tasks or recent approvals) is what a daemon before PER-276 pushes; the page still renders it through a legacy adapter, and the relay's SQL still accepts it (stored whole, 32 KiB).
 
-Field names may be adjusted by DB-1 with the UI ticket told; `remote` never gains a text field without a plan change. DB-1 changed: `pulse.items[]` gained `source` and `state` is `new|told`; `repos[].protected` became `ci` (protection isn't stored, only a GitHub call knows it); `extensions[].status` is `enabled|disabled|disabled_tampered`; `approvals.items[].code` may be null; `started_at` is never null. The UI's types and fixtures follow, and a Python test validates the fixtures against the models. The exact shape is `docs/snapshot.schema.json`; the field notes are in `interfaces.md` (Dashboard snapshot).
+Field names may be adjusted by DB-1 with the UI ticket told. (PER-276: `remote` now carries text; the two exceptions above are the rule.) DB-1 changed: `pulse.items[]` gained `source` and `state` is `new|told`; `repos[].protected` became `ci` (protection isn't stored, only a GitHub call knows it); `extensions[].status` is `enabled|disabled|disabled_tampered`; `approvals.items[].code` may be null; `started_at` is never null. The UI's types and fixtures follow, and a Python test validates the fixtures against the models. The exact shape is `docs/snapshot.schema.json`; the field notes are in `interfaces.md` (Dashboard snapshot).
 
 ## 4. Tickets
 

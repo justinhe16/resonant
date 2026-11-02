@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -15,7 +16,15 @@ from typing import Any, cast
 
 import httpx
 import pytest
-from test_dashboard_snapshot import SECRET, _busy  # pyright: ignore[reportPrivateUsage]
+from test_dashboard_snapshot import (
+    FAKE_TOKEN,
+    SECRET,
+    SECRET_SAMPLES,
+    _busy,  # pyright: ignore[reportPrivateUsage]
+    remote_dump,
+    seed_secret,
+    seed_worst,
+)
 
 from resonant.config import RelayConfig, load_settings
 from resonant.dashboard import pusher as pusher_mod
@@ -33,7 +42,9 @@ from resonant.dashboard.snapshot import (
     build_snapshot,
     to_remote,
 )
+from resonant.redact import Redactor, redact_secrets
 from resonant.secrets import FakeKeychain, SecretStore
+from resonant.store.claude_brain import SESSION_KV
 from resonant.store.db import kv_get, kv_set, utcnow
 
 URL = "https://abcdefghijklmnop.supabase.co"
@@ -45,8 +56,9 @@ T0 = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
 
 @dataclass
 class FakeSupabase:
-    """``POST /rest/v1/rpc/relay_ingest`` with the migration's rules (token hash, remote tier,
-    size cap). ``script`` holds what the next requests get: a status code or an exception."""
+    """``POST /rest/v1/rpc/relay_ingest`` with the migration's rules (token hash, remote tier of
+    schema 2, size cap of 256 KiB, no link). ``script`` holds what the next requests get: a
+    status code or an exception."""
 
     token_sha256: str = hashlib.sha256(TOKEN.encode()).hexdigest()
     script: list[int | Exception] = field(default_factory=list[int | Exception])
@@ -68,9 +80,11 @@ class FakeSupabase:
         if hashlib.sha256(str(body.get("p_token", "")).encode()).hexdigest() != self.token_sha256:
             return httpx.Response(403)
         data = body["p_data"]
-        if data_size(data) > 65536:
+        if data_size(data) > 262144:
             return httpx.Response(413)
-        if data.get("tier") != "remote":
+        if data.get("tier") != "remote" or data.get("schema") != 2:
+            return httpx.Response(400)
+        if '"remote_url"' in json.dumps(data):
             return httpx.Response(400)
         self.stored.append(data)
         return httpx.Response(204)
@@ -88,8 +102,8 @@ class Sleeps:
 
 
 def _seed_local_text(conn: sqlite3.Connection) -> None:
-    """Text in every local-only place (run asks, PR links, questions, approvals, pulse titles,
-    trust rules, repos, health details), each holding ``LEAK``. None of it may leave."""
+    """Text in every place (run asks, PR links, questions, approvals, pulse titles, trust rules,
+    repos, health details), each holding ``LEAK``."""
     _busy(conn, utcnow())
 
 
@@ -106,8 +120,10 @@ def make_pusher(
     cfg = RelayConfig(**fields)
     kc = keychain if keychain is not None else FakeKeychain(items={SUPABASE_KEY_REF: TOKEN})
 
-    async def snapshot() -> Snapshot:
-        return build_snapshot(db, settings, started_at=T0, now=utcnow(), version="abcdef12")
+    async def snapshot(redactor: Redactor) -> Snapshot:
+        return build_snapshot(
+            db, settings, started_at=T0, now=utcnow(), version="abcdef12", redactor=redactor
+        )
 
     return SnapshotPusher(
         db,
@@ -128,28 +144,32 @@ def health(db: sqlite3.Connection) -> dict[str, Any]:
 # --- what leaves -----------------------------------------------------------------------------
 
 
-async def test_only_the_remote_tier_leaves(db: sqlite3.Connection) -> None:
+async def test_the_remote_tier_leaves_with_its_text(db: sqlite3.Connection) -> None:
+    """PER-276: the same data as the local tier, texts included, minus the Remote Control links
+    and approval codes (and nothing else)."""
     _seed_local_text(db)
+    kv_set(db, SESSION_KV, {"session_id": "s", "turns": 2, "pid": 1,
+                            "remote_url": "https://claude.ai/code/session_abc"})  # fmt: skip
     fake = FakeSupabase()
     p = make_pusher(db, fake)
     outcome = await p.push_once()
     assert outcome.ok, outcome
     [request] = fake.requests
     raw = request.content.decode()
-    assert LEAK not in raw and "dori" not in raw  # no text, no repo names
+    assert "claude.ai" not in raw and "remote_url" not in raw
     body = json.loads(raw)
     assert set(body) == {"p_token", "p_data"}
     data = body["p_data"]
     snap = Snapshot.model_validate(data)
-    assert snap.tier == "remote"
+    assert snap.tier == "remote" and snap.schema_ == 2 and data["trimmed"] == "none"
     assert snap == to_remote(snap)  # nothing local left to strip
-    for key in ("trust_rules", "repos"):
-        assert key not in data
-    for part in ("runs", "approvals", "questions", "pulse"):
-        assert "items" not in data[part]
-    assert "missing" not in data["runner"]
-    assert all("reason" not in h for h in data["health"])
-    assert data["approvals"]["open"] == 1 and data["paused"] is True  # counts and states do
+    assert data["runs"]["items"][0]["ask"] == f"build {LEAK}"  # text goes
+    assert data["approvals"]["items"][0]["summary"] == f"restart {LEAK}"
+    assert data["questions"]["items"][0]["text"] == f"which db {LEAK}?"
+    assert data["pulse"]["items"][0]["title"] == f"CI red {LEAK}"
+    assert data["trust_rules"] and data["repos"] and data["claude_brain"]["turns"] == 2
+    assert data["approvals"]["open"] == 1 and data["paused"] is True
+    assert '"code"' not in json.dumps(data["approvals"])  # the approval's code stays on the Mini
     assert fake.stored == [data]
 
 
@@ -293,28 +313,25 @@ async def test_snapshot_too_large_is_not_sent(
     assert fake.requests == []
 
 
-async def test_too_large_with_briefs_goes_without_them(
+async def test_too_large_is_shrunk_and_says_so(
     db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _busy(db, utcnow())
-    full = to_remote(build_snapshot(db, load_settings(), started_at=T0, now=utcnow(),
-                                    version="abcdef12")).model_dump(mode="json")  # fmt: skip
-    bare = pusher_mod.drop_briefs(full)
-    assert data_size(bare) < data_size(full)
-    monkeypatch.setattr(pusher_mod, "MAX_BYTES", data_size(bare) + 50)
+    full = to_remote(
+        build_snapshot(db, load_settings(), started_at=T0, now=utcnow(), version="abcdef12")
+    ).model_dump(mode="json")
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", data_size(full) - 1)  # just too big
     fake = FakeSupabase()
     outcome = await make_pusher(db, fake).push_once()
     assert outcome.ok, outcome
     data = json.loads(fake.requests[0].content)["p_data"]
-    for part in ("runs", "approvals", "questions", "pulse"):
-        assert data[part]["brief"] == []
-    assert data["brain_activity"]["recent"] == []
-    assert data["runs"]["by_state"] == full["runs"]["by_state"]
-    assert data["pulse"]["open"] == full["pulse"]["open"] == 1
+    assert data["trimmed"] != "none" and data_size(data) <= pusher_mod.MAX_BYTES
+    Snapshot.model_validate(data)
+    assert data["pulse"]["open"] == full["pulse"]["open"] == 1  # the counts stay
 
 
 async def test_a_broken_snapshot_is_a_failed_push(db: sqlite3.Connection) -> None:
-    async def broken() -> Snapshot:
+    async def broken(_: Redactor) -> Snapshot:
         raise sqlite3.OperationalError(f"disk I/O error {LEAK}")
 
     fake = FakeSupabase()
@@ -371,6 +388,171 @@ async def test_redactor_covers_a_detail_that_quotes_the_token(db: sqlite3.Connec
     assert "[redacted]" in outcome.detail
 
 
+# --- the secrets ------------------------------------------------------------------------------
+
+
+async def test_the_token_is_read_before_the_snapshot_is_built(db: sqlite3.Connection) -> None:
+    built: list[Redactor] = []
+
+    async def snapshot(redactor: Redactor) -> Snapshot:
+        built.append(redactor)
+        return build_snapshot(db, load_settings(), started_at=T0)
+
+    fake = FakeSupabase()
+    p = make_pusher(db, fake, keychain=FakeKeychain())
+    p._snapshot = snapshot  # pyright: ignore[reportPrivateUsage]
+    outcome = await p.push_once()
+    assert outcome.fatal and "missing secret" in outcome.detail
+    assert built == [] and fake.requests == []  # failed before building anything
+    # With the secret, the builder gets a redactor that knows the token and the anon key.
+    p = make_pusher(db, fake)
+    p._snapshot = snapshot  # pyright: ignore[reportPrivateUsage]
+    assert (await p.push_once()).ok
+    [redactor] = built
+    assert redactor.text(f"a {TOKEN} b {ANON}") == "a [redacted] b [redacted]"
+
+
+async def test_the_dump_is_scanned_again_for_the_secrets(db: sqlite3.Connection) -> None:
+    """What the builder couldn't clean (an identifier, which isn't free text) is replaced
+    by the pusher's own pass over every string: the known token, and credential-shaped text."""
+    ghp = "ghp_" + "a1b2" * 8  # lowercase and digits only: a valid identifier
+    assert redact_secrets(ghp) != ghp
+
+    async def snapshot(redactor: Redactor) -> Snapshot:
+        s = build_snapshot(db, load_settings(), started_at=T0, redactor=redactor)
+        rows = [s.health[0].model_copy(update={"name": n}) for n in (TOKEN, ghp)]
+        return s.model_copy(update={"health": [*rows, *s.health[1:]]})
+
+    fake = FakeSupabase()
+    p = make_pusher(db, fake)
+    p._snapshot = snapshot  # pyright: ignore[reportPrivateUsage]
+    outcome = await p.push_once()
+    assert outcome.ok, outcome
+    data = json.loads(fake.requests[0].content)["p_data"]
+    text = json.dumps(data)
+    assert TOKEN not in text and ghp not in text
+    assert [h["name"] for h in data["health"][:2]] == ["[redacted]", "[redacted]"]
+
+
+@pytest.mark.parametrize("family", sorted(SECRET_SAMPLES))
+async def test_no_secret_reaches_the_relay(db: sqlite3.Connection, family: str) -> None:
+    """A credential of each family, and the relay's own token, in every free-text source of
+    the snapshot (run, approval, question, pulse, tool call, health, task, extension, ...):
+    none reaches the transport, and what does is clean of credential-shaped text."""
+    secret, raw = SECRET_SAMPLES[family]
+    seed_secret(db, utcnow(), secret, FAKE_TOKEN)
+    fake = FakeSupabase(token_sha256=hashlib.sha256(FAKE_TOKEN.encode()).hexdigest())
+    p = make_pusher(db, fake, keychain=FakeKeychain(items={SUPABASE_KEY_REF: FAKE_TOKEN}))
+    outcome = await p.push_once()
+    assert outcome.ok, outcome
+    [request] = fake.requests
+    data = json.loads(request.content)["p_data"]
+    text = json.dumps(data, ensure_ascii=False)
+    assert raw not in text and FAKE_TOKEN not in text and secret not in text
+    assert "leak" in text  # the texts went, cleaned
+    assert redact_secrets(text) == text
+    assert fake.stored == [data]
+
+
+# --- shrinking ---------------------------------------------------------------------------------
+
+
+def _stages(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """The dump after each step of ``SHRINK_STEPS`` applied in turn, on copies."""
+    out = copy.deepcopy(data)
+    stages: list[dict[str, Any]] = []
+    for name, step in pusher_mod.SHRINK_STEPS:
+        out["trimmed"] = name
+        step(out)
+        stages.append(copy.deepcopy(out))
+    return stages
+
+
+def test_shrink_steps_are_ordered_deterministic_and_valid(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_worst(db, utcnow())
+    data = remote_dump(db, utcnow())
+    before = copy.deepcopy(data)
+    # With a cap nothing fits (0), every step runs, one after the other.
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", 0)
+    stages = _stages(data)
+    assert [s["trimmed"] for s in stages] == ["history", "lists", "detail", "items"]
+    sizes = [data_size(data), *(data_size(s) for s in stages)]
+    assert sizes == sorted(sizes, reverse=True) and len(set(sizes)) == 5  # each one cuts more
+    for stage in stages:
+        Snapshot.model_validate(stage)  # every step's output is a valid snapshot
+    history, lists, detail, items = stages
+    r = history["runs"]["items"][0]
+    assert len(r["history"]) <= 4 and len(r["did"]) <= 3 and len(r["effects"]) <= 3
+    assert all(len(t["history"]) <= 3 for t in history["tasks"]["items"])
+    assert all(len(a["changes"] or []) <= 3 for a in history["approvals"]["items"])
+    assert len(history["runs"]["items"]) == len(data["runs"]["items"])  # lists intact
+    assert all(
+        len(v) == 5
+        for v in (lists["runs"]["items"], lists["tasks"]["items"], lists["approvals"]["recent"],
+                  lists["pulse"]["items"], lists["questions"]["items"],
+                  lists["claude_brain"]["tools"])
+    )  # fmt: skip
+    assert lists["approvals"]["items"] == history["approvals"]["items"]  # pending stay
+    run = detail["runs"]["items"][0]
+    assert run["summary"] is None and run["did"] == [] and run["detail"] is False
+    assert "summary" not in run["outside"]
+    assert all(e["tools"] == [] for e in detail["extensions"])
+    assert all(t["error"] is None for t in detail["tasks"]["items"])
+    assert all(a["changes"] is None for a in detail["approvals"]["items"])
+    for key, sub in (
+        ("runs", "items"), ("tasks", "items"), ("approvals", "items"), ("approvals", "recent"),
+        ("pulse", "items"), ("questions", "items"),
+    ):  # fmt: skip
+        assert items[key][sub] == []
+    assert items["claude_brain"]["tools"] == [] and items["trust_rules"] == []
+    assert items["repos"] == [] and items["extensions"] and items["health"]
+    assert items["runs"]["by_state"] == data["runs"]["by_state"]  # the counts stay
+    assert items["approvals"]["open"] == data["approvals"]["open"]
+    # Deterministic, and the input is untouched.
+    assert _stages(data) == stages
+    assert data == before
+
+
+def test_shrink_stops_at_the_first_step_that_fits(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_worst(db, utcnow())
+    data = remote_dump(db, utcnow())
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", 0)
+    stages = _stages(data)
+    for stage in stages:
+        # A cap this stage just fits: the stages before it were over it.
+        monkeypatch.setattr(pusher_mod, "MAX_BYTES", data_size(stage))
+        out = pusher_mod.shrink(data)
+        assert out["trimmed"] == stage["trimmed"]
+        assert data_size(out) <= pusher_mod.MAX_BYTES
+        Snapshot.model_validate(out)
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", data_size(data))
+    assert pusher_mod.shrink(data) is data  # it fits: untouched
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", 0)
+    assert pusher_mod.shrink(data)["trimmed"] == "items"  # nothing fits: the last step
+
+
+def test_the_halving_stops_as_soon_as_it_fits(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_worst(db, utcnow())
+    data = remote_dump(db, utcnow())
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", 0)
+    history, lists = _stages(data)[:2]
+    floor = data_size(lists)
+    half = copy.deepcopy(history)
+    half["trimmed"] = "lists"
+    for parent, key in pusher_mod._lists(half):  # pyright: ignore[reportPrivateUsage]
+        parent[key] = parent[key][: len(parent[key]) // 2]
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", data_size(half))
+    out = pusher_mod.shrink(data)
+    assert out["trimmed"] == "lists" and floor < data_size(out) <= data_size(half)
+    assert len(out["runs"]["items"]) == len(history["runs"]["items"]) // 2
+
+
 # --- the run loop ----------------------------------------------------------------------------
 
 
@@ -408,7 +590,7 @@ async def test_run_owns_and_closes_its_client(db: sqlite3.Connection) -> None:
     settings = load_settings()
     cfg = RelayConfig(enabled=True, supabase_url=URL, anon_key=ANON)
 
-    async def snapshot() -> Snapshot:
+    async def snapshot(_: Redactor) -> Snapshot:
         return build_snapshot(db, settings, started_at=T0)
 
     async def stop(_: float) -> None:
@@ -440,7 +622,7 @@ def test_relay_row_in_the_snapshot(db: sqlite3.Connection, tmp_path: Path) -> No
     [row] = [h for h in snap.health if h.name == "relay"]
     assert row.state == "failing" and row.since == T0 and row.reason == "HTTP 401: x"
     [remote] = [h for h in to_remote(snap).health if h.name == "relay"]
-    assert remote.state == "failing" and remote.reason is None
+    assert remote.state == "failing" and remote.reason == "HTTP 401: x"  # PER-276: same text
     kv_set(db, RELAY_HEALTH_KV, {"state": "bogus"})
     [row] = [h for h in build_snapshot(db, settings, started_at=T0).health if h.name == "relay"]
     assert row.state == "unknown"
@@ -528,7 +710,7 @@ async def test_daemon_pushes_the_remote_tier(resonant_home: Path) -> None:
     daemon.pusher = SnapshotPusher(
         daemon.conn,
         settings.relay,
-        snapshot=lambda: local_snapshot(daemon.state),
+        snapshot=lambda redactor: local_snapshot(daemon.state, redactor=redactor),
         secrets=SecretStore(kc),
         client=fake.client(),
     )

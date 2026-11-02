@@ -44,3 +44,12 @@ export function outcomeTone(outcome: string | null): BadgeTone {
   if (/fail|error|timeout/i.test(outcome)) return "bad";
   return "neutral";
 }
+
+/** Task states: same palette as runs, with queued and cancelled neutral. */
+export function taskTone(status: string): BadgeTone {
+  return status === "done" ? "ok" : runTone(status);
+}
+
+export function approvalTone(status: string): BadgeTone {
+  return status === "approved" ? "ok" : status === "rejected" ? "bad" : "neutral";
+}

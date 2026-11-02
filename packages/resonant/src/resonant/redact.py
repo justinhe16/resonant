@@ -23,7 +23,7 @@ import base64
 import json
 import re
 from collections.abc import Iterable
-from typing import cast
+from typing import Final, cast
 
 REDACTED = "[redacted]"
 _MIN_B64 = 6  # a shorter stable interior would match unrelated base64
@@ -143,15 +143,24 @@ class Redactor:
 
 # --- pattern-based (values unknown) ---------------------------------------------------
 
+# A word boundary on the left, ASCII only (Postgres's ``\y`` depends on the database locale for
+# non-ASCII letters; this one is never narrower, so what the relay's SQL family refuses is
+# always replaced here first).
+_WORD_START = r"(?<![A-Za-z0-9_])"
+
 _SECRET_SCRUBS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----.*?"
                 r"(?:-----END [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----|\Z)", re.DOTALL), REDACTED),
-    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    # The bare header too (a text cut before its closing dashes), as the relay's SQL family has it.
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY"), REDACTED),
+    (re.compile(_WORD_START + r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|sk-[A-Za-z0-9_-]{20,}|xox[abprse]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}"
                 r"|AIza[0-9A-Za-z_-]{35}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{36}"
                 r"|lin_api_[A-Za-z0-9]{20,}|sb_secret_[A-Za-z0-9_-]{10,})"), REDACTED),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), REDACTED),
-    (re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{12,}"), rf"\1\2{REDACTED}"),
+    (re.compile(_WORD_START + r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+     REDACTED),
+    (re.compile(r"(?i)" + _WORD_START + r"(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{12,}"),
+     rf"\1\2{REDACTED}"),
     (re.compile(r"(\b[a-z][a-z0-9+.-]{0,31}://)[^/\s@'\"]{1,256}@"), rf"\1{REDACTED}@"),
     # A credential-named key (``GITHUB_TOKEN``, ``"password"``, ``api_key``) with a literal
     # value: quoted, or a bare token with both a letter and a digit. Calls are left alone.
@@ -178,3 +187,40 @@ def redact_secrets(text: str) -> str:
     for pattern, repl in _SECRET_SCRUBS:
         text = pattern.sub(repl, text)
     return text
+
+
+CUT_MARK: Final = "… [cut]"
+
+# The relay's own check (``relay_ingest``, supabase/migrations/20261102000000): the pattern
+# families above that have a fixed shape, as one Postgres ARE (``\y`` is a word boundary).
+# ``redact_secrets`` is a superset (tests/test_redact.py), so a snapshot that went through it
+# never trips the database; the fuzzy ``password=`` family stays Python-only. The migration
+# holds this exact text (a test compares them).
+SECRET_SQL_FAMILY: Final = "".join((  # joined: ruff's S105 reads a literal as a password
+    r"\y(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}",
+    r"|xox[abprse]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}",
+    r"|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{36}|lin_api_[A-Za-z0-9]{20,}",
+    r"|sb_secret_[A-Za-z0-9_-]{10,}",
+    r"|eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+    r"|[Bb]earer\s+[A-Za-z0-9._~+/=-]{12,})",
+    r"|-----BEGIN [A-Z0-9 ]*PRIVATE KEY",
+))  # fmt: skip
+
+
+def clip_text(text: str | None, cap: int, *, known: Redactor | None = None) -> str | None:
+    """``text`` made safe to publish, at most ``cap`` characters: credential-shaped text
+    replaced (``redact_secrets`` over the first ``cap`` + ``REDACT_SLACK`` characters, so a
+    secret that straddles the cut is whole when it is seen), then each value ``known`` (a
+    ``Redactor``) replaced, then cut to ``cap`` with ``CUT_MARK`` as the last characters
+    (counted inside ``cap``) when anything was cut. None stays None."""
+    if text is None:
+        return None
+    head = text[: cap + REDACT_SLACK]
+    out = redact_secrets(head)
+    if known:
+        out = known.text(out)
+    if len(out) > cap or len(head) < len(text):
+        if len(out) + len(CUT_MARK) <= cap:
+            return out + CUT_MARK
+        return out[: max(0, cap - len(CUT_MARK))] + CUT_MARK
+    return out

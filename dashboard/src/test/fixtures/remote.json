@@ -1,101 +1,732 @@
 {
-  "schema": 1,
+  "schema": 2,
   "tier": "remote",
-  "taken_at": "2026-10-16T09:00:00+00:00",
+  "taken_at": "2026-10-16T09:00:00Z",
   "version": "3ef397a1",
-  "started_at": "2026-10-15T21:14:00+00:00",
-  "last_tick": "2026-10-16T08:59:58+00:00",
+  "started_at": "2026-10-15T21:14:00Z",
+  "last_tick": "2026-10-16T08:59:58Z",
   "autonomy": "on",
   "paused": false,
   "dry_run": false,
+  "trimmed": "none",
+  "limits": {
+    "runs": 50,
+    "run_detail": 20,
+    "tasks": 50,
+    "task_detail": 20,
+    "approvals_recent": 20,
+    "approvals_pending": 20,
+    "questions": 20,
+    "pulse": 60,
+    "brain_tools": 20
+  },
   "health": [
-    { "name": "loop", "state": "ok", "since": "2026-10-15T21:14:05+00:00" },
-    { "name": "model", "state": "ok", "since": "2026-10-15T21:14:20+00:00" },
-    { "name": "imessage", "state": "degraded", "since": "2026-10-16T08:41:00+00:00" },
-    { "name": "store", "state": "ok", "since": "2026-10-15T21:14:05+00:00" },
-    { "name": "ext:github", "state": "unknown", "since": null }
+    {
+      "name": "loop",
+      "state": "ok",
+      "since": "2026-10-15T21:14:05Z",
+      "reason": null,
+      "outside": []
+    },
+    {
+      "name": "model",
+      "state": "ok",
+      "since": "2026-10-15T21:14:20Z",
+      "reason": null,
+      "outside": []
+    },
+    {
+      "name": "imessage",
+      "state": "degraded",
+      "since": "2026-10-16T08:41:00Z",
+      "reason": "self-test timed out after 90s",
+      "outside": []
+    },
+    {
+      "name": "store",
+      "state": "ok",
+      "since": "2026-10-15T21:14:05Z",
+      "reason": null,
+      "outside": []
+    },
+    {
+      "name": "ext:github",
+      "state": "unknown",
+      "since": null,
+      "reason": "no run yet",
+      "outside": [
+        "reason"
+      ]
+    }
   ],
-  "tasks": { "by_state": { "running": 2, "waiting": 1, "done": 41, "failed": 2 } },
-  "slots": { "used": 2, "max": 5 },
+  "tasks": {
+    "by_state": {
+      "running": 2,
+      "waiting": 1,
+      "done": 41,
+      "failed": 2
+    },
+    "items": [
+      {
+        "id": "t_4f1a9c",
+        "kind": "run",
+        "runner": "claude",
+        "extension": null,
+        "status": "running",
+        "wait_reason": null,
+        "wake_at": null,
+        "attempts": 1,
+        "step_no": 3,
+        "created_at": "2026-10-16T08:46:30Z",
+        "updated_at": "2026-10-16T08:58:00Z",
+        "label": "Add a dashboard job to CI",
+        "error": null,
+        "run_code": "R12",
+        "history": [
+          {
+            "at": "2026-10-16T08:46:30Z",
+            "event": "task.created"
+          },
+          {
+            "at": "2026-10-16T08:47:00Z",
+            "event": "task.started"
+          }
+        ],
+        "approval_ids": [],
+        "outside": []
+      },
+      {
+        "id": "t_77c0de",
+        "kind": "run",
+        "runner": "claude",
+        "extension": null,
+        "status": "waiting",
+        "wait_reason": "human_reply",
+        "wake_at": "2026-10-16T20:12:00Z",
+        "attempts": 1,
+        "step_no": 2,
+        "created_at": "2026-10-16T07:29:30Z",
+        "updated_at": "2026-10-16T08:12:00Z",
+        "label": "Bump the exchange client",
+        "error": null,
+        "run_code": "R11",
+        "history": [
+          {
+            "at": "2026-10-16T08:12:00Z",
+            "event": "task.waiting"
+          }
+        ],
+        "approval_ids": [],
+        "outside": []
+      },
+      {
+        "id": "t_8a0b11",
+        "kind": "job",
+        "runner": "claude",
+        "extension": "github",
+        "status": "waiting",
+        "wait_reason": "approval",
+        "wake_at": null,
+        "attempts": 1,
+        "step_no": 0,
+        "created_at": "2026-10-16T08:50:00Z",
+        "updated_at": "2026-10-16T08:50:00Z",
+        "label": "github/watch",
+        "error": null,
+        "run_code": null,
+        "history": [],
+        "approval_ids": [
+          "ap_k7q2"
+        ],
+        "outside": []
+      },
+      {
+        "id": "t_c3a915",
+        "kind": "run",
+        "runner": "claude",
+        "extension": null,
+        "status": "failed",
+        "wait_reason": null,
+        "wake_at": null,
+        "attempts": 2,
+        "step_no": 4,
+        "created_at": "2026-10-15T22:09:30Z",
+        "updated_at": "2026-10-15T22:31:00Z",
+        "label": "Migrate the notes export",
+        "error": "usage limit reached",
+        "run_code": "R9",
+        "history": [
+          {
+            "at": "2026-10-15T22:31:00Z",
+            "event": "task.failed"
+          }
+        ],
+        "approval_ids": [],
+        "outside": [
+          "error"
+        ]
+      },
+      {
+        "id": "t_9e9e9e",
+        "kind": "chat",
+        "runner": "brain",
+        "extension": null,
+        "status": "done",
+        "wait_reason": null,
+        "wake_at": null,
+        "attempts": 1,
+        "step_no": 0,
+        "created_at": "2026-10-16T08:30:00Z",
+        "updated_at": "2026-10-16T08:30:20Z",
+        "label": null,
+        "error": null,
+        "run_code": null,
+        "history": [],
+        "approval_ids": [],
+        "outside": []
+      }
+    ]
+  },
+  "slots": {
+    "used": 2,
+    "max": 5
+  },
   "runs": {
-    "by_state": { "running": 1, "waiting": 1, "ready": 1, "merged": 6, "failed": 1 },
-    "detected": { "by_kind": { "push": 1, "http": 1, "merge": 1 }, "high": 1 },
-    "brief": [
+    "by_state": {
+      "running": 1,
+      "waiting": 1,
+      "ready": 1,
+      "merged": 6,
+      "failed": 1
+    },
+    "detected": {
+      "by_kind": {
+        "push": 1,
+        "http": 1,
+        "merge": 1
+      },
+      "high": 1
+    },
+    "items": [
       {
         "code": "R12",
         "state": "running",
-        "scratch": false,
-        "has_pr": false,
-        "started_at": "2026-10-16T08:47:00+00:00",
+        "waiting_reason": null,
+        "started_at": "2026-10-16T08:47:00Z",
         "ended_at": null,
-        "waiting_reason": null
+        "detected": 2,
+        "repo": "resonant",
+        "ask": "Add a dashboard job to CI that rebuilds the UI and fails if dist differs",
+        "branch": "r12-dashboard-ci",
+        "base_branch": "main",
+        "head_sha": "a1b2c3d4",
+        "pr_url": null,
+        "pr_number": null,
+        "github_repo": "example/resonant",
+        "created_at": "2026-10-16T08:46:30Z",
+        "task_id": "t_4f1a9c",
+        "step": "session",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": null,
+        "cost_usd": 0.84,
+        "tokens_in": 182000,
+        "tokens_out": 9400,
+        "session_seconds": 780,
+        "wait_seconds": 0,
+        "files_changed": 2,
+        "flagged_paths": [],
+        "summary": null,
+        "failure": null,
+        "last_note": "Lint and typecheck pass; writing the workflow step now",
+        "did": [
+          "pushed r12-dashboard-ci",
+          "read the CI workflow files"
+        ],
+        "effects": [
+          {
+            "kind": "push",
+            "what": "git push origin r12-dashboard-ci",
+            "high": false
+          },
+          {
+            "kind": "http",
+            "what": "curl https://api.github.com/repos/example/resonant/actions/runs",
+            "high": false
+          }
+        ],
+        "merged": [],
+        "merged_by": null,
+        "history": [
+          {
+            "at": "2026-10-16T08:47:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-16T08:52:00Z",
+            "event": "side_effect"
+          }
+        ],
+        "approval_ids": [],
+        "question_ids": [],
+        "linear_ids": [],
+        "detail": true,
+        "outside": [
+          "last_note",
+          "did",
+          "effects"
+        ]
       },
       {
         "code": "R11",
         "state": "waiting",
-        "scratch": false,
-        "has_pr": false,
-        "started_at": "2026-10-16T07:30:00+00:00",
+        "waiting_reason": "question",
+        "started_at": "2026-10-16T07:30:00Z",
         "ended_at": null,
-        "waiting_reason": "question"
+        "detected": 0,
+        "repo": "trading-bot",
+        "ask": "Bump the exchange client and rerun the backtest",
+        "branch": "r11-bump-client",
+        "base_branch": "main",
+        "head_sha": null,
+        "pr_url": null,
+        "pr_number": null,
+        "github_repo": "example/trading-bot",
+        "created_at": "2026-10-16T07:29:30Z",
+        "task_id": "t_77c0de",
+        "step": "session",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": null,
+        "cost_usd": 0.31,
+        "tokens_in": 64000,
+        "tokens_out": 3100,
+        "session_seconds": 2500,
+        "wait_seconds": 2900,
+        "files_changed": 0,
+        "flagged_paths": [],
+        "summary": null,
+        "failure": null,
+        "last_note": null,
+        "did": [],
+        "effects": [],
+        "merged": [],
+        "merged_by": null,
+        "history": [
+          {
+            "at": "2026-10-16T07:30:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-16T08:12:00Z",
+            "event": "asked"
+          }
+        ],
+        "approval_ids": [],
+        "question_ids": [
+          7
+        ],
+        "linear_ids": [],
+        "detail": true,
+        "outside": [
+          "ask"
+        ]
       },
       {
         "code": "R10",
         "state": "ready",
-        "scratch": false,
-        "has_pr": true,
-        "started_at": "2026-10-16T06:02:00+00:00",
-        "ended_at": "2026-10-16T06:40:00+00:00",
-        "waiting_reason": null
+        "waiting_reason": null,
+        "started_at": "2026-10-16T06:02:00Z",
+        "ended_at": "2026-10-16T06:40:00Z",
+        "detected": 1,
+        "repo": "resonant",
+        "ask": "Fix the flaky pulse quiet-hours test (PER-241)",
+        "branch": "r10-quiet-hours",
+        "base_branch": "main",
+        "head_sha": "9f8e7d6c5b",
+        "pr_url": "https://github.com/example/resonant/pull/81",
+        "pr_number": 81,
+        "github_repo": "example/resonant",
+        "created_at": "2026-10-16T06:01:30Z",
+        "task_id": "t_2b8d10",
+        "step": "publish",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": 0,
+        "cost_usd": 1.27,
+        "tokens_in": 412000,
+        "tokens_out": 21000,
+        "session_seconds": 2280,
+        "wait_seconds": 0,
+        "files_changed": 3,
+        "flagged_paths": [
+          ".github/workflows/ci.yml"
+        ],
+        "summary": "Pinned the clock in the quiet-hours test; the flake came from reading the wall time twice.",
+        "failure": null,
+        "last_note": "CI green",
+        "did": [
+          "opened PR 81",
+          "watched CI to green"
+        ],
+        "effects": [
+          {
+            "kind": "merge",
+            "what": "gh pr merge 81 --squash",
+            "high": true
+          }
+        ],
+        "merged": [],
+        "merged_by": null,
+        "history": [
+          {
+            "at": "2026-10-16T06:02:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-16T06:20:00Z",
+            "event": "side_effect"
+          },
+          {
+            "at": "2026-10-16T06:40:00Z",
+            "event": "ready"
+          }
+        ],
+        "approval_ids": [
+          "ap_k7q2"
+        ],
+        "question_ids": [],
+        "linear_ids": [
+          "PER-241"
+        ],
+        "detail": true,
+        "outside": [
+          "summary",
+          "last_note",
+          "did",
+          "effects",
+          "flagged_paths"
+        ]
       },
       {
         "code": "R9",
         "state": "failed",
-        "scratch": false,
-        "has_pr": false,
-        "started_at": "2026-10-15T22:10:00+00:00",
-        "ended_at": "2026-10-15T22:31:00+00:00",
-        "waiting_reason": null
+        "waiting_reason": null,
+        "started_at": "2026-10-15T22:10:00Z",
+        "ended_at": "2026-10-15T22:31:00Z",
+        "detected": 0,
+        "repo": "notes",
+        "ask": "Migrate the notes export to the new schema",
+        "branch": null,
+        "base_branch": null,
+        "head_sha": null,
+        "pr_url": null,
+        "pr_number": null,
+        "github_repo": null,
+        "created_at": "2026-10-15T22:09:30Z",
+        "task_id": "t_c3a915",
+        "step": "harvest",
+        "attempts": 2,
+        "sessions": 2,
+        "exit_code": 1,
+        "cost_usd": 0.62,
+        "tokens_in": 150000,
+        "tokens_out": 8000,
+        "session_seconds": 1200,
+        "wait_seconds": 60,
+        "files_changed": 0,
+        "flagged_paths": [],
+        "summary": null,
+        "failure": "Session hit the usage limit twice; gave up",
+        "last_note": "Session hit the usage limit twice; gave up",
+        "did": [],
+        "effects": [],
+        "merged": [],
+        "merged_by": null,
+        "history": [
+          {
+            "at": "2026-10-15T22:10:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-15T22:31:00Z",
+            "event": "failed"
+          }
+        ],
+        "approval_ids": [],
+        "question_ids": [],
+        "linear_ids": [],
+        "detail": true,
+        "outside": [
+          "failure",
+          "last_note"
+        ]
+      },
+      {
+        "code": "R8",
+        "state": "merged",
+        "waiting_reason": null,
+        "started_at": "2026-10-15T18:00:00Z",
+        "ended_at": "2026-10-15T18:50:00Z",
+        "detected": 0,
+        "repo": "resonant",
+        "ask": "Add an hourly update to system_texts",
+        "branch": "r8-hourly",
+        "base_branch": "main",
+        "head_sha": "0123abc",
+        "pr_url": "https://github.com/example/resonant/pull/79",
+        "pr_number": 79,
+        "github_repo": "example/resonant",
+        "created_at": "2026-10-15T17:59:30Z",
+        "task_id": "t_5d5d5d",
+        "step": "reply",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": 0,
+        "cost_usd": 0.9,
+        "tokens_in": 300000,
+        "tokens_out": 12000,
+        "session_seconds": 3000,
+        "wait_seconds": 0,
+        "files_changed": 4,
+        "flagged_paths": [],
+        "summary": "Recorded the hourly update.",
+        "failure": null,
+        "last_note": null,
+        "did": [],
+        "effects": [],
+        "merged": [
+          "example/resonant#79"
+        ],
+        "merged_by": "resonant",
+        "history": [
+          {
+            "at": "2026-10-15T18:00:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-15T18:50:00Z",
+            "event": "merged"
+          }
+        ],
+        "approval_ids": [],
+        "question_ids": [],
+        "linear_ids": [],
+        "detail": true,
+        "outside": [
+          "summary"
+        ]
+      },
+      {
+        "code": "R3",
+        "state": "merged",
+        "waiting_reason": null,
+        "started_at": "2026-10-14T10:00:00Z",
+        "ended_at": "2026-10-14T10:20:00Z",
+        "detected": 0,
+        "repo": "",
+        "ask": "Summarise the week's notes",
+        "branch": null,
+        "base_branch": null,
+        "head_sha": null,
+        "pr_url": null,
+        "pr_number": null,
+        "github_repo": null,
+        "created_at": "2026-10-14T09:59:30Z",
+        "task_id": null,
+        "step": "reply",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": 0,
+        "cost_usd": 0.1,
+        "tokens_in": 20000,
+        "tokens_out": 900,
+        "session_seconds": 1200,
+        "wait_seconds": 0,
+        "files_changed": 0,
+        "flagged_paths": [],
+        "summary": null,
+        "failure": null,
+        "last_note": null,
+        "did": [],
+        "effects": [],
+        "merged": [],
+        "merged_by": null,
+        "history": [],
+        "approval_ids": [],
+        "question_ids": [],
+        "linear_ids": [],
+        "detail": false,
+        "outside": []
       }
     ]
   },
   "approvals": {
-    "open": 1,
-    "brief": [
+    "open": 2,
+    "items": [
       {
+        "id": "ap_k7q2",
+        "member_ids": [
+          "ap_k7q2"
+        ],
+        "summary": "merge_pr github: example/resonant#81",
         "level": "L1",
         "effect": "write",
         "needs_code": true,
-        "asked_at": "2026-10-16T08:50:00+00:00",
-        "expires_at": "2026-10-16T09:50:00+00:00"
+        "tool": "merge_pr",
+        "extension": "github",
+        "status": "pending",
+        "asked_at": "2026-10-16T08:50:00Z",
+        "expires_at": "2026-10-16T09:50:00Z",
+        "decided_at": null,
+        "decided_by": null,
+        "task_id": "t_8a0b11",
+        "run_code": "R10",
+        "changes": null,
+        "outside": []
+      },
+      {
+        "id": "ap_d7a",
+        "member_ids": [
+          "ap_d7a",
+          "ap_d7b",
+          "ap_d7c"
+        ],
+        "summary": "3 changes",
+        "level": "L2",
+        "effect": "write",
+        "needs_code": false,
+        "tool": "batch",
+        "extension": null,
+        "status": "pending",
+        "asked_at": "2026-10-16T08:55:00Z",
+        "expires_at": "2026-10-16T09:55:00Z",
+        "decided_at": null,
+        "decided_by": null,
+        "task_id": null,
+        "run_code": null,
+        "changes": [
+          {
+            "summary": "linear: save issue title=\"Retry the relay push\"",
+            "level": "L3"
+          },
+          {
+            "summary": "linear: save comment issue=\"PER-263\"",
+            "level": "L3"
+          },
+          {
+            "summary": "restart resonant",
+            "level": "L2"
+          }
+        ],
+        "outside": [
+          "summary",
+          "changes"
+        ]
+      }
+    ],
+    "recent": [
+      {
+        "id": "ap_r1",
+        "member_ids": [
+          "ap_r1"
+        ],
+        "summary": "push resonant r8-hourly",
+        "level": "L2",
+        "effect": "write",
+        "needs_code": false,
+        "tool": "git_push",
+        "extension": null,
+        "status": "approved",
+        "asked_at": "2026-10-15T18:40:00Z",
+        "expires_at": "2026-10-15T19:10:00Z",
+        "decided_at": "2026-10-15T18:42:00Z",
+        "decided_by": "owner",
+        "task_id": "t_5d5d5d",
+        "run_code": "R8",
+        "changes": null,
+        "outside": []
       }
     ]
   },
   "questions": {
     "open": 1,
-    "brief": [{ "run_code": "R11", "options": 2, "asked_at": "2026-10-16T08:12:00+00:00" }]
+    "items": [
+      {
+        "id": 7,
+        "run_code": "R11",
+        "kind": "choice",
+        "text": "The new client drops Python 3.11. Bump the runtime too, or pin the old client?",
+        "options": [
+          "bump runtime",
+          "pin old client"
+        ],
+        "urgent": false,
+        "asked_at": "2026-10-16T08:12:00Z",
+        "outside": [
+          "text",
+          "options"
+        ]
+      }
+    ]
   },
   "pulse": {
     "open": 3,
     "untold": 2,
-    "brief": [
+    "items": [
       {
         "source": "core",
+        "key": "run/R11",
+        "title": "R11 asked a question",
         "urgency": "urgent",
         "state": "new",
-        "updated_at": "2026-10-16T08:12:00+00:00"
+        "updated_at": "2026-10-16T08:12:00Z",
+        "expires_at": "2026-10-17T08:12:00Z",
+        "told_at": null,
+        "run_code": "R11",
+        "outside": [
+          "title"
+        ]
       },
       {
         "source": "github",
+        "key": "pr/81",
+        "title": "PR #81 is green and waiting for you",
         "urgency": "normal",
         "state": "new",
-        "updated_at": "2026-10-16T08:40:00+00:00"
+        "updated_at": "2026-10-16T08:40:00Z",
+        "expires_at": "2026-10-17T08:40:00Z",
+        "told_at": null,
+        "run_code": null,
+        "outside": [
+          "title"
+        ]
       },
       {
         "source": "weather",
+        "key": "umbrella",
+        "title": "Rain after 4pm",
         "urgency": "low",
         "state": "told",
-        "updated_at": "2026-10-16T06:00:00+00:00"
+        "updated_at": "2026-10-16T06:00:00Z",
+        "expires_at": "2026-10-17T06:00:00Z",
+        "told_at": "2026-10-16T06:05:00Z",
+        "run_code": null,
+        "outside": [
+          "title"
+        ]
+      },
+      {
+        "source": "core",
+        "key": "notice/backup",
+        "title": "Backup finished",
+        "urgency": "low",
+        "state": "told",
+        "updated_at": "2026-10-16T03:31:00Z",
+        "expires_at": "2026-10-17T03:31:00Z",
+        "told_at": "2026-10-16T04:00:00Z",
+        "run_code": null,
+        "outside": []
       }
     ]
   },
@@ -108,59 +739,230 @@
       "jobs": [
         {
           "id": "watch",
-          "next_due": "2026-10-16T09:05:00+00:00",
-          "last_run_at": "2026-10-16T08:55:00+00:00",
+          "schedule": "*/5 * * * *",
+          "tz": "UTC",
+          "effect": "read",
+          "level": "L0",
+          "next_due": "2026-10-16T09:05:00Z",
+          "last_run_at": "2026-10-16T08:55:00Z",
           "last_outcome": "ok",
           "fail_streak": 0
         },
         {
           "id": "digest",
-          "next_due": "2026-10-17T08:00:00+00:00",
-          "last_run_at": "2026-10-16T08:00:00+00:00",
+          "schedule": "0 8 * * *",
+          "tz": "America/Los_Angeles",
+          "effect": "read",
+          "level": "L0",
+          "next_due": "2026-10-17T08:00:00Z",
+          "last_run_at": "2026-10-16T08:00:00Z",
           "last_outcome": "ok",
           "fail_streak": 0
         }
+      ],
+      "description": "GitHub issues, PRs and CI",
+      "source_kind": "repo",
+      "commit": "3ef397a1b2c4",
+      "installed_at": "2026-09-20T12:00:00Z",
+      "tools": [
+        {
+          "name": "merge_pr",
+          "via": "cli",
+          "server": null,
+          "effect": "write",
+          "level": "L1",
+          "description": "Merge a pull request"
+        },
+        {
+          "name": "list_prs",
+          "via": "cli",
+          "server": null,
+          "effect": "read",
+          "level": "L0",
+          "description": "List open pull requests"
+        }
+      ],
+      "mcp_servers": [],
+      "secrets": [
+        "github_token"
+      ],
+      "report_max": "normal",
+      "repos": [
+        "resonant"
       ]
     },
     {
       "name": "weather",
       "status": "enabled",
       "health": "degraded",
-      "muted_until": "2026-10-16T12:00:00+00:00",
+      "muted_until": "2026-10-16T12:00:00Z",
       "jobs": [
         {
           "id": "forecast",
-          "next_due": "2026-10-16T10:00:00+00:00",
-          "last_run_at": "2026-10-16T08:00:00+00:00",
+          "schedule": "0 * * * *",
+          "tz": "UTC",
+          "effect": "read",
+          "level": "L0",
+          "next_due": "2026-10-16T10:00:00Z",
+          "last_run_at": "2026-10-16T08:00:00Z",
           "last_outcome": "failed",
           "fail_streak": 2
         }
-      ]
+      ],
+      "description": "Forecast and rain alerts",
+      "source_kind": "path",
+      "commit": null,
+      "installed_at": "2026-10-01T09:00:00Z",
+      "tools": [
+        {
+          "name": "forecast",
+          "via": "mcp",
+          "server": "weather-mcp",
+          "effect": "read",
+          "level": "L0",
+          "description": "Hourly forecast"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "weather-mcp",
+          "transport": "http",
+          "host": "mcp.weather.example"
+        }
+      ],
+      "secrets": [],
+      "report_max": "low",
+      "repos": []
     },
-    { "name": "notes-sync", "status": "disabled", "health": "unknown", "muted_until": null, "jobs": [] }
+    {
+      "name": "notes-sync",
+      "status": "disabled",
+      "health": "unknown",
+      "muted_until": null,
+      "jobs": [],
+      "description": null,
+      "source_kind": "other",
+      "commit": null,
+      "installed_at": "2026-10-02T09:00:00Z",
+      "tools": [],
+      "mcp_servers": [],
+      "secrets": [],
+      "report_max": null,
+      "repos": []
+    }
   ],
-  "runner": { "set_up": true, "gaps": 0 },
+  "core_jobs": [
+    {
+      "id": "briefing",
+      "schedule": "0 8 * * *",
+      "tz": "America/Los_Angeles",
+      "effect": null,
+      "level": null,
+      "next_due": "2026-10-17T08:00:00Z",
+      "last_run_at": "2026-10-16T08:00:00Z",
+      "last_outcome": "ok",
+      "fail_streak": 0
+    },
+    {
+      "id": "pulse",
+      "schedule": "0 * * * *",
+      "tz": "America/Los_Angeles",
+      "effect": null,
+      "level": null,
+      "next_due": "2026-10-16T10:00:00Z",
+      "last_run_at": "2026-10-16T09:00:00Z",
+      "last_outcome": "ok",
+      "fail_streak": 0
+    },
+    {
+      "id": "backup",
+      "schedule": "30 3 * * *",
+      "tz": "America/Los_Angeles",
+      "effect": null,
+      "level": null,
+      "next_due": "2026-10-17T03:30:00Z",
+      "last_run_at": "2026-10-16T03:30:00Z",
+      "last_outcome": "ok",
+      "fail_streak": 0
+    }
+  ],
+  "runner": {
+    "set_up": true,
+    "missing": [],
+    "gaps": 0
+  },
+  "trust_rules": [
+    {
+      "n": 1,
+      "text": "allow push on resonant"
+    },
+    {
+      "n": 2,
+      "text": "ask merge on trading"
+    },
+    {
+      "n": 3,
+      "text": "notify failed now"
+    }
+  ],
+  "repos": [
+    {
+      "name": "resonant",
+      "slug": "example/resonant",
+      "mode": "push",
+      "base": "main",
+      "ci": true
+    },
+    {
+      "name": "trading-bot",
+      "slug": "example/trading-bot",
+      "mode": "push",
+      "base": "main",
+      "ci": false
+    },
+    {
+      "name": "upstream-lib",
+      "slug": "example/upstream-lib",
+      "mode": "fork",
+      "base": "develop",
+      "ci": null
+    }
+  ],
+  "claude_brain": {
+    "state": "up",
+    "turns": 3,
+    "tools": [
+      {
+        "at": "2026-10-16T08:59:50Z",
+        "tool": "Bash",
+        "decision": "gate",
+        "command": "git push origin feat",
+        "cwd": "/Users/x/code/r",
+        "status": "ok",
+        "write": true,
+        "outside": [
+          "command"
+        ]
+      },
+      {
+        "at": "2026-10-16T08:59:40Z",
+        "tool": "Bash",
+        "decision": "allowed",
+        "command": "git rev-list --count HEAD",
+        "cwd": "/Users/x/code/r",
+        "status": "ok",
+        "write": false,
+        "outside": [
+          "command"
+        ]
+      }
+    ]
+  },
   "brain_activity": {
     "calls_today": 4,
     "writes_today": 1,
     "state": "up",
-    "turns": 3,
-    "recent": [
-      {
-        "at": "2026-10-16T08:59:50+00:00",
-        "tool": "bash",
-        "decision": "gate",
-        "status": "ok",
-        "write": true
-      },
-      {
-        "at": "2026-10-16T08:59:40+00:00",
-        "tool": "bash",
-        "decision": "allowed",
-        "status": "ok",
-        "write": false
-      }
-    ]
+    "turns": 3
   },
   "trust_rule_count": 3,
   "repo_count": 3

@@ -33,6 +33,7 @@ from resonant.config import Settings, is_loopback
 from resonant.dashboard.snapshot import Snapshot, build_snapshot
 from resonant.loop import Loop
 from resonant.monitor import channels_snapshot
+from resonant.redact import Redactor
 from resonant.status import collect_status
 
 if TYPE_CHECKING:
@@ -168,9 +169,20 @@ async def runner_missing(state: DaemonState) -> list[str] | None:
         return state.runner_check[1]
 
 
-async def local_snapshot(state: DaemonState) -> Snapshot:
+def _core_jobs(state: DaemonState) -> list[tuple[str, str, str]]:
+    """``(id, cron, tz)`` of the scheduler's core jobs (none without a ``Scheduler``)."""
+    from resonant.extensions.scheduler import Scheduler  # a cycle at import time
+
+    scheduler = state.loop.scheduler
+    if not isinstance(scheduler, Scheduler):
+        return []
+    return [(j.job_id, j.schedule.expr, str(j.schedule.tz)) for j in scheduler.jobs if j.core]
+
+
+async def local_snapshot(state: DaemonState, *, redactor: Redactor | None = None) -> Snapshot:
     """The local-tier snapshot of this daemon, as ``/api/dashboard`` serves it. The status
-    relay (``dashboard.pusher``) pushes ``to_remote`` of the same."""
+    relay (``dashboard.pusher``) pushes ``to_remote`` of the same, built with a ``redactor``
+    that holds the relay's own secrets."""
     return build_snapshot(
         state.conn,
         state.settings,
@@ -178,6 +190,8 @@ async def local_snapshot(state: DaemonState) -> Snapshot:
         last_tick=state.loop.last_tick,
         slots=state.loop.slots,
         runner_missing=await runner_missing(state),
+        core_jobs=_core_jobs(state),
+        redactor=redactor,
     )
 
 

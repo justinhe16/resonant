@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { SupabaseGate } from "@/SupabaseGate";
@@ -46,6 +46,21 @@ describe("SupabaseGate", () => {
 
     expect(await screen.findByRole("heading", { name: /something is degraded/i })).toBeInTheDocument();
     expect(client.latest).toHaveBeenCalled();
+  });
+
+  it("keeps a deep link in the hash through the login and opens it once ready", async () => {
+    const user = userEvent.setup();
+    window.location.hash = "#/runs/R12";
+    render(<SupabaseGate client={fakeClient({ kind: "signed_out" })} />);
+    await user.type(await screen.findByLabelText("Email"), "owner@example.com");
+    await user.type(screen.getByLabelText("Password"), "right");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await user.type(await screen.findByLabelText("Authentication code"), "123456");
+    await user.click(screen.getByRole("button", { name: "Verify" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("heading", { name: "Run R12" })).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/runs/R12");
   });
 
   it("shows sign-in errors and stays on the form", async () => {

@@ -145,7 +145,7 @@ class Daemon:
             self.pusher = SnapshotPusher(
                 self.conn,
                 settings.relay,
-                snapshot=lambda: local_snapshot(self.state),
+                snapshot=lambda redactor: local_snapshot(self.state, redactor=redactor),
                 secrets=secrets if secrets is not None else SecretStore(),
             )
         else:

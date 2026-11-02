@@ -6,7 +6,7 @@ export function ageSeconds(iso: string | null | undefined, now: number): number 
   return (now - t) / 1000;
 }
 
-function span(seconds: number): string {
+export function span(seconds: number): string {
   const s = Math.round(Math.abs(seconds));
   if (s < 60) return `${s}s`;
   const m = Math.round(s / 60);

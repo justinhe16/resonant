@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, cast
@@ -197,6 +197,19 @@ def recent(conn: sqlite3.Connection, limit: int = 20) -> list[Run]:
         (limit,),
     ).fetchall()
     return [_row(r) for r in rows]
+
+
+def codes_by_task(conn: sqlite3.Connection, task_ids: Sequence[str]) -> dict[str, str]:
+    """``task id -> run code`` for the runs of these tasks (the newest run of a task that has
+    several), for the dashboard's links between a task and its run."""
+    if not task_ids:
+        return {}
+    rows = conn.execute(
+        "SELECT task_id, code FROM runs WHERE task_id IN (SELECT value FROM json_each(?))"
+        " ORDER BY seq",
+        (json.dumps(list(task_ids)),),
+    ).fetchall()
+    return {r["task_id"]: r["code"] for r in rows}
 
 
 def active(conn: sqlite3.Connection, repo: str | None = None) -> list[Run]:

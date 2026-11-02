@@ -1,27 +1,36 @@
-"""The dashboard snapshot (docs/dashboard-plan.md §3): Pydantic models and the builder.
+"""The dashboard snapshot (docs/dashboard-plan.md §3, PER-276): Pydantic models and the builder.
 
-One schema, two tiers (plan D3):
+One schema, two tiers that carry the same data (PER-276, which supersedes plan D3's text-free
+remote tier): ``local`` is served on loopback only (``GET /api/dashboard``) and ``remote`` is
+what the relay stores in Supabase, where only the owner (password and TOTP) can read it. The
+two differ in exactly two things, both declared with :data:`LOCAL_ONLY` (``"x-tier": "local"``
+in the JSON schema), optional, and left out of the output when None: ``remote_url`` (a running
+worker's, and the Claude brain's, Remote Control link: whoever holds it can drive the session)
+and an approval's ``code`` (the second factor the owner types for an L1 approval).
+:func:`to_remote` clears those, at any depth, so a new local-only field is covered by
+declaring it, not by remembering a filter.
 
-- ``local`` is served on loopback only (``GET /api/dashboard``). It may carry text: run asks,
-  PR links, approval and question texts, pulse titles, trust rules and repos.
-- ``remote`` is what may leave the Mini (the relay, DB-3). It is a strict subset: health,
-  counts, states, identifiers and times only. Each local-only list of texts (``runs.items``,
-  ``approvals.items``, ...) has a ``brief`` beside it on both tiers: one row per item with its
-  code, kind, state and times and none of its text, so the remote page can list them too.
+Every free text (asks, summaries, approval and question texts, pulse titles, health reasons,
+tool commands, trust rules, ...) passes through one function, :func:`_Text`: ``redact.clip_text``
+(credential-shaped text replaced, then the known secret values the caller passes, then cut to
+the field's cap with a ``… [cut]`` marker). The caps are in the field types (``Txt64`` is a
+string of at most 64 characters, ``maxLength`` in the schema); nothing is longer than 800, and
+a test checks every free-text node of the schema. A model with text that came from outside the
+owner's conversation (a worker, an extension, a web page) lists the names of those fields in
+``outside``, so the page can say so. The relay's SQL refuses any secret-shaped text that still
+gets there (``redact.SECRET_SQL_FAMILY``), and the pusher scans the dump once more with the
+secrets it knows.
 
-Every field that only the local tier carries is declared with :data:`LOCAL_ONLY` (it shows as
-``"x-tier": "local"`` in the JSON schema), defaults to None and is left out of the output when
-None. :func:`to_remote` clears every such field, at any depth, so a new local field is covered
-by declaring it, not by remembering a filter. Every string the remote tier keeps is a
-``Literal``, a ``datetime`` or matches a short identifier pattern, so it can't hold free text;
-``tests/test_dashboard_snapshot.py`` checks both over the schema and over random data.
-
-``docs/snapshot.schema.json`` is generated from :class:`Snapshot`:
+Size: the lists are capped (:class:`Limits`, quoted by the page) and ``pusher.shrink`` trims
+them further, in a fixed order, when the JSON is still over the relay's cap (``trimmed`` says
+how far). ``docs/snapshot.schema.json`` is generated from :class:`Snapshot`:
 ``uv run python -m resonant.dashboard.snapshot > docs/snapshot.schema.json``. A test fails
-when it is stale. ``dashboard/src/types.ts`` (DB-2) mirrors it.
+when it is stale. ``dashboard/src/types.ts`` mirrors it.
 
 The builder only reads the store (and the live state the caller passes in). It never reads a
-secret's value: the runner's gaps come from ``ClaudeRunner.setup_gaps``, by name.
+secret's value: the runner's gaps come from ``ClaudeRunner.setup_gaps``, by name. What it never
+ships at all: task checkpoints, results and scopes, channel refs, session ids, worktree and
+workspace paths, run commands, MCP pins and input schemas, an extension's source path.
 """
 
 from __future__ import annotations
@@ -32,9 +41,10 @@ import re
 import sqlite3
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, cast, get_args
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -46,11 +56,14 @@ from resonant.extensions.cron import CronError, parse_schedule
 from resonant.extensions.notify import muted_until
 from resonant.gate.policy import change_line, strictest, widens_trust
 from resonant.loop.slots import SlotPool
-from resonant.loop.types import TaskStatus
+from resonant.loop.types import Task, TaskStatus
+from resonant.loop.types import WaitReason as TaskWait
 from resonant.monitor import EXT_CHECK_PREFIX, health_snapshot
-from resonant.store import approvals, pulse, questions, repos, runs, trust
+from resonant.redact import Redactor, clip_text
+from resonant.store import approvals, pulse, questions, repos, runs, system_texts, trust
 from resonant.store import extensions as ext_store
 from resonant.store import tasks as task_store
+from resonant.store.audit import EVENT_NAME, run_events, task_events
 from resonant.store.claude_brain import recent_tools, tool_counts
 from resonant.store.claude_brain import status_of as claude_status
 from resonant.store.db import kv_get, utcnow
@@ -58,21 +71,42 @@ from resonant.store.extensions import ExtensionStatus
 from resonant.store.pulse import Urgency
 from resonant.store.repos import Mode
 from resonant.store.runs import Status as RunStatus
+from resonant.store.runs import Step as RunStep
 from resonant.store.runs import WaitReason
+from resonant_sdk import DEFAULT_LEVEL, Effect
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
+
+# The caps. ``Limits`` quotes the first group to the page ("it keeps the newest 50 runs").
 RUN_ITEMS = 50  # active runs first, then the most recent (``runs.recent``)
+RUN_DETAIL = 20  # of those, the first this many carry their text and history
+TASK_ITEMS = 50
+TASK_DETAIL = 20
+APPROVALS_RECENT = 20  # decided in the last ``RECENT_APPROVALS_DAYS`` days, newest first
+APPROVALS_PENDING = 20
+QUESTION_ITEMS = 20
+PULSE_ITEMS = 60
 BRAIN_TOOL_ITEMS = 20  # the Claude brain's last tool calls (PER-258)
-# The briefs' size caps, so the remote tier stays well under the relay's 30 KiB: the first
-# runs (active first, as ``runs.recent`` orders them), the first open approvals and questions,
-# and the most urgent open pulse items. ``tests/test_dashboard_snapshot.py`` fills every one.
-# All of them full take about 10 KB (about 18 KB with ten extensions, in the test); the pusher
-# drops them if a snapshot is still too large.
-RUN_BRIEF_ITEMS = 20
-APPROVAL_BRIEF_ITEMS = 10
-QUESTION_BRIEF_ITEMS = 10
-PULSE_BRIEF_ITEMS = 20
-BRAIN_BRIEF_ITEMS = 10  # ``brain_activity.recent``: the newest of ``claude_brain.tools``
+EXTENSION_ITEMS = 20
+CORE_JOB_ITEMS = 12
+TRUST_RULE_ITEMS = 50
+REPO_ITEMS = 50
+RECENT_APPROVALS_DAYS = 7
+RUN_HISTORY = 12  # a run's last audit rows (``run.start``, ``run.ready``, ...)
+TASK_HISTORY = 10
+RUN_DID = 10
+RUN_EFFECTS = 10
+RUN_MERGED = 5
+RUN_FLAGGED = 5
+RUN_LINEAR_IDS = 5
+RELATED_IDS = 10  # a run's or task's linked approvals
+QUESTION_OPTIONS = 6
+APPROVAL_CHANGES = 10
+EXT_TOOLS = 40
+EXT_MCP_SERVERS = 5
+EXT_SECRETS = 10
+EXT_REPOS = 20
+RUNNER_MISSING = 10
 
 # A field only the local tier carries. ``to_remote`` clears it; None is left out of the output.
 LOCAL_ONLY: Final[JsonDict] = {"x-tier": "local"}
@@ -89,18 +123,49 @@ EffectKind = Literal[
     "push", "merge", "release", "repo", "deploy", "publish", "http", "self", "message", "mcp",
     "github",
 ]  # fmt: skip
+EffectName = Literal["read", "write", "pay"]
+ApprovalLevel = Literal["L0", "L1", "L2", "L3"]
+Trimmed = Literal["none", "history", "lists", "detail", "items"]
 
-# Identifiers the remote tier may carry: health check names (``model``, ``ext:github``),
-# extension names and job ids (the SDK's slugs, owner-chosen but never message content).
-# A row whose identifier doesn't match is left out of the snapshot, never an error.
+# Identifiers: health check names (``model``, ``ext:github``), extension names and job ids (the
+# SDK's slugs, owner-chosen but never message content). A row whose identifier doesn't match
+# is left out of the snapshot, never an error.
 IDENT_PATTERN: Final = r"^[a-z][a-z0-9:_-]{0,63}$"
 Ident = Annotated[str, StringConstraints(pattern=IDENT_PATTERN)]
-# A run or watch code (``R3``, ``W2``): a letter and a counter, never content.
-CODE_PATTERN: Final = r"^[A-Z][0-9]{1,6}$"
-Code = Annotated[str, StringConstraints(pattern=CODE_PATTERN)]
 # A git sha (8 hex) or the package version when there is no git checkout.
 VERSION_PATTERN: Final = r"^[0-9A-Za-z.+-]{1,40}$"
 Version = Annotated[str, StringConstraints(pattern=VERSION_PATTERN)]
+# An audit action as a short event name (``start``, ``approval.requested``).
+EVENT_PATTERN: Final = EVENT_NAME.pattern
+EventName = Annotated[str, StringConstraints(pattern=EVENT_PATTERN)]
+SHA_PATTERN: Final = r"^[0-9a-f]{7,40}$"
+Sha = Annotated[str, StringConstraints(pattern=SHA_PATTERN)]
+LINEAR_PATTERN: Final = r"^[A-Z]{2,10}-\d{1,6}$"
+LinearId = Annotated[str, StringConstraints(pattern=LINEAR_PATTERN)]
+PR_URL_PATTERN: Final = r"^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$"
+PrUrl = Annotated[str, StringConstraints(pattern=PR_URL_PATTERN)]
+# The name of a field of the same object (``summary``, ``flagged_paths``).
+OutsideName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z_]{0,31}$")]
+
+
+def _txt(n: int) -> Any:
+    return StringConstraints(max_length=n)
+
+
+# Free text, by cap (characters, the marker included).
+Txt16 = Annotated[str, _txt(16)]
+Txt32 = Annotated[str, _txt(32)]
+Txt40 = Annotated[str, _txt(40)]
+Txt64 = Annotated[str, _txt(64)]
+Txt80 = Annotated[str, _txt(80)]
+Txt100 = Annotated[str, _txt(100)]
+Txt120 = Annotated[str, _txt(120)]
+Txt160 = Annotated[str, _txt(160)]
+Txt200 = Annotated[str, _txt(200)]
+Txt300 = Annotated[str, _txt(300)]
+Txt400 = Annotated[str, _txt(400)]
+Txt600 = Annotated[str, _txt(600)]
+Txt800 = Annotated[str, _txt(800)]
 
 # The relay's own health row (``resonant.dashboard.pusher``): {state, since, detail}. Unlike the
 # monitor's checks it can be ``failing``. Absent while the relay is off.
@@ -110,21 +175,27 @@ RELAY_CHECK: Final = "relay"
 _GIT = "/usr/bin/git"  # SIP-protected; never looked up by name
 _SHA = re.compile(r"[0-9a-f]{40}")
 _IDENT = re.compile(IDENT_PATTERN)
-_CODE = re.compile(CODE_PATTERN)
+_PR_URL = re.compile(PR_URL_PATTERN)
+_HEAD_SHA = re.compile(SHA_PATTERN)
+# Linear ids: upper case in an ask (``PER-276``; ``gpt-4`` is not one). In a branch (lower case,
+# a slug of the ask) only a key the ask named, or one starting a path segment as Linear's own
+# branch names do (``justin/per-276-...``).
+_LINEAR = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,10}-\d{1,6})(?![A-Za-z0-9])")
+_LINEAR_BRANCH = re.compile(r"(?<![a-z0-9])([a-z]{2,10})-(\d{1,6})(?![a-z0-9])")
+_RUN_KEY = re.compile(r"run/(r\d{1,6})")
 _OUTCOMES: frozenset[str] = frozenset(get_args(JobOutcome))
 _HEALTH_STATES: frozenset[str] = frozenset(get_args(HealthState))
 _TASK_STATES: frozenset[str] = frozenset(get_args(TaskStatus))
 _RUN_STATES: frozenset[str] = frozenset(get_args(RunStatus))
 _EFFECT_KINDS: frozenset[str] = frozenset(get_args(EffectKind))
+_EFFECT_NAMES: frozenset[str] = frozenset(get_args(EffectName))
+_LEVELS: frozenset[str] = frozenset(get_args(ApprovalLevel))
 _URGENCIES: tuple[Urgency, ...] = get_args(Urgency)
+_URGENCY_RANK: Final[Mapping[str, int]] = {u: n for n, u in enumerate(pulse.URGENCIES)}
 
 
 def _ident(value: str) -> bool:
     return _IDENT.fullmatch(value) is not None
-
-
-def _code(value: str) -> bool:
-    return _CODE.fullmatch(value) is not None
 
 
 def _counts(counts: Mapping[str, int], known: frozenset[str]) -> dict[Any, int]:
@@ -137,19 +208,70 @@ def _local() -> Any:
     return Field(default=None, exclude_if=lambda v: v is None, json_schema_extra=LOCAL_ONLY)
 
 
+def _list() -> Any:
+    """An optional list field: empty by default."""
+    return Field(default_factory=list)
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class Limits(_Model):
+    """How much of each list the snapshot keeps, so the page can say "the newest 50"."""
+
+    runs: int = RUN_ITEMS
+    run_detail: int = RUN_DETAIL
+    tasks: int = TASK_ITEMS
+    task_detail: int = TASK_DETAIL
+    approvals_recent: int = APPROVALS_RECENT
+    approvals_pending: int = APPROVALS_PENDING
+    questions: int = QUESTION_ITEMS
+    pulse: int = PULSE_ITEMS
+    brain_tools: int = BRAIN_TOOL_ITEMS
+
+
+class Event(_Model):
+    """One audit row of a run or task: when, and which action (a run's lose their ``run.``)."""
+
+    at: datetime
+    event: EventName
 
 
 class HealthRow(_Model):
     name: Ident
     state: HealthState
     since: datetime | None
-    reason: str | None = _local()  # the check's detail (scrubbed by the monitor)
+    reason: Txt200 | None = None  # the check's detail
+    outside: list[OutsideName] = _list()  # ``["reason"]`` for an extension's own check
+
+
+class TaskItem(_Model):
+    """One durable task (a chat turn, a run, a job that needs approval, a reminder, a watch
+    check). Never its checkpoint, result, scope, channel ref, session id or worktree."""
+
+    id: Txt64
+    kind: Txt32
+    runner: Txt32
+    extension: Txt64 | None
+    status: TaskStatus
+    wait_reason: TaskWait | None
+    wake_at: datetime | None
+    attempts: int
+    step_no: int
+    created_at: datetime
+    updated_at: datetime
+    label: Txt120 | None  # the checkpoint's title, or ``ext/job`` for a job
+    error: Txt300 | None
+    run_code: Txt16 | None
+    history: list[Event] = _list()
+    approval_ids: list[Txt64] = _list()
+    outside: list[OutsideName] = _list()
 
 
 class Tasks(_Model):
     by_state: dict[TaskStatus, int]
+    items: list[TaskItem] = _list()
 
 
 class Slots(_Model):
@@ -157,38 +279,62 @@ class Slots(_Model):
     max: int
 
 
+class RunEffect(_Model):
+    """A side effect Resonant read in a run's commands (TR-1)."""
+
+    kind: EffectKind
+    what: Txt80
+    high: bool
+
+
 class RunItem(_Model):
-    code: str
+    code: Txt16
     state: RunStatus
-    repo: str  # empty for a scratch run
-    ask: str
-    branch: str | None
-    pr_url: str | None
-    pr_number: int | None
+    waiting_reason: WaitReason | None
     started_at: datetime | None
     ended_at: datetime | None
-    waiting_reason: WaitReason | None
-    last_note: str | None
     detected: int  # side effects detected in its commands (TR-1, ``run.seen:<code>``)
+    repo: Txt100  # empty for a scratch run
+    ask: Txt300
+    branch: Txt120 | None
+    base_branch: Txt120 | None
+    head_sha: Sha | None
+    pr_url: PrUrl | None  # only a github.com pull request link
+    pr_number: int | None
+    github_repo: Txt100 | None  # ``owner/name`` of the repo; None for a scratch run
+    created_at: datetime
     remote_url: str | None = _local()  # RC-1: the running session's Remote Control link
-
-
-class RunBrief(_Model):
-    """A run on both tiers: no ask, repo, branch, note or link."""
-
-    code: Code
-    state: RunStatus
-    scratch: bool  # no repo
-    has_pr: bool
-    started_at: datetime | None
-    ended_at: datetime | None
-    waiting_reason: WaitReason | None
+    task_id: Txt64 | None
+    step: RunStep
+    attempts: int
+    sessions: int
+    exit_code: int | None
+    cost_usd: float | None
+    tokens_in: int | None
+    tokens_out: int | None
+    session_seconds: float
+    wait_seconds: float
+    files_changed: int | None
+    flagged_paths: list[Txt120] = _list()
+    summary: Txt800 | None
+    failure: Txt400 | None
+    last_note: Txt200 | None
+    did: list[Txt80] = _list()  # what the worker said it did (``did:`` notes), newest last
+    effects: list[RunEffect] = _list()
+    merged: list[Txt40] = _list()
+    merged_by: Literal["resonant", "run"] | None
+    history: list[Event] = _list()  # oldest first
+    approval_ids: list[Txt64] = _list()
+    question_ids: list[int] = _list()
+    linear_ids: list[LinearId] = _list()  # as plain text: no workspace is configured
+    detail: bool  # False past ``Limits.run_detail``: its text and history are left out
+    outside: list[OutsideName] = _list()
 
 
 class DetectedEffects(_Model):
     """PER-263: the side effects detected in the commands of the runs the snapshot lists
-    (TR-1, the last ``RUN_ITEMS`` runs), counts only, so the remote tier has them too:
-    by kind, and how many of them were high-impact (a base push, a publish, a delete)."""
+    (TR-1), counts only: by kind, and how many of them were high-impact (a base push, a
+    publish, a delete)."""
 
     by_kind: dict[EffectKind, int]
     high: int
@@ -197,106 +343,110 @@ class DetectedEffects(_Model):
 class Runs(_Model):
     by_state: dict[RunStatus, int]
     detected: DetectedEffects
-    items: list[RunItem] | None = _local()
-    brief: list[RunBrief] = Field(default_factory=list[RunBrief])
-
-
-ApprovalLevel = Literal["L0", "L1", "L2", "L3"]
+    items: list[RunItem] = _list()
 
 
 class ApprovalChange(_Model):
     """One change of a batch (BA-1): its line in the batch's prompt, and its own level."""
 
-    summary: str
+    summary: Txt200
     level: ApprovalLevel
 
 
 class ApprovalItem(_Model):
-    """What one answer decides: a lone approval, or a batch (PER-254) as one row with the
-    batch's code (its first approval's), the summary ``N changes``, its strictest
-    level, when it was asked and its one expiry. ``changes`` lists a batch's changes in
-    order; it is absent for a lone approval."""
+    """What one answer decides: a lone approval, or a batch (PER-254) as one row with its first
+    approval's id, the summary ``N changes``, its strictest level, when it was asked and its
+    one expiry. ``changes`` lists a batch's changes in order; it is absent for a lone
+    approval. ``code`` (the second factor an L1 yes needs) is local only."""
 
-    code: str | None
-    summary: str
+    id: Txt64
+    member_ids: list[Txt64]
+    code: str | None = _local()
+    summary: Txt300
     level: ApprovalLevel
-    asked_at: datetime
-    expires_at: datetime
-    changes: list[ApprovalChange] | None = _local()
-
-
-class ApprovalBrief(_Model):
-    """A pending approval on both tiers: no summary, and not its code (the owner types it to
-    say yes, so it stays on the Mini and iMessage). A batch (PER-254) is one brief, like its row."""
-
-    level: ApprovalLevel
-    effect: Literal["read", "write", "pay"]
+    effect: EffectName
     needs_code: bool
+    tool: Txt64
+    extension: Txt64 | None
+    status: Literal["pending", "approved", "rejected", "expired"]
     asked_at: datetime
     expires_at: datetime
+    decided_at: datetime | None
+    decided_by: Txt40 | None
+    task_id: Txt64 | None
+    run_code: Txt16 | None
+    changes: list[ApprovalChange] | None = None
+    outside: list[OutsideName] = _list()
 
 
 class Approvals(_Model):
     open: int  # rows (what the owner answers): a batch counts once
-    items: list[ApprovalItem] | None = _local()
-    brief: list[ApprovalBrief] = Field(default_factory=list[ApprovalBrief])
+    items: list[ApprovalItem] = _list()  # pending, oldest first
+    recent: list[ApprovalItem] = _list()  # decided in the last week, newest first
 
 
 class QuestionItem(_Model):
-    run_code: str
-    text: str
-    options: list[str]
+    id: int
+    run_code: Txt16
+    kind: Txt16
+    text: Txt600
+    options: list[Txt80]
+    urgent: bool
     asked_at: datetime
-
-
-class QuestionBrief(_Model):
-    """An open worker question on both tiers: whose, how many options, when. No text."""
-
-    run_code: Code
-    options: int
-    asked_at: datetime
+    outside: list[OutsideName] = _list()
 
 
 class Questions(_Model):
     open: int
-    items: list[QuestionItem] | None = _local()
-    brief: list[QuestionBrief] = Field(default_factory=list[QuestionBrief])
+    items: list[QuestionItem] = _list()
 
 
 class PulseItem(_Model):
-    source: str  # ``core`` or the extension that reported it
-    key: str
-    title: str
+    source: Txt64  # ``core`` or the extension that reported it
+    key: Txt120
+    title: Txt200
     urgency: Urgency
     state: PulseState
     updated_at: datetime
-
-
-class PulseBrief(_Model):
-    """An open pulse item on both tiers: who reported it, how urgent, when. No key or title."""
-
-    source: Ident  # ``core``, the extension, or ``other``
-    urgency: Urgency
-    state: PulseState
-    updated_at: datetime
+    expires_at: datetime
+    told_at: datetime | None
+    run_code: Txt16 | None
+    outside: list[OutsideName] = _list()
 
 
 class Pulse(_Model):
     open: int
     # PER-263: items whose latest version the owner hasn't heard (``pulse.pending`` at every
-    # urgency, muted sources included, and cleared items whose last word is owed), so the
-    # remote tier shows a held or muted reporter's backlog without the titles.
+    # urgency, muted sources included, and cleared items whose last word is owed).
     untold: int
-    items: list[PulseItem] | None = _local()
-    brief: list[PulseBrief] = Field(default_factory=list[PulseBrief])
+    items: list[PulseItem] = _list()
 
 
 class Job(_Model):
     id: Ident
+    schedule: Txt64 | None = None  # cron
+    tz: Txt64 | None = None
+    effect: EffectName | None = None
+    level: ApprovalLevel | None = None
     next_due: datetime | None  # None when the extension is disabled or the schedule is bad
     last_run_at: datetime | None
     last_outcome: JobOutcome | None
     fail_streak: int
+
+
+class ExtTool(_Model):
+    name: Txt64
+    via: Literal["cli", "mcp"]
+    server: Txt64 | None
+    effect: EffectName
+    level: ApprovalLevel
+    description: Txt160 | None
+
+
+class McpServer(_Model):
+    id: Txt64
+    transport: Literal["stdio", "http"]
+    host: Txt120 | None  # an http server's host only: never its path or query
 
 
 class Extension(_Model):
@@ -305,11 +455,20 @@ class Extension(_Model):
     health: HealthState  # its ``ext:<name>`` check
     muted_until: datetime | None  # PER-263: ``/ext mute``'s end while it is muted (notify)
     jobs: list[Job]
+    description: Txt120 | None = None
+    source_kind: Literal["repo", "path", "other"] = "other"
+    commit: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{7,12}$")] | None = None
+    installed_at: datetime | None = None
+    tools: list[ExtTool] = _list()
+    mcp_servers: list[McpServer] = _list()
+    secrets: list[Ident] = _list()  # names only
+    report_max: Urgency | None = None
+    repos: list[Txt100] = _list()
 
 
 class Runner(_Model):
     set_up: bool
-    missing: list[str] | None = _local()  # what to set up, in words
+    missing: list[Txt120] = _list()  # what to set up, in words
     gaps: int = 0  # how many
 
 
@@ -317,64 +476,49 @@ class BrainTool(_Model):
     """PER-258: one of the Claude brain's tool calls (its ``brain.tool`` audit row)."""
 
     at: datetime
-    tool: str
-    decision: str  # allowed (the read list), read, gate, granted, asked, refused, denied, resonant
-    command: str  # redacted and clipped by the bridge
-    cwd: str
+    tool: Txt64
+    decision: (
+        Txt16  # allowed (the read list), read, gate, granted, asked, refused, denied, resonant
+    )
+    command: Txt200
+    cwd: Txt120
     status: Literal["ok", "error"]
     write: bool
+    outside: list[OutsideName] = _list()  # ``["command"]``
 
 
 class ClaudeBrain(_Model):
-    """BR-11: the Claude brain's session (local tier only, like the rest of the claude
-    details): up or down, its turns, its Remote Control link while one is on, and its last
-    tool calls (PER-258)."""
+    """BR-11: the Claude brain's session: up or down, its turns, its Remote Control link while
+    one is on (local only), and its last tool calls (PER-258)."""
 
     state: Literal["up", "down"]
     turns: int
     remote_url: str | None = _local()
-    tools: list[BrainTool] = Field(default_factory=list[BrainTool])
-
-
-BrainDecision = Literal[
-    "allowed", "read", "gate", "granted", "asked", "refused", "denied", "resonant", "other"
-]
-
-
-class BrainToolBrief(_Model):
-    """One of the Claude brain's tool calls on both tiers: the tool's kind (``bash``,
-    ``read``, ``mcp``; ``other`` for a name that isn't a plain slug), the decision and the
-    outcome. Never its command or directory."""
-
-    at: datetime
-    tool: Ident
-    decision: BrainDecision
-    status: Literal["ok", "error"]
-    write: bool
+    tools: list[BrainTool] = _list()
 
 
 class BrainActivity(_Model):
-    """PER-258: the Claude brain's tool calls today (``settings.timezone``), counts only, so
-    the remote tier has them too: every call, and the changes that ran. With its session's
-    state and turns (None before its first start) and its last calls, briefly."""
+    """PER-258: the Claude brain's tool calls today (``settings.timezone``), counts only: every
+    call, and the changes that ran. With its session's state and turns (None before its first
+    start)."""
 
     calls_today: int
     writes_today: int
     state: Literal["up", "down"] | None = None
     turns: int = 0
-    recent: list[BrainToolBrief] = Field(default_factory=list[BrainToolBrief])
 
 
 class TrustRule(_Model):
     n: int  # the rule's id, as ``/trust`` lists it
-    text: str
+    text: Txt200
 
 
 class RepoItem(_Model):
-    name: str
+    name: Txt64
     mode: Mode
-    base: str
+    base: Txt120
     ci: bool | None  # CI seen on the repo (None: not checked yet)
+    slug: Txt100
 
 
 class Snapshot(_Model):
@@ -389,7 +533,7 @@ class Snapshot(_Model):
         title="Snapshot",
     )
 
-    schema_: Literal[1] = Field(alias="schema")
+    schema_: Literal[2] = Field(alias="schema")
     tier: Tier
     taken_at: datetime
     version: Version
@@ -398,6 +542,8 @@ class Snapshot(_Model):
     autonomy: Literal["on", "off"]
     paused: bool
     dry_run: bool
+    trimmed: Trimmed = "none"  # how far the pusher cut the lists to fit the relay
+    limits: Limits
     health: list[HealthRow]
     tasks: Tasks
     slots: Slots
@@ -406,13 +552,14 @@ class Snapshot(_Model):
     questions: Questions
     pulse: Pulse
     extensions: list[Extension]
+    core_jobs: list[Job]
     runner: Runner
-    trust_rules: list[TrustRule] | None = _local()
-    repos: list[RepoItem] | None = _local()
-    claude_brain: ClaudeBrain | None = _local()  # BR-11; None before its first start
+    trust_rules: list[TrustRule]
+    repos: list[RepoItem]
+    claude_brain: ClaudeBrain | None = None  # BR-11; None before its first start
     brain_activity: BrainActivity = Field(default_factory=lambda: BrainActivity(
         calls_today=0, writes_today=0))  # fmt: skip
-    trust_rule_count: int = 0  # the rules and repos themselves are local only
+    trust_rule_count: int = 0
     repo_count: int = 0
 
 
@@ -475,6 +622,23 @@ def code_version() -> str:
     return sha[:8] if out.returncode == 0 and _SHA.fullmatch(sha) else __version__
 
 
+class _Text:
+    """The one pass every free text goes through (``redact.clip_text``): credential-shaped
+    text, then the caller's known secret values, then the field's cap."""
+
+    def __init__(self, known: Redactor | None) -> None:
+        self.known = known
+
+    def __call__(self, value: str, cap: int) -> str:
+        return clip_text(value, cap, known=self.known) or ""
+
+    def opt(self, value: str | None, cap: int) -> str | None:
+        return None if value is None else clip_text(value, cap, known=self.known)
+
+    def many(self, values: Iterable[str], cap: int) -> list[str]:
+        return [self(v, cap) for v in values]
+
+
 def _health_state(raw: object) -> HealthState:
     return cast(HealthState, raw) if raw in _HEALTH_STATES else "unknown"
 
@@ -488,17 +652,19 @@ def _since(raw: object) -> datetime | None:
         return None
 
 
-def _health(conn: sqlite3.Connection) -> dict[str, HealthRow]:
+def _health(conn: sqlite3.Connection, t: _Text) -> dict[str, HealthRow]:
     rows: dict[str, HealthRow] = {}
     for name, h in health_snapshot(conn).items():
         if not _ident(name):  # a stale or hand-edited kv key
             continue
         detail = h.get("detail")
+        reason = t.opt(detail, 200) if isinstance(detail, str) and detail else None
         rows[name] = HealthRow(
             name=name,
             state=_health_state(h.get("state")),
             since=_since(h.get("since")),
-            reason=detail if isinstance(detail, str) and detail else None,
+            reason=reason,
+            outside=["reason"] if reason and name.startswith(EXT_CHECK_PREFIX) else [],
         )
     raw = kv_get(conn, RELAY_HEALTH_KV)
     if isinstance(raw, dict):
@@ -508,9 +674,54 @@ def _health(conn: sqlite3.Connection) -> dict[str, HealthRow]:
             name=RELAY_CHECK,
             state=_health_state(relay.get("state")),
             since=_since(relay.get("since")),
-            reason=detail if isinstance(detail, str) and detail else None,
+            reason=t.opt(detail, 200) if isinstance(detail, str) and detail else None,
         )
     return rows
+
+
+def _effect(raw: object) -> EffectName | None:
+    return cast(EffectName, raw) if isinstance(raw, str) and raw in _EFFECT_NAMES else None
+
+
+def _level(raw: object, effect: EffectName | None) -> ApprovalLevel | None:
+    """The declared level, else the effect's default (``DEFAULT_LEVEL``)."""
+    if isinstance(raw, str) and raw in _LEVELS:
+        return cast(ApprovalLevel, raw)
+    return None if effect is None else DEFAULT_LEVEL[Effect(effect)].value
+
+
+def _job(
+    job_id: str,
+    st: ext_store.JobState | None,
+    *,
+    schedule: str | None,
+    tz: str | None,
+    effect: EffectName | None,
+    level: ApprovalLevel | None,
+    next_due: datetime | None,
+    t: _Text,
+) -> Job:
+    outcome = None if st is None else st.last_outcome
+    return Job(
+        id=job_id,
+        schedule=t.opt(schedule, 64),
+        tz=t.opt(tz, 64),
+        effect=effect,
+        level=level,
+        next_due=next_due,
+        last_run_at=None if st is None else st.last_run_at,
+        last_outcome=None
+        if outcome is None
+        else cast(JobOutcome, outcome if outcome in _OUTCOMES else "other"),
+        fail_streak=0 if st is None else st.fail_streak,
+    )
+
+
+def _next_due(expr: object, tz: str, now: datetime) -> datetime | None:
+    try:
+        return parse_schedule(str(expr or ""), tz).next_after(now)
+    except (CronError, ValueError):
+        return None
 
 
 def _jobs(
@@ -518,35 +729,184 @@ def _jobs(
     states: Mapping[str, ext_store.JobState],
     settings: Settings,
     now: datetime,
+    t: _Text,
 ) -> list[Job]:
     jobs: list[Job] = []
     for spec in cast(list[dict[str, Any]], record.manifest.get("jobs") or []):
         job_id = str(spec.get("id", ""))
         if not _ident(job_id):
             continue
-        next_due: datetime | None = None
-        if record.status == "enabled":
-            try:
-                schedule = parse_schedule(
-                    str(spec.get("schedule", "")), spec.get("tz") or settings.timezone
-                )
-                next_due = schedule.next_after(now)
-            except (CronError, ValueError):
-                next_due = None
-        st = states.get(job_id)
-        outcome = None if st is None else st.last_outcome
+        zone = str(spec.get("tz") or settings.timezone)
+        next_due = (
+            _next_due(spec.get("schedule"), zone, now) if record.status == "enabled" else None
+        )
+        effect = _effect(spec.get("effect", "write"))
         jobs.append(
-            Job(
-                id=job_id,
+            _job(
+                job_id,
+                states.get(job_id),
+                schedule=None if spec.get("schedule") is None else str(spec["schedule"]),
+                tz=None if spec.get("tz") is None else str(spec["tz"]),
+                effect=effect,
+                level=_level(spec.get("level"), effect),
                 next_due=next_due,
-                last_run_at=None if st is None else st.last_run_at,
-                last_outcome=None
-                if outcome is None
-                else cast(JobOutcome, outcome if outcome in _OUTCOMES else "other"),
-                fail_streak=0 if st is None else st.fail_streak,
+                t=t,
             )
         )
     return jobs
+
+
+def _core_jobs(
+    conn: sqlite3.Connection,
+    core_jobs: Sequence[tuple[str, str, str]],
+    settings: Settings,
+    now: datetime,
+    t: _Text,
+) -> list[Job]:
+    """The daemon's own jobs. ``core_jobs`` is the scheduler's ``(id, cron, tz)``; without it
+    (a process with no scheduler) only the jobs the store has a state for, with no schedule."""
+    states = {j.job_id: j for j in ext_store.list_jobs(conn, ext_store.CORE_EXT)}
+    out: list[Job] = []
+    if core_jobs:
+        for job_id, cron, tz in core_jobs:
+            if _ident(job_id):
+                out.append(
+                    _job(
+                        job_id,
+                        states.get(job_id),
+                        schedule=cron,
+                        tz=tz,
+                        effect="read",
+                        level="L0",
+                        next_due=_next_due(cron, tz or settings.timezone, now),
+                        t=t,
+                    )
+                )
+    else:
+        out = [
+            _job(j.job_id, j, schedule=None, tz=None, effect=None, level=None, next_due=None, t=t)
+            for j in states.values()
+            if _ident(j.job_id)
+        ]
+    return out[:CORE_JOB_ITEMS]
+
+
+def _tools_of(manifest: Mapping[str, Any], t: _Text) -> tuple[list[ExtTool], list[McpServer]]:
+    """The tools and MCP servers an extension declares. Never a command line, an input
+    schema, a pin or an argument; an http server shows its host only."""
+    tools: list[ExtTool] = []
+    cli = manifest.get("tools")
+    for name, spec in (cast(dict[str, Any], cli) if isinstance(cli, dict) else {}).items():
+        if not isinstance(spec, dict):
+            continue
+        fields = cast(dict[str, Any], spec)
+        effect = _effect(fields.get("effect"))
+        level = _level(fields.get("level"), effect)
+        if effect is None or level is None:
+            continue
+        desc = fields.get("description")
+        tools.append(
+            ExtTool(
+                name=t(str(name), 64),
+                via="cli",
+                server=None,
+                effect=effect,
+                level=level,
+                description=t.opt(desc, 160) if isinstance(desc, str) and desc else None,
+            )
+        )
+    servers: list[McpServer] = []
+    mcp = manifest.get("mcp")
+    raw_servers: object = (
+        cast(dict[str, Any], mcp).get("servers") if isinstance(mcp, dict) else None
+    )
+    for sid, server in (
+        cast(dict[str, Any], raw_servers) if isinstance(raw_servers, dict) else {}
+    ).items():
+        if not isinstance(server, dict):
+            continue
+        sv = cast(dict[str, Any], server)
+        http = sv.get("transport") == "http"
+        host = None
+        if http:
+            try:
+                host = urlsplit(str(sv.get("url", ""))).hostname
+            except ValueError:
+                host = None
+        servers.append(
+            McpServer(
+                id=t(str(sid), 64),
+                transport="http" if http else "stdio",
+                host=t.opt(host, 120),
+            )
+        )
+        for tool in cast(list[Any], sv.get("tools") or []):
+            if not isinstance(tool, dict):
+                continue
+            tf = cast(dict[str, Any], tool)
+            effect = _effect(tf.get("effect"))
+            level = _level(tf.get("level"), effect)
+            if effect is None or level is None or not isinstance(tf.get("name"), str):
+                continue
+            desc = tf.get("description")
+            tools.append(
+                ExtTool(
+                    name=t(str(tf["name"]), 64),
+                    via="mcp",
+                    server=t(str(sid), 64),
+                    effect=effect,
+                    level=level,
+                    description=t.opt(desc, 160) if isinstance(desc, str) and desc else None,
+                )
+            )
+    return tools[:EXT_TOOLS], servers[:EXT_MCP_SERVERS]
+
+
+def _extension(
+    conn: sqlite3.Connection,
+    record: ext_store.ExtensionRecord,
+    health: Mapping[str, HealthRow],
+    settings: Settings,
+    now: datetime,
+    t: _Text,
+) -> Extension:
+    manifest = record.manifest
+    states = {j.job_id: j for j in ext_store.list_jobs(conn, record.name)}
+    check = health.get(EXT_CHECK_PREFIX + record.name)
+    tools, servers = _tools_of(manifest, t)
+    desc = manifest.get("description")
+    secrets = manifest.get("secrets")
+    report = manifest.get("report")
+    max_urgency = (
+        cast(dict[str, Any], report).get("max_urgency") if isinstance(report, dict) else None
+    )
+    ext_repos = manifest.get("repos")
+    kind = record.source.split(":", 1)[0]
+    commit = (record.commit or "")[:12].lower()
+    return Extension(
+        name=record.name,
+        status=record.status,
+        health="unknown" if check is None else check.state,
+        muted_until=muted_until(conn, record.name, now),
+        jobs=_jobs(record, states, settings, now, t),
+        description=t.opt(desc, 120) if isinstance(desc, str) and desc else None,
+        source_kind="repo" if kind == "repo" else "path" if kind == "path" else "other",
+        commit=commit if re.fullmatch(r"[0-9a-f]{7,12}", commit) else None,
+        installed_at=record.installed_at,
+        tools=tools,
+        mcp_servers=servers,
+        secrets=[
+            s
+            for s in (cast(list[Any], secrets) if isinstance(secrets, list) else [])
+            if isinstance(s, str) and _ident(s)
+        ][:EXT_SECRETS],
+        report_max=max_urgency if max_urgency in _URGENCIES else None,
+        repos=t.many(
+            [r for r in (cast(list[Any], ext_repos) if isinstance(ext_repos, list) else [])
+             if isinstance(r, str)][:EXT_REPOS],
+            100,
+        ),
+    )  # fmt: skip
 
 
 def _extensions(
@@ -554,23 +914,13 @@ def _extensions(
     health: Mapping[str, HealthRow],
     settings: Settings,
     now: datetime,
+    t: _Text,
 ) -> list[Extension]:
-    out: list[Extension] = []
-    for record in ext_store.list_extensions(conn):
-        if not _ident(record.name):
-            continue
-        states = {j.job_id: j for j in ext_store.list_jobs(conn, record.name)}
-        check = health.get(EXT_CHECK_PREFIX + record.name)
-        out.append(
-            Extension(
-                name=record.name,
-                status=record.status,
-                health="unknown" if check is None else check.state,
-                muted_until=muted_until(conn, record.name, now),
-                jobs=_jobs(record, states, settings, now),
-            )
-        )
-    return out
+    return [
+        _extension(conn, record, health, settings, now, t)
+        for record in ext_store.list_extensions(conn)
+        if _ident(record.name)
+    ][:EXTENSION_ITEMS]
 
 
 def build_snapshot(
@@ -583,35 +933,74 @@ def build_snapshot(
     runner_missing: Sequence[str] | None = None,
     now: datetime | None = None,
     version: str | None = None,
+    core_jobs: Sequence[tuple[str, str, str]] = (),
+    redactor: Redactor | None = None,
 ) -> Snapshot:
     """The local-tier snapshot (``to_remote`` derives the remote one).
 
     ``slots`` is the loop's Claude slot pool (without it: none used, ``claude.max_concurrent``
     max). ``runner_missing`` is ``ClaudeRunner.setup_gaps()``'s list, or None when no Claude
-    runner is wired in this process (then the runner is not set up).
+    runner is wired in this process (then the runner is not set up). ``core_jobs`` is the
+    scheduler's ``(id, cron, tz)`` per core job. ``redactor`` holds secret values the text
+    passes must also remove (the relay pusher's token and key).
     """
     now = now or utcnow()
-    health = _health(conn)
+    t = _Text(redactor)
+    health = _health(conn, t)
+    ctx = _Context(conn, now)
+
+    task_rows = task_store.recent(conn, TASK_ITEMS)
     run_rows = runs.recent(conn, limit=RUN_ITEMS)
-    pending = _approval_items(conn, approvals.pending_all(conn, now))
     asks = questions.open_asks(conn)
+    pending_rows = approvals.pending_all(conn, now)
+    recent_rows = approvals.recent_decided(
+        conn, now - timedelta(days=RECENT_APPROVALS_DAYS), APPROVALS_RECENT * 5
+    )
+    ctx.add_tasks([r.task_id for r in run_rows if r.task_id])
+    ctx.add_tasks([r.id for r in task_rows])
+    ctx.add_tasks([a.task_id for a in (*pending_rows, *recent_rows) if a.task_id])
+    ctx.load(task_rows)
+
+    pending = _approval_items(conn, pending_rows, ctx, t, pending=True)
+    recent_items = _approval_items(conn, recent_rows, ctx, t, pending=False)
+    pending_shown = pending[:APPROVALS_PENDING]
+    recent_shown = recent_items[:APPROVALS_RECENT]
+    visible = {m for a in (*pending_shown, *recent_shown) for m in a.member_ids}
+    related = approvals.ids_by_task(conn, ctx.task_ids, now - timedelta(days=RECENT_APPROVALS_DAYS))
+
     items = pulse.open_items(conn, now)
     untold = pulse.pending(conn, _URGENCIES, now)
-    detected = {r.code: _detected(conn, r.code) for r in run_rows}
+    from resonant.runners import reports  # an import cycle at module level (EffectKind)
+
+    detected = {r.code: _detected(conn, r.code, reports) for r in run_rows}
+    events = run_events(conn, [(r.code, r.task_id) for r in run_rows], RUN_HISTORY)
+    task_history = task_events(conn, [r.id for r in task_rows[:TASK_DETAIL]], TASK_HISTORY)
+    slug_of = {r.name: r.slug for r in repos.list_all(conn)}
+    open_question_ids: dict[str, list[int]] = {}
+    for q in asks[:QUESTION_ITEMS]:
+        open_question_ids.setdefault(q.run_code, []).append(q.id)
+
     autonomy = kv_get(conn, "autonomy", "on")
-    brain = _claude_brain(conn)
+    brain = _claude_brain(conn, t)
     if runner_missing is None:
         runner = Runner(
-            set_up=False, missing=["no Claude runner in this daemon (iMessage is off)"], gaps=1
+            set_up=False,
+            missing=[t("no Claude runner in this daemon (iMessage is off)", 120)],
+            gaps=1,
         )
     else:
         runner = Runner(
             set_up=not runner_missing,
-            missing=list(runner_missing) or None,
+            missing=t.many(runner_missing[:RUNNER_MISSING], 120),
             gaps=len(runner_missing),
         )
     rules = trust.list_rules(conn)
     repo_rows = repos.list_all(conn)
+
+    def related_ids(task_id: str | None) -> list[str]:
+        ids = [i for i in related.get(task_id or "", []) if i in visible]
+        return ids[-RELATED_IDS:]
+
     return Snapshot(
         schema=SCHEMA_VERSION,
         tier="local",
@@ -622,97 +1011,86 @@ def build_snapshot(
         autonomy="off" if autonomy == "off" else "on",
         paused=kv_get(conn, "paused", False) is True,
         dry_run=settings.dry_run,
+        limits=Limits(),
         health=list(health.values()),
-        tasks=Tasks(by_state=_counts(task_store.count_by_status(conn), _TASK_STATES)),
+        tasks=Tasks(
+            by_state=_counts(task_store.count_by_status(conn), _TASK_STATES),
+            items=[
+                _task_item(
+                    task,
+                    ctx,
+                    t,
+                    history=task_history.get(task.id, []) if n < TASK_DETAIL else [],
+                    approval_ids=related_ids(task.id),
+                )
+                for n, task in enumerate(task_rows)
+            ],
+        ),
         slots=Slots(
             used=0 if slots is None else slots.in_use,
             max=settings.claude.max_concurrent if slots is None else slots.capacity,
         ),
         runs=Runs(
             by_state=_counts(runs.count_by_status(conn), _RUN_STATES),
-            detected=_detected_counts(detected.values()),
+            detected=_detected_counts(d for d in detected.values()),
             items=[
-                RunItem(
-                    code=r.code,
-                    state=r.status,
-                    repo=r.repo,
-                    ask=r.ask,
-                    branch=r.branch,
-                    pr_url=r.pr_url,
-                    pr_number=r.pr_number,
-                    started_at=r.started_at,
-                    ended_at=r.ended_at,
-                    waiting_reason=r.wait_reason if r.status == "waiting" else None,
-                    last_note=r.last_note,
-                    detected=len(detected[r.code]),
-                    remote_url=r.remote_url if r.status == "running" else None,
+                _run_item(
+                    r,
+                    conn,
+                    ctx,
+                    t,
+                    reports,
+                    detail=n < RUN_DETAIL,
+                    detected=detected[r.code],
+                    history=events.get(r.code, []),
+                    github_repo=slug_of.get(r.repo) if r.repo else None,
+                    approval_ids=related_ids(r.task_id),
+                    question_ids=open_question_ids.get(r.code, []),
                 )
-                for r in run_rows
-            ],
-            brief=[
-                RunBrief(
-                    code=r.code,
-                    state=r.status,
-                    scratch=not r.repo,
-                    has_pr=r.pr_url is not None or r.pr_number is not None,
-                    started_at=r.started_at,
-                    ended_at=r.ended_at,
-                    waiting_reason=r.wait_reason if r.status == "waiting" else None,
-                )
-                for r in [r for r in run_rows if _code(r.code)][:RUN_BRIEF_ITEMS]
+                for n, r in enumerate(run_rows)
             ],
         ),
         approvals=Approvals(
             open=len(pending),
-            items=[item for item, _ in pending],
-            brief=[brief for _, brief in pending[:APPROVAL_BRIEF_ITEMS]],
+            items=pending_shown,
+            recent=recent_shown,
         ),
         questions=Questions(
             open=len(asks),
             items=[
                 QuestionItem(
-                    run_code=q.run_code,
-                    text=q.question,
-                    options=list(q.options),
+                    id=q.id,
+                    run_code=t(q.run_code, 16),
+                    kind=t(q.kind, 16),
+                    text=t(q.question, 600),
+                    options=t.many(q.options[:QUESTION_OPTIONS], 80),
+                    urgent=q.urgent,
                     asked_at=q.asked_at,
+                    outside=["text", "options"],
                 )
-                for q in asks
-            ],
-            brief=[
-                QuestionBrief(run_code=q.run_code, options=len(q.options), asked_at=q.asked_at)
-                for q in [q for q in asks if _code(q.run_code)][:QUESTION_BRIEF_ITEMS]
+                for q in asks[:QUESTION_ITEMS]
             ],
         ),
         pulse=Pulse(
             open=len(items),
             untold=len(untold),
             items=[
-                PulseItem(
-                    source=i.source,
-                    key=i.key,
-                    title=i.title,
-                    urgency=i.urgency,
-                    state="new" if i.changed else "told",
-                    updated_at=i.updated_at,
-                )
-                for i in items
-            ],
-            brief=[
-                PulseBrief(
-                    source=i.source if _ident(i.source) else "other",
-                    urgency=i.urgency,
-                    state="new" if i.changed else "told",
-                    updated_at=i.updated_at,
-                )
+                _pulse_item(i, t)
                 for i in sorted(
                     items, key=lambda i: (_URGENCY_RANK[i.urgency], -i.updated_at.timestamp())
-                )[:PULSE_BRIEF_ITEMS]
+                )[:PULSE_ITEMS]
             ],
         ),
-        extensions=_extensions(conn, health, settings, now),
+        extensions=_extensions(conn, health, settings, now, t),
+        core_jobs=_core_jobs(conn, core_jobs, settings, now, t),
         runner=runner,
-        trust_rules=[TrustRule(n=r.id, text=r.text) for r in rules],
-        repos=[RepoItem(name=r.name, mode=r.mode, base=r.base, ci=r.ci) for r in repo_rows],
+        trust_rules=[TrustRule(n=r.id, text=t(r.text, 200)) for r in rules[:TRUST_RULE_ITEMS]],
+        repos=[
+            RepoItem(
+                name=t(r.name, 64), mode=r.mode, base=t(r.base, 120), ci=r.ci, slug=t(r.slug, 100)
+            )
+            for r in repo_rows[:REPO_ITEMS]
+        ],
         claude_brain=brain,
         brain_activity=_brain_activity(conn, settings, now, brain),
         trust_rule_count=len(rules),
@@ -720,96 +1098,328 @@ def build_snapshot(
     )
 
 
-def _detected(conn: sqlite3.Connection, code: str) -> list[tuple[EffectKind, bool]]:
-    """Run ``code``'s detected side effects as (kind, high), unknown kinds left out."""
-    from resonant.runners.reports import detected_list  # a cycle at import time (EffectKind)
+class _Context:
+    """The tasks the builder looks at more than once (taint, run codes), read once."""
 
+    def __init__(self, conn: sqlite3.Connection, now: datetime) -> None:
+        self.conn = conn
+        self.now = now
+        self.task_ids: list[str] = []
+        self._tasks: dict[str, Task | None] = {}
+        self._codes: dict[str, str] | None = None
+
+    def add_tasks(self, ids: Iterable[str]) -> None:
+        for i in ids:
+            if i not in self.task_ids:
+                self.task_ids.append(i)
+
+    def load(self, tasks: Sequence[Task]) -> None:
+        for task in tasks:
+            self._tasks[task.id] = task
+
+    def task(self, task_id: str | None) -> Task | None:
+        if task_id is None:
+            return None
+        if task_id not in self._tasks:
+            self._tasks[task_id] = task_store.get_task(self.conn, task_id)
+        return self._tasks[task_id]
+
+    def tainted(self, task_id: str | None) -> bool:
+        task = self.task(task_id)
+        return task is not None and system_texts.tainted(task.checkpoint)
+
+    def run_code(self, task_id: str | None) -> str | None:
+        if task_id is None:
+            return None
+        if self._codes is None:
+            self._codes = runs.codes_by_task(self.conn, self.task_ids)
+        return self._codes.get(task_id)
+
+
+def _events(rows: Sequence[tuple[datetime, str]], *, strip: str = "") -> list[Event]:
+    out: list[Event] = []
+    for at, action in rows:
+        name = action.removeprefix(strip) if strip else action
+        if EVENT_NAME.fullmatch(name):
+            out.append(Event(at=at, event=name))
+    return out
+
+
+def _task_label(task: Task, t: _Text) -> str | None:
+    title = task.checkpoint.get("title")
+    if isinstance(title, str) and title.strip():
+        return t(title.strip(), 120)
+    if task.kind == "job":
+        from resonant.extensions.scheduler import job_checkpoint  # a cycle at import time
+
+        found = job_checkpoint(task.checkpoint)
+        if found is not None:
+            return t(f"{found[0]}/{found[1]}", 120)
+    return None
+
+
+def _task_item(
+    task: Task,
+    ctx: _Context,
+    t: _Text,
+    *,
+    history: Sequence[tuple[datetime, str]],
+    approval_ids: list[str],
+) -> TaskItem:
+    error = t.opt(task.error, 300)
+    return TaskItem(
+        id=t(task.id, 64),
+        kind=t(task.kind, 32),
+        runner=t(task.runner, 32),
+        extension=t.opt(task.extension, 64),
+        status=task.status,
+        wait_reason=task.wait_reason,
+        wake_at=task.wake_at,
+        attempts=task.attempts,
+        step_no=task.step_no,
+        created_at=task.created_at,
+        updated_at=task.updated_at,
+        label=_task_label(task, t),
+        error=error,
+        run_code=ctx.run_code(task.id),
+        history=_events(history)[-TASK_HISTORY:],
+        approval_ids=approval_ids,
+        outside=["error"] if error else [],
+    )
+
+
+def _linear_ids(ask: str | None, branch: str | None = None) -> list[str]:
+    seen: list[str] = []
+    for m in _LINEAR.finditer((ask or "")[:2000]):
+        if m.group(1) not in seen:
+            seen.append(m.group(1))
+    keys = {i.split("-", 1)[0] for i in seen}
+    text = (branch or "")[:300]
+    for m in _LINEAR_BRANCH.finditer(text):
+        key = m.group(1).upper()
+        starts_segment = m.start() == 0 or text[m.start() - 1] == "/"
+        ident = f"{key}-{m.group(2)}"
+        if (key in keys or starts_segment) and ident not in seen:
+            seen.append(ident)
+    return seen[:RUN_LINEAR_IDS]
+
+
+def _run_item(
+    r: runs.Run,
+    conn: sqlite3.Connection,
+    ctx: _Context,
+    t: _Text,
+    reports: Any,
+    *,
+    detail: bool,
+    detected: Sequence[tuple[EffectKind, str, bool]],
+    history: Sequence[tuple[datetime, str]],
+    github_repo: str | None,
+    approval_ids: list[str],
+    question_ids: list[int],
+) -> RunItem:
+    did = t.many(reports.did_list(conn, r.code)[-RUN_DID:], 80) if detail else []
+    effects = (
+        [
+            RunEffect(kind=k, what=t(what, 80), high=high)
+            for k, what, high in detected[-RUN_EFFECTS:]
+        ]
+        if detail
+        else []
+    )
+    flagged = t.many(r.flagged_paths[:RUN_FLAGGED], 120) if detail else []
+    summary = t.opt(r.summary, 800) if detail else None
+    failure = t.opt(r.failure, 400) if detail else None
+    note = t.opt(r.last_note, 200)
+    merged_by = reports.merged_by_of(conn, r.code)
+    outside = [
+        name
+        for name, present in (
+            ("summary", summary),
+            ("failure", failure),
+            ("last_note", note),
+            ("did", did),
+            ("effects", effects),
+            ("flagged_paths", flagged),
+        )
+        if present
+    ]
+    if ctx.tainted(r.task_id):
+        outside.insert(0, "ask")
+    return RunItem(
+        code=t(r.code, 16),
+        state=r.status,
+        waiting_reason=r.wait_reason if r.status == "waiting" else None,
+        started_at=r.started_at,
+        ended_at=r.ended_at,
+        detected=len(detected),
+        repo=t(r.repo, 100),
+        ask=t(r.ask, 300),
+        branch=t.opt(r.branch, 120),
+        base_branch=t.opt(r.base_branch, 120),
+        head_sha=r.head_sha if r.head_sha and _HEAD_SHA.fullmatch(r.head_sha) else None,
+        pr_url=r.pr_url if r.pr_url and _PR_URL.fullmatch(r.pr_url) else None,
+        pr_number=r.pr_number,
+        github_repo=t.opt(github_repo, 100),
+        created_at=r.created_at,
+        remote_url=r.remote_url if r.status == "running" else None,
+        task_id=t.opt(r.task_id, 64),
+        step=r.step,
+        attempts=r.attempts,
+        sessions=r.sessions,
+        exit_code=r.exit_code,
+        cost_usd=r.cost_usd,
+        tokens_in=r.tokens_in,
+        tokens_out=r.tokens_out,
+        session_seconds=r.session_seconds,
+        wait_seconds=r.wait_seconds,
+        files_changed=r.files_changed,
+        flagged_paths=flagged,
+        summary=summary,
+        failure=failure,
+        last_note=note,
+        did=did,
+        effects=effects,
+        merged=t.many(reports.merged_list(conn, r.code)[:RUN_MERGED], 40),
+        merged_by=None if merged_by is None else merged_by.by,
+        history=_events(history, strip="run.")[-RUN_HISTORY:] if detail else [],
+        approval_ids=approval_ids,
+        question_ids=question_ids,
+        linear_ids=_linear_ids(r.ask, r.branch),
+        detail=detail,
+        outside=outside,
+    )
+
+
+def _detected(
+    conn: sqlite3.Connection, code: str, reports: Any
+) -> list[tuple[EffectKind, str, bool]]:
+    """Run ``code``'s detected side effects as (kind, what, high), unknown kinds left out."""
     # ``detected_list`` casts the stored kind unchecked: a stale kv row can hold anything.
-    return [(e.kind, e.high) for e in detected_list(conn, code) if e.kind in _EFFECT_KINDS]
+    return [
+        (cast(EffectKind, e.kind), cast(str, e.what), cast(bool, e.high))
+        for e in reports.detected_list(conn, code)
+        if e.kind in _EFFECT_KINDS
+    ]
 
 
-def _detected_counts(per_run: Iterable[list[tuple[EffectKind, bool]]]) -> DetectedEffects:
+def _detected_counts(per_run: Iterable[Sequence[tuple[EffectKind, str, bool]]]) -> DetectedEffects:
     by_kind: dict[EffectKind, int] = {}
     high = 0
     for effects in per_run:
-        for kind, is_high in effects:
+        for kind, _what, is_high in effects:
             by_kind[kind] = by_kind.get(kind, 0) + 1
             high += is_high
     return DetectedEffects(by_kind=by_kind, high=high)
 
 
+def _pulse_item(i: pulse.Item, t: _Text) -> PulseItem:
+    from resonant.extensions.pulse_job import CORE, NOTICE_PREFIX  # a cycle at import time
+
+    code = _RUN_KEY.fullmatch(i.key) if i.source == CORE else None
+    notice = i.source == CORE and i.key.startswith(NOTICE_PREFIX)  # mirrors ``is_outside``
+    return PulseItem(
+        source=t(i.source, 64),
+        key=t(i.key, 120),
+        title=t(i.title, 200),
+        urgency=i.urgency,
+        state="new" if i.changed else "told",
+        updated_at=i.updated_at,
+        expires_at=i.expires_at,
+        told_at=i.told_at,
+        run_code=None if code is None else code.group(1).upper(),
+        outside=[] if notice else ["title"],
+    )
+
+
 def _approval_items(
-    conn: sqlite3.Connection, pending: Sequence[approvals.Approval]
-) -> list[tuple[ApprovalItem, ApprovalBrief]]:
-    """``pending`` (oldest first) as what one answer decides, each row with its text-free
-    brief for both tiers (R5; a batch's brief takes its strictest level and effect, and needs
-    the code as the gate does): each lone approval, and each
-    batch (BA-1) once, where its oldest pending approval is. One answer decides all of it
-    (``yes`` / ``no``, or ``yes 1,3`` for some and the rest dropped, PER-255), so it is one
-    row. A batch's code is its first approval's and its
-    changes are in its order (both as its prompt showed them); it expires as one. A batch
-    whose approvals aren't all pending any more (one decided on its own: a race) can't be
-    answered as one (the gate's ``_units``; the runner drops the rest), so what is left of it
-    shows as lone rows, never under a code that no longer binds."""
-    index = approvals.batches_of(conn, [a.id for a in pending])
-    by_id = {a.id: a for a in pending}
-    out: list[tuple[ApprovalItem, ApprovalBrief]] = []
+    conn: sqlite3.Connection,
+    rows: Sequence[approvals.Approval],
+    ctx: _Context,
+    t: _Text,
+    *,
+    pending: bool,
+) -> list[ApprovalItem]:
+    """``rows`` as what one answer decides: each lone approval, and each batch (BA-1) once,
+    where its first row is. One answer decides all of a batch (``yes`` / ``no``, or ``yes
+    1,3`` for some and the rest dropped, PER-255), so it is one row. Its id and code are its
+    first approval's and its changes are in its order (both as its prompt showed them); it
+    expires as one. A batch whose approvals aren't all in ``rows`` (one decided on its own: a
+    race) can't be answered as one (the gate's ``_units``; the runner drops the rest), so what
+    is left of it shows as lone rows, never under a code that no longer binds."""
+    index = approvals.batches_of(conn, [a.id for a in rows])
+    by_id = {a.id: a for a in rows}
+    out: list[ApprovalItem] = []
     seen: set[str] = set()
-    for a in pending:
+    for a in rows:
         batch = index.get(a.id)
         if batch is None or any(i not in by_id for i in batch.approval_ids):
-            item = ApprovalItem(
-                code=a.code,
-                summary=a.summary,
-                level=a.level.value,
-                asked_at=a.created_at,
-                expires_at=a.expires_at,
-            )
-            out.append((item, _approval_brief(item, [a], batch=False)))
+            out.append(_approval_item([a], batch=False, ctx=ctx, t=t, pending=pending))
             continue
         if batch.id in seen:
             continue
         seen.add(batch.id)
         members = [by_id[i] for i in batch.approval_ids]
-        item = ApprovalItem(
-            code=members[0].code,
-            summary=f"{len(members)} changes",
-            level=strictest([m.level for m in members]).value,
-            asked_at=batch.created_at,
-            expires_at=min(m.expires_at for m in members),
-            changes=[ApprovalChange(summary=change_line(m), level=m.level.value) for m in members],
+        out.append(
+            _approval_item(
+                members, batch=True, ctx=ctx, t=t, pending=pending, asked_at=batch.created_at
+            )
         )
-        out.append((item, _approval_brief(item, members, batch=True)))
     return out
 
 
 _EFFECT_RANK: Final[Mapping[str, int]] = {"read": 0, "write": 1, "pay": 2}
 
 
-def _approval_brief(
-    item: ApprovalItem, members: Sequence[approvals.Approval], *, batch: bool
-) -> ApprovalBrief:
-    """``item``'s row on both tiers: its level and times, the strictest effect of its
-    approvals, and whether a yes needs the code (as the gate's ``_Unit.needs_code``: any
-    approval needs it, or a batch has a change that widens trust). No summary and no code."""
+def _approval_item(
+    members: Sequence[approvals.Approval],
+    *,
+    batch: bool,
+    ctx: _Context,
+    t: _Text,
+    pending: bool,
+    asked_at: datetime | None = None,
+) -> ApprovalItem:
+    """One row: its level (a batch: the strictest), the strictest effect of its approvals,
+    and whether a yes needs the code (as the gate's ``_Unit.needs_code``: any approval needs
+    it, or a batch has a change that widens trust)."""
+    first = members[0]
     effect = max((m.effect.value for m in members), key=_EFFECT_RANK.__getitem__)
-    return ApprovalBrief(
-        level=item.level,
-        effect=cast(Literal["read", "write", "pay"], effect),
+    decided = [m.decided_at for m in members if m.decided_at is not None]
+    return ApprovalItem(
+        id=t(first.id, 64),
+        member_ids=[t(m.id, 64) for m in members],
+        code=first.code,
+        summary=t(f"{len(members)} changes" if batch else first.summary, 300),
+        level=strictest([m.level for m in members]).value,
+        effect=cast(EffectName, effect),
         needs_code=any(m.require_code for m in members)
         or (batch and any(widens_trust(m.tool, m.extension) for m in members)),
-        asked_at=item.asked_at,
-        expires_at=item.expires_at,
+        tool=t(first.tool, 64),
+        extension=t.opt(first.extension, 64),
+        status="pending" if pending else first.status,
+        asked_at=asked_at or first.created_at,
+        expires_at=min(m.expires_at for m in members),
+        decided_at=None if pending or not decided else max(decided),
+        decided_by=None
+        if pending
+        else t.opt(next((m.decided_by for m in members if m.decided_by), None), 40),
+        task_id=t.opt(first.task_id, 64),
+        run_code=ctx.run_code(first.task_id),
+        changes=[
+            ApprovalChange(summary=t(change_line(m), 200), level=m.level.value)
+            for m in members[:APPROVAL_CHANGES]
+        ]
+        if batch
+        else None,
+        outside=["summary", "changes"] if ctx.tainted(first.task_id) else [],
     )
-
-
-_URGENCY_RANK: Final[Mapping[str, int]] = {u: n for n, u in enumerate(pulse.URGENCIES)}
 
 
 _RC_URL = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]{1,200}")
 
 
-def _claude_brain(conn: sqlite3.Connection) -> ClaudeBrain | None:
+def _claude_brain(conn: sqlite3.Connection, t: _Text) -> ClaudeBrain | None:
     found = claude_status(conn)
     if found is None:
         return None
@@ -819,40 +1429,29 @@ def _claude_brain(conn: sqlite3.Connection) -> ClaudeBrain | None:
         state="up" if up else "down",
         turns=int(found.get("turns") or 0),
         remote_url=url if up and isinstance(url, str) and _RC_URL.fullmatch(url) else None,
-        tools=_brain_tools(conn),
+        tools=_brain_tools(conn, t),
     )
 
 
-def _brain_tools(conn: sqlite3.Connection) -> list[BrainTool]:
+def _brain_tools(conn: sqlite3.Connection, t: _Text) -> list[BrainTool]:
     out: list[BrainTool] = []
     for row in recent_tools(conn, BRAIN_TOOL_ITEMS):
         try:
             out.append(
                 BrainTool(
                     at=datetime.fromisoformat(str(row.get("at"))),
-                    tool=str(row.get("tool") or "?")[:64],
-                    decision=str(row.get("decision") or "?")[:16],
-                    command=str(row.get("command") or "")[:200],
-                    cwd=str(row.get("cwd") or "")[:300],
+                    tool=t(str(row.get("tool") or "?"), 64),
+                    decision=t(str(row.get("decision") or "?"), 16),
+                    command=t(str(row.get("command") or ""), 200),
+                    cwd=t(str(row.get("cwd") or ""), 120),
                     status="error" if row.get("status") == "error" else "ok",
                     write=row.get("write") is True,
+                    outside=["command"],
                 )
             )
         except ValueError:
             continue
     return out
-
-
-_DECISIONS: frozenset[str] = frozenset(get_args(BrainDecision))
-
-
-def _tool_kind(name: str) -> str:
-    """A tool's name as a slug for the remote tier: ``Bash`` is ``bash``, every MCP tool is
-    ``mcp`` (its server and tool names stay local), anything else not a slug is ``other``."""
-    if name.startswith("mcp__"):
-        return "mcp"
-    kind = name.lower()
-    return kind if _ident(kind) else "other"
 
 
 def _brain_activity(
@@ -866,18 +1465,6 @@ def _brain_activity(
         writes_today=counts["writes"],
         state=None if brain is None else brain.state,
         turns=0 if brain is None else brain.turns,
-        recent=[]
-        if brain is None
-        else [
-            BrainToolBrief(
-                at=t.at,
-                tool=_tool_kind(t.tool),
-                decision=cast(BrainDecision, t.decision if t.decision in _DECISIONS else "other"),
-                status=t.status,
-                write=t.write,
-            )
-            for t in brain.tools[:BRAIN_BRIEF_ITEMS]
-        ],
     )
 
 

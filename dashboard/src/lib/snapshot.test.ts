@@ -1,32 +1,45 @@
 import { describe, expect, it } from "vitest";
-import { empty, local, remote } from "@/test/fixtures";
-import { clone } from "@/test/fixtures";
-import { assertSnapshot, forTier, isSnapshot, ordered, RUN_STATE_ORDER, safeHttpsUrl, staleness, sum, worstHealth } from "./snapshot";
+import type { Snapshot } from "@/types";
+import { clone, empty, local, remote, remoteV1, remoteV1Raw } from "@/test/fixtures";
+import {
+  assertSnapshot,
+  githubLinks,
+  isSnapshot,
+  normalize,
+  ordered,
+  RUN_STATE_ORDER,
+  safeHttpsUrl,
+  snapshotProblem,
+  staleness,
+  sum,
+  worstHealth,
+} from "./snapshot";
 
 describe("snapshot fixtures", () => {
   it("are valid snapshots", () => {
-    for (const s of [local, remote, empty]) expect(isSnapshot(s)).toBe(true);
+    for (const s of [local, remote, empty, remoteV1Raw]) expect(isSnapshot(s)).toBe(true);
   });
 
-  it("keep remote a strict subset with no text fields (plan §1 D3)", () => {
+  it("have the same shape on both tiers apart from the two local-only fields", () => {
     expect(remote.tier).toBe("remote");
-    for (const h of remote.health) expect(h).not.toHaveProperty("reason");
-    expect(remote.runs).not.toHaveProperty("items");
-    expect(remote.approvals).not.toHaveProperty("items");
-    expect(remote.questions).not.toHaveProperty("items");
-    expect(remote.pulse).not.toHaveProperty("items");
-    expect(remote.runner).not.toHaveProperty("missing");
-    expect(remote).not.toHaveProperty("trust_rules");
-    expect(remote).not.toHaveProperty("repos");
-    // Every remote key exists in the local tier.
-    for (const k of Object.keys(remote)) expect(local).toHaveProperty(k);
+    const expected = structuredClone(local) as Snapshot;
+    expected.tier = "remote";
+    for (const r of expected.runs.items) delete r.remote_url;
+    for (const a of [...expected.approvals.items, ...expected.approvals.recent]) delete a.code;
+    delete expected.claude_brain?.remote_url;
+    expect(remote).toEqual(expected);
+    expect(JSON.stringify(remote)).not.toContain("remote_url");
+    for (const a of [...remote.approvals.items, ...remote.approvals.recent]) expect(a).not.toHaveProperty("code");
+    expect(local.approvals.items[0]).toHaveProperty("code");
   });
 });
 
 describe("helpers", () => {
-  it("rejects other schemas", () => {
-    expect(() => assertSnapshot({ ...local, schema: 2 })).toThrow(/schema 2/);
+  it("accepts schema 1 and 2 and rejects others", () => {
+    expect(snapshotProblem({ ...local, schema: 3 })).toMatch(/unsupported schema 3/);
+    expect(() => assertSnapshot({ ...local, schema: 3 })).toThrow(/schema 3/);
     expect(() => assertSnapshot("<html>")).toThrow(/Not a valid dashboard snapshot/);
+    expect(snapshotProblem(remoteV1Raw)).toBeNull();
   });
 
   it("names the first missing or malformed field", () => {
@@ -39,6 +52,23 @@ describe("helpers", () => {
     expect(() => assertSnapshot({ ...local, repos: {} })).toThrow("(repos)");
     expect(() => assertSnapshot({ ...local, pulse: { open: 3, untold: "2" } })).toThrow("(pulse.untold)");
     expect(() => assertSnapshot({ ...local, runs: { by_state: {}, detected: { high: 0 } } })).toThrow("(runs.detected)");
+  });
+
+  it("checks the v2 lists", () => {
+    const without = (path: [string, string?]) => {
+      const c = structuredClone(local) as unknown as Record<string, Record<string, unknown>>;
+      if (path[1]) delete c[path[0]]![path[1]];
+      else delete (c as Record<string, unknown>)[path[0]];
+      return c;
+    };
+    expect(snapshotProblem(without(["limits"]))).toBe("limits");
+    expect(snapshotProblem(without(["tasks", "items"]))).toBe("tasks.items");
+    expect(snapshotProblem(without(["runs", "items"]))).toBe("runs.items");
+    expect(snapshotProblem(without(["approvals", "recent"]))).toBe("approvals.recent");
+    expect(snapshotProblem(without(["questions", "items"]))).toBe("questions.items");
+    expect(snapshotProblem(without(["pulse", "items"]))).toBe("pulse.items");
+    expect(snapshotProblem(without(["core_jobs"]))).toBe("core_jobs");
+    expect(snapshotProblem(without(["trust_rules"]))).toBe("trust_rules");
   });
 
   it("ranks health", () => {
@@ -59,54 +89,86 @@ describe("helpers", () => {
   });
 });
 
-describe("forTier", () => {
-  it("strips local-only fields from a remote snapshot that carries them", () => {
-    const leaky = clone(local, {
-      tier: "remote",
-      claude_brain: { state: "up", turns: 3, remote_url: "https://claude.ai/code/x" },
-    });
-    const out = forTier(leaky);
-    expect(out.runs.items).toBeUndefined();
-    expect(out.approvals.items).toBeUndefined();
-    expect(out.questions.items).toBeUndefined();
-    expect(out.pulse.items).toBeUndefined();
-    expect(out.runner.missing).toBeUndefined();
-    expect(out.trust_rules).toBeUndefined();
-    expect(out.repos).toBeUndefined();
-    expect(out.claude_brain).toBeUndefined();
-    for (const h of out.health) expect(h.reason).toBeUndefined();
-    expect(out.approvals.open).toBe(2);
-    // PER-263: the remote counts stay.
-    expect(out.pulse.untold).toBe(2);
-    expect(out.runs.detected).toEqual({ by_kind: { push: 1, http: 1, merge: 1 }, high: 1 });
+describe("normalize", () => {
+  it("returns a v2 snapshot as it is", () => {
+    expect(normalize(local)).toBe(local);
+    expect(assertSnapshot(local)).toBe(local);
+    expect(local).not.toHaveProperty("legacy");
   });
 
-  it("adds no PER-263 keys to an older remote snapshot", () => {
-    const old = clone(remote);
-    delete old.pulse.untold;
-    delete old.runs.detected;
-    const out = forTier(old);
-    expect(out.pulse).not.toHaveProperty("untold");
-    expect(out.pulse.open).toBe(3);
-    expect(out.runs).not.toHaveProperty("detected");
+  it("maps a v1 remote snapshot's briefs onto v2 rows with no detail", () => {
+    const n = remoteV1;
+    expect(n.schema).toBe(2);
+    expect(n.legacy).toBe(true);
+    expect(n.trimmed).toBe("none");
+    expect(n.limits.runs).toBe(50);
+    expect(n.runs.items.map((r) => r.code)).toEqual(remoteV1Raw.runs.brief!.map((r) => r.code));
+    expect(n.runs.items[0]).toMatchObject({ ask: "", repo: "", detail: false, did: [], history: [], github_repo: null });
+    expect(n.approvals.items).toHaveLength(remoteV1Raw.approvals.brief!.length);
+    expect(n.approvals.items[0]).toMatchObject({ summary: "", effect: "write", needs_code: true, status: "pending" });
+    expect(n.approvals.recent).toEqual([]);
+    expect(n.questions.items[0]).toMatchObject({ run_code: "R11", text: "", options: [] });
+    expect(n.pulse.items).toHaveLength(remoteV1Raw.pulse.brief!.length);
+    expect(n.pulse.untold).toBe(2);
+    expect(n.tasks).toEqual({ by_state: remoteV1Raw.tasks.by_state, items: [] });
+    expect(n.core_jobs).toEqual([]);
+    expect(n.runs.detected.high).toBe(1);
+    expect(n.extensions[0]).toMatchObject({ tools: [], mcp_servers: [], secrets: [], description: null });
+    expect(n.brain_activity).toMatchObject({ calls_today: 4, state: "up", turns: 3 });
+    // The brain's last calls become tool rows with no command.
+    expect(n.claude_brain?.tools).toHaveLength(2);
+    expect(n.claude_brain?.tools[0]).toMatchObject({ tool: "bash", command: "", outside: [] });
   });
 
-  it("keeps the briefs but only their known fields", () => {
+  it("fills missing optional v1 parts with empty values", () => {
+    const old = structuredClone(remoteV1Raw) as unknown as Record<string, Record<string, unknown>>;
+    delete old.runs!.brief;
+    delete old.approvals!.brief;
+    delete old.pulse!.untold;
+    delete old.runs!.detected;
+    delete old.brain_activity;
+    const n = normalize(old as never);
+    expect(n.runs.items).toEqual([]);
+    expect(n.approvals.items).toEqual([]);
+    expect(n.pulse.untold).toBe(0);
+    expect(n.runs.detected).toEqual({ by_kind: {}, high: 0 });
+    expect(n.brain_activity).toEqual({ calls_today: 0, writes_today: 0, state: null, turns: 0 });
+    expect(n.claude_brain).toBeNull();
+  });
+
+  it("maps v1 local items (texts, codes) too", () => {
+    const v1 = {
+      ...structuredClone(remoteV1Raw),
+      tier: "local" as const,
+      runs: {
+        by_state: { running: 1 },
+        items: [
+          {
+            code: "R1", state: "running", repo: "resonant", ask: "Do it", branch: "b", pr_url: null, pr_number: null,
+            started_at: "2026-10-16T08:00:00+00:00", ended_at: null, waiting_reason: null, last_note: "ok",
+          },
+        ],
+      },
+      approvals: {
+        open: 1,
+        items: [{ code: "K7", summary: "merge it", level: "L1", asked_at: "2026-10-16T08:00:00+00:00", expires_at: null }],
+      },
+    };
+    const n = normalize(v1);
+    expect(n.runs.items[0]).toMatchObject({ ask: "Do it", repo: "resonant", branch: "b", last_note: "ok" });
+    expect(n.approvals.items[0]).toMatchObject({ code: "K7", summary: "merge it", needs_code: true });
+  });
+
+  it("drops the local-only fields from a remote snapshot that carries them", () => {
     const leaky = clone(local, { tier: "remote" });
-    (leaky.runs.brief![0] as unknown as Record<string, unknown>).ask = "leaked ask";
-    (leaky.brain_activity!.recent![0] as unknown as Record<string, unknown>).command = "git push";
-    const out = forTier(leaky);
-    expect(out.runs.brief).toHaveLength(4);
-    expect(out.runs.brief![0]).not.toHaveProperty("ask");
-    expect(out.approvals.brief).toHaveLength(1);
-    expect(out.questions.brief?.[0]?.run_code).toBe("R11");
-    expect(out.pulse.brief).toHaveLength(3);
-    expect(out.brain_activity!.recent![0]).not.toHaveProperty("command");
-    expect(JSON.stringify(out)).not.toContain("leaked ask");
-  });
-
-  it("leaves a local snapshot alone", () => {
-    expect(forTier(local)).toBe(local);
+    const n = normalize(leaky);
+    expect(n.runs.items.some((r) => "remote_url" in r)).toBe(false);
+    expect(n.approvals.items.some((a) => "code" in a)).toBe(false);
+    expect(n.claude_brain).not.toHaveProperty("remote_url");
+    expect(JSON.stringify(n)).not.toContain("claude.ai/code");
+    expect(JSON.stringify(n)).not.toContain("K7Q2");
+    // A local snapshot keeps them.
+    expect(normalize(local).runs.items[0]).toHaveProperty("remote_url");
   });
 });
 
@@ -143,5 +205,34 @@ describe("safeHttpsUrl", () => {
     expect(safeHttpsUrl("https://user:pw@github.com/a")).toBeNull();
     expect(safeHttpsUrl("not a url")).toBeNull();
     expect(safeHttpsUrl(null)).toBeNull();
+  });
+});
+
+describe("githubLinks", () => {
+  const base = {
+    pr_url: "https://github.com/example/resonant/pull/81",
+    github_repo: "example/resonant",
+    branch: "resonant/r10-quiet hours",
+    head_sha: "9f8e7d6c5b",
+  };
+
+  it("builds the PR, branch and commit links on github.com", () => {
+    expect(githubLinks(base)).toEqual({
+      pr: "https://github.com/example/resonant/pull/81",
+      branch: "https://github.com/example/resonant/tree/resonant/r10-quiet%20hours",
+      commit: "https://github.com/example/resonant/commit/9f8e7d6c5b",
+    });
+  });
+
+  it("has no branch or commit link without a GitHub repo", () => {
+    expect(githubLinks({ ...base, github_repo: null })).toEqual({ pr: base.pr_url, branch: null, commit: null });
+  });
+
+  it("refuses other hosts, schemes and malformed slugs or shas", () => {
+    expect(githubLinks({ ...base, pr_url: "https://evil.example/pull/1" }).pr).toBeNull();
+    expect(githubLinks({ ...base, pr_url: "javascript:alert(1)" }).pr).toBeNull();
+    expect(githubLinks({ ...base, pr_url: "http://github.com/a/b/pull/1" }).pr).toBeNull();
+    expect(githubLinks({ ...base, github_repo: "a/b/../../evil" }).branch).toBeNull();
+    expect(githubLinks({ ...base, head_sha: "zzzz" }).commit).toBeNull();
   });
 });

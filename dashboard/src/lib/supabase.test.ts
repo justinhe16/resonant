@@ -1,27 +1,39 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { describe, expect, it, vi } from "vitest";
-import { remote } from "@/test/fixtures";
+import { remote, remoteV1Raw } from "@/test/fixtures";
 import { wrapSupabase } from "./supabase";
+
+type Row = { data: unknown; taken_at: string };
 
 interface FakeOpts {
   session?: boolean;
   aal?: "aal1" | "aal2";
   totp?: { id: string; status: string; factor_type?: string }[];
-  row?: unknown;
+  /** the history table's newest row */
+  row?: Row;
+  /** the one-row snapshot_latest table */
+  latest?: Row;
   rowError?: string;
 }
 
 function fake(o: FakeOpts) {
   const totp = (o.totp ?? []).map((f) => ({ factor_type: "totp", ...f }));
-  const query = {
-    select: vi.fn(() => query),
-    order: vi.fn(() => query),
-    limit: vi.fn(() => query),
-    maybeSingle: vi.fn(async () => ({
-      data: o.row ?? null,
-      error: o.rowError ? { message: o.rowError } : null,
-    })),
-  };
+  const queries: Record<string, { cols: string[]; query: Record<string, ReturnType<typeof vi.fn>> }> = {};
+  const from = vi.fn((table: string) => {
+    const cols: string[] = [];
+    const query: Record<string, ReturnType<typeof vi.fn>> = {};
+    query.select = vi.fn((c: string) => (cols.push(c), query));
+    query.order = vi.fn(() => query);
+    query.limit = vi.fn(() => query);
+    query.maybeSingle = vi.fn(async () => {
+      const row = table === "snapshot_latest" ? o.latest : o.row;
+      // A column list of just taken_at returns just that.
+      const data = row && cols.at(-1) === "taken_at" ? { taken_at: row.taken_at } : (row ?? null);
+      return { data, error: o.rowError ? { message: o.rowError } : null };
+    });
+    queries[table] = { cols, query };
+    return query;
+  });
   const auth = {
     getSession: vi.fn(async () => ({ data: { session: o.session ? {} : null }, error: null })),
     signInWithPassword: vi.fn(async () => ({ data: {}, error: null })),
@@ -39,8 +51,8 @@ function fake(o: FakeOpts) {
       challengeAndVerify: vi.fn(async () => ({ data: {}, error: null })),
     },
   };
-  const sb = { auth, from: vi.fn(() => query) } as unknown as SupabaseClient;
-  return { sb, auth, query };
+  const sb = { auth, from } as unknown as SupabaseClient;
+  return { sb, auth, from, queries };
 }
 
 describe("wrapSupabase", () => {
@@ -61,13 +73,46 @@ describe("wrapSupabase", () => {
     await expect(wrapSupabase(f.sb).signIn("a@b.c", "x")).rejects.toThrow("Invalid login");
   });
 
-  it("reads the newest snapshot row", async () => {
-    const f = fake({ row: { data: remote, taken_at: remote.taken_at } });
+  it("reads the one-row snapshot_latest table", async () => {
+    const f = fake({ latest: { data: remote, taken_at: remote.taken_at } });
     const snap = await wrapSupabase(f.sb).latest();
     expect(snap?.tier).toBe("remote");
-    expect(f.sb.from).toHaveBeenCalledWith("snapshots");
-    expect(f.query.order).toHaveBeenCalledWith("taken_at", { ascending: false });
-    expect(f.query.limit).toHaveBeenCalledWith(1);
+    expect(f.from).toHaveBeenCalledWith("snapshot_latest");
+    expect(f.from).not.toHaveBeenCalledWith("snapshots");
+  });
+
+  it("fetches the body only when taken_at changed", async () => {
+    const f = fake({ latest: { data: remote, taken_at: remote.taken_at } });
+    const client = wrapSupabase(f.sb);
+    const first = await client.latest();
+    const second = await client.latest();
+    expect(second).toBe(first); // the cached one
+    const selects = f.from.mock.results.map((r) => (r.value as { select: { mock: { calls: string[][] } } }).select.mock.calls[0]![0]);
+    expect(selects).toEqual(["taken_at", "data, taken_at", "taken_at"]); // body once, time twice
+  });
+
+  it("fetches again when a newer snapshot arrives", async () => {
+    const o: FakeOpts = { latest: { data: remote, taken_at: remote.taken_at } };
+    const f = fake(o);
+    const client = wrapSupabase(f.sb);
+    await client.latest();
+    const newer = { ...remote, taken_at: "2026-10-16T09:01:00+00:00" };
+    o.latest = { data: newer, taken_at: newer.taken_at };
+    expect((await client.latest())?.taken_at).toBe(newer.taken_at);
+  });
+
+  it("falls back to the newest history row when snapshot_latest is empty", async () => {
+    const f = fake({ row: { data: remoteV1Raw, taken_at: remoteV1Raw.taken_at } });
+    const snap = await wrapSupabase(f.sb).latest();
+    expect(snap?.legacy).toBe(true);
+    expect(f.from).toHaveBeenCalledWith("snapshots");
+    expect(f.queries.snapshots!.query.order).toHaveBeenCalledWith("taken_at", { ascending: false });
+    expect(f.queries.snapshots!.query.limit).toHaveBeenCalledWith(1);
+  });
+
+  it("treats a slim history row as no snapshot", async () => {
+    const slim = { schema: 2, tier: "remote", taken_at: remote.taken_at, slim: true, health: [], counts: {} };
+    expect(await wrapSupabase(fake({ row: { data: slim, taken_at: slim.taken_at } }).sb).latest()).toBeNull();
   });
 
   it("returns null with no rows and throws on errors", async () => {

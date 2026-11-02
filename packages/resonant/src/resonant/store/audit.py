@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 from resonant.store.db import now_iso
+
+RUN_EVENT_SCAN = 20_000  # rows of the audit log ``run_events`` looks at, newest first
+EVENT_NAME = re.compile(r"^[a-z][a-z0-9._:-]{0,63}$")
 
 
 def audit(
@@ -47,3 +53,59 @@ def audit(
             trace_id,
         ),
     )
+
+
+def run_events(
+    conn: sqlite3.Connection, runs: Sequence[tuple[str, str | None]], per_run: int = 12
+) -> dict[str, list[tuple[datetime, str]]]:
+    """``run code -> [(at, action)]``, oldest first, the last ``per_run`` of each run's
+    ``run.*`` audit rows (``run.start``, ``run.ready``, ...). The log keeps 365 days and has
+    no index on ``detail``, so the scan is bounded twice: from the oldest ``run.start`` of
+    these runs' tasks (``audit_task`` index; a run with no task adds nothing, and without any
+    the scan starts at the beginning) and at ``RUN_EVENT_SCAN`` rows, newest first."""
+    if not runs:
+        return {}
+    codes = [code for code, _ in runs]
+    task_ids = [t for _, t in runs if t is not None]
+    floor = 0
+    if task_ids and len(task_ids) == len(runs):
+        row = conn.execute(
+            "SELECT MIN(id) FROM audit_log WHERE action = 'run.start'"
+            " AND task_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(task_ids),),
+        ).fetchone()
+        floor = int(row[0] or 0)
+    rows = conn.execute(
+        """SELECT at, action, json_extract(detail, '$.run') FROM audit_log
+               WHERE id >= ? AND action LIKE 'run.%'
+                 AND json_extract(detail, '$.run') IN (SELECT value FROM json_each(?))
+               ORDER BY id DESC LIMIT ?""",
+        (floor, json.dumps(codes), RUN_EVENT_SCAN),
+    ).fetchall()
+    out: dict[str, list[tuple[datetime, str]]] = {}
+    for at, action, code in rows:  # newest first
+        kept = out.setdefault(str(code), [])
+        if len(kept) < per_run:
+            kept.append((datetime.fromisoformat(at), action))
+    return {code: events[::-1] for code, events in out.items()}
+
+
+def task_events(
+    conn: sqlite3.Connection, task_ids: Sequence[str], per_task: int = 10
+) -> dict[str, list[tuple[datetime, str]]]:
+    """``task id -> [(at, action)]``, oldest first, the last ``per_task`` audit rows of each
+    task (the ``audit_task`` index)."""
+    if not task_ids:
+        return {}
+    rows = conn.execute(
+        """SELECT task_id, at, action FROM (
+               SELECT task_id, at, action, id, ROW_NUMBER() OVER (
+                   PARTITION BY task_id ORDER BY id DESC) AS n
+               FROM audit_log WHERE task_id IN (SELECT value FROM json_each(?)))
+           WHERE n <= ? ORDER BY task_id, id""",
+        (json.dumps(list(task_ids)), per_task),
+    ).fetchall()
+    out: dict[str, list[tuple[datetime, str]]] = {}
+    for task_id, at, action in rows:
+        out.setdefault(task_id, []).append((datetime.fromisoformat(at), action))
+    return out

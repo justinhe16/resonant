@@ -1,13 +1,18 @@
 import { ChevronDown, OctagonPause } from "lucide-react";
-import { Ago, Dot, Row, Rows, StateBadge } from "@/components/bits";
+import { Ago, Dot, OutsideText, Row, RouteLink, Rows, StateBadge } from "@/components/bits";
+import { Explainer } from "@/components/Explainer";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Separator } from "@/components/ui/separator";
-import { worstHealth } from "@/lib/snapshot";
+import type { ExplainerKey } from "@/lib/explainers";
+import { isOutside, worstHealth } from "@/lib/snapshot";
 import { duration } from "@/lib/time";
 import { healthTone } from "@/lib/tone";
 import type { Snapshot } from "@/types";
+
+/** Health rows with their own explainer (the relay is the dead-man switch). */
+const ROW_EXPLAINER: Record<string, ExplainerKey> = { relay: "relay", backup: "backups" };
 
 const HEADLINE = {
   ok: "All systems normal",
@@ -29,7 +34,10 @@ export function SystemStatus({ snap, now, stale }: { snap: Snapshot; now: number
   return (
     <Card className="[--card-spacing:--spacing(5)]">
       <CardHeader className="gap-2">
-        <p className="text-xs font-medium text-muted-foreground">System status</p>
+        <div className="flex items-center gap-1.5">
+          <p className="text-xs font-medium text-muted-foreground">System status</p>
+          <Explainer name="System status" text="status" />
+        </div>
         <div className="flex items-center gap-2.5">
           <Dot tone={healthTone(worst)} pulse={worst === "failing" && !stale} className="size-2.5" />
           <h1 className="text-xl font-semibold">
@@ -78,8 +86,15 @@ export function SystemStatus({ snap, now, stale }: { snap: Snapshot; now: number
                 {snap.health.map((h) => (
                   <Row key={h.name} className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <p className="font-mono text-sm">{h.name}</p>
-                      {h.reason && <p className="mt-0.5 text-xs text-muted-foreground">{h.reason}</p>}
+                      <p className="flex items-center gap-1 font-mono text-sm">
+                        <RouteLink to={{ kind: "health", name: h.name }}>{h.name}</RouteLink>
+                        {ROW_EXPLAINER[h.name] && <Explainer name={h.name} text={ROW_EXPLAINER[h.name]!} />}
+                      </p>
+                      {h.reason && (
+                        <p className="mt-0.5 text-xs text-muted-foreground">
+                          <OutsideText text={h.reason} outside={isOutside(h, "reason")} />
+                        </p>
+                      )}
                     </div>
                     <div className="flex shrink-0 flex-col items-end gap-1">
                       <StateBadge tone={healthTone(h.state)}>{h.state}</StateBadge>

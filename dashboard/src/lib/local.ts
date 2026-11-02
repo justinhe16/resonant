@@ -1,8 +1,8 @@
 import { assertSnapshot } from "@/lib/snapshot";
-import type { Snapshot } from "@/types";
+import type { Normalized } from "@/types";
 
 /** Reads the local tier from the daemon on loopback. */
-export async function loadLocal(signal?: AbortSignal, fetchImpl: typeof fetch = fetch): Promise<Snapshot> {
+export async function loadLocal(signal?: AbortSignal, fetchImpl: typeof fetch = fetch): Promise<Normalized> {
   const res = await fetchImpl("/api/dashboard", {
     cache: "no-store",
     headers: { accept: "application/json" },

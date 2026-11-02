@@ -1,16 +1,29 @@
 {
-  "schema": 1,
+  "schema": 2,
   "tier": "local",
-  "taken_at": "2026-10-16T09:00:00+00:00",
+  "taken_at": "2026-10-16T09:00:00Z",
   "version": "3ef397a1",
-  "started_at": "2026-10-16T08:58:00+00:00",
+  "started_at": "2026-10-16T08:58:00Z",
   "last_tick": null,
   "autonomy": "off",
   "paused": true,
   "dry_run": true,
+  "trimmed": "none",
+  "limits": {
+    "runs": 50,
+    "run_detail": 20,
+    "tasks": 50,
+    "task_detail": 20,
+    "approvals_recent": 20,
+    "approvals_pending": 20,
+    "questions": 20,
+    "pulse": 60,
+    "brain_tools": 20
+  },
   "health": [],
   "tasks": {
-    "by_state": {}
+    "by_state": {},
+    "items": []
   },
   "slots": {
     "used": 0,
@@ -18,12 +31,16 @@
   },
   "runs": {
     "by_state": {},
-    "detected": { "by_kind": {}, "high": 0 },
+    "detected": {
+      "by_kind": {},
+      "high": 0
+    },
     "items": []
   },
   "approvals": {
     "open": 0,
-    "items": []
+    "items": [],
+    "recent": []
   },
   "questions": {
     "open": 0,
@@ -35,13 +52,24 @@
     "items": []
   },
   "extensions": [],
+  "core_jobs": [],
   "runner": {
     "set_up": false,
     "missing": [
       "claude",
       "gh auth"
-    ]
+    ],
+    "gaps": 2
   },
   "trust_rules": [],
-  "repos": []
+  "repos": [],
+  "claude_brain": null,
+  "brain_activity": {
+    "calls_today": 0,
+    "writes_today": 0,
+    "state": null,
+    "turns": 0
+  },
+  "trust_rule_count": 0,
+  "repo_count": 0
 }
