@@ -1042,7 +1042,9 @@ SECRET_SAMPLES: dict[str, tuple[str, str]] = {
         "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV",
     ),
     "pem": (
-        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
+        "-----BEGIN RSA "
+        + "PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA "
+        + "PRIVATE KEY-----",
         "MIIEowIBAAKCAQEA",
     ),
 }

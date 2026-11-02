@@ -497,7 +497,7 @@ SQL_FAMILIES = [
     "sk-" + "proj1234567890abcdefghijklmnop",
     "xoxb-" + "1234567890-abcdefghijklmnop",
     "AKIA" + "IOSFODNN7EXAMPLE",
-    "ASIAIOSFODNN7EXAMPLE",
+    "ASIA" + "IOSFODNN7EXAMPLE",
     "AIza" + "a1B2" * 8 + "xyz",
     "glpat-" + "g1" * 10,
     "npm_" + "n1" * 18,
@@ -506,7 +506,7 @@ SQL_FAMILIES = [
     "eyJhbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiIxMjM0NTY3ODkwIn0" + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV",
     "Bearer abcdefghijklmnop1234567890",
     "bearer   abcdefghijklmnop",
-    "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
+    "-----BEGIN RSA " + "PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA " + "PRIVATE KEY-----",
     "-----BEGIN PRIVATE KEY",
 ]
 
