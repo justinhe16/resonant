@@ -551,6 +551,20 @@ async def test_a_no_holds_when_the_server_reverts(world: World) -> None:
     assert world.host.disabled_tools("mail") == {"sleep": "declined"}
 
 
+async def test_a_no_holds_across_a_restart_with_the_server_already_reverted(
+    world: World,
+) -> None:
+    world.knob("sleep_variant", "required")
+    await world.host.start_mcp()
+    await world.job()
+    assert world.reply("no").ok
+    world.knob("sleep_variant", "")
+    await world.restart()  # no job ran; the server is back to what was approved
+    assert world.host.disabled_tools("mail") == {"sleep": "declined"}
+    with pytest.raises(McpError, match="disabled"):
+        await world.host.mcp_handlers[("mail", "sleep")]({"seconds": 0}, _ctx())
+
+
 async def test_at_most_three_questions_a_day_per_tool(world: World) -> None:
     await world.host.start_mcp()
     for name in ("a", "b", "c", "d", "e"):
@@ -563,12 +577,25 @@ async def test_at_most_three_questions_a_day_per_tool(world: World) -> None:
     await world.relist()
     assert len(world.audits("ext.mcp_repin_capped")) == 2
     await world.job()
-    assert len(world.channel.prompts) == 1  # only the newest pending one is prompted
+    assert world.channel.prompts == []  # c's question is stale (the server moved on): expired
+    assert world.rows()[2].status == "expired"
     assert world.host.disabled_tools("mail") == {}
     world.clock.advance(hours=25)  # a new day, a newer change: asks again
     world.knob("sleep_variant", "req:f")
     await world.relist()
     assert len(world.rows()) == 4
+
+
+async def test_a_capped_tool_is_asked_again_once_the_window_passes(world: World) -> None:
+    await world.host.start_mcp()
+    for name in ("a", "b", "c", "d"):
+        world.knob("sleep_variant", f"req:{name}")
+        await world.relist()
+    assert len(world.rows()) == 3  # "d" was capped and nothing is pending for it
+    assert "sleep" not in world.host.loaded["mail"].mcp["fake"].pending
+    world.clock.advance(hours=25)
+    await world.relist()  # the same live pin, a later check
+    assert len(world.rows()) == 4 and world.rows()[-1].status == "pending"
 
 
 async def test_a_yes_that_no_longer_applies_says_so(world: World) -> None:

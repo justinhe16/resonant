@@ -506,7 +506,9 @@ def _names(schema: Mapping[str, Any]) -> set[str]:
     return {x for x in cast(list[Any], v) if isinstance(x, str)} if isinstance(v, list) else set()
 
 
-_PLAIN = re.compile(r"^[A-Za-z0-9_.\- ]{1,40}$")
+_PLAIN = re.compile(r"^[A-Za-z0-9_.\- ]{1,40}$")  # an enum/const value: spaces allowed
+_NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,40}$")  # a property, $defs or required name: none
+_REF = re.compile(r"^#/(\$defs|definitions)/[A-Za-z0-9_.\-]{1,40}$")  # a local def, by name
 _NAME_MAPS = ("properties", "patternProperties", "$defs", "definitions")
 
 
@@ -539,6 +541,8 @@ def _strings(schema: object, out: set[tuple[str, str]]) -> None:
             _values(value, out)
         elif key in ("pattern", "format") and isinstance(value, str):
             out.add(("pattern", value))
+        elif key == "$ref" and isinstance(value, str):
+            out.add(("ref", value))
         else:
             _strings(value, out)
 
@@ -557,13 +561,17 @@ def _values(value: object, out: set[tuple[str, str]]) -> None:
 
 def new_strings_plain(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
     """Whether every string ``new`` adds to ``old`` is plain: a name or enum/const value of
-    at most 40 letters, digits, ``_ . -`` and spaces. A new pattern, format or
+    at most 40 letters, digits, ``_ . -`` (a value may also hold spaces), and a ``$ref`` only
+    to a ``#/$defs/<name>`` of that kind. A new pattern, format or
     ``patternProperties`` key is never plain (conservative: regex text can say anything)."""
     before: set[tuple[str, str]] = set()
     after: set[tuple[str, str]] = set()
     _strings(old, before)
     _strings(new, after)
-    return all(kind != "pattern" and _PLAIN.match(text) for kind, text in after - before)
+    rules = {"name": _NAME, "value": _PLAIN, "ref": _REF}
+    return all(
+        kind in rules and rules[kind].match(text) is not None for kind, text in after - before
+    )
 
 
 def diff_input(old: Mapping[str, Any], new: Mapping[str, Any]) -> SchemaChange:
@@ -1260,8 +1268,8 @@ class McpServerRuntime:
                     self._migrate(tool, cast(str, got))
                     continue
             elif got == pin:
-                held = self.pending.pop(tool, None)  # the server went back to what was approved
-                if held is not None and self.declined is not None and self.declined(tool):
+                self.pending.pop(tool, None)  # the server went back to what was approved
+                if self.declined is not None and self.declined(tool):
                     self.disable(tool, "declined")  # a no holds until ext update
                 continue
             elif (
@@ -1282,7 +1290,11 @@ class McpServerRuntime:
         save lost)."""
         new = input_schema(entry)  # usable: ``got`` is not INVALID_PIN
         old = self.schemas.get(tool)
-        change = diff_input(old, new) if old is not None else SchemaChange((), (), (), (), (), True)
+        change = (
+            diff_input(old, new)
+            if old is not None
+            else SchemaChange((), (), (), (), (), True, True)
+        )
         effect = self.effects.get(tool)
         # New server text the model would read is never accepted unseen, a read tool too.
         if (effect == "read" and not change.unplain) or (
@@ -1297,10 +1309,12 @@ class McpServerRuntime:
         if self.on_pending is None:
             return True
         try:
-            answer, _ = self.on_pending(self.server_id, tool, got, new, change)
+            answer, asked = self.on_pending(self.server_id, tool, got, new, change)
         except Exception:
             log.exception("mcp re-pin question failed")
             return True  # keep it as it is
+        if answer == "keep" and asked is None:
+            self.pending.pop(tool, None)  # nothing was asked (capped, no owner): try again later
         if answer == "accept":
             return self._accept(tool, got, new, change, "owner")
         if answer == "off":
