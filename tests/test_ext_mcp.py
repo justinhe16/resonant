@@ -54,7 +54,10 @@ from resonant.extensions.mcp import (
     McpSession,
     McpToolError,
     McpToolHandler,
+    PendingAnswer,
+    SchemaChange,
     approve,
+    diff_input,
     discover,
     input_schema,
     parse_pins,
@@ -130,8 +133,46 @@ class DriftLog(list[tuple[str, str | None]]):
         self.append((tool, live))
 
 
+class RepinLog(list[tuple[str, str, str, str]]):
+    """An ``on_repin`` that records ``(tool, old pin, new pin, how)`` and saves."""
+
+    saved = True
+
+    def __call__(
+        self,
+        server: str,
+        tool: str,
+        old: str,
+        new: str,
+        schema: dict[str, Any],
+        change: SchemaChange,
+        how: str,
+    ) -> bool:
+        if self.saved:
+            self.append((tool, old, new, how))
+        return self.saved
+
+
+class AskLog(list[tuple[str, str, SchemaChange]]):
+    """An ``on_pending`` that records ``(tool, live pin, change)`` and answers ``answer``."""
+
+    answer: PendingAnswer = "keep"
+
+    def __call__(
+        self, server: str, tool: str, live: str, schema: dict[str, Any], change: SchemaChange
+    ) -> tuple[PendingAnswer, str | None]:
+        self.append((tool, live, change))
+        return self.answer, None
+
+
 def manifest(text: str = MANIFEST) -> Manifest:
     return Manifest.model_validate(parse_yaml(text))
+
+
+def effects_of() -> dict[str, str]:
+    mcp = manifest().mcp
+    assert mcp is not None
+    return {t.name: t.effect.value for _, t in mcp.tools()}
 
 
 def write_ext(root: Path, text: str = MANIFEST) -> Path:
@@ -443,6 +484,74 @@ def test_server_argv(tmp_path: Path) -> None:
         server_argv(root, "./gone.py", (), None)
 
 
+# --- PER-275: how a schema changed ---------------------------------------------------------
+
+BASE: dict[str, Any] = {
+    "type": "object",
+    "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+    "required": ["a"],
+}
+
+
+def _with(**changes: Any) -> dict[str, Any]:
+    return {**BASE, **changes}
+
+
+def test_diff_input_identical_or_output_only_is_benign_and_empty() -> None:
+    change = diff_input(BASE, json.loads(json.dumps(BASE)))
+    assert change == SchemaChange((), (), (), (), (), False) and change.benign
+
+
+def test_diff_input_new_optional_properties_are_benign() -> None:
+    new = _with(properties={**BASE["properties"], "c": {"type": "string"}})
+    change = diff_input(BASE, new)
+    assert change.added_optional == ("c",) and change.benign
+    assert change.to_json()["added_optional"] == ["c"]
+
+
+@pytest.mark.parametrize(
+    ("new", "field"),
+    [
+        (_with(properties={**BASE["properties"], "c": {}}, required=["a", "c"]), "added_required"),
+        (_with(required=["a", "b"]), "added_required"),  # an existing field becomes required
+        (_with(properties={"a": {"type": "string"}}), "removed"),
+        (_with(properties={**BASE["properties"], "b": {"type": "string"}}), "changed"),
+        (_with(required=[]), "unrequired"),
+        (_with(additionalProperties=False), "other"),
+        (_with(anyOf=[{"required": ["a"]}]), "other"),
+        (_with(type="array"), "other"),
+    ],
+)
+def test_diff_input_anything_else_is_not_benign(new: dict[str, Any], field: str) -> None:
+    change = diff_input(BASE, new)
+    assert not change.benign and bool(getattr(change, field))
+
+
+def test_diff_input_defs_may_grow_but_not_change() -> None:
+    old = _with(**{"$defs": {"d": {"type": "string"}}})
+    grown = _with(
+        properties={**BASE["properties"], "c": {"$ref": "#/$defs/e"}},
+        **{"$defs": {"d": {"type": "string"}, "e": {"type": "integer"}}},
+    )
+    assert diff_input(old, grown).benign
+    changed = _with(**{"$defs": {"d": {"type": "integer"}}})
+    assert diff_input(old, changed).other
+    assert diff_input(old, BASE).other  # a def that vanished
+
+
+def test_diff_input_a_change_inside_an_existing_property_is_changed() -> None:
+    old = _with(properties={"a": {"type": "object", "properties": {"x": {"type": "string"}}}})
+    new = _with(
+        properties={
+            "a": {
+                "type": "object",
+                "properties": {"x": {"type": "string"}, "y": {"type": "string"}},
+            }
+        }
+    )
+    assert diff_input(old, new).changed == ("a",)
+
+
 # --- the runtime against the fake server ----------------------------------------------------
 
 
@@ -471,6 +580,10 @@ async def runtime(tmp_path: Path, ext_root: Path) -> AsyncIterator[McpServerRunt
         tracker=ProcessTracker(sample_s=0.2, grace_s=0.5),
         secrets=lambda: store,
         on_drift=drift,
+        effects=effects_of(),
+        schemas={name: p["input_schema"] for name, p in pins.items()},
+        on_repin=RepinLog(),
+        on_pending=AskLog(),
     )
     yield rt
     await rt.aclose()
@@ -579,18 +692,47 @@ async def test_aclose_kills_children_a_graceful_exit_leaves(
     assert runtime.tracker.live == 0
 
 
-async def test_pin_mismatch_at_start_disables_the_tool(
+async def test_read_tool_drift_at_start_is_repinned(
     runtime: McpServerRuntime, tmp_path: Path
 ) -> None:
     (tmp_path / "data").mkdir(exist_ok=True)
     (tmp_path / "data" / "schema").write_text("changed")
+    old = runtime.approved["echo"]
     await runtime.start()
-    assert runtime.disabled == {"echo": "changed"}
-    drift = cast(DriftLog, runtime.on_drift)
-    assert [t for t, _ in drift] == ["echo"] and drift[0][1] is not None
-    with pytest.raises(McpError, match="disabled"):
-        await runtime.call("echo", {"text": "x"}, 10)
-    assert "secrets" in (await runtime.call("whoami", {}, 10))["text"]  # others still work
+    assert runtime.disabled == {} and cast(DriftLog, runtime.on_drift) == []
+    repins = cast(RepinLog, runtime.on_repin)
+    assert [(t, o, h) for t, o, _, h in repins] == [("echo", old, "auto")]
+    assert runtime.approved["echo"] == repins[0][2] != old
+    assert "extra" in runtime.schemas["echo"]["properties"]
+    assert cast(AskLog, runtime.on_pending) == [] and runtime.pending == {}
+    assert (await runtime.call("echo", {"text": "x", "extra": 1}, 10))["text"] == "x"
+    assert "secrets" in (await runtime.call("whoami", {}, 10))["text"]
+
+
+async def test_write_tool_drift_keeps_the_old_schema_and_asks(
+    runtime: McpServerRuntime, tmp_path: Path
+) -> None:
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "sleep_variant").write_text("required")
+    old, old_schema = runtime.approved["sleep"], runtime.schemas["sleep"]
+    await runtime.start()
+    assert runtime.disabled == {} and cast(DriftLog, runtime.on_drift) == []
+    asks = cast(AskLog, runtime.on_pending)
+    assert [(t, c.added_required) for t, _, c in asks] == [("sleep", ("team",))]
+    assert runtime.approved["sleep"] == old and runtime.schemas["sleep"] == old_schema
+    assert runtime.pending["sleep"].pin == asks[0][1]
+    # Still callable on the OLD schema: old arguments pass, nothing new is demanded.
+    handler = McpToolHandler("mail", _spec(runtime, "sleep"), runtime)
+    assert not list(handler._validator().iter_errors({"seconds": 0}))  # pyright: ignore[reportPrivateUsage]
+    # A re-check of the same live pin doesn't ask again.
+    runtime._check(await discover(request(runtime.root, tmp_path / "data")))  # pyright: ignore[reportPrivateUsage]
+    assert len(asks) == 1
+
+
+def _spec(runtime: McpServerRuntime, tool: str) -> Any:
+    mcp = manifest().mcp
+    assert mcp is not None
+    return next(s for s in manifest().tool_specs() if s.name == tool)
 
 
 async def test_a_reworded_description_is_not_drift(
@@ -603,13 +745,136 @@ async def test_a_reworded_description_is_not_drift(
     assert (await runtime.call("echo", {"text": "x"}, 10))["text"] == "x"
 
 
-async def test_list_changed_rechecks_and_disables(runtime: McpServerRuntime) -> None:
+async def test_list_changed_repins_a_read_tool(runtime: McpServerRuntime) -> None:
     assert (await runtime.call("echo", {"text": "x"}, 10))["text"] == "x"
     await runtime.call("mutate", {}, 10)
+    assert (await runtime.call("echo", {"text": "x"}, 10))["text"] == "x"
+    assert runtime.disabled == {} and cast(DriftLog, runtime.on_drift) == []
+    assert [(t, h) for t, _, _, h in cast(RepinLog, runtime.on_repin)] == [("echo", "auto")]
+    assert "extra" in runtime.schemas["echo"]["properties"]
+
+
+@pytest.mark.parametrize(
+    ("variant", "auto"),
+    [("optional", True), ("output", True), ("required", False), ("retype", False)],
+)
+async def test_write_drift_repins_only_when_benign(
+    runtime: McpServerRuntime, tmp_path: Path, variant: str, auto: bool
+) -> None:
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "sleep_variant").write_text(variant)
+    await runtime.start()
+    repins = [t for t, *_ in cast(RepinLog, runtime.on_repin)]
+    asked = [t for t, *_ in cast(AskLog, runtime.on_pending)]
+    assert (repins, asked) == (["sleep"], []) if auto else ([], ["sleep"])
+    assert runtime.disabled == {}
+
+
+async def test_accept_pending_swaps_the_schema_and_a_revert_clears_it(
+    runtime: McpServerRuntime, tmp_path: Path
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "sleep_variant").write_text("required")
+    await runtime.start()
+    live = runtime.pending["sleep"].pin
+    assert not runtime.accept_pending("sleep", "0" * 64)  # another definition
+    assert runtime.accept_pending("sleep", live)
+    assert runtime.approved["sleep"] == live and runtime.pending == {}
+    assert runtime.schemas["sleep"]["required"] == ["team"]
+    assert [h for *_, h in cast(RepinLog, runtime.on_repin)] == ["owner"]
+    assert not runtime.accept_pending("sleep", live)  # once
+    # Pending, then the server goes back: nothing left to ask about.
+    (data / "sleep_variant").write_text("retype")
+    runtime._check(await discover(request(runtime.root, data)))  # pyright: ignore[reportPrivateUsage]
+    assert "sleep" in runtime.pending
+    (data / "sleep_variant").write_text("required")
+    runtime._check(await discover(request(runtime.root, data)))  # pyright: ignore[reportPrivateUsage]
+    assert runtime.pending == {}
+
+
+async def test_disable_turns_a_pending_tool_off_without_an_alert(
+    runtime: McpServerRuntime, tmp_path: Path
+) -> None:
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "sleep_variant").write_text("required")
+    await runtime.start()
+    runtime.disable("sleep", "declined")
+    assert runtime.disabled == {"sleep": "declined"} and runtime.pending == {}
+    assert cast(DriftLog, runtime.on_drift) == []
     with pytest.raises(McpError, match="disabled"):
-        await runtime.call("echo", {"text": "x"}, 10)
-    assert runtime.disabled == {"echo": "changed"}
+        await runtime.call("sleep", {"seconds": 0}, 10)
+
+
+async def test_a_no_bites_on_the_next_call(runtime: McpServerRuntime, tmp_path: Path) -> None:
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "sleep_variant").write_text("required")
+    await runtime.start()
+    said_no = [False]
+    runtime.declined = lambda tool: said_no[0]
+    said_no[0] = True
+    with pytest.raises(McpError, match="disabled"):
+        await runtime.call("sleep", {"seconds": 0}, 10)
+    assert runtime.disabled == {"sleep": "declined"}
+
+
+async def test_owner_answers_to_the_question(runtime: McpServerRuntime, tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "sleep_variant").write_text("required")
+    asks = cast(AskLog, runtime.on_pending)
+    asks.answer = "off"
+    await runtime.start()
+    assert runtime.disabled == {"sleep": "declined"} and cast(DriftLog, runtime.on_drift) == []
+    runtime.disabled.clear()
+    asks.answer = "accept"
+    runtime._check(await discover(request(runtime.root, data)))  # pyright: ignore[reportPrivateUsage]
+    assert runtime.schemas["sleep"]["required"] == ["team"] and runtime.pending == {}
+
+
+async def test_removed_tool_is_disabled_and_reported(
+    runtime: McpServerRuntime, tmp_path: Path
+) -> None:
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "sleep_variant").write_text("gone")
+    await runtime.start()
+    assert runtime.disabled == {"sleep": "removed"}
+    assert cast(DriftLog, runtime.on_drift) == [("sleep", None)]
+    assert cast(RepinLog, runtime.on_repin) == [] and runtime.pending == {}
+
+
+async def test_a_listed_twice_tool_stays_off_even_for_a_read_tool(
+    runtime: McpServerRuntime,
+) -> None:
+    runtime._check(  # pyright: ignore[reportPrivateUsage]
+        [{"name": "echo"}, {"name": "echo"}, *[{"name": n} for n in LISTED if n != "echo"]]
+    )
+    assert runtime.disabled.get("echo") == "changed"
+
+
+async def test_an_unusable_schema_is_off_not_repinned(runtime: McpServerRuntime) -> None:
+    bad = {"name": "echo", "inputSchema": {"type": "string"}}
+    runtime._check([bad, *[{"name": n, "inputSchema": {"type": "object"}} for n in LISTED[1:]]])  # pyright: ignore[reportPrivateUsage]
+    assert runtime.disabled["echo"] == "changed"
+    assert cast(DriftLog, runtime.on_drift)[0][0] == "echo"
+
+
+async def test_a_lost_save_turns_the_tool_off(runtime: McpServerRuntime, tmp_path: Path) -> None:
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "schema").write_text("changed")
+    cast(RepinLog, runtime.on_repin).saved = False  # a reinstall or update since load
+    old = runtime.approved["echo"]
+    await runtime.start()
+    assert runtime.disabled == {"echo": "changed"} and runtime.approved["echo"] == old
     assert [t for t, _ in cast(DriftLog, runtime.on_drift)] == ["echo"]
+
+
+async def test_a_runtime_built_by_hand_is_strict(runtime: McpServerRuntime, tmp_path: Path) -> None:
+    runtime.effects = {}  # unknown effects are writes that are never benign
+    (tmp_path / "data").mkdir(exist_ok=True)
+    (tmp_path / "data" / "schema").write_text("changed")
+    await runtime.start()
+    assert "echo" in runtime.pending and cast(RepinLog, runtime.on_repin) == []
 
 
 async def test_missing_secret_is_definite(runtime: McpServerRuntime) -> None:
@@ -685,12 +950,12 @@ async def test_host_refuses_missing_pins(
     assert "mail" not in h.loaded and "isn't pinned" in h.refused["mail"]
 
 
-async def test_host_drift_alerts_once_hides_the_tool_and_reports_health(
+async def test_host_drift_of_a_tool_listed_twice_alerts_once_hides_the_tool_and_reports_health(
     host: ExtensionHost, db: sqlite3.Connection, settings: Settings
 ) -> None:
     data = settings.ext_data_dir / "mail"
     data.mkdir(parents=True, exist_ok=True)
-    (data / "schema").write_text("v9")
+    (data / "sleep_variant").write_text("dup")  # listed twice: never re-pinned
     sent: list[int] = []
 
     async def alert() -> None:
@@ -699,17 +964,17 @@ async def test_host_drift_alerts_once_hides_the_tool_and_reports_health(
     host.alert = alert
     await host.start_mcp()
     await asyncio.sleep(0)
-    assert host.disabled_tools("mail") == {"echo": "changed"}
-    assert "echo" not in {s.name for s in host.tool_specs("mail")}
-    echo = host.registry.get("mail", "echo")
+    assert host.disabled_tools("mail") == {"sleep": "changed"}
+    assert "sleep" not in {s.name for s in host.tool_specs("mail")}
+    echo = host.registry.get("mail", "sleep")
     assert echo is not None and host.hidden(echo)
     alerts = pending_alerts(db)
-    assert alerts["mail/echo"]["text"] == drift_text("mail", "echo")
+    assert alerts["mail/sleep"]["text"] == drift_text("mail", "sleep")
     assert sent == [1]
     rows = db.execute(
         "SELECT tool, detail FROM audit_log WHERE action = 'ext.mcp_drift'"
     ).fetchall()
-    assert len(rows) == 1 and rows[0][0] == "echo" and json.loads(rows[0][1])["server"] == "fake"
+    assert len(rows) == 1 and rows[0][0] == "sleep" and json.loads(rows[0][1])["server"] == "fake"
     # Another load and start of the same drift doesn't alert again.
     await host.aclose()
     again = ExtensionHost.from_settings(settings, db, ToolRegistry(), runner=FakeExtProcess())
@@ -720,7 +985,7 @@ async def test_host_drift_alerts_once_hides_the_tool_and_reports_health(
     assert len(db.execute("SELECT 1 FROM audit_log WHERE action = 'ext.mcp_drift'").fetchall()) == 1
     health = await ExtensionHealth(again).evaluate(utcnow())
     result = health["ext:mail"]
-    assert result is not None and not result[0].ok and "mcp tool echo disabled" in result[0].detail
+    assert result is not None and not result[0].ok and "mcp tool sleep disabled" in result[0].detail
 
 
 def as_v1(pins: dict[str, Any]) -> dict[str, Any]:
@@ -834,7 +1099,7 @@ async def test_send_alerts_delivers_drift(host: ExtensionHost, db: sqlite3.Conne
             self.sent.append((to, text))
 
     host._drift(  # pyright: ignore[reportPrivateUsage]
-        host.loaded["mail"].record, "fake", "echo", None
+        host.loaded["mail"].record, "fake", "echo", "invalid"
     )
     channel = Channel()
     assert await send_alerts(db, channel, "+15551234567") == 1  # type: ignore[arg-type]
@@ -1437,13 +1702,6 @@ def test_mcp_command_symlink_to_a_fetch_runner_is_refused(tmp_path: Path) -> Non
         resolve_mcp_command(root, str(link))
     for name in ("ksh", "tcsh", "sudo", "xargs", "tsx"):
         assert mcp_command_error(root.resolve(), name) is not None
-
-
-async def test_duplicate_live_tool_is_drift(runtime: McpServerRuntime) -> None:
-    runtime._check(  # pyright: ignore[reportPrivateUsage]
-        [{"name": "echo"}, {"name": "echo"}, *[{"name": n} for n in LISTED if n != "echo"]]
-    )
-    assert runtime.disabled["echo"] == "changed"
 
 
 async def test_send_alerts_keeps_a_newer_alert(db: sqlite3.Connection) -> None:

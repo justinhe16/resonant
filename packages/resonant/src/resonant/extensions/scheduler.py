@@ -166,6 +166,14 @@ def remind_job(deps: CoreDeps) -> CoreJob | None:
     return factory(deps)
 
 
+def mcp_drift_job(deps: CoreDeps) -> CoreJob | None:
+    """``core/mcp`` (PER-275, ``extensions/mcp_drift.py``: MCP re-pin questions and heads-ups),
+    imported late like ``remind_job``."""
+    from resonant.extensions.mcp_drift import mcp_drift_job as factory
+
+    return factory(deps)
+
+
 def watches_job(deps: CoreDeps) -> CoreJob | None:
     """``core/watches`` (BR-7, ``runners/watch.py``), imported late: the runners import the
     gate and the router, which this module must not pull in at import time."""
@@ -182,6 +190,7 @@ CORE_JOBS: tuple[CoreJobFactory, ...] = (
     backup_job,
     store_upkeep_job,
     remind_job,
+    mcp_drift_job,
 )
 
 

@@ -133,6 +133,37 @@ def test_extension_crud(db: sqlite3.Connection) -> None:
     assert [e.name for e in ext_store.list_extensions(db)] == ["alpha", "example"]
 
 
+def test_set_mcp_pin_writes_the_schema_and_still_compare_and_sets(db: sqlite3.Connection) -> None:
+    pins = {
+        "a": {"server": "s", "pin": "p1", "input_schema": {"type": "object"}, "v": 2},
+        "b": {"server": "s", "pin": "q1", "input_schema": {"type": "object"}, "v": 2},
+    }
+    rec = _record(mcp_pins=pins)
+    ext_store.save_extension(db, rec)
+    schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+    at = rec.installed_at
+    assert not ext_store.set_mcp_pin(
+        db, "example", "a", installed_at=at, old_pin="stale", pin="p2", version=2
+    )
+    later = NOW + timedelta(days=1)
+    assert not ext_store.set_mcp_pin(
+        db, "example", "a", installed_at=later, old_pin="p1", pin="p2", version=2
+    )
+    assert ext_store.set_mcp_pin(
+        db, "example", "a", installed_at=at, old_pin="p1", pin="p2", version=2, input_schema=schema
+    )
+    got = ext_store.get_extension(db, "example")
+    assert got is not None
+    assert got.mcp_pins["a"] == {"server": "s", "pin": "p2", "input_schema": schema, "v": 2}
+    assert got.mcp_pins["b"] == pins["b"]
+    # Without a schema the stored one is kept (the v1 migration).
+    assert ext_store.set_mcp_pin(
+        db, "example", "b", installed_at=at, old_pin="q1", pin="q2", version=2
+    )
+    again = ext_store.get_extension(db, "example")
+    assert again is not None and again.mcp_pins["b"]["input_schema"] == {"type": "object"}
+
+
 def test_core_name_is_reserved(db: sqlite3.Connection) -> None:
     with pytest.raises(ValueError, match="reserved"):
         ext_store.save_extension(db, _record("core"))

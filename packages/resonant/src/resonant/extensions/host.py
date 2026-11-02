@@ -38,9 +38,25 @@ alone: those are not tampering. A load never raises for one bad extension.
 
 MCP servers (``extensions/mcp.py``) are started by :meth:`ExtensionHost.start_mcp` once the
 daemon runs (and again on the next call after one ends), tracked by ``tracker`` so ``/kill``
-ends them, and ended by :meth:`ExtensionHost.aclose` on shutdown. A tool whose live pin no
-longer matches is disabled (hidden from chat, refused on call), audited ``ext.mcp_drift``,
-and alerted once per (install, tool, live pin) through ``ALERTS_KEY`` and ``alert``.
+ends them, and ended by :meth:`ExtensionHost.aclose` on shutdown.
+
+MCP drift (PER-275; the rules are in ``extensions/mcp.py``, the texts and the follow-up job
+in ``extensions/mcp_drift.py``). The host owns the saves and the questions:
+
+- ``_repinned`` saves an accepted re-pin (pin, version and stripped input schema of that one
+  tool in ``extensions.mcp_pins``, compare-and-set on the install and the old pin), audits
+  ``ext.mcp_repinned``, swaps the schema the model sees (``ToolRegistry.replace`` and
+  ``loaded[...].tools``: only ``args_schema`` changes) and, for an automatic one, upserts one
+  pulse line. A restart finds the pin already saved and says nothing.
+- ``_pending`` asks the owner about a write or pay change that isn't benign: one task-less
+  approval (``REPIN_TOOL``, its ``intent_hash`` the live pin, 24 h), audited
+  ``ext.mcp_repin_asked``. The approval row is the record: a restart finds it and neither
+  asks again nor forgets a yes or a no. Any earlier "no" since the install turns the tool
+  off (``declined``) until ``ext update``; an expired question leaves the tool as it is.
+- A tool turned OFF (removed, listed twice, unusable schema, a v1 pin that no longer matches)
+  is hidden from chat, refused on call, audited ``ext.mcp_drift``. All but a removal alert
+  the owner once per (install, tool, live pin) through ``ALERTS_KEY`` and ``alert``; a
+  removal is one non-urgent heads-up queued in ``NOTES_KEY`` for ``core/mcp``.
 
 Health (D11). The manifest's ``health.check`` is compiled at load like a tool (no
 placeholders; a pinned ``gh``/``git`` uses ``argv0_paths["health"]``).
@@ -51,6 +67,7 @@ placeholders; a pinned ``gh``/``git`` uses ``argv0_paths["health"]``).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import shlex
 import sqlite3
@@ -64,6 +81,8 @@ import yaml
 from pydantic import ValidationError
 
 from resonant import killswitch
+from resonant.brain.notices import TTL_S as NOTICE_TTL_S
+from resonant.brain.notices import item_key as notice_key
 from resonant.config import Settings
 from resonant.executor import ContextHandler, HandlerKey
 from resonant.extensions import pin
@@ -74,8 +93,17 @@ from resonant.extensions.mcp import (
     HttpTarget,
     McpServerRuntime,
     McpToolHandler,
+    PendingAnswer,
+    SchemaChange,
     parse_pins,
     server_argv,
+)
+from resonant.extensions.mcp_drift import (
+    REPIN_TTL_S,
+    auto_title,
+    queue_note,
+    removed_title,
+    repin_summary,
 )
 from resonant.extensions.mcp_http import HTTP_MESSAGE_CAP
 from resonant.extensions.process import (
@@ -90,16 +118,19 @@ from resonant.extensions.process import (
     ensure_data_dir,
     scratch_env,
 )
+from resonant.gate.codes import new_code
 from resonant.gateway.channel import ChannelError, ChannelRefused
 from resonant.monitor import CheckResult
 from resonant.ops import Sender
 from resonant.redact import Redactor
 from resonant.secrets import SecretError, SecretStore, values_of
+from resonant.store import approvals as ap
 from resonant.store import extensions as store
+from resonant.store import pulse as items
 from resonant.store.audit import audit
-from resonant.store.db import atomic, iso, kv_get, kv_set
+from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.tools.registry import ToolRegistry
-from resonant_sdk import Manifest, ToolSpec
+from resonant_sdk import Effect, Level, Manifest, ToolSpec
 from resonant_sdk.manifest import Job, McpHttpServer, duration_s, load_manifest
 
 log = logging.getLogger(__name__)
@@ -174,9 +205,13 @@ class ExtensionHost:
     )
     # MCP servers read their tools' secrets at start; build_components sets the store.
     secrets: SecretStore | None = None
+    # PER-275: who is asked about a changed MCP tool (None: nobody; the tool stays as it is).
+    owner: str | None = None
+    clock: Callable[[], datetime] = utcnow
     # Sends queued alerts now (wiring sets it to ``send_alerts`` once iMessage is up).
     alert: Callable[[], Awaitable[object]] | None = None
     message_cap: int = 256 * 1024
+    _accepting: dict[tuple[str, str], str] = field(default_factory=dict[tuple[str, str], str])
     _job_keys: set[HandlerKey] = field(default_factory=set[HandlerKey])
     _side: set[asyncio.Task[object]] = field(default_factory=set[asyncio.Task[object]])
 
@@ -353,6 +388,8 @@ class ExtensionHost:
                     raise LoadRefused(f"mcp server {sid}: {e}") from None
             approved: dict[str, str] = {}
             legacy: dict[str, dict[str, Any]] = {}
+            effects: dict[str, str] = {}
+            enforced: dict[str, dict[str, Any]] = {}
             for tool in server.tools:
                 pin = pins.get(tool.name)
                 if pin is None or pin.server != sid:
@@ -361,6 +398,8 @@ class ExtensionHost:
                     )
                 approved[tool.name] = pin.pin
                 schemas[tool.name] = pin.input_schema
+                effects[tool.name] = tool.effect.value
+                enforced[tool.name] = pin.input_schema
                 if pin.version != PIN_VERSION:
                     legacy[tool.name] = pin.input_schema
             name = record.name
@@ -379,14 +418,25 @@ class ExtensionHost:
                 on_drift=lambda sid, tool, live, rec=record: self._drift(rec, sid, tool, live),
                 legacy=legacy,
                 on_migrate=lambda sid, tool, new, rec=record: self._migrate(rec, sid, tool, new),
+                effects=effects,
+                schemas=enforced,
+                on_repin=lambda sid, tool, old, new, schema, change, how, rec=record: (
+                    self._repinned(rec, sid, tool, old, new, schema, change, how)
+                ),
+                on_pending=lambda sid, tool, live, schema, change, rec=record: self._pending(
+                    rec, sid, tool, live, schema, change
+                ),
+                declined=lambda tool, rec=record: self.declined(rec, tool),
                 message_cap=self.message_cap if http is None else HTTP_MESSAGE_CAP,
                 http=http,
             )
         return runtimes, schemas
 
     def _drift(self, record: store.ExtensionRecord, sid: str, tool: str, live: str | None) -> None:
-        """An MCP tool no longer matches its pin: audit it and queue one owner alert per
-        (install, tool, live pin), then send it if a sender is set."""
+        """An MCP tool was turned off: audit it and tell the owner once per (install, tool,
+        live pin). Removed: a non-urgent heads-up (``NOTES_KEY``, sent by ``core/mcp``).
+        Anything else (listed twice, unusable schema, a v1 pin that no longer matches): an
+        urgent alert, sent now if a sender is set."""
         key = f"{record.name}/{tool}"
         dedupe = f"ext-mcp-drift:{key}:{iso(record.installed_at)}:{live or 'removed'}"
         with atomic(self.conn):
@@ -395,9 +445,13 @@ class ExtensionHost:
             if seen_map.get(key) == dedupe:
                 return
             kv_set(self.conn, MCP_DRIFT_KEY, {**seen_map, key: dedupe})
-            alerts = pending_alerts(self.conn)
-            alerts[key] = {"text": drift_text(record.name, tool), "dedupe_key": dedupe}
-            kv_set(self.conn, ALERTS_KEY, alerts)
+            if live is None:
+                note = f"mcp/{record.name}/{tool}/removed/{iso(record.installed_at)}"
+                queue_note(self.conn, key, note, removed_title(record.name, tool))
+            else:
+                alerts = pending_alerts(self.conn)
+                alerts[key] = {"text": drift_text(record.name, tool), "dedupe_key": dedupe}
+                kv_set(self.conn, ALERTS_KEY, alerts)
             audit(
                 self.conn,
                 "ext.mcp_drift",
@@ -405,12 +459,172 @@ class ExtensionHost:
                 server=sid,
                 tool=tool,
                 live_pin=live,
-                approved_pin=_approved_pin(record, tool),
+                approved_pin=self._pin_now(record, tool),
             )
-        if self.alert is not None:
+        if live is not None and self.alert is not None:
             task = asyncio.ensure_future(self.alert())
             self._side.add(task)
             task.add_done_callback(self._side.discard)
+
+    def _pin_now(self, record: store.ExtensionRecord, tool: str) -> str | None:
+        """The pin stored for ``tool`` now (a re-pin may have moved it since load)."""
+        current = store.get_extension(self.conn, record.name)
+        return _approved_pin(current if current is not None else record, tool)
+
+    def _runtime(self, ext: str, tool: str) -> McpServerRuntime | None:
+        loaded = self.loaded.get(ext)
+        if loaded is None:
+            return None
+        return next((r for r in loaded.mcp.values() if tool in r.approved), None)
+
+    def declined(self, record: store.ExtensionRecord, tool: str) -> bool:
+        """The owner said no to a re-pin of ``tool`` since this install (one indexed read)."""
+        rows = ap.repin_rows(self.conn, record.name, tool, since=record.installed_at)
+        return any(r.status == "rejected" for r in rows)
+
+    def _repinned(
+        self,
+        record: store.ExtensionRecord,
+        sid: str,
+        tool: str,
+        old: str,
+        new: str,
+        schema: dict[str, Any],
+        change: SchemaChange,
+        how: str,
+    ) -> bool:
+        """Save an accepted re-pin of one MCP tool (see the module docstring). False when the
+        save lost (a reinstall or update since load): the runtime then turns the tool off."""
+        runtime = self._runtime(record.name, tool)
+        effect = runtime.effects.get(tool, "write") if runtime is not None else "write"
+        approval_id = self._accepting.pop((record.name, tool), None) if how == "owner" else None
+        now = self.clock()
+        with atomic(self.conn):
+            saved = store.set_mcp_pin(
+                self.conn,
+                record.name,
+                tool,
+                installed_at=record.installed_at,
+                old_pin=old,
+                pin=new,
+                version=PIN_VERSION,
+                input_schema=schema,
+            )
+            if not saved:
+                return False
+            audit(
+                self.conn,
+                "ext.mcp_repinned",
+                extension=record.name,
+                server=sid,
+                tool=tool,
+                old_pin=old,
+                new_pin=new,
+                effect=effect,
+                how=how,
+                change=change.to_json(),
+                approval_id=approval_id,
+            )
+            if how == "auto":
+                items.upsert(
+                    self.conn,
+                    "core",
+                    notice_key(f"mcp/{record.name}/{tool}/{new[:12]}"),
+                    auto_title(record.name, tool, effect, change),
+                    "normal",
+                    None,
+                    False,
+                    NOTICE_TTL_S,
+                    now,
+                )
+        self._swap_schema(record.name, tool, schema)
+        log.info("mcp tool re-pinned", extra={"extension": record.name, "tool": tool, "how": how})
+        return True
+
+    def _swap_schema(self, ext: str, tool: str, schema: dict[str, Any]) -> None:
+        """Show the model (and the gate's summaries) the re-pinned schema: only ``args_schema``
+        of the tool's spec changes. The handler reads its runtime, so it is not rebuilt."""
+        loaded = self.loaded.get(ext)
+        if loaded is None:
+            return
+        spec = self.registry.get(ext, tool)
+        if spec is None:
+            return
+        new = spec.model_copy(update={"args_schema": schema})
+        self.registry.replace(new)
+        self.loaded[ext] = dataclasses.replace(
+            loaded, tools=tuple(new if t.name == tool else t for t in loaded.tools)
+        )
+
+    def _pending(
+        self,
+        record: store.ExtensionRecord,
+        sid: str,
+        tool: str,
+        live: str,
+        schema: dict[str, Any],
+        change: SchemaChange,
+    ) -> tuple[PendingAnswer, str | None]:
+        """A write or pay tool changed beyond what is benign: what to do about it now. The
+        approvals table is the memory (module docstring): an earlier no turns it off, a yes
+        already given accepts it, a question already asked is left to be answered or expire,
+        otherwise ask once."""
+        now = self.clock()
+        with atomic(self.conn):
+            ap.expire_due(self.conn, now)
+            rows = ap.repin_rows(self.conn, record.name, tool, since=record.installed_at)
+            no = next((r for r in rows if r.status == "rejected"), None)
+            if no is not None:
+                return "off", no.id
+            same = [r for r in rows if r.intent_hash == live]
+            if same:
+                last = same[-1]
+                if last.status == "approved" and last.used_at is None:
+                    self._accepting[(record.name, tool)] = last.id
+                    return "accept", last.id
+                if last.status in ("pending", "expired"):
+                    return "keep", last.id
+            if self.owner is None:
+                log.warning("mcp tool changed but no owner to ask", extra={"tool": tool})
+                return "keep", None
+            for r in rows:
+                if r.status == "pending":
+                    ap.expire_one(self.conn, r.id, now, reason=ap.SUPERSEDED)
+            approval_id = ap.insert_approval(
+                self.conn,
+                ap.NewApproval(
+                    task_id=None,
+                    intent_hash=live,
+                    tool=ap.REPIN_TOOL,
+                    effect=Effect.WRITE,
+                    level=Level.L2,
+                    summary=repin_summary(record.name, tool, change),
+                    approvers=(self.owner,),
+                    code=new_code(ap.pending_codes(self.conn)),
+                    expires_at=now + timedelta(seconds=REPIN_TTL_S),
+                    extension=record.name,
+                    requested_by="resonant",
+                    action_key=ap.REPIN_TOOL,
+                    action_target=ap.repin_target(record.name, tool),
+                ),
+                now,
+            )
+            audit(
+                self.conn,
+                "ext.mcp_repin_asked",
+                extension=record.name,
+                server=sid,
+                tool=tool,
+                approval_id=approval_id,
+                old_pin=self._runtime_pin(record.name, tool),
+                live_pin=live,
+                change=change.to_json(),
+            )
+        return "keep", approval_id
+
+    def _runtime_pin(self, ext: str, tool: str) -> str | None:
+        runtime = self._runtime(ext, tool)
+        return None if runtime is None else runtime.approved.get(tool)
 
     def _migrate(self, record: store.ExtensionRecord, sid: str, tool: str, pin: str) -> None:
         """A version-1 MCP pin still matched by schema: save its version-2 pin and audit it
@@ -467,14 +681,15 @@ class ExtensionHost:
         await asyncio.gather(*self._side, return_exceptions=True)
 
     def disabled_tools(self, extension: str) -> dict[str, str]:
-        """MCP tools of ``extension`` disabled since load: ``{tool: "changed"|"removed"}``."""
+        """MCP tools of ``extension`` disabled since load:
+        ``{tool: "changed"|"removed"|"declined"}``."""
         ext = self.loaded.get(extension)
         if ext is None:
             return {}
         return {t: why for r in ext.mcp.values() for t, why in r.disabled.items()}
 
     def hidden(self, spec: ToolSpec) -> bool:
-        """Kept out of chat: job specs, and MCP tools disabled by a pin change."""
+        """Kept out of chat: job specs, and MCP tools turned off by drift."""
         if self.is_job(spec):
             return True
         return spec.extension is not None and spec.name in self.disabled_tools(spec.extension)
@@ -636,9 +851,13 @@ class ExtensionHealth:
             if j.fail_streak >= FAIL_STREAK_ALERT
         ]
         last = self._last.get(name)
+        # A removed tool got its one non-urgent heads-up and a declined one is the owner's own
+        # answer: neither is a degrade to text about. "changed" (listed twice, unusable schema,
+        # a v1 pin that no longer matches) stays urgent, as before.
         drift = [
             f"mcp tool {tool} disabled ({why} since you approved it)"
             for tool, why in sorted(self.host.disabled_tools(name).items())
+            if why not in ("removed", "declined")
         ]
         problems = ([last.detail] if last is not None and not last.ok else []) + streaks + drift
         if not problems:

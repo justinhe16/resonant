@@ -128,6 +128,26 @@ async def prompt_batch(
     )  # fmt: skip
 
 
+async def prompt_row(
+    conn: sqlite3.Connection, channel: Channel, row: ap.Approval, now: datetime
+) -> PromptResult:
+    """PER-275: send a stored, task-less approval (an MCP re-pin question) to its approvers.
+    Same failure rules as ``prompt_approvers``; the channel dedupes by ``approval_dedupe_key``."""
+    assert row.code is not None
+    prompt = ApprovalPrompt(
+        approval_id=row.id,
+        code=row.code,
+        summary=row.summary,
+        effect=row.effect.value,
+        level=row.level.value,
+        expires_at=row.expires_at,
+        require_code=row.require_code,
+        phrased=row.phrased,
+    )
+    return await _prompt(conn, channel, prompt, row.approvers, (row.id,), task_id=None,
+                         now=lambda: now)  # fmt: skip
+
+
 async def _prompt(
     conn: sqlite3.Connection,
     channel: Channel,
@@ -135,7 +155,7 @@ async def _prompt(
     approvers: Sequence[str],
     approval_ids: Sequence[str],
     *,
-    task_id: str,
+    task_id: str | None,
     now: Callable[[], datetime],
 ) -> PromptResult:
     reached: list[str] = []

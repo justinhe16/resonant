@@ -254,6 +254,7 @@ def build_components(
     secret_store = secrets if secrets is not None else SecretStore()
     host = ExtensionHost.from_settings(settings, conn, registry, runner=ext_runner)
     host.secrets = secret_store
+    host.owner = principals.owner if loaded else None  # PER-275: who is asked about MCP drift
     host.load()
     gate = PolicyGate(
         conn,

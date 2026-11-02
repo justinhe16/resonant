@@ -15,6 +15,11 @@ JSON-RPC 2.0 and offers:
 - ``fail``: an ``isError`` result.
 - ``hidden``: never listed in a manifest; records a call in ``$HOME/hidden-called``.
 
+``$HOME/sleep_variant`` changes the write tool ``sleep`` at the next ``tools/list`` (PER-275):
+``optional`` adds an optional ``note`` property, ``required`` a required ``team``, ``retype``
+makes ``seconds`` a string, ``gone`` omits it, ``dup`` lists it twice, ``output`` adds an
+``outputSchema``.
+
 ``$HOME/variant`` (any text) changes ``echo``'s description and annotations at the next
 ``tools/list`` (not pinned); ``$HOME/schema`` (any text) adds a property to its input schema.
 Arguments: ``--no-tools`` (no tools capability), ``--exit`` (exit at once),
@@ -58,6 +63,36 @@ def schema_changed() -> bool:
     return os.path.exists(os.path.join(HOME, "schema"))
 
 
+def sleep_variant() -> str:
+    try:
+        with open(os.path.join(HOME, "sleep_variant")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def sleep_tools() -> list[dict[str, Any]]:
+    v = sleep_variant()
+    props: dict[str, Any] = {"seconds": {"type": "number"}}
+    tool: dict[str, Any] = {
+        "name": "sleep",
+        "description": "sleep",
+        "inputSchema": {"type": "object", "properties": props},
+    }
+    if v == "gone":
+        return []
+    if v == "optional":
+        props["note"] = {"type": "string"}
+    elif v == "required":
+        props["team"] = {"type": "string"}
+        tool["inputSchema"]["required"] = ["team"]
+    elif v == "retype":
+        props["seconds"] = {"type": "string"}
+    elif v == "output":
+        tool["outputSchema"] = {"type": "object", "properties": {"slept": {"type": "boolean"}}}
+    return [tool, tool] if v == "dup" else [tool]
+
+
 def tools() -> list[dict[str, Any]]:
     v = variant()
     extra = {"extra": {"type": "integer"}} if schema_changed() else {}
@@ -82,11 +117,7 @@ def tools() -> list[dict[str, Any]]:
         },
         {"name": "whoami", "description": "who", "inputSchema": {"type": "object"}},
         {"name": "leak", "description": "leak", "inputSchema": {"type": "object"}},
-        {
-            "name": "sleep",
-            "description": "sleep",
-            "inputSchema": {"type": "object", "properties": {"seconds": {"type": "number"}}},
-        },
+        *sleep_tools(),
         {"name": "spawn", "description": "spawn", "inputSchema": {"type": "object"}},
         {"name": "mutate", "description": "mutate", "inputSchema": {"type": "object"}},
         {"name": "big", "description": "big", "inputSchema": {"type": "object"}},

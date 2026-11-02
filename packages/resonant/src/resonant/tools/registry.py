@@ -36,3 +36,14 @@ class ToolRegistry:
             )
             if extension is None or ext == extension
         ]
+
+    def replace(self, spec: ToolSpec) -> None:
+        """Swap a registered spec for one that differs only in ``args_schema`` (an MCP tool's
+        accepted re-pin). Anything else differing is a bug: ValueError."""
+        key = (spec.extension, spec.name)
+        old = self._specs.get(key)
+        if old is None:
+            raise ValueError(f"tool {spec.name!r} is not registered for {spec.extension!r}")
+        if old.model_copy(update={"args_schema": spec.args_schema}) != spec:
+            raise ValueError(f"tool {spec.name!r}: only args_schema may change")
+        self._specs[key] = spec
