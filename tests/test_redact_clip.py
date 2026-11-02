@@ -175,3 +175,14 @@ def test_remote_control_links_are_scrubbed_and_the_migration_refuses_them() -> N
     assert "https://claude.ai/code/" not in (clip_text("x" * 290 + url, 295) or "")
     assert f"p_data::text ~ '{RC_LINK_SQL}'" in MIGRATION.read_text()
     assert re.search(RC_LINK_SQL.replace("\\.", "."), url)
+    # Never narrower than the SQL check: the bare prefix and a cut-off link are scrubbed too.
+    sql = re.compile(RC_LINK_SQL)
+    for text in (
+        "see https://claude.ai/code/… now",
+        "https://claude.ai/code/",
+        "R4 Remote Control: https://claude.ai/code/",
+        f"x {url}/more?y=1",
+    ):
+        out = scrub_rc_links(text)
+        assert not sql.search(out), out
+        assert not sql.search(clip_text(text, 200) or "")

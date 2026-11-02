@@ -209,8 +209,10 @@ SECRET_SQL_FAMILY: Final = "".join((  # joined: ruff's S105 reads a literal as a
 
 
 # A Claude Remote Control link (whoever holds it can drive the session): never published in
-# any text. ``relay_ingest`` refuses the same shape (``RC_LINK_SQL``).
-RC_LINK = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]+")
+# any text. ``relay_ingest`` refuses any text holding the prefix (``RC_LINK_SQL``), so the
+# scrub takes the bare prefix too (``*``, not ``+``): text that only mentions the prefix must
+# never get a whole push refused.
+RC_LINK = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]*")
 RC_LINK_SQL: Final = "https://claude\\.ai/code/"
 RC_MARK: Final = "[remote control link]"
 
