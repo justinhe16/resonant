@@ -8,6 +8,9 @@ The gate owns the policy (who may approve, binding, codes). This module owns the
 - An approval is single use: ``mark_used`` sets ``used_at`` once, in the same transaction
   as the executor's ``started`` row.
 - ``wake_resolved`` tells the waiting task, in the resolver's transaction.
+- PER-275: an MCP re-pin question (``REPIN_TOOL``) has no task (``task_id`` NULL): ``resolve``
+  answers it with no task check, and ``settle`` spends it once decided, either way
+  (``repin_rows`` / ``unsettled_repins`` read them for the ``core/mcp`` job).
 
 Orphans (pending approvals of a task that became terminal) are expired by ``store.tasks``.
 """
@@ -32,6 +35,15 @@ ApprovalStatus = Literal["pending", "approved", "rejected", "expired"]
 # The approvals' tool for a worker's ``resonant check`` (``trust.checks`` uses it).
 # Its approval may be answered while the run's task is queued.
 CHECK_TOOL = "trust_check"
+# PER-275: the approvals' tool for "yes re-pins this MCP tool's changed schema". Task-less.
+REPIN_TOOL = "mcp_repin"
+
+
+def repin_target(extension: str, tool: str) -> str:
+    """The ``action_target`` of a re-pin question: which tool it is about (its ``action_key``
+    is ``REPIN_TOOL``)."""
+    return f"{extension}/{tool}"
+
 
 # Why ``resolve`` refused. "task_not_waiting": the task is no longer waiting or running.
 # "always_unsupported": ``yes always`` for an approval that doesn't offer it.
@@ -51,7 +63,7 @@ class ChannelRef:
 
 @dataclass(frozen=True)
 class NewApproval:
-    task_id: str
+    task_id: str | None
     intent_hash: str
     tool: str
     effect: Effect
@@ -125,8 +137,10 @@ class Approval:
 
     def resolved(self) -> ResolvedApproval:
         """This row as a gate ``ResolvedApproval``. Only meaningful once decided."""
-        assert self.task_id is not None
-        return ResolvedApproval(self.id, self.task_id, self.intent_hash, self.status == "approved")
+        # A re-pin question has no task: ``wake_resolved`` skips the missing task row.
+        return ResolvedApproval(
+            self.id, self.task_id or "", self.intent_hash, self.status == "approved"
+        )
 
 
 def _dt(v: str | None) -> datetime | None:
@@ -430,7 +444,8 @@ def resolve(
     """Approve or reject a pending approval. Returns None on success, else why not.
 
     One conditional UPDATE: the row must still be pending and unexpired, and its task must
-    be waiting or running. A worker's trust check (``tool = 'trust_check'``) is also
+    be waiting or running (an MCP re-pin question has none: it is answerable on its own).
+    A worker's trust check (``tool = 'trust_check'``) is also
     answerable while its run's task is ``queued`` (woken and waiting for a Claude slot): the
     check's own wait reads the row, not the task (EM-5). The refusal reason is read
     afterwards and is informational only.
@@ -444,9 +459,10 @@ def resolve(
                resolved_event_id = ?, always = ?
            WHERE id = ? AND status = 'pending' AND expires_at > ?
              AND (? = 0 OR (allow_always = 1 AND require_code = 0))
-             AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = approvals.task_id
-                         AND (tasks.status IN ('waiting', 'running')
-                              OR (tasks.status = 'queued' AND approvals.tool = ?)))""",
+             AND (EXISTS (SELECT 1 FROM tasks WHERE tasks.id = approvals.task_id
+                          AND (tasks.status IN ('waiting', 'running')
+                               OR (tasks.status = 'queued' AND approvals.tool = ?)))
+                  OR (approvals.task_id IS NULL AND approvals.tool = ?))""",
         (
             "approved" if approved else "rejected",
             decided_by,
@@ -457,6 +473,7 @@ def resolve(
             iso(now),
             always,
             CHECK_TOOL,
+            REPIN_TOOL,
         ),
     )
     if cur.rowcount == 1:
@@ -481,6 +498,56 @@ def mark_used(conn: sqlite3.Connection, approval_id: str, now: datetime) -> bool
         (iso(now), approval_id),
     )
     return cur.rowcount == 1
+
+
+def settle(conn: sqlite3.Connection, approval_id: str, now: datetime) -> bool:
+    """Spend a decided task-less approval (a re-pin question), approved or rejected: sets
+    ``used_at`` once. True exactly once."""
+    cur = conn.execute(
+        """UPDATE approvals SET used_at = ?
+           WHERE id = ? AND status IN ('approved', 'rejected') AND used_at IS NULL""",
+        (iso(now), approval_id),
+    )
+    return cur.rowcount == 1
+
+
+def repin_rows(
+    conn: sqlite3.Connection,
+    extension: str,
+    tool: str,
+    *,
+    since: datetime,
+) -> list[Approval]:
+    """The re-pin questions asked of ``extension``'s ``tool`` since ``since`` (its install
+    time: an ``ext update`` starts clean), oldest first, whatever their status."""
+    rows = conn.execute(
+        """SELECT * FROM approvals WHERE tool = ? AND task_id IS NULL AND extension = ?
+               AND action_target = ? AND created_at >= ?
+           ORDER BY created_at, id""",
+        (REPIN_TOOL, extension, repin_target(extension, tool), iso(since)),
+    ).fetchall()
+    return [_row_to_approval(r) for r in rows]
+
+
+def unsettled_repins(conn: sqlite3.Connection) -> list[Approval]:
+    """Decided re-pin questions nobody has acted on yet (approved or rejected, unspent)."""
+    rows = conn.execute(
+        """SELECT * FROM approvals WHERE tool = ? AND task_id IS NULL
+               AND status IN ('approved', 'rejected') AND used_at IS NULL
+           ORDER BY decided_at, id""",
+        (REPIN_TOOL,),
+    ).fetchall()
+    return [_row_to_approval(r) for r in rows]
+
+
+def pending_repins(conn: sqlite3.Connection) -> list[Approval]:
+    """Every pending re-pin question, oldest first (expired or not: callers expire first)."""
+    rows = conn.execute(
+        """SELECT * FROM approvals WHERE tool = ? AND task_id IS NULL AND status = 'pending'
+           ORDER BY created_at, id""",
+        (REPIN_TOOL,),
+    ).fetchall()
+    return [_row_to_approval(r) for r in rows]
 
 
 def expire_due(conn: sqlite3.Connection, now: datetime) -> int:

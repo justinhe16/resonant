@@ -279,6 +279,63 @@ def test_mark_used_once(db: sqlite3.Connection) -> None:
     assert a is not None and a.used_at == NOW
 
 
+# --- PER-275: a task-less re-pin question -------------------------------------------------
+
+
+def _repin(db: sqlite3.Connection, tool: str = "mcp_repin", code: str = "A8") -> str:
+    spec = ap.NewApproval(
+        task_id=None,
+        intent_hash="live",
+        tool=tool,
+        effect=Effect.WRITE,
+        level=Level.L2,
+        summary="Mail changed sleep (+required field team). Accept",
+        approvers=("justin",),
+        code=code,
+        expires_at=NOW + TTL,
+        extension="mail",
+        requested_by="resonant",
+        action_key=ap.REPIN_TOOL,
+        action_target=ap.repin_target("mail", "sleep"),
+    )
+    return ap.insert_approval(db, spec, NOW)
+
+
+def test_a_repin_question_resolves_without_a_task_and_other_task_less_rows_do_not(
+    db: sqlite3.Connection,
+) -> None:
+    yes, other = _repin(db), _repin(db, tool="other", code="A9")
+    assert ap.resolve(db, other, approved=True, decided_by="justin", now=NOW) == "task_not_waiting"
+    assert ap.resolve(db, yes, approved=True, decided_by="justin", now=NOW) is None
+    a = ap.get_approval(db, yes)
+    assert a is not None and a.status == "approved" and a.task_id is None
+    resolved = a.resolved()  # no task: an empty id, which ``wake_resolved`` skips
+    assert resolved.task_id == "" and resolved.approved
+    result = ap.resolve_result([a])
+    assert ap.wake_resolved(db, result, NOW) == 0
+
+
+def test_settle_spends_a_decided_repin_once_either_way(db: sqlite3.Connection) -> None:
+    yes, no, pending = _repin(db), _repin(db, code="A9"), _repin(db, code="B1")
+    ap.resolve(db, yes, approved=True, decided_by="justin", now=NOW)
+    ap.resolve(db, no, approved=False, decided_by="justin", now=NOW)
+    assert not ap.settle(db, pending, NOW)  # nothing decided
+    assert {a.id for a in ap.unsettled_repins(db)} == {yes, no}
+    assert ap.settle(db, yes, NOW) and not ap.settle(db, yes, NOW)
+    assert ap.settle(db, no, NOW) and not ap.settle(db, no, NOW)
+    assert ap.unsettled_repins(db) == []
+    assert [a.id for a in ap.pending_repins(db)] == [pending]
+
+
+def test_repin_rows_are_for_one_tool_since_its_install(db: sqlite3.Connection) -> None:
+    first = _repin(db)
+    rows = ap.repin_rows(db, "mail", "sleep", since=NOW)
+    assert [r.id for r in rows] == [first]
+    assert ap.repin_rows(db, "mail", "sleep", since=NOW + timedelta(seconds=1)) == []
+    assert ap.repin_rows(db, "mail", "other", since=NOW) == []
+    assert ap.repin_rows(db, "other", "sleep", since=NOW) == []
+
+
 # --- expiry ----------------------------------------------------------------------------
 
 

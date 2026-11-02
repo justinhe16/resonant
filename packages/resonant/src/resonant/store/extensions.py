@@ -3,7 +3,8 @@
 - ``extensions``: one row per installed extension, the registry of record. It holds the
   approved manifest snapshot and the pins (``commit``, ``tree_digest``, ``manifest_sha``,
   ``argv0_paths``) that the host re-verifies at load. The manager writes it; the host only
-  reads it, flips ``status`` and re-pins a version-1 MCP pin at version 2 (``set_mcp_pin``).
+  reads it, flips ``status`` and re-pins an MCP tool (``set_mcp_pin``: a v1 pin at version 2, or an
+  accepted schema drift, PER-275).
 - ``ext_jobs``: scheduler state per ``(ext, job_id)``. Core jobs use ``ext="core"``.
   ``last_due`` only moves forward, so a stale writer can never make a due time run twice.
 
@@ -155,9 +156,11 @@ def set_mcp_pin(
     old_pin: str,
     pin: str,
     version: int,
+    input_schema: dict[str, Any] | None = None,
 ) -> bool:
     """Re-pin one MCP tool of the install made at ``installed_at``, only while its stored pin
-    is still ``old_pin``. False (nothing written) after a reinstall or update, or once done."""
+    is still ``old_pin``. Only ``pin``, ``v`` and (when given) ``input_schema`` of that one
+    entry change. False (nothing written) after a reinstall or update, or once done."""
     with atomic(conn):
         row = conn.execute(
             "SELECT mcp_pins FROM extensions WHERE name = ? AND installed_at = ?",
@@ -169,7 +172,10 @@ def set_mcp_pin(
         entry: object = pins.get(tool)
         if not isinstance(entry, dict) or cast(dict[str, Any], entry).get("pin") != old_pin:
             return False
-        pins[tool] = {**cast(dict[str, Any], entry), "pin": pin, "v": version}
+        new_entry = {**cast(dict[str, Any], entry), "pin": pin, "v": version}
+        if input_schema is not None:
+            new_entry["input_schema"] = input_schema
+        pins[tool] = new_entry
         conn.execute(
             "UPDATE extensions SET mcp_pins = ? WHERE name = ?",
             (json.dumps(pins, sort_keys=True), name),

@@ -753,7 +753,7 @@ class PolicyGate:
             approval = ap.get_approval(self.conn, resolution.approval_id)
             reason: str | None
             unit: _Unit | None = None
-            if approval is None or approval.task_id is None:
+            if approval is None or (approval.task_id is None and approval.tool != ap.REPIN_TOOL):
                 reason = "not_found"
             elif resolution.actor not in approval.approvers or not self.principals.can(
                 resolution.actor, "approve", approval.extension
@@ -860,7 +860,7 @@ class PolicyGate:
                 done_rows = [d for d in rows if d is not None]
                 result = ap.resolve_result(done_rows)
                 done = done_rows[0]
-                if reply.comments and reply.decision == "approve":
+                if reply.comments and reply.decision == "approve" and done.task_id is not None:
                     _add_comments(self.conn, done, reply)
                 if unit.batch is None and done.always and done.always_scope and done.always_action:
                     _add_standing_rule(self.conn, done, reply.actor, now)
@@ -973,7 +973,7 @@ class PolicyGate:
 
     def _may_approve(self, reply: ApprovalReply, a: ap.Approval) -> bool:
         return (
-            a.task_id is not None
+            (a.task_id is not None or a.tool == ap.REPIN_TOOL)  # PER-275: a re-pin has no task
             and reply.actor in a.approvers
             and self.principals.can(reply.actor, "approve", a.extension)
         )

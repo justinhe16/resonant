@@ -115,6 +115,16 @@ def fake(loopback: None) -> Iterator[Any]:
     server.stop()
 
 
+def _save(*_args: object) -> bool:
+    return True
+
+
+def _effects(url: str) -> dict[str, str]:
+    mcp = Manifest.model_validate(parse_yaml(linear_yaml(url))).mcp
+    assert mcp is not None
+    return {t.name: t.effect.value for _, t in mcp.tools()}
+
+
 class DriftLog(list[tuple[str, str | None]]):
     def __call__(self, server: str, tool: str, live: str | None) -> None:
         self.append((tool, live))
@@ -226,6 +236,9 @@ async def runtime(fake: Any, tmp_path: Path) -> AsyncIterator[McpServerRuntime]:
         tracker=ProcessTracker(sample_s=0.2, grace_s=0.5),
         secrets=lambda: store,
         on_drift=DriftLog(),
+        effects=_effects(fake.url),
+        schemas={name: p["input_schema"] for name, p in pins.items()},
+        on_repin=_save,
         message_cap=HTTP_MESSAGE_CAP,
         http=HttpTarget(fake.url, "token"),
     )
@@ -364,26 +377,29 @@ async def test_session_expiry_restarts_and_retries_once(
     assert len([c for c, _ in fake.calls if c == "list_teams"]) == 2  # the 404 never ran
 
 
-async def test_pin_mismatch_at_start_disables_the_tool(
-    runtime: McpServerRuntime, fake: Any
-) -> None:
+async def test_read_drift_at_start_is_repinned(runtime: McpServerRuntime, fake: Any) -> None:
+    old = runtime.approved["list_issues"]
     fake.variant = " changed"
     await runtime.start()
-    assert runtime.disabled == {"list_issues": "changed"}
-    with pytest.raises(McpError, match="disabled"):
-        await runtime.call("list_issues", {}, 10)
+    assert runtime.disabled == {} and cast(DriftLog, runtime.on_drift) == []
+    assert runtime.approved["list_issues"] != old
+    assert "variant" in runtime.schemas["list_issues"]["properties"]
+    assert (await runtime.call("list_issues", {}, 10))["text"] is not None
     assert (await runtime.call("list_teams", {}, 10))["text"] == "[]"
+    # Nothing about where it connects or how it signs in is the runtime's to change.
+    assert runtime.http == HttpTarget(fake.url, "token")
 
 
 async def test_list_changed_on_the_get_stream_rechecks(
     runtime: McpServerRuntime, fake: Any
 ) -> None:
+    old = runtime.approved["list_issues"]
     await runtime.call("list_teams", {}, 10)
     assert await until(lambda: any(r["method"] == "GET" for r in fake.requests))
     assert await until(lambda: bool(fake._streams))  # pyright: ignore[reportPrivateUsage]
     await runtime.call("mutate", {}, 10)
-    assert await until(lambda: "list_issues" in runtime.disabled)
-    assert [t for t, _ in cast(DriftLog, runtime.on_drift)] == ["list_issues"]
+    assert await until(lambda: runtime.approved["list_issues"] != old)
+    assert runtime.disabled == {} and cast(DriftLog, runtime.on_drift) == []
 
 
 async def test_no_get_stream_is_fine(runtime: McpServerRuntime, fake: Any) -> None:

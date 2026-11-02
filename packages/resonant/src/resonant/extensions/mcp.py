@@ -30,9 +30,19 @@ Design (carried from the old backlog; deferred parts are in ``docs/extensions.md
   description no longer disables a tool. ``ext add`` starts the server once (no secrets, a
   scratch home) to read its tools, shows the pins as escalations and stores them with the
   stripped input schemas and ``"v": 2`` (``ExtensionRecord.mcp_pins``). Every server start
-  and every ``notifications/tools/list_changed`` re-lists and compares; a missing or changed
-  tool is disabled for the life of the process and the owner is alerted once. Calls wait
-  while a re-list is in flight.
+  and every ``notifications/tools/list_changed`` re-lists and compares (PER-275, below).
+  Calls wait while a re-list is in flight.
+- **Drift.** A live pin that differs from the approved one is classified (``diff_input``).
+  A read tool is re-pinned on the spot (``on_repin``, how ``auto``). A write or pay tool is
+  re-pinned only when benign: new optional top-level properties, or an output-schema-only
+  change (the output schema is hashed but never shown or enforced, so it is not diffed). Any
+  other change leaves the tool callable on its OLD approved schema while the host asks the
+  owner (``on_pending``: keep, accept or off); a yes re-pins (``accept_pending``), a no
+  turns it off (``disable``, ``declined``). A removed tool is disabled (``removed``); a tool
+  listed twice, with an unusable schema, a version-1 pin that no longer matches, or a failed
+  save is disabled too (``changed``); those and only those call ``on_drift``. The schema
+  enforced on a call is ``schemas[tool]``, which moves with an accepted re-pin. Never
+  touched: the manifest, a tool's effect or level, its description, URL, transport, secrets.
 - **Pin migration.** A version-1 pin (no ``"v"``; it also hashed the description and
   annotations) is never compared as a hash: if its stored stripped input schema equals the
   live one, the tool is accepted and re-pinned at version 2 through ``on_migrate`` (the host
@@ -66,7 +76,7 @@ import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import jsonschema
 
@@ -442,6 +452,151 @@ def pins_digest(raw: Mapping[str, Any]) -> str:
         return ""
     text = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class SchemaChange:
+    """How a tool's stripped input schema changed (``diff_input``), top level only."""
+
+    added_optional: tuple[str, ...]  # new properties, not in the new ``required``
+    added_required: tuple[str, ...]  # in the new ``required`` and not the old one
+    removed: tuple[str, ...]
+    changed: tuple[str, ...]  # an existing property whose subschema differs
+    unrequired: tuple[str, ...]  # was required, no longer
+    other: bool  # any other top-level keyword differs (additionalProperties, anyOf, type, ...)
+    # A string the change ADDS anywhere in the schema (a property name, an enum or const
+    # value, a pattern or format) isn't plain: new server text the model would read.
+    unplain: bool = False
+
+    @property
+    def benign(self) -> bool:
+        """Only new optional properties (or nothing), all in plain words: what an old call
+        still satisfies and nothing new for the model to read."""
+        return not (
+            self.added_required
+            or self.removed
+            or self.changed
+            or self.unrequired
+            or self.other
+            or self.unplain
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "added_optional": list(self.added_optional),
+            "added_required": list(self.added_required),
+            "removed": list(self.removed),
+            "changed": list(self.changed),
+            "unrequired": list(self.unrequired),
+            "other": self.other,
+            "unplain": self.unplain,
+        }
+
+
+_DEFS = ("$defs", "definitions")
+
+
+def _map(schema: Mapping[str, Any], key: str) -> dict[str, Any]:
+    v: object = schema.get(key)
+    return cast(dict[str, Any], v) if isinstance(v, dict) else {}
+
+
+def _names(schema: Mapping[str, Any]) -> set[str]:
+    v: object = schema.get("required")
+    return {x for x in cast(list[Any], v) if isinstance(x, str)} if isinstance(v, list) else set()
+
+
+_PLAIN = re.compile(r"^[A-Za-z0-9_.\- ]{1,40}$")  # an enum/const value: spaces allowed
+_NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,40}$")  # a property, $defs or required name: none
+_REF = re.compile(r"^#/(\$defs|definitions)/[A-Za-z0-9_.\-]{1,40}$")  # a local def, by name
+_NAME_MAPS = ("properties", "patternProperties", "$defs", "definitions")
+
+
+def _canon(value: object) -> str:
+    """Canonical JSON: ``1``, ``1.0`` and ``true`` differ here, as they do for a validator."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _same(a: object, b: object) -> bool:
+    return _canon(a) == _canon(b)
+
+
+def _strings(schema: object, out: set[tuple[str, str]]) -> None:
+    """Every string of a stripped schema the model could read, by kind: names (property,
+    ``$defs`` and ``required`` entries), values (``enum``/``const``) and patterns/formats."""
+    if isinstance(schema, list):
+        for item in cast(list[Any], schema):
+            _strings(item, out)
+        return
+    if not isinstance(schema, dict):
+        return
+    for key, value in cast(dict[str, Any], schema).items():
+        if key in _NAME_MAPS and isinstance(value, dict):
+            for name, sub in cast(dict[str, Any], value).items():
+                out.add(("pattern" if key == "patternProperties" else "name", name))
+                _strings(sub, out)
+        elif key == "required" and isinstance(value, list):
+            out |= {("name", x) for x in cast(list[Any], value) if isinstance(x, str)}
+        elif key in ("enum", "const"):
+            _values(value, out)
+        elif key in ("pattern", "format") and isinstance(value, str):
+            out.add(("pattern", value))
+        elif key == "$ref" and isinstance(value, str):
+            out.add(("ref", value))
+        else:
+            _strings(value, out)
+
+
+def _values(value: object, out: set[tuple[str, str]]) -> None:
+    if isinstance(value, str):
+        out.add(("value", value))
+    elif isinstance(value, list):
+        for item in cast(list[Any], value):
+            _values(item, out)
+    elif isinstance(value, dict):
+        for k, v in cast(dict[str, Any], value).items():
+            out.add(("value", k))
+            _values(v, out)
+
+
+def new_strings_plain(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
+    """Whether every string ``new`` adds to ``old`` is plain: a name or enum/const value of
+    at most 40 letters, digits, ``_ . -`` (a value may also hold spaces), and a ``$ref`` only
+    to a ``#/$defs/<name>`` of that kind. A new pattern, format or
+    ``patternProperties`` key is never plain (conservative: regex text can say anything)."""
+    before: set[tuple[str, str]] = set()
+    after: set[tuple[str, str]] = set()
+    _strings(old, before)
+    _strings(new, after)
+    rules = {"name": _NAME, "value": _PLAIN, "ref": _REF}
+    return all(
+        kind in rules and rules[kind].match(text) is not None for kind, text in after - before
+    )
+
+
+def diff_input(old: Mapping[str, Any], new: Mapping[str, Any]) -> SchemaChange:
+    """Compare two stripped input schemas. Properties by key, ``required`` as sets, every
+    other keyword by value; ``$defs`` may only grow (a new optional property may ``$ref`` a
+    new def). Identical schemas give a benign, empty change (an output-only change)."""
+    po, pn = _map(old, "properties"), _map(new, "properties")
+    ro, rn = _names(old), _names(new)
+    added = sorted(set(pn) - set(po))
+    other = False
+    for key in sorted((set(old) | set(new)) - {"properties", "required"}):
+        if key in _DEFS:
+            do, dn = _map(old, key), _map(new, key)
+            other = other or any(k not in dn or not _same(dn[k], v) for k, v in do.items())
+        elif not _same(old.get(key), new.get(key)):
+            other = True
+    return SchemaChange(
+        added_optional=tuple(p for p in added if p not in rn),
+        added_required=tuple(sorted(rn - ro)),
+        removed=tuple(sorted(set(po) - set(pn))),
+        changed=tuple(sorted(p for p in set(po) & set(pn) if not _same(po[p], pn[p]))),
+        unrequired=tuple(sorted(ro - rn)),
+        other=other,
+        unplain=not new_strings_plain(old, new),
+    )
 
 
 @dataclass(frozen=True)
@@ -886,7 +1041,17 @@ def _retrieve(fut: asyncio.Future[Any]) -> None:
 
 # --- one server of an installed extension ----------------------------------------------
 
-DriftFn = Callable[[str, str, str | None], None]  # (server id, tool, live pin or None)
+# Only for a tool turned OFF: (server id, tool, live pin or None when it is gone).
+DriftFn = Callable[[str, str, str | None], None]
+# (server id, tool, old pin, new pin, new input schema, change, how) -> saved. A False (the
+# host's save lost: a reinstall or update) turns the tool off instead.
+RepinFn = Callable[[str, str, str, str, dict[str, Any], "SchemaChange", str], bool]
+PendingAnswer = Literal["keep", "accept", "off"]
+# (server id, tool, live pin, new schema, change) -> what to do now, and the approval's id.
+PendingFn = Callable[
+    [str, str, str, dict[str, Any], "SchemaChange"], tuple[PendingAnswer, str | None]
+]
+DeclinedFn = Callable[[str], bool]  # tool -> the owner said no to its re-pin
 MigrateFn = Callable[[str, str, str], None]  # (server id, tool, new version-2 pin)
 INVALID_PIN = "invalid"  # the live tool's input schema can't be used: never a match
 
@@ -905,6 +1070,15 @@ class HttpTarget:
 
     url: str
     secret: str | None = None
+
+
+@dataclass(frozen=True)
+class Pending:
+    """A drifted write or pay tool nobody has accepted: still callable on its old schema."""
+
+    pin: str
+    schema: dict[str, Any]
+    change: SchemaChange
 
 
 @dataclass(eq=False)
@@ -929,6 +1103,16 @@ class McpServerRuntime:
     # and migrated on the first match (``on_migrate``).
     legacy: dict[str, dict[str, Any]] = field(default_factory=dict[str, dict[str, Any]])
     on_migrate: MigrateFn | None = None
+    # PER-275: tool -> "read" | "write" | "pay" (the manifest's); a tool missing here is
+    # treated as a write that is never benign.
+    effects: dict[str, str] = field(default_factory=dict[str, str])
+    # tool -> the stripped input schema enforced on a call (moves with an accepted re-pin).
+    schemas: dict[str, dict[str, Any]] = field(default_factory=dict[str, dict[str, Any]])
+    on_repin: RepinFn | None = None
+    on_pending: PendingFn | None = None
+    declined: DeclinedFn | None = None
+    pending: dict[str, Pending] = field(default_factory=dict[str, Pending])
+    verified_once: bool = False  # a first ``_check`` has run in this process
     python: str = sys.executable
     message_cap: int = MESSAGE_CAP
     start_timeout_s: float = START_TIMEOUT_S
@@ -1034,6 +1218,8 @@ class McpServerRuntime:
     async def call(self, tool: str, args: dict[str, Any], timeout_s: float) -> dict[str, Any]:
         if tool not in self.approved:
             raise McpError(f"{tool} is not a listed tool of this server")
+        if tool in self.pending and self.declined is not None and self.declined(tool):
+            self.disable(tool, "declined")  # the owner said no: it bites on the next call
         if tool in self.disabled:
             raise McpError(disabled_text(self.ext, tool))
         for attempt in (1, 2):
@@ -1082,17 +1268,109 @@ class McpServerRuntime:
                     self._migrate(tool, cast(str, got))
                     continue
             elif got == pin:
+                self.pending.pop(tool, None)  # the server went back to what was approved
+                if self.declined is not None and self.declined(tool):
+                    self.disable(tool, "declined")  # a no holds until ext update
                 continue
-            self.disabled[tool] = "removed" if tool not in live else "changed"
-            log.warning(
-                "mcp tool disabled",
-                extra={"label": self.label, "tool": tool, "why": self.disabled[tool]},
-            )
-            if self.on_drift is not None:
-                try:
-                    self.on_drift(self.server_id, tool, got)
-                except Exception:
-                    log.exception("mcp drift alert failed")
+            elif (
+                entry is not None
+                and got is not None
+                and got != INVALID_PIN
+                and self._drifted(tool, entry, got)
+            ):
+                continue
+            if tool not in live:
+                self._off(tool, "removed", None)
+            else:  # listed twice (no live entry) or an unusable schema
+                self._off(tool, "changed", got or INVALID_PIN)
+        self.verified_once = True
+
+    def _drifted(self, tool: str, entry: Mapping[str, Any], got: str) -> bool:
+        """A usable live schema with a new pin: re-pin it, or ask. False: turn it off (the
+        save lost)."""
+        if self.declined is not None and self.declined(tool):
+            self.disable(tool, "declined")  # a no holds until ext update, whatever comes next
+            return True
+        new = input_schema(entry)  # usable: ``got`` is not INVALID_PIN
+        old = self.schemas.get(tool)
+        change = (
+            diff_input(old, new)
+            if old is not None
+            else SchemaChange((), (), (), (), (), True, True)
+        )
+        effect = self.effects.get(tool)
+        # New server text the model would read is never accepted unseen, a read tool too.
+        if (effect == "read" and not change.unplain) or (
+            effect in ("write", "pay") and change.benign
+        ):
+            return self._accept(tool, got, new, change, "auto")
+        held = self.pending.get(tool)
+        if held is not None and held.pin == got:
+            return True  # already asked about this one
+        self.pending[tool] = Pending(got, new, change)
+        log.warning("mcp tool changed; asking", extra={"label": self.label, "tool": tool})
+        if self.on_pending is None:
+            return True
+        try:
+            answer, asked = self.on_pending(self.server_id, tool, got, new, change)
+        except Exception:
+            log.exception("mcp re-pin question failed")
+            return True  # keep it as it is
+        if answer == "keep" and asked is None:
+            self.pending.pop(tool, None)  # nothing was asked (capped, no owner): try again later
+        if answer == "accept":
+            return self._accept(tool, got, new, change, "owner")
+        if answer == "off":
+            self.disable(tool, "declined")
+        return True
+
+    def _accept(
+        self, tool: str, pin: str, schema: dict[str, Any], change: SchemaChange, how: str
+    ) -> bool:
+        """Adopt the live pin and schema for ``tool`` (saved first through ``on_repin``)."""
+        old = self.approved[tool]
+        if self.on_repin is not None:
+            try:
+                saved = self.on_repin(self.server_id, tool, old, pin, schema, change, how)
+            except Exception:
+                log.exception("mcp re-pin failed to save")
+                saved = False
+            if not saved:
+                return False
+        self.approved[tool] = pin
+        self.schemas[tool] = schema
+        self.pending.pop(tool, None)
+        log.info("mcp tool re-pinned", extra={"label": self.label, "tool": tool, "how": how})
+        return True
+
+    def _off(self, tool: str, why: str, live_pin: str | None) -> None:
+        """Turn a tool off for the life of the process and tell the host (``on_drift``)."""
+        self.pending.pop(tool, None)
+        self.disabled[tool] = why
+        log.warning("mcp tool disabled", extra={"label": self.label, "tool": tool, "why": why})
+        if self.on_drift is not None:
+            try:
+                self.on_drift(self.server_id, tool, live_pin)
+            except Exception:
+                log.exception("mcp drift alert failed")
+
+    def disable(self, tool: str, why: str) -> None:
+        """Turn a tool off without an alert (the owner said no: ``declined``)."""
+        if tool in self.approved and tool not in self.disabled:
+            self.pending.pop(tool, None)
+            self.disabled[tool] = why
+            log.warning("mcp tool disabled", extra={"label": self.label, "tool": tool, "why": why})
+
+    def accept_pending(self, tool: str, live_pin: str) -> bool:
+        """The owner said yes to the change ``live_pin`` names: re-pin it. False when nothing
+        is pending for that pin (the server moved on) or the save lost (then it is off)."""
+        held = self.pending.get(tool)
+        if held is None or held.pin != live_pin or tool in self.disabled:
+            return False
+        if self._accept(tool, held.pin, held.schema, held.change, "owner"):
+            return True
+        self._off(tool, "changed", live_pin)
+        return False
 
     def _migrate(self, tool: str, pin: str) -> None:
         """A version-1 pin whose input schema still matches: re-pin it at version 2."""
@@ -1159,7 +1437,9 @@ class McpToolHandler(ContextHandler):
 
     def _validator(self) -> Any:
         # Local $refs only: jsonschema's referencing registry never fetches remote ones.
-        return jsonschema.Draft202012Validator(self.spec.args_schema)
+        return jsonschema.Draft202012Validator(
+            self.runtime.schemas.get(self.spec.name, self.spec.args_schema)
+        )
 
     async def __call__(self, args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         undeclared = set(ctx.secrets) - {f"RESONANT_SECRET_{s.upper()}" for s in self.spec.secrets}
@@ -1211,11 +1491,15 @@ __all__ = [
     "McpToolError",
     "McpToolHandler",
     "McpToolPin",
+    "Pending",
     "RpcSession",
+    "SchemaChange",
     "approve",
+    "diff_input",
     "disabled_text",
     "discover",
     "input_schema",
+    "new_strings_plain",
     "parse_pins",
     "pins_digest",
     "pins_json",
