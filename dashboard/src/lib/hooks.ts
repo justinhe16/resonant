@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Snapshot } from "@/types";
+import type { Normalized } from "@/types";
 
 export const POLL_MS = 10_000;
 
-export type Loader = (signal: AbortSignal) => Promise<Snapshot | null>;
+export type Loader = (signal: AbortSignal) => Promise<Normalized | null>;
 
 export interface PollState {
-  snapshot: Snapshot | null;
+  snapshot: Normalized | null;
   /** Set when the last fetch failed; the previous snapshot is kept. */
   error: string | null;
   /** True until the first fetch settles. */
@@ -16,7 +16,7 @@ export interface PollState {
 
 /** Fetches now, then every `intervalMs`, and again as soon as the tab becomes visible. */
 export function usePolling(load: Loader, intervalMs: number = POLL_MS): PollState {
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<Normalized | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [kick, setKick] = useState(0);

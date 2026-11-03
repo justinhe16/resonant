@@ -2,7 +2,7 @@
 
 The off-Mini half of the remote dashboard ([`docs/dashboard-plan.md`](../docs/dashboard-plan.md), DB-4). One small Fly machine that:
 
-1. **Serves the dashboard** from the committed build in `dashboard/dist`, with a `config.json` generated at boot from the environment (`{"source": "supabase", "url": SUPABASE_URL, "anon_key": SUPABASE_ANON_KEY}`; the committed local-mode `config.json` is never served). The browser logs in with Supabase Auth (password + TOTP, AAL2) and reads snapshots itself; the relay never sees the owner's session.
+1. **Serves the dashboard** from the committed build in `dashboard/dist`, with a `config.json` generated at boot from the environment (`{"source": "supabase", "url": SUPABASE_URL, "anon_key": SUPABASE_ANON_KEY}`; the committed local-mode `config.json` is never served). The browser logs in with Supabase Auth (password + TOTP, AAL2) and reads the latest snapshot (`snapshot_latest`; PER-276: the full snapshot, texts included) itself; the relay never sees the owner's session.
 2. **Runs the dead-man checker** (plan §1 D6): every minute it reads the newest snapshot's `taken_at` and health states and alerts when snapshots stop, when a health row is `failing`, or when it can't read Supabase at all, and once more on each recovery.
 3. Answers **`/healthz`** (`{"ok": true}`, or 503 when the checker has stopped checking). It says nothing about Resonant's state: the URL is public.
 
@@ -63,7 +63,7 @@ Logs carry what happened (state changes, alerts sent, failures by status code or
 
 ## The checker's read path
 
-The checker needs only the newest snapshot's `taken_at` and each health row's `name` and `state`. It reads through the `StatusSource` interface in `source.py`.
+The checker needs only the newest snapshot's `taken_at` and each health row's `name` and `state`. It reads through the `StatusSource` interface in `source.py`, from the `snapshots` history table, whose schema-2 rows are slim (PER-276: `schema, tier, taken_at, version, slim, health [{name, state, since}], counts`) and carry exactly that, so the checker never reads the 256 KiB `snapshot_latest` row and is unchanged.
 
 **`RELAY_READ=rpc` (the default, and what the migration grants).** The relay calls `POST /rest/v1/rpc/relay_status` with the public anon key as `apikey` (and as `Authorization: Bearer` only for a legacy JWT key; an `sb_publishable_` key goes in `apikey` alone) and body `{"token": "<RELAY_STATUS_TOKEN>"}`. The function is `public.relay_status(token text) returns jsonb` in [`supabase/migrations/20261016000000_relay.sql`](../supabase/migrations/20261016000000_relay.sql): `SECURITY DEFINER`, executable by `anon`, `volatile` so PostgREST takes POST only. It compares the token's SHA-256 with `relay_private.config.status_token_sha256`; a wrong token (or none configured) **raises** `42501`, which PostgREST answers with 401/403 and the relay reports as a read error ("HTTP 401"), never as "no snapshots". With no snapshots it returns `null`, else `{"taken_at": <timestamptz>, "health": [{"name": text, "state": text}, ...]}` from the newest row by `taken_at`. Nothing with write access or broad read access lives on Fly.
 

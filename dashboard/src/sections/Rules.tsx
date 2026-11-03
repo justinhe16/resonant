@@ -1,35 +1,22 @@
-import { Empty, Group, LocalOnly, Row, Rows, Section, StateBadge } from "@/components/bits";
+import { CollapsibleSection } from "@/components/CollapsibleSection";
+import { Empty, Group, Row, Rows, StateBadge } from "@/components/bits";
 import { Badge } from "@/components/ui/badge";
-import type { Repo, Snapshot, TrustRule } from "@/types";
+import type { Repo, TrustRule } from "@/types";
 
-/** The remote tier's rules and repos: how many, nothing else. */
-export function RulesCount({ snap }: { snap: Snapshot }) {
-  return (
-    <Section title="Rules and repos" description="Change rules with /rules on iMessage">
-      <div className="space-y-3">
-        <dl className="grid grid-cols-2 gap-3">
-          {(
-            [
-              ["Trust rules", snap.trust_rule_count ?? 0],
-              ["Repos", snap.repo_count ?? 0],
-            ] as const
-          ).map(([label, n]) => (
-            <div key={label} className="rounded-lg bg-muted/60 px-3 py-2.5">
-              <dt className="text-xs text-muted-foreground">{label}</dt>
-              <dd className="mt-0.5 text-xl font-semibold tabular-nums">{n}</dd>
-            </div>
-          ))}
-        </dl>
-        <LocalOnly what="The rules and repo names" />
-      </div>
-    </Section>
-  );
-}
-
-/** Local tier only. */
 export function Rules({ rules, repos }: { rules: TrustRule[]; repos: Repo[] }) {
   return (
-    <Section title="Rules and repos" description="Change rules with /rules on iMessage">
+    <CollapsibleSection
+      id="rules"
+      title="Rules and repos"
+      total={rules.length + repos.length}
+      explainer="rules"
+      summary={
+        <p className="text-xs text-muted-foreground">
+          {rules.length} trust rule{rules.length === 1 ? "" : "s"}, {repos.length} repo{repos.length === 1 ? "" : "s"}.
+          Change rules with /rules on iMessage.
+        </p>
+      }
+    >
       <div className="space-y-5">
         <Group label="Trust rules" count={rules.length}>
           {rules.length === 0 ? (
@@ -39,7 +26,7 @@ export function Rules({ rules, repos }: { rules: TrustRule[]; repos: Repo[] }) {
               {rules.map((r) => (
                 <li key={r.n} className="flex gap-3 py-2.5 text-sm first:pt-0 last:pb-0">
                   <span className="w-6 shrink-0 text-right font-mono text-muted-foreground tabular-nums">{r.n}</span>
-                  <span>{r.text}</span>
+                  <span className="min-w-0 break-words">{r.text}</span>
                 </li>
               ))}
             </ol>
@@ -66,6 +53,6 @@ export function Rules({ rules, repos }: { rules: TrustRule[]; repos: Repo[] }) {
           )}
         </Group>
       </div>
-    </Section>
+    </CollapsibleSection>
   );
 }

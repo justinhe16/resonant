@@ -1,11 +1,14 @@
-// Mirrors the snapshot contract in docs/dashboard-plan.md §3 (built by
-// resonant/dashboard/snapshot.py, schema in docs/snapshot.schema.json).
+// Mirrors the snapshot contract (built by resonant/dashboard/snapshot.py, schema in
+// docs/snapshot.schema.json), schema 2.
 //
-// One type covers both tiers. Fields marked "local only" are absent from a `remote`
-// snapshot (what leaves the Mini): no message bodies, asks, task contents, repo names or
-// URLs. Each local-only `items` list has a `brief` beside it on both tiers (codes, kinds,
-// states and times, no text), so the remote page can still list them. The UI hides
-// whatever the tier doesn't carry.
+// Both tiers carry the same fields, with free text redacted and clipped. Two fields exist only
+// in the `local` tier: `remote_url` (the Remote Control link) and an approval's `code` (the
+// second factor the owner types). The UI just doesn't show them when they are absent.
+//
+// Text written by a worker, an extension or a web page is listed by field name in the
+// `outside` array of the row that holds it; the UI renders it as plain text with a badge.
+// Schema 1 (briefs, no texts on the remote tier) is in `lib/legacy.ts` and is mapped onto
+// these types by `normalize`.
 
 /** ISO 8601 timestamp, e.g. "2026-10-16T09:30:00+00:00". */
 export type Timestamp = string;
@@ -14,215 +17,305 @@ export type Tier = "local" | "remote";
 
 export type HealthState = "ok" | "degraded" | "failing" | "unknown";
 
+export type Urgency = "urgent" | "normal" | "low";
+
+/** Counts keyed by state, e.g. {running: 2, waiting: 1}. */
+export type ByState = Record<string, number>;
+
+/** What the pusher shrank to fit the relay: nothing, history, lists, detail, or every item. */
+export type Trimmed = "none" | "history" | "lists" | "detail" | "items";
+
+/** How many rows of each list a snapshot keeps (the UI quotes these). */
+export interface Limits {
+  runs: number;
+  run_detail: number;
+  tasks: number;
+  task_detail: number;
+  approvals_recent: number;
+  approvals_pending: number;
+  questions: number;
+  pulse: number;
+  brain_tools: number;
+}
+
 export interface HealthRow {
   name: string;
   state: HealthState;
   since: Timestamp | null;
-  /** local only */
-  reason?: string | null;
+  reason: string | null;
+  outside: string[];
 }
-
-/** Counts keyed by state, e.g. {running: 2, waiting: 1}. */
-export type ByState = Record<string, number>;
 
 export interface Slots {
   used: number;
   max: number;
 }
 
+/** One audit event; run events have no `run.` prefix (start, side_effect, ready, merged, failed). */
+export interface Event {
+  at: Timestamp;
+  event: string;
+}
+
+export type TaskStatus = "queued" | "running" | "waiting" | "done" | "failed" | "cancelled";
+
+export interface TaskItem {
+  id: string;
+  kind: string;
+  runner: string;
+  extension: string | null;
+  status: TaskStatus;
+  wait_reason: string | null;
+  wake_at: Timestamp | null;
+  attempts: number;
+  step_no: number;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+  label: string | null;
+  error: string | null;
+  run_code: string | null;
+  /** only the first `limits.task_detail` tasks carry history */
+  history: Event[];
+  approval_ids: string[];
+  outside: string[];
+}
+
+export interface Tasks {
+  by_state: ByState;
+  items: TaskItem[];
+}
+
+/** side effects a run's commands showed (push, merge, release, repo, deploy, publish, http, self, message, mcp, github) */
+export type EffectKind = string;
+
+export interface RunEffect {
+  kind: EffectKind;
+  what: string;
+  /** a base push, a publish or a delete */
+  high: boolean;
+}
+
 export interface RunItem {
   code: string;
   state: string;
-  repo: string | null;
+  waiting_reason: string | null;
+  started_at: Timestamp | null;
+  ended_at: Timestamp | null;
+  /** how many side effects were detected in its commands */
+  detected: number;
+  /** "" for a run with no repo (it works in a scratch folder) */
+  repo: string;
   ask: string;
   branch: string | null;
+  base_branch: string | null;
+  head_sha: string | null;
   pr_url: string | null;
   pr_number: number | null;
-  started_at: Timestamp | null;
-  ended_at: Timestamp | null;
-  waiting_reason: string | null;
+  /** owner/name of the repo on GitHub; null for scratch runs */
+  github_repo: string | null;
+  created_at: Timestamp;
+  /** local tier only: the running session's Remote Control link */
+  remote_url?: string;
+  task_id: string | null;
+  /** where the run is: prepare, session, harvest, publish or reply */
+  step: string;
+  attempts: number;
+  sessions: number;
+  exit_code: number | null;
+  cost_usd: number;
+  tokens_in: number;
+  tokens_out: number;
+  session_seconds: number;
+  wait_seconds: number;
+  files_changed: number;
+  flagged_paths: string[];
+  summary: string | null;
+  failure: string | null;
   last_note: string | null;
-  /** side effects detected in its commands (TR-1); absent before PER-263 */
-  detected?: number;
-  remote_url?: string; // RC-1, local tier only: the running session's Remote Control link
+  /** what the worker said it did (newest last) */
+  did: string[];
+  effects: RunEffect[];
+  merged: string[];
+  merged_by: "resonant" | "run" | null;
+  /** oldest first */
+  history: Event[];
+  approval_ids: string[];
+  question_ids: number[];
+  /** Linear ids found in the ask and branch, as plain text (no workspace is known) */
+  linear_ids: string[];
+  /** false for runs past `limits.run_detail`: their texts and history are left out */
+  detail: boolean;
+  outside: string[];
 }
 
-/** PER-263: side effects detected in the listed runs' commands (TR-1), counts in both tiers. */
 export interface DetectedEffects {
-  /** by kind: push, merge, release, repo, deploy, publish, http, self, message, mcp, github */
   by_kind: Record<string, number>;
-  /** how many were high-impact (a base push, a publish, a delete) */
   high: number;
-}
-
-/** A run without its texts: no ask, repo, branch, note or link. Both tiers. */
-export interface RunBrief {
-  code: string;
-  state: string;
-  /** no repo */
-  scratch: boolean;
-  has_pr: boolean;
-  started_at: Timestamp | null;
-  ended_at: Timestamp | null;
-  waiting_reason: string | null;
 }
 
 export interface Runs {
   by_state: ByState;
-  /** absent in snapshots from before PER-263 */
-  detected?: DetectedEffects;
-  /** local only */
-  items?: RunItem[];
-  /** both tiers; absent in snapshots from before it */
-  brief?: RunBrief[];
+  detected: DetectedEffects;
+  items: RunItem[];
 }
 
-/** One change of an approval batch: its line in the batch's prompt and its own level. */
 export interface ApprovalChange {
   summary: string;
   level: string;
 }
 
-/** What one answer decides: a lone approval, or a batch (PER-254) as one row with the batch's
- * code, its strictest level and its one expiry. */
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
+
+/** What one answer decides: a lone approval, or a batch as one row with its members. */
 export interface ApprovalItem {
-  /** null for an approval sent without a code */
-  code: string | null;
+  /** the first member's approval id */
+  id: string;
+  member_ids: string[];
+  /** local tier only: the code the owner types; never in the relay */
+  code?: string;
   summary: string;
   level: string;
+  effect: "read" | "write" | "pay";
+  needs_code: boolean;
+  tool: string;
+  extension: string | null;
+  status: ApprovalStatus;
   asked_at: Timestamp;
   expires_at: Timestamp | null;
-  /** a batch's changes, in order; absent for a lone approval (and before PER-254) */
-  changes?: ApprovalChange[];
+  decided_at: Timestamp | null;
+  decided_by: string | null;
+  task_id: string | null;
+  run_code: string | null;
+  changes: ApprovalChange[] | null;
+  outside: string[];
 }
 
-/** A pending approval without its summary or code. Both tiers. */
-export interface ApprovalBrief {
-  level: string;
-  effect: "read" | "write" | "pay" | string;
-  /** the owner has to type its code to say yes */
-  needs_code: boolean;
-  asked_at: Timestamp;
-  expires_at: Timestamp | null;
+export interface Approvals {
+  open: number;
+  /** pending */
+  items: ApprovalItem[];
+  /** decided in the last 7 days, newest first */
+  recent: ApprovalItem[];
 }
 
 export interface QuestionItem {
+  id: number;
   run_code: string;
+  kind: string;
   text: string;
   options: string[];
+  urgent: boolean;
   asked_at: Timestamp;
+  outside: string[];
 }
 
-/** A worker question without its text or options. Both tiers. */
-export interface QuestionBrief {
-  run_code: string;
-  /** how many options it offers */
-  options: number;
-  asked_at: Timestamp;
+export interface Questions {
+  open: number;
+  items: QuestionItem[];
 }
-
-export type Urgency = "urgent" | "normal" | "low";
 
 export interface PulseItem {
   /** "core" or the extension that reported it; (source, key) is unique */
   source: string;
   key: string;
   title: string;
-  urgency: Urgency | string;
+  urgency: Urgency;
   /** new: the owner hasn't heard this version yet */
   state: "new" | "told";
   updated_at: Timestamp;
+  expires_at: Timestamp;
+  told_at: Timestamp | null;
+  run_code: string | null;
+  outside: string[];
 }
 
-/** An open pulse item without its key or title. Both tiers. */
-export interface PulseBrief {
-  /** "core", the extension, or "other" */
-  source: string;
-  urgency: Urgency | string;
-  state: "new" | "told";
-  updated_at: Timestamp;
-}
-
-export interface OpenList<T, B> {
+export interface Pulse {
   open: number;
-  /** local only */
-  items?: T[];
-  /** both tiers; absent in snapshots from before it */
-  brief?: B[];
-}
-
-export interface PulseList extends OpenList<PulseItem, PulseBrief> {
-  /** PER-263: items whose latest version the owner hasn't heard (muted sources included), in
-   * both tiers; absent in snapshots from before PER-263 */
-  untold?: number;
+  /** items whose latest version the owner hasn't heard (muted sources included) */
+  untold: number;
+  items: PulseItem[];
 }
 
 export interface Job {
   id: string;
+  schedule: string | null;
+  tz: string | null;
+  effect: string | null;
+  level: string | null;
   next_due: Timestamp | null;
   last_run_at: Timestamp | null;
   last_outcome: string | null;
   fail_streak: number;
 }
 
+export interface ExtTool {
+  name: string;
+  via: "cli" | "mcp";
+  server: string | null;
+  effect: string;
+  level: string;
+  description: string | null;
+}
+
+export interface McpServer {
+  id: string;
+  transport: "stdio" | "http";
+  /** the URL's host only */
+  host: string | null;
+}
+
 export interface Extension {
   name: string;
   status: "enabled" | "disabled" | "disabled_tampered";
   health: HealthState | string;
-  /** PER-263: when `/ext mute` ends, while muted; absent in snapshots from before it */
-  muted_until?: Timestamp | null;
+  muted_until: Timestamp | null;
   jobs: Job[];
+  description: string | null;
+  source_kind: "repo" | "path" | "other";
+  commit: string | null;
+  installed_at: Timestamp;
+  tools: ExtTool[];
+  mcp_servers: McpServer[];
+  /** names only */
+  secrets: string[];
+  report_max: Urgency | null;
+  repos: string[];
 }
 
 export interface Runner {
   set_up: boolean;
-  /** local only */
-  missing?: string[];
-  /** how many things are missing (both tiers) */
-  gaps?: number;
+  missing: string[];
+  gaps: number;
 }
 
-/** One of the Claude brain's tool calls (PER-258). */
+/** One of the Claude brain's tool calls. */
 export interface BrainTool {
   at: Timestamp;
   tool: string;
-  /** allowed (the read list), read, gate, granted, asked, refused, denied, resonant */
+  /** allowed (the read list), read, gate, granted, asked, refused, denied, resonant, other */
   decision: string;
-  /** redacted and clipped */
   command: string;
   cwd: string;
   status: "ok" | "error";
   write: boolean;
+  outside: string[];
 }
 
-/** BR-11: the Claude brain's long-lived session (local tier only). */
 export interface ClaudeBrain {
   state: "up" | "down";
   turns: number;
-  /** while Remote Control is on */
+  /** local tier only; while Remote Control is on */
   remote_url?: string;
-  /** its last tool calls, newest first */
-  tools?: BrainTool[];
+  /** newest first */
+  tools: BrainTool[];
 }
 
-/** A Claude brain tool call without its command or directory. Both tiers. */
-export interface BrainToolBrief {
-  at: Timestamp;
-  /** the tool's kind: "bash", "read", "mcp", ... or "other" */
-  tool: string;
-  decision: string;
-  status: "ok" | "error";
-  write: boolean;
-}
-
-/** The Claude brain's tool calls today, its session's state and its last calls, briefly. Both tiers. */
 export interface BrainActivity {
   calls_today: number;
   writes_today: number;
   /** null before its first start */
-  state?: "up" | "down" | null;
-  turns?: number;
-  recent?: BrainToolBrief[];
+  state: "up" | "down" | null;
+  turns: number;
 }
 
 export interface TrustRule {
@@ -232,6 +325,7 @@ export interface TrustRule {
 
 export interface Repo {
   name: string;
+  slug: string;
   mode: string;
   base: string;
   /** CI seen on the repo; null when not checked yet */
@@ -239,7 +333,7 @@ export interface Repo {
 }
 
 export interface Snapshot {
-  schema: 1;
+  schema: 2;
   tier: Tier;
   taken_at: Timestamp;
   /** git sha, 8 chars */
@@ -249,27 +343,29 @@ export interface Snapshot {
   autonomy: "on" | "off";
   paused: boolean;
   dry_run: boolean;
+  trimmed: Trimmed;
+  limits: Limits;
   health: HealthRow[];
-  tasks: { by_state: ByState };
+  tasks: Tasks;
   slots: Slots;
   runs: Runs;
-  approvals: OpenList<ApprovalItem, ApprovalBrief>;
-  questions: OpenList<QuestionItem, QuestionBrief>;
-  pulse: PulseList;
+  approvals: Approvals;
+  questions: Questions;
+  pulse: Pulse;
   extensions: Extension[];
+  core_jobs: Job[];
   runner: Runner;
-  /** local only */
-  trust_rules?: TrustRule[];
-  /** local only */
-  repos?: Repo[];
-  /** local only; absent before the Claude brain first starts */
-  claude_brain?: ClaudeBrain;
-  /** absent in snapshots from before PER-258 */
-  brain_activity?: BrainActivity;
-  /** how many trust rules and repos (both tiers; the rules and repos are local only) */
-  trust_rule_count?: number;
-  repo_count?: number;
+  trust_rules: TrustRule[];
+  repos: Repo[];
+  /** absent before the Claude brain first starts */
+  claude_brain?: ClaudeBrain | null;
+  brain_activity: BrainActivity;
+  trust_rule_count: number;
+  repo_count: number;
 }
+
+/** A normalized snapshot; `legacy` is set when it came from a schema 1 push (no detail). */
+export type Normalized = Snapshot & { legacy?: true };
 
 /** Runtime config read from config.json next to index.html. */
 export type DashboardConfig =

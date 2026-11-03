@@ -1,25 +1,26 @@
-import { CircleAlert, LogOut, Moon, RefreshCw, Sun, WifiOff } from "lucide-react";
-import { type ReactNode, useMemo } from "react";
+import { CircleAlert, Info, LogOut, Moon, RefreshCw, Sun, WifiOff } from "lucide-react";
+import type { ReactNode } from "react";
 import { Dot } from "@/components/bits";
+import { DetailDialog } from "@/components/detail/DetailDialog";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { type Loader, useNow, usePolling } from "@/lib/hooks";
-import { forTier, staleness, worstHealth } from "@/lib/snapshot";
+import { staleness, worstHealth } from "@/lib/snapshot";
 import { duration, relative } from "@/lib/time";
 import { useTheme } from "@/lib/theme";
 import { healthTone } from "@/lib/tone";
 import { Claude } from "@/sections/Claude";
 import { Extensions } from "@/sections/Extensions";
+import { Jobs } from "@/sections/Jobs";
 import { Pulse } from "@/sections/Pulse";
-import { Rules, RulesCount } from "@/sections/Rules";
+import { Rules } from "@/sections/Rules";
 import { SystemStatus } from "@/sections/SystemStatus";
 import { WaitingOnYou } from "@/sections/WaitingOnYou";
-import { ActiveRuns, ActiveTasks, RunsAndTasks, Slots } from "@/sections/Work";
+import { ActiveRuns, ActiveTasks, RecentRuns, Slots, Tasks } from "@/sections/Work";
 
 export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () => void }) {
-  const { snapshot: raw, error, loading, refresh } = usePolling(load);
-  const snap = useMemo(() => (raw ? forTier(raw) : null), [raw]);
+  const { snapshot: snap, error, loading, refresh } = usePolling(load);
   const now = useNow();
 
   const stale = snap ? staleness(snap, now) : null;
@@ -76,6 +77,16 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
             )}
           </Alert>
         )}
+        {snap?.legacy && (
+          <Alert variant="warn" data-testid="legacy-banner">
+            <Info />
+            <AlertTitle>Older snapshot format</AlertTitle>
+            <AlertDescription>
+              The Mini hasn't been updated yet, so this page has counts, codes and states but not the details. Restart
+              the daemon after the update to get them.
+            </AlertDescription>
+          </Alert>
+        )}
         {error && (
           <Alert variant={snap ? "warn" : "bad"} data-testid="error-banner">
             <WifiOff />
@@ -97,18 +108,19 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
             </div>
             <div className="space-y-6" data-testid="column-right">
               {guard(<WaitingOnYou snap={snap} now={now} />)}
-              {guard(<RunsAndTasks snap={snap} now={now} />)}
+              {guard(<RecentRuns snap={snap} now={now} />)}
+              {guard(<Tasks snap={snap} now={now} />)}
               {guard(<Claude snap={snap} now={now} />)}
               {guard(<Extensions snap={snap} now={now} />)}
+              {guard(<Jobs snap={snap} now={now} />)}
               {guard(<Pulse snap={snap} now={now} />)}
-              {/* The rules and repos themselves exist only in the local tier; the remote one counts them. */}
-              {snap.tier === "local"
-                ? guard(<Rules rules={snap.trust_rules ?? []} repos={snap.repos ?? []} />)
-                : snap.trust_rule_count !== undefined && guard(<RulesCount snap={snap} />)}
+              {guard(<Rules rules={snap.trust_rules} repos={snap.repos} />)}
             </div>
           </div>
         )}
       </main>
+
+      {snap && <DetailDialog snap={snap} now={now} />}
 
       {snap && (
         <footer className="mx-auto max-w-6xl px-4 pb-10 text-xs text-muted-foreground sm:px-6 lg:px-8">

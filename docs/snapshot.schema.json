@@ -1,54 +1,6 @@
 {
   "$comment": "Generated from resonant/dashboard/snapshot.py; do not edit.",
   "$defs": {
-    "ApprovalBrief": {
-      "additionalProperties": false,
-      "description": "A pending approval on both tiers: no summary, and not its code (the owner types it to\nsay yes, so it stays on the Mini and iMessage). A batch (PER-254) is one brief, like its row.",
-      "properties": {
-        "asked_at": {
-          "format": "date-time",
-          "title": "Asked At",
-          "type": "string"
-        },
-        "effect": {
-          "enum": [
-            "read",
-            "write",
-            "pay"
-          ],
-          "title": "Effect",
-          "type": "string"
-        },
-        "expires_at": {
-          "format": "date-time",
-          "title": "Expires At",
-          "type": "string"
-        },
-        "level": {
-          "enum": [
-            "L0",
-            "L1",
-            "L2",
-            "L3"
-          ],
-          "title": "Level",
-          "type": "string"
-        },
-        "needs_code": {
-          "title": "Needs Code",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "level",
-        "effect",
-        "needs_code",
-        "asked_at",
-        "expires_at"
-      ],
-      "title": "ApprovalBrief",
-      "type": "object"
-    },
     "ApprovalChange": {
       "additionalProperties": false,
       "description": "One change of a batch (BA-1): its line in the batch's prompt, and its own level.",
@@ -64,6 +16,7 @@
           "type": "string"
         },
         "summary": {
+          "maxLength": 200,
           "title": "Summary",
           "type": "string"
         }
@@ -77,7 +30,7 @@
     },
     "ApprovalItem": {
       "additionalProperties": false,
-      "description": "What one answer decides: a lone approval, or a batch (PER-254) as one row with the\nbatch's code (its first approval's), the summary ``N changes``, its strictest\nlevel, when it was asked and its one expiry. ``changes`` lists a batch's changes in\norder; it is absent for a lone approval.",
+      "description": "What one answer decides: a lone approval, or a batch (PER-254) as one row with its first\napproval's id, the summary ``N changes``, its strictest level, when it was asked and its\none expiry. ``changes`` lists a batch's changes in order; it is absent for a lone\napproval. ``code`` (the second factor an L1 yes needs) is local only.",
       "properties": {
         "asked_at": {
           "format": "date-time",
@@ -97,8 +50,7 @@
             }
           ],
           "default": null,
-          "title": "Changes",
-          "x-tier": "local"
+          "title": "Changes"
         },
         "code": {
           "anyOf": [
@@ -109,11 +61,63 @@
               "type": "null"
             }
           ],
-          "title": "Code"
+          "default": null,
+          "title": "Code",
+          "x-tier": "local"
+        },
+        "decided_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Decided At"
+        },
+        "decided_by": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Decided By"
+        },
+        "effect": {
+          "enum": [
+            "read",
+            "write",
+            "pay"
+          ],
+          "title": "Effect",
+          "type": "string"
         },
         "expires_at": {
           "format": "date-time",
           "title": "Expires At",
+          "type": "string"
+        },
+        "extension": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Extension"
+        },
+        "id": {
+          "maxLength": 64,
+          "title": "Id",
           "type": "string"
         },
         "level": {
@@ -126,17 +130,87 @@
           "title": "Level",
           "type": "string"
         },
+        "member_ids": {
+          "items": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "title": "Member Ids",
+          "type": "array"
+        },
+        "needs_code": {
+          "title": "Needs Code",
+          "type": "boolean"
+        },
+        "outside": {
+          "items": {
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "type": "string"
+          },
+          "title": "Outside",
+          "type": "array"
+        },
+        "run_code": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Run Code"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "approved",
+            "rejected",
+            "expired"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
         "summary": {
+          "maxLength": 300,
           "title": "Summary",
+          "type": "string"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Id"
+        },
+        "tool": {
+          "maxLength": 64,
+          "title": "Tool",
           "type": "string"
         }
       },
       "required": [
-        "code",
+        "id",
+        "member_ids",
         "summary",
         "level",
+        "effect",
+        "needs_code",
+        "tool",
+        "extension",
+        "status",
         "asked_at",
-        "expires_at"
+        "expires_at",
+        "decided_at",
+        "decided_by",
+        "task_id",
+        "run_code"
       ],
       "title": "ApprovalItem",
       "type": "object"
@@ -144,32 +218,23 @@
     "Approvals": {
       "additionalProperties": false,
       "properties": {
-        "brief": {
-          "items": {
-            "$ref": "#/$defs/ApprovalBrief"
-          },
-          "title": "Brief",
-          "type": "array"
-        },
         "items": {
-          "anyOf": [
-            {
-              "items": {
-                "$ref": "#/$defs/ApprovalItem"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
+          "items": {
+            "$ref": "#/$defs/ApprovalItem"
+          },
           "title": "Items",
-          "x-tier": "local"
+          "type": "array"
         },
         "open": {
           "title": "Open",
           "type": "integer"
+        },
+        "recent": {
+          "items": {
+            "$ref": "#/$defs/ApprovalItem"
+          },
+          "title": "Recent",
+          "type": "array"
         }
       },
       "required": [
@@ -180,18 +245,11 @@
     },
     "BrainActivity": {
       "additionalProperties": false,
-      "description": "PER-258: the Claude brain's tool calls today (``settings.timezone``), counts only, so\nthe remote tier has them too: every call, and the changes that ran. With its session's\nstate and turns (None before its first start) and its last calls, briefly.",
+      "description": "PER-258: the Claude brain's tool calls today (``settings.timezone``), counts only: every\ncall, and the changes that ran. With its session's state and turns (None before its first\nstart).",
       "properties": {
         "calls_today": {
           "title": "Calls Today",
           "type": "integer"
-        },
-        "recent": {
-          "items": {
-            "$ref": "#/$defs/BrainToolBrief"
-          },
-          "title": "Recent",
-          "type": "array"
         },
         "state": {
           "anyOf": [
@@ -236,16 +294,27 @@
           "type": "string"
         },
         "command": {
+          "maxLength": 200,
           "title": "Command",
           "type": "string"
         },
         "cwd": {
+          "maxLength": 120,
           "title": "Cwd",
           "type": "string"
         },
         "decision": {
+          "maxLength": 16,
           "title": "Decision",
           "type": "string"
+        },
+        "outside": {
+          "items": {
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "type": "string"
+          },
+          "title": "Outside",
+          "type": "array"
         },
         "status": {
           "enum": [
@@ -256,6 +325,7 @@
           "type": "string"
         },
         "tool": {
+          "maxLength": 64,
           "title": "Tool",
           "type": "string"
         },
@@ -276,61 +346,9 @@
       "title": "BrainTool",
       "type": "object"
     },
-    "BrainToolBrief": {
-      "additionalProperties": false,
-      "description": "One of the Claude brain's tool calls on both tiers: the tool's kind (``bash``,\n``read``, ``mcp``; ``other`` for a name that isn't a plain slug), the decision and the\noutcome. Never its command or directory.",
-      "properties": {
-        "at": {
-          "format": "date-time",
-          "title": "At",
-          "type": "string"
-        },
-        "decision": {
-          "enum": [
-            "allowed",
-            "read",
-            "gate",
-            "granted",
-            "asked",
-            "refused",
-            "denied",
-            "resonant",
-            "other"
-          ],
-          "title": "Decision",
-          "type": "string"
-        },
-        "status": {
-          "enum": [
-            "ok",
-            "error"
-          ],
-          "title": "Status",
-          "type": "string"
-        },
-        "tool": {
-          "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
-          "title": "Tool",
-          "type": "string"
-        },
-        "write": {
-          "title": "Write",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "at",
-        "tool",
-        "decision",
-        "status",
-        "write"
-      ],
-      "title": "BrainToolBrief",
-      "type": "object"
-    },
     "ClaudeBrain": {
       "additionalProperties": false,
-      "description": "BR-11: the Claude brain's session (local tier only, like the rest of the claude\ndetails): up or down, its turns, its Remote Control link while one is on, and its last\ntool calls (PER-258).",
+      "description": "BR-11: the Claude brain's session: up or down, its turns, its Remote Control link while\none is on (local only), and its last tool calls (PER-258).",
       "properties": {
         "remote_url": {
           "anyOf": [
@@ -374,7 +392,7 @@
     },
     "DetectedEffects": {
       "additionalProperties": false,
-      "description": "PER-263: the side effects detected in the commands of the runs the snapshot lists\n(TR-1, the last ``RUN_ITEMS`` runs), counts only, so the remote tier has them too:\nby kind, and how many of them were high-impact (a base push, a publish, a delete).",
+      "description": "PER-263: the side effects detected in the commands of the runs the snapshot lists\n(TR-1), counts only: by kind, and how many of them were high-impact (a base push, a\npublish, a delete).",
       "properties": {
         "by_kind": {
           "additionalProperties": {
@@ -410,9 +428,128 @@
       "title": "DetectedEffects",
       "type": "object"
     },
+    "Event": {
+      "additionalProperties": false,
+      "description": "One audit row of a run or task: when, and which action (a run's lose their ``run.``).",
+      "properties": {
+        "at": {
+          "format": "date-time",
+          "title": "At",
+          "type": "string"
+        },
+        "event": {
+          "pattern": "^[a-z][a-z0-9._:-]{0,63}$",
+          "title": "Event",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "event"
+      ],
+      "title": "Event",
+      "type": "object"
+    },
+    "ExtTool": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Description"
+        },
+        "effect": {
+          "enum": [
+            "read",
+            "write",
+            "pay"
+          ],
+          "title": "Effect",
+          "type": "string"
+        },
+        "level": {
+          "enum": [
+            "L0",
+            "L1",
+            "L2",
+            "L3"
+          ],
+          "title": "Level",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 64,
+          "title": "Name",
+          "type": "string"
+        },
+        "server": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Server"
+        },
+        "via": {
+          "enum": [
+            "cli",
+            "mcp"
+          ],
+          "title": "Via",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "via",
+        "server",
+        "effect",
+        "level",
+        "description"
+      ],
+      "title": "ExtTool",
+      "type": "object"
+    },
     "Extension": {
       "additionalProperties": false,
       "properties": {
+        "commit": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{7,12}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Commit"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
         "health": {
           "enum": [
             "ok",
@@ -423,11 +560,31 @@
           "title": "Health",
           "type": "string"
         },
+        "installed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Installed At"
+        },
         "jobs": {
           "items": {
             "$ref": "#/$defs/Job"
           },
           "title": "Jobs",
+          "type": "array"
+        },
+        "mcp_servers": {
+          "items": {
+            "$ref": "#/$defs/McpServer"
+          },
+          "title": "Mcp Servers",
           "type": "array"
         },
         "muted_until": {
@@ -447,6 +604,49 @@
           "title": "Name",
           "type": "string"
         },
+        "report_max": {
+          "anyOf": [
+            {
+              "enum": [
+                "urgent",
+                "normal",
+                "low"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Report Max"
+        },
+        "repos": {
+          "items": {
+            "maxLength": 100,
+            "type": "string"
+          },
+          "title": "Repos",
+          "type": "array"
+        },
+        "secrets": {
+          "items": {
+            "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+            "type": "string"
+          },
+          "title": "Secrets",
+          "type": "array"
+        },
+        "source_kind": {
+          "default": "other",
+          "enum": [
+            "repo",
+            "path",
+            "other"
+          ],
+          "title": "Source Kind",
+          "type": "string"
+        },
         "status": {
           "enum": [
             "enabled",
@@ -455,6 +655,13 @@
           ],
           "title": "Status",
           "type": "string"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ExtTool"
+          },
+          "title": "Tools",
+          "type": "array"
         }
       },
       "required": [
@@ -475,9 +682,18 @@
           "title": "Name",
           "type": "string"
         },
+        "outside": {
+          "items": {
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "type": "string"
+          },
+          "title": "Outside",
+          "type": "array"
+        },
         "reason": {
           "anyOf": [
             {
+              "maxLength": 200,
               "type": "string"
             },
             {
@@ -485,8 +701,7 @@
             }
           ],
           "default": null,
-          "title": "Reason",
-          "x-tier": "local"
+          "title": "Reason"
         },
         "since": {
           "anyOf": [
@@ -522,6 +737,23 @@
     "Job": {
       "additionalProperties": false,
       "properties": {
+        "effect": {
+          "anyOf": [
+            {
+              "enum": [
+                "read",
+                "write",
+                "pay"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effect"
+        },
         "fail_streak": {
           "title": "Fail Streak",
           "type": "integer"
@@ -563,6 +795,24 @@
           ],
           "title": "Last Run At"
         },
+        "level": {
+          "anyOf": [
+            {
+              "enum": [
+                "L0",
+                "L1",
+                "L2",
+                "L3"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Level"
+        },
         "next_due": {
           "anyOf": [
             {
@@ -574,6 +824,32 @@
             }
           ],
           "title": "Next Due"
+        },
+        "schedule": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Schedule"
+        },
+        "tz": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tz"
         }
       },
       "required": [
@@ -586,31 +862,105 @@
       "title": "Job",
       "type": "object"
     },
-    "Pulse": {
+    "Limits": {
+      "additionalProperties": false,
+      "description": "How much of each list the snapshot keeps, so the page can say \"the newest 50\".",
+      "properties": {
+        "approvals_pending": {
+          "default": 20,
+          "title": "Approvals Pending",
+          "type": "integer"
+        },
+        "approvals_recent": {
+          "default": 20,
+          "title": "Approvals Recent",
+          "type": "integer"
+        },
+        "brain_tools": {
+          "default": 20,
+          "title": "Brain Tools",
+          "type": "integer"
+        },
+        "pulse": {
+          "default": 60,
+          "title": "Pulse",
+          "type": "integer"
+        },
+        "questions": {
+          "default": 20,
+          "title": "Questions",
+          "type": "integer"
+        },
+        "run_detail": {
+          "default": 20,
+          "title": "Run Detail",
+          "type": "integer"
+        },
+        "runs": {
+          "default": 50,
+          "title": "Runs",
+          "type": "integer"
+        },
+        "task_detail": {
+          "default": 20,
+          "title": "Task Detail",
+          "type": "integer"
+        },
+        "tasks": {
+          "default": 50,
+          "title": "Tasks",
+          "type": "integer"
+        }
+      },
+      "title": "Limits",
+      "type": "object"
+    },
+    "McpServer": {
       "additionalProperties": false,
       "properties": {
-        "brief": {
-          "items": {
-            "$ref": "#/$defs/PulseBrief"
-          },
-          "title": "Brief",
-          "type": "array"
-        },
-        "items": {
+        "host": {
           "anyOf": [
             {
-              "items": {
-                "$ref": "#/$defs/PulseItem"
-              },
-              "type": "array"
+              "maxLength": 120,
+              "type": "string"
             },
             {
               "type": "null"
             }
           ],
-          "default": null,
+          "title": "Host"
+        },
+        "id": {
+          "maxLength": 64,
+          "title": "Id",
+          "type": "string"
+        },
+        "transport": {
+          "enum": [
+            "stdio",
+            "http"
+          ],
+          "title": "Transport",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "transport",
+        "host"
+      ],
+      "title": "McpServer",
+      "type": "object"
+    },
+    "Pulse": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/PulseItem"
+          },
           "title": "Items",
-          "x-tier": "local"
+          "type": "array"
         },
         "open": {
           "title": "Open",
@@ -628,55 +978,41 @@
       "title": "Pulse",
       "type": "object"
     },
-    "PulseBrief": {
-      "additionalProperties": false,
-      "description": "An open pulse item on both tiers: who reported it, how urgent, when. No key or title.",
-      "properties": {
-        "source": {
-          "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
-          "title": "Source",
-          "type": "string"
-        },
-        "state": {
-          "enum": [
-            "new",
-            "told"
-          ],
-          "title": "State",
-          "type": "string"
-        },
-        "updated_at": {
-          "format": "date-time",
-          "title": "Updated At",
-          "type": "string"
-        },
-        "urgency": {
-          "enum": [
-            "urgent",
-            "normal",
-            "low"
-          ],
-          "title": "Urgency",
-          "type": "string"
-        }
-      },
-      "required": [
-        "source",
-        "urgency",
-        "state",
-        "updated_at"
-      ],
-      "title": "PulseBrief",
-      "type": "object"
-    },
     "PulseItem": {
       "additionalProperties": false,
       "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
         "key": {
+          "maxLength": 120,
           "title": "Key",
           "type": "string"
         },
+        "outside": {
+          "items": {
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "type": "string"
+          },
+          "title": "Outside",
+          "type": "array"
+        },
+        "run_code": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Run Code"
+        },
         "source": {
+          "maxLength": 64,
           "title": "Source",
           "type": "string"
         },
@@ -689,8 +1025,21 @@
           "type": "string"
         },
         "title": {
+          "maxLength": 200,
           "title": "Title",
           "type": "string"
+        },
+        "told_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Told At"
         },
         "updated_at": {
           "format": "date-time",
@@ -713,36 +1062,12 @@
         "title",
         "urgency",
         "state",
-        "updated_at"
+        "updated_at",
+        "expires_at",
+        "told_at",
+        "run_code"
       ],
       "title": "PulseItem",
-      "type": "object"
-    },
-    "QuestionBrief": {
-      "additionalProperties": false,
-      "description": "An open worker question on both tiers: whose, how many options, when. No text.",
-      "properties": {
-        "asked_at": {
-          "format": "date-time",
-          "title": "Asked At",
-          "type": "string"
-        },
-        "options": {
-          "title": "Options",
-          "type": "integer"
-        },
-        "run_code": {
-          "pattern": "^[A-Z][0-9]{1,6}$",
-          "title": "Run Code",
-          "type": "string"
-        }
-      },
-      "required": [
-        "run_code",
-        "options",
-        "asked_at"
-      ],
-      "title": "QuestionBrief",
       "type": "object"
     },
     "QuestionItem": {
@@ -753,26 +1078,53 @@
           "title": "Asked At",
           "type": "string"
         },
+        "id": {
+          "title": "Id",
+          "type": "integer"
+        },
+        "kind": {
+          "maxLength": 16,
+          "title": "Kind",
+          "type": "string"
+        },
         "options": {
           "items": {
+            "maxLength": 80,
             "type": "string"
           },
           "title": "Options",
           "type": "array"
         },
+        "outside": {
+          "items": {
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "type": "string"
+          },
+          "title": "Outside",
+          "type": "array"
+        },
         "run_code": {
+          "maxLength": 16,
           "title": "Run Code",
           "type": "string"
         },
         "text": {
+          "maxLength": 600,
           "title": "Text",
           "type": "string"
+        },
+        "urgent": {
+          "title": "Urgent",
+          "type": "boolean"
         }
       },
       "required": [
+        "id",
         "run_code",
+        "kind",
         "text",
         "options",
+        "urgent",
         "asked_at"
       ],
       "title": "QuestionItem",
@@ -781,28 +1133,12 @@
     "Questions": {
       "additionalProperties": false,
       "properties": {
-        "brief": {
-          "items": {
-            "$ref": "#/$defs/QuestionBrief"
-          },
-          "title": "Brief",
-          "type": "array"
-        },
         "items": {
-          "anyOf": [
-            {
-              "items": {
-                "$ref": "#/$defs/QuestionItem"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
+          "items": {
+            "$ref": "#/$defs/QuestionItem"
+          },
           "title": "Items",
-          "x-tier": "local"
+          "type": "array"
         },
         "open": {
           "title": "Open",
@@ -819,6 +1155,7 @@
       "additionalProperties": false,
       "properties": {
         "base": {
+          "maxLength": 120,
           "title": "Base",
           "type": "string"
         },
@@ -842,7 +1179,13 @@
           "type": "string"
         },
         "name": {
+          "maxLength": 64,
           "title": "Name",
+          "type": "string"
+        },
+        "slug": {
+          "maxLength": 100,
+          "title": "Slug",
           "type": "string"
         }
       },
@@ -850,105 +1193,87 @@
         "name",
         "mode",
         "base",
-        "ci"
+        "ci",
+        "slug"
       ],
       "title": "RepoItem",
       "type": "object"
     },
-    "RunBrief": {
+    "RunEffect": {
       "additionalProperties": false,
-      "description": "A run on both tiers: no ask, repo, branch, note or link.",
+      "description": "A side effect Resonant read in a run's commands (TR-1).",
       "properties": {
-        "code": {
-          "pattern": "^[A-Z][0-9]{1,6}$",
-          "title": "Code",
-          "type": "string"
-        },
-        "ended_at": {
-          "anyOf": [
-            {
-              "format": "date-time",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Ended At"
-        },
-        "has_pr": {
-          "title": "Has Pr",
+        "high": {
+          "title": "High",
           "type": "boolean"
         },
-        "scratch": {
-          "title": "Scratch",
-          "type": "boolean"
-        },
-        "started_at": {
-          "anyOf": [
-            {
-              "format": "date-time",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Started At"
-        },
-        "state": {
+        "kind": {
           "enum": [
-            "queued",
-            "running",
-            "waiting",
-            "ready",
-            "merged",
-            "failed",
-            "cancelled",
-            "no_changes",
-            "done"
+            "push",
+            "merge",
+            "release",
+            "repo",
+            "deploy",
+            "publish",
+            "http",
+            "self",
+            "message",
+            "mcp",
+            "github"
           ],
-          "title": "State",
+          "title": "Kind",
           "type": "string"
         },
-        "waiting_reason": {
-          "anyOf": [
-            {
-              "enum": [
-                "usage_reset",
-                "question"
-              ],
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Waiting Reason"
+        "what": {
+          "maxLength": 80,
+          "title": "What",
+          "type": "string"
         }
       },
       "required": [
-        "code",
-        "state",
-        "scratch",
-        "has_pr",
-        "started_at",
-        "ended_at",
-        "waiting_reason"
+        "kind",
+        "what",
+        "high"
       ],
-      "title": "RunBrief",
+      "title": "RunEffect",
       "type": "object"
     },
     "RunItem": {
       "additionalProperties": false,
       "properties": {
+        "approval_ids": {
+          "items": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "title": "Approval Ids",
+          "type": "array"
+        },
         "ask": {
+          "maxLength": 300,
           "title": "Ask",
           "type": "string"
+        },
+        "attempts": {
+          "title": "Attempts",
+          "type": "integer"
+        },
+        "base_branch": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Base Branch"
         },
         "branch": {
           "anyOf": [
             {
+              "maxLength": 120,
               "type": "string"
             },
             {
@@ -958,12 +1283,48 @@
           "title": "Branch"
         },
         "code": {
+          "maxLength": 16,
           "title": "Code",
           "type": "string"
+        },
+        "cost_usd": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cost Usd"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "detail": {
+          "title": "Detail",
+          "type": "boolean"
         },
         "detected": {
           "title": "Detected",
           "type": "integer"
+        },
+        "did": {
+          "items": {
+            "maxLength": 80,
+            "type": "string"
+          },
+          "title": "Did",
+          "type": "array"
+        },
+        "effects": {
+          "items": {
+            "$ref": "#/$defs/RunEffect"
+          },
+          "title": "Effects",
+          "type": "array"
         },
         "ended_at": {
           "anyOf": [
@@ -977,9 +1338,83 @@
           ],
           "title": "Ended At"
         },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Exit Code"
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "maxLength": 400,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Failure"
+        },
+        "files_changed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Files Changed"
+        },
+        "flagged_paths": {
+          "items": {
+            "maxLength": 120,
+            "type": "string"
+          },
+          "title": "Flagged Paths",
+          "type": "array"
+        },
+        "github_repo": {
+          "anyOf": [
+            {
+              "maxLength": 100,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Github Repo"
+        },
+        "head_sha": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{7,40}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Head Sha"
+        },
+        "history": {
+          "items": {
+            "$ref": "#/$defs/Event"
+          },
+          "title": "History",
+          "type": "array"
+        },
         "last_note": {
           "anyOf": [
             {
+              "maxLength": 200,
               "type": "string"
             },
             {
@@ -987,6 +1422,45 @@
             }
           ],
           "title": "Last Note"
+        },
+        "linear_ids": {
+          "items": {
+            "pattern": "^[A-Z]{2,10}-\\d{1,6}$",
+            "type": "string"
+          },
+          "title": "Linear Ids",
+          "type": "array"
+        },
+        "merged": {
+          "items": {
+            "maxLength": 40,
+            "type": "string"
+          },
+          "title": "Merged",
+          "type": "array"
+        },
+        "merged_by": {
+          "anyOf": [
+            {
+              "enum": [
+                "resonant",
+                "run"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Merged By"
+        },
+        "outside": {
+          "items": {
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "type": "string"
+          },
+          "title": "Outside",
+          "type": "array"
         },
         "pr_number": {
           "anyOf": [
@@ -1002,6 +1476,7 @@
         "pr_url": {
           "anyOf": [
             {
+              "pattern": "^https://github\\.com/[\\w.-]+/[\\w.-]+/pull/\\d+$",
               "type": "string"
             },
             {
@@ -1009,6 +1484,13 @@
             }
           ],
           "title": "Pr Url"
+        },
+        "question_ids": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Question Ids",
+          "type": "array"
         },
         "remote_url": {
           "anyOf": [
@@ -1024,8 +1506,17 @@
           "x-tier": "local"
         },
         "repo": {
+          "maxLength": 100,
           "title": "Repo",
           "type": "string"
+        },
+        "session_seconds": {
+          "title": "Session Seconds",
+          "type": "number"
+        },
+        "sessions": {
+          "title": "Sessions",
+          "type": "integer"
         },
         "started_at": {
           "anyOf": [
@@ -1054,6 +1545,67 @@
           "title": "State",
           "type": "string"
         },
+        "step": {
+          "enum": [
+            "prepare",
+            "session",
+            "harvest",
+            "publish",
+            "reply"
+          ],
+          "title": "Step",
+          "type": "string"
+        },
+        "summary": {
+          "anyOf": [
+            {
+              "maxLength": 800,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Summary"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Task Id"
+        },
+        "tokens_in": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tokens In"
+        },
+        "tokens_out": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tokens Out"
+        },
+        "wait_seconds": {
+          "title": "Wait Seconds",
+          "type": "number"
+        },
         "waiting_reason": {
           "anyOf": [
             {
@@ -1073,16 +1625,35 @@
       "required": [
         "code",
         "state",
+        "waiting_reason",
+        "started_at",
+        "ended_at",
+        "detected",
         "repo",
         "ask",
         "branch",
+        "base_branch",
+        "head_sha",
         "pr_url",
         "pr_number",
-        "started_at",
-        "ended_at",
-        "waiting_reason",
+        "github_repo",
+        "created_at",
+        "task_id",
+        "step",
+        "attempts",
+        "sessions",
+        "exit_code",
+        "cost_usd",
+        "tokens_in",
+        "tokens_out",
+        "session_seconds",
+        "wait_seconds",
+        "files_changed",
+        "summary",
+        "failure",
         "last_note",
-        "detected"
+        "merged_by",
+        "detail"
       ],
       "title": "RunItem",
       "type": "object"
@@ -1096,20 +1667,12 @@
           "type": "integer"
         },
         "missing": {
-          "anyOf": [
-            {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
+          "items": {
+            "maxLength": 120,
+            "type": "string"
+          },
           "title": "Missing",
-          "x-tier": "local"
+          "type": "array"
         },
         "set_up": {
           "title": "Set Up",
@@ -1125,13 +1688,6 @@
     "Runs": {
       "additionalProperties": false,
       "properties": {
-        "brief": {
-          "items": {
-            "$ref": "#/$defs/RunBrief"
-          },
-          "title": "Brief",
-          "type": "array"
-        },
         "by_state": {
           "additionalProperties": {
             "type": "integer"
@@ -1156,20 +1712,11 @@
           "$ref": "#/$defs/DetectedEffects"
         },
         "items": {
-          "anyOf": [
-            {
-              "items": {
-                "$ref": "#/$defs/RunItem"
-              },
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
+          "items": {
+            "$ref": "#/$defs/RunItem"
+          },
           "title": "Items",
-          "x-tier": "local"
+          "type": "array"
         }
       },
       "required": [
@@ -1198,6 +1745,177 @@
       "title": "Slots",
       "type": "object"
     },
+    "TaskItem": {
+      "additionalProperties": false,
+      "description": "One durable task (a chat turn, a run, a job that needs approval, a reminder, a watch\ncheck). Never its checkpoint, result, scope, channel ref, session id or worktree.",
+      "properties": {
+        "approval_ids": {
+          "items": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "title": "Approval Ids",
+          "type": "array"
+        },
+        "attempts": {
+          "title": "Attempts",
+          "type": "integer"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "maxLength": 300,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Error"
+        },
+        "extension": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Extension"
+        },
+        "history": {
+          "items": {
+            "$ref": "#/$defs/Event"
+          },
+          "title": "History",
+          "type": "array"
+        },
+        "id": {
+          "maxLength": 64,
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "maxLength": 32,
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Label"
+        },
+        "outside": {
+          "items": {
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "type": "string"
+          },
+          "title": "Outside",
+          "type": "array"
+        },
+        "run_code": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Run Code"
+        },
+        "runner": {
+          "maxLength": 32,
+          "title": "Runner",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "queued",
+            "running",
+            "waiting",
+            "done",
+            "failed",
+            "cancelled"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "step_no": {
+          "title": "Step No",
+          "type": "integer"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "title": "Updated At",
+          "type": "string"
+        },
+        "wait_reason": {
+          "anyOf": [
+            {
+              "enum": [
+                "approval",
+                "human_reply",
+                "usage_reset",
+                "ci",
+                "veto",
+                "resource"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Wait Reason"
+        },
+        "wake_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Wake At"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "runner",
+        "extension",
+        "status",
+        "wait_reason",
+        "wake_at",
+        "attempts",
+        "step_no",
+        "created_at",
+        "updated_at",
+        "label",
+        "error",
+        "run_code"
+      ],
+      "title": "TaskItem",
+      "type": "object"
+    },
     "Tasks": {
       "additionalProperties": false,
       "properties": {
@@ -1217,6 +1935,13 @@
           },
           "title": "By State",
           "type": "object"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/TaskItem"
+          },
+          "title": "Items",
+          "type": "array"
         }
       },
       "required": [
@@ -1233,6 +1958,7 @@
           "type": "integer"
         },
         "text": {
+          "maxLength": 200,
           "title": "Text",
           "type": "string"
         }
@@ -1272,8 +1998,14 @@
           "type": "null"
         }
       ],
-      "default": null,
-      "x-tier": "local"
+      "default": null
+    },
+    "core_jobs": {
+      "items": {
+        "$ref": "#/$defs/Job"
+      },
+      "title": "Core Jobs",
+      "type": "array"
     },
     "dry_run": {
       "title": "Dry Run",
@@ -1305,6 +2037,9 @@
       ],
       "title": "Last Tick"
     },
+    "limits": {
+      "$ref": "#/$defs/Limits"
+    },
     "paused": {
       "title": "Paused",
       "type": "boolean"
@@ -1321,20 +2056,11 @@
       "type": "integer"
     },
     "repos": {
-      "anyOf": [
-        {
-          "items": {
-            "$ref": "#/$defs/RepoItem"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
+      "items": {
+        "$ref": "#/$defs/RepoItem"
+      },
       "title": "Repos",
-      "x-tier": "local"
+      "type": "array"
     },
     "runner": {
       "$ref": "#/$defs/Runner"
@@ -1343,7 +2069,7 @@
       "$ref": "#/$defs/Runs"
     },
     "schema": {
-      "const": 1,
+      "const": 2,
       "title": "Schema",
       "type": "integer"
     },
@@ -1371,26 +2097,29 @@
       "title": "Tier",
       "type": "string"
     },
+    "trimmed": {
+      "default": "none",
+      "enum": [
+        "none",
+        "history",
+        "lists",
+        "detail",
+        "items"
+      ],
+      "title": "Trimmed",
+      "type": "string"
+    },
     "trust_rule_count": {
       "default": 0,
       "title": "Trust Rule Count",
       "type": "integer"
     },
     "trust_rules": {
-      "anyOf": [
-        {
-          "items": {
-            "$ref": "#/$defs/TrustRule"
-          },
-          "type": "array"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
+      "items": {
+        "$ref": "#/$defs/TrustRule"
+      },
       "title": "Trust Rules",
-      "x-tier": "local"
+      "type": "array"
     },
     "version": {
       "pattern": "^[0-9A-Za-z.+-]{1,40}$",
@@ -1408,6 +2137,7 @@
     "autonomy",
     "paused",
     "dry_run",
+    "limits",
     "health",
     "tasks",
     "slots",
@@ -1416,7 +2146,10 @@
     "questions",
     "pulse",
     "extensions",
-    "runner"
+    "core_jobs",
+    "runner",
+    "trust_rules",
+    "repos"
   ],
   "title": "Snapshot",
   "type": "object"

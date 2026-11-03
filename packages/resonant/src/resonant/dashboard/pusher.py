@@ -31,6 +31,7 @@ While ``relay.enabled``, the daemon runs :meth:`SnapshotPusher.run` as a backgro
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import random
@@ -46,7 +47,7 @@ import httpx
 from resonant.config import RelayConfig
 from resonant.dashboard.snapshot import RELAY_HEALTH_KV, Snapshot, to_remote
 from resonant.monitor import scrub
-from resonant.redact import Redactor
+from resonant.redact import Redactor, redact_secrets, scrub_rc_links
 from resonant.secrets import SecretError, SecretMissing, SecretStore, secret_ref
 from resonant.store.db import iso, kv_get, kv_set, utcnow
 
@@ -55,9 +56,11 @@ log = logging.getLogger(__name__)
 RELAY_EXT: Final = "relay"
 SUPABASE_KEY_REF: Final = secret_ref(RELAY_EXT, "supabase_key")
 INGEST_PATH: Final = "/rest/v1/rpc/relay_ingest"
-# The migration caps ``octet_length(data::text)`` at 32768. Measured here the same way, with a
-# margin for Postgres's own number formatting, so a refused 413 never surprises us.
-MAX_BYTES: Final = 30 * 1024
+# The migration caps ``octet_length(data::text)`` at 262144 (256 KiB). Measured here the same
+# way, with a margin for Postgres's own number formatting, so a refused 413 never surprises us.
+MAX_BYTES: Final = 240 * 1024
+SHRINK_FLOOR: Final = 5  # step 2 keeps at least this many of each list
+EXT_TOOLS_TRIMMED: Final = 10  # step 1 keeps this many of each extension's tools
 MIN_GAP_S: Final = 1.0  # between pushes, even when one overran every_s
 FAIL_AFTER: Final = 3
 BACKOFF_S: Final = 2.0
@@ -81,16 +84,146 @@ def data_size(data: Any) -> int:
     return len(json.dumps(data, ensure_ascii=False, separators=(", ", ": ")).encode())
 
 
-def drop_briefs(data: dict[str, Any]) -> dict[str, Any]:
-    """``data`` without its per-item lists (each ``brief`` and ``brain_activity.recent``),
-    for a remote tier over the cap: the page still gets every count, state and health row."""
-    out = dict(data)
-    for section in ("runs", "approvals", "questions", "pulse"):
-        if isinstance(out.get(section), dict):
-            out[section] = out[section] | {"brief": []}
-    if isinstance(out.get("brain_activity"), dict):
-        out["brain_activity"] = out["brain_activity"] | {"recent": []}
+def _items(data: dict[str, Any], section: str) -> list[dict[str, Any]]:
+    node = data.get(section)
+    items = cast(dict[str, Any], node).get("items") if isinstance(node, dict) else None
+    return cast(list[dict[str, Any]], items) if isinstance(items, list) else []
+
+
+def _approval_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    node = data.get("approvals")
+    if not isinstance(node, dict):
+        return []
+    rows = cast(dict[str, Any], node)
+    return [
+        r for key in ("items", "recent") for r in cast(list[dict[str, Any]], rows.get(key) or [])
+    ]
+
+
+def _drop_outside(row: dict[str, Any], *names: str) -> None:
+    if isinstance(row.get("outside"), list):
+        row["outside"] = [o for o in cast(list[str], row["outside"]) if o not in names]
+
+
+def _lists(data: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:
+    """The (parent, key) of every list step 2 halves and step 4 empties."""
+    found: list[tuple[dict[str, Any], str]] = []
+    for section, key in (
+        ("runs", "items"),
+        ("tasks", "items"),
+        ("approvals", "recent"),
+        ("pulse", "items"),
+        ("questions", "items"),
+    ):
+        node = data.get(section)
+        if isinstance(node, dict) and isinstance(cast(dict[str, Any], node).get(key), list):
+            found.append((cast(dict[str, Any], node), key))
+    brain = data.get("claude_brain")
+    if isinstance(brain, dict) and isinstance(cast(dict[str, Any], brain).get("tools"), list):
+        found.append((cast(dict[str, Any], brain), "tools"))
+    return found
+
+
+def _cut_history(out: dict[str, Any]) -> None:
+    for run in _items(out, "runs"):
+        run["history"] = run.get("history", [])[-4:]
+        run["did"] = run.get("did", [])[-3:]
+        run["effects"] = run.get("effects", [])[-3:]
+    for task in _items(out, "tasks"):
+        task["history"] = task.get("history", [])[-3:]
+    for row in _approval_rows(out):
+        if isinstance(row.get("changes"), list):
+            row["changes"] = row["changes"][:3]
+    # An extension's tool list is the biggest block a snapshot can carry (40 tools with their
+    # descriptions each): cut it before any run or task row has to go.
+    for ext in cast(list[dict[str, Any]], out.get("extensions") or []):
+        if isinstance(ext.get("tools"), list):
+            ext["tools"] = ext["tools"][:EXT_TOOLS_TRIMMED]
+
+
+def _halve_lists(out: dict[str, Any]) -> None:
+    lists = _lists(out)
+    while data_size(out) > MAX_BYTES and any(len(p[k]) > SHRINK_FLOOR for p, k in lists):
+        for parent, key in lists:
+            parent[key] = parent[key][: max(SHRINK_FLOOR, len(parent[key]) // 2)]
+
+
+def _cut_detail(out: dict[str, Any]) -> None:
+    for run in _items(out, "runs"):
+        run.update(summary=None, failure=None, did=[], effects=[], history=[], flagged_paths=[],
+                   detail=False)  # fmt: skip
+        _drop_outside(run, "summary", "failure", "did", "effects", "flagged_paths")
+    for task in _items(out, "tasks"):
+        task.update(error=None, history=[])
+        _drop_outside(task, "error")
+    for ext in cast(list[dict[str, Any]], out.get("extensions") or []):
+        ext["tools"] = []
+    for row in _approval_rows(out):
+        if row.get("changes") is not None:
+            row["changes"] = None
+            _drop_outside(row, "changes")
+
+
+def _cut_items(out: dict[str, Any]) -> None:
+    for parent, key in _lists(out):
+        parent[key] = []
+    approvals_node = out.get("approvals")
+    if isinstance(approvals_node, dict):
+        cast(dict[str, Any], approvals_node)["items"] = []
+    out["trust_rules"] = []
+    out["repos"] = []
+
+
+# (what ``trimmed`` says, the step). Each step works on a copy and is applied after the ones
+# before it; ``_halve_lists`` stops by itself as soon as the JSON fits.
+SHRINK_STEPS: Final[tuple[tuple[str, Callable[[dict[str, Any]], None]], ...]] = (
+    ("history", _cut_history),
+    ("lists", _halve_lists),
+    ("detail", _cut_detail),
+    ("items", _cut_items),
+)
+
+
+def shrink(data: dict[str, Any]) -> dict[str, Any]:
+    """``data`` cut to fit ``MAX_BYTES``, by the first of ``SHRINK_STEPS`` (each includes the
+    ones before it) that does, with ``trimmed`` saying which; ``data`` itself when it already
+    fits, the last step's result when none does. Deterministic, and every step's output is
+    still a valid snapshot.
+
+    1. ``history``: a run's last 4 events, 3 did notes and 3 effects, a task's last 3 events,
+       a batch's first 3 changes, an extension's first ``EXT_TOOLS_TRIMMED`` tools.
+    2. ``lists``: the runs, tasks, recently decided approvals, pulse items, brain tool calls
+       and questions, halved together (each keeps at least ``SHRINK_FLOOR``) until it fits.
+    3. ``detail``: every run's summary, failure, did, effects, history and flagged paths, every
+       task's error and history, every extension's tools and every batch's changes dropped.
+    4. ``items``: every one of those lists, pending approvals, trust rules and repos emptied;
+       the counts, health, extensions and jobs stay.
+    """
+    if data_size(data) <= MAX_BYTES:
+        return data
+    out = copy.deepcopy(data)
+    for name, step in SHRINK_STEPS:
+        out["trimmed"] = name
+        step(out)
+        if data_size(out) <= MAX_BYTES:
+            break
     return out
+
+
+def _scrub(data: dict[str, Any], known: Redactor) -> dict[str, Any]:
+    """``data`` with the values ``known`` holds replaced in every string and key, then every
+    string value cleaned of credential-shaped text (the last check before the wire)."""
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, str):
+            return redact_secrets(scrub_rc_links(node))
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in cast(dict[str, Any], node).items()}
+        if isinstance(node, list):
+            return [walk(v) for v in cast(list[Any], node)]
+        return node
+
+    return cast(dict[str, Any], walk(known.deep(data)))
 
 
 def clear_relay_health(conn: sqlite3.Connection) -> None:
@@ -104,8 +237,9 @@ def clear_relay_health(conn: sqlite3.Connection) -> None:
 class SnapshotPusher:
     """Pushes the remote tier of ``snapshot()`` to Supabase. See the module doc.
 
-    ``snapshot`` returns the local-tier snapshot (``api.local_snapshot``); this class applies
-    ``to_remote`` itself, so a caller can't hand it anything wider. ``client``, ``sleep``,
+    ``snapshot(redactor)`` returns the local-tier snapshot (``api.local_snapshot``) built with
+    the relay's own secrets as known values; this class applies ``to_remote`` itself, so a
+    caller can't hand it anything wider. ``client``, ``sleep``,
     ``clock``, ``monotonic`` and ``jitter`` are injectable for tests.
     """
 
@@ -114,7 +248,7 @@ class SnapshotPusher:
         conn: sqlite3.Connection,
         config: RelayConfig,
         *,
-        snapshot: Callable[[], Awaitable[Snapshot]],
+        snapshot: Callable[[Redactor], Awaitable[Snapshot]],
         secrets: SecretStore,
         client: httpx.AsyncClient | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -169,16 +303,6 @@ class SnapshotPusher:
 
     async def _push(self) -> PushOutcome:
         try:
-            data = to_remote(await self._snapshot()).model_dump(mode="json")
-        except Exception as e:
-            return PushOutcome(False, False, f"snapshot failed ({type(e).__name__})")
-        size = data_size(data)
-        if size > MAX_BYTES:
-            data = drop_briefs(data)  # the counts and health still go out
-            size = data_size(data)
-        if size > MAX_BYTES:
-            return PushOutcome(False, True, f"snapshot too large ({size} > {MAX_BYTES} bytes)")
-        try:
             token = await self.secrets.get(SUPABASE_KEY_REF)
         except SecretMissing:
             return PushOutcome(
@@ -187,6 +311,17 @@ class SnapshotPusher:
         except SecretError as e:
             return PushOutcome(False, False, f"keychain: {e.reason}")
         redactor = Redactor([token, self.anon_key])
+        try:
+            snapshot = await self._snapshot(redactor)
+            data = _scrub(to_remote(snapshot).model_dump(mode="json"), redactor)
+        except Exception as e:
+            return PushOutcome(False, False, f"snapshot failed ({type(e).__name__})")
+        size = data_size(data)
+        if size > MAX_BYTES:
+            data = shrink(data)  # the counts and health still go out
+            size = data_size(data)
+        if size > MAX_BYTES:
+            return PushOutcome(False, True, f"snapshot too large ({size} > {MAX_BYTES} bytes)")
         body = json.dumps({"p_token": token, "p_data": data}).encode()
         outcome = _OK
         for attempt in range(1, self.config.max_attempts + 1):

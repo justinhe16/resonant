@@ -123,6 +123,17 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Task | None:
     return None if r is None else row_to_task(r)
 
 
+def recent(conn: sqlite3.Connection, limit: int = 50) -> list[Task]:
+    """Active tasks (queued, running, waiting) first, then the most recently updated; at most
+    ``limit`` (the dashboard's task list)."""
+    rows = conn.execute(
+        "SELECT * FROM tasks ORDER BY (status IN ('queued', 'running', 'waiting')) DESC,"
+        " updated_at DESC, id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [row_to_task(r) for r in rows]
+
+
 def runnable_tasks(conn: sqlite3.Connection, now: datetime, limit: int) -> list[Task]:
     """Queued tasks whose backoff (wake_at) has passed, by priority then age."""
     rows = conn.execute(

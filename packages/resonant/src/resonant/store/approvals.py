@@ -367,6 +367,36 @@ def pending_all(conn: sqlite3.Connection, now: datetime) -> list[Approval]:
     return [_row_to_approval(r) for r in rows]
 
 
+def recent_decided(conn: sqlite3.Connection, since: datetime, limit: int) -> list[Approval]:
+    """Approvals decided (approved, rejected or expired) at or after ``since``, newest
+    decision first, at most ``limit`` (the dashboard's recently decided)."""
+    rows = conn.execute(
+        """SELECT * FROM approvals WHERE status != 'pending' AND decided_at IS NOT NULL
+               AND decided_at >= ? ORDER BY decided_at DESC, id DESC LIMIT ?""",
+        (iso(since), limit),
+    ).fetchall()
+    return [_row_to_approval(r) for r in rows]
+
+
+def ids_by_task(
+    conn: sqlite3.Connection, task_ids: Sequence[str], since: datetime
+) -> dict[str, list[str]]:
+    """``task id -> approval ids`` (oldest first) of approvals asked at or after ``since``
+    by these tasks, whatever their status."""
+    if not task_ids:
+        return {}
+    rows = conn.execute(
+        """SELECT task_id, id FROM approvals
+               WHERE task_id IN (SELECT value FROM json_each(?)) AND created_at >= ?
+               ORDER BY created_at, id""",
+        (json.dumps(list(task_ids)), iso(since)),
+    ).fetchall()
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        out.setdefault(r["task_id"], []).append(r["id"])
+    return out
+
+
 def open_at(conn: sqlite3.Connection, principal: str, at: datetime) -> list[Approval]:
     """Approvals ``principal`` is an approver for that were open (created, undecided and
     unexpired) at time ``at``, whatever their status now. Oldest first.
