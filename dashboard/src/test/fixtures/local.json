@@ -982,257 +982,160 @@
         "id": "core:gateway",
         "kind": "core",
         "label": "iMessage gateway",
-        "parent": null,
         "text": "Reads new texts from Messages' chat.db and sends Resonant's replies, approval asks, pulses and briefings back over iMessage.",
         "tags": [],
         "health": "degraded",
         "check": "imessage",
-        "state": null,
         "module": "resonant/gateway/imessage/",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "messages"
       },
       {
         "id": "core:loop",
         "kind": "core",
         "label": "Event loop",
-        "parent": null,
         "text": "Turns every text, job and worker event into a durable task and runs the tasks by priority within the slot pool.",
         "tags": [],
         "health": "ok",
         "check": "loop",
-        "state": null,
         "module": "resonant/loop/",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "messages"
       },
       {
         "id": "core:router",
         "kind": "core",
         "label": "qwen router",
-        "parent": null,
         "text": "The local qwen3 model on Ollama triages each text: it answers a greeting or ack itself, builds the news check in code and hands everything else to Claude; it never writes a fact.",
         "tags": [],
         "health": "ok",
         "check": "model",
-        "state": null,
         "module": "resonant/router/",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "messages"
       },
       {
         "id": "core:brain",
         "kind": "core",
         "label": "Claude brain",
-        "parent": null,
         "text": "One long-lived Claude Code session on the subscription answers every other text in Resonant's one voice and calls Resonant's tools through the gate.",
         "tags": [],
         "health": "ok",
-        "check": null,
         "state": "up",
         "module": "resonant/runners/brain.py",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "brain"
       },
       {
         "id": "core:toolcore",
         "kind": "core",
         "label": "Tool core",
-        "parent": null,
         "text": "The one call path for the brain, jobs and watches: the registry, then the gate, then the executor; a boundary test keeps every call on it.",
         "tags": [],
-        "health": null,
-        "check": null,
-        "state": null,
         "module": "resonant/toolcore/",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "toolcore"
       },
       {
         "id": "core:gate",
         "kind": "core",
         "label": "Gate and policy",
-        "parent": null,
         "text": "Weighs each call's level against who chose it, applies trust rules and standing allows, and asks the owner by text (yes, yes always or yes <code>) when it must.",
         "tags": [],
-        "health": null,
-        "check": null,
-        "state": null,
         "module": "resonant/gate/",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "toolcore"
       },
       {
         "id": "core:executor",
         "kind": "core",
         "label": "Executor",
-        "parent": null,
         "text": "Runs an allowed call once (idempotency key), reads its Keychain secrets just before the call and writes the audit row.",
         "tags": [],
-        "health": null,
-        "check": null,
-        "state": null,
         "module": "resonant/executor.py",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "toolcore"
       },
       {
         "id": "core:scheduler",
         "kind": "core",
         "label": "Scheduler",
-        "parent": null,
         "text": "In-daemon cron: runs Resonant's own jobs (pulse, briefing, backups, prune, MCP drift) and every extension's jobs through the tool core; due runs are skipped while paused.",
         "tags": [],
         "health": "ok",
-        "check": null,
-        "state": null,
         "module": "resonant/extensions/scheduler.py",
         "last_run_at": "2026-10-16T09:00:00Z",
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "scheduler"
       },
       {
         "id": "core:workers",
         "kind": "core",
         "label": "Claude workers",
-        "parent": null,
         "text": "Claude Code runs, each on its own branch copy of a repo in ~/code or a scratch dir, push PRs with a one-hour GitHub App token for one repo and ask or note over the worker desk.",
         "tags": [],
         "health": "ok",
-        "check": null,
-        "state": null,
         "module": "resonant/runners/claude.py",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "workers"
       },
       {
         "id": "core:pulse",
         "kind": "core",
         "label": "Reports, pulse and briefing",
-        "parent": null,
         "text": "Collects run outcomes and extension reports as pulse items: urgent ones text at once, the rest go in the hourly pulse or the 08:00 briefing.",
         "tags": [],
-        "health": null,
-        "check": null,
-        "state": null,
         "module": "resonant/extensions/pulse_job.py",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "messages"
       },
       {
         "id": "core:store",
         "kind": "core",
         "label": "Store (SQLite)",
-        "parent": null,
         "text": "One SQLite file (WAL) with tasks, events, approvals, runs, trust rules, repos, pulse items, the audit log and kv state.",
         "tags": [],
         "health": "ok",
         "check": "store",
-        "state": null,
         "module": "resonant/store/",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "store"
       },
       {
         "id": "core:backups",
         "kind": "core",
         "label": "Backups",
-        "parent": null,
         "text": "core/backup copies the store every day with SQLite's online backup and keeps 7 daily and 4 weekly copies; core/prune trims old rows after a good backup.",
         "tags": [],
         "health": "unknown",
-        "check": null,
-        "state": null,
         "module": "resonant/backup.py",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "store"
       },
       {
         "id": "core:dashboard",
         "kind": "core",
         "label": "Local dashboard",
-        "parent": null,
         "text": "Serves this page and /api/dashboard on 127.0.0.1:7777, loopback only.",
         "tags": [],
-        "health": null,
-        "check": null,
-        "state": null,
         "module": "resonant/api.py",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "relay"
       },
       {
         "id": "core:relay",
         "kind": "core",
         "label": "Relay pusher",
-        "parent": null,
         "text": "Pushes the redacted remote snapshot to Supabase every minute; nothing connects into the Mini.",
         "tags": [],
         "health": "unknown",
-        "check": null,
-        "state": null,
         "module": "resonant/dashboard/pusher.py",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "relay"
       },
       {
         "id": "core:supabase",
         "kind": "core",
         "label": "Supabase",
-        "parent": null,
         "text": "Keeps the latest snapshot behind an insert-only RPC that refuses secret-shaped text; only the owner, with password and TOTP, can read it.",
         "tags": [],
-        "health": null,
-        "check": null,
-        "state": null,
         "module": "supabase/",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "relay"
       },
       {
         "id": "core:fly",
         "kind": "core",
         "label": "Fly dashboard and dead-man switch",
-        "parent": null,
         "text": "The Fly app serves this page from Supabase and checks the newest snapshot every minute; a stale snapshot or a failing check alerts the owner on ntfy.",
         "tags": [],
-        "health": null,
-        "check": null,
-        "state": null,
         "module": "relay/",
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "relay"
       },
       {
         "id": "job:core/briefing",
@@ -1244,9 +1147,6 @@
           "core job"
         ],
         "health": "ok",
-        "check": null,
-        "state": null,
-        "module": null,
         "last_run_at": "2026-10-16T08:00:00Z",
         "last_outcome": "ok",
         "ext": "core",
@@ -1262,9 +1162,6 @@
           "core job"
         ],
         "health": "ok",
-        "check": null,
-        "state": null,
-        "module": null,
         "last_run_at": "2026-10-16T09:00:00Z",
         "last_outcome": "ok",
         "ext": "core",
@@ -1280,9 +1177,6 @@
           "core job"
         ],
         "health": "ok",
-        "check": null,
-        "state": null,
-        "module": null,
         "last_run_at": "2026-10-16T03:30:00Z",
         "last_outcome": "ok",
         "ext": "core",
@@ -1292,102 +1186,72 @@
         "id": "proc:com.resonant.daemon",
         "kind": "process",
         "label": "com.resonant.daemon",
-        "parent": null,
         "text": "The Resonant daemon: one Python process with the loop, gate, scheduler and local API; launchd starts it at login and restarts it if it exits.",
         "tags": [
           "launchd",
           "plist"
         ],
         "health": "ok",
-        "check": null,
         "state": "running",
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "processes"
       },
       {
         "id": "proc:com.resonant.ollama",
         "kind": "process",
         "label": "com.resonant.ollama",
-        "parent": null,
         "text": "Ollama serving the local qwen model the router uses, kept loaded in memory.",
         "tags": [
           "launchd",
           "plist"
         ],
         "health": "ok",
-        "check": null,
         "state": "running",
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "processes"
       },
       {
         "id": "proc:com.resonant.caffeinate",
         "kind": "process",
         "label": "com.resonant.caffeinate",
-        "parent": null,
         "text": "caffeinate -i -m -s keeps the Mini awake on AC power so the daemon never sleeps.",
         "tags": [
           "launchd",
           "plist"
         ],
         "health": "ok",
-        "check": null,
         "state": "running",
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "processes"
       },
       {
         "id": "proc:com.notessync.agent",
         "kind": "process",
         "label": "com.notessync.agent",
-        "parent": null,
         "text": "Syncs notes to the notes repo every 15 minutes.",
         "tags": [
           "launchd",
           "plist"
         ],
         "health": "degraded",
-        "check": null,
         "state": "exited 1",
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
         "ext": "notes-sync",
-        "job": null
+        "group": "processes"
       },
       {
         "id": "proc:com.tradingbot.paper",
         "kind": "process",
         "label": "com.tradingbot.paper",
-        "parent": null,
         "text": "A launchd agent named after a repo in the registry.",
         "tags": [
           "launchd",
           "plist"
         ],
         "health": "ok",
-        "check": null,
         "state": "idle",
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": null,
-        "job": null
+        "group": "processes"
       },
       {
         "id": "ext:github",
         "kind": "extension",
         "label": "github",
-        "parent": null,
         "text": "github: local CLI tools; 1 read runs without asking, 1 write always asks for yes <code>, 2 scheduled jobs. GitHub issues, PRs and CI.",
         "tags": [
           "local CLI"
@@ -1395,11 +1259,9 @@
         "health": "ok",
         "check": "ext:github",
         "state": "enabled",
-        "module": null,
         "last_run_at": "2026-10-16T08:55:00Z",
-        "last_outcome": null,
         "ext": "github",
-        "job": null
+        "group": "extensions"
       },
       {
         "id": "tool:github/merge_pr",
@@ -1413,14 +1275,7 @@
           "L1",
           "always asks for yes <code>"
         ],
-        "health": null,
-        "check": null,
-        "state": null,
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": "github",
-        "job": null
+        "ext": "github"
       },
       {
         "id": "tool:github/list_prs",
@@ -1434,14 +1289,7 @@
           "L0",
           "runs without asking"
         ],
-        "health": null,
-        "check": null,
-        "state": null,
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": "github",
-        "job": null
+        "ext": "github"
       },
       {
         "id": "job:github/watch",
@@ -1454,9 +1302,6 @@
           "L0"
         ],
         "health": "ok",
-        "check": null,
-        "state": null,
-        "module": null,
         "last_run_at": "2026-10-16T08:55:00Z",
         "last_outcome": "ok",
         "ext": "github",
@@ -1473,9 +1318,6 @@
           "L0"
         ],
         "health": "ok",
-        "check": null,
-        "state": null,
-        "module": null,
         "last_run_at": "2026-10-16T08:00:00Z",
         "last_outcome": "ok",
         "ext": "github",
@@ -1490,32 +1332,21 @@
         "tags": [
           "repo"
         ],
-        "health": null,
-        "check": null,
-        "state": null,
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": "github",
-        "job": null
+        "ext": "github"
       },
       {
         "id": "ext:weather",
         "kind": "extension",
         "label": "weather",
-        "parent": null,
         "text": "weather: MCP connector to mcp.weather.example; 1 read runs without asking, 1 scheduled job. Forecast and rain alerts.",
         "tags": [
           "hosted MCP (mcp.weather.example)"
         ],
         "health": "degraded",
-        "check": null,
         "state": "enabled",
-        "module": null,
         "last_run_at": "2026-10-16T08:00:00Z",
-        "last_outcome": null,
         "ext": "weather",
-        "job": null
+        "group": "extensions"
       },
       {
         "id": "mcp:weather/weather-mcp",
@@ -1526,14 +1357,7 @@
         "tags": [
           "http"
         ],
-        "health": null,
-        "check": null,
-        "state": null,
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": "weather",
-        "job": null
+        "ext": "weather"
       },
       {
         "id": "tool:weather/weather-mcp/forecast",
@@ -1547,14 +1371,7 @@
           "L0",
           "runs without asking"
         ],
-        "health": null,
-        "check": null,
-        "state": null,
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
-        "ext": "weather",
-        "job": null
+        "ext": "weather"
       },
       {
         "id": "job:weather/forecast",
@@ -1567,9 +1384,6 @@
           "L0"
         ],
         "health": "degraded",
-        "check": null,
-        "state": null,
-        "module": null,
         "last_run_at": "2026-10-16T08:00:00Z",
         "last_outcome": "failed",
         "ext": "weather",
@@ -1579,17 +1393,12 @@
         "id": "ext:notes-sync",
         "kind": "extension",
         "label": "notes-sync",
-        "parent": null,
         "text": "notes-sync: no tools.",
         "tags": [],
         "health": "unknown",
-        "check": null,
         "state": "disabled",
-        "module": null,
-        "last_run_at": null,
-        "last_outcome": null,
         "ext": "notes-sync",
-        "job": null
+        "group": "extensions"
       }
     ],
     "edges": [
@@ -1792,6 +1601,53 @@
         "source": "ext:notes-sync",
         "target": "proc:com.notessync.agent",
         "label": "owns"
+      }
+    ],
+    "groups": [
+      {
+        "id": "messages",
+        "label": "Messages in and out",
+        "text": "Texts come in over iMessage, the event loop queues them and the qwen router triages them; replies, approval asks, pulses and briefings go back out the same way."
+      },
+      {
+        "id": "brain",
+        "label": "Claude brain",
+        "text": "One long-lived Claude Code session answers every text the router hands on and calls Resonant's tools through the gate."
+      },
+      {
+        "id": "toolcore",
+        "label": "Gate and tool core",
+        "text": "Every tool call takes one path: the registry, the gate (which asks you by text when it must) and the executor, which runs it once and audits it."
+      },
+      {
+        "id": "workers",
+        "label": "Workers",
+        "text": "Claude Code runs on their own branch copies of a repo; they push PRs and report back."
+      },
+      {
+        "id": "scheduler",
+        "label": "Scheduler and jobs",
+        "text": "In-daemon cron for Resonant's own jobs and every extension's jobs, all through the tool core."
+      },
+      {
+        "id": "extensions",
+        "label": "Extensions",
+        "text": "What you installed: each extension with its MCP servers, tools, jobs and repos, from the manifest you approved."
+      },
+      {
+        "id": "store",
+        "label": "Store and backups",
+        "text": "One SQLite file holds tasks, approvals, runs and the audit log, copied every day."
+      },
+      {
+        "id": "relay",
+        "label": "Dashboard and relay",
+        "text": "This page, served on the Mini and, from the snapshot pushed to Supabase every minute, by the Fly app that also watches for silence."
+      },
+      {
+        "id": "processes",
+        "label": "launchd agents",
+        "text": "The Mac's launchd agents Resonant knows: its own, those an extension declares and those named after a registered repo."
       }
     ],
     "processes_scanned": true,

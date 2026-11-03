@@ -7,7 +7,7 @@ import { DecisionBadge } from "@/sections/Claude";
 import { JobRow } from "@/sections/Extensions";
 import { Changes } from "@/sections/WaitingOnYou";
 import { TaskRow } from "@/sections/Work";
-import { connections, KIND_LABEL } from "@/lib/diagram";
+import { buildTree, connections, GROUP_PREFIX, KIND_LABEL, rollup, shownEdges } from "@/lib/diagram";
 import type { Route } from "@/lib/route";
 import { money, num } from "@/lib/format";
 import { approvalTitle, findApproval, githubLinks, isOutside, safeHttpsUrl, taskTitle } from "@/lib/snapshot";
@@ -717,12 +717,87 @@ function effectsView(kind: string, { snap }: Ctx): View {
   };
 }
 
-function nodeView(id: string, { snap, now }: Ctx): View {
+/** One of the diagram's high-level boxes (PER-278): what it does, the worst health inside it,
+ * its parts and the other groups it talks to. */
+function groupView(id: string, { snap }: Ctx): View {
+  const d = snap.diagram;
+  const tree = d ? buildTree(d) : null;
+  const g = tree?.byId.get(id);
+  if (!d || !tree || !g) {
+    return notKept("Diagram", `Group ${id.slice(GROUP_PREFIX.length)}`, "it lists what the daemon knows about right now", snap);
+  }
+  const roll = rollup(g);
+  const edges = shownEdges(d, tree, new Set());
+  const into = edges.filter((e) => e.target === id);
+  const out = edges.filter((e) => e.source === id);
+  const groupLink = (gid: string) => (
+    <RouteLink to={{ kind: "node", id: gid }} className="font-medium text-info">
+      {tree.byId.get(gid)?.label ?? gid}
+    </RouteLink>
+  );
+  return {
+    title: g.label,
+    description: "Group in the diagram",
+    body: (
+      <div className="space-y-5">
+        {g.text && <p className="text-sm">{g.text}</p>}
+        {roll.health && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <StateBadge tone={healthTone(roll.health)}>{roll.health}</StateBadge>
+            <span className="text-xs text-muted-foreground">the worst health inside it</span>
+          </div>
+        )}
+        <Group label="Inside" count={g.children.length}>
+          <ul className="space-y-1 text-sm">
+            {g.children.map((c) => (
+              <li key={c.id}>
+                {c.node ? <NodeLink n={c.node} /> : c.label}
+                {c.children.length > 0 && (
+                  <span className="text-muted-foreground">
+                    {" "}
+                    ({c.children.length} part{c.children.length === 1 ? "" : "s"})
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </Group>
+        {(into.length > 0 || out.length > 0) && (
+          <Group label="Talks to" count={into.length + out.length}>
+            <ul className="space-y-1 text-sm">
+              {into.map((e) => (
+                <li key={e.id}>
+                  <span className="text-muted-foreground">from </span>
+                  {groupLink(e.source)}
+                  {e.label && <span className="text-muted-foreground"> ({e.label})</span>}
+                </li>
+              ))}
+              {out.map((e) => (
+                <li key={e.id}>
+                  <span className="text-muted-foreground">to </span>
+                  {groupLink(e.target)}
+                  {e.label && <span className="text-muted-foreground"> ({e.label})</span>}
+                </li>
+              ))}
+            </ul>
+          </Group>
+        )}
+      </div>
+    ),
+  };
+}
+
+function nodeView(id: string, ctx: Ctx): View {
+  if (id.startsWith(GROUP_PREFIX)) return groupView(id, ctx);
+  const { snap, now } = ctx;
   const d = snap.diagram;
   const n = d?.nodes.find((x) => x.id === id);
   if (!d || !n) return notKept("Diagram", `Component ${id}`, "it lists what the daemon knows about right now", snap);
   const { into, out } = connections(d, n.id);
   const parent = n.parent ? d.nodes.find((x) => x.id === n.parent) : undefined;
+  const tree = buildTree(d);
+  const home = tree.byId.get(n.id)?.parent;
+  const group = !parent && home ? tree.byId.get(home) : undefined;
   const ext = n.ext && n.ext !== "core" ? snap.extensions.find((e) => e.name === n.ext) : undefined;
   const check = n.check ? snap.health.find((h) => h.name === n.check) : undefined;
   return {
@@ -742,7 +817,17 @@ function nodeView(id: string, { snap, now }: Ctx): View {
         </div>
         <Fields>
           <F label="Kind">{KIND_LABEL[n.kind]}</F>
-          <F label="Part of">{parent && <NodeLink n={parent} />}</F>
+          <F label="Part of">
+            {parent ? (
+              <NodeLink n={parent} />
+            ) : (
+              group && (
+                <RouteLink to={{ kind: "node", id: group.id }} className="font-medium text-info">
+                  {group.label}
+                </RouteLink>
+              )
+            )}
+          </F>
           <F label="Extension">
             {ext && (
               <RouteLink to={{ kind: "extension", name: ext.name }} className="font-mono font-medium text-info">

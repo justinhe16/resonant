@@ -360,6 +360,15 @@ export interface DiagramNode {
   /** the extension (`core` for a core job) whose PER-276 view it opens */
   ext?: string | null;
   job?: string | null;
+  /** its top-level box (`Diagram.groups`), on nodes without a parent; absent before PER-278 */
+  group?: string | null;
+}
+
+/** One of the high-level boxes the Diagram tab starts from (PER-278). */
+export interface DiagramGroup {
+  id: string;
+  label: string;
+  text: string;
 }
 
 export interface DiagramEdge {
@@ -371,6 +380,8 @@ export interface DiagramEdge {
 export interface Diagram {
   nodes: DiagramNode[];
   edges: DiagramEdge[];
+  /** the top-level boxes, in flow order; absent before PER-278 (the page has its own copy) */
+  groups?: DiagramGroup[];
   /** false: the daemon couldn't read launchd, so process states are unknown */
   processes_scanned?: boolean;
   /** true: over the daemon's caps; some boxes were left out */

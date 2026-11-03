@@ -47,7 +47,14 @@ from typing import Annotated, Any, Final, Literal, cast, get_args
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    StringConstraints,
+    model_serializer,
+)
 from pydantic.config import JsonDict
 
 from resonant import __version__
@@ -557,6 +564,25 @@ class DiagramNode(_Model):
     last_outcome: JobOutcome | None = None
     ext: Ident | None = None  # the extension (``core`` for a core job) it opens in its view
     job: Ident | None = None  # a job node's job id
+    # PER-278: its top-level box (``Diagram.groups``), on nodes without a parent (a child is in
+    # its parent's); None from a daemon before it
+    group: Ident | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_nulls(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Unset fields are left out (PER-278): a node is mostly nulls, and with up to
+        ``DIAGRAM_NODES`` of them that is a few KB of the relay's budget. The page reads a
+        missing field as null."""
+        out = cast(dict[str, Any], handler(self))
+        return {k: v for k, v in out.items() if v is not None}
+
+
+class DiagramGroup(_Model):
+    """One of the high-level boxes the Diagram tab starts from (``dashboard.diagram.GROUPS``)."""
+
+    id: Ident
+    label: Txt100
+    text: Txt300
 
 
 class DiagramEdge(_Model):
@@ -572,6 +598,7 @@ class Diagram(_Model):
 
     nodes: list[DiagramNode] = _list()
     edges: list[DiagramEdge] = _list()
+    groups: list[DiagramGroup] = _list()  # PER-278; empty from a daemon before it
     processes_scanned: bool = False  # False: the launchd scan didn't run (states unknown)
     truncated: bool = False  # True: over ``DIAGRAM_NODES``/``DIAGRAM_EDGES``, the rest left out
 
@@ -1278,6 +1305,7 @@ def _diagram(
         last = max((j.last_run_at for j in core_jobs if j.last_run_at), default=None)
         add(DiagramNode(
             id=f"core:{c.id}", kind="core", label=c.label, text=t(c.text, 300), health=state,
+            group=c.group,
             check=c.check if row else None, module=c.module,
             last_run_at=last if c.id == "scheduler" else None,
             state=None if brain is None or c.id != "brain" else brain.state,
@@ -1323,7 +1351,7 @@ def _diagram(
         add(DiagramNode(
             id=node_id, kind="process", label=t(label, 100), text=t(text, 300),
             tags=tags, health=cast(HealthState, agent_health), state=t(agent_state, 32),
-            ext=owner[0] if owner else None,
+            ext=owner[0] if owner else None, group="processes",
         ))  # fmt: skip
         if label in diagram_parts.AGENT_RUNS:
             link(node_id, f"core:{diagram_parts.AGENT_RUNS[label]}", "runs")
@@ -1347,7 +1375,7 @@ def _diagram(
             id=ext_id, kind="extension", label=e.name, text=t(sentence, 300),
             tags=sorted({k for _e, _l, k in kinds}), health=e.health,
             check=EXT_CHECK_PREFIX + e.name if EXT_CHECK_PREFIX + e.name in health else None,
-            state=e.status, last_run_at=last, ext=e.name,
+            state=e.status, last_run_at=last, ext=e.name, group="extensions",
         )):  # fmt: skip
             continue
         link("core:executor", ext_id, "tool calls")
@@ -1405,7 +1433,14 @@ def _diagram(
         for label, (owner, _desc) in declared.items():
             if owner == e.name:
                 link(ext_id, f"proc:{label}", "owns")
-    return Diagram(nodes=nodes, edges=edges, processes_scanned=agents is not None, truncated=cut)
+    groups = [DiagramGroup(id=g.id, label=g.label, text=g.text) for g in diagram_parts.GROUPS]
+    return Diagram(
+        nodes=nodes,
+        edges=edges,
+        groups=groups,
+        processes_scanned=agents is not None,
+        truncated=cut,
+    )
 
 
 class _Context:

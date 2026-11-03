@@ -439,6 +439,13 @@
           "title": "Edges",
           "type": "array"
         },
+        "groups": {
+          "items": {
+            "$ref": "#/$defs/DiagramGroup"
+          },
+          "title": "Groups",
+          "type": "array"
+        },
         "nodes": {
           "items": {
             "$ref": "#/$defs/DiagramNode"
@@ -494,6 +501,34 @@
       "title": "DiagramEdge",
       "type": "object"
     },
+    "DiagramGroup": {
+      "additionalProperties": false,
+      "description": "One of the high-level boxes the Diagram tab starts from (``dashboard.diagram.GROUPS``).",
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 100,
+          "title": "Label",
+          "type": "string"
+        },
+        "text": {
+          "maxLength": 300,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "text"
+      ],
+      "title": "DiagramGroup",
+      "type": "object"
+    },
     "DiagramNode": {
       "additionalProperties": false,
       "description": "One box of the architecture diagram (``Snapshot.diagram``): a core component, a launchd\nagent, an extension, or one of an extension's MCP servers, tools, jobs or repos.",
@@ -523,6 +558,19 @@
           ],
           "default": null,
           "title": "Ext"
+        },
+        "group": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Group"
         },
         "health": {
           "anyOf": [

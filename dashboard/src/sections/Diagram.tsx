@@ -1,17 +1,54 @@
-import { Info, Maximize2, Minus, Plus } from "lucide-react";
-import { type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import "@xyflow/react/dist/base.css";
+import {
+  Background,
+  BackgroundVariant,
+  BaseEdge,
+  type Edge,
+  type EdgeProps,
+  getBezierPath,
+  Handle,
+  type InternalNode,
+  MarkerType,
+  type Node,
+  type NodeMouseHandler,
+  type NodeProps,
+  Panel,
+  Position,
+  ReactFlow,
+  ReactFlowProvider,
+  useInternalNode,
+  useReactFlow,
+} from "@xyflow/react";
+import { ChevronDown, ChevronRight, Info, Maximize2, Minus, Plus } from "lucide-react";
+import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Explainer } from "@/components/Explainer";
-import { Dot, Empty, Group, RouteLink, Row, Rows } from "@/components/bits";
+import { Dot, RouteLink } from "@/components/bits";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
-import { caption, edgePath, grouped, KIND_LABEL, layout, type Layout, NODE_H, nodeRoute, visible } from "@/lib/diagram";
+import {
+  buildTree,
+  containers,
+  isOpen,
+  type Item,
+  itemRoute,
+  KIND_LABEL,
+  type Rollup,
+  rollup,
+  shownEdges,
+  subline,
+  type Tree,
+} from "@/lib/diagram";
+import { absolute, layout, type Layout } from "@/lib/diagramLayout";
 import { toHash } from "@/lib/route";
 import { healthTone } from "@/lib/tone";
 import { cn } from "@/lib/utils";
-import type { Diagram as DiagramData, DiagramNode, Snapshot } from "@/types";
+import type { Diagram as DiagramData, Snapshot } from "@/types";
 
 type Mode = "graph" | "list";
+
+const MODE_KEY = "resonant.diagram.mode";
+const OPEN_KEY = "resonant.diagram.open";
 
 function read(key: string): string | null {
   try {
@@ -31,7 +68,7 @@ function write(key: string, value: string) {
 
 /** Graph from `md` up, the stacked list on a phone; the owner's pick is remembered. */
 function initialMode(): Mode {
-  const saved = read("resonant.diagram.mode");
+  const saved = read(MODE_KEY);
   if (saved === "graph" || saved === "list") return saved;
   try {
     return window.matchMedia("(min-width: 768px)").matches ? "graph" : "list";
@@ -40,43 +77,79 @@ function initialMode(): Mode {
   }
 }
 
-const TONE_FILL: Record<string, string> = {
-  ok: "fill-ok",
-  warn: "fill-warn",
-  bad: "fill-bad",
-  info: "fill-info",
-  neutral: "fill-muted-foreground/50",
-};
+/** The boxes left open last time (both views share them); everything closed at first. */
+function initialOpen(): Set<string> {
+  try {
+    const raw: unknown = JSON.parse(read(OPEN_KEY) ?? "[]");
+    return new Set(Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Animate re-layouts unless the owner asked for less motion (or there is no screen). */
+function motionOk(): boolean {
+  try {
+    return typeof window.requestAnimationFrame === "function" && !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  } catch {
+    return false;
+  }
+}
+
+/** The same object as long as its content is: the page polls every 10 s, and an unchanged
+ * diagram shouldn't be laid out (and tweened) again. */
+function useSame<T>(value: T): T {
+  const [kept, setKept] = useState<{ value: T; seen: T; key: string }>(() => ({ value, seen: value, key: JSON.stringify(value) }));
+  if (kept.seen !== value) {
+    const key = JSON.stringify(value);
+    setKept(key === kept.key ? { ...kept, seen: value } : { value, seen: value, key });
+    return key === kept.key ? kept.value : value;
+  }
+  return kept.value;
+}
 
 export function Diagram({ snap }: { snap: Snapshot }) {
   const [mode, setMode] = useState<Mode>(initialMode);
-  const [children, setChildren] = useState(() => read("resonant.diagram.children") !== "hide");
+  const [open, setOpen] = useState<Set<string>>(initialOpen);
+  // What the last toggle asks the graph to show: the box just opened, or everything.
+  const [focus, setFocus] = useState<{ id: string | null; n: number }>({ id: null, n: 0 });
+  const d = useSame(snap.diagram);
+  const tree = useMemo(() => (d ? buildTree(d) : null), [d]);
+  const anyOpen = tree ? [...open].some((id) => tree.byId.has(id)) : false;
+
+  const change = (next: Set<string>, focusId: string | null) => {
+    write(OPEN_KEY, JSON.stringify([...next]));
+    setOpen(next);
+    setFocus((f) => ({ id: focusId, n: f.n + 1 }));
+  };
+  const toggle = (id: string) => {
+    const next = new Set(open);
+    const opening = !next.has(id);
+    if (opening) next.add(id);
+    else next.delete(id);
+    change(next, opening ? id : null);
+  };
   const pick = (m: Mode) => {
     setMode(m);
-    write("resonant.diagram.mode", m);
+    write(MODE_KEY, m);
   };
-  const toggleChildren = () => {
-    setChildren((c) => {
-      write("resonant.diagram.children", c ? "hide" : "show");
-      return !c;
-    });
-  };
-  const d = snap.diagram;
+
   return (
     <Card className="[--card-spacing:--spacing(5)]" data-testid="section-diagram">
       <CardHeader>
         <div className="flex flex-wrap items-center gap-2">
-          <h2 className="flex min-w-0 flex-1 items-center gap-1.5 text-sm font-medium">
+          <h2 className="flex min-w-48 flex-1 items-center gap-1.5 text-sm font-medium">
             How Resonant is put together
             <Explainer name="Diagram" text="diagram" />
           </h2>
-          {d && (
+          {tree && (
             <div className="flex flex-wrap items-center gap-1.5">
-              {mode === "graph" && (
-                <Button variant="outline" size="sm" onClick={toggleChildren} aria-pressed={children}>
-                  {children ? "Hide tools, jobs and repos" : "Show tools, jobs and repos"}
-                </Button>
-              )}
+              <Button variant="outline" size="sm" onClick={() => change(new Set(containers(tree)), null)}>
+                Expand all
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => change(new Set(), null)} disabled={!anyOpen}>
+                Collapse all
+              </Button>
               <div role="radiogroup" aria-label="Diagram view" className="inline-flex rounded-lg border p-0.5">
                 {(["graph", "list"] as const).map((m) => (
                   <button
@@ -99,7 +172,7 @@ export function Diagram({ snap }: { snap: Snapshot }) {
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
-        {!d ? (
+        {!d || !tree ? (
           <Alert variant="warn" data-testid="diagram-missing">
             <Info />
             <AlertTitle>No diagram in this snapshot</AlertTitle>
@@ -119,7 +192,13 @@ export function Diagram({ snap }: { snap: Snapshot }) {
                 There is more than the diagram can carry, so the last extensions or their tools are left out.
               </p>
             )}
-            {mode === "graph" ? <Graph d={d} showChildren={children} /> : <List d={d} />}
+            {mode === "graph" ? (
+              <ReactFlowProvider>
+                <Graph d={d} tree={tree} open={open} toggle={toggle} focus={focus} />
+              </ReactFlowProvider>
+            ) : (
+              <List d={d} tree={tree} open={open} toggle={toggle} />
+            )}
           </>
         )}
       </CardContent>
@@ -127,248 +206,337 @@ export function Diagram({ snap }: { snap: Snapshot }) {
   );
 }
 
+function details(item: Item) {
+  window.location.hash = toHash(itemRoute(item));
+}
+
+function RollupBadge({ roll }: { roll: Rollup }) {
+  const parts = `${roll.count} part${roll.count === 1 ? "" : "s"}`;
+  return (
+    <span
+      className="inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground tabular-nums"
+      title={roll.health ? `${parts}, worst health ${roll.health}` : parts}
+      data-testid="rollup"
+      data-health={roll.health ?? undefined}
+    >
+      {roll.health && <Dot tone={healthTone(roll.health)} className="size-1.5" />}
+      {roll.count}
+    </span>
+  );
+}
+
 // --- graph --------------------------------------------------------------------------------
 
-interface View {
-  x: number;
-  y: number;
-  k: number;
+interface BoxData extends Record<string, unknown> {
+  item: Item;
+  open: boolean;
+  roll: Rollup;
 }
 
-const MIN_K = 0.2;
-const MAX_K = 2.5;
+type BoxNode = Node<BoxData, "box">;
 
-type Pt = { x: number; y: number };
+const Toggle = createContext<(id: string) => void>(() => {});
 
-/** The two pointers of a pinch, or null. */
-function pair(points: Map<number, Pt>): [Pt, Pt] | null {
-  const [a, b] = [...points.values()];
-  return points.size === 2 && a && b ? [a, b] : null;
-}
+const KIND_BORDER: Record<string, string> = {
+  group: "border-[1.5px] border-foreground/30",
+  core: "border-info/70",
+  extension: "border-foreground/40",
+  process: "border-dashed border-muted-foreground/60",
+};
 
-function clampK(k: number) {
-  return Math.min(MAX_K, Math.max(MIN_K, k));
-}
+const ICON_BUTTON =
+  "nodrag nopan rounded p-0.5 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50";
+const HANDLE = "!size-1 !min-h-0 !min-w-0 !border-0 !bg-transparent";
 
-function fit(l: Layout, w: number, h: number): View {
-  if (!l.width || !l.height || !w || !h) return { x: 0, y: 0, k: 1 };
-  const k = clampK(Math.min(w / l.width, h / l.height, 1));
-  return { x: (w - l.width * k) / 2, y: (h - l.height * k) / 2, k };
-}
-
-/** The first view: all of it when it fits legibly, else readable size from the left, where a
- * text comes in. */
-function start(l: Layout, w: number, h: number): View {
-  const all = fit(l, w, h);
-  if (all.k >= START_K) return all;
-  return { k: START_K, x: 8, y: (h - l.height * START_K) / 2 };
-}
-
-const START_K = 0.9;
-
-function Graph({ d, showChildren }: { d: DiagramData; showChildren: boolean }) {
-  const { nodes, edges } = useMemo(() => visible(d, showChildren), [d, showChildren]);
-  const l = useMemo(() => layout(nodes, edges), [nodes, edges]);
-  const box = useRef<HTMLDivElement>(null);
-  const [size, setSize] = useState({ w: 0, h: 0 });
-  const [view, setView] = useState<View | null>(null);
-  const pointers = useRef(new Map<number, { x: number; y: number }>());
-  const moved = useRef(0);
-  const pinch = useRef<{ dist: number; k: number } | null>(null);
-
-  useEffect(() => {
-    const el = box.current;
-    if (!el) return;
-    const measure = () => setSize({ w: el.clientWidth, h: el.clientHeight });
-    measure();
-    if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  // A new layout (children shown or hidden, a node added) fits again.
-  const layoutKey = `${l.width}x${l.height}:${nodes.length}`;
-  const fitted = useRef("");
-  useEffect(() => {
-    if (fitted.current !== layoutKey && size.w) {
-      fitted.current = layoutKey;
-      setView(start(l, size.w, size.h));
-    }
-  }, [layoutKey, l, size]);
-
-  const v = view ?? start(l, size.w, size.h);
-
-  const zoomAt = useCallback((factor: number, cx: number, cy: number) => {
-    setView((cur) => {
-      const base = cur ?? { x: 0, y: 0, k: 1 };
-      const k = clampK(base.k * factor);
-      const r = k / base.k;
-      return { k, x: cx - (cx - base.x) * r, y: cy - (cy - base.y) * r };
-    });
-  }, []);
-
-  useEffect(() => {
-    const el = box.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const rect = el.getBoundingClientRect();
-      zoomAt(Math.exp(-e.deltaY * 0.0015), e.clientX - rect.left, e.clientY - rect.top);
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, [zoomAt]);
-
-  const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
-    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    moved.current = 0;
-    const two = pair(pointers.current);
-    if (two) pinch.current = { dist: Math.hypot(two[0].x - two[1].x, two[0].y - two[1].y), k: v.k };
-  };
-  const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
-    const last = pointers.current.get(e.pointerId);
-    if (!last) return;
-    const dx = e.clientX - last.x;
-    const dy = e.clientY - last.y;
-    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    moved.current += Math.abs(dx) + Math.abs(dy);
-    if (moved.current > 4 && !box.current?.hasPointerCapture?.(e.pointerId)) {
-      box.current?.setPointerCapture?.(e.pointerId);
-    }
-    const two = pair(pointers.current);
-    if (two && pinch.current) {
-      const [a, b] = two;
-      const rect = box.current?.getBoundingClientRect();
-      const dist = Math.hypot(a.x - b.x, a.y - b.y);
-      const target = clampK(pinch.current.k * (dist / pinch.current.dist));
-      zoomAt(target / v.k, (a.x + b.x) / 2 - (rect?.left ?? 0), (a.y + b.y) / 2 - (rect?.top ?? 0));
-      return;
-    }
-    if (pointers.current.size === 1) setView({ ...v, x: v.x + dx, y: v.y + dy });
-  };
-  const onPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
-    pointers.current.delete(e.pointerId);
-    if (pointers.current.size < 2) pinch.current = null;
-  };
-
-  const open = (n: DiagramNode) => {
-    if (moved.current > 4) return; // the end of a drag, not a click
-    window.location.hash = toHash(nodeRoute(n));
-  };
-
+function BoxView({ data }: NodeProps<BoxNode>) {
+  const toggle = useContext(Toggle);
+  const { item, open, roll } = data;
+  const n = item.node;
+  const parts = item.children.length > 0;
+  // A node shows its own health; a closed group, the worst of its parts.
+  const health = n ? n.health : open ? null : roll.health;
   return (
-    <div className="space-y-2">
-      <div
-        ref={box}
-        className="relative h-[70vh] min-h-80 touch-none overflow-hidden rounded-lg border bg-background select-none"
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-        data-testid="diagram-graph"
-      >
-        <svg width="100%" height="100%" role="group" aria-label="Architecture diagram" className="block">
-          <defs>
-            <marker id="diagram-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-              <path d="M0,0 L10,5 L0,10 z" className="fill-muted-foreground" />
-            </marker>
-          </defs>
-          <g transform={`translate(${v.x},${v.y}) scale(${v.k})`}>
-            {l.edges.map((pe) => (
-              <g key={`${pe.edge.source}->${pe.edge.target}`}>
-                <path
-                  d={edgePath(pe.points)}
-                  fill="none"
-                  className="stroke-muted-foreground/60"
-                  strokeWidth={1.2}
-                  markerEnd="url(#diagram-arrow)"
-                />
-                {pe.label && pe.edge.label && (
-                  <text
-                    x={pe.label.x}
-                    y={pe.label.y}
-                    textAnchor="middle"
-                    dominantBaseline="middle"
-                    className="fill-muted-foreground text-[10px]"
-                    paintOrder="stroke"
-                    stroke="var(--background)"
-                    strokeWidth={3}
-                  >
-                    {pe.edge.label}
-                  </text>
-                )}
-              </g>
-            ))}
-            {l.nodes.map((p) => (
-              <NodeBox key={p.node.id} p={p} onOpen={open} />
-            ))}
-          </g>
-        </svg>
-        <div className="absolute right-2 bottom-2 flex flex-col gap-1">
-          <Button variant="outline" size="icon" aria-label="Zoom in" onClick={() => zoomAt(1.25, size.w / 2, size.h / 2)}>
-            <Plus />
-          </Button>
-          <Button variant="outline" size="icon" aria-label="Zoom out" onClick={() => zoomAt(0.8, size.w / 2, size.h / 2)}>
-            <Minus />
-          </Button>
-          <Button variant="outline" size="icon" aria-label="Fit to view" onClick={() => setView(fit(l, size.w, size.h))}>
-            <Maximize2 />
-          </Button>
-        </div>
+    <div
+      className={cn(
+        "flex h-full w-full flex-col rounded-lg border text-card-foreground transition-colors",
+        open ? "bg-muted/40" : "cursor-pointer bg-card hover:bg-muted",
+        KIND_BORDER[n?.kind ?? "group"] ?? "border-border",
+      )}
+      data-node={item.id}
+      role="group"
+      aria-label={`${item.label}, ${n ? KIND_LABEL[n.kind] : "group"}${health ? `, ${health}` : ""}`}
+    >
+      <Handle type="target" position={Position.Left} isConnectable={false} className={HANDLE} />
+      <div className={cn("flex items-center gap-1.5 px-2.5 pt-2", open && "cursor-pointer")} data-box-header>
+        {health && <Dot tone={healthTone(health)} />}
+        <span className={cn("min-w-0 flex-1 truncate font-medium", n ? "text-xs" : "text-sm")} title={item.text || item.label}>
+          {item.label}
+        </span>
+        {parts && (
+          <button
+            type="button"
+            className={ICON_BUTTON}
+            aria-expanded={open}
+            aria-label={`${open ? "Collapse" : "Expand"} ${item.label}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              toggle(item.id);
+            }}
+          >
+            {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+          </button>
+        )}
+        <button
+          type="button"
+          className={ICON_BUTTON}
+          aria-label={`Details: ${item.label}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            details(item);
+          }}
+        >
+          <Info className="size-3.5" />
+        </button>
       </div>
-      <Legend />
+      {!open && (
+        <div className="flex items-center gap-1.5 px-2.5 pt-1">
+          <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">{subline(item)}</span>
+          {parts && n && <RollupBadge roll={roll} />}
+        </div>
+      )}
+      <Handle type="source" position={Position.Right} isConnectable={false} className={HANDLE} />
     </div>
   );
 }
 
-const KIND_STROKE: Record<string, string> = {
-  core: "stroke-info",
-  extension: "stroke-foreground/50",
-  process: "stroke-muted-foreground/60",
-};
+const NODE_TYPES = { box: BoxView };
 
-function NodeBox({ p, onOpen }: { p: { node: DiagramNode; x: number; y: number; w: number; h: number }; onOpen: (n: DiagramNode) => void }) {
-  const n = p.node;
-  const tone = n.health ? healthTone(n.health) : null;
-  const x = p.x - p.w / 2;
-  const y = p.y - p.h / 2;
-  const label = n.label.length > 30 ? `${n.label.slice(0, 29)}…` : n.label;
-  const sub = caption(n);
+type Rect = { x: number; y: number; w: number; h: number };
+
+function rectOf(n: InternalNode<BoxNode>): Rect {
+  const { x, y } = n.internals.positionAbsolute;
+  return { x, y, w: n.measured.width ?? n.width ?? 0, h: n.measured.height ?? n.height ?? 0 };
+}
+
+/** The middle of the side of `a` that faces `b`, and which side that is. */
+function facing(a: Rect, b: Rect): [number, number, Position] {
+  const dx = b.x + b.w / 2 - (a.x + a.w / 2);
+  const dy = b.y + b.h / 2 - (a.y + a.h / 2);
+  if (Math.abs(dx) / Math.max(1, a.w + b.w) >= Math.abs(dy) / Math.max(1, a.h + b.h)) {
+    return dx >= 0 ? [a.x + a.w, a.y + a.h / 2, Position.Right] : [a.x, a.y + a.h / 2, Position.Left];
+  }
+  return dy >= 0 ? [a.x + a.w / 2, a.y + a.h, Position.Bottom] : [a.x + a.w / 2, a.y, Position.Top];
+}
+
+/** An edge from the side of one box that faces the other to the side of that one facing back,
+ * so it never loops round a box whichever way the layout put them. */
+function FloatingEdge({ id, source, target, markerStart, markerEnd, label, style }: EdgeProps) {
+  const s = useInternalNode<BoxNode>(source);
+  const t = useInternalNode<BoxNode>(target);
+  if (!s || !t) return null;
+  const a = rectOf(s);
+  const b = rectOf(t);
+  const [sourceX, sourceY, sourcePosition] = facing(a, b);
+  const [targetX, targetY, targetPosition] = facing(b, a);
+  const [path, labelX, labelY] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
   return (
-    <g
-      role="button"
-      tabIndex={0}
-      aria-label={`${n.label}, ${KIND_LABEL[n.kind]}${n.health ? `, ${n.health}` : ""}`}
-      data-node={n.id}
-      className="cursor-pointer outline-none [&:focus-visible>rect]:stroke-ring [&:hover>rect]:fill-muted"
-      onClick={() => onOpen(n)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onOpen(n);
-        }
-      }}
-    >
-      <title>{n.text}</title>
-      <rect
-        x={x}
-        y={y}
-        width={p.w}
-        height={NODE_H}
-        rx={8}
-        className={cn("fill-card", KIND_STROKE[n.kind] ?? "stroke-border")}
-        strokeWidth={n.kind === "core" || n.kind === "extension" ? 1.6 : 1}
-        strokeDasharray={n.kind === "process" ? "4 3" : undefined}
-      />
-      {tone && <circle cx={x + 12} cy={y + 16} r={4} className={TONE_FILL[tone]} />}
-      <text x={x + (tone ? 22 : 10)} y={y + 19} className="fill-foreground text-[12px] font-medium">
-        {label}
-      </text>
-      <text x={x + 10} y={y + 35} className="fill-muted-foreground text-[10px]">
-        {sub.length > 40 ? `${sub.slice(0, 39)}…` : sub}
-      </text>
-    </g>
+    <BaseEdge
+      id={id}
+      path={path}
+      markerStart={markerStart}
+      markerEnd={markerEnd}
+      label={label}
+      labelX={labelX}
+      labelY={labelY}
+      labelBgPadding={[3, 1]}
+      labelBgBorderRadius={3}
+      style={style}
+    />
+  );
+}
+
+const EDGE_TYPES = { floating: FloatingEdge };
+const ARROW = { type: MarkerType.ArrowClosed, width: 14, height: 14, color: "var(--muted-foreground)" } as const;
+
+const TWEEN_MS = 280;
+const MIN_ZOOM = 0.15;
+
+type Frame = Map<string, { x: number; y: number; w: number; h: number }>;
+interface Tween {
+  target: BoxNode[];
+  from: Frame | null;
+  k: number;
+}
+
+function frameOf(nodes: BoxNode[]): Frame {
+  return new Map(nodes.map((n) => [n.id, { x: n.position.x, y: n.position.y, w: n.width ?? 0, h: n.height ?? 0 }]));
+}
+
+function tweened({ target, from, k }: Tween): BoxNode[] {
+  if (!from || k >= 1) return target;
+  const e = 1 - (1 - k) ** 3;
+  const mix = (a: number, b: number) => a + (b - a) * e;
+  return target.map((n) => {
+    const f = from.get(n.id);
+    if (!f) return n;
+    return {
+      ...n,
+      position: { x: mix(f.x, n.position.x), y: mix(f.y, n.position.y) },
+      width: mix(f.w, n.width ?? 0),
+      height: mix(f.h, n.height ?? 0),
+    };
+  });
+}
+
+/** `target`, reached smoothly from where the boxes were (a box new to the screen starts where
+ * it ends; with reduced motion, or no screen, everything jumps). */
+function useTween(target: BoxNode[]): BoxNode[] {
+  const [anim, setAnim] = useState<Tween>({ target, from: null, k: 1 });
+  let current = anim;
+  if (anim.target !== target) {
+    // A new layout starts from what is on screen now (adjusting state on a prop change).
+    current = { target, from: motionOk() ? frameOf(tweened(anim)) : null, k: 0 };
+    setAnim(current);
+  }
+  const { from, target: goal } = current;
+  useEffect(() => {
+    if (!from) return;
+    let raf = 0;
+    const start = performance.now();
+    const step = (now: number) => {
+      const k = Math.min(1, (now - start) / TWEEN_MS);
+      setAnim((a) => (a.target === goal ? { ...a, k } : a));
+      if (k < 1) raf = window.requestAnimationFrame(step);
+    };
+    raf = window.requestAnimationFrame(step);
+    return () => window.cancelAnimationFrame(raf);
+  }, [from, goal]);
+  return tweened(current);
+}
+
+function toNodes(l: Layout, open: ReadonlySet<string>): BoxNode[] {
+  return l.boxes.map((b) => ({
+    id: b.item.id,
+    type: "box",
+    position: { x: b.x, y: b.y },
+    width: b.w,
+    height: b.h,
+    parentId: b.item.parent ?? undefined,
+    zIndex: b.item.depth,
+    draggable: false,
+    selectable: false,
+    data: { item: b.item, open: isOpen(b.item, open), roll: rollup(b.item) },
+  }));
+}
+
+function Graph({
+  d,
+  tree,
+  open,
+  toggle,
+  focus,
+}: {
+  d: DiagramData;
+  tree: Tree;
+  open: ReadonlySet<string>;
+  toggle: (id: string) => void;
+  focus: { id: string | null; n: number };
+}) {
+  const edges = useMemo(() => shownEdges(d, tree, open, true), [d, tree, open]);
+  const l = useMemo(() => layout(tree, open, edges), [tree, open, edges]);
+  const nodes = useTween(useMemo(() => toNodes(l, open), [l, open]));
+  const rfEdges: Edge[] = useMemo(
+    () =>
+      edges.map((e) => ({
+        id: e.id,
+        type: "floating",
+        source: e.source,
+        target: e.target,
+        label: e.label,
+        markerStart: e.both ? ARROW : undefined,
+        // Over the open box an end sits in, under the boxes themselves.
+        zIndex: Math.max(tree.byId.get(e.source)?.depth ?? 0, tree.byId.get(e.target)?.depth ?? 0),
+        markerEnd: ARROW,
+        focusable: false,
+      })),
+    [edges, tree],
+  );
+  const rf = useReactFlow<BoxNode>();
+  const box = useRef<HTMLDivElement>(null);
+
+  /** Show this part of the canvas, at most at 100%. */
+  const show = useCallback(
+    (r: { x: number; y: number; w: number; h: number }, duration: number) => {
+      const el = box.current;
+      const W = el?.clientWidth ?? 0;
+      const H = el?.clientHeight ?? 0;
+      if (!W || !H || !r.w || !r.h) return;
+      const pad = 24;
+      const zoom = Math.max(MIN_ZOOM, Math.min(1, (W - pad * 2) / r.w, (H - pad * 2) / r.h));
+      void rf.setViewport({ x: W / 2 - (r.x + r.w / 2) * zoom, y: H / 2 - (r.y + r.h / 2) * zoom, zoom }, { duration });
+    },
+    [rf],
+  );
+  const fitAll = (duration: number) => show({ x: 0, y: 0, w: l.width, h: l.height }, duration);
+
+  // After a toggle: the box just opened, or everything.
+  const seen = useRef(focus.n);
+  useEffect(() => {
+    if (seen.current === focus.n) return;
+    seen.current = focus.n;
+    const at = focus.id ? absolute(l).get(focus.id) : undefined;
+    show(at ?? { x: 0, y: 0, w: l.width, h: l.height }, motionOk() ? TWEEN_MS : 0);
+  }, [focus, l, show]);
+
+  const onNodeClick: NodeMouseHandler<BoxNode> = (event, node) => {
+    const { item, open: shownOpen } = node.data;
+    // An open box closes from its header only: its body is where its parts are.
+    if (shownOpen) {
+      if (event.target instanceof Element && event.target.closest("[data-box-header]")) toggle(item.id);
+      return;
+    }
+    if (item.children.length > 0) toggle(item.id);
+    else details(item);
+  };
+
+  return (
+    <div className="space-y-2">
+      <Toggle.Provider value={toggle}>
+        <div ref={box} className="relative h-[60vh] min-h-80 overflow-hidden rounded-lg border bg-background" data-testid="diagram-graph">
+          <ReactFlow<BoxNode>
+            nodes={nodes}
+            edges={rfEdges}
+            nodeTypes={NODE_TYPES}
+            edgeTypes={EDGE_TYPES}
+            onNodeClick={onNodeClick}
+            onInit={() => fitAll(0)}
+            nodesDraggable={false}
+            nodesConnectable={false}
+            nodesFocusable={false}
+            edgesFocusable={false}
+            elementsSelectable={false}
+            minZoom={MIN_ZOOM}
+            maxZoom={2.5}
+            proOptions={{ hideAttribution: true }}
+            aria-label="Architecture diagram"
+          >
+            <Background variant={BackgroundVariant.Dots} gap={18} size={1} color="var(--border)" />
+            <Panel position="bottom-right" className="flex flex-col gap-1">
+              <Button variant="outline" size="icon" aria-label="Zoom in" onClick={() => void rf.zoomIn({ duration: 150 })}>
+                <Plus />
+              </Button>
+              <Button variant="outline" size="icon" aria-label="Zoom out" onClick={() => void rf.zoomOut({ duration: 150 })}>
+                <Minus />
+              </Button>
+              <Button variant="outline" size="icon" aria-label="Fit to view" onClick={() => fitAll(motionOk() ? 200 : 0)}>
+                <Maximize2 />
+              </Button>
+            </Panel>
+          </ReactFlow>
+        </div>
+      </Toggle.Provider>
+      <Legend />
+    </div>
   );
 }
 
@@ -376,10 +544,10 @@ function Legend() {
   return (
     <p className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
       <span className="inline-flex items-center gap-1.5">
-        <span className="inline-block h-3 w-5 rounded-sm border-[1.6px] border-info" /> core
+        <span className="inline-block h-3 w-5 rounded-sm border-[1.5px] border-foreground/30" /> group
       </span>
       <span className="inline-flex items-center gap-1.5">
-        <span className="inline-block h-3 w-5 rounded-sm border-[1.6px] border-foreground/50" /> extension
+        <span className="inline-block h-3 w-5 rounded-sm border border-info/70" /> core
       </span>
       <span className="inline-flex items-center gap-1.5">
         <span className="inline-block h-3 w-5 rounded-sm border border-dashed border-muted-foreground/60" /> launchd agent
@@ -387,84 +555,96 @@ function Legend() {
       <span className="inline-flex items-center gap-1.5">
         <Dot tone="ok" /> healthy <Dot tone="warn" /> degraded <Dot tone="bad" /> failing
       </span>
-      <span>Drag to pan, scroll or pinch to zoom; click a box for its details.</span>
+      <span>Click a box to open it into its parts, (i) for its details. Drag to pan, scroll or pinch to zoom.</span>
     </p>
   );
 }
 
 // --- list (phones) ------------------------------------------------------------------------
 
-function NodeRow({ n, d, nested }: { n: DiagramNode; d: DiagramData; nested?: DiagramNode[] }) {
-  const byId = useMemo(() => new Map(d.nodes.map((x) => [x.id, x])), [d]);
-  const out = d.edges.filter((e) => e.source === n.id && byId.get(e.target) && byId.get(e.target)?.parent !== n.id);
+function ListItem({
+  item,
+  open,
+  toggle,
+  outs,
+}: {
+  item: Item;
+  open: ReadonlySet<string>;
+  toggle: (id: string) => void;
+  outs: Map<string, ReactNode>;
+}) {
+  const n = item.node;
+  const parts = item.children.length > 0;
+  const shown = isOpen(item, open);
+  const roll = rollup(item);
+  const health = n ? n.health : roll.health;
   return (
-    <Row className="relative">
+    <li className="py-2" data-item={item.id}>
       <div className="flex items-center gap-2">
-        {n.health && <Dot tone={healthTone(n.health)} />}
-        <RouteLink to={nodeRoute(n)} stretch className="min-w-0 truncate text-sm font-medium">
-          {n.label}
+        {parts ? (
+          <button
+            type="button"
+            className="-ml-1 rounded p-0.5 text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50"
+            aria-expanded={shown}
+            aria-label={`${shown ? "Collapse" : "Expand"} ${item.label}`}
+            onClick={() => toggle(item.id)}
+          >
+            {shown ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+          </button>
+        ) : (
+          <span className="w-4 shrink-0" aria-hidden />
+        )}
+        {health && <Dot tone={healthTone(health)} />}
+        <RouteLink to={itemRoute(item)} className={cn("min-w-0 truncate text-sm", n ? "font-medium" : "font-semibold")}>
+          {item.label}
         </RouteLink>
-        <span className="ml-auto shrink-0 text-xs text-muted-foreground">{caption(n)}</span>
+        <span className="ml-auto flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+          {n && subline(item)}
+          {parts && !shown && <RollupBadge roll={roll} />}
+        </span>
       </div>
-      <p className="mt-1 text-xs text-muted-foreground">{n.text}</p>
-      {out.length > 0 && (
-        <p className="mt-1 text-xs">
-          <span className="text-muted-foreground">→ </span>
-          {out.map((e, i) => (
-            <span key={`${e.source}-${e.target}`}>
-              {i > 0 && ", "}
-              {byId.get(e.target)?.label}
-              {e.label && <span className="text-muted-foreground"> ({e.label})</span>}
-            </span>
+      {item.text && <p className="mt-1 ml-6 text-xs text-muted-foreground">{item.text}</p>}
+      {outs.get(item.id)}
+      {shown && (
+        <ul className="mt-1 ml-3 divide-y border-l pl-3">
+          {item.children.map((c) => (
+            <ListItem key={c.id} item={c} open={open} toggle={toggle} outs={outs} />
           ))}
-        </p>
+        </ul>
       )}
-      {nested && nested.length > 0 && (
-        <div className="relative z-10 mt-2 border-l pl-3">
-          <Rows>
-            {nested.map((c) => (
-              <NodeRow key={c.id} n={c} d={d} />
-            ))}
-          </Rows>
-        </div>
-      )}
-    </Row>
+    </li>
   );
 }
 
-function List({ d }: { d: DiagramData }) {
-  const g = useMemo(() => grouped(d), [d]);
-  return (
-    <div className="space-y-5" data-testid="diagram-list">
-      <Group label="Core" count={g.core.length}>
-        <Rows>
-          {g.core.map((n) => (
-            <NodeRow key={n.id} n={n} d={d} nested={g.childrenOf(n.id)} />
+function List({ d, tree, open, toggle }: { d: DiagramData; tree: Tree; open: ReadonlySet<string>; toggle: (id: string) => void }) {
+  // Where each group sends things, as the graph shows them with every box closed.
+  const outs = useMemo(() => {
+    const out = new Map<string, ReactNode>();
+    const edges = shownEdges(d, tree, new Set());
+    for (const g of tree.roots) {
+      const mine = edges.filter((e) => e.source === g.id);
+      if (!mine.length) continue;
+      out.set(
+        g.id,
+        <p className="mt-1 ml-6 text-xs">
+          <span className="text-muted-foreground">→ </span>
+          {mine.map((e, i) => (
+            <span key={e.id}>
+              {i > 0 && ", "}
+              {tree.byId.get(e.target)?.label}
+              {e.label && <span className="text-muted-foreground"> ({e.label})</span>}
+            </span>
           ))}
-        </Rows>
-      </Group>
-      <Group label="Processes" count={g.processes.length}>
-        {g.processes.length === 0 ? (
-          <Empty>No launchd agents found.</Empty>
-        ) : (
-          <Rows>
-            {g.processes.map((n) => (
-              <NodeRow key={n.id} n={n} d={d} />
-            ))}
-          </Rows>
-        )}
-      </Group>
-      <Group label="Extensions" count={g.extensions.length}>
-        {g.extensions.length === 0 ? (
-          <Empty>No extensions installed.</Empty>
-        ) : (
-          <Rows>
-            {g.extensions.map(({ ext, children }) => (
-              <NodeRow key={ext.id} n={ext} d={d} nested={children} />
-            ))}
-          </Rows>
-        )}
-      </Group>
-    </div>
+        </p>,
+      );
+    }
+    return out;
+  }, [d, tree]);
+  return (
+    <ul className="divide-y" data-testid="diagram-list">
+      {tree.roots.map((g) => (
+        <ListItem key={g.id} item={g} open={open} toggle={toggle} outs={outs} />
+      ))}
+    </ul>
   );
 }

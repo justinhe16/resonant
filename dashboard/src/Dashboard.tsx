@@ -1,5 +1,5 @@
 import { CircleAlert, Info, LogOut, Moon, RefreshCw, Sun, WifiOff } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { lazy, type ReactNode, Suspense, useState } from "react";
 import { Dot } from "@/components/bits";
 import { DetailDialog } from "@/components/detail/DetailDialog";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -12,7 +12,6 @@ import { useTheme } from "@/lib/theme";
 import { healthTone } from "@/lib/tone";
 import { cn } from "@/lib/utils";
 import { Claude } from "@/sections/Claude";
-import { Diagram } from "@/sections/Diagram";
 import { Extensions } from "@/sections/Extensions";
 import { Jobs } from "@/sections/Jobs";
 import { Pulse } from "@/sections/Pulse";
@@ -20,6 +19,9 @@ import { Rules } from "@/sections/Rules";
 import { SystemStatus } from "@/sections/SystemStatus";
 import { WaitingOnYou } from "@/sections/WaitingOnYou";
 import { ActiveRuns, ActiveTasks, RecentRuns, Slots, Tasks } from "@/sections/Work";
+
+// The Diagram tab (React Flow and dagre) loads on first open: the overview doesn't carry it.
+const Diagram = lazy(() => import("@/sections/Diagram").then((m) => ({ default: m.Diagram })));
 
 type Tab = "overview" | "diagram";
 const TAB_KEY = "resonant.tab";
@@ -143,7 +145,11 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
         )}
         {snap && tab === "diagram" && (
           <div role="tabpanel" id="panel-diagram" aria-labelledby="tab-diagram">
-            {guard(<Diagram snap={snap} />)}
+            {guard(
+              <Suspense fallback={<p className="text-sm text-muted-foreground">Loading the diagram…</p>}>
+                <Diagram snap={snap} />
+              </Suspense>,
+            )}
           </div>
         )}
         {snap && tab === "overview" && (
