@@ -16,6 +16,7 @@ allowlist, symlinks, builtin command names, approver grants) live in
 from __future__ import annotations
 
 import re
+import shlex
 import string
 from itertools import pairwise
 from pathlib import Path
@@ -49,9 +50,19 @@ EXAMPLE_MAX = 80
 REPOS_MAX = 20
 JOB_DESCRIPTION_MAX = 160  # one line: what the job does (the dashboard's diagram shows it)
 LAUNCH_AGENTS_MAX = 10
+PANELS_MAX = 8
+PANEL_BYTES_CAP = 32768  # one panel's normalised JSON, whatever ``max_bytes`` says
+PANEL_BYTES_DEFAULT = 16384
+PANEL_TIMEOUT_MAX_S = 120.0
+PANEL_MIN_INTERVAL_S = 60
+PANEL_DESCRIPTION_MAX = 160
+PANEL_TITLE_MAX = 60
+PANEL_ARGV_MAX = 16
+PANEL_ARG_MAX = 200
 LAUNCH_AGENT_LABEL = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 
 _CRON_FIELD = re.compile(r"^[A-Za-z0-9*/,\-]+$")
+_NUMERIC_CRON_FIELD = re.compile(r"^[0-9*/,\-]+$")
 _DURATION = re.compile(r"^\d+[smh]$")
 _REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
@@ -81,7 +92,7 @@ def duration_s(v: str) -> int:
     return int(v[:-1]) * _UNIT_S[v[-1]]
 
 
-def _cron_values(field: str, lo: int, hi: int) -> set[int]:
+def cron_values(field: str, lo: int, hi: int) -> set[int]:
     """Expand one numeric cron field (``*``, ``a``, ``a-b``, any with ``/n``, comma lists)."""
     values: set[int] = set()
     for item in field.split(","):
@@ -110,9 +121,7 @@ def cron_min_interval_s(schedule: str) -> int:
     restriction never makes a schedule look sparser than it is.
     """
     minute, hour = schedule.split()[:2]
-    times = sorted(
-        h * 60 + m for h in _cron_values(hour, 0, 23) for m in _cron_values(minute, 0, 59)
-    )
+    times = sorted(h * 60 + m for h in cron_values(hour, 0, 23) for m in cron_values(minute, 0, 59))
     gaps = [b - a for a, b in pairwise(times)]
     gaps.append(times[0] + 24 * 60 - times[-1])  # across midnight
     return min(gaps) * 60
@@ -191,6 +200,104 @@ class Job(_Strict):
             },
             effect=self.effect,
             level=self.level,
+            source=f"ext:{extension}",
+            extension=extension,
+            timeout_s=self.timeout_s,
+            secrets=self.secrets,
+        )
+
+
+def _numeric_cron(v: str) -> str:
+    """A panel's cron: 5 numeric fields, each in range (no names, no ``@``)."""
+    fields = v.split()
+    if len(fields) != 5 or not all(_NUMERIC_CRON_FIELD.fullmatch(f) for f in fields):
+        raise ValueError(f"cron {v!r} must be 5 numeric fields (no names or @ shortcuts)")
+    for field, lo, hi in zip(fields, (0, 0, 1, 1, 0), (59, 23, 31, 12, 7), strict=True):
+        cron_values(field, lo, hi)
+    if cron_min_interval_s(v) < PANEL_MIN_INTERVAL_S:
+        raise ValueError(f"cron {v!r} fires more often than every minute")
+    return v
+
+
+class PanelRefresh(_Strict):
+    """How often a panel's command runs: ``idle`` always, ``active`` instead of it while the
+    local time is inside the active cron's hours, days and months."""
+
+    idle: str
+    active: str | None = None
+
+    @field_validator("idle", "active")
+    @classmethod
+    def _cron(cls, v: str | None) -> str | None:
+        return None if v is None else _numeric_cron(v)
+
+
+class Panel(_Strict):
+    """A dashboard panel: Resonant runs ``command`` on a schedule, reads its JSON output
+    (``resonant_sdk.panel_schema``) and draws it. An L0 read, never chat-visible; the command
+    is data-only, with no placeholders."""
+
+    id: str = Field(pattern=SLUG)
+    title: str = Field(min_length=1, max_length=PANEL_TITLE_MAX)
+    description: str = Field(default="", max_length=PANEL_DESCRIPTION_MAX)
+    command: tuple[str, ...] = Field(min_length=1, max_length=PANEL_ARGV_MAX)
+    refresh: PanelRefresh
+    tz: str | None = None
+    secrets: tuple[SecretName, ...] = ()
+    timeout_s: float = Field(default=30.0, gt=0, le=PANEL_TIMEOUT_MAX_S)
+    max_bytes: int = Field(default=PANEL_BYTES_DEFAULT, ge=1024, le=PANEL_BYTES_CAP)
+
+    @field_validator("title", "description")
+    @classmethod
+    def _one_line(cls, v: str) -> str:
+        if not v.isprintable() or (v != v.strip()):
+            raise ValueError("must be one line with no control characters or edge spaces")
+        return v
+
+    @field_validator("command")
+    @classmethod
+    def _command(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        for a in v:
+            if not a or len(a) > PANEL_ARG_MAX or not (a.isascii() and a.isprintable()):
+                raise ValueError(
+                    f"command items must be 1-{PANEL_ARG_MAX} printable ASCII characters"
+                )
+            if "{" in a or "}" in a:
+                raise ValueError("a panel command takes no placeholders ({ or })")
+        return v
+
+    @field_validator("tz")
+    @classmethod
+    def _tz(cls, v: str | None) -> str | None:
+        if v is not None:
+            try:
+                ZoneInfo(v)
+            except (ZoneInfoNotFoundError, ValueError) as e:
+                raise ValueError(f"unknown timezone {v!r}") from e
+        return v
+
+    @property
+    def run(self) -> str:
+        """The command as the run string every manifest command is (``shlex.split`` inverts)."""
+        return shlex.join(self.command)
+
+    @property
+    def spec_name(self) -> str:
+        return "panel_" + self.id.replace("-", "_")
+
+    def spec(self, extension: str) -> ToolSpec:
+        """The panel as a ToolSpec (an L0 read). It never enters a model toolset."""
+        return ToolSpec(
+            name=self.spec_name,
+            description="dashboard panel",
+            args_schema={
+                "type": "object",
+                "properties": {"due_at": {"type": "string"}},
+                "required": ["due_at"],
+                "additionalProperties": False,
+            },
+            effect=Effect.READ,
+            level=None,
             source=f"ext:{extension}",
             extension=extension,
             timeout_s=self.timeout_s,
@@ -462,6 +569,7 @@ class Manifest(BaseModel):
     secrets: tuple[SecretName, ...] = ()
     repos: tuple[str, ...] = Field(default=(), max_length=REPOS_MAX)  # GitHub "owner/name" links
     launch_agents: tuple[LaunchAgent, ...] = Field(default=(), max_length=LAUNCH_AGENTS_MAX)
+    panels: tuple[Panel, ...] = Field(default=(), max_length=PANELS_MAX)  # PER-280
     # Host binaries the extension's own code runs (the github extension's gh). Each is pinned
     # by absolute path at install and given as RESONANT_BIN_<NAME>; PATH never has to hold it.
     bins: tuple[Literal["gh", "git"], ...] = ()
@@ -523,17 +631,23 @@ class Manifest(BaseModel):
             raise ValueError("mcp tool names must be unique across servers")
         if clash := set(self.tools) & set(mcp_names):
             raise ValueError(f"tool names defined twice (cli and mcp): {sorted(clash)}")
+        panel_ids = [p.id for p in self.panels]
+        if len(panel_ids) != len(set(panel_ids)):
+            raise ValueError("panel ids must be unique")
         job_specs = self.job_specs()  # also enforces ToolSpec invariants
         tool_specs = self.tool_specs()
+        panel_specs = self.panel_specs()
         if clash := {s.name for s in tool_specs} & {s.name for s in job_specs}:
             raise ValueError(f"tool names collide with job spec names: {sorted(clash)}")
+        if clash := {s.name for s in panel_specs} & {s.name for s in tool_specs + job_specs}:
+            raise ValueError(f"panel spec names collide with tool or job names: {sorted(clash)}")
         declared = set(self.secrets)
         for sid, server in (self.mcp.servers if self.mcp else {}).items():
             if undeclared := set(server.secrets) - declared:
                 raise ValueError(
                     f"mcp server {sid}: secrets not declared at top level: {undeclared}"
                 )
-        for spec in tool_specs + job_specs:
+        for spec in tool_specs + job_specs + panel_specs:
             if undeclared := set(spec.secrets) - declared:
                 raise ValueError(f"{spec.name}: secrets not declared at top level: {undeclared}")
         for job in self.jobs:
@@ -594,6 +708,10 @@ class Manifest(BaseModel):
     def job_specs(self) -> list[ToolSpec]:
         """One ``job_<id>`` spec per job. Never part of a model toolset."""
         return [j.spec(self.name) for j in self.jobs]
+
+    def panel_specs(self) -> list[ToolSpec]:
+        """One ``panel_<id>`` spec per panel (L0 reads). Never part of a model toolset."""
+        return [p.spec(self.name) for p in self.panels]
 
 
 class _StrictBoolLoader(yaml.SafeLoader):

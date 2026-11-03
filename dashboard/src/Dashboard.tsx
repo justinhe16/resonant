@@ -2,10 +2,12 @@ import { CircleAlert, Info, LogOut, Moon, RefreshCw, Sun, WifiOff } from "lucide
 import { lazy, type ReactNode, Suspense, useState } from "react";
 import { Dot } from "@/components/bits";
 import { DetailDialog } from "@/components/detail/DetailDialog";
+import { ExtensionPage } from "@/pages/ExtensionPage";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { type Loader, useNow, usePolling } from "@/lib/hooks";
+import { useHashRoute } from "@/lib/route";
 import { staleness, worstHealth } from "@/lib/snapshot";
 import { duration, relative } from "@/lib/time";
 import { useTheme } from "@/lib/theme";
@@ -37,6 +39,8 @@ function readTab(): Tab {
 export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () => void }) {
   const { snapshot: snap, error, loading, refresh } = usePolling(load);
   const now = useNow();
+  const route = useHashRoute();
+  const extPage = route?.kind === "ext" ? route : null;
   const [tab, setTabState] = useState<Tab>(readTab);
   const setTab = (next: Tab) => {
     setTabState(next);
@@ -122,7 +126,8 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
         {!snap && !loading && !error && (
           <p className="py-10 text-center text-sm text-muted-foreground">No snapshot has been sent yet.</p>
         )}
-        {snap && (
+        {snap && extPage && guard(<ExtensionPage snap={snap} now={now} route={extPage} />)}
+        {snap && !extPage && (
           <div role="tablist" aria-label="Dashboard view" className="inline-flex rounded-lg border bg-card p-0.5">
             {(["overview", "diagram"] as const).map((t) => (
               <button
@@ -143,7 +148,7 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
             ))}
           </div>
         )}
-        {snap && tab === "diagram" && (
+        {snap && !extPage && tab === "diagram" && (
           <div role="tabpanel" id="panel-diagram" aria-labelledby="tab-diagram">
             {guard(
               <Suspense fallback={<p className="text-sm text-muted-foreground">Loading the diagram…</p>}>
@@ -152,7 +157,7 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
             )}
           </div>
         )}
-        {snap && tab === "overview" && (
+        {snap && !extPage && tab === "overview" && (
           <div
             role="tabpanel"
             id="panel-overview"

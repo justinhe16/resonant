@@ -331,6 +331,18 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
         )
         if job.description:
             lines.append(f"    {_s(job.description, 160)}")
+    if m.panels:  # PER-280: dashboard panels, read-only L0
+        lines.append("Panels:")
+        for panel in m.panels:
+            when = schedule_words(panel.refresh.idle, panel.tz)
+            if panel.refresh.active:
+                when += f"; active: {schedule_words(panel.refresh.active, panel.tz)}"
+            lines.append(
+                f"  {_s(panel.id, 40)} {_s(panel.title, 60)} {when}, read L0, "
+                f"max {panel.max_bytes} B, runs {panel.run}"
+            )
+            if panel.description:
+                lines.append(f"    {_s(panel.description, 160)}")
     if m.repos:
         lines.append(f"Repos: {', '.join(_s(r, 80) for r in m.repos)}")
     if m.launch_agents:  # PER-277: names for the dashboard's diagram; never run or loaded
@@ -396,10 +408,23 @@ def update_lines(
         was = old_grant.removeprefix("reports: ") or "none"
         diff = [d for d in diff if d != f"  - {old_grant}"]  # the ~ line says it
         diff.append(f"  ~ {new_grant or 'reports: none (refused)'} (was: {was})")
+    diff += _panel_diff(old, new.manifest)
     what = "Manifest" if new.pin.manifest_sha != old.manifest_sha else "MCP tools"
     lines.append(f"{what}: changed. Escalations:" if diff else f"{what}: changed")
     lines += diff
     return lines
+
+
+def _panel_diff(old: ext_store.ExtensionRecord, new: Manifest) -> list[str]:
+    """``+ panel <id>`` / ``- panel <id>`` for panels an update adds or drops."""
+    try:
+        before = [p.id for p in Manifest.model_validate(old.manifest).panels]
+    except ValidationError:
+        return []
+    after = [p.id for p in new.panels]
+    return [f"  + panel {_s(i, 40)}" for i in after if i not in before] + [
+        f"  - panel {_s(i, 40)}" for i in before if i not in after
+    ]
 
 
 def _old_grant(old: ext_store.ExtensionRecord) -> str:
@@ -733,6 +758,7 @@ class ExtensionManager:
             with atomic(self.conn):
                 ext_store.save_extension(self.conn, record)
                 ext_store.prune_jobs(self.conn, name, [j.id for j in staged.manifest.jobs])
+                ext_store.prune_panels(self.conn, name, [p.id for p in staged.manifest.panels])
                 repos.set_links(self.conn, name, staged.manifest.repos)
                 origin = {"source": approved.source, "secrets": sorted(staged.manifest.secrets)}
                 kv_set(self.conn, ORIGIN_KEY.format(name=name), origin)
@@ -765,6 +791,7 @@ class ExtensionManager:
         manifest ``bins`` entry under ``bin:<name>``."""
         names = {f"tool {n}": n for n in manifest.tools}
         names.update({f"job {j.id}": j.spec_name for j in manifest.jobs})
+        names.update({f"panel {p.id}": p.spec_name for p in manifest.panels})
         names["health"] = "health"
         pins = {
             names[where]: resolve_argv0(root, run, self.ext_path)

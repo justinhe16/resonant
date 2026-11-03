@@ -415,3 +415,58 @@ def test_downtime_needs_aware() -> None:
     down = Downtime(since=NINE - timedelta(hours=1), until=NINE)
     with pytest.raises(ValueError, match="timezone-aware"):
         down.covers(datetime(2026, 10, 14, 9))
+
+
+# --- in_window (PER-280: a panel's active window) ---------------------------------------
+
+
+def test_in_window_matches_hours_days_and_months_and_ignores_the_minute() -> None:
+    from resonant.extensions.cron import in_window
+
+    expr = "*/1 9-16 * * 1-5"  # weekdays 09:00-16:59
+
+    def mon(h: int, m: int = 0) -> datetime:
+        return local(2026, 10, 12, h, m).astimezone(UTC)
+
+    assert [in_window(expr, TZ, mon(h)) for h in (8, 9, 12, 16, 17)] == [
+        False, True, True, True, False,
+    ]  # fmt: skip
+    assert in_window("0 9 * * *", TZ, mon(9, 59)) and not in_window("0 9 * * *", TZ, mon(10, 0))
+    assert not in_window(expr, TZ, local(2026, 10, 10, 12).astimezone(UTC))  # a Saturday
+    assert not in_window(expr, TZ, local(2026, 10, 11, 12).astimezone(UTC))  # a Sunday
+    assert in_window("* * * 10 *", TZ, mon(3)) and not in_window("* * * 11 *", TZ, mon(3))
+
+
+def test_in_window_uses_the_zone_not_utc() -> None:
+    from resonant.extensions.cron import in_window
+
+    instant = datetime(2026, 10, 12, 20, 0, tzinfo=UTC)  # 13:00 in LA, 16:00 in New York
+    assert in_window("* 13 * * *", TZ, instant)
+    assert not in_window("* 13 * * *", "America/New_York", instant)
+    assert in_window("* 16 * * *", ZoneInfo("America/New_York"), instant)
+    assert in_window("* 20 * * *", "UTC", instant)
+
+
+def test_in_window_day_of_month_and_week_or_rule_and_sunday_as_7() -> None:
+    from resonant.extensions.cron import in_window
+
+    sun = local(2026, 10, 11, 12).astimezone(UTC)  # a Sunday, the 11th
+    assert in_window("* * * * 0", TZ, sun) and in_window("* * * * 7", TZ, sun)
+    assert not in_window("* * * * 1-5", TZ, sun)
+    # both restricted: either matches (cron's OR)
+    assert in_window("* * 11 * 1", TZ, sun)  # the 11th, though not a Monday
+    assert in_window("* * 12 * 0", TZ, sun)  # a Sunday, though not the 12th
+    assert not in_window("* * 12 * 1", TZ, sun)
+    # one side a star: both must match
+    assert not in_window("* * */2 * 0", TZ, local(2026, 10, 18, 12).astimezone(UTC))
+    assert in_window("* * */2 * 0", TZ, local(2026, 10, 25, 12).astimezone(UTC))
+
+
+def test_in_window_is_false_for_a_bad_expression_and_needs_an_aware_time() -> None:
+    from resonant.extensions.cron import in_window
+
+    now = datetime(2026, 10, 12, 20, 0, tzinfo=UTC)
+    assert in_window("nonsense", TZ, now) is False
+    assert in_window("* 99 * * *", TZ, now) is False
+    with pytest.raises(ValueError, match="aware"):
+        in_window("* * * * *", TZ, datetime(2026, 10, 12, 20, 0))

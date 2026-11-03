@@ -12,7 +12,9 @@ import type { Snapshot } from "@/types";
  * What it shows comes from the URL hash (`#/runs/R12`), so a view can be linked.
  */
 export function DetailDialog({ snap, now }: { snap: Snapshot; now: number }) {
-  const route = useHashRoute();
+  const found = useHashRoute();
+  // An extension's page (`#/ext/…`) is the page itself, not a dialog.
+  const route = found?.kind === "ext" ? null : found;
   const hash = route ? toHash(route) : "";
   const body = useRef<HTMLDivElement>(null);
   useEffect(() => {

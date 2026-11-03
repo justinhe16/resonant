@@ -352,11 +352,17 @@ const legacyPulse = (p: V1PulseItem | V1PulseBrief): PulseItem => {
 /** The page reads one shape: this maps a schema 1 push onto it (briefs become rows with no
  * detail) and returns a schema 2 snapshot as it is. */
 export function normalize(raw: Snapshot | V1Snapshot): Normalized {
-  const out = raw.schema === 2 ? raw : fromV1(raw);
+  const out = raw.schema === 2 ? withPanels(raw) : fromV1(raw);
   return out.tier === "remote" ? withoutLocalOnly(out) : out;
 }
 
-/** The two fields the relay never carries (the Remote Control link and an approval's code):
+/** A daemon from before PER-280 sends no `panels` on its extensions. */
+function withPanels(s: Snapshot): Snapshot {
+  if (s.extensions.every((e) => Array.isArray(e.panels))) return s;
+  return { ...s, extensions: s.extensions.map((e) => ({ ...e, panels: e.panels ?? [] })) };
+}
+
+/** The fields the relay never carries (the Remote Control link, an approval's code and a panel's local URL):
  * dropped from a remote snapshot even if one slipped through, so they can't be shown. */
 function withoutLocalOnly(s: Normalized): Normalized {
   const bare = <T extends object>(row: T, key: string): T =>
@@ -370,6 +376,7 @@ function withoutLocalOnly(s: Normalized): Normalized {
       recent: s.approvals.recent.map((a) => bare(a, "code")),
     },
     claude_brain: s.claude_brain ? bare(s.claude_brain, "remote_url") : s.claude_brain,
+    extensions: s.extensions.map((e) => ({ ...e, panels: e.panels.map((p) => bare(p, "local_url")) })),
   };
 }
 
@@ -408,6 +415,7 @@ function fromV1(s: V1Snapshot): Normalized {
     secrets: [],
     report_max: null,
     repos: [],
+    panels: [],
   });
   return {
     schema: 2,

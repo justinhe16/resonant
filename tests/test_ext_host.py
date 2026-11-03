@@ -376,3 +376,113 @@ def test_unexpected_load_error_is_a_refusal(
     monkeypatch.setattr("resonant.extensions.host.dir_errors", boom)
     host = host_for(settings, db)
     assert host.refused == {"example": "load failed (RuntimeError)"}
+
+
+# --- panels (PER-280) ---------------------------------------------------------------------
+
+PANEL_MANIFEST = (
+    MANIFEST
+    + """\
+panels:
+  - id: paper-pnl
+    title: Paper trading
+    command: [./cli.py, panel, paper]
+    refresh: {idle: "*/15 * * * *", active: "*/1 9-16 * * 1-5"}
+    tz: America/New_York
+    secrets: [token]
+    timeout_s: 45
+    max_bytes: 8192
+  - id: oncall
+    title: On call
+    command: [./cli.py, panel, oncall]
+    refresh: {idle: "0 * * * *"}
+"""
+)
+
+
+def test_panels_register_as_hidden_l0_reads_with_a_job_handler(
+    settings: Settings, db: sqlite3.Connection
+) -> None:
+    install_fixture(settings, db, PANEL_MANIFEST, {"cli.py": CLI})
+    host = host_for(settings, db)
+    assert not host.refused
+    names = [s.name for s in host.registry.specs("example")]
+    assert names == ["get_time", "job_long_job", "panel_oncall", "panel_paper_pnl", "write_note"]
+    # kept out of chat and out of the job list, but known as hidden
+    assert [s.name for s in host.tool_specs()] == ["get_time", "write_note"]
+    assert [s.name for s in host.job_specs()] == ["job_long_job"]
+    spec = host.registry.get("example", "panel_paper_pnl")
+    assert spec is not None and host.is_job(spec) and host.hidden(spec)
+    assert spec.effect is Effect.READ and spec.effective_level.value == "L0"
+    assert spec.secrets == ("token",) and spec.timeout_s == 45
+    handler = host.handlers[("example", "panel_paper_pnl")]
+    assert handler.job  # RESONANT_JOB_DUE_AT is set for it
+    assert handler.command.render({"due_at": "x"})[-2:] == ("panel", "paper")
+
+
+def test_scheduled_panels_come_in_manifest_order_with_their_entries(
+    settings: Settings, db: sqlite3.Connection
+) -> None:
+    install_fixture(settings, db, PANEL_MANIFEST, {"cli.py": CLI})
+    host = host_for(settings, db)
+    got = host.scheduled_panels()
+    assert [(hp.ext, hp.panel.id) for hp in got] == [
+        ("example", "paper-pnl"),
+        ("example", "oncall"),
+    ]
+    first = got[0]
+    assert first.spec.name == "panel_paper_pnl" and first.panel.max_bytes == 8192
+    assert first.panel.refresh.active == "*/1 9-16 * * 1-5"
+    assert first.handler is host.handlers[("example", "panel_paper_pnl")]
+
+
+def test_a_panel_whose_pinned_command_is_missing_refuses_the_extension(
+    settings: Settings, db: sqlite3.Connection
+) -> None:
+    manifest = GH_MANIFEST + (
+        "panels:\n  - id: prs\n    title: PRs\n    command: [gh, pr, list]\n"
+        "    refresh: {idle: '*/5 * * * *'}\n"
+    )
+    rec = install_fixture(settings, db, manifest, {}, argv0_paths={"prs": "/nonexistent/gh"})
+    host = host_for(settings, db)
+    assert not host.loaded
+    assert host.refused[rec.name].startswith("prs: pinned command")
+    fake_gh = settings.home / "bin" / "gh"
+    fake_gh.parent.mkdir()
+    fake_gh.write_text("#!/bin/sh\n")
+    fake_gh.chmod(0o755)
+    install_fixture(
+        settings, db, manifest, {}, argv0_paths={"prs": str(fake_gh), "panel_prs": "/nonexistent"}
+    )
+    host = host_for(settings, db)
+    assert host.refused["hub"].startswith("panel_prs: pinned command /nonexistent")
+    install_fixture(
+        settings, db, manifest, {}, argv0_paths={"prs": str(fake_gh), "panel_prs": str(fake_gh)}
+    )
+    host = host_for(settings, db)
+    assert "hub" in host.loaded
+    assert host.handlers[("hub", "panel_prs")].command.render({"due_at": "t"})[0] == str(fake_gh)
+
+
+def test_a_panel_with_a_placeholder_never_validates(
+    settings: Settings, db: sqlite3.Connection
+) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="placeholders"):
+        Manifest.model_validate_json(
+            json.dumps(
+                {
+                    "name": "x",
+                    "version": 1,
+                    "panels": [
+                        {
+                            "id": "p",
+                            "title": "P",
+                            "command": ["./cli.py", "{due_at}"],
+                            "refresh": {"idle": "0 * * * *"},
+                        }
+                    ],
+                }
+            )
+        )

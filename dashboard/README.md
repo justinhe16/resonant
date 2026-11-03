@@ -30,7 +30,11 @@ DASHBOARD_FIXTURE=local npm run dev   # serves src/test/fixtures/local.json at /
 npm run dev                           # proxies /api to a running daemon on 127.0.0.1:7777
 ```
 
-`DASHBOARD_FIXTURE` also takes `remote`, `remote-v1` (an old daemon's text-free push) and `empty`. The fixtures are real snapshots: `tests/test_dashboard_snapshot.py` validates them against the Pydantic models, and `remote.json` must be `local.json` without its links and approval codes.
+`DASHBOARD_FIXTURE` also takes `remote`, `remote-v1` (an old daemon's text-free push) and `empty`. The fixtures are real snapshots: `tests/test_dashboard_snapshot.py` validates them against the Pydantic models, and `remote.json` must be `local.json` without its links and approval codes (the Remote Control links, approval `code`s and each panel's `local_url`).
+
+## Extension panels (PER-280)
+
+An extension can declare dashboard panels; the daemon validates what they print and the snapshot carries it as data (`extensions[].panels`, types in `src/types.ts`). The page only draws it: widgets are in `src/components/panel/` (stat, series as hand-rolled inline SVG, table, status, kv, text, details), the formatting and SVG geometry in `src/lib/panels.ts`, and `#/ext/<name>[/<panel>]` opens an extension's page (`src/pages/ExtensionPage.tsx`) instead of a dialog. Text in a panel is always rendered as plain text. Chart colours are the `--chart-1..4` tokens in `src/index.css`. The local-only `local_url` is stripped from a remote snapshot in `normalize`.
 
 ## Checks
 

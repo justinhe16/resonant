@@ -80,11 +80,11 @@ def test_migration_004_over_populated_003(tmp_path: Path) -> None:
     conn.close()
 
     # job-guard and status refuse the v3 store until the daemon migrates it.
-    with pytest.raises(StoreUnavailableError, match="schema v3 < v25"):
+    with pytest.raises(StoreUnavailableError, match="schema v3 < v26"):
         open_existing(path)
 
     conn = open_db(path)
-    assert schema_version(conn) == latest_version() == 25
+    assert schema_version(conn) == latest_version() == 26
     tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
     assert {"extensions", "ext_jobs"} <= tables
     # Existing rows survive.
@@ -111,7 +111,7 @@ def test_job_guard_fails_closed_on_v3_store(
     runner = CliRunner()
     res = runner.invoke(app, ["job-guard", "--job", "x/y", "--", "echo", "RAN"])
     assert res.exit_code == 75 and executed == []
-    assert "schema v3 < v25" in res.output
+    assert "schema v3 < v26" in res.output
 
     open_db(resonant_home / "resonant.db").close()  # the daemon migrates on start
     ok = runner.invoke(app, ["job-guard", "--job", "x/y", "--", "echo", "RAN"])
@@ -277,10 +277,94 @@ def test_migration_005_adds_pulse_items_over_populated_004(tmp_path: Path) -> No
     conn = connect(path)
     assert migrate(conn, _migrations_through(4)) == 4
     conn.close()
-    with pytest.raises(StoreUnavailableError, match="schema v4 < v25"):
+    with pytest.raises(StoreUnavailableError, match="schema v4 < v26"):
         open_existing(path)
     conn = open_db(path)
-    assert schema_version(conn) == 25
+    assert schema_version(conn) == 26
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(pulse_items)")}
     assert {"source", "key", "urgency", "fingerprint", "cleared", "told_fingerprint"} <= cols
     conn.close()
+
+
+# --- ext_panels (migration 026, PER-280) ------------------------------------------------
+
+
+def test_migration_026_creates_ext_panels_over_a_populated_025(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "old.db")
+    assert migrate(conn, _migrations_through(25)) == 25
+    ext_store.save_extension(conn, _record())
+    conn.close()
+    conn = open_db(tmp_path / "old.db")
+    assert schema_version(conn) == 26
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(ext_panels)")]
+    assert cols == [
+        "ext",
+        "panel_id",
+        "data_json",
+        "updated_at",
+        "bytes",
+        "last_run_at",
+        "last_ok",
+        "last_error",
+        "fail_streak",
+        "expect_by",
+    ]
+    assert ext_store.get_extension(conn, "example") is not None  # rows survive
+    assert ext_store.list_panels(conn) == []
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO ext_panels (ext, panel_id, fail_streak) VALUES ('a', 'b', -1)")
+    conn.close()
+
+
+def test_panel_save_fail_list_and_streak(db: sqlite3.Connection) -> None:
+    assert ext_store.get_panel(db, "example", "paper") is None
+    later = NOW + timedelta(minutes=15)
+    with transaction(db):
+        st = ext_store.record_panel_failure(db, "example", "paper", ran_at=NOW, error="boom")
+    assert (st.data_json, st.last_ok, st.fail_streak, st.last_error) == (None, False, 1, "boom")
+    with transaction(db):
+        st = ext_store.save_panel_ok(
+            db, "example", "paper", data='{"views":[]}', updated_at=NOW, ran_at=NOW, bytes=14,
+            expect_by=later,
+        )  # fmt: skip
+    assert st.data_json == '{"views":[]}' and st.last_ok is True and st.fail_streak == 0
+    assert st.last_error is None and st.expect_by == later and st.bytes == 14
+    assert st.updated_at == NOW and st.last_run_at == NOW
+    with transaction(db):
+        ext_store.record_panel_failure(db, "example", "paper", ran_at=later, error="one")
+        st = ext_store.record_panel_failure(db, "example", "paper", ran_at=later, error="two")
+    # a failure keeps the last good copy and counts up
+    assert st.fail_streak == 2 and st.last_error == "two" and st.last_ok is False
+    assert st.data_json == '{"views":[]}' and st.updated_at == NOW and st.expect_by == later
+    with transaction(db):
+        st = ext_store.save_panel_ok(
+            db, "example", "paper", data="{}", updated_at=later, ran_at=later, bytes=2,
+            expect_by=later,
+        )  # fmt: skip
+    assert st.fail_streak == 0 and st.last_error is None
+    with transaction(db):
+        ext_store.record_panel_failure(db, "other", "z", ran_at=NOW, error="x")
+        ext_store.record_panel_failure(db, "example", "alpha", ran_at=NOW, error="x")
+    assert [(p.ext, p.panel_id) for p in ext_store.list_panels(db)] == [
+        ("example", "alpha"),
+        ("example", "paper"),
+        ("other", "z"),
+    ]
+    assert [p.panel_id for p in ext_store.list_panels(db, "example")] == ["alpha", "paper"]
+
+
+def test_prune_panels_and_delete_extension_cascade(db: sqlite3.Connection) -> None:
+    ext_store.save_extension(db, _record())
+    with transaction(db):
+        for pid in ("a", "b", "c"):
+            ext_store.record_panel_failure(db, "example", pid, ran_at=NOW, error="x")
+        ext_store.record_panel_failure(db, "keep", "a", ran_at=NOW, error="x")
+        assert ext_store.prune_panels(db, "example", ["b"]) == 2
+    assert [p.panel_id for p in ext_store.list_panels(db, "example")] == ["b"]
+    with transaction(db):
+        assert ext_store.prune_panels(db, "example", []) == 1
+    assert ext_store.list_panels(db, "example") == []
+    with transaction(db):
+        ext_store.record_panel_failure(db, "example", "a", ran_at=NOW, error="x")
+        assert ext_store.delete_extension(db, "example") is True
+    assert [p.ext for p in ext_store.list_panels(db)] == ["keep"]

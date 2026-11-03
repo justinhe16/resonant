@@ -23,6 +23,7 @@ from test_dashboard_snapshot import (
     _busy,  # pyright: ignore[reportPrivateUsage]
     remote_dump,
     seed_secret,
+    seed_typical,
     seed_worst,
 )
 
@@ -477,17 +478,22 @@ def test_shrink_steps_are_ordered_deterministic_and_valid(
     # With a cap nothing fits (0), every step runs, one after the other.
     monkeypatch.setattr(pusher_mod, "MAX_BYTES", 0)
     stages = _stages(data)
-    assert [s["trimmed"] for s in stages] == ["history", "lists", "detail", "items"]
+    assert [s["trimmed"] for s in stages] == ["history", "panels", "lists", "detail", "items"]
     sizes = [data_size(data), *(data_size(s) for s in stages)]
-    assert sizes == sorted(sizes, reverse=True) and len(set(sizes)) == 5  # each one cuts more
+    assert sizes == sorted(sizes, reverse=True) and len(set(sizes)) == 6  # each one cuts more
     for stage in stages:
         Snapshot.model_validate(stage)  # every step's output is a valid snapshot
-    history, lists, detail, items = stages
+    history, panels, lists, detail, items = stages
     r = history["runs"]["items"][0]
     assert len(r["history"]) <= 4 and len(r["did"]) <= 3 and len(r["effects"]) <= 3
     assert all(len(t["history"]) <= 3 for t in history["tasks"]["items"])
     assert all(len(a["changes"] or []) <= 3 for a in history["approvals"]["items"])
     assert len(history["runs"]["items"]) == len(data["runs"]["items"])  # lists intact
+    held = [p for e in history["extensions"] for p in e["panels"] if p["views"]]
+    assert held and not any(p["views"] for e in panels["extensions"] for p in e["panels"])
+    dropped = [p for e in panels["extensions"] for p in e["panels"] if p["truncated"]]
+    assert dropped and all("views" not in p["outside"] for p in dropped)
+    assert len(panels["runs"]["items"]) == len(data["runs"]["items"])  # the lists are untouched
     assert all(
         len(v) == 5
         for v in (lists["runs"]["items"], lists["tasks"]["items"], lists["approvals"]["recent"],
@@ -541,9 +547,9 @@ def test_the_halving_stops_as_soon_as_it_fits(
     seed_worst(db, utcnow())
     data = remote_dump(db, utcnow())
     monkeypatch.setattr(pusher_mod, "MAX_BYTES", 0)
-    history, lists = _stages(data)[:2]
+    history, panels, lists = _stages(data)[:3]
     floor = data_size(lists)
-    half = copy.deepcopy(history)
+    half = copy.deepcopy(panels)
     half["trimmed"] = "lists"
     for parent, key in pusher_mod._lists(half):  # pyright: ignore[reportPrivateUsage]
         parent[key] = parent[key][: len(parent[key]) // 2]
@@ -551,6 +557,7 @@ def test_the_halving_stops_as_soon_as_it_fits(
     out = pusher_mod.shrink(data)
     assert out["trimmed"] == "lists" and floor < data_size(out) <= data_size(half)
     assert len(out["runs"]["items"]) == len(history["runs"]["items"]) // 2
+    assert out["extensions"] == half["extensions"]  # the panels step already ran
 
 
 # --- the run loop ----------------------------------------------------------------------------
@@ -724,3 +731,40 @@ async def test_daemon_pushes_the_remote_tier(resonant_home: Path) -> None:
     [data] = fake.stored
     assert Snapshot.model_validate(data).tier == "remote"
     assert data["dry_run"] is True
+
+
+def test_dropping_panels_is_enough_when_they_are_what_is_over(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PER-280: ``trimmed`` says ``panels`` when only panels had to go: the biggest first, the
+    lists not halved, every dropped panel still a row with its state."""
+    from panel_helpers import panel_manifest, raw_panel, store_panel
+
+    from resonant.store import extensions as ext_store
+
+    now = utcnow()
+    seed_typical(db, now)
+    ids = ("a", "b", "c", "d")
+    ext_store.save_extension(
+        db,
+        ext_store.ExtensionRecord(
+            name="ledger", source="repo:ledger", commit="a" * 40, tree_digest="d",
+            manifest_sha="m", installed_at=now, installed_by="justin",
+            manifest=panel_manifest("ledger", ids),
+        ),
+    )  # fmt: skip
+    for k, pid in enumerate(ids):
+        store_panel(db, "ledger", pid, raw_panel(rows=50 - 10 * k, items=50, details=100), now)
+    data = remote_dump(db, now)
+    assert data["trimmed"] == "none"
+    size = data_size(data)
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", size - 30_000)  # about one panel too many
+    out = pusher_mod.shrink(data)
+    assert out["trimmed"] == "panels" and data_size(out) <= pusher_mod.MAX_BYTES
+    held = {p["id"]: bool(p["views"]) for e in out["extensions"] for p in e["panels"]}
+    assert held["a"] is False and sum(held.values()) >= 1  # the biggest went; not all of them
+    dropped = [p for e in out["extensions"] for p in e["panels"] if not p["views"]]
+    assert all(p["truncated"] and p["ok"] for p in dropped)
+    for section in ("runs", "tasks", "pulse", "questions"):  # the lists are not halved
+        assert len(out[section]["items"]) == len(data[section]["items"])
+    Snapshot.model_validate(out)

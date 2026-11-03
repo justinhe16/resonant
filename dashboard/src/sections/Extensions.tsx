@@ -1,5 +1,6 @@
 import { CollapsibleSection } from "@/components/CollapsibleSection";
 import { ListRow } from "@/components/ListRow";
+import { PanelGlance } from "@/components/panel/PanelGlance";
 import { absolute } from "@/lib/time";
 import { healthTone, outcomeTone } from "@/lib/tone";
 import type { Extension, Job, Snapshot } from "@/types";
@@ -40,6 +41,10 @@ function ExtensionRow({ ext, now }: { ext: Extension; now: number }) {
       hint={muted ? `muted until ${absolute(ext.muted_until)}` : failing ? `${jobs}, failing` : jobs}
       time={last}
       now={now}
+      below={
+        ext.panels.length > 0 &&
+        ext.panels.slice(0, 2).map((p) => <PanelGlance key={p.id} ext={ext.name} panel={p} now={now} />)
+      }
       testId="extension-row"
     />
   );

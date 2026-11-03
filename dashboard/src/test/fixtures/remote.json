@@ -794,6 +794,400 @@
       "report_max": "normal",
       "repos": [
         "resonant"
+      ],
+      "panels": [
+        {
+          "id": "prs",
+          "title": "Pull requests",
+          "description": "Open PRs and CI across the watched repos",
+          "schedule": "*/15 * * * *",
+          "active": "*/5 8-18 * * 1-5",
+          "tz": "America/Los_Angeles",
+          "updated_at": "2026-10-16T08:58:30Z",
+          "last_run_at": "2026-10-16T08:58:31Z",
+          "ok": true,
+          "stale": false,
+          "error": null,
+          "fail_streak": 0,
+          "health": "ok",
+          "truncated": false,
+          "bytes": 2860,
+          "views": [
+            {
+              "id": "overview",
+              "title": "Overview",
+              "widgets": [
+                {
+                  "type": "stat",
+                  "id": "open",
+                  "label": "Open PRs",
+                  "value": 7,
+                  "format": "integer",
+                  "delta": -2
+                },
+                {
+                  "type": "stat",
+                  "id": "pass",
+                  "label": "CI pass rate",
+                  "value": 94.5,
+                  "format": "percent",
+                  "delta": 1.2,
+                  "delta_format": "percent",
+                  "health": "ok"
+                },
+                {
+                  "type": "stat",
+                  "id": "wait",
+                  "label": "Median wait",
+                  "value": 5400,
+                  "format": "duration",
+                  "delta": -600,
+                  "delta_format": "duration",
+                  "hint": "time to first review"
+                },
+                {
+                  "type": "series",
+                  "id": "opened",
+                  "title": "PRs opened and merged",
+                  "kind": "line",
+                  "x_type": "time",
+                  "x": [
+                    1792116000,
+                    1792119600,
+                    1792123200,
+                    1792126800,
+                    1792130400,
+                    1792134000,
+                    1792137600,
+                    1792141200
+                  ],
+                  "format": "integer",
+                  "stacked": false,
+                  "series": [
+                    {
+                      "name": "Opened",
+                      "values": [
+                        1,
+                        0,
+                        2,
+                        null,
+                        3,
+                        2,
+                        4,
+                        3
+                      ]
+                    },
+                    {
+                      "name": "Merged",
+                      "values": [
+                        0,
+                        1,
+                        1,
+                        2,
+                        null,
+                        1,
+                        2,
+                        3
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "series",
+                  "id": "byrepo",
+                  "title": "Open PRs by repo",
+                  "kind": "bar",
+                  "x_type": "category",
+                  "x": [
+                    "resonant",
+                    "dashboard",
+                    "docs"
+                  ],
+                  "format": "integer",
+                  "stacked": true,
+                  "series": [
+                    {
+                      "name": "Open",
+                      "values": [
+                        4,
+                        2,
+                        1
+                      ]
+                    },
+                    {
+                      "name": "Draft",
+                      "values": [
+                        1,
+                        0,
+                        2
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "table",
+                  "id": "list",
+                  "title": "Needs a look",
+                  "columns": [
+                    {
+                      "key": "pr",
+                      "label": "PR",
+                      "type": "text"
+                    },
+                    {
+                      "key": "state",
+                      "label": "State",
+                      "type": "pill"
+                    },
+                    {
+                      "key": "lines",
+                      "label": "Lines",
+                      "type": "number"
+                    },
+                    {
+                      "key": "cost",
+                      "label": "CI cost",
+                      "type": "money",
+                      "currency": "USD"
+                    },
+                    {
+                      "key": "opened",
+                      "label": "Opened",
+                      "type": "time"
+                    },
+                    {
+                      "key": "act",
+                      "label": "Check",
+                      "type": "link"
+                    }
+                  ],
+                  "truncated": true,
+                  "total_rows": 7,
+                  "rows": [
+                    [
+                      "resonant#212 Fix relay budget",
+                      {
+                        "label": "CI green",
+                        "tone": "ok"
+                      },
+                      340,
+                      0.42,
+                      1792138200,
+                      {
+                        "label": "List PRs",
+                        "tool": "list_prs"
+                      }
+                    ],
+                    [
+                      "dashboard#88 Panels page",
+                      {
+                        "label": "CI failing",
+                        "tone": "bad"
+                      },
+                      1210,
+                      1.8,
+                      1792085400,
+                      {
+                        "label": "List PRs",
+                        "tool": "list_prs"
+                      }
+                    ],
+                    [
+                      "docs#31 Extensions guide",
+                      {
+                        "label": "draft",
+                        "tone": "neutral"
+                      },
+                      95,
+                      null,
+                      null,
+                      null
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "health",
+              "title": "Health",
+              "widgets": [
+                {
+                  "type": "status",
+                  "id": "checks",
+                  "title": "Checks",
+                  "items": [
+                    {
+                      "name": "GitHub API",
+                      "state": "up",
+                      "detail": "200 in 180 ms",
+                      "since": "2026-10-16T06:00:00Z"
+                    },
+                    {
+                      "name": "CI runners",
+                      "state": "warn",
+                      "detail": "1 queued job waiting",
+                      "since": "2026-10-16T08:40:00Z"
+                    },
+                    {
+                      "name": "Webhook",
+                      "state": "down"
+                    },
+                    {
+                      "name": "Mirror",
+                      "state": "unknown"
+                    }
+                  ],
+                  "truncated": false
+                },
+                {
+                  "type": "kv",
+                  "id": "limits",
+                  "title": "Rate limit",
+                  "truncated": false,
+                  "items": [
+                    {
+                      "key": "Remaining",
+                      "value": 4210,
+                      "format": "integer"
+                    },
+                    {
+                      "key": "Resets in",
+                      "value": 1800,
+                      "format": "duration"
+                    },
+                    {
+                      "key": "Cached",
+                      "value": true
+                    },
+                    {
+                      "key": "Token",
+                      "value": "app (read only)"
+                    },
+                    {
+                      "key": "Last error",
+                      "value": null
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "outside": [
+            "views"
+          ]
+        },
+        {
+          "id": "ci",
+          "title": "CI report",
+          "description": "Nightly build summary",
+          "schedule": "0 * * * *",
+          "active": null,
+          "tz": null,
+          "updated_at": "2026-10-16T07:40:00Z",
+          "last_run_at": "2026-10-16T08:55:12Z",
+          "ok": false,
+          "stale": true,
+          "error": "exit 1: gh: HTTP 502 Bad Gateway",
+          "fail_streak": 3,
+          "health": "warn",
+          "truncated": false,
+          "bytes": 1190,
+          "views": [
+            {
+              "id": "summary",
+              "title": "Summary",
+              "widgets": [
+                {
+                  "type": "text",
+                  "id": "note",
+                  "text": "Nightly build: 3 of 41 jobs failed.\nLook at <b>docs</b> first; it has been red since Tuesday."
+                },
+                {
+                  "type": "series",
+                  "id": "trend",
+                  "title": "Build minutes",
+                  "kind": "area",
+                  "x_type": "time",
+                  "x": [
+                    1792116000,
+                    1792119600,
+                    1792123200,
+                    1792126800,
+                    1792130400
+                  ],
+                  "unit": "min",
+                  "format": "number",
+                  "stacked": false,
+                  "downsampled_from": 600,
+                  "series": [
+                    {
+                      "name": "Minutes",
+                      "values": [
+                        12.5,
+                        14,
+                        null,
+                        13.2,
+                        15.8
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "details",
+                  "id": "raw",
+                  "title": "Raw data",
+                  "collapsed": true,
+                  "truncated": false,
+                  "rows": [
+                    {
+                      "depth": 0,
+                      "key": "",
+                      "kind": "object"
+                    },
+                    {
+                      "depth": 1,
+                      "key": "failed",
+                      "kind": "array"
+                    },
+                    {
+                      "depth": 2,
+                      "key": "[0]",
+                      "kind": "string",
+                      "value": "docs"
+                    },
+                    {
+                      "depth": 2,
+                      "key": "[1]",
+                      "kind": "string",
+                      "value": "lint"
+                    },
+                    {
+                      "depth": 1,
+                      "key": "total",
+                      "kind": "number",
+                      "value": "41"
+                    },
+                    {
+                      "depth": 1,
+                      "key": "flaky",
+                      "kind": "bool",
+                      "value": "false"
+                    },
+                    {
+                      "depth": 1,
+                      "key": "owner",
+                      "kind": "null"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "outside": [
+            "views",
+            "error"
+          ]
+        }
       ]
     },
     {
@@ -837,7 +1231,8 @@
       ],
       "secrets": [],
       "report_max": "low",
-      "repos": []
+      "repos": [],
+      "panels": []
     },
     {
       "name": "notes-sync",
@@ -853,7 +1248,8 @@
       "mcp_servers": [],
       "secrets": [],
       "report_max": null,
-      "repos": []
+      "repos": [],
+      "panels": []
     }
   ],
   "core_jobs": [
@@ -1394,6 +1790,39 @@
         "state": "disabled",
         "ext": "notes-sync",
         "group": "extensions"
+      },
+      {
+        "id": "panel:github/prs",
+        "kind": "panel",
+        "label": "Pull requests",
+        "parent": "ext:github",
+        "text": "Open PRs and CI across the watched repos",
+        "tags": [
+          "panel",
+          "read",
+          "L0"
+        ],
+        "health": "ok",
+        "last_run_at": "2026-10-16T08:58:30Z",
+        "ext": "github",
+        "panel": "prs"
+      },
+      {
+        "id": "panel:github/ci",
+        "kind": "panel",
+        "label": "CI report",
+        "parent": "ext:github",
+        "text": "Nightly build summary",
+        "tags": [
+          "panel",
+          "read",
+          "L0",
+          "stale"
+        ],
+        "health": "degraded",
+        "last_run_at": "2026-10-16T07:40:00Z",
+        "ext": "github",
+        "panel": "ci"
       }
     ],
     "edges": [
@@ -1596,6 +2025,16 @@
         "source": "ext:notes-sync",
         "target": "proc:com.notessync.agent",
         "label": "owns"
+      },
+      {
+        "source": "ext:github",
+        "target": "panel:github/prs",
+        "label": "draws"
+      },
+      {
+        "source": "ext:github",
+        "target": "panel:github/ci",
+        "label": "draws"
       }
     ],
     "groups": [

@@ -199,6 +199,7 @@ def no_wall_clock_jobs(request: pytest.FixtureRequest, monkeypatch: pytest.Monke
 
     monkeypatch.setattr(daemon, "CORE_JOBS", ())
     monkeypatch.setattr(daemon, "cleanup_job", no_job)
+    monkeypatch.setattr(daemon, "PANEL_FIRST_RUN_S", None)  # PER-280: no start-up panel runs
 
 
 @pytest.fixture

@@ -37,6 +37,9 @@ export interface ListRowProps {
   now: number;
   /** extra badges after the pill (rare: muted, fails) */
   extra?: ReactNode;
+  /** content on a line of its own under the row (an extension's panel glances); its links
+   * need `relative z-10` to stay above the row's stretched link */
+  below?: ReactNode;
   testId?: string;
 }
 
@@ -57,6 +60,7 @@ export function ListRow({
   time,
   now,
   extra,
+  below,
   testId = "list-row",
 }: ListRowProps) {
   const titleCls = cn(
@@ -65,7 +69,10 @@ export function ListRow({
     mono && "font-mono text-[0.8rem]",
   );
   return (
-    <li className="relative flex min-h-10 items-center gap-2 py-2 first:pt-0 last:pb-0 sm:gap-3" data-testid={testId}>
+    <li
+      className={cn("relative flex min-h-10 items-center gap-2 py-2 first:pt-0 last:pb-0 sm:gap-3", below && "flex-wrap")}
+      data-testid={testId}
+    >
       {refText && (
         <span
           className="max-w-[7rem] shrink-0 truncate font-mono text-xs font-semibold text-foreground tabular-nums"
@@ -106,6 +113,7 @@ export function ListRow({
           {short(time, now)}
         </time>
       )}
+      {below && <div className="basis-full">{below}</div>}
     </li>
   );
 }

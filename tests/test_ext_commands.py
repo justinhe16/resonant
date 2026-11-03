@@ -1008,3 +1008,74 @@ async def test_pulse_now_real_path_paused_and_member_refused(
         "SELECT COUNT(*) FROM audit_log WHERE action = 'router.admin_refused'"
     ).fetchone()
     assert n[0] == 1
+
+
+# --- read_panel (PER-280) ---------------------------------------------------------------------
+
+PANEL_DEMO = (
+    DEMO
+    + """\
+panels:
+  - id: paper
+    title: Paper trading
+    command: [./cli.py, panel, paper]
+    refresh: {idle: "*/15 * * * *"}
+  - id: oncall
+    title: On call
+    command: [./cli.py, panel, oncall]
+    refresh: {idle: "*/15 * * * *"}
+"""
+)
+
+
+def test_read_panel_summarises_each_panel_and_reads_one_in_full(ctx: BuiltinContext) -> None:
+    from panel_helpers import raw_panel, store_panel
+
+    from resonant.tools.ext import READ_PANEL, read_panel
+
+    install(ctx, PANEL_DEMO)
+    with transaction(ctx.conn):
+        store_panel(ctx.conn, "demo", "paper", raw_panel(), NOW)
+        ext_store.record_panel_failure(ctx.conn, "demo", "oncall", ran_at=NOW, error="timeout")
+    out = read_panel(ctx, {"extension": "demo"})
+    json.dumps(out, allow_nan=False)
+    paper, oncall = out["panels"]
+    assert (paper["id"], paper["title"], paper["ok"], paper["stale"]) == (
+        "paper",
+        "Paper trading",
+        True,
+        False,
+    )
+    assert paper["stats"] == [
+        {"label": "Equity", "value": 10432.5, "unit": None},
+        {"label": "Cash", "value": 2210.0, "unit": "USD"},
+    ]
+    assert paper["updated_at"] is not None and "views" not in paper
+    assert (oncall["ok"], oncall["stale"], oncall["error"], oncall["stats"]) == (
+        False,
+        True,
+        "timeout",
+        [],
+    )
+    one = read_panel(ctx, {"extension": "demo", "panel": "paper"})["panel"]
+    assert one["id"] == "paper" and [v["id"] for v in one["views"]] == ["overview", "system"]
+    assert one["views"][0]["widgets"][0]["type"] == "stat" and one["truncated"] is True
+    # it only reads: it can't be told to run anything, and a spec says so
+    assert READ_PANEL.untrusted is True and READ_PANEL.effect.value == "read"
+    assert READ_PANEL.effective_level.value == "L0"
+
+
+def test_read_panel_refuses_what_it_does_not_know(ctx: BuiltinContext) -> None:
+    from resonant.tools.ext import read_panel
+
+    install(ctx, PANEL_DEMO)
+    for args, why in (
+        ({"extension": "nope"}, "no such extension"),
+        ({"extension": "demo", "panel": "nope"}, "no such panel"),
+        ({"extension": "demo", "bogus": 1}, "unknown arguments"),
+        ({"extension": "demo", "panel": 3}, "panel must be"),
+        ({}, "no such extension"),
+    ):
+        with pytest.raises(ToolFailed, match=why):
+            read_panel(ctx, args)
+    assert read_panel(ctx, {"extension": "demo"})["panels"][0]["stats"] == []  # never run yet

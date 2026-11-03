@@ -390,6 +390,113 @@
       "title": "ClaudeBrain",
       "type": "object"
     },
+    "DetailRow": {
+      "additionalProperties": false,
+      "properties": {
+        "depth": {
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Depth",
+          "type": "integer"
+        },
+        "key": {
+          "maxLength": 64,
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "bool",
+            "null"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "required": [
+        "depth",
+        "key",
+        "kind"
+      ],
+      "title": "DetailRow",
+      "type": "object"
+    },
+    "DetailsWidget": {
+      "additionalProperties": false,
+      "properties": {
+        "collapsed": {
+          "default": true,
+          "title": "Collapsed",
+          "type": "boolean"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "rows": {
+          "items": {
+            "$ref": "#/$defs/DetailRow"
+          },
+          "title": "Rows",
+          "type": "array"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "type": {
+          "const": "details",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "rows"
+      ],
+      "title": "DetailsWidget",
+      "type": "object"
+    },
     "DetectedEffects": {
       "additionalProperties": false,
       "description": "PER-263: the side effects detected in the commands of the runs the snapshot lists\n(TR-1), counts only: by kind, and how many of them were high-impact (a base push, a\npublish, a delete).",
@@ -616,7 +723,8 @@
             "server",
             "tool",
             "job",
-            "repo"
+            "repo",
+            "panel"
           ],
           "title": "Kind",
           "type": "string"
@@ -672,6 +780,19 @@
           ],
           "default": null,
           "title": "Module"
+        },
+        "panel": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Panel"
         },
         "parent": {
           "anyOf": [
@@ -897,6 +1018,13 @@
           "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
           "title": "Name",
           "type": "string"
+        },
+        "panels": {
+          "items": {
+            "$ref": "#/$defs/Panel"
+          },
+          "title": "Panels",
+          "type": "array"
         },
         "report_max": {
           "anyOf": [
@@ -1156,6 +1284,130 @@
       "title": "Job",
       "type": "object"
     },
+    "KvItem": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "anyOf": [
+            {
+              "enum": [
+                "number",
+                "integer",
+                "money",
+                "percent",
+                "duration",
+                "bytes"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format"
+        },
+        "key": {
+          "maxLength": 40,
+          "title": "Key",
+          "type": "string"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "key",
+        "value"
+      ],
+      "title": "KvItem",
+      "type": "object"
+    },
+    "KvWidget": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/KvItem"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "type": {
+          "const": "kv",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "items"
+      ],
+      "title": "KvWidget",
+      "type": "object"
+    },
     "Limits": {
       "additionalProperties": false,
       "description": "How much of each list the snapshot keeps, so the page can say \"the newest 50\".",
@@ -1209,6 +1461,27 @@
       "title": "Limits",
       "type": "object"
     },
+    "LinkCell": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "maxLength": 64,
+          "title": "Label",
+          "type": "string"
+        },
+        "tool": {
+          "maxLength": 64,
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "tool"
+      ],
+      "title": "LinkCell",
+      "type": "object"
+    },
     "McpServer": {
       "additionalProperties": false,
       "properties": {
@@ -1244,6 +1517,273 @@
         "host"
       ],
       "title": "McpServer",
+      "type": "object"
+    },
+    "Panel": {
+      "additionalProperties": false,
+      "description": "One dashboard panel an extension declares: its latest good copy and its run state.",
+      "properties": {
+        "active": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Active"
+        },
+        "bytes": {
+          "default": 0,
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 160,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        },
+        "fail_streak": {
+          "default": 0,
+          "title": "Fail Streak",
+          "type": "integer"
+        },
+        "health": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "warn",
+                "bad"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health"
+        },
+        "id": {
+          "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "last_run_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Run At"
+        },
+        "local_url": {
+          "anyOf": [
+            {
+              "maxLength": 300,
+              "pattern": "^http://127\\.0\\.0\\.1:[0-9]{1,5}(/[!-~]*)?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Url",
+          "x-tier": "local"
+        },
+        "ok": {
+          "default": false,
+          "title": "Ok",
+          "type": "boolean"
+        },
+        "outside": {
+          "items": {
+            "pattern": "^[a-z][a-z_]{0,31}$",
+            "type": "string"
+          },
+          "title": "Outside",
+          "type": "array"
+        },
+        "schedule": {
+          "maxLength": 64,
+          "title": "Schedule",
+          "type": "string"
+        },
+        "stale": {
+          "default": true,
+          "title": "Stale",
+          "type": "boolean"
+        },
+        "title": {
+          "maxLength": 64,
+          "title": "Title",
+          "type": "string"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "tz": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tz"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "views": {
+          "items": {
+            "$ref": "#/$defs/PanelView"
+          },
+          "title": "Views",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "schedule"
+      ],
+      "title": "Panel",
+      "type": "object"
+    },
+    "PanelView": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 40,
+          "title": "Title",
+          "type": "string"
+        },
+        "widgets": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "details": "#/$defs/DetailsWidget",
+                "kv": "#/$defs/KvWidget",
+                "series": "#/$defs/SeriesWidget",
+                "stat": "#/$defs/StatWidget",
+                "status": "#/$defs/StatusWidget",
+                "table": "#/$defs/TableWidget",
+                "text": "#/$defs/TextWidget"
+              },
+              "propertyName": "type"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/StatWidget"
+              },
+              {
+                "$ref": "#/$defs/SeriesWidget"
+              },
+              {
+                "$ref": "#/$defs/TableWidget"
+              },
+              {
+                "$ref": "#/$defs/StatusWidget"
+              },
+              {
+                "$ref": "#/$defs/KvWidget"
+              },
+              {
+                "$ref": "#/$defs/TextWidget"
+              },
+              {
+                "$ref": "#/$defs/DetailsWidget"
+              }
+            ]
+          },
+          "title": "Widgets",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "widgets"
+      ],
+      "title": "PanelView",
+      "type": "object"
+    },
+    "PillCell": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "maxLength": 24,
+          "title": "Label",
+          "type": "string"
+        },
+        "tone": {
+          "enum": [
+            "ok",
+            "warn",
+            "bad",
+            "neutral"
+          ],
+          "title": "Tone",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "tone"
+      ],
+      "title": "PillCell",
       "type": "object"
     },
     "Pulse": {
@@ -2020,6 +2560,182 @@
       "title": "Runs",
       "type": "object"
     },
+    "SeriesLine": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "maxLength": 32,
+          "title": "Name",
+          "type": "string"
+        },
+        "values": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "values"
+      ],
+      "title": "SeriesLine",
+      "type": "object"
+    },
+    "SeriesWidget": {
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "downsampled_from": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Downsampled From"
+        },
+        "format": {
+          "default": "number",
+          "enum": [
+            "number",
+            "integer",
+            "money",
+            "percent",
+            "duration",
+            "bytes"
+          ],
+          "title": "Format",
+          "type": "string"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "kind": {
+          "enum": [
+            "line",
+            "area",
+            "bar"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "series": {
+          "items": {
+            "$ref": "#/$defs/SeriesLine"
+          },
+          "title": "Series",
+          "type": "array"
+        },
+        "stacked": {
+          "default": false,
+          "title": "Stacked",
+          "type": "boolean"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "series",
+          "title": "Type",
+          "type": "string"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "x": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "maxLength": 24,
+                "type": "string"
+              }
+            ]
+          },
+          "title": "X",
+          "type": "array"
+        },
+        "x_type": {
+          "enum": [
+            "time",
+            "category"
+          ],
+          "title": "X Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "kind",
+        "x_type",
+        "x",
+        "series"
+      ],
+      "title": "SeriesWidget",
+      "type": "object"
+    },
     "Slots": {
       "additionalProperties": false,
       "properties": {
@@ -2037,6 +2753,442 @@
         "max"
       ],
       "title": "Slots",
+      "type": "object"
+    },
+    "StatWidget": {
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "delta": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delta"
+        },
+        "delta_format": {
+          "anyOf": [
+            {
+              "enum": [
+                "number",
+                "integer",
+                "money",
+                "percent",
+                "duration",
+                "bytes"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delta Format"
+        },
+        "format": {
+          "default": "number",
+          "enum": [
+            "number",
+            "integer",
+            "money",
+            "percent",
+            "duration",
+            "bytes"
+          ],
+          "title": "Format",
+          "type": "string"
+        },
+        "health": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "warn",
+                "bad"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health"
+        },
+        "hint": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hint"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "label": {
+          "maxLength": 40,
+          "title": "Label",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "stat",
+          "title": "Type",
+          "type": "string"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "type",
+        "label",
+        "value"
+      ],
+      "title": "StatWidget",
+      "type": "object"
+    },
+    "StatusItem": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "name": {
+          "maxLength": 64,
+          "title": "Name",
+          "type": "string"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Since"
+        },
+        "state": {
+          "enum": [
+            "up",
+            "down",
+            "warn",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "state"
+      ],
+      "title": "StatusItem",
+      "type": "object"
+    },
+    "StatusWidget": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/StatusItem"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "type": {
+          "const": "status",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "items"
+      ],
+      "title": "StatusWidget",
+      "type": "object"
+    },
+    "TableColumn": {
+      "additionalProperties": false,
+      "properties": {
+        "align": {
+          "anyOf": [
+            {
+              "enum": [
+                "left",
+                "right"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Align"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "key": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+          "title": "Key",
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 32,
+          "title": "Label",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "text",
+            "number",
+            "money",
+            "time",
+            "pill",
+            "link"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "type"
+      ],
+      "title": "TableColumn",
+      "type": "object"
+    },
+    "TableWidget": {
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/TableColumn"
+          },
+          "title": "Columns",
+          "type": "array"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "rows": {
+          "items": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PillCell"
+                },
+                {
+                  "$ref": "#/$defs/LinkCell"
+                },
+                {
+                  "maxLength": 120,
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "title": "Rows",
+          "type": "array"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "total_rows": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Total Rows"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "type": {
+          "const": "table",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "columns",
+        "rows"
+      ],
+      "title": "TableWidget",
       "type": "object"
     },
     "TaskItem": {
@@ -2257,6 +3409,53 @@
       "title": "Tasks",
       "type": "object"
     },
+    "TextWidget": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "text": {
+          "maxLength": 800,
+          "title": "Text",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "text",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "text"
+      ],
+      "title": "TextWidget",
+      "type": "object"
+    },
     "TrustRule": {
       "additionalProperties": false,
       "properties": {
@@ -2420,6 +3619,7 @@
       "enum": [
         "none",
         "history",
+        "panels",
         "lists",
         "detail",
         "items"

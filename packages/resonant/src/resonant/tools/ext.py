@@ -14,6 +14,11 @@
   off: true}`` lifts it, through the notifier's API (``notify.mute`` / ``notify.unmute``:
   kv ``ext.<name>.muted_until``, audited ``ext.notify_muted`` / ``ext.notify_unmuted``).
 
+- ``read_panel`` (L0, untrusted): ``{extension}`` lists that extension's dashboard panels
+  (PER-280) with each one's run state and the stat widgets of its first view; ``{extension,
+  panel}`` gives one panel's whole last good copy. It reads ``ext_panels`` only and never
+  runs anything. The panel's words are the extension's, so the calling task is tainted.
+
 Handlers don't see the requester; the gate limits callers to principals who may request
 global tools (the owner).
 """
@@ -39,6 +44,7 @@ from resonant.tools.when import format_due
 from resonant_sdk import Effect, Level, Manifest, ToolSpec
 
 if TYPE_CHECKING:
+    from resonant.dashboard.snapshot import Panel
     from resonant.extensions.host import ExtensionHost
 
 log = logging.getLogger(__name__)
@@ -74,7 +80,27 @@ MUTE_EXTENSION = ToolSpec(
     timeout_s=5.0,
 )
 
-SPECS: tuple[ToolSpec, ...] = (LIST_EXTENSIONS, MUTE_EXTENSION)
+READ_PANEL = ToolSpec(
+    name="read_panel",
+    description=(
+        "Read an extension's dashboard panels (the last copy each one drew): their stat "
+        "numbers, or with `panel` one panel's views in full. Never runs the extension."
+    ),
+    args_schema={
+        "type": "object",
+        "properties": {
+            "extension": {"type": "string", "maxLength": 48},
+            "panel": {"type": "string", "maxLength": 48},
+        },
+        "required": ["extension"],
+        "additionalProperties": False,
+    },
+    effect=Effect.READ,
+    untrusted=True,  # D6: the panel's text is the extension's, so the calling task is tainted
+    timeout_s=5.0,
+)
+
+SPECS: tuple[ToolSpec, ...] = (LIST_EXTENSIONS, MUTE_EXTENSION, READ_PANEL)
 
 
 def _health(snapshot: dict[str, dict[str, Any]], ext: str) -> str | None:
@@ -224,6 +250,60 @@ def mute_extension(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _stats(views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The first view's stat widgets as ``{label, value, unit}``."""
+    widgets: list[dict[str, Any]] = views[0]["widgets"] if views else []
+    return [
+        {"label": w["label"], "value": w["value"], "unit": w.get("unit")}
+        for w in widgets
+        if w["type"] == "stat"
+    ]
+
+
+def _head(p: Panel) -> dict[str, Any]:
+    return {
+        "id": p.id,
+        "title": p.title,
+        "updated_at": None if p.updated_at is None else iso(p.updated_at),
+        "ok": p.ok,
+        "stale": p.stale,
+        "error": p.error,
+    }
+
+
+def read_panel(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
+    from resonant.dashboard.snapshot import extension_panels  # a cycle at module level
+
+    unknown = set(args) - {"extension", "panel"}
+    if unknown:
+        raise ToolFailed(f"unknown arguments: {sorted(unknown)}")
+    name, wanted = args.get("extension"), args.get("panel")
+    if not isinstance(name, str) or (record := store.get_extension(ctx.conn, name)) is None:
+        raise ToolFailed("no such extension")
+    if wanted is not None and not isinstance(wanted, str):
+        raise ToolFailed("panel must be a panel id")
+    panels = extension_panels(ctx.conn, record, ctx.clock())
+    if wanted is None:
+        return {
+            "extension": name,
+            "panels": [
+                {**_head(p), "stats": _stats([v.model_dump(mode="json") for v in p.views])}
+                for p in panels
+            ],
+        }
+    found = next((p for p in panels if p.id == wanted), None)
+    if found is None:
+        raise ToolFailed("no such panel")
+    return {
+        "extension": name,
+        "panel": {
+            **_head(found),
+            "truncated": found.truncated,
+            "views": [v.model_dump(mode="json") for v in found.views],
+        },
+    }
+
+
 def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
     async def _list(args: dict[str, Any]) -> dict[str, Any]:
         no_args(LIST_EXTENSIONS.name, args)
@@ -232,4 +312,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
     async def _mute(args: dict[str, Any]) -> dict[str, Any]:
         return mute_extension(ctx, args)
 
-    return {LIST_EXTENSIONS.name: _list, MUTE_EXTENSION.name: _mute}
+    async def _read_panel(args: dict[str, Any]) -> dict[str, Any]:
+        return read_panel(ctx, args)
+
+    return {LIST_EXTENSIONS.name: _list, MUTE_EXTENSION.name: _mute, READ_PANEL.name: _read_panel}

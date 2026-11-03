@@ -46,6 +46,17 @@ Core jobs (``ext="core"``). ``CORE_JOBS`` is a tuple of factories, like ``BUILTI
 each gets ``CoreDeps`` at daemon start and returns a ``CoreJob`` (or None when disabled).
 A core job is trusted core code: L0 only, run inline without the gate, with no secrets.
 
+Panels (PER-280). An extension's dashboard panels (``Manifest.panels``) are L0 reads run
+inline like an L0 job, through the same ``_call`` (gate audit, secrets, redaction, timeout),
+but with their own state (``ext_panels``) and schedule: the ``idle`` cron, or the ``active``
+one while local time is inside its hours, days and months (``cron.in_window``). Each runs once
+at start-up too (``PANEL_FIRST_RUN_S`` after the daemon starts, staggered), and never within
+55 s of its own previous start. A run's output goes through ``extensions.panels.normalize``:
+a good copy is stored (``panel.run``), a refusal or a failure keeps the last good copy and
+grows the streak (``panel.failed``); ``panel.denied``, ``panel.killed``, ``panel.dry_run`` and
+``panel.skipped_paused`` only audit. Paused, a panel simply doesn't run: its missed due times
+are not audited.
+
 A job whose schedule doesn't parse is skipped at build; a job that raises during a tick is
 logged and skipped for that tick. Neither stops the others.
 """
@@ -60,6 +71,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
+from zoneinfo import ZoneInfo
 
 from resonant import killswitch
 from resonant.executor import CallContext, ToolFailed
@@ -72,9 +84,11 @@ from resonant.extensions.cron import (
     Outcome,
     Schedule,
     decide,
+    in_window,
     parse_schedule,
 )
 from resonant.extensions.notify import take_baseline
+from resonant.extensions.panels import Normalized, normalize
 from resonant.extensions.process import ExtAmbiguous, ExtFailed, ProcessTracker
 from resonant.extensions.pulse_job import pulse_job
 from resonant.gate import Gate
@@ -218,6 +232,62 @@ class ScheduledJob:
         return self.core or self.spec.effective_level is Level.L0
 
 
+PANEL_GUARD_S = 55.0  # a panel never starts twice within this many seconds
+PANEL_BOOT_STAGGER_S = 3.0
+PANEL_SLACK_S = 120.0  # past its next due + timeout, a panel is stale
+
+
+@dataclass(frozen=True)
+class ScheduledPanel:
+    ext: str
+    panel_id: str
+    spec: ToolSpec
+    idle: Schedule
+    active_expr: str | None
+    active: Schedule | None
+    tz: ZoneInfo
+    call: JobCall
+    max_bytes: int
+    tools: frozenset[str]  # this extension's tool names: a link cell may name only these
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.ext, f"panel:{self.panel_id}")
+
+    @property
+    def label(self) -> str:
+        return f"{self.ext}/panel:{self.panel_id}"
+
+    def schedule_at(self, now: datetime) -> Schedule:
+        """The governing schedule: ``active`` inside its window, else ``idle``."""
+        if (
+            self.active is not None
+            and self.active_expr
+            and in_window(self.active_expr, self.tz, now)
+        ):
+            return self.active
+        return self.idle
+
+    def next_run_after(self, after: datetime) -> datetime | None:
+        """The next time a run would really start: the earliest due time of either cron at
+        which that cron is the governing one."""
+        at = after
+        for _ in range(500):
+            cands = [
+                (due, s)
+                for s in (self.idle, self.active)
+                if s is not None and (due := s.next_after(at)) is not None
+            ]
+            if not cands:
+                return None
+            cands.sort(key=lambda c: c[0])
+            for due, which in cands:
+                if due == cands[0][0] and self.schedule_at(due) is which:
+                    return due
+            at = cands[0][0]
+        return None
+
+
 @dataclass(frozen=True)
 class _Result:
     outcome: str  # ok | failed | killed | denied | dry_run | skipped_paused
@@ -305,11 +375,16 @@ class Scheduler:
         tick_s: float = 30.0,
         started_at: datetime | None = None,
         clock: Callable[[], datetime] = utcnow,
+        panels: Sequence[ScheduledPanel] = (),
+        panel_first_run_s: float | None = None,
     ) -> None:
         """``started_at`` (the daemon's start) with kv ``scheduler.last_tick`` gives the
-        downtime that ``catchup`` may cover. An extension job's spec is the ``registry``'s."""
+        downtime that ``catchup`` may cover. An extension job's spec is the ``registry``'s.
+        ``panels`` run once ``panel_first_run_s`` after ``started_at`` (None: not at start-up),
+        one every ``PANEL_BOOT_STAGGER_S``, then on their own schedules."""
         self.conn = conn
         self.jobs = tuple(jobs)
+        self.panels = tuple(panels)
         self.core = ToolCore(conn, registry=registry, gate=gate, executor=InlineExecutor(gate))
         self.owner = owner
         self.secrets = secrets
@@ -323,6 +398,17 @@ class Scheduler:
         self._background: set[asyncio.Task[Any]] = set()
         self._paused: bool | None = None
         self._unhook: Callable[[], None] | None = None
+        begin = started_at or clock()
+        self._panel_boot: dict[tuple[str, str], datetime] = (
+            {}
+            if panel_first_run_s is None
+            else {
+                p.key: begin + timedelta(seconds=panel_first_run_s + PANEL_BOOT_STAGGER_S * i)
+                for i, p in enumerate(self.panels)
+            }
+        )
+        self._panel_due: dict[tuple[str, str], datetime] = {}
+        self._panel_started: dict[tuple[str, str], datetime] = {}
 
     @classmethod
     def from_components(
@@ -335,6 +421,7 @@ class Scheduler:
         channel: Channel | None = None,
         core_jobs: Sequence[CoreJobFactory] = CORE_JOBS,
         clock: Callable[[], datetime] = utcnow,
+        panel_first_run_s: float | None = None,
     ) -> Scheduler:
         """Every loaded extension's jobs, then the core jobs, over the components' gate and
         the executor's ``SecretStore``."""
@@ -346,6 +433,34 @@ class Scheduler:
             schedule = _schedule(conn, hj.ext, hj.job.id, hj.job.schedule, hj.job.tz, settings)
             if schedule is not None:
                 jobs.append(ScheduledJob(hj.ext, hj.job.id, hj.spec, schedule, hj.handler, catchup))
+        panels: list[ScheduledPanel] = []
+        for hp in host.scheduled_panels() if host is not None else []:
+            zone = hp.panel.tz or settings.timezone
+            pid = f"panel:{hp.panel.id}"
+            idle = _schedule(conn, hp.ext, pid, hp.panel.refresh.idle, zone, settings)
+            active_expr = hp.panel.refresh.active
+            active = (
+                None
+                if active_expr is None
+                else _schedule(conn, hp.ext, pid, active_expr, zone, settings)
+            )
+            if idle is not None:
+                panels.append(
+                    ScheduledPanel(
+                        hp.ext,
+                        hp.panel.id,
+                        hp.spec,
+                        idle,
+                        active_expr if active is not None else None,
+                        active,
+                        idle.tz,
+                        hp.handler,
+                        hp.panel.max_bytes,
+                        frozenset(s.name for s in host.loaded[hp.ext].tools)
+                        if host
+                        else frozenset(),
+                    )
+                )
         deps = CoreDeps(
             settings,
             conn,
@@ -391,6 +506,8 @@ class Scheduler:
             tick_s=settings.loop.tick_s,
             started_at=started_at,
             clock=clock,
+            panels=panels,
+            panel_first_run_s=panel_first_run_s,
         )
 
     # --- lifecycle ------------------------------------------------------------------------
@@ -481,6 +598,16 @@ class Scheduler:
                     times.append(t)
             except ValueError:
                 log.exception("next due failed", extra={"job": job.label})
+        for panel in self.panels:
+            try:
+                times += [t for t in self._panel_boot.values() if t > after]
+                times += [
+                    t
+                    for s in (panel.idle, panel.active)
+                    if s is not None and (t := s.next_after(after)) is not None
+                ]
+            except ValueError:
+                log.exception("next due failed", extra={"job": panel.label})
         return min(times, default=None)
 
     async def tick(self, now: datetime) -> None:
@@ -492,6 +619,11 @@ class Scheduler:
                 self._tick_job(job, now, paused)
             except Exception:
                 log.exception("job tick failed", extra={"job": job.label})
+        for panel in self.panels:
+            try:
+                self._tick_panel(panel, now, paused)
+            except Exception:
+                log.exception("panel tick failed", extra={"job": panel.label})
         with atomic(self.conn):
             kv_set(self.conn, LAST_TICK_KEY, iso(now))
 
@@ -553,6 +685,112 @@ class Scheduler:
     def _audit_missed(self, job: ScheduledJob, d: Decision) -> None:
         for due in d.missed:
             self._audit(job, "job.missed", due, truncated=d.truncated)
+
+    # --- panels (PER-280) -----------------------------------------------------------------
+
+    def _tick_panel(self, p: ScheduledPanel, now: datetime, paused: bool) -> None:
+        key = p.key
+        if paused or key in self._inflight:
+            return  # silently: a panel's missed due times are never audited
+        started = self._panel_started.get(key)
+        if started is not None and (now - started).total_seconds() < PANEL_GUARD_S:
+            return
+        boot = self._panel_boot.get(key)
+        if boot is not None and now >= boot:
+            del self._panel_boot[key]
+            self._start_panel(p, now, now)
+            return
+        d = decide(
+            p.schedule_at(now),
+            now=now,
+            last_due=self._panel_due.get(key),
+            paused=False,
+            catchup=None,
+            downtime=None,
+            busy=False,
+            on_time=self.on_time,
+        )
+        if d.last_due is not None:
+            self._panel_due[key] = d.last_due
+        if d.outcome is Outcome.RUN:
+            assert d.due is not None
+            self._start_panel(p, d.due, now)
+
+    def _start_panel(self, p: ScheduledPanel, due: datetime, now: datetime) -> None:
+        self._panel_started[p.key] = now
+        task = asyncio.get_running_loop().create_task(
+            self._run_panel(p, due), name=f"panel:{p.label}"
+        )
+        self._inflight[p.key] = task
+        task.add_done_callback(lambda t, key=p.key: self._inline_done(key, t))
+
+    async def _run_panel(self, p: ScheduledPanel, due: datetime) -> None:
+        # The throwaway job is only the shape ``_call`` takes: gate, secrets, redaction, timeout.
+        job = ScheduledJob(p.ext, f"panel:{p.panel_id}", p.spec, p.idle, p.call)
+        async with self._sem:
+            if read_paused(self.conn):
+                result = _Result("skipped_paused")
+            else:
+                result = await self._call(job, due)
+            self._finish_panel(p, due, result)
+
+    def _audit_panel(self, p: ScheduledPanel, action: str, due: datetime, **detail: Any) -> None:
+        audit(
+            self.conn,
+            action,
+            extension=p.ext,
+            tool=p.spec.name,
+            effect=p.spec.effect.value,
+            level=p.spec.effective_level.value,
+            panel=f"{p.ext}/{p.panel_id}",
+            due=iso(due),
+            **detail,
+        )
+
+    def _expect_by(self, p: ScheduledPanel, now: datetime) -> datetime:
+        nxt = p.next_run_after(now) or now + timedelta(hours=25)
+        return nxt + timedelta(seconds=p.spec.timeout_s + PANEL_SLACK_S)
+
+    def _finish_panel(self, p: ScheduledPanel, due: datetime, r: _Result) -> None:
+        now = self.clock()
+        with transaction(self.conn):
+            match r.outcome:
+                case "ok":
+                    got = normalize(r.data, max_bytes=p.max_bytes, tools=p.tools, ran_at=now)
+                    if isinstance(got, Normalized):
+                        store.save_panel_ok(
+                            self.conn,
+                            p.ext,
+                            p.panel_id,
+                            data=json.dumps(got.data, separators=(",", ":")),
+                            updated_at=got.updated_at,
+                            ran_at=now,
+                            bytes=got.bytes,
+                            expect_by=self._expect_by(p, now),
+                        )
+                        self._audit_panel(
+                            p, "panel.run", due, ok=True, ms=r.duration_ms, bytes=got.bytes,
+                            truncated=got.truncated,
+                        )  # fmt: skip
+                    else:
+                        store.record_panel_failure(
+                            self.conn, p.ext, p.panel_id, ran_at=now, error=got.error
+                        )
+                        self._audit_panel(p, "panel.failed", due, error=got.error)
+                case "failed" | "denied":
+                    error = _clip(r.error or r.outcome)
+                    store.record_panel_failure(
+                        self.conn, p.ext, p.panel_id, ran_at=now, error=error
+                    )
+                    detail = {"stderr_tail": r.stderr_tail} if r.stderr_tail else {}
+                    action = "panel.failed" if r.outcome == "failed" else "panel.denied"
+                    self._audit_panel(p, action, due, error=error, **detail)
+                case "killed":
+                    self._audit_panel(p, "panel.killed", due, error=r.error)
+                case "dry_run":
+                    self._audit_panel(p, "panel.dry_run", due)
+                case _:
+                    self._audit_panel(p, "panel.skipped_paused", due)
 
     # --- gated runs: a task for JobRunner -------------------------------------------------
 
@@ -741,6 +979,7 @@ __all__ = [
     "CoreJobFactory",
     "JobCall",
     "ScheduledJob",
+    "ScheduledPanel",
     "Scheduler",
     "job_checkpoint",
     "job_spec_name",

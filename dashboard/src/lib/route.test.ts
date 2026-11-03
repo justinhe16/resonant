@@ -11,6 +11,8 @@ const CASES: [string, Route][] = [
   ["#/approvals/ap_k7q2", { kind: "approval", id: "ap_k7q2" }],
   ["#/questions/7", { kind: "question", id: 7 }],
   ["#/extensions/github", { kind: "extension", name: "github" }],
+  ["#/ext/github", { kind: "ext", name: "github" }],
+  ["#/ext/github/prs", { kind: "ext", name: "github", panel: "prs" }],
   ["#/jobs/core/pulse", { kind: "job", ext: "core", id: "pulse" }],
   ["#/pulse/core/run%2FR12", { kind: "pulse", source: "core", key: "run/R12" }],
   ["#/health/ext%3Agithub", { kind: "health", name: "ext:github" }],
@@ -25,7 +27,7 @@ describe("route", () => {
   });
 
   it("ignores hashes that aren't routes (login fragments, junk)", () => {
-    for (const h of ["", "#", "#access_token=abc&type=recovery", "#/", "#/nope/1", "#/questions/x", "#/jobs/core", "#/pulse/core"])
+    for (const h of ["", "#", "#access_token=abc&type=recovery", "#/", "#/nope/1", "#/questions/x", "#/jobs/core", "#/pulse/core", "#/ext"])
       expect(parseHash(h)).toBeNull();
   });
 

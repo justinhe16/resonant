@@ -45,7 +45,13 @@ from typing import Any, Final, Literal, cast
 import httpx
 
 from resonant.config import RelayConfig
-from resonant.dashboard.snapshot import RELAY_HEALTH_KV, Snapshot, to_remote
+from resonant.dashboard.snapshot import (
+    RELAY_HEALTH_KV,
+    Snapshot,
+    fit_panels,
+    panel_bytes,
+    to_remote,
+)
 from resonant.monitor import scrub
 from resonant.redact import Redactor, redact_secrets, scrub_rc_links
 from resonant.secrets import SecretError, SecretMissing, SecretStore, secret_ref
@@ -146,7 +152,7 @@ def _cut_history(out: dict[str, Any]) -> None:
 
 
 # The diagram nodes that belong to an extension: step 1 drops their sentences, step 3 them.
-_DIAGRAM_CHILDREN: Final = frozenset({"tool", "server", "repo", "job"})
+_DIAGRAM_CHILDREN: Final = frozenset({"tool", "server", "repo", "job", "panel"})
 
 
 def _diagram_nodes(out: dict[str, Any]) -> list[dict[str, Any]]:
@@ -175,6 +181,16 @@ def _cut_diagram_children(out: dict[str, Any]) -> None:
         for e in (cast(list[dict[str, Any]], edges) if isinstance(edges, list) else [])
         if e.get("source") in ids and e.get("target") in ids
     ]
+
+
+def _cut_panels(out: dict[str, Any]) -> None:
+    """Drop panels' views (``snapshot.fit_panels``: the largest first, the oldest among equals)
+    until the JSON fits or none has any left. Each keeps its state and says ``truncated``."""
+    exts = cast(list[dict[str, Any]], out.get("extensions") or [])
+    while (size := data_size(out)) > MAX_BYTES and (held := panel_bytes(exts)) > 0:
+        # Ask for a little more than the overshoot, so one pass usually does it; at least one
+        # panel always goes (a budget below what is held).
+        fit_panels(exts, max(0, min(held - 1, held - (size - MAX_BYTES))))
 
 
 def _halve_lists(out: dict[str, Any]) -> None:
@@ -215,6 +231,7 @@ def _cut_items(out: dict[str, Any]) -> None:
 # before it; ``_halve_lists`` stops by itself as soon as the JSON fits.
 SHRINK_STEPS: Final[tuple[tuple[str, Callable[[dict[str, Any]], None]], ...]] = (
     ("history", _cut_history),
+    ("panels", _cut_panels),
     ("lists", _halve_lists),
     ("detail", _cut_detail),
     ("items", _cut_items),
@@ -230,12 +247,16 @@ def shrink(data: dict[str, Any]) -> dict[str, Any]:
     1. ``history``: a run's last 4 events, 3 did notes and 3 effects, a task's last 3 events,
        a batch's first 3 changes, an extension's first ``EXT_TOOLS_TRIMMED`` tools, and no
        sentence on the diagram's extension children (tools, servers, jobs, repos).
-    2. ``lists``: the runs, tasks, recently decided approvals, pulse items, brain tool calls
+    2. ``panels`` (PER-280): extension panels' views dropped one panel at a time, the largest
+       first (the oldest among equals), until it fits; each keeps its title and run state and
+       says ``truncated``. They go before the lists: history cuts are cheap, but a panel is
+       what the owner asked the relay to carry, and a run row is not.
+    3. ``lists``: the runs, tasks, recently decided approvals, pulse items, brain tool calls
        and questions, halved together (each keeps at least ``SHRINK_FLOOR``) until it fits.
-    3. ``detail``: every run's summary, failure, did, effects, history and flagged paths, every
+    4. ``detail``: every run's summary, failure, did, effects, history and flagged paths, every
        task's error and history, every extension's tools and every batch's changes dropped,
        and the diagram's extension children (core jobs stay).
-    4. ``items``: every one of those lists, pending approvals, trust rules and repos emptied;
+    5. ``items``: every one of those lists, pending approvals, trust rules and repos emptied;
        the counts, health, extensions and jobs stay.
     """
     if data_size(data) <= MAX_BYTES:

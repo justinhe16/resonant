@@ -474,3 +474,73 @@ def test_a_node_leaves_its_unset_fields_out(db: sqlite3.Connection) -> None:
         n.pop("group", None)
     parsed = Snapshot.model_validate(old)
     assert parsed.diagram is not None and parsed.diagram.groups == []
+
+
+# --- panel nodes (PER-280) --------------------------------------------------------------
+
+
+def _panel_install(db: sqlite3.Connection, now: datetime) -> None:
+    from panel_helpers import panel_manifest, raw_panel, store_panel
+
+    manifest = panel_manifest("ledger", ("paper", "oncall", "never", "late", "bad"))
+    manifest["panels"][1].pop("description")  # no description: the node says what it is
+    _install(db, manifest, now)
+    store_panel(db, "ledger", "paper", raw_panel(), now)
+    store_panel(db, "ledger", "oncall", raw_panel(rows=2), now)
+    ext_store.record_panel_failure(db, "ledger", "oncall", ran_at=now, error="exit 1")
+    store_panel(db, "ledger", "late", raw_panel(rows=2), now)
+    db.execute("UPDATE ext_panels SET expect_by = ? WHERE panel_id = 'late'", (iso(now),))
+    store_panel(db, "ledger", "bad", raw_panel(rows=2), now)
+    for _ in range(3):
+        ext_store.record_panel_failure(db, "ledger", "bad", ran_at=now, error="exit 1")
+
+
+def test_panels_are_nodes_under_their_extension_with_a_draws_edge(db: sqlite3.Connection) -> None:
+    now = utcnow()
+    _panel_install(db, now)
+    s = _build(db, now)
+    nodes = _nodes(s)
+    paper = nodes["panel:ledger/paper"]
+    assert (paper.kind, paper.parent, paper.label) == ("panel", "ext:ledger", "Panel paper")
+    assert (paper.ext, paper.panel, paper.text) == ("ledger", "paper", "The paper panel")
+    assert paper.tags == ["panel", "read", "L0"] and paper.health == "ok"
+    assert paper.last_run_at is not None and paper.job is None
+    oncall = nodes["panel:ledger/oncall"]
+    assert oncall.text.startswith(
+        "ledger/oncall: a dashboard panel; Resonant runs its panel command"
+    )
+    assert oncall.text.endswith("in its active hours and draws the result.")
+    assert oncall.tags == ["panel", "read", "L0", "stale"] and oncall.health == "degraded"
+    never = nodes["panel:ledger/never"]
+    assert never.health == "unknown" and never.last_run_at is None and "stale" in never.tags
+    assert (
+        nodes["panel:ledger/late"].health == "degraded"
+        and "stale" in nodes["panel:ledger/late"].tags
+    )
+    assert nodes["panel:ledger/bad"].health == "failing"
+    assert s.diagram is not None
+    edges = [
+        (e.source, e.target, e.label) for e in s.diagram.edges if e.target.startswith("panel:")
+    ]
+    assert ("ext:ledger", "panel:ledger/paper", "draws") in edges and len(edges) == 5
+    # every panel node is under an extension, so it needs no group of its own
+    assert all(n.group is None for n in nodes.values() if n.kind == "panel")
+
+
+def test_the_relay_trim_keeps_panel_nodes_until_the_detail_step_and_never_orphans_edges(
+    db: sqlite3.Connection,
+) -> None:
+    now = utcnow()
+    _panel_install(db, now)
+    data = to_remote(_build(db, now)).model_dump(mode="json")
+    assert any(n["kind"] == "panel" for n in data["diagram"]["nodes"])
+    step1 = json.loads(json.dumps(data))
+    pusher_mod._cut_history(step1)  # pyright: ignore[reportPrivateUsage]
+    panels = [n for n in step1["diagram"]["nodes"] if n["kind"] == "panel"]
+    assert panels and all(n["text"] == "" for n in panels)  # the sentence goes first
+    Snapshot.model_validate(step1)
+    pusher_mod._cut_detail(step1)  # pyright: ignore[reportPrivateUsage]
+    assert not [n for n in step1["diagram"]["nodes"] if n["kind"] == "panel"]
+    ids = {n["id"] for n in step1["diagram"]["nodes"]}
+    assert all(e["source"] in ids and e["target"] in ids for e in step1["diagram"]["edges"])
+    Snapshot.model_validate(step1)

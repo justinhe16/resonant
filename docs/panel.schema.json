@@ -1,0 +1,1030 @@
+{
+  "$comment": "Generated from resonant_sdk/panel_schema.py; do not edit.",
+  "$defs": {
+    "Column": {
+      "additionalProperties": false,
+      "properties": {
+        "align": {
+          "anyOf": [
+            {
+              "enum": [
+                "left",
+                "right"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Align"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "key": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+          "title": "Key",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string",
+          "x-cut-at": 32
+        },
+        "type": {
+          "default": "text",
+          "enum": [
+            "text",
+            "number",
+            "money",
+            "time",
+            "pill",
+            "link"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "label"
+      ],
+      "title": "Column",
+      "type": "object"
+    },
+    "Details": {
+      "additionalProperties": false,
+      "description": "Any JSON value. Core flattens it into at most 200 rows (an object's key is the row's\ntext, never a JSON key); containers deeper than 5 levels become ``\u2026``.",
+      "properties": {
+        "collapsed": {
+          "default": true,
+          "title": "Collapsed",
+          "type": "boolean"
+        },
+        "data": {
+          "title": "Data"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "details",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "data"
+      ],
+      "title": "Details",
+      "type": "object"
+    },
+    "Kv": {
+      "additionalProperties": false,
+      "description": "The first 30 items are kept.",
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/KvItem"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "kv",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "items"
+      ],
+      "title": "Kv",
+      "type": "object"
+    },
+    "KvItem": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "anyOf": [
+            {
+              "enum": [
+                "number",
+                "integer",
+                "money",
+                "percent",
+                "duration",
+                "bytes"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format"
+        },
+        "key": {
+          "title": "Key",
+          "type": "string",
+          "x-cut-at": 40
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 16
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "string",
+              "x-cut-at": 120
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "key",
+        "value"
+      ],
+      "title": "KvItem",
+      "type": "object"
+    },
+    "Link": {
+      "additionalProperties": false,
+      "description": "A chip that names a tool of this extension (shown as ``ext/tool``); it runs nothing.",
+      "properties": {
+        "label": {
+          "title": "Label",
+          "type": "string",
+          "x-cut-at": 64
+        },
+        "tool": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "tool"
+      ],
+      "title": "Link",
+      "type": "object"
+    },
+    "Pill": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "title": "Label",
+          "type": "string",
+          "x-cut-at": 24
+        },
+        "tone": {
+          "enum": [
+            "ok",
+            "warn",
+            "bad",
+            "neutral"
+          ],
+          "title": "Tone",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "tone"
+      ],
+      "title": "Pill",
+      "type": "object"
+    },
+    "Series": {
+      "additionalProperties": false,
+      "description": "At most 4 lines of the same length as ``x.values``; at most 2400 points (a time axis over\n240 is downsampled to 240).",
+      "properties": {
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "format": {
+          "anyOf": [
+            {
+              "enum": [
+                "number",
+                "integer",
+                "money",
+                "percent",
+                "duration",
+                "bytes"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "kind": {
+          "enum": [
+            "line",
+            "area",
+            "bar"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "series": {
+          "items": {
+            "$ref": "#/$defs/SeriesLine"
+          },
+          "maxItems": 4,
+          "title": "Series",
+          "type": "array"
+        },
+        "stacked": {
+          "default": false,
+          "title": "Stacked",
+          "type": "boolean"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "series",
+          "title": "Type",
+          "type": "string"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 16
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "x": {
+          "$ref": "#/$defs/SeriesX"
+        }
+      },
+      "required": [
+        "type",
+        "kind",
+        "x",
+        "series"
+      ],
+      "title": "Series",
+      "type": "object"
+    },
+    "SeriesLine": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string",
+          "x-cut-at": 32
+        },
+        "values": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "values"
+      ],
+      "title": "SeriesLine",
+      "type": "object"
+    },
+    "SeriesX": {
+      "additionalProperties": false,
+      "description": "``time``: values ascending (ISO-8601 with offset or unix seconds). ``category``: strings,\ncut to 24 characters, at most 240.",
+      "properties": {
+        "type": {
+          "enum": [
+            "time",
+            "category"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "values": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "format": "date-time",
+                "type": "string"
+              }
+            ]
+          },
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "values"
+      ],
+      "title": "SeriesX",
+      "type": "object"
+    },
+    "Stat": {
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "delta": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delta"
+        },
+        "delta_format": {
+          "anyOf": [
+            {
+              "enum": [
+                "number",
+                "integer",
+                "money",
+                "percent",
+                "duration",
+                "bytes"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delta Format"
+        },
+        "format": {
+          "anyOf": [
+            {
+              "enum": [
+                "number",
+                "integer",
+                "money",
+                "percent",
+                "duration",
+                "bytes"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format"
+        },
+        "health": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "warn",
+                "bad"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health"
+        },
+        "hint": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 80
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hint"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string",
+          "x-cut-at": 40
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "stat",
+          "title": "Type",
+          "type": "string"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 16
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "string",
+              "x-cut-at": 40
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        }
+      },
+      "required": [
+        "type",
+        "label",
+        "value"
+      ],
+      "title": "Stat",
+      "type": "object"
+    },
+    "Status": {
+      "additionalProperties": false,
+      "description": "The first 50 items are kept.",
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/StatusItem"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "status",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "items"
+      ],
+      "title": "Status",
+      "type": "object"
+    },
+    "StatusItem": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 120
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Detail"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string",
+          "x-cut-at": 64
+        },
+        "since": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Since"
+        },
+        "state": {
+          "enum": [
+            "up",
+            "down",
+            "warn",
+            "unknown"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "state"
+      ],
+      "title": "StatusItem",
+      "type": "object"
+    },
+    "Table": {
+      "additionalProperties": false,
+      "description": "At most 8 columns; the first 50 rows are kept. A row is ``{column key: cell}``; a\nmissing key is null, an unknown key is refused.",
+      "properties": {
+        "columns": {
+          "items": {
+            "$ref": "#/$defs/Column"
+          },
+          "maxItems": 8,
+          "title": "Columns",
+          "type": "array"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "rows": {
+          "items": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Pill"
+                },
+                {
+                  "$ref": "#/$defs/Link"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object"
+          },
+          "title": "Rows",
+          "type": "array"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "table",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "columns",
+        "rows"
+      ],
+      "title": "Table",
+      "type": "object"
+    },
+    "Text": {
+      "additionalProperties": false,
+      "description": "Plain text only: never rendered as markup.",
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string",
+          "x-cut-at": 800
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "text",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "text"
+      ],
+      "title": "Text",
+      "type": "object"
+    },
+    "View": {
+      "additionalProperties": false,
+      "description": "A tab of the panel. At most 24 widgets (48 per panel).",
+      "properties": {
+        "id": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string",
+          "x-cut-at": 40
+        },
+        "widgets": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "details": "#/$defs/Details",
+                "kv": "#/$defs/Kv",
+                "series": "#/$defs/Series",
+                "stat": "#/$defs/Stat",
+                "status": "#/$defs/Status",
+                "table": "#/$defs/Table",
+                "text": "#/$defs/Text"
+              },
+              "propertyName": "type"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Stat"
+              },
+              {
+                "$ref": "#/$defs/Series"
+              },
+              {
+                "$ref": "#/$defs/Table"
+              },
+              {
+                "$ref": "#/$defs/Status"
+              },
+              {
+                "$ref": "#/$defs/Kv"
+              },
+              {
+                "$ref": "#/$defs/Text"
+              },
+              {
+                "$ref": "#/$defs/Details"
+              }
+            ]
+          },
+          "maxItems": 24,
+          "minItems": 1,
+          "title": "Widgets",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "widgets"
+      ],
+      "title": "View",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "What a panel command prints on stdout.",
+  "properties": {
+    "actions": {
+      "default": [],
+      "items": {},
+      "maxItems": 0,
+      "title": "Actions",
+      "type": "array"
+    },
+    "health": {
+      "anyOf": [
+        {
+          "enum": [
+            "ok",
+            "warn",
+            "bad"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Health"
+    },
+    "local_url": {
+      "anyOf": [
+        {
+          "maxLength": 300,
+          "pattern": "^http://127\\.0\\.0\\.1:[0-9]{1,5}(/[!-~]*)?$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Local Url"
+    },
+    "schema": {
+      "const": 1,
+      "title": "Schema",
+      "type": "integer"
+    },
+    "updated_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Updated At"
+    },
+    "views": {
+      "items": {
+        "$ref": "#/$defs/View"
+      },
+      "maxItems": 6,
+      "minItems": 1,
+      "title": "Views",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "views"
+  ],
+  "title": "PanelOutput",
+  "type": "object"
+}
