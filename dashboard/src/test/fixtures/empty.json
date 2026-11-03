@@ -71,5 +71,428 @@
     "turns": 0
   },
   "trust_rule_count": 0,
-  "repo_count": 0
+  "repo_count": 0,
+  "diagram": {
+    "nodes": [
+      {
+        "id": "core:gateway",
+        "kind": "core",
+        "label": "iMessage gateway",
+        "parent": null,
+        "text": "Reads new texts from Messages' chat.db and sends Resonant's replies, approval asks, pulses and briefings back over iMessage.",
+        "tags": [],
+        "health": "unknown",
+        "check": null,
+        "state": null,
+        "module": "resonant/gateway/imessage/",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:loop",
+        "kind": "core",
+        "label": "Event loop",
+        "parent": null,
+        "text": "Turns every text, job and worker event into a durable task and runs the tasks by priority within the slot pool.",
+        "tags": [],
+        "health": "unknown",
+        "check": null,
+        "state": null,
+        "module": "resonant/loop/",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:router",
+        "kind": "core",
+        "label": "qwen router",
+        "parent": null,
+        "text": "The local qwen3 model on Ollama triages each text: it answers a greeting or ack itself, builds the news check in code and hands everything else to Claude; it never writes a fact.",
+        "tags": [],
+        "health": "unknown",
+        "check": null,
+        "state": null,
+        "module": "resonant/router/",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:brain",
+        "kind": "core",
+        "label": "Claude brain",
+        "parent": null,
+        "text": "One long-lived Claude Code session on the subscription answers every other text in Resonant's one voice and calls Resonant's tools through the gate.",
+        "tags": [],
+        "health": "unknown",
+        "check": null,
+        "state": null,
+        "module": "resonant/runners/brain.py",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:toolcore",
+        "kind": "core",
+        "label": "Tool core",
+        "parent": null,
+        "text": "The one call path for the brain, jobs and watches: the registry, then the gate, then the executor; a boundary test keeps every call on it.",
+        "tags": [],
+        "health": null,
+        "check": null,
+        "state": null,
+        "module": "resonant/toolcore/",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:gate",
+        "kind": "core",
+        "label": "Gate and policy",
+        "parent": null,
+        "text": "Weighs each call's level against who chose it, applies trust rules and standing allows, and asks the owner by text (yes, yes always or yes <code>) when it must.",
+        "tags": [],
+        "health": null,
+        "check": null,
+        "state": null,
+        "module": "resonant/gate/",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:executor",
+        "kind": "core",
+        "label": "Executor",
+        "parent": null,
+        "text": "Runs an allowed call once (idempotency key), reads its Keychain secrets just before the call and writes the audit row.",
+        "tags": [],
+        "health": null,
+        "check": null,
+        "state": null,
+        "module": "resonant/executor.py",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:scheduler",
+        "kind": "core",
+        "label": "Scheduler",
+        "parent": null,
+        "text": "In-daemon cron: runs Resonant's own jobs (pulse, briefing, backups, prune, MCP drift) and every extension's jobs through the tool core; due runs are skipped while paused.",
+        "tags": [],
+        "health": null,
+        "check": null,
+        "state": null,
+        "module": "resonant/extensions/scheduler.py",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:workers",
+        "kind": "core",
+        "label": "Claude workers",
+        "parent": null,
+        "text": "Claude Code runs, each on its own branch copy of a repo in ~/code or a scratch dir, push PRs with a one-hour GitHub App token for one repo and ask or note over the worker desk.",
+        "tags": [],
+        "health": "degraded",
+        "check": null,
+        "state": null,
+        "module": "resonant/runners/claude.py",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:pulse",
+        "kind": "core",
+        "label": "Reports, pulse and briefing",
+        "parent": null,
+        "text": "Collects run outcomes and extension reports as pulse items: urgent ones text at once, the rest go in the hourly pulse or the 08:00 briefing.",
+        "tags": [],
+        "health": null,
+        "check": null,
+        "state": null,
+        "module": "resonant/extensions/pulse_job.py",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:store",
+        "kind": "core",
+        "label": "Store (SQLite)",
+        "parent": null,
+        "text": "One SQLite file (WAL) with tasks, events, approvals, runs, trust rules, repos, pulse items, the audit log and kv state.",
+        "tags": [],
+        "health": "unknown",
+        "check": null,
+        "state": null,
+        "module": "resonant/store/",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:backups",
+        "kind": "core",
+        "label": "Backups",
+        "parent": null,
+        "text": "core/backup copies the store every day with SQLite's online backup and keeps 7 daily and 4 weekly copies; core/prune trims old rows after a good backup.",
+        "tags": [],
+        "health": "unknown",
+        "check": null,
+        "state": null,
+        "module": "resonant/backup.py",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:dashboard",
+        "kind": "core",
+        "label": "Local dashboard",
+        "parent": null,
+        "text": "Serves this page and /api/dashboard on 127.0.0.1:7777, loopback only.",
+        "tags": [],
+        "health": null,
+        "check": null,
+        "state": null,
+        "module": "resonant/api.py",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:relay",
+        "kind": "core",
+        "label": "Relay pusher",
+        "parent": null,
+        "text": "Pushes the redacted remote snapshot to Supabase every minute; nothing connects into the Mini.",
+        "tags": [],
+        "health": "unknown",
+        "check": null,
+        "state": null,
+        "module": "resonant/dashboard/pusher.py",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:supabase",
+        "kind": "core",
+        "label": "Supabase",
+        "parent": null,
+        "text": "Keeps the latest snapshot behind an insert-only RPC that refuses secret-shaped text; only the owner, with password and TOTP, can read it.",
+        "tags": [],
+        "health": null,
+        "check": null,
+        "state": null,
+        "module": "supabase/",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "core:fly",
+        "kind": "core",
+        "label": "Fly dashboard and dead-man switch",
+        "parent": null,
+        "text": "The Fly app serves this page from Supabase and checks the newest snapshot every minute; a stale snapshot or a failing check alerts the owner on ntfy.",
+        "tags": [],
+        "health": null,
+        "check": null,
+        "state": null,
+        "module": "relay/",
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "proc:com.resonant.daemon",
+        "kind": "process",
+        "label": "com.resonant.daemon",
+        "parent": null,
+        "text": "The Resonant daemon: one Python process with the loop, gate, scheduler and local API; launchd starts it at login and restarts it if it exits.",
+        "tags": [
+          "launchd"
+        ],
+        "health": "unknown",
+        "check": null,
+        "state": "not scanned",
+        "module": null,
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "proc:com.resonant.ollama",
+        "kind": "process",
+        "label": "com.resonant.ollama",
+        "parent": null,
+        "text": "Ollama serving the local qwen model the router uses, kept loaded in memory.",
+        "tags": [
+          "launchd"
+        ],
+        "health": "unknown",
+        "check": null,
+        "state": "not scanned",
+        "module": null,
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      },
+      {
+        "id": "proc:com.resonant.caffeinate",
+        "kind": "process",
+        "label": "com.resonant.caffeinate",
+        "parent": null,
+        "text": "caffeinate -i -m -s keeps the Mini awake on AC power so the daemon never sleeps.",
+        "tags": [
+          "launchd"
+        ],
+        "health": "unknown",
+        "check": null,
+        "state": "not scanned",
+        "module": null,
+        "last_run_at": null,
+        "last_outcome": null,
+        "ext": null,
+        "job": null
+      }
+    ],
+    "edges": [
+      {
+        "source": "core:gateway",
+        "target": "core:loop",
+        "label": "text in"
+      },
+      {
+        "source": "core:loop",
+        "target": "core:router",
+        "label": "triage"
+      },
+      {
+        "source": "core:router",
+        "target": "core:gateway",
+        "label": "greeting / ack"
+      },
+      {
+        "source": "core:router",
+        "target": "core:brain",
+        "label": "everything else"
+      },
+      {
+        "source": "core:brain",
+        "target": "core:toolcore",
+        "label": "tool call"
+      },
+      {
+        "source": "core:toolcore",
+        "target": "core:gate",
+        "label": "check"
+      },
+      {
+        "source": "core:gate",
+        "target": "core:executor",
+        "label": "allowed"
+      },
+      {
+        "source": "core:gate",
+        "target": "core:gateway",
+        "label": "approval ask"
+      },
+      {
+        "source": "core:executor",
+        "target": "core:workers",
+        "label": "start run"
+      },
+      {
+        "source": "core:scheduler",
+        "target": "core:toolcore",
+        "label": "jobs"
+      },
+      {
+        "source": "core:workers",
+        "target": "core:pulse",
+        "label": "run reports"
+      },
+      {
+        "source": "core:pulse",
+        "target": "core:gateway",
+        "label": "texts out"
+      },
+      {
+        "source": "core:brain",
+        "target": "core:gateway",
+        "label": "answer"
+      },
+      {
+        "source": "core:executor",
+        "target": "core:store",
+        "label": "audit"
+      },
+      {
+        "source": "core:store",
+        "target": "core:backups",
+        "label": "daily copy"
+      },
+      {
+        "source": "core:store",
+        "target": "core:dashboard",
+        "label": "snapshot"
+      },
+      {
+        "source": "core:store",
+        "target": "core:relay",
+        "label": "snapshot"
+      },
+      {
+        "source": "core:relay",
+        "target": "core:supabase",
+        "label": "push / min"
+      },
+      {
+        "source": "core:supabase",
+        "target": "core:fly",
+        "label": "read"
+      },
+      {
+        "source": "proc:com.resonant.daemon",
+        "target": "core:loop",
+        "label": "runs"
+      },
+      {
+        "source": "proc:com.resonant.ollama",
+        "target": "core:router",
+        "label": "runs"
+      }
+    ],
+    "processes_scanned": false,
+    "truncated": false
+  }
 }

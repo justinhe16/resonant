@@ -329,8 +329,13 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
             f"{spec.effect.value} {spec.effective_level.value}, catchup {_s(job.catchup, 10)}"
             f", runs {job.run}"
         )
+        if job.description:
+            lines.append(f"    {_s(job.description, 160)}")
     if m.repos:
         lines.append(f"Repos: {', '.join(_s(r, 80) for r in m.repos)}")
+    if m.launch_agents:  # PER-277: names for the dashboard's diagram; never run or loaded
+        agents = ", ".join(_s(a.label, 128) for a in m.launch_agents)
+        lines.append(f"Launch agents (shown on the dashboard only): {agents}")
     if m.report is not None and m.report.max_urgency != "urgent":
         lines.append(report_grant(m).replace("reports:", "Reports:", 1))
     if m.notify:

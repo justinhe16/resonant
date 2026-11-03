@@ -1,11 +1,12 @@
 import type { ReactNode } from "react";
 import { Ago, Empty, ExternalLink, Group, Meta, OutsideText, RouteLink, Row, Rows, StateBadge } from "@/components/bits";
-import { ApprovalLinks, Missing, RunLines, RunLink, TaskLink, idChip } from "@/components/detail/links";
+import { ApprovalLinks, DiagramText, Missing, NodeLink, RunLines, RunLink, TaskLink, idChip } from "@/components/detail/links";
 import { F, Fields, Timeline, When } from "@/components/detail/parts";
 import { Badge } from "@/components/ui/badge";
 import { DecisionBadge } from "@/sections/Claude";
 import { JobRow } from "@/sections/Extensions";
 import { Changes } from "@/sections/WaitingOnYou";
+import { connections, KIND_LABEL } from "@/lib/diagram";
 import type { Route } from "@/lib/route";
 import { money, num } from "@/lib/format";
 import { approvalTitle, findApproval, githubLinks, isOutside, safeHttpsUrl } from "@/lib/snapshot";
@@ -381,6 +382,7 @@ function extensionView(name: string, { snap, now }: Ctx): View {
     description: e.description ?? undefined,
     body: (
       <div className="space-y-5">
+        <DiagramText snap={snap} id={`ext:${e.name}`} />
         <div className="flex flex-wrap items-center gap-1.5">
           <StateBadge tone={healthTone(e.health)}>{e.health}</StateBadge>
           <Badge variant={e.status === "enabled" ? "ok" : "warn"}>{e.status.replace(/_/g, " ")}</Badge>
@@ -477,6 +479,7 @@ function jobView(ext: string, id: string, { snap, now }: Ctx): View {
     description: ext === "core" ? "A core job" : "An extension job",
     body: (
       <div className="space-y-5">
+        <DiagramText snap={snap} id={`job:${ext}/${j.id}`} />
         <div className="flex flex-wrap items-center gap-1.5">
           <Badge variant={j.last_outcome === "ok" ? "ok" : j.last_outcome ? "bad" : "neutral"}>
             {j.last_outcome ?? "not run"}
@@ -718,6 +721,81 @@ function effectsView(kind: string, { snap }: Ctx): View {
   };
 }
 
+function nodeView(id: string, { snap, now }: Ctx): View {
+  const d = snap.diagram;
+  const n = d?.nodes.find((x) => x.id === id);
+  if (!d || !n) return notKept("Diagram", `Component ${id}`, "it lists what the daemon knows about right now", snap);
+  const { into, out } = connections(d, n.id);
+  const parent = n.parent ? d.nodes.find((x) => x.id === n.parent) : undefined;
+  const ext = n.ext && n.ext !== "core" ? snap.extensions.find((e) => e.name === n.ext) : undefined;
+  const check = n.check ? snap.health.find((h) => h.name === n.check) : undefined;
+  return {
+    title: n.label,
+    description: `${KIND_LABEL[n.kind].charAt(0).toUpperCase()}${KIND_LABEL[n.kind].slice(1)} in the diagram`,
+    body: (
+      <div className="space-y-5">
+        {n.text && <p className="text-sm">{n.text}</p>}
+        <div className="flex flex-wrap items-center gap-1.5">
+          {n.health && <StateBadge tone={healthTone(n.health)}>{n.health}</StateBadge>}
+          {n.state && <Badge variant="neutral">{n.state.replace(/_/g, " ")}</Badge>}
+          {(n.tags ?? []).map((t) => (
+            <Badge key={t} variant="neutral">
+              {t}
+            </Badge>
+          ))}
+        </div>
+        <Fields>
+          <F label="Kind">{KIND_LABEL[n.kind]}</F>
+          <F label="Part of">{parent && <NodeLink n={parent} />}</F>
+          <F label="Extension">
+            {ext && (
+              <RouteLink to={{ kind: "extension", name: ext.name }} className="font-mono font-medium text-info">
+                {ext.name}
+              </RouteLink>
+            )}
+          </F>
+          <F label="Code">{n.module && <span className="font-mono">{n.module}</span>}</F>
+          <F label="Health check">
+            {check && (
+              <RouteLink to={{ kind: "health", name: check.name }} className="font-mono font-medium text-info">
+                {check.name}
+              </RouteLink>
+            )}
+          </F>
+          <F label="Checked since">{check && <When iso={check.since} now={now} />}</F>
+          <F label="Last run">{n.last_run_at && <When iso={n.last_run_at} now={now} />}</F>
+          <F label="Last outcome">{n.last_outcome}</F>
+        </Fields>
+        {check?.reason && (
+          <p className="text-sm text-muted-foreground">
+            <OutsideText text={check.reason} outside={isOutside(check, "reason")} />
+          </p>
+        )}
+        {(into.length > 0 || out.length > 0) && (
+          <Group label="Talks to" count={into.length + out.length}>
+            <ul className="space-y-1 text-sm">
+              {into.map(([e, other]) => (
+                <li key={`in-${other.id}`}>
+                  <span className="text-muted-foreground">from </span>
+                  <NodeLink n={other} />
+                  {e.label && <span className="text-muted-foreground"> ({e.label})</span>}
+                </li>
+              ))}
+              {out.map(([e, other]) => (
+                <li key={`out-${other.id}`}>
+                  <span className="text-muted-foreground">to </span>
+                  <NodeLink n={other} />
+                  {e.label && <span className="text-muted-foreground"> ({e.label})</span>}
+                </li>
+              ))}
+            </ul>
+          </Group>
+        )}
+      </div>
+    ),
+  };
+}
+
 /** What the dialog shows for a route in this snapshot. */
 export function describeRoute(route: Route, ctx: Ctx): View {
   switch (route.kind) {
@@ -745,5 +823,7 @@ export function describeRoute(route: Route, ctx: Ctx): View {
       return healthView(route.name, ctx);
     case "brain-tool":
       return brainToolView(route.at, ctx);
+    case "node":
+      return nodeView(route.id, ctx);
   }
 }

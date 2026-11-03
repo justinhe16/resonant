@@ -428,6 +428,252 @@
       "title": "DetectedEffects",
       "type": "object"
     },
+    "Diagram": {
+      "additionalProperties": false,
+      "description": "How Resonant is put together right now: the curated core skeleton\n(``dashboard.diagram.CORE``), the launchd agents it knows, and every installed extension\nfrom its approved manifest; health and last runs from the store.",
+      "properties": {
+        "edges": {
+          "items": {
+            "$ref": "#/$defs/DiagramEdge"
+          },
+          "title": "Edges",
+          "type": "array"
+        },
+        "nodes": {
+          "items": {
+            "$ref": "#/$defs/DiagramNode"
+          },
+          "title": "Nodes",
+          "type": "array"
+        },
+        "processes_scanned": {
+          "default": false,
+          "title": "Processes Scanned",
+          "type": "boolean"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        }
+      },
+      "title": "Diagram",
+      "type": "object"
+    },
+    "DiagramEdge": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "source": {
+          "maxLength": 200,
+          "title": "Source",
+          "type": "string"
+        },
+        "target": {
+          "maxLength": 200,
+          "title": "Target",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "target"
+      ],
+      "title": "DiagramEdge",
+      "type": "object"
+    },
+    "DiagramNode": {
+      "additionalProperties": false,
+      "description": "One box of the architecture diagram (``Snapshot.diagram``): a core component, a launchd\nagent, an extension, or one of an extension's MCP servers, tools, jobs or repos.",
+      "properties": {
+        "check": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Check"
+        },
+        "ext": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ext"
+        },
+        "health": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "degraded",
+                "failing",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Health"
+        },
+        "id": {
+          "maxLength": 200,
+          "title": "Id",
+          "type": "string"
+        },
+        "job": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Job"
+        },
+        "kind": {
+          "enum": [
+            "core",
+            "process",
+            "extension",
+            "server",
+            "tool",
+            "job",
+            "repo"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 100,
+          "title": "Label",
+          "type": "string"
+        },
+        "last_outcome": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "failed",
+                "killed",
+                "denied",
+                "dry_run",
+                "skipped_paused",
+                "other"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Outcome"
+        },
+        "last_run_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Run At"
+        },
+        "module": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Module"
+        },
+        "parent": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "maxLength": 32,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State"
+        },
+        "tags": {
+          "items": {
+            "maxLength": 32,
+            "type": "string"
+          },
+          "title": "Tags",
+          "type": "array"
+        },
+        "text": {
+          "maxLength": 300,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "label",
+        "text"
+      ],
+      "title": "DiagramNode",
+      "type": "object"
+    },
     "Event": {
       "additionalProperties": false,
       "description": "One audit row of a run or task: when, and which action (a run's lose their ``run.``).",
@@ -2006,6 +2252,17 @@
       },
       "title": "Core Jobs",
       "type": "array"
+    },
+    "diagram": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Diagram"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "dry_run": {
       "title": "Dry Run",

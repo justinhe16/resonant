@@ -139,6 +139,42 @@ def _cut_history(out: dict[str, Any]) -> None:
     for ext in cast(list[dict[str, Any]], out.get("extensions") or []):
         if isinstance(ext.get("tools"), list):
             ext["tools"] = ext["tools"][:EXT_TOOLS_TRIMMED]
+    # The diagram's children (PER-277) keep their boxes but lose their sentences.
+    for node in _diagram_nodes(out):
+        if node.get("kind") in _DIAGRAM_CHILDREN:
+            node["text"] = ""
+
+
+# The diagram nodes that belong to an extension: step 1 drops their sentences, step 3 them.
+_DIAGRAM_CHILDREN: Final = frozenset({"tool", "server", "repo", "job"})
+
+
+def _diagram_nodes(out: dict[str, Any]) -> list[dict[str, Any]]:
+    diagram = out.get("diagram")
+    if not isinstance(diagram, dict):
+        return []
+    nodes = cast(dict[str, Any], diagram).get("nodes")
+    return cast(list[dict[str, Any]], nodes) if isinstance(nodes, list) else []
+
+
+def _cut_diagram_children(out: dict[str, Any]) -> None:
+    diagram = out.get("diagram")
+    if not isinstance(diagram, dict):
+        return
+    node = cast(dict[str, Any], diagram)
+    kept = [
+        n
+        for n in _diagram_nodes(out)
+        if n.get("kind") not in _DIAGRAM_CHILDREN or n.get("ext") == "core"
+    ]
+    ids = {n.get("id") for n in kept}
+    node["nodes"] = kept
+    edges = node.get("edges")
+    node["edges"] = [
+        e
+        for e in (cast(list[dict[str, Any]], edges) if isinstance(edges, list) else [])
+        if e.get("source") in ids and e.get("target") in ids
+    ]
 
 
 def _halve_lists(out: dict[str, Any]) -> None:
@@ -158,6 +194,7 @@ def _cut_detail(out: dict[str, Any]) -> None:
         _drop_outside(task, "error")
     for ext in cast(list[dict[str, Any]], out.get("extensions") or []):
         ext["tools"] = []
+    _cut_diagram_children(out)
     for row in _approval_rows(out):
         if row.get("changes") is not None:
             row["changes"] = None
@@ -191,11 +228,13 @@ def shrink(data: dict[str, Any]) -> dict[str, Any]:
     still a valid snapshot.
 
     1. ``history``: a run's last 4 events, 3 did notes and 3 effects, a task's last 3 events,
-       a batch's first 3 changes, an extension's first ``EXT_TOOLS_TRIMMED`` tools.
+       a batch's first 3 changes, an extension's first ``EXT_TOOLS_TRIMMED`` tools, and no
+       sentence on the diagram's extension children (tools, servers, jobs, repos).
     2. ``lists``: the runs, tasks, recently decided approvals, pulse items, brain tool calls
        and questions, halved together (each keeps at least ``SHRINK_FLOOR``) until it fits.
     3. ``detail``: every run's summary, failure, did, effects, history and flagged paths, every
-       task's error and history, every extension's tools and every batch's changes dropped.
+       task's error and history, every extension's tools and every batch's changes dropped,
+       and the diagram's extension children (core jobs stay).
     4. ``items``: every one of those lists, pending approvals, trust rules and repos emptied;
        the counts, health, extensions and jobs stay.
     """

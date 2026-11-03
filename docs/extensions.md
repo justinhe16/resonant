@@ -60,6 +60,7 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 | `secrets` | list of names | Keychain secret names (`^[a-z][a-z0-9_]{0,31}$`) your tools and jobs may receive. Every tool's and job's `secrets` must be listed here. |
 | `bins` | list of `gh`/`git`, optional | Host binaries your own code runs (the github extension's `gh`). Each is pinned by its real absolute path at install and reaches every process of the extension as `RESONANT_BIN_<NAME>` (`RESONANT_BIN_GH`); run it by that path, never by a `PATH` lookup. Shown as an escalation at install. |
 | `repos` | list of `owner/name`, ≤ 20, optional | GitHub repos this extension is about (e.g. `me/trading-bot`). Saying "work on trading" in a request then means those repos: one link resolves to it, several ask which. Links are only a name for the repo; they grant nothing, and the repo is checked against GitHub when first used. `ext add`/`update` replace the links, `ext remove` drops them, and `/ext list` shows them. |
+| `launch_agents` | list of `{label, description}`, ≤ 10, optional | launchd agents your own setup installs (a trading loop, a token refresher), e.g. `{label: com.tradejev.paper, description: The paper trading loop.}`. Names only: Resonant never installs, loads or reads them, and they grant nothing. The dashboard's Diagram tab shows each one under your extension with whether it is running (PER-277). `label` is `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, unique; `description` is one line, ≤ 160 chars. |
 
 ## 4. Tools
 
@@ -215,7 +216,10 @@ jobs:
     secrets: [token]               # must also appear in top-level secrets
     timeout_s: 300                 # default 300, at most 1800
     catchup: 1h                    # none (default) or up to 24h: run once if missed while down
+    description: polls your PRs' CI for the hourly rollup   # optional, one line, ≤ 160 chars
 ```
+
+- `description` says what the job does, in one line, for the dashboard's Diagram tab (`github/watch: every 10 min job (read, runs without asking): polls …`). Display only; optional.
 
 - A job runs as `scheduled`: nobody chose it, so L0 runs silently, L3 runs and reports to your approvers, and L2 and L1 ask first.
 - **Cadence.** A job may fire at most every 5 minutes, and **at most hourly if it asks** (L1 or L2), so prompts can't pile up. Give a job the lowest effect that's true; a job without `effect` is a write and asks.

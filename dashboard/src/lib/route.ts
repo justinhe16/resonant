@@ -13,7 +13,8 @@ export type Route =
   | { kind: "job"; ext: string; id: string }
   | { kind: "pulse"; source: string; key: string }
   | { kind: "health"; name: string }
-  | { kind: "brain-tool"; at: string };
+  | { kind: "brain-tool"; at: string }
+  | { kind: "node"; id: string };
 
 const enc = encodeURIComponent;
 
@@ -63,6 +64,9 @@ export function parseHash(hash: string): Route | null {
       return a ? { kind: "health", name: a } : null;
     case "brain":
       return a ? { kind: "brain-tool", at: a } : null;
+    case "diagram":
+      // A node id has slashes of its own (`tool:linear/linear/save_issue`).
+      return a ? { kind: "node", id: seg.slice(1).join("/") } : null;
     default:
       return null;
   }
@@ -94,6 +98,8 @@ export function toHash(r: Route): string {
       return `#/health/${enc(r.name)}`;
     case "brain-tool":
       return `#/brain/${enc(r.at)}`;
+    case "node":
+      return `#/diagram/${enc(r.id)}`;
   }
 }
 

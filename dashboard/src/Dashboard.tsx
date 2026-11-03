@@ -1,5 +1,5 @@
 import { CircleAlert, Info, LogOut, Moon, RefreshCw, Sun, WifiOff } from "lucide-react";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { Dot } from "@/components/bits";
 import { DetailDialog } from "@/components/detail/DetailDialog";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -10,7 +10,9 @@ import { staleness, worstHealth } from "@/lib/snapshot";
 import { duration, relative } from "@/lib/time";
 import { useTheme } from "@/lib/theme";
 import { healthTone } from "@/lib/tone";
+import { cn } from "@/lib/utils";
 import { Claude } from "@/sections/Claude";
+import { Diagram } from "@/sections/Diagram";
 import { Extensions } from "@/sections/Extensions";
 import { Jobs } from "@/sections/Jobs";
 import { Pulse } from "@/sections/Pulse";
@@ -19,9 +21,29 @@ import { SystemStatus } from "@/sections/SystemStatus";
 import { WaitingOnYou } from "@/sections/WaitingOnYou";
 import { ActiveRuns, ActiveTasks, RecentRuns, Slots, Tasks } from "@/sections/Work";
 
+type Tab = "overview" | "diagram";
+const TAB_KEY = "resonant.tab";
+
+function readTab(): Tab {
+  try {
+    return window.localStorage.getItem(TAB_KEY) === "diagram" ? "diagram" : "overview";
+  } catch {
+    return "overview";
+  }
+}
+
 export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () => void }) {
   const { snapshot: snap, error, loading, refresh } = usePolling(load);
   const now = useNow();
+  const [tab, setTabState] = useState<Tab>(readTab);
+  const setTab = (next: Tab) => {
+    setTabState(next);
+    try {
+      window.localStorage.setItem(TAB_KEY, next);
+    } catch {
+      /* not remembered */
+    }
+  };
 
   const stale = snap ? staleness(snap, now) : null;
   const worst = snap?.health.length ? worstHealth(snap.health.map((h) => h.state)) : "unknown";
@@ -99,7 +121,38 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
           <p className="py-10 text-center text-sm text-muted-foreground">No snapshot has been sent yet.</p>
         )}
         {snap && (
-          <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
+          <div role="tablist" aria-label="Dashboard view" className="inline-flex rounded-lg border bg-card p-0.5">
+            {(["overview", "diagram"] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                role="tab"
+                id={`tab-${t}`}
+                aria-selected={tab === t}
+                aria-controls={`panel-${t}`}
+                onClick={() => setTab(t)}
+                className={cn(
+                  "rounded-md px-3 py-1.5 text-sm font-medium outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+                  tab === t ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {t === "overview" ? "Overview" : "Diagram"}
+              </button>
+            ))}
+          </div>
+        )}
+        {snap && tab === "diagram" && (
+          <div role="tabpanel" id="panel-diagram" aria-labelledby="tab-diagram">
+            {guard(<Diagram snap={snap} />)}
+          </div>
+        )}
+        {snap && tab === "overview" && (
+          <div
+            role="tabpanel"
+            id="panel-overview"
+            aria-labelledby="tab-overview"
+            className="grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]"
+          >
             <div className="space-y-6" data-testid="column-left">
               {guard(<SystemStatus snap={snap} now={now} stale={stale !== null} />)}
               {guard(<Slots snap={snap} />)}

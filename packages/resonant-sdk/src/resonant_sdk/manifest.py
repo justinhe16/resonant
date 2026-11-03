@@ -47,6 +47,9 @@ DESCRIPTION_MAX = 120
 EXAMPLES_MAX = 3
 EXAMPLE_MAX = 80
 REPOS_MAX = 20
+JOB_DESCRIPTION_MAX = 160  # one line: what the job does (the dashboard's diagram shows it)
+LAUNCH_AGENTS_MAX = 10
+LAUNCH_AGENT_LABEL = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 
 _CRON_FIELD = re.compile(r"^[A-Za-z0-9*/,\-]+$")
 _DURATION = re.compile(r"^\d+[smh]$")
@@ -129,6 +132,15 @@ class Job(_Strict):
     secrets: tuple[SecretName, ...] = ()
     timeout_s: float = Field(default=300.0, gt=0, le=JOB_TIMEOUT_MAX_S)
     catchup: str = "none"  # "none" or a duration <= 24h
+    # What the job does, in one line (PER-277: the dashboard's diagram shows it). Display only.
+    description: str = Field(default="", max_length=JOB_DESCRIPTION_MAX)
+
+    @field_validator("description")
+    @classmethod
+    def _description(cls, v: str) -> str:
+        if not v.isprintable():
+            raise ValueError("description must be one line with no control characters")
+        return v
 
     @field_validator("tz")
     @classmethod
@@ -184,6 +196,22 @@ class Job(_Strict):
             timeout_s=self.timeout_s,
             secrets=self.secrets,
         )
+
+
+class LaunchAgent(_Strict):
+    """A launchd agent the extension's own setup installs (its trading loop, say). Names only:
+    Resonant never installs, loads or reads it; the dashboard's diagram shows whether it runs
+    (PER-277)."""
+
+    label: str = Field(pattern=LAUNCH_AGENT_LABEL)
+    description: str = Field(default="", max_length=JOB_DESCRIPTION_MAX)
+
+    @field_validator("description")
+    @classmethod
+    def _description(cls, v: str) -> str:
+        if not v.isprintable():
+            raise ValueError("description must be one line with no control characters")
+        return v
 
 
 class CliTool(_Strict):
@@ -433,6 +461,7 @@ class Manifest(BaseModel):
     health: Health | None = None
     secrets: tuple[SecretName, ...] = ()
     repos: tuple[str, ...] = Field(default=(), max_length=REPOS_MAX)  # GitHub "owner/name" links
+    launch_agents: tuple[LaunchAgent, ...] = Field(default=(), max_length=LAUNCH_AGENTS_MAX)
     # Host binaries the extension's own code runs (the github extension's gh). Each is pinned
     # by absolute path at install and given as RESONANT_BIN_<NAME>; PATH never has to hold it.
     bins: tuple[Literal["gh", "git"], ...] = ()
@@ -456,6 +485,13 @@ class Manifest(BaseModel):
     def _examples(cls, v: tuple[str, ...]) -> tuple[str, ...]:
         if bad := [e for e in v if not e.strip() or len(e) > EXAMPLE_MAX or not e.isprintable()]:
             raise ValueError(f"examples must be single lines of 1-{EXAMPLE_MAX} chars: {bad}")
+        return v
+
+    @field_validator("launch_agents")
+    @classmethod
+    def _launch_agents(cls, v: tuple[LaunchAgent, ...]) -> tuple[LaunchAgent, ...]:
+        if len({a.label for a in v}) != len(v):
+            raise ValueError("launch_agents labels must be unique")
         return v
 
     @field_validator("repos")

@@ -1,7 +1,8 @@
 import { Ago, Meta, OutsideText, RouteLink, Row, Rows, StateBadge } from "@/components/bits";
+import { nodeRoute } from "@/lib/diagram";
 import { findApproval, isOutside } from "@/lib/snapshot";
 import { runTone } from "@/lib/tone";
-import type { Snapshot } from "@/types";
+import type { DiagramNode, Snapshot } from "@/types";
 
 export const idChip = "rounded bg-muted px-1.5 py-0.5 font-mono text-xs";
 
@@ -87,6 +88,22 @@ export function RunLines({ runs, now }: { runs: Snapshot["runs"]["items"]; now: 
         </Row>
       ))}
     </Rows>
+  );
+}
+
+
+/** The diagram's one sentence on what a component does, when the snapshot has it. */
+export function DiagramText({ snap, id }: { snap: Snapshot; id: string }) {
+  const n = snap.diagram?.nodes.find((x) => x.id === id);
+  if (!n?.text) return null;
+  return <p className="text-sm">{n.text}</p>;
+}
+
+export function NodeLink({ n }: { n: DiagramNode }) {
+  return (
+    <RouteLink to={nodeRoute(n)} className="font-medium text-info">
+      {n.label}
+    </RouteLink>
   );
 }
 

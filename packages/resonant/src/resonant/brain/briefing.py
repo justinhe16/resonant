@@ -303,6 +303,7 @@ def gather_briefing(
         slots=slots,
         runner_missing=runner_missing,
         now=now,
+        diagram=False,  # the briefing never reads it
     )
     status = collect_status(conn, settings, started_at=started_at, last_tick=last_tick)
     code_dir = settings.runner.code_dir

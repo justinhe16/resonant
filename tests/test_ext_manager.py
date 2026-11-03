@@ -504,6 +504,25 @@ def test_unmarked_data_dir_needs_adopt(mgr: ExtensionManager, resonant_home: Pat
     mgr.discard(staged)
 
 
+def test_confirm_shows_launch_agents_and_job_descriptions(
+    mgr: ExtensionManager, repo: Path
+) -> None:
+    """PER-277's display fields are on the install screen too (names only, never run)."""
+    manifest = repo / "extensions" / "demo" / "resonant.yaml"
+    manifest.write_text(
+        MANIFEST
+        + "launch_agents: [{label: com.demo.loop, description: the loop}]\n"
+        + "jobs:\n  - {id: tick, schedule: '0 * * * *', run: ./cli.py get, effect: read,"
+        + " description: counts the things}\n"
+    )
+    commit_all(repo)
+    staged = mgr.stage("repo:demo")
+    lines = confirm_lines(staged)
+    mgr.discard(staged)
+    assert 'Launch agents (shown on the dashboard only): "com.demo.loop"' in lines
+    assert '    "counts the things"' in lines
+
+
 def test_repo_links_follow_install_update_and_remove(
     mgr: ExtensionManager, repo: Path, conn: sqlite3.Connection
 ) -> None:
