@@ -4,7 +4,7 @@ The starting point for a new session. What's live, how we work, what's open. Det
 
 ## What's live
 
-Main is deployed on the Mac mini (`com.resonant.daemon`), schema 22, two extensions installed (github, linear).
+Main is deployed on the Mac mini (`com.resonant.daemon`), schema 25, two extensions installed (github, linear).
 
 | Area | What it does | PRs |
 |---|---|---|
@@ -20,6 +20,7 @@ Main is deployed on the Mac mini (`com.resonant.daemon`), schema 22, two extensi
 | Full remote dashboard (PER-276) | The remote page is the local page: the relay stores the full schema-2 snapshot (`snapshot_latest`, 256 KiB, owner + MFA read; slim history rows) with texts, tasks, recent approvals, core jobs, per-run detail and history; only Remote Control links and approval codes stay on the Mini. One redaction + truncation pass (caps, `… [cut]`, `outside` provenance), a second scan in the pusher and a secret-shaped-text refusal in `relay_ingest`. Collapsible sections, detail dialogs with deep links, (i) explainers on the page. Migration `20261102000000_relay_full_snapshot.sql` applied; Fly app redeployed (`fly deploy --config relay/fly.toml --dockerfile relay/Dockerfile --app resonant-relay-jhe .`); daemon pushing schema 2 (about 67 KB) | #145, deployed 2026-11-02 |
 | Diagram tab (PER-277) | A live architecture map on both tiers: the core skeleton (curated in `resonant/dashboard/diagram.py`, a test ties it to the code and `architecture.md`), launchd agents (`com.resonant.*`, labels an extension declares in its new `launch_agents`, `com.<repo>.*` for registered repos; names and `launchctl list` only) and every extension with its MCP servers, tools, jobs (new optional job `description`) and repos, one sentence each, with health and last runs. Carried in the schema-2 snapshot as `diagram` (no Supabase migration; about 15–30 KB), trimmed first by the pusher; dagre + inline SVG with pan/zoom, a stacked list on phones, boxes open the PER-276 detail dialogs | #146, deployed 2026-11-03 |
 | Diagram v2 (PER-278) | Diagram tab on React Flow (`@xyflow/react` 12.12.0, lazy-loaded): 9 groups first, click a box to expand it in place (nested), roll-up health and counts, (i) details, expand/collapse all, phone accordion; `diagram.GROUPS` and `group` on nodes | #148, deployed 2026-11-03 |
+| Clean rows and task titles (PER-279) | One shared `ListRow` (ref · title · pill · time · one hint) across every section, details in the dialogs; sections ordered Waiting on you → Extensions → Pulse → …; "Claude tool calls"; `tasks.title` (migration 025, backfilled) derived in code (`store/task_titles.py`), redacted, URL userinfo dropped, codes masked | #147, deployed 2026-11-03 (schema 25) |
 | Tool core (TC-1) | `resonant/toolcore/`: the single call path (registry → gate → executor) for the Claude brain, the local runner, jobs and watches; a boundary test enforces it | #109 |
 | Backups (BK-1) | Daily SQLite backup at 03:30, 7 daily + 4 weekly, 36h alert, `resonant backup now/list/restore` | #110 |
 | Quiet briefing (BF-1) | All-zero items dropped; an empty briefing is one line | #111 |
