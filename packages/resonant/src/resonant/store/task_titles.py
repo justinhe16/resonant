@@ -42,10 +42,11 @@ TITLE_MAX = 80  # characters, after redaction
 TEXT_WORDS = 6  # an owner's text
 RUN_WORDS = 8  # a run's ask
 
-_URL = re.compile(r"(?:https?://|www\.)([^\s/?#]+)\S*", re.IGNORECASE)
+# Userinfo (``user:pass@``) is dropped: only the host is kept.
+_URL = re.compile(r"(?:https?://|www\.)(?:[^\s/?#@]*@)?([^\s/?#@]+)\S*", re.IGNORECASE)
 # Openers that say nothing about the ask: greetings, fillers, "can you", "please".
 _OPENER = re.compile(
-    r"^(?:(?:hey|hi|hello|yo|ok|okay|so|um|uh|please|pls|plz|resonant|claude)\b[\s,!.:;-]*"
+    r"^(?:(?:hey|hi|hello|yo|ok|okay|so|um|uh|please|pls|plz|resonant|claude)\b(?!\.\w)[\s,!.:;-]*"
     r"|(?:can|could|would|will) (?:you|u)\b\s*)+",
     re.IGNORECASE,
 )

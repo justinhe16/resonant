@@ -87,6 +87,16 @@ def test_approval_code_shapes_are_masked_in_text_titles() -> None:
     assert tt.from_text("fix PER-279 for R11 and A1") == "Fix PER-279 for R11 and A1"  # not codes
 
 
+def test_link_userinfo_never_reaches_a_title() -> None:
+    title = tt.from_text("open https://user:hunter2pass@host.com/x now")
+    assert title == "Open host.com now"
+    assert "hunter2" not in (tt.from_text("see http://tok@example.org") or "")
+
+
+def test_a_claude_link_keeps_its_host() -> None:
+    assert tt.from_text("https://claude.ai/code/session_x go") == "claude.ai go"
+
+
 def test_clean_is_one_redacted_line_under_the_cap() -> None:
     assert tt.clean(None) is None and tt.clean("  ") is None
     assert tt.clean("a\n  b") == "a b"
