@@ -285,6 +285,7 @@ def read_panel(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
     panels = extension_panels(ctx.conn, record, ctx.clock())
     if wanted is None:
         return {
+            "untrusted": True,
             "extension": name,
             "panels": [
                 {**_head(p), "stats": _stats([v.model_dump(mode="json") for v in p.views])}
@@ -295,6 +296,7 @@ def read_panel(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
     if found is None:
         raise ToolFailed("no such panel")
     return {
+        "untrusted": True,
         "extension": name,
         "panel": {
             **_head(found),

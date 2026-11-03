@@ -345,3 +345,45 @@ def test_expect_by_helper_is_the_governing_cron_not_just_the_active_one() -> Non
     assert panel.next_run_after(at(8, 59)) == at(9)
     assert panel.schedule_at(at(9)) is panel.active and panel.schedule_at(at(8)) is panel.idle
     assert panel.next_run_after(at(12, 30, day=17)) == at(12, 45, day=17)  # a Saturday
+
+
+async def test_hung_panels_do_not_starve_jobs(tmp_path: Path) -> None:
+    from resonant.extensions.process import ExtRequest
+
+    release = asyncio.Event()
+
+    class Hang(FakeExtProcess):
+        async def run(self, req: ExtRequest, *, redact: Any) -> ExtOutput:
+            self.calls.append(req)
+            if "panel_" in req.label:
+                await release.wait()
+            return ExtOutput({"ok": True}, (), 0, 1)
+
+    manifest = TWO.replace(
+        "tools:",
+        "jobs:\n  - {id: tick, schedule: '*/5 * * * *', run: ./cli.py tick, effect: read}\ntools:",
+        1,
+    )
+    runner = Hang()
+    async with panel_harness(
+        tmp_path, runner, manifest=manifest, at=at(8, 7), extensions={"max_concurrent_jobs": 1}
+    ) as h:
+        start = at(8, 7)
+        sched_with_boot(h, start)
+        await h.loop.run_once()
+        for sec in (30, 33):  # both panels start and hang
+            h.clock.set(start + timedelta(seconds=sec))
+            await h.loop.run_once()
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+        assert [c.label for c in runner.calls].count("example/panel_paper") == 1
+        assert h.sched.running == 2
+        h.clock.set(at(8, 10))  # the job is due while both panels hang
+        await h.loop.run_once()
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if any("job_tick" in c.label for c in runner.calls):
+                break
+        assert any("job_tick" in c.label for c in runner.calls)
+        release.set()
+        await h.sched.drain()

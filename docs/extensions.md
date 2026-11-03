@@ -302,7 +302,7 @@ Everything a panel prints is the extension's, not yours: it is marked `outside` 
 - The `idle` cron runs always. While the daemon's local time (in `tz`) matches the hours, days and months of `active`, **`active` runs instead of `idle`**, and the minute field of `active` sets how often. `active: "*/1 9-16 * * 1-5"` is every minute from 09:00 to 16:59 on weekdays and `idle` the rest of the time. Crons are five numeric fields (no names, no `@`); both fields of day-of-month and day-of-week restricted match either, as in cron; day-of-week 7 is Sunday.
 - **Floor:** a panel can run at most once a minute, and never starts twice within 55 seconds. Each panel also runs **once at start-up**, about 30 seconds after the daemon starts, staggered by 3 seconds per panel, so the dashboard has data before the first cron time.
 - **Pause.** While the kill switch is on, a panel doesn't run, and missed runs are not caught up or logged. The last copy stays.
-- Runs share the scheduler's concurrency limit (`extensions.max_concurrent_jobs`). The audit has one `panel.run` row per good run (`ok`, `ms`, `bytes`, `truncated`) on top of the gate's own row, and `panel.failed`, `panel.denied`, `panel.killed`, `panel.dry_run` or `panel.skipped_paused` otherwise.
+- Panels run at most 2 at a time, in slots of their own, so panels that hang up to their timeout can't hold up jobs (jobs keep `extensions.max_concurrent_jobs`). The audit has one `panel.run` row per good run (`ok`, `ms`, `bytes`, `truncated`) on top of the gate's own row, and `panel.failed`, `panel.denied`, `panel.killed`, `panel.dry_run` or `panel.skipped_paused` otherwise.
 
 ### Failure, stale and health
 

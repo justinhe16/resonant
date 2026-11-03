@@ -50,7 +50,7 @@ describe("PanelCard", () => {
 
   it("says a panel was too big for the relay when it has no views", () => {
     card({ ...prs, views: [], truncated: true, outside: [] });
-    expect(screen.getByTestId("panel-empty")).toHaveTextContent("Too big to send to the relay this time; it shows on the Mini's page.");
+    expect(screen.getByTestId("panel-empty")).toHaveTextContent("Too big to show this time (over the panel size budget); the next smaller update will show.");
   });
 
   it("only links a loopback URL", () => {

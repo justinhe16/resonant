@@ -768,3 +768,65 @@ def test_dropping_panels_is_enough_when_they_are_what_is_over(
     for section in ("runs", "tasks", "pulse", "questions"):  # the lists are not halved
         assert len(out[section]["items"]) == len(data[section]["items"])
     Snapshot.model_validate(out)
+
+
+def _no_strip(_out: dict[str, Any]) -> None:
+    return None
+
+
+def test_twenty_extensions_of_maxed_out_panels_still_shrink_to_fit(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PER-280: panel metadata (title, description, schedules, error) is cut too, so the
+    worst case (the 20-extension cap, 15 with 8 maxed-out panels, on a typical store) fits."""
+    from panel_helpers import panel_manifest, raw_panel, store_panel
+
+    from resonant.store import extensions as ext_store
+
+    now = utcnow()
+    seed_typical(db, now)
+    ids = tuple(f"p{k}" for k in range(8))
+    big = raw_panel(rows=50, items=50, details=100)
+    for e in range(20):
+        name = f"w{e:02d}".ljust(40, "x")
+        manifest = panel_manifest(name, ids)
+        for panel in manifest["panels"]:
+            panel.update(
+                title="T" * 60, description="d" * 160, tz="America/Argentina/ComodRivadavia",
+                refresh={"idle": "*/15 * * * *", "active": "*/1 9-16 * * 1-5"},
+            )  # fmt: skip
+        ext_store.save_extension(
+            db,
+            ext_store.ExtensionRecord(
+                name=name, source="repo:x", commit="a" * 40, tree_digest="d", manifest_sha="m",
+                installed_at=now, installed_by="justin", manifest=manifest,
+            ),
+        )  # fmt: skip
+        for pid in ids:
+            store_panel(db, name, pid, big, now)
+            ext_store.record_panel_failure(db, name, pid, ran_at=now, error="e" * 200)
+    data = remote_dump(db, now)
+    panels = [p for e in data["extensions"] for p in e["panels"]]
+    # 5 typical extensions + 15 of these fill the 20-extension cap
+    assert len(panels) == 8 * 15 and data_size(data) > pusher_mod.MAX_BYTES
+    # without the metadata step this is over the cap even with every view and list gone
+    out = pusher_mod.shrink(data)
+    assert data_size(out) <= pusher_mod.MAX_BYTES, data_size(out)
+    Snapshot.model_validate(out)
+    # Push it to the last step: with every view, list and diagram child gone the panels' own
+    # metadata is what is left, and the last step cuts that too.
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", 0)
+    with monkeypatch.context() as m:
+        m.setattr(pusher_mod, "_strip_panels", _no_strip)
+        without = data_size(_stages(data)[-1])
+    with_strip = _stages(data)[-1]
+    assert data_size(with_strip) < without - 50_000, (data_size(with_strip), without)
+    monkeypatch.setattr(pusher_mod, "MAX_BYTES", without - 1)
+    out = pusher_mod.shrink(data)
+    assert out["trimmed"] == "items" and data_size(out) <= without - 1
+    held = [p for e in out["extensions"] for p in e["panels"]]
+    assert held and all(
+        not p["views"] and p["description"] is None and p["error"] is None and p["outside"] == []
+        for p in held
+    )
+    Snapshot.model_validate(out)

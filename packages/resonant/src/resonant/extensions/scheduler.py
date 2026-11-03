@@ -234,6 +234,7 @@ class ScheduledJob:
 
 PANEL_GUARD_S = 55.0  # a panel never starts twice within this many seconds
 PANEL_BOOT_STAGGER_S = 3.0
+PANEL_CONCURRENCY = 2  # panel runs at once, apart from the jobs' ``max_concurrent``
 PANEL_SLACK_S = 120.0  # past its next due + timeout, a panel is stale
 
 
@@ -393,6 +394,8 @@ class Scheduler:
         self.on_time = ON_TIME + timedelta(seconds=tick_s)
         self.downtime = self._downtime(started_at or clock())
         self._sem = asyncio.Semaphore(max_concurrent)
+        # Panels have their own slots: a few hung panels (timeout up to 120 s) must not starve jobs.
+        self._panel_sem = asyncio.Semaphore(PANEL_CONCURRENCY)
         self._claimed: dict[tuple[str, str], datetime] = {}
         self._inflight: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._background: set[asyncio.Task[Any]] = set()
@@ -727,7 +730,7 @@ class Scheduler:
     async def _run_panel(self, p: ScheduledPanel, due: datetime) -> None:
         # The throwaway job is only the shape ``_call`` takes: gate, secrets, redaction, timeout.
         job = ScheduledJob(p.ext, f"panel:{p.panel_id}", p.spec, p.idle, p.call)
-        async with self._sem:
+        async with self._panel_sem:
             if read_paused(self.conn):
                 result = _Result("skipped_paused")
             else:

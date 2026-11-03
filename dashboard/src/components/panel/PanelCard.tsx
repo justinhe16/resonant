@@ -8,7 +8,10 @@ import { cn } from "@/lib/utils";
 import type { Panel } from "@/types";
 
 /** Only a loopback URL is linked, whatever the snapshot says. */
-const isLocalUrl = (u: string) => /^http:\/\/127\.0\.0\.1:\d{1,5}(\/|$)/.test(u);
+const isLocalUrl = (u: string) => {
+  const m = /^http:\/\/127\.0\.0\.1:(\d{1,5})(\/[!-~]*)?$/.exec(u);
+  return m !== null && Number(m[1]) >= 1 && Number(m[1]) <= 65535;
+};
 
 /** One panel of an extension: title and age, the stale state with its error, and the views
  * (tabs when there are several). Everything in it was drawn from data the extension printed. */
@@ -45,7 +48,7 @@ export function PanelCard({ ext, panel: p, now }: { ext: string; panel: Panel; n
         {!neverRun && p.views.length === 0 && (
           <p className="text-sm text-muted-foreground" data-testid="panel-empty">
             {p.truncated
-              ? "Too big to send to the relay this time; it shows on the Mini's page."
+              ? "Too big to show this time (over the panel size budget); the next smaller update will show."
               : "Nothing to show yet."}
           </p>
         )}

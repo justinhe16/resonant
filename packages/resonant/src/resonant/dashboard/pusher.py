@@ -225,6 +225,23 @@ def _cut_items(out: dict[str, Any]) -> None:
         cast(dict[str, Any], approvals_node)["items"] = []
     out["trust_rules"] = []
     out["repos"] = []
+    _strip_panels(out)
+
+
+def _strip_panels(out: dict[str, Any]) -> None:
+    """The last resort for panels: their views are gone by now, so drop their long optional
+    fields (description, error, schedule, active, tz); and if that is still over, the panel
+    rows themselves. Each step leaves a valid snapshot."""
+    exts = cast(list[dict[str, Any]], out.get("extensions") or [])
+    panels = [p for e in exts for p in cast(list[dict[str, Any]], e.get("panels") or [])]
+    for p in panels:
+        p.update(views=[], truncated=True, description=None, error=None, active=None, tz=None,
+                 schedule="", local_url=None)  # fmt: skip
+        p.pop("local_url", None)
+        p["outside"] = []
+    if data_size(out) > MAX_BYTES:
+        for e in exts:
+            e["panels"] = []
 
 
 # (what ``trimmed`` says, the step). Each step works on a copy and is applied after the ones
