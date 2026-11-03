@@ -298,18 +298,20 @@ def test_the_test_suite_never_asks_the_real_launchctl() -> None:
         ("com.resonant.anything", True),
         ("com.tradejev.declared", True),
         ("com.tradejev.paper", True),  # repo trade-jev
-        ("com.dori.sync", True),  # repo dori
+        ("com.dori.sync", True),  # repo dori (four letters, the shortest that counts)
         ("com.apple.Safari", False),
         ("com.owner.personal", False),
         ("org.tradejev.paper", False),
         ("com.tradejevx.paper", False),
         ("homebrew.mxcl.ollama", False),
+        ("com.apple.Safari", False),  # a repo named apple claims nothing
+        ("com.docker.helper", False),
+        ("com.abc.x", False),  # too short a repo name
     ],
 )
 def test_only_known_agents_are_allowed(label: str, allowed: bool) -> None:
-    assert diagram.agent_allowed(label, ["com.tradejev.declared"], ["trade-jev", "dori"]) is (
-        allowed
-    )
+    repo_names = ["trade-jev", "dori", "apple", "docker", "abc"]
+    assert diagram.agent_allowed(label, ["com.tradejev.declared"], repo_names) is allowed
 
 
 # --- sentences ----------------------------------------------------------------------------
@@ -386,3 +388,32 @@ def test_the_trim_drops_diagram_children_and_keeps_edges_whole(db: sqlite3.Conne
     ids = {n["id"] for n in step1["diagram"]["nodes"]}
     assert all(e["source"] in ids and e["target"] in ids for e in step1["diagram"]["edges"])
     Snapshot.model_validate(step1)
+
+
+def test_a_full_install_is_capped_flagged_and_still_fits(db: sqlite3.Connection) -> None:
+    """Many big extensions: the diagram stops at its caps, says so, and the relay's shrink
+    still brings the whole snapshot under its cap as a valid snapshot."""
+    from resonant.dashboard import snapshot as snap
+
+    now = utcnow()
+    for i in range(20):
+        name = f"e{i:02d}".ljust(60, "x")
+        _install(db, {
+            "name": name, "description": "d" * 120,
+            "repos": [f"o/{'r' * 90}{k}" for k in range(20)],
+            "jobs": [{"id": f"j{k}", "schedule": "*/5 * * * *", "description": "x" * 160}
+                     for k in range(5)],
+            "tools": {f"t{k}".ljust(64, "x"): {"effect": "write", "description": "y" * 300}
+                      for k in range(40)},
+        }, now)  # fmt: skip
+    s = _build(db, now, launch_agents=AGENTS)
+    assert s.diagram is not None and s.diagram.truncated
+    assert len(s.diagram.nodes) == snap.DIAGRAM_NODES
+    assert len(s.diagram.edges) <= snap.DIAGRAM_EDGES
+    out = pusher_mod.shrink(to_remote(s).model_dump(mode="json"))
+    assert pusher_mod.data_size(out) <= pusher_mod.MAX_BYTES
+    Snapshot.model_validate(out)
+
+
+def test_the_briefing_can_skip_the_diagram(db: sqlite3.Connection) -> None:
+    assert _build(db, utcnow(), diagram=False).diagram is None

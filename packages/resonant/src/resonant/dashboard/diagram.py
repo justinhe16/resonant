@@ -269,6 +269,15 @@ def _squash(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
+# A repo name that is a vendor's (``com.apple.*``, ``com.docker.*``) or too short to mean
+# anything never claims agents.
+_VENDORS: Final = frozenset({
+    "apple", "google", "microsoft", "docker", "adobe", "mozilla", "brave", "spotify",
+    "dropbox", "zoom", "slack", "jetbrains", "github", "openssh", "homebrew", "oracle",
+})  # fmt: skip
+_MIN_REPO_KEY = 4
+
+
 def agent_allowed(label: str, declared: Iterable[str], repo_names: Iterable[str]) -> bool:
     """Resonant's own agents, the ones an extension declares, and ``com.<repo>.*`` for a
     registered repo; never any other agent of the owner's."""
@@ -277,7 +286,10 @@ def agent_allowed(label: str, declared: Iterable[str], repo_names: Iterable[str]
     parts = label.split(".")
     if len(parts) < 3 or parts[0] != "com":
         return False
-    return any(_squash(r) and parts[1].lower() == _squash(r) for r in repo_names)
+    key = parts[1].lower()
+    if len(key) < _MIN_REPO_KEY or key in _VENDORS:
+        return False
+    return any(key == _squash(r) for r in repo_names)
 
 
 def agent_health(a: AgentState | None) -> tuple[str, str]:

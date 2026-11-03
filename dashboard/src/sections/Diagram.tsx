@@ -114,6 +114,11 @@ export function Diagram({ snap }: { snap: Snapshot }) {
                 The daemon couldn't read launchd, so the processes' states are unknown.
               </p>
             )}
+            {d.truncated && (
+              <p className="text-xs text-muted-foreground" data-testid="diagram-truncated">
+                There is more than the diagram can carry, so the last extensions or their tools are left out.
+              </p>
+            )}
             {mode === "graph" ? <Graph d={d} showChildren={children} /> : <List d={d} />}
           </>
         )}

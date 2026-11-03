@@ -1789,6 +1789,7 @@
         "label": "owns"
       }
     ],
-    "processes_scanned": true
+    "processes_scanned": true,
+    "truncated": false
   }
 }

@@ -492,6 +492,7 @@
         "label": "runs"
       }
     ],
-    "processes_scanned": false
+    "processes_scanned": false,
+    "truncated": false
   }
 }

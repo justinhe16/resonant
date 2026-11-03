@@ -450,6 +450,11 @@
           "default": false,
           "title": "Processes Scanned",
           "type": "boolean"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
         }
       },
       "title": "Diagram",

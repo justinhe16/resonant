@@ -370,6 +370,8 @@ export interface Diagram {
   edges: DiagramEdge[];
   /** false: the daemon couldn't read launchd, so process states are unknown */
   processes_scanned?: boolean;
+  /** true: over the daemon's caps; some boxes were left out */
+  truncated?: boolean;
 }
 
 export interface Snapshot {

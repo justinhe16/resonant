@@ -124,6 +124,12 @@ describe("Diagram tab", () => {
     expect(within(card).getByTestId("diagram-missing")).toBeInTheDocument();
   });
 
+  it("says when the daemon cut the diagram to its caps", async () => {
+    mount(clone(local, { diagram: { ...diagram, truncated: true } }));
+    const card = await openDiagram("list");
+    expect(within(card).getByTestId("diagram-truncated")).toBeInTheDocument();
+  });
+
   it("remembers the tab", async () => {
     mount(local);
     await openDiagram("list");

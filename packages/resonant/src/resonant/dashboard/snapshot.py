@@ -533,6 +533,7 @@ DiagramKind = Literal["core", "process", "extension", "server", "tool", "job", "
 DIAGRAM_NODES = 250  # core and processes first, then each extension with its children
 DIAGRAM_EDGES = 400
 DIAGRAM_PROCESSES = 30
+_ID_MAX = 200  # ``DiagramNode.id``; an id built longer is left out, never a failed snapshot
 
 
 class DiagramNode(_Model):
@@ -569,6 +570,7 @@ class Diagram(_Model):
     nodes: list[DiagramNode] = _list()
     edges: list[DiagramEdge] = _list()
     processes_scanned: bool = False  # False: the launchd scan didn't run (states unknown)
+    truncated: bool = False  # True: over ``DIAGRAM_NODES``/``DIAGRAM_EDGES``, the rest left out
 
 
 class Snapshot(_Model):
@@ -987,6 +989,7 @@ def build_snapshot(
     core_jobs: Sequence[tuple[str, str, str]] = (),
     redactor: Redactor | None = None,
     launch_agents: Sequence[AgentState] | None = None,
+    diagram: bool = True,
 ) -> Snapshot:
     """The local-tier snapshot (``to_remote`` derives the remote one).
 
@@ -1063,17 +1066,21 @@ def build_snapshot(
 
     extension_rows = _extensions(conn, health, settings, now, t)
     core_job_rows = _core_jobs(conn, core_jobs, settings, now, t)
-    diagram = _diagram(
-        conn,
-        extensions=extension_rows,
-        core_jobs=core_job_rows,
-        health=health,
-        brain=brain,
-        runner=runner,
-        repo_names=[r.name for r in repo_rows],
-        agents=launch_agents,
-        now=now,
-        t=t,
+    graph = (
+        None
+        if not diagram
+        else _diagram(
+            conn,
+            extensions=extension_rows,
+            core_jobs=core_job_rows,
+            health=health,
+            brain=brain,
+            runner=runner,
+            repo_names=[r.name for r in repo_rows],
+            agents=launch_agents,
+            now=now,
+            t=t,
+        )
     )
 
     return Snapshot(
@@ -1170,7 +1177,7 @@ def build_snapshot(
         brain_activity=_brain_activity(conn, settings, now, brain),
         trust_rule_count=len(rules),
         repo_count=len(repo_rows),
-        diagram=diagram,
+        diagram=graph,
     )
 
 
@@ -1235,16 +1242,24 @@ def _diagram(
     nodes: list[DiagramNode] = []
     edges: list[DiagramEdge] = []
     ids: set[str] = set()
+    cut = False
 
     def add(node: DiagramNode) -> bool:
-        if node.id in ids or len(nodes) >= DIAGRAM_NODES:
+        nonlocal cut
+        if node.id in ids:
+            return False
+        if len(nodes) >= DIAGRAM_NODES:
+            cut = True
             return False
         ids.add(node.id)
         nodes.append(node)
         return True
 
     def link(source: str, target: str, label: str | None = None) -> None:
-        if source in ids and target in ids and len(edges) < DIAGRAM_EDGES:
+        nonlocal cut
+        if source in ids and target in ids and len(edges) >= DIAGRAM_EDGES:
+            cut = True
+        elif source in ids and target in ids:
             edges.append(DiagramEdge(source=source, target=target, label=t.opt(label, 40)))
 
     # The core skeleton, health from its check (or the state the snapshot already has).
@@ -1338,7 +1353,7 @@ def _diagram(
         if e.jobs or e.report_max:
             link(ext_id, "core:pulse", "reports")
         for m in e.mcp_servers:
-            server_id = f"mcp:{e.name}/{m.id}"
+            server_id = f"mcp:{e.name}/{m.id}"  # at most 4 + 64 + 1 + 64
             where = (
                 f"hosted MCP server at {m.host}"
                 if m.transport == "http" and m.host
@@ -1356,7 +1371,7 @@ def _diagram(
         for tool, (effect, level, kind) in zip(e.tools, kinds, strict=True):
             tool_id = f"tool:{e.name}/{tool.server + '/' if tool.server else ''}{tool.name}"
             words = diagram_parts.level_words(effect, level)
-            if add(DiagramNode(
+            if len(tool_id) <= _ID_MAX and add(DiagramNode(
                 id=tool_id, kind="tool", label=tool.name, parent=ext_id,
                 text=t(diagram_parts.tool_sentence(e.name, tool.name, kind, effect, level,
                                                    tool.description), 300),
@@ -1377,7 +1392,7 @@ def _diagram(
                 link(ext_id, job_id, "cron")
         for r in e.repos:
             repo_id = f"repo:{e.name}/{r}"
-            if add(DiagramNode(
+            if len(repo_id) <= _ID_MAX and add(DiagramNode(
                 id=repo_id, kind="repo", label=r, parent=ext_id,
                 text=t(f"{e.name} is about {r}: a request that names {e.name} means this repo "
                        "for a worker run. The link grants nothing.", 300),
@@ -1387,7 +1402,7 @@ def _diagram(
         for label, (owner, _desc) in declared.items():
             if owner == e.name:
                 link(ext_id, f"proc:{label}", "owns")
-    return Diagram(nodes=nodes, edges=edges, processes_scanned=agents is not None)
+    return Diagram(nodes=nodes, edges=edges, processes_scanned=agents is not None, truncated=cut)
 
 
 class _Context:
