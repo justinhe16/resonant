@@ -360,6 +360,10 @@ async def test_two_pending_re_asks_with_codes_then_the_code_binds(
         "Reply yes <code> or no <code>."
     )
     assert [c["title"] for c in h.tasks("reply")] == [APPROVAL_TITLE]
+    # PER-279: the task's title says what the reply was about, never a code
+    (title,) = [r[0] for r in h.db.execute("SELECT title FROM tasks WHERE kind = 'reply'")]
+    assert title.startswith("Approval reply") and first.code not in title
+    assert second.code not in title
 
     await h.say(f"yes {second.code}")
     assert h.tool_log == ["restart_ollama"]

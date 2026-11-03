@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { CollapsibleSection } from "@/components/CollapsibleSection";
-import { Ago, Empty, Group, Meta, OutsideText, Row, RouteLink, Rows, StateBadge } from "@/components/bits";
+import { Empty, Group, OutsideText, Rows } from "@/components/bits";
+import { ListRow } from "@/components/ListRow";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { approvalTitle, isOutside } from "@/lib/snapshot";
+import { short } from "@/lib/time";
 import { approvalTone, levelTone } from "@/lib/tone";
 import type { ApprovalItem, QuestionItem, Snapshot } from "@/types";
 
@@ -44,24 +46,18 @@ function Approvals({ items, now }: { items: ApprovalItem[]; now: number }) {
   return (
     <Rows>
       {items.map((a) => (
-        <Row key={a.id} className="relative">
-          <div className="flex items-start justify-between gap-3">
-            <p className="min-w-0 text-sm">
-              <OutsideText text={approvalTitle(a)} outside={isOutside(a, "summary")} />
-            </p>
-            <Badge variant={levelTone(a.level)}>{a.level}</Badge>
-          </div>
-          <Changes approval={a} />
-          <Meta>
-            {a.code && <span className="font-mono">code {a.code}</span>}
-            {a.changes && a.changes.length > 0 && <span>one answer for all</span>}
-            <Ago iso={a.asked_at} now={now} prefix="asked " />
-            {a.expires_at && <Ago iso={a.expires_at} now={now} prefix="expires " />}
-            <RouteLink to={{ kind: "approval", id: a.id }} stretch className="font-medium text-info">
-              details
-            </RouteLink>
-          </Meta>
-        </Row>
+        <ListRow
+          key={a.id}
+          to={{ kind: "approval", id: a.id }}
+          refText={a.run_code ?? undefined}
+          title={approvalTitle(a)}
+          outside={isOutside(a, "summary")}
+          pill={{ tone: levelTone(a.level), label: a.level, plain: true, title: a.needs_code ? "needs its code" : undefined }}
+          hint={a.expires_at ? `expires ${short(a.expires_at, now)}` : undefined}
+          time={a.asked_at}
+          now={now}
+          testId="approval-row"
+        />
       ))}
     </Rows>
   );
@@ -94,23 +90,18 @@ function Recent({ items, now }: { items: ApprovalItem[]; now: number }) {
     <div className="space-y-3">
       <Rows>
         {shown.map((a) => (
-          <Row key={a.id} className="relative">
-            <div className="flex items-start justify-between gap-3">
-              <p className="min-w-0 text-sm text-muted-foreground">
-                <OutsideText text={approvalTitle(a)} outside={isOutside(a, "summary")} />
-              </p>
-              <StateBadge tone={approvalTone(a.status)}>{a.status}</StateBadge>
-            </div>
-            <Meta>
-              <Badge variant={levelTone(a.level)}>{a.level}</Badge>
-              {a.decided_at && (
-                <Ago iso={a.decided_at} now={now} prefix={a.decided_by ? `${a.decided_by} ` : "decided "} />
-              )}
-              <RouteLink to={{ kind: "approval", id: a.id }} stretch className="font-medium text-info">
-                details
-              </RouteLink>
-            </Meta>
-          </Row>
+          <ListRow
+            key={a.id}
+            to={{ kind: "approval", id: a.id }}
+            refText={a.run_code ?? undefined}
+            title={approvalTitle(a)}
+            outside={isOutside(a, "summary")}
+            muted
+            pill={{ tone: approvalTone(a.status), label: a.status, title: a.decided_by ? `by ${a.decided_by}` : undefined }}
+            time={a.decided_at ?? a.asked_at}
+            now={now}
+            testId="approval-row"
+          />
         ))}
       </Rows>
       {items.length > RECENT_PREVIEW && (
@@ -127,27 +118,18 @@ function Questions({ items, now }: { items: QuestionItem[]; now: number }) {
   return (
     <Rows>
       {items.map((q) => (
-        <Row key={q.id} className="relative">
-          <p className="text-sm">
-            <RouteLink to={{ kind: "question", id: q.id }} stretch className="mr-2 font-mono text-xs font-semibold">
-              {q.run_code}
-            </RouteLink>
-            {q.text && <OutsideText text={q.text} outside={isOutside(q, "text")} />}
-          </p>
-          {q.options.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {q.options.map((o, i) => (
-                <Badge key={i} variant="outline" className="h-auto whitespace-normal">
-                  ({String.fromCharCode(97 + i)}) {o}
-                </Badge>
-              ))}
-            </div>
-          )}
-          <Meta>
-            {q.urgent && <Badge variant="bad">urgent</Badge>}
-            <Ago iso={q.asked_at} now={now} prefix="asked " />
-          </Meta>
-        </Row>
+        <ListRow
+          key={q.id}
+          to={{ kind: "question", id: q.id }}
+          refText={q.run_code}
+          title={q.text || "A question"}
+          outside={!!q.text && isOutside(q, "text")}
+          pill={q.urgent ? { tone: "bad", label: "urgent" } : { tone: "warn", label: "asks" }}
+          hint={q.options.length > 0 ? `${q.options.length} options` : undefined}
+          time={q.asked_at}
+          now={now}
+          testId="question-row"
+        />
       ))}
     </Rows>
   );

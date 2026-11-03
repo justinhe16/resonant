@@ -1305,7 +1305,11 @@ def test_a_typical_store_fits_without_trimming(db: sqlite3.Connection) -> None:
     assert len(data["questions"]["items"]) == 3 and len(data["extensions"]) == 5
     assert data["trimmed"] == "none"
     size = data_size(data)
-    assert size < pusher_mod.MAX_BYTES // 2, size
+    # Half the cap for the lists; the diagram (PER-277, which used up this headroom) is extra
+    # and the first thing the pusher drops. PER-279's task titles add about 1.2 KB here.
+    lists = data_size({k: v for k, v in data.items() if k != "diagram"})
+    assert lists < pusher_mod.MAX_BYTES // 2, lists
+    assert size < pusher_mod.MAX_BYTES * 3 // 4, size
     assert pusher_mod.shrink(data) is data  # fits: untouched
 
 

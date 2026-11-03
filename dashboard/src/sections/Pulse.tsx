@@ -1,5 +1,6 @@
 import { CollapsibleSection } from "@/components/CollapsibleSection";
-import { Ago, Meta, OutsideText, Row, RouteLink, StateBadge } from "@/components/bits";
+import { Ago } from "@/components/bits";
+import { ListRow } from "@/components/ListRow";
 import { Badge } from "@/components/ui/badge";
 import { isOutside, mutedExtensions } from "@/lib/snapshot";
 import { urgencyTone } from "@/lib/tone";
@@ -43,29 +44,17 @@ export function Pulse({ snap, now }: { snap: Snapshot; now: number }) {
         ) : undefined
       }
       render={(p) => (
-        <Row key={`${p.source}/${p.key}`} className="relative">
-          <div className="flex items-start justify-between gap-3">
-            <p className="min-w-0 text-sm">
-              <OutsideText text={p.title || p.source} outside={isOutside(p, "title")} />
-            </p>
-            <StateBadge tone={urgencyTone(p.urgency)}>{p.urgency}</StateBadge>
-          </div>
-          <Meta>
-            {p.key ? (
-              <RouteLink
-                to={{ kind: "pulse", source: p.source, key: p.key }}
-                stretch
-                className="truncate font-mono font-medium text-info"
-              >
-                {p.source}/{p.key}
-              </RouteLink>
-            ) : (
-              <span className="font-mono">{p.source}</span>
-            )}
-            {p.state === "new" && <span>new</span>}
-            <Ago iso={p.updated_at} now={now} prefix="updated " />
-          </Meta>
-        </Row>
+        <ListRow
+          key={`${p.source}/${p.key}`}
+          to={p.key ? { kind: "pulse", source: p.source, key: p.key } : undefined}
+          title={p.title || p.source}
+          outside={!!p.title && isOutside(p, "title")}
+          pill={{ tone: urgencyTone(p.urgency), label: p.urgency }}
+          hint={p.state === "new" ? `new · ${p.source}` : p.source}
+          time={p.updated_at}
+          now={now}
+          testId="pulse-row"
+        />
       )}
     />
   );

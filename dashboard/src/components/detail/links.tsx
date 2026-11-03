@@ -1,7 +1,7 @@
-import { Ago, Meta, OutsideText, RouteLink, Row, Rows, StateBadge } from "@/components/bits";
+import { RouteLink, Rows } from "@/components/bits";
 import { nodeRoute } from "@/lib/diagram";
-import { findApproval, isOutside } from "@/lib/snapshot";
-import { runTone } from "@/lib/tone";
+import { findApproval } from "@/lib/snapshot";
+import { RunRow } from "@/sections/Work";
 import type { DiagramNode, Snapshot } from "@/types";
 
 export const idChip = "rounded bg-muted px-1.5 py-0.5 font-mono text-xs";
@@ -67,30 +67,11 @@ export function RunLines({ runs, now }: { runs: Snapshot["runs"]["items"]; now: 
   return (
     <Rows>
       {runs.map((r) => (
-        <Row key={r.code} className="relative">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <RouteLink to={{ kind: "run", code: r.code }} stretch className="font-mono text-sm font-semibold">
-                {r.code}
-              </RouteLink>
-              {r.repo && <span className="text-xs text-muted-foreground"> · {r.repo}</span>}
-              {r.ask && (
-                <p className="line-clamp-2 text-sm">
-                  <OutsideText text={r.ask} outside={isOutside(r, "ask")} />
-                </p>
-              )}
-            </div>
-            <StateBadge tone={runTone(r.state)}>{r.state}</StateBadge>
-          </div>
-          <Meta>
-            <Ago iso={r.ended_at ?? r.started_at} now={now} />
-          </Meta>
-        </Row>
+        <RunRow key={r.code} run={r} now={now} />
       ))}
     </Rows>
   );
 }
-
 
 /** The diagram's one sentence on what a component does, when the snapshot has it. */
 export function DiagramText({ snap, id }: { snap: Snapshot; id: string }) {

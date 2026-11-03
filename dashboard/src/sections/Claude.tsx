@@ -1,5 +1,6 @@
 import { CollapsibleSection } from "@/components/CollapsibleSection";
-import { Ago, ExternalLink, Group, OutsideText, Row, RouteLink, StateBadge } from "@/components/bits";
+import { ExternalLink, Group, StateBadge } from "@/components/bits";
+import { ListRow } from "@/components/ListRow";
 import type { BadgeTone } from "@/components/ui/badge";
 import { isOutside, safeHttpsUrl } from "@/lib/snapshot";
 import type { Snapshot } from "@/types";
@@ -27,8 +28,8 @@ export function DecisionBadge({ decision, status }: { decision: string; status: 
 }
 
 /**
- * The worker runner (Claude Code in worktrees) and the Claude brain: its session, today's
- * tool calls and its last calls. The same on both tiers.
+ * "Claude tool calls": the Claude brain's last tool calls, one line each, with its session
+ * and today's counts, and whether the worker runner is set up. The same on both tiers.
  */
 export function Claude({ snap, now }: { snap: Snapshot; now: number }) {
   const brain = snap.claude_brain;
@@ -41,7 +42,7 @@ export function Claude({ snap, now }: { snap: Snapshot; now: number }) {
   return (
     <CollapsibleSection
       id="claude"
-      title="Claude"
+      title="Claude tool calls"
       total={Math.max(activity.calls_today, tools.length)}
       rows={tools}
       explainer="claude"
@@ -79,23 +80,21 @@ export function Claude({ snap, now }: { snap: Snapshot; now: number }) {
         </div>
       }
       render={(t, i) => (
-        <Row key={`${t.at}-${i}`} className="relative flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <p className="font-mono text-sm break-all">
-              <RouteLink to={{ kind: "brain-tool", at: t.at }} stretch className="text-muted-foreground">
-                {t.tool}
-              </RouteLink>{" "}
-              {t.command && <OutsideText text={t.command} outside={isOutside(t, "command")} />}
-            </p>
-            {t.cwd && <p className="mt-0.5 truncate text-xs text-muted-foreground">{t.cwd}</p>}
-          </div>
-          <div className="flex shrink-0 flex-col items-end gap-1">
-            <DecisionBadge decision={t.decision} status={t.status} />
-            <span className="text-xs text-muted-foreground">
-              <Ago iso={t.at} now={now} />
-            </span>
-          </div>
-        </Row>
+        <ListRow
+          key={`${t.at}-${i}`}
+          to={{ kind: "brain-tool", at: t.at }}
+          refText={t.tool}
+          title={t.command || t.cwd || t.tool}
+          outside={!!t.command && isOutside(t, "command")}
+          mono
+          pill={{
+            tone: t.status === "error" ? "bad" : (DECISION_TONE[t.decision] ?? "neutral"),
+            label: t.status === "error" ? `${t.decision} · error` : t.decision,
+          }}
+          time={t.at}
+          now={now}
+          testId="tool-row"
+        />
       )}
     />
   );

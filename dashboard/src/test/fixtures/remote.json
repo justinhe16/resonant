@@ -80,6 +80,7 @@
         "created_at": "2026-10-16T08:46:30Z",
         "updated_at": "2026-10-16T08:58:00Z",
         "label": "Add a dashboard job to CI",
+        "title": "Add a dashboard job to CI",
         "error": null,
         "run_code": "R12",
         "history": [
@@ -108,6 +109,7 @@
         "created_at": "2026-10-16T07:29:30Z",
         "updated_at": "2026-10-16T08:12:00Z",
         "label": "Bump the exchange client",
+        "title": "Bump the exchange client",
         "error": null,
         "run_code": "R11",
         "history": [
@@ -132,6 +134,7 @@
         "created_at": "2026-10-16T08:50:00Z",
         "updated_at": "2026-10-16T08:50:00Z",
         "label": "github/watch",
+        "title": "github/watch",
         "error": null,
         "run_code": null,
         "history": [],
@@ -153,6 +156,7 @@
         "created_at": "2026-10-15T22:09:30Z",
         "updated_at": "2026-10-15T22:31:00Z",
         "label": "Migrate the notes export",
+        "title": "Migrate the notes export",
         "error": "usage limit reached",
         "run_code": "R9",
         "history": [
@@ -179,6 +183,7 @@
         "created_at": "2026-10-16T08:30:00Z",
         "updated_at": "2026-10-16T08:30:20Z",
         "label": null,
+        "title": "Look up net worth",
         "error": null,
         "run_code": null,
         "history": [],

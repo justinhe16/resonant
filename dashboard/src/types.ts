@@ -72,6 +72,9 @@ export interface TaskItem {
   created_at: Timestamp;
   updated_at: Timestamp;
   label: string | null;
+  /** PER-279: a short human title stored at creation ("Look up net worth"); `title` is in
+   * `outside` when its words came from outside text. Absent from a daemon before it. */
+  title?: string | null;
   error: string | null;
   run_code: string | null;
   /** only the first `limits.task_detail` tasks carry history */

@@ -166,13 +166,14 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
               {guard(<ActiveTasks snap={snap} />)}
             </div>
             <div className="space-y-6" data-testid="column-right">
+              {/* PER-279: Extensions right under the approvals, then Pulse; the rest keep their order. */}
               {guard(<WaitingOnYou snap={snap} now={now} />)}
+              {guard(<Extensions snap={snap} now={now} />)}
+              {guard(<Pulse snap={snap} now={now} />)}
               {guard(<RecentRuns snap={snap} now={now} />)}
               {guard(<Tasks snap={snap} now={now} />)}
               {guard(<Claude snap={snap} now={now} />)}
-              {guard(<Extensions snap={snap} now={now} />)}
               {guard(<Jobs snap={snap} now={now} />)}
-              {guard(<Pulse snap={snap} now={now} />)}
               {guard(<Rules rules={snap.trust_rules} repos={snap.repos} />)}
             </div>
           </div>
