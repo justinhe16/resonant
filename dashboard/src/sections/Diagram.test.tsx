@@ -230,6 +230,14 @@ describe("Diagram tab", () => {
     expect(boxes(card)).toHaveLength(buildTree(diagram).roots.length);
   });
 
+  it("a remembered box that no longer exists doesn't count as open", async () => {
+    window.localStorage.setItem("resonant.diagram.open", JSON.stringify(["ext:removed"]));
+    mount(local);
+    const card = await openDiagram("graph");
+    expect(within(card).getByRole("button", { name: "Collapse all" })).toBeDisabled();
+    expect(boxes(card)).toHaveLength(buildTree(diagram).roots.length);
+  });
+
   it("a group's details say what it does, its worst health and what is inside", async () => {
     mount(local);
     const card = await openDiagram("graph");

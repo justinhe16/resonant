@@ -96,13 +96,26 @@ function motionOk(): boolean {
   }
 }
 
+/** The same object as long as its content is: the page polls every 10 s, and an unchanged
+ * diagram shouldn't be laid out (and tweened) again. */
+function useSame<T>(value: T): T {
+  const [kept, setKept] = useState<{ value: T; seen: T; key: string }>(() => ({ value, seen: value, key: JSON.stringify(value) }));
+  if (kept.seen !== value) {
+    const key = JSON.stringify(value);
+    setKept(key === kept.key ? { ...kept, seen: value } : { value, seen: value, key });
+    return key === kept.key ? kept.value : value;
+  }
+  return kept.value;
+}
+
 export function Diagram({ snap }: { snap: Snapshot }) {
   const [mode, setMode] = useState<Mode>(initialMode);
   const [open, setOpen] = useState<Set<string>>(initialOpen);
   // What the last toggle asks the graph to show: the box just opened, or everything.
   const [focus, setFocus] = useState<{ id: string | null; n: number }>({ id: null, n: 0 });
-  const d = snap.diagram;
+  const d = useSame(snap.diagram);
   const tree = useMemo(() => (d ? buildTree(d) : null), [d]);
+  const anyOpen = tree ? [...open].some((id) => tree.byId.has(id)) : false;
 
   const change = (next: Set<string>, focusId: string | null) => {
     write(OPEN_KEY, JSON.stringify([...next]));
@@ -134,7 +147,7 @@ export function Diagram({ snap }: { snap: Snapshot }) {
               <Button variant="outline" size="sm" onClick={() => change(new Set(containers(tree)), null)}>
                 Expand all
               </Button>
-              <Button variant="outline" size="sm" onClick={() => change(new Set(), null)} disabled={open.size === 0}>
+              <Button variant="outline" size="sm" onClick={() => change(new Set(), null)} disabled={!anyOpen}>
                 Collapse all
               </Button>
               <div role="radiogroup" aria-label="Diagram view" className="inline-flex rounded-lg border p-0.5">
