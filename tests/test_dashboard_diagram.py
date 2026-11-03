@@ -417,3 +417,60 @@ def test_a_full_install_is_capped_flagged_and_still_fits(db: sqlite3.Connection)
 
 def test_the_briefing_can_skip_the_diagram(db: sqlite3.Connection) -> None:
     assert _build(db, utcnow(), diagram=False).diagram is None
+
+
+# --- groups (PER-278) ---------------------------------------------------------------------
+
+
+def test_the_groups_are_a_short_high_level_list() -> None:
+    """The tab starts from these boxes: about 6 to 8 (plus launchd), each named once, every
+    core component in one of them."""
+    ids = [g.id for g in diagram.GROUPS]
+    assert len(ids) == len(set(ids)) and 6 <= len(ids) <= 9
+    for g in diagram.GROUPS:
+        assert len(g.label) <= 40 and g.text.endswith(".") and len(g.text) <= 300
+    for c in diagram.CORE:
+        assert c.group in diagram.GROUP_IDS, c.id
+    # The flow's ends each have their own box.
+    assert {"messages", "brain", "toolcore", "extensions", "relay"} <= diagram.GROUP_IDS
+
+
+def test_every_node_is_in_a_group_or_under_a_parent(db: sqlite3.Connection) -> None:
+    now = datetime(2026, 11, 2, 15, 0, tzinfo=UTC)
+    for m in (_real("github"), TRADE_JEV):
+        _install(db, m, now)
+    repos.add(db, "jhe/trade-jev", base="main", source="test", name="trade-jev")
+    s = _build(db, now, launch_agents=AGENTS)
+    assert s.diagram is not None
+    assert [g.id for g in s.diagram.groups] == [g.id for g in diagram.GROUPS]
+    nodes = _nodes(s)
+    for n in nodes.values():
+        if n.parent:
+            assert n.group is None and n.parent in nodes, n.id  # nests under its parent
+        else:
+            assert n.group in diagram.GROUP_IDS, n.id
+    assert nodes["core:gateway"].group == "messages" and nodes["core:gate"].group == "toolcore"
+    assert nodes["ext:github"].group == "extensions"
+    assert nodes["proc:com.tradejev.paper"].group == "processes"
+    assert nodes["job:core/pulse"].parent == "core:scheduler"
+    assert nodes["core:scheduler"].group == "scheduler"
+    used = {n.group for n in nodes.values() if n.group}
+    assert used == diagram.GROUP_IDS  # with an extension and agents, every box has something
+
+
+def test_a_node_leaves_its_unset_fields_out(db: sqlite3.Connection) -> None:
+    """A diagram node is mostly nulls: they are left out on the wire (the page reads a missing
+    field as null) and the dump still validates; a node without ``group`` (an older daemon's)
+    still parses."""
+    s = _build(db, utcnow())
+    data = to_remote(s).model_dump(mode="json")
+    gate = next(n for n in data["diagram"]["nodes"] if n["id"] == "core:gate")
+    assert "parent" not in gate and "last_run_at" not in gate and gate["group"] == "toolcore"
+    assert all(None not in n.values() for n in data["diagram"]["nodes"])
+    assert Snapshot.model_validate(data).diagram == s.diagram
+    old = json.loads(json.dumps(data))
+    old["diagram"].pop("groups")
+    for n in old["diagram"]["nodes"]:
+        n.pop("group", None)
+    parsed = Snapshot.model_validate(old)
+    assert parsed.diagram is not None and parsed.diagram.groups == []
