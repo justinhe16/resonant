@@ -82,6 +82,11 @@ def test_from_text(text: str, words: int, want: str | None) -> None:
     assert tt.from_text(text, words) == want
 
 
+def test_approval_code_shapes_are_masked_in_text_titles() -> None:
+    assert tt.from_text("approve d7 and K4 now") == "Approve [code] and [code] now"
+    assert tt.from_text("fix PER-279 for R11 and A1") == "Fix PER-279 for R11 and A1"  # not codes
+
+
 def test_clean_is_one_redacted_line_under_the_cap() -> None:
     assert tt.clean(None) is None and tt.clean("  ") is None
     assert tt.clean("a\n  b") == "a b"
@@ -266,6 +271,27 @@ def test_migration_025_adds_the_columns_and_backfills(tmp_path: Path) -> None:
     # new tasks get theirs at creation
     tid = task_store.insert_task(conn, _new("reminder", "reminder", checkpoint={"text": "z"}))
     assert _task(conn, tid) == ("Reminder: Z", 0)
+    conn.close()
+
+
+def test_backfill_skips_a_row_it_cannot_title(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = connect(tmp_path / "v24.db")
+    migrate(conn, through(24))
+    _raw_task(conn, "t1", "job", {"ext": "a", "job": "b"})
+    _raw_task(conn, "t2", "reminder", {"text": "x"})
+    real = tt.derive
+
+    def flaky(c: sqlite3.Connection, **kw: object) -> tt.Title | None:
+        if kw["kind"] == "job":
+            raise RuntimeError("odd row")
+        return real(c, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tt, "derive", flaky)
+    assert migrate(conn) == 25  # the migration still commits
+    got = dict(conn.execute("SELECT id, title FROM tasks").fetchall())
+    assert got == {"t1": None, "t2": "Reminder: X"}
     conn.close()
 
 

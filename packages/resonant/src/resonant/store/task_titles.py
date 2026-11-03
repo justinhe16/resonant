@@ -26,13 +26,17 @@ inbox's outcome, never the text the owner typed.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
+from resonant.gate.codes import CODE_DIGITS, CODE_LETTERS
 from resonant.redact import clip_text
+
+log = logging.getLogger(__name__)
 
 TITLE_MAX = 80  # characters, after redaction
 TEXT_WORDS = 6  # an owner's text
@@ -46,6 +50,8 @@ _OPENER = re.compile(
     re.IGNORECASE,
 )
 _SPACE = re.compile(r"\s+")
+_CODE = re.compile(rf"(?<![\w-])[{CODE_LETTERS}][{CODE_DIGITS}](?![\w-])", re.IGNORECASE)
+CODE_MASK = "[code]"
 _TRIM = ".,;:!?-\u2013\u2014\"'`([{<"  # stripped from the end of a cut title (dashes too)
 
 
@@ -68,11 +74,15 @@ def clean(title: str | None) -> str | None:
 def from_text(text: str | None, words: int = TEXT_WORDS) -> str | None:
     """The cleaned first ``words`` words of ``text``'s first non-empty line: a link becomes
     its host, a greeting or "can you" opener is dropped, the first letter is capitalised and
-    ``…`` marks a cut. None when nothing is left."""
+    ``…`` marks a cut; an approval-code-shaped token is masked. None when nothing is left."""
     if not text:
         return None
     line = next((ln for ln in text.splitlines() if ln.strip()), "")
     line = _URL.sub(lambda m: m.group(1).removeprefix("www."), line)
+    # A token shaped like an approval code (``D7``, ``gate/codes.py``) is masked: codes stay
+    # on the Mini, and a title reaches the remote page. Code-built titles (``Watch W3``) never
+    # come through here.
+    line = _CODE.sub(CODE_MASK, line)
     line = _SPACE.sub(" ", line).strip()
     stripped = _OPENER.sub("", line).strip()
     line = stripped or line
@@ -209,8 +219,12 @@ def backfill(conn: sqlite3.Connection, *, batch: int = 500) -> int:
             except ValueError:
                 raw = {}
             cp = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
-            found = derive(conn, kind=r[1], checkpoint=cp, origin_event_id=r[3])
-            text = clean(found.text) if found else None
+            try:
+                found = derive(conn, kind=r[1], checkpoint=cp, origin_event_id=r[3])
+                text = clean(found.text) if found else None
+            except Exception:  # best-effort: one odd row never fails the migration
+                log.warning("task title backfill: skipped task %s", r[0], exc_info=True)
+                continue
             if text is None or found is None:
                 continue
             conn.execute(

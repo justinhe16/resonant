@@ -91,7 +91,13 @@ def test_migration_003_over_populated_002(tmp_path: Path) -> None:
     path = tmp_path / "old.db"
     conn = connect(path)
     assert migrate(conn, _migrations_through(2)) == 2
-    task_id = _task(conn)
+    task_id = "t_old"  # a v2 row (no ``title`` yet: migration 025)
+    conn.execute(
+        "INSERT INTO tasks (id, kind, runner, priority, status, wait_reason, wake_at, checkpoint,"
+        " trace_id, created_at, updated_at) VALUES (?, 'chat', 'local', 1, 'waiting',"
+        " 'approval', ?, '{}', 'tr', ?, ?)",
+        (task_id, iso(NOW + TTL), iso(NOW), iso(NOW)),
+    )
     ts = iso(NOW)
     conn.execute(
         """INSERT INTO approvals (id, task_id, intent_hash, tool, effect, level, summary,

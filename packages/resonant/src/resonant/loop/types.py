@@ -77,6 +77,7 @@ class NewTask:
     trace_id: str | None = None
     wake_at: datetime | None = None  # not before (e.g. a reminder's due time)
     # PER-279: the task's short human title; None derives one (``store/task_titles.py``).
+    # A given title is stored as Resonant's own (not ``outside``): pass code-built text only.
     title: str | None = None
 
 

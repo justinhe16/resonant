@@ -450,7 +450,6 @@ function fromV1(s: V1Snapshot): Normalized {
   };
 }
 
-/** What an approval is when its summary isn't known (a schema 1 brief). */
 /** A run's title line: its ask's first line, else its repo, else its code. */
 export function runTitle(r: RunItem): string {
   const first = r.ask.split("\n").find((l) => l.trim())?.trim();
@@ -462,6 +461,7 @@ export function taskTitle(t: TaskItem): string {
   return t.title?.trim() || t.label?.trim() || t.kind;
 }
 
+/** What an approval is when its summary isn't known (a schema 1 brief). */
 export function approvalTitle(a: ApprovalItem): string {
   if (a.summary) return a.summary;
   const what = a.effect === "pay" ? "A payment" : a.effect === "read" ? "A read" : "A change";
