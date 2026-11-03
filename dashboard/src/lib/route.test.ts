@@ -15,6 +15,7 @@ const CASES: [string, Route][] = [
   ["#/pulse/core/run%2FR12", { kind: "pulse", source: "core", key: "run/R12" }],
   ["#/health/ext%3Agithub", { kind: "health", name: "ext:github" }],
   ["#/brain/2026-10-16T08%3A59%3A50%2B00%3A00", { kind: "brain-tool", at: "2026-10-16T08:59:50+00:00" }],
+  ["#/diagram/tool%3Aweather%2Fweather-mcp%2Fforecast", { kind: "node", id: "tool:weather/weather-mcp/forecast" }],
 ];
 
 describe("route", () => {

@@ -30,6 +30,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from resonant import __version__
 from resonant.config import Settings, is_loopback
+from resonant.dashboard.diagram import cached_scan
 from resonant.dashboard.snapshot import Snapshot, build_snapshot
 from resonant.loop import Loop
 from resonant.monitor import channels_snapshot
@@ -192,6 +193,7 @@ async def local_snapshot(state: DaemonState, *, redactor: Redactor | None = None
         runner_missing=await runner_missing(state),
         core_jobs=_core_jobs(state),
         redactor=redactor,
+        launch_agents=await asyncio.to_thread(cached_scan),  # PER-277's diagram, 60 s cache
     )
 
 

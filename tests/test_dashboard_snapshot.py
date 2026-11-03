@@ -985,7 +985,9 @@ def _seed_texts(db: sqlite3.Connection, now: datetime, text: Any) -> None:
             name="github", source="repo:github", commit="abc1234", tree_digest="d",
             manifest_sha="m", installed_at=now, installed_by="justin",
             manifest={"name": "github", "description": text(), "repos": [text()],
-                      "jobs": [{"id": "j", "schedule": text(), "tz": text()}],
+                      "jobs": [{"id": "j", "schedule": text(), "tz": text(),
+                                "description": text()}],
+                      "launch_agents": [{"label": "com.github.watcher", "description": text()}],
                       "tools": {"t": {"effect": "read", "description": text()}},
                       "mcp": {"servers": {"m": {"transport": "stdio", "tools": [
                           {"name": "u", "effect": "read", "description": text()}]}}}},
@@ -1262,7 +1264,9 @@ def seed_worst(db: sqlite3.Connection, now: datetime) -> None:
                     "name": name, "description": x(200), "secrets": [f"s{k}" for k in range(12)],
                     "repos": [x(150)] * 25, "report": {"max_urgency": "urgent"},
                     "jobs": [{"id": f"j{k}".ljust(64, "x"), "schedule": "*/5 * * * *",
-                              "tz": x(80), "run": "x"} for k in range(5)],
+                              "tz": x(80), "run": "x", "description": x(200)} for k in range(5)],
+                    "launch_agents": [{"label": f"com.{name}.a{k}", "description": x(200)}
+                                      for k in range(10)],
                     "tools": {f"t{k}".ljust(80, "x"): {"effect": "write", "description": x(300)}
                               for k in range(50)},
                     "mcp": {"servers": {f"m{k}".ljust(40, "x"): {

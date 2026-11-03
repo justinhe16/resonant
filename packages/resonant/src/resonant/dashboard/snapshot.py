@@ -52,6 +52,9 @@ from pydantic.config import JsonDict
 
 from resonant import __version__
 from resonant.config import Settings
+from resonant.dashboard import diagram as diagram_parts
+from resonant.dashboard.diagram import LABEL_PATTERN as AGENT_LABEL_PATTERN
+from resonant.dashboard.diagram import AgentState
 from resonant.extensions.cron import CronError, parse_schedule
 from resonant.extensions.notify import muted_until
 from resonant.gate.policy import change_line, strictest, widens_trust
@@ -183,6 +186,7 @@ _HEAD_SHA = re.compile(SHA_PATTERN)
 _LINEAR = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,10}-\d{1,6})(?![A-Za-z0-9])")
 _LINEAR_BRANCH = re.compile(r"(?<![a-z0-9])([a-z]{2,10})-(\d{1,6})(?![a-z0-9])")
 _RUN_KEY = re.compile(r"run/(r\d{1,6})")
+_AGENT_LABEL = re.compile(AGENT_LABEL_PATTERN)
 _OUTCOMES: frozenset[str] = frozenset(get_args(JobOutcome))
 _HEALTH_STATES: frozenset[str] = frozenset(get_args(HealthState))
 _TASK_STATES: frozenset[str] = frozenset(get_args(TaskStatus))
@@ -521,6 +525,52 @@ class RepoItem(_Model):
     slug: Txt100
 
 
+# --- the diagram (PER-277) ------------------------------------------------------------------
+
+DiagramKind = Literal["core", "process", "extension", "server", "tool", "job", "repo"]
+# What the page opens for a node: the PER-276 view it already has (``extension``, ``job``,
+# ``health``) or the node's own view.
+DIAGRAM_NODES = 250  # core and processes first, then each extension with its children
+DIAGRAM_EDGES = 400
+DIAGRAM_PROCESSES = 30
+
+
+class DiagramNode(_Model):
+    """One box of the architecture diagram (``Snapshot.diagram``): a core component, a launchd
+    agent, an extension, or one of an extension's MCP servers, tools, jobs or repos."""
+
+    id: Txt200  # ``core:gate``, ``proc:com.resonant.daemon``, ``ext:linear``, ``tool:linear/x``
+    kind: DiagramKind
+    label: Txt100
+    parent: Txt200 | None = None  # the node it belongs to (an extension's child, a core job)
+    text: Txt300  # one sentence on its job
+    tags: list[Txt32] = _list()  # ``mcp``, ``read``, ``asks first``, ``running``
+    health: HealthState | None = None
+    check: Ident | None = None  # its health row (``#/health/<check>``)
+    state: Txt32 | None = None  # a process's launchd state, an extension's status
+    module: Txt120 | None = None  # a core component's place in the repo
+    last_run_at: datetime | None = None
+    last_outcome: JobOutcome | None = None
+    ext: Ident | None = None  # the extension (``core`` for a core job) it opens in its view
+    job: Ident | None = None  # a job node's job id
+
+
+class DiagramEdge(_Model):
+    source: Txt200
+    target: Txt200
+    label: Txt40 | None = None
+
+
+class Diagram(_Model):
+    """How Resonant is put together right now: the curated core skeleton
+    (``dashboard.diagram.CORE``), the launchd agents it knows, and every installed extension
+    from its approved manifest; health and last runs from the store."""
+
+    nodes: list[DiagramNode] = _list()
+    edges: list[DiagramEdge] = _list()
+    processes_scanned: bool = False  # False: the launchd scan didn't run (states unknown)
+
+
 class Snapshot(_Model):
     """Everything the dashboard shows, at ``taken_at``."""
 
@@ -561,6 +611,7 @@ class Snapshot(_Model):
         calls_today=0, writes_today=0))  # fmt: skip
     trust_rule_count: int = 0
     repo_count: int = 0
+    diagram: Diagram | None = None  # PER-277; None from a daemon before it
 
 
 # --- tiers --------------------------------------------------------------------------------
@@ -935,6 +986,7 @@ def build_snapshot(
     version: str | None = None,
     core_jobs: Sequence[tuple[str, str, str]] = (),
     redactor: Redactor | None = None,
+    launch_agents: Sequence[AgentState] | None = None,
 ) -> Snapshot:
     """The local-tier snapshot (``to_remote`` derives the remote one).
 
@@ -942,7 +994,9 @@ def build_snapshot(
     max). ``runner_missing`` is ``ClaudeRunner.setup_gaps()``'s list, or None when no Claude
     runner is wired in this process (then the runner is not set up). ``core_jobs`` is the
     scheduler's ``(id, cron, tz)`` per core job. ``redactor`` holds secret values the text
-    passes must also remove (the relay pusher's token and key).
+    passes must also remove (the relay pusher's token and key). ``launch_agents`` is
+    ``diagram.cached_scan()``'s list (None: not scanned); only the agents the diagram allows
+    (``diagram.agent_allowed``) are shipped.
     """
     now = now or utcnow()
     run_rows = runs.recent(conn, limit=RUN_ITEMS)
@@ -1006,6 +1060,21 @@ def build_snapshot(
     def related_ids(task_id: str | None) -> list[str]:
         ids = [i for i in related.get(task_id or "", []) if i in visible]
         return ids[-RELATED_IDS:]
+
+    extension_rows = _extensions(conn, health, settings, now, t)
+    core_job_rows = _core_jobs(conn, core_jobs, settings, now, t)
+    diagram = _diagram(
+        conn,
+        extensions=extension_rows,
+        core_jobs=core_job_rows,
+        health=health,
+        brain=brain,
+        runner=runner,
+        repo_names=[r.name for r in repo_rows],
+        agents=launch_agents,
+        now=now,
+        t=t,
+    )
 
     return Snapshot(
         schema=SCHEMA_VERSION,
@@ -1087,8 +1156,8 @@ def build_snapshot(
                 )[:PULSE_ITEMS]
             ],
         ),
-        extensions=_extensions(conn, health, settings, now, t),
-        core_jobs=_core_jobs(conn, core_jobs, settings, now, t),
+        extensions=extension_rows,
+        core_jobs=core_job_rows,
         runner=runner,
         trust_rules=[TrustRule(n=r.id, text=t(r.text, 200)) for r in rules[:TRUST_RULE_ITEMS]],
         repos=[
@@ -1101,7 +1170,224 @@ def build_snapshot(
         brain_activity=_brain_activity(conn, settings, now, brain),
         trust_rule_count=len(rules),
         repo_count=len(repo_rows),
+        diagram=diagram,
     )
+
+
+# --- the diagram ----------------------------------------------------------------------------
+
+
+def _declared_agents(conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    """label -> (extension, description) of every ``launch_agents`` entry an installed
+    extension's approved manifest declares."""
+    out: dict[str, tuple[str, str]] = {}
+    for record in ext_store.list_extensions(conn):
+        raw = record.manifest.get("launch_agents")
+        for entry in cast(list[Any], raw) if isinstance(raw, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            fields = cast(dict[str, Any], entry)
+            label = fields.get("label")
+            desc = fields.get("description")
+            if isinstance(label, str) and _AGENT_LABEL.fullmatch(label) and _ident(record.name):
+                out.setdefault(label, (record.name, desc if isinstance(desc, str) else ""))
+    return out
+
+
+def _job_descriptions(conn: sqlite3.Connection) -> dict[tuple[str, str], str]:
+    out: dict[tuple[str, str], str] = {}
+    for record in ext_store.list_extensions(conn):
+        for spec in cast(list[Any], record.manifest.get("jobs") or []):
+            if isinstance(spec, dict):
+                fields = cast(dict[str, Any], spec)
+                desc = fields.get("description")
+                if isinstance(desc, str) and desc.strip():
+                    out[(record.name, str(fields.get("id", "")))] = desc
+    return out
+
+
+_HEALTH_RANK: Final[Mapping[str, int]] = {"ok": 0, "unknown": 1, "degraded": 2, "failing": 3}
+
+
+def worst_health(states: Iterable[HealthState]) -> HealthState:
+    return cast(HealthState, max(states, key=_HEALTH_RANK.__getitem__, default="unknown"))
+
+
+def _job_health(j: Job) -> HealthState:
+    if j.fail_streak > 0:
+        return "degraded" if j.fail_streak < 3 else "failing"
+    return "ok" if j.last_outcome in ("ok", "dry_run", "skipped_paused") else "unknown"
+
+
+def _diagram(
+    conn: sqlite3.Connection,
+    *,
+    extensions: Sequence[Extension],
+    core_jobs: Sequence[Job],
+    health: Mapping[str, HealthRow],
+    brain: ClaudeBrain | None,
+    runner: Runner,
+    repo_names: Sequence[str],
+    agents: Sequence[AgentState] | None,
+    now: datetime,
+    t: _Text,
+) -> Diagram:
+    nodes: list[DiagramNode] = []
+    edges: list[DiagramEdge] = []
+    ids: set[str] = set()
+
+    def add(node: DiagramNode) -> bool:
+        if node.id in ids or len(nodes) >= DIAGRAM_NODES:
+            return False
+        ids.add(node.id)
+        nodes.append(node)
+        return True
+
+    def link(source: str, target: str, label: str | None = None) -> None:
+        if source in ids and target in ids and len(edges) < DIAGRAM_EDGES:
+            edges.append(DiagramEdge(source=source, target=target, label=t.opt(label, 40)))
+
+    # The core skeleton, health from its check (or the state the snapshot already has).
+    for c in diagram_parts.CORE:
+        row = health.get(c.check) if c.check else None
+        state: HealthState | None = row.state if row else ("unknown" if c.check else None)
+        if c.id == "brain":
+            state = "unknown" if brain is None else ("ok" if brain.state == "up" else "degraded")
+        elif c.id == "workers":
+            state = "ok" if runner.set_up else "degraded"
+        elif c.id == "scheduler" and core_jobs:
+            state = worst_health([_job_health(j) for j in core_jobs])
+        last = max((j.last_run_at for j in core_jobs if j.last_run_at), default=None)
+        add(DiagramNode(
+            id=f"core:{c.id}", kind="core", label=c.label, text=t(c.text, 300), health=state,
+            check=c.check if row else None, module=c.module,
+            last_run_at=last if c.id == "scheduler" else None,
+            state=None if brain is None or c.id != "brain" else brain.state,
+        ))  # fmt: skip
+    for source, target, label in diagram_parts.CORE_EDGES:
+        link(f"core:{source}", f"core:{target}", label)
+    for j in core_jobs:
+        what = diagram_parts.CORE_JOB_TEXT.get(j.id)
+        node_id = f"job:core/{j.id}"
+        if add(DiagramNode(
+            id=node_id, kind="job", label=j.id, parent="core:scheduler",
+            text=t(diagram_parts.job_sentence("core", j.id, j.schedule, j.tz, None, None, what,
+                                              now), 300),
+            tags=["core job"], health=_job_health(j), last_run_at=j.last_run_at,
+            last_outcome=j.last_outcome, ext="core", job=j.id,
+        )):  # fmt: skip
+            link("core:scheduler", node_id)
+
+    # launchd agents: the daemon's own, com.resonant.*, those an extension declares, and
+    # com.<repo>.* for a registered repo. Nothing else the scan saw ever gets here.
+    declared = _declared_agents(conn)
+    seen = {a.label: a for a in agents or ()}
+    allowed = {
+        label for label in seen if diagram_parts.agent_allowed(label, declared, repo_names)
+    } | set(declared)
+    known = list(diagram_parts.KNOWN_AGENTS)
+    ordered = [*known, *sorted(allowed - set(known))]
+    for label in [x for x in ordered if t(x, 128) == x][:DIAGRAM_PROCESSES]:
+        a = seen.get(label)
+        agent_health, agent_state = diagram_parts.agent_health(a) if agents is not None else (
+            "unknown", "not scanned")  # fmt: skip
+        owner = declared.get(label)
+        if label in diagram_parts.KNOWN_AGENTS:
+            text = diagram_parts.KNOWN_AGENTS[label]
+        elif owner is not None:
+            text = owner[1] or f"A launchd agent the {owner[0]} extension declares."
+        elif label.startswith("com.resonant."):
+            text = "A Resonant launchd agent."
+        else:
+            text = "A launchd agent named after a repo in the registry."
+        node_id = f"proc:{label}"
+        tags = ["launchd"] + (["plist"] if a is not None and a.plist else [])
+        add(DiagramNode(
+            id=node_id, kind="process", label=t(label, 100), text=t(text, 300),
+            tags=tags, health=cast(HealthState, agent_health), state=t(agent_state, 32),
+            ext=owner[0] if owner else None,
+        ))  # fmt: skip
+        if label in diagram_parts.AGENT_RUNS:
+            link(node_id, f"core:{diagram_parts.AGENT_RUNS[label]}", "runs")
+
+    # Extensions, from their approved manifests (already redacted and capped in ``extensions``).
+    job_text = _job_descriptions(conn)
+    for e in extensions:
+        hosts = [m.host for m in e.mcp_servers if m.transport == "http" and m.host]
+        transport = {m.id: (m.transport, m.host) for m in e.mcp_servers}
+        kinds = [
+            (tool.effect, tool.level,
+             diagram_parts.tool_kind(tool.via, *transport.get(tool.server or "", (None, None))))
+            for tool in e.tools
+        ]  # fmt: skip
+        ext_id = f"ext:{e.name}"
+        last = max((j.last_run_at for j in e.jobs if j.last_run_at), default=None)
+        sentence = diagram_parts.extension_sentence(
+            e.name, e.description, kinds, hosts, len(e.jobs)
+        )
+        if not add(DiagramNode(
+            id=ext_id, kind="extension", label=e.name, text=t(sentence, 300),
+            tags=sorted({k for _e, _l, k in kinds}), health=e.health,
+            check=EXT_CHECK_PREFIX + e.name if EXT_CHECK_PREFIX + e.name in health else None,
+            state=e.status, last_run_at=last, ext=e.name,
+        )):  # fmt: skip
+            continue
+        link("core:executor", ext_id, "tool calls")
+        if e.jobs:
+            link("core:scheduler", ext_id, "jobs")
+        if e.jobs or e.report_max:
+            link(ext_id, "core:pulse", "reports")
+        for m in e.mcp_servers:
+            server_id = f"mcp:{e.name}/{m.id}"
+            where = (
+                f"hosted MCP server at {m.host}"
+                if m.transport == "http" and m.host
+                else (
+                    "local MCP server over stdio" if m.transport == "stdio" else "hosted MCP server"
+                )
+            )
+            if add(DiagramNode(
+                id=server_id, kind="server", label=m.id, parent=ext_id,
+                text=t(f"{e.name}/{m.id}: {where}; Resonant lists and pins its tools at install "
+                       "and re-checks them for drift.", 300),
+                tags=[m.transport], ext=e.name,
+            )):  # fmt: skip
+                link(ext_id, server_id, "MCP")
+        for tool, (effect, level, kind) in zip(e.tools, kinds, strict=True):
+            tool_id = f"tool:{e.name}/{tool.server + '/' if tool.server else ''}{tool.name}"
+            words = diagram_parts.level_words(effect, level)
+            if add(DiagramNode(
+                id=tool_id, kind="tool", label=tool.name, parent=ext_id,
+                text=t(diagram_parts.tool_sentence(e.name, tool.name, kind, effect, level,
+                                                   tool.description), 300),
+                tags=[tool.via, effect, level, words], ext=e.name,
+            )):  # fmt: skip
+                server_id = f"mcp:{e.name}/{tool.server}"
+                link(server_id if tool.server and server_id in ids else ext_id, tool_id)
+        for j in e.jobs:
+            job_id = f"job:{e.name}/{j.id}"
+            what = job_text.get((e.name, j.id))
+            if add(DiagramNode(
+                id=job_id, kind="job", label=j.id, parent=ext_id,
+                text=t(diagram_parts.job_sentence(e.name, j.id, j.schedule, j.tz, j.effect,
+                                                  j.level, what, now), 300),
+                tags=[x for x in (j.effect, j.level) if x], health=_job_health(j),
+                last_run_at=j.last_run_at, last_outcome=j.last_outcome, ext=e.name, job=j.id,
+            )):  # fmt: skip
+                link(ext_id, job_id, "cron")
+        for r in e.repos:
+            repo_id = f"repo:{e.name}/{r}"
+            if add(DiagramNode(
+                id=repo_id, kind="repo", label=r, parent=ext_id,
+                text=t(f"{e.name} is about {r}: a request that names {e.name} means this repo "
+                       "for a worker run. The link grants nothing.", 300),
+                tags=["repo"], ext=e.name,
+            )):  # fmt: skip
+                link(ext_id, repo_id, "linked")
+        for label, (owner, _desc) in declared.items():
+            if owner == e.name:
+                link(ext_id, f"proc:{label}", "owns")
+    return Diagram(nodes=nodes, edges=edges, processes_scanned=agents is not None)
 
 
 class _Context:

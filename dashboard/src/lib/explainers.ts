@@ -22,6 +22,8 @@ export const EXPLAINERS = {
     "core/backup copies the store every day at 03:30 (by default) with SQLite's online backup, checks it, and keeps 7 daily and 4 Sunday copies in ~/.resonant/backups. The backup check fails after 36 hours without a good copy.",
   status:
     "Each row is a health check: the model, iMessage, the loop, the store, backups, each extension's own check and the relay. The overall state is the worst one.",
+  diagram:
+    "A live map of how Resonant works and what is plugged into it, rebuilt with every snapshot. Core is Resonant's own skeleton: a text comes in through iMessage, the qwen router answers greetings and passes the rest to the Claude brain, whose tool calls go through the tool core and the gate to the executor, which runs extension tools and starts Claude workers. Jobs and run outcomes become reports for the pulse and briefing, which go back out by iMessage, and the daemon pushes this page's data to the relay. Processes are the launchd agents: Resonant's own (com.resonant.*), those an extension declares, and those named after a repo in the registry; your other agents are never read. Extensions, with their tools, jobs, MCP servers and repos, come from the manifests you approved at install. Health and last runs come from the store. Click any box for its details.",
   rules:
     "Trust rules are your standing answers for workers: before anything net new a worker checks, and gets ok or a question for you. Teach them in chat or with /rules. Repos is the list of repos workers work in.",
 } as const;

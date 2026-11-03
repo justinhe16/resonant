@@ -226,6 +226,16 @@ def brew_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def never_the_real_launchd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The diagram's launchd scan (PER-277) never asks the real launchctl: a test's agents
+    come only from its temp HOME's ~/Library/LaunchAgents (or an injected listing)."""
+    from resonant.dashboard import diagram
+
+    monkeypatch.setattr(diagram, "_launchctl_list", lambda: None)
+    monkeypatch.setattr(diagram, "_cache", None)
+
+
+@pytest.fixture(autouse=True)
 def never_the_real_claude_voice(monkeypatch: pytest.MonkeyPatch) -> None:
     """PER-273: no test's proactive-text voice finds the real ``claude`` on the PATH (it would
     spend the owner's Claude usage): the lookup answers "not installed". Tests that exercise

@@ -332,6 +332,46 @@ export interface Repo {
   ci: boolean | null;
 }
 
+/** One box of the architecture diagram (PER-277). */
+export type DiagramKind = "core" | "process" | "extension" | "server" | "tool" | "job" | "repo";
+
+export interface DiagramNode {
+  /** `core:gate`, `proc:com.resonant.daemon`, `ext:linear`, `tool:linear/linear/save_issue`, … */
+  id: string;
+  kind: DiagramKind;
+  label: string;
+  /** the node it belongs to (an extension's child, a core job's scheduler) */
+  parent?: string | null;
+  /** one sentence on its job */
+  text: string;
+  tags?: string[];
+  health?: HealthState | null;
+  /** its health row, for `#/health/<check>` */
+  check?: string | null;
+  /** a process's launchd state, an extension's status */
+  state?: string | null;
+  /** a core component's place in the repo */
+  module?: string | null;
+  last_run_at?: Timestamp | null;
+  last_outcome?: string | null;
+  /** the extension (`core` for a core job) whose PER-276 view it opens */
+  ext?: string | null;
+  job?: string | null;
+}
+
+export interface DiagramEdge {
+  source: string;
+  target: string;
+  label?: string | null;
+}
+
+export interface Diagram {
+  nodes: DiagramNode[];
+  edges: DiagramEdge[];
+  /** false: the daemon couldn't read launchd, so process states are unknown */
+  processes_scanned?: boolean;
+}
+
 export interface Snapshot {
   schema: 2;
   tier: Tier;
@@ -362,6 +402,8 @@ export interface Snapshot {
   brain_activity: BrainActivity;
   trust_rule_count: number;
   repo_count: number;
+  /** PER-277; absent from a daemon before it */
+  diagram?: Diagram | null;
 }
 
 /** A normalized snapshot; `legacy` is set when it came from a schema 1 push (no detail). */

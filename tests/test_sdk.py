@@ -175,6 +175,30 @@ def test_bad_repos_refused(repos: list[str]) -> None:
         manifest(repos=repos)
 
 
+def test_job_descriptions_and_launch_agents_are_optional_display_fields() -> None:
+    """PER-277: shown on the dashboard's diagram; they grant nothing."""
+    job = {"id": "close", "schedule": "10 16 * * 1-5", "run": "python3 x.py", "effect": "read"}
+    m = manifest(jobs=[job])
+    assert m.jobs[0].description == "" and m.launch_agents == ()
+    m = manifest(
+        jobs=[{**job, "description": "reads paper.db and adds the day's P&L"}],
+        launch_agents=[{"label": "com.tradejev.paper", "description": "the trading loop"},
+                       {"label": "com.tradejev.view"}],
+    )  # fmt: skip
+    assert m.jobs[0].description.startswith("reads paper.db")
+    assert [a.label for a in m.launch_agents] == ["com.tradejev.paper", "com.tradejev.view"]
+    for bad in (
+        {"jobs": [{**job, "description": "two\nlines"}]},
+        {"jobs": [{**job, "description": "x" * 161}]},
+        {"launch_agents": [{"label": "bad label"}]},
+        {"launch_agents": [{"label": "com.x.y"}, {"label": "com.x.y"}]},
+        {"launch_agents": [{"label": f"com.x.a{i}"} for i in range(11)]},
+        {"launch_agents": [{"label": "com.x.y", "run": "evil"}]},
+    ):
+        with pytest.raises(ValidationError):
+            manifest(**bad)
+
+
 def test_description_examples_and_names() -> None:
     m = manifest(description="d" * 120, examples=["what time is it", "e" * 80])
     assert m.description and len(m.examples) == 2
