@@ -1,6 +1,7 @@
-"""The architecture diagram's parts (PER-277): the curated core skeleton, the launchd scan and
-the plain-words sentences. ``dashboard.snapshot`` assembles them, with the extensions from the
-installed manifests and health and last runs from the store, into ``Snapshot.diagram``.
+"""The architecture diagram's parts (PER-277, PER-278): the curated core skeleton and the
+high-level groups the Diagram tab starts from, the launchd scan and the plain-words sentences.
+``dashboard.snapshot`` assembles them, with the extensions from the installed manifests and
+health and last runs from the store, into ``Snapshot.diagram``.
 
 Nothing here is hand-kept per install. The only curated part is :data:`CORE`, Resonant's own
 skeleton (the boxes of docs/architecture.md), and :data:`CORE_EDGES` between them; a test
@@ -41,6 +42,65 @@ class CoreComponent:
     module: str  # where it lives, repo-relative (``resonant/...`` is under packages/resonant/src)
     text: str  # one sentence on its job
     check: str | None = None  # its health check (``monitor.CHECKS`` or ``relay``)
+    group: str = ""  # the top-level box it sits in (a :data:`GROUPS` id)
+
+
+@dataclass(frozen=True)
+class DiagramGroupDef:
+    id: str
+    label: str
+    text: str  # one sentence on what the group does
+
+
+# The high-level boxes the Diagram tab starts from (PER-278), in flow order. Every core
+# component names one; core jobs sit in ``scheduler``, launchd agents in ``processes`` and
+# every extension (its tools, jobs, MCP servers and repos nest under it) in ``extensions``.
+GROUPS: Final[tuple[DiagramGroupDef, ...]] = (
+    DiagramGroupDef(
+        "messages", "Messages in and out",
+        "Texts come in over iMessage, the event loop queues them and the qwen router triages "
+        "them; replies, approval asks, pulses and briefings go back out the same way.",
+    ),
+    DiagramGroupDef(
+        "brain", "Claude brain",
+        "One long-lived Claude Code session answers every text the router hands on and calls "
+        "Resonant's tools through the gate.",
+    ),
+    DiagramGroupDef(
+        "toolcore", "Gate and tool core",
+        "Every tool call takes one path: the registry, the gate (which asks you by text when it "
+        "must) and the executor, which runs it once and audits it.",
+    ),
+    DiagramGroupDef(
+        "workers", "Workers",
+        "Claude Code runs on their own branch copies of a repo; they push PRs and report back.",
+    ),
+    DiagramGroupDef(
+        "scheduler", "Scheduler and jobs",
+        "In-daemon cron for Resonant's own jobs and every extension's jobs, all through the "
+        "tool core.",
+    ),
+    DiagramGroupDef(
+        "extensions", "Extensions",
+        "What you installed: each extension with its MCP servers, tools, jobs and repos, from "
+        "the manifest you approved.",
+    ),
+    DiagramGroupDef(
+        "store", "Store and backups",
+        "One SQLite file holds tasks, approvals, runs and the audit log, copied every day.",
+    ),
+    DiagramGroupDef(
+        "relay", "Dashboard and relay",
+        "This page, served on the Mini and, from the snapshot pushed to Supabase every minute, "
+        "by the Fly app that also watches for silence.",
+    ),
+    DiagramGroupDef(
+        "processes", "launchd agents",
+        "The Mac's launchd agents Resonant knows: its own, those an extension declares and those "
+        "named after a registered repo.",
+    ),
+)  # fmt: skip
+GROUP_IDS: Final = frozenset(g.id for g in GROUPS)
 
 
 # The skeleton, in the order a text flows through it. Each ``module`` is named in
@@ -51,12 +111,14 @@ CORE: Final[tuple[CoreComponent, ...]] = (
         "Reads new texts from Messages' chat.db and sends Resonant's replies, approval asks, "
         "pulses and briefings back over iMessage.",
         check="imessage",
+        group="messages",
     ),
     CoreComponent(
         "loop", "Event loop", "resonant/loop/",
         "Turns every text, job and worker event into a durable task and runs the tasks by "
         "priority within the slot pool.",
         check="loop",
+        group="messages",
     ),
     CoreComponent(
         "router", "qwen router", "resonant/router/",
@@ -64,73 +126,87 @@ CORE: Final[tuple[CoreComponent, ...]] = (
         "itself, builds the news check in code and hands everything else to Claude; it never "
         "writes a fact.",
         check="model",
+        group="messages",
     ),
     CoreComponent(
         "brain", "Claude brain", "resonant/runners/brain.py",
         "One long-lived Claude Code session on the subscription answers every other text in "
         "Resonant's one voice and calls Resonant's tools through the gate.",
+        group="brain",
     ),
     CoreComponent(
         "toolcore", "Tool core", "resonant/toolcore/",
         "The one call path for the brain, jobs and watches: the registry, then the gate, then "
         "the executor; a boundary test keeps every call on it.",
+        group="toolcore",
     ),
     CoreComponent(
         "gate", "Gate and policy", "resonant/gate/",
         "Weighs each call's level against who chose it, applies trust rules and standing "
         "allows, and asks the owner by text (yes, yes always or yes <code>) when it must.",
+        group="toolcore",
     ),
     CoreComponent(
         "executor", "Executor", "resonant/executor.py",
         "Runs an allowed call once (idempotency key), reads its Keychain secrets just before "
         "the call and writes the audit row.",
+        group="toolcore",
     ),
     CoreComponent(
         "scheduler", "Scheduler", "resonant/extensions/scheduler.py",
         "In-daemon cron: runs Resonant's own jobs (pulse, briefing, backups, prune, MCP drift) "
         "and every extension's jobs through the tool core; due runs are skipped while paused.",
+        group="scheduler",
     ),
     CoreComponent(
         "workers", "Claude workers", "resonant/runners/claude.py",
         "Claude Code runs, each on its own branch copy of a repo in ~/code or a scratch dir, push "
         "PRs with a one-hour GitHub App token for one repo and ask or note over the worker desk.",
+        group="workers",
     ),
     CoreComponent(
         "pulse", "Reports, pulse and briefing", "resonant/extensions/pulse_job.py",
         "Collects run outcomes and extension reports as pulse items: urgent ones text at once, "
         "the rest go in the hourly pulse or the 08:00 briefing.",
+        group="messages",
     ),
     CoreComponent(
         "store", "Store (SQLite)", "resonant/store/",
         "One SQLite file (WAL) with tasks, events, approvals, runs, trust rules, repos, pulse "
         "items, the audit log and kv state.",
         check="store",
+        group="store",
     ),
     CoreComponent(
         "backups", "Backups", "resonant/backup.py",
         "core/backup copies the store every day with SQLite's online backup and keeps 7 daily "
         "and 4 weekly copies; core/prune trims old rows after a good backup.",
         check="backup",
+        group="store",
     ),
     CoreComponent(
         "dashboard", "Local dashboard", "resonant/api.py",
         "Serves this page and /api/dashboard on 127.0.0.1:7777, loopback only.",
+        group="relay",
     ),
     CoreComponent(
         "relay", "Relay pusher", "resonant/dashboard/pusher.py",
         "Pushes the redacted remote snapshot to Supabase every minute; nothing connects into "
         "the Mini.",
         check="relay",
+        group="relay",
     ),
     CoreComponent(
         "supabase", "Supabase", "supabase/",
         "Keeps the latest snapshot behind an insert-only RPC that refuses secret-shaped text; "
         "only the owner, with password and TOTP, can read it.",
+        group="relay",
     ),
     CoreComponent(
         "fly", "Fly dashboard and dead-man switch", "relay/",
         "The Fly app serves this page from Supabase and checks the newest snapshot every "
         "minute; a stale snapshot or a failing check alerts the owner on ntfy.",
+        group="relay",
     ),
 )  # fmt: skip
 
