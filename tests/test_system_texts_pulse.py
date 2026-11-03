@@ -66,7 +66,7 @@ def test_migration_024_keeps_rows_and_ids_and_widens_the_kinds(tmp_path: Path) -
     conn.commit()
     before = [tuple(r) for r in conn.execute("SELECT * FROM system_texts ORDER BY id")]
 
-    assert migrate(conn) == 24 == schema_version(conn)
+    assert migrate(conn, through(24)) == 24 == schema_version(conn)
     assert [tuple(r) for r in conn.execute("SELECT * FROM system_texts ORDER BY id")] == before
     # the AUTOINCREMENT mark is carried: a pruned id is never reused
     system_texts.record(conn, OWNER, "pulse", "btw:\n[a] x", ref="pulse:2026-10-13:09", now=T9)
@@ -94,7 +94,7 @@ def test_migration_024_keeps_rows_and_ids_and_widens_the_kinds(tmp_path: Path) -
 def test_migration_024_on_an_empty_table(tmp_path: Path) -> None:
     conn = connect(tmp_path / "empty.db")
     migrate(conn, through(23))
-    assert migrate(conn) == 24
+    assert migrate(conn, through(24)) == 24
     system_texts.record(conn, OWNER, "pulse", "btw:\n[a] x", ref="k")
     assert [t.id for t in rows(conn)] == [1]
     conn.close()

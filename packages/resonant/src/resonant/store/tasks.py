@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime
 from typing import Any, cast
 
 from resonant.loop.types import TERMINAL, NewTask, Task, TaskStatus, WaitReason
+from resonant.store import task_titles
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, now_iso
 from resonant_sdk import Event, new_id
+
+log = logging.getLogger(__name__)
 
 
 def _dt(v: str | None) -> datetime | None:
@@ -53,16 +57,36 @@ def row_to_task(r: sqlite3.Row) -> Task:
         channel_ref=_json(r["channel_ref"]),
         result=_json(r["result"]),
         error=r["error"],
+        title=r["title"],
+        title_outside=bool(r["title_outside"]),
     )
 
 
 def insert_task(conn: sqlite3.Connection, spec: NewTask) -> str:
+    """Insert ``spec`` as a queued task. Its title (PER-279) is ``spec.title``, else derived
+    from what the task is (``task_titles.derive``), redacted either way."""
     task_id = new_id()
     ts = now_iso()
+    if spec.title is not None:
+        title, outside = task_titles.clean(spec.title), False
+    else:
+        try:
+            found = task_titles.derive(
+                conn,
+                kind=spec.kind,
+                checkpoint=spec.checkpoint,
+                origin_event_id=spec.origin_event_id,
+            )
+        except Exception:  # a title is best-effort: never what stops a task
+            log.warning("task title: couldn't derive one for a %s task", spec.kind, exc_info=True)
+            found = None
+        title = task_titles.clean(found.text) if found else None
+        outside = found is not None and found.outside
     conn.execute(
         """INSERT INTO tasks (id, kind, runner, extension, principal, lane, priority, checkpoint,
-               scope, origin_event_id, channel_ref, trace_id, wake_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               scope, origin_event_id, channel_ref, trace_id, wake_at, created_at, updated_at,
+               title, title_outside)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task_id,
             spec.kind,
@@ -79,6 +103,8 @@ def insert_task(conn: sqlite3.Connection, spec: NewTask) -> str:
             None if spec.wake_at is None else iso(spec.wake_at),
             ts,
             ts,
+            title,
+            int(outside and title is not None),
         ),
     )
     return task_id

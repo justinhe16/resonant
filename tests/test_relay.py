@@ -412,6 +412,8 @@ async def test_a_plain_yes_with_no_approval_open_answers_the_question(
     assert workers.answers == [("R4", "yes", 1)]
     assert h.channel.replies() == ["→ R4"]
     assert h.tasks("reply")[-1]["title"] == RELAY_TITLE
+    titles = [r[0] for r in h.db.execute("SELECT title FROM tasks WHERE kind = 'reply'")]
+    assert titles[-1] == "Reply to R4"  # PER-279
 
 
 async def test_a_plain_yes_with_both_open_binds_neither(make: Callable[[], Harness]) -> None:

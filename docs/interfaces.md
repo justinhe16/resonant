@@ -36,6 +36,7 @@ class Event(BaseModel, extra="forbid", frozen=True):
 | `checkpoint` | opaque JSON owned by the runner, written every step |
 | `claude_session_id`, `worktree_path`, `scope` | runner state that must survive a crash |
 | `origin_event_id`, `channel_ref`, `trace_id` | provenance, where to reply, and tracing |
+| `title`, `title_outside` | PER-279, migration 025: a short human line for the dashboard (`Look up net worth`), set once by `insert_task`: `NewTask.title`, else `store/task_titles.derive` in code (no model call): an owner's text, its cleaned first six words from the origin event (`Photo or file` for media with none); a job `<ext>/<job>`; a watch `Watch W3: <what>`; a run its ask's first eight words (`Merge R4: …` for a merge watch); an ask the owner's own words, else the question; a reminder `Reminder: <text>`; a reply or command its code-built title; a refused approval or batch reply `Approval reply: <reason>` (never the typed code), a worker reply `Reply to R4`. Redacted (`redact.clip_text`, 80 chars) before it is stored. `title_outside` is 1 when the words came from outside text (a tainted task's question or ask). Existing rows are backfilled by 025's Python step (`task_titles.backfill`, run by `store.db.migrate` in the same transaction) |
 
 ## Runner: `resonant.loop.types`
 

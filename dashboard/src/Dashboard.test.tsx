@@ -33,16 +33,24 @@ const section = (id: string) => screen.getByTestId(`section-${id}`);
 const trigger = (id: string) =>
   within(within(section(id)).getByRole("heading", { level: 2 })).getByRole("button");
 const ASK12 = "Add a dashboard job to CI that rebuilds the UI and fails if dist differs";
+/** PER-279: Extensions right under the approvals, then Pulse; the rest keep their order. */
 const HEADS = [
   "Waiting on you (3)",
+  "Extensions (3 of 3)",
+  "Pulse (3 of 3)",
   "Recent runs (3 of 8)",
   "Tasks (3 of 46)",
-  "Claude (2 of 4)",
-  "Extensions (3 of 3)",
+  "Claude tool calls (2 of 4)",
   "Jobs (3 of 3)",
-  "Pulse (3 of 3)",
   "Rules and repos (6)",
 ];
+/** The one-line row (PER-279) that holds `text`. */
+const rowOf = (text: string | RegExp, el: HTMLElement = document.body) => within(el).getByText(text).closest("li")!;
+/** Opens the detail dialog of the row that holds `text` (the row's one link). */
+async function openRow(u: ReturnType<typeof user>, text: string | RegExp, el?: HTMLElement) {
+  await u.click(within(rowOf(text, el)).getAllByRole("link")[0]!);
+  return screen.findByRole("dialog");
+}
 
 describe("Dashboard, local tier", () => {
   it("shows the system status at a glance", async () => {
@@ -81,33 +89,36 @@ describe("Dashboard, local tier", () => {
     expect(within(screen.getByTestId("column-left")).getByRole("heading", { level: 1 })).toBeInTheDocument();
   });
 
-  it("shows an approval batch as one row with its changes", async () => {
+  it("shows an approval batch as one line, with its changes and code in the dialog", async () => {
+    const u = user();
     mount(local);
     await ready();
-    const row = screen.getByText("3 changes").closest("li")!;
-    const changes = within(row).getByRole("list", { name: "Changes" });
+    const row = rowOf("3 changes");
+    expect(within(row).queryByRole("list", { name: "Changes" })).not.toBeInTheDocument();
+    expect(within(row).queryByText(/D7/)).not.toBeInTheDocument();
+    expect(within(row).getByText("L2")).toBeInTheDocument(); // the batch's strictest
+    expect(within(row).getByText("expires in 55m")).toBeInTheDocument();
+    expect(within(row).getByText("5m")).toBeInTheDocument(); // asked
+    const dialog = await openRow(u, "3 changes");
+    const changes = within(dialog).getByRole("list", { name: "Changes" });
     expect(within(changes).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
       '1.linear: save issue title="Retry the relay push"outsideL3',
       '2.linear: save comment issue="PER-263"outsideL3',
       "3.restart resonantoutsideL2",
     ]);
-    expect(within(row).getByText("code D7")).toBeInTheDocument();
-    expect(within(row).getByText("one answer for all")).toBeInTheDocument();
-    expect(within(row).getByText("expires in 55 min")).toBeInTheDocument();
-    expect(within(row).getAllByText("L2")).toHaveLength(2); // the batch's strictest, and change 3
-    // A lone approval has no change list.
-    const lone = screen.getByText("merge_pr github: example/resonant#81").closest("li")!;
-    expect(within(lone).queryByRole("list", { name: "Changes" })).not.toBeInTheDocument();
-    expect(within(lone).queryByText("one answer for all")).not.toBeInTheDocument();
-    expect(within(lone).getByText("code K7Q2")).toBeInTheDocument();
+    expect(within(dialog).getByText("D7")).toBeInTheDocument(); // the code, local tier only
+    expect(within(dialog).getByText("ap_d7b")).toBeInTheDocument(); // one answer for all
   });
 
   it("lists recently decided approvals", async () => {
+    const u = user();
     mount(local);
     await ready();
-    const row = screen.getByText("push resonant r8-hourly").closest("li")!;
+    const row = rowOf("push resonant r8-hourly");
     expect(within(row).getByText("approved")).toBeInTheDocument();
-    expect(within(row).getByText("owner 14 h ago")).toBeInTheDocument();
+    expect(within(row).getByText("14h")).toBeInTheDocument();
+    const dialog = await openRow(u, "push resonant r8-hourly");
+    expect(within(dialog).getByText("owner")).toBeInTheDocument(); // decided by
   });
 
   it("shows run, task, question, pulse and job rows from the snapshot", async () => {
@@ -115,46 +126,66 @@ describe("Dashboard, local tier", () => {
     mount(local);
     await ready();
     const left = screen.getByTestId("column-left");
-    const right = screen.getByTestId("column-right");
     expect(within(left).getByText(ASK12)).toBeInTheDocument();
-    expect(within(left).getByText("waiting (question)")).toBeInTheDocument();
-    expect(within(left).queryByText("R10")).not.toBeInTheDocument();
-    expect(within(right).getByText("R10")).toBeInTheDocument(); // ready
-    expect(screen.getByRole("link", { name: "PR #81" })).toHaveAttribute(
-      "href",
-      "https://github.com/example/resonant/pull/81",
+    expect(within(rowOf("R11", left)).getByText("waiting").closest("[title]")).toHaveAttribute(
+      "title",
+      "waiting: question",
     );
-    expect(screen.getByText("(a) bump runtime")).toBeInTheDocument();
+    expect(within(left).queryByText("R10")).not.toBeInTheDocument();
+    expect(within(section("runs")).getByText("R10")).toBeInTheDocument(); // ready
+    expect(screen.queryByRole("link", { name: "PR #81" })).not.toBeInTheDocument(); // in the dialog
+    expect(within(rowOf(/The new client drops Python/)).getByText("R11")).toBeInTheDocument();
+    expect(screen.queryByText("(a) bump runtime")).not.toBeInTheDocument(); // in the dialog
     expect(screen.getByText("merge_pr github: example/resonant#81")).toBeInTheDocument();
     expect(screen.getByText("L1")).toBeInTheDocument();
-    expect(screen.getByText("expires in 50 min")).toBeInTheDocument();
+    expect(screen.getByText("expires in 50m")).toBeInTheDocument();
     expect(screen.getByText("3 open")).toBeInTheDocument();
     // Pulse: urgent first.
     const pulse = screen.getByText("Rain after 4pm").closest("ul")!;
     expect(within(pulse).getAllByRole("listitem")[0]).toHaveTextContent("R11 asked a question");
-    // Extensions list their jobs; the third has none.
-    expect(screen.getByText("2 fails in a row")).toBeInTheDocument();
-    expect(screen.getByText("No scheduled jobs.")).toBeInTheDocument();
+    // Extensions: one line each; a failing job shows in the hint, the jobs are in the dialog.
+    expect(within(rowOf("github", section("extensions"))).getByText("2 jobs")).toBeInTheDocument();
+    expect(within(rowOf("weather", section("extensions"))).getByText(/^muted until /)).toBeInTheDocument();
+    expect(within(rowOf("notes-sync", section("extensions"))).getByText("disabled")).toBeInTheDocument();
+    expect(screen.queryByText("No scheduled jobs.")).not.toBeInTheDocument();
     expect(within(section("jobs")).getByText("briefing")).toBeInTheDocument();
     await u.click(trigger("rules"));
     expect(screen.getByText("ask merge on trading")).toBeInTheDocument();
     expect(screen.getByText("no CI")).toBeInTheDocument();
   });
 
-  it("says how many side effects were detected per run", async () => {
+  it("says how many side effects were detected per run, in its dialog", async () => {
+    const u = user();
     mount(local);
-    expect(await screen.findByText("2 side effects detected")).toBeInTheDocument();
-    expect(screen.getByText("1 side effect detected")).toBeInTheDocument();
-    expect(screen.getAllByText(/side effects? detected/)).toHaveLength(2); // none for a run with 0
+    await ready();
+    expect(screen.queryByText(/side effects? detected/)).not.toBeInTheDocument(); // not on the rows
+    const dialog = await openRow(u, ASK12);
+    expect(within(dialog).getByText("2 detected in its commands")).toBeInTheDocument();
   });
 
   it("shows the Remote Control link only where the snapshot carries it", async () => {
+    const u = user();
     mount(local);
     await ready();
     expect(screen.getAllByRole("link", { name: "Remote Control" }).map((a) => a.getAttribute("href"))).toEqual([
-      "https://claude.ai/code/session_r12",
       "https://claude.ai/code/session_brain",
     ]);
+    const dialog = await openRow(u, ASK12);
+    expect(within(dialog).getByRole("link", { name: "Open session" })).toHaveAttribute(
+      "href",
+      "https://claude.ai/code/session_r12",
+    );
+  });
+
+  it("shows each task's title with its local creation time", async () => {
+    mount(local);
+    await ready();
+    const tasks = section("tasks");
+    const row = rowOf(/^Add a dashboard job to CI · /, tasks);
+    expect(row).toHaveTextContent(/Add a dashboard job to CI · \d{1,2}:\d{2}(am|pm)( \S+)?, Oct 1[56]/);
+    expect(within(row).getByText("4f1a9c")).toHaveAttribute("title", "t_4f1a9c"); // the id's tail
+    expect(within(row).getByText("running")).toBeInTheDocument();
+    expect(within(row).getAllByRole("link")).toHaveLength(1); // the whole row opens the task
   });
 
   it("refuses non-https PR links", async () => {
@@ -188,15 +219,13 @@ describe("outside text", () => {
   it("badges text a worker wrote, and not the Resonant-made kind", async () => {
     mount(local);
     await ready();
-    // R11's ask is tainted; R12's ask is not (only its note and side effects are outside).
-    const r11 = screen.getByText(/The new client drops Python/).closest("li")!;
-    expect(r11).toBeTruthy();
+    // R11's ask is tainted; R12's ask is not (its note and side effects are in its dialog).
     const r11Row = screen.getByText("Bump the exchange client and rerun the backtest").closest("li")!;
     expect(badges(r11Row)).toHaveLength(1);
     const r12Row = screen.getByText(ASK12).closest("li")!;
     const ask = within(r12Row).getByText("Add a dashboard job to CI that rebuilds the UI and fails if dist differs");
     expect(ask.querySelector("button")).toBeNull(); // no badge inside the ask
-    expect(badges(r12Row)).toHaveLength(1); // its last note
+    expect(badges(r12Row)).toHaveLength(0);
     // A pulse notice from core carries no badge; an extension's title does.
     expect(badges(screen.getByText("Rain after 4pm").closest("li")!)).toHaveLength(1);
   });
@@ -253,6 +282,33 @@ describe("collapsible sections", () => {
     expect(trigger("runs")).toHaveAttribute("aria-expanded", "true");
     await u.click(trigger("runs"));
     expect(localStorage.getItem("resonant.section.runs")).toBe("closed");
+  });
+
+  it("keeps each section's remembered state after the reorder (PER-279)", async () => {
+    // Keys are per section id, not per position: moving Extensions and Pulse up keeps them.
+    localStorage.setItem("resonant.section.extensions", "open");
+    localStorage.setItem("resonant.section.pulse", "closed");
+    localStorage.setItem("resonant.section.claude", "open");
+    mount(local);
+    await ready();
+    const order = within(screen.getByTestId("column-right"))
+      .getAllByTestId(/^section-/)
+      .map((el) => el.dataset.testid);
+    expect(order).toEqual([
+      "section-waiting",
+      "section-extensions",
+      "section-pulse",
+      "section-runs",
+      "section-tasks",
+      "section-claude",
+      "section-jobs",
+      "section-rules",
+    ]);
+    expect(trigger("extensions")).toHaveAttribute("aria-expanded", "true");
+    expect(trigger("pulse")).toHaveAttribute("aria-expanded", "false");
+    // The renamed section keeps its id, so its stored state still applies.
+    expect(trigger("claude")).toHaveAttribute("aria-expanded", "true");
+    expect(within(section("claude")).getByRole("heading", { level: 2 })).toHaveTextContent(/^Claude tool calls/);
   });
 
   it("lets a remembered 'closed' override an open default", async () => {
@@ -319,7 +375,7 @@ describe("explainers", () => {
     ["Waiting on you", /Resonant texts a prompt with a code/],
     ["Recent runs", /GitHub App token for that one repo/],
     ["Tasks", /survives restarts|survive restarts/],
-    ["Claude", /one long-lived Claude Code session/],
+    ["Claude tool calls", /Every tool call the Claude brain made/],
     ["Extensions", /resonant\.yaml/],
     ["Jobs", /run-cleanup: 04:30/],
     ["Pulse", /core\/pulse/],
@@ -346,7 +402,7 @@ describe("detail dialog", () => {
     const u = user();
     mount(local);
     await ready();
-    await u.click(within(section("active-runs")).getByRole("link", { name: "R12" }));
+    await u.click(within(section("active-runs")).getByRole("link", { name: ASK12 }));
     expect(window.location.hash).toBe("#/runs/R12");
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByRole("heading", { name: "Run R12" })).toBeInTheDocument();
@@ -451,8 +507,8 @@ describe("detail dialog", () => {
     await u.click(within(section("tasks")).getByRole("link", { name: "waiting: 1" }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByRole("heading", { name: "Tasks: waiting" })).toBeInTheDocument();
-    expect(within(dialog).getByText("t_77c0de")).toBeInTheDocument();
-    expect(within(dialog).getByText("t_8a0b11")).toBeInTheDocument();
+    expect(within(dialog).getByText(/^Bump the exchange client · /)).toBeInTheDocument();
+    expect(within(dialog).getByText(/^github\/watch · /)).toBeInTheDocument();
   });
 
   it("opens the runs behind a side-effect pill", async () => {
@@ -471,23 +527,26 @@ describe("detail dialog", () => {
     mount(local);
     await ready();
 
-    await u.click(within(screen.getByText("merge_pr github: example/resonant#81").closest("li")!).getByRole("link", { name: "details" }));
-    let dialog = await screen.findByRole("dialog");
+    let dialog = await openRow(u, "merge_pr github: example/resonant#81");
     expect(within(dialog).getByRole("heading", { name: "Approval" })).toBeInTheDocument();
     expect(within(dialog).getByText("K7Q2")).toBeInTheDocument(); // the code, in the local tier
     expect(within(dialog).getByRole("link", { name: "R10" })).toHaveAttribute("href", "#/runs/R10");
     await u.click(within(dialog).getByRole("button", { name: "Close" }));
 
-    await u.click(within(section("extensions")).getByRole("link", { name: "github" }));
-    dialog = await screen.findByRole("dialog");
+    dialog = await openRow(u, "github", section("extensions"));
     expect(window.location.hash).toBe("#/extensions/github");
     expect(within(dialog).getByRole("heading", { name: "github" })).toBeInTheDocument();
     expect(within(dialog).getByText("merge_pr")).toBeInTheDocument();
     expect(within(dialog).getByText("github_token")).toBeInTheDocument(); // a secret's name
+    expect(within(dialog).getByText("digest")).toBeInTheDocument(); // its jobs live here now
     await u.click(within(dialog).getByRole("button", { name: "Close" }));
 
-    await u.click(within(section("pulse")).getByRole("link", { name: "core/run/R11" }));
-    dialog = await screen.findByRole("dialog");
+    dialog = await openRow(u, "weather", section("extensions"));
+    expect(within(dialog).getByText("2 fails")).toBeInTheDocument(); // a failing job's streak
+    expect(within(dialog).getByText("muted")).toBeInTheDocument();
+    await u.click(within(dialog).getByRole("button", { name: "Close" }));
+
+    dialog = await openRow(u, "R11 asked a question", section("pulse"));
     expect(window.location.hash).toBe("#/pulse/core/run%2FR11");
     expect(within(dialog).getByRole("link", { name: "R11" })).toBeInTheDocument();
     await u.click(within(dialog).getByRole("button", { name: "Close" }));
@@ -498,8 +557,7 @@ describe("detail dialog", () => {
     expect(within(dialog).getByText("0 * * * *")).toBeInTheDocument();
     await u.click(within(dialog).getByRole("button", { name: "Close" }));
 
-    await u.click(within(section("tasks")).getByRole("link", { name: "t_4f1a9c" }));
-    dialog = await screen.findByRole("dialog");
+    dialog = await openRow(u, "4f1a9c", section("tasks"));
     expect(within(dialog).getByRole("link", { name: "R12" })).toBeInTheDocument();
   });
 
@@ -563,8 +621,9 @@ describe("Dashboard, remote tier", () => {
     await ready();
     expect(screen.getByText(ASK12)).toBeInTheDocument();
     expect(screen.getByText("merge_pr github: example/resonant#81")).toBeInTheDocument();
-    expect(screen.getByText("(a) bump runtime")).toBeInTheDocument();
+    expect(screen.getByText(/The new client drops Python/)).toBeInTheDocument();
     expect(screen.getByText("Rain after 4pm")).toBeInTheDocument();
+    expect(screen.getByText(/^Add a dashboard job to CI · /)).toBeInTheDocument(); // a task's title
     expect(screen.queryByText(/^code /)).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: "Remote Control" })).not.toBeInTheDocument();
     expect(screen.queryByText(/shown on the local dashboard only/)).not.toBeInTheDocument();
@@ -586,7 +645,7 @@ describe("Dashboard, remote tier", () => {
     await ready();
     expect(screen.getByTestId("pulse-untold")).toHaveTextContent("2 untold");
     expect(screen.getByTestId("pulse-muted")).toHaveTextContent("weather muted, ends in 3 h");
-    expect(screen.getAllByText("muted")).toHaveLength(1); // the weather extension's badge
+    expect(screen.getAllByText(/^muted until /)).toHaveLength(1); // the weather extension's hint
   });
 
   it("shows detected side effects as counts", async () => {

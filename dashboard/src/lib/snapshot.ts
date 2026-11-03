@@ -21,6 +21,7 @@ import type {
   QuestionItem,
   RunItem,
   Snapshot,
+  TaskItem,
 } from "@/types";
 
 /** Snapshot is considered stale after this many seconds without a newer `taken_at`. */
@@ -450,6 +451,17 @@ function fromV1(s: V1Snapshot): Normalized {
 }
 
 /** What an approval is when its summary isn't known (a schema 1 brief). */
+/** A run's title line: its ask's first line, else its repo, else its code. */
+export function runTitle(r: RunItem): string {
+  const first = r.ask.split("\n").find((l) => l.trim())?.trim();
+  return first || r.repo || `Run ${r.code}`;
+}
+
+/** A task's short human title (PER-279), else its label, else its kind. */
+export function taskTitle(t: TaskItem): string {
+  return t.title?.trim() || t.label?.trim() || t.kind;
+}
+
 export function approvalTitle(a: ApprovalItem): string {
   if (a.summary) return a.summary;
   const what = a.effect === "pay" ? "A payment" : a.effect === "read" ? "A read" : "A change";

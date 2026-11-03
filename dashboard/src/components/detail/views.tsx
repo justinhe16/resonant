@@ -1,15 +1,16 @@
 import type { ReactNode } from "react";
-import { Ago, Empty, ExternalLink, Group, Meta, OutsideText, RouteLink, Row, Rows, StateBadge } from "@/components/bits";
+import { Empty, ExternalLink, Group, OutsideText, RouteLink, Row, Rows, StateBadge } from "@/components/bits";
 import { ApprovalLinks, DiagramText, Missing, NodeLink, RunLines, RunLink, TaskLink, idChip } from "@/components/detail/links";
 import { F, Fields, Timeline, When } from "@/components/detail/parts";
 import { Badge } from "@/components/ui/badge";
 import { DecisionBadge } from "@/sections/Claude";
 import { JobRow } from "@/sections/Extensions";
 import { Changes } from "@/sections/WaitingOnYou";
+import { TaskRow } from "@/sections/Work";
 import { connections, KIND_LABEL } from "@/lib/diagram";
 import type { Route } from "@/lib/route";
 import { money, num } from "@/lib/format";
-import { approvalTitle, findApproval, githubLinks, isOutside, safeHttpsUrl } from "@/lib/snapshot";
+import { approvalTitle, findApproval, githubLinks, isOutside, safeHttpsUrl, taskTitle } from "@/lib/snapshot";
 import { span } from "@/lib/time";
 import { approvalTone, healthTone, levelTone, runTone, taskTone, urgencyTone } from "@/lib/tone";
 import type { Job, Snapshot } from "@/types";
@@ -130,6 +131,9 @@ function runView(code: string, { snap, now }: Ctx): View {
             {(run.tokens_in > 0 || run.tokens_out > 0) && `${num(run.tokens_in)} in, ${num(run.tokens_out)} out`}
           </F>
           <F label="Files changed">{run.files_changed > 0 && run.files_changed}</F>
+          <F label="Side effects">
+            {run.detected > 0 && `${run.detected} detected in its commands`}
+          </F>
           <F label="Exit code">{run.exit_code !== null && run.exit_code}</F>
           <F label="Merged">
             {run.merged.length > 0 && (
@@ -221,7 +225,7 @@ function taskView(id: string, { snap, now }: Ctx): View {
   if (!t)
     return notKept(`Task ${id}`, id, `it keeps ${snap.limits.tasks} tasks: the active ones, then the newest`, snap);
   return {
-    title: t.label ?? `Task ${t.id}`,
+    title: taskTitle(t),
     description: `Task ${t.id}`,
     body: (
       <div className="space-y-5">
@@ -229,6 +233,11 @@ function taskView(id: string, { snap, now }: Ctx): View {
           {t.status}
           {t.wait_reason ? ` (${t.wait_reason.replace(/_/g, " ")})` : ""}
         </StateBadge>
+        {t.title && isOutside(t, "title") && (
+          <p className="text-sm">
+            <OutsideText text={t.title} outside />
+          </p>
+        )}
         {t.error && (
           <Group label="Error">
             <p className="text-sm text-bad">
@@ -238,6 +247,7 @@ function taskView(id: string, { snap, now }: Ctx): View {
         )}
         <Fields>
           <F label="Kind">{t.kind}</F>
+          <F label="Label">{t.label && t.label !== taskTitle(t) && t.label}</F>
           <F label="Runner">{t.runner}</F>
           <F label="Extension">
             {t.extension && (
@@ -660,21 +670,7 @@ function tasksView(state: string | undefined, { snap, now }: Ctx): View {
       ) : (
         <Rows>
           {items.map((t) => (
-            <Row key={t.id} className="relative">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <RouteLink to={{ kind: "task", id: t.id }} stretch className="font-mono text-sm font-semibold">
-                    {t.id}
-                  </RouteLink>
-                  <span className="text-xs text-muted-foreground"> · {t.kind}</span>
-                  {t.label && <p className="line-clamp-2 text-sm">{t.label}</p>}
-                </div>
-                <StateBadge tone={taskTone(t.status)}>{t.status}</StateBadge>
-              </div>
-              <Meta>
-                <Ago iso={t.updated_at} now={now} prefix="updated " />
-              </Meta>
-            </Row>
+            <TaskRow key={t.id} task={t} now={now} />
           ))}
         </Rows>
       ),

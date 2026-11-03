@@ -266,6 +266,9 @@ class TaskItem(_Model):
     created_at: datetime
     updated_at: datetime
     label: Txt120 | None  # the checkpoint's title, or ``ext/job`` for a job
+    # PER-279: the short human title stored at creation (``tasks.title``); ``outside`` lists
+    # ``title`` when its words came from outside text. None for a task from before it.
+    title: Txt80 | None = None
     error: Txt300 | None
     run_code: Txt16 | None
     history: list[Event] = _list()
@@ -1474,6 +1477,12 @@ def _task_item(
     approval_ids: list[str],
 ) -> TaskItem:
     error = t.opt(task.error, 300)
+    title = t.opt(task.title, 80) if task.title and task.title.strip() else None
+    outside = [
+        name
+        for name, present in (("title", title and task.title_outside), ("error", error))
+        if present
+    ]
     return TaskItem(
         id=t(task.id, 64),
         kind=t(task.kind, 32),
@@ -1487,11 +1496,12 @@ def _task_item(
         created_at=task.created_at,
         updated_at=task.updated_at,
         label=_task_label(task, t),
+        title=title,
         error=error,
         run_code=ctx.run_code(task.id),
         history=_events(history)[-TASK_HISTORY:],
         approval_ids=approval_ids,
-        outside=["error"] if error else [],
+        outside=outside,
     )
 
 

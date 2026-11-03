@@ -1,5 +1,6 @@
 import { CollapsibleSection } from "@/components/CollapsibleSection";
-import { Ago, Counts, ExternalLink, Group, Meta, OutsideText, Row, RouteLink, Section, StateBadge } from "@/components/bits";
+import { Counts, Group, Section } from "@/components/bits";
+import { ListRow } from "@/components/ListRow";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import {
@@ -8,9 +9,11 @@ import {
   RUN_STATE_ORDER,
   isOutside,
   ordered,
-  safeHttpsUrl,
+  runTitle,
   sum,
+  taskTitle,
 } from "@/lib/snapshot";
+import { localStamp } from "@/lib/time";
 import { runTone, taskTone } from "@/lib/tone";
 import { toHash } from "@/lib/route";
 import { cn } from "@/lib/utils";
@@ -154,100 +157,41 @@ function DetectedEffects({ detected }: { detected: Snapshot["runs"]["detected"] 
   );
 }
 
+/** A run's one line: R11 · its ask · state · when it ended (or started); the repo as the hint. */
 export function RunRow({ run, now }: { run: RunItem; now: number }) {
-  const prUrl = safeHttpsUrl(run.pr_url);
-  const remoteUrl = safeHttpsUrl(run.remote_url);
+  const waiting = run.waiting_reason ? `waiting: ${run.waiting_reason.replace(/_/g, " ")}` : undefined;
   return (
-    <Row className="relative">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-xs text-muted-foreground">
-            <RouteLink to={{ kind: "run", code: run.code }} stretch className="font-mono font-semibold text-foreground">
-              {run.code}
-            </RouteLink>
-            {run.repo && <span> · {run.repo}</span>}
-          </p>
-          {run.ask && (
-            <p className="mt-0.5 line-clamp-2 text-sm">
-              <OutsideText text={run.ask} outside={isOutside(run, "ask")} />
-            </p>
-          )}
-        </div>
-        <StateBadge tone={runTone(run.state)}>
-          {run.state}
-          {run.waiting_reason ? ` (${run.waiting_reason.replace(/_/g, " ")})` : ""}
-        </StateBadge>
-      </div>
-      {run.last_note && (
-        <p className="mt-1.5 text-xs text-muted-foreground italic">
-          “<OutsideText text={run.last_note} outside={isOutside(run, "last_note")} />”
-        </p>
-      )}
-      <Meta>
-        {run.ended_at ? (
-          <Ago iso={run.ended_at} now={now} prefix="ended " />
-        ) : (
-          <Ago iso={run.started_at} now={now} prefix="started " />
-        )}
-        {run.branch && <span className="truncate font-mono">{run.branch}</span>}
-        {!!run.detected && (
-          <span>
-            {run.detected} side effect{run.detected === 1 ? "" : "s"} detected
-          </span>
-        )}
-        {prUrl && (
-          <span className="relative z-10">
-            <ExternalLink href={prUrl}>PR #{run.pr_number ?? "?"}</ExternalLink>
-          </span>
-        )}
-        {remoteUrl && (
-          <span className="relative z-10">
-            <ExternalLink href={remoteUrl}>Remote Control</ExternalLink>
-          </span>
-        )}
-      </Meta>
-    </Row>
+    <ListRow
+      to={{ kind: "run", code: run.code }}
+      refText={run.code}
+      title={runTitle(run)}
+      outside={!!run.ask && isOutside(run, "ask")}
+      pill={{ tone: runTone(run.state), label: run.state.replace(/_/g, " "), title: waiting }}
+      hint={run.repo || undefined}
+      time={run.ended_at ?? run.started_at ?? run.created_at}
+      now={now}
+      testId="run-row"
+    />
   );
 }
 
+/** A task's one line: its title with its local creation time (``Look up net worth · 9:30am PT,
+ * Oct 26``) · state · last update. A task from before titles shows its label or kind. */
 export function TaskRow({ task, now }: { task: TaskItem; now: number }) {
+  const waiting = task.wait_reason ? `waiting: ${task.wait_reason.replace(/_/g, " ")}` : undefined;
+  const stamp = localStamp(task.created_at);
+  const name = taskTitle(task);
   return (
-    <Row className="relative">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-xs text-muted-foreground">
-            <RouteLink to={{ kind: "task", id: task.id }} stretch className="font-mono font-semibold text-foreground">
-              {task.id}
-            </RouteLink>
-            <span>
-              {" "}
-              · {task.kind}
-              {task.extension ? ` · ${task.extension}` : ""}
-            </span>
-          </p>
-          {task.label && <p className="mt-0.5 line-clamp-2 text-sm">{task.label}</p>}
-        </div>
-        <StateBadge tone={taskTone(task.status)}>
-          {task.status}
-          {task.wait_reason ? ` (${task.wait_reason.replace(/_/g, " ")})` : ""}
-        </StateBadge>
-      </div>
-      {task.error && (
-        <p className="mt-1.5 text-xs text-bad">
-          <OutsideText text={task.error} outside={isOutside(task, "error")} />
-        </p>
-      )}
-      <Meta>
-        <Ago iso={task.updated_at} now={now} prefix="updated " />
-        {task.attempts > 1 && <span>{task.attempts} attempts</span>}
-        {task.run_code && (
-          <span className="relative z-10">
-            <RouteLink to={{ kind: "run", code: task.run_code }} className="font-mono font-medium text-info">
-              {task.run_code}
-            </RouteLink>
-          </span>
-        )}
-      </Meta>
-    </Row>
+    <ListRow
+      to={{ kind: "task", id: task.id }}
+      refText={task.id.slice(-6)}
+      refTitle={task.id}
+      title={stamp ? `${name} · ${stamp}` : name}
+      outside={!!task.title && isOutside(task, "title")}
+      pill={{ tone: taskTone(task.status), label: task.status, title: waiting }}
+      time={task.updated_at}
+      now={now}
+      testId="task-row"
+    />
   );
 }

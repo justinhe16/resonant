@@ -1,6 +1,5 @@
 import { CollapsibleSection } from "@/components/CollapsibleSection";
-import { Ago, Empty, Meta, Row, RouteLink, Rows, StateBadge } from "@/components/bits";
-import { Badge } from "@/components/ui/badge";
+import { ListRow } from "@/components/ListRow";
 import { absolute } from "@/lib/time";
 import { healthTone, outcomeTone } from "@/lib/tone";
 import type { Extension, Job, Snapshot } from "@/types";
@@ -20,70 +19,48 @@ export function Extensions({ snap, now }: { snap: Snapshot; now: number }) {
   );
 }
 
+/** An extension's one line: name · what it is · health · its newest job run; muted and job
+ * counts as the hint. Tools, jobs and the rest are in its dialog. */
 function ExtensionRow({ ext, now }: { ext: Extension; now: number }) {
   const muted = !!ext.muted_until && Date.parse(ext.muted_until) > now;
+  const last = ext.jobs.map((j) => j.last_run_at).filter((t): t is string => !!t).sort().at(-1) ?? null;
+  const failing = ext.jobs.some((j) => j.fail_streak > 0);
+  const jobs = `${ext.jobs.length} job${ext.jobs.length === 1 ? "" : "s"}`;
   return (
-    <Row className="relative">
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <h3 className="text-sm font-medium">
-            <RouteLink to={{ kind: "extension", name: ext.name }} stretch className="font-mono">
-              {ext.name}
-            </RouteLink>
-          </h3>
-          <p className="text-xs text-muted-foreground">
-            {ext.status.replace(/_/g, " ")} · {ext.tools.length} tool{ext.tools.length === 1 ? "" : "s"}
-          </p>
-        </div>
-        <span className="flex shrink-0 items-center gap-1.5">
-          {muted && (
-            <Badge variant="warn" title={`muted until ${absolute(ext.muted_until)}`}>
-              muted
-            </Badge>
-          )}
-          <StateBadge tone={healthTone(ext.health)}>{ext.health}</StateBadge>
-        </span>
-      </div>
-      {ext.description && (
-        <p className="mt-1.5 text-xs text-muted-foreground">{ext.description}</p>
-      )}
-      <div className="mt-2">
-        {ext.jobs.length === 0 ? (
-          <Empty>No scheduled jobs.</Empty>
-        ) : (
-          <Rows>
-            {ext.jobs.map((j) => (
-              <JobRow key={j.id} job={j} ext={ext.name} now={now} />
-            ))}
-          </Rows>
-        )}
-      </div>
-    </Row>
+    <ListRow
+      to={{ kind: "extension", name: ext.name }}
+      refText={ext.name}
+      title={ext.description || `${ext.tools.length} tool${ext.tools.length === 1 ? "" : "s"}`}
+      muted={!ext.description}
+      pill={
+        ext.status !== "enabled"
+          ? { tone: "warn", label: ext.status.replace(/_/g, " ") }
+          : { tone: healthTone(ext.health), label: ext.health }
+      }
+      hint={muted ? `muted until ${absolute(ext.muted_until)}` : failing ? `${jobs}, failing` : jobs}
+      time={last}
+      now={now}
+      testId="extension-row"
+    />
   );
 }
 
-/** One scheduled job (an extension's or a core one). */
+/** One scheduled job (an extension's or a core one): id · schedule · last outcome · last run. */
 export function JobRow({ job: j, ext, now }: { job: Job; ext: string; now: number }) {
+  const pill =
+    j.fail_streak > 0
+      ? { tone: "bad" as const, label: `${j.fail_streak} fail${j.fail_streak === 1 ? "" : "s"}`, title: j.last_outcome ?? undefined }
+      : { tone: outcomeTone(j.last_outcome), label: j.last_outcome ?? "not run", plain: true };
   return (
-    <Row className="relative grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 py-2.5 text-sm">
-      <RouteLink to={{ kind: "job", ext, id: j.id }} stretch className="font-mono text-xs">
-        {j.id}
-      </RouteLink>
-      <span className="flex items-center justify-end gap-1.5">
-        {j.fail_streak > 0 && (
-          <Badge variant="bad">
-            {j.fail_streak} fail{j.fail_streak === 1 ? "" : "s"} in a row
-          </Badge>
-        )}
-        <Badge variant={outcomeTone(j.last_outcome)}>{j.last_outcome ?? "not run"}</Badge>
-      </span>
-      <div className="col-span-2">
-        <Meta>
-          {j.schedule && <span className="font-mono">{j.schedule}</span>}
-          <Ago iso={j.last_run_at} now={now} prefix="last " />
-          {j.next_due && <Ago iso={j.next_due} now={now} prefix="next " />}
-        </Meta>
-      </div>
-    </Row>
+    <ListRow
+      to={{ kind: "job", ext, id: j.id }}
+      title={j.id}
+      mono
+      pill={pill}
+      hint={j.schedule ?? undefined}
+      time={j.last_run_at}
+      now={now}
+      testId="job-row"
+    />
   );
 }

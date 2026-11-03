@@ -58,6 +58,8 @@ class Task:
     channel_ref: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    title: str | None = None  # PER-279: a short human line (``store/task_titles.py``)
+    title_outside: bool = False  # its words came from outside text
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,8 @@ class NewTask:
     channel_ref: dict[str, Any] | None = None
     trace_id: str | None = None
     wake_at: datetime | None = None  # not before (e.g. a reminder's due time)
+    # PER-279: the task's short human title; None derives one (``store/task_titles.py``).
+    title: str | None = None
 
 
 # --- step outcomes -------------------------------------------------------------------

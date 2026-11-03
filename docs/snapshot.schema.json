@@ -2106,6 +2106,19 @@
           "title": "Step No",
           "type": "integer"
         },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
         "updated_at": {
           "format": "date-time",
           "title": "Updated At",

@@ -168,8 +168,18 @@ def migrate(conn: sqlite3.Connection, migrations: list[tuple[int, str]] | None =
                 continue  # another process applied it while we waited for the lock
             for stmt in statements:
                 conn.execute(stmt)
+            _after(conn, version)
             conn.execute(f"PRAGMA user_version = {version:d}")
     return schema_version(conn)
+
+
+def _after(conn: sqlite3.Connection, version: int) -> None:
+    """A migration's Python step, in its transaction: 025 backfills task titles (PER-279),
+    which needs the redaction pass. Each step is a no-op when its columns aren't there."""
+    if version == 25:
+        from resonant.store.task_titles import backfill  # store.db is imported by everything
+
+        backfill(conn)
 
 
 def _apply_foreign_keys_off(conn: sqlite3.Connection, version: int, statements: list[str]) -> None:

@@ -67,6 +67,7 @@ from resonant.router.fast_path import FastPath
 from resonant.router.intents import ExtensionCatalog, IntentLabel
 from resonant.router.relay import Relay, clash_text, plain_reply_clashes
 from resonant.store import approvals as ap
+from resonant.store import task_titles
 from resonant.store.db import utcnow
 from resonant.tools import ToolRegistry
 from resonant_sdk import Event, ToolSpec
@@ -163,7 +164,14 @@ class Router:
         spans: SpanFactory = partial(span, self.conn, trace_id=event.trace_id)
         channel_ref = _channel_ref(event, principal)
 
-        def reply(text: str, tool_used: str | None, intent: IntentLabel, title: str) -> NewTask:
+        def reply(
+            text: str,
+            tool_used: str | None,
+            intent: IntentLabel,
+            title: str,
+            *,
+            human: str | None = None,
+        ) -> NewTask:
             return NewTask(
                 kind=KIND_REPLY,
                 runner=RUNNER,
@@ -176,6 +184,7 @@ class Router:
                     "intent": intent,
                     "title": title,
                 },
+                title=human,  # PER-279; None derives it from ``title``
             )
 
         # A pending "For R4 or R6?" answers only the very next message, whatever it is.
@@ -218,8 +227,10 @@ class Router:
                 checkpoint={"title": MEDIA_TITLE},
             )
 
-        def relayed(text: str) -> NewTask:
-            return reply(text, None, "run_project", RELAY_TITLE)
+        def relayed(text: str, run_code: str | None = None) -> NewTask:
+            return reply(
+                text, None, "run_project", RELAY_TITLE, human=task_titles.worker_reply(run_code)
+            )
 
         # A plain yes/no while a worker question is open: the approval keeps it only when no
         # question competes; with both open, it binds neither (relay.py, "approval clash"),
@@ -249,11 +260,17 @@ class Router:
         if answered is not None:
             if answered.reply is None:
                 return None  # consumed: the woken runner sends the confirmation
-            return reply(answered.reply, None, "job_control", APPROVAL_TITLE)
+            return reply(
+                answered.reply,
+                None,
+                "job_control",
+                APPROVAL_TITLE,
+                human=task_titles.approval_reply(answered.reason),
+            )
 
         direct = None if voice else self.relay.direct(event, text, principal, stash)
         if direct is not None:
-            return relayed(direct.reply)
+            return relayed(direct.reply, direct.run_code)
 
         if cmd is not None and not cmd.slash:
             result = await self.fast_path.run(
@@ -269,7 +286,7 @@ class Router:
             else await self.relay.free(event, text, principal, "question", spans=spans)
         )
         if free is not None:
-            return relayed(free.reply)
+            return relayed(free.reply, free.run_code)
         with spans("router.brain", principal=principal):
             pass
         return NewTask(
