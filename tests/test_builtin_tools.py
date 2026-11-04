@@ -52,6 +52,7 @@ NAMES = {
     "update_resonant",
     "list_extensions",
     "mute_extension",
+    "read_panel",  # PER-280: an extension panel's last copy (untrusted)
     "pulse_preview",
     "open_items",
     "briefing_preview",

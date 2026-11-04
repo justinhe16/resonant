@@ -23,6 +23,8 @@ Only the things that need you, the owner, at the Mini or on your phone. Planned 
 - **An external uptime check** on https://resonant-relay-jhe.fly.dev/healthz (it returns 503 when the checker stalls). A Fly outage is otherwise silent.
 - **The ntfy alert channel:** the default is a public `ntfy.sh` topic, and the long random topic is the password. If missed pushes or that bother you, move to a protected topic (`NTFY_TOKEN`), your own ntfy server (`NTFY_URL`) or a webhook (`WEBHOOK_URL`) into SMS or email. No code change.
 
+- **Panels, phase 2 (PER-280):** a panels table of its own in the relay (so a panel isn't cut by the snapshot's size cap and can refresh faster than the snapshot), and panel `actions` (a button that calls one of the extension's tools through the normal gate). Neither is built; the contract reserves `actions` and the snapshot's `trimmed: panels` is the stopgap.
+
 ## Done
 
 The github and Linear extensions are installed and updated (2026-10-21), and the github token can merge (Contents and Pull requests write). The Claude login works, and the GitHub App and Resonant's own token are set. Daily backups run at 03:30. The old-runner leftovers are gone. The relay is live (PER-251, 2026-10-20): remote dashboard at https://resonant-relay-jhe.fly.dev/ and ntfy alerts if the Mini goes quiet.

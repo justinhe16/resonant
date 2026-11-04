@@ -41,7 +41,7 @@ import re
 import sqlite3
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, cast, get_args
 from urllib.parse import urlsplit
@@ -135,7 +135,7 @@ EffectKind = Literal[
 ]  # fmt: skip
 EffectName = Literal["read", "write", "pay"]
 ApprovalLevel = Literal["L0", "L1", "L2", "L3"]
-Trimmed = Literal["none", "history", "lists", "detail", "items"]
+Trimmed = Literal["none", "history", "panels", "lists", "detail", "items"]
 
 # Identifiers: health check names (``model``, ``ext:github``), extension names and job ids (the
 # SDK's slugs, owner-chosen but never message content). A row whose identifier doesn't match
@@ -176,6 +176,7 @@ Txt300 = Annotated[str, _txt(300)]
 Txt400 = Annotated[str, _txt(400)]
 Txt600 = Annotated[str, _txt(600)]
 Txt800 = Annotated[str, _txt(800)]
+Txt24 = Annotated[str, _txt(24)]
 
 # The relay's own health row (``resonant.dashboard.pusher``): {state, since, detail}. Unlike the
 # monitor's checks it can be ``failing``. Absent while the relay is off.
@@ -463,6 +464,191 @@ class McpServer(_Model):
     host: Txt120 | None  # an http server's host only: never its path or query
 
 
+# --- extension panels (PER-280) -------------------------------------------------------------
+# What ``extensions.panels.normalize`` produces from a panel command's output and the builder
+# reads back from ``ext_panels``. The shape is flat on purpose: no recursive model (the schema
+# test walks ``$ref`` without a cycle guard), and ``details`` is a list of rows whose keys are
+# *values*, so a key named ``remote_url`` can never reach the relay's guard.
+
+PANEL_BUDGET_BYTES: Final = 100 * 1024  # all panels' views in one snapshot
+PanelTone = Literal["ok", "warn", "bad"]
+PillTone = Literal["ok", "warn", "bad", "neutral"]
+PanelFormat = Literal["number", "integer", "money", "percent", "duration", "bytes"]
+PanelSlug = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9_-]{0,31}$")]
+Currency = Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")]
+LocalUrl = Annotated[
+    str,
+    StringConstraints(pattern=r"^http://127\.0\.0\.1:[0-9]{1,5}(/[!-~]*)?$", max_length=300),
+]
+Num = int | float
+
+
+class _Sparse(_Model):
+    """A panel part whose unset optional fields are left out (like ``DiagramNode``): a snapshot
+    carries up to ``PANEL_BUDGET_BYTES`` of widgets, mostly nulls otherwise. A required field
+    that is null (a stat's ``value``) stays. The page reads a missing optional as null."""
+
+    @model_serializer(mode="wrap")
+    def _drop_unset(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        out = cast(dict[str, Any], handler(self))
+        optional = {n for n, f in type(self).model_fields.items() if not f.is_required()}
+        return {k: v for k, v in out.items() if v is not None or k not in optional}
+
+
+class StatWidget(_Sparse):
+    type: Literal["stat"]
+    id: PanelSlug | None = None
+    title: Txt64 | None = None
+    label: Txt40
+    value: Num | Txt40 | None
+    unit: Txt16 | None = None
+    format: PanelFormat = "number"
+    currency: Currency | None = None
+    delta: Num | None = None
+    delta_format: PanelFormat | None = None
+    health: PanelTone | None = None
+    hint: Txt80 | None = None
+
+
+class SeriesLine(_Model):
+    name: Txt32
+    values: list[Num | None]
+
+
+class SeriesWidget(_Sparse):
+    type: Literal["series"]
+    id: PanelSlug | None = None
+    title: Txt64 | None = None
+    kind: Literal["line", "area", "bar"]
+    x_type: Literal["time", "category"]
+    x: list[Num | Txt24]  # time = unix seconds
+    series: list[SeriesLine]
+    unit: Txt16 | None = None
+    format: PanelFormat = "number"
+    currency: Currency | None = None
+    stacked: bool = False
+    downsampled_from: int | None = None
+
+
+class TableColumn(_Sparse):
+    key: PanelSlug
+    label: Txt32
+    type: Literal["text", "number", "money", "time", "pill", "link"]
+    align: Literal["left", "right"] | None = None
+    currency: Currency | None = None
+
+
+class PillCell(_Model):
+    label: Txt24
+    tone: PillTone
+
+
+class LinkCell(_Model):
+    label: Txt64
+    tool: Txt64
+
+
+Cell = PillCell | LinkCell | Txt120 | Num | None  # time cells = unix seconds
+
+
+class TableWidget(_Sparse):
+    type: Literal["table"]
+    id: PanelSlug | None = None
+    title: Txt64 | None = None
+    columns: list[TableColumn]
+    rows: list[list[Cell]]  # aligned to ``columns``
+    truncated: bool = False
+    total_rows: int | None = None
+
+
+class StatusItem(_Sparse):
+    name: Txt64
+    state: Literal["up", "down", "warn", "unknown"]
+    detail: Txt120 | None = None
+    since: datetime | None = None
+
+
+class StatusWidget(_Sparse):
+    type: Literal["status"]
+    id: PanelSlug | None = None
+    title: Txt64 | None = None
+    items: list[StatusItem]
+    truncated: bool = False
+
+
+class KvItem(_Sparse):
+    key: Txt40
+    value: bool | Num | Txt120 | None
+    format: PanelFormat | None = None
+    unit: Txt16 | None = None
+
+
+class KvWidget(_Sparse):
+    type: Literal["kv"]
+    id: PanelSlug | None = None
+    title: Txt64 | None = None
+    items: list[KvItem]
+    truncated: bool = False
+
+
+class TextWidget(_Sparse):
+    type: Literal["text"]
+    id: PanelSlug | None = None
+    title: Txt64 | None = None
+    text: Txt800
+
+
+class DetailRow(_Sparse):
+    depth: Annotated[int, Field(ge=0, le=5)]
+    key: Txt64  # ``[3]`` for an array item, empty for the root
+    kind: Literal["object", "array", "string", "number", "bool", "null"]
+    value: Txt200 | None = None
+
+
+class DetailsWidget(_Sparse):
+    type: Literal["details"]
+    id: PanelSlug | None = None
+    title: Txt64 | None = None
+    rows: list[DetailRow]
+    collapsed: bool = True
+    truncated: bool = False
+
+
+PanelWidget = Annotated[
+    StatWidget | SeriesWidget | TableWidget | StatusWidget | KvWidget | TextWidget | DetailsWidget,
+    Field(discriminator="type"),
+]
+
+
+class PanelView(_Model):
+    id: PanelSlug
+    title: Txt40
+    widgets: list[PanelWidget]
+
+
+class Panel(_Model):
+    """One dashboard panel an extension declares: its latest good copy and its run state."""
+
+    id: Ident
+    title: Txt64
+    description: Txt160 | None = None
+    schedule: Txt64  # the idle cron
+    active: Txt64 | None = None
+    tz: Txt64 | None = None
+    updated_at: datetime | None = None  # the data's time, in the last good copy
+    last_run_at: datetime | None = None  # None: never run
+    ok: bool = False  # the last run succeeded
+    stale: bool = True
+    error: Txt200 | None = None  # the last run's error (kept while a good copy shows)
+    fail_streak: int = 0
+    health: PanelTone | None = None  # the author's own
+    truncated: bool = False  # core cut something, or the views were dropped for size
+    bytes: int = 0
+    local_url: LocalUrl | None = _local()
+    views: list[PanelView] = _list()
+    outside: list[OutsideName] = _list()  # ``views`` and ``error``: an extension's own words
+
+
 class Extension(_Model):
     name: Ident
     status: ExtensionStatus
@@ -478,6 +664,7 @@ class Extension(_Model):
     secrets: list[Ident] = _list()  # names only
     report_max: Urgency | None = None
     repos: list[Txt100] = _list()
+    panels: list[Panel] = _list()  # PER-280, in manifest order
 
 
 class Runner(_Model):
@@ -537,7 +724,7 @@ class RepoItem(_Model):
 
 # --- the diagram (PER-277) ------------------------------------------------------------------
 
-DiagramKind = Literal["core", "process", "extension", "server", "tool", "job", "repo"]
+DiagramKind = Literal["core", "process", "extension", "server", "tool", "job", "repo", "panel"]
 # What the page opens for a node: the PER-276 view it already has (``extension``, ``job``,
 # ``health``) or the node's own view.
 DIAGRAM_NODES = 250  # core and processes first, then each extension with its children
@@ -567,6 +754,7 @@ class DiagramNode(_Model):
     # PER-278: its top-level box (``Diagram.groups``), on nodes without a parent (a child is in
     # its parent's); None from a daemon before it
     group: Ident | None = None
+    panel: Ident | None = None  # PER-280: a panel node's panel id
 
     @model_serializer(mode="wrap")
     def _drop_nulls(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -945,6 +1133,195 @@ def _tools_of(manifest: Mapping[str, Any], t: _Text) -> tuple[list[ExtTool], lis
     return tools[:EXT_TOOLS], servers[:EXT_MCP_SERVERS]
 
 
+_LOCAL_URL = re.compile(r"^http://127\.0\.0\.1:[0-9]{1,5}(/[!-~]*)?$")
+PANEL_ITEMS = 8  # per extension (``resonant_sdk.manifest.PANELS_MAX``)
+
+
+def _scrub_deep(value: Any, t: _Text) -> Any:
+    """Every string of a stored panel copy through the one text pass again (credential-shaped
+    text, the caller's known values), each at its own length so nothing is cut here: the caps
+    are the models'. The copy was clipped when it was stored; this catches a stored row that
+    predates a pattern or a value learned since."""
+    if isinstance(value, str):
+        return t(value, max(len(value), 1)) if value else value
+    if isinstance(value, list):
+        return [_scrub_deep(v, t) for v in cast(list[Any], value)]
+    if isinstance(value, dict):
+        return {k: _scrub_deep(v, t) for k, v in cast(dict[str, Any], value).items()}
+    return value
+
+
+def _stored_views(
+    st: ext_store.PanelState | None, t: _Text
+) -> tuple[list[PanelView], dict[str, Any], bool]:
+    """``(views, the copy's other fields, readable)`` from ``ext_panels.data_json``."""
+    if st is None or st.data_json is None:
+        return [], {}, True
+    try:
+        data: Any = json.loads(st.data_json)
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        fields = cast(dict[str, Any], _scrub_deep(data, t))
+        views = [PanelView.model_validate(v) for v in cast(list[Any], fields.get("views") or [])]
+    except (ValueError, TypeError):  # ValidationError is a ValueError
+        return [], {}, False
+    return views, fields, True
+
+
+def _panel(
+    spec: Mapping[str, Any],
+    st: ext_store.PanelState | None,
+    record: ext_store.ExtensionRecord,
+    now: datetime,
+    t: _Text,
+) -> Panel | None:
+    pid = str(spec.get("id", ""))
+    title = spec.get("title")
+    refresh = spec.get("refresh")
+    idle = cast(dict[str, Any], refresh).get("idle") if isinstance(refresh, dict) else None
+    active = cast(dict[str, Any], refresh).get("active") if isinstance(refresh, dict) else None
+    if not (_ident(pid) and isinstance(title, str) and isinstance(idle, str)):
+        return None
+    views, fields, readable = _stored_views(st, t)
+    desc = spec.get("description")
+    error = None if st is None else t.opt(st.last_error, 200)
+    if not readable:
+        error = "stored copy unreadable"
+    has_copy = st is not None and st.data_json is not None and readable
+    stale = (
+        not has_copy
+        or (st is not None and st.fail_streak > 0)
+        or record.status != "enabled"
+        or (st is not None and st.expect_by is not None and now > st.expect_by)
+    )
+    health = fields.get("health")
+    local_url = fields.get("local_url")
+    return Panel(
+        id=pid,
+        title=t(title, 64),
+        description=t.opt(desc, 160) if isinstance(desc, str) and desc else None,
+        schedule=t(idle, 64),
+        active=t.opt(active, 64) if isinstance(active, str) else None,
+        tz=t.opt(str(spec["tz"]), 64) if spec.get("tz") is not None else None,
+        updated_at=None if st is None or not has_copy else st.updated_at,
+        last_run_at=None if st is None else st.last_run_at,
+        ok=st is not None and st.last_ok is True,
+        stale=stale,
+        error=error,
+        fail_streak=0 if st is None else st.fail_streak,
+        health=health if health in ("ok", "warn", "bad") else None,
+        truncated=fields.get("truncated") is True,
+        bytes=0 if st is None or not has_copy else st.bytes,
+        local_url=local_url
+        if isinstance(local_url, str) and _LOCAL_URL.fullmatch(local_url)
+        else None,
+        views=views,
+        outside=[*(["views"] if views else []), *(["error"] if error else [])],
+    )
+
+
+def _panels(
+    record: ext_store.ExtensionRecord,
+    states: Mapping[str, ext_store.PanelState],
+    now: datetime,
+    t: _Text,
+) -> list[Panel]:
+    """The extension's panels in manifest order: the stored good copy and the run state."""
+    out: list[Panel] = []
+    for spec in cast(list[Any], record.manifest.get("panels") or []):
+        if isinstance(spec, dict):
+            fields = cast(dict[str, Any], spec)
+            if p := _panel(fields, states.get(str(fields.get("id", ""))), record, now, t):
+                out.append(p)
+    return out[:PANEL_ITEMS]
+
+
+def extension_panels(
+    conn: sqlite3.Connection, record: ext_store.ExtensionRecord, now: datetime
+) -> list[Panel]:
+    """``record``'s panels as the snapshot shows them (``read_panel`` reads these): the last good
+    copy and the run state, every text passed through the one text pass."""
+    states = {p.panel_id: p for p in ext_store.list_panels(conn, record.name)}
+    return _panels(record, states, now, _Text(None))
+
+
+def _views_size(views: Any) -> int:
+    return len(json.dumps(views, separators=(",", ":")).encode())
+
+
+def _drop_set(
+    rows: Sequence[tuple[int, datetime | None, str, str]], budget: int
+) -> set[tuple[str, str]]:
+    """Which ``(ext, panel)`` lose their views to fit ``budget`` bytes in all: the largest
+    first, the oldest ``updated_at`` (never updated first) among equals, then ``(ext, id)``."""
+    total = sum(size for size, *_ in rows)
+    drop: set[tuple[str, str]] = set()
+    epoch = datetime.min.replace(tzinfo=UTC)
+    for size, _updated, ext, pid in sorted(rows, key=lambda r: (-r[0], r[1] or epoch, r[2], r[3])):
+        if total <= budget or size == 0:
+            break
+        drop.add((ext, pid))
+        total -= size
+    return drop
+
+
+def panel_bytes(extensions: Sequence[Mapping[str, Any]]) -> int:
+    """The bytes of every panel's views in a dumped snapshot's ``extensions``."""
+    return sum(
+        _views_size(p.get("views") or [])
+        for e in extensions
+        for p in cast(list[dict[str, Any]], e.get("panels") or [])
+        if p.get("views")
+    )
+
+
+def fit_panels(extensions: Sequence[dict[str, Any]], budget: int = PANEL_BUDGET_BYTES) -> bool:
+    """Drop panels' views, in place, in a dumped snapshot's ``extensions`` until all panels
+    together fit ``budget`` bytes (compact JSON). The largest goes first, the oldest among
+    equals, then by ``(ext, id)``. A dropped panel keeps its state: ``views`` empty,
+    ``truncated`` true, ``views`` no longer in ``outside``. True when anything was dropped."""
+    rows: list[tuple[int, datetime | None, str, str]] = []
+    for e in extensions:
+        for p in cast(list[dict[str, Any]], e.get("panels") or []):
+            raw = p.get("updated_at")
+            try:
+                updated = datetime.fromisoformat(raw) if isinstance(raw, str) else None
+            except ValueError:
+                updated = None
+            rows.append((_views_size(p["views"]) if p.get("views") else 0, updated,
+                         str(e.get("name")), str(p.get("id"))))  # fmt: skip
+    drop = _drop_set(rows, budget)
+    for e in extensions:
+        for p in cast(list[dict[str, Any]], e.get("panels") or []):
+            if (str(e.get("name")), str(p.get("id"))) in drop:
+                p["views"] = []
+                p["truncated"] = True
+                p["outside"] = [o for o in cast(list[str], p.get("outside") or []) if o != "views"]
+    return bool(drop)
+
+
+def _fit_models(extensions: list[Extension], budget: int = PANEL_BUDGET_BYTES) -> list[Extension]:
+    rows = [
+        (_views_size([v.model_dump(mode="json") for v in p.views]) if p.views else 0,
+         p.updated_at, e.name, p.id)
+        for e in extensions
+        for p in e.panels
+    ]  # fmt: skip
+    drop = _drop_set(rows, budget)
+    if not drop:
+        return extensions
+    return [
+        e.model_copy(update={"panels": [
+            p.model_copy(update={
+                "views": [], "truncated": True,
+                "outside": [o for o in p.outside if o != "views"],
+            }) if (e.name, p.id) in drop else p
+            for p in e.panels
+        ]})
+        for e in extensions
+    ]  # fmt: skip
+
+
 def _extension(
     conn: sqlite3.Connection,
     record: ext_store.ExtensionRecord,
@@ -988,6 +1365,9 @@ def _extension(
             [r for r in (cast(list[Any], ext_repos) if isinstance(ext_repos, list) else [])
              if isinstance(r, str)][:EXT_REPOS],
             100,
+        ),
+        panels=_panels(
+            record, {p.panel_id: p for p in ext_store.list_panels(conn, record.name)}, now, t
         ),
     )  # fmt: skip
 
@@ -1094,7 +1474,7 @@ def build_snapshot(
         ids = [i for i in related.get(task_id or "", []) if i in visible]
         return ids[-RELATED_IDS:]
 
-    extension_rows = _extensions(conn, health, settings, now, t)
+    extension_rows = _fit_models(_extensions(conn, health, settings, now, t))
     core_job_rows = _core_jobs(conn, core_jobs, settings, now, t)
     graph = (
         None
@@ -1254,6 +1634,14 @@ def _job_health(j: Job) -> HealthState:
     if j.fail_streak > 0:
         return "degraded" if j.fail_streak < 3 else "failing"
     return "ok" if j.last_outcome in ("ok", "dry_run", "skipped_paused") else "unknown"
+
+
+def _panel_health(p: Panel) -> HealthState:
+    if p.last_run_at is None:
+        return "unknown"
+    if p.fail_streak >= 3:
+        return "failing"
+    return "degraded" if p.stale or not p.ok else "ok"
 
 
 def _diagram(
@@ -1421,6 +1809,19 @@ def _diagram(
                 last_run_at=j.last_run_at, last_outcome=j.last_outcome, ext=e.name, job=j.id,
             )):  # fmt: skip
                 link(ext_id, job_id, "cron")
+        for p in e.panels:
+            panel_id = f"panel:{e.name}/{p.id}"
+            when = diagram_parts.cron_words(p.schedule, p.tz, now)
+            if p.active:
+                when += f", and {diagram_parts.cron_words(p.active, p.tz, now)} in its active hours"
+            if add(DiagramNode(
+                id=panel_id, kind="panel", label=t(p.title, 100), parent=ext_id,
+                text=t(p.description or f"{e.name}/{p.id}: a dashboard panel; Resonant runs its "
+                       f"panel command {when} and draws the result.", 300),
+                tags=["panel", "read", "L0", *(["stale"] if p.stale else [])],
+                health=_panel_health(p), last_run_at=p.updated_at, ext=e.name, panel=p.id,
+            )):  # fmt: skip
+                link(ext_id, panel_id, "draws")
         for r in e.repos:
             repo_id = f"repo:{e.name}/{r}"
             if len(repo_id) <= _ID_MAX and add(DiagramNode(

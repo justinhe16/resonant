@@ -695,3 +695,41 @@ def test_one_token_cannot_be_both(db: Pg) -> None:
         f"update relay_private.config set status_token_sha256 = decode('{_sha(INGEST)}', 'hex');"
     )
     assert r.sqlstate == "23514"
+
+
+def test_a_remote_snapshot_with_panels_is_accepted(db: Pg, tmp_path: Path) -> None:
+    """PER-280: panels need no migration. Their widgets carry no ``remote_url`` key (``details``
+    is flattened to rows whose keys are values), no approval codes and no secret-shaped text."""
+    import sys
+
+    sys.path.insert(0, str(ROOT / "tests"))
+    from panel_helpers import panel_manifest, raw_panel, store_panel
+
+    from resonant.store import extensions as ext_store
+
+    now = datetime.now(UTC)
+    conn = open_db(tmp_path / "panels.db")
+    try:
+        ext_store.save_extension(
+            conn,
+            ext_store.ExtensionRecord(
+                name="ledger", source="repo:ledger", commit="a" * 40, tree_digest="d",
+                manifest_sha="m", installed_at=now, installed_by="justin",
+                manifest=panel_manifest("ledger", ("paper",)),
+            ),
+        )  # fmt: skip
+        raw = raw_panel()
+        views = raw["views"][1]["widgets"]
+        views.append({"type": "details", "data": {"remote_url": "x", "list": [1, 2]}})
+        store_panel(conn, "ledger", "paper", raw, now)
+        snap = build_snapshot(conn, load_settings(), started_at=now, version="abcdef12")
+    finally:
+        conn.close()
+    remote = to_remote(snap).model_dump(mode="json")
+    (panel,) = remote["extensions"][0]["panels"]
+    assert panel["views"] and "local_url" not in panel
+    text = json.dumps(remote)
+    assert '"remote_url":' not in text and "remote_url" in text  # a value, never a key
+    assert ingest(db, remote).ok
+    assert count_latest(db) == 1
+    assert latest(db)["extensions"][0]["panels"][0]["id"] == "paper"

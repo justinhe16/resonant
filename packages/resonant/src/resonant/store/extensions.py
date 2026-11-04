@@ -1,10 +1,11 @@
-"""Extensions and job-state repositories (migrations 004, 012). Plain functions over a connection.
+"""Extensions, job-state and panel repositories (migrations 004, 012, 026). Plain functions.
 
 - ``extensions``: one row per installed extension, the registry of record. It holds the
   approved manifest snapshot and the pins (``commit``, ``tree_digest``, ``manifest_sha``,
   ``argv0_paths``) that the host re-verifies at load. The manager writes it; the host only
   reads it, flips ``status`` and re-pins an MCP tool (``set_mcp_pin``: a v1 pin at version 2, or an
   accepted schema drift, PER-275).
+- ``ext_panels``: the latest good copy and run state per ``(ext, panel_id)`` (PER-280).
 - ``ext_jobs``: scheduler state per ``(ext, job_id)``. Core jobs use ``ext="core"``.
   ``last_due`` only moves forward, so a stale writer can never make a due time run twice.
 
@@ -54,6 +55,22 @@ class JobState:
     last_outcome: str | None
     open_task_id: str | None
     fail_streak: int
+
+
+@dataclass(frozen=True)
+class PanelState:
+    """One panel's latest good copy and run state (``ext_panels``, migration 026)."""
+
+    ext: str
+    panel_id: str
+    data_json: str | None  # the normalized {views, health, local_url, truncated}
+    updated_at: datetime | None
+    bytes: int
+    last_run_at: datetime | None
+    last_ok: bool | None  # None: never run
+    last_error: str | None
+    fail_streak: int
+    expect_by: datetime | None
 
 
 def _dt(v: str | None) -> datetime | None:
@@ -187,6 +204,7 @@ def delete_extension(conn: sqlite3.Connection, name: str) -> bool:
     """Delete the row and its ``ext_jobs`` state in one transaction. False if absent."""
     with atomic(conn):
         conn.execute("DELETE FROM ext_jobs WHERE ext = ?", (name,))
+        conn.execute("DELETE FROM ext_panels WHERE ext = ?", (name,))
         cur = conn.execute("DELETE FROM extensions WHERE name = ?", (name,))
     return cur.rowcount == 1
 
@@ -279,4 +297,94 @@ def prune_jobs(conn: sqlite3.Connection, ext: str, keep: Collection[str]) -> int
     sql = "DELETE FROM ext_jobs WHERE ext = ?"
     if keep_ids:
         sql += f" AND job_id NOT IN ({marks})"
+    return conn.execute(sql, (ext, *keep_ids)).rowcount
+
+
+# --- ext_panels (PER-280) ---------------------------------------------------------------
+
+
+def _row_to_panel(r: sqlite3.Row) -> PanelState:
+    return PanelState(
+        ext=r["ext"],
+        panel_id=r["panel_id"],
+        data_json=r["data_json"],
+        updated_at=_dt(r["updated_at"]),
+        bytes=r["bytes"],
+        last_run_at=_dt(r["last_run_at"]),
+        last_ok=None if r["last_ok"] is None else bool(r["last_ok"]),
+        last_error=r["last_error"],
+        fail_streak=r["fail_streak"],
+        expect_by=_dt(r["expect_by"]),
+    )
+
+
+def get_panel(conn: sqlite3.Connection, ext: str, panel_id: str) -> PanelState | None:
+    row = conn.execute(
+        "SELECT * FROM ext_panels WHERE ext = ? AND panel_id = ?", (ext, panel_id)
+    ).fetchone()
+    return None if row is None else _row_to_panel(row)
+
+
+def list_panels(conn: sqlite3.Connection, ext: str | None = None) -> list[PanelState]:
+    """Every panel's state (or one extension's), sorted by ``(ext, panel_id)``."""
+    if ext is None:
+        rows = conn.execute("SELECT * FROM ext_panels ORDER BY ext, panel_id").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM ext_panels WHERE ext = ? ORDER BY panel_id", (ext,)
+        ).fetchall()
+    return [_row_to_panel(r) for r in rows]
+
+
+def save_panel_ok(
+    conn: sqlite3.Connection,
+    ext: str,
+    panel_id: str,
+    *,
+    data: str,
+    updated_at: datetime,
+    ran_at: datetime,
+    bytes: int,
+    expect_by: datetime,
+) -> PanelState:
+    """Store a good copy: the streak resets and the error clears."""
+    conn.execute(
+        """INSERT INTO ext_panels (ext, panel_id, data_json, updated_at, bytes, last_run_at,
+               last_ok, last_error, fail_streak, expect_by)
+           VALUES (?, ?, ?, ?, ?, ?, 1, NULL, 0, ?)
+           ON CONFLICT (ext, panel_id) DO UPDATE SET
+               data_json = excluded.data_json, updated_at = excluded.updated_at,
+               bytes = excluded.bytes, last_run_at = excluded.last_run_at, last_ok = 1,
+               last_error = NULL, fail_streak = 0, expect_by = excluded.expect_by""",
+        (ext, panel_id, data, iso(updated_at), bytes, iso(ran_at), iso(expect_by)),
+    )
+    state = get_panel(conn, ext, panel_id)
+    assert state is not None
+    return state
+
+
+def record_panel_failure(
+    conn: sqlite3.Connection, ext: str, panel_id: str, *, ran_at: datetime, error: str
+) -> PanelState:
+    """Record a failed run: the streak grows and the last good copy is kept."""
+    conn.execute(
+        """INSERT INTO ext_panels (ext, panel_id, last_run_at, last_ok, last_error, fail_streak)
+           VALUES (?, ?, ?, 0, ?, 1)
+           ON CONFLICT (ext, panel_id) DO UPDATE SET
+               last_run_at = excluded.last_run_at, last_ok = 0,
+               last_error = excluded.last_error, fail_streak = ext_panels.fail_streak + 1""",
+        (ext, panel_id, iso(ran_at), error),
+    )
+    state = get_panel(conn, ext, panel_id)
+    assert state is not None
+    return state
+
+
+def prune_panels(conn: sqlite3.Connection, ext: str, keep: Collection[str]) -> int:
+    """Delete ``ext``'s panel rows not in ``keep`` (panels an update removed)."""
+    keep_ids = sorted(keep)
+    marks = ", ".join("?" for _ in keep_ids)
+    sql = "DELETE FROM ext_panels WHERE ext = ?"
+    if keep_ids:
+        sql += f" AND panel_id NOT IN ({marks})"
     return conn.execute(sql, (ext, *keep_ids)).rowcount

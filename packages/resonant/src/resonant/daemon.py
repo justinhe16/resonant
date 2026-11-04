@@ -67,6 +67,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Seconds after start that every extension panel first runs (PER-280), so the dashboard has
+# data before the first cron time. Tests set it to None (the conftest's wall-clock switch).
+PANEL_FIRST_RUN_S: float | None = 30.0
+
 
 class _Server(uvicorn.Server):
     """uvicorn without its own signal handling: the daemon owns shutdown."""
@@ -137,6 +141,7 @@ class Daemon:
             started_at=self.state.started_at,
             channel=None if self.imessage is None else self.imessage.channel,
             core_jobs=(*CORE_JOBS, cleanup_job),
+            panel_first_run_s=PANEL_FIRST_RUN_S,
         )
         self.loop.scheduler = self.scheduler
         # The status relay (dashboard.pusher): the remote tier of the snapshot to Supabase.

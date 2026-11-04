@@ -20,15 +20,17 @@ describe("snapshot fixtures", () => {
     for (const s of [local, remote, empty, remoteV1Raw]) expect(isSnapshot(s)).toBe(true);
   });
 
-  it("have the same shape on both tiers apart from the two local-only fields", () => {
+  it("have the same shape on both tiers apart from the local-only fields", () => {
     expect(remote.tier).toBe("remote");
     const expected = structuredClone(local) as Snapshot;
     expected.tier = "remote";
     for (const r of expected.runs.items) delete r.remote_url;
     for (const a of [...expected.approvals.items, ...expected.approvals.recent]) delete a.code;
     delete expected.claude_brain?.remote_url;
+    for (const e of expected.extensions) for (const p of e.panels) delete p.local_url;
     expect(remote).toEqual(expected);
     expect(JSON.stringify(remote)).not.toContain("remote_url");
+    expect(JSON.stringify(remote)).not.toContain("local_url");
     for (const a of [...remote.approvals.items, ...remote.approvals.recent]) expect(a).not.toHaveProperty("code");
     expect(local.approvals.items[0]).toHaveProperty("code");
   });
@@ -169,6 +171,11 @@ describe("normalize", () => {
     expect(JSON.stringify(n)).not.toContain("K7Q2");
     // A local snapshot keeps them.
     expect(normalize(local).runs.items[0]).toHaveProperty("remote_url");
+    // PER-280: a panel's local_url is stripped from a remote snapshot even if one slipped through
+    const leaked = clone(remote);
+    leaked.extensions[0]!.panels[0]!.local_url = "http://127.0.0.1:8765/x";
+    expect(normalize(leaked).extensions[0]!.panels[0]).not.toHaveProperty("local_url");
+    expect(normalize(local).extensions[0]!.panels[0]).toHaveProperty("local_url");
   });
 });
 
@@ -234,5 +241,17 @@ describe("githubLinks", () => {
     expect(githubLinks({ ...base, pr_url: "http://github.com/a/b/pull/1" }).pr).toBeNull();
     expect(githubLinks({ ...base, github_repo: "a/b/../../evil" }).branch).toBeNull();
     expect(githubLinks({ ...base, head_sha: "zzzz" }).commit).toBeNull();
+  });
+});
+
+describe("panels (PER-280)", () => {
+  it("defaults panels to [] for a daemon from before it", () => {
+    const old = structuredClone(local) as unknown as { extensions: Record<string, unknown>[] };
+    for (const e of old.extensions) delete e.panels;
+    expect(assertSnapshot(old).extensions.every((e) => Array.isArray(e.panels) && e.panels.length === 0)).toBe(true);
+  });
+
+  it("maps a schema 1 push onto extensions with no panels", () => {
+    expect(remoteV1.extensions.every((e) => e.panels.length === 0)).toBe(true);
   });
 });

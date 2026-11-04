@@ -242,6 +242,7 @@ const KIND_BORDER: Record<string, string> = {
   core: "border-info/70",
   extension: "border-foreground/40",
   process: "border-dashed border-muted-foreground/60",
+  panel: "border-chart-3/60",
 };
 
 const ICON_BUTTON =

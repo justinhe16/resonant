@@ -1,9 +1,9 @@
 // Mirrors the snapshot contract (built by resonant/dashboard/snapshot.py, schema in
 // docs/snapshot.schema.json), schema 2.
 //
-// Both tiers carry the same fields, with free text redacted and clipped. Two fields exist only
-// in the `local` tier: `remote_url` (the Remote Control link) and an approval's `code` (the
-// second factor the owner types). The UI just doesn't show them when they are absent.
+// Both tiers carry the same fields, with free text redacted and clipped. Three fields exist only
+// in the `local` tier: `remote_url` (the Remote Control link), an approval's `code` (the
+// second factor the owner types) and a panel's `local_url`. The UI just doesn't show them when they are absent.
 //
 // Text written by a worker, an extension or a web page is listed by field name in the
 // `outside` array of the row that holds it; the UI renders it as plain text with a badge.
@@ -22,8 +22,8 @@ export type Urgency = "urgent" | "normal" | "low";
 /** Counts keyed by state, e.g. {running: 2, waiting: 1}. */
 export type ByState = Record<string, number>;
 
-/** What the pusher shrank to fit the relay: nothing, history, lists, detail, or every item. */
-export type Trimmed = "none" | "history" | "lists" | "detail" | "items";
+/** What the pusher shrank to fit the relay: nothing, history, panels, lists, detail, or every item. */
+export type Trimmed = "none" | "history" | "panels" | "lists" | "detail" | "items";
 
 /** How many rows of each list a snapshot keeps (the UI quotes these). */
 export interface Limits {
@@ -267,6 +267,160 @@ export interface McpServer {
   host: string | null;
 }
 
+// --- extension panels (PER-280) ---------------------------------------------------------------
+// An extension prints a declarative panel; core validates and normalizes it and the page draws
+// it. Times in series `x` and table `time` cells are unix seconds.
+
+export type PanelTone = "ok" | "warn" | "bad";
+export type PillTone = PanelTone | "neutral";
+export type PanelFormat = "number" | "integer" | "money" | "percent" | "duration" | "bytes";
+
+interface WidgetBase {
+  id?: string | null;
+  title?: string | null;
+}
+
+export interface StatWidget extends WidgetBase {
+  type: "stat";
+  label: string;
+  value: number | string | null;
+  unit?: string | null;
+  format: PanelFormat;
+  currency?: string | null;
+  delta?: number | null;
+  delta_format?: PanelFormat | null;
+  health?: PanelTone | null;
+  hint?: string | null;
+}
+
+export interface SeriesLine {
+  name: string;
+  values: (number | null)[];
+}
+
+export interface SeriesWidget extends WidgetBase {
+  type: "series";
+  kind: "line" | "area" | "bar";
+  x_type: "time" | "category";
+  x: (number | string)[];
+  series: SeriesLine[];
+  unit?: string | null;
+  format: PanelFormat;
+  currency?: string | null;
+  stacked: boolean;
+  downsampled_from?: number | null;
+}
+
+export interface TableColumn {
+  key: string;
+  label: string;
+  type: "text" | "number" | "money" | "time" | "pill" | "link";
+  align?: "left" | "right" | null;
+  currency?: string | null;
+}
+
+export interface PillCell {
+  label: string;
+  tone: PillTone;
+}
+
+export interface LinkCell {
+  label: string;
+  tool: string;
+}
+
+export type Cell = PillCell | LinkCell | string | number | null;
+
+export interface TableWidget extends WidgetBase {
+  type: "table";
+  columns: TableColumn[];
+  /** aligned to `columns` */
+  rows: Cell[][];
+  truncated: boolean;
+  total_rows?: number | null;
+}
+
+export interface StatusItem {
+  name: string;
+  state: "up" | "down" | "warn" | "unknown";
+  detail?: string | null;
+  since?: Timestamp | null;
+}
+
+export interface StatusWidget extends WidgetBase {
+  type: "status";
+  items: StatusItem[];
+  truncated: boolean;
+}
+
+export interface KvItem {
+  key: string;
+  value: string | number | boolean | null;
+  format?: PanelFormat | null;
+  unit?: string | null;
+}
+
+export interface KvWidget extends WidgetBase {
+  type: "kv";
+  items: KvItem[];
+  truncated: boolean;
+}
+
+export interface TextWidget extends WidgetBase {
+  type: "text";
+  text: string;
+}
+
+/** One line of a flattened JSON value: `key` is "[3]" for array items, "" for the root. */
+export interface DetailRow {
+  depth: number;
+  key: string;
+  kind: "object" | "array" | "string" | "number" | "bool" | "null";
+  value?: string | null;
+}
+
+export interface DetailsWidget extends WidgetBase {
+  type: "details";
+  rows: DetailRow[];
+  collapsed: boolean;
+  truncated: boolean;
+}
+
+export type PanelWidget = StatWidget | SeriesWidget | TableWidget | StatusWidget | KvWidget | TextWidget | DetailsWidget;
+
+export interface PanelView {
+  id: string;
+  title: string;
+  widgets: PanelWidget[];
+}
+
+export interface Panel {
+  id: string;
+  title: string;
+  description?: string | null;
+  /** the idle cron */
+  schedule: string;
+  active?: string | null;
+  tz?: string | null;
+  /** data time of the last good copy */
+  updated_at: Timestamp | null;
+  /** null: never run */
+  last_run_at: Timestamp | null;
+  ok: boolean;
+  stale: boolean;
+  /** the last run's error (kept while a good copy shows) */
+  error?: string | null;
+  fail_streak: number;
+  health?: PanelTone | null;
+  /** core cut something, or the views were dropped for size */
+  truncated: boolean;
+  bytes: number;
+  /** local tier only */
+  local_url?: string;
+  views: PanelView[];
+  outside: string[];
+}
+
 export interface Extension {
   name: string;
   status: "enabled" | "disabled" | "disabled_tampered";
@@ -283,6 +437,8 @@ export interface Extension {
   secrets: string[];
   report_max: Urgency | null;
   repos: string[];
+  /** PER-280, in manifest order; `normalize` makes it [] for a daemon before it */
+  panels: Panel[];
 }
 
 export interface Runner {
@@ -336,7 +492,7 @@ export interface Repo {
 }
 
 /** One box of the architecture diagram (PER-277). */
-export type DiagramKind = "core" | "process" | "extension" | "server" | "tool" | "job" | "repo";
+export type DiagramKind = "core" | "process" | "extension" | "server" | "tool" | "job" | "repo" | "panel";
 
 export interface DiagramNode {
   /** `core:gate`, `proc:com.resonant.daemon`, `ext:linear`, `tool:linear/linear/save_issue`, … */
@@ -360,6 +516,8 @@ export interface DiagramNode {
   /** the extension (`core` for a core job) whose PER-276 view it opens */
   ext?: string | null;
   job?: string | null;
+  /** a panel node's panel id (PER-280) */
+  panel?: string | null;
   /** its top-level box (`Diagram.groups`), on nodes without a parent; absent before PER-278 */
   group?: string | null;
 }

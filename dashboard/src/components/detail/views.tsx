@@ -463,6 +463,26 @@ function extensionView(name: string, { snap, now }: Ctx): View {
             </Rows>
           )}
         </Group>
+        {e.panels.length > 0 && (
+          <Group label="Panels" count={e.panels.length}>
+            <Rows>
+              {e.panels.map((p) => (
+                <Row key={p.id}>
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+                    <span className="font-medium">{p.title}</span>
+                    {p.stale && <Badge variant="warn">stale</Badge>}
+                    <span className="text-xs text-muted-foreground">
+                      {p.updated_at ? <When iso={p.updated_at} now={now} /> : "no data yet"}
+                    </span>
+                  </div>
+                </Row>
+              ))}
+            </Rows>
+            <RouteLink to={{ kind: "ext", name: e.name }} className="mt-2 inline-block text-sm font-medium text-info">
+              Open dashboard
+            </RouteLink>
+          </Group>
+        )}
         <Group label="Jobs" count={e.jobs.length}>
           {e.jobs.length === 0 ? (
             <Empty>No scheduled jobs.</Empty>
@@ -896,6 +916,8 @@ export function describeRoute(route: Route, ctx: Ctx): View {
       return questionView(route.id, ctx);
     case "extension":
       return extensionView(route.name, ctx);
+    case "ext":
+      return extensionView(route.name, ctx); // the page itself is not a dialog; this is only a fallback
     case "job":
       return jobView(route.ext, route.id, ctx);
     case "pulse":

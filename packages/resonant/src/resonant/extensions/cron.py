@@ -26,6 +26,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cronsim import CronSim, CronSimError
 
+from resonant_sdk.manifest import cron_values
+
 # A due time at most this old when the scheduler sees it is on time, not late.
 ON_TIME = timedelta(minutes=1)
 # The longest ``catchup`` window a job may declare.
@@ -103,6 +105,34 @@ def parse_schedule(expr: str, tz: ZoneInfo | str) -> Schedule:
     if schedule.next_after(probe) is None:
         raise CronError(f"{text!r}: never fires")
     return schedule
+
+
+def in_window(expr: str, tz: ZoneInfo | str, now: datetime) -> bool:
+    """Whether local time ``now`` falls in the hours, days and months of a numeric cron
+    ``expr``, ignoring its minute field (a panel's *active window*: ``*/1 9-16 * * 1-5``
+    is 09:00-16:59 on weekdays). A day-of-month and a day-of-week that are both restricted
+    match either one, as in cron; day-of-week 7 is Sunday (0). False for an expression
+    that isn't five numeric fields."""
+    _aware(now, "now")
+    zone = tz if isinstance(tz, ZoneInfo) else ZoneInfo(tz)
+    local = now.astimezone(zone)
+    fields = expr.split()
+    if len(fields) != 5:
+        return False
+    try:
+        hours = cron_values(fields[1], 0, 23)
+        doms = cron_values(fields[2], 1, 31)
+        months = cron_values(fields[3], 1, 12)
+        dows = {d % 7 for d in cron_values(fields[4], 0, 7)}
+    except ValueError:
+        return False
+    if local.hour not in hours or local.month not in months:
+        return False
+    dom_ok = local.day in doms
+    dow_ok = (local.weekday() + 1) % 7 in dows
+    if fields[2].startswith("*") or fields[4].startswith("*"):
+        return dom_ok and dow_ok
+    return dom_ok or dow_ok
 
 
 class Outcome(StrEnum):

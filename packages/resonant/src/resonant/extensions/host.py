@@ -9,13 +9,14 @@ For each ``enabled`` row (``store.extensions``), in name order:
    flip, so it alerts once), audited ``ext.tampered``. Nothing of it is registered.
 2. **Manifest.** The approved snapshot from the row, validated again; its name must be the
    row's. ``checks.dir_errors`` must pass on the copy.
-3. **Commands.** Every tool's and job's ``run`` is compiled once (``ExtCommand.compile``,
+3. **Commands.** Every tool's, job's and panel's ``run`` is compiled once (``ExtCommand.compile``,
    ``argv0`` from ``record.argv0_paths[<spec name>]``, which must still exist). Tool
    placeholders must be declared args; a job's only placeholder may be ``{due_at}``. Each
    manifest ``bins`` entry must be pinned (``argv0_paths["bin:<name>"]``) and still exist;
    it reaches every process of the extension as ``RESONANT_BIN_<NAME>``.
 4. **Register.** Tool specs (``Manifest.tool_specs()``) and job specs (``job_specs()``,
-   ``job_<id>``) go into the ``ToolRegistry``, each with an ``ExtensionHandler``. Job specs
+   ``job_<id>``) go into the ``ToolRegistry``, each with an ``ExtensionHandler``; so do panel
+   specs (PER-280, ``panel_<id>``, no placeholders allowed). Job and panel specs
    are kept out of chat: ``tool_specs()`` here lists tools only, and ``is_job`` tells them
    apart.
 
@@ -34,7 +35,8 @@ alone: those are not tampering. A load never raises for one bad extension.
 ``handlers`` and ``mcp_handlers`` are merged into the executor's map at build.
 ``approvers_for`` is the gate's manifest-approvers seam. ``tracker`` is the one
 ``ProcessTracker`` for the kill switch.
-``scheduled_jobs()`` is what the scheduler (``extensions/scheduler.py``) runs.
+``scheduled_jobs()`` and ``scheduled_panels()`` are what the scheduler
+(``extensions/scheduler.py``) runs.
 
 MCP servers (``extensions/mcp.py``) are started by :meth:`ExtensionHost.start_mcp` once the
 daemon runs (and again on the next call after one ends), tracked by ``tracker`` so ``/kill``
@@ -131,7 +133,7 @@ from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant.tools.registry import ToolRegistry
 from resonant_sdk import Effect, Level, Manifest, ToolSpec
-from resonant_sdk.manifest import Job, McpHttpServer, duration_s, load_manifest
+from resonant_sdk.manifest import Job, McpHttpServer, Panel, duration_s, load_manifest
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +175,15 @@ class LoadedExtension:
     health: ExtCommand | None = None  # the compiled manifest ``health.check``
     bins: Mapping[str, str] = field(default_factory=dict[str, str])  # RESONANT_BIN_* -> pin
     mcp: Mapping[str, McpServerRuntime] = field(default_factory=dict[str, McpServerRuntime])
+    panels: tuple[ToolSpec, ...] = ()  # PER-280: the ``panel_<id>`` specs, kept out of chat
+
+
+@dataclass(frozen=True)
+class HostPanel:
+    ext: str
+    panel: Panel  # the manifest entry: title, refresh, tz, max_bytes
+    spec: ToolSpec  # the registered panel_<id> spec
+    handler: ExtensionHandler
 
 
 @dataclass(frozen=True)
@@ -313,7 +324,9 @@ class ExtensionHost:
             name: (t.run, frozenset(t.args), False) for name, t in manifest.tools.items()
         }
         runs |= {j.spec_name: (j.run, JOB_ARGS, True) for j in manifest.jobs}
-        for spec in (*tools, *jobs):
+        panels = tuple(manifest.panel_specs())
+        runs |= {p.spec_name: (p.run, frozenset[str](), True) for p in manifest.panels}
+        for spec in (*tools, *jobs, *panels):
             if spec.extension != record.name or spec.source != f"ext:{record.name}":
                 raise LoadRefused(f"{spec.name}: spec is not scoped to this extension")
             if spec.name in schemas:
@@ -354,7 +367,7 @@ class ExtensionHost:
                 raise LoadRefused(f"health: {e}") from None
             if health.placeholders:
                 raise LoadRefused("health: the check takes no placeholders")
-        ext = LoadedExtension(record, manifest, root, tools, jobs, health, bins, runtimes)
+        ext = LoadedExtension(record, manifest, root, tools, jobs, health, bins, runtimes, panels)
         return ext, handlers
 
     def _prepare_mcp(
@@ -736,14 +749,14 @@ class ExtensionHost:
         if any(s.extension == name for s in self.registry.specs()):
             raise LoadRefused("already registered")
         try:
-            for spec in (*ext.tools, *ext.jobs):
+            for spec in (*ext.tools, *ext.jobs, *ext.panels):
                 self.registry.register(spec)
         except ValueError as e:
             self.registry.unregister_extension(name)
             raise LoadRefused(str(e)) from None
         self.handlers |= {k: h for k, h in handlers.items() if isinstance(h, ExtensionHandler)}
         self.mcp_handlers |= {k: h for k, h in handlers.items() if isinstance(h, McpToolHandler)}
-        self._job_keys |= {(name, s.name) for s in ext.jobs}
+        self._job_keys |= {(name, s.name) for s in (*ext.jobs, *ext.panels)}
         self.loaded[name] = ext
 
     def _tamper(self, record: store.ExtensionRecord, reason: str) -> None:
@@ -809,6 +822,20 @@ class ExtensionHost:
                     out.append(HostJob(name, job, spec, handler))
         return out
 
+    def scheduled_panels(self) -> list[HostPanel]:
+        """Every loaded panel with its manifest entry, registered spec and handler, by
+        extension then manifest order."""
+        out: list[HostPanel] = []
+        for name in sorted(self.loaded):
+            ext = self.loaded[name]
+            specs = {s.name: s for s in ext.panels}
+            for panel in ext.manifest.panels:
+                spec = specs.get(panel.spec_name)
+                handler = self.handlers.get((name, panel.spec_name))
+                if spec is not None and isinstance(handler, ExtensionHandler):
+                    out.append(HostPanel(name, panel, spec, handler))
+        return out
+
     def manifest(self, name: str) -> Manifest | None:
         ext = self.loaded.get(name)
         return None if ext is None else ext.manifest
@@ -844,10 +871,10 @@ class ExtensionHealth:
     One check per extension that is loaded, refused at load, or ``disabled_tampered``.
     A loaded one is ok unless its manifest ``health.check`` failed (run every
     ``health.every`` through the process runner, with the extension's declared secrets and
-    ``extensions.process.health_timeout_s``; exit 0 is ok) or a job has failed
-    ``FAIL_STREAK_ALERT`` (3) times in a row (``ext_jobs.fail_streak``). Refused and
-    tampered ones are always degraded. While paused no command runs (the last result
-    stands). Details are code-built: stderr never reaches them.
+    ``extensions.process.health_timeout_s``; exit 0 is ok) or a job or panel has
+    failed ``FAIL_STREAK_ALERT`` (3) times in a row (``ext_jobs`` / ``ext_panels``
+    ``fail_streak``). Refused and tampered ones are always degraded. While paused no
+    command runs (the last result stands). Details are code-built: stderr never reaches them.
     """
 
     host: ExtensionHost
@@ -885,6 +912,11 @@ class ExtensionHealth:
             f"job {j.job_id} failed {j.fail_streak} times in a row"
             for j in store.list_jobs(self.host.conn, name)
             if j.fail_streak >= FAIL_STREAK_ALERT
+        ]
+        streaks += [
+            f"panel {p.panel_id} failed {p.fail_streak} times in a row"
+            for p in store.list_panels(self.host.conn, name)
+            if p.fail_streak >= FAIL_STREAK_ALERT
         ]
         last = self._last.get(name)
         # A removed tool got its one non-urgent heads-up and a declined one is the owner's own

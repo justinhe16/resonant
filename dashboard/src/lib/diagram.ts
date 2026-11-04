@@ -13,11 +13,13 @@ export const KIND_LABEL: Record<DiagramKind, string> = {
   tool: "tool",
   job: "job",
   repo: "repo",
+  panel: "panel",
 };
 
 /** The detail view a node opens: an extension's and a job's PER-276 view, else its own. */
 export function nodeRoute(n: DiagramNode): Route {
   if (n.kind === "extension" && n.ext) return { kind: "extension", name: n.ext };
+  if (n.kind === "panel" && n.ext) return { kind: "ext", name: n.ext, ...(n.panel && { panel: n.panel }) };
   if (n.kind === "job" && n.ext && n.job) return { kind: "job", ext: n.ext, id: n.job };
   return { kind: "node", id: n.id };
 }
@@ -36,6 +38,8 @@ export function caption(n: DiagramNode): string {
         .join(" · ");
     case "job":
       return n.last_outcome ? `job · last ${n.last_outcome}` : "job · not run";
+    case "panel":
+      return ["panel", tags.includes("stale") ? "stale" : n.last_run_at ? "live" : "not run"].join(" · ");
     default:
       return KIND_LABEL[n.kind];
   }

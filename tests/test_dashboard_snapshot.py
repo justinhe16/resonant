@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, cast, get_args
 
 import pytest
+from panel_helpers import panel_manifest, raw_panel, store_panel
 from pydantic import BaseModel, ValidationError
 
 from resonant import __version__
@@ -22,6 +23,7 @@ from resonant.dashboard import snapshot as snap
 from resonant.dashboard.pusher import data_size
 from resonant.dashboard.snapshot import Snapshot, build_snapshot, schema_json, to_remote
 from resonant.extensions import notify
+from resonant.extensions.panels import Normalized
 from resonant.loop import SlotPool
 from resonant.loop.types import NewTask
 from resonant.redact import CUT_MARK, Redactor, redact_secrets
@@ -112,7 +114,7 @@ def test_free_text_is_capped_in_the_schema() -> None:
 
 
 def test_local_only_fields_are_marked() -> None:
-    """Exactly two things differ between the tiers (PER-276), so a rename can't silently move
+    """Exactly three things differ between the tiers (PER-276), so a rename can't silently move
     one, and a new local-only field is a decision, not an accident."""
     models = [
         m
@@ -124,6 +126,7 @@ def test_local_only_fields_are_marked() -> None:
         ("RunItem", "remote_url"),
         ("ClaudeBrain", "remote_url"),
         ("ApprovalItem", "code"),
+        ("Panel", "local_url"),
     }
 
 
@@ -990,9 +993,23 @@ def _seed_texts(db: sqlite3.Connection, now: datetime, text: Any) -> None:
                       "launch_agents": [{"label": "com.github.watcher", "description": text()}],
                       "tools": {"t": {"effect": "read", "description": text()}},
                       "mcp": {"servers": {"m": {"transport": "stdio", "tools": [
-                          {"name": "u", "effect": "read", "description": text()}]}}}},
+                          {"name": "u", "effect": "read", "description": text()}]}}},
+                      "panels": [{"id": "p", "title": text(), "description": text(),
+                                  "refresh": {"idle": text(), "active": text()}, "tz": text()}]},
         ),
     )  # fmt: skip
+    # PER-280: a panel's stored copy (written as the store holds it, not through normalize, so
+    # the snapshot's own text pass is what is tested), and its last error.
+    views = [{"id": "v", "title": "V", "widgets": [
+        {"type": "text", "text": text()[:800]},
+        {"type": "details", "rows": [{"depth": 0, "key": "k", "kind": "string",
+                                      "value": text()[:200]}]},
+    ]}]  # fmt: skip
+    ext_store.save_panel_ok(
+        db, "github", "p", data=json.dumps({"views": views, "health": "ok"}), updated_at=now,
+        ran_at=now, bytes=10, expect_by=now + timedelta(hours=1),
+    )  # fmt: skip
+    ext_store.record_panel_failure(db, "github", "p", ran_at=now, error=text())
     db.execute(
         "INSERT INTO trust_rules (scope, action, effect, created_from, created_at)"
         " VALUES (?, 'merge', 'ask', 'chat', ?)",
@@ -1287,6 +1304,19 @@ def seed_worst(db: sqlite3.Connection, now: datetime) -> None:
     for _ in range(30):
         audit(db, TOOL_ACTION, tool=x(80), decision="granted", command=x(400), cwd=x(400),
               status="error", write=True)  # fmt: skip
+    # PER-280: an extension (sorted first, so the 20-extension cap keeps it) with 8 full panels,
+    # about 190 KB: over ``PANEL_BUDGET_BYTES``, so the builder drops the biggest ones.
+    ids = tuple(f"p{k}" for k in range(8))
+    ext_store.save_extension(
+        db,
+        ext_store.ExtensionRecord(
+            name="aa-panels", source="repo:aa", commit="a" * 40, tree_digest="d",
+            manifest_sha="m", installed_at=now, installed_by="justin",
+            manifest=panel_manifest("aa-panels", ids),
+        ),
+    )  # fmt: skip
+    for k, pid in enumerate(ids):
+        store_panel(db, "aa-panels", pid, raw_panel(rows=50 - k, items=50, details=100), now)
 
 
 def remote_dump(db: sqlite3.Connection, now: datetime) -> dict[str, Any]:
@@ -1359,3 +1389,235 @@ def test_the_v1_remote_fixture_is_schema_one() -> None:
     """A snapshot an old daemon pushed: the page still renders it (legacy adapter)."""
     data = json.loads((UI_FIXTURES / "remote-v1.json").read_text())
     assert data["schema"] == 1 and data["tier"] == "remote"
+
+
+# --- extension panels (PER-280) -------------------------------------------------------------
+
+
+def _panel_ext(
+    db: sqlite3.Connection,
+    now: datetime,
+    name: str = "ledger",
+    ids: tuple[str, ...] = ("paper", "oncall"),
+    status: str = "enabled",
+) -> None:
+    ext_store.save_extension(
+        db,
+        ext_store.ExtensionRecord(
+            name=name, source=f"repo:{name}", commit="a" * 40, tree_digest="d", manifest_sha="m",
+            installed_at=now, installed_by="justin", manifest=panel_manifest(name, ids),
+            status=cast(Any, status),
+        ),
+    )  # fmt: skip
+
+
+def _panels(db: sqlite3.Connection, now: datetime, name: str = "ledger") -> dict[str, Any]:
+    s = build_snapshot(db, load_settings(), started_at=now, now=now)
+    (ext,) = [e for e in s.model_dump(mode="json")["extensions"] if e["name"] == name]
+    return {p["id"]: p for p in ext["panels"]}
+
+
+def test_a_panel_shows_its_copy_state_and_marks_its_words_as_outside(
+    db: sqlite3.Connection,
+) -> None:
+    now = utcnow()
+    _panel_ext(db, now, ids=("paper", "oncall", "never"))
+    got = store_panel(db, "ledger", "paper", raw_panel(), now - timedelta(minutes=2))
+    ext_store.save_panel_ok(
+        db, "ledger", "oncall", data=json.dumps({"views": [], "truncated": True}),
+        updated_at=now, ran_at=now, bytes=2, expect_by=now + timedelta(minutes=20),
+    )  # fmt: skip
+    ext_store.record_panel_failure(db, "ledger", "oncall", ran_at=now, error="exit 1")
+    panels = _panels(db, now)
+    paper = panels["paper"]
+    assert paper["title"] == "Panel paper" and paper["description"] == "The paper panel"
+    assert paper["schedule"] == "*/15 * * * *" and paper["active"] == "*/1 9-16 * * 1-5"
+    assert paper["tz"] == "America/New_York" and paper["ok"] is True and paper["stale"] is False
+    assert paper["fail_streak"] == 0 and paper["bytes"] == got.bytes and paper["health"] == "ok"
+    assert paper["local_url"] == "http://127.0.0.1:8765/ledger" and paper["truncated"] is True
+    assert paper["updated_at"] is not None and paper["last_run_at"] is not None
+    assert [v["id"] for v in paper["views"]] == ["overview", "system"]
+    assert paper["outside"] == ["views"] and paper["error"] is None
+    stat = paper["views"][0]["widgets"][0]
+    assert stat == {
+        "type": "stat", "label": "Equity", "value": 10432.5, "format": "money", "delta": 12.5,
+        "health": "ok",
+    }  # fmt: skip
+    oncall = panels["oncall"]
+    assert oncall["ok"] is False and oncall["stale"] is True and oncall["fail_streak"] == 1
+    assert oncall["error"] == "exit 1" and oncall["outside"] == ["error"] and oncall["views"] == []
+    never = panels["never"]
+    assert never["updated_at"] is None and never["last_run_at"] is None
+    assert never["stale"] is True and never["ok"] is False and never["bytes"] == 0
+    assert never["views"] == [] and never["outside"] == []
+    assert list(panels) == ["paper", "oncall", "never"]  # manifest order
+
+
+def test_the_stale_rule(db: sqlite3.Connection) -> None:
+    now = utcnow()
+    _panel_ext(db, now, ids=("a", "b", "c", "d"))
+    soon, past = now + timedelta(minutes=5), now - timedelta(seconds=1)
+    for pid, expect in (("a", soon), ("b", soon), ("c", past), ("d", None)):
+        ext_store.save_panel_ok(
+            db, "ledger", pid, data='{"views": []}', updated_at=now, ran_at=now, bytes=2,
+            expect_by=expect or soon,
+        )  # fmt: skip
+    db.execute("UPDATE ext_panels SET expect_by = NULL WHERE panel_id = 'd'")
+    ext_store.record_panel_failure(db, "ledger", "b", ran_at=now, error="x")
+    p = _panels(db, now)
+    assert [p[i]["stale"] for i in "abcd"] == [False, True, True, False]
+    # an extension that is not enabled has nothing fresh
+    ext_store.set_status(db, "ledger", "disabled")
+    assert all(x["stale"] for x in _panels(db, now).values())
+
+
+def test_an_unreadable_stored_copy_shows_no_views_and_says_so(db: sqlite3.Connection) -> None:
+    now = utcnow()
+    _panel_ext(db, now, ids=("a", "b"))
+    bad_view = {"id": "v", "title": "x" * 50, "widgets": [{"type": "text", "text": "t"}]}
+    for pid, data in (("a", json.dumps({"views": [bad_view]})), ("b", "not json{")):
+        ext_store.save_panel_ok(
+            db, "ledger", pid, data=data, updated_at=now, ran_at=now, bytes=9,
+            expect_by=now + timedelta(hours=1),
+        )  # fmt: skip
+    for panel in _panels(db, now).values():
+        assert panel["views"] == [] and panel["error"] == "stored copy unreadable"
+        assert panel["stale"] is True and panel["outside"] == ["error"] and panel["bytes"] == 0
+
+
+def test_local_url_is_local_tier_only(db: sqlite3.Connection) -> None:
+    now = utcnow()
+    _panel_ext(db, now)
+    store_panel(db, "ledger", "paper", raw_panel(), now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now)
+    local = s.model_dump(mode="json")
+    assert _panels(db, now)["paper"]["local_url"] == "http://127.0.0.1:8765/ledger"
+    assert '"local_url"' in json.dumps(local)
+    remote = to_remote(s).model_dump(mode="json")
+    assert '"local_url"' not in json.dumps(remote) and "127.0.0.1:8765" not in json.dumps(remote)
+    # a stored url that is not loopback http is dropped, not shipped
+    db.execute(
+        "UPDATE ext_panels SET data_json = replace(data_json, 'http://127.0.0.1:8765', "
+        "'https://evil.example') WHERE panel_id = 'paper'"
+    )
+    assert "local_url" not in _panels(db, now)["paper"]
+
+
+def _json_keys(node: Any) -> set[str]:
+    if isinstance(node, dict):
+        return set(cast(dict[str, Any], node)) | {
+            k for v in cast(dict[str, Any], node).values() for k in _json_keys(v)
+        }
+    if isinstance(node, list):
+        return {k for v in cast(list[Any], node) for k in _json_keys(v)}
+    return set()
+
+
+def test_panel_words_are_redacted_in_both_tiers_even_from_a_stored_copy(
+    db: sqlite3.Connection,
+) -> None:
+    now = utcnow()
+    _panel_ext(db, now, ids=("a",))
+    ghp = "ghp_" + "a1B2" * 9
+    views = [{"id": "v", "title": "V", "widgets": [
+        {"type": "text", "text": f"token {ghp} link {RC} ok"},
+        {"type": "kv", "items": [{"key": "k", "value": f"{ghp}"}]},
+        {"type": "details", "rows": [{"depth": 0, "key": "remote_url", "kind": "string",
+                                      "value": RC}]},
+    ]}]  # fmt: skip
+    ext_store.save_panel_ok(
+        db, "ledger", "a", data=json.dumps({"views": views}), updated_at=now, ran_at=now,
+        bytes=9, expect_by=now + timedelta(hours=1),
+    )  # fmt: skip
+    ext_store.record_panel_failure(db, "ledger", "a", ran_at=now, error=f"boom {ghp}")
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, redactor=Redactor(["tok-123"]))
+    for tier in (s, to_remote(s)):
+        text = json.dumps(tier.model_dump(mode="json"))
+        assert ghp not in text and "claude.ai/code" not in text and "AbC123xyz" not in text
+        assert "remote_url" not in _json_keys(tier.model_dump(mode="json"))  # a value, not a key
+        assert "ok" in text and redact_secrets(text) == text
+
+
+def test_the_panel_budget_drops_the_largest_then_the_oldest_and_says_truncated(
+    db: sqlite3.Connection,
+) -> None:
+    now = utcnow()
+    ids = ("old", "new", "mid", "small")
+    _panel_ext(db, now, ids=ids)
+    sizes: dict[str, Normalized] = {}
+    plan: list[tuple[str, dict[str, Any], int]] = [
+        ("old", {"rows": 50, "items": 50, "details": 100}, 90),  # the two largest are equal
+        ("new", {"rows": 50, "items": 50, "details": 100}, 1),
+        ("mid", {"rows": 10, "items": 10, "details": 10}, 1),
+        ("small", {"rows": 2, "items": 2, "details": 2}, 1),
+    ]
+    for pid, kw, age in plan:
+        at = now - timedelta(minutes=age)
+        sizes[pid] = store_panel(db, "ledger", pid, raw_panel(updated_at=at, **kw), at)
+    total = sum(n.bytes for n in sizes.values())
+    assert sizes["old"].bytes == sizes["new"].bytes > sizes["mid"].bytes > sizes["small"].bytes
+    s = build_snapshot(db, load_settings(), started_at=now, now=now)
+    assert all(p.views for p in s.extensions[0].panels) and total < snap.PANEL_BUDGET_BYTES
+    exts = [e.model_dump(mode="json") for e in s.extensions]
+    assert snap.panel_bytes(exts) == total
+    assert snap.fit_panels(exts, total) is False  # fits: nothing dropped
+
+    def held() -> dict[str, bool]:
+        return {p["id"]: bool(p["views"]) for p in exts[0]["panels"]}
+
+    assert snap.fit_panels(exts, total - 1) is True  # one must go: the oldest of the two largest
+    assert held() == {"old": False, "new": True, "mid": True, "small": True}
+    gone = next(p for p in exts[0]["panels"] if p["id"] == "old")
+    assert gone["truncated"] is True and "views" not in gone["outside"] and gone["ok"] is True
+    assert snap.panel_bytes(exts) <= total - 1
+    assert snap.fit_panels(exts, snap.panel_bytes(exts) - 1) is True  # then the other large one
+    assert held() == {"old": False, "new": False, "mid": True, "small": True}
+    assert snap.fit_panels(exts, 0) is True
+    assert snap.panel_bytes(exts) == 0 and snap.fit_panels(exts, 0) is False
+    Snapshot.model_validate({**s.model_dump(mode="json"), "extensions": exts})
+
+
+def test_the_builder_enforces_the_panel_budget_before_the_diagram(
+    db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = utcnow()
+    ids = tuple(f"p{i}" for i in range(6))
+    _panel_ext(db, now, ids=ids)
+    for pid in ids:
+        store_panel(db, "ledger", pid, raw_panel(rows=50, items=50, details=100), now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now)
+    panels = s.extensions[0].panels
+    held = [p for p in panels if p.views]
+    assert 0 < len(held) < len(panels), "six 26 KB panels are over the 100 KB budget"
+    assert sum(p.bytes for p in held) <= snap.PANEL_BUDGET_BYTES
+    dropped = [p for p in panels if not p.views]
+    assert all(p.truncated and "views" not in p.outside for p in dropped)
+    # a dropped panel keeps its state and still has its diagram node
+    assert {n.panel for n in (s.diagram.nodes if s.diagram else []) if n.kind == "panel"} == set(
+        ids
+    )
+
+
+def test_a_typical_store_with_two_full_panels_still_fits_the_relay(db: sqlite3.Connection) -> None:
+    now = utcnow()
+    seed_typical(db, now)
+    without = data_size(remote_dump(db, now))
+    _panel_ext(db, now)
+    for pid in ("paper", "oncall"):
+        store_panel(db, "ledger", pid, raw_panel(), now)
+    data = remote_dump(db, now)
+    size = data_size(data)
+    assert data["trimmed"] == "none" and pusher_mod.shrink(data) is data
+    assert 40_000 < size - without < 70_000, (without, size)  # two ~24 KB panels
+    assert size < pusher_mod.MAX_BYTES * 3 // 4, size
+
+
+def test_the_panel_schema_is_in_the_snapshot_schema_and_is_flat() -> None:
+    schema = Snapshot.model_json_schema()
+    defs = schema["$defs"]
+    assert {"Panel", "PanelView", "StatWidget", "DetailRow", "DetailsWidget"} <= set(defs)
+    assert (
+        "panels" in defs["Extension"]["properties"] and "panel" in defs["DiagramNode"]["properties"]
+    )
+    assert "panels" in schema["properties"]["trimmed"]["enum"]
+    assert defs["Panel"]["properties"]["local_url"]["x-tier"] == "local"

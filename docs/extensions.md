@@ -61,6 +61,7 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 | `bins` | list of `gh`/`git`, optional | Host binaries your own code runs (the github extension's `gh`). Each is pinned by its real absolute path at install and reaches every process of the extension as `RESONANT_BIN_<NAME>` (`RESONANT_BIN_GH`); run it by that path, never by a `PATH` lookup. Shown as an escalation at install. |
 | `repos` | list of `owner/name`, ≤ 20, optional | GitHub repos this extension is about (e.g. `me/trading-bot`). Saying "work on trading" in a request then means those repos: one link resolves to it, several ask which. Links are only a name for the repo; they grant nothing, and the repo is checked against GitHub when first used. `ext add`/`update` replace the links, `ext remove` drops them, and `/ext list` shows them. |
 | `launch_agents` | list of `{label, description}`, ≤ 10, optional | launchd agents your own setup installs (a trading loop, a token refresher), e.g. `{label: com.tradejev.paper, description: The paper trading loop.}`. Names only: Resonant never installs, loads or reads them, and they grant nothing. The dashboard's Diagram tab shows each one under your extension with whether it is running (PER-277). `label` is `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, unique; `description` is one line, ≤ 160 chars. |
+| `panels` | list, ≤ 8, optional | Dashboard panels: a command Resonant runs on a schedule and draws from the JSON it prints, described in §6a (PER-280). |
 
 ## 4. Tools
 
@@ -228,6 +229,162 @@ jobs:
 - While the kill switch is on, due jobs are skipped and never caught up, and a running job's processes are killed.
 - **Critical jobs** (deferred: `ext add` refuses `critical: true` for now) will get their own LaunchAgent, wrapped as `resonant job-guard --job <ext>/<id> -- <run>`, which **refuses to run while the kill switch is engaged** and fails closed (exit 75). Make them idempotent and safe to skip.
 
+## 6a. Panels
+
+A panel is a page of your extension on the dashboard: stats, charts, tables, status lists. You **compute**, Resonant **draws**. Your command prints data; Resonant never runs your code in the browser and never renders your markup. Every string is plain text.
+
+```yaml
+panels:
+  - id: paper                      # slug, unique among your panels, at most 8 panels
+    title: Paper trading           # 1-60 chars, one line
+    description: PnL and positions # optional, ≤ 160 chars
+    command: [./cli.py, panel, paper]   # a list of 1-16 printable-ASCII items, each ≤ 200; no { or }
+    refresh:
+      idle: "*/15 * * * *"         # required: the cron when nothing else applies
+      active: "*/1 9-16 * * 1-5"   # optional: the cron instead of idle while its hours/days/months match
+    tz: America/New_York           # default: the daemon's timezone
+    secrets: [alpaca_key]          # must also appear in top-level secrets
+    timeout_s: 30                  # default 30, at most 120
+    max_bytes: 24576               # default 16384, 1024-32768
+```
+
+- **A panel is an L0 read.** It is never an escalation: it can't ask, can't write, and runs through the same gate and audit as any scheduled L0 read (`origin: scheduled`). A command that runs `gh` or `git` still shows as "network" at install. Its command follows the tool rules: a `.py` file in your directory, `python3 <script.py>`, `gh` or `git`; no placeholders, so no arguments from anywhere but your manifest. Each panel also has a hidden `panel_<id>` spec (dashes become underscores) that never appears in chat. No tool may use that name.
+- **Install and update.** `ext add` shows a `Panels:` block (id, title, schedule, `read L0`, size cap, the command), and `ext update` lists `+ panel <id>` and `- panel <id>`. An update that drops a panel drops its stored copy.
+- **Where it shows.** The Overview tab shows up to two panels' first stats under your extension, tapping opens your extension's page (`#/ext/<name>`) with every panel, and the Diagram tab has a node per panel. The brain can read the last copy with `read_panel` (below).
+
+### What the command prints
+
+One JSON object on stdout and exit 0, like a tool. The JSON schema is [`panel.schema.json`](panel.schema.json), generated from `resonant_sdk/panel_schema.py` (`uv run python -m resonant_sdk.panel_schema > docs/panel.schema.json`; a test fails when it is stale).
+
+```json
+{ "schema": 1,
+  "updated_at": "2026-10-16T16:58:30Z",
+  "health": "ok",
+  "local_url": "http://127.0.0.1:8765/paper",
+  "views": [ { "id": "overview", "title": "Overview", "widgets": [ … ] } ] }
+```
+
+| Field | Rule |
+|---|---|
+| `schema` | Must be `1`; anything else is refused. |
+| `updated_at` | Optional, ISO-8601 **with an offset**: when the data is from. A time in the future is clamped to the end of the run; absent means the end of the run. |
+| `health` | Optional `ok`, `warn` or `bad`: your own verdict, shown as a dot. |
+| `local_url` | Optional `http://127.0.0.1:<1-65535>/…`, ≤ 300 printable ASCII: your own page on this Mac. The **local** dashboard links it ("Open locally"); the relay never sees it. Anything else (https, another host, `localhost`, port 0) is refused. |
+| `actions` | Reserved. Absent or `[]`; a non-empty list is refused. |
+| `views` | 1 to 6 tabs `{id, title (cut at 40), widgets}`; 1 to 24 widgets per view and at most 48 per panel. `id` is `^[a-z0-9][a-z0-9_-]{0,31}$`. |
+
+**Cut, never refused: strings.** A string over its cap is cut by Resonant (ending `… [cut]`). **Refused: structure.** An unknown key or widget type, a wrong type, or a count over a limit refuses the whole run: the last good copy stays on the page with the error. Errors are built by Resonant (`refused: view overview widget 3 (series): 5 series (max 4)`), redacted, and ≤ 200 characters.
+
+Every widget may carry `id` (a slug) and `title` (cut at 64). `Format` is one of `number`, `integer`, `money`, `percent` (12.3 → `12.3%`), `duration` (seconds) or `bytes`; `Tone` is `ok`/`warn`/`bad`; `currency` is three capitals (default USD). A *time* is an ISO-8601 string with an offset, or unix seconds.
+
+| `type` | Fields | Limits and behaviour |
+|---|---|---|
+| `stat` | `label` (cut 40), `value` (number, string cut 40, or null), `unit` (cut 16), `format`, `currency`, `delta` (number), `delta_format`, `health` (Tone), `hint` (cut 80) | A bool `value` is refused. |
+| `series` | `kind` (`line`, `area`, `bar`), `x: {type: time or category, values}`, `series: [{name (cut 32), values}]`, `unit`, `format`, `currency`, `stacked` | 1-4 lines (5 is refused), each as long as `x.values` (`null` is a gap). At most 2400 points. A `time` axis must not go backwards; over 240 points it is downsampled to 240 (see below). A `category` axis is strings (cut 24), at most 240. |
+| `table` | `columns: [{key (slug), label (cut 32), type, align, currency}]`, `rows: [{<key>: cell}]` | 1-8 columns (9 is refused). `type` is `text`, `number`, `money`, `time`, `pill` or `link`. Cells: `text` a string (cut 120); `number`/`money` a number; `time` a time; `pill` `{label (cut 24), tone: ok/warn/bad/neutral}` or a string (tone neutral); `link` `{label (cut 64), tool}`. `null` or a missing key is an empty cell. A wrong-typed cell or an unknown key is refused. A link to a tool that isn't in this manifest is shown as plain text; a link runs nothing, it only names a tool as `ext/tool`. The first 50 rows are kept: the widget says `truncated` and `total_rows`. |
+| `status` | `items: [{name (cut 64), state: up/down/warn/unknown, detail (cut 120), since (time)}]` | The first 50 items. |
+| `kv` | `items: [{key (cut 40), value (string cut 120, number, bool or null), format, unit}]` | The first 30 items. |
+| `text` | `text` (cut 800) | Plain text, shown as is (`<b>` stays `<b>`). |
+| `details` | `data` (any JSON value), `collapsed` (default true) | Flattened by Resonant into at most 200 rows `{depth, key, kind, value}` in document order (see below); a container at depth 5 becomes one `…` row. |
+
+**Downsampling.** A time axis over 240 points keeps the first and last points exactly and splits the middle into 238 equal buckets. Each bucket takes the x of its first point and, per line, the mean of its non-null values (null if all are null). The widget says `downsampled_from: <n>`.
+
+**`details` is flattened.** The relay's guard refuses any JSON key named `remote_url` anywhere, and keys are not scanned for secrets, so a free-form tree can't be sent as it is. Resonant turns it into rows whose keys are *values*: the root has an empty key, an object's key is its name, an array item is `[0]`, `[1]`, … and `kind` is `object`, `array`, `string`, `number`, `bool` or `null` (a string is cut at 200).
+
+**Size.** After normalising, the panel's views are measured as compact JSON. Over `min(max_bytes, 32768)` is refused (`panel is 40123 bytes after normalising (max 24576)`). Rows and items cut for count mark the copy `truncated`; a cut string or a downsampled axis doesn't.
+
+### Redaction and where words come from
+
+Everything a panel prints is the extension's, not yours: it is marked `outside` on the dashboard. It passes the same redaction as every other text (credential-shaped text and the values of your declared secrets become `[redacted]`, Remote Control links are replaced) when it is stored **and** again every time a snapshot is built, so a stored copy can't leak what a later pattern catches. The brain's `read_panel` returns text from outside, so a task that reads it is treated as tainted (D6).
+
+### Refresh
+
+- The `idle` cron runs always. While the daemon's local time (in `tz`) matches the hours, days and months of `active`, **`active` runs instead of `idle`**, and the minute field of `active` sets how often. `active: "*/1 9-16 * * 1-5"` is every minute from 09:00 to 16:59 on weekdays and `idle` the rest of the time. Crons are five numeric fields (no names, no `@`); both fields of day-of-month and day-of-week restricted match either, as in cron; day-of-week 7 is Sunday.
+- **Floor:** a panel can run at most once a minute, and never starts twice within 55 seconds. Each panel also runs **once at start-up**, about 30 seconds after the daemon starts, staggered by 3 seconds per panel, so the dashboard has data before the first cron time.
+- **Pause.** While the kill switch is on, a panel doesn't run, and missed runs are not caught up or logged. The last copy stays.
+- Panels run at most 2 at a time, in slots of their own, so panels that hang up to their timeout can't hold up jobs (jobs keep `extensions.max_concurrent_jobs`). The audit has one `panel.run` row per good run (`ok`, `ms`, `bytes`, `truncated`) on top of the gate's own row, and `panel.failed`, `panel.denied`, `panel.killed`, `panel.dry_run` or `panel.skipped_paused` otherwise.
+
+### Failure, stale and health
+
+A failed run (non-zero exit, timeout, bad output, a missing secret) or a refused output **keeps the last good copy**, records the error and counts a streak. A panel is **stale** when its last run failed, it has no good copy yet, its extension isn't enabled, or it is later than its next expected run plus its timeout plus 120 seconds. The dashboard greys a stale panel and shows the error with the old copy. Three failures in a row (`panel <id> failed 3 times in a row`) turn the extension's `ext:<name>` health to degraded, like a job, and a good run clears it.
+
+### Budgets
+
+One panel is at most `min(max_bytes, 32 KiB)`. All panels in one snapshot are at most **100 KB**: over that, panels are dropped largest first (the oldest data among equals), each shown with its title and run state and "too big to send". The relay's own cap is 240 KB: when the snapshot is still over it, the pusher trims in this order: history, **panels** (largest first), the lists, detail, items (`trimmed` says how far).
+
+### Helpers (stdlib only)
+
+Extensions run as `python -I -S`, so the SDK isn't importable: copy `packages/resonant-sdk/src/resonant_sdk/panel.py` next to your script, like `emit.py`, and add the script's directory to `sys.path`.
+
+```python
+from panel import print_panel, stat, series, table, column, pill, link, status, kv, text, details, view
+```
+
+`stat`, `series`, `table` (with `column`, `pill`, `link`), `status`, `kv`, `text` and `details` build the widgets as dicts (None fields are left out, a `datetime` becomes ISO text and must have a timezone); `view(id, title, widgets)` builds a tab and `print_panel(views, updated_at=…, health=…, local_url=…)` prints the object.
+
+### Example: a finance extension
+
+```yaml
+panels:
+  - id: paper
+    title: Paper trading
+    description: Equity, PnL and open positions
+    command: [./cli.py, panel, paper]
+    refresh: {idle: "*/15 * * * *", active: "*/1 9-16 * * 1-5"}
+    tz: America/New_York
+    secrets: [alpaca_key]
+    max_bytes: 24576
+```
+
+```python
+# cli.py, `panel paper`
+from panel import column, link, pill, print_panel, series, stat, table, view
+
+equity, history, positions = load()   # your own code
+print_panel(
+    [view("overview", "Overview", [
+        stat("Equity", equity.now, format="money", delta=equity.now - equity.open),
+        stat("Day PnL", equity.day, format="money", health="ok" if equity.day >= 0 else "bad"),
+        series("area", [t for t, _ in history], {"Equity": [v for _, v in history]},
+               format="money", title="Equity today"),
+        table(
+            [column("sym", "Symbol"), column("qty", "Qty", "number"),
+             column("pnl", "PnL", "money"), column("side", "Side", "pill"),
+             column("act", "", "link")],
+            [{"sym": p.sym, "qty": p.qty, "pnl": p.pnl,
+              "side": pill(p.side, "ok" if p.pnl >= 0 else "bad"),
+              "act": link("close", "close_position")} for p in positions],
+            title="Positions",
+        ),
+    ])],
+    local_url="http://127.0.0.1:8765/paper",
+)
+```
+
+### Example: an on-call extension
+
+```yaml
+panels:
+  - id: oncall
+    title: On call
+    command: [./cli.py, panel, oncall]
+    refresh: {idle: "*/5 * * * *"}
+```
+
+```python
+from panel import details, kv, print_panel, status, view
+
+print_panel([view("now", "Now", [
+    status([{"name": s.name, "state": s.state, "detail": s.note} for s in services]),
+    kv({"open incidents": open_count, "on call": who}),
+    details(last_incident),     # any JSON; shown as a collapsed tree
+])], health="warn" if open_count else "ok")
+```
+
+### `read_panel`
+
+The brain can read what a panel last drew: `read_panel {extension}` lists the extension's panels (`id`, `title`, `updated_at`, `ok`, `stale`, `error`) with the stat widgets of each first view as `{label, value, unit}`; `read_panel {extension, panel}` returns that panel's views in full. It reads the stored copy only and never runs anything. Its output is outside text, so the calling task is tainted.
+
 ## 7. Events and notifications
 
 Your processes report what happened by emitting events: either an `"events"` list in the result object, or JSON lines written to file descriptor 3 (`RESONANT_EVENTS_FD`) with the stdlib helper `emit.py` copied from the SDK (`from emit import emit; emit("ci_failed", "✗ resonant#40 CI failed (lint)", "resonant#40:run:123:failed")`). Events count only when the run succeeds.
@@ -318,6 +475,7 @@ The digest is sha256 over the sorted `(path, file/executable/symlink, sha256(con
 - [ ] Every MCP tool you want is listed with its real effect and a description written for the model.
 - [ ] A non-zero exit means nothing took effect; state goes to `$RESONANT_EXT_DATA`.
 - [ ] Every job declares its real effect; asking jobs (L1/L2) run at most hourly.
+- [ ] Every panel prints one JSON object with `schema: 1`, stays under its `max_bytes`, and is safe to run every minute (it only reads). Its `local_url` is loopback http, and nothing secret goes in a title or a cell.
 - [ ] Every tool prints exactly one JSON object and exits 0 on success.
 - [ ] Effects and levels are as low as safely possible, and `commit: true` is on irreversible actions.
 - [ ] No secrets in the repo; secrets are declared and stored in the Keychain.

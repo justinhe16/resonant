@@ -79,6 +79,8 @@ describe("diagram hierarchy", () => {
       "job:github/watch",
       "job:github/digest",
       "repo:github/resonant",
+      "panel:github/prs",
+      "panel:github/ci",
     ]);
     expect(tree.byId.get("tool:github/merge_pr")?.depth).toBe(2);
     expect(tree.byId.get("group:scheduler")?.children.map((c) => c.id)).toEqual(["core:scheduler"]);
@@ -105,7 +107,7 @@ describe("diagram hierarchy", () => {
 
   it("rolls the worst health and the part count up to a closed box", () => {
     expect(rollup(tree.byId.get("ext:weather")!)).toEqual({ health: "degraded", count: 3 });
-    expect(rollup(tree.byId.get("ext:github")!)).toEqual({ health: "ok", count: 5 });
+    expect(rollup(tree.byId.get("ext:github")!)).toEqual({ health: "degraded", count: 7 }); // its CI panel is stale
     expect(rollup(tree.byId.get("group:extensions")!)).toEqual({ health: "degraded", count: 3 });
     expect(rollup(tree.byId.get("group:messages")!).health).toBe("degraded"); // the gateway
     expect(rollup(tree.byId.get("group:toolcore")!)).toEqual({ health: null, count: 3 }); // none known

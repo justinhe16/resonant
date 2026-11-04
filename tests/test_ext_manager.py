@@ -930,3 +930,110 @@ def test_cli_validate_prints_the_report_grant(tmp_path: Path) -> None:
     ext = write_ext(tmp_path / "rep", _with_report("urgent"))
     code, out = invoke("validate", str(ext))
     assert code == 0 and "reports: may text you any time (urgent)" in out
+
+
+# --- panels (PER-280) -------------------------------------------------------------------
+
+
+PANELS = """\
+panels:
+  - id: paper
+    title: Paper trading
+    description: PnL and positions
+    command: [./cli.py, panel, paper]
+    refresh: {idle: "*/15 * * * *", active: "*/1 9-16 * * 1-5"}
+    tz: America/New_York
+    max_bytes: 24576
+  - id: oncall
+    title: On call
+    command: [./cli.py, panel, oncall]
+    refresh: {idle: "0 * * * *"}
+"""
+
+
+def test_confirm_shows_a_panels_block_only_when_there_are_panels(
+    mgr: ExtensionManager, repo: Path
+) -> None:
+    plain = mgr.stage("repo:demo")
+    assert "Panels:" not in confirm_lines(plain)
+    mgr.discard(plain)
+    (repo / "extensions" / "demo" / "resonant.yaml").write_text(MANIFEST + PANELS)
+    commit_all(repo)
+    staged = mgr.stage("repo:demo")
+    lines = confirm_lines(staged)
+    mgr.discard(staged)
+    i = lines.index("Panels:")
+    assert lines[i + 1 : i + 4] == [
+        '  "paper" "Paper trading" every 15 minutes "America/New_York"; active: '
+        'cron "*/1 9-16 * * 1-5" "America/New_York", read L0, max 24576 B, '
+        "runs ./cli.py panel paper",
+        '    "PnL and positions"',
+        '  "oncall" "On call" hourly at :00, read L0, max 16384 B, runs ./cli.py panel oncall',
+    ]
+    assert "Jobs: none" in lines  # the panels are not jobs
+
+
+def test_a_panel_is_pinned_pruned_and_diffed(
+    mgr: ExtensionManager, repo: Path, conn: sqlite3.Connection
+) -> None:
+    manifest = repo / "extensions" / "demo" / "resonant.yaml"
+    manifest.write_text(MANIFEST + PANELS)
+    commit_all(repo)
+    first = mgr.stage("repo:demo")
+    mgr.discard(first)
+    record = mgr.install(first.pin, name="demo")
+    # argv0 is pinned per panel spec, under its spec name
+    assert {"panel_paper", "panel_oncall"} <= set(record.argv0_paths)
+    assert record.manifest["panels"][0]["command"] == ["./cli.py", "panel", "paper"]
+    with atomic(conn):
+        ext_store.record_panel_failure(conn, "demo", "oncall", ran_at=NOW, error="x")
+        ext_store.record_panel_failure(conn, "demo", "paper", ran_at=NOW, error="x")
+    # an update that drops one and adds another: the diff says so, and the state is pruned
+    manifest.write_text(MANIFEST + PANELS.split("  - id: oncall")[0] + PANELS_NEW)
+    commit_all(repo)
+    second = mgr.stage("repo:demo")
+    diff = update_lines(record, mgr.installed_files("demo"), second)
+    mgr.discard(second)
+    assert '  + panel "tape"' in diff and '  - panel "oncall"' in diff
+    assert not [d for d in diff if '"paper"' in d]
+    mgr.install(second.pin, name="demo")
+    assert [p.panel_id for p in ext_store.list_panels(conn, "demo")] == ["paper"]
+
+
+PANELS_NEW = """\
+  - id: tape
+    title: Tape
+    command: [./cli.py, panel, tape]
+    refresh: {idle: "*/5 * * * *"}
+"""
+NOW = datetime(2026, 10, 14, 15, 0, tzinfo=UTC)
+
+
+def test_a_panel_command_goes_through_the_directory_checks(
+    mgr: ExtensionManager, repo: Path
+) -> None:
+    ext = repo / "extensions" / "demo"
+    (ext / "resonant.yaml").write_text(
+        MANIFEST
+        + "panels:\n  - id: bad\n    title: Bad\n    command: [sh, -c, 'true']\n"
+        + "    refresh: {idle: '0 * * * *'}\n"
+    )
+    commit_all(repo)
+    with pytest.raises(ManagerError) as e:
+        mgr.stage("repo:demo")
+    assert any(p.startswith("panel bad:") for p in e.value.problems), e.value.problems
+
+
+def test_a_panel_that_runs_gh_shows_as_network(mgr: ExtensionManager, repo: Path) -> None:
+    from resonant.extensions.manager import escalations
+    from resonant_sdk import Manifest
+    from resonant_sdk.manifest import parse_yaml
+
+    m = Manifest.model_validate(
+        parse_yaml(
+            MANIFEST
+            + "panels:\n  - id: prs\n    title: PRs\n    command: [gh, pr, list]\n"
+            + "    refresh: {idle: '*/5 * * * *'}\n"
+        )
+    )
+    assert "panel prs runs gh (network)" in [e.replace('"', "") for e in escalations(m)]

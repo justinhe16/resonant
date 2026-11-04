@@ -93,6 +93,7 @@ def commands(manifest: Manifest) -> list[tuple[str, str]]:
     """Every command the manifest can run, as ``(where, run)``."""
     out = [(f"tool {name}", t.run) for name, t in manifest.tools.items()]
     out += [(f"job {j.id}", j.run) for j in manifest.jobs]
+    out += [(f"panel {p.id}", p.run) for p in manifest.panels]
     if manifest.health:
         out.append(("health", manifest.health.check))
     return out

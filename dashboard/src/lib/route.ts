@@ -10,6 +10,8 @@ export type Route =
   | { kind: "approval"; id: string }
   | { kind: "question"; id: number }
   | { kind: "extension"; name: string }
+  /** an extension's dashboard page (PER-280), not a dialog; `panel` scrolls to one card */
+  | { kind: "ext"; name: string; panel?: string }
   | { kind: "job"; ext: string; id: string }
   | { kind: "pulse"; source: string; key: string }
   | { kind: "health"; name: string }
@@ -56,6 +58,8 @@ export function parseHash(hash: string): Route | null {
     }
     case "extensions":
       return a ? { kind: "extension", name: a } : null;
+    case "ext":
+      return a ? { kind: "ext", name: a, ...(b && { panel: b }) } : null;
     case "jobs":
       return a && b ? { kind: "job", ext: a, id: b } : null;
     case "pulse":
@@ -90,6 +94,8 @@ export function toHash(r: Route): string {
       return `#/questions/${r.id}`;
     case "extension":
       return `#/extensions/${enc(r.name)}`;
+    case "ext":
+      return `#/ext/${enc(r.name)}${r.panel ? `/${enc(r.panel)}` : ""}`;
     case "job":
       return `#/jobs/${enc(r.ext)}/${enc(r.id)}`;
     case "pulse":
