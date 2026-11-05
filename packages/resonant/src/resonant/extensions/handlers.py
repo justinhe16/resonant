@@ -9,6 +9,9 @@ environment from scratch (``scratch_env``), runs it through the process runner w
 
 Jobs take ``{due_at}``: it becomes ``RESONANT_JOB_DUE_AT`` (and fills ``{due_at}`` if the
 job's ``run`` uses it).
+
+A panel with ``history`` (PER-286) is ``dated``: a call with a ``date`` arg (``YYYY-MM-DD``,
+the archiver's) runs the same argv plus ``--date <date>``. Any other handler refuses ``date``.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from resonant.executor import CallContext, ContextHandler, ToolFailed
+from resonant.extensions.panel_history import parse_day
 from resonant.extensions.process import (
     ExtCommand,
     ExtRequest,
@@ -42,6 +46,7 @@ class ExtensionHandler(ContextHandler):
     path_env: str
     job: bool = False
     bins: Mapping[str, str] = field(default_factory=dict[str, str])  # RESONANT_BIN_* -> pin
+    dated: bool = False  # PER-286: a history panel; a ``date`` arg adds ``--date <date>``
 
     async def __call__(self, args: dict[str, Any], ctx: CallContext) -> dict[str, Any]:
         due_at: str | None = None
@@ -51,6 +56,13 @@ class ExtensionHandler(ContextHandler):
                 raise ToolFailed("a job needs a due_at string")
             due_at = value
         argv = self.command.render(args)
+        if "date" in args:
+            day = args["date"]
+            if not self.dated:
+                raise ToolFailed("this command takes no date")
+            if not isinstance(day, str) or parse_day(day) is None:
+                raise ToolFailed("date must be YYYY-MM-DD")
+            argv = (*argv, "--date", day)
         undeclared = set(ctx.secrets) - {f"RESONANT_SECRET_{s.upper()}" for s in self.spec.secrets}
         if undeclared:  # the executor passes only declared ones; never widen
             raise ToolFailed("secrets not declared by this tool")

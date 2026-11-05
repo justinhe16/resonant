@@ -28,6 +28,7 @@ MIGRATION = (
     / "migrations"
     / "20261102000000_relay_full_snapshot.sql"
 )
+PANEL_DAYS_MIGRATION = MIGRATION.with_name("20261105000000_relay_panel_days.sql")  # PER-286
 # Postgres's ``\y`` (a word boundary) is Python's ``\b``; the rest is the same syntax.
 SQL_RE = re.compile(SECRET_SQL_FAMILY.replace(r"\y", r"\b"))
 
@@ -103,8 +104,9 @@ def _sample(rng: random.Random) -> str:
     return f"{noise()}{prefix}{body}{noise()}"
 
 
-def test_the_migration_holds_this_exact_pattern() -> None:
-    sql = MIGRATION.read_text()
+@pytest.mark.parametrize("migration", [MIGRATION, PANEL_DAYS_MIGRATION])
+def test_the_migration_holds_this_exact_pattern(migration: Path) -> None:
+    sql = migration.read_text()
     assert SECRET_SQL_FAMILY in sql
     assert sql.count(SECRET_SQL_FAMILY) == 1 and "p_data::text ~ '" + SECRET_SQL_FAMILY + "'" in sql
 

@@ -5,6 +5,7 @@ import { TriangleAlert } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { loadConfig } from "@/lib/config";
 import { loadLocal } from "@/lib/local";
+import { loadLocalDay } from "@/lib/panelDays";
 import { createRemoteClient, type RemoteClient } from "@/lib/supabase";
 
 type State =
@@ -44,7 +45,7 @@ export function App({ makeRemote = createRemoteClient }: AppProps) {
     case "loading":
       return null;
     case "local":
-      return <Dashboard load={loadLocal} />;
+      return <Dashboard load={loadLocal} loadDay={loadLocalDay} />;
     case "supabase":
       return <SupabaseGate client={state.client} />;
     case "error":

@@ -411,6 +411,28 @@
       "title": "Marker",
       "type": "object"
     },
+    "PanelNone": {
+      "additionalProperties": false,
+      "description": "PER-286: what a history run (``--date YYYY-MM-DD``) prints for a day with no data (a\nweekend, a holiday). The day is recorded as none, never retried and never listed.",
+      "properties": {
+        "none": {
+          "const": true,
+          "title": "None",
+          "type": "boolean"
+        },
+        "schema": {
+          "const": 1,
+          "title": "Schema",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "schema",
+        "none"
+      ],
+      "title": "PanelNone",
+      "type": "object"
+    },
     "Pill": {
       "additionalProperties": false,
       "properties": {

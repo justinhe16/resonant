@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, cast
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 import httpx
 import typer
@@ -956,6 +957,79 @@ def ext_list(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
             f" jobs {len(r.manifest.get('jobs') or [])}  {iso(r.installed_at)}"
             + (f"  repos {', '.join(_clean_repos(r.manifest))}" if r.manifest.get("repos") else "")
         )
+
+
+@ext_app.command("panel-history")
+def ext_panel_history(
+    name: Annotated[str, typer.Argument(help="An installed extension")],
+    panel: Annotated[str, typer.Argument(help="One of its panels with history")],
+    rebuild: Annotated[
+        bool, typer.Option("--rebuild", help="Archive the days again (the daemon re-runs them).")
+    ] = False,
+    since: Annotated[
+        str | None, typer.Option("--since", help="With --rebuild: from this day (YYYY-MM-DD).")
+    ] = None,
+) -> None:
+    """A panel's archived days (PER-286); --rebuild queues them to be archived again."""
+    from resonant.extensions import panel_history as ph
+
+    settings = load_settings()
+    if since is not None and not rebuild:
+        typer.echo("error: --since goes with --rebuild", err=True)
+        raise typer.Exit(2)
+    with contextlib.closing(_open_store(settings, readonly=not rebuild)) as conn:
+        record = ext_store.get_extension(conn, name)
+        if record is None:
+            typer.echo(f"error: {name} is not installed", err=True)
+            raise typer.Exit(1)
+        found = ph.panel_history(record.manifest, panel)
+        if found is None:
+            typer.echo(f"error: {name} has no panel {panel} with history", err=True)
+            raise typer.Exit(1)
+        keep_days, tz_name = found
+        tz = ZoneInfo(tz_name or settings.timezone)
+        now = utcnow()
+        oldest, last = ph.keep_from(now, tz, keep_days), ph.latest_day(now, tz)
+        if not rebuild:
+            rows = ext_store.list_panel_days(conn, name, panel)
+            if not rows:
+                typer.echo(f"{name}/{panel}: no archived days yet (keep {keep_days}d)")
+            for r in rows:
+                err = f"  {clean_external(r.last_error)[:120]}" if r.last_error else ""
+                typer.echo(f"{r.day}  {r.status:<7} {r.bytes:>6} B  tries {r.attempts}{err}")
+            return
+        first = oldest  # the oldest day kept (older ones are pruned)
+        if since is not None:
+            start = ph.parse_day(since)
+            if start is None:
+                typer.echo("error: --since must be YYYY-MM-DD", err=True)
+                raise typer.Exit(2)
+            if start > last:
+                typer.echo(f"error: {since} hasn't been archived yet (latest {last})", err=True)
+                raise typer.Exit(1)
+            if start < first:
+                typer.echo(f"error: {since} is past keep ({keep_days}d: from {first})", err=True)
+                raise typer.Exit(1)
+            first = start
+        days = [d.isoformat() for d in ph.days_between(first, last)]
+        with atomic(conn):
+            n = ext_store.queue_rebuild(conn, name, panel, days, at=now)
+            audit(
+                conn,
+                "panel.history_rebuild",
+                requested_by=_CLI_ACTOR,
+                extension=name,
+                panel=f"{name}/{panel}",
+                since=days[0] if days else None,
+                days=n,
+            )
+    typer.echo(
+        f"Queued {n} day{'s' if n != 1 else ''} of {name}/{panel} ({days[0]} to {days[-1]}). "
+        "The daemon archives them again one at a time, newest first; each keeps its old copy "
+        "until the new one lands."
+        if n
+        else "Nothing to rebuild."
+    )
 
 
 # --- secrets ---------------------------------------------------------------------------

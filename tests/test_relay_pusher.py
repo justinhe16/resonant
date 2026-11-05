@@ -901,3 +901,140 @@ def test_twenty_extensions_of_maxed_out_panels_still_shrink_to_fit(
         for p in held
     )
     Snapshot.model_validate(out)
+
+
+# --- panel days (PER-286) --------------------------------------------------------------------
+
+
+@dataclass
+class DaysFake:
+    """The snapshot RPC accepts everything; ``relay_panel_day`` answers from ``script``
+    (default 204) and records each body."""
+
+    script: list[int] = field(default_factory=list[int])
+    days: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == INGEST_PATH:
+            return httpx.Response(204)
+        assert request.url.path == pusher_mod.DAY_PATH
+        assert request.headers.get("apikey") == ANON
+        self.days.append(json.loads(request.content))
+        return httpx.Response(self.script.pop(0) if self.script else 204)
+
+
+def _days_pusher(db: sqlite3.Connection, fake: DaysFake, clock: list[datetime]) -> SnapshotPusher:
+    settings = load_settings()
+
+    async def snapshot(redactor: Redactor) -> Snapshot:
+        return build_snapshot(db, settings, started_at=T0, now=T0, redactor=redactor)
+
+    return SnapshotPusher(
+        db,
+        RelayConfig(enabled=True, supabase_url=URL, anon_key=ANON, max_attempts=1),
+        snapshot=snapshot,
+        secrets=SecretStore(FakeKeychain(items={SUPABASE_KEY_REF: TOKEN})),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(fake.handle)),
+        sleep=Sleeps(),
+        clock=lambda: clock[0],
+        jitter=lambda: 0.0,
+    )
+
+
+def _history_ext(db: sqlite3.Connection) -> None:
+    from panel_helpers import normalized, panel_manifest, raw_panel
+
+    from resonant.store import extensions as ext_store
+
+    manifest = panel_manifest("ledger", ("paper",))
+    manifest["panels"][0]["history"] = {"every": "daily", "keep": "90d"}
+    ext_store.save_extension(
+        db,
+        ext_store.ExtensionRecord(
+            name="ledger", source="repo:ledger", commit="a" * 40, tree_digest="d",
+            manifest_sha="m", manifest=manifest, installed_at=T0, installed_by="justin",
+        ),
+    )  # fmt: skip
+    data = json.dumps(normalized(raw_panel(points=20, rows=3, items=3, details=3)).data)
+    for day in ("2026-10-13", "2026-10-14", "2026-10-15", "2026-10-12"):
+        ext_store.save_day_ok(db, "ledger", "paper", day, data=data, bytes=9, at=T0)
+    db.commit()
+
+
+async def test_archived_days_upload_once_after_a_push_oldest_first(db: sqlite3.Connection) -> None:
+    from resonant.store import extensions as ext_store
+
+    _history_ext(db)
+    fake, clock = DaysFake(), [T0]
+    pusher = _days_pusher(db, fake, clock)
+    assert (await pusher.push_once()).ok
+    assert [d["p_day"] for d in fake.days] == ["2026-10-12", "2026-10-13", "2026-10-14"]
+    body = fake.days[0]
+    assert body["p_ext"] == "ledger" and body["p_panel"] == "paper" and body["p_keep_days"] == 90
+    assert body["p_token"] == TOKEN
+    assert set(body["p_data"]) == {"views", "health", "truncated"}
+    assert "local_url" not in json.dumps(body["p_data"])  # never leaves the Mac
+    await pusher.push_once()
+    assert [d["p_day"] for d in fake.days][3:] == ["2026-10-15"]
+    await pusher.push_once()
+    assert len(fake.days) == 4  # each once
+    assert not any(d.upload_due for d in ext_store.list_panel_days(db, "ledger", "paper"))
+
+
+async def test_a_failed_day_upload_backs_off_and_retries(db: sqlite3.Connection) -> None:
+    from resonant.store import extensions as ext_store
+
+    _history_ext(db)
+    fake, clock = DaysFake(script=[503]), [T0]
+    pusher = _days_pusher(db, fake, clock)
+    assert (await pusher.push_once()).ok  # a day failing never fails the snapshot push
+    assert [d["p_day"] for d in fake.days] == ["2026-10-12"]  # stops at the first failure
+    row = ext_store.get_panel_day(db, "ledger", "paper", "2026-10-12")
+    assert row is not None and row.upload_due and row.upload_tries == 1
+    assert row.upload_next_at == T0 + timedelta(seconds=60)
+    assert kv_get(db, RELAY_HEALTH_KV)["state"] == "ok"  # type: ignore[index]
+    await pusher.push_once()
+    assert [d["p_day"] for d in fake.days][1:] == ["2026-10-13", "2026-10-14", "2026-10-15"]
+    clock[0] = T0 + timedelta(seconds=61)
+    await pusher.push_once()
+    assert fake.days[-1]["p_day"] == "2026-10-12"
+    row = ext_store.get_panel_day(db, "ledger", "paper", "2026-10-12")
+    assert row is not None and not row.upload_due and row.upload_tries == 0
+
+
+async def test_a_day_rebuilt_to_none_is_deleted_remotely(db: sqlite3.Connection) -> None:
+    from resonant.store import extensions as ext_store
+
+    _history_ext(db)
+    fake, clock = DaysFake(), [T0]
+    pusher = _days_pusher(db, fake, clock)
+    for _ in range(2):
+        await pusher.push_once()
+    ext_store.save_day_none(db, "ledger", "paper", "2026-10-13", at=T0)
+    db.commit()
+    await pusher.push_once()
+    assert fake.days[-1]["p_day"] == "2026-10-13" and fake.days[-1]["p_data"] is None
+
+
+async def test_days_of_a_removed_panel_are_dropped_not_sent(db: sqlite3.Connection) -> None:
+    from resonant.store import extensions as ext_store
+
+    _history_ext(db)
+    record = ext_store.get_extension(db, "ledger")
+    assert record is not None
+    manifest = dict(record.manifest)
+    manifest["panels"] = [{**manifest["panels"][0], "history": None}]
+    ext_store.save_extension(db, replace_manifest(record, manifest))
+    db.commit()
+    fake, clock = DaysFake(), [T0]
+    await _days_pusher(db, fake, clock).push_once()
+    assert fake.days == []
+    assert [d.day for d in ext_store.list_panel_days(db, "ledger", "paper") if d.upload_due] == [
+        "2026-10-15"
+    ]
+
+
+def replace_manifest(record: Any, manifest: dict[str, Any]) -> Any:
+    from dataclasses import replace
+
+    return replace(record, manifest=manifest)

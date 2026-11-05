@@ -4,7 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "@/Dashboard";
 import { clone, FIXTURE_NOW, local, remote } from "@/test/fixtures";
 import priceFixture from "@/test/fixtures/price.json";
-import type { Panel, PriceWidget, Snapshot } from "@/types";
+import type { DayLoader } from "@/lib/panelDays";
+import type { Panel, PanelDay, PriceWidget, Snapshot } from "@/types";
 
 const user = () => userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
 const mount = (snap: Snapshot) => render(<Dashboard load={async () => snap} />);
@@ -156,5 +157,111 @@ describe("price panels (PER-282)", () => {
     expect(glance).toHaveTextContent(/updated .* ago/);
     expect(within(glance).queryByTestId("price-chart")).toBeNull();
     expect(within(glance).queryByTestId("stat-value")).toBeNull();
+  });
+});
+
+describe("panel history (PER-286)", () => {
+  const archivedDay: PanelDay = {
+    views: [{ id: "v", title: "V", widgets: [{ type: "text", text: "archived words" }] }],
+    health: "warn",
+    truncated: false,
+  };
+  afterEach(() => window.sessionStorage.clear());
+
+  const mountDays = (snap: Snapshot, loadDay: DayLoader = vi.fn(async () => archivedDay)) => {
+    render(<Dashboard load={async () => snap} loadDay={loadDay} />);
+    return loadDay;
+  };
+
+  it("shows the picker only when a panel has history, on Today (live) by default", async () => {
+    window.location.hash = "#/ext/github";
+    const loadDay = mountDays(local);
+    const picker = await screen.findByTestId("day-picker");
+    expect(picker).toHaveValue("live");
+    expect(screen.getByRole("combobox", { name: "Day" })).toBe(picker);
+    expect(within(picker).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Today (live)",
+      "Thu 10/15",
+      "Wed 10/14",
+      "Mon 10/12",
+    ]);
+    expect(screen.queryByTestId("archived-day")).toBeNull();
+    expect(loadDay).not.toHaveBeenCalled();
+    // the live page says which days couldn't be archived
+    expect(screen.getByTestId("panel-days-failed")).toHaveTextContent("Couldn't archive Tue 10/13 (tried 3 times).");
+  });
+
+  it("has no picker without history", async () => {
+    window.location.hash = "#/ext/github";
+    const snap = clone(local);
+    for (const p of snap.extensions.find((e) => e.name === "github")!.panels) p.history = null;
+    mountDays(snap);
+    await screen.findByTestId("extension-page");
+    expect(screen.queryByTestId("day-picker")).toBeNull();
+  });
+
+  it("an archived day draws the panels that have it and no data for the others", async () => {
+    const u = user();
+    window.location.hash = "#/ext/github";
+    const loadDay = mountDays(local);
+    await u.selectOptions(await screen.findByTestId("day-picker"), "2026-10-14");
+    expect(await screen.findByTestId("archived-day")).toHaveTextContent("Wed 10/14 (archived)");
+    await screen.findByText("archived words");
+    expect(loadDay).toHaveBeenCalledTimes(1);
+    expect(loadDay).toHaveBeenCalledWith("github", "prs", "2026-10-14");
+    const cards = screen.getAllByTestId("panel-card");
+    expect(within(cards[0]!).getByText("Wed 10/14 (archived)")).toBeInTheDocument();
+    expect(within(cards[0]!).queryByTestId("panel-updated")).toBeNull();
+    expect(within(cards[0]!).queryByTestId("panel-days-failed")).toBeNull();
+    expect(within(cards[1]!).getByTestId("panel-no-day")).toHaveTextContent("No data for this day.");
+    expect(screen.queryByRole("link", { name: "Open locally" })).toBeNull();
+    // back to live
+    await u.selectOptions(screen.getByTestId("day-picker"), "live");
+    expect(screen.queryByTestId("archived-day")).toBeNull();
+    expect(screen.queryByText("archived words")).toBeNull();
+  });
+
+  it("a day the source has no row for shows no data, and a failed fetch says so", async () => {
+    const u = user();
+    window.location.hash = "#/ext/github";
+    const loadDay = vi.fn(async (_e: string, _p: string, d: string) => {
+      if (d === "2026-10-12") throw new Error("HTTP 500");
+      return null;
+    });
+    mountDays(local, loadDay);
+    await u.selectOptions(await screen.findByTestId("day-picker"), "2026-10-15");
+    await screen.findByTestId("archived-day");
+    expect(await screen.findAllByTestId("panel-no-day")).toHaveLength(2);
+    await u.selectOptions(screen.getByTestId("day-picker"), "2026-10-12");
+    expect(await screen.findByTestId("day-error")).toHaveTextContent("Couldn't load some of Mon 10/12: HTTP 500");
+  });
+
+  it("remembers the pick for the session", async () => {
+    const u = user();
+    window.location.hash = "#/ext/github";
+    const { unmount } = render(<Dashboard load={async () => local} loadDay={vi.fn(async () => archivedDay)} />);
+    await u.selectOptions(await screen.findByTestId("day-picker"), "2026-10-15");
+    expect(window.sessionStorage.getItem("resonant.day.github")).toBe("2026-10-15");
+    unmount();
+    mountDays(local);
+    expect(await screen.findByTestId("day-picker")).toHaveValue("2026-10-15");
+    expect(await screen.findByTestId("archived-day")).toHaveTextContent("Thu 10/15 (archived)");
+  });
+
+  it("a remembered day that is no longer listed falls back to live", async () => {
+    window.sessionStorage.setItem("resonant.day.github", "2026-09-01");
+    window.location.hash = "#/ext/github";
+    const loadDay = mountDays(local);
+    expect(await screen.findByTestId("day-picker")).toHaveValue("live");
+    expect(loadDay).not.toHaveBeenCalled();
+  });
+
+  it("works on the remote fixture too", async () => {
+    const u = user();
+    window.location.hash = "#/ext/github";
+    const loadDay = mountDays(remote);
+    await u.selectOptions(await screen.findByTestId("day-picker"), "2026-10-15");
+    await screen.findByText("archived words");
+    expect(loadDay).toHaveBeenCalledWith("github", "prs", "2026-10-15");
   });
 });

@@ -25,6 +25,12 @@ While ``relay.enabled``, the daemon runs :meth:`SnapshotPusher.run` as a backgro
 - **Reconnect** (PER-284). From the ``FAIL_AFTER``-th failed push in a row on, each failure
   closes and drops the pusher's own HTTP client, so the next push opens fresh connections
   (after a Wi-Fi drop the old pool kept failing with ``ConnectError`` until a restart).
+- **Panel days** (PER-286). After a push lands, up to ``DAYS_PER_PUSH`` newly archived panel
+  days (``ext_panel_days.upload_due``) go to the RPC ``relay_panel_day`` with the same key and
+  token, each once: the panel's views through the same scrub (never a ``local_url``), or null
+  to drop a day a rebuild found empty. A failed one waits ``DAY_BACKOFF_S`` doubling up to
+  ``DAY_BACKOFF_MAX_S`` and the rest wait for the next push; it never touches the relay's
+  health row. The RPC prunes that panel's rows past its ``keep``.
 - **Kill switch.** ``/kill`` doesn't stop the relay: it is outbound status, not an action, and
   a paused Mini is exactly what the owner wants to see from away. The snapshot says
   ``paused: true``. ``dry_run`` doesn't stop it either. Only ``relay.enabled: false`` does,
@@ -42,7 +48,7 @@ import sqlite3
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Final, Literal, cast
 
 import httpx
@@ -53,18 +59,25 @@ from resonant.dashboard.snapshot import (
     Snapshot,
     fit_panels,
     panel_bytes,
+    panel_day,
     to_remote,
 )
+from resonant.extensions.panel_history import panel_history
 from resonant.monitor import scrub
 from resonant.redact import Redactor, redact_secrets, scrub_rc_links
 from resonant.secrets import SecretError, SecretMissing, SecretStore, secret_ref
-from resonant.store.db import iso, kv_get, kv_set, utcnow
+from resonant.store import extensions as ext_store
+from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 
 log = logging.getLogger(__name__)
 
 RELAY_EXT: Final = "relay"
 SUPABASE_KEY_REF: Final = secret_ref(RELAY_EXT, "supabase_key")
 INGEST_PATH: Final = "/rest/v1/rpc/relay_ingest"
+DAY_PATH: Final = "/rest/v1/rpc/relay_panel_day"  # PER-286
+DAYS_PER_PUSH: Final = 3
+DAY_BACKOFF_S: Final = 60.0
+DAY_BACKOFF_MAX_S: Final = 6 * 3600.0
 # The migration caps ``octet_length(data::text)`` at 262144 (256 KiB). Measured here the same
 # way, with a margin for Postgres's own number formatting, so a refused 413 never surprises us.
 MAX_BYTES: Final = 240 * 1024
@@ -348,6 +361,7 @@ class SnapshotPusher:
         self.conn = conn
         self.config = config
         self.url = config.supabase_url + INGEST_PATH
+        self.day_url = config.supabase_url + DAY_PATH
         self.anon_key = config.anon_key
         self._snapshot = snapshot
         self.secrets = secrets
@@ -401,7 +415,58 @@ class SnapshotPusher:
         self._record(outcome)
         if not outcome.ok and self.failures >= FAIL_AFTER:
             await self._drop_client()  # on every failure from the FAIL_AFTER-th on
+        if outcome.ok:
+            try:
+                await self.push_days()
+            except Exception as e:  # a day upload never fails the snapshot push
+                log.warning("panel day upload crashed: %s", type(e).__name__)
         return outcome
+
+    async def push_days(self) -> int:
+        """Upload up to ``DAYS_PER_PUSH`` archived panel days (PER-286); returns how many
+        landed. Stops at the first failure (it backs off; the rest wait for the next push)."""
+        now = self._clock()
+        due = ext_store.days_to_upload(self.conn, now, DAYS_PER_PUSH)
+        if not due:
+            return 0
+        try:
+            token = await self.secrets.get(SUPABASE_KEY_REF)
+        except SecretError:
+            return 0  # the snapshot push reports a Keychain problem
+        redactor = Redactor([token, self.anon_key])
+        sent = 0
+        for row in due:
+            record = ext_store.get_extension(self.conn, row.ext)
+            found = None if record is None else panel_history(record.manifest, row.panel_id)
+            data: dict[str, Any] | None = None
+            if record is not None and row.data_json is not None:
+                day = panel_day(self.conn, record, row.panel_id, row.day, redactor)
+                if day is not None:
+                    data = _scrub({k: day[k] for k in ("views", "health", "truncated")}, redactor)
+            if found is None or (row.data_json is not None and data is None):
+                # Gone, history turned off, or an unreadable copy: nothing to send.
+                with atomic(self.conn):
+                    ext_store.mark_uploaded(self.conn, row.ext, row.panel_id, row.day)
+                continue
+            body = json.dumps({
+                "p_token": token, "p_ext": row.ext, "p_panel": row.panel_id, "p_day": row.day,
+                "p_data": data, "p_keep_days": found[0],
+            }).encode()  # fmt: skip
+            outcome = await self._post(body, self.day_url)
+            with atomic(self.conn):
+                if outcome.ok:
+                    ext_store.mark_uploaded(self.conn, row.ext, row.panel_id, row.day)
+                else:
+                    wait = min(DAY_BACKOFF_MAX_S, DAY_BACKOFF_S * 2**row.upload_tries)
+                    ext_store.mark_upload_failed(
+                        self.conn, row.ext, row.panel_id, row.day,
+                        next_at=now + timedelta(seconds=wait),
+                    )  # fmt: skip
+            if not outcome.ok:
+                log.warning("panel day upload failed: %s", scrub(redactor.text(outcome.detail)))
+                break
+            sent += 1
+        return sent
 
     async def _push(self) -> PushOutcome:
         try:
@@ -442,7 +507,7 @@ class SnapshotPusher:
         base = min(BACKOFF_MAX_S, BACKOFF_S * 2 ** (attempt - 1))
         return base * (1 + 0.25 * self._jitter())
 
-    async def _post(self, body: bytes) -> PushOutcome:
+    async def _post(self, body: bytes, url: str | None = None) -> PushOutcome:
         headers = {
             "apikey": self.anon_key,
             "content-type": "application/json",
@@ -457,7 +522,7 @@ class SnapshotPusher:
                 # stream: the status line is all we need; the body is never read.
                 async with self.client.stream(
                     "POST",
-                    self.url,
+                    url or self.url,
                     content=body,
                     headers=headers,
                     timeout=self.config.timeout_s,

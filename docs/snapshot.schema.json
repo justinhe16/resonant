@@ -1589,6 +1589,17 @@
           "default": null,
           "title": "Health"
         },
+        "history": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PanelHistory"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "id": {
           "pattern": "^[a-z][a-z0-9:_-]{0,63}$",
           "title": "Id",
@@ -1695,6 +1706,32 @@
         "schedule"
       ],
       "title": "Panel",
+      "type": "object"
+    },
+    "PanelHistory": {
+      "additionalProperties": false,
+      "description": "PER-286: a panel's archived days. Only the list travels in the snapshot; a day's copy is\nfetched when the owner picks it (``GET /api/ext/<ext>/panels/<id>/days/<day>`` locally,\nthe ``panel_days`` table remotely).",
+      "properties": {
+        "days": {
+          "items": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "type": "string"
+          },
+          "maxItems": 730,
+          "title": "Days",
+          "type": "array"
+        },
+        "failed": {
+          "items": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "type": "string"
+          },
+          "maxItems": 31,
+          "title": "Failed",
+          "type": "array"
+        }
+      },
+      "title": "PanelHistory",
       "type": "object"
     },
     "PanelView": {

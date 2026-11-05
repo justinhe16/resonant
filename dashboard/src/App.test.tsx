@@ -40,6 +40,7 @@ describe("App", () => {
       verify: vi.fn(),
       signOut: vi.fn(),
       latest: vi.fn(),
+      panelDay: vi.fn(async () => null),
       onAuthChange: vi.fn(() => () => {}),
     };
     const makeRemote = vi.fn(async () => client);

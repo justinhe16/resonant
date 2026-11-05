@@ -3,6 +3,7 @@ import { Ago, Dot, ExternalLink, OutsideBadge, OutsideText } from "@/components/
 import { Widgets } from "@/components/panel/Widget";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { dayLabel } from "@/lib/panelDays";
 import { panelTone } from "@/lib/panels";
 import { cn } from "@/lib/utils";
 import type { Panel } from "@/types";
@@ -14,11 +15,14 @@ const isLocalUrl = (u: string) => {
 };
 
 /** One panel of an extension: title and age, the stale state with its error, and the views
- * (tabs when there are several). Everything in it was drawn from data the extension printed. */
-export function PanelCard({ ext, panel: p, now }: { ext: string; panel: Panel; now: number }) {
+ * (tabs when there are several). Everything in it was drawn from data the extension printed.
+ * `archived` (PER-286, a YYYY-MM-DD) shows an archived day's copy instead of the live one:
+ * no run state, and "No data for this day" when it has no views. */
+export function PanelCard({ ext, panel: p, now, archived }: { ext: string; panel: Panel; now: number; archived?: string }) {
   const [tab, setTab] = useState(0);
   const view = p.views[Math.min(tab, p.views.length - 1)];
-  const neverRun = p.last_run_at === null && p.views.length === 0;
+  const neverRun = !archived && p.last_run_at === null && p.views.length === 0;
+  const failed = archived ? [] : (p.history?.failed ?? []);
   return (
     <Card className="[--card-spacing:--spacing(5)]" id={`panel-${p.id}`} data-testid="panel-card" data-stale={p.stale || undefined}>
       <CardHeader>
@@ -26,18 +30,23 @@ export function PanelCard({ ext, panel: p, now }: { ext: string; panel: Panel; n
           {p.health && <Dot tone={panelTone(p.health)} />}
           <h2 className="text-sm font-medium">{p.title}</h2>
           {p.outside.length > 0 && <OutsideBadge />}
-          {p.stale && !neverRun && <Badge variant="warn">stale</Badge>}
+          {p.stale && !neverRun && !archived && <Badge variant="warn">stale</Badge>}
+          {archived && <Badge variant="info">{dayLabel(archived)} (archived)</Badge>}
         </CardTitle>
         <CardDescription className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
           {p.description && <span>{p.description}</span>}
-          <span data-testid="panel-updated">
-            {p.updated_at ? <Ago iso={p.updated_at} now={now} prefix="updated " /> : "no data yet"}
-          </span>
-          {p.local_url && isLocalUrl(p.local_url) && <ExternalLink href={p.local_url}>Open locally</ExternalLink>}
+          {!archived && (
+            <span data-testid="panel-updated">
+              {p.updated_at ? <Ago iso={p.updated_at} now={now} prefix="updated " /> : "no data yet"}
+            </span>
+          )}
+          {!archived && p.local_url && isLocalUrl(p.local_url) && (
+            <ExternalLink href={p.local_url}>Open locally</ExternalLink>
+          )}
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
-        {p.error && (
+        {!archived && p.error && (
           <p className="rounded-md border border-bad/30 bg-bad/10 px-2.5 py-1.5 text-xs text-bad" data-testid="panel-error">
             {p.fail_streak > 0 ? `Failed ${p.fail_streak} time${p.fail_streak === 1 ? "" : "s"} in a row: ` : "Last run: "}
             <OutsideText text={p.error} outside={false} />
@@ -45,7 +54,12 @@ export function PanelCard({ ext, panel: p, now }: { ext: string; panel: Panel; n
           </p>
         )}
         {neverRun && <p className="text-sm text-muted-foreground">Waiting for first run.</p>}
-        {!neverRun && p.views.length === 0 && (
+        {archived && p.views.length === 0 && (
+          <p className="text-sm text-muted-foreground" data-testid="panel-no-day">
+            No data for this day.
+          </p>
+        )}
+        {!archived && !neverRun && p.views.length === 0 && (
           <p className="text-sm text-muted-foreground" data-testid="panel-empty">
             {p.truncated
               ? "Too big to show this time (over the panel size budget); the next smaller update will show."
@@ -72,12 +86,18 @@ export function PanelCard({ ext, panel: p, now }: { ext: string; panel: Panel; n
           </div>
         )}
         {view && (
-          <div className={cn(p.stale && "opacity-60")} data-testid="panel-body" role={p.views.length > 1 ? "tabpanel" : undefined}>
+          <div className={cn(p.stale && !archived && "opacity-60")} data-testid="panel-body" role={p.views.length > 1 ? "tabpanel" : undefined}>
             <Widgets widgets={view.widgets} ext={ext} now={now} />
           </div>
         )}
         {p.truncated && p.views.length > 0 && (
           <p className="text-xs text-muted-foreground">Some of this panel was cut to fit its size limit.</p>
+        )}
+        {failed.length > 0 && (
+          <p className="text-xs text-muted-foreground" data-testid="panel-days-failed">
+            Couldn't archive {failed.slice(0, 3).map(dayLabel).join(", ")}
+            {failed.length > 3 ? ` and ${failed.length - 3} more` : ""} (tried 3 times).
+          </p>
         )}
       </CardContent>
     </Card>

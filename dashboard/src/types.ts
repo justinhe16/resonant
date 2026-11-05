@@ -465,6 +465,22 @@ export interface Panel {
   local_url?: string;
   views: PanelView[];
   outside: string[];
+  /** PER-286: a panel with `history` lists its archived days (newest first) */
+  history?: PanelHistory | null;
+}
+
+export interface PanelHistory {
+  /** YYYY-MM-DD, newest first: the days with an archived copy */
+  days: string[];
+  /** days that failed 3 times (shown on the panel; they don't degrade the extension) */
+  failed?: string[];
+}
+
+/** PER-286: one archived day of a panel, as the local API or the `panel_days` row holds it. */
+export interface PanelDay {
+  views: PanelView[];
+  health?: PanelTone | null;
+  truncated?: boolean;
 }
 
 export interface Extension {

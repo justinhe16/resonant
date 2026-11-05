@@ -51,12 +51,16 @@ export function SupabaseGate({ client }: { client: RemoteClient }) {
 
   const signOut = () => void run(() => client.signOut());
   const load = useCallback(() => client.latest(), [client]);
+  const loadDay = useCallback(
+    (ext: string, panel: string, day: string) => client.panelDay(ext, panel, day),
+    [client],
+  );
 
   switch (stage.kind) {
     case "loading":
       return <Shell>{null}</Shell>;
     case "ready":
-      return <Dashboard load={load} onSignOut={signOut} />;
+      return <Dashboard load={load} loadDay={loadDay} onSignOut={signOut} />;
     case "signed_out":
       return (
         <Shell error={error}>

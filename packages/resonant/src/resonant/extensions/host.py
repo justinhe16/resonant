@@ -332,6 +332,7 @@ class ExtensionHost:
         runs |= {j.spec_name: (j.run, JOB_ARGS, True) for j in manifest.jobs}
         panels = tuple(manifest.panel_specs())
         runs |= {p.spec_name: (p.run, frozenset[str](), True) for p in manifest.panels}
+        dated = {p.spec_name for p in manifest.panels if p.history is not None}  # PER-286
         for spec in (*tools, *jobs, *panels):
             if spec.extension != record.name or spec.source != f"ext:{record.name}":
                 raise LoadRefused(f"{spec.name}: spec is not scoped to this extension")
@@ -362,6 +363,7 @@ class ExtensionHost:
                 path_env=self.path_env,
                 job=job,
                 bins=bins,
+                dated=spec.name in dated,
             )
         health: ExtCommand | None = None
         if manifest.health is not None:

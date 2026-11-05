@@ -78,7 +78,7 @@ from resonant.store import repos
 from resonant.store.audit import audit
 from resonant.store.db import atomic, kv_get, kv_set, utcnow
 from resonant_sdk import Manifest, load_manifest
-from resonant_sdk.manifest import McpHttpServer
+from resonant_sdk.manifest import McpHttpServer, Panel
 from resonant_sdk.tool import Level
 
 MANIFEST_FILE = "resonant.yaml"
@@ -346,7 +346,7 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
                 when += f"; active: {schedule_words(panel.refresh.active, panel.tz)}"
             lines.append(
                 f"  {_s(panel.id, 40)} {_s(panel.title, 60)} {when}, read L0, "
-                f"max {panel.max_bytes} B, runs {panel.run}"
+                f"max {panel.max_bytes} B, runs {panel.run}{history_words(panel)}"
             )
             if panel.description:
                 lines.append(f"    {_s(panel.description, 160)}")
@@ -428,8 +428,21 @@ def update_lines(
     return lines
 
 
+def history_words(panel: Panel) -> str:
+    """PER-286: the panel line's history part, ``; history daily, keep 365d (the same command
+    with --date YYYY-MM-DD for each ended day)``. Same command, read-only: not an escalation."""
+    h = panel.history
+    if h is None:
+        return ""
+    return (
+        f"; history {h.every}, keep {h.keep} "
+        "(the same command with --date YYYY-MM-DD for each ended day)"
+    )
+
+
 def _panel_diff(old: ext_store.ExtensionRecord, new: Manifest) -> list[str]:
-    """``+ panel <id>`` / ``- panel <id>`` for panels an update adds or drops."""
+    """``+ panel <id>`` / ``- panel <id>`` for panels an update adds or drops. A history change
+    is no escalation (PER-286): the panel line of the review shows it."""
     try:
         before = [p.id for p in Manifest.model_validate(old.manifest).panels]
     except ValidationError:
@@ -772,6 +785,9 @@ class ExtensionManager:
                 ext_store.save_extension(self.conn, record)
                 ext_store.prune_jobs(self.conn, name, [j.id for j in staged.manifest.jobs])
                 ext_store.prune_panels(self.conn, name, [p.id for p in staged.manifest.panels])
+                ext_store.prune_panel_days(
+                    self.conn, name, [p.id for p in staged.manifest.panels if p.history]
+                )
                 repos.set_links(self.conn, name, staged.manifest.repos)
                 origin = {"source": approved.source, "secrets": sorted(staged.manifest.secrets)}
                 kv_set(self.conn, ORIGIN_KEY.format(name=name), origin)
