@@ -34,7 +34,7 @@ npm run dev                           # proxies /api to a running daemon on 127.
 
 ## Extension panels (PER-280)
 
-An extension can declare dashboard panels; the daemon validates what they print and the snapshot carries it as data (`extensions[].panels`, types in `src/types.ts`). The page only draws it: widgets are in `src/components/panel/` (stat, series as hand-rolled inline SVG, table, status, kv, text, details), the formatting and SVG geometry in `src/lib/panels.ts`, and `#/ext/<name>[/<panel>]` opens an extension's page (`src/pages/ExtensionPage.tsx`) instead of a dialog. Text in a panel is always rendered as plain text. Chart colours are the `--chart-1..4` tokens in `src/index.css`. The local-only `local_url` is stripped from a remote snapshot in `normalize`.
+An extension can declare dashboard panels; the daemon validates what they print and the snapshot carries it as data (`extensions[].panels`, types in `src/types.ts`). The page only draws it: widgets are in `src/components/panel/` (stat, series as hand-rolled inline SVG, table, status, kv, text, details, and `price`: candles and trades with zoom/pan, PER-282), the formatting and SVG geometry in `src/lib/panels.ts` and `src/lib/price.ts` (which also decodes the compact price columns), and `#/ext/<name>[/<panel>]` opens an extension's page (`src/pages/ExtensionPage.tsx`) instead of a dialog. Text in a panel is always rendered as plain text. Chart colours are the `--chart-1..4` tokens in `src/index.css`, with `--up`/`--down` for price candles. The local-only `local_url` is stripped from a remote snapshot in `normalize`.
 
 ## Checks
 

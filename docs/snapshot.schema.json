@@ -1716,6 +1716,7 @@
               "mapping": {
                 "details": "#/$defs/DetailsWidget",
                 "kv": "#/$defs/KvWidget",
+                "price": "#/$defs/PriceWidget",
                 "series": "#/$defs/SeriesWidget",
                 "stat": "#/$defs/StatWidget",
                 "status": "#/$defs/StatusWidget",
@@ -1745,6 +1746,9 @@
               },
               {
                 "$ref": "#/$defs/DetailsWidget"
+              },
+              {
+                "$ref": "#/$defs/PriceWidget"
               }
             ]
           },
@@ -1784,6 +1788,422 @@
         "tone"
       ],
       "title": "PillCell",
+      "type": "object"
+    },
+    "PriceMarker": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "up",
+            "down",
+            "dot"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "price": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Price"
+        },
+        "t": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "T"
+        },
+        "tone": {
+          "enum": [
+            "ok",
+            "warn",
+            "bad",
+            "neutral"
+          ],
+          "title": "Tone",
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "price",
+        "kind",
+        "tone"
+      ],
+      "title": "PriceMarker",
+      "type": "object"
+    },
+    "PriceTrade": {
+      "additionalProperties": false,
+      "properties": {
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "entry_px": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Entry Px"
+        },
+        "entry_t": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Entry T"
+        },
+        "exit_px": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Px"
+        },
+        "exit_t": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit T"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 40,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "pnl": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pnl"
+        },
+        "side": {
+          "enum": [
+            "long",
+            "short"
+          ],
+          "title": "Side",
+          "type": "string"
+        },
+        "why": {
+          "anyOf": [
+            {
+              "maxLength": 24,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Why"
+        }
+      },
+      "required": [
+        "side",
+        "entry_t",
+        "entry_px"
+      ],
+      "title": "PriceTrade",
+      "type": "object"
+    },
+    "PriceWidget": {
+      "additionalProperties": false,
+      "description": "A price chart (PER-282), columnar and delta-coded so a day of 1-minute candles fits a\npanel's 32 KiB. Candle ``i`` opens at ``t0 + dt[0] + ... + dt[i]`` (``dt[0]`` is 0; whole\nseconds). Prices are integers in units of ``q * 10**-dp`` (``q`` is the prices' common\ntick: 25 for quarter points with ``dp`` 2). With ``mode: candles``, ``o[i]`` is\nthe open minus the previous non-null close (the first candle's open itself), ``h[i]`` the\nhigh minus the open, ``l[i]`` the open minus the low and ``c[i]`` the close minus the open.\nWith ``mode: line`` there is only ``c``: each close minus the previous non-null close (the\nfirst close itself). A null is a gap in every column.",
+      "properties": {
+        "aggregated_from": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Aggregated From"
+        },
+        "c": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "C",
+          "type": "array"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "dp": {
+          "maximum": 8,
+          "minimum": 0,
+          "title": "Dp",
+          "type": "integer"
+        },
+        "dt": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Dt",
+          "type": "array"
+        },
+        "format": {
+          "default": "number",
+          "enum": [
+            "number",
+            "integer",
+            "money",
+            "percent",
+            "duration",
+            "bytes"
+          ],
+          "title": "Format",
+          "type": "string"
+        },
+        "h": {
+          "anyOf": [
+            {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "H"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "l": {
+          "anyOf": [
+            {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "L"
+        },
+        "markers": {
+          "items": {
+            "$ref": "#/$defs/PriceMarker"
+          },
+          "title": "Markers",
+          "type": "array"
+        },
+        "mode": {
+          "enum": [
+            "candles",
+            "line"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "o": {
+          "anyOf": [
+            {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "O"
+        },
+        "q": {
+          "default": 1,
+          "minimum": 1,
+          "title": "Q",
+          "type": "integer"
+        },
+        "t0": {
+          "title": "T0",
+          "type": "integer"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "trades": {
+          "items": {
+            "$ref": "#/$defs/PriceTrade"
+          },
+          "title": "Trades",
+          "type": "array"
+        },
+        "type": {
+          "const": "price",
+          "title": "Type",
+          "type": "string"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        }
+      },
+      "required": [
+        "type",
+        "mode",
+        "t0",
+        "dt",
+        "dp",
+        "c"
+      ],
+      "title": "PriceWidget",
       "type": "object"
     },
     "Pulse": {

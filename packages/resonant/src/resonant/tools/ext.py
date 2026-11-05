@@ -26,8 +26,8 @@ global tools (the owner).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ValidationError
 
@@ -260,6 +260,40 @@ def _stats(views: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _price_summary(w: dict[str, Any]) -> dict[str, Any]:
+    """A price widget for the brain: its columns decoded into a few numbers, the trades and
+    markers as they are (the compact encoding means nothing to a model)."""
+    from resonant.extensions.panels import decode_price
+
+    times, rows = decode_price(w)
+    got = [(t, r) for t, r in zip(times, rows, strict=True) if r is not None]
+    summary: dict[str, Any] = {
+        "type": "price",
+        "title": w.get("title"),
+        "mode": w["mode"],
+        "unit": w.get("unit"),
+        "candles": len(times),
+        "aggregated_from": w.get("aggregated_from"),
+        "trades": w.get("trades", []),
+        "markers": w.get("markers", []),
+    }
+    if got:
+        summary |= {
+            "from": iso(datetime.fromtimestamp(got[0][0], UTC)),
+            "to": iso(datetime.fromtimestamp(got[-1][0], UTC)),
+            "open": got[0][1][0],
+            "high": max(r[1] for _, r in got),
+            "low": min(r[2] for _, r in got),
+            "last": got[-1][1][3],
+        }
+    return summary
+
+
+def _brain_view(v: dict[str, Any]) -> dict[str, Any]:
+    widgets = cast(list[dict[str, Any]], v["widgets"])
+    return {**v, "widgets": [_price_summary(w) if w["type"] == "price" else w for w in widgets]}
+
+
 def _head(p: Panel) -> dict[str, Any]:
     return {
         "id": p.id,
@@ -301,7 +335,7 @@ def read_panel(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
         "panel": {
             **_head(found),
             "truncated": found.truncated,
-            "views": [v.model_dump(mode="json") for v in found.views],
+            "views": [_brain_view(v.model_dump(mode="json")) for v in found.views],
         },
     }
 

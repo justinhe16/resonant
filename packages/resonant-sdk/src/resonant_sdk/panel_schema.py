@@ -39,6 +39,10 @@ STATUS_ITEMS_MAX = 50
 KV_ITEMS_MAX = 30
 DETAIL_ROWS_MAX = 200
 DETAIL_DEPTH_MAX = 5
+PRICE_POINTS_MAX = 20160  # two weeks of 1-minute bars; more is refused (PER-282)
+PRICE_POINTS_KEPT = 1440  # a day of 1-minute bars; more is aggregated into wider candles
+TRADES_MAX = 100
+MARKERS_MAX = 200
 
 SLUG = r"^[a-z0-9][a-z0-9_-]{0,31}$"
 LOCAL_URL = r"^http://127\.0\.0\.1:[0-9]{1,5}(/[!-~]*)?$"
@@ -206,8 +210,62 @@ class Details(_In):
     collapsed: bool = True
 
 
+class Candles(_In):
+    """Open, high, low and close, each as long as ``x``. A candle is all four numbers with
+    ``h >= max(o, c)`` and ``l <= min(o, c)``, or all four null (a gap)."""
+
+    o: list[Num | None]
+    h: list[Num | None]
+    l: list[Num | None]  # noqa: E741 (the OHLC name)
+    c: list[Num | None]
+
+
+class Trade(_In):
+    """A position on the chart: entered at ``entry_t``/``entry_px``, exited at
+    ``exit_t``/``exit_px`` (both null while it is open). ``pnl`` is its money result."""
+
+    side: Literal["long", "short"]
+    entry_t: Time
+    entry_px: Num
+    exit_t: Time | None = None
+    exit_px: Num | None = None
+    pnl: Num | None = None
+    currency: Currency | None = None
+    label: Cut40 | None = None
+    why: Cut24 | None = None
+
+
+class Marker(_In):
+    """A point of interest: an arrow up or down, or a dot."""
+
+    t: Time
+    price: Num
+    kind: Literal["up", "down", "dot"] = "dot"
+    tone: PillTone = "neutral"
+    label: Cut40 | None = None
+
+
+class Price(_In):
+    """A price chart (PER-282): ``candles`` or ``line`` (closes only) over ``x``, the candles'
+    open times, strictly increasing (whole seconds; a fraction is rounded). At most 20160
+    points; over 1440 they are aggregated into wider candles. At most 100 trades and 200
+    markers."""
+
+    type: Literal["price"]
+    id: Slug | None = None
+    title: Cut64 | None = None
+    x: Annotated[list[Time], _max_items(PRICE_POINTS_MAX)]
+    candles: Candles | None = None
+    line: list[Num | None] | None = None
+    unit: Cut16 | None = None
+    format: Format | None = None
+    currency: Currency | None = None
+    trades: Annotated[list[Trade], _max_items(TRADES_MAX)] = []
+    markers: Annotated[list[Marker], _max_items(MARKERS_MAX)] = []
+
+
 Widget = Annotated[
-    Stat | Series | Table | Status | Kv | Text | Details, Field(discriminator="type")
+    Stat | Series | Table | Status | Kv | Text | Details | Price, Field(discriminator="type")
 ]
 
 
