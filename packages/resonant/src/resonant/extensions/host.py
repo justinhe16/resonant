@@ -63,7 +63,9 @@ in ``extensions/mcp_drift.py``). The host owns the saves and the questions:
 Health (D11). The manifest's ``health.check`` is compiled at load like a tool (no
 placeholders; a pinned ``gh``/``git`` uses ``argv0_paths["health"]``).
 ``ExtensionHealth`` turns the loaded, refused and tampered extensions into the monitor's
-``ext:<name>`` checks.
+``ext:<name>`` checks. The optional ``recover.run`` (PER-284) is compiled the same way
+(``argv0_paths["recover"]``); ``ExtensionHealth`` hands each fresh health result to
+``extensions.recover.Recovery``, which runs it after two failures in a row.
 """
 
 from __future__ import annotations
@@ -77,7 +79,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 from pydantic import ValidationError
@@ -135,6 +137,9 @@ from resonant.tools.registry import ToolRegistry
 from resonant_sdk import Effect, Level, Manifest, ToolSpec
 from resonant_sdk.manifest import Job, McpHttpServer, Panel, duration_s, load_manifest
 
+if TYPE_CHECKING:
+    from resonant.extensions.recover import Recovery
+
 log = logging.getLogger(__name__)
 
 ALERTS_KEY = "ext.alerts"  # kv: {name: {text, dedupe_key}}, sent to the owner on start
@@ -176,6 +181,7 @@ class LoadedExtension:
     bins: Mapping[str, str] = field(default_factory=dict[str, str])  # RESONANT_BIN_* -> pin
     mcp: Mapping[str, McpServerRuntime] = field(default_factory=dict[str, McpServerRuntime])
     panels: tuple[ToolSpec, ...] = ()  # PER-280: the ``panel_<id>`` specs, kept out of chat
+    recover: ExtCommand | None = None  # PER-284: the compiled manifest ``recover.run``
 
 
 @dataclass(frozen=True)
@@ -367,7 +373,19 @@ class ExtensionHost:
                 raise LoadRefused(f"health: {e}") from None
             if health.placeholders:
                 raise LoadRefused("health: the check takes no placeholders")
-        ext = LoadedExtension(record, manifest, root, tools, jobs, health, bins, runtimes, panels)
+        recover: ExtCommand | None = None
+        if manifest.recover is not None:
+            try:
+                recover = ExtCommand.compile(
+                    manifest.recover.run, root=root, argv0=record.argv0_paths.get("recover")
+                )
+            except TemplateError as e:
+                raise LoadRefused(f"recover: {e}") from None
+            if recover.placeholders:
+                raise LoadRefused("recover: the command takes no placeholders")
+        ext = LoadedExtension(
+            record, manifest, root, tools, jobs, health, bins, runtimes, panels, recover
+        )
         return ext, handlers
 
     def _prepare_mcp(
@@ -880,13 +898,19 @@ class ExtensionHealth:
     host: ExtensionHost
     secrets: SecretStore | None = None
     timeout_s: float = 20.0
+    # PER-284: gets every fresh health result; runs ``recover`` after two failures in a row.
+    recovery: Recovery | None = None
     _last: dict[str, _HealthRun] = field(default_factory=dict[str, _HealthRun])
 
     @classmethod
     def from_settings(
-        cls, settings: Settings, host: ExtensionHost, secrets: SecretStore | None
+        cls,
+        settings: Settings,
+        host: ExtensionHost,
+        secrets: SecretStore | None,
+        recovery: Recovery | None = None,
     ) -> ExtensionHealth:
-        return cls(host, secrets, settings.extensions.process.health_timeout_s)
+        return cls(host, secrets, settings.extensions.process.health_timeout_s, recovery)
 
     async def evaluate(self, now: datetime) -> dict[str, tuple[CheckResult, bool] | None]:
         """``{"ext:<name>": (result, fresh) | None}`` for every current extension. ``fresh``
@@ -952,6 +976,13 @@ class ExtensionHealth:
         if detail == "paused":
             return False
         self._last[name] = _HealthRun(now, ok, detail)
+        if self.recovery is not None:
+            try:
+                await self.recovery.observe(name, ok, now)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # recovery never takes the monitor down
+                log.warning("recovery raised %s", type(e).__name__, extra={"extension": name})
         return True
 
     async def _run(self, name: str, ext: LoadedExtension, command: ExtCommand) -> tuple[bool, str]:

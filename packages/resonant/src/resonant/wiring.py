@@ -47,7 +47,8 @@ run's outcome text, and the core pulse and briefing jobs (built later from the s
 components) for theirs. Off: those texts stay code-built.
 
 Extension health. The monitor gets ``extensions.host.ExtensionHealth`` as its dynamic
-``ext:<name>`` checks (health commands, job fail streaks, load refusals, tampering).
+``ext:<name>`` checks (health commands, job fail streaks, load refusals, tampering), with an
+``extensions.recover.Recovery`` (PER-284) when there is an owner to text.
 
 Brain. ``runner="brain"`` (``runners.brain.BrainRunner``, BR-1, PER-256) is the router's
 chat target: the local model only routes (small talk and code-built news are answered there),
@@ -105,6 +106,7 @@ from resonant.extensions.host import ExtensionHealth, ExtensionHost, send_alerts
 from resonant.extensions.notify import Notifier
 from resonant.extensions.pulse import EVENT_TYPE, Pulse
 from resonant.extensions.pulse_job import JOB_ID as PULSE_JOB
+from resonant.extensions.recover import Recovery
 from resonant.extensions.scheduler import CoreDeps
 from resonant.gate import PolicyGate
 from resonant.gateway.imessage.channel import IMessageChannel
@@ -554,7 +556,16 @@ def build_imessage_stack(
         ext_checks=(
             None
             if host is None
-            else ExtensionHealth.from_settings(settings, host, components.executor.secrets)
+            else ExtensionHealth.from_settings(
+                settings,
+                host,
+                components.executor.secrets,
+                recovery=(
+                    None
+                    if owner is None
+                    else Recovery(host, channel, owner, settings, components.executor.secrets)
+                ),
+            )
         ),
     )
     return IMessageStack(

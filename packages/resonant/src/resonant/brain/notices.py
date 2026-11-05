@@ -35,7 +35,7 @@ import sqlite3
 import weakref
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from resonant.config import Settings
@@ -119,12 +119,16 @@ async def send_notice(
     key: str,
     title: str,
     now: datetime,
+    daily_cap: bool = True,
 ) -> Notice:
     """Store the notice as a pulse item and send it now if the caps allow (module
     docstring). Raises a ``ChannelError`` other than a refusal (the caller retries; the
-    send is deduped by key)."""
+    send is deduped by key). ``daily_cap=False`` (an extension's recovery line, PER-284,
+    which has its own cap) skips step 3 and isn't counted against it."""
     async with _lock():
-        return await _send_notice(conn, channel, owner, settings, key=key, title=title, now=now)
+        return await _send_notice(
+            conn, channel, owner, settings, key=key, title=title, now=now, daily_cap=daily_cap
+        )
 
 
 async def _send_notice(
@@ -136,6 +140,7 @@ async def _send_notice(
     key: str,
     title: str,
     now: datetime,
+    daily_cap: bool = True,
 ) -> Notice:
     pkey = item_key(key)
     dedupe = f"notice:{pkey}"
@@ -174,7 +179,7 @@ async def _send_notice(
     if _count(conn, "hour", hour, dedupe) >= settings.extensions.notify.max_per_hour:
         return held("capped_hour", "normal")
     today = _count(conn, "day", day, dedupe)
-    if today >= settings.brain.proactive_per_day:
+    if daily_cap and today >= settings.brain.proactive_per_day:
         return held("capped_day", "low")
     item = store("normal")
     text = render_item(item, "", settings.extensions.notify.max_chars)
@@ -183,6 +188,8 @@ async def _send_notice(
     except ChannelRefused:
         log.warning("brain notice refused by the channel")
         return held("unreachable", "normal")
+    # Only notices under the daily cap count against it (the ``day`` field is what's counted).
+    counted: dict[str, Any] = {"day": day, "today": today + 1} if daily_cap else {}
     with atomic(conn):
         items.mark_told(conn, [item], now)
         audit(
@@ -193,8 +200,7 @@ async def _send_notice(
             decision="sent",
             key=pkey,
             hour=hour,
-            day=day,
-            today=today + 1,
+            **counted,
         )
     return Notice("sent", pkey)
 

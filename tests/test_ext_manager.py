@@ -702,6 +702,37 @@ def test_update_lines_diff_escalations_and_code_only(
     assert escalations(staged.manifest) == ['secret "demo/token" (Keychain)']
 
 
+def test_adding_or_changing_recover_is_an_escalation_in_the_update_preview(
+    mgr: ExtensionManager, repo: Path
+) -> None:
+    """PER-284: ``recover`` runs on its own, so the update preview flags it and re-approval
+    is needed like any manifest change; the install pins its argv[0] as ``recover``."""
+    record = mgr.install(mgr.stage("repo:demo").pin, name="demo")
+    health = "health: {check: ./cli.py status, every: 5m}\n"
+    recover = "recover: {run: ./cli.py recover, timeout: 120s}\n"
+    (repo / "extensions" / "demo" / "resonant.yaml").write_text(MANIFEST + health + recover)
+    commit_all(repo)
+    staged = mgr.stage("repo:demo")
+    lines = update_lines(record, mgr.installed_files("demo"), staged)
+    confirm = confirm_lines(staged)
+    mgr.discard(staged)
+    line = "recover: may run ./cli.py recover on its own when health fails twice"
+    assert "Manifest: changed. Escalations:" in lines
+    assert f"  + {line}" in lines
+    assert f"  ! {line}" in confirm
+    assert any(c.startswith("Recover: ./cli.py recover, timeout") for c in confirm)
+    record = mgr.install(mgr.stage("repo:demo").pin, name="demo")
+    assert record.argv0_paths["recover"].endswith("/cli.py")
+    changed = recover.replace("./cli.py recover", "./cli.py recover --hard")
+    (repo / "extensions" / "demo" / "resonant.yaml").write_text(MANIFEST + health + changed)
+    commit_all(repo)
+    staged = mgr.stage("repo:demo")
+    lines = update_lines(record, mgr.installed_files("demo"), staged)
+    mgr.discard(staged)
+    assert f"  - {line}" in lines
+    assert f"  + {line.replace('recover on', 'recover --hard on')}" in lines
+
+
 # --- CLI ------------------------------------------------------------------------------
 
 

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import threading
@@ -84,15 +85,22 @@ async def deadman_task(
     healthy: Callable[[], bool],
     client: httpx.AsyncClient | None = None,
     reason: Callable[[], str | None] | None = None,
+    client_factory: Callable[[], httpx.AsyncClient] | None = None,
 ) -> None:
     """Ping ``url`` while healthy; otherwise POST ``/fail`` with a short plain-text reason.
 
     ``reason`` (e.g. ``HealthMonitor.deadman_reason``) returns why the owner can't be
     reached by other means, or None. A non-None reason sends ``/fail`` even while the loop
     is healthy. The URL holds the check's secret UUID, so it is never logged.
+
+    An owned client (none passed; ``client_factory`` builds it, tests) is closed and rebuilt
+    after ``DEADMAN_RESET_AFTER`` failed pings in a row (PER-284: a pool left stale by a
+    network drop never wedges the dead-man).
     """
     owns = client is None
-    client = client or httpx.AsyncClient(timeout=10)
+    factory = client_factory or (lambda: httpx.AsyncClient(timeout=10))
+    client = client or factory()
+    failures = 0
     try:
         while True:
             ok, why = healthy(), _safe_reason(reason)
@@ -106,9 +114,16 @@ async def deadman_task(
                         content=body[:FAIL_BODY_MAX].encode(),
                         headers={"content-type": "text/plain; charset=utf-8"},
                     )
+                failures = 0
             except httpx.HTTPError as e:
                 # str(e) can include the request URL (e.g. HTTPStatusError): log the type only.
                 log.warning("dead-man ping failed: %s", type(e).__name__)
+                failures += 1
+                if owns and failures >= DEADMAN_RESET_AFTER:
+                    failures = 0
+                    old, client = client, factory()
+                    with contextlib.suppress(Exception):
+                        await old.aclose()
             await asyncio.sleep(interval_s)
     finally:
         if owns:
@@ -116,6 +131,7 @@ async def deadman_task(
 
 
 FAIL_BODY_MAX = 500
+DEADMAN_RESET_AFTER = 3
 
 
 def _safe_reason(reason: Callable[[], str | None] | None) -> str | None:

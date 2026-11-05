@@ -70,7 +70,7 @@ from resonant.extensions.sources import (
     stage_path,
     stage_repo,
 )
-from resonant.gate.codes import sanitize_external
+from resonant.gate.codes import clean_external, sanitize_external
 from resonant.principals import Principals
 from resonant.secrets import InvalidSecretRef, secret_ref
 from resonant.store import extensions as ext_store
@@ -219,7 +219,14 @@ def escalations(
     out += _mcp_escalations(manifest, mcp_pins or {})
     if manifest.report is not None and manifest.report.max_urgency == "urgent":
         out.append(report_grant(manifest))
+    if manifest.recover is not None:
+        out.append(recover_escalation(manifest.recover.run))
     return out
+
+
+def recover_escalation(run: str) -> str:
+    """PER-284: ``recover: may run ./cli.py recover on its own when health fails twice``."""
+    return f"recover: may run {clean_external(run)[:160]} on its own when health fails twice"
 
 
 def _final_words(commit: bool, level: Level) -> str:
@@ -355,6 +362,12 @@ def confirm_lines(staged: Staged, registered: Collection[str] = ()) -> list[str]
         lines.append(f"Notify: {events} via {m.notify.channel}")
     if m.health:
         lines.append(f"Health: {m.health.check} every {_s(m.health.every, 10)}")
+    if m.recover:
+        secrets = f", secrets {', '.join(m.recover.secrets)}" if m.recover.secrets else ""
+        lines.append(
+            f"Recover: {m.recover.run}, timeout {_s(m.recover.timeout, 10)}{secrets}"
+            " (when health fails twice in a row; at most every 15 min, 3 a day)"
+        )
     if len(m.tools) > TOOL_WARN_COUNT:
         lines.append(f"warning: {len(m.tools)} tools; above {TOOL_WARN_COUNT} routing suffers")
     lines += [f"note: {n}" for n in staged.notes]
@@ -787,12 +800,14 @@ class ExtensionManager:
         return record
 
     def _argv0_paths(self, root: Path, manifest: Manifest) -> dict[str, str]:
-        """Pinned absolute argv[0] per spec name (``health`` for the health check), and each
+        """Pinned absolute argv[0] per spec name (``health`` for the health check, ``recover``
+        for the recover command), and each
         manifest ``bins`` entry under ``bin:<name>``."""
         names = {f"tool {n}": n for n in manifest.tools}
         names.update({f"job {j.id}": j.spec_name for j in manifest.jobs})
         names.update({f"panel {p.id}": p.spec_name for p in manifest.panels})
         names["health"] = "health"
+        names["recover"] = "recover"
         pins = {
             names[where]: resolve_argv0(root, run, self.ext_path)
             for where, run in commands(manifest)
