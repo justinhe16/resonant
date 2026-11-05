@@ -863,6 +863,13 @@ class Scheduler:
                       panel=f"{p.ext}/{p.panel_id}", before=before, days=n)  # fmt: skip
 
     async def _run_archive(self, p: ScheduledPanel, day: str) -> None:
+        try:
+            await self._archive_day(p, day)
+        except Exception as e:  # never a tight loop: no row was written, so hold instead
+            log.error("panel archive failed: %s", type(e).__name__, extra={"job": p.label})
+            self._history_hold = self.clock() + history.DEFER
+
+    async def _archive_day(self, p: ScheduledPanel, day: str) -> None:
         due = self.clock()
         # The throwaway job is the shape ``_call`` takes; its label names the day.
         job = ScheduledJob(p.ext, f"panel:{p.panel_id}:{day}", p.spec, p.idle, p.call)

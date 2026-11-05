@@ -5,7 +5,7 @@ import { StateBadge } from "@/components/bits";
 import { PanelCard } from "@/components/panel/PanelCard";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { archivedDays, dayLabel, type DayLoader, hasHistory, LIVE, readPick, savePick } from "@/lib/panelDays";
+import { archivedDays, dayLabel, dayList, type DayLoader, hasHistory, LIVE, readPick, savePick } from "@/lib/panelDays";
 import { closeRoute, type Route } from "@/lib/route";
 import { healthTone } from "@/lib/tone";
 import { cn } from "@/lib/utils";
@@ -31,7 +31,7 @@ type DayState = { key: string; byPanel: Record<string, PanelDay | null>; error?:
 
 /** PER-286: the archived copies of `day` for the panels that list it (the others have none). */
 function useDay(ext: Extension | undefined, day: string, loadDay: DayLoader | undefined): DayState | null {
-  const ids = ext && day !== LIVE ? ext.panels.filter((p) => p.history?.days.includes(day)).map((p) => p.id) : [];
+  const ids = ext && day !== LIVE ? ext.panels.filter((p) => dayList(p).includes(day)).map((p) => p.id) : [];
   const key = ext && day !== LIVE ? `${ext.name}|${day}|${ids.join(",")}` : "";
   const [state, setState] = useState<DayState | null>(null);
   useEffect(() => {

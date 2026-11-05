@@ -26,7 +26,7 @@ from typer.testing import CliRunner
 from resonant.api import DaemonState, create_app
 from resonant.cli import app as cli_app
 from resonant.config import load_settings
-from resonant.dashboard.snapshot import build_snapshot, extension_panels, panel_day
+from resonant.dashboard.snapshot import build_snapshot, extension_panels, panel_day, to_remote
 from resonant.extensions import panel_history as ph
 from resonant.extensions.host import ExtensionHealth
 from resonant.extensions.manager import history_words
@@ -350,7 +350,8 @@ async def test_a_none_day_is_recorded_never_retried_and_never_listed(tmp_path: P
         assert record is not None
         (panel,) = extension_panels(h.db, record, h.clock.now)
         assert panel.history is not None
-        assert "2026-10-13" not in panel.history.days and "2026-10-12" in panel.history.days
+        listed = [*panel.history.days, *(panel.history.pending or [])]
+        assert "2026-10-13" not in listed and "2026-10-12" in listed
         assert panel_day(h.db, record, "paper", "2026-10-13") is None
         assert [json.loads(a["detail"])["status"] for a in h.audits("panel.archived")].count(
             "none"
@@ -505,6 +506,7 @@ def _seed_days(db: sqlite3.Connection, now: datetime) -> None:
     data = json.dumps(normalized(raw).data)
     ext_store.save_day_ok(db, "example", "paper", "2026-10-13", data=data, bytes=99, at=now)
     ext_store.save_day_ok(db, "example", "paper", "2026-10-12", data=data, bytes=99, at=now)
+    assert ext_store.mark_uploaded(db, "example", "paper", "2026-10-12", data)  # on the relay
     ext_store.save_day_none(db, "example", "paper", "2026-10-11", at=now)
     for _ in range(3):
         ext_store.record_day_failure(
@@ -522,11 +524,16 @@ def test_the_snapshot_lists_only_days_with_a_copy(tmp_path: Path) -> None:
     snap = build_snapshot(db, load_settings(), started_at=now, now=now)
     paper, plain = snap.extensions[0].panels
     assert paper.history is not None
-    assert paper.history.days == ["2026-10-13", "2026-10-12"]
+    # the 12th is on the relay; the 13th isn't yet: only the local tier lists it
+    assert paper.history.days == ["2026-10-12"] and paper.history.pending == ["2026-10-13"]
     assert paper.history.failed == ["2026-10-10"]
     assert plain.history is None
     dumped = snap.model_dump(mode="json")["extensions"][0]["panels"][0]
-    assert dumped["history"] == {"days": ["2026-10-13", "2026-10-12"], "failed": ["2026-10-10"]}
+    assert dumped["history"] == {
+        "days": ["2026-10-12"], "pending": ["2026-10-13"], "failed": ["2026-10-10"]
+    }  # fmt: skip
+    remote = to_remote(snap).model_dump(mode="json")["extensions"][0]["panels"][0]
+    assert remote["history"] == {"days": ["2026-10-12"], "failed": ["2026-10-10"]}
     # a day list never carries a copy: the snapshot is a list of dates
     assert "Equity" not in json.dumps(dumped["history"])
 
@@ -540,7 +547,8 @@ def test_the_day_list_is_capped_at_keep(tmp_path: Path) -> None:
         ext_store.save_day_ok(db, "example", "paper", day, data='{"views":[]}', bytes=2, at=now)
     snap = build_snapshot(db, load_settings(), started_at=now, now=now)
     history = snap.extensions[0].panels[0].history
-    assert history is not None and len(history.days) == 7 and history.days[0] == "2026-10-13"
+    assert history is not None and history.days == [] and history.pending is not None
+    assert len(history.pending) == 7 and history.pending[0] == "2026-10-13"
 
 
 async def test_the_local_api_serves_a_day_read_only_and_404s_the_rest(tmp_path: Path) -> None:
@@ -713,3 +721,37 @@ async def test_a_killed_run_defers_without_counting_and_holds_the_archiver(
         assert run.days == ["2026-10-13"]  # held: no other day meanwhile
         await h.tick(at(1, 18))
         assert run.days == ["2026-10-13", "2026-10-13"]
+
+
+def test_mark_uploaded_keeps_a_day_a_rebuild_changed_meanwhile(tmp_path: Path) -> None:
+    db = open_db(tmp_path / "s.db")
+    now = utcnow()
+    _save_ext(db, now)
+    ext_store.save_day_ok(db, "example", "paper", "2026-10-13", data='{"a":1}', bytes=7, at=now)
+    sent = ext_store.get_panel_day(db, "example", "paper", "2026-10-13")
+    assert sent is not None
+    ext_store.save_day_ok(db, "example", "paper", "2026-10-13", data='{"a":2}', bytes=7, at=now)
+    assert not ext_store.mark_uploaded(db, "example", "paper", "2026-10-13", sent.data_json)
+    row = ext_store.get_panel_day(db, "example", "paper", "2026-10-13")
+    assert row is not None and row.upload_due
+    assert ext_store.mark_uploaded(db, "example", "paper", "2026-10-13", '{"a":2}')
+
+
+async def test_an_unexpected_error_holds_the_archiver_instead_of_looping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = Script()
+    async with hist_harness(tmp_path, run, at_=at(1, 1)) as h:
+        calls: list[str] = []
+
+        def boom(*a: Any, **k: Any) -> None:
+            calls.append("x")
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(h.sched, "_finish_archive", boom)
+        await h.tick(at(1, 2))
+        await h.tick(at(1, 3))
+        await h.tick(at(1, 10))
+        assert calls == ["x"]  # held for 15 minutes, not retried every tick
+        await h.tick(at(1, 18))
+        assert calls == ["x", "x"]

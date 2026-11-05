@@ -311,9 +311,10 @@ def _head(p: Panel) -> dict[str, Any]:
         "error": p.error,
     }
     if p.history is not None:  # PER-286: the archived days (newest first)
+        days = sorted([*p.history.days, *(p.history.pending or [])], reverse=True)
         head["history"] = {
-            "days": len(p.history.days),
-            "newest": p.history.days[:7],
+            "days": len(days),
+            "newest": days[:7],
             "failed": p.history.failed[:7],
         }
     return head

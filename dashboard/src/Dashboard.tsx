@@ -127,7 +127,7 @@ export function Dashboard({ load, loadDay, onSignOut }: { load: Loader; loadDay?
         {!snap && !loading && !error && (
           <p className="py-10 text-center text-sm text-muted-foreground">No snapshot has been sent yet.</p>
         )}
-        {snap && extPage && guard(<ExtensionPage snap={snap} now={now} route={extPage} loadDay={loadDay} />)}
+        {snap && extPage && guard(<ExtensionPage key={extPage.name} snap={snap} now={now} route={extPage} loadDay={loadDay} />)}
         {snap && !extPage && (
           <div role="tablist" aria-label="Dashboard view" className="inline-flex rounded-lg border bg-card p-0.5">
             {(["overview", "diagram"] as const).map((t) => (

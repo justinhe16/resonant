@@ -472,6 +472,8 @@ export interface Panel {
 export interface PanelHistory {
   /** YYYY-MM-DD, newest first: the days with an archived copy */
   days: string[];
+  /** local tier only: days with a copy the relay doesn't have yet */
+  pending?: string[] | null;
   /** days that failed 3 times (shown on the panel; they don't degrade the extension) */
   failed?: string[];
 }

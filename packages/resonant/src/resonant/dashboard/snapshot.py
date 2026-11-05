@@ -693,7 +693,13 @@ class PanelHistory(_Model):
     fetched when the owner picks it (``GET /api/ext/<ext>/panels/<id>/days/<day>`` locally,
     the ``panel_days`` table remotely)."""
 
+    # Days with a copy the relay has (the remote page can fetch them), newest first.
     days: list[PanelDayText] = Field(default_factory=list[str], max_length=HISTORY_DAYS_MAX)
+    # Days with a copy the relay doesn't have yet (local only: the local page lists them too).
+    pending: list[PanelDayText] | None = Field(
+        default=None, max_length=HISTORY_DAYS_MAX, exclude_if=lambda v: v is None,
+        json_schema_extra=LOCAL_ONLY,
+    )  # fmt: skip
     # Days that failed 3 times (newest first): the panel shows them, ext health doesn't.
     failed: list[PanelDayText] = Field(default_factory=list[str], max_length=HISTORY_FAILED_MAX)
 
@@ -1248,10 +1254,13 @@ def _history(spec: Mapping[str, Any], days: Sequence[ext_store.PanelDay]) -> Pan
     if not isinstance(h, dict):
         return None
     keep = cast(dict[str, Any], h).get("keep")
-    n = int(keep[:-1]) if isinstance(keep, str) and re.fullmatch(r"[0-9]{1,3}d", keep) else 365
+    n = int(keep[:-1]) if isinstance(keep, str) and re.fullmatch(r"[0-9]{1,4}d", keep) else 365
     n = max(1, min(n, HISTORY_DAYS_MAX))
+    copies = [d for d in days if d.data_json is not None][:n]
+    pending = [d.day for d in copies if d.upload_due]
     return PanelHistory(
-        days=[d.day for d in days if d.data_json is not None][:n],
+        days=[d.day for d in copies if not d.upload_due],
+        pending=pending or None,
         failed=[d.day for d in days if d.status == "failed"][:HISTORY_FAILED_MAX],
     )
 

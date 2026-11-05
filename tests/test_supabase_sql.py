@@ -788,6 +788,14 @@ def test_panel_day_is_stored_and_only_the_owner_reads_it(db: Pg) -> None:
     assert json.loads(db.ok("select data from public.panel_days;"))["health"] == "warn"
     assert panel_day(db, d, None).ok
     assert day_rows(db) == []
+    # a JSON null as the jsonb value 'null' (PostgREST's body mapping) deletes too
+    assert panel_day(db, d).ok
+    r = db.run(
+        f"select public.relay_panel_day('{INGEST}', 'ledger', 'paper', '{d}', 'null'::jsonb, 365);",
+        role="anon",
+    )
+    assert r.ok, r.err
+    assert day_rows(db) == []
 
 
 def test_panel_days_cannot_be_written_or_read_directly(db: Pg) -> None:

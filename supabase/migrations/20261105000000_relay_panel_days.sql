@@ -91,6 +91,11 @@ begin
     raise exception 'relay: bad keep' using errcode = 'PT400';
   end if;
 
+  -- PostgREST may pass a JSON null as SQL NULL or as the jsonb value 'null': both delete.
+  if p_data is not null and jsonb_typeof(p_data) = 'null' then
+    p_data := null;
+  end if;
+
   if p_data is not null then
     if jsonb_typeof(p_data) <> 'object' then
       raise exception 'relay: data must be an object' using errcode = 'PT400';

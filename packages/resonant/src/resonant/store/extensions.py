@@ -579,11 +579,18 @@ def days_to_upload(conn: sqlite3.Connection, now: datetime, limit: int) -> list[
     return [_row_to_day(r) for r in rows]
 
 
-def mark_uploaded(conn: sqlite3.Connection, ext: str, panel_id: str, day: str) -> None:
-    conn.execute(
-        """UPDATE ext_panel_days SET upload_due = 0, upload_tries = 0, upload_next_at = NULL
-           WHERE ext = ? AND panel_id = ? AND day = ?""",
-        (ext, panel_id, day),
+def mark_uploaded(
+    conn: sqlite3.Connection, ext: str, panel_id: str, day: str, sent: str | None
+) -> bool:
+    """The relay has ``sent`` (the ``data_json`` that was uploaded). A row whose copy changed
+    meanwhile (a rebuild landed) stays due. True when cleared."""
+    return (
+        conn.execute(
+            """UPDATE ext_panel_days SET upload_due = 0, upload_tries = 0, upload_next_at = NULL
+               WHERE ext = ? AND panel_id = ? AND day = ? AND data_json IS ?""",
+            (ext, panel_id, day, sent),
+        ).rowcount
+        == 1
     )
 
 

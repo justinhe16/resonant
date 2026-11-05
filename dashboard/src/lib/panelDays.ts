@@ -1,4 +1,4 @@
-import type { Extension, PanelDay } from "@/types";
+import type { Extension, Panel, PanelDay } from "@/types";
 
 /** Fetches one archived day of a panel (PER-286); null when there is none for that day. */
 export type DayLoader = (ext: string, panel: string, day: string) => Promise<PanelDay | null>;
@@ -37,10 +37,13 @@ export async function loadLocalDay(
   return assertDay(await res.json());
 }
 
+/** A panel's archived days: on the relay, plus (local tier) those not uploaded yet. */
+export const dayList = (p: Panel): string[] => [...(p.history?.days ?? []), ...(p.history?.pending ?? [])];
+
 /** Every archived day of the extension's panels, newest first, without repeats. */
 export function archivedDays(ext: Extension): string[] {
   const all = new Set<string>();
-  for (const p of ext.panels) for (const d of p.history?.days ?? []) if (isDay(d)) all.add(d);
+  for (const p of ext.panels) for (const d of dayList(p)) if (isDay(d)) all.add(d);
   return [...all].sort().reverse();
 }
 

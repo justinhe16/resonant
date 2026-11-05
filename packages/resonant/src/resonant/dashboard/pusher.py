@@ -446,7 +446,9 @@ class SnapshotPusher:
             if found is None or (row.data_json is not None and data is None):
                 # Gone, history turned off, or an unreadable copy: nothing to send.
                 with atomic(self.conn):
-                    ext_store.mark_uploaded(self.conn, row.ext, row.panel_id, row.day)
+                    ext_store.mark_uploaded(
+                        self.conn, row.ext, row.panel_id, row.day, row.data_json
+                    )
                 continue
             body = json.dumps({
                 "p_token": token, "p_ext": row.ext, "p_panel": row.panel_id, "p_day": row.day,
@@ -455,7 +457,9 @@ class SnapshotPusher:
             outcome = await self._post(body, self.day_url)
             with atomic(self.conn):
                 if outcome.ok:
-                    ext_store.mark_uploaded(self.conn, row.ext, row.panel_id, row.day)
+                    ext_store.mark_uploaded(
+                        self.conn, row.ext, row.panel_id, row.day, row.data_json
+                    )
                 else:
                     wait = min(DAY_BACKOFF_MAX_S, DAY_BACKOFF_S * 2**row.upload_tries)
                     ext_store.mark_upload_failed(

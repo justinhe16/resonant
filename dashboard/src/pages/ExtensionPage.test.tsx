@@ -260,8 +260,15 @@ describe("panel history (PER-286)", () => {
     const u = user();
     window.location.hash = "#/ext/github";
     const loadDay = mountDays(remote);
-    await u.selectOptions(await screen.findByTestId("day-picker"), "2026-10-15");
+    const picker = await screen.findByTestId("day-picker");
+    // a day the relay doesn't have yet is listed only locally
+    expect(within(picker).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Today (live)",
+      "Wed 10/14",
+      "Mon 10/12",
+    ]);
+    await u.selectOptions(picker, "2026-10-14");
     await screen.findByText("archived words");
-    expect(loadDay).toHaveBeenCalledWith("github", "prs", "2026-10-15");
+    expect(loadDay).toHaveBeenCalledWith("github", "prs", "2026-10-14");
   });
 });
