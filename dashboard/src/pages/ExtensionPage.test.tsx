@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "@/Dashboard";
 import { clone, FIXTURE_NOW, local, remote } from "@/test/fixtures";
-import type { Snapshot } from "@/types";
+import priceFixture from "@/test/fixtures/price.json";
+import type { Panel, PriceWidget, Snapshot } from "@/types";
 
 const user = () => userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
 const mount = (snap: Snapshot) => render(<Dashboard load={async () => snap} />);
@@ -110,5 +111,50 @@ describe("the overview", () => {
     expect(await screen.findByTestId("extension-page")).toBeInTheDocument();
     await u.click(screen.getByRole("button", { name: "Back" }));
     expect(await screen.findByRole("tab", { name: "Diagram", selected: true })).toBeInTheDocument();
+  });
+});
+
+describe("price panels (PER-282)", () => {
+  const withChart = (order: "after" | "alone" | "middle") => {
+    const snap = clone(local);
+    const ext = snap.extensions[0]!;
+    const [prs, ci] = ext.panels as [Panel, Panel];
+    const chart: Panel = { ...prs, id: "chart", title: "NQ chart", views: [{ id: "chart", title: "Chart", widgets: [priceFixture.candles as PriceWidget] }] };
+    ext.panels = order === "alone" ? [chart] : order === "after" ? [prs, ci, chart] : [prs, chart, ci];
+    return snap;
+  };
+  const cells = async () => {
+    const page = await screen.findByTestId("extension-page");
+    return within(page).getAllByTestId("panel-cell");
+  };
+
+  it("a chart-only panel alone in its row takes the full width", async () => {
+    window.location.hash = "#/ext/github";
+    const { unmount } = mount(withChart("alone"));
+    const [only] = await cells();
+    expect(only).toHaveAttribute("data-wide", "true");
+    expect(only).toHaveClass("lg:col-span-2");
+    expect(within(only!).getByTestId("price-chart")).toBeInTheDocument();
+    unmount();
+    mount(withChart("after")); // the third of three: alone in the second row
+    const three = await cells();
+    expect(three.map((c) => c.hasAttribute("data-wide"))).toEqual([false, false, true]);
+  });
+
+  it("next to another panel it keeps its column", async () => {
+    window.location.hash = "#/ext/github";
+    mount(withChart("middle"));
+    const three = await cells();
+    expect(three.map((c) => c.hasAttribute("data-wide"))).toEqual([false, false, false]);
+    expect(three.every((c) => c.classList.contains("min-w-0"))).toBe(true);
+  });
+
+  it("the overview glance of a chart-only panel is its title and age, no chart", async () => {
+    mount(withChart("alone"));
+    const glance = (await screen.findAllByTestId("panel-glance"))[0]!;
+    expect(glance).toHaveTextContent("NQ chart");
+    expect(glance).toHaveTextContent(/updated .* ago/);
+    expect(within(glance).queryByTestId("price-chart")).toBeNull();
+    expect(within(glance).queryByTestId("stat-value")).toBeNull();
   });
 });

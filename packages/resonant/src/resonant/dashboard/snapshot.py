@@ -614,8 +614,65 @@ class DetailsWidget(_Sparse):
     truncated: bool = False
 
 
+class PriceTrade(_Sparse):
+    side: Literal["long", "short"]
+    entry_t: Num  # unix seconds
+    entry_px: Num
+    exit_t: Num | None = None  # null with ``exit_px`` while the trade is open
+    exit_px: Num | None = None
+    pnl: Num | None = None
+    currency: Currency | None = None
+    label: Txt40 | None = None
+    why: Txt24 | None = None
+
+
+class PriceMarker(_Sparse):
+    t: Num  # unix seconds
+    price: Num
+    kind: Literal["up", "down", "dot"]
+    tone: PillTone
+    label: Txt40 | None = None
+
+
+class PriceWidget(_Sparse):
+    """A price chart (PER-282), columnar and delta-coded so a day of 1-minute candles fits a
+    panel's 32 KiB. Candle ``i`` opens at ``t0 + dt[0] + ... + dt[i]`` (``dt[0]`` is 0; whole
+    seconds). Prices are integers in units of ``q * 10**-dp`` (``q`` is the prices' common
+    tick: 25 for quarter points with ``dp`` 2). With ``mode: candles``, ``o[i]`` is
+    the open minus the previous non-null close (the first candle's open itself), ``h[i]`` the
+    high minus the open, ``l[i]`` the open minus the low and ``c[i]`` the close minus the open.
+    With ``mode: line`` there is only ``c``: each close minus the previous non-null close (the
+    first close itself). A null is a gap in every column."""
+
+    type: Literal["price"]
+    id: PanelSlug | None = None
+    title: Txt64 | None = None
+    mode: Literal["candles", "line"]
+    t0: int
+    dt: list[int]
+    dp: Annotated[int, Field(ge=0, le=8)]
+    q: Annotated[int, Field(ge=1)] = 1
+    o: list[int | None] | None = None
+    h: list[int | None] | None = None
+    l: list[int | None] | None = None  # noqa: E741 (the OHLC name)
+    c: list[int | None]
+    unit: Txt16 | None = None
+    format: PanelFormat = "number"
+    currency: Currency | None = None
+    trades: list[PriceTrade] = _list()
+    markers: list[PriceMarker] = _list()
+    aggregated_from: int | None = None
+
+
 PanelWidget = Annotated[
-    StatWidget | SeriesWidget | TableWidget | StatusWidget | KvWidget | TextWidget | DetailsWidget,
+    StatWidget
+    | SeriesWidget
+    | TableWidget
+    | StatusWidget
+    | KvWidget
+    | TextWidget
+    | DetailsWidget
+    | PriceWidget,
     Field(discriminator="type"),
 ]
 

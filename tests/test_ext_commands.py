@@ -1065,6 +1065,40 @@ def test_read_panel_summarises_each_panel_and_reads_one_in_full(ctx: BuiltinCont
     assert READ_PANEL.effective_level.value == "L0"
 
 
+def test_read_panel_decodes_a_price_chart_for_the_brain(ctx: BuiltinContext) -> None:
+    from panel_helpers import store_panel
+
+    from resonant.tools.ext import read_panel
+    from resonant_sdk import panel as p
+
+    install(ctx, PANEL_DEMO)
+    s0 = int(NOW.timestamp()) - 600
+    x = [s0, s0 + 60, s0 + 120]
+    chart = p.price(
+        x,
+        candles=[(10, 12, 9, 11), None, (11, 13.25, 10.5, 12.5)],
+        title="NQ",
+        trades=[p.trade("long", s0, 10.25, s0 + 120, 12.5, pnl=45.0, why="target")],
+    )
+    with transaction(ctx.conn):
+        store_panel(ctx.conn, "demo", "paper", p.panel([p.view("c", "Chart", [chart])]), NOW)
+    (w,) = read_panel(ctx, {"extension": "demo", "panel": "paper"})["panel"]["views"][0]["widgets"]
+    assert {
+        k: w[k] for k in ("type", "title", "mode", "candles", "open", "high", "low", "last")
+    } == {
+        "type": "price",
+        "title": "NQ",
+        "mode": "candles",
+        "candles": 3,
+        "open": 10,
+        "high": 13.25,
+        "low": 9,
+        "last": 12.5,
+    }
+    assert w["trades"][0]["why"] == "target" and "dt" not in w and "c" not in w
+    assert w["from"].startswith("20") and w["to"] > w["from"]
+
+
 def test_read_panel_refuses_what_it_does_not_know(ctx: BuiltinContext) -> None:
     from resonant.tools.ext import read_panel
 

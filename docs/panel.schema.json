@@ -1,6 +1,88 @@
 {
   "$comment": "Generated from resonant_sdk/panel_schema.py; do not edit.",
   "$defs": {
+    "Candles": {
+      "additionalProperties": false,
+      "description": "Open, high, low and close, each as long as ``x``. A candle is all four numbers with\n``h >= max(o, c)`` and ``l <= min(o, c)``, or all four null (a gap).",
+      "properties": {
+        "c": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "C",
+          "type": "array"
+        },
+        "h": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "H",
+          "type": "array"
+        },
+        "l": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "L",
+          "type": "array"
+        },
+        "o": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "O",
+          "type": "array"
+        }
+      },
+      "required": [
+        "o",
+        "h",
+        "l",
+        "c"
+      ],
+      "title": "Candles",
+      "type": "object"
+    },
     "Column": {
       "additionalProperties": false,
       "properties": {
@@ -257,6 +339,78 @@
       "title": "Link",
       "type": "object"
     },
+    "Marker": {
+      "additionalProperties": false,
+      "description": "A point of interest: an arrow up or down, or a dot.",
+      "properties": {
+        "kind": {
+          "default": "dot",
+          "enum": [
+            "up",
+            "down",
+            "dot"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 40
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "price": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Price"
+        },
+        "t": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "format": "date-time",
+              "type": "string"
+            }
+          ],
+          "title": "T"
+        },
+        "tone": {
+          "default": "neutral",
+          "enum": [
+            "ok",
+            "warn",
+            "bad",
+            "neutral"
+          ],
+          "title": "Tone",
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "price"
+      ],
+      "title": "Marker",
+      "type": "object"
+    },
     "Pill": {
       "additionalProperties": false,
       "properties": {
@@ -281,6 +435,168 @@
         "tone"
       ],
       "title": "Pill",
+      "type": "object"
+    },
+    "Price": {
+      "additionalProperties": false,
+      "description": "A price chart (PER-282): ``candles`` or ``line`` (closes only) over ``x``, the candles'\nopen times, strictly increasing (whole seconds; a fraction is rounded). At most 20160\npoints; over 1440 they are aggregated into wider candles. At most 100 trades and 200\nmarkers.",
+      "properties": {
+        "candles": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Candles"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "format": {
+          "anyOf": [
+            {
+              "enum": [
+                "number",
+                "integer",
+                "money",
+                "percent",
+                "duration",
+                "bytes"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line"
+        },
+        "markers": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Marker"
+          },
+          "maxItems": 200,
+          "title": "Markers",
+          "type": "array"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "trades": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Trade"
+          },
+          "maxItems": 100,
+          "title": "Trades",
+          "type": "array"
+        },
+        "type": {
+          "const": "price",
+          "title": "Type",
+          "type": "string"
+        },
+        "unit": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 16
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unit"
+        },
+        "x": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "format": "date-time",
+                "type": "string"
+              }
+            ]
+          },
+          "maxItems": 20160,
+          "title": "X",
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "x"
+      ],
+      "title": "Price",
       "type": "object"
     },
     "Series": {
@@ -884,6 +1200,141 @@
       "title": "Text",
       "type": "object"
     },
+    "Trade": {
+      "additionalProperties": false,
+      "description": "A position on the chart: entered at ``entry_t``/``entry_px``, exited at\n``exit_t``/``exit_px`` (both null while it is open). ``pnl`` is its money result.",
+      "properties": {
+        "currency": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z]{3}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "entry_px": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "title": "Entry Px"
+        },
+        "entry_t": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "format": "date-time",
+              "type": "string"
+            }
+          ],
+          "title": "Entry T"
+        },
+        "exit_px": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Px"
+        },
+        "exit_t": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit T"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 40
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "pnl": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pnl"
+        },
+        "side": {
+          "enum": [
+            "long",
+            "short"
+          ],
+          "title": "Side",
+          "type": "string"
+        },
+        "why": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-cut-at": 24
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Why"
+        }
+      },
+      "required": [
+        "side",
+        "entry_t",
+        "entry_px"
+      ],
+      "title": "Trade",
+      "type": "object"
+    },
     "View": {
       "additionalProperties": false,
       "description": "A tab of the panel. At most 24 widgets (48 per panel).",
@@ -904,6 +1355,7 @@
               "mapping": {
                 "details": "#/$defs/Details",
                 "kv": "#/$defs/Kv",
+                "price": "#/$defs/Price",
                 "series": "#/$defs/Series",
                 "stat": "#/$defs/Stat",
                 "status": "#/$defs/Status",
@@ -933,6 +1385,9 @@
               },
               {
                 "$ref": "#/$defs/Details"
+              },
+              {
+                "$ref": "#/$defs/Price"
               }
             ]
           },

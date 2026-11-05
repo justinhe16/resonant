@@ -386,7 +386,53 @@ export interface DetailsWidget extends WidgetBase {
   truncated: boolean;
 }
 
-export type PanelWidget = StatWidget | SeriesWidget | TableWidget | StatusWidget | KvWidget | TextWidget | DetailsWidget;
+export interface PriceTrade {
+  side: "long" | "short";
+  /** unix seconds */
+  entry_t: number;
+  entry_px: number;
+  /** null with `exit_px` while the trade is open */
+  exit_t?: number | null;
+  exit_px?: number | null;
+  pnl?: number | null;
+  currency?: string | null;
+  label?: string | null;
+  why?: string | null;
+}
+
+export interface PriceMarker {
+  /** unix seconds */
+  t: number;
+  price: number;
+  kind: "up" | "down" | "dot";
+  tone: PillTone;
+  label?: string | null;
+}
+
+/** A price chart (PER-282), columnar and delta-coded (decode with `decodePrice`): candle `i`
+ * opens at `t0 + dt[0..i]`; prices are integers in units of `q * 10^-dp`. Candles: `o` is the
+ * open minus the previous close, `h` high minus open, `l` open minus low, `c` close minus open.
+ * Line: only `c`, each close minus the previous. A null is a gap. */
+export interface PriceWidget extends WidgetBase {
+  type: "price";
+  mode: "candles" | "line";
+  t0: number;
+  dt: number[];
+  dp: number;
+  q?: number;
+  o?: (number | null)[] | null;
+  h?: (number | null)[] | null;
+  l?: (number | null)[] | null;
+  c: (number | null)[];
+  unit?: string | null;
+  format: PanelFormat;
+  currency?: string | null;
+  trades: PriceTrade[];
+  markers: PriceMarker[];
+  aggregated_from?: number | null;
+}
+
+export type PanelWidget = StatWidget | SeriesWidget | TableWidget | StatusWidget | KvWidget | TextWidget | DetailsWidget | PriceWidget;
 
 export interface PanelView {
   id: string;

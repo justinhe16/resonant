@@ -101,6 +101,9 @@
   --chart-2: oklch(0.66 0.17 50);
   --chart-3: oklch(0.58 0.12 190);
   --chart-4: oklch(0.52 0.2 330);
+  /* Price candles (PER-282): calmer than ok/bad, so a trade's win/loss line stays on top. */
+  --up: oklch(0.6 0.1 165);
+  --down: oklch(0.58 0.15 22);
 }
 
 .dark {
@@ -132,6 +135,8 @@
   --chart-2: oklch(0.78 0.15 60);
   --chart-3: oklch(0.76 0.12 190);
   --chart-4: oklch(0.74 0.16 335);
+  --up: oklch(0.72 0.1 165);
+  --down: oklch(0.68 0.14 22);
 }
 
 @theme inline {
@@ -162,6 +167,8 @@
   --color-chart-2: var(--chart-2);
   --color-chart-3: var(--chart-3);
   --color-chart-4: var(--chart-4);
+  --color-up: var(--up);
+  --color-down: var(--down);
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);

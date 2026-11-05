@@ -286,8 +286,15 @@ Every widget may carry `id` (a slug) and `title` (cut at 64). `Format` is one of
 | `kv` | `items: [{key (cut 40), value (string cut 120, number, bool or null), format, unit}]` | The first 30 items. |
 | `text` | `text` (cut 800) | Plain text, shown as is (`<b>` stays `<b>`). |
 | `details` | `data` (any JSON value), `collapsed` (default true) | Flattened by Resonant into at most 200 rows `{depth, key, kind, value}` in document order (see below); a container at depth 5 becomes one `…` row. |
+| `price` | `x` (candle open times), `candles: {o, h, l, c}` **or** `line` (closes), `unit`, `format`, `currency`, `trades: [{side: long/short, entry_t, entry_px, exit_t, exit_px, pnl, currency, label (cut 40), why (cut 24)}]`, `markers: [{t, price, kind: up/down/dot, tone: ok/warn/bad/neutral, label (cut 40)}]` | PER-282. `x` strictly increases (whole seconds; a fraction is rounded). Give exactly one of `candles` and `line`, each column as long as `x`. A candle is all four numbers with `h ≥ max(o, c)` and `l ≤ min(o, c)`, or all four `null` (a gap); anything else is refused. At most 20160 points; over 1440 they are **aggregated**, never averaged (see below). An open trade has `exit_t` and `exit_px` both null (one without the other is refused, as is an exit before its entry). At most 100 trades and 200 markers (more is refused). |
 
 **Downsampling.** A time axis over 240 points keeps the first and last points exactly and splits the middle into 238 equal buckets. Each bucket takes the x of its first point and, per line, the mean of its non-null values (null if all are null). The widget says `downsampled_from: <n>`.
+
+**Price candles are aggregated.** Over 1440 points (a day of 1-minute bars), every `k = ceil(n / 1440)` candles in a row become one: the first open, the highest high, the lowest low and the last close, at the first candle's time (a line keeps the last close; a run of gaps stays a gap). The widget says `aggregated_from: <n>`.
+
+**Price columns are compact.** So that a day of 1-minute candles with trades fits the 32 KiB panel cap, the snapshot carries a price widget delta-coded (`docs/snapshot.schema.json`, `PriceWidget`): `t0` plus `dt` (seconds since the previous candle, `dt[0] = 0`), and prices as integers in units of `q · 10^-dp` (`dp` is the most decimals any price has, at most 8; `q` their common tick, 25 for quarter points). With `mode: candles`, `o` is the open minus the previous close (the first open itself), `h` the high minus the open, `l` the open minus the low and `c` the close minus the open; with `mode: line` there is only `c`, each close minus the previous one. Trades and markers keep their own numbers, times in unix seconds. The dashboard decodes it in `dashboard/src/lib/price.ts`, the daemon in `extensions.panels.decode_price`; you never write this form, you print the plain one above. 1440 NQ 1-minute candles with 20 trades come to about 23 KB. Prices on a coarse tick compress best. Prices with many decimals and no common tick (computed values, say) take more room, and a full 1440 of them can pass the cap and be refused. Round your prices to the instrument's tick, or send fewer candles.
+
+**How a price chart is drawn.** Candles (up hollow, down filled) or a close line; a trade is ▲ (long) or ▼ (short) at entry, a dot at exit and a thin line between them, green or red by the sign of `pnl` (of its points when there is no `pnl`); an open trade's line is dashed to the last close. Hovering or tapping a trade shows its times, side, entry → exit, points, money and `why`; a crosshair shows a candle's OHLC. ctrl/⌘ + wheel or a pinch zooms the time axis (a plain wheel scrolls the page), a drag pans, a double click or double tap (or **Reset**) fits everything, and the chips show the last 30 minutes, the last hour or **All**. The y axis fits what is visible. A collapsed **Trades** table under the chart lists every trade. On your extension's page, panels sit in two columns from `lg`; a panel whose only widget is a price chart takes the whole row when it would be alone in it. The overview glance shows stats only, so a chart-only panel shows its title and age there.
 
 **`details` is flattened.** The relay's guard refuses any JSON key named `remote_url` anywhere, and keys are not scanned for secrets, so a free-form tree can't be sent as it is. Resonant turns it into rows whose keys are *values*: the root has an empty key, an object's key is its name, an array item is `[0]`, `[1]`, … and `kind` is `object`, `array`, `string`, `number`, `bool` or `null` (a string is cut at 200).
 
@@ -318,9 +325,17 @@ Extensions run as `python -I -S`, so the SDK isn't importable: copy `packages/re
 
 ```python
 from panel import print_panel, stat, series, table, column, pill, link, status, kv, text, details, view
+from panel import price, trade, marker
 ```
 
-`stat`, `series`, `table` (with `column`, `pill`, `link`), `status`, `kv`, `text` and `details` build the widgets as dicts (None fields are left out, a `datetime` becomes ISO text and must have a timezone); `view(id, title, widgets)` builds a tab and `print_panel(views, updated_at=…, health=…, local_url=…)` prints the object.
+`stat`, `series`, `table` (with `column`, `pill`, `link`), `status`, `kv`, `text`, `details` and `price` (with `trade` and `marker`) build the widgets as dicts (None fields are left out, a `datetime` becomes ISO text and must have a timezone); `view(id, title, widgets)` builds a tab and `print_panel(views, updated_at=…, health=…, local_url=…)` prints the object.
+
+```python
+price(x, *, candles=None, line=None, trades=(), markers=(), **fields)  # fields: unit, format, currency, id, title
+#   candles: {"o": [...], "h": [...], "l": [...], "c": [...]} or rows [(o, h, l, c) | None, ...]
+trade(side, entry_t, entry_px, exit_t=None, exit_px=None, **fields)    # fields: pnl, currency, label, why
+marker(t, price, kind="dot", tone="neutral", **fields)                  # fields: label
+```
 
 ### Example: a finance extension
 
@@ -383,7 +398,7 @@ print_panel([view("now", "Now", [
 
 ### `read_panel`
 
-The brain can read what a panel last drew: `read_panel {extension}` lists the extension's panels (`id`, `title`, `updated_at`, `ok`, `stale`, `error`) with the stat widgets of each first view as `{label, value, unit}`; `read_panel {extension, panel}` returns that panel's views in full. It reads the stored copy only and never runs anything. Its output is outside text, so the calling task is tainted.
+The brain can read what a panel last drew: `read_panel {extension}` lists the extension's panels (`id`, `title`, `updated_at`, `ok`, `stale`, `error`) with the stat widgets of each first view as `{label, value, unit}`; `read_panel {extension, panel}` returns that panel's views in full, except that a `price` widget comes back decoded into a summary (`mode`, `unit`, `candles`, `aggregated_from`, `from`, `to`, `open`, `high`, `low`, `last`, and its `trades` and `markers` as they are). It reads the stored copy only and never runs anything. Its output is outside text, so the calling task is tainted.
 
 ## 7. Events and notifications
 

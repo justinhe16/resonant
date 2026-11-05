@@ -9,7 +9,8 @@ models (``dashboard.snapshot.PanelView``), in this order:
    the field path and the error type, never from the values it echoes);
 2. the structural refusals, each named by view and widget (too many series, points,
    categories or columns, a time axis that goes backwards, a cell of the wrong type, ...);
-3. cuts and downsampling (rows, items, a long time axis), flattening of ``details``;
+3. cuts and downsampling (rows, items, a long time axis), flattening of ``details``, a
+   ``price`` chart's OHLC aggregation over 1440 points and its compact columns (PER-282);
 4. times become unix seconds (a status ``since``: a datetime);
 5. every string goes through ``redact.clip_text`` at its cap: too long is cut, never refused;
 6. the result is validated into ``PanelView`` models and measured as compact JSON against
@@ -28,7 +29,10 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
+from functools import reduce
 from itertools import pairwise
+from math import gcd
 from typing import Any, cast
 
 from pydantic import ValidationError
@@ -363,6 +367,192 @@ def _details(w: ps.Details, ctx: _Ctx) -> dict[str, Any]:
     }
 
 
+# --- price (PER-282) --------------------------------------------------------------------------
+
+_DP_MAX = 8
+_SAFE_INT = 2**53 - 1  # the page decodes the integers as JS numbers
+OHLC = tuple[float, float, float, float] | None
+
+
+def _decimals(v: float) -> int:
+    """How many decimal places ``v`` is written with (``repr``), at most ``_DP_MAX``."""
+    if isinstance(v, int) or float(v).is_integer():
+        return 0
+    exp = Decimal(repr(v)).as_tuple().exponent
+    return min(-exp, _DP_MAX) if isinstance(exp, int) and exp < 0 else 0
+
+
+def _dp(values: list[float]) -> int:
+    """The decimal places to keep: the most any price has, fewer while a scaled price would
+    pass ``2**53``."""
+    dp = max((_decimals(v) for v in values), default=0)
+    top = max((abs(v) for v in values), default=0.0)
+    while dp > 0 and top * 10**dp > _SAFE_INT:
+        dp -= 1
+    if top * 10**dp > _SAFE_INT:
+        raise _Refuse("price out of range")
+    return dp
+
+
+def _aggregate(rows: list[OHLC], times: list[int], k: int) -> tuple[list[OHLC], list[int]]:
+    """``k`` candles at a time into one: the first open, the highest high, the lowest low,
+    the last close, at the first candle's time; a bucket of gaps is a gap."""
+    out: list[OHLC] = []
+    for lo in range(0, len(rows), k):
+        got = [r for r in rows[lo : lo + k] if r is not None]
+        out.append(
+            (got[0][0], max(r[1] for r in got), min(r[2] for r in got), got[-1][3]) if got else None
+        )
+    return out, times[::k]
+
+
+def _price_rows(w: ps.Price, n: int, ctx: _Ctx) -> list[OHLC]:
+    """The candles as rows (a line's close is all four), checked."""
+    if (w.candles is None) == (w.line is None):
+        raise ctx.fail("give exactly one of candles or line")
+    if w.line is not None:
+        if len(w.line) != n:
+            raise ctx.fail(f"line has {len(w.line)} values for {n} x")
+        return [None if v is None else (v, v, v, v) for v in w.line]
+    c = cast(ps.Candles, w.candles)
+    for name in ("o", "h", "l", "c"):
+        if (got := len(getattr(c, name))) != n:
+            raise ctx.fail(f"candles.{name} has {got} values for {n} x")
+    rows: list[OHLC] = []
+    for i, (o, h, lo, cl) in enumerate(zip(c.o, c.h, c.l, c.c, strict=True)):
+        quad = (o, h, lo, cl)
+        if all(v is None for v in quad):
+            rows.append(None)
+            continue
+        if any(v is None for v in quad):
+            raise ctx.fail(f"candle {i + 1} is partly null")
+        o, h, lo, cl = cast(tuple[float, float, float, float], quad)
+        if h < max(o, cl) or lo > min(o, cl):
+            raise ctx.fail(f"candle {i + 1} has h < max(o, c) or l > min(o, c)")
+        rows.append((o, h, lo, cl))
+    return rows
+
+
+def _trade(t: ps.Trade, i: int, ctx: _Ctx) -> dict[str, Any]:
+    where = f"{ctx.where}: trade {i + 1}"
+    if (t.exit_t is None) != (t.exit_px is None):
+        raise _Refuse(f"{where}: exit_t and exit_px are both set or both null")
+    entry = _unix(t.entry_t, where)
+    exit_t = None if t.exit_t is None else _unix(t.exit_t, where)
+    if exit_t is not None and exit_t < entry:
+        raise _Refuse(f"{where}: exit before entry")
+    return {
+        "side": t.side,
+        "entry_t": entry,
+        "entry_px": t.entry_px,
+        "exit_t": exit_t,
+        "exit_px": t.exit_px,
+        "pnl": t.pnl,
+        "currency": t.currency,
+        "label": _to(t.label, 40),
+        "why": _to(t.why, 24),
+    }
+
+
+def _price(w: ps.Price, ctx: _Ctx) -> dict[str, Any]:
+    n = len(w.x)
+    if n > ps.PRICE_POINTS_MAX:
+        raise ctx.fail(f"{n} points (max {ps.PRICE_POINTS_MAX})")
+    if len(w.trades) > ps.TRADES_MAX:
+        raise ctx.fail(f"{len(w.trades)} trades (max {ps.TRADES_MAX})")
+    if len(w.markers) > ps.MARKERS_MAX:
+        raise ctx.fail(f"{len(w.markers)} markers (max {ps.MARKERS_MAX})")
+    times = [round(_unix(v, f"{ctx.where}: x")) for v in w.x]
+    if any(b <= a for a, b in pairwise(times)):
+        raise ctx.fail("x must strictly increase")
+    rows = _price_rows(w, n, ctx)
+    aggregated: int | None = None
+    if n > ps.PRICE_POINTS_KEPT:
+        rows, times = _aggregate(rows, times, -(-n // ps.PRICE_POINTS_KEPT))
+        aggregated = n
+    dp = _dp([v for r in rows if r is not None for v in r])
+    scaled = [tuple(round(v * 10**dp) for v in r) if r is not None else None for r in rows]
+    q = reduce(gcd, (v for r in scaled if r is not None for v in r), 0) or 1  # the tick
+    line = w.line is not None
+    cols: dict[str, list[int | None]] = {k: [] for k in ("o", "h", "l", "c")}
+    prev: int | None = None  # the last non-null close, scaled
+    for r in scaled:
+        if r is None:
+            for col in cols.values():
+                col.append(None)
+            continue
+        o, h, lo, cl = (v // q for v in r)
+        if line:
+            cols["c"].append(cl - (prev or 0))
+        else:
+            cols["o"].append(o - (prev or 0))
+            cols["h"].append(h - o)
+            cols["l"].append(o - lo)
+            cols["c"].append(cl - o)
+        prev = cl
+    return {
+        **_common(w),
+        "type": "price",
+        "mode": "line" if line else "candles",
+        "t0": times[0] if times else 0,
+        "dt": [0, *(b - a for a, b in pairwise(times))] if times else [],
+        "dp": dp,
+        "q": q,
+        **({} if line else {"o": cols["o"], "h": cols["h"], "l": cols["l"]}),
+        "c": cols["c"],
+        "unit": _to(w.unit, 16),
+        "format": w.format or "number",
+        "currency": w.currency,
+        "trades": [_trade(t, i, ctx) for i, t in enumerate(w.trades)],
+        "markers": [
+            {
+                "t": _unix(m.t, f"{ctx.where}: marker {i + 1}"),
+                "price": m.price,
+                "kind": m.kind,
+                "tone": m.tone,
+                "label": _to(m.label, 40),
+            }
+            for i, m in enumerate(w.markers)
+        ],
+        "aggregated_from": aggregated,
+    }
+
+
+def decode_price(w: Mapping[str, Any]) -> tuple[list[int], list[OHLC]]:
+    """A normalised price widget's candle times (unix seconds) and ``(o, h, l, c)`` rows (a
+    line's close is all four; a gap is None): the inverse of the encoding in ``_price``."""
+    q, div = int(w.get("q", 1)), 10 ** int(w["dp"])
+
+    def px(k: int) -> float:
+        return k * q / div
+
+    times: list[int] = []
+    t = int(w["t0"])
+    for d in cast(list[int], w["dt"]):
+        t += d
+        times.append(t)
+    rows: list[OHLC] = []
+    prev = 0
+    line = w["mode"] == "line"
+    cs = cast(list[int | None], w["c"])
+    os_ = cast(list[int | None], w.get("o") or [None] * len(cs))
+    hs = cast(list[int | None], w.get("h") or [None] * len(cs))
+    ls = cast(list[int | None], w.get("l") or [None] * len(cs))
+    for o, h, lo, c in zip(os_, hs, ls, cs, strict=True):
+        if c is None:
+            rows.append(None)
+            continue
+        if line:
+            prev += c
+            v = px(prev)
+            rows.append((v, v, v, v))
+            continue
+        op = prev + (o or 0)
+        prev = op + c
+        rows.append((px(op), px(op + (h or 0)), px(op - (lo or 0)), px(prev)))
+    return times, rows
+
+
 def _widget(w: Any, ctx: _Ctx) -> dict[str, Any]:
     if isinstance(w, ps.Stat):
         return _stat(w)
@@ -376,6 +566,8 @@ def _widget(w: Any, ctx: _Ctx) -> dict[str, Any]:
         return _kv(w, ctx)
     if isinstance(w, ps.Text):
         return {**_common(w), "type": "text", "text": _t(w.text, 800)}
+    if isinstance(w, ps.Price):
+        return _price(w, ctx)
     return _details(cast(ps.Details, w), ctx)
 
 

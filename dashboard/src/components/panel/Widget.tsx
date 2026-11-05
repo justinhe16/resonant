@@ -1,4 +1,5 @@
 import { Fragment } from "react";
+import { PriceWidget } from "@/components/panel/PriceWidget";
 import { SeriesWidget } from "@/components/panel/SeriesWidget";
 import { DetailsWidget, KvWidget, StatusWidget, TextWidget } from "@/components/panel/SmallWidgets";
 import { StatWidget } from "@/components/panel/StatWidget";
@@ -22,6 +23,8 @@ export function Widget({ w, ext, now }: { w: PanelWidget; ext: string; now: numb
       return <TextWidget w={w} />;
     case "details":
       return <DetailsWidget w={w} />;
+    case "price":
+      return <PriceWidget w={w} />;
     default:
       return (
         <p className="text-xs text-muted-foreground" data-testid="widget-unknown">

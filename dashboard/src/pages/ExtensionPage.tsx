@@ -7,7 +7,17 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { closeRoute, type Route } from "@/lib/route";
 import { healthTone } from "@/lib/tone";
-import type { Snapshot } from "@/types";
+import { cn } from "@/lib/utils";
+import type { Panel, Snapshot } from "@/types";
+
+/** A panel whose every view is just a price chart. */
+const chartOnly = (p: Panel) => p.views.length > 0 && p.views.every((v) => v.widgets.length === 1 && v.widgets[0]!.type === "price");
+
+/** Panels fill two columns in order; a chart-only panel that would sit alone in its row (the
+ * only panel, or the last of an odd count) takes the whole row. */
+function wide(panels: Panel[], i: number): boolean {
+  return i === panels.length - 1 && i % 2 === 0 && chartOnly(panels[i]!);
+}
 
 /** An extension's dashboard (`#/ext/<name>[/<panel>]`): every panel it declares as a card,
  * one column on a phone and two from `lg`. */
@@ -48,8 +58,10 @@ export function ExtensionPage({ snap, now, route }: { snap: Snapshot; now: numbe
         </p>
       ) : (
         <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-2">
-          {ext.panels.map((p) => (
-            <PanelCard key={p.id} ext={ext.name} panel={p} now={now} />
+          {ext.panels.map((p, i) => (
+            <div key={p.id} className={cn("min-w-0", wide(ext.panels, i) && "lg:col-span-2")} data-testid="panel-cell" data-wide={wide(ext.panels, i) || undefined}>
+              <PanelCard ext={ext.name} panel={p} now={now} />
+            </div>
           ))}
         </div>
       )}
