@@ -127,6 +127,7 @@ def test_local_only_fields_are_marked() -> None:
         ("ClaudeBrain", "remote_url"),
         ("ApprovalItem", "code"),
         ("Panel", "local_url"),
+        ("PanelHistory", "pending"),  # PER-286: days the relay doesn't have yet
     }
 
 

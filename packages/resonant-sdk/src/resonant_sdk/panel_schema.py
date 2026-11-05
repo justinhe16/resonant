@@ -20,7 +20,7 @@ build the same JSON with the stdlib-only helpers in ``resonant_sdk/panel.py``.
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StringConstraints
 
@@ -304,9 +304,42 @@ class PanelOutput(_In):
     views: Annotated[list[View], Field(min_length=1, max_length=VIEWS_MAX)]
 
 
+class PanelNone(_In):
+    """PER-286: what a history run (``--date YYYY-MM-DD``) prints for a day with no data (a
+    weekend, a holiday). The day is recorded as none, never retried and never listed."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        validate_by_name=True,
+        validate_by_alias=True,
+        serialize_by_alias=True,
+        title="PanelNone",
+    )
+
+    schema_: Literal[1] = Field(alias="schema")
+    none: Literal[True]
+
+
+def is_none(raw: object) -> bool:
+    """``raw`` is exactly ``{"schema": 1, "none": true}`` (PER-286)."""
+    if not isinstance(raw, dict):
+        return False
+    fields = cast(dict[str, Any], raw)
+    return (
+        set(fields) == {"schema", "none"}
+        and type(fields["schema"]) is int
+        and fields["schema"] == PANEL_SCHEMA_VERSION
+        and fields["none"] is True
+    )
+
+
 def schema_json() -> str:
-    """``docs/panel.schema.json``: the JSON schema of :class:`PanelOutput`."""
-    schema = PanelOutput.model_json_schema(by_alias=True)
+    """``docs/panel.schema.json``: the JSON schema of :class:`PanelOutput`, with
+    :class:`PanelNone` (a history run's no-data answer) under ``$defs``."""
+    schema = PanelOutput.model_json_schema(by_alias=True, ref_template="#/$defs/{model}")
+    none = PanelNone.model_json_schema(by_alias=True)
+    schema.setdefault("$defs", {})["PanelNone"] = none
     schema = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$comment": "Generated from resonant_sdk/panel_schema.py; do not edit.",

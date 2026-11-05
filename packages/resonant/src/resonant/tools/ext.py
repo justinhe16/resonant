@@ -16,8 +16,10 @@
 
 - ``read_panel`` (L0, untrusted): ``{extension}`` lists that extension's dashboard panels
   (PER-280) with each one's run state and the stat widgets of its first view; ``{extension,
-  panel}`` gives one panel's whole last good copy. It reads ``ext_panels`` only and never
-  runs anything. The panel's words are the extension's, so the calling task is tainted.
+  panel}`` gives one panel's whole last good copy, and ``{extension, panel, day}``
+  (PER-286, ``YYYY-MM-DD``) one archived day of a panel with ``history``. It reads
+  ``ext_panels`` and ``ext_panel_days`` only and never runs anything. The panel's words are
+  the extension's, so the calling task is tainted.
 
 Handlers don't see the requester; the gate limits callers to principals who may request
 global tools (the owner).
@@ -84,13 +86,15 @@ READ_PANEL = ToolSpec(
     name="read_panel",
     description=(
         "Read an extension's dashboard panels (the last copy each one drew): their stat "
-        "numbers, or with `panel` one panel's views in full. Never runs the extension."
+        "numbers, or with `panel` one panel's views in full, or with `panel` and `day` "
+        "(YYYY-MM-DD) that panel's archived copy of a past day. Never runs the extension."
     ),
     args_schema={
         "type": "object",
         "properties": {
             "extension": {"type": "string", "maxLength": 48},
             "panel": {"type": "string", "maxLength": 48},
+            "day": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
         },
         "required": ["extension"],
         "additionalProperties": False,
@@ -298,7 +302,7 @@ def _brain_view(v: dict[str, Any]) -> dict[str, Any]:
 
 
 def _head(p: Panel) -> dict[str, Any]:
-    return {
+    head: dict[str, Any] = {
         "id": p.id,
         "title": p.title,
         "updated_at": None if p.updated_at is None else iso(p.updated_at),
@@ -306,19 +310,46 @@ def _head(p: Panel) -> dict[str, Any]:
         "stale": p.stale,
         "error": p.error,
     }
+    if p.history is not None:  # PER-286: the archived days (newest first)
+        days = sorted([*p.history.days, *(p.history.pending or [])], reverse=True)
+        head["history"] = {
+            "days": len(days),
+            "newest": days[:7],
+            "failed": p.history.failed[:7],
+        }
+    return head
 
 
 def read_panel(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
-    from resonant.dashboard.snapshot import extension_panels  # a cycle at module level
+    from resonant.dashboard.snapshot import extension_panels, panel_day  # a cycle at module level
+    from resonant.extensions.panel_history import parse_day
 
-    unknown = set(args) - {"extension", "panel"}
+    unknown = set(args) - {"extension", "panel", "day"}
     if unknown:
         raise ToolFailed(f"unknown arguments: {sorted(unknown)}")
-    name, wanted = args.get("extension"), args.get("panel")
+    name, wanted, day = args.get("extension"), args.get("panel"), args.get("day")
     if not isinstance(name, str) or (record := store.get_extension(ctx.conn, name)) is None:
         raise ToolFailed("no such extension")
     if wanted is not None and not isinstance(wanted, str):
         raise ToolFailed("panel must be a panel id")
+    if day is not None:
+        if wanted is None:
+            raise ToolFailed("day needs a panel")
+        if not isinstance(day, str) or parse_day(day) is None:
+            raise ToolFailed("day must be YYYY-MM-DD")
+        got = panel_day(ctx.conn, record, wanted, day)
+        if got is None:
+            raise ToolFailed("no archived copy of that panel for that day")
+        return {
+            "untrusted": True,
+            "extension": name,
+            "panel": {
+                "id": wanted,
+                "day": day,
+                "truncated": got["truncated"],
+                "views": [_brain_view(v) for v in got["views"]],
+            },
+        }
     panels = extension_panels(ctx.conn, record, ctx.clock())
     if wanted is None:
         return {

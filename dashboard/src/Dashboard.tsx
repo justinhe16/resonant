@@ -7,6 +7,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { type Loader, useNow, usePolling } from "@/lib/hooks";
+import type { DayLoader } from "@/lib/panelDays";
 import { useHashRoute } from "@/lib/route";
 import { staleness, worstHealth } from "@/lib/snapshot";
 import { duration, relative } from "@/lib/time";
@@ -36,7 +37,7 @@ function readTab(): Tab {
   }
 }
 
-export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () => void }) {
+export function Dashboard({ load, loadDay, onSignOut }: { load: Loader; loadDay?: DayLoader; onSignOut?: () => void }) {
   const { snapshot: snap, error, loading, refresh } = usePolling(load);
   const now = useNow();
   const route = useHashRoute();
@@ -126,7 +127,7 @@ export function Dashboard({ load, onSignOut }: { load: Loader; onSignOut?: () =>
         {!snap && !loading && !error && (
           <p className="py-10 text-center text-sm text-muted-foreground">No snapshot has been sent yet.</p>
         )}
-        {snap && extPage && guard(<ExtensionPage snap={snap} now={now} route={extPage} />)}
+        {snap && extPage && guard(<ExtensionPage key={extPage.name} snap={snap} now={now} route={extPage} loadDay={loadDay} />)}
         {snap && !extPage && (
           <div role="tablist" aria-label="Dashboard view" className="inline-flex rounded-lg border bg-card p-0.5">
             {(["overview", "diagram"] as const).map((t) => (

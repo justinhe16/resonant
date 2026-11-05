@@ -59,6 +59,9 @@ PANEL_DESCRIPTION_MAX = 160
 PANEL_TITLE_MAX = 60
 PANEL_ARGV_MAX = 16
 PANEL_ARG_MAX = 200
+PANEL_HISTORY_KEEP_DEFAULT = "365d"
+PANEL_HISTORY_KEEP_MIN_DAYS = 7
+PANEL_HISTORY_KEEP_MAX_DAYS = 730
 RECOVER_TIMEOUT_DEFAULT = "120s"
 RECOVER_TIMEOUT_MAX_S = 300
 LAUNCH_AGENT_LABEL = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
@@ -67,6 +70,7 @@ _CRON_FIELD = re.compile(r"^[A-Za-z0-9*/,\-]+$")
 _NUMERIC_CRON_FIELD = re.compile(r"^[0-9*/,\-]+$")
 _DURATION = re.compile(r"^\d+[smh]$")
 _REPO_SLUG = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+DAY = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"  # a history day, YYYY-MM-DD
 _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 _EVENT = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 RESERVED_EVENT = "item"  # the pulse's event type (``report()``); never a ``notify.on`` entry
@@ -234,6 +238,32 @@ class PanelRefresh(_Strict):
         return None if v is None else _numeric_cron(v)
 
 
+class PanelHistory(_Strict):
+    """PER-286: a panel's per-day archive. Once a calendar day (in the panel's ``tz``) has
+    ended, Resonant runs the panel's ``command`` plus ``--date YYYY-MM-DD`` once for it and
+    keeps the result for ``keep`` days. Same command, read-only: not an escalation."""
+
+    every: Literal["daily"]
+    keep: str = PANEL_HISTORY_KEEP_DEFAULT  # 7d to 730d
+
+    @field_validator("keep")
+    @classmethod
+    def _keep(cls, v: str) -> str:
+        if not re.fullmatch(r"[0-9]{1,4}d", v):
+            raise ValueError(f"keep {v!r} must look like 365d (days)")
+        days = int(v[:-1])
+        if not PANEL_HISTORY_KEEP_MIN_DAYS <= days <= PANEL_HISTORY_KEEP_MAX_DAYS:
+            raise ValueError(
+                f"keep must be between {PANEL_HISTORY_KEEP_MIN_DAYS}d and "
+                f"{PANEL_HISTORY_KEEP_MAX_DAYS}d"
+            )
+        return v
+
+    @property
+    def keep_days(self) -> int:
+        return int(self.keep[:-1])
+
+
 class Panel(_Strict):
     """A dashboard panel: Resonant runs ``command`` on a schedule, reads its JSON output
     (``resonant_sdk.panel_schema``) and draws it. An L0 read, never chat-visible; the command
@@ -248,6 +278,7 @@ class Panel(_Strict):
     secrets: tuple[SecretName, ...] = ()
     timeout_s: float = Field(default=30.0, gt=0, le=PANEL_TIMEOUT_MAX_S)
     max_bytes: int = Field(default=PANEL_BYTES_DEFAULT, ge=1024, le=PANEL_BYTES_CAP)
+    history: PanelHistory | None = None  # PER-286: per-day archive, run with ``--date``
 
     @field_validator("title", "description")
     @classmethod
@@ -266,6 +297,8 @@ class Panel(_Strict):
                 )
             if "{" in a or "}" in a:
                 raise ValueError("a panel command takes no placeholders ({ or })")
+            if a == "--date" or a.startswith("--date="):
+                raise ValueError("--date is added by Resonant for history runs")
         return v
 
     @field_validator("tz")
@@ -294,7 +327,11 @@ class Panel(_Strict):
             description="dashboard panel",
             args_schema={
                 "type": "object",
-                "properties": {"due_at": {"type": "string"}},
+                "properties": {
+                    "due_at": {"type": "string"},
+                    # PER-286: a history run's day, passed as ``--date <day>``
+                    **({"date": {"type": "string", "pattern": DAY}} if self.history else {}),
+                },
                 "required": ["due_at"],
                 "additionalProperties": False,
             },

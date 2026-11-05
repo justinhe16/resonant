@@ -683,6 +683,27 @@ class PanelView(_Model):
     widgets: list[PanelWidget]
 
 
+PanelDayText = Annotated[str, StringConstraints(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")]
+HISTORY_DAYS_MAX: Final = 730  # ``history.keep``'s ceiling
+HISTORY_FAILED_MAX: Final = 31
+
+
+class PanelHistory(_Model):
+    """PER-286: a panel's archived days. Only the list travels in the snapshot; a day's copy is
+    fetched when the owner picks it (``GET /api/ext/<ext>/panels/<id>/days/<day>`` locally,
+    the ``panel_days`` table remotely)."""
+
+    # Days with a copy the relay has (the remote page can fetch them), newest first.
+    days: list[PanelDayText] = Field(default_factory=list[str], max_length=HISTORY_DAYS_MAX)
+    # Days with a copy the relay doesn't have yet (local only: the local page lists them too).
+    pending: list[PanelDayText] | None = Field(
+        default=None, max_length=HISTORY_DAYS_MAX, exclude_if=lambda v: v is None,
+        json_schema_extra=LOCAL_ONLY,
+    )  # fmt: skip
+    # Days that failed 3 times (newest first): the panel shows them, ext health doesn't.
+    failed: list[PanelDayText] = Field(default_factory=list[str], max_length=HISTORY_FAILED_MAX)
+
+
 class Panel(_Model):
     """One dashboard panel an extension declares: its latest good copy and its run state."""
 
@@ -704,6 +725,7 @@ class Panel(_Model):
     local_url: LocalUrl | None = _local()
     views: list[PanelView] = _list()
     outside: list[OutsideName] = _list()  # ``views`` and ``error``: an extension's own words
+    history: PanelHistory | None = None  # PER-286: only for a panel with ``history``
 
 
 class Extension(_Model):
@@ -1225,12 +1247,31 @@ def _stored_views(
     return views, fields, True
 
 
+def _history(spec: Mapping[str, Any], days: Sequence[ext_store.PanelDay]) -> PanelHistory | None:
+    """The day list of a panel with ``history`` (newest first, at most ``keep``): every day
+    with a good copy, and the failed ones."""
+    h = spec.get("history")
+    if not isinstance(h, dict):
+        return None
+    keep = cast(dict[str, Any], h).get("keep")
+    n = int(keep[:-1]) if isinstance(keep, str) and re.fullmatch(r"[0-9]{1,4}d", keep) else 365
+    n = max(1, min(n, HISTORY_DAYS_MAX))
+    copies = [d for d in days if d.data_json is not None][:n]
+    pending = [d.day for d in copies if d.upload_due]
+    return PanelHistory(
+        days=[d.day for d in copies if not d.upload_due],
+        pending=pending or None,
+        failed=[d.day for d in days if d.status == "failed"][:HISTORY_FAILED_MAX],
+    )
+
+
 def _panel(
     spec: Mapping[str, Any],
     st: ext_store.PanelState | None,
     record: ext_store.ExtensionRecord,
     now: datetime,
     t: _Text,
+    days: Sequence[ext_store.PanelDay] = (),
 ) -> Panel | None:
     pid = str(spec.get("id", ""))
     title = spec.get("title")
@@ -1274,6 +1315,7 @@ def _panel(
         else None,
         views=views,
         outside=[*(["views"] if views else []), *(["error"] if error else [])],
+        history=_history(spec, days),
     )
 
 
@@ -1282,13 +1324,21 @@ def _panels(
     states: Mapping[str, ext_store.PanelState],
     now: datetime,
     t: _Text,
+    conn: sqlite3.Connection | None = None,
 ) -> list[Panel]:
-    """The extension's panels in manifest order: the stored good copy and the run state."""
+    """The extension's panels in manifest order: the stored good copy and the run state (and,
+    with ``conn``, a history panel's archived days)."""
     out: list[Panel] = []
     for spec in cast(list[Any], record.manifest.get("panels") or []):
         if isinstance(spec, dict):
             fields = cast(dict[str, Any], spec)
-            if p := _panel(fields, states.get(str(fields.get("id", ""))), record, now, t):
+            pid = str(fields.get("id", ""))
+            days = (
+                ext_store.list_panel_days(conn, record.name, pid)
+                if conn is not None and isinstance(fields.get("history"), dict)
+                else []
+            )
+            if p := _panel(fields, states.get(pid), record, now, t, days):
                 out.append(p)
     return out[:PANEL_ITEMS]
 
@@ -1299,7 +1349,53 @@ def extension_panels(
     """``record``'s panels as the snapshot shows them (``read_panel`` reads these): the last good
     copy and the run state, every text passed through the one text pass."""
     states = {p.panel_id: p for p in ext_store.list_panels(conn, record.name)}
-    return _panels(record, states, now, _Text(None))
+    return _panels(record, states, now, _Text(None), conn)
+
+
+def panel_day(
+    conn: sqlite3.Connection,
+    record: ext_store.ExtensionRecord,
+    panel_id: str,
+    day: str,
+    redactor: Redactor | None = None,
+) -> dict[str, Any] | None:
+    """PER-286: one archived day of a history panel as the dashboard draws it: ``{ext, panel,
+    day, views, health, truncated, bytes, outside}``, every text through the one text pass
+    again and no ``local_url`` (an archived day links nowhere). None: no such panel with
+    history, no such day, or a day without a good copy (none, failed)."""
+    spec = next(
+        (
+            cast(dict[str, Any], p)
+            for p in cast(list[Any], record.manifest.get("panels") or [])
+            if isinstance(p, dict) and cast(dict[str, Any], p).get("id") == panel_id
+        ),
+        None,
+    )
+    if spec is None or not isinstance(spec.get("history"), dict):
+        return None
+    row = ext_store.get_panel_day(conn, record.name, panel_id, day)
+    if row is None or row.data_json is None:
+        return None
+    t = _Text(redactor)
+    try:
+        data: Any = json.loads(row.data_json)
+        if not isinstance(data, dict):
+            return None
+        fields = cast(dict[str, Any], _scrub_deep(data, t))
+        views = [PanelView.model_validate(v) for v in cast(list[Any], fields.get("views") or [])]
+    except (ValueError, TypeError):
+        return None
+    health = fields.get("health")
+    return {
+        "ext": record.name,
+        "panel": panel_id,
+        "day": day,
+        "views": [v.model_dump(mode="json") for v in views],
+        "health": health if health in ("ok", "warn", "bad") else None,
+        "truncated": fields.get("truncated") is True,
+        "bytes": row.bytes,
+        "outside": ["views"] if views else [],
+    }
 
 
 def _views_size(views: Any) -> int:
@@ -1424,7 +1520,7 @@ def _extension(
             100,
         ),
         panels=_panels(
-            record, {p.panel_id: p for p in ext_store.list_panels(conn, record.name)}, now, t
+            record, {p.panel_id: p for p in ext_store.list_panels(conn, record.name)}, now, t, conn
         ),
     )  # fmt: skip
 

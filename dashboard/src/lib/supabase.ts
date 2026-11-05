@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { assertDay, isDay } from "@/lib/panelDays";
 import { assertSnapshot } from "@/lib/snapshot";
-import type { Normalized } from "@/types";
+import type { Normalized, PanelDay } from "@/types";
 
 export type AuthStage =
   | { kind: "signed_out" }
@@ -17,6 +18,8 @@ export interface RemoteClient {
   verify(factorId: string, code: string): Promise<void>;
   signOut(): Promise<void>;
   latest(): Promise<Normalized | null>;
+  /** PER-286: one archived day of a panel (the `panel_days` row), or null. */
+  panelDay(ext: string, panel: string, day: string): Promise<PanelDay | null>;
   onAuthChange(cb: () => void): () => void;
 }
 
@@ -86,6 +89,19 @@ export function wrapSupabase(sb: SupabaseClient): RemoteClient {
       if (typeof row.data === "object" && row.data !== null && (row.data as { slim?: unknown }).slim === true)
         return null;
       return remember(row);
+    },
+    async panelDay(ext, panel, day) {
+      if (!isDay(day)) return null;
+      const row = check(
+        await sb
+          .from("panel_days")
+          .select("data")
+          .eq("ext", ext)
+          .eq("panel_id", panel)
+          .eq("day", day)
+          .maybeSingle<{ data: unknown }>(),
+      );
+      return row ? assertDay(row.data) : null;
     },
     onAuthChange(cb) {
       const { data } = auth.onAuthStateChange(() => cb());

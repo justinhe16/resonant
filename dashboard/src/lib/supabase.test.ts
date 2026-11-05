@@ -120,3 +120,35 @@ describe("wrapSupabase", () => {
     await expect(wrapSupabase(fake({ rowError: "JWT expired" }).sb).latest()).rejects.toThrow("JWT expired");
   });
 });
+
+describe("panelDay", () => {
+  function daysFake(row: { data: unknown } | null, error?: string) {
+    const eqs: [string, string][] = [];
+    const query: Record<string, ReturnType<typeof vi.fn>> = {};
+    query.select = vi.fn(() => query);
+    query.eq = vi.fn((k: string, v: string) => (eqs.push([k, v]), query));
+    query.maybeSingle = vi.fn(async () => ({ data: row, error: error ? { message: error } : null }));
+    const from = vi.fn(() => query);
+    return { sb: { auth: {}, from } as unknown as SupabaseClient, from, eqs };
+  }
+
+  it("reads the panel_days row of that ext, panel and day", async () => {
+    const f = daysFake({ data: { views: [], health: "ok", truncated: false } });
+    const got = await wrapSupabase(f.sb).panelDay("github", "prs", "2026-10-15");
+    expect(f.from).toHaveBeenCalledWith("panel_days");
+    expect(f.eqs).toEqual([
+      ["ext", "github"],
+      ["panel_id", "prs"],
+      ["day", "2026-10-15"],
+    ]);
+    expect(got).toEqual({ views: [], health: "ok", truncated: false });
+  });
+
+  it("is null without a row or for a non-day, and throws on an error", async () => {
+    expect(await wrapSupabase(daysFake(null).sb).panelDay("github", "prs", "2026-10-15")).toBeNull();
+    const f = daysFake(null);
+    expect(await wrapSupabase(f.sb).panelDay("github", "prs", "latest")).toBeNull();
+    expect(f.from).not.toHaveBeenCalled();
+    await expect(wrapSupabase(daysFake(null, "denied").sb).panelDay("github", "prs", "2026-10-15")).rejects.toThrow("denied");
+  });
+});

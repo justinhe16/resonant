@@ -247,10 +247,11 @@ panels:
     secrets: [alpaca_key]          # must also appear in top-level secrets
     timeout_s: 30                  # default 30, at most 120
     max_bytes: 24576               # default 16384, 1024-32768
+    history: {every: daily, keep: 365d}  # optional (PER-286): one archived copy per day, see History
 ```
 
 - **A panel is an L0 read.** It is never an escalation: it can't ask, can't write, and runs through the same gate and audit as any scheduled L0 read (`origin: scheduled`). A command that runs `gh` or `git` still shows as "network" at install. Its command follows the tool rules: a `.py` file in your directory, `python3 <script.py>`, `gh` or `git`; no placeholders, so no arguments from anywhere but your manifest. Each panel also has a hidden `panel_<id>` spec (dashes become underscores) that never appears in chat. No tool may use that name.
-- **Install and update.** `ext add` shows a `Panels:` block (id, title, schedule, `read L0`, size cap, the command), and `ext update` lists `+ panel <id>` and `- panel <id>`. An update that drops a panel drops its stored copy.
+- **Install and update.** `ext add` shows a `Panels:` block (id, title, schedule, `read L0`, size cap, the command, and the history setting), and `ext update` lists `+ panel <id>` and `- panel <id>`. An update that drops a panel drops its stored copy.
 - **Where it shows.** The Overview tab shows up to two panels' first stats under your extension, tapping opens your extension's page (`#/ext/<name>`) with every panel, and the Diagram tab has a node per panel. The brain can read the last copy with `read_panel` (below).
 
 ### What the command prints
@@ -315,6 +316,22 @@ Everything a panel prints is the extension's, not yours: it is marked `outside` 
 ### Failure, stale and health
 
 A failed run (non-zero exit, timeout, bad output, a missing secret) or a refused output **keeps the last good copy**, records the error and counts a streak. A panel is **stale** when its last run failed, it has no good copy yet, its extension isn't enabled, or it is later than its next expected run plus its timeout plus 120 seconds. The dashboard greys a stale panel and shows the error with the old copy. Three failures in a row (`panel <id> failed 3 times in a row`) turn the extension's `ext:<name>` health to degraded, like a job, and a good run clears it.
+
+### History
+
+A panel can keep **one copy per calendar day** and let the owner look back at it: `history: {every: daily, keep: 365d}`. `every` accepts only `daily`; `keep` is 7d to 730d (default 365d). A panel without `history` behaves exactly as before.
+
+- **The day** is a calendar day in the panel's `tz` (default: the daemon's timezone).
+- **The archive command** is your `command` plus `--date YYYY-MM-DD`: `[./cli.py, panel, paper]` runs as `./cli.py panel paper --date 2026-11-03`. Same runner, gate, secrets, `timeout_s`, `max_bytes`, normalisation and refusals as a live run. Your command must not contain `--date` itself.
+- **No data that day** (a weekend, a holiday): print exactly `{"schema": 1, "none": true}` (`panel.print_none()`; `PanelNone` in `docs/panel.schema.json`). The day is recorded as none: never retried and never listed.
+- **When.** A day is archived once it has ended in `tz`, at the first scheduler tick after **00:15** local of the next day. A failed attempt (non-zero exit, timeout, a refused output) is retried after 15 minutes, then after an hour; the third failure marks the day **failed**: the panel says `Couldn't archive Tue 11/3`, but your `ext:<name>` health is not degraded. Your live panel's own streak is separate.
+- **Backfill.** After an install, an update or a daemon start, missing days are filled going back `min(keep, 30)` days, newest first, **one archive run at a time** for the whole daemon, and only while no live panel is running, so a backfill never delays a live refresh.
+- **Immutable.** An archived day (ok, none or failed) is never re-run on its own. The owner (or Claude, when asked) can redo days: `resonant ext panel-history <ext> <panel>` lists them, and `resonant ext panel-history <ext> <panel> --rebuild [--since YYYY-MM-DD]` queues every kept day (or those from `--since`) again; each keeps its old copy until the new one lands.
+- **Store.** `ext_panel_days` (store migration 027): `(ext, panel_id, day)`, status `pending|ok|none|failed`, the normalised copy, `bytes`, attempts and the last error. Days older than `keep` are pruned hourly; removing the extension or the panel, or turning `history` off, deletes its days.
+- **Dashboard.** `#/ext/<name>` gets a **Day** picker when a panel has history: **Today (live)** and every archived day, newest first. Picking a day fetches that day's copy (locally from `GET /api/ext/<name>/panels/<id>/days/<YYYY-MM-DD>` on 127.0.0.1, read-only, 404 for an unknown, none or failed day; remotely from the Supabase `panel_days` table) and marks the page `Tue 11/3 (archived)`. Panels without that day say "No data for this day". The pick lasts for the browser session.
+- **Relay.** The snapshot carries only the list of days (`extensions[].panels[].history = {days, failed}`, at most `keep` days), so the 100 KB panel budget barely moves. Each newly archived day is uploaded once through the `relay_panel_day` RPC (the ingest token, the same scrub, never a `local_url`), retried with backoff; the RPC prunes rows past `keep`.
+- **Install and update.** The panel line in `ext add`/`ext update` ends with `; history daily, keep 365d (the same command with --date YYYY-MM-DD for each ended day)`. It is not an escalation: the same read-only command.
+- **Audit.** `panel.archived` (`day`, `status` ok or none, `ms`, `bytes`), `panel.archive_failed` (`day`, `error`, `attempts`, `failed`), `panel.archive_deferred` (killed or paused: not an attempt; the archiver waits 15 minutes), `panel.history_pruned` and `panel.history_rebuild`.
 
 ### Budgets
 
@@ -399,7 +416,7 @@ print_panel([view("now", "Now", [
 
 ### `read_panel`
 
-The brain can read what a panel last drew: `read_panel {extension}` lists the extension's panels (`id`, `title`, `updated_at`, `ok`, `stale`, `error`) with the stat widgets of each first view as `{label, value, unit}`; `read_panel {extension, panel}` returns that panel's views in full, except that a `price` widget comes back decoded into a summary (`mode`, `unit`, `candles`, `aggregated_from`, `from`, `to`, `open`, `high`, `low`, `last`, and its `trades` and `markers` as they are). It reads the stored copy only and never runs anything. Its output is outside text, so the calling task is tainted.
+The brain can read what a panel last drew: `read_panel {extension}` lists the extension's panels (`id`, `title`, `updated_at`, `ok`, `stale`, `error`) with the stat widgets of each first view as `{label, value, unit}`; `read_panel {extension, panel}` returns that panel's views in full, and `read_panel {extension, panel, day}` (PER-286, `YYYY-MM-DD`) a history panel's archived copy of that day (the list form adds `history: {days, newest, failed}` for such a panel), except that a `price` widget comes back decoded into a summary (`mode`, `unit`, `candles`, `aggregated_from`, `from`, `to`, `open`, `high`, `low`, `last`, and its `trades` and `markers` as they are). It reads the stored copy only and never runs anything. Its output is outside text, so the calling task is tainted.
 
 ## 6b. Recovery
 

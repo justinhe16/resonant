@@ -1040,6 +1040,39 @@ PANELS_NEW = """\
 NOW = datetime(2026, 10, 14, 15, 0, tzinfo=UTC)
 
 
+def test_panel_history_shows_in_the_review_is_no_escalation_and_its_days_are_pruned(
+    mgr: ExtensionManager, repo: Path, conn: sqlite3.Connection
+) -> None:
+    """PER-286: ``history`` is shown on the panel line, isn't an escalation (same command,
+    read-only), and turning it off (or dropping the panel) deletes the panel's days."""
+    manifest = repo / "extensions" / "demo" / "resonant.yaml"
+    with_history = PANELS.replace(
+        "    max_bytes: 24576\n", "    max_bytes: 24576\n    history: {every: daily, keep: 365d}\n"
+    )
+    manifest.write_text(MANIFEST + with_history)
+    commit_all(repo)
+    staged = mgr.stage("repo:demo")
+    lines = confirm_lines(staged)
+    mgr.discard(staged)
+    assert "Escalations: none" in lines
+    (paper,) = [ln for ln in lines if ln.startswith('  "paper"')]
+    assert paper.endswith(
+        "runs ./cli.py panel paper; history daily, keep 365d "
+        "(the same command with --date YYYY-MM-DD for each ended day)"
+    )
+    record = mgr.install(mgr.stage("repo:demo").pin, name="demo")
+    with atomic(conn):
+        ext_store.save_day_ok(conn, "demo", "paper", "2026-10-13", data="{}", bytes=2, at=NOW)
+    manifest.write_text(MANIFEST + PANELS)  # history off
+    commit_all(repo)
+    second = mgr.stage("repo:demo")
+    diff = update_lines(record, mgr.installed_files("demo"), second)
+    mgr.discard(second)
+    assert not [d for d in diff if "history" in d or '"paper"' in d]
+    mgr.install(second.pin, name="demo")
+    assert ext_store.list_panel_days(conn, "demo", "paper") == []
+
+
 def test_a_panel_command_goes_through_the_directory_checks(
     mgr: ExtensionManager, repo: Path
 ) -> None:

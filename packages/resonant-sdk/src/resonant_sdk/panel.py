@@ -186,6 +186,12 @@ def panel(
     )
 
 
+def print_none() -> None:
+    """PER-286: a history run's answer for a day with no data (``--date`` a weekend, a
+    holiday): ``{"schema": 1, "none": true}``. That day is recorded and never listed."""
+    sys.stdout.write(json.dumps({"schema": SCHEMA, "none": True}, separators=(",", ":")) + "\n")
+
+
 def print_panel(views: Sequence[Mapping[str, Any]], **fields: Any) -> None:
     """Print the panel as the one JSON object on stdout the command must end with."""
     sys.stdout.write(json.dumps(panel(views, **fields), separators=(",", ":")) + "\n")

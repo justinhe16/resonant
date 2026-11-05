@@ -27,7 +27,11 @@ describe("snapshot fixtures", () => {
     for (const r of expected.runs.items) delete r.remote_url;
     for (const a of [...expected.approvals.items, ...expected.approvals.recent]) delete a.code;
     delete expected.claude_brain?.remote_url;
-    for (const e of expected.extensions) for (const p of e.panels) delete p.local_url;
+    for (const e of expected.extensions)
+      for (const p of e.panels) {
+        delete p.local_url;
+        if (p.history) delete p.history.pending; // PER-286: days the relay doesn't have yet
+      }
     expect(remote).toEqual(expected);
     expect(JSON.stringify(remote)).not.toContain("remote_url");
     expect(JSON.stringify(remote)).not.toContain("local_url");

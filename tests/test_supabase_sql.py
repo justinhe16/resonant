@@ -186,7 +186,7 @@ def _sha(token: str) -> str:
 def db(pg: Pg) -> Pg:
     """A configured project with no snapshots."""
     pg.ok(
-        "truncate public.snapshots, public.snapshot_latest;"
+        "truncate public.snapshots, public.snapshot_latest, public.panel_days;"
         f"update relay_private.config set owner_id = '{OWNER}',"
         f" ingest_token_sha256 = decode('{_sha(INGEST)}', 'hex'),"
         f" status_token_sha256 = decode('{_sha(STATUS)}', 'hex');"
@@ -733,3 +733,138 @@ def test_a_remote_snapshot_with_panels_is_accepted(db: Pg, tmp_path: Path) -> No
     assert ingest(db, remote).ok
     assert count_latest(db) == 1
     assert latest(db)["extensions"][0]["panels"][0]["id"] == "paper"
+
+
+# --- panel days (PER-286) --------------------------------------------------------------------
+
+DAY_DATA = {"views": [{"id": "v", "title": "V", "widgets": [{"type": "text", "text": "hi"}]}],
+            "health": "ok", "truncated": False}  # fmt: skip
+
+
+def _day(db: Pg, offset: int = 1) -> str:
+    """``current_date - offset`` as the server sees it."""
+    return db.ok(f"select (current_date - {offset})::text;")
+
+
+def panel_day(
+    db: Pg,
+    day: str,
+    data: Any = DAY_DATA,
+    *,
+    ext: str = "ledger",
+    panel: str = "paper",
+    keep: int = 365,
+    token: str = INGEST,
+    role: str = "anon",
+) -> Result:
+    lit = "null" if data is None else f"{_lit(data)}::jsonb"
+    return db.run(
+        f"select public.relay_panel_day('{token}', {_lit(ext)}::jsonb #>> '{{}}',"
+        f" {_lit(panel)}::jsonb #>> '{{}}', '{day}', {lit}, {keep});",
+        role=role,
+    )
+
+
+def day_rows(db: Pg) -> list[str]:
+    out = db.ok("select ext || '/' || panel_id || '/' || day from public.panel_days order by 1;")
+    return out.splitlines() if out else []
+
+
+def test_panel_day_is_stored_and_only_the_owner_reads_it(db: Pg) -> None:
+    d = _day(db)
+    assert panel_day(db, d).ok
+    assert day_rows(db) == [f"ledger/paper/{d}"]
+    assert _visible(db, OWNER_AAL2, "panel_days") == 1
+    assert _visible(db, {**OWNER_AAL2, "aal": "aal1"}, "panel_days") == 0
+    assert _visible(db, {**OWNER_AAL2, "sub": STRANGER}, "panel_days") == 0
+    got = db.ok(
+        f"select data from public.panel_days where day = '{d}';",
+        role="authenticated",
+        claims=OWNER_AAL2,
+    )
+    assert json.loads(got) == DAY_DATA
+    # an upsert replaces the copy (a rebuild); null deletes it (a rebuild found no data)
+    assert panel_day(db, d, {**DAY_DATA, "health": "warn"}).ok
+    assert json.loads(db.ok("select data from public.panel_days;"))["health"] == "warn"
+    assert panel_day(db, d, None).ok
+    assert day_rows(db) == []
+    # a JSON null as the jsonb value 'null' (PostgREST's body mapping) deletes too
+    assert panel_day(db, d).ok
+    r = db.run(
+        f"select public.relay_panel_day('{INGEST}', 'ledger', 'paper', '{d}', 'null'::jsonb, 365);",
+        role="anon",
+    )
+    assert r.ok, r.err
+    assert day_rows(db) == []
+
+
+def test_panel_days_cannot_be_written_or_read_directly(db: Pg) -> None:
+    d = _day(db)
+    assert panel_day(db, d).ok
+    for role, claims in (("anon", None), ("authenticated", OWNER_AAL2)):
+        for sql in (
+            "insert into public.panel_days (ext, panel_id, day, data)"
+            f" values ('a', 'b', '{d}', '{{}}');",
+            "update public.panel_days set data = '{}';",
+            "delete from public.panel_days;",
+        ):
+            r = db.run(sql, role=role, claims=claims)
+            assert not r.ok and r.sqlstate == "42501", (role, sql, r.err)
+    r = db.run("select * from public.panel_days;", role="anon")
+    assert r.sqlstate == "42501"
+    r = panel_day(db, d, role="authenticated")
+    assert r.sqlstate == "42501"  # only anon (with the token) may call it
+    assert len(day_rows(db)) == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "state"),
+    [
+        ({"token": "x" * 56}, "PT403"),
+        ({"ext": "Bad.Ext"}, "PT400"),
+        ({"panel": "a/b"}, "PT400"),
+        ({"keep": 6}, "PT400"),
+        ({"keep": 731}, "PT400"),
+    ],
+)
+def test_panel_day_refusals(db: Pg, change: dict[str, Any], state: str) -> None:
+    r = panel_day(db, _day(db), **change)
+    assert not r.ok and r.sqlstate == state, r.err
+    assert day_rows(db) == []
+
+
+def test_panel_day_refuses_bad_days_and_bad_data(db: Pg) -> None:
+    for day in ("2026-13-01", "13/10/2026", _day(db, -3), _day(db, 800)):
+        r = panel_day(db, day)
+        assert not r.ok and r.sqlstate == "PT400", (day, r.err)
+    d = _day(db)
+    for data in (
+        [1, 2],
+        {**DAY_DATA, "local_url": "http://127.0.0.1:8765/"},
+        {"views": [{"nested": {"remote_url": "x"}}]},
+        {"views": [{"text": "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2"}]},
+        {"views": [{"text": "see https://claude.ai/code/session_x"}]},
+    ):
+        r = panel_day(db, d, data)
+        assert not r.ok and r.sqlstate == "PT400", (data, r.err)
+    r = panel_day(db, d, {"views": [], "pad": "x" * 70000})
+    assert not r.ok and r.sqlstate == "PT413"
+    assert day_rows(db) == []
+
+
+def test_panel_day_prunes_that_panel_past_keep(db: Pg) -> None:
+    for offset in (40, 20, 1):
+        assert panel_day(db, _day(db, offset), keep=365).ok
+    assert panel_day(db, _day(db, 40), panel="chart", keep=365).ok
+    assert panel_day(db, _day(db, 2), keep=30).ok
+    assert day_rows(db) == sorted(
+        [f"ledger/chart/{_day(db, 40)}"] + [f"ledger/paper/{_day(db, o)}" for o in (20, 2, 1)]
+    )
+
+
+def test_panel_day_rate_limit(db: Pg) -> None:
+    for offset in range(1, 31):
+        assert panel_day(db, _day(db, offset)).ok
+    r = panel_day(db, _day(db, 31))
+    assert not r.ok and r.sqlstate == "PT429"
+    assert len(day_rows(db)) == 30

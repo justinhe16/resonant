@@ -57,6 +57,15 @@ grows the streak (``panel.failed``); ``panel.denied``, ``panel.killed``, ``panel
 ``panel.skipped_paused`` only audit. Paused, a panel simply doesn't run: its missed due times
 are not audited.
 
+Panel history (PER-286). A panel with ``history`` also archives one copy per calendar day
+(``extensions/panel_history.py`` has the rules: which day, backoff, prune). At most one archive
+run is in flight at a time, and one starts only while no live panel is running, so a backfill
+never takes a live panel's place. It goes through the same ``_call`` with ``date`` added (the
+handler appends ``--date <day>``) and the same ``normalize``; ``{"schema": 1, "none": true}``
+records the day as none. Audited ``panel.archived`` (``status`` ok or none),
+``panel.archive_failed`` and ``panel.archive_deferred`` (killed or paused: not an attempt,
+and the archiver holds for 15 minutes).
+
 A job whose schedule doesn't parse is skipped at build; a job that raises during a tick is
 logged and skipped for that tick. Neither stops the others.
 """
@@ -75,6 +84,7 @@ from zoneinfo import ZoneInfo
 
 from resonant import killswitch
 from resonant.executor import CallContext, ToolFailed
+from resonant.extensions import panel_history as history
 from resonant.extensions.briefing import briefing_job
 from resonant.extensions.cron import (
     ON_TIME,
@@ -106,6 +116,7 @@ from resonant.store.tasks import insert_event, insert_task
 from resonant.toolcore import Asked, CallScope, InlineExecutor, Refused, ToolCore
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect, Event, Level, ToolSpec, new_id
+from resonant_sdk.panel_schema import is_none
 
 if TYPE_CHECKING:
     from resonant.components import Components
@@ -250,6 +261,7 @@ class ScheduledPanel:
     call: JobCall
     max_bytes: int
     tools: frozenset[str]  # this extension's tool names: a link cell may name only these
+    keep_days: int | None = None  # PER-286: ``history.keep`` in days; None: no history
 
     @property
     def key(self) -> tuple[str, str]:
@@ -412,6 +424,9 @@ class Scheduler:
         )
         self._panel_due: dict[tuple[str, str], datetime] = {}
         self._panel_started: dict[tuple[str, str], datetime] = {}
+        self._archive: asyncio.Task[None] | None = None  # PER-286: one archive run at a time
+        self._pruned: dict[tuple[str, str], datetime] = {}
+        self._history_hold: datetime | None = None  # after a deferral (dry run, kill): wait
 
     @classmethod
     def from_components(
@@ -462,6 +477,7 @@ class Scheduler:
                         frozenset(s.name for s in host.loaded[hp.ext].tools)
                         if host
                         else frozenset(),
+                        hp.panel.history.keep_days if hp.panel.history is not None else None,
                     )
                 )
         deps = CoreDeps(
@@ -627,6 +643,10 @@ class Scheduler:
                 self._tick_panel(panel, now, paused)
             except Exception:
                 log.exception("panel tick failed", extra={"job": panel.label})
+        try:
+            self._tick_history(now, paused)
+        except Exception:
+            log.exception("panel history tick failed")
         with atomic(self.conn):
             kv_set(self.conn, LAST_TICK_KEY, iso(now))
 
@@ -795,6 +815,117 @@ class Scheduler:
                 case _:
                     self._audit_panel(p, "panel.skipped_paused", due)
 
+    # --- panel history (PER-286) ----------------------------------------------------------
+
+    @property
+    def archiving(self) -> bool:
+        return self._archive is not None and not self._archive.done()
+
+    def _tick_history(self, now: datetime, paused: bool) -> None:
+        kept = [p for p in self.panels if p.keep_days is not None]
+        if not kept:
+            return
+        for p in kept:
+            self._prune_history(p, now)
+        if paused or self.archiving or any(p.key in self._inflight for p in self.panels):
+            return  # one at a time, and live panels first
+        if self._history_hold is not None and now < self._history_hold:
+            return  # a run was just deferred (dry run, kill): don't walk every day meanwhile
+        best: tuple[str, ScheduledPanel] | None = None
+        for p in kept:
+            assert p.keep_days is not None
+            since = history.keep_from(now, p.tz, p.keep_days).isoformat()
+            rows = {
+                d.day: history.DayState(d.status, d.next_try_at)
+                for d in store.list_panel_days(self.conn, p.ext, p.panel_id, since=since)
+            }
+            day = history.next_day(rows, now, p.tz, p.keep_days)
+            if day is not None and (best is None or day.isoformat() > best[0]):
+                best = (day.isoformat(), p)
+        if best is not None:
+            day, p = best
+            self._archive = asyncio.get_running_loop().create_task(
+                self._run_archive(p, day), name=f"panel-day:{p.label}:{day}"
+            )
+            self._background.add(self._archive)
+            self._archive.add_done_callback(self._background.discard)
+
+    def _prune_history(self, p: ScheduledPanel, now: datetime) -> None:
+        assert p.keep_days is not None
+        last = self._pruned.get(p.key)
+        if last is not None and now - last < history.PRUNE_EVERY:
+            return
+        self._pruned[p.key] = now
+        before = history.keep_from(now, p.tz, p.keep_days).isoformat()
+        with atomic(self.conn):
+            if n := store.prune_days_before(self.conn, p.ext, p.panel_id, before):
+                audit(self.conn, "panel.history_pruned", extension=p.ext,
+                      panel=f"{p.ext}/{p.panel_id}", before=before, days=n)  # fmt: skip
+
+    async def _run_archive(self, p: ScheduledPanel, day: str) -> None:
+        try:
+            await self._archive_day(p, day)
+        except Exception as e:  # never a tight loop: no row was written, so hold instead
+            log.error("panel archive failed: %s", type(e).__name__, extra={"job": p.label})
+            self._history_hold = self.clock() + history.DEFER
+
+    async def _archive_day(self, p: ScheduledPanel, day: str) -> None:
+        due = self.clock()
+        # The throwaway job is the shape ``_call`` takes; its label names the day.
+        job = ScheduledJob(p.ext, f"panel:{p.panel_id}:{day}", p.spec, p.idle, p.call)
+        if read_paused(self.conn):
+            result = _Result("skipped_paused")
+        else:
+            result = await self._call(job, due, extra={"date": day})
+        self._finish_archive(p, day, due, result)
+
+    def _finish_archive(self, p: ScheduledPanel, day: str, due: datetime, r: _Result) -> None:
+        now = self.clock()
+        error: str | None = None
+        with transaction(self.conn):
+            if r.outcome == "ok":
+                if is_none(r.data):
+                    store.save_day_none(self.conn, p.ext, p.panel_id, day, at=now)
+                    self._audit_panel(p, "panel.archived", due, day=day, status="none",
+                                      ms=r.duration_ms)  # fmt: skip
+                    return
+                got = normalize(r.data, max_bytes=p.max_bytes, tools=p.tools, ran_at=now)
+                if isinstance(got, Normalized):
+                    store.save_day_ok(
+                        self.conn,
+                        p.ext,
+                        p.panel_id,
+                        day,
+                        data=json.dumps(got.data, separators=(",", ":")),
+                        bytes=got.bytes,
+                        at=now,
+                    )
+                    self._audit_panel(p, "panel.archived", due, day=day, status="ok",
+                                      ms=r.duration_ms, bytes=got.bytes)  # fmt: skip
+                    return
+                error = got.error
+            elif r.outcome in ("failed", "denied"):
+                error = _clip(r.error or r.outcome)
+            if error is None:  # killed, dry run, paused: not an attempt
+                store.record_day_failure(
+                    self.conn, p.ext, p.panel_id, day, at=now, error=None,
+                    max_attempts=history.MAX_ATTEMPTS, next_try_at=now + history.DEFER,
+                    count=False,
+                )  # fmt: skip
+                self._history_hold = now + history.DEFER
+                self._audit_panel(p, "panel.archive_deferred", due, day=day, why=r.outcome)
+                return
+            before = store.get_panel_day(self.conn, p.ext, p.panel_id, day)
+            attempts = (0 if before is None else before.attempts) + 1
+            row = store.record_day_failure(
+                self.conn, p.ext, p.panel_id, day, at=now, error=error,
+                max_attempts=history.MAX_ATTEMPTS, next_try_at=history.retry_at(attempts, now),
+            )  # fmt: skip
+            detail = {"stderr_tail": r.stderr_tail} if r.stderr_tail else {}
+            self._audit_panel(p, "panel.archive_failed", due, day=day, error=error,
+                              attempts=row.attempts, failed=row.status == "failed",
+                              **detail)  # fmt: skip
+
     # --- gated runs: a task for JobRunner -------------------------------------------------
 
     def _queue_task(self, job: ScheduledJob, d: Decision) -> None:
@@ -852,9 +983,11 @@ class Scheduler:
                 result = await self._call(job, d.due)
             self._finish(job, d, result)
 
-    async def _call(self, job: ScheduledJob, due: datetime) -> _Result:
+    async def _call(
+        self, job: ScheduledJob, due: datetime, extra: Mapping[str, Any] | None = None
+    ) -> _Result:
         task_id = f"job:{job.label}:{iso(due)}"
-        args: dict[str, Any] = {"due_at": iso(due)}
+        args: dict[str, Any] = {"due_at": iso(due), **(extra or {})}
         if not job.core and (refused := await self._admit(job, task_id, args)) is not None:
             return refused
         env: dict[str, str] = {}

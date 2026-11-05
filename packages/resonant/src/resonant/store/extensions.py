@@ -1,4 +1,5 @@
-"""Extensions, job-state and panel repositories (migrations 004, 012, 026). Plain functions.
+"""Extensions, job-state and panel repositories (migrations 004, 012, 026, 027). Plain
+functions.
 
 - ``extensions``: one row per installed extension, the registry of record. It holds the
   approved manifest snapshot and the pins (``commit``, ``tree_digest``, ``manifest_sha``,
@@ -6,6 +7,7 @@
   reads it, flips ``status`` and re-pins an MCP tool (``set_mcp_pin``: a v1 pin at version 2, or an
   accepted schema drift, PER-275).
 - ``ext_panels``: the latest good copy and run state per ``(ext, panel_id)`` (PER-280).
+- ``ext_panel_days``: a panel's archived copy per calendar day (PER-286, ``history``).
 - ``ext_jobs``: scheduler state per ``(ext, job_id)``. Core jobs use ``ext="core"``.
   ``last_due`` only moves forward, so a stale writer can never make a due time run twice.
 
@@ -71,6 +73,28 @@ class PanelState:
     last_error: str | None
     fail_streak: int
     expect_by: datetime | None
+
+
+DayStatus = Literal["pending", "ok", "none", "failed"]
+
+
+@dataclass(frozen=True)
+class PanelDay:
+    """One archived day of a panel (``ext_panel_days``, migration 027)."""
+
+    ext: str
+    panel_id: str
+    day: str  # YYYY-MM-DD in the panel's tz
+    status: DayStatus
+    data_json: str | None  # a good copy (kept while a rebuild is pending or failed)
+    bytes: int
+    created_at: datetime
+    attempts: int
+    last_error: str | None
+    next_try_at: datetime | None
+    upload_due: bool
+    upload_tries: int
+    upload_next_at: datetime | None
 
 
 def _dt(v: str | None) -> datetime | None:
@@ -205,6 +229,7 @@ def delete_extension(conn: sqlite3.Connection, name: str) -> bool:
     with atomic(conn):
         conn.execute("DELETE FROM ext_jobs WHERE ext = ?", (name,))
         conn.execute("DELETE FROM ext_panels WHERE ext = ?", (name,))
+        conn.execute("DELETE FROM ext_panel_days WHERE ext = ?", (name,))
         cur = conn.execute("DELETE FROM extensions WHERE name = ?", (name,))
     return cur.rowcount == 1
 
@@ -388,3 +413,192 @@ def prune_panels(conn: sqlite3.Connection, ext: str, keep: Collection[str]) -> i
     if keep_ids:
         sql += f" AND panel_id NOT IN ({marks})"
     return conn.execute(sql, (ext, *keep_ids)).rowcount
+
+
+def prune_panel_days(conn: sqlite3.Connection, ext: str, keep: Collection[str]) -> int:
+    """Delete ``ext``'s archived days of panels not in ``keep`` (removed, or no history)."""
+    keep_ids = sorted(keep)
+    marks = ", ".join("?" for _ in keep_ids)
+    sql = "DELETE FROM ext_panel_days WHERE ext = ?"
+    if keep_ids:
+        sql += f" AND panel_id NOT IN ({marks})"
+    return conn.execute(sql, (ext, *keep_ids)).rowcount
+
+
+# --- ext_panel_days (PER-286) ---------------------------------------------------------------
+
+
+def _row_to_day(r: sqlite3.Row) -> PanelDay:
+    created = _dt(r["created_at"])
+    assert created is not None
+    return PanelDay(
+        ext=r["ext"],
+        panel_id=r["panel_id"],
+        day=r["day"],
+        status=r["status"],
+        data_json=r["data_json"],
+        bytes=r["bytes"],
+        created_at=created,
+        attempts=r["attempts"],
+        last_error=r["last_error"],
+        next_try_at=_dt(r["next_try_at"]),
+        upload_due=bool(r["upload_due"]),
+        upload_tries=r["upload_tries"],
+        upload_next_at=_dt(r["upload_next_at"]),
+    )
+
+
+def get_panel_day(conn: sqlite3.Connection, ext: str, panel_id: str, day: str) -> PanelDay | None:
+    row = conn.execute(
+        "SELECT * FROM ext_panel_days WHERE ext = ? AND panel_id = ? AND day = ?",
+        (ext, panel_id, day),
+    ).fetchone()
+    return None if row is None else _row_to_day(row)
+
+
+def list_panel_days(
+    conn: sqlite3.Connection, ext: str, panel_id: str, *, since: str | None = None
+) -> list[PanelDay]:
+    """A panel's archived days, newest first (``since``: that day and later)."""
+    rows = conn.execute(
+        "SELECT * FROM ext_panel_days WHERE ext = ? AND panel_id = ? AND day >= ?"
+        " ORDER BY day DESC",
+        (ext, panel_id, since or ""),
+    ).fetchall()
+    return [_row_to_day(r) for r in rows]
+
+
+def save_day_ok(
+    conn: sqlite3.Connection,
+    ext: str,
+    panel_id: str,
+    day: str,
+    *,
+    data: str,
+    bytes: int,
+    at: datetime,
+) -> None:
+    """A good copy for ``day``: the relay gets it next."""
+    conn.execute(
+        """INSERT INTO ext_panel_days (ext, panel_id, day, status, data_json, bytes, created_at,
+               attempts, last_error, next_try_at, upload_due, upload_tries, upload_next_at)
+           VALUES (?, ?, ?, 'ok', ?, ?, ?, 1, NULL, NULL, 1, 0, NULL)
+           ON CONFLICT (ext, panel_id, day) DO UPDATE SET
+               status = 'ok', data_json = excluded.data_json, bytes = excluded.bytes,
+               attempts = ext_panel_days.attempts + 1, last_error = NULL, next_try_at = NULL,
+               upload_due = 1, upload_tries = 0, upload_next_at = NULL""",
+        (ext, panel_id, day, data, bytes, iso(at)),
+    )
+
+
+def save_day_none(
+    conn: sqlite3.Connection, ext: str, panel_id: str, day: str, *, at: datetime
+) -> None:
+    """No data that day: never retried, never listed. A copy it replaces (a rebuild) is
+    dropped from the relay too."""
+    conn.execute(
+        """INSERT INTO ext_panel_days (ext, panel_id, day, status, data_json, bytes, created_at,
+               attempts, last_error, next_try_at, upload_due, upload_tries, upload_next_at)
+           VALUES (?, ?, ?, 'none', NULL, 0, ?, 1, NULL, NULL, 0, 0, NULL)
+           ON CONFLICT (ext, panel_id, day) DO UPDATE SET
+               status = 'none', upload_due = (ext_panel_days.data_json IS NOT NULL),
+               data_json = NULL, bytes = 0, attempts = ext_panel_days.attempts + 1,
+               last_error = NULL, next_try_at = NULL, upload_tries = 0, upload_next_at = NULL""",
+        (ext, panel_id, day, iso(at)),
+    )
+
+
+def record_day_failure(
+    conn: sqlite3.Connection,
+    ext: str,
+    panel_id: str,
+    day: str,
+    *,
+    at: datetime,
+    error: str | None,
+    max_attempts: int,
+    next_try_at: datetime | None,
+    count: bool = True,
+) -> PanelDay:
+    """A failed attempt: ``pending`` until ``next_try_at``, ``failed`` after ``max_attempts``.
+    A good copy from before (a rebuild) is kept. ``count=False`` (a dry run, a kill) only
+    defers the day."""
+    add = 1 if count else 0
+    conn.execute(
+        """INSERT INTO ext_panel_days (ext, panel_id, day, status, created_at, attempts,
+               last_error, next_try_at)
+           VALUES (?, ?, ?, CASE WHEN ? >= ? THEN 'failed' ELSE 'pending' END, ?, ?, ?, ?)
+           ON CONFLICT (ext, panel_id, day) DO UPDATE SET
+               attempts = ext_panel_days.attempts + ?,
+               status = CASE WHEN ext_panel_days.attempts + ? >= ? THEN 'failed'
+                             ELSE 'pending' END,
+               last_error = COALESCE(excluded.last_error, ext_panel_days.last_error),
+               next_try_at = excluded.next_try_at""",
+        (ext, panel_id, day, add, max_attempts, iso(at), add, error,
+         None if next_try_at is None else iso(next_try_at), add, add, max_attempts),
+    )  # fmt: skip
+    row = get_panel_day(conn, ext, panel_id, day)
+    assert row is not None
+    return row
+
+
+def queue_rebuild(
+    conn: sqlite3.Connection, ext: str, panel_id: str, days: Collection[str], *, at: datetime
+) -> int:
+    """Mark ``days`` to be archived again (``resonant ext panel-history --rebuild``): each is
+    ``pending`` with no attempts; a good copy shows until the new one replaces it."""
+    n = 0
+    for day in sorted(days):
+        conn.execute(
+            """INSERT INTO ext_panel_days (ext, panel_id, day, status, created_at)
+               VALUES (?, ?, ?, 'pending', ?)
+               ON CONFLICT (ext, panel_id, day) DO UPDATE SET
+                   status = 'pending', attempts = 0, last_error = NULL, next_try_at = NULL""",
+            (ext, panel_id, day, iso(at)),
+        )
+        n += 1
+    return n
+
+
+def prune_days_before(conn: sqlite3.Connection, ext: str, panel_id: str, day: str) -> int:
+    """Delete a panel's archived days before ``day`` (past its ``keep``)."""
+    return conn.execute(
+        "DELETE FROM ext_panel_days WHERE ext = ? AND panel_id = ? AND day < ?",
+        (ext, panel_id, day),
+    ).rowcount
+
+
+def days_to_upload(conn: sqlite3.Connection, now: datetime, limit: int) -> list[PanelDay]:
+    """Days the relay still has to receive (oldest first), not held by a backoff."""
+    rows = conn.execute(
+        """SELECT * FROM ext_panel_days WHERE upload_due = 1
+               AND (upload_next_at IS NULL OR upload_next_at <= ?)
+           ORDER BY day, ext, panel_id LIMIT ?""",
+        (iso(now), limit),
+    ).fetchall()
+    return [_row_to_day(r) for r in rows]
+
+
+def mark_uploaded(
+    conn: sqlite3.Connection, ext: str, panel_id: str, day: str, sent: str | None
+) -> bool:
+    """The relay has ``sent`` (the ``data_json`` that was uploaded). A row whose copy changed
+    meanwhile (a rebuild landed) stays due. True when cleared."""
+    return (
+        conn.execute(
+            """UPDATE ext_panel_days SET upload_due = 0, upload_tries = 0, upload_next_at = NULL
+               WHERE ext = ? AND panel_id = ? AND day = ? AND data_json IS ?""",
+            (ext, panel_id, day, sent),
+        ).rowcount
+        == 1
+    )
+
+
+def mark_upload_failed(
+    conn: sqlite3.Connection, ext: str, panel_id: str, day: str, *, next_at: datetime
+) -> None:
+    conn.execute(
+        """UPDATE ext_panel_days SET upload_tries = upload_tries + 1, upload_next_at = ?
+           WHERE ext = ? AND panel_id = ? AND day = ?""",
+        (iso(next_at), ext, panel_id, day),
+    )

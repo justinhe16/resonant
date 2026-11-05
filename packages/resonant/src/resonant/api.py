@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -31,11 +31,13 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from resonant import __version__
 from resonant.config import Settings, is_loopback
 from resonant.dashboard.diagram import cached_scan
-from resonant.dashboard.snapshot import Snapshot, build_snapshot
+from resonant.dashboard.snapshot import Snapshot, build_snapshot, panel_day
+from resonant.extensions.panel_history import parse_day
 from resonant.loop import Loop
 from resonant.monitor import channels_snapshot
 from resonant.redact import Redactor
 from resonant.status import collect_status
+from resonant.store import extensions as ext_store
 
 if TYPE_CHECKING:
     from resonant.components import Components
@@ -223,6 +225,23 @@ def create_app(state: DaemonState, *, dashboard_dist: Path | None = None) -> Fas
         """The local-tier snapshot (docs/dashboard-plan.md §3, docs/snapshot.schema.json)."""
         response.headers["Cache-Control"] = "no-store"  # it carries asks and approval texts
         return (await local_snapshot(state)).model_dump(mode="json")
+
+    @app.get("/api/ext/{name}/panels/{panel_id}/days/{day}")
+    async def panel_history_day(  # pyright: ignore[reportUnusedFunction]
+        name: str, panel_id: str, day: str, response: Response
+    ) -> dict[str, Any]:
+        """PER-286: one archived day of a history panel (read-only). 404 for an unknown
+        extension, panel or day, and for a day recorded as none or failed."""
+        response.headers["Cache-Control"] = "no-store"
+        record = ext_store.get_extension(state.conn, name) if len(name) <= 64 else None
+        found = (
+            panel_day(state.conn, record, panel_id, day)
+            if record is not None and len(panel_id) <= 64 and parse_day(day) is not None
+            else None
+        )
+        if found is None:
+            raise HTTPException(status_code=404, detail="no such day")
+        return found
 
     @app.get("/api/tools")
     async def tools() -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]
