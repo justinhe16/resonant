@@ -18,6 +18,16 @@ const width = () => {
 const pointer = (type: "pointerDown" | "pointerMove" | "pointerUp", el: Element, clientX: number, pointerType = "mouse") =>
   fireEvent[type](el, { clientX, clientY: 100, pointerId: 1, pointerType, isPrimary: true });
 
+/** The fixture with `k` more flat 1-minute candles, as the next snapshot of a live chart. */
+const grown = (k: number): PriceWidget => ({
+  ...candles,
+  dt: [...candles.dt, ...Array<number>(k).fill(60)],
+  o: [...candles.o!, ...Array<number>(k).fill(0)],
+  h: [...candles.h!, ...Array<number>(k).fill(0)],
+  l: [...candles.l!, ...Array<number>(k).fill(0)],
+  c: [...candles.c, ...Array<number>(k).fill(0)],
+});
+
 describe("price widget", () => {
   it("draws candles hollow up and filled down, markers, and an accessible summary", () => {
     draw(candles);
@@ -188,4 +198,64 @@ describe("price widget", () => {
     draw({ ...candles, aggregated_from: 3000 });
     expect(screen.getByTestId("price-aggregated")).toHaveTextContent("3000 candles combined into 120 wider ones");
   });
+
+  it("a new candle keeps the owner's view: All stays all, a chip re-applies, a zoom stays", async () => {
+    const u = userEvent.setup();
+    const { rerender } = draw(candles);
+    const again = (w: PriceWidget) => rerender(<Widget w={w} ext="trade-jev" now={NOW} />);
+    again(grown(1));
+    expect(win()).toEqual([-0.5, 120.5]); // All follows
+    await u.click(screen.getByRole("button", { name: "30m" }));
+    again(grown(2));
+    expect(win()).toEqual([91.5, 121.5]); // still the last 30 minutes
+    fireEvent.wheel(chart(), { deltaY: -400, clientX: 100, ctrlKey: true }); // zoom on the left
+    const zoomed = win();
+    again(grown(5));
+    expect(win()).toEqual(zoomed); // left alone
+    await u.click(screen.getByRole("button", { name: "1h" }));
+    pointer("pointerDown", chart(), 300);
+    pointer("pointerMove", chart(), 400); // drag right: earlier candles, off the right edge
+    pointer("pointerUp", chart(), 400);
+    const panned = win();
+    again(grown(6));
+    expect(win()).toEqual(panned);
+    fireEvent.keyDown(chart(), { key: "0" });
+    fireEvent.wheel(chart(), { deltaY: -400, clientX: 576, ctrlKey: true }); // zoom at the right edge: follows
+    const [lo, hi] = win();
+    again(grown(8));
+    expect(win()).toEqual([lo! + 2, hi! + 2]);
+  });
+
+  it("a tap or click off the trades unpins one; a cancelled touch is not a tap", async () => {
+    const u = userEvent.setup();
+    draw(candles);
+    const [first] = screen.getAllByTestId("price-trade-hit") as [HTMLElement, ...HTMLElement[]];
+    await u.click(first);
+    fireEvent.pointerLeave(first, { pointerType: "mouse" });
+    expect(screen.getByTestId("price-tooltip")).toHaveTextContent("target");
+    pointer("pointerDown", chart(), 500, "touch");
+    pointer("pointerUp", chart(), 500, "touch");
+    expect(screen.getByTestId("price-tooltip")).toHaveTextContent(/O[\d,.]+H/); // the crosshair now
+    cleanupTip();
+    await u.click(first);
+    fireEvent.pointerLeave(first, { pointerType: "mouse" });
+    pointer("pointerDown", chart(), 500);
+    pointer("pointerUp", chart(), 500);
+    fireEvent.pointerLeave(chart(), { pointerType: "mouse" });
+    expect(screen.queryByTestId("price-tooltip")).toBeNull();
+    // a page scroll that began on the chart: down, then cancel, twice; no crosshair, no fit
+    fireEvent.wheel(chart(), { deltaY: -400, clientX: 300, ctrlKey: true });
+    const before = win();
+    for (let k = 0; k < 2; k++) {
+      pointer("pointerDown", chart(), 300, "touch");
+      fireEvent.pointerCancel(chart(), { pointerId: 1, pointerType: "touch" });
+    }
+    expect(screen.queryByTestId("price-crosshair")).toBeNull();
+    expect(win()).toEqual(before);
+  });
 });
+
+function cleanupTip() {
+  fireEvent.keyDown(screen.getByTestId("price-chart"), { key: "Escape" });
+}
+

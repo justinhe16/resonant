@@ -203,16 +203,16 @@ export function niceTicks(lo: number, hi: number, count = 4): { ticks: number[];
 export function priceLabel(v: number, step: number, w: Pick<PriceWidget, "format" | "currency">): string {
   if (w.format === "money") return formatValue(v, "money", { currency: w.currency });
   if (w.format !== "number") return formatValue(v, w.format);
-  const decimals = Math.min(6, (String(Number(step.toPrecision(6))).split(".")[1] ?? "").length);
+  const decimals = Math.min(8, Math.max(0, Math.ceil(-Math.log10(step) - 1e-9), (Number(step.toPrecision(6)).toFixed(8).replace(/0+$/, "").split(".")[1] ?? "").length));
   return new Intl.NumberFormat("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals }).format(v);
 }
 
-/** A price in a tooltip or the table: the data's own precision, up to 6 decimals. */
+/** A price in a tooltip or the table: the data's own precision, up to 8 decimals. */
 export function priceText(v: number | null | undefined, w: Pick<PriceWidget, "format" | "currency" | "unit">): string {
   if (v === null || v === undefined) return "—";
   if (w.format === "money") return formatValue(v, "money", { currency: w.currency });
   if (w.format !== "number") return formatValue(v, w.format, { unit: w.unit });
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 6 }).format(v);
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 }).format(v);
 }
 
 /** Up to `max` candle indexes in `[a, b]` to label on the time axis, evenly spaced. */

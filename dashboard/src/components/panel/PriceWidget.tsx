@@ -4,6 +4,7 @@ import { formatValue, fromUnix, timeTick, type Plot } from "@/lib/panels";
 import {
   candlePaths,
   type Candles,
+  clampWindow,
   decodePrice,
   fullWindow,
   indexAt,
@@ -96,15 +97,17 @@ export function PriceWidget({ w }: { w: Price }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const clipId = useId().replace(/:/g, "");
 
-  // A new snapshot with another number of candles refits.
-  const seen = useRef(n);
-  useEffect(() => {
-    if (seen.current !== n) {
-      seen.current = n;
-      setWin(fullWindow(n));
-      setChip("all");
-    }
-  }, [n]);
+  // A new snapshot with another number of candles keeps what the owner is looking at: a chip
+  // re-applies (All stays all, 30m stays the last 30 minutes), a zoom pinned to the right edge
+  // follows the new candles, any other zoom stays where it is.
+  // (Adjusted while rendering, React's pattern for state that follows a prop.)
+  const [seen, setSeen] = useState(n);
+  if (seen !== n) {
+    setSeen(n);
+    const c = CHIPS.find((k) => k.id === chip);
+    if (c) setWin(c.seconds === null ? fullWindow(n) : rangeWindow(d, c.seconds));
+    else setWin(win.hi >= seen - 0.5 - 1e-6 ? panWindow(win, n - seen, n) : clampWindow(win, n));
+  }
 
   const apply = useCallback((next: Win) => {
     setWin(next);
@@ -146,7 +149,8 @@ export function PriceWidget({ w }: { w: Price }) {
       e.preventDefault();
       const box = svg.getBoundingClientRect();
       const px = e.clientX - box.left;
-      setWin((cur) => zoomWindow(cur, Math.exp(e.deltaY * 0.004), indexAt(px, cur, plot), n));
+      const dy = e.deltaY * (e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 400 : 1); // lines, pages
+      setWin((cur) => zoomWindow(cur, Math.exp(Math.max(-200, Math.min(200, dy)) * 0.004), indexAt(px, cur, plot), n));
       setChip(null);
     };
     svg.addEventListener("wheel", onWheel, { passive: false });
@@ -203,6 +207,7 @@ export function PriceWidget({ w }: { w: Price }) {
     drag.current = null;
     if (!dr || dr.moved || n === 0) return;
     const px = localX(e);
+    if (e.pointerType === "mouse") setPicked(null); // a click off the trades unpins one
     if (e.pointerType !== "mouse") {
       const now = e.timeStamp || Date.now();
       const prev = lastTap.current;
@@ -212,8 +217,17 @@ export function PriceWidget({ w }: { w: Price }) {
         return;
       }
       lastTap.current = { at: now, x: px };
+      setPicked(null); // a tap off the trades unpins one
       if (px >= plot.x0 && px <= plot.x1) setHover(nearest(px));
     }
+  };
+  // A cancel (the browser took over, e.g. a vertical page scroll that began on the chart) is
+  // not a tap: forget the gesture, show nothing.
+  const onPointerCancel = (e: ReactPointerEvent<SVGSVGElement>) => {
+    pointers.current.delete(e.pointerId);
+    if (pointers.current.size < 2) pinch.current = null;
+    drag.current = null;
+    lastTap.current = null;
   };
   const onKeyDown = (e: ReactKeyboardEvent<SVGSVGElement>) => {
     if (n === 0) return;
@@ -241,7 +255,8 @@ export function PriceWidget({ w }: { w: Price }) {
 
   const current = pointed ?? picked;
   const shown = current !== null ? trades[current] : undefined;
-  const tipX = shown ? x(shown.i0) : hover !== null ? x(hover) : null;
+  const rawTipX = shown ? x(shown.i0) : hover !== null ? x(hover) : null;
+  const tipX = rawTipX === null ? null : Math.min(Math.max(rawTipX, plot.x0), plot.x1); // a pinned trade may be off screen
   const full = isFull(win, n);
 
   return (
@@ -299,7 +314,7 @@ export function PriceWidget({ w }: { w: Price }) {
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
-            onPointerCancel={onPointerUp}
+            onPointerCancel={onPointerCancel}
             onPointerLeave={(e) => e.pointerType === "mouse" && setHover(null)}
             onDoubleClick={fit}
             onKeyDown={onKeyDown}

@@ -269,9 +269,12 @@ def _price_summary(w: dict[str, Any]) -> dict[str, Any]:
     got = [(t, r) for t, r in zip(times, rows, strict=True) if r is not None]
     summary: dict[str, Any] = {
         "type": "price",
+        "id": w.get("id"),
         "title": w.get("title"),
         "mode": w["mode"],
         "unit": w.get("unit"),
+        "format": w.get("format"),
+        "currency": w.get("currency"),
         "candles": len(times),
         "aggregated_from": w.get("aggregated_from"),
         "trades": w.get("trades", []),

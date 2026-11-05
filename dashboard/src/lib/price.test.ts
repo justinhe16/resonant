@@ -150,6 +150,8 @@ describe("y range and ticks", () => {
     expect(priceLabel(25000, 20, { format: "number" })).toBe("25,000");
     expect(priceLabel(25000.25, 0.25, { format: "number" })).toBe("25,000.25");
     expect(priceLabel(12.5, 2.5, { format: "money", currency: "USD" })).toBe("$12.50");
+    expect(priceLabel(0.0000025, 0.0000005, { format: "number" })).toBe("0.0000025");
+    expect(priceLabel(1, 1e-8, { format: "number" })).toBe("1.00000000");
     expect(timeTicks(0, 2, 5)).toEqual([0, 1, 2]);
     expect(timeTicks(10, 110, 3)).toEqual([10, 60, 110]);
   });
