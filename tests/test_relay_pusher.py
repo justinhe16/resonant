@@ -258,6 +258,77 @@ async def test_degraded_then_failing_then_recovered(db: sqlite3.Connection) -> N
     assert health(db)["state"] == "ok" and p.failures == 0
 
 
+async def test_a_wedged_client_is_replaced_after_fail_after_failures(
+    db: sqlite3.Connection,
+) -> None:
+    """PER-284: after a Wi-Fi drop the old pool kept failing with ConnectError until a restart.
+    From the FAIL_AFTER-th failure in a row on, the pusher drops its own client; a fresh one
+    lands the next push."""
+    fake = FakeSupabase()
+
+    def wedged(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("stale pool", request=request)
+
+    clients: list[httpx.AsyncClient] = []
+
+    def factory() -> httpx.AsyncClient:
+        first = not clients
+        clients.append(
+            httpx.AsyncClient(transport=httpx.MockTransport(wedged)) if first else fake.client()
+        )
+        return clients[-1]
+
+    p = make_pusher(db, fake)
+    p._client, p._owns_client, p._client_factory = None, True, factory  # pyright: ignore[reportPrivateUsage]
+    for n in range(1, FAIL_AFTER):
+        assert not (await p.push_once()).ok
+        assert len(clients) == 1 and not clients[0].is_closed, n  # kept until FAIL_AFTER
+    out = await p.push_once()
+    assert not out.ok and out.detail.startswith("network error (ConnectError)")
+    assert health(db)["state"] == "failing"
+    assert clients[0].is_closed  # dropped on the FAIL_AFTER-th failure
+    assert (await p.push_once()).ok  # a fresh client: the push lands
+    assert len(clients) == 2 and len(fake.stored) == 1
+    assert health(db)["state"] == "ok" and p.failures == 0
+
+
+async def test_an_injected_client_is_never_dropped(db: sqlite3.Connection) -> None:
+    fake = FakeSupabase(script=[503] * (FAIL_AFTER + 1))
+    p = make_pusher(db, fake, max_attempts=1)
+    client = p.client
+    for _ in range(FAIL_AFTER + 1):
+        await p.push_once()
+    assert p.client is client and not client.is_closed  # the caller's to close
+    assert (await p.push_once()).ok
+
+
+async def test_the_factory_builds_an_owned_client(db: sqlite3.Connection) -> None:
+    settings = load_settings()
+    cfg = RelayConfig(enabled=True, supabase_url=URL, anon_key=ANON)
+    fake = FakeSupabase(script=[503] * FAIL_AFTER)
+    built: list[httpx.AsyncClient] = []
+
+    def factory() -> httpx.AsyncClient:
+        built.append(fake.client())
+        return built[-1]
+
+    async def snapshot(redactor: Redactor) -> Snapshot:
+        return build_snapshot(db, settings, started_at=T0, redactor=redactor)
+
+    p = SnapshotPusher(
+        db,
+        cfg.model_copy(update={"max_attempts": 1}),
+        snapshot=snapshot,
+        secrets=SecretStore(FakeKeychain(items={SUPABASE_KEY_REF: TOKEN})),
+        client_factory=factory,
+        sleep=Sleeps(),
+    )
+    for _ in range(FAIL_AFTER):
+        await p.push_once()
+    assert len(built) == 1 and built[0].is_closed
+    assert (await p.push_once()).ok and len(built) == 2
+
+
 @pytest.mark.parametrize("code", [401, 403])
 async def test_rejected_credentials_fail_at_once_without_retry(
     db: sqlite3.Connection, code: int

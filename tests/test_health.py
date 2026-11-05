@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 
 import httpx
@@ -55,3 +56,35 @@ async def test_deadman_pings_success_and_fail() -> None:
     task.cancel()
     assert seen[0] == "/abc"
     assert seen[-1] == "/abc/fail"
+
+
+async def test_deadman_rebuilds_a_wedged_client() -> None:
+    """PER-284: after DEADMAN_RESET_AFTER failed pings in a row an owned client is closed and
+    rebuilt, so a pool left stale by a network drop doesn't keep the dead-man failing."""
+    seen: list[str] = []
+    clients: list[httpx.AsyncClient] = []
+
+    def wedged(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("stale pool", request=request)
+
+    def fresh(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200)
+
+    def factory() -> httpx.AsyncClient:
+        handler = wedged if not clients else fresh
+        clients.append(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        return clients[-1]
+
+    task = asyncio.create_task(
+        deadman_task("https://hc.example/abc", 0.001, lambda: True, client_factory=factory)
+    )
+    for _ in range(500):
+        await asyncio.sleep(0.002)
+        if seen:
+            break
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert seen and seen[0] == "/abc"
+    assert len(clients) == 2 and clients[0].is_closed and clients[1].is_closed  # owned: closed

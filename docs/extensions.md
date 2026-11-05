@@ -57,6 +57,7 @@ Unknown keys are errors. YAML is parsed so that only `true`/`false` are booleans
 | `notify` | `{on: [event…], channel: imessage\|slack}` | Which of your emitted events are forwarded to people. |
 | `report` | `{max_urgency: urgent\|normal\|low}` | The highest urgency your `report()` items may use (`urgent` texts the owner right away, `normal` joins the hourly pulse, `low` waits for the 08:00 briefing). Without it, reports are refused. `item` is reserved and can't be in `notify.on`. |
 | `health` | `{check: <cmd>, every: 30s\|5m\|1h}` | A health command. A zero exit code means healthy. |
+| `recover` | `{run: <cmd>, timeout: 120s, secrets: [...]}`, optional; needs `health` | A command Resonant runs on its own when the health check fails twice in a row (an alive-but-stuck process), described in §6b (PER-284). `run` follows the job rules (no placeholders); `timeout` defaults to 120s, at most 300s; `secrets` must be declared at the top level. Shown as an escalation at install. |
 | `secrets` | list of names | Keychain secret names (`^[a-z][a-z0-9_]{0,31}$`) your tools and jobs may receive. Every tool's and job's `secrets` must be listed here. |
 | `bins` | list of `gh`/`git`, optional | Host binaries your own code runs (the github extension's `gh`). Each is pinned by its real absolute path at install and reaches every process of the extension as `RESONANT_BIN_<NAME>` (`RESONANT_BIN_GH`); run it by that path, never by a `PATH` lookup. Shown as an escalation at install. |
 | `repos` | list of `owner/name`, ≤ 20, optional | GitHub repos this extension is about (e.g. `me/trading-bot`). Saying "work on trading" in a request then means those repos: one link resolves to it, several ask which. Links are only a name for the repo; they grant nothing, and the repo is checked against GitHub when first used. `ext add`/`update` replace the links, `ext remove` drops them, and `/ext list` shows them. |
@@ -400,6 +401,22 @@ print_panel([view("now", "Now", [
 
 The brain can read what a panel last drew: `read_panel {extension}` lists the extension's panels (`id`, `title`, `updated_at`, `ok`, `stale`, `error`) with the stat widgets of each first view as `{label, value, unit}`; `read_panel {extension, panel}` returns that panel's views in full, except that a `price` widget comes back decoded into a summary (`mode`, `unit`, `candles`, `aggregated_from`, `from`, `to`, `open`, `high`, `low`, `last`, and its `trades` and `markers` as they are). It reads the stored copy only and never runs anything. Its output is outside text, so the calling task is tainted.
 
+## 6b. Recovery
+
+launchd restarts a process that exits. `recover` is for one that is **alive but stuck**: a loop that keeps its heartbeat but stopped working after a network drop.
+
+```yaml
+health: {check: ./cli.py health, every: 5m}
+recover: {run: ./cli.py recover, timeout: 120s}
+```
+
+- **When.** Your `health.check` fails (non-zero exit, timeout, a missing secret) **twice in a row**. An ok check resets the count, and so does a recover run: the next one needs two fresh failures.
+- **Limits.** At most one run per 15 minutes and 3 per local day per extension. The first trigger past the third texts once (`trade-jev: recovered 3 times today; not trying again until tomorrow`) and nothing more runs until the next day. Never while the kill switch is engaged or autonomy is off.
+- **How it runs.** Like a job: your pinned command in the approved copy, a scratch environment (`HOME` = your data dir) with only the secrets `recover.secrets` lists, the same process runner (so `/kill` ends it) and `timeout`. Print one short line saying what you did, then exit 0; a non-zero exit is a failed recovery. Make it idempotent and safe to run when nothing is wrong.
+- **What you see.** One text, built by code: `trade-jev: recovering (health failed twice): <your first stdout line>` (redacted of your secrets, cleaned, URLs dropped, at most 160 chars), or `... recover failed (exit N)` / `(timed out)`. It follows the notice rules: held while paused or in quiet hours (the hourly pulse carries it), but it doesn't use the daily notice budget. Every run is audited `ext.recover` with `exit_code` and `duration_ms`.
+- **State** is one kv row per extension, `ext.recover.<name>` (streak, last run, today's count).
+- **Approval.** `ext add`/`ext update` list it under escalations: `! recover: may run ./cli.py recover on its own when health fails twice`. Adding or changing it is a manifest change that needs your typed confirmation again.
+
 ## 7. Events and notifications
 
 Your processes report what happened by emitting events: either an `"events"` list in the result object, or JSON lines written to file descriptor 3 (`RESONANT_EVENTS_FD`) with the stdlib helper `emit.py` copied from the SDK (`from emit import emit; emit("ci_failed", "✗ resonant#40 CI failed (lint)", "resonant#40:run:123:failed")`). Events count only when the run succeeds.
@@ -470,7 +487,7 @@ These run **only in the Mini's terminal**, never over iMessage.
 `ext add`:
 1. Copies the approved bytes into a staging dir. `repo:` reads the **HEAD commit** (`git archive`), so uncommitted edits are never installed. `path:` reads the tracked files from the git index, and refuses the directory if any tracked file there has uncommitted changes. Nothing else is a source.
 2. Validates the manifest and the directory: stdlib only, the argv[0] allowlist, MCP server commands, no symlink that leaves the tree, the name rules and approver grants. Critical jobs are refused for now. Then it starts each stdio MCP server once (no secrets, a scratch home), asks each http server for its tools (after asking you before sending its token), and pins the tools you listed.
-3. Shows a heading built by code, `my-ext repo:my-ext@a1b2c3d4 digest 9f3e01aa` (commit and content digest), then **escalations first** (secrets, approvers, tools and jobs that ask, commands that use `gh`/`git`, each MCP server and each MCP tool with its pin), then every tool, job, report grant, notify event, linked repo and the health check. Every string from your manifest is shown sanitized.
+3. Shows a heading built by code, `my-ext repo:my-ext@a1b2c3d4 digest 9f3e01aa` (commit and content digest), then **escalations first** (secrets, approvers, tools and jobs that ask, commands that use `gh`/`git`, each MCP server and each MCP tool with its pin, a `recover` command), then every tool, job, report grant, notify event, linked repo, the health check and the recover command. Every string from your manifest is shown sanitized.
 4. You confirm by typing the extension name.
 5. It stages the source **again** and refuses if the commit, digest, manifest or MCP tool pins changed since you confirmed. The copy goes to `~/.resonant/extensions/<name>/` (read-only), its digest is recomputed, and only then is the row written, with an `ext.install` audit row.
 6. If the daemon is up, it restarts (reply-first path), and the owner gets `Back up …` and `Installed my-ext`.

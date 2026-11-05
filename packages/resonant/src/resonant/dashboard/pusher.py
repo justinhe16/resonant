@@ -22,6 +22,9 @@ While ``relay.enabled``, the daemon runs :meth:`SnapshotPusher.run` as a backgro
   credentials, a refused snapshot, a missing secret). The row in a pushed snapshot is the state
   before that push. ``detail`` is built by code (an HTTP status or an exception type, never a
   response body or a URL), redacted of the token and key, and capped.
+- **Reconnect** (PER-284). From the ``FAIL_AFTER``-th failed push in a row on, each failure
+  closes and drops the pusher's own HTTP client, so the next push opens fresh connections
+  (after a Wi-Fi drop the old pool kept failing with ``ConnectError`` until a restart).
 - **Kill switch.** ``/kill`` doesn't stop the relay: it is outbound status, not an action, and
   a paused Mini is exactly what the owner wants to see from away. The snapshot says
   ``paused: true``. ``dry_run`` doesn't stop it either. Only ``relay.enabled: false`` does,
@@ -311,12 +314,18 @@ def clear_relay_health(conn: sqlite3.Connection) -> None:
         log.warning("could not clear the relay health row")
 
 
+def _new_client() -> httpx.AsyncClient:
+    # No proxy or CA settings from the environment: one fixed https endpoint.
+    return httpx.AsyncClient(follow_redirects=False, trust_env=False)
+
+
 class SnapshotPusher:
     """Pushes the remote tier of ``snapshot()`` to Supabase. See the module doc.
 
     ``snapshot(redactor)`` returns the local-tier snapshot (``api.local_snapshot``) built with
     the relay's own secrets as known values; this class applies ``to_remote`` itself, so a
-    caller can't hand it anything wider. ``client``, ``sleep``,
+    caller can't hand it anything wider. ``client`` (kept for good), ``client_factory`` (an
+    owned client, rebuilt after ``FAIL_AFTER`` failed pushes in a row), ``sleep``,
     ``clock``, ``monotonic`` and ``jitter`` are injectable for tests.
     """
 
@@ -328,6 +337,7 @@ class SnapshotPusher:
         snapshot: Callable[[Redactor], Awaitable[Snapshot]],
         secrets: SecretStore,
         client: httpx.AsyncClient | None = None,
+        client_factory: Callable[[], httpx.AsyncClient] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], datetime] = utcnow,
         monotonic: Callable[[], float] = time.monotonic,
@@ -342,9 +352,10 @@ class SnapshotPusher:
         self._snapshot = snapshot
         self.secrets = secrets
         self._owns_client = client is None
-        # Created on first use (run() closes it), so a pusher that never runs holds nothing.
-        # No proxy or CA settings from the environment: one fixed https endpoint.
+        # Created on first use (run() closes it), so a pusher that never runs holds nothing;
+        # ``client_factory`` (tests) builds it. Dropped after FAIL_AFTER failures in a row.
         self._client = client
+        self._client_factory = client_factory or _new_client
         self._sleep = sleep
         self._clock = clock
         self._monotonic = monotonic
@@ -354,8 +365,20 @@ class SnapshotPusher:
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(follow_redirects=False, trust_env=False)
+            self._client = self._client_factory()
         return self._client
+
+    async def _drop_client(self) -> None:
+        """Close and forget an owned client so the next push opens fresh connections (PER-284:
+        after a network drop its pool can stay wedged on dead sockets). An injected client
+        is the caller's and is kept."""
+        if not self._owns_client or self._client is None:
+            return
+        client, self._client = self._client, None
+        try:
+            await client.aclose()
+        except Exception as e:  # a dead pool may fail to close; it is dropped either way
+            log.warning("status relay client close failed: %s", type(e).__name__)
 
     async def run(self) -> None:
         """Push every ``every_s`` (start to start, at least ``MIN_GAP_S`` apart) until cancelled."""
@@ -376,6 +399,8 @@ class SnapshotPusher:
         """One push with its retries; records the health row. Returns the outcome."""
         outcome = await self._push()
         self._record(outcome)
+        if not outcome.ok and self.failures >= FAIL_AFTER:
+            await self._drop_client()  # on every failure from the FAIL_AFTER-th on
         return outcome
 
     async def _push(self) -> PushOutcome:

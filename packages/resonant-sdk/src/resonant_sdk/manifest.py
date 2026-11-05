@@ -59,6 +59,8 @@ PANEL_DESCRIPTION_MAX = 160
 PANEL_TITLE_MAX = 60
 PANEL_ARGV_MAX = 16
 PANEL_ARG_MAX = 200
+RECOVER_TIMEOUT_DEFAULT = "120s"
+RECOVER_TIMEOUT_MAX_S = 300
 LAUNCH_AGENT_LABEL = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
 
 _CRON_FIELD = re.compile(r"^[A-Za-z0-9*/,\-]+$")
@@ -551,6 +553,35 @@ class Health(_Strict):
         return v
 
 
+class Recover(_Strict):
+    """PER-284: a command Resonant runs on its own when ``health.check`` fails twice in a
+    row (an alive-but-stuck process). Same rules as a job's ``run`` (an in-dir ``.py``,
+    ``python3 <file>``, ``gh`` or ``git``; pinned at install; no placeholders) and only the
+    secrets it declares here, which must be declared at the top level."""
+
+    run: str
+    timeout: str = RECOVER_TIMEOUT_DEFAULT  # 30s / 2m; at most 300s
+    secrets: tuple[SecretName, ...] = ()
+
+    @field_validator("run")
+    @classmethod
+    def _run(cls, v: str) -> str:
+        if "{" in v or "}" in v:
+            raise ValueError("recover run takes no placeholders")
+        return v
+
+    @field_validator("timeout")
+    @classmethod
+    def _timeout(cls, v: str) -> str:
+        if not 0 < duration_s(v) <= RECOVER_TIMEOUT_MAX_S:
+            raise ValueError(f"recover timeout must be between 1s and {RECOVER_TIMEOUT_MAX_S}s")
+        return v
+
+    @property
+    def timeout_s(self) -> float:
+        return float(duration_s(self.timeout))
+
+
 class Manifest(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
 
@@ -566,6 +597,7 @@ class Manifest(BaseModel):
     notify: Notify | None = None
     report: Report | None = None
     health: Health | None = None
+    recover: Recover | None = None  # PER-284: needs ``health``
     secrets: tuple[SecretName, ...] = ()
     repos: tuple[str, ...] = Field(default=(), max_length=REPOS_MAX)  # GitHub "owner/name" links
     launch_agents: tuple[LaunchAgent, ...] = Field(default=(), max_length=LAUNCH_AGENTS_MAX)
@@ -650,6 +682,11 @@ class Manifest(BaseModel):
         for spec in tool_specs + job_specs + panel_specs:
             if undeclared := set(spec.secrets) - declared:
                 raise ValueError(f"{spec.name}: secrets not declared at top level: {undeclared}")
+        if self.recover is not None:
+            if self.health is None:
+                raise ValueError("recover needs a health check (it runs when health fails)")
+            if undeclared := set(self.recover.secrets) - declared:
+                raise ValueError(f"recover: secrets not declared at top level: {undeclared}")
         for job in self.jobs:
             asks = job.spec(self.name).effective_level in (Level.L1, Level.L2)
             if asks and cron_min_interval_s(job.schedule) < ASKING_JOB_MIN_INTERVAL_S:

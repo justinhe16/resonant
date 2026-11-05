@@ -96,6 +96,8 @@ def commands(manifest: Manifest) -> list[tuple[str, str]]:
     out += [(f"panel {p.id}", p.run) for p in manifest.panels]
     if manifest.health:
         out.append(("health", manifest.health.check))
+    if manifest.recover:
+        out.append(("recover", manifest.recover.run))
     return out
 
 
