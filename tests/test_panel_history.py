@@ -460,6 +460,54 @@ async def test_a_dated_call_on_a_plain_panel_is_refused(tmp_path: Path) -> None:
         assert run.calls == []
 
 
+OWN_DATE = MANIFEST.replace(
+    "  go: {run: ./cli.py go, effect: read}\n",
+    "  go: {run: ./cli.py go, effect: read}\n"
+    "  pnl:\n"
+    "    run: ./cli.py pnl --date {date}\n"
+    "    effect: read\n"
+    "    args: {date: string}\n"
+    "  trades:\n"
+    "    run: ./cli.py trades --date {date} --limit {limit}\n"
+    "    effect: read\n"
+    "    args: {date: string, limit: integer}\n",
+)
+
+
+@pytest.mark.parametrize(
+    "day", ["", "today", "yesterday", "2026-11-06", "week", "month", "2026-11-02..2026-11-06"]
+)
+async def test_a_tool_that_declares_date_gets_it_as_its_own_arg(tmp_path: Path, day: str) -> None:
+    """The tool's ``run`` places its ``date`` and the extension parses it: no ``YYYY-MM-DD``
+    check and no second ``--date``. PER-286 refused every such call (trade_jev_pnl and friends)."""
+    from resonant.executor import CallContext
+
+    run = Script()
+    async with hist_harness(tmp_path, run, manifest=OWN_DATE, at_=at(1, 1)) as h:
+        host = h.components.extensions
+        assert host is not None
+        pnl = host.handlers[("example", "pnl")]
+        await pnl({"date": day}, CallContext({}, "k", "t"))
+        trades = host.handlers[("example", "trades")]
+        await trades({"date": day, "limit": 5}, CallContext({}, "k", "t"))
+        got = [c.argv[-2:] for c in run.calls if "pnl" in c.argv] + [
+            c.argv[-4:] for c in run.calls if "trades" in c.argv
+        ]
+        assert got == [("--date", day), ("--date", day, "--limit", "5")]
+
+
+async def test_a_tool_that_does_not_declare_date_still_refuses_it(tmp_path: Path) -> None:
+    from resonant.executor import CallContext, ToolFailed
+
+    run = Script()
+    async with hist_harness(tmp_path, run, manifest=OWN_DATE, at_=at(1, 1)) as h:
+        host = h.components.extensions
+        assert host is not None
+        with pytest.raises(ToolFailed, match="no date"):
+            await host.handlers[("example", "go")]({"date": "today"}, CallContext({}, "k", "t"))
+        assert not [c for c in run.calls if "go" in c.argv]
+
+
 # --- store: removal --------------------------------------------------------------------------
 
 

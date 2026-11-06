@@ -11,7 +11,9 @@ Jobs take ``{due_at}``: it becomes ``RESONANT_JOB_DUE_AT`` (and fills ``{due_at}
 job's ``run`` uses it).
 
 A panel with ``history`` (PER-286) is ``dated``: a call with a ``date`` arg (``YYYY-MM-DD``,
-the archiver's) runs the same argv plus ``--date <date>``. Any other handler refuses ``date``.
+the archiver's) runs the same argv plus ``--date <date>``. A tool that declares its own ``date``
+arg gets it like any other arg: its ``run`` template places it and the extension parses it, in
+whatever forms it accepts. Any other handler refuses ``date``.
 """
 
 from __future__ import annotations
@@ -57,12 +59,13 @@ class ExtensionHandler(ContextHandler):
             due_at = value
         argv = self.command.render(args)
         if "date" in args:
-            day = args["date"]
-            if not self.dated:
+            if self.dated:
+                day = args["date"]
+                if not isinstance(day, str) or parse_day(day) is None:
+                    raise ToolFailed("date must be YYYY-MM-DD")
+                argv = (*argv, "--date", day)
+            elif "date" not in self.spec.args_schema.get("properties", {}):
                 raise ToolFailed("this command takes no date")
-            if not isinstance(day, str) or parse_day(day) is None:
-                raise ToolFailed("date must be YYYY-MM-DD")
-            argv = (*argv, "--date", day)
         undeclared = set(ctx.secrets) - {f"RESONANT_SECRET_{s.upper()}" for s in self.spec.secrets}
         if undeclared:  # the executor passes only declared ones; never widen
             raise ToolFailed("secrets not declared by this tool")
