@@ -82,7 +82,8 @@ OVERFLOW_KEY = "ext.notify.overflow"  # kv: {ext: [hour iso, ...]} with capped e
 FLUSH_EVERY_S = 60.0
 
 # Non-ASCII symbols extensions use for status; everything else outside printable ASCII
-# (zero-width, bidi, look-alike scripts, control characters) becomes a space.
+# (zero-width, bidi, look-alike scripts, control characters) becomes a space, after minus
+# signs are mapped to ``-`` (``_MINUS`` below).
 SYMBOLS = frozenset(
     "\u2713\u2717\u2714\u2718\u26a0"  # check and cross marks, warning
     "\u25cf\u2022\u00b7\u2026\u2013\u2014"  # dots, ellipsis, dashes
@@ -96,7 +97,7 @@ SYMBOLS = frozenset(
 _MINUS = str.maketrans(dict.fromkeys("\u2212\u2010\u2012\u2796\u02d7", "-"))
 _DASH_MINUS = re.compile(r"(?:(?<=[\s(])|^)[\u2013\u2014\u2015](?=[$\d.])")
 _BRACKETS = str.maketrans({"[": "(", "]": ")", "{": "(", "}": ")"})
-_SEP = r"[\s:,;&'\"()?!.-]+"
+_SEP = r"[\s:,;&'\"()?!.\u2013\u2014-]+"  # en/em dashes pass the filter, so they separate too
 _CODE = r"(?<![A-Za-z0-9])[A-Za-z][\s\-_.:/]*[0-9](?![0-9])"
 _CODE_AFTER_REPLY = re.compile(rf"(?i)\b(yes|no|stop)({_SEP}){_CODE}")
 _CODE_BEFORE_REPLY = re.compile(rf"(?i){_CODE}({_SEP})(yes|no|stop)\b")

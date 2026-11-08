@@ -201,6 +201,19 @@ def test_minus_signs_and_dashes_before_numbers_become_ascii_minus(text: str, exp
     assert clean_text(text) == expected
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("yes \u2212A7", "'yes' -?"),
+        ("A\u22127 yes", "? yes"),
+        ("yes\u2014A7", "'yes'\u2014?"),
+        ("A7\u2013no", "?\u2013no"),
+    ],
+)
+def test_a_minus_or_dash_never_unmasks_a_code_next_to_a_reply(text: str, expected: str) -> None:
+    assert clean_text(text) == expected
+
+
 # --- mute --------------------------------------------------------------------------------
 
 
