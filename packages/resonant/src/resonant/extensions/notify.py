@@ -37,10 +37,11 @@ caught by the channel's dedupe record (written with the send). The per-hour coun
 distinct event keys audited ``ext.notify_sent``, so a retried event never counts twice.
 
 Anti-spoofing (:func:`render`). The text is untrusted: one line of printable ASCII plus a
-few status symbols, ``[ ] { }`` become ``( )`` so ``[A7]`` reads ``(A7)``, a code-like token
-next to ``yes``/``no``/``stop`` is masked, every ``reply`` and a leading ``yes``/``no``/
-``stop`` is quoted, and the whole is clipped to ``max_chars``. The code-built prefix comes
-first, so a notification never starts like an approval prompt (``[A7] …? Reply yes / no``).
+few status symbols (a Unicode minus becomes ``-``, so a negative number keeps its sign),
+``[ ] { }`` become ``( )`` so ``[A7]`` reads ``(A7)``, a code-like token next to
+``yes``/``no``/``stop`` is masked, every ``reply`` and a leading ``yes``/``no``/``stop`` is
+quoted, and the whole is clipped to ``max_chars``. The code-built prefix comes first, so a
+notification never starts like an approval prompt (``[A7] …? Reply yes / no``).
 
 Mute (the API ``/ext mute`` calls): :func:`mute` and :func:`unmute` write kv
 ``ext.<name>.muted_until`` and audit ``ext.notify_muted`` / ``ext.notify_unmuted``;
@@ -88,6 +89,12 @@ SYMBOLS = frozenset(
     "\u2192\u2190\u2191\u2193\u25b6"  # arrows
     "\U0001f440\U0001f534\U0001f7e2\U0001f7e1\u23f0\u270b"  # eyes, red/green/yellow, alarm, hand
 )
+# Minus signs and hyphens NFKC leaves non-ASCII: they become ASCII ``-``, not a space, so
+# ``Jev \u2212$575`` keeps its sign. An en/em dash (or horizontal bar) read as a minus where it
+# starts a number (``P&L \u2013$575``, ``(\u20145.2%)``); between digits (``10\u201320``) it stays
+# a dash.
+_MINUS = str.maketrans(dict.fromkeys("\u2212\u2010\u2012\u2796\u02d7", "-"))
+_DASH_MINUS = re.compile(r"(?:(?<=[\s(])|^)[\u2013\u2014\u2015](?=[$\d.])")
 _BRACKETS = str.maketrans({"[": "(", "]": ")", "{": "(", "}": ")"})
 _SEP = r"[\s:,;&'\"()?!.-]+"
 _CODE = r"(?<![A-Za-z0-9])[A-Za-z][\s\-_.:/]*[0-9](?![0-9])"
@@ -119,7 +126,7 @@ def prefix(name: str) -> str:
 
 def clean_text(text: str) -> str:
     """The extension's text made safe to forward (see the module docstring), unclipped."""
-    norm = unicodedata.normalize("NFKC", text)
+    norm = _DASH_MINUS.sub("-", unicodedata.normalize("NFKC", text).translate(_MINUS))
     kept = "".join(ch if 32 <= ord(ch) < 127 or ch in SYMBOLS else " " for ch in norm)
     flat = " ".join(kept.translate(_BRACKETS).split())
     flat = _CODE_AFTER_REPLY.sub(lambda m: f"{m.group(1)}{m.group(2)}?", flat)
