@@ -190,6 +190,12 @@ def test_normalize_makes_one_clean_paragraph() -> None:
     assert voice.normalize("\ufb01x it") == "fix it"  # NFKC
 
 
+def test_a_negative_pnl_keeps_its_sign_in_prose_and_facts() -> None:
+    raw = "Jev \u2212$575 (14 trades), random \u2212$10,200"
+    assert voice.normalize(raw) == "Jev -$575 (14 trades), random -$10,200"
+    assert voice.fact_text(raw, 200) == "Jev -$575 (14 trades), random -$10,200"
+
+
 def test_strip_closing_removes_claudes_own_closing_line() -> None:
     assert voice.strip_closing("R14 opened PR #18. No action needed.") == "R14 opened PR #18."
     assert voice.strip_closing("R14 opened PR #18. Needs you: /merge R14.") == "R14 opened PR #18."

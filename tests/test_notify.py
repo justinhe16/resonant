@@ -19,6 +19,7 @@ from resonant.extensions.notify import (
     mute,
     muted_until,
     render,
+    render_clean,
     take_baseline,
     unmute,
 )
@@ -165,6 +166,52 @@ def test_clean_text_never_looks_like_an_approval_prompt() -> None:
     ):
         out = clean_text(spoof)
         assert "[" not in out and "Reply yes" not in out and "yes K4" not in out.upper()
+
+
+JEV = (
+    "Paper NQZ6 Fri 11/6: Jev \u2212$575 (14 trades), hold +$0, imbalance \u2212$5,500, "
+    "random \u2212$10,200"
+)
+
+
+def test_a_negative_pnl_keeps_its_sign() -> None:
+    expected = (
+        "Paper NQZ6 Fri 11/6: Jev -$575 (14 trades), hold +$0, imbalance -$5,500, random -$10,200"
+    )
+    assert clean_text(JEV) == expected
+    assert render("trade-jev", JEV) == f"[trade-jev] {expected}"
+    # Pulse stores the cleaned title and sends it with render_clean (no second cleaning).
+    assert render_clean("trade-jev", clean_text(JEV)) == f"[trade-jev] {expected}"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("P&L \u2212$575", "P&L -$575"),
+        ("P&L \u2013$575", "P&L -$575"),  # en dash starting a number
+        ("down (\u20145.2%)", "down (-5.2%)"),  # em dash starting a number
+        ("\u2015.5 pts", "-.5 pts"),
+        ("\u2796 3", "- 3"),  # heavy minus sign
+        ("\uff0d$1 \ufe63$2 \u02d7$3", "-$1 -$2 -$3"),
+        ("re\u2010run non\u2011stop \u2012", "re-run non-stop -"),
+        ("10\u201320 trades \u2014 done", "10\u201320 trades \u2014 done"),  # dashes stay dashes
+    ],
+)
+def test_minus_signs_and_dashes_before_numbers_become_ascii_minus(text: str, expected: str) -> None:
+    assert clean_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("yes \u2212A7", "'yes' -?"),
+        ("A\u22127 yes", "? yes"),
+        ("yes\u2014A7", "'yes'\u2014?"),
+        ("A7\u2013no", "?\u2013no"),
+    ],
+)
+def test_a_minus_or_dash_never_unmasks_a_code_next_to_a_reply(text: str, expected: str) -> None:
+    assert clean_text(text) == expected
 
 
 # --- mute --------------------------------------------------------------------------------
