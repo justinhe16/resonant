@@ -76,7 +76,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from resonant.extensions.notify import clean_text
-from resonant.extensions.pulse import render_item
+from resonant.extensions.pulse import render_item, urgent_mark
 from resonant.store import extensions as ext_store
 from resonant.store import pulse as store
 from resonant.store import runs as runs_store
@@ -244,7 +244,7 @@ Entry = tuple[str, tuple[store.Item, ...]]
 def worker_line(item: store.Item) -> str:
     """One run's own line (its title is code-built around cleaned parts): ``🔴`` for a
     failure nobody was texted."""
-    return render_item(item, "\U0001f534" if item.urgency == "urgent" else "", LINE_MAX)
+    return render_item(item, urgent_mark(item) if item.urgency == "urgent" else "", LINE_MAX)
 
 
 def _finished_first(items: Sequence[store.Item]) -> list[store.Item]:

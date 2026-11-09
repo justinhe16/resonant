@@ -77,6 +77,7 @@ class Item:
     told_fingerprint: str | None
     told_at: datetime | None
     acked_at: datetime | None = None
+    tone: str | None = None  # ``good``: an urgent item that is good news (display only)
 
     @property
     def changed(self) -> bool:
@@ -135,6 +136,7 @@ def _row_to_item(r: sqlite3.Row) -> Item:
         told_fingerprint=r["told_fingerprint"],
         told_at=None if told_at is None else datetime.fromisoformat(told_at),
         acked_at=None if acked_at is None else datetime.fromisoformat(acked_at),
+        tone=r["tone"],
     )
 
 
@@ -148,6 +150,7 @@ def upsert(
     clear: bool,
     ttl_s: int,
     now: datetime,
+    tone: str | None = None,
 ) -> tuple[Change, Item]:
     """Record a report; returns the change and the stored item (for :func:`mark_told`).
 
@@ -176,12 +179,12 @@ def upsert(
         told: str | None = None if row is None else row["told_fingerprint"]
         conn.execute(
             "INSERT INTO pulse_items"
-            " (source, key, title, urgency, fingerprint, cleared, updated_at, expires_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " (source, key, title, urgency, fingerprint, cleared, updated_at, expires_at, tone)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT (source, key) DO UPDATE SET title = excluded.title,"
             " urgency = excluded.urgency, fingerprint = excluded.fingerprint,"
             " cleared = excluded.cleared, updated_at = excluded.updated_at,"
-            " expires_at = excluded.expires_at",
+            " expires_at = excluded.expires_at, tone = excluded.tone",
             (
                 source,
                 key,
@@ -191,6 +194,7 @@ def upsert(
                 int(clear),
                 iso(now),
                 iso(now + timedelta(seconds=ttl_s)),
+                tone,
             ),
         )
     item = get(conn, source, key)

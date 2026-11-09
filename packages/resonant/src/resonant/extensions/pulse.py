@@ -18,7 +18,8 @@ For one event, in order:
    (``payload.baseline``, the job's first run after install) is stored as told and never sent:
    audit ``pulse.held`` ``reason=baseline``.
 4. An urgent item the owner hasn't heard (fingerprint != ``told_fingerprint``) is sent now:
-   ``[name] 🔴 <title>`` (``✓`` for ``clear``) to each recipient (the gate's approvers), with
+   ``[name] 🔴 <title>`` (``✓`` for ``clear``; 🟢 for ``tone: good``) to each recipient (the gate's
+   approvers), with
    dedupe key ``pulse:urgent:<event id>:<recipient>``, then ``mark_told`` and audit
    ``pulse.sent``. While paused (unknown counts as paused), muted, or over the per-hour cap
    (shared with the notifier: ``notify.sent_in_hour``) it stays pending, audit ``pulse.held``
@@ -84,6 +85,7 @@ log = logging.getLogger(__name__)
 
 EVENT_TYPE = "item"
 URGENT_MARK = "\U0001f534"  # red circle
+GOOD_MARK = "\U0001f7e2"  # green circle: an urgent item with ``tone: good``
 CLEAR_MARK = "✓"  # check mark
 _RANK: dict[str, int] = {"urgent": 2, "normal": 1, "low": 0}
 _TTL = re.compile(r"^(\d+)([smh])$")
@@ -93,6 +95,11 @@ _TTL_UNIT_S = {"s": 1, "m": 60, "h": 3600}
 def clamp(urgency: items.Urgency, grant: items.Urgency) -> items.Urgency:
     """``urgency``, or ``grant`` when that is lower (urgent > normal > low)."""
     return urgency if _RANK[urgency] <= _RANK[grant] else grant
+
+
+def urgent_mark(item: items.Item) -> str:
+    """The marker of an urgent item: green for ``tone: good`` news, else red."""
+    return GOOD_MARK if item.tone == "good" else URGENT_MARK
 
 
 def render_item(item: items.Item, mark: str = "", max_chars: int = 300) -> str:
@@ -174,7 +181,7 @@ class Pulse:
         if reason is not None:
             self._audit("pulse.held", ext, event, reason=reason, key=item.key)
             return None
-        mark = CLEAR_MARK if item.cleared else URGENT_MARK
+        mark = CLEAR_MARK if item.cleared else urgent_mark(item)
         message = render_item(item, mark, self.config.max_chars)
         sent = 0
         for recipient in self.recipients(ext) or ():
@@ -205,6 +212,7 @@ class Pulse:
         key, urgency = data.get("key"), data.get("urgency", "normal")
         clear = data.get("clear", False)
         quiet = data.get("quiet", False)
+        tone = "good" if data.get("tone") == "good" else None  # anything else: no tone
         if not isinstance(key, str):
             raise ValueError("key must be a string")
         if urgency not in items.URGENCIES:
@@ -234,6 +242,7 @@ class Pulse:
             clear,
             _ttl_s(data.get("ttl")),
             event.occurred_at,
+            tone,
         )
         return item, granted, quiet
 

@@ -79,7 +79,7 @@ from zoneinfo import ZoneInfo
 from resonant import killswitch
 from resonant.executor import CallContext
 from resonant.extensions import notify, rollup
-from resonant.extensions.pulse import render_item
+from resonant.extensions.pulse import render_item, urgent_mark
 from resonant.store import pulse as store
 from resonant.store import system_texts
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
@@ -129,7 +129,11 @@ def manual_dedupe_key(local: datetime) -> str:
 def item_line(item: store.Item, max_chars: int = LINE_MAX) -> str:
     """One item as a line: ``[dori] ✓ Dori recovered``, ``[trader] 🔴 PnL ...``; a core item
     has no ``[name]`` prefix (its title carries its own symbol)."""
-    mark = "✓" if item.cleared and item.source != CORE else "🔴" if item.urgency == "urgent" else ""
+    mark = ""
+    if item.cleared and item.source != CORE:
+        mark = "✓"
+    elif item.urgency == "urgent":
+        mark = urgent_mark(item)
     return render_item(item, mark, max_chars)
 
 
@@ -169,7 +173,7 @@ def is_worker_item(item: store.Item) -> bool:
 def worker_line(item: store.Item, max_chars: int = LINE_MAX) -> str:
     """One worker as a line under ``Workers:`` (its title is code-built around cleaned
     parts): ``🔴`` for one that should have been texted (a failure nobody took)."""
-    return render_item(item, "🔴" if item.urgency == "urgent" else "", max_chars)
+    return render_item(item, urgent_mark(item) if item.urgency == "urgent" else "", max_chars)
 
 
 def order_workers(items: Sequence[store.Item]) -> list[store.Item]:
