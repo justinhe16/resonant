@@ -267,7 +267,7 @@ def test_migration_025_adds_the_columns_and_backfills(tmp_path: Path) -> None:
     _raw_task(conn, "t6", "mystery", {})
     conn.execute("UPDATE tasks SET checkpoint = 'not json' WHERE id = 't6'")
 
-    assert migrate(conn) == 27 == schema_version(conn)
+    assert migrate(conn) == 28 == schema_version(conn)
     got = {r["id"]: (r["title"], r["title_outside"])
            for r in conn.execute("SELECT id, title, title_outside FROM tasks")}  # fmt: skip
     title1 = got["t1"][0]
@@ -299,7 +299,7 @@ def test_backfill_skips_a_row_it_cannot_title(
         return real(c, **kw)  # type: ignore[arg-type]
 
     monkeypatch.setattr(tt, "derive", flaky)
-    assert migrate(conn) == 27  # the migration still commits
+    assert migrate(conn) == 28  # the migration still commits
     got = dict(conn.execute("SELECT id, title FROM tasks").fetchall())
     assert got == {"t1": None, "t2": "Reminder: X"}
     conn.close()
