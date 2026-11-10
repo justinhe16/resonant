@@ -103,13 +103,14 @@ def _stall_fact(conn: sqlite3.Connection, item: store.Item, roll: rollup.Rollup)
         if m is None:
             return None
         rest = _QUIET_PAREN.sub("", m.group(3) or "")
+        waiting = rollup.stall_kind(item, roll) == "ready"
         return Item(
             ref=m.group(1),
-            outcome="pr_stalled",
+            outcome="pr_waiting_merge" if waiting else "pr_stalled",
             pr=int(m.group(2)),
             title=voice.fact_text(rest, voice.TITLE_MAX),
             quiet=quiet.group(0) if quiet else None,
-            needs=f"a look at {m.group(1)}",
+            needs=f"merge {m.group(1)}" if waiting else f"a look at {m.group(1)}",
         )
     run = runs_store.get(conn, code.removeprefix("run-").upper())
     if run is None:

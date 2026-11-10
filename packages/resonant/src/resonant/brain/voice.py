@@ -55,11 +55,12 @@ Outcome = Literal[
     "pr_merged",
     "review_requested",
     "pr_stalled",
+    "pr_waiting_merge",
 ]
 OUTCOMES: tuple[str, ...] = (
     "opened_pr", "upstream_pr", "merged", "merged_onto_base", "no_changes", "finished",
     "local_branch", "couldnt_push", "failed", "running", "stalled", "waiting_merge", "queued",
-    "pr_merged", "review_requested", "pr_stalled",
+    "pr_merged", "review_requested", "pr_stalled", "pr_waiting_merge",
 )  # fmt: skip
 
 # The code-built section headers: a voiced text has none of them (the guard's format rule).
@@ -99,6 +100,7 @@ OUTCOME_VERBS: dict[Outcome, frozenset[str]] = {
     "queued": frozenset(),
     "review_requested": frozenset(),
     "pr_stalled": frozenset(),
+    "pr_waiting_merge": frozenset(),
 }
 # Resonant's run tools: a reply that is the text of a call to one is never sent.
 CALL_TOOLS = (

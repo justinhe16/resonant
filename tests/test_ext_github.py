@@ -469,7 +469,8 @@ def test_watch_reports_pr_activity_once_per_moment_it_moved(gh: FakeGh) -> None:
     assert active[0]["data"] == {
         "repo": RESONANT, "number": 40, "title": "A change",
         "url": f"https://github.com/{RESONANT}/pull/40",
-        "active_at": "2026-10-14T01:05:00Z", "draft": False,
+        "active_at": "2026-10-14T01:05:00Z", "draft": False, "ci": "passing",
+        "review": "review_required",
     }  # fmt: skip
     assert active[0]["text"] == "resonant#40 A change"
     assert gh.run("prs").out["prs"][0]["active_at"] == "2026-10-14T01:05:00Z"

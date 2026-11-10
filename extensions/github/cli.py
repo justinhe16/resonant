@@ -522,12 +522,14 @@ def pr_data(pr: dict[str, Any]) -> dict[str, Any]:
 def active_events(mine: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """``pr_active`` for each open PR of the owner's, once per moment it last moved (the key
     holds ``active_at``): Resonant's hourly rollup reads them for ``Still working on`` and
-    to flag one that has gone quiet. Never texted by default."""
+    to flag one that has gone quiet (``ci`` and ``review`` tell it whether the quiet is waiting
+    on the owner's merge). Never texted by default."""
     out: list[dict[str, Any]] = []
     for pr in mine:
         if not pr["active_at"]:
             continue
-        data = {**pr_data(pr), "active_at": pr["active_at"], "draft": pr["draft"]}
+        data = {**pr_data(pr), "active_at": pr["active_at"], "draft": pr["draft"],
+                "ci": pr["ci"], "review": pr["review"]}  # fmt: skip
         key = f"{pr['repo']}#{pr['number']}:active:{pr['active_at']}"
         out.append(event("pr_active", f"{ref(pr)} {pr['title']}", key, data))
     return out
