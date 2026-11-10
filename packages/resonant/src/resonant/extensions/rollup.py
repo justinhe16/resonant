@@ -29,8 +29,12 @@ the pulse's exactly-once delivery cover it):
   How it reads depends on what the quiet means (PER-266): a ``ready`` run's PR waits on the
   owner (``Waiting on you to merge: …``), a queued run whose task waits on ``resource``
   (every worker slot busy, PER-259) is ``Queued behind other runs: …``, and anything else
-  ``Looks like … got dropped``. The key and state are the same for all three, so the
-  wording never makes an old stall news again.
+  ``Looks like … got dropped``. The same goes for an open PR of the owner's that is not a
+  run's: its ``pr_active`` says its ``ci``, and a quiet one whose CI passes (or that has no
+  checks at all) and has no changes requested is finished, waiting on the owner's merge
+  (``Waiting on you to merge``), not dropped; failing or pending CI, or an event without
+  ``ci``, stays ``dropped``. The key and state are the same for all of them, so the wording
+  never makes an old stall news again.
 
 **Context** (listed when there is news, never a reason to send): ``Still working on``, the
 runs going (their items, which are told as they are written) and the open PRs with activity
@@ -96,6 +100,7 @@ PR_EVENTS = ("pr_active", "pr_merged", "pr_closed", "review_requested")
 NEWS_WINDOW = timedelta(hours=48)  # a merge or review request older than this isn't news
 PR_WINDOW = timedelta(days=7)  # the github events read; a PR quiet longer drops out
 OLD_MERGE = timedelta(days=3)  # an untold merged/ item older than this is dropped, not said
+READY_CI = ("passing", "none")  # a PR's ``ci`` when only the owner's merge is left
 READY_WINDOW = timedelta(days=7)  # a ready run's PR older than this is no longer watched
 STALL_AFTER = timedelta(hours=4)  # the default of ``pulse.stall_after``
 WATCH_FRESH = timedelta(minutes=30)  # three missed 10-minute watches: PR data is stale
@@ -123,13 +128,15 @@ class Rollup:
     ``R4 add dark mode``), ``working`` (open PRs with recent activity, named),
     ``stalled`` (run codes with an open stall item, left out of ``Still working on``), and
     the stalled runs whose quiet is the owner's merge (``ready``) or the slot limit
-    (``queued``)."""
+    (``queued``), and ``ready_prs`` (stall item keys of the owner's own PRs whose quiet is
+    their merge: CI passing or none, see :attr:`Pr.waiting_on_owner`)."""
 
     labels: Mapping[str, str] = field(default_factory=dict[str, str])
     working: tuple[str, ...] = ()
     stalled: frozenset[str] = frozenset()
     ready: frozenset[str] = frozenset()
     queued: frozenset[str] = frozenset()
+    ready_prs: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -147,6 +154,20 @@ class Pr:
     ended_at: datetime | None = None  # when it was merged or closed
     seen_at: datetime | None = None  # when the event that left it so was stored
     draft: bool = False
+    ci: str | None = None  # passing | failing | pending | none; None from an older event
+    review: str | None = None  # GitHub's review decision, lowercase
+
+    @property
+    def waiting_on_owner(self) -> bool:
+        """Open, not a draft, CI passing (or no checks at all) and no changes requested: what
+        is left is the owner's merge, so its quiet is not a drop. An event without ``ci``
+        (an older watch) says nothing, so it is never ready."""
+        return (
+            self.state == "open"
+            and not self.draft
+            and self.ci in READY_CI
+            and self.review != "changes_requested"
+        )
 
     @property
     def ref(self) -> str:
@@ -333,7 +354,7 @@ def stall_kind(item: store.Item, r: Rollup) -> str:
     """What a stall's quiet means: ``ready`` (a PR waiting on the owner's merge), ``queued``
     (behind the slot limit) or ``dropped``."""
     code = _stall_code(item)
-    if code in r.ready:
+    if code in r.ready or item.key in r.ready_prs:
         return "ready"
     return "queued" if code in r.queued else "dropped"
 
@@ -477,7 +498,14 @@ def github_prs(
             active = _when(d.get("active_at"))
             if before is not None and before.state != "open" and not _reopened(before, active):
                 continue  # merged or closed is final unless it moved after (a reopen)
-            prs[key] = replace(base, active_at=active, draft=d.get("draft") is True)
+            ci, review = d.get("ci"), d.get("review")
+            prs[key] = replace(
+                base,
+                active_at=active,
+                draft=d.get("draft") is True,
+                ci=ci if isinstance(ci, str) else None,
+                review=review if isinstance(review, str) else None,
+            )
         elif kind == "pr_merged":
             merged_at = _when(d.get("merged_at")) or _when(occurred)
             prs[key] = replace(base, state="merged", merged_at=merged_at, ended_at=merged_at)
@@ -566,23 +594,32 @@ def gather(
         elif behind_slots(conn, run):
             queued.add(code)
     working: list[str] = []
-    if github_installed(conn) is not None and watch_fresh(conn, now):
+    ready_prs: set[str] = set()
+    if github_installed(conn) is not None:
         prs, _reviews = github_prs(conn, now)
         ours = _run_pr_urls(runs_store.recent(conn, 200))
-        working = [
-            p.name
+        fresh = watch_fresh(conn, now)
+        ready_prs = {
+            stall_key("pr:", f"{p.repo}:{p.number}")
             for p in prs
-            if p.state == "open"
-            and p.url not in ours
-            and p.active_at is not None
-            and now - p.active_at < stall_after
-        ]
+            if p.url not in ours and p.waiting_on_owner
+        }
+        if fresh:
+            working = [
+                p.name
+                for p in prs
+                if p.state == "open"
+                and p.url not in ours
+                and p.active_at is not None
+                and now - p.active_at < stall_after
+            ]
     return Rollup(
         labels=labels,
         working=tuple(working),
         stalled=stalled,
         ready=frozenset(ready),
         queued=frozenset(queued),
+        ready_prs=frozenset(ready_prs),
     )
 
 

@@ -52,7 +52,7 @@ It keeps no state. Each run reads the current open PRs and their branch's workfl
 - You're a requested reviewer: `review_requested`, key `<repo>#<n>:<head sha>:review`, data `{repo, number, title, url}`.
 
 And for the rollup:
-- Each open PR of yours: `pr_active`, key `<repo>#<n>:active:<active_at>`, data `{repo, number, title, url, active_at, draft}`. `active_at` is when it last moved: its `updatedAt` (commits, comments, reviews) or its latest check start, finish or status, whichever is later. A new commit or a finished check makes a new key.
+- Each open PR of yours: `pr_active`, key `<repo>#<n>:active:<active_at>`, data `{repo, number, title, url, active_at, draft, ci, review}` (`ci`: `passing`, `failing`, `pending` or `none` when it has no checks; `review`: GitHub's review decision, lowercase, or null). The rollup reads `ci` to tell a finished PR waiting for your merge from one that was dropped. `active_at` is when it last moved: its `updatedAt` (commits, comments, reviews) or its latest check start, finish or status, whichever is later. A new commit or a finished check makes a new key.
 - Your PRs closed in the last two days (one more search, at most 20): `pr_merged`, key `<repo>#<n>:merged` (data adds `merged_at`), or `pr_closed`, key `<repo>#<n>:closed:<closed at>`.
 
 Cancelled, skipped and in-progress runs are ignored. A re-run keeps its run id, so a failed run that passes on re-run sends no `fixed`. The same state always produces the same keys, so Resonant's events table (unique per key) drops repeats, and the first run after install is a silent baseline. Events go to fd 3 when Resonant provides it, otherwise into the result's `events` list.

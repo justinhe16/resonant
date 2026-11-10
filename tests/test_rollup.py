@@ -386,6 +386,44 @@ def test_github_merges_work_and_stalls_join_the_rollup(db: sqlite3.Connection) -
     assert ru.gather(db, now + 3 * H, []).working == ()
 
 
+def test_a_quiet_pr_with_passing_or_no_ci_waits_on_the_owner_not_dropped(
+    db: sqlite3.Connection,
+) -> None:
+    now = utcnow().replace(microsecond=0) + H
+    install_github(db, now - 30 * 24 * H)
+    fresh(db, now - timedelta(minutes=5))
+    old = iso(now - 6 * H)
+    watch(
+        db,
+        ("pr_active", "a1", pr(1, "green", active_at=old, ci="passing", review="approved")),
+        ("pr_active", "a2", pr(2, "bare repo", active_at=old, ci="none")),
+        ("pr_active", "a3", pr(3, "red", active_at=old, ci="failing")),
+        ("pr_active", "a4", pr(4, "running", active_at=old, ci="pending")),
+        ("pr_active", "a5", pr(5, "old event", active_at=old)),  # no ci: as before
+        (
+            "pr_active",
+            "a6",
+            pr(6, "fixme", active_at=old, ci="passing", review="changes_requested"),
+        ),
+        ("pr_active", "a7", pr(7, "parked", active_at=old, ci="passing", draft=True)),
+    )
+    ru.refresh(db, now)
+    items = ps.pending(db, ("urgent", "normal"), now)
+    assert sorted(i.key.removeprefix("stall/pr:own/dori:") for i in items) == [
+        "1", "2", "3", "4", "5", "6"
+    ]  # fmt: skip
+    roll = ru.gather(db, now, items)
+    assert roll.ready_prs == {"stall/pr:own/dori:1", "stall/pr:own/dori:2"}
+    kinds = {i.key[-1]: ru.stall_kind(i, roll) for i in items}
+    assert kinds == {"1": "ready", "2": "ready", "3": "dropped", "4": "dropped",
+                     "5": "dropped", "6": "dropped"}  # fmt: skip
+    assert lines(items, [], roll) == [
+        "Looks like dori#3 red (~6h quiet), dori#4 running (~6h quiet), dori#5 old event"
+        " (~6h quiet), dori#6 fixme (~6h quiet) got dropped. You should take a look.",
+        "Waiting on you to merge: dori#1 green (~6h quiet), dori#2 bare repo (~6h quiet)",
+    ]
+
+
 def test_github_state_from_before_the_install_is_never_announced(
     db: sqlite3.Connection,
 ) -> None:
