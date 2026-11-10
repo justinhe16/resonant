@@ -100,12 +100,15 @@ def report(
     ttl: str = "24h",
     baseline: bool = False,
     quiet: bool | None = None,
+    tone: object = None,
     seq: list[int] = [0],  # noqa: B006 - unique dedupe keys across calls
 ) -> None:
     seq[0] += 1
     data = {"key": key, "urgency": urgency, "state": state, "clear": clear, "ttl": ttl}
     if quiet is not None:  # None: an extension older than BF-1 (no field)
         data["quiet"] = quiet
+    if tone is not None:
+        data["tone"] = tone
     with transaction(db):
         persist_events(
             db,
@@ -560,3 +563,34 @@ async def test_without_the_quiet_field_a_report_is_as_before(db: sqlite3.Connect
     await make_loop(db, make_pulse(db, ch)).run_once()
     assert ch.sent == [] and audit_rows(db, "pulse.held") == []
     assert {i.key for i in items.pending(db, ("normal",), T0)} == {"dori/n", "dori/m"}
+
+
+# --- tone ----------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("urgency", "tone", "text"),
+    [
+        ("urgent", "good", "[dori] \U0001f7e2 Dori won"),
+        ("urgent", None, "[dori] \U0001f534 Dori won"),
+        ("urgent", "great", "[dori] \U0001f534 Dori won"),
+        ("urgent", 5, "[dori] \U0001f534 Dori won"),
+    ],
+)
+async def test_good_tone_turns_the_urgent_mark_green(
+    db: sqlite3.Connection, urgency: str, tone: object, text: str
+) -> None:
+    ch = DedupeChannel()
+    pulse = make_pulse(db, ch)
+    report(db, title="Dori won", urgency=urgency, tone=tone)
+    await make_loop(db, pulse, ch).run_once()
+    assert ch.texts == [text]
+
+
+async def test_good_tone_on_a_normal_item_is_not_texted(db: sqlite3.Connection) -> None:
+    ch = DedupeChannel()
+    pulse = make_pulse(db, ch)
+    report(db, title="Dori won", urgency="normal", tone="good")
+    await make_loop(db, pulse, ch).run_once()
+    assert ch.texts == []
+    assert item(db).tone == "good" and item(db).urgency == "normal"

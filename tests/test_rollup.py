@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,19 @@ def item(
     fp = f"fp-{key}"
     return ps.Item("core", key, title, urgency, fp, cleared, at,  # type: ignore[arg-type]
                    at + timedelta(days=1), fp if told else None, None)  # fmt: skip
+
+
+def toned(key: str, title: str, urgency: str, tone: str | None) -> ps.Item:
+    return replace(item(key, title, cleared=True, urgency=urgency), tone=tone)
+
+
+def test_good_tone_turns_an_urgent_workers_mark_green() -> None:
+    assert lines([toned("run/r1", "R1 done", "urgent", "good")]) == ["\U0001f7e2 R1 done"]
+    assert lines([toned("run/r1", "R1 done", "urgent", "bad")]) == ["\U0001f534 R1 done"]
+    assert lines([toned("run/r1", "R1 done", "normal", "good")]) == ["R1 done"]
+    ext = replace(toned("k", "Won", "urgent", "good"), source="trader", cleared=False)
+    assert pulse_job.item_line(ext) == "[trader] \U0001f7e2 Won"
+    assert pulse_job.worker_line(ext) == "[trader] \U0001f7e2 Won"
 
 
 def lines(news: list[ps.Item], context: list[ps.Item] = (), roll: Any = None) -> list[str]:  # type: ignore[assignment]

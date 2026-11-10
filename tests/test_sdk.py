@@ -538,6 +538,17 @@ def test_report_validates_locally(
         report(**args)
 
 
+def test_report_carries_tone_only_when_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    from resonant_sdk.emit import report
+
+    def go() -> None:
+        assert report("a", "b", urgency="urgent", tone="good")
+        assert report("a", "b", urgency="urgent")
+
+    toned, plain = _captured_events(monkeypatch, go)
+    assert toned["data"]["tone"] == "good" and "tone" not in plain["data"]
+
+
 def test_emit_module_imports_only_the_stdlib() -> None:
     import ast
 
