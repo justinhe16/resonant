@@ -197,6 +197,7 @@ from resonant.runners.worker_desk import (
     BLOCK_S,
     CHECK_OK,
     RESTARTED,
+    GatedTools,
     OpenQuestion,
     Relayed,
     RelayRefused,
@@ -969,6 +970,7 @@ class ClaudeRunner:
         bridge: OwnerBridge | None = None,
         resonant_home: Path | None = None,
         instance: str = inst.DEFAULT_INSTANCE,
+        requests: GatedTools | None = None,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -1089,6 +1091,7 @@ class ClaudeRunner:
             owner=owner,
             on_restart=self._on_self_restart,
             on_self_op=self._on_self_op,
+            requests=requests,  # PER-296: `resonant request`
         )
         self.voice = voice
         self.owner = owner
@@ -2190,7 +2193,8 @@ class ClaudeRunner:
         # the worker CLI: written now, before any session can touch bin/
         if params.ctl_dir is not None:
             ctl = worker_cli.make_ctl_dir(self.cfg.work_dir, params.run_dir.name)
-            worker_cli.write_shim(params.run_dir / "bin", ctl, self.ask_block_s)
+            worker_cli.write_shim(params.run_dir / "bin", ctl, self.ask_block_s,
+                                  requestable=self.desk.requestable())  # fmt: skip
 
     def _prepared(self, run: Run) -> Prepared:
         run_dir = self.cfg.work_dir / run.code

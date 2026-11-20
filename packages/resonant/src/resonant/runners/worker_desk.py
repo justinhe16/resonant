@@ -19,6 +19,18 @@ checks and owner messages for running Claude workers.
   the owner's approval) outlives the CLI's wait and the turn; a decision that comes later
   wakes the run and is delivered on resume.
 
+- ``request`` (PER-296): ``resonant request <ext>.<tool> [--arg k=v …] [--reason …]``, an
+  extension tool the instance marks ``worker_requestable``, called through the gate as the
+  run's requester (``runners.worker_requests``): the approval is asked in the run's thread
+  and the tool runs on an approver's yes. A tool that isn't requestable, or args that don't
+  fit its schema, are a usage error (exit 2); at most ``MAX_OPEN_REQUESTS`` wait per run
+  (the next is ``EXIT_BUSY``: nothing asked). Waited for like a check (a repeat while it is
+  open joins it): the result (``Approved by Brian: …``, ``Denied by Justin: …``) is the
+  CLI's reply, exit 0 when the tool ran, else 1; or, after the CLI gave up (exit 3), the
+  resume prompt's ``Your request (…): …``. ``runner.ask_timeout`` and a restart close it
+  like a check (its approval expires: ask again if you still need it). A call that ran goes
+  on the run's side-effect list (``ran dori.prod_deploy commit=abc (approved by Brian)``).
+
 - ``restart``/``update`` (GD-1): Resonant itself, through the same ``Ops`` as ``/restart
   resonant`` and ``/update`` (``SelfOps``). Allowed without asking when the run's requester is
   the owner and the ask mentions it (``asked_for``: restart, redeploy, deploy, …; for update
@@ -50,14 +62,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import logging
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from resonant.gate.actions import args_target as action_target
 from resonant.gate.codes import clean_external
 from resonant.gateway.channel import Channel, ChannelError
 from resonant.redact import Redactor
@@ -78,7 +92,9 @@ from resonant.runners.worker_cli import (
     Reply,
     Request,
     SelfOp,
+    ToolRequest,
 )
+from resonant.store import approvals as ap
 from resonant.store import jobs as jobs_store
 from resonant.store import pulse as pulse_store
 from resonant.store import questions as qs
@@ -89,6 +105,10 @@ from resonant.store.runs import Run
 from resonant.store.trust import ANY, slug
 from resonant.trust.checks import CHECK_TOOL, MAX_PENDING
 from resonant.worker_text import owner_question_text
+
+if TYPE_CHECKING:
+    from resonant.runners.worker_requests import Fulfilled
+    from resonant_sdk import ToolSpec
 
 log = logging.getLogger(__name__)
 
@@ -137,7 +157,24 @@ _DEPLOY_WORDS = re.compile(
 )
 _UPDATE_WORDS = re.compile(r"\bupdate" + _TARGET + r"|(?<!\w)/update\b", re.I)
 
-EventKind = Literal["question", "note", "check"]
+MAX_OPEN_REQUESTS = 3  # per run: more is approval spam
+REQUEST_TIMEOUT = "No decision from an approver in time; the tool didn't run."
+REQUEST_RESTARTED = (
+    "Resonant restarted before an approver decided, so the tool didn't run; run `resonant "
+    "request` again if you still need it."
+)
+REQUESTS_BUSY = (
+    f"Too many open requests (at most {MAX_OPEN_REQUESTS} per run); wait for their results, "
+    "then run this one again. This is not a no."
+)
+NO_REQUESTS = "Not requestable: no tools can be requested here."
+REQUEST_FAILED = "Not done: Resonant hit an error, so the tool didn't run."
+MAY_HAVE_RUN = (
+    "An approver approved it, but Resonant lost track of the run ({why}): it may have run. "
+    "Check before asking again."
+)
+
+EventKind = Literal["question", "note", "check", "request"]
 NO_TRUST = "denied: checks aren't set up here, so don't do it."
 JOB_NOTE_NO_JOB = "This run isn't a registered job's, so there is nothing to save to."
 
@@ -154,6 +191,28 @@ class TrustChecker(Protocol):
         cost_usd: float = 0.0,
         what: str = "",
     ) -> Literal["ok", "denied", "busy", "handled"]: ...
+
+
+class GatedTools(Protocol):
+    """``runners.worker_requests.WorkerRequests`` (PER-296), as the desk uses it."""
+
+    def requestable(self) -> list[ToolSpec]: ...
+
+    def find(self, extension: str, tool: str) -> ToolSpec | None: ...
+
+    def fit_args(self, spec: ToolSpec, pairs: Any) -> dict[str, Any]: ...
+
+    async def fulfil(
+        self,
+        run: Run,
+        qid: int,
+        spec: ToolSpec,
+        args: dict[str, Any],
+        reason: str = "",
+        *,
+        on_approval: Callable[[str], None] = ...,
+        on_ran: Callable[[str], None] = ...,
+    ) -> Fulfilled: ...
 
 
 class SelfOps(Protocol):
@@ -269,13 +328,15 @@ class WorkerDesk:
         owner: str | None = None,
         on_restart: Callable[[str], None] = lambda _code: None,
         on_self_op: Callable[[str, str, str], Awaitable[None]] | None = None,
+        requests: GatedTools | None = None,
     ) -> None:
         """``wake(run, key)`` tells the run's task something arrived (a no-op unless it is
         waiting). ``redactor_for(code)`` knows the run's secrets; ``on_note(code)`` refreshes
         its pulse item. ``self_ops`` restarts or updates Resonant (None: refused), ``owner``
         is the principal whose ask can include that, ``on_restart(code)`` runs just
         before a restart this run asked for, and ``on_self_op(code, op, what)`` reports one
-        that went through (``what``: ``restarted Resonant (abc1234)``)."""
+        that went through (``what``: ``restarted Resonant (abc1234)``). ``requests`` calls
+        a worker's gated tools (PER-296; None: nothing is requestable)."""
         self.conn = conn
         self.channel = channel
         self.trust = trust
@@ -294,6 +355,9 @@ class WorkerDesk:
         self._waiters: dict[int, asyncio.Event] = {}  # question id -> set when it leaves open
         # (run, system, action, irreversible, cost, what) -> (question id, the decision task)
         self._checks: dict[tuple[Any, ...], tuple[int, asyncio.Task[None]]] = {}
+        self.requests = requests
+        # (run, extension, tool, args) -> (question id, the request's task: its result)
+        self._requests: dict[tuple[Any, ...], tuple[int, asyncio.Task[Fulfilled | None]]] = {}
 
     # -- the CLI ---------------------------------------------------------------------------
 
@@ -311,6 +375,8 @@ class WorkerDesk:
                 return await self._check(run, req, gone)
             case SelfOp():
                 return await self._self_op(run, req, gone)
+            case ToolRequest():
+                return await self._request(run, req, gone)
             case JobNote():
                 return self._job_note(run, req)
 
@@ -567,6 +633,107 @@ class WorkerDesk:
         rc = EXIT_OK if ok else EXIT_BUSY if busy else EXIT_DENIED
         return self._reply(run.code, _check_line(q, short=True), rc, qid=qid)
 
+    def requestable(self) -> list[tuple[str, str]]:
+        """``(<ext>.<tool>, description)`` of every requestable tool (the shim's ``--help``)."""
+        if self.requests is None:
+            return []
+        return [(f"{s.extension}.{s.name}", s.description) for s in self.requests.requestable()]
+
+    def _not_requestable(self, name: str) -> Reply:
+        names = [n for n, _d in self.requestable()]
+        if not names:
+            return Reply(NO_REQUESTS, EXIT_USAGE)
+        return Reply(
+            f"Not requestable: {name}. You may request: {', '.join(names)} "
+            "(`resonant request --help`).",
+            EXIT_USAGE,
+        )
+
+    async def _request(
+        self, run: Run, req: ToolRequest, gone: asyncio.Future[None]
+    ) -> Reply | None:
+        """``resonant request`` (module docstring): refused before anything is asked, or a
+        request row with the gate call in the background, waited for like a check."""
+        if self.requests is None:
+            return Reply(NO_REQUESTS, EXIT_USAGE)
+        spec = self.requests.find(req.extension, req.tool)
+        if spec is None:
+            return self._not_requestable(req.name)
+        try:
+            args = self.requests.fit_args(spec, req.args)
+        except ValueError as e:
+            return Reply(f"Usage error: {e}.", EXIT_USAGE)
+        target = action_target(args)
+        key = (run.code, req.extension, req.tool, json.dumps(args, sort_keys=True))
+        entry = self._requests.get(key)
+        if entry is None:
+            if len(qs.open_for_run(self.conn, run.code, "request")) >= MAX_OPEN_REQUESTS:
+                return self._reply(run.code, REQUESTS_BUSY, EXIT_BUSY)  # nothing was asked
+            text = f"{req.name} {target}"
+            q = qs.ask(self.conn, run.code, "request", text, at=self.clock())
+            with atomic(self.conn):
+                audit(self.conn, "run.request", run=run.code, question_id=q.id,
+                      extension=req.extension, tool=req.tool)  # fmt: skip
+            await self.events.emit(WorkerEvent("request", run.code, text, False, q.asked_at, q.id))
+            task = asyncio.ensure_future(self._fulfil(q.id, run, spec, args, req.reason))
+            entry = (q.id, task)
+            self._requests[key] = entry
+            task.add_done_callback(lambda _t, k=key: self._requests.pop(k, None))
+        qid, task = entry
+        decided = asyncio.ensure_future(asyncio.shield(task))
+        try:
+            await asyncio.wait({decided, gone}, timeout=self.block_s,
+                               return_when=asyncio.FIRST_COMPLETED)  # fmt: skip
+        finally:
+            decided.cancel()
+        q = qs.get(self.conn, qid)
+        assert q is not None
+        if q.status == "open":
+            qs.defer(self.conn, qid)
+            q = qs.get(self.conn, qid)
+            assert q is not None
+        if q.status == "open":
+            return None if gone.done() else self._reply(run.code, NO_ANSWER_YET, EXIT_PENDING)
+        if q.status == "cancelled":
+            return Reply(RUN_OVER, EXIT_UNREACHABLE)
+        if gone.done():
+            return None
+        done = task.result() if task.done() and not task.cancelled() else None
+        ok = q.status == "answered" and done is not None and done.ok
+        return self._reply(run.code, q.answer or REQUEST_TIMEOUT, EXIT_OK if ok else EXIT_DENIED,
+                           qid=qid)  # fmt: skip
+
+    async def _fulfil(
+        self, qid: int, run: Run, spec: ToolSpec, args: dict[str, Any], reason: str
+    ) -> Fulfilled | None:
+        """The gate call for one request; its result recorded (and the run woken) when it
+        comes. None when it failed unexpectedly (the worker is told it didn't run)."""
+        assert self.requests is not None
+        code = run.code
+
+        def approval(approval_id: str) -> None:
+            qs.set_approval(self.conn, qid, approval_id)
+
+        def ran(did: str) -> None:
+            record_did(self.conn, code, did)
+
+        try:
+            done: Fulfilled | None = await self.requests.fulfil(
+                run, qid, spec, args, reason, on_approval=approval, on_ran=ran
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("worker request failed", extra={"run": code})
+            done = None
+        text = REQUEST_FAILED if done is None else done.text
+        with atomic(self.conn):
+            audit(self.conn, "run.request_done", run=code, question_id=qid,
+                  ok=done is not None and done.ok)  # fmt: skip
+        if qs.answer(self.conn, qid, text, at=self.clock()):
+            self._notify(code, qid)
+        return done
+
     @staticmethod
     def _check_text(system: str, action: str, req: Check, *, daemon: bool = False) -> str:
         # A daemon-made check reads "<action> on <system> (asked by Resonant): …". A worker's
@@ -771,8 +938,10 @@ class WorkerDesk:
         for q in qs.open_for_run(self.conn, code):
             if q.asked_at + self.ask_timeout > now:
                 continue
-            if qs.time_out(self.conn, q.id, ASK_TIMEOUT if q.kind == "ask" else CHECK_TIMEOUT,
-                           at=now):  # fmt: skip
+            if q.kind == "request" and self._approved(q) and self._in_flight(q.id):
+                continue  # approved and running now: its result lands, not a timeout
+            text = {"ask": ASK_TIMEOUT, "request": REQUEST_TIMEOUT}.get(q.kind, CHECK_TIMEOUT)
+            if qs.time_out(self.conn, q.id, text, at=now):
                 with atomic(self.conn):
                     audit(self.conn, "run.ask_timeout", run=code, question_id=q.id)
                 if q.kind == "ask":
@@ -792,7 +961,7 @@ class WorkerDesk:
         qs.cancel_open(self.conn, code)
         for q in open_asks:
             self._pulse_question_done(code, q.id)
-        for key, (qid, task) in list(self._checks.items()):
+        for key, (qid, task) in [*self._checks.items(), *self._requests.items()]:
             if key[0] == code:
                 task.cancel()
                 if (ev := self._waiters.pop(qid, None)) is not None:
@@ -818,15 +987,34 @@ class WorkerDesk:
                     " AND tool = ? AND status = 'pending'",
                     (now.isoformat(), run.task_id, CHECK_TOOL),
                 )
+        # PER-296: a request's gate call was in this process too: closed, its approval expired
+        from resonant.runners.worker_requests import close_stale_tasks
+
+        close_stale_tasks(self.conn)
+        for q in qs.open_requests(self.conn):
+            lost = MAY_HAVE_RUN.format(why="Resonant restarted")
+            qs.time_out(self.conn, q.id, lost if self._approved(q) else REQUEST_RESTARTED, at=now)
+            if q.approval_id is not None:
+                with atomic(self.conn):
+                    ap.expire_one(self.conn, q.approval_id, now, reason="restarted")
 
     async def aclose(self) -> None:
-        tasks = [t for _qid, t in self._checks.values()]
+        tasks: list[asyncio.Task[Any]] = [t for _qid, t in self._checks.values()]
+        tasks += [t for _qid, t in self._requests.values()]
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _approved(self, q: qs.Question) -> bool:
+        """A request whose approval was given (its tool may be running, or may have run)."""
+        a = ap.get_approval(self.conn, q.approval_id) if q.approval_id else None
+        return a is not None and a.status == "approved"
+
+    def _in_flight(self, qid: int) -> bool:
+        return any(q == qid and not t.done() for q, t in self._requests.values())
+
     def _stop_check(self, qid: int) -> None:
-        for _key, (q, task) in list(self._checks.items()):
+        for _key, (q, task) in [*self._checks.items(), *self._requests.items()]:
             if q == qid:
                 task.cancel()
 
@@ -894,6 +1082,8 @@ def _delivery_line(q: qs.Question) -> str:
     """An answer the session gets after the CLI call that asked has returned."""
     if q.kind == "check":
         return _check_line(q)
+    if q.kind == "request":
+        return f"Your request ({clip(q.question, 200)}): {q.answer or REQUEST_TIMEOUT}"
     if q.status == "timed_out":
         return f"Your question {_quote(q.question)}: {q.answer or ASK_TIMEOUT}"
     return f"The owner answered your question {_quote(q.question)}: {q.answer}"

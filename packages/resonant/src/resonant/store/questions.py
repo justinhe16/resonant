@@ -1,10 +1,12 @@
 """Worker questions and owner messages (migration 011, docs/employee-plan.md D3, EM-3).
 
-A question is one ``resonant ask`` (kind ``ask``) or a ``resonant check`` that is waiting for
-the owner (kind ``check``). An owner message is text for a running worker
-(``ClaudeRunner.deliver_message``). Plain functions over a connection; every state change is
-one conditional UPDATE, so of two racing paths (the CLI giving up and an answer arriving, a
-CLI reply and a resume prompt) exactly one wins.
+A question is one ``resonant ask`` (kind ``ask``), a ``resonant check`` that is waiting for
+the owner (kind ``check``) or a ``resonant request`` waiting for an approver and the tool's
+run (kind ``request``, migration 033; ``approval_id`` is the gate approval it asked for).
+An owner message is text for a running worker (``ClaudeRunner.deliver_message``). Plain
+functions over a connection; every state change is one conditional UPDATE, so of two racing
+paths (the CLI giving up and an answer arriving, a CLI reply and a resume prompt) exactly one
+wins.
 
 Question states: ``open`` -> ``answered`` | ``timed_out`` | ``cancelled``. ``deferred`` marks
 an open question the CLI stopped waiting for: the run waits for it when its turn ends.
@@ -22,7 +24,7 @@ from typing import Literal, cast
 
 from resonant.store.db import atomic, iso, now_iso
 
-Kind = Literal["ask", "check"]
+Kind = Literal["ask", "check", "request"]
 QStatus = Literal["open", "answered", "timed_out", "cancelled"]
 
 
@@ -40,6 +42,7 @@ class Question:
     asked_at: datetime
     answered_at: datetime | None
     delivered_at: datetime | None
+    approval_id: str | None = None  # a request's gate approval (migration 033)
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,7 @@ def _question(r: sqlite3.Row) -> Question:
         asked_at=asked,
         answered_at=_dt(r["answered_at"]),
         delivered_at=_dt(r["delivered_at"]),
+        approval_id=r["approval_id"],
     )
 
 
@@ -101,6 +105,28 @@ def ask(
     q = get(conn, int(cur.lastrowid or 0))
     assert q is not None
     return q
+
+
+def set_approval(conn: sqlite3.Connection, qid: int, approval_id: str) -> None:
+    """The gate approval a request asked for (so a restart can expire it)."""
+    conn.execute("UPDATE run_questions SET approval_id = ? WHERE id = ?", (approval_id, qid))
+
+
+def open_requests(conn: sqlite3.Connection) -> list[Question]:
+    """Every open ``request``, oldest first (daemon start closes them)."""
+    rows = conn.execute(
+        "SELECT * FROM run_questions WHERE status = 'open' AND kind = 'request' ORDER BY id"
+    ).fetchall()
+    return [_question(r) for r in rows]
+
+
+def by_approval(conn: sqlite3.Connection, approval_id: str) -> Question | None:
+    """The request that asked for ``approval_id``, if a worker's request did."""
+    r = conn.execute(
+        "SELECT * FROM run_questions WHERE approval_id = ? ORDER BY id DESC LIMIT 1",
+        (approval_id,),
+    ).fetchone()
+    return None if r is None else _question(r)
 
 
 def get(conn: sqlite3.Connection, qid: int) -> Question | None:

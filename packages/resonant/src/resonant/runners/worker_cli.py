@@ -20,17 +20,20 @@ any other process.
 
 The protocol is one JSON line each way. Request: ``{"token", "cmd", ...}`` with ``cmd`` one
 of ``ask``/``note``/``check``/``restart``/``update`` (GD-1: restart Resonant, or pull its main,
-sync and restart; the run is stopped by the restart and resumed after it) or ``job_note``
-(PER-298: ``{"payload": "<the JSON object>"}``, a registered job's memory and seen keys). Reply:
+sync and restart; the run is stopped by the restart and resumed after it), ``job_note``
+(PER-298: ``{"payload": "<the JSON object>"}``, a registered job's memory and seen keys) or
+``request`` (PER-296: ``{"tool": "<ext>.<tool>", "args": {k: v}, "reason"}``, an extension
+tool the instance marks ``worker_requestable``, called through the gate as the run's
+requester and approved in the run's thread). Reply:
 ``{"text", "exit"}``; the shim prints ``text`` (plain text for Claude to read) and exits with
 ``exit``:
 
-    0  ok: the answer, the note recorded, or the check is ok
-    1  the check was denied: don't do it
-    2  usage error
+    0  ok: the answer, the note recorded, the check is ok, or the request ran
+    1  the check was denied, or the request was denied, expired, refused or failed
+    2  usage error (a request for a tool that isn't requestable, or args that don't fit)
     3  no answer yet: finish what you can, then end your turn; the run resumes with the answer
     4  Resonant can't be reached (or the run is over)
-    5  too many pending checks: the check wasn't asked; wait for answers, then run it again
+    5  too many pending checks or open requests: nothing was asked; wait, then run it again
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ import stat
 import struct
 import sys
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -70,6 +73,10 @@ MAX_OPTIONS = 10
 MAX_OPTION = 100
 MAX_WHAT = 1000
 MAX_NAME = 64
+MAX_TOOL = 130  # ``<ext>.<tool>``
+MAX_ARGS = 32
+MAX_ARG = 2000
+MAX_REASON = 300
 MAX_JOB_NOTE = 4096  # bytes: store.jobs.MEMORY_MAX
 MAX_SEEN = 200  # keys in one job-note
 MAX_SEEN_KEY = 200
@@ -123,7 +130,22 @@ class JobNote:
     seen: tuple[str, ...] = ()
 
 
-Request = Ask | Note | Check | SelfOp | JobNote
+@dataclass(frozen=True)
+class ToolRequest:
+    """``resonant request <ext>.<tool> [--arg k=v …] [--reason …]`` (PER-296). ``args`` are
+    the CLI's strings, in order; the desk fits them to the tool's schema."""
+
+    extension: str
+    tool: str
+    args: tuple[tuple[str, str], ...] = ()
+    reason: str = ""
+
+    @property
+    def name(self) -> str:
+        return f"{self.extension}.{self.tool}"
+
+
+Request = Ask | Note | Check | SelfOp | JobNote | ToolRequest
 
 
 @dataclass(frozen=True)
@@ -196,9 +218,34 @@ def parse_request(obj: Any) -> Request:
         )
     if cmd == "restart" or cmd == "update":
         return SelfOp(cmd)
+    if cmd == "request":
+        return _tool_request(req)
     if cmd == "job_note":
         return _job_note(req)
-    raise BadRequest("unknown command; use ask, note, check, job-note, restart or update")
+    raise BadRequest("unknown command; use ask, note, check, job-note, request, restart or update")
+
+
+def _tool_request(req: dict[str, Any]) -> ToolRequest:
+    name = _text(req, "tool", MAX_TOOL)
+    ext, dot, tool = name.partition(".")
+    if not dot or not ext or not tool:
+        raise BadRequest("name the tool as <extension>.<tool>")
+    raw = req.get("args", {})
+    if not isinstance(raw, dict):
+        raise BadRequest("args must be key=value pairs")
+    pairs: list[tuple[str, str]] = []
+    for key, value in cast(dict[Any, Any], raw).items():
+        if not isinstance(key, str) or not key or len(key) > MAX_NAME:
+            raise BadRequest("each arg needs a name (at most 64 characters)")
+        if not isinstance(value, str):
+            raise BadRequest(f"arg {key} must be text")
+        if len(value) > MAX_ARG:
+            raise BadRequest(f"arg {key} is too long (at most {MAX_ARG} characters)")
+        pairs.append((key, value))
+    if len(pairs) > MAX_ARGS:
+        raise BadRequest(f"too many args (at most {MAX_ARGS})")
+    reason = _text(req, "reason", MAX_REASON, required=False)
+    return ToolRequest(ext, tool, tuple(pairs), reason)
 
 
 def _job_note(req: dict[str, Any]) -> JobNote:
@@ -308,6 +355,11 @@ _SHIM_SOURCE = r'''
       a deploy, an email): those are listed in your report to the owner.
   resonant check --system S --action A [--irreversible] [--cost USD] "<what>"
       Before anything that could be net new: ok (go ahead) or denied (don't).
+  resonant request <extension>.<tool> [--arg key=value ...] [--reason "<why>"]
+      Ask for a gated tool (a production deploy, say) instead of doing it yourself: an
+      approver approves it in the run's thread, Resonant runs it, and you get the result.
+      Waits like ask (exit 3: end your turn, you're resumed with the result). At most 3
+      open at once. `resonant request --help` lists the tools you may request here.
   resonant job-note '{"seen": ["<key>", ...], "note": "<memory>"}'
       Only in a registered job's run: save what its next run should know (note replaces
       the memory, at most 4 KB) and the keys it handled (seen adds them).
@@ -316,8 +368,9 @@ _SHIM_SOURCE = r'''
   resonant update
       Deploy Resonant: pull main in its checkout, sync, restart (as /update does).
 
-Exit codes: 0 ok (answered, noted, check ok); 1 check denied; 2 usage error;
-3 no answer yet (end your turn, you'll be resumed); 4 Resonant can't be reached.
+Exit codes: 0 ok (answered, noted, check ok, request ran); 1 check denied, or the request
+was denied, expired or failed; 2 usage error (or a tool you can't request); 3 no answer yet
+(end your turn, you'll be resumed); 4 Resonant can't be reached; 5 too many waiting.
 """
 import argparse
 import json
@@ -327,6 +380,7 @@ import sys
 
 CTL = @CTL@
 WAIT_S = @WAIT_S@
+REQUESTABLE = @REQUESTABLE@
 
 
 def main():
@@ -346,6 +400,13 @@ def main():
     c.add_argument("--irreversible", action="store_true")
     c.add_argument("--cost", type=float, default=0.0)
     c.add_argument("what", nargs="+")
+    tools = "\n".join("  %s  %s" % (n, d) for n, d in REQUESTABLE) or "  (none here)"
+    r = sub.add_parser("request", help="ask an approver for a gated tool; get its result",
+                       epilog="Tools you may request here:\n" + tools,
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    r.add_argument("tool", help="<extension>.<tool>")
+    r.add_argument("--arg", action="append", default=[], metavar="KEY=VALUE")
+    r.add_argument("--reason", default="", help="why, in a sentence (the approver sees it)")
     j = sub.add_parser("job-note", help="save a registered job's memory and seen keys")
     j.add_argument("payload", help='JSON: {"seen": [...], "note": "..."}')
     sub.add_parser("restart", help="restart Resonant (this session is resumed after it)")
@@ -364,6 +425,15 @@ def main():
         req = {"cmd": "job_note", "payload": args.payload}
     elif args.cmd in ("restart", "update"):
         req = {"cmd": args.cmd}
+    elif args.cmd == "request":
+        kv = {}
+        for item in args.arg:
+            key, eq, value = item.partition("=")
+            if not eq or not key.strip():
+                print("Usage error: --arg takes key=value (got %r)." % item)
+                return 2
+            kv[key.strip()] = value
+        req = {"cmd": "request", "tool": args.tool, "args": kv, "reason": args.reason}
     else:
         req = {"cmd": "check", "system": args.system, "action": args.action,
                "irreversible": args.irreversible, "cost_usd": args.cost,
@@ -415,20 +485,43 @@ def shim_interpreter() -> str:
     return "/usr/bin/python3"
 
 
-def shim_text(ctl: Path, wait_s: float, interpreter: str | None = None) -> str:
+Requestable = Sequence[tuple[str, str]]  # (``<ext>.<tool>``, one-line description)
+
+
+def shim_text(
+    ctl: Path, wait_s: float, interpreter: str | None = None, requestable: Requestable = ()
+) -> str:
+    """The shim's source. ``requestable`` is what ``resonant request --help`` lists (PER-296):
+    printable text only, as a Python literal."""
     python = interpreter or shim_interpreter()
     if any(c.isspace() for c in python):
         raise OSError(f"the shim's interpreter path has a space: {python!r}")
-    body = _SHIM_SOURCE.replace("@CTL@", repr(str(ctl))).replace("@WAIT_S@", repr(float(wait_s)))
+    tools = [(_printable(n, MAX_TOOL), _printable(d, 120)) for n, d in requestable]
+    body = (
+        _SHIM_SOURCE.replace("@CTL@", repr(str(ctl)))
+        .replace("@WAIT_S@", repr(float(wait_s)))
+        .replace("@REQUESTABLE@", repr(tools))
+    )
     return f"#!{python} -IS\n{body.lstrip()}"
 
 
-def write_shim(bin_dir: Path, ctl: Path, wait_s: float, interpreter: str | None = None) -> Path:
+def _printable(text: str, limit: int) -> str:
+    flat = "".join(c if c.isprintable() else " " for c in text).strip()
+    return flat[:limit]
+
+
+def write_shim(
+    bin_dir: Path,
+    ctl: Path,
+    wait_s: float,
+    interpreter: str | None = None,
+    requestable: Requestable = (),
+) -> Path:
     """``<bin_dir>/resonant`` (0700), replaced by rename so a planted link is never followed."""
     bin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=bin_dir, prefix=".resonant-")
     try:
-        os.write(fd, shim_text(ctl, wait_s, interpreter).encode())
+        os.write(fd, shim_text(ctl, wait_s, interpreter, requestable).encode())
         os.fchmod(fd, 0o700)
     finally:
         os.close(fd)
