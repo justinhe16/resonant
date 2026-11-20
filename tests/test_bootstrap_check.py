@@ -196,7 +196,7 @@ def test_dry_run_off_fails_on_a_pre_phase2_store(resonant_home: Path) -> None:
     )
     rows = _helper(resonant_home)
     assert rows["store schema 30"][:2] == ("FAIL", True)
-    assert "v2 < v30" in rows["store schema 30"][2]
+    assert "v2 < v31" in rows["store schema 30"][2]
     assert rows["dry_run"][:2] == ("FAIL", True)
 
 

@@ -36,7 +36,9 @@ ends there with ``Didn't: denied.``), ``--ask TEXT`` (with ``--options``) runs `
 picks the question, ``"text|opt,opt"``, by a key found in the prompt), and ``--wait-message S``
 calls ``resonant note`` for up to S seconds until a reply carries an owner message. Each call
 is noted in ``<run>/tmp/cli.json`` (argv, exit code, output). ``--check-flag F`` (repeatable)
-adds a flag such as ``--irreversible`` to the ``check`` call.
+adds a flag such as ``--irreversible`` to the ``check`` call. ``--request "EXT.TOOL k=v …"``
+(repeatable) runs ``resonant request`` with those ``--arg`` pairs (no result yet, exit 3: the
+turn ends with ``Waiting for the approver.``; any other failure: ``Didn't: …``).
 
 Ask mode (BR-5): an argv with ``--restricted`` is an ``ask_claude`` session (``_ask_mode``
 below): the question on stdin, an ``init`` event with the allowed built-ins and fake
@@ -190,6 +192,7 @@ ap.add_argument("--note")
 ap.add_argument("--urgent-note")
 ap.add_argument("--check")
 ap.add_argument("--check-flag", action="append", default=[])
+ap.add_argument("--request", action="append", default=[])  # "ext.tool k=v ..." (PER-296)
 ap.add_argument("--guard-probe")
 ap.add_argument("--wait-message", type=float, default=0.0)
 ap.add_argument("--bash", action="append", default=[])  # Bash tool calls shown, not run (TR-1)
@@ -438,6 +441,16 @@ def first_steps() -> bool:
         rc, _ = cli("check", "--system", system, "--action", action, *args.check_flag, what)
         if rc != 0:
             result("Didn't: denied.")
+            return False
+    for spec in args.request:  # PER-296: `resonant request` for a gated tool
+        tool, *pairs = spec.split()
+        argv = ["request", tool, *[x for p in pairs for x in ("--arg", p)]]
+        rc, text = cli(*argv, "--reason", "ship the fix")
+        if rc == 3:
+            result("Waiting for the approver.")
+            return False
+        if rc != 0:
+            result(f"Didn't: {text.strip()[:80]}")
             return False
     if args.wait_message:
         end = time.time() + args.wait_message

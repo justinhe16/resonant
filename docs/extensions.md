@@ -87,6 +87,8 @@ While the kill switch is on (`/kill`), everything above L0 asks first, and L1 st
 
 Pick the lowest level you'd be comfortable with if the model misunderstood a request. Mark irreversible, user-visible actions (send, pay, delete) with `commit: true`.
 
+**Worker-requestable tools (PER-296).** `worker_requestable: true` on a CLI or MCP tool lets a Claude worker ask for it with `resonant request <extension>.<tool> --arg k=v … --reason "…"` instead of doing the action itself (a production deploy, say). The call goes through the gate as the run's requester (a member needs `request` for the tool), its approval is posted in the run's thread (Slack buttons; an L1 tool needs the code, which a button carries), and on an approver's yes Resonant runs it once and gives the worker the result. `resonant request --help` in a worker lists the instance's requestable tools. Leave it off (the default) for anything a worker should never trigger, even with an approval.
+
 ### CLI tools (default)
 
 ```yaml
