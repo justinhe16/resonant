@@ -660,3 +660,13 @@ async def test_an_approver_answers_anothers_run_only_by_code_outside_its_thread(
     r.workers.ask("R1", "Which DB?")
     assert await team_route(r, "postgres", "brian", "T-9") is None  # not taken for R1
     assert await team_route(r, "R1 postgres", "brian", "T-9") == "→ R1"
+
+
+async def test_a_bystanders_small_talk_in_the_thread_routes_normally(
+    db: sqlite3.Connection,
+) -> None:
+    r = team_rig(db)  # the brain is down: no sure pick
+    r.workers.run("R1", requested_by="brian", thread="T-1")
+    r.workers.ask("R1", "Which DB?")
+    assert await team_route(r, "ok thanks", "miu", "T-1") is None
+    assert r.workers.answers == []

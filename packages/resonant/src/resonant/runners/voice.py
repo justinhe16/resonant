@@ -154,7 +154,8 @@ class ClaudeVoice:
     ``claude_cmd``/``call``/``login_check`` are seams for tests; by default the ``claude``
     on the PATH, a real subprocess and ``LoginCheck`` over it (the owner's login, used only
     with ``runner.guard: off`` and no token or key).
-    ``home`` is the ``HOME`` the call runs with (the owner's, for their login)."""
+    ``home`` is the ``HOME`` the call runs with (the owner's, for their login).
+    ``claude_config_dir`` (PER-291): the call's ``CLAUDE_CONFIG_DIR``; set, no owner login."""
 
     def __init__(
         self,
@@ -172,8 +173,11 @@ class ClaudeVoice:
         clock: Callable[[], datetime] = utcnow,
         poll_s: float = POLL_S,
         kill_grace_s: float = KILL_GRACE_S,
+        claude_config_dir: Path | None = None,
     ) -> None:
         self.conn = conn
+        # PER-291: runner.claude_config_dir; set, the owner's login is never used
+        self.claude_config_dir = claude_config_dir
         self.cfg = cfg
         self.secrets = secrets
         self.cwd = cwd
@@ -329,12 +333,15 @@ class ClaudeVoice:
         login = (
             not (secrets.claude_token or secrets.anthropic_key)
             and self.guard == "off"
+            and self.claude_config_dir is None
             and await self._login_ok()
         )
         source = auth_source(secrets, login_ok=login)
         if source is None:
             return self._unused(fallback, "not_set_up")
         env = status_env(self.home)
+        if self.claude_config_dir is not None:
+            env["CLAUDE_CONFIG_DIR"] = str(self.claude_config_dir)
         if source == "token" and secrets.claude_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = secrets.claude_token
         elif source == "api_key" and secrets.anthropic_key:

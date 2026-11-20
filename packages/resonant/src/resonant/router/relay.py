@@ -508,6 +508,12 @@ class Relay:
         says_new = pick is not None and pick[0] == NONE and pick[1] >= LIKELY
         if len(opens) == 1:
             q = opens[0]
+            run = workers.get_run(q.run_code)
+            if run is not None and not self.may_answer(principal, run):
+                # PER-294: a bystander in the run's thread is refused only when the brain is
+                # sure it's an answer ("ok thanks" routes normally, never by the short bias)
+                sure = pick is not None and pick[0] == q.run_code and pick[1] >= LIKELY
+                return self._refused(run) if sure else None
             recent = (now - q.asked_at).total_seconds() <= RECENT_S
             if says_new or _CONTROL.match(normalize(text)):
                 return None  # a leading control verb vetoes even a confident pick
@@ -628,10 +634,10 @@ class Relay:
         text: str,
         *,
         by_content: bool,
-        principal: str | None = None,
+        principal: str,
     ) -> RelayResult:
-        run = workers.get_run(q.run_code) if principal is not None else None
-        if run is not None and principal is not None and not self.may_answer(principal, run):
+        run = workers.get_run(q.run_code)
+        if run is not None and not self.may_answer(principal, run):
             return self._refused(run)
         result = workers.answer_question(q.run_code, answer_text(text, q.options), question_id=q.id)
         if (sent := _sent(result)) is not None:

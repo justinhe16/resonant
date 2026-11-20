@@ -819,3 +819,56 @@ def test_runner_remote_control_row(resonant_home: Path) -> None:
 
     rows = {r[2]: r for r in check.runner_rows(off, 14, nothing)}
     assert rows["runner remote control"][0] == "SKIP"
+
+
+def test_coris_claude_config_dir_and_session_env_rows(resonant_home: Path, tmp_path: Path) -> None:
+    """PER-291: the config dir's skills, a FAIL for any MCP server configured there, the
+    scoped credentials by name only, and no owner-login PASS with the dir set."""
+    import json
+
+    check = _load_helper()
+
+    def none(_ref: str) -> bool:
+        return False
+
+    def every(_ref: str) -> bool:
+        return True
+
+    personal = load_settings()
+    assert check.claude_config_row(personal)[0] == "SKIP"
+    assert check.session_env_row(personal, none)[0] == "SKIP"
+
+    config_dir = tmp_path / "cori-claude"
+    for skill in ("robot-surf", "linear-surf"):
+        (config_dir / "skills" / skill).mkdir(parents=True)
+    (config_dir / "settings.json").write_text("{}")
+    env = {"FLY_API_TOKEN": "dori/fly_staging_token", "VERCEL_TOKEN": "dori/vercel_token"}
+    cori = load_settings(runner={"claude_config_dir": config_dir, "session_env": env})
+    row = check.claude_config_row(cori)
+    assert row[:3] == ("PASS", False, "runner claude config dir")
+    assert "no MCP servers" in row[3] and "linear-surf, robot-surf" in row[3]
+    (config_dir / ".claude.json").write_text(json.dumps({
+        "oauthAccount": {"emailAddress": "hidden@example.com"},
+        "mcpServers": {"linear": {"command": "x"}},
+        "projects": {"/x": {"mcpServers": {"supabase": {}}}},
+    }))  # fmt: skip
+    row = check.claude_config_row(cori)
+    assert row[0] == "FAIL" and "linear (.claude.json)" in row[3] and "supabase" in row[3]
+    assert "hidden@example.com" not in row[3]  # names only
+
+    def has(ref: str) -> bool | str:
+        return ref == "dori/vercel_token"
+
+    row = check.session_env_row(cori, has)
+    assert row[0] == "FAIL"
+    assert row[3] == "not set up: FLY_API_TOKEN (resonant secret set dori/fly_staging_token)"
+    assert check.session_env_row(cori, every)[0] == "PASS"
+
+    def logged_in(settings: object) -> bool:
+        return True
+
+    rows = {r[2]: r for r in check.runner_rows(cori, 14, none, login=logged_in)}
+    claude = rows["runner secret runner/claude_token (or runner/anthropic_key)"]
+    assert claude[0] == "FAIL" and "log in" not in claude[3]  # never the owner's login
+    assert rows["runner claude config dir"][0] == "FAIL"  # the MCP servers above
+    assert rows["runner session env"][0] == "FAIL"
