@@ -70,9 +70,10 @@ from resonant.loop.slots import SlotPool
 from resonant.loop.types import Task, TaskStatus
 from resonant.loop.types import WaitReason as TaskWait
 from resonant.monitor import EXT_CHECK_PREFIX, health_snapshot
-from resonant.redact import Redactor, clip_text
+from resonant.redact import Redactor, clip_text, scrub_rc_links
 from resonant.store import approvals, pulse, questions, repos, runs, system_texts, trust
 from resonant.store import extensions as ext_store
+from resonant.store import jobs as job_store
 from resonant.store import tasks as task_store
 from resonant.store.audit import EVENT_NAME, run_events, task_events
 from resonant.store.claude_brain import recent_tools, tool_counts
@@ -102,6 +103,7 @@ EXTENSION_ITEMS = 20
 CORE_JOB_ITEMS = 12
 TRUST_RULE_ITEMS = 50
 REPO_ITEMS = 50
+REGISTERED_JOB_ITEMS = 30  # PER-306: the live registered jobs (store.jobs.MAX_JOBS caps them too)
 RECENT_APPROVALS_DAYS = 7
 RUN_HISTORY = 12  # a run's last audit rows (``run.start``, ``run.ready``, ...)
 TASK_HISTORY = 10
@@ -224,6 +226,12 @@ def _local() -> Any:
 def _list() -> Any:
     """An optional list field: empty by default."""
     return Field(default_factory=list)
+
+
+def _omit() -> Any:
+    """PER-306: an optional field left out of the output when None, so a snapshot without it
+    (personal Resonant: no Slack, no member asking) is byte for byte what it was before."""
+    return Field(default=None, exclude_if=lambda v: v is None)
 
 
 class _Model(BaseModel):
@@ -352,6 +360,9 @@ class RunItem(_Model):
     linear_ids: list[LinearId] = _list()  # as plain text: no workspace is configured
     detail: bool  # False past ``Limits.run_detail``: its text and history are left out
     outside: list[OutsideName] = _list()
+    # PER-306: who asked for it when that isn't the owner (a member or an approver on Cori);
+    # left out for the owner's own runs, and when no principals are loaded
+    requested_by: Txt40 | None = _omit()
 
 
 class DetectedEffects(_Model):
@@ -400,6 +411,8 @@ class ApprovalItem(_Model):
     run_code: Txt16 | None
     changes: list[ApprovalChange] | None = None
     outside: list[OutsideName] = _list()
+    # PER-306: whose task asked when that isn't the owner (``decided_by`` is who resolved it)
+    requested_by: Txt40 | None = _omit()
 
 
 class Approvals(_Model):
@@ -455,6 +468,40 @@ class Job(_Model):
     last_run_at: datetime | None
     last_outcome: JobOutcome | None
     fail_streak: int
+
+
+class RegisteredJob(_Model):
+    """PER-298's registered job (``store.jobs``): cron plus a prompt, one worker run per
+    firing. The prompt and memory never ship; the name is the creator's words."""
+
+    id: Txt16  # ``J3``
+    name: Txt64
+    kind: Txt16  # ``schedule`` (PER-298) or ``watch`` (PER-299)
+    state: Literal["active", "paused"]
+    schedule: Txt100  # cron
+    tz: Txt64
+    next_due: datetime | None  # None while paused, or when the schedule doesn't parse
+    last_run_code: Txt16 | None
+    last_run_status: RunStatus | None  # the run's state now (None: no run, or pruned)
+    last_run_at: datetime | None
+    last_error: Txt200 | None  # why the last firing didn't start
+    created_by: Txt40  # the creator principal's name
+    output: Txt64  # ``thread``, ``dm`` or ``room:<key>``
+    outside: list[OutsideName] = _list()  # ``["name"]`` when a member added it
+
+
+class SlackStatus(_Model):
+    """PER-295's adapter, as ``/api/channels`` reports it."""
+
+    connected: bool
+    last_event_at: datetime | None
+    followed_threads: int
+
+
+class Channels(_Model):
+    """PER-306: the live channel adapters beyond iMessage (iMessage is a health row)."""
+
+    slack: SlackStatus | None = None
 
 
 class ExtTool(_Model):
@@ -920,6 +967,12 @@ class Snapshot(_Model):
     trust_rule_count: int = 0
     repo_count: int = 0
     diagram: Diagram | None = None  # PER-277; None from a daemon before it
+    # PER-306: registered jobs (left out when there are none) and the Slack adapter's state
+    # (left out without one): personal Resonant's snapshot is unchanged without them
+    jobs: list[RegisteredJob] = Field(
+        default_factory=list[RegisteredJob], exclude_if=lambda v: not v
+    )
+    channels: Channels | None = _omit()
 
 
 # --- tiers --------------------------------------------------------------------------------
@@ -947,6 +1000,59 @@ def to_remote(snapshot: Snapshot) -> Snapshot:
     (``model_copy`` doesn't validate) so a pusher can only ever send a valid remote tier."""
     stripped = cast(Snapshot, _strip(snapshot)).model_copy(update={"tier": "remote"})
     return Snapshot.model_validate(stripped.model_dump())
+
+
+# Keys that are local-only wherever they appear (``RunItem``/``ClaudeBrain.remote_url``,
+# ``Panel.local_url``): dropped at any depth by ``strip_local_json``, known model or not.
+_LOCAL_EVERYWHERE: Final = frozenset({"remote_url", "local_url"})
+
+
+def _models_in(annotation: Any) -> tuple[type[BaseModel], ...]:
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return (annotation,)
+    return tuple(m for arg in get_args(annotation) for m in _models_in(arg))
+
+
+@functools.cache
+def _json_shape(
+    model: type[BaseModel],
+) -> tuple[frozenset[str], dict[str, tuple[type[BaseModel], ...]]]:
+    """A model's local-only JSON keys, and the models each of its JSON keys may hold."""
+    local = frozenset(
+        (f.alias or name) for name, f in model.model_fields.items() if is_local_only(model, name)
+    )
+    kids = {(f.alias or name): _models_in(f.annotation) for name, f in model.model_fields.items()}
+    return local, kids
+
+
+def _strip_json(value: Any, models: tuple[type[BaseModel], ...]) -> Any:
+    if isinstance(value, dict):
+        drop = set(_LOCAL_EVERYWHERE)
+        for m in models:
+            drop |= _json_shape(m)[0]
+        out: dict[str, Any] = {}
+        for key, item in cast(dict[Any, Any], value).items():
+            if not isinstance(key, str) or key in drop:
+                continue
+            kids = tuple(k for m in models for k in _json_shape(m)[1].get(key, ()))
+            out[key] = _strip_json(item, kids)
+        return out
+    if isinstance(value, list):
+        return [_strip_json(v, models) for v in cast(list[Any], value)]
+    if isinstance(value, str):
+        return scrub_rc_links(value)
+    return value
+
+
+def strip_local_json(data: Mapping[str, Any]) -> dict[str, Any]:
+    """PER-306: another instance's local-tier snapshot (its ``/api/dashboard`` JSON) without
+    what only its own loopback page may show, as ``to_remote`` does for a model: every
+    :data:`LOCAL_ONLY` field (Remote Control links, approval codes, panel links), found by
+    walking the JSON along :class:`Snapshot`'s models, plus any ``remote_url``/``local_url``
+    key at any depth, and every Remote Control link inside a text. It works on plain JSON so a
+    newer instance's snapshot (fields this checkout doesn't know) still passes: unknown keys
+    are kept (the page ignores what it doesn't read) and their texts scrubbed too."""
+    return cast(dict[str, Any], _strip_json(dict(data), (Snapshot,)))
 
 
 def schema_json() -> str:
@@ -1563,6 +1669,7 @@ def build_snapshot(
     launch_agents: Sequence[AgentState] | None = None,
     diagram: bool = True,
     owner: str | None = None,
+    slack: Mapping[str, Any] | None = None,
 ) -> Snapshot:
     """The local-tier snapshot (``to_remote`` derives the remote one).
 
@@ -1576,6 +1683,7 @@ def build_snapshot(
     of any other principal (a member, or a Slack workspace's default principal on Cori) has
     its words marked ``outside`` (its title and label, its run's ask, its approvals' summary
     and changes; PER-304). None (no principals loaded): nothing is marked for that.
+    ``slack`` is the live Slack adapter's ``health()`` (PER-306; None: no Slack adapter).
     """
     now = now or utcnow()
     run_rows = runs.recent(conn, limit=RUN_ITEMS)
@@ -1755,6 +1863,56 @@ def build_snapshot(
         trust_rule_count=len(rules),
         repo_count=len(repo_rows),
         diagram=graph,
+        jobs=_registered_jobs(conn, ctx, t),
+        channels=_channels(slack),
+    )
+
+
+def _registered_jobs(conn: sqlite3.Connection, ctx: _Context, t: _Text) -> list[RegisteredJob]:
+    """PER-306: the live registered jobs, oldest first (as ``list_jobs`` lists them)."""
+    out: list[RegisteredJob] = []
+    for j in job_store.live(conn)[:REGISTERED_JOB_ITEMS]:
+        if j.state == "deleted":
+            continue
+        run = runs.get(conn, j.last_run_code) if j.last_run_code else None
+        member = ctx.owner is not None and j.created_by != ctx.owner
+        out.append(
+            RegisteredJob(
+                id=t(j.id, 16),
+                name=t(j.name, 64),
+                kind=t(j.kind, 16),
+                state=j.state,
+                schedule=t(j.schedule, 100),
+                tz=t(j.tz, 64),
+                next_due=_next_due(j.schedule, j.tz, ctx.now) if j.state == "active" else None,
+                last_run_code=t.opt(j.last_run_code, 16),
+                last_run_status=None if run is None else run.status,
+                last_run_at=j.last_run_at,
+                last_error=t.opt(j.last_error, 200),
+                created_by=t(j.created_by, 40),
+                output=t(j.output, 64),
+                outside=["name"] if member else [],
+            )
+        )
+    return out
+
+
+def _channels(slack: Mapping[str, Any] | None) -> Channels | None:
+    """PER-306: the Slack adapter's ``{connected, last_event_at, followed_threads}``."""
+    if slack is None:
+        return None
+    raw_at = slack.get("last_event_at")
+    try:
+        at = datetime.fromisoformat(raw_at) if isinstance(raw_at, str) else None
+    except ValueError:
+        at = None
+    threads = slack.get("followed_threads")
+    return Channels(
+        slack=SlackStatus(
+            connected=slack.get("connected") is True,
+            last_event_at=at,
+            followed_threads=threads if isinstance(threads, int) and threads >= 0 else 0,
+        )
     )
 
 
@@ -2187,6 +2345,7 @@ def _run_item(
     ]
     if ctx.outside(r.task_id):
         outside.insert(0, "ask")
+    requester = r.requester
     return RunItem(
         code=t(r.code, 16),
         state=r.status,
@@ -2229,6 +2388,7 @@ def _run_item(
         linear_ids=_linear_ids(r.ask, r.branch),
         detail=detail,
         outside=outside,
+        requested_by=t(requester, 40) if ctx.owner is not None and requester != ctx.owner else None,
     )
 
 
@@ -2354,7 +2514,16 @@ def _approval_item(
         if batch
         else None,
         outside=["summary", "changes"] if ctx.outside(first.task_id) else [],
+        requested_by=_requester(ctx, first.task_id, t),
     )
+
+
+def _requester(ctx: _Context, task_id: str | None, t: _Text) -> str | None:
+    """PER-306: the task's principal when it is someone other than the owner."""
+    task = ctx.task(task_id)
+    if ctx.owner is None or task is None or not _member(task, ctx.owner):
+        return None
+    return t(task.principal or "", 40)
 
 
 _RC_URL = re.compile(r"https://claude\.ai/code/[A-Za-z0-9_-]{1,200}")

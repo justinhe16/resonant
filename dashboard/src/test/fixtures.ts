@@ -1,6 +1,7 @@
 import type { V1Snapshot } from "@/lib/legacy";
 import { assertSnapshot } from "@/lib/snapshot";
 import type { Snapshot } from "@/types";
+import coriJson from "./fixtures/cori.json";
 import emptyJson from "./fixtures/empty.json";
 import localJson from "./fixtures/local.json";
 import remoteJson from "./fixtures/remote.json";
@@ -10,6 +11,8 @@ import remoteV1Json from "./fixtures/remote-v1.json";
 export const local = localJson as unknown as Snapshot;
 export const remote = remoteJson as unknown as Snapshot;
 export const empty = emptyJson as unknown as Snapshot;
+/** PER-306: Cori's local snapshot: registered jobs, Slack, a member's run and approval. */
+export const cori = coriJson as unknown as Snapshot;
 /** A schema 1 remote snapshot as an un-updated daemon pushed it (briefs, no texts). */
 export const remoteV1Raw = remoteV1Json as unknown as V1Snapshot;
 /** The same, normalized the way the page reads it. */

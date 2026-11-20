@@ -1438,7 +1438,7 @@ def test_the_worst_case_shrinks_to_fit(db: sqlite3.Connection) -> None:
 UI_FIXTURES = Path(__file__).resolve().parents[1] / "dashboard" / "src" / "test" / "fixtures"
 
 
-@pytest.mark.parametrize("name", ["empty", "local", "remote"])
+@pytest.mark.parametrize("name", ["empty", "local", "remote", "cori"])
 def test_the_ui_fixtures_match_the_schema(name: str) -> None:
     """DB-2's fixtures are real snapshots, so the UI is tested on the shape the daemon sends."""
     data = json.loads((UI_FIXTURES / f"{name}.json").read_text())
@@ -1690,3 +1690,128 @@ def test_the_panel_schema_is_in_the_snapshot_schema_and_is_flat() -> None:
     )
     assert "panels" in schema["properties"]["trimmed"]["enum"]
     assert defs["Panel"]["properties"]["local_url"]["x-tier"] == "local"
+
+
+# --- PER-306: registered jobs, Slack, who asked, and the instance proxy's strip -----------
+
+
+def test_without_jobs_slack_or_members_the_dump_is_unchanged(db: sqlite3.Connection) -> None:
+    """Personal Resonant (no registered jobs, no Slack, only the owner asking): none of the
+    PER-306 keys appear, so its API and its push are exactly what they were."""
+    now = utcnow().replace(microsecond=0)
+    _member_tasks(db, now)
+    dump = build_snapshot(db, load_settings(), started_at=now, now=now).model_dump(mode="json")
+    assert "jobs" not in dump and "channels" not in dump
+    assert all("requested_by" not in r for r in dump["runs"]["items"])
+    assert all("requested_by" not in a for a in dump["approvals"]["items"])
+    owner = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    odump = owner.model_dump(mode="json")
+    assert "jobs" not in odump and "channels" not in odump
+
+
+def test_who_asked_is_named_when_it_isnt_the_owner(db: sqlite3.Connection) -> None:
+    now = utcnow().replace(microsecond=0)
+    made = _member_tasks(db, now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    run_items = {r.code: r for r in s.runs.items}
+    approvals = {a.task_id: a for a in s.approvals.items}
+    member_task, member_run = made["member"]
+    assert run_items[member_run].requested_by == "teammate"
+    assert approvals[member_task].requested_by == "teammate"
+    owner_task, owner_run = made["owner"]
+    assert run_items[owner_run].requested_by is None
+    assert approvals[owner_task].requested_by is None
+    asked = runs.create(db, repo="", ask="for bob", principal="justin", session_id="b",
+                        max_seconds=60, requested_by="bob")  # fmt: skip
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    assert {r.code: r for r in s.runs.items}[asked.code].requested_by == "bob"
+    assert "requested_by" in to_remote(s).model_dump(mode="json")["runs"]["items"][0]
+
+
+def test_registered_jobs(db: sqlite3.Connection) -> None:
+    from resonant.store import jobs as job_store
+
+    now = datetime(2026, 11, 20, 17, 0, tzinfo=UTC)
+    a = job_store.create(db, name="flaky CI", schedule="0 9 * * 1", tz="America/Los_Angeles",
+                         prompt="check flaky CI " + SECRET, repo=None, output="room:eng",
+                         created_by="justin", channel_ref=None, now=now)  # fmt: skip
+    b = job_store.create(db, name="member's job", schedule="30 8 * * *", tz="UTC",
+                         prompt="x", repo=None, output="thread", created_by="slack:U1",
+                         channel_ref=None, now=now)  # fmt: skip
+    gone = job_store.create(db, name="gone", schedule="0 1 * * *", tz="UTC", prompt="x",
+                            repo=None, output="dm", created_by="justin", channel_ref=None,
+                            now=now)  # fmt: skip
+    run = runs.create(db, repo="", ask="job run", principal="justin", session_id="j",
+                      max_seconds=60)  # fmt: skip
+    runs.update(db, run.code, status="failed")
+    job_store.started(db, a.id, run.code, now)
+    job_store.set_state(db, b.id, "paused", now, expect=("active",))
+    job_store.set_state(db, gone.id, "deleted", now, expect=("active",))
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    jobs = {j.id: j for j in s.jobs}
+    assert set(jobs) == {a.id, b.id}
+    ja, jb = jobs[a.id], jobs[b.id]
+    assert (ja.name, ja.kind, ja.state, ja.output) == ("flaky CI", "schedule", "active", "room:eng")
+    assert ja.next_due == datetime(2026, 11, 23, 17, 0, tzinfo=UTC)  # Monday 09:00 PT
+    assert (ja.last_run_code, ja.last_run_status, ja.created_by) == (run.code, "failed", "justin")
+    assert ja.outside == []
+    assert jb.state == "paused" and jb.next_due is None and jb.last_run_code is None
+    assert jb.outside == ["name"]  # a member's words
+    dump = to_remote(s).model_dump(mode="json")
+    assert SECRET not in json.dumps(dump) and "prompt" not in dump["jobs"][0]
+
+
+def test_slack_status(db: sqlite3.Connection) -> None:
+    now = utcnow().replace(microsecond=0)
+    health = {"ok": True, "connected": True, "last_event_at": iso(now), "followed_threads": 3,
+              "last_error": None, "detail": "connected"}  # fmt: skip
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, slack=health)
+    assert s.channels is not None and s.channels.slack is not None
+    assert s.channels.slack.connected and s.channels.slack.followed_threads == 3
+    assert s.channels.slack.last_event_at == now
+    bad = {"connected": "yes", "last_event_at": "nope", "followed_threads": -1}
+    odd = build_snapshot(db, load_settings(), started_at=now, now=now, slack=bad)
+    assert odd.channels is not None and odd.channels.slack is not None
+    assert odd.channels.slack == snap.SlackStatus(
+        connected=False, last_event_at=None, followed_threads=0
+    )
+
+
+def _walk(value: Any, path: str = "$") -> Any:
+    """Every (path, key, value) of a JSON tree."""
+    if isinstance(value, dict):
+        for k, v in cast(dict[str, Any], value).items():
+            yield path, k, v
+            yield from _walk(v, f"{path}.{k}")
+    elif isinstance(value, list):
+        for i, v in enumerate(cast(list[Any], value)):
+            yield from _walk(v, f"{path}[{i}]")
+
+
+def test_the_instance_proxy_strip_leaves_no_link_or_code(db: sqlite3.Connection) -> None:
+    """PER-306's schema walk: another instance's local snapshot through ``strip_local_json``
+    has no Remote Control link and no approval code anywhere, keeps everything else (run
+    codes included), and lets a newer schema's unknown fields through, scrubbed."""
+    now = utcnow()
+    kv_set(db, SESSION_KV, {"session_id": "s", "turns": 1, "pid": 1, "remote_url": RC})
+    _seed_texts(db, now, lambda: "x")
+    run = runs.create(db, repo="", ask="y", principal="j", session_id="s2", max_seconds=60)
+    runs.update(db, run.code, status="running", remote_url=RC)
+    local = build_snapshot(db, load_settings(), started_at=now, now=now).model_dump(mode="json")
+    assert any(a.get("code") for a in local["approvals"]["items"])
+    local["future"] = {"remote_url": RC, "note": f"see {RC}", "rows": [{"local_url": "x"}]}
+    out = snap.strip_local_json(local)
+    text = json.dumps(out)
+    assert "claude.ai/code" not in text
+    for path, key, value in _walk(out):
+        assert key not in ("remote_url", "local_url"), path
+        if key == "code" and ".approvals." in f"{path}.":
+            pytest.fail(f"approval code at {path}")
+        assert not (isinstance(value, str) and "claude.ai/code" in value), path
+    assert out["future"]["note"] == "see [remote control link]"
+    assert [r["code"] for r in out["runs"]["items"]] == [r["code"] for r in local["runs"]["items"]]
+    expected = _local_view(local)
+    expected["tier"] = "local"
+    del expected["future"]
+    del out["future"]
+    assert out == expected  # nothing else touched

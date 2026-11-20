@@ -21,6 +21,7 @@ function fakeClient(initial: AuthStage) {
     signOut: vi.fn(async () => {
       stage = { kind: "signed_out" };
     }),
+    instances: vi.fn(async () => []),
     latest: vi.fn(async () => remote),
     panelDay: vi.fn(async () => null),
     onAuthChange: vi.fn(() => () => {}),

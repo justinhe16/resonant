@@ -1,0 +1,2158 @@
+{
+  "schema": 2,
+  "tier": "local",
+  "taken_at": "2026-10-16T09:00:00Z",
+  "version": "3ef397a1",
+  "instance": {
+    "name": "cori",
+    "display_name": "Cori"
+  },
+  "started_at": "2026-10-15T21:14:00Z",
+  "last_tick": "2026-10-16T08:59:58Z",
+  "autonomy": "on",
+  "paused": false,
+  "dry_run": false,
+  "trimmed": "none",
+  "limits": {
+    "runs": 50,
+    "run_detail": 20,
+    "tasks": 50,
+    "task_detail": 20,
+    "approvals_recent": 20,
+    "approvals_pending": 20,
+    "questions": 20,
+    "pulse": 60,
+    "brain_tools": 20
+  },
+  "health": [
+    {
+      "name": "loop",
+      "state": "ok",
+      "since": "2026-10-15T21:14:05Z",
+      "reason": null,
+      "outside": []
+    },
+    {
+      "name": "model",
+      "state": "ok",
+      "since": "2026-10-15T21:14:20Z",
+      "reason": null,
+      "outside": []
+    },
+    {
+      "name": "imessage",
+      "state": "degraded",
+      "since": "2026-10-16T08:41:00Z",
+      "reason": "self-test timed out after 90s",
+      "outside": []
+    },
+    {
+      "name": "store",
+      "state": "ok",
+      "since": "2026-10-15T21:14:05Z",
+      "reason": null,
+      "outside": []
+    },
+    {
+      "name": "ext:github",
+      "state": "unknown",
+      "since": null,
+      "reason": "no run yet",
+      "outside": [
+        "reason"
+      ]
+    }
+  ],
+  "tasks": {
+    "by_state": {
+      "running": 2,
+      "waiting": 1,
+      "done": 41,
+      "failed": 2
+    },
+    "items": [
+      {
+        "id": "t_4f1a9c",
+        "kind": "run",
+        "runner": "claude",
+        "extension": null,
+        "status": "running",
+        "wait_reason": null,
+        "wake_at": null,
+        "attempts": 1,
+        "step_no": 3,
+        "created_at": "2026-10-16T08:46:30Z",
+        "updated_at": "2026-10-16T08:58:00Z",
+        "label": "Add a dashboard job to CI",
+        "title": "Add a dashboard job to CI",
+        "error": null,
+        "run_code": "R12",
+        "history": [
+          {
+            "at": "2026-10-16T08:46:30Z",
+            "event": "task.created"
+          },
+          {
+            "at": "2026-10-16T08:47:00Z",
+            "event": "task.started"
+          }
+        ],
+        "approval_ids": [],
+        "outside": []
+      },
+      {
+        "id": "t_77c0de",
+        "kind": "run",
+        "runner": "claude",
+        "extension": null,
+        "status": "waiting",
+        "wait_reason": "human_reply",
+        "wake_at": "2026-10-16T20:12:00Z",
+        "attempts": 1,
+        "step_no": 2,
+        "created_at": "2026-10-16T07:29:30Z",
+        "updated_at": "2026-10-16T08:12:00Z",
+        "label": "Bump the exchange client",
+        "title": "Bump the exchange client",
+        "error": null,
+        "run_code": "R11",
+        "history": [
+          {
+            "at": "2026-10-16T08:12:00Z",
+            "event": "task.waiting"
+          }
+        ],
+        "approval_ids": [],
+        "outside": []
+      },
+      {
+        "id": "t_8a0b11",
+        "kind": "job",
+        "runner": "claude",
+        "extension": "github",
+        "status": "waiting",
+        "wait_reason": "approval",
+        "wake_at": null,
+        "attempts": 1,
+        "step_no": 0,
+        "created_at": "2026-10-16T08:50:00Z",
+        "updated_at": "2026-10-16T08:50:00Z",
+        "label": "github/watch",
+        "title": "github/watch",
+        "error": null,
+        "run_code": null,
+        "history": [],
+        "approval_ids": [
+          "ap_k7q2"
+        ],
+        "outside": []
+      },
+      {
+        "id": "t_c3a915",
+        "kind": "run",
+        "runner": "claude",
+        "extension": null,
+        "status": "failed",
+        "wait_reason": null,
+        "wake_at": null,
+        "attempts": 2,
+        "step_no": 4,
+        "created_at": "2026-10-15T22:09:30Z",
+        "updated_at": "2026-10-15T22:31:00Z",
+        "label": "Migrate the notes export",
+        "title": "Migrate the notes export",
+        "error": "usage limit reached",
+        "run_code": "R9",
+        "history": [
+          {
+            "at": "2026-10-15T22:31:00Z",
+            "event": "task.failed"
+          }
+        ],
+        "approval_ids": [],
+        "outside": [
+          "error"
+        ]
+      },
+      {
+        "id": "t_9e9e9e",
+        "kind": "chat",
+        "runner": "brain",
+        "extension": null,
+        "status": "done",
+        "wait_reason": null,
+        "wake_at": null,
+        "attempts": 1,
+        "step_no": 0,
+        "created_at": "2026-10-16T08:30:00Z",
+        "updated_at": "2026-10-16T08:30:20Z",
+        "label": null,
+        "title": "Look up net worth",
+        "error": null,
+        "run_code": null,
+        "history": [],
+        "approval_ids": [],
+        "outside": []
+      }
+    ]
+  },
+  "slots": {
+    "used": 2,
+    "max": 5
+  },
+  "runs": {
+    "by_state": {
+      "running": 1,
+      "waiting": 1,
+      "ready": 1,
+      "merged": 6,
+      "failed": 1
+    },
+    "detected": {
+      "by_kind": {
+        "push": 1,
+        "http": 1,
+        "merge": 1
+      },
+      "high": 1
+    },
+    "items": [
+      {
+        "code": "R12",
+        "state": "running",
+        "waiting_reason": null,
+        "started_at": "2026-10-16T08:47:00Z",
+        "ended_at": null,
+        "detected": 2,
+        "repo": "resonant",
+        "ask": "Add a dashboard job to CI that rebuilds the UI and fails if dist differs",
+        "branch": "r12-dashboard-ci",
+        "base_branch": "main",
+        "head_sha": "a1b2c3d4",
+        "pr_url": null,
+        "pr_number": null,
+        "github_repo": "example/resonant",
+        "created_at": "2026-10-16T08:46:30Z",
+        "task_id": "t_4f1a9c",
+        "step": "session",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": null,
+        "cost_usd": 0.84,
+        "tokens_in": 182000,
+        "tokens_out": 9400,
+        "session_seconds": 780,
+        "wait_seconds": 0,
+        "files_changed": 2,
+        "flagged_paths": [],
+        "summary": null,
+        "failure": null,
+        "last_note": "Lint and typecheck pass; writing the workflow step now",
+        "did": [
+          "pushed r12-dashboard-ci",
+          "read the CI workflow files"
+        ],
+        "effects": [
+          {
+            "kind": "push",
+            "what": "git push origin r12-dashboard-ci",
+            "high": false
+          },
+          {
+            "kind": "http",
+            "what": "curl https://api.github.com/repos/example/resonant/actions/runs",
+            "high": false
+          }
+        ],
+        "merged": [],
+        "merged_by": null,
+        "history": [
+          {
+            "at": "2026-10-16T08:47:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-16T08:52:00Z",
+            "event": "side_effect"
+          }
+        ],
+        "approval_ids": [],
+        "question_ids": [],
+        "linear_ids": [],
+        "detail": true,
+        "outside": [
+          "last_note",
+          "did",
+          "effects"
+        ],
+        "remote_url": "https://claude.ai/code/session_r12",
+        "requested_by": "slack:U07TEAM"
+      },
+      {
+        "code": "R11",
+        "state": "waiting",
+        "waiting_reason": "question",
+        "started_at": "2026-10-16T07:30:00Z",
+        "ended_at": null,
+        "detected": 0,
+        "repo": "trading-bot",
+        "ask": "Bump the exchange client and rerun the backtest",
+        "branch": "r11-bump-client",
+        "base_branch": "main",
+        "head_sha": null,
+        "pr_url": null,
+        "pr_number": null,
+        "github_repo": "example/trading-bot",
+        "created_at": "2026-10-16T07:29:30Z",
+        "task_id": "t_77c0de",
+        "step": "session",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": null,
+        "cost_usd": 0.31,
+        "tokens_in": 64000,
+        "tokens_out": 3100,
+        "session_seconds": 2500,
+        "wait_seconds": 2900,
+        "files_changed": 0,
+        "flagged_paths": [],
+        "summary": null,
+        "failure": null,
+        "last_note": null,
+        "did": [],
+        "effects": [],
+        "merged": [],
+        "merged_by": null,
+        "history": [
+          {
+            "at": "2026-10-16T07:30:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-16T08:12:00Z",
+            "event": "asked"
+          }
+        ],
+        "approval_ids": [],
+        "question_ids": [
+          7
+        ],
+        "linear_ids": [],
+        "detail": true,
+        "outside": [
+          "ask"
+        ]
+      },
+      {
+        "code": "R10",
+        "state": "ready",
+        "waiting_reason": null,
+        "started_at": "2026-10-16T06:02:00Z",
+        "ended_at": "2026-10-16T06:40:00Z",
+        "detected": 1,
+        "repo": "resonant",
+        "ask": "Fix the flaky pulse quiet-hours test (PER-241)",
+        "branch": "r10-quiet-hours",
+        "base_branch": "main",
+        "head_sha": "9f8e7d6c5b",
+        "pr_url": "https://github.com/example/resonant/pull/81",
+        "pr_number": 81,
+        "github_repo": "example/resonant",
+        "created_at": "2026-10-16T06:01:30Z",
+        "task_id": "t_2b8d10",
+        "step": "publish",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": 0,
+        "cost_usd": 1.27,
+        "tokens_in": 412000,
+        "tokens_out": 21000,
+        "session_seconds": 2280,
+        "wait_seconds": 0,
+        "files_changed": 3,
+        "flagged_paths": [
+          ".github/workflows/ci.yml"
+        ],
+        "summary": "Pinned the clock in the quiet-hours test; the flake came from reading the wall time twice.",
+        "failure": null,
+        "last_note": "CI green",
+        "did": [
+          "opened PR 81",
+          "watched CI to green"
+        ],
+        "effects": [
+          {
+            "kind": "merge",
+            "what": "gh pr merge 81 --squash",
+            "high": true
+          }
+        ],
+        "merged": [],
+        "merged_by": null,
+        "history": [
+          {
+            "at": "2026-10-16T06:02:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-16T06:20:00Z",
+            "event": "side_effect"
+          },
+          {
+            "at": "2026-10-16T06:40:00Z",
+            "event": "ready"
+          }
+        ],
+        "approval_ids": [
+          "ap_k7q2"
+        ],
+        "question_ids": [],
+        "linear_ids": [
+          "PER-241"
+        ],
+        "detail": true,
+        "outside": [
+          "summary",
+          "last_note",
+          "did",
+          "effects",
+          "flagged_paths"
+        ]
+      },
+      {
+        "code": "R9",
+        "state": "failed",
+        "waiting_reason": null,
+        "started_at": "2026-10-15T22:10:00Z",
+        "ended_at": "2026-10-15T22:31:00Z",
+        "detected": 0,
+        "repo": "notes",
+        "ask": "Migrate the notes export to the new schema",
+        "branch": null,
+        "base_branch": null,
+        "head_sha": null,
+        "pr_url": null,
+        "pr_number": null,
+        "github_repo": null,
+        "created_at": "2026-10-15T22:09:30Z",
+        "task_id": "t_c3a915",
+        "step": "harvest",
+        "attempts": 2,
+        "sessions": 2,
+        "exit_code": 1,
+        "cost_usd": 0.62,
+        "tokens_in": 150000,
+        "tokens_out": 8000,
+        "session_seconds": 1200,
+        "wait_seconds": 60,
+        "files_changed": 0,
+        "flagged_paths": [],
+        "summary": null,
+        "failure": "Session hit the usage limit twice; gave up",
+        "last_note": "Session hit the usage limit twice; gave up",
+        "did": [],
+        "effects": [],
+        "merged": [],
+        "merged_by": null,
+        "history": [
+          {
+            "at": "2026-10-15T22:10:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-15T22:31:00Z",
+            "event": "failed"
+          }
+        ],
+        "approval_ids": [],
+        "question_ids": [],
+        "linear_ids": [],
+        "detail": true,
+        "outside": [
+          "failure",
+          "last_note"
+        ]
+      },
+      {
+        "code": "R8",
+        "state": "merged",
+        "waiting_reason": null,
+        "started_at": "2026-10-15T18:00:00Z",
+        "ended_at": "2026-10-15T18:50:00Z",
+        "detected": 0,
+        "repo": "resonant",
+        "ask": "Add an hourly update to system_texts",
+        "branch": "r8-hourly",
+        "base_branch": "main",
+        "head_sha": "0123abc",
+        "pr_url": "https://github.com/example/resonant/pull/79",
+        "pr_number": 79,
+        "github_repo": "example/resonant",
+        "created_at": "2026-10-15T17:59:30Z",
+        "task_id": "t_5d5d5d",
+        "step": "reply",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": 0,
+        "cost_usd": 0.9,
+        "tokens_in": 300000,
+        "tokens_out": 12000,
+        "session_seconds": 3000,
+        "wait_seconds": 0,
+        "files_changed": 4,
+        "flagged_paths": [],
+        "summary": "Recorded the hourly update.",
+        "failure": null,
+        "last_note": null,
+        "did": [],
+        "effects": [],
+        "merged": [
+          "example/resonant#79"
+        ],
+        "merged_by": "resonant",
+        "history": [
+          {
+            "at": "2026-10-15T18:00:00Z",
+            "event": "start"
+          },
+          {
+            "at": "2026-10-15T18:50:00Z",
+            "event": "merged"
+          }
+        ],
+        "approval_ids": [],
+        "question_ids": [],
+        "linear_ids": [],
+        "detail": true,
+        "outside": [
+          "summary"
+        ]
+      },
+      {
+        "code": "R3",
+        "state": "merged",
+        "waiting_reason": null,
+        "started_at": "2026-10-14T10:00:00Z",
+        "ended_at": "2026-10-14T10:20:00Z",
+        "detected": 0,
+        "repo": "",
+        "ask": "Summarise the week's notes",
+        "branch": null,
+        "base_branch": null,
+        "head_sha": null,
+        "pr_url": null,
+        "pr_number": null,
+        "github_repo": null,
+        "created_at": "2026-10-14T09:59:30Z",
+        "task_id": null,
+        "step": "reply",
+        "attempts": 1,
+        "sessions": 1,
+        "exit_code": 0,
+        "cost_usd": 0.1,
+        "tokens_in": 20000,
+        "tokens_out": 900,
+        "session_seconds": 1200,
+        "wait_seconds": 0,
+        "files_changed": 0,
+        "flagged_paths": [],
+        "summary": null,
+        "failure": null,
+        "last_note": null,
+        "did": [],
+        "effects": [],
+        "merged": [],
+        "merged_by": null,
+        "history": [],
+        "approval_ids": [],
+        "question_ids": [],
+        "linear_ids": [],
+        "detail": false,
+        "outside": []
+      }
+    ]
+  },
+  "approvals": {
+    "open": 2,
+    "items": [
+      {
+        "id": "ap_k7q2",
+        "member_ids": [
+          "ap_k7q2"
+        ],
+        "code": "K7Q2",
+        "summary": "merge_pr github: example/resonant#81",
+        "level": "L1",
+        "effect": "write",
+        "needs_code": true,
+        "tool": "merge_pr",
+        "extension": "github",
+        "status": "pending",
+        "asked_at": "2026-10-16T08:50:00Z",
+        "expires_at": "2026-10-16T09:50:00Z",
+        "decided_at": null,
+        "decided_by": null,
+        "task_id": "t_8a0b11",
+        "run_code": "R10",
+        "changes": null,
+        "outside": [],
+        "requested_by": "slack:U07TEAM"
+      },
+      {
+        "id": "ap_d7a",
+        "member_ids": [
+          "ap_d7a",
+          "ap_d7b",
+          "ap_d7c"
+        ],
+        "code": "D7",
+        "summary": "3 changes",
+        "level": "L2",
+        "effect": "write",
+        "needs_code": false,
+        "tool": "batch",
+        "extension": null,
+        "status": "pending",
+        "asked_at": "2026-10-16T08:55:00Z",
+        "expires_at": "2026-10-16T09:55:00Z",
+        "decided_at": null,
+        "decided_by": null,
+        "task_id": null,
+        "run_code": null,
+        "changes": [
+          {
+            "summary": "linear: save issue title=\"Retry the relay push\"",
+            "level": "L3"
+          },
+          {
+            "summary": "linear: save comment issue=\"PER-263\"",
+            "level": "L3"
+          },
+          {
+            "summary": "restart resonant",
+            "level": "L2"
+          }
+        ],
+        "outside": [
+          "summary",
+          "changes"
+        ]
+      }
+    ],
+    "recent": [
+      {
+        "id": "ap_r1",
+        "member_ids": [
+          "ap_r1"
+        ],
+        "code": "M3P9",
+        "summary": "push resonant r8-hourly",
+        "level": "L2",
+        "effect": "write",
+        "needs_code": false,
+        "tool": "git_push",
+        "extension": null,
+        "status": "approved",
+        "asked_at": "2026-10-15T18:40:00Z",
+        "expires_at": "2026-10-15T19:10:00Z",
+        "decided_at": "2026-10-15T18:42:00Z",
+        "decided_by": "owner",
+        "task_id": "t_5d5d5d",
+        "run_code": "R8",
+        "changes": null,
+        "outside": []
+      }
+    ]
+  },
+  "questions": {
+    "open": 1,
+    "items": [
+      {
+        "id": 7,
+        "run_code": "R11",
+        "kind": "choice",
+        "text": "The new client drops Python 3.11. Bump the runtime too, or pin the old client?",
+        "options": [
+          "bump runtime",
+          "pin old client"
+        ],
+        "urgent": false,
+        "asked_at": "2026-10-16T08:12:00Z",
+        "outside": [
+          "text",
+          "options"
+        ]
+      }
+    ]
+  },
+  "pulse": {
+    "open": 3,
+    "untold": 2,
+    "items": [
+      {
+        "source": "core",
+        "key": "run/R11",
+        "title": "R11 asked a question",
+        "urgency": "urgent",
+        "state": "new",
+        "updated_at": "2026-10-16T08:12:00Z",
+        "expires_at": "2026-10-17T08:12:00Z",
+        "told_at": null,
+        "run_code": "R11",
+        "outside": [
+          "title"
+        ]
+      },
+      {
+        "source": "github",
+        "key": "pr/81",
+        "title": "PR #81 is green and waiting for you",
+        "urgency": "normal",
+        "state": "new",
+        "updated_at": "2026-10-16T08:40:00Z",
+        "expires_at": "2026-10-17T08:40:00Z",
+        "told_at": null,
+        "run_code": null,
+        "outside": [
+          "title"
+        ]
+      },
+      {
+        "source": "weather",
+        "key": "umbrella",
+        "title": "Rain after 4pm",
+        "urgency": "low",
+        "state": "told",
+        "updated_at": "2026-10-16T06:00:00Z",
+        "expires_at": "2026-10-17T06:00:00Z",
+        "told_at": "2026-10-16T06:05:00Z",
+        "run_code": null,
+        "outside": [
+          "title"
+        ]
+      },
+      {
+        "source": "core",
+        "key": "notice/backup",
+        "title": "Backup finished",
+        "urgency": "low",
+        "state": "told",
+        "updated_at": "2026-10-16T03:31:00Z",
+        "expires_at": "2026-10-17T03:31:00Z",
+        "told_at": "2026-10-16T04:00:00Z",
+        "run_code": null,
+        "outside": []
+      }
+    ]
+  },
+  "extensions": [
+    {
+      "name": "github",
+      "status": "enabled",
+      "health": "ok",
+      "muted_until": null,
+      "jobs": [
+        {
+          "id": "watch",
+          "schedule": "*/5 * * * *",
+          "tz": "UTC",
+          "effect": "read",
+          "level": "L0",
+          "next_due": "2026-10-16T09:05:00Z",
+          "last_run_at": "2026-10-16T08:55:00Z",
+          "last_outcome": "ok",
+          "fail_streak": 0
+        },
+        {
+          "id": "digest",
+          "schedule": "0 8 * * *",
+          "tz": "America/Los_Angeles",
+          "effect": "read",
+          "level": "L0",
+          "next_due": "2026-10-17T08:00:00Z",
+          "last_run_at": "2026-10-16T08:00:00Z",
+          "last_outcome": "ok",
+          "fail_streak": 0
+        }
+      ],
+      "description": "GitHub issues, PRs and CI",
+      "source_kind": "repo",
+      "commit": "3ef397a1b2c4",
+      "installed_at": "2026-09-20T12:00:00Z",
+      "tools": [
+        {
+          "name": "merge_pr",
+          "via": "cli",
+          "server": null,
+          "effect": "write",
+          "level": "L1",
+          "description": "Merge a pull request"
+        },
+        {
+          "name": "list_prs",
+          "via": "cli",
+          "server": null,
+          "effect": "read",
+          "level": "L0",
+          "description": "List open pull requests"
+        }
+      ],
+      "mcp_servers": [],
+      "secrets": [
+        "github_token"
+      ],
+      "report_max": "normal",
+      "repos": [
+        "resonant"
+      ],
+      "panels": [
+        {
+          "id": "prs",
+          "title": "Pull requests",
+          "description": "Open PRs and CI across the watched repos",
+          "schedule": "*/15 * * * *",
+          "active": "*/5 8-18 * * 1-5",
+          "tz": "America/Los_Angeles",
+          "updated_at": "2026-10-16T08:58:30Z",
+          "last_run_at": "2026-10-16T08:58:31Z",
+          "ok": true,
+          "stale": false,
+          "error": null,
+          "fail_streak": 0,
+          "health": "ok",
+          "truncated": false,
+          "bytes": 2860,
+          "local_url": "http://127.0.0.1:8765/panels/prs",
+          "views": [
+            {
+              "id": "overview",
+              "title": "Overview",
+              "widgets": [
+                {
+                  "type": "stat",
+                  "id": "open",
+                  "label": "Open PRs",
+                  "value": 7,
+                  "format": "integer",
+                  "delta": -2
+                },
+                {
+                  "type": "stat",
+                  "id": "pass",
+                  "label": "CI pass rate",
+                  "value": 94.5,
+                  "format": "percent",
+                  "delta": 1.2,
+                  "delta_format": "percent",
+                  "health": "ok"
+                },
+                {
+                  "type": "stat",
+                  "id": "wait",
+                  "label": "Median wait",
+                  "value": 5400,
+                  "format": "duration",
+                  "delta": -600,
+                  "delta_format": "duration",
+                  "hint": "time to first review"
+                },
+                {
+                  "type": "series",
+                  "id": "opened",
+                  "title": "PRs opened and merged",
+                  "kind": "line",
+                  "x_type": "time",
+                  "x": [
+                    1792116000,
+                    1792119600,
+                    1792123200,
+                    1792126800,
+                    1792130400,
+                    1792134000,
+                    1792137600,
+                    1792141200
+                  ],
+                  "format": "integer",
+                  "stacked": false,
+                  "series": [
+                    {
+                      "name": "Opened",
+                      "values": [
+                        1,
+                        0,
+                        2,
+                        null,
+                        3,
+                        2,
+                        4,
+                        3
+                      ]
+                    },
+                    {
+                      "name": "Merged",
+                      "values": [
+                        0,
+                        1,
+                        1,
+                        2,
+                        null,
+                        1,
+                        2,
+                        3
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "series",
+                  "id": "byrepo",
+                  "title": "Open PRs by repo",
+                  "kind": "bar",
+                  "x_type": "category",
+                  "x": [
+                    "resonant",
+                    "dashboard",
+                    "docs"
+                  ],
+                  "format": "integer",
+                  "stacked": true,
+                  "series": [
+                    {
+                      "name": "Open",
+                      "values": [
+                        4,
+                        2,
+                        1
+                      ]
+                    },
+                    {
+                      "name": "Draft",
+                      "values": [
+                        1,
+                        0,
+                        2
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "table",
+                  "id": "list",
+                  "title": "Needs a look",
+                  "columns": [
+                    {
+                      "key": "pr",
+                      "label": "PR",
+                      "type": "text"
+                    },
+                    {
+                      "key": "state",
+                      "label": "State",
+                      "type": "pill"
+                    },
+                    {
+                      "key": "lines",
+                      "label": "Lines",
+                      "type": "number"
+                    },
+                    {
+                      "key": "cost",
+                      "label": "CI cost",
+                      "type": "money",
+                      "currency": "USD"
+                    },
+                    {
+                      "key": "opened",
+                      "label": "Opened",
+                      "type": "time"
+                    },
+                    {
+                      "key": "act",
+                      "label": "Check",
+                      "type": "link"
+                    }
+                  ],
+                  "truncated": true,
+                  "total_rows": 7,
+                  "rows": [
+                    [
+                      "resonant#212 Fix relay budget",
+                      {
+                        "label": "CI green",
+                        "tone": "ok"
+                      },
+                      340,
+                      0.42,
+                      1792138200,
+                      {
+                        "label": "List PRs",
+                        "tool": "list_prs"
+                      }
+                    ],
+                    [
+                      "dashboard#88 Panels page",
+                      {
+                        "label": "CI failing",
+                        "tone": "bad"
+                      },
+                      1210,
+                      1.8,
+                      1792085400,
+                      {
+                        "label": "List PRs",
+                        "tool": "list_prs"
+                      }
+                    ],
+                    [
+                      "docs#31 Extensions guide",
+                      {
+                        "label": "draft",
+                        "tone": "neutral"
+                      },
+                      95,
+                      null,
+                      null,
+                      null
+                    ]
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "health",
+              "title": "Health",
+              "widgets": [
+                {
+                  "type": "status",
+                  "id": "checks",
+                  "title": "Checks",
+                  "items": [
+                    {
+                      "name": "GitHub API",
+                      "state": "up",
+                      "detail": "200 in 180 ms",
+                      "since": "2026-10-16T06:00:00Z"
+                    },
+                    {
+                      "name": "CI runners",
+                      "state": "warn",
+                      "detail": "1 queued job waiting",
+                      "since": "2026-10-16T08:40:00Z"
+                    },
+                    {
+                      "name": "Webhook",
+                      "state": "down"
+                    },
+                    {
+                      "name": "Mirror",
+                      "state": "unknown"
+                    }
+                  ],
+                  "truncated": false
+                },
+                {
+                  "type": "kv",
+                  "id": "limits",
+                  "title": "Rate limit",
+                  "truncated": false,
+                  "items": [
+                    {
+                      "key": "Remaining",
+                      "value": 4210,
+                      "format": "integer"
+                    },
+                    {
+                      "key": "Resets in",
+                      "value": 1800,
+                      "format": "duration"
+                    },
+                    {
+                      "key": "Cached",
+                      "value": true
+                    },
+                    {
+                      "key": "Token",
+                      "value": "app (read only)"
+                    },
+                    {
+                      "key": "Last error",
+                      "value": null
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "outside": [
+            "views"
+          ],
+          "history": {
+            "days": [
+              "2026-10-14",
+              "2026-10-12"
+            ],
+            "pending": [
+              "2026-10-15"
+            ],
+            "failed": [
+              "2026-10-13"
+            ]
+          }
+        },
+        {
+          "id": "ci",
+          "title": "CI report",
+          "description": "Nightly build summary",
+          "schedule": "0 * * * *",
+          "active": null,
+          "tz": null,
+          "updated_at": "2026-10-16T07:40:00Z",
+          "last_run_at": "2026-10-16T08:55:12Z",
+          "ok": false,
+          "stale": true,
+          "error": "exit 1: gh: HTTP 502 Bad Gateway",
+          "fail_streak": 3,
+          "health": "warn",
+          "truncated": false,
+          "bytes": 1190,
+          "views": [
+            {
+              "id": "summary",
+              "title": "Summary",
+              "widgets": [
+                {
+                  "type": "text",
+                  "id": "note",
+                  "text": "Nightly build: 3 of 41 jobs failed.\nLook at <b>docs</b> first; it has been red since Tuesday."
+                },
+                {
+                  "type": "series",
+                  "id": "trend",
+                  "title": "Build minutes",
+                  "kind": "area",
+                  "x_type": "time",
+                  "x": [
+                    1792116000,
+                    1792119600,
+                    1792123200,
+                    1792126800,
+                    1792130400
+                  ],
+                  "unit": "min",
+                  "format": "number",
+                  "stacked": false,
+                  "downsampled_from": 600,
+                  "series": [
+                    {
+                      "name": "Minutes",
+                      "values": [
+                        12.5,
+                        14,
+                        null,
+                        13.2,
+                        15.8
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "type": "details",
+                  "id": "raw",
+                  "title": "Raw data",
+                  "collapsed": true,
+                  "truncated": false,
+                  "rows": [
+                    {
+                      "depth": 0,
+                      "key": "",
+                      "kind": "object"
+                    },
+                    {
+                      "depth": 1,
+                      "key": "failed",
+                      "kind": "array"
+                    },
+                    {
+                      "depth": 2,
+                      "key": "[0]",
+                      "kind": "string",
+                      "value": "docs"
+                    },
+                    {
+                      "depth": 2,
+                      "key": "[1]",
+                      "kind": "string",
+                      "value": "lint"
+                    },
+                    {
+                      "depth": 1,
+                      "key": "total",
+                      "kind": "number",
+                      "value": "41"
+                    },
+                    {
+                      "depth": 1,
+                      "key": "flaky",
+                      "kind": "bool",
+                      "value": "false"
+                    },
+                    {
+                      "depth": 1,
+                      "key": "owner",
+                      "kind": "null"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "outside": [
+            "views",
+            "error"
+          ],
+          "history": null
+        }
+      ]
+    },
+    {
+      "name": "weather",
+      "status": "enabled",
+      "health": "degraded",
+      "muted_until": "2026-10-16T12:00:00Z",
+      "jobs": [
+        {
+          "id": "forecast",
+          "schedule": "0 * * * *",
+          "tz": "UTC",
+          "effect": "read",
+          "level": "L0",
+          "next_due": "2026-10-16T10:00:00Z",
+          "last_run_at": "2026-10-16T08:00:00Z",
+          "last_outcome": "failed",
+          "fail_streak": 2
+        }
+      ],
+      "description": "Forecast and rain alerts",
+      "source_kind": "path",
+      "commit": null,
+      "installed_at": "2026-10-01T09:00:00Z",
+      "tools": [
+        {
+          "name": "forecast",
+          "via": "mcp",
+          "server": "weather-mcp",
+          "effect": "read",
+          "level": "L0",
+          "description": "Hourly forecast"
+        }
+      ],
+      "mcp_servers": [
+        {
+          "id": "weather-mcp",
+          "transport": "http",
+          "host": "mcp.weather.example"
+        }
+      ],
+      "secrets": [],
+      "report_max": "low",
+      "repos": [],
+      "panels": []
+    },
+    {
+      "name": "notes-sync",
+      "status": "disabled",
+      "health": "unknown",
+      "muted_until": null,
+      "jobs": [],
+      "description": null,
+      "source_kind": "other",
+      "commit": null,
+      "installed_at": "2026-10-02T09:00:00Z",
+      "tools": [],
+      "mcp_servers": [],
+      "secrets": [],
+      "report_max": null,
+      "repos": [],
+      "panels": []
+    }
+  ],
+  "core_jobs": [
+    {
+      "id": "briefing",
+      "schedule": "0 8 * * *",
+      "tz": "America/Los_Angeles",
+      "effect": null,
+      "level": null,
+      "next_due": "2026-10-17T08:00:00Z",
+      "last_run_at": "2026-10-16T08:00:00Z",
+      "last_outcome": "ok",
+      "fail_streak": 0
+    },
+    {
+      "id": "pulse",
+      "schedule": "0 * * * *",
+      "tz": "America/Los_Angeles",
+      "effect": null,
+      "level": null,
+      "next_due": "2026-10-16T10:00:00Z",
+      "last_run_at": "2026-10-16T09:00:00Z",
+      "last_outcome": "ok",
+      "fail_streak": 0
+    },
+    {
+      "id": "backup",
+      "schedule": "30 3 * * *",
+      "tz": "America/Los_Angeles",
+      "effect": null,
+      "level": null,
+      "next_due": "2026-10-17T03:30:00Z",
+      "last_run_at": "2026-10-16T03:30:00Z",
+      "last_outcome": "ok",
+      "fail_streak": 0
+    }
+  ],
+  "runner": {
+    "set_up": true,
+    "missing": [],
+    "gaps": 0
+  },
+  "trust_rules": [
+    {
+      "n": 1,
+      "text": "allow push on resonant"
+    },
+    {
+      "n": 2,
+      "text": "ask merge on trading"
+    },
+    {
+      "n": 3,
+      "text": "notify failed now"
+    }
+  ],
+  "repos": [
+    {
+      "name": "resonant",
+      "slug": "example/resonant",
+      "mode": "push",
+      "base": "main",
+      "ci": true
+    },
+    {
+      "name": "trading-bot",
+      "slug": "example/trading-bot",
+      "mode": "push",
+      "base": "main",
+      "ci": false
+    },
+    {
+      "name": "upstream-lib",
+      "slug": "example/upstream-lib",
+      "mode": "fork",
+      "base": "develop",
+      "ci": null
+    }
+  ],
+  "claude_brain": {
+    "state": "up",
+    "turns": 3,
+    "remote_url": "https://claude.ai/code/session_brain",
+    "tools": [
+      {
+        "at": "2026-10-16T08:59:50Z",
+        "tool": "Bash",
+        "decision": "gate",
+        "command": "git push origin feat",
+        "cwd": "/Users/x/code/r",
+        "status": "ok",
+        "write": true,
+        "outside": [
+          "command"
+        ]
+      },
+      {
+        "at": "2026-10-16T08:59:40Z",
+        "tool": "Bash",
+        "decision": "allowed",
+        "command": "git rev-list --count HEAD",
+        "cwd": "/Users/x/code/r",
+        "status": "ok",
+        "write": false,
+        "outside": [
+          "command"
+        ]
+      }
+    ]
+  },
+  "brain_activity": {
+    "calls_today": 4,
+    "writes_today": 1,
+    "state": "up",
+    "turns": 3
+  },
+  "trust_rule_count": 3,
+  "repo_count": 3,
+  "diagram": {
+    "nodes": [
+      {
+        "id": "core:gateway",
+        "kind": "core",
+        "label": "iMessage gateway",
+        "text": "Reads new texts from Messages' chat.db and sends Resonant's replies, approval asks, pulses and briefings back over iMessage.",
+        "tags": [],
+        "health": "degraded",
+        "check": "imessage",
+        "module": "resonant/gateway/imessage/",
+        "group": "messages"
+      },
+      {
+        "id": "core:loop",
+        "kind": "core",
+        "label": "Event loop",
+        "text": "Turns every text, job and worker event into a durable task and runs the tasks by priority within the slot pool.",
+        "tags": [],
+        "health": "ok",
+        "check": "loop",
+        "module": "resonant/loop/",
+        "group": "messages"
+      },
+      {
+        "id": "core:router",
+        "kind": "core",
+        "label": "qwen router",
+        "text": "The local qwen3 model on Ollama triages each text: it answers a greeting or ack itself, builds the news check in code and hands everything else to Claude; it never writes a fact.",
+        "tags": [],
+        "health": "ok",
+        "check": "model",
+        "module": "resonant/router/",
+        "group": "messages"
+      },
+      {
+        "id": "core:brain",
+        "kind": "core",
+        "label": "Claude brain",
+        "text": "One long-lived Claude Code session on the subscription answers every other text in Resonant's one voice and calls Resonant's tools through the gate.",
+        "tags": [],
+        "health": "ok",
+        "state": "up",
+        "module": "resonant/runners/brain.py",
+        "group": "brain"
+      },
+      {
+        "id": "core:toolcore",
+        "kind": "core",
+        "label": "Tool core",
+        "text": "The one call path for the brain, jobs and watches: the registry, then the gate, then the executor; a boundary test keeps every call on it.",
+        "tags": [],
+        "module": "resonant/toolcore/",
+        "group": "toolcore"
+      },
+      {
+        "id": "core:gate",
+        "kind": "core",
+        "label": "Gate and policy",
+        "text": "Weighs each call's level against who chose it, applies trust rules and standing allows, and asks the owner by text (yes, yes always or yes <code>) when it must.",
+        "tags": [],
+        "module": "resonant/gate/",
+        "group": "toolcore"
+      },
+      {
+        "id": "core:executor",
+        "kind": "core",
+        "label": "Executor",
+        "text": "Runs an allowed call once (idempotency key), reads its Keychain secrets just before the call and writes the audit row.",
+        "tags": [],
+        "module": "resonant/executor.py",
+        "group": "toolcore"
+      },
+      {
+        "id": "core:scheduler",
+        "kind": "core",
+        "label": "Scheduler",
+        "text": "In-daemon cron: runs Resonant's own jobs (pulse, briefing, backups, prune, MCP drift) and every extension's jobs through the tool core; due runs are skipped while paused.",
+        "tags": [],
+        "health": "ok",
+        "module": "resonant/extensions/scheduler.py",
+        "last_run_at": "2026-10-16T09:00:00Z",
+        "group": "scheduler"
+      },
+      {
+        "id": "core:workers",
+        "kind": "core",
+        "label": "Claude workers",
+        "text": "Claude Code runs, each on its own branch copy of a repo in ~/code or a scratch dir, push PRs with a one-hour GitHub App token for one repo and ask or note over the worker desk.",
+        "tags": [],
+        "health": "ok",
+        "module": "resonant/runners/claude.py",
+        "group": "workers"
+      },
+      {
+        "id": "core:pulse",
+        "kind": "core",
+        "label": "Reports, pulse and briefing",
+        "text": "Collects run outcomes and extension reports as pulse items: urgent ones text at once, the rest go in the hourly pulse or the 08:00 briefing.",
+        "tags": [],
+        "module": "resonant/extensions/pulse_job.py",
+        "group": "messages"
+      },
+      {
+        "id": "core:store",
+        "kind": "core",
+        "label": "Store (SQLite)",
+        "text": "One SQLite file (WAL) with tasks, events, approvals, runs, trust rules, repos, pulse items, the audit log and kv state.",
+        "tags": [],
+        "health": "ok",
+        "check": "store",
+        "module": "resonant/store/",
+        "group": "store"
+      },
+      {
+        "id": "core:backups",
+        "kind": "core",
+        "label": "Backups",
+        "text": "core/backup copies the store every day with SQLite's online backup and keeps 7 daily and 4 weekly copies; core/prune trims old rows after a good backup.",
+        "tags": [],
+        "health": "unknown",
+        "module": "resonant/backup.py",
+        "group": "store"
+      },
+      {
+        "id": "core:dashboard",
+        "kind": "core",
+        "label": "Local dashboard",
+        "text": "Serves this page and /api/dashboard on 127.0.0.1:7777, loopback only.",
+        "tags": [],
+        "module": "resonant/api.py",
+        "group": "relay"
+      },
+      {
+        "id": "core:relay",
+        "kind": "core",
+        "label": "Relay pusher",
+        "text": "Pushes the redacted remote snapshot to Supabase every minute; nothing connects into the Mini.",
+        "tags": [],
+        "health": "unknown",
+        "module": "resonant/dashboard/pusher.py",
+        "group": "relay"
+      },
+      {
+        "id": "core:supabase",
+        "kind": "core",
+        "label": "Supabase",
+        "text": "Keeps the latest snapshot behind an insert-only RPC that refuses secret-shaped text; only the owner, with password and TOTP, can read it.",
+        "tags": [],
+        "module": "supabase/",
+        "group": "relay"
+      },
+      {
+        "id": "core:fly",
+        "kind": "core",
+        "label": "Fly dashboard and dead-man switch",
+        "text": "The Fly app serves this page from Supabase and checks the newest snapshot every minute; a stale snapshot or a failing check alerts the owner on ntfy.",
+        "tags": [],
+        "module": "relay/",
+        "group": "relay"
+      },
+      {
+        "id": "job:core/briefing",
+        "kind": "job",
+        "label": "briefing",
+        "parent": "core:scheduler",
+        "text": "core/briefing: daily 08:00 PDT job: sends the morning briefing with everything still open.",
+        "tags": [
+          "core job"
+        ],
+        "health": "ok",
+        "last_run_at": "2026-10-16T08:00:00Z",
+        "last_outcome": "ok",
+        "ext": "core",
+        "job": "briefing"
+      },
+      {
+        "id": "job:core/pulse",
+        "kind": "job",
+        "label": "pulse",
+        "parent": "core:scheduler",
+        "text": "core/pulse: hourly job: sends the hourly pulse: what you haven't heard yet, in one short text.",
+        "tags": [
+          "core job"
+        ],
+        "health": "ok",
+        "last_run_at": "2026-10-16T09:00:00Z",
+        "last_outcome": "ok",
+        "ext": "core",
+        "job": "pulse"
+      },
+      {
+        "id": "job:core/backup",
+        "kind": "job",
+        "label": "backup",
+        "parent": "core:scheduler",
+        "text": "core/backup: daily 03:30 PDT job: copies the store and checks the copy.",
+        "tags": [
+          "core job"
+        ],
+        "health": "ok",
+        "last_run_at": "2026-10-16T03:30:00Z",
+        "last_outcome": "ok",
+        "ext": "core",
+        "job": "backup"
+      },
+      {
+        "id": "proc:com.resonant.daemon",
+        "kind": "process",
+        "label": "com.resonant.daemon",
+        "text": "The Resonant daemon: one Python process with the loop, gate, scheduler and local API; launchd starts it at login and restarts it if it exits.",
+        "tags": [
+          "launchd",
+          "plist"
+        ],
+        "health": "ok",
+        "state": "running",
+        "group": "processes"
+      },
+      {
+        "id": "proc:com.resonant.ollama",
+        "kind": "process",
+        "label": "com.resonant.ollama",
+        "text": "Ollama serving the local qwen model the router uses, kept loaded in memory.",
+        "tags": [
+          "launchd",
+          "plist"
+        ],
+        "health": "ok",
+        "state": "running",
+        "group": "processes"
+      },
+      {
+        "id": "proc:com.resonant.caffeinate",
+        "kind": "process",
+        "label": "com.resonant.caffeinate",
+        "text": "caffeinate -i -m -s keeps the Mini awake on AC power so the daemon never sleeps.",
+        "tags": [
+          "launchd",
+          "plist"
+        ],
+        "health": "ok",
+        "state": "running",
+        "group": "processes"
+      },
+      {
+        "id": "proc:com.notessync.agent",
+        "kind": "process",
+        "label": "com.notessync.agent",
+        "text": "Syncs notes to the notes repo every 15 minutes.",
+        "tags": [
+          "launchd",
+          "plist"
+        ],
+        "health": "degraded",
+        "state": "exited 1",
+        "ext": "notes-sync",
+        "group": "processes"
+      },
+      {
+        "id": "proc:com.tradingbot.paper",
+        "kind": "process",
+        "label": "com.tradingbot.paper",
+        "text": "A launchd agent named after a repo in the registry.",
+        "tags": [
+          "launchd",
+          "plist"
+        ],
+        "health": "ok",
+        "state": "idle",
+        "group": "processes"
+      },
+      {
+        "id": "ext:github",
+        "kind": "extension",
+        "label": "github",
+        "text": "github: local CLI tools; 1 read runs without asking, 1 write always asks for yes <code>, 2 scheduled jobs. GitHub issues, PRs and CI.",
+        "tags": [
+          "local CLI"
+        ],
+        "health": "ok",
+        "check": "ext:github",
+        "state": "enabled",
+        "last_run_at": "2026-10-16T08:55:00Z",
+        "ext": "github",
+        "group": "extensions"
+      },
+      {
+        "id": "tool:github/merge_pr",
+        "kind": "tool",
+        "label": "merge_pr",
+        "parent": "ext:github",
+        "text": "github/merge_pr: local CLI write tool, always asks for yes <code>. Merge a pull request.",
+        "tags": [
+          "cli",
+          "write",
+          "L1",
+          "always asks for yes <code>"
+        ],
+        "ext": "github"
+      },
+      {
+        "id": "tool:github/list_prs",
+        "kind": "tool",
+        "label": "list_prs",
+        "parent": "ext:github",
+        "text": "github/list_prs: local CLI read tool, runs without asking. List open pull requests.",
+        "tags": [
+          "cli",
+          "read",
+          "L0",
+          "runs without asking"
+        ],
+        "ext": "github"
+      },
+      {
+        "id": "job:github/watch",
+        "kind": "job",
+        "label": "watch",
+        "parent": "ext:github",
+        "text": "github/watch: every 5 min job (read, runs without asking): polls your PRs' CI and reviews and records events for the hourly rollup.",
+        "tags": [
+          "read",
+          "L0"
+        ],
+        "health": "ok",
+        "last_run_at": "2026-10-16T08:55:00Z",
+        "last_outcome": "ok",
+        "ext": "github",
+        "job": "watch"
+      },
+      {
+        "id": "job:github/digest",
+        "kind": "job",
+        "label": "digest",
+        "parent": "ext:github",
+        "text": "github/digest: daily 08:00 PDT job (read, runs without asking): reports a summary of your PRs for the 08:00 briefing.",
+        "tags": [
+          "read",
+          "L0"
+        ],
+        "health": "ok",
+        "last_run_at": "2026-10-16T08:00:00Z",
+        "last_outcome": "ok",
+        "ext": "github",
+        "job": "digest"
+      },
+      {
+        "id": "repo:github/resonant",
+        "kind": "repo",
+        "label": "resonant",
+        "parent": "ext:github",
+        "text": "github is about resonant: a request that names github means this repo for a worker run. The link grants nothing.",
+        "tags": [
+          "repo"
+        ],
+        "ext": "github"
+      },
+      {
+        "id": "ext:weather",
+        "kind": "extension",
+        "label": "weather",
+        "text": "weather: MCP connector to mcp.weather.example; 1 read runs without asking, 1 scheduled job. Forecast and rain alerts.",
+        "tags": [
+          "hosted MCP (mcp.weather.example)"
+        ],
+        "health": "degraded",
+        "state": "enabled",
+        "last_run_at": "2026-10-16T08:00:00Z",
+        "ext": "weather",
+        "group": "extensions"
+      },
+      {
+        "id": "mcp:weather/weather-mcp",
+        "kind": "server",
+        "label": "weather-mcp",
+        "parent": "ext:weather",
+        "text": "weather/weather-mcp: hosted MCP server at mcp.weather.example; Resonant lists and pins its tools at install and re-checks them for drift.",
+        "tags": [
+          "http"
+        ],
+        "ext": "weather"
+      },
+      {
+        "id": "tool:weather/weather-mcp/forecast",
+        "kind": "tool",
+        "label": "forecast",
+        "parent": "ext:weather",
+        "text": "weather/forecast: hosted MCP (mcp.weather.example) read tool, runs without asking. Hourly forecast.",
+        "tags": [
+          "mcp",
+          "read",
+          "L0",
+          "runs without asking"
+        ],
+        "ext": "weather"
+      },
+      {
+        "id": "job:weather/forecast",
+        "kind": "job",
+        "label": "forecast",
+        "parent": "ext:weather",
+        "text": "weather/forecast: hourly job (read, runs without asking): adds tomorrow's forecast to the briefing.",
+        "tags": [
+          "read",
+          "L0"
+        ],
+        "health": "degraded",
+        "last_run_at": "2026-10-16T08:00:00Z",
+        "last_outcome": "failed",
+        "ext": "weather",
+        "job": "forecast"
+      },
+      {
+        "id": "ext:notes-sync",
+        "kind": "extension",
+        "label": "notes-sync",
+        "text": "notes-sync: no tools.",
+        "tags": [],
+        "health": "unknown",
+        "state": "disabled",
+        "ext": "notes-sync",
+        "group": "extensions"
+      },
+      {
+        "id": "panel:github/prs",
+        "kind": "panel",
+        "label": "Pull requests",
+        "parent": "ext:github",
+        "text": "Open PRs and CI across the watched repos",
+        "tags": [
+          "panel",
+          "read",
+          "L0"
+        ],
+        "health": "ok",
+        "last_run_at": "2026-10-16T08:58:30Z",
+        "ext": "github",
+        "panel": "prs"
+      },
+      {
+        "id": "panel:github/ci",
+        "kind": "panel",
+        "label": "CI report",
+        "parent": "ext:github",
+        "text": "Nightly build summary",
+        "tags": [
+          "panel",
+          "read",
+          "L0",
+          "stale"
+        ],
+        "health": "degraded",
+        "last_run_at": "2026-10-16T07:40:00Z",
+        "ext": "github",
+        "panel": "ci"
+      }
+    ],
+    "edges": [
+      {
+        "source": "core:gateway",
+        "target": "core:loop",
+        "label": "text in"
+      },
+      {
+        "source": "core:loop",
+        "target": "core:router",
+        "label": "triage"
+      },
+      {
+        "source": "core:router",
+        "target": "core:gateway",
+        "label": "greeting / ack"
+      },
+      {
+        "source": "core:router",
+        "target": "core:brain",
+        "label": "everything else"
+      },
+      {
+        "source": "core:brain",
+        "target": "core:toolcore",
+        "label": "tool call"
+      },
+      {
+        "source": "core:toolcore",
+        "target": "core:gate",
+        "label": "check"
+      },
+      {
+        "source": "core:gate",
+        "target": "core:executor",
+        "label": "allowed"
+      },
+      {
+        "source": "core:gate",
+        "target": "core:gateway",
+        "label": "approval ask"
+      },
+      {
+        "source": "core:executor",
+        "target": "core:workers",
+        "label": "start run"
+      },
+      {
+        "source": "core:scheduler",
+        "target": "core:toolcore",
+        "label": "jobs"
+      },
+      {
+        "source": "core:workers",
+        "target": "core:pulse",
+        "label": "run reports"
+      },
+      {
+        "source": "core:pulse",
+        "target": "core:gateway",
+        "label": "texts out"
+      },
+      {
+        "source": "core:brain",
+        "target": "core:gateway",
+        "label": "answer"
+      },
+      {
+        "source": "core:executor",
+        "target": "core:store",
+        "label": "audit"
+      },
+      {
+        "source": "core:store",
+        "target": "core:backups",
+        "label": "daily copy"
+      },
+      {
+        "source": "core:store",
+        "target": "core:dashboard",
+        "label": "snapshot"
+      },
+      {
+        "source": "core:store",
+        "target": "core:relay",
+        "label": "snapshot"
+      },
+      {
+        "source": "core:relay",
+        "target": "core:supabase",
+        "label": "push / min"
+      },
+      {
+        "source": "core:supabase",
+        "target": "core:fly",
+        "label": "read"
+      },
+      {
+        "source": "core:scheduler",
+        "target": "job:core/briefing",
+        "label": null
+      },
+      {
+        "source": "core:scheduler",
+        "target": "job:core/pulse",
+        "label": null
+      },
+      {
+        "source": "core:scheduler",
+        "target": "job:core/backup",
+        "label": null
+      },
+      {
+        "source": "proc:com.resonant.daemon",
+        "target": "core:loop",
+        "label": "runs"
+      },
+      {
+        "source": "proc:com.resonant.ollama",
+        "target": "core:router",
+        "label": "runs"
+      },
+      {
+        "source": "core:executor",
+        "target": "ext:github",
+        "label": "tool calls"
+      },
+      {
+        "source": "core:scheduler",
+        "target": "ext:github",
+        "label": "jobs"
+      },
+      {
+        "source": "ext:github",
+        "target": "core:pulse",
+        "label": "reports"
+      },
+      {
+        "source": "ext:github",
+        "target": "tool:github/merge_pr",
+        "label": null
+      },
+      {
+        "source": "ext:github",
+        "target": "tool:github/list_prs",
+        "label": null
+      },
+      {
+        "source": "ext:github",
+        "target": "job:github/watch",
+        "label": "cron"
+      },
+      {
+        "source": "ext:github",
+        "target": "job:github/digest",
+        "label": "cron"
+      },
+      {
+        "source": "ext:github",
+        "target": "repo:github/resonant",
+        "label": "linked"
+      },
+      {
+        "source": "core:executor",
+        "target": "ext:weather",
+        "label": "tool calls"
+      },
+      {
+        "source": "core:scheduler",
+        "target": "ext:weather",
+        "label": "jobs"
+      },
+      {
+        "source": "ext:weather",
+        "target": "core:pulse",
+        "label": "reports"
+      },
+      {
+        "source": "ext:weather",
+        "target": "mcp:weather/weather-mcp",
+        "label": "MCP"
+      },
+      {
+        "source": "mcp:weather/weather-mcp",
+        "target": "tool:weather/weather-mcp/forecast",
+        "label": null
+      },
+      {
+        "source": "ext:weather",
+        "target": "job:weather/forecast",
+        "label": "cron"
+      },
+      {
+        "source": "core:executor",
+        "target": "ext:notes-sync",
+        "label": "tool calls"
+      },
+      {
+        "source": "ext:notes-sync",
+        "target": "proc:com.notessync.agent",
+        "label": "owns"
+      },
+      {
+        "source": "ext:github",
+        "target": "panel:github/prs",
+        "label": "draws"
+      },
+      {
+        "source": "ext:github",
+        "target": "panel:github/ci",
+        "label": "draws"
+      }
+    ],
+    "groups": [
+      {
+        "id": "messages",
+        "label": "Messages in and out",
+        "text": "Texts come in over iMessage, the event loop queues them and the qwen router triages them; replies, approval asks, pulses and briefings go back out the same way."
+      },
+      {
+        "id": "brain",
+        "label": "Claude brain",
+        "text": "One long-lived Claude Code session answers every text the router hands on and calls Resonant's tools through the gate."
+      },
+      {
+        "id": "toolcore",
+        "label": "Gate and tool core",
+        "text": "Every tool call takes one path: the registry, the gate (which asks you by text when it must) and the executor, which runs it once and audits it."
+      },
+      {
+        "id": "workers",
+        "label": "Workers",
+        "text": "Claude Code runs on their own branch copies of a repo; they push PRs and report back."
+      },
+      {
+        "id": "scheduler",
+        "label": "Scheduler and jobs",
+        "text": "In-daemon cron for Resonant's own jobs and every extension's jobs, all through the tool core."
+      },
+      {
+        "id": "extensions",
+        "label": "Extensions",
+        "text": "What you installed: each extension with its MCP servers, tools, jobs and repos, from the manifest you approved."
+      },
+      {
+        "id": "store",
+        "label": "Store and backups",
+        "text": "One SQLite file holds tasks, approvals, runs and the audit log, copied every day."
+      },
+      {
+        "id": "relay",
+        "label": "Dashboard and relay",
+        "text": "This page, served on the Mini and, from the snapshot pushed to Supabase every minute, by the Fly app that also watches for silence."
+      },
+      {
+        "id": "processes",
+        "label": "launchd agents",
+        "text": "The Mac's launchd agents Resonant knows: its own, those an extension declares and those named after a registered repo."
+      }
+    ],
+    "processes_scanned": true,
+    "truncated": false
+  },
+  "jobs": [
+    {
+      "id": "J1",
+      "name": "Flaky CI sweep",
+      "kind": "schedule",
+      "state": "active",
+      "schedule": "0 9 * * 1",
+      "tz": "America/Los_Angeles",
+      "next_due": "2026-10-19T16:00:00Z",
+      "last_run_code": "R12",
+      "last_run_status": "running",
+      "last_run_at": "2026-10-16T08:30:00Z",
+      "last_error": null,
+      "created_by": "justin",
+      "output": "room:eng",
+      "outside": []
+    },
+    {
+      "id": "J2",
+      "name": "Weekly dependency report",
+      "kind": "schedule",
+      "state": "paused",
+      "schedule": "30 8 * * 5",
+      "tz": "America/Los_Angeles",
+      "next_due": null,
+      "last_run_code": null,
+      "last_run_status": null,
+      "last_run_at": null,
+      "last_error": null,
+      "created_by": "slack:U07TEAM",
+      "output": "thread",
+      "outside": [
+        "name"
+      ]
+    }
+  ],
+  "channels": {
+    "slack": {
+      "connected": true,
+      "last_event_at": "2026-10-16T08:59:30Z",
+      "followed_threads": 3
+    }
+  }
+}

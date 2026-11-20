@@ -1,11 +1,14 @@
 import { TriangleAlert } from "lucide-react";
 import { type FormEvent, type ReactNode, useCallback, useEffect, useState } from "react";
-import { Dashboard } from "@/Dashboard";
+import { InstanceDashboard } from "@/Instances";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import type { Loader } from "@/lib/hooks";
+import type { InstanceRef } from "@/lib/instances";
+import type { DayLoader } from "@/lib/panelDays";
 import type { AuthStage, RemoteClient } from "@/lib/supabase";
 
 type Stage = AuthStage | { kind: "loading" };
@@ -50,9 +53,18 @@ export function SupabaseGate({ client }: { client: RemoteClient }) {
   };
 
   const signOut = () => void run(() => client.signOut());
-  const load = useCallback(() => client.latest(), [client]);
-  const loadDay = useCallback(
-    (ext: string, panel: string, day: string) => client.panelDay(ext, panel, day),
+  // PER-306: every read names its instance (one `snapshot_latest` row each); none listed
+  // (before PER-304's column) reads the newest row, as before.
+  const loaderFor = useCallback(
+    (inst: InstanceRef | null): Loader =>
+      () =>
+        client.latest(inst?.name),
+    [client],
+  );
+  const dayLoaderFor = useCallback(
+    (inst: InstanceRef | null): DayLoader =>
+      (ext: string, panel: string, day: string) =>
+        client.panelDay(ext, panel, day, inst?.name),
     [client],
   );
 
@@ -60,7 +72,7 @@ export function SupabaseGate({ client }: { client: RemoteClient }) {
     case "loading":
       return <Shell>{null}</Shell>;
     case "ready":
-      return <Dashboard load={load} loadDay={loadDay} onSignOut={signOut} />;
+      return <RemoteInstances client={client} loaderFor={loaderFor} dayLoaderFor={dayLoaderFor} onSignOut={signOut} />;
     case "signed_out":
       return (
         <Shell error={error}>
@@ -92,6 +104,34 @@ export function SupabaseGate({ client }: { client: RemoteClient }) {
         </Shell>
       );
   }
+}
+
+/** Lists the instances once signed in (the rows of `snapshot_latest`), then shows the chosen
+ * one's dashboard; the switcher appears when there are two or more. */
+function RemoteInstances({
+  client,
+  loaderFor,
+  dayLoaderFor,
+  onSignOut,
+}: {
+  client: RemoteClient;
+  loaderFor: (inst: InstanceRef | null) => Loader;
+  dayLoaderFor: (inst: InstanceRef | null) => DayLoader;
+  onSignOut: () => void;
+}) {
+  const [instances, setInstances] = useState<InstanceRef[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    client.instances().then(
+      (list) => alive && setInstances(list),
+      () => alive && setInstances([]),
+    );
+    return () => {
+      alive = false;
+    };
+  }, [client]);
+  if (instances === null) return null;
+  return <InstanceDashboard instances={instances} loaderFor={loaderFor} dayLoaderFor={dayLoaderFor} onSignOut={onSignOut} />;
 }
 
 function Shell({ children, error }: { children: ReactNode; error?: string | null }) {

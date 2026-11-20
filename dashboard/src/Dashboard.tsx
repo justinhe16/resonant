@@ -18,7 +18,9 @@ import { Claude } from "@/sections/Claude";
 import { Extensions } from "@/sections/Extensions";
 import { Jobs } from "@/sections/Jobs";
 import { Pulse } from "@/sections/Pulse";
+import { RegisteredJobs } from "@/sections/RegisteredJobs";
 import { Rules } from "@/sections/Rules";
+import { Slack } from "@/sections/Slack";
 import { SystemStatus } from "@/sections/SystemStatus";
 import { WaitingOnYou } from "@/sections/WaitingOnYou";
 import { ActiveRuns, ActiveTasks, RecentRuns, Slots, Tasks } from "@/sections/Work";
@@ -37,7 +39,21 @@ function readTab(): Tab {
   }
 }
 
-export function Dashboard({ load, loadDay, onSignOut }: { load: Loader; loadDay?: DayLoader; onSignOut?: () => void }) {
+export function Dashboard({
+  load,
+  loadDay,
+  onSignOut,
+  name,
+  switcher,
+}: {
+  load: Loader;
+  loadDay?: DayLoader;
+  onSignOut?: () => void;
+  /** PER-306: the instance shown, when there is more than one */
+  name?: string;
+  /** PER-306: the instance switcher, in place of the title */
+  switcher?: ReactNode;
+}) {
   const { snapshot: snap, error, loading, refresh } = usePolling(load);
   const now = useNow();
   const route = useHashRoute();
@@ -52,6 +68,7 @@ export function Dashboard({ load, loadDay, onSignOut }: { load: Loader; loadDay?
     }
   };
 
+  const title = name ?? snap?.instance?.display_name ?? "Resonant";
   const stale = snap ? staleness(snap, now) : null;
   const worst = snap?.health.length ? worstHealth(snap.health.map((h) => h.state)) : "unknown";
   // One bad section shows its own error; the next snapshot retries it.
@@ -62,7 +79,7 @@ export function Dashboard({ load, loadDay, onSignOut }: { load: Loader; loadDay?
       <header className="sticky top-0 z-10 border-b bg-background/80 pt-[env(safe-area-inset-top)] backdrop-blur supports-[backdrop-filter]:bg-background/70">
         <div className="mx-auto flex h-14 max-w-6xl items-center gap-3 px-4 sm:px-6 lg:px-8">
           <Dot tone={snap && !stale ? healthTone(worst) : "neutral"} />
-          <span className="font-semibold tracking-tight">Resonant</span>
+          {switcher ?? <span className="font-semibold tracking-tight">{title}</span>}
           {snap && (
             <span className="truncate text-xs text-muted-foreground" data-testid="last-seen">
               seen {relative(snap.taken_at, now)}
@@ -119,7 +136,7 @@ export function Dashboard({ load, loadDay, onSignOut }: { load: Loader; loadDay?
         {error && (
           <Alert variant={snap ? "warn" : "bad"} data-testid="error-banner">
             <WifiOff />
-            <AlertTitle>Can't reach Resonant</AlertTitle>
+            <AlertTitle>Can't reach {title}</AlertTitle>
             <AlertDescription className="break-words">{error}</AlertDescription>
           </Alert>
         )}
@@ -167,6 +184,7 @@ export function Dashboard({ load, loadDay, onSignOut }: { load: Loader; loadDay?
           >
             <div className="space-y-6" data-testid="column-left">
               {guard(<SystemStatus snap={snap} now={now} stale={stale !== null} />)}
+              {snap.channels?.slack && guard(<Slack slack={snap.channels.slack} now={now} />)}
               {guard(<Slots snap={snap} />)}
               {guard(<ActiveRuns snap={snap} now={now} />)}
               {guard(<ActiveTasks snap={snap} />)}
@@ -180,6 +198,7 @@ export function Dashboard({ load, loadDay, onSignOut }: { load: Loader; loadDay?
               {guard(<Tasks snap={snap} now={now} />)}
               {guard(<Claude snap={snap} now={now} />)}
               {guard(<Jobs snap={snap} now={now} />)}
+              {snap.jobs && snap.jobs.length > 0 && guard(<RegisteredJobs snap={snap} now={now} />)}
               {guard(<Rules rules={snap.trust_rules} repos={snap.repos} />)}
             </div>
           </div>

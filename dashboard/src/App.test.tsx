@@ -39,6 +39,7 @@ describe("App", () => {
       signIn: vi.fn(),
       verify: vi.fn(),
       signOut: vi.fn(),
+      instances: vi.fn(async () => []),
       latest: vi.fn(),
       panelDay: vi.fn(async () => null),
       onAuthChange: vi.fn(() => () => {}),
