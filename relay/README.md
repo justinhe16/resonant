@@ -3,7 +3,7 @@
 The off-Mini half of the remote dashboard ([`docs/dashboard-plan.md`](../docs/dashboard-plan.md), DB-4). One small Fly machine that:
 
 1. **Serves the dashboard** from the committed build in `dashboard/dist`, with a `config.json` generated at boot from the environment (`{"source": "supabase", "url": SUPABASE_URL, "anon_key": SUPABASE_ANON_KEY}`; the committed local-mode `config.json` is never served). The browser logs in with Supabase Auth (password + TOTP, AAL2) and reads the latest snapshot (`snapshot_latest`; PER-276: the full snapshot, texts included) itself; the relay never sees the owner's session.
-2. **Runs the dead-man checker** (plan §1 D6): every minute it reads the newest snapshot's `taken_at` and health states and alerts when snapshots stop, when a health row is `failing`, or when it can't read Supabase at all, and once more on each recovery.
+2. **Runs the dead-man checker** (plan §1 D6): every minute it reads each watched instance's newest snapshot `taken_at` and health states (PER-305: `RELAY_INSTANCES`, default personal Resonant only) and alerts when an instance's snapshots stop, when one of its health rows is `failing`, or when it can't read Supabase at all, and once more on each recovery. Cori's alerts also go to `#voyager-pulse` through her Slack Incoming Webhook: a dead Cori can't say she's dead.
 3. Answers **`/healthz`** (`{"ok": true}`, or 503 when the checker has stopped checking). It says nothing about Resonant's state: the URL is public.
 
 It never connects to the Mini and nothing on the Mini connects to it (D4).
@@ -19,7 +19,7 @@ The rest of Resonant is Python, so the relay uses the same ruff, pyright (strict
 | `resonant_relay/config.py` | settings from env, validated at boot (accepts only an `sb_publishable_` key or an anon-role JWT as the anon key, a non-origin `SUPABASE_URL`, non-https alert URLs) |
 | `resonant_relay/source.py` | the checker's read path: the `StatusSource` interface, `RpcSource` (default) and `TableSource` |
 | `resonant_relay/checker.py` | the incident state machine |
-| `resonant_relay/alerts.py` | ntfy and webhook channels |
+| `resonant_relay/alerts.py` | ntfy, generic webhook and per-instance Slack Incoming Webhook channels |
 | `resonant_relay/web.py` | static server, generated `config.json`, security headers, `/healthz` |
 | `resonant_relay/http.py` | outbound HTTPS: no redirects, 10s timeout, 256 KiB cap, errors that never include a URL |
 | `Dockerfile`, `fly.toml`, `../.dockerignore` | the image and the Fly app. **The build context is the repo root** (the image copies `dashboard/dist`), so `.dockerignore` lives at the root and allow-lists just `relay/resonant_relay` and `dashboard/dist`. |
@@ -42,20 +42,25 @@ Public values go in `fly.toml` `[env]`; everything owner-specific is a `fly secr
 | `NTFY_URL` | `https://ntfy.sh` | ntfy server |
 | `NTFY_TOPIC` | | ntfy topic (1-64 of `A-Za-z0-9_-`). Anyone who knows it can read your alerts and post to it: treat it as a secret, make it long and random. |
 | `NTFY_TOKEN` | | optional ntfy access token (`Authorization: Bearer`) for a protected topic |
-| `WEBHOOK_URL` | | optional https URL; gets a JSON POST per alert: `{"source": "resonant-relay", "kind": "stale"\|"failing"\|"read_error", "event": "open"\|"recovered", "title", "message", "at"}` |
+| `WEBHOOK_URL` | | optional https URL; gets a JSON POST per alert: `{"source": "resonant-relay", "kind": "stale"\|"failing"\|"read_error", "event": "open"\|"recovered", "title", "message", "at"}`, plus `"instance"` on another instance's `stale`/`failing` alert (PER-305; personal's body is unchanged) |
+| `RELAY_INSTANCES` | `resonant` | comma list of instances to watch (`resonant,cori`). A listed instance that never pushed (or has no ingest token yet) counts as stale; rows of an unlisted instance are ignored. Public: `fly.toml` `[env]`. |
+| `RELAY_NOTIFY_<INSTANCE>` | the global channels, plus `slack` when `SLACK_WEBHOOK_<INSTANCE>` is set | comma list of channels for that instance's `stale`/`failing` alerts: `ntfy`, `webhook`, `slack` (e.g. `RELAY_NOTIFY_CORI=ntfy,slack`). Each must be set up, or the relay refuses to start (`slack` listed without its URL included). `-` in a name is `_` here. Personal has neither this nor a Slack webhook, so it stays on ntfy/webhook. Public: `fly.toml` `[env]`. |
+| `SLACK_WEBHOOK_<INSTANCE>` | | that instance's Slack Incoming Webhook (`SLACK_WEBHOOK_CORI`, posting to `#voyager-pulse`). A secret: `fly secrets` only, never logged. Must be `https://hooks.slack.com/...`, or the relay refuses to start. Unset: no Slack posts, nothing else changes. |
 | `PORT`, `DIST_DIR` | `8080`, `/app/dist` | set by the image |
 
-At least one of `NTFY_TOPIC` or `WEBHOOK_URL` is required; with both, each gets every alert.
+At least one of `NTFY_TOPIC` or `WEBHOOK_URL` is required; with both, each gets every alert (unless an instance's `RELAY_NOTIFY_<INSTANCE>` narrows its own). `read_error` always goes to the global channels only, never Slack: it is about the relay, not an instance.
 
 ## The checker
 
-Three independent incidents, each with one alert when it opens and one when it recovers:
+Independent incidents, each with one alert when it opens and one when it recovers. `stale` and `failing` are kept per watched instance (`RELAY_INSTANCES`), so Cori going quiet while personal is fresh is one Cori incident and nothing for personal; `read_error` is one, global:
 
-- **stale**: the newest snapshot is older than `STALE_AFTER`, or there are none at all. "Snapshots stopped: none for 7m (last 12:03 UTC)."
-- **failing**: the newest snapshot has a health row in state `failing` (`degraded` and `unknown` don't alert; the dashboard shows them). The alert names the rows. Rows joining or leaving while the incident is open don't alert again; it recovers when none is failing.
-- **read_error**: Supabase couldn't be read (network, HTTP error, bad token, unexpected shape) for `READ_FAIL_AFTER` in a row. This is reported distinctly ("the relay can't read snapshots ... it can't tell whether Resonant is up"). While reads fail, stale and failing keep their last known value, so a Supabase outage neither fakes a recovery nor piles on a second "stale" alert.
+- **stale**: the instance's newest snapshot is older than `STALE_AFTER`, or there are none at all. "Snapshots stopped: none for 7m (last 12:03 UTC)."
+- **failing**: the instance's newest snapshot has a health row in state `failing` (`degraded` and `unknown` don't alert; the dashboard shows them). The alert names the rows. Rows joining or leaving while the incident is open don't alert again; it recovers when none is failing.
+- **read_error**: Supabase couldn't be read (network, HTTP error, bad token, unexpected shape) for `READ_FAIL_AFTER` in a row. This is reported distinctly ("the relay can't read snapshots ... it can't tell whether Resonant is up"). While reads fail, every instance's stale and failing keep their last known value, so a Supabase outage neither fakes a recovery nor piles on a second "stale" alert.
 
-Each channel remembers what it last told you, per incident, so a failed send is retried at the next check and a broken webhook never makes ntfy repeat itself. State lives in memory: after a restart or deploy, an incident that is still open is announced once more. That is why the app runs on **exactly one machine**; two would alert twice.
+Alerts name the instance by its display name (the name capitalized, as the daemon's default `instance.display_name`). Personal Resonant's text is exactly what it was before instances ("Resonant: no snapshots" / "Snapshots stopped: …"); Cori's ntfy titles read "Cori: no snapshots", "Cori: snapshots back", "Cori: health failing", "Cori: health ok". Slack gets one code-built line: `🔴 Cori: no snapshot for 7m (last 14:02 UTC)`, `🔴 Cori: failing — channel:slack, model`, `✅ Cori: back (snapshot 20s old)`, `✅ Cori: health ok, nothing failing`. Removing an instance from `RELAY_INSTANCES` (a restart) drops its state silently.
+
+Each channel remembers what it last told you, per incident it hears about, so a failed send is retried at the next check and a broken webhook (or Slack) never makes ntfy repeat itself. State lives in memory: after a restart or deploy, an incident that is still open is announced once more. That is why the app runs on **exactly one machine**; two would alert twice.
 
 A watchdog exits the process if the checker hasn't finished a check for `max(3 × CHECK_EVERY + 30s, 180s)`; Fly restarts it (`[[restart]] policy = "always"`), and `/healthz` goes 503 meanwhile.
 
@@ -63,11 +68,11 @@ Logs carry what happened (state changes, alerts sent, failures by status code or
 
 ## The checker's read path
 
-The checker needs only the newest snapshot's `taken_at` and each health row's `name` and `state`. It reads through the `StatusSource` interface in `source.py`, from the `snapshots` history table, whose schema-2 rows are slim (PER-276: `schema, tier, taken_at, version, slim, health [{name, state, since}], counts`) and carry exactly that, so the checker never reads the 256 KiB `snapshot_latest` row and is unchanged.
+The checker needs only each instance's newest snapshot `taken_at` and each health row's `name` and `state`. It reads through the `StatusSource` interface in `source.py`, from the `snapshots` history table, whose schema-2 rows are slim (PER-276: `schema, tier, taken_at, version, slim, health [{name, state, since}], counts`) and carry exactly that, so the checker never reads the 256 KiB `snapshot_latest` row and is unchanged.
 
-**`RELAY_READ=rpc` (the default, and what the migration grants).** The relay calls `POST /rest/v1/rpc/relay_status` with the public anon key as `apikey` (and as `Authorization: Bearer` only for a legacy JWT key; an `sb_publishable_` key goes in `apikey` alone) and body `{"token": "<RELAY_STATUS_TOKEN>"}`. The function is `public.relay_status(token text) returns jsonb` in [`supabase/migrations/20261016000000_relay.sql`](../supabase/migrations/20261016000000_relay.sql): `SECURITY DEFINER`, executable by `anon`, `volatile` so PostgREST takes POST only. It compares the token's SHA-256 with `relay_private.config.status_token_sha256`; a wrong token (or none configured) **raises** `42501`, which PostgREST answers with 401/403 and the relay reports as a read error ("HTTP 401"), never as "no snapshots". With no snapshots it returns `null`, else `{"taken_at": <timestamptz>, "health": [{"name": text, "state": text}, ...]}` from the newest row by `taken_at`. Since PER-304 (`20261120000000_relay_instances.sql`) the relay is keyed by instance: the top-level `taken_at` and `health` are personal Resonant's (`resonant`) newest row, so this checker is unchanged, and an added `"instances": [{"instance", "taken_at", "health"}, ...]` lists every instance with an ingest token (`taken_at` null for one that never pushed), for a per-instance checker (PER-305). Nothing with write access or broad read access lives on Fly.
+**`RELAY_READ=rpc` (the default, and what the migration grants).** The relay calls `POST /rest/v1/rpc/relay_status` with the public anon key as `apikey` (and as `Authorization: Bearer` only for a legacy JWT key; an `sb_publishable_` key goes in `apikey` alone) and body `{"token": "<RELAY_STATUS_TOKEN>"}`. The function is `public.relay_status(token text) returns jsonb` in [`supabase/migrations/20261016000000_relay.sql`](../supabase/migrations/20261016000000_relay.sql): `SECURITY DEFINER`, executable by `anon`, `volatile` so PostgREST takes POST only. It compares the token's SHA-256 with `relay_private.config.status_token_sha256`; a wrong token (or none configured) **raises** `42501`, which PostgREST answers with 401/403 and the relay reports as a read error ("HTTP 401"), never as "no snapshots". With no snapshots it returns `null`, else `{"taken_at": <timestamptz>, "health": [{"name": text, "state": text}, ...]}` from the newest row by `taken_at`. Since PER-304 (`20261120000000_relay_instances.sql`) the relay is keyed by instance: the top-level `taken_at` and `health` are personal Resonant's (`resonant`) newest row, so this checker is unchanged, and an added `"instances": [{"instance", "taken_at", "health"}, ...]` lists every instance with an ingest token (`taken_at` null for one that never pushed), which this checker reads (PER-305); an answer without `instances` (before that migration) still parses, as `resonant`'s. Nothing with write access or broad read access lives on Fly.
 
-**Fallback: `RELAY_READ=table`.** The relay sends `GET /rest/v1/snapshots?select=taken_at,health:data->health&order=taken_at.desc&limit=1` with `RELAY_READ_KEY` as both `apikey` and bearer. That key's role must be able to `SELECT taken_at, data` on `snapshots`. The migration grants that to nobody but the MFA'd owner, and the only built-in key that could is `service_role`, which bypasses RLS and can write everything: don't use it. `rpc` is the supported path.
+**Fallback: `RELAY_READ=table`.** The relay sends `GET /rest/v1/snapshots?select=taken_at,health:data->health&instance=eq.<instance>&order=taken_at.desc&limit=1`, one per watched instance, with `RELAY_READ_KEY` as both `apikey` and bearer. That key's role must be able to `SELECT taken_at, data` on `snapshots`. The migration grants that to nobody but the MFA'd owner, and the only built-in key that could is `service_role`, which bypasses RLS and can write everything: don't use it. `rpc` is the supported path.
 
 ## Deploy (owner steps)
 
@@ -78,7 +83,8 @@ brew install flyctl && fly auth login
 fly apps create "$APP"                  # leaves relay/fly.toml untouched; every command takes --app
 # Secrets on stdin, so they stay out of shell history and argv (go-live 15 step 5 makes the
 # status token and the ntfy topic in shell variables first):
-#   SUPABASE_URL, SUPABASE_ANON_KEY, RELAY_STATUS_TOKEN, NTFY_TOPIC [, NTFY_URL, NTFY_TOKEN, WEBHOOK_URL]
+#   SUPABASE_URL, SUPABASE_ANON_KEY, RELAY_STATUS_TOKEN, NTFY_TOPIC [, NTFY_URL, NTFY_TOKEN, WEBHOOK_URL,
+#   SLACK_WEBHOOK_CORI]
 { echo "SUPABASE_URL=..."; ...; } | fly secrets import --app "$APP" --stage
 fly secrets list --app "$APP"           # names and digests only
 
