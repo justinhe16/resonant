@@ -165,7 +165,7 @@ async def _prompt(
     unreachable: list[str] = []
     error: ChannelError | None = None
     asking = get_task(conn, task_id) if task_id else None
-    thread = thread_of(asking)
+    thread = thread_of(asking, to=None if asking is None else asking.principal)
     for approver in approvers:
         try:
             mine = thread is not None and asking is not None and approver == asking.principal

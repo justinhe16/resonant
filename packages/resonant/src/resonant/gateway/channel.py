@@ -161,25 +161,27 @@ class Channel(Protocol):
 
 def event_identity(event: Event) -> str | None:
     """The sender's channel identity of a message event: ``payload.identity``, set by the
-    adapter. An iMessage event stored before PER-292 has only ``payload.handle``; its
-    identity is ``imessage:<handle>``. None when neither is there."""
+    adapter, and only on the adapter's own channel (``slack:…`` on a ``slack`` event). An
+    iMessage event stored before PER-292 has only ``payload.handle``; its identity is
+    ``imessage:<handle>``. None otherwise."""
     identity: object = event.payload.get("identity")
     if isinstance(identity, str) and identity:
-        return identity
+        return identity if identity.partition(":")[0] == event.source else None
     handle: object = event.payload.get("handle")
     if event.source == "imessage" and isinstance(handle, str) and handle:
         return f"imessage:{handle}"
     return None
 
 
-def thread_of(task: Task | dict[str, Any] | None) -> MessageRef | None:
+def thread_of(task: Task | dict[str, Any] | None, *, to: str | None = None) -> MessageRef | None:
     """Where a task's replies go: its ``channel_ref`` thread as a ``MessageRef``, or None.
 
     None for a task with no ``channel_ref``, for an unthreaded channel (iMessage) and for
     every ``channel_ref`` written before PER-292 (no ``thread``): their sends pick the
-    principal's first running identity, as before."""
+    principal's first running identity, as before. ``to``: the principal the text goes to;
+    a thread that is another principal's is None (a thread is only ever its asker's)."""
     ref = task if isinstance(task, dict) or task is None else task.channel_ref
-    if ref is None:
+    if ref is None or (to is not None and ref.get("principal") != to):
         return None
     channel, thread, msg = ref.get("channel"), ref.get("thread"), ref.get("ref")
     if not isinstance(channel, str) or not isinstance(thread, str) or not thread:

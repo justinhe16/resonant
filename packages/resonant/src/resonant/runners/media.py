@@ -211,7 +211,7 @@ class MediaRunner(LocalRunner):
     async def _say(self, task: Task, principal: str, text: str, path: str) -> StepOutcome:
         try:
             await self.channel.send(
-                principal, text, thread=thread_of(task), dedupe_key=f"reply:{task.id}"
+                principal, text, thread=thread_of(task, to=principal), dedupe_key=f"reply:{task.id}"
             )
         except ChannelRefused as e:
             return Fail(f"reply refused: {e}")

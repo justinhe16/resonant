@@ -1146,7 +1146,7 @@ class AskRunner:
             if task_id in self._answered or self._has_answer(task_id):
                 return
             try:
-                thread = thread_of(get_task(self.conn, task_id))
+                thread = thread_of(get_task(self.conn, task_id), to=principal)
                 await self.channel.send(
                     principal, text, thread=thread, dedupe_key=ACK_KEY + task_id
                 )
@@ -1733,7 +1733,7 @@ class AskRunner:
             await self.channel.send(
                 task.principal,
                 UNAVAILABLE_RETRY,
-                thread=thread_of(task),
+                thread=thread_of(task, to=task.principal),
                 dedupe_key=f"ask:down:{task.id}",
             )
         except ChannelError as e:
@@ -2095,7 +2095,7 @@ class AskRunner:
             await self.channel.send(
                 task.principal,
                 reply,
-                thread=thread_of(task),
+                thread=thread_of(task, to=task.principal),
                 dedupe_key=key if isinstance(key, str) else f"ask:{task.id}",
             )
         except ChannelRefused as e:

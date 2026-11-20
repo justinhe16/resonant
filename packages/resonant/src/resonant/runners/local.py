@@ -386,7 +386,10 @@ class LocalRunner:
         with spans(f"runner.{self.name}.send", reply_len=len(answer.reply), resend=resend) as s:
             try:
                 await self.channel.send(
-                    principal, answer.reply, thread=thread_of(task), dedupe_key=f"reply:{task.id}"
+                    principal,
+                    answer.reply,
+                    thread=thread_of(task, to=principal),
+                    dedupe_key=f"reply:{task.id}",
                 )
             except ChannelRefused as e:
                 s.set(ok=False, error=type(e).__name__)
@@ -642,7 +645,10 @@ class LocalRunner:
         with spans(f"runner.{self.name}.answer_first", reply_len=len(text)) as s:
             try:
                 await self.channel.send(
-                    principal, text, thread=thread_of(task), dedupe_key=f"answer:{task.id}"
+                    principal,
+                    text,
+                    thread=thread_of(task, to=principal),
+                    dedupe_key=f"answer:{task.id}",
                 )
             except ChannelRefused as e:
                 s.set(ok=False, error=type(e).__name__)

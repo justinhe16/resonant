@@ -1685,7 +1685,7 @@ class ClaudeRunner:
         """PER-292: where the run's texts go: the thread of the message that asked for it
         (its task's ``channel_ref``), or None (iMessage, a run with no task)."""
         task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
-        return thread_of(task)
+        return thread_of(task, to=run.principal)
 
     def _watch_merge(self, run: Run, *, unattended: bool = False) -> None:
         """Start the owner's merge watch for a ready run whose CI is still running: a task

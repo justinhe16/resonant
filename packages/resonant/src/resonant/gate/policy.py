@@ -125,7 +125,9 @@ NO_TASK = "approvals need a task"
 OWNER_ASKED = "owner_asked"
 
 # Channels whose text replies may bind approvals: every channel adapter (PER-292; the
-# identity still has to resolve to the approver). The iMessage reader already drops SMS.
+# identity still has to resolve to the approver: the router's inbox checks it with
+# ``gateway.channel.event_identity``, which ties it to the event's channel). The iMessage
+# reader already drops SMS.
 REPLY_CHANNELS = frozenset(KNOWN_CHANNELS)
 
 # BA-1: at most this many changes wait on the owner in one batch (``gate.batch_max``).

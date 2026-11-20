@@ -253,6 +253,8 @@ def test_thread_of_a_threaded_channel() -> None:
     ref = {"channel": "slack", "principal": OWNER, "identity": "slack:U1", "thread": "T1",
            "ref": "s:9"}  # fmt: skip
     assert thread_of(task_with(ref)) == MessageRef("slack", "s:9", "T1")
+    assert thread_of(task_with(ref), to=OWNER) == MessageRef("slack", "s:9", "T1")
+    assert thread_of(task_with(ref), to=MEMBER) is None  # never into another's thread
 
 
 async def test_an_old_row_still_sends(db: sqlite3.Connection, principals: Principals) -> None:
@@ -274,6 +276,9 @@ def test_event_identity() -> None:
     legacy = Event(source="imessage", type="message", payload={"handle": PHONE})
     assert event_identity(legacy) == f"imessage:{PHONE}"
     assert event_identity(Event(source="slack", type="message", payload={"handle": "x"})) is None
+    # an identity from another channel than the event's source is not trusted
+    spoof = Event(source="slack", type="message", payload={"identity": f"imessage:{PHONE}"})
+    assert event_identity(spoof) is None
 
 
 # --- router, approvals and relay on any channel ------------------------------------------------

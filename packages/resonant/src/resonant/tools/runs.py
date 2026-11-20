@@ -470,7 +470,8 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             raise ToolFailed(f"start_run: repo is too long (at most {REPO_MAX} characters)")
         # PER-292: the run's texts go to the thread it was asked in (the calling task's)
         task = task_store.get_task(ctx.conn, call.task_id) if call is not None else None
-        ref = None if task is None else task.channel_ref
+        owner = ctx.principals.owner  # the run is the owner's: only the owner's thread
+        ref = None if task is None or task.principal != owner else task.channel_ref
         thread = {} if ref is None else {"channel_ref": ref}
         result = await claude.start_run(
             repo, ask, ctx.principals.owner, merge=merge, report=report, **thread

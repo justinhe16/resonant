@@ -456,7 +456,8 @@ class WorkerDesk:
 
     def _thread(self, run: Run) -> MessageRef | None:
         """PER-292: the thread the run was asked in (its task's ``channel_ref``), or None."""
-        return thread_of(task_store.get_task(self.conn, run.task_id) if run.task_id else None)
+        task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
+        return thread_of(task, to=run.principal)
 
     def _pulse_question(self, run: Run, q: qs.Question) -> None:
         """The question as a core pulse item, already told (it is texted now). The hourly
