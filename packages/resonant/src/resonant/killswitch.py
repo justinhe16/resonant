@@ -10,7 +10,15 @@ Pause hooks (Phase 3). ``add_pause_hook(fn)`` registers ``fn(conn, paused)``, ca
 ``engage`` (``paused=True``) or ``release`` (``False``) commits. The daemon's scheduler uses
 it to kill every tracked extension process at once on ``/kill``. A hook that raises is
 logged and never undoes the switch. A CLI ``resonant kill`` runs in another process, so no
-hook fires there: the scheduler notices the flag on its next tick.
+hook fires there: the scheduler notices the flag on its next tick and fires the hooks itself
+(``fire_hooks``), so a pause written by another process (``resonant kill``, personal
+Resonant's fan-out) ends runs and the brain session like an in-process ``/kill``.
+
+Pause source (PER-290). ``paused_by`` (kv) is who engaged it: the owner's handle,
+``owner:cli``, or ``sibling:resonant`` when personal Resonant's ``/kill`` paused this instance
+(``resonant pause --by sibling:resonant``). An engage while already paused keeps the first
+source, so personal's ``/resume`` (``resonant resume --if-by sibling:resonant``) never undoes a
+pause someone else made. ``release`` clears it.
 """
 
 from __future__ import annotations
@@ -26,6 +34,9 @@ log = logging.getLogger(__name__)
 
 PauseHook = Callable[[sqlite3.Connection, bool], None]
 _hooks: list[PauseHook] = []
+PAUSED_BY_KEY = "paused_by"
+SIBLING_SOURCE = "sibling:resonant"  # personal Resonant's /kill, fanned out (PER-290)
+UNRECORDED_SOURCE = "unrecorded:before-sources"  # a pause older than paused_by
 
 
 def add_pause_hook(hook: PauseHook) -> Callable[[], None]:
@@ -52,8 +63,14 @@ def _state(conn: sqlite3.Connection) -> dict[str, object]:
 
 
 def engage(conn: sqlite3.Connection, *, actor: str, reason: str | None = None) -> None:
+    """Autonomy off, paused. ``paused_by`` becomes ``actor`` unless already paused (the
+    first source stays)."""
     with atomic(conn):
         before = _state(conn)
+        if kv_get(conn, "paused") is not True:
+            kv_set(conn, PAUSED_BY_KEY, actor)
+        elif paused_by(conn) is None:  # paused before sources were recorded: not this actor's
+            kv_set(conn, PAUSED_BY_KEY, UNRECORDED_SOURCE)
         kv_set(conn, "autonomy", "off")
         kv_set(conn, "paused", True)
         audit(conn, "killswitch.engage", requested_by=actor, reason=reason, before=before)
@@ -66,8 +83,21 @@ def release(conn: sqlite3.Connection, *, actor: str) -> None:
         before = _state(conn)
         kv_set(conn, "autonomy", "on")
         kv_set(conn, "paused", False)
+        conn.execute("DELETE FROM kv WHERE key = ?", (PAUSED_BY_KEY,))
         audit(conn, "killswitch.release", requested_by=actor, before=before)
     _notify(conn, False)
+
+
+def paused_by(conn: sqlite3.Connection) -> str | None:
+    """Who engaged the pause in force (PER-290), or None (not recorded)."""
+    value = kv_get(conn, PAUSED_BY_KEY)
+    return value if isinstance(value, str) else None
+
+
+def fire_hooks(conn: sqlite3.Connection, paused: bool) -> None:
+    """Run the pause hooks for a change another process made (the scheduler's tick saw the
+    flag move without an in-process ``engage``/``release``)."""
+    _notify(conn, paused)
 
 
 class PausedStateUnknownError(RuntimeError):

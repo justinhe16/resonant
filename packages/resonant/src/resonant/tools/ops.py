@@ -19,11 +19,22 @@ launchd labels, Ollama's and this instance's daemon (``Settings.daemon_label``),
   ``git pull --ff-only``. HEAD unchanged: ``Already up to date``, no restart. Otherwise
   ``uv sync --frozen``; a failed sync is reported and nothing restarts (the tree is at the
   new commit, the running process is unaffected). A good sync restarts as above.
+  PER-290: refused outright when ``ops.self_update`` is false (Cori: "code updates come from
+  personal Resonant"). With siblings installed (``instance.siblings``: other instances on
+  this checkout), after a good sync: a pull that added a migration
+  (``git diff --name-only <old> <new> -- <migrations>``) backs every store up first (this
+  one's and each sibling's, with the running code); then each loaded sibling is restarted
+  (its restart marker in its own store, ``launchctl kickstart -k``) and this instance last.
+  A stopped sibling stays stopped; one that fails is reported ("Cori didn't come back") and
+  this instance still restarts. No siblings: exactly the steps above.
 - ``disk``: free space on ``/`` and ``RESONANT_HOME``.
 - ``recent_logs``: the last ``n`` (≤ 20) lines of ``logs/resonant.jsonl``, one short line
   each, ≤ 300 chars, cleaned like ``tail_log`` (``clean_line``): credential-shaped text
   (``redact.redact_secrets``) and key-shaped tokens → ``[redacted]``, ``$HOME`` and any
   ``/Users/<name>`` → ``~``, URLs → ``<url>``, emails and phone numbers → ``<handle>``.
+
+``restart_ollama`` is registered only where ``model.manage`` is true (never on a non-default
+instance: personal Resonant owns Ollama, PER-290).
 
 None of these is exempt from dry_run: they act on the system, so under dry_run the gate
 answers ``Dry run: would restart Ollama`` and the handler never runs.
@@ -41,6 +52,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+from resonant import instance
 from resonant.config import Settings
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.gate.types import Intent
@@ -56,6 +68,7 @@ from resonant.ops import (
     mark_restart,
     restart_later_argv,
 )
+from resonant.ops import siblings as sib
 from resonant.redact import REDACT_SLACK, REDACTED, redact_secrets
 from resonant.store.db import iso, kv_get, kv_set
 from resonant.tools.base import NO_ARGS, BuiltinContext, no_args
@@ -71,7 +84,13 @@ GIT_TIMEOUT_S = 10.0  # local reads: branch, status, HEAD
 PULL_TIMEOUT_S = 60.0
 SYNC_TIMEOUT_S = 240.0
 # Every step of an update, plus slack, so the executor's timeout never fires first.
-UPDATE_TIMEOUT_S = 4 * GIT_TIMEOUT_S + PULL_TIMEOUT_S + SYNC_TIMEOUT_S + 20.0  # 360 s
+_UPDATE_SELF_S = 4 * GIT_TIMEOUT_S + PULL_TIMEOUT_S + SYNC_TIMEOUT_S + 20.0  # 360 s
+# PER-290: with one sibling (Cori), the migration diff, two backups and its restart.
+_SIBLINGS_S = GIT_TIMEOUT_S + 2 * sib.BACKUP_TIMEOUT_S + sib.PRINT_TIMEOUT_S + KICKSTART_TIMEOUT_S
+UPDATE_TIMEOUT_S = _UPDATE_SELF_S + _SIBLINGS_S
+# A pull that touches this dir carries a migration (each store migrates itself at start).
+MIGRATIONS_DIR = "packages/resonant/src/resonant/store/migrations"
+SELF_UPDATE_OFF = "code updates come from personal Resonant"
 
 # A restart loop (a model retrying, or an owner tapping /restart_ollama) can't keep Ollama
 # down: one kickstart per window.
@@ -162,9 +181,13 @@ class Ops:
         owner: str,
         clock: Callable[[], datetime],
         uid: int | None = None,
+        siblings: Callable[[str], list[instance.Sibling]] = instance.siblings,
     ) -> None:
         self.conn = conn
+        self.settings = settings
         self.label = settings.daemon_label  # this instance's daemon (PER-297)
+        self.self_update = settings.ops.self_update  # PER-290
+        self.find_siblings = siblings
         self.repo = settings.ops.repo_path
         self.uv = settings.ops.uv_path
         self.uv_cache = settings.home / UV_CACHE
@@ -247,6 +270,8 @@ class Ops:
         }
 
     async def update_resonant(self) -> dict[str, Any]:
+        if not self.self_update:
+            raise ToolFailed(SELF_UPDATE_OFF)
         if self.repo is None:
             raise ToolFailed("ops.repo_path isn't set; not updating")
         if self.uv is None:
@@ -277,8 +302,37 @@ class Ops:
         if sync_error is not None:
             # The tree is at the new commit; the running process is untouched. No restart.
             return {**out, "synced": False, "sync_error": sync_error, "restarting": False}
+        siblings = self.find_siblings(self.settings.instance.name)
+        if siblings:
+            out |= await self._deploy_siblings(siblings, old, new)
         self._restart_later(new)
         return {**out, "synced": True, "restarting": True, "delay_s": RESTART_DELAY_S}
+
+    async def _migration_pending(self, old: str, new: str) -> bool:
+        """Whether ``old..new`` touches the migrations (a failed diff counts as yes)."""
+        try:
+            changed = await self._git("diff", "--name-only", old, new, "--", MIGRATIONS_DIR)
+        except ToolFailed:
+            return True
+        return bool(changed)
+
+    async def _deploy_siblings(
+        self, siblings: list[instance.Sibling], old: str, new: str
+    ) -> dict[str, Any]:
+        """PER-290: back every store up on a migration, then restart each sibling (this
+        instance restarts last, in the caller)."""
+        out: dict[str, Any] = {}
+        if await self._migration_pending(old, new):
+            me = self.settings.instance
+            targets = [sib.StoreBackup(me.display_name, self.settings.home, me.name)]
+            targets += [sib.StoreBackup(s.display_name, s.home, s.name) for s in siblings]
+            out["migration"] = True
+            out["backups"] = await sib.backup_stores(targets, self.clock(), "ops/update")
+        out["siblings"] = [
+            await sib.restart_sibling(self.runner, s, commit=new, now=self.clock(), uid=self.uid)
+            for s in siblings
+        ]
+        return out
 
 
 # --- reads -------------------------------------------------------------------------------
@@ -399,6 +453,14 @@ def recent_logs(logs_dir: Path, args: dict[str, Any]) -> dict[str, Any]:
 # --- registration ------------------------------------------------------------------------
 
 
+def specs_for(ctx: BuiltinContext) -> tuple[ToolSpec, ...]:
+    """``SPECS``, without ``restart_ollama`` where this instance doesn't manage Ollama
+    (``model.manage``; never on a non-default instance, PER-290)."""
+    if ctx.state.settings.model.manage:
+        return SPECS
+    return tuple(s for s in SPECS if s is not RESTART_OLLAMA)
+
+
 def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
     settings = ctx.state.settings
     ops = Ops(
@@ -429,10 +491,13 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
     async def _recent_logs(args: dict[str, Any]) -> dict[str, Any]:
         return recent_logs(logs_dir, args)
 
-    return {
+    out: dict[str, ToolHandler] = {
         RESTART_OLLAMA.name: _restart_ollama,
         RESTART_RESONANT.name: _restart_resonant,
         UPDATE_RESONANT.name: _update_resonant,
         DISK.name: _disk,
         RECENT_LOGS.name: _recent_logs,
     }
+    if not settings.model.manage:
+        del out[RESTART_OLLAMA.name]
+    return out

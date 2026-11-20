@@ -28,21 +28,23 @@ channels:
   imessage:
     enabled: false                      # Cori talks in Slack (PER-292, PER-295), never iMessage
 
+# PER-290 (two daemons, one checkout): Ollama and keep-awake stay personal Resonant's (Cori
+# reads these as false and refuses them true; she uses the owner's Ollama at 127.0.0.1:11434),
+# and code deploys come from personal Resonant (Cori's /update, update_resonant and her workers'
+# `resonant update` are refused). Her jobs, watchers, trust rules and facts stay hers to change.
+power:
+  keep_awake: false
+model:
+  manage: false
+ops:
+  self_update: false
+runner:
+  self_repo: false                      # no "resonant" repo for her workers (GD-1)
+
 # --- added by later Phase 8 tickets; leave commented until they land ---------------------
 #
-# PER-290 (two daemons, one checkout): shared agents stay personal Resonant's, and code
-# deploys come from personal Resonant.
-# power:
-#   keep_awake: false
-# model:
-#   manage: false
-# ops:
-#   self_update: false
-# runner:
-#   self_repo: false
-#
 # PER-291 (Cori's scope): worker and brain rules, scoped worker env, own Claude config dir
-# and a read scope without anything personal.
+# and a read scope without anything personal. (Its runner keys go in the runner block above.)
 # runner:
 #   instructions_file: ~/resonant/config/cori/worker-rules.md
 #   claude_config_dir: ~/cori/claude

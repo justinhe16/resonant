@@ -15,6 +15,7 @@ from resonant.gate.codes import clean_external
 from resonant.gate.policy import APPROVAL_EXPIRED, APPROVAL_USED, NOT_APPROVED
 from resonant.gate.summary import phrased
 from resonant.gate.summary import summarize as summarize_args
+from resonant.ops.siblings import sibling_lines
 from resonant.tools.ops import summary_action as ops_action
 
 DONE_NOT_APPROVED = "Not done."
@@ -72,7 +73,7 @@ def _updated(d: dict[str, Any]) -> str | None:
     if d.get("updated") is False:
         return f"Already up to date ({new})."
     if d.get("restarting") is True:
-        return f"Updated {old} → {new}, restarting…"
+        return "\n".join([f"Updated {old} → {new}, restarting…", *sibling_lines(d)])
     if d.get("synced") is False:
         error = clean_external(str(d.get("sync_error") or "failed"))[:60]
         return (

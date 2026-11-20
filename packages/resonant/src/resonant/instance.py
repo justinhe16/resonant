@@ -28,6 +28,11 @@ The ``api.port`` is not derived: each instance's config sets it (``config/cori.e
 uses 7778), and ``resonant daemon install`` refuses a port that is already bound
 (``port_in_use``).
 
+**Siblings** (PER-290): the other instances installed on this user, found from their
+LaunchAgent plists (``com.resonant[.<name>].daemon.plist`` in ``~/Library/LaunchAgents``) and
+the ``RESONANT_HOME`` each one runs with (``siblings``). One checkout runs them all, so a code
+deploy restarts every sibling, and personal Resonant's kill switch pauses them too.
+
 This module imports nothing from the rest of Resonant, so ``config``, ``launchd``,
 ``secrets`` and ``ops`` can all use it.
 """
@@ -35,7 +40,9 @@ This module imports nothing from the rest of Resonant, so ``config``, ``launchd`
 from __future__ import annotations
 
 import errno
+import logging
 import os
+import plistlib
 import re
 import socket
 from collections.abc import Mapping
@@ -44,6 +51,8 @@ from pathlib import Path
 from typing import cast
 
 import yaml
+
+log = logging.getLogger(__name__)
 
 DEFAULT_INSTANCE = "resonant"
 DEFAULT_DISPLAY_NAME = "Resonant"
@@ -215,6 +224,76 @@ def select(flag: str | None, env: Mapping[str, str] | None = None) -> str | None
     if from_env is not None and from_env != flag:
         raise InstanceError(f"--instance {flag} disagrees with {INSTANCE_ENV}={from_env}")
     return flag
+
+
+# --- siblings (PER-290) ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Sibling:
+    """Another instance installed on this user: its name, daemon label, home (from its
+    plist's ``RESONANT_HOME``) and plist."""
+
+    name: str
+    label: str
+    home: Path
+    plist: Path
+
+    @property
+    def display_name(self) -> str:
+        """How replies name it: ``Resonant`` for the default instance, else ``Cori``."""
+        return DEFAULT_DISPLAY_NAME if is_default(self.name) else self.name.capitalize()
+
+
+def label_owner(label: str) -> str | None:
+    """The instance whose daemon label ``label`` is, or None."""
+    if label == _DAEMON_LABEL:
+        return DEFAULT_INSTANCE
+    m = _LABEL_RE.fullmatch(label)
+    return m["name"] if m is not None and not is_default(m["name"]) else None
+
+
+def agents_dir() -> Path:
+    return Path("~/Library/LaunchAgents").expanduser()
+
+
+def _plist_home(path: Path, name: str) -> Path | None:
+    """The ``RESONANT_HOME`` a daemon plist runs with (else its instance's default home), or
+    None when the plist can't be read."""
+    try:
+        with path.open("rb") as f:
+            data: object = plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    env = cast(dict[str, object], data).get("EnvironmentVariables")
+    raw = cast(dict[str, object], env).get(HOME_ENV) if isinstance(env, dict) else None
+    return Path(raw).expanduser() if isinstance(raw, str) and raw else home_for(name)
+
+
+def siblings(me: str, directory: Path | None = None) -> list[Sibling]:
+    """Every *other* instance with an installed daemon plist, by name. A plist that can't be
+    read, or whose home is missing, is skipped with a warning (a deploy goes on without it)."""
+    found: list[Sibling] = []
+    where = agents_dir() if directory is None else directory
+    try:
+        entries = sorted(where.glob("com.resonant*.daemon.plist"))
+    except OSError:
+        return []
+    for path in entries:
+        name = label_owner(path.name.removesuffix(".plist"))
+        if name is None or name == me:
+            continue
+        home = _plist_home(path, name)
+        if home is None:
+            log.warning("sibling %s: its plist can't be read; skipped", name)
+            continue
+        if not home.is_dir():
+            log.warning("sibling %s: its home %s is missing; skipped", name, home)
+            continue
+        found.append(Sibling(name, daemon_label(name), home, path))
+    return found
 
 
 # --- the API port -------------------------------------------------------------------------
