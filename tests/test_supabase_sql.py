@@ -1092,6 +1092,16 @@ def test_status_for_a_personal_only_project(db: Pg, tmp_path: Path) -> None:
     assert [i["instance"] for i in out["instances"]] == ["resonant"]
 
 
+def test_status_keeps_the_old_fields_when_only_another_instance_pushed(
+    db: Pg, tmp_path: Path
+) -> None:
+    add_cori(db)
+    assert ingest_as(db, remote_snapshot(tmp_path, instance=CORI_ID), token=CORI).ok
+    out = json.loads(status(db).out)
+    assert out["taken_at"] is None and out["health"] == []
+    assert [i["instance"] for i in out["instances"]] == ["cori", "resonant"]
+
+
 # --- the migration on today's schema ---------------------------------------------------------
 
 INSTANCES_MIGRATION = ROOT / "supabase" / "migrations" / "20261120000000_relay_instances.sql"

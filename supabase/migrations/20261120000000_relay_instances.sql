@@ -36,8 +36,9 @@
 --                                 {"instances": [{"instance", "taken_at", "health"}, ...]} (each
 --                                 instance that has an ingest token, by name; taken_at null and
 --                                 health [] for one that never pushed) plus the old top-level
---                                 "taken_at" and "health" of `resonant`'s newest snapshot, so the
---                                 Fly checker from before this keeps working unchanged.
+--                                 "taken_at" and "health" of `resonant`'s newest snapshot (null
+--                                 and [] when it has none), so the Fly checker from before this
+--                                 keeps working unchanged.
 --
 -- Unchanged: the RLS owner-read policies (instance is just a column), the secret-shape,
 -- remote_url, approval-code and Remote Control link refusals, the size caps.
@@ -108,21 +109,21 @@ security definer
 set search_path = ''
 as $$
 declare
-  found text;
+  token_instance text;
 begin
   if p_token is null or length(p_token) < 32 then
     raise exception 'relay: bad token' using errcode = 'PT403';
   end if;
-  select t.instance into found
+  select t.instance into token_instance
     from relay_private.ingest_tokens t
    where t.token_sha256 = sha256(convert_to(p_token, 'UTF8'));
-  if found is null then
+  if token_instance is null then
     raise exception 'relay: bad token' using errcode = 'PT403';
   end if;
-  if p_instance is not null and p_instance is distinct from found then
+  if p_instance is not null and p_instance is distinct from token_instance then
     raise exception 'relay: token is not this instance' using errcode = 'PT403';
   end if;
-  return found;
+  return token_instance;
 end
 $$;
 revoke all on function relay_private.ingest_instance(text, text) from public, anon, authenticated;
@@ -139,7 +140,6 @@ alter table public.snapshots
   add column instance text not null default 'resonant'
   constraint snapshots_instance check (instance ~ '^[a-z][a-z0-9-]{0,31}$');
 create index snapshots_instance_taken_at_idx on public.snapshots (instance, taken_at desc);
-create index snapshots_instance_received_at_idx on public.snapshots (instance, received_at);
 
 alter table public.panel_days
   add column instance text not null default 'resonant'
@@ -457,7 +457,10 @@ begin
    order by s.taken_at desc
    limit 1;
 
-  return jsonb_build_object('instances', instances) || coalesce(personal, '{}'::jsonb);
+  -- No `resonant` row (a project where only another instance pushes): the old fields are
+  -- still there, empty, so an old checker reads "nothing from personal", not a bad shape.
+  return jsonb_build_object('instances', instances)
+         || coalesce(personal, jsonb_build_object('taken_at', null, 'health', '[]'::jsonb));
 end
 $$;
 revoke all on function public.relay_status(text) from public, anon, authenticated;
