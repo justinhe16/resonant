@@ -737,7 +737,7 @@ dead-man: GET <dead-man url> · POST <url>/fail with the reason
 HealthMonitor(conn, *, model, channel, owner, daemon_healthy).run()
   checks: model (probe/5 min) · imessage (reader + self-test/6h) · loop · store
   kv health.<check> = {state: ok|degraded|unknown, since, detail}`,
-    inv:["kill -9 checks that launchd restarts the daemon (verified in PR2)","SIGSTOP freezes the whole process (watchdog included), so the dead-man switch is what alerts","One owner alert per incident, at most one per check per 6h, plus a resolved message","No Slack in core: alerts go over iMessage or the dead-man"],
+    inv:["kill -9 checks that launchd restarts the daemon (verified in PR2)","SIGSTOP freezes the whole process (watchdog included), so the dead-man switch is what alerts","One owner alert per incident, at most one per check per 6h, plus a resolved message","Alerts go through the channel hub (the owner's first running identity) or the dead-man"],
     files:["packages/resonant/src/resonant/health.py","packages/resonant/src/resonant/monitor.py","tests/test_health.py","tests/test_monitor.py"]},
   launchd:{label:"launchd LaunchAgents", phase:"0", status:"built",
     what:"Runs as a per-user LaunchAgent (gui/<uid>), not a system daemon. Messages.app, computer use, and the login Keychain all need the GUI session. Plists are built with plistlib.",

@@ -127,7 +127,7 @@ from resonant.brain.text import drop_pending_asks, flat
 from resonant.config import DEFAULT_READ_DENY, AskClaudeConfig, ClaudeSessionConfig, Settings
 from resonant.gate.codes import mask_codes
 from resonant.gate.shell import ASK_RULES, READ_RULES, TOOL_WRITE
-from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
+from resonant.gateway.channel import Channel, ChannelError, ChannelRefused, thread_of
 from resonant.loop.types import (
     PRIORITY_MEMBER,
     PRIORITY_OWNER,
@@ -1146,7 +1146,10 @@ class AskRunner:
             if task_id in self._answered or self._has_answer(task_id):
                 return
             try:
-                await self.channel.send(principal, text, dedupe_key=ACK_KEY + task_id)
+                thread = thread_of(get_task(self.conn, task_id), to=principal)
+                await self.channel.send(
+                    principal, text, thread=thread, dedupe_key=ACK_KEY + task_id
+                )
             except ChannelError as e:
                 log.warning("ask: ack not sent (%s)", type(e).__name__)
 
@@ -1728,7 +1731,10 @@ class AskRunner:
             return await self._finish(task, ctx, cp, status, UNAVAILABLE_REPLY)
         try:
             await self.channel.send(
-                task.principal, UNAVAILABLE_RETRY, dedupe_key=f"ask:down:{task.id}"
+                task.principal,
+                UNAVAILABLE_RETRY,
+                thread=thread_of(task, to=task.principal),
+                dedupe_key=f"ask:down:{task.id}",
             )
         except ChannelError as e:
             log.warning("ask: unavailable notice not sent (%s)", type(e).__name__)
@@ -2087,7 +2093,10 @@ class AskRunner:
         key = cp.get("dedupe_key")
         try:
             await self.channel.send(
-                task.principal, reply, dedupe_key=key if isinstance(key, str) else f"ask:{task.id}"
+                task.principal,
+                reply,
+                thread=thread_of(task, to=task.principal),
+                dedupe_key=key if isinstance(key, str) else f"ask:{task.id}",
             )
         except ChannelRefused as e:
             return Fail(f"ask reply refused: {e}")

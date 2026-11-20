@@ -672,6 +672,10 @@ async def test_free_text_routes_to_the_brain_without_a_model_call(
     assert task.channel_ref == {
         "channel": "imessage",
         "principal": OWNER,
+        # PER-292: the hub's fields (an event without payload.identity gets it from handle)
+        "identity": "imessage:+15550000000",
+        "thread": None,
+        "ref": "G1",
         "handle": "+15550000000",
         "chat_guid": "iMessage;-;+15550000000",
         "guid": "G1",

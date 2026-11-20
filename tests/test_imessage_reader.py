@@ -162,6 +162,8 @@ def test_known_handle_becomes_exactly_one_event(
     assert event.task_id is None
     assert event.payload == {
         "text": "what's on today?",
+        "identity": f"imessage:{OWNER_PHONE}",  # PER-292: the hub's identity and ref
+        "ref": "G-1",
         "guid": "G-1",
         "handle": OWNER_PHONE,
         "chat_guid": f"iMessage;-;{OWNER_PHONE}",

@@ -75,7 +75,7 @@ from resonant.gate import (
 from resonant.gate.codes import clean_external
 from resonant.gate.policy import batch_line, widens_trust
 from resonant.gate.types import Origin
-from resonant.gateway.channel import Channel, ChannelError, ChannelRefused
+from resonant.gateway.channel import Channel, ChannelError, ChannelRefused, thread_of
 from resonant.loop.types import Done, Fail, StepContext, StepOutcome, Task, Wait
 from resonant.models import ModelClient, SpanFactory
 from resonant.observability.spans import span
@@ -385,7 +385,12 @@ class LocalRunner:
     ) -> StepOutcome:
         with spans(f"runner.{self.name}.send", reply_len=len(answer.reply), resend=resend) as s:
             try:
-                await self.channel.send(principal, answer.reply, dedupe_key=f"reply:{task.id}")
+                await self.channel.send(
+                    principal,
+                    answer.reply,
+                    thread=thread_of(task, to=principal),
+                    dedupe_key=f"reply:{task.id}",
+                )
             except ChannelRefused as e:
                 s.set(ok=False, error=type(e).__name__)
                 return Fail(f"reply refused: {e}")
@@ -639,7 +644,12 @@ class LocalRunner:
             return None
         with spans(f"runner.{self.name}.answer_first", reply_len=len(text)) as s:
             try:
-                await self.channel.send(principal, text, dedupe_key=f"answer:{task.id}")
+                await self.channel.send(
+                    principal,
+                    text,
+                    thread=thread_of(task, to=principal),
+                    dedupe_key=f"answer:{task.id}",
+                )
             except ChannelRefused as e:
                 s.set(ok=False, error=type(e).__name__)
                 return Fail(f"reply refused: {e}")

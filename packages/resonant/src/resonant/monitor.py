@@ -1,6 +1,6 @@
-"""Brain health: periodic checks, owner alerts over iMessage, and dead-man reasons.
+"""Brain health: periodic checks, owner alerts over the channel, and dead-man reasons.
 
-``HealthMonitor`` evaluates four checks every ``interval_s`` (60s):
+``HealthMonitor`` evaluates these checks every ``interval_s`` (60s):
 
 - ``model``: ``ModelClient.probe()`` every ``model_every_s`` (5 min). The result is cached
   in kv ``model.probe`` (the builtin ``model_status`` tool reads it).
@@ -8,6 +8,10 @@
   ``imessage.selftest``). The self-test is re-run every ``selftest_every_s`` (6h), after
   ``selftest_after_errors`` (2) consecutive reader errors, and every
   ``selftest_retry_s`` (30 min) while the last one failed.
+- one check per other enabled channel (PER-292; ``slack``, kv ``health.slack``): the
+  adapter failed to start (``not running: <why>``), its ``health()`` reports an error, or
+  its last self-test (every ``selftest_every_s``, retried every ``selftest_retry_s`` while
+  failing) failed. The ``imessage`` check keeps its name and kv ``health.imessage``.
 - ``loop``: ``Daemon.healthy()``, dead-lettered events and failed tasks in the last hour.
 - ``store``: the DB is writable and free disk is above ``min_free_bytes`` (2GB).
 - ``backup`` (BK-1, ``resonant.backup.health_check``): a successful daily backup within
@@ -20,8 +24,10 @@ Each check is a small state machine ``ok -> degraded -> ok`` persisted in kv
 ``health.<check>`` = ``{state, since, detail, checked_at, ...}``. The owner gets one
 iMessage per incident once a check has been degraded for ``alert_after`` (2) consecutive
 evaluations, at most one per check per ``alert_cooldown_s`` (6h), and one "resolved: ..."
-message when an alerted incident clears. While the ``imessage`` check itself is degraded
-(or there is no channel), no iMessage is attempted: :meth:`HealthMonitor.deadman_reason`
+message when an alerted incident clears. Alerts go through ``channel`` (the daemon's
+``ChannelHub``), which picks the owner's first running identity. While every channel check
+is degraded (iMessage-only: the ``imessage`` check; or there is no channel), no text is
+attempted: :meth:`HealthMonitor.deadman_reason`
 returns the reason and the dead-man ``/fail`` ping carries it instead (``ext:`` checks
 are not brain health and never reach the dead-man). The same
 happens after 3 consecutive failed owner sends. A cached model probe doesn't count as a new
@@ -46,6 +52,7 @@ from typing import Any, Literal, Protocol, cast
 
 from resonant.gateway.channel import ChannelError, MessageRef, SelfTestResult
 from resonant.models import ProbeResult
+from resonant.principals import KNOWN_CHANNELS
 from resonant.store.audit import audit
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 
@@ -186,8 +193,13 @@ def _disk_free(path: Path) -> int:
 
 def health_snapshot(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     """``{check: {state, since, detail, checked_at}}`` from kv; ``unknown`` if never run.
-    The static checks, then every persisted ``ext:<name>`` check by name."""
+    The static checks, every other channel's persisted check (``slack``), then every
+    persisted ``ext:<name>`` check by name."""
     snap = {c: CheckState.from_kv(kv_get(conn, HEALTH_KV_PREFIX + c)).public() for c in CHECKS}
+    for name in KNOWN_CHANNELS:
+        raw: object = kv_get(conn, HEALTH_KV_PREFIX + name)
+        if name not in snap and raw is not None:
+            snap[name] = CheckState.from_kv(raw).public()
     for name in _ext_check_names(conn):
         snap[name] = CheckState.from_kv(kv_get(conn, HEALTH_KV_PREFIX + name)).public()
     return snap
@@ -202,12 +214,18 @@ def _ext_check_names(conn: sqlite3.Connection) -> list[str]:
 
 
 def channels_snapshot(
-    conn: sqlite3.Connection, *, imessage_enabled: bool, channel: MonitoredChannel | None
+    conn: sqlite3.Connection,
+    *,
+    imessage_enabled: bool,
+    channel: MonitoredChannel | None,
+    others: Mapping[str, MonitoredChannel] | None = None,
 ) -> list[dict[str, Any]]:
     """``GET /api/channels``: ``[{name, enabled, ok, last_read_at, last_selftest}]``.
 
-    Without a live channel, ``ok`` and ``last_read_at`` are null; ``last_selftest`` comes
-    from kv either way (``resonant selftest imessage`` also writes it).
+    The ``imessage`` row first (``channel``: the live iMessage adapter). Without it, ``ok``
+    and ``last_read_at`` are null; ``last_selftest`` comes from kv either way (``resonant
+    selftest imessage`` also writes it). Then one row per other live adapter (``others``,
+    PER-292), with ``last_selftest`` null.
     """
     raw: object = kv_get(conn, SELFTEST_KV)
     last_selftest: dict[str, Any] | None = None
@@ -226,7 +244,7 @@ def channels_snapshot(
         ok = h.get("ok") is True
         read_at = h.get("last_read_at")
         last_read_at = read_at if isinstance(read_at, str) else None
-    return [
+    rows = [
         {
             "name": "imessage",
             "enabled": imessage_enabled or channel is not None,
@@ -235,6 +253,19 @@ def channels_snapshot(
             "last_selftest": last_selftest,
         }
     ]
+    for name, other in (others or {}).items():
+        h = other.health()
+        read_at = h.get("last_read_at")
+        rows.append(
+            {
+                "name": name,
+                "enabled": True,
+                "ok": h.get("ok") is True,
+                "last_read_at": read_at if isinstance(read_at, str) else None,
+                "last_selftest": None,
+            }
+        )
+    return rows
 
 
 # --- the monitor -------------------------------------------------------------------------
@@ -243,9 +274,12 @@ def channels_snapshot(
 class HealthMonitor:
     """Evaluates the checks, persists their state, and alerts the owner. See module doc.
 
-    Dependencies are injected: ``model`` (anything with ``probe()``), ``channel`` (the
-    iMessage channel, or None: no alerts and no imessage check), ``owner`` (the principal
-    alerted), ``daemon_healthy`` (``Daemon.healthy``), ``clock`` and ``sleep``.
+    Dependencies are injected: ``model`` (anything with ``probe()``), ``channel`` (what
+    alerts go through: the daemon's ``ChannelHub``, or None: no alerts and no channel
+    checks), ``channels`` (PER-292: the adapters to check, by name; None means ``channel``
+    itself is the iMessage adapter, as before the hub), ``channel_failures`` (adapters that
+    failed to start, with a short reason: ``ChannelHub.failures``), ``owner`` (the
+    principal alerted), ``daemon_healthy`` (``Daemon.healthy``), ``clock`` and ``sleep``.
     ``model_meta`` (e.g. ``{"model": ..., "api": ...}``) is merged into the cached probe.
     """
 
@@ -276,10 +310,19 @@ class HealthMonitor:
         send_failures_for_deadman: int = 3,
         ext_checks: DynamicChecks | None = None,
         backup_check: Callable[[datetime], CheckResult | None] | None = None,
+        channels: Mapping[str, MonitoredChannel] | None = None,
+        channel_failures: Callable[[], Mapping[str, str]] | None = None,
     ) -> None:
         self.conn = conn
         self.model = model
         self.channel = channel
+        self.channels: dict[str, MonitoredChannel] = (
+            dict(channels)
+            if channels is not None
+            else ({} if channel is None else {"imessage": channel})
+        )
+        self.channel_failures: Callable[[], Mapping[str, str]] = channel_failures or _none_failed
+        self._selftests: dict[str, tuple[bool, datetime, str]] = {}  # non-iMessage adapters
         self.owner = owner
         self.daemon_healthy = daemon_healthy
         self.db_path = db_path
@@ -329,14 +372,21 @@ class HealthMonitor:
         """Run every check once, update state, persist it, then send alerts/recoveries."""
         states = self._load()
         now = self.clock()
-        results: dict[CheckName, CheckResult | None] = {
+        results: dict[str, CheckResult | None] = {
             "model": await self._check_model(now),
             "imessage": await self._check_imessage(now),
-            "loop": self._check_loop(now),
-            "store": self._check_store(),
-            "backup": self._check_backup(now),
         }
+        for name in self.channels:
+            if name != "imessage":
+                results[name] = await self._check_channel(name, now)
+        results.update(
+            loop=self._check_loop(now),
+            store=self._check_store(),
+            backup=self._check_backup(now),
+        )
         for name, result in results.items():
+            if name not in states:
+                states[name] = CheckState.from_kv(kv_get(self.conn, HEALTH_KV_PREFIX + name))
             if result is not None:
                 # A cached model result is not a new observation: it doesn't count
                 # toward the alert debounce (so a single failed probe never alerts).
@@ -377,9 +427,9 @@ class HealthMonitor:
     def deadman_reason(self) -> str | None:
         """Reason for the dead-man ``/fail`` body, or None when the owner can be texted.
 
-        Set while a check is degraded and the owner can't be texted: the ``imessage``
-        check is degraded, there is no channel or owner, or the last
-        ``send_failures_for_deadman`` owner sends failed.
+        Set while a check is degraded and the owner can't be texted: every channel check
+        is degraded (iMessage-only: the ``imessage`` check), there is no channel or owner,
+        or the last ``send_failures_for_deadman`` owner sends failed.
         """
         if self.states is None:
             return None
@@ -393,8 +443,8 @@ class HealthMonitor:
         sends_failing = self._send_failures >= self.send_failures_for_deadman
         if self._can_text_owner() and not sends_failing:
             return None
-        # The imessage reason first: it's why nobody was texted.
-        degraded.sort(key=lambda ns: ns[0] != "imessage")
+        # The channel reasons first: they're why nobody was texted.
+        degraded.sort(key=lambda ns: ns[0] not in self.channels)
         parts = [f"{n}: {s.detail or 'degraded'}" for n, s in degraded]
         if sends_failing:
             parts.insert(0, "owner alerts failing")
@@ -417,9 +467,12 @@ class HealthMonitor:
         return self._model_result
 
     async def _check_imessage(self, now: datetime) -> CheckResult | None:
-        if self.channel is None:
+        channel = self.channels.get("imessage")
+        if channel is None:
             return None
-        h = self.channel.health()
+        if (why := self.channel_failures().get("imessage")) is not None:
+            return CheckResult(False, f"imessage not running: {scrub(why, 90)}")
+        h = channel.health()
         err = h.get("last_error")
         if err is not None or h.get("fda_ok") is False:
             self._reader_errors += 1
@@ -436,7 +489,7 @@ class HealthMonitor:
             due = True
         if due:
             try:
-                await self.channel.self_test(timeout_s=self.selftest_timeout_s)
+                await channel.self_test(timeout_s=self.selftest_timeout_s)
             except Exception as e:  # a self-test must never take the monitor down
                 log.warning("imessage self-test raised %s", type(e).__name__)
                 self._kv_write(
@@ -456,6 +509,30 @@ class HealthMonitor:
             return CheckResult(False, f"imessage reader error: {scrub(str(err), 80)}")
         if last is not None and not last[0]:
             return CheckResult(False, f"imessage selftest failed: {scrub(last[2], 90)}")
+        return CheckResult(True, "ok")
+
+    async def _check_channel(self, name: str, now: datetime) -> CheckResult:
+        """A non-iMessage adapter (PER-292): started, healthy, and its last self-test ok."""
+        if (why := self.channel_failures().get(name)) is not None:
+            return CheckResult(False, f"{name} not running: {scrub(why, 90)}")
+        channel = self.channels[name]
+        last = self._selftests.get(name)
+        due = last is None or now - last[1] >= (
+            self.selftest_every if last[0] else self.selftest_retry
+        )
+        if due:
+            try:
+                r = await channel.self_test(timeout_s=self.selftest_timeout_s)
+                last = (r.ok, now, r.detail)
+            except Exception as e:  # a self-test must never take the monitor down
+                log.warning("%s self-test raised %s", name, type(e).__name__)
+                last = (False, now, f"self-test error ({type(e).__name__})")
+            self._selftests[name] = last
+        err = channel.health().get("last_error")
+        if err is not None:
+            return CheckResult(False, f"{name} error: {scrub(str(err), 80)}")
+        if last is not None and not last[0]:
+            return CheckResult(False, f"{name} selftest failed: {scrub(last[2], 90)}")
         return CheckResult(True, "ok")
 
     def _last_selftest(self) -> tuple[bool, datetime | None, str] | None:
@@ -541,12 +618,12 @@ class HealthMonitor:
         s.detail = scrub(r.detail)
 
     def _can_text_owner(self) -> bool:
+        """A channel and an owner, and at least one channel check not degraded."""
         assert self.states is not None
-        return (
-            self.channel is not None
-            and self.owner is not None
-            and self.states["imessage"].state != "degraded"
-        )
+        if self.channel is None or self.owner is None:
+            return False
+        names = list(self.channels) or ["imessage"]
+        return any((s := self.states.get(n)) is None or s.state != "degraded" for n in names)
 
     async def _notify(self, states: dict[str, CheckState], now: datetime) -> None:
         if not self._can_text_owner():
@@ -626,6 +703,10 @@ class HealthMonitor:
                 )
         except sqlite3.Error as e:
             log.warning("health audit not written: %s", type(e).__name__)
+
+
+def _none_failed() -> Mapping[str, str]:
+    return {}
 
 
 def _model_result(p: ProbeResult) -> CheckResult:

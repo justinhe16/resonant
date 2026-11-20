@@ -24,10 +24,11 @@ from typer.testing import CliRunner
 from resonant.cli import app
 from resonant.config import ModelConfig, Settings, load_settings
 from resonant.daemon import Daemon
-from resonant.e2e import RecordingOsaRunner, ScriptedModel, wait_until
+from resonant.e2e import FakeChannel, RecordingOsaRunner, ScriptedModel, wait_until
 from resonant.e2e.bench import report, run_e2e_bench
 from resonant.gateway.imessage.fixtures import FakeChatDB
 from resonant.loop.echo import EchoRunner
+from resonant.principals import load_principals
 from resonant.store.db import iso, kv_set, utcnow
 from resonant.tools.ops import RESTART_OLLAMA, UPDATE_RESONANT
 from resonant.wiring import brain_step_limit, local_step_limit
@@ -156,6 +157,50 @@ async def test_imessage_disabled_daemon_runs_without_channel_or_monitor() -> Non
     assert channels[0]["enabled"] is False and channels[0]["ok"] is None
     daemon.stop()
     assert await asyncio.wait_for(run, 5) == 0
+
+
+async def test_two_adapters_imessage_and_a_fake_slack(
+    resonant_home: Path, chat: FakeChatDB
+) -> None:
+    """PER-292: the hub over iMessage and a fake Slack adapter. Each message is answered on
+    the channel it came from (Slack in its thread); a proactive text goes to the owner's
+    first identity (iMessage); the monitor checks both."""
+    (resonant_home / "principals.yaml").write_text(
+        PRINCIPALS.replace(f'"imessage:{OWNER_PHONE}"]', f'"imessage:{OWNER_PHONE}", "slack:U1"]')
+    )
+    settings = load_settings(
+        api={"port": free_port()},
+        channels={
+            "imessage": {"enabled": True, "db_path": chat.path, "poll_s": 0.05, "self_handle": SELF}
+        },
+    )
+    slack = FakeChannel("slack", load_principals(resonant_home / "principals.yaml"))
+    osa = RecordingOsaRunner()
+    daemon = Daemon(settings, model=ScriptedModel(), osa_runner=osa, channels={"slack": slack})
+    kv_set(daemon.conn, "imessage.selftest", {"ok": True, "at": iso(utcnow()), "detail": "ok"})
+    run = asyncio.create_task(daemon.run())
+    assert daemon.stack is not None
+    hub = daemon.stack.channel
+    await wait_until(lambda: hub.health()["adapters"]["imessage"]["last_read_at"] is not None, 10)
+    try:
+        assert hub.names == ("imessage", "slack")
+        assert slack.inject("U1", "/approvals")
+        assert (await slack.wait_for(1, 10)).thread == "slack-in:1"
+        chat.add_message(handle=OWNER_PHONE, text="/approvals")
+        assert (
+            (await osa.wait_for(1, 10)).text == slack.texts[0] == "Nothing is waiting for approval."
+        )
+        assert len(slack.sent) == 1
+        await hub.send("justin", "proactive", dedupe_key="t:proactive")
+        assert osa.sent[-1].text == "proactive" and len(slack.sent) == 1
+        assert daemon.state.monitor is not None
+        states = await daemon.state.monitor.evaluate()
+        assert states["imessage"].state == "ok" and states["slack"].state == "ok"
+        events = daemon.conn.execute("SELECT source FROM events ORDER BY rowid").fetchall()
+        assert {e[0] for e in events} >= {"imessage", "slack"}
+    finally:
+        daemon.stop()
+        assert await asyncio.wait_for(run, 10) == 0
 
 
 # --- wiring ----------------------------------------------------------------------------

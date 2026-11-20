@@ -456,13 +456,20 @@ def test_non_approvers_get_the_generic_answer(
 
 @pytest.mark.parametrize(
     "kw",
-    [{"channel": "sms"}, {"channel": "slack"}, {"path": "classifier"}, {"all_in_batch": True}],
+    [{"channel": "sms"}, {"path": "classifier"}, {"all_in_batch": True}],
 )
 def test_unsupported_replies(db: sqlite3.Connection, gate: PolicyGate, kw: dict[str, Any]) -> None:
     asked = ask(db, gate)
     result = reply(gate, **kw)
     assert not result.ok and result.reason == "unsupported"
     assert status(db, asked) == "pending"
+
+
+def test_a_slack_reply_binds_like_an_imessage_one(db: sqlite3.Connection, gate: PolicyGate) -> None:
+    """PER-292: Slack is a core channel; the router already checked the identity."""
+    asked = ask(db, gate)
+    assert reply(gate, channel="slack").ok
+    assert status(db, asked) == "approved"
 
 
 def test_refusals_are_audited_with_the_reply(db: sqlite3.Connection, gate: PolicyGate) -> None:

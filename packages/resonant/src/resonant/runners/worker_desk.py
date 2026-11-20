@@ -59,7 +59,7 @@ from datetime import datetime, timedelta
 from typing import Any, Literal, Protocol
 
 from resonant.gate.codes import clean_external
-from resonant.gateway.channel import Channel, ChannelError
+from resonant.gateway.channel import Channel, ChannelError, MessageRef, thread_of
 from resonant.redact import Redactor
 from resonant.runners.reports import did_of, record_did
 from resonant.runners.worker_cli import (
@@ -80,6 +80,7 @@ from resonant.runners.worker_cli import (
 from resonant.store import pulse as pulse_store
 from resonant.store import questions as qs
 from resonant.store import runs
+from resonant.store import tasks as task_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.store.runs import Run
@@ -448,9 +449,15 @@ class WorkerDesk:
         )  # fmt: skip
         self._pulse_question(run, q)
         try:
-            await self.channel.send(run.principal, text, dedupe_key=f"run:{run.code}:ask:{q.id}")
+            await self.channel.send(run.principal, text, thread=self._thread(run),
+                                    dedupe_key=f"run:{run.code}:ask:{q.id}")  # fmt: skip
         except ChannelError as e:  # the question stays open; the pulse re-mentions it
             log.warning("question not texted", extra={"run": run.code, "reason": str(e)})
+
+    def _thread(self, run: Run) -> MessageRef | None:
+        """PER-292: the thread the run was asked in (its task's ``channel_ref``), or None."""
+        task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
+        return thread_of(task, to=run.principal)
 
     def _pulse_question(self, run: Run, q: qs.Question) -> None:
         """The question as a core pulse item, already told (it is texted now). The hourly

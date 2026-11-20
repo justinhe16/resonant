@@ -62,6 +62,7 @@ from resonant.gate.types import Intent
 from resonant.store import pulse as pulse_store
 from resonant.store import repos as repos_store
 from resonant.store import runs as runs_store
+from resonant.store import tasks as task_store
 from resonant.tools.base import BuiltinContext
 from resonant.trust import merge_decision
 from resonant_sdk import Effect, Level, ToolSpec
@@ -106,6 +107,7 @@ class RunnerApi(Protocol):
         *,
         merge: bool = False,
         report: Report = "digest",
+        channel_ref: dict[str, Any] | None = None,
     ) -> Started | Refused: ...
 
     def list_runs(self, limit: int = 20) -> list[Run]: ...
@@ -444,7 +446,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             "set channels.imessage.enabled in ~/.resonant/config.yaml and restart Resonant",
         )
 
-    async def _start_run(args: dict[str, Any]) -> dict[str, Any]:
+    async def _start_run(args: dict[str, Any], call: CallContext | None = None) -> dict[str, Any]:
         unknown = set(args) - {"repo", "ask", "merge", "report"}
         if unknown:
             raise ToolFailed(f"start_run: unknown arguments: {sorted(unknown)}")
@@ -466,7 +468,14 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"started": False, "text": missing()}
         if repo is not None and len(repo) > REPO_MAX:
             raise ToolFailed(f"start_run: repo is too long (at most {REPO_MAX} characters)")
-        result = await claude.start_run(repo, ask, ctx.principals.owner, merge=merge, report=report)
+        # PER-292: the run's texts go to the thread it was asked in (the calling task's)
+        task = task_store.get_task(ctx.conn, call.task_id) if call is not None else None
+        owner = ctx.principals.owner  # the run is the owner's: only the owner's thread
+        ref = None if task is None or task.principal != owner else task.channel_ref
+        thread = {} if ref is None else {"channel_ref": ref}
+        result = await claude.start_run(
+            repo, ask, ctx.principals.owner, merge=merge, report=report, **thread
+        )
         if (reason := _refusal(result)) is not None:
             return {"started": False, "text": reason}
         started = cast("Started", result)
@@ -631,7 +640,7 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
     return {
         ANSWER_WORKER.name: _answer_worker,
         MESSAGE_WORKER.name: _message_worker,
-        START_RUN.name: _start_run,
+        START_RUN.name: cast(ToolHandler, _WithContext(_start_run)),
         LIST_RUNS.name: _list_runs,
         RUN_ACTIVITY.name: _run_activity,
         CANCEL_RUN.name: _cancel_run,

@@ -11,6 +11,8 @@ system text the brains see, PER-268):
   channel dedupes by ``approval_dedupe_key``.
 - ``reached`` empty with no transient error means no approver is reachable: the caller
   fails for good.
+- PER-292: the prompt to the asking task's own principal goes to that task's thread
+  (``thread_of``); every other approver gets it in their own conversation.
 
 ``remind_due`` (PER-261, the ``core/remind`` job, every minute) sends each prompt one
 reminder at half its TTL, to whoever got it: ``[A7] still waiting, expires in 15 min``. A
@@ -25,7 +27,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +38,7 @@ from resonant.gateway.channel import (
     ChannelError,
     ChannelRefused,
     approval_dedupe_key,
+    thread_of,
 )
 from resonant.store import approvals as ap
 from resonant.store import system_texts
@@ -161,9 +164,14 @@ async def _prompt(
     reached: list[str] = []
     unreachable: list[str] = []
     error: ChannelError | None = None
+    asking = get_task(conn, task_id) if task_id else None
+    thread = thread_of(asking, to=None if asking is None else asking.principal)
     for approver in approvers:
         try:
-            ref = await channel.request_approval(approver, prompt)
+            mine = thread is not None and asking is not None and approver == asking.principal
+            ref = await channel.request_approval(
+                approver, replace(prompt, thread=thread) if mine else prompt
+            )
         except ChannelRefused as e:
             unreachable.append(approver)
             with transaction(conn):
@@ -188,8 +196,7 @@ async def _prompt(
         # PER-268: the brains see what was asked ("approve it?" is the prompt's job); a
         # tainted task's args were chosen after outside content, so only a fixed line
         key = approval_dedupe_key(prompt.approval_id, approver)
-        task = get_task(conn, task_id) if task_id else None
-        outside = task is not None and system_texts.tainted(task.checkpoint)
+        outside = asking is not None and system_texts.tainted(asking.checkpoint)
         system_texts.record(conn, approver, "approval", prompt.text(), ref=key, task_id=task_id,
                             now=at, outside=outside)  # fmt: skip
     return PromptResult(tuple(reached), tuple(unreachable), error)
