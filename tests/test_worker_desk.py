@@ -440,3 +440,23 @@ def test_migration_031_keeps_questions_and_allows_requests(tmp_path: Path) -> No
     assert r.id == 2 and qs.by_approval(conn, "A1") == qs.get(conn, r.id)
     assert [x.id for x in qs.open_requests(conn)] == [2]
     conn.close()
+
+
+async def test_a_restart_after_the_approval_says_it_may_have_run(db: sqlite3.Connection) -> None:
+    h = Harness(db, block_s=0.1)
+    h.executor.release = asyncio.Event()  # the deploy hangs after the yes
+    code = h.run("brian")
+    await h.request(code, ("commit", "abc"))
+    (_to, prompt), *_ = await h.prompted()
+    assert h.click(prompt.approval_id, "brian")
+    h.desk.ask_timeout = timedelta(0)
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        h.desk.time_out_due(code)  # approved and running: no timeout
+    (q,) = qs.for_run(db, code)
+    assert q.status == "open"
+    Harness(db).desk.startup()  # the daemon died mid-deploy
+    (q,) = qs.for_run(db, code)
+    assert q.status == "timed_out" and q.answer is not None and "it may have run" in q.answer
+    h.executor.release.set()
+    await h.desk.aclose()

@@ -62,6 +62,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import logging
 import re
 import sqlite3
@@ -166,6 +167,10 @@ REQUESTS_BUSY = (
 )
 NO_REQUESTS = "Not requestable: no tools can be requested here."
 REQUEST_FAILED = "Not done: Resonant hit an error, so the tool didn't run."
+MAY_HAVE_RUN = (
+    "An approver approved it, but Resonant lost track of the run ({why}): it may have run. "
+    "Check before asking again."
+)
 
 EventKind = Literal["question", "note", "check", "request"]
 NO_TRUST = "denied: checks aren't set up here, so don't do it."
@@ -634,7 +639,7 @@ class WorkerDesk:
         except ValueError as e:
             return Reply(f"Usage error: {e}.", EXIT_USAGE)
         target = action_target(args)
-        key = (run.code, req.extension, req.tool, target)
+        key = (run.code, req.extension, req.tool, json.dumps(args, sort_keys=True))
         entry = self._requests.get(key)
         if entry is None:
             if len(qs.open_for_run(self.conn, run.code, "request")) >= MAX_OPEN_REQUESTS:
@@ -908,6 +913,8 @@ class WorkerDesk:
         for q in qs.open_for_run(self.conn, code):
             if q.asked_at + self.ask_timeout > now:
                 continue
+            if q.kind == "request" and self._approved(q) and self._in_flight(q.id):
+                continue  # approved and running now: its result lands, not a timeout
             text = {"ask": ASK_TIMEOUT, "request": REQUEST_TIMEOUT}.get(q.kind, CHECK_TIMEOUT)
             if qs.time_out(self.conn, q.id, text, at=now):
                 with atomic(self.conn):
@@ -960,7 +967,8 @@ class WorkerDesk:
 
         close_stale_tasks(self.conn)
         for q in qs.open_requests(self.conn):
-            qs.time_out(self.conn, q.id, REQUEST_RESTARTED, at=now)
+            lost = MAY_HAVE_RUN.format(why="Resonant restarted")
+            qs.time_out(self.conn, q.id, lost if self._approved(q) else REQUEST_RESTARTED, at=now)
             if q.approval_id is not None:
                 with atomic(self.conn):
                     ap.expire_one(self.conn, q.approval_id, now, reason="restarted")
@@ -971,6 +979,14 @@ class WorkerDesk:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _approved(self, q: qs.Question) -> bool:
+        """A request whose approval was given (its tool may be running, or may have run)."""
+        a = ap.get_approval(self.conn, q.approval_id) if q.approval_id else None
+        return a is not None and a.status == "approved"
+
+    def _in_flight(self, qid: int) -> bool:
+        return any(q == qid and not t.done() for q, t in self._requests.values())
 
     def _stop_check(self, qid: int) -> None:
         for _key, (q, task) in [*self._checks.items(), *self._requests.items()]:

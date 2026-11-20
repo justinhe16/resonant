@@ -192,10 +192,23 @@ class WorkerRequests:
         docstring). ``on_approval(id)`` hears the approval as soon as it opens, ``on_ran(did)``
         a call that ran. Never raises for a "no"."""
         task_id = self._open_task(run, spec, qid)
+        opened: list[str] = []
+
+        def approval(approval_id: str) -> None:
+            opened.append(approval_id)
+            on_approval(approval_id)
+
         try:
-            done = await self._fulfil(run, task_id, qid, spec, args, reason, on_approval, on_ran)
+            done = await self._fulfil(run, task_id, qid, spec, args, reason, approval, on_ran)
         except asyncio.CancelledError:
             self._close_task(task_id, "cancelled")
+            raise
+        except Exception:
+            # an unexpected failure: nothing may bind the approval later, and the task ends
+            for approval_id in opened:
+                with atomic(self.conn):
+                    ap.expire_one(self.conn, approval_id, self.clock(), reason="error")
+            self._close_task(task_id, "failed")
             raise
         self._close_task(task_id, "done" if done.ok else "failed")
         return done
@@ -261,9 +274,11 @@ class WorkerRequests:
         return tid
 
     def _close_task(self, task_id: str, status: Literal["done", "failed", "cancelled"]) -> None:
-        with contextlib.suppress(sqlite3.Error):
+        try:
             task_store.set_status(self.conn, task_id, status,
                                   expect=("queued", "running", "waiting"))  # fmt: skip
+        except sqlite3.Error:
+            log.warning("couldn't close request task %s", task_id, exc_info=True)
 
     def _finish(
         self,

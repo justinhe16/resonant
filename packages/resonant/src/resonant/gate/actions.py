@@ -57,6 +57,7 @@ _PR_TOOLS: dict[tuple[str, str], str] = {
 }
 _MERGE_RUN = "merge_run"  # the builtin that merges a run's PR (``tools/runs.py``)
 TARGET_MAX = 200  # a requestable tool's ``k=v`` target; longer: a digest
+_PLAIN = re.compile(r"[A-Za-z0-9._:/@+#-]+")  # a value shown bare; anything else is JSON-quoted
 
 
 @dataclass(frozen=True)
@@ -109,9 +110,10 @@ def for_intent(conn: sqlite3.Connection, intent: Intent) -> Action | None:
 
 def args_target(args: dict[str, Any]) -> str:
     """A worker-requestable tool's target (PER-296): its args as ``k=v`` pairs, sorted
-    (``commit=abc service=api``); a long one is a digest of them."""
+    (``commit=abc service=api``; a value with spaces or ``=`` JSON-quoted, so two arg sets
+    never read the same); a long one is a digest of them."""
     text = " ".join(
-        f"{k}={v if isinstance(v, str) else json.dumps(v, sort_keys=True)}"
+        f"{k}={v if isinstance(v, str) and _PLAIN.fullmatch(v) else json.dumps(v, sort_keys=True)}"
         for k, v in sorted(args.items())
     )
     if len(text) <= TARGET_MAX:
