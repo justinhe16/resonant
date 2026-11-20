@@ -45,6 +45,7 @@ from resonant.runners.worker_desk import asked_for
 from resonant.sandbox import SandboxParams
 from resonant.secrets import (
     ANTHROPIC_KEY_REF,
+    CLAUDE_MISSING,
     CLAUDE_TOKEN_REF,
     RunnerSecrets,
     SecretStore,
@@ -769,3 +770,160 @@ def test_the_surf_prompt_is_a_narrow_default() -> None:
 def test_the_worker_prompt_asks_for_did_notes() -> None:
     prompt = claude_mod.WORKER_PROMPT
     assert '`resonant note "did: <what you did>"`' in prompt and "merge with gh" in prompt
+
+
+# --- PER-291: Cori's scope (worker rules, scoped env, own Claude config dir) ------------------
+
+FLY = "fly-staging-" + "S3ntinelFlyT0ken" * 3
+VERCEL = "vercel-" + "S3ntinelVercel" * 3
+CORI_ENV = {"FLY_API_TOKEN": "dori/fly_staging_token", "VERCEL_TOKEN": "dori/vercel_token"}
+RULES = "You are working for Cori, the DORI team's coworker."
+
+
+def cori(h: Harness, rules: Path | None = None, **update: Any) -> None:
+    h.runner.cfg = h.cfg.model_copy(update={
+        "instructions_file": rules, "session_env": dict(CORI_ENV),
+        "claude_config_dir": h.root / "cori-claude", **update,
+    })  # fmt: skip
+    h.keychain.items["dori/fly_staging_token"] = FLY
+    h.keychain.items["dori/vercel_token"] = VERCEL
+
+
+def system_prompt(call: dict[str, Any]) -> str:
+    argv = call["argv"]
+    return argv[argv.index("--append-system-prompt") + 1]
+
+
+async def test_a_cori_run_carries_the_rules_scoped_env_its_home_and_config_dir(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    rules = tmp_path / "worker-rules.md"
+    rules.write_text(RULES + "\n")
+    home = tmp_path / "resonant-cori"
+    h = build(tmp_path / "h", db, login_check=boom, resonant_home=home, instance="cori")
+    cori(h, rules)
+    await h.start()
+    await h.drain()
+    assert h.run().status == "ready"
+    [call] = h.argv_log()
+    env = call["env"]
+    # the rules follow the run's own instructions and the surf prompt
+    prompt = system_prompt(call)
+    assert prompt.endswith("\n\n" + RULES)
+    assert prompt.index(claude_mod.WORKER_PROMPT) < prompt.index(RULES)
+    assert env["FLY_API_TOKEN"] == FLY and env["VERCEL_TOKEN"] == VERCEL
+    assert env["RESONANT_HOME"] == str(home) and env["RESONANT_INSTANCE"] == "cori"
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "h" / "cori-claude")
+    assert env["HOME"] == str(owner_home(h))  # still unguarded: the real HOME, no wrap
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == CLAUDE_TOKEN  # Cori's own token
+    # every value is known to the run's redactor: nothing in the end text says it
+    assert all(FLY not in t and VERCEL not in t for t in h.chan.texts())
+
+
+async def test_with_a_config_dir_the_owners_login_is_never_tried(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    tried: list[bool] = []
+
+    async def login() -> bool:
+        tried.append(True)
+        return True
+
+    h = build(tmp_path, db, login_check=login)
+    cori(h)
+    del h.keychain.items[CLAUDE_TOKEN_REF]
+    assert await h.runner.login_ok() is False
+    gaps, how = await h.runner.setup_gaps()
+    assert gaps == [f"secret {CLAUDE_MISSING}"] and "claude" not in how[0].split()[0]
+    res = await h.runner.start_run("proj", "fix it", "owner", report="now")
+    assert not isinstance(res, Started)  # not set up: no token, and no owner login
+    assert tried == []
+
+
+async def test_a_missing_scoped_secret_doesnt_fail_the_run_and_is_said_once(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    h = build(tmp_path, db)
+    cori(h)
+    del h.keychain.items["dori/fly_staging_token"]
+    await h.start()
+    await h.drain()
+    assert h.run().status == "ready"
+    [call] = h.argv_log()
+    assert "FLY_API_TOKEN" not in call["env"] and call["env"]["VERCEL_TOKEN"] == VERCEL
+    line = "FLY_API_TOKEN not set up (resonant secret set dori/fly_staging_token)"
+    said = [t for t in h.chan.texts() if line in t]
+    assert len(said) == 1 and said[0].count(line) == 1
+    assert "⚠" not in said[0]  # a setup note, not an alert
+
+
+async def test_scoped_values_never_reach_transcripts_texts_audit_or_logs(
+    tmp_path: Path, db: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("DEBUG")
+    h = build(tmp_path, db, scenario="leak", extra=["--leak", FLY])
+    cori(h)
+    await h.start()
+    await h.drain()
+    raw = (h.runner.transcript_dir / "R1.jsonl").read_text()
+    assert "FLY_API_TOKEN" in raw and "[redacted]" in raw  # the name stays, the value goes
+    dump = "\n".join(
+        str(tuple(row)) for t in ("runs", "tasks", "audit_log", "pulse_items", "events", "kv")
+        for row in h.conn.execute(f"SELECT * FROM {t}")
+    )  # fmt: skip
+    for value in (FLY, VERCEL):
+        assert value not in raw and value not in dump and value not in caplog.text
+        assert all(value not in t for t in h.chan.texts())
+
+
+async def test_a_missing_or_oversized_rules_file_starts_the_run_and_warns_the_owner_once(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    rules = tmp_path / "worker-rules.md"
+    h = build(tmp_path / "h", db, owner="owner")
+    cori(h, rules)  # missing
+    await h.start()
+    await h.drain()
+    assert h.run().status == "ready"
+    assert system_prompt(h.argv_log()[0]).endswith(claude_mod.WORKER_PROMPT)
+    missing = f"⚠ Worker instructions {rules} is missing: sessions start without them."
+    rules.write_text("x" * (8 * 1024 + 1))  # over 8 KB, twice
+    await h.start()
+    await h.start()
+    await h.drain()
+    assert all("xxxx" not in system_prompt(c) for c in h.argv_log("R2") + h.argv_log("R3"))
+    big = f"⚠ Worker instructions {rules} is over 8 KB: sessions start without them."
+    warns = [t for t in h.chan.texts() if t.startswith("⚠ Worker instructions")]
+    assert warns == [missing, big]
+
+
+async def test_personal_resonant_adds_no_rules_no_scoped_env_and_keeps_the_argv(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """Golden: without Cori config the argv is exactly as before and the env gains only the
+    instance's own two names."""
+    h = build(tmp_path, db)
+    cfg = h.runner.cfg
+    assert cfg.instructions_file is None and cfg.session_env == {}
+    assert cfg.claude_config_dir is None
+    await h.start()
+    await h.drain()
+    run = h.run()
+    [call] = h.argv_log()
+    argv, env = call["argv"], call["env"]
+    i = argv.index("-p")
+    assert argv[i:] == [
+        "-p", "--session-id", run.session_id, "-n", "R1", "--input-format", "stream-json",
+        "--output-format", "stream-json", "--verbose", "--permission-mode", "bypassPermissions",
+        "--append-system-prompt",
+        claude_mod.RUNNER_PROMPT.format(repo="own/proj", branch=run.branch, base="main",
+                                        attempts=claude_mod.MAX_FIX_ATTEMPTS)
+        + claude_mod.SURF_PROMPT.format(branch=run.branch) + claude_mod.WORKER_PROMPT,
+        "--max-turns", str(h.runner.max_turns),
+    ]  # fmt: skip
+    assert "CLAUDE_CONFIG_DIR" not in env
+    assert env["RESONANT_INSTANCE"] == "resonant" and env["RESONANT_HOME"] == str(
+        h.runner.resonant_home
+    )
+    ours = {"RESONANT_HOME", "RESONANT_INSTANCE", "RESONANT_RUN"}
+    assert {k for k in env if k.startswith("RESONANT_")} == ours

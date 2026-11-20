@@ -683,3 +683,42 @@ async def test_registered_handlers(db: sqlite3.Connection, root: Path, tmp_path:
     assert (await h[(None, "read_transcript")]({"code": "R1"}))["found"] is False
     for spec in files.SPECS:
         assert components.registry.get(None, spec.name) == spec
+
+
+# --- PER-291: Cori's read scope --------------------------------------------------------------
+
+CORI_EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "cori.example.yaml"
+
+
+def cori_settings(resonant_home: Path, user_home: Path) -> Any:
+    (resonant_home / "config.yaml").write_text(CORI_EXAMPLE.read_text())
+    write(user_home / "trade-jev" / "accounts.yaml", "account: mff-1\n")
+    write(user_home / ".resonant" / "config.yaml", "dry_run: false\n")
+    write(user_home / "code" / "mycelium" / "README.md", "personal\n")
+    write(user_home / "cori" / "code" / "voyager-web" / "README.md", "voyager-web\n")
+    return load_settings()
+
+
+async def test_coris_brain_reads_only_dori_and_refuses_personal_files(
+    resonant_home: Path, user_home: Path
+) -> None:
+    from resonant.runners.ask import AskScope
+
+    settings = cori_settings(resonant_home, user_home)
+    scope = ReadScope.from_settings(settings)
+    assert "voyager-web" in read(scope, "~/cori/code/voyager-web/README.md")["content"]
+    for path in ("~/trade-jev/accounts.yaml", "~/.resonant/config.yaml",
+                 "~/code/mycelium/README.md"):  # fmt: skip
+        with pytest.raises(ToolFailed, match="deny list"):
+            read(scope, path)
+        with pytest.raises(ToolFailed, match="deny list"):
+            await files.search(scope, None, {"pattern": "a", "path": str(Path(path).parent)})
+    # a search of the whole scope never finds them either
+    assert (await files.search(scope, None, {"pattern": "voyager-web"}))["count"] == 1
+    for pattern in ("mff-1", "personal", "dry_run"):
+        found = await files.search(scope, None, {"pattern": pattern})
+        assert found["hits"] == [], pattern
+    # ask_claude follows the same scope
+    ask = AskScope.from_settings(settings).read()
+    for path in (user_home / "trade-jev" / "accounts.yaml", user_home / ".resonant" / "x"):
+        assert ask.denied(path) or not ask.inside(path)

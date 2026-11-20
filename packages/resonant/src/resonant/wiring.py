@@ -494,6 +494,7 @@ def build_stack(
             cwd=settings.home / "voice",
             guard=settings.runner.guard,
             timezone=settings.timezone,
+            claude_config_dir=settings.runner.claude_config_dir,  # PER-291
         )
         if settings.brain.voice.enabled
         else None
@@ -519,6 +520,9 @@ def build_stack(
         self_repo=settings.ops.repo_path if settings.runner.self_repo else None,
         voice=voice,
         api_port=settings.api.port,  # PER-297: the thin guard denies this instance's port
+        # PER-291: a stray real `resonant` call from a worker targets this instance
+        resonant_home=settings.home,
+        instance=settings.instance.name,
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
@@ -538,6 +542,9 @@ def build_stack(
         tools=tool_access(components, brain, settings),  # BR-10: the brain's asks
         session=settings.brain.claude_session,  # BR-11: the Claude brain
         taint_hops=settings.brain.taint_hops,
+        # PER-291: the instance's Claude config dir and the brain's instructions file
+        claude_config_dir=settings.runner.claude_config_dir,
+        instructions_file=settings.brain.instructions_file,
     )
     components.runners[asks.name] = asks
     loop.runners[asks.name] = asks

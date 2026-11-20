@@ -404,3 +404,23 @@ async def test_without_claude_the_voice_reads_no_secret_and_probes_no_login(
     out = await v.write(facts(), FALLBACK)
     assert (out.text, out.used, out.reason) == (FALLBACK, False, "not_set_up")
     assert touched == [] and not (tmp_path / "v").exists()
+
+
+async def test_an_instances_config_dir_reaches_the_voice_and_skips_the_login(
+    tmp_path: Path, db: sqlite3.Connection
+) -> None:
+    """PER-291: ``runner.claude_config_dir`` is the call's ``CLAUDE_CONFIG_DIR``, and with it
+    set the owner's stored login is never tried."""
+    tried: list[bool] = []
+
+    async def ok() -> bool:
+        tried.append(True)
+        return True
+
+    config_dir = tmp_path / "cori-claude"
+    r = Rig(tmp_path, db, claude_config_dir=config_dir)
+    assert (await r.voice.write(facts(), FALLBACK)).used
+    assert r.calls[0][1]["CLAUDE_CONFIG_DIR"] == str(config_dir)
+    no_token = Rig(tmp_path / "n", db, token=False, login_check=ok, claude_config_dir=config_dir)
+    assert (await no_token.voice.write(facts(), FALLBACK)).reason == "not_set_up"
+    assert tried == []

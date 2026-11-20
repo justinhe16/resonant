@@ -276,7 +276,16 @@ class Fake:
         if self.a.notes:
             path = os.path.join(self.a.notes, "session.json")
             with open(path + ".tmp", "w") as f:  # atomic: a test may read it mid-turn
-                json.dump({"argv": sys.argv[1:], "tools": self.listed, **extra}, f)
+                # PER-291: which Claude config dir the session was given (a path, no secret)
+                json.dump(
+                    {
+                        "argv": sys.argv[1:],
+                        "tools": self.listed,
+                        "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"),
+                        **extra,
+                    },
+                    f,
+                )
             os.replace(path + ".tmp", path)
 
     def close(self) -> None:

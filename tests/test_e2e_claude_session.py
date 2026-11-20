@@ -170,6 +170,7 @@ async def start(
     *,
     session: dict[str, Any] | None = None,
     ask: dict[str, Any] | None = None,
+    asks_kw: dict[str, Any] | None = None,
 ) -> AsyncGenerator[World]:
     (home / "principals.yaml").write_text(PRINCIPALS)
     code = tmp_path / "code"
@@ -222,6 +223,7 @@ async def start(
         poll_s=0.05,
         kill_grace_s=0.5,
         bridge_root=tmp_path / "bridges",
+        **(asks_kw or {}),
     )
     components.runners[asks.name] = asks
     daemon.loop.runners[asks.name] = asks
@@ -278,6 +280,7 @@ async def test_follow_ups_go_into_the_same_session_and_see_prior_context(
         assert argv[argv.index("--setting-sources") + 1] == ""
         assert "Bash(git rev-list:*)" in argv[argv.index("--allowedTools") + 1].split(",")
         assert "mcp__resonant__add_note" in argv[argv.index("--allowedTools") + 1]
+        assert first["config_dir"] is None  # PER-291: personal sets no CLAUDE_CONFIG_DIR
         # the follow-up is a second message into the same process, which saw the first
         answer = await _hard(w, "and how do I fix it?", answer="You asked: {prev}")
         second = w.session()
@@ -294,6 +297,25 @@ async def test_follow_ups_go_into_the_same_session_and_see_prior_context(
             line for line in (await w.say("/status"))[0].splitlines() if "Claude brain" in line
         ]
         assert status == "Claude brain: up · 2 turns"
+
+
+async def test_an_instances_config_dir_and_brain_rules_reach_the_session(
+    resonant_home: Path, chat: FakeChatDB, tmp_path: Path
+) -> None:
+    """PER-291: with ``runner.claude_config_dir`` the brain session gets it as
+    ``CLAUDE_CONFIG_DIR`` and ``brain.instructions_file`` follows Resonant's own system text."""
+    rules = tmp_path / "brain-rules.md"
+    rules.write_text("You answer the DORI team in Slack.\n")
+    config_dir = tmp_path / "cori-claude"
+    config_dir.mkdir()
+    kw = {"claude_config_dir": config_dir, "instructions_file": rules}
+    async with start(resonant_home, chat, tmp_path, asks_kw=kw) as w:
+        await _hard(w, "why is R4 slow?", answer="R4 waits on CI.")
+        seen = w.session()
+        assert seen["config_dir"] == str(config_dir)
+        system = seen["argv"][seen["argv"].index("--append-system-prompt") + 1]
+        assert system.startswith("You are Resonant")  # Resonant's own text stays first
+        assert system.endswith("\n\nYou answer the DORI team in Slack.")
 
 
 async def test_two_hard_texts_back_to_back_queue_in_order(

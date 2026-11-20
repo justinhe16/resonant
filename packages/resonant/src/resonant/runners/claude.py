@@ -87,9 +87,11 @@ from zoneinfo import ZoneInfo
 
 import psutil
 
+from resonant import instance as inst
 from resonant import killswitch
 from resonant.brain.voice import Voice, VoiceResult, merged_facts, outcome_facts, record_text
 from resonant.config import RunnerConfig, RunnerRepo
+from resonant.config import resonant_home as default_resonant_home
 from resonant.extensions.notify import clean_text
 from resonant.gate import actions as action_ids
 from resonant.gate.codes import clean_external
@@ -133,6 +135,13 @@ from resonant.runner.resolve import (
     Resolved,
     Resolver,
 )
+from resonant.runner.scope import (
+    Instructions,
+    ScopedEnv,
+    load_session_env,
+    read_instructions,
+    warn_key,
+)
 from resonant.runner.workspace import (
     CREDS_DIR,
     FORK_NEEDS_PUBLIC_REPO,
@@ -165,6 +174,7 @@ from resonant.runners.reports import (
     WorkerReports,
     alerts,
     clear_alerts,
+    clear_setup_notes,
     deps_line,
     detected_list,
     end_event,
@@ -176,6 +186,8 @@ from resonant.runners.reports import (
     set_alert,
     set_merged,
     set_merged_by,
+    set_setup_note,
+    setup_notes,
     shown_did,
 )
 from resonant.runners.side_effects import RunContext, SideEffect, detect
@@ -895,6 +907,8 @@ class _Work:
     secrets: RunnerSecrets = field(repr=False)
     redactor: Redactor = field(repr=False)
     local: str | None = None  # RX-1: why the run can't push (a ``NO_PUSH_LONG`` key)
+    # PER-291: runner.session_env as read for this step (values redacted like the secrets)
+    scoped: ScopedEnv = field(default_factory=ScopedEnv, repr=False)
 
 
 Wrap = Callable[[Sequence[str], SandboxParams], Sequence[str]]
@@ -949,6 +963,8 @@ class ClaudeRunner:
         end_grace_s: float = END_GRACE_S,
         voice: Voice | None = None,
         api_port: int = API_PORT,
+        resonant_home: Path | None = None,
+        instance: str = inst.DEFAULT_INSTANCE,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -981,9 +997,16 @@ class ClaudeRunner:
         code-built text stays the fallback and the ⚠ lines, side effects and the closing
         line stay code-built. None: every text is code-built.
 
-        PER-297: ``api_port`` is this instance's ``api.port``, which the thin guard denies."""
+        PER-297: ``api_port`` is this instance's ``api.port``, which the thin guard denies.
+
+        PER-291: ``resonant_home`` (default ``$RESONANT_HOME`` or ``~/.resonant``) and
+        ``instance`` are put in every session's environment (``RESONANT_HOME``,
+        ``RESONANT_INSTANCE``), so a stray real ``resonant`` call targets this instance."""
         self.conn = conn
         self.api_port = api_port
+        self.resonant_home = resonant_home or default_resonant_home()
+        self.instance = instance
+        self._warned: set[str] = set()  # PER-291: ⚠ lines the owner already got this process
         self.cfg = runner
         self.channel = channel
         self.secrets = secrets
@@ -1083,8 +1106,9 @@ class ClaudeRunner:
 
     async def login_ok(self) -> bool:
         """Whether a session can use the owner's own ``claude`` login: only with the guard off
-        (under ``thin`` the session has a run-local HOME and no Keychain)."""
-        if self.guard != "off":
+        (under ``thin`` the session has a run-local HOME and no Keychain) and no
+        ``runner.claude_config_dir`` (PER-291: that instance never uses the owner's login)."""
+        if self.guard != "off" or self.cfg.claude_config_dir is not None:
             return False
         try:
             return await self._login_check()
@@ -1338,7 +1362,9 @@ class ClaudeRunner:
             for ref in refs:
                 missing.append(f"secret {ref}")
                 cmd = f"resonant secret set {ref.split(' ', 1)[0]}"
-                if ref == CLAUDE_MISSING and self.guard == "off":
+                # PER-291: with runner.claude_config_dir only the instance's token counts
+                if (ref == CLAUDE_MISSING and self.guard == "off"
+                        and self.cfg.claude_config_dir is None):  # fmt: skip
                     missing[-1] = f"a Claude login (or secret {ref})"
                     cmd = f"{LOGIN_HOW}, or {cmd}"
                 how.append(cmd)
@@ -2018,7 +2044,11 @@ class ClaudeRunner:
         local = task.checkpoint.get("local")
         if not (isinstance(local, str) and local in NO_PUSH_LONG) or run.scratch:
             local = None
-        w = _Work(task, ctx, secrets, Redactor(secrets.values()), local)
+        scoped = ScopedEnv()
+        if self.cfg.session_env:  # PER-291: read at run start; a missing one isn't fatal
+            scoped = await load_session_env(self.secrets, self.cfg.session_env)
+        w = _Work(task, ctx, secrets, Redactor([*secrets.values(), *scoped.secrets()]), local,
+                  scoped)  # fmt: skip
         try:
             if run.status == "waiting" and run.wait_reason == "question":
                 self.desk.time_out_due(run.code)
@@ -2185,6 +2215,7 @@ class ClaudeRunner:
         p: Prepared,
         *,
         local: bool = False,
+        scoped: ScopedEnv | None = None,
     ) -> dict[str, str]:
         """The session's environment, from scratch either way, with at most one Claude
         credential: the token, else the API key, else none (the owner's own login, guard off
@@ -2204,6 +2235,14 @@ class ClaudeRunner:
             env = owner_env(params, home=self.home, path_dirs=params.path_dirs,
                             claude_token=token, anthropic_key=key)  # fmt: skip
         env[MARKER_ENV] = marker  # the run's session id: unique, never reused
+        # PER-291: a stray real `resonant` call targets this instance, never another one
+        env[inst.HOME_ENV] = str(self.resonant_home)
+        env[inst.INSTANCE_ENV] = self.instance
+        if self.guard == "off" and self.cfg.claude_config_dir is not None:
+            # this instance's own skills and settings, none of the owner's (thin has its own)
+            env["CLAUDE_CONFIG_DIR"] = str(self.cfg.claude_config_dir)
+        if scoped is not None:
+            env.update(scoped.values)  # runner.session_env; names can't shadow ours (config)
         if p.scratch or local:
             # No GitHub credentials: with the real HOME, gh would otherwise find the owner's
             # own login (~/.config/gh). An empty config dir keeps RX-1's "can't push yet".
@@ -2229,6 +2268,7 @@ class ClaudeRunner:
         *,
         api_billing: bool,
         local: str | None = None,
+        instructions: Instructions | None = None,
     ) -> list[str]:
         head = list(self._claude_cmd or [str(params.run_dir / "bin" / "claude")])
         argv = [
@@ -2264,7 +2304,8 @@ class ClaudeRunner:
             "--append-system-prompt",
             self._prompt(run, p, local=local)
             + WORKER_PROMPT
-            + (RESTART_PROMPT if self.desk.self_ops is not None else ""),
+            + (RESTART_PROMPT if self.desk.self_ops is not None else "")
+            + (instructions.suffix() if instructions is not None else ""),
             "--max-turns",
             str(self.max_turns),
         ]
@@ -2346,16 +2387,44 @@ class ClaudeRunner:
     async def _run_session(
         self, w: _Work, run: Run, p: Prepared, params: SandboxParams
     ) -> StepOutcome | None:
-        argv = self._argv(run, p, params, api_billing=bool(w.secrets.anthropic_key), local=w.local)
+        instructions = await self._instructions(run)
+        argv = self._argv(run, p, params, api_billing=bool(w.secrets.anthropic_key),
+                          local=w.local, instructions=instructions)  # fmt: skip
+        self._note_scoped(run, w.scoped)
         if self.guard == "thin":
             argv = list(self._wrap(argv, params))
-        env = self._env(params, run.session_id, w.secrets, p, local=w.local is not None)
+        env = self._env(params, run.session_id, w.secrets, p, local=w.local is not None,
+                        scoped=w.scoped)  # fmt: skip
         prompt = self._turn_prompt(run, local=w.local is not None)
         server = await self._open_ctl(run, w)
         try:
             return await self._spawn_session(w, run, p, argv, env, prompt, server)
         finally:
             await self._close_ctl(run.code, server)
+
+    async def _instructions(self, run: Run) -> Instructions:
+        """PER-291: ``runner.instructions_file`` for this session. A file that can't be used
+        sends the owner one ⚠ line (once per daemon process and problem); the session starts
+        without it."""
+        found = await asyncio.to_thread(
+            read_instructions, self.cfg.instructions_file, what="worker"
+        )
+        line = found.warning("Worker")
+        if line is not None and line not in self._warned and self.owner is not None:
+            self._warned.add(line)
+            try:
+                await self.channel.send(self.owner, line, dedupe_key=warn_key("runner", line))
+            except ChannelError:
+                self._warned.discard(line)
+                log.warning("instructions warning not sent", extra={"run": run.code})
+        return found
+
+    def _note_scoped(self, run: Run, scoped: ScopedEnv) -> None:
+        """PER-291: the scoped variables that weren't set up, said once in the run's end
+        text (kept like the ⚠ lines, without making the text urgent)."""
+        line = scoped.missing_line()
+        if line is not None:
+            set_setup_note(self.conn, run.code, line)
 
     def _turn_prompt(self, run: Run, *, local: bool = False) -> str:
         """The prompt of this turn: the ask for a new session; for a resumed one, the
@@ -3276,9 +3345,8 @@ class ClaudeRunner:
         return repo.slug
 
     def _redactor(self, w: _Work, code: str) -> Redactor:
-        return Redactor(
-            [*w.secrets.values(), *self._tokens.get(code, ()), *self._spent.get(code, ())]
-        )
+        return Redactor([*w.secrets.values(), *w.scoped.secrets(), *self._tokens.get(code, ()),
+                         *self._spent.get(code, ())])  # fmt: skip
 
     async def _mint(self, run: Run, secrets: RunnerSecrets) -> str:
         """A new token for the run's repo, remembered so it is revoked at the end. A fork
@@ -3440,6 +3508,7 @@ class ClaudeRunner:
             warned = True
         text: str | None = None
         also: str | None = None
+        setup = setup_notes(self.conn, run.code)  # PER-291: scoped vars not set up
         if parts is not None:
             head, lines, said = parts
             if run.status != "cancelled" and (still := self._still_working(run)):
@@ -3447,7 +3516,8 @@ class ClaudeRunner:
             if note:  # the auto-merge's note says how to merge it: no second hint
                 lines = [line for line in lines if not line.startswith(f"/merge {run.code} ")]
             also = self.reports.also_line(run, skip=merged)
-            extra = [*warn, *([note] if note else []), *lines, *([also] if also else []), *said]
+            extra = [*warn, *setup, *([note] if note else []), *lines, *([also] if also else []),
+                     *said]  # fmt: skip
             text = end_text(head, extra)
         held = any(
             e.high and e.kind in HELD_KINDS for e in detected_list(self.conn, run.code)
@@ -3475,7 +3545,8 @@ class ClaudeRunner:
             # PER-273: Claude writes the prose; the ⚠ lines, side effects and the closing
             # line stay code-built. Any trouble sends ``text`` as it is (the fallback).
             facts = outcome_facts(run, ci=ci, no_ci=no_ci, upstream=upstream, watching=watching,
-                                  merged=merged, merged_by=merged_by, warn=warn, note=note,
+                                  merged=merged, merged_by=merged_by, warn=[*warn, *setup],
+                                  note=note,
                                   lines=parts[1], also=also,
                                   going=self._still_names(run))  # fmt: skip
             if facts is not None:
@@ -3494,6 +3565,7 @@ class ClaudeRunner:
             self.reports.told(item)
         if warn:
             clear_alerts(self.conn, run.code)
+        clear_setup_notes(self.conn, run.code)
         # PER-268: what the owner was told, for the brains. Code-built, it leaves out the
         # worker's own words (summary, did: notes); a voiced text (PER-273) paraphrases the
         # summary. Still outside content as list_runs is (the ask may
@@ -3502,7 +3574,7 @@ class ClaudeRunner:
         bare = end_parts(replace(run, summary=None), ci, no_ci=no_ci, upstream=upstream,
                          watching=watching, merged=merged, merged_by=merged_by)  # fmt: skip
         if bare is not None:
-            said = end_text(bare[0], [*warn, *([note] if note else []), *bare[1]])
+            said = end_text(bare[0], [*warn, *setup, *([note] if note else []), *bare[1]])
             if voiced is not None and voiced.used:
                 said = record_text(text)  # PER-273: what the owner read
             ref = f"run:{run.code}:{run.status}"

@@ -94,6 +94,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -143,6 +144,7 @@ from resonant.observability.spans import span
 from resonant.redact import Redactor
 from resonant.router.prefixes import time_context
 from resonant.runner.claude_auth import LoginCheck, auth_source, status_env
+from resonant.runner.scope import Instructions, read_instructions, warn_key
 from resonant.runners import reaper
 from resonant.runners.ask_tools import (
     PERMISSION_LISTING,
@@ -616,8 +618,10 @@ def ask_argv(
     kind: Kind,
     api_billing: bool,
     mcp: McpSetup | None = None,
+    extra: str = "",
 ) -> list[str]:
-    """The session's argv (the question goes on stdin). The ``Read`` deny rules go in
+    """The session's argv (the question goes on stdin). ``extra`` (PER-291): the
+    instance's ``brain.instructions_file`` text, after the prompt. The ``Read`` deny rules go in
     ``--settings`` (JSON: a deny entry may hold a space or a comma, which the
     ``--disallowedTools`` list would split); ``--settings`` still applies under
     ``--restricted``. ``mcp`` (BR-10): Resonant's tools, each allowed by name; no other MCP
@@ -653,7 +657,7 @@ def ask_argv(
         "--max-turns",
         str(cfg.max_turns),
         "--append-system-prompt",
-        prompt.replace("{max_chars}", str(cfg.reply_max_chars)),
+        prompt.replace("{max_chars}", str(cfg.reply_max_chars)) + extra,
     ]
     if api_billing:  # a subscription has no dollar budget
         argv += ["--max-budget-usd", f"{cfg.max_budget_usd:g}"]
@@ -671,6 +675,7 @@ def session_argv(
     resume: bool,
     budget_turns: int = 50,
     max_turns: int | None = None,
+    extra: str = "",
 ) -> list[str]:
     """The Claude brain's argv (BR-11): ``ask_argv``'s allow, deny and ``Read`` rules for a
     ``general`` ask with Resonant's tools (``--add-dir`` roots, ``--strict-mcp-config``), but
@@ -686,7 +691,8 @@ def session_argv(
     (``claude_session.max_turns``): ``--max-turns``, which counts per user message in a
     stream-json session (probed on 2.1.305, PER-262); a turn is also bounded by
     ``claude_session.turn_timeout_s``. API billing: ``--max-budget-usd`` is the session's,
-    ``max_budget_usd`` per turn for ``budget_turns`` (``rotate_turns``) turns."""
+    ``max_budget_usd`` per turn for ``budget_turns`` (``rotate_turns``) turns. ``extra``
+    (PER-291): the instance's ``brain.instructions_file`` text, after Resonant's own."""
     ts = toolset(cfg, "general")
     denied = [*dict.fromkeys([*cfg_writes(cfg), *ts.blocked])]
     rules = {"deny": scope.deny_rules(), "ask": list(ASK_RULES)}
@@ -724,13 +730,18 @@ def session_argv(
         "--append-system-prompt",
         f"{SESSION_PROMPT} {TOOL_NOTES} {SHELL_PROMPT}".replace(
             "{max_chars}", str(cfg.reply_max_chars)
-        ),
+        )
+        + extra,
     ]
     if max_turns is not None:
         argv += ["--max-turns", str(max_turns)]
     if api_billing:
         argv += ["--max-budget-usd", f"{cfg.max_budget_usd * budget_turns:g}"]
     return argv
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
 def progress_line(did: Sequence[str]) -> str:
@@ -940,6 +951,8 @@ class AskRunner:
         kill_grace_s: float = KILL_GRACE_S,
         defer_s: float = DEFER_S,
         bridge_root: Path | None = None,
+        claude_config_dir: Path | None = None,
+        instructions_file: Path | None = None,
     ) -> None:
         """``scope``: what an ask may read (``AskScope.from_settings``, the read tools'
         sources). ``ask_root``: where each ask gets an empty cwd (``<RESONANT_HOME>/ask``: not
@@ -952,7 +965,13 @@ class AskRunner:
         only); its ``max_per_hour`` is the runaway guard either way. ``taint_hops``:
         ``brain.taint_hops`` (PER-245), for the session's and a one-shot ask's history.
         ``bridge_root``: where the tool bridges' ``rsn-mcp-*`` dirs are swept at startup
-        (PER-262; None: the system temp dir, where ``McpServer`` makes them)."""
+        (PER-262; None: the system temp dir, where ``McpServer`` makes them).
+        ``claude_config_dir`` (PER-291, ``runner.claude_config_dir``): every ask's and the
+        brain session's ``CLAUDE_CONFIG_DIR``; set, the owner's login is never used.
+        ``instructions_file`` (``brain.instructions_file``): appended to the system text."""
+        self.claude_config_dir = claude_config_dir
+        self.instructions_file = instructions_file
+        self._warned: set[str] = set()
         self.taint_hops = taint_hops
         self.bridge_root = bridge_root
         self.conn = conn
@@ -1363,6 +1382,7 @@ class AskRunner:
         login = (
             not (secrets.claude_token or secrets.anthropic_key)
             and self.guard == "off"
+            and self.claude_config_dir is None  # PER-291: never the owner's login then
             and await self._login_ok()
         )
         source = auth_source(secrets, login_ok=login)
@@ -1371,13 +1391,16 @@ class AskRunner:
             return await self._not_set_up(task, ctx, cp)
         redactor = Redactor(secrets.values())
         env = status_env(self.home)
+        if self.claude_config_dir is not None:
+            env["CLAUDE_CONFIG_DIR"] = str(self.claude_config_dir)
+        extra = (await self._instructions()).suffix()
         if source == "token" and secrets.claude_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = secrets.claude_token
         elif source == "api_key" and secrets.anthropic_key:
             env["ANTHROPIC_API_KEY"] = secrets.anthropic_key
         if self._is_turn(cp):  # BR-11: a turn of the Claude brain
             return await self._turn(task, ctx, cp, question, kind, head, env,
-                                    source == "api_key", redactor)  # fmt: skip
+                                    source == "api_key", redactor, extra=extra)  # fmt: skip
         marker = f"ask-{task.id}"
         env[MARKER_ENV] = marker
         bridge = self._bridge(task, ctx, cp)
@@ -1396,7 +1419,7 @@ class AskRunner:
                     log.warning("ask: tool bridge didn't start", extra={"error": type(e).__name__})
                     return await self._finish(task, ctx, cp, "failed", FAILED.format(why="tools"))
             argv = ask_argv(head, cfg=self.cfg, scope=self.scope, kind=kind,
-                            api_billing=source == "api_key", mcp=mcp)  # fmt: skip
+                            api_billing=source == "api_key", mcp=mcp, extra=extra)  # fmt: skip
             try:
                 names = await asyncio.to_thread(self._prepare_dir, ask_dir, cp.get("attachments"))
             except OSError as e:
@@ -1518,6 +1541,8 @@ class AskRunner:
         env: dict[str, str],
         api_billing: bool,
         redactor: Redactor,
+        *,
+        extra: str = "",
     ) -> StepOutcome:
         """One Claude brain turn (BR-11): this task's bridge bound to the session's server
         for the turn, the message written, its ``result`` read. Taint: the asking turn's
@@ -1556,7 +1581,7 @@ class AskRunner:
             return session_argv(head, cfg=self.cfg, scope=self.scope, api_billing=api_billing,
                                 mcp=mcp, session_id=session_id, resume=resume,
                                 budget_turns=brain.cfg.rotate_turns,
-                                max_turns=brain.cfg.max_turns)  # fmt: skip
+                                max_turns=brain.cfg.max_turns, extra=extra)  # fmt: skip
 
         def hops_of(out: TurnOutcome) -> int | None:
             if bridge.read_outside:
@@ -1603,7 +1628,8 @@ class AskRunner:
                 paused=self._paused,
                 may_retry=lambda: bridge.changes == 0 and not bridge.asked,
                 started=started,
-                fingerprint=",".join(mcp.allowed),
+                # PER-291: changed instructions rotate the session like changed tools
+                fingerprint=",".join(mcp.allowed) + (f"|{_digest(extra)}" if extra else ""),
                 hops_of=hops_of,
             )
 
@@ -2231,6 +2257,20 @@ class AskRunner:
             return list(self._claude_cmd)
         found = resolve_tool("claude")
         return None if found is None else [str(found)]
+
+    async def _instructions(self) -> Instructions:
+        """PER-291: ``brain.instructions_file`` for this ask or turn. A file that can't be
+        used sends the owner one ⚠ line (once per daemon process and problem)."""
+        found = await asyncio.to_thread(read_instructions, self.instructions_file, what="brain")
+        line = found.warning("Brain")
+        if line is not None and line not in self._warned:
+            self._warned.add(line)
+            try:
+                await self.channel.send(self.owner, line, dedupe_key=warn_key("brain", line))
+            except ChannelError:
+                self._warned.discard(line)
+                log.warning("brain instructions warning not sent")
+        return found
 
     async def _login_ok(self) -> bool:
         try:

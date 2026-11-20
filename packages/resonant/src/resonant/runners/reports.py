@@ -117,6 +117,7 @@ DID_ITEM_MAX = 80
 DID_IN_TITLE = 100  # the did part of a digest line
 DID_IN_TEXT = 300  # the Did: line of a texted end reply
 SELF_SYSTEM = "resonant"  # the trust system of a worker's restart or update
+_SETUP_KEY = "run.setup:"  # kv: PER-291 setup lines (scoped vars not set up)
 _ALERT_KEY = "run.alert:"  # kv: a run's ⚠ lines for its end text (PER-268), oldest first
 _MERGED_KEY = "run.merged:"  # kv: the PRs a run merged onto its base (PER-268)
 _MERGED_BY_KEY = "run.merged_by:"  # kv: who merged a run's own PR, by Resonant's record (PER-269)
@@ -253,6 +254,27 @@ def clear_alerts(conn: sqlite3.Connection, code: str) -> None:
 
 def alerts(conn: sqlite3.Connection, code: str) -> list[str]:
     value: object = kv_get(conn, _ALERT_KEY + code)
+    if not isinstance(value, list):
+        return []
+    return [v for v in cast(list[object], value) if isinstance(v, str)]
+
+
+def set_setup_note(conn: sqlite3.Connection, code: str, line: str) -> None:
+    """PER-291: a line about the run's setup (scoped credentials not set up) for its end
+    text, said once. Unlike a ⚠ line it doesn't make the text urgent."""
+    with atomic(conn):
+        kept = [n for n in setup_notes(conn, code) if n != line]
+        kv_set(conn, _SETUP_KEY + code, [*kept, line][-ALERTS_KEEP:])
+
+
+def clear_setup_notes(conn: sqlite3.Connection, code: str) -> None:
+    with atomic(conn):
+        if kv_get(conn, _SETUP_KEY + code) is not None:
+            kv_set(conn, _SETUP_KEY + code, [])
+
+
+def setup_notes(conn: sqlite3.Connection, code: str) -> list[str]:
+    value: object = kv_get(conn, _SETUP_KEY + code)
     if not isinstance(value, list):
         return []
     return [v for v in cast(list[object], value) if isinstance(v, str)]

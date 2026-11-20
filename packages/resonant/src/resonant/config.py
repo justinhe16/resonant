@@ -551,6 +551,17 @@ class PulseConfig(_Section):
 _RUNNER_REPO_NAME = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 _RUNNER_REMOTE = re.compile(r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _RUNNER_BASE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,99}")
+# PER-291: ``runner.session_env`` names. Resonant's own variables (the session's paths, its
+# Claude credential and config dir, git's and gh's setup) can't be taken over by config.
+_ENV_VAR = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
+_RESERVED_ENV = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "CLAUDE_CODE_TMPDIR",
+    "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER",
+    "GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN", "GH_PROMPT_DISABLED", "GH_NO_UPDATE_NOTIFIER",
+    "RESONANT_HOME", "RESONANT_INSTANCE", "RESONANT_RUN", "UV_CACHE_DIR", "npm_config_cache",
+    "PIP_CACHE_DIR", "BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS",
+})  # fmt: skip
+_RESERVED_ENV_PREFIXES = ("GIT_", "RESONANT_", "DYLD_", "LD_")
 
 
 class RunnerRepo(_Section):
@@ -669,6 +680,21 @@ class RunnerConfig(_Section):
     # PER-290: with the guard off, register the daemon's own checkout (``ops.repo_path``) as
     # the repo ``resonant`` (GD-1). False (Cori): no such repo.
     self_repo: bool = True
+    # PER-291 (CS-1): a text file appended to every worker's system prompt, after the run's
+    # own instructions (and SURF_PROMPT). At most 8 KB, read at run start, logged by sha only;
+    # missing or too big: the run starts without it and the owner gets one ⚠ line.
+    instructions_file: Path | None = None
+    # PER-291: scoped credentials, ``{VAR: secret-ref}``. Each value is read from this
+    # instance's Keychain at run start and put in the worker's environment (redacted from
+    # transcripts and texts like the run's other secrets). A missing one doesn't fail the
+    # run. The one exception to GD-1's "no secret in a worker's env but its Claude
+    # credential" (docs/limits.md). Empty (personal Resonant): nothing is added.
+    session_env: dict[str, str] = Field(default_factory=dict[str, str])
+    # PER-291: Claude's config dir for this instance's workers, the ask runner, the Claude
+    # brain and the voice (``CLAUDE_CONFIG_DIR``), instead of the owner's ~/.claude. Set, the
+    # owner's stored ``claude`` login is never used: the instance's runner/claude_token is
+    # (or runner/anthropic_key). Guard ``thin`` keeps its own run-local dir.
+    claude_config_dir: Path | None = None
 
     @field_validator("guard", "remote_control", mode="before")
     @classmethod
@@ -726,6 +752,33 @@ class RunnerConfig(_Section):
     @classmethod
     def _absolute_binary(cls, v: Path) -> Path:
         return _absolute(v, "runner binary paths")
+
+    @field_validator("instructions_file", "claude_config_dir")
+    @classmethod
+    def _scope_paths(cls, v: Path | None) -> Path | None:
+        if v is None:
+            return None
+        return _absolute(v.expanduser(), "runner.instructions_file and claude_config_dir")
+
+    @field_validator("session_env")
+    @classmethod
+    def _session_env(cls, v: dict[str, str]) -> dict[str, str]:
+        from resonant.secrets import InvalidSecretRef, validate_ref
+
+        for var, ref in v.items():
+            if not _ENV_VAR.fullmatch(var):
+                raise ValueError(f"runner.session_env: {var!r} isn't an env var name")
+            if var in _RESERVED_ENV or var.startswith(_RESERVED_ENV_PREFIXES):
+                raise ValueError(f"runner.session_env: {var} is set by Resonant itself")
+            try:
+                validate_ref(ref)
+            except InvalidSecretRef as e:
+                raise ValueError(f"runner.session_env.{var}: {e}") from None
+            if ref.startswith("runner/"):
+                raise ValueError(
+                    f"runner.session_env.{var}: runner/* items are Resonant's own, not a worker's"
+                )
+        return v
 
 
 _CALENDAR = "mcp__claude_ai_Google_Calendar__"
@@ -988,6 +1041,9 @@ class BrainConfig(_Section):
     # Added to DEFAULT_READ_DENY (which always applies), checked before the roots. Resonant's
     # own secrets (the DB, run-secrets, ext-data, run dirs) are refused whatever this says.
     read_deny: list[str] = Field(default_factory=list[str])
+    # PER-291 (CS-1): a text file appended to the Claude brain's system text (the session's
+    # and a one-shot ask's), after Resonant's own. Same rules as runner.instructions_file.
+    instructions_file: Path | None = None
     # ripgrep for `search`, by absolute path. Missing: a bounded Python search instead.
     rg_path: Path | None = Path("/opt/homebrew/bin/rg")
     # ask_claude (BR-5, docs/brain-plan.md D8): reads the same roots and deny list.
@@ -1021,6 +1077,11 @@ class BrainConfig(_Section):
             log.warning("brain.route: local is deprecated; reading it as triage")
             self.route = "triage"
         return self
+
+    @field_validator("instructions_file")
+    @classmethod
+    def _instructions(cls, v: Path | None) -> Path | None:
+        return _absolute(v.expanduser(), "brain.instructions_file") if v else None
 
     @field_validator("whisper_path", "whisper_model")
     @classmethod
@@ -1165,6 +1226,36 @@ class Settings(BaseSettings):
                             f"runner.{label} {path} overlaps {what} ({other}); "
                             f"instance {name} needs its own"
                         )
+        return self
+
+    @model_validator(mode="after")
+    def _read_roots_apart(self) -> Self:
+        """PER-291: a non-default instance's ``brain.read_roots`` may not overlap another
+        instance's home or worker dirs: the default instance's (``~/.resonant``, ``~/code``,
+        ``~/resonant-runs``) or any other ``~/.resonant-<name>``. Its own home and dirs are
+        fine."""
+        name = self.instance.name
+        roots = self.brain.read_roots
+        if inst.is_default(name) or not roots:
+            return self
+        theirs = [(f"the {inst.DEFAULT_INSTANCE} instance's {label}", p.expanduser().resolve())
+                  for label, p in inst.run_dirs(inst.DEFAULT_INSTANCE).items()]  # fmt: skip
+        theirs.append((f"the {inst.DEFAULT_INSTANCE} instance's home",
+                       inst.home_for(inst.DEFAULT_INSTANCE).resolve()))  # fmt: skip
+        for root in roots:
+            real = root.resolve()
+            for what, other in theirs:
+                if inst.overlaps(real, other):
+                    raise ValueError(
+                        f"brain.read_roots entry {root} overlaps {what} ({other}); "
+                        f"instance {name} reads only its own"
+                    )
+            for part in (root, *root.parents, real, *real.parents):
+                owner = inst.home_owner(part)
+                if owner is not None and owner != name:
+                    raise ValueError(
+                        f"brain.read_roots entry {root} is inside instance {owner}'s home"
+                    )
         return self
 
     @model_validator(mode="after")
