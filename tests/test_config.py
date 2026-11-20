@@ -326,3 +326,72 @@ def test_instance_name_must_be_a_slug(resonant_home: Path) -> None:
     (resonant_home / "config.yaml").write_text("instance:\n  name: Cori.Bot\n")
     with pytest.raises(ValidationError, match="slug"):
         load_settings()
+
+
+# --- PER-291: Cori's scope keys ---------------------------------------------------------------
+
+
+def test_cori_example_sets_her_scope(resonant_home: Path) -> None:
+    (resonant_home / "config.yaml").write_text((REPO / "config/cori.example.yaml").read_text())
+    s = load_settings()
+    home = Path.home()
+    assert s.runner.instructions_file == home / "resonant/config/cori/worker-rules.md"
+    assert s.brain.instructions_file == home / "resonant/config/cori/brain-rules.md"
+    assert s.runner.claude_config_dir == home / "cori/claude"
+    assert s.runner.session_env["FLY_API_TOKEN"] == "dori/fly_staging_token"
+    assert len(s.runner.session_env) == 8
+    assert s.brain.read_roots == [home / "cori/code", home / ".resonant-cori/logs"]
+    assert "~/trade-jev" in s.brain.read_deny and "~/.resonant" in s.brain.read_deny
+    # the wording files ship in the repo, each well under the 8 KB cap
+    for name in ("worker-rules.md", "brain-rules.md"):
+        text = (REPO / "config/cori" / name).read_text()
+        assert 0 < len(text.encode()) < 8 * 1024
+
+
+def test_personal_defaults_have_no_scope(resonant_home: Path) -> None:
+    s = load_settings()
+    assert s.runner.instructions_file is None and s.brain.instructions_file is None
+    assert s.runner.session_env == {} and s.runner.claude_config_dir is None
+
+
+@pytest.mark.parametrize(
+    ("env", "match"),
+    [
+        ({"fly_token": "dori/fly"}, "env var name"),
+        ({"PATH": "dori/path"}, "set by Resonant"),
+        ({"CLAUDE_CONFIG_DIR": "dori/x"}, "set by Resonant"),
+        ({"GIT_ASKPASS": "dori/x"}, "set by Resonant"),
+        ({"RESONANT_HOME": "dori/x"}, "set by Resonant"),
+        ({"FLY_API_TOKEN": "not a ref"}, "bad secret ref"),
+        ({"FLY_API_TOKEN": "runner/claude_token"}, "Resonant's own"),
+    ],
+)
+def test_session_env_validation(env: dict[str, str], match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        load_settings(runner={"session_env": env})
+
+
+def test_scope_paths_must_be_absolute() -> None:
+    with pytest.raises(ValidationError):
+        load_settings(runner={"instructions_file": "rules.md"})
+    with pytest.raises(ValidationError):
+        load_settings(brain={"instructions_file": "rules.md"})
+
+
+@pytest.mark.parametrize(
+    "root",
+    ["~/.resonant/logs", "~/code/voyager-web", "~", "~/resonant-runs", "~/.resonant-other/logs"],
+)
+def test_a_non_default_instances_read_roots_stay_out_of_other_instances(
+    resonant_home: Path, root: str
+) -> None:
+    (resonant_home / "config.yaml").write_text(
+        f"instance:\n  name: cori\nbrain:\n  read_roots: [{root}]\n"
+    )
+    with pytest.raises(ValidationError, match="read_roots"):
+        load_settings()
+
+
+def test_personal_read_roots_are_not_restricted(resonant_home: Path) -> None:
+    s = load_settings(brain={"read_roots": ["~/code", "~/.resonant-cori/logs"]})
+    assert s.brain.read_roots == [Path.home() / "code", Path.home() / ".resonant-cori/logs"]

@@ -37,6 +37,7 @@ from resonant.principals import Principal, Principals
 from resonant.redact import Redactor
 from resonant.runners import ask as ask_mod
 from resonant.runners.ask import (
+    ASK_PROMPT,
     NOT_SET_UP,
     PAUSED,
     READ_BUILTINS,
@@ -884,3 +885,62 @@ def test_usage_of_keeps_token_counts_and_duration() -> None:
         "input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 5, "duration_ms": 900
     }  # fmt: skip
     assert usage_of({"result": "hi"}) is None
+
+
+# --- PER-291: an instance's Claude config dir and brain rules ---------------------------------
+
+
+async def test_an_instances_config_dir_reaches_every_ask_and_skips_the_owners_login(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    config_dir = tmp_path / "cori-claude"
+    h = make(db, tmp_path)
+    h.runner.claude_config_dir = config_dir
+    out, _ = await h.ask()
+    assert isinstance(out, Done) and out.result["status"] == "answered"
+    assert "CLAUDE_CONFIG_DIR" in h.argv_notes()["env"]
+    # no token: the owner's stored login is never tried, whatever it would say
+    tried: list[bool] = []
+
+    async def login_check() -> bool:
+        tried.append(True)
+        return True
+
+    h2 = make(db, tmp_path / "two", token=False)
+    h2.runner.claude_config_dir = config_dir
+    h2.runner._login_check = login_check  # pyright: ignore[reportPrivateUsage]
+    out, _ = await h2.ask()
+    assert isinstance(out, Done) and out.result["status"] == "not_set_up"
+    assert tried == []
+
+
+async def test_personal_asks_get_no_config_dir_and_no_extra_text(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    h = make(db, tmp_path)
+    await h.ask()
+    seen = h.argv_notes()
+    assert "CLAUDE_CONFIG_DIR" not in seen["env"]
+    system = seen["argv"][seen["argv"].index("--append-system-prompt") + 1]
+    assert system == ASK_PROMPT.replace("{max_chars}", "1500")
+
+
+async def test_brain_rules_follow_the_ask_prompt_and_a_bad_file_warns_once(
+    db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    rules = tmp_path / "brain-rules.md"
+    rules.write_text("You answer the DORI team in Slack.\n")
+    h = make(db, tmp_path)
+    h.runner.instructions_file = rules
+    await h.ask()
+    system = h.argv_notes()["argv"][h.argv_notes()["argv"].index("--append-system-prompt") + 1]
+    assert system.endswith("\n\nYou answer the DORI team in Slack.")
+    # too big: the ask still runs, without it, and the owner hears it once
+    rules.write_text("x" * (8 * 1024 + 1))
+    for _ in range(2):
+        out, _ = await h.ask()
+        assert isinstance(out, Done) and out.result["status"] == "answered"
+    system = h.argv_notes()["argv"][h.argv_notes()["argv"].index("--append-system-prompt") + 1]
+    assert "xxxx" not in system
+    warns = [t for t in h.channel.texts if t.startswith("⚠ Brain instructions")]
+    assert warns == [f"⚠ Brain instructions {rules} is over 8 KB: sessions start without them."]
