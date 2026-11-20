@@ -19,6 +19,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from resonant.brain.briefing import last_talked, run_name, since_notes
+from resonant.brain.history import channel_of
 from resonant.brain.text import flat
 from resonant.config import Settings
 from resonant.gate.policy import change_line
@@ -65,7 +66,13 @@ def news_reply(
     tz = ZoneInfo(settings.timezone)
     try:
         since = (
-            last_talked(conn, principal, before_event_id=event_id, conversation=conversation)
+            last_talked(
+                conn,
+                principal,
+                before_event_id=event_id,
+                source=channel_of(conn, event_id),
+                conversation=conversation,
+            )
             if event_id is not None
             else None
         )

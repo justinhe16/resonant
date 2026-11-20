@@ -1,6 +1,6 @@
--- 029 (PER-294): one Slack thread is one conversation.
+-- 030 (PER-294): one Slack thread is one conversation.
 -- ``tasks.conversation``: the thread a task's message came from (``channel_ref.thread``); NULL
--- is the principal's own conversation (iMessage, and every task written before 029). The
+-- is the principal's own conversation (iMessage, and every task written before 030). The
 -- brains' history, the "since we last spoke" delta and the system texts read by it.
 ALTER TABLE tasks ADD COLUMN conversation TEXT;
 UPDATE tasks SET conversation = json_extract(channel_ref, '$.thread')

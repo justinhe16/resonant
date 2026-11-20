@@ -104,6 +104,7 @@ from resonant.models import (
     SpanFactory,
 )
 from resonant.observability.spans import span
+from resonant.principals import KNOWN_CHANNELS
 from resonant.redact import Redactor
 from resonant.router.intents import ExtensionCatalog
 from resonant.runners.local import gated_answer, model_result
@@ -140,7 +141,9 @@ OWNER_ASKED_SCHEMA: dict[str, Any] = {
         "PR use merge_run (find its code with list_runs, not GitHub)."
     ),
 }
-OWNER_SOURCES = frozenset({"imessage"})  # where the owner's own messages come from
+# Where a principal's own messages come from: every channel adapter (PER-295: Slack too; the
+# event's principal still has to be the asker, and the adapter authenticated the sender).
+OWNER_SOURCES = frozenset(KNOWN_CHANNELS)
 BRAIN_RUNNER = "brain"  # the chat runner that hands a turn to Claude
 
 SERVER = "resonant"

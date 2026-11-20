@@ -105,7 +105,7 @@ def _row(r: sqlite3.Row) -> SystemText:
 
 
 def _has_conversations(conn: sqlite3.Connection) -> bool:
-    """``tasks.conversation`` exists (migration 029)."""
+    """``tasks.conversation`` exists (migration 030)."""
     return any(r[1] == "conversation" for r in conn.execute("PRAGMA table_info(tasks)"))
 
 

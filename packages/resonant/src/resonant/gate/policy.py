@@ -56,7 +56,10 @@ is pending for the actor, now and when the reply was sent. ``require_code`` need
 ``yes <code>``; a plain no may deny. ``yes always`` binds the same way but only to an
 approval that offered it (``allow_always``: a worker's trust check or an owner's L2 chat
 call; never ``require_code``) and only from the owner, else ``always_unsupported``.
-Resolution is idempotent per reply event (``resolved_event_id``).
+Resolution is idempotent per reply event (``resolved_event_id``). A Slack button
+(PER-295, ``path="button"``) is a reply that always carries its prompt's code: it binds like
+``yes <code>``/``no <code>`` (L1 too), its sent-before rule is that the prompt reached some
+approver before the click, and pay never binds by button.
 
 Batches (BA-1, ``open_batch``): a task that collected several changes needing approval asks
 the owner once. ``open_batch`` stores the snapshot in ``approval_batches`` (its approvals, in
@@ -130,6 +133,8 @@ OWNER_ASKED = "owner_asked"
 # ``gateway.channel.event_identity``, which ties it to the event's channel). The iMessage
 # reader already drops SMS.
 REPLY_CHANNELS = frozenset(KNOWN_CHANNELS)
+# PER-295: channels whose approval prompts carry buttons (``path="button"`` replies).
+BUTTON_CHANNELS = frozenset({"slack"})
 
 # BA-1: at most this many changes wait on the owner in one batch (``gate.batch_max``).
 DEFAULT_BATCH_MAX = 10
@@ -912,9 +917,11 @@ class PolicyGate:
     ) -> tuple[_Unit | None, ReplyRefusal | None]:
         """What this reply binds to (one approval, or a batch as one unit), or why it binds
         none."""
+        button = reply.path == "button"
         if (
             reply.channel not in REPLY_CHANNELS
-            or reply.path != "parser"
+            or reply.path not in ("parser", "button")
+            or (button and (reply.channel not in BUTTON_CHANNELS or reply.code is None))
             or reply.all_in_batch
             or reply.batch_id is not None
         ):
@@ -937,7 +944,14 @@ class PolicyGate:
             return None, "ambiguous"
         else:
             target = prompted[0] if prompted else mine[0]
-        if not all(_sent_before(m, reply) for m in target.members):
+        if button:
+            # PER-295: the click is on the posted prompt, so it went out before the click; to
+            # some approver (a shared thread), not necessarily this one. Pay is typed only.
+            if not all(_posted_before(m, reply) for m in target.members):
+                return None, "not_sent_before"
+            if any(m.effect == Effect.PAY for m in target.members):
+                return None, "code_required"
+        elif not all(_sent_before(m, reply) for m in target.members):
             return None, "not_sent_before"
         if reply.picks is not None:
             if target.batch is None:
@@ -1129,6 +1143,11 @@ class _Unit:
             level=self.level,
             effect=self.effect,
         )
+
+
+def _posted_before(a: ap.Approval, reply: ApprovalReply) -> bool:
+    """A button's sent-before rule: the prompt reached some approver before the click."""
+    return any(r.at < reply.occurred_at for r in a.channel_refs)
 
 
 def _sent_before(a: ap.Approval, reply: ApprovalReply) -> bool:

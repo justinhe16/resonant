@@ -217,6 +217,10 @@ def _ext_check_names(conn: sqlite3.Connection) -> list[str]:
     return [str(r[0]).removeprefix(HEALTH_KV_PREFIX) for r in rows]
 
 
+# The adapter health keys ``/api/channels`` passes through as a row's ``status`` (PER-295).
+CHANNEL_STATUS_KEYS = ("connected", "last_event_at", "followed_threads")
+
+
 def channels_snapshot(
     conn: sqlite3.Connection,
     *,
@@ -229,7 +233,9 @@ def channels_snapshot(
     The ``imessage`` row first (``channel``: the live iMessage adapter). Without it, ``ok``
     and ``last_read_at`` are null; ``last_selftest`` comes from kv either way (``resonant
     selftest imessage`` also writes it). Then one row per other live adapter (``others``,
-    PER-292), with ``last_selftest`` null.
+    PER-292), with ``last_selftest`` null and, when the adapter reports them, a ``status``
+    of ``CHANNEL_STATUS_KEYS`` (Slack, PER-295: ``{connected, last_event_at,
+    followed_threads}``).
     """
     raw: object = kv_get(conn, SELFTEST_KV)
     last_selftest: dict[str, Any] | None = None
@@ -260,15 +266,18 @@ def channels_snapshot(
     for name, other in (others or {}).items():
         h = other.health()
         read_at = h.get("last_read_at")
-        rows.append(
-            {
-                "name": name,
-                "enabled": True,
-                "ok": h.get("ok") is True,
-                "last_read_at": read_at if isinstance(read_at, str) else None,
-                "last_selftest": None,
-            }
-        )
+        row: dict[str, Any] = {
+            "name": name,
+            "enabled": True,
+            "ok": h.get("ok") is True,
+            "last_read_at": read_at if isinstance(read_at, str) else None,
+            "last_selftest": None,
+        }
+        # PER-295: an adapter's own status (Slack: connected, last event, followed threads)
+        status = {k: h[k] for k in CHANNEL_STATUS_KEYS if k in h}
+        if status:
+            row["status"] = status
+        rows.append(row)
     return rows
 
 
@@ -534,12 +543,16 @@ class HealthMonitor:
                 log.warning("%s self-test raised %s", name, type(e).__name__)
                 last = (False, now, f"self-test error ({type(e).__name__})")
             self._selftests[name] = last
-        err = channel.health().get("last_error")
+        h = channel.health()
+        err = h.get("last_error")
         if err is not None:
             return CheckResult(False, f"{name} error: {scrub(str(err), 80)}")
         if last is not None and not last[0]:
             return CheckResult(False, f"{name} selftest failed: {scrub(last[2], 90)}")
-        return CheckResult(True, "ok")
+        # PER-295: an adapter's code-built status line (Slack: connected, followed threads,
+        # last event) is the ok detail, so the snapshot's health row shows it.
+        detail = h.get("detail")
+        return CheckResult(True, scrub(detail, 120) if isinstance(detail, str) and detail else "ok")
 
     def _last_selftest(self) -> tuple[bool, datetime | None, str] | None:
         raw: object = kv_get(self.conn, SELFTEST_KV)

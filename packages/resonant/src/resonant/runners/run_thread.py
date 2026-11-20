@@ -1,6 +1,6 @@
 """Where a run's texts go (PER-294): the thread it was asked in, addressed to who asked.
 
-A run keeps its thread (``runs.channel_ref``, migration 029; older runs: its task's
+A run keeps its thread (``runs.channel_ref``, migration 030; older runs: its task's
 ``channel_ref``) and its requester (``runs.requested_by``; None: the run's principal, the
 owner). Its questions (``R4 asks:``), trust checks, notes and outcome go to that thread,
 addressed to the requester. A requester who can't be reached any more (left the workspace:
@@ -20,7 +20,7 @@ from resonant.store.tasks import get_task
 
 
 def run_ref(conn: sqlite3.Connection, run: Run) -> dict[str, Any] | None:
-    """The run's ``channel_ref``: its own, else its task's (a run from before 029)."""
+    """The run's ``channel_ref``: its own, else its task's (a run from before 030)."""
     if run.channel_ref is not None:
         return run.channel_ref
     task = get_task(conn, run.task_id) if run.task_id else None

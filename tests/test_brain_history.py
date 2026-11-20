@@ -51,7 +51,7 @@ def seed(db: sqlite3.Connection, n: int, *, start: int = 0) -> list[str]:
 
 
 def test_migration_015(db: sqlite3.Connection) -> None:
-    assert schema_version(db) == latest_version() == 29
+    assert schema_version(db) == latest_version() == 30
     cols = {r["name"] for r in db.execute("PRAGMA table_info(brain_summaries)")}
     assert cols == {"principal", "summary", "through_event_id", "folded", "source", "updated_at"}
 
@@ -245,7 +245,7 @@ def test_migration_017_starts_summaries_over(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == 29
+    assert schema_version(conn) == 30
     assert store.get_summary(conn, OWNER) is None
     conn.close()
 
@@ -405,7 +405,7 @@ def test_migration_018_starts_summaries_over(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     conn = open_db(path)
-    assert schema_version(conn) == 29
+    assert schema_version(conn) == 30
     assert store.get_summary(conn, OWNER) is None
     conn.close()
 
@@ -773,9 +773,9 @@ async def test_a_thread_folds_into_its_own_summary(db: sqlite3.Connection) -> No
     assert saved is not None and saved.summary == "thread summary"
 
 
-def test_migration_029_backfills_task_conversations(tmp_path: Path) -> None:
+def test_migration_030_backfills_task_conversations(tmp_path: Path) -> None:
     conn = connect(tmp_path / "m.db")
-    migrate(conn, [m for m in db_mod._migrations() if m[0] <= 28])  # pyright: ignore[reportPrivateUsage]
+    migrate(conn, [m for m in db_mod._migrations() if m[0] <= 29])  # pyright: ignore[reportPrivateUsage]
     conn.execute(
         "INSERT INTO tasks (id, kind, runner, priority, channel_ref, trace_id, created_at,"
         " updated_at) VALUES ('t1', 'chat', 'local', 1, ?, 'x', 'n', 'n'),"
@@ -783,6 +783,6 @@ def test_migration_029_backfills_task_conversations(tmp_path: Path) -> None:
         ('{"channel": "slack", "thread": "T-A"}', '{"channel": "imessage", "thread": null}'),
     )
     conn.commit()
-    assert migrate(conn) == 29
+    assert migrate(conn) == 30
     got = dict(conn.execute("SELECT id, conversation FROM tasks").fetchall())
     assert got == {"t1": "T-A", "t2": None}

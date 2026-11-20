@@ -87,7 +87,7 @@ class Run:
     last_note: str | None = None  # the worker's latest ``resonant note``
     resume_prompt: str | None = None  # what the current turn delivered (resent after a crash)
     remote_url: str | None = None  # the latest session's Remote Control URL (migration 014)
-    # PER-294 (migration 029): the thread the run was asked in (the asking task's
+    # PER-294 (migration 030): the thread the run was asked in (the asking task's
     # ``channel_ref``) and who asked (``requested_by``; None: the run's ``principal``). Its
     # questions, trust checks and outcome go to that thread, addressed to the requester.
     channel_ref: dict[str, Any] | None = None
@@ -204,7 +204,7 @@ def create(
             "session_id": session_id, "max_seconds": max_seconds,
             "max_budget_usd": max_budget_usd, "created_at": ts, "updated_at": ts,
         }  # fmt: skip
-        # migration 029's columns only when set (a store part way through its migrations)
+        # migration 030's columns only when set (a store part way through its migrations)
         if channel_ref is not None:
             cols["channel_ref"] = json.dumps(dict(channel_ref))
         if requested_by is not None:
