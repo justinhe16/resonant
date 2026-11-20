@@ -58,6 +58,7 @@ from resonant_sdk import Level, ToolSpec
 if TYPE_CHECKING:
     from resonant.api import DaemonState
     from resonant.brain.voice import Voice
+    from resonant.channel_watchers import ChannelWatchers
     from resonant.ops import OpsRunner
 
 log = logging.getLogger(__name__)
@@ -82,6 +83,9 @@ class Components:
     # PER-273: writes the prose of Resonant's own texts (outcomes, pulse, briefing); None:
     # they stay code-built. Set by ``wiring.build_imessage_stack``, read by the core jobs.
     voice: Voice | None = None
+    # PER-299: channel watchers (``wiring.build_stack``); ``add_job`` checks the channel
+    # through it. None without a channel stack.
+    watchers: ChannelWatchers | None = None
 
     def chat_specs(self) -> list[ToolSpec]:
         """Every registered spec a chat step can call: builtins and extension tools, never

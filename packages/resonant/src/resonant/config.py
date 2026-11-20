@@ -397,6 +397,17 @@ class TrustConfig(_Section):
     cost_ask_over_usd: float = Field(default=20.0, ge=0, allow_inf_nan=False)
 
 
+class WatchersConfig(_Section):
+    """Channel watchers (PER-299, ``resonant/channel_watchers.py``): registered jobs that
+    start a run per matching Slack message."""
+
+    # Runs one watcher may start in any hour; the next match pauses it, with one note.
+    max_per_hour: int = Field(default=20, ge=1, le=500)
+    # The optional ``ask`` filter's yes/no from the local model waits at most this long; a
+    # late or failed answer is a no (no run, audited ``watch.ask_failed``).
+    ask_timeout_s: float = Field(default=20.0, gt=0, le=120)
+
+
 def _package_checkout() -> Path | None:
     """The git checkout containing the running package, if it runs from one."""
     for parent in Path(__file__).resolve().parents:
@@ -1297,6 +1308,7 @@ class Settings(BaseSettings):
     pulse: PulseConfig = Field(default_factory=PulseConfig)
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
     trust: TrustConfig = Field(default_factory=TrustConfig)
+    watchers: WatchersConfig = Field(default_factory=WatchersConfig)  # PER-299
     brain: BrainConfig = Field(default_factory=BrainConfig)
     # PER-301: another instance's bridge to personal Resonant (None: no forwarding)
     notify_owner: NotifyOwnerConfig | None = None

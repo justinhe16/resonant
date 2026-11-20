@@ -231,7 +231,10 @@ NOTE_HOWTO = (
 
 def context_text(job: store.Job) -> str:
     """What a job's run is told on its first turn, after the job's prompt."""
-    lines = [f"This run is registered job {job.id} ({job.name}), started on its schedule."]
+    if job.kind == "watch":  # PER-299: the message itself is in the ask
+        lines = [f"This run is watcher {job.id} ({job.name}), started by a matching message."]
+    else:
+        lines = [f"This run is registered job {job.id} ({job.name}), started on its schedule."]
     if job.memory:
         lines += ["Its memory from earlier runs:", job.memory]
     else:

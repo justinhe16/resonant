@@ -32,6 +32,18 @@ transport (``gateway.slack.client``); they are never logged, stored or put in an
   cached). A redelivered envelope has the same dedupe key, so the loop drops it. An accepted
   message gets an :eyes: reaction.
 
+**Watchers** (PER-299, ``resonant/channel_watchers.py``). ``watchers`` (a ``WatchIndex``, set
+by ``wiring.build_stack``) is checked before an untagged channel message, or an untagged reply
+in a thread Cori doesn't follow, is dropped: never for a mention (the mention path only), a
+DM, the bot's own message, an edit or another team. Any same-team sender counts (a principal
+or not). Each watcher of the channel whose code filter matches (``contains``, ``from``, the
+guarded ``regex``; replies only with ``include_replies``) gets one ``watch_match`` event
+(``dedupe_key="slack:<ch>:<ts>:J<n>"``); the message's thread is then one Cori may post in
+(kv ``slack.watch_thread:<ch>:<root>``, 14 days) without following it. Text over
+``max_body_chars`` is dropped (audited ``watch.too_long``). :meth:`watch_target` resolves the
+channel ``add_job`` names (``<#C…|name>``, ``C…``, a rooms key, ``#name``) and checks that
+the bot is a member (``conversations.info``: ``channels:read``/``groups:read``).
+
 **Threads.** A thread is ``(channel, root ts)`` (``store/slack.py``). It is followed from the
 first message that tags the bot (or any DM) until it has been idle ``follow_idle_days``. A
 reply goes to the thread it answers: ``MessageRef("slack", "<ch>:<ts>", thread="<ch>:<root>")``.
@@ -79,6 +91,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import re
 import sqlite3
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -119,6 +132,7 @@ from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 from resonant_sdk import Effect, Event
 
 if TYPE_CHECKING:
+    from resonant.channel_watchers import WatchIndex
     from resonant.gate.types import Gate
     from resonant.secrets import SecretStore
 
@@ -138,7 +152,30 @@ FUTURE_SKEW = timedelta(minutes=5)
 EYES = "eyes"
 MAX_MENTION_LOOKUPS = 10  # users.info calls per message at most; the rest stay @U…
 UNKNOWN_AUDIT_EVERY = timedelta(hours=1)  # slack.unknown_sender at most this often per identity
+WATCH_THREAD_PREFIX = "slack.watch_thread:"  # PER-299: threads a watcher's run may post in
+WATCH_THREAD_TTL = timedelta(days=14)
+LIST_PAGES = 5  # conversations.list pages looked at to find a channel by name
 _RATE_WINDOW = timedelta(minutes=1)
+
+
+class WatchRefused(ChannelError):
+    """``watch_target`` can't watch that channel. ``reason``: ``not_member``, ``not_found``,
+    ``dm``, ``archived``, ``no_scope`` or ``error``; ``name``: the channel's, when known."""
+
+    def __init__(self, reason: str, name: str | None = None, detail: str = "") -> None:
+        super().__init__(f"slack: can't watch {name or 'that channel'}: {reason} {detail}".strip())
+        self.reason = reason
+        self.name = name
+
+
+@dataclass(frozen=True)
+class WatchTarget:
+    id: str
+    name: str
+
+
+_CHANNEL_LINK = re.compile(r"^<#([CG][A-Z0-9]{2,31})(?:\|([^>]*))?>$")
+_CHANNEL_ID = re.compile(r"^[CG][A-Z0-9]{2,31}$")
 
 
 @dataclass(frozen=True)
@@ -200,6 +237,7 @@ class SlackChannel:
         self._last_error: str | None = None
         self._room_errors: dict[str, str] = {}  # room key -> its last post's failure (PER-303)
         self._threads_swept: datetime | None = None
+        self.watchers: WatchIndex | None = None  # PER-299 (``wiring.build_stack``)
 
     @property
     def name(self) -> str:
@@ -367,7 +405,13 @@ class SlackChannel:
             return
         payload = cast(dict[str, Any], raw)
         if kind == "events_api":
-            parsed = ev.parse_message(payload, team_id=self.team_id, bot_user_id=self.bot_user_id)
+            index = self.watchers
+            parsed = ev.parse_message(
+                payload,
+                team_id=self.team_id,
+                bot_user_id=self.bot_user_id,
+                channel_messages=index is not None and bool(index.channels()),
+            )
             if isinstance(parsed, ev.Dropped):
                 if parsed.reason in ("other_team", "malformed"):
                     log.info("slack: dropped an event (%s)", parsed.reason)
@@ -385,21 +429,28 @@ class SlackChannel:
         submit = self._submit
         if submit is None:
             return
+        if m.kind == "channel":  # an untagged channel message: watchers only (PER-299)
+            await self._watch(m)
+            return
         identity = f"slack:{m.user}"
         principal = self.principals.resolve(identity, vouched=True)  # same team: vouched
         now = self.clock()
+        followed = True
+        if m.kind == "reply":
+            with atomic(self.conn):
+                followed = store.followed(self.conn, m.channel, m.thread_ts, now, self.idle)
         if principal is None:
             last = self._unknown.get(identity)
             if last is None or now - last >= UNKNOWN_AUDIT_EVERY:
                 self._unknown[identity] = now
                 with atomic(self.conn):
                     audit(self.conn, "slack.unknown_sender", identity=identity, ref=m.ref)
-            return
-        if m.kind == "reply":
-            with atomic(self.conn):
-                followed = store.followed(self.conn, m.channel, m.thread_ts, now, self.idle)
             if not followed:
-                return  # an untagged reply in a thread Cori doesn't follow
+                await self._watch(m)
+            return
+        if not followed:
+            await self._watch(m)  # an untagged reply in a thread Cori doesn't follow
+            return
         text = ev.clean_text(m.text, self.bot_user_id)
         if len(text) > self.config.max_body_chars:
             with atomic(self.conn):
@@ -463,6 +514,155 @@ class SlackChannel:
                 )
             except SlackCallError as e:
                 log.info("slack: reaction failed (%s)", e.error)
+
+    async def _watch(self, m: ev.Message) -> None:
+        """Hand a message no other path takes to the channel's watchers (PER-299): one
+        ``watch_match`` event per watcher whose code filter matches."""
+        index, submit = self.watchers, self._submit
+        if index is None or submit is None:
+            return
+        found = index.for_channel(m.channel)
+        if m.kind == "reply":
+            found = [w for w in found if w.filter.include_replies]
+        if not found:
+            return
+        from resonant.channel_watchers import code_match, match_event, regex_match
+        from resonant.registered_jobs import principal_for
+
+        text = ev.clean_text(m.text, self.bot_user_id)
+        if not text:
+            return
+        if len(text) > self.config.max_body_chars:
+            with atomic(self.conn):
+                audit(self.conn, "watch.too_long", ref=m.ref, length=len(text),
+                      limit=self.config.max_body_chars)  # fmt: skip
+            return
+        identity = f"slack:{m.user}"
+        sender = self.principals.resolve(identity, vouched=True)
+        names: set[str] = {m.user, identity, *([sender] if sender else [])}
+        display = await self._user_name(m.user) if any(w.filter.senders for w in found) else None
+        if display:
+            names.add(display)
+        now = self.clock()
+        at = min(ev.ts_time(m.ts) or now, now + FUTURE_SKEW)
+        rendered: str | None = None
+        for w in found:
+            if not code_match(w.filter, text, names):
+                continue
+            if w.filter.pattern is not None:
+                hit = await regex_match(w.filter.pattern, text)
+                if hit is None:
+                    with atomic(self.conn):
+                        audit(self.conn, "watch.regex_slow", job=w.job.id, ref=m.ref,
+                              length=len(text))  # fmt: skip
+                    continue
+                if not hit:
+                    continue
+            if rendered is None:
+                rendered = text
+                if users := ev.mentions(text)[:MAX_MENTION_LOOKUPS]:
+                    rendered = ev.render_mentions(
+                        text, {u: await self._user_name(u) for u in users}
+                    )
+                with atomic(self.conn):
+                    kv_set(self.conn, f"{WATCH_THREAD_PREFIX}{m.channel}:{m.thread_ts}",
+                           {"at": iso(now)})  # fmt: skip
+            if display is None:
+                display = await self._user_name(m.user)
+            who = self.principals.display(sender) if sender else display
+            event = match_event(
+                w,
+                text=rendered,
+                identity=identity,
+                sender=who,
+                channel=m.channel,
+                ts=m.ts,
+                thread_ts=m.thread_ts,
+                at=at,
+                principal=principal_for(w.job, self.principals),
+            )
+            if submit(event):
+                log.info("slack: watcher %s matched %s (%d chars)", w.job.id, m.ref, len(text))
+
+    def _watched(self, channel: str, thread_ts: str) -> bool:
+        """A watcher's run may post in this thread (PER-299)."""
+        record: object = kv_get(self.conn, f"{WATCH_THREAD_PREFIX}{channel}:{thread_ts}")
+        at = cast(dict[str, object], record).get("at") if isinstance(record, dict) else None
+        if not isinstance(at, str):
+            return False
+        try:
+            return self.clock() - datetime.fromisoformat(at) < WATCH_THREAD_TTL
+        except ValueError:
+            return False
+
+    async def watch_target(self, raw: str) -> WatchTarget:
+        """The channel ``add_job`` names for a watcher, checked: the bot must be in it.
+        ``raw``: ``<#C…|name>``, ``C…``/``G…``, a ``rooms`` key, or ``#name``/``name``.
+        Raises :class:`WatchRefused`."""
+        web = self.web
+        if web is None:
+            raise WatchRefused("error", None, "Slack isn't connected")
+        text = raw.strip()
+        name: str | None = None
+        cid: str | None = None
+        if m := _CHANNEL_LINK.match(text):
+            cid, name = m.group(1), m.group(2) or None
+        elif _CHANNEL_ID.match(text):
+            cid = text
+        else:
+            name = text.removeprefix("#").strip().lower()
+            if not name:
+                raise WatchRefused("not_found", None)
+            cid = self.config.rooms.get(name) or await self._find_channel(name)
+            if cid is None:
+                raise WatchRefused("not_found", name)
+        assert cid is not None
+        try:
+            body = await web.call("conversations.info", {"channel": cid})
+        except SlackCallError as e:
+            if e.error in ("channel_not_found", "not_in_channel"):
+                raise WatchRefused("not_found", name or cid) from None
+            if e.error == "missing_scope":
+                raise WatchRefused("no_scope", name or cid) from None
+            raise WatchRefused("error", name or cid, e.error) from None
+        raw_info: object = body.get("channel")
+        info = cast(dict[str, Any], raw_info) if isinstance(raw_info, dict) else {}
+        found = info.get("name")
+        shown: str = found if isinstance(found, str) and found else (name or cid)
+        if info.get("is_im") or info.get("is_mpim"):
+            raise WatchRefused("dm", shown)
+        if info.get("is_archived"):
+            raise WatchRefused("archived", shown)
+        if info.get("is_member") is not True:
+            raise WatchRefused("not_member", shown)
+        return WatchTarget(cid, shown)
+
+    async def _find_channel(self, name: str) -> str | None:
+        web = self.web
+        assert web is not None
+        cursor: str | None = None
+        for _ in range(LIST_PAGES):
+            args: dict[str, Any] = {"types": "public_channel,private_channel",
+                                    "exclude_archived": True, "limit": 200}  # fmt: skip
+            if cursor:
+                args["cursor"] = cursor
+            try:
+                body = await web.call("conversations.list", args)
+            except SlackCallError as e:
+                if e.error == "missing_scope":
+                    raise WatchRefused("no_scope", name) from None
+                raise WatchRefused("error", name, e.error) from None
+            chans: object = body.get("channels")
+            for c in cast(list[object], chans) if isinstance(chans, list) else []:
+                d = cast(dict[str, Any], c) if isinstance(c, dict) else {}
+                if d.get("name") == name and isinstance(d.get("id"), str):
+                    return cast(str, d["id"])
+            meta: object = body.get("response_metadata")
+            nxt = cast(dict[str, Any], meta).get("next_cursor") if isinstance(meta, dict) else None
+            if not isinstance(nxt, str) or not nxt:
+                return None
+            cursor = nxt
+        return None
 
     def _allow(self, principal: str, now: datetime) -> bool:
         recent = self._recent.setdefault(principal, deque())
@@ -861,7 +1061,9 @@ class SlackChannel:
         if thread is not None and thread.channel == CHANNEL_NAME and thread.thread:
             channel, _, ts = thread.thread.partition(":")
             with atomic(self.conn):
-                ok = bool(channel and ts) and store.known(self.conn, channel, ts)
+                ok = bool(channel and ts) and (
+                    store.known(self.conn, channel, ts) or self._watched(channel, ts)
+                )
             if ok:
                 return channel, ts
             log.info("slack: thread for %s is not one Cori follows; sending a DM", principal)
@@ -979,7 +1181,20 @@ def sweep_sent(conn: sqlite3.Connection, now: datetime) -> int:
         "(json_extract(value, '$.at') IS NULL OR json_extract(value, '$.at') < ?)",
         (DEDUPE_PREFIX + "%", cutoff),
     )
+    conn.execute(  # PER-299: watched threads past their TTL
+        "DELETE FROM kv WHERE key LIKE ? AND "
+        "(json_extract(value, '$.at') IS NULL OR json_extract(value, '$.at') < ?)",
+        (WATCH_THREAD_PREFIX + "%", iso(now - WATCH_THREAD_TTL)),
+    )
     return cur.rowcount
 
 
-__all__ = ["CHANNEL_NAME", "DEDUPE_TTL", "SELFTEST_KV", "SlackChannel", "already_text"]
+__all__ = [
+    "CHANNEL_NAME",
+    "DEDUPE_TTL",
+    "SELFTEST_KV",
+    "SlackChannel",
+    "WatchRefused",
+    "WatchTarget",
+    "already_text",
+]

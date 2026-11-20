@@ -52,6 +52,11 @@ gate:
 trust:
   cost_ask_over_usd: 20.0               # a worker check costing more than this asks you; at or under, cost alone doesn't
 
+# PER-299: channel watchers (Slack only; Cori). Every key has a default.
+# watchers:
+#   max_per_hour: 20                    # runs per watcher an hour; the next match pauses it with one note
+#   ask_timeout_s: 20                   # the optional `ask` filter's local-model yes/no; late = no
+
 # ops:
 #   repo_path: ~/resonant               # repo /update pulls into; default: the checkout Resonant runs from
 #   uv_path: /opt/homebrew/bin/uv       # absolute path to uv for /update; unset means /update refuses

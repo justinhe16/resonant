@@ -39,6 +39,14 @@ channels:
     follow_idle_days: 14                # a tagged thread is followed until idle this long
     # link_base: https://resonant-relay-jhe.fly.dev   # run codes link to <link_base>#/runs/R12
 
+# PER-299: channel watchers ("@cori whenever someone posts a bug in #support, triage it").
+# Added in Slack by an approver (add_job with a channel); invite @Cori to the channel first.
+# The Slack app needs the channels:read/groups:read scopes and the message.channels/
+# message.groups events (channels:history/groups:history) to see untagged channel messages.
+# watchers:
+#   max_per_hour: 20                    # runs per watcher an hour; the next match pauses it
+#   ask_timeout_s: 20                   # the optional `ask` filter's local-model yes/no
+
 # PER-303: the hourly alive line to #voyager-pulse ("✓ Cori up · healthy · idle"). Turn on at
 # go-live with channels.slack (rooms: {pulse: C…} above). Absence is the Fly checker's (PER-305).
 # pulse:

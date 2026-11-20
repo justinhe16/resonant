@@ -108,6 +108,7 @@ from typing import Any, Protocol, cast, runtime_checkable
 
 from resonant.backup import health_check as backup_health
 from resonant.brain.facts import FactStore, facts_dir
+from resonant.channel_watchers import WATCH_EVENT, ChannelWatchers, close_regex_worker
 from resonant.components import Components
 from resonant.config import ModelConfig, Settings
 from resonant.executor import ToolFailed
@@ -131,6 +132,7 @@ from resonant.notify_owner import OwnerBridge
 from resonant.ops import SubprocessRunner, back_up
 from resonant.ops.siblings import kill_switch_fan_out
 from resonant.principals import Principals
+from resonant.registered_jobs import JobRunner as RegisteredJobRunner
 from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
 from resonant.runners.ask import AskRunner, AskScope
@@ -182,15 +184,25 @@ def brain_step_limit(model: ModelConfig, tools: Iterable[ToolSpec] = ()) -> floa
 RouteFn = Callable[[Event], Awaitable[NewTask | None]]
 
 
-def route_event(router: RouteFn, notifier: Notifier, pulse: Pulse | None = None) -> RouteFn:
+def route_event(
+    router: RouteFn,
+    notifier: Notifier,
+    pulse: Pulse | None = None,
+    watchers: ChannelWatchers | None = None,
+) -> RouteFn:
     """The loop's router hook: ``ext.<name>.item`` events to the pulse, other ``ext:*``
-    events to the notifier, the rest to the router."""
+    events to the notifier, ``watch_match`` events to the channel watchers (PER-299: each
+    starts a run itself; the event is consumed), the rest to the router."""
 
     async def route(event: Event) -> NewTask | None:
         if event.source.startswith("ext:"):
             if pulse is not None and event.type == f"ext.{event.source[4:]}.{EVENT_TYPE}":
                 return await pulse.route(event)
             return await notifier.route(event)
+        if event.type == WATCH_EVENT:
+            if watchers is not None:
+                await watchers.route(event)
+            return None
         return await router(event)
 
     return route
@@ -304,6 +316,7 @@ class Stack:
         created it."""
         if self.brain is not None:
             await self.brain.aclose()  # background history folds use the model
+        await close_regex_worker()  # PER-299: the watchers' regex helper process
         close, self._close_model = self._close_model, None
         if close is not None:
             await close()
@@ -512,7 +525,21 @@ def build_stack(
         config=settings.extensions.notify,
         bridge=bridge,
     )
-    loop.router = route_event(router.route, notifier, pulse)
+    # PER-299: channel watchers (a watched Slack message starts a run as the watcher's creator)
+    slack_adapter = channel.adapter("slack")
+    watchers = ChannelWatchers(
+        conn,
+        config=settings.watchers,
+        principals=components.principals,
+        model=model,
+        runner=lambda: cast("RegisteredJobRunner | None", components.runners.get("claude")),
+        channel=channel,
+        slack=slack_adapter,
+    )
+    if slack_adapter is not None and hasattr(slack_adapter, "watchers"):
+        cast(Any, slack_adapter).watchers = watchers.index
+    components.watchers = watchers
+    loop.router = route_event(router.route, notifier, pulse, watchers)
     jobs = JobRunner(
         conn,
         gate=gate,

@@ -53,6 +53,8 @@ class FakeSlackWeb:
     team_id: str = "T0TEAM"
     bot_user_id: str = "U0BOT"
     names: dict[str, str] = field(default_factory=dict[str, str])  # users.info display names
+    # conversations.info / conversations.list (PER-299): id -> {"name", "is_member", ...}
+    channels: dict[str, dict[str, Any]] = field(default_factory=dict[str, dict[str, Any]])
     calls: list[tuple[str, dict[str, Any]]] = field(
         default_factory=list[tuple[str, dict[str, Any]]]
     )
@@ -102,6 +104,14 @@ class FakeSlackWeb:
             case "reactions.add":
                 self.reactions.append(dict(args))
                 return {"ok": True}
+            case "conversations.info":
+                cid = str(args["channel"])
+                if cid not in self.channels:
+                    raise SlackCallError(method, "channel_not_found")
+                return {"ok": True, "channel": {"id": cid, **self.channels[cid]}}
+            case "conversations.list":
+                listed = [{"id": k, **v} for k, v in self.channels.items()]
+                return {"ok": True, "channels": listed, "response_metadata": {"next_cursor": ""}}
             case "users.info":
                 uid = str(args["user"])
                 if uid not in self.names:

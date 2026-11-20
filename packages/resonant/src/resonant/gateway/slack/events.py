@@ -9,8 +9,11 @@
 - ``self``: the bot's own message (``user`` is the bot, or any ``bot_id``).
 - ``subtype``: an edit, delete, join, bot or any other subtype (only plain messages,
   ``thread_broadcast`` and ``file_share`` pass; files themselves are ignored in v1).
-- ``untagged``: a channel message that neither tags the bot nor is a thread reply. The
-  channel then keeps a thread reply only if the thread is followed.
+- ``untagged``: a channel message that neither tags the bot nor is a thread reply, with
+  ``channel_messages=False`` (the default). With ``channel_messages=True`` (PER-299: the
+  channel has watchers) it is a ``Message`` of kind ``channel`` instead, which never routes:
+  only watchers see it. The channel keeps a thread reply only if the thread is followed (else
+  only watchers with ``include_replies`` see it).
 - ``malformed``: a required field is missing or the wrong type (a truncated payload is never
   replied from).
 - ``unsupported``: any other event type.
@@ -40,13 +43,14 @@ _TS = re.compile(r"^\d{1,12}\.\d{1,9}$")
 _ID = re.compile(r"^[A-Z0-9]{2,32}$")
 _MENTION = re.compile(r"<@([UW][A-Z0-9]{2,31})(?:\|[^>]*)?>")
 
-Kind = Literal["mention", "im", "reply"]
+Kind = Literal["mention", "im", "reply", "channel"]
 
 
 @dataclass(frozen=True)
 class Message:
     """A message that may route. ``kind``: it tags the bot (``mention``), it's a DM
-    (``im``), or it's an untagged reply in a thread (``reply``: routes only if followed).
+    (``im``), it's an untagged reply in a thread (``reply``: routes only if followed), or an
+    untagged top-level channel message (``channel``: never routes; watchers only, PER-299).
     ``thread_ts`` is the thread's root (the message's own ``ts`` when it starts one)."""
 
     kind: Kind
@@ -93,7 +97,9 @@ def _dict(v: object) -> dict[str, Any] | None:
     return cast(dict[str, Any], v) if isinstance(v, dict) else None
 
 
-def parse_message(payload: dict[str, Any], *, team_id: str, bot_user_id: str) -> Message | Dropped:
+def parse_message(
+    payload: dict[str, Any], *, team_id: str, bot_user_id: str, channel_messages: bool = False
+) -> Message | Dropped:
     """An ``events_api`` envelope's payload as a :class:`Message`, or why it's dropped."""
     event = _dict(payload.get("event"))
     if event is None:
@@ -134,6 +140,8 @@ def parse_message(payload: dict[str, Any], *, team_id: str, bot_user_id: str) ->
         kind = "mention"  # the message twin of an app_mention (same dedupe key)
     elif isinstance(thread_ts, str) and thread_ts != ts:
         kind = "reply"
+    elif channel_messages and _s(event, "channel_type") in ("channel", "group"):
+        kind = "channel"
     else:
         return Dropped("untagged")
     return Message(kind=kind, user=user, channel=channel, ts=ts, thread_ts=root, text=text)

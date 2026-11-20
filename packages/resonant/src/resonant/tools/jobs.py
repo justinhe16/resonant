@@ -7,6 +7,12 @@
   thread it was asked in; the default when there is one), ``dm`` (the default otherwise) or
   ``room:<key>`` (``channels.slack.rooms``). The reply says the schedule in words and the
   next 3 times.
+- PER-299, watchers: ``add_job{channel, filter, prompt, repo?, output?, name?}`` (no
+  ``schedule``) watches a Slack channel instead (``resonant/channel_watchers.py``): one run per
+  message that matches ``filter`` (``contains``, ``from``, ``regex``, ``ask``,
+  ``include_replies``). The bot must already be in the channel (``conversations.info``), else
+  "invite @Cori to #support first". ``output`` ``thread`` (the default) is the matched
+  message's thread.
 - ``list_jobs`` (L0, grant ``jobs``): every live job with its state, last run and next due.
 - ``pause_job{id}``, ``resume_job{id}``, ``delete_job{id}``, ``run_job_now{id}`` (L3: do,
   then report). Resuming never catches up; ``run_job_now`` starts one run now (not while
@@ -22,6 +28,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from resonant import channel_watchers as cw
 from resonant import registered_jobs as rj
 from resonant.executor import CallContext, ContextHandler, ToolFailed, ToolHandler
 from resonant.extensions.cron import CronError, parse_schedule
@@ -40,6 +47,23 @@ OUTPUT_MAX = 40
 PROMPT_SHOWN = 80  # list_jobs
 PROMPT_ASKED = 1000  # the add_job approval: what runs unattended, shown nearly whole
 JOBS_SHOWN = 25
+CHANNEL_MAX = 100
+_WORDS: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string", "minLength": 1, "maxLength": cw.TERM_MAX},
+    "maxItems": cw.CONTAINS_MAX,
+}
+FILTER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "contains": _WORDS,
+        "from": {**_WORDS, "maxItems": cw.FROM_MAX},
+        "regex": {"type": "string", "maxLength": cw.REGEX_MAX},
+        "ask": {"type": "string", "maxLength": cw.ASK_MAX},
+        "include_replies": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
 
 
 def _id_args() -> dict[str, Any]:
@@ -59,20 +83,26 @@ ADD_JOB = ToolSpec(
         "Register a recurring job: on a cron schedule, start a Claude worker run with "
         "`prompt` ('every Monday at 9 check flaky CI and file tickets'). Turn the words into "
         "five-field cron in local time (minute hour day month weekday, e.g. '0 9 * * 1'); at "
-        "most every 15 minutes. `repo` (a registered repo) when the work is in one. `output`: "
-        "'thread' (this thread, the default), 'dm', or 'room:<key>' for a configured room. "
-        "Asks first. The reply says the schedule in words and the next times."
+        "most every 15 minutes. Or, instead of `schedule`, a watcher ('whenever someone posts "
+        "a bug in #support, triage it'): `channel` (the Slack channel, like #support, as "
+        "written) and `filter` ({contains: [words, any matches], from: [people], regex, ask: "
+        "a yes/no question for the local model, include_replies}); one run per matching "
+        "message. `repo` (a registered repo) when the work is in one. `output`: 'thread' "
+        "(this thread, or for a watcher the message's thread; the default), 'dm', or "
+        "'room:<key>' for a configured room. Asks first. The reply says when it runs."
     ),
     args_schema={
         "type": "object",
         "properties": {
             "schedule": {"type": "string", "minLength": 1, "maxLength": SCHEDULE_MAX},
+            "channel": {"type": "string", "minLength": 1, "maxLength": CHANNEL_MAX},
+            "filter": FILTER_SCHEMA,
             "prompt": {"type": "string", "minLength": 1, "maxLength": store.PROMPT_MAX},
             "repo": {"type": "string", "maxLength": 200},
             "output": {"type": "string", "maxLength": OUTPUT_MAX},
             "name": {"type": "string", "minLength": 1, "maxLength": store.NAME_MAX},
         },
-        "required": ["schedule", "prompt"],
+        "required": ["prompt"],
         "additionalProperties": False,
     },
     effect=Effect.WRITE,
@@ -142,18 +172,36 @@ def summary_action(intent: Intent) -> str | None:
     if intent.extension is not None or intent.tool != ADD_JOB.name:
         return None
     a = intent.args
-    schedule, prompt = a.get("schedule"), a.get("prompt")
-    if not isinstance(schedule, str) or not isinstance(prompt, str):
+    schedule, prompt, channel = a.get("schedule"), a.get("prompt"), a.get("channel")
+    if not isinstance(prompt, str):
+        return None
+    watch = isinstance(channel, str) and schedule is None
+    if not watch and not isinstance(schedule, str):
         return None
     name = a.get("name")
-    head = f'add job "{_clip(name, store.NAME_MAX)}"' if isinstance(name, str) else "add a job"
+    kind = "watcher" if watch else "job"
+    head = (
+        f'add {kind} "{_clip(name, store.NAME_MAX)}"' if isinstance(name, str) else f"add a {kind}"
+    )
     repo = a.get("repo")
     where = f" in {_clip(repo, 60)}" if isinstance(repo, str) and repo.strip() else ""
     output = a.get("output")
     out = _clip(output, OUTPUT_MAX) if isinstance(output, str) and output.strip() else "thread"
-    when = rj.describe(" ".join(schedule.split()))
     flat = clean_external(prompt)
     more = f" (+{len(flat) - PROMPT_ASKED + 1} more chars)" if len(flat) > PROMPT_ASKED else ""
+    if watch:
+        assert isinstance(channel, str)
+        try:
+            when = cw.describe(None, cw.parse_filter(a.get("filter")),
+                               channel=_clip(channel, CHANNEL_MAX))  # fmt: skip
+        except cw.FilterError:
+            when = f"every matching message in {_clip(channel, CHANNEL_MAX)}"
+        return (
+            f"{head}: {_clip(when, 400)}, start a run{where}: "
+            f'"{_clip(prompt, PROMPT_ASKED)}"{more}, output to {out}'
+        )
+    assert isinstance(schedule, str)
+    when = rj.describe(" ".join(schedule.split()))
     return (
         f"{head}: {when} ({_clip(schedule, SCHEDULE_MAX)}), start a run{where}: "
         f'"{_clip(prompt, PROMPT_ASKED)}"{more}, output to {out}'
@@ -187,8 +235,11 @@ class _Tools:
             raise ToolFailed(f"{tool}: no job {jid}")
         return job
 
-    def _output(self, raw: object, ref: dict[str, Any] | None) -> str:
-        threaded = ref is not None and isinstance(ref.get("thread"), str) and bool(ref["thread"])
+    def _output(self, raw: object, ref: dict[str, Any] | None, *, watch: bool = False) -> str:
+        # a watcher's thread is the matched message's, so it always has one
+        threaded = watch or (
+            ref is not None and isinstance(ref.get("thread"), str) and bool(ref["thread"])
+        )
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             return "thread" if threaded else "dm"
         if not isinstance(raw, str):
@@ -221,10 +272,20 @@ class _Tools:
             )
         return found.name
 
+    def _when(self, job: store.Job) -> str:
+        if job.kind != "watch":
+            return rj.describe(job.schedule)
+        f = cw.job_filter(job)
+        name = (job.watch_filter or {}).get(cw.CHANNEL_NAME_KEY)
+        shown = name if isinstance(name, str) else None
+        if f is None:
+            return f"watches {job.watch_channel} (its filter no longer parses)"
+        return "watches " + cw.describe(shown, f, channel=job.watch_channel)
+
     def _describe(self, job: store.Job) -> dict[str, Any]:
         now = self.ctx.clock()
         nxt: str | None = None
-        if job.state == "active":
+        if job.state == "active" and job.kind != "watch":
             try:
                 times = rj.next_times(parse_schedule(job.schedule, job.tz), now, 1)
             except CronError:
@@ -241,8 +302,9 @@ class _Tools:
         return {
             "id": job.id,
             "name": job.name,
+            "kind": job.kind,
             "schedule": job.schedule,
-            "when": rj.describe(job.schedule),
+            "when": self._when(job),
             "tz": job.tz,
             "state": job.state,
             "repo": job.repo,
@@ -252,6 +314,7 @@ class _Tools:
             "last_run": last,
             "last_error": None if job.last_error is None else _clip(job.last_error, 120),
             "next_due": nxt,
+            **({"channel": job.watch_channel} if job.kind == "watch" else {}),
         }
 
     def _line(self, d: dict[str, Any]) -> str:
@@ -272,25 +335,40 @@ class _Tools:
     # --- handlers ---------------------------------------------------------------------------
 
     async def add(self, args: dict[str, Any], call: CallContext | None = None) -> dict[str, Any]:
-        if unknown := set(args) - {"schedule", "prompt", "repo", "output", "name"}:
+        allowed = {"schedule", "channel", "filter", "prompt", "repo", "output", "name"}
+        if unknown := set(args) - allowed:
             raise ToolFailed(f"add_job: unknown arguments: {sorted(unknown)}")
-        raw_schedule, raw_prompt = args.get("schedule"), args.get("prompt")
-        if not isinstance(raw_schedule, str) or not isinstance(raw_prompt, str):
-            raise ToolFailed("add_job: schedule and prompt are required strings")
+        raw_schedule, raw_prompt, raw_channel = (
+            args.get("schedule"),
+            args.get("prompt"),
+            args.get("channel"),
+        )
+        watch = raw_channel is not None
+        if watch == (raw_schedule is not None):
+            raise ToolFailed("add_job: give a schedule (a timed job) or a channel (a watcher)")
+        if not isinstance(raw_prompt, str):
+            raise ToolFailed("add_job: prompt is a required string")
         prompt = raw_prompt.strip()
         if not prompt or len(prompt) > store.PROMPT_MAX:
             raise ToolFailed(f"add_job: prompt is 1 to {store.PROMPT_MAX} characters")
-        try:
-            schedule = rj.parse(raw_schedule, self.tz)
-        except CronError as e:
-            raise ToolFailed(f"add_job: {e}") from e
         principal, ref = self._caller(call)
-        output = self._output(args.get("output"), ref)
+        output = self._output(args.get("output"), ref, watch=watch)
         repo = self._repo(args.get("repo"))
         raw_name = args.get("name")
         if raw_name is not None and not isinstance(raw_name, str):
             raise ToolFailed("add_job: name is a string")
         name = " ".join((raw_name or "").split())[: store.NAME_MAX] or _clip(prompt, 40)
+        if watch:
+            return await self._add_watcher(args, prompt=prompt, name=name, repo=repo,
+                                           output=output, principal=principal, ref=ref)  # fmt: skip
+        if not isinstance(raw_schedule, str):
+            raise ToolFailed("add_job: schedule is a five-field cron string")
+        if args.get("filter") is not None:
+            raise ToolFailed("add_job: a filter is for a watcher (a channel), not a schedule")
+        try:
+            schedule = rj.parse(raw_schedule, self.tz)
+        except CronError as e:
+            raise ToolFailed(f"add_job: {e}") from e
         if store.count_live(self.ctx.conn) >= rj.MAX_JOBS:
             raise ToolFailed(f"add_job: {rj.MAX_JOBS} jobs already; delete one first")
         now = self.ctx.clock()
@@ -313,6 +391,80 @@ class _Tools:
             f"Next: {', '.join(times)}. Output: {rj.output_text(job)}."
         )
         return {**self._describe(job), "added": True, "next": times, "text": text}
+
+    async def _add_watcher(
+        self,
+        args: dict[str, Any],
+        *,
+        prompt: str,
+        name: str,
+        repo: str | None,
+        output: str,
+        principal: str,
+        ref: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """PER-299: a watcher. The filter is checked, then the channel: the bot must be in it."""
+        raw = args.get("channel")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ToolFailed("add_job: channel is the Slack channel to watch, like #support")
+        try:
+            flt = cw.parse_filter(args.get("filter"))
+        except cw.FilterError as e:
+            raise ToolFailed(f"add_job: {e}") from None
+        if store.count_live(self.ctx.conn) >= rj.MAX_JOBS:
+            raise ToolFailed(f"add_job: {rj.MAX_JOBS} jobs already; delete one first")
+        target = await self._watch_target(raw)
+        stored = {**flt.to_json(), cw.CHANNEL_NAME_KEY: target.name}
+        job = store.create(
+            self.ctx.conn,
+            name=name,
+            schedule="",
+            tz=self.tz,
+            prompt=prompt,
+            repo=repo,
+            output=output,
+            created_by=principal,
+            channel_ref=ref,
+            now=self.ctx.clock(),
+            kind="watch",
+            watch_channel=target.id,
+            watch_filter=stored,
+        )
+        out = "the message's thread" if output == "thread" else rj.output_text(job)
+        text = (
+            f"Added {job.id} ({name}): watching {cw.describe(target.name, flt)}; one run per "
+            f"match, at most {self._max_per_hour()} an hour. Output: {out}."
+        )
+        return {**self._describe(job), "added": True, "text": text}
+
+    def _max_per_hour(self) -> int:
+        return self.ctx.state.settings.watchers.max_per_hour
+
+    async def _watch_target(self, raw: str) -> Any:
+        """The checked channel (``SlackChannel.watch_target``), or a ToolFailed that says
+        what to do."""
+        components = self.ctx.state.components
+        watchers = None if components is None else components.watchers
+        slack: Any = None if watchers is None else watchers.slack
+        if slack is None or not hasattr(slack, "watch_target"):
+            raise ToolFailed("add_job: watchers need Slack, and Slack isn't running here")
+        from resonant.gateway.slack.channel import WatchRefused
+
+        me = self.ctx.state.settings.instance.display_name
+        try:
+            return await slack.watch_target(raw)
+        except WatchRefused as e:
+            where = f"#{e.name}" if e.name else raw.strip()
+            why = {
+                "not_member": f"I'm not in {where}. Invite @{me} to {where} first "
+                f"(/invite @{me}), then ask again.",
+                "not_found": f"I can't see {where}. If it's private, invite @{me} to it first "
+                f"(/invite @{me}), then ask again.",
+                "dm": "watchers watch channels, not DMs.",
+                "archived": f"{where} is archived.",
+                "no_scope": "the Slack app needs the channels:read and groups:read scopes.",
+            }.get(e.reason, f"Slack couldn't check {where}.")
+            raise ToolFailed(f"add_job: {why}") from None
 
     async def list(self, args: dict[str, Any], call: CallContext | None = None) -> dict[str, Any]:
         del call
@@ -361,6 +513,10 @@ class _Tools:
     ) -> dict[str, Any]:
         by, _ = self._caller(call)
         job = self._job(RUN_JOB_NOW.name, args)
+        if job.kind == "watch":
+            return {"id": job.id, "started": False,
+                    "text": f"{job.id} ({job.name}) is a watcher: it runs on matching "
+                            "messages, not on demand."}  # fmt: skip
         if job.state != "active":
             return {"id": job.id, "started": False,
                     "text": f"{job.id} ({job.name}) is paused; resume it first."}  # fmt: skip
