@@ -15,6 +15,13 @@ Each call can sleep ``delay_s`` first, to stand in for model latency.
 
 ``RecordingOsaRunner`` records every osascript argv (handle, text, monotonic time) instead of
 running it, and lets a caller wait for the n-th send.
+
+``FakeChannel`` (PER-292) is an in-memory channel adapter for the hub: a threaded channel
+(Slack-shaped) by default. ``inject`` turns ``<name>:<uid>`` text into the message event an
+adapter would submit (``payload.identity``, ``ref``, ``thread``; the thread defaults to the
+message's own ref, as a Slack message starts its own thread). Sends and approval prompts go
+only to principals with an identity on this channel (else ``ChannelRefused``), are deduped
+by key, and are recorded in ``sent`` with their thread. It never touches the network.
 """
 
 from __future__ import annotations
@@ -24,12 +31,23 @@ import json
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, cast
 
 from resonant.brain.triage import SCHEMA as TRIAGE_SCHEMA
+from resonant.gateway.channel import (
+    ApprovalPrompt,
+    ChannelRefused,
+    MessageRef,
+    SelfTestResult,
+    Submit,
+    approval_dedupe_key,
+)
 from resonant.gateway.imessage.sender import OSASCRIPT, OsaResult
 from resonant.models import ChatMessage, ModelReply, ProbeResult, SpanFactory
-from resonant_sdk import ToolSpec
+from resonant.principals import Principals
+from resonant.store.db import iso, utcnow
+from resonant_sdk import Event, ToolSpec
 
 DEFAULT_TRIAGE: dict[str, Any] = {
     "handler": "claude",
@@ -146,3 +164,149 @@ async def wait_until(
         if loop.time() >= deadline:
             raise TimeoutError("condition not met in time")
         await asyncio.sleep(poll_s)
+
+
+# --- a fake channel adapter (PER-292) ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FakeSent:
+    principal: str
+    text: str
+    thread: str | None  # the thread it went to (``MessageRef.thread``), None unthreaded
+    dedupe_key: str | None
+    ref: str
+
+
+class FakeChannel:
+    """An in-memory ``Channel`` adapter named ``name`` (see the module docstring).
+
+    ``threaded=False`` ignores ``thread`` (iMessage-shaped). ``fail_start`` makes ``start``
+    raise (the hub leaves it out). ``fail_selftest`` makes ``self_test`` report a failure.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        principals: Principals,
+        *,
+        threaded: bool = True,
+        fail_start: bool = False,
+        fail_selftest: bool = False,
+        clock: Callable[[], datetime] = utcnow,
+    ) -> None:
+        self._name = name
+        self.principals = principals
+        self.threaded = threaded
+        self.fail_start = fail_start
+        self.fail_selftest = fail_selftest
+        self.clock = clock
+        self.sent: list[FakeSent] = []
+        self.prompts: list[ApprovalPrompt] = []
+        self.selftests = 0
+        self._submit: Submit | None = None
+        self._keys: dict[str, MessageRef] = {}
+        self._n = 0
+        self.injected = 0  # messages injected so far (the last one's ref is <name>-in:<n>)
+        self._started_at: datetime | None = None
+        self._changed = asyncio.Event()
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def texts(self) -> list[str]:
+        return [m.text for m in self.sent]
+
+    async def start(self, submit: Submit) -> None:
+        if self.fail_start:
+            raise RuntimeError(f"{self._name}: can't connect")
+        self._submit = submit
+        self._started_at = self.clock()
+
+    async def stop(self) -> None:
+        self._submit = None
+
+    def health(self) -> dict[str, Any]:
+        at = self._started_at
+        return {"ok": at is not None, "last_read_at": iso(at) if at else None, "last_error": None}
+
+    async def self_test(self, *, timeout_s: float = 10.0) -> SelfTestResult:
+        self.selftests += 1
+        if self.fail_selftest:
+            return SelfTestResult(False, "no round trip")
+        return SelfTestResult(True, "ok")
+
+    # -- inbound --
+
+    def inject(
+        self,
+        uid: str,
+        text: str,
+        *,
+        thread: str | None = None,
+        at: datetime | None = None,
+    ) -> bool:
+        """Submit a message from ``<name>:<uid>`` as the adapter would; False when it isn't
+        submitted (an unknown identity is dropped, as an adapter does, or not started)."""
+        identity = f"{self._name}:{uid}"
+        principal = self.principals.resolve(identity)
+        if principal is None or self._submit is None:
+            return False
+        self.injected += 1
+        ref = f"{self._name}-in:{self.injected}"
+        event = Event(
+            source=self._name,
+            type="message",
+            principal=principal,
+            payload={
+                "text": text,
+                "identity": identity,
+                "ref": ref,
+                "thread": (thread or ref) if self.threaded else None,
+                "at": iso(at or self.clock()),
+                "truncated": False,
+            },
+            dedupe_key=f"{self._name}:{ref}",
+            occurred_at=at or self.clock(),
+        )
+        return self._submit(event)
+
+    # -- outbound --
+
+    async def send(
+        self,
+        principal: str,
+        text: str,
+        *,
+        thread: MessageRef | None = None,
+        dedupe_key: str | None = None,
+    ) -> MessageRef:
+        p = self.principals.principals.get(principal)
+        if p is None or not any(i.startswith(f"{self._name}:") for i in p.identities):
+            raise ChannelRefused(f"no {self._name} identity")
+        if dedupe_key is not None and (prev := self._keys.get(dedupe_key)) is not None:
+            return prev
+        self._n += 1
+        where = thread.thread if self.threaded and thread is not None else None
+        ref = MessageRef(self._name, f"{self._name}-out:{self._n}", where)
+        self.sent.append(FakeSent(principal, text, where, dedupe_key, ref.ref))
+        if dedupe_key is not None:
+            self._keys[dedupe_key] = ref
+        self._changed.set()
+        return ref
+
+    async def request_approval(self, principal: str, prompt: ApprovalPrompt) -> MessageRef:
+        key = approval_dedupe_key(prompt.approval_id, principal)
+        if key not in self._keys:
+            self.prompts.append(prompt)
+        return await self.send(principal, prompt.text(), thread=prompt.thread, dedupe_key=key)
+
+    async def wait_for(self, count: int, timeout_s: float) -> FakeSent:
+        """Wait until at least ``count`` sends were recorded; return the ``count``-th."""
+        async with asyncio.timeout(timeout_s):
+            while len(self.sent) < count:
+                self._changed.clear()
+                await self._changed.wait()
+        return self.sent[count - 1]

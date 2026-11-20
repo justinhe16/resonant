@@ -326,7 +326,7 @@ class IMessageChannel:
         """Send ``prompt.text()`` to ``principal`` through :meth:`send` (allowlist, rate
         limit), deduped by ``approval_dedupe_key``: a repeat returns the first ref and sends
         nothing. Audits ``imessage.approval_sent`` (ids, code and level; never the summary).
-        Raises what :meth:`send` raises.
+        Raises what :meth:`send` raises. ``prompt.thread`` is ignored (1:1 chats, unthreaded).
         """
         key = approval_dedupe_key(prompt.approval_id, principal)
         self._resolve(principal)  # refuse an unknown principal even on a repeat

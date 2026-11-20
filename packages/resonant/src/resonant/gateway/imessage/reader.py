@@ -45,8 +45,10 @@ after ``chat.db-wal`` changes, which is checked every 250ms.
     attachment tables gives none. A member's attachment-only message is skipped as before.
 
 Surviving rows become ``Event(source="imessage", type="message", principal=...,
-dedupe_key="imessage:<guid>")`` and go to ``submit``. The cursor advances only past rows
-that were fully handled, once per batch. A crash replays at most one batch, and the
+dedupe_key="imessage:<guid>")`` and go to ``submit``. The payload carries the hub's
+``identity`` (``imessage:<handle>``) and ``ref`` (the guid), plus ``handle``, ``chat_guid``
+and ``guid``; there is no ``thread`` (iMessage chats here are 1:1). The cursor advances
+only past rows that were fully handled, once per batch. A crash replays at most one batch, and the
 dedupe key makes that harmless.
 
 **Timestamps.** ``occurred_at`` is the row's ``date``, clamped to at most ``FUTURE_SKEW``
@@ -388,6 +390,8 @@ class IMessageReader:
             text = text[: self.config.max_body_chars]
         payload: dict[str, Any] = {
             "text": text,
+            "identity": f"imessage:{handle}",  # PER-292: the hub's contract (gateway/channel.py)
+            "ref": guid,
             "guid": guid,
             "handle": handle,
             "chat_guid": row["chat_guid"],

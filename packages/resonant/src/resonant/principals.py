@@ -30,6 +30,7 @@ Action = Literal["request", "approve", "admin"]
 GrantableAction = Literal["request", "approve"]
 
 _KNOWN_CHANNELS = ("imessage", "slack")
+KNOWN_CHANNELS = _KNOWN_CHANNELS  # every channel an identity may name (the hub's adapters)
 BUILTIN_GRANT = "builtin:"  # grants key prefix for a builtin group (``ToolSpec.grant``)
 # chat.db stores handles as E.164 phone numbers or lowercase emails. Requiring the same form
 # here means a handle can only match by exact string comparison.

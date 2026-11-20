@@ -1,6 +1,7 @@
 """Router: the Loop's router hook. Decides quickly what each incoming message is about.
 
-``Router.route(event) -> NewTask | None``. For ``imessage``/``message`` events:
+``Router.route(event) -> NewTask | None``. For ``message`` events from any channel in
+``channels`` (PER-292: the hub's adapters; ``("imessage",)`` by default):
 
 (a) Fast path (no model call): ``NewTask(kind="reply", runner="local",
     checkpoint={"fast_reply": text, "tool_used": ..., "intent": ..., "title": command})``.
@@ -41,6 +42,12 @@ fast path uses ``evaluate``/``consume``/``pending_for``, the inbox ``resolve_rep
 ``/projects`` shows; it never contains message text.
 
 Priority always comes from the principal (owner or member), never from the model.
+
+``channel_ref`` (PER-292, every task the router makes): ``{channel, principal, identity,
+thread, ref}`` from the event (``gateway/channel.py``: the adapter sets ``payload.identity``,
+``ref`` and, on a threaded channel, ``thread``), plus iMessage's ``handle``, ``chat_guid``
+and ``guid``, which it has always written (older rows have only those). ``thread_of(task)``
+reads it back for the replies.
 """
 
 from __future__ import annotations
@@ -48,7 +55,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from datetime import datetime
 from functools import partial
 from typing import Any
@@ -56,6 +63,7 @@ from typing import Any
 from resonant.executor import HandlerKey, ToolHandler
 from resonant.gate import Gate
 from resonant.gate.replies import parse_reply
+from resonant.gateway.channel import event_identity
 from resonant.gateway.imessage.attachments import from_payload
 from resonant.loop.types import PRIORITY_MEMBER, PRIORITY_OWNER, NewTask
 from resonant.models import ModelClient, SpanFactory
@@ -123,8 +131,10 @@ class Router:
         clock: Callable[[], datetime] = utcnow,
         timezone: str = "UTC",
         extensions: ExtensionCatalog | None = None,
+        channels: Collection[str] = ("imessage",),
     ) -> None:
         self.conn = conn
+        self.channels = frozenset(channels)  # the sources whose messages route (PER-292)
         self.principals = principals
         self.registry = registry
         self.extensions = extensions
@@ -147,7 +157,7 @@ class Router:
         return await self.route(event)
 
     async def route(self, event: Event) -> NewTask | None:
-        if event.source != "imessage" or event.type != "message":
+        if event.source not in self.channels or event.type != "message":
             return None
         principal = event.principal
         if principal is None or principal not in self.principals.principals:
@@ -300,11 +310,20 @@ class Router:
 
 
 def _channel_ref(event: Event, principal: str) -> dict[str, Any]:
+    """Where the message came from (module docstring). iMessage keeps ``handle``,
+    ``chat_guid`` and ``guid`` so readers of older rows still parse new ones."""
     p = event.payload
-    return {
+    ref: dict[str, Any] = {
         "channel": event.source,
         "principal": principal,
-        "handle": p.get("handle"),
-        "chat_guid": p.get("chat_guid"),
-        "guid": p.get("guid"),
+        "identity": event_identity(event),
+        "thread": _str(p.get("thread")),
+        "ref": _str(p.get("ref")) or _str(p.get("guid")),
     }
+    if event.source == "imessage":
+        ref.update(handle=p.get("handle"), chat_guid=p.get("chat_guid"), guid=p.get("guid"))
+    return ref
+
+
+def _str(v: object) -> str | None:
+    return v if isinstance(v, str) and v else None

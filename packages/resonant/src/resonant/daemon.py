@@ -4,30 +4,33 @@ launchd (KeepAlive) supervises the process. SIGTERM/SIGINT trigger a graceful st
 in-flight steps get a short grace period, and anything unfinished resumes from its
 checkpoint on the next start.
 
-With ``channels.imessage.enabled`` the daemon also runs the Phase 1 stack
-(``resonant.wiring``): the iMessage channel feeds ``loop.submit``, the router is the loop's
-router hook, ``runner="local"`` answers, ``runner="reminder"`` sends due reminders, and the
+With any ``channels.<x>.enabled`` (PER-292; or adapters a test injects with ``channels=``)
+the daemon also runs the channel stack (``resonant.wiring.build_stack``): the channel hub's
+adapters feed ``loop.submit``, the router is the loop's router hook, ``runner="local"``
+answers, ``runner="reminder"`` sends due reminders, and the
 health monitor runs; ``runner="job"`` runs scheduled jobs above L0; extension events are
-notified (``extensions.notify``) and the notifier's end-of-hour flush runs. On shutdown the reader
+notified (``extensions.notify``) and the notifier's end-of-hour flush runs. On shutdown the readers
 and monitor stop first (no new events), then the loop drains in-flight steps (which may
-still send their replies), then the model client closes. With it disabled, the daemon is
-exactly Phase 0 apart from the gate and the scheduler.
+still send their replies), then the model client closes. With every channel disabled, the
+daemon is exactly Phase 0 apart from the gate and the scheduler. If no adapter starts, the
+daemon exits 1 (iMessage-only, as before); one failing next to others is logged and left to
+the monitor.
 
 The status relay (``dashboard.pusher``, docs/dashboard-plan.md D4). With ``relay.enabled`` an aux
 task pushes the remote tier of the dashboard snapshot to Supabase every ``relay.every_s``; it is
 cancelled with the other aux tasks on shutdown. Disabled, the daemon clears its health row.
 
-Claude workers (docs/employee-plan.md). With iMessage on, ``runner="claude"`` is registered by
-the wiring. Before the loop starts, the daemon calls ``ClaudeRunner.start()``: it ends every session
-process a crash left behind (matched by pid and start time), wipes leftover token dirs and
-hooks the kill switch, and only then does ``Loop.run`` resume tasks. The scheduler also gets
-the ``core/run-cleanup`` job (``runners.claude.cleanup_job``).
+Claude workers (docs/employee-plan.md). With the channel stack on, ``runner="claude"`` is
+registered by the wiring. Before the loop starts, the daemon calls ``ClaudeRunner.start()``:
+it ends every session process a crash left behind (matched by pid and start time), wipes
+leftover token dirs and hooks the kill switch, and only then does ``Loop.run`` resume tasks.
+The scheduler also gets the ``core/run-cleanup`` job (``runners.claude.cleanup_job``).
 
 The gate is always the Phase 2 ``PolicyGate``; the startup line logs
 ``gate=policy dry_run=<bool>``.
 
 The scheduler (``extensions.scheduler.Scheduler``) is built after the components and the
-iMessage stack and set as ``loop.scheduler``, iMessage on or off: L0 and core jobs run
+channel stack and set as ``loop.scheduler``, channels on or off: L0 and core jobs run
 inline from the loop's tick. It registers the kill switch hook at start; on shutdown,
 after the reader stops, its inline runs are cancelled (decided again on the next start).
 """
@@ -60,11 +63,14 @@ from resonant.secrets import SecretStore
 from resonant.store.db import open_db, utcnow
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from resonant.extensions.process import ExtRunner
+    from resonant.gateway.channel import Channel
     from resonant.gateway.imessage.sender import OsaRunner
     from resonant.models import ModelClient
     from resonant.ops import OpsRunner
-    from resonant.wiring import IMessageStack
+    from resonant.wiring import Stack
 
 log = logging.getLogger(__name__)
 
@@ -91,12 +97,14 @@ class Daemon:
         ops_runner: OpsRunner | None = None,
         secrets: SecretStore | None = None,
         ext_runner: ExtRunner | None = None,
+        channels: Mapping[str, Channel] | None = None,
     ) -> None:
         """``model`` and ``osa_runner`` replace Ollama and osascript (tests, ``bench e2e``).
 
-        They are used only when ``channels.imessage.enabled`` is true. ``ops_runner``
-        replaces the ops tools' subprocesses (git, uv, launchctl); ``secrets`` and
-        ``ext_runner`` replace the Keychain and the extension process runner.
+        They are used only when the channel stack runs. ``ops_runner`` replaces the ops
+        tools' subprocesses (git, uv, launchctl); ``secrets`` and ``ext_runner`` replace the
+        Keychain and the extension process runner. ``channels``: extra adapters for the hub
+        (tests: ``e2e.FakeChannel("slack")``); any given turns the channel stack on.
         """
         self.settings = settings
         self.conn = open_db(settings.db_path)
@@ -115,11 +123,11 @@ class Daemon:
             secrets=secrets,
             ext_runner=ext_runner,
         )
-        self.imessage: IMessageStack | None = None
-        if settings.channels.imessage.enabled:
-            from resonant.wiring import build_imessage_stack
+        self.stack: Stack | None = None
+        if settings.channels.enabled() or channels:
+            from resonant.wiring import build_stack
 
-            self.imessage = build_imessage_stack(
+            self.stack = build_stack(
                 settings,
                 self.conn,
                 self.state.components,
@@ -128,8 +136,9 @@ class Daemon:
                 model=model,
                 osa_runner=osa_runner,
                 started_at=self.state.started_at,
+                channels=channels,
             )
-            self.state.monitor = self.imessage.monitor
+            self.state.monitor = self.stack.monitor
             brain = self.state.components.runners.get("brain")
             if isinstance(brain, BrainRunner):
                 # The briefing's "Workers aren't set up" uses the dashboard's runner check
@@ -140,7 +149,7 @@ class Daemon:
             self.conn,
             self.state.components,
             started_at=self.state.started_at,
-            channel=None if self.imessage is None else self.imessage.channel,
+            channel=None if self.stack is None else self.stack.channel,
             core_jobs=(*CORE_JOBS, cleanup_job),
             panel_first_run_s=PANEL_FIRST_RUN_S,
         )
@@ -172,6 +181,11 @@ class Daemon:
         self._stop = asyncio.Event()
         self.heartbeat = Heartbeat()
 
+    @property
+    def imessage(self) -> Stack | None:
+        """The channel stack under its pre-PER-292 name (tests and older callers)."""
+        return self.stack
+
     def healthy(self) -> bool:
         """The loop has ticked recently (within 3 ticks, or at least 90s).
 
@@ -199,12 +213,12 @@ class Daemon:
             with contextlib.suppress(NotImplementedError, RuntimeError):
                 aio.add_signal_handler(sig, self.stop)
 
-        if self.imessage is not None:
+        if self.stack is not None:
             try:
-                await self.imessage.start(self.loop)
+                await self.stack.start(self.loop)
             except Exception:
-                log.exception("imessage channel failed to start")
-                await self.imessage.aclose()
+                log.exception("no channel could start")
+                await self.stack.aclose()
                 self.conn.close()
                 return 1
         self.scheduler.start()
@@ -212,13 +226,13 @@ class Daemon:
         mcp_start = None
         if ext_host is not None and any(e.mcp for e in ext_host.loaded.values()):
             mcp_start = asyncio.create_task(ext_host.start_mcp(), name="mcp-start")
-        if self.imessage is not None and self.imessage.claude is not None:
+        if self.stack is not None and self.stack.claude is not None:
             # Before the loop resumes anything: end the processes a crash left behind.
             try:
-                await self.imessage.claude.start()
+                await self.stack.claude.start()
             except Exception:
                 log.exception("runner startup failed")
-        if self.imessage is not None:
+        if self.stack is not None:
             from resonant.wiring import start_asks
 
             await start_asks(self.state.components)  # PER-262: the brain's leftovers
@@ -226,7 +240,7 @@ class Daemon:
         server_task = asyncio.create_task(self._serve(), name="api")
         stop_task = asyncio.create_task(self._stop.wait(), name="stop")
         aux = [asyncio.create_task(heartbeat_task(self.heartbeat), name="heartbeat")]
-        monitor = self.state.monitor  # set only when channels.imessage.enabled
+        monitor = self.state.monitor  # set only when the channel stack runs
         why = None if monitor is None else monitor.deadman_reason
         if url := self.settings.health.healthchecks_url:
             aux.append(
@@ -239,8 +253,8 @@ class Daemon:
             aux.append(asyncio.create_task(monitor.run(), name="health-monitor"))
         if self.pusher is not None:
             aux.append(asyncio.create_task(self.pusher.run(), name="relay"))
-        if self.imessage is not None and self.imessage.notifier is not None:
-            aux.append(asyncio.create_task(self.imessage.notifier.run(), name="notify-flush"))
+        if self.stack is not None and self.stack.notifier is not None:
+            aux.append(asyncio.create_task(self.stack.notifier.run(), name="notify-flush"))
         watchdog = Watchdog(self.heartbeat, self.settings.health.watchdog_stale_s)
         watchdog.start()
         host = self.state.components.extensions if self.state.components else None
@@ -248,7 +262,7 @@ class Daemon:
             "%s",
             started_line(
                 self.settings,
-                imessage=self.imessage is not None,
+                imessage=self.stack is not None and "imessage" in self.stack.channel.names,
                 relay=self.pusher is not None,
                 extensions=0 if host is None else len(host.loaded),
                 jobs=len(self.scheduler.jobs),
@@ -262,8 +276,8 @@ class Daemon:
             log.error("component exited unexpectedly: %s", [t.get_name() for t in done])
 
         self.server.should_exit = True
-        if self.imessage is not None:
-            await self.imessage.stop()  # no new events while the loop drains
+        if self.stack is not None:
+            await self.stack.stop()  # no new events while the loop drains
         await self.scheduler.aclose()
         if mcp_start is not None:
             mcp_start.cancel()
@@ -281,13 +295,13 @@ class Daemon:
                 crashed = True
         if ext_host is not None:
             await ext_host.aclose()  # after the drain: every MCP server's process group
-        if self.imessage is not None:
-            if self.imessage.claude is not None:
-                await self.imessage.claude.aclose()
+        if self.stack is not None:
+            if self.stack.claude is not None:
+                await self.stack.claude.aclose()
             from resonant.wiring import close_asks
 
             await close_asks(self.state.components)  # BR-11: the Claude brain's session
-            await self.imessage.aclose()
+            await self.stack.aclose()
         self.conn.close()
         log.info("resonant daemon stopped")
         return 1 if crashed else 0

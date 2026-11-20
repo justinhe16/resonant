@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from resonant.config import Settings
-from resonant.gateway.channel import Channel, ChannelError, ChannelRefused, Submit
+from resonant.gateway.channel import Channel, ChannelError, ChannelRefused, Submit, thread_of
 from resonant.gateway.imessage.attachments import Attachment, from_payload
 from resonant.loop.types import Done, Fail, StepContext, StepOutcome, Task
 from resonant.models import ModelClient, SpanFactory
@@ -210,7 +210,9 @@ class MediaRunner(LocalRunner):
 
     async def _say(self, task: Task, principal: str, text: str, path: str) -> StepOutcome:
         try:
-            await self.channel.send(principal, text, dedupe_key=f"reply:{task.id}")
+            await self.channel.send(
+                principal, text, thread=thread_of(task), dedupe_key=f"reply:{task.id}"
+            )
         except ChannelRefused as e:
             return Fail(f"reply refused: {e}")
         except ChannelError as e:

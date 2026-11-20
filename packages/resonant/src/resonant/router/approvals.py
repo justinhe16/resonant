@@ -5,8 +5,9 @@ never read as a reply) and before keywords and the brain:
 
 1. ``parse_reply(text, truncated=payload.truncated)``. Text that doesn't parse returns None
    and routes normally; it is never swallowed.
-2. The sender's identity (``imessage:<handle>``) must map to the event's principal: the
-   gate trusts ``reply.actor``.
+2. The sender's identity (``payload.identity``, set by the adapter: ``imessage:<handle>``,
+   ``slack:<user>``; ``gateway.channel.event_identity``) must map to the event's principal:
+   the gate trusts ``reply.actor``. The reply's ``channel`` is the event's source.
 3. ``gate.resolve_reply`` binds, resolves and wakes in one transaction, idempotent per
    event id. On success (or a replay of the same event) nothing is sent here: the woken
    runner sends the templated confirmation.
@@ -28,6 +29,7 @@ from typing import Any, Literal
 from resonant.gate.codes import pick_example
 from resonant.gate.replies import ParsedReply, parse_reply
 from resonant.gate.types import ApprovalReply, Gate, PendingApproval
+from resonant.gateway.channel import event_identity
 from resonant.models import SpanFactory
 from resonant.models.client import null_spans
 from resonant.principals import Principals
@@ -37,7 +39,6 @@ from resonant_sdk import Event
 
 NOTHING_WAITING = "Nothing is waiting for approval."
 ALWAYS_UNSUPPORTED = "Not done: yes always isn't offered for that one."
-CHANNEL = "imessage"
 MAX_ARGS_CHARS = 1500
 
 Outcome = Literal["resolved", "replay", "refused", "unauthenticated"]
@@ -131,16 +132,15 @@ class ApprovalInbox:
         return result
 
     def _handle(self, event: Event, text: str, principal: str, parsed: ParsedReply) -> InboxResult:
-        handle: object = event.payload.get("handle")
-        identity = f"{CHANNEL}:{handle}"
-        if not isinstance(handle, str) or self.principals.resolve(identity) != principal:
+        identity = event_identity(event)
+        if identity is None or self.principals.resolve(identity) != principal:
             return InboxResult(NOTHING_WAITING, "unauthenticated", "identity_mismatch")
         replay = bool(ap.by_resolved_event(self.conn, event.id))
         result = self.gate.resolve_reply(
             ApprovalReply(
                 actor=principal,
                 actor_identity=identity,
-                channel=CHANNEL,
+                channel=event.source,
                 raw_text=text,
                 decision=parsed.decision,
                 path="parser",

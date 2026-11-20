@@ -1,18 +1,28 @@
-"""iMessage composition: the channel, router, local, reminder and job runners, and health
-monitor.
+"""Channel stack composition: the channel hub, router, local, reminder and job runners, and
+health monitor.
 
-``build_imessage_stack`` is the one place these are wired together. The daemon calls it when
-``channels.imessage.enabled`` is true; ``resonant bench e2e`` and the end-to-end tests call
-it with fakes. With iMessage disabled nothing here runs and the daemon is exactly Phase 0.
+``build_stack`` is the one place these are wired together. The daemon calls it when any
+``channels.<x>.enabled`` is true (or a test injects adapters); ``resonant bench e2e`` and the
+end-to-end tests call it with fakes. With every channel disabled nothing here runs and the
+daemon is exactly Phase 0. (``build_imessage_stack`` and ``IMessageStack`` are the pre-PER-292
+names, kept as aliases.)
+
+Channels (PER-292). ``build_channels`` builds one adapter per enabled channel (iMessage
+today; Slack is PER-295) and ``build_stack`` puts them, plus any injected ``channels``, in one
+``gateway.hub.ChannelHub``. Every component below gets the hub as its ``channel``: none of
+them names an adapter. The router accepts messages from every adapter in the hub.
 
 Lifecycle (the daemon drives it)::
 
-    stack = build_imessage_stack(settings, conn, components, loop, daemon_healthy=...)
-    await stack.start(loop)  # the chat.db reader feeds loop.submit
+    stack = build_stack(settings, conn, components, loop, daemon_healthy=...)
+    await stack.start(loop)  # every adapter starts; their events feed loop.submit
     ...                      # loop.run(), stack.monitor.run()
-    await stack.stop()       # stop the reader and the monitor (no new events)
+    await stack.stop()       # stop the readers and the monitor (no new events)
     ...                      # the loop drains in-flight steps; replies can still be sent
     await stack.aclose()     # close the model client's HTTP pool
+
+One adapter failing at start leaves the others running (the monitor reports it); if none
+starts, ``start`` raises and the daemon exits 1, as an iMessage-only daemon always did.
 
 Step limit. ``LocalRunner`` defaults to ``max_step_s=30`` but one step can run one tool for
 up to its ``timeout_s`` (``update_resonant``: 360s; an extension tool at most 300s; job specs
@@ -24,21 +34,21 @@ executor times out first and the user always gets an answer; the loop's stuck ch
 backstop for a wedged step.
 
 Back up. After a restart the owner asked for (``restart_resonant``, ``update_resonant``),
-``IMessageStack.start`` sends ``Back up (<commit>), down Ns`` once (``resonant.ops.back_up``).
+``Stack.start`` sends ``Back up (<commit>), down Ns`` once (``resonant.ops.back_up``).
 Then it sends any queued extension alerts to the owner (``extensions.host.send_alerts``:
 ``example changed on disk since you approved it; disabled. …``), once each.
 
 Jobs. ``runner="job"`` (``runners.job.JobRunner``) runs scheduled jobs above L0: it prompts
-approvers and sends job reports over iMessage, so it is registered here. Its recipients are
+approvers and sends job reports over the channel, so it is registered here. Its recipients are
 the gate's approvers for the extension (owner first). The scheduler itself is the daemon's
-(it runs L0 jobs with iMessage off too); a gated job task left with no job runner fails as
+(it runs L0 jobs with every channel off too); a gated job task left with no job runner fails as
 ``unknown runner``, like a reminder.
 
 Notifications. The loop's router hook is :func:`route_event`: ``ext:*`` events (stored by
 job runs) go to ``extensions.notify.Notifier.route`` (``ext.<name>.item`` reports go to
 ``extensions.pulse.Pulse.route``), everything else to ``Router.route``,
 which is unchanged. The notifier sends to the same recipients as job reports, and its
-``run`` (started by the daemon) sends the end-of-hour ``+N more updates``. With iMessage
+``run`` (started by the daemon) sends the end-of-hour ``+N more updates``. With every channel
 off there is no router hook: extension events wait unrouted, as messages would.
 
 Voice (PER-273). With ``brain.voice.enabled`` (the default) one ``runners.voice.ClaudeVoice``
@@ -58,7 +68,7 @@ and the slot pool for the context, and the owner's facts store. Its step limit i
 
 Ask Claude. ``runner="ask"`` (``runners.ask.AskRunner``, BR-5) runs one read-only ``claude -p``
 per ``ask_claude`` call and texts the answer, so it is registered here; the tool reaches it as
-``components.runners["ask"]``. With iMessage off the tool answers that it isn't running.
+``components.runners["ask"]``. With every channel off the tool answers that it isn't running.
 
 Media and watches (BR-7). ``runner="media"`` (``runners.media.MediaRunner``) answers an
 owner's message with attachments: an image or PDF goes to ``ask_claude`` as a direct call, a
@@ -71,17 +81,17 @@ under the thin guard in a worktree of the owner's checkout (or a scratch dir) an
 PR or the answer; it replies over the channel, so it is registered here. The daemon calls its
 ``start()`` before the loop resumes anything (it ends the processes a crash left and hooks the
 kill switch) and ``aclose()`` at the end. The tools and slash commands reach it as
-``IMessageStack.claude`` or ``components.runners["claude"]``.
+``Stack.claude`` or ``components.runners["claude"]``.
 
-Trust checks. ``IMessageStack.trust`` (``trust.checks.TrustChecks``) answers a worker's
+Trust checks. ``Stack.trust`` (``trust.checks.TrustChecks``) answers a worker's
 ``resonant check``: it asks the owner over this channel when a check is net new or a rule
 says to ask. EM-3's per-run socket calls its ``request_check``.
 
-Reminders. ``runner="reminder"`` sends due reminders through the iMessage channel, so it is
+Reminders. ``runner="reminder"`` sends due reminders through the channel, so it is
 registered here, not in Phase 0. ``add_reminder`` only runs inside the loop (the router or a
 runner step). The loop ticks again after every step and then sleeps only until the earliest
 queued ``wake_at`` (``Loop.wait_s``), so a new reminder fires on time with no extra nudge.
-With iMessage disabled no reminder runner exists: nothing can create a reminder, and one
+With every channel disabled no reminder runner exists: nothing can create a reminder, and one
 left over from an earlier run fails as ``unknown runner`` once it is due (it couldn't be
 delivered anyway). Reminders not yet due stay queued.
 """
@@ -90,11 +100,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 from resonant.backup import health_check as backup_health
 from resonant.brain.facts import FactStore, facts_dir
@@ -109,12 +119,15 @@ from resonant.extensions.pulse_job import JOB_ID as PULSE_JOB
 from resonant.extensions.recover import Recovery
 from resonant.extensions.scheduler import CoreDeps
 from resonant.gate import PolicyGate
+from resonant.gateway.channel import Channel
+from resonant.gateway.hub import ChannelHub
 from resonant.gateway.imessage.channel import IMessageChannel
 from resonant.gateway.imessage.sender import OsaRunner
 from resonant.loop import Loop, NewTask
 from resonant.models import ModelClient
-from resonant.monitor import HealthMonitor
+from resonant.monitor import HealthMonitor, MonitoredChannel
 from resonant.ops import SubprocessRunner, back_up
+from resonant.principals import Principals
 from resonant.router import Router
 from resonant.router.fast_path import core_briefing, core_pulse
 from resonant.runners.ask import AskRunner, AskScope
@@ -178,9 +191,26 @@ def route_event(router: RouteFn, notifier: Notifier, pulse: Pulse | None = None)
     return route
 
 
+def build_channels(
+    settings: Settings,
+    principals: Principals,
+    conn: sqlite3.Connection,
+    *,
+    osa_runner: OsaRunner | None = None,
+) -> dict[str, Channel]:
+    """One adapter per enabled channel, by name, in ``ChannelsConfig`` order (iMessage
+    first). PER-295 adds Slack here."""
+    out: dict[str, Channel] = {}
+    if settings.channels.imessage.enabled:
+        out["imessage"] = IMessageChannel(
+            settings.channels.imessage, principals, conn, runner=osa_runner
+        )
+    return out
+
+
 @dataclass
-class IMessageStack:
-    channel: IMessageChannel
+class Stack:
+    channel: ChannelHub
     router: Router
     runner: LocalRunner
     reminders: ReminderRunner
@@ -199,15 +229,15 @@ class IMessageStack:
 
     @property
     def running(self) -> bool:
-        """True between :meth:`start` and :meth:`stop` (the chat.db reader is running)."""
+        """True between :meth:`start` and :meth:`stop` (the adapters' readers are running)."""
         return self._started
 
     async def start(self, loop: Loop) -> None:
-        """Start the chat.db reader (its events go to ``loop.submit``), then say "back up"
-        if this start follows a restart the owner asked for."""
+        """Start every adapter (their events go to ``loop.submit``; raises when none
+        starts), then say "back up" if this start follows a restart the owner asked for."""
         await self.channel.start(loop.submit)
         self._started = True
-        log.info("imessage channel started")
+        log.info("channels started: %s", ", ".join(self.channel.running))
         try:
             if await back_up(self.channel.conn, self.channel, self.owner):
                 log.info("sent back-up message after a requested restart")
@@ -228,7 +258,7 @@ class IMessageStack:
             log.exception("extension alerts failed")
 
     async def stop(self) -> None:
-        """Stop the monitor, the notifier's flush and the reader. Safe to call twice or
+        """Stop the monitor, the notifier's flush and the adapters. Safe to call twice or
         before ``start``."""
         self.monitor.stop()
         if self.notifier is not None:
@@ -238,7 +268,7 @@ class IMessageStack:
         if self._started:
             self._started = False
             await self.channel.stop()
-            log.info("imessage channel stopped")
+            log.info("channels stopped")
 
     async def aclose(self) -> None:
         """Stop the brain's background folds, then close the model client if this stack
@@ -330,7 +360,7 @@ def _worker_ops(
     return Ops(conn, settings, runner, owner=owner, clock=utcnow)
 
 
-def build_imessage_stack(
+def build_stack(
     settings: Settings,
     conn: sqlite3.Connection,
     components: Components,
@@ -340,14 +370,18 @@ def build_imessage_stack(
     model: ModelClient | None = None,
     osa_runner: OsaRunner | None = None,
     started_at: datetime | None = None,
-) -> IMessageStack:
-    """Build the channel, router, runners and monitor, and hook them into ``loop``.
+    channels: Mapping[str, Channel] | None = None,
+) -> Stack:
+    """Build the channel hub, router, runners and monitor, and hook them into ``loop``.
+
+    The hub holds ``build_channels(settings, ...)`` then ``channels`` (adapters a test or
+    the bench injects, e.g. ``e2e.FakeChannel("slack")``); at least one is needed.
 
     Sets ``loop.router`` to :func:`route_event` (the notifier, then ``Router.route``) and
     registers ``runner="local"``, ``runner="reminder"``, ``runner="job"`` and
     ``runner="claude"`` in both ``components.runners`` and ``loop.runners``. ``model``
     defaults to an ``OllamaClient`` over ``settings.model`` (closed by
-    :meth:`IMessageStack.aclose`); ``osa_runner`` defaults to the real osascript runner.
+    :meth:`Stack.aclose`); ``osa_runner`` defaults to the real osascript runner.
     Tests and the e2e bench inject fakes for both. ``started_at`` (the daemon's start, for
     the brain's briefing) defaults to now.
     """
@@ -359,9 +393,9 @@ def build_imessage_stack(
         client = OllamaClient(settings.model)
         model, close_model = client, client.aclose
 
-    channel = IMessageChannel(
-        settings.channels.imessage, components.principals, conn, runner=osa_runner
-    )
+    adapters = build_channels(settings, components.principals, conn, osa_runner=osa_runner)
+    adapters.update(channels or {})
+    channel = ChannelHub(adapters, components.principals, conn)
     router = Router(
         conn,
         principals=components.principals,
@@ -371,6 +405,7 @@ def build_imessage_stack(
         model=model,
         timezone=settings.timezone,
         extensions=components.extensions,
+        channels=channel.names,
     )
     runner = components.register_local_runner(
         conn,
@@ -549,6 +584,9 @@ def build_imessage_stack(
         conn,
         model=model,
         channel=channel,
+        # PER-292: one check per adapter (every adapter reports health and self-tests)
+        channels=cast("Mapping[str, MonitoredChannel]", channel.adapters),
+        channel_failures=lambda: channel.failures,
         owner=owner,
         daemon_healthy=daemon_healthy,
         db_path=settings.db_path,
@@ -569,7 +607,7 @@ def build_imessage_stack(
             )
         ),
     )
-    return IMessageStack(
+    return Stack(
         channel=channel,
         router=router,
         runner=runner,
@@ -585,4 +623,32 @@ def build_imessage_stack(
         brain=brain,
         extensions=components.extensions,
         _close_model=close_model,
+    )
+
+
+# The pre-PER-292 names (tests, docs and callers written before the hub).
+IMessageStack = Stack
+
+
+def build_imessage_stack(
+    settings: Settings,
+    conn: sqlite3.Connection,
+    components: Components,
+    loop: Loop,
+    *,
+    daemon_healthy: Callable[[], bool],
+    model: ModelClient | None = None,
+    osa_runner: OsaRunner | None = None,
+    started_at: datetime | None = None,
+) -> Stack:
+    """``build_stack`` under its pre-PER-292 name: the adapters ``settings`` enables."""
+    return build_stack(
+        settings,
+        conn,
+        components,
+        loop,
+        daemon_healthy=daemon_healthy,
+        model=model,
+        osa_runner=osa_runner,
+        started_at=started_at,
     )

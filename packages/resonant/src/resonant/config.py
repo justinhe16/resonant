@@ -202,7 +202,8 @@ class IMessageConfig(_Section):
     # Resonant's own Apple ID email handle (iMessage only; no phone number registered).
     # The adapter skips it on receive and uses it for the send/receive self-test.
     self_handle: str | None = None
-    # Turns on the Phase 1 stack (resonant.wiring): reader, router, local runner, monitor.
+    # Turns on the iMessage adapter. Any enabled channel turns on the channel stack
+    # (resonant.wiring): router, runners, monitor, notifier (PER-292).
     enabled: bool = False
     # Opened read-only (mode=ro); needs Full Disk Access for the daemon's Python.
     db_path: Path = Field(default=Path("~/Library/Messages/chat.db"), validate_default=True)
@@ -229,7 +230,20 @@ class IMessageConfig(_Section):
 
 
 class ChannelsConfig(_Section):
+    """One section per channel adapter; each has ``enabled``. PER-292: the daemon builds the
+    channel stack (``resonant.wiring.build_stack``) when any of them is enabled. A new
+    channel (Slack, PER-295) adds its section here and its adapter in
+    ``wiring.build_channels``."""
+
     imessage: IMessageConfig = Field(default_factory=IMessageConfig)
+
+    def enabled(self) -> tuple[str, ...]:
+        """The enabled channels' names, in field order (iMessage first)."""
+        return tuple(
+            name
+            for name in type(self).model_fields
+            if getattr(getattr(self, name), "enabled", False) is True
+        )
 
 
 class GateConfig(_Section):

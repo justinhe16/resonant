@@ -55,6 +55,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from resonant.gate.types import PendingApproval
+from resonant.gateway.channel import event_identity
 from resonant.models import ModelClient, ModelError, SpanFactory
 from resonant.models.client import ChatMessage, null_spans
 from resonant.principals import Principals
@@ -69,7 +70,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-CHANNEL = "imessage"
 PENDING_S = 600.0  # how long "For R4 or R6?" waits for the code
 RECENT_S = 1800.0  # a question this fresh takes short replies as answers
 SHORT_WORDS = 12
@@ -313,10 +313,10 @@ class Relay:
     # -- who and what --
 
     def _authentic(self, event: Event, principal: str) -> bool:
-        handle: object = event.payload.get("handle")
-        return isinstance(handle, str) and self.principals.resolve(f"{CHANNEL}:{handle}") == (
-            principal
-        )
+        """The sender's identity (``payload.identity``, set by the adapter) is the
+        principal's (PER-292: any channel)."""
+        identity = event_identity(event)
+        return identity is not None and self.principals.resolve(identity) == principal
 
     def _run(self, workers: Workers, code: str, principal: str) -> Run | None:
         run = workers.get_run(code)

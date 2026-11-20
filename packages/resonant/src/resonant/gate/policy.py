@@ -102,7 +102,7 @@ from resonant.gate.types import (
     ReplyRefusal,
     ResolveResult,
 )
-from resonant.principals import Principals
+from resonant.principals import KNOWN_CHANNELS, Principals
 from resonant.store import approvals as ap
 from resonant.store import outbound
 from resonant.store import trust as trust_store
@@ -124,8 +124,9 @@ NO_TASK = "approvals need a task"
 # ``approval.resolve`` ``decision`` and ``path``).
 OWNER_ASKED = "owner_asked"
 
-# Channels whose text replies may bind approvals. The iMessage reader already drops SMS.
-REPLY_CHANNELS = frozenset({"imessage"})
+# Channels whose text replies may bind approvals: every channel adapter (PER-292; the
+# identity still has to resolve to the approver). The iMessage reader already drops SMS.
+REPLY_CHANNELS = frozenset(KNOWN_CHANNELS)
 
 # BA-1: at most this many changes wait on the owner in one batch (``gate.batch_max``).
 DEFAULT_BATCH_MAX = 10

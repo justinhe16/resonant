@@ -5,6 +5,20 @@ Messages.app, the real ``chat.db`` or the network (except ``bench e2e --model re
 which talks to the local Ollama).
 """
 
-from resonant.e2e.fakes import RecordingOsaRunner, ScriptedModel, SentMessage, wait_until
+from resonant.e2e.fakes import (
+    FakeChannel,
+    FakeSent,
+    RecordingOsaRunner,
+    ScriptedModel,
+    SentMessage,
+    wait_until,
+)
 
-__all__ = ["RecordingOsaRunner", "ScriptedModel", "SentMessage", "wait_until"]
+__all__ = [
+    "FakeChannel",
+    "FakeSent",
+    "RecordingOsaRunner",
+    "ScriptedModel",
+    "SentMessage",
+    "wait_until",
+]

@@ -261,10 +261,12 @@ def create_app(state: DaemonState, *, dashboard_dist: Path | None = None) -> Fas
 
     @app.get("/api/channels")
     async def channels() -> list[dict[str, Any]]:  # pyright: ignore[reportUnusedFunction]
+        live = {} if state.monitor is None else state.monitor.channels
         return channels_snapshot(
             state.conn,
             imessage_enabled=state.settings.channels.imessage.enabled,
-            channel=None if state.monitor is None else state.monitor.channel,
+            channel=live.get("imessage"),
+            others={n: c for n, c in live.items() if n != "imessage"},
         )
 
     # Last, so the routes above win over files of the same name in the build. The build's
