@@ -2,8 +2,9 @@
 ``disk`` (L0) and ``recent_logs`` (L0).
 
 Every subprocess is an argv list through the injectable ``OpsRunner`` (``resonant.ops``):
-no shell, a timeout each, stderr never logged or returned. The restarts act only on the two
-fixed launchd labels, and ``update_resonant`` only in ``settings.ops.repo_path``.
+no shell, a timeout each, stderr never logged or returned. The restarts act only on two
+launchd labels, Ollama's and this instance's daemon (``Settings.daemon_label``), and
+``update_resonant`` only in ``settings.ops.repo_path``.
 
 - ``restart_ollama``: ``launchctl kickstart -k gui/<uid>/com.resonant.ollama`` (15 s), at
   most once per ``OLLAMA_COOLDOWN`` (5 min; kv ``ops.ollama_restarted_at``, so it holds
@@ -43,7 +44,7 @@ from typing import Any, cast
 from resonant.config import Settings
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.gate.types import Intent
-from resonant.launchd import DAEMON_LABEL, OLLAMA_LABEL
+from resonant.launchd import OLLAMA_LABEL
 from resonant.ops import (
     KICKSTART_TIMEOUT_S,
     RESTART_DELAY_S,
@@ -163,6 +164,7 @@ class Ops:
         uid: int | None = None,
     ) -> None:
         self.conn = conn
+        self.label = settings.daemon_label  # this instance's daemon (PER-297)
         self.repo = settings.ops.repo_path
         self.uv = settings.ops.uv_path
         self.uv_cache = settings.home / UV_CACHE
@@ -224,7 +226,7 @@ class Ops:
         """Mark the restart, then spawn the detached helper (the reply goes out first)."""
         mark_restart(self.conn, by=self.owner, commit=commit, now=self.clock())
         try:
-            self.runner.spawn_detached(restart_later_argv(DAEMON_LABEL, RESTART_DELAY_S))
+            self.runner.spawn_detached(restart_later_argv(self.label, RESTART_DELAY_S))
         except OSError as e:
             clear_restart(self.conn, planned=True)
             raise ToolFailed(f"couldn't start the restart helper ({type(e).__name__})") from None
@@ -238,7 +240,7 @@ class Ops:
                 commit = None  # the restart doesn't need it; "back up" just omits it
         self._restart_later(commit)
         return {
-            "label": DAEMON_LABEL,
+            "label": self.label,
             "restarting": True,
             "delay_s": RESTART_DELAY_S,
             "commit": commit,

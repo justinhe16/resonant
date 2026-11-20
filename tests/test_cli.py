@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+
+import pytest
 from typer.testing import CliRunner
 
 from resonant.cli import app
@@ -10,3 +13,18 @@ def test_help_lists_daemon_commands() -> None:
     assert result.exit_code == 0
     for cmd in ("run", "install", "uninstall", "logs"):
         assert cmd in result.output
+
+
+def test_help_lists_the_instance_option() -> None:
+    """PER-297: every command can target an instance (tests/test_instance.py has the matrix)."""
+    result = CliRunner().invoke(app, ["--help"], env={"NO_COLOR": "1", "TERM": "dumb"})
+    assert result.exit_code == 0
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)  # rich styles each part in CI
+    assert "--instance" in plain
+
+
+def test_instance_flag_and_env_must_agree(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RESONANT_INSTANCE", "cori")
+    result = CliRunner().invoke(app, ["--instance", "dori", "status"])
+    assert result.exit_code == 2
+    assert "disagrees with RESONANT_INSTANCE=cori" in result.output

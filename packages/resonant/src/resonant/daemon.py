@@ -50,6 +50,7 @@ from resonant.config import Settings
 from resonant.dashboard.pusher import SnapshotPusher, clear_relay_health
 from resonant.extensions.scheduler import CORE_JOBS, Scheduler
 from resonant.health import Heartbeat, Watchdog, deadman_task, heartbeat_task
+from resonant.instance import is_default
 from resonant.loop import Loop, SlotPool
 from resonant.loop.echo import EchoRunner
 from resonant.observability import configure_logging
@@ -151,7 +152,11 @@ class Daemon:
                 self.conn,
                 settings.relay,
                 snapshot=lambda redactor: local_snapshot(self.state, redactor=redactor),
-                secrets=secrets if secrets is not None else SecretStore(),
+                secrets=(
+                    secrets
+                    if secrets is not None
+                    else SecretStore(service=settings.keychain_service)
+                ),
             )
         else:
             clear_relay_health(self.conn)
@@ -240,15 +245,14 @@ class Daemon:
         watchdog.start()
         host = self.state.components.extensions if self.state.components else None
         log.info(
-            "resonant daemon started (api %s:%s, gate=policy dry_run=%s, imessage=%s, "
-            "relay=%s, extensions=%d, jobs=%d)",
-            self.settings.api.host,
-            self.settings.api.port,
-            self.settings.dry_run,
-            "on" if self.imessage is not None else "off",
-            "on" if self.pusher is not None else "off",
-            0 if host is None else len(host.loaded),
-            len(self.scheduler.jobs),
+            "%s",
+            started_line(
+                self.settings,
+                imessage=self.imessage is not None,
+                relay=self.pusher is not None,
+                extensions=0 if host is None else len(host.loaded),
+                jobs=len(self.scheduler.jobs),
+            ),
         )
         done, _ = await asyncio.wait(
             {loop_task, server_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
@@ -287,6 +291,20 @@ class Daemon:
         self.conn.close()
         log.info("resonant daemon stopped")
         return 1 if crashed else 0
+
+
+def started_line(
+    settings: Settings, *, imessage: bool, relay: bool, extensions: int, jobs: int
+) -> str:
+    """The startup log line. PER-297: the personal instance's is exactly as before
+    instances; any other instance names itself first."""
+    named = settings.instance
+    who = "" if is_default(named.name) else f"instance {named.name} ({named.display_name}), "
+    return (
+        f"resonant daemon started ({who}api {settings.api.host}:{settings.api.port}, "
+        f"gate=policy dry_run={settings.dry_run}, imessage={'on' if imessage else 'off'}, "
+        f"relay={'on' if relay else 'off'}, extensions={extensions}, jobs={jobs})"
+    )
 
 
 def run(settings: Settings) -> int:

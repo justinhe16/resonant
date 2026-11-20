@@ -17,9 +17,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from resonant import instance
 from resonant.config import Settings
 
-DAEMON_LABEL = "com.resonant.daemon"
+# The default instance's daemon label. Any instance's is ``Settings.daemon_label``
+# (``com.resonant.<name>.daemon`` for every name but ``resonant``, PER-297).
+DAEMON_LABEL = instance.daemon_label(instance.DEFAULT_INSTANCE)
 OLLAMA_LABEL = "com.resonant.ollama"
 # Keeps the Mini awake (power.keep_awake). The label matches the hand-installed agent the
 # Mini already had, so `resonant daemon install` adopts it instead of adding a second one.
@@ -48,11 +51,16 @@ def plist_path(label: str) -> Path:
 
 
 def daemon_plist(settings: Settings, python: str | None = None) -> dict[str, Any]:
+    """The instance's daemon agent. Any instance but the default also gets
+    ``RESONANT_INSTANCE``, so the daemon refuses a home that says it is someone else."""
     logs = settings.logs_dir
+    env = {"RESONANT_HOME": str(settings.home), "PATH": _path(python)}
+    if not instance.is_default(settings.instance.name):
+        env[instance.INSTANCE_ENV] = settings.instance.name
     return {
-        "Label": DAEMON_LABEL,
+        "Label": settings.daemon_label,
         "ProgramArguments": [python or sys.executable, "-m", "resonant", "daemon", "run"],
-        "EnvironmentVariables": {"RESONANT_HOME": str(settings.home), "PATH": _path(python)},
+        "EnvironmentVariables": env,
         "WorkingDirectory": str(settings.home),
         "RunAtLoad": True,
         "KeepAlive": True,

@@ -707,6 +707,7 @@ class Workspace:
         fork_url_for: Callable[[str], str] | None = None,
         fork_wait_s: float = FORK_READY_WAIT_S,
         guard: Callable[[Sequence[str]], Sequence[str]] | None = None,
+        api_port: int | None = None,
     ) -> None:
         """``guard`` wraps every git command run in a checkout (whose ``.git`` a worker can
         write) so it runs under the thin guard (EM-3): by default ``sandbox.wrap`` when
@@ -714,6 +715,7 @@ class Workspace:
         unguarded then, so guarding the daemon's git from it would protect nothing, and the
         daemon's own checkout, write-protected by the profile, can be a run's repo)."""
         self.cfg = cfg
+        self.api_port = api_port  # the instance's api.port for the thin guard (None: 7777)
         self.conn = conn  # the repo registry (store.repos)
         # The git URL of a repo. Always https without credentials; tests point it at a path.
         self._url_for: Callable[[Repo], str] = url_for or _https_url
@@ -732,6 +734,7 @@ class Workspace:
         never as the daemon. Fails closed when the sandbox isn't there."""
         from resonant.sandbox import SandboxParams, default_deny_exec, sandbox_exec_available
         from resonant.sandbox import wrap as sandbox_wrap
+        from resonant.sandbox.profile import API_PORT
 
         if self._guard_prefix is None:
             if not sandbox_exec_available():
@@ -744,6 +747,7 @@ class Workspace:
                 secrets_dir=self.cfg.secrets_dir, work_dir=self.cfg.work_dir,
                 deny_exec=default_deny_exec(), deny_read=tuple(self.cfg.deny_read),
                 ctl_root=ctl, ctl_dir=ctl / "_none",
+                api_port=API_PORT if self.api_port is None else self.api_port,
             )  # fmt: skip
             self._guard_prefix = sandbox_wrap(["/usr/bin/true"], params)[:-1]
         return [*self._guard_prefix, *argv]

@@ -26,6 +26,7 @@ from typing import Any, cast
 
 from test_runner_claude import GH_TOKEN, GIT, GIT_ENV, Harness, build, git
 
+from resonant.config import ApiConfig
 from resonant.runner.workspace import needs_github_token
 from resonant.runners import claude as claude_mod
 from resonant.runners.claude import Refused, Started, reply_text
@@ -175,7 +176,7 @@ async def test_claude_only_repo_with_a_checkout_commits_locally(
     # it can't be merged; the cleanup after keep_days keeps the branch (it moved)
     assert await h.runner.merge_run("R1") == Refused("R1 isn't ready to merge (done).")
     runs_store.update(db, "R1", ended_at=utcnow() - timedelta(days=8))
-    deps = SimpleNamespace(settings=SimpleNamespace(runner=h.cfg), conn=db)
+    deps = SimpleNamespace(settings=SimpleNamespace(runner=h.cfg, api=ApiConfig()), conn=db)
     job = claude_mod.cleanup_job(cast(Any, deps))
     assert job is not None
     await job.run({}, cast(Any, None))

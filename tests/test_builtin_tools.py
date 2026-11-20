@@ -257,6 +257,7 @@ async def test_daemon_status(db: sqlite3.Connection, components: Components) -> 
     out = await call(components, "daemon_status")
     assert set(out) == {
         "version",
+        "instance",  # PER-297
         "uptime_s",
         "last_tick",
         "inflight",

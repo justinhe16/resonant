@@ -1,9 +1,11 @@
 """Keychain secrets: ``SecretStore`` over ``/usr/bin/security``.
 
-Every secret is a generic-password item in the login keychain with service ``resonant`` and
-account ``<ext>/<name>`` (a *ref*, e.g. ``github/token``). Extensions get a secret only on an
-inherited pipe (fd 4), never in env or argv; ``RESONANT_SECRET_<NAME>`` is just this module's
-key format for the hand-off to the process runner, which strips it before spawning.
+Every secret is a generic-password item in the login keychain with service ``resonant`` (an
+instance's ``Settings.keychain_service``: ``resonant-<name>`` for any instance but the default,
+PER-297) and account ``<ext>/<name>`` (a *ref*, e.g. ``github/token``). Extensions get a
+secret only on an inherited pipe (fd 4), never in env or argv; ``RESONANT_SECRET_<NAME>`` is
+just this module's key format for the hand-off to the process runner, which strips it before
+spawning.
 
 Rules this module keeps:
 
@@ -36,6 +38,8 @@ import signal
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
+
+from resonant.instance import SERVICE_RE
 
 SECURITY = "/usr/bin/security"
 SERVICE = "resonant"
@@ -200,34 +204,50 @@ class SubprocessSecurity:
 # --- the store ---------------------------------------------------------------------------
 
 
-def find_argv(ref: str, *, value: bool) -> list[str]:
-    argv = [SECURITY, "find-generic-password", "-s", SERVICE, "-a", validate_ref(ref)]
+def validate_service(service: str) -> str:
+    """A service that is safe in argv and on a ``security -i`` line (no spaces, no option)."""
+    if not SERVICE_RE.fullmatch(service):
+        raise ValueError(f"keychain service {service!r} must match [a-z][a-z0-9._-]{{0,63}}")
+    return service
+
+
+def find_argv(ref: str, *, value: bool, service: str = SERVICE) -> list[str]:
+    s = validate_service(service)
+    argv = [SECURITY, "find-generic-password", "-s", s, "-a", validate_ref(ref)]
     return [*argv, "-w"] if value else argv
 
 
 SET_ARGV = [SECURITY, "-i"]  # the command goes on stdin, so the value is never in argv
 
 
-def add_command(ref: str, value: str) -> bytes:
+def add_command(ref: str, value: str, *, service: str = SERVICE) -> bytes:
     """The ``security -i`` line that creates or replaces (-U) the item. ``encode_value`` makes
     the value one token of plain characters, so it needs no quoting."""
     stored = encode_value(value)
     assert _PLAIN.fullmatch(stored)
-    return f"add-generic-password -U -s {SERVICE} -a {validate_ref(ref)} -w {stored}\n".encode()
+    s = validate_service(service)
+    return f"add-generic-password -U -s {s} -a {validate_ref(ref)} -w {stored}\n".encode()
 
 
-def delete_argv(ref: str) -> list[str]:
-    return [SECURITY, "delete-generic-password", "-s", SERVICE, "-a", validate_ref(ref)]
+def delete_argv(ref: str, *, service: str = SERVICE) -> list[str]:
+    s = validate_service(service)
+    return [SECURITY, "delete-generic-password", "-s", s, "-a", validate_ref(ref)]
 
 
 class SecretStore:
-    """Keychain items ``resonant`` / ``<ext>/<name>``. No caching."""
+    """Keychain items ``<service>`` / ``<ext>/<name>``. No caching. ``service`` is the
+    instance's (``Settings.keychain_service``); the default is the personal instance's."""
 
     def __init__(
-        self, runner: SecurityRunner | None = None, *, timeout_s: float = TIMEOUT_S
+        self,
+        runner: SecurityRunner | None = None,
+        *,
+        timeout_s: float = TIMEOUT_S,
+        service: str = SERVICE,
     ) -> None:
         self.runner: SecurityRunner = runner if runner is not None else SubprocessSecurity()
         self.timeout_s = timeout_s
+        self.service = validate_service(service)
 
     async def _run(self, ref: str, argv: list[str], stdin: bytes | None = None) -> SecurityResult:
         try:
@@ -248,7 +268,7 @@ class SecretStore:
 
     async def get(self, ref: str) -> str:
         """The value. Raises ``SecretMissing`` or ``SecretUnavailable``."""
-        result = await self._run(ref, find_argv(ref, value=True))
+        result = await self._run(ref, find_argv(ref, value=True, service=self.service))
         if result.returncode != 0:
             raise self._failed(ref, result.returncode)
         out = result.stdout.decode(errors="replace")
@@ -259,7 +279,7 @@ class SecretStore:
 
     async def exists(self, ref: str) -> bool:
         """Whether the item exists, without reading its value."""
-        result = await self._run(ref, find_argv(ref, value=False))
+        result = await self._run(ref, find_argv(ref, value=False, service=self.service))
         if result.returncode == 0:
             return True
         error = self._failed(ref, result.returncode)
@@ -270,13 +290,13 @@ class SecretStore:
     async def set(self, ref: str, value: str) -> None:
         """Create or replace the item. The value goes on stdin, never in argv."""
         validate_value(value)
-        result = await self._run(ref, SET_ARGV, stdin=add_command(ref, value))
+        result = await self._run(ref, SET_ARGV, stdin=add_command(ref, value, service=self.service))
         if result.returncode != 0:
             raise self._failed(ref, result.returncode)
 
     async def delete(self, ref: str) -> bool:
         """Delete the item. False if there was none."""
-        result = await self._run(ref, delete_argv(ref))
+        result = await self._run(ref, delete_argv(ref, service=self.service))
         if result.returncode == 0:
             return True
         error = self._failed(ref, result.returncode)
@@ -386,6 +406,8 @@ class FakeKeychain:
     items: dict[str, str] = field(default_factory=dict[str, str])  # ref -> value
     calls: list[SecurityCall] = field(default_factory=list[SecurityCall])
     fail_with: int | BaseException | None = None  # every call fails this way while set
+    # The one Keychain service this fake answers for; a call naming another fails the test.
+    service: str = SERVICE
 
     async def run(
         self, argv: Sequence[str], *, stdin: bytes | None, timeout_s: float
@@ -403,7 +425,7 @@ class FakeKeychain:
             assert "\n" not in line and len(line) < 4096, "security -i reads a line of ~4 KB"
             args = (SECURITY, *line.split(" "))
         opts = {a: args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-s", "-a")}
-        assert opts.get("-s") == SERVICE, args
+        assert opts.get("-s") == self.service, args
         ref = opts["-a"]
         match args[1]:
             case "find-generic-password":

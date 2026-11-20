@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import os
 import re
 from datetime import time, timedelta
 from pathlib import Path
@@ -21,19 +20,23 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
+    EnvSettingsSource,
     InitSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     YamlConfigSettingsSource,
 )
 
+from resonant import instance as inst
 from resonant_sdk.manifest import duration_s
 
 DEFAULT_HOME = Path("~/.resonant")
 
 
 def resonant_home() -> Path:
-    return Path(os.environ.get("RESONANT_HOME", DEFAULT_HOME)).expanduser()
+    """``RESONANT_HOME``, else the home of ``RESONANT_INSTANCE`` (``~/.resonant-<name>``),
+    else ``~/.resonant`` (``resonant.instance.resolve_home``)."""
+    return inst.resolve_home()
 
 
 log = logging.getLogger(__name__)
@@ -52,6 +55,34 @@ def is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+class InstanceConfig(_Section):
+    """Which instance this home is (PER-297, ``resonant.instance``). Absent: ``resonant``, the
+    personal instance, with every name exactly as before instances existed."""
+
+    name: str = inst.DEFAULT_INSTANCE
+    # How texts and the dashboard name it ("Resonant up 3h"). Unset: ``Resonant`` for the
+    # default instance, else the name capitalized (cori -> Cori).
+    display_name: str = inst.DEFAULT_DISPLAY_NAME
+
+    @field_validator("name")
+    @classmethod
+    def _slug(cls, v: str) -> str:
+        return inst.validate_name(v)
+
+    @field_validator("display_name")
+    @classmethod
+    def _display(cls, v: str) -> str:
+        if not v.strip() or v.strip() != v or len(v) > 40 or not v.isprintable():
+            raise ValueError("instance.display_name must be 1-40 printable characters")
+        return v
+
+    @model_validator(mode="after")
+    def _default_display(self) -> Self:
+        if "display_name" not in self.model_fields_set and not inst.is_default(self.name):
+            self.display_name = self.name.capitalize()
+        return self
 
 
 class ModelConfig(_Section):
@@ -323,6 +354,17 @@ class SecretsConfig(_Section):
     # Items created by this binary trust it, so the GUI-session daemon reads without a prompt.
     security_path: Path = Path("/usr/bin/security")
     timeout_s: float = Field(default=5.0, gt=0, le=30)
+    # The Keychain service every item is stored under (PER-297). Unset: derived from the
+    # instance (``resonant``, or ``resonant-<name>``); read it as ``Settings.keychain_service``.
+    # A stated one may not be another instance's derived service.
+    service: str | None = None
+
+    @field_validator("service")
+    @classmethod
+    def _service(cls, v: str | None) -> str | None:
+        if v is not None and not inst.SERVICE_RE.fullmatch(v):
+            raise ValueError("secrets.service must match [a-z][a-z0-9._-]{0,63}")
+        return v
 
     @field_validator("security_path")
     @classmethod
@@ -998,6 +1040,7 @@ class Settings(BaseSettings):
     )
 
     home: Path = Field(default_factory=resonant_home)
+    instance: InstanceConfig = Field(default_factory=InstanceConfig)
     timezone: str = "America/Los_Angeles"
     # Safe by default: the gate logs side effects instead of executing them.
     dry_run: bool = True
@@ -1028,20 +1071,79 @@ class Settings(BaseSettings):
         return v.expanduser()
 
     @model_validator(mode="after")
-    def _runner_state_in_home(self) -> Self:
-        """``runner.mirror_dir`` and ``runner.secrets_dir`` are Resonant's own state: unless
-        they are set, they live in the Resonant home (``<home>/runner/mirrors`` and
-        ``<home>/run-secrets``), so ``RESONANT_HOME`` or ``home=`` moves them too (PER-271:
-        a test's isolated home never reaches the real ``~/.resonant``)."""
-        unset = {"mirror_dir", "secrets_dir"} - self.runner.model_fields_set
-        if unset:
-            defaults = {
-                "mirror_dir": self.home / "runner" / "mirrors",
-                "secrets_dir": self.home / "run-secrets",
-            }
-            given = self.runner.model_dump(exclude_unset=True)
-            self.runner = RunnerConfig.model_validate(given | {k: defaults[k] for k in unset})
+    def _instance_home(self) -> Self:
+        """A home that is some instance's default home (``~/.resonant``, ``~/.resonant-<x>``)
+        holds only that instance: running another name there would mix two instances' DBs,
+        Keychain items and labels."""
+        owner = inst.home_owner(self.home)
+        if owner is not None and owner != self.instance.name:
+            raise ValueError(f"{self.home} is instance {owner}'s home, not {self.instance.name}'s")
         return self
+
+    @model_validator(mode="after")
+    def _runner_state_in_home(self) -> Self:
+        """Unset runner dirs get their instance's defaults (PER-297, PER-271):
+
+        - ``runner.mirror_dir`` and ``runner.secrets_dir`` are Resonant's own state and live in
+          the Resonant home (``<home>/runner/mirrors`` and ``<home>/run-secrets``), so
+          ``RESONANT_HOME`` or ``home=`` moves them too (a test's isolated home never reaches
+          the real ``~/.resonant``).
+        - ``runner.work_dir``, ``code_dir`` and ``cache_dir`` come from the instance name
+          (``instance.run_dirs``): today's for ``resonant``, ``~/<name>/runs``, ``~/<name>/code``
+          and ``~/<name>/runs/.cache`` otherwise.
+
+        Set fields win. Then a non-default instance's worker dirs, set or derived, may not
+        overlap the default instance's (two instances would both have an R4)."""
+        name = self.instance.name
+        derived: dict[str, Path] = {
+            "mirror_dir": self.home / "runner" / "mirrors",
+            "secrets_dir": self.home / "run-secrets",
+        }
+        if not inst.is_default(name):
+            derived |= dict(inst.run_dirs(name).items())
+        unset = set(derived) - self.runner.model_fields_set
+        if unset:
+            given = self.runner.model_dump(exclude_unset=True)
+            self.runner = RunnerConfig.model_validate(given | {k: derived[k] for k in unset})
+        if not inst.is_default(name):
+            theirs = inst.run_dirs(inst.DEFAULT_INSTANCE)
+            others = [(f"the {inst.DEFAULT_INSTANCE} instance's {label}", p.expanduser().resolve())
+                      for label, p in theirs.items()]  # fmt: skip
+            others.append((f"the {inst.DEFAULT_INSTANCE} instance's home",
+                           inst.home_for(inst.DEFAULT_INSTANCE).resolve()))  # fmt: skip
+            mine = (("work_dir", self.runner.work_dir), ("code_dir", self.runner.code_dir),
+                    ("cache_dir", self.runner.cache_dir))  # fmt: skip
+            for label, path in mine:
+                for what, other in others:
+                    if inst.overlaps(path, other):
+                        raise ValueError(
+                            f"runner.{label} {path} overlaps {what} ({other}); "
+                            f"instance {name} needs its own"
+                        )
+        return self
+
+    @model_validator(mode="after")
+    def _unique_service(self) -> Self:
+        stated = self.secrets.service
+        if stated is not None:
+            owner = inst.service_owner(stated)
+            if owner is not None and owner != self.instance.name:
+                raise ValueError(
+                    f"secrets.service {stated} is instance {owner}'s Keychain service, "
+                    f"not {self.instance.name}'s"
+                )
+        return self
+
+    @property
+    def keychain_service(self) -> str:
+        """The Keychain service for this instance's items: ``secrets.service`` when set, else
+        ``resonant`` / ``resonant-<name>`` (``instance.keychain_service``)."""
+        return self.secrets.service or inst.keychain_service(self.instance.name)
+
+    @property
+    def daemon_label(self) -> str:
+        """This instance's LaunchAgent label (``instance.daemon_label``)."""
+        return inst.daemon_label(self.instance.name)
 
     @field_validator("timezone")
     @classmethod
@@ -1089,7 +1191,7 @@ class Settings(BaseSettings):
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         # config.yaml lives in the effective home: an explicit `home=` wins over
-        # RESONANT_HOME, which wins over the default.
+        # RESONANT_HOME, which wins over RESONANT_INSTANCE's home, then the default.
         home = resonant_home()
         if isinstance(init_settings, InitSettingsSource):
             init_kwargs = cast(dict[str, object], init_settings.init_kwargs)  # pyright: ignore[reportUnknownMemberType]
@@ -1097,7 +1199,20 @@ class Settings(BaseSettings):
             if isinstance(explicit, str | Path):
                 home = Path(explicit).expanduser()
         yaml_source = YamlConfigSettingsSource(settings_cls, yaml_file=home / "config.yaml")
-        return (init_settings, env_settings, yaml_source)
+        # PER-297: RESONANT_INSTANCE picks an instance; it isn't the `instance` section (a
+        # bare name isn't JSON), so the env source never sees it. The name it asks for is the
+        # instance's name unless `instance=` is passed, and a home whose config.yaml states
+        # another name is refused (InstanceMismatch).
+        if isinstance(env_settings, EnvSettingsSource):
+            env_settings.env_vars = {
+                k: v for k, v in env_settings.env_vars.items()
+                if k.lower() != inst.INSTANCE_ENV.lower()
+            }  # fmt: skip
+        sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings]
+        if (want := inst.requested()) is not None:
+            inst.check_home(home, want)
+            sources.append(InitSettingsSource(settings_cls, {"instance": {"name": want}}))
+        return (*sources, yaml_source)
 
 
 def load_settings(**overrides: Any) -> Settings:

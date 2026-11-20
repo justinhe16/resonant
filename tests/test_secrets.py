@@ -523,7 +523,9 @@ def test_cli_list_shows_names_and_presence_only(
     keychain.items["github/token"] = TOKEN
     code, out = run("list", str(extra))
     assert code == 0, out
-    lines = [line.split() for line in out.strip().splitlines()]
+    *rows, summary = out.strip().splitlines()
+    assert summary == "1 of 3 present (service resonant)"  # PER-297
+    lines = [line.split() for line in rows]
     assert lines == [
         ["example/api_key", "missing"],
         ["github/hook_key", "missing"],

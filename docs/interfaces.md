@@ -464,7 +464,7 @@ secret_notice(SecretError) -> str
 ## Secrets: `resonant.secrets`, `resonant.redact`
 
 ```python
-SecretStore(runner: SecurityRunner | None = None, *, timeout_s=5.0)   # no caching
+SecretStore(runner: SecurityRunner | None = None, *, timeout_s=5.0, service="resonant")   # no caching
     async .get(ref) -> str            # SecretMissing | SecretUnavailable
     async .exists(ref) -> bool        # no value read
     async .set(ref, value) -> None    # value on stdin; InvalidSecretValue
@@ -473,11 +473,11 @@ SecretStore(runner: SecurityRunner | None = None, *, timeout_s=5.0)   # no cachi
 validate_ref(ref) / secret_ref(ext, name) / split_ref(ref) / env_name(name) / values_of(env)
 class SecretError(Exception): ref, reason    # SecretMissing, SecretUnavailable
 Redactor(values).text(str) -> str ; .deep(obj) -> obj      # REDACTED = "[redacted]"
-resonant.secrets.FakeKeychain                # in-memory SecurityRunner for tests
+resonant.secrets.FakeKeychain(service="resonant")   # in-memory SecurityRunner for tests; asserts -s
 ```
 
-- **Items.** Login keychain, generic password, service `resonant`, account = the ref `<ext>/<name>`. `<ext>` follows the manifest name rule (`[a-z][a-z0-9-]{0,47}`), `<name>` is `[a-z][a-z0-9_]{0,31}`. Both start with a letter, so `-a <ref>` can never be read as an option. Env names are `RESONANT_SECRET_<UPPER(name)>`: the key format of the daemon-side hand-off only (`SecretStore.env_for`, `CallContext.secrets`, `scratch_env`). `ExtProcess` strips them from the child's env and delivers them on fd 4 (see Process).
-- **`security` calls.** `/usr/bin/security find-generic-password -s resonant -a <ref> [-w]`, `add-generic-password -U -s resonant -a <ref> -w`, `delete-generic-password -s resonant -a <ref>`. Always an argv (no shell), 5 s timeout (the process group is killed), a new session (no controlling terminal), a minimal env (`PATH`, `LANG`, `HOME`, `USER`, `LOGNAME`), stdin `/dev/null` except for `set`, stderr discarded unread.
+- **Items.** Login keychain, generic password, service `resonant` (PER-297: the instance's `Settings.keychain_service`, `resonant-<name>` for any instance but the default; every daemon and CLI store is built with it), account = the ref `<ext>/<name>`. `<ext>` follows the manifest name rule (`[a-z][a-z0-9-]{0,47}`), `<name>` is `[a-z][a-z0-9_]{0,31}`. Both start with a letter, so `-a <ref>` can never be read as an option. Env names are `RESONANT_SECRET_<UPPER(name)>`: the key format of the daemon-side hand-off only (`SecretStore.env_for`, `CallContext.secrets`, `scratch_env`). `ExtProcess` strips them from the child's env and delivers them on fd 4 (see Process).
+- **`security` calls.** `/usr/bin/security find-generic-password -s <service> -a <ref> [-w]`, `add-generic-password -U -s <service> -a <ref> -w`, `delete-generic-password -s <service> -a <ref>` (`<service>` is `resonant` for the personal instance; it matches `[a-z][a-z0-9._-]{0,63}`, checked before any argv is built). Always an argv (no shell), 5 s timeout (the process group is killed), a new session (no controlling terminal), a minimal env (`PATH`, `LANG`, `HOME`, `USER`, `LOGNAME`), stdin `/dev/null` except for `set`, stderr discarded unread.
 - **Values never in argv.** Reads take the value from stdout (one trailing newline stripped). `set` runs `security -i` and writes the `add-generic-password` command on stdin (a line of about 4 KB at most). `set` takes 8 or more printable ASCII characters and newlines, at most 3500 once stored (a value with spaces, quotes or newlines is stored as `resonant-b64:<base64>` and decoded on read); `resonant secret set <ref> --from-file <path|->` reads a multi-line value such as a PEM in-process.
 - **Exit codes.** 0 is ok. 44 (`errSecItemNotFound`) is `SecretMissing` (`exists` and `delete` return False). Anything else, a timeout or a failure to start is `SecretUnavailable`, with a reason such as `keychain locked or no user interaction allowed (exit 36)`. Messages carry the ref and code only, never a value or `security`'s output, and nothing is logged.
 - **Redaction.** `Redactor` matches each value raw, URL-encoded (`%XX` either case, `+` for space), JSON-string-escaped (incl. `\/` and `\uXXXX`), or any per-character mix of those; and base64 (standard or URL-safe) at the three byte alignments, matching only the characters that depend on the value alone, so a value inside a larger blob is caught. Overlapping matches merge into one `[redacted]`. `deep` redacts every string in dicts (keys too), lists and tuples and returns a copy. Other transforms (hex, HTML entities, double escaping, line-wrapped MIME base64) are not matched; `bytes` and sets pass through `deep` unchanged (phase 3 plan §5 residual).
@@ -681,6 +681,48 @@ Outcome: idle | run | skipped_paused | overlap | missed
 - `in_window(expr, tz, now) -> bool` (PER-280): whether local `now` falls in the hour, day-of-month, month and day-of-week fields of a numeric cron, ignoring its minute field (a panel's *active window*). Both day fields restricted match either (cron's OR), day-of-week 7 is Sunday, and an expression that isn't five numeric fields is False.
 - `catchup` must be within 0–24h (`MAX_CATCHUP`), else `ValueError`. `missed`/`skipped` list at most the 50 most recent (`MAX_LISTED`), and only due times within 31 days (`LOOKBACK`); `truncated` says more were dropped; an `idle` with `truncated` returns `last_due` at the lookback edge so later ticks don't rescan.
 
+## Instances: `resonant.instance` (PER-297)
+
+One checkout can run several daemons as one macOS user. Each is an *instance*. Everything that would collide on one user is derived from `instance.name` by `resonant.instance`, and nothing else derives it. The defaults are the names Resonant had before instances, so a home with no `instance:` block and no `RESONANT_INSTANCE` is byte-for-byte unchanged.
+
+```python
+DEFAULT_INSTANCE = "resonant"; INSTANCE_ENV = "RESONANT_INSTANCE"
+validate_name(name) -> str            # [a-z][a-z0-9-]{0,31}, else InstanceError (a ValueError)
+home_for(name) -> Path                # ~/.resonant | ~/.resonant-<name> (expanded)
+daemon_label(name) -> str             # com.resonant.daemon | com.resonant.<name>.daemon
+is_daemon_label(label) -> bool        # some instance's daemon label (the ops allow-list)
+keychain_service(name) -> str         # resonant | resonant-<name>
+service_owner(service) -> str | None  # whose derived service it is
+home_owner(home) -> str | None        # whose default home it is
+run_dirs(name) -> RunDirs(work_dir, code_dir, cache_dir)   # unexpanded, like config defaults
+requested(env=None) -> str | None     # RESONANT_INSTANCE, validated
+resolve_home(env=None) -> Path        # RESONANT_HOME, else home_for(requested() or "resonant")
+stated_name(config_yaml) -> str | None
+check_home(home, want) -> None        # InstanceMismatch when config.yaml states another name
+select(flag, env=None) -> str | None  # --instance and RESONANT_INSTANCE together; disagreeing: InstanceError
+port_in_use(host, port) -> bool       # bind test with SO_REUSEADDR
+Settings.instance: InstanceConfig(name, display_name)
+Settings.keychain_service -> str      # secrets.service or keychain_service(instance.name)
+Settings.daemon_label -> str
+```
+
+| What | `resonant` (default) | another name, e.g. `cori` |
+|---|---|---|
+| home | `~/.resonant` | `~/.resonant-cori` |
+| LaunchAgent label | `com.resonant.daemon` | `com.resonant.cori.daemon` |
+| Keychain service | `resonant` | `resonant-cori` |
+| `runner.work_dir` / `code_dir` / `cache_dir` | `~/resonant-runs`, `~/code`, `~/resonant-runs/.cache` | `~/cori/runs`, `~/cori/code`, `~/cori/runs/.cache` |
+| `runner.mirror_dir` / `secrets_dir` | `<home>/runner/mirrors`, `<home>/run-secrets` (as before) | same, in its own home |
+| `api.port` | 7777 | not derived: set it (`config/cori.example.yaml` uses 7778) |
+
+- **Picking the instance.** `home=` (tests) wins, then `RESONANT_HOME`, then `home_for(RESONANT_INSTANCE)`, then `~/.resonant`. `RESONANT_INSTANCE` is not a settings env var: `Settings` drops it from its env source and, when set, makes it the instance name (below `instance=` init kwargs, above `config.yaml`). A `config.yaml` that states another `instance.name` raises `InstanceMismatch` ("this home (…) is instance cori, not resonant"). A home that is another instance's default home (`~/.resonant` for `cori`, `~/.resonant-cori` for `resonant`) is a validation error. Any other hand-set `RESONANT_HOME` is unchanged.
+- **CLI.** `resonant --instance <name> …` is the same as `RESONANT_INSTANCE=<name>`; the callback sets the env var for the rest of the process and its children. Both given and different: exit 2. A home/name mismatch or a bad slug: exit 2 with the reason, before any command runs.
+- **Derived only when unset.** `runner.work_dir`, `code_dir` and `cache_dir` take `run_dirs(name)` only when they aren't set (the same rule as `mirror_dir`/`secrets_dir`). A non-default instance's worker dirs, set or derived, may not overlap the default instance's run dirs, code dir or home (so `instance.name: code` and `runner.code_dir: ~/code/cori` are refused). Two different names' derived dirs never overlap otherwise. A stated `secrets.service` may not be another instance's derived service.
+- **Wired in.** `launchd.daemon_plist` (label, plus `RESONANT_INSTANCE` in `EnvironmentVariables` for a non-default instance), `resonant daemon install/uninstall`, `resonant status`, the backup and restart paths of the CLI, `tools.ops.Ops.restart_resonant`, the ops allow-list (`ops.is_ops_label`: Ollama's label or any instance's daemon label), every `SecretStore` the daemon and CLI build, and the thin guard's denied port (`SandboxParams.api_port` from `api.port`; `runner.sb` takes it as `@API_PORT@`).
+- **Port check.** `resonant daemon install` refuses an `api.port` something already listens on, naming the port (and the instance, when it's another Resonant daemon answering `/api/status`). Its own running daemon (same instance name; a daemon from before PER-297 counts as `resonant`) is a reinstall and goes ahead.
+- **Shown.** `/api/status` and `daemon_status` carry `instance: {name, display_name}`; `/status` starts with the display name (`Resonant up 3h` as before); `resonant status` prints an `instance` line; the snapshot has `instance` (schema 2, additive, optional); the startup log line is unchanged for `resonant` and starts `instance <name> (<display_name>), ` otherwise.
+- **Not yet.** Shared agents (caffeinate, Ollama), `/update` across instances, sibling discovery and backups naming (PER-290); worker and brain scope (PER-291); the relay keyed by instance (PER-304). `_daemon_pids` (the restore guard) still sees every instance's `resonant daemon run`.
+
 ## Phase 3 config: `resonant.config`
 
 Every section has defaults, so a Phase 2 `config.yaml` loads unchanged. Unknown keys are errors, and caps are bounded both ways.
@@ -701,6 +743,9 @@ Every section has defaults, so a Phase 2 `config.yaml` loads unchanged. Unknown 
 | `extensions.notify.max_chars` | 300 | 40–1000 | the notification text clip |
 | `secrets.security_path` | `/usr/bin/security` | absolute | Keychain access |
 | `secrets.timeout_s` | 5 | > 0, ≤ 30 | each `security` call |
+| `secrets.service` | unset: `resonant`, or `resonant-<name>` | `[a-z][a-z0-9._-]{0,63}`; not another instance's derived service | the Keychain service (`Settings.keychain_service`, PER-297) |
+| `instance.name` | `resonant` | `[a-z][a-z0-9-]{0,31}` | which instance this home is; see [Instances](#instances-resonantinstance-per-297) |
+| `instance.display_name` | `Resonant`; another instance's name capitalized | 1–40 printable | `/status`, `resonant status`, the snapshot, the startup line |
 | `briefing.enabled` | true | | `core/briefing` |
 | `briefing.at` | `"08:00"` | 24-hour `HH:MM` in `timezone` | `BriefingConfig.local_time` |
 | `pulse.enabled` | true | | the hourly pulse and urgent interrupts |
@@ -1940,7 +1985,7 @@ Daemon(settings, *, model: ModelClient | None = None, osa_runner: OsaRunner | No
        ext_runner: ExtRunner | None = None)
 ```
 
-- **Gate.** Always `PolicyGate`, iMessage on or off. The startup log line includes `gate=policy dry_run=<bool>`. With `dry_run: true`, L0 reads (chat and the fast path) are allowed exactly as before.
+- **Gate.** Always `PolicyGate`, iMessage on or off. The startup log line (`daemon.started_line`) includes `gate=policy dry_run=<bool>`; a non-default instance's starts `instance <name> (<display_name>), ` (PER-297). With `dry_run: true`, L0 reads (chat and the fast path) are allowed exactly as before.
 - **`channels.imessage.enabled: false`** (the default): the daemon is Phase 0 apart from the gate. `loop.router` is None, `loop.runners == {"echo"}`, `DaemonState.monitor` is None, and nothing imports the model client.
 - **Enabled:** `Daemon.__init__` calls `build_imessage_stack` once, after `build_components`. It builds `IMessageChannel(config, principals, conn, runner=osa_runner)`, `Router(...)` over the components' registry, gate and handlers, registers `LocalRunner` (`components.register_local_runner(..., timezone=settings.timezone)`, then `loop.runners["local"]`, `max_step_s = local_step_limit`) and `ReminderRunner` (`runners["reminder"]`, see Reminders), builds the `Notifier` (same recipients as `JobRunner`, `config=extensions.notify`), sets `loop.router = route_event(router.route, notifier)`, and builds `HealthMonitor(conn, model, channel, owner, daemon_healthy=Daemon.healthy, db_path, model_meta, ext_checks=ExtensionHealth(...))`, which becomes `DaemonState.monitor`. It also builds `TrustChecks` (`IMessageStack.trust`), the `AskRunner` (`runners["ask"]`, BR-5), the `ClaudeRunner` (`IMessageStack.claude`, `runners["claude"]`, `max_runs = claude.max_concurrent − claude.reserved_oncall_slots`, at least 1; the router's relay gets it for owner replies) and the `Pulse` (`IMessageStack.pulse`). `model` defaults to `OllamaClient(settings.model)` (closed by `aclose`); `osa_runner` defaults to real osascript. Tests and `resonant bench e2e` inject `resonant.e2e.ScriptedModel` and `RecordingOsaRunner`; tests also pass `ops_runner=FakeOpsRunner()` (it goes to `build_components`).
 - **Start:** `Daemon.run` starts the channel (`channel.start(loop.submit)`, then `ops.back_up`: `Back up (<commit>), down Ns` once after a requested restart, then `extensions.host.send_alerts`: queued tamper alerts to the owner, once each) before the loop, then the loop, the API, the monitor, the notifier's flush (`notifier.run()`) and the dead-man (with `monitor.deadman_reason`). `IMessageStack.stop` stops the flush with the monitor.
@@ -1977,7 +2022,7 @@ All endpoints are loopback only. Remote status goes through the push-only status
 | `GET /healthz` | `{"ok": true}` |
 | `GET /api/dashboard` | the dashboard snapshot, `local` tier (schema 2; [`dashboard-plan.md`](dashboard-plan.md) §3; the exact shape is [`snapshot.schema.json`](snapshot.schema.json)), `Cache-Control: no-store`. See [Dashboard snapshot](#dashboard-snapshot) |
 | `GET /…` (anything else) | the dashboard build in `dashboard/dist`: static files, `index.html` at `/`, and its `config.json` (`{"source": "local"}`). The API routes win over files of the same name. Without a build, `/` is a placeholder page saying it is missing. The mount is decided at start, so a new build needs a restart |
-| `GET /api/status` | version, uptime, last tick, dry_run, autonomy, paused, task counts by status and wait reason, `approvals_pending` (unexpired pending approvals, all approvers), in-flight count, `health: {model, imessage, loop, store, ext:<name>…}` each `{state: unknown\|ok\|degraded, since, detail, checked_at}` |
+| `GET /api/status` | version, `instance: {name, display_name}` (PER-297), uptime, last tick, dry_run, autonomy, paused, task counts by status and wait reason, `approvals_pending` (unexpired pending approvals, all approvers), in-flight count, `health: {model, imessage, loop, store, ext:<name>…}` each `{state: unknown\|ok\|degraded, since, detail, checked_at}` |
 | `GET /api/channels` | `[{name: "imessage", enabled, ok, last_read_at, last_selftest: {ok, at, detail} \| null}]`; `ok` and `last_read_at` are null without a live channel |
 | `GET /api/ext/<name>/panels/<id>/days/<YYYY-MM-DD>` | PER-286: one archived day of a history panel, read-only (`Cache-Control: no-store`): `{ext, panel, day, views, health, truncated, bytes, outside}`, every text through the snapshot's text pass again and no `local_url`. 404 for an unknown extension, panel (or one without `history`), a malformed day, and a day that was never archived, recorded none, or failed. Other methods: 405 |
 | `GET /api/tools` | registered tool specs: `[{name, extension, effect, level, description, args_schema}]` (`level` is the effective level) |

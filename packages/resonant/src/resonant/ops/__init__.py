@@ -36,13 +36,23 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from resonant.instance import is_daemon_label
 from resonant.launchd import DAEMON_LABEL, OLLAMA_LABEL
 from resonant.store.db import atomic, iso, kv_get, kv_set, utcnow
 
 log = logging.getLogger(__name__)
 
 LAUNCHCTL = "/bin/launchctl"
-LABELS = frozenset({DAEMON_LABEL, OLLAMA_LABEL})  # the only services ops may restart
+# The default instance's labels. Ops may restart Ollama and any instance's daemon
+# (``is_ops_label``: com.resonant.daemon or com.resonant.<name>.daemon, PER-297), nothing else.
+LABELS = frozenset({DAEMON_LABEL, OLLAMA_LABEL})
+
+
+def is_ops_label(label: str) -> bool:
+    """A label the ops may kickstart: Ollama's, or an instance's daemon."""
+    return label == OLLAMA_LABEL or is_daemon_label(label)
+
+
 RESTART_DELAY_S = 3
 KICKSTART_TIMEOUT_S = 15.0
 RESTART_PENDING_KEY = "ops.restart_pending"
@@ -154,15 +164,15 @@ class SubprocessRunner:
 
 
 def kickstart_argv(label: str, uid: int | None = None) -> list[str]:
-    """``launchctl kickstart -k gui/<uid>/<label>`` for one of the two ops labels."""
-    if label not in LABELS:
+    """``launchctl kickstart -k gui/<uid>/<label>`` for an ops label (``is_ops_label``)."""
+    if not is_ops_label(label):
         raise ValueError(f"not an ops label: {label!r}")
     return [LAUNCHCTL, "kickstart", "-k", f"gui/{os.getuid() if uid is None else uid}/{label}"]
 
 
 def restart_later_argv(label: str, delay_s: int = RESTART_DELAY_S) -> list[str]:
     """The detached helper that restarts ``label`` after ``delay_s`` seconds."""
-    if label not in LABELS:
+    if not is_ops_label(label):
         raise ValueError(f"not an ops label: {label!r}")
     return [sys.executable, "-m", "resonant.ops.restart_later", label, str(delay_s)]
 
@@ -296,6 +306,7 @@ __all__ = [
     "back_up",
     "back_up_text",
     "clear_restart",
+    "is_ops_label",
     "kickstart_argv",
     "mark_restart",
     "ops_env",

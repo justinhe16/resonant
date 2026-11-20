@@ -229,6 +229,13 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class Instance(_Model):
+    """Which instance took the snapshot (PER-297, ``resonant.instance``)."""
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9-]{0,31}$")
+    display_name: str = Field(min_length=1, max_length=40)
+
+
 class Limits(_Model):
     """How much of each list the snapshot keeps, so the page can say "the newest 50"."""
 
@@ -886,6 +893,7 @@ class Snapshot(_Model):
     tier: Tier
     taken_at: datetime
     version: Version
+    instance: Instance | None = None  # PER-297; None from a daemon before it
     started_at: datetime  # when the daemon started
     last_tick: datetime | None
     autonomy: Literal["on", "off"]
@@ -1651,6 +1659,7 @@ def build_snapshot(
         tier="local",
         taken_at=now,
         version=version or code_version(),
+        instance=Instance(name=settings.instance.name, display_name=settings.instance.display_name),
         started_at=started_at,
         last_tick=last_tick,
         autonomy="off" if autonomy == "off" else "on",

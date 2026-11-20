@@ -616,6 +616,8 @@ export interface Snapshot {
   taken_at: Timestamp;
   /** git sha, 8 chars */
   version: string;
+  /** PER-297: which instance took it; absent from a daemon before it */
+  instance?: Instance | null;
   started_at: Timestamp;
   last_tick: Timestamp | null;
   autonomy: "on" | "off";
@@ -642,6 +644,12 @@ export interface Snapshot {
   repo_count: number;
   /** PER-277; absent from a daemon before it */
   diagram?: Diagram | null;
+}
+
+/** Which instance took the snapshot (PER-297). */
+export interface Instance {
+  name: string;
+  display_name: string;
 }
 
 /** A normalized snapshot; `legacy` is set when it came from a schema 1 push (no detail). */
