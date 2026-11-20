@@ -50,6 +50,11 @@ way to send an iMessage (the thin guard) and nothing it writes is read as a repl
 ``what`` text is the worker's and is cleaned (``clean_external``: printable ASCII, brackets
 dropped, code-like tokens masked) and clipped before it is shown.
 
+A run a watcher started (PER-299, ``store.jobs.tainted_run``: a watched Slack message, outside
+text, is its input) is tainted from the start: a check that a rule or "seen before" would
+allow asks anyway (reason ``started by a watched message``), and ``yes always`` is never
+offered for it.
+
 Every outcome is audited (``trust.check``), on top of the ``trust.evaluate`` row and the
 approval's own ``approval.resolve`` row.
 """
@@ -73,6 +78,7 @@ from resonant.principals import Principals
 from resonant.runners.approve import prompt_approvers
 from resonant.runners.run_thread import run_thread
 from resonant.store import approvals as ap
+from resonant.store import jobs as jobs_store
 from resonant.store import runs as runs_store
 from resonant.store import trust as store
 from resonant.store.audit import audit
@@ -194,6 +200,10 @@ class TrustChecks:
             now=self.clock(),
             cost_ask_over_usd=self.cost_ask_over_usd,
         )
+        if decision.ok and jobs_store.tainted_run(self.conn, run.code):
+            # PER-299: a watched message (outside text) started this run: no rule allows its
+            # checks without asking, and no "yes always" is offered.
+            decision = TrustDecision("ask", "started by a watched message")
         if decision.ok:
             return "ok"
         approval = self._approval(
@@ -273,7 +283,11 @@ class TrustChecks:
                     return None
                 # An owner's own ask rule is changed over chat, not from a prompt; and a
                 # rule on an area of other systems would cover more than was asked.
-                always = decision.rule is None and not _covers_others(self.conn, system, repo)
+                always = (
+                    decision.rule is None
+                    and not _covers_others(self.conn, system, repo)
+                    and not jobs_store.tainted_run(self.conn, run_code)  # PER-299
+                )
                 try:
                     code = new_code(ap.pending_codes(self.conn))
                 except RuntimeError:  # every approval code is taken

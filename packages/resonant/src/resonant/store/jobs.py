@@ -1,4 +1,9 @@
 """Registered jobs (migration 032, PER-298): cron plus a prompt, one worker run per firing.
+PER-299 (migration 033) adds watchers: ``kind = 'watch'``, a Slack channel (``watch_channel``)
+and a filter (``filter_json``) in place of a schedule (``schedule`` is ``''``); each matching
+message starts one run (``resonant/channel_watchers.py``). ``watchers(conn, channel)`` lists
+the active ones of a channel; ``generation()`` moves on every create and state change in this
+process, so an in-memory index knows when to reload.
 
 A job is one ``registered_jobs`` row. ``create`` gives it the next ``J<n>``; ``get`` takes
 ``J3`` or ``3``; ``live`` lists the active and paused ones (never ``deleted``). ``claim_due``
@@ -58,6 +63,8 @@ class Job:
     seen: tuple[str, ...]
     created_at: datetime
     updated_at: datetime
+    watch_channel: str | None = None  # PER-299: a watcher's Slack channel id
+    watch_filter: dict[str, Any] | None = None  # PER-299: a watcher's filter (filter_json)
 
     @property
     def room(self) -> str | None:
@@ -77,6 +84,7 @@ def _row(r: sqlite3.Row) -> Job:
     note = cast(dict[str, Any], memory).get("note") if isinstance(memory, dict) else None
     seen: object = json.loads(r["seen_json"]) if r["seen_json"] else []
     keys = tuple(str(k) for k in cast(list[Any], seen)) if isinstance(seen, list) else ()
+    flt: object = json.loads(r["filter_json"]) if r["filter_json"] else None
     created = _dt(r["created_at"])
     updated = _dt(r["updated_at"])
     assert created is not None and updated is not None
@@ -100,7 +108,22 @@ def _row(r: sqlite3.Row) -> Job:
         seen=keys,
         created_at=created,
         updated_at=updated,
+        watch_channel=r["watch_channel"],
+        watch_filter=cast(dict[str, Any], flt) if isinstance(flt, dict) else None,
     )
+
+
+_generation = 0
+
+
+def generation() -> int:
+    """Moves on every ``create`` and ``set_state`` in this process (``WatchIndex`` reloads)."""
+    return _generation
+
+
+def _bump() -> None:
+    global _generation
+    _generation += 1
 
 
 def parse_id(text: object) -> str | None:
@@ -124,13 +147,19 @@ def create(
     channel_ref: dict[str, Any] | None,
     now: datetime,
     kind: Kind = "schedule",
+    watch_channel: str | None = None,
+    watch_filter: dict[str, Any] | None = None,
 ) -> Job:
-    """A new active job. ``last_due`` starts at ``now``: only due times after it fire."""
+    """A new active job. ``last_due`` starts at ``now``: only due times after it fire. A
+    watcher (``kind="watch"``) has ``watch_channel`` and ``filter`` and an empty schedule."""
+    if (kind == "watch") != (watch_channel is not None):
+        raise ValueError("a watcher, and only a watcher, has a watch_channel")
     with atomic(conn):
         cur = conn.execute(
             "INSERT INTO registered_jobs (id, kind, name, schedule, tz, prompt, repo, output,"
-            " created_by, channel_ref, state, last_due, created_at, updated_at)"
-            " VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+            " created_by, channel_ref, state, last_due, created_at, updated_at, watch_channel,"
+            " filter_json)"
+            " VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
             (
                 kind,
                 name,
@@ -144,10 +173,13 @@ def create(
                 iso(now),
                 iso(now),
                 iso(now),
+                watch_channel,
+                None if watch_filter is None else json.dumps(watch_filter),
             ),
         )
         n = cur.lastrowid
         conn.execute("UPDATE registered_jobs SET id = ? WHERE n = ?", (f"J{n}", n))
+    _bump()
     job = get(conn, f"J{n}")
     assert job is not None
     return job
@@ -177,6 +209,16 @@ def active(conn: sqlite3.Connection, kind: Kind = "schedule") -> list[Job]:
         "SELECT * FROM registered_jobs WHERE state = 'active' AND kind = ? ORDER BY n", (kind,)
     ).fetchall()
     return [_row(r) for r in rows]
+
+
+def watchers(conn: sqlite3.Connection, channel: str | None = None) -> list[Job]:
+    """Active watchers (of ``channel`` when given), oldest first."""
+    sql = "SELECT * FROM registered_jobs WHERE kind = 'watch' AND state = 'active'"
+    params: tuple[Any, ...] = ()
+    if channel is not None:
+        sql += " AND watch_channel = ?"
+        params = (channel,)
+    return [_row(r) for r in conn.execute(sql + " ORDER BY n", params).fetchall()]
 
 
 def count_live(conn: sqlite3.Connection) -> int:
@@ -209,6 +251,7 @@ def set_state(
             f"UPDATE registered_jobs SET {sets} WHERE id = ? AND state IN ({placeholders})",  # noqa: S608 - placeholders only
             (*params, job_id, *expect),
         )
+    _bump()
     return cur.rowcount == 1
 
 
@@ -290,13 +333,20 @@ def save_note(
 
 @dataclass(frozen=True)
 class RunLink:
+    """``tainted`` (PER-299): the run was started by outside text (a watched message), so
+    its gated steps always ask (``tainted_run``)."""
+
     job: str
     room: str | None = None
+    tainted: bool = False
 
 
 def link_run(conn: sqlite3.Connection, run_code: str, link: RunLink) -> None:
+    value: dict[str, Any] = {"job": link.job, "room": link.room}
+    if link.tainted:
+        value["tainted"] = True
     with atomic(conn):
-        kv_set(conn, _LINK + run_code, {"job": link.job, "room": link.room})
+        kv_set(conn, _LINK + run_code, value)
 
 
 def run_link(conn: sqlite3.Connection, run_code: str) -> RunLink | None:
@@ -308,7 +358,14 @@ def run_link(conn: sqlite3.Connection, run_code: str) -> RunLink | None:
     job, room = d.get("job"), d.get("room")
     if not isinstance(job, str):
         return None
-    return RunLink(job, room if isinstance(room, str) and room else None)
+    return RunLink(job, room if isinstance(room, str) and room else None, d.get("tainted") is True)
+
+
+def tainted_run(conn: sqlite3.Connection, run_code: str) -> bool:
+    """PER-299: ``run_code`` was started by a watched message (outside text): a trust rule
+    never allows its checks without asking, and its ask allows no ``resonant restart``."""
+    link = run_link(conn, run_code)
+    return link is not None and link.tainted
 
 
 __all__ = [
@@ -325,6 +382,7 @@ __all__ = [
     "claim_due",
     "count_live",
     "create",
+    "generation",
     "get",
     "link_run",
     "live",
@@ -334,4 +392,6 @@ __all__ = [
     "save_note",
     "set_state",
     "started",
+    "tainted_run",
+    "watchers",
 ]

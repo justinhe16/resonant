@@ -22,7 +22,8 @@ checks and owner messages for running Claude workers.
 - ``restart``/``update`` (GD-1): Resonant itself, through the same ``Ops`` as ``/restart
   resonant`` and ``/update`` (``SelfOps``). Allowed without asking when the run's requester is
   the owner and the ask mentions it (``asked_for``: restart, redeploy, deploy, …; for update
-  also "update resonant"), once per run; otherwise it is a check like any other (system
+  also "update resonant"), once per run, never for a watcher's run (PER-299: its ask holds a
+  watched message); otherwise it is a check like any other (system
   ``resonant``, action ``restart`` or ``update``: net new the first time, so ``yes always``
   covers the next). The
   reply goes out before the restart (the helper waits 3 s); the restart stops the session and
@@ -330,8 +331,10 @@ class WorkerDesk:
         if run.code in self._self_op_busy:
             return Reply("Not done: a restart or update for this run is already going.",
                          EXIT_DENIED)  # fmt: skip
+        # PER-299: a watcher's run has outside text in its ask: it allows nothing by itself
+        tainted = jobs_store.tainted_run(self.conn, run.code)
         if not (self.owner is not None and run.requester == self.owner and done == 0
-                and asked_for(run.ask, req.op)):  # fmt: skip
+                and not tainted and asked_for(run.ask, req.op)):  # fmt: skip
             what = f"{req.op} Resonant (the daemon itself)"
             checked = await self._check(run, Check(SELF_SYSTEM, req.op, what), gone)
             if checked is None or checked.exit != EXIT_OK:
