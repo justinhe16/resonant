@@ -1,9 +1,11 @@
-"""What Resonant itself texted a principal (PER-268, migration 019; 024 adds the pulse).
+"""What Resonant itself texted a principal (PER-268, migration 019; 024 adds the pulse, 030 the
+heartbeat).
 
 Code-built texts the owner got outside a reply to their message (an approval prompt, the
 result of an approved call, a run's end text; since PER-274 the hourly pulse and the
-briefing, ``pulse`` and ``briefing``) are recorded here after they are sent, so the
-brains can see them: qwen's history shows them between the exchanges as system turns
+briefing, ``pulse`` and ``briefing``; since PER-303 the hourly alive line a room gets,
+``heartbeat``, under the room's principal ``room:<key>``) are recorded here after they are
+sent, so the brains can see them: qwen's history shows them between the exchanges as system turns
 (``brain.history.replayed``) and the Claude brain gets the new ones at the top of its next
 turn (``runners.ask``). ``ref`` is the send's dedupe key, so a resend records nothing new.
 The text is code-built from cleaned parts and is cleaned again here (``notify.clean_text``)
@@ -27,10 +29,12 @@ from resonant.store.db import atomic, iso, utcnow
 
 log = logging.getLogger(__name__)
 
-Kind = Literal["approval", "result", "run", "pulse", "briefing"]
+Kind = Literal["approval", "result", "run", "pulse", "briefing", "heartbeat"]
 TEXT_MAX = 400
-LONG_KINDS: frozenset[Kind] = frozenset({"pulse", "briefing"})
-LONG_MAX = 1200  # a pulse or briefing (1,000 chars, ``pulse_job.MAX_CHARS``) with its `` / ``s
+LONG_KINDS: frozenset[Kind] = frozenset({"pulse", "briefing", "heartbeat"})
+# a pulse or briefing (1,000 chars, ``pulse_job.MAX_CHARS``) with its `` / ``s; a heartbeat is
+# at most 500 (``pulse_job.HEARTBEAT_MAX_CHARS``)
+LONG_MAX = 1200
 KEEP = timedelta(days=7)
 
 
