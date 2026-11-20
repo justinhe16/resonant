@@ -428,7 +428,7 @@ def runner_rows(
     claude_how = (
         f"needed for any run: claude setup-token, then resonant secret set {CLAUDE_TOKEN_REF}"
     )
-    if guard == "off":
+    if guard == "off" and settings.runner.claude_config_dir is None:
         claude_how = (
             "needed for any run: log in with `claude` on the Mini, or claude setup-token, then "
             f"resonant secret set {CLAUDE_TOKEN_REF}"
@@ -458,7 +458,9 @@ def runner_rows(
         errors = [f for f in found if isinstance(f, str)]
         if any(f is True for f in found):
             rows.append(("PASS", False, step, "present (value not read)"))
-        elif CLAUDE_TOKEN_REF in refs and guard == "off" and _safe(login, settings):
+        elif (CLAUDE_TOKEN_REF in refs and guard == "off"
+              and settings.runner.claude_config_dir is None  # PER-291: never the owner's
+              and _safe(login, settings)):  # fmt: skip
             rows.append(("PASS", False, step, "not set: your own claude login works (guard off)"))
         elif errors:
             rows.append(("FAIL", False, step, errors[0]))
@@ -498,6 +500,8 @@ def runner_rows(
         detail = "thin: the Seatbelt profile wraps every worker (resonant sandbox check)"
     rows.append(("PASS", False, "runner guard", detail))
     rows.append(remote_control_row(settings, remote_last))
+    rows.append(claude_config_row(settings))
+    rows.append(session_env_row(settings, present))
     # Resonant's own repo (GD-1): the daemon's checkout is registered as "resonant" at start.
     own = settings.ops.repo_path
     if own is not None and (own / ".git").is_dir() and guard == "thin":
@@ -523,6 +527,72 @@ def runner_rows(
             why = f"no workflow on pull_request: Resonant won't merge its runs (/repo ci {name})"
             rows.append(("FAIL", False, step, why))
     return rows
+
+
+def _mcp_servers(config_dir: Path) -> list[str]:
+    """The MCP servers configured in a Claude config dir: ``.claude.json``'s
+    ``mcpServers`` (user scope) and each project's, and ``settings.json``'s if any. Names only;
+    nothing else of either file is read out."""
+    import json
+
+    names: list[str] = []
+
+    def take(obj: object, where: str) -> None:
+        if isinstance(obj, dict):
+            names.extend(f"{n} ({where})" for n in cast(dict[str, object], obj))
+
+    for name in (".claude.json", "settings.json"):
+        try:
+            data: object = json.loads((config_dir / name).read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        top = cast(dict[str, object], data)
+        take(top.get("mcpServers"), name)
+        projects = top.get("projects")
+        if isinstance(projects, dict):
+            for proj, cfg in cast(dict[str, object], projects).items():
+                if isinstance(cfg, dict):
+                    take(cast(dict[str, object], cfg).get("mcpServers"), f"{name} {proj}")
+    return names
+
+
+def claude_config_row(settings: Settings) -> Row:
+    """PER-291: ``runner.claude_config_dir`` (Cori's ``~/cori/claude``): its skills, and a
+    FAIL when any MCP server is configured there (the instance's workers and brain must load
+    none of the owner's). Unset: SKIP (workers load the owner's ~/.claude, GD-1)."""
+    step = "runner claude config dir"
+    config_dir = settings.runner.claude_config_dir
+    if config_dir is None:
+        return ("SKIP", False, step, "not set: workers load your own ~/.claude (GD-1)")
+    if not config_dir.is_dir():
+        return ("FAIL", False, step, f"{config_dir} doesn't exist (docs/go-live.md, Cori)")
+    skills_dir = config_dir / "skills"
+    skills = (
+        sorted(p.name for p in skills_dir.iterdir() if p.is_dir()) if skills_dir.is_dir() else []
+    )
+    servers = _mcp_servers(config_dir)
+    listed = f"skills: {', '.join(skills) or 'none'}"
+    if servers:
+        found = ", ".join(servers)
+        why = f"{config_dir}: MCP servers configured ({found}); remove them. {listed}"
+        return ("FAIL", False, step, why)
+    return ("PASS", False, step, f"{config_dir}: no MCP servers; {listed}")
+
+
+def session_env_row(settings: Settings, present: Callable[[str], bool | str]) -> Row:
+    """PER-291: ``runner.session_env``'s Keychain items, by name only (no value is read).
+    Missing ones don't fail a run (its end text says so): advisory."""
+    step = "runner session env"
+    spec = settings.runner.session_env
+    if not spec:
+        return ("SKIP", False, step, "none (workers get no scoped credentials)")
+    missing = [f"{var} (resonant secret set {ref})" for var, ref in spec.items()
+               if present(ref) is not True]  # fmt: skip
+    if missing:
+        return ("FAIL", False, step, f"not set up: {'; '.join(missing)}")
+    return ("PASS", False, step, f"{len(spec)} present (values not read): {', '.join(spec)}")
 
 
 # --- the status relay (docs/dashboard-plan.md D4, DB-3; go-live step 15) -------------------

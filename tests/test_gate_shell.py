@@ -482,3 +482,37 @@ def test_a_grant_is_spent_once_and_only_by_its_turn(db: sqlite3.Connection) -> N
     with atomic(db):
         add_grant(db, args, task_id="T-approved", now=now)
     assert not take_grant(db, args, task_id="T-approved", now=now + timedelta(hours=1))
+
+
+# --- PER-291: Cori's brain shell follows her read scope --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["cat ~/trade-jev/accounts.yaml", "cat ~/.resonant/config.yaml", "ls ~/code",
+     "grep -r token ~/resonant", "cat ~/.fly/config.yml"],
+)  # fmt: skip
+def test_coris_shell_reads_of_personal_files_are_refused_not_asked(
+    resonant_home: Path, user_home: Path, command: str
+) -> None:
+    from resonant.components import shell_policy
+    from resonant.config import load_settings
+
+    example = Path(__file__).resolve().parents[1] / "config" / "cori.example.yaml"
+    (resonant_home / "config.yaml").write_text(example.read_text())
+    for path in (
+        "trade-jev/accounts.yaml",
+        ".resonant/config.yaml",
+        "code/x/README.md",
+        "resonant/README.md",
+        ".fly/config.yml",
+        "cori/code/voyager-web/README.md",
+    ):
+        (user_home / path).parent.mkdir(parents=True, exist_ok=True)
+        (user_home / path).write_text("x\n")
+    policy = shell_policy(load_settings())
+    cwd = user_home / "cori" / "code" / "voyager-web"
+    v = policy.judge({"tool": "Bash", "command": command, "cwd": str(cwd)})
+    assert v.kind == "never" and "outside the folders" in v.why
+    ok = policy.judge({"tool": "Bash", "command": "cat README.md", "cwd": str(cwd)})
+    assert ok.kind == "read"
