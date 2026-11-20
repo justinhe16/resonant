@@ -376,6 +376,9 @@ class Command:
     tool: str | None = None  # a builtin (extension None); None: handled by the fast path
     parse: Parse = no_args
     owner_only: bool = False
+    # PER-293: an owner-only command an approver may use too (its tools are global requests,
+    # or the instance-only pause). Without it an owner-only command is admin: owner alone.
+    staff: bool = False
     subs: tuple[Sub, ...] = ()
     extension: str | None = None  # an ``/<ext>`` command: every tool is that extension's
 
@@ -575,6 +578,7 @@ COMMANDS: tuple[Command, ...] = (
         "restart the model server or Resonant itself",
         "ops",
         owner_only=True,
+        staff=True,
         subs=(Sub("ollama", "restart_ollama"), Sub("resonant", "restart_resonant")),
     ),
     Command(
@@ -585,7 +589,7 @@ COMMANDS: tuple[Command, ...] = (
         tool="update_resonant",
         owner_only=True,
     ),
-    Command("/disk", "/disk", "free disk space", "ops", tool="disk", owner_only=True),
+    Command("/disk", "/disk", "free disk space", "ops", tool="disk", owner_only=True, staff=True),
     Command(
         "/logs",
         "/logs [n]",
@@ -602,6 +606,7 @@ COMMANDS: tuple[Command, ...] = (
         "job_control",
         parse=approvals_args,
         owner_only=True,
+        staff=True,
     ),
     Command(
         "/run",
@@ -611,6 +616,7 @@ COMMANDS: tuple[Command, ...] = (
         tool="start_run",
         parse=run_args,
         owner_only=True,
+        staff=True,
     ),
     Command(
         "/runs",
@@ -620,6 +626,7 @@ COMMANDS: tuple[Command, ...] = (
         tool="list_runs",
         parse=runs_args,
         owner_only=True,
+        staff=True,
     ),
     Command(
         "/cancel",
@@ -629,6 +636,7 @@ COMMANDS: tuple[Command, ...] = (
         tool="cancel_run",
         parse=run_code_args,
         owner_only=True,
+        staff=True,
     ),
     Command(
         "/merge",
@@ -638,6 +646,7 @@ COMMANDS: tuple[Command, ...] = (
         tool="merge_run",
         parse=run_code_args,
         owner_only=True,
+        staff=True,
     ),
     Command(
         "/repos",
@@ -646,6 +655,7 @@ COMMANDS: tuple[Command, ...] = (
         "run_project",
         tool="list_repos",
         owner_only=True,
+        staff=True,
     ),
     Command(
         "/repo",
@@ -653,6 +663,7 @@ COMMANDS: tuple[Command, ...] = (
         "add <x> [as <name>]; forget <x>; new <name> [public]; ci <repo> [merge]",
         "run_project",
         owner_only=True,
+        staff=True,
         subs=(
             Sub("add", "add_repo", repo_add_args, usage="/repo add <owner/name> [as <name>]"),
             Sub("forget", "forget_repo", repo_one_args, usage="/repo forget <repo>"),
@@ -673,6 +684,7 @@ COMMANDS: tuple[Command, ...] = (
         "rules",
         tool="list_trust_rules",
         owner_only=True,
+        staff=True,
         subs=(
             Sub("forget", "remove_trust_rule", forget_rule_args, usage="/rules forget <n>"),
             Sub(
@@ -686,8 +698,8 @@ COMMANDS: tuple[Command, ...] = (
     EXT,
     PULSE,
     HELP,
-    Command("/kill", "/kill", "stop autonomy and pause", "system", owner_only=True),
-    Command("/resume", "/resume", "turn autonomy back on", "system", owner_only=True),
+    Command("/kill", "/kill", "stop autonomy and pause", "system", owner_only=True, staff=True),
+    Command("/resume", "/resume", "turn autonomy back on", "system", owner_only=True, staff=True),
 )
 BY_NAME: dict[str, Command] = {c.name: c for c in COMMANDS}
 
@@ -736,14 +748,18 @@ def available(
 ) -> list[Command]:
     """The commands ``principal`` may use, in registry order.
 
-    Owner-only commands need ``admin``. A command with tools needs each of them registered
-    and ``request`` on its extension. Commands with neither (``/help``) are for everyone.
+    Owner-only commands need ``admin`` (or an approver, for ``staff`` ones). A builtin
+    command with tools needs each of them registered and requestable; an ``/<ext>`` command
+    needs any of them (per-tool grants). Commands with neither (``/help``) are for everyone.
     """
     out: list[Command] = []
     for c in commands:
-        if c.owner_only and not principals.can(principal, "admin", None):
+        if not allowed(c, principal, principals):
             continue
-        if not all(
+        # An ``/<ext>`` command shows when any of its tools may be requested (PER-293:
+        # per-tool grants); a builtin command needs every tool it can call.
+        check = all if c.extension is None else any
+        if not check(
             can_request(
                 principal, t, principals=principals, registry=registry, extension=c.extension
             )
@@ -752,6 +768,14 @@ def available(
             continue
         out.append(c)
     return out
+
+
+def allowed(c: Command, principal: str, principals: Principals) -> bool:
+    """Whether ``principal`` may use ``c`` at all: an owner-only command needs ``admin``, or
+    an approver when it is ``staff`` (PER-293). Its tools are checked separately."""
+    if not c.owner_only or principals.can(principal, "admin", None):
+        return True
+    return c.staff and principals.is_approver(principal)
 
 
 def can_request(

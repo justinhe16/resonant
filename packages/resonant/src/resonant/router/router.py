@@ -160,12 +160,12 @@ class Router:
         if event.source not in self.channels or event.type != "message":
             return None
         principal = event.principal
-        if principal is None or principal not in self.principals.principals:
+        if principal is None or not self.principals.known(principal):
             return None
         text: Any = event.payload.get("text")
         if not isinstance(text, str):
             return None
-        is_owner = self.principals.principals[principal].role == "owner"
+        is_owner = self.principals.role(principal) == "owner"
         media = is_owner and bool(from_payload(event.payload))
         if not text.strip() and not media:
             return None
@@ -204,7 +204,7 @@ class Router:
         # keywords.
         # A voice transcript is chat only: never a slash command or keyword (``/restart``
         # misheard would run as explicit consent), an approval or a worker reply.
-        cmd = None if voice else self.fast_path.match(text)
+        cmd = None if voice else self.fast_path.match(text, principal)
         if cmd is not None and cmd.slash:
             result = await self.fast_path.run(
                 cmd, principal=principal, event_id=event.id, trace_id=event.trace_id, spans=spans

@@ -481,12 +481,19 @@ The example is a noisy demo (a 5-minute incident job, an hourly fake PnL that ap
 ```yaml
 principals:
   justin:    {role: owner, identities: ["imessage:+15551234567", "imessage:me@icloud.com"]}
+  brian:     {role: approver, identities: ["slack:U01"]}
   cofounder: {identities: ["slack:U02"], grants: {my-ext: [request, approve]}}
+  miu:       {identities: ["slack:U03"], grants: {my-ext: {request: [file_ticket], approve: []}}}
+default: {channel: slack, grants: {my-ext: {request: [file_ticket]}}}
 ```
 
 - `request` allows asking Resonant to use the extension's tools or start its tasks.
-- `approve` allows approving the extension's actions when the gate asks. The principal must also be listed in `approvers:`.
-- The owner can always do everything. Identity grants permissions; message content never does.
+- `approve` allows approving the extension's actions when the gate asks. A member must also be listed in `approvers:`.
+- A grant is the whole extension (`[request, approve]`) or per tool (`{request: [tool, …], approve: [tool, …]}`): members may file tickets but not deploy. A per-tool grant naming a tool your manifest doesn't define grants nothing; `resonant ext validate` warns about it.
+- The owner can always do everything. An `approver` (role) may request and approve every extension's tools without being listed in `approvers:`, but never admin (`/ext`, `/update`, secrets).
+- `default:` covers anyone in the Slack workspace the owner didn't list (the adapter vouches for them): a member with those grants. It can never approve, so a manifest can't name one in `approvers:` (validation fails).
+- On a team config (an approver or a `default:`), a member with any `request` grant reaches Claude, which offers them only the tools they may request.
+- Identity grants permissions; message content never does.
 
 ## 9. Registering an extension
 

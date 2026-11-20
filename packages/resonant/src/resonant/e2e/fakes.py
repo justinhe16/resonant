@@ -194,10 +194,14 @@ class FakeChannel:
         fail_start: bool = False,
         fail_selftest: bool = False,
         clock: Callable[[], datetime] = utcnow,
+        vouch: bool = False,
     ) -> None:
         self._name = name
         self.principals = principals
         self.threaded = threaded
+        # PER-293: the adapter vouches every sender is in its workspace (Slack's team_id
+        # check, PER-295), so an unlisted one resolves to the workspace default.
+        self.vouch = vouch
         self.fail_start = fail_start
         self.fail_selftest = fail_selftest
         self.clock = clock
@@ -251,7 +255,7 @@ class FakeChannel:
         """Submit a message from ``<name>:<uid>`` as the adapter would; False when it isn't
         submitted (an unknown identity is dropped, as an adapter does, or not started)."""
         identity = f"{self._name}:{uid}"
-        principal = self.principals.resolve(identity)
+        principal = self.principals.resolve(identity, vouched=self.vouch)
         if principal is None or self._submit is None:
             return False
         self.injected += 1
@@ -283,7 +287,7 @@ class FakeChannel:
         thread: MessageRef | None = None,
         dedupe_key: str | None = None,
     ) -> MessageRef:
-        p = self.principals.principals.get(principal)
+        p = self.principals.get(principal)
         if p is None or not any(i.startswith(f"{self._name}:") for i in p.identities):
             raise ChannelRefused(f"no {self._name} identity")
         if dedupe_key is not None and (prev := self._keys.get(dedupe_key)) is not None:

@@ -156,7 +156,7 @@ class ChannelHub:
 
     def pick(self, principal: str, thread: MessageRef | None = None) -> Channel:
         """The adapter a send to ``principal`` goes through. Raises ``ChannelRefused``."""
-        p = self.principals.principals.get(principal)
+        p = self.principals.get(principal)
         if p is None:
             self._refuse(principal, "unknown principal")
         running = set(self.running)

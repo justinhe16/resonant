@@ -9,3 +9,15 @@ principals:
     identities: ["slack:U11111111"]
     grants:
       example: [request, approve]       # per-extension: request and/or approve
+  # PER-293 (Cori): an approver requests and approves everything, never admin.
+  # brian:
+  #   role: approver
+  #   identities: ["slack:U22222222"]
+  # A per-tool grant: these tools only (members may file tickets but not deploy).
+  # miu:
+  #   identities: ["slack:U33333333"]
+  #   grants:
+  #     dori: {request: [file_ticket, find_tickets, staging_status]}
+# Optional (Slack only, never iMessage): anyone else in the workspace is a member with these
+# grants. Never an approver.
+# default: {channel: slack, grants: {dori: {request: [file_ticket, find_tickets, staging_status]}}}

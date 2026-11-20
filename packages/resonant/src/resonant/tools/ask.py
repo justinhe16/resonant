@@ -38,6 +38,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from resonant.executor import CallContext, ContextHandler, ToolFailed, ToolHandler
+from resonant.principals import CLAUDE_GRANT
 from resonant.store import tasks as task_store
 from resonant.tools.base import BuiltinContext
 from resonant_sdk import Effect, Level, ToolSpec
@@ -86,6 +87,7 @@ ASK_CLAUDE = ToolSpec(
     level=Level.L0,
     timeout_s=10.0,
     untrusted=True,  # D6: its answer is outside content, so the calling task is tainted
+    grant=CLAUDE_GRANT,  # PER-293: members with a Claude or extension grant reach Claude
 )
 SPECS: tuple[ToolSpec, ...] = (ASK_CLAUDE,)
 
