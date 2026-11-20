@@ -26,16 +26,21 @@ def message(
     task: bool = True,
     source: str = "imessage",
     checkpoint: dict[str, Any] | None = None,
+    thread: str | None = None,
 ) -> str:
     """Store one message event (and, with ``task``, the task it started, whose checkpoint
     holds ``reply`` and any ``checkpoint`` keys). Returns the event id. Without ``task`` the
     event is stored consumed, in the same transaction: a message that started no task was
     already handled, and a running daemon's loop must not route it as a new one (it would
-    race the test's next message for the scripted triage)."""
+    race the test's next message for the scripted triage). ``thread`` (PER-294): posted in
+    that thread (``payload.thread``, the task's ``channel_ref``)."""
     extra: dict[str, Any] = {} if at is None else {"occurred_at": at}
-    event = Event(
-        source=source, type="message", principal=principal, payload={"text": text}, **extra
-    )
+    payload: dict[str, Any] = {"text": text}
+    ref: dict[str, Any] | None = None
+    if thread is not None:
+        payload["thread"] = thread
+        ref = {"channel": source, "principal": principal, "thread": thread}
+    event = Event(source=source, type="message", principal=principal, payload=payload, **extra)
     with transaction(db):
         repo.insert_event(db, event)
         if not task:
@@ -55,6 +60,7 @@ def message(
                     principal=principal,
                     checkpoint=cp,
                     origin_event_id=event.id,
+                    channel_ref=ref,
                     trace_id=event.trace_id,
                 ),
             )

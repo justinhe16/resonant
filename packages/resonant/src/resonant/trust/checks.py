@@ -71,6 +71,7 @@ from resonant.gate.types import NeedsApproval, canonical_json
 from resonant.gateway.channel import Channel, ChannelError
 from resonant.principals import Principals
 from resonant.runners.approve import prompt_approvers
+from resonant.runners.run_thread import run_thread
 from resonant.store import approvals as ap
 from resonant.store import runs as runs_store
 from resonant.store import trust as store
@@ -288,7 +289,7 @@ class TrustChecks:
                         summary=check_summary(
                             run_code, shown, system, action, decision.reason, always=always
                         ),
-                        approvers=(self.principals.owner,),
+                        approvers=self._approvers(run),
                         code=code,
                         expires_at=now + self.ttl,
                         require_code=False,
@@ -313,12 +314,25 @@ class TrustChecks:
             allow_always=row.allow_always,
         )
 
-    async def _prompt(self, task_id: str, needs: NeedsApproval) -> bool | None:
-        """Prompt the owner. True: reached; False: unreachable for good; None: retry."""
+    def _approvers(self, run: runs_store.Run) -> tuple[str, ...]:
+        """PER-294: who may answer a run's check: its requester and the approvers (the owner
+        first). Owner-only: the owner alone, as before."""
+        names = [self.principals.owner, *self.principals.approver_names]
+        if self.principals.is_approver(run.requester):
+            names.insert(0, run.requester)
+        return tuple(dict.fromkeys(names))
+
+    async def _prompt(self, task_id: str, needs: NeedsApproval, run_code: str) -> bool | None:
+        """Prompt the approvers (PER-294: the requester in the run's thread). True: reached;
+        False: unreachable for good; None: retry."""
+        run = runs_store.get(self.conn, run_code)
+        thread = None if run is None else run_thread(self.conn, run)
+        in_thread = None if run is None or thread is None else (run.requester, thread)
         try:
             result = await prompt_approvers(
-                self.conn, self.channel, needs, task_id=task_id, now=self.clock
-            )
+                self.conn, self.channel, needs, task_id=task_id, now=self.clock,
+                in_thread=in_thread,
+            )  # fmt: skip
         except ChannelError:
             return None
         if result.reached:
@@ -329,7 +343,7 @@ class TrustChecks:
         self, run_code: str, task_id: str, needs: NeedsApproval, system: str, action: str
     ) -> tuple[Answer, str | None]:
         """Prompt, then wait for the owner's answer, the expiry, or the run ending."""
-        reached = await self._prompt(task_id, needs)
+        reached = await self._prompt(task_id, needs, run_code)
         if reached is False:
             with atomic(self.conn):
                 ap.expire_one(self.conn, needs.approval_id, self.clock(), reason="unreachable")
@@ -349,7 +363,7 @@ class TrustChecks:
             if row.status == "approved":
                 return await self._approved(run_code, row, system, action), None
             if reached is None and (now - last_prompt).total_seconds() >= REPROMPT_S:
-                reached = await self._prompt(task_id, needs)  # the channel dedupes
+                reached = await self._prompt(task_id, needs, run_code)  # the channel dedupes
                 last_prompt = now
                 if reached is False:
                     with atomic(self.conn):
@@ -366,7 +380,10 @@ class TrustChecks:
             # only the first spends it and adds the rule. A later check asks again.
             first = ap.mark_used(self.conn, row.id, now)
             store.mark_seen(self.conn, system, action, now)
-            if first and row.always and row.allow_always and not row.require_code:
+            # PER-294: only the owner and approvers teach rules (a ``yes always`` from anyone
+            # else is a plain yes).
+            teacher = row.decided_by is not None and self.principals.is_approver(row.decided_by)
+            if first and teacher and row.always and row.allow_always and not row.require_code:
                 added = store.add_rule(
                     self.conn,
                     scope=system,

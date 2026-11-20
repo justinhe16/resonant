@@ -108,6 +108,7 @@ class RunnerApi(Protocol):
         merge: bool = False,
         report: Report = "digest",
         channel_ref: dict[str, Any] | None = None,
+        requested_by: str | None = None,
     ) -> Started | Refused: ...
 
     def list_runs(self, limit: int = 20) -> list[Run]: ...
@@ -468,14 +469,18 @@ def handlers(ctx: BuiltinContext) -> dict[str, ToolHandler]:
             return {"started": False, "text": missing()}
         if repo is not None and len(repo) > REPO_MAX:
             raise ToolFailed(f"start_run: repo is too long (at most {REPO_MAX} characters)")
-        # PER-292: the run's texts go to the thread it was asked in (the calling task's)
+        # PER-292: the run's texts go to the thread it was asked in (the calling task's).
+        # PER-294: the run stays the owner's, but it keeps who asked (``requested_by``): its
+        # questions, checks and outcome go to their thread, addressed to them.
         task = task_store.get_task(ctx.conn, call.task_id) if call is not None else None
-        owner = ctx.principals.owner  # the run is the owner's: only the owner's thread
-        ref = None if task is None or task.principal != owner else task.channel_ref
-        thread = {} if ref is None else {"channel_ref": ref}
-        result = await claude.start_run(
-            repo, ask, ctx.principals.owner, merge=merge, report=report, **thread
-        )
+        owner = ctx.principals.owner
+        asker = None if task is None else task.principal
+        thread: dict[str, Any] = {}
+        if task is not None and task.channel_ref is not None:
+            thread["channel_ref"] = task.channel_ref
+        if asker is not None and asker != owner:
+            thread["requested_by"] = asker
+        result = await claude.start_run(repo, ask, owner, merge=merge, report=report, **thread)
         if (reason := _refusal(result)) is not None:
             return {"started": False, "text": reason}
         started = cast("Started", result)

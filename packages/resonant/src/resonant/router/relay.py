@@ -34,6 +34,14 @@ The router calls it at three points (``router.py``):
    when it is confident, else ``For R4 (…) or R6 (…)?`` and the original message is
    stashed (``kv``) until the next reply resolves it.
 
+**Threads and who may answer** (PER-294). A run keeps the thread it was asked in and who asked
+(``runs.channel_ref``, ``runs.requested_by``). A reply is matched by thread first: in a thread
+with a run's open question, only that thread's questions count (no ``For R4 or R6?`` across
+threads); elsewhere, by code as above. Only the run's requester and the approvers (the owner
+included) may answer or message a run: anyone else's answer in its thread, or ``R4 …``, gets
+``Only Brian or Justin can answer R4.`` and reaches nothing. With no threads and the owner
+alone (iMessage), nothing changes: every run is the owner's.
+
 A question only counts if it was asked before the owner's message was sent (the
 sent-before rule of approvals). Answers confirm in one line: ``→ R4`` (``→ R4 (Which DB?)``
 when the brain picked by content, so a wrong pick is visible at once), messages ``→ R4
@@ -56,6 +64,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from resonant.gate.types import PendingApproval
 from resonant.gateway.channel import event_identity
+from resonant.loop.types import conversation_of
 from resonant.models import ModelClient, ModelError, SpanFactory
 from resonant.models.client import ChatMessage, null_spans
 from resonant.principals import Principals
@@ -291,6 +300,17 @@ def _words(text: str) -> int:
     return len(normalize(text).split())
 
 
+def event_thread(event: Event) -> str | None:
+    """The thread a message was posted in (``payload.thread``), or None (iMessage)."""
+    thread: Any = event.payload.get("thread")
+    return thread if isinstance(thread, str) and thread else None
+
+
+def run_conversation(run: Run) -> str | None:
+    """The thread a run was asked in (``runs.channel_ref``, PER-294), or None."""
+    return conversation_of(run.channel_ref)
+
+
 # --- the relay ---------------------------------------------------------------------------------
 
 
@@ -318,22 +338,54 @@ class Relay:
         identity = event_identity(event)
         return identity is not None and self.principals.resolve(identity) == principal
 
-    def _run(self, workers: Workers, code: str, principal: str) -> Run | None:
+    def may_answer(self, principal: str, run: Run) -> bool:
+        """PER-294: the run's requester (or its principal), or, on a team config, an approver
+        (the owner included). Owner-only: the run's own principal, as before."""
+        if principal in (run.requester, run.principal):
+            return True
+        return self.principals.team and self.principals.is_approver(principal)
+
+    def _run(
+        self, workers: Workers, code: str, principal: str, event: Event | None = None
+    ) -> Run | None:
+        """The run ``code`` when ``principal`` may answer it, or ``event`` is in its thread
+        (then ``_answer`` refuses anyone else: PER-294)."""
         run = workers.get_run(code)
-        return run if run is not None and run.principal == principal else None
+        if run is None:
+            return None
+        if self.may_answer(principal, run):
+            return run
+        thread = None if event is None else event_thread(event)
+        return run if thread is not None and thread == run_conversation(run) else None
 
     def open_for(self, event: Event, principal: str) -> list[OpenQuestion]:
-        """The principal's open questions asked before ``event`` was sent, oldest first."""
+        """The open questions a reply from ``principal`` may be taken for, asked before
+        ``event`` was sent, oldest first. PER-294: thread first: in a thread with a run's open
+        question, only that thread's (whoever wrote: ``_answer`` refuses who may not answer);
+        else the questions of the runs ``principal`` asked for (the owner: every run, as
+        before). An approver answers another's run by code (``R4 …``)."""
         workers = self.workers()
         if workers is None or not self._authentic(event, principal):
             return []
         out: list[OpenQuestion] = []
+        here: list[OpenQuestion] = []
+        thread = event_thread(event)
         for q in workers.open_questions():
             if q.asked_at >= event.occurred_at:
                 continue  # the owner hadn't seen it when they wrote this
-            if self._run(workers, q.run_code, principal) is not None:
+            run = workers.get_run(q.run_code)
+            if run is None:
+                continue
+            if thread is not None and run_conversation(run) == thread:
+                here.append(q)
+            elif principal in (run.requester, run.principal):
                 out.append(q)
-        return out
+        return here or out
+
+    def _asked(self, workers: Workers, event: Event, code: str) -> list[OpenQuestion]:
+        """Run ``code``'s open questions asked before ``event`` was sent, oldest first."""
+        return [q for q in workers.open_questions()
+                if q.run_code == code and q.asked_at < event.occurred_at]  # fmt: skip
 
     # -- 2. no model call --
 
@@ -355,10 +407,14 @@ class Relay:
         if stash is not None and addressed is None:
             picked = self._stash_pick(text, stash, opens)
             if picked is not None:
-                return self._answer(workers, picked, stash["text"], by_content=False)
+                return self._answer(
+                    workers, picked, stash["text"], by_content=False, principal=principal
+                )
         fits = [q for q in opens if match_option(text, q.options) is not None]
         if len(fits) == 1:
-            return self._answer(workers, fits[0], text, by_content=len(opens) > 1)
+            return self._answer(
+                workers, fits[0], text, by_content=len(opens) > 1, principal=principal
+            )
         return None
 
     def _addressed(
@@ -369,13 +425,17 @@ class Relay:
         a: Addressed,
         stash: dict[str, Any] | None,
     ) -> RelayResult | None:
-        run = self._run(workers, a.code, principal)
+        run = self._run(workers, a.code, principal, event)
         if run is None:
             return None  # not one of the owner's runs: route normally
-        opens = [q for q in self.open_for(event, principal) if q.run_code == run.code]
+        if not self.may_answer(principal, run):
+            return self._refused(run)
+        opens = self._asked(workers, event, run.code)
         if not a.rest:
             if stash is not None and opens and stash["ids"].get(run.code) == opens[0].id:
-                return self._answer(workers, opens[0], stash["text"], by_content=False)
+                return self._answer(
+                    workers, opens[0], stash["text"], by_content=False, principal=principal
+                )
             if opens:
                 return RelayResult(
                     f"What's your answer for {run.code} ({short_question(opens[0])})? "
@@ -388,7 +448,7 @@ class Relay:
         if not a.tell and _CONTROL.match(a.rest) and not picks_option:
             return None  # "R4 cancel", "R4 status": run control, unless it's one of the options
         if opens:
-            return self._answer(workers, opens[0], a.rest, by_content=False)
+            return self._answer(workers, opens[0], a.rest, by_content=False, principal=principal)
         if not run.active:
             return RelayResult(f"{run.code} isn't running ({run.status}); nothing sent.",
                                "refused", run.code)  # fmt: skip
@@ -452,19 +512,23 @@ class Relay:
             if says_new or _CONTROL.match(normalize(text)):
                 return None  # a leading control verb vetoes even a confident pick
             if pick is not None and pick[0] == q.run_code and pick[1] >= LIKELY:
-                return self._answer(workers, q, text, by_content=False)
+                return self._answer(workers, q, text, by_content=False, principal=principal)
             if commandish:
                 return None
-            return self._answer(workers, q, text, by_content=False) if recent and short else None
+            return (
+                self._answer(workers, q, text, by_content=False, principal=principal)
+                if recent and short
+                else None
+            )
         if pick is not None and pick[1] >= SURE and not _CONTROL.match(normalize(text)):
             if pick[0] == NONE:
                 return None
             chosen = next(q for q in opens if q.run_code == pick[0])
-            return self._answer(workers, chosen, text, by_content=True)
+            return self._answer(workers, chosen, text, by_content=True, principal=principal)
         if says_new or commandish:
             return None
         if (named := self._named_repo(workers, text, opens)) is not None:
-            return self._answer(workers, named, text, by_content=True)
+            return self._answer(workers, named, text, by_content=True, principal=principal)
         if pick is None and not short:
             return None  # the brain is down and this doesn't look like a reply
         self._put_stash(principal, text, opens)
@@ -558,13 +622,29 @@ class Relay:
     # -- doing it --
 
     def _answer(
-        self, workers: Workers, q: OpenQuestion, text: str, *, by_content: bool
+        self,
+        workers: Workers,
+        q: OpenQuestion,
+        text: str,
+        *,
+        by_content: bool,
+        principal: str | None = None,
     ) -> RelayResult:
+        run = workers.get_run(q.run_code) if principal is not None else None
+        if run is not None and principal is not None and not self.may_answer(principal, run):
+            return self._refused(run)
         result = workers.answer_question(q.run_code, answer_text(text, q.options), question_id=q.id)
         if (sent := _sent(result)) is not None:
             line = sent + (f" ({short_question(q)})" if by_content else "")
             return RelayResult(line, "answered", q.run_code)
         return RelayResult(_reason(result), "refused", q.run_code)
+
+    def _refused(self, run: Run) -> RelayResult:
+        """PER-294: someone who may not answer the run (a member in its thread)."""
+        names = [run.requester, self.principals.owner, *self.principals.approver_names]
+        shown = [self.principals.display(n) for n in dict.fromkeys(names)]
+        who = shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + f" or {shown[-1]}"
+        return RelayResult(f"Only {who} can answer {run.code}.", "refused", run.code)
 
     def _message(self, workers: Workers, code: str, text: str) -> RelayResult:
         result = workers.deliver_message(code, text)

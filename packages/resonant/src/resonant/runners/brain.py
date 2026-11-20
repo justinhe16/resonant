@@ -64,13 +64,13 @@ from zoneinfo import ZoneInfo
 from resonant.brain import triage
 from resonant.brain.context import build_context
 from resonant.brain.facts import FactStore
-from resonant.brain.history import fold, fold_due
+from resonant.brain.history import fold, fold_due, summary_key
 from resonant.brain.news import news_reply
 from resonant.config import Settings
 from resonant.gate.types import Origin
 from resonant.gateway.channel import Channel
 from resonant.loop.slots import SlotPool
-from resonant.loop.types import Done, StepContext, StepOutcome, Task
+from resonant.loop.types import Done, StepContext, StepOutcome, Task, channel_of
 from resonant.models import (
     ChatMessage,
     ModelClient,
@@ -270,33 +270,40 @@ class BrainRunner(LocalRunner):
     async def step(self, task: Task, events: list[Any], ctx: StepContext) -> StepOutcome:
         out = await super().step(task, events, ctx)
         if isinstance(out, Done) and task.principal is not None:
-            self._maybe_fold(task.principal, task.trace_id)
+            self._maybe_fold(task.principal, task.trace_id, task.conversation)
         return out
 
-    def _maybe_fold(self, principal: str, trace_id: str) -> None:
-        """Fold the principal's history in the background once it is due (D3): after the
-        reply went out, never on the reply path."""
-        if principal in self._folding:
-            return  # one fold per principal at a time (the model has one slot)
+    def _maybe_fold(self, principal: str, trace_id: str, conversation: str | None = None) -> None:
+        """Fold the conversation's history (the principal's own, or a thread's: PER-294) in
+        the background once it is due (D3): after the reply went out, never on the reply
+        path."""
+        key = summary_key(principal, conversation)
+        if key in self._folding:
+            return  # one fold per conversation at a time (the model has one slot)
         try:
-            if not fold_due(self.conn, principal):
+            if not fold_due(self.conn, principal, conversation=conversation):
                 return
         except sqlite3.Error:
             log.exception("brain: fold check failed")
             return
         spans = self._spans(trace_id)
-        self._folding.add(principal)
-        job = asyncio.get_running_loop().create_task(self._fold(principal, spans))
+        self._folding.add(key)
+        job = asyncio.get_running_loop().create_task(
+            self._fold(principal, spans, conversation, key)
+        )
         self._folds.add(job)
         job.add_done_callback(self._folds.discard)
 
-    async def _fold(self, principal: str, spans: SpanFactory) -> None:
+    async def _fold(
+        self, principal: str, spans: SpanFactory, conversation: str | None, key: str
+    ) -> None:
         try:
-            await fold(self.conn, self.model, principal, spans=spans, now=self.now)
+            await fold(self.conn, self.model, principal, spans=spans, now=self.now,
+                       conversation=conversation)  # fmt: skip
         except Exception:
             log.exception("brain: history fold failed")
         finally:
-            self._folding.discard(principal)
+            self._folding.discard(key)
 
     async def idle(self) -> None:
         """Wait for background folds and the runner check (tests). Only unfinished jobs are
@@ -417,6 +424,8 @@ class BrainRunner(LocalRunner):
                 last_tick=self.last_tick(),
                 slots=self.slots,
                 runner_missing=self._runner_missing(),
+                source=channel_of(task),
+                conversation=task.conversation,
             )
             s.set(history_turns=len(context.history))
         st = _Turn(text, principal, asked_back=asked_back(context.history))
@@ -533,8 +542,9 @@ class BrainRunner(LocalRunner):
 
     def _news(self, task: Task, principal: str) -> str | None:
         return news_reply(
-            self.conn, self.settings, principal, event_id=task.origin_event_id, now=self.now()
-        )
+            self.conn, self.settings, principal, event_id=task.origin_event_id, now=self.now(),
+            conversation=task.conversation,
+        )  # fmt: skip
 
     async def _triage(self, text: str, st: _Turn, spans: SpanFactory) -> triage.Triage | None:
         """PER-256: the local model's one call, over a small prompt (no tools, no history).

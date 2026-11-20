@@ -87,6 +87,16 @@ class Run:
     last_note: str | None = None  # the worker's latest ``resonant note``
     resume_prompt: str | None = None  # what the current turn delivered (resent after a crash)
     remote_url: str | None = None  # the latest session's Remote Control URL (migration 014)
+    # PER-294 (migration 029): the thread the run was asked in (the asking task's
+    # ``channel_ref``) and who asked (``requested_by``; None: the run's ``principal``). Its
+    # questions, trust checks and outcome go to that thread, addressed to the requester.
+    channel_ref: dict[str, Any] | None = None
+    requested_by: str | None = None
+
+    @property
+    def requester(self) -> str:
+        """Who asked for the run: ``requested_by``, else the run's principal (the owner)."""
+        return self.requested_by or self.principal
 
     @property
     def scratch(self) -> bool:
@@ -156,7 +166,19 @@ def _row(r: sqlite3.Row) -> Run:
         last_note=r["last_note"] if "last_note" in r.keys() else None,  # noqa: SIM118
         resume_prompt=r["resume_prompt"] if "resume_prompt" in r.keys() else None,  # noqa: SIM118
         remote_url=r["remote_url"] if "remote_url" in r.keys() else None,  # noqa: SIM118
+        channel_ref=_ref(r["channel_ref"]) if "channel_ref" in r.keys() else None,  # noqa: SIM118
+        requested_by=r["requested_by"] if "requested_by" in r.keys() else None,  # noqa: SIM118
     )
+
+
+def _ref(raw: str | None) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    try:
+        value: Any = json.loads(raw)
+    except ValueError:
+        return None
+    return cast(dict[str, Any], value) if isinstance(value, dict) else None
 
 
 def create(
@@ -168,16 +190,29 @@ def create(
     session_id: str,
     max_seconds: int,
     max_budget_usd: float | None = None,
+    channel_ref: Mapping[str, Any] | None = None,
+    requested_by: str | None = None,
 ) -> Run:
-    """Insert a queued run and give it the next code. Never reuses a code."""
+    """Insert a queued run and give it the next code. Never reuses a code. ``channel_ref``
+    and ``requested_by`` (PER-294): the thread it was asked in and who asked."""
     ts = now_iso()
     with atomic(conn):
         row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'runs'").fetchone()
         seq = (0 if row is None else int(row["seq"])) + 1
+        cols: dict[str, Any] = {
+            "seq": seq, "code": f"R{seq}", "principal": principal, "repo": repo, "ask": ask,
+            "session_id": session_id, "max_seconds": max_seconds,
+            "max_budget_usd": max_budget_usd, "created_at": ts, "updated_at": ts,
+        }  # fmt: skip
+        # migration 029's columns only when set (a store part way through its migrations)
+        if channel_ref is not None:
+            cols["channel_ref"] = json.dumps(dict(channel_ref))
+        if requested_by is not None:
+            cols["requested_by"] = requested_by
+        names, marks = ", ".join(cols), ", ".join("?" * len(cols))
         conn.execute(
-            "INSERT INTO runs (seq, code, principal, repo, ask, session_id, max_seconds,"
-            " max_budget_usd, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (seq, f"R{seq}", principal, repo, ask, session_id, max_seconds, max_budget_usd, ts, ts),
+            f"INSERT INTO runs ({names}) VALUES ({marks})",  # noqa: S608 - fixed column names
+            tuple(cols.values()),
         )
     run = get(conn, f"R{seq}")
     assert run is not None
