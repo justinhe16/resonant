@@ -2,6 +2,7 @@
 
 The SDK's ``Manifest`` validates the file on its own. These need more context:
 - ``approver_errors``: approvers against ``principals.yaml``.
+- ``grant_warnings``: per-tool grants naming a tool the extension doesn't define (PER-293).
 - ``name_errors``: the extension name against builtin command words.
 - ``dir_errors``: the extension directory. Stdlib only (no dependency files, so no
   build-time code ever runs), every command's argv[0] on the allowlist, and no symlink that
@@ -17,12 +18,12 @@ import shlex
 import shutil
 import sys
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from resonant.principals import Principals
+from resonant.principals import Grant, Principals, ToolGrants
 from resonant.router.commands import BY_NAME
 from resonant.sandbox import guarded_tool
 from resonant_sdk import Manifest
@@ -71,14 +72,43 @@ _SKIP_DIRS = frozenset({".git", "__pycache__"})
 
 
 def approver_errors(manifest: Manifest, principals: Principals) -> list[str]:
-    """Each declared approver must exist and hold ``approve`` for this extension."""
+    """Each declared approver must exist, hold ``approve`` for this extension (for at least
+    one of its tools, under a per-tool grant), and never be a workspace-default member."""
     errors: list[str] = []
     for name in manifest.approvers:
-        if name not in principals.principals:
+        if principals.is_default(name) or name == "default" or ":" in name:
+            errors.append(f"approver {name!r} is a workspace-default member; it never approves")
+        elif name not in principals.principals:
             errors.append(f"approver {name!r} is not a known principal")
-        elif not principals.can(name, "approve", manifest.name):
+        elif not principals.holds(name, "approve", manifest.name):
             errors.append(f"approver {name!r} lacks the approve grant for {manifest.name!r}")
     return errors
+
+
+def grant_warnings(manifest: Manifest, principals: Principals) -> list[str]:
+    """PER-293: a per-tool grant for this extension naming a tool it doesn't define (it
+    grants nothing). Warnings, never errors: the grant may predate a rename."""
+    known = {s.name for s in manifest.tool_specs()}
+    if manifest.mcp is not None:
+        known |= {t.name for server in manifest.mcp.servers.values() for t in server.tools}
+    holders: list[tuple[str, Mapping[str, Grant]]] = [
+        (name, p.grants) for name, p in principals.principals.items()
+    ]
+    if principals.default is not None:
+        holders.append(("default", principals.default.grants))
+    out: list[str] = []
+    for who, grants in holders:
+        grant = grants.get(manifest.name)
+        if not isinstance(grant, ToolGrants):
+            continue
+        for action in ("request", "approve"):
+            for tool in grant.tools(action):
+                if tool not in known:
+                    out.append(
+                        f"{who}: {action} grant names unknown tool {manifest.name}.{tool} "
+                        "(grants nothing)"
+                    )
+    return out
 
 
 def name_errors(manifest: Manifest) -> list[str]:

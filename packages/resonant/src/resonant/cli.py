@@ -24,7 +24,13 @@ from pydantic import ValidationError
 from resonant import daemon as daemon_mod
 from resonant import instance, killswitch, launchd
 from resonant.config import Settings, load_settings
-from resonant.extensions.checks import EXT_PATH, approver_errors, dir_errors, name_errors
+from resonant.extensions.checks import (
+    EXT_PATH,
+    approver_errors,
+    dir_errors,
+    grant_warnings,
+    name_errors,
+)
 from resonant.extensions.manager import (
     AdoptRequired,
     ExtensionManager,
@@ -862,7 +868,10 @@ def ext_validate(
     settings = load_settings()
     problems = name_errors(manifest) + dir_errors(manifest_path.parent, manifest)
     if settings.principals_path.exists():
-        problems += approver_errors(manifest, load_principals(settings.principals_path))
+        principals = load_principals(settings.principals_path)
+        problems += approver_errors(manifest, principals)
+        for warning in grant_warnings(manifest, principals):
+            typer.echo(f"warning: {warning}")
     else:
         typer.echo(f"note: {settings.principals_path} missing; approver grants not checked")
     typer.echo(f"{manifest.name} v{manifest.version}")
