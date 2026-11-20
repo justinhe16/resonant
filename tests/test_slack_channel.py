@@ -689,3 +689,72 @@ async def test_the_gate_takes_buttons_only_from_slack_and_only_with_a_code(
     assert gate.resolve_reply(early).reason == "not_sent_before"
     row = ap.get_approval(w.slack.conn, d.approval_id)
     assert row is not None and row.status == "pending"
+
+
+async def test_an_event_without_team_id_is_never_vouched(w: World) -> None:
+    env = mention(BRIAN, f"<@{BOT}> hi")
+    del env["payload"]["team_id"]
+    await w.socket.deliver(env)
+    assert w.events == []
+
+
+async def test_unknown_senders_are_audited_once_an_hour(db: sqlite3.Connection) -> None:
+    world = make(db)
+    await world.slack.start(submitter(world))
+    for i in range(3):
+        await world.socket.deliver(mention("U9STRANGER", f"<@{BOT}> {i}", ts=f"17000000{i}.1"))
+    n = "SELECT COUNT(*) FROM audit_log WHERE action = 'slack.unknown_sender'"
+    assert db.execute(n).fetchone()[0] == 1
+    world.clock.now += timedelta(hours=2)
+    await world.socket.deliver(mention("U9STRANGER", f"<@{BOT}> later", ts="1700000009.1"))
+    assert db.execute(n).fetchone()[0] == 2
+    await world.slack.stop()
+
+
+async def test_a_click_must_match_the_posted_approval_and_code(
+    gw: tuple[World, PolicyGate],
+) -> None:
+    w, gate = gw
+    first = await ask(w, gate, ADD)
+    second = await ask(w, gate, WIPE)
+    w.clock.now = utcnow() + timedelta(seconds=1)
+    posted = next(p for p in w.web.posts if p.channel == "D2BRIAN" and first.code in p.text)
+    # the first prompt's message, carrying the second approval's code: binds nothing
+    await w.socket.deliver(
+        click(BRIAN, first.approval_id, second.code, channel="D2BRIAN", ts=posted.ts)
+    )
+    await w.socket.deliver(
+        click(
+            BRIAN,
+            second.approval_id,
+            second.code,
+            channel="D2BRIAN",
+            ts=posted.ts,
+            action_ts="1800000900.000001",
+        )
+    )
+    for d in (first, second):
+        row = ap.get_approval(w.slack.conn, d.approval_id)
+        assert row is not None and row.status == "pending"
+    assert w.web.ephemerals[-1]["text"] == "Nothing is waiting for approval."
+
+
+def test_brain_history_follows_the_conversations_channel(db: sqlite3.Connection) -> None:
+    from resonant.brain.history import channel_of
+    from resonant.runners.ask_tools import OWNER_SOURCES
+    from resonant.store.tasks import insert_event
+
+    slack_event = Event(
+        source="slack",
+        type="message",
+        principal="brian",
+        payload={"text": "hi"},
+        dedupe_key="slack:C1:1.1",
+    )
+    other = Event(source="gate", type="human_input", payload={}, dedupe_key="g:1")
+    insert_event(db, slack_event)
+    insert_event(db, other)
+    assert channel_of(db, slack_event.id) == "slack"
+    assert channel_of(db, other.id) == "imessage" and channel_of(db, None) == "imessage"
+    assert channel_of(db, "missing") == "imessage"
+    assert {"imessage", "slack"} <= OWNER_SOURCES

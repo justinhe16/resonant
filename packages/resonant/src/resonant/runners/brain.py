@@ -64,7 +64,7 @@ from zoneinfo import ZoneInfo
 from resonant.brain import triage
 from resonant.brain.context import build_context
 from resonant.brain.facts import FactStore
-from resonant.brain.history import fold, fold_due
+from resonant.brain.history import channel_of, fold, fold_due
 from resonant.brain.news import news_reply
 from resonant.config import Settings
 from resonant.gate.types import Origin
@@ -411,6 +411,7 @@ class BrainRunner(LocalRunner):
                 principals=self.principals,
                 text=text,
                 event_id=task.origin_event_id,
+                source=channel_of(self.conn, task.origin_event_id),  # PER-295: Slack too
                 started_at=self.started_at,
                 facts=self.facts,
                 now=self.now(),

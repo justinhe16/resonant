@@ -131,6 +131,8 @@ SWEEP_S = 30.0
 THREAD_SWEEP_EVERY = timedelta(hours=1)
 FUTURE_SKEW = timedelta(minutes=5)
 EYES = "eyes"
+MAX_MENTION_LOOKUPS = 10  # users.info calls per message at most; the rest stay @U…
+UNKNOWN_AUDIT_EVERY = timedelta(hours=1)  # slack.unknown_sender at most this often per identity
 _RATE_WINDOW = timedelta(minutes=1)
 
 
@@ -142,6 +144,7 @@ class _State:
     by: str | None  # who decided, as a reply names them
     approvers: tuple[str, ...]
     pay: bool
+    code: str | None  # the approval's (a batch: its first approval's) reply code
 
 
 class SlackChannel:
@@ -185,6 +188,7 @@ class SlackChannel:
         self._names: dict[str, str] = {}
         self._dms: dict[str, str] = {}
         self._recent: dict[str, deque[datetime]] = {}
+        self._unknown: dict[str, datetime] = {}  # identity -> last slack.unknown_sender audit
         self._connected = False
         self._connected_at: datetime | None = None
         self._last_event_at: datetime | None = None
@@ -375,11 +379,14 @@ class SlackChannel:
             return
         identity = f"slack:{m.user}"
         principal = self.principals.resolve(identity, vouched=True)  # same team: vouched
-        if principal is None:
-            with atomic(self.conn):
-                audit(self.conn, "slack.unknown_sender", identity=identity, ref=m.ref)
-            return
         now = self.clock()
+        if principal is None:
+            last = self._unknown.get(identity)
+            if last is None or now - last >= UNKNOWN_AUDIT_EVERY:
+                self._unknown[identity] = now
+                with atomic(self.conn):
+                    audit(self.conn, "slack.unknown_sender", identity=identity, ref=m.ref)
+            return
         if m.kind == "reply":
             with atomic(self.conn):
                 followed = store.followed(self.conn, m.channel, m.thread_ts, now, self.idle)
@@ -407,7 +414,7 @@ class SlackChannel:
                     limit_per_minute=self.config.inbound_per_minute,
                 )
             return
-        if users := ev.mentions(text):
+        if users := ev.mentions(text)[:MAX_MENTION_LOOKUPS]:
             text = ev.render_mentions(text, {u: await self._user_name(u) for u in users})
         if not text:
             return
@@ -490,8 +497,18 @@ class SlackChannel:
     async def _on_click(self, click: ev.Click) -> None:
         identity = f"slack:{click.user}"
         actor = self.principals.resolve(identity, vouched=True)
+        with atomic(self.conn):
+            posted = store.prompt_at(self.conn, click.channel, click.ts)
         state = self._state(click.approval_id)
-        if state is None:
+        if (
+            state is None
+            or state.code != click.code.upper()
+            or (
+                posted is not None
+                and (posted.approval_id, posted.code) != (click.approval_id, click.code)
+            )
+        ):
+            # the button's approval and code must be the ones posted (the gate binds by code)
             await self._ephemeral(click, "Nothing is waiting for approval.")
             return
         if state.status != "pending":
@@ -568,6 +585,7 @@ class SlackChannel:
             by=shown,
             approvers=approvers or head.approvers,
             pay=any(a.effect == Effect.PAY for a in rows),
+            code=head.code.upper() if head.code else None,
         )
 
     def _names_of(self, approvers: tuple[str, ...]) -> str:

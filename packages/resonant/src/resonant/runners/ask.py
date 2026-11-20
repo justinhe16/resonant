@@ -118,6 +118,7 @@ from resonant.brain import guard
 from resonant.brain.history import (
     DEFAULT_TAINT_HOPS,
     SinceLast,
+    channel_of,
     primer,
     since_last,
     system_gaps,
@@ -1849,6 +1850,7 @@ class AskRunner:
             return [], None
         try:
             found = unfolded(self.conn, principal, before_event_id=source.origin_event_id,
+                             source=channel_of(self.conn, source.origin_event_id),
                              limit=HISTORY_EXCHANGES)  # fmt: skip
         except sqlite3.Error:
             return [], None

@@ -3,8 +3,9 @@
 :func:`parse_message` reads an ``events_api`` payload into a :class:`Message`, or a
 :class:`Dropped` with a short reason (never text):
 
-- ``other_team``: the payload's ``team_id``, or the sender's ``user_team``/``team``, isn't
-  ``channels.slack.team_id``. Only same-team senders are vouched for.
+- ``other_team``: the payload's ``team_id`` is missing or isn't ``channels.slack.team_id``, or
+  the sender's ``user_team``/``team`` (when present) isn't. Only same-team senders are vouched
+  for, and the check fails closed.
 - ``self``: the bot's own message (``user`` is the bot, or any ``bot_id``).
 - ``subtype``: an edit, delete, join, bot or any other subtype (only plain messages,
   ``thread_broadcast`` and ``file_share`` pass; files themselves are ignored in v1).
@@ -97,7 +98,7 @@ def parse_message(payload: dict[str, Any], *, team_id: str, bot_user_id: str) ->
     event = _dict(payload.get("event"))
     if event is None:
         return Dropped("malformed")
-    if _s(payload, "team_id") not in (None, team_id):
+    if _s(payload, "team_id") != team_id:  # fails closed: the vouch rests on it
         return Dropped("other_team")
     for key in ("user_team", "team"):
         if _s(event, key) not in (None, team_id):
