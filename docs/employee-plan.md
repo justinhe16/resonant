@@ -245,6 +245,7 @@ Built: `runners/worker_cli.py` (wire, shim, socket server, peer check), `runners
   - `resonant ask "<q>" [--options a,b,c] [--urgent]`
   - `resonant note "<progress>" [--urgent]`
   - `resonant check --system S --action A [--irreversible] [--cost USD] "<what>"`
+  - `resonant job-note '{"seen": [...], "note": "..."}'` (PER-298): only in a registered job's run; saves the job's memory and seen keys for its next run
 
   Replies are plain text. The exit codes:
   - `0`: answered, noted, or the check is ok.

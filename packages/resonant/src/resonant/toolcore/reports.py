@@ -218,6 +218,11 @@ REPORTS: dict[str, Callable[[dict[str, Any]], str | None]] = {
     "forget": _fact_forgotten,
     "create_watch": _watch_created,
     "cancel_watch": _watch_cancelled,
+    "add_job": _run_text,  # PER-298: the job tools' own code-built text
+    "pause_job": _run_text,
+    "resume_job": _run_text,
+    "delete_job": _run_text,
+    "run_job_now": _run_text,
 }
 
 

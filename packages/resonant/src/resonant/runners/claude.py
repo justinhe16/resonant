@@ -231,6 +231,7 @@ from resonant.secrets import (
     missing_runner_secrets,
 )
 from resonant.store import approvals as approvals_store
+from resonant.store import jobs as jobs_store
 from resonant.store import questions as questions_store
 from resonant.store import repos as repo_store
 from resonant.store import runs, system_texts
@@ -1408,6 +1409,7 @@ class ClaudeRunner:
         merge: bool = False,
         report: Report = "digest",
         channel_ref: dict[str, Any] | None = None,
+        job: jobs_store.RunLink | None = None,
     ) -> Started | Refused:
         """Create a run and its task. ``repo`` is free text (a name, ``owner/name``, a URL):
         the resolver turns it into a registered repo, registering one it hasn't seen. No repo
@@ -1431,7 +1433,13 @@ class ClaudeRunner:
         token a repo needs a checkout already, or must be public (cloned anonymously).
 
         ``channel_ref`` (PER-292): the asking task's, kept on the run's task so the run's
-        texts go to the thread it was asked in (``thread_of``)."""
+        texts go to the thread it was asked in (``thread_of``).
+
+        ``job`` (PER-298): the registered job this run is a firing of (``registered_jobs``):
+        linked in kv before the task exists, so its first prompt gets the job's memory
+        (``registered_jobs.run_context``), its ``resonant job-note`` writes back, and its end
+        text goes to the job's room when it has one. The task's checkpoint says
+        ``origin: scheduled``."""
         if (text := await self.setup_missing()) is not None:
             return Refused(text)
         ask = ask.strip()
@@ -1471,6 +1479,8 @@ class ClaudeRunner:
             max_budget_usd=self.cfg.max_budget_usd,
         )
         self.reports.set_report(run.code, report)
+        if job is not None:
+            jobs_store.link_run(self.conn, run.code, job)
         spec = NewTask(
             kind=TASK_KIND,
             runner=RUNNER_NAME,
@@ -1482,6 +1492,7 @@ class ClaudeRunner:
                 "title": f"run {run.code} · {repo or 'no repo'}",
                 **({"merge": True} if auto_merge else {}),
                 **({"local": local} if local is not None else {}),
+                **({"job": job.job, "origin": "scheduled"} if job is not None else {}),
             },
         )
         try:
@@ -2443,7 +2454,11 @@ class ClaudeRunner:
                 saved = f"{saved}\n\n{fresh}" if saved else fresh
                 runs.update(self.conn, run.code, resume_prompt=saved)
         if not run.sessions:
-            return run.ask + (f"\n\n{saved}" if saved else "")
+            from resonant.registered_jobs import run_context  # PER-298: a job's memory
+
+            job = run_context(self.conn, run.code)
+            head = run.ask if job is None else f"{run.ask}\n\n{job}"
+            return head + (f"\n\n{saved}" if saved else "")
         if fresh is not None:
             return f"{saved}\n\nCarry on with the task."
         if run.scratch:
@@ -3562,8 +3577,7 @@ class ClaudeRunner:
                 if voiced.used:
                     text = voiced.text
         try:
-            await self.channel.send(run.principal, text, thread=self._thread(run),
-                                    dedupe_key=f"run:{run.code}:{run.status}")  # fmt: skip
+            await self._send_end(run, text)
         except ChannelRefused:  # nobody took it: the digest carries the line (and warning)
             log.warning("run reply refused", extra={"run": run.code})
             self._unrevoked.pop(run.code, None)
@@ -3588,6 +3602,21 @@ class ClaudeRunner:
             ref = f"run:{run.code}:{run.status}"
             system_texts.record(self.conn, run.principal, "run", said, ref=ref,
                                 task_id=run.task_id, outside=True)  # fmt: skip
+
+    async def _send_end(self, run: Run, text: str) -> None:
+        """The end text: to the run's thread (else the principal), or, for a registered
+        job's run with a room output (PER-298), to that room; a room that refuses falls back
+        to the principal. Raises ``ChannelRefused`` when nobody took it."""
+        key = f"run:{run.code}:{run.status}"
+        link = jobs_store.run_link(self.conn, run.code)
+        poster: Any = getattr(self.channel, "post_room", None)
+        if link is not None and link.room is not None and poster is not None:
+            try:
+                await poster(link.room, text, dedupe_key=key)
+                return
+            except ChannelRefused:
+                log.warning("job room refused the end text", extra={"run": run.code})
+        await self.channel.send(run.principal, text, thread=self._thread(run), dedupe_key=key)
 
     def _voiced(self, run: Run) -> bool:
         """Whether ``run``'s outcome text is written by the voice: the owner's, not a

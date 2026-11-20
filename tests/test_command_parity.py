@@ -58,6 +58,12 @@ CHAT_WRITES = {
     "forget",
     "create_watch",
     "cancel_watch",
+    # Registered jobs (PER-298): adding one asks (L2); the rest act on the job (L3).
+    "add_job",
+    "pause_job",
+    "resume_job",
+    "delete_job",
+    "run_job_now",
 }
 
 SPECS = {s.name: s for s in BUILTIN_SPECS}
