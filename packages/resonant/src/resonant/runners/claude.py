@@ -232,6 +232,7 @@ from resonant_sdk import Event
 if TYPE_CHECKING:
     from resonant.executor import CallContext
     from resonant.extensions.scheduler import CoreDeps, CoreJob
+    from resonant.notify_owner import OwnerBridge
 
 log = logging.getLogger(__name__)
 
@@ -949,6 +950,7 @@ class ClaudeRunner:
         end_grace_s: float = END_GRACE_S,
         voice: Voice | None = None,
         api_port: int = API_PORT,
+        bridge: OwnerBridge | None = None,
     ) -> None:
         """``max_runs``: sessions at once (the Claude slots minus the on-call reserve).
         ``github`` builds the resolver's GitHub client from the secrets (tests pass a fake; by
@@ -981,9 +983,13 @@ class ClaudeRunner:
         code-built text stays the fallback and the ⚠ lines, side effects and the closing
         line stay code-built. None: every text is code-built.
 
-        PER-297: ``api_port`` is this instance's ``api.port``, which the thin guard denies."""
+        PER-297: ``api_port`` is this instance's ``api.port``, which the thin guard denies.
+
+        PER-301: ``bridge`` (an instance with ``notify_owner``) also forwards a run's urgent
+        failure to personal Resonant, which texts the owner."""
         self.conn = conn
         self.api_port = api_port
+        self.bridge = bridge
         self.cfg = runner
         self.channel = channel
         self.secrets = secrets
@@ -3467,6 +3473,8 @@ class ClaudeRunner:
                 level = "now"
             self.reports.audit_report(run, event, level)
             item = self.reports.ended(run, title, urgent=event == "failed" or warned)
+            if self.bridge is not None and event == "failed" and level == "now":
+                self.bridge.forward(f"run/{run.code}", title)  # PER-301
             if level == "digest":
                 self._unrevoked.pop(run.code, None)  # the line carries the warning
                 return

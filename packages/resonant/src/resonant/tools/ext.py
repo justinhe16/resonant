@@ -36,7 +36,9 @@ from pydantic import ValidationError
 from resonant.executor import ToolFailed, ToolHandler
 from resonant.extensions import briefing, notify, pulse_job
 from resonant.extensions.cron import CronError, parse_schedule
+from resonant.extensions.pulse import instance_source
 from resonant.gate.codes import clean_external
+from resonant.instance import NAME_RE
 from resonant.monitor import health_snapshot
 from resonant.store import extensions as store
 from resonant.store import repos
@@ -223,17 +225,32 @@ def _core_jobs(ctx: BuiltinContext, now: datetime) -> list[dict[str, Any]]:
     return out
 
 
+def _instance_source(ctx: BuiltinContext, name: str) -> str | None:
+    """PER-301: ``/ext mute cori`` mutes the alerts another instance sends through
+    ``/api/notify-owner`` (pulse source ``instance:cori``), once it has sent one."""
+    if not NAME_RE.fullmatch(name):
+        return None
+    source = instance_source(name)
+    row = ctx.conn.execute("SELECT 1 FROM pulse_items WHERE source = ? LIMIT 1", (source,))
+    return source if row.fetchone() is not None else None
+
+
 def mute_extension(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
     unknown = set(args) - {"extension", "until", "off"}
     if unknown:
         raise ToolFailed(f"unknown arguments: {sorted(unknown)}")
     name, until_raw, off = args.get("extension"), args.get("until"), args.get("off")
-    if not isinstance(name, str) or store.get_extension(ctx.conn, name) is None:
+    if not isinstance(name, str):
+        raise ToolFailed("no such extension")
+    target = (
+        name if store.get_extension(ctx.conn, name) is not None else _instance_source(ctx, name)
+    )
+    if target is None:
         raise ToolFailed("no such extension")
     owner = ctx.principals.owner
     now = ctx.clock()
     if off is True and until_raw is None:
-        was = notify.unmute(ctx.conn, name, by=owner, now=now)
+        was = notify.unmute(ctx.conn, target, by=owner, now=now)
         return {"extension": name, "muted_until": None, "was_muted": was}
     if off is not None or not isinstance(until_raw, str):
         raise ToolFailed("give either until or off")
@@ -245,7 +262,7 @@ def mute_extension(ctx: BuiltinContext, args: dict[str, Any]) -> dict[str, Any]:
         raise ToolFailed("until needs a UTC offset")
     if until <= now or until > now + MUTE_MAX + MUTE_SLACK:
         raise ToolFailed("until must be in the future and at most 7 days ahead")
-    notify.mute(ctx.conn, name, until, by=owner)
+    notify.mute(ctx.conn, target, until, by=owner)
     tz = ctx.state.settings.timezone
     return {
         "extension": name,

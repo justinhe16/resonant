@@ -139,6 +139,7 @@ class Daemon:
                 channels=channels,
             )
             self.state.monitor = self.stack.monitor
+            self.state.pulse = self.stack.pulse  # PER-301: POST /api/notify-owner
             brain = self.state.components.runners.get("brain")
             if isinstance(brain, BrainRunner):
                 # The briefing's "Workers aren't set up" uses the dashboard's runner check
@@ -256,6 +257,8 @@ class Daemon:
             aux.append(asyncio.create_task(self.pusher.run(), name="relay"))
         if self.stack is not None and self.stack.notifier is not None:
             aux.append(asyncio.create_task(self.stack.notifier.run(), name="notify-flush"))
+        if self.stack is not None and self.stack.bridge is not None:  # PER-301
+            aux.append(asyncio.create_task(self.stack.bridge.run(), name="notify-owner"))
         watchdog = Watchdog(self.heartbeat, self.settings.health.watchdog_stale_s)
         watchdog.start()
         host = self.state.components.extensions if self.state.components else None
