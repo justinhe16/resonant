@@ -219,7 +219,9 @@ async def test_a_failing_runner_check_doesnt_break_the_dashboard(
     loop = Loop(db, {}, settings.loop, SlotPool(2, 1))
     state = DaemonState(settings, db, loop, started_at=utcnow())
     boom = Boom()
-    state.components = cast(Components, SimpleNamespace(runners={"claude": boom}))
+    state.components = cast(
+        Components, SimpleNamespace(runners={"claude": boom}, principals_loaded=False)
+    )
     app = create_app(state, dashboard_dist=tmp_path)
     async with _client(app) as client:
         first = await client.get("/api/dashboard")

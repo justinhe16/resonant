@@ -777,6 +777,74 @@ def test_taint_provenance(db: sqlite3.Connection) -> None:
     assert approvals_by_task[batch_item].outside == ["summary", "changes"]
 
 
+def _member_tasks(db: sqlite3.Connection, now: datetime) -> dict[str, tuple[str, str]]:
+    """An owner's, a member's and a principal-less (job) task, each with a title, a checkpoint
+    title (the label), a run and a pending approval. name -> (task id, run code)."""
+    out: dict[str, tuple[str, str]] = {}
+    for n, (name, principal) in enumerate(
+        (("owner", "justin"), ("member", "teammate"), ("system", None)), start=1
+    ):
+        tid = task_store.insert_task(
+            db,
+            NewTask(kind="chat", runner="local", priority=1, principal=principal,
+                    checkpoint={"title": f"{name} label"}),
+        )  # fmt: skip
+        db.execute("UPDATE tasks SET title = ? WHERE id = ?", (f"{name} title", tid))
+        run = runs.create(db, repo="", ask=f"{name} ask", principal=principal or "j",
+                          session_id=name, max_seconds=60)  # fmt: skip
+        runs.update(db, run.code, task_id=tid)
+        _approval(db, tid, n, Level.L2, now, summary=f"{name} summary")
+        out[name] = (tid, run.code)
+    return out
+
+
+def test_a_members_words_are_marked_outside(db: sqlite3.Connection) -> None:
+    """PER-304: on Cori every Slack member's message is someone else's words. A task whose
+    principal isn't the owner has its title and label, its run's ask and its approvals'
+    summary marked outside; the owner's and a principal-less task's are not."""
+    now = utcnow().replace(microsecond=0)
+    made = _member_tasks(db, now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now, owner="justin")
+    tasks = {t.id: t for t in s.tasks.items}
+    run_items = {r.code: r for r in s.runs.items}
+    approvals = {a.task_id: a for a in s.approvals.items}
+    member_task, member_run = made["member"]
+    assert tasks[member_task].outside == ["label", "title"]
+    assert tasks[member_task].title == "member title"  # the same text pass, just marked
+    assert "ask" in run_items[member_run].outside
+    assert approvals[member_task].outside == ["summary", "changes"]
+    for name in ("owner", "system"):
+        tid, code = made[name]
+        assert tasks[tid].outside == [], name
+        assert "ask" not in run_items[code].outside, name
+        assert approvals[tid].outside == [], name
+
+
+def test_without_an_owner_nothing_is_marked_for_members(db: sqlite3.Connection) -> None:
+    """No principals loaded (or the briefing, which never passes one): as before PER-304."""
+    now = utcnow().replace(microsecond=0)
+    made = _member_tasks(db, now)
+    s = build_snapshot(db, load_settings(), started_at=now, now=now)
+    member_task, member_run = made["member"]
+    assert {t.id: t for t in s.tasks.items}[member_task].outside == []
+    assert "ask" not in {r.code: r for r in s.runs.items}[member_run].outside
+
+
+def test_a_members_secret_is_redacted_and_marked(db: sqlite3.Connection) -> None:
+    now = utcnow().replace(microsecond=0)
+    tid = task_store.insert_task(
+        db, NewTask(kind="chat", runner="local", priority=2, principal="teammate")
+    )
+    ghp = "ghp_" + "a1b2" * 8  # credential-shaped
+    db.execute("UPDATE tasks SET title = ? WHERE id = ?", (f"use {ghp} or {SECRET}", tid))
+    s = build_snapshot(
+        db, load_settings(), started_at=now, now=now, owner="justin", redactor=Redactor([SECRET])
+    )
+    [t] = s.tasks.items
+    assert t.outside == ["title"] and t.title is not None and t.title.startswith("use ")
+    assert ghp not in t.title and SECRET not in t.title and redact_secrets(t.title) == t.title
+
+
 def test_tasks_never_ship_their_internals(db: sqlite3.Connection) -> None:
     now = utcnow()
     tid = task_store.insert_task(

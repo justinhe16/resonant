@@ -159,7 +159,8 @@ async def test_the_remote_tier_leaves_with_its_text(db: sqlite3.Connection) -> N
     raw = request.content.decode()
     assert "claude.ai" not in raw and "remote_url" not in raw
     body = json.loads(raw)
-    assert set(body) == {"p_token", "p_data"}
+    assert set(body) == {"p_token", "p_data", "p_instance"}
+    assert body["p_instance"] == "resonant"  # PER-304: personal Resonant, no instance config
     data = body["p_data"]
     snap = Snapshot.model_validate(data)
     assert snap.tier == "remote" and snap.schema_ == 2 and data["trimmed"] == "none"
@@ -172,6 +173,57 @@ async def test_the_remote_tier_leaves_with_its_text(db: sqlite3.Connection) -> N
     assert data["approvals"]["open"] == 1 and data["paused"] is True
     assert '"code"' not in json.dumps(data["approvals"])  # the approval's code stays on the Mini
     assert fake.stored == [data]
+
+
+async def test_cori_pushes_as_cori_with_members_words_marked_and_scrubbed(
+    db: sqlite3.Connection,
+) -> None:
+    """PER-304: a Cori daemon sends ``p_instance: cori`` and a snapshot that names it; a Slack
+    member's words are marked outside and go through the same redaction, and nothing
+    secret-shaped is left in what is sent."""
+    from resonant.loop.types import NewTask
+    from resonant.store import runs
+    from resonant.store import tasks as task_store
+
+    ghp = "ghp_" + "a1b2" * 8
+    tid = task_store.insert_task(
+        db, NewTask(kind="chat", runner="local", priority=2, principal="teammate")
+    )
+    db.execute("UPDATE tasks SET title = ? WHERE id = ?", (f"deploy with {ghp}", tid))
+    run = runs.create(db, repo="", ask=f"ship it, token {ghp}", principal="teammate",
+                      session_id="s", max_seconds=60)  # fmt: skip
+    runs.update(db, run.code, task_id=tid)
+    settings = load_settings(instance={"name": "cori"})
+    assert settings.instance.display_name == "Cori"
+
+    async def snapshot(redactor: Redactor) -> Snapshot:
+        return build_snapshot(db, settings, started_at=T0, now=utcnow(), version="abcdef12",
+                              redactor=redactor, owner="justin")  # fmt: skip
+
+    fake = FakeSupabase()
+    p = SnapshotPusher(
+        db,
+        RelayConfig(enabled=True, supabase_url=URL, anon_key=ANON),
+        snapshot=snapshot,
+        secrets=SecretStore(FakeKeychain(items={SUPABASE_KEY_REF: TOKEN})),
+        client=fake.client(),
+        sleep=Sleeps(),
+        clock=lambda: T0,
+        instance=settings.instance.name,
+    )
+    assert (await p.push_once()).ok
+    [request] = fake.requests
+    raw = request.content.decode()
+    body = json.loads(raw)
+    assert body["p_instance"] == "cori"
+    data = body["p_data"]
+    assert data["instance"] == {"name": "cori", "display_name": "Cori"}
+    [task] = data["tasks"]["items"]
+    assert task["outside"] == ["title"] and task["title"].startswith("deploy with ")
+    [item] = data["runs"]["items"]
+    assert item["outside"][0] == "ask" and item["ask"].startswith("ship it, token ")
+    assert ghp not in raw and "a1b2a1b2" not in raw
+    assert redact_secrets(json.dumps(data)) == json.dumps(data)
 
 
 async def test_request_shape_and_credentials(db: sqlite3.Connection) -> None:
@@ -784,6 +836,7 @@ async def test_daemon_pushes_the_remote_tier(resonant_home: Path) -> None:
     kc = FakeKeychain(items={SUPABASE_KEY_REF: TOKEN})
     daemon = Daemon(settings, secrets=SecretStore(kc))
     assert daemon.pusher is not None
+    assert daemon.pusher.instance == "resonant"  # PER-304: settings.instance.name
     fake = FakeSupabase()
     daemon.pusher = SnapshotPusher(
         daemon.conn,
@@ -971,7 +1024,7 @@ async def test_archived_days_upload_once_after_a_push_oldest_first(db: sqlite3.C
     assert [d["p_day"] for d in fake.days] == ["2026-10-12", "2026-10-13", "2026-10-14"]
     body = fake.days[0]
     assert body["p_ext"] == "ledger" and body["p_panel"] == "paper" and body["p_keep_days"] == 90
-    assert body["p_token"] == TOKEN
+    assert body["p_token"] == TOKEN and body["p_instance"] == "resonant"  # PER-304
     assert set(body["p_data"]) == {"views", "health", "truncated"}
     assert "local_url" not in json.dumps(body["p_data"])  # never leaves the Mac
     await pusher.push_once()

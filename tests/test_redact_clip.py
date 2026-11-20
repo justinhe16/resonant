@@ -29,6 +29,8 @@ MIGRATION = (
     / "20261102000000_relay_full_snapshot.sql"
 )
 PANEL_DAYS_MIGRATION = MIGRATION.with_name("20261105000000_relay_panel_days.sql")  # PER-286
+# PER-304: relay_ingest and relay_panel_day again, keyed by instance (each holds it once).
+INSTANCES_MIGRATION = MIGRATION.with_name("20261120000000_relay_instances.sql")
 # Postgres's ``\y`` (a word boundary) is Python's ``\b``; the rest is the same syntax.
 SQL_RE = re.compile(SECRET_SQL_FAMILY.replace(r"\y", r"\b"))
 
@@ -104,11 +106,15 @@ def _sample(rng: random.Random) -> str:
     return f"{noise()}{prefix}{body}{noise()}"
 
 
-@pytest.mark.parametrize("migration", [MIGRATION, PANEL_DAYS_MIGRATION])
-def test_the_migration_holds_this_exact_pattern(migration: Path) -> None:
+@pytest.mark.parametrize(
+    ("migration", "times"), [(MIGRATION, 1), (PANEL_DAYS_MIGRATION, 1), (INSTANCES_MIGRATION, 2)]
+)
+def test_the_migration_holds_this_exact_pattern(migration: Path, times: int) -> None:
     sql = migration.read_text()
     assert SECRET_SQL_FAMILY in sql
-    assert sql.count(SECRET_SQL_FAMILY) == 1 and "p_data::text ~ '" + SECRET_SQL_FAMILY + "'" in sql
+    assert sql.count(SECRET_SQL_FAMILY) == times
+    assert sql.count("p_data::text ~ '" + SECRET_SQL_FAMILY + "'") == times
+    assert sql.count(f"p_data::text ~ '{RC_LINK_SQL}'") == times
 
 
 @pytest.mark.parametrize(

@@ -20,7 +20,8 @@ import shutil
 import socket
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -133,10 +134,10 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
-@pytest.fixture(scope="module")
-def pg() -> Iterator[Pg]:
+@contextmanager
+def cluster(migrations: list[Path]) -> Generator[Pg]:
+    """A throwaway Postgres with the stub and ``migrations`` applied."""
     assert BINDIR is not None
-    assert MIGRATIONS, "no migrations"
     # A short path: a Unix socket path must fit in ~100 bytes.
     base = Path(tempfile.mkdtemp(prefix="rpg", dir="/tmp"))
     data, sock = base / "data", base / "sock"
@@ -166,7 +167,7 @@ def pg() -> Iterator[Pg]:
     try:
         db = Pg(BINDIR, sock, port)
         db.ok(STUB.read_text())
-        for m in MIGRATIONS:
+        for m in migrations:
             db.ok(m.read_text())
         yield db
     finally:
@@ -178,6 +179,13 @@ def pg() -> Iterator[Pg]:
         shutil.rmtree(base, ignore_errors=True)
 
 
+@pytest.fixture(scope="module")
+def pg() -> Iterator[Pg]:
+    assert MIGRATIONS, "no migrations"
+    with cluster(MIGRATIONS) as db:
+        yield db
+
+
 def _sha(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -187,9 +195,11 @@ def db(pg: Pg) -> Pg:
     """A configured project with no snapshots."""
     pg.ok(
         "truncate public.snapshots, public.snapshot_latest, public.panel_days;"
+        "delete from relay_private.ingest_tokens;"
         f"update relay_private.config set owner_id = '{OWNER}',"
-        f" ingest_token_sha256 = decode('{_sha(INGEST)}', 'hex'),"
         f" status_token_sha256 = decode('{_sha(STATUS)}', 'hex');"
+        "insert into relay_private.ingest_tokens (instance, token_sha256)"
+        f" values ('resonant', decode('{_sha(INGEST)}', 'hex'));"
     )
     return pg
 
@@ -381,7 +391,7 @@ def test_ingest_refuses_a_bad_token(db: Pg, tmp_path: Path, token: str) -> None:
 
 
 def test_ingest_refuses_everything_until_configured(db: Pg, tmp_path: Path) -> None:
-    db.ok("update relay_private.config set ingest_token_sha256 = null;")
+    db.ok("delete from relay_private.ingest_tokens;")
     assert ingest(db, remote_snapshot(tmp_path)).sqlstate == "PT403"
 
 
@@ -598,11 +608,14 @@ def test_the_tables_cap_size_even_for_postgres(db: Pg) -> None:
     big = json.dumps({"x": "y" * 263_000})
     r = db.run(f"insert into public.snapshot_latest (taken_at, data) values (now(), '{big}');")
     assert r.sqlstate == "23514"
-    r = db.run(
-        "insert into public.snapshot_latest (singleton, taken_at, data) values"
-        " (false, now(), '{}');"
-    )
-    assert r.sqlstate == "23514"  # one row only
+    db.ok("insert into public.snapshot_latest (taken_at, data) values (now(), '{}');")
+    r = db.run("insert into public.snapshot_latest (taken_at, data) values (now(), '{}');")
+    assert r.sqlstate == "23505"  # one row per instance
+    for table in ("snapshot_latest", "snapshots"):
+        r = db.run(
+            f"insert into public.{table} (instance, taken_at, data) values ('Cori', now(), '{{}}');"
+        )
+        assert r.sqlstate == "23514", (table, r.err)  # the instance name is a slug
 
 
 # --- the owner's read ------------------------------------------------------------------------
@@ -653,7 +666,7 @@ def test_status_returns_the_newest_taken_at_and_health_states_only(db: Pg, tmp_p
     older = (newer - timedelta(minutes=3)).isoformat()
     assert ingest(db, remote_snapshot(tmp_path, taken_at=older, health=[])).ok  # arrives later
     out = json.loads(status(db).out)
-    assert set(out) == {"taken_at", "health"}  # nothing else leaves
+    assert set(out) == {"instances", "taken_at", "health"}  # nothing else leaves
     assert datetime.fromisoformat(out["taken_at"]) == newer
     assert out["health"] == [
         {"name": "model", "state": "ok"},
@@ -668,7 +681,7 @@ def test_status_still_returns_health_after_a_slim_row(db: Pg, tmp_path: Path) ->
     assert ingest(db, remote).ok
     assert json.loads(db.ok("select data from public.snapshots;"))["slim"] is True
     out = json.loads(status(db).out)
-    assert set(out) == {"taken_at", "health"}
+    assert set(out) == {"instances", "taken_at", "health"}
     assert out["health"] == [{"name": h["name"], "state": h["state"]} for h in remote["health"]]
     assert {"name": "relay", "state": "failing"} in out["health"]
 
@@ -695,6 +708,16 @@ def test_one_token_cannot_be_both(db: Pg) -> None:
         f"update relay_private.config set status_token_sha256 = decode('{_sha(INGEST)}', 'hex');"
     )
     assert r.sqlstate == "23514"
+    r = db.run(
+        "insert into relay_private.ingest_tokens (instance, token_sha256)"
+        f" values ('cori', decode('{_sha(STATUS)}', 'hex'));"
+    )
+    assert r.sqlstate == "23514"
+    r = db.run(  # and one ingest token can't be two instances'
+        "insert into relay_private.ingest_tokens (instance, token_sha256)"
+        f" values ('cori', decode('{_sha(INGEST)}', 'hex'));"
+    )
+    assert r.sqlstate == "23505"
 
 
 def test_a_remote_snapshot_with_panels_is_accepted(db: Pg, tmp_path: Path) -> None:
@@ -868,3 +891,259 @@ def test_panel_day_rate_limit(db: Pg) -> None:
     r = panel_day(db, _day(db, 31))
     assert not r.ok and r.sqlstate == "PT429"
     assert len(day_rows(db)) == 30
+
+
+# --- instances (PER-304) ---------------------------------------------------------------------
+
+CORI = "c" * 8 + "0011223344556677" * 3
+CORI_ID = {"name": "cori", "display_name": "Cori"}
+
+
+def add_cori(db: Pg) -> None:
+    db.ok(
+        "insert into relay_private.ingest_tokens (instance, token_sha256)"
+        f" values ('cori', decode('{_sha(CORI)}', 'hex'));"
+    )
+
+
+def ingest_as(
+    db: Pg, data: Any, token: str = INGEST, instance: str | None = None, role: str = "anon"
+) -> Result:
+    arg = "" if instance is None else f", p_instance => {_lit(instance)}::jsonb #>> '{{}}'"
+    return db.run(
+        f"select public.relay_ingest(p_token => '{token}', p_data => {_lit(data)}::jsonb{arg});",
+        role=role,
+    )
+
+
+def rows_by_instance(db: Pg, table: str) -> dict[str, int]:
+    out = db.ok(
+        f"select instance || '=' || count(*) from public.{table} group by instance order by 1;"
+    )
+    return {k: int(v) for k, v in (line.split("=") for line in out.splitlines())} if out else {}
+
+
+def latest_of(db: Pg, instance: str) -> dict[str, Any]:
+    return json.loads(
+        db.ok(f"select data from public.snapshot_latest where instance = '{instance}';")
+    )
+
+
+def test_a_personal_push_without_p_instance_lands_in_resonant(db: Pg, tmp_path: Path) -> None:
+    """An old daemon (no p_instance, and a snapshot that may not name its instance) and a new
+    personal one both land in `resonant`; a personal-only setup never makes a `cori` row."""
+    data = remote_snapshot(tmp_path)
+    assert data["instance"] == {"name": "resonant", "display_name": "Resonant"}
+    assert ingest(db, data).ok  # relay_ingest(token, data): the old two-argument call
+    old = {k: v for k, v in remote_snapshot(tmp_path, version="old").items() if k != "instance"}
+    db.ok("update public.snapshots set received_at = received_at - interval '2 minutes';")
+    assert ingest(db, old).ok
+    assert ingest_as(db, remote_snapshot(tmp_path), instance="resonant").ok
+    assert rows_by_instance(db, "snapshots") == {"resonant": 3}
+    assert rows_by_instance(db, "snapshot_latest") == {"resonant": 1}
+    d = _day(db)
+    assert panel_day(db, d).ok  # the old six-argument call
+    assert db.ok("select instance from public.panel_days;") == "resonant"
+
+
+def test_a_cori_token_writes_only_the_cori_row(db: Pg, tmp_path: Path) -> None:
+    add_cori(db)
+    personal = remote_snapshot(tmp_path, version="mine")
+    assert ingest(db, personal).ok
+    cori = remote_snapshot(tmp_path, instance=CORI_ID, version="cori")
+    assert ingest_as(db, cori, token=CORI).ok  # no p_instance: the token says
+    assert ingest_as(db, cori, token=CORI, instance="cori").ok
+    assert rows_by_instance(db, "snapshots") == {"cori": 2, "resonant": 1}
+    assert rows_by_instance(db, "snapshot_latest") == {"cori": 1, "resonant": 1}
+    assert latest_of(db, "resonant")["version"] == "mine"
+    assert latest_of(db, "cori")["version"] == "cori"
+    # The owner reads both (the policy is unchanged; instance is just a column).
+    assert _visible(db, OWNER_AAL2, "snapshot_latest") == 2
+    assert _visible(db, {**OWNER_AAL2, "sub": STRANGER}, "snapshot_latest") == 0
+
+
+@pytest.mark.parametrize(
+    ("token", "instance", "snapshot_instance"),
+    [
+        (CORI, "resonant", CORI_ID),  # the Cori token, saying resonant
+        (INGEST, "cori", None),  # the personal token, saying cori
+        (CORI, None, {"name": "resonant", "display_name": "Resonant"}),  # the data disagrees
+        (INGEST, None, CORI_ID),
+        (CORI, "nobody", CORI_ID),
+    ],
+)
+def test_a_mismatched_instance_is_refused(
+    db: Pg,
+    tmp_path: Path,
+    token: str,
+    instance: str | None,
+    snapshot_instance: dict[str, str] | None,
+) -> None:
+    add_cori(db)
+    data = remote_snapshot(tmp_path)
+    if snapshot_instance is not None:
+        data["instance"] = snapshot_instance
+    r = ingest_as(db, data, token=token, instance=instance)
+    assert r.sqlstate == "PT403", r.err
+    assert count(db) == 0 and count_latest(db) == 0
+
+
+def test_an_unknown_token_is_refused_whatever_instance_it_names(db: Pg, tmp_path: Path) -> None:
+    for instance in (None, "resonant", "cori"):
+        r = ingest_as(db, remote_snapshot(tmp_path), token=CORI, instance=instance)
+        assert r.sqlstate == "PT403", r.err  # Cori's token isn't registered here
+
+
+def test_the_rate_limit_is_per_instance(db: Pg, tmp_path: Path) -> None:
+    add_cori(db)
+    for _ in range(3):
+        assert ingest(db, remote_snapshot(tmp_path)).ok
+    assert ingest(db, remote_snapshot(tmp_path)).sqlstate == "PT429"
+    cori = remote_snapshot(tmp_path, instance=CORI_ID)
+    for _ in range(3):
+        assert ingest_as(db, cori, token=CORI).ok  # personal's limit doesn't touch Cori
+    assert ingest_as(db, cori, token=CORI).sqlstate == "PT429"
+    assert rows_by_instance(db, "snapshots") == {"cori": 3, "resonant": 3}
+
+
+def test_the_row_cap_is_per_instance(db: Pg, tmp_path: Path) -> None:
+    add_cori(db)
+    db.ok(
+        "insert into public.snapshots (instance, taken_at, received_at, data)"
+        " select 'cori', now(), now() - interval '2 minutes', jsonb_build_object('n', g)"
+        " from generate_series(1, 12005) g;"
+        "insert into public.snapshots (taken_at, received_at, data)"
+        " select now(), now() - interval '2 minutes', jsonb_build_object('n', g)"
+        " from generate_series(1, 50) g;"
+    )
+    assert ingest_as(db, remote_snapshot(tmp_path, instance=CORI_ID), token=CORI).ok
+    assert rows_by_instance(db, "snapshots") == {"cori": 12000, "resonant": 50}
+
+
+def cori_day(db: Pg, day: str, data: Any = DAY_DATA, *, instance: str | None = None) -> Result:
+    arg = "" if instance is None else f", p_instance => '{instance}'"
+    return db.run(
+        f"select public.relay_panel_day(p_token => '{CORI}', p_ext => 'ledger',"
+        f" p_panel => 'paper', p_day => '{day}', p_data => {_lit(data)}::jsonb,"
+        f" p_keep_days => 365{arg});",
+        role="anon",
+    )
+
+
+def test_panel_days_are_per_instance(db: Pg) -> None:
+    add_cori(db)
+    d = _day(db)
+    assert panel_day(db, d).ok
+    assert cori_day(db, d, {**DAY_DATA, "health": "warn"}).ok  # same ext, panel and day
+    assert cori_day(db, d, {**DAY_DATA, "health": "warn"}, instance="cori").ok
+    assert rows_by_instance(db, "panel_days") == {"cori": 1, "resonant": 1}
+    health = db.ok("select instance || '=' || (data->>'health') from public.panel_days order by 1;")
+    assert health.splitlines() == ["cori=warn", "resonant=ok"]
+    r = cori_day(db, d, instance="resonant")
+    assert r.sqlstate == "PT403", r.err
+    # Deleting Cori's day leaves personal's.
+    assert cori_day(db, d, None).ok
+    assert rows_by_instance(db, "panel_days") == {"resonant": 1}
+
+
+def test_the_panel_day_rate_limit_is_per_instance(db: Pg) -> None:
+    add_cori(db)
+    for offset in range(1, 31):
+        assert panel_day(db, _day(db, offset)).ok
+    assert panel_day(db, _day(db, 31)).sqlstate == "PT429"
+    assert cori_day(db, _day(db, 31)).ok
+
+
+def test_status_lists_every_instance_and_keeps_the_old_fields(db: Pg, tmp_path: Path) -> None:
+    add_cori(db)
+    now = datetime.now(UTC).replace(microsecond=0)
+    health = [{"name": "model", "state": "ok", "since": None}]
+    assert ingest(db, remote_snapshot(tmp_path, taken_at=now.isoformat(), health=health)).ok
+    out = json.loads(status(db).out)
+    assert set(out) == {"instances", "taken_at", "health"}
+    # The old shape, for a checker from before: personal's newest snapshot.
+    assert datetime.fromisoformat(out["taken_at"]) == now
+    assert out["health"] == [{"name": "model", "state": "ok"}]
+    # Cori has a token but never pushed.
+    assert [i["instance"] for i in out["instances"]] == ["cori", "resonant"]
+    cori, mine = out["instances"]
+    assert cori == {"instance": "cori", "taken_at": None, "health": []}
+    assert set(mine) == {"instance", "taken_at", "health"}
+    assert datetime.fromisoformat(mine["taken_at"]) == now and mine["health"] == out["health"]
+
+    earlier = now - timedelta(minutes=2)
+    failing = [{"name": "slack", "state": "failing", "since": None}]
+    cori_snap = remote_snapshot(
+        tmp_path, instance=CORI_ID, taken_at=earlier.isoformat(), health=failing
+    )
+    assert ingest_as(db, cori_snap, token=CORI).ok
+    out = json.loads(status(db).out)
+    cori, mine = out["instances"]
+    assert datetime.fromisoformat(cori["taken_at"]) == earlier
+    assert cori["health"] == [{"name": "slack", "state": "failing"}]
+    # Cori's newer or older push never changes the old top-level fields.
+    assert datetime.fromisoformat(out["taken_at"]) == now
+    assert out["health"] == [{"name": "model", "state": "ok"}]
+
+
+def test_status_for_a_personal_only_project(db: Pg, tmp_path: Path) -> None:
+    assert ingest(db, remote_snapshot(tmp_path)).ok
+    out = json.loads(status(db).out)
+    assert [i["instance"] for i in out["instances"]] == ["resonant"]
+
+
+# --- the migration on today's schema ---------------------------------------------------------
+
+INSTANCES_MIGRATION = ROOT / "supabase" / "migrations" / "20261120000000_relay_instances.sql"
+
+
+def test_the_migration_keeps_existing_rows_and_the_token_as_resonant(tmp_path: Path) -> None:
+    """Applied to a copy of the schema before it, with rows in every table: they all become
+    `resonant`'s, the configured ingest token keeps working (now as `resonant`), and an old
+    two-argument push lands there."""
+    before = [m for m in MIGRATIONS if m.name < INSTANCES_MIGRATION.name]
+    assert INSTANCES_MIGRATION in MIGRATIONS and len(before) == len(MIGRATIONS) - 1
+    with cluster(before) as db:
+        db.ok(
+            f"update relay_private.config set owner_id = '{OWNER}',"
+            f" ingest_token_sha256 = decode('{_sha(INGEST)}', 'hex'),"
+            f" status_token_sha256 = decode('{_sha(STATUS)}', 'hex');"
+        )
+        old = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=5)
+        assert ingest(db, remote_snapshot(tmp_path, taken_at=old.isoformat(), version="pre")).ok
+        assert panel_day(db, _day(db)).ok
+        db.ok(INSTANCES_MIGRATION.read_text())
+
+        assert rows_by_instance(db, "snapshots") == {"resonant": 1}
+        assert rows_by_instance(db, "snapshot_latest") == {"resonant": 1}
+        assert rows_by_instance(db, "panel_days") == {"resonant": 1}
+        assert latest_of(db, "resonant")["version"] == "pre"
+        token_row = db.ok(
+            "select instance || '=' || encode(token_sha256, 'hex')"
+            " from relay_private.ingest_tokens;"
+        )
+        assert token_row == f"resonant={_sha(INGEST)}"
+        assert (
+            db.ok(
+                "select count(*) from information_schema.columns"
+                " where table_schema = 'relay_private' and column_name = 'ingest_token_sha256';"
+            )
+            == "0"
+        )
+        # The old daemon's call, unchanged, replaces the same row.
+        assert ingest(db, remote_snapshot(tmp_path, version="post")).ok
+        assert rows_by_instance(db, "snapshot_latest") == {"resonant": 1}
+        assert latest_of(db, "resonant")["version"] == "post"
+        assert panel_day(db, _day(db, 2)).ok
+        assert rows_by_instance(db, "panel_days") == {"resonant": 2}
+        # The old checker's fields are still there.
+        assert set(json.loads(status(db).out)) == {"instances", "taken_at", "health"}
+        assert _visible(db, OWNER_AAL2, "snapshot_latest") == 1
+
+
+def test_the_migration_on_an_unconfigured_project(tmp_path: Path) -> None:
+    before = [m for m in MIGRATIONS if m.name < INSTANCES_MIGRATION.name]
+    with cluster(before) as db:
+        db.ok(INSTANCES_MIGRATION.read_text())
+        assert db.ok("select count(*) from relay_private.ingest_tokens;") == "0"
+        assert ingest(db, remote_snapshot(tmp_path)).sqlstate == "PT403"

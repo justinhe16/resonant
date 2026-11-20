@@ -16,10 +16,11 @@ tool commands, trust rules, ...) passes through one function, :func:`_Text`: ``r
 the field's cap with a ``… [cut]`` marker). The caps are in the field types (``Txt64`` is a
 string of at most 64 characters, ``maxLength`` in the schema); nothing is longer than 800, and
 a test checks every free-text node of the schema. A model with text that came from outside the
-owner's conversation (a worker, an extension, a web page) lists the names of those fields in
-``outside``, so the page can say so. The relay's SQL refuses any secret-shaped text that still
-gets there (``redact.SECRET_SQL_FAMILY``), and the pusher scans the dump once more with the
-secrets it knows.
+owner's conversation (a worker, an extension, a web page, or a member: PER-304, a task whose
+principal is not the owner, as every Slack member's message on Cori is) lists the names of
+those fields in ``outside``, so the page can say so. The relay's SQL refuses any
+secret-shaped text that still gets there (``redact.SECRET_SQL_FAMILY``), and the pusher scans
+the dump once more with the secrets it knows.
 
 Size: the lists are capped (:class:`Limits`, quoted by the page) and ``pusher.shrink`` trims
 them further, in a fixed order, when the JSON is still over the relay's cap (``trimmed`` says
@@ -1561,6 +1562,7 @@ def build_snapshot(
     redactor: Redactor | None = None,
     launch_agents: Sequence[AgentState] | None = None,
     diagram: bool = True,
+    owner: str | None = None,
 ) -> Snapshot:
     """The local-tier snapshot (``to_remote`` derives the remote one).
 
@@ -1570,7 +1572,10 @@ def build_snapshot(
     scheduler's ``(id, cron, tz)`` per core job. ``redactor`` holds secret values the text
     passes must also remove (the relay pusher's token and key). ``launch_agents`` is
     ``diagram.cached_scan()``'s list (None: not scanned); only the agents the diagram allows
-    (``diagram.agent_allowed``) are shipped.
+    (``diagram.agent_allowed``) are shipped. ``owner`` is the owner principal's name: a task
+    of any other principal (a member, or a Slack workspace's default principal on Cori) has
+    its words marked ``outside`` (its title and label, its run's ask, its approvals' summary
+    and changes; PER-304). None (no principals loaded): nothing is marked for that.
     """
     now = now or utcnow()
     run_rows = runs.recent(conn, limit=RUN_ITEMS)
@@ -1582,7 +1587,7 @@ def build_snapshot(
         links.append(session["remote_url"])
     t = _Text(Redactor([*(redactor.values if redactor else ()), *links]))
     health = _health(conn, t)
-    ctx = _Context(conn, now)
+    ctx = _Context(conn, now, owner)
 
     task_rows = task_store.recent(conn, TASK_ITEMS)
     asks = questions.open_asks(conn)
@@ -2009,9 +2014,10 @@ def _diagram(
 class _Context:
     """The tasks the builder looks at more than once (taint, run codes), read once."""
 
-    def __init__(self, conn: sqlite3.Connection, now: datetime) -> None:
+    def __init__(self, conn: sqlite3.Connection, now: datetime, owner: str | None = None) -> None:
         self.conn = conn
         self.now = now
+        self.owner = owner
         self.task_ids: list[str] = []
         self._tasks: dict[str, Task | None] = {}
         self._codes: dict[str, str] | None = None
@@ -2036,12 +2042,26 @@ class _Context:
         task = self.task(task_id)
         return task is not None and system_texts.tainted(task.checkpoint)
 
+    def from_member(self, task_id: str | None) -> bool:
+        """Whether a task's words are a member's (PER-304): its principal is someone other
+        than the owner. A task with no principal (a job, a system task) is not."""
+        task = self.task(task_id)
+        return self.owner is not None and task is not None and _member(task, self.owner)
+
+    def outside(self, task_id: str | None) -> bool:
+        """Tainted, or a member's: the words came from outside the owner's conversation."""
+        return self.tainted(task_id) or self.from_member(task_id)
+
     def run_code(self, task_id: str | None) -> str | None:
         if task_id is None:
             return None
         if self._codes is None:
             self._codes = runs.codes_by_task(self.conn, self.task_ids)
         return self._codes.get(task_id)
+
+
+def _member(task: Task, owner: str) -> bool:
+    return task.principal is not None and task.principal != owner
 
 
 def _events(rows: Sequence[tuple[datetime, str]], *, strip: str = "") -> list[Event]:
@@ -2076,9 +2096,15 @@ def _task_item(
 ) -> TaskItem:
     error = t.opt(task.error, 300)
     title = t.opt(task.title, 80) if task.title and task.title.strip() else None
+    label = _task_label(task, t)
+    member = ctx.owner is not None and _member(task, ctx.owner)  # PER-304
     outside = [
         name
-        for name, present in (("title", title and task.title_outside), ("error", error))
+        for name, present in (
+            ("label", label and member),
+            ("title", title and (task.title_outside or member)),
+            ("error", error),
+        )
         if present
     ]
     return TaskItem(
@@ -2093,7 +2119,7 @@ def _task_item(
         step_no=task.step_no,
         created_at=task.created_at,
         updated_at=task.updated_at,
-        label=_task_label(task, t),
+        label=label,
         title=title,
         error=error,
         run_code=ctx.run_code(task.id),
@@ -2159,7 +2185,7 @@ def _run_item(
         )
         if present
     ]
-    if ctx.tainted(r.task_id):
+    if ctx.outside(r.task_id):
         outside.insert(0, "ask")
     return RunItem(
         code=t(r.code, 16),
@@ -2327,7 +2353,7 @@ def _approval_item(
         ]
         if batch
         else None,
-        outside=["summary", "changes"] if ctx.tainted(first.task_id) else [],
+        outside=["summary", "changes"] if ctx.outside(first.task_id) else [],
     )
 
 
