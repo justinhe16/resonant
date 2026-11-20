@@ -580,6 +580,24 @@ def _hhmm_time(text: str) -> time:
     return time(int(hour), int(minute))
 
 
+class HeartbeatConfig(_Section):
+    """``pulse.heartbeat`` (PER-303): the hourly "alive" line ``core/pulse`` posts to a room
+    (``channels.slack.rooms.<room>``), whether or not the owner pulse had news. ``room: null``
+    (the default) is off."""
+
+    room: str | None = None  # a ``channels.slack.rooms`` key (Cori: ``pulse``)
+    # true: skip ``pulse.quiet_hours`` like the owner pulse. false (the default): post through
+    # them, so the room shows a gap-free hourly line.
+    quiet_hours: bool = False
+
+    @field_validator("room")
+    @classmethod
+    def _room(cls, v: str | None) -> str | None:
+        if v is not None and not _ROOM_KEY.match(v):
+            raise ValueError("pulse.heartbeat.room must be a channels.slack.rooms key (a slug)")
+        return v
+
+
 class PulseConfig(_Section):
     """The pulse (docs/pulse-plan.md): hourly "btw" messages and urgent interrupts."""
 
@@ -594,6 +612,8 @@ class PulseConfig(_Section):
     # GH-2: a run or open PR with no activity this long is flagged once in the progress
     # rollup ("looks like R3 got dropped, ~5h quiet"). A duration, 1h to 168h.
     stall_after: str = "4h"
+    # PER-303: the hourly alive line to a room (off unless ``room`` is set).
+    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
 
     @field_validator("quiet_hours")
     @classmethod

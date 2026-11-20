@@ -14,6 +14,8 @@ of Slack. Nothing reaches the network.
   dori.prod_deploy --arg commit=abc``. The approval is posted in the run's thread with
   buttons; Miu's click changes nothing, Brian's runs the deploy once, and the run resumes with
   the result.
+- PER-303: with ``pulse.heartbeat.room: pulse`` the daemon's own ``core/pulse`` job posts the
+  hourly alive line to ``#voyager-pulse`` (``channels.slack.rooms.pulse``) once per hour.
 """
 
 from __future__ import annotations
@@ -37,9 +39,12 @@ from test_e2e_runner import (
 )
 from test_runner_claude import until
 
-from resonant.config import ChannelsConfig
+from resonant.config import ChannelsConfig, PulseConfig
 from resonant.daemon import Daemon
 from resonant.e2e.extensions import install_fixture
+from resonant.executor import CallContext
+from resonant.extensions.pulse_job import pulse_job
+from resonant.extensions.scheduler import CoreDeps
 from resonant.gateway.slack import SlackChannel
 from resonant.gateway.slack import channel as slack_module
 from resonant.gateway.slack.fixtures import (
@@ -96,6 +101,8 @@ async def slack_daemon(
     chat: FakeChatDB,
     mp: pytest.MonkeyPatch,
     extra: list[str] | None = None,
+    *,
+    heartbeat: bool = False,
 ) -> AsyncGenerator[tuple[World, Daemon, FakeSlackWeb, FakeSlackSocket]]:
     """``extra``: the fake worker's options; with them the dori extension is installed too."""
     w = make_world(tmp_path, home, chat, mp, scenario="happy", runner_opts={"ask_block_s": 0.5},
@@ -107,11 +114,14 @@ async def slack_daemon(
                 "enabled": True,
                 "team_id": TEAM_ID,
                 "bot_user_id": BOT,
-                "rooms": {"digest": "C0DIGEST"},
+                "rooms": {"digest": "C0DIGEST", "pulse": "C0PULSE"},
             }
         }
     )
-    w.settings = w.settings.model_copy(update={"channels": channels})
+    update: dict[str, object] = {"channels": channels}
+    if heartbeat:
+        update["pulse"] = PulseConfig.model_validate({"heartbeat": {"room": "pulse"}})
+    w.settings = w.settings.model_copy(update=update)
     w.keychain.items.update(
         {"slack/bot_token": "xoxb-e2e-fake", "slack/app_token": "xapp-e2e-fake"}
     )
@@ -319,3 +329,36 @@ async def test_a_workers_request_is_approved_in_the_runs_thread_and_runs_once(
             "Your request (dori.prod_deploy commit=abc): Approved by Brian: Done: "
         ), prompts[1]
         assert '"version": "v142"' in prompts[1]
+
+
+async def test_the_hourly_heartbeat_posts_once_to_the_pulse_room(
+    tmp_path: Path, resonant_home: Path, chat: FakeChatDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with slack_daemon(tmp_path, resonant_home, chat, monkeypatch, heartbeat=True) as (
+        _w,
+        d,
+        web,
+        _socket,
+    ):
+        # the daemon's own core/pulse factory over its hub (the conftest keeps wall-clock core
+        # jobs out of test daemons, so the hour is driven here)
+        assert d.stack is not None
+        assert d.state.components is not None
+        deps = CoreDeps(d.settings, d.conn, d.state.components, d.stack.channel, "justin")
+        job = pulse_job(deps)
+        assert job is not None and job.runs_while_paused  # it posts while paused too
+        ctx = CallContext(secrets={}, idempotency_key="e2e", task_id="e2e")
+        due = {"due_at": "2026-11-20T17:00:00+00:00"}
+        out = await job.run(due, ctx)
+        assert out["heartbeat"] == {"posted": True}
+        (post,) = [p for p in web.posts if p.channel == "C0PULSE"]
+        assert post.text.startswith("✓ Resonant up · ") and post.thread_ts is None
+        assert "\n" not in post.text  # all well: one line
+        # the same hour again (a restart, a catch-up): no second post
+        out = await job.run(due, ctx)
+        assert out["heartbeat"] == {"posted": False, "skipped": "duplicate"}
+        assert len([p for p in web.posts if p.channel == "C0PULSE"]) == 1
+        (row,) = d.conn.execute(
+            "SELECT principal, kind FROM system_texts WHERE ref LIKE 'heartbeat:%'"
+        ).fetchall()
+        assert tuple(row) == ("room:pulse", "heartbeat")

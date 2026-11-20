@@ -1,4 +1,4 @@
--- 031 (PER-296): a worker's `resonant request <ext>.<tool>` waits like a check, as a
+-- 032 (PER-296): a worker's `resonant request <ext>.<tool>` waits like a check, as a
 -- run_questions row of kind ``request``; ``approval_id`` is the gate approval it asked for
 -- (NULL until one opens, and for asks and checks), so a restart can expire it.
 -- SQLite can't change a CHECK in place, so ``run_questions`` is rebuilt (the 12-step ALTER).

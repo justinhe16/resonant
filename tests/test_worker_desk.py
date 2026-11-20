@@ -387,7 +387,7 @@ async def test_a_timeout_or_restart_closes_it_and_expires_the_approval(
     assert a is not None and a.status == "expired"
 
 
-# --- the flag, the action identity and migration 031 ------------------------------------------
+# --- the flag, the action identity and migration 032 ------------------------------------------
 
 
 def test_only_extension_tools_are_worker_requestable() -> None:
@@ -414,14 +414,15 @@ def test_a_requestable_call_is_an_action_keyed_by_its_args(db: sqlite3.Connectio
     assert action_ids.args_target({"x": "y" * 300}).startswith("sha256:")
 
 
-def test_migration_031_keeps_questions_and_allows_requests(tmp_path: Path) -> None:
+def test_migration_032_keeps_questions_and_allows_requests(tmp_path: Path) -> None:
     found = sorted(
         (int(f.name[:3]), f.read_text())
         for f in resources.files("resonant.store.migrations").iterdir()
         if f.name.endswith(".sql")
     )
     conn = connect(tmp_path / "old.db")
-    assert migrate(conn, [m for m in found if m[0] <= 30]) == 30
+    prior = max(v for v, _sql in found if v < 32)  # the migration before 032
+    assert migrate(conn, [m for m in found if m[0] <= prior]) == prior
     conn.execute(
         "INSERT INTO run_questions (run_code, kind, question, asked_at) VALUES"
         " ('R1', 'ask', 'which one?', '2026-11-20T12:00:00+00:00')"

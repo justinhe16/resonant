@@ -442,6 +442,22 @@ async def test_post_room_posts_only_to_configured_rooms(w: World, db: sqlite3.Co
         await hub.post_room("unknown", "nope")
 
 
+async def test_a_failed_room_post_is_noted_in_health_until_the_room_works(w: World) -> None:
+    # PER-303: the bot removed from #voyager-pulse -> the slack check's detail says so (the
+    # check stays ok: everything else still works); the next good post clears it
+    w.web.fail("chat.postMessage", SlackCallError("chat.postMessage", "not_in_channel"))
+    with pytest.raises(ChannelSendError):
+        await w.slack.post_room("pulse", "alive", dedupe_key="heartbeat:2026-10-13:09")
+    h = w.slack.health()
+    assert "room pulse: chat.postMessage failed: not_in_channel" in h["detail"]
+    assert h["ok"] is True and h["last_error"] is None
+    with pytest.raises(ChannelRefused):
+        await w.slack.post_room("gone", "alive")
+    assert "room gone: unknown room 'gone'" in w.slack.health()["detail"]
+    await w.slack.post_room("pulse", "alive", dedupe_key="heartbeat:2026-10-13:10")
+    assert "room pulse" not in w.slack.health()["detail"]
+
+
 # --- approval buttons -------------------------------------------------------------------------
 
 
