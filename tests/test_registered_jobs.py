@@ -505,11 +505,14 @@ async def test_a_jobs_end_text_goes_to_its_room(db: sqlite3.Connection) -> None:
             store.link_run(db, run.code, link)
         return run
 
-    def no_thread(_run: object) -> None:
-        return None
+    def sender(ch: Recorder) -> Any:
+        async def send_run(run: runs_store.Run, text: str, *, dedupe_key: str | None) -> None:
+            await ch.send(run.principal, text, dedupe_key=dedupe_key)
+
+        return send_run
 
     ch = Recorder()
-    me = SimpleNamespace(conn=db, channel=ch, _thread=no_thread)
+    me = SimpleNamespace(conn=db, channel=ch, _send_run=sender(ch))
     await ClaudeRunner._send_end(me, run_for(store.RunLink("J1", "digest")), "R1 done")  # type: ignore[arg-type]
     await ClaudeRunner._send_end(me, run_for(store.RunLink("J2")), "R2 done")  # type: ignore[arg-type]
     await ClaudeRunner._send_end(me, run_for(None), "R3 done")  # type: ignore[arg-type]
@@ -521,6 +524,6 @@ async def test_a_jobs_end_text_goes_to_its_room(db: sqlite3.Connection) -> None:
             raise ChannelRefused("no running channel has rooms")
 
     no_room = Refusing()
-    me = SimpleNamespace(conn=db, channel=no_room, _thread=no_thread)
+    me = SimpleNamespace(conn=db, channel=no_room, _send_run=sender(no_room))
     await ClaudeRunner._send_end(me, run_for(store.RunLink("J1", "digest")), "R4 done")  # type: ignore[arg-type]
     assert [(p, t) for p, t, _ in no_room.sent] == [("brian", "R4 done")]

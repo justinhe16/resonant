@@ -1,4 +1,4 @@
--- 030: registered jobs (PER-298, ``store/jobs.py``; ``resonant/registered_jobs.py``).
+-- 031: registered jobs (PER-298, ``store/jobs.py``; ``resonant/registered_jobs.py``).
 -- A job is cron plus a prompt: each firing starts one Claude worker run as ``created_by``.
 -- Approvers add, list, pause, resume, delete and run them by plain words (``tools/jobs.py``);
 -- the ``core/registered_jobs`` job fires the due ones every minute.

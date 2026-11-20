@@ -60,6 +60,11 @@ CLAUDE_GRANT = "claude"
 ADMIN_TOOLS: frozenset[str] = frozenset(
     {"update_resonant", "mute_extension", "list_extensions", "pulse_preview", "shell", "shell_read"}
 )
+# PER-294: trust rules stay instance-wide and only the owner and approvers teach them: a member
+# never requests these builtins, whatever their grants say.
+TRUST_TOOLS: frozenset[str] = frozenset(
+    {"add_trust_rule", "allow_trust_rule", "remove_trust_rule", "allow_tools"}
+)
 # chat.db stores handles as E.164 phone numbers or lowercase emails. Requiring the same form
 # here means a handle can only match by exact string comparison.
 _IMESSAGE_HANDLE = re.compile(
@@ -274,7 +279,7 @@ class Principals(BaseModel):
         if p.role == "approver":
             return extension is not None or tool not in ADMIN_TOOLS
         if extension is None:
-            if action != "request" or grant is None:
+            if action != "request" or grant is None or tool in TRUST_TOOLS:
                 return False
             if _grants_action(p.grants.get(BUILTIN_GRANT + grant), "request", None):
                 return True

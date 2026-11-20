@@ -1,4 +1,4 @@
-"""Registered jobs (migration 030, PER-298): cron plus a prompt, one worker run per firing.
+"""Registered jobs (migration 031, PER-298): cron plus a prompt, one worker run per firing.
 
 A job is one ``registered_jobs`` row. ``create`` gives it the next ``J<n>``; ``get`` takes
 ``J3`` or ``3``; ``live`` lists the active and paused ones (never ``deleted``). ``claim_due``

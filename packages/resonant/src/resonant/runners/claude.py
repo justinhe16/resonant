@@ -95,7 +95,7 @@ from resonant.config import resonant_home as default_resonant_home
 from resonant.extensions.notify import clean_text
 from resonant.gate import actions as action_ids
 from resonant.gate.codes import clean_external
-from resonant.gateway.channel import Channel, ChannelError, ChannelRefused, MessageRef, thread_of
+from resonant.gateway.channel import Channel, ChannelError, ChannelRefused, MessageRef
 from resonant.loop.types import (
     PRIORITY_OWNER,
     Done,
@@ -190,6 +190,7 @@ from resonant.runners.reports import (
     setup_notes,
     shown_did,
 )
+from resonant.runners.run_thread import run_thread, send_run
 from resonant.runners.side_effects import RunContext, SideEffect, detect
 from resonant.runners.worker_cli import Check, WorkerServer
 from resonant.runners.worker_desk import (
@@ -1409,6 +1410,7 @@ class ClaudeRunner:
         merge: bool = False,
         report: Report = "digest",
         channel_ref: dict[str, Any] | None = None,
+        requested_by: str | None = None,
         job: jobs_store.RunLink | None = None,
     ) -> Started | Refused:
         """Create a run and its task. ``repo`` is free text (a name, ``owner/name``, a URL):
@@ -1433,7 +1435,9 @@ class ClaudeRunner:
         token a repo needs a checkout already, or must be public (cloned anonymously).
 
         ``channel_ref`` (PER-292): the asking task's, kept on the run's task so the run's
-        texts go to the thread it was asked in (``thread_of``).
+        texts go to the thread it was asked in (``thread_of``). PER-294: it is kept on the run
+        too (``runs.channel_ref``) with ``requested_by`` (who asked: the run's questions,
+        checks and outcome go to that thread, addressed to them; None: ``principal``).
 
         ``job`` (PER-298): the registered job this run is a firing of (``registered_jobs``):
         linked in kv before the task exists, so its first prompt gets the job's memory
@@ -1477,6 +1481,8 @@ class ClaudeRunner:
             session_id=str(uuid.uuid4()),
             max_seconds=self.max_session_s,
             max_budget_usd=self.cfg.max_budget_usd,
+            channel_ref=channel_ref,
+            requested_by=None if requested_by == principal else requested_by,
         )
         self.reports.set_report(run.code, report)
         if job is not None:
@@ -1726,9 +1732,12 @@ class ClaudeRunner:
 
     def _thread(self, run: Run) -> MessageRef | None:
         """PER-292: where the run's texts go: the thread of the message that asked for it
-        (its task's ``channel_ref``), or None (iMessage, a run with no task)."""
-        task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
-        return thread_of(task, to=run.principal)
+        (PER-294: ``runs.channel_ref``, else its task's), or None (iMessage, no task)."""
+        return run_thread(self.conn, run)
+
+    async def _send_run(self, run: Run, text: str, *, dedupe_key: str | None) -> MessageRef:
+        """PER-294: one of the run's texts, to its thread and requester (``send_run``)."""
+        return await send_run(self.channel, self.conn, run, text, dedupe_key=dedupe_key)
 
     def _watch_merge(self, run: Run, *, unattended: bool = False) -> None:
         """Start the owner's merge watch for a ready run whose CI is still running: a task
@@ -1914,7 +1923,7 @@ class ClaudeRunner:
         item = self.reports.running(run, _bucket(run.session_seconds))
         key = f"run:{run.code}:note:{uuid.uuid4().hex}"  # each urgent note is its own news
         try:
-            await self.channel.send(run.principal, text, thread=self._thread(run), dedupe_key=key)
+            await self._send_run(run, text, dedupe_key=key)
         except ChannelError as e:  # the digest line still carries the note
             log.warning("note not texted", extra={"run": run.code, "reason": str(e)})
             return
@@ -1934,8 +1943,7 @@ class ClaudeRunner:
             return
         key = f"run:{run.code}:{op}:{uuid.uuid4().hex}"
         try:
-            await self.channel.send(run.principal, self.reports.self_op_text(run, what),
-                                    thread=self._thread(run), dedupe_key=key)  # fmt: skip
+            await self._send_run(run, self.reports.self_op_text(run, what), dedupe_key=key)
         except ChannelError as e:  # the digest line still carries it
             log.warning("self op not texted", extra={"run": run.code, "reason": str(e)})
             return
@@ -2000,7 +2008,7 @@ class ClaudeRunner:
             return
         key = f"run:{run.code}:seen:{uuid.uuid4().hex}"
         try:
-            await self.channel.send(run.principal, text, thread=self._thread(run), dedupe_key=key)
+            await self._send_run(run, text, dedupe_key=key)
         except ChannelError as e:  # the digest line still lists it
             log.warning("side effect not texted", extra={"run": run.code, "reason": str(e)})
             return
@@ -2885,8 +2893,7 @@ class ClaudeRunner:
             else f"{run.code}: Remote Control unavailable: {why}."
         )
         try:  # once per run, whichever comes first (a resume's new URL is in /runs)
-            await self.channel.send(run.principal, text, thread=self._thread(run),
-                                    dedupe_key=f"run:{run.code}:remote")  # fmt: skip
+            await self._send_run(run, text, dedupe_key=f"run:{run.code}:remote")  # fmt: skip
         except ChannelError as e:
             log.warning("remote control not texted", extra={"run": run.code, "reason": str(e)})
 
@@ -3318,10 +3325,9 @@ class ClaudeRunner:
                 if owner and (merged.no_ci or merged.flagged):
                     # the warnings the owner would have seen on a direct /merge
                     with contextlib.suppress(ChannelError):
-                        await self.channel.send(
-                            run.principal, merged.text, thread=self._thread(run),
-                            dedupe_key=f"run:{run.code}:merge-watch-warn",
-                        )  # fmt: skip
+                        await self._send_run(
+                            run, merged.text, dedupe_key=f"run:{run.code}:merge-watch-warn"
+                        )
                 if first:  # the merged line is the run's only word: never cleared silently
                     await self._deprovision(run.code)
                     await self._end_cli(run.code)
@@ -3335,9 +3341,8 @@ class ClaudeRunner:
         assert why is not None
         if owner:
             with contextlib.suppress(ChannelError):
-                await self.channel.send(
-                    run.principal, f"{run.code} not merged: {why}. /merge {run.code} to try again.",
-                    thread=self._thread(run),
+                await self._send_run(
+                    run, f"{run.code} not merged: {why}. /merge {run.code} to try again.",
                     dedupe_key=f"run:{run.code}:merge-watch:{task.checkpoint.get('since')}",
                 )  # fmt: skip
             return done
@@ -3345,9 +3350,9 @@ class ClaudeRunner:
         if first:
             return await self._conclude(run, note=note)
         with contextlib.suppress(ChannelError):
-            await self.channel.send(
-                run.principal, f"{run.code} {note[0].lower()}{note[1:]}",
-                thread=self._thread(run), dedupe_key=f"run:{run.code}:auto-merge",
+            await self._send_run(
+                run, f"{run.code} {note[0].lower()}{note[1:]}",
+                dedupe_key=f"run:{run.code}:auto-merge",
             )  # fmt: skip
         return done
 
@@ -3600,7 +3605,7 @@ class ClaudeRunner:
             if voiced is not None and voiced.used:
                 said = record_text(text)  # PER-273: what the owner read
             ref = f"run:{run.code}:{run.status}"
-            system_texts.record(self.conn, run.principal, "run", said, ref=ref,
+            system_texts.record(self.conn, run.requester, "run", said, ref=ref,
                                 task_id=run.task_id, outside=True)  # fmt: skip
 
     async def _send_end(self, run: Run, text: str) -> None:
@@ -3616,12 +3621,13 @@ class ClaudeRunner:
                 return
             except ChannelRefused:
                 log.warning("job room refused the end text", extra={"run": run.code})
-        await self.channel.send(run.principal, text, thread=self._thread(run), dedupe_key=key)
+        await self._send_run(run, text, dedupe_key=key)
 
     def _voiced(self, run: Run) -> bool:
-        """Whether ``run``'s outcome text is written by the voice: the owner's, not a
-        cancel (the owner did it, the text is one line of ours)."""
-        return run.status != "cancelled" and (self.owner is None or run.principal == self.owner)
+        """Whether ``run``'s outcome text is written by the voice: one the owner asked for
+        (PER-294: the requester, not the run's principal), not a cancel (the owner did it, the
+        text is one line of ours)."""
+        return run.status != "cancelled" and (self.owner is None or run.requester == self.owner)
 
     def _still_names(self, run: Run) -> list[str]:
         """The owner's other active runs, by name (at most two, then ``N more``); [] when
@@ -3674,14 +3680,13 @@ class ClaudeRunner:
             if voiced.used:
                 text = voiced.text
         try:
-            await self.channel.send(run.principal, text, thread=self._thread(run),
-                                    dedupe_key=f"run:{run.code}:merged")  # fmt: skip
+            await self._send_run(run, text, dedupe_key=f"run:{run.code}:merged")  # fmt: skip
         except ChannelError as e:
             log.warning("merge not texted", extra={"run": run.code, "reason": str(e)})
             return
         self.reports.told(item)
         if voiced is not None and voiced.used:
-            system_texts.record(self.conn, run.principal, "run", record_text(text),
+            system_texts.record(self.conn, run.requester, "run", record_text(text),
                                 ref=f"run:{run.code}:merged", task_id=run.task_id,
                                 outside=True)  # fmt: skip
 

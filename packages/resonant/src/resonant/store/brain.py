@@ -90,23 +90,33 @@ def thread_after(
     before_event_id: str | None,
     limit: int,
     newest: bool,
+    conversation: str | None = None,
 ) -> list[tuple[Event, dict[str, Any] | None]]:
     """``principal``'s events of one source and type strictly after ``after_event_id`` (None:
     from the start; an id no longer stored also counts from the start) and strictly before
     ``before_event_id`` (None: up to the latest). At most ``limit`` of them: the newest when
     ``newest``, else the oldest. Always oldest first. Each with the checkpoint of the task it
-    started (None if it started none)."""
+    started (None if it started none).
+
+    ``conversation`` (PER-294): a thread's events instead (``payload.thread``), whoever sent
+    them and on any source: one thread is one conversation."""
     if limit <= 0:
         return []
     order = "DESC" if newest else "ASC"
+    if conversation is None:
+        who = "e.principal = ? AND e.source = ?"
+        keys: tuple[str, ...] = (principal, source)
+    else:
+        who = "json_extract(e.payload, '$.thread') = ?"
+        keys = (conversation,)
     rows = conn.execute(
         f"""SELECT e.*, t.checkpoint AS origin_checkpoint FROM events e
             LEFT JOIN tasks t ON t.origin_event_id = e.id
-            WHERE e.principal = ? AND e.source = ? AND e.type = ?
+            WHERE {who} AND e.type = ?
               AND e.rowid > COALESCE((SELECT rowid FROM events WHERE id = ?), 0)
               AND (? IS NULL OR e.rowid < (SELECT rowid FROM events WHERE id = ?))
-            ORDER BY e.rowid {order} LIMIT ?""",  # noqa: S608 - order is a fixed keyword
-        (principal, source, event_type, after_event_id, before_event_id, before_event_id, limit),
+            ORDER BY e.rowid {order} LIMIT ?""",  # noqa: S608 - fixed fragments only
+        (*keys, event_type, after_event_id, before_event_id, before_event_id, limit),
     ).fetchall()
     if newest:
         rows = list(reversed(rows))

@@ -104,6 +104,11 @@ def _row(r: sqlite3.Row) -> SystemText:
                       datetime.fromisoformat(r["sent_at"]), bool(r["outside"]))  # fmt: skip
 
 
+def _has_conversations(conn: sqlite3.Connection) -> bool:
+    """``tasks.conversation`` exists (migration 030)."""
+    return any(r[1] == "conversation" for r in conn.execute("PRAGMA table_info(tasks)"))
+
+
 def between(
     conn: sqlite3.Connection,
     principal: str,
@@ -111,17 +116,45 @@ def between(
     after: datetime | None = None,
     before: datetime | None = None,
     limit: int = 50,
+    conversation: str | None = None,
 ) -> list[SystemText]:
     """``principal``'s texts sent in ``(after, before)`` (None: open), the newest ``limit``,
-    oldest first."""
+    oldest first.
+
+    PER-294: by conversation. ``conversation`` (a thread): the texts of tasks in that thread
+    (``tasks.conversation``: a run's outcome, its questions' prompts), whoever they went to,
+    each once (a prompt sent to several approvers is one text).
+    None (the principal's own conversation): ``principal``'s texts, less those of a task in a
+    thread (none before PER-294, so an iMessage-only transcript is unchanged)."""
+    if conversation is None:
+        who = "principal = ?"
+        if _has_conversations(conn):  # not on a store part way through its migrations
+            who += (
+                " AND (task_id IS NULL OR task_id NOT IN"
+                " (SELECT id FROM tasks WHERE conversation IS NOT NULL))"
+            )
+        key = principal
+    else:
+        who = "task_id IN (SELECT id FROM tasks WHERE conversation = ?)"
+        key = conversation
     rows = conn.execute(
-        """SELECT * FROM system_texts WHERE principal = ?
+        f"""SELECT * FROM system_texts WHERE {who}
              AND (? IS NULL OR sent_at > ?) AND (? IS NULL OR sent_at < ?)
-           ORDER BY id DESC LIMIT ?""",
-        (principal, *([None] * 2 if after is None else [iso(after)] * 2),
+           ORDER BY id DESC LIMIT ?""",  # noqa: S608 - fixed fragments only
+        (key, *([None] * 2 if after is None else [iso(after)] * 2),
          *([None] * 2 if before is None else [iso(before)] * 2), limit),
     ).fetchall()  # fmt: skip
-    return [_row(r) for r in reversed(rows)]
+    out = [_row(r) for r in reversed(rows)]
+    if conversation is None:
+        return out
+    # One prompt sent to several approvers is one text in the thread: the first copy.
+    seen: set[tuple[str | None, str]] = set()
+    kept: list[SystemText] = []
+    for t in out:
+        if (t.task_id, t.text) not in seen:
+            seen.add((t.task_id, t.text))
+            kept.append(t)
+    return kept
 
 
 def after_id(

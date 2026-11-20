@@ -60,6 +60,16 @@ class Task:
     error: str | None = None
     title: str | None = None  # PER-279: a short human line (``store/task_titles.py``)
     title_outside: bool = False  # its words came from outside text
+    # PER-294 (migration 030): the thread the task's message came from (``channel_ref.thread``);
+    # None is the principal's own conversation.
+    conversation: str | None = None
+
+
+def conversation_of(channel_ref: dict[str, Any] | None) -> str | None:
+    """PER-294: a task's conversation key: its ``channel_ref`` thread, else None (the
+    principal's own conversation: iMessage, and every ``channel_ref`` before PER-292)."""
+    thread: Any = None if channel_ref is None else channel_ref.get("thread")
+    return thread if isinstance(thread, str) and thread else None
 
 
 @dataclass(frozen=True)

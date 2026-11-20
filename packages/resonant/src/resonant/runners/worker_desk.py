@@ -59,9 +59,10 @@ from datetime import datetime, timedelta
 from typing import Any, Literal, Protocol
 
 from resonant.gate.codes import clean_external
-from resonant.gateway.channel import Channel, ChannelError, MessageRef, thread_of
+from resonant.gateway.channel import Channel, ChannelError
 from resonant.redact import Redactor
 from resonant.runners.reports import did_of, record_did
+from resonant.runners.run_thread import send_run
 from resonant.runners.worker_cli import (
     EXIT_BUSY,
     EXIT_DENIED,
@@ -82,7 +83,6 @@ from resonant.store import jobs as jobs_store
 from resonant.store import pulse as pulse_store
 from resonant.store import questions as qs
 from resonant.store import runs
-from resonant.store import tasks as task_store
 from resonant.store.audit import audit
 from resonant.store.db import atomic
 from resonant.store.runs import Run
@@ -330,7 +330,7 @@ class WorkerDesk:
         if run.code in self._self_op_busy:
             return Reply("Not done: a restart or update for this run is already going.",
                          EXIT_DENIED)  # fmt: skip
-        if not (self.owner is not None and run.principal == self.owner and done == 0
+        if not (self.owner is not None and run.requester == self.owner and done == 0
                 and asked_for(run.ask, req.op)):  # fmt: skip
             what = f"{req.op} Resonant (the daemon itself)"
             checked = await self._check(run, Check(SELF_SYSTEM, req.op, what), gone)
@@ -442,10 +442,11 @@ class WorkerDesk:
 
     async def _tell_owner(self, run: Run, q: qs.Question) -> None:
         """``R4 asks: <q>`` (with ``(a) … (b) …`` options; ``⚠`` first when urgent) to the
-        requester, on the run replies' path. With other questions open it ends with how to
-        answer this one by code, since a plain reply would be ambiguous (EM-5)."""
+        requester, on the run replies' path (PER-294: the run's thread, ``send_run``). With
+        other questions open for them it ends with how to answer this one by code, since a
+        plain reply would be ambiguous (EM-5)."""
         others = any(
-            o.run_code != run.code and _principal(self.conn, o.run_code) == run.principal
+            o.run_code != run.code and _requester(self.conn, o.run_code) == run.requester
             for o in qs.open_asks(self.conn)
         )
         text = owner_question_text(
@@ -454,15 +455,10 @@ class WorkerDesk:
         )  # fmt: skip
         self._pulse_question(run, q)
         try:
-            await self.channel.send(run.principal, text, thread=self._thread(run),
-                                    dedupe_key=f"run:{run.code}:ask:{q.id}")  # fmt: skip
+            await send_run(self.channel, self.conn, run, text,
+                           dedupe_key=f"run:{run.code}:ask:{q.id}")  # fmt: skip
         except ChannelError as e:  # the question stays open; the pulse re-mentions it
             log.warning("question not texted", extra={"run": run.code, "reason": str(e)})
-
-    def _thread(self, run: Run) -> MessageRef | None:
-        """PER-292: the thread the run was asked in (its task's ``channel_ref``), or None."""
-        task = task_store.get_task(self.conn, run.task_id) if run.task_id else None
-        return thread_of(task, to=run.principal)
 
     def _pulse_question(self, run: Run, q: qs.Question) -> None:
         """The question as a core pulse item, already told (it is texted now). The hourly
@@ -853,9 +849,9 @@ def question_item_key(code: str, qid: int) -> str:
     return f"question/{code.lower()}-{qid}"
 
 
-def _principal(conn: sqlite3.Connection, code: str) -> str | None:
+def _requester(conn: sqlite3.Connection, code: str) -> str | None:
     run = runs.get(conn, code)
-    return None if run is None else run.principal
+    return None if run is None else run.requester
 
 
 def _answered_twin(

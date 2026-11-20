@@ -1,6 +1,6 @@
 """Registered jobs (PER-298): "every Monday at 9, check flaky CI and file tickets".
 
-A job is cron plus a prompt (``store/jobs.py``, migration 030). Approvers add, list, pause,
+A job is cron plus a prompt (``store/jobs.py``, migration 031). Approvers add, list, pause,
 resume, delete and run them in plain words (``tools/jobs.py``); each firing starts one Claude
 worker run (``ClaudeRunner.start_run``) as the job's creator, and the run's end text goes to
 the job's output. It is the instance's own runtime state: it works with ``ops.self_update``
