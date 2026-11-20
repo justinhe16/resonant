@@ -19,12 +19,18 @@ the brain's tool call, a job) has one identity: the system, the verb and the tar
   ``github.merge_pr`` for that repo and number), or did the owner approve the run's own merge
   (an approved check for it)? Only a merge with no such record keeps the ⚠ alert.
 
+A worker-requestable extension tool (PER-296, ``resonant request``) is an action too: the
+extension, the tool and its args (``dori prod_deploy commit=abc``), so two runs asking for
+the same deploy share one approval and the second is pointed to the first.
+
 The identities are code-built from registered tools' args and the run's registered repo,
 never from a model's or a worker's words alone (a check's ``what`` only picks the PR number).
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -50,6 +56,8 @@ _PR_TOOLS: dict[tuple[str, str], str] = {
     (GITHUB, "rerun_failed"): RERUN,
 }
 _MERGE_RUN = "merge_run"  # the builtin that merges a run's PR (``tools/runs.py``)
+TARGET_MAX = 200  # a requestable tool's ``k=v`` target; longer: a digest
+_PLAIN = re.compile(r"[A-Za-z0-9._:/@+#-]+")  # a value shown bare; anything else is JSON-quoted
 
 
 @dataclass(frozen=True)
@@ -86,7 +94,11 @@ def for_intent(conn: sqlite3.Connection, intent: Intent) -> Action | None:
     if intent.extension is not None:
         verb = _PR_TOOLS.get((intent.extension, intent.tool))
         target = pr_target(args.get("repo"), args.get("number")) if verb else None
-        return Action(GITHUB, verb, target) if verb and target else None
+        if verb and target:
+            return Action(GITHUB, verb, target)
+        if intent.spec.worker_requestable:  # PER-296: two runs asking one deploy share it
+            return Action(intent.extension, intent.tool, args_target(args))
+        return None
     if intent.tool == _MERGE_RUN and isinstance(code := args.get("code"), str):
         run = runs_store.get(conn, code.strip().upper())
         if run is None or run.pr_number is None:
@@ -94,6 +106,19 @@ def for_intent(conn: sqlite3.Connection, intent: Intent) -> Action | None:
         target = pr_target(_repo_slug(conn, run.repo), run.pr_number)
         return Action(GITHUB, MERGE, target) if target else None
     return None
+
+
+def args_target(args: dict[str, Any]) -> str:
+    """A worker-requestable tool's target (PER-296): its args as ``k=v`` pairs, sorted
+    (``commit=abc service=api``; a value with spaces or ``=`` JSON-quoted, so two arg sets
+    never read the same); a long one is a digest of them."""
+    text = " ".join(
+        f"{k}={v if isinstance(v, str) and _PLAIN.fullmatch(v) else json.dumps(v, sort_keys=True)}"
+        for k, v in sorted(args.items())
+    )
+    if len(text) <= TARGET_MAX:
+        return text or "-"
+    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()[:32]
 
 
 def merged_by(intent: Intent) -> str | None:

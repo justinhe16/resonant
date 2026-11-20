@@ -372,6 +372,7 @@ class CliTool(_Strict):
     commit: bool = False
     timeout_s: float = Field(default=30.0, gt=0, le=TOOL_TIMEOUT_MAX_S)
     approval_summary: str | None = None  # PER-268: see ToolSpec; uses only declared args
+    worker_requestable: bool = False  # PER-296: a worker may ask for it (`resonant request`)
 
     @model_validator(mode="after")
     def _placeholders_declared(self) -> Self:
@@ -413,6 +414,7 @@ class McpTool(_Strict):
     # PER-268: see ToolSpec. The server's schema is only known at install, so an arg it
     # names that the call lacks falls back to the arg list.
     approval_summary: str | None = None
+    worker_requestable: bool = False  # PER-296: a worker may ask for it (`resonant request`)
 
     @field_validator("description")
     @classmethod
@@ -756,6 +758,7 @@ class Manifest(BaseModel):
                 secrets=t.secrets,
                 commit=t.commit,
                 approval_summary=t.approval_summary,
+                worker_requestable=t.worker_requestable,
             )
             for name, t in self.tools.items()
         ]
@@ -774,6 +777,7 @@ class Manifest(BaseModel):
                     secrets=t.secrets,
                     commit=t.commit,
                     approval_summary=t.approval_summary,
+                    worker_requestable=t.worker_requestable,
                 )
                 for _, t in self.mcp.tools()
             ]

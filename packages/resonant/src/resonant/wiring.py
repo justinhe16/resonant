@@ -144,8 +144,10 @@ from resonant.runners.reminder import ReminderRunner
 from resonant.runners.voice import ClaudeVoice
 from resonant.runners.watch import WatchRunner
 from resonant.runners.worker_desk import SelfOps
+from resonant.runners.worker_requests import WorkerRequests
 from resonant.secrets import SecretStore
 from resonant.store.db import utcnow
+from resonant.toolcore import ToolCore
 from resonant.tools.ops import Ops
 from resonant.trust.checks import TrustChecks
 from resonant_sdk import Event, ToolSpec
@@ -550,6 +552,14 @@ def build_stack(
         else None
     )
     components.voice = voice
+    # PER-296: a worker's `resonant request` calls a worker_requestable extension tool through
+    # the gate as the run's requester; its approval is asked in the run's thread
+    requests = WorkerRequests(
+        conn,
+        core=ToolCore(conn, registry=components.registry, gate=gate, executor=components.executor),
+        channel=channel,
+        principals=components.principals,
+    )
     claude = ClaudeRunner(
         conn,
         runner=settings.runner,
@@ -574,6 +584,7 @@ def build_stack(
         resonant_home=settings.home,
         instance=settings.instance.name,
         bridge=bridge,
+        requests=requests,
     )
     components.runners[claude.name] = claude
     loop.runners[claude.name] = claude
