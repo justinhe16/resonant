@@ -103,7 +103,7 @@ from resonant.gate.types import (
     ReplyRefusal,
     ResolveResult,
 )
-from resonant.principals import KNOWN_CHANNELS, Principals
+from resonant.principals import ADMIN_TOOLS, KNOWN_CHANNELS, Principals
 from resonant.store import approvals as ap
 from resonant.store import outbound
 from resonant.store import trust as trust_store
@@ -511,7 +511,7 @@ class PolicyGate:
         per-tool grant covers only its tools)."""
         staff = (self.principals.owner, *self.principals.approver_names)
         if extension is None:
-            return staff
+            return (self.principals.owner,) if tool in ADMIN_TOOLS else staff
         named = self.approvers_for(extension)
         if isinstance(named, str):  # a bare name is a seam bug, never a list of letters
             raise TypeError("approvers_for must return a sequence of names, not a str")

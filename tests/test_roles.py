@@ -19,7 +19,7 @@ from resonant.executor import HandlerKey, ToolHandler
 from resonant.extensions.checks import approver_errors, grant_warnings
 from resonant.gate import ApprovalResolution, DryRunGate, Intent, NeedsApproval, PolicyGate
 from resonant.loop import NewTask
-from resonant.principals import CLAUDE_GRANT, Principals, ToolGrants
+from resonant.principals import ADMIN_TOOLS, CLAUDE_GRANT, Principals, ToolGrants
 from resonant.router import Router
 from resonant.router.fast_path import (
     KILL_REPLY,
@@ -405,3 +405,49 @@ async def test_approvers_get_staff_commands(router: Router) -> None:
     assert {"/kill", "/resume", "/rules", "/approvals", "/disk"} <= available
     assert not {"/update", "/ext", "/pulse"} & available
     assert not {"/kill", "/rules", "/run"} & {c.name for c in router.fast_path.available("miu")}
+
+
+# --- review fixes: admin builtins from any path, pause ownership -----------------------------
+
+
+@pytest.mark.parametrize("name", sorted(ADMIN_TOOLS))
+def test_approvers_never_reach_admin_builtins(team: Principals, name: str) -> None:
+    spec = tool(name, None)
+    assert not team.may_request("brian", spec)
+    assert not team.can("brian", "approve", None, tool=name)
+    assert team.may_request("justin", spec)
+
+
+def test_admin_builtins_are_asked_of_the_owner_alone(
+    db: sqlite3.Connection, team: Principals
+) -> None:
+    gate = policy(db, team, [])
+    assert gate.approvers(None, "update_resonant") == ("justin",)
+    assert gate.approvers(None, "restart_resonant") == ("justin", "brian")
+
+
+def test_approver_brain_tools_leave_out_admin_builtins(team: Principals) -> None:
+    offered = [s for s in BUILTIN_SPECS if team.may_request("brian", s)]
+    names = {s.name for s in offered}
+    assert "start_run" in names and "merge_run" in names
+    assert not names & ADMIN_TOOLS
+
+
+async def test_approver_cant_resume_the_owners_pause(
+    db: sqlite3.Connection, router: Router
+) -> None:
+    killswitch.release(db, actor="test")
+    assert await reply(router, "/kill", "justin") == KILL_REPLY
+    assert await reply(router, "resume", "brian") == "Justin paused this; he resumes it."
+    assert kv_get(db, "paused") is True
+
+
+async def test_the_owner_takes_over_an_approvers_pause(
+    db: sqlite3.Connection, router: Router
+) -> None:
+    killswitch.release(db, actor="test")
+    assert await reply(router, "pause", "brian") == KILL_REPLY
+    assert await reply(router, "/kill", "justin") == KILL_REPLY
+    assert killswitch.paused_by(db) == "justin"
+    assert await reply(router, "resume", "brian") == "Justin paused this; he resumes it."
+    assert kv_get(db, "paused") is True

@@ -10,7 +10,8 @@ Roles (PER-293): ``owner | approver | member``.
 - Exactly one principal has ``role: owner``. The owner can do anything, including
   admin actions (kill switch fan-out, ``/update``, ``/ext``, secrets, editing principals).
 - An ``approver`` may ``request`` and ``approve`` everything: every builtin (global scope)
-  and every extension. Never ``admin``.
+  and every extension. Never ``admin``, and never an ``ADMIN_TOOLS`` builtin (``/update``,
+  ``/ext``, ``/pulse``'s tools, the brain shell) from any path.
 - A ``member`` can only do what ``grants`` lists. A grant is per extension
   (``{dori: [request]}``: every dori tool) or per tool
   (``{dori: {request: [file_ticket], approve: []}}``: only those tools).
@@ -53,6 +54,12 @@ BUILTIN_GRANT = "builtin:"  # grants key prefix for a builtin group (``ToolSpec.
 # [request]``, or, on a team config (``Principals.team``), by holding ``request`` on any
 # extension tool (Claude is how they use it).
 CLAUDE_GRANT = "claude"
+# PER-293: builtins that are admin whatever the path (brain, gate, slash command): an approver
+# may neither request nor approve them. ``/update``, ``/ext`` and ``/pulse``'s tools, and the
+# brain shell (it could edit principals or reach secrets).
+ADMIN_TOOLS: frozenset[str] = frozenset(
+    {"update_resonant", "mute_extension", "list_extensions", "pulse_preview", "shell", "shell_read"}
+)
 # chat.db stores handles as E.164 phone numbers or lowercase emails. Requiring the same form
 # here means a handle can only match by exact string comparison.
 _IMESSAGE_HANDLE = re.compile(
@@ -255,8 +262,8 @@ class Principals(BaseModel):
         tool: str | None = None,
     ) -> bool:
         """``grant`` is the tool's ``ToolSpec.grant``; it matters only for a global request.
-        ``tool`` is the tool's name; it matters only for a per-tool grant (without it, a
-        per-tool grant covers nothing)."""
+        ``tool`` is the tool's name; it matters for a per-tool grant (without it, a per-tool
+        grant covers nothing) and for an approver's builtin (never an ``ADMIN_TOOLS`` one)."""
         p = self.get(principal)
         if p is None:
             return False
@@ -265,7 +272,7 @@ class Principals(BaseModel):
         if action == "admin":
             return False
         if p.role == "approver":
-            return True
+            return extension is not None or tool not in ADMIN_TOOLS
         if extension is None:
             if action != "request" or grant is None:
                 return False

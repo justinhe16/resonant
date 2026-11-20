@@ -54,8 +54,9 @@ nothing runs.
 PER-293: an approver may use them too (and the words ``pause`` / ``resume``, approvers
 only), on this instance alone: never the sibling fan-out, the source recorded as
 ``approver:<name>``, and a pause personal Resonant made (``sibling:resonant``) is never theirs
-to resume (``SIBLING_PAUSE_REPLY``). Owner-only commands an approver may use are the
-registry's ``staff`` ones; the rest (``/update``, ``/ext``, ``/pulse``) stay the owner's.
+to resume (``SIBLING_PAUSE_REPLY``), nor is the owner's own (``OWNER_PAUSE_REPLY``).
+Owner-only commands an approver may use are the registry's ``staff`` ones; the rest
+(``/update``, ``/ext``, ``/pulse``) stay the owner's.
 A member asking for ``/run`` or ``/merge`` gets ``start_work_reply`` (who can start work).
 A slash command whose tool the principal can't request gets "not allowed"; a keyword in
 that case falls through to the brain (``run`` returns None).
@@ -109,7 +110,7 @@ from resonant.router.render import (
 from resonant.store import extensions as ext_store
 from resonant.store import repos as repo_store
 from resonant.store.audit import audit
-from resonant.store.db import atomic, iso, utcnow
+from resonant.store.db import atomic, iso, kv_get, utcnow
 from resonant.toolcore import allow_inline
 from resonant.tools import ToolRegistry
 from resonant_sdk import Effect
@@ -127,7 +128,9 @@ KILL_REPLY = "kill switch engaged"
 RESUME_REPLY = "resumed: autonomy on, unpaused"
 # PER-293: an approver's resume of a pause personal Resonant made ({owner} is the owner).
 SIBLING_PAUSE_REPLY = "{owner} paused everything from personal Resonant; he resumes it there."
-APPROVER_SOURCE = "approver:"  # kv ``paused_by`` for an approver's pause: ``approver:<name>``
+# PER-293: an approver's resume of a pause the owner made here (only approvers' pauses lift).
+OWNER_PAUSE_REPLY = "{owner} paused this; he resumes it."
+APPROVER_SOURCE = killswitch.APPROVER_SOURCE  # kv ``paused_by``: ``approver:<name>``
 # PER-293: plain words an approver may use for the instance-only pause (owners use /kill).
 APPROVER_KEYWORDS: dict[str, str] = {"pause": "/kill", "resume": "/resume"}
 # PER-293: the builtins only the owner and approvers may ask for (start_work_reply).
@@ -658,19 +661,24 @@ class FastPath:
         return start_work_reply(self.principals, can_file=can_file)
 
     def _approver_resume(self, cmd: FastCommand, principal: str) -> FastPathResult:
-        """PER-293: an approver's ``/resume``: this instance only, and never a pause personal
-        Resonant made (``sibling:resonant``): the owner resumes that there."""
-        if killswitch.paused_by(self.conn) == killswitch.SIBLING_SOURCE:
+        """PER-293: an approver's ``/resume``: this instance only, and only an approver's
+        pause. Personal Resonant's (``sibling:resonant``) the owner resumes there; the owner's
+        own here (or one with no recorded source) he resumes himself."""
+        source = killswitch.paused_by(self.conn)
+        paused = kv_get(self.conn, "paused") is True
+        if paused and (source is None or not source.startswith(APPROVER_SOURCE)):
             with atomic(self.conn):
                 audit(
                     self.conn,
                     "router.resume_refused",
                     requested_by=principal,
                     command=cmd.name,
-                    paused_by=killswitch.SIBLING_SOURCE,
+                    paused_by=source,
                 )
             owner = self.principals.display(self.principals.owner)
-            return self._result(cmd, SIBLING_PAUSE_REPLY.format(owner=owner))
+            sibling = source == killswitch.SIBLING_SOURCE
+            text = (SIBLING_PAUSE_REPLY if sibling else OWNER_PAUSE_REPLY).format(owner=owner)
+            return self._result(cmd, text)
         killswitch.release(self.conn, actor=APPROVER_SOURCE + principal)
         return self._result(cmd, RESUME_REPLY, "killswitch.release")
 
